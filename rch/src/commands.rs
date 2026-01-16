@@ -2,7 +2,8 @@
 //!
 //! This module contains the actual business logic for each CLI subcommand.
 
-use anyhow::{Context, Result, bail};
+use crate::ui::style::Style;
+use anyhow::{bail, Context, Result};
 use directories::ProjectDirs;
 use rch_common::{RchConfig, SshClient, SshOptions, WorkerConfig, WorkerId};
 use std::path::{Path, PathBuf};
@@ -11,6 +12,15 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::process::Command;
 use tracing::debug;
+
+/// Create a style for terminal output.
+///
+/// Detects terminal capabilities and creates appropriate styling.
+fn terminal_style() -> Style {
+    let is_tty = is_terminal::is_terminal(std::io::stdout());
+    let supports_unicode = is_tty && std::env::var("LANG").map(|l| l.contains("UTF")).unwrap_or(true);
+    Style::new(is_tty, supports_unicode)
+}
 
 /// Get the RCH config directory path.
 pub fn config_dir() -> Option<PathBuf> {
@@ -111,34 +121,55 @@ pub fn load_workers_from_config() -> Result<Vec<WorkerConfig>> {
 /// List all configured workers.
 pub fn workers_list() -> Result<()> {
     let workers = load_workers_from_config()?;
+    let style = terminal_style();
 
     if workers.is_empty() {
         return Ok(());
     }
 
-    println!("Configured Workers");
-    println!("==================");
+    println!("{}", style.format_header("Configured Workers"));
     println!();
 
     for worker in &workers {
-        println!("  {} - {}@{}", worker.id, worker.user, worker.host);
         println!(
-            "    Slots: {}, Priority: {}",
-            worker.total_slots, worker.priority
+            "  {} {} {}@{}",
+            style.symbols.bullet_filled,
+            style.highlight(worker.id.as_str()),
+            style.muted(&worker.user),
+            style.info(&worker.host)
+        );
+        println!(
+            "    {} {} {}  {} {} {}",
+            style.key("Slots"),
+            style.muted(":"),
+            style.value(&worker.total_slots.to_string()),
+            style.key("Priority"),
+            style.muted(":"),
+            style.value(&worker.priority.to_string())
         );
         if !worker.tags.is_empty() {
-            println!("    Tags: {}", worker.tags.join(", "));
+            println!(
+                "    {} {} {}",
+                style.key("Tags"),
+                style.muted(":"),
+                style.muted(&worker.tags.join(", "))
+            );
         }
         println!();
     }
 
-    println!("Total: {} worker(s)", workers.len());
+    println!(
+        "{} {} worker(s)",
+        style.muted("Total:"),
+        style.highlight(&workers.len().to_string())
+    );
     Ok(())
 }
 
 /// Probe worker connectivity.
 pub async fn workers_probe(worker_id: Option<String>, all: bool) -> Result<()> {
     let workers = load_workers_from_config()?;
+    let style = terminal_style();
 
     if workers.is_empty() {
         return Ok(());
@@ -149,21 +180,37 @@ pub async fn workers_probe(worker_id: Option<String>, all: bool) -> Result<()> {
     } else if let Some(id) = &worker_id {
         workers.iter().filter(|w| w.id.as_str() == id).collect()
     } else {
-        println!("Specify a worker ID or use --all to probe all workers.");
+        println!(
+            "{} Specify a worker ID or use {} to probe all workers.",
+            style.info(style.symbols.info),
+            style.highlight("--all")
+        );
         return Ok(());
     };
 
     if targets.is_empty() {
         if let Some(id) = worker_id {
-            println!("Worker '{}' not found in configuration.", id);
+            println!(
+                "{} Worker '{}' not found in configuration.",
+                style.warning(style.symbols.warning),
+                style.highlight(&id)
+            );
         }
         return Ok(());
     }
 
-    println!("Probing {} worker(s)...\n", targets.len());
+    println!(
+        "Probing {} worker(s)...\n",
+        style.highlight(&targets.len().to_string())
+    );
 
     for worker in targets {
-        print!("  {} ({}@{})... ", worker.id, worker.user, worker.host);
+        print!(
+            "  {} {}@{}... ",
+            style.highlight(worker.id.as_str()),
+            style.muted(&worker.user),
+            style.info(&worker.host)
+        );
 
         let mut client = SshClient::new(worker.clone(), SshOptions::default());
 
@@ -173,19 +220,27 @@ pub async fn workers_probe(worker_id: Option<String>, all: bool) -> Result<()> {
                 match client.health_check().await {
                     Ok(true) => {
                         let latency = start.elapsed().as_millis();
-                        println!("✓ OK ({}ms)", latency);
+                        println!(
+                            "{} ({}ms)",
+                            style.format_success("OK"),
+                            style.muted(&latency.to_string())
+                        );
                     }
                     Ok(false) => {
-                        println!("✗ Health check failed");
+                        println!("{}", style.format_error("Health check failed"));
                     }
                     Err(e) => {
-                        println!("✗ Error: {}", e);
+                        println!("{} {}", style.error(style.symbols.failure), style.error(&e.to_string()));
                     }
                 }
                 let _ = client.disconnect().await;
             }
             Err(e) => {
-                println!("✗ Connection failed: {}", e);
+                println!(
+                    "{} Connection failed: {}",
+                    style.error(style.symbols.failure),
+                    style.muted(&e.to_string())
+                );
             }
         }
     }
@@ -304,13 +359,24 @@ pub async fn workers_enable(worker_id: &str) -> Result<()> {
 /// Check daemon status.
 pub fn daemon_status() -> Result<()> {
     let socket_path = Path::new(DEFAULT_SOCKET_PATH);
+    let style = terminal_style();
 
-    println!("RCH Daemon Status");
-    println!("=================\n");
+    println!("{}", style.format_header("RCH Daemon Status"));
+    println!();
 
     if socket_path.exists() {
-        println!("  Status: Running");
-        println!("  Socket: {}", DEFAULT_SOCKET_PATH);
+        println!(
+            "  {} {} {}",
+            style.key("Status"),
+            style.muted(":"),
+            style.success("Running")
+        );
+        println!(
+            "  {} {} {}",
+            style.key("Socket"),
+            style.muted(":"),
+            style.value(DEFAULT_SOCKET_PATH)
+        );
 
         // Try to get more info from the daemon
         if let Ok(metadata) = std::fs::metadata(socket_path) {
@@ -318,14 +384,36 @@ pub fn daemon_status() -> Result<()> {
                 if let Ok(duration) = modified.elapsed() {
                     let hours = duration.as_secs() / 3600;
                     let mins = (duration.as_secs() % 3600) / 60;
-                    println!("  Uptime: ~{}h {}m", hours, mins);
+                    println!(
+                        "  {} {} ~{}h {}m",
+                        style.key("Uptime"),
+                        style.muted(":"),
+                        hours,
+                        mins
+                    );
                 }
             }
         }
     } else {
-        println!("  Status: Not running");
-        println!("  Socket: {} (not found)", DEFAULT_SOCKET_PATH);
-        println!("\n  Start with: rch daemon start");
+        println!(
+            "  {} {} {}",
+            style.key("Status"),
+            style.muted(":"),
+            style.error("Not running")
+        );
+        println!(
+            "  {} {} {} {}",
+            style.key("Socket"),
+            style.muted(":"),
+            style.muted(DEFAULT_SOCKET_PATH),
+            style.muted("(not found)")
+        );
+        println!();
+        println!(
+            "  {} Start with: {}",
+            style.info(style.symbols.info),
+            style.highlight("rch daemon start")
+        );
     }
 
     Ok(())
@@ -606,7 +694,11 @@ enabled = true
 
 /// Validate configuration files.
 pub fn config_validate() -> Result<()> {
-    println!("Validating RCH configuration...\n");
+    let style = terminal_style();
+
+    println!(
+        "Validating RCH configuration...\n"
+    );
 
     let mut errors = 0;
     let mut warnings = 0;
@@ -615,7 +707,10 @@ pub fn config_validate() -> Result<()> {
     let config_dir = match config_dir() {
         Some(d) => d,
         None => {
-            println!("✗ Could not determine config directory");
+            println!(
+                "{} Could not determine config directory",
+                style.error(style.symbols.failure)
+            );
             return Ok(());
         }
     };
@@ -626,32 +721,63 @@ pub fn config_validate() -> Result<()> {
         match std::fs::read_to_string(&config_path) {
             Ok(content) => match toml::from_str::<RchConfig>(&content) {
                 Ok(config) => {
-                    println!("✓ config.toml: Valid");
+                    println!(
+                        "{} {}: {}",
+                        style.success(style.symbols.success),
+                        style.highlight("config.toml"),
+                        style.success("Valid")
+                    );
 
                     // Validate values
                     if config.compilation.confidence_threshold < 0.0
                         || config.compilation.confidence_threshold > 1.0
                     {
-                        println!("  ⚠ confidence_threshold should be between 0.0 and 1.0");
+                        println!(
+                            "  {} {} should be between 0.0 and 1.0",
+                            style.warning(style.symbols.warning),
+                            style.key("confidence_threshold")
+                        );
                         warnings += 1;
                     }
                     if config.transfer.compression_level > 19 {
-                        println!("  ⚠ compression_level should be 1-19");
+                        println!(
+                            "  {} {} should be 1-19",
+                            style.warning(style.symbols.warning),
+                            style.key("compression_level")
+                        );
                         warnings += 1;
                     }
                 }
                 Err(e) => {
-                    println!("✗ config.toml: Parse error - {}", e);
+                    println!(
+                        "{} {}: {} - {}",
+                        style.error(style.symbols.failure),
+                        style.highlight("config.toml"),
+                        style.error("Parse error"),
+                        style.muted(&e.to_string())
+                    );
                     errors += 1;
                 }
             },
             Err(e) => {
-                println!("✗ config.toml: Read error - {}", e);
+                println!(
+                    "{} {}: {} - {}",
+                    style.error(style.symbols.failure),
+                    style.highlight("config.toml"),
+                    style.error("Read error"),
+                    style.muted(&e.to_string())
+                );
                 errors += 1;
             }
         }
     } else {
-        println!("- config.toml: Not found (using defaults)");
+        println!(
+            "{} {}: {} {}",
+            style.muted("-"),
+            style.highlight("config.toml"),
+            style.muted("Not found"),
+            style.muted("(using defaults)")
+        );
     }
 
     // Check workers.toml
@@ -665,26 +791,56 @@ pub fn config_validate() -> Result<()> {
                         .and_then(|w| w.as_array())
                         .map(|a| a.len())
                         .unwrap_or(0);
-                    println!("✓ workers.toml: Valid ({} workers)", workers);
+                    println!(
+                        "{} {}: {} ({} workers)",
+                        style.success(style.symbols.success),
+                        style.highlight("workers.toml"),
+                        style.success("Valid"),
+                        workers
+                    );
 
                     if workers == 0 {
-                        println!("  ⚠ No workers defined");
+                        println!(
+                            "  {} No workers defined",
+                            style.warning(style.symbols.warning)
+                        );
                         warnings += 1;
                     }
                 }
                 Err(e) => {
-                    println!("✗ workers.toml: Parse error - {}", e);
+                    println!(
+                        "{} {}: {} - {}",
+                        style.error(style.symbols.failure),
+                        style.highlight("workers.toml"),
+                        style.error("Parse error"),
+                        style.muted(&e.to_string())
+                    );
                     errors += 1;
                 }
             },
             Err(e) => {
-                println!("✗ workers.toml: Read error - {}", e);
+                println!(
+                    "{} {}: {} - {}",
+                    style.error(style.symbols.failure),
+                    style.highlight("workers.toml"),
+                    style.error("Read error"),
+                    style.muted(&e.to_string())
+                );
                 errors += 1;
             }
         }
     } else {
-        println!("✗ workers.toml: Not found");
-        println!("  Run `rch config init` to create it");
+        println!(
+            "{} {}: {}",
+            style.error(style.symbols.failure),
+            style.highlight("workers.toml"),
+            style.error("Not found")
+        );
+        println!(
+            "  {} Run {} to create it",
+            style.info(style.symbols.info),
+            style.highlight("rch config init")
+        );
         errors += 1;
     }
 
@@ -693,14 +849,31 @@ pub fn config_validate() -> Result<()> {
     if project_config.exists() {
         match std::fs::read_to_string(&project_config) {
             Ok(content) => match toml::from_str::<RchConfig>(&content) {
-                Ok(_) => println!("✓ .rch/config.toml: Valid"),
+                Ok(_) => println!(
+                    "{} {}: {}",
+                    style.success(style.symbols.success),
+                    style.highlight(".rch/config.toml"),
+                    style.success("Valid")
+                ),
                 Err(e) => {
-                    println!("✗ .rch/config.toml: Parse error - {}", e);
+                    println!(
+                        "{} {}: {} - {}",
+                        style.error(style.symbols.failure),
+                        style.highlight(".rch/config.toml"),
+                        style.error("Parse error"),
+                        style.muted(&e.to_string())
+                    );
                     errors += 1;
                 }
             },
             Err(e) => {
-                println!("✗ .rch/config.toml: Read error - {}", e);
+                println!(
+                    "{} {}: {} - {}",
+                    style.error(style.symbols.failure),
+                    style.highlight(".rch/config.toml"),
+                    style.error("Read error"),
+                    style.muted(&e.to_string())
+                );
                 errors += 1;
             }
         }
@@ -709,13 +882,19 @@ pub fn config_validate() -> Result<()> {
     println!();
     if errors > 0 {
         println!(
-            "Validation failed: {} error(s), {} warning(s)",
-            errors, warnings
+            "{} {} error(s), {} warning(s)",
+            style.format_error("Validation failed:"),
+            errors,
+            warnings
         );
     } else if warnings > 0 {
-        println!("Validation passed with {} warning(s)", warnings);
+        println!(
+            "{} with {} warning(s)",
+            style.format_warning("Validation passed"),
+            warnings
+        );
     } else {
-        println!("Validation passed!");
+        println!("{}", style.format_success("Validation passed!"));
     }
 
     Ok(())
@@ -1040,23 +1219,41 @@ pub async fn hook_test() -> Result<()> {
 
 /// Show overall system status.
 pub async fn status_overview(show_workers: bool, show_jobs: bool) -> Result<()> {
-    println!("RCH Status");
-    println!("==========\n");
+    let style = terminal_style();
+
+    println!("{}", style.format_header("RCH Status"));
+    println!();
 
     // Daemon status
     let daemon_running = Path::new(DEFAULT_SOCKET_PATH).exists();
     println!(
-        "Daemon: {}",
-        if daemon_running { "Running" } else { "Stopped" }
+        "  {} {} {}",
+        style.key("Daemon"),
+        style.muted(":"),
+        if daemon_running {
+            style.success("Running")
+        } else {
+            style.error("Stopped")
+        }
     );
 
     // Worker count
     match load_workers_from_config() {
         Ok(workers) => {
-            println!("Workers: {} configured", workers.len());
+            println!(
+                "  {} {} {} configured",
+                style.key("Workers"),
+                style.muted(":"),
+                style.highlight(&workers.len().to_string())
+            );
         }
         Err(_) => {
-            println!("Workers: Not configured");
+            println!(
+                "  {} {} {}",
+                style.key("Workers"),
+                style.muted(":"),
+                style.warning("Not configured")
+            );
         }
     }
 
@@ -1076,48 +1273,54 @@ pub async fn status_overview(show_workers: bool, show_jobs: bool) -> Result<()> 
         .unwrap_or(false);
 
     println!(
-        "Hook: {}",
+        "  {} {} {}",
+        style.key("Hook"),
+        style.muted(":"),
         if hook_installed {
-            "Installed"
+            style.success("Installed")
         } else {
-            "Not installed"
+            style.warning("Not installed")
         }
     );
 
     if show_workers {
-        println!("\n--- Workers ---");
+        println!("\n{}", style.format_header("Workers"));
         let workers = load_workers_from_config().unwrap_or_default();
         if workers.is_empty() {
-            println!("  (none configured)");
+            println!("  {}", style.muted("(none configured)"));
         } else {
             for worker in &workers {
                 // Try to get status from daemon if running
                 let status = if daemon_running {
-                    "unknown" // Would need daemon API to get actual status
+                    style.muted("unknown")
                 } else {
-                    "daemon-offline"
+                    style.warning("daemon-offline")
                 };
                 println!(
-                    "  {} - {}@{} [{}]",
-                    worker.id, worker.user, worker.host, status
+                    "  {} {} {}@{} [{}]",
+                    style.symbols.bullet_filled,
+                    style.highlight(worker.id.as_str()),
+                    style.muted(&worker.user),
+                    style.info(&worker.host),
+                    status
                 );
             }
         }
     }
 
     if show_jobs {
-        println!("\n--- Active Jobs ---");
+        println!("\n{}", style.format_header("Active Jobs"));
         if daemon_running {
             match send_daemon_command("GET /jobs\n").await {
                 Ok(response) if !response.trim().is_empty() => {
                     println!("{}", response);
                 }
                 _ => {
-                    println!("  (no active jobs)");
+                    println!("  {}", style.muted("(no active jobs)"));
                 }
             }
         } else {
-            println!("  (daemon not running)");
+            println!("  {}", style.muted("(daemon not running)"));
         }
     }
 
