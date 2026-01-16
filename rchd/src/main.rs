@@ -7,6 +7,7 @@
 
 mod api;
 mod config;
+mod health;
 mod selection;
 mod workers;
 
@@ -76,6 +77,12 @@ async fn main() -> Result<()> {
     // Create Unix socket listener
     let listener = UnixListener::bind(&cli.socket)?;
     info!("Listening on {:?}", cli.socket);
+
+    // Start health monitor
+    let health_config = health::HealthConfig::default();
+    let health_monitor = health::HealthMonitor::new(worker_pool.clone(), health_config);
+    let _health_handle = health_monitor.start();
+    info!("Health monitor started");
 
     // Main accept loop
     loop {
