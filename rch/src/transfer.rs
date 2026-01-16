@@ -4,6 +4,7 @@
 //! commands, and retrieving build artifacts.
 
 use anyhow::{Context, Result, bail};
+use rch_common::mock::{self, MockConfig, MockRsync, MockRsyncConfig, MockSshClient};
 use rch_common::{CommandResult, SshClient, SshOptions, TransferConfig, WorkerConfig};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -45,6 +46,7 @@ impl TransferPipeline {
     }
 
     /// Set custom SSH options.
+    #[allow(dead_code)] // Reserved for future CLI/config support
     pub fn with_ssh_options(mut self, options: SshOptions) -> Self {
         self.ssh_options = options;
         self
@@ -59,6 +61,22 @@ impl TransferPipeline {
     pub async fn sync_to_remote(&self, worker: &WorkerConfig) -> Result<SyncResult> {
         let remote_path = self.remote_path();
         let destination = format!("{}@{}:{}", worker.user, worker.host, remote_path);
+
+        if mock::is_mock_enabled() {
+            let rsync = MockRsync::new(MockRsyncConfig::from_env());
+            let result = rsync
+                .sync_to_remote(
+                    &self.project_root.display().to_string(),
+                    &destination,
+                    &self.transfer_config.exclude_patterns,
+                )
+                .await?;
+            return Ok(SyncResult {
+                bytes_transferred: result.bytes_transferred,
+                files_transferred: result.files_transferred,
+                duration_ms: result.duration_ms,
+            });
+        }
 
         info!(
             "Syncing {} -> {} on {}",
@@ -128,6 +146,7 @@ impl TransferPipeline {
     }
 
     /// Execute a compilation command on the remote worker.
+    #[allow(dead_code)] // Reserved for future usage
     pub async fn execute_remote(
         &self,
         worker: &WorkerConfig,
@@ -137,6 +156,14 @@ impl TransferPipeline {
 
         // Wrap command to run in project directory
         let wrapped_command = format!("cd {} && {}", remote_path, command);
+
+        if mock::is_mock_enabled() {
+            let mut client = MockSshClient::new(worker.clone(), MockConfig::from_env());
+            client.connect().await?;
+            let result = client.execute(&wrapped_command).await?;
+            client.disconnect().await?;
+            return Ok(result);
+        }
 
         info!("Executing on {}: {}", worker.id, command);
 
@@ -174,6 +201,16 @@ impl TransferPipeline {
         let remote_path = self.remote_path();
         let wrapped_command = format!("cd {} && {}", remote_path, command);
 
+        if mock::is_mock_enabled() {
+            let mut client = MockSshClient::new(worker.clone(), MockConfig::from_env());
+            client.connect().await?;
+            let result = client
+                .execute_streaming(&wrapped_command, on_stdout, on_stderr)
+                .await?;
+            client.disconnect().await?;
+            return Ok(result);
+        }
+
         let mut client = SshClient::new(worker.clone(), self.ssh_options.clone());
         client.connect().await?;
 
@@ -193,6 +230,22 @@ impl TransferPipeline {
         artifact_patterns: &[String],
     ) -> Result<SyncResult> {
         let remote_path = self.remote_path();
+
+        if mock::is_mock_enabled() {
+            let rsync = MockRsync::new(MockRsyncConfig::from_env());
+            let result = rsync
+                .retrieve_artifacts(
+                    &format!("{}@{}:{}/", worker.user, worker.host, remote_path),
+                    &self.project_root.display().to_string(),
+                    artifact_patterns,
+                )
+                .await?;
+            return Ok(SyncResult {
+                bytes_transferred: result.bytes_transferred,
+                files_transferred: result.files_transferred,
+                duration_ms: result.duration_ms,
+            });
+        }
 
         info!("Retrieving artifacts from {} on {}", remote_path, worker.id);
 
@@ -254,8 +307,14 @@ impl TransferPipeline {
     }
 
     /// Clean up remote project directory.
+    #[allow(dead_code)] // Reserved for future cleanup routines
     pub async fn cleanup_remote(&self, worker: &WorkerConfig) -> Result<()> {
         let remote_path = self.remote_path();
+
+        if mock::is_mock_enabled() {
+            debug!("Mock cleanup of {} on {}", remote_path, worker.id);
+            return Ok(());
+        }
 
         info!("Cleaning up {} on {}", remote_path, worker.id);
 

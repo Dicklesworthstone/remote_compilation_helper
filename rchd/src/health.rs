@@ -3,6 +3,7 @@
 //! Periodically checks worker availability and updates their status.
 
 use crate::workers::{WorkerPool, WorkerState};
+use rch_common::mock::{self, MockConfig, MockSshClient};
 use rch_common::{SshClient, SshOptions, WorkerStatus};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -250,6 +251,31 @@ async fn check_worker_health(
 ) -> HealthCheckResult {
     let start = Instant::now();
 
+    if mock::is_mock_enabled() {
+        let mut client = MockSshClient::new(worker.config.clone(), MockConfig::from_env());
+        match client.connect().await {
+            Ok(()) => match client.execute("echo health_check").await {
+                Ok(result) => {
+                    let duration = start.elapsed();
+                    let _ = client.disconnect().await;
+                    if result.success() && result.stdout.trim() == "health_check" {
+                        return HealthCheckResult::success(duration.as_millis() as u64);
+                    }
+                    return HealthCheckResult::failure(format!(
+                        "Unexpected response: exit={}, stdout={}",
+                        result.exit_code,
+                        result.stdout.trim()
+                    ));
+                }
+                Err(e) => {
+                    let _ = client.disconnect().await;
+                    return HealthCheckResult::failure(format!("Command failed: {}", e));
+                }
+            },
+            Err(e) => return HealthCheckResult::failure(format!("Connection failed: {}", e)),
+        }
+    }
+
     // Create SSH connection with timeout
     let ssh_options = SshOptions {
         connect_timeout: config.check_timeout,
@@ -300,6 +326,33 @@ pub async fn probe_worker(worker: &WorkerState) -> HealthCheckResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rch_common::mock::{
+        MockConfig, clear_mock_overrides, set_mock_enabled_override, set_mock_ssh_config_override,
+    };
+    use rch_common::{WorkerConfig, WorkerId};
+    use std::sync::OnceLock;
+    use tokio::sync::Mutex;
+
+    fn test_lock() -> &'static Mutex<()> {
+        static ENV_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+        ENV_MUTEX.get_or_init(|| Mutex::new(()))
+    }
+
+    struct MockOverrideGuard;
+
+    impl MockOverrideGuard {
+        fn set_failure() -> Self {
+            set_mock_enabled_override(Some(true));
+            set_mock_ssh_config_override(Some(MockConfig::connection_failure()));
+            Self
+        }
+    }
+
+    impl Drop for MockOverrideGuard {
+        fn drop(&mut self) {
+            clear_mock_overrides();
+        }
+    }
 
     #[test]
     fn test_health_config_default() {
@@ -381,5 +434,24 @@ mod tests {
         health.update(result, &config);
         assert_eq!(health.status(), WorkerStatus::Healthy);
         assert_eq!(health.consecutive_failures, 0);
+    }
+
+    #[tokio::test]
+    async fn test_check_worker_health_mock_failure() {
+        let _lock = test_lock().lock().await;
+        let _overrides = MockOverrideGuard::set_failure();
+
+        let worker = WorkerState::new(WorkerConfig {
+            id: WorkerId::new("mock-fail"),
+            host: "mock.host".to_string(),
+            user: "mockuser".to_string(),
+            identity_file: "~/.ssh/mock".to_string(),
+            total_slots: 4,
+            priority: 100,
+            tags: vec![],
+        });
+
+        let result = check_worker_health(&Arc::new(worker), &HealthConfig::default()).await;
+        assert!(!result.healthy);
     }
 }

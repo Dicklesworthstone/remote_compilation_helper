@@ -4,6 +4,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod mock;
 pub mod patterns;
 pub mod protocol;
 pub mod ssh;

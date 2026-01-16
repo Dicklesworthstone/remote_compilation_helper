@@ -341,8 +341,66 @@ async fn execute_remote_compilation(
 mod tests {
     use super::*;
     use rch_common::ToolInput;
+    use rch_common::mock::{
+        self, MockConfig, MockRsyncConfig, Phase, clear_mock_overrides, set_mock_enabled_override,
+        set_mock_rsync_config_override, set_mock_ssh_config_override,
+    };
+    use std::sync::OnceLock;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
     use tokio::net::UnixListener;
+    use tokio::sync::Mutex;
+
+    fn test_lock() -> &'static Mutex<()> {
+        static ENV_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+        ENV_MUTEX.get_or_init(|| Mutex::new(()))
+    }
+
+    struct TestOverridesGuard;
+
+    impl TestOverridesGuard {
+        fn set(socket_path: &str, ssh_config: MockConfig, rsync_config: MockRsyncConfig) -> Self {
+            let mut config = rch_common::RchConfig::default();
+            config.general.socket_path = socket_path.to_string();
+            crate::config::set_test_config_override(Some(config));
+
+            set_mock_enabled_override(Some(true));
+            set_mock_ssh_config_override(Some(ssh_config));
+            set_mock_rsync_config_override(Some(rsync_config));
+
+            Self
+        }
+    }
+
+    impl Drop for TestOverridesGuard {
+        fn drop(&mut self) {
+            crate::config::set_test_config_override(None);
+            clear_mock_overrides();
+        }
+    }
+
+    async fn spawn_mock_daemon(socket_path: &str, response: SelectionResponse) {
+        let _ = std::fs::remove_file(socket_path);
+        let listener = UnixListener::bind(socket_path).expect("Failed to bind mock socket");
+
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("Accept failed");
+            let (reader, mut writer) = stream.into_split();
+            let mut buf_reader = TokioBufReader::new(reader);
+
+            let mut request_line = String::new();
+            buf_reader
+                .read_line(&mut request_line)
+                .await
+                .expect("Failed to read request");
+
+            let body = serde_json::to_string(&response).expect("Serialize response");
+            let http = format!("HTTP/1.1 200 OK\r\n\r\n{}", body);
+            writer
+                .write_all(http.as_bytes())
+                .await
+                .expect("Write response");
+        });
+    }
 
     #[tokio::test]
     async fn test_non_bash_allowed() {
@@ -537,7 +595,10 @@ mod tests {
         // Spawn mock daemon handler
         let socket_path_clone = socket_path.clone();
         let daemon_handle = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("Failed to accept connection");
+            let (stream, _) = listener
+                .accept()
+                .await
+                .expect("Failed to accept connection");
             let (reader, mut writer) = stream.into_split();
             let mut buf_reader = TokioBufReader::new(reader);
 
@@ -601,7 +662,10 @@ mod tests {
 
         let socket_path_clone = socket_path.clone();
         let daemon_handle = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("Failed to accept connection");
+            let (stream, _) = listener
+                .accept()
+                .await
+                .expect("Failed to accept connection");
             let (reader, mut writer) = stream.into_split();
             let mut buf_reader = TokioBufReader::new(reader);
 
@@ -677,6 +741,159 @@ mod tests {
         let output = process_hook(input).await;
         // Should allow because daemon isn't running (fail-open)
         assert!(output.is_allow());
+    }
+
+    #[tokio::test]
+    async fn test_process_hook_remote_success_mocked() {
+        let _lock = test_lock().lock().await;
+        let socket_path = format!(
+            "/tmp/rch_test_hook_success_{}_{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+
+        let _overrides = TestOverridesGuard::set(
+            &socket_path,
+            MockConfig::default(),
+            MockRsyncConfig::success(),
+        );
+        mock::clear_global_invocations();
+
+        let response = SelectionResponse {
+            worker: rch_common::WorkerId::new("mock-worker"),
+            host: "mock.host.local".to_string(),
+            user: "mockuser".to_string(),
+            identity_file: "~/.ssh/mock_key".to_string(),
+            slots_available: 8,
+            speed_score: 90.0,
+        };
+        spawn_mock_daemon(&socket_path, response).await;
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
+
+        let input = HookInput {
+            tool_name: "Bash".to_string(),
+            tool_input: ToolInput {
+                command: "cargo build".to_string(),
+                description: None,
+            },
+            session_id: None,
+        };
+
+        let output = process_hook(input).await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        assert!(!output.is_allow());
+
+        let rsync_logs = mock::global_rsync_invocations_snapshot();
+        let ssh_logs = mock::global_ssh_invocations_snapshot();
+
+        assert!(rsync_logs.iter().any(|i| i.phase == Phase::Sync));
+        assert!(rsync_logs.iter().any(|i| i.phase == Phase::Artifacts));
+        assert!(ssh_logs.iter().any(|i| i.phase == Phase::Execute));
+    }
+
+    #[tokio::test]
+    async fn test_process_hook_remote_sync_failure_allows() {
+        let _lock = test_lock().lock().await;
+        let socket_path = format!(
+            "/tmp/rch_test_hook_sync_fail_{}_{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+
+        let _overrides = TestOverridesGuard::set(
+            &socket_path,
+            MockConfig::default(),
+            MockRsyncConfig::sync_failure(),
+        );
+        mock::clear_global_invocations();
+
+        let response = SelectionResponse {
+            worker: rch_common::WorkerId::new("mock-worker"),
+            host: "mock.host.local".to_string(),
+            user: "mockuser".to_string(),
+            identity_file: "~/.ssh/mock_key".to_string(),
+            slots_available: 8,
+            speed_score: 90.0,
+        };
+        spawn_mock_daemon(&socket_path, response).await;
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
+
+        let input = HookInput {
+            tool_name: "Bash".to_string(),
+            tool_input: ToolInput {
+                command: "cargo build".to_string(),
+                description: None,
+            },
+            session_id: None,
+        };
+
+        let output = process_hook(input).await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        assert!(output.is_allow());
+
+        let rsync_logs = mock::global_rsync_invocations_snapshot();
+        let ssh_logs = mock::global_ssh_invocations_snapshot();
+        assert!(rsync_logs.iter().any(|i| i.phase == Phase::Sync));
+        assert!(ssh_logs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_process_hook_remote_nonzero_exit_denies() {
+        let _lock = test_lock().lock().await;
+        let socket_path = format!(
+            "/tmp/rch_test_hook_exit_nonzero_{}_{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+
+        let _overrides = TestOverridesGuard::set(
+            &socket_path,
+            MockConfig {
+                default_exit_code: 2,
+                ..MockConfig::default()
+            },
+            MockRsyncConfig::success(),
+        );
+        mock::clear_global_invocations();
+
+        let response = SelectionResponse {
+            worker: rch_common::WorkerId::new("mock-worker"),
+            host: "mock.host.local".to_string(),
+            user: "mockuser".to_string(),
+            identity_file: "~/.ssh/mock_key".to_string(),
+            slots_available: 8,
+            speed_score: 90.0,
+        };
+        spawn_mock_daemon(&socket_path, response).await;
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
+
+        let input = HookInput {
+            tool_name: "Bash".to_string(),
+            tool_input: ToolInput {
+                command: "cargo build".to_string(),
+                description: None,
+            },
+            session_id: None,
+        };
+
+        let output = process_hook(input).await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        assert!(!output.is_allow());
     }
 
     #[test]

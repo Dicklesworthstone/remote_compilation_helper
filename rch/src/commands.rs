@@ -41,8 +41,8 @@ pub fn load_workers_from_config() -> Result<Vec<WorkerConfig>> {
         .with_context(|| format!("Failed to read {:?}", config_path))?;
 
     // Parse the TOML - expect [[workers]] array
-    let parsed: toml::Value = toml::from_str(&contents)
-        .with_context(|| format!("Failed to parse {:?}", config_path))?;
+    let parsed: toml::Value =
+        toml::from_str(&contents).with_context(|| format!("Failed to parse {:?}", config_path))?;
 
     let empty_array = vec![];
     let workers_array = parsed
@@ -52,7 +52,10 @@ pub fn load_workers_from_config() -> Result<Vec<WorkerConfig>> {
 
     let mut workers = Vec::new();
     for entry in workers_array {
-        let enabled = entry.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+        let enabled = entry
+            .get("enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
         if !enabled {
             continue;
         }
@@ -118,10 +121,7 @@ pub fn workers_list() -> Result<()> {
     println!();
 
     for worker in &workers {
-        println!(
-            "  {} - {}@{}",
-            worker.id, worker.user, worker.host
-        );
+        println!("  {} - {}@{}", worker.id, worker.user, worker.host);
         println!(
             "    Slots: {}, Priority: {}",
             worker.total_slots, worker.priority
@@ -147,10 +147,7 @@ pub async fn workers_probe(worker_id: Option<String>, all: bool) -> Result<()> {
     let targets: Vec<&WorkerConfig> = if all {
         workers.iter().collect()
     } else if let Some(id) = &worker_id {
-        workers
-            .iter()
-            .filter(|w| w.id.as_str() == id)
-            .collect()
+        workers.iter().filter(|w| w.id.as_str() == id).collect()
     } else {
         println!("Specify a worker ID or use --all to probe all workers.");
         return Ok(());
@@ -228,11 +225,7 @@ pub async fn workers_benchmark() -> Result<()> {
 
                 match result {
                     Ok(r) if r.success() => {
-                        println!(
-                            "✓ {}ms total, exit={}",
-                            duration.as_millis(),
-                            r.exit_code
-                        );
+                        println!("✓ {}ms total, exit={}", duration.as_millis(), r.exit_code);
                     }
                     Ok(r) => {
                         println!("✗ Failed (exit={})", r.exit_code);
@@ -416,11 +409,7 @@ pub async fn daemon_stop() -> Result<()> {
             println!("Attempting to find and kill daemon process...");
 
             // Try pkill
-            let output = Command::new("pkill")
-                .arg("-f")
-                .arg("rchd")
-                .output()
-                .await;
+            let output = Command::new("pkill").arg("-f").arg("rchd").output().await;
 
             match output {
                 Ok(o) if o.status.success() => {
@@ -453,7 +442,9 @@ pub fn daemon_logs(lines: usize) -> Result<()> {
     // Try common log locations
     let log_paths = vec![
         PathBuf::from("/tmp/rchd.log"),
-        config_dir().map(|d| d.join("daemon.log")).unwrap_or_default(),
+        config_dir()
+            .map(|d| d.join("daemon.log"))
+            .unwrap_or_default(),
         dirs::cache_dir()
             .map(|d| d.join("rch").join("daemon.log"))
             .unwrap_or_default(),
@@ -641,9 +632,7 @@ pub fn config_validate() -> Result<()> {
                     if config.compilation.confidence_threshold < 0.0
                         || config.compilation.confidence_threshold > 1.0
                     {
-                        println!(
-                            "  ⚠ confidence_threshold should be between 0.0 and 1.0"
-                        );
+                        println!("  ⚠ confidence_threshold should be between 0.0 and 1.0");
                         warnings += 1;
                     }
                     if config.transfer.compression_level > 19 {
@@ -719,7 +708,10 @@ pub fn config_validate() -> Result<()> {
 
     println!();
     if errors > 0 {
-        println!("Validation failed: {} error(s), {} warning(s)", errors, warnings);
+        println!(
+            "Validation failed: {} error(s), {} warning(s)",
+            errors, warnings
+        );
     } else if warnings > 0 {
         println!("Validation passed with {} warning(s)", warnings);
     } else {
@@ -756,8 +748,7 @@ pub fn hook_install() -> Result<()> {
     println!("Installing RCH hook for Claude Code...\n");
 
     // Find the rch binary path
-    let rch_path = std::env::current_exe()
-        .unwrap_or_else(|_| PathBuf::from("rch"));
+    let rch_path = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("rch"));
 
     // Create or update settings.json
     let mut settings: serde_json::Value = if settings_path.exists() {
@@ -775,9 +766,7 @@ pub fn hook_install() -> Result<()> {
         .entry("hooks")
         .or_insert(serde_json::json!({}));
 
-    let hooks_obj = hooks
-        .as_object_mut()
-        .context("Hooks must be an object")?;
+    let hooks_obj = hooks.as_object_mut().context("Hooks must be an object")?;
 
     // Add PreToolUse hook for Bash
     hooks_obj.insert(
@@ -1029,10 +1018,7 @@ fn which_rchd() -> PathBuf {
     }
 
     // Check PATH
-    if let Ok(output) = std::process::Command::new("which")
-        .arg("rchd")
-        .output()
-    {
+    if let Ok(output) = std::process::Command::new("which").arg("rchd").output() {
         if output.status.success() {
             let path = String::from_utf8_lossy(&output.stdout);
             return PathBuf::from(path.trim());
@@ -1102,7 +1088,10 @@ enabled = true
 
         let entry = &workers_array[0];
         assert_eq!(entry.get("id").unwrap().as_str().unwrap(), "test-worker");
-        assert_eq!(entry.get("host").unwrap().as_str().unwrap(), "192.168.1.100");
+        assert_eq!(
+            entry.get("host").unwrap().as_str().unwrap(),
+            "192.168.1.100"
+        );
         assert_eq!(entry.get("total_slots").unwrap().as_integer().unwrap(), 8);
     }
 
@@ -1136,7 +1125,7 @@ total_slots = 32
 
         // Check that worker2 is disabled
         let worker2 = &workers_array[1];
-        assert_eq!(worker2.get("enabled").unwrap().as_bool().unwrap(), false);
+        assert!(!worker2.get("enabled").unwrap().as_bool().unwrap());
     }
 
     #[test]
@@ -1227,7 +1216,10 @@ enabled = true
         let entry = &parsed.get("workers").unwrap().as_array().unwrap()[0];
 
         // Simulate the conversion logic from load_workers_from_config
-        let id = entry.get("id").and_then(|v| v.as_str()).unwrap_or("unknown");
+        let id = entry
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
         let host = entry
             .get("host")
             .and_then(|v| v.as_str())

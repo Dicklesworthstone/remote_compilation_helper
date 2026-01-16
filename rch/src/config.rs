@@ -7,6 +7,20 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tracing::debug;
 
+#[cfg(test)]
+use std::sync::{Mutex, OnceLock};
+
+#[cfg(test)]
+fn test_config_override() -> &'static Mutex<Option<RchConfig>> {
+    static OVERRIDE: OnceLock<Mutex<Option<RchConfig>>> = OnceLock::new();
+    OVERRIDE.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+pub fn set_test_config_override(config: Option<RchConfig>) {
+    *test_config_override().lock().unwrap() = config;
+}
+
 /// Get the user config directory.
 pub fn config_dir() -> Option<PathBuf> {
     ProjectDirs::from("com", "rch", "rch").map(|dirs| dirs.config_dir().to_path_buf())
@@ -14,6 +28,11 @@ pub fn config_dir() -> Option<PathBuf> {
 
 /// Load configuration from all sources.
 pub fn load_config() -> Result<RchConfig> {
+    #[cfg(test)]
+    if let Some(config) = test_config_override().lock().unwrap().clone() {
+        return Ok(config);
+    }
+
     // Start with defaults
     let mut config = RchConfig::default();
 
@@ -140,6 +159,7 @@ fn default_true() -> bool {
 }
 
 /// Load workers configuration from file.
+#[allow(dead_code)] // Scaffolded for future CLI usage
 pub fn load_workers_config(path: Option<&Path>) -> Result<WorkersConfig> {
     let config_path = match path {
         Some(p) => p.to_path_buf(),
@@ -166,6 +186,7 @@ pub fn load_workers_config(path: Option<&Path>) -> Result<WorkersConfig> {
 }
 
 /// Generate an example project config.
+#[allow(dead_code)] // Used by future CLI scaffolding
 pub fn example_project_config() -> String {
     r#"# RCH Project Configuration
 # Place this file at .rch/config.toml in your project root
@@ -197,6 +218,7 @@ exclude_patterns = [
 }
 
 /// Generate an example workers config.
+#[allow(dead_code)] // Used by future CLI scaffolding
 pub fn example_workers_config() -> String {
     r#"# RCH Workers Configuration
 # Place this file at ~/.config/rch/workers.toml
@@ -225,6 +247,7 @@ enabled = true
 }
 
 /// Validate a config file.
+#[allow(dead_code)] // Used by future CLI scaffolding
 pub fn validate_config(path: &Path) -> Result<()> {
     let contents = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read config from {:?}", path))?;
@@ -263,6 +286,7 @@ mod tests {
     #[test]
     fn test_example_workers_config_valid() {
         let toml_str = example_workers_config();
-        let _: WorkersConfig = toml::from_str(&toml_str).expect("Example workers config should parse");
+        let _: WorkersConfig =
+            toml::from_str(&toml_str).expect("Example workers config should parse");
     }
 }

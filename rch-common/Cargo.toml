@@ -15,6 +15,7 @@ tracing = { workspace = true }
 tokio = { workspace = true }
 openssh = { workspace = true }
 anyhow = { workspace = true }
+chrono = { workspace = true }
 shellexpand = "3.1"
 
 [lints.rust]

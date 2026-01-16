@@ -41,6 +41,9 @@ blake3 = "1.5"
 # Compression
 zstd = "0.13"
 
+# Time formatting for mock transport logging
+chrono = "0.4"
+
 # SSH
 openssh = "0.11"
 

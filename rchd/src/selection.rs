@@ -81,8 +81,8 @@ fn compute_score(
 mod tests {
     use super::*;
     use crate::workers::WorkerState;
-    use rch_common::{WorkerConfig, WorkerId};
     use rch_common::WorkerStatus;
+    use rch_common::{WorkerConfig, WorkerId};
 
     fn make_worker(id: &str, total_slots: u32, speed: f64) -> WorkerState {
         let config = WorkerConfig {
@@ -141,8 +141,7 @@ mod tests {
     #[tokio::test]
     async fn test_select_worker_respects_slot_availability() {
         let pool = WorkerPool::new();
-        pool.add_worker(make_worker("full", 4, 70.0).config)
-            .await;
+        pool.add_worker(make_worker("full", 4, 70.0).config).await;
         pool.add_worker(make_worker("available", 8, 50.0).config)
             .await;
 
