@@ -25,5 +25,8 @@ shellexpand = "3.1"
 dirs = "5"
 urlencoding = "2"
 
+[dev-dependencies]
+tempfile = "3"
+
 [lints.rust]
 unsafe_code = "forbid"

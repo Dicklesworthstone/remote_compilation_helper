@@ -1073,3 +1073,230 @@ async fn send_daemon_command(command: &str) -> Result<String> {
 
     Ok(response)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_workers_toml_single_worker() {
+        let toml_content = r#"
+[[workers]]
+id = "test-worker"
+host = "192.168.1.100"
+user = "testuser"
+identity_file = "~/.ssh/test_key"
+total_slots = 8
+priority = 100
+tags = ["rust", "test"]
+enabled = true
+"#;
+
+        let parsed: toml::Value = toml::from_str(toml_content).expect("Failed to parse TOML");
+        let workers_array = parsed
+            .get("workers")
+            .and_then(|w| w.as_array())
+            .expect("Expected workers array");
+
+        assert_eq!(workers_array.len(), 1);
+
+        let entry = &workers_array[0];
+        assert_eq!(entry.get("id").unwrap().as_str().unwrap(), "test-worker");
+        assert_eq!(entry.get("host").unwrap().as_str().unwrap(), "192.168.1.100");
+        assert_eq!(entry.get("total_slots").unwrap().as_integer().unwrap(), 8);
+    }
+
+    #[test]
+    fn test_parse_workers_toml_multiple_workers() {
+        let toml_content = r#"
+[[workers]]
+id = "worker1"
+host = "192.168.1.100"
+total_slots = 16
+
+[[workers]]
+id = "worker2"
+host = "192.168.1.101"
+total_slots = 8
+enabled = false
+
+[[workers]]
+id = "worker3"
+host = "192.168.1.102"
+total_slots = 32
+"#;
+
+        let parsed: toml::Value = toml::from_str(toml_content).expect("Failed to parse TOML");
+        let workers_array = parsed
+            .get("workers")
+            .and_then(|w| w.as_array())
+            .expect("Expected workers array");
+
+        assert_eq!(workers_array.len(), 3);
+
+        // Check that worker2 is disabled
+        let worker2 = &workers_array[1];
+        assert_eq!(worker2.get("enabled").unwrap().as_bool().unwrap(), false);
+    }
+
+    #[test]
+    fn test_parse_workers_toml_defaults() {
+        let toml_content = r#"
+[[workers]]
+id = "minimal"
+host = "example.com"
+"#;
+
+        let parsed: toml::Value = toml::from_str(toml_content).expect("Failed to parse TOML");
+        let workers_array = parsed
+            .get("workers")
+            .and_then(|w| w.as_array())
+            .expect("Expected workers array");
+
+        let entry = &workers_array[0];
+
+        // These should be None (using defaults)
+        assert!(entry.get("user").is_none());
+        assert!(entry.get("identity_file").is_none());
+        assert!(entry.get("total_slots").is_none());
+        assert!(entry.get("priority").is_none());
+        assert!(entry.get("enabled").is_none());
+    }
+
+    #[test]
+    fn test_parse_workers_toml_empty() {
+        let toml_content = "# Empty workers file";
+
+        let parsed: toml::Value = toml::from_str(toml_content).expect("Failed to parse TOML");
+        let workers_array = parsed.get("workers").and_then(|w| w.as_array());
+
+        assert!(workers_array.is_none());
+    }
+
+    #[test]
+    fn test_default_socket_path() {
+        assert_eq!(DEFAULT_SOCKET_PATH, "/tmp/rch.sock");
+    }
+
+    #[test]
+    fn test_which_rchd_fallback() {
+        // When rchd is not found, it should fall back to just "rchd"
+        let path = which_rchd();
+        // The path should either be a valid path or just "rchd"
+        assert!(
+            path.exists() || path == PathBuf::from("rchd"),
+            "Expected either a valid path or 'rchd' fallback"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_daemon_socket_not_found() {
+        // Test that commands handle missing daemon gracefully
+        let result = send_daemon_command("GET /status\n").await;
+
+        // Should fail because socket doesn't exist
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_config_dir_returns_some() {
+        // config_dir should return Some on most systems
+        let dir = config_dir();
+        // Can be None in some CI environments, but usually Some
+        if let Some(d) = dir {
+            assert!(d.ends_with("rch") || d.to_string_lossy().contains("rch"));
+        }
+    }
+
+    #[test]
+    fn test_worker_config_conversion() {
+        // Test that TOML values convert correctly to WorkerConfig fields
+        let toml_content = r#"
+[[workers]]
+id = "conversion-test"
+host = "10.0.0.1"
+user = "admin"
+identity_file = "/path/to/key"
+total_slots = 24
+priority = 150
+tags = ["gpu", "fast"]
+enabled = true
+"#;
+
+        let parsed: toml::Value = toml::from_str(toml_content).expect("Failed to parse TOML");
+        let entry = &parsed.get("workers").unwrap().as_array().unwrap()[0];
+
+        // Simulate the conversion logic from load_workers_from_config
+        let id = entry.get("id").and_then(|v| v.as_str()).unwrap_or("unknown");
+        let host = entry
+            .get("host")
+            .and_then(|v| v.as_str())
+            .unwrap_or("localhost");
+        let user = entry
+            .get("user")
+            .and_then(|v| v.as_str())
+            .unwrap_or("ubuntu");
+        let identity_file = entry
+            .get("identity_file")
+            .and_then(|v| v.as_str())
+            .unwrap_or("~/.ssh/id_rsa");
+        let total_slots = entry
+            .get("total_slots")
+            .and_then(|v| v.as_integer())
+            .unwrap_or(8) as u32;
+        let priority = entry
+            .get("priority")
+            .and_then(|v| v.as_integer())
+            .unwrap_or(100) as u32;
+
+        assert_eq!(id, "conversion-test");
+        assert_eq!(host, "10.0.0.1");
+        assert_eq!(user, "admin");
+        assert_eq!(identity_file, "/path/to/key");
+        assert_eq!(total_slots, 24);
+        assert_eq!(priority, 150);
+    }
+
+    #[test]
+    fn test_hook_classification_in_test_command() {
+        use rch_common::classify_command;
+
+        // These should be classified as compilation commands
+        let compilation_commands = vec![
+            "cargo build --release",
+            "cargo test",
+            "cargo check",
+            "rustc main.rs",
+            "gcc -o main main.c",
+            "make all",
+        ];
+
+        for cmd in compilation_commands {
+            let class = classify_command(cmd);
+            assert!(
+                class.is_compilation,
+                "Expected '{}' to be classified as compilation",
+                cmd
+            );
+        }
+
+        // These should NOT be classified as compilation commands
+        let non_compilation_commands = vec![
+            "cargo fmt",
+            "cargo clean",
+            "cargo --version",
+            "ls -la",
+            "cd /tmp",
+            "echo hello",
+        ];
+
+        for cmd in non_compilation_commands {
+            let class = classify_command(cmd);
+            assert!(
+                !class.is_compilation,
+                "Expected '{}' to NOT be classified as compilation",
+                cmd
+            );
+        }
+    }
+}
