@@ -121,7 +121,7 @@ id = "mock-worker"
 host = "mock.host"
 user = "mockuser"
 identity_file = "~/.ssh/mock"
-total_slots = 8
+total_slots = 64
 priority = 100
 enabled = true
 EOF
@@ -153,11 +153,20 @@ start_daemon() {
     DAEMON_LOG="$LOG_DIR/rchd.log"
 
     log "INFO" "DAEMON" "Starting rchd (socket: $SOCKET_PATH)"
-    "$PROJECT_ROOT/target/debug/rchd" \
-        --socket "$SOCKET_PATH" \
-        --workers-config "$WORKERS_FILE" \
-        --foreground \
-        >>"$DAEMON_LOG" 2>&1 &
+    if [[ "$MODE" == "mock" ]]; then
+        env RCH_MOCK_SSH=1 RCH_MOCK_SSH_STDOUT=health_check \
+            "$PROJECT_ROOT/target/debug/rchd" \
+            --socket "$SOCKET_PATH" \
+            --workers-config "$WORKERS_FILE" \
+            --foreground \
+            >>"$DAEMON_LOG" 2>&1 &
+    else
+        "$PROJECT_ROOT/target/debug/rchd" \
+            --socket "$SOCKET_PATH" \
+            --workers-config "$WORKERS_FILE" \
+            --foreground \
+            >>"$DAEMON_LOG" 2>&1 &
+    fi
     RCHD_PID=$!
 
     local waited=0
@@ -197,7 +206,7 @@ run_hook() {
     local hook_err="$LOG_DIR/hook_${scenario}.err"
     local env_args=("$@")
 
-    log "INFO" "HOOK" "Running hook ($scenario)"
+    log "INFO" "HOOK" "Running hook ($scenario)" >&2
     (
         cd "$PROJECT_DIR"
         printf '%s\n' "$(hook_json)" | \
@@ -219,7 +228,15 @@ check_artifacts_real() {
 
 check_artifacts_mock() {
     local hook_err="$1"
-    /bin/grep -q "Artifacts retrieved" "$hook_err"
+    local hook_out="${hook_err%.err}.out"
+    /bin/grep -q "Artifacts retrieved" "$hook_err" || /bin/grep -q "Artifacts retrieved" "$hook_out"
+}
+
+check_artifacts_mock_failure() {
+    local hook_err="$1"
+    local hook_out="${hook_err%.err}.out"
+    /bin/grep -q "Failed to retrieve artifacts" "$hook_err" || \
+        /bin/grep -q "Failed to retrieve artifacts" "$hook_out"
 }
 
 run_scenario() {
@@ -259,12 +276,21 @@ run_scenario() {
         fi
     fi
 
-    if [[ "$MODE" == "mock" && "$expect" == "deny" && "$fail" != "sync" && "$fail" != "exec" && "$fail" != "worker-down" ]]; then
-        if check_artifacts_mock "$LOG_DIR/hook_${scenario}.err"; then
-            log "INFO" "ARTIFACTS" "$scenario artifact phase logged"
+    if [[ "$MODE" == "mock" && "$expect" == "deny" && "$fail" != "sync" && "$fail" != "exec" && "$fail" != "worker-down" && "$fail" != "remote-exit" ]]; then
+        if [[ "$fail" == "artifacts" ]]; then
+            if check_artifacts_mock_failure "$LOG_DIR/hook_${scenario}.err"; then
+                log "INFO" "ARTIFACTS" "$scenario artifact failure logged"
+            else
+                log "FAIL" "ARTIFACTS" "$scenario artifact failure missing"
+                return 1
+            fi
         else
-            log "FAIL" "ARTIFACTS" "$scenario artifact phase missing"
-            return 1
+            if check_artifacts_mock "$LOG_DIR/hook_${scenario}.err"; then
+                log "INFO" "ARTIFACTS" "$scenario artifact phase logged"
+            else
+                log "FAIL" "ARTIFACTS" "$scenario artifact phase missing"
+                return 1
+            fi
         fi
     fi
 
