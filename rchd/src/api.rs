@@ -7,7 +7,7 @@
 use crate::selection::{SelectionWeights, select_worker};
 use crate::workers::WorkerPool;
 use anyhow::{Result, anyhow};
-use rch_common::{SelectionRequest, SelectionResponse};
+use rch_common::{SelectedWorker, SelectionReason, SelectionRequest, SelectionResponse};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tracing::{debug, warn};
@@ -149,27 +149,65 @@ async fn handle_select_worker(
         request.project, request.estimated_cores
     );
 
+    // Check if any workers are configured
+    let all_workers = pool.all_workers().await;
+    if all_workers.is_empty() {
+        debug!("No workers configured");
+        return Ok(SelectionResponse {
+            worker: None,
+            reason: SelectionReason::NoWorkersConfigured,
+        });
+    }
+
+    // Check if any workers are healthy
+    let healthy_workers = pool.healthy_workers().await;
+    if healthy_workers.is_empty() {
+        debug!("All workers unreachable");
+        return Ok(SelectionResponse {
+            worker: None,
+            reason: SelectionReason::AllWorkersUnreachable,
+        });
+    }
+
     let weights = SelectionWeights::default();
-    let worker = select_worker(pool, &request, &weights)
-        .await
-        .ok_or_else(|| anyhow!("No available worker with {} slots", request.estimated_cores))?;
+    let selected = select_worker(pool, &request, &weights).await;
+
+    let Some(worker) = selected else {
+        // Workers exist and are healthy, but none have enough slots
+        debug!(
+            "All workers busy (no worker has {} available slots)",
+            request.estimated_cores
+        );
+        return Ok(SelectionResponse {
+            worker: None,
+            reason: SelectionReason::AllWorkersBusy,
+        });
+    };
 
     // Reserve the slots
     if !worker.reserve_slots(request.estimated_cores) {
         warn!(
-            "Failed to reserve {} slots on {}",
+            "Failed to reserve {} slots on {} (race condition)",
             request.estimated_cores, worker.config.id
         );
-        return Err(anyhow!("Failed to reserve slots"));
+        // This can happen if another request reserved the slots between
+        // selection and reservation. Treat as all workers busy.
+        return Ok(SelectionResponse {
+            worker: None,
+            reason: SelectionReason::AllWorkersBusy,
+        });
     }
 
     Ok(SelectionResponse {
-        worker: worker.config.id.clone(),
-        host: worker.config.host.clone(),
-        user: worker.config.user.clone(),
-        identity_file: worker.config.identity_file.clone(),
-        slots_available: worker.available_slots(),
-        speed_score: worker.speed_score,
+        worker: Some(SelectedWorker {
+            id: worker.config.id.clone(),
+            host: worker.config.host.clone(),
+            user: worker.config.user.clone(),
+            identity_file: worker.config.identity_file.clone(),
+            slots_available: worker.available_slots(),
+            speed_score: worker.speed_score,
+        }),
+        reason: SelectionReason::Success,
     })
 }
 
