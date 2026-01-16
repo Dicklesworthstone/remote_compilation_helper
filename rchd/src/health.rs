@@ -251,7 +251,15 @@ async fn check_worker_health(
 ) -> HealthCheckResult {
     let start = Instant::now();
 
-    if mock::is_mock_enabled() {
+    // Debug: log mock mode status and env var
+    let mock_env = std::env::var("RCH_MOCK_SSH").unwrap_or_default();
+    let mock_enabled = mock::is_mock_enabled();
+    debug!(
+        "Health check for {}: mock_enabled={}, RCH_MOCK_SSH='{}'",
+        worker.config.id, mock_enabled, mock_env
+    );
+
+    if mock_enabled {
         let mut client = MockSshClient::new(worker.config.clone(), MockConfig::from_env());
         match client.connect().await {
             Ok(()) => match client.execute("echo health_check").await {
