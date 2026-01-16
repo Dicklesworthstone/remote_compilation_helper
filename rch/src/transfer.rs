@@ -58,10 +58,7 @@ impl TransferPipeline {
     /// Synchronize local project to remote worker.
     pub async fn sync_to_remote(&self, worker: &WorkerConfig) -> Result<SyncResult> {
         let remote_path = self.remote_path();
-        let destination = format!(
-            "{}@{}:{}",
-            worker.user, worker.host, remote_path
-        );
+        let destination = format!("{}@{}:{}", worker.user, worker.host, remote_path);
 
         info!(
             "Syncing {} -> {} on {}",
@@ -98,16 +95,15 @@ impl TransferPipeline {
         cmd.arg(format!("{}/", self.project_root.display())) // Trailing slash = contents only
             .arg(&destination);
 
-        cmd.stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
-        debug!("Running: rsync {:?}", cmd.as_std().get_args().collect::<Vec<_>>());
+        debug!(
+            "Running: rsync {:?}",
+            cmd.as_std().get_args().collect::<Vec<_>>()
+        );
 
         let start = std::time::Instant::now();
-        let output = cmd
-            .output()
-            .await
-            .context("Failed to execute rsync")?;
+        let output = cmd.output().await.context("Failed to execute rsync")?;
 
         let duration = start.elapsed();
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -115,13 +111,14 @@ impl TransferPipeline {
 
         if !output.status.success() {
             warn!("rsync failed: {}", stderr);
-            bail!("rsync failed with exit code {:?}: {}", output.status.code(), stderr);
+            bail!(
+                "rsync failed with exit code {:?}: {}",
+                output.status.code(),
+                stderr
+            );
         }
 
-        info!(
-            "Sync completed in {}ms",
-            duration.as_millis()
-        );
+        info!("Sync completed in {}ms", duration.as_millis());
 
         Ok(SyncResult {
             bytes_transferred: parse_rsync_bytes(&stdout),
@@ -139,15 +136,9 @@ impl TransferPipeline {
         let remote_path = self.remote_path();
 
         // Wrap command to run in project directory
-        let wrapped_command = format!(
-            "cd {} && {}",
-            remote_path, command
-        );
+        let wrapped_command = format!("cd {} && {}", remote_path, command);
 
-        info!(
-            "Executing on {}: {}",
-            worker.id, command
-        );
+        info!("Executing on {}: {}", worker.id, command);
 
         let mut client = SshClient::new(worker.clone(), self.ssh_options.clone());
         client.connect().await?;
@@ -157,10 +148,7 @@ impl TransferPipeline {
         client.disconnect().await?;
 
         if result.success() {
-            info!(
-                "Command succeeded in {}ms",
-                result.duration_ms
-            );
+            info!("Command succeeded in {}ms", result.duration_ms);
         } else {
             warn!(
                 "Command failed (exit={}) in {}ms",
@@ -206,18 +194,13 @@ impl TransferPipeline {
     ) -> Result<SyncResult> {
         let remote_path = self.remote_path();
 
-        info!(
-            "Retrieving artifacts from {} on {}",
-            remote_path, worker.id
-        );
+        info!("Retrieving artifacts from {} on {}", remote_path, worker.id);
 
         let mut cmd = Command::new("rsync");
-        cmd.arg("-az")
-            .arg("-e")
-            .arg(format!(
-                "ssh -i {} -o StrictHostKeyChecking=no -o BatchMode=yes",
-                shellexpand::tilde(&worker.identity_file)
-            ));
+        cmd.arg("-az").arg("-e").arg(format!(
+            "ssh -i {} -o StrictHostKeyChecking=no -o BatchMode=yes",
+            shellexpand::tilde(&worker.identity_file)
+        ));
 
         // Add zstd compression
         if self.transfer_config.compression_level > 0 {
@@ -234,23 +217,19 @@ impl TransferPipeline {
         }
         cmd.arg("--exclude").arg("*"); // Exclude everything else
 
-        let source = format!(
-            "{}@{}:{}/",
-            worker.user, worker.host, remote_path
-        );
+        let source = format!("{}@{}:{}/", worker.user, worker.host, remote_path);
         cmd.arg(&source)
             .arg(format!("{}/", self.project_root.display()));
 
-        cmd.stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
-        debug!("Running artifact retrieval: rsync {:?}", cmd.as_std().get_args().collect::<Vec<_>>());
+        debug!(
+            "Running artifact retrieval: rsync {:?}",
+            cmd.as_std().get_args().collect::<Vec<_>>()
+        );
 
         let start = std::time::Instant::now();
-        let output = cmd
-            .output()
-            .await
-            .context("Failed to retrieve artifacts")?;
+        let output = cmd.output().await.context("Failed to retrieve artifacts")?;
 
         let duration = start.elapsed();
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -265,10 +244,7 @@ impl TransferPipeline {
             );
         }
 
-        info!(
-            "Artifacts retrieved in {}ms",
-            duration.as_millis()
-        );
+        info!("Artifacts retrieved in {}ms", duration.as_millis());
 
         Ok(SyncResult {
             bytes_transferred: parse_rsync_bytes(&stdout),
@@ -286,9 +262,7 @@ impl TransferPipeline {
         let mut client = SshClient::new(worker.clone(), self.ssh_options.clone());
         client.connect().await?;
 
-        let result = client
-            .execute(&format!("rm -rf {}", remote_path))
-            .await?;
+        let result = client.execute(&format!("rm -rf {}", remote_path)).await?;
 
         client.disconnect().await?;
 
@@ -329,13 +303,16 @@ fn parse_rsync_bytes(output: &str) -> u64 {
 /// Parse files transferred from rsync output.
 fn parse_rsync_files(output: &str) -> u32 {
     // rsync verbose output lists files, count them
-    output.lines().filter(|l| !l.trim().is_empty() && !l.contains("sent")).count() as u32
+    output
+        .lines()
+        .filter(|l| !l.trim().is_empty() && !l.contains("sent"))
+        .count() as u32
 }
 
 /// Compute a hash of the project for cache invalidation.
 pub fn compute_project_hash(project_path: &Path) -> String {
-    use std::hash::{Hash, Hasher};
     use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
 
     let mut hasher = DefaultHasher::new();
 

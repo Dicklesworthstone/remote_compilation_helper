@@ -174,7 +174,10 @@ pub fn load_daemon_config(path: Option<&Path>) -> Result<DaemonConfig> {
     };
 
     if !config_path.exists() {
-        debug!("Daemon config not found at {:?}, using defaults", config_path);
+        debug!(
+            "Daemon config not found at {:?}, using defaults",
+            config_path
+        );
         return Ok(DaemonConfig::default());
     }
 
@@ -350,9 +353,11 @@ enabled = true
     #[test]
     fn test_example_configs_valid() {
         let workers_toml = example_workers_config();
-        let _: WorkersConfig = toml::from_str(&workers_toml).expect("Example workers config should parse");
+        let _: WorkersConfig =
+            toml::from_str(&workers_toml).expect("Example workers config should parse");
 
         let daemon_toml = example_daemon_config();
-        let _: DaemonConfig = toml::from_str(&daemon_toml).expect("Example daemon config should parse");
+        let _: DaemonConfig =
+            toml::from_str(&daemon_toml).expect("Example daemon config should parse");
     }
 }

@@ -172,7 +172,10 @@ impl HealthMonitor {
             *running.write().await = true;
             let mut ticker = interval(config.check_interval);
 
-            info!("Health monitor started (interval: {:?})", config.check_interval);
+            info!(
+                "Health monitor started (interval: {:?})",
+                config.check_interval
+            );
 
             loop {
                 ticker.tick().await;
@@ -205,9 +208,7 @@ impl HealthMonitor {
                     } else {
                         warn!(
                             "Worker {} check failed: {:?} (failures: {})",
-                            worker_id,
-                            result.error,
-                            health.consecutive_failures
+                            worker_id, result.error, health.consecutive_failures
                         );
                     }
 

@@ -64,8 +64,10 @@ async fn main() -> Result<()> {
     // Initialize worker pool
     let worker_pool = workers::WorkerPool::new();
     for worker_config in workers {
-        info!("Adding worker: {} ({}@{}, {} slots)",
-              worker_config.id, worker_config.user, worker_config.host, worker_config.total_slots);
+        info!(
+            "Adding worker: {} ({}@{}, {} slots)",
+            worker_config.id, worker_config.user, worker_config.host, worker_config.total_slots
+        );
         worker_pool.add_worker(worker_config).await;
     }
 
@@ -101,4 +103,3 @@ async fn main() -> Result<()> {
         }
     }
 }
-

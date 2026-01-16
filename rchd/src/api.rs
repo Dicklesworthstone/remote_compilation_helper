@@ -4,9 +4,9 @@
 //! - Request: `GET /select-worker?project=X&cores=N\n`
 //! - Response: JSON `SelectionResponse` or error
 
-use crate::selection::{select_worker, SelectionWeights};
+use crate::selection::{SelectionWeights, select_worker};
 use crate::workers::WorkerPool;
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use rch_common::{SelectionRequest, SelectionResponse};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -37,7 +37,10 @@ pub async fn handle_connection(stream: UnixStream, pool: WorkerPool) -> Result<(
     let response_bytes = match response {
         Ok(resp) => {
             let json = serde_json::to_string(&resp)?;
-            format!("HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n{}\n", json)
+            format!(
+                "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n{}\n",
+                json
+            )
         }
         Err(e) => {
             let error_json = serde_json::json!({ "error": e.to_string() });
@@ -235,7 +238,10 @@ mod tests {
     #[test]
     fn test_urlencoding_decode_no_encoding() {
         assert_eq!(urlencoding_decode("simple"), "simple");
-        assert_eq!(urlencoding_decode("with-dash_underscore"), "with-dash_underscore");
+        assert_eq!(
+            urlencoding_decode("with-dash_underscore"),
+            "with-dash_underscore"
+        );
     }
 
     #[test]

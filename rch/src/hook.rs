@@ -3,12 +3,13 @@
 //! Handles incoming hook requests from Claude Code, classifies commands,
 //! and routes compilation commands to remote workers.
 
+use crate::config::load_config;
 use crate::transfer::{
-    compute_project_hash, default_rust_artifact_patterns, project_id_from_path, TransferPipeline,
+    TransferPipeline, compute_project_hash, default_rust_artifact_patterns, project_id_from_path,
 };
 use anyhow::Result;
 use rch_common::{
-    classify_command, HookInput, HookOutput, SelectionResponse, TransferConfig, WorkerConfig,
+    HookInput, HookOutput, SelectionResponse, TransferConfig, WorkerConfig, classify_command,
 };
 use std::io::{self, BufRead, Write};
 use std::path::Path;
@@ -65,6 +66,19 @@ async fn process_hook(input: HookInput) -> HookOutput {
         return HookOutput::allow();
     }
 
+    let config = match load_config() {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            warn!("Failed to load config: {}, allowing local execution", e);
+            return HookOutput::allow();
+        }
+    };
+
+    if !config.general.enabled {
+        debug!("RCH disabled via config, allowing local execution");
+        return HookOutput::allow();
+    }
+
     let command = &input.tool_input.command;
     debug!("Processing command: {}", command);
 
@@ -85,8 +99,7 @@ async fn process_hook(input: HookInput) -> HookOutput {
     );
 
     // Check confidence threshold
-    // TODO: Load from config
-    let confidence_threshold = 0.85;
+    let confidence_threshold = config.compilation.confidence_threshold;
     if classification.confidence < confidence_threshold {
         debug!(
             "Confidence {:.2} below threshold {:.2}, allowing local execution",
@@ -96,10 +109,9 @@ async fn process_hook(input: HookInput) -> HookOutput {
     }
 
     // Query daemon for a worker
-    let socket_path = "/tmp/rch.sock";
     let project = extract_project_name();
 
-    match query_daemon(socket_path, &project, 4).await {
+    match query_daemon(&config.general.socket_path, &project, 4).await {
         Ok(worker) => {
             info!(
                 "Selected worker: {} at {}@{} ({} slots, speed {:.1})",
@@ -107,7 +119,7 @@ async fn process_hook(input: HookInput) -> HookOutput {
             );
 
             // Execute remote compilation pipeline
-            match execute_remote_compilation(&worker, command).await {
+            match execute_remote_compilation(&worker, command, config.transfer.clone()).await {
                 Ok(exit_code) => {
                     if exit_code == 0 {
                         // Command succeeded remotely - deny local execution
@@ -147,11 +159,7 @@ async fn process_hook(input: HookInput) -> HookOutput {
 }
 
 /// Query the daemon for a worker.
-async fn query_daemon(
-    socket_path: &str,
-    project: &str,
-    cores: u32,
-) -> Result<SelectionResponse> {
+async fn query_daemon(socket_path: &str, project: &str, cores: u32) -> Result<SelectionResponse> {
     // Check if socket exists
     if !Path::new(socket_path).exists() {
         return Err(anyhow::anyhow!("Daemon socket not found: {}", socket_path));
@@ -252,6 +260,7 @@ fn selection_to_worker_config(response: &SelectionResponse) -> WorkerConfig {
 async fn execute_remote_compilation(
     worker_response: &SelectionResponse,
     command: &str,
+    transfer_config: TransferConfig,
 ) -> Result<i32> {
     let worker_config = selection_to_worker_config(worker_response);
 
@@ -268,22 +277,14 @@ async fn execute_remote_compilation(
     );
 
     // Create transfer pipeline
-    let transfer_config = TransferConfig::default();
-    let pipeline = TransferPipeline::new(
-        project_root,
-        project_id,
-        project_hash,
-        transfer_config,
-    );
+    let pipeline = TransferPipeline::new(project_root, project_id, project_hash, transfer_config);
 
     // Step 1: Sync project to remote
     info!("Syncing project to worker {}...", worker_config.id);
     let sync_result = pipeline.sync_to_remote(&worker_config).await?;
     info!(
         "Sync complete: {} files, {} bytes in {}ms",
-        sync_result.files_transferred,
-        sync_result.bytes_transferred,
-        sync_result.duration_ms
+        sync_result.files_transferred, sync_result.bytes_transferred, sync_result.duration_ms
     );
 
     // Step 2: Execute command remotely with streaming output
@@ -314,7 +315,10 @@ async fn execute_remote_compilation(
     if result.success() {
         info!("Retrieving build artifacts...");
         let artifact_patterns = default_rust_artifact_patterns();
-        match pipeline.retrieve_artifacts(&worker_config, &artifact_patterns).await {
+        match pipeline
+            .retrieve_artifacts(&worker_config, &artifact_patterns)
+            .await
+        {
             Ok(artifact_result) => {
                 info!(
                     "Artifacts retrieved: {} files, {} bytes in {}ms",
@@ -401,7 +405,10 @@ mod tests {
     #[test]
     fn test_urlencoding_encode_no_encoding_needed() {
         assert_eq!(urlencoding_encode("simple"), "simple");
-        assert_eq!(urlencoding_encode("with-dash_underscore.dot~tilde"), "with-dash_underscore.dot~tilde");
+        assert_eq!(
+            urlencoding_encode("with-dash_underscore.dot~tilde"),
+            "with-dash_underscore.dot~tilde"
+        );
         assert_eq!(urlencoding_encode("ABC123"), "ABC123");
     }
 

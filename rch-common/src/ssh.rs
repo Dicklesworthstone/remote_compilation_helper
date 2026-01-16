@@ -160,10 +160,7 @@ impl SshClient {
 
     /// Execute a command on the remote worker.
     pub async fn execute(&self, command: &str) -> Result<CommandResult> {
-        let session = self
-            .session
-            .as_ref()
-            .context("Not connected to worker")?;
+        let session = self.session.as_ref().context("Not connected to worker")?;
 
         let start = std::time::Instant::now();
         debug!("Executing on {}: {}", self.config.id, command);
@@ -240,10 +237,7 @@ impl SshClient {
         F: FnMut(&str),
         G: FnMut(&str),
     {
-        let session = self
-            .session
-            .as_ref()
-            .context("Not connected to worker")?;
+        let session = self.session.as_ref().context("Not connected to worker")?;
 
         let start = std::time::Instant::now();
         debug!("Executing (streaming) on {}: {}", self.config.id, command);
@@ -350,10 +344,7 @@ impl SshPool {
     }
 
     /// Get or create a connection to a worker.
-    pub async fn get_or_connect(
-        &self,
-        config: &WorkerConfig,
-    ) -> Result<Arc<RwLock<SshClient>>> {
+    pub async fn get_or_connect(&self, config: &WorkerConfig) -> Result<Arc<RwLock<SshClient>>> {
         let worker_id = config.id.clone();
 
         // Check if we already have a connection

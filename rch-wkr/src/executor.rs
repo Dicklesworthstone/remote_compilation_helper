@@ -1,8 +1,8 @@
 //! Command execution on worker.
 
 use anyhow::Result;
-use thiserror::Error;
 use std::process::Stdio;
+use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tracing::{debug, error, info};

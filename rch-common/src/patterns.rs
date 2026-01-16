@@ -277,11 +277,7 @@ fn classify_full(cmd: &str) -> Classification {
             || cmd.contains(".cpp")
             || cmd.contains(".cc"))
     {
-        return Classification::compilation(
-            CompilationKind::Clangpp,
-            0.90,
-            "clang++ compilation",
-        );
+        return Classification::compilation(CompilationKind::Clangpp, 0.90, "clang++ compilation");
     }
 
     // Make
