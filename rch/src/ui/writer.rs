@@ -32,13 +32,13 @@ impl OutputWriter {
 
     /// Create a writer for stdout.
     pub fn stdout() -> Self {
-        let is_tty = is_terminal::is_terminal(&io::stdout());
+        let is_tty = is_terminal::is_terminal(io::stdout());
         Self::new(io::stdout(), is_tty)
     }
 
     /// Create a writer for stderr.
     pub fn stderr() -> Self {
-        let is_tty = is_terminal::is_terminal(&io::stderr());
+        let is_tty = is_terminal::is_terminal(io::stderr());
         Self::new(io::stderr(), is_tty)
     }
 
