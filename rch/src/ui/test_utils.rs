@@ -2,8 +2,8 @@
 //!
 //! Provides helpers for capturing and asserting on CLI output in tests.
 
-use super::context::{ColorChoice, OutputConfig, OutputContext, OutputMode, Verbosity};
-use super::writer::{OutputWriter, SharedOutputBuffer};
+use super::context::{ColorChoice, OutputConfig, OutputContext, OutputMode};
+use super::writer::SharedOutputBuffer;
 use regex::Regex;
 
 /// Captured output from a test run.

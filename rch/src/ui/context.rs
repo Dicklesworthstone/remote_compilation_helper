@@ -184,7 +184,7 @@ pub enum ColorChoice {
 
 impl ColorChoice {
     /// Parse from CLI string argument.
-    pub fn from_str(s: &str) -> Self {
+    pub fn parse(s: &str) -> Self {
         match s.to_lowercase().as_str() {
             "always" | "yes" | "true" => Self::Always,
             "never" | "no" | "false" => Self::Never,
@@ -583,10 +583,10 @@ mod tests {
 
     #[test]
     fn test_color_choice_parse() {
-        assert_eq!(ColorChoice::from_str("always"), ColorChoice::Always);
-        assert_eq!(ColorChoice::from_str("never"), ColorChoice::Never);
-        assert_eq!(ColorChoice::from_str("auto"), ColorChoice::Auto);
-        assert_eq!(ColorChoice::from_str("invalid"), ColorChoice::Auto);
+        assert_eq!(ColorChoice::parse("always"), ColorChoice::Always);
+        assert_eq!(ColorChoice::parse("never"), ColorChoice::Never);
+        assert_eq!(ColorChoice::parse("auto"), ColorChoice::Auto);
+        assert_eq!(ColorChoice::parse("invalid"), ColorChoice::Auto);
     }
 
     #[test]
