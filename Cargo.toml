@@ -1,0 +1,63 @@
+[workspace]
+resolver = "3"
+members = [
+    "rch",
+    "rchd",
+    "rch-wkr",
+    "rch-common",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["Remote Compilation Helper Contributors"]
+repository = "https://github.com/Dicklesworthstone/remote_compilation_helper"
+
+[workspace.dependencies]
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Async runtime
+tokio = { version = "1.43", features = ["full"] }
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# String search (SIMD-accelerated)
+memchr = "2.7"
+
+# Regex for pattern matching
+regex = "1.11"
+
+# Fast hashing
+blake3 = "1.5"
+
+# Compression
+zstd = "0.13"
+
+# SSH
+openssh = "0.11"
+
+# Configuration
+toml = "0.8"
+directories = "6.0"
+
+# Error handling
+thiserror = "2.0"
+anyhow = "1.0"
+
+# Internal crates
+rch-common = { path = "rch-common" }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
