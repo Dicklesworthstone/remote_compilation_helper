@@ -10,6 +10,7 @@ mod commands;
 mod config;
 mod hook;
 mod transfer;
+pub mod ui;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};

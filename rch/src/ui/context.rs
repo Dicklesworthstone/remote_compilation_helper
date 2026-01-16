@@ -13,7 +13,6 @@ use super::writer::OutputWriter;
 use colored::Color;
 use serde::Serialize;
 use std::env;
-use std::io::Write;
 
 /// Output mode determining how content is formatted and displayed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -697,5 +696,98 @@ mod tests {
         assert!(output.contains("Status"));
         assert!(output.contains("worker-1"));
         assert!(output.contains("healthy"));
+    }
+
+    #[test]
+    fn test_terminal_caps_defaults() {
+        let caps = TerminalCaps::default();
+        assert_eq!(caps.width, 80);
+        assert_eq!(caps.height, 24);
+        assert!(!caps.supports_color);
+        assert!(!caps.supports_unicode);
+        assert_eq!(caps.color_level, ColorLevel::Ansi16);
+        assert!(!caps.supports_hyperlinks);
+        assert_eq!(caps.background, Background::Dark);
+    }
+
+    #[test]
+    fn test_context_background_methods() {
+        let config = OutputConfig::default();
+        let (ctx, _, _) = make_test_context(config);
+
+        // Default background is dark
+        let bg = ctx.background();
+        // Either light or dark is valid, just ensure the methods are consistent
+        if bg == Background::Light {
+            assert!(ctx.is_light_background());
+            assert!(!ctx.is_dark_background());
+        } else {
+            assert!(!ctx.is_light_background());
+            assert!(ctx.is_dark_background());
+        }
+    }
+
+    #[test]
+    fn test_context_color_level() {
+        let config = OutputConfig::default();
+        let (ctx, _, _) = make_test_context(config);
+
+        // Color level should be a valid level
+        let level = ctx.color_level();
+        assert!(
+            level == ColorLevel::None
+                || level == ColorLevel::Ansi16
+                || level == ColorLevel::Ansi256
+                || level == ColorLevel::TrueColor
+        );
+    }
+
+    #[test]
+    fn test_context_color_level_plain_mode() {
+        let config = OutputConfig {
+            force_mode: Some(OutputMode::Plain),
+            ..Default::default()
+        };
+        let (ctx, _, _) = make_test_context(config);
+
+        // Plain mode should return None color level regardless of terminal
+        assert_eq!(ctx.color_level(), ColorLevel::None);
+    }
+
+    #[test]
+    fn test_context_resolve_color() {
+        use crate::ui::adaptive::palette;
+
+        let config = OutputConfig::default();
+        let (ctx, _, _) = make_test_context(config);
+
+        // Resolve should return a valid color
+        let color = ctx.resolve_color(&palette::SUCCESS);
+        // Just verify we get a color (the exact value depends on background)
+        let _ = color;
+    }
+
+    #[test]
+    fn test_context_supports_hyperlinks_human_mode() {
+        let config = OutputConfig {
+            force_mode: Some(OutputMode::Human),
+            ..Default::default()
+        };
+        let (ctx, _, _) = make_test_context(config);
+
+        // Result depends on environment, just verify it doesn't panic
+        let _ = ctx.supports_hyperlinks();
+    }
+
+    #[test]
+    fn test_context_supports_hyperlinks_plain_mode() {
+        let config = OutputConfig {
+            force_mode: Some(OutputMode::Plain),
+            ..Default::default()
+        };
+        let (ctx, _, _) = make_test_context(config);
+
+        // Plain mode should never support hyperlinks
+        assert!(!ctx.supports_hyperlinks());
     }
 }

@@ -24,6 +24,10 @@ directories = { workspace = true }
 shellexpand = "3.1"
 dirs = "5"
 urlencoding = "2"
+colored = "2"
+is-terminal = "0.4"
+terminal_size = "0.3"
+regex = "1"
 
 [dev-dependencies]
 tempfile = "3"

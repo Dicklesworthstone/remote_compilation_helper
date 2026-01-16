@@ -141,7 +141,7 @@ impl Write for OutputBuffer {
 }
 
 /// A clonable version of OutputBuffer that implements Write by wrapping a clone.
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Debug)]
 pub struct SharedOutputBuffer {
     inner: Arc<Mutex<Vec<u8>>>,
 }
