@@ -7,11 +7,13 @@
 //!
 //! - [`collect`]: Real-time metrics collection from /proc filesystem
 //! - [`benchmarks`]: Synthetic benchmarks for measuring worker performance
+//! - [`speedscore`]: Unified performance scoring combining all benchmarks
 
 #![forbid(unsafe_code)]
 
 pub mod benchmarks;
 pub mod collect;
+pub mod speedscore;
 
 pub use benchmarks::compilation::{
     CompilationBenchmark, CompilationBenchmarkError, CompilationBenchmarkResult,
@@ -29,4 +31,7 @@ pub use collect::disk::{
 pub use collect::memory::{MemoryInfo, MemoryPressureStall, MemoryTelemetry};
 pub use collect::network::{
     NetDevStats, NetworkCollector, NetworkError, NetworkMetrics, NetworkTelemetry,
+};
+pub use speedscore::{
+    calculate_speedscore, BenchmarkResults, SpeedScore, SpeedScoreWeights, SPEEDSCORE_VERSION,
 };
