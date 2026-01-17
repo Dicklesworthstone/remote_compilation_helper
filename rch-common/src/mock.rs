@@ -63,6 +63,16 @@ pub fn is_mock_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// Check if a host string indicates mock mode (mock://).
+pub fn is_mock_host(host: &str) -> bool {
+    host.starts_with("mock://")
+}
+
+/// Check if a worker should use mock transport.
+pub fn is_mock_worker(worker: &WorkerConfig) -> bool {
+    is_mock_host(&worker.host)
+}
+
 fn global_ssh_invocations() -> &'static Mutex<Vec<MockInvocation>> {
     static GLOBAL: OnceLock<Mutex<Vec<MockInvocation>>> = OnceLock::new();
     GLOBAL.get_or_init(|| Mutex::new(Vec::new()))

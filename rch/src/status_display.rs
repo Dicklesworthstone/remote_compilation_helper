@@ -9,11 +9,14 @@
 use crate::status_types::{DaemonFullStatusResponse, extract_json_body, format_duration};
 use crate::ui::theme::Theme;
 use anyhow::{Context, Result};
+use std::path::PathBuf;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
 /// Default daemon socket path.
-pub const DEFAULT_SOCKET_PATH: &str = "/tmp/rch.sock";
+fn default_socket_path() -> PathBuf {
+    PathBuf::from(rch_common::default_socket_path())
+}
 
 /// Query daemon's /status API for comprehensive status.
 pub async fn query_daemon_full_status() -> Result<DaemonFullStatusResponse> {
@@ -31,7 +34,7 @@ pub async fn query_daemon_full_status() -> Result<DaemonFullStatusResponse> {
 
 /// Send a status command to the daemon.
 async fn send_status_command() -> Result<String> {
-    let stream = UnixStream::connect(DEFAULT_SOCKET_PATH)
+    let stream = UnixStream::connect(default_socket_path())
         .await
         .context("Failed to connect to daemon socket")?;
 

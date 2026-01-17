@@ -447,41 +447,52 @@ async fn handle_select_worker(
 
     let weights = SelectionWeights::default();
     let circuit_config = CircuitBreakerConfig::default();
-    let result = select_worker_with_config(pool, &request, &weights, &circuit_config).await;
 
-    let Some(worker) = result.worker else {
-        debug!("No worker selected: {}", result.reason);
-        return Ok(SelectionResponse {
-            worker: None,
-            reason: result.reason,
-        });
-    };
+    // Retry loop to handle race conditions where slots are taken between selection and reservation
+    let mut attempts = 0;
+    const MAX_ATTEMPTS: u32 = 3;
 
-    // Reserve the slots
-    if !worker.reserve_slots(request.estimated_cores) {
+    loop {
+        attempts += 1;
+        let result = select_worker_with_config(pool, &request, &weights, &circuit_config).await;
+
+        let Some(worker) = result.worker else {
+            debug!("No worker selected: {}", result.reason);
+            return Ok(SelectionResponse {
+                worker: None,
+                reason: result.reason,
+            });
+        };
+
+        // Reserve the slots
+        if worker.reserve_slots(request.estimated_cores) {
+            return Ok(SelectionResponse {
+                worker: Some(SelectedWorker {
+                    id: worker.config.id.clone(),
+                    host: worker.config.host.clone(),
+                    user: worker.config.user.clone(),
+                    identity_file: worker.config.identity_file.clone(),
+                    slots_available: worker.available_slots(),
+                    speed_score: worker.speed_score,
+                }),
+                reason: SelectionReason::Success,
+            });
+        }
+
         warn!(
-            "Failed to reserve {} slots on {} (race condition)",
-            request.estimated_cores, worker.config.id
+            "Failed to reserve {} slots on {} (race condition), attempt {}/{}",
+            request.estimated_cores, worker.config.id, attempts, MAX_ATTEMPTS
         );
-        // This can happen if another request reserved the slots between
-        // selection and reservation. Treat as all workers busy.
-        return Ok(SelectionResponse {
-            worker: None,
-            reason: SelectionReason::AllWorkersBusy,
-        });
-    }
 
-    Ok(SelectionResponse {
-        worker: Some(SelectedWorker {
-            id: worker.config.id.clone(),
-            host: worker.config.host.clone(),
-            user: worker.config.user.clone(),
-            identity_file: worker.config.identity_file.clone(),
-            slots_available: worker.available_slots(),
-            speed_score: worker.speed_score,
-        }),
-        reason: SelectionReason::Success,
-    })
+        if attempts >= MAX_ATTEMPTS {
+            // Give up after max attempts
+            return Ok(SelectionResponse {
+                worker: None,
+                reason: SelectionReason::AllWorkersBusy,
+            });
+        }
+        // Loop again - next selection will see reduced slot count
+    }
 }
 
 /// Handle a release-worker request.

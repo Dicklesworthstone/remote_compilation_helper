@@ -341,10 +341,9 @@ async fn stop_daemon_gracefully(_timeout_secs: u64) -> Result<bool, UpdateError>
     use tokio::io::AsyncWriteExt;
     use tokio::net::UnixStream;
 
-    const SOCKET_PATH: &str = "/tmp/rch.sock";
-
     // Check if daemon is running
-    let socket_path = Path::new(SOCKET_PATH);
+    let socket_path_buf = PathBuf::from(rch_common::default_socket_path());
+    let socket_path = Path::new(&socket_path_buf);
     if !socket_path.exists() {
         return Ok(false);
     }

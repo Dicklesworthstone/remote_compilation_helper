@@ -12,8 +12,8 @@ mod toolchain;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use rch_common::WorkerCapabilities;
+use rch_common::{LogConfig, init_logging};
 use tracing::info;
-use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 #[derive(Parser)]
 #[command(name = "rch-wkr")]
@@ -77,16 +77,11 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // Initialize logging
-    let filter = if cli.verbose {
-        EnvFilter::new("debug")
-    } else {
-        EnvFilter::new("info")
-    };
-
-    tracing_subscriber::registry()
-        .with(fmt::layer().with_writer(std::io::stderr))
-        .with(filter)
-        .init();
+    let mut log_config = LogConfig::from_env("info").with_stderr();
+    if cli.verbose {
+        log_config = log_config.with_level("debug");
+    }
+    let _logging_guards = init_logging(&log_config)?;
 
     match cli.command {
         Commands::Execute {

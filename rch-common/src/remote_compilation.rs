@@ -10,6 +10,7 @@
 //! 6. Comparing binary hashes to verify correctness
 
 use crate::binary_hash::{BinaryHashResult, binaries_equivalent, compute_binary_hash};
+use crate::mock::{self, MockConfig, MockRsync, MockRsyncConfig, MockSshClient};
 use crate::ssh::{SshClient, SshOptions};
 use crate::test_change::{TestChangeGuard, TestCodeChange};
 use crate::types::WorkerConfig;
@@ -63,6 +64,10 @@ pub struct RemoteCompilationTest {
     pub binary_name: Option<String>,
     /// Remote base directory for builds.
     pub remote_base: String,
+}
+
+fn use_mock_transport(worker: &WorkerConfig) -> bool {
+    mock::is_mock_enabled() || mock::is_mock_worker(worker)
 }
 
 impl Default for RemoteCompilationTest {
@@ -298,6 +303,28 @@ impl RemoteCompilationTest {
         let remote_path = self.remote_project_path();
         let escaped_remote_path = escape(Cow::from(&remote_path));
 
+        if use_mock_transport(&self.worker) {
+            let mut client = MockSshClient::new(self.worker.clone(), MockConfig::from_env());
+            client.connect().await?;
+            let mkdir_cmd = format!("mkdir -p {}", escaped_remote_path);
+            let mkdir_result = client.execute(&mkdir_cmd).await?;
+            client.disconnect().await?;
+
+            if !mkdir_result.success() {
+                bail!("Failed to create remote directory: {}", mkdir_result.stderr);
+            }
+
+            let rsync = MockRsync::new(MockRsyncConfig::from_env());
+            let destination = format!(
+                "{}@{}:{}",
+                self.worker.user, self.worker.host, escaped_remote_path
+            );
+            rsync
+                .sync_to_remote(&self.test_project.display().to_string(), &destination, &[])
+                .await?;
+            return Ok(());
+        }
+
         // First ensure remote directory exists
         let mut client = SshClient::new(self.worker.clone(), self.ssh_options.clone());
         client.connect().await?;
@@ -368,6 +395,23 @@ impl RemoteCompilationTest {
 
         debug!("Running remote build: {}", build_cmd);
 
+        if use_mock_transport(&self.worker) {
+            let mut client = MockSshClient::new(self.worker.clone(), MockConfig::from_env());
+            client.connect().await?;
+            let result = client.execute(&build_cmd).await?;
+            client.disconnect().await?;
+
+            if !result.success() {
+                bail!(
+                    "Remote build failed (exit {}): {}",
+                    result.exit_code,
+                    result.stderr
+                );
+            }
+
+            return Ok(());
+        }
+
         let mut client = SshClient::new(self.worker.clone(), self.ssh_options.clone());
         client.connect().await?;
         let result = client.execute(&build_cmd).await?;
@@ -400,6 +444,18 @@ impl RemoteCompilationTest {
             .join(format!("{}_remote", profile));
         std::fs::create_dir_all(&local_dest)
             .with_context(|| format!("Failed to create directory: {:?}", local_dest))?;
+
+        if use_mock_transport(&self.worker) {
+            let rsync = MockRsync::new(MockRsyncConfig::from_env());
+            let remote_target = format!(
+                "{}@{}:{}/target/{}/",
+                self.worker.user, self.worker.host, remote_path, profile
+            );
+            rsync
+                .retrieve_artifacts(&remote_target, &local_dest.display().to_string(), &[])
+                .await?;
+            return Ok(());
+        }
 
         let remote_target = format!(
             "{}@{}:{}/target/{}/",

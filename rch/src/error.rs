@@ -779,15 +779,16 @@ mod tests {
 
     #[test]
     fn test_daemon_socket_not_found() {
+        let socket_path = rch_common::default_socket_path();
         let err = DaemonError::SocketNotFound {
-            socket_path: "/tmp/rch.sock".to_string(),
+            socket_path: socket_path.clone(),
         };
 
         let report = Report::new(err);
         let formatted = format!("{:?}", report);
 
         assert!(
-            formatted.contains("/tmp/rch.sock"),
+            formatted.contains(&socket_path),
             "Should include socket path: {formatted}"
         );
         assert!(
@@ -812,15 +813,16 @@ mod tests {
 
     #[test]
     fn test_daemon_connection_failed() {
+        let socket_path = rch_common::default_socket_path();
         let err = DaemonError::ConnectionFailed {
-            socket_path: "/tmp/rch.sock".to_string(),
+            socket_path: socket_path.clone(),
             source: std::io::Error::new(std::io::ErrorKind::NotFound, "socket not found"),
         };
 
         let report = Report::new(err);
         let formatted = format!("{:?}", report);
 
-        assert!(formatted.contains("/tmp/rch.sock"));
+        assert!(formatted.contains(&socket_path));
         assert!(formatted.contains("rch::daemon::connection_failed"));
     }
 

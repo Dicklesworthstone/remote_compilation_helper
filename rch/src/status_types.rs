@@ -167,12 +167,13 @@ mod tests {
 
     #[test]
     fn test_deserialize_daemon_status() {
-        let json = r#"{
+        let socket_path = rch_common::default_socket_path();
+        let json = serde_json::json!({
             "daemon": {
                 "pid": 1234,
                 "uptime_secs": 3600,
                 "version": "0.1.0",
-                "socket_path": "/tmp/rch.sock",
+                "socket_path": socket_path,
                 "started_at": "2026-01-16T12:00:00Z",
                 "workers_total": 2,
                 "workers_healthy": 2,
@@ -191,9 +192,9 @@ mod tests {
                 "local_count": 0,
                 "avg_duration_ms": 45000
             }
-        }"#;
+        });
 
-        let status: DaemonFullStatusResponse = serde_json::from_str(json).unwrap();
+        let status: DaemonFullStatusResponse = serde_json::from_value(json).unwrap();
         assert_eq!(status.daemon.pid, 1234);
         assert_eq!(status.stats.total_builds, 10);
     }

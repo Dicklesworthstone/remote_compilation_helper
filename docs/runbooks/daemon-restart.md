@@ -56,7 +56,7 @@ rch daemon restart --force
 
 # 3. If still stuck, kill manually
 pkill -9 rchd
-rm /tmp/rch.sock  # Clean up socket file
+rm "${XDG_RUNTIME_DIR:-$HOME/.cache/rch}/rch.sock"  # Clean up socket file
 
 # 4. Start fresh
 rchd &
@@ -171,7 +171,7 @@ Error: Address already in use
 pgrep rchd
 
 # If not running, remove stale socket
-rm /tmp/rch.sock
+rm "${XDG_RUNTIME_DIR:-$HOME/.cache/rch}/rch.sock"
 
 # Start daemon
 rch daemon start
@@ -180,16 +180,16 @@ rch daemon start
 ### Permission Denied
 
 ```
-Error: Permission denied: /tmp/rch.sock
+Error: Permission denied: ~/.cache/rch/rch.sock
 ```
 
 **Solution:**
 ```bash
 # Check socket ownership
-ls -la /tmp/rch.sock
+ls -la "${XDG_RUNTIME_DIR:-$HOME/.cache/rch}/rch.sock"
 
 # Remove if owned by different user
-sudo rm /tmp/rch.sock
+sudo rm "${XDG_RUNTIME_DIR:-$HOME/.cache/rch}/rch.sock"
 
 # Start as your user
 rch daemon start
@@ -238,7 +238,7 @@ rch daemon status
 rch workers probe --all
 
 # 3. Verify API is responding
-curl -s --unix-socket /tmp/rch.sock http://localhost/status | jq
+curl -s --unix-socket "${XDG_RUNTIME_DIR:-$HOME/.cache/rch}/rch.sock" http://localhost/status | jq
 
 # 4. Test a build
 cd /path/to/test/project

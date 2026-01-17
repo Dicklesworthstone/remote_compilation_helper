@@ -10,7 +10,9 @@ pub mod binary_hash;
 pub mod config;
 pub mod discovery;
 pub mod e2e;
+pub mod logging;
 pub mod mock;
+pub mod mock_worker;
 pub mod patterns;
 #[cfg(test)]
 mod patterns_security_test;
@@ -25,6 +27,8 @@ pub mod types;
 pub use binary_hash::{
     BinaryHashResult, binaries_equivalent, binary_contains_marker, compute_binary_hash,
 };
+pub use logging::{LogConfig, LogFormat, LoggingGuards, init_logging};
+pub use mock_worker::MockWorkerServer;
 pub use patterns::{
     Classification, ClassificationDetails, ClassificationTier, CompilationKind, TierDecision,
     classify_command, classify_command_detailed,
@@ -36,9 +40,9 @@ pub use toolchain::{ToolchainInfo, wrap_command_with_toolchain};
 pub use types::{
     BuildLocation, BuildRecord, BuildStats, CircuitBreakerConfig, CircuitState, CircuitStats,
     CompilationConfig, CompilationMetrics, CompilationTimer, CompilationTimingBreakdown,
-    GeneralConfig, MetricsAggregator, RchConfig, ReleaseRequest, RequiredRuntime, SelectedWorker,
-    SelectionReason, SelectionRequest, SelectionResponse, TransferConfig, WorkerCapabilities,
-    WorkerConfig, WorkerId, WorkerStatus,
+    GeneralConfig, MetricsAggregator, OutputConfig, OutputVisibility, RchConfig, ReleaseRequest,
+    RequiredRuntime, SelectedWorker, SelectionReason, SelectionRequest, SelectionResponse,
+    TransferConfig, WorkerCapabilities, WorkerConfig, WorkerId, WorkerStatus, default_socket_path,
 };
 
 // Config module re-exports

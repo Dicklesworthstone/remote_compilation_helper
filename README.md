@@ -282,6 +282,8 @@ rch hook test                 # Simulate hook invocation
 
 ## Configuration
 
+For full configuration precedence and reference, see `docs/guides/configuration.md`.
+
 ### User Config (`~/.config/rch/config.toml`)
 
 ```toml
@@ -289,7 +291,7 @@ rch hook test                 # Simulate hook invocation
 [general]
 enabled = true
 log_level = "info"
-socket_path = "/tmp/rch.sock"
+socket_path = "~/.cache/rch/rch.sock"
 
 # Compilation settings
 [compilation]

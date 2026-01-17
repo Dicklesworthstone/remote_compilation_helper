@@ -47,6 +47,10 @@ pub use primitives::{
     ensure_directory, ensure_symlink, update_if_changed,
 };
 
+fn default_socket_path() -> PathBuf {
+    PathBuf::from(rch_common::default_socket_path())
+}
+
 /// Complete RCH installation state.
 ///
 /// This struct captures the entire state of an RCH installation, including
@@ -468,7 +472,7 @@ fn detect_workers_state(issues: &mut Vec<StateIssue>) -> Result<WorkersState> {
 
 /// Detect daemon state.
 fn detect_daemon_state(issues: &mut Vec<StateIssue>) -> Result<DaemonState> {
-    let socket_path = PathBuf::from("/tmp/rch.sock");
+    let socket_path = default_socket_path();
     let socket_exists = socket_path.exists();
 
     // Try to check if daemon is responsive
@@ -653,7 +657,7 @@ mod tests {
                 daemon: DaemonState {
                     running: true,
                     pid: Some(12345),
-                    socket_path: PathBuf::from("/tmp/rch.sock"),
+                    socket_path: default_socket_path(),
                     socket_responsive: true,
                     version: Some("0.1.0".to_string()),
                 },

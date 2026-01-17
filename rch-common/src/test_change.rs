@@ -58,8 +58,9 @@ impl TestCodeChange {
         // Modify: add a const that will be compiled into the binary
         let modified = format!(
             "{}\n\n// RCH Self-Test Marker (auto-generated, safe to remove)\n\
+             #[used]\n\
              #[allow(dead_code)]\n\
-             const {}: &str = \"{}\";\n",
+             static {}: &str = \"{}\";\n",
             original, change_id, change_id
         );
 

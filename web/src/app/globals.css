@@ -3,14 +3,15 @@
 
 @custom-variant dark (&:is(.dark *));
 
-/* RCH Dashboard Theme - Dark by default */
+/* RCH Dashboard Theme - Light by default */
 :root {
+  color-scheme: light;
   /* Surface colors */
-  --surface: oklch(15% 0.01 240);
-  --surface-elevated: oklch(20% 0.01 240);
-  --border: oklch(0.922 0 0);
-  --muted: oklch(0.97 0 0);
-  --muted-foreground: oklch(0.556 0 0);
+  --surface: oklch(0.985 0.003 240);
+  --surface-elevated: oklch(0.97 0.004 240);
+  --border: oklch(0.9 0 0);
+  --muted: oklch(0.95 0 0);
+  --muted-foreground: oklch(0.5 0 0);
 
   /* Semantic colors */
   --primary: oklch(0.205 0 0);
@@ -155,6 +156,9 @@ body {
 }
 
 .dark {
+  color-scheme: dark;
+  --surface: oklch(0.15 0.01 240);
+  --surface-elevated: oklch(0.2 0.01 240);
   --background: oklch(0.145 0 0);
   --foreground: oklch(0.985 0 0);
   --card: oklch(0.205 0 0);
@@ -194,5 +198,13 @@ body {
   }
   body {
     @apply bg-background text-foreground;
+  }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  * {
+    transition-property: background-color, color, border-color, fill, stroke;
+    transition-duration: 200ms;
+    transition-timing-function: ease;
   }
 }

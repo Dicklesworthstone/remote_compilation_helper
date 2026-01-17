@@ -355,7 +355,7 @@ mod tests {
                 pid: 1234,
                 uptime_secs: 3600,
                 version: "0.1.0".to_string(),
-                socket_path: "/tmp/rch.sock".to_string(),
+                socket_path: rch_common::default_socket_path(),
                 started_at: "2026-01-17T00:00:00Z".to_string(),
                 workers_total: workers.len(),
                 workers_healthy: workers.len(),
@@ -559,7 +559,10 @@ mod tests {
             "VERIFY: socket_path={:?} version={}",
             state.daemon.socket_path, state.daemon.version
         );
-        assert_eq!(state.daemon.socket_path, PathBuf::from("/tmp/rch.sock"));
+        assert_eq!(
+            state.daemon.socket_path,
+            PathBuf::from(rch_common::default_socket_path())
+        );
         assert_eq!(state.daemon.version, "0.1.0");
         info!("TEST PASS: test_update_state_daemon_socket_path");
     }

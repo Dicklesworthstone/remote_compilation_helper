@@ -19,6 +19,10 @@ use tracing::{debug, info, warn};
 /// Remote project path prefix.
 const REMOTE_BASE: &str = "/tmp/rch";
 
+fn use_mock_transport(worker: &WorkerConfig) -> bool {
+    mock::is_mock_enabled() || mock::is_mock_worker(worker)
+}
+
 /// Transfer pipeline for remote compilation.
 pub struct TransferPipeline {
     /// Local project root.
@@ -68,7 +72,7 @@ impl TransferPipeline {
         let escaped_remote_path = escape(Cow::from(&remote_path));
         let destination = format!("{}@{}:{}", worker.user, worker.host, escaped_remote_path);
 
-        if mock::is_mock_enabled() {
+        if use_mock_transport(worker) {
             let rsync = MockRsync::new(MockRsyncConfig::from_env());
             let result = rsync
                 .sync_to_remote(
@@ -184,7 +188,7 @@ impl TransferPipeline {
         // Wrap command to run in project directory
         let wrapped_command = format!("cd {} && {}", escaped_remote_path, toolchain_command);
 
-        if mock::is_mock_enabled() {
+        if use_mock_transport(worker) {
             let mut client = MockSshClient::new(worker.clone(), MockConfig::from_env());
             client.connect().await?;
             let result = client.execute(&wrapped_command).await?;
@@ -233,7 +237,7 @@ impl TransferPipeline {
         let toolchain_command = wrap_command_with_toolchain(command, toolchain);
         let wrapped_command = format!("cd {} && {}", escaped_remote_path, toolchain_command);
 
-        if mock::is_mock_enabled() {
+        if use_mock_transport(worker) {
             let mut client = MockSshClient::new(worker.clone(), MockConfig::from_env());
             client.connect().await?;
             let result = client
@@ -264,7 +268,7 @@ impl TransferPipeline {
         let remote_path = self.remote_path();
         let escaped_remote_path = escape(Cow::from(&remote_path));
 
-        if mock::is_mock_enabled() {
+        if use_mock_transport(worker) {
             let rsync = MockRsync::new(MockRsyncConfig::from_env());
             let result = rsync
                 .retrieve_artifacts(
@@ -358,7 +362,7 @@ impl TransferPipeline {
         let remote_path = self.remote_path();
         let escaped_remote_path = escape(Cow::from(&remote_path));
 
-        if mock::is_mock_enabled() {
+        if use_mock_transport(worker) {
             debug!("Mock cleanup of {} on {}", remote_path, worker.id);
             return Ok(());
         }

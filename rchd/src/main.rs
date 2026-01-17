@@ -16,13 +16,13 @@ mod workers;
 
 use anyhow::Result;
 use clap::Parser;
+use rch_common::{LogConfig, init_logging};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::net::UnixListener;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
-use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 use history::BuildHistory;
 
@@ -31,7 +31,7 @@ use history::BuildHistory;
 #[command(author, version, about = "RCH daemon - worker fleet orchestration")]
 struct Cli {
     /// Path to Unix socket
-    #[arg(short, long, default_value = "/tmp/rch.sock")]
+    #[arg(short, long, default_value_os_t = crate::config::default_socket_path())]
     socket: PathBuf,
 
     /// Path to workers configuration
@@ -81,16 +81,11 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // Initialize logging
-    let filter = if cli.verbose {
-        EnvFilter::new("debug")
-    } else {
-        EnvFilter::new("info")
-    };
-
-    tracing_subscriber::registry()
-        .with(fmt::layer())
-        .with(filter)
-        .init();
+    let mut log_config = LogConfig::from_env("info");
+    if cli.verbose {
+        log_config = log_config.with_level("debug");
+    }
+    let _logging_guards = init_logging(&log_config)?;
 
     info!("Starting RCH daemon...");
 
@@ -292,7 +287,7 @@ mod tests {
             pool,
             history,
             started_at,
-            socket_path: "/tmp/rch.sock".to_string(),
+            socket_path: rch_common::default_socket_path(),
             version: env!("CARGO_PKG_VERSION"),
             pid: std::process::id(),
         };
@@ -329,7 +324,7 @@ mod tests {
             pool,
             history,
             started_at: Instant::now(),
-            socket_path: "/tmp/rch.sock".to_string(),
+            socket_path: rch_common::default_socket_path(),
             version: "0.1.0",
             pid: 12345,
         };
@@ -351,7 +346,7 @@ mod tests {
             pool: pool.clone(),
             history: history.clone(),
             started_at: Instant::now(),
-            socket_path: "/tmp/rch.sock".to_string(),
+            socket_path: rch_common::default_socket_path(),
             version: "0.1.0",
             pid: 1234,
         };
@@ -392,7 +387,7 @@ mod tests {
             pool,
             history,
             started_at,
-            socket_path: "/tmp/rch.sock".to_string(),
+            socket_path: rch_common::default_socket_path(),
             version: "0.1.0",
             pid: 1234,
         };
@@ -431,7 +426,7 @@ mod tests {
             pool,
             history,
             started_at: Instant::now(),
-            socket_path: "/tmp/rch.sock".to_string(),
+            socket_path: rch_common::default_socket_path(),
             version: "0.1.0",
             pid: 1234,
         };

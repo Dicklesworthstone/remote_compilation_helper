@@ -154,6 +154,14 @@ impl Default for HarnessConfig {
 
         let bin_dir = cargo_target.join(profile);
 
+        let mut env_vars = HashMap::new();
+        if std::env::var("CI")
+            .map(|v| v == "1" || v.to_lowercase() == "true")
+            .unwrap_or(false)
+        {
+            env_vars.insert("RCH_MOCK_SSH".to_string(), "1".to_string());
+        }
+
         Self {
             temp_dir: std::env::temp_dir().join("rch_e2e_tests"),
             default_timeout: Duration::from_secs(30),
@@ -162,7 +170,7 @@ impl Default for HarnessConfig {
             rch_binary: bin_dir.join("rch"),
             rchd_binary: bin_dir.join("rchd"),
             rch_wkr_binary: bin_dir.join("rch-wkr"),
-            env_vars: HashMap::new(),
+            env_vars,
         }
     }
 }

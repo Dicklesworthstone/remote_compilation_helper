@@ -49,7 +49,7 @@ pub struct DaemonConfig {
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
-            socket_path: PathBuf::from("/tmp/rch.sock"),
+            socket_path: default_socket_path(),
             health_check_interval_secs: 30,
             worker_timeout_secs: 10,
             max_jobs_per_slot: 1,
@@ -116,8 +116,8 @@ impl From<WorkerEntry> for WorkerConfig {
 }
 
 // Default value functions
-fn default_socket_path() -> PathBuf {
-    PathBuf::from("/tmp/rch.sock")
+pub(crate) fn default_socket_path() -> PathBuf {
+    PathBuf::from(rch_common::default_socket_path())
 }
 
 fn default_health_interval() -> u64 {
@@ -280,7 +280,7 @@ pub fn example_daemon_config() -> String {
 # Place this file at ~/.config/rch/daemon.toml
 
 # Unix socket path for hook communication
-socket_path = "/tmp/rch.sock"
+socket_path = "~/.cache/rch/rch.sock"
 
 # Health check interval in seconds
 health_check_interval_secs = 30
@@ -315,7 +315,8 @@ mod tests {
     #[test]
     fn test_default_daemon_config() {
         let config = DaemonConfig::default();
-        assert_eq!(config.socket_path, PathBuf::from("/tmp/rch.sock"));
+        let expected_socket = PathBuf::from(rch_common::default_socket_path());
+        assert_eq!(config.socket_path, expected_socket);
         assert_eq!(config.health_check_interval_secs, 30);
         assert!(config.connection_pooling);
     }
@@ -410,7 +411,8 @@ log_level = "debug"
         let config = load_daemon_config(Some(&nonexistent_path)).unwrap();
 
         // Should use default values
-        assert_eq!(config.socket_path, PathBuf::from("/tmp/rch.sock"));
+        let expected_socket = PathBuf::from(rch_common::default_socket_path());
+        assert_eq!(config.socket_path, expected_socket);
         assert_eq!(config.health_check_interval_secs, 30);
         assert_eq!(config.worker_timeout_secs, 10);
         assert_eq!(config.max_jobs_per_slot, 1);

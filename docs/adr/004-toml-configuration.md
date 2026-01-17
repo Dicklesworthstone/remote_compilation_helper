@@ -44,7 +44,7 @@ Use TOML for all configuration files.
 [general]
 enabled = true
 log_level = "info"
-socket_path = "/tmp/rch.sock"
+socket_path = "~/.cache/rch/rch.sock"
 
 [compilation]
 confidence_threshold = 0.85

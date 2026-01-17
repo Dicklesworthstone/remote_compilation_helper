@@ -26,9 +26,9 @@ mod update;
 use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::CompleteEnv;
+use rch_common::{LogConfig, init_logging};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 use ui::{ColorChoice, OutputConfig, OutputContext};
 
 #[derive(Parser)]
@@ -72,6 +72,9 @@ ENVIRONMENT VARIABLES:
     RCH_DAEMON_TIMEOUT_MS Timeout for daemon communication (default: 5000)
     RCH_SSH_KEY           Path to SSH private key for worker connections
     RCH_TRANSFER_ZSTD_LEVEL  Compression level 1-22 (default: 3)
+    RCH_VISIBILITY        Hook output visibility: none, summary, verbose
+    RCH_VERBOSE           Convenience: sets visibility=verbose when true
+    RCH_QUIET             Force visibility=none when true
     RCH_MOCK_SSH          Enable mock SSH for testing (set to 1)
     RCH_TEST_MODE         Enable test mode (set to 1)
     RCH_ENABLE_METRICS    Enable metrics collection (set to true)
@@ -794,18 +797,17 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // Initialize logging
-    let filter = if cli.verbose {
-        EnvFilter::new("debug")
-    } else if cli.quiet {
-        EnvFilter::new("error")
-    } else {
-        EnvFilter::new("info")
+    let base_level = match config::load_config() {
+        Ok(cfg) => cfg.general.log_level,
+        Err(_) => "info".to_string(),
     };
-
-    tracing_subscriber::registry()
-        .with(fmt::layer())
-        .with(filter)
-        .init();
+    let mut log_config = LogConfig::from_env(&base_level);
+    if cli.verbose {
+        log_config = log_config.with_level("debug");
+    } else if cli.quiet {
+        log_config = log_config.with_level("error");
+    }
+    let _logging_guards = init_logging(&log_config)?;
 
     // Create output context from CLI flags
     let output_config = OutputConfig {

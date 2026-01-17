@@ -308,13 +308,22 @@ impl MemoryTelemetry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tracing::{Level, info};
-    use tracing_subscriber::fmt;
+    use tracing::info;
+    use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
     fn init_test_logging() {
-        let _ = fmt()
-            .with_max_level(Level::DEBUG)
-            .with_test_writer()
+        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug"));
+        let _ = tracing_subscriber::registry()
+            .with(
+                fmt::layer()
+                    .with_test_writer()
+                    .with_target(true)
+                    .with_file(true)
+                    .with_line_number(true)
+                    .with_thread_ids(true)
+                    .json(),
+            )
+            .with(filter)
             .try_init();
     }
 

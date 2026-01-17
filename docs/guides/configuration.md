@@ -41,8 +41,9 @@ Sections and fields:
 ### `[general]`
 - `enabled` (bool, default `true`) — Master on/off switch for the hook.
 - `log_level` (string, default `"info"`) — `trace|debug|info|warn|error`.
-- `socket_path` (string, default `"/tmp/rch.sock"`) — Unix socket path used to
-  communicate with the daemon.
+- `socket_path` (string, default `"$XDG_RUNTIME_DIR/rch.sock"` if set, otherwise
+  `"~/.cache/rch/rch.sock"`; falls back to `"/tmp/rch.sock"`) — Unix socket path
+  used to communicate with the daemon.
 
 ### `[compilation]`
 - `confidence_threshold` (float, default `0.85`) — Minimum classifier confidence
@@ -70,7 +71,7 @@ Example:
 [general]
 enabled = true
 log_level = "info"
-socket_path = "/tmp/rch.sock"
+socket_path = "~/.cache/rch/rch.sock"
 
 [compilation]
 confidence_threshold = 0.85
@@ -122,7 +123,8 @@ enabled = true
 Location: `~/.config/rch/daemon.toml`
 
 Fields:
-- `socket_path` (default `/tmp/rch.sock`) — Unix socket path.
+- `socket_path` (default `$XDG_RUNTIME_DIR/rch.sock` or `~/.cache/rch/rch.sock`)
+  — Unix socket path.
 - `health_check_interval_secs` (default `30`) — Health check cadence.
 - `worker_timeout_secs` (default `10`) — Mark worker unreachable after timeout.
 - `max_jobs_per_slot` (default `1`) — Max concurrent jobs per slot.
@@ -144,6 +146,10 @@ These are read by the hook configuration loader:
 - `RCH_CONFIDENCE_THRESHOLD`
 - `RCH_COMPRESSION`
 
+Note: `rch config export` currently outputs `RCH_DAEMON_SOCKET` and
+`RCH_TRANSFER_ZSTD_LEVEL`; the hook loader reads `RCH_SOCKET_PATH` and
+`RCH_COMPRESSION`. When in doubt, use `rch config show --sources`.
+
 ### CLI/daemon options (documented in `rch --help` / validators)
 
 - `RCH_PROFILE`
@@ -154,6 +160,7 @@ These are read by the hook configuration loader:
 - `RCH_TRANSFER_ZSTD_LEVEL`
 - `RCH_ENABLE_METRICS`
 - `RCH_TEST_MODE`
+- `RCH_MIN_LOCAL_TIME_MS`
 
 ### Hook integration variables
 Used by hook integration scripts (see `docs/extending/integration-hooks.md`):
@@ -207,7 +214,6 @@ Used by hook integration scripts (see `docs/extending/integration-hooks.md`):
 - `RCH_E2E_WORKER_USER`
 - `RCH_CIRCUIT_FAILURE_THRESHOLD`
 - `RCH_CIRCUIT_RESET_TIMEOUT_SEC`
-- `RCH_DAEMON_TIMEOUT_MS`
 - `RCH_OTEL_ENABLED`
 - `RCH_PRESET`
 - `RCH_BAD_BOOL`
@@ -237,7 +243,8 @@ These appear in docs/README but are not currently used by the config loader:
 - `RCH_DRY_RUN`
 - `RCH_LOCAL_ONLY`
 - `RCH_STREAM_MODE`
-- `RCH_WORKERS`
+- `RCH_WORKER` (override form; distinct from hook-provided variable)
+- `RCH_WORKERS` (override form)
 - `RCH_NO_CACHE`
 
 ## Per-Project Configuration

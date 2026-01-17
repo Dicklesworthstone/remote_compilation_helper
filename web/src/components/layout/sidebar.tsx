@@ -1,10 +1,13 @@
 'use client';
 
 import { useEffect, useState, useRef } from 'react';
-import { Server, History, Settings, Activity, Home, Menu, X } from 'lucide-react';
+import { Server, History, Settings, Activity, Home, Menu, X, Sun, Moon } from 'lucide-react';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import { AnimatePresence, motion } from 'motion/react';
+import { useTheme } from 'next-themes';
+
+import { Button } from '@/components/ui/button';
 
 const navItems = [
   { href: '/', icon: Home, label: 'Overview' },
@@ -67,13 +70,48 @@ function SidebarContent({ pathname, onNavigate, variant }: SidebarContentProps) 
         </ul>
       </nav>
 
-      <div className="p-4 border-t border-border">
+      <div className="p-4 border-t border-border space-y-3">
+        <ThemeToggle />
         <div className="text-xs text-muted-foreground">
           <span>Version </span>
           <span className="font-mono">0.1.0</span>
         </div>
       </div>
     </>
+  );
+}
+
+function ThemeToggle() {
+  const { resolvedTheme, setTheme } = useTheme();
+  const [mounted, setMounted] = useState(false);
+
+  useEffect(() => {
+    setMounted(true);
+  }, []);
+
+  const isDark = resolvedTheme === 'dark';
+  const label = isDark ? 'Switch to light theme' : 'Switch to dark theme';
+  const current = mounted ? (isDark ? 'Dark' : 'Light') : 'System';
+
+  return (
+    <div className="flex items-center justify-between gap-3">
+      <div className="text-xs text-muted-foreground">
+        <div className="uppercase tracking-[0.2em] text-[10px]">Theme</div>
+        <div className="text-foreground text-xs">{current}</div>
+      </div>
+      <Button
+        type="button"
+        variant="ghost"
+        size="icon-sm"
+        aria-label={label}
+        title={label}
+        onClick={() => setTheme(isDark ? 'light' : 'dark')}
+        disabled={!mounted}
+        className="border border-border bg-surface/70"
+      >
+        {isDark ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
+      </Button>
+    </div>
   );
 }
 

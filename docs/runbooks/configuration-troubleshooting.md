@@ -193,7 +193,7 @@ speed_weight = 0.5
 cache_weight = 0.1
 
 [daemon]
-socket_path = "/tmp/rch.sock"
+socket_path = "~/.cache/rch/rch.sock"
 health_interval_secs = 30
 ```
 

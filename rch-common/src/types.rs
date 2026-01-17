@@ -2,6 +2,7 @@
 
 use crate::toolchain::ToolchainInfo;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 /// Unique identifier for a worker in the fleet.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -273,6 +274,8 @@ pub struct RchConfig {
     pub transfer: TransferConfig,
     #[serde(default)]
     pub circuit: CircuitBreakerConfig,
+    #[serde(default)]
+    pub output: OutputConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -293,7 +296,62 @@ impl Default for GeneralConfig {
         Self {
             enabled: true,
             log_level: "info".to_string(),
-            socket_path: "/tmp/rch.sock".to_string(),
+            socket_path: default_socket_path(),
+        }
+    }
+}
+
+/// Visibility level for hook output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OutputVisibility {
+    None,
+    Summary,
+    Verbose,
+}
+
+impl Default for OutputVisibility {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
+impl std::fmt::Display for OutputVisibility {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value = match self {
+            OutputVisibility::None => "none",
+            OutputVisibility::Summary => "summary",
+            OutputVisibility::Verbose => "verbose",
+        };
+        write!(f, "{}", value)
+    }
+}
+
+impl std::str::FromStr for OutputVisibility {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_lowercase().as_str() {
+            "none" | "silent" | "quiet" => Ok(Self::None),
+            "summary" | "short" => Ok(Self::Summary),
+            "verbose" | "debug" => Ok(Self::Verbose),
+            _ => Err(()),
+        }
+    }
+}
+
+/// Hook output configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutputConfig {
+    /// Output visibility level for hook messages.
+    #[serde(default = "default_output_visibility")]
+    pub visibility: OutputVisibility,
+}
+
+impl Default for OutputConfig {
+    fn default() -> Self {
+        Self {
+            visibility: OutputVisibility::None,
         }
     }
 }
@@ -677,8 +735,29 @@ fn default_log_level() -> String {
     "info".to_string()
 }
 
-fn default_socket_path() -> String {
+pub fn default_socket_path() -> String {
+    // Prefer XDG_RUNTIME_DIR if available (per-user runtime directory).
+    if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
+        if !runtime_dir.trim().is_empty() {
+            let path = PathBuf::from(runtime_dir).join("rch.sock");
+            return path.to_string_lossy().to_string();
+        }
+    }
+
+    // Fallback to ~/.cache/rch/rch.sock (persistent across reboots).
+    if let Some(cache_dir) = dirs::cache_dir() {
+        let rch_cache = cache_dir.join("rch");
+        let _ = std::fs::create_dir_all(&rch_cache);
+        return rch_cache.join("rch.sock").to_string_lossy().to_string();
+    }
+
+    // Last resort: /tmp/rch.sock
     "/tmp/rch.sock".to_string()
+}
+
+#[allow(dead_code)]
+fn default_output_visibility() -> OutputVisibility {
+    OutputVisibility::None
 }
 
 fn default_confidence() -> f64 {

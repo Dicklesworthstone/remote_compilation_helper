@@ -38,7 +38,8 @@ Content-Type: application/json
 {"worker": {...}, "reason": "success"}
 ```
 
-**Socket path:** `/tmp/rch.sock` (configurable)
+**Socket path:** `$XDG_RUNTIME_DIR/rch.sock` (preferred) or `~/.cache/rch/rch.sock`
+(configurable; falls back to `/tmp/rch.sock`)
 
 ## Consequences
 

@@ -2,9 +2,9 @@
 
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
-use rch_common::{ConfigValueSource, RchConfig};
+use rch_common::{ConfigValueSource, OutputVisibility, RchConfig};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use tracing::debug;
 
@@ -64,6 +64,32 @@ pub fn load_config() -> Result<RchConfig> {
     Ok(config)
 }
 
+/// Validation issues grouped by file.
+#[derive(Debug, Clone, Default)]
+pub struct FileValidation {
+    pub file: PathBuf,
+    pub errors: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+impl FileValidation {
+    pub fn new(file: &Path) -> Self {
+        Self {
+            file: file.to_path_buf(),
+            errors: Vec::new(),
+            warnings: Vec::new(),
+        }
+    }
+
+    pub fn error(&mut self, message: impl Into<String>) {
+        self.errors.push(message.into());
+    }
+
+    pub fn warn(&mut self, message: impl Into<String>) {
+        self.warnings.push(message.into());
+    }
+}
+
 /// Mapping of config keys to their value sources.
 pub type ConfigSourceMap = HashMap<String, ConfigValueSource>;
 
@@ -84,6 +110,8 @@ struct PartialRchConfig {
     transfer: PartialTransferConfig,
     #[serde(default)]
     circuit: PartialCircuitConfig,
+    #[serde(default)]
+    output: PartialOutputConfig,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -113,6 +141,11 @@ struct PartialCircuitConfig {
     window_secs: Option<u64>,
     open_cooldown_secs: Option<u64>,
     half_open_max_probes: Option<u32>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PartialOutputConfig {
+    visibility: Option<OutputVisibility>,
 }
 
 /// Load configuration with source tracking.
@@ -177,6 +210,197 @@ fn load_partial_config(path: &Path) -> Result<PartialRchConfig> {
     Ok(parsed)
 }
 
+/// Validate a standard RCH config file (config.toml or .rch/config.toml).
+pub fn validate_rch_config_file(path: &Path) -> FileValidation {
+    let mut validation = FileValidation::new(path);
+    let contents = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(err) => {
+            validation.error(format!("Read failed: {}", err));
+            return validation;
+        }
+    };
+
+    let config: RchConfig = match toml::from_str(&contents) {
+        Ok(config) => config,
+        Err(err) => {
+            validation.error(format!("TOML parse error: {}", err));
+            return validation;
+        }
+    };
+
+    if config.compilation.confidence_threshold < 0.0
+        || config.compilation.confidence_threshold > 1.0
+    {
+        validation.error("compilation.confidence_threshold must be within [0.0, 1.0]".to_string());
+    }
+
+    if config.transfer.compression_level > 19 {
+        validation.warn("transfer.compression_level should be within [1, 19]".to_string());
+    } else if config.transfer.compression_level == 0 {
+        validation.warn("transfer.compression_level is 0 (compression disabled)".to_string());
+    }
+
+    if config.general.socket_path.trim().is_empty() {
+        validation.error("general.socket_path cannot be empty".to_string());
+    } else {
+        let expanded = shellexpand::tilde(&config.general.socket_path);
+        let socket_path = Path::new(expanded.as_ref());
+        if !socket_path.exists() {
+            validation.warn(format!(
+                "general.socket_path does not exist: {}",
+                socket_path.display()
+            ));
+        }
+    }
+
+    validation
+}
+
+/// Validate a workers configuration file (workers.toml).
+pub fn validate_workers_config_file(path: &Path) -> FileValidation {
+    let mut validation = FileValidation::new(path);
+    let contents = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(err) => {
+            validation.error(format!("Read failed: {}", err));
+            return validation;
+        }
+    };
+
+    let raw: toml::Value = match toml::from_str(&contents) {
+        Ok(value) => value,
+        Err(err) => {
+            validation.error(format!("TOML parse error: {}", err));
+            return validation;
+        }
+    };
+
+    let workers = match raw.get("workers") {
+        Some(val) => match val.as_array() {
+            Some(array) => array,
+            None => {
+                validation.error("workers must be an array".to_string());
+                return validation;
+            }
+        },
+        None => {
+            validation.warn("No workers defined in workers.toml".to_string());
+            return validation;
+        }
+    };
+
+    if workers.is_empty() {
+        validation.warn("No workers defined in workers.toml".to_string());
+        return validation;
+    }
+
+    let mut seen_ids = HashSet::new();
+
+    for (index, worker) in workers.iter().enumerate() {
+        let Some(table) = worker.as_table() else {
+            validation.error(format!("workers[{}] must be a table", index));
+            continue;
+        };
+
+        let id_value = table.get("id");
+        let id = match id_value.and_then(|v| v.as_str()) {
+            Some(value) => value.trim().to_string(),
+            None => {
+                if id_value.is_some() {
+                    validation.error(format!("workers[{}].id must be a string", index));
+                }
+                String::new()
+            }
+        };
+        if id.is_empty() {
+            if id_value.is_none() {
+                validation.error(format!("workers[{}].id is required", index));
+            }
+        } else {
+            let key = id.to_lowercase();
+            if !seen_ids.insert(key) {
+                validation.error(format!("Duplicate worker id '{}'", id));
+            }
+        }
+
+        let host_value = table.get("host");
+        let host = match host_value.and_then(|v| v.as_str()) {
+            Some(value) => value.trim().to_string(),
+            None => {
+                if host_value.is_some() {
+                    validation.error(format!("workers[{}].host must be a string", index));
+                }
+                String::new()
+            }
+        };
+        if host.is_empty() && host_value.is_none() {
+            validation.error(format!("workers[{}].host is required", index));
+        }
+
+        let default_identity = default_identity_file();
+        let identity_field = table.get("identity_file");
+        let identity_value = match identity_field.and_then(|v| v.as_str()) {
+            Some(value) => value,
+            None => {
+                if identity_field.is_some() {
+                    validation.error(format!(
+                        "workers[{}] {} identity_file must be a string",
+                        index,
+                        if id.is_empty() { "(unknown id)" } else { &id }
+                    ));
+                } else {
+                    validation.warn(format!(
+                        "workers[{}] {} has no identity_file (using default {})",
+                        index,
+                        if id.is_empty() { "(unknown id)" } else { &id },
+                        default_identity
+                    ));
+                }
+                default_identity.as_str()
+            }
+        };
+        if identity_value.trim().is_empty() {
+            validation.error(format!(
+                "workers[{}] {} identity_file cannot be empty",
+                index,
+                if id.is_empty() { "(unknown id)" } else { &id }
+            ));
+        }
+
+        let expanded_identity = shellexpand::tilde(identity_value);
+        let identity_path = Path::new(expanded_identity.as_ref());
+        if !identity_path.exists() {
+            validation.error(format!(
+                "workers[{}] {} identity_file not found: {}",
+                index,
+                if id.is_empty() { "(unknown id)" } else { &id },
+                identity_path.display()
+            ));
+        }
+
+        if let Some(total_slots) = table.get("total_slots") {
+            if let Some(value) = total_slots.as_integer() {
+                if value <= 0 {
+                    validation.warn(format!(
+                        "workers[{}] {} total_slots should be > 0",
+                        index,
+                        if id.is_empty() { "(unknown id)" } else { &id }
+                    ));
+                }
+            } else {
+                validation.error(format!(
+                    "workers[{}] {} total_slots must be an integer",
+                    index,
+                    if id.is_empty() { "(unknown id)" } else { &id }
+                ));
+            }
+        }
+    }
+
+    validation
+}
+
 fn default_sources_map() -> ConfigSourceMap {
     let mut sources = HashMap::new();
     for key in [
@@ -193,6 +417,7 @@ fn default_sources_map() -> ConfigSourceMap {
         "circuit.window_secs",
         "circuit.open_cooldown_secs",
         "circuit.half_open_max_probes",
+        "output.visibility",
     ] {
         sources.insert(key.to_string(), ConfigValueSource::Default);
     }
@@ -289,6 +514,13 @@ fn apply_layer(
             set_source(sources, "circuit.half_open_max_probes", source.clone());
         }
     }
+
+    if let Some(visibility) = layer.output.visibility {
+        if visibility != defaults.output.visibility {
+            config.output.visibility = visibility;
+            set_source(sources, "output.visibility", source.clone());
+        }
+    }
 }
 
 fn set_source(sources: &mut ConfigSourceMap, key: &str, source: ConfigValueSource) {
@@ -319,6 +551,9 @@ fn merge_config(mut base: RchConfig, overlay: RchConfig) -> RchConfig {
 
     // Merge circuit breaker section
     merge_circuit(&mut base.circuit, &overlay.circuit, &default.circuit);
+
+    // Merge output section
+    merge_output(&mut base.output, &overlay.output, &default.output);
 
     base
 }
@@ -401,6 +636,17 @@ fn merge_circuit(
     }
 }
 
+/// Merge OutputConfig fields.
+fn merge_output(
+    base: &mut rch_common::OutputConfig,
+    overlay: &rch_common::OutputConfig,
+    default: &rch_common::OutputConfig,
+) {
+    if overlay.visibility != default.visibility {
+        base.visibility = overlay.visibility;
+    }
+}
+
 /// Apply environment variable overrides.
 fn apply_env_overrides(mut config: RchConfig) -> RchConfig {
     apply_env_overrides_inner(&mut config, None, None);
@@ -417,6 +663,14 @@ fn apply_env_overrides_inner(
             map.get(name).cloned()
         } else {
             std::env::var(name).ok()
+        }
+    };
+
+    let parse_bool = |value: &str| -> Option<bool> {
+        match value.trim().to_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" | "" => Some(false),
+            _ => None,
         }
     };
 
@@ -476,6 +730,41 @@ fn apply_env_overrides_inner(
                     ConfigValueSource::EnvVar("RCH_COMPRESSION".to_string()),
                 );
             }
+        }
+    }
+
+    let mut visibility_override: Option<(OutputVisibility, String)> = None;
+
+    if let Some(val) = get_env("RCH_QUIET") {
+        if parse_bool(&val).unwrap_or(false) {
+            visibility_override = Some((OutputVisibility::None, "RCH_QUIET".to_string()));
+        }
+    }
+
+    if visibility_override.is_none() {
+        if let Some(val) = get_env("RCH_VISIBILITY") {
+            if let Ok(mode) = val.parse::<OutputVisibility>() {
+                visibility_override = Some((mode, "RCH_VISIBILITY".to_string()));
+            }
+        }
+    }
+
+    if visibility_override.is_none() {
+        if let Some(val) = get_env("RCH_VERBOSE") {
+            if parse_bool(&val).unwrap_or(false) {
+                visibility_override = Some((OutputVisibility::Verbose, "RCH_VERBOSE".to_string()));
+            }
+        }
+    }
+
+    if let Some((mode, source_var)) = visibility_override {
+        config.output.visibility = mode;
+        if let Some(ref mut sources) = sources {
+            set_source(
+                sources,
+                "output.visibility",
+                ConfigValueSource::EnvVar(source_var),
+            );
         }
     }
 }
@@ -590,6 +879,10 @@ exclude_patterns = [
     "*.rlib",
     "*.rmeta",
 ]
+
+[output]
+# Hook output visibility: none, summary, verbose
+visibility = "none"
 "#
     .to_string()
 }
@@ -645,6 +938,7 @@ pub fn validate_config(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::NamedTempFile;
     use tracing::info;
 
     #[test]
@@ -678,6 +972,73 @@ mod tests {
         let _: WorkersConfig =
             toml::from_str(&toml_str).expect("Example workers config should parse");
         info!("PASS: Example workers config parses successfully");
+    }
+
+    #[test]
+    fn test_validate_valid_config() {
+        info!("TEST START: test_validate_valid_config");
+        let mut file = NamedTempFile::new().expect("create temp file");
+        std::io::Write::write_all(file.as_file_mut(), example_project_config().as_bytes())
+            .expect("write config");
+        let result = validate_rch_config_file(file.path());
+        info!(
+            "RESULT: errors={}, warnings={}",
+            result.errors.len(),
+            result.warnings.len()
+        );
+        assert!(result.errors.is_empty());
+        info!("TEST PASS: test_validate_valid_config");
+    }
+
+    #[test]
+    fn test_validate_invalid_toml_syntax() {
+        info!("TEST START: test_validate_invalid_toml_syntax");
+        let mut file = NamedTempFile::new().expect("create temp file");
+        std::io::Write::write_all(file.as_file_mut(), b"invalid [ toml").expect("write config");
+        let result = validate_rch_config_file(file.path());
+        info!("RESULT: errors={:?}", result.errors);
+        assert!(!result.errors.is_empty());
+        info!("TEST PASS: test_validate_invalid_toml_syntax");
+    }
+
+    #[test]
+    fn test_validate_threshold_range() {
+        info!("TEST START: test_validate_threshold_range");
+        let mut file = NamedTempFile::new().expect("create temp file");
+        std::io::Write::write_all(
+            file.as_file_mut(),
+            b"[compilation]\nconfidence_threshold = 1.5\n",
+        )
+        .expect("write config");
+        let result = validate_rch_config_file(file.path());
+        info!("RESULT: errors={:?}", result.errors);
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.contains("confidence_threshold"))
+        );
+        info!("TEST PASS: test_validate_threshold_range");
+    }
+
+    #[test]
+    fn test_validate_file_path_exists() {
+        info!("TEST START: test_validate_file_path_exists");
+        let mut file = NamedTempFile::new().expect("create temp file");
+        let workers_toml = r#"
+[[workers]]
+id = "gpu-1"
+host = "10.0.0.5"
+user = "ubuntu"
+identity_file = "/nonexistent/ssh_key"
+total_slots = 4
+"#;
+        std::io::Write::write_all(file.as_file_mut(), workers_toml.as_bytes())
+            .expect("write workers config");
+        let result = validate_workers_config_file(file.path());
+        info!("RESULT: errors={:?}", result.errors);
+        assert!(result.errors.iter().any(|e| e.contains("identity_file")));
+        info!("TEST PASS: test_validate_file_path_exists");
     }
 
     // ========================================================================
@@ -927,6 +1288,29 @@ mod tests {
             &ConfigValueSource::EnvVar("RCH_LOG_LEVEL".to_string())
         );
         info!("PASS: Environment source detected for general.log_level");
+    }
+
+    #[test]
+    fn test_source_tracking_env_visibility_override() {
+        info!("TEST: test_source_tracking_env_visibility_override");
+        let mut env_overrides: HashMap<String, String> = HashMap::new();
+        env_overrides.insert("RCH_VISIBILITY".to_string(), "summary".to_string());
+
+        let loaded = load_config_with_sources_from_paths(None, None, Some(&env_overrides))
+            .expect("load_config_with_sources_from_paths should succeed");
+
+        info!("RESULT: visibility={}", loaded.config.output.visibility);
+        assert_eq!(loaded.config.output.visibility, OutputVisibility::Summary);
+
+        let source = loaded
+            .sources
+            .get("output.visibility")
+            .expect("output.visibility source present");
+        assert_eq!(
+            source,
+            &ConfigValueSource::EnvVar("RCH_VISIBILITY".to_string())
+        );
+        info!("PASS: Environment source detected for output.visibility");
     }
 
     #[test]

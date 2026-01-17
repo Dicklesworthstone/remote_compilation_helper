@@ -63,7 +63,7 @@ rch daemon status
 pgrep -x rchd
 
 # Check socket file
-ls -la /tmp/rch.sock
+ls -la "${XDG_RUNTIME_DIR:-$HOME/.cache/rch}/rch.sock"
 
 # Check daemon logs
 rch daemon logs --tail 50

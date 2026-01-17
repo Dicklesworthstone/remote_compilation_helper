@@ -15,6 +15,8 @@ pub mod benchmarks;
 pub mod collect;
 pub mod speedscore;
 
+pub use rch_common::{LogConfig, LogFormat, LoggingGuards, init_logging};
+
 pub use benchmarks::compilation::{
     CompilationBenchmark, CompilationBenchmarkError, CompilationBenchmarkResult,
 };

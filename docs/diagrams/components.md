@@ -33,7 +33,7 @@ RCH consists of three main components that work together to transparently offloa
 │        │              └───────────────────────┬────────────────────────┘    │
 │        │                                      │                             │
 │        │                                      │ Unix Socket                 │
-│        │                                      │ /tmp/rch.sock               │
+│        │                                      │ ~/.cache/rch/rch.sock       │
 │        │                                      ▼                             │
 │        │              ┌───────────────────────────────────────────────────┐ │
 │        │              │              rchd (Local Daemon)                  │ │

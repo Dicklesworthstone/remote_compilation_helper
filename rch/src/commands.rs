@@ -28,6 +28,59 @@ use crate::transfer::project_id_from_path;
 /// Default socket path.
 const DEFAULT_SOCKET_PATH: &str = "/tmp/rch.sock";
 
+fn print_file_validation(
+    label: &str,
+    validations: &[crate::config::FileValidation],
+    style: &crate::ui::theme::Theme,
+    path: &Path,
+) {
+    let Some(validation) = validations.iter().find(|v| v.file == path) else {
+        return;
+    };
+
+    if validation.errors.is_empty() && validation.warnings.is_empty() {
+        println!(
+            "{} {}: {}",
+            StatusIndicator::Success.display(style),
+            style.highlight(label),
+            style.success("Valid")
+        );
+        return;
+    }
+
+    if validation.errors.is_empty() {
+        println!(
+            "{} {}: {}",
+            StatusIndicator::Warning.display(style),
+            style.highlight(label),
+            style.warning("Valid (warnings)")
+        );
+    } else {
+        println!(
+            "{} {}: {}",
+            StatusIndicator::Error.display(style),
+            style.highlight(label),
+            style.error("Invalid")
+        );
+    }
+
+    for warning in &validation.warnings {
+        println!(
+            "  {} {}",
+            StatusIndicator::Warning.display(style),
+            style.muted(warning)
+        );
+    }
+
+    for error in &validation.errors {
+        println!(
+            "  {} {}",
+            StatusIndicator::Error.display(style),
+            style.error(error)
+        );
+    }
+}
+
 // =============================================================================
 // JSON Response Types
 // =============================================================================
@@ -4212,78 +4265,89 @@ enabled = true
 pub fn config_validate(ctx: &OutputContext) -> Result<()> {
     let style = ctx.theme();
 
-    println!("Validating RCH configuration...\n");
+    let mut validations: Vec<crate::config::FileValidation> = Vec::new();
 
-    let mut errors = 0;
-    let mut warnings = 0;
-
-    // Check config directory
     let config_dir = match config_dir() {
         Some(d) => d,
         None => {
+            if ctx.is_json() {
+                let response = ConfigValidationResponse {
+                    errors: vec![ConfigValidationIssue {
+                        file: "config".to_string(),
+                        message: "Could not determine config directory".to_string(),
+                    }],
+                    warnings: vec![],
+                    valid: false,
+                };
+                let _ = ctx.json(&JsonResponse::ok_cmd("config validate", response));
+                std::process::exit(1);
+            }
             println!(
                 "{} Could not determine config directory",
                 StatusIndicator::Error.display(style)
             );
-            return Ok(());
+            std::process::exit(1);
         }
     };
 
-    // Check config.toml
+    // config.toml
     let config_path = config_dir.join("config.toml");
     if config_path.exists() {
-        match std::fs::read_to_string(&config_path) {
-            Ok(content) => match toml::from_str::<RchConfig>(&content) {
-                Ok(config) => {
-                    println!(
-                        "{} {}: {}",
-                        StatusIndicator::Success.display(style),
-                        style.highlight("config.toml"),
-                        style.success("Valid")
-                    );
+        validations.push(crate::config::validate_rch_config_file(&config_path));
+    }
 
-                    // Validate values
-                    if config.compilation.confidence_threshold < 0.0
-                        || config.compilation.confidence_threshold > 1.0
-                    {
-                        println!(
-                            "  {} {} should be between 0.0 and 1.0",
-                            StatusIndicator::Warning.display(style),
-                            style.key("confidence_threshold")
-                        );
-                        warnings += 1;
-                    }
-                    if config.transfer.compression_level > 19 {
-                        println!(
-                            "  {} {} should be 1-19",
-                            StatusIndicator::Warning.display(style),
-                            style.key("compression_level")
-                        );
-                        warnings += 1;
-                    }
-                }
-                Err(e) => {
-                    println!(
-                        "{} {}: {} - {}",
-                        StatusIndicator::Error.display(style),
-                        style.highlight("config.toml"),
-                        style.error("Parse error"),
-                        style.muted(&e.to_string())
-                    );
-                    errors += 1;
-                }
-            },
-            Err(e) => {
-                println!(
-                    "{} {}: {} - {}",
-                    StatusIndicator::Error.display(style),
-                    style.highlight("config.toml"),
-                    style.error("Read error"),
-                    style.muted(&e.to_string())
-                );
-                errors += 1;
-            }
+    // workers.toml
+    let workers_path = config_dir.join("workers.toml");
+    if workers_path.exists() {
+        validations.push(crate::config::validate_workers_config_file(&workers_path));
+    } else {
+        let mut missing = crate::config::FileValidation::new(&workers_path);
+        missing.error("workers.toml not found (run `rch config init`)".to_string());
+        validations.push(missing);
+    }
+
+    // project config
+    let project_config = PathBuf::from(".rch/config.toml");
+    if project_config.exists() {
+        validations.push(crate::config::validate_rch_config_file(&project_config));
+    }
+
+    let mut error_items = Vec::new();
+    let mut warning_items = Vec::new();
+    for validation in &validations {
+        for error in &validation.errors {
+            error_items.push(ConfigValidationIssue {
+                file: validation.file.display().to_string(),
+                message: error.clone(),
+            });
         }
+        for warning in &validation.warnings {
+            warning_items.push(ConfigValidationIssue {
+                file: validation.file.display().to_string(),
+                message: warning.clone(),
+            });
+        }
+    }
+
+    let valid = error_items.is_empty();
+
+    if ctx.is_json() {
+        let response = ConfigValidationResponse {
+            errors: error_items,
+            warnings: warning_items,
+            valid,
+        };
+        let _ = ctx.json(&JsonResponse::ok_cmd("config validate", response));
+        if !valid {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
+    println!("Validating RCH configuration...\n");
+
+    if config_path.exists() {
+        print_file_validation("config.toml", &validations, style, &config_path);
     } else {
         println!(
             "{} {}: {} {}",
@@ -4294,118 +4358,26 @@ pub fn config_validate(ctx: &OutputContext) -> Result<()> {
         );
     }
 
-    // Check workers.toml
-    let workers_path = config_dir.join("workers.toml");
-    if workers_path.exists() {
-        match std::fs::read_to_string(&workers_path) {
-            Ok(content) => match toml::from_str::<toml::Value>(&content) {
-                Ok(parsed) => {
-                    let workers = parsed
-                        .get("workers")
-                        .and_then(|w| w.as_array())
-                        .map(|a| a.len())
-                        .unwrap_or(0);
-                    println!(
-                        "{} {}: {} ({} workers)",
-                        StatusIndicator::Success.display(style),
-                        style.highlight("workers.toml"),
-                        style.success("Valid"),
-                        workers
-                    );
+    print_file_validation("workers.toml", &validations, style, &workers_path);
 
-                    if workers == 0 {
-                        println!(
-                            "  {} No workers defined",
-                            StatusIndicator::Warning.display(style)
-                        );
-                        warnings += 1;
-                    }
-                }
-                Err(e) => {
-                    println!(
-                        "{} {}: {} - {}",
-                        StatusIndicator::Error.display(style),
-                        style.highlight("workers.toml"),
-                        style.error("Parse error"),
-                        style.muted(&e.to_string())
-                    );
-                    errors += 1;
-                }
-            },
-            Err(e) => {
-                println!(
-                    "{} {}: {} - {}",
-                    StatusIndicator::Error.display(style),
-                    style.highlight("workers.toml"),
-                    style.error("Read error"),
-                    style.muted(&e.to_string())
-                );
-                errors += 1;
-            }
-        }
-    } else {
-        println!(
-            "{} {}: {}",
-            StatusIndicator::Error.display(style),
-            style.highlight("workers.toml"),
-            style.error("Not found")
-        );
-        println!(
-            "  {} Run {} to create it",
-            StatusIndicator::Info.display(style),
-            style.highlight("rch config init")
-        );
-        errors += 1;
-    }
-
-    // Check project config
-    let project_config = PathBuf::from(".rch/config.toml");
     if project_config.exists() {
-        match std::fs::read_to_string(&project_config) {
-            Ok(content) => match toml::from_str::<RchConfig>(&content) {
-                Ok(_) => println!(
-                    "{} {}: {}",
-                    StatusIndicator::Success.display(style),
-                    style.highlight(".rch/config.toml"),
-                    style.success("Valid")
-                ),
-                Err(e) => {
-                    println!(
-                        "{} {}: {} - {}",
-                        StatusIndicator::Error.display(style),
-                        style.highlight(".rch/config.toml"),
-                        style.error("Parse error"),
-                        style.muted(&e.to_string())
-                    );
-                    errors += 1;
-                }
-            },
-            Err(e) => {
-                println!(
-                    "{} {}: {} - {}",
-                    StatusIndicator::Error.display(style),
-                    style.highlight(".rch/config.toml"),
-                    style.error("Read error"),
-                    style.muted(&e.to_string())
-                );
-                errors += 1;
-            }
-        }
+        print_file_validation(".rch/config.toml", &validations, style, &project_config);
     }
 
     println!();
-    if errors > 0 {
+    if !valid {
         println!(
             "{} {} error(s), {} warning(s)",
             style.format_error("Validation failed:"),
-            errors,
-            warnings
+            error_items.len(),
+            warning_items.len()
         );
-    } else if warnings > 0 {
+        std::process::exit(1);
+    } else if !warning_items.is_empty() {
         println!(
             "{} with {} warning(s)",
             style.format_warning("Validation passed"),
-            warnings
+            warning_items.len()
         );
     } else {
         println!("{}", style.format_success("Validation passed!"));
@@ -4499,6 +4471,7 @@ pub fn config_export(format: &str, ctx: &OutputContext) -> Result<()> {
             println!();
             println!("export RCH_ENABLED={}", config.general.enabled);
             println!("export RCH_LOG_LEVEL=\"{}\"", config.general.log_level);
+            println!("export RCH_VISIBILITY=\"{}\"", config.output.visibility);
             println!(
                 "export RCH_DAEMON_SOCKET=\"{}\"",
                 config.general.socket_path
@@ -4523,6 +4496,7 @@ pub fn config_export(format: &str, ctx: &OutputContext) -> Result<()> {
             println!();
             println!("RCH_ENABLED={}", config.general.enabled);
             println!("RCH_LOG_LEVEL={}", config.general.log_level);
+            println!("RCH_VISIBILITY={}", config.output.visibility);
             println!("RCH_DAEMON_SOCKET={}", config.general.socket_path);
             println!(
                 "RCH_CONFIDENCE_THRESHOLD={}",
@@ -4546,6 +4520,9 @@ pub fn config_export(format: &str, ctx: &OutputContext) -> Result<()> {
                         "enabled": config.general.enabled,
                         "log_level": config.general.log_level,
                         "socket_path": config.general.socket_path,
+                    },
+                    "output": {
+                        "visibility": config.output.visibility.to_string(),
                     },
                     "compilation": {
                         "confidence_threshold": config.compilation.confidence_threshold,

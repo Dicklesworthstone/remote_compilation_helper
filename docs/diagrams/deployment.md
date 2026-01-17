@@ -35,7 +35,7 @@ Typical deployment with multiple AI agents and remote workers:
 │  └───────────────────────────────┬───────────────────────────────────────┘  │
 │                                  │                                          │
 │                                  │ Unix Socket                              │
-│                                  │ /tmp/rch.sock                            │
+│                                  │ ~/.cache/rch/rch.sock                    │
 │                                  ▼                                          │
 │  ┌───────────────────────────────────────────────────────────────────────┐  │
 │  │                        rchd (Local Daemon)                            │  │

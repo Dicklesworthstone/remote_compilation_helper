@@ -10,12 +10,12 @@ use crate::transfer::{
     TransferPipeline, compute_project_hash, default_rust_artifact_patterns, project_id_from_path,
 };
 use rch_common::{
-    CompilationKind, HookInput, HookOutput, RequiredRuntime, SelectedWorker, SelectionResponse,
-    ToolchainInfo, TransferConfig, WorkerConfig, WorkerId, classify_command,
+    CompilationKind, HookInput, HookOutput, OutputVisibility, RequiredRuntime, SelectedWorker,
+    SelectionResponse, ToolchainInfo, TransferConfig, WorkerConfig, WorkerId, classify_command,
 };
 use std::io::{self, BufRead, Write};
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tracing::{debug, info, warn};
@@ -61,6 +61,38 @@ pub async fn run_hook() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct HookReporter {
+    visibility: OutputVisibility,
+}
+
+impl HookReporter {
+    fn new(visibility: OutputVisibility) -> Self {
+        Self { visibility }
+    }
+
+    fn summary(&self, message: &str) {
+        if self.visibility != OutputVisibility::None {
+            eprintln!("{}", message);
+        }
+    }
+
+    fn verbose(&self, message: &str) {
+        if self.visibility == OutputVisibility::Verbose {
+            eprintln!("{}", message);
+        }
+    }
+}
+
+fn format_duration_ms(duration: Duration) -> String {
+    let millis = duration.as_millis();
+    if millis >= 1000 {
+        format!("{:.1}s", millis as f64 / 1000.0)
+    } else {
+        format!("{}ms", millis)
+    }
+}
+
 /// Process a hook request and return the output.
 async fn process_hook(input: HookInput) -> HookOutput {
     // Tier 0: Only process Bash tool
@@ -76,6 +108,8 @@ async fn process_hook(input: HookInput) -> HookOutput {
             return HookOutput::allow();
         }
     };
+
+    let reporter = HookReporter::new(config.output.visibility);
 
     if !config.general.enabled {
         debug!("RCH disabled via config, allowing local execution");
@@ -122,6 +156,10 @@ async fn process_hook(input: HookInput) -> HookOutput {
         "Compilation detected: {:?} (confidence: {:.2}, classified in {:.3}ms)",
         classification.kind, classification.confidence, duration_ms
     );
+    reporter.verbose(&format!(
+        "[RCH] compile {:?} (confidence {:.2})",
+        classification.kind, classification.confidence
+    ));
 
     // Check confidence threshold
     let confidence_threshold = config.compilation.confidence_threshold;
@@ -130,12 +168,14 @@ async fn process_hook(input: HookInput) -> HookOutput {
             "Confidence {:.2} below threshold {:.2}, allowing local execution",
             classification.confidence, confidence_threshold
         );
+        reporter.summary("[RCH] local (confidence below threshold)");
         return HookOutput::allow();
     }
 
     // Query daemon for a worker
     let project = extract_project_name();
     let estimated_cores = 4;
+    reporter.verbose("[RCH] selecting worker...");
 
     // Detect toolchain to send to daemon
     let project_root_for_detection = std::env::current_dir().ok();
@@ -175,6 +215,7 @@ async fn process_hook(input: HookInput) -> HookOutput {
                     "⚠️ RCH: No remote workers available ({}), executing locally",
                     response.reason
                 );
+                reporter.summary(&format!("[RCH] local ({})", response.reason));
                 return HookOutput::allow();
             };
 
@@ -182,15 +223,22 @@ async fn process_hook(input: HookInput) -> HookOutput {
                 "Selected worker: {} at {}@{} ({} slots, speed {:.1})",
                 worker.id, worker.user, worker.host, worker.slots_available, worker.speed_score
             );
+            reporter.verbose(&format!(
+                "[RCH] selected {}@{} (slots {}, speed {:.1})",
+                worker.user, worker.host, worker.slots_available, worker.speed_score
+            ));
 
             // Execute remote compilation pipeline
+            let remote_start = Instant::now();
             let result = execute_remote_compilation(
                 &worker,
                 command,
                 config.transfer.clone(),
                 toolchain.as_ref(),
+                &reporter,
             )
             .await;
+            let remote_elapsed = remote_start.elapsed();
 
             // Always release slots after execution
             if let Err(e) =
@@ -205,6 +253,11 @@ async fn process_hook(input: HookInput) -> HookOutput {
                         // Command succeeded remotely - deny local execution
                         // The agent sees output via stderr, artifacts are local
                         info!("Remote compilation succeeded, denying local execution");
+                        reporter.summary(&format!(
+                            "[RCH] remote {} ({})",
+                            worker.id,
+                            format_duration_ms(remote_elapsed)
+                        ));
                         HookOutput::deny(
                             "RCH: Command executed successfully on remote worker".to_string(),
                         )
@@ -214,6 +267,8 @@ async fn process_hook(input: HookInput) -> HookOutput {
                             "Remote toolchain failure detected (exit {}), falling back to local",
                             result.exit_code
                         );
+                        reporter
+                            .summary(&format!("[RCH] local (toolchain missing on {})", worker.id));
                         HookOutput::allow()
                     } else {
                         // Command failed remotely - still deny to prevent re-execution
@@ -222,6 +277,10 @@ async fn process_hook(input: HookInput) -> HookOutput {
                             "Remote compilation failed (exit {}), denying local execution",
                             result.exit_code
                         );
+                        reporter.summary(&format!(
+                            "[RCH] remote {} failed (exit {})",
+                            worker.id, result.exit_code
+                        ));
                         HookOutput::deny(format!(
                             "RCH: Remote compilation failed with exit code {}",
                             result.exit_code
@@ -234,12 +293,14 @@ async fn process_hook(input: HookInput) -> HookOutput {
                         "Remote execution pipeline failed: {}, falling back to local",
                         e
                     );
+                    reporter.summary("[RCH] local (remote pipeline failed)");
                     HookOutput::allow()
                 }
             }
         }
         Err(e) => {
             warn!("Failed to query daemon: {}, allowing local execution", e);
+            reporter.summary("[RCH] local (daemon unavailable)");
             HookOutput::allow()
         }
     }
@@ -462,6 +523,7 @@ async fn execute_remote_compilation(
     command: &str,
     transfer_config: TransferConfig,
     toolchain: Option<&ToolchainInfo>,
+    reporter: &HookReporter,
 ) -> anyhow::Result<RemoteExecutionResult> {
     let worker_config = selected_worker_to_config(worker);
 
@@ -476,6 +538,10 @@ async fn execute_remote_compilation(
         "Starting remote compilation pipeline for {} (hash: {})",
         project_id, project_hash
     );
+    reporter.verbose(&format!(
+        "[RCH] sync start (project {} on {})",
+        project_id, worker_config.id
+    ));
 
     // Create transfer pipeline
     let pipeline = TransferPipeline::new(
@@ -492,9 +558,14 @@ async fn execute_remote_compilation(
         "Sync complete: {} files, {} bytes in {}ms",
         sync_result.files_transferred, sync_result.bytes_transferred, sync_result.duration_ms
     );
+    reporter.verbose(&format!(
+        "[RCH] sync done: {} files, {} bytes in {}ms",
+        sync_result.files_transferred, sync_result.bytes_transferred, sync_result.duration_ms
+    ));
 
     // Step 2: Execute command remotely with streaming output
     info!("Executing command remotely: {}", command);
+    reporter.verbose(&format!("[RCH] exec start: {}", command));
 
     // Capture stderr for toolchain failure detection
     let mut stderr_capture = String::new();
@@ -521,10 +592,15 @@ async fn execute_remote_compilation(
         "Remote command finished: exit={} in {}ms",
         result.exit_code, result.duration_ms
     );
+    reporter.verbose(&format!(
+        "[RCH] exec done: exit={} in {}ms",
+        result.exit_code, result.duration_ms
+    ));
 
     // Step 3: Retrieve artifacts
     if result.success() {
         info!("Retrieving build artifacts...");
+        reporter.verbose("[RCH] artifacts: retrieving...");
         let artifact_patterns = default_rust_artifact_patterns();
         match pipeline
             .retrieve_artifacts(&worker_config, &artifact_patterns)
@@ -537,9 +613,16 @@ async fn execute_remote_compilation(
                     artifact_result.bytes_transferred,
                     artifact_result.duration_ms
                 );
+                reporter.verbose(&format!(
+                    "[RCH] artifacts done: {} files, {} bytes in {}ms",
+                    artifact_result.files_transferred,
+                    artifact_result.bytes_transferred,
+                    artifact_result.duration_ms
+                ));
             }
             Err(e) => {
                 warn!("Failed to retrieve artifacts: {}", e);
+                reporter.verbose("[RCH] artifacts failed (continuing)");
                 // Continue anyway - compilation succeeded
             }
         }

@@ -16,6 +16,10 @@ use tokio::sync::RwLock;
 use tokio::time::interval;
 use tracing::{debug, info, warn};
 
+fn is_mock_transport(worker: &WorkerState) -> bool {
+    mock::is_mock_enabled() || mock::is_mock_worker(&worker.config)
+}
+
 /// Default health check interval.
 const DEFAULT_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -411,10 +415,10 @@ async fn check_worker_health(
 
     // Debug: log mock mode status and env var
     let mock_env = std::env::var("RCH_MOCK_SSH").unwrap_or_default();
-    let mock_enabled = mock::is_mock_enabled();
+    let mock_enabled = is_mock_transport(worker);
     debug!(
-        "Health check for {}: mock_enabled={}, RCH_MOCK_SSH='{}'",
-        worker.config.id, mock_enabled, mock_env
+        "Health check for {}: mock_enabled={}, RCH_MOCK_SSH='{}', host='{}'",
+        worker.config.id, mock_enabled, mock_env, worker.config.host
     );
 
     if mock_enabled {
@@ -500,7 +504,7 @@ pub async fn probe_worker_capabilities(
     use rch_common::{SshClient, SshOptions, WorkerCapabilities};
 
     // Check if mock mode is enabled
-    if mock::is_mock_enabled() {
+    if is_mock_transport(worker) {
         // In mock mode, return default capabilities (no Bun)
         debug!(
             "Worker {} capabilities probe: mock mode, returning defaults",

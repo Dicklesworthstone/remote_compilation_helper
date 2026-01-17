@@ -11,8 +11,10 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Default socket path.
-const DEFAULT_SOCKET_PATH: &str = "/tmp/rch.sock";
+/// Default socket path (XDG_RUNTIME_DIR -> ~/.cache/rch -> /tmp fallback).
+fn default_socket_path() -> PathBuf {
+    PathBuf::from(rch_common::default_socket_path())
+}
 
 // =============================================================================
 // JSON Response Types
@@ -231,7 +233,7 @@ impl QuickCheckResult {
 /// Run a quick health check (for post-install feedback).
 /// This runs fast checks only (no network probes).
 pub fn run_quick_check() -> QuickCheckResult {
-    let socket_path = Path::new(DEFAULT_SOCKET_PATH);
+    let socket_path = default_socket_path();
     let daemon_running = socket_path.exists();
 
     // Check workers
@@ -923,14 +925,14 @@ fn check_daemon(checks: &mut Vec<CheckResult>, ctx: &OutputContext, _options: &D
         println!();
     }
 
-    let socket_path = Path::new(DEFAULT_SOCKET_PATH);
+    let socket_path = default_socket_path();
     let result = if socket_path.exists() {
         CheckResult {
             category: "daemon".to_string(),
             name: "daemon_socket".to_string(),
             status: CheckStatus::Pass,
             message: "Daemon socket exists".to_string(),
-            details: Some(DEFAULT_SOCKET_PATH.to_string()),
+            details: Some(socket_path.to_string_lossy().to_string()),
             suggestion: None,
             fixable: false,
         }
@@ -940,7 +942,7 @@ fn check_daemon(checks: &mut Vec<CheckResult>, ctx: &OutputContext, _options: &D
             name: "daemon_socket".to_string(),
             status: CheckStatus::Warning,
             message: "Daemon is not running".to_string(),
-            details: Some(DEFAULT_SOCKET_PATH.to_string()),
+            details: Some(socket_path.to_string_lossy().to_string()),
             suggestion: Some("Start daemon with: rch daemon start".to_string()),
             fixable: false,
         }
@@ -948,6 +950,24 @@ fn check_daemon(checks: &mut Vec<CheckResult>, ctx: &OutputContext, _options: &D
 
     print_check_result(&result, ctx);
     checks.push(result);
+
+    // Warn if a legacy /tmp socket exists but the default has moved.
+    let legacy_socket = Path::new("/tmp/rch.sock");
+    if socket_path != legacy_socket && legacy_socket.exists() {
+        let legacy_result = CheckResult {
+            category: "daemon".to_string(),
+            name: "legacy_socket_path".to_string(),
+            status: CheckStatus::Warning,
+            message: "Legacy /tmp socket detected".to_string(),
+            details: Some(legacy_socket.display().to_string()),
+            suggestion: Some(
+                "Restart the daemon so it binds to the new default socket path".to_string(),
+            ),
+            fixable: false,
+        };
+        print_check_result(&legacy_result, ctx);
+        checks.push(legacy_result);
+    }
 
     if !ctx.is_json() {
         println!();
