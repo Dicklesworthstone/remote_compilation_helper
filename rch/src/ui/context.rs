@@ -231,8 +231,9 @@ impl OutputContext {
             ColorChoice::Auto => mode == OutputMode::Human && caps.supports_color,
         };
         let supports_unicode = caps.supports_unicode;
+        let supports_hyperlinks = mode == OutputMode::Human && caps.supports_hyperlinks;
 
-        let style = Style::new(colors_enabled, supports_unicode);
+        let style = Style::new(colors_enabled, supports_unicode, supports_hyperlinks);
 
         Self {
             mode,

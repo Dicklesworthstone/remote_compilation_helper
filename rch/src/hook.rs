@@ -10,8 +10,8 @@ use crate::transfer::{
 };
 use anyhow::Result;
 use rch_common::{
-    HookInput, HookOutput, SelectedWorker, SelectionResponse, TransferConfig, WorkerConfig,
-    classify_command,
+    HookInput, HookOutput, ReleaseRequest, SelectedWorker, SelectionResponse, ToolchainInfo,
+    TransferConfig, WorkerConfig, WorkerId, classify_command,
 };
 use std::io::{self, BufRead, Write};
 use std::path::Path;
@@ -112,8 +112,33 @@ async fn process_hook(input: HookInput) -> HookOutput {
 
     // Query daemon for a worker
     let project = extract_project_name();
+    let estimated_cores = 4;
 
-    match query_daemon(&config.general.socket_path, &project, 4).await {
+    // Detect toolchain to send to daemon
+    let project_root_for_detection = std::env::current_dir().ok();
+    let toolchain = if let Some(root) = &project_root_for_detection {
+        match detect_toolchain(root) {
+            Ok(tc) => {
+                debug!("Detected toolchain: {}", tc);
+                Some(tc)
+            }
+            Err(e) => {
+                warn!("Failed to detect toolchain: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    match query_daemon(
+        &config.general.socket_path,
+        &project,
+        estimated_cores,
+        toolchain.as_ref(),
+    )
+    .await
+    {
         Ok(response) => {
             // Check if a worker was assigned
             let Some(worker) = response.worker else {
@@ -131,7 +156,22 @@ async fn process_hook(input: HookInput) -> HookOutput {
             );
 
             // Execute remote compilation pipeline
-            match execute_remote_compilation(&worker, command, config.transfer.clone()).await {
+            let result = execute_remote_compilation(
+                &worker,
+                command,
+                config.transfer.clone(),
+                toolchain.as_ref(),
+            )
+            .await;
+
+            // Always release slots after execution
+            if let Err(e) =
+                release_worker(&config.general.socket_path, &worker.id, estimated_cores).await
+            {
+                warn!("Failed to release worker slots: {}", e);
+            }
+
+            match result {
                 Ok(result) => {
                     if result.exit_code == 0 {
                         // Command succeeded remotely - deny local execution
@@ -178,7 +218,12 @@ async fn process_hook(input: HookInput) -> HookOutput {
 }
 
 /// Query the daemon for a worker.
-async fn query_daemon(socket_path: &str, project: &str, cores: u32) -> Result<SelectionResponse> {
+async fn query_daemon(
+    socket_path: &str,
+    project: &str,
+    cores: u32,
+    toolchain: Option<&ToolchainInfo>,
+) -> Result<SelectionResponse> {
     // Check if socket exists
     if !Path::new(socket_path).exists() {
         return Err(anyhow::anyhow!("Daemon socket not found: {}", socket_path));
@@ -188,12 +233,17 @@ async fn query_daemon(socket_path: &str, project: &str, cores: u32) -> Result<Se
     let stream = UnixStream::connect(socket_path).await?;
     let (reader, mut writer) = stream.into_split();
 
+    // Build query string
+    let mut query = format!("project={}&cores={}", urlencoding_encode(project), cores);
+
+    if let Some(tc) = toolchain {
+        if let Ok(json) = serde_json::to_string(tc) {
+            query.push_str(&format!("&toolchain={}", urlencoding_encode(&json)));
+        }
+    }
+
     // Send request
-    let request = format!(
-        "GET /select-worker?project={}&cores={}\n",
-        urlencoding_encode(project),
-        cores
-    );
+    let request = format!("GET /select-worker?{}\n", query);
     writer.write_all(request.as_bytes()).await?;
     writer.flush().await?;
 
@@ -219,6 +269,32 @@ async fn query_daemon(socket_path: &str, project: &str, cores: u32) -> Result<Se
     // Parse response
     let response: SelectionResponse = serde_json::from_str(body.trim())?;
     Ok(response)
+}
+
+/// Release reserved slots on a worker.
+async fn release_worker(socket_path: &str, worker_id: &WorkerId, slots: u32) -> Result<()> {
+    if !Path::new(socket_path).exists() {
+        return Ok(()); // Ignore if daemon gone
+    }
+
+    let stream = UnixStream::connect(socket_path).await?;
+    let (reader, mut writer) = stream.into_split();
+
+    // Send request
+    let request = format!(
+        "POST /release-worker?worker={}&slots={}\n",
+        urlencoding_encode(worker_id.as_str()),
+        slots
+    );
+    writer.write_all(request.as_bytes()).await?;
+    writer.flush().await?;
+
+    // Read response line (to ensure daemon processed it)
+    let mut reader = BufReader::new(reader);
+    let mut line = String::new();
+    reader.read_line(&mut line).await?;
+
+    Ok(())
 }
 
 /// URL percent-encoding for query parameters.
@@ -314,6 +390,7 @@ async fn execute_remote_compilation(
     worker: &SelectedWorker,
     command: &str,
     transfer_config: TransferConfig,
+    toolchain: Option<&ToolchainInfo>,
 ) -> Result<RemoteExecutionResult> {
     let worker_config = selected_worker_to_config(worker);
 
@@ -345,18 +422,6 @@ async fn execute_remote_compilation(
         sync_result.files_transferred, sync_result.bytes_transferred, sync_result.duration_ms
     );
 
-    // Detect toolchain
-    let toolchain = match detect_toolchain(&project_root) {
-        Ok(tc) => {
-            debug!("Detected toolchain: {}", tc);
-            Some(tc)
-        }
-        Err(e) => {
-            warn!("Failed to detect toolchain: {}", e);
-            None
-        }
-    };
-
     // Step 2: Execute command remotely with streaming output
     info!("Executing command remotely: {}", command);
 
@@ -368,7 +433,7 @@ async fn execute_remote_compilation(
         .execute_remote_streaming(
             &worker_config,
             command,
-            toolchain.as_ref(),
+            toolchain,
             |line| {
                 // Write stdout lines to stderr (hook stdout is for protocol)
                 eprintln!("{}", line);
@@ -476,7 +541,8 @@ mod tests {
             writer
                 .write_all(http.as_bytes())
                 .await
-                .expect("Write response");
+                .expect("Failed to write response");
+            writer.flush().await.expect("Failed to flush response");
         });
     }
 
@@ -654,7 +720,7 @@ mod tests {
     #[tokio::test]
     async fn test_daemon_query_missing_socket() {
         // Query a non-existent socket should fail gracefully
-        let result = query_daemon("/tmp/nonexistent_rch_test.sock", "testproj", 4).await;
+        let result = query_daemon("/tmp/nonexistent_rch_test.sock", "testproj", 4, None).await;
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(err_msg.contains("not found") || err_msg.contains("No such file"));
@@ -714,13 +780,14 @@ mod tests {
                 .write_all(http_response.as_bytes())
                 .await
                 .expect("Failed to write response");
+            writer.flush().await.expect("Failed to flush response");
         });
 
         // Give daemon time to start listening
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
         // Query the mock daemon
-        let result = query_daemon(&socket_path, "test-project", 4).await;
+        let result = query_daemon(&socket_path, "test-project", 4, None).await;
 
         // Clean up
         daemon_handle.await.expect("Daemon task panicked");
@@ -751,6 +818,7 @@ mod tests {
             let (reader, mut writer) = stream.into_split();
             let mut buf_reader = TokioBufReader::new(reader);
 
+            // Read the request line
             let mut request_line = String::new();
             buf_reader.read_line(&mut request_line).await.expect("Read");
 
@@ -776,7 +844,7 @@ mod tests {
 
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
-        let result = query_daemon(&socket_path, "my project/test", 2).await;
+        let result = query_daemon(&socket_path, "my project/test", 2, None).await;
         daemon_handle.await.expect("Daemon task");
         let _ = std::fs::remove_file(&socket_path_clone);
 
@@ -1266,7 +1334,7 @@ mod tests {
             buf_reader.read_line(&mut request_line).await.expect("read");
 
             // Return HTTP 500 error
-            let http = "HTTP/1.1 500 Internal Server Error\r\n\r\n{\"error\": \"internal\"}";
+            let http = "HTTP/1.1 500 Internal Server Error\r\n\r\n Расположение: {\"error\": \"internal\"}";
             writer.write_all(http.as_bytes()).await.expect("write");
         });
 

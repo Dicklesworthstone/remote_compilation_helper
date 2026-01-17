@@ -164,22 +164,29 @@ pub struct Style {
     pub symbols: Symbols,
     pub colors_enabled: bool,
     supports_unicode: bool,
+    supports_hyperlinks: bool,
 }
 
 impl Style {
     /// Create a new style with colors and unicode support.
-    pub fn new(colors_enabled: bool, supports_unicode: bool) -> Self {
+    pub fn new(colors_enabled: bool, supports_unicode: bool, supports_hyperlinks: bool) -> Self {
         Self {
             colors: SemanticColors::default(),
             symbols: Symbols::for_unicode(supports_unicode),
             colors_enabled,
             supports_unicode,
+            supports_hyperlinks,
         }
     }
 
     /// Check if unicode symbols are supported.
     pub fn supports_unicode(&self) -> bool {
         self.supports_unicode
+    }
+
+    /// Check if hyperlinks are supported.
+    pub fn supports_hyperlinks(&self) -> bool {
+        self.supports_hyperlinks
     }
 
     /// Apply success styling to text.
@@ -305,6 +312,19 @@ impl Style {
             format!("\n{}\n{}", title, "-".repeat(title.len()))
         }
     }
+
+    /// Format a hyperlink (OSC 8).
+    pub fn link(&self, text: &str, url: &str) -> String {
+        if self.supports_hyperlinks {
+            format!("\x1b]8;;{}\x1b\\{}\x1b]8;;\x1b\\", url, text)
+        } else {
+            if text == url {
+                url.to_string()
+            } else {
+                format!("{} ({})", text, url)
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -336,7 +356,7 @@ mod tests {
 
     #[test]
     fn test_style_with_colors_disabled() {
-        let style = Style::new(false, true);
+        let style = Style::new(false, true, false);
         let styled = style.success("test");
         // When colors are disabled, the string should not contain escape codes
         let output = styled.to_string();
@@ -345,7 +365,7 @@ mod tests {
 
     #[test]
     fn test_format_key_value() {
-        let style = Style::new(false, true);
+        let style = Style::new(false, true, false);
         let formatted = style.format_key_value("Status", "Healthy", 10);
         assert!(formatted.contains("Status"));
         assert!(formatted.contains("Healthy"));
@@ -354,7 +374,7 @@ mod tests {
 
     #[test]
     fn test_format_header() {
-        let style = Style::new(false, true);
+        let style = Style::new(false, true, false);
         let header = style.format_header("Workers");
         assert!(header.contains("Workers"));
         assert!(header.contains("-------"));
@@ -398,7 +418,7 @@ mod tests {
 
     #[test]
     fn test_status_indicator_display_no_color() {
-        let style = Style::new(false, true);
+        let style = Style::new(false, true, false);
         let display = StatusIndicator::Success.display(&style);
         let output = display.to_string();
         assert_eq!(output, "✓");
@@ -407,10 +427,30 @@ mod tests {
 
     #[test]
     fn test_status_indicator_with_label() {
-        let style = Style::new(false, true);
+        let style = Style::new(false, true, false);
         let output = StatusIndicator::Success.with_label(&style, "Running");
         assert!(output.contains("✓"));
         assert!(output.contains("Running"));
+    }
+
+    #[test]
+    fn test_hyperlink_formatting() {
+        let style = Style::new(false, true, true);
+        let link = style.link("Click me", "https://example.com");
+        assert_eq!(
+            link,
+            "\x1b]8;;https://example.com\x1b\\Click me\x1b]8;;\x1b\\"
+        );
+    }
+
+    #[test]
+    fn test_hyperlink_fallback() {
+        let style = Style::new(false, true, false);
+        let link = style.link("Click me", "https://example.com");
+        assert_eq!(link, "Click me (https://example.com)");
+
+        let link_same = style.link("https://example.com", "https://example.com");
+        assert_eq!(link_same, "https://example.com");
     }
 
     #[test]

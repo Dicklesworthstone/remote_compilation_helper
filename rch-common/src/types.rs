@@ -141,6 +141,15 @@ pub struct SelectionResponse {
     pub reason: SelectionReason,
 }
 
+/// Request to release reserved worker slots.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReleaseRequest {
+    /// ID of the worker to release slots on.
+    pub worker_id: WorkerId,
+    /// Number of slots to release.
+    pub slots: u32,
+}
+
 /// Configuration for a remote worker.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerConfig {

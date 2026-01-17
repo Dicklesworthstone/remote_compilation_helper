@@ -19,6 +19,6 @@ pub use ssh::{CommandResult, KnownHostsPolicy, SshClient, SshOptions, SshPool};
 pub use toolchain::{ToolchainInfo, wrap_command_with_toolchain};
 pub use types::{
     BuildLocation, BuildRecord, BuildStats, CircuitBreakerConfig, CircuitState, CircuitStats,
-    CompilationConfig, GeneralConfig, RchConfig, SelectedWorker, SelectionReason, SelectionRequest,
-    SelectionResponse, TransferConfig, WorkerConfig, WorkerId, WorkerStatus,
+    CompilationConfig, GeneralConfig, RchConfig, ReleaseRequest, SelectedWorker, SelectionReason,
+    SelectionRequest, SelectionResponse, TransferConfig, WorkerConfig, WorkerId, WorkerStatus,
 };

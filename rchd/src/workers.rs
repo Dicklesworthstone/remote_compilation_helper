@@ -2,7 +2,9 @@
 
 #![allow(dead_code)] // Scaffold code - methods will be used in future beads
 
-use rch_common::{CircuitState, CircuitStats, CircuitBreakerConfig, WorkerConfig, WorkerId, WorkerStatus};
+use rch_common::{
+    CircuitBreakerConfig, CircuitState, CircuitStats, WorkerConfig, WorkerId, WorkerStatus,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
@@ -235,6 +237,17 @@ impl WorkerPool {
         if let Some(worker) = workers.get(id) {
             worker.set_status(status).await;
             debug!("Set {} status to {:?}", id, status);
+        }
+    }
+
+    /// Release reserved slots on a worker.
+    pub async fn release_slots(&self, id: &WorkerId, slots: u32) {
+        let workers = self.workers.read().await;
+        if let Some(worker) = workers.get(id) {
+            worker.release_slots(slots);
+            debug!("Released {} slots on worker {}", slots, id);
+        } else {
+            debug!("Worker {} not found, cannot release slots", id);
         }
     }
 }

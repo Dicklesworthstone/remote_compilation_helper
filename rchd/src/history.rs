@@ -7,8 +7,8 @@ use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, warn};
 
 /// Default maximum number of builds to retain.
@@ -309,9 +309,11 @@ mod tests {
 
         let worker1_builds = history.by_worker("worker-1", 10);
         assert_eq!(worker1_builds.len(), 2);
-        assert!(worker1_builds
-            .iter()
-            .all(|b| b.worker_id.as_deref() == Some("worker-1")));
+        assert!(
+            worker1_builds
+                .iter()
+                .all(|b| b.worker_id.as_deref() == Some("worker-1"))
+        );
     }
 
     #[test]

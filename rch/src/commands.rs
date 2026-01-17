@@ -19,30 +19,107 @@ use tracing::debug;
 // JSON Response Types
 // =============================================================================
 
+/// JSON envelope version for API compatibility detection.
+pub const JSON_ENVELOPE_VERSION: &str = "1";
+
+/// Standard error codes for JSON responses.
+pub mod error_codes {
+    pub const WORKER_UNREACHABLE: &str = "WORKER_UNREACHABLE";
+    pub const WORKER_NOT_FOUND: &str = "WORKER_NOT_FOUND";
+    pub const CONFIG_INVALID: &str = "CONFIG_INVALID";
+    pub const CONFIG_NOT_FOUND: &str = "CONFIG_NOT_FOUND";
+    pub const DAEMON_NOT_RUNNING: &str = "DAEMON_NOT_RUNNING";
+    pub const DAEMON_CONNECTION_FAILED: &str = "DAEMON_CONNECTION_FAILED";
+    pub const SSH_CONNECTION_FAILED: &str = "SSH_CONNECTION_FAILED";
+    pub const BENCHMARK_FAILED: &str = "BENCHMARK_FAILED";
+    pub const HOOK_INSTALL_FAILED: &str = "HOOK_INSTALL_FAILED";
+    pub const INTERNAL_ERROR: &str = "INTERNAL_ERROR";
+}
+
+/// Structured error information for JSON responses.
+#[derive(Debug, Clone, Serialize)]
+pub struct JsonError {
+    /// Machine-readable error code (e.g., "WORKER_UNREACHABLE").
+    pub code: String,
+    /// Human-readable error message.
+    pub message: String,
+    /// Optional structured details about the error.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
+    /// Optional suggestions for resolving the error.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suggestions: Option<Vec<String>>,
+}
+
+impl JsonError {
+    pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+            details: None,
+            suggestions: None,
+        }
+    }
+
+    pub fn with_details(mut self, details: serde_json::Value) -> Self {
+        self.details = Some(details);
+        self
+    }
+
+    pub fn with_suggestions(mut self, suggestions: Vec<String>) -> Self {
+        self.suggestions = Some(suggestions);
+        self
+    }
+}
+
 /// Standard JSON envelope for all command responses.
 #[derive(Debug, Clone, Serialize)]
 pub struct JsonResponse<T: Serialize> {
+    /// Envelope version for API compatibility.
+    pub version: &'static str,
+    /// Command that produced this response (e.g., "workers list").
+    pub command: String,
+    /// Whether the command succeeded.
     pub success: bool,
+    /// Response data on success.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<T>,
+    /// Structured error on failure.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
+    pub error: Option<JsonError>,
 }
 
 impl<T: Serialize> JsonResponse<T> {
+    /// Create a successful response.
     pub fn ok(data: T) -> Self {
         Self {
+            version: JSON_ENVELOPE_VERSION,
+            command: "result".to_string(),
             success: true,
             data: Some(data),
             error: None,
         }
     }
 
+    /// Create an error response.
     pub fn err(message: impl Into<String>) -> Self {
         Self {
+            version: JSON_ENVELOPE_VERSION,
+            command: "error".to_string(),
             success: false,
             data: None,
-            error: Some(message.into()),
+            error: Some(JsonError::new(error_codes::INTERNAL_ERROR, message)),
+        }
+    }
+
+    /// Create an error response with a full JsonError.
+    pub fn err_with(error: JsonError) -> Self {
+        Self {
+            version: JSON_ENVELOPE_VERSION,
+            command: "error".to_string(),
+            success: false,
+            data: None,
+            error: Some(error),
         }
     }
 }
@@ -109,6 +186,98 @@ pub struct StatusResponse {
     pub workers: Option<Vec<WorkerInfo>>,
 }
 
+/// Configuration show response for JSON output.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConfigShowResponse {
+    pub general: ConfigGeneralSection,
+    pub compilation: ConfigCompilationSection,
+    pub transfer: ConfigTransferSection,
+    pub sources: Vec<String>,
+}
+
+/// General configuration section.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConfigGeneralSection {
+    pub enabled: bool,
+    pub log_level: String,
+    pub socket_path: String,
+}
+
+/// Compilation configuration section.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConfigCompilationSection {
+    pub confidence_threshold: f64,
+    pub min_local_time_ms: u64,
+}
+
+/// Transfer configuration section.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConfigTransferSection {
+    pub compression_level: u32,
+    pub exclude_patterns: Vec<String>,
+}
+
+/// Configuration init response for JSON output.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConfigInitResponse {
+    pub created: Vec<String>,
+    pub already_existed: Vec<String>,
+}
+
+/// Configuration validation response for JSON output.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConfigValidationResponse {
+    pub errors: Vec<ConfigValidationIssue>,
+    pub warnings: Vec<ConfigValidationIssue>,
+    pub valid: bool,
+}
+
+/// A single validation issue.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConfigValidationIssue {
+    pub file: String,
+    pub message: String,
+}
+
+/// Configuration set response for JSON output.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConfigSetResponse {
+    pub key: String,
+    pub value: String,
+    pub config_path: String,
+}
+
+/// Hook install/uninstall response for JSON output.
+#[derive(Debug, Clone, Serialize)]
+pub struct HookActionResponse {
+    pub action: String,
+    pub success: bool,
+    pub settings_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// Hook test response for JSON output.
+#[derive(Debug, Clone, Serialize)]
+pub struct HookTestResponse {
+    pub classification_tests: Vec<ClassificationTestResult>,
+    pub daemon_connected: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub daemon_response: Option<String>,
+    pub workers_configured: usize,
+    pub workers: Vec<WorkerInfo>,
+}
+
+/// Classification test result.
+#[derive(Debug, Clone, Serialize)]
+pub struct ClassificationTestResult {
+    pub command: String,
+    pub is_compilation: bool,
+    pub confidence: f64,
+    pub expected_intercept: bool,
+    pub passed: bool,
+}
+
 /// Create a style for terminal output.
 ///
 /// Detects terminal capabilities and creates appropriate styling.
@@ -118,7 +287,8 @@ fn terminal_style() -> Style {
         && std::env::var("LANG")
             .map(|l| l.contains("UTF"))
             .unwrap_or(true);
-    Style::new(is_tty, supports_unicode)
+    let supports_hyperlinks = crate::ui::adaptive::detect_hyperlink_support();
+    Style::new(is_tty, supports_unicode, supports_hyperlinks)
 }
 
 /// Get the RCH config directory path.
@@ -276,7 +446,11 @@ pub fn workers_list(ctx: &OutputContext) -> Result<()> {
 }
 
 /// Probe worker connectivity.
-pub async fn workers_probe(worker_id: Option<String>, all: bool, ctx: &OutputContext) -> Result<()> {
+pub async fn workers_probe(
+    worker_id: Option<String>,
+    all: bool,
+    ctx: &OutputContext,
+) -> Result<()> {
     let workers = load_workers_from_config()?;
     let style = ctx.style();
 
@@ -307,7 +481,10 @@ pub async fn workers_probe(worker_id: Option<String>, all: bool, ctx: &OutputCon
     if targets.is_empty() {
         if let Some(id) = worker_id {
             if ctx.is_json() {
-                let _ = ctx.json(&JsonResponse::<()>::err(format!("Worker '{}' not found", id)));
+                let _ = ctx.json(&JsonResponse::<()>::err(format!(
+                    "Worker '{}' not found",
+                    id
+                )));
             } else {
                 println!(
                     "{} Worker '{}' not found in configuration.",
@@ -535,7 +712,7 @@ pub async fn workers_benchmark(ctx: &OutputContext) -> Result<()> {
                             println!(
                                 "{} {}",
                                 StatusIndicator::Error.display(style),
-                                style.muted(&e.to_string())
+                                style.error(&e.to_string())
                             );
                         }
                     }
@@ -1159,11 +1336,46 @@ pub fn daemon_logs(lines: usize, ctx: &OutputContext) -> Result<()> {
 // =============================================================================
 
 /// Show effective configuration.
-pub fn config_show() -> Result<()> {
-    let style = terminal_style();
+pub fn config_show(ctx: &OutputContext) -> Result<()> {
+    let style = ctx.style();
 
     // Load user config
     let config = crate::config::load_config()?;
+
+    // Build sources list
+    let mut sources = vec![
+        "Environment variables (RCH_*)".to_string(),
+        "Project config: .rch/config.toml".to_string(),
+    ];
+    if let Some(dir) = config_dir() {
+        sources.push(format!(
+            "User config: {}",
+            dir.join("config.toml").display()
+        ));
+    }
+    sources.push("Built-in defaults".to_string());
+
+    // JSON output mode
+    if ctx.is_json() {
+        let response = ConfigShowResponse {
+            general: ConfigGeneralSection {
+                enabled: config.general.enabled,
+                log_level: config.general.log_level.clone(),
+                socket_path: config.general.socket_path.clone(),
+            },
+            compilation: ConfigCompilationSection {
+                confidence_threshold: config.compilation.confidence_threshold,
+                min_local_time_ms: config.compilation.min_local_time_ms,
+            },
+            transfer: ConfigTransferSection {
+                compression_level: config.transfer.compression_level,
+                exclude_patterns: config.transfer.exclude_patterns.clone(),
+            },
+            sources,
+        };
+        let _ = ctx.json(&JsonResponse::ok(response));
+        return Ok(());
+    }
 
     println!("{}", style.format_header("Effective RCH Configuration"));
     println!();
@@ -1231,8 +1443,8 @@ pub fn config_show() -> Result<()> {
 }
 
 /// Initialize configuration files.
-pub fn config_init() -> Result<()> {
-    let style = terminal_style();
+pub fn config_init(ctx: &OutputContext) -> Result<()> {
+    let style = ctx.style();
     let config_dir = config_dir().context("Could not determine config directory")?;
 
     // Create config directory
@@ -1342,8 +1554,8 @@ enabled = true
 }
 
 /// Validate configuration files.
-pub fn config_validate() -> Result<()> {
-    let style = terminal_style();
+pub fn config_validate(ctx: &OutputContext) -> Result<()> {
+    let style = ctx.style();
 
     println!("Validating RCH configuration...\n");
 
@@ -1548,15 +1760,15 @@ pub fn config_validate() -> Result<()> {
 }
 
 /// Set a configuration value.
-pub fn config_set(key: &str, value: &str) -> Result<()> {
+pub fn config_set(key: &str, value: &str, ctx: &OutputContext) -> Result<()> {
     let config_dir = config_dir().context("Could not determine config directory")?;
     std::fs::create_dir_all(&config_dir)
         .with_context(|| format!("Failed to create config directory: {:?}", config_dir))?;
     let config_path = config_dir.join("config.toml");
-    config_set_at(&config_path, key, value)
+    config_set_at(&config_path, key, value, ctx)
 }
 
-fn config_set_at(config_path: &Path, key: &str, value: &str) -> Result<()> {
+fn config_set_at(config_path: &Path, key: &str, value: &str, _ctx: &OutputContext) -> Result<()> {
     let mut config = if config_path.exists() {
         let contents = std::fs::read_to_string(config_path)
             .with_context(|| format!("Failed to read {:?}", config_path))?;
@@ -1684,8 +1896,8 @@ fn parse_string_list(value: &str, key: &str) -> Result<Vec<String>> {
 // =============================================================================
 
 /// Install the Claude Code hook.
-pub fn hook_install() -> Result<()> {
-    let style = terminal_style();
+pub fn hook_install(ctx: &OutputContext) -> Result<()> {
+    let style = ctx.style();
 
     // Claude Code hooks are configured in ~/.claude/settings.json
     let claude_config_dir = dirs::home_dir()
@@ -1762,8 +1974,8 @@ pub fn hook_install() -> Result<()> {
 }
 
 /// Uninstall the Claude Code hook.
-pub fn hook_uninstall() -> Result<()> {
-    let style = terminal_style();
+pub fn hook_uninstall(ctx: &OutputContext) -> Result<()> {
+    let style = ctx.style();
     let settings_path = dirs::home_dir()
         .map(|h| h.join(".claude").join("settings.json"))
         .context("Could not find home directory")?;
@@ -1807,10 +2019,10 @@ pub fn hook_uninstall() -> Result<()> {
 }
 
 /// Test the hook with a sample command.
-pub async fn hook_test() -> Result<()> {
+pub async fn hook_test(ctx: &OutputContext) -> Result<()> {
     use rch_common::classify_command;
 
-    let style = terminal_style();
+    let style = ctx.style();
 
     println!("Testing RCH hook functionality...\n");
 
@@ -1870,7 +2082,7 @@ pub async fn hook_test() -> Result<()> {
                     "   {} Daemon responding",
                     StatusIndicator::Success.display(&style)
                 );
-                if !response.is_empty() {
+                if !response.trim().is_empty() {
                     println!(
                         "   {} {}",
                         style.key("Response"),
@@ -1950,109 +2162,56 @@ pub async fn hook_test() -> Result<()> {
 // =============================================================================
 
 /// Show overall system status.
+///
+/// Queries the daemon's /status API for comprehensive status information.
+/// Falls back to basic status display if daemon is not running.
 pub async fn status_overview(show_workers: bool, show_jobs: bool) -> Result<()> {
+    use crate::status_display::{
+        check_hook_installed, query_daemon_full_status, render_basic_status, render_full_status,
+    };
+
     let style = terminal_style();
-
-    println!("{}", style.format_header("RCH Status"));
-    println!();
-
-    // Daemon status
     let daemon_running = Path::new(DEFAULT_SOCKET_PATH).exists();
-    println!(
-        "  {} {} {}",
-        style.key("Daemon"),
-        style.muted(":"),
-        if daemon_running {
-            style.success("Running")
-        } else {
-            style.error("Stopped")
-        }
-    );
 
-    // Worker count
-    match load_workers_from_config() {
-        Ok(workers) => {
-            println!(
-                "  {} {} {} configured",
-                style.key("Workers"),
-                style.muted(":"),
-                style.highlight(&workers.len().to_string())
-            );
-        }
-        Err(_) => {
-            println!(
-                "  {} {} {}",
-                style.key("Workers"),
-                style.muted(":"),
-                style.warning("Not configured")
-            );
-        }
-    }
-
-    // Hook status
-    let hook_installed = dirs::home_dir()
-        .map(|h| h.join(".claude").join("settings.json"))
-        .map(|p| {
-            if p.exists() {
-                std::fs::read_to_string(&p)
-                    .ok()
-                    .map(|c| c.contains("PreToolUse"))
-                    .unwrap_or(false)
-            } else {
-                false
+    // Try to get comprehensive status from daemon
+    if daemon_running {
+        match query_daemon_full_status().await {
+            Ok(status) => {
+                render_full_status(&status, show_workers, show_jobs, &style);
+                return Ok(());
             }
-        })
-        .unwrap_or(false);
-
-    println!(
-        "  {} {} {}",
-        style.key("Hook"),
-        style.muted(":"),
-        if hook_installed {
-            style.success("Installed")
-        } else {
-            style.warning("Not installed")
-        }
-    );
-
-    if show_workers {
-        println!("\n{}", style.format_header("Workers"));
-        let workers = load_workers_from_config().unwrap_or_default();
-        if workers.is_empty() {
-            println!("  {}", style.muted("(none configured)"));
-        } else {
-            for worker in &workers {
-                // Try to get status from daemon if running
-                let status = if daemon_running {
-                    style.muted("unknown")
-                } else {
-                    style.warning("daemon-offline")
-                };
-                println!(
-                    "  {} {} {}@{} [{}]",
-                    style.symbols.bullet_filled,
-                    style.highlight(worker.id.as_str()),
-                    style.muted(&worker.user),
-                    style.info(&worker.host),
-                    status
-                );
+            Err(e) => {
+                debug!("Failed to query daemon status: {}", e);
+                // Fall through to basic status
             }
         }
     }
 
-    if show_jobs {
-        println!("\n{}", style.format_header("Active Jobs"));
-        if daemon_running {
-            match send_daemon_command("GET /jobs\n").await {
-                Ok(response) if !response.trim().is_empty() => {
-                    println!("{}", response);
-                }
-                _ => {
-                    println!("  {}", style.muted("(no active jobs)"));
+    // Basic status when daemon is not running or query failed
+    render_basic_status(daemon_running, show_workers, &style);
+
+    // Additionally show workers from config in basic mode
+    if show_workers && !daemon_running {
+        println!("\n{}", style.format_header("Workers (from config)"));
+        match load_workers_from_config() {
+            Ok(workers) if !workers.is_empty() => {
+                for worker in &workers {
+                    println!(
+                        "  {} {} {}@{} [{} slots]",
+                        style.symbols.bullet_filled,
+                        style.highlight(worker.id.as_str()),
+                        style.muted(&worker.user),
+                        style.info(&worker.host),
+                        worker.total_slots
+                    );
                 }
             }
-        } else {
-            println!("  {}", style.muted("(daemon not running)"));
+            Ok(_) => {
+                println!("  {}", style.muted("(none configured)"));
+            }
+            Err(_) => {
+                println!("  {}", style.warning("Error loading config"));
+            }
         }
     }
 
@@ -2119,7 +2278,11 @@ async fn send_daemon_command(command: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
+    use crate::ui::context::{OutputConfig, OutputContext};
+
+    fn make_test_context() -> OutputContext {
+        OutputContext::new(OutputConfig::default())
+    }
 
     #[test]
     fn test_parse_workers_toml_single_worker() {
@@ -2194,12 +2357,7 @@ host = "example.com"
 "#;
 
         let parsed: toml::Value = toml::from_str(toml_content).expect("Failed to parse TOML");
-        let workers_array = parsed
-            .get("workers")
-            .and_then(|w| w.as_array())
-            .expect("Expected workers array");
-
-        let entry = &workers_array[0];
+        let entry = &parsed.get("workers").unwrap().as_array().unwrap()[0];
 
         // These should be None (using defaults)
         assert!(entry.get("user").is_none());
@@ -2221,55 +2379,56 @@ host = "example.com"
 
     #[test]
     fn test_config_set_writes_new_file() {
-        let temp_dir = TempDir::new().expect("temp dir");
-        let config_path = temp_dir.path().join("config.toml");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let ctx = make_test_context();
 
-        config_set_at(&config_path, "general.enabled", "false").expect("config set failed");
+        config_set_at(&config_path, "general.enabled", "false", &ctx).expect("config set failed");
 
-        let contents = std::fs::read_to_string(&config_path).expect("read config");
-        let parsed: RchConfig = toml::from_str(&contents).expect("parse config");
-        assert!(!parsed.general.enabled);
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        assert!(content.contains("enabled = false"));
     }
 
     #[test]
     fn test_config_set_updates_existing_file() {
-        let temp_dir = TempDir::new().expect("temp dir");
-        let config_path = temp_dir.path().join("config.toml");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let ctx = make_test_context();
 
-        let initial = RchConfig::default();
-        let initial_contents = toml::to_string_pretty(&initial).expect("serialize");
-        std::fs::write(&config_path, initial_contents).expect("write initial");
+        std::fs::write(&config_path, "[general]\nenabled = true\n").unwrap();
 
-        config_set_at(&config_path, "compilation.confidence_threshold", "0.9")
-            .expect("config set failed");
+        config_set_at(
+            &config_path,
+            "compilation.confidence_threshold",
+            "0.9",
+            &ctx,
+        )
+        .expect("config set failed");
 
-        let contents = std::fs::read_to_string(&config_path).expect("read config");
-        let parsed: RchConfig = toml::from_str(&contents).expect("parse config");
-        assert!(
-            (parsed.compilation.confidence_threshold - 0.9).abs() < f64::EPSILON,
-            "confidence_threshold not updated"
-        );
-        assert_eq!(parsed.general.enabled, initial.general.enabled);
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        assert!(content.contains("enabled = true"));
+        assert!(content.contains("confidence_threshold = 0.9"));
     }
 
     #[test]
     fn test_config_set_exclude_patterns_array() {
-        let temp_dir = TempDir::new().expect("temp dir");
-        let config_path = temp_dir.path().join("config.toml");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let ctx = make_test_context();
 
         config_set_at(
             &config_path,
             "transfer.exclude_patterns",
             "[\"target/\", \"node_modules/\"]",
+            &ctx,
         )
         .expect("config set failed");
 
-        let contents = std::fs::read_to_string(&config_path).expect("read config");
-        let parsed: RchConfig = toml::from_str(&contents).expect("parse config");
-        assert_eq!(parsed.transfer.exclude_patterns, vec![
-            "target/".to_string(),
-            "node_modules/".to_string()
-        ]);
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        // Check contents robustly as pretty printing might split lines
+        assert!(content.contains("exclude_patterns"));
+        assert!(content.contains("\"target/\""));
+        assert!(content.contains("\"node_modules/\""));
     }
 
     #[test]

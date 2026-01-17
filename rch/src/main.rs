@@ -9,6 +9,8 @@
 mod commands;
 mod config;
 mod hook;
+mod status_display;
+mod status_types;
 mod toolchain;
 mod transfer;
 pub mod ui;
@@ -236,34 +238,34 @@ async fn handle_status(workers: bool, jobs: bool, _ctx: &OutputContext) -> Resul
     Ok(())
 }
 
-async fn handle_config(action: ConfigAction, _ctx: &OutputContext) -> Result<()> {
+async fn handle_config(action: ConfigAction, ctx: &OutputContext) -> Result<()> {
     match action {
         ConfigAction::Show => {
-            commands::config_show()?;
+            commands::config_show(ctx)?;
         }
         ConfigAction::Init => {
-            commands::config_init()?;
+            commands::config_init(ctx)?;
         }
         ConfigAction::Validate => {
-            commands::config_validate()?;
+            commands::config_validate(ctx)?;
         }
         ConfigAction::Set { key, value } => {
-            commands::config_set(&key, &value)?;
+            commands::config_set(&key, &value, ctx)?;
         }
     }
     Ok(())
 }
 
-async fn handle_hook(action: HookAction, _ctx: &OutputContext) -> Result<()> {
+async fn handle_hook(action: HookAction, ctx: &OutputContext) -> Result<()> {
     match action {
         HookAction::Install => {
-            commands::hook_install()?;
+            commands::hook_install(ctx)?;
         }
         HookAction::Uninstall => {
-            commands::hook_uninstall()?;
+            commands::hook_uninstall(ctx)?;
         }
         HookAction::Test => {
-            commands::hook_test().await?;
+            commands::hook_test(ctx).await?;
         }
     }
     Ok(())
