@@ -337,13 +337,13 @@ mod tests {
 
     #[test]
     fn test_get_bool_true_values() {
-        let vars = ["RCH_TEST_BOOL"];
+        let vars = ["RCH_TEST_BOOL_TRUE"];
         cleanup_env(&vars);
 
         for val in &["1", "true", "yes", "on", "TRUE", "Yes"] {
-            set_env("RCH_TEST_BOOL", val);
+            set_env("RCH_TEST_BOOL_TRUE", val);
             let mut parser = EnvParser::new();
-            let result = parser.get_bool("TEST_BOOL", false);
+            let result = parser.get_bool("TEST_BOOL_TRUE", false);
             assert!(result.value, "Expected true for '{}'", val);
             assert!(!parser.has_errors());
         }
@@ -353,13 +353,13 @@ mod tests {
 
     #[test]
     fn test_get_bool_false_values() {
-        let vars = ["RCH_TEST_BOOL"];
+        let vars = ["RCH_TEST_BOOL_FALSE"];
         cleanup_env(&vars);
 
         for val in &["0", "false", "no", "off", "FALSE", ""] {
-            set_env("RCH_TEST_BOOL", val);
+            set_env("RCH_TEST_BOOL_FALSE", val);
             let mut parser = EnvParser::new();
-            let result = parser.get_bool("TEST_BOOL", true);
+            let result = parser.get_bool("TEST_BOOL_FALSE", true);
             assert!(!result.value, "Expected false for '{}'", val);
             assert!(!parser.has_errors());
         }

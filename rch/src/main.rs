@@ -507,6 +507,22 @@ enum WorkersAction {
         #[arg(long)]
         skip_toolchain: bool,
     },
+    /// Interactive wizard to add a new worker
+    #[command(after_help = r#"EXAMPLES:
+    rch workers init                # Interactive wizard to add a worker
+    rch workers init --yes          # Accept all detected defaults
+
+This wizard will guide you through adding a worker:
+  1. Enter hostname/IP and SSH credentials
+  2. Test SSH connection
+  3. Auto-detect CPU cores
+  4. Auto-detect Rust toolchain
+  5. Save to workers.toml"#)]
+    Init {
+        /// Accept detected defaults without prompting
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -917,6 +933,9 @@ async fn handle_workers(action: WorkersAction, ctx: &OutputContext) -> Result<()
             skip_toolchain,
         } => {
             commands::workers_setup(worker, all, dry_run, skip_binary, skip_toolchain, ctx).await?;
+        }
+        WorkersAction::Init { yes } => {
+            commands::workers_init(yes, ctx).await?;
         }
     }
     Ok(())
