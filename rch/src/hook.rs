@@ -296,7 +296,10 @@ async fn query_daemon(
     }
 
     // Add classification duration for AGENTS.md compliance tracking
-    query.push_str(&format!("&classification_us={}", classification_duration_us));
+    query.push_str(&format!(
+        "&classification_us={}",
+        classification_duration_us
+    ));
 
     // Send request
     let request = format!("GET /select-worker?{}\n", query);
@@ -852,8 +855,15 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
         // Query the mock daemon
-        let result =
-            query_daemon(&socket_path, "test-project", 4, None, RequiredRuntime::None, 100).await;
+        let result = query_daemon(
+            &socket_path,
+            "test-project",
+            4,
+            None,
+            RequiredRuntime::None,
+            100,
+        )
+        .await;
 
         // Clean up
         daemon_handle.await.expect("Daemon task panicked");

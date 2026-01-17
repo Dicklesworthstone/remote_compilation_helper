@@ -38,52 +38,56 @@ impl HistoryManager {
             .unwrap_or_else(|| PathBuf::from("."))
             .join("rch")
             .join("fleet_history");
-        
+
         fs::create_dir_all(&history_dir)?;
-        
+
         Ok(Self { history_dir })
     }
 
     /// Get deployment history, optionally filtered by worker.
-    pub fn get_history(&self, limit: usize, worker: Option<&str>) -> Result<Vec<DeploymentHistoryEntry>> {
+    pub fn get_history(
+        &self,
+        limit: usize,
+        worker: Option<&str>,
+    ) -> Result<Vec<DeploymentHistoryEntry>> {
         let history_file = self.history_dir.join("deployments.jsonl");
-        
+
         if !history_file.exists() {
             return Ok(Vec::new());
         }
-        
+
         let content = fs::read_to_string(&history_file)?;
         let mut entries: Vec<DeploymentHistoryEntry> = content
             .lines()
             .filter_map(|line| serde_json::from_str(line).ok())
             .collect();
-        
+
         // Filter by worker if specified
         if let Some(worker_id) = worker {
             entries.retain(|e| e.worker_id == worker_id);
         }
-        
+
         // Sort by timestamp descending (most recent first)
         entries.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
-        
+
         // Limit results
         entries.truncate(limit);
-        
+
         Ok(entries)
     }
 
     /// Record a new deployment.
     pub fn record_deployment(&self, entry: &DeploymentHistoryEntry) -> Result<()> {
         let history_file = self.history_dir.join("deployments.jsonl");
-        
+
         let mut file = fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&history_file)?;
-        
+
         use std::io::Write;
         writeln!(file, "{}", serde_json::to_string(entry)?)?;
-        
+
         Ok(())
     }
 
@@ -96,7 +100,7 @@ impl HistoryManager {
     /// Get the previous version for a worker (for rollback).
     pub fn get_previous_version(&self, worker_id: &str) -> Result<Option<String>> {
         let history = self.get_history(10, Some(worker_id))?;
-        
+
         // Find the first successful deployment that's different from current
         let mut seen_current = false;
         for entry in history {
@@ -107,7 +111,7 @@ impl HistoryManager {
                 seen_current = true;
             }
         }
-        
+
         Ok(None)
     }
 }

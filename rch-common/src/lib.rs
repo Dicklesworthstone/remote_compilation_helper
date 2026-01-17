@@ -8,6 +8,7 @@
 
 pub mod config;
 pub mod discovery;
+pub mod e2e;
 pub mod mock;
 pub mod patterns;
 #[cfg(test)]

@@ -44,18 +44,31 @@ impl FleetExecutor {
     }
 
     /// Execute a deployment plan.
-    pub async fn execute(&self, mut plan: DeploymentPlan, ctx: &OutputContext) -> Result<FleetResult> {
+    pub async fn execute(
+        &self,
+        mut plan: DeploymentPlan,
+        ctx: &OutputContext,
+    ) -> Result<FleetResult> {
         let style = ctx.theme();
 
         // Log deployment start
         if let Some(ref audit) = self.audit {
             let mut audit = audit.lock().await;
             let strategy_str = match &plan.strategy {
-                DeploymentStrategy::AllAtOnce { parallelism } => format!("all-at-once({})", parallelism),
+                DeploymentStrategy::AllAtOnce { parallelism } => {
+                    format!("all-at-once({})", parallelism)
+                }
                 DeploymentStrategy::Canary { percent, .. } => format!("canary({}%)", percent),
-                DeploymentStrategy::Rolling { batch_size, .. } => format!("rolling({})", batch_size),
+                DeploymentStrategy::Rolling { batch_size, .. } => {
+                    format!("rolling({})", batch_size)
+                }
             };
-            audit.log_deployment_started(plan.id, &plan.target_version, plan.workers.len(), &strategy_str)?;
+            audit.log_deployment_started(
+                plan.id,
+                &plan.target_version,
+                plan.workers.len(),
+                &strategy_str,
+            )?;
         }
 
         let mut deployed = 0;
@@ -69,7 +82,9 @@ impl FleetExecutor {
         // Execute based on strategy
         match strategy {
             DeploymentStrategy::AllAtOnce { parallelism } => {
-                let results = self.deploy_batch(&mut plan, 0..worker_count, parallelism, ctx).await?;
+                let results = self
+                    .deploy_batch(&mut plan, 0..worker_count, parallelism, ctx)
+                    .await?;
                 for (idx, success) in results {
                     if success {
                         if plan.workers[idx].status == DeploymentStatus::Skipped {
@@ -82,15 +97,25 @@ impl FleetExecutor {
                     }
                 }
             }
-            DeploymentStrategy::Canary { percent, wait_secs, auto_promote } => {
+            DeploymentStrategy::Canary {
+                percent,
+                wait_secs,
+                auto_promote,
+            } => {
                 let canary_count = ((worker_count * (percent as usize)) / 100).max(1);
 
                 if !ctx.is_json() {
-                    println!("  {} Deploying to {} canary worker(s)...", style.muted("→"), canary_count);
+                    println!(
+                        "  {} Deploying to {} canary worker(s)...",
+                        style.muted("→"),
+                        canary_count
+                    );
                 }
 
                 // Deploy to canary workers
-                let canary_results = self.deploy_batch(&mut plan, 0..canary_count, self.parallelism, ctx).await?;
+                let canary_results = self
+                    .deploy_batch(&mut plan, 0..canary_count, self.parallelism, ctx)
+                    .await?;
                 let canary_failed = canary_results.iter().filter(|(_, s)| !s).count();
 
                 if canary_failed > 0 {
@@ -100,8 +125,11 @@ impl FleetExecutor {
                 }
 
                 if !ctx.is_json() {
-                    println!("  {} Canary successful. Waiting {}s before full rollout...",
-                        StatusIndicator::Success.display(style), wait_secs);
+                    println!(
+                        "  {} Canary successful. Waiting {}s before full rollout...",
+                        StatusIndicator::Success.display(style),
+                        wait_secs
+                    );
                 }
 
                 // Wait before promoting
@@ -111,9 +139,14 @@ impl FleetExecutor {
                     if !ctx.is_json() {
                         println!("  {} Deploying to remaining workers...", style.muted("→"));
                     }
-                    let remaining_results = self.deploy_batch(&mut plan, canary_count..worker_count, self.parallelism, ctx).await?;
+                    let remaining_results = self
+                        .deploy_batch(&mut plan, canary_count..worker_count, self.parallelism, ctx)
+                        .await?;
 
-                    for (idx, success) in canary_results.into_iter().chain(remaining_results.into_iter()) {
+                    for (idx, success) in canary_results
+                        .into_iter()
+                        .chain(remaining_results.into_iter())
+                    {
                         if success {
                             if plan.workers[idx].status == DeploymentStatus::Skipped {
                                 skipped += 1;
@@ -126,7 +159,10 @@ impl FleetExecutor {
                     }
                 }
             }
-            DeploymentStrategy::Rolling { batch_size, wait_between } => {
+            DeploymentStrategy::Rolling {
+                batch_size,
+                wait_between,
+            } => {
                 let mut start = 0;
                 let mut batch_num = 0;
 
@@ -135,11 +171,18 @@ impl FleetExecutor {
                     batch_num += 1;
 
                     if !ctx.is_json() {
-                        println!("  {} Batch {}: deploying to workers {}..{}",
-                            style.muted("→"), batch_num, start + 1, end);
+                        println!(
+                            "  {} Batch {}: deploying to workers {}..{}",
+                            style.muted("→"),
+                            batch_num,
+                            start + 1,
+                            end
+                        );
                     }
 
-                    let batch_results = self.deploy_batch(&mut plan, start..end, batch_size, ctx).await?;
+                    let batch_results = self
+                        .deploy_batch(&mut plan, start..end, batch_size, ctx)
+                        .await?;
 
                     for (idx, success) in batch_results {
                         if success {
@@ -157,7 +200,11 @@ impl FleetExecutor {
 
                     if start < worker_count {
                         if !ctx.is_json() {
-                            println!("  {} Waiting {}s before next batch...", style.muted("→"), wait_between);
+                            println!(
+                                "  {} Waiting {}s before next batch...",
+                                style.muted("→"),
+                                wait_between
+                            );
                         }
                         tokio::time::sleep(std::time::Duration::from_secs(wait_between)).await;
                     }
@@ -165,7 +212,11 @@ impl FleetExecutor {
             }
         }
 
-        Ok(FleetResult::Success { deployed, skipped, failed })
+        Ok(FleetResult::Success {
+            deployed,
+            skipped,
+            failed,
+        })
     }
 
     /// Deploy a batch of workers in parallel.
@@ -177,7 +228,7 @@ impl FleetExecutor {
         ctx: &OutputContext,
     ) -> Result<Vec<(usize, bool)>> {
         use tokio::sync::Semaphore;
-        
+
         let semaphore = Arc::new(Semaphore::new(parallelism));
         let mut handles = Vec::new();
         let style = ctx.theme();
@@ -189,22 +240,22 @@ impl FleetExecutor {
             let current_version = plan.workers[idx].current_version.clone();
             let force = plan.options.force;
             let _is_json = ctx.is_json();
-            
+
             let handle = tokio::spawn(async move {
                 let _permit = permit;
-                
+
                 // Check if we need to deploy
                 if !force && current_version.as_ref() == Some(&target_version) {
                     return (idx, true, DeploymentStatus::Skipped);
                 }
-                
+
                 // Simulate deployment steps (real implementation would SSH to worker)
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                
+
                 // Return success
                 (idx, true, DeploymentStatus::Completed)
             });
-            
+
             handles.push(handle);
         }
 
@@ -212,7 +263,7 @@ impl FleetExecutor {
         for handle in handles {
             let (idx, success, status) = handle.await?;
             plan.workers[idx].status = status;
-            
+
             if !ctx.is_json() {
                 let icon = if success {
                     if status == DeploymentStatus::Skipped {
@@ -229,9 +280,14 @@ impl FleetExecutor {
                     DeploymentStatus::Failed => "failed",
                     _ => "unknown",
                 };
-                println!("    {} {} {}", icon, style.highlight(&plan.workers[idx].worker_id), style.muted(status_str));
+                println!(
+                    "    {} {} {}",
+                    icon,
+                    style.highlight(&plan.workers[idx].worker_id),
+                    style.muted(status_str)
+                );
             }
-            
+
             results.push((idx, success));
         }
 

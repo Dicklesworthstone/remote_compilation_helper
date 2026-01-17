@@ -73,9 +73,7 @@ pub fn init_otel() -> Result<Option<OtelGuard>> {
 
     // Require an endpoint when enabled
     let Some(endpoint) = config.endpoint else {
-        tracing::warn!(
-            "OpenTelemetry enabled but OTEL_EXPORTER_OTLP_ENDPOINT not set, disabling"
-        );
+        tracing::warn!("OpenTelemetry enabled but OTEL_EXPORTER_OTLP_ENDPOINT not set, disabling");
         return Ok(None);
     };
 

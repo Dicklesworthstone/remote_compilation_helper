@@ -3,13 +3,16 @@
 //! This module provides utilities for checking and reporting compliance
 //! with the performance budgets defined in AGENTS.md.
 
+// Allow dead code for budget types not yet fully integrated
+#![allow(dead_code)]
+
 use serde::Serialize;
 
+use super::DECISION_BUDGET_VIOLATIONS;
 use super::latency::{
     COMPILATION_BUDGET_MS, COMPILATION_PANIC_MS, NON_COMPILATION_BUDGET_MS,
     NON_COMPILATION_PANIC_MS, WORKER_SELECTION_BUDGET_MS, WORKER_SELECTION_PANIC_MS,
 };
-use super::DECISION_BUDGET_VIOLATIONS;
 
 /// Overall budget compliance status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -76,7 +79,8 @@ pub fn get_budget_status() -> BudgetStatusResponse {
     let worker_selection_violations = get_violations("worker_selection");
 
     // Determine overall status
-    let total_violations = non_compilation_violations + compilation_violations + worker_selection_violations;
+    let total_violations =
+        non_compilation_violations + compilation_violations + worker_selection_violations;
     let status = if total_violations == 0 {
         BudgetStatus::Passing
     } else {
@@ -157,8 +161,7 @@ mod tests {
                 > status.budgets.non_compilation.budget_ms
         );
         assert!(
-            status.budgets.compilation.panic_threshold_ms
-                > status.budgets.compilation.budget_ms
+            status.budgets.compilation.panic_threshold_ms > status.budgets.compilation.budget_ms
         );
         assert!(
             status.budgets.worker_selection.panic_threshold_ms

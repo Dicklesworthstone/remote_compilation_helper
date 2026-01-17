@@ -111,8 +111,9 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Interactive first-time setup wizard
-    #[command(after_help = r#"EXAMPLES:
+    #[command(alias = "setup", after_help = r#"EXAMPLES:
     rch init              # Start interactive setup wizard
+    rch setup             # Same as 'rch init' (alias)
     rch init --yes        # Accept all defaults without prompting
     rch init --skip-test  # Skip the test compilation step
 
@@ -843,9 +844,11 @@ async fn main() -> Result<()> {
                 };
                 tui::run_tui(config).await
             }
-            Commands::Web { port, no_open, prod } => {
-                handle_web(port, no_open, prod, &ctx).await
-            }
+            Commands::Web {
+                port,
+                no_open,
+                prod,
+            } => handle_web(port, no_open, prod, &ctx).await,
         },
     }
 }
@@ -1132,36 +1135,36 @@ async fn handle_web(port: u16, no_open: bool, prod: bool, ctx: &OutputContext) -
         .stderr(Stdio::null())
         .status();
 
-    let (cmd_name, cmd_args) = if bun_check.is_ok() {
+    let port_str = port.to_string();
+    let (cmd_name, cmd_args): (&str, Vec<&str>) = if bun_check.is_ok() {
         if prod {
-            ("bun", vec!["run", "start", "--", "-p", &port.to_string()])
+            ("bun", vec!["run", "start", "--", "-p", &port_str])
         } else {
-            ("bun", vec!["run", "dev", "--", "-p", &port.to_string()])
+            ("bun", vec!["run", "dev", "--", "-p", &port_str])
         }
     } else {
         // Fall back to npm
         if prod {
-            ("npm", vec!["run", "start", "--", "-p", &port.to_string()])
+            ("npm", vec!["run", "start", "--", "-p", &port_str])
         } else {
-            ("npm", vec!["run", "dev", "--", "-p", &port.to_string()])
+            ("npm", vec!["run", "dev", "--", "-p", &port_str])
         }
     };
 
     let url = format!("http://localhost:{}", port);
+    ctx.info(&format!("Dashboard available at: {}", url));
 
     // Open browser unless disabled
     if !no_open {
+        ctx.info("Opening browser...");
         // Give the server a moment to start
+        let url_clone = url.clone();
         tokio::spawn(async move {
             tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-            let _ = open_browser(&url);
+            let _ = open_browser(&url_clone);
         });
     }
 
-    ctx.info(&format!("Dashboard available at: {}", url));
-    if !no_open {
-        ctx.info("Opening browser...");
-    }
     ctx.info("Press Ctrl+C to stop the server");
 
     // Run the web server
@@ -1236,26 +1239,18 @@ fn find_web_directory() -> Result<PathBuf> {
 fn open_browser(url: &str) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
-        std::process::Command::new("open")
-            .arg(url)
-            .spawn()?;
+        std::process::Command::new("open").arg(url).spawn()?;
     }
 
     #[cfg(target_os = "linux")]
     {
         // Try xdg-open first, then fall back to common browsers
-        let result = std::process::Command::new("xdg-open")
-            .arg(url)
-            .spawn();
+        let result = std::process::Command::new("xdg-open").arg(url).spawn();
 
         if result.is_err() {
             // Try common browsers
             for browser in &["firefox", "chromium", "chromium-browser", "google-chrome"] {
-                if std::process::Command::new(browser)
-                    .arg(url)
-                    .spawn()
-                    .is_ok()
-                {
+                if std::process::Command::new(browser).arg(url).spawn().is_ok() {
                     break;
                 }
             }
@@ -1270,4 +1265,1112 @@ fn open_browser(url: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+// =============================================================================
+// Unit Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    // -------------------------------------------------------------------------
+    // CLI Parsing Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn cli_parses_no_args() {
+        let cli = Cli::try_parse_from(["rch"]).unwrap();
+        assert!(cli.command.is_none());
+        assert!(!cli.verbose);
+        assert!(!cli.quiet);
+        assert!(!cli.json);
+        assert_eq!(cli.color, "auto");
+    }
+
+    #[test]
+    fn cli_parses_verbose_flag() {
+        let cli = Cli::try_parse_from(["rch", "-v"]).unwrap();
+        assert!(cli.verbose);
+        assert!(!cli.quiet);
+    }
+
+    #[test]
+    fn cli_parses_verbose_long_flag() {
+        let cli = Cli::try_parse_from(["rch", "--verbose"]).unwrap();
+        assert!(cli.verbose);
+    }
+
+    #[test]
+    fn cli_parses_quiet_flag() {
+        let cli = Cli::try_parse_from(["rch", "-q"]).unwrap();
+        assert!(cli.quiet);
+        assert!(!cli.verbose);
+    }
+
+    #[test]
+    fn cli_parses_quiet_long_flag() {
+        let cli = Cli::try_parse_from(["rch", "--quiet"]).unwrap();
+        assert!(cli.quiet);
+    }
+
+    #[test]
+    fn cli_parses_json_flag() {
+        let cli = Cli::try_parse_from(["rch", "--json"]).unwrap();
+        assert!(cli.json);
+    }
+
+    #[test]
+    fn cli_parses_color_always() {
+        let cli = Cli::try_parse_from(["rch", "--color", "always"]).unwrap();
+        assert_eq!(cli.color, "always");
+    }
+
+    #[test]
+    fn cli_parses_color_never() {
+        let cli = Cli::try_parse_from(["rch", "--color", "never"]).unwrap();
+        assert_eq!(cli.color, "never");
+    }
+
+    #[test]
+    fn cli_parses_color_auto() {
+        let cli = Cli::try_parse_from(["rch", "--color", "auto"]).unwrap();
+        assert_eq!(cli.color, "auto");
+    }
+
+    // -------------------------------------------------------------------------
+    // Daemon Subcommand Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn cli_parses_daemon_start() {
+        let cli = Cli::try_parse_from(["rch", "daemon", "start"]).unwrap();
+        match cli.command {
+            Some(Commands::Daemon {
+                action: DaemonAction::Start,
+            }) => {}
+            _ => panic!("Expected daemon start command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_daemon_stop() {
+        let cli = Cli::try_parse_from(["rch", "daemon", "stop"]).unwrap();
+        match cli.command {
+            Some(Commands::Daemon {
+                action: DaemonAction::Stop,
+            }) => {}
+            _ => panic!("Expected daemon stop command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_daemon_restart() {
+        let cli = Cli::try_parse_from(["rch", "daemon", "restart"]).unwrap();
+        match cli.command {
+            Some(Commands::Daemon {
+                action: DaemonAction::Restart,
+            }) => {}
+            _ => panic!("Expected daemon restart command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_daemon_status() {
+        let cli = Cli::try_parse_from(["rch", "daemon", "status"]).unwrap();
+        match cli.command {
+            Some(Commands::Daemon {
+                action: DaemonAction::Status,
+            }) => {}
+            _ => panic!("Expected daemon status command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_daemon_logs_default() {
+        let cli = Cli::try_parse_from(["rch", "daemon", "logs"]).unwrap();
+        match cli.command {
+            Some(Commands::Daemon {
+                action: DaemonAction::Logs { lines },
+            }) => {
+                assert_eq!(lines, 50);
+            }
+            _ => panic!("Expected daemon logs command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_daemon_logs_custom_lines() {
+        let cli = Cli::try_parse_from(["rch", "daemon", "logs", "-n", "100"]).unwrap();
+        match cli.command {
+            Some(Commands::Daemon {
+                action: DaemonAction::Logs { lines },
+            }) => {
+                assert_eq!(lines, 100);
+            }
+            _ => panic!("Expected daemon logs command"),
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Workers Subcommand Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn cli_parses_workers_list() {
+        let cli = Cli::try_parse_from(["rch", "workers", "list"]).unwrap();
+        match cli.command {
+            Some(Commands::Workers {
+                action: WorkersAction::List,
+            }) => {}
+            _ => panic!("Expected workers list command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_workers_probe_specific() {
+        let cli = Cli::try_parse_from(["rch", "workers", "probe", "css"]).unwrap();
+        match cli.command {
+            Some(Commands::Workers {
+                action: WorkersAction::Probe { worker, all },
+            }) => {
+                assert_eq!(worker, Some("css".to_string()));
+                assert!(!all);
+            }
+            _ => panic!("Expected workers probe command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_workers_probe_all() {
+        let cli = Cli::try_parse_from(["rch", "workers", "probe", "--all"]).unwrap();
+        match cli.command {
+            Some(Commands::Workers {
+                action: WorkersAction::Probe { worker, all },
+            }) => {
+                assert!(worker.is_none());
+                assert!(all);
+            }
+            _ => panic!("Expected workers probe command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_workers_benchmark() {
+        let cli = Cli::try_parse_from(["rch", "workers", "benchmark"]).unwrap();
+        match cli.command {
+            Some(Commands::Workers {
+                action: WorkersAction::Benchmark,
+            }) => {}
+            _ => panic!("Expected workers benchmark command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_workers_drain() {
+        let cli = Cli::try_parse_from(["rch", "workers", "drain", "css"]).unwrap();
+        match cli.command {
+            Some(Commands::Workers {
+                action: WorkersAction::Drain { worker },
+            }) => {
+                assert_eq!(worker, "css");
+            }
+            _ => panic!("Expected workers drain command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_workers_enable() {
+        let cli = Cli::try_parse_from(["rch", "workers", "enable", "css"]).unwrap();
+        match cli.command {
+            Some(Commands::Workers {
+                action: WorkersAction::Enable { worker },
+            }) => {
+                assert_eq!(worker, "css");
+            }
+            _ => panic!("Expected workers enable command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_workers_discover() {
+        let cli = Cli::try_parse_from(["rch", "workers", "discover", "--probe", "--add"]).unwrap();
+        match cli.command {
+            Some(Commands::Workers {
+                action: WorkersAction::Discover { probe, add, yes },
+            }) => {
+                assert!(probe);
+                assert!(add);
+                assert!(!yes);
+            }
+            _ => panic!("Expected workers discover command"),
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Status Subcommand Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn cli_parses_status_default() {
+        let cli = Cli::try_parse_from(["rch", "status"]).unwrap();
+        match cli.command {
+            Some(Commands::Status { workers, jobs }) => {
+                assert!(!workers);
+                assert!(!jobs);
+            }
+            _ => panic!("Expected status command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_status_with_workers() {
+        let cli = Cli::try_parse_from(["rch", "status", "--workers"]).unwrap();
+        match cli.command {
+            Some(Commands::Status { workers, jobs }) => {
+                assert!(workers);
+                assert!(!jobs);
+            }
+            _ => panic!("Expected status command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_status_with_jobs() {
+        let cli = Cli::try_parse_from(["rch", "status", "--jobs"]).unwrap();
+        match cli.command {
+            Some(Commands::Status { workers, jobs }) => {
+                assert!(!workers);
+                assert!(jobs);
+            }
+            _ => panic!("Expected status command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_status_with_both() {
+        let cli = Cli::try_parse_from(["rch", "status", "--workers", "--jobs"]).unwrap();
+        match cli.command {
+            Some(Commands::Status { workers, jobs }) => {
+                assert!(workers);
+                assert!(jobs);
+            }
+            _ => panic!("Expected status command"),
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Config Subcommand Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn cli_parses_config_show() {
+        let cli = Cli::try_parse_from(["rch", "config", "show"]).unwrap();
+        match cli.command {
+            Some(Commands::Config {
+                action: ConfigAction::Show { sources },
+            }) => {
+                assert!(!sources);
+            }
+            _ => panic!("Expected config show command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_config_show_sources() {
+        let cli = Cli::try_parse_from(["rch", "config", "show", "--sources"]).unwrap();
+        match cli.command {
+            Some(Commands::Config {
+                action: ConfigAction::Show { sources },
+            }) => {
+                assert!(sources);
+            }
+            _ => panic!("Expected config show command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_config_init() {
+        let cli = Cli::try_parse_from(["rch", "config", "init"]).unwrap();
+        match cli.command {
+            Some(Commands::Config {
+                action:
+                    ConfigAction::Init {
+                        wizard,
+                        non_interactive,
+                        defaults,
+                    },
+            }) => {
+                assert!(!wizard);
+                assert!(!non_interactive);
+                assert!(!defaults);
+            }
+            _ => panic!("Expected config init command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_config_init_wizard() {
+        let cli = Cli::try_parse_from(["rch", "config", "init", "--wizard"]).unwrap();
+        match cli.command {
+            Some(Commands::Config {
+                action: ConfigAction::Init { wizard, .. },
+            }) => {
+                assert!(wizard);
+            }
+            _ => panic!("Expected config init command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_config_validate() {
+        let cli = Cli::try_parse_from(["rch", "config", "validate"]).unwrap();
+        match cli.command {
+            Some(Commands::Config {
+                action: ConfigAction::Validate,
+            }) => {}
+            _ => panic!("Expected config validate command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_config_set() {
+        let cli = Cli::try_parse_from(["rch", "config", "set", "log_level", "debug"]).unwrap();
+        match cli.command {
+            Some(Commands::Config {
+                action: ConfigAction::Set { key, value },
+            }) => {
+                assert_eq!(key, "log_level");
+                assert_eq!(value, "debug");
+            }
+            _ => panic!("Expected config set command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_config_export() {
+        let cli = Cli::try_parse_from(["rch", "config", "export"]).unwrap();
+        match cli.command {
+            Some(Commands::Config {
+                action: ConfigAction::Export { format },
+            }) => {
+                assert_eq!(format, "shell");
+            }
+            _ => panic!("Expected config export command"),
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Hook Subcommand Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn cli_parses_hook_install() {
+        let cli = Cli::try_parse_from(["rch", "hook", "install"]).unwrap();
+        match cli.command {
+            Some(Commands::Hook {
+                action: HookAction::Install,
+            }) => {}
+            _ => panic!("Expected hook install command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_hook_uninstall() {
+        let cli = Cli::try_parse_from(["rch", "hook", "uninstall"]).unwrap();
+        match cli.command {
+            Some(Commands::Hook {
+                action: HookAction::Uninstall,
+            }) => {}
+            _ => panic!("Expected hook uninstall command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_hook_test() {
+        let cli = Cli::try_parse_from(["rch", "hook", "test"]).unwrap();
+        match cli.command {
+            Some(Commands::Hook {
+                action: HookAction::Test,
+            }) => {}
+            _ => panic!("Expected hook test command"),
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Doctor Subcommand Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn cli_parses_doctor_default() {
+        let cli = Cli::try_parse_from(["rch", "doctor"]).unwrap();
+        match cli.command {
+            Some(Commands::Doctor { fix, install_deps }) => {
+                assert!(!fix);
+                assert!(!install_deps);
+            }
+            _ => panic!("Expected doctor command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_doctor_with_fix() {
+        let cli = Cli::try_parse_from(["rch", "doctor", "--fix"]).unwrap();
+        match cli.command {
+            Some(Commands::Doctor { fix, install_deps }) => {
+                assert!(fix);
+                assert!(!install_deps);
+            }
+            _ => panic!("Expected doctor command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_doctor_install_deps() {
+        let cli = Cli::try_parse_from(["rch", "doctor", "--install-deps"]).unwrap();
+        match cli.command {
+            Some(Commands::Doctor { fix, install_deps }) => {
+                assert!(!fix);
+                assert!(install_deps);
+            }
+            _ => panic!("Expected doctor command"),
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Init Subcommand Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn cli_parses_init_default() {
+        let cli = Cli::try_parse_from(["rch", "init"]).unwrap();
+        match cli.command {
+            Some(Commands::Init { yes, skip_test }) => {
+                assert!(!yes);
+                assert!(!skip_test);
+            }
+            _ => panic!("Expected init command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_init_yes() {
+        let cli = Cli::try_parse_from(["rch", "init", "--yes"]).unwrap();
+        match cli.command {
+            Some(Commands::Init { yes, skip_test }) => {
+                assert!(yes);
+                assert!(!skip_test);
+            }
+            _ => panic!("Expected init command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_init_skip_test() {
+        let cli = Cli::try_parse_from(["rch", "init", "--skip-test"]).unwrap();
+        match cli.command {
+            Some(Commands::Init { yes, skip_test }) => {
+                assert!(!yes);
+                assert!(skip_test);
+            }
+            _ => panic!("Expected init command"),
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Update Subcommand Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn cli_parses_update_default() {
+        let cli = Cli::try_parse_from(["rch", "update"]).unwrap();
+        match cli.command {
+            Some(Commands::Update {
+                check,
+                version,
+                channel,
+                fleet,
+                ..
+            }) => {
+                assert!(!check);
+                assert!(version.is_none());
+                assert_eq!(channel, "stable");
+                assert!(!fleet);
+            }
+            _ => panic!("Expected update command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_update_check() {
+        let cli = Cli::try_parse_from(["rch", "update", "--check"]).unwrap();
+        match cli.command {
+            Some(Commands::Update { check, .. }) => {
+                assert!(check);
+            }
+            _ => panic!("Expected update command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_update_version() {
+        let cli = Cli::try_parse_from(["rch", "update", "--version", "v0.2.0"]).unwrap();
+        match cli.command {
+            Some(Commands::Update { version, .. }) => {
+                assert_eq!(version, Some("v0.2.0".to_string()));
+            }
+            _ => panic!("Expected update command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_update_channel() {
+        let cli = Cli::try_parse_from(["rch", "update", "--channel", "beta"]).unwrap();
+        match cli.command {
+            Some(Commands::Update { channel, .. }) => {
+                assert_eq!(channel, "beta");
+            }
+            _ => panic!("Expected update command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_update_fleet() {
+        let cli = Cli::try_parse_from(["rch", "update", "--fleet"]).unwrap();
+        match cli.command {
+            Some(Commands::Update { fleet, .. }) => {
+                assert!(fleet);
+            }
+            _ => panic!("Expected update command"),
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Fleet Subcommand Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn cli_parses_fleet_deploy_default() {
+        let cli = Cli::try_parse_from(["rch", "fleet", "deploy"]).unwrap();
+        match cli.command {
+            Some(Commands::Fleet {
+                action:
+                    FleetAction::Deploy {
+                        worker,
+                        parallel,
+                        canary,
+                        dry_run,
+                        ..
+                    },
+            }) => {
+                assert!(worker.is_none());
+                assert_eq!(parallel, 4);
+                assert!(canary.is_none());
+                assert!(!dry_run);
+            }
+            _ => panic!("Expected fleet deploy command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_fleet_deploy_worker() {
+        let cli = Cli::try_parse_from(["rch", "fleet", "deploy", "--worker", "css"]).unwrap();
+        match cli.command {
+            Some(Commands::Fleet {
+                action: FleetAction::Deploy { worker, .. },
+            }) => {
+                assert_eq!(worker, Some("css".to_string()));
+            }
+            _ => panic!("Expected fleet deploy command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_fleet_deploy_canary() {
+        let cli = Cli::try_parse_from(["rch", "fleet", "deploy", "--canary", "25"]).unwrap();
+        match cli.command {
+            Some(Commands::Fleet {
+                action: FleetAction::Deploy { canary, .. },
+            }) => {
+                assert_eq!(canary, Some(25));
+            }
+            _ => panic!("Expected fleet deploy command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_fleet_rollback() {
+        let cli = Cli::try_parse_from(["rch", "fleet", "rollback"]).unwrap();
+        match cli.command {
+            Some(Commands::Fleet {
+                action:
+                    FleetAction::Rollback {
+                        worker, to_version, ..
+                    },
+            }) => {
+                assert!(worker.is_none());
+                assert!(to_version.is_none());
+            }
+            _ => panic!("Expected fleet rollback command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_fleet_status() {
+        let cli = Cli::try_parse_from(["rch", "fleet", "status"]).unwrap();
+        match cli.command {
+            Some(Commands::Fleet {
+                action: FleetAction::Status { worker, watch },
+            }) => {
+                assert!(worker.is_none());
+                assert!(!watch);
+            }
+            _ => panic!("Expected fleet status command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_fleet_verify() {
+        let cli = Cli::try_parse_from(["rch", "fleet", "verify"]).unwrap();
+        match cli.command {
+            Some(Commands::Fleet {
+                action: FleetAction::Verify { worker },
+            }) => {
+                assert!(worker.is_none());
+            }
+            _ => panic!("Expected fleet verify command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_fleet_history() {
+        let cli = Cli::try_parse_from(["rch", "fleet", "history", "--limit", "20"]).unwrap();
+        match cli.command {
+            Some(Commands::Fleet {
+                action: FleetAction::History { limit, worker },
+            }) => {
+                assert_eq!(limit, 20);
+                assert!(worker.is_none());
+            }
+            _ => panic!("Expected fleet history command"),
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Dashboard and Web Subcommand Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn cli_parses_dashboard_default() {
+        let cli = Cli::try_parse_from(["rch", "dashboard"]).unwrap();
+        match cli.command {
+            Some(Commands::Dashboard {
+                refresh,
+                no_mouse,
+                high_contrast,
+            }) => {
+                assert_eq!(refresh, 1000);
+                assert!(!no_mouse);
+                assert!(!high_contrast);
+            }
+            _ => panic!("Expected dashboard command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_dashboard_custom_refresh() {
+        let cli = Cli::try_parse_from(["rch", "dashboard", "--refresh", "500"]).unwrap();
+        match cli.command {
+            Some(Commands::Dashboard { refresh, .. }) => {
+                assert_eq!(refresh, 500);
+            }
+            _ => panic!("Expected dashboard command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_web_default() {
+        let cli = Cli::try_parse_from(["rch", "web"]).unwrap();
+        match cli.command {
+            Some(Commands::Web {
+                port,
+                no_open,
+                prod,
+            }) => {
+                assert_eq!(port, 3000);
+                assert!(!no_open);
+                assert!(!prod);
+            }
+            _ => panic!("Expected web command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_web_custom_port() {
+        let cli = Cli::try_parse_from(["rch", "web", "--port", "3001"]).unwrap();
+        match cli.command {
+            Some(Commands::Web { port, .. }) => {
+                assert_eq!(port, 3001);
+            }
+            _ => panic!("Expected web command"),
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Completions Subcommand Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn cli_parses_completions_generate_bash() {
+        let cli = Cli::try_parse_from(["rch", "completions", "generate", "bash"]).unwrap();
+        match cli.command {
+            Some(Commands::Completions {
+                action: CompletionsAction::Generate { shell },
+            }) => {
+                assert_eq!(shell, clap_complete::Shell::Bash);
+            }
+            _ => panic!("Expected completions generate command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_completions_install() {
+        let cli = Cli::try_parse_from(["rch", "completions", "install", "zsh"]).unwrap();
+        match cli.command {
+            Some(Commands::Completions {
+                action: CompletionsAction::Install { shell, dry_run },
+            }) => {
+                assert_eq!(shell, Some(clap_complete::Shell::Zsh));
+                assert!(!dry_run);
+            }
+            _ => panic!("Expected completions install command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_completions_status() {
+        let cli = Cli::try_parse_from(["rch", "completions", "status"]).unwrap();
+        match cli.command {
+            Some(Commands::Completions {
+                action: CompletionsAction::Status,
+            }) => {}
+            _ => panic!("Expected completions status command"),
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Agents Subcommand Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn cli_parses_agents_list() {
+        let cli = Cli::try_parse_from(["rch", "agents", "list"]).unwrap();
+        match cli.command {
+            Some(Commands::Agents {
+                action: AgentsAction::List { all },
+            }) => {
+                assert!(!all);
+            }
+            _ => panic!("Expected agents list command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_agents_list_all() {
+        let cli = Cli::try_parse_from(["rch", "agents", "list", "--all"]).unwrap();
+        match cli.command {
+            Some(Commands::Agents {
+                action: AgentsAction::List { all },
+            }) => {
+                assert!(all);
+            }
+            _ => panic!("Expected agents list command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_agents_status() {
+        let cli = Cli::try_parse_from(["rch", "agents", "status"]).unwrap();
+        match cli.command {
+            Some(Commands::Agents {
+                action: AgentsAction::Status { agent },
+            }) => {
+                assert!(agent.is_none());
+            }
+            _ => panic!("Expected agents status command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_agents_install_hook() {
+        let cli = Cli::try_parse_from(["rch", "agents", "install-hook", "claude-code"]).unwrap();
+        match cli.command {
+            Some(Commands::Agents {
+                action: AgentsAction::InstallHook { agent, dry_run },
+            }) => {
+                assert_eq!(agent, "claude-code");
+                assert!(!dry_run);
+            }
+            _ => panic!("Expected agents install-hook command"),
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Global Flag Inheritance Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn cli_global_flags_with_subcommand() {
+        let cli = Cli::try_parse_from(["rch", "-v", "--json", "daemon", "status"]).unwrap();
+        assert!(cli.verbose);
+        assert!(cli.json);
+        match cli.command {
+            Some(Commands::Daemon {
+                action: DaemonAction::Status,
+            }) => {}
+            _ => panic!("Expected daemon status command"),
+        }
+    }
+
+    #[test]
+    fn cli_global_flags_after_subcommand() {
+        let cli = Cli::try_parse_from(["rch", "daemon", "status", "-v", "--json"]).unwrap();
+        assert!(cli.verbose);
+        assert!(cli.json);
+    }
+
+    // -------------------------------------------------------------------------
+    // Error Case Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn cli_rejects_unknown_subcommand() {
+        let result = Cli::try_parse_from(["rch", "unknown"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn cli_rejects_invalid_color_option() {
+        // Note: clap accepts any string for color, the validation happens at runtime
+        // with ColorChoice::parse, so this test verifies clap accepts it
+        let cli = Cli::try_parse_from(["rch", "--color", "invalid"]).unwrap();
+        assert_eq!(cli.color, "invalid");
+    }
+
+    #[test]
+    fn cli_daemon_requires_action() {
+        let result = Cli::try_parse_from(["rch", "daemon"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn cli_workers_requires_action() {
+        let result = Cli::try_parse_from(["rch", "workers"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn cli_config_requires_action() {
+        let result = Cli::try_parse_from(["rch", "config"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn cli_hook_requires_action() {
+        let result = Cli::try_parse_from(["rch", "hook"]);
+        assert!(result.is_err());
+    }
+
+    // -------------------------------------------------------------------------
+    // ColorChoice Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn color_choice_parse_auto() {
+        let choice = ColorChoice::parse("auto");
+        assert_eq!(choice, ColorChoice::Auto);
+    }
+
+    #[test]
+    fn color_choice_parse_always() {
+        let choice = ColorChoice::parse("always");
+        assert_eq!(choice, ColorChoice::Always);
+    }
+
+    #[test]
+    fn color_choice_parse_never() {
+        let choice = ColorChoice::parse("never");
+        assert_eq!(choice, ColorChoice::Never);
+    }
+
+    #[test]
+    fn color_choice_parse_unknown_defaults_to_auto() {
+        let choice = ColorChoice::parse("invalid");
+        assert_eq!(choice, ColorChoice::Auto);
+    }
+
+    // -------------------------------------------------------------------------
+    // OutputConfig Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn output_config_default_values() {
+        let config = OutputConfig::default();
+        assert!(!config.json);
+        assert!(!config.verbose);
+        assert!(!config.quiet);
+    }
+
+    #[test]
+    fn output_config_from_cli_args_verbose() {
+        let cli = Cli::try_parse_from(["rch", "-v"]).unwrap();
+        let config = OutputConfig {
+            json: cli.json,
+            verbose: cli.verbose,
+            quiet: cli.quiet,
+            color: ColorChoice::parse(&cli.color),
+            ..Default::default()
+        };
+        assert!(config.verbose);
+        assert!(!config.quiet);
+        assert!(!config.json);
+    }
+
+    #[test]
+    fn output_config_from_cli_args_json() {
+        let cli = Cli::try_parse_from(["rch", "--json"]).unwrap();
+        let config = OutputConfig {
+            json: cli.json,
+            verbose: cli.verbose,
+            quiet: cli.quiet,
+            color: ColorChoice::parse(&cli.color),
+            ..Default::default()
+        };
+        assert!(config.json);
+        assert!(!config.verbose);
+    }
+
+    #[test]
+    fn output_config_from_cli_args_quiet() {
+        let cli = Cli::try_parse_from(["rch", "-q"]).unwrap();
+        let config = OutputConfig {
+            json: cli.json,
+            verbose: cli.verbose,
+            quiet: cli.quiet,
+            color: ColorChoice::parse(&cli.color),
+            ..Default::default()
+        };
+        assert!(config.quiet);
+        assert!(!config.verbose);
+    }
+
+    // -------------------------------------------------------------------------
+    // OutputContext Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn output_context_creation_from_config() {
+        let config = OutputConfig {
+            json: true,
+            verbose: true,
+            quiet: false,
+            color: ColorChoice::Never,
+            ..Default::default()
+        };
+        let ctx = OutputContext::new(config);
+        assert!(ctx.is_json());
+        assert!(ctx.is_verbose());
+        assert!(!ctx.is_quiet());
+    }
+
+    #[test]
+    fn output_context_is_verbose_false_by_default() {
+        let ctx = OutputContext::new(OutputConfig::default());
+        assert!(!ctx.is_verbose());
+    }
+
+    #[test]
+    fn output_context_is_quiet_false_by_default() {
+        let ctx = OutputContext::new(OutputConfig::default());
+        assert!(!ctx.is_quiet());
+    }
+
+    // -------------------------------------------------------------------------
+    // find_web_directory Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn find_web_directory_error_message_is_helpful() {
+        let temp_dir = std::env::temp_dir().join("rch_test_no_web");
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let original_dir = std::env::current_dir().unwrap();
+
+        let _ = std::env::set_current_dir(&temp_dir);
+        let result = find_web_directory();
+        let _ = std::env::set_current_dir(&original_dir);
+
+        if let Err(e) = result {
+            let msg = e.to_string();
+            assert!(msg.contains("Could not find web dashboard"));
+        }
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    // -------------------------------------------------------------------------
+    // Command Definition Validity Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn cli_command_debug_assert_passes() {
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn cli_has_version() {
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        assert!(cmd.get_version().is_some());
+    }
+
+    #[test]
+    fn cli_has_about() {
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        assert!(cmd.get_about().is_some());
+    }
+
+    #[test]
+    fn cli_has_after_help_with_examples() {
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        let after_help = cmd
+            .get_after_help()
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        assert!(after_help.contains("EXAMPLES:"));
+        assert!(after_help.contains("ENVIRONMENT VARIABLES:"));
+        assert!(after_help.contains("CONFIG PRECEDENCE"));
+    }
+
+    #[test]
+    fn cli_subcommands_have_help() {
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        let subcommands: Vec<_> = cmd.get_subcommands().collect();
+        assert!(!subcommands.is_empty());
+
+        // Verify key subcommands exist
+        let names: Vec<_> = subcommands
+            .iter()
+            .filter_map(|c| c.get_name().into())
+            .collect();
+        assert!(names.contains(&"daemon"));
+        assert!(names.contains(&"workers"));
+        assert!(names.contains(&"status"));
+        assert!(names.contains(&"config"));
+        assert!(names.contains(&"hook"));
+    }
 }

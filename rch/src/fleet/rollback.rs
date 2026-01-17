@@ -49,9 +49,9 @@ impl RollbackManager {
             .unwrap_or_else(|| PathBuf::from("."))
             .join("rch")
             .join("backups");
-        
+
         std::fs::create_dir_all(&backup_dir)?;
-        
+
         Ok(Self {
             history: HistoryManager::new()?,
             backup_dir,
@@ -73,7 +73,7 @@ impl RollbackManager {
         // Process workers (simplified - real impl would use parallelism)
         for worker in workers {
             let worker_id = &worker.id.0;
-            
+
             // Determine target version
             let target_version = if let Some(v) = to_version {
                 v.to_string()
@@ -125,14 +125,21 @@ impl RollbackManager {
     }
 
     /// Create a backup of a worker's current binary.
-    pub async fn create_backup(&self, worker: &WorkerConfig, version: &str) -> Result<WorkerBackup> {
-        let backup_path = self.backup_dir.join(&worker.id.0).join(format!("{}.bak", version));
-        
+    pub async fn create_backup(
+        &self,
+        worker: &WorkerConfig,
+        version: &str,
+    ) -> Result<WorkerBackup> {
+        let backup_path = self
+            .backup_dir
+            .join(&worker.id.0)
+            .join(format!("{}.bak", version));
+
         std::fs::create_dir_all(backup_path.parent().unwrap())?;
-        
+
         // Real impl would SSH and copy binary
         // For now, just create the backup record
-        
+
         Ok(WorkerBackup {
             worker_id: worker.id.0.clone(),
             version: version.to_string(),
@@ -142,7 +149,11 @@ impl RollbackManager {
     }
 
     /// Restore a worker from backup.
-    pub async fn restore_backup(&self, _backup: &WorkerBackup, _worker: &WorkerConfig) -> Result<()> {
+    pub async fn restore_backup(
+        &self,
+        _backup: &WorkerBackup,
+        _worker: &WorkerConfig,
+    ) -> Result<()> {
         // Real impl would SSH and restore binary
         // Simulated for now
         Ok(())

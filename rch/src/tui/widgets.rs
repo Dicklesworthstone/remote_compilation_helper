@@ -4,11 +4,11 @@
 
 use crate::tui::state::{BuildStatus, CircuitState, Panel, TuiState, WorkerStatus};
 use ratatui::{
+    Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
-    Frame,
 };
 
 /// Get color scheme based on high contrast mode.
@@ -259,7 +259,12 @@ fn render_workers_panel(frame: &mut Frame, area: Rect, state: &TuiState, colors:
 }
 
 /// Render active builds panel.
-fn render_active_builds_panel(frame: &mut Frame, area: Rect, state: &TuiState, colors: &ColorScheme) {
+fn render_active_builds_panel(
+    frame: &mut Frame,
+    area: Rect,
+    state: &TuiState,
+    colors: &ColorScheme,
+) {
     let is_selected = state.selected_panel == Panel::ActiveBuilds;
     let border_style = if is_selected {
         Style::default().fg(colors.highlight)
@@ -337,7 +342,12 @@ fn render_active_builds_panel(frame: &mut Frame, area: Rect, state: &TuiState, c
 }
 
 /// Render build history panel.
-fn render_build_history_panel(frame: &mut Frame, area: Rect, state: &TuiState, colors: &ColorScheme) {
+fn render_build_history_panel(
+    frame: &mut Frame,
+    area: Rect,
+    state: &TuiState,
+    colors: &ColorScheme,
+) {
     let is_selected = state.selected_panel == Panel::BuildHistory;
     let border_style = if is_selected {
         Style::default().fg(colors.highlight)
@@ -382,7 +392,10 @@ fn render_build_history_panel(frame: &mut Frame, area: Rect, state: &TuiState, c
                 Span::raw(cmd),
                 Span::raw(" @ "),
                 Span::styled(worker, Style::default().fg(colors.highlight)),
-                Span::styled(format!(" ({})", duration), Style::default().fg(colors.muted)),
+                Span::styled(
+                    format!(" ({})", duration),
+                    Style::default().fg(colors.muted),
+                ),
             ]))
             .style(style)
         })
@@ -422,16 +435,9 @@ fn format_duration_ms(ms: u64) -> String {
 /// Render the footer with help hints.
 fn render_footer(frame: &mut Frame, area: Rect, state: &TuiState, colors: &ColorScheme) {
     let hints = if state.filter_mode {
-        vec![
-            ("Esc", "Exit filter"),
-            ("Enter", "Apply"),
-        ]
+        vec![("Esc", "Exit filter"), ("Enter", "Apply")]
     } else if state.log_view.is_some() {
-        vec![
-            ("Esc", "Close logs"),
-            ("↑/↓", "Scroll"),
-            ("y", "Copy"),
-        ]
+        vec![("Esc", "Close logs"), ("↑/↓", "Scroll"), ("y", "Copy")]
     } else {
         vec![
             ("q", "Quit"),
@@ -487,24 +493,27 @@ fn render_help_overlay(frame: &mut Frame, colors: &ColorScheme) {
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
-        Line::from(vec![
-            Span::styled("Navigation", Style::default().add_modifier(Modifier::BOLD)),
-        ]),
+        Line::from(vec![Span::styled(
+            "Navigation",
+            Style::default().add_modifier(Modifier::BOLD),
+        )]),
         Line::from("  ↑/k, ↓/j    Move selection up/down"),
         Line::from("  Tab         Next panel"),
         Line::from("  Shift+Tab   Previous panel"),
         Line::from("  Enter       Select/expand item"),
         Line::from(""),
-        Line::from(vec![
-            Span::styled("Actions", Style::default().add_modifier(Modifier::BOLD)),
-        ]),
+        Line::from(vec![Span::styled(
+            "Actions",
+            Style::default().add_modifier(Modifier::BOLD),
+        )]),
         Line::from("  r           Refresh data from daemon"),
         Line::from("  /           Filter build history"),
         Line::from("  y           Copy selected item"),
         Line::from(""),
-        Line::from(vec![
-            Span::styled("General", Style::default().add_modifier(Modifier::BOLD)),
-        ]),
+        Line::from(vec![Span::styled(
+            "General",
+            Style::default().add_modifier(Modifier::BOLD),
+        )]),
         Line::from("  q, Esc      Quit / Close overlay"),
         Line::from("  ?           Toggle this help"),
         Line::from(""),
@@ -530,10 +539,20 @@ fn render_help_overlay(frame: &mut Frame, colors: &ColorScheme) {
 /// Render error bar at bottom of screen.
 fn render_error_bar(frame: &mut Frame, error: &str, colors: &ColorScheme) {
     let area = frame.area();
-    let error_area = Rect::new(1, area.height.saturating_sub(2), area.width.saturating_sub(2), 1);
+    let error_area = Rect::new(
+        1,
+        area.height.saturating_sub(2),
+        area.width.saturating_sub(2),
+        1,
+    );
 
     let error_msg = Paragraph::new(Line::from(vec![
-        Span::styled("Error: ", Style::default().fg(colors.error).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "Error: ",
+            Style::default()
+                .fg(colors.error)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(error, Style::default().fg(colors.error)),
     ]));
 
@@ -570,7 +589,9 @@ fn render_logs_panel(frame: &mut Frame, area: Rect, state: &TuiState, colors: &C
     // Calculate visible window
     let visible_height = area.height.saturating_sub(2) as usize; // Account for borders
     let total_lines = log_view.lines.len();
-    let scroll_offset = log_view.scroll_offset.min(total_lines.saturating_sub(visible_height));
+    let scroll_offset = log_view
+        .scroll_offset
+        .min(total_lines.saturating_sub(visible_height));
     let end_line = (scroll_offset + visible_height).min(total_lines);
 
     // Get visible lines with scroll offset
@@ -598,27 +619,16 @@ fn render_logs_panel(frame: &mut Frame, area: Rect, state: &TuiState, colors: &C
 
     // Build title with scroll position indicator
     let scroll_indicator = if total_lines > visible_height {
-        format!(
-            " [{}-{}/{}]",
-            scroll_offset + 1,
-            end_line,
-            total_lines
-        )
+        format!(" [{}-{}/{}]", scroll_offset + 1, end_line, total_lines)
     } else {
         String::new()
     };
 
-    let auto_scroll_indicator = if log_view.auto_scroll {
-        " [AUTO]"
-    } else {
-        ""
-    };
+    let auto_scroll_indicator = if log_view.auto_scroll { " [AUTO]" } else { "" };
 
     let title = format!(
         "Build Logs: {}{}{} (Esc to close, PgUp/PgDn to scroll)",
-        log_view.build_id,
-        scroll_indicator,
-        auto_scroll_indicator,
+        log_view.build_id, scroll_indicator, auto_scroll_indicator,
     );
 
     let list = List::new(items).block(
@@ -632,7 +642,14 @@ fn render_logs_panel(frame: &mut Frame, area: Rect, state: &TuiState, colors: &C
 
     // Render scroll bar on the right side if content exceeds visible area
     if total_lines > visible_height {
-        render_scrollbar(frame, area, scroll_offset, total_lines, visible_height, colors);
+        render_scrollbar(
+            frame,
+            area,
+            scroll_offset,
+            total_lines,
+            visible_height,
+            colors,
+        );
     }
 }
 
@@ -655,7 +672,8 @@ fn render_scrollbar(
     let thumb_size = ((visible as f64 / total as f64) * scrollbar_height as f64).max(1.0) as u16;
     let scroll_range = total.saturating_sub(visible);
     let thumb_pos = if scroll_range > 0 {
-        ((offset as f64 / scroll_range as f64) * (scrollbar_height as f64 - thumb_size as f64)) as u16
+        ((offset as f64 / scroll_range as f64) * (scrollbar_height as f64 - thumb_size as f64))
+            as u16
     } else {
         0
     };

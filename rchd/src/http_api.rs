@@ -10,16 +10,16 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::{
+    Json, Router,
     extract::State,
-    http::{header, StatusCode},
+    http::{StatusCode, header},
     response::IntoResponse,
     routing::get,
-    Json, Router,
 };
 use serde_json::json;
 
-use crate::workers::WorkerPool;
 use crate::metrics::{self, budget};
+use crate::workers::WorkerPool;
 
 /// Shared state for HTTP handlers.
 #[derive(Clone)]
@@ -166,7 +166,12 @@ mod tests {
         let router = create_router(state);
 
         let response = router
-            .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
 
@@ -188,7 +193,12 @@ mod tests {
         let router = create_router(state);
 
         let response = router
-            .oneshot(Request::builder().uri("/ready").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/ready")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
 
@@ -210,7 +220,12 @@ mod tests {
         let router = create_router(state);
 
         let response = router
-            .oneshot(Request::builder().uri("/budget").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/budget")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
 

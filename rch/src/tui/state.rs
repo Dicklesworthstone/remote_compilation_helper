@@ -171,13 +171,10 @@ impl TuiState {
                 .build_history
                 .get(self.selected_index)
                 .map(|b| b.command.clone()),
-            Panel::Logs => self.log_view.as_ref().map(|l| {
-                l.lines
-                    .iter()
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            }),
+            Panel::Logs => self
+                .log_view
+                .as_ref()
+                .map(|l| l.lines.iter().cloned().collect::<Vec<_>>().join("\n")),
         };
         self.last_copied = text;
     }
@@ -189,7 +186,10 @@ impl TuiState {
             .filter(|b| {
                 // Apply query filter
                 if !self.filter.query.is_empty()
-                    && !b.command.to_lowercase().contains(&self.filter.query.to_lowercase())
+                    && !b
+                        .command
+                        .to_lowercase()
+                        .contains(&self.filter.query.to_lowercase())
                 {
                     return false;
                 }

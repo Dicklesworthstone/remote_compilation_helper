@@ -6,7 +6,11 @@ use rch_common::WorkerConfig;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub enum Severity { Info, Warning, Error }
+pub enum Severity {
+    Info,
+    Warning,
+    Error,
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PreflightResult {
@@ -37,13 +41,37 @@ pub struct WorkerStatus {
     pub issues: Vec<String>,
 }
 
-pub async fn run_preflight(_worker: &WorkerConfig, _ctx: &OutputContext) -> Result<PreflightResult> {
+pub async fn run_preflight(
+    _worker: &WorkerConfig,
+    _ctx: &OutputContext,
+) -> Result<PreflightResult> {
     // Simulate successful preflight - real impl would SSH
-    Ok(PreflightResult { ssh_ok: true, disk_space_mb: 10000, disk_ok: true, rsync_ok: true, zstd_ok: true, rustup_ok: true, current_version: None, issues: vec![] })
+    Ok(PreflightResult {
+        ssh_ok: true,
+        disk_space_mb: 10000,
+        disk_ok: true,
+        rsync_ok: true,
+        zstd_ok: true,
+        rustup_ok: true,
+        current_version: None,
+        issues: vec![],
+    })
 }
 
-pub async fn get_fleet_status(workers: &[&WorkerConfig], _ctx: &OutputContext) -> Result<Vec<WorkerStatus>> {
-    Ok(workers.iter().map(|w| WorkerStatus { worker_id: w.id.0.clone(), reachable: true, healthy: true, version: Some("0.1.0".into()), issues: vec![] }).collect())
+pub async fn get_fleet_status(
+    workers: &[&WorkerConfig],
+    _ctx: &OutputContext,
+) -> Result<Vec<WorkerStatus>> {
+    Ok(workers
+        .iter()
+        .map(|w| WorkerStatus {
+            worker_id: w.id.0.clone(),
+            reachable: true,
+            healthy: true,
+            version: Some("0.1.0".into()),
+            issues: vec![],
+        })
+        .collect())
 }
 
 #[allow(dead_code)]

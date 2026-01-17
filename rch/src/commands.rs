@@ -4447,3 +4447,539 @@ pub async fn init_wizard(yes: bool, skip_test: bool, ctx: &OutputContext) -> Res
 
     Ok(())
 }
+
+// =============================================================================
+// Unit Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // -------------------------------------------------------------------------
+    // JsonError Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn json_error_new_creates_error_with_code_and_message() {
+        let error = JsonError::new("TEST_CODE", "Test message");
+        assert_eq!(error.code, "TEST_CODE");
+        assert_eq!(error.message, "Test message");
+        assert!(error.details.is_none());
+        assert!(error.suggestions.is_none());
+    }
+
+    #[test]
+    fn json_error_with_details_adds_details() {
+        let details = json!({"key": "value", "count": 42});
+        let error = JsonError::new("CODE", "msg").with_details(details.clone());
+        assert!(error.details.is_some());
+        assert_eq!(error.details.unwrap(), details);
+    }
+
+    #[test]
+    fn json_error_with_suggestions_adds_suggestions() {
+        let suggestions = vec!["Try this".to_string(), "Or that".to_string()];
+        let error = JsonError::new("CODE", "msg").with_suggestions(suggestions.clone());
+        assert!(error.suggestions.is_some());
+        assert_eq!(error.suggestions.unwrap(), suggestions);
+    }
+
+    #[test]
+    fn json_error_chained_builders_work() {
+        let error = JsonError::new("CODE", "msg")
+            .with_details(json!({"info": "test"}))
+            .with_suggestions(vec!["suggestion".to_string()]);
+        assert_eq!(error.code, "CODE");
+        assert!(error.details.is_some());
+        assert!(error.suggestions.is_some());
+    }
+
+    #[test]
+    fn json_error_serializes_correctly() {
+        let error = JsonError::new("TEST_ERROR", "Something went wrong");
+        let json = serde_json::to_value(&error).unwrap();
+        assert_eq!(json["code"], "TEST_ERROR");
+        assert_eq!(json["message"], "Something went wrong");
+        // details and suggestions should be omitted when None
+        assert!(json.get("details").is_none());
+        assert!(json.get("suggestions").is_none());
+    }
+
+    #[test]
+    fn json_error_with_details_serializes_details() {
+        let error = JsonError::new("CODE", "msg").with_details(json!({"count": 5}));
+        let json = serde_json::to_value(&error).unwrap();
+        assert_eq!(json["details"]["count"], 5);
+    }
+
+    // -------------------------------------------------------------------------
+    // JsonResponse Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn json_response_ok_creates_success_response() {
+        let response: JsonResponse<String> = JsonResponse::ok("test cmd", "test data".to_string());
+        assert!(response.success);
+        assert_eq!(response.command, "test cmd");
+        assert_eq!(response.version, JSON_ENVELOPE_VERSION);
+        assert!(response.data.is_some());
+        assert_eq!(response.data.unwrap(), "test data");
+        assert!(response.error.is_none());
+    }
+
+    #[test]
+    fn json_response_ok_cmd_is_alias_for_ok() {
+        let response1: JsonResponse<i32> = JsonResponse::ok("cmd", 42);
+        let response2: JsonResponse<i32> = JsonResponse::ok_cmd("cmd", 42);
+        assert_eq!(response1.command, response2.command);
+        assert_eq!(response1.success, response2.success);
+        assert_eq!(response1.data, response2.data);
+    }
+
+    #[test]
+    fn json_response_err_creates_error_response() {
+        let response: JsonResponse<()> = JsonResponse::err("failed cmd", "error message");
+        assert!(!response.success);
+        assert_eq!(response.command, "failed cmd");
+        assert!(response.data.is_none());
+        assert!(response.error.is_some());
+        let error = response.error.unwrap();
+        assert_eq!(error.code, error_codes::INTERNAL_ERROR);
+        assert_eq!(error.message, "error message");
+    }
+
+    #[test]
+    fn json_response_err_cmd_creates_error_with_custom_code() {
+        let response: JsonResponse<()> = JsonResponse::err_cmd(
+            "cmd",
+            error_codes::WORKER_UNREACHABLE,
+            "Worker not available",
+        );
+        assert!(!response.success);
+        assert!(response.error.is_some());
+        let error = response.error.unwrap();
+        assert_eq!(error.code, error_codes::WORKER_UNREACHABLE);
+        assert_eq!(error.message, "Worker not available");
+    }
+
+    #[test]
+    fn json_response_ok_serializes_without_error_field() {
+        let response: JsonResponse<String> = JsonResponse::ok("test", "data".to_string());
+        let json = serde_json::to_value(&response).unwrap();
+        assert!(json.get("error").is_none());
+        assert_eq!(json["data"], "data");
+        assert_eq!(json["success"], true);
+    }
+
+    #[test]
+    fn json_response_err_serializes_without_data_field() {
+        let response: JsonResponse<String> = JsonResponse::err("test", "error msg");
+        let json = serde_json::to_value(&response).unwrap();
+        assert!(json.get("data").is_none());
+        assert!(json.get("error").is_some());
+        assert_eq!(json["success"], false);
+    }
+
+    #[test]
+    fn json_response_with_complex_data_serializes() {
+        #[derive(Serialize)]
+        struct ComplexData {
+            name: String,
+            count: u32,
+            items: Vec<String>,
+        }
+        let data = ComplexData {
+            name: "test".to_string(),
+            count: 3,
+            items: vec!["a".to_string(), "b".to_string()],
+        };
+        let response = JsonResponse::ok("complex", data);
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["data"]["name"], "test");
+        assert_eq!(json["data"]["count"], 3);
+        assert_eq!(json["data"]["items"].as_array().unwrap().len(), 2);
+    }
+
+    // -------------------------------------------------------------------------
+    // WorkerInfo Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn worker_info_from_worker_config_converts_all_fields() {
+        let config = WorkerConfig {
+            id: WorkerId::new("test-worker"),
+            host: "192.168.1.100".to_string(),
+            user: "admin".to_string(),
+            identity_file: "~/.ssh/key.pem".to_string(),
+            total_slots: 16,
+            priority: 50,
+            tags: vec!["fast".to_string(), "ssd".to_string()],
+        };
+        let info = WorkerInfo::from(&config);
+        assert_eq!(info.id, "test-worker");
+        assert_eq!(info.host, "192.168.1.100");
+        assert_eq!(info.user, "admin");
+        assert_eq!(info.total_slots, 16);
+        assert_eq!(info.priority, 50);
+        assert_eq!(info.tags, vec!["fast", "ssd"]);
+    }
+
+    #[test]
+    fn worker_info_from_worker_config_with_empty_tags() {
+        let config = WorkerConfig {
+            id: WorkerId::new("minimal"),
+            host: "host.example.com".to_string(),
+            user: "ubuntu".to_string(),
+            identity_file: "~/.ssh/id_rsa".to_string(),
+            total_slots: 8,
+            priority: 100,
+            tags: vec![],
+        };
+        let info = WorkerInfo::from(&config);
+        assert!(info.tags.is_empty());
+    }
+
+    #[test]
+    fn worker_info_serializes_correctly() {
+        let config = WorkerConfig {
+            id: WorkerId::new("w1"),
+            host: "host".to_string(),
+            user: "user".to_string(),
+            identity_file: "key".to_string(),
+            total_slots: 4,
+            priority: 75,
+            tags: vec!["gpu".to_string()],
+        };
+        let info = WorkerInfo::from(&config);
+        let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(json["id"], "w1");
+        assert_eq!(json["host"], "host");
+        assert_eq!(json["total_slots"], 4);
+        assert_eq!(json["tags"].as_array().unwrap().len(), 1);
+    }
+
+    // -------------------------------------------------------------------------
+    // Response Types Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn workers_list_response_serializes() {
+        let response = WorkersListResponse {
+            workers: vec![],
+            count: 0,
+        };
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["count"], 0);
+        assert!(json["workers"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn workers_list_response_with_workers_serializes() {
+        let workers = vec![
+            WorkerInfo {
+                id: "w1".to_string(),
+                host: "host1".to_string(),
+                user: "u1".to_string(),
+                total_slots: 8,
+                priority: 100,
+                tags: vec![],
+            },
+            WorkerInfo {
+                id: "w2".to_string(),
+                host: "host2".to_string(),
+                user: "u2".to_string(),
+                total_slots: 16,
+                priority: 50,
+                tags: vec!["fast".to_string()],
+            },
+        ];
+        let response = WorkersListResponse { workers, count: 2 };
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["count"], 2);
+        let workers_arr = json["workers"].as_array().unwrap();
+        assert_eq!(workers_arr.len(), 2);
+        assert_eq!(workers_arr[0]["id"], "w1");
+        assert_eq!(workers_arr[1]["id"], "w2");
+    }
+
+    #[test]
+    fn worker_probe_result_success_serializes() {
+        let result = WorkerProbeResult {
+            id: "worker1".to_string(),
+            host: "192.168.1.1".to_string(),
+            status: "healthy".to_string(),
+            latency_ms: Some(42),
+            error: None,
+        };
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["id"], "worker1");
+        assert_eq!(json["status"], "healthy");
+        assert_eq!(json["latency_ms"], 42);
+        assert!(json.get("error").is_none()); // skipped when None
+    }
+
+    #[test]
+    fn worker_probe_result_failure_serializes() {
+        let result = WorkerProbeResult {
+            id: "worker2".to_string(),
+            host: "192.168.1.2".to_string(),
+            status: "unreachable".to_string(),
+            latency_ms: None,
+            error: Some("Connection refused".to_string()),
+        };
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["status"], "unreachable");
+        assert!(json.get("latency_ms").is_none()); // skipped when None
+        assert_eq!(json["error"], "Connection refused");
+    }
+
+    #[test]
+    fn daemon_status_response_running_serializes() {
+        let response = DaemonStatusResponse {
+            running: true,
+            socket_path: "/tmp/rch.sock".to_string(),
+            uptime_seconds: Some(3600),
+        };
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["running"], true);
+        assert_eq!(json["socket_path"], "/tmp/rch.sock");
+        assert_eq!(json["uptime_seconds"], 3600);
+    }
+
+    #[test]
+    fn daemon_status_response_not_running_serializes() {
+        let response = DaemonStatusResponse {
+            running: false,
+            socket_path: "/tmp/rch.sock".to_string(),
+            uptime_seconds: None,
+        };
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["running"], false);
+        assert!(json.get("uptime_seconds").is_none());
+    }
+
+    #[test]
+    fn status_response_serializes() {
+        let response = StatusResponse {
+            daemon_running: true,
+            hook_installed: true,
+            workers_count: 3,
+            workers: None,
+        };
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["daemon_running"], true);
+        assert_eq!(json["hook_installed"], true);
+        assert_eq!(json["workers_count"], 3);
+        assert!(json.get("workers").is_none());
+    }
+
+    #[test]
+    fn config_show_response_serializes() {
+        let response = ConfigShowResponse {
+            general: ConfigGeneralSection {
+                enabled: true,
+                log_level: "info".to_string(),
+                socket_path: "/tmp/rch.sock".to_string(),
+            },
+            compilation: ConfigCompilationSection {
+                confidence_threshold: 0.85,
+                min_local_time_ms: 2000,
+            },
+            transfer: ConfigTransferSection {
+                compression_level: 3,
+                exclude_patterns: vec!["target/".to_string()],
+            },
+            sources: vec!["~/.config/rch/config.toml".to_string()],
+            value_sources: None,
+        };
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["general"]["enabled"], true);
+        assert_eq!(json["compilation"]["confidence_threshold"], 0.85);
+        assert_eq!(json["transfer"]["compression_level"], 3);
+    }
+
+    #[test]
+    fn config_init_response_serializes() {
+        let response = ConfigInitResponse {
+            created: vec!["config.toml".to_string()],
+            already_existed: vec!["workers.toml".to_string()],
+        };
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["created"].as_array().unwrap().len(), 1);
+        assert_eq!(json["already_existed"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn config_validation_response_valid_serializes() {
+        let response = ConfigValidationResponse {
+            errors: vec![],
+            warnings: vec![],
+            valid: true,
+        };
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["valid"], true);
+        assert!(json["errors"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn config_validation_response_with_issues_serializes() {
+        let response = ConfigValidationResponse {
+            errors: vec![ConfigValidationIssue {
+                file: "config.toml".to_string(),
+                message: "Invalid syntax".to_string(),
+            }],
+            warnings: vec![ConfigValidationIssue {
+                file: "workers.toml".to_string(),
+                message: "Deprecated field".to_string(),
+            }],
+            valid: false,
+        };
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["valid"], false);
+        assert_eq!(json["errors"][0]["message"], "Invalid syntax");
+        assert_eq!(json["warnings"][0]["file"], "workers.toml");
+    }
+
+    #[test]
+    fn config_set_response_serializes() {
+        let response = ConfigSetResponse {
+            key: "general.log_level".to_string(),
+            value: "debug".to_string(),
+            config_path: "/home/user/.config/rch/config.toml".to_string(),
+        };
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["key"], "general.log_level");
+        assert_eq!(json["value"], "debug");
+    }
+
+    #[test]
+    fn config_export_response_serializes() {
+        let response = ConfigExportResponse {
+            format: "toml".to_string(),
+            content: "[general]\nenabled = true".to_string(),
+        };
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["format"], "toml");
+        assert!(json["content"].as_str().unwrap().contains("enabled"));
+    }
+
+    #[test]
+    fn hook_action_response_success_serializes() {
+        let response = HookActionResponse {
+            action: "install".to_string(),
+            success: true,
+            settings_path: "~/.config/claude-code/settings.json".to_string(),
+            message: Some("Hook installed successfully".to_string()),
+        };
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["action"], "install");
+        assert_eq!(json["success"], true);
+        assert_eq!(json["message"], "Hook installed successfully");
+    }
+
+    #[test]
+    fn hook_action_response_without_message_serializes() {
+        let response = HookActionResponse {
+            action: "uninstall".to_string(),
+            success: true,
+            settings_path: "path".to_string(),
+            message: None,
+        };
+        let json = serde_json::to_value(&response).unwrap();
+        assert!(json.get("message").is_none());
+    }
+
+    #[test]
+    fn hook_test_response_serializes() {
+        let response = HookTestResponse {
+            classification_tests: vec![ClassificationTestResult {
+                command: "cargo build".to_string(),
+                is_compilation: true,
+                confidence: 0.95,
+                expected_intercept: true,
+                passed: true,
+            }],
+            daemon_connected: true,
+            daemon_response: Some("OK".to_string()),
+            workers_configured: 2,
+            workers: vec![],
+        };
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["daemon_connected"], true);
+        assert_eq!(json["workers_configured"], 2);
+        let tests = json["classification_tests"].as_array().unwrap();
+        assert_eq!(tests[0]["command"], "cargo build");
+        assert_eq!(tests[0]["passed"], true);
+    }
+
+    #[test]
+    fn classification_test_result_serializes() {
+        let result = ClassificationTestResult {
+            command: "bun test".to_string(),
+            is_compilation: true,
+            confidence: 0.92,
+            expected_intercept: true,
+            passed: true,
+        };
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["command"], "bun test");
+        assert_eq!(json["is_compilation"], true);
+        assert_eq!(json["confidence"], 0.92);
+    }
+
+    // -------------------------------------------------------------------------
+    // Error Codes Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn error_codes_are_strings() {
+        assert_eq!(error_codes::WORKER_UNREACHABLE, "WORKER_UNREACHABLE");
+        assert_eq!(error_codes::WORKER_NOT_FOUND, "WORKER_NOT_FOUND");
+        assert_eq!(error_codes::CONFIG_INVALID, "CONFIG_INVALID");
+        assert_eq!(error_codes::CONFIG_NOT_FOUND, "CONFIG_NOT_FOUND");
+        assert_eq!(error_codes::DAEMON_NOT_RUNNING, "DAEMON_NOT_RUNNING");
+        assert_eq!(
+            error_codes::DAEMON_CONNECTION_FAILED,
+            "DAEMON_CONNECTION_FAILED"
+        );
+        assert_eq!(error_codes::SSH_CONNECTION_FAILED, "SSH_CONNECTION_FAILED");
+        assert_eq!(error_codes::BENCHMARK_FAILED, "BENCHMARK_FAILED");
+        assert_eq!(error_codes::HOOK_INSTALL_FAILED, "HOOK_INSTALL_FAILED");
+        assert_eq!(error_codes::INTERNAL_ERROR, "INTERNAL_ERROR");
+    }
+
+    // -------------------------------------------------------------------------
+    // config_dir Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn config_dir_returns_some() {
+        // config_dir should return a path on most systems
+        let dir = config_dir();
+        // We can't guarantee it returns Some on all systems, but if it does,
+        // it should be a valid path that ends with "rch"
+        if let Some(path) = dir {
+            assert!(path.to_string_lossy().contains("rch"));
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // JSON_ENVELOPE_VERSION Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn json_envelope_version_is_expected_value() {
+        assert_eq!(JSON_ENVELOPE_VERSION, "1");
+    }
+
+    // -------------------------------------------------------------------------
+    // DEFAULT_SOCKET_PATH Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn default_socket_path_is_expected() {
+        assert_eq!(DEFAULT_SOCKET_PATH, "/tmp/rch.sock");
+    }
+}

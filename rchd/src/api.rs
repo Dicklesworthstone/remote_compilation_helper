@@ -211,7 +211,10 @@ pub async fn handle_connection(
         Ok(ApiRequest::Shutdown) => {
             metrics::inc_requests("shutdown");
             let _ = shutdown_tx.send(()).await;
-            ("{\"status\":\"shutting_down\"}".to_string(), "application/json")
+            (
+                "{\"status\":\"shutting_down\"}".to_string(),
+                "application/json",
+            )
         }
         Err(e) => return Err(e),
     };

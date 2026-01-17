@@ -81,8 +81,8 @@ fn handle_key_input_mode(key: KeyEvent) -> Action {
     }
 
     match key.code {
-        KeyCode::Esc => Action::Back,           // Exit input mode
-        KeyCode::Enter => Action::Select,       // Apply filter
+        KeyCode::Esc => Action::Back,     // Exit input mode
+        KeyCode::Enter => Action::Select, // Apply filter
         KeyCode::Backspace => Action::DeleteChar,
         KeyCode::Char(c) => Action::TextInput(c),
         _ => Action::Tick,
@@ -90,7 +90,10 @@ fn handle_key_input_mode(key: KeyEvent) -> Action {
 }
 
 /// Poll for events with optional input mode flag.
-pub fn poll_event_with_mode(timeout: Duration, input_mode: bool) -> std::io::Result<Option<Action>> {
+pub fn poll_event_with_mode(
+    timeout: Duration,
+    input_mode: bool,
+) -> std::io::Result<Option<Action>> {
     if event::poll(timeout)? {
         match event::read()? {
             Event::Key(key) => {

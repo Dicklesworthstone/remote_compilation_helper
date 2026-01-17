@@ -6,10 +6,16 @@
 //! - Worker selection: < 10ms
 //! - Full pipeline: < 15% overhead
 
+// Allow dead code for latency tracking types not yet integrated
+#![allow(dead_code)]
+
 use std::time::{Duration, Instant};
 use tracing::warn;
 
-use super::{CLASSIFICATION_TIER_LATENCY, CLASSIFICATION_TIER_TOTAL, DECISION_BUDGET_VIOLATIONS, DECISION_LATENCY};
+use super::{
+    CLASSIFICATION_TIER_LATENCY, CLASSIFICATION_TIER_TOTAL, DECISION_BUDGET_VIOLATIONS,
+    DECISION_LATENCY,
+};
 
 /// Performance budget for non-compilation decisions (milliseconds).
 /// From AGENTS.md: "Hook decision (non-compilation) | <1ms | 5ms"
@@ -131,7 +137,9 @@ pub fn record_classification_tier(tier: u8, duration: Duration) {
     let tier_str = tier.to_string();
 
     // Increment tier counter
-    CLASSIFICATION_TIER_TOTAL.with_label_values(&[&tier_str]).inc();
+    CLASSIFICATION_TIER_TOTAL
+        .with_label_values(&[&tier_str])
+        .inc();
 
     // Record tier latency
     CLASSIFICATION_TIER_LATENCY
@@ -253,8 +261,16 @@ mod tests {
 
     #[test]
     fn test_panic_thresholds() {
-        assert!(DecisionType::NonCompilation.panic_threshold_ms() > DecisionType::NonCompilation.budget_ms());
-        assert!(DecisionType::Compilation.panic_threshold_ms() > DecisionType::Compilation.budget_ms());
-        assert!(DecisionType::WorkerSelection.panic_threshold_ms() > DecisionType::WorkerSelection.budget_ms());
+        assert!(
+            DecisionType::NonCompilation.panic_threshold_ms()
+                > DecisionType::NonCompilation.budget_ms()
+        );
+        assert!(
+            DecisionType::Compilation.panic_threshold_ms() > DecisionType::Compilation.budget_ms()
+        );
+        assert!(
+            DecisionType::WorkerSelection.panic_threshold_ms()
+                > DecisionType::WorkerSelection.budget_ms()
+        );
     }
 }

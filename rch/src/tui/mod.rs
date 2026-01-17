@@ -8,5 +8,5 @@ mod event;
 mod state;
 mod widgets;
 
-pub use app::{run_tui, TuiConfig};
+pub use app::{TuiConfig, run_tui};
 pub use state::{Panel, TuiState};

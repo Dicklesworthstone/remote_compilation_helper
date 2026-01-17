@@ -9,6 +9,10 @@
 //! - Classification tier metrics (per-tier breakdown)
 //! - OpenTelemetry tracing support (optional)
 
+// Allow dead code for metric helpers that are part of the public API but not yet used
+// These will be used as the metrics integration is completed
+#![allow(dead_code)]
+
 pub mod budget;
 pub mod latency;
 pub mod tracing;
@@ -459,11 +463,8 @@ mod tests {
         let test_registry = Registry::new();
 
         // Register a sample metric
-        let counter = CounterVec::new(
-            Opts::new("test_counter", "A test counter"),
-            &["label"],
-        )
-        .unwrap();
+        let counter =
+            CounterVec::new(Opts::new("test_counter", "A test counter"), &["label"]).unwrap();
         test_registry.register(Box::new(counter.clone())).unwrap();
 
         // Increment the counter
@@ -514,7 +515,9 @@ mod tests {
 
         let encoder = TextEncoder::new();
         let mut buffer = Vec::new();
-        encoder.encode(&test_registry.gather(), &mut buffer).unwrap();
+        encoder
+            .encode(&test_registry.gather(), &mut buffer)
+            .unwrap();
 
         let output = String::from_utf8(buffer).unwrap();
         assert!(output.contains("# HELP test_counter"));

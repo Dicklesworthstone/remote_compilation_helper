@@ -5,7 +5,7 @@
 use crate::status_display::query_daemon_full_status;
 use crate::status_types::DaemonFullStatusResponse;
 use crate::tui::{
-    event::{poll_event_with_mode, Action},
+    event::{Action, poll_event_with_mode},
     state::{
         ActiveBuild, BuildProgress, BuildStatus, CircuitState, DaemonState, HistoricalBuild,
         Status, TuiState, WorkerState, WorkerStatus,
@@ -17,9 +17,9 @@ use chrono::{DateTime, Utc};
 use crossterm::{
     event::{DisableMouseCapture, EnableMouseCapture},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use ratatui::{backend::CrosstermBackend, Terminal};
+use ratatui::{Terminal, backend::CrosstermBackend};
 use std::io::{self, Stdout};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
