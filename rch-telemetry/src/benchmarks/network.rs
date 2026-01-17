@@ -323,7 +323,7 @@ impl NetworkBenchmark {
     async fn warmup_connection(&self) -> Result<(), NetworkBenchmarkError> {
         let output = Command::new("ssh")
             .args(self.ssh_base_args())
-            .arg(&self.worker.destination())
+            .arg(self.worker.destination())
             .arg("echo")
             .arg("warmup")
             .output()
@@ -492,7 +492,7 @@ impl NetworkBenchmark {
 
             let output = Command::new("ssh")
                 .args(self.ssh_base_args())
-                .arg(&self.worker.destination())
+                .arg(self.worker.destination())
                 .arg("echo")
                 .arg("ping")
                 .output()
@@ -527,7 +527,7 @@ impl NetworkBenchmark {
     async fn get_ssh_version(&self) -> Result<String, NetworkBenchmarkError> {
         let output = Command::new("ssh")
             .args(self.ssh_base_args())
-            .arg(&self.worker.destination())
+            .arg(self.worker.destination())
             .arg("ssh")
             .arg("-V")
             .stderr(Stdio::piped())
@@ -554,7 +554,7 @@ impl NetworkBenchmark {
 
         let output = Command::new("ssh")
             .args(self.ssh_base_args())
-            .arg(&self.worker.destination())
+            .arg(self.worker.destination())
             .arg("rm")
             .arg("-f")
             .arg(&remote_path)
