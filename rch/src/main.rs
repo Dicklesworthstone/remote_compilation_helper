@@ -361,6 +361,21 @@ enum WorkersAction {
         #[arg(long)]
         yes: bool,
     },
+    /// Synchronize Rust toolchain to workers
+    #[command(after_help = r#"EXAMPLES:
+    rch workers sync-toolchain css           # Sync toolchain to specific worker
+    rch workers sync-toolchain --all         # Sync toolchain to all workers
+    rch workers sync-toolchain --all --dry-run  # Preview what would happen"#)]
+    SyncToolchain {
+        /// Worker ID to sync, or --all for all workers
+        worker: Option<String>,
+        /// Sync to all workers
+        #[arg(long)]
+        all: bool,
+        /// Show planned actions without executing
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -583,6 +598,9 @@ async fn handle_workers(action: WorkersAction, ctx: &OutputContext) -> Result<()
         }
         WorkersAction::Discover { probe, add, yes } => {
             commands::workers_discover(probe, add, yes, ctx).await?;
+        }
+        WorkersAction::SyncToolchain { worker, all, dry_run } => {
+            commands::workers_sync_toolchain(worker, all, dry_run, ctx).await?;
         }
     }
     Ok(())

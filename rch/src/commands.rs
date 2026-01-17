@@ -1627,6 +1627,60 @@ impl ProbeInfo {
     }
 }
 
+/// Sync Rust toolchain to workers.
+///
+/// This ensures workers have the same Rust version and components
+/// installed as the local machine.
+pub async fn workers_sync_toolchain(
+    worker: Option<String>,
+    all: bool,
+    dry_run: bool,
+    ctx: &OutputContext,
+) -> Result<()> {
+    let style = ctx.theme();
+
+    // Validate arguments
+    if worker.is_none() && !all {
+        anyhow::bail!("Specify a worker ID or use --all");
+    }
+
+    println!("{}", style.format_header("Sync Rust Toolchain"));
+    println!();
+
+    // Get local toolchain info
+    let local_version = std::process::Command::new("rustc")
+        .arg("--version")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_else(|_| "unknown".into());
+
+    println!(
+        "  {} {} {}",
+        style.key("Local"),
+        style.muted(":"),
+        style.value(&local_version)
+    );
+    println!();
+
+    if dry_run {
+        println!(
+            "{} Dry run - no changes will be made",
+            StatusIndicator::Info.display(style)
+        );
+        println!();
+    }
+
+    // TODO: Actually sync toolchain to workers
+    // For now, this is a stub that shows what would be done
+    println!(
+        "{} Toolchain sync not yet implemented",
+        StatusIndicator::Warning.display(style)
+    );
+    println!("  This will install matching Rust toolchain on workers.");
+
+    Ok(())
+}
+
 // =============================================================================
 // Daemon Commands
 // =============================================================================
