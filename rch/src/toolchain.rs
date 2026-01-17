@@ -386,4 +386,244 @@ mod tests {
             assert!(!info.channel.is_empty());
         }
     }
+
+    // === Additional edge case tests for toolchain synchronization ===
+
+    #[test]
+    fn test_parse_channel_string_beta_no_date() {
+        let info = parse_channel_string("beta").unwrap();
+        assert_eq!(info.channel, "beta");
+        assert_eq!(info.date, None);
+        assert_eq!(info.rustup_toolchain(), "beta");
+    }
+
+    #[test]
+    fn test_parse_channel_string_two_digit_version() {
+        // Handle two-part versions like "1.75"
+        let info = parse_channel_string("1.75").unwrap();
+        assert_eq!(info.channel, "1.75");
+        assert_eq!(info.date, None);
+    }
+
+    #[test]
+    fn test_parse_channel_string_unknown_format() {
+        // Unknown formats should still parse without error
+        let info = parse_channel_string("custom-toolchain").unwrap();
+        assert_eq!(info.channel, "custom-toolchain");
+        assert_eq!(info.date, None);
+    }
+
+    #[test]
+    fn test_parse_channel_string_nightly_with_invalid_date() {
+        // "nightly-" prefix but not a valid date should treat as custom channel
+        let info = parse_channel_string("nightly-not-a-date").unwrap();
+        // Should not extract as date since it's not a valid date format
+        assert_eq!(info.channel, "nightly-not-a-date");
+        assert_eq!(info.date, None);
+    }
+
+    #[test]
+    fn test_is_valid_date_edge_cases() {
+        // Boundary dates
+        assert!(is_valid_date("2000-01-01"));
+        assert!(is_valid_date("2099-12-31"));
+
+        // Invalid formats
+        assert!(!is_valid_date(""));
+        assert!(!is_valid_date("2024"));
+        assert!(!is_valid_date("2024-01"));
+        assert!(!is_valid_date("2024/01/15"));
+        assert!(!is_valid_date("01-15-2024"));
+        assert!(!is_valid_date("2024-13-01")); // Technically valid format, but invalid month
+    }
+
+    #[test]
+    fn test_is_version_number_edge_cases() {
+        // Valid versions
+        assert!(is_version_number("0.0.1"));
+        assert!(is_version_number("99.99.99"));
+        assert!(is_version_number("1.0"));
+
+        // Invalid versions
+        assert!(!is_version_number("1"));
+        assert!(!is_version_number("1."));
+        assert!(!is_version_number(".1.0"));
+        assert!(!is_version_number("1.2.3.4")); // Too many parts
+        assert!(!is_version_number("a.b.c"));
+    }
+
+    #[test]
+    fn test_parse_rustc_version_edge_cases() {
+        // Minimal nightly format
+        let info = parse_rustc_version("rustc 1.80.0-nightly (abcdef123 2025-01-01)").unwrap();
+        assert_eq!(info.channel, "nightly");
+        assert_eq!(info.date, Some("2025-01-01".to_string()));
+
+        // Minimal beta format
+        let info = parse_rustc_version("rustc 1.80.0-beta.1 (abcdef123 2025-02-01)");
+        // beta.1 format should fall back to simple parsing
+        assert!(info.is_ok());
+
+        // Fallback for unusual formats
+        let info = parse_rustc_version("rustc 1.80.0-nightly");
+        assert!(info.is_ok());
+        let info = info.unwrap();
+        assert_eq!(info.channel, "nightly");
+    }
+
+    #[test]
+    fn test_parse_rustc_version_invalid_formats() {
+        // Empty string
+        let result = parse_rustc_version("");
+        assert!(result.is_err());
+
+        // Not rustc output
+        let result = parse_rustc_version("cargo 1.75.0");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_detect_toolchain_toml_with_components() {
+        // TOML with additional fields like components and targets
+        let tmp = TempDir::new().unwrap();
+        let toolchain_path = tmp.path().join("rust-toolchain.toml");
+        let mut file = std::fs::File::create(&toolchain_path).unwrap();
+        writeln!(file, "[toolchain]").unwrap();
+        writeln!(file, "channel = \"nightly-2024-06-01\"").unwrap();
+        writeln!(file, "components = [\"rustfmt\", \"clippy\"]").unwrap();
+        writeln!(file, "targets = [\"wasm32-unknown-unknown\"]").unwrap();
+
+        let info = detect_toolchain(tmp.path()).unwrap();
+        assert_eq!(info.channel, "nightly");
+        assert_eq!(info.date, Some("2024-06-01".to_string()));
+    }
+
+    #[test]
+    fn test_detect_toolchain_toml_with_profile() {
+        // TOML with profile field
+        let tmp = TempDir::new().unwrap();
+        let toolchain_path = tmp.path().join("rust-toolchain.toml");
+        let mut file = std::fs::File::create(&toolchain_path).unwrap();
+        writeln!(file, "[toolchain]").unwrap();
+        writeln!(file, "channel = \"stable\"").unwrap();
+        writeln!(file, "profile = \"minimal\"").unwrap();
+
+        let info = detect_toolchain(tmp.path()).unwrap();
+        assert_eq!(info.channel, "stable");
+    }
+
+    #[test]
+    fn test_detect_toolchain_legacy_with_whitespace() {
+        // Legacy file with extra whitespace
+        let tmp = TempDir::new().unwrap();
+        let toolchain_path = tmp.path().join("rust-toolchain");
+        std::fs::write(&toolchain_path, "  nightly-2024-03-15  \n\n").unwrap();
+
+        let info = detect_toolchain(tmp.path()).unwrap();
+        assert_eq!(info.channel, "nightly");
+        assert_eq!(info.date, Some("2024-03-15".to_string()));
+    }
+
+    #[test]
+    fn test_detect_toolchain_legacy_empty_file() {
+        // Empty legacy file should fail
+        let tmp = TempDir::new().unwrap();
+        let toolchain_path = tmp.path().join("rust-toolchain");
+        std::fs::write(&toolchain_path, "").unwrap();
+
+        // Should fall through to legacy file, find it invalid, then fall back to rustc
+        let result = detect_toolchain(tmp.path());
+        // Either falls back to rustc or returns error depending on rustc availability
+        // Don't assert success/failure - just that it doesn't panic
+        let _ = result;
+    }
+
+    #[test]
+    fn test_detect_toolchain_invalid_toml() {
+        // Invalid TOML should fall through to legacy or rustc
+        let tmp = TempDir::new().unwrap();
+        let toolchain_path = tmp.path().join("rust-toolchain.toml");
+        std::fs::write(&toolchain_path, "this is not valid toml [[[").unwrap();
+
+        // Should fall through to rustc fallback (if available)
+        let result = detect_toolchain(tmp.path());
+        // Don't assert success/failure - just verify no panic
+        let _ = result;
+    }
+
+    #[test]
+    fn test_detect_toolchain_toml_missing_channel() {
+        // TOML without channel field
+        let tmp = TempDir::new().unwrap();
+        let toolchain_path = tmp.path().join("rust-toolchain.toml");
+        let mut file = std::fs::File::create(&toolchain_path).unwrap();
+        writeln!(file, "[toolchain]").unwrap();
+        writeln!(file, "components = [\"rustfmt\"]").unwrap();
+        // No channel field
+
+        // Should fall through to rustc fallback
+        let result = detect_toolchain(tmp.path());
+        let _ = result;
+    }
+
+    #[test]
+    fn test_toolchain_info_display() {
+        // Test Display trait implementation (via rustup_toolchain)
+        let info = ToolchainInfo {
+            channel: "nightly".to_string(),
+            date: Some("2024-01-15".to_string()),
+            full_version: "rustc 1.76.0-nightly".to_string(),
+        };
+        assert_eq!(format!("{}", info), "nightly-2024-01-15");
+
+        let info = ToolchainInfo {
+            channel: "stable".to_string(),
+            date: None,
+            full_version: "rustc 1.75.0".to_string(),
+        };
+        assert_eq!(format!("{}", info), "stable");
+    }
+
+    #[test]
+    fn test_toolchain_info_equality() {
+        let info1 = ToolchainInfo {
+            channel: "nightly".to_string(),
+            date: Some("2024-01-15".to_string()),
+            full_version: "a".to_string(),
+        };
+        let info2 = ToolchainInfo {
+            channel: "nightly".to_string(),
+            date: Some("2024-01-15".to_string()),
+            full_version: "b".to_string(),
+        };
+        // Different full_version means not equal
+        assert_ne!(info1, info2);
+
+        let info3 = info1.clone();
+        assert_eq!(info1, info3);
+    }
+
+    #[test]
+    fn test_toolchain_info_methods() {
+        let nightly = ToolchainInfo::new("nightly", Some("2024-01-15".to_string()), "");
+        assert!(nightly.is_nightly());
+        assert!(!nightly.is_stable());
+        assert!(!nightly.is_beta());
+
+        let stable = ToolchainInfo::new("stable", None, "");
+        assert!(stable.is_stable());
+        assert!(!stable.is_nightly());
+        assert!(!stable.is_beta());
+
+        let beta = ToolchainInfo::new("beta", None, "");
+        assert!(beta.is_beta());
+        assert!(!beta.is_stable());
+        assert!(!beta.is_nightly());
+
+        // Custom channel
+        let custom = ToolchainInfo::new("1.75.0", None, "");
+        assert!(!custom.is_nightly());
+        assert!(!custom.is_stable());
+        assert!(!custom.is_beta());
+    }
 }
