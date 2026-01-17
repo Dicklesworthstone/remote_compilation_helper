@@ -562,6 +562,68 @@ fn default_excludes() -> Vec<String> {
     ]
 }
 
+// ============================================================================
+// Build History Types
+// ============================================================================
+
+/// Location where a build was executed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BuildLocation {
+    /// Build executed locally.
+    Local,
+    /// Build executed on a remote worker.
+    Remote,
+}
+
+impl Default for BuildLocation {
+    fn default() -> Self {
+        Self::Local
+    }
+}
+
+/// Record of a completed build.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BuildRecord {
+    /// Unique build identifier.
+    pub id: u64,
+    /// When the build started (ISO 8601 timestamp).
+    pub started_at: String,
+    /// When the build completed (ISO 8601 timestamp).
+    pub completed_at: String,
+    /// Project identifier (usually directory name or hash).
+    pub project_id: String,
+    /// Worker that executed the build (None if local).
+    pub worker_id: Option<String>,
+    /// Full command executed.
+    pub command: String,
+    /// Exit code (0 = success).
+    pub exit_code: i32,
+    /// Duration in milliseconds.
+    pub duration_ms: u64,
+    /// Build location (local or remote).
+    pub location: BuildLocation,
+    /// Bytes transferred (if remote).
+    pub bytes_transferred: Option<u64>,
+}
+
+/// Aggregate statistics for build history.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BuildStats {
+    /// Total number of builds in history.
+    pub total_builds: usize,
+    /// Number of successful builds (exit_code == 0).
+    pub success_count: usize,
+    /// Number of failed builds (exit_code != 0).
+    pub failure_count: usize,
+    /// Number of remote builds.
+    pub remote_count: usize,
+    /// Number of local builds.
+    pub local_count: usize,
+    /// Average build duration in milliseconds.
+    pub avg_duration_ms: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

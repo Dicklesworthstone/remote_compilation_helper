@@ -4,11 +4,13 @@
 //! - Request: `GET /select-worker?project=X&cores=N\n`
 //! - Response: JSON `SelectionResponse` or error
 
+use crate::DaemonContext;
 use crate::selection::{SelectionWeights, select_worker};
 use crate::workers::WorkerPool;
 use anyhow::{Result, anyhow};
 use rch_common::{
-    SelectedWorker, SelectionReason, SelectionRequest, SelectionResponse, WorkerStatus,
+    BuildRecord, BuildStats, CircuitState, SelectedWorker, SelectionReason, SelectionRequest,
+    SelectionResponse, WorkerStatus,
 };
 use serde::Serialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -22,21 +24,101 @@ enum ApiRequest {
     Status,
 }
 
-/// Response payload for GET /status.
+// ============================================================================
+// Status Response Types (per bead remote_compilation_helper-3sy)
+// ============================================================================
+
+/// Full status response for GET /status.
 #[derive(Debug, Serialize)]
-struct DaemonStatus {
-    workers_total: usize,
-    workers_healthy: usize,
-    workers_degraded: usize,
-    workers_unreachable: usize,
-    workers_draining: usize,
-    workers_disabled: usize,
-    slots_total: u32,
-    slots_available: u32,
+pub struct StatusResponse {
+    /// Daemon metadata.
+    pub daemon: DaemonStatusInfo,
+    /// Worker states.
+    pub workers: Vec<WorkerStatusInfo>,
+    /// Currently active builds (placeholder for future).
+    pub active_builds: Vec<ActiveBuild>,
+    /// Recent completed builds.
+    pub recent_builds: Vec<BuildRecord>,
+    /// Issues and warnings.
+    pub issues: Vec<Issue>,
+    /// Aggregate statistics.
+    pub stats: BuildStats,
+}
+
+/// Daemon metadata.
+#[derive(Debug, Serialize)]
+pub struct DaemonStatusInfo {
+    /// Process ID.
+    pub pid: u32,
+    /// Uptime in seconds.
+    pub uptime_secs: u64,
+    /// Daemon version.
+    pub version: String,
+    /// Unix socket path.
+    pub socket_path: String,
+    /// When daemon started (ISO 8601).
+    pub started_at: String,
+    /// Total workers configured.
+    pub workers_total: usize,
+    /// Healthy workers.
+    pub workers_healthy: usize,
+    /// Total slots.
+    pub slots_total: u32,
+    /// Available slots.
+    pub slots_available: u32,
+}
+
+/// Worker status information.
+#[derive(Debug, Serialize)]
+pub struct WorkerStatusInfo {
+    /// Worker ID.
+    pub id: String,
+    /// Host address.
+    pub host: String,
+    /// SSH user.
+    pub user: String,
+    /// Current status.
+    pub status: String,
+    /// Circuit breaker state.
+    pub circuit_state: String,
+    /// Used slots.
+    pub used_slots: u32,
+    /// Total slots.
+    pub total_slots: u32,
+    /// Speed score (0-100).
+    pub speed_score: f64,
+    /// Last error message, if any.
+    pub last_error: Option<String>,
+}
+
+/// Active build information (placeholder).
+#[derive(Debug, Serialize)]
+pub struct ActiveBuild {
+    /// Build ID.
+    pub id: u64,
+    /// Project identifier.
+    pub project_id: String,
+    /// Worker executing the build.
+    pub worker_id: String,
+    /// Command being executed.
+    pub command: String,
+    /// When build started (ISO 8601).
+    pub started_at: String,
+}
+
+/// Issue or warning.
+#[derive(Debug, Serialize)]
+pub struct Issue {
+    /// Severity: info, warning, error.
+    pub severity: String,
+    /// Short summary.
+    pub summary: String,
+    /// Suggested remediation command.
+    pub remediation: Option<String>,
 }
 
 /// Handle an incoming connection on the Unix socket.
-pub async fn handle_connection(stream: UnixStream, pool: WorkerPool) -> Result<()> {
+pub async fn handle_connection(stream: UnixStream, ctx: DaemonContext) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
@@ -53,11 +135,11 @@ pub async fn handle_connection(stream: UnixStream, pool: WorkerPool) -> Result<(
     // Parse and handle the request
     let response_json = match parse_request(line) {
         Ok(ApiRequest::SelectWorker(request)) => {
-            let response = handle_select_worker(&pool, request).await?;
+            let response = handle_select_worker(&ctx.pool, request).await?;
             serde_json::to_string(&response)?
         }
         Ok(ApiRequest::Status) => {
-            let status = handle_status(&pool).await?;
+            let status = handle_status(&ctx).await?;
             serde_json::to_string(&status)?
         }
         Err(e) => return Err(e),
@@ -235,46 +317,140 @@ async fn handle_select_worker(
 }
 
 /// Handle a status request.
-async fn handle_status(pool: &WorkerPool) -> Result<DaemonStatus> {
-    let workers = pool.all_workers().await;
+async fn handle_status(ctx: &DaemonContext) -> Result<StatusResponse> {
+    let workers = ctx.pool.all_workers().await;
 
     let mut workers_healthy = 0;
-    let mut workers_degraded = 0;
-    let mut workers_unreachable = 0;
-    let mut workers_draining = 0;
-    let mut workers_disabled = 0;
     let mut slots_total = 0u32;
     let mut slots_available = 0u32;
 
+    let mut worker_infos = Vec::with_capacity(workers.len());
+    let mut issues = Vec::new();
+
     for worker in &workers {
         let status = worker.status().await;
-        match status {
-            WorkerStatus::Healthy => workers_healthy += 1,
-            WorkerStatus::Degraded => workers_degraded += 1,
-            WorkerStatus::Unreachable => workers_unreachable += 1,
-            WorkerStatus::Draining => workers_draining += 1,
-            WorkerStatus::Disabled => workers_disabled += 1,
+        let used_slots = worker.config.total_slots - worker.available_slots();
+
+        // Count healthy workers
+        if status == WorkerStatus::Healthy {
+            workers_healthy += 1;
         }
 
         slots_total = slots_total.saturating_add(worker.config.total_slots);
         slots_available = slots_available.saturating_add(worker.available_slots());
+
+        // Build worker status info
+        let status_str = match status {
+            WorkerStatus::Healthy => "healthy",
+            WorkerStatus::Degraded => "degraded",
+            WorkerStatus::Unreachable => "unreachable",
+            WorkerStatus::Draining => "draining",
+            WorkerStatus::Disabled => "disabled",
+        };
+
+        // Get circuit state from worker (default to Closed if not available)
+        let circuit_state = worker.circuit_state().await.unwrap_or(CircuitState::Closed);
+        let circuit_str = match circuit_state {
+            CircuitState::Closed => "closed",
+            CircuitState::Open => "open",
+            CircuitState::HalfOpen => "half_open",
+        };
+
+        worker_infos.push(WorkerStatusInfo {
+            id: worker.config.id.to_string(),
+            host: worker.config.host.clone(),
+            user: worker.config.user.clone(),
+            status: status_str.to_string(),
+            circuit_state: circuit_str.to_string(),
+            used_slots,
+            total_slots: worker.config.total_slots,
+            speed_score: worker.speed_score,
+            last_error: worker.last_error().await,
+        });
+
+        // Generate issues based on worker state
+        if circuit_state == CircuitState::Open {
+            issues.push(Issue {
+                severity: "error".to_string(),
+                summary: format!("Circuit open for worker '{}'", worker.config.id),
+                remediation: Some(format!(
+                    "rch workers probe {} --force",
+                    worker.config.id
+                )),
+            });
+        } else if status == WorkerStatus::Unreachable {
+            issues.push(Issue {
+                severity: "error".to_string(),
+                summary: format!("Worker '{}' is unreachable", worker.config.id),
+                remediation: Some(format!("rch workers probe {}", worker.config.id)),
+            });
+        } else if status == WorkerStatus::Degraded {
+            issues.push(Issue {
+                severity: "warning".to_string(),
+                summary: format!("Worker '{}' is degraded (slow response)", worker.config.id),
+                remediation: None,
+            });
+        }
     }
 
-    Ok(DaemonStatus {
-        workers_total: workers.len(),
-        workers_healthy,
-        workers_degraded,
-        workers_unreachable,
-        workers_draining,
-        workers_disabled,
-        slots_total,
-        slots_available,
+    // Calculate uptime
+    let uptime_secs = ctx.started_at.elapsed().as_secs();
+
+    // Get started_at as ISO 8601 (approximation using current time - uptime)
+    let started_at = {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let start = now - uptime_secs;
+        // Format as ISO 8601
+        let dt = chrono::DateTime::from_timestamp(start as i64, 0)
+            .unwrap_or_else(|| chrono::Utc::now());
+        dt.to_rfc3339()
+    };
+
+    // Get recent builds from history
+    let recent_builds = ctx.history.recent(20);
+    let stats = ctx.history.stats();
+
+    Ok(StatusResponse {
+        daemon: DaemonStatusInfo {
+            pid: ctx.pid,
+            uptime_secs,
+            version: ctx.version.to_string(),
+            socket_path: ctx.socket_path.clone(),
+            started_at,
+            workers_total: workers.len(),
+            workers_healthy,
+            slots_total,
+            slots_available,
+        },
+        workers: worker_infos,
+        active_builds: vec![], // TODO: Implement active build tracking
+        recent_builds,
+        issues,
+        stats,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::history::BuildHistory;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    fn make_test_context(pool: WorkerPool) -> DaemonContext {
+        DaemonContext {
+            pool,
+            history: Arc::new(BuildHistory::new(100)),
+            started_at: Instant::now(),
+            socket_path: "/tmp/test.sock".to_string(),
+            version: "0.1.0",
+            pid: 1234,
+        }
+    }
 
     #[test]
     fn test_parse_request_basic() {
@@ -502,15 +678,13 @@ mod tests {
         assert!(worker1.reserve_slots(2));
         assert!(worker2.reserve_slots(3));
 
-        let status = handle_status(&pool).await.unwrap();
+        let ctx = make_test_context(pool);
+        let status = handle_status(&ctx).await.unwrap();
 
-        assert_eq!(status.workers_total, 2);
-        assert_eq!(status.workers_healthy, 1);
-        assert_eq!(status.workers_degraded, 1);
-        assert_eq!(status.workers_unreachable, 0);
-        assert_eq!(status.workers_draining, 0);
-        assert_eq!(status.workers_disabled, 0);
-        assert_eq!(status.slots_total, 12);
-        assert_eq!(status.slots_available, 7);
+        assert_eq!(status.daemon.workers_total, 2);
+        assert_eq!(status.daemon.workers_healthy, 1);
+        assert_eq!(status.daemon.slots_total, 12);
+        assert_eq!(status.daemon.slots_available, 7);
+        assert_eq!(status.workers.len(), 2);
     }
 }

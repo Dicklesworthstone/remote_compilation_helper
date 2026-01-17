@@ -4,7 +4,7 @@
 
 use crate::workers::{WorkerPool, WorkerState};
 use rch_common::mock::{self, MockConfig, MockSshClient};
-use rch_common::{SshClient, SshOptions, WorkerStatus};
+use rch_common::{CircuitBreakerConfig, CircuitState, CircuitStats, SshClient, SshOptions, WorkerStatus};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
@@ -31,6 +31,8 @@ pub struct HealthConfig {
     pub degraded_threshold_ms: u64,
     /// Number of consecutive failures before marking unreachable.
     pub failure_threshold: u32,
+    /// Circuit breaker configuration.
+    pub circuit: CircuitBreakerConfig,
 }
 
 impl Default for HealthConfig {
@@ -40,6 +42,7 @@ impl Default for HealthConfig {
             check_timeout: DEFAULT_CHECK_TIMEOUT,
             degraded_threshold_ms: DEGRADED_THRESHOLD_MS,
             failure_threshold: 3,
+            circuit: CircuitBreakerConfig::default(),
         }
     }
 }
@@ -78,32 +81,48 @@ impl HealthCheckResult {
     }
 }
 
-/// Worker health state tracking.
+/// Worker health state tracking with circuit breaker integration.
 #[derive(Debug)]
 pub struct WorkerHealth {
-    /// Consecutive failure count.
-    consecutive_failures: u32,
     /// Last health check result.
     last_result: Option<HealthCheckResult>,
-    /// Current status.
+    /// Current worker status.
     current_status: WorkerStatus,
+    /// Circuit breaker statistics for this worker.
+    circuit: CircuitStats,
+    /// Last error message (for diagnostics).
+    last_error: Option<String>,
 }
 
 impl Default for WorkerHealth {
     fn default() -> Self {
         Self {
-            consecutive_failures: 0,
             last_result: None,
             current_status: WorkerStatus::Healthy,
+            circuit: CircuitStats::new(),
+            last_error: None,
         }
     }
 }
 
 impl WorkerHealth {
+    /// Create a new WorkerHealth with default state.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
     /// Update health state based on check result.
-    pub fn update(&mut self, result: HealthCheckResult, config: &HealthConfig) {
+    ///
+    /// This drives circuit breaker state transitions based on health check outcomes:
+    /// - On success: records success, may close half-open circuit
+    /// - On failure: records failure, may open circuit
+    pub fn update(&mut self, result: HealthCheckResult, config: &HealthConfig, worker_id: &str) {
+        let prior_circuit_state = self.circuit.state();
+
         if result.healthy {
-            self.consecutive_failures = 0;
+            // Record success in circuit stats
+            self.circuit.record_success();
+            self.last_error = None;
 
             // Check if response is slow (degraded)
             if result.response_time_ms > config.degraded_threshold_ms {
@@ -111,31 +130,103 @@ impl WorkerHealth {
             } else {
                 self.current_status = WorkerStatus::Healthy;
             }
-        } else {
-            self.consecutive_failures += 1;
 
-            if self.consecutive_failures >= config.failure_threshold {
+            // Check if circuit should close (half-open -> closed)
+            if self.circuit.should_close(&config.circuit) {
+                info!(
+                    "Worker {} circuit closing: {} consecutive successes",
+                    worker_id, config.circuit.success_threshold
+                );
+                self.circuit.close();
+            }
+        } else {
+            // Record failure in circuit stats
+            self.circuit.record_failure();
+            self.last_error = result.error.clone();
+
+            // Check if circuit should open (closed -> open)
+            if self.circuit.should_open(&config.circuit) {
+                info!(
+                    "Worker {} circuit opening: {} consecutive failures",
+                    worker_id,
+                    self.circuit.consecutive_failures()
+                );
+                self.circuit.open();
+                self.current_status = WorkerStatus::Unreachable;
+            } else if self.circuit.state() == CircuitState::Open {
+                // Already open, keep unreachable
+                self.current_status = WorkerStatus::Unreachable;
+            } else if self.circuit.state() == CircuitState::HalfOpen {
+                // Failure in half-open means reopen circuit
+                info!(
+                    "Worker {} circuit reopening: probe failed in half-open state",
+                    worker_id
+                );
+                self.circuit.open();
                 self.current_status = WorkerStatus::Unreachable;
             } else {
-                // Still trying, keep current status unless already unreachable
-                if self.current_status != WorkerStatus::Unreachable {
-                    self.current_status = WorkerStatus::Degraded;
-                }
+                // Still trying, mark as degraded
+                self.current_status = WorkerStatus::Degraded;
             }
+        }
+
+        // Check if circuit should transition to half-open (open -> half-open)
+        if self.circuit.state() == CircuitState::Open
+            && self.circuit.should_half_open(&config.circuit)
+        {
+            info!(
+                "Worker {} circuit transitioning to half-open: cooldown elapsed",
+                worker_id
+            );
+            self.circuit.half_open();
+        }
+
+        // Log state transitions
+        let new_circuit_state = self.circuit.state();
+        if prior_circuit_state != new_circuit_state {
+            info!(
+                "Worker {} circuit state: {:?} -> {:?}",
+                worker_id, prior_circuit_state, new_circuit_state
+            );
         }
 
         self.last_result = Some(result);
     }
 
-    /// Get current status.
+    /// Get current worker status.
     pub fn status(&self) -> WorkerStatus {
         self.current_status
+    }
+
+    /// Get current circuit state.
+    pub fn circuit_state(&self) -> CircuitState {
+        self.circuit.state()
+    }
+
+    /// Get circuit statistics.
+    pub fn circuit_stats(&self) -> &CircuitStats {
+        &self.circuit
     }
 
     /// Get last check result.
     #[allow(dead_code)] // Will be used by status API
     pub fn last_result(&self) -> Option<&HealthCheckResult> {
         self.last_result.as_ref()
+    }
+
+    /// Get last error message.
+    pub fn last_error(&self) -> Option<&str> {
+        self.last_error.as_deref()
+    }
+
+    /// Check if this worker can be used for a probe in half-open state.
+    pub fn can_probe(&self, config: &HealthConfig) -> bool {
+        self.circuit.can_probe(&config.circuit)
+    }
+
+    /// Start a probe request (call when sending a request to half-open circuit).
+    pub fn start_probe(&mut self, config: &HealthConfig) -> bool {
+        self.circuit.start_probe(&config.circuit)
     }
 }
 
@@ -197,7 +288,7 @@ impl HealthMonitor {
                     // Update health state
                     let mut states = health_states.write().await;
                     let health = states.entry(worker_id.clone()).or_default();
-                    health.update(result.clone(), &config);
+                    health.update(result.clone(), &config, &worker_id);
 
                     // Log status changes
                     let new_status = health.status();
@@ -209,7 +300,7 @@ impl HealthMonitor {
                     } else {
                         warn!(
                             "Worker {} check failed: {:?} (failures: {})",
-                            worker_id, result.error, health.consecutive_failures
+                            worker_id, result.error, health.circuit_stats().consecutive_failures()
                         );
                     }
 
@@ -391,9 +482,9 @@ mod tests {
 
         // Successful check
         let result = HealthCheckResult::success(100);
-        health.update(result, &config);
+        health.update(result, &config, "test-worker");
         assert_eq!(health.status(), WorkerStatus::Healthy);
-        assert_eq!(health.consecutive_failures, 0);
+        assert_eq!(health.circuit_stats().consecutive_failures(), 0);
     }
 
     #[test]
@@ -403,7 +494,7 @@ mod tests {
 
         // Slow response (degraded)
         let result = HealthCheckResult::success(6000); // Over threshold
-        health.update(result, &config);
+        health.update(result, &config, "test-worker");
         assert_eq!(health.status(), WorkerStatus::Degraded);
     }
 
@@ -418,11 +509,11 @@ mod tests {
         // Multiple failures
         for _ in 0..3 {
             let result = HealthCheckResult::failure("Connection failed".to_string());
-            health.update(result, &config);
+            health.update(result, &config, "test-worker");
         }
 
         assert_eq!(health.status(), WorkerStatus::Unreachable);
-        assert_eq!(health.consecutive_failures, 3);
+        assert_eq!(health.circuit_stats().consecutive_failures(), 3);
     }
 
     #[test]
@@ -433,15 +524,152 @@ mod tests {
         // Fail twice
         for _ in 0..2 {
             let result = HealthCheckResult::failure("Error".to_string());
-            health.update(result, &config);
+            health.update(result, &config, "test-worker");
         }
-        assert_eq!(health.consecutive_failures, 2);
+        assert_eq!(health.circuit_stats().consecutive_failures(), 2);
 
         // Then succeed
         let result = HealthCheckResult::success(100);
-        health.update(result, &config);
+        health.update(result, &config, "test-worker");
         assert_eq!(health.status(), WorkerStatus::Healthy);
-        assert_eq!(health.consecutive_failures, 0);
+        assert_eq!(health.circuit_stats().consecutive_failures(), 0);
+    }
+
+    #[test]
+    fn test_circuit_opens_on_failure_threshold() {
+        let config = HealthConfig {
+            circuit: CircuitBreakerConfig {
+                failure_threshold: 3,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut health = WorkerHealth::default();
+
+        // Initial state is closed
+        assert_eq!(health.circuit_state(), CircuitState::Closed);
+
+        // Fail up to threshold
+        for i in 0..3 {
+            let result = HealthCheckResult::failure("Connection failed".to_string());
+            health.update(result, &config, "test-worker");
+            if i < 2 {
+                // Circuit still closed before threshold
+                assert_eq!(health.circuit_state(), CircuitState::Closed);
+            }
+        }
+
+        // Circuit should now be open
+        assert_eq!(health.circuit_state(), CircuitState::Open);
+        assert_eq!(health.status(), WorkerStatus::Unreachable);
+    }
+
+    #[test]
+    fn test_circuit_transitions_to_half_open() {
+        let config = HealthConfig {
+            circuit: CircuitBreakerConfig {
+                failure_threshold: 2,
+                open_cooldown_secs: 0, // Instant cooldown for testing
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut health = WorkerHealth::default();
+
+        // With open_cooldown_secs=0, the circuit opens then immediately transitions
+        // to half-open in the same update() call when should_half_open() is checked.
+        for _ in 0..2 {
+            let result = HealthCheckResult::failure("Error".to_string());
+            health.update(result, &config, "test-worker");
+        }
+        // With cooldown=0, we go straight to HalfOpen after opening
+        assert_eq!(health.circuit_state(), CircuitState::HalfOpen);
+    }
+
+    #[test]
+    fn test_circuit_closes_after_success_in_half_open() {
+        let config = HealthConfig {
+            circuit: CircuitBreakerConfig {
+                failure_threshold: 2,
+                success_threshold: 2,
+                open_cooldown_secs: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut health = WorkerHealth::default();
+
+        // Open and transition to half-open
+        for _ in 0..2 {
+            let result = HealthCheckResult::failure("Error".to_string());
+            health.update(result, &config, "test-worker");
+        }
+        // Trigger half-open transition
+        let result = HealthCheckResult::success(50);
+        health.update(result, &config, "test-worker");
+        assert_eq!(health.circuit_state(), CircuitState::HalfOpen);
+
+        // One more success should close circuit (success_threshold=2)
+        let result = HealthCheckResult::success(50);
+        health.update(result, &config, "test-worker");
+        assert_eq!(health.circuit_state(), CircuitState::Closed);
+        assert_eq!(health.status(), WorkerStatus::Healthy);
+    }
+
+    #[test]
+    fn test_circuit_reopens_on_failure_in_half_open() {
+        // Use two configs: one with cooldown=0 to quickly get to half-open,
+        // then one with longer cooldown to verify reopen stays open
+        let config_fast = HealthConfig {
+            circuit: CircuitBreakerConfig {
+                failure_threshold: 2,
+                open_cooldown_secs: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let config_slow = HealthConfig {
+            circuit: CircuitBreakerConfig {
+                failure_threshold: 2,
+                open_cooldown_secs: 60, // Long cooldown so circuit stays open
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut health = WorkerHealth::default();
+
+        // Open and transition to half-open (with fast cooldown)
+        for _ in 0..2 {
+            let result = HealthCheckResult::failure("Error".to_string());
+            health.update(result, &config_fast, "test-worker");
+        }
+        // With cooldown=0, we're now in HalfOpen
+        assert_eq!(health.circuit_state(), CircuitState::HalfOpen);
+
+        // Failure in half-open should reopen circuit (use slow config so it stays open)
+        let result = HealthCheckResult::failure("Failed again".to_string());
+        health.update(result, &config_slow, "test-worker");
+        assert_eq!(health.circuit_state(), CircuitState::Open);
+        assert_eq!(health.status(), WorkerStatus::Unreachable);
+    }
+
+    #[test]
+    fn test_circuit_stats_accessors() {
+        let config = HealthConfig::default();
+        let mut health = WorkerHealth::default();
+
+        // Initially no error
+        assert!(health.last_error().is_none());
+
+        // After failure, error is stored
+        let result = HealthCheckResult::failure("Test error message".to_string());
+        health.update(result, &config, "test-worker");
+        assert_eq!(health.last_error(), Some("Test error message"));
+
+        // After success, error is cleared
+        let result = HealthCheckResult::success(50);
+        health.update(result, &config, "test-worker");
+        assert!(health.last_error().is_none());
     }
 
     #[tokio::test]

@@ -2,7 +2,7 @@
 
 #![allow(dead_code)] // Scaffold code - methods will be used in future beads
 
-use rch_common::{WorkerConfig, WorkerId, WorkerStatus};
+use rch_common::{CircuitState, CircuitStats, CircuitBreakerConfig, WorkerConfig, WorkerId, WorkerStatus};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
@@ -22,6 +22,10 @@ pub struct WorkerState {
     pub speed_score: f64,
     /// Projects cached on this worker.
     pub cached_projects: Vec<String>,
+    /// Circuit breaker statistics.
+    circuit: RwLock<CircuitStats>,
+    /// Last error message.
+    last_error_msg: RwLock<Option<String>>,
 }
 
 impl WorkerState {
@@ -33,6 +37,8 @@ impl WorkerState {
             used_slots: AtomicU32::new(0),
             speed_score: 50.0, // Default mid-range score
             cached_projects: Vec::new(),
+            circuit: RwLock::new(CircuitStats::new()),
+            last_error_msg: RwLock::new(None),
         }
     }
 
@@ -79,6 +85,84 @@ impl WorkerState {
     /// Check if this worker has a cached copy of a project.
     pub fn has_cached_project(&self, project: &str) -> bool {
         self.cached_projects.iter().any(|p| p == project)
+    }
+
+    /// Get the current circuit breaker state.
+    pub async fn circuit_state(&self) -> Option<CircuitState> {
+        Some(self.circuit.read().await.state())
+    }
+
+    /// Get the circuit stats (for internal use).
+    pub async fn circuit_stats(&self) -> CircuitStats {
+        self.circuit.read().await.clone()
+    }
+
+    /// Record a successful operation for circuit breaker.
+    pub async fn record_success(&self) {
+        let mut circuit = self.circuit.write().await;
+        circuit.record_success();
+    }
+
+    /// Record a failed operation for circuit breaker.
+    pub async fn record_failure(&self, error_msg: Option<String>) {
+        let mut circuit = self.circuit.write().await;
+        circuit.record_failure();
+
+        if let Some(msg) = error_msg {
+            *self.last_error_msg.write().await = Some(msg);
+        }
+    }
+
+    /// Check if circuit should open based on config.
+    pub async fn should_open_circuit(&self, config: &CircuitBreakerConfig) -> bool {
+        self.circuit.read().await.should_open(config)
+    }
+
+    /// Check if circuit should transition to half-open.
+    pub async fn should_half_open(&self, config: &CircuitBreakerConfig) -> bool {
+        self.circuit.read().await.should_half_open(config)
+    }
+
+    /// Check if circuit should close.
+    pub async fn should_close_circuit(&self, config: &CircuitBreakerConfig) -> bool {
+        self.circuit.read().await.should_close(config)
+    }
+
+    /// Check if we can send a probe request.
+    pub async fn can_probe(&self, config: &CircuitBreakerConfig) -> bool {
+        self.circuit.read().await.can_probe(config)
+    }
+
+    /// Start a probe request.
+    pub async fn start_probe(&self, config: &CircuitBreakerConfig) -> bool {
+        self.circuit.write().await.start_probe(config)
+    }
+
+    /// Open the circuit.
+    pub async fn open_circuit(&self) {
+        self.circuit.write().await.open();
+    }
+
+    /// Transition to half-open.
+    pub async fn half_open_circuit(&self) {
+        self.circuit.write().await.half_open();
+    }
+
+    /// Close the circuit.
+    pub async fn close_circuit(&self) {
+        self.circuit.write().await.close();
+        // Clear last error on circuit close
+        *self.last_error_msg.write().await = None;
+    }
+
+    /// Get the last error message.
+    pub async fn last_error(&self) -> Option<String> {
+        self.last_error_msg.read().await.clone()
+    }
+
+    /// Set an error message.
+    pub async fn set_error(&self, msg: String) {
+        *self.last_error_msg.write().await = Some(msg);
     }
 }
 

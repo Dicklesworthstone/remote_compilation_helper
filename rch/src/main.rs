@@ -15,7 +15,9 @@ pub mod ui;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use std::sync::Arc;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
+use ui::{ColorChoice, OutputConfig, OutputContext};
 
 #[derive(Parser)]
 #[command(name = "rch")]
@@ -35,6 +37,14 @@ struct Cli {
     /// Suppress non-error output
     #[arg(short, long, global = true)]
     quiet: bool,
+
+    /// Output as JSON for machine parsing
+    #[arg(long, global = true)]
+    json: bool,
+
+    /// Color output mode: auto, always, never
+    #[arg(long, global = true, default_value = "auto")]
+    color: String,
 }
 
 #[derive(Subcommand)]
@@ -153,6 +163,16 @@ async fn main() -> Result<()> {
         .with(filter)
         .init();
 
+    // Create output context from CLI flags
+    let output_config = OutputConfig {
+        json: cli.json,
+        verbose: cli.verbose,
+        quiet: cli.quiet,
+        color: ColorChoice::parse(&cli.color),
+        ..Default::default()
+    };
+    let ctx = Arc::new(OutputContext::new(output_config));
+
     // If no subcommand, we're being invoked as a hook
     match cli.command {
         None => {
@@ -160,63 +180,63 @@ async fn main() -> Result<()> {
             hook::run_hook().await
         }
         Some(cmd) => match cmd {
-            Commands::Daemon { action } => handle_daemon(action).await,
-            Commands::Workers { action } => handle_workers(action).await,
-            Commands::Status { workers, jobs } => handle_status(workers, jobs).await,
-            Commands::Config { action } => handle_config(action).await,
-            Commands::Hook { action } => handle_hook(action).await,
+            Commands::Daemon { action } => handle_daemon(action, &ctx).await,
+            Commands::Workers { action } => handle_workers(action, &ctx).await,
+            Commands::Status { workers, jobs } => handle_status(workers, jobs, &ctx).await,
+            Commands::Config { action } => handle_config(action, &ctx).await,
+            Commands::Hook { action } => handle_hook(action, &ctx).await,
         },
     }
 }
 
-async fn handle_daemon(action: DaemonAction) -> Result<()> {
+async fn handle_daemon(action: DaemonAction, ctx: &OutputContext) -> Result<()> {
     match action {
         DaemonAction::Start => {
-            commands::daemon_start().await?;
+            commands::daemon_start(ctx).await?;
         }
         DaemonAction::Stop => {
-            commands::daemon_stop().await?;
+            commands::daemon_stop(ctx).await?;
         }
         DaemonAction::Restart => {
-            commands::daemon_restart().await?;
+            commands::daemon_restart(ctx).await?;
         }
         DaemonAction::Status => {
-            commands::daemon_status()?;
+            commands::daemon_status(ctx)?;
         }
         DaemonAction::Logs { lines } => {
-            commands::daemon_logs(lines)?;
+            commands::daemon_logs(lines, ctx)?;
         }
     }
     Ok(())
 }
 
-async fn handle_workers(action: WorkersAction) -> Result<()> {
+async fn handle_workers(action: WorkersAction, ctx: &OutputContext) -> Result<()> {
     match action {
         WorkersAction::List => {
-            commands::workers_list()?;
+            commands::workers_list(ctx)?;
         }
         WorkersAction::Probe { worker, all } => {
-            commands::workers_probe(worker, all).await?;
+            commands::workers_probe(worker, all, ctx).await?;
         }
         WorkersAction::Benchmark => {
-            commands::workers_benchmark().await?;
+            commands::workers_benchmark(ctx).await?;
         }
         WorkersAction::Drain { worker } => {
-            commands::workers_drain(&worker).await?;
+            commands::workers_drain(&worker, ctx).await?;
         }
         WorkersAction::Enable { worker } => {
-            commands::workers_enable(&worker).await?;
+            commands::workers_enable(&worker, ctx).await?;
         }
     }
     Ok(())
 }
 
-async fn handle_status(workers: bool, jobs: bool) -> Result<()> {
+async fn handle_status(workers: bool, jobs: bool, _ctx: &OutputContext) -> Result<()> {
     commands::status_overview(workers, jobs).await?;
     Ok(())
 }
 
-async fn handle_config(action: ConfigAction) -> Result<()> {
+async fn handle_config(action: ConfigAction, _ctx: &OutputContext) -> Result<()> {
     match action {
         ConfigAction::Show => {
             commands::config_show()?;
@@ -234,7 +254,7 @@ async fn handle_config(action: ConfigAction) -> Result<()> {
     Ok(())
 }
 
-async fn handle_hook(action: HookAction) -> Result<()> {
+async fn handle_hook(action: HookAction, _ctx: &OutputContext) -> Result<()> {
     match action {
         HookAction::Install => {
             commands::hook_install()?;

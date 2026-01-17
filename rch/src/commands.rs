@@ -2,16 +2,112 @@
 //!
 //! This module contains the actual business logic for each CLI subcommand.
 
+use crate::ui::context::OutputContext;
 use crate::ui::style::{StatusIndicator, Style};
 use anyhow::{Context, Result, bail};
 use directories::ProjectDirs;
 use rch_common::{RchConfig, SshClient, SshOptions, WorkerConfig, WorkerId};
+use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::process::Command;
 use tracing::debug;
+
+// =============================================================================
+// JSON Response Types
+// =============================================================================
+
+/// Standard JSON envelope for all command responses.
+#[derive(Debug, Clone, Serialize)]
+pub struct JsonResponse<T: Serialize> {
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<T>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl<T: Serialize> JsonResponse<T> {
+    pub fn ok(data: T) -> Self {
+        Self {
+            success: true,
+            data: Some(data),
+            error: None,
+        }
+    }
+
+    pub fn err(message: impl Into<String>) -> Self {
+        Self {
+            success: false,
+            data: None,
+            error: Some(message.into()),
+        }
+    }
+}
+
+/// Worker information for JSON output.
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkerInfo {
+    pub id: String,
+    pub host: String,
+    pub user: String,
+    pub total_slots: u32,
+    pub priority: u32,
+    pub tags: Vec<String>,
+}
+
+impl From<&WorkerConfig> for WorkerInfo {
+    fn from(w: &WorkerConfig) -> Self {
+        Self {
+            id: w.id.as_str().to_string(),
+            host: w.host.clone(),
+            user: w.user.clone(),
+            total_slots: w.total_slots,
+            priority: w.priority,
+            tags: w.tags.clone(),
+        }
+    }
+}
+
+/// Workers list response.
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkersListResponse {
+    pub workers: Vec<WorkerInfo>,
+    pub count: usize,
+}
+
+/// Worker probe result.
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkerProbeResult {
+    pub id: String,
+    pub host: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latency_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Daemon status response.
+#[derive(Debug, Clone, Serialize)]
+pub struct DaemonStatusResponse {
+    pub running: bool,
+    pub socket_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uptime_seconds: Option<u64>,
+}
+
+/// System status response.
+#[derive(Debug, Clone, Serialize)]
+pub struct StatusResponse {
+    pub daemon_running: bool,
+    pub hook_installed: bool,
+    pub workers_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workers: Option<Vec<WorkerInfo>>,
+}
 
 /// Create a style for terminal output.
 ///
@@ -122,9 +218,19 @@ pub fn load_workers_from_config() -> Result<Vec<WorkerConfig>> {
 }
 
 /// List all configured workers.
-pub fn workers_list() -> Result<()> {
+pub fn workers_list(ctx: &OutputContext) -> Result<()> {
     let workers = load_workers_from_config()?;
-    let style = terminal_style();
+    let style = ctx.style();
+
+    // JSON output mode
+    if ctx.is_json() {
+        let response = WorkersListResponse {
+            count: workers.len(),
+            workers: workers.iter().map(WorkerInfo::from).collect(),
+        };
+        let _ = ctx.json(&JsonResponse::ok(response));
+        return Ok(());
+    }
 
     if workers.is_empty() {
         return Ok(());
@@ -170,11 +276,14 @@ pub fn workers_list() -> Result<()> {
 }
 
 /// Probe worker connectivity.
-pub async fn workers_probe(worker_id: Option<String>, all: bool) -> Result<()> {
+pub async fn workers_probe(worker_id: Option<String>, all: bool, ctx: &OutputContext) -> Result<()> {
     let workers = load_workers_from_config()?;
-    let style = terminal_style();
+    let style = ctx.style();
 
     if workers.is_empty() {
+        if ctx.is_json() {
+            let _ = ctx.json(&JsonResponse::<Vec<WorkerProbeResult>>::ok(vec![]));
+        }
         return Ok(());
     }
 
@@ -183,37 +292,51 @@ pub async fn workers_probe(worker_id: Option<String>, all: bool) -> Result<()> {
     } else if let Some(id) = &worker_id {
         workers.iter().filter(|w| w.id.as_str() == id).collect()
     } else {
-        println!(
-            "{} Specify a worker ID or use {} to probe all workers.",
-            StatusIndicator::Info.display(&style),
-            style.highlight("--all")
-        );
+        if ctx.is_json() {
+            let _ = ctx.json(&JsonResponse::<()>::err("Specify a worker ID or use --all"));
+        } else {
+            println!(
+                "{} Specify a worker ID or use {} to probe all workers.",
+                StatusIndicator::Info.display(style),
+                style.highlight("--all")
+            );
+        }
         return Ok(());
     };
 
     if targets.is_empty() {
         if let Some(id) = worker_id {
-            println!(
-                "{} Worker '{}' not found in configuration.",
-                StatusIndicator::Warning.display(&style),
-                style.highlight(&id)
-            );
+            if ctx.is_json() {
+                let _ = ctx.json(&JsonResponse::<()>::err(format!("Worker '{}' not found", id)));
+            } else {
+                println!(
+                    "{} Worker '{}' not found in configuration.",
+                    StatusIndicator::Warning.display(style),
+                    style.highlight(&id)
+                );
+            }
         }
         return Ok(());
     }
 
-    println!(
-        "Probing {} worker(s)...\n",
-        style.highlight(&targets.len().to_string())
-    );
+    let mut results = Vec::new();
+
+    if !ctx.is_json() {
+        println!(
+            "Probing {} worker(s)...\n",
+            style.highlight(&targets.len().to_string())
+        );
+    }
 
     for worker in targets {
-        print!(
-            "  {} {}@{}... ",
-            style.highlight(worker.id.as_str()),
-            style.muted(&worker.user),
-            style.info(&worker.host)
-        );
+        if !ctx.is_json() {
+            print!(
+                "  {} {}@{}... ",
+                style.highlight(worker.id.as_str()),
+                style.muted(&worker.user),
+                style.info(&worker.host)
+            );
+        }
 
         let mut client = SshClient::new(worker.clone(), SshOptions::default());
 
@@ -222,63 +345,128 @@ pub async fn workers_probe(worker_id: Option<String>, all: bool) -> Result<()> {
                 let start = std::time::Instant::now();
                 match client.health_check().await {
                     Ok(true) => {
-                        let latency = start.elapsed().as_millis();
-                        println!(
-                            "{} ({}ms)",
-                            StatusIndicator::Success.with_label(&style, "OK"),
-                            style.muted(&latency.to_string())
-                        );
+                        let latency = start.elapsed().as_millis() as u64;
+                        if ctx.is_json() {
+                            results.push(WorkerProbeResult {
+                                id: worker.id.as_str().to_string(),
+                                host: worker.host.clone(),
+                                status: "ok".to_string(),
+                                latency_ms: Some(latency),
+                                error: None,
+                            });
+                        } else {
+                            println!(
+                                "{} ({}ms)",
+                                StatusIndicator::Success.with_label(style, "OK"),
+                                style.muted(&latency.to_string())
+                            );
+                        }
                     }
                     Ok(false) => {
-                        println!(
-                            "{}",
-                            StatusIndicator::Error.with_label(&style, "Health check failed")
-                        );
+                        if ctx.is_json() {
+                            results.push(WorkerProbeResult {
+                                id: worker.id.as_str().to_string(),
+                                host: worker.host.clone(),
+                                status: "unhealthy".to_string(),
+                                latency_ms: None,
+                                error: Some("Health check failed".to_string()),
+                            });
+                        } else {
+                            println!(
+                                "{}",
+                                StatusIndicator::Error.with_label(style, "Health check failed")
+                            );
+                        }
                     }
                     Err(e) => {
-                        println!(
-                            "{} {}",
-                            StatusIndicator::Error.display(&style),
-                            style.error(&e.to_string())
-                        );
+                        if ctx.is_json() {
+                            results.push(WorkerProbeResult {
+                                id: worker.id.as_str().to_string(),
+                                host: worker.host.clone(),
+                                status: "error".to_string(),
+                                latency_ms: None,
+                                error: Some(e.to_string()),
+                            });
+                        } else {
+                            println!(
+                                "{} {}",
+                                StatusIndicator::Error.display(style),
+                                style.error(&e.to_string())
+                            );
+                        }
                     }
                 }
                 let _ = client.disconnect().await;
             }
             Err(e) => {
-                println!(
-                    "{} Connection failed: {}",
-                    StatusIndicator::Error.display(&style),
-                    style.muted(&e.to_string())
-                );
+                if ctx.is_json() {
+                    results.push(WorkerProbeResult {
+                        id: worker.id.as_str().to_string(),
+                        host: worker.host.clone(),
+                        status: "connection_failed".to_string(),
+                        latency_ms: None,
+                        error: Some(e.to_string()),
+                    });
+                } else {
+                    println!(
+                        "{} Connection failed: {}",
+                        StatusIndicator::Error.display(style),
+                        style.muted(&e.to_string())
+                    );
+                }
             }
         }
+    }
+
+    if ctx.is_json() {
+        let _ = ctx.json(&JsonResponse::ok(results));
     }
 
     Ok(())
 }
 
+/// Worker benchmark result for JSON output.
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkerBenchmarkResult {
+    pub id: String,
+    pub host: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 /// Run worker benchmarks.
-pub async fn workers_benchmark() -> Result<()> {
+pub async fn workers_benchmark(ctx: &OutputContext) -> Result<()> {
     let workers = load_workers_from_config()?;
-    let style = terminal_style();
+    let style = ctx.style();
 
     if workers.is_empty() {
+        if ctx.is_json() {
+            let _ = ctx.json(&JsonResponse::<Vec<WorkerBenchmarkResult>>::ok(vec![]));
+        }
         return Ok(());
     }
 
-    println!(
-        "Running benchmarks on {} worker(s)...\n",
-        style.highlight(&workers.len().to_string())
-    );
+    let mut results = Vec::new();
+
+    if !ctx.is_json() {
+        println!(
+            "Running benchmarks on {} worker(s)...\n",
+            style.highlight(&workers.len().to_string())
+        );
+    }
 
     for worker in &workers {
-        print!(
-            "  {} {}@{}... ",
-            style.highlight(worker.id.as_str()),
-            style.muted(&worker.user),
-            style.info(&worker.host)
-        );
+        if !ctx.is_json() {
+            print!(
+                "  {} {}@{}... ",
+                style.highlight(worker.id.as_str()),
+                style.muted(&worker.user),
+                style.info(&worker.host)
+            );
+        }
 
         let mut client = SshClient::new(worker.clone(), SshOptions::default());
 
@@ -299,62 +487,121 @@ pub async fn workers_benchmark() -> Result<()> {
 
                 match result {
                     Ok(r) if r.success() => {
-                        println!(
-                            "{} {}ms {}",
-                            StatusIndicator::Success.display(&style),
-                            style.highlight(&duration.as_millis().to_string()),
-                            style.muted("total")
-                        );
+                        let duration_ms = duration.as_millis() as u64;
+                        if ctx.is_json() {
+                            results.push(WorkerBenchmarkResult {
+                                id: worker.id.as_str().to_string(),
+                                host: worker.host.clone(),
+                                status: "ok".to_string(),
+                                duration_ms: Some(duration_ms),
+                                error: None,
+                            });
+                        } else {
+                            println!(
+                                "{} {}ms {}",
+                                StatusIndicator::Success.display(style),
+                                style.highlight(&duration_ms.to_string()),
+                                style.muted("total")
+                            );
+                        }
                     }
                     Ok(r) => {
-                        println!(
-                            "{} (exit={})",
-                            StatusIndicator::Error.with_label(&style, "Failed"),
-                            style.muted(&r.exit_code.to_string())
-                        );
+                        if ctx.is_json() {
+                            results.push(WorkerBenchmarkResult {
+                                id: worker.id.as_str().to_string(),
+                                host: worker.host.clone(),
+                                status: "failed".to_string(),
+                                duration_ms: None,
+                                error: Some(format!("exit code {}", r.exit_code)),
+                            });
+                        } else {
+                            println!(
+                                "{} (exit={})",
+                                StatusIndicator::Error.with_label(style, "Failed"),
+                                style.muted(&r.exit_code.to_string())
+                            );
+                        }
                     }
                     Err(e) => {
-                        println!(
-                            "{} {}",
-                            StatusIndicator::Error.display(&style),
-                            style.muted(&e.to_string())
-                        );
+                        if ctx.is_json() {
+                            results.push(WorkerBenchmarkResult {
+                                id: worker.id.as_str().to_string(),
+                                host: worker.host.clone(),
+                                status: "error".to_string(),
+                                duration_ms: None,
+                                error: Some(e.to_string()),
+                            });
+                        } else {
+                            println!(
+                                "{} {}",
+                                StatusIndicator::Error.display(style),
+                                style.muted(&e.to_string())
+                            );
+                        }
                     }
                 }
                 let _ = client.disconnect().await;
             }
             Err(e) => {
-                println!(
-                    "{} {}",
-                    StatusIndicator::Error.with_label(&style, "Connection failed:"),
-                    style.muted(&e.to_string())
-                );
+                if ctx.is_json() {
+                    results.push(WorkerBenchmarkResult {
+                        id: worker.id.as_str().to_string(),
+                        host: worker.host.clone(),
+                        status: "connection_failed".to_string(),
+                        duration_ms: None,
+                        error: Some(e.to_string()),
+                    });
+                } else {
+                    println!(
+                        "{} {}",
+                        StatusIndicator::Error.with_label(style, "Connection failed:"),
+                        style.muted(&e.to_string())
+                    );
+                }
             }
         }
     }
 
-    println!(
-        "\n{} For accurate speed scores, use longer benchmark runs.",
-        StatusIndicator::Info.display(&style)
-    );
+    if ctx.is_json() {
+        let _ = ctx.json(&JsonResponse::ok(results));
+    } else {
+        println!(
+            "\n{} For accurate speed scores, use longer benchmark runs.",
+            StatusIndicator::Info.display(style)
+        );
+    }
     Ok(())
 }
 
+/// Worker action response for JSON output.
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkerActionResponse {
+    pub worker_id: String,
+    pub action: String,
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
 /// Drain a worker (requires daemon).
-pub async fn workers_drain(worker_id: &str) -> Result<()> {
-    let style = terminal_style();
+pub async fn workers_drain(worker_id: &str, ctx: &OutputContext) -> Result<()> {
+    let style = ctx.style();
 
     // Check if daemon is running
     if !Path::new(DEFAULT_SOCKET_PATH).exists() {
-        println!(
-            "{} Daemon is not running. Start it with {}",
-            StatusIndicator::Error.display(&style),
-            style.highlight("rch daemon start")
-        );
-        println!(
-            "\n{} Draining requires the daemon to track worker state.",
-            StatusIndicator::Info.display(&style)
-        );
+        if ctx.is_json() {
+            let _ = ctx.json(&JsonResponse::<()>::err("Daemon is not running"));
+        } else {
+            println!(
+                "{} Daemon is not running. Start it with {}",
+                StatusIndicator::Error.display(style),
+                style.highlight("rch daemon start")
+            );
+            println!(
+                "\n{} Draining requires the daemon to track worker state.",
+                StatusIndicator::Info.display(style)
+            );
+        }
         return Ok(());
     }
 
@@ -362,33 +609,55 @@ pub async fn workers_drain(worker_id: &str) -> Result<()> {
     match send_daemon_command(&format!("POST /workers/{}/drain\n", worker_id)).await {
         Ok(response) => {
             if response.contains("error") || response.contains("Error") {
-                println!(
-                    "{} Failed to drain worker: {}",
-                    StatusIndicator::Error.display(&style),
-                    style.muted(&response)
-                );
+                if ctx.is_json() {
+                    let _ = ctx.json(&JsonResponse::ok(WorkerActionResponse {
+                        worker_id: worker_id.to_string(),
+                        action: "drain".to_string(),
+                        success: false,
+                        message: Some(response),
+                    }));
+                } else {
+                    println!(
+                        "{} Failed to drain worker: {}",
+                        StatusIndicator::Error.display(style),
+                        style.muted(&response)
+                    );
+                }
             } else {
-                println!(
-                    "{} Worker {} is now draining.",
-                    StatusIndicator::Success.display(&style),
-                    style.highlight(worker_id)
-                );
-                println!(
-                    "  {} No new jobs will be sent. Existing jobs will complete.",
-                    StatusIndicator::Info.display(&style)
-                );
+                if ctx.is_json() {
+                    let _ = ctx.json(&JsonResponse::ok(WorkerActionResponse {
+                        worker_id: worker_id.to_string(),
+                        action: "drain".to_string(),
+                        success: true,
+                        message: Some("Worker is now draining".to_string()),
+                    }));
+                } else {
+                    println!(
+                        "{} Worker {} is now draining.",
+                        StatusIndicator::Success.display(style),
+                        style.highlight(worker_id)
+                    );
+                    println!(
+                        "  {} No new jobs will be sent. Existing jobs will complete.",
+                        StatusIndicator::Info.display(style)
+                    );
+                }
             }
         }
         Err(e) => {
-            println!(
-                "{} Failed to communicate with daemon: {}",
-                StatusIndicator::Error.display(&style),
-                style.muted(&e.to_string())
-            );
-            println!(
-                "\n{} Drain/enable commands require the daemon to be running.",
-                StatusIndicator::Info.display(&style)
-            );
+            if ctx.is_json() {
+                let _ = ctx.json(&JsonResponse::<()>::err(e.to_string()));
+            } else {
+                println!(
+                    "{} Failed to communicate with daemon: {}",
+                    StatusIndicator::Error.display(style),
+                    style.muted(&e.to_string())
+                );
+                println!(
+                    "\n{} Drain/enable commands require the daemon to be running.",
+                    StatusIndicator::Info.display(style)
+                );
+            }
         }
     }
 
@@ -396,40 +665,66 @@ pub async fn workers_drain(worker_id: &str) -> Result<()> {
 }
 
 /// Enable a worker (requires daemon).
-pub async fn workers_enable(worker_id: &str) -> Result<()> {
-    let style = terminal_style();
+pub async fn workers_enable(worker_id: &str, ctx: &OutputContext) -> Result<()> {
+    let style = ctx.style();
 
     if !Path::new(DEFAULT_SOCKET_PATH).exists() {
-        println!(
-            "{} Daemon is not running. Start it with {}",
-            StatusIndicator::Error.display(&style),
-            style.highlight("rch daemon start")
-        );
+        if ctx.is_json() {
+            let _ = ctx.json(&JsonResponse::<()>::err("Daemon is not running"));
+        } else {
+            println!(
+                "{} Daemon is not running. Start it with {}",
+                StatusIndicator::Error.display(style),
+                style.highlight("rch daemon start")
+            );
+        }
         return Ok(());
     }
 
     match send_daemon_command(&format!("POST /workers/{}/enable\n", worker_id)).await {
         Ok(response) => {
             if response.contains("error") || response.contains("Error") {
-                println!(
-                    "{} Failed to enable worker: {}",
-                    StatusIndicator::Error.display(&style),
-                    style.muted(&response)
-                );
+                if ctx.is_json() {
+                    let _ = ctx.json(&JsonResponse::ok(WorkerActionResponse {
+                        worker_id: worker_id.to_string(),
+                        action: "enable".to_string(),
+                        success: false,
+                        message: Some(response),
+                    }));
+                } else {
+                    println!(
+                        "{} Failed to enable worker: {}",
+                        StatusIndicator::Error.display(style),
+                        style.muted(&response)
+                    );
+                }
             } else {
-                println!(
-                    "{} Worker {} is now enabled.",
-                    StatusIndicator::Success.display(&style),
-                    style.highlight(worker_id)
-                );
+                if ctx.is_json() {
+                    let _ = ctx.json(&JsonResponse::ok(WorkerActionResponse {
+                        worker_id: worker_id.to_string(),
+                        action: "enable".to_string(),
+                        success: true,
+                        message: Some("Worker is now enabled".to_string()),
+                    }));
+                } else {
+                    println!(
+                        "{} Worker {} is now enabled.",
+                        StatusIndicator::Success.display(style),
+                        style.highlight(worker_id)
+                    );
+                }
             }
         }
         Err(e) => {
-            println!(
-                "{} Failed to communicate with daemon: {}",
-                StatusIndicator::Error.display(&style),
-                style.muted(&e.to_string())
-            );
+            if ctx.is_json() {
+                let _ = ctx.json(&JsonResponse::<()>::err(e.to_string()));
+            } else {
+                println!(
+                    "{} Failed to communicate with daemon: {}",
+                    StatusIndicator::Error.display(style),
+                    style.muted(&e.to_string())
+                );
+            }
         }
     }
 
@@ -441,19 +736,39 @@ pub async fn workers_enable(worker_id: &str) -> Result<()> {
 // =============================================================================
 
 /// Check daemon status.
-pub fn daemon_status() -> Result<()> {
+pub fn daemon_status(ctx: &OutputContext) -> Result<()> {
     let socket_path = Path::new(DEFAULT_SOCKET_PATH);
-    let style = terminal_style();
+    let style = ctx.style();
+
+    let running = socket_path.exists();
+    let uptime_seconds = if running {
+        std::fs::metadata(socket_path)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.elapsed().ok())
+            .map(|d| d.as_secs())
+    } else {
+        None
+    };
+
+    if ctx.is_json() {
+        let _ = ctx.json(&JsonResponse::ok(DaemonStatusResponse {
+            running,
+            socket_path: DEFAULT_SOCKET_PATH.to_string(),
+            uptime_seconds,
+        }));
+        return Ok(());
+    }
 
     println!("{}", style.format_header("RCH Daemon Status"));
     println!();
 
-    if socket_path.exists() {
+    if running {
         println!(
             "  {} {} {}",
             style.key("Status"),
             style.muted(":"),
-            StatusIndicator::Success.with_label(&style, "Running")
+            StatusIndicator::Success.with_label(style, "Running")
         );
         println!(
             "  {} {} {}",
@@ -462,28 +777,23 @@ pub fn daemon_status() -> Result<()> {
             style.value(DEFAULT_SOCKET_PATH)
         );
 
-        // Try to get more info from the daemon
-        if let Ok(metadata) = std::fs::metadata(socket_path) {
-            if let Ok(modified) = metadata.modified() {
-                if let Ok(duration) = modified.elapsed() {
-                    let hours = duration.as_secs() / 3600;
-                    let mins = (duration.as_secs() % 3600) / 60;
-                    println!(
-                        "  {} {} ~{}h {}m",
-                        style.key("Uptime"),
-                        style.muted(":"),
-                        hours,
-                        mins
-                    );
-                }
-            }
+        if let Some(secs) = uptime_seconds {
+            let hours = secs / 3600;
+            let mins = (secs % 3600) / 60;
+            println!(
+                "  {} {} ~{}h {}m",
+                style.key("Uptime"),
+                style.muted(":"),
+                hours,
+                mins
+            );
         }
     } else {
         println!(
             "  {} {} {}",
             style.key("Status"),
             style.muted(":"),
-            StatusIndicator::Error.with_label(&style, "Not running")
+            StatusIndicator::Error.with_label(style, "Not running")
         );
         println!(
             "  {} {} {} {}",
@@ -495,7 +805,7 @@ pub fn daemon_status() -> Result<()> {
         println!();
         println!(
             "  {} Start with: {}",
-            StatusIndicator::Info.display(&style),
+            StatusIndicator::Info.display(style),
             style.highlight("rch daemon start")
         );
     }
@@ -503,34 +813,55 @@ pub fn daemon_status() -> Result<()> {
     Ok(())
 }
 
+/// Daemon action response for JSON output.
+#[derive(Debug, Clone, Serialize)]
+pub struct DaemonActionResponse {
+    pub action: String,
+    pub success: bool,
+    pub socket_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
 /// Start the daemon.
-pub async fn daemon_start() -> Result<()> {
-    let style = terminal_style();
+pub async fn daemon_start(ctx: &OutputContext) -> Result<()> {
+    let style = ctx.style();
     let socket_path = Path::new(DEFAULT_SOCKET_PATH);
 
     if socket_path.exists() {
-        println!(
-            "{} Daemon appears to already be running.",
-            StatusIndicator::Warning.display(&style)
-        );
-        println!(
-            "  {} {} {}",
-            style.key("Socket"),
-            style.muted(":"),
-            style.value(DEFAULT_SOCKET_PATH)
-        );
-        println!(
-            "\n{} Use {} to restart it.",
-            StatusIndicator::Info.display(&style),
-            style.highlight("rch daemon restart")
-        );
+        if ctx.is_json() {
+            let _ = ctx.json(&JsonResponse::ok(DaemonActionResponse {
+                action: "start".to_string(),
+                success: false,
+                socket_path: DEFAULT_SOCKET_PATH.to_string(),
+                message: Some("Daemon already running".to_string()),
+            }));
+        } else {
+            println!(
+                "{} Daemon appears to already be running.",
+                StatusIndicator::Warning.display(style)
+            );
+            println!(
+                "  {} {} {}",
+                style.key("Socket"),
+                style.muted(":"),
+                style.value(DEFAULT_SOCKET_PATH)
+            );
+            println!(
+                "\n{} Use {} to restart it.",
+                StatusIndicator::Info.display(style),
+                style.highlight("rch daemon restart")
+            );
+        }
         return Ok(());
     }
 
     // Check if rchd binary exists
     let rchd_path = which_rchd();
 
-    println!("Starting RCH daemon...");
+    if !ctx.is_json() {
+        println!("Starting RCH daemon...");
+    }
     debug!("Using rchd binary: {:?}", rchd_path);
 
     // Spawn rchd in background using nohup to detach from terminal
@@ -548,39 +879,61 @@ pub async fn daemon_start() -> Result<()> {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
             if socket_path.exists() {
-                println!(
-                    "{}",
-                    StatusIndicator::Success.with_label(&style, "Daemon started successfully.")
-                );
-                println!(
-                    "  {} {} {}",
-                    style.key("Socket"),
-                    style.muted(":"),
-                    style.value(DEFAULT_SOCKET_PATH)
-                );
+                if ctx.is_json() {
+                    let _ = ctx.json(&JsonResponse::ok(DaemonActionResponse {
+                        action: "start".to_string(),
+                        success: true,
+                        socket_path: DEFAULT_SOCKET_PATH.to_string(),
+                        message: Some("Daemon started successfully".to_string()),
+                    }));
+                } else {
+                    println!(
+                        "{}",
+                        StatusIndicator::Success.with_label(style, "Daemon started successfully.")
+                    );
+                    println!(
+                        "  {} {} {}",
+                        style.key("Socket"),
+                        style.muted(":"),
+                        style.value(DEFAULT_SOCKET_PATH)
+                    );
+                }
             } else {
-                println!(
-                    "{} Daemon process started but socket not found.",
-                    StatusIndicator::Warning.display(&style)
-                );
-                println!(
-                    "  {} Check logs with: {}",
-                    StatusIndicator::Info.display(&style),
-                    style.highlight("rch daemon logs")
-                );
+                if ctx.is_json() {
+                    let _ = ctx.json(&JsonResponse::ok(DaemonActionResponse {
+                        action: "start".to_string(),
+                        success: false,
+                        socket_path: DEFAULT_SOCKET_PATH.to_string(),
+                        message: Some("Process started but socket not found".to_string()),
+                    }));
+                } else {
+                    println!(
+                        "{} Daemon process started but socket not found.",
+                        StatusIndicator::Warning.display(style)
+                    );
+                    println!(
+                        "  {} Check logs with: {}",
+                        StatusIndicator::Info.display(style),
+                        style.highlight("rch daemon logs")
+                    );
+                }
             }
         }
         Err(e) => {
-            println!(
-                "{} Failed to start daemon: {}",
-                StatusIndicator::Error.display(&style),
-                style.muted(&e.to_string())
-            );
-            println!(
-                "\n{} Make sure {} is in your PATH or installed.",
-                StatusIndicator::Info.display(&style),
-                style.highlight("rchd")
-            );
+            if ctx.is_json() {
+                let _ = ctx.json(&JsonResponse::<()>::err(e.to_string()));
+            } else {
+                println!(
+                    "{} Failed to start daemon: {}",
+                    StatusIndicator::Error.display(style),
+                    style.muted(&e.to_string())
+                );
+                println!(
+                    "\n{} Make sure {} is in your PATH or installed.",
+                    StatusIndicator::Info.display(style),
+                    style.highlight("rchd")
+                );
+            }
         }
     }
 
@@ -588,20 +941,31 @@ pub async fn daemon_start() -> Result<()> {
 }
 
 /// Stop the daemon.
-pub async fn daemon_stop() -> Result<()> {
-    let style = terminal_style();
+pub async fn daemon_stop(ctx: &OutputContext) -> Result<()> {
+    let style = ctx.style();
     let socket_path = Path::new(DEFAULT_SOCKET_PATH);
 
     if !socket_path.exists() {
-        println!(
-            "{} Daemon is not running {}",
-            StatusIndicator::Pending.display(&style),
-            style.muted("(socket not found)")
-        );
+        if ctx.is_json() {
+            let _ = ctx.json(&JsonResponse::ok(DaemonActionResponse {
+                action: "stop".to_string(),
+                success: true,
+                socket_path: DEFAULT_SOCKET_PATH.to_string(),
+                message: Some("Daemon was not running".to_string()),
+            }));
+        } else {
+            println!(
+                "{} Daemon is not running {}",
+                StatusIndicator::Pending.display(style),
+                style.muted("(socket not found)")
+            );
+        }
         return Ok(());
     }
 
-    println!("Stopping RCH daemon...");
+    if !ctx.is_json() {
+        println!("Stopping RCH daemon...");
+    }
 
     // Try graceful shutdown via socket
     match send_daemon_command("POST /shutdown\n").await {
@@ -610,25 +974,44 @@ pub async fn daemon_stop() -> Result<()> {
             for _ in 0..10 {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 if !socket_path.exists() {
-                    println!(
-                        "{}",
-                        StatusIndicator::Success.with_label(&style, "Daemon stopped.")
-                    );
+                    if ctx.is_json() {
+                        let _ = ctx.json(&JsonResponse::ok(DaemonActionResponse {
+                            action: "stop".to_string(),
+                            success: true,
+                            socket_path: DEFAULT_SOCKET_PATH.to_string(),
+                            message: Some("Daemon stopped".to_string()),
+                        }));
+                    } else {
+                        println!(
+                            "{}",
+                            StatusIndicator::Success.with_label(style, "Daemon stopped.")
+                        );
+                    }
                     return Ok(());
                 }
             }
-            println!(
-                "{} Daemon may still be shutting down...",
-                StatusIndicator::Warning.display(&style)
-            );
+            if ctx.is_json() {
+                let _ = ctx.json(&JsonResponse::ok(DaemonActionResponse {
+                    action: "stop".to_string(),
+                    success: false,
+                    socket_path: DEFAULT_SOCKET_PATH.to_string(),
+                    message: Some("Daemon may still be shutting down".to_string()),
+                }));
+            } else {
+                println!(
+                    "{} Daemon may still be shutting down...",
+                    StatusIndicator::Warning.display(style)
+                );
+            }
         }
         Err(_) => {
-            // Try to kill by finding the process
-            println!(
-                "{} Could not send shutdown command.",
-                StatusIndicator::Warning.display(&style)
-            );
-            println!("Attempting to find and kill daemon process...");
+            if !ctx.is_json() {
+                println!(
+                    "{} Could not send shutdown command.",
+                    StatusIndicator::Warning.display(style)
+                );
+                println!("Attempting to find and kill daemon process...");
+            }
 
             // Try pkill
             let output = Command::new("pkill").arg("-f").arg("rchd").output().await;
@@ -637,21 +1020,34 @@ pub async fn daemon_stop() -> Result<()> {
                 Ok(o) if o.status.success() => {
                     // Remove stale socket
                     let _ = std::fs::remove_file(socket_path);
-                    println!(
-                        "{}",
-                        StatusIndicator::Success.with_label(&style, "Daemon stopped.")
-                    );
+                    if ctx.is_json() {
+                        let _ = ctx.json(&JsonResponse::ok(DaemonActionResponse {
+                            action: "stop".to_string(),
+                            success: true,
+                            socket_path: DEFAULT_SOCKET_PATH.to_string(),
+                            message: Some("Daemon stopped via pkill".to_string()),
+                        }));
+                    } else {
+                        println!(
+                            "{}",
+                            StatusIndicator::Success.with_label(style, "Daemon stopped.")
+                        );
+                    }
                 }
                 _ => {
-                    println!(
-                        "{} Could not stop daemon. You may need to kill it manually.",
-                        StatusIndicator::Error.display(&style)
-                    );
-                    println!(
-                        "  {} Try: {}",
-                        StatusIndicator::Info.display(&style),
-                        style.highlight("pkill -9 rchd")
-                    );
+                    if ctx.is_json() {
+                        let _ = ctx.json(&JsonResponse::<()>::err("Could not stop daemon"));
+                    } else {
+                        println!(
+                            "{} Could not stop daemon. You may need to kill it manually.",
+                            StatusIndicator::Error.display(style)
+                        );
+                        println!(
+                            "  {} Try: {}",
+                            StatusIndicator::Info.display(style),
+                            style.highlight("pkill -9 rchd")
+                        );
+                    }
                 }
             }
         }
@@ -661,21 +1057,32 @@ pub async fn daemon_stop() -> Result<()> {
 }
 
 /// Restart the daemon.
-pub async fn daemon_restart() -> Result<()> {
-    let style = terminal_style();
-    println!(
-        "{} Restarting RCH daemon...\n",
-        StatusIndicator::Info.display(&style)
-    );
-    daemon_stop().await?;
+pub async fn daemon_restart(ctx: &OutputContext) -> Result<()> {
+    let style = ctx.style();
+    if !ctx.is_json() {
+        println!(
+            "{} Restarting RCH daemon...\n",
+            StatusIndicator::Info.display(style)
+        );
+    }
+    daemon_stop(ctx).await?;
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    daemon_start().await?;
+    daemon_start(ctx).await?;
     Ok(())
 }
 
+/// Daemon logs response for JSON output.
+#[derive(Debug, Clone, Serialize)]
+pub struct DaemonLogsResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log_file: Option<String>,
+    pub lines: Vec<String>,
+    pub found: bool,
+}
+
 /// Show daemon logs.
-pub fn daemon_logs(lines: usize) -> Result<()> {
-    let style = terminal_style();
+pub fn daemon_logs(lines: usize, ctx: &OutputContext) -> Result<()> {
+    let style = ctx.style();
 
     // Try common log locations
     let log_paths = vec![
@@ -690,42 +1097,59 @@ pub fn daemon_logs(lines: usize) -> Result<()> {
 
     for path in &log_paths {
         if path.exists() {
-            println!(
-                "{} {} {}\n",
-                style.key("Log file"),
-                style.muted(":"),
-                style.value(&path.display().to_string())
-            );
-
             let content = std::fs::read_to_string(path)?;
             let all_lines: Vec<&str> = content.lines().collect();
             let start = all_lines.len().saturating_sub(lines);
+            let log_lines: Vec<String> = all_lines[start..].iter().map(|s| s.to_string()).collect();
 
-            for line in &all_lines[start..] {
-                println!("{}", line);
+            if ctx.is_json() {
+                let _ = ctx.json(&JsonResponse::ok(DaemonLogsResponse {
+                    log_file: Some(path.display().to_string()),
+                    lines: log_lines,
+                    found: true,
+                }));
+            } else {
+                println!(
+                    "{} {} {}\n",
+                    style.key("Log file"),
+                    style.muted(":"),
+                    style.value(&path.display().to_string())
+                );
+
+                for line in &all_lines[start..] {
+                    println!("{}", line);
+                }
             }
 
             return Ok(());
         }
     }
 
-    println!(
-        "{} No log file found.",
-        StatusIndicator::Warning.display(&style)
-    );
-    println!("\n{}", style.key("Checked locations:"));
-    for path in &log_paths {
+    if ctx.is_json() {
+        let _ = ctx.json(&JsonResponse::ok(DaemonLogsResponse {
+            log_file: None,
+            lines: vec![],
+            found: false,
+        }));
+    } else {
         println!(
-            "  {} {}",
-            style.muted("-"),
-            style.muted(&path.display().to_string())
+            "{} No log file found.",
+            StatusIndicator::Warning.display(style)
+        );
+        println!("\n{}", style.key("Checked locations:"));
+        for path in &log_paths {
+            println!(
+                "  {} {}",
+                style.muted("-"),
+                style.muted(&path.display().to_string())
+            );
+        }
+        println!(
+            "\n{} The daemon may log to stderr. Try running in foreground: {}",
+            StatusIndicator::Info.display(style),
+            style.highlight("rchd")
         );
     }
-    println!(
-        "\n{} The daemon may log to stderr. Try running in foreground: {}",
-        StatusIndicator::Info.display(&style),
-        style.highlight("rchd")
-    );
 
     Ok(())
 }
