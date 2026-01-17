@@ -13,6 +13,9 @@ use rch_common::{
     CompilationKind, HookInput, HookOutput, OutputVisibility, RequiredRuntime, SelectedWorker,
     SelectionResponse, ToolchainInfo, TransferConfig, WorkerConfig, WorkerId, classify_command,
 };
+use rch_telemetry::protocol::{
+    PIGGYBACK_MARKER, TelemetrySource, WorkerTelemetry, extract_piggybacked_telemetry,
+};
 use std::io::{self, BufRead, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -272,6 +275,7 @@ async fn process_hook(input: HookInput) -> HookOutput {
                 config.transfer.clone(),
                 toolchain.as_ref(),
                 &reporter,
+                &config.general.socket_path,
             )
             .await;
             let remote_elapsed = remote_start.elapsed();
@@ -572,6 +576,7 @@ async fn execute_remote_compilation(
     transfer_config: TransferConfig,
     toolchain: Option<&ToolchainInfo>,
     reporter: &HookReporter,
+    socket_path: &str,
 ) -> anyhow::Result<RemoteExecutionResult> {
     let worker_config = selected_worker_to_config(worker);
 
@@ -619,18 +624,28 @@ async fn execute_remote_compilation(
     let mut stderr_capture = String::new();
 
     // Stream stdout/stderr to our stderr so the agent sees the output
+    let command_with_telemetry = wrap_command_with_telemetry(command, &worker_config.id);
+    let mut suppress_telemetry = false;
+
     let result = pipeline
         .execute_remote_streaming(
             &worker_config,
-            command,
+            &command_with_telemetry,
             toolchain,
             |line| {
+                if suppress_telemetry {
+                    return;
+                }
+                if line.trim() == PIGGYBACK_MARKER {
+                    suppress_telemetry = true;
+                    return;
+                }
                 // Write stdout lines to stderr (hook stdout is for protocol)
-                eprintln!("{}", line);
+                eprint!("{}", line);
             },
             |line| {
                 // Write stderr lines to stderr and capture for analysis
-                eprintln!("{}", line);
+                eprint!("{}", line);
                 stderr_capture.push_str(line);
             },
         )
@@ -676,11 +691,64 @@ async fn execute_remote_compilation(
         }
     }
 
+    // Step 4: Extract and forward telemetry (piggybacked in stdout)
+    let extraction = extract_piggybacked_telemetry(&result.stdout);
+    if let Some(error) = extraction.extraction_error {
+        warn!("Telemetry extraction failed: {}", error);
+    }
+    if let Some(telemetry) = extraction.telemetry {
+        if let Err(e) = send_telemetry(socket_path, TelemetrySource::Piggyback, &telemetry).await {
+            warn!("Failed to forward telemetry to daemon: {}", e);
+        }
+    }
+
     Ok(RemoteExecutionResult {
         exit_code: result.exit_code,
         stderr: stderr_capture,
         duration_ms: result.duration_ms,
     })
+}
+
+fn wrap_command_with_telemetry(command: &str, worker_id: &WorkerId) -> String {
+    let escaped_worker = shell_escape::escape(worker_id.as_str().into());
+    format!(
+        "{cmd}; status=$?; if command -v rch-telemetry >/dev/null 2>&1; then \
+         telemetry=$(rch-telemetry collect --format json --worker-id {worker} 2>/dev/null || true); \
+         if [ -n \"$telemetry\" ]; then echo '{marker}'; echo \"$telemetry\"; fi; \
+         fi; exit $status",
+        cmd = command,
+        worker = escaped_worker,
+        marker = PIGGYBACK_MARKER
+    )
+}
+
+async fn send_telemetry(
+    socket_path: &str,
+    source: TelemetrySource,
+    telemetry: &WorkerTelemetry,
+) -> anyhow::Result<()> {
+    if !Path::new(socket_path).exists() {
+        return Ok(());
+    }
+
+    let stream = UnixStream::connect(socket_path).await?;
+    let (reader, mut writer) = stream.into_split();
+
+    let body = telemetry.to_json()?;
+    let request = format!(
+        "POST /telemetry?source={}\n{}\n",
+        urlencoding_encode(&source.to_string()),
+        body
+    );
+
+    writer.write_all(request.as_bytes()).await?;
+    writer.flush().await?;
+
+    let mut reader = BufReader::new(reader);
+    let mut line = String::new();
+    reader.read_line(&mut line).await?;
+
+    Ok(())
 }
 
 #[cfg(test)]

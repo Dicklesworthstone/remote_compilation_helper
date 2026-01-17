@@ -254,14 +254,13 @@ mod tests {
                 one_min: 2.4,
                 five_min: 1.8,
                 fifteen_min: 1.5,
+                running_processes: 2,
+                total_processes: 128,
             },
             psi: Some(CpuPressureStall {
                 some_avg10: 1.5,
                 some_avg60: 1.2,
                 some_avg300: 0.8,
-                full_avg10: None,
-                full_avg60: None,
-                full_avg300: None,
             }),
         }
     }
@@ -367,10 +366,7 @@ mod tests {
 
     #[test]
     fn test_extract_piggybacked_invalid_json() {
-        let output = format!(
-            "Build output\n{}\n{{invalid json}}",
-            PIGGYBACK_MARKER
-        );
+        let output = format!("Build output\n{}\n{{invalid json}}", PIGGYBACK_MARKER);
         let extraction = extract_piggybacked_telemetry(&output);
 
         assert!(extraction.telemetry.is_none());

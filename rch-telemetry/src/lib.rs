@@ -13,6 +13,7 @@
 
 pub mod benchmarks;
 pub mod collect;
+pub mod protocol;
 pub mod speedscore;
 
 pub use rch_common::{LogConfig, LogFormat, LoggingGuards, init_logging};

@@ -14,8 +14,9 @@ use rch_common::{
     BuildRecord, BuildStats, CircuitBreakerConfig, CircuitState, ReleaseRequest, RequiredRuntime,
     SelectedWorker, SelectionReason, SelectionRequest, SelectionResponse, WorkerStatus,
 };
+use rch_telemetry::protocol::{TelemetrySource, WorkerTelemetry};
 use serde::Serialize;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tracing::{debug, warn};
 
@@ -24,6 +25,7 @@ use tracing::{debug, warn};
 enum ApiRequest {
     SelectWorker(SelectionRequest),
     ReleaseWorker(ReleaseRequest),
+    IngestTelemetry(TelemetrySource),
     Status,
     Metrics,
     Health,
@@ -190,6 +192,41 @@ pub async fn handle_connection(
             handle_release_worker(&ctx.pool, request).await?;
             ("{}".to_string(), "application/json")
         }
+        Ok(ApiRequest::IngestTelemetry(source)) => {
+            metrics::inc_requests("telemetry");
+            let mut body = String::new();
+            reader.read_to_string(&mut body).await?;
+            let payload = body.trim();
+
+            if payload.is_empty() {
+                warn!("Telemetry ingestion received empty body");
+                (
+                    "{\"status\":\"error\",\"error\":\"empty telemetry payload\"}".to_string(),
+                    "application/json",
+                )
+            } else {
+                match WorkerTelemetry::from_json(payload) {
+                    Ok(telemetry) => {
+                        if !telemetry.is_compatible() {
+                            warn!(
+                                "Telemetry protocol version mismatch for worker {}",
+                                telemetry.worker_id
+                            );
+                        }
+                        ctx.telemetry.ingest(telemetry, source);
+                        ("{\"status\":\"ok\"}".to_string(), "application/json")
+                    }
+                    Err(e) => {
+                        warn!("Failed to parse telemetry JSON: {}", e);
+                        (
+                            "{\"status\":\"error\",\"error\":\"invalid telemetry payload\"}"
+                                .to_string(),
+                            "application/json",
+                        )
+                    }
+                }
+            }
+        }
         Ok(ApiRequest::Status) => {
             metrics::inc_requests("status");
             let status = handle_status(&ctx).await?;
@@ -312,6 +349,34 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
         }));
     }
 
+    if path.starts_with("/telemetry") {
+        if method != "POST" {
+            return Err(anyhow!(
+                "Only POST method supported for telemetry ingestion"
+            ));
+        }
+
+        let query = path.strip_prefix("/telemetry").unwrap_or("");
+        let query = query.strip_prefix('?').unwrap_or("");
+
+        let mut source = None;
+        for param in query.split('&') {
+            if param.is_empty() {
+                continue;
+            }
+            let mut kv = param.splitn(2, '=');
+            let key = kv.next().unwrap_or("");
+            let value = kv.next().unwrap_or("");
+
+            if key == "source" {
+                source = parse_telemetry_source(&urlencoding_decode(value));
+            }
+        }
+
+        let source = source.unwrap_or(TelemetrySource::Piggyback);
+        return Ok(ApiRequest::IngestTelemetry(source));
+    }
+
     if !path.starts_with("/select-worker") {
         return Err(anyhow!("Unknown endpoint: {}", path));
     }
@@ -369,6 +434,15 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
         required_runtime,
         classification_duration_us,
     }))
+}
+
+fn parse_telemetry_source(value: &str) -> Option<TelemetrySource> {
+    match value.trim().to_lowercase().as_str() {
+        "piggyback" => Some(TelemetrySource::Piggyback),
+        "ssh-poll" | "ssh_poll" | "ssh" => Some(TelemetrySource::SshPoll),
+        "on-demand" | "on_demand" | "ondemand" => Some(TelemetrySource::OnDemand),
+        _ => None,
+    }
 }
 
 /// URL percent-decoding.
@@ -675,13 +749,15 @@ async fn handle_status(ctx: &DaemonContext) -> Result<StatusResponse> {
 mod tests {
     use super::*;
     use crate::history::BuildHistory;
+    use crate::telemetry::TelemetryStore;
     use std::sync::Arc;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     fn make_test_context(pool: WorkerPool) -> DaemonContext {
         DaemonContext {
             pool,
             history: Arc::new(BuildHistory::new(100)),
+            telemetry: Arc::new(TelemetryStore::new(Duration::from_secs(300))),
             started_at: Instant::now(),
             socket_path: "/tmp/test.sock".to_string(),
             version: "0.1.0",

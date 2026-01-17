@@ -12,6 +12,7 @@ mod history;
 mod http_api;
 mod metrics;
 mod selection;
+mod telemetry;
 mod workers;
 
 use anyhow::Result;
@@ -25,6 +26,7 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use history::BuildHistory;
+use telemetry::{TelemetryPoller, TelemetryPollerConfig, TelemetryStore};
 
 #[derive(Parser)]
 #[command(name = "rchd")]
@@ -66,6 +68,8 @@ pub struct DaemonContext {
     pub pool: workers::WorkerPool,
     /// Build history.
     pub history: Arc<BuildHistory>,
+    /// Telemetry store.
+    pub telemetry: Arc<TelemetryStore>,
     /// Daemon start time.
     pub started_at: Instant,
     /// Socket path (for status reporting).
@@ -150,9 +154,12 @@ async fn main() -> Result<()> {
     info!("Listening on {:?}", cli.socket);
 
     // Create daemon context
+    let telemetry_store = Arc::new(TelemetryStore::new(std::time::Duration::from_secs(300)));
+
     let context = DaemonContext {
         pool: worker_pool.clone(),
         history,
+        telemetry: telemetry_store.clone(),
         started_at: Instant::now(),
         socket_path: cli.socket.to_string_lossy().to_string(),
         version: env!("CARGO_PKG_VERSION"),
@@ -164,6 +171,15 @@ async fn main() -> Result<()> {
     let health_monitor = health::HealthMonitor::new(worker_pool.clone(), health_config);
     let health_handle = health_monitor.start();
     info!("Health monitor started");
+
+    // Start telemetry poller
+    let telemetry_poller = TelemetryPoller::new(
+        worker_pool.clone(),
+        telemetry_store.clone(),
+        TelemetryPollerConfig::default(),
+    );
+    let _telemetry_handle = telemetry_poller.start();
+    info!("Telemetry poller started");
 
     // Start HTTP server for metrics/health endpoints (if enabled)
     let _http_handle = if cli.metrics_port > 0 {
@@ -225,7 +241,13 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::telemetry::TelemetryStore;
+    use std::time::Duration;
     use std::time::Instant;
+
+    fn make_test_telemetry() -> Arc<TelemetryStore> {
+        Arc::new(TelemetryStore::new(Duration::from_secs(300)))
+    }
 
     fn init_test_logging() {
         let _ = tracing_subscriber::fmt()
@@ -249,6 +271,7 @@ mod tests {
         let context = DaemonContext {
             pool: pool.clone(),
             history: history.clone(),
+            telemetry: make_test_telemetry(),
             started_at,
             socket_path: "/tmp/test.sock".to_string(),
             version: "0.1.0-test",
@@ -286,6 +309,7 @@ mod tests {
         let context = DaemonContext {
             pool,
             history,
+            telemetry: make_test_telemetry(),
             started_at,
             socket_path: rch_common::default_socket_path(),
             version: env!("CARGO_PKG_VERSION"),
@@ -323,6 +347,7 @@ mod tests {
         let context = DaemonContext {
             pool,
             history,
+            telemetry: make_test_telemetry(),
             started_at: Instant::now(),
             socket_path: rch_common::default_socket_path(),
             version: "0.1.0",
@@ -345,6 +370,7 @@ mod tests {
         let context = DaemonContext {
             pool: pool.clone(),
             history: history.clone(),
+            telemetry: make_test_telemetry(),
             started_at: Instant::now(),
             socket_path: rch_common::default_socket_path(),
             version: "0.1.0",
@@ -386,6 +412,7 @@ mod tests {
         let context = DaemonContext {
             pool,
             history,
+            telemetry: make_test_telemetry(),
             started_at,
             socket_path: rch_common::default_socket_path(),
             version: "0.1.0",
@@ -425,6 +452,7 @@ mod tests {
         let context = DaemonContext {
             pool,
             history,
+            telemetry: make_test_telemetry(),
             started_at: Instant::now(),
             socket_path: rch_common::default_socket_path(),
             version: "0.1.0",

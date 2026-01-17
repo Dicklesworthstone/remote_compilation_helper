@@ -862,6 +862,16 @@ async fn main() -> Result<()> {
             Commands::Agents { action } => handle_agents(action, &ctx).await,
             Commands::Completions { action } => handle_completions(action, &ctx),
             Commands::Doctor { fix, install_deps } => handle_doctor(fix, install_deps, &ctx).await,
+            Commands::SelfTest {
+                worker,
+                all,
+                project,
+                timeout,
+                debug,
+            } => {
+                let _ = (worker, all, project, timeout, debug);
+                Err(anyhow::anyhow!("self-test command is not implemented yet"))
+            }
             Commands::Update {
                 check,
                 version,

@@ -1474,6 +1474,36 @@ mod tests {
     }
 
     #[test]
+    fn test_cargo_cmd_uses_custom_path() {
+        init_test_logging();
+        info!("TEST START: test_cargo_cmd_uses_custom_path");
+
+        let custom = PathBuf::from("fake_cargo");
+        let benchmark = CompilationBenchmark::new().with_cargo_path(custom.clone());
+        let cmd = benchmark.cargo_cmd();
+
+        assert_eq!(cmd.get_program(), custom.as_os_str());
+        info!("VERIFY: cargo_cmd uses custom path");
+
+        info!("TEST PASS: test_cargo_cmd_uses_custom_path");
+    }
+
+    #[test]
+    fn test_rustc_cmd_uses_custom_path() {
+        init_test_logging();
+        info!("TEST START: test_rustc_cmd_uses_custom_path");
+
+        let custom = PathBuf::from("fake_rustc");
+        let benchmark = CompilationBenchmark::new().with_rustc_path(custom.clone());
+        let cmd = benchmark.rustc_cmd();
+
+        assert_eq!(cmd.get_program(), custom.as_os_str());
+        info!("VERIFY: rustc_cmd uses custom path");
+
+        info!("TEST PASS: test_rustc_cmd_uses_custom_path");
+    }
+
+    #[test]
     fn test_score_calculation() {
         init_test_logging();
         info!("TEST START: test_score_calculation");
@@ -1519,6 +1549,36 @@ mod tests {
         info!("VERIFY: Score {} is near expected 500", score);
 
         info!("TEST PASS: test_score_calculation_slow_machine");
+    }
+
+    #[test]
+    fn test_score_calculation_debug_only() {
+        init_test_logging();
+        info!("TEST START: test_score_calculation_debug_only");
+
+        let score = calculate_compilation_score(5000, 0, 0);
+        info!("INPUT: debug=5000ms only");
+        info!("RESULT: score = {}", score);
+
+        assert!(score > 200.0 && score < 300.0);
+        info!("VERIFY: Debug-only score is in expected range");
+
+        info!("TEST PASS: test_score_calculation_debug_only");
+    }
+
+    #[test]
+    fn test_score_calculation_incremental_only() {
+        init_test_logging();
+        info!("TEST START: test_score_calculation_incremental_only");
+
+        let score = calculate_compilation_score(0, 0, 1000);
+        info!("INPUT: incremental=1000ms only");
+        info!("RESULT: score = {}", score);
+
+        assert!(score > 120.0 && score < 180.0);
+        info!("VERIFY: Incremental-only score is in expected range");
+
+        info!("TEST PASS: test_score_calculation_incremental_only");
     }
 
     #[test]
@@ -1685,6 +1745,20 @@ mod tests {
 
         info!("VERIFY: File was touched with timestamp comment");
         info!("TEST PASS: test_touch_source_file");
+    }
+
+    #[test]
+    fn test_touch_source_file_missing_main() {
+        init_test_logging();
+        info!("TEST START: test_touch_source_file_missing_main");
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let err = touch_source_file(temp_dir.path()).expect_err("Expected missing file error");
+
+        assert_eq!(err.phase, "incremental_build");
+        info!("VERIFY: Missing main.rs returns incremental_build error");
+
+        info!("TEST PASS: test_touch_source_file_missing_main");
     }
 
     // Integration tests that actually run cargo

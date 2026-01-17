@@ -2145,6 +2145,7 @@ dependencies = [
  "pulldown-cmark",
  "ratatui",
  "rch-common",
+ "rch-telemetry",
  "regex",
  "reqwest",
  "serde",
@@ -2195,7 +2196,9 @@ dependencies = [
 name = "rch-telemetry"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "chrono",
+ "clap",
  "fastrand",
  "rch-common",
  "serde",

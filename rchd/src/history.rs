@@ -67,11 +67,10 @@ impl BuildHistory {
         );
 
         // Prepare for persistence before locking
-        let persistence_task = if let Some(ref path) = self.persistence_path {
-            Some((path.clone(), record.clone()))
-        } else {
-            None
-        };
+        let persistence_task = self
+            .persistence_path
+            .as_ref()
+            .map(|path| (path.clone(), record.clone()));
 
         // Update memory state under lock
         {
