@@ -966,8 +966,9 @@ pub async fn workers_enable(worker_id: &str, ctx: &OutputContext) -> Result<()> 
 
 /// Deploy rch-wkr binary to workers.
 ///
-/// This is a stub implementation - actual deployment logic to be implemented.
-#[allow(dead_code)]
+/// Finds the local rch-wkr binary, checks version on remote workers,
+/// and deploys if needed using scp. Falls back to user directories
+/// if /usr/local/bin requires sudo.
 pub async fn workers_deploy_binary(
     worker_id: Option<String>,
     all: bool,
@@ -995,38 +996,367 @@ pub async fn workers_deploy_binary(
         return Ok(());
     }
 
-    // Stub implementation
+    // Load workers configuration
+    let workers = load_workers_from_config()?;
+    if workers.is_empty() {
+        if ctx.is_json() {
+            let _ = ctx.json(&JsonResponse::<()>::err_cmd(
+                "workers deploy-binary",
+                error_codes::CONFIG_NOT_FOUND,
+                "No workers configured. Run 'rch workers discover --add' first.",
+            ));
+        } else {
+            println!(
+                "{} No workers configured.",
+                StatusIndicator::Error.display(style)
+            );
+            println!(
+                "  {} Run: rch workers discover --add --yes",
+                style.muted("→")
+            );
+        }
+        return Ok(());
+    }
+
+    // Filter to target workers
+    let target_workers: Vec<&WorkerConfig> = if all {
+        workers.iter().collect()
+    } else if let Some(ref id) = worker_id {
+        workers.iter().filter(|w| w.id.0 == *id).collect()
+    } else {
+        vec![]
+    };
+
+    if target_workers.is_empty() {
+        if ctx.is_json() {
+            let _ = ctx.json(&JsonResponse::<()>::err_cmd(
+                "workers deploy-binary",
+                error_codes::WORKER_NOT_FOUND,
+                format!("Worker '{}' not found", worker_id.unwrap_or_default()),
+            ));
+        } else {
+            println!(
+                "{} Worker not found: {}",
+                StatusIndicator::Error.display(style),
+                worker_id.unwrap_or_default()
+            );
+        }
+        return Ok(());
+    }
+
+    // Find local rch-wkr binary
+    let local_binary = find_local_binary("rch-wkr")?;
+    let local_version = get_binary_version(&local_binary).await?;
+
+    if !ctx.is_json() {
+        println!("{}", style.format_header("Deploy rch-wkr Binary"));
+        println!();
+        println!(
+            "  {} Local binary: {}",
+            style.muted("→"),
+            style.value(&local_binary.display().to_string())
+        );
+        println!(
+            "  {} Local version: {}",
+            style.muted("→"),
+            style.value(&local_version)
+        );
+        println!();
+    }
+
+    // Deploy to each target worker
+    let mut results: Vec<DeployResult> = Vec::new();
+
+    for worker in &target_workers {
+        let result = deploy_binary_to_worker(
+            worker,
+            &local_binary,
+            &local_version,
+            force,
+            dry_run,
+            ctx,
+        )
+        .await;
+        results.push(result);
+    }
+
+    // JSON output
     if ctx.is_json() {
-        let _ = ctx.json(&JsonResponse::<()>::err_cmd(
+        let _ = ctx.json(&JsonResponse::ok(
             "workers deploy-binary",
-            error_codes::INTERNAL_ERROR,
-            "Binary deployment not yet implemented",
+            serde_json::json!({
+                "local_binary": local_binary.display().to_string(),
+                "local_version": local_version,
+                "results": results,
+            }),
         ));
     } else {
+        // Summary
+        let success_count = results.iter().filter(|r| r.success).count();
+        let skip_count = results.iter().filter(|r| r.skipped).count();
+        let fail_count = results.len() - success_count - skip_count;
+
+        println!();
         println!(
-            "{} Binary deployment is not yet implemented.",
-            StatusIndicator::Warning.display(style)
+            "  {} Deployed: {}, Skipped: {}, Failed: {}",
+            style.muted("Summary:"),
+            style.success(&success_count.to_string()),
+            style.muted(&skip_count.to_string()),
+            if fail_count > 0 {
+                style.error(&fail_count.to_string())
+            } else {
+                style.muted("0")
+            }
         );
-        println!(
-            "  {} This feature will deploy the rch-wkr binary to remote workers.",
-            style.muted("→")
-        );
-        if let Some(ref w) = worker_id {
-            println!("  {} Target worker: {}", style.muted("→"), style.highlight(w));
-        } else if all {
-            println!("  {} Target: all workers", style.muted("→"));
-        }
-        if force {
-            println!("  {} Force overwrite: yes", style.muted("→"));
-        }
-        if dry_run {
-            println!("  {} Dry run: yes (no changes will be made)", style.muted("→"));
+    }
+
+    Ok(())
+}
+
+/// Find a local binary in common locations.
+fn find_local_binary(name: &str) -> Result<PathBuf> {
+    let locations = [
+        // Target directory (development)
+        std::env::current_dir()
+            .ok()
+            .map(|p| p.join("target/release").join(name)),
+        std::env::current_dir()
+            .ok()
+            .map(|p| p.join("target/debug").join(name)),
+        // Cargo install location
+        dirs::home_dir().map(|h| h.join(".cargo/bin").join(name)),
+        // User local bin
+        dirs::home_dir().map(|h| h.join(".local/bin").join(name)),
+        // System paths
+        Some(PathBuf::from("/usr/local/bin").join(name)),
+        Some(PathBuf::from("/usr/bin").join(name)),
+    ];
+
+    for loc in locations.into_iter().flatten() {
+        if loc.exists() && loc.is_file() {
+            return Ok(loc);
         }
     }
 
-    let _ = (worker_id, all, force, dry_run); // Suppress unused warnings
+    bail!(
+        "Could not find {} binary. Build with 'cargo build --release -p rch-wkr'",
+        name
+    )
+}
 
-    Ok(())
+/// Get version string from a local binary.
+async fn get_binary_version(path: &Path) -> Result<String> {
+    let output = Command::new(path)
+        .arg("--version")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .context("Failed to execute binary for version check")?;
+
+    if !output.status.success() {
+        bail!("Binary returned non-zero exit code for --version");
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(stdout.trim().to_string())
+}
+
+/// Deploy binary to a single worker.
+async fn deploy_binary_to_worker(
+    worker: &WorkerConfig,
+    local_binary: &Path,
+    local_version: &str,
+    force: bool,
+    dry_run: bool,
+    ctx: &OutputContext,
+) -> DeployResult {
+    let style = ctx.theme();
+    let worker_id = &worker.id.0;
+
+    if !ctx.is_json() {
+        print!(
+            "  {} {}... ",
+            StatusIndicator::Info.display(style),
+            style.highlight(worker_id)
+        );
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+    }
+
+    // Check remote version
+    let remote_version = get_remote_version(worker).await;
+
+    // Decide whether to deploy
+    match &remote_version {
+        Ok(ver) if ver == local_version && !force => {
+            if !ctx.is_json() {
+                println!("{} (already at {})", style.muted("skipped"), local_version);
+            }
+            return DeployResult {
+                worker_id: worker_id.clone(),
+                success: true,
+                skipped: true,
+                remote_version: Some(ver.clone()),
+                install_path: None,
+                error: None,
+            };
+        }
+        Ok(ver) => {
+            debug!("Remote version {} differs from local {}", ver, local_version);
+        }
+        Err(_) => {
+            debug!("rch-wkr not installed on {}", worker_id);
+        }
+    };
+
+    if dry_run {
+        if !ctx.is_json() {
+            println!("{} (would deploy {})", style.muted("dry-run"), local_version);
+        }
+        return DeployResult {
+            worker_id: worker_id.clone(),
+            success: true,
+            skipped: false,
+            remote_version: remote_version.ok(),
+            install_path: None,
+            error: None,
+        };
+    }
+
+    // Deploy the binary
+    match deploy_via_scp(worker, local_binary).await {
+        Ok(install_path) => {
+            if !ctx.is_json() {
+                println!(
+                    "{} (installed to {})",
+                    StatusIndicator::Success.display(style),
+                    install_path
+                );
+            }
+            DeployResult {
+                worker_id: worker_id.clone(),
+                success: true,
+                skipped: false,
+                remote_version: Some(local_version.to_string()),
+                install_path: Some(install_path),
+                error: None,
+            }
+        }
+        Err(e) => {
+            if !ctx.is_json() {
+                println!("{} ({})", StatusIndicator::Error.display(style), e);
+            }
+            DeployResult {
+                worker_id: worker_id.clone(),
+                success: false,
+                skipped: false,
+                remote_version: remote_version.ok(),
+                install_path: None,
+                error: Some(e.to_string()),
+            }
+        }
+    }
+}
+
+/// Get rch-wkr version from remote worker.
+async fn get_remote_version(worker: &WorkerConfig) -> Result<String> {
+    let mut cmd = Command::new("ssh");
+    cmd.arg("-o").arg("BatchMode=yes");
+    cmd.arg("-o").arg("ConnectTimeout=10");
+    cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
+    cmd.arg("-i").arg(&worker.identity_file);
+    cmd.arg(format!("{}@{}", worker.user, worker.host));
+    cmd.arg("rch-wkr --version 2>/dev/null || ~/.local/bin/rch-wkr --version 2>/dev/null");
+
+    let output = cmd.output().await.context("Failed to SSH to worker")?;
+
+    if !output.status.success() {
+        bail!("rch-wkr not found on remote");
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(stdout.trim().to_string())
+}
+
+/// Deploy binary to worker via scp.
+async fn deploy_via_scp(worker: &WorkerConfig, local_binary: &Path) -> Result<String> {
+    let target = format!("{}@{}", worker.user, worker.host);
+    let remote_dir = ".local/bin";
+    let remote_path = format!("{}/rch-wkr", remote_dir);
+
+    // Ensure directory exists
+    let mut mkdir_cmd = Command::new("ssh");
+    mkdir_cmd
+        .arg("-o").arg("BatchMode=yes")
+        .arg("-o").arg("ConnectTimeout=10")
+        .arg("-i").arg(&worker.identity_file)
+        .arg(&target)
+        .arg(format!("mkdir -p ~/{}", remote_dir));
+
+    let mkdir_output = mkdir_cmd.output().await.context("Failed to create remote directory")?;
+    if !mkdir_output.status.success() {
+        bail!(
+            "Failed to create remote directory: {}",
+            String::from_utf8_lossy(&mkdir_output.stderr)
+        );
+    }
+
+    // Copy binary
+    let mut scp_cmd = Command::new("scp");
+    scp_cmd
+        .arg("-o").arg("BatchMode=yes")
+        .arg("-o").arg("ConnectTimeout=30")
+        .arg("-i").arg(&worker.identity_file)
+        .arg(local_binary)
+        .arg(format!("{}:~/{}", target, remote_path));
+
+    let scp_output = scp_cmd.output().await.context("Failed to scp binary")?;
+    if !scp_output.status.success() {
+        bail!("scp failed: {}", String::from_utf8_lossy(&scp_output.stderr));
+    }
+
+    // Make executable
+    let mut chmod_cmd = Command::new("ssh");
+    chmod_cmd
+        .arg("-o").arg("BatchMode=yes")
+        .arg("-i").arg(&worker.identity_file)
+        .arg(&target)
+        .arg(format!("chmod +x ~/{}", remote_path));
+
+    let chmod_output = chmod_cmd.output().await.context("Failed to chmod binary")?;
+    if !chmod_output.status.success() {
+        bail!("chmod failed: {}", String::from_utf8_lossy(&chmod_output.stderr));
+    }
+
+    // Verify installation
+    let mut verify_cmd = Command::new("ssh");
+    verify_cmd
+        .arg("-o").arg("BatchMode=yes")
+        .arg("-i").arg(&worker.identity_file)
+        .arg(&target)
+        .arg(format!("~/{} health", remote_path));
+
+    let verify_output = verify_cmd.output().await.context("Failed to verify installation")?;
+    if !verify_output.status.success() {
+        bail!(
+            "Health check failed: {}",
+            String::from_utf8_lossy(&verify_output.stderr)
+        );
+    }
+
+    Ok(format!("~/{}", remote_path))
+}
+
+/// Result of deploying to a single worker.
+#[derive(Debug, Clone, Serialize)]
+struct DeployResult {
+    worker_id: String,
+    success: bool,
+    skipped: bool,
+    remote_version: Option<String>,
+    install_path: Option<String>,
+    error: Option<String>,
 }
 
 /// Discover potential workers from SSH config and shell aliases.
