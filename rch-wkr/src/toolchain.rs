@@ -460,4 +460,215 @@ mod tests {
         let result = ensure_toolchain(&tc);
         println!("Ensure stable result: {:?}", result);
     }
+
+    // === Cache behavior tests ===
+
+    #[test]
+    fn test_cache_starts_empty() {
+        // Clear first to ensure clean state
+        clear_cache();
+        let cached = get_cached_toolchains();
+        assert!(cached.is_empty(), "Cache should be empty after clear");
+    }
+
+    #[test]
+    fn test_cache_clear_is_thorough() {
+        // Simulate adding to cache by directly manipulating (if possible)
+        // Since we can't easily add without rustup, just verify clear works
+        clear_cache();
+        let before = get_cached_toolchains();
+        assert!(before.is_empty());
+
+        // Clear again (should be idempotent)
+        clear_cache();
+        let after = get_cached_toolchains();
+        assert!(after.is_empty());
+    }
+
+    #[test]
+    fn test_cache_independent_of_clear_order() {
+        // Multiple clears should all succeed
+        for _ in 0..5 {
+            clear_cache();
+            assert!(get_cached_toolchains().is_empty());
+        }
+    }
+
+    #[test]
+    fn test_toolchain_error_variants() {
+        // Test all error variants for coverage
+        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "test");
+        let tc_err: ToolchainError = io_err.into();
+        assert!(tc_err.to_string().contains("IO error"));
+
+        let check_err = ToolchainError::CheckFailed("connection lost".to_string());
+        assert!(check_err.to_string().contains("connection lost"));
+
+        let install_err = ToolchainError::InstallFailed("no space left".to_string());
+        assert!(install_err.to_string().contains("no space left"));
+
+        let rustup_err = ToolchainError::RustupNotAvailable;
+        assert!(rustup_err.to_string().contains("Rustup"));
+    }
+
+    #[test]
+    fn test_parse_toolchain_string_beta() {
+        let tc = parse_toolchain_string("beta");
+        assert_eq!(tc.channel, "beta");
+        assert_eq!(tc.date, None);
+    }
+
+    #[test]
+    fn test_parse_toolchain_string_custom_channel() {
+        // Unknown formats should be parsed as-is
+        let tc = parse_toolchain_string("my-custom-toolchain");
+        assert_eq!(tc.channel, "my-custom-toolchain");
+        assert_eq!(tc.date, None);
+    }
+
+    #[test]
+    fn test_is_date_format_edge_cases() {
+        // Valid boundary dates
+        assert!(is_date_format("1970-01-01"));
+        assert!(is_date_format("2099-12-31"));
+
+        // Invalid formats
+        assert!(!is_date_format(""));
+        assert!(!is_date_format("2024"));
+        assert!(!is_date_format("2024-01"));
+        assert!(!is_date_format("20240115"));
+        assert!(!is_date_format("2024/01/15"));
+    }
+
+    #[test]
+    fn test_strip_target_triple_unknown_target() {
+        // Unknown targets should be left as-is
+        assert_eq!(
+            strip_target_triple("nightly-unknown-target-triple"),
+            "nightly-unknown-target-triple"
+        );
+        assert_eq!(strip_target_triple("stable-custom"), "stable-custom");
+    }
+
+    #[test]
+    fn test_parse_toolchain_string_with_all_targets() {
+        // Test all supported target triples
+        let targets = [
+            "x86_64-unknown-linux-gnu",
+            "x86_64-unknown-linux-musl",
+            "x86_64-apple-darwin",
+            "aarch64-unknown-linux-gnu",
+            "aarch64-apple-darwin",
+            "x86_64-pc-windows-msvc",
+            "x86_64-pc-windows-gnu",
+        ];
+
+        for target in &targets {
+            let tc_str = format!("nightly-{}", target);
+            let tc = parse_toolchain_string(&tc_str);
+            assert_eq!(
+                tc.channel, "nightly",
+                "Failed for target: {}",
+                target
+            );
+        }
+    }
+
+    #[test]
+    fn test_toolchain_info_new_constructor() {
+        let tc = ToolchainInfo::new(
+            "nightly",
+            Some("2024-01-15".to_string()),
+            "rustc 1.76.0-nightly",
+        );
+        assert_eq!(tc.channel, "nightly");
+        assert_eq!(tc.date, Some("2024-01-15".to_string()));
+        assert_eq!(tc.full_version, "rustc 1.76.0-nightly");
+    }
+
+    #[test]
+    fn test_toolchain_info_channel_detection() {
+        let nightly = ToolchainInfo::new("nightly", None, "");
+        assert!(nightly.is_nightly());
+        assert!(!nightly.is_stable());
+        assert!(!nightly.is_beta());
+
+        let stable = ToolchainInfo::new("stable", None, "");
+        assert!(stable.is_stable());
+
+        let beta = ToolchainInfo::new("beta", None, "");
+        assert!(beta.is_beta());
+    }
+
+    #[test]
+    #[ignore]
+    fn test_cache_population_on_availability_check() {
+        // This test requires rustup
+        clear_cache();
+
+        // First call should query rustup and cache if found
+        let result1 = is_toolchain_available("stable");
+        if result1.is_ok() && result1.unwrap() {
+            let cached = get_cached_toolchains();
+            assert!(cached.contains(&"stable".to_string()));
+
+            // Second call should use cache
+            let result2 = is_toolchain_available("stable");
+            assert!(result2.is_ok());
+            assert!(result2.unwrap());
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn test_cache_miss_then_hit() {
+        // This test requires rustup
+        clear_cache();
+
+        // Check a toolchain - if available, should be cached
+        let result = is_toolchain_available("stable");
+        if let Ok(true) = result {
+            // Should now be in cache
+            let cached = get_cached_toolchains();
+            assert!(
+                cached.contains(&"stable".to_string()),
+                "Stable should be cached after successful check"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn test_cache_invalidation() {
+        // This test requires rustup
+        // Check stable is available and cached
+        clear_cache();
+        let _ = is_toolchain_available("stable");
+
+        // Clear should remove it
+        clear_cache();
+        let cached = get_cached_toolchains();
+        assert!(
+            !cached.contains(&"stable".to_string()),
+            "Cache should be empty after clear"
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn test_ensure_toolchain_caches_on_success() {
+        // This test requires rustup
+        clear_cache();
+
+        let tc = ToolchainInfo::new("stable", None, "");
+        let result = ensure_toolchain(&tc);
+
+        if result.is_ok() {
+            let cached = get_cached_toolchains();
+            assert!(
+                cached.contains(&"stable".to_string()),
+                "Stable should be cached after ensure"
+            );
+        }
+    }
 }

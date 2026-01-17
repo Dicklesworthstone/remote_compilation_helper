@@ -240,8 +240,7 @@ impl SshClient {
                 })
             }
             Err(_) => {
-                // Timeout occurred - dropping child will terminate the process
-                drop(child);
+                // Timeout occurred - the async block owns child and dropping it will terminate the process
                 warn!("Command timed out on {} after {:?}", self.config.id, self.options.command_timeout);
                 anyhow::bail!("Command timed out after {:?}", self.options.command_timeout);
             }
@@ -326,7 +325,7 @@ impl SshClient {
             }
 
             let status = child.wait().await?;
-            Ok(status)
+            Ok::<_, anyhow::Error>(status)
         };
 
         match tokio::time::timeout(self.options.command_timeout, streaming_future).await {
@@ -343,8 +342,7 @@ impl SshClient {
                 })
             }
             Err(_) => {
-                // Timeout occurred - dropping child will terminate the process
-                drop(child);
+                // Timeout occurred - the async block owns child and dropping it will terminate the process
                 warn!("Command (streaming) timed out on {} after {:?}", self.config.id, self.options.command_timeout);
                 anyhow::bail!("Command timed out after {:?}", self.options.command_timeout);
             }
