@@ -51,6 +51,7 @@
 
 pub mod adaptive;
 pub mod context;
+pub mod markdown;
 pub mod progress;
 pub mod styled;
 pub mod test_utils;
@@ -73,6 +74,7 @@ pub use styled::{
     Align, BorderChars, BorderStyle, BoxStyle, Margin, Padding, Spacing, join_horizontal,
     join_vertical, place, presets,
 };
+pub use markdown::{render_markdown, strip_markdown};
 pub use theme::{SemanticColors, StatusIndicator, Symbols, Theme};
 pub use writer::{OutputBuffer, OutputWriter, SharedOutputBuffer};
 

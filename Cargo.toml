@@ -61,6 +61,9 @@ thiserror = "2.0"
 anyhow = "1.0"
 miette = { version = "7", features = ["fancy"] }
 
+# Markdown rendering
+pulldown-cmark = "0.12"
+
 # Internal crates
 rch-common = { path = "rch-common" }
 

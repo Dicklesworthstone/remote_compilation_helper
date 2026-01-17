@@ -43,6 +43,9 @@ shell-escape = "0.1.5"
 # State detection dependencies
 which = "7"
 
+# Markdown rendering
+pulldown-cmark = { workspace = true }
+
 [dev-dependencies]
 tempfile = "3"
 
