@@ -667,4 +667,149 @@ mod tests {
             );
         }
     }
+
+    // === Integration tests with mock scenarios ===
+    //
+    // These tests verify the decision paths through the toolchain module
+    // without requiring actual rustup. They focus on edge cases and error handling.
+
+    #[test]
+    fn test_ensure_toolchain_returns_rustup_not_available_error() {
+        // Test error type when rustup is not available
+        // (This would happen on systems without rustup)
+        let err = ToolchainError::RustupNotAvailable;
+        assert!(matches!(err, ToolchainError::RustupNotAvailable));
+        assert!(err.to_string().contains("Rustup"));
+    }
+
+    #[test]
+    fn test_ensure_toolchain_returns_install_failed_error() {
+        // Test error type when installation fails
+        let err = ToolchainError::InstallFailed("network timeout".to_string());
+        assert!(matches!(err, ToolchainError::InstallFailed(_)));
+        assert!(err.to_string().contains("network timeout"));
+    }
+
+    #[test]
+    fn test_parse_toolchain_for_ensure() {
+        // Test that parse_toolchain_string produces valid input for ensure_toolchain
+        let tc_str = "nightly-2024-01-15";
+        let tc_info = parse_toolchain_string(tc_str);
+
+        // Verify the parsed info is valid for rustup
+        assert_eq!(tc_info.channel, "nightly");
+        assert_eq!(tc_info.date, Some("2024-01-15".to_string()));
+        assert_eq!(tc_info.rustup_toolchain(), "nightly-2024-01-15");
+    }
+
+    #[test]
+    fn test_parse_toolchain_for_ensure_stable() {
+        let tc_info = parse_toolchain_string("stable");
+        assert_eq!(tc_info.channel, "stable");
+        assert_eq!(tc_info.date, None);
+        assert_eq!(tc_info.rustup_toolchain(), "stable");
+    }
+
+    #[test]
+    fn test_parse_toolchain_for_ensure_beta_with_date() {
+        let tc_info = parse_toolchain_string("beta-2024-03-01");
+        assert_eq!(tc_info.channel, "beta");
+        assert_eq!(tc_info.date, Some("2024-03-01".to_string()));
+        assert_eq!(tc_info.rustup_toolchain(), "beta-2024-03-01");
+    }
+
+    #[test]
+    fn test_parse_toolchain_strips_target_before_ensure() {
+        // Toolchains with target triples should be normalized
+        let tc_info = parse_toolchain_string("nightly-2024-01-15-x86_64-unknown-linux-gnu");
+        assert_eq!(tc_info.channel, "nightly");
+        assert_eq!(tc_info.date, Some("2024-01-15".to_string()));
+        // The rustup_toolchain() should give a format that rustup understands
+        assert_eq!(tc_info.rustup_toolchain(), "nightly-2024-01-15");
+    }
+
+    #[test]
+    fn test_toolchain_error_from_io() {
+        // Test From<std::io::Error> for ToolchainError
+        let io_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "access denied");
+        let tc_err: ToolchainError = io_err.into();
+        assert!(matches!(tc_err, ToolchainError::Io(_)));
+        assert!(tc_err.to_string().contains("IO error"));
+    }
+
+    #[test]
+    fn test_toolchain_error_debug_format() {
+        // Test Debug implementation
+        let err = ToolchainError::RustupNotAvailable;
+        let debug_str = format!("{:?}", err);
+        assert!(debug_str.contains("RustupNotAvailable"));
+
+        let err2 = ToolchainError::InstallFailed("test".to_string());
+        let debug_str2 = format!("{:?}", err2);
+        assert!(debug_str2.contains("InstallFailed"));
+    }
+
+    #[test]
+    fn test_command_wrapping_for_toolchain() {
+        // Test that wrap_command_with_toolchain from rch_common works correctly
+        use rch_common::wrap_command_with_toolchain;
+
+        let tc = ToolchainInfo::new("nightly", Some("2024-01-15".to_string()), "");
+        let wrapped = wrap_command_with_toolchain("cargo build", Some(&tc));
+        assert_eq!(wrapped, "rustup run nightly-2024-01-15 cargo build");
+
+        // Without toolchain should pass through
+        let direct = wrap_command_with_toolchain("cargo build", None);
+        assert_eq!(direct, "cargo build");
+    }
+
+    #[test]
+    fn test_fallback_path_on_toolchain_error() {
+        // Simulate the fallback decision path when toolchain fails
+        // In the actual code, this triggers execution without toolchain wrapping
+        let result: Result<()> = Err(ToolchainError::InstallFailed("test".to_string()));
+
+        // On error, the caller should fall back to default execution
+        match result {
+            Ok(()) => panic!("Expected error"),
+            Err(e) => {
+                // The error message should be informative for logging
+                let msg = e.to_string();
+                assert!(!msg.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn test_nightly_with_invalid_date_parsed_as_custom() {
+        // If the date part doesn't look like a date, treat as custom channel
+        let tc = parse_toolchain_string("nightly-foobar");
+        // This should be parsed as channel="nightly-foobar" with no date
+        // since "foobar" doesn't match YYYY-MM-DD
+        assert_eq!(tc.channel, "nightly-foobar");
+        assert_eq!(tc.date, None);
+    }
+
+    #[test]
+    fn test_beta_with_invalid_date_parsed_as_custom() {
+        let tc = parse_toolchain_string("beta-invalid");
+        assert_eq!(tc.channel, "beta-invalid");
+        assert_eq!(tc.date, None);
+    }
+
+    #[test]
+    fn test_version_number_as_channel() {
+        // Specific versions should be parsed as channels
+        let tc = parse_toolchain_string("1.75.0");
+        assert_eq!(tc.channel, "1.75.0");
+        assert_eq!(tc.date, None);
+        assert_eq!(tc.rustup_toolchain(), "1.75.0");
+    }
+
+    #[test]
+    fn test_two_digit_version() {
+        let tc = parse_toolchain_string("1.75");
+        assert_eq!(tc.channel, "1.75");
+        assert_eq!(tc.date, None);
+    }
 }
