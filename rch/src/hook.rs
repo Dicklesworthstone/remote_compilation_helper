@@ -261,6 +261,40 @@ fn selected_worker_to_config(worker: &SelectedWorker) -> WorkerConfig {
     }
 }
 
+/// Result of remote compilation execution.
+#[derive(Debug)]
+struct RemoteExecutionResult {
+    /// Exit code of the remote command.
+    exit_code: i32,
+    /// Standard error output (used for toolchain detection).
+    stderr: String,
+}
+
+/// Check if the failure is a toolchain-related infrastructure failure.
+///
+/// Returns true if the error indicates a toolchain issue that should
+/// trigger a local fallback rather than denying execution.
+fn is_toolchain_failure(stderr: &str, exit_code: i32) -> bool {
+    if exit_code == 0 {
+        return false;
+    }
+
+    // Check for common toolchain failure patterns
+    let toolchain_patterns = [
+        "toolchain",
+        "is not installed",
+        "rustup: command not found",
+        "rustup: not found",
+        "error: no such command",
+        "error: toolchain",
+    ];
+
+    let stderr_lower = stderr.to_lowercase();
+    toolchain_patterns
+        .iter()
+        .any(|pattern| stderr_lower.contains(&pattern.to_lowercase()))
+}
+
 /// Execute a compilation command on a remote worker.
 ///
 /// This function:
@@ -268,12 +302,12 @@ fn selected_worker_to_config(worker: &SelectedWorker) -> WorkerConfig {
 /// 2. Executes the command remotely with streaming output
 /// 3. Retrieves build artifacts back to local
 ///
-/// Returns the exit code of the remote command.
+/// Returns the execution result including exit code and stderr.
 async fn execute_remote_compilation(
     worker: &SelectedWorker,
     command: &str,
     transfer_config: TransferConfig,
-) -> Result<i32> {
+) -> Result<RemoteExecutionResult> {
     let worker_config = selected_worker_to_config(worker);
 
     // Get current working directory as project root
@@ -319,6 +353,9 @@ async fn execute_remote_compilation(
     // Step 2: Execute command remotely with streaming output
     info!("Executing command remotely: {}", command);
 
+    // Capture stderr for toolchain failure detection
+    let mut stderr_capture = String::new();
+
     // Stream stdout/stderr to our stderr so the agent sees the output
     let result = pipeline
         .execute_remote_streaming(
@@ -330,8 +367,9 @@ async fn execute_remote_compilation(
                 eprintln!("{}", line);
             },
             |line| {
-                // Write stderr lines to stderr
+                // Write stderr lines to stderr and capture for analysis
                 eprintln!("{}", line);
+                stderr_capture.push_str(line);
             },
         )
         .await?;
@@ -364,7 +402,10 @@ async fn execute_remote_compilation(
         }
     }
 
-    Ok(result.exit_code)
+    Ok(RemoteExecutionResult {
+        exit_code: result.exit_code,
+        stderr: stderr_capture,
+    })
 }
 
 #[cfg(test)]
