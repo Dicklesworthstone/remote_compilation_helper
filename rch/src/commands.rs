@@ -1359,6 +1359,311 @@ struct DeployResult {
     error: Option<String>,
 }
 
+/// Synchronize Rust toolchain to workers.
+///
+/// Detects the project's required toolchain from rust-toolchain.toml,
+/// checks each worker's installed toolchains, and installs if missing.
+pub async fn workers_sync_toolchain(
+    worker_id: Option<String>,
+    all: bool,
+    dry_run: bool,
+    ctx: &OutputContext,
+) -> Result<()> {
+    let style = ctx.theme();
+
+    if worker_id.is_none() && !all {
+        if ctx.is_json() {
+            let _ = ctx.json(&JsonResponse::<()>::err_cmd(
+                "workers sync-toolchain",
+                error_codes::CONFIG_INVALID,
+                "Specify either a worker ID or --all",
+            ));
+        } else {
+            println!(
+                "{} Specify either {} or {}",
+                StatusIndicator::Error.display(style),
+                style.highlight("<worker-id>"),
+                style.highlight("--all")
+            );
+        }
+        return Ok(());
+    }
+
+    // Detect project toolchain
+    let toolchain = detect_project_toolchain()?;
+
+    // Load workers configuration
+    let workers = load_workers_from_config()?;
+    if workers.is_empty() {
+        if ctx.is_json() {
+            let _ = ctx.json(&JsonResponse::<()>::err_cmd(
+                "workers sync-toolchain",
+                error_codes::CONFIG_NOT_FOUND,
+                "No workers configured",
+            ));
+        } else {
+            println!(
+                "{} No workers configured.",
+                StatusIndicator::Error.display(style)
+            );
+        }
+        return Ok(());
+    }
+
+    // Filter to target workers
+    let target_workers: Vec<&WorkerConfig> = if all {
+        workers.iter().collect()
+    } else if let Some(ref id) = worker_id {
+        workers.iter().filter(|w| w.id.0 == *id).collect()
+    } else {
+        vec![]
+    };
+
+    if target_workers.is_empty() {
+        if ctx.is_json() {
+            let _ = ctx.json(&JsonResponse::<()>::err_cmd(
+                "workers sync-toolchain",
+                error_codes::WORKER_NOT_FOUND,
+                format!("Worker '{}' not found", worker_id.unwrap_or_default()),
+            ));
+        } else {
+            println!(
+                "{} Worker not found: {}",
+                StatusIndicator::Error.display(style),
+                worker_id.unwrap_or_default()
+            );
+        }
+        return Ok(());
+    }
+
+    if !ctx.is_json() {
+        println!("{}", style.format_header("Sync Rust Toolchain"));
+        println!();
+        println!(
+            "  {} Required toolchain: {}",
+            style.muted("→"),
+            style.highlight(&toolchain)
+        );
+        if dry_run {
+            println!(
+                "  {} {}",
+                style.muted("→"),
+                style.warning("DRY RUN - no changes will be made")
+            );
+        }
+        println!();
+    }
+
+    // Sync to each target worker
+    let mut results: Vec<ToolchainSyncResult> = Vec::new();
+
+    for worker in &target_workers {
+        let result = sync_toolchain_to_worker(worker, &toolchain, dry_run, ctx).await;
+        results.push(result);
+    }
+
+    // JSON output
+    if ctx.is_json() {
+        let _ = ctx.json(&JsonResponse::ok(
+            "workers sync-toolchain",
+            serde_json::json!({
+                "toolchain": toolchain,
+                "results": results,
+            }),
+        ));
+    } else {
+        // Summary
+        let success_count = results.iter().filter(|r| r.success).count();
+        let already_count = results.iter().filter(|r| r.already_installed).count();
+        let fail_count = results.len() - success_count;
+
+        println!();
+        println!(
+            "  {} Installed: {}, Already present: {}, Failed: {}",
+            style.muted("Summary:"),
+            style.success(&(success_count - already_count).to_string()),
+            style.muted(&already_count.to_string()),
+            if fail_count > 0 {
+                style.error(&fail_count.to_string())
+            } else {
+                style.muted("0")
+            }
+        );
+    }
+
+    Ok(())
+}
+
+/// Detect the project's required toolchain from rust-toolchain.toml or rust-toolchain.
+fn detect_project_toolchain() -> Result<String> {
+    use std::fs;
+
+    // Check for rust-toolchain.toml first
+    let toml_path = std::env::current_dir()?.join("rust-toolchain.toml");
+    if toml_path.exists() {
+        let content = fs::read_to_string(&toml_path)?;
+        // Parse TOML to find channel
+        // Format: [toolchain]\nchannel = "nightly-2025-01-01"
+        for line in content.lines() {
+            let line = line.trim();
+            if line.starts_with("channel") {
+                if let Some(value) = line.split('=').nth(1) {
+                    let channel = value.trim().trim_matches('"').trim_matches('\'');
+                    return Ok(channel.to_string());
+                }
+            }
+        }
+    }
+
+    // Check for rust-toolchain (plain text)
+    let plain_path = std::env::current_dir()?.join("rust-toolchain");
+    if plain_path.exists() {
+        let content = fs::read_to_string(&plain_path)?;
+        return Ok(content.trim().to_string());
+    }
+
+    // Default to stable if no toolchain file
+    Ok("stable".to_string())
+}
+
+/// Sync toolchain to a single worker.
+async fn sync_toolchain_to_worker(
+    worker: &WorkerConfig,
+    toolchain: &str,
+    dry_run: bool,
+    ctx: &OutputContext,
+) -> ToolchainSyncResult {
+    let style = ctx.theme();
+    let worker_id = &worker.id.0;
+
+    if !ctx.is_json() {
+        print!(
+            "  {} {}... ",
+            StatusIndicator::Info.display(style),
+            style.highlight(worker_id)
+        );
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+    }
+
+    // Check if toolchain is already installed
+    match check_remote_toolchain(worker, toolchain).await {
+        Ok(true) => {
+            if !ctx.is_json() {
+                println!("{} (already installed)", style.muted("skipped"));
+            }
+            return ToolchainSyncResult {
+                worker_id: worker_id.clone(),
+                success: true,
+                already_installed: true,
+                installed_toolchain: Some(toolchain.to_string()),
+                error: None,
+            };
+        }
+        Ok(false) => {
+            // Need to install
+        }
+        Err(e) => {
+            if !ctx.is_json() {
+                println!("{} ({})", style.error("FAILED"), e);
+            }
+            return ToolchainSyncResult {
+                worker_id: worker_id.clone(),
+                success: false,
+                already_installed: false,
+                installed_toolchain: None,
+                error: Some(e.to_string()),
+            };
+        }
+    }
+
+    if dry_run {
+        if !ctx.is_json() {
+            println!("{} (would install {})", style.muted("dry-run"), toolchain);
+        }
+        return ToolchainSyncResult {
+            worker_id: worker_id.clone(),
+            success: true,
+            already_installed: false,
+            installed_toolchain: None,
+            error: None,
+        };
+    }
+
+    // Install the toolchain
+    match install_remote_toolchain(worker, toolchain).await {
+        Ok(()) => {
+            if !ctx.is_json() {
+                println!("{} (installed)", StatusIndicator::Success.display(style));
+            }
+            ToolchainSyncResult {
+                worker_id: worker_id.clone(),
+                success: true,
+                already_installed: false,
+                installed_toolchain: Some(toolchain.to_string()),
+                error: None,
+            }
+        }
+        Err(e) => {
+            if !ctx.is_json() {
+                println!("{} ({})", style.error("FAILED"), e);
+            }
+            ToolchainSyncResult {
+                worker_id: worker_id.clone(),
+                success: false,
+                already_installed: false,
+                installed_toolchain: None,
+                error: Some(e.to_string()),
+            }
+        }
+    }
+}
+
+/// Check if a toolchain is installed on a remote worker.
+async fn check_remote_toolchain(worker: &WorkerConfig, toolchain: &str) -> Result<bool> {
+    let mut cmd = Command::new("ssh");
+    cmd.arg("-o").arg("BatchMode=yes");
+    cmd.arg("-o").arg("ConnectTimeout=10");
+    cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
+    cmd.arg("-i").arg(&worker.identity_file);
+    cmd.arg(format!("{}@{}", worker.user, worker.host));
+    cmd.arg(format!("rustup show | grep -q '{}' && echo FOUND || echo NOTFOUND", toolchain));
+
+    let output = cmd.output().await.context("Failed to SSH to worker")?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    Ok(stdout.trim() == "FOUND")
+}
+
+/// Install a toolchain on a remote worker.
+async fn install_remote_toolchain(worker: &WorkerConfig, toolchain: &str) -> Result<()> {
+    let mut cmd = Command::new("ssh");
+    cmd.arg("-o").arg("BatchMode=yes");
+    cmd.arg("-o").arg("ConnectTimeout=60"); // Toolchain install can take a while
+    cmd.arg("-i").arg(&worker.identity_file);
+    cmd.arg(format!("{}@{}", worker.user, worker.host));
+    cmd.arg(format!("rustup install {} && rustup component add rust-src --toolchain {}", toolchain, toolchain));
+
+    let output = cmd.output().await.context("Failed to install toolchain")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("rustup install failed: {}", stderr.trim());
+    }
+
+    Ok(())
+}
+
+/// Result of syncing toolchain to a single worker.
+#[derive(Debug, Clone, Serialize)]
+struct ToolchainSyncResult {
+    worker_id: String,
+    success: bool,
+    already_installed: bool,
+    installed_toolchain: Option<String>,
+    error: Option<String>,
+}
+
 /// Discover potential workers from SSH config and shell aliases.
 pub async fn workers_discover(
     probe: bool,
@@ -1625,60 +1930,6 @@ impl ProbeInfo {
             self.cores, self.memory_gb, self.disk_gb, self.arch, rust
         )
     }
-}
-
-/// Sync Rust toolchain to workers.
-///
-/// This ensures workers have the same Rust version and components
-/// installed as the local machine.
-pub async fn workers_sync_toolchain(
-    worker: Option<String>,
-    all: bool,
-    dry_run: bool,
-    ctx: &OutputContext,
-) -> Result<()> {
-    let style = ctx.theme();
-
-    // Validate arguments
-    if worker.is_none() && !all {
-        anyhow::bail!("Specify a worker ID or use --all");
-    }
-
-    println!("{}", style.format_header("Sync Rust Toolchain"));
-    println!();
-
-    // Get local toolchain info
-    let local_version = std::process::Command::new("rustc")
-        .arg("--version")
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_else(|_| "unknown".into());
-
-    println!(
-        "  {} {} {}",
-        style.key("Local"),
-        style.muted(":"),
-        style.value(&local_version)
-    );
-    println!();
-
-    if dry_run {
-        println!(
-            "{} Dry run - no changes will be made",
-            StatusIndicator::Info.display(style)
-        );
-        println!();
-    }
-
-    // TODO: Actually sync toolchain to workers
-    // For now, this is a stub that shows what would be done
-    println!(
-        "{} Toolchain sync not yet implemented",
-        StatusIndicator::Warning.display(style)
-    );
-    println!("  This will install matching Rust toolchain on workers.");
-
-    Ok(())
 }
 
 // =============================================================================
