@@ -2,6 +2,7 @@
 
 #![allow(dead_code)] // Scaffold code - methods will be used in future beads
 
+use crate::metrics::latency::{DecisionTimer, DecisionType};
 use crate::workers::{WorkerPool, WorkerState};
 use rch_common::{
     CircuitBreakerConfig, CircuitState, RequiredRuntime, SelectionReason, SelectionRequest,
@@ -61,12 +62,16 @@ pub async fn select_worker(
 /// Select the best worker with explicit circuit breaker config.
 ///
 /// Returns both the selected worker and the reason for selection result.
+/// Tracks selection latency against the <10ms budget from AGENTS.md.
 pub async fn select_worker_with_config(
     pool: &WorkerPool,
     request: &SelectionRequest,
     weights: &SelectionWeights,
     circuit_config: &CircuitBreakerConfig,
 ) -> SelectionResult {
+    // Track worker selection latency (budget: <10ms, panic: 50ms)
+    let _timer = DecisionTimer::new(DecisionType::WorkerSelection);
+
     let workers = pool.healthy_workers().await;
 
     if workers.is_empty() {
