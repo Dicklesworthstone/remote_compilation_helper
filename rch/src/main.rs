@@ -376,6 +376,32 @@ Controls:
         #[arg(long)]
         high_contrast: bool,
     },
+
+    /// Launch the web-based dashboard in your browser
+    #[command(after_help = r#"EXAMPLES:
+    rch web                           # Start dev server and open browser
+    rch web --port 3001               # Use custom port
+    rch web --no-open                 # Don't open browser automatically
+    rch web --prod                    # Serve production build
+
+The web dashboard provides a modern browser-based interface for:
+  - Viewing worker status and slot utilization
+  - Monitoring active and recent builds
+  - Viewing system issues and metrics
+  - Real-time updates via polling"#)]
+    Web {
+        /// Port to run the web server on (default: 3000)
+        #[arg(long, default_value = "3000")]
+        port: u16,
+
+        /// Don't automatically open the browser
+        #[arg(long)]
+        no_open: bool,
+
+        /// Serve production build instead of dev server
+        #[arg(long)]
+        prod: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -817,6 +843,9 @@ async fn main() -> Result<()> {
                 };
                 tui::run_tui(config).await
             }
+            Commands::Web { port, no_open, prod } => {
+                handle_web(port, no_open, prod, &ctx).await
+            }
         },
     }
 }
@@ -1085,4 +1114,160 @@ async fn handle_fleet(action: FleetAction, ctx: &OutputContext) -> Result<()> {
         } => fleet::drain(ctx, worker, all, timeout).await,
         FleetAction::History { limit, worker } => fleet::history(ctx, limit, worker).await,
     }
+}
+
+/// Handle web dashboard command
+async fn handle_web(port: u16, no_open: bool, prod: bool, ctx: &OutputContext) -> Result<()> {
+    use std::process::{Command, Stdio};
+
+    // Find the web directory relative to the rch binary or use compile-time path
+    let web_dir = find_web_directory()?;
+
+    ctx.info(&format!("Starting web dashboard on port {}...", port));
+
+    // Check if bun is available
+    let bun_check = Command::new("bun")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+
+    let (cmd_name, cmd_args) = if bun_check.is_ok() {
+        if prod {
+            ("bun", vec!["run", "start", "--", "-p", &port.to_string()])
+        } else {
+            ("bun", vec!["run", "dev", "--", "-p", &port.to_string()])
+        }
+    } else {
+        // Fall back to npm
+        if prod {
+            ("npm", vec!["run", "start", "--", "-p", &port.to_string()])
+        } else {
+            ("npm", vec!["run", "dev", "--", "-p", &port.to_string()])
+        }
+    };
+
+    let url = format!("http://localhost:{}", port);
+
+    // Open browser unless disabled
+    if !no_open {
+        // Give the server a moment to start
+        tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+            let _ = open_browser(&url);
+        });
+    }
+
+    ctx.info(&format!("Dashboard available at: {}", url));
+    if !no_open {
+        ctx.info("Opening browser...");
+    }
+    ctx.info("Press Ctrl+C to stop the server");
+
+    // Run the web server
+    let status = Command::new(cmd_name)
+        .args(&cmd_args)
+        .current_dir(&web_dir)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()?;
+
+    if !status.success() {
+        anyhow::bail!("Web server exited with error");
+    }
+
+    Ok(())
+}
+
+/// Find the web directory
+fn find_web_directory() -> Result<PathBuf> {
+    // Try relative to current directory first
+    let cwd = std::env::current_dir()?;
+    let web_in_cwd = cwd.join("web");
+    if web_in_cwd.exists() && web_in_cwd.join("package.json").exists() {
+        return Ok(web_in_cwd);
+    }
+
+    // Try relative to the executable
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            // Check sibling web directory
+            let web_sibling = exe_dir.join("web");
+            if web_sibling.exists() && web_sibling.join("package.json").exists() {
+                return Ok(web_sibling);
+            }
+
+            // Check parent's web directory (for dev builds)
+            if let Some(parent) = exe_dir.parent() {
+                let web_parent = parent.join("web");
+                if web_parent.exists() && web_parent.join("package.json").exists() {
+                    return Ok(web_parent);
+                }
+            }
+        }
+    }
+
+    // Try common installation paths
+    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?;
+    let common_paths = [
+        home.join(".local/share/rch/web"),
+        home.join(".rch/web"),
+        PathBuf::from("/usr/local/share/rch/web"),
+        PathBuf::from("/usr/share/rch/web"),
+    ];
+
+    for path in common_paths {
+        if path.exists() && path.join("package.json").exists() {
+            return Ok(path);
+        }
+    }
+
+    anyhow::bail!(
+        "Could not find web dashboard directory. \n\
+         Expected to find it at one of:\n  \
+         - ./web\n  \
+         - ~/.local/share/rch/web\n  \
+         - /usr/local/share/rch/web\n\n\
+         If you installed from source, run 'rch web' from the project root."
+    )
+}
+
+/// Open a URL in the default browser
+fn open_browser(url: &str) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(url)
+            .spawn()?;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        // Try xdg-open first, then fall back to common browsers
+        let result = std::process::Command::new("xdg-open")
+            .arg(url)
+            .spawn();
+
+        if result.is_err() {
+            // Try common browsers
+            for browser in &["firefox", "chromium", "chromium-browser", "google-chrome"] {
+                if std::process::Command::new(browser)
+                    .arg(url)
+                    .spawn()
+                    .is_ok()
+                {
+                    break;
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("cmd")
+            .args(&["/C", "start", "", url])
+            .spawn()?;
+    }
+
+    Ok(())
 }
