@@ -14,6 +14,7 @@ pub mod benchmarks;
 pub mod collect;
 
 pub use benchmarks::cpu::{CpuBenchmark, CpuBenchmarkResult};
+pub use benchmarks::memory::{MemoryBenchmark, MemoryBenchmarkResult};
 pub use collect::disk::{
     DiskCollector, DiskError, DiskMetrics, DiskStats, DiskTelemetry, FileDescriptorStats,
 };

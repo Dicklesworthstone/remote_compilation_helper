@@ -10,5 +10,7 @@
 //! - **Representative**: Exercise operations similar to actual compilation workloads
 
 pub mod cpu;
+pub mod memory;
 
 pub use cpu::{CpuBenchmark, CpuBenchmarkResult};
+pub use memory::{MemoryBenchmark, MemoryBenchmarkResult};
