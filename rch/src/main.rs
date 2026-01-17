@@ -1528,6 +1528,45 @@ mod tests {
         }
     }
 
+    #[test]
+    fn cli_parses_workers_init() {
+        let cli = Cli::try_parse_from(["rch", "workers", "init"]).unwrap();
+        match cli.command {
+            Some(Commands::Workers {
+                action: WorkersAction::Init { yes },
+            }) => {
+                assert!(!yes);
+            }
+            _ => panic!("Expected workers init command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_workers_init_with_yes() {
+        let cli = Cli::try_parse_from(["rch", "workers", "init", "--yes"]).unwrap();
+        match cli.command {
+            Some(Commands::Workers {
+                action: WorkersAction::Init { yes },
+            }) => {
+                assert!(yes);
+            }
+            _ => panic!("Expected workers init command with --yes"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_workers_init_short_yes_flag() {
+        let cli = Cli::try_parse_from(["rch", "workers", "init", "-y"]).unwrap();
+        match cli.command {
+            Some(Commands::Workers {
+                action: WorkersAction::Init { yes },
+            }) => {
+                assert!(yes);
+            }
+            _ => panic!("Expected workers init command with -y"),
+        }
+    }
+
     // -------------------------------------------------------------------------
     // Status Subcommand Tests
     // -------------------------------------------------------------------------

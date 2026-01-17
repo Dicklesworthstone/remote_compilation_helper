@@ -10,13 +10,26 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use rch_common::e2e::{
     fixtures::DaemonConfigFixture,
     harness::{HarnessResult, TestHarnessBuilder},
 };
+
+/// Get the absolute path to the project root directory
+fn project_root() -> PathBuf {
+    // The test runs from the crate directory, so we need to go up to workspace root
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    manifest_dir.parent().unwrap().to_path_buf()
+}
+
+/// Get the path to the rchd binary
+fn rchd_binary_path() -> PathBuf {
+    let root = project_root();
+    root.join("target").join("debug").join("rchd")
+}
 
 /// Send a request to the daemon via Unix socket and get the response body
 fn send_request(socket_path: &Path, request: &str) -> std::io::Result<String> {
@@ -75,6 +88,7 @@ fn test_daemon_startup_creates_socket() -> HarnessResult<()> {
     let harness = TestHarnessBuilder::new("daemon_startup_socket")
         .cleanup_on_success(true)
         .cleanup_on_failure(false)
+        .rchd_binary(rchd_binary_path())
         .build()?;
 
     // Create minimal workers config
@@ -110,6 +124,7 @@ fn test_daemon_health_endpoint() -> HarnessResult<()> {
     let harness = TestHarnessBuilder::new("daemon_health")
         .cleanup_on_success(true)
         .cleanup_on_failure(false)
+        .rchd_binary(rchd_binary_path())
         .build()?;
 
     // Create minimal workers config
@@ -161,6 +176,7 @@ fn test_daemon_ready_endpoint() -> HarnessResult<()> {
     let harness = TestHarnessBuilder::new("daemon_ready")
         .cleanup_on_success(true)
         .cleanup_on_failure(false)
+        .rchd_binary(rchd_binary_path())
         .build()?;
 
     // Create workers config
@@ -212,6 +228,7 @@ fn test_daemon_status_endpoint() -> HarnessResult<()> {
     let harness = TestHarnessBuilder::new("daemon_status")
         .cleanup_on_success(true)
         .cleanup_on_failure(false)
+        .rchd_binary(rchd_binary_path())
         .build()?;
 
     // Create workers config
@@ -274,6 +291,7 @@ fn test_daemon_budget_endpoint() -> HarnessResult<()> {
     let harness = TestHarnessBuilder::new("daemon_budget")
         .cleanup_on_success(true)
         .cleanup_on_failure(false)
+        .rchd_binary(rchd_binary_path())
         .build()?;
 
     // Create workers config
@@ -318,6 +336,7 @@ fn test_daemon_graceful_shutdown() -> HarnessResult<()> {
     let harness = TestHarnessBuilder::new("daemon_shutdown")
         .cleanup_on_success(true)
         .cleanup_on_failure(false)
+        .rchd_binary(rchd_binary_path())
         .build()?;
 
     // Create workers config
@@ -386,6 +405,7 @@ fn test_daemon_metrics_endpoint() -> HarnessResult<()> {
     let harness = TestHarnessBuilder::new("daemon_metrics")
         .cleanup_on_success(true)
         .cleanup_on_failure(false)
+        .rchd_binary(rchd_binary_path())
         .build()?;
 
     // Create workers config

@@ -188,3 +188,314 @@ fn hostname() -> String {
                 .unwrap_or_else(|_| "unknown".to_string())
         })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ========================
+    // DeploymentAuditEntry tests
+    // ========================
+
+    #[test]
+    fn deployment_audit_entry_default_has_nil_deployment_id() {
+        let entry = DeploymentAuditEntry::default();
+        assert_eq!(entry.deployment_id, Uuid::nil());
+    }
+
+    #[test]
+    fn deployment_audit_entry_default_has_deployment_started_event() {
+        let entry = DeploymentAuditEntry::default();
+        assert_eq!(entry.event_type, AuditEventType::DeploymentStarted);
+    }
+
+    #[test]
+    fn deployment_audit_entry_default_has_no_worker() {
+        let entry = DeploymentAuditEntry::default();
+        assert!(entry.worker_id.is_none());
+    }
+
+    #[test]
+    fn deployment_audit_entry_default_has_empty_details() {
+        let entry = DeploymentAuditEntry::default();
+        assert_eq!(entry.details, serde_json::json!({}));
+    }
+
+    #[test]
+    fn deployment_audit_entry_default_has_empty_user_and_machine() {
+        let entry = DeploymentAuditEntry::default();
+        assert_eq!(entry.user, "");
+        assert_eq!(entry.machine, "");
+    }
+
+    #[test]
+    fn deployment_audit_entry_serializes_roundtrip() {
+        let entry = DeploymentAuditEntry {
+            timestamp: Utc::now(),
+            deployment_id: Uuid::new_v4(),
+            event_type: AuditEventType::WorkerInstallCompleted,
+            worker_id: Some("worker-1".to_string()),
+            details: serde_json::json!({"version": "1.0.0"}),
+            user: "test-user".to_string(),
+            machine: "test-machine".to_string(),
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let restored: DeploymentAuditEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.deployment_id, entry.deployment_id);
+        assert_eq!(restored.event_type, AuditEventType::WorkerInstallCompleted);
+        assert_eq!(restored.worker_id, Some("worker-1".to_string()));
+        assert_eq!(restored.user, "test-user");
+        assert_eq!(restored.machine, "test-machine");
+    }
+
+    // ========================
+    // AuditEventType tests
+    // ========================
+
+    #[test]
+    fn audit_event_type_deployment_started_serializes() {
+        let event = AuditEventType::DeploymentStarted;
+        let json = serde_json::to_string(&event).unwrap();
+        assert_eq!(json, "\"DeploymentStarted\"");
+    }
+
+    #[test]
+    fn audit_event_type_deployment_completed_serializes() {
+        let event = AuditEventType::DeploymentCompleted;
+        let json = serde_json::to_string(&event).unwrap();
+        assert_eq!(json, "\"DeploymentCompleted\"");
+    }
+
+    #[test]
+    fn audit_event_type_deployment_failed_serializes() {
+        let event = AuditEventType::DeploymentFailed;
+        let json = serde_json::to_string(&event).unwrap();
+        assert_eq!(json, "\"DeploymentFailed\"");
+    }
+
+    #[test]
+    fn audit_event_type_worker_events_serialize() {
+        let events = [
+            (AuditEventType::WorkerPreflight, "WorkerPreflight"),
+            (AuditEventType::WorkerDrainStarted, "WorkerDrainStarted"),
+            (AuditEventType::WorkerDrainCompleted, "WorkerDrainCompleted"),
+            (AuditEventType::WorkerTransferStarted, "WorkerTransferStarted"),
+            (
+                AuditEventType::WorkerTransferCompleted,
+                "WorkerTransferCompleted",
+            ),
+            (AuditEventType::WorkerInstallStarted, "WorkerInstallStarted"),
+            (
+                AuditEventType::WorkerInstallCompleted,
+                "WorkerInstallCompleted",
+            ),
+            (AuditEventType::WorkerVerifyStarted, "WorkerVerifyStarted"),
+            (
+                AuditEventType::WorkerVerifyCompleted,
+                "WorkerVerifyCompleted",
+            ),
+            (AuditEventType::WorkerFailed, "WorkerFailed"),
+            (AuditEventType::WorkerRolledBack, "WorkerRolledBack"),
+        ];
+        for (event, expected) in events {
+            let json = serde_json::to_string(&event).unwrap();
+            assert_eq!(json, format!("\"{}\"", expected));
+        }
+    }
+
+    #[test]
+    fn audit_event_type_canary_events_serialize() {
+        let events = [
+            (AuditEventType::CanaryStarted, "CanaryStarted"),
+            (AuditEventType::CanaryPassed, "CanaryPassed"),
+            (AuditEventType::CanaryFailed, "CanaryFailed"),
+        ];
+        for (event, expected) in events {
+            let json = serde_json::to_string(&event).unwrap();
+            assert_eq!(json, format!("\"{}\"", expected));
+        }
+    }
+
+    #[test]
+    fn audit_event_type_equality() {
+        assert_eq!(AuditEventType::DeploymentStarted, AuditEventType::DeploymentStarted);
+        assert_ne!(AuditEventType::DeploymentStarted, AuditEventType::DeploymentCompleted);
+    }
+
+    // ========================
+    // AuditSummary tests
+    // ========================
+
+    #[test]
+    fn audit_summary_serializes_roundtrip() {
+        let summary = AuditSummary {
+            total_events: 10,
+            workers_deployed: 5,
+            workers_failed: 2,
+            duration_ms: 12345,
+        };
+        let json = serde_json::to_string(&summary).unwrap();
+        let restored: AuditSummary = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.total_events, 10);
+        assert_eq!(restored.workers_deployed, 5);
+        assert_eq!(restored.workers_failed, 2);
+        assert_eq!(restored.duration_ms, 12345);
+    }
+
+    // ========================
+    // AuditLogger tests
+    // ========================
+
+    #[test]
+    fn audit_logger_new_without_path_creates_memory_only_logger() {
+        let logger = AuditLogger::new(None).unwrap();
+        assert!(logger.entries().is_empty());
+    }
+
+    #[test]
+    fn audit_logger_log_stores_entry() {
+        let mut logger = AuditLogger::new(None).unwrap();
+        let entry = DeploymentAuditEntry::default();
+        logger.log(entry).unwrap();
+        assert_eq!(logger.entries().len(), 1);
+    }
+
+    #[test]
+    fn audit_logger_log_multiple_entries() {
+        let mut logger = AuditLogger::new(None).unwrap();
+        for i in 0..5 {
+            let mut entry = DeploymentAuditEntry::default();
+            entry.user = format!("user-{}", i);
+            logger.log(entry).unwrap();
+        }
+        assert_eq!(logger.entries().len(), 5);
+    }
+
+    #[test]
+    fn audit_logger_summary_empty_logger() {
+        let logger = AuditLogger::new(None).unwrap();
+        let summary = logger.summary();
+        assert_eq!(summary.total_events, 0);
+        assert_eq!(summary.workers_deployed, 0);
+        assert_eq!(summary.workers_failed, 0);
+        assert_eq!(summary.duration_ms, 0);
+    }
+
+    #[test]
+    fn audit_logger_summary_counts_deployed_workers() {
+        let mut logger = AuditLogger::new(None).unwrap();
+
+        // Log some worker install completed events
+        for i in 0..3 {
+            logger
+                .log(DeploymentAuditEntry {
+                    event_type: AuditEventType::WorkerInstallCompleted,
+                    worker_id: Some(format!("worker-{}", i)),
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+
+        let summary = logger.summary();
+        assert_eq!(summary.workers_deployed, 3);
+    }
+
+    #[test]
+    fn audit_logger_summary_counts_failed_workers() {
+        let mut logger = AuditLogger::new(None).unwrap();
+
+        // Log some worker failed events
+        for i in 0..2 {
+            logger
+                .log(DeploymentAuditEntry {
+                    event_type: AuditEventType::WorkerFailed,
+                    worker_id: Some(format!("worker-{}", i)),
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+
+        let summary = logger.summary();
+        assert_eq!(summary.workers_failed, 2);
+    }
+
+    #[test]
+    fn audit_logger_log_deployment_started_logs_correct_event() {
+        let mut logger = AuditLogger::new(None).unwrap();
+        let deployment_id = Uuid::new_v4();
+
+        logger
+            .log_deployment_started(deployment_id, "1.0.0", 5, "all-at-once")
+            .unwrap();
+
+        let entries = logger.entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].deployment_id, deployment_id);
+        assert_eq!(entries[0].event_type, AuditEventType::DeploymentStarted);
+        assert!(entries[0].worker_id.is_none());
+        assert!(entries[0].details["target_version"] == "1.0.0");
+        assert!(entries[0].details["worker_count"] == 5);
+        assert!(entries[0].details["strategy"] == "all-at-once");
+    }
+
+    #[test]
+    fn audit_logger_log_worker_event_logs_correct_event() {
+        let mut logger = AuditLogger::new(None).unwrap();
+        let deployment_id = Uuid::new_v4();
+
+        logger
+            .log_worker_event(
+                deployment_id,
+                "worker-1",
+                AuditEventType::WorkerTransferStarted,
+                serde_json::json!({"bytes": 1024}),
+            )
+            .unwrap();
+
+        let entries = logger.entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].deployment_id, deployment_id);
+        assert_eq!(
+            entries[0].event_type,
+            AuditEventType::WorkerTransferStarted
+        );
+        assert_eq!(entries[0].worker_id, Some("worker-1".to_string()));
+        assert!(entries[0].details["bytes"] == 1024);
+    }
+
+    #[test]
+    fn audit_logger_entries_returns_all_logged_entries() {
+        let mut logger = AuditLogger::new(None).unwrap();
+
+        logger.log(DeploymentAuditEntry::default()).unwrap();
+        logger
+            .log(DeploymentAuditEntry {
+                event_type: AuditEventType::DeploymentCompleted,
+                ..Default::default()
+            })
+            .unwrap();
+
+        let entries = logger.entries();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].event_type, AuditEventType::DeploymentStarted);
+        assert_eq!(entries[1].event_type, AuditEventType::DeploymentCompleted);
+    }
+
+    // ========================
+    // whoami/hostname helper tests
+    // ========================
+
+    #[test]
+    fn whoami_returns_string() {
+        let user = whoami();
+        // Should return something (either env var or "unknown")
+        assert!(!user.is_empty() || user == "unknown");
+    }
+
+    #[test]
+    fn hostname_returns_string() {
+        let host = hostname();
+        // Should return something (either env var or "unknown")
+        assert!(!host.is_empty() || host == "unknown");
+    }
+}

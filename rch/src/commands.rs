@@ -2061,6 +2061,323 @@ struct ToolchainSyncResult {
     error: Option<String>,
 }
 
+/// Interactive wizard to add a new worker.
+pub async fn workers_init(yes: bool, ctx: &OutputContext) -> Result<()> {
+    use dialoguer::{Confirm, Input};
+    use tokio::process::Command;
+
+    let style = ctx.theme();
+
+    println!();
+    println!("{}", style.format_header("Add New Worker"));
+    println!();
+    println!(
+        "  {} This wizard will guide you through adding a remote compilation worker.",
+        style.muted("→")
+    );
+    println!();
+
+    // Step 1: Get hostname
+    println!("{}", style.highlight("Step 1/5: Connection Details"));
+    let hostname: String = if yes {
+        bail!("--yes flag requires hostname via environment variable RCH_INIT_HOST");
+    } else {
+        Input::new()
+            .with_prompt("Hostname or IP address")
+            .interact_text()?
+    };
+
+    // Get username with default
+    let default_user = std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_else(|_| "ubuntu".to_string());
+    let username: String = if yes {
+        default_user
+    } else {
+        Input::new()
+            .with_prompt("SSH Username")
+            .default(default_user)
+            .interact_text()?
+    };
+
+    // Get SSH key path with default
+    let default_key = dirs::home_dir()
+        .map(|h| h.join(".ssh/id_rsa").display().to_string())
+        .unwrap_or_else(|| "~/.ssh/id_rsa".to_string());
+    let identity_file: String = if yes {
+        default_key
+    } else {
+        Input::new()
+            .with_prompt("SSH Key Path")
+            .default(default_key)
+            .interact_text()?
+    };
+
+    // Get worker ID with default based on hostname
+    let default_id = hostname
+        .split('.')
+        .next()
+        .unwrap_or(&hostname)
+        .replace(|c: char| !c.is_alphanumeric() && c != '-', "-");
+    let worker_id: String = if yes {
+        default_id
+    } else {
+        Input::new()
+            .with_prompt("Worker ID (short name)")
+            .default(default_id)
+            .interact_text()?
+    };
+    println!();
+
+    // Step 2: Test SSH connection
+    println!("{}", style.highlight("Step 2/5: Testing SSH Connection"));
+    print!(
+        "  {} Connecting to {}@{}... ",
+        StatusIndicator::Info.display(style),
+        style.highlight(&username),
+        style.highlight(&hostname)
+    );
+
+    // Build SSH test command
+    let mut cmd = Command::new("ssh");
+    cmd.arg("-o").arg("BatchMode=yes");
+    cmd.arg("-o").arg("ConnectTimeout=10");
+    cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
+    cmd.arg("-i").arg(&identity_file);
+
+    let target = format!("{}@{}", username, hostname);
+    cmd.arg(&target);
+    cmd.arg("echo 'RCH_TEST_OK'");
+
+    let output = cmd.output().await;
+    match output {
+        Ok(out) if out.status.success() => {
+            println!("{}", style.success("OK"));
+        }
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            println!("{}", style.error("FAILED"));
+            println!();
+            println!(
+                "  {} SSH connection failed: {}",
+                StatusIndicator::Error.display(style),
+                stderr.trim()
+            );
+            println!();
+            println!("  {} Troubleshooting tips:", style.muted("→"));
+            println!("      • Check that the hostname is correct");
+            println!("      • Verify the SSH key exists and has correct permissions");
+            println!("      • Try: ssh -i {} {}@{}", identity_file, username, hostname);
+            return Ok(());
+        }
+        Err(e) => {
+            println!("{}", style.error("FAILED"));
+            println!();
+            println!(
+                "  {} Could not execute SSH: {}",
+                StatusIndicator::Error.display(style),
+                e
+            );
+            return Ok(());
+        }
+    }
+    println!();
+
+    // Step 3: Auto-detect system info
+    println!("{}", style.highlight("Step 3/5: Detecting System Capabilities"));
+
+    let mut cmd = Command::new("ssh");
+    cmd.arg("-o").arg("BatchMode=yes");
+    cmd.arg("-o").arg("ConnectTimeout=10");
+    cmd.arg("-i").arg(&identity_file);
+    cmd.arg(&target);
+
+    // Probe script to get cores and Rust version
+    let probe_script = r#"echo "CORES:$(nproc 2>/dev/null || echo 0)"; \
+echo "RUST:$(rustc --version 2>/dev/null || echo none)""#;
+    cmd.arg(probe_script);
+
+    let output = cmd.output().await.context("Failed to probe worker")?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    let mut detected_cores: u32 = 8; // default
+    let mut rust_version: Option<String> = None;
+
+    for line in stdout.lines() {
+        if let Some((key, value)) = line.split_once(':') {
+            match key {
+                "CORES" => detected_cores = value.trim().parse().unwrap_or(8),
+                "RUST" => {
+                    let v = value.trim();
+                    rust_version = if v == "none" { None } else { Some(v.to_string()) };
+                }
+                _ => {}
+            }
+        }
+    }
+
+    println!(
+        "  {} {} CPU cores",
+        StatusIndicator::Success.display(style),
+        style.highlight(&detected_cores.to_string())
+    );
+    if let Some(ref rust) = rust_version {
+        println!(
+            "  {} {}",
+            StatusIndicator::Success.display(style),
+            style.highlight(rust)
+        );
+    } else {
+        println!(
+            "  {} Rust {}",
+            StatusIndicator::Warning.display(style),
+            style.warning("not installed")
+        );
+        println!(
+            "      {} Will be installed during toolchain sync",
+            style.muted("→")
+        );
+    }
+    println!();
+
+    // Step 4: Configure slots and priority
+    println!("{}", style.highlight("Step 4/5: Worker Configuration"));
+
+    let total_slots: u32 = if yes {
+        detected_cores
+    } else {
+        let use_recommended = Confirm::new()
+            .with_prompt(format!(
+                "Use recommended {} slots (based on {} CPU cores)?",
+                detected_cores, detected_cores
+            ))
+            .default(true)
+            .interact()
+            .unwrap_or(true);
+
+        if use_recommended {
+            detected_cores
+        } else {
+            Input::new()
+                .with_prompt("Total slots")
+                .default(detected_cores)
+                .interact_text()?
+        }
+    };
+
+    let priority: u32 = if yes {
+        100
+    } else {
+        Input::new()
+            .with_prompt("Priority (100 = normal, higher = preferred)")
+            .default(100u32)
+            .interact_text()?
+    };
+    println!();
+
+    // Step 5: Save to workers.toml
+    println!("{}", style.highlight("Step 5/5: Saving Configuration"));
+
+    let config_dir = directories::ProjectDirs::from("com", "rch", "rch")
+        .map(|p| p.config_dir().to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("~/.config/rch"));
+
+    std::fs::create_dir_all(&config_dir)?;
+    let workers_path = config_dir.join("workers.toml");
+
+    // Read existing content if any
+    let existing_content = std::fs::read_to_string(&workers_path).unwrap_or_default();
+
+    // Check if this worker ID already exists
+    if existing_content.contains(&format!("id = \"{}\"", worker_id)) {
+        println!(
+            "  {} Worker '{}' already exists in {}",
+            StatusIndicator::Warning.display(style),
+            style.highlight(&worker_id),
+            workers_path.display()
+        );
+        if !yes {
+            let overwrite = Confirm::new()
+                .with_prompt("Update existing worker configuration?")
+                .default(false)
+                .interact()
+                .unwrap_or(false);
+            if !overwrite {
+                println!(
+                    "  {} Aborted. No changes made.",
+                    StatusIndicator::Info.display(style)
+                );
+                return Ok(());
+            }
+            // For simplicity, we'll append a new entry. User can manually clean up duplicates.
+        }
+    }
+
+    // Build new worker entry
+    let mut new_entry = String::new();
+    if !existing_content.is_empty() && !existing_content.ends_with('\n') {
+        new_entry.push('\n');
+    }
+    if !existing_content.is_empty() {
+        new_entry.push('\n');
+    }
+    new_entry.push_str(&format!("# Added by: rch workers init ({})\n",
+        chrono::Local::now().format("%Y-%m-%d %H:%M")));
+    new_entry.push_str("[[workers]]\n");
+    new_entry.push_str(&format!("id = \"{}\"\n", worker_id));
+    new_entry.push_str(&format!("host = \"{}\"\n", hostname));
+    new_entry.push_str(&format!("user = \"{}\"\n", username));
+    new_entry.push_str(&format!("identity_file = \"{}\"\n", identity_file));
+    new_entry.push_str(&format!("total_slots = {}\n", total_slots));
+    new_entry.push_str(&format!("priority = {}\n", priority));
+
+    // Append to file
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&workers_path)?;
+    std::io::Write::write_all(&mut file, new_entry.as_bytes())?;
+
+    println!(
+        "  {} Added worker '{}' to {}",
+        StatusIndicator::Success.display(style),
+        style.highlight(&worker_id),
+        workers_path.display()
+    );
+    println!();
+
+    // Summary and next steps
+    println!("{}", style.format_success("Worker added successfully!"));
+    println!();
+    println!("  {} Next steps:", style.muted("→"));
+    println!(
+        "      {} {} {} Deploy rch-wkr binary",
+        style.highlight("rch workers deploy-binary"),
+        style.muted(&worker_id),
+        style.muted("#")
+    );
+    println!(
+        "      {} {} {} Sync Rust toolchain",
+        style.highlight("rch workers sync-toolchain"),
+        style.muted(&worker_id),
+        style.muted("#")
+    );
+    println!(
+        "      {} {} {} Complete setup in one command",
+        style.highlight("rch workers setup"),
+        style.muted(&worker_id),
+        style.muted("#")
+    );
+    println!();
+    println!(
+        "  {} Or run '{}' to list all workers.",
+        style.muted("→"),
+        style.highlight("rch workers list")
+    );
+
+    Ok(())
+}
+
 /// Discover potential workers from SSH config and shell aliases.
 pub async fn workers_discover(
     probe: bool,

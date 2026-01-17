@@ -41,6 +41,7 @@ hyper = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+rch-common = { workspace = true }
 
 [lints.rust]
 unsafe_code = "forbid"
