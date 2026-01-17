@@ -301,6 +301,18 @@ impl HealthMonitor {
                             "Worker {} healthy ({}ms)",
                             worker_id, result.response_time_ms
                         );
+
+                        // Probe capabilities after successful health check
+                        // This runs in the background to avoid slowing down health checks
+                        let worker_clone = worker.clone();
+                        let timeout = config.check_timeout;
+                        tokio::spawn(async move {
+                            if let Some(capabilities) =
+                                probe_worker_capabilities(&worker_clone, timeout).await
+                            {
+                                worker_clone.set_capabilities(capabilities).await;
+                            }
+                        });
                     } else {
                         warn!(
                             "Worker {} check failed: {:?} (failures: {})",
@@ -426,6 +438,89 @@ pub async fn probe_worker(worker: &WorkerState) -> HealthCheckResult {
     let config = HealthConfig::default();
     let worker_arc = Arc::new(WorkerState::new(worker.config.clone()));
     check_worker_health(&worker_arc, &config).await
+}
+
+/// Probe worker capabilities (Bun, Node, Rust versions).
+///
+/// Runs `rch-wkr capabilities` on the worker and parses the JSON output.
+/// Returns None if probing fails (worker continues without capability info).
+pub async fn probe_worker_capabilities(
+    worker: &Arc<WorkerState>,
+    timeout: Duration,
+) -> Option<rch_common::WorkerCapabilities> {
+    use rch_common::{SshClient, SshOptions, WorkerCapabilities};
+
+    // Check if mock mode is enabled
+    if mock::is_mock_enabled() {
+        // In mock mode, return default capabilities (no Bun)
+        debug!(
+            "Worker {} capabilities probe: mock mode, returning defaults",
+            worker.config.id
+        );
+        return Some(WorkerCapabilities::new());
+    }
+
+    let ssh_options = SshOptions {
+        connect_timeout: timeout,
+        command_timeout: timeout,
+        control_master: false,
+        ..Default::default()
+    };
+
+    let mut client = SshClient::new(worker.config.clone(), ssh_options);
+
+    match client.connect().await {
+        Ok(()) => {
+            // Try to run rch-wkr capabilities command
+            match client.execute("rch-wkr capabilities 2>/dev/null").await {
+                Ok(result) => {
+                    let _ = client.disconnect().await;
+
+                    if result.success() {
+                        // Parse JSON output
+                        match serde_json::from_str::<WorkerCapabilities>(&result.stdout) {
+                            Ok(capabilities) => {
+                                debug!(
+                                    "Worker {} capabilities: rustc={:?}, bun={:?}, node={:?}",
+                                    worker.config.id,
+                                    capabilities.rustc_version,
+                                    capabilities.bun_version,
+                                    capabilities.node_version
+                                );
+                                return Some(capabilities);
+                            }
+                            Err(e) => {
+                                debug!(
+                                    "Worker {} capabilities JSON parse failed: {} (output: {})",
+                                    worker.config.id,
+                                    e,
+                                    result.stdout.trim()
+                                );
+                            }
+                        }
+                    } else {
+                        // rch-wkr might not be installed yet, that's OK
+                        debug!(
+                            "Worker {} capabilities probe failed (rch-wkr may not be installed): exit={}",
+                            worker.config.id, result.exit_code
+                        );
+                    }
+                }
+                Err(e) => {
+                    let _ = client.disconnect().await;
+                    debug!("Worker {} capabilities probe command failed: {}", worker.config.id, e);
+                }
+            }
+        }
+        Err(e) => {
+            debug!(
+                "Worker {} capabilities probe connection failed: {}",
+                worker.config.id, e
+            );
+        }
+    }
+
+    None
 }
 
 #[cfg(test)]
@@ -705,7 +800,7 @@ mod tests {
         use super::*;
         use crate::selection::{SelectionWeights, select_worker_with_config};
         use crate::workers::WorkerPool;
-        use rch_common::SelectionRequest;
+        use rch_common::{RequiredRuntime, SelectionRequest};
 
         fn make_worker_config(id: &str) -> WorkerConfig {
             WorkerConfig {
@@ -725,6 +820,7 @@ mod tests {
                 estimated_cores: cores,
                 preferred_workers: vec![],
                 toolchain: None,
+                required_runtime: RequiredRuntime::default(),
             }
         }
 

@@ -3,7 +3,9 @@
 #![allow(dead_code)] // Scaffold code - methods will be used in future beads
 
 use crate::workers::{WorkerPool, WorkerState};
-use rch_common::{CircuitBreakerConfig, CircuitState, SelectionReason, SelectionRequest};
+use rch_common::{
+    CircuitBreakerConfig, CircuitState, RequiredRuntime, SelectionReason, SelectionRequest,
+};
 use std::cmp::Ordering;
 use std::sync::Arc;
 use tracing::debug;
@@ -116,6 +118,7 @@ pub async fn select_worker_with_config(
     let mut candidates: Vec<(Arc<WorkerState>, CircuitState, f64)> = Vec::new();
     let mut all_circuits_open = true;
     let mut any_has_slots = false;
+    let mut any_has_runtime = false;
 
     for worker in workers {
         let circuit_state = worker.circuit_state().await.unwrap_or(CircuitState::Closed);
@@ -152,6 +155,23 @@ pub async fn select_worker_with_config(
             continue;
         }
 
+        // Check required runtime capability
+        let has_required_runtime = match &request.required_runtime {
+            RequiredRuntime::None => true,
+            RequiredRuntime::Rust => worker.has_rust().await,
+            RequiredRuntime::Bun => worker.has_bun().await,
+            RequiredRuntime::Node => worker.has_node().await,
+        };
+
+        if !has_required_runtime {
+            debug!(
+                "Worker {} excluded: missing required runtime {:?}",
+                worker.config.id, request.required_runtime
+            );
+            continue;
+        }
+
+        any_has_runtime = true;
         any_has_slots = true;
 
         // Compute score with circuit state penalty
@@ -171,6 +191,14 @@ pub async fn select_worker_with_config(
     }
 
     if candidates.is_empty() {
+        // Check if no workers have required runtime (before other checks)
+        if !any_has_runtime && request.required_runtime != RequiredRuntime::None {
+            return SelectionResult {
+                worker: None,
+                reason: SelectionReason::NoWorkersWithRuntime(format!("{:?}", request.required_runtime)),
+            };
+        }
+
         if all_circuits_open {
             return SelectionResult {
                 worker: None,
@@ -253,7 +281,7 @@ mod tests {
     use super::*;
     use crate::workers::WorkerState;
     use rch_common::WorkerStatus;
-    use rch_common::{WorkerConfig, WorkerId};
+    use rch_common::{RequiredRuntime, WorkerConfig, WorkerId};
 
     fn make_worker(id: &str, total_slots: u32, speed: f64) -> WorkerState {
         let config = WorkerConfig {
@@ -278,6 +306,7 @@ mod tests {
             estimated_cores: 4,
             preferred_workers: vec![],
             toolchain: None,
+            required_runtime: RequiredRuntime::default(),
         };
         let weights = SelectionWeights::default();
 
@@ -303,6 +332,7 @@ mod tests {
             estimated_cores: 2,
             preferred_workers: vec![],
             toolchain: None,
+            required_runtime: RequiredRuntime::default(),
         };
         let weights = SelectionWeights::default();
 
@@ -328,6 +358,7 @@ mod tests {
             estimated_cores: 2,
             preferred_workers: vec![],
             toolchain: None,
+            required_runtime: RequiredRuntime::default(),
         };
         let weights = SelectionWeights::default();
 
@@ -351,6 +382,7 @@ mod tests {
             estimated_cores: 2,
             preferred_workers: vec![],
             toolchain: None,
+            required_runtime: RequiredRuntime::default(),
         };
         let weights = SelectionWeights::default();
         let config = CircuitBreakerConfig::default();
@@ -378,6 +410,7 @@ mod tests {
             estimated_cores: 2,
             preferred_workers: vec![],
             toolchain: None,
+            required_runtime: RequiredRuntime::default(),
         };
         let weights = SelectionWeights::default();
         let config = CircuitBreakerConfig::default();
@@ -403,6 +436,7 @@ mod tests {
             estimated_cores: 2,
             preferred_workers: vec![],
             toolchain: None,
+            required_runtime: RequiredRuntime::default(),
         };
         let weights = SelectionWeights::default();
         let config = CircuitBreakerConfig {
@@ -443,6 +477,7 @@ mod tests {
             estimated_cores: 2,
             preferred_workers: vec![],
             toolchain: None,
+            required_runtime: RequiredRuntime::default(),
         };
         let weights = SelectionWeights::default();
 
@@ -472,6 +507,7 @@ mod tests {
             estimated_cores: 2,
             preferred_workers: vec![],
             toolchain: None,
+            required_runtime: RequiredRuntime::default(),
         };
         let weights = SelectionWeights::default();
         let config = CircuitBreakerConfig::default();
@@ -511,6 +547,7 @@ mod tests {
             estimated_cores: 2,
             preferred_workers: vec![],
             toolchain: None,
+            required_runtime: RequiredRuntime::default(),
         };
         let config = CircuitBreakerConfig::default();
 

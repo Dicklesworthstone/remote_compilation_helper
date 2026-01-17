@@ -9,8 +9,8 @@ use crate::selection::{SelectionWeights, select_worker_with_config};
 use crate::workers::WorkerPool;
 use anyhow::{Result, anyhow};
 use rch_common::{
-    BuildRecord, BuildStats, CircuitBreakerConfig, CircuitState, ReleaseRequest, SelectedWorker,
-    SelectionReason, SelectionRequest, SelectionResponse, WorkerStatus,
+    BuildRecord, BuildStats, CircuitBreakerConfig, CircuitState, ReleaseRequest, RequiredRuntime,
+    SelectedWorker, SelectionReason, SelectionRequest, SelectionResponse, WorkerStatus,
 };
 use serde::Serialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -268,6 +268,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
         estimated_cores,
         preferred_workers: vec![],
         toolchain,
+        required_runtime: RequiredRuntime::default(),
     }))
 }
 
@@ -640,7 +641,7 @@ mod tests {
     // Selection response tests - reason field scenarios
     // =========================================================================
 
-    use rch_common::{WorkerConfig, WorkerId, WorkerStatus};
+    use rch_common::{RequiredRuntime, WorkerConfig, WorkerId, WorkerStatus};
 
     fn make_test_worker(id: &str, total_slots: u32) -> WorkerConfig {
         WorkerConfig {
@@ -662,6 +663,7 @@ mod tests {
             estimated_cores: 4,
             preferred_workers: vec![],
             toolchain: None,
+            required_runtime: RequiredRuntime::default(),
         };
 
         let response = handle_select_worker(&pool, request).await.unwrap();
@@ -686,6 +688,7 @@ mod tests {
             estimated_cores: 2,
             preferred_workers: vec![],
             toolchain: None,
+            required_runtime: RequiredRuntime::default(),
         };
 
         let response = handle_select_worker(&pool, request).await.unwrap();
@@ -707,6 +710,7 @@ mod tests {
             estimated_cores: 2, // Request more than available
             preferred_workers: vec![],
             toolchain: None,
+            required_runtime: RequiredRuntime::default(),
         };
 
         let response = handle_select_worker(&pool, request).await.unwrap();
@@ -724,6 +728,7 @@ mod tests {
             estimated_cores: 4,
             preferred_workers: vec![],
             toolchain: None,
+            required_runtime: RequiredRuntime::default(),
         };
 
         let response = handle_select_worker(&pool, request).await.unwrap();
@@ -746,6 +751,7 @@ mod tests {
             estimated_cores: 8, // Request more than total slots
             preferred_workers: vec![],
             toolchain: None,
+            required_runtime: RequiredRuntime::default(),
         };
 
         let response = handle_select_worker(&pool, request).await.unwrap();

@@ -11,6 +11,7 @@ mod toolchain;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use rch_common::WorkerCapabilities;
 use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
@@ -50,8 +51,15 @@ enum Commands {
     /// Respond to health check
     Health,
 
-    /// Report system info
+    /// Report system info (human-readable)
     Info,
+
+    /// Report runtime capabilities (JSON output for daemon)
+    ///
+    /// Returns a JSON object with detected runtime versions for
+    /// Rust, Bun, Node.js, and npm. Used by the daemon during
+    /// health checks to populate WorkerCapabilities.
+    Capabilities,
 
     /// Clean up old project caches
     Cleanup {
@@ -141,6 +149,12 @@ async fn main() -> Result<()> {
             print_system_info();
             Ok(())
         }
+        Commands::Capabilities => {
+            let capabilities = probe_capabilities();
+            // Output as JSON for the daemon to parse
+            println!("{}", serde_json::to_string(&capabilities)?);
+            Ok(())
+        }
         Commands::Cleanup { max_age_hours } => cache::cleanup(max_age_hours).await,
         Commands::Benchmark => run_benchmark().await,
     }
@@ -215,6 +229,87 @@ fn print_system_info() {
             .to_string();
         println!("rsync: {}", first_line);
     }
+
+    // JavaScript/TypeScript runtimes
+    println!("\n=== JavaScript Runtimes ===");
+    if let Ok(output) = Command::new("bun").args(["--version"]).output() {
+        if output.status.success() {
+            println!("bun: {}", String::from_utf8_lossy(&output.stdout).trim());
+        }
+    } else {
+        println!("bun: not installed");
+    }
+    if let Ok(output) = Command::new("node").args(["--version"]).output() {
+        if output.status.success() {
+            println!("node: {}", String::from_utf8_lossy(&output.stdout).trim());
+        }
+    } else {
+        println!("node: not installed");
+    }
+    if let Ok(output) = Command::new("npm").args(["--version"]).output() {
+        if output.status.success() {
+            println!("npm: {}", String::from_utf8_lossy(&output.stdout).trim());
+        }
+    } else {
+        println!("npm: not installed");
+    }
+}
+
+/// Probe runtime capabilities and return structured data.
+///
+/// This function detects installed runtimes (Rust, Bun, Node.js, npm)
+/// and returns a WorkerCapabilities struct suitable for JSON serialization.
+fn probe_capabilities() -> WorkerCapabilities {
+    use std::process::Command;
+
+    let mut capabilities = WorkerCapabilities::new();
+
+    // Probe rustc version
+    if let Ok(output) = Command::new("rustc").args(["--version"]).output() {
+        if output.status.success() {
+            let version_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            // Extract just the version number (e.g., "rustc 1.75.0 (..." -> "1.75.0")
+            if let Some(version) = version_str.split_whitespace().nth(1) {
+                capabilities.rustc_version = Some(version.to_string());
+            } else {
+                capabilities.rustc_version = Some(version_str);
+            }
+        }
+    }
+
+    // Probe bun version
+    if let Ok(output) = Command::new("bun").args(["--version"]).output() {
+        if output.status.success() {
+            let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !version.is_empty() {
+                capabilities.bun_version = Some(version);
+            }
+        }
+    }
+
+    // Probe node version
+    if let Ok(output) = Command::new("node").args(["--version"]).output() {
+        if output.status.success() {
+            let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            // Remove leading 'v' if present (e.g., "v20.10.0" -> "20.10.0")
+            let version = version.strip_prefix('v').unwrap_or(&version).to_string();
+            if !version.is_empty() {
+                capabilities.node_version = Some(version);
+            }
+        }
+    }
+
+    // Probe npm version
+    if let Ok(output) = Command::new("npm").args(["--version"]).output() {
+        if output.status.success() {
+            let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !version.is_empty() {
+                capabilities.npm_version = Some(version);
+            }
+        }
+    }
+
+    capabilities
 }
 
 async fn run_benchmark() -> Result<()> {

@@ -3,7 +3,8 @@
 #![allow(dead_code)] // Scaffold code - methods will be used in future beads
 
 use rch_common::{
-    CircuitBreakerConfig, CircuitState, CircuitStats, WorkerConfig, WorkerId, WorkerStatus,
+    CircuitBreakerConfig, CircuitState, CircuitStats, WorkerCapabilities, WorkerConfig, WorkerId,
+    WorkerStatus,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -28,6 +29,8 @@ pub struct WorkerState {
     circuit: RwLock<CircuitStats>,
     /// Last error message.
     last_error_msg: RwLock<Option<String>>,
+    /// Runtime capabilities (Bun, Node, Rust versions).
+    capabilities: RwLock<WorkerCapabilities>,
 }
 
 impl WorkerState {
@@ -41,6 +44,7 @@ impl WorkerState {
             cached_projects: Vec::new(),
             circuit: RwLock::new(CircuitStats::new()),
             last_error_msg: RwLock::new(None),
+            capabilities: RwLock::new(WorkerCapabilities::new()),
         }
     }
 
@@ -185,6 +189,31 @@ impl WorkerState {
     /// Set an error message.
     pub async fn set_error(&self, msg: String) {
         *self.last_error_msg.write().await = Some(msg);
+    }
+
+    /// Update worker capabilities.
+    pub async fn set_capabilities(&self, capabilities: WorkerCapabilities) {
+        *self.capabilities.write().await = capabilities;
+    }
+
+    /// Get worker capabilities.
+    pub async fn capabilities(&self) -> WorkerCapabilities {
+        self.capabilities.read().await.clone()
+    }
+
+    /// Check if this worker has Bun installed.
+    pub async fn has_bun(&self) -> bool {
+        self.capabilities.read().await.has_bun()
+    }
+
+    /// Check if this worker has Node.js installed.
+    pub async fn has_node(&self) -> bool {
+        self.capabilities.read().await.has_node()
+    }
+
+    /// Check if this worker has Rust installed.
+    pub async fn has_rust(&self) -> bool {
+        self.capabilities.read().await.has_rust()
     }
 }
 

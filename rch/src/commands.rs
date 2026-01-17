@@ -2275,14 +2275,17 @@ pub fn hook_install(ctx: &OutputContext) -> Result<()> {
 
     let hooks_obj = hooks.as_object_mut().context("Hooks must be an object")?;
 
-    // Add PreToolUse hook for Bash
+    // Add PreToolUse hook for Bash (new array format with matchers)
+    // Note: rch runs as hook when invoked without a subcommand, so no args needed
+    // matcher: "Bash" matches the Bash tool name
     hooks_obj.insert(
         "PreToolUse".to_string(),
-        serde_json::json!({
-            "command": rch_path.to_string_lossy(),
-            "args": ["hook"],
-            "tools": ["Bash"]
-        }),
+        serde_json::json!([
+            {
+                "matcher": "Bash",
+                "hooks": [{"type": "command", "command": rch_path.to_string_lossy()}]
+            }
+        ]),
     );
 
     // Write back to file

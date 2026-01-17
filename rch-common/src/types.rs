@@ -63,6 +63,26 @@ impl Default for WorkerStatus {
     }
 }
 
+/// Required runtime for command execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RequiredRuntime {
+    /// No specific runtime required (default).
+    None,
+    /// Requires Rust toolchain.
+    Rust,
+    /// Requires Bun runtime.
+    Bun,
+    /// Requires Node.js runtime.
+    Node,
+}
+
+impl Default for RequiredRuntime {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
 /// Worker selection request sent from hook to daemon.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SelectionRequest {
@@ -76,6 +96,9 @@ pub struct SelectionRequest {
     /// Rust toolchain information for the project.
     #[serde(default)]
     pub toolchain: Option<ToolchainInfo>,
+    /// Required runtime for command execution.
+    #[serde(default)]
+    pub required_runtime: RequiredRuntime,
 }
 
 /// Reason for worker selection result.
@@ -97,6 +120,8 @@ pub enum SelectionReason {
     AllWorkersBusy,
     /// No workers match required tags or preferences.
     NoMatchingWorkers,
+    /// No workers have the required runtime (e.g., Bun, Node).
+    NoWorkersWithRuntime(String),
     /// Internal error during selection.
     SelectionError(String),
 }
@@ -110,6 +135,7 @@ impl std::fmt::Display for SelectionReason {
             Self::AllCircuitsOpen => write!(f, "all worker circuits open"),
             Self::AllWorkersBusy => write!(f, "all workers at capacity"),
             Self::NoMatchingWorkers => write!(f, "no matching workers found"),
+            Self::NoWorkersWithRuntime(rt) => write!(f, "no workers with {} installed", rt),
             Self::SelectionError(e) => write!(f, "selection error: {}", e),
         }
     }
@@ -173,6 +199,49 @@ pub struct WorkerConfig {
 
 fn default_priority() -> u32 {
     100
+}
+
+/// Runtime capabilities detected on a worker.
+///
+/// These are probed during health checks and cached for routing decisions.
+/// Commands requiring specific runtimes (e.g., `bun test`) can be routed
+/// only to workers with the corresponding capability.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WorkerCapabilities {
+    /// Rust compiler version (from `rustc --version`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rustc_version: Option<String>,
+    /// Bun runtime version (from `bun --version`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bun_version: Option<String>,
+    /// Node.js version (from `node --version`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_version: Option<String>,
+    /// npm version (from `npm --version`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub npm_version: Option<String>,
+}
+
+impl WorkerCapabilities {
+    /// Create new empty capabilities.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Check if this worker has Bun installed.
+    pub fn has_bun(&self) -> bool {
+        self.bun_version.is_some()
+    }
+
+    /// Check if this worker has Node.js installed.
+    pub fn has_node(&self) -> bool {
+        self.node_version.is_some()
+    }
+
+    /// Check if this worker has Rust installed.
+    pub fn has_rust(&self) -> bool {
+        self.rustc_version.is_some()
+    }
 }
 
 /// RCH configuration.
