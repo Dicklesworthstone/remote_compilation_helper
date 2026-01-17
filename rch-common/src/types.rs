@@ -736,4 +736,248 @@ mod tests {
         assert_eq!(worker.slots_available, 16);
         assert_eq!(parsed.reason, SelectionReason::Success);
     }
+
+    // CircuitStats tests
+
+    #[test]
+    fn test_circuit_stats_new() {
+        let stats = CircuitStats::new();
+        assert_eq!(stats.state(), CircuitState::Closed);
+        assert_eq!(stats.consecutive_failures(), 0);
+        assert_eq!(stats.error_rate(), 0.0);
+        assert!(stats.opened_at().is_none());
+    }
+
+    #[test]
+    fn test_circuit_stats_record_success() {
+        let mut stats = CircuitStats::new();
+        stats.record_success();
+        stats.record_success();
+        assert_eq!(stats.error_rate(), 0.0);
+        assert_eq!(stats.consecutive_failures(), 0);
+    }
+
+    #[test]
+    fn test_circuit_stats_record_failure() {
+        let mut stats = CircuitStats::new();
+        stats.record_failure();
+        stats.record_failure();
+        assert_eq!(stats.consecutive_failures(), 2);
+        assert_eq!(stats.error_rate(), 1.0); // 2 failures, 0 successes
+    }
+
+    #[test]
+    fn test_circuit_stats_error_rate() {
+        let mut stats = CircuitStats::new();
+        stats.record_success();
+        stats.record_success();
+        stats.record_failure();
+        // 1 failure / 3 total = 0.333...
+        assert!((stats.error_rate() - 0.333).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_circuit_stats_should_open_consecutive_failures() {
+        let mut stats = CircuitStats::new();
+        let config = CircuitBreakerConfig::default(); // threshold = 3
+
+        stats.record_failure();
+        assert!(!stats.should_open(&config));
+
+        stats.record_failure();
+        assert!(!stats.should_open(&config));
+
+        stats.record_failure();
+        assert!(stats.should_open(&config)); // 3 consecutive failures
+    }
+
+    #[test]
+    fn test_circuit_stats_should_open_error_rate() {
+        let mut stats = CircuitStats::new();
+        let config = CircuitBreakerConfig {
+            error_rate_threshold: 0.5,
+            ..Default::default()
+        };
+
+        // Need at least 5 samples
+        stats.record_success();
+        stats.record_success();
+        stats.record_failure();
+        stats.record_failure();
+        assert!(!stats.should_open(&config)); // Only 4 samples
+
+        stats.record_failure(); // 5 samples: 2 success, 3 failures = 60% error rate
+        assert!(stats.should_open(&config));
+    }
+
+    #[test]
+    fn test_circuit_stats_success_resets_consecutive_failures() {
+        let mut stats = CircuitStats::new();
+        stats.record_failure();
+        stats.record_failure();
+        assert_eq!(stats.consecutive_failures(), 2);
+
+        stats.record_success();
+        assert_eq!(stats.consecutive_failures(), 0);
+    }
+
+    #[test]
+    fn test_circuit_stats_open_transition() {
+        let mut stats = CircuitStats::new();
+        stats.open();
+
+        assert_eq!(stats.state(), CircuitState::Open);
+        assert!(stats.opened_at().is_some());
+    }
+
+    #[test]
+    fn test_circuit_stats_half_open_transition() {
+        let mut stats = CircuitStats::new();
+        stats.open();
+        stats.half_open();
+
+        assert_eq!(stats.state(), CircuitState::HalfOpen);
+    }
+
+    #[test]
+    fn test_circuit_stats_close_transition() {
+        let mut stats = CircuitStats::new();
+        stats.open();
+        stats.half_open();
+        stats.close();
+
+        assert_eq!(stats.state(), CircuitState::Closed);
+        assert!(stats.opened_at().is_none());
+        assert_eq!(stats.consecutive_failures(), 0);
+    }
+
+    #[test]
+    fn test_circuit_stats_should_close() {
+        let mut stats = CircuitStats::new();
+        let config = CircuitBreakerConfig {
+            success_threshold: 2,
+            ..Default::default()
+        };
+
+        stats.open();
+        stats.half_open();
+
+        assert!(!stats.should_close(&config)); // 0 successes
+
+        stats.record_success();
+        assert!(!stats.should_close(&config)); // 1 success
+
+        stats.record_success();
+        assert!(stats.should_close(&config)); // 2 successes
+    }
+
+    #[test]
+    fn test_circuit_stats_can_probe() {
+        let mut stats = CircuitStats::new();
+        let config = CircuitBreakerConfig {
+            half_open_max_probes: 1,
+            ..Default::default()
+        };
+
+        // Can't probe when closed
+        assert!(!stats.can_probe(&config));
+
+        stats.open();
+        // Can't probe when open
+        assert!(!stats.can_probe(&config));
+
+        stats.half_open();
+        // Can probe when half-open
+        assert!(stats.can_probe(&config));
+
+        // Start a probe
+        assert!(stats.start_probe(&config));
+        // Can't start another probe
+        assert!(!stats.can_probe(&config));
+        assert!(!stats.start_probe(&config));
+    }
+
+    #[test]
+    fn test_circuit_stats_probe_completion() {
+        let mut stats = CircuitStats::new();
+        let config = CircuitBreakerConfig {
+            half_open_max_probes: 1,
+            ..Default::default()
+        };
+
+        stats.open();
+        stats.half_open();
+        stats.start_probe(&config);
+
+        // Probe completes with success
+        stats.record_success();
+
+        // Can start another probe
+        assert!(stats.can_probe(&config));
+    }
+
+    #[test]
+    fn test_circuit_stats_failure_in_half_open() {
+        let mut stats = CircuitStats::new();
+        let config = CircuitBreakerConfig {
+            success_threshold: 2,
+            ..Default::default()
+        };
+
+        stats.open();
+        stats.half_open();
+
+        stats.record_success();
+        assert_eq!(stats.consecutive_failures(), 0);
+
+        // Failure resets consecutive successes
+        stats.record_failure();
+        assert!(!stats.should_close(&config));
+
+        // Need 2 more successes
+        stats.record_success();
+        stats.record_success();
+        assert!(stats.should_close(&config));
+    }
+
+    #[test]
+    fn test_circuit_stats_reset_window() {
+        let mut stats = CircuitStats::new();
+        stats.record_success();
+        stats.record_failure();
+
+        assert!(stats.error_rate() > 0.0);
+
+        stats.reset_window();
+        assert_eq!(stats.error_rate(), 0.0);
+    }
+
+    #[test]
+    fn test_circuit_state_transitions_are_deterministic() {
+        let config = CircuitBreakerConfig::default();
+        let mut stats = CircuitStats::new();
+
+        // Start closed
+        assert_eq!(stats.state(), CircuitState::Closed);
+
+        // Cause failures to open
+        for _ in 0..3 {
+            stats.record_failure();
+        }
+        assert!(stats.should_open(&config));
+        stats.open();
+        assert_eq!(stats.state(), CircuitState::Open);
+
+        // Transition to half-open after cooldown would be checked
+        stats.half_open();
+        assert_eq!(stats.state(), CircuitState::HalfOpen);
+
+        // Successes to close
+        for _ in 0..2 {
+            stats.record_success();
+        }
+        assert!(stats.should_close(&config));
+        stats.close();
+        assert_eq!(stats.state(), CircuitState::Closed);
+    }
 }
