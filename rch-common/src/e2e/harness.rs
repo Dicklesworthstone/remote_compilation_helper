@@ -328,9 +328,9 @@ impl TestHarness {
 
     /// Start the daemon process
     pub fn start_daemon(&self, extra_args: &[&str]) -> HarnessResult<u32> {
-        let config_dir = self.test_dir.join("config");
-        let config_str: String = config_dir.to_string_lossy().into_owned();
-        let mut args: Vec<&str> = vec!["--config", &config_str];
+        let workers_config = self.test_dir.join("config").join("workers.toml");
+        let workers_config_str: String = workers_config.to_string_lossy().into_owned();
+        let mut args: Vec<&str> = vec!["--workers-config", &workers_config_str];
         args.extend(extra_args);
 
         self.spawn_process("daemon", &self.config.rchd_binary, &args, None)
