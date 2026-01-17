@@ -4,11 +4,11 @@
 //! and routes compilation commands to remote workers.
 
 use crate::config::load_config;
+use crate::error::{DaemonError, TransferError};
 use crate::toolchain::detect_toolchain;
 use crate::transfer::{
     TransferPipeline, compute_project_hash, default_rust_artifact_patterns, project_id_from_path,
 };
-use anyhow::Result;
 use rch_common::{
     CompilationKind, HookInput, HookOutput, RequiredRuntime, SelectedWorker, SelectionResponse,
     ToolchainInfo, TransferConfig, WorkerConfig, WorkerId, classify_command,
@@ -21,7 +21,7 @@ use tokio::net::UnixStream;
 use tracing::{debug, info, warn};
 
 /// Run the hook, reading from stdin and writing to stdout.
-pub async fn run_hook() -> Result<()> {
+pub async fn run_hook() -> anyhow::Result<()> {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
 
@@ -253,10 +253,13 @@ pub(crate) async fn query_daemon(
     toolchain: Option<&ToolchainInfo>,
     required_runtime: RequiredRuntime,
     classification_duration_us: u64,
-) -> Result<SelectionResponse> {
+) -> anyhow::Result<SelectionResponse> {
     // Check if socket exists
     if !Path::new(socket_path).exists() {
-        return Err(anyhow::anyhow!("Daemon socket not found: {}", socket_path));
+        return Err(DaemonError::SocketNotFound {
+            socket_path: socket_path.to_string(),
+        }
+        .into());
     }
 
     // Connect to daemon
@@ -321,7 +324,7 @@ pub(crate) async fn release_worker(
     socket_path: &str,
     worker_id: &WorkerId,
     slots: u32,
-) -> Result<()> {
+) -> anyhow::Result<()> {
     if !Path::new(socket_path).exists() {
         return Ok(()); // Ignore if daemon gone
     }
@@ -459,12 +462,12 @@ async fn execute_remote_compilation(
     command: &str,
     transfer_config: TransferConfig,
     toolchain: Option<&ToolchainInfo>,
-) -> Result<RemoteExecutionResult> {
+) -> anyhow::Result<RemoteExecutionResult> {
     let worker_config = selected_worker_to_config(worker);
 
     // Get current working directory as project root
-    let project_root = std::env::current_dir()
-        .map_err(|e| anyhow::anyhow!("Failed to get current directory: {}", e))?;
+    let project_root =
+        std::env::current_dir().map_err(|e| TransferError::NoProjectRoot { source: e })?;
 
     let project_id = project_id_from_path(&project_root);
     let project_hash = compute_project_hash(&project_root);

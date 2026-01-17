@@ -2,6 +2,7 @@
 //!
 //! This module contains the actual business logic for each CLI subcommand.
 
+use crate::error::ConfigError;
 use crate::ui::context::OutputContext;
 use crate::ui::theme::StatusIndicator;
 use anyhow::{Context, Result, bail};
@@ -4484,31 +4485,47 @@ pub fn config_export(format: &str, ctx: &OutputContext) -> Result<()> {
 }
 
 fn parse_bool(value: &str, key: &str) -> Result<bool> {
-    value
-        .trim()
-        .parse::<bool>()
-        .map_err(|_| anyhow::anyhow!("Invalid boolean for {}: {}", key, value))
+    value.trim().parse::<bool>().map_err(|_| {
+        ConfigError::InvalidValue {
+            field: key.to_string(),
+            reason: format!("'{}' is not a valid boolean", value.trim()),
+            suggestion: "Use 'true' or 'false'".to_string(),
+        }
+        .into()
+    })
 }
 
 fn parse_u32(value: &str, key: &str) -> Result<u32> {
-    value
-        .trim()
-        .parse::<u32>()
-        .map_err(|_| anyhow::anyhow!("Invalid u32 for {}: {}", key, value))
+    value.trim().parse::<u32>().map_err(|_| {
+        ConfigError::InvalidValue {
+            field: key.to_string(),
+            reason: format!("'{}' is not a valid unsigned integer", value.trim()),
+            suggestion: "Use a positive whole number (e.g., 0, 1, 42, 1000)".to_string(),
+        }
+        .into()
+    })
 }
 
 fn parse_u64(value: &str, key: &str) -> Result<u64> {
-    value
-        .trim()
-        .parse::<u64>()
-        .map_err(|_| anyhow::anyhow!("Invalid u64 for {}: {}", key, value))
+    value.trim().parse::<u64>().map_err(|_| {
+        ConfigError::InvalidValue {
+            field: key.to_string(),
+            reason: format!("'{}' is not a valid unsigned integer", value.trim()),
+            suggestion: "Use a positive whole number (e.g., 0, 1, 42, 1000)".to_string(),
+        }
+        .into()
+    })
 }
 
 fn parse_f64(value: &str, key: &str) -> Result<f64> {
-    value
-        .trim()
-        .parse::<f64>()
-        .map_err(|_| anyhow::anyhow!("Invalid float for {}: {}", key, value))
+    value.trim().parse::<f64>().map_err(|_| {
+        ConfigError::InvalidValue {
+            field: key.to_string(),
+            reason: format!("'{}' is not a valid number", value.trim()),
+            suggestion: "Use a decimal number (e.g., 0.5, 1.0, 3.14)".to_string(),
+        }
+        .into()
+    })
 }
 
 fn parse_string_list(value: &str, key: &str) -> Result<Vec<String>> {
@@ -4524,12 +4541,18 @@ fn parse_string_list(value: &str, key: &str) -> Result<Vec<String>> {
         let array = parsed
             .get("value")
             .and_then(|v| v.as_array())
-            .ok_or_else(|| anyhow::anyhow!("Invalid array for {}", key))?;
+            .ok_or_else(|| ConfigError::InvalidValue {
+                field: key.to_string(),
+                reason: format!("'{}' is not a valid array", trimmed),
+                suggestion: "Use TOML array syntax: [\"item1\", \"item2\"]".to_string(),
+            })?;
         let mut result = Vec::with_capacity(array.len());
         for item in array {
-            let item_str = item
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("Array items must be strings for {}", key))?;
+            let item_str = item.as_str().ok_or_else(|| ConfigError::InvalidValue {
+                field: key.to_string(),
+                reason: "Array contains non-string items".to_string(),
+                suggestion: "All array items must be strings: [\"item1\", \"item2\"]".to_string(),
+            })?;
             result.push(item_str.to_string());
         }
         return Ok(result);

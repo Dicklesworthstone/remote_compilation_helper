@@ -187,11 +187,23 @@ pub enum DaemonError {
     )]
     NotRunning,
 
+    /// Daemon socket file not found.
+    #[error("Daemon socket not found at {socket_path}")]
+    #[diagnostic(
+        code(rch::daemon::socket_not_found),
+        help(
+            "The daemon socket file does not exist. This usually means:\n  1. The daemon is not running\n  2. The socket path is misconfigured\n\nStart the daemon: rch daemon start\nOr check config: rch config show | grep socket"
+        )
+    )]
+    SocketNotFound { socket_path: String },
+
     /// Failed to connect to daemon.
     #[error("Failed to connect to daemon at {socket_path}")]
     #[diagnostic(
         code(rch::daemon::connection_failed),
-        help("Ensure the daemon is running: rch daemon status")
+        help(
+            "The daemon socket exists but connection failed.\n\nCheck daemon status: rch daemon status\nView daemon logs: rch daemon logs\nRestart daemon: rch daemon restart"
+        )
     )]
     ConnectionFailed {
         socket_path: String,
@@ -239,6 +251,19 @@ pub enum DaemonError {
 /// Errors related to file transfer operations.
 #[derive(Error, Diagnostic, Debug)]
 pub enum TransferError {
+    /// Failed to determine project root.
+    #[error("Failed to determine project root directory")]
+    #[diagnostic(
+        code(rch::transfer::no_project_root),
+        help(
+            "Could not get the current working directory.\n\nEnsure you are running from a valid directory:\n  pwd\n  ls -la"
+        )
+    )]
+    NoProjectRoot {
+        #[source]
+        source: std::io::Error,
+    },
+
     /// rsync command failed.
     #[error("rsync failed with exit code {exit_code:?}")]
     #[diagnostic(
@@ -538,6 +563,26 @@ mod tests {
     }
 
     #[test]
+    fn test_daemon_socket_not_found() {
+        let err = DaemonError::SocketNotFound {
+            socket_path: "/tmp/rch.sock".to_string(),
+        };
+
+        let report = Report::new(err);
+        let formatted = format!("{:?}", report);
+
+        assert!(
+            formatted.contains("/tmp/rch.sock"),
+            "Should include socket path: {formatted}"
+        );
+        assert!(
+            formatted.contains("rch daemon start"),
+            "Should suggest starting daemon: {formatted}"
+        );
+        assert!(formatted.contains("rch::daemon::socket_not_found"));
+    }
+
+    #[test]
     fn test_daemon_port_in_use_suggests_alternative() {
         let err = DaemonError::PortInUse { port: 7800 };
         let report = Report::new(err);
@@ -567,6 +612,22 @@ mod tests {
     // =========================================================================
     // TransferError Tests
     // =========================================================================
+
+    #[test]
+    fn test_transfer_no_project_root() {
+        let err = TransferError::NoProjectRoot {
+            source: std::io::Error::new(std::io::ErrorKind::NotFound, "directory not found"),
+        };
+
+        let report = Report::new(err);
+        let formatted = format!("{:?}", report);
+
+        assert!(
+            formatted.contains("project root"),
+            "Should mention project root: {formatted}"
+        );
+        assert!(formatted.contains("rch::transfer::no_project_root"));
+    }
 
     #[test]
     fn test_rsync_failed_includes_exit_code() {
