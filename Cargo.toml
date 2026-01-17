@@ -64,3 +64,29 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# cargo-dist configuration for automated releases
+[workspace.metadata.dist]
+cargo-dist-version = "0.26.0"
+ci = "github"
+# Include all platform-specific binaries in releases
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
+# Generate shell installer for Unix platforms
+installers = ["shell", "powershell"]
+# SHA256 checksums for verification
+checksum = "sha256"
+# Include SBOM for supply chain security
+cargo-auditable = true
+# Build all workspace binaries
+all-features = false
+# GitHub Releases hosting
+hosting = ["github"]
+# Tag pattern for releases
+tag-namespace = "v"
