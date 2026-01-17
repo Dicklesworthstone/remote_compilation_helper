@@ -73,6 +73,14 @@ impl JsonError {
         self.suggestions = Some(suggestions);
         self
     }
+
+    /// Create a JsonError from a miette Diagnostic.
+    pub fn from_diagnostic(diag: &dyn miette::Diagnostic) -> Self {
+        let code = diag.code().map(|c| c.to_string()).unwrap_or_else(|| error_codes::INTERNAL_ERROR.to_string());
+        let message = diag.to_string();
+        let suggestions = diag.help().map(|h| vec![h.to_string()]);
+        Self { code, message, details: None, suggestions }
+    }
 }
 
 /// Standard JSON envelope for all command responses.
@@ -329,7 +337,7 @@ pub fn load_workers_from_config() -> Result<Vec<WorkerConfig>> {
         .with_context(|| format!("Failed to read {:?}", config_path))?;
 
     // Parse the TOML - expect [[workers]] array
-    let parsed: toml::Value =
+    let parsed: toml::Value = 
         toml::from_str(&contents).with_context(|| format!("Failed to parse {:?}", config_path))?;
 
     let empty_array = vec![];
@@ -547,7 +555,7 @@ pub async fn workers_probe(
                             });
                         } else {
                             println!(
-                                "{} ({})",
+                                "{} ({}ms)",
                                 StatusIndicator::Success.with_label(style, "OK"),
                                 style.muted(&latency.to_string())
                             );
@@ -781,7 +789,7 @@ pub async fn workers_drain(worker_id: &str, ctx: &OutputContext) -> Result<()> {
     // Check if daemon is running
     if !Path::new(DEFAULT_SOCKET_PATH).exists() {
         if ctx.is_json() {
-            let _ = ctx.json(&JsonResponse::<()>::err("workers drain", "Daemon is not running"));
+            let _ = ctx.json(&JsonResponse::<()>::err_cmd("workers drain", error_codes::DAEMON_NOT_RUNNING, "Daemon is not running"));
         } else {
             println!(
                 "{} Daemon is not running. Start it with {}",
@@ -837,7 +845,7 @@ pub async fn workers_drain(worker_id: &str, ctx: &OutputContext) -> Result<()> {
         }
         Err(e) => {
             if ctx.is_json() {
-                let _ = ctx.json(&JsonResponse::<()>::err("workers drain", e.to_string()));
+                let _ = ctx.json(&JsonResponse::<()>::err_cmd("workers drain", error_codes::INTERNAL_ERROR, e.to_string()));
             } else {
                 println!(
                     "{} Failed to communicate with daemon: {}",
@@ -861,7 +869,7 @@ pub async fn workers_enable(worker_id: &str, ctx: &OutputContext) -> Result<()> 
 
     if !Path::new(DEFAULT_SOCKET_PATH).exists() {
         if ctx.is_json() {
-            let _ = ctx.json(&JsonResponse::<()>::err("workers enable", "Daemon is not running"));
+            let _ = ctx.json(&JsonResponse::<()>::err_cmd("workers enable", error_codes::DAEMON_NOT_RUNNING, "Daemon is not running"));
         } else {
             println!(
                 "{} Daemon is not running. Start it with {}",
@@ -908,7 +916,7 @@ pub async fn workers_enable(worker_id: &str, ctx: &OutputContext) -> Result<()> 
         }
         Err(e) => {
             if ctx.is_json() {
-                let _ = ctx.json(&JsonResponse::<()>::err("workers enable", e.to_string()));
+                let _ = ctx.json(&JsonResponse::<()>::err_cmd("workers enable", error_codes::INTERNAL_ERROR, e.to_string()));
             } else {
                 println!(
                     "{} Failed to communicate with daemon: {}",
@@ -1911,7 +1919,7 @@ fn parse_string_list(value: &str, key: &str) -> Result<Vec<String>> {
 
     if trimmed.starts_with('[') {
         let wrapped = format!("value = {}", trimmed);
-        let parsed: toml::Value =
+        let parsed: toml::Value = 
             toml::from_str(&wrapped).with_context(|| format!("Invalid array for {}", key))?;
         let array = parsed
             .get("value")
@@ -2139,6 +2147,30 @@ pub async fn status_overview(_workers: bool, _jobs: bool) -> Result<()> {
 
 // Stub for hook_test
 pub async fn hook_test(_ctx: &OutputContext) -> Result<()> {
+    // Implementation placeholder
+    Ok(())
+}
+
+// Stub for agents_list
+pub fn agents_list(_all: bool, _ctx: &OutputContext) -> Result<()> {
+    // Implementation placeholder
+    Ok(())
+}
+
+// Stub for agents_status
+pub fn agents_status(_agent: Option<String>, _ctx: &OutputContext) -> Result<()> {
+    // Implementation placeholder
+    Ok(())
+}
+
+// Stub for agents_install_hook
+pub fn agents_install_hook(_agent: &str, _dry_run: bool, _ctx: &OutputContext) -> Result<()> {
+    // Implementation placeholder
+    Ok(())
+}
+
+// Stub for agents_uninstall_hook
+pub fn agents_uninstall_hook(_agent: &str, _dry_run: bool, _ctx: &OutputContext) -> Result<()> {
     // Implementation placeholder
     Ok(())
 }

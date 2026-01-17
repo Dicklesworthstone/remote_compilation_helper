@@ -19,7 +19,8 @@ pub mod ui;
 mod update;
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::CompleteEnv;
 use std::sync::Arc;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 use ui::{ColorChoice, OutputConfig, OutputContext};
@@ -87,6 +88,13 @@ enum Commands {
     Hook {
         #[command(subcommand)]
         action: HookAction,
+    },
+
+    /// Generate shell completions
+    Completions {
+        /// Shell to generate completions for
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
     },
 
     /// Update RCH binaries
@@ -199,6 +207,9 @@ enum HookAction {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Handle dynamic shell completions (exits if handling a completion request)
+    CompleteEnv::with_factory(Cli::command).complete();
+
     let cli = Cli::parse();
 
     // Initialize logging
@@ -237,6 +248,10 @@ async fn main() -> Result<()> {
             Commands::Status { workers, jobs } => handle_status(workers, jobs, &ctx).await,
             Commands::Config { action } => handle_config(action, &ctx).await,
             Commands::Hook { action } => handle_hook(action, &ctx).await,
+            Commands::Completions { shell } => {
+                generate_completions(shell);
+                Ok(())
+            }
             Commands::Update {
                 check,
                 version,
@@ -384,4 +399,14 @@ async fn handle_update(
     )
     .await
     .map_err(|e| anyhow::anyhow!("{}", e))
+}
+
+/// Generate shell completion scripts for static installation
+fn generate_completions(shell: clap_complete::Shell) {
+    clap_complete::generate(
+        shell,
+        &mut Cli::command(),
+        "rch",
+        &mut std::io::stdout(),
+    );
 }
