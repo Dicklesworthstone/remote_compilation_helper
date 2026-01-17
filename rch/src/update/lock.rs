@@ -114,9 +114,16 @@ fn is_process_running(pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     #[test]
     fn test_lock_acquire_and_release() {
+        let _guard = test_lock().lock().unwrap();
         // First lock should succeed
         let lock1 = UpdateLock::acquire();
         assert!(lock1.is_ok());
@@ -135,6 +142,7 @@ mod tests {
 
     #[test]
     fn test_is_locked_false_when_no_lock() {
+        let _guard = test_lock().lock().unwrap();
         // Clear any existing lock first
         if let Ok(path) = get_lock_path() {
             let _ = std::fs::remove_file(path);
@@ -158,6 +166,7 @@ mod tests {
 
     #[test]
     fn test_lock_file_contains_pid() {
+        let _guard = test_lock().lock().unwrap();
         // Clear any existing lock first
         if let Ok(path) = get_lock_path() {
             let _ = std::fs::remove_file(&path);
@@ -178,6 +187,7 @@ mod tests {
 
     #[test]
     fn test_lock_removed_on_drop() {
+        let _guard = test_lock().lock().unwrap();
         // Clear any existing lock first
         if let Ok(path) = get_lock_path() {
             let _ = std::fs::remove_file(&path);
@@ -195,6 +205,7 @@ mod tests {
 
     #[test]
     fn test_stale_lock_from_dead_process() {
+        let _guard = test_lock().lock().unwrap();
         // Clear any existing lock first
         let path = get_lock_path().unwrap();
         let _ = std::fs::remove_file(&path);
@@ -217,6 +228,7 @@ mod tests {
 
     #[test]
     fn test_is_locked_with_active_lock() {
+        let _guard = test_lock().lock().unwrap();
         // Clear any existing lock first
         if let Ok(path) = get_lock_path() {
             let _ = std::fs::remove_file(&path);

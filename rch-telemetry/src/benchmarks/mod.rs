@@ -9,8 +9,14 @@
 //! - **Fast**: Complete in <5 seconds to minimize scheduling disruption
 //! - **Representative**: Exercise operations similar to actual compilation workloads
 
+pub mod compilation;
 pub mod cpu;
+pub mod disk;
 pub mod memory;
 
+pub use compilation::{
+    CompilationBenchmark, CompilationBenchmarkError, CompilationBenchmarkResult,
+};
 pub use cpu::{CpuBenchmark, CpuBenchmarkResult};
+pub use disk::{DiskBenchmark, DiskBenchmarkResult};
 pub use memory::{MemoryBenchmark, MemoryBenchmarkResult};

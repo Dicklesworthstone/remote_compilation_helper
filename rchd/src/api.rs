@@ -374,8 +374,9 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
 /// URL percent-decoding.
 ///
 /// Decodes %XX hex sequences to their original characters.
+/// Handles UTF-8 multi-byte sequences correctly (e.g. %C3%A9 -> é).
 fn urlencoding_decode(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
+    let mut bytes: Vec<u8> = Vec::with_capacity(s.len());
     let mut chars = s.chars().peekable();
 
     while let Some(c) = chars.next() {
@@ -384,22 +385,24 @@ fn urlencoding_decode(s: &str) -> String {
             let hex: String = chars.by_ref().take(2).collect();
             if hex.len() == 2 {
                 if let Ok(byte) = u8::from_str_radix(&hex, 16) {
-                    result.push(byte as char);
+                    bytes.push(byte);
                     continue;
                 }
             }
             // Invalid encoding, keep original
-            result.push('%');
-            result.push_str(&hex);
+            bytes.push(b'%');
+            bytes.extend_from_slice(hex.as_bytes());
         } else if c == '+' {
             // + is space in application/x-www-form-urlencoded
-            result.push(' ');
+            bytes.push(b' ');
         } else {
-            result.push(c);
+            let mut buf = [0; 4];
+            let s = c.encode_utf8(&mut buf);
+            bytes.extend_from_slice(s.as_bytes());
         }
     }
 
-    result
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 /// Handle a select-worker request.
@@ -815,6 +818,24 @@ mod tests {
         assert_eq!(urlencoding_decode("foo%GGbar"), "foo%GGbar");
         // Incomplete sequence at end
         assert_eq!(urlencoding_decode("foo%2"), "foo%2");
+    }
+
+    #[test]
+    fn test_urlencoding_decode_utf8() {
+        // "é" is %C3%A9 in UTF-8
+        assert_eq!(urlencoding_decode("%C3%A9"), "é");
+        // "こんにちは" (Konnichiwa)
+        // こ: %E3%81%93
+        // ん: %E3%82%93
+        // に: %E3%81%AB
+        // ち: %E3%81%A1
+        // は: %E3%81%AF
+        assert_eq!(
+            urlencoding_decode("%E3%81%93%E3%82%93%E3%81%AB%E3%81%A1%E3%81%AF"),
+            "こんにちは"
+        );
+        // Mixed
+        assert_eq!(urlencoding_decode("hello%20%F0%9F%8C%8D"), "hello 🌍");
     }
 
     // Helper for test_parse_request_with_toolchain

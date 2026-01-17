@@ -9,6 +9,8 @@ Get remote compilation working in 5 minutes.
 - Rust toolchain installed on both machines
 - Claude Code or another supported AI coding agent
 
+Need help setting up SSH? See the [SSH setup guide](./guides/ssh-setup.md).
+
 ## 1. Install RCH (30 seconds)
 
 **From Source (Recommended):**

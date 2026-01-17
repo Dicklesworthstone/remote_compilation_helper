@@ -277,18 +277,16 @@ mod tests {
 
     #[test]
     fn test_filter_by_channel_beta_only() {
-        let releases = vec![
-            ReleaseInfo {
-                tag_name: "v0.1.0".to_string(),
-                name: "Stable Only".to_string(),
-                prerelease: false,
-                draft: false,
-                html_url: "".to_string(),
-                body: None,
-                assets: vec![],
-                published_at: None,
-            },
-        ];
+        let releases = vec![ReleaseInfo {
+            tag_name: "v0.1.0".to_string(),
+            name: "Stable Only".to_string(),
+            prerelease: false,
+            draft: false,
+            html_url: "".to_string(),
+            body: None,
+            assets: vec![],
+            published_at: None,
+        }];
 
         // Beta channel requires prerelease flag
         assert!(filter_by_channel(&releases, Channel::Beta).is_none());

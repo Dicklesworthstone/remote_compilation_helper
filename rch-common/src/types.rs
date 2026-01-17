@@ -1526,7 +1526,11 @@ mod tests {
     // Compilation Timing Tests
     // ========================================================================
 
-    fn make_test_metrics(speedup: Option<f64>, total_secs: u64, success: bool) -> CompilationMetrics {
+    fn make_test_metrics(
+        speedup: Option<f64>,
+        total_secs: u64,
+        success: bool,
+    ) -> CompilationMetrics {
         CompilationMetrics {
             project_id: "test-project".to_string(),
             worker_id: "worker-1".to_string(),
@@ -1592,7 +1596,11 @@ mod tests {
 
         assert!(metrics.speedup.is_some());
         let speedup = metrics.speedup.unwrap();
-        assert!((speedup - 3.0).abs() < 0.01, "Expected 3.0x speedup, got {}", speedup);
+        assert!(
+            (speedup - 3.0).abs() < 0.01,
+            "Expected 3.0x speedup, got {}",
+            speedup
+        );
     }
 
     #[test]

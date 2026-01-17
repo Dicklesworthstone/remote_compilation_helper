@@ -135,14 +135,20 @@ impl SshClient {
 
         // Enable control master for connection reuse
         if self.options.control_master {
-            let control_dir = Path::new("/tmp/rch-ssh");
-            if let Err(e) = std::fs::create_dir_all(control_dir) {
+            let control_dir = if let Some(runtime_dir) = dirs::runtime_dir() {
+                runtime_dir.join("rch-ssh")
+            } else {
+                let username = whoami::username();
+                std::env::temp_dir().join(format!("rch-ssh-{}", username))
+            };
+
+            if let Err(e) = std::fs::create_dir_all(&control_dir) {
                 warn!(
                     "Failed to create SSH control directory {:?}: {}",
                     control_dir, e
                 );
             }
-            builder.control_directory("/tmp/rch-ssh");
+            builder.control_directory(&control_dir);
         }
 
         let session = builder

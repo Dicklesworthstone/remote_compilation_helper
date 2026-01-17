@@ -142,9 +142,24 @@ impl NetDevStats {
 
         // Common virtual interface prefixes
         const VIRTUAL_PREFIXES: &[&str] = &[
-            "docker", "br-", "veth", "virbr", "vnet", "tun", "tap", "bond", "dummy", "gre", "sit",
-            "ip6tnl", "ip6gre", "vxlan", "geneve", "wg", // WireGuard
-            "tailscale", "utun",
+            "docker",
+            "br-",
+            "veth",
+            "virbr",
+            "vnet",
+            "tun",
+            "tap",
+            "bond",
+            "dummy",
+            "gre",
+            "sit",
+            "ip6tnl",
+            "ip6gre",
+            "vxlan",
+            "geneve",
+            "wg", // WireGuard
+            "tailscale",
+            "utun",
         ];
 
         for prefix in VIRTUAL_PREFIXES {
@@ -219,7 +234,8 @@ impl NetworkMetrics {
 
         // Convert bytes/sec to Mbps (megabits per second)
         // 1 byte = 8 bits, 1 Mbps = 1,000,000 bits/sec
-        let bytes_to_mbps = |bytes: u64| -> f64 { (bytes as f64 * 8.0) / (duration_secs * 1_000_000.0) };
+        let bytes_to_mbps =
+            |bytes: u64| -> f64 { (bytes as f64 * 8.0) / (duration_secs * 1_000_000.0) };
 
         let rx_mbps = bytes_to_mbps(rx_bytes_delta);
         let tx_mbps = bytes_to_mbps(tx_bytes_delta);
@@ -285,11 +301,7 @@ impl NetworkTelemetry {
     /// Collect network telemetry from two snapshots.
     ///
     /// Only includes physical interfaces (filters out virtual/container interfaces).
-    pub fn from_snapshots(
-        prev: &[NetDevStats],
-        curr: &[NetDevStats],
-        duration_secs: f64,
-    ) -> Self {
+    pub fn from_snapshots(prev: &[NetDevStats], curr: &[NetDevStats], duration_secs: f64) -> Self {
         let timestamp = Utc::now();
 
         // Build a map of previous stats by interface name
@@ -301,9 +313,9 @@ impl NetworkTelemetry {
             .iter()
             .filter(|s| s.is_physical())
             .filter_map(|curr_stat| {
-                prev_map
-                    .get(curr_stat.interface.as_str())
-                    .map(|prev_stat| NetworkMetrics::from_delta(prev_stat, curr_stat, duration_secs))
+                prev_map.get(curr_stat.interface.as_str()).map(|prev_stat| {
+                    NetworkMetrics::from_delta(prev_stat, curr_stat, duration_secs)
+                })
             })
             .collect();
 
@@ -508,12 +520,36 @@ docker0:  1000000    1000    0    0    0     0          0         0   500000    
         }
 
         // eth0 and ens5 should be physical
-        assert!(stats.iter().find(|s| s.interface == "eth0").unwrap().is_physical());
-        assert!(stats.iter().find(|s| s.interface == "ens5").unwrap().is_physical());
+        assert!(
+            stats
+                .iter()
+                .find(|s| s.interface == "eth0")
+                .unwrap()
+                .is_physical()
+        );
+        assert!(
+            stats
+                .iter()
+                .find(|s| s.interface == "ens5")
+                .unwrap()
+                .is_physical()
+        );
 
         // lo and docker0 should not be physical
-        assert!(!stats.iter().find(|s| s.interface == "lo").unwrap().is_physical());
-        assert!(!stats.iter().find(|s| s.interface == "docker0").unwrap().is_physical());
+        assert!(
+            !stats
+                .iter()
+                .find(|s| s.interface == "lo")
+                .unwrap()
+                .is_physical()
+        );
+        assert!(
+            !stats
+                .iter()
+                .find(|s| s.interface == "docker0")
+                .unwrap()
+                .is_physical()
+        );
 
         info!("TEST PASS: test_physical_interface_filter");
     }
@@ -524,8 +560,18 @@ docker0:  1000000    1000    0    0    0     0          0         0   500000    
         info!("TEST START: test_virtual_interface_prefixes");
 
         let virtual_names = vec![
-            "lo", "docker0", "br-abc123", "veth12345", "virbr0", "vnet0",
-            "tun0", "tap0", "bond0", "dummy0", "wg0", "tailscale0",
+            "lo",
+            "docker0",
+            "br-abc123",
+            "veth12345",
+            "virbr0",
+            "vnet0",
+            "tun0",
+            "tap0",
+            "bond0",
+            "dummy0",
+            "wg0",
+            "tailscale0",
         ];
 
         let physical_names = vec!["eth0", "ens5", "enp0s3", "em1", "wlan0"];
@@ -606,10 +652,22 @@ docker0:  1000000    1000    0    0    0     0          0         0   500000    
             "RESULT: calculated throughput"
         );
 
-        assert!((metrics.rx_mbps - 1000.0).abs() < 0.1, "rx_mbps should be ~1000");
-        assert!((metrics.tx_mbps - 500.0).abs() < 0.1, "tx_mbps should be ~500");
-        assert!((metrics.total_mbps - 1500.0).abs() < 0.1, "total_mbps should be ~1500");
-        assert!((metrics.rx_pps - 100_000.0).abs() < 0.1, "rx_pps should be ~100000");
+        assert!(
+            (metrics.rx_mbps - 1000.0).abs() < 0.1,
+            "rx_mbps should be ~1000"
+        );
+        assert!(
+            (metrics.tx_mbps - 500.0).abs() < 0.1,
+            "tx_mbps should be ~500"
+        );
+        assert!(
+            (metrics.total_mbps - 1500.0).abs() < 0.1,
+            "total_mbps should be ~1500"
+        );
+        assert!(
+            (metrics.rx_pps - 100_000.0).abs() < 0.1,
+            "rx_pps should be ~100000"
+        );
 
         info!("TEST PASS: test_throughput_calculation");
     }
@@ -654,10 +712,22 @@ docker0:  1000000    1000    0    0    0     0          0         0   500000    
             "RESULT: calculated rates over 10 seconds"
         );
 
-        assert!((metrics.rx_mbps - 100.0).abs() < 0.1, "rx_mbps should be ~100");
-        assert!((metrics.rx_pps - 10_000.0).abs() < 0.1, "rx_pps should be ~10000");
-        assert!((metrics.error_rate - 0.5).abs() < 0.01, "error_rate should be ~0.5");
-        assert!((metrics.drop_rate - 0.2).abs() < 0.01, "drop_rate should be ~0.2");
+        assert!(
+            (metrics.rx_mbps - 100.0).abs() < 0.1,
+            "rx_mbps should be ~100"
+        );
+        assert!(
+            (metrics.rx_pps - 10_000.0).abs() < 0.1,
+            "rx_pps should be ~10000"
+        );
+        assert!(
+            (metrics.error_rate - 0.5).abs() < 0.01,
+            "error_rate should be ~0.5"
+        );
+        assert!(
+            (metrics.drop_rate - 0.2).abs() < 0.01,
+            "drop_rate should be ~0.2"
+        );
 
         info!("TEST PASS: test_throughput_with_duration");
     }

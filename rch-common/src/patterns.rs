@@ -376,14 +376,52 @@ pub fn normalize_command(cmd: &str) -> Cow<'_, str> {
         }
 
         // Handle env VAR=val syntax
-        // Logic: if result starts with VAR=val, strip it
-        // We look for the first space, and check if the part before it contains '='
-        if let Some(space_idx) = result.find(' ') {
-            let first_word = &result[..space_idx];
-            if first_word.contains('=') && !first_word.contains('"') && !first_word.contains('\'') {
-                result = result[space_idx..].trim_start();
-                changed = true;
+        // Logic: if result starts with VAR=val (potentially quoted), strip it.
+        // We need to parse the first token respecting quotes.
+        let chars = result.chars();
+        let mut token_len = 0;
+        let mut in_quote = None; // None, Some('\''), Some('"')
+        let mut escaped = false;
+        let mut has_equals = false;
+        let mut has_space = false;
+
+        for c in chars {
+            if escaped {
+                escaped = false;
+                token_len += c.len_utf8();
+                continue;
             }
+
+            if c == '\\' {
+                escaped = true;
+                token_len += c.len_utf8();
+                continue;
+            }
+
+            if let Some(q) = in_quote {
+                if c == q {
+                    in_quote = None;
+                }
+                token_len += c.len_utf8();
+            } else if c == '"' || c == '\'' {
+                in_quote = Some(c);
+                token_len += c.len_utf8();
+            } else if c.is_whitespace() {
+                has_space = true;
+                break;
+            } else {
+                if c == '=' {
+                    has_equals = true;
+                }
+                token_len += c.len_utf8();
+            }
+        }
+
+        if has_equals && in_quote.is_none() && has_space {
+            // It was a complete token with an equals sign followed by space.
+            // We assume it's an env var and strip it.
+            result = result[token_len..].trim_start();
+            changed = true;
         }
 
         if !changed {

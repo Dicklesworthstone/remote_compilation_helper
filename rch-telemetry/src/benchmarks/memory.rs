@@ -64,7 +64,7 @@ pub struct MemoryBenchmark {
 impl Default for MemoryBenchmark {
     fn default() -> Self {
         Self {
-            seq_buffer_size: 256 * 1024 * 1024, // 256 MB
+            seq_buffer_size: 256 * 1024 * 1024,      // 256 MB
             random_buffer_elements: 8 * 1024 * 1024, // 64 MB (8M * 8 bytes)
             random_iterations: 10_000_000,
             alloc_iterations: 100_000,
@@ -143,14 +143,23 @@ impl MemoryBenchmark {
 
         // Run individual benchmarks
         let seq_bandwidth = sequential_bandwidth_benchmark(self.seq_buffer_size);
-        debug!(seq_bandwidth_gbps = seq_bandwidth, "Sequential bandwidth complete");
+        debug!(
+            seq_bandwidth_gbps = seq_bandwidth,
+            "Sequential bandwidth complete"
+        );
 
         let random_latency =
             random_access_latency_benchmark(self.random_buffer_elements, self.random_iterations);
-        debug!(random_latency_ns = random_latency, "Random access latency complete");
+        debug!(
+            random_latency_ns = random_latency,
+            "Random access latency complete"
+        );
 
         let alloc_ops = allocation_benchmark(self.alloc_iterations);
-        debug!(alloc_ops_per_second = alloc_ops, "Allocation benchmark complete");
+        debug!(
+            alloc_ops_per_second = alloc_ops,
+            "Allocation benchmark complete"
+        );
 
         let duration = start.elapsed();
         let duration_ms = duration.as_millis() as u64;
@@ -314,7 +323,9 @@ pub fn random_access_latency_benchmark(buffer_elements: usize, iterations: usize
     // Simple LCG for deterministic shuffle
     let mut rng_state = 12345u64;
     for i in (1..buffer_elements).rev() {
-        rng_state = rng_state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+        rng_state = rng_state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1);
         let j = (rng_state as usize) % (i + 1);
         buffer.swap(i, j);
     }
@@ -410,10 +421,7 @@ mod tests {
         info!("RESULT: Sequential bandwidth = {} GB/s", gbps);
 
         assert!(gbps > 0.1); // At least 100 MB/s
-        info!(
-            "VERIFY: Bandwidth {} GB/s exceeds minimum 0.1 GB/s",
-            gbps
-        );
+        info!("VERIFY: Bandwidth {} GB/s exceeds minimum 0.1 GB/s", gbps);
 
         info!("TEST PASS: test_sequential_bandwidth_positive");
     }
@@ -614,10 +622,7 @@ mod tests {
         let result = benchmark.run();
         let elapsed = start.elapsed();
 
-        info!(
-            "RESULT: completed in {:?}, score={}",
-            elapsed, result.score
-        );
+        info!("RESULT: completed in {:?}, score={}", elapsed, result.score);
 
         // Should complete in reasonable time (allow more than CPU benchmark)
         assert!(elapsed < Duration::from_secs(30));
