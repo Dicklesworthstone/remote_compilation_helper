@@ -367,6 +367,13 @@ impl OutputContext {
         &self.theme
     }
 
+    /// Get the style configuration (alias for theme()).
+    ///
+    /// This is an alias for `theme()` for API compatibility.
+    pub fn style(&self) -> &Theme {
+        &self.theme
+    }
+
     // --- Adaptive color support ---
 
     /// Check if the terminal has a light background.

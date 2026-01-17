@@ -52,7 +52,7 @@ fn should_show_progress(ctx: &OutputContext) -> bool {
 
 /// Get the appropriate spinner characters for the terminal.
 fn spinner_chars(ctx: &OutputContext) -> &'static [&'static str] {
-    if ctx.style().supports_unicode() {
+    if ctx.theme().supports_unicode() {
         SPINNER_CHARS
     } else {
         SPINNER_CHARS_ASCII
@@ -61,7 +61,7 @@ fn spinner_chars(ctx: &OutputContext) -> &'static [&'static str] {
 
 /// Get the appropriate progress bar characters for the terminal.
 fn progress_chars(ctx: &OutputContext) -> &'static str {
-    if ctx.style().supports_unicode() {
+    if ctx.theme().supports_unicode() {
         PROGRESS_CHARS
     } else {
         PROGRESS_CHARS_ASCII
@@ -292,7 +292,7 @@ impl StepProgress {
             steps,
             current: 0,
             ctx_mode: ctx.mode(),
-            ctx_unicode: ctx.style().supports_unicode(),
+            ctx_unicode: ctx.theme().supports_unicode(),
         }
     }
 
@@ -405,7 +405,7 @@ impl MultiProgressManager {
         Self {
             multi,
             visible,
-            ctx_unicode: ctx.style().supports_unicode(),
+            ctx_unicode: ctx.theme().supports_unicode(),
         }
     }
 

@@ -10,7 +10,7 @@ use rch_common::{RchConfig, SshClient, SshOptions, WorkerConfig, WorkerId};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::process::Command;
 use tracing::debug;
@@ -399,7 +399,7 @@ pub fn load_workers_from_config() -> Result<Vec<WorkerConfig>> {
 /// List all configured workers.
 pub fn workers_list(ctx: &OutputContext) -> Result<()> {
     let workers = load_workers_from_config()?;
-    let style = ctx.style();
+    let style = ctx.theme();
 
     // JSON output mode
     if ctx.is_json() {
@@ -461,7 +461,7 @@ pub async fn workers_probe(
     ctx: &OutputContext,
 ) -> Result<()> {
     let workers = load_workers_from_config()?;
-    let style = ctx.style();
+    let style = ctx.theme();
 
     if workers.is_empty() {
         if ctx.is_json() {
@@ -547,7 +547,7 @@ pub async fn workers_probe(
                             });
                         } else {
                             println!(
-                                "{} ({}ms)",
+                                "{} ({})",
                                 StatusIndicator::Success.with_label(style, "OK"),
                                 style.muted(&latency.to_string())
                             );
@@ -631,7 +631,7 @@ pub struct WorkerBenchmarkResult {
 /// Run worker benchmarks.
 pub async fn workers_benchmark(ctx: &OutputContext) -> Result<()> {
     let workers = load_workers_from_config()?;
-    let style = ctx.style();
+    let style = ctx.theme();
 
     if workers.is_empty() {
         if ctx.is_json() {
@@ -776,7 +776,7 @@ pub struct WorkerActionResponse {
 
 /// Drain a worker (requires daemon).
 pub async fn workers_drain(worker_id: &str, ctx: &OutputContext) -> Result<()> {
-    let style = ctx.style();
+    let style = ctx.theme();
 
     // Check if daemon is running
     if !Path::new(DEFAULT_SOCKET_PATH).exists() {
@@ -857,7 +857,7 @@ pub async fn workers_drain(worker_id: &str, ctx: &OutputContext) -> Result<()> {
 
 /// Enable a worker (requires daemon).
 pub async fn workers_enable(worker_id: &str, ctx: &OutputContext) -> Result<()> {
-    let style = ctx.style();
+    let style = ctx.theme();
 
     if !Path::new(DEFAULT_SOCKET_PATH).exists() {
         if ctx.is_json() {
@@ -929,7 +929,7 @@ pub async fn workers_enable(worker_id: &str, ctx: &OutputContext) -> Result<()> 
 /// Check daemon status.
 pub fn daemon_status(ctx: &OutputContext) -> Result<()> {
     let socket_path = Path::new(DEFAULT_SOCKET_PATH);
-    let style = ctx.style();
+    let style = ctx.theme();
 
     let running = socket_path.exists();
     let uptime_seconds = if running {
@@ -1016,7 +1016,7 @@ pub struct DaemonActionResponse {
 
 /// Start the daemon.
 pub async fn daemon_start(ctx: &OutputContext) -> Result<()> {
-    let style = ctx.style();
+    let style = ctx.theme();
     let socket_path = Path::new(DEFAULT_SOCKET_PATH);
 
     if socket_path.exists() {
@@ -1133,7 +1133,7 @@ pub async fn daemon_start(ctx: &OutputContext) -> Result<()> {
 
 /// Stop the daemon.
 pub async fn daemon_stop(ctx: &OutputContext) -> Result<()> {
-    let style = ctx.style();
+    let style = ctx.theme();
     let socket_path = Path::new(DEFAULT_SOCKET_PATH);
 
     if !socket_path.exists() {
@@ -1249,7 +1249,7 @@ pub async fn daemon_stop(ctx: &OutputContext) -> Result<()> {
 
 /// Restart the daemon.
 pub async fn daemon_restart(ctx: &OutputContext) -> Result<()> {
-    let style = ctx.style();
+    let style = ctx.theme();
     if !ctx.is_json() {
         println!(
             "{} Restarting RCH daemon...\n",
@@ -1273,7 +1273,7 @@ pub struct DaemonLogsResponse {
 
 /// Show daemon logs.
 pub fn daemon_logs(lines: usize, ctx: &OutputContext) -> Result<()> {
-    let style = ctx.style();
+    let style = ctx.theme();
 
     // Try common log locations
     let log_paths = vec![
@@ -1351,7 +1351,7 @@ pub fn daemon_logs(lines: usize, ctx: &OutputContext) -> Result<()> {
 
 /// Show effective configuration.
 pub fn config_show(ctx: &OutputContext) -> Result<()> {
-    let style = ctx.style();
+    let style = ctx.theme();
 
     // Load user config
     let config = crate::config::load_config()?;
@@ -1458,7 +1458,7 @@ pub fn config_show(ctx: &OutputContext) -> Result<()> {
 
 /// Initialize configuration files.
 pub fn config_init(ctx: &OutputContext) -> Result<()> {
-    let style = ctx.style();
+    let style = ctx.theme();
     let config_dir = config_dir().context("Could not determine config directory")?;
 
     // Create config directory
@@ -1595,7 +1595,7 @@ enabled = true
 
 /// Validate configuration files.
 pub fn config_validate(ctx: &OutputContext) -> Result<()> {
-    let style = ctx.style();
+    let style = ctx.theme();
 
     println!("Validating RCH configuration...\n");
 
@@ -1948,7 +1948,7 @@ fn parse_string_list(value: &str, key: &str) -> Result<Vec<String>> {
 
 /// Install the Claude Code hook.
 pub fn hook_install(ctx: &OutputContext) -> Result<()> {
-    let style = ctx.style();
+    let style = ctx.theme();
 
     // Claude Code hooks are configured in ~/.claude/settings.json
     let claude_config_dir = dirs::home_dir() 
@@ -2020,7 +2020,7 @@ pub fn hook_install(ctx: &OutputContext) -> Result<()> {
 
 /// Uninstall the Claude Code hook.
 pub fn hook_uninstall(ctx: &OutputContext) -> Result<()> {
-    let style = ctx.style();
+    let style = ctx.theme();
 
     let claude_config_dir = dirs::home_dir()
         .map(|h| h.join(".claude"))
@@ -2131,10 +2131,9 @@ async fn send_daemon_command(command: &str) -> Result<String> {
     Ok(response)
 }
 
-/// Show system status overview.
-pub async fn status_overview(_show_workers: bool, _show_jobs: bool) -> Result<()> {
-    // TODO: Implement full status display
-    println!("Status overview not yet implemented.");
+// Stub for status_overview
+pub async fn status_overview(_workers: bool, _jobs: bool) -> Result<()> {
+    // Implementation placeholder
     Ok(())
 }
 
