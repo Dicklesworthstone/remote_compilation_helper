@@ -67,6 +67,7 @@ make, cmake --build, ninja, meson compile
 bun install/add/remove     # Modifies node_modules
 bun run/dev/build          # Needs local ports
 cargo build | tee log      # Piped
+cargo build > output.txt   # Redirected
 cargo build &              # Background
 ```
 
@@ -80,12 +81,18 @@ echo '{"tool":"Bash","input":{"command":"cargo build"}}' | rch hook
 echo '{"tool":"Bash","input":{"command":"ls -la"}}' | rch hook
 # → {"allow":true}
 
+# Dry run with file input
+RCH_DRY_RUN=1 rch hook < test-input.json
+
 # Dry run (logs but no remote execution)
 RCH_DRY_RUN=1 cargo check
 
 # Debug logging
 RCH_LOG=debug cargo build
 RCH_LOG=trace cargo build  # Maximum detail
+
+# Verify hook is running
+ps aux | grep rch
 ```
 
 ## Configuration
@@ -101,6 +108,14 @@ local_patterns = [           # Force local execution
     "cargo fmt",
     "cargo doc"
 ]
+```
+
+## Uninstalling
+
+```bash
+rch hook uninstall  # Removes hook from ~/.claude/settings.json
+
+# Manual removal: edit ~/.claude/settings.json and remove the PreToolUse entry
 ```
 
 ## Security

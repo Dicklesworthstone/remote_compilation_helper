@@ -47,6 +47,16 @@ identity_file = "~/.ssh/id_ed25519"
 total_slots = 8
 priority = 50
 tags = ["rust"]
+
+# Specialized TypeScript worker
+[[workers]]
+id = "ts-builder"
+host = "ts.internal"
+user = "node"
+identity_file = "~/.ssh/ts_key"
+total_slots = 16
+priority = 75
+tags = ["bun", "typescript"]
 ```
 
 ## SSH Config Discovery
