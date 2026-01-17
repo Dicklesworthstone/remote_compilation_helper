@@ -176,17 +176,26 @@ mod tests {
 
         let defaults = Profile::Dev.get_defaults();
 
-        // Should include both defaults when vars are unset
-        assert!(
-            defaults
-                .iter()
-                .any(|(k, v)| *k == "RCH_LOG_LEVEL" && *v == "debug")
-        );
-        assert!(
-            defaults
-                .iter()
-                .any(|(k, v)| *k == "RCH_LOG_FORMAT" && *v == "pretty")
-        );
+        // If variables are unset, defaults should include them; otherwise they should be omitted.
+        if env::var("RCH_LOG_LEVEL").is_ok() {
+            assert!(!defaults.iter().any(|(k, _)| *k == "RCH_LOG_LEVEL"));
+        } else {
+            assert!(
+                defaults
+                    .iter()
+                    .any(|(k, v)| *k == "RCH_LOG_LEVEL" && *v == "debug")
+            );
+        }
+
+        if env::var("RCH_LOG_FORMAT").is_ok() {
+            assert!(!defaults.iter().any(|(k, _)| *k == "RCH_LOG_FORMAT"));
+        } else {
+            assert!(
+                defaults
+                    .iter()
+                    .any(|(k, v)| *k == "RCH_LOG_FORMAT" && *v == "pretty")
+            );
+        }
     }
 
     #[test]

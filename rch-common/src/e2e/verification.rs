@@ -182,8 +182,7 @@ impl RemoteCompilationTest {
         let change = TestCodeChange::for_main_rs(&self.project_path)
             .with_context(|| "Failed to create test change")?;
         let change_id = change.change_id.clone();
-        let guard = TestChangeGuard::new(change)
-            .with_context(|| "Failed to apply test change")?;
+        let guard = TestChangeGuard::new(change).with_context(|| "Failed to apply test change")?;
 
         info!("Applied test change: {}", guard.change_id());
 
@@ -360,18 +359,17 @@ impl RemoteCompilationTest {
             "cargo build"
         };
 
-        let ssh_cmd = format!(
-            "cd {} && {}",
-            remote_path.display(),
-            build_cmd
-        );
+        let ssh_cmd = format!("cd {} && {}", remote_path.display(), build_cmd);
 
         let identity_file = shellexpand::tilde(&self.worker.identity_file).to_string();
         let mut cmd = Command::new("ssh");
         cmd.args([
-            "-i", &identity_file,
-            "-o", "StrictHostKeyChecking=no",
-            "-o", "BatchMode=yes",
+            "-i",
+            &identity_file,
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "BatchMode=yes",
             &format!("{}@{}", self.worker.user, self.worker.host),
             &ssh_cmd,
         ]);
@@ -396,13 +394,18 @@ impl RemoteCompilationTest {
         let mkdir_cmd = format!("mkdir -p {}", remote_path.display());
         let mut mkdir = Command::new("ssh");
         mkdir.args([
-            "-i", &identity_file,
-            "-o", "StrictHostKeyChecking=no",
-            "-o", "BatchMode=yes",
+            "-i",
+            &identity_file,
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "BatchMode=yes",
             &format!("{}@{}", self.worker.user, self.worker.host),
             &mkdir_cmd,
         ]);
-        mkdir.output().context("Failed to create remote directory")?;
+        mkdir
+            .output()
+            .context("Failed to create remote directory")?;
 
         // Build rsync command
         let mut cmd = Command::new("rsync");
@@ -412,7 +415,10 @@ impl RemoteCompilationTest {
             &self.config.rsync_compression.to_string(),
             "--delete",
             "-e",
-            &format!("ssh -i {} -o StrictHostKeyChecking=no -o BatchMode=yes", identity_file),
+            &format!(
+                "ssh -i {} -o StrictHostKeyChecking=no -o BatchMode=yes",
+                identity_file
+            ),
         ]);
 
         // Add exclude patterns
@@ -466,7 +472,10 @@ impl RemoteCompilationTest {
             "--compress-level",
             &self.config.rsync_compression.to_string(),
             "-e",
-            &format!("ssh -i {} -o StrictHostKeyChecking=no -o BatchMode=yes", identity_file),
+            &format!(
+                "ssh -i {} -o StrictHostKeyChecking=no -o BatchMode=yes",
+                identity_file
+            ),
         ]);
 
         // Source (remote target/debug or target/release) and destination
@@ -513,9 +522,7 @@ impl RemoteCompilationTest {
     /// Get the path to the remote binary (stored locally after rsync).
     fn remote_binary_path_local(&self) -> PathBuf {
         let binary_name = self.get_binary_name().unwrap_or_else(|| "main".to_string());
-        self.project_path
-            .join("target_remote")
-            .join(&binary_name)
+        self.project_path.join("target_remote").join(&binary_name)
     }
 
     /// Get the remote project path on the worker.

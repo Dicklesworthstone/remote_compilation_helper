@@ -4629,6 +4629,25 @@ pub async fn diagnose(command: &str, ctx: &OutputContext) -> Result<()> {
     let decision = build_diagnose_decision(&details.classification, threshold);
     let would_intercept = decision.would_intercept;
 
+    debug!(
+        "Diagnose input='{}' normalized='{}'",
+        details.original, details.normalized
+    );
+    debug!(
+        "Classification confidence={:.2} reason='{}'",
+        details.classification.confidence, details.classification.reason
+    );
+    debug!(
+        "Confidence threshold={:.2} source='{}'",
+        threshold, threshold_source
+    );
+    for tier in &details.tiers {
+        debug!(
+            "Tier {} {} decision={:?} reason='{}'",
+            tier.tier, tier.name, tier.decision, tier.reason
+        );
+    }
+
     let required_runtime = required_runtime_for_kind(details.classification.kind);
 
     let socket_path = config.general.socket_path.clone();
@@ -4650,13 +4669,21 @@ pub async fn diagnose(command: &str, ctx: &OutputContext) -> Result<()> {
                 daemon_status.status = Some(health.status);
                 daemon_status.version = Some(health.version);
                 daemon_status.uptime_seconds = Some(health.uptime_seconds);
+                debug!(
+                    "Daemon health ok status='{}' version='{}' uptime={}s",
+                    daemon_status.status.as_deref().unwrap_or("unknown"),
+                    daemon_status.version.as_deref().unwrap_or("unknown"),
+                    daemon_status.uptime_seconds.unwrap_or(0)
+                );
             }
             Err(err) => {
                 daemon_status.error = Some(format!("health check failed: {}", err));
+                debug!("Daemon health failed: {}", err);
             }
         }
     } else {
         daemon_status.error = Some("daemon socket not found".to_string());
+        debug!("Daemon socket not found: {}", socket_path);
     }
 
     let mut worker_selection = None;
@@ -4692,11 +4719,20 @@ pub async fn diagnose(command: &str, ctx: &OutputContext) -> Result<()> {
                 worker_selection = Some(DiagnoseWorkerSelection {
                     estimated_cores,
                     worker: response.worker.clone(),
-                    reason: response.reason,
+                    reason: response.reason.clone(),
                 });
+                if let Some(worker) = response.worker.as_ref() {
+                    debug!(
+                        "Worker selected id='{}' slots_available={} speed_score={:.2} reason={:?}",
+                        worker.id, worker.slots_available, worker.speed_score, response.reason
+                    );
+                } else {
+                    debug!("No worker selected reason={:?}", response.reason);
+                }
             }
             Err(err) => {
                 daemon_status.error = Some(format!("selection request failed: {}", err));
+                debug!("Worker selection request failed: {}", err);
             }
         }
     }

@@ -378,7 +378,12 @@ mod tests {
         }
     }
 
-    fn make_history(id: &str, command: &str, worker: Option<&str>, success: bool) -> HistoricalBuild {
+    fn make_history(
+        id: &str,
+        command: &str,
+        worker: Option<&str>,
+        success: bool,
+    ) -> HistoricalBuild {
         HistoricalBuild {
             id: id.to_string(),
             command: command.to_string(),

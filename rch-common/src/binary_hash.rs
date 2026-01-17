@@ -7,10 +7,10 @@
 use anyhow::{Context, Result, anyhow};
 use blake3::Hasher;
 use object::{Object, ObjectSection};
+use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::Path;
-use serde::{Deserialize, Serialize};
 use tracing::info;
 
 /// Result of computing hashes for a binary file.
@@ -234,8 +234,8 @@ mod tests {
             "target/debug/rch",
             "target/release/rchd",
             "target/debug/rchd",
-            "/bin/ls",    // Fallback to system binary
-            "/bin/cat",   // Another fallback
+            "/bin/ls",  // Fallback to system binary
+            "/bin/cat", // Another fallback
             "/usr/bin/ls",
         ];
 
@@ -310,7 +310,10 @@ mod tests {
         let result = binaries_equivalent(&local, &remote);
         info!("RESULT: binaries_equivalent = {}", result);
 
-        assert!(result, "Binaries with matching code hash should be equivalent");
+        assert!(
+            result,
+            "Binaries with matching code hash should be equivalent"
+        );
         info!("VERIFY: Binaries with matching code hash are equivalent");
         info!("TEST PASS: test_binaries_equivalent_matching");
     }
@@ -341,7 +344,10 @@ mod tests {
         let result = binaries_equivalent(&local, &remote);
         info!("RESULT: binaries_equivalent = {}", result);
 
-        assert!(!result, "Binaries with different code hash should not be equivalent");
+        assert!(
+            !result,
+            "Binaries with different code hash should not be equivalent"
+        );
         info!("VERIFY: Different code hash makes binaries non-equivalent");
         info!("TEST PASS: test_binaries_not_equivalent_different_code_hash");
     }
@@ -372,7 +378,10 @@ mod tests {
         let result = binaries_equivalent(&local, &remote);
         info!("RESULT: binaries_equivalent = {}", result);
 
-        assert!(!result, "Binaries with different text size should not be equivalent");
+        assert!(
+            !result,
+            "Binaries with different text size should not be equivalent"
+        );
         info!("VERIFY: Different text section size makes binaries non-equivalent");
         info!("TEST PASS: test_binaries_not_equivalent_different_size");
     }
@@ -403,7 +412,10 @@ mod tests {
         let result = binaries_equivalent(&local, &remote);
         info!("RESULT: binaries_equivalent = {}", result);
 
-        assert!(!result, "Binaries with different debug status should not be equivalent");
+        assert!(
+            !result,
+            "Binaries with different debug status should not be equivalent"
+        );
         info!("VERIFY: Different debug status makes binaries non-equivalent");
         info!("TEST PASS: test_binaries_not_equivalent_different_debug_status");
     }
@@ -469,9 +481,20 @@ mod tests {
         info!("RESULT: is_debug={}", result.is_debug);
 
         // BLAKE3 produces 64-character hex string
-        assert_eq!(result.full_hash.len(), 64, "Full hash should be 64 hex chars");
-        assert_eq!(result.code_hash.len(), 64, "Code hash should be 64 hex chars");
-        assert!(result.text_section_size > 0, "Text section should have content");
+        assert_eq!(
+            result.full_hash.len(),
+            64,
+            "Full hash should be 64 hex chars"
+        );
+        assert_eq!(
+            result.code_hash.len(),
+            64,
+            "Code hash should be 64 hex chars"
+        );
+        assert!(
+            result.text_section_size > 0,
+            "Text section should have content"
+        );
 
         info!("VERIFY: All fields have valid values");
         info!("TEST PASS: test_binary_hash_result_fields");
@@ -493,7 +516,10 @@ mod tests {
         // Look for a common string that should exist in any ELF binary
         // Most binaries contain "ELF" or common library strings
         let marker = "ELF";
-        info!("INPUT: binary_contains_marker({:?}, '{}')", binary_path, marker);
+        info!(
+            "INPUT: binary_contains_marker({:?}, '{}')",
+            binary_path, marker
+        );
 
         let result = binary_contains_marker(&binary_path, marker).unwrap();
         info!("RESULT: contains_marker = {}", result);
@@ -519,7 +545,10 @@ mod tests {
 
         // Look for a unique string that should NOT exist in any binary
         let marker = "RCH_TEST_MARKER_UNIQUE_12345_XYZ";
-        info!("INPUT: binary_contains_marker({:?}, '{}')", binary_path, marker);
+        info!(
+            "INPUT: binary_contains_marker({:?}, '{}')",
+            binary_path, marker
+        );
 
         let result = binary_contains_marker(&binary_path, marker).unwrap();
         info!("RESULT: contains_marker = {}", result);

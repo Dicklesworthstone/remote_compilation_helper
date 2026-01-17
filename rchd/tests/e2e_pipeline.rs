@@ -139,7 +139,9 @@ fn create_lib_project(harness: &TestHarness, name: &str) -> HarnessResult<PathBu
 #[test]
 fn test_cargo_build_release() {
     let harness = create_pipeline_harness("cargo_build_release").unwrap();
-    harness.logger.info("[e2e::pipeline] TEST START: test_cargo_build_release");
+    harness
+        .logger
+        .info("[e2e::pipeline] TEST START: test_cargo_build_release");
 
     // Setup project
     let project_dir = create_test_project(&harness, "test-project").unwrap();
@@ -153,7 +155,9 @@ fn test_cargo_build_release() {
     let socket_path = setup_daemon_with_workers(&harness, &workers).unwrap();
 
     harness.logger.info("[e2e::pipeline] SETUP: daemon_started");
-    harness.logger.info("[e2e::pipeline] SETUP: worker=worker1 slots=4");
+    harness
+        .logger
+        .info("[e2e::pipeline] SETUP: worker=worker1 slots=4");
 
     // Start daemon
     start_daemon(&harness, &socket_path, &[]).unwrap();
@@ -161,8 +165,12 @@ fn test_cargo_build_release() {
         .wait_for_socket(&socket_path, Duration::from_secs(10))
         .unwrap();
 
-    harness.logger.info("[e2e::pipeline] ──────────────────────────────────");
-    harness.logger.info("[e2e::pipeline] EXEC: cargo build --release (simulated via API)");
+    harness
+        .logger
+        .info("[e2e::pipeline] ──────────────────────────────────");
+    harness
+        .logger
+        .info("[e2e::pipeline] EXEC: cargo build --release (simulated via API)");
 
     // Simulate hook intercepting the command by selecting a worker
     let response = send_socket_request(
@@ -173,14 +181,22 @@ fn test_cargo_build_release() {
 
     assert!(response.contains("200 OK"), "Got: {}", response);
     let body = extract_json_body(&response).unwrap();
-    harness.logger.info(format!("[e2e::pipeline] DAEMON: worker_selected {}", body));
+    harness
+        .logger
+        .info(format!("[e2e::pipeline] DAEMON: worker_selected {}", body));
 
     // Verify daemon responds correctly
     assert!(body.contains("reason"), "Expected selection reason");
 
-    harness.logger.info("[e2e::pipeline] ──────────────────────────────────");
-    harness.logger.info("[e2e::pipeline] VERIFY: pipeline_flow_correct=true");
-    harness.logger.info("[e2e::pipeline] TEST PASS: test_cargo_build_release");
+    harness
+        .logger
+        .info("[e2e::pipeline] ──────────────────────────────────");
+    harness
+        .logger
+        .info("[e2e::pipeline] VERIFY: pipeline_flow_correct=true");
+    harness
+        .logger
+        .info("[e2e::pipeline] TEST PASS: test_cargo_build_release");
     harness.mark_passed();
 }
 
@@ -188,7 +204,9 @@ fn test_cargo_build_release() {
 #[test]
 fn test_cargo_test() {
     let harness = create_pipeline_harness("cargo_test").unwrap();
-    harness.logger.info("[e2e::pipeline] TEST START: test_cargo_test");
+    harness
+        .logger
+        .info("[e2e::pipeline] TEST START: test_cargo_test");
 
     // Create library project with tests
     let project_dir = create_lib_project(&harness, "test-lib").unwrap();
@@ -206,7 +224,9 @@ fn test_cargo_test() {
         .wait_for_socket(&socket_path, Duration::from_secs(10))
         .unwrap();
 
-    harness.logger.info("[e2e::pipeline] EXEC: cargo test (simulated via API)");
+    harness
+        .logger
+        .info("[e2e::pipeline] EXEC: cargo test (simulated via API)");
 
     // Select worker for test run
     let response = send_socket_request(
@@ -217,8 +237,12 @@ fn test_cargo_test() {
 
     assert!(response.contains("200 OK"), "Got: {}", response);
 
-    harness.logger.info("[e2e::pipeline] VERIFY: test_command_handled=true");
-    harness.logger.info("[e2e::pipeline] TEST PASS: test_cargo_test");
+    harness
+        .logger
+        .info("[e2e::pipeline] VERIFY: test_command_handled=true");
+    harness
+        .logger
+        .info("[e2e::pipeline] TEST PASS: test_cargo_test");
     harness.mark_passed();
 }
 
@@ -226,7 +250,9 @@ fn test_cargo_test() {
 #[test]
 fn test_incremental_build() {
     let harness = create_pipeline_harness("incremental_build").unwrap();
-    harness.logger.info("[e2e::pipeline] TEST START: test_incremental_build");
+    harness
+        .logger
+        .info("[e2e::pipeline] TEST START: test_incremental_build");
 
     let project_dir = create_test_project(&harness, "incremental-project").unwrap();
     harness.logger.info(format!(
@@ -243,7 +269,9 @@ fn test_incremental_build() {
         .wait_for_socket(&socket_path, Duration::from_secs(10))
         .unwrap();
 
-    harness.logger.info("[e2e::pipeline] PHASE 1: Initial build");
+    harness
+        .logger
+        .info("[e2e::pipeline] PHASE 1: Initial build");
 
     // First build
     let response1 = send_socket_request(
@@ -253,7 +281,9 @@ fn test_incremental_build() {
     .unwrap();
     assert!(response1.contains("200 OK"), "First: {}", response1);
 
-    harness.logger.info("[e2e::pipeline] PHASE 2: Incremental build after modification");
+    harness
+        .logger
+        .info("[e2e::pipeline] PHASE 2: Incremental build after modification");
 
     // Simulate file modification (in real test, we'd modify src/main.rs)
     // For now, just verify the daemon handles subsequent requests
@@ -264,8 +294,12 @@ fn test_incremental_build() {
     .unwrap();
     assert!(response2.contains("200 OK"), "Second: {}", response2);
 
-    harness.logger.info("[e2e::pipeline] VERIFY: incremental_builds_work=true");
-    harness.logger.info("[e2e::pipeline] TEST PASS: test_incremental_build");
+    harness
+        .logger
+        .info("[e2e::pipeline] VERIFY: incremental_builds_work=true");
+    harness
+        .logger
+        .info("[e2e::pipeline] TEST PASS: test_incremental_build");
     harness.mark_passed();
 }
 
@@ -273,7 +307,9 @@ fn test_incremental_build() {
 #[test]
 fn test_build_failure() {
     let harness = create_pipeline_harness("build_failure").unwrap();
-    harness.logger.info("[e2e::pipeline] TEST START: test_build_failure");
+    harness
+        .logger
+        .info("[e2e::pipeline] TEST START: test_build_failure");
 
     // Create a project with intentional compile error
     let project_dir = harness.test_dir().join("broken-project");
@@ -296,7 +332,9 @@ edition = "2024"
     )
     .unwrap();
 
-    harness.logger.info("[e2e::pipeline] SETUP: project with intentional compile error");
+    harness
+        .logger
+        .info("[e2e::pipeline] SETUP: project with intentional compile error");
 
     // Setup daemon
     let workers = WorkersFixture::mock_local(1);
@@ -316,8 +354,12 @@ edition = "2024"
 
     assert!(response.contains("200 OK"), "Got: {}", response);
 
-    harness.logger.info("[e2e::pipeline] VERIFY: daemon_handles_failure=true");
-    harness.logger.info("[e2e::pipeline] TEST PASS: test_build_failure");
+    harness
+        .logger
+        .info("[e2e::pipeline] VERIFY: daemon_handles_failure=true");
+    harness
+        .logger
+        .info("[e2e::pipeline] TEST PASS: test_build_failure");
     harness.mark_passed();
 }
 
@@ -325,7 +367,9 @@ edition = "2024"
 #[test]
 fn test_rchignore_handling() {
     let harness = create_pipeline_harness("rchignore_handling").unwrap();
-    harness.logger.info("[e2e::pipeline] TEST START: test_rchignore_handling");
+    harness
+        .logger
+        .info("[e2e::pipeline] TEST START: test_rchignore_handling");
 
     let project_dir = create_test_project(&harness, "ignore-project").unwrap();
 
@@ -345,8 +389,12 @@ node_modules/
     std::fs::write(project_dir.join("target/debug/dummy"), "large binary").unwrap();
     std::fs::write(project_dir.join("build.log"), "log data").unwrap();
 
-    harness.logger.info("[e2e::pipeline] SETUP: .rchignore configured");
-    harness.logger.info("[e2e::pipeline] SETUP: created target/ and *.log files");
+    harness
+        .logger
+        .info("[e2e::pipeline] SETUP: .rchignore configured");
+    harness
+        .logger
+        .info("[e2e::pipeline] SETUP: created target/ and *.log files");
 
     // Setup daemon
     let workers = WorkersFixture::mock_local(1);
@@ -361,8 +409,12 @@ node_modules/
     let response = send_socket_request(&socket_path, "GET /health").unwrap();
     assert!(response.contains("200 OK"), "Got: {}", response);
 
-    harness.logger.info("[e2e::pipeline] VERIFY: rchignore_respected=true");
-    harness.logger.info("[e2e::pipeline] TEST PASS: test_rchignore_handling");
+    harness
+        .logger
+        .info("[e2e::pipeline] VERIFY: rchignore_respected=true");
+    harness
+        .logger
+        .info("[e2e::pipeline] TEST PASS: test_rchignore_handling");
     harness.mark_passed();
 }
 
@@ -370,7 +422,9 @@ node_modules/
 #[test]
 fn test_large_project() {
     let harness = create_pipeline_harness("large_project").unwrap();
-    harness.logger.info("[e2e::pipeline] TEST START: test_large_project");
+    harness
+        .logger
+        .info("[e2e::pipeline] TEST START: test_large_project");
 
     let project_dir = create_test_project(&harness, "large-project").unwrap();
 
@@ -384,7 +438,9 @@ fn test_large_project() {
         .unwrap();
     }
 
-    harness.logger.info("[e2e::pipeline] SETUP: created 50+ source files");
+    harness
+        .logger
+        .info("[e2e::pipeline] SETUP: created 50+ source files");
 
     // Setup daemon
     let workers = WorkersFixture::mock_local(1);
@@ -417,8 +473,12 @@ fn test_large_project() {
         elapsed
     );
 
-    harness.logger.info("[e2e::pipeline] VERIFY: large_project_handled=true");
-    harness.logger.info("[e2e::pipeline] TEST PASS: test_large_project");
+    harness
+        .logger
+        .info("[e2e::pipeline] VERIFY: large_project_handled=true");
+    harness
+        .logger
+        .info("[e2e::pipeline] TEST PASS: test_large_project");
     harness.mark_passed();
 }
 
@@ -426,7 +486,9 @@ fn test_large_project() {
 #[test]
 fn test_symlink_handling() {
     let harness = create_pipeline_harness("symlink_handling").unwrap();
-    harness.logger.info("[e2e::pipeline] TEST START: test_symlink_handling");
+    harness
+        .logger
+        .info("[e2e::pipeline] TEST START: test_symlink_handling");
 
     let project_dir = create_test_project(&harness, "symlink-project").unwrap();
 
@@ -440,9 +502,13 @@ fn test_symlink_handling() {
     #[cfg(unix)]
     {
         if std::os::unix::fs::symlink(&shared_dir, &symlink_path).is_ok() {
-            harness.logger.info("[e2e::pipeline] SETUP: created symlink");
+            harness
+                .logger
+                .info("[e2e::pipeline] SETUP: created symlink");
         } else {
-            harness.logger.info("[e2e::pipeline] SETUP: symlink creation failed (expected on some systems)");
+            harness
+                .logger
+                .info("[e2e::pipeline] SETUP: symlink creation failed (expected on some systems)");
         }
     }
 
@@ -458,8 +524,12 @@ fn test_symlink_handling() {
     let response = send_socket_request(&socket_path, "GET /health").unwrap();
     assert!(response.contains("200 OK"), "Got: {}", response);
 
-    harness.logger.info("[e2e::pipeline] VERIFY: symlinks_handled=true");
-    harness.logger.info("[e2e::pipeline] TEST PASS: test_symlink_handling");
+    harness
+        .logger
+        .info("[e2e::pipeline] VERIFY: symlinks_handled=true");
+    harness
+        .logger
+        .info("[e2e::pipeline] TEST PASS: test_symlink_handling");
     harness.mark_passed();
 }
 
@@ -467,13 +537,17 @@ fn test_symlink_handling() {
 #[test]
 fn test_parallel_builds() {
     let harness = create_pipeline_harness("parallel_builds").unwrap();
-    harness.logger.info("[e2e::pipeline] TEST START: test_parallel_builds");
+    harness
+        .logger
+        .info("[e2e::pipeline] TEST START: test_parallel_builds");
 
     // Create two projects
     let _project1 = create_test_project(&harness, "project1").unwrap();
     let _project2 = create_test_project(&harness, "project2").unwrap();
 
-    harness.logger.info("[e2e::pipeline] SETUP: created two projects");
+    harness
+        .logger
+        .info("[e2e::pipeline] SETUP: created two projects");
 
     // Setup daemon with multiple workers
     let workers = WorkersFixture::mock_local(2);
@@ -489,11 +563,17 @@ fn test_parallel_builds() {
     let socket2 = socket_path.clone();
 
     let handle1 = std::thread::spawn(move || {
-        send_socket_request(&socket1, "GET /select-worker?project=project1&cores=2&runtime=rust")
+        send_socket_request(
+            &socket1,
+            "GET /select-worker?project=project1&cores=2&runtime=rust",
+        )
     });
 
     let handle2 = std::thread::spawn(move || {
-        send_socket_request(&socket2, "GET /select-worker?project=project2&cores=2&runtime=rust")
+        send_socket_request(
+            &socket2,
+            "GET /select-worker?project=project2&cores=2&runtime=rust",
+        )
     });
 
     let result1 = handle1.join().unwrap();
@@ -505,8 +585,12 @@ fn test_parallel_builds() {
     assert!(result1.unwrap().contains("200 OK"), "Project1 not OK");
     assert!(result2.unwrap().contains("200 OK"), "Project2 not OK");
 
-    harness.logger.info("[e2e::pipeline] VERIFY: parallel_builds_work=true");
-    harness.logger.info("[e2e::pipeline] TEST PASS: test_parallel_builds");
+    harness
+        .logger
+        .info("[e2e::pipeline] VERIFY: parallel_builds_work=true");
+    harness
+        .logger
+        .info("[e2e::pipeline] TEST PASS: test_parallel_builds");
     harness.mark_passed();
 }
 
@@ -518,7 +602,9 @@ fn test_parallel_builds() {
 #[test]
 fn test_interrupted_transfer() {
     let harness = create_pipeline_harness("interrupted_transfer").unwrap();
-    harness.logger.info("[e2e::pipeline] TEST START: test_interrupted_transfer");
+    harness
+        .logger
+        .info("[e2e::pipeline] TEST START: test_interrupted_transfer");
 
     let _project = create_test_project(&harness, "interrupt-project").unwrap();
 
@@ -534,8 +620,12 @@ fn test_interrupted_transfer() {
     let response = send_socket_request(&socket_path, "GET /status").unwrap();
     assert!(response.contains("200 OK"), "Got: {}", response);
 
-    harness.logger.info("[e2e::pipeline] VERIFY: error_recovery_works=true");
-    harness.logger.info("[e2e::pipeline] TEST PASS: test_interrupted_transfer");
+    harness
+        .logger
+        .info("[e2e::pipeline] VERIFY: error_recovery_works=true");
+    harness
+        .logger
+        .info("[e2e::pipeline] TEST PASS: test_interrupted_transfer");
     harness.mark_passed();
 }
 
@@ -543,7 +633,9 @@ fn test_interrupted_transfer() {
 #[test]
 fn test_worker_crash_handling() {
     let harness = create_pipeline_harness("worker_crash").unwrap();
-    harness.logger.info("[e2e::pipeline] TEST START: test_worker_crash_handling");
+    harness
+        .logger
+        .info("[e2e::pipeline] TEST START: test_worker_crash_handling");
 
     let _project = create_test_project(&harness, "crash-project").unwrap();
 
@@ -559,8 +651,12 @@ fn test_worker_crash_handling() {
     let response = send_socket_request(&socket_path, "GET /health").unwrap();
     assert!(response.contains("200 OK"), "Got: {}", response);
 
-    harness.logger.info("[e2e::pipeline] VERIFY: crash_handling_works=true");
-    harness.logger.info("[e2e::pipeline] TEST PASS: test_worker_crash_handling");
+    harness
+        .logger
+        .info("[e2e::pipeline] VERIFY: crash_handling_works=true");
+    harness
+        .logger
+        .info("[e2e::pipeline] TEST PASS: test_worker_crash_handling");
     harness.mark_passed();
 }
 
@@ -568,7 +664,9 @@ fn test_worker_crash_handling() {
 #[test]
 fn test_concurrent_same_project() {
     let harness = create_pipeline_harness("concurrent_same_project").unwrap();
-    harness.logger.info("[e2e::pipeline] TEST START: test_concurrent_same_project");
+    harness
+        .logger
+        .info("[e2e::pipeline] TEST START: test_concurrent_same_project");
 
     let _project = create_test_project(&harness, "shared-project").unwrap();
 
@@ -608,8 +706,12 @@ fn test_concurrent_same_project() {
     assert!(result1.is_ok(), "Request1 failed: {:?}", result1.err());
     assert!(result2.is_ok(), "Request2 failed: {:?}", result2.err());
 
-    harness.logger.info("[e2e::pipeline] VERIFY: concurrent_same_project_safe=true");
-    harness.logger.info("[e2e::pipeline] TEST PASS: test_concurrent_same_project");
+    harness
+        .logger
+        .info("[e2e::pipeline] VERIFY: concurrent_same_project_safe=true");
+    harness
+        .logger
+        .info("[e2e::pipeline] TEST PASS: test_concurrent_same_project");
     harness.mark_passed();
 }
 
@@ -617,7 +719,9 @@ fn test_concurrent_same_project() {
 #[test]
 fn test_graceful_degradation() {
     let harness = create_pipeline_harness("graceful_degradation").unwrap();
-    harness.logger.info("[e2e::pipeline] TEST START: test_graceful_degradation");
+    harness
+        .logger
+        .info("[e2e::pipeline] TEST START: test_graceful_degradation");
 
     let _project = create_test_project(&harness, "degrade-project").unwrap();
 
@@ -634,7 +738,11 @@ fn test_graceful_degradation() {
     let response = send_socket_request(&socket_path, "GET /ready").unwrap();
     assert!(response.contains("200 OK"), "Got: {}", response);
 
-    harness.logger.info("[e2e::pipeline] VERIFY: graceful_degradation_works=true");
-    harness.logger.info("[e2e::pipeline] TEST PASS: test_graceful_degradation");
+    harness
+        .logger
+        .info("[e2e::pipeline] VERIFY: graceful_degradation_works=true");
+    harness
+        .logger
+        .info("[e2e::pipeline] TEST PASS: test_graceful_degradation");
     harness.mark_passed();
 }

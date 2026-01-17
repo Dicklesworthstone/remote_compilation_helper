@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tokio::process::Command;
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 
 use crate::binary_hash::{BinaryHashResult, binaries_equivalent, compute_binary_hash};
 use crate::test_change::{TestChangeGuard, TestCodeChange};
@@ -104,7 +104,8 @@ impl RemoteCompilationTest {
     /// Get the path to the local binary after building.
     fn local_binary_path(&self) -> PathBuf {
         // Assuming this is a Rust project with a binary of the same name as the directory
-        let project_name = self.test_project
+        let project_name = self
+            .test_project
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("test_project");
@@ -113,16 +114,20 @@ impl RemoteCompilationTest {
 
     /// Get the path to the remote binary after syncing back.
     fn remote_binary_path(&self) -> PathBuf {
-        let project_name = self.test_project
+        let project_name = self
+            .test_project
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("test_project");
-        self.test_project.join("target/release_remote").join(project_name)
+        self.test_project
+            .join("target/release_remote")
+            .join(project_name)
     }
 
     /// Get the remote project path on the worker.
     fn remote_project_path(&self) -> PathBuf {
-        let project_name = self.test_project
+        let project_name = self
+            .test_project
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("test_project");
@@ -142,40 +147,46 @@ impl RemoteCompilationTest {
 
     /// Build rsync args with optional identity file.
     fn rsync_ssh_option(&self) -> Option<String> {
-        self.worker.identity_file.as_ref().map(|identity| {
-            format!("ssh -o BatchMode=yes -i {}", identity.to_string_lossy())
-        })
+        self.worker
+            .identity_file
+            .as_ref()
+            .map(|identity| format!("ssh -o BatchMode=yes -i {}", identity.to_string_lossy()))
     }
 
     /// Run the full remote compilation verification test.
     pub async fn run(&mut self) -> Result<VerificationResult> {
         let start = Instant::now();
-        info!("Starting remote compilation verification for worker {}", self.worker.id);
+        info!(
+            "Starting remote compilation verification for worker {}",
+            self.worker.id
+        );
 
         // 1. Apply test change to make binary unique
         let change = TestCodeChange::for_main_rs(&self.test_project)
             .context("Failed to create test code change")?;
-        let guard = TestChangeGuard::new(change)
-            .context("Failed to apply test change")?;
+        let guard = TestChangeGuard::new(change).context("Failed to apply test change")?;
         info!("Applied test change: {}", guard.change_id());
 
         // 2. Build locally first
         info!("Building locally for reference hash");
         let local_build_start = Instant::now();
-        self.build_local().await
-            .context("Local build failed")?;
+        self.build_local().await.context("Local build failed")?;
         let local_compilation_ms = local_build_start.elapsed().as_millis() as u64;
         self.local_compilation_ms = Some(local_compilation_ms);
 
         let local_hash = compute_binary_hash(&self.local_binary_path())
             .context("Failed to compute local binary hash")?;
-        info!("Local build complete in {}ms: hash={}",
-              local_compilation_ms, &local_hash.code_hash[..16]);
+        info!(
+            "Local build complete in {}ms: hash={}",
+            local_compilation_ms,
+            &local_hash.code_hash[..16]
+        );
 
         // 3. rsync up to worker
         info!("Syncing source to worker {}", self.worker.id);
         let rsync_up_start = Instant::now();
-        self.rsync_to_worker().await
+        self.rsync_to_worker()
+            .await
             .context("Failed to rsync to worker")?;
         let rsync_up_ms = rsync_up_start.elapsed().as_millis() as u64;
         info!("Source synced to worker in {}ms", rsync_up_ms);
@@ -183,15 +194,15 @@ impl RemoteCompilationTest {
         // 4. Build on worker
         info!("Building on remote worker");
         let compile_start = Instant::now();
-        self.build_remote().await
-            .context("Remote build failed")?;
+        self.build_remote().await.context("Remote build failed")?;
         let compilation_ms = compile_start.elapsed().as_millis() as u64;
         info!("Remote build complete in {}ms", compilation_ms);
 
         // 5. rsync back
         info!("Syncing artifacts from worker");
         let rsync_down_start = Instant::now();
-        self.rsync_from_worker().await
+        self.rsync_from_worker()
+            .await
             .context("Failed to rsync from worker")?;
         let rsync_down_ms = rsync_down_start.elapsed().as_millis() as u64;
         info!("Artifacts synced back in {}ms", rsync_down_ms);
@@ -262,9 +273,12 @@ impl RemoteCompilationTest {
 
         let mut cmd = Command::new("rsync");
         cmd.args([
-            "-az", "--delete",
-            "--exclude", "target/",
-            "--exclude", ".git/",
+            "-az",
+            "--delete",
+            "--exclude",
+            "target/",
+            "--exclude",
+            ".git/",
         ]);
 
         if let Some(ssh_option) = self.rsync_ssh_option() {
@@ -275,8 +289,7 @@ impl RemoteCompilationTest {
         cmd.arg(&remote_path);
 
         info!("Running rsync to {}", remote_path);
-        let output = cmd.output().await
-            .context("Failed to execute rsync")?;
+        let output = cmd.output().await.context("Failed to execute rsync")?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -288,10 +301,7 @@ impl RemoteCompilationTest {
     /// Build the project on the remote worker.
     async fn build_remote(&self) -> Result<()> {
         let remote_project = self.remote_project_path();
-        let build_cmd = format!(
-            "cd {} && cargo build --release",
-            remote_project.display()
-        );
+        let build_cmd = format!("cd {} && cargo build --release", remote_project.display());
 
         let mut cmd = Command::new("ssh");
         for arg in self.ssh_args() {
@@ -299,8 +309,13 @@ impl RemoteCompilationTest {
         }
         cmd.arg(&build_cmd);
 
-        info!("Running remote build: ssh {} '{}'", self.worker.ssh_host, build_cmd);
-        let output = cmd.output().await
+        info!(
+            "Running remote build: ssh {} '{}'",
+            self.worker.ssh_host, build_cmd
+        );
+        let output = cmd
+            .output()
+            .await
             .context("Failed to execute remote build")?;
 
         if !output.status.success() {
@@ -334,8 +349,7 @@ impl RemoteCompilationTest {
         cmd.arg(format!("{}/", local_target.display()));
 
         info!("Running rsync from {}", remote_target);
-        let output = cmd.output().await
-            .context("Failed to execute rsync")?;
+        let output = cmd.output().await.context("Failed to execute rsync")?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -356,7 +370,9 @@ impl RemoteCompilationTest {
         cmd.arg(&cleanup_cmd);
 
         info!("Cleaning up remote: {}", cleanup_cmd);
-        let output = cmd.output().await
+        let output = cmd
+            .output()
+            .await
             .context("Failed to execute remote cleanup")?;
 
         if !output.status.success() {
@@ -377,7 +393,9 @@ pub async fn verify_ssh_connectivity(worker: &VerificationWorkerConfig) -> Resul
     cmd.arg(&worker.ssh_host);
     cmd.arg("echo ok");
 
-    let output = cmd.output().await
+    let output = cmd
+        .output()
+        .await
         .context("Failed to execute SSH connectivity test")?;
 
     Ok(output.status.success())
@@ -393,7 +411,9 @@ pub async fn verify_rsync_available(worker: &VerificationWorkerConfig) -> Result
     cmd.arg(&worker.ssh_host);
     cmd.arg("which rsync");
 
-    let output = cmd.output().await
+    let output = cmd
+        .output()
+        .await
         .context("Failed to check rsync availability")?;
 
     Ok(output.status.success())
@@ -409,7 +429,9 @@ pub async fn verify_cargo_available(worker: &VerificationWorkerConfig) -> Result
     cmd.arg(&worker.ssh_host);
     cmd.arg("which cargo");
 
-    let output = cmd.output().await
+    let output = cmd
+        .output()
+        .await
         .context("Failed to check cargo availability")?;
 
     Ok(output.status.success())
@@ -438,7 +460,10 @@ mod tests {
             build_dir: PathBuf::from("/tmp/rch_builds"),
         };
 
-        info!("INPUT: VerificationWorkerConfig with id={}, host={}", worker.id, worker.ssh_host);
+        info!(
+            "INPUT: VerificationWorkerConfig with id={}, host={}",
+            worker.id, worker.ssh_host
+        );
 
         assert_eq!(worker.id, "test-worker");
         assert_eq!(worker.ssh_host, "user@192.168.1.100");
@@ -526,7 +551,10 @@ mod tests {
         info!("INPUT: test_project=/tmp/my_project");
         info!("RESULT: local_binary_path={:?}", path);
 
-        assert_eq!(path, PathBuf::from("/tmp/my_project/target/release/my_project"));
+        assert_eq!(
+            path,
+            PathBuf::from("/tmp/my_project/target/release/my_project")
+        );
 
         info!("VERIFY: Local binary path constructed correctly");
         info!("TEST PASS: test_local_binary_path");
@@ -550,7 +578,10 @@ mod tests {
         info!("INPUT: test_project=/tmp/my_project");
         info!("RESULT: remote_binary_path={:?}", path);
 
-        assert_eq!(path, PathBuf::from("/tmp/my_project/target/release_remote/my_project"));
+        assert_eq!(
+            path,
+            PathBuf::from("/tmp/my_project/target/release_remote/my_project")
+        );
 
         info!("VERIFY: Remote binary path constructed correctly");
         info!("TEST PASS: test_remote_binary_path");

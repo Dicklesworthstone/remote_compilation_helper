@@ -569,10 +569,7 @@ fn render_copy_feedback(frame: &mut Frame, colors: &ColorScheme) {
     let feedback_area = Rect::new(x, 1, width, 1);
     let visible = &message[..width as usize];
 
-    let feedback = Paragraph::new(Span::styled(
-        visible,
-        Style::default().fg(colors.success),
-    ));
+    let feedback = Paragraph::new(Span::styled(visible, Style::default().fg(colors.success)));
 
     frame.render_widget(feedback, feedback_area);
 }
@@ -713,9 +710,9 @@ mod tests {
         TuiState, WorkerState, WorkerStatus,
     };
     use chrono::Utc;
+    use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
-    use ratatui::Terminal;
     use tracing::info;
 
     fn init_test_logging() {
@@ -833,26 +830,30 @@ mod tests {
             },
             ..Default::default()
         };
-        state.build_history.push_back(crate::tui::state::HistoricalBuild {
-            id: "h1".to_string(),
-            command: "cargo build".to_string(),
-            worker: Some("worker-1".to_string()),
-            started_at: Utc::now(),
-            completed_at: Utc::now(),
-            duration_ms: 1200,
-            success: true,
-            exit_code: Some(0),
-        });
-        state.build_history.push_back(crate::tui::state::HistoricalBuild {
-            id: "h2".to_string(),
-            command: "cargo test".to_string(),
-            worker: Some("worker-2".to_string()),
-            started_at: Utc::now(),
-            completed_at: Utc::now(),
-            duration_ms: 1500,
-            success: false,
-            exit_code: Some(1),
-        });
+        state
+            .build_history
+            .push_back(crate::tui::state::HistoricalBuild {
+                id: "h1".to_string(),
+                command: "cargo build".to_string(),
+                worker: Some("worker-1".to_string()),
+                started_at: Utc::now(),
+                completed_at: Utc::now(),
+                duration_ms: 1200,
+                success: true,
+                exit_code: Some(0),
+            });
+        state
+            .build_history
+            .push_back(crate::tui::state::HistoricalBuild {
+                id: "h2".to_string(),
+                command: "cargo test".to_string(),
+                worker: Some("worker-2".to_string()),
+                started_at: Utc::now(),
+                completed_at: Utc::now(),
+                duration_ms: 1500,
+                success: false,
+                exit_code: Some(1),
+            });
         let content = render_to_string(80, 10, |f| {
             let colors = get_colors(false);
             render_build_history_panel(f, Rect::new(0, 0, 80, 10), &state, &colors);

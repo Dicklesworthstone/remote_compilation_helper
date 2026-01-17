@@ -127,8 +127,7 @@ impl RemoteCompilationTest {
 
         info!(
             "Starting remote compilation verification for {:?} on worker {}",
-            self.test_project,
-            self.worker.id
+            self.test_project, self.worker.id
         );
 
         // 1. Apply test change to make binary unique
@@ -155,7 +154,9 @@ impl RemoteCompilationTest {
         // 3. rsync up to worker
         info!("Syncing source to worker {}", self.worker.id);
         let rsync_up_start = Instant::now();
-        self.rsync_to_worker().await.context("rsync to worker failed")?;
+        self.rsync_to_worker()
+            .await
+            .context("rsync to worker failed")?;
         let rsync_up_ms = rsync_up_start.elapsed().as_millis() as u64;
         info!("rsync upload complete in {}ms", rsync_up_ms);
 
@@ -169,7 +170,9 @@ impl RemoteCompilationTest {
         // 5. rsync back
         info!("Syncing artifacts from worker");
         let rsync_down_start = Instant::now();
-        self.rsync_from_worker().await.context("rsync from worker failed")?;
+        self.rsync_from_worker()
+            .await
+            .context("rsync from worker failed")?;
         let rsync_down_ms = rsync_down_start.elapsed().as_millis() as u64;
         info!("rsync download complete in {}ms", rsync_down_ms);
 
@@ -212,14 +215,25 @@ impl RemoteCompilationTest {
     /// Get the path to the local binary after build.
     fn local_binary_path(&self) -> PathBuf {
         let binary_name = self.get_binary_name();
-        let profile = if self.release_mode { "release" } else { "debug" };
-        self.test_project.join("target").join(profile).join(binary_name)
+        let profile = if self.release_mode {
+            "release"
+        } else {
+            "debug"
+        };
+        self.test_project
+            .join("target")
+            .join(profile)
+            .join(binary_name)
     }
 
     /// Get the path where remote binary will be stored locally after retrieval.
     fn remote_binary_path(&self) -> PathBuf {
         let binary_name = self.get_binary_name();
-        let profile = if self.release_mode { "release" } else { "debug" };
+        let profile = if self.release_mode {
+            "release"
+        } else {
+            "debug"
+        };
         self.test_project
             .join("target")
             .join(format!("{}_remote", profile))
@@ -261,9 +275,15 @@ impl RemoteCompilationTest {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        debug!("Running local build: cargo build {}", if self.release_mode { "--release" } else { "" });
+        debug!(
+            "Running local build: cargo build {}",
+            if self.release_mode { "--release" } else { "" }
+        );
 
-        let output = cmd.output().await.context("Failed to execute cargo build")?;
+        let output = cmd
+            .output()
+            .await
+            .context("Failed to execute cargo build")?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -314,7 +334,10 @@ impl RemoteCompilationTest {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        debug!("Running rsync to worker: {:?}", cmd.as_std().get_args().collect::<Vec<_>>());
+        debug!(
+            "Running rsync to worker: {:?}",
+            cmd.as_std().get_args().collect::<Vec<_>>()
+        );
 
         let output = cmd.output().await.context("Failed to execute rsync")?;
 
@@ -351,7 +374,11 @@ impl RemoteCompilationTest {
         client.disconnect().await?;
 
         if !result.success() {
-            bail!("Remote build failed (exit {}): {}", result.exit_code, result.stderr);
+            bail!(
+                "Remote build failed (exit {}): {}",
+                result.exit_code,
+                result.stderr
+            );
         }
 
         Ok(())
@@ -360,10 +387,17 @@ impl RemoteCompilationTest {
     /// Sync build artifacts from the worker via rsync.
     async fn rsync_from_worker(&self) -> Result<()> {
         let remote_path = self.remote_project_path();
-        let profile = if self.release_mode { "release" } else { "debug" };
+        let profile = if self.release_mode {
+            "release"
+        } else {
+            "debug"
+        };
 
         // Create local destination directory for remote artifacts
-        let local_dest = self.test_project.join("target").join(format!("{}_remote", profile));
+        let local_dest = self
+            .test_project
+            .join("target")
+            .join(format!("{}_remote", profile));
         std::fs::create_dir_all(&local_dest)
             .with_context(|| format!("Failed to create directory: {:?}", local_dest))?;
 
@@ -387,7 +421,10 @@ impl RemoteCompilationTest {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        debug!("Running rsync from worker: {:?}", cmd.as_std().get_args().collect::<Vec<_>>());
+        debug!(
+            "Running rsync from worker: {:?}",
+            cmd.as_std().get_args().collect::<Vec<_>>()
+        );
 
         let output = cmd.output().await.context("Failed to retrieve artifacts")?;
 
@@ -563,8 +600,16 @@ mod tests {
         info!("RESULT: local_path={:?}", local_path);
         info!("RESULT: remote_path={:?}", remote_path);
 
-        assert!(local_path.to_string_lossy().contains("target/release/my_binary"));
-        assert!(remote_path.to_string_lossy().contains("target/release_remote/my_binary"));
+        assert!(
+            local_path
+                .to_string_lossy()
+                .contains("target/release/my_binary")
+        );
+        assert!(
+            remote_path
+                .to_string_lossy()
+                .contains("target/release_remote/my_binary")
+        );
 
         info!("VERIFY: Binary paths are correct for release mode");
         info!("TEST PASS: remote_compilation_test_binary_path_release");
@@ -594,8 +639,16 @@ mod tests {
         info!("RESULT: local_path={:?}", local_path);
         info!("RESULT: remote_path={:?}", remote_path);
 
-        assert!(local_path.to_string_lossy().contains("target/debug/my_binary"));
-        assert!(remote_path.to_string_lossy().contains("target/debug_remote/my_binary"));
+        assert!(
+            local_path
+                .to_string_lossy()
+                .contains("target/debug/my_binary")
+        );
+        assert!(
+            remote_path
+                .to_string_lossy()
+                .contains("target/debug_remote/my_binary")
+        );
 
         info!("VERIFY: Binary paths are correct for debug mode");
         info!("TEST PASS: remote_compilation_test_binary_path_debug");

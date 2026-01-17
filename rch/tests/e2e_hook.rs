@@ -10,7 +10,7 @@
 //! Uses the E2E test harness from rch-common.
 
 use rch_common::e2e::{HarnessResult, HookInputFixture, TestHarness, TestHarnessBuilder};
-use rch_common::{classify_command, classify_command_detailed, Classification, TierDecision};
+use rch_common::{Classification, TierDecision, classify_command, classify_command_detailed};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -117,23 +117,42 @@ fn classify_and_log(harness: &TestHarness, command: &str) -> Classification {
 fn test_hook_intercepts_cargo_build() {
     let harness = create_hook_harness("hook_intercepts_cargo_build").unwrap();
 
-    harness.logger.info("TEST START: test_hook_intercepts_cargo_build");
+    harness
+        .logger
+        .info("TEST START: test_hook_intercepts_cargo_build");
 
     // Test basic cargo build
     let result = classify_and_log(&harness, "cargo build");
-    harness.assert(result.is_compilation, "cargo build should be intercepted").unwrap();
-    assert!(result.confidence >= 0.95, "cargo build confidence should be >= 0.95");
+    harness
+        .assert(result.is_compilation, "cargo build should be intercepted")
+        .unwrap();
+    assert!(
+        result.confidence >= 0.95,
+        "cargo build confidence should be >= 0.95"
+    );
 
     // Test cargo build --release
     let result = classify_and_log(&harness, "cargo build --release");
-    harness.assert(result.is_compilation, "cargo build --release should be intercepted").unwrap();
+    harness
+        .assert(
+            result.is_compilation,
+            "cargo build --release should be intercepted",
+        )
+        .unwrap();
     assert!(result.confidence >= 0.95);
 
     // Test cargo build with target
     let result = classify_and_log(&harness, "cargo build --target x86_64-unknown-linux-gnu");
-    harness.assert(result.is_compilation, "cargo build with target should be intercepted").unwrap();
+    harness
+        .assert(
+            result.is_compilation,
+            "cargo build with target should be intercepted",
+        )
+        .unwrap();
 
-    harness.logger.info("TEST PASS: test_hook_intercepts_cargo_build");
+    harness
+        .logger
+        .info("TEST PASS: test_hook_intercepts_cargo_build");
     harness.mark_passed();
 }
 
@@ -141,22 +160,35 @@ fn test_hook_intercepts_cargo_build() {
 fn test_hook_intercepts_cargo_test() {
     let harness = create_hook_harness("hook_intercepts_cargo_test").unwrap();
 
-    harness.logger.info("TEST START: test_hook_intercepts_cargo_test");
+    harness
+        .logger
+        .info("TEST START: test_hook_intercepts_cargo_test");
 
     // Test cargo test
     let result = classify_and_log(&harness, "cargo test");
-    harness.assert(result.is_compilation, "cargo test should be intercepted").unwrap();
+    harness
+        .assert(result.is_compilation, "cargo test should be intercepted")
+        .unwrap();
     assert!(result.confidence >= 0.95);
 
     // Test cargo test with package
     let result = classify_and_log(&harness, "cargo test -p my_crate");
-    harness.assert(result.is_compilation, "cargo test -p should be intercepted").unwrap();
+    harness
+        .assert(result.is_compilation, "cargo test -p should be intercepted")
+        .unwrap();
 
     // Test cargo test with specific test
     let result = classify_and_log(&harness, "cargo test test_my_function");
-    harness.assert(result.is_compilation, "cargo test with name should be intercepted").unwrap();
+    harness
+        .assert(
+            result.is_compilation,
+            "cargo test with name should be intercepted",
+        )
+        .unwrap();
 
-    harness.logger.info("TEST PASS: test_hook_intercepts_cargo_test");
+    harness
+        .logger
+        .info("TEST PASS: test_hook_intercepts_cargo_test");
     harness.mark_passed();
 }
 
@@ -164,13 +196,19 @@ fn test_hook_intercepts_cargo_test() {
 fn test_hook_intercepts_cargo_check() {
     let harness = create_hook_harness("hook_intercepts_cargo_check").unwrap();
 
-    harness.logger.info("TEST START: test_hook_intercepts_cargo_check");
+    harness
+        .logger
+        .info("TEST START: test_hook_intercepts_cargo_check");
 
     let result = classify_and_log(&harness, "cargo check");
-    harness.assert(result.is_compilation, "cargo check should be intercepted").unwrap();
+    harness
+        .assert(result.is_compilation, "cargo check should be intercepted")
+        .unwrap();
     assert!(result.confidence >= 0.90);
 
-    harness.logger.info("TEST PASS: test_hook_intercepts_cargo_check");
+    harness
+        .logger
+        .info("TEST PASS: test_hook_intercepts_cargo_check");
     harness.mark_passed();
 }
 
@@ -178,10 +216,14 @@ fn test_hook_intercepts_cargo_check() {
 fn test_hook_intercepts_rustc() {
     let harness = create_hook_harness("hook_intercepts_rustc").unwrap();
 
-    harness.logger.info("TEST START: test_hook_intercepts_rustc");
+    harness
+        .logger
+        .info("TEST START: test_hook_intercepts_rustc");
 
     let result = classify_and_log(&harness, "rustc main.rs");
-    harness.assert(result.is_compilation, "rustc should be intercepted").unwrap();
+    harness
+        .assert(result.is_compilation, "rustc should be intercepted")
+        .unwrap();
     assert!(result.confidence >= 0.95);
 
     harness.logger.info("TEST PASS: test_hook_intercepts_rustc");
@@ -192,17 +234,28 @@ fn test_hook_intercepts_rustc() {
 fn test_hook_intercepts_bun_test() {
     let harness = create_hook_harness("hook_intercepts_bun_test").unwrap();
 
-    harness.logger.info("TEST START: test_hook_intercepts_bun_test");
+    harness
+        .logger
+        .info("TEST START: test_hook_intercepts_bun_test");
 
     let result = classify_and_log(&harness, "bun test");
-    harness.assert(result.is_compilation, "bun test should be intercepted").unwrap();
+    harness
+        .assert(result.is_compilation, "bun test should be intercepted")
+        .unwrap();
     assert!(result.confidence >= 0.95);
 
     // With coverage
     let result = classify_and_log(&harness, "bun test --coverage");
-    harness.assert(result.is_compilation, "bun test --coverage should be intercepted").unwrap();
+    harness
+        .assert(
+            result.is_compilation,
+            "bun test --coverage should be intercepted",
+        )
+        .unwrap();
 
-    harness.logger.info("TEST PASS: test_hook_intercepts_bun_test");
+    harness
+        .logger
+        .info("TEST PASS: test_hook_intercepts_bun_test");
     harness.mark_passed();
 }
 
@@ -210,13 +263,19 @@ fn test_hook_intercepts_bun_test() {
 fn test_hook_intercepts_bun_typecheck() {
     let harness = create_hook_harness("hook_intercepts_bun_typecheck").unwrap();
 
-    harness.logger.info("TEST START: test_hook_intercepts_bun_typecheck");
+    harness
+        .logger
+        .info("TEST START: test_hook_intercepts_bun_typecheck");
 
     let result = classify_and_log(&harness, "bun typecheck");
-    harness.assert(result.is_compilation, "bun typecheck should be intercepted").unwrap();
+    harness
+        .assert(result.is_compilation, "bun typecheck should be intercepted")
+        .unwrap();
     assert!(result.confidence >= 0.95);
 
-    harness.logger.info("TEST PASS: test_hook_intercepts_bun_typecheck");
+    harness
+        .logger
+        .info("TEST PASS: test_hook_intercepts_bun_typecheck");
     harness.mark_passed();
 }
 
@@ -227,7 +286,12 @@ fn test_hook_intercepts_gcc() {
     harness.logger.info("TEST START: test_hook_intercepts_gcc");
 
     let result = classify_and_log(&harness, "gcc -o main main.c");
-    harness.assert(result.is_compilation, "gcc compilation should be intercepted").unwrap();
+    harness
+        .assert(
+            result.is_compilation,
+            "gcc compilation should be intercepted",
+        )
+        .unwrap();
     assert!(result.confidence >= 0.90);
 
     harness.logger.info("TEST PASS: test_hook_intercepts_gcc");
@@ -241,7 +305,9 @@ fn test_hook_intercepts_make() {
     harness.logger.info("TEST START: test_hook_intercepts_make");
 
     let result = classify_and_log(&harness, "make -j8");
-    harness.assert(result.is_compilation, "make -j8 should be intercepted").unwrap();
+    harness
+        .assert(result.is_compilation, "make -j8 should be intercepted")
+        .unwrap();
     assert!(result.confidence >= 0.85);
 
     harness.logger.info("TEST PASS: test_hook_intercepts_make");
@@ -252,13 +318,19 @@ fn test_hook_intercepts_make() {
 fn test_hook_intercepts_cmake_build() {
     let harness = create_hook_harness("hook_intercepts_cmake_build").unwrap();
 
-    harness.logger.info("TEST START: test_hook_intercepts_cmake_build");
+    harness
+        .logger
+        .info("TEST START: test_hook_intercepts_cmake_build");
 
     let result = classify_and_log(&harness, "cmake --build .");
-    harness.assert(result.is_compilation, "cmake --build should be intercepted").unwrap();
+    harness
+        .assert(result.is_compilation, "cmake --build should be intercepted")
+        .unwrap();
     assert!(result.confidence >= 0.85);
 
-    harness.logger.info("TEST PASS: test_hook_intercepts_cmake_build");
+    harness
+        .logger
+        .info("TEST PASS: test_hook_intercepts_cmake_build");
     harness.mark_passed();
 }
 
@@ -270,29 +342,43 @@ fn test_hook_intercepts_cmake_build() {
 fn test_hook_ignores_non_compilation() {
     let harness = create_hook_harness("hook_ignores_non_compilation").unwrap();
 
-    harness.logger.info("TEST START: test_hook_ignores_non_compilation");
+    harness
+        .logger
+        .info("TEST START: test_hook_ignores_non_compilation");
 
     // Test ls
     let result = classify_and_log(&harness, "ls -la");
-    harness.assert(!result.is_compilation, "ls should NOT be intercepted").unwrap();
+    harness
+        .assert(!result.is_compilation, "ls should NOT be intercepted")
+        .unwrap();
 
     // Test cd
     let result = classify_and_log(&harness, "cd /tmp");
-    harness.assert(!result.is_compilation, "cd should NOT be intercepted").unwrap();
+    harness
+        .assert(!result.is_compilation, "cd should NOT be intercepted")
+        .unwrap();
 
     // Test echo
     let result = classify_and_log(&harness, "echo hello");
-    harness.assert(!result.is_compilation, "echo should NOT be intercepted").unwrap();
+    harness
+        .assert(!result.is_compilation, "echo should NOT be intercepted")
+        .unwrap();
 
     // Test cat
     let result = classify_and_log(&harness, "cat file.txt");
-    harness.assert(!result.is_compilation, "cat should NOT be intercepted").unwrap();
+    harness
+        .assert(!result.is_compilation, "cat should NOT be intercepted")
+        .unwrap();
 
     // Test git
     let result = classify_and_log(&harness, "git status");
-    harness.assert(!result.is_compilation, "git should NOT be intercepted").unwrap();
+    harness
+        .assert(!result.is_compilation, "git should NOT be intercepted")
+        .unwrap();
 
-    harness.logger.info("TEST PASS: test_hook_ignores_non_compilation");
+    harness
+        .logger
+        .info("TEST PASS: test_hook_ignores_non_compilation");
     harness.mark_passed();
 }
 
@@ -300,22 +386,44 @@ fn test_hook_ignores_non_compilation() {
 fn test_hook_ignores_piped_commands() {
     let harness = create_hook_harness("hook_ignores_piped").unwrap();
 
-    harness.logger.info("TEST START: test_hook_ignores_piped_commands");
+    harness
+        .logger
+        .info("TEST START: test_hook_ignores_piped_commands");
 
     // Piped cargo build
     let result = classify_and_log(&harness, "cargo build | tee log");
-    harness.assert(!result.is_compilation, "piped cargo build should NOT be intercepted").unwrap();
-    assert!(result.reason.contains("piped"), "Reason should mention piped");
+    harness
+        .assert(
+            !result.is_compilation,
+            "piped cargo build should NOT be intercepted",
+        )
+        .unwrap();
+    assert!(
+        result.reason.contains("piped"),
+        "Reason should mention piped"
+    );
 
     // Piped with grep
     let result = classify_and_log(&harness, "cargo build 2>&1 | grep error");
-    harness.assert(!result.is_compilation, "piped command should NOT be intercepted").unwrap();
+    harness
+        .assert(
+            !result.is_compilation,
+            "piped command should NOT be intercepted",
+        )
+        .unwrap();
 
     // Piped bun test
     let result = classify_and_log(&harness, "bun test | grep PASS");
-    harness.assert(!result.is_compilation, "piped bun test should NOT be intercepted").unwrap();
+    harness
+        .assert(
+            !result.is_compilation,
+            "piped bun test should NOT be intercepted",
+        )
+        .unwrap();
 
-    harness.logger.info("TEST PASS: test_hook_ignores_piped_commands");
+    harness
+        .logger
+        .info("TEST PASS: test_hook_ignores_piped_commands");
     harness.mark_passed();
 }
 
@@ -323,22 +431,44 @@ fn test_hook_ignores_piped_commands() {
 fn test_hook_ignores_redirected_commands() {
     let harness = create_hook_harness("hook_ignores_redirected").unwrap();
 
-    harness.logger.info("TEST START: test_hook_ignores_redirected_commands");
+    harness
+        .logger
+        .info("TEST START: test_hook_ignores_redirected_commands");
 
     // Output redirection
     let result = classify_and_log(&harness, "cargo build > output.txt");
-    harness.assert(!result.is_compilation, "redirected cargo build should NOT be intercepted").unwrap();
-    assert!(result.reason.contains("redirect"), "Reason should mention redirect");
+    harness
+        .assert(
+            !result.is_compilation,
+            "redirected cargo build should NOT be intercepted",
+        )
+        .unwrap();
+    assert!(
+        result.reason.contains("redirect"),
+        "Reason should mention redirect"
+    );
 
     // Stderr redirection
     let result = classify_and_log(&harness, "cargo build 2> errors.txt");
-    harness.assert(!result.is_compilation, "stderr redirected should NOT be intercepted").unwrap();
+    harness
+        .assert(
+            !result.is_compilation,
+            "stderr redirected should NOT be intercepted",
+        )
+        .unwrap();
 
     // Combined redirection
     let result = classify_and_log(&harness, "cargo build > out.txt 2>&1");
-    harness.assert(!result.is_compilation, "combined redirect should NOT be intercepted").unwrap();
+    harness
+        .assert(
+            !result.is_compilation,
+            "combined redirect should NOT be intercepted",
+        )
+        .unwrap();
 
-    harness.logger.info("TEST PASS: test_hook_ignores_redirected_commands");
+    harness
+        .logger
+        .info("TEST PASS: test_hook_ignores_redirected_commands");
     harness.mark_passed();
 }
 
@@ -346,18 +476,35 @@ fn test_hook_ignores_redirected_commands() {
 fn test_hook_ignores_background_commands() {
     let harness = create_hook_harness("hook_ignores_background").unwrap();
 
-    harness.logger.info("TEST START: test_hook_ignores_background_commands");
+    harness
+        .logger
+        .info("TEST START: test_hook_ignores_background_commands");
 
     // Backgrounded cargo build
     let result = classify_and_log(&harness, "cargo build &");
-    harness.assert(!result.is_compilation, "backgrounded cargo build should NOT be intercepted").unwrap();
-    assert!(result.reason.contains("background"), "Reason should mention background");
+    harness
+        .assert(
+            !result.is_compilation,
+            "backgrounded cargo build should NOT be intercepted",
+        )
+        .unwrap();
+    assert!(
+        result.reason.contains("background"),
+        "Reason should mention background"
+    );
 
     // Backgrounded bun test
     let result = classify_and_log(&harness, "bun test &");
-    harness.assert(!result.is_compilation, "backgrounded bun test should NOT be intercepted").unwrap();
+    harness
+        .assert(
+            !result.is_compilation,
+            "backgrounded bun test should NOT be intercepted",
+        )
+        .unwrap();
 
-    harness.logger.info("TEST PASS: test_hook_ignores_background_commands");
+    harness
+        .logger
+        .info("TEST PASS: test_hook_ignores_background_commands");
     harness.mark_passed();
 }
 
@@ -365,22 +512,44 @@ fn test_hook_ignores_background_commands() {
 fn test_hook_ignores_chained_commands() {
     let harness = create_hook_harness("hook_ignores_chained").unwrap();
 
-    harness.logger.info("TEST START: test_hook_ignores_chained_commands");
+    harness
+        .logger
+        .info("TEST START: test_hook_ignores_chained_commands");
 
     // && chained
     let result = classify_and_log(&harness, "cargo build && cargo test");
-    harness.assert(!result.is_compilation, "&& chained should NOT be intercepted").unwrap();
-    assert!(result.reason.contains("chained"), "Reason should mention chained");
+    harness
+        .assert(
+            !result.is_compilation,
+            "&& chained should NOT be intercepted",
+        )
+        .unwrap();
+    assert!(
+        result.reason.contains("chained"),
+        "Reason should mention chained"
+    );
 
     // ; chained
     let result = classify_and_log(&harness, "cargo build; cargo test");
-    harness.assert(!result.is_compilation, "; chained should NOT be intercepted").unwrap();
+    harness
+        .assert(
+            !result.is_compilation,
+            "; chained should NOT be intercepted",
+        )
+        .unwrap();
 
     // || chained
     let result = classify_and_log(&harness, "cargo build || echo failed");
-    harness.assert(!result.is_compilation, "|| chained should NOT be intercepted").unwrap();
+    harness
+        .assert(
+            !result.is_compilation,
+            "|| chained should NOT be intercepted",
+        )
+        .unwrap();
 
-    harness.logger.info("TEST PASS: test_hook_ignores_chained_commands");
+    harness
+        .logger
+        .info("TEST PASS: test_hook_ignores_chained_commands");
     harness.mark_passed();
 }
 
@@ -388,13 +557,25 @@ fn test_hook_ignores_chained_commands() {
 fn test_hook_ignores_cargo_fmt() {
     let harness = create_hook_harness("hook_ignores_cargo_fmt").unwrap();
 
-    harness.logger.info("TEST START: test_hook_ignores_cargo_fmt");
+    harness
+        .logger
+        .info("TEST START: test_hook_ignores_cargo_fmt");
 
     let result = classify_and_log(&harness, "cargo fmt");
-    harness.assert(!result.is_compilation, "cargo fmt should NOT be intercepted").unwrap();
-    assert!(result.reason.contains("never-intercept"), "Should match never-intercept pattern");
+    harness
+        .assert(
+            !result.is_compilation,
+            "cargo fmt should NOT be intercepted",
+        )
+        .unwrap();
+    assert!(
+        result.reason.contains("never-intercept"),
+        "Should match never-intercept pattern"
+    );
 
-    harness.logger.info("TEST PASS: test_hook_ignores_cargo_fmt");
+    harness
+        .logger
+        .info("TEST PASS: test_hook_ignores_cargo_fmt");
     harness.mark_passed();
 }
 
@@ -402,18 +583,31 @@ fn test_hook_ignores_cargo_fmt() {
 fn test_hook_ignores_bun_install() {
     let harness = create_hook_harness("hook_ignores_bun_install").unwrap();
 
-    harness.logger.info("TEST START: test_hook_ignores_bun_install");
+    harness
+        .logger
+        .info("TEST START: test_hook_ignores_bun_install");
 
     let result = classify_and_log(&harness, "bun install");
-    harness.assert(!result.is_compilation, "bun install should NOT be intercepted").unwrap();
+    harness
+        .assert(
+            !result.is_compilation,
+            "bun install should NOT be intercepted",
+        )
+        .unwrap();
 
     let result = classify_and_log(&harness, "bun add lodash");
-    harness.assert(!result.is_compilation, "bun add should NOT be intercepted").unwrap();
+    harness
+        .assert(!result.is_compilation, "bun add should NOT be intercepted")
+        .unwrap();
 
     let result = classify_and_log(&harness, "bun run dev");
-    harness.assert(!result.is_compilation, "bun run should NOT be intercepted").unwrap();
+    harness
+        .assert(!result.is_compilation, "bun run should NOT be intercepted")
+        .unwrap();
 
-    harness.logger.info("TEST PASS: test_hook_ignores_bun_install");
+    harness
+        .logger
+        .info("TEST PASS: test_hook_ignores_bun_install");
     harness.mark_passed();
 }
 
@@ -421,17 +615,34 @@ fn test_hook_ignores_bun_install() {
 fn test_hook_ignores_bun_watch_mode() {
     let harness = create_hook_harness("hook_ignores_bun_watch").unwrap();
 
-    harness.logger.info("TEST START: test_hook_ignores_bun_watch_mode");
+    harness
+        .logger
+        .info("TEST START: test_hook_ignores_bun_watch_mode");
 
     // Watch mode is interactive - should not be intercepted
     let result = classify_and_log(&harness, "bun test --watch");
-    harness.assert(!result.is_compilation, "bun test --watch should NOT be intercepted").unwrap();
-    assert!(result.reason.contains("interactive"), "Should indicate interactive mode");
+    harness
+        .assert(
+            !result.is_compilation,
+            "bun test --watch should NOT be intercepted",
+        )
+        .unwrap();
+    assert!(
+        result.reason.contains("interactive"),
+        "Should indicate interactive mode"
+    );
 
     let result = classify_and_log(&harness, "bun typecheck --watch");
-    harness.assert(!result.is_compilation, "bun typecheck --watch should NOT be intercepted").unwrap();
+    harness
+        .assert(
+            !result.is_compilation,
+            "bun typecheck --watch should NOT be intercepted",
+        )
+        .unwrap();
 
-    harness.logger.info("TEST PASS: test_hook_ignores_bun_watch_mode");
+    harness
+        .logger
+        .info("TEST PASS: test_hook_ignores_bun_watch_mode");
     harness.mark_passed();
 }
 
@@ -480,12 +691,18 @@ fn test_hook_timing_budget() {
     // Calculate P99 for non-compilation
     non_compilation_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let p99_idx = (non_compilation_times.len() as f64 * 0.99) as usize;
-    let p99_non_compilation = non_compilation_times.get(p99_idx.min(non_compilation_times.len() - 1)).copied().unwrap_or(0.0);
+    let p99_non_compilation = non_compilation_times
+        .get(p99_idx.min(non_compilation_times.len() - 1))
+        .copied()
+        .unwrap_or(0.0);
 
     // Calculate P99 for compilation
     compilation_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let p99_idx = (compilation_times.len() as f64 * 0.99) as usize;
-    let p99_compilation = compilation_times.get(p99_idx.min(compilation_times.len() - 1)).copied().unwrap_or(0.0);
+    let p99_compilation = compilation_times
+        .get(p99_idx.min(compilation_times.len() - 1))
+        .copied()
+        .unwrap_or(0.0);
 
     harness.logger.log_with_context(
         rch_common::e2e::LogLevel::Info,
@@ -495,8 +712,14 @@ fn test_hook_timing_budget() {
             p99_non_compilation, p99_compilation
         ),
         vec![
-            ("non_compilation_count".to_string(), non_compilation_times.len().to_string()),
-            ("compilation_count".to_string(), compilation_times.len().to_string()),
+            (
+                "non_compilation_count".to_string(),
+                non_compilation_times.len().to_string(),
+            ),
+            (
+                "compilation_count".to_string(),
+                compilation_times.len().to_string(),
+            ),
         ],
     );
 
@@ -529,7 +752,9 @@ fn test_hook_timing_budget() {
 fn test_hook_classification_details() {
     let harness = create_hook_harness("hook_classification_details").unwrap();
 
-    harness.logger.info("TEST START: test_hook_classification_details");
+    harness
+        .logger
+        .info("TEST START: test_hook_classification_details");
 
     // Test detailed classification for diagnostics
     let detailed = classify_command_detailed("cargo build --release");
@@ -557,7 +782,9 @@ fn test_hook_classification_details() {
     assert!(detailed.classification.is_compilation);
     assert!(detailed.classification.confidence >= 0.95);
 
-    harness.logger.info("TEST PASS: test_hook_classification_details");
+    harness
+        .logger
+        .info("TEST PASS: test_hook_classification_details");
     harness.mark_passed();
 }
 
@@ -565,19 +792,30 @@ fn test_hook_classification_details() {
 fn test_hook_classification_details_piped_rejection() {
     let harness = create_hook_harness("hook_classification_details_piped").unwrap();
 
-    harness.logger.info("TEST START: test_hook_classification_details_piped_rejection");
+    harness
+        .logger
+        .info("TEST START: test_hook_classification_details_piped_rejection");
 
     let detailed = classify_command_detailed("cargo build | tee log.txt");
 
     // Should be rejected at Tier 1 (structure analysis)
     let tier1 = detailed.tiers.iter().find(|t| t.tier == 1).unwrap();
-    assert_eq!(tier1.decision, TierDecision::Reject, "Tier 1 should reject piped command");
-    assert!(tier1.reason.contains("piped"), "Reason should mention piped");
+    assert_eq!(
+        tier1.decision,
+        TierDecision::Reject,
+        "Tier 1 should reject piped command"
+    );
+    assert!(
+        tier1.reason.contains("piped"),
+        "Reason should mention piped"
+    );
 
     // Final classification should be non-compilation
     assert!(!detailed.classification.is_compilation);
 
-    harness.logger.info("TEST PASS: test_hook_classification_details_piped_rejection");
+    harness
+        .logger
+        .info("TEST PASS: test_hook_classification_details_piped_rejection");
     harness.mark_passed();
 }
 
@@ -585,18 +823,29 @@ fn test_hook_classification_details_piped_rejection() {
 fn test_hook_classification_details_never_intercept() {
     let harness = create_hook_harness("hook_classification_details_never_intercept").unwrap();
 
-    harness.logger.info("TEST START: test_hook_classification_details_never_intercept");
+    harness
+        .logger
+        .info("TEST START: test_hook_classification_details_never_intercept");
 
     let detailed = classify_command_detailed("cargo fmt");
 
     // Should pass Tier 0, 1, 2 but reject at Tier 3
     let tier3 = detailed.tiers.iter().find(|t| t.tier == 3).unwrap();
-    assert_eq!(tier3.decision, TierDecision::Reject, "Tier 3 should reject cargo fmt");
-    assert!(tier3.reason.contains("never-intercept"), "Reason should mention never-intercept");
+    assert_eq!(
+        tier3.decision,
+        TierDecision::Reject,
+        "Tier 3 should reject cargo fmt"
+    );
+    assert!(
+        tier3.reason.contains("never-intercept"),
+        "Reason should mention never-intercept"
+    );
 
     assert!(!detailed.classification.is_compilation);
 
-    harness.logger.info("TEST PASS: test_hook_classification_details_never_intercept");
+    harness
+        .logger
+        .info("TEST PASS: test_hook_classification_details_never_intercept");
     harness.mark_passed();
 }
 
@@ -608,17 +857,34 @@ fn test_hook_classification_details_never_intercept() {
 fn test_hook_wrapped_commands() {
     let harness = create_hook_harness("hook_wrapped_commands").unwrap();
 
-    harness.logger.info("TEST START: test_hook_wrapped_commands");
+    harness
+        .logger
+        .info("TEST START: test_hook_wrapped_commands");
 
     // Commands with wrappers should be normalized and classified
     let result = classify_and_log(&harness, "time cargo build");
-    harness.assert(result.is_compilation, "time cargo build should be intercepted").unwrap();
+    harness
+        .assert(
+            result.is_compilation,
+            "time cargo build should be intercepted",
+        )
+        .unwrap();
 
     let result = classify_and_log(&harness, "sudo cargo check");
-    harness.assert(result.is_compilation, "sudo cargo check should be intercepted").unwrap();
+    harness
+        .assert(
+            result.is_compilation,
+            "sudo cargo check should be intercepted",
+        )
+        .unwrap();
 
     let result = classify_and_log(&harness, "env RUST_BACKTRACE=1 cargo test");
-    harness.assert(result.is_compilation, "env-wrapped cargo test should be intercepted").unwrap();
+    harness
+        .assert(
+            result.is_compilation,
+            "env-wrapped cargo test should be intercepted",
+        )
+        .unwrap();
 
     harness.logger.info("TEST PASS: test_hook_wrapped_commands");
     harness.mark_passed();
@@ -632,7 +898,9 @@ fn test_hook_wrapped_commands() {
 fn test_hook_input_fixture_format() {
     let harness = create_hook_harness("hook_input_fixture").unwrap();
 
-    harness.logger.info("TEST START: test_hook_input_fixture_format");
+    harness
+        .logger
+        .info("TEST START: test_hook_input_fixture_format");
 
     // Test HookInputFixture generates valid JSON
     let input = HookInputFixture::cargo_build();
@@ -646,7 +914,9 @@ fn test_hook_input_fixture_format() {
     let json = input.to_json();
     assert!(json.contains("\"command\": \"cargo test --release\""));
 
-    harness.logger.info("TEST PASS: test_hook_input_fixture_format");
+    harness
+        .logger
+        .info("TEST PASS: test_hook_input_fixture_format");
     harness.mark_passed();
 }
 
@@ -658,14 +928,19 @@ fn test_hook_input_fixture_format() {
 fn test_hook_env_rch_disabled() {
     let harness = create_hook_harness("hook_env_disabled").unwrap();
 
-    harness.logger.info("TEST START: test_hook_env_rch_disabled");
+    harness
+        .logger
+        .info("TEST START: test_hook_env_rch_disabled");
 
     // When RCH_ENABLED=false, classification should still work
     // (the config check happens in the hook, not in classify_command)
     // This test verifies the classification logic is independent of config
 
     let result = classify_command("cargo build");
-    assert!(result.is_compilation, "Classification should work regardless of RCH_ENABLED");
+    assert!(
+        result.is_compilation,
+        "Classification should work regardless of RCH_ENABLED"
+    );
 
     harness.logger.info("TEST PASS: test_hook_env_rch_disabled");
     harness.mark_passed();
@@ -682,11 +957,20 @@ fn test_hook_empty_command() {
     harness.logger.info("TEST START: test_hook_empty_command");
 
     let result = classify_command("");
-    assert!(!result.is_compilation, "Empty command should not be intercepted");
-    assert!(result.reason.contains("empty"), "Reason should mention empty");
+    assert!(
+        !result.is_compilation,
+        "Empty command should not be intercepted"
+    );
+    assert!(
+        result.reason.contains("empty"),
+        "Reason should mention empty"
+    );
 
     let result = classify_command("   ");
-    assert!(!result.is_compilation, "Whitespace-only command should not be intercepted");
+    assert!(
+        !result.is_compilation,
+        "Whitespace-only command should not be intercepted"
+    );
 
     harness.logger.info("TEST PASS: test_hook_empty_command");
     harness.mark_passed();
@@ -696,16 +980,27 @@ fn test_hook_empty_command() {
 fn test_hook_subshell_capture() {
     let harness = create_hook_harness("hook_subshell_capture").unwrap();
 
-    harness.logger.info("TEST START: test_hook_subshell_capture");
+    harness
+        .logger
+        .info("TEST START: test_hook_subshell_capture");
 
     // Subshell capture should not be intercepted
     let result = classify_command("cargo build $(echo src/)");
-    assert!(!result.is_compilation, "Subshell capture should not be intercepted");
-    assert!(result.reason.contains("subshell"), "Reason should mention subshell");
+    assert!(
+        !result.is_compilation,
+        "Subshell capture should not be intercepted"
+    );
+    assert!(
+        result.reason.contains("subshell"),
+        "Reason should mention subshell"
+    );
 
     // Backtick subshell
     let result = classify_command("cargo build `echo flags`");
-    assert!(!result.is_compilation, "Backtick subshell should not be intercepted");
+    assert!(
+        !result.is_compilation,
+        "Backtick subshell should not be intercepted"
+    );
 
     harness.logger.info("TEST PASS: test_hook_subshell_capture");
     harness.mark_passed();
@@ -715,21 +1010,37 @@ fn test_hook_subshell_capture() {
 fn test_hook_version_checks_not_intercepted() {
     let harness = create_hook_harness("hook_version_checks").unwrap();
 
-    harness.logger.info("TEST START: test_hook_version_checks_not_intercepted");
+    harness
+        .logger
+        .info("TEST START: test_hook_version_checks_not_intercepted");
 
     // Version checks should not be intercepted
     let result = classify_command("cargo --version");
-    assert!(!result.is_compilation, "cargo --version should not be intercepted");
+    assert!(
+        !result.is_compilation,
+        "cargo --version should not be intercepted"
+    );
 
     let result = classify_command("rustc --version");
-    assert!(!result.is_compilation, "rustc --version should not be intercepted");
+    assert!(
+        !result.is_compilation,
+        "rustc --version should not be intercepted"
+    );
 
     let result = classify_command("gcc --version");
-    assert!(!result.is_compilation, "gcc --version should not be intercepted");
+    assert!(
+        !result.is_compilation,
+        "gcc --version should not be intercepted"
+    );
 
     let result = classify_command("bun --version");
-    assert!(!result.is_compilation, "bun --version should not be intercepted");
+    assert!(
+        !result.is_compilation,
+        "bun --version should not be intercepted"
+    );
 
-    harness.logger.info("TEST PASS: test_hook_version_checks_not_intercepted");
+    harness
+        .logger
+        .info("TEST PASS: test_hook_version_checks_not_intercepted");
     harness.mark_passed();
 }

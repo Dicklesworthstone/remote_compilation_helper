@@ -233,7 +233,10 @@ mod tests {
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         let backspace = KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE);
         let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
-        info!("INPUT: text={:?} enter={:?} backspace={:?} esc={:?}", text, enter, backspace, esc);
+        info!(
+            "INPUT: text={:?} enter={:?} backspace={:?} esc={:?}",
+            text, enter, backspace, esc
+        );
         assert_eq!(handle_key_input_mode(text), Action::TextInput('a'));
         assert_eq!(handle_key_input_mode(enter), Action::Select);
         assert_eq!(handle_key_input_mode(backspace), Action::DeleteChar);

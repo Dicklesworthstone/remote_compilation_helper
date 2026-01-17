@@ -359,9 +359,11 @@ fn test_select_worker_basic() {
         .unwrap();
 
     // Send select-worker request
-    let response =
-        send_socket_request(&socket_path, "GET /select-worker?project=test-project&cores=2")
-            .unwrap();
+    let response = send_socket_request(
+        &socket_path,
+        "GET /select-worker?project=test-project&cores=2",
+    )
+    .unwrap();
 
     // Verify response
     assert!(
@@ -432,7 +434,9 @@ fn test_select_worker_missing_project() {
         }
         Err(e) => {
             // Connection error is also acceptable - daemon closed connection
-            harness.logger.info(format!("Connection error (expected): {}", e));
+            harness
+                .logger
+                .info(format!("Connection error (expected): {}", e));
         }
     }
 
@@ -488,9 +492,10 @@ fn test_unknown_endpoint() {
             harness.logger.info(format!("Response: {}", r));
         }
         Err(e) => {
-            harness
-                .logger
-                .info(format!("Connection error (expected for unknown endpoint): {}", e));
+            harness.logger.info(format!(
+                "Connection error (expected for unknown endpoint): {}",
+                e
+            ));
         }
     }
 
@@ -517,9 +522,10 @@ fn test_invalid_method() {
             harness.logger.info(format!("Response: {}", r));
         }
         Err(e) => {
-            harness
-                .logger
-                .info(format!("Connection error (expected for invalid method): {}", e));
+            harness.logger.info(format!(
+                "Connection error (expected for invalid method): {}",
+                e
+            ));
         }
     }
 
@@ -539,7 +545,9 @@ fn test_daemon_custom_socket_path() {
 
     // Create daemon config pointing to custom socket
     let daemon_config = DaemonConfigFixture::minimal(&custom_socket);
-    harness.create_daemon_config(&daemon_config.to_toml()).unwrap();
+    harness
+        .create_daemon_config(&daemon_config.to_toml())
+        .unwrap();
 
     let workers = WorkersFixture::empty();
     harness.create_workers_config(&workers.to_toml()).unwrap();
@@ -652,9 +660,11 @@ fn test_daemon_with_history_file() {
         .unwrap();
 
     // Make a request that would be recorded in history
-    let response =
-        send_socket_request(&socket_path, "GET /select-worker?project=history-test&cores=1")
-            .unwrap();
+    let response = send_socket_request(
+        &socket_path,
+        "GET /select-worker?project=history-test&cores=1",
+    )
+    .unwrap();
     assert!(response.contains("200 OK"), "Got: {}", response);
 
     // Get status to check recent builds
@@ -685,7 +695,11 @@ fn test_cleanup_verification() {
 
     // Start daemon and create resources
     let pid_result = start_daemon_with_socket(&harness, &socket_path, &[]);
-    assert!(pid_result.is_ok(), "Failed to start daemon: {:?}", pid_result);
+    assert!(
+        pid_result.is_ok(),
+        "Failed to start daemon: {:?}",
+        pid_result
+    );
 
     harness
         .wait_for_socket(&socket_path, Duration::from_secs(10))
@@ -736,7 +750,9 @@ fn test_startup_synchronization_backoff() {
     let harness = create_daemon_harness("startup_backoff").unwrap();
     let socket_path = setup_daemon_configs(&harness).unwrap();
 
-    harness.logger.info("TEST: test_startup_synchronization_backoff");
+    harness
+        .logger
+        .info("TEST: test_startup_synchronization_backoff");
 
     // Record time before starting daemon
     let start_time = std::time::Instant::now();
@@ -755,10 +771,9 @@ fn test_startup_synchronization_backoff() {
         wait_result
     );
 
-    harness.logger.info(format!(
-        "TIMING: Socket detected after {:?}",
-        elapsed
-    ));
+    harness
+        .logger
+        .info(format!("TIMING: Socket detected after {:?}", elapsed));
 
     // Verify the socket is actually usable
     let response = send_socket_request(&socket_path, "GET /health").unwrap();
@@ -771,10 +786,9 @@ fn test_startup_synchronization_backoff() {
     // Startup should typically complete in < 500ms for a healthy system
     // We log this for monitoring but don't assert as it depends on system load
     if elapsed > Duration::from_millis(500) {
-        harness.logger.warn(format!(
-            "SLOW STARTUP: {:?} (expected < 500ms)",
-            elapsed
-        ));
+        harness
+            .logger
+            .warn(format!("SLOW STARTUP: {:?} (expected < 500ms)", elapsed));
     }
 
     harness.mark_passed();

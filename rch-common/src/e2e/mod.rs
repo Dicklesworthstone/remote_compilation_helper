@@ -63,8 +63,8 @@ pub use fixtures::{
     WorkersFixture,
 };
 pub use harness::{
-    cleanup_stale_test_artifacts, CommandResult, HarnessConfig, HarnessError, HarnessResult,
-    ProcessInfo, TestHarness, TestHarnessBuilder,
+    CommandResult, HarnessConfig, HarnessError, HarnessResult, ProcessInfo, TestHarness,
+    TestHarnessBuilder, cleanup_stale_test_artifacts,
 };
 pub use logging::{
     LogEntry, LogLevel, LogSource, LoggerConfig, TestLogSummary, TestLogger, TestLoggerBuilder,

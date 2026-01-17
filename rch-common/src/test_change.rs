@@ -108,8 +108,9 @@ impl TestCodeChange {
             "Reverting test change {} from {:?}",
             self.change_id, self.file_path
         );
-        fs::write(&self.file_path, &self.original_content)
-            .with_context(|| format!("Failed to restore original content to {:?}", self.file_path))?;
+        fs::write(&self.file_path, &self.original_content).with_context(|| {
+            format!("Failed to restore original content to {:?}", self.file_path)
+        })?;
         Ok(())
     }
 
@@ -237,9 +238,7 @@ mod tests {
 
         assert!(change.change_id.starts_with("RCH_TEST_"));
         assert!(change.modified_content.contains(&change.change_id));
-        assert!(change
-            .modified_content
-            .contains("// RCH Self-Test Marker"));
+        assert!(change.modified_content.contains("// RCH Self-Test Marker"));
         assert_eq!(change.original_content, original_content);
 
         info!("VERIFY: Test change created successfully");
@@ -263,13 +262,19 @@ mod tests {
         // Apply the change
         change.apply().unwrap();
         let after_apply = fs::read_to_string(&file_path).unwrap();
-        info!("AFTER APPLY: contains_marker={}", after_apply.contains(&change.change_id));
+        info!(
+            "AFTER APPLY: contains_marker={}",
+            after_apply.contains(&change.change_id)
+        );
         assert!(after_apply.contains(&change.change_id));
 
         // Revert the change
         change.revert().unwrap();
         let after_revert = fs::read_to_string(&file_path).unwrap();
-        info!("AFTER REVERT: equals_original={}", after_revert == original_content);
+        info!(
+            "AFTER REVERT: equals_original={}",
+            after_revert == original_content
+        );
         assert_eq!(after_revert, original_content);
 
         info!("VERIFY: Apply and revert work correctly");
@@ -294,9 +299,12 @@ mod tests {
 
             // While guard is alive, file should be modified
             let during = fs::read_to_string(&file_path).unwrap();
-            info!("DURING GUARD: contains_marker={}", during.contains(&change_id));
+            info!(
+                "DURING GUARD: contains_marker={}",
+                during.contains(&change_id)
+            );
             assert!(during.contains(&change_id));
-            
+
             // Guard will be dropped here
         }
 

@@ -107,7 +107,9 @@ total_slots = 4
     let socket_arg = socket_path.to_string_lossy().to_string();
     let pid = harness.start_daemon(&["--socket", &socket_arg, "--foreground"])?;
 
-    harness.logger.info(format!("Daemon started with PID: {}", pid));
+    harness
+        .logger
+        .info(format!("Daemon started with PID: {}", pid));
 
     // Wait for socket to be created
     harness.wait_for_socket(&socket_path, Duration::from_secs(10))?;
@@ -147,11 +149,12 @@ total_slots = 4
     harness.wait_for_socket(&socket_path, Duration::from_secs(10))?;
 
     // Send health check request
-    let response = send_request(&socket_path, "GET /health").map_err(|e| {
-        rch_common::e2e::harness::HarnessError::Io(e)
-    })?;
+    let response = send_request(&socket_path, "GET /health")
+        .map_err(rch_common::e2e::harness::HarnessError::Io)?;
 
-    harness.logger.info(format!("Health response: {}", response));
+    harness
+        .logger
+        .info(format!("Health response: {}", response));
 
     // Verify health response contains expected fields
     let status = get_json_field(&response, "status");
@@ -164,7 +167,10 @@ total_slots = 4
     harness.assert(version.is_some(), "Health response should include version")?;
 
     let uptime = get_json_field(&response, "uptime_seconds");
-    harness.assert(uptime.is_some(), "Health response should include uptime_seconds")?;
+    harness.assert(
+        uptime.is_some(),
+        "Health response should include uptime_seconds",
+    )?;
 
     harness.mark_passed();
     Ok(())
@@ -199,9 +205,8 @@ total_slots = 4
     harness.wait_for_socket(&socket_path, Duration::from_secs(10))?;
 
     // Send ready check request
-    let response = send_request(&socket_path, "GET /ready").map_err(|e| {
-        rch_common::e2e::harness::HarnessError::Io(e)
-    })?;
+    let response = send_request(&socket_path, "GET /ready")
+        .map_err(rch_common::e2e::harness::HarnessError::Io)?;
 
     harness.logger.info(format!("Ready response: {}", response));
 
@@ -257,11 +262,12 @@ total_slots = 8
     harness.wait_for_socket(&socket_path, Duration::from_secs(10))?;
 
     // Send status request
-    let response = send_request(&socket_path, "GET /status").map_err(|e| {
-        rch_common::e2e::harness::HarnessError::Io(e)
-    })?;
+    let response = send_request(&socket_path, "GET /status")
+        .map_err(rch_common::e2e::harness::HarnessError::Io)?;
 
-    harness.logger.info(format!("Status response: {}", response));
+    harness
+        .logger
+        .info(format!("Status response: {}", response));
 
     // Verify status response contains daemon info
     harness.assert(
@@ -314,11 +320,12 @@ total_slots = 4
     harness.wait_for_socket(&socket_path, Duration::from_secs(10))?;
 
     // Send budget request
-    let response = send_request(&socket_path, "GET /budget").map_err(|e| {
-        rch_common::e2e::harness::HarnessError::Io(e)
-    })?;
+    let response = send_request(&socket_path, "GET /budget")
+        .map_err(rch_common::e2e::harness::HarnessError::Io)?;
 
-    harness.logger.info(format!("Budget response: {}", response));
+    harness
+        .logger
+        .info(format!("Budget response: {}", response));
 
     // Budget endpoint should return a valid JSON response
     harness.assert(
@@ -359,20 +366,20 @@ total_slots = 4
     harness.wait_for_socket(&socket_path, Duration::from_secs(10))?;
 
     // Verify daemon is healthy first
-    let health_response = send_request(&socket_path, "GET /health").map_err(|e| {
-        rch_common::e2e::harness::HarnessError::Io(e)
-    })?;
+    let health_response = send_request(&socket_path, "GET /health")
+        .map_err(rch_common::e2e::harness::HarnessError::Io)?;
     harness.assert(
         health_response.contains("healthy"),
         "Daemon should be healthy before shutdown",
     )?;
 
     // Send shutdown request
-    let shutdown_response = send_request(&socket_path, "POST /shutdown").map_err(|e| {
-        rch_common::e2e::harness::HarnessError::Io(e)
-    })?;
+    let shutdown_response = send_request(&socket_path, "POST /shutdown")
+        .map_err(rch_common::e2e::harness::HarnessError::Io)?;
 
-    harness.logger.info(format!("Shutdown response: {}", shutdown_response));
+    harness
+        .logger
+        .info(format!("Shutdown response: {}", shutdown_response));
 
     // Verify shutdown response
     harness.assert(
@@ -428,18 +435,17 @@ total_slots = 4
     harness.wait_for_socket(&socket_path, Duration::from_secs(10))?;
 
     // Send metrics request
-    let response = send_request(&socket_path, "GET /metrics").map_err(|e| {
-        rch_common::e2e::harness::HarnessError::Io(e)
-    })?;
+    let response = send_request(&socket_path, "GET /metrics")
+        .map_err(rch_common::e2e::harness::HarnessError::Io)?;
 
-    harness.logger.info(format!("Metrics response (first 500 chars): {}", &response[..response.len().min(500)]));
+    harness.logger.info(format!(
+        "Metrics response (first 500 chars): {}",
+        &response[..response.len().min(500)]
+    ));
 
     // Metrics should be in Prometheus format (text/plain)
     // Should contain standard metric comments or metric lines
-    harness.assert(
-        !response.is_empty(),
-        "Metrics response should not be empty",
-    )?;
+    harness.assert(!response.is_empty(), "Metrics response should not be empty")?;
 
     harness.mark_passed();
     Ok(())
@@ -477,7 +483,9 @@ total_slots = 4
     let result = send_request(&socket_path, "GET /nonexistent");
 
     // Either an error response or connection drop is acceptable
-    harness.logger.info(format!("Unknown endpoint result: {:?}", result));
+    harness
+        .logger
+        .info(format!("Unknown endpoint result: {:?}", result));
 
     // The test passes as long as the daemon doesn't crash
     // Send a follow-up health check to verify daemon is still running
@@ -529,9 +537,8 @@ fn test_daemon_config_fixture_integration() -> HarnessResult<()> {
     harness.wait_for_socket(&socket_path, Duration::from_secs(10))?;
 
     // Verify daemon is running with our fixture config
-    let status = send_request(&socket_path, "GET /status").map_err(|e| {
-        rch_common::e2e::harness::HarnessError::Io(e)
-    })?;
+    let status = send_request(&socket_path, "GET /status")
+        .map_err(rch_common::e2e::harness::HarnessError::Io)?;
 
     harness.assert(
         status.contains("fixture-worker"),

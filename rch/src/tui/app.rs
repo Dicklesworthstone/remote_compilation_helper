@@ -430,9 +430,7 @@ mod tests {
         let config = TuiConfig::default();
         info!(
             "VERIFY: refresh_interval_ms={} mouse_support={} high_contrast={}",
-            config.refresh_interval_ms,
-            config.mouse_support,
-            config.high_contrast
+            config.refresh_interval_ms, config.mouse_support, config.high_contrast
         );
         assert_eq!(config.refresh_interval_ms, 1000);
         assert!(config.mouse_support);
@@ -447,7 +445,10 @@ mod tests {
         let response = make_response(vec![], vec![], vec![]);
         let mut state = TuiState::new();
         update_state_from_daemon(&mut state, response);
-        info!("VERIFY: status={:?} uptime={:?}", state.daemon.status, state.daemon.uptime);
+        info!(
+            "VERIFY: status={:?} uptime={:?}",
+            state.daemon.status, state.daemon.uptime
+        );
         assert_eq!(state.daemon.status, Status::Running);
         assert_eq!(state.daemon.uptime, Duration::from_secs(3600));
         info!("TEST PASS: test_update_state_sets_daemon_running");
@@ -506,7 +507,10 @@ mod tests {
         info!("VERIFY: active_builds={}", state.active_builds.len());
         assert_eq!(state.active_builds.len(), 1);
         assert_eq!(state.active_builds[0].status, BuildStatus::Compiling);
-        assert_eq!(state.active_builds[0].progress.as_ref().unwrap().phase, "compiling");
+        assert_eq!(
+            state.active_builds[0].progress.as_ref().unwrap().phase,
+            "compiling"
+        );
         assert_eq!(state.active_builds[0].worker.as_deref(), Some("worker-1"));
         info!("TEST PASS: test_update_state_active_builds_mapping");
     }

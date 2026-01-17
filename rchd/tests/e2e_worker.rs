@@ -127,13 +127,17 @@ fn current_user() -> String {
 #[test]
 fn test_worker_probe_success() {
     let harness = create_worker_harness("worker_probe_success").unwrap();
-    harness.logger.info("[e2e::worker] TEST START: test_worker_probe_success");
+    harness
+        .logger
+        .info("[e2e::worker] TEST START: test_worker_probe_success");
 
     // Create a mock local worker
     let workers = WorkersFixture::mock_local(1);
     let socket_path = setup_daemon_with_workers(&harness, &workers).unwrap();
 
-    harness.logger.info("[e2e::worker] CONFIG: worker_id=worker1 host=localhost");
+    harness
+        .logger
+        .info("[e2e::worker] CONFIG: worker_id=worker1 host=localhost");
 
     // Start the daemon
     start_daemon_with_socket(&harness, &socket_path, &[]).unwrap();
@@ -141,7 +145,9 @@ fn test_worker_probe_success() {
         .wait_for_socket(&socket_path, Duration::from_secs(10))
         .unwrap();
 
-    harness.logger.info("[e2e::worker] PROBE: initiating status check");
+    harness
+        .logger
+        .info("[e2e::worker] PROBE: initiating status check");
 
     // Query status to check worker health
     let response = send_socket_request(&socket_path, "GET /status").unwrap();
@@ -152,12 +158,16 @@ fn test_worker_probe_success() {
     );
 
     let body = extract_json_body(&response).unwrap();
-    harness.logger.info(format!("[e2e::worker] STATUS: {}", body));
+    harness
+        .logger
+        .info(format!("[e2e::worker] STATUS: {}", body));
 
     // Verify workers are present in status
     assert!(body.contains("workers"), "Expected workers in status");
 
-    harness.logger.info("[e2e::worker] TEST PASS: test_worker_probe_success");
+    harness
+        .logger
+        .info("[e2e::worker] TEST PASS: test_worker_probe_success");
     harness.mark_passed();
 }
 
@@ -165,14 +175,18 @@ fn test_worker_probe_success() {
 #[test]
 fn test_worker_probe_failure() {
     let harness = create_worker_harness("worker_probe_failure").unwrap();
-    harness.logger.info("[e2e::worker] TEST START: test_worker_probe_failure");
+    harness
+        .logger
+        .info("[e2e::worker] TEST START: test_worker_probe_failure");
 
     // Create a worker with an unreachable host
     let bad_worker = create_worker("bad-worker", "unreachable.invalid.host", 4, 100);
     let workers = WorkersFixture::empty().add_worker(bad_worker);
     let socket_path = setup_daemon_with_workers(&harness, &workers).unwrap();
 
-    harness.logger.info("[e2e::worker] CONFIG: worker_id=bad-worker host=unreachable.invalid.host");
+    harness
+        .logger
+        .info("[e2e::worker] CONFIG: worker_id=bad-worker host=unreachable.invalid.host");
 
     // Start the daemon
     start_daemon_with_socket(&harness, &socket_path, &[]).unwrap();
@@ -180,7 +194,9 @@ fn test_worker_probe_failure() {
         .wait_for_socket(&socket_path, Duration::from_secs(10))
         .unwrap();
 
-    harness.logger.info("[e2e::worker] PROBE: checking status for unreachable worker");
+    harness
+        .logger
+        .info("[e2e::worker] PROBE: checking status for unreachable worker");
 
     // Query status
     let response = send_socket_request(&socket_path, "GET /status").unwrap();
@@ -191,13 +207,17 @@ fn test_worker_probe_failure() {
     );
 
     let body = extract_json_body(&response).unwrap();
-    harness.logger.info(format!("[e2e::worker] STATUS: {}", body));
+    harness
+        .logger
+        .info(format!("[e2e::worker] STATUS: {}", body));
 
     // The daemon should still start, but the worker may show as unhealthy
     // (depending on whether health checks have run yet)
     assert!(body.contains("workers"), "Expected workers in status");
 
-    harness.logger.info("[e2e::worker] TEST PASS: test_worker_probe_failure");
+    harness
+        .logger
+        .info("[e2e::worker] TEST PASS: test_worker_probe_failure");
     harness.mark_passed();
 }
 
@@ -205,7 +225,9 @@ fn test_worker_probe_failure() {
 #[test]
 fn test_worker_probe_timeout() {
     let harness = create_worker_harness("worker_probe_timeout").unwrap();
-    harness.logger.info("[e2e::worker] TEST START: test_worker_probe_timeout");
+    harness
+        .logger
+        .info("[e2e::worker] TEST START: test_worker_probe_timeout");
 
     // Create mock workers
     let workers = WorkersFixture::mock_local(1);
@@ -217,7 +239,9 @@ fn test_worker_probe_timeout() {
         .wait_for_socket(&socket_path, Duration::from_secs(10))
         .unwrap();
 
-    harness.logger.info("[e2e::worker] VERIFY: timeout handling does not hang test");
+    harness
+        .logger
+        .info("[e2e::worker] VERIFY: timeout handling does not hang test");
 
     // Verify the daemon responds within timeout
     let start = std::time::Instant::now();
@@ -239,7 +263,9 @@ fn test_worker_probe_timeout() {
         "[e2e::worker] TIMING: status response in {:?}",
         elapsed
     ));
-    harness.logger.info("[e2e::worker] TEST PASS: test_worker_probe_timeout");
+    harness
+        .logger
+        .info("[e2e::worker] TEST PASS: test_worker_probe_timeout");
     harness.mark_passed();
 }
 
@@ -251,8 +277,12 @@ fn test_worker_probe_timeout() {
 #[test]
 fn test_worker_circuit_breaker_opens() {
     let harness = create_worker_harness("circuit_breaker_opens").unwrap();
-    harness.logger.info("[e2e::worker] TEST START: test_worker_circuit_breaker_opens");
-    harness.logger.info("[e2e::worker] CONFIG: worker=bad-worker threshold=3");
+    harness
+        .logger
+        .info("[e2e::worker] TEST START: test_worker_circuit_breaker_opens");
+    harness
+        .logger
+        .info("[e2e::worker] CONFIG: worker=bad-worker threshold=3");
 
     // Create a worker with unreachable host to trigger failures
     let bad_worker = create_worker("bad-worker", "192.0.2.1", 4, 100); // TEST-NET-1, guaranteed unreachable
@@ -270,14 +300,20 @@ fn test_worker_circuit_breaker_opens() {
     assert!(response.contains("200 OK"), "Got: {}", response);
 
     let body = extract_json_body(&response).unwrap();
-    harness.logger.info(format!("[e2e::worker] STATUS: {}", body));
+    harness
+        .logger
+        .info(format!("[e2e::worker] STATUS: {}", body));
 
     // Verify circuit state is tracked (may be closed, open, or half_open depending on timing)
     // The important thing is that the daemon handles the worker state properly
     assert!(body.contains("workers"), "Expected workers in status");
 
-    harness.logger.info("[e2e::worker] VERIFY: circuit state is tracked");
-    harness.logger.info("[e2e::worker] TEST PASS: test_worker_circuit_breaker_opens");
+    harness
+        .logger
+        .info("[e2e::worker] VERIFY: circuit state is tracked");
+    harness
+        .logger
+        .info("[e2e::worker] TEST PASS: test_worker_circuit_breaker_opens");
     harness.mark_passed();
 }
 
@@ -285,7 +321,9 @@ fn test_worker_circuit_breaker_opens() {
 #[test]
 fn test_worker_circuit_breaker_half_open() {
     let harness = create_worker_harness("circuit_breaker_half_open").unwrap();
-    harness.logger.info("[e2e::worker] TEST START: test_worker_circuit_breaker_half_open");
+    harness
+        .logger
+        .info("[e2e::worker] TEST START: test_worker_circuit_breaker_half_open");
 
     let workers = WorkersFixture::mock_local(1);
     let socket_path = setup_daemon_with_workers(&harness, &workers).unwrap();
@@ -301,13 +339,19 @@ fn test_worker_circuit_breaker_half_open() {
     assert!(response.contains("200 OK"), "Got: {}", response);
 
     let body = extract_json_body(&response).unwrap();
-    harness.logger.info(format!("[e2e::worker] STATUS: {}", body));
+    harness
+        .logger
+        .info(format!("[e2e::worker] STATUS: {}", body));
 
     // Verify worker state is present
     assert!(body.contains("workers"), "Expected workers in status");
 
-    harness.logger.info("[e2e::worker] VERIFY: half-open state handling works");
-    harness.logger.info("[e2e::worker] TEST PASS: test_worker_circuit_breaker_half_open");
+    harness
+        .logger
+        .info("[e2e::worker] VERIFY: half-open state handling works");
+    harness
+        .logger
+        .info("[e2e::worker] TEST PASS: test_worker_circuit_breaker_half_open");
     harness.mark_passed();
 }
 
@@ -315,8 +359,12 @@ fn test_worker_circuit_breaker_half_open() {
 #[test]
 fn test_worker_circuit_breaker_recovery() {
     let harness = create_worker_harness("circuit_breaker_recovery").unwrap();
-    harness.logger.info("[e2e::worker] TEST START: test_worker_circuit_breaker_recovery");
-    harness.logger.info("[e2e::worker] VERIFY: state transitions CLOSED -> OPEN -> HALF_OPEN -> CLOSED");
+    harness
+        .logger
+        .info("[e2e::worker] TEST START: test_worker_circuit_breaker_recovery");
+    harness
+        .logger
+        .info("[e2e::worker] VERIFY: state transitions CLOSED -> OPEN -> HALF_OPEN -> CLOSED");
 
     let workers = WorkersFixture::mock_local(1);
     let socket_path = setup_daemon_with_workers(&harness, &workers).unwrap();
@@ -332,12 +380,16 @@ fn test_worker_circuit_breaker_recovery() {
     assert!(response.contains("200 OK"), "Got: {}", response);
 
     let body = extract_json_body(&response).unwrap();
-    harness.logger.info(format!("[e2e::worker] STATUS: {}", body));
+    harness
+        .logger
+        .info(format!("[e2e::worker] STATUS: {}", body));
 
     // Verify circuit state tracking
     assert!(body.contains("workers"), "Expected workers in status");
 
-    harness.logger.info("[e2e::worker] TEST PASS: test_worker_circuit_breaker_recovery");
+    harness
+        .logger
+        .info("[e2e::worker] TEST PASS: test_worker_circuit_breaker_recovery");
     harness.mark_passed();
 }
 
@@ -349,9 +401,13 @@ fn test_worker_circuit_breaker_recovery() {
 #[test]
 fn test_remote_command_success() {
     let harness = create_worker_harness("remote_command_success").unwrap();
-    harness.logger.info("[e2e::worker] TEST START: test_remote_command_success");
+    harness
+        .logger
+        .info("[e2e::worker] TEST START: test_remote_command_success");
     harness.logger.info("[e2e::worker] WORKER: worker1");
-    harness.logger.info("[e2e::worker] COMMAND: echo \"hello world\"");
+    harness
+        .logger
+        .info("[e2e::worker] COMMAND: echo \"hello world\"");
 
     let workers = WorkersFixture::mock_local(1);
     let socket_path = setup_daemon_with_workers(&harness, &workers).unwrap();
@@ -372,12 +428,16 @@ fn test_remote_command_success() {
     assert!(response.contains("200 OK"), "Got: {}", response);
 
     let body = extract_json_body(&response).unwrap();
-    harness.logger.info(format!("[e2e::worker] SELECT: {}", body));
+    harness
+        .logger
+        .info(format!("[e2e::worker] SELECT: {}", body));
 
     // Verify selection response
     assert!(body.contains("reason"), "Expected reason in response");
 
-    harness.logger.info("[e2e::worker] TEST PASS: test_remote_command_success");
+    harness
+        .logger
+        .info("[e2e::worker] TEST PASS: test_remote_command_success");
     harness.mark_passed();
 }
 
@@ -385,7 +445,9 @@ fn test_remote_command_success() {
 #[test]
 fn test_remote_command_failure() {
     let harness = create_worker_harness("remote_command_failure").unwrap();
-    harness.logger.info("[e2e::worker] TEST START: test_remote_command_failure");
+    harness
+        .logger
+        .info("[e2e::worker] TEST START: test_remote_command_failure");
 
     let workers = WorkersFixture::mock_local(1);
     let socket_path = setup_daemon_with_workers(&harness, &workers).unwrap();
@@ -400,8 +462,12 @@ fn test_remote_command_failure() {
     let response = send_socket_request(&socket_path, "GET /health").unwrap();
     assert!(response.contains("200 OK"), "Got: {}", response);
 
-    harness.logger.info("[e2e::worker] VERIFY: exit code captured for failed commands");
-    harness.logger.info("[e2e::worker] TEST PASS: test_remote_command_failure");
+    harness
+        .logger
+        .info("[e2e::worker] VERIFY: exit code captured for failed commands");
+    harness
+        .logger
+        .info("[e2e::worker] TEST PASS: test_remote_command_failure");
     harness.mark_passed();
 }
 
@@ -409,7 +475,9 @@ fn test_remote_command_failure() {
 #[test]
 fn test_remote_command_timeout() {
     let harness = create_worker_harness("remote_command_timeout").unwrap();
-    harness.logger.info("[e2e::worker] TEST START: test_remote_command_timeout");
+    harness
+        .logger
+        .info("[e2e::worker] TEST START: test_remote_command_timeout");
 
     let workers = WorkersFixture::mock_local(1);
     let socket_path = setup_daemon_with_workers(&harness, &workers).unwrap();
@@ -426,10 +494,16 @@ fn test_remote_command_timeout() {
     let elapsed = start.elapsed();
 
     assert!(response.contains("200 OK"), "Got: {}", response);
-    harness.logger.info(format!("[e2e::worker] TIMING: response in {:?}", elapsed));
+    harness
+        .logger
+        .info(format!("[e2e::worker] TIMING: response in {:?}", elapsed));
 
-    harness.logger.info("[e2e::worker] VERIFY: timeout kills long-running commands");
-    harness.logger.info("[e2e::worker] TEST PASS: test_remote_command_timeout");
+    harness
+        .logger
+        .info("[e2e::worker] VERIFY: timeout kills long-running commands");
+    harness
+        .logger
+        .info("[e2e::worker] TEST PASS: test_remote_command_timeout");
     harness.mark_passed();
 }
 
@@ -437,7 +511,9 @@ fn test_remote_command_timeout() {
 #[test]
 fn test_remote_command_output_streaming() {
     let harness = create_worker_harness("remote_command_streaming").unwrap();
-    harness.logger.info("[e2e::worker] TEST START: test_remote_command_output_streaming");
+    harness
+        .logger
+        .info("[e2e::worker] TEST START: test_remote_command_output_streaming");
 
     let workers = WorkersFixture::mock_local(1);
     let socket_path = setup_daemon_with_workers(&harness, &workers).unwrap();
@@ -452,8 +528,12 @@ fn test_remote_command_output_streaming() {
     let response = send_socket_request(&socket_path, "GET /status").unwrap();
     assert!(response.contains("200 OK"), "Got: {}", response);
 
-    harness.logger.info("[e2e::worker] VERIFY: large output is streamed, not buffered");
-    harness.logger.info("[e2e::worker] TEST PASS: test_remote_command_output_streaming");
+    harness
+        .logger
+        .info("[e2e::worker] VERIFY: large output is streamed, not buffered");
+    harness
+        .logger
+        .info("[e2e::worker] TEST PASS: test_remote_command_output_streaming");
     harness.mark_passed();
 }
 
@@ -465,7 +545,9 @@ fn test_remote_command_output_streaming() {
 #[test]
 fn test_worker_selection_single() {
     let harness = create_worker_harness("worker_selection_single").unwrap();
-    harness.logger.info("[e2e::worker] TEST START: test_worker_selection_single");
+    harness
+        .logger
+        .info("[e2e::worker] TEST START: test_worker_selection_single");
 
     // Create a single worker
     let workers = WorkersFixture::mock_local(1);
@@ -487,13 +569,19 @@ fn test_worker_selection_single() {
     assert!(response.contains("200 OK"), "Got: {}", response);
 
     let body = extract_json_body(&response).unwrap();
-    harness.logger.info(format!("[e2e::worker] SELECTION: {}", body));
+    harness
+        .logger
+        .info(format!("[e2e::worker] SELECTION: {}", body));
 
     // Verify selection made
     assert!(body.contains("reason"), "Expected reason in response");
 
-    harness.logger.info("[e2e::worker] VERIFY: single worker selected immediately");
-    harness.logger.info("[e2e::worker] TEST PASS: test_worker_selection_single");
+    harness
+        .logger
+        .info("[e2e::worker] VERIFY: single worker selected immediately");
+    harness
+        .logger
+        .info("[e2e::worker] TEST PASS: test_worker_selection_single");
     harness.mark_passed();
 }
 
@@ -501,7 +589,9 @@ fn test_worker_selection_single() {
 #[test]
 fn test_worker_selection_multiple() {
     let harness = create_worker_harness("worker_selection_multiple").unwrap();
-    harness.logger.info("[e2e::worker] TEST START: test_worker_selection_multiple");
+    harness
+        .logger
+        .info("[e2e::worker] TEST START: test_worker_selection_multiple");
 
     // Create workers with different capacities
     let gpu_worker = create_worker("gpu-1", "localhost", 8, 100);
@@ -512,7 +602,9 @@ fn test_worker_selection_multiple() {
 
     let socket_path = setup_daemon_with_workers(&harness, &workers).unwrap();
 
-    harness.logger.info("[e2e::worker] WORKERS: [gpu-1 (slots=8, priority=100), cpu-1 (slots=4, priority=50)]");
+    harness.logger.info(
+        "[e2e::worker] WORKERS: [gpu-1 (slots=8, priority=100), cpu-1 (slots=4, priority=50)]",
+    );
 
     // Start daemon
     start_daemon_with_socket(&harness, &socket_path, &[]).unwrap();
@@ -533,12 +625,16 @@ fn test_worker_selection_multiple() {
     harness
         .logger
         .info("[e2e::worker] SELECTION: scoring workers...");
-    harness.logger.info(format!("[e2e::worker] RESULT: {}", body));
+    harness
+        .logger
+        .info(format!("[e2e::worker] RESULT: {}", body));
 
     // Verify selection response contains reason
     assert!(body.contains("reason"), "Expected reason in response");
 
-    harness.logger.info("[e2e::worker] TEST PASS: test_worker_selection_multiple");
+    harness
+        .logger
+        .info("[e2e::worker] TEST PASS: test_worker_selection_multiple");
     harness.mark_passed();
 }
 
@@ -546,7 +642,9 @@ fn test_worker_selection_multiple() {
 #[test]
 fn test_worker_selection_all_busy() {
     let harness = create_worker_harness("worker_selection_all_busy").unwrap();
-    harness.logger.info("[e2e::worker] TEST START: test_worker_selection_all_busy");
+    harness
+        .logger
+        .info("[e2e::worker] TEST START: test_worker_selection_all_busy");
 
     // Create workers with no available slots (0 slots)
     let busy_worker = WorkerFixture {
@@ -568,22 +666,25 @@ fn test_worker_selection_all_busy() {
         .unwrap();
 
     // Request worker selection
-    let response = send_socket_request(
-        &socket_path,
-        "GET /select-worker?project=busy-test&cores=4",
-    )
-    .unwrap();
+    let response =
+        send_socket_request(&socket_path, "GET /select-worker?project=busy-test&cores=4").unwrap();
 
     assert!(response.contains("200 OK"), "Got: {}", response);
 
     let body = extract_json_body(&response).unwrap();
-    harness.logger.info(format!("[e2e::worker] RESULT: {}", body));
+    harness
+        .logger
+        .info(format!("[e2e::worker] RESULT: {}", body));
 
     // The response should indicate no worker available
     assert!(body.contains("reason"), "Expected reason in response");
 
-    harness.logger.info("[e2e::worker] VERIFY: no-worker returned with reason");
-    harness.logger.info("[e2e::worker] TEST PASS: test_worker_selection_all_busy");
+    harness
+        .logger
+        .info("[e2e::worker] VERIFY: no-worker returned with reason");
+    harness
+        .logger
+        .info("[e2e::worker] TEST PASS: test_worker_selection_all_busy");
     harness.mark_passed();
 }
 
@@ -591,7 +692,9 @@ fn test_worker_selection_all_busy() {
 #[test]
 fn test_worker_selection_tag_filtering() {
     let harness = create_worker_harness("worker_selection_tags").unwrap();
-    harness.logger.info("[e2e::worker] TEST START: test_worker_selection_tag_filtering");
+    harness
+        .logger
+        .info("[e2e::worker] TEST START: test_worker_selection_tag_filtering");
 
     let workers = WorkersFixture::mock_local(2);
     let socket_path = setup_daemon_with_workers(&harness, &workers).unwrap();
@@ -612,13 +715,19 @@ fn test_worker_selection_tag_filtering() {
     assert!(response.contains("200 OK"), "Got: {}", response);
 
     let body = extract_json_body(&response).unwrap();
-    harness.logger.info(format!("[e2e::worker] RESULT: {}", body));
+    harness
+        .logger
+        .info(format!("[e2e::worker] RESULT: {}", body));
 
     // Verify selection response
     assert!(body.contains("reason"), "Expected reason in response");
 
-    harness.logger.info("[e2e::worker] VERIFY: only matching workers selected");
-    harness.logger.info("[e2e::worker] TEST PASS: test_worker_selection_tag_filtering");
+    harness
+        .logger
+        .info("[e2e::worker] VERIFY: only matching workers selected");
+    harness
+        .logger
+        .info("[e2e::worker] TEST PASS: test_worker_selection_tag_filtering");
     harness.mark_passed();
 }
 
@@ -630,7 +739,9 @@ fn test_worker_selection_tag_filtering() {
 #[test]
 fn test_ssh_key_auth() {
     let harness = create_worker_harness("ssh_key_auth").unwrap();
-    harness.logger.info("[e2e::worker] TEST START: test_ssh_key_auth");
+    harness
+        .logger
+        .info("[e2e::worker] TEST START: test_ssh_key_auth");
 
     // Test with different key types in worker config
     let workers = WorkersFixture::mock_local(1);
@@ -646,8 +757,12 @@ fn test_ssh_key_auth() {
     let response = send_socket_request(&socket_path, "GET /health").unwrap();
     assert!(response.contains("200 OK"), "Got: {}", response);
 
-    harness.logger.info("[e2e::worker] VERIFY: Ed25519, RSA, ECDSA keys supported");
-    harness.logger.info("[e2e::worker] TEST PASS: test_ssh_key_auth");
+    harness
+        .logger
+        .info("[e2e::worker] VERIFY: Ed25519, RSA, ECDSA keys supported");
+    harness
+        .logger
+        .info("[e2e::worker] TEST PASS: test_ssh_key_auth");
     harness.mark_passed();
 }
 
@@ -655,7 +770,9 @@ fn test_ssh_key_auth() {
 #[test]
 fn test_ssh_agent_auth() {
     let harness = create_worker_harness("ssh_agent_auth").unwrap();
-    harness.logger.info("[e2e::worker] TEST START: test_ssh_agent_auth");
+    harness
+        .logger
+        .info("[e2e::worker] TEST START: test_ssh_agent_auth");
 
     let workers = WorkersFixture::mock_local(1);
     let socket_path = setup_daemon_with_workers(&harness, &workers).unwrap();
@@ -670,8 +787,12 @@ fn test_ssh_agent_auth() {
     let response = send_socket_request(&socket_path, "GET /health").unwrap();
     assert!(response.contains("200 OK"), "Got: {}", response);
 
-    harness.logger.info("[e2e::worker] VERIFY: SSH_AUTH_SOCK agent forwarding works");
-    harness.logger.info("[e2e::worker] TEST PASS: test_ssh_agent_auth");
+    harness
+        .logger
+        .info("[e2e::worker] VERIFY: SSH_AUTH_SOCK agent forwarding works");
+    harness
+        .logger
+        .info("[e2e::worker] TEST PASS: test_ssh_agent_auth");
     harness.mark_passed();
 }
 
@@ -683,7 +804,9 @@ fn test_ssh_agent_auth() {
 #[test]
 fn test_worker_reconnect_after_network_blip() {
     let harness = create_worker_harness("worker_reconnect").unwrap();
-    harness.logger.info("[e2e::worker] TEST START: test_worker_reconnect_after_network_blip");
+    harness
+        .logger
+        .info("[e2e::worker] TEST START: test_worker_reconnect_after_network_blip");
 
     let workers = WorkersFixture::mock_local(1);
     let socket_path = setup_daemon_with_workers(&harness, &workers).unwrap();
@@ -705,8 +828,12 @@ fn test_worker_reconnect_after_network_blip() {
     let response2 = send_socket_request(&socket_path, "GET /status").unwrap();
     assert!(response2.contains("200 OK"), "Second: {}", response2);
 
-    harness.logger.info("[e2e::worker] VERIFY: reconnection after network blip works");
-    harness.logger.info("[e2e::worker] TEST PASS: test_worker_reconnect_after_network_blip");
+    harness
+        .logger
+        .info("[e2e::worker] VERIFY: reconnection after network blip works");
+    harness
+        .logger
+        .info("[e2e::worker] TEST PASS: test_worker_reconnect_after_network_blip");
     harness.mark_passed();
 }
 
@@ -714,7 +841,9 @@ fn test_worker_reconnect_after_network_blip() {
 #[test]
 fn test_worker_handles_utf8_output() {
     let harness = create_worker_harness("worker_utf8_output").unwrap();
-    harness.logger.info("[e2e::worker] TEST START: test_worker_handles_utf8_output");
+    harness
+        .logger
+        .info("[e2e::worker] TEST START: test_worker_handles_utf8_output");
 
     let workers = WorkersFixture::mock_local(1);
     let socket_path = setup_daemon_with_workers(&harness, &workers).unwrap();
@@ -733,8 +862,12 @@ fn test_worker_handles_utf8_output() {
     let body = extract_json_body(&response).unwrap();
     assert!(!body.is_empty(), "Expected non-empty response body");
 
-    harness.logger.info("[e2e::worker] VERIFY: UTF-8 output handled correctly");
-    harness.logger.info("[e2e::worker] TEST PASS: test_worker_handles_utf8_output");
+    harness
+        .logger
+        .info("[e2e::worker] VERIFY: UTF-8 output handled correctly");
+    harness
+        .logger
+        .info("[e2e::worker] TEST PASS: test_worker_handles_utf8_output");
     harness.mark_passed();
 }
 
@@ -742,7 +875,9 @@ fn test_worker_handles_utf8_output() {
 #[test]
 fn test_worker_handles_binary_output() {
     let harness = create_worker_harness("worker_binary_output").unwrap();
-    harness.logger.info("[e2e::worker] TEST START: test_worker_handles_binary_output");
+    harness
+        .logger
+        .info("[e2e::worker] TEST START: test_worker_handles_binary_output");
 
     let workers = WorkersFixture::mock_local(1);
     let socket_path = setup_daemon_with_workers(&harness, &workers).unwrap();
@@ -757,8 +892,12 @@ fn test_worker_handles_binary_output() {
     let response = send_socket_request(&socket_path, "GET /health").unwrap();
     assert!(response.contains("200 OK"), "Got: {}", response);
 
-    harness.logger.info("[e2e::worker] VERIFY: binary output handled correctly");
-    harness.logger.info("[e2e::worker] TEST PASS: test_worker_handles_binary_output");
+    harness
+        .logger
+        .info("[e2e::worker] VERIFY: binary output handled correctly");
+    harness
+        .logger
+        .info("[e2e::worker] TEST PASS: test_worker_handles_binary_output");
     harness.mark_passed();
 }
 
@@ -770,7 +909,9 @@ fn test_worker_handles_binary_output() {
 #[test]
 fn test_release_worker() {
     let harness = create_worker_harness("release_worker").unwrap();
-    harness.logger.info("[e2e::worker] TEST START: test_release_worker");
+    harness
+        .logger
+        .info("[e2e::worker] TEST START: test_release_worker");
 
     let workers = WorkersFixture::mock_local(1);
     let socket_path = setup_daemon_with_workers(&harness, &workers).unwrap();
@@ -782,16 +923,17 @@ fn test_release_worker() {
         .unwrap();
 
     // Release worker slot
-    let response = send_socket_request(
-        &socket_path,
-        "POST /release-worker?worker=worker1&slots=1",
-    )
-    .unwrap();
+    let response =
+        send_socket_request(&socket_path, "POST /release-worker?worker=worker1&slots=1").unwrap();
 
     assert!(response.contains("200 OK"), "Got: {}", response);
 
-    harness.logger.info("[e2e::worker] VERIFY: worker slot released successfully");
-    harness.logger.info("[e2e::worker] TEST PASS: test_release_worker");
+    harness
+        .logger
+        .info("[e2e::worker] VERIFY: worker slot released successfully");
+    harness
+        .logger
+        .info("[e2e::worker] TEST PASS: test_release_worker");
     harness.mark_passed();
 }
 
@@ -799,7 +941,9 @@ fn test_release_worker() {
 #[test]
 fn test_release_worker_invalid() {
     let harness = create_worker_harness("release_worker_invalid").unwrap();
-    harness.logger.info("[e2e::worker] TEST START: test_release_worker_invalid");
+    harness
+        .logger
+        .info("[e2e::worker] TEST START: test_release_worker_invalid");
 
     let workers = WorkersFixture::mock_local(1);
     let socket_path = setup_daemon_with_workers(&harness, &workers).unwrap();
@@ -819,9 +963,13 @@ fn test_release_worker_invalid() {
     // Daemon may accept or reject this gracefully
     match response {
         Ok(r) => harness.logger.info(format!("[e2e::worker] RESULT: {}", r)),
-        Err(e) => harness.logger.info(format!("[e2e::worker] ERROR (expected): {}", e)),
+        Err(e) => harness
+            .logger
+            .info(format!("[e2e::worker] ERROR (expected): {}", e)),
     }
 
-    harness.logger.info("[e2e::worker] TEST PASS: test_release_worker_invalid");
+    harness
+        .logger
+        .info("[e2e::worker] TEST PASS: test_release_worker_invalid");
     harness.mark_passed();
 }

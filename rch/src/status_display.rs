@@ -268,11 +268,7 @@ fn render_circuit_details(worker: &crate::status_types::WorkerStatusFromApi, sty
 
     // Show help text for non-closed circuits
     if !help_text.is_empty() {
-        println!(
-            "    {} {}",
-            style.muted("Help:"),
-            style.info(help_text)
-        );
+        println!("    {} {}", style.muted("Help:"), style.info(help_text));
     }
 }
 
@@ -398,11 +394,7 @@ pub fn circuit_state_explanation(
                 Some(secs) => format!(" (auto-recovery in {}s)", secs),
                 None => " (cooldown elapsed, awaiting probe)".to_string(),
             };
-            let explanation = format!(
-                "Circuit open due to {}{}",
-                reason,
-                timing
-            );
+            let explanation = format!("Circuit open due to {}{}", reason, timing);
             (
                 "OPEN",
                 explanation,
@@ -414,11 +406,7 @@ pub fn circuit_state_explanation(
             "Testing recovery - limited requests allowed".to_string(),
             "Probing in progress; success will close circuit",
         ),
-        _ => (
-            "UNKNOWN",
-            "Unknown circuit state".to_string(),
-            "",
-        ),
+        _ => ("UNKNOWN", "Unknown circuit state".to_string(), ""),
     }
 }
 

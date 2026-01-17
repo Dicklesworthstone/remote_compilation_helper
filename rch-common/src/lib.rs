@@ -22,14 +22,16 @@ pub mod test_change;
 pub mod toolchain;
 pub mod types;
 
-pub use binary_hash::{BinaryHashResult, binaries_equivalent, binary_contains_marker, compute_binary_hash};
-pub use test_change::{TestChangeGuard, TestCodeChange};
+pub use binary_hash::{
+    BinaryHashResult, binaries_equivalent, binary_contains_marker, compute_binary_hash,
+};
 pub use patterns::{
     Classification, ClassificationDetails, ClassificationTier, CompilationKind, TierDecision,
     classify_command, classify_command_detailed,
 };
 pub use protocol::{HookInput, HookOutput, ToolInput};
 pub use ssh::{CommandResult, KnownHostsPolicy, SshClient, SshOptions, SshPool};
+pub use test_change::{TestChangeGuard, TestCodeChange};
 pub use toolchain::{ToolchainInfo, wrap_command_with_toolchain};
 pub use types::{
     BuildLocation, BuildRecord, BuildStats, CircuitBreakerConfig, CircuitState, CircuitStats,
