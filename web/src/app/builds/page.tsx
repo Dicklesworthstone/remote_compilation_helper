@@ -214,11 +214,11 @@ export default function BuildsPage() {
             <table className="w-full text-sm" data-testid="builds-table">
               <thead className="bg-surface-elevated">
                 <tr>
-                  <th className="text-left p-3 font-medium text-muted-foreground">Project</th>
-                  <th className="text-left p-3 font-medium text-muted-foreground">Worker</th>
-                  <th className="text-left p-3 font-medium text-muted-foreground">Duration</th>
-                  <th className="text-left p-3 font-medium text-muted-foreground">Status</th>
-                  <th className="text-left p-3 font-medium text-muted-foreground">Time</th>
+                  <th scope="col" className="text-left p-3 font-medium text-muted-foreground">Project</th>
+                  <th scope="col" className="text-left p-3 font-medium text-muted-foreground">Worker</th>
+                  <th scope="col" className="text-left p-3 font-medium text-muted-foreground">Duration</th>
+                  <th scope="col" className="text-left p-3 font-medium text-muted-foreground">Status</th>
+                  <th scope="col" className="text-left p-3 font-medium text-muted-foreground">Time</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-border">

@@ -63,7 +63,15 @@ export function WorkerCard({ worker }: WorkerCardProps) {
           <span>Slots Used</span>
           <span>{worker.used_slots} / {worker.total_slots}</span>
         </div>
-        <div className="h-2 bg-surface-elevated rounded-full overflow-hidden">
+        <div
+          className="h-2 bg-surface-elevated rounded-full overflow-hidden"
+          role="progressbar"
+          aria-label="Slots used"
+          aria-valuemin={0}
+          aria-valuemax={worker.total_slots}
+          aria-valuenow={worker.used_slots}
+          aria-valuetext={`${worker.used_slots} of ${worker.total_slots} slots used`}
+        >
           <motion.div
             className="h-full bg-primary rounded-full"
             initial={{ width: 0 }}
