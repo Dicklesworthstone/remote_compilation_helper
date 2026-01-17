@@ -39,6 +39,24 @@ pub enum WorkerStatus {
     Disabled,
 }
 
+/// Circuit breaker state for a worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CircuitState {
+    /// Normal operation.
+    Closed,
+    /// Circuit is open (short-circuit).
+    Open,
+    /// Circuit is half-open (probing).
+    HalfOpen,
+}
+
+impl Default for CircuitState {
+    fn default() -> Self {
+        Self::Closed
+    }
+}
+
 impl Default for WorkerStatus {
     fn default() -> Self {
         Self::Healthy
@@ -157,6 +175,8 @@ pub struct RchConfig {
     pub compilation: CompilationConfig,
     #[serde(default)]
     pub transfer: TransferConfig,
+    #[serde(default)]
+    pub circuit: CircuitBreakerConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -178,6 +198,42 @@ impl Default for GeneralConfig {
             enabled: true,
             log_level: "info".to_string(),
             socket_path: "/tmp/rch.sock".to_string(),
+        }
+    }
+}
+
+/// Circuit breaker configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CircuitBreakerConfig {
+    /// Consecutive failures to open circuit.
+    #[serde(default = "default_circuit_failure_threshold")]
+    pub failure_threshold: u32,
+    /// Consecutive successes to close circuit.
+    #[serde(default = "default_circuit_success_threshold")]
+    pub success_threshold: u32,
+    /// Error rate threshold (0.0-1.0) to open circuit.
+    #[serde(default = "default_circuit_error_rate_threshold")]
+    pub error_rate_threshold: f64,
+    /// Rolling window size in seconds.
+    #[serde(default = "default_circuit_window_secs")]
+    pub window_secs: u64,
+    /// Cooldown duration before half-open (seconds).
+    #[serde(default = "default_circuit_open_cooldown_secs")]
+    pub open_cooldown_secs: u64,
+    /// Max concurrent probes in half-open.
+    #[serde(default = "default_circuit_half_open_max_probes")]
+    pub half_open_max_probes: u32,
+}
+
+impl Default for CircuitBreakerConfig {
+    fn default() -> Self {
+        Self {
+            failure_threshold: default_circuit_failure_threshold(),
+            success_threshold: default_circuit_success_threshold(),
+            error_rate_threshold: default_circuit_error_rate_threshold(),
+            window_secs: default_circuit_window_secs(),
+            open_cooldown_secs: default_circuit_open_cooldown_secs(),
+            half_open_max_probes: default_circuit_half_open_max_probes(),
         }
     }
 }
@@ -220,6 +276,30 @@ impl Default for TransferConfig {
     }
 }
 
+fn default_circuit_failure_threshold() -> u32 {
+    3
+}
+
+fn default_circuit_success_threshold() -> u32 {
+    2
+}
+
+fn default_circuit_error_rate_threshold() -> f64 {
+    0.5
+}
+
+fn default_circuit_window_secs() -> u64 {
+    60
+}
+
+fn default_circuit_open_cooldown_secs() -> u64 {
+    30
+}
+
+fn default_circuit_half_open_max_probes() -> u32 {
+    1
+}
+
 fn default_true() -> bool {
     true
 }
@@ -257,6 +337,48 @@ fn default_excludes() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_circuit_state_default() {
+        assert_eq!(CircuitState::default(), CircuitState::Closed);
+    }
+
+    #[test]
+    fn test_circuit_config_defaults() {
+        let config = CircuitBreakerConfig::default();
+        assert_eq!(config.failure_threshold, 3);
+        assert_eq!(config.success_threshold, 2);
+        assert_eq!(config.error_rate_threshold, 0.5);
+        assert_eq!(config.window_secs, 60);
+        assert_eq!(config.open_cooldown_secs, 30);
+        assert_eq!(config.half_open_max_probes, 1);
+    }
+
+    #[test]
+    fn test_rch_config_has_circuit_defaults() {
+        let config = RchConfig::default();
+        assert_eq!(config.circuit.failure_threshold, 3);
+    }
+
+    #[test]
+    fn test_circuit_config_serde_roundtrip() {
+        let config = CircuitBreakerConfig {
+            failure_threshold: 5,
+            success_threshold: 3,
+            error_rate_threshold: 0.75,
+            window_secs: 120,
+            open_cooldown_secs: 45,
+            half_open_max_probes: 2,
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let parsed: CircuitBreakerConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.failure_threshold, 5);
+        assert_eq!(parsed.success_threshold, 3);
+        assert_eq!(parsed.error_rate_threshold, 0.75);
+        assert_eq!(parsed.window_secs, 120);
+        assert_eq!(parsed.open_cooldown_secs, 45);
+        assert_eq!(parsed.half_open_max_probes, 2);
+    }
 
     #[test]
     fn test_selection_reason_serialization() {
