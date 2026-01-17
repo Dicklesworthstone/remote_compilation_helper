@@ -451,6 +451,7 @@ fn test_daemon_unknown_endpoint_error() -> HarnessResult<()> {
     let harness = TestHarnessBuilder::new("daemon_unknown_endpoint")
         .cleanup_on_success(true)
         .cleanup_on_failure(false)
+        .rchd_binary(rchd_binary_path())
         .build()?;
 
     // Create workers config
@@ -498,6 +499,7 @@ fn test_daemon_config_fixture_integration() -> HarnessResult<()> {
     let harness = TestHarnessBuilder::new("daemon_config_fixture")
         .cleanup_on_success(true)
         .cleanup_on_failure(false)
+        .rchd_binary(rchd_binary_path())
         .build()?;
 
     // Use fixtures to generate config
