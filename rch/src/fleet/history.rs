@@ -114,4 +114,366 @@ impl HistoryManager {
 
         Ok(None)
     }
+
+    /// Create a history manager with a custom directory (for testing).
+    #[cfg(test)]
+    pub fn with_dir(history_dir: PathBuf) -> Result<Self> {
+        fs::create_dir_all(&history_dir)?;
+        Ok(Self { history_dir })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    // ========================
+    // DeploymentHistoryEntry tests
+    // ========================
+
+    #[test]
+    fn deployment_history_entry_serializes() {
+        let entry = DeploymentHistoryEntry {
+            timestamp: "2024-01-15T10:30:00Z".to_string(),
+            worker_id: "worker-1".to_string(),
+            version: "1.0.0".to_string(),
+            previous_version: Some("0.9.0".to_string()),
+            success: true,
+            duration_ms: 5000,
+            error: None,
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(json.contains("2024-01-15T10:30:00Z"));
+        assert!(json.contains("worker-1"));
+        assert!(json.contains("1.0.0"));
+        assert!(json.contains("0.9.0"));
+        assert!(json.contains("\"success\":true"));
+        assert!(json.contains("5000"));
+    }
+
+    #[test]
+    fn deployment_history_entry_failed_serializes() {
+        let entry = DeploymentHistoryEntry {
+            timestamp: "2024-01-15T10:35:00Z".to_string(),
+            worker_id: "worker-2".to_string(),
+            version: "1.0.0".to_string(),
+            previous_version: None,
+            success: false,
+            duration_ms: 1000,
+            error: Some("Connection timeout".to_string()),
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(json.contains("worker-2"));
+        assert!(json.contains("\"success\":false"));
+        assert!(json.contains("Connection timeout"));
+    }
+
+    #[test]
+    fn deployment_history_entry_deserializes_roundtrip() {
+        let entry = DeploymentHistoryEntry {
+            timestamp: "2024-01-15T11:00:00Z".to_string(),
+            worker_id: "test-worker".to_string(),
+            version: "2.0.0".to_string(),
+            previous_version: Some("1.5.0".to_string()),
+            success: true,
+            duration_ms: 3500,
+            error: None,
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let restored: DeploymentHistoryEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.timestamp, "2024-01-15T11:00:00Z");
+        assert_eq!(restored.worker_id, "test-worker");
+        assert_eq!(restored.version, "2.0.0");
+        assert_eq!(restored.previous_version, Some("1.5.0".to_string()));
+        assert!(restored.success);
+        assert_eq!(restored.duration_ms, 3500);
+        assert!(restored.error.is_none());
+    }
+
+    // ========================
+    // HistoryManager tests
+    // ========================
+
+    #[test]
+    fn history_manager_with_dir_creates_directory() {
+        let temp_dir = TempDir::new().unwrap();
+        let history_dir = temp_dir.path().join("test_history");
+        let _manager = HistoryManager::with_dir(history_dir.clone()).unwrap();
+        assert!(history_dir.exists());
+    }
+
+    #[test]
+    fn history_manager_get_history_empty() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager = HistoryManager::with_dir(temp_dir.path().join("history")).unwrap();
+        let history = manager.get_history(10, None).unwrap();
+        assert!(history.is_empty());
+    }
+
+    #[test]
+    fn history_manager_record_and_get_deployment() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager = HistoryManager::with_dir(temp_dir.path().join("history")).unwrap();
+
+        let entry = DeploymentHistoryEntry {
+            timestamp: "2024-01-15T12:00:00Z".to_string(),
+            worker_id: "worker-1".to_string(),
+            version: "1.0.0".to_string(),
+            previous_version: None,
+            success: true,
+            duration_ms: 2000,
+            error: None,
+        };
+
+        manager.record_deployment(&entry).unwrap();
+
+        let history = manager.get_history(10, None).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].worker_id, "worker-1");
+        assert_eq!(history[0].version, "1.0.0");
+    }
+
+    #[test]
+    fn history_manager_get_history_filtered_by_worker() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager = HistoryManager::with_dir(temp_dir.path().join("history")).unwrap();
+
+        // Record deployments for different workers
+        for (worker, version) in [("worker-1", "1.0.0"), ("worker-2", "1.0.0"), ("worker-1", "1.1.0")] {
+            manager
+                .record_deployment(&DeploymentHistoryEntry {
+                    timestamp: format!("2024-01-15T12:0{}:00Z", version.chars().nth(2).unwrap()),
+                    worker_id: worker.to_string(),
+                    version: version.to_string(),
+                    previous_version: None,
+                    success: true,
+                    duration_ms: 1000,
+                    error: None,
+                })
+                .unwrap();
+        }
+
+        let history_w1 = manager.get_history(10, Some("worker-1")).unwrap();
+        assert_eq!(history_w1.len(), 2);
+        for entry in &history_w1 {
+            assert_eq!(entry.worker_id, "worker-1");
+        }
+
+        let history_w2 = manager.get_history(10, Some("worker-2")).unwrap();
+        assert_eq!(history_w2.len(), 1);
+        assert_eq!(history_w2[0].worker_id, "worker-2");
+    }
+
+    #[test]
+    fn history_manager_get_history_respects_limit() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager = HistoryManager::with_dir(temp_dir.path().join("history")).unwrap();
+
+        // Record many deployments
+        for i in 0..10 {
+            manager
+                .record_deployment(&DeploymentHistoryEntry {
+                    timestamp: format!("2024-01-15T12:{:02}:00Z", i),
+                    worker_id: "worker-1".to_string(),
+                    version: format!("1.0.{}", i),
+                    previous_version: None,
+                    success: true,
+                    duration_ms: 1000,
+                    error: None,
+                })
+                .unwrap();
+        }
+
+        let history = manager.get_history(3, None).unwrap();
+        assert_eq!(history.len(), 3);
+    }
+
+    #[test]
+    fn history_manager_get_history_sorted_descending() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager = HistoryManager::with_dir(temp_dir.path().join("history")).unwrap();
+
+        // Record deployments with different timestamps
+        for i in 0..5 {
+            manager
+                .record_deployment(&DeploymentHistoryEntry {
+                    timestamp: format!("2024-01-15T12:{:02}:00Z", i),
+                    worker_id: "worker-1".to_string(),
+                    version: format!("1.0.{}", i),
+                    previous_version: None,
+                    success: true,
+                    duration_ms: 1000,
+                    error: None,
+                })
+                .unwrap();
+        }
+
+        let history = manager.get_history(10, None).unwrap();
+        // Most recent (04) should be first
+        assert!(history[0].timestamp > history[1].timestamp);
+        assert!(history[1].timestamp > history[2].timestamp);
+    }
+
+    #[test]
+    fn history_manager_get_last_successful() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager = HistoryManager::with_dir(temp_dir.path().join("history")).unwrap();
+
+        // Record failed then successful
+        manager
+            .record_deployment(&DeploymentHistoryEntry {
+                timestamp: "2024-01-15T12:00:00Z".to_string(),
+                worker_id: "worker-1".to_string(),
+                version: "1.0.0".to_string(),
+                previous_version: None,
+                success: true,
+                duration_ms: 1000,
+                error: None,
+            })
+            .unwrap();
+
+        manager
+            .record_deployment(&DeploymentHistoryEntry {
+                timestamp: "2024-01-15T12:01:00Z".to_string(),
+                worker_id: "worker-1".to_string(),
+                version: "1.1.0".to_string(),
+                previous_version: Some("1.0.0".to_string()),
+                success: false,
+                duration_ms: 500,
+                error: Some("Failed".to_string()),
+            })
+            .unwrap();
+
+        let last = manager.get_last_successful("worker-1").unwrap();
+        assert!(last.is_some());
+        assert_eq!(last.unwrap().version, "1.0.0");
+    }
+
+    #[test]
+    fn history_manager_get_last_successful_none() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager = HistoryManager::with_dir(temp_dir.path().join("history")).unwrap();
+
+        // Only failed deployments
+        manager
+            .record_deployment(&DeploymentHistoryEntry {
+                timestamp: "2024-01-15T12:00:00Z".to_string(),
+                worker_id: "worker-1".to_string(),
+                version: "1.0.0".to_string(),
+                previous_version: None,
+                success: false,
+                duration_ms: 500,
+                error: Some("Failed".to_string()),
+            })
+            .unwrap();
+
+        let last = manager.get_last_successful("worker-1").unwrap();
+        assert!(last.is_none());
+    }
+
+    #[test]
+    fn history_manager_get_previous_version() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager = HistoryManager::with_dir(temp_dir.path().join("history")).unwrap();
+
+        // Record two successful deployments
+        manager
+            .record_deployment(&DeploymentHistoryEntry {
+                timestamp: "2024-01-15T12:00:00Z".to_string(),
+                worker_id: "worker-1".to_string(),
+                version: "1.0.0".to_string(),
+                previous_version: None,
+                success: true,
+                duration_ms: 1000,
+                error: None,
+            })
+            .unwrap();
+
+        manager
+            .record_deployment(&DeploymentHistoryEntry {
+                timestamp: "2024-01-15T12:01:00Z".to_string(),
+                worker_id: "worker-1".to_string(),
+                version: "1.1.0".to_string(),
+                previous_version: Some("1.0.0".to_string()),
+                success: true,
+                duration_ms: 1000,
+                error: None,
+            })
+            .unwrap();
+
+        let prev = manager.get_previous_version("worker-1").unwrap();
+        assert!(prev.is_some());
+        assert_eq!(prev.unwrap(), "1.0.0");
+    }
+
+    #[test]
+    fn history_manager_get_previous_version_none_with_single_deployment() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager = HistoryManager::with_dir(temp_dir.path().join("history")).unwrap();
+
+        // Only one successful deployment
+        manager
+            .record_deployment(&DeploymentHistoryEntry {
+                timestamp: "2024-01-15T12:00:00Z".to_string(),
+                worker_id: "worker-1".to_string(),
+                version: "1.0.0".to_string(),
+                previous_version: None,
+                success: true,
+                duration_ms: 1000,
+                error: None,
+            })
+            .unwrap();
+
+        let prev = manager.get_previous_version("worker-1").unwrap();
+        assert!(prev.is_none());
+    }
+
+    #[test]
+    fn history_manager_get_previous_version_skips_failures() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager = HistoryManager::with_dir(temp_dir.path().join("history")).unwrap();
+
+        // Record: success, fail, success
+        manager
+            .record_deployment(&DeploymentHistoryEntry {
+                timestamp: "2024-01-15T12:00:00Z".to_string(),
+                worker_id: "worker-1".to_string(),
+                version: "1.0.0".to_string(),
+                previous_version: None,
+                success: true,
+                duration_ms: 1000,
+                error: None,
+            })
+            .unwrap();
+
+        manager
+            .record_deployment(&DeploymentHistoryEntry {
+                timestamp: "2024-01-15T12:01:00Z".to_string(),
+                worker_id: "worker-1".to_string(),
+                version: "1.1.0".to_string(),
+                previous_version: Some("1.0.0".to_string()),
+                success: false,
+                duration_ms: 500,
+                error: Some("Failed".to_string()),
+            })
+            .unwrap();
+
+        manager
+            .record_deployment(&DeploymentHistoryEntry {
+                timestamp: "2024-01-15T12:02:00Z".to_string(),
+                worker_id: "worker-1".to_string(),
+                version: "1.2.0".to_string(),
+                previous_version: Some("1.0.0".to_string()),
+                success: true,
+                duration_ms: 1000,
+                error: None,
+            })
+            .unwrap();
+
+        let prev = manager.get_previous_version("worker-1").unwrap();
+        assert!(prev.is_some());
+        // Should skip the failed 1.1.0 and return 1.0.0
+        assert_eq!(prev.unwrap(), "1.0.0");
+    }
 }
