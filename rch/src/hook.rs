@@ -749,7 +749,14 @@ mod tests {
     #[tokio::test]
     async fn test_daemon_query_missing_socket() {
         // Query a non-existent socket should fail gracefully
-        let result = query_daemon("/tmp/nonexistent_rch_test.sock", "testproj", 4, None, RequiredRuntime::None).await;
+        let result = query_daemon(
+            "/tmp/nonexistent_rch_test.sock",
+            "testproj",
+            4,
+            None,
+            RequiredRuntime::None,
+        )
+        .await;
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(err_msg.contains("not found") || err_msg.contains("No such file"));
@@ -816,7 +823,8 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
         // Query the mock daemon
-        let result = query_daemon(&socket_path, "test-project", 4, None, RequiredRuntime::None).await;
+        let result =
+            query_daemon(&socket_path, "test-project", 4, None, RequiredRuntime::None).await;
 
         // Clean up
         daemon_handle.await.expect("Daemon task panicked");
@@ -873,7 +881,14 @@ mod tests {
 
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
-        let result = query_daemon(&socket_path, "my project/test", 2, None, RequiredRuntime::None).await;
+        let result = query_daemon(
+            &socket_path,
+            "my project/test",
+            2,
+            None,
+            RequiredRuntime::None,
+        )
+        .await;
         daemon_handle.await.expect("Daemon task");
         let _ = std::fs::remove_file(&socket_path_clone);
 

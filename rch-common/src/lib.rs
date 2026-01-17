@@ -35,6 +35,6 @@ pub use config::{
 
 // Discovery module re-exports
 pub use discovery::{
-    DiscoveredHost, DiscoverySource, discover_all, parse_shell_aliases, parse_shell_aliases_content,
-    parse_ssh_config, parse_ssh_config_content,
+    DiscoveredHost, DiscoverySource, discover_all, parse_shell_aliases,
+    parse_shell_aliases_content, parse_ssh_config, parse_ssh_config_content,
 };

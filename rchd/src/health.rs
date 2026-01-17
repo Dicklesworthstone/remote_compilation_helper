@@ -508,7 +508,10 @@ pub async fn probe_worker_capabilities(
                 }
                 Err(e) => {
                     let _ = client.disconnect().await;
-                    debug!("Worker {} capabilities probe command failed: {}", worker.config.id, e);
+                    debug!(
+                        "Worker {} capabilities probe command failed: {}",
+                        worker.config.id, e
+                    );
                 }
             }
         }

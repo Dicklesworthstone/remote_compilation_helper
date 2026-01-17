@@ -276,23 +276,28 @@ pub fn parse_shell_aliases() -> Result<Vec<DiscoveredHost>> {
 }
 
 /// Parse a shell RC file for SSH aliases.
-pub fn parse_shell_aliases_file(path: &PathBuf, source: DiscoverySource) -> Result<Vec<DiscoveredHost>> {
+pub fn parse_shell_aliases_file(
+    path: &PathBuf,
+    source: DiscoverySource,
+) -> Result<Vec<DiscoveredHost>> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read shell RC file: {}", path.display()))?;
     parse_shell_aliases_content(&content, source)
 }
 
 /// Parse shell alias content for SSH commands.
-pub fn parse_shell_aliases_content(content: &str, source: DiscoverySource) -> Result<Vec<DiscoveredHost>> {
+pub fn parse_shell_aliases_content(
+    content: &str,
+    source: DiscoverySource,
+) -> Result<Vec<DiscoveredHost>> {
     use regex::Regex;
 
     let mut hosts = Vec::new();
 
     // Match alias definitions with ssh commands
     // Handles: alias NAME='ssh ...' or alias NAME="ssh ..."
-    let alias_re = Regex::new(
-        r#"(?m)^\s*alias\s+(\w+)\s*=\s*['"]ssh\s+(.*)['"]"#
-    ).context("Failed to compile alias regex")?;
+    let alias_re = Regex::new(r#"(?m)^\s*alias\s+(\w+)\s*=\s*['"]ssh\s+(.*)['"]"#)
+        .context("Failed to compile alias regex")?;
 
     // Extract -i identity file
     let identity_re = Regex::new(r"-i\s+(\S+)").context("Failed to compile identity regex")?;

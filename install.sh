@@ -56,6 +56,9 @@ TEMP_DIR=""
 TARBALL_PATH=""
 PROXY_ARGS=""
 
+# Default color values (set properly by setup_ui)
+RED='' GREEN='' YELLOW='' BLUE='' MAGENTA='' CYAN='' BOLD='' DIM='' NC=''
+
 # ============================================================================
 # Terminal Detection and UI Setup
 # ============================================================================

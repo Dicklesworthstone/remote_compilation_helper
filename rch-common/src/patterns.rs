@@ -195,15 +195,7 @@ pub fn normalize_command(cmd: &str) -> Cow<'_, str> {
 
     // Strip common command prefixes/wrappers
     let wrappers = [
-        "sudo ",
-        "env ",
-        "time ",
-        "nice ",
-        "ionice ",
-        "strace ",
-        "ltrace ",
-        "perf ",
-        "taskset ",
+        "sudo ", "env ", "time ", "nice ", "ionice ", "strace ", "ltrace ", "perf ", "taskset ",
         "numactl ",
     ];
 
@@ -215,7 +207,7 @@ pub fn normalize_command(cmd: &str) -> Cow<'_, str> {
                 changed = true;
             }
         }
-        
+
         // Handle env VAR=val syntax
         // Logic: if result starts with VAR=val, strip it
         // We look for the first space, and check if the part before it contains '='
@@ -236,20 +228,20 @@ pub fn normalize_command(cmd: &str) -> Cow<'_, str> {
     // We assume the command is the first word
     if result.starts_with('/') {
         if let Some(space_idx) = result.find(' ') {
-             let cmd_part = &result[..space_idx];
-             if let Some(last_slash) = cmd_part.rfind('/') {
-                 // Reconstruct: <stripped_cmd> <rest>
-                 // This is tricky with Cow, so we'll just return Owned if we modify
-                 let stripped_cmd = &cmd_part[last_slash+1..];
-                 let rest = &result[space_idx..];
-                 return Cow::Owned(format!("{}{}", stripped_cmd, rest));
-             }
-         } else {
-             // Single word command
-              if let Some(last_slash) = result.rfind('/') {
-                 result = &result[last_slash+1..];
-             }
-         }
+            let cmd_part = &result[..space_idx];
+            if let Some(last_slash) = cmd_part.rfind('/') {
+                // Reconstruct: <stripped_cmd> <rest>
+                // This is tricky with Cow, so we'll just return Owned if we modify
+                let stripped_cmd = &cmd_part[last_slash + 1..];
+                let rest = &result[space_idx..];
+                return Cow::Owned(format!("{}{}", stripped_cmd, rest));
+            }
+        } else {
+            // Single word command
+            if let Some(last_slash) = result.rfind('/') {
+                result = &result[last_slash + 1..];
+            }
+        }
     }
 
     if result == cmd {
@@ -482,7 +474,10 @@ fn classify_full(cmd: &str) -> Classification {
         if let Some(after) = rest.strip_prefix("typecheck") {
             if after.is_empty() || after.starts_with(' ') {
                 // Check for --watch flag - don't intercept interactive mode
-                if after.split_whitespace().any(|a| a == "-w" || a == "--watch") {
+                if after
+                    .split_whitespace()
+                    .any(|a| a == "-w" || a == "--watch")
+                {
                     return Classification::not_compilation(
                         "bun typecheck --watch is interactive (not intercepted)",
                     );
@@ -904,14 +899,23 @@ mod tests {
         // This fails currently because classify_full expects command to start with "cargo"
         // Wrapper tools like "time", "sudo", "env" break this logic
         let result = classify_command("time cargo build");
-        assert!(result.is_compilation, "Should classify 'time cargo build' as compilation");
+        assert!(
+            result.is_compilation,
+            "Should classify 'time cargo build' as compilation"
+        );
         assert_eq!(result.kind, Some(CompilationKind::CargoBuild));
 
         let result = classify_command("sudo cargo check");
-        assert!(result.is_compilation, "Should classify 'sudo cargo check' as compilation");
+        assert!(
+            result.is_compilation,
+            "Should classify 'sudo cargo check' as compilation"
+        );
 
         let result = classify_command("env RUST_BACKTRACE=1 cargo test");
-        assert!(result.is_compilation, "Should classify env-wrapped cargo test as compilation");
+        assert!(
+            result.is_compilation,
+            "Should classify env-wrapped cargo test as compilation"
+        );
     }
 
     // =========================================================================
@@ -923,7 +927,10 @@ mod tests {
         // Piped commands should be rejected at Tier 1 (structure analysis)
         let result = classify_command("bun test | grep error");
         assert!(!result.is_compilation);
-        assert!(result.reason.contains("piped"), "Should be rejected as piped command");
+        assert!(
+            result.reason.contains("piped"),
+            "Should be rejected as piped command"
+        );
 
         // Piped with output filtering
         let result = classify_command("bun test 2>&1 | tee output.log");

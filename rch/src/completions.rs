@@ -8,8 +8,8 @@ use clap::CommandFactory;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::ui::OutputContext;
 use crate::Cli;
+use crate::ui::OutputContext;
 
 /// Standard installation paths for each shell
 #[derive(Debug, Clone)]
@@ -145,7 +145,10 @@ pub fn install_completions(
     }
 
     if dry_run {
-        println!("Would write completion script to: {}", paths.script_path.display());
+        println!(
+            "Would write completion script to: {}",
+            paths.script_path.display()
+        );
         if let (Some(rc_file), Some(rc_line)) = (&paths.rc_file, &paths.rc_line) {
             if !rc_file_has_rch_setup(rc_file)? {
                 println!("Would add to {}: {}", rc_file.display(), rc_line);
@@ -156,9 +159,8 @@ pub fn install_completions(
 
     // Create parent directory if needed
     if let Some(parent) = paths.script_path.parent() {
-        fs::create_dir_all(parent).with_context(|| {
-            format!("Failed to create directory: {}", parent.display())
-        })?;
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create directory: {}", parent.display()))?;
     }
 
     // Write the completion script
@@ -269,7 +271,11 @@ pub fn uninstall_completions(
         })?;
 
         if !ctx.is_quiet() {
-            println!("Removed {:?} completions from {}", shell, paths.script_path.display());
+            println!(
+                "Removed {:?} completions from {}",
+                shell,
+                paths.script_path.display()
+            );
         }
     } else if !ctx.is_quiet() {
         println!(
@@ -305,7 +311,11 @@ pub fn show_status(ctx: &OutputContext) -> Result<()> {
     for shell in &shells {
         if let Ok(paths) = get_install_paths(*shell) {
             let installed = paths.script_path.exists();
-            let status = if installed { "installed" } else { "not installed" };
+            let status = if installed {
+                "installed"
+            } else {
+                "not installed"
+            };
             println!(
                 "  {:12} {} ({})",
                 format!("{:?}:", shell),
@@ -351,7 +361,12 @@ mod tests {
     #[test]
     fn test_get_install_paths_bash() {
         let paths = get_install_paths(clap_complete::Shell::Bash).unwrap();
-        assert!(paths.script_path.to_string_lossy().contains("bash-completion"));
+        assert!(
+            paths
+                .script_path
+                .to_string_lossy()
+                .contains("bash-completion")
+        );
     }
 
     #[test]

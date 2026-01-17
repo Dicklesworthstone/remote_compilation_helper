@@ -66,6 +66,7 @@ pub use adaptive::{
 pub use context::{
     ColorChoice, OutputConfig, OutputContext, OutputMode, TerminalCaps, Verbosity, default_context,
 };
+pub use markdown::{render_markdown, strip_markdown};
 pub use progress::{
     MultiProgressManager, Spinner, StepProgress, TransferProgress, with_spinner,
     with_spinner_result,
@@ -74,7 +75,6 @@ pub use styled::{
     Align, BorderChars, BorderStyle, BoxStyle, Margin, Padding, Spacing, join_horizontal,
     join_vertical, place, presets,
 };
-pub use markdown::{render_markdown, strip_markdown};
 pub use theme::{SemanticColors, StatusIndicator, Symbols, Theme};
 pub use writer::{OutputBuffer, OutputWriter, SharedOutputBuffer};
 

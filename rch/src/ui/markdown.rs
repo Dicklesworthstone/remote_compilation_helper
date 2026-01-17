@@ -313,7 +313,8 @@ impl TerminalRenderer {
     fn write_code_line(&mut self, line: &str) {
         let indent = "    ";
         if self.colors_enabled {
-            self.output.push_str(&format!("{}{}", indent, line.dimmed()));
+            self.output
+                .push_str(&format!("{}{}", indent, line.dimmed()));
         } else {
             self.output.push_str(&format!("{}{}", indent, line));
         }

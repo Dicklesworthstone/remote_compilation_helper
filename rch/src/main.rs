@@ -12,6 +12,7 @@ mod completions;
 mod config;
 mod doctor;
 pub mod error;
+pub mod fleet;
 mod hook;
 pub mod state;
 mod status_display;
@@ -24,6 +25,7 @@ mod update;
 use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::CompleteEnv;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 use ui::{ColorChoice, OutputConfig, OutputContext};
@@ -323,6 +325,23 @@ CHECKS PERFORMED:
         #[arg(long)]
         show_changelog: bool,
     },
+
+    /// Deploy, rollback, and manage the worker fleet
+    #[command(after_help = r#"EXAMPLES:
+    rch fleet deploy                    # Deploy to all workers
+    rch fleet deploy --canary 25        # Canary deployment to 25%
+    rch fleet rollback                  # Rollback to previous version
+    rch fleet status                    # Show deployment status
+    rch fleet verify                    # Verify installations
+    rch fleet history                   # Show deployment history
+
+Fleet management provides centralized deployment, rollback, and
+monitoring capabilities for the rch-wkr worker agent across all
+configured remote workers."#)]
+    Fleet {
+        #[command(subcommand)]
+        action: FleetAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -543,6 +562,138 @@ enum CompletionsAction {
     Status,
 }
 
+#[derive(Subcommand)]
+enum FleetAction {
+    /// Deploy or update rch-wkr to workers
+    #[command(after_help = r#"EXAMPLES:
+    rch fleet deploy                    # Deploy to all workers
+    rch fleet deploy --worker css       # Deploy to specific worker
+    rch fleet deploy --canary 25        # Deploy to 25% first, then all
+    rch fleet deploy --parallel 4       # Max 4 concurrent deployments
+    rch fleet deploy --dry-run          # Preview deployment plan
+    rch fleet deploy --verify           # Verify after deployment
+    rch fleet deploy --drain-first      # Drain builds before deploy"#)]
+    Deploy {
+        /// Target specific worker(s), comma-separated
+        #[arg(long)]
+        worker: Option<String>,
+        /// Max parallel deployments (default: 4)
+        #[arg(long, default_value = "4")]
+        parallel: usize,
+        /// Deploy to N% of workers first, wait before full rollout
+        #[arg(long)]
+        canary: Option<u8>,
+        /// Wait time in seconds after canary before full rollout (default: 60)
+        #[arg(long, default_value = "60")]
+        canary_wait: u64,
+        /// Skip rustup/toolchain sync
+        #[arg(long)]
+        no_toolchain: bool,
+        /// Reinstall even if version matches
+        #[arg(long)]
+        force: bool,
+        /// Run post-install verification
+        #[arg(long)]
+        verify: bool,
+        /// Drain active builds before deploy
+        #[arg(long)]
+        drain_first: bool,
+        /// Max wait for drain in seconds (default: 120)
+        #[arg(long, default_value = "120")]
+        drain_timeout: u64,
+        /// Show detailed plan without executing
+        #[arg(long)]
+        dry_run: bool,
+        /// Resume from previous failed deployment
+        #[arg(long)]
+        resume: bool,
+        /// Deploy specific version (default: current local)
+        #[arg(long)]
+        version: Option<String>,
+        /// Write deployment audit log to file
+        #[arg(long)]
+        audit_log: Option<PathBuf>,
+    },
+
+    /// Rollback to previous version
+    #[command(after_help = r#"EXAMPLES:
+    rch fleet rollback                  # Rollback all to previous version
+    rch fleet rollback --worker css     # Rollback specific worker
+    rch fleet rollback --to-version v0.1.0  # Rollback to specific version
+    rch fleet rollback --dry-run        # Preview rollback plan"#)]
+    Rollback {
+        /// Rollback specific worker(s)
+        #[arg(long)]
+        worker: Option<String>,
+        /// Rollback to specific version
+        #[arg(long)]
+        to_version: Option<String>,
+        /// Max parallel rollbacks (default: 4)
+        #[arg(long, default_value = "4")]
+        parallel: usize,
+        /// Verify after rollback
+        #[arg(long)]
+        verify: bool,
+        /// Show planned actions without executing
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Show fleet deployment status
+    #[command(after_help = r#"EXAMPLES:
+    rch fleet status                    # Quick overview
+    rch fleet status --worker css       # Show specific worker
+    rch fleet status --watch            # Continuous update"#)]
+    Status {
+        /// Show specific worker
+        #[arg(long)]
+        worker: Option<String>,
+        /// Continuous update (1s interval)
+        #[arg(long)]
+        watch: bool,
+    },
+
+    /// Verify worker installations
+    #[command(after_help = r#"EXAMPLES:
+    rch fleet verify                    # Verify all workers
+    rch fleet verify --worker css       # Verify specific worker"#)]
+    Verify {
+        /// Verify specific worker(s)
+        #[arg(long)]
+        worker: Option<String>,
+    },
+
+    /// Drain workers before maintenance
+    #[command(after_help = r#"EXAMPLES:
+    rch fleet drain css                 # Drain specific worker
+    rch fleet drain --all               # Drain all workers
+    rch fleet drain css --timeout 300   # Custom drain timeout"#)]
+    Drain {
+        /// Worker to drain
+        worker: Option<String>,
+        /// Drain all workers
+        #[arg(long)]
+        all: bool,
+        /// Timeout in seconds (default: 120)
+        #[arg(long, default_value = "120")]
+        timeout: u64,
+    },
+
+    /// Show deployment history
+    #[command(after_help = r#"EXAMPLES:
+    rch fleet history                   # Show last 10 deployments
+    rch fleet history --limit 20        # Show more entries
+    rch fleet history --worker css      # Filter by worker"#)]
+    History {
+        /// Number of deployments to show (default: 10)
+        #[arg(long, default_value = "10")]
+        limit: usize,
+        /// Filter by worker
+        #[arg(long)]
+        worker: Option<String>,
+    },
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Handle dynamic shell completions (exits if handling a completion request)
@@ -619,6 +770,7 @@ async fn main() -> Result<()> {
                 )
                 .await
             }
+            Commands::Fleet { action } => handle_fleet(action, &ctx).await,
         },
     }
 }
@@ -672,7 +824,11 @@ async fn handle_workers(action: WorkersAction, ctx: &OutputContext) -> Result<()
         WorkersAction::Discover { probe, add, yes } => {
             commands::workers_discover(probe, add, yes, ctx).await?;
         }
-        WorkersAction::SyncToolchain { worker, all, dry_run } => {
+        WorkersAction::SyncToolchain {
+            worker,
+            all,
+            dry_run,
+        } => {
             commands::workers_sync_toolchain(worker, all, dry_run, ctx).await?;
         }
         WorkersAction::Setup {
@@ -807,14 +963,16 @@ fn handle_completions(action: CompletionsAction, ctx: &OutputContext) -> Result<
             Ok(())
         }
         CompletionsAction::Install { shell, dry_run } => {
-            let shell = shell.or_else(completions::detect_current_shell).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Could not detect current shell. Please specify a shell explicitly:\n\
+            let shell = shell
+                .or_else(completions::detect_current_shell)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Could not detect current shell. Please specify a shell explicitly:\n\
                      rch completions install bash\n\
                      rch completions install zsh\n\
                      rch completions install fish"
-                )
-            })?;
+                    )
+                })?;
             completions::install_completions(shell, ctx, dry_run)?;
             Ok(())
         }
@@ -826,5 +984,59 @@ fn handle_completions(action: CompletionsAction, ctx: &OutputContext) -> Result<
             completions::show_status(ctx)?;
             Ok(())
         }
+    }
+}
+
+/// Handle fleet subcommands
+async fn handle_fleet(action: FleetAction, ctx: &OutputContext) -> Result<()> {
+    match action {
+        FleetAction::Deploy {
+            worker,
+            parallel,
+            canary,
+            canary_wait,
+            no_toolchain,
+            force,
+            verify,
+            drain_first,
+            drain_timeout,
+            dry_run,
+            resume,
+            version,
+            audit_log,
+        } => {
+            fleet::deploy(
+                ctx,
+                worker,
+                parallel,
+                canary,
+                canary_wait,
+                no_toolchain,
+                force,
+                verify,
+                drain_first,
+                drain_timeout,
+                dry_run,
+                resume,
+                version,
+                audit_log,
+            )
+            .await
+        }
+        FleetAction::Rollback {
+            worker,
+            to_version,
+            parallel,
+            verify,
+            dry_run,
+        } => fleet::rollback(ctx, worker, to_version, parallel, verify, dry_run).await,
+        FleetAction::Status { worker, watch } => fleet::status(ctx, worker, watch).await,
+        FleetAction::Verify { worker } => fleet::verify(ctx, worker).await,
+        FleetAction::Drain {
+            worker,
+            all,
+            timeout,
+        } => fleet::drain(ctx, worker, all, timeout).await,
+        FleetAction::History { limit, worker } => fleet::history(ctx, limit, worker).await,
     }
 }

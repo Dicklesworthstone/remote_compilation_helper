@@ -88,11 +88,13 @@ impl WorkerState {
         let mut current = self.used_slots.load(Ordering::Relaxed);
         loop {
             let new_val = current.saturating_sub(count);
-            
+
             if count > current {
                 tracing::warn!(
                     "Worker {}: attempted to release {} slots but only {} in use",
-                    self.config.id, count, current
+                    self.config.id,
+                    count,
+                    current
                 );
             }
 

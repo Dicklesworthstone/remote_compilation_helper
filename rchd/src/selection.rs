@@ -195,7 +195,10 @@ pub async fn select_worker_with_config(
         if !any_has_runtime && request.required_runtime != RequiredRuntime::None {
             return SelectionResult {
                 worker: None,
-                reason: SelectionReason::NoWorkersWithRuntime(format!("{:?}", request.required_runtime)),
+                reason: SelectionReason::NoWorkersWithRuntime(format!(
+                    "{:?}",
+                    request.required_runtime
+                )),
             };
         }
 

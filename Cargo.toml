@@ -42,6 +42,9 @@ regex = "1.11"
 # Fast hashing
 blake3 = "1.5"
 
+# UUID generation
+uuid = { version = "1.11", features = ["v4", "serde"] }
+
 # Compression
 zstd = "0.13"
 

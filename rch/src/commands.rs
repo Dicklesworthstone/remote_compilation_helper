@@ -1068,15 +1068,9 @@ pub async fn workers_deploy_binary(
     let mut results: Vec<DeployResult> = Vec::new();
 
     for worker in &target_workers {
-        let result = deploy_binary_to_worker(
-            worker,
-            &local_binary,
-            &local_version,
-            force,
-            dry_run,
-            ctx,
-        )
-        .await;
+        let result =
+            deploy_binary_to_worker(worker, &local_binary, &local_version, force, dry_run, ctx)
+                .await;
         results.push(result);
     }
 
@@ -1203,7 +1197,10 @@ async fn deploy_binary_to_worker(
             };
         }
         Ok(ver) => {
-            debug!("Remote version {} differs from local {}", ver, local_version);
+            debug!(
+                "Remote version {} differs from local {}",
+                ver, local_version
+            );
         }
         Err(_) => {
             debug!("rch-wkr not installed on {}", worker_id);
@@ -1212,7 +1209,11 @@ async fn deploy_binary_to_worker(
 
     if dry_run {
         if !ctx.is_json() {
-            println!("{} (would deploy {})", style.muted("dry-run"), local_version);
+            println!(
+                "{} (would deploy {})",
+                style.muted("dry-run"),
+                local_version
+            );
         }
         return DeployResult {
             worker_id: worker_id.clone(),
@@ -1288,13 +1289,19 @@ async fn deploy_via_scp(worker: &WorkerConfig, local_binary: &Path) -> Result<St
     // Ensure directory exists
     let mut mkdir_cmd = Command::new("ssh");
     mkdir_cmd
-        .arg("-o").arg("BatchMode=yes")
-        .arg("-o").arg("ConnectTimeout=10")
-        .arg("-i").arg(&worker.identity_file)
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("ConnectTimeout=10")
+        .arg("-i")
+        .arg(&worker.identity_file)
         .arg(&target)
         .arg(format!("mkdir -p ~/{}", remote_dir));
 
-    let mkdir_output = mkdir_cmd.output().await.context("Failed to create remote directory")?;
+    let mkdir_output = mkdir_cmd
+        .output()
+        .await
+        .context("Failed to create remote directory")?;
     if !mkdir_output.status.success() {
         bail!(
             "Failed to create remote directory: {}",
@@ -1305,39 +1312,55 @@ async fn deploy_via_scp(worker: &WorkerConfig, local_binary: &Path) -> Result<St
     // Copy binary
     let mut scp_cmd = Command::new("scp");
     scp_cmd
-        .arg("-o").arg("BatchMode=yes")
-        .arg("-o").arg("ConnectTimeout=30")
-        .arg("-i").arg(&worker.identity_file)
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("ConnectTimeout=30")
+        .arg("-i")
+        .arg(&worker.identity_file)
         .arg(local_binary)
         .arg(format!("{}:~/{}", target, remote_path));
 
     let scp_output = scp_cmd.output().await.context("Failed to scp binary")?;
     if !scp_output.status.success() {
-        bail!("scp failed: {}", String::from_utf8_lossy(&scp_output.stderr));
+        bail!(
+            "scp failed: {}",
+            String::from_utf8_lossy(&scp_output.stderr)
+        );
     }
 
     // Make executable
     let mut chmod_cmd = Command::new("ssh");
     chmod_cmd
-        .arg("-o").arg("BatchMode=yes")
-        .arg("-i").arg(&worker.identity_file)
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-i")
+        .arg(&worker.identity_file)
         .arg(&target)
         .arg(format!("chmod +x ~/{}", remote_path));
 
     let chmod_output = chmod_cmd.output().await.context("Failed to chmod binary")?;
     if !chmod_output.status.success() {
-        bail!("chmod failed: {}", String::from_utf8_lossy(&chmod_output.stderr));
+        bail!(
+            "chmod failed: {}",
+            String::from_utf8_lossy(&chmod_output.stderr)
+        );
     }
 
     // Verify installation
     let mut verify_cmd = Command::new("ssh");
     verify_cmd
-        .arg("-o").arg("BatchMode=yes")
-        .arg("-i").arg(&worker.identity_file)
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-i")
+        .arg(&worker.identity_file)
         .arg(&target)
         .arg(format!("~/{} health", remote_path));
 
-    let verify_output = verify_cmd.output().await.context("Failed to verify installation")?;
+    let verify_output = verify_cmd
+        .output()
+        .await
+        .context("Failed to verify installation")?;
     if !verify_output.status.success() {
         bail!(
             "Health check failed: {}",
@@ -1585,14 +1608,14 @@ pub async fn workers_setup(
             "  {} Workers: {} ({})",
             style.muted("→"),
             target_workers.len(),
-            if all { "all" } else { worker_id.as_deref().unwrap_or("?") }
+            if all {
+                "all"
+            } else {
+                worker_id.as_deref().unwrap_or("?")
+            }
         );
         if let Some(ref tc) = toolchain {
-            println!(
-                "  {} Toolchain: {}",
-                style.muted("→"),
-                style.highlight(tc)
-            );
+            println!("  {} Toolchain: {}", style.muted("→"), style.highlight(tc));
         }
         if dry_run {
             println!(
@@ -1995,7 +2018,10 @@ async fn check_remote_toolchain(worker: &WorkerConfig, toolchain: &str) -> Resul
     cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
     cmd.arg("-i").arg(&worker.identity_file);
     cmd.arg(format!("{}@{}", worker.user, worker.host));
-    cmd.arg(format!("rustup show | grep -q '{}' && echo FOUND || echo NOTFOUND", toolchain));
+    cmd.arg(format!(
+        "rustup show | grep -q '{}' && echo FOUND || echo NOTFOUND",
+        toolchain
+    ));
 
     let output = cmd.output().await.context("Failed to SSH to worker")?;
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -2010,7 +2036,10 @@ async fn install_remote_toolchain(worker: &WorkerConfig, toolchain: &str) -> Res
     cmd.arg("-o").arg("ConnectTimeout=60"); // Toolchain install can take a while
     cmd.arg("-i").arg(&worker.identity_file);
     cmd.arg(format!("{}@{}", worker.user, worker.host));
-    cmd.arg(format!("rustup install {} && rustup component add rust-src --toolchain {}", toolchain, toolchain));
+    cmd.arg(format!(
+        "rustup install {} && rustup component add rust-src --toolchain {}",
+        toolchain, toolchain
+    ));
 
     let output = cmd.output().await.context("Failed to install toolchain")?;
 
@@ -2113,8 +2142,12 @@ pub async fn workers_discover(
         );
         if let Some(ref identity) = host.identity_file {
             // Shorten path for display
-            let short_path = identity
-                .replace(&dirs::home_dir().map(|p| p.display().to_string()).unwrap_or_default(), "~");
+            let short_path = identity.replace(
+                &dirs::home_dir()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default(),
+                "~",
+            );
             println!("      {} Key: {}", style.muted("└"), short_path);
         }
         println!("      {} Source: {}", style.muted("└"), host.source);
@@ -2263,7 +2296,11 @@ echo "ARCH:$(uname -m 2>/dev/null || echo unknown)""#;
                 "DISK" => info.disk_gb = value.trim().parse().unwrap_or(0),
                 "RUST" => {
                     let v = value.trim();
-                    info.rust_version = if v == "none" { None } else { Some(v.to_string()) };
+                    info.rust_version = if v == "none" {
+                        None
+                    } else {
+                        Some(v.to_string())
+                    };
                 }
                 "ARCH" => info.arch = value.trim().to_string(),
                 _ => {}
@@ -3162,13 +3199,10 @@ pub fn config_init(ctx: &OutputContext, wizard: bool, use_defaults: bool) -> Res
 
     // JSON output
     if ctx.is_json() {
-        let _ = ctx.json(&JsonResponse::ok_cmd(
-            "config init",
-            ConfigInitResponse {
-                created,
-                already_existed,
-            },
-        ));
+        let _ = ctx.json(&JsonResponse::ok_cmd("config init", ConfigInitResponse {
+            created,
+            already_existed,
+        }));
         return Ok(());
     }
 
@@ -3305,13 +3339,10 @@ enabled = true
     }
 
     if ctx.is_json() {
-        let _ = ctx.json(&JsonResponse::ok_cmd(
-            "config init",
-            ConfigInitResponse {
-                created,
-                already_existed,
-            },
-        ));
+        let _ = ctx.json(&JsonResponse::ok_cmd("config init", ConfigInitResponse {
+            created,
+            already_existed,
+        }));
         return Ok(());
     }
 
@@ -3477,11 +3508,7 @@ fn collect_worker_values(
     let mut worker_num = 1;
 
     loop {
-        println!(
-            "\n{} Worker #{}",
-            style.muted("─────────────"),
-            worker_num
-        );
+        println!("\n{} Worker #{}", style.muted("─────────────"), worker_num);
 
         let id: String = Input::new()
             .with_prompt("Worker ID (short name)")
@@ -4308,7 +4335,10 @@ pub async fn init_wizard(yes: bool, skip_test: bool, ctx: &OutputContext) -> Res
     println!();
 
     // Step 2: Discover workers
-    println!("{}", style.highlight("Step 2/8: Discover potential workers"));
+    println!(
+        "{}",
+        style.highlight("Step 2/8: Discover potential workers")
+    );
     workers_discover(true, false, yes, ctx).await?;
     println!();
 
@@ -4350,7 +4380,10 @@ pub async fn init_wizard(yes: bool, skip_test: bool, ctx: &OutputContext) -> Res
     println!();
 
     // Step 6: Sync toolchain
-    println!("{}", style.highlight("Step 6/8: Synchronize Rust toolchain"));
+    println!(
+        "{}",
+        style.highlight("Step 6/8: Synchronize Rust toolchain")
+    );
     let sync_toolchain = if yes {
         true
     } else {

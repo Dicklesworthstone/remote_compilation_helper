@@ -685,7 +685,11 @@ pub fn join_horizontal(items: &[&str], spacing: u16) -> String {
     let item_lines: Vec<Vec<&str>> = items.iter().map(|s| s.lines().collect()).collect();
 
     // Find max height
-    let max_height = item_lines.iter().map(|lines| lines.len()).max().unwrap_or(0);
+    let max_height = item_lines
+        .iter()
+        .map(|lines| lines.len())
+        .max()
+        .unwrap_or(0);
 
     // Find width of each item
     let item_widths: Vec<usize> = item_lines
@@ -726,13 +730,7 @@ pub fn join_vertical(items: &[&str]) -> String {
 }
 
 /// Place content at a specific position within a canvas.
-pub fn place(
-    width: u16,
-    height: u16,
-    h_align: Align,
-    v_align: Align,
-    content: &str,
-) -> String {
+pub fn place(width: u16, height: u16, h_align: Align, v_align: Align, content: &str) -> String {
     let lines: Vec<&str> = content.lines().collect();
     let content_height = lines.len() as u16;
     let content_width = lines
@@ -937,9 +935,7 @@ mod tests {
 
     #[test]
     fn test_render_simple_box_no_colors() {
-        let style = BoxStyle::new()
-            .border(BorderStyle::Normal)
-            .width(10);
+        let style = BoxStyle::new().border(BorderStyle::Normal).width(10);
 
         let output = style.render("Hello", false, true);
 
@@ -951,9 +947,7 @@ mod tests {
 
     #[test]
     fn test_render_box_ascii_fallback() {
-        let style = BoxStyle::new()
-            .border(BorderStyle::Rounded)
-            .width(10);
+        let style = BoxStyle::new().border(BorderStyle::Rounded).width(10);
 
         let output = style.render("Hi", false, false);
 
@@ -979,9 +973,7 @@ mod tests {
 
     #[test]
     fn test_render_multiline_content() {
-        let style = BoxStyle::new()
-            .border(BorderStyle::Normal)
-            .width(20);
+        let style = BoxStyle::new().border(BorderStyle::Normal).width(20);
 
         let output = style.render("Line 1\nLine 2\nLine 3", false, true);
         let lines: Vec<&str> = output.lines().collect();
@@ -1034,9 +1026,7 @@ mod tests {
 
     #[test]
     fn test_no_border() {
-        let style = BoxStyle::new()
-            .border(BorderStyle::None)
-            .width(10);
+        let style = BoxStyle::new().border(BorderStyle::None).width(10);
 
         let output = style.render("Hello", false, true);
 
@@ -1123,9 +1113,7 @@ mod tests {
 
     #[test]
     fn test_min_width() {
-        let style = BoxStyle::new()
-            .border(BorderStyle::Normal)
-            .min_width(20);
+        let style = BoxStyle::new().border(BorderStyle::Normal).min_width(20);
 
         let output = style.render("Hi", false, true);
 
