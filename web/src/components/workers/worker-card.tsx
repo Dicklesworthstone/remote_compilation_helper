@@ -34,6 +34,8 @@ export function WorkerCard({ worker }: WorkerCardProps) {
       animate={{ opacity: 1, y: 0 }}
       exit={{ opacity: 0, scale: 0.95 }}
       className="bg-card border border-border rounded-lg p-4 hover:border-primary/50 transition-colors"
+      data-testid="worker-card"
+      data-worker-id={worker.id}
     >
       <div className="flex items-start justify-between mb-3">
         <div className="flex items-center gap-3">
@@ -45,14 +47,18 @@ export function WorkerCard({ worker }: WorkerCardProps) {
             <p className="text-sm text-muted-foreground">{worker.user}@{worker.host}</p>
           </div>
         </div>
-        <div className={`flex items-center gap-1.5 px-2 py-1 rounded-full text-xs font-medium ${status.color}`}>
+        <div
+          className={`flex items-center gap-1.5 px-2 py-1 rounded-full text-xs font-medium ${status.color}`}
+          data-testid="worker-status"
+          data-status={worker.status}
+        >
           <StatusIcon className="w-3.5 h-3.5" />
           {status.label}
         </div>
       </div>
 
       {/* Slots Progress */}
-      <div className="mb-3">
+      <div className="mb-3" data-testid="worker-slots">
         <div className="flex justify-between text-xs text-muted-foreground mb-1">
           <span>Slots Used</span>
           <span>{worker.used_slots} / {worker.total_slots}</span>
@@ -63,6 +69,7 @@ export function WorkerCard({ worker }: WorkerCardProps) {
             initial={{ width: 0 }}
             animate={{ width: `${slotsUsedPercent}%` }}
             transition={{ duration: 0.5, ease: 'easeOut' }}
+            data-testid="worker-slots-bar"
           />
         </div>
       </div>
@@ -73,14 +80,18 @@ export function WorkerCard({ worker }: WorkerCardProps) {
           <Zap className="w-3.5 h-3.5" />
           <span>Speed: {worker.speed_score.toFixed(1)}</span>
         </div>
-        <div className={`flex items-center gap-1 ${circuit.color}`}>
+        <div
+          className={`flex items-center gap-1 ${circuit.color}`}
+          data-testid="worker-circuit"
+          data-circuit={worker.circuit_state}
+        >
           <span>Circuit: {circuit.label}</span>
         </div>
       </div>
 
       {/* Error Message */}
       {worker.last_error && (
-        <div className="mt-3 p-2 bg-error/10 rounded text-xs text-error">
+        <div className="mt-3 p-2 bg-error/10 rounded text-xs text-error" data-testid="worker-error">
           {worker.last_error}
         </div>
       )}
