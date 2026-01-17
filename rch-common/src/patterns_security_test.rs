@@ -28,7 +28,7 @@ mod tests {
         // This is tricky. If the command itself uses quotes correctly, it might be a valid arg.
         // e.g. rustc -C "link-arg=-Wl,-rpath;..." (unlikely to use ; like that but possible)
         // classify_command calls contains_unquoted(';') which handles quotes.
-        
+
         // Let's test a hypothetical command that uses ; in quotes
         // cargo run --example "foo;bar"
         // This *should* be classified as compilation (cargo run), assuming "foo;bar" is just an arg.

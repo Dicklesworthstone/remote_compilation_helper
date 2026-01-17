@@ -241,7 +241,10 @@ impl SshClient {
             }
             Err(_) => {
                 // Timeout occurred - the async block owns child and dropping it will terminate the process
-                warn!("Command timed out on {} after {:?}", self.config.id, self.options.command_timeout);
+                warn!(
+                    "Command timed out on {} after {:?}",
+                    self.config.id, self.options.command_timeout
+                );
                 anyhow::bail!("Command timed out after {:?}", self.options.command_timeout);
             }
         }
@@ -343,7 +346,10 @@ impl SshClient {
             }
             Err(_) => {
                 // Timeout occurred - the async block owns child and dropping it will terminate the process
-                warn!("Command (streaming) timed out on {} after {:?}", self.config.id, self.options.command_timeout);
+                warn!(
+                    "Command (streaming) timed out on {} after {:?}",
+                    self.config.id, self.options.command_timeout
+                );
                 anyhow::bail!("Command timed out after {:?}", self.options.command_timeout);
             }
         }

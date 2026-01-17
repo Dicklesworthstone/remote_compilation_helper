@@ -840,4 +840,91 @@ mod tests {
         assert_eq!(format!("{}", Phase::Execute), "EXEC");
         assert_eq!(format!("{}", Phase::Artifacts), "ARTIFACTS");
     }
+
+    #[test]
+    fn test_mock_config_toolchain_install_failure() {
+        let config = MockConfig::toolchain_install_failure();
+        assert!(config.fail_toolchain_install);
+        assert!(!config.no_rustup);
+    }
+
+    #[test]
+    fn test_mock_config_no_rustup() {
+        let config = MockConfig::no_rustup();
+        assert!(config.no_rustup);
+        assert!(!config.fail_toolchain_install);
+    }
+
+    #[tokio::test]
+    async fn test_mock_ssh_client_no_rustup() {
+        let worker_config = WorkerConfig {
+            id: WorkerId::new("mock-worker"),
+            host: "mock.host".to_string(),
+            user: "mockuser".to_string(),
+            identity_file: "~/.ssh/mock".to_string(),
+            total_slots: 8,
+            priority: 100,
+            tags: vec![],
+        };
+
+        let mut client = MockSshClient::new(worker_config, MockConfig::no_rustup());
+        client.connect().await.unwrap();
+
+        // Any rustup command should fail with command not found
+        let result = client.execute("rustup --version").await.unwrap();
+        assert_eq!(result.exit_code, 127);
+        assert!(result.stderr.contains("command not found"));
+    }
+
+    #[tokio::test]
+    async fn test_mock_ssh_client_toolchain_install_failure() {
+        let worker_config = WorkerConfig {
+            id: WorkerId::new("mock-worker"),
+            host: "mock.host".to_string(),
+            user: "mockuser".to_string(),
+            identity_file: "~/.ssh/mock".to_string(),
+            total_slots: 8,
+            priority: 100,
+            tags: vec![],
+        };
+
+        let mut client = MockSshClient::new(worker_config, MockConfig::toolchain_install_failure());
+        client.connect().await.unwrap();
+
+        // Toolchain install commands should fail
+        let result = client
+            .execute("rustup toolchain install nightly-2024-01-15")
+            .await
+            .unwrap();
+        assert_eq!(result.exit_code, 1);
+        assert!(result.stderr.contains("is not installed"));
+
+        // Rustup run commands should also fail
+        let result = client
+            .execute("rustup run nightly-2024-01-15 cargo build")
+            .await
+            .unwrap();
+        assert_eq!(result.exit_code, 1);
+        assert!(result.stderr.contains("is not installed"));
+    }
+
+    #[tokio::test]
+    async fn test_mock_ssh_client_normal_command_with_toolchain_failure() {
+        let worker_config = WorkerConfig {
+            id: WorkerId::new("mock-worker"),
+            host: "mock.host".to_string(),
+            user: "mockuser".to_string(),
+            identity_file: "~/.ssh/mock".to_string(),
+            total_slots: 8,
+            priority: 100,
+            tags: vec![],
+        };
+
+        let mut client = MockSshClient::new(worker_config, MockConfig::toolchain_install_failure());
+        client.connect().await.unwrap();
+
+        // Non-rustup commands should still succeed
+        let result = client.execute("cargo build").await.unwrap();
+        assert_eq!(result.exit_code, 0);
+    }
 }

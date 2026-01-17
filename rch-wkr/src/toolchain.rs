@@ -566,11 +566,7 @@ mod tests {
         for target in &targets {
             let tc_str = format!("nightly-{}", target);
             let tc = parse_toolchain_string(&tc_str);
-            assert_eq!(
-                tc.channel, "nightly",
-                "Failed for target: {}",
-                target
-            );
+            assert_eq!(tc.channel, "nightly", "Failed for target: {}", target);
         }
     }
 

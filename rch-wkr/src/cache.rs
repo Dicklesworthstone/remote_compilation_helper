@@ -119,7 +119,10 @@ pub async fn cleanup(max_age_hours: u64) -> Result<()> {
                 if read_dir.next().is_none() {
                     debug!("Removing empty project directory: {:?}", project_path);
                     if let Err(e) = std::fs::remove_dir(&project_path) {
-                        warn!("Failed to remove empty project dir {:?}: {}", project_path, e);
+                        warn!(
+                            "Failed to remove empty project dir {:?}: {}",
+                            project_path, e
+                        );
                         errors += 1;
                     }
                 }
