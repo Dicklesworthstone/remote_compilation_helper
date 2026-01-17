@@ -8,7 +8,7 @@
 # Options:
 #   --mock                 Run with mock SSH/rsync (default)
 #   --real                 Run with real workers (requires env below)
-#   --fail MODE            Inject failure: sync|exec|artifacts|worker-down|remote-exit|toolchain-install|no-rustup
+#   --fail MODE            Inject failure: sync|exec|artifacts|worker-down|remote-exit|toolchain-install|no-rustup|circuit-open
 #   --run-all              In mock mode, run success + failure scenarios
 #   --unit                 Also run `cargo test --workspace`
 #   --verbose              Enable verbose output
@@ -324,6 +324,7 @@ run_scenario() {
         remote-exit) envs+=("RCH_MOCK_SSH_EXIT_CODE=2") ;;
         toolchain-install) envs+=("RCH_MOCK_TOOLCHAIN_INSTALL_FAIL=1") ;;
         no-rustup) envs+=("RCH_MOCK_NO_RUSTUP=1") ;;
+        circuit-open) envs+=("RCH_MOCK_CIRCUIT_OPEN=1") ;;
         "") ;;
         *) die "Unknown failure mode: $fail" ;;
     esac
@@ -457,12 +458,21 @@ run_e2e() {
         run_scenario "no_rustup" "allow" "no-rustup"
 
         log "INFO" "E2E" "Toolchain scenarios complete"
+
+        # Circuit breaker scenarios
+        log "INFO" "E2E" "Running circuit breaker scenarios..."
+
+        # Test: All circuits open triggers local fallback
+        # When RCH_MOCK_CIRCUIT_OPEN is set, daemon returns AllCircuitsOpen
+        run_scenario "circuit_open" "allow" "circuit-open"
+
+        log "INFO" "E2E" "Circuit breaker scenarios complete"
         return
     fi
 
     if [[ -n "$FAIL_MODE" ]]; then
         case "$FAIL_MODE" in
-            sync|exec|worker-down|toolchain-install|no-rustup) run_scenario "$FAIL_MODE" "allow" "$FAIL_MODE" ;;
+            sync|exec|worker-down|toolchain-install|no-rustup|circuit-open) run_scenario "$FAIL_MODE" "allow" "$FAIL_MODE" ;;
             artifacts|remote-exit) run_scenario "$FAIL_MODE" "deny" "$FAIL_MODE" ;;
             *) die "Unknown failure mode: $FAIL_MODE" ;;
         esac

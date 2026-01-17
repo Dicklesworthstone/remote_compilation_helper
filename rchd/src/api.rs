@@ -9,7 +9,7 @@ use crate::selection::{SelectionWeights, select_worker_with_config};
 use crate::workers::WorkerPool;
 use anyhow::{Result, anyhow};
 use rch_common::{
-    BuildRecord, BuildStats, CircuitBreakerConfig, CircuitState, SelectedWorker,
+    BuildRecord, BuildStats, CircuitBreakerConfig, CircuitState, ReleaseRequest, SelectedWorker,
     SelectionReason, SelectionRequest, SelectionResponse, WorkerStatus,
 };
 use serde::Serialize;
@@ -21,6 +21,7 @@ use tracing::{debug, warn};
 #[derive(Debug)]
 enum ApiRequest {
     SelectWorker(SelectionRequest),
+    ReleaseWorker(ReleaseRequest),
     Status,
 }
 
@@ -138,6 +139,10 @@ pub async fn handle_connection(stream: UnixStream, ctx: DaemonContext) -> Result
             let response = handle_select_worker(&ctx.pool, request).await?;
             serde_json::to_string(&response)?
         }
+        Ok(ApiRequest::ReleaseWorker(request)) => {
+            handle_release_worker(&ctx.pool, request).await?;
+            "{}".to_string()
+        }
         Ok(ApiRequest::Status) => {
             let status = handle_status(&ctx).await?;
             serde_json::to_string(&status)?
@@ -168,24 +173,60 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
     let method = parts[0];
     let path = parts[1];
 
-    if method != "GET" {
-        return Err(anyhow!("Only GET method supported"));
+    if method != "GET" && method != "POST" {
+        return Err(anyhow!("Only GET and POST methods supported"));
     }
 
     if path == "/status" {
         return Ok(ApiRequest::Status);
     }
 
+    if path.starts_with("/release-worker") {
+        if method != "POST" {
+            return Err(anyhow!("Only POST method supported for release"));
+        }
+
+        let query = path.strip_prefix("/release-worker").unwrap_or("");
+        let query = query.strip_prefix('?').unwrap_or("");
+
+        let mut worker_id = None;
+        let mut slots = None;
+
+        for param in query.split('&') {
+            if param.is_empty() {
+                continue;
+            }
+            let mut kv = param.splitn(2, '=');
+            let key = kv.next().unwrap_or("");
+            let value = kv.next().unwrap_or("");
+
+            match key {
+                "worker" => worker_id = Some(urlencoding_decode(value)),
+                "slots" => slots = value.parse().ok(),
+                _ => {} // Ignore unknown parameters
+            }
+        }
+
+        let worker_id = worker_id.ok_or_else(|| anyhow!("Missing 'worker' parameter"))?;
+        let slots = slots.unwrap_or(0);
+
+        return Ok(ApiRequest::ReleaseWorker(ReleaseRequest {
+            worker_id: rch_common::WorkerId::new(worker_id),
+            slots,
+        }));
+    }
+
     if !path.starts_with("/select-worker") {
         return Err(anyhow!("Unknown endpoint: {}", path));
     }
 
-    // Parse query parameters
+    // Parse query parameters for select-worker
     let query = path.strip_prefix("/select-worker").unwrap_or("");
     let query = query.strip_prefix('?').unwrap_or("");
 
     let mut project = None;
     let mut cores = None;
+    let mut toolchain = None;
 
     for param in query.split('&') {
         if param.is_empty() {
@@ -198,6 +239,10 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
         match key {
             "project" => project = Some(urlencoding_decode(value)),
             "cores" => cores = value.parse().ok(),
+            "toolchain" => {
+                let json = urlencoding_decode(value);
+                toolchain = serde_json::from_str(&json).ok();
+            }
             _ => {} // Ignore unknown parameters
         }
     }
@@ -209,7 +254,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
         project,
         estimated_cores,
         preferred_workers: vec![],
-        toolchain: None,
+        toolchain,
     }))
 }
 
@@ -254,6 +299,15 @@ async fn handle_select_worker(
         request.project, request.estimated_cores
     );
 
+    // Mock support: RCH_MOCK_CIRCUIT_OPEN simulates all circuits open
+    if std::env::var("RCH_MOCK_CIRCUIT_OPEN").is_ok() {
+        debug!("RCH_MOCK_CIRCUIT_OPEN set, returning AllCircuitsOpen");
+        return Ok(SelectionResponse {
+            worker: None,
+            reason: SelectionReason::AllCircuitsOpen,
+        });
+    }
+
     let weights = SelectionWeights::default();
     let circuit_config = CircuitBreakerConfig::default();
     let result = select_worker_with_config(pool, &request, &weights, &circuit_config).await;
@@ -291,6 +345,16 @@ async fn handle_select_worker(
         }),
         reason: SelectionReason::Success,
     })
+}
+
+/// Handle a release-worker request.
+async fn handle_release_worker(pool: &WorkerPool, request: ReleaseRequest) -> Result<()> {
+    debug!(
+        "Releasing {} slots on worker {}",
+        request.slots, request.worker_id
+    );
+    pool.release_slots(&request.worker_id, request.slots).await;
+    Ok(())
 }
 
 /// Handle a status request.
@@ -350,10 +414,7 @@ async fn handle_status(ctx: &DaemonContext) -> Result<StatusResponse> {
             issues.push(Issue {
                 severity: "error".to_string(),
                 summary: format!("Circuit open for worker '{}'", worker.config.id),
-                remediation: Some(format!(
-                    "rch workers probe {} --force",
-                    worker.config.id
-                )),
+                remediation: Some(format!("rch workers probe {} --force", worker.config.id)),
             });
         } else if status == WorkerStatus::Unreachable {
             issues.push(Issue {
@@ -382,8 +443,7 @@ async fn handle_status(ctx: &DaemonContext) -> Result<StatusResponse> {
             .as_secs();
         let start = now - uptime_secs;
         // Format as ISO 8601
-        let dt = chrono::DateTime::from_timestamp(start as i64, 0)
-            .unwrap_or_else(|| chrono::Utc::now());
+        let dt = chrono::DateTime::from_timestamp(start as i64, 0).unwrap_or_else(chrono::Utc::now);
         dt.to_rfc3339()
     };
 
@@ -463,9 +523,33 @@ mod tests {
     fn test_parse_request_status() {
         let req = parse_request("GET /status").unwrap();
         match req {
-            ApiRequest::Status => {}
+            ApiRequest::Status => {} // Correct
             _ => panic!("expected status request"),
         }
+    }
+
+    #[test]
+    fn test_parse_request_with_toolchain() {
+        // Create a toolchain JSON and URL encode it
+        let toolchain_json = r###"{"channel":"nightly","date":"2024-01-01","full_version":"rustc 1.76.0-nightly"}"###;
+        let encoded = urlencoding_encode(toolchain_json);
+        let query = format!(
+            "GET /select-worker?project=test&cores=4&toolchain={}",
+            encoded
+        );
+
+        let req = parse_request(&query).unwrap();
+        let ApiRequest::SelectWorker(req) = req else {
+            panic!("expected select-worker request");
+        };
+
+        assert_eq!(req.project, "test");
+        assert_eq!(req.estimated_cores, 4);
+        assert!(req.toolchain.is_some());
+
+        let tc = req.toolchain.unwrap();
+        assert_eq!(tc.channel, "nightly");
+        assert_eq!(tc.date, Some("2024-01-01".to_string()));
     }
 
     #[test]
@@ -476,7 +560,7 @@ mod tests {
 
     #[test]
     fn test_parse_request_invalid_method() {
-        let result = parse_request("POST /select-worker?project=test");
+        let result = parse_request("PUT /select-worker?project=test");
         assert!(result.is_err());
     }
 
@@ -520,6 +604,23 @@ mod tests {
         assert_eq!(urlencoding_decode("foo%GGbar"), "foo%GGbar");
         // Incomplete sequence at end
         assert_eq!(urlencoding_decode("foo%2"), "foo%2");
+    }
+
+    // Helper for test_parse_request_with_toolchain
+    fn urlencoding_encode(s: &str) -> String {
+        let mut result = String::with_capacity(s.len() * 3);
+        for c in s.chars() {
+            match c {
+                'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => result.push(c),
+                _ => {
+                    for byte in c.to_string().as_bytes() {
+                        result.push('%');
+                        result.push_str(&format!("{:02X}", byte));
+                    }
+                }
+            }
+        }
+        result
     }
 
     // =========================================================================

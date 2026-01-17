@@ -1,5 +1,7 @@
 //! Worker selection algorithm.
 
+#![allow(dead_code)] // Scaffold code - methods will be used in future beads
+
 use crate::workers::{WorkerPool, WorkerState};
 use rch_common::{CircuitBreakerConfig, CircuitState, SelectionReason, SelectionRequest};
 use std::cmp::Ordering;
@@ -120,10 +122,7 @@ pub async fn select_worker_with_config(
 
         match circuit_state {
             CircuitState::Open => {
-                debug!(
-                    "Worker {} excluded: circuit open",
-                    worker.config.id
-                );
+                debug!("Worker {} excluded: circuit open", worker.config.id);
                 continue;
             }
             CircuitState::HalfOpen => {
@@ -391,7 +390,8 @@ mod tests {
     #[tokio::test]
     async fn test_select_worker_allows_half_open_with_probe_budget() {
         let pool = WorkerPool::new();
-        pool.add_worker(make_worker("half_open", 8, 50.0).config).await;
+        pool.add_worker(make_worker("half_open", 8, 50.0).config)
+            .await;
 
         // Put worker in half-open state
         let worker = pool.get(&WorkerId::new("half_open")).await.unwrap();
@@ -411,7 +411,9 @@ mod tests {
         };
 
         let result = select_worker_with_config(&pool, &request, &weights, &config).await;
-        let selected = result.worker.expect("Expected half-open worker to be selected");
+        let selected = result
+            .worker
+            .expect("Expected half-open worker to be selected");
         assert_eq!(result.reason, SelectionReason::Success);
         assert_eq!(selected.config.id.as_str(), "half_open");
     }
@@ -419,7 +421,8 @@ mod tests {
     #[tokio::test]
     async fn test_select_worker_excludes_half_open_at_probe_limit() {
         let pool = WorkerPool::new();
-        pool.add_worker(make_worker("half_open", 8, 50.0).config).await;
+        pool.add_worker(make_worker("half_open", 8, 50.0).config)
+            .await;
         pool.add_worker(make_worker("closed", 4, 40.0).config).await;
 
         // Put worker in half-open state and exhaust probe budget
@@ -444,7 +447,9 @@ mod tests {
         let weights = SelectionWeights::default();
 
         let result = select_worker_with_config(&pool, &request, &weights, &config).await;
-        let selected = result.worker.expect("Expected closed worker to be selected");
+        let selected = result
+            .worker
+            .expect("Expected closed worker to be selected");
         assert_eq!(result.reason, SelectionReason::Success);
         // Should select the closed worker since half-open is at probe limit
         assert_eq!(selected.config.id.as_str(), "closed");
@@ -453,7 +458,8 @@ mod tests {
     #[tokio::test]
     async fn test_select_worker_prefers_closed_over_half_open() {
         let pool = WorkerPool::new();
-        pool.add_worker(make_worker("half_open", 16, 90.0).config).await;
+        pool.add_worker(make_worker("half_open", 16, 90.0).config)
+            .await;
         pool.add_worker(make_worker("closed", 8, 50.0).config).await;
 
         // Put first worker in half-open state (normally would be preferred due to higher speed)
@@ -491,7 +497,8 @@ mod tests {
         // Closed: 0.8 (80/100)
         // Half-open: 0.8 * 0.5 = 0.4
         let pool = WorkerPool::new();
-        pool.add_worker(make_worker("half_open", 16, 80.0).config).await;
+        pool.add_worker(make_worker("half_open", 16, 80.0).config)
+            .await;
         pool.add_worker(make_worker("closed", 8, 50.0).config).await;
 
         // Put first worker in half-open state

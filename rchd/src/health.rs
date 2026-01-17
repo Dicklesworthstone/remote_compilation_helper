@@ -2,9 +2,13 @@
 //!
 //! Periodically checks worker availability and updates their status.
 
+#![allow(dead_code)] // Scaffold code - methods will be used in future beads
+
 use crate::workers::{WorkerPool, WorkerState};
 use rch_common::mock::{self, MockConfig, MockSshClient};
-use rch_common::{CircuitBreakerConfig, CircuitState, CircuitStats, SshClient, SshOptions, WorkerStatus};
+use rch_common::{
+    CircuitBreakerConfig, CircuitState, CircuitStats, SshClient, SshOptions, WorkerStatus,
+};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
@@ -300,7 +304,9 @@ impl HealthMonitor {
                     } else {
                         warn!(
                             "Worker {} check failed: {:?} (failures: {})",
-                            worker_id, result.error, health.circuit_stats().consecutive_failures()
+                            worker_id,
+                            result.error,
+                            health.circuit_stats().consecutive_failures()
                         );
                     }
 
@@ -689,5 +695,367 @@ mod tests {
 
         let result = check_worker_health(&Arc::new(worker), &HealthConfig::default()).await;
         assert!(!result.healthy);
+    }
+
+    // ============================================================================
+    // Integration tests: Health monitoring -> Circuit breaker -> Worker selection
+    // ============================================================================
+
+    mod integration_tests {
+        use super::*;
+        use crate::selection::{SelectionWeights, select_worker_with_config};
+        use crate::workers::WorkerPool;
+        use rch_common::SelectionRequest;
+
+        fn make_worker_config(id: &str) -> WorkerConfig {
+            WorkerConfig {
+                id: WorkerId::new(id),
+                host: format!("{}.host", id),
+                user: "testuser".to_string(),
+                identity_file: "~/.ssh/test".to_string(),
+                total_slots: 8,
+                priority: 100,
+                tags: vec![],
+            }
+        }
+
+        fn make_request(project: &str, cores: u32) -> SelectionRequest {
+            SelectionRequest {
+                project: project.to_string(),
+                estimated_cores: cores,
+                preferred_workers: vec![],
+                toolchain: None,
+            }
+        }
+
+        #[tokio::test]
+        async fn test_integration_health_failures_cause_selection_exclusion() {
+            // Test that health failures leading to open circuit cause worker to be
+            // excluded from selection, and when all workers are in open state,
+            // selection returns AllCircuitsOpen.
+
+            let pool = WorkerPool::new();
+            pool.add_worker(make_worker_config("worker-1")).await;
+            pool.add_worker(make_worker_config("worker-2")).await;
+
+            let health_config = HealthConfig {
+                circuit: CircuitBreakerConfig {
+                    failure_threshold: 3,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let weights = SelectionWeights::default();
+            let request = make_request("test-project", 2);
+
+            // Initially, selection should succeed
+            let result =
+                select_worker_with_config(&pool, &request, &weights, &health_config.circuit).await;
+            assert!(result.worker.is_some());
+            assert_eq!(result.reason, rch_common::SelectionReason::Success);
+
+            // Simulate consecutive failures on worker-1 to open its circuit
+            let worker1 = pool.get(&WorkerId::new("worker-1")).await.unwrap();
+            for _ in 0..3 {
+                worker1
+                    .record_failure(Some("Connection timeout".to_string()))
+                    .await;
+            }
+            // Manually check if circuit should open and transition
+            if worker1.should_open_circuit(&health_config.circuit).await {
+                worker1.open_circuit().await;
+            }
+
+            // Selection should still work (worker-2 is available)
+            let result =
+                select_worker_with_config(&pool, &request, &weights, &health_config.circuit).await;
+            assert!(result.worker.is_some());
+            let selected = result.worker.unwrap();
+            assert_eq!(selected.config.id.as_str(), "worker-2");
+
+            // Now fail worker-2 as well
+            let worker2 = pool.get(&WorkerId::new("worker-2")).await.unwrap();
+            for _ in 0..3 {
+                worker2
+                    .record_failure(Some("Connection timeout".to_string()))
+                    .await;
+            }
+            if worker2.should_open_circuit(&health_config.circuit).await {
+                worker2.open_circuit().await;
+            }
+
+            // Both circuits open - selection should return AllCircuitsOpen
+            let result =
+                select_worker_with_config(&pool, &request, &weights, &health_config.circuit).await;
+            assert!(result.worker.is_none());
+            assert_eq!(result.reason, rch_common::SelectionReason::AllCircuitsOpen);
+        }
+
+        #[tokio::test]
+        async fn test_integration_circuit_recovery_path() {
+            // Test full recovery: Open -> HalfOpen -> Closed
+            // Verify selection behavior at each stage.
+
+            let pool = WorkerPool::new();
+            pool.add_worker(make_worker_config("recovery-worker")).await;
+
+            let health_config = HealthConfig {
+                circuit: CircuitBreakerConfig {
+                    failure_threshold: 2,
+                    success_threshold: 2,
+                    open_cooldown_secs: 0, // Immediate transition to half-open
+                    half_open_max_probes: 1,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let weights = SelectionWeights::default();
+            let request = make_request("test-project", 2);
+
+            let worker = pool.get(&WorkerId::new("recovery-worker")).await.unwrap();
+
+            // Stage 1: Circuit is Closed
+            assert_eq!(worker.circuit_state().await.unwrap(), CircuitState::Closed);
+            let result =
+                select_worker_with_config(&pool, &request, &weights, &health_config.circuit).await;
+            assert!(result.worker.is_some());
+
+            // Stage 2: Cause failures to open circuit
+            for _ in 0..2 {
+                worker.record_failure(Some("Error".to_string())).await;
+            }
+            if worker.should_open_circuit(&health_config.circuit).await {
+                worker.open_circuit().await;
+            }
+            assert_eq!(worker.circuit_state().await.unwrap(), CircuitState::Open);
+
+            // Stage 3: Transition to half-open (cooldown=0)
+            if worker.should_half_open(&health_config.circuit).await {
+                worker.half_open_circuit().await;
+            }
+            assert_eq!(
+                worker.circuit_state().await.unwrap(),
+                CircuitState::HalfOpen
+            );
+
+            // Stage 4: Selection should work in half-open with probe budget
+            let result =
+                select_worker_with_config(&pool, &request, &weights, &health_config.circuit).await;
+            assert!(result.worker.is_some());
+
+            // Stage 5: Record successes to close circuit
+            worker.record_success().await;
+            worker.record_success().await;
+            if worker.should_close_circuit(&health_config.circuit).await {
+                worker.close_circuit().await;
+            }
+            assert_eq!(worker.circuit_state().await.unwrap(), CircuitState::Closed);
+
+            // Stage 6: Selection works normally again
+            let result =
+                select_worker_with_config(&pool, &request, &weights, &health_config.circuit).await;
+            assert!(result.worker.is_some());
+            assert_eq!(result.reason, rch_common::SelectionReason::Success);
+        }
+
+        #[tokio::test]
+        async fn test_integration_half_open_probe_exhaustion() {
+            // Test that when a half-open worker exhausts its probe budget,
+            // it's excluded until the probe completes.
+
+            let pool = WorkerPool::new();
+            pool.add_worker(make_worker_config("probe-worker")).await;
+
+            let circuit_config = CircuitBreakerConfig {
+                failure_threshold: 2,
+                open_cooldown_secs: 0,
+                half_open_max_probes: 1,
+                ..Default::default()
+            };
+            let weights = SelectionWeights::default();
+            let request = make_request("test-project", 2);
+
+            let worker = pool.get(&WorkerId::new("probe-worker")).await.unwrap();
+
+            // Open and transition to half-open
+            for _ in 0..2 {
+                worker.record_failure(None).await;
+            }
+            worker.open_circuit().await;
+            worker.half_open_circuit().await;
+
+            // First selection should succeed and start probe
+            let result1 =
+                select_worker_with_config(&pool, &request, &weights, &circuit_config).await;
+            assert!(result1.worker.is_some());
+
+            // Second selection should fail (probe budget exhausted)
+            let result2 =
+                select_worker_with_config(&pool, &request, &weights, &circuit_config).await;
+            // With only one worker and probe exhausted, should return busy/circuits open
+            assert!(result2.worker.is_none());
+        }
+
+        #[tokio::test]
+        async fn test_integration_mixed_circuit_states() {
+            // Test selection behavior with workers in different circuit states:
+            // - Worker A: Closed (healthy)
+            // - Worker B: Open (excluded)
+            // - Worker C: HalfOpen (available with penalty)
+            // Verify that closed is preferred over half-open due to penalty.
+
+            let pool = WorkerPool::new();
+            pool.add_worker(WorkerConfig {
+                id: WorkerId::new("closed-worker"),
+                host: "closed.host".to_string(),
+                user: "testuser".to_string(),
+                identity_file: "~/.ssh/test".to_string(),
+                total_slots: 8,
+                priority: 100,
+                tags: vec![],
+            })
+            .await;
+            pool.add_worker(WorkerConfig {
+                id: WorkerId::new("open-worker"),
+                host: "open.host".to_string(),
+                user: "testuser".to_string(),
+                identity_file: "~/.ssh/test".to_string(),
+                total_slots: 16, // More slots - would normally be preferred
+                priority: 100,
+                tags: vec![],
+            })
+            .await;
+            pool.add_worker(WorkerConfig {
+                id: WorkerId::new("half-open-worker"),
+                host: "half-open.host".to_string(),
+                user: "testuser".to_string(),
+                identity_file: "~/.ssh/test".to_string(),
+                total_slots: 12, // More slots than closed
+                priority: 100,
+                tags: vec![],
+            })
+            .await;
+
+            let circuit_config = CircuitBreakerConfig {
+                failure_threshold: 2,
+                open_cooldown_secs: 0,
+                half_open_max_probes: 10, // High limit to avoid probe exhaustion
+                ..Default::default()
+            };
+            let weights = SelectionWeights::default();
+            let request = make_request("test-project", 2);
+
+            // Set up circuit states
+            let open_worker = pool.get(&WorkerId::new("open-worker")).await.unwrap();
+            open_worker.open_circuit().await;
+
+            let half_open_worker = pool.get(&WorkerId::new("half-open-worker")).await.unwrap();
+            half_open_worker.open_circuit().await;
+            half_open_worker.half_open_circuit().await;
+
+            // Selection should prefer closed-worker despite having fewer slots
+            // because half-open has penalty and open is excluded
+            let result =
+                select_worker_with_config(&pool, &request, &weights, &circuit_config).await;
+            assert!(result.worker.is_some());
+            let selected = result.worker.unwrap();
+            assert_eq!(selected.config.id.as_str(), "closed-worker");
+        }
+
+        #[tokio::test]
+        async fn test_integration_failure_in_half_open_reopens() {
+            // Test that a failure during half-open probe causes circuit to reopen.
+
+            let pool = WorkerPool::new();
+            pool.add_worker(make_worker_config("reopen-worker")).await;
+
+            let circuit_config = CircuitBreakerConfig {
+                failure_threshold: 2,
+                open_cooldown_secs: 0,
+                half_open_max_probes: 1,
+                ..Default::default()
+            };
+
+            let worker = pool.get(&WorkerId::new("reopen-worker")).await.unwrap();
+
+            // Transition to half-open
+            worker.record_failure(None).await;
+            worker.record_failure(None).await;
+            worker.open_circuit().await;
+            worker.half_open_circuit().await;
+            assert_eq!(
+                worker.circuit_state().await.unwrap(),
+                CircuitState::HalfOpen
+            );
+
+            // Start a probe
+            worker.start_probe(&circuit_config).await;
+
+            // Simulate failure during probe - record failure and reopen
+            worker
+                .record_failure(Some("Probe failed".to_string()))
+                .await;
+            worker.open_circuit().await; // Failure in half-open should reopen
+
+            assert_eq!(worker.circuit_state().await.unwrap(), CircuitState::Open);
+            assert_eq!(worker.last_error().await, Some("Probe failed".to_string()));
+        }
+
+        #[tokio::test]
+        async fn test_integration_health_update_drives_circuit_transitions() {
+            // Test that WorkerHealth.update() correctly drives all circuit
+            // state transitions based on health check results.
+
+            let config = HealthConfig {
+                circuit: CircuitBreakerConfig {
+                    failure_threshold: 3,
+                    success_threshold: 2,
+                    open_cooldown_secs: 0, // Immediate half-open
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut health = WorkerHealth::default();
+
+            // Initial state: Closed
+            assert_eq!(health.circuit_state(), CircuitState::Closed);
+            assert_eq!(health.status(), WorkerStatus::Healthy);
+
+            // Failures 1 & 2: Still closed, status degrades
+            health.update(
+                HealthCheckResult::failure("Error 1".to_string()),
+                &config,
+                "test-worker",
+            );
+            assert_eq!(health.circuit_state(), CircuitState::Closed);
+            assert_eq!(health.status(), WorkerStatus::Degraded);
+
+            health.update(
+                HealthCheckResult::failure("Error 2".to_string()),
+                &config,
+                "test-worker",
+            );
+            assert_eq!(health.circuit_state(), CircuitState::Closed);
+
+            // Failure 3: Circuit opens, then immediately goes to half-open
+            // (since open_cooldown_secs = 0)
+            health.update(
+                HealthCheckResult::failure("Error 3".to_string()),
+                &config,
+                "test-worker",
+            );
+            // With cooldown=0, after opening it checks should_half_open which is true
+            assert_eq!(health.circuit_state(), CircuitState::HalfOpen);
+            assert_eq!(health.status(), WorkerStatus::Unreachable);
+
+            // Success 1: Still half-open
+            health.update(HealthCheckResult::success(50), &config, "test-worker");
+            assert_eq!(health.circuit_state(), CircuitState::HalfOpen);
+
+            // Success 2: Circuit closes (success_threshold = 2)
+            health.update(HealthCheckResult::success(50), &config, "test-worker");
+            assert_eq!(health.circuit_state(), CircuitState::Closed);
+            assert_eq!(health.status(), WorkerStatus::Healthy);
+        }
     }
 }
