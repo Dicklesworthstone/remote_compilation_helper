@@ -8,7 +8,9 @@
 
 mod commands;
 mod config;
+pub mod error;
 mod hook;
+pub mod state;
 mod status_display;
 mod status_types;
 mod toolchain;

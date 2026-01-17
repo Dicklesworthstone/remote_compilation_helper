@@ -203,7 +203,7 @@ pub struct OutputContext {
     /// Terminal capabilities.
     caps: TerminalCaps,
     /// Styling configuration.
-    style: Theme,
+    theme: Theme,
     /// Thread-safe stdout writer.
     stdout: OutputWriter,
     /// Thread-safe stderr writer.
@@ -233,13 +233,13 @@ impl OutputContext {
         let supports_unicode = caps.supports_unicode;
         let supports_hyperlinks = mode == OutputMode::Human && caps.supports_hyperlinks;
 
-        let style = Theme::new(colors_enabled, supports_unicode, supports_hyperlinks);
+        let theme = Theme::new(colors_enabled, supports_unicode, supports_hyperlinks);
 
         Self {
             mode,
             verbosity,
             caps,
-            style,
+            theme,
             stdout,
             stderr,
         }
@@ -363,8 +363,8 @@ impl OutputContext {
     }
 
     /// Get the style configuration.
-    pub fn style(&self) -> &Theme {
-        &self.style
+    pub fn theme(&self) -> &Theme {
+        &self.theme
     }
 
     // --- Adaptive color support ---
@@ -413,7 +413,7 @@ impl OutputContext {
         if self.is_quiet() || self.is_json() {
             return;
         }
-        self.stderr.write_line(&self.style.format_success(msg));
+        self.stderr.write_line(&self.theme.format_success(msg));
     }
 
     /// Print an error message to stderr.
@@ -422,7 +422,7 @@ impl OutputContext {
         if self.is_json() {
             return;
         }
-        self.stderr.write_line(&self.style.format_error(msg));
+        self.stderr.write_line(&self.theme.format_error(msg));
     }
 
     /// Print a warning message to stderr.
@@ -430,7 +430,7 @@ impl OutputContext {
         if self.is_quiet() || self.is_json() {
             return;
         }
-        self.stderr.write_line(&self.style.format_warning(msg));
+        self.stderr.write_line(&self.theme.format_warning(msg));
     }
 
     /// Print an info message to stderr.
@@ -438,7 +438,7 @@ impl OutputContext {
         if self.is_quiet() || self.is_json() {
             return;
         }
-        self.stderr.write_line(&self.style.format_info(msg));
+        self.stderr.write_line(&self.theme.format_info(msg));
     }
 
     /// Print a debug message to stderr (only in verbose mode).
@@ -447,7 +447,7 @@ impl OutputContext {
             return;
         }
         self.stderr
-            .write_line(&format!("[DEBUG] {}", self.style.muted(msg)));
+            .write_line(&format!("[DEBUG] {}", self.theme.muted(msg)));
     }
 
     // --- Structured output (to stdout) ---
@@ -465,7 +465,7 @@ impl OutputContext {
         if self.is_json() {
             return;
         }
-        self.stdout.write_line(&self.style.format_header(title));
+        self.stdout.write_line(&self.theme.format_header(title));
     }
 
     /// Print a key-value pair with alignment.
@@ -474,7 +474,7 @@ impl OutputContext {
             return;
         }
         self.stdout
-            .write_line(&self.style.format_key_value(key, value, 16));
+            .write_line(&self.theme.format_key_value(key, value, 16));
     }
 
     /// Print a key-value pair with custom key width.
@@ -483,7 +483,7 @@ impl OutputContext {
             return;
         }
         self.stdout
-            .write_line(&self.style.format_key_value(key, value, width));
+            .write_line(&self.theme.format_key_value(key, value, width));
     }
 
     /// Print a simple table.
@@ -509,7 +509,7 @@ impl OutputContext {
             .map(|(h, w)| format!("{:width$}", h, width = *w))
             .collect();
         self.stdout
-            .write_line(&self.style.highlight(&header_line.join("  ")).to_string());
+            .write_line(&self.theme.highlight(&header_line.join("  ")).to_string());
 
         // Print separator
         let sep: Vec<String> = widths.iter().map(|w| "-".repeat(*w)).collect();
