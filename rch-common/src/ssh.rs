@@ -215,8 +215,8 @@ impl SshClient {
                 .wait()
                 .await
                 .with_context(|| "Failed to wait for command completion")?;
-            
-            Ok((status, stdout, stderr))
+
+            Ok::<_, anyhow::Error>((status, stdout, stderr))
         };
 
         match tokio::time::timeout(self.options.command_timeout, execution_future).await {
@@ -240,8 +240,8 @@ impl SshClient {
                 })
             }
             Err(_) => {
-                // Timeout occurred
-                let _ = child.kill().await;
+                // Timeout occurred - dropping child will terminate the process
+                drop(child);
                 warn!("Command timed out on {} after {:?}", self.config.id, self.options.command_timeout);
                 anyhow::bail!("Command timed out after {:?}", self.options.command_timeout);
             }
@@ -343,7 +343,8 @@ impl SshClient {
                 })
             }
             Err(_) => {
-                let _ = child.kill().await;
+                // Timeout occurred - dropping child will terminate the process
+                drop(child);
                 warn!("Command (streaming) timed out on {} after {:?}", self.config.id, self.options.command_timeout);
                 anyhow::bail!("Command timed out after {:?}", self.options.command_timeout);
             }
