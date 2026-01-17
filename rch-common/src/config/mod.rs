@@ -17,3 +17,11 @@ pub use env::{EnvError, EnvParser};
 pub use profiles::Profile;
 pub use source::{ConfigSource, ConfigValueSource, Sourced};
 pub use validate::{ConfigWarning, Severity, validate_config};
+
+#[cfg(test)]
+pub(crate) fn env_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    use std::sync::{Mutex, OnceLock};
+
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+}

@@ -120,15 +120,19 @@ impl std::fmt::Display for Profile {
 mod tests {
     use super::*;
 
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        super::super::env_test_lock()
+    }
+
     /// Helper to safely set an env var in tests.
     fn set_env(key: &str, value: &str) {
-        // SAFETY: Tests run single-threaded via --test-threads=1 or use serial isolation.
+        // SAFETY: Tests are serialized with env_guard().
         unsafe { std::env::set_var(key, value) };
     }
 
     /// Helper to safely remove an env var in tests.
     fn remove_env(key: &str) {
-        // SAFETY: Tests run single-threaded via --test-threads=1 or use serial isolation.
+        // SAFETY: Tests are serialized with env_guard().
         unsafe { std::env::remove_var(key) };
     }
 
@@ -170,6 +174,7 @@ mod tests {
 
     #[test]
     fn test_dev_profile_defaults() {
+        let _guard = env_guard();
         // Clean up any vars that might affect the test
         remove_env("RCH_LOG_LEVEL");
         remove_env("RCH_LOG_FORMAT");
@@ -200,6 +205,7 @@ mod tests {
 
     #[test]
     fn test_test_profile_enables_mock() {
+        let _guard = env_guard();
         // Clean up any vars that might affect the test
         remove_env("RCH_MOCK_SSH");
         remove_env("RCH_TEST_MODE");
@@ -222,6 +228,7 @@ mod tests {
 
     #[test]
     fn test_profile_doesnt_override() {
+        let _guard = env_guard();
         // Set a value before getting defaults
         set_env("RCH_LOG_LEVEL", "error");
 

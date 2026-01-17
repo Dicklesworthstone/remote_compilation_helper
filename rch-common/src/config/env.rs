@@ -321,6 +321,7 @@ impl Default for EnvParser {
 #[allow(unsafe_code)]
 mod tests {
     use super::*;
+    use crate::config::env_test_lock;
     use std::env;
 
     fn cleanup_env(vars: &[&str]) {
@@ -335,8 +336,13 @@ mod tests {
         unsafe { env::set_var(key, value) };
     }
 
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        env_test_lock()
+    }
+
     #[test]
     fn test_get_bool_true_values() {
+        let _guard = env_guard();
         let vars = ["RCH_TEST_BOOL_TRUE"];
         cleanup_env(&vars);
 
@@ -353,6 +359,7 @@ mod tests {
 
     #[test]
     fn test_get_bool_false_values() {
+        let _guard = env_guard();
         let vars = ["RCH_TEST_BOOL_FALSE"];
         cleanup_env(&vars);
 
@@ -369,6 +376,7 @@ mod tests {
 
     #[test]
     fn test_get_bool_invalid_uses_default() {
+        let _guard = env_guard();
         let vars = ["RCH_BAD_BOOL"];
         cleanup_env(&vars);
 
@@ -383,6 +391,7 @@ mod tests {
 
     #[test]
     fn test_get_u64_range_valid() {
+        let _guard = env_guard();
         let vars = ["RCH_TEST_U64"];
         cleanup_env(&vars);
 
@@ -397,6 +406,7 @@ mod tests {
 
     #[test]
     fn test_get_u64_range_out_of_range() {
+        let _guard = env_guard();
         // Use unique var name to avoid race with test_get_u64_range_valid
         let vars = ["RCH_TEST_U64_OOR"];
         cleanup_env(&vars);
@@ -412,6 +422,7 @@ mod tests {
 
     #[test]
     fn test_get_log_level_valid() {
+        let _guard = env_guard();
         let vars = ["RCH_LOG_LEVEL"];
         cleanup_env(&vars);
 
@@ -428,6 +439,7 @@ mod tests {
 
     #[test]
     fn test_get_log_level_invalid() {
+        let _guard = env_guard();
         let vars = ["RCH_LOG_LEVEL"];
         cleanup_env(&vars);
 
@@ -442,6 +454,7 @@ mod tests {
 
     #[test]
     fn test_get_string_list() {
+        let _guard = env_guard();
         let vars = ["RCH_TEST_LIST"];
         cleanup_env(&vars);
 
@@ -455,6 +468,7 @@ mod tests {
 
     #[test]
     fn test_get_optional_string() {
+        let _guard = env_guard();
         let vars = ["RCH_TEST_OPT"];
         cleanup_env(&vars);
 
@@ -480,6 +494,7 @@ mod tests {
 
     #[test]
     fn test_source_tracking() {
+        let _guard = env_guard();
         let vars = ["RCH_TEST_SRC"];
         cleanup_env(&vars);
 
