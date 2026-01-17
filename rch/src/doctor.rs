@@ -1221,9 +1221,10 @@ mod tests {
     #[test]
     fn test_run_quick_check_returns_result() {
         // This test just verifies that run_quick_check executes without panicking
+        // and returns a valid result structure
         let result = run_quick_check();
         // We can't assert on specific values because they depend on system state,
-        // but we can check that the result is valid
-        assert!(result.warnings.len() + result.errors.len() >= 0);
+        // but we can verify the result is accessible and properly structured
+        let _total_issues = result.warnings.len() + result.errors.len();
     }
 }
