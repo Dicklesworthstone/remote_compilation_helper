@@ -1498,6 +1498,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "unicode-width 0.2.2",
  "urlencoding",
  "which",
 ]

@@ -28,6 +28,7 @@ shellexpand = "3.1"
 dirs = "5"
 urlencoding = "2"
 colored = "2"
+unicode-width = { workspace = true }
 is-terminal = "0.4"
 terminal_size = "0.3"
 regex = "1"

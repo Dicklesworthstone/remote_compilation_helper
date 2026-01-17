@@ -52,6 +52,7 @@
 pub mod adaptive;
 pub mod context;
 pub mod progress;
+pub mod styled;
 pub mod test_utils;
 pub mod theme;
 pub mod writer;
@@ -67,6 +68,10 @@ pub use context::{
 pub use progress::{
     MultiProgressManager, Spinner, StepProgress, TransferProgress, with_spinner,
     with_spinner_result,
+};
+pub use styled::{
+    Align, BorderChars, BorderStyle, BoxStyle, Margin, Padding, Spacing, join_horizontal,
+    join_vertical, place, presets,
 };
 pub use theme::{SemanticColors, StatusIndicator, Symbols, Theme};
 pub use writer::{OutputBuffer, OutputWriter, SharedOutputBuffer};

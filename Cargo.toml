@@ -33,6 +33,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # String search (SIMD-accelerated)
 memchr = "2.7"
 
+# Unicode text handling
+unicode-width = "0.2"
+
 # Regex for pattern matching
 regex = "1.11"
 
