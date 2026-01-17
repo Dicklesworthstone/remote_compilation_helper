@@ -205,6 +205,20 @@ fn default_priority() -> u32 {
     100
 }
 
+impl Default for WorkerConfig {
+    fn default() -> Self {
+        Self {
+            id: WorkerId::new("default-worker"),
+            host: "localhost".to_string(),
+            user: "user".to_string(),
+            identity_file: "~/.ssh/id_rsa".to_string(),
+            total_slots: 4,
+            priority: default_priority(),
+            tags: Vec::new(),
+        }
+    }
+}
+
 /// Runtime capabilities detected on a worker.
 ///
 /// These are probed during health checks and cached for routing decisions.

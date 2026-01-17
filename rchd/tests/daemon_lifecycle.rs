@@ -68,9 +68,8 @@ fn get_json_field(json: &str, field: &str) -> Option<String> {
         let rest = &json[start + pattern.len()..];
         let rest = rest.trim_start();
 
-        if rest.starts_with('"') {
+        if let Some(rest) = rest.strip_prefix('"') {
             // String value
-            let rest = &rest[1..];
             if let Some(end) = rest.find('"') {
                 return Some(rest[..end].to_string());
             }

@@ -83,6 +83,40 @@ pub struct Classification {
     pub reason: String,
 }
 
+/// Decision outcome for a classification tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TierDecision {
+    Pass,
+    Reject,
+}
+
+/// Detailed result for a single classification tier.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClassificationTier {
+    /// Tier index (0-4).
+    pub tier: u8,
+    /// Tier name.
+    pub name: String,
+    /// Decision for this tier.
+    pub decision: TierDecision,
+    /// Reason for the decision.
+    pub reason: String,
+}
+
+/// Detailed classification results with per-tier decisions.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClassificationDetails {
+    /// Original command string.
+    pub original: String,
+    /// Normalized command string (wrappers stripped).
+    pub normalized: String,
+    /// Per-tier decisions.
+    pub tiers: Vec<ClassificationTier>,
+    /// Final classification result.
+    pub classification: Classification,
+}
+
 impl Classification {
     /// Create a non-compilation classification.
     pub fn not_compilation(reason: impl Into<String>) -> Self {
@@ -187,6 +221,139 @@ pub fn classify_command(cmd: &str) -> Classification {
 
     // Tier 4: Full classification
     classify_full(normalized)
+}
+
+/// Classify a shell command with detailed tier decisions for diagnostics.
+pub fn classify_command_detailed(cmd: &str) -> ClassificationDetails {
+    let original = cmd.to_string();
+    let cmd = cmd.trim();
+    let mut tiers = Vec::new();
+
+    // Tier 0: Instant reject - empty command
+    if cmd.is_empty() {
+        let classification = Classification::not_compilation("empty command");
+        tiers.push(ClassificationTier {
+            tier: 0,
+            name: "instant_reject".to_string(),
+            decision: TierDecision::Reject,
+            reason: "empty command".to_string(),
+        });
+        return ClassificationDetails {
+            original,
+            normalized: cmd.to_string(),
+            tiers,
+            classification,
+        };
+    }
+
+    tiers.push(ClassificationTier {
+        tier: 0,
+        name: "instant_reject".to_string(),
+        decision: TierDecision::Pass,
+        reason: "command present".to_string(),
+    });
+
+    // Tier 1: Structure analysis
+    if let Some(reason) = check_structure(cmd) {
+        let classification = Classification::not_compilation(reason);
+        tiers.push(ClassificationTier {
+            tier: 1,
+            name: "structure_analysis".to_string(),
+            decision: TierDecision::Reject,
+            reason: reason.to_string(),
+        });
+        return ClassificationDetails {
+            original,
+            normalized: cmd.to_string(),
+            tiers,
+            classification,
+        };
+    }
+
+    tiers.push(ClassificationTier {
+        tier: 1,
+        name: "structure_analysis".to_string(),
+        decision: TierDecision::Pass,
+        reason: "no pipes/redirects/backgrounding".to_string(),
+    });
+
+    // Tier 2: SIMD keyword filter
+    if !contains_compilation_keyword(cmd) {
+        let classification = Classification::not_compilation("no compilation keyword");
+        tiers.push(ClassificationTier {
+            tier: 2,
+            name: "keyword_filter".to_string(),
+            decision: TierDecision::Reject,
+            reason: "no compilation keyword".to_string(),
+        });
+        return ClassificationDetails {
+            original,
+            normalized: cmd.to_string(),
+            tiers,
+            classification,
+        };
+    }
+
+    tiers.push(ClassificationTier {
+        tier: 2,
+        name: "keyword_filter".to_string(),
+        decision: TierDecision::Pass,
+        reason: "keyword present".to_string(),
+    });
+
+    // Normalize command for Tier 3 and 4
+    let normalized_cow = normalize_command(cmd);
+    let normalized = normalized_cow.as_ref();
+
+    // Tier 3: Negative pattern check - never intercept these
+    for pattern in NEVER_INTERCEPT {
+        if let Some(rest) = normalized.strip_prefix(pattern) {
+            if rest.is_empty() || rest.starts_with(' ') {
+                let reason = format!("matches never-intercept: {pattern}");
+                let classification = Classification::not_compilation(reason.clone());
+                tiers.push(ClassificationTier {
+                    tier: 3,
+                    name: "never_intercept".to_string(),
+                    decision: TierDecision::Reject,
+                    reason,
+                });
+                return ClassificationDetails {
+                    original,
+                    normalized: normalized.to_string(),
+                    tiers,
+                    classification,
+                };
+            }
+        }
+    }
+
+    tiers.push(ClassificationTier {
+        tier: 3,
+        name: "never_intercept".to_string(),
+        decision: TierDecision::Pass,
+        reason: "no never-intercept match".to_string(),
+    });
+
+    // Tier 4: Full classification
+    let classification = classify_full(normalized);
+    let decision = if classification.is_compilation {
+        TierDecision::Pass
+    } else {
+        TierDecision::Reject
+    };
+    tiers.push(ClassificationTier {
+        tier: 4,
+        name: "full_classification".to_string(),
+        decision,
+        reason: classification.reason.clone(),
+    });
+
+    ClassificationDetails {
+        original,
+        normalized: normalized.to_string(),
+        tiers,
+        classification,
+    }
 }
 
 /// Normalize a command by stripping common wrappers (sudo, time, env, etc.)
@@ -1015,5 +1182,38 @@ mod tests {
         if result.is_compilation {
             assert_eq!(result.kind, Some(CompilationKind::BunTest));
         }
+    }
+
+    #[test]
+    fn test_classify_command_detailed_matches_basic() {
+        let commands = [
+            "cargo build",
+            "cargo test --release",
+            "bun typecheck",
+            "gcc -c main.c -o main.o",
+            "ls -la",
+        ];
+
+        for cmd in commands {
+            let basic = classify_command(cmd);
+            let detailed = classify_command_detailed(cmd);
+            assert_eq!(basic, detailed.classification);
+        }
+    }
+
+    #[test]
+    fn test_classify_command_detailed_rejects_piped() {
+        let detailed = classify_command_detailed("cargo build | tee log.txt");
+        assert!(!detailed.classification.is_compilation);
+        let tier1 = detailed.tiers.iter().find(|t| t.tier == 1).unwrap();
+        assert_eq!(tier1.decision, TierDecision::Reject);
+        assert!(tier1.reason.contains("piped"));
+    }
+
+    #[test]
+    fn test_classify_command_detailed_normalizes_wrappers() {
+        let detailed = classify_command_detailed("sudo cargo check");
+        assert_eq!(detailed.normalized, "cargo check");
+        assert!(detailed.classification.is_compilation);
     }
 }

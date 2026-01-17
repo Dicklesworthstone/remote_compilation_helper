@@ -155,21 +155,7 @@ async fn process_hook(input: HookInput) -> HookOutput {
     };
 
     // Determine required runtime
-    let required_runtime = match classification.kind {
-        Some(k) => match k {
-            CompilationKind::CargoBuild
-            | CompilationKind::CargoTest
-            | CompilationKind::CargoCheck
-            | CompilationKind::CargoClippy
-            | CompilationKind::CargoDoc
-            | CompilationKind::Rustc => RequiredRuntime::Rust,
-
-            CompilationKind::BunTest | CompilationKind::BunTypecheck => RequiredRuntime::Bun,
-
-            _ => RequiredRuntime::None,
-        },
-        None => RequiredRuntime::None,
-    };
+    let required_runtime = required_runtime_for_kind(classification.kind);
 
     match query_daemon(
         &config.general.socket_path,
@@ -260,7 +246,7 @@ async fn process_hook(input: HookInput) -> HookOutput {
 }
 
 /// Query the daemon for a worker.
-async fn query_daemon(
+pub(crate) async fn query_daemon(
     socket_path: &str,
     project: &str,
     cores: u32,
@@ -331,7 +317,11 @@ async fn query_daemon(
 }
 
 /// Release reserved slots on a worker.
-async fn release_worker(socket_path: &str, worker_id: &WorkerId, slots: u32) -> Result<()> {
+pub(crate) async fn release_worker(
+    socket_path: &str,
+    worker_id: &WorkerId,
+    slots: u32,
+) -> Result<()> {
     if !Path::new(socket_path).exists() {
         return Ok(()); // Ignore if daemon gone
     }
@@ -435,6 +425,25 @@ fn is_toolchain_failure(stderr: &str, exit_code: i32) -> bool {
     toolchain_patterns
         .iter()
         .any(|pattern| stderr_lower.contains(&pattern.to_lowercase()))
+}
+
+/// Map a classification kind to required runtime.
+pub(crate) fn required_runtime_for_kind(kind: Option<CompilationKind>) -> RequiredRuntime {
+    match kind {
+        Some(k) => match k {
+            CompilationKind::CargoBuild
+            | CompilationKind::CargoTest
+            | CompilationKind::CargoCheck
+            | CompilationKind::CargoClippy
+            | CompilationKind::CargoDoc
+            | CompilationKind::Rustc => RequiredRuntime::Rust,
+
+            CompilationKind::BunTest | CompilationKind::BunTypecheck => RequiredRuntime::Bun,
+
+            _ => RequiredRuntime::None,
+        },
+        None => RequiredRuntime::None,
+    }
 }
 
 /// Execute a compilation command on a remote worker.

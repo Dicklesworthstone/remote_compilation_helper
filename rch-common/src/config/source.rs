@@ -4,6 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::path::PathBuf;
 
 /// Where a configuration value originated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -56,6 +57,42 @@ impl ConfigSource {
 impl fmt::Display for ConfigSource {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.display_name())
+    }
+}
+
+/// Detailed source for a specific configuration value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigValueSource {
+    /// Built-in default value.
+    Default,
+    /// User-level config file (~/.config/rch/config.toml).
+    UserConfig(PathBuf),
+    /// Project-level config file (.rch/config.toml).
+    ProjectConfig(PathBuf),
+    /// Environment variable name.
+    EnvVar(String),
+}
+
+impl ConfigValueSource {
+    /// Render a human-friendly label for CLI output.
+    pub fn label(&self) -> String {
+        match self {
+            ConfigValueSource::Default => "default".to_string(),
+            ConfigValueSource::UserConfig(path) => {
+                format!("user:{}", path.display())
+            }
+            ConfigValueSource::ProjectConfig(path) => {
+                format!("project:{}", path.display())
+            }
+            ConfigValueSource::EnvVar(name) => format!("env:{}", name),
+        }
+    }
+}
+
+impl fmt::Display for ConfigValueSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.label())
     }
 }
 

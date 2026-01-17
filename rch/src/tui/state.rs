@@ -336,3 +336,217 @@ impl Default for LogViewState {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tracing::info;
+
+    fn init_test_logging() {
+        let _ = tracing_subscriber::fmt()
+            .with_test_writer()
+            .with_max_level(tracing::Level::DEBUG)
+            .try_init();
+    }
+
+    fn make_worker(id: &str) -> WorkerState {
+        WorkerState {
+            id: id.to_string(),
+            host: "host".to_string(),
+            status: WorkerStatus::Healthy,
+            circuit: CircuitState::Closed,
+            total_slots: 8,
+            used_slots: 1,
+            latency_ms: 10,
+            last_seen: Utc::now(),
+            builds_completed: 0,
+        }
+    }
+
+    fn make_active_build(id: &str, command: &str) -> ActiveBuild {
+        ActiveBuild {
+            id: id.to_string(),
+            command: command.to_string(),
+            worker: Some("worker-1".to_string()),
+            started_at: Utc::now(),
+            progress: Some(BuildProgress {
+                phase: "compiling".to_string(),
+                percent: Some(50),
+                current_file: None,
+            }),
+            status: BuildStatus::Compiling,
+        }
+    }
+
+    fn make_history(id: &str, command: &str, worker: Option<&str>, success: bool) -> HistoricalBuild {
+        HistoricalBuild {
+            id: id.to_string(),
+            command: command.to_string(),
+            worker: worker.map(|w| w.to_string()),
+            started_at: Utc::now(),
+            completed_at: Utc::now(),
+            duration_ms: 1200,
+            success,
+            exit_code: Some(if success { 0 } else { 1 }),
+        }
+    }
+
+    #[test]
+    fn test_state_default_values() {
+        init_test_logging();
+        info!("TEST START: test_state_default_values");
+        let state = TuiState::default();
+        info!(
+            "VERIFY: panel={:?} index={} show_help={} filter_mode={}",
+            state.selected_panel, state.selected_index, state.show_help, state.filter_mode
+        );
+        assert_eq!(state.selected_panel, Panel::Workers);
+        assert_eq!(state.selected_index, 0);
+        assert!(state.workers.is_empty());
+        assert!(state.active_builds.is_empty());
+        assert!(state.build_history.is_empty());
+        assert!(state.filter.query.is_empty());
+        assert!(state.log_view.is_none());
+        info!("TEST PASS: test_state_default_values");
+    }
+
+    #[test]
+    fn test_panel_cycle_next_prev() {
+        init_test_logging();
+        info!("TEST START: test_panel_cycle_next_prev");
+        let mut state = TuiState::default();
+        assert_eq!(state.selected_panel, Panel::Workers);
+        state.next_panel();
+        assert_eq!(state.selected_panel, Panel::ActiveBuilds);
+        state.next_panel();
+        assert_eq!(state.selected_panel, Panel::BuildHistory);
+        state.next_panel();
+        assert_eq!(state.selected_panel, Panel::Logs);
+        state.next_panel();
+        assert_eq!(state.selected_panel, Panel::Workers);
+
+        state.prev_panel();
+        assert_eq!(state.selected_panel, Panel::Logs);
+        state.prev_panel();
+        assert_eq!(state.selected_panel, Panel::BuildHistory);
+        info!("TEST PASS: test_panel_cycle_next_prev");
+    }
+
+    #[test]
+    fn test_selection_bounds_for_workers() {
+        init_test_logging();
+        info!("TEST START: test_selection_bounds_for_workers");
+        let mut state = TuiState::default();
+        state.workers = vec![make_worker("w1"), make_worker("w2")];
+        state.selected_panel = Panel::Workers;
+        state.selected_index = 0;
+        state.select_up();
+        assert_eq!(state.selected_index, 0);
+        state.select_down();
+        assert_eq!(state.selected_index, 1);
+        state.select_down();
+        assert_eq!(state.selected_index, 1);
+        info!("TEST PASS: test_selection_bounds_for_workers");
+    }
+
+    #[test]
+    fn test_handle_select_active_build_opens_logs() {
+        init_test_logging();
+        info!("TEST START: test_handle_select_active_build_opens_logs");
+        let mut state = TuiState::default();
+        state.active_builds = vec![make_active_build("b1", "cargo build")];
+        state.selected_panel = Panel::ActiveBuilds;
+        state.handle_select();
+        assert!(state.log_view.is_some());
+        let log_view = state.log_view.as_ref().unwrap();
+        assert_eq!(log_view.build_id, "b1");
+        assert!(log_view.auto_scroll);
+        info!("TEST PASS: test_handle_select_active_build_opens_logs");
+    }
+
+    #[test]
+    fn test_handle_select_logs_toggles_auto_scroll() {
+        init_test_logging();
+        info!("TEST START: test_handle_select_logs_toggles_auto_scroll");
+        let mut state = TuiState::default();
+        state.log_view = Some(LogViewState::default());
+        state.selected_panel = Panel::Logs;
+        let before = state.log_view.as_ref().unwrap().auto_scroll;
+        state.handle_select();
+        let after = state.log_view.as_ref().unwrap().auto_scroll;
+        assert_ne!(before, after);
+        info!("TEST PASS: test_handle_select_logs_toggles_auto_scroll");
+    }
+
+    #[test]
+    fn test_copy_selected_variants() {
+        init_test_logging();
+        info!("TEST START: test_copy_selected_variants");
+        let mut state = TuiState::default();
+        state.workers = vec![make_worker("w1")];
+        state.selected_panel = Panel::Workers;
+        state.copy_selected();
+        assert_eq!(state.last_copied.as_deref(), Some("w1@host"));
+
+        state.active_builds = vec![make_active_build("b1", "cargo test")];
+        state.selected_panel = Panel::ActiveBuilds;
+        state.copy_selected();
+        assert_eq!(state.last_copied.as_deref(), Some("cargo test"));
+
+        state.build_history = VecDeque::from([make_history("h1", "cargo check", Some("w1"), true)]);
+        state.selected_panel = Panel::BuildHistory;
+        state.copy_selected();
+        assert_eq!(state.last_copied.as_deref(), Some("cargo check"));
+        info!("TEST PASS: test_copy_selected_variants");
+    }
+
+    #[test]
+    fn test_copy_selected_logs_joined_lines() {
+        init_test_logging();
+        info!("TEST START: test_copy_selected_logs_joined_lines");
+        let mut state = TuiState::default();
+        let mut log_view = LogViewState::default();
+        log_view.lines.push_back("line1".to_string());
+        log_view.lines.push_back("line2".to_string());
+        state.log_view = Some(log_view);
+        state.selected_panel = Panel::Logs;
+        state.copy_selected();
+        assert_eq!(state.last_copied.as_deref(), Some("line1\nline2"));
+        info!("TEST PASS: test_copy_selected_logs_joined_lines");
+    }
+
+    #[test]
+    fn test_filtered_build_history_filters() {
+        init_test_logging();
+        info!("TEST START: test_filtered_build_history_filters");
+        let mut state = TuiState::default();
+        state.build_history = VecDeque::from([
+            make_history("h1", "cargo build", Some("w1"), true),
+            make_history("h2", "cargo test", Some("w2"), false),
+        ]);
+
+        state.filter.query = "build".to_string();
+        let filtered = state.filtered_build_history();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, "h1");
+
+        state.filter.query.clear();
+        state.filter.worker_filter = Some("w2".to_string());
+        let filtered = state.filtered_build_history();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, "h2");
+
+        state.filter.worker_filter = None;
+        state.filter.success_only = true;
+        let filtered = state.filtered_build_history();
+        assert_eq!(filtered.len(), 1);
+        assert!(filtered[0].success);
+
+        state.filter.success_only = false;
+        state.filter.failed_only = true;
+        let filtered = state.filtered_build_history();
+        assert_eq!(filtered.len(), 1);
+        assert!(!filtered[0].success);
+        info!("TEST PASS: test_filtered_build_history_filters");
+    }
+}

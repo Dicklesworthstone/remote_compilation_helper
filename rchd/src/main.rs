@@ -226,3 +226,289 @@ async fn main() -> Result<()> {
     info!("Daemon stopped");
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    fn init_test_logging() {
+        let _ = tracing_subscriber::fmt()
+            .with_test_writer()
+            .with_max_level(tracing::Level::DEBUG)
+            .try_init();
+    }
+
+    // =========================================================================
+    // test_daemon_context_creation - DaemonContext initialization tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_daemon_context_creation_basic() {
+        init_test_logging();
+
+        let pool = workers::WorkerPool::new();
+        let history = Arc::new(BuildHistory::new(100));
+        let started_at = Instant::now();
+
+        let context = DaemonContext {
+            pool: pool.clone(),
+            history: history.clone(),
+            started_at,
+            socket_path: "/tmp/test.sock".to_string(),
+            version: "0.1.0-test",
+            pid: std::process::id(),
+        };
+
+        assert_eq!(context.socket_path, "/tmp/test.sock");
+        assert_eq!(context.version, "0.1.0-test");
+        assert!(context.pid > 0);
+        assert!(context.pool.is_empty());
+        assert!(context.history.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_daemon_context_with_workers() {
+        init_test_logging();
+
+        let pool = workers::WorkerPool::new();
+
+        // Add a worker
+        let worker_config = rch_common::WorkerConfig {
+            id: rch_common::WorkerId::new("test-worker"),
+            host: "192.168.1.100".to_string(),
+            user: "ubuntu".to_string(),
+            identity_file: "~/.ssh/id_rsa".to_string(),
+            total_slots: 8,
+            priority: 100,
+            tags: vec!["rust".to_string()],
+        };
+        pool.add_worker(worker_config).await;
+
+        let history = Arc::new(BuildHistory::new(100));
+        let started_at = Instant::now();
+
+        let context = DaemonContext {
+            pool,
+            history,
+            started_at,
+            socket_path: "/tmp/rch.sock".to_string(),
+            version: env!("CARGO_PKG_VERSION"),
+            pid: std::process::id(),
+        };
+
+        assert_eq!(context.pool.len(), 1);
+        let workers = context.pool.all_workers().await;
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0].config.id.as_str(), "test-worker");
+    }
+
+    #[tokio::test]
+    async fn test_daemon_context_with_history() {
+        init_test_logging();
+
+        let pool = workers::WorkerPool::new();
+        let history = Arc::new(BuildHistory::new(100));
+
+        // Add a build record
+        let record = rch_common::BuildRecord {
+            id: 1,
+            started_at: "2024-01-01T00:00:00Z".to_string(),
+            completed_at: "2024-01-01T00:01:00Z".to_string(),
+            project_id: "test-project".to_string(),
+            worker_id: Some("worker-1".to_string()),
+            command: "cargo build".to_string(),
+            exit_code: 0,
+            duration_ms: 60000,
+            location: rch_common::BuildLocation::Remote,
+            bytes_transferred: Some(1024),
+        };
+        history.record(record);
+
+        let context = DaemonContext {
+            pool,
+            history,
+            started_at: Instant::now(),
+            socket_path: "/tmp/rch.sock".to_string(),
+            version: "0.1.0",
+            pid: 12345,
+        };
+
+        assert_eq!(context.history.len(), 1);
+        let recent = context.history.recent(10);
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].project_id, "test-project");
+    }
+
+    #[tokio::test]
+    async fn test_daemon_context_clone() {
+        init_test_logging();
+
+        let pool = workers::WorkerPool::new();
+        let history = Arc::new(BuildHistory::new(100));
+
+        let context = DaemonContext {
+            pool: pool.clone(),
+            history: history.clone(),
+            started_at: Instant::now(),
+            socket_path: "/tmp/rch.sock".to_string(),
+            version: "0.1.0",
+            pid: 1234,
+        };
+
+        // Clone the context
+        let context_clone = context.clone();
+
+        // Both should share the same underlying data
+        assert_eq!(context.socket_path, context_clone.socket_path);
+        assert_eq!(context.version, context_clone.version);
+        assert_eq!(context.pid, context_clone.pid);
+
+        // Add a worker via original - should be visible in clone
+        let worker_config = rch_common::WorkerConfig {
+            id: rch_common::WorkerId::new("shared-worker"),
+            host: "192.168.1.200".to_string(),
+            user: "admin".to_string(),
+            identity_file: "~/.ssh/key".to_string(),
+            total_slots: 4,
+            priority: 50,
+            tags: vec![],
+        };
+        context.pool.add_worker(worker_config).await;
+
+        // Clone should see the worker
+        assert_eq!(context_clone.pool.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_daemon_context_uptime() {
+        init_test_logging();
+
+        let pool = workers::WorkerPool::new();
+        let history = Arc::new(BuildHistory::new(100));
+        let started_at = Instant::now();
+
+        let context = DaemonContext {
+            pool,
+            history,
+            started_at,
+            socket_path: "/tmp/rch.sock".to_string(),
+            version: "0.1.0",
+            pid: 1234,
+        };
+
+        // Wait a small amount
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        // Uptime should be measurable
+        let uptime = context.started_at.elapsed();
+        assert!(uptime.as_millis() >= 10);
+    }
+
+    #[tokio::test]
+    async fn test_daemon_context_multiple_workers() {
+        init_test_logging();
+
+        let pool = workers::WorkerPool::new();
+
+        // Add multiple workers
+        for i in 1..=5 {
+            let worker_config = rch_common::WorkerConfig {
+                id: rch_common::WorkerId::new(format!("worker-{}", i)),
+                host: format!("192.168.1.{}", 100 + i),
+                user: "ubuntu".to_string(),
+                identity_file: "~/.ssh/id_rsa".to_string(),
+                total_slots: (i * 4) as u32,
+                priority: 100 - i as u32,
+                tags: vec![format!("tag-{}", i)],
+            };
+            pool.add_worker(worker_config).await;
+        }
+
+        let history = Arc::new(BuildHistory::new(100));
+
+        let context = DaemonContext {
+            pool,
+            history,
+            started_at: Instant::now(),
+            socket_path: "/tmp/rch.sock".to_string(),
+            version: "0.1.0",
+            pid: 1234,
+        };
+
+        assert_eq!(context.pool.len(), 5);
+    }
+
+    // =========================================================================
+    // test_daemon_build_history - BuildHistory integration tests
+    // =========================================================================
+
+    #[test]
+    fn test_daemon_build_history_capacity() {
+        init_test_logging();
+
+        // Test that BuildHistory respects capacity limits
+        let history = BuildHistory::new(3);
+
+        for i in 1..=5 {
+            let record = rch_common::BuildRecord {
+                id: i,
+                started_at: format!("2024-01-01T00:0{}:00Z", i),
+                completed_at: format!("2024-01-01T00:0{}:30Z", i),
+                project_id: "test-project".to_string(),
+                worker_id: None,
+                command: format!("cargo build {}", i),
+                exit_code: 0,
+                duration_ms: 1000,
+                location: rch_common::BuildLocation::Local,
+                bytes_transferred: None,
+            };
+            history.record(record);
+        }
+
+        // Should only retain last 3 entries
+        assert_eq!(history.len(), 3);
+        let recent = history.recent(10);
+        assert_eq!(recent[0].id, 5); // Most recent
+        assert_eq!(recent[2].id, 3); // Oldest retained
+    }
+
+    #[test]
+    fn test_daemon_build_history_stats() {
+        init_test_logging();
+
+        let history = BuildHistory::new(100);
+
+        // Add mixed success/failure, remote/local builds
+        let records = vec![
+            (1, 0, rch_common::BuildLocation::Remote, 1000),
+            (2, 0, rch_common::BuildLocation::Remote, 2000),
+            (3, 1, rch_common::BuildLocation::Local, 500),
+            (4, 0, rch_common::BuildLocation::Local, 1500),
+        ];
+
+        for (id, exit_code, location, duration_ms) in records {
+            let record = rch_common::BuildRecord {
+                id,
+                started_at: "2024-01-01T00:00:00Z".to_string(),
+                completed_at: "2024-01-01T00:00:30Z".to_string(),
+                project_id: "test".to_string(),
+                worker_id: None,
+                command: "cargo test".to_string(),
+                exit_code,
+                duration_ms,
+                location,
+                bytes_transferred: None,
+            };
+            history.record(record);
+        }
+
+        let stats = history.stats();
+        assert_eq!(stats.total_builds, 4);
+        assert_eq!(stats.success_count, 3);
+        assert_eq!(stats.failure_count, 1);
+        assert_eq!(stats.remote_count, 2);
+        assert_eq!(stats.local_count, 2);
+        assert_eq!(stats.avg_duration_ms, 1250); // (1000+2000+500+1500)/4
+    }
+}

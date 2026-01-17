@@ -698,3 +698,231 @@ fn render_scrollbar(
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tui::state::{
+        ActiveBuild, BuildProgress, BuildStatus, CircuitState, LogViewState, Panel, TuiState,
+        WorkerState, WorkerStatus,
+    };
+    use chrono::Utc;
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+    use ratatui::Terminal;
+    use tracing::info;
+
+    fn init_test_logging() {
+        let _ = tracing_subscriber::fmt()
+            .with_test_writer()
+            .with_max_level(tracing::Level::DEBUG)
+            .try_init();
+    }
+
+    fn buffer_to_string(buffer: &Buffer) -> String {
+        let mut out = String::new();
+        let width = buffer.area.width;
+        let height = buffer.area.height;
+        for y in 0..height {
+            for x in 0..width {
+                if let Some(cell) = buffer.cell((x, y)) {
+                    out.push_str(cell.symbol());
+                } else {
+                    out.push(' ');
+                }
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    fn render_to_string<F>(width: u16, height: u16, mut draw: F) -> String
+    where
+        F: FnMut(&mut Frame),
+    {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f)).unwrap();
+        buffer_to_string(terminal.backend().buffer())
+    }
+
+    fn sample_worker(id: &str, status: WorkerStatus, circuit: CircuitState) -> WorkerState {
+        WorkerState {
+            id: id.to_string(),
+            host: "worker.local".to_string(),
+            status,
+            circuit,
+            total_slots: 8,
+            used_slots: 2,
+            latency_ms: 10,
+            last_seen: Utc::now(),
+            builds_completed: 3,
+        }
+    }
+
+    fn sample_active_build(id: &str, command: &str) -> ActiveBuild {
+        ActiveBuild {
+            id: id.to_string(),
+            command: command.to_string(),
+            worker: Some("worker-1".to_string()),
+            started_at: Utc::now(),
+            progress: Some(BuildProgress {
+                phase: "compiling".to_string(),
+                percent: Some(42),
+                current_file: None,
+            }),
+            status: BuildStatus::Compiling,
+        }
+    }
+
+    #[test]
+    fn test_render_workers_panel_contains_ids() {
+        init_test_logging();
+        info!("TEST START: test_render_workers_panel_contains_ids");
+        let mut state = TuiState::default();
+        state.selected_panel = Panel::Workers;
+        state.workers = vec![
+            sample_worker("worker-a", WorkerStatus::Healthy, CircuitState::Closed),
+            sample_worker("worker-b", WorkerStatus::Degraded, CircuitState::HalfOpen),
+        ];
+        let content = render_to_string(60, 10, |f| {
+            let colors = get_colors(false);
+            render_workers_panel(f, Rect::new(0, 0, 60, 10), &state, &colors);
+        });
+        info!("VERIFY: content contains worker ids");
+        assert!(content.contains("worker-a"));
+        assert!(content.contains("worker-b"));
+        info!("TEST PASS: test_render_workers_panel_contains_ids");
+    }
+
+    #[test]
+    fn test_render_active_builds_panel_shows_command() {
+        init_test_logging();
+        info!("TEST START: test_render_active_builds_panel_shows_command");
+        let mut state = TuiState::default();
+        state.selected_panel = Panel::ActiveBuilds;
+        state.active_builds = vec![sample_active_build("b1", "cargo build")];
+        let content = render_to_string(80, 10, |f| {
+            let colors = get_colors(false);
+            render_active_builds_panel(f, Rect::new(0, 0, 80, 10), &state, &colors);
+        });
+        assert!(content.contains("cargo build"));
+        assert!(content.contains("worker-1"));
+        info!("TEST PASS: test_render_active_builds_panel_shows_command");
+    }
+
+    #[test]
+    fn test_render_build_history_panel_shows_filtered_title() {
+        init_test_logging();
+        info!("TEST START: test_render_build_history_panel_shows_filtered_title");
+        let mut state = TuiState::default();
+        state.selected_panel = Panel::BuildHistory;
+        state.filter.query = "build".to_string();
+        state.build_history.push_back(crate::tui::state::HistoricalBuild {
+            id: "h1".to_string(),
+            command: "cargo build".to_string(),
+            worker: Some("worker-1".to_string()),
+            started_at: Utc::now(),
+            completed_at: Utc::now(),
+            duration_ms: 1200,
+            success: true,
+            exit_code: Some(0),
+        });
+        state.build_history.push_back(crate::tui::state::HistoricalBuild {
+            id: "h2".to_string(),
+            command: "cargo test".to_string(),
+            worker: Some("worker-2".to_string()),
+            started_at: Utc::now(),
+            completed_at: Utc::now(),
+            duration_ms: 1500,
+            success: false,
+            exit_code: Some(1),
+        });
+        let content = render_to_string(80, 10, |f| {
+            let colors = get_colors(false);
+            render_build_history_panel(f, Rect::new(0, 0, 80, 10), &state, &colors);
+        });
+        assert!(content.contains("Build History [1/2]"));
+        info!("TEST PASS: test_render_build_history_panel_shows_filtered_title");
+    }
+
+    #[test]
+    fn test_render_logs_panel_scroll_indicator() {
+        init_test_logging();
+        info!("TEST START: test_render_logs_panel_scroll_indicator");
+        let mut state = TuiState::default();
+        let mut log_view = LogViewState::default();
+        for i in 0..10 {
+            log_view.lines.push_back(format!("line {}", i));
+        }
+        log_view.scroll_offset = 2;
+        state.log_view = Some(log_view);
+        state.selected_panel = Panel::Logs;
+        let content = render_to_string(80, 8, |f| {
+            let colors = get_colors(false);
+            render_logs_panel(f, Rect::new(0, 0, 80, 8), &state, &colors);
+        });
+        assert!(content.contains("[3-6/10]"));
+        assert!(content.contains("AUTO"));
+        info!("TEST PASS: test_render_logs_panel_scroll_indicator");
+    }
+
+    #[test]
+    fn test_render_help_overlay() {
+        init_test_logging();
+        info!("TEST START: test_render_help_overlay");
+        let mut state = TuiState::default();
+        state.show_help = true;
+        let content = render_to_string(80, 24, |f| render(f, &state));
+        assert!(content.contains("RCH Dashboard Help"));
+        info!("TEST PASS: test_render_help_overlay");
+    }
+
+    #[test]
+    fn test_render_filter_input_overlay() {
+        init_test_logging();
+        info!("TEST START: test_render_filter_input_overlay");
+        let mut state = TuiState::default();
+        state.filter_mode = true;
+        state.filter.query = "abc".to_string();
+        let content = render_to_string(80, 24, |f| render(f, &state));
+        assert!(content.contains("Search:"));
+        assert!(content.contains("/abc"));
+        info!("TEST PASS: test_render_filter_input_overlay");
+    }
+
+    #[test]
+    fn test_render_error_bar() {
+        init_test_logging();
+        info!("TEST START: test_render_error_bar");
+        let mut state = TuiState::default();
+        state.error = Some("daemon down".to_string());
+        let content = render_to_string(80, 24, |f| render(f, &state));
+        assert!(content.contains("Error:"));
+        assert!(content.contains("daemon down"));
+        info!("TEST PASS: test_render_error_bar");
+    }
+
+    #[test]
+    fn test_render_copy_feedback() {
+        init_test_logging();
+        info!("TEST START: test_render_copy_feedback");
+        let mut state = TuiState::default();
+        state.last_copied = Some("payload".to_string());
+        let content = render_to_string(80, 24, |f| render(f, &state));
+        assert!(content.contains("Copied to clipboard!"));
+        info!("TEST PASS: test_render_copy_feedback");
+    }
+
+    #[test]
+    fn test_render_minimum_size_no_panic() {
+        init_test_logging();
+        info!("TEST START: test_render_minimum_size_no_panic");
+        let state = TuiState::default();
+        let result = std::panic::catch_unwind(|| {
+            let _ = render_to_string(1, 1, |f| render(f, &state));
+        });
+        assert!(result.is_ok());
+        info!("TEST PASS: test_render_minimum_size_no_panic");
+    }
+}

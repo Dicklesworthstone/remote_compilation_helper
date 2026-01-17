@@ -15,5 +15,5 @@ pub mod validate;
 
 pub use env::{EnvError, EnvParser};
 pub use profiles::Profile;
-pub use source::{ConfigSource, Sourced};
+pub use source::{ConfigSource, ConfigValueSource, Sourced};
 pub use validate::{ConfigWarning, Severity, validate_config};

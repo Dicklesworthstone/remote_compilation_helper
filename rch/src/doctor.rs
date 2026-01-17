@@ -202,6 +202,7 @@ pub async fn run_doctor(ctx: &OutputContext, options: DoctorOptions) -> Result<(
 
 /// Quick health check result for post-hook-install display.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct QuickCheckResult {
     pub daemon_running: bool,
     pub worker_count: usize,
@@ -221,6 +222,7 @@ impl QuickCheckResult {
     }
 
     /// Check if there are any issues.
+    #[allow(dead_code)]
     pub fn has_issues(&self) -> bool {
         !self.warnings.is_empty() || !self.errors.is_empty()
     }

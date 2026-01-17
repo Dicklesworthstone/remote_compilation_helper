@@ -15,6 +15,8 @@ pub mod patterns;
 #[cfg(test)]
 mod patterns_security_test;
 pub mod protocol;
+pub mod remote_compilation;
+pub mod remote_verification;
 pub mod ssh;
 pub mod test_change;
 pub mod toolchain;
@@ -22,7 +24,10 @@ pub mod types;
 
 pub use binary_hash::{BinaryHashResult, binaries_equivalent, binary_contains_marker, compute_binary_hash};
 pub use test_change::{TestChangeGuard, TestCodeChange};
-pub use patterns::{Classification, CompilationKind, classify_command};
+pub use patterns::{
+    Classification, ClassificationDetails, ClassificationTier, CompilationKind, TierDecision,
+    classify_command, classify_command_detailed,
+};
 pub use protocol::{HookInput, HookOutput, ToolInput};
 pub use ssh::{CommandResult, KnownHostsPolicy, SshClient, SshOptions, SshPool};
 pub use toolchain::{ToolchainInfo, wrap_command_with_toolchain};
@@ -35,7 +40,8 @@ pub use types::{
 
 // Config module re-exports
 pub use config::{
-    ConfigSource, ConfigWarning, EnvError, EnvParser, Profile, Severity, Sourced, validate_config,
+    ConfigSource, ConfigValueSource, ConfigWarning, EnvError, EnvParser, Profile, Severity,
+    Sourced, validate_config,
 };
 
 // Discovery module re-exports

@@ -210,10 +210,10 @@ pub fn cleanup_stale_test_artifacts(base_dir: &Path, max_age: Duration) {
                 if let Ok(dir_entries) = std::fs::read_dir(&path) {
                     for file_entry in dir_entries.flatten() {
                         let file_path = file_entry.path();
-                        if file_path.extension().map_or(false, |e| e == "sock") {
-                            if std::fs::remove_file(&file_path).is_ok() {
-                                cleaned_sockets += 1;
-                            }
+                        if file_path.extension().is_some_and(|e| e == "sock")
+                            && std::fs::remove_file(&file_path).is_ok()
+                        {
+                            cleaned_sockets += 1;
                         }
                     }
                 }

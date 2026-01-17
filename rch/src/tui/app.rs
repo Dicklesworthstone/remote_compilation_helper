@@ -332,12 +332,212 @@ async fn run_app(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::status_types::{
+        ActiveBuildFromApi, BuildRecordFromApi, BuildStatsFromApi, DaemonFullStatusResponse,
+        DaemonInfoFromApi, IssueFromApi, WorkerStatusFromApi,
+    };
+    use tracing::info;
+
+    fn init_test_logging() {
+        let _ = tracing_subscriber::fmt()
+            .with_test_writer()
+            .with_max_level(tracing::Level::DEBUG)
+            .try_init();
+    }
+
+    fn make_response(
+        workers: Vec<WorkerStatusFromApi>,
+        active_builds: Vec<ActiveBuildFromApi>,
+        recent_builds: Vec<BuildRecordFromApi>,
+    ) -> DaemonFullStatusResponse {
+        DaemonFullStatusResponse {
+            daemon: DaemonInfoFromApi {
+                pid: 1234,
+                uptime_secs: 3600,
+                version: "0.1.0".to_string(),
+                socket_path: "/tmp/rch.sock".to_string(),
+                started_at: "2026-01-17T00:00:00Z".to_string(),
+                workers_total: workers.len(),
+                workers_healthy: workers.len(),
+                slots_total: 32,
+                slots_available: 24,
+            },
+            workers,
+            active_builds,
+            recent_builds,
+            issues: vec![IssueFromApi {
+                severity: "info".to_string(),
+                summary: "all good".to_string(),
+                remediation: None,
+            }],
+            stats: BuildStatsFromApi {
+                total_builds: 42,
+                success_count: 40,
+                failure_count: 2,
+                remote_count: 40,
+                local_count: 2,
+                avg_duration_ms: 1200,
+            },
+        }
+    }
+
+    fn worker_status(id: &str, status: &str, circuit: &str) -> WorkerStatusFromApi {
+        WorkerStatusFromApi {
+            id: id.to_string(),
+            host: "worker.local".to_string(),
+            user: "builder".to_string(),
+            status: status.to_string(),
+            circuit_state: circuit.to_string(),
+            used_slots: 2,
+            total_slots: 8,
+            speed_score: 75.0,
+            last_error: None,
+        }
+    }
+
+    fn active_build(id: u64, worker_id: &str, command: &str) -> ActiveBuildFromApi {
+        ActiveBuildFromApi {
+            id,
+            project_id: "proj".to_string(),
+            worker_id: worker_id.to_string(),
+            command: command.to_string(),
+            started_at: "2026-01-17T00:00:00Z".to_string(),
+        }
+    }
+
+    fn build_record(id: u64, exit_code: i32, command: &str) -> BuildRecordFromApi {
+        BuildRecordFromApi {
+            id,
+            started_at: "2026-01-17T00:00:00Z".to_string(),
+            completed_at: "2026-01-17T00:00:05Z".to_string(),
+            project_id: "proj".to_string(),
+            worker_id: Some("worker-1".to_string()),
+            command: command.to_string(),
+            exit_code,
+            duration_ms: 5000,
+            location: "remote".to_string(),
+            bytes_transferred: Some(1234),
+        }
+    }
 
     #[test]
     fn test_tui_config_default() {
+        init_test_logging();
+        info!("TEST START: test_tui_config_default");
         let config = TuiConfig::default();
+        info!(
+            "VERIFY: refresh_interval_ms={} mouse_support={} high_contrast={}",
+            config.refresh_interval_ms,
+            config.mouse_support,
+            config.high_contrast
+        );
         assert_eq!(config.refresh_interval_ms, 1000);
         assert!(config.mouse_support);
         assert!(!config.high_contrast);
+        info!("TEST PASS: test_tui_config_default");
+    }
+
+    #[test]
+    fn test_update_state_sets_daemon_running() {
+        init_test_logging();
+        info!("TEST START: test_update_state_sets_daemon_running");
+        let response = make_response(vec![], vec![], vec![]);
+        let mut state = TuiState::new();
+        update_state_from_daemon(&mut state, response);
+        info!("VERIFY: status={:?} uptime={:?}", state.daemon.status, state.daemon.uptime);
+        assert_eq!(state.daemon.status, Status::Running);
+        assert_eq!(state.daemon.uptime, Duration::from_secs(3600));
+        info!("TEST PASS: test_update_state_sets_daemon_running");
+    }
+
+    #[test]
+    fn test_update_state_worker_status_mapping() {
+        init_test_logging();
+        info!("TEST START: test_update_state_worker_status_mapping");
+        let workers = vec![
+            worker_status("w1", "healthy", "closed"),
+            worker_status("w2", "degraded", "half_open"),
+            worker_status("w3", "draining", "open"),
+            worker_status("w4", "unknown", "closed"),
+        ];
+        let response = make_response(workers, vec![], vec![]);
+        let mut state = TuiState::new();
+        update_state_from_daemon(&mut state, response);
+        info!("VERIFY: worker_count={}", state.workers.len());
+        assert_eq!(state.workers.len(), 4);
+        assert_eq!(state.workers[0].status, WorkerStatus::Healthy);
+        assert_eq!(state.workers[1].status, WorkerStatus::Degraded);
+        assert_eq!(state.workers[2].status, WorkerStatus::Draining);
+        assert_eq!(state.workers[3].status, WorkerStatus::Unreachable);
+        info!("TEST PASS: test_update_state_worker_status_mapping");
+    }
+
+    #[test]
+    fn test_update_state_circuit_mapping() {
+        init_test_logging();
+        info!("TEST START: test_update_state_circuit_mapping");
+        let workers = vec![
+            worker_status("w1", "healthy", "closed"),
+            worker_status("w2", "healthy", "half_open"),
+            worker_status("w3", "healthy", "open"),
+            worker_status("w4", "healthy", "mystery"),
+        ];
+        let response = make_response(workers, vec![], vec![]);
+        let mut state = TuiState::new();
+        update_state_from_daemon(&mut state, response);
+        assert_eq!(state.workers[0].circuit, CircuitState::Closed);
+        assert_eq!(state.workers[1].circuit, CircuitState::HalfOpen);
+        assert_eq!(state.workers[2].circuit, CircuitState::Open);
+        assert_eq!(state.workers[3].circuit, CircuitState::Open);
+        info!("TEST PASS: test_update_state_circuit_mapping");
+    }
+
+    #[test]
+    fn test_update_state_active_builds_mapping() {
+        init_test_logging();
+        info!("TEST START: test_update_state_active_builds_mapping");
+        let active = vec![active_build(1, "worker-1", "cargo build --release")];
+        let response = make_response(vec![], active, vec![]);
+        let mut state = TuiState::new();
+        update_state_from_daemon(&mut state, response);
+        info!("VERIFY: active_builds={}", state.active_builds.len());
+        assert_eq!(state.active_builds.len(), 1);
+        assert_eq!(state.active_builds[0].status, BuildStatus::Compiling);
+        assert_eq!(state.active_builds[0].progress.as_ref().unwrap().phase, "compiling");
+        assert_eq!(state.active_builds[0].worker.as_deref(), Some("worker-1"));
+        info!("TEST PASS: test_update_state_active_builds_mapping");
+    }
+
+    #[test]
+    fn test_update_state_build_history_limit() {
+        init_test_logging();
+        info!("TEST START: test_update_state_build_history_limit");
+        let mut history = Vec::new();
+        for i in 0..120u64 {
+            history.push(build_record(i, 0, "cargo build"));
+        }
+        let response = make_response(vec![], vec![], history);
+        let mut state = TuiState::new();
+        update_state_from_daemon(&mut state, response);
+        info!("VERIFY: history_len={}", state.build_history.len());
+        assert_eq!(state.build_history.len(), 100);
+        info!("TEST PASS: test_update_state_build_history_limit");
+    }
+
+    #[test]
+    fn test_update_state_build_history_success_flag() {
+        init_test_logging();
+        info!("TEST START: test_update_state_build_history_success_flag");
+        let history = vec![
+            build_record(1, 0, "cargo build"),
+            build_record(2, 1, "cargo test"),
+        ];
+        let response = make_response(vec![], vec![], history);
+        let mut state = TuiState::new();
+        update_state_from_daemon(&mut state, response);
+        assert_eq!(state.build_history.len(), 2);
+        assert!(state.build_history[0].success);
+        assert!(!state.build_history[1].success);
+        info!("TEST PASS: test_update_state_build_history_success_flag");
     }
 }

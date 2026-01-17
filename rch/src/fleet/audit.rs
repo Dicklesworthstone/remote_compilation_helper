@@ -373,8 +373,10 @@ mod tests {
     fn audit_logger_log_multiple_entries() {
         let mut logger = AuditLogger::new(None).unwrap();
         for i in 0..5 {
-            let mut entry = DeploymentAuditEntry::default();
-            entry.user = format!("user-{}", i);
+            let entry = DeploymentAuditEntry {
+                user: format!("user-{}", i),
+                ..Default::default()
+            };
             logger.log(entry).unwrap();
         }
         assert_eq!(logger.entries().len(), 5);

@@ -303,6 +303,14 @@ log_level = "info"
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
+
+    fn init_test_logging() {
+        let _ = tracing_subscriber::fmt()
+            .with_test_writer()
+            .with_max_level(tracing::Level::DEBUG)
+            .try_init();
+    }
 
     #[test]
     fn test_default_daemon_config() {
@@ -359,5 +367,362 @@ enabled = true
         let daemon_toml = example_daemon_config();
         let _: DaemonConfig =
             toml::from_str(&daemon_toml).expect("Example daemon config should parse");
+    }
+
+    // =========================================================================
+    // test_daemon_config_loading - Config file parsing, defaults, validation
+    // =========================================================================
+
+    #[test]
+    fn test_daemon_config_loading_from_file() {
+        init_test_logging();
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("daemon.toml");
+
+        let config_content = r#"
+socket_path = "/custom/path/rch.sock"
+health_check_interval_secs = 60
+worker_timeout_secs = 30
+max_jobs_per_slot = 2
+connection_pooling = false
+log_level = "debug"
+"#;
+        std::fs::write(&config_path, config_content).unwrap();
+
+        let config = load_daemon_config(Some(&config_path)).unwrap();
+
+        assert_eq!(config.socket_path, PathBuf::from("/custom/path/rch.sock"));
+        assert_eq!(config.health_check_interval_secs, 60);
+        assert_eq!(config.worker_timeout_secs, 30);
+        assert_eq!(config.max_jobs_per_slot, 2);
+        assert!(!config.connection_pooling);
+        assert_eq!(config.log_level, "debug");
+    }
+
+    #[test]
+    fn test_daemon_config_loading_missing_file_uses_defaults() {
+        init_test_logging();
+
+        let temp_dir = TempDir::new().unwrap();
+        let nonexistent_path = temp_dir.path().join("nonexistent.toml");
+
+        let config = load_daemon_config(Some(&nonexistent_path)).unwrap();
+
+        // Should use default values
+        assert_eq!(config.socket_path, PathBuf::from("/tmp/rch.sock"));
+        assert_eq!(config.health_check_interval_secs, 30);
+        assert_eq!(config.worker_timeout_secs, 10);
+        assert_eq!(config.max_jobs_per_slot, 1);
+        assert!(config.connection_pooling);
+        assert_eq!(config.log_level, "info");
+    }
+
+    #[test]
+    fn test_daemon_config_loading_partial_file() {
+        init_test_logging();
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("daemon.toml");
+
+        // Only specify some fields - others should use defaults
+        let config_content = r#"
+socket_path = "/custom/rch.sock"
+log_level = "warn"
+"#;
+        std::fs::write(&config_path, config_content).unwrap();
+
+        let config = load_daemon_config(Some(&config_path)).unwrap();
+
+        // Specified values
+        assert_eq!(config.socket_path, PathBuf::from("/custom/rch.sock"));
+        assert_eq!(config.log_level, "warn");
+
+        // Default values for unspecified fields
+        assert_eq!(config.health_check_interval_secs, 30);
+        assert_eq!(config.worker_timeout_secs, 10);
+        assert_eq!(config.max_jobs_per_slot, 1);
+        assert!(config.connection_pooling);
+    }
+
+    #[test]
+    fn test_daemon_config_loading_invalid_toml() {
+        init_test_logging();
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("daemon.toml");
+
+        let config_content = "this is not valid toml {{{";
+        std::fs::write(&config_path, config_content).unwrap();
+
+        let result = load_daemon_config(Some(&config_path));
+        assert!(result.is_err());
+    }
+
+    // =========================================================================
+    // test_daemon_worker_loading - Workers.toml parsing, validation
+    // =========================================================================
+
+    #[test]
+    fn test_worker_loading_from_file() {
+        init_test_logging();
+
+        let temp_dir = TempDir::new().unwrap();
+        let workers_path = temp_dir.path().join("workers.toml");
+
+        let config_content = r#"
+[[workers]]
+id = "server1"
+host = "192.168.1.100"
+user = "ubuntu"
+identity_file = "~/.ssh/id_rsa"
+total_slots = 16
+priority = 100
+tags = ["rust", "fast"]
+enabled = true
+
+[[workers]]
+id = "server2"
+host = "192.168.1.101"
+user = "admin"
+identity_file = "~/.ssh/admin_key"
+total_slots = 8
+priority = 80
+tags = ["backup"]
+enabled = true
+"#;
+        std::fs::write(&workers_path, config_content).unwrap();
+
+        let workers = load_workers(Some(&workers_path)).unwrap();
+
+        assert_eq!(workers.len(), 2);
+        assert_eq!(workers[0].id.as_str(), "server1");
+        assert_eq!(workers[0].host, "192.168.1.100");
+        assert_eq!(workers[0].total_slots, 16);
+        assert_eq!(workers[1].id.as_str(), "server2");
+        assert_eq!(workers[1].host, "192.168.1.101");
+    }
+
+    #[test]
+    fn test_worker_loading_disabled_workers_filtered() {
+        init_test_logging();
+
+        let temp_dir = TempDir::new().unwrap();
+        let workers_path = temp_dir.path().join("workers.toml");
+
+        let config_content = r#"
+[[workers]]
+id = "enabled-worker"
+host = "192.168.1.100"
+enabled = true
+
+[[workers]]
+id = "disabled-worker"
+host = "192.168.1.101"
+enabled = false
+"#;
+        std::fs::write(&workers_path, config_content).unwrap();
+
+        let workers = load_workers(Some(&workers_path)).unwrap();
+
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0].id.as_str(), "enabled-worker");
+    }
+
+    #[test]
+    fn test_worker_loading_missing_file_returns_empty() {
+        init_test_logging();
+
+        let temp_dir = TempDir::new().unwrap();
+        let nonexistent_path = temp_dir.path().join("nonexistent.toml");
+
+        let workers = load_workers(Some(&nonexistent_path)).unwrap();
+
+        assert!(workers.is_empty());
+    }
+
+    #[test]
+    fn test_worker_loading_default_values() {
+        init_test_logging();
+
+        let temp_dir = TempDir::new().unwrap();
+        let workers_path = temp_dir.path().join("workers.toml");
+
+        // Only specify required fields - others should use defaults
+        let config_content = r#"
+[[workers]]
+id = "minimal"
+host = "192.168.1.100"
+"#;
+        std::fs::write(&workers_path, config_content).unwrap();
+
+        let config = load_workers_config(Some(&workers_path)).unwrap();
+
+        assert_eq!(config.workers.len(), 1);
+        let worker = &config.workers[0];
+
+        assert_eq!(worker.id, "minimal");
+        assert_eq!(worker.host, "192.168.1.100");
+        // Default values
+        assert_eq!(worker.user, "ubuntu"); // default_user()
+        assert_eq!(worker.identity_file, "~/.ssh/id_rsa"); // default_identity_file()
+        assert_eq!(worker.total_slots, 8); // default_slots()
+        assert_eq!(worker.priority, 100); // default_priority()
+        assert!(worker.tags.is_empty());
+        assert!(worker.enabled); // default_true()
+    }
+
+    #[test]
+    fn test_worker_loading_missing_required_id_fails() {
+        init_test_logging();
+
+        let temp_dir = TempDir::new().unwrap();
+        let workers_path = temp_dir.path().join("workers.toml");
+
+        // Missing required 'id' field
+        let config_content = r#"
+[[workers]]
+host = "192.168.1.100"
+user = "ubuntu"
+"#;
+        std::fs::write(&workers_path, config_content).unwrap();
+
+        let result = load_workers_config(Some(&workers_path));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_worker_loading_missing_required_host_fails() {
+        init_test_logging();
+
+        let temp_dir = TempDir::new().unwrap();
+        let workers_path = temp_dir.path().join("workers.toml");
+
+        // Missing required 'host' field
+        let config_content = r#"
+[[workers]]
+id = "worker1"
+user = "ubuntu"
+"#;
+        std::fs::write(&workers_path, config_content).unwrap();
+
+        let result = load_workers_config(Some(&workers_path));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_worker_loading_invalid_toml_fails() {
+        init_test_logging();
+
+        let temp_dir = TempDir::new().unwrap();
+        let workers_path = temp_dir.path().join("workers.toml");
+
+        let config_content = "this is not valid toml {{{";
+        std::fs::write(&workers_path, config_content).unwrap();
+
+        let result = load_workers_config(Some(&workers_path));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_worker_loading_empty_workers_array() {
+        init_test_logging();
+
+        let temp_dir = TempDir::new().unwrap();
+        let workers_path = temp_dir.path().join("workers.toml");
+
+        let config_content = "# Empty workers config\n";
+        std::fs::write(&workers_path, config_content).unwrap();
+
+        let workers = load_workers(Some(&workers_path)).unwrap();
+        assert!(workers.is_empty());
+    }
+
+    #[test]
+    fn test_worker_loading_multiple_tags() {
+        init_test_logging();
+
+        let temp_dir = TempDir::new().unwrap();
+        let workers_path = temp_dir.path().join("workers.toml");
+
+        let config_content = r#"
+[[workers]]
+id = "multi-tag"
+host = "192.168.1.100"
+tags = ["rust", "go", "python", "fast", "production"]
+"#;
+        std::fs::write(&workers_path, config_content).unwrap();
+
+        let config = load_workers_config(Some(&workers_path)).unwrap();
+
+        assert_eq!(config.workers[0].tags.len(), 5);
+        assert!(config.workers[0].tags.contains(&"rust".to_string()));
+        assert!(config.workers[0].tags.contains(&"production".to_string()));
+    }
+
+    #[test]
+    fn test_worker_entry_conversion_preserves_all_fields() {
+        init_test_logging();
+
+        let entry = WorkerEntry {
+            id: "test-worker".to_string(),
+            host: "10.0.0.1".to_string(),
+            user: "admin".to_string(),
+            identity_file: "/path/to/key".to_string(),
+            total_slots: 32,
+            priority: 200,
+            tags: vec!["tag1".to_string(), "tag2".to_string()],
+            enabled: true,
+        };
+
+        let config: WorkerConfig = entry.into();
+
+        assert_eq!(config.id.as_str(), "test-worker");
+        assert_eq!(config.host, "10.0.0.1");
+        assert_eq!(config.user, "admin");
+        assert_eq!(config.identity_file, "/path/to/key");
+        assert_eq!(config.total_slots, 32);
+        assert_eq!(config.priority, 200);
+        assert_eq!(config.tags.len(), 2);
+        assert_eq!(config.tags[0], "tag1");
+        assert_eq!(config.tags[1], "tag2");
+    }
+
+    #[test]
+    fn test_worker_loading_zero_slots() {
+        init_test_logging();
+
+        let temp_dir = TempDir::new().unwrap();
+        let workers_path = temp_dir.path().join("workers.toml");
+
+        let config_content = r#"
+[[workers]]
+id = "zero-slots"
+host = "192.168.1.100"
+total_slots = 0
+"#;
+        std::fs::write(&workers_path, config_content).unwrap();
+
+        let config = load_workers_config(Some(&workers_path)).unwrap();
+        assert_eq!(config.workers[0].total_slots, 0);
+    }
+
+    #[test]
+    fn test_worker_loading_high_priority() {
+        init_test_logging();
+
+        let temp_dir = TempDir::new().unwrap();
+        let workers_path = temp_dir.path().join("workers.toml");
+
+        let config_content = r#"
+[[workers]]
+id = "high-priority"
+host = "192.168.1.100"
+priority = 999999
+"#;
+        std::fs::write(&workers_path, config_content).unwrap();
+
+        let config = load_workers_config(Some(&workers_path)).unwrap();
+        assert_eq!(config.workers[0].priority, 999999);
     }
 }

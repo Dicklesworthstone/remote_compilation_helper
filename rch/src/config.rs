@@ -2,8 +2,9 @@
 
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
-use rch_common::RchConfig;
+use rch_common::{ConfigValueSource, RchConfig};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tracing::debug;
 
@@ -61,6 +62,237 @@ pub fn load_config() -> Result<RchConfig> {
     config = apply_env_overrides(config);
 
     Ok(config)
+}
+
+/// Mapping of config keys to their value sources.
+pub type ConfigSourceMap = HashMap<String, ConfigValueSource>;
+
+/// Loaded config with source tracking.
+#[derive(Debug, Clone)]
+pub struct LoadedConfig {
+    pub config: RchConfig,
+    pub sources: ConfigSourceMap,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PartialRchConfig {
+    #[serde(default)]
+    general: PartialGeneralConfig,
+    #[serde(default)]
+    compilation: PartialCompilationConfig,
+    #[serde(default)]
+    transfer: PartialTransferConfig,
+    #[serde(default)]
+    circuit: PartialCircuitConfig,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PartialGeneralConfig {
+    enabled: Option<bool>,
+    log_level: Option<String>,
+    socket_path: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PartialCompilationConfig {
+    confidence_threshold: Option<f64>,
+    min_local_time_ms: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PartialTransferConfig {
+    compression_level: Option<u32>,
+    exclude_patterns: Option<Vec<String>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PartialCircuitConfig {
+    failure_threshold: Option<u32>,
+    success_threshold: Option<u32>,
+    error_rate_threshold: Option<f64>,
+    window_secs: Option<u64>,
+    open_cooldown_secs: Option<u64>,
+    half_open_max_probes: Option<u32>,
+}
+
+/// Load configuration with source tracking.
+pub fn load_config_with_sources() -> Result<LoadedConfig> {
+    let user_path = config_dir().map(|d| d.join("config.toml"));
+    let project_path = PathBuf::from(".rch/config.toml");
+
+    let user_path = user_path.as_deref().filter(|p| p.exists());
+    let project_path = project_path.as_path();
+    let project_path = if project_path.exists() {
+        Some(project_path)
+    } else {
+        None
+    };
+
+    load_config_with_sources_from_paths(user_path, project_path, None)
+}
+
+fn load_config_with_sources_from_paths(
+    user_path: Option<&Path>,
+    project_path: Option<&Path>,
+    env_overrides: Option<&HashMap<String, String>>,
+) -> Result<LoadedConfig> {
+    let defaults = RchConfig::default();
+    let mut config = defaults.clone();
+    let mut sources = default_sources_map();
+
+    if let Some(path) = user_path {
+        debug!("Loading user config with sources from {:?}", path);
+        let layer = load_partial_config(path)?;
+        apply_layer(
+            &mut config,
+            &mut sources,
+            &layer,
+            &ConfigValueSource::UserConfig(path.to_path_buf()),
+            &defaults,
+        );
+    }
+
+    if let Some(path) = project_path {
+        debug!("Loading project config with sources from {:?}", path);
+        let layer = load_partial_config(path)?;
+        apply_layer(
+            &mut config,
+            &mut sources,
+            &layer,
+            &ConfigValueSource::ProjectConfig(path.to_path_buf()),
+            &defaults,
+        );
+    }
+
+    apply_env_overrides_inner(&mut config, Some(&mut sources), env_overrides);
+
+    Ok(LoadedConfig { config, sources })
+}
+
+fn load_partial_config(path: &Path) -> Result<PartialRchConfig> {
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read {:?}", path))?;
+    let parsed: PartialRchConfig = toml::from_str(&content)
+        .with_context(|| format!("Failed to parse {:?}", path))?;
+    Ok(parsed)
+}
+
+fn default_sources_map() -> ConfigSourceMap {
+    let mut sources = HashMap::new();
+    for key in [
+        "general.enabled",
+        "general.log_level",
+        "general.socket_path",
+        "compilation.confidence_threshold",
+        "compilation.min_local_time_ms",
+        "transfer.compression_level",
+        "transfer.exclude_patterns",
+        "circuit.failure_threshold",
+        "circuit.success_threshold",
+        "circuit.error_rate_threshold",
+        "circuit.window_secs",
+        "circuit.open_cooldown_secs",
+        "circuit.half_open_max_probes",
+    ] {
+        sources.insert(key.to_string(), ConfigValueSource::Default);
+    }
+    sources
+}
+
+fn apply_layer(
+    config: &mut RchConfig,
+    sources: &mut ConfigSourceMap,
+    layer: &PartialRchConfig,
+    source: &ConfigValueSource,
+    defaults: &RchConfig,
+) {
+    const EPSILON: f64 = 0.0001;
+
+    if let Some(enabled) = layer.general.enabled {
+        if enabled != defaults.general.enabled {
+            config.general.enabled = enabled;
+            set_source(sources, "general.enabled", source.clone());
+        }
+    }
+    if let Some(log_level) = layer.general.log_level.as_ref() {
+        if log_level != &defaults.general.log_level {
+            config.general.log_level = log_level.clone();
+            set_source(sources, "general.log_level", source.clone());
+        }
+    }
+    if let Some(socket_path) = layer.general.socket_path.as_ref() {
+        if socket_path != &defaults.general.socket_path {
+            config.general.socket_path = socket_path.clone();
+            set_source(sources, "general.socket_path", source.clone());
+        }
+    }
+
+    if let Some(threshold) = layer.compilation.confidence_threshold {
+        if (threshold - defaults.compilation.confidence_threshold).abs() > EPSILON {
+            config.compilation.confidence_threshold = threshold;
+            set_source(sources, "compilation.confidence_threshold", source.clone());
+        }
+    }
+    if let Some(min_local) = layer.compilation.min_local_time_ms {
+        if min_local != defaults.compilation.min_local_time_ms {
+            config.compilation.min_local_time_ms = min_local;
+            set_source(sources, "compilation.min_local_time_ms", source.clone());
+        }
+    }
+
+    if let Some(compression) = layer.transfer.compression_level {
+        if compression != defaults.transfer.compression_level {
+            config.transfer.compression_level = compression;
+            set_source(sources, "transfer.compression_level", source.clone());
+        }
+    }
+    if let Some(patterns) = layer.transfer.exclude_patterns.as_ref() {
+        if patterns != &defaults.transfer.exclude_patterns {
+            config.transfer.exclude_patterns = patterns.clone();
+            set_source(sources, "transfer.exclude_patterns", source.clone());
+        }
+    }
+
+    if let Some(failure_threshold) = layer.circuit.failure_threshold {
+        if failure_threshold != defaults.circuit.failure_threshold {
+            config.circuit.failure_threshold = failure_threshold;
+            set_source(sources, "circuit.failure_threshold", source.clone());
+        }
+    }
+    if let Some(success_threshold) = layer.circuit.success_threshold {
+        if success_threshold != defaults.circuit.success_threshold {
+            config.circuit.success_threshold = success_threshold;
+            set_source(sources, "circuit.success_threshold", source.clone());
+        }
+    }
+    if let Some(error_rate_threshold) = layer.circuit.error_rate_threshold {
+        if (error_rate_threshold - defaults.circuit.error_rate_threshold).abs() > EPSILON {
+            config.circuit.error_rate_threshold = error_rate_threshold;
+            set_source(sources, "circuit.error_rate_threshold", source.clone());
+        }
+    }
+    if let Some(window_secs) = layer.circuit.window_secs {
+        if window_secs != defaults.circuit.window_secs {
+            config.circuit.window_secs = window_secs;
+            set_source(sources, "circuit.window_secs", source.clone());
+        }
+    }
+    if let Some(open_cooldown_secs) = layer.circuit.open_cooldown_secs {
+        if open_cooldown_secs != defaults.circuit.open_cooldown_secs {
+            config.circuit.open_cooldown_secs = open_cooldown_secs;
+            set_source(sources, "circuit.open_cooldown_secs", source.clone());
+        }
+    }
+    if let Some(half_open_max_probes) = layer.circuit.half_open_max_probes {
+        if half_open_max_probes != defaults.circuit.half_open_max_probes {
+            config.circuit.half_open_max_probes = half_open_max_probes;
+            set_source(sources, "circuit.half_open_max_probes", source.clone());
+        }
+    }
+}
+
+fn set_source(sources: &mut ConfigSourceMap, key: &str, source: ConfigValueSource) {
+    sources.insert(key.to_string(), source);
 }
 
 /// Merge two configs, with the second overriding the first.
@@ -171,31 +403,81 @@ fn merge_circuit(
 
 /// Apply environment variable overrides.
 fn apply_env_overrides(mut config: RchConfig) -> RchConfig {
-    if let Ok(val) = std::env::var("RCH_ENABLED") {
+    apply_env_overrides_inner(&mut config, None, None);
+    config
+}
+
+fn apply_env_overrides_inner(
+    config: &mut RchConfig,
+    mut sources: Option<&mut ConfigSourceMap>,
+    env_overrides: Option<&HashMap<String, String>>,
+) {
+    let get_env = |name: &str| -> Option<String> {
+        if let Some(map) = env_overrides {
+            map.get(name).cloned()
+        } else {
+            std::env::var(name).ok()
+        }
+    };
+
+    if let Some(val) = get_env("RCH_ENABLED") {
         config.general.enabled = val.parse().unwrap_or(true);
+        if let Some(ref mut sources) = sources {
+            set_source(
+                sources,
+                "general.enabled",
+                ConfigValueSource::EnvVar("RCH_ENABLED".to_string()),
+            );
+        }
     }
 
-    if let Ok(val) = std::env::var("RCH_LOG_LEVEL") {
+    if let Some(val) = get_env("RCH_LOG_LEVEL") {
         config.general.log_level = val;
+        if let Some(ref mut sources) = sources {
+            set_source(
+                sources,
+                "general.log_level",
+                ConfigValueSource::EnvVar("RCH_LOG_LEVEL".to_string()),
+            );
+        }
     }
 
-    if let Ok(val) = std::env::var("RCH_SOCKET_PATH") {
+    if let Some(val) = get_env("RCH_SOCKET_PATH") {
         config.general.socket_path = val;
+        if let Some(ref mut sources) = sources {
+            set_source(
+                sources,
+                "general.socket_path",
+                ConfigValueSource::EnvVar("RCH_SOCKET_PATH".to_string()),
+            );
+        }
     }
 
-    if let Ok(val) = std::env::var("RCH_CONFIDENCE_THRESHOLD") {
+    if let Some(val) = get_env("RCH_CONFIDENCE_THRESHOLD") {
         if let Ok(threshold) = val.parse() {
             config.compilation.confidence_threshold = threshold;
+            if let Some(ref mut sources) = sources {
+                set_source(
+                    sources,
+                    "compilation.confidence_threshold",
+                    ConfigValueSource::EnvVar("RCH_CONFIDENCE_THRESHOLD".to_string()),
+                );
+            }
         }
     }
 
-    if let Ok(val) = std::env::var("RCH_COMPRESSION") {
+    if let Some(val) = get_env("RCH_COMPRESSION") {
         if let Ok(level) = val.parse() {
             config.transfer.compression_level = level;
+            if let Some(ref mut sources) = sources {
+                set_source(
+                    sources,
+                    "transfer.compression_level",
+                    ConfigValueSource::EnvVar("RCH_COMPRESSION".to_string()),
+                );
+            }
         }
     }
-
-    config
 }
 
 /// Workers configuration file structure.
@@ -566,6 +848,87 @@ mod tests {
         );
 
         info!("PASS: Nested section fields merge correctly");
+    }
+
+    // ========================================================================
+    // Source Tracking Tests - Issue remote_compilation_helper-8qc.2
+    // ========================================================================
+
+    #[test]
+    fn test_source_tracking_default() {
+        info!("TEST: test_source_tracking_default");
+        let env_overrides: HashMap<String, String> = HashMap::new();
+
+        let loaded =
+            load_config_with_sources_from_paths(None, None, Some(&env_overrides))
+                .expect("load_config_with_sources_from_paths should succeed");
+
+        let source = loaded
+            .sources
+            .get("general.enabled")
+            .expect("general.enabled source present");
+        assert_eq!(source, &ConfigValueSource::Default);
+        info!("PASS: Default source detected for general.enabled");
+    }
+
+    #[test]
+    fn test_source_tracking_user_file() {
+        info!("TEST: test_source_tracking_user_file");
+        let temp_dir = std::env::temp_dir().join(format!(
+            "rch_test_config_user_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&temp_dir).expect("create temp dir");
+        let user_path = temp_dir.join("config.toml");
+
+        let toml_str = r#"
+            [general]
+            log_level = "debug"
+        "#;
+        std::fs::write(&user_path, toml_str).expect("write user config");
+
+        let env_overrides: HashMap<String, String> = HashMap::new();
+        let loaded =
+            load_config_with_sources_from_paths(Some(&user_path), None, Some(&env_overrides))
+                .expect("load_config_with_sources_from_paths should succeed");
+
+        info!("RESULT: log_level={}", loaded.config.general.log_level);
+        assert_eq!(loaded.config.general.log_level, "debug");
+
+        let source = loaded
+            .sources
+            .get("general.log_level")
+            .expect("general.log_level source present");
+        assert_eq!(source, &ConfigValueSource::UserConfig(user_path));
+        info!("PASS: User config source detected for general.log_level");
+    }
+
+    #[test]
+    fn test_source_tracking_env_override() {
+        info!("TEST: test_source_tracking_env_override");
+        let mut env_overrides: HashMap<String, String> = HashMap::new();
+        env_overrides.insert("RCH_LOG_LEVEL".to_string(), "warn".to_string());
+
+        let loaded =
+            load_config_with_sources_from_paths(None, None, Some(&env_overrides))
+                .expect("load_config_with_sources_from_paths should succeed");
+
+        info!("RESULT: log_level={}", loaded.config.general.log_level);
+        assert_eq!(loaded.config.general.log_level, "warn");
+
+        let source = loaded
+            .sources
+            .get("general.log_level")
+            .expect("general.log_level source present");
+        assert_eq!(
+            source,
+            &ConfigValueSource::EnvVar("RCH_LOG_LEVEL".to_string())
+        );
+        info!("PASS: Environment source detected for general.log_level");
     }
 
     #[test]

@@ -10,10 +10,11 @@ use object::{Object, ObjectSection};
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::Path;
+use serde::{Deserialize, Serialize};
 use tracing::info;
 
 /// Result of computing hashes for a binary file.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BinaryHashResult {
     /// Hash of the entire binary file (includes non-deterministic elements).
     pub full_hash: String,

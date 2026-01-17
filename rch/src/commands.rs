@@ -7,15 +7,21 @@ use crate::ui::theme::StatusIndicator;
 use anyhow::{Context, Result, bail};
 use directories::ProjectDirs;
 use rch_common::{
-    DiscoveredHost, RchConfig, SshClient, SshOptions, WorkerConfig, WorkerId, discover_all,
+    Classification, ClassificationDetails, ClassificationTier, CompilationKind, ConfigValueSource,
+    RchConfig, RequiredRuntime, SelectedWorker, SelectionReason, SshClient, SshOptions,
+    WorkerConfig, WorkerId, classify_command_detailed, discover_all,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::process::Command;
 use tracing::debug;
+
+use crate::hook::{query_daemon, release_worker, required_runtime_for_kind};
+use crate::toolchain::detect_toolchain;
+use crate::transfer::project_id_from_path;
 
 /// Default socket path.
 const DEFAULT_SOCKET_PATH: &str = "/tmp/rch.sock";
@@ -224,14 +230,15 @@ pub struct ConfigShowResponse {
     pub general: ConfigGeneralSection,
     pub compilation: ConfigCompilationSection,
     pub transfer: ConfigTransferSection,
+    pub circuit: ConfigCircuitSection,
     pub sources: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub value_sources: Option<Vec<ConfigValueSource>>,
+    pub value_sources: Option<Vec<ConfigValueSourceInfo>>,
 }
 
 /// Source information for a single configuration value.
 #[derive(Debug, Clone, Serialize)]
-pub struct ConfigValueSource {
+pub struct ConfigValueSourceInfo {
     pub key: String,
     pub value: String,
     pub source: String,
@@ -266,6 +273,17 @@ pub struct ConfigTransferSection {
     pub exclude_patterns: Vec<String>,
 }
 
+/// Circuit breaker configuration section.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConfigCircuitSection {
+    pub failure_threshold: u32,
+    pub success_threshold: u32,
+    pub error_rate_threshold: f64,
+    pub window_secs: u64,
+    pub open_cooldown_secs: u64,
+    pub half_open_max_probes: u32,
+}
+
 /// Configuration init response for JSON output.
 #[derive(Debug, Clone, Serialize)]
 pub struct ConfigInitResponse {
@@ -294,6 +312,53 @@ pub struct ConfigSetResponse {
     pub key: String,
     pub value: String,
     pub config_path: String,
+}
+
+/// Diagnose command response for JSON output.
+#[derive(Debug, Clone, Serialize)]
+pub struct DiagnoseResponse {
+    pub classification: Classification,
+    pub tiers: Vec<ClassificationTier>,
+    pub command: String,
+    pub normalized_command: String,
+    pub decision: DiagnoseDecision,
+    pub threshold: DiagnoseThreshold,
+    pub daemon: DiagnoseDaemonStatus,
+    pub required_runtime: RequiredRuntime,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_selection: Option<DiagnoseWorkerSelection>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DiagnoseDecision {
+    pub would_intercept: bool,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DiagnoseThreshold {
+    pub value: f64,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DiagnoseDaemonStatus {
+    pub socket_path: String,
+    pub socket_exists: bool,
+    pub reachable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uptime_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DiagnoseWorkerSelection {
+    pub estimated_cores: u32,
+    pub worker: Option<SelectedWorker>,
+    pub reason: SelectionReason,
 }
 
 /// Hook install/uninstall response for JSON output.
@@ -3107,9 +3172,17 @@ pub fn daemon_logs(lines: usize, ctx: &OutputContext) -> Result<()> {
 pub fn config_show(show_sources: bool, ctx: &OutputContext) -> Result<()> {
     let style = ctx.theme();
 
-    // Load user config
-    let config = crate::config::load_config()?;
-    let defaults = RchConfig::default();
+    // Load config (with source tracking when requested)
+    let loaded = if show_sources {
+        Some(crate::config::load_config_with_sources()?)
+    } else {
+        None
+    };
+    let config = if let Some(loaded) = &loaded {
+        loaded.config.clone()
+    } else {
+        crate::config::load_config()?
+    };
 
     // Build sources list
     let mut sources = vec![
@@ -3126,7 +3199,11 @@ pub fn config_show(show_sources: bool, ctx: &OutputContext) -> Result<()> {
 
     // Determine source for each value
     let value_sources = if show_sources {
-        Some(determine_value_sources(&config, &defaults))
+        let sources = loaded
+            .as_ref()
+            .map(|loaded| &loaded.sources)
+            .expect("sources available when show_sources is true");
+        Some(collect_value_sources(&config, sources))
     } else {
         None
     };
@@ -3147,6 +3224,14 @@ pub fn config_show(show_sources: bool, ctx: &OutputContext) -> Result<()> {
                 compression_level: config.transfer.compression_level,
                 exclude_patterns: config.transfer.exclude_patterns.clone(),
             },
+            circuit: ConfigCircuitSection {
+                failure_threshold: config.circuit.failure_threshold,
+                success_threshold: config.circuit.success_threshold,
+                error_rate_threshold: config.circuit.error_rate_threshold,
+                window_secs: config.circuit.window_secs,
+                open_cooldown_secs: config.circuit.open_cooldown_secs,
+                half_open_max_probes: config.circuit.half_open_max_probes,
+            },
             sources,
             value_sources,
         };
@@ -3159,7 +3244,7 @@ pub fn config_show(show_sources: bool, ctx: &OutputContext) -> Result<()> {
 
     // Helper closure to format value with source
     let format_with_source =
-        |key: &str, value: &str, sources: &Option<Vec<ConfigValueSource>>| -> String {
+        |key: &str, value: &str, sources: &Option<Vec<ConfigValueSourceInfo>>| -> String {
             if let Some(vs) = sources {
                 if let Some(s) = vs.iter().find(|v| v.key == key) {
                     return format!("{} {}", value, style.muted(&format!("# from {}", s.source)));
@@ -3227,11 +3312,76 @@ pub fn config_show(show_sources: bool, ctx: &OutputContext) -> Result<()> {
             &value_sources
         )
     );
-    println!("  {} = [", style.key("exclude_patterns"));
+    let exclude_source = source_label("transfer.exclude_patterns", &value_sources);
+    if let Some(source) = exclude_source {
+        println!(
+            "  {} = [ {}",
+            style.key("exclude_patterns"),
+            style.muted(&format!("# from {}", source))
+        );
+    } else {
+        println!("  {} = [", style.key("exclude_patterns"));
+    }
     for pattern in &config.transfer.exclude_patterns {
         println!("    {},", style.value(&format!("\"{}\"", pattern)));
     }
     println!("  ]");
+
+    println!("\n{}", style.highlight("[circuit]"));
+    println!(
+        "  {} = {}",
+        style.key("failure_threshold"),
+        format_with_source(
+            "circuit.failure_threshold",
+            &style.value(&config.circuit.failure_threshold.to_string()),
+            &value_sources
+        )
+    );
+    println!(
+        "  {} = {}",
+        style.key("success_threshold"),
+        format_with_source(
+            "circuit.success_threshold",
+            &style.value(&config.circuit.success_threshold.to_string()),
+            &value_sources
+        )
+    );
+    println!(
+        "  {} = {}",
+        style.key("error_rate_threshold"),
+        format_with_source(
+            "circuit.error_rate_threshold",
+            &style.value(&config.circuit.error_rate_threshold.to_string()),
+            &value_sources
+        )
+    );
+    println!(
+        "  {} = {}",
+        style.key("window_secs"),
+        format_with_source(
+            "circuit.window_secs",
+            &style.value(&config.circuit.window_secs.to_string()),
+            &value_sources
+        )
+    );
+    println!(
+        "  {} = {}",
+        style.key("open_cooldown_secs"),
+        format_with_source(
+            "circuit.open_cooldown_secs",
+            &style.value(&config.circuit.open_cooldown_secs.to_string()),
+            &value_sources
+        )
+    );
+    println!(
+        "  {} = {}",
+        style.key("half_open_max_probes"),
+        format_with_source(
+            "circuit.half_open_max_probes",
+            &style.value(&config.circuit.half_open_max_probes.to_string()),
+            &value_sources
+        )
+    );
 
     // Show config file locations
     println!(
@@ -3254,128 +3404,116 @@ pub fn config_show(show_sources: bool, ctx: &OutputContext) -> Result<()> {
     Ok(())
 }
 
-/// Determine the source of each configuration value.
-fn determine_value_sources(config: &RchConfig, defaults: &RchConfig) -> Vec<ConfigValueSource> {
-    let mut sources = Vec::new();
-    let project_config_exists = PathBuf::from(".rch/config.toml").exists();
-    let user_config_exists = config_dir()
-        .map(|d| d.join("config.toml").exists())
-        .unwrap_or(false);
+/// Determine the source of each configuration value using tracked sources.
+fn collect_value_sources(
+    config: &RchConfig,
+    sources: &crate::config::ConfigSourceMap,
+) -> Vec<ConfigValueSourceInfo> {
+    let mut values = Vec::new();
 
-    // Check each value and determine its source
-    // Priority: env > project > user > default
+    push_value_source(
+        &mut values,
+        "general.enabled",
+        config.general.enabled.to_string(),
+        sources,
+    );
+    push_value_source(
+        &mut values,
+        "general.log_level",
+        config.general.log_level.clone(),
+        sources,
+    );
+    push_value_source(
+        &mut values,
+        "general.socket_path",
+        config.general.socket_path.clone(),
+        sources,
+    );
+    push_value_source(
+        &mut values,
+        "compilation.confidence_threshold",
+        config.compilation.confidence_threshold.to_string(),
+        sources,
+    );
+    push_value_source(
+        &mut values,
+        "compilation.min_local_time_ms",
+        config.compilation.min_local_time_ms.to_string(),
+        sources,
+    );
+    push_value_source(
+        &mut values,
+        "transfer.compression_level",
+        config.transfer.compression_level.to_string(),
+        sources,
+    );
+    push_value_source(
+        &mut values,
+        "transfer.exclude_patterns",
+        format!("{:?}", config.transfer.exclude_patterns),
+        sources,
+    );
+    push_value_source(
+        &mut values,
+        "circuit.failure_threshold",
+        config.circuit.failure_threshold.to_string(),
+        sources,
+    );
+    push_value_source(
+        &mut values,
+        "circuit.success_threshold",
+        config.circuit.success_threshold.to_string(),
+        sources,
+    );
+    push_value_source(
+        &mut values,
+        "circuit.error_rate_threshold",
+        config.circuit.error_rate_threshold.to_string(),
+        sources,
+    );
+    push_value_source(
+        &mut values,
+        "circuit.window_secs",
+        config.circuit.window_secs.to_string(),
+        sources,
+    );
+    push_value_source(
+        &mut values,
+        "circuit.open_cooldown_secs",
+        config.circuit.open_cooldown_secs.to_string(),
+        sources,
+    );
+    push_value_source(
+        &mut values,
+        "circuit.half_open_max_probes",
+        config.circuit.half_open_max_probes.to_string(),
+        sources,
+    );
 
-    // general.enabled
-    let enabled_source = if std::env::var("RCH_ENABLED").is_ok() {
-        "env:RCH_ENABLED"
-    } else if project_config_exists && config.general.enabled != defaults.general.enabled {
-        "project:.rch/config.toml"
-    } else if user_config_exists && config.general.enabled != defaults.general.enabled {
-        "user:~/.config/rch/config.toml"
-    } else {
-        "default"
-    };
-    sources.push(ConfigValueSource {
-        key: "general.enabled".to_string(),
-        value: config.general.enabled.to_string(),
-        source: enabled_source.to_string(),
+    values
+}
+
+fn push_value_source(
+    values: &mut Vec<ConfigValueSourceInfo>,
+    key: &str,
+    value: String,
+    sources: &crate::config::ConfigSourceMap,
+) {
+    let source = sources
+        .get(key)
+        .map(|s| s.label())
+        .unwrap_or_else(|| ConfigValueSource::Default.label());
+    values.push(ConfigValueSourceInfo {
+        key: key.to_string(),
+        value,
+        source,
     });
+}
 
-    // general.log_level
-    let log_level_source = if std::env::var("RCH_LOG_LEVEL").is_ok() {
-        "env:RCH_LOG_LEVEL"
-    } else if project_config_exists && config.general.log_level != defaults.general.log_level {
-        "project:.rch/config.toml"
-    } else if user_config_exists && config.general.log_level != defaults.general.log_level {
-        "user:~/.config/rch/config.toml"
-    } else {
-        "default"
-    };
-    sources.push(ConfigValueSource {
-        key: "general.log_level".to_string(),
-        value: config.general.log_level.clone(),
-        source: log_level_source.to_string(),
-    });
-
-    // general.socket_path
-    let socket_source = if std::env::var("RCH_SOCKET_PATH").is_ok() {
-        "env:RCH_SOCKET_PATH"
-    } else if project_config_exists && config.general.socket_path != defaults.general.socket_path {
-        "project:.rch/config.toml"
-    } else if user_config_exists && config.general.socket_path != defaults.general.socket_path {
-        "user:~/.config/rch/config.toml"
-    } else {
-        "default"
-    };
-    sources.push(ConfigValueSource {
-        key: "general.socket_path".to_string(),
-        value: config.general.socket_path.clone(),
-        source: socket_source.to_string(),
-    });
-
-    // compilation.confidence_threshold
-    let threshold_source = if std::env::var("RCH_CONFIDENCE_THRESHOLD").is_ok() {
-        "env:RCH_CONFIDENCE_THRESHOLD"
-    } else if project_config_exists
-        && (config.compilation.confidence_threshold - defaults.compilation.confidence_threshold)
-            .abs()
-            > f64::EPSILON
-    {
-        "project:.rch/config.toml"
-    } else if user_config_exists
-        && (config.compilation.confidence_threshold - defaults.compilation.confidence_threshold)
-            .abs()
-            > f64::EPSILON
-    {
-        "user:~/.config/rch/config.toml"
-    } else {
-        "default"
-    };
-    sources.push(ConfigValueSource {
-        key: "compilation.confidence_threshold".to_string(),
-        value: config.compilation.confidence_threshold.to_string(),
-        source: threshold_source.to_string(),
-    });
-
-    // compilation.min_local_time_ms
-    let min_local_source = if project_config_exists
-        && config.compilation.min_local_time_ms != defaults.compilation.min_local_time_ms
-    {
-        "project:.rch/config.toml"
-    } else if user_config_exists
-        && config.compilation.min_local_time_ms != defaults.compilation.min_local_time_ms
-    {
-        "user:~/.config/rch/config.toml"
-    } else {
-        "default"
-    };
-    sources.push(ConfigValueSource {
-        key: "compilation.min_local_time_ms".to_string(),
-        value: config.compilation.min_local_time_ms.to_string(),
-        source: min_local_source.to_string(),
-    });
-
-    // transfer.compression_level
-    let compression_source = if std::env::var("RCH_COMPRESSION").is_ok() {
-        "env:RCH_COMPRESSION"
-    } else if project_config_exists
-        && config.transfer.compression_level != defaults.transfer.compression_level
-    {
-        "project:.rch/config.toml"
-    } else if user_config_exists
-        && config.transfer.compression_level != defaults.transfer.compression_level
-    {
-        "user:~/.config/rch/config.toml"
-    } else {
-        "default"
-    };
-    sources.push(ConfigValueSource {
-        key: "transfer.compression_level".to_string(),
-        value: config.transfer.compression_level.to_string(),
-        source: compression_source.to_string(),
-    });
-
+fn source_label(key: &str, sources: &Option<Vec<ConfigValueSourceInfo>>) -> Option<String> {
     sources
+        .as_ref()
+        .and_then(|values| values.iter().find(|v| v.key == key).map(|v| v.source.clone()))
 }
 
 /// Initialize configuration files with optional interactive wizard.
@@ -4408,6 +4546,335 @@ fn parse_string_list(value: &str, key: &str) -> Result<Vec<String>> {
 }
 
 // =============================================================================
+// Diagnose Command
+// =============================================================================
+
+#[derive(Debug, Clone, Deserialize)]
+struct DaemonHealthResponse {
+    status: String,
+    version: String,
+    uptime_seconds: u64,
+}
+
+async fn query_daemon_health(socket_path: &str) -> Result<DaemonHealthResponse> {
+    let stream = UnixStream::connect(socket_path).await?;
+    let (reader, mut writer) = stream.into_split();
+
+    let request = "GET /health\n";
+    writer.write_all(request.as_bytes()).await?;
+    writer.flush().await?;
+
+    let mut reader = BufReader::new(reader);
+    let mut line = String::new();
+    let mut body = String::new();
+    let mut in_body = false;
+
+    loop {
+        line.clear();
+        let n = reader.read_line(&mut line).await?;
+        if n == 0 {
+            break;
+        }
+        if in_body {
+            body.push_str(&line);
+        } else if line.trim().is_empty() {
+            in_body = true;
+        }
+    }
+
+    let health: DaemonHealthResponse = serde_json::from_str(body.trim())?;
+    Ok(health)
+}
+
+/// Diagnose command classification and selection decisions.
+pub async fn diagnose(command: &str, ctx: &OutputContext) -> Result<()> {
+    let style = ctx.theme();
+    let config = crate::config::load_config()?;
+    let defaults = RchConfig::default();
+
+    let details: ClassificationDetails = classify_command_detailed(command);
+    let threshold = config.compilation.confidence_threshold;
+
+    let sources = determine_value_sources(&config, &defaults);
+    let threshold_source = sources
+        .iter()
+        .find(|s| s.key == "compilation.confidence_threshold")
+        .map(|s| s.source.clone())
+        .unwrap_or_else(|| "default".to_string());
+
+    let would_intercept = details.classification.is_compilation
+        && details.classification.confidence >= threshold;
+    let decision_reason = if !details.classification.is_compilation {
+        format!("not a compilation command ({})", details.classification.reason)
+    } else if details.classification.confidence < threshold {
+        format!(
+            "confidence {:.2} below threshold {:.2}",
+            details.classification.confidence, threshold
+        )
+    } else {
+        "meets confidence threshold".to_string()
+    };
+
+    let required_runtime = required_runtime_for_kind(details.classification.kind);
+
+    let socket_path = config.general.socket_path.clone();
+    let socket_exists = Path::new(&socket_path).exists();
+    let mut daemon_status = DiagnoseDaemonStatus {
+        socket_path: socket_path.clone(),
+        socket_exists,
+        reachable: false,
+        version: None,
+        uptime_seconds: None,
+        error: None,
+    };
+
+    if socket_exists {
+        match query_daemon_health(&socket_path).await {
+            Ok(health) => {
+                daemon_status.reachable = health.status == "healthy";
+                daemon_status.version = Some(health.version);
+                daemon_status.uptime_seconds = Some(health.uptime_seconds);
+            }
+            Err(err) => {
+                daemon_status.error = Some(format!("health check failed: {}", err));
+            }
+        }
+    } else {
+        daemon_status.error = Some("daemon socket not found".to_string());
+    }
+
+    let mut worker_selection = None;
+    if would_intercept && daemon_status.reachable {
+        let estimated_cores = 4;
+        let project_root = std::env::current_dir().ok();
+        let project = project_root
+            .as_ref()
+            .map(|path| project_id_from_path(path))
+            .unwrap_or_else(|| "unknown".to_string());
+        let toolchain = project_root
+            .as_ref()
+            .and_then(|root| detect_toolchain(root).ok());
+
+        match query_daemon(
+            &socket_path,
+            &project,
+            estimated_cores,
+            toolchain.as_ref(),
+            required_runtime,
+            0,
+        )
+        .await
+        {
+            Ok(response) => {
+                if let Some(worker) = response.worker.as_ref() {
+                    if let Err(err) = release_worker(&socket_path, &worker.id, estimated_cores).await
+                    {
+                        debug!("Failed to release worker slots: {}", err);
+                    }
+                }
+                worker_selection = Some(DiagnoseWorkerSelection {
+                    estimated_cores,
+                    worker: response.worker.clone(),
+                    reason: response.reason,
+                });
+            }
+            Err(err) => {
+                daemon_status.error =
+                    Some(format!("selection request failed: {}", err));
+            }
+        }
+    }
+
+    if ctx.is_json() {
+        let response = DiagnoseResponse {
+            classification: details.classification.clone(),
+            tiers: details.tiers.clone(),
+            command: details.original.clone(),
+            normalized_command: details.normalized.clone(),
+            decision: DiagnoseDecision {
+                would_intercept,
+                reason: decision_reason,
+            },
+            threshold: DiagnoseThreshold {
+                value: threshold,
+                source: threshold_source,
+            },
+            daemon: daemon_status,
+            required_runtime,
+            worker_selection,
+        };
+        let _ = ctx.json(&JsonResponse::ok("diagnose", response));
+        return Ok(());
+    }
+
+    println!("{}", style.format_header("RCH Diagnose"));
+    println!();
+
+    println!("{}", style.highlight("Command Analysis"));
+    println!(
+        "  {} {}",
+        style.key("Input:"),
+        style.value(details.original.trim())
+    );
+    if details.normalized != details.original.trim() {
+        println!(
+            "  {} {}",
+            style.key("Normalized:"),
+            style.value(details.normalized.trim())
+        );
+    }
+    println!("  {} {}", style.key("Tool:"), style.value("Bash"));
+    println!();
+
+    println!("{}", style.highlight("Classification"));
+    let kind_label = details
+        .classification
+        .kind
+        .map(|k| format!("{:?}", k))
+        .unwrap_or_else(|| "none".to_string());
+    println!("  {} {}", style.key("Kind:"), style.value(&kind_label));
+    println!(
+        "  {} {} {}",
+        style.key("Confidence:"),
+        style.value(&format!("{:.2}", details.classification.confidence)),
+        style.muted(&format!("({})", details.classification.reason))
+    );
+    println!(
+        "  {} {} {}",
+        style.key("Threshold:"),
+        style.value(&format!("{:.2}", threshold)),
+        style.muted(&format!("# from {}", threshold_source))
+    );
+
+    let decision_label = if would_intercept {
+        style.format_success("WOULD INTERCEPT")
+    } else {
+        style.format_warning("WOULD NOT INTERCEPT")
+    };
+    println!("  {} {}", style.key("Decision:"), decision_label);
+    println!("  {} {}", style.key("Reason:"), style.value(&decision_reason));
+    println!();
+
+    println!("{}", style.highlight("Tier Decisions"));
+    for tier in &details.tiers {
+        let decision = match tier.decision {
+            rch_common::TierDecision::Pass => style.format_success("PASS"),
+            rch_common::TierDecision::Reject => style.format_warning("REJECT"),
+        };
+        println!(
+            "  {} {} {} {}",
+            style.key(&format!("Tier {}:", tier.tier)),
+            style.value(&tier.name),
+            style.muted("→"),
+            decision
+        );
+        println!("    {} {}", style.muted("reason:"), tier.reason);
+    }
+    println!();
+
+    println!("{}", style.highlight("Daemon Status"));
+    println!(
+        "  {} {}",
+        style.key("Socket:"),
+        style.value(&daemon_status.socket_path)
+    );
+    println!(
+        "  {} {}",
+        style.key("Socket exists:"),
+        style.value(&daemon_status.socket_exists.to_string())
+    );
+    println!(
+        "  {} {}",
+        style.key("Reachable:"),
+        style.value(&daemon_status.reachable.to_string())
+    );
+    if let Some(version) = &daemon_status.version {
+        println!("  {} {}", style.key("Version:"), style.value(version));
+    }
+    if let Some(uptime) = daemon_status.uptime_seconds {
+        println!(
+            "  {} {}s",
+            style.key("Uptime:"),
+            style.value(&uptime.to_string())
+        );
+    }
+    if let Some(error) = &daemon_status.error {
+        println!(
+            "  {} {}",
+            style.key("Error:"),
+            style.value(error)
+        );
+    }
+    println!();
+
+    println!("{}", style.highlight("Worker Selection (simulated)"));
+    if let Some(selection) = &worker_selection {
+        match &selection.worker {
+            Some(worker) => {
+                println!(
+                    "  {} {}",
+                    style.key("Selected:"),
+                    style.value(&worker.id.to_string())
+                );
+                println!(
+                    "  {} {}@{}",
+                    style.key("Host:"),
+                    style.value(&worker.user),
+                    style.value(&worker.host)
+                );
+                println!(
+                    "  {} {}",
+                    style.key("Slots available:"),
+                    style.value(&worker.slots_available.to_string())
+                );
+                println!(
+                    "  {} {:.1}",
+                    style.key("Speed score:"),
+                    worker.speed_score
+                );
+                println!(
+                    "  {} {}",
+                    style.key("Reason:"),
+                    style.value(&selection.reason.to_string())
+                );
+            }
+            None => {
+                println!(
+                    "  {} {}",
+                    style.key("Result:"),
+                    style.value("No worker selected")
+                );
+                println!(
+                    "  {} {}",
+                    style.key("Reason:"),
+                    style.value(&selection.reason.to_string())
+                );
+            }
+        }
+    } else if !would_intercept {
+        println!(
+            "  {} {}",
+            style.key("Skipped:"),
+            style.value("Command would not be intercepted")
+        );
+    } else if !daemon_status.reachable {
+        println!(
+            "  {} {}",
+            style.key("Skipped:"),
+            style.value("Daemon not reachable")
+        );
+    } else {
+        println!(
+            "  {} {}",
+            style.key("Skipped:"),
+            style.value("Selection unavailable")
+        );
+    }
+
+    Ok(())
+}
+
+// =============================================================================
 // Hook Commands
 // =============================================================================
 
@@ -5124,6 +5591,14 @@ mod tests {
                 compression_level: 3,
                 exclude_patterns: vec!["target/".to_string()],
             },
+            circuit: ConfigCircuitSection {
+                failure_threshold: 3,
+                success_threshold: 2,
+                error_rate_threshold: 0.5,
+                window_secs: 60,
+                open_cooldown_secs: 30,
+                half_open_max_probes: 2,
+            },
             sources: vec!["~/.config/rch/config.toml".to_string()],
             value_sources: None,
         };
@@ -5131,6 +5606,7 @@ mod tests {
         assert_eq!(json["general"]["enabled"], true);
         assert_eq!(json["compilation"]["confidence_threshold"], 0.85);
         assert_eq!(json["transfer"]["compression_level"], 3);
+        assert_eq!(json["circuit"]["failure_threshold"], 3);
     }
 
     #[test]

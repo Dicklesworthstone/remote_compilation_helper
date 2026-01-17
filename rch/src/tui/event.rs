@@ -111,3 +111,146 @@ pub fn poll_event_with_mode(
         Ok(Some(Action::Tick))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyEvent, KeyEventKind};
+    use tracing::info;
+
+    fn init_test_logging() {
+        let _ = tracing_subscriber::fmt()
+            .with_test_writer()
+            .with_max_level(tracing::Level::DEBUG)
+            .try_init();
+    }
+
+    #[test]
+    fn test_handle_key_quit_variants() {
+        init_test_logging();
+        info!("TEST START: test_handle_key_quit_variants");
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        let q = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE);
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        info!("INPUT: ctrl_c={:?} q={:?} esc={:?}", ctrl_c, q, esc);
+        assert_eq!(handle_key(ctrl_c), Action::Quit);
+        assert_eq!(handle_key(q), Action::Quit);
+        assert_eq!(handle_key(esc), Action::Quit);
+        info!("TEST PASS: test_handle_key_quit_variants");
+    }
+
+    #[test]
+    fn test_handle_key_navigation() {
+        init_test_logging();
+        info!("TEST START: test_handle_key_navigation");
+        assert_eq!(
+            handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+            Action::Up
+        );
+        assert_eq!(
+            handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE)),
+            Action::Up
+        );
+        assert_eq!(
+            handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+            Action::Down
+        );
+        assert_eq!(
+            handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)),
+            Action::Down
+        );
+        assert_eq!(
+            handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+            Action::NextPanel
+        );
+        assert_eq!(
+            handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)),
+            Action::PrevPanel
+        );
+        assert_eq!(
+            handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE)),
+            Action::PageUp
+        );
+        assert_eq!(
+            handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE)),
+            Action::PageDown
+        );
+        assert_eq!(
+            handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE)),
+            Action::JumpTop
+        );
+        assert_eq!(
+            handle_key(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT)),
+            Action::JumpBottom
+        );
+        info!("TEST PASS: test_handle_key_navigation");
+    }
+
+    #[test]
+    fn test_handle_key_actions() {
+        init_test_logging();
+        info!("TEST START: test_handle_key_actions");
+        assert_eq!(
+            handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE)),
+            Action::Refresh
+        );
+        assert_eq!(
+            handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE)),
+            Action::Help
+        );
+        assert_eq!(
+            handle_key(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE)),
+            Action::Help
+        );
+        assert_eq!(
+            handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE)),
+            Action::Filter
+        );
+        assert_eq!(
+            handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)),
+            Action::Copy
+        );
+        assert_eq!(
+            handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Action::Select
+        );
+        assert_eq!(
+            handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
+            Action::Back
+        );
+        assert_eq!(
+            handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
+            Action::Tick
+        );
+        info!("TEST PASS: test_handle_key_actions");
+    }
+
+    #[test]
+    fn test_handle_key_input_mode_text() {
+        init_test_logging();
+        info!("TEST START: test_handle_key_input_mode_text");
+        let text = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        let backspace = KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE);
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        info!("INPUT: text={:?} enter={:?} backspace={:?} esc={:?}", text, enter, backspace, esc);
+        assert_eq!(handle_key_input_mode(text), Action::TextInput('a'));
+        assert_eq!(handle_key_input_mode(enter), Action::Select);
+        assert_eq!(handle_key_input_mode(backspace), Action::DeleteChar);
+        assert_eq!(handle_key_input_mode(esc), Action::Back);
+        info!("TEST PASS: test_handle_key_input_mode_text");
+    }
+
+    #[test]
+    fn test_handle_key_input_mode_ctrl_c_quit() {
+        init_test_logging();
+        info!("TEST START: test_handle_key_input_mode_ctrl_c_quit");
+        let ctrl_c = KeyEvent::new_with_kind(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+            KeyEventKind::Press,
+        );
+        assert_eq!(handle_key_input_mode(ctrl_c), Action::Quit);
+        info!("TEST PASS: test_handle_key_input_mode_ctrl_c_quit");
+    }
+}

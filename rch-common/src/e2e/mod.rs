@@ -8,6 +8,7 @@
 //! - **logging**: Structured logging system for capturing test execution details
 //! - **harness**: Test harness for managing processes, files, and assertions
 //! - **fixtures**: Pre-built configurations and sample data for tests
+//! - **verification**: Remote compilation verification for self-testing
 //!
 //! # Usage Example
 //!
@@ -54,6 +55,7 @@
 pub mod fixtures;
 pub mod harness;
 pub mod logging;
+pub mod verification;
 
 // Re-export commonly used items
 pub use fixtures::{
@@ -67,6 +69,7 @@ pub use harness::{
 pub use logging::{
     LogEntry, LogLevel, LogSource, LoggerConfig, TestLogSummary, TestLogger, TestLoggerBuilder,
 };
+pub use verification::{RemoteCompilationTest, VerificationConfig, VerificationResult};
 
 /// Macro for creating E2E tests with automatic harness setup and cleanup
 ///
