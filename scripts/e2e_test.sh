@@ -245,6 +245,30 @@ run_hook() {
     fi
 }
 
+# Run hook with toolchain specification (for toolchain sync tests)
+run_hook_with_toolchain() {
+    local scenario="$1"
+    local toolchain="$2"
+    shift 2
+    local hook_out="$LOG_DIR/hook_${scenario}.out"
+    local hook_err="$LOG_DIR/hook_${scenario}.err"
+    local env_args=("$@")
+
+    log "INFO" "HOOK" "Running hook with toolchain ($scenario, tc=$toolchain)" >&2
+    (
+        cd "$PROJECT_DIR"
+        printf '%s\n' "$(hook_json_with_toolchain "$toolchain")" | \
+            env RCH_SOCKET_PATH="$SOCKET_PATH" "${env_args[@]}" \
+            "$PROJECT_ROOT/target/debug/rch" >"$hook_out" 2>"$hook_err"
+    )
+
+    if /bin/grep -q '"permissionDecision":"deny"' "$hook_out"; then
+        echo "deny"
+    else
+        echo "allow"
+    fi
+}
+
 check_artifacts_real() {
     local bin_path="$PROJECT_DIR/target/debug/rch_e2e_app"
     [[ -x "$bin_path" ]]
@@ -349,6 +373,56 @@ run_scenario() {
     fi
 
     log "INFO" "SCENARIO" "$scenario OK"
+}
+
+# Run a scenario with explicit toolchain specification
+run_toolchain_scenario() {
+    local scenario="$1"
+    local toolchain="$2"
+    local expect="$3"
+    local fail="$4"
+    local envs=()
+
+    if [[ "$MODE" == "mock" ]]; then
+        envs+=("RCH_MOCK_SSH=1")
+    fi
+
+    case "$fail" in
+        toolchain-install) envs+=("RCH_MOCK_TOOLCHAIN_INSTALL_FAIL=1") ;;
+        no-rustup) envs+=("RCH_MOCK_NO_RUSTUP=1") ;;
+        "") ;;
+        *) die "Unknown toolchain failure mode: $fail" ;;
+    esac
+
+    local result
+    result="$(run_hook_with_toolchain "$scenario" "$toolchain" "${envs[@]}")"
+
+    if [[ "$result" != "$expect" ]]; then
+        log "FAIL" "TOOLCHAIN" "$scenario expected $expect, got $result"
+        return 1
+    fi
+
+    # Verify decision path logging
+    local hook_err="$LOG_DIR/hook_${scenario}.err"
+    local hook_out="$LOG_DIR/hook_${scenario}.out"
+
+    if [[ "$fail" == "toolchain-install" ]]; then
+        if check_toolchain_failure_logged "$hook_err"; then
+            log "INFO" "TOOLCHAIN" "$scenario: toolchain failure properly logged"
+        else
+            log "WARN" "TOOLCHAIN" "$scenario: toolchain failure not explicitly logged (may be hidden)"
+        fi
+    fi
+
+    if [[ "$fail" == "no-rustup" ]]; then
+        if check_no_rustup_logged "$hook_err"; then
+            log "INFO" "TOOLCHAIN" "$scenario: no-rustup properly logged"
+        else
+            log "WARN" "TOOLCHAIN" "$scenario: no-rustup not explicitly logged (may be hidden)"
+        fi
+    fi
+
+    log "INFO" "TOOLCHAIN" "$scenario OK (tc=$toolchain)"
 }
 
 run_e2e() {

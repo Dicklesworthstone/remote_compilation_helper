@@ -238,6 +238,234 @@ impl Default for CircuitBreakerConfig {
     }
 }
 
+/// Circuit breaker statistics for tracking state transitions.
+///
+/// Maintains a rolling window of successes and failures to determine
+/// when the circuit should open, close, or enter half-open state.
+#[derive(Debug, Clone, Default)]
+pub struct CircuitStats {
+    /// Current circuit state.
+    state: CircuitState,
+    /// Consecutive failure count (reset on success).
+    consecutive_failures: u32,
+    /// Consecutive success count in half-open state (reset on failure).
+    consecutive_successes: u32,
+    /// Total successes in the current rolling window.
+    window_successes: u32,
+    /// Total failures in the current rolling window.
+    window_failures: u32,
+    /// Timestamp when circuit entered Open state (epoch millis).
+    opened_at: Option<u64>,
+    /// Timestamp of last state change (epoch millis).
+    last_state_change: u64,
+    /// Current active probes in half-open state.
+    active_probes: u32,
+}
+
+impl CircuitStats {
+    /// Create new circuit stats in the closed state.
+    pub fn new() -> Self {
+        Self {
+            state: CircuitState::Closed,
+            consecutive_failures: 0,
+            consecutive_successes: 0,
+            window_successes: 0,
+            window_failures: 0,
+            opened_at: None,
+            last_state_change: Self::now_millis(),
+            active_probes: 0,
+        }
+    }
+
+    /// Get the current circuit state.
+    pub fn state(&self) -> CircuitState {
+        self.state
+    }
+
+    /// Get the timestamp when the circuit opened (if open).
+    pub fn opened_at(&self) -> Option<u64> {
+        self.opened_at
+    }
+
+    /// Get the timestamp of the last state change.
+    pub fn last_state_change(&self) -> u64 {
+        self.last_state_change
+    }
+
+    /// Get the consecutive failure count.
+    pub fn consecutive_failures(&self) -> u32 {
+        self.consecutive_failures
+    }
+
+    /// Get the error rate in the current window (0.0-1.0).
+    pub fn error_rate(&self) -> f64 {
+        let total = self.window_successes + self.window_failures;
+        if total == 0 {
+            return 0.0;
+        }
+        self.window_failures as f64 / total as f64
+    }
+
+    /// Record a successful operation.
+    ///
+    /// In closed state: resets consecutive failures, increments window successes.
+    /// In half-open state: increments consecutive successes.
+    pub fn record_success(&mut self) {
+        self.window_successes += 1;
+        self.consecutive_failures = 0;
+
+        if self.state == CircuitState::HalfOpen {
+            self.consecutive_successes += 1;
+            if self.active_probes > 0 {
+                self.active_probes -= 1;
+            }
+        }
+    }
+
+    /// Record a failed operation.
+    ///
+    /// Increments consecutive failures and window failures.
+    /// In half-open state, resets consecutive successes.
+    pub fn record_failure(&mut self) {
+        self.window_failures += 1;
+        self.consecutive_failures += 1;
+
+        if self.state == CircuitState::HalfOpen {
+            self.consecutive_successes = 0;
+            if self.active_probes > 0 {
+                self.active_probes -= 1;
+            }
+        }
+    }
+
+    /// Check if the circuit should open based on config thresholds.
+    ///
+    /// Returns true if:
+    /// - Consecutive failures exceed threshold, OR
+    /// - Error rate exceeds threshold (with minimum sample size)
+    pub fn should_open(&self, config: &CircuitBreakerConfig) -> bool {
+        if self.state != CircuitState::Closed {
+            return false;
+        }
+
+        // Open if consecutive failures exceed threshold
+        if self.consecutive_failures >= config.failure_threshold {
+            return true;
+        }
+
+        // Open if error rate exceeds threshold (with minimum 5 samples)
+        let total = self.window_successes + self.window_failures;
+        if total >= 5 && self.error_rate() >= config.error_rate_threshold {
+            return true;
+        }
+
+        false
+    }
+
+    /// Check if the circuit should transition to half-open.
+    ///
+    /// Returns true if the circuit is open and the cooldown period has elapsed.
+    pub fn should_half_open(&self, config: &CircuitBreakerConfig) -> bool {
+        if self.state != CircuitState::Open {
+            return false;
+        }
+
+        let now = Self::now_millis();
+        let cooldown_ms = config.open_cooldown_secs * 1000;
+
+        if let Some(opened_at) = self.opened_at {
+            now.saturating_sub(opened_at) >= cooldown_ms
+        } else {
+            false
+        }
+    }
+
+    /// Check if the circuit should close.
+    ///
+    /// Returns true if in half-open state and consecutive successes
+    /// meet or exceed the success threshold.
+    pub fn should_close(&self, config: &CircuitBreakerConfig) -> bool {
+        if self.state != CircuitState::HalfOpen {
+            return false;
+        }
+
+        self.consecutive_successes >= config.success_threshold
+    }
+
+    /// Check if a probe request can be made in half-open state.
+    ///
+    /// Returns true if active probes are below the maximum allowed.
+    pub fn can_probe(&self, config: &CircuitBreakerConfig) -> bool {
+        if self.state != CircuitState::HalfOpen {
+            return false;
+        }
+
+        self.active_probes < config.half_open_max_probes
+    }
+
+    /// Start a probe request in half-open state.
+    ///
+    /// Returns true if the probe was started, false if already at max probes.
+    pub fn start_probe(&mut self, config: &CircuitBreakerConfig) -> bool {
+        if !self.can_probe(config) {
+            return false;
+        }
+        self.active_probes += 1;
+        true
+    }
+
+    /// Transition the circuit to open state.
+    pub fn open(&mut self) {
+        if self.state != CircuitState::Open {
+            self.state = CircuitState::Open;
+            self.opened_at = Some(Self::now_millis());
+            self.last_state_change = Self::now_millis();
+            self.consecutive_successes = 0;
+            self.active_probes = 0;
+        }
+    }
+
+    /// Transition the circuit to half-open state.
+    pub fn half_open(&mut self) {
+        if self.state != CircuitState::HalfOpen {
+            self.state = CircuitState::HalfOpen;
+            self.last_state_change = Self::now_millis();
+            self.consecutive_successes = 0;
+            self.active_probes = 0;
+        }
+    }
+
+    /// Transition the circuit to closed state.
+    pub fn close(&mut self) {
+        if self.state != CircuitState::Closed {
+            self.state = CircuitState::Closed;
+            self.last_state_change = Self::now_millis();
+            self.opened_at = None;
+            self.consecutive_failures = 0;
+            self.consecutive_successes = 0;
+            self.active_probes = 0;
+            // Reset the window on close
+            self.window_successes = 0;
+            self.window_failures = 0;
+        }
+    }
+
+    /// Reset the rolling window counters.
+    ///
+    /// Called periodically to ensure the window reflects recent activity.
+    pub fn reset_window(&mut self) {
+        self.window_successes = 0;
+        self.window_failures = 0;
+    }
+
+    fn now_millis() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompilationConfig {
     /// Minimum confidence score to intercept (0.0-1.0).
