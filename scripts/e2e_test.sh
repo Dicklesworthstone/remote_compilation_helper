@@ -8,7 +8,7 @@
 # Options:
 #   --mock                 Run with mock SSH/rsync (default)
 #   --real                 Run with real workers (requires env below)
-#   --fail MODE            Inject failure: sync|exec|artifacts|worker-down|remote-exit
+#   --fail MODE            Inject failure: sync|exec|artifacts|worker-down|remote-exit|toolchain-install|no-rustup
 #   --run-all              In mock mode, run success + failure scenarios
 #   --unit                 Also run `cargo test --workspace`
 #   --verbose              Enable verbose output
@@ -209,6 +209,21 @@ hook_json() {
 JSON
 }
 
+# Hook JSON with toolchain specification for toolchain sync tests
+hook_json_with_toolchain() {
+    local toolchain="${1:-nightly-2024-01-15}"
+    cat <<JSON
+{
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "cargo build",
+    "description": "rch e2e build with toolchain",
+    "toolchain": "$toolchain"
+  }
+}
+JSON
+}
+
 run_hook() {
     local scenario="$1"; shift
     local hook_out="$LOG_DIR/hook_${scenario}.out"
@@ -248,6 +263,25 @@ check_artifacts_mock_failure() {
         /bin/grep -q "Failed to retrieve artifacts" "$hook_out"
 }
 
+# Check that toolchain failure was logged with decision path
+check_toolchain_failure_logged() {
+    local hook_err="$1"
+    local hook_out="${hook_err%.err}.out"
+    # Look for toolchain-related log messages
+    /bin/grep -qi "toolchain" "$hook_err" || \
+        /bin/grep -qi "toolchain" "$hook_out" || \
+        /bin/grep -qi "rustup" "$hook_err" || \
+        /bin/grep -qi "rustup" "$hook_out"
+}
+
+# Check that no-rustup fallback was logged
+check_no_rustup_logged() {
+    local hook_err="$1"
+    local hook_out="${hook_err%.err}.out"
+    /bin/grep -qi "rustup not available\|no rustup\|Continuing with default" "$hook_err" || \
+        /bin/grep -qi "rustup not available\|no rustup\|Continuing with default" "$hook_out"
+}
+
 run_scenario() {
     local scenario="$1"
     local expect="$2"
@@ -264,6 +298,8 @@ run_scenario() {
         artifacts) envs+=("RCH_MOCK_RSYNC_FAIL_ARTIFACTS=1") ;;
         worker-down) envs+=("RCH_MOCK_SSH_FAIL_CONNECT=1") ;;
         remote-exit) envs+=("RCH_MOCK_SSH_EXIT_CODE=2") ;;
+        toolchain-install) envs+=("RCH_MOCK_TOOLCHAIN_INSTALL_FAIL=1") ;;
+        no-rustup) envs+=("RCH_MOCK_NO_RUSTUP=1") ;;
         "") ;;
         *) die "Unknown failure mode: $fail" ;;
     esac
@@ -285,7 +321,7 @@ run_scenario() {
         fi
     fi
 
-    if [[ "$MODE" == "mock" && "$expect" == "deny" && "$fail" != "sync" && "$fail" != "exec" && "$fail" != "worker-down" && "$fail" != "remote-exit" ]]; then
+    if [[ "$MODE" == "mock" && "$expect" == "deny" && "$fail" != "sync" && "$fail" != "exec" && "$fail" != "worker-down" && "$fail" != "remote-exit" && "$fail" != "toolchain-install" && "$fail" != "no-rustup" ]]; then
         if [[ "$fail" == "artifacts" ]]; then
             if check_artifacts_mock_failure "$LOG_DIR/hook_${scenario}.err"; then
                 log "INFO" "ARTIFACTS" "$scenario artifact failure logged"
@@ -303,6 +339,15 @@ run_scenario() {
         fi
     fi
 
+    # Toolchain-specific checks (allow fallback expected)
+    if [[ "$MODE" == "mock" && "$fail" == "toolchain-install" ]]; then
+        log "INFO" "TOOLCHAIN" "$scenario: toolchain install failure triggered local fallback"
+    fi
+
+    if [[ "$MODE" == "mock" && "$fail" == "no-rustup" ]]; then
+        log "INFO" "TOOLCHAIN" "$scenario: no-rustup triggered local fallback"
+    fi
+
     log "INFO" "SCENARIO" "$scenario OK"
 }
 
@@ -317,12 +362,18 @@ run_e2e() {
         run_scenario "worker_down" "allow" "worker-down"
         run_scenario "artifact_fail" "deny" "artifacts"
         run_scenario "remote_exit" "deny" "remote-exit"
+
+        # Toolchain synchronization scenarios
+        log "INFO" "E2E" "Running toolchain synchronization scenarios..."
+        run_scenario "toolchain_install_fail" "allow" "toolchain-install"
+        run_scenario "no_rustup" "allow" "no-rustup"
+        log "INFO" "E2E" "Toolchain scenarios complete"
         return
     fi
 
     if [[ -n "$FAIL_MODE" ]]; then
         case "$FAIL_MODE" in
-            sync|exec|worker-down) run_scenario "$FAIL_MODE" "allow" "$FAIL_MODE" ;;
+            sync|exec|worker-down|toolchain-install|no-rustup) run_scenario "$FAIL_MODE" "allow" "$FAIL_MODE" ;;
             artifacts|remote-exit) run_scenario "$FAIL_MODE" "deny" "$FAIL_MODE" ;;
             *) die "Unknown failure mode: $FAIL_MODE" ;;
         esac

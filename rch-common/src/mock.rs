@@ -158,6 +158,10 @@ pub struct MockConfig {
     pub execution_delay_ms: u64,
     /// Command-specific results (command -> result).
     pub command_results: HashMap<String, CommandResult>,
+    /// Simulate toolchain install failure.
+    pub fail_toolchain_install: bool,
+    /// Simulate no rustup available.
+    pub no_rustup: bool,
 }
 
 impl Default for MockConfig {
@@ -170,6 +174,8 @@ impl Default for MockConfig {
             fail_execute: false,
             execution_delay_ms: 10,
             command_results: HashMap::new(),
+            fail_toolchain_install: false,
+            no_rustup: false,
         }
     }
 }
@@ -237,8 +243,26 @@ impl MockConfig {
 
         config.fail_connect = env_flag("RCH_MOCK_SSH_FAIL_CONNECT");
         config.fail_execute = env_flag("RCH_MOCK_SSH_FAIL_EXECUTE");
+        config.fail_toolchain_install = env_flag("RCH_MOCK_TOOLCHAIN_INSTALL_FAIL");
+        config.no_rustup = env_flag("RCH_MOCK_NO_RUSTUP");
 
         config
+    }
+
+    /// Create a config that simulates toolchain install failure.
+    pub fn toolchain_install_failure() -> Self {
+        Self {
+            fail_toolchain_install: true,
+            ..Self::default()
+        }
+    }
+
+    /// Create a config that simulates no rustup available.
+    pub fn no_rustup() -> Self {
+        Self {
+            no_rustup: true,
+            ..Self::default()
+        }
     }
 }
 
@@ -372,6 +396,36 @@ impl MockSshClient {
             self.mock_config.execution_delay_ms,
         ))
         .await;
+
+        // Check for toolchain-related failures
+        if self.mock_config.no_rustup && command.contains("rustup") {
+            log_phase(
+                Phase::Execute,
+                "Mock: rustup not available (no_rustup mode)",
+            );
+            return Ok(CommandResult {
+                exit_code: 127,
+                stdout: String::new(),
+                stderr: "rustup: command not found".to_string(),
+                duration_ms: start.elapsed().as_millis() as u64,
+            });
+        }
+
+        if self.mock_config.fail_toolchain_install
+            && command.contains("rustup")
+            && (command.contains("toolchain install") || command.contains("run"))
+        {
+            log_phase(
+                Phase::Execute,
+                "Mock: toolchain install failed (fail_toolchain_install mode)",
+            );
+            return Ok(CommandResult {
+                exit_code: 1,
+                stdout: String::new(),
+                stderr: "error: toolchain 'nightly-2024-01-15' is not installed".to_string(),
+                duration_ms: start.elapsed().as_millis() as u64,
+            });
+        }
 
         // Check for command-specific result
         if let Some(result) = self.mock_config.command_results.get(command) {
