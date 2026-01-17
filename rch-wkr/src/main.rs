@@ -7,6 +7,7 @@
 
 mod cache;
 mod executor;
+mod toolchain;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -36,6 +37,14 @@ enum Commands {
         /// Command to execute
         #[arg(short, long)]
         command: String,
+
+        /// Toolchain to use (e.g., "nightly", "nightly-2024-01-15", "stable")
+        ///
+        /// If specified, the worker will ensure this toolchain is available
+        /// (installing via rustup if necessary) and wrap the command with
+        /// `rustup run <toolchain>`.
+        #[arg(short, long)]
+        toolchain: Option<String>,
     },
 
     /// Respond to health check
@@ -72,8 +81,49 @@ async fn main() -> Result<()> {
         .init();
 
     match cli.command {
-        Commands::Execute { workdir, command } => {
-            match executor::execute(&workdir, &command).await {
+        Commands::Execute {
+            workdir,
+            command,
+            toolchain,
+        } => {
+            // Prepare the command, optionally wrapping with toolchain
+            let final_command = if let Some(tc_str) = toolchain {
+                // Parse toolchain string and ensure it's available
+                let tc_info = toolchain::parse_toolchain_string(&tc_str);
+
+                // Ensure toolchain is available (install if needed)
+                match toolchain::ensure_toolchain(&tc_info) {
+                    Ok(()) => {
+                        info!("Toolchain {} ready", tc_str);
+                    }
+                    Err(e) => {
+                        // Log but continue - fail-open behavior
+                        tracing::warn!(
+                            "Failed to ensure toolchain {}: {}. Continuing with default.",
+                            tc_str,
+                            e
+                        );
+                        // Fall through to execute without toolchain wrapping
+                        return match executor::execute(&workdir, &command).await {
+                            Ok(()) => Ok(()),
+                            Err(err) => {
+                                if let Some(failure) = err.downcast_ref::<executor::CommandFailed>()
+                                {
+                                    std::process::exit(failure.exit_code);
+                                }
+                                Err(err)
+                            }
+                        };
+                    }
+                }
+
+                // Wrap command with rustup run
+                rch_common::wrap_command_with_toolchain(&command, Some(&tc_info))
+            } else {
+                command
+            };
+
+            match executor::execute(&workdir, &final_command).await {
                 Ok(()) => Ok(()),
                 Err(err) => {
                     if let Some(failure) = err.downcast_ref::<executor::CommandFailed>() {

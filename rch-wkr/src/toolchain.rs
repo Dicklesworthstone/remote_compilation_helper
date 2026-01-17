@@ -1,0 +1,463 @@
+//! Rust toolchain verification and installation on worker.
+//!
+//! Ensures the required toolchain is available before executing compilation
+//! commands, installing via rustup if necessary.
+
+use rch_common::ToolchainInfo;
+use std::collections::HashSet;
+use std::process::Command;
+use std::sync::RwLock;
+use thiserror::Error;
+use tracing::{debug, info, warn};
+
+/// Thread-safe cache of known-available toolchains.
+///
+/// Uses a `RwLock<HashSet>` for efficient concurrent reads with occasional writes
+/// when new toolchains are discovered or installed.
+static TOOLCHAIN_CACHE: RwLock<Option<HashSet<String>>> = RwLock::new(None);
+
+/// Errors that can occur during toolchain operations.
+#[derive(Debug, Error)]
+pub enum ToolchainError {
+    /// Toolchain availability check failed (reserved for future use).
+    #[allow(dead_code)]
+    #[error("Failed to check toolchain availability: {0}")]
+    CheckFailed(String),
+
+    #[error("Failed to install toolchain: {0}")]
+    InstallFailed(String),
+
+    #[error("Rustup not available")]
+    RustupNotAvailable,
+
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+/// Result type for toolchain operations.
+pub type Result<T> = std::result::Result<T, ToolchainError>;
+
+/// Check if rustup is available on this system.
+pub fn rustup_available() -> bool {
+    Command::new("rustup")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Check if a toolchain is installed and available.
+///
+/// First checks the cache, then falls back to rustup.
+pub fn is_toolchain_available(toolchain: &str) -> Result<bool> {
+    // Check cache first
+    {
+        let cache = TOOLCHAIN_CACHE.read().unwrap();
+        if let Some(ref set) = *cache {
+            if set.contains(toolchain) {
+                debug!("Toolchain {} found in cache", toolchain);
+                return Ok(true);
+            }
+        }
+    }
+
+    // Query rustup
+    debug!("Checking toolchain {} via rustup", toolchain);
+    let output = Command::new("rustup")
+        .args(["run", toolchain, "rustc", "--version"])
+        .output()?;
+
+    let available = output.status.success();
+
+    // Update cache if available
+    if available {
+        let mut cache = TOOLCHAIN_CACHE.write().unwrap();
+        let set = cache.get_or_insert_with(HashSet::new);
+        set.insert(toolchain.to_string());
+        debug!("Cached toolchain {} as available", toolchain);
+    }
+
+    Ok(available)
+}
+
+/// Install a toolchain via rustup using minimal profile.
+///
+/// Uses `--profile minimal` to reduce installation size and time.
+pub fn install_toolchain(toolchain: &str) -> Result<()> {
+    info!("Installing toolchain {} via rustup", toolchain);
+
+    let output = Command::new("rustup")
+        .args(["toolchain", "install", toolchain, "--profile", "minimal"])
+        .output()?;
+
+    if output.status.success() {
+        info!("Successfully installed toolchain {}", toolchain);
+
+        // Update cache
+        let mut cache = TOOLCHAIN_CACHE.write().unwrap();
+        let set = cache.get_or_insert_with(HashSet::new);
+        set.insert(toolchain.to_string());
+
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(ToolchainError::InstallFailed(format!(
+            "rustup install failed: {}",
+            stderr.trim()
+        )))
+    }
+}
+
+/// Ensure a toolchain is available, installing if necessary.
+///
+/// This is the main entry point for toolchain verification:
+/// 1. Check if toolchain is already available (cached or via rustup)
+/// 2. If not available, install via rustup with minimal profile
+/// 3. Return Ok(()) if toolchain is now usable
+///
+/// # Fail-Open Behavior
+///
+/// On installation failure, this returns an error but callers should consider
+/// falling back to local execution rather than blocking the agent.
+pub fn ensure_toolchain(toolchain: &ToolchainInfo) -> Result<()> {
+    let tc_str = toolchain.rustup_toolchain();
+    info!(
+        "Ensuring toolchain {} is available (channel: {}, date: {:?})",
+        tc_str, toolchain.channel, toolchain.date
+    );
+
+    // Check if rustup is available
+    if !rustup_available() {
+        warn!("Rustup not available on this worker");
+        return Err(ToolchainError::RustupNotAvailable);
+    }
+
+    // Check if toolchain is already available
+    if is_toolchain_available(&tc_str)? {
+        debug!("Toolchain {} is already available", tc_str);
+        return Ok(());
+    }
+
+    // Install the toolchain
+    info!("Toolchain {} not found, installing...", tc_str);
+    install_toolchain(&tc_str)?;
+
+    // Verify installation
+    if is_toolchain_available(&tc_str)? {
+        info!("Toolchain {} is now available", tc_str);
+        Ok(())
+    } else {
+        Err(ToolchainError::InstallFailed(format!(
+            "Toolchain {} not available after installation",
+            tc_str
+        )))
+    }
+}
+
+/// Clear the toolchain cache.
+///
+/// Useful for testing or when toolchains may have been removed.
+#[allow(dead_code)]
+pub fn clear_cache() {
+    let mut cache = TOOLCHAIN_CACHE.write().unwrap();
+    *cache = None;
+    debug!("Toolchain cache cleared");
+}
+
+/// Get the current cache contents for debugging.
+#[allow(dead_code)]
+pub fn get_cached_toolchains() -> Vec<String> {
+    let cache = TOOLCHAIN_CACHE.read().unwrap();
+    match &*cache {
+        Some(set) => set.iter().cloned().collect(),
+        None => Vec::new(),
+    }
+}
+
+/// Parse a toolchain string into a ToolchainInfo.
+///
+/// Handles formats like:
+/// - "stable", "beta", "nightly" (simple channel)
+/// - "nightly-2024-01-15" (channel with date)
+/// - "1.75.0" (specific version)
+pub fn parse_toolchain_string(s: &str) -> ToolchainInfo {
+    let s = strip_target_triple(s);
+
+    // Handle nightly-YYYY-MM-DD format
+    if let Some(date) = s.strip_prefix("nightly-") {
+        if is_date_format(date) {
+            return ToolchainInfo::new("nightly", Some(date.to_string()), s);
+        }
+    }
+
+    // Handle beta-YYYY-MM-DD format
+    if let Some(date) = s.strip_prefix("beta-") {
+        if is_date_format(date) {
+            return ToolchainInfo::new("beta", Some(date.to_string()), s);
+        }
+    }
+
+    // Simple channel or version
+    ToolchainInfo::new(s, None, s)
+}
+
+/// Check if a string looks like a date (YYYY-MM-DD).
+fn is_date_format(s: &str) -> bool {
+    if s.len() != 10 {
+        return false;
+    }
+    let parts: Vec<&str> = s.split('-').collect();
+    parts.len() == 3
+        && parts[0].len() == 4
+        && parts[1].len() == 2
+        && parts[2].len() == 2
+        && parts.iter().all(|p| p.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// Strip target triple from toolchain string if present.
+///
+/// Toolchain strings may include target triples like "nightly-x86_64-unknown-linux-gnu".
+/// This function strips the target triple to get the base toolchain.
+pub fn strip_target_triple(toolchain: &str) -> &str {
+    // Common target triple patterns
+    const TARGET_PATTERNS: &[&str] = &[
+        "-x86_64-unknown-linux-gnu",
+        "-x86_64-unknown-linux-musl",
+        "-x86_64-apple-darwin",
+        "-aarch64-unknown-linux-gnu",
+        "-aarch64-apple-darwin",
+        "-x86_64-pc-windows-msvc",
+        "-x86_64-pc-windows-gnu",
+    ];
+
+    for pattern in TARGET_PATTERNS {
+        if let Some(stripped) = toolchain.strip_suffix(pattern) {
+            return stripped;
+        }
+    }
+
+    toolchain
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_strip_target_triple_linux() {
+        assert_eq!(
+            strip_target_triple("nightly-x86_64-unknown-linux-gnu"),
+            "nightly"
+        );
+        assert_eq!(
+            strip_target_triple("stable-x86_64-unknown-linux-gnu"),
+            "stable"
+        );
+        assert_eq!(
+            strip_target_triple("nightly-2024-01-15-x86_64-unknown-linux-gnu"),
+            "nightly-2024-01-15"
+        );
+    }
+
+    #[test]
+    fn test_strip_target_triple_macos() {
+        assert_eq!(strip_target_triple("stable-x86_64-apple-darwin"), "stable");
+        assert_eq!(
+            strip_target_triple("nightly-aarch64-apple-darwin"),
+            "nightly"
+        );
+    }
+
+    #[test]
+    fn test_strip_target_triple_no_triple() {
+        assert_eq!(strip_target_triple("nightly"), "nightly");
+        assert_eq!(strip_target_triple("stable"), "stable");
+        assert_eq!(
+            strip_target_triple("nightly-2024-01-15"),
+            "nightly-2024-01-15"
+        );
+    }
+
+    #[test]
+    fn test_cache_operations() {
+        // Start with a clean cache
+        clear_cache();
+        assert!(get_cached_toolchains().is_empty());
+
+        // Cache is initially empty
+        let initial = get_cached_toolchains();
+        assert!(initial.is_empty());
+    }
+
+    #[test]
+    fn test_cache_clear_behavior() {
+        // Verify cache clears correctly
+        clear_cache();
+        let cached = get_cached_toolchains();
+        assert!(cached.is_empty(), "Cache should be empty after clear");
+    }
+
+    #[test]
+    fn test_toolchain_error_display() {
+        // Test error message formatting
+        let err = ToolchainError::InstallFailed("rustup failed".to_string());
+        assert!(err.to_string().contains("rustup failed"));
+
+        let err = ToolchainError::RustupNotAvailable;
+        assert!(err.to_string().contains("Rustup not available"));
+
+        let err = ToolchainError::CheckFailed("check failed".to_string());
+        assert!(err.to_string().contains("check failed"));
+    }
+
+    #[test]
+    fn test_parse_toolchain_string_edge_cases() {
+        // Test empty string
+        let tc = parse_toolchain_string("");
+        assert_eq!(tc.channel, "");
+
+        // Test just a version major.minor
+        let tc = parse_toolchain_string("1.75");
+        assert_eq!(tc.channel, "1.75");
+        assert_eq!(tc.date, None);
+
+        // Test with musl target
+        let tc = parse_toolchain_string("stable-x86_64-unknown-linux-musl");
+        assert_eq!(tc.channel, "stable");
+
+        // Test Windows target
+        let tc = parse_toolchain_string("nightly-x86_64-pc-windows-msvc");
+        assert_eq!(tc.channel, "nightly");
+    }
+
+    #[test]
+    fn test_strip_target_triple_windows() {
+        assert_eq!(
+            strip_target_triple("stable-x86_64-pc-windows-msvc"),
+            "stable"
+        );
+        assert_eq!(
+            strip_target_triple("nightly-2024-01-15-x86_64-pc-windows-gnu"),
+            "nightly-2024-01-15"
+        );
+    }
+
+    #[test]
+    fn test_strip_target_triple_aarch64() {
+        assert_eq!(
+            strip_target_triple("stable-aarch64-unknown-linux-gnu"),
+            "stable"
+        );
+    }
+
+    #[test]
+    fn test_parse_toolchain_preserves_full_version() {
+        let tc = parse_toolchain_string("nightly-2024-01-15");
+        assert_eq!(tc.full_version, "nightly-2024-01-15");
+
+        let tc = parse_toolchain_string("stable");
+        assert_eq!(tc.full_version, "stable");
+    }
+
+    #[test]
+    fn test_toolchain_info_rustup_toolchain() {
+        let tc = ToolchainInfo::new("nightly", Some("2024-01-15".to_string()), "");
+        assert_eq!(tc.rustup_toolchain(), "nightly-2024-01-15");
+
+        let tc_stable = ToolchainInfo::new("stable", None, "");
+        assert_eq!(tc_stable.rustup_toolchain(), "stable");
+    }
+
+    #[test]
+    fn test_parse_toolchain_string_stable() {
+        let tc = parse_toolchain_string("stable");
+        assert_eq!(tc.channel, "stable");
+        assert_eq!(tc.date, None);
+    }
+
+    #[test]
+    fn test_parse_toolchain_string_nightly() {
+        let tc = parse_toolchain_string("nightly");
+        assert_eq!(tc.channel, "nightly");
+        assert_eq!(tc.date, None);
+    }
+
+    #[test]
+    fn test_parse_toolchain_string_nightly_with_date() {
+        let tc = parse_toolchain_string("nightly-2024-01-15");
+        assert_eq!(tc.channel, "nightly");
+        assert_eq!(tc.date, Some("2024-01-15".to_string()));
+        assert_eq!(tc.rustup_toolchain(), "nightly-2024-01-15");
+    }
+
+    #[test]
+    fn test_parse_toolchain_string_beta_with_date() {
+        let tc = parse_toolchain_string("beta-2024-02-01");
+        assert_eq!(tc.channel, "beta");
+        assert_eq!(tc.date, Some("2024-02-01".to_string()));
+    }
+
+    #[test]
+    fn test_parse_toolchain_string_version() {
+        let tc = parse_toolchain_string("1.75.0");
+        assert_eq!(tc.channel, "1.75.0");
+        assert_eq!(tc.date, None);
+    }
+
+    #[test]
+    fn test_parse_toolchain_string_with_target() {
+        let tc = parse_toolchain_string("nightly-x86_64-unknown-linux-gnu");
+        assert_eq!(tc.channel, "nightly");
+        assert_eq!(tc.date, None);
+    }
+
+    #[test]
+    fn test_parse_toolchain_string_nightly_date_with_target() {
+        let tc = parse_toolchain_string("nightly-2024-01-15-x86_64-unknown-linux-gnu");
+        assert_eq!(tc.channel, "nightly");
+        assert_eq!(tc.date, Some("2024-01-15".to_string()));
+    }
+
+    #[test]
+    fn test_is_date_format() {
+        assert!(is_date_format("2024-01-15"));
+        assert!(is_date_format("2023-12-31"));
+        assert!(!is_date_format("2024-1-15")); // Missing leading zero
+        assert!(!is_date_format("2024-01-1")); // Missing leading zero
+        assert!(!is_date_format("24-01-15")); // Year too short
+        assert!(!is_date_format("not-a-date"));
+        assert!(!is_date_format("x86_64")); // Not a date
+    }
+
+    // Note: Tests that require rustup are integration tests and should be
+    // run with actual rustup available. They're marked with #[ignore] for
+    // regular test runs.
+
+    #[test]
+    #[ignore]
+    fn test_rustup_available_integration() {
+        // This test requires rustup to be installed
+        let available = rustup_available();
+        println!("Rustup available: {}", available);
+        // Don't assert - just check it doesn't panic
+    }
+
+    #[test]
+    #[ignore]
+    fn test_is_toolchain_available_stable() {
+        // This test requires rustup and stable toolchain
+        clear_cache();
+        let result = is_toolchain_available("stable");
+        println!("Stable toolchain available: {:?}", result);
+    }
+
+    #[test]
+    #[ignore]
+    fn test_ensure_toolchain_stable() {
+        // This test requires rustup
+        clear_cache();
+        let tc = ToolchainInfo::new("stable", None, "");
+        let result = ensure_toolchain(&tc);
+        println!("Ensure stable result: {:?}", result);
+    }
+}
