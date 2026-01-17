@@ -784,6 +784,325 @@ pub struct BuildStats {
     pub avg_duration_ms: u64,
 }
 
+// ============================================================================
+// Compilation Timing and Metrics
+// ============================================================================
+
+use std::collections::VecDeque;
+use std::time::{Duration, Instant};
+
+/// Breakdown of timing for each compilation phase.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CompilationTimingBreakdown {
+    /// Time to sync source files to worker.
+    #[serde(with = "duration_millis")]
+    pub rsync_up: Duration,
+    /// Time for cargo build on worker.
+    #[serde(with = "duration_millis")]
+    pub remote_build: Duration,
+    /// Time to sync artifacts back.
+    #[serde(with = "duration_millis")]
+    pub rsync_down: Duration,
+    /// Total end-to-end latency.
+    #[serde(with = "duration_millis")]
+    pub total: Duration,
+}
+
+mod duration_millis {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::time::Duration;
+
+    pub fn serialize<S>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        duration.as_millis().serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Duration, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let millis = u64::deserialize(deserializer)?;
+        Ok(Duration::from_millis(millis))
+    }
+}
+
+/// Comprehensive metrics for a single compilation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompilationMetrics {
+    /// Project identifier (usually directory name or hash).
+    pub project_id: String,
+    /// Worker that performed the compilation.
+    pub worker_id: String,
+    /// When the compilation occurred.
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+    /// Timing breakdown for each phase.
+    pub timing: CompilationTimingBreakdown,
+    /// Local build time for comparison (if available).
+    #[serde(with = "option_duration_millis")]
+    pub local_build_time: Option<Duration>,
+    /// Speedup ratio (local_time / remote_time).
+    pub speedup: Option<f64>,
+    /// Number of files synced to worker.
+    pub files_synced: u64,
+    /// Total bytes transferred.
+    pub bytes_transferred: u64,
+    /// Exit code from compilation.
+    pub exit_code: i32,
+    /// Whether compilation succeeded.
+    pub success: bool,
+}
+
+mod option_duration_millis {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::time::Duration;
+
+    pub fn serialize<S>(duration: &Option<Duration>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match duration {
+            Some(d) => Some(d.as_millis() as u64).serialize(serializer),
+            None => Option::<u64>::None.serialize(serializer),
+        }
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<Duration>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let opt: Option<u64> = Option::deserialize(deserializer)?;
+        Ok(opt.map(Duration::from_millis))
+    }
+}
+
+impl CompilationMetrics {
+    /// Calculate speedup based on local vs remote build time.
+    pub fn calculate_speedup(&mut self) {
+        if let Some(local) = self.local_build_time {
+            if self.timing.total.as_millis() > 0 {
+                self.speedup = Some(local.as_secs_f64() / self.timing.total.as_secs_f64());
+            }
+        }
+    }
+
+    /// Check if remote compilation was beneficial (faster than local).
+    pub fn is_beneficial(&self) -> bool {
+        self.speedup.map(|s| s > 1.0).unwrap_or(false)
+    }
+}
+
+impl Default for CompilationMetrics {
+    fn default() -> Self {
+        Self {
+            project_id: String::new(),
+            worker_id: String::new(),
+            timestamp: chrono::Utc::now(),
+            timing: CompilationTimingBreakdown::default(),
+            local_build_time: None,
+            speedup: None,
+            files_synced: 0,
+            bytes_transferred: 0,
+            exit_code: 0,
+            success: true,
+        }
+    }
+}
+
+/// Timer for tracking compilation phases.
+///
+/// Use this to measure the duration of each phase of remote compilation.
+///
+/// # Example
+/// ```ignore
+/// let mut timer = CompilationTimer::new("my-project", "worker-1");
+/// // ... rsync source files ...
+/// timer.end_rsync_up();
+/// // ... run cargo build ...
+/// timer.end_remote_build();
+/// // ... rsync artifacts back ...
+/// timer.end_rsync_down();
+/// let metrics = timer.finish(0, 100, 1_000_000);
+/// ```
+#[derive(Debug)]
+pub struct CompilationTimer {
+    project_id: String,
+    worker_id: String,
+    start: Instant,
+    phase_start: Instant,
+    rsync_up: Option<Duration>,
+    remote_build: Option<Duration>,
+    rsync_down: Option<Duration>,
+}
+
+impl CompilationTimer {
+    /// Create a new timer for a compilation.
+    pub fn new(project_id: &str, worker_id: &str) -> Self {
+        let now = Instant::now();
+        Self {
+            project_id: project_id.to_string(),
+            worker_id: worker_id.to_string(),
+            start: now,
+            phase_start: now,
+            rsync_up: None,
+            remote_build: None,
+            rsync_down: None,
+        }
+    }
+
+    /// Mark the end of the rsync upload phase.
+    pub fn end_rsync_up(&mut self) {
+        self.rsync_up = Some(self.phase_start.elapsed());
+        self.phase_start = Instant::now();
+        tracing::info!(
+            rsync_up_ms = %self.rsync_up.unwrap().as_millis(),
+            "TIMING: rsync_up completed"
+        );
+    }
+
+    /// Mark the end of the remote build phase.
+    pub fn end_remote_build(&mut self) {
+        self.remote_build = Some(self.phase_start.elapsed());
+        self.phase_start = Instant::now();
+        tracing::info!(
+            remote_build_ms = %self.remote_build.unwrap().as_millis(),
+            "TIMING: remote_build completed"
+        );
+    }
+
+    /// Mark the end of the rsync download phase.
+    pub fn end_rsync_down(&mut self) {
+        self.rsync_down = Some(self.phase_start.elapsed());
+        tracing::info!(
+            rsync_down_ms = %self.rsync_down.unwrap().as_millis(),
+            "TIMING: rsync_down completed"
+        );
+    }
+
+    /// Finish timing and produce metrics.
+    pub fn finish(self, exit_code: i32, files: u64, bytes: u64) -> CompilationMetrics {
+        let total = self.start.elapsed();
+        tracing::info!(
+            total_ms = %total.as_millis(),
+            exit_code = %exit_code,
+            "TIMING: compilation completed"
+        );
+
+        CompilationMetrics {
+            project_id: self.project_id,
+            worker_id: self.worker_id,
+            timestamp: chrono::Utc::now(),
+            timing: CompilationTimingBreakdown {
+                rsync_up: self.rsync_up.unwrap_or_default(),
+                remote_build: self.remote_build.unwrap_or_default(),
+                rsync_down: self.rsync_down.unwrap_or_default(),
+                total,
+            },
+            local_build_time: None,
+            speedup: None,
+            files_synced: files,
+            bytes_transferred: bytes,
+            exit_code,
+            success: exit_code == 0,
+        }
+    }
+}
+
+/// Aggregator for compilation metrics with statistics.
+#[derive(Debug)]
+pub struct MetricsAggregator {
+    history: VecDeque<CompilationMetrics>,
+    max_history: usize,
+}
+
+impl MetricsAggregator {
+    /// Create a new aggregator with a maximum history size.
+    pub fn new(max_history: usize) -> Self {
+        Self {
+            history: VecDeque::with_capacity(max_history),
+            max_history,
+        }
+    }
+
+    /// Record a new compilation's metrics.
+    pub fn record(&mut self, metrics: CompilationMetrics) {
+        if self.history.len() >= self.max_history {
+            self.history.pop_front();
+        }
+        self.history.push_back(metrics);
+    }
+
+    /// Get the average speedup across all recorded compilations.
+    pub fn average_speedup(&self) -> Option<f64> {
+        let speedups: Vec<f64> = self.history.iter().filter_map(|m| m.speedup).collect();
+
+        if speedups.is_empty() {
+            None
+        } else {
+            Some(speedups.iter().sum::<f64>() / speedups.len() as f64)
+        }
+    }
+
+    /// Get the p50 (median) total compilation time.
+    pub fn p50_total_time(&self) -> Option<Duration> {
+        self.percentile_total_time(0.50)
+    }
+
+    /// Get the p95 total compilation time.
+    pub fn p95_total_time(&self) -> Option<Duration> {
+        self.percentile_total_time(0.95)
+    }
+
+    /// Get the p99 total compilation time.
+    pub fn p99_total_time(&self) -> Option<Duration> {
+        self.percentile_total_time(0.99)
+    }
+
+    /// Get a percentile of total compilation times.
+    fn percentile_total_time(&self, percentile: f64) -> Option<Duration> {
+        let mut times: Vec<_> = self.history.iter().map(|m| m.timing.total).collect();
+
+        if times.is_empty() {
+            return None;
+        }
+
+        times.sort();
+        let idx = ((times.len() as f64 * percentile) as usize).min(times.len() - 1);
+        Some(times[idx])
+    }
+
+    /// Get the success rate as a percentage.
+    pub fn success_rate(&self) -> f64 {
+        if self.history.is_empty() {
+            return 100.0;
+        }
+        let successes = self.history.iter().filter(|m| m.success).count();
+        (successes as f64 / self.history.len() as f64) * 100.0
+    }
+
+    /// Get the number of recorded compilations.
+    pub fn count(&self) -> usize {
+        self.history.len()
+    }
+
+    /// Get all recorded metrics.
+    pub fn metrics(&self) -> &VecDeque<CompilationMetrics> {
+        &self.history
+    }
+
+    /// Clear all recorded metrics.
+    pub fn clear(&mut self) {
+        self.history.clear();
+    }
+}
+
+impl Default for MetricsAggregator {
+    fn default() -> Self {
+        Self::new(1000)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1201,5 +1520,263 @@ mod tests {
         assert!(stats.should_close(&config));
         stats.close();
         assert_eq!(stats.state(), CircuitState::Closed);
+    }
+
+    // ========================================================================
+    // Compilation Timing Tests
+    // ========================================================================
+
+    fn make_test_metrics(speedup: Option<f64>, total_secs: u64, success: bool) -> CompilationMetrics {
+        CompilationMetrics {
+            project_id: "test-project".to_string(),
+            worker_id: "worker-1".to_string(),
+            timestamp: chrono::Utc::now(),
+            timing: CompilationTimingBreakdown {
+                rsync_up: Duration::from_millis(100),
+                remote_build: Duration::from_millis(800),
+                rsync_down: Duration::from_millis(100),
+                total: Duration::from_secs(total_secs),
+            },
+            local_build_time: speedup.map(|s| Duration::from_secs_f64(total_secs as f64 * s)),
+            speedup,
+            files_synced: 100,
+            bytes_transferred: 1_000_000,
+            exit_code: if success { 0 } else { 1 },
+            success,
+        }
+    }
+
+    #[test]
+    fn test_compilation_timing_breakdown_default() {
+        let timing = CompilationTimingBreakdown::default();
+        assert_eq!(timing.rsync_up, Duration::ZERO);
+        assert_eq!(timing.remote_build, Duration::ZERO);
+        assert_eq!(timing.rsync_down, Duration::ZERO);
+        assert_eq!(timing.total, Duration::ZERO);
+    }
+
+    #[test]
+    fn test_compilation_timing_breakdown_serialization() {
+        let timing = CompilationTimingBreakdown {
+            rsync_up: Duration::from_millis(100),
+            remote_build: Duration::from_millis(2000),
+            rsync_down: Duration::from_millis(50),
+            total: Duration::from_millis(2150),
+        };
+
+        let json = serde_json::to_string(&timing).unwrap();
+        assert!(json.contains("100")); // rsync_up
+        assert!(json.contains("2000")); // remote_build
+        assert!(json.contains("50")); // rsync_down
+        assert!(json.contains("2150")); // total
+
+        let parsed: CompilationTimingBreakdown = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.rsync_up, timing.rsync_up);
+        assert_eq!(parsed.remote_build, timing.remote_build);
+        assert_eq!(parsed.rsync_down, timing.rsync_down);
+        assert_eq!(parsed.total, timing.total);
+    }
+
+    #[test]
+    fn test_compilation_metrics_calculate_speedup() {
+        let mut metrics = CompilationMetrics {
+            timing: CompilationTimingBreakdown {
+                total: Duration::from_secs(10),
+                ..Default::default()
+            },
+            local_build_time: Some(Duration::from_secs(30)),
+            ..Default::default()
+        };
+
+        metrics.calculate_speedup();
+
+        assert!(metrics.speedup.is_some());
+        let speedup = metrics.speedup.unwrap();
+        assert!((speedup - 3.0).abs() < 0.01, "Expected 3.0x speedup, got {}", speedup);
+    }
+
+    #[test]
+    fn test_compilation_metrics_is_beneficial() {
+        let mut metrics = CompilationMetrics::default();
+
+        // No speedup calculated
+        assert!(!metrics.is_beneficial());
+
+        // Speedup > 1 is beneficial
+        metrics.speedup = Some(1.5);
+        assert!(metrics.is_beneficial());
+
+        // Speedup < 1 is not beneficial
+        metrics.speedup = Some(0.8);
+        assert!(!metrics.is_beneficial());
+
+        // Speedup = 1 is not beneficial (exactly same speed)
+        metrics.speedup = Some(1.0);
+        assert!(!metrics.is_beneficial());
+    }
+
+    #[test]
+    fn test_compilation_metrics_serialization() {
+        let metrics = make_test_metrics(Some(2.5), 10, true);
+        let json = serde_json::to_string(&metrics).unwrap();
+
+        assert!(json.contains("test-project"));
+        assert!(json.contains("worker-1"));
+        assert!(json.contains("2.5")); // speedup
+
+        let parsed: CompilationMetrics = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.project_id, "test-project");
+        assert_eq!(parsed.worker_id, "worker-1");
+        assert!(parsed.success);
+    }
+
+    #[test]
+    fn test_compilation_timer_new() {
+        let timer = CompilationTimer::new("my-project", "my-worker");
+        assert_eq!(timer.project_id, "my-project");
+        assert_eq!(timer.worker_id, "my-worker");
+        assert!(timer.rsync_up.is_none());
+        assert!(timer.remote_build.is_none());
+        assert!(timer.rsync_down.is_none());
+    }
+
+    #[test]
+    fn test_compilation_timer_phases() {
+        let mut timer = CompilationTimer::new("test", "worker");
+
+        // Simulate rsync up
+        std::thread::sleep(Duration::from_millis(5));
+        timer.end_rsync_up();
+        assert!(timer.rsync_up.is_some());
+        assert!(timer.rsync_up.unwrap() >= Duration::from_millis(5));
+
+        // Simulate remote build
+        std::thread::sleep(Duration::from_millis(10));
+        timer.end_remote_build();
+        assert!(timer.remote_build.is_some());
+        assert!(timer.remote_build.unwrap() >= Duration::from_millis(10));
+
+        // Simulate rsync down
+        std::thread::sleep(Duration::from_millis(5));
+        timer.end_rsync_down();
+        assert!(timer.rsync_down.is_some());
+        assert!(timer.rsync_down.unwrap() >= Duration::from_millis(5));
+
+        // Finish
+        let metrics = timer.finish(0, 50, 500_000);
+        assert_eq!(metrics.project_id, "test");
+        assert_eq!(metrics.worker_id, "worker");
+        assert!(metrics.success);
+        assert!(metrics.timing.total >= Duration::from_millis(20));
+        assert_eq!(metrics.files_synced, 50);
+        assert_eq!(metrics.bytes_transferred, 500_000);
+    }
+
+    #[test]
+    fn test_metrics_aggregator_new() {
+        let agg = MetricsAggregator::new(100);
+        assert_eq!(agg.count(), 0);
+        assert!(agg.average_speedup().is_none());
+    }
+
+    #[test]
+    fn test_metrics_aggregator_record() {
+        let mut agg = MetricsAggregator::new(3);
+
+        // Record first metric
+        agg.record(make_test_metrics(Some(2.0), 10, true));
+        assert_eq!(agg.count(), 1);
+
+        // Record up to max
+        agg.record(make_test_metrics(Some(3.0), 20, true));
+        agg.record(make_test_metrics(Some(4.0), 30, true));
+        assert_eq!(agg.count(), 3);
+
+        // Exceed max should drop oldest
+        agg.record(make_test_metrics(Some(5.0), 40, true));
+        assert_eq!(agg.count(), 3);
+    }
+
+    #[test]
+    fn test_metrics_aggregator_average_speedup() {
+        let mut agg = MetricsAggregator::new(100);
+
+        // Empty case
+        assert!(agg.average_speedup().is_none());
+
+        // Add metrics with speedups 1, 2, 3, 4, 5 -> average = 3
+        for i in 1..=5 {
+            agg.record(make_test_metrics(Some(i as f64), 10, true));
+        }
+
+        let avg = agg.average_speedup().unwrap();
+        assert!((avg - 3.0).abs() < 0.01, "Expected 3.0, got {}", avg);
+    }
+
+    #[test]
+    fn test_metrics_aggregator_average_speedup_with_none() {
+        let mut agg = MetricsAggregator::new(100);
+
+        // Mix of Some and None speedups
+        agg.record(make_test_metrics(Some(2.0), 10, true));
+        agg.record(make_test_metrics(None, 10, true)); // No speedup
+        agg.record(make_test_metrics(Some(4.0), 10, true));
+
+        // Average should only consider metrics with speedup
+        let avg = agg.average_speedup().unwrap();
+        assert!((avg - 3.0).abs() < 0.01, "Expected 3.0, got {}", avg);
+    }
+
+    #[test]
+    fn test_metrics_aggregator_percentiles() {
+        let mut agg = MetricsAggregator::new(100);
+
+        // Add metrics with total times 1s, 2s, 3s, ..., 10s
+        for i in 1..=10 {
+            agg.record(make_test_metrics(Some(1.0), i, true));
+        }
+
+        // p50 (median) should be around 5s
+        let p50 = agg.p50_total_time().unwrap();
+        assert!(p50 >= Duration::from_secs(5) && p50 <= Duration::from_secs(6));
+
+        // p95 should be around 9s or 10s
+        let p95 = agg.p95_total_time().unwrap();
+        assert!(p95 >= Duration::from_secs(9) && p95 <= Duration::from_secs(10));
+
+        // p99 should be 10s
+        let p99 = agg.p99_total_time().unwrap();
+        assert!(p99 >= Duration::from_secs(9));
+    }
+
+    #[test]
+    fn test_metrics_aggregator_success_rate() {
+        let mut agg = MetricsAggregator::new(100);
+
+        // Empty case
+        assert_eq!(agg.success_rate(), 100.0);
+
+        // All successful
+        agg.record(make_test_metrics(Some(1.0), 10, true));
+        agg.record(make_test_metrics(Some(1.0), 10, true));
+        assert_eq!(agg.success_rate(), 100.0);
+
+        // Add a failure (2 success, 1 failure = 66.67%)
+        agg.record(make_test_metrics(Some(1.0), 10, false));
+        let rate = agg.success_rate();
+        assert!((rate - 66.67).abs() < 1.0, "Expected ~66.67%, got {}", rate);
+    }
+
+    #[test]
+    fn test_metrics_aggregator_clear() {
+        let mut agg = MetricsAggregator::new(100);
+        agg.record(make_test_metrics(Some(1.0), 10, true));
+        agg.record(make_test_metrics(Some(2.0), 20, true));
+
+        assert_eq!(agg.count(), 2);
+
+        agg.clear();
+        assert_eq!(agg.count(), 0);
+        assert!(agg.average_speedup().is_none());
     }
 }

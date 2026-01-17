@@ -35,7 +35,8 @@ pub use test_change::{TestChangeGuard, TestCodeChange};
 pub use toolchain::{ToolchainInfo, wrap_command_with_toolchain};
 pub use types::{
     BuildLocation, BuildRecord, BuildStats, CircuitBreakerConfig, CircuitState, CircuitStats,
-    CompilationConfig, GeneralConfig, RchConfig, ReleaseRequest, RequiredRuntime, SelectedWorker,
+    CompilationConfig, CompilationMetrics, CompilationTimer, CompilationTimingBreakdown,
+    GeneralConfig, MetricsAggregator, RchConfig, ReleaseRequest, RequiredRuntime, SelectedWorker,
     SelectionReason, SelectionRequest, SelectionResponse, TransferConfig, WorkerCapabilities,
     WorkerConfig, WorkerId, WorkerStatus,
 };
