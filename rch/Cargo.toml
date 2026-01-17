@@ -47,6 +47,10 @@ which = "7"
 # Markdown rendering
 pulldown-cmark = { workspace = true }
 
+# TUI (Terminal User Interface)
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+
 # Interactive CLI prompts
 dialoguer = { workspace = true }
 console = { workspace = true }

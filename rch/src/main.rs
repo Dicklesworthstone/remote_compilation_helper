@@ -19,6 +19,7 @@ mod status_display;
 mod status_types;
 mod toolchain;
 mod transfer;
+pub mod tui;
 pub mod ui;
 mod update;
 
@@ -341,6 +342,39 @@ configured remote workers."#)]
     Fleet {
         #[command(subcommand)]
         action: FleetAction,
+    },
+
+    /// Interactive TUI dashboard for real-time monitoring
+    #[command(after_help = r#"EXAMPLES:
+    rch dashboard                      # Launch TUI dashboard
+    rch dashboard --refresh 500        # 500ms refresh rate
+    rch dashboard --no-mouse           # Disable mouse support
+    rch dashboard --high-contrast      # High contrast mode
+
+The dashboard provides real-time monitoring of:
+  - Worker status and slot utilization
+  - Active build progress
+  - Build history with filtering
+  - Log tail view for active builds
+
+Controls:
+  q/Esc    - Quit
+  ↑/↓      - Navigate
+  Tab      - Switch panels
+  r        - Refresh data
+  ?        - Help"#)]
+    Dashboard {
+        /// Refresh interval in milliseconds (default: 1000)
+        #[arg(long, default_value = "1000")]
+        refresh: u64,
+
+        /// Disable mouse support
+        #[arg(long)]
+        no_mouse: bool,
+
+        /// High contrast mode for accessibility
+        #[arg(long)]
+        high_contrast: bool,
     },
 }
 
@@ -771,6 +805,18 @@ async fn main() -> Result<()> {
                 .await
             }
             Commands::Fleet { action } => handle_fleet(action, &ctx).await,
+            Commands::Dashboard {
+                refresh,
+                no_mouse,
+                high_contrast,
+            } => {
+                let config = tui::TuiConfig {
+                    refresh_interval_ms: refresh,
+                    mouse_support: !no_mouse,
+                    high_contrast,
+                };
+                tui::run_tui(config).await
+            }
         },
     }
 }

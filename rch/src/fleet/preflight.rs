@@ -37,7 +37,7 @@ pub struct WorkerStatus {
     pub issues: Vec<String>,
 }
 
-pub async fn run_preflight(worker: &WorkerConfig, _ctx: &OutputContext) -> Result<PreflightResult> {
+pub async fn run_preflight(_worker: &WorkerConfig, _ctx: &OutputContext) -> Result<PreflightResult> {
     // Simulate successful preflight - real impl would SSH
     Ok(PreflightResult { ssh_ok: true, disk_space_mb: 10000, disk_ok: true, rsync_ok: true, zstd_ok: true, rustup_ok: true, current_version: None, issues: vec![] })
 }
@@ -46,4 +46,5 @@ pub async fn get_fleet_status(workers: &[&WorkerConfig], _ctx: &OutputContext) -
     Ok(workers.iter().map(|w| WorkerStatus { worker_id: w.id.0.clone(), reachable: true, healthy: true, version: Some("0.1.0".into()), issues: vec![] }).collect())
 }
 
+#[allow(dead_code)]
 pub const MIN_DISK_SPACE_MB: u64 = 500;
