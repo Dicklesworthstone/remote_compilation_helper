@@ -1779,6 +1779,30 @@ mod tests {
         }
     }
 
+    #[test]
+    fn cli_parses_setup_as_alias_for_init() {
+        let cli = Cli::try_parse_from(["rch", "setup"]).unwrap();
+        match cli.command {
+            Some(Commands::Init { yes, skip_test }) => {
+                assert!(!yes);
+                assert!(!skip_test);
+            }
+            _ => panic!("Expected init command from setup alias"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_setup_with_flags() {
+        let cli = Cli::try_parse_from(["rch", "setup", "--yes", "--skip-test"]).unwrap();
+        match cli.command {
+            Some(Commands::Init { yes, skip_test }) => {
+                assert!(yes);
+                assert!(skip_test);
+            }
+            _ => panic!("Expected init command from setup alias with flags"),
+        }
+    }
+
     // -------------------------------------------------------------------------
     // Update Subcommand Tests
     // -------------------------------------------------------------------------
