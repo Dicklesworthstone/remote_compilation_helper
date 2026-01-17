@@ -283,6 +283,23 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_targets_trims_and_filters_invalid_levels() {
+        let targets = parse_target_overrides(" rchd::api = DEBUG ,hyper=verbose,=warn,missing");
+        assert_eq!(targets.get("rchd::api"), Some(&"debug".to_string()));
+        assert!(!targets.contains_key("hyper"));
+        assert!(!targets.contains_key(""));
+        assert!(!targets.contains_key("missing"));
+    }
+
+    #[test]
+    fn test_log_format_parse() {
+        assert_eq!(LogFormat::parse("pretty"), Some(LogFormat::Pretty));
+        assert_eq!(LogFormat::parse("JSON"), Some(LogFormat::Json));
+        assert_eq!(LogFormat::parse("Compact"), Some(LogFormat::Compact));
+        assert_eq!(LogFormat::parse("invalid"), None);
+    }
+
+    #[test]
     fn test_env_filter_builds_overrides() {
         let mut config = LogConfig {
             level: "info".to_string(),

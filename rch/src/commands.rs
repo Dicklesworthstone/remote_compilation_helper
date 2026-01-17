@@ -286,6 +286,7 @@ pub struct ConfigShowResponse {
     pub compilation: ConfigCompilationSection,
     pub transfer: ConfigTransferSection,
     pub circuit: ConfigCircuitSection,
+    pub output: ConfigOutputSection,
     pub sources: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub value_sources: Option<Vec<ConfigValueSourceInfo>>,
@@ -337,6 +338,13 @@ pub struct ConfigCircuitSection {
     pub window_secs: u64,
     pub open_cooldown_secs: u64,
     pub half_open_max_probes: u32,
+}
+
+/// Output configuration section.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConfigOutputSection {
+    pub visibility: rch_common::OutputVisibility,
+    pub first_run_complete: bool,
 }
 
 /// Configuration init response for JSON output.
@@ -3420,6 +3428,10 @@ pub fn config_show(show_sources: bool, ctx: &OutputContext) -> Result<()> {
                 open_cooldown_secs: config.circuit.open_cooldown_secs,
                 half_open_max_probes: config.circuit.half_open_max_probes,
             },
+            output: ConfigOutputSection {
+                visibility: config.output.visibility,
+                first_run_complete: config.output.first_run_complete,
+            },
             sources,
             value_sources,
         };
@@ -3571,6 +3583,26 @@ pub fn config_show(show_sources: bool, ctx: &OutputContext) -> Result<()> {
         )
     );
 
+    println!("\n{}", style.highlight("[output]"));
+    println!(
+        "  {} = {}",
+        style.key("visibility"),
+        format_with_source(
+            "output.visibility",
+            &style.value(&config.output.visibility.to_string()),
+            &value_sources
+        )
+    );
+    println!(
+        "  {} = {}",
+        style.key("first_run_complete"),
+        format_with_source(
+            "output.first_run_complete",
+            &style.value(&config.output.first_run_complete.to_string()),
+            &value_sources
+        )
+    );
+
     // Show config file locations
     println!(
         "\n{}",
@@ -3675,6 +3707,18 @@ fn collect_value_sources(
         &mut values,
         "circuit.half_open_max_probes",
         config.circuit.half_open_max_probes.to_string(),
+        sources,
+    );
+    push_value_source(
+        &mut values,
+        "output.visibility",
+        config.output.visibility.to_string(),
+        sources,
+    );
+    push_value_source(
+        &mut values,
+        "output.first_run_complete",
+        config.output.first_run_complete.to_string(),
         sources,
     );
 
@@ -4483,9 +4527,21 @@ fn config_set_at(config_path: &Path, key: &str, value: &str, ctx: &OutputContext
         "transfer.exclude_patterns" => {
             config.transfer.exclude_patterns = parse_string_list(value, key)?;
         }
+        "output.visibility" => {
+            let trimmed = value.trim().trim_matches(|c| c == '"');
+            let visibility = trimmed
+                .parse::<rch_common::OutputVisibility>()
+                .map_err(|_| {
+                    anyhow::anyhow!("output.visibility must be one of: none, summary, verbose")
+                })?;
+            config.output.visibility = visibility;
+        }
+        "output.first_run_complete" | "first_run_complete" => {
+            config.output.first_run_complete = parse_bool(value, key)?;
+        }
         _ => {
             bail!(
-                "Unknown config key: {}. Supported keys: general.enabled, general.log_level, general.socket_path, compilation.confidence_threshold, compilation.min_local_time_ms, transfer.compression_level, transfer.exclude_patterns",
+                "Unknown config key: {}. Supported keys: general.enabled, general.log_level, general.socket_path, compilation.confidence_threshold, compilation.min_local_time_ms, transfer.compression_level, transfer.exclude_patterns, output.visibility, output.first_run_complete, first_run_complete",
                 key
             );
         }
@@ -5782,6 +5838,10 @@ mod tests {
                 window_secs: 60,
                 open_cooldown_secs: 30,
                 half_open_max_probes: 2,
+            },
+            output: ConfigOutputSection {
+                visibility: rch_common::OutputVisibility::None,
+                first_run_complete: false,
             },
             sources: vec!["~/.config/rch/config.toml".to_string()],
             value_sources: None,

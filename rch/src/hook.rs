@@ -93,6 +93,42 @@ fn format_duration_ms(duration: Duration) -> String {
     }
 }
 
+fn estimate_local_time_ms(remote_ms: u64, worker_speed_score: f64) -> Option<u64> {
+    if remote_ms == 0 || worker_speed_score <= 0.0 {
+        return None;
+    }
+    let normalized = worker_speed_score.clamp(1.0, 100.0);
+    let estimate = (remote_ms as f64) * (100.0 / normalized);
+    Some(estimate.round().max(1.0) as u64)
+}
+
+fn emit_first_run_message(worker: &SelectedWorker, remote_ms: u64, local_ms: Option<u64>) {
+    let divider = "----------------------------------------";
+    let remote = format_duration_ms(Duration::from_millis(remote_ms));
+
+    eprintln!();
+    eprintln!("{}", divider);
+    eprintln!("First remote build complete!");
+    eprintln!();
+
+    if let Some(local_ms) = local_ms {
+        let local = format_duration_ms(Duration::from_millis(local_ms));
+        eprintln!(
+            "Your build ran on '{}' in {} (local estimate ~{}).",
+            worker.id, remote, local
+        );
+    } else {
+        eprintln!("Your build ran on '{}' in {}.", worker.id, remote);
+    }
+
+    eprintln!("RCH will run silently in the background from now on.");
+    eprintln!();
+    eprintln!("To see build activity: rch status --jobs");
+    eprintln!("To disable this message: rch config set first_run_complete true");
+    eprintln!("{}", divider);
+    eprintln!();
+}
+
 /// Process a hook request and return the output.
 async fn process_hook(input: HookInput) -> HookOutput {
     // Tier 0: Only process Bash tool
@@ -258,6 +294,16 @@ async fn process_hook(input: HookInput) -> HookOutput {
                             worker.id,
                             format_duration_ms(remote_elapsed)
                         ));
+
+                        if !config.output.first_run_complete {
+                            let local_estimate =
+                                estimate_local_time_ms(result.duration_ms, worker.speed_score);
+                            emit_first_run_message(&worker, result.duration_ms, local_estimate);
+                            if let Err(e) = crate::config::set_first_run_complete(true) {
+                                warn!("Failed to persist first_run_complete: {}", e);
+                            }
+                        }
+
                         HookOutput::deny(
                             "RCH: Command executed successfully on remote worker".to_string(),
                         )
@@ -464,6 +510,8 @@ struct RemoteExecutionResult {
     exit_code: i32,
     /// Standard error output (used for toolchain detection).
     stderr: String,
+    /// Remote command duration in milliseconds.
+    duration_ms: u64,
 }
 
 /// Check if the failure is a toolchain-related infrastructure failure.
@@ -631,6 +679,7 @@ async fn execute_remote_compilation(
     Ok(RemoteExecutionResult {
         exit_code: result.exit_code,
         stderr: stderr_capture,
+        duration_ms: result.duration_ms,
     })
 }
 

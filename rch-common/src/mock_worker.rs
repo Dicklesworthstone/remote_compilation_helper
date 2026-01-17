@@ -115,3 +115,57 @@ fn normalize_uri(uri: String) -> String {
         format!("mock://{}", uri)
     }
 }
+
+#[cfg(test)]
+#[allow(unsafe_code)]
+mod tests {
+    use super::*;
+    use crate::mock::{clear_mock_overrides, is_mock_enabled};
+    use std::env;
+
+    fn clear_env() {
+        // SAFETY: Tests control env var lifecycle within the module.
+        unsafe { env::remove_var("RCH_MOCK_SSH") };
+    }
+
+    #[test]
+    fn test_default_uri_prefix_and_uniqueness() {
+        let server_a = MockWorkerServer::builder().build();
+        let server_b = MockWorkerServer::builder().build();
+
+        assert!(server_a.uri().starts_with("mock://worker-"));
+        assert!(server_b.uri().starts_with("mock://worker-"));
+        assert_ne!(server_a.uri(), server_b.uri());
+    }
+
+    #[test]
+    fn test_bind_normalizes_uri() {
+        let server = MockWorkerServer::builder().bind("localhost:9900").build();
+        assert_eq!(server.uri(), "mock://localhost:9900");
+    }
+
+    #[test]
+    fn test_bind_preserves_mock_prefix() {
+        let server = MockWorkerServer::builder()
+            .bind("mock://example:1234")
+            .build();
+        assert_eq!(server.uri(), "mock://example:1234");
+    }
+
+    #[test]
+    fn test_start_stop_toggles_mock_enabled() {
+        clear_env();
+        clear_mock_overrides();
+
+        let mut server = MockWorkerServer::builder().bind("worker-a").build();
+        assert!(!is_mock_enabled());
+
+        server.start();
+        assert!(is_mock_enabled());
+
+        server.stop();
+        assert!(!is_mock_enabled());
+
+        clear_mock_overrides();
+    }
+}

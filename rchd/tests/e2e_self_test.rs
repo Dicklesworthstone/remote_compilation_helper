@@ -1,6 +1,7 @@
 //! E2E tests for self-test infrastructure (hash verification + remote compilation).
 
 use anyhow::{Context, Result, bail};
+use chrono::Utc;
 use rch_common::binary_hash::compute_binary_hash;
 use rch_common::e2e::RustProjectFixture;
 use rch_common::remote_compilation::RemoteCompilationTest;
@@ -12,7 +13,6 @@ use tempfile::TempDir;
 use tokio::process::Command;
 use tokio::time::sleep;
 use tracing::info;
-use chrono::Utc;
 
 fn init_test_logging() {
     let _ = tracing_subscriber::fmt()
@@ -44,7 +44,13 @@ async fn build_release(project_dir: &Path) -> Result<()> {
 fn binary_path(project_dir: &Path, name: &str) -> std::path::PathBuf {
     let target_dir = std::env::var_os("CARGO_TARGET_DIR")
         .map(std::path::PathBuf::from)
-        .map(|path| if path.is_absolute() { path } else { project_dir.join(path) })
+        .map(|path| {
+            if path.is_absolute() {
+                path
+            } else {
+                project_dir.join(path)
+            }
+        })
         .unwrap_or_else(|| project_dir.join("target"));
 
     target_dir.join("release").join(name)

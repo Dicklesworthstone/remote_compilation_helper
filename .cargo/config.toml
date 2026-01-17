@@ -1,0 +1,6 @@
+[llvm-cov]
+exclude = [
+    "*/tests/*",
+    "*/benches/*",
+    "*/examples/*",
+]

@@ -146,6 +146,7 @@ struct PartialCircuitConfig {
 #[derive(Debug, Default, Deserialize)]
 struct PartialOutputConfig {
     visibility: Option<OutputVisibility>,
+    first_run_complete: Option<bool>,
 }
 
 /// Load configuration with source tracking.
@@ -418,6 +419,7 @@ fn default_sources_map() -> ConfigSourceMap {
         "circuit.open_cooldown_secs",
         "circuit.half_open_max_probes",
         "output.visibility",
+        "output.first_run_complete",
     ] {
         sources.insert(key.to_string(), ConfigValueSource::Default);
     }
@@ -519,6 +521,12 @@ fn apply_layer(
         if visibility != defaults.output.visibility {
             config.output.visibility = visibility;
             set_source(sources, "output.visibility", source.clone());
+        }
+    }
+    if let Some(first_run_complete) = layer.output.first_run_complete {
+        if first_run_complete != defaults.output.first_run_complete {
+            config.output.first_run_complete = first_run_complete;
+            set_source(sources, "output.first_run_complete", source.clone());
         }
     }
 }
@@ -645,12 +653,43 @@ fn merge_output(
     if overlay.visibility != default.visibility {
         base.visibility = overlay.visibility;
     }
+    if overlay.first_run_complete != default.first_run_complete {
+        base.first_run_complete = overlay.first_run_complete;
+    }
 }
 
 /// Apply environment variable overrides.
 fn apply_env_overrides(mut config: RchConfig) -> RchConfig {
     apply_env_overrides_inner(&mut config, None, None);
     config
+}
+
+/// Persist the first-run completion flag in the user config.
+#[allow(dead_code)] // Reserved for future CLI usage (first-run UX)
+pub fn set_first_run_complete(value: bool) -> Result<()> {
+    let config_dir = config_dir().context("Could not determine config directory")?;
+    std::fs::create_dir_all(&config_dir)
+        .with_context(|| format!("Failed to create config directory: {:?}", config_dir))?;
+    let config_path = config_dir.join("config.toml");
+
+    let mut config = if config_path.exists() {
+        let contents = std::fs::read_to_string(&config_path)
+            .with_context(|| format!("Failed to read {:?}", config_path))?;
+        toml::from_str::<RchConfig>(&contents)
+            .with_context(|| format!("Failed to parse {:?}", config_path))?
+    } else {
+        RchConfig::default()
+    };
+
+    if config.output.first_run_complete == value {
+        return Ok(());
+    }
+
+    config.output.first_run_complete = value;
+    let contents = toml::to_string_pretty(&config)?;
+    std::fs::write(&config_path, format!("{}\n", contents))
+        .with_context(|| format!("Failed to write {:?}", config_path))?;
+    Ok(())
 }
 
 fn apply_env_overrides_inner(
@@ -1518,5 +1557,90 @@ total_slots = 4
         );
 
         info!("PASS: Real-world project config scenario works correctly");
+    }
+
+    #[test]
+    fn test_apply_env_overrides_enabled_false() {
+        info!("TEST: test_apply_env_overrides_enabled_false");
+        let mut config = RchConfig::default();
+        let mut sources = default_sources_map();
+        let mut env_overrides: HashMap<String, String> = HashMap::new();
+        env_overrides.insert("RCH_ENABLED".to_string(), "false".to_string());
+
+        apply_env_overrides_inner(&mut config, Some(&mut sources), Some(&env_overrides));
+
+        info!("RESULT: enabled={}", config.general.enabled);
+        assert!(
+            !config.general.enabled,
+            "expected RCH_ENABLED=false to disable"
+        );
+        let source = sources
+            .get("general.enabled")
+            .expect("general.enabled source present");
+        assert_eq!(
+            source,
+            &ConfigValueSource::EnvVar("RCH_ENABLED".to_string())
+        );
+        info!("PASS: RCH_ENABLED override applied with source tracking");
+    }
+
+    #[test]
+    fn test_apply_env_overrides_visibility_precedence() {
+        info!("TEST: test_apply_env_overrides_visibility_precedence");
+        let mut config = RchConfig::default();
+        let mut sources = default_sources_map();
+        let mut env_overrides: HashMap<String, String> = HashMap::new();
+        env_overrides.insert("RCH_VISIBILITY".to_string(), "verbose".to_string());
+        env_overrides.insert("RCH_VERBOSE".to_string(), "true".to_string());
+        env_overrides.insert("RCH_QUIET".to_string(), "1".to_string());
+
+        apply_env_overrides_inner(&mut config, Some(&mut sources), Some(&env_overrides));
+
+        info!("RESULT: visibility={:?}", config.output.visibility);
+        assert_eq!(config.output.visibility, OutputVisibility::None);
+        let source = sources
+            .get("output.visibility")
+            .expect("output.visibility source present");
+        assert_eq!(source, &ConfigValueSource::EnvVar("RCH_QUIET".to_string()));
+        info!("PASS: RCH_QUIET takes precedence over visibility/verbose");
+    }
+
+    #[test]
+    fn test_validate_workers_duplicate_ids() {
+        info!("TEST: test_validate_workers_duplicate_ids");
+        let identity = NamedTempFile::new().expect("create identity file");
+        let mut file = NamedTempFile::new().expect("create workers config file");
+
+        let workers_toml = format!(
+            r#"
+[[workers]]
+id = "dup"
+host = "127.0.0.1"
+identity_file = "{}"
+total_slots = 4
+
+[[workers]]
+id = "dup"
+host = "127.0.0.2"
+identity_file = "{}"
+total_slots = 8
+"#,
+            identity.path().display(),
+            identity.path().display()
+        );
+
+        std::io::Write::write_all(file.as_file_mut(), workers_toml.as_bytes())
+            .expect("write workers config");
+
+        let result = validate_workers_config_file(file.path());
+        info!("RESULT: errors={:?}", result.errors);
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.contains("Duplicate worker id")),
+            "expected duplicate worker id error"
+        );
+        info!("PASS: duplicate worker ids are detected");
     }
 }

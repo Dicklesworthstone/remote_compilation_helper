@@ -346,12 +346,16 @@ pub struct OutputConfig {
     /// Output visibility level for hook messages.
     #[serde(default = "default_output_visibility")]
     pub visibility: OutputVisibility,
+    /// Whether the first-run success message has been shown.
+    #[serde(default)]
+    pub first_run_complete: bool,
 }
 
 impl Default for OutputConfig {
     fn default() -> Self {
         Self {
             visibility: OutputVisibility::None,
+            first_run_complete: false,
         }
     }
 }
