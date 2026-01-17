@@ -10,32 +10,9 @@
 
 #![allow(dead_code)]
 
-use serde::{Deserialize, Serialize};
+use rch_common::ToolchainInfo;
 use std::path::Path;
 use std::process::Command;
-
-/// Detected Rust toolchain information.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ToolchainInfo {
-    /// The channel: "stable", "beta", "nightly", or specific version like "1.75.0".
-    pub channel: String,
-    /// Optional date for nightly/beta: "2024-01-15".
-    pub date: Option<String>,
-    /// Full version string from rustc --version.
-    pub full_version: String,
-}
-
-impl ToolchainInfo {
-    /// Format for rustup run command.
-    ///
-    /// Returns the toolchain identifier suitable for `rustup run <toolchain>`.
-    pub fn rustup_toolchain(&self) -> String {
-        match &self.date {
-            Some(date) => format!("{}-{}", self.channel, date),
-            None => self.channel.clone(),
-        }
-    }
-}
 
 /// Errors that can occur during toolchain detection.
 #[derive(Debug, thiserror::Error)]
