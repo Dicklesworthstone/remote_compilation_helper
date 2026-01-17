@@ -7,6 +7,7 @@
 #![deny(unsafe_code)]
 
 pub mod config;
+pub mod discovery;
 pub mod mock;
 pub mod patterns;
 #[cfg(test)]
@@ -30,4 +31,10 @@ pub use types::{
 // Config module re-exports
 pub use config::{
     ConfigSource, ConfigWarning, EnvError, EnvParser, Profile, Severity, Sourced, validate_config,
+};
+
+// Discovery module re-exports
+pub use discovery::{
+    DiscoveredHost, DiscoverySource, discover_all, parse_shell_aliases, parse_shell_aliases_content,
+    parse_ssh_config, parse_ssh_config_content,
 };
