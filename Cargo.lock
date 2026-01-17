@@ -2165,10 +2165,13 @@ name = "rch-telemetry"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "fastrand",
  "serde",
  "serde_json",
+ "shellexpand",
  "tempfile",
  "thiserror 2.0.17",
+ "tokio",
  "tracing",
  "tracing-subscriber",
 ]

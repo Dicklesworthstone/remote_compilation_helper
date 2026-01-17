@@ -19,6 +19,10 @@ pub use benchmarks::compilation::{
 pub use benchmarks::cpu::{CpuBenchmark, CpuBenchmarkResult};
 pub use benchmarks::disk::{DiskBenchmark, DiskBenchmarkResult};
 pub use benchmarks::memory::{MemoryBenchmark, MemoryBenchmarkResult};
+pub use benchmarks::network::{
+    NetworkBenchmark, NetworkBenchmarkError, NetworkBenchmarkResult, WorkerConnection,
+    calculate_latency_stats,
+};
 pub use collect::disk::{
     DiskCollector, DiskError, DiskMetrics, DiskStats, DiskTelemetry, FileDescriptorStats,
 };

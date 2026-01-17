@@ -13,6 +13,7 @@ pub mod compilation;
 pub mod cpu;
 pub mod disk;
 pub mod memory;
+pub mod network;
 
 pub use compilation::{
     CompilationBenchmark, CompilationBenchmarkError, CompilationBenchmarkResult,
@@ -20,3 +21,7 @@ pub use compilation::{
 pub use cpu::{CpuBenchmark, CpuBenchmarkResult};
 pub use disk::{DiskBenchmark, DiskBenchmarkResult};
 pub use memory::{MemoryBenchmark, MemoryBenchmarkResult};
+pub use network::{
+    NetworkBenchmark, NetworkBenchmarkError, NetworkBenchmarkResult, WorkerConnection,
+    calculate_latency_stats,
+};
