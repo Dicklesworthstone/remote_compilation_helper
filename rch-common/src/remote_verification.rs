@@ -383,6 +383,143 @@ impl RemoteCompilationTest {
     }
 }
 
+#[cfg(test)]
+mod basic_tests {
+    use super::*;
+    use crate::types::{WorkerConfig, WorkerId};
+
+    fn sample_worker_config() -> WorkerConfig {
+        WorkerConfig {
+            id: WorkerId::new("worker-1"),
+            host: "example.com".to_string(),
+            user: "builder".to_string(),
+            identity_file: "/tmp/id_rsa".to_string(),
+            total_slots: 8,
+            priority: 100,
+            tags: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_verification_worker_config_from_worker_config() {
+        let worker = sample_worker_config();
+        let build_dir = PathBuf::from("/tmp/rch-build");
+        let verification = VerificationWorkerConfig::from_worker_config(&worker, build_dir.clone());
+
+        assert_eq!(verification.id, "worker-1");
+        assert_eq!(verification.ssh_host, "builder@example.com");
+        assert_eq!(
+            verification.identity_file,
+            Some(PathBuf::from("/tmp/id_rsa"))
+        );
+        assert_eq!(verification.build_dir, build_dir);
+    }
+
+    #[test]
+    fn test_remote_compilation_paths() {
+        let verification = VerificationWorkerConfig {
+            id: "worker-1".to_string(),
+            ssh_host: "builder@example.com".to_string(),
+            identity_file: Some(PathBuf::from("/tmp/id_rsa")),
+            build_dir: PathBuf::from("/tmp/rch-builds"),
+        };
+        let test_project = PathBuf::from("/tmp/test-project");
+        let test = RemoteCompilationTest::new(verification, test_project.clone());
+
+        assert_eq!(
+            test.local_binary_path(),
+            test_project.join("target/release/test-project")
+        );
+        assert_eq!(
+            test.remote_binary_path(),
+            test_project.join("target/release_remote/test-project")
+        );
+        assert_eq!(
+            test.remote_project_path(),
+            PathBuf::from("/tmp/rch-builds/self_test/test-project")
+        );
+    }
+
+    #[test]
+    fn test_ssh_args_with_identity() {
+        let verification = VerificationWorkerConfig {
+            id: "worker-1".to_string(),
+            ssh_host: "builder@example.com".to_string(),
+            identity_file: Some(PathBuf::from("/tmp/key.pem")),
+            build_dir: PathBuf::from("/tmp/rch-builds"),
+        };
+        let test = RemoteCompilationTest::new(verification, PathBuf::from("/tmp/project"));
+        let args = test.ssh_args();
+
+        assert!(args.contains(&"-i".to_string()));
+        assert!(args.contains(&"/tmp/key.pem".to_string()));
+        assert_eq!(args.last(), Some(&"builder@example.com".to_string()));
+    }
+
+    #[test]
+    fn test_ssh_args_without_identity() {
+        let verification = VerificationWorkerConfig {
+            id: "worker-1".to_string(),
+            ssh_host: "builder@example.com".to_string(),
+            identity_file: None,
+            build_dir: PathBuf::from("/tmp/rch-builds"),
+        };
+        let test = RemoteCompilationTest::new(verification, PathBuf::from("/tmp/project"));
+        let args = test.ssh_args();
+
+        assert!(!args.contains(&"-i".to_string()));
+        assert_eq!(args.last(), Some(&"builder@example.com".to_string()));
+    }
+
+    #[test]
+    fn test_rsync_ssh_option() {
+        let verification = VerificationWorkerConfig {
+            id: "worker-1".to_string(),
+            ssh_host: "builder@example.com".to_string(),
+            identity_file: Some(PathBuf::from("/tmp/key.pem")),
+            build_dir: PathBuf::from("/tmp/rch-builds"),
+        };
+        let test = RemoteCompilationTest::new(verification, PathBuf::from("/tmp/project"));
+
+        assert_eq!(
+            test.rsync_ssh_option(),
+            Some("ssh -o BatchMode=yes -i /tmp/key.pem".to_string())
+        );
+    }
+
+    fn dummy_hash() -> BinaryHashResult {
+        BinaryHashResult {
+            full_hash: "full".to_string(),
+            code_hash: "code".to_string(),
+            text_section_size: 123,
+            is_debug: false,
+        }
+    }
+
+    #[test]
+    fn test_speedup_factor() {
+        let result = VerificationResult {
+            success: true,
+            local_hash: dummy_hash(),
+            remote_hash: dummy_hash(),
+            rsync_up_ms: 10,
+            compilation_ms: 500,
+            rsync_down_ms: 10,
+            total_ms: 520,
+            error: None,
+        };
+
+        assert_eq!(result.speedup_factor(1000), Some(2.0));
+        assert_eq!(result.speedup_factor(0), None);
+
+        let zero_remote = VerificationResult {
+            compilation_ms: 0,
+            ..result
+        };
+        assert_eq!(zero_remote.speedup_factor(1000), None);
+    }
+}
+
 /// Quick verification that tests basic SSH connectivity to a worker.
 pub async fn verify_ssh_connectivity(worker: &VerificationWorkerConfig) -> Result<bool> {
     let mut cmd = Command::new("ssh");
