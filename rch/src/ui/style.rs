@@ -163,6 +163,7 @@ pub struct Style {
     pub colors: SemanticColors,
     pub symbols: Symbols,
     pub colors_enabled: bool,
+    supports_unicode: bool,
 }
 
 impl Style {
@@ -172,7 +173,13 @@ impl Style {
             colors: SemanticColors::default(),
             symbols: Symbols::for_unicode(supports_unicode),
             colors_enabled,
+            supports_unicode,
         }
+    }
+
+    /// Check if unicode symbols are supported.
+    pub fn supports_unicode(&self) -> bool {
+        self.supports_unicode
     }
 
     /// Apply success styling to text.
