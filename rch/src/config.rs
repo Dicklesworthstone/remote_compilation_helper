@@ -71,6 +71,7 @@ fn merge_config(_base: RchConfig, overlay: RchConfig) -> RchConfig {
         general: overlay.general,
         compilation: overlay.compilation,
         transfer: overlay.transfer,
+        circuit: overlay.circuit,
     }
 }
 

@@ -4,6 +4,7 @@
 //! and routes compilation commands to remote workers.
 
 use crate::config::load_config;
+use crate::toolchain::detect_toolchain;
 use crate::transfer::{
     TransferPipeline, compute_project_hash, default_rust_artifact_patterns, project_id_from_path,
 };
@@ -288,7 +289,12 @@ async fn execute_remote_compilation(
     );
 
     // Create transfer pipeline
-    let pipeline = TransferPipeline::new(project_root, project_id, project_hash, transfer_config);
+    let pipeline = TransferPipeline::new(
+        project_root.clone(),
+        project_id,
+        project_hash,
+        transfer_config,
+    );
 
     // Step 1: Sync project to remote
     info!("Syncing project to worker {}...", worker_config.id);
@@ -298,16 +304,27 @@ async fn execute_remote_compilation(
         sync_result.files_transferred, sync_result.bytes_transferred, sync_result.duration_ms
     );
 
+    // Detect toolchain
+    let toolchain = match detect_toolchain(&project_root) {
+        Ok(tc) => {
+            debug!("Detected toolchain: {}", tc);
+            Some(tc)
+        }
+        Err(e) => {
+            warn!("Failed to detect toolchain: {}", e);
+            None
+        }
+    };
+
     // Step 2: Execute command remotely with streaming output
     info!("Executing command remotely: {}", command);
 
     // Stream stdout/stderr to our stderr so the agent sees the output
-    // TODO: Integrate toolchain detection here once fully wired up
     let result = pipeline
         .execute_remote_streaming(
             &worker_config,
             command,
-            None, // Toolchain - will be integrated with detect_toolchain
+            toolchain.as_ref(),
             |line| {
                 // Write stdout lines to stderr (hook stdout is for protocol)
                 eprintln!("{}", line);
