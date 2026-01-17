@@ -2161,6 +2161,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "rch-telemetry"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.17",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "rch-wkr"
 version = "0.1.0"
 dependencies = [

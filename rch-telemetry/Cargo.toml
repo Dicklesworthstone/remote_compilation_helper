@@ -1,0 +1,20 @@
+[package]
+name = "rch-telemetry"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Telemetry collection for Remote Compilation Helper workers"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3.19"
+tracing-subscriber = { workspace = true }
+
+[lints.rust]
+unsafe_code = "deny"

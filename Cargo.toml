@@ -5,6 +5,7 @@ members = [
     "rchd",
     "rch-wkr",
     "rch-common",
+    "rch-telemetry",
 ]
 
 [workspace.package]
