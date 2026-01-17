@@ -81,7 +81,27 @@ impl WorkerState {
 
     /// Release slots after a job completes.
     pub fn release_slots(&self, count: u32) {
-        self.used_slots.fetch_sub(count, Ordering::SeqCst);
+        let mut current = self.used_slots.load(Ordering::Relaxed);
+        loop {
+            let new_val = current.saturating_sub(count);
+            
+            if count > current {
+                tracing::warn!(
+                    "Worker {}: attempted to release {} slots but only {} in use",
+                    self.config.id, count, current
+                );
+            }
+
+            match self.used_slots.compare_exchange(
+                current,
+                new_val,
+                Ordering::SeqCst,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
     }
 
     /// Check if this worker has a cached copy of a project.

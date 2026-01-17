@@ -23,6 +23,7 @@ enum ApiRequest {
     SelectWorker(SelectionRequest),
     ReleaseWorker(ReleaseRequest),
     Status,
+    Shutdown,
 }
 
 // ============================================================================
@@ -119,7 +120,11 @@ pub struct Issue {
 }
 
 /// Handle an incoming connection on the Unix socket.
-pub async fn handle_connection(stream: UnixStream, ctx: DaemonContext) -> Result<()> {
+pub async fn handle_connection(
+    stream: UnixStream,
+    ctx: DaemonContext,
+    shutdown_tx: tokio::sync::mpsc::Sender<()>,
+) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
@@ -146,6 +151,10 @@ pub async fn handle_connection(stream: UnixStream, ctx: DaemonContext) -> Result
         Ok(ApiRequest::Status) => {
             let status = handle_status(&ctx).await?;
             serde_json::to_string(&status)?
+        }
+        Ok(ApiRequest::Shutdown) => {
+            let _ = shutdown_tx.send(()).await;
+            "{\"status\":\"shutting_down\"}".to_string()
         }
         Err(e) => return Err(e),
     };
@@ -175,6 +184,10 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
 
     if method != "GET" && method != "POST" {
         return Err(anyhow!("Only GET and POST methods supported"));
+    }
+
+    if path == "/shutdown" && method == "POST" {
+        return Ok(ApiRequest::Shutdown);
     }
 
     if path == "/status" {

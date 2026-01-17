@@ -14,12 +14,13 @@ use serde::{Deserialize, Serialize};
 /// Used for SIMD-accelerated quick filtering (Tier 2).
 pub static COMPILATION_KEYWORDS: &[&str] = &[
     "cargo", "rustc", "gcc", "g++", "clang", "clang++", "make", "cmake", "ninja", "meson", "cc",
-    "c++",
+    "c++", "bun",
 ];
 
 /// Commands that should NEVER be intercepted, even if they contain compilation keywords.
 /// These either modify local state or have dependencies on local execution.
 pub static NEVER_INTERCEPT: &[&str] = &[
+    // Cargo commands that modify local state or shouldn't be intercepted
     "cargo install",
     "cargo publish",
     "cargo login",
@@ -35,6 +36,7 @@ pub static NEVER_INTERCEPT: &[&str] = &[
     "cargo watch",
     "cargo --version",
     "cargo -V",
+    // Compiler version checks
     "rustc --version",
     "rustc -V",
     "gcc --version",
@@ -44,6 +46,27 @@ pub static NEVER_INTERCEPT: &[&str] = &[
     "make --version",
     "make -v",
     "cmake --version",
+    // Bun package management - MUST NOT intercept (modifies local state)
+    "bun install",
+    "bun add",
+    "bun remove",
+    "bun link",
+    "bun unlink",
+    "bun pm",
+    "bun init",
+    "bun create",
+    "bun upgrade",
+    "bun completions",
+    // Bun execution that shouldn't be intercepted
+    "bun run",
+    "bun build",
+    "bun --help",
+    "bun -h",
+    "bun --version",
+    "bun -v",
+    // Bun dev/repl - require local interactivity
+    "bun dev",
+    "bun repl",
 ];
 
 /// Result of command classification.
@@ -85,6 +108,7 @@ impl Classification {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CompilationKind {
+    // Rust commands
     /// cargo build, cargo test, cargo check, etc.
     CargoBuild,
     CargoTest,
@@ -93,6 +117,8 @@ pub enum CompilationKind {
     CargoDoc,
     /// rustc invocation
     Rustc,
+
+    // C/C++ commands
     /// GCC compilation
     Gcc,
     /// G++ compilation
@@ -101,6 +127,8 @@ pub enum CompilationKind {
     Clang,
     /// Clang++ compilation
     Clangpp,
+
+    // Build systems
     /// make build
     Make,
     /// cmake --build
@@ -109,6 +137,12 @@ pub enum CompilationKind {
     Ninja,
     /// meson compile
     Meson,
+
+    // Bun commands
+    /// bun test - Runs Bun's built-in test runner
+    BunTest,
+    /// bun typecheck - Runs TypeScript type checking
+    BunTypecheck,
 }
 
 /// Classify a shell command.
@@ -342,6 +376,44 @@ fn classify_full(cmd: &str) -> Classification {
         return Classification::compilation(CompilationKind::Meson, 0.85, "meson compile");
     }
 
+    // Bun commands
+    if cmd.starts_with("bun ") {
+        let rest = &cmd[4..]; // Skip "bun "
+
+        // bun test [options] [patterns]
+        // Examples: "bun test", "bun test --watch", "bun test src/"
+        if rest.starts_with("test") {
+            let after_test = &rest[4..];
+            // Ensure it's "test" or "test " (not "testing")
+            if after_test.is_empty() || after_test.starts_with(' ') {
+                return Classification::compilation(
+                    CompilationKind::BunTest,
+                    0.95,
+                    "bun test command",
+                );
+            }
+        }
+
+        // bun typecheck [options]
+        // Examples: "bun typecheck", "bun typecheck --watch"
+        if rest.starts_with("typecheck") {
+            let after = &rest[9..];
+            if after.is_empty() || after.starts_with(' ') {
+                return Classification::compilation(
+                    CompilationKind::BunTypecheck,
+                    0.95,
+                    "bun typecheck command",
+                );
+            }
+        }
+
+        // bun x (alias for bunx - package runner)
+        // NOT intercepted - similar to npx, runs arbitrary packages
+        if rest.starts_with("x ") {
+            return Classification::not_compilation("bun x runs arbitrary packages");
+        }
+    }
+
     Classification::not_compilation("no matching pattern")
 }
 
@@ -465,5 +537,166 @@ mod tests {
     fn test_empty_command() {
         let result = classify_command("");
         assert!(!result.is_compilation);
+    }
+
+    // Bun tests - keyword detection and never-intercept patterns
+
+    #[test]
+    fn test_bun_keyword_detected() {
+        // Verify "bun" triggers keyword detection (Tier 2 passes)
+        assert!(contains_compilation_keyword("bun test"));
+        assert!(contains_compilation_keyword("bun typecheck"));
+        assert!(contains_compilation_keyword("bun install")); // keyword present, but will be blocked in Tier 3
+    }
+
+    #[test]
+    fn test_bun_install_not_intercepted() {
+        // Package management - modifies node_modules
+        let result = classify_command("bun install");
+        assert!(!result.is_compilation);
+        assert!(result.reason.contains("never-intercept"));
+    }
+
+    #[test]
+    fn test_bun_add_not_intercepted() {
+        // Adding packages - modifies package.json and node_modules
+        let result = classify_command("bun add lodash");
+        assert!(!result.is_compilation);
+        assert!(result.reason.contains("never-intercept"));
+    }
+
+    #[test]
+    fn test_bun_remove_not_intercepted() {
+        let result = classify_command("bun remove lodash");
+        assert!(!result.is_compilation);
+        assert!(result.reason.contains("never-intercept"));
+    }
+
+    #[test]
+    fn test_bun_run_not_intercepted() {
+        // Generic script runner - could do anything
+        let result = classify_command("bun run build");
+        assert!(!result.is_compilation);
+        assert!(result.reason.contains("never-intercept"));
+    }
+
+    #[test]
+    fn test_bun_build_not_intercepted() {
+        // Creates bundles in local directory
+        let result = classify_command("bun build ./src/index.ts");
+        assert!(!result.is_compilation);
+        assert!(result.reason.contains("never-intercept"));
+    }
+
+    #[test]
+    fn test_bun_version_not_intercepted() {
+        let result = classify_command("bun --version");
+        assert!(!result.is_compilation);
+        assert!(result.reason.contains("never-intercept"));
+
+        let result = classify_command("bun -v");
+        assert!(!result.is_compilation);
+        assert!(result.reason.contains("never-intercept"));
+    }
+
+    #[test]
+    fn test_bun_dev_not_intercepted() {
+        // Development server needs local ports
+        let result = classify_command("bun dev");
+        assert!(!result.is_compilation);
+        assert!(result.reason.contains("never-intercept"));
+    }
+
+    #[test]
+    fn test_bun_repl_not_intercepted() {
+        // Interactive REPL
+        let result = classify_command("bun repl");
+        assert!(!result.is_compilation);
+        assert!(result.reason.contains("never-intercept"));
+    }
+
+    #[test]
+    fn test_bun_link_not_intercepted() {
+        let result = classify_command("bun link");
+        assert!(!result.is_compilation);
+        assert!(result.reason.contains("never-intercept"));
+    }
+
+    #[test]
+    fn test_bun_init_not_intercepted() {
+        let result = classify_command("bun init");
+        assert!(!result.is_compilation);
+        assert!(result.reason.contains("never-intercept"));
+    }
+
+    #[test]
+    fn test_bun_create_not_intercepted() {
+        let result = classify_command("bun create next-app");
+        assert!(!result.is_compilation);
+        assert!(result.reason.contains("never-intercept"));
+    }
+
+    #[test]
+    fn test_bun_pm_not_intercepted() {
+        let result = classify_command("bun pm cache");
+        assert!(!result.is_compilation);
+        assert!(result.reason.contains("never-intercept"));
+    }
+
+    #[test]
+    fn test_bun_help_not_intercepted() {
+        let result = classify_command("bun --help");
+        assert!(!result.is_compilation);
+        assert!(result.reason.contains("never-intercept"));
+
+        let result = classify_command("bun -h");
+        assert!(!result.is_compilation);
+        assert!(result.reason.contains("never-intercept"));
+    }
+
+    #[test]
+    fn test_bun_test_passes_tier3() {
+        // bun test should NOT be blocked by never-intercept
+        // It will reach Tier 4 and fail with "no matching pattern" for now
+        // (until BunTest classification is added in a subsequent bead)
+        let result = classify_command("bun test");
+        // Currently fails Tier 4 because BunTest isn't implemented yet
+        // But it should NOT have been blocked by Tier 3
+        assert!(!result.reason.contains("never-intercept"));
+    }
+
+    #[test]
+    fn test_bun_typecheck_passes_tier3() {
+        // bun typecheck should NOT be blocked by never-intercept
+        let result = classify_command("bun typecheck");
+        // Should reach Tier 4 (not blocked by Tier 3)
+        assert!(!result.reason.contains("never-intercept"));
+    }
+
+    // Bun CompilationKind serialization tests
+
+    #[test]
+    fn test_bun_compilation_kind_serde() {
+        // BunTest serialization
+        let kind = CompilationKind::BunTest;
+        let json = serde_json::to_string(&kind).unwrap();
+        assert_eq!(json, "\"bun_test\"");
+        let parsed: CompilationKind = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, CompilationKind::BunTest);
+
+        // BunTypecheck serialization
+        let kind = CompilationKind::BunTypecheck;
+        let json = serde_json::to_string(&kind).unwrap();
+        assert_eq!(json, "\"bun_typecheck\"");
+        let parsed: CompilationKind = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, CompilationKind::BunTypecheck);
+    }
+
+    #[test]
+    fn test_bun_kinds_are_distinct() {
+        // BunTest and BunTypecheck are different
+        assert_ne!(CompilationKind::BunTest, CompilationKind::BunTypecheck);
+        // BunTest is different from CargoTest (different ecosystems)
+        assert_ne!(CompilationKind::BunTest, CompilationKind::CargoTest);
     }
 }

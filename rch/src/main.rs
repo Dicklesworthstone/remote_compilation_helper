@@ -8,6 +8,7 @@
 
 pub mod agent;
 mod commands;
+mod completions;
 mod config;
 mod doctor;
 pub mod error;
@@ -184,20 +185,33 @@ compilation commands to remote workers."#)]
         action: AgentsAction,
     },
 
-    /// Generate shell completion scripts
+    /// Generate and install shell completion scripts
     #[command(after_help = r#"EXAMPLES:
-    # Bash (add to ~/.bashrc)
-    rch completions bash > ~/.local/share/bash-completion/completions/rch
+    # Generate completions to stdout
+    rch completions generate bash > ~/.local/share/bash-completion/completions/rch
 
-    # Zsh (add to ~/.zshrc: fpath=(~/.zsh/completion $fpath))
-    rch completions zsh > ~/.zsh/completion/_rch
+    # Install completions automatically (recommended)
+    rch completions install bash
+    rch completions install zsh
+    rch completions install fish
 
-    # Fish
-    rch completions fish > ~/.config/fish/completions/rch.fish"#)]
+    # Install for current shell (auto-detected)
+    rch completions install
+
+    # Check installation status
+    rch completions status
+
+    # Uninstall completions
+    rch completions uninstall bash
+
+INSTALL LOCATIONS:
+    Bash:       ~/.local/share/bash-completion/completions/rch
+    Zsh:        ~/.zfunc/_rch (adds fpath to .zshrc)
+    Fish:       ~/.config/fish/completions/rch.fish
+    PowerShell: ~/.config/powershell/rch.ps1"#)]
     Completions {
-        /// Shell to generate completions for
-        #[arg(value_enum)]
-        shell: clap_complete::Shell,
+        #[command(subcommand)]
+        action: CompletionsAction,
     },
 
     /// Run comprehensive diagnostics and optionally auto-fix issues
@@ -382,6 +396,36 @@ enum AgentsAction {
     },
 }
 
+#[derive(Subcommand)]
+enum CompletionsAction {
+    /// Generate completion script to stdout
+    Generate {
+        /// Shell to generate completions for
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
+    /// Install completions to standard shell locations
+    Install {
+        /// Shell to install completions for (auto-detected if omitted)
+        #[arg(value_enum)]
+        shell: Option<clap_complete::Shell>,
+        /// Show what would be done without making changes
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Uninstall completions
+    Uninstall {
+        /// Shell to uninstall completions for
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+        /// Show what would be done without making changes
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Show completion installation status for all shells
+    Status,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Handle dynamic shell completions (exits if handling a completion request)
@@ -426,10 +470,7 @@ async fn main() -> Result<()> {
             Commands::Config { action } => handle_config(action, &ctx).await,
             Commands::Hook { action } => handle_hook(action, &ctx).await,
             Commands::Agents { action } => handle_agents(action, &ctx).await,
-            Commands::Completions { shell } => {
-                generate_completions(shell);
-                Ok(())
-            }
+            Commands::Completions { action } => handle_completions(action, &ctx),
             Commands::Doctor { fix, install_deps } => handle_doctor(fix, install_deps, &ctx).await,
             Commands::Update {
                 check,
@@ -612,7 +653,32 @@ async fn handle_update(
     .map_err(|e| anyhow::anyhow!("{}", e))
 }
 
-/// Generate shell completion scripts for static installation
-fn generate_completions(shell: clap_complete::Shell) {
-    clap_complete::generate(shell, &mut Cli::command(), "rch", &mut std::io::stdout());
+/// Handle completions subcommands
+fn handle_completions(action: CompletionsAction, ctx: &OutputContext) -> Result<()> {
+    match action {
+        CompletionsAction::Generate { shell } => {
+            clap_complete::generate(shell, &mut Cli::command(), "rch", &mut std::io::stdout());
+            Ok(())
+        }
+        CompletionsAction::Install { shell, dry_run } => {
+            let shell = shell.or_else(completions::detect_current_shell).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Could not detect current shell. Please specify a shell explicitly:\n\
+                     rch completions install bash\n\
+                     rch completions install zsh\n\
+                     rch completions install fish"
+                )
+            })?;
+            completions::install_completions(shell, ctx, dry_run)?;
+            Ok(())
+        }
+        CompletionsAction::Uninstall { shell, dry_run } => {
+            completions::uninstall_completions(shell, ctx, dry_run)?;
+            Ok(())
+        }
+        CompletionsAction::Status => {
+            completions::show_status(ctx)?;
+            Ok(())
+        }
+    }
 }

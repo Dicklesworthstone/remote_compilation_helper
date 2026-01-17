@@ -521,7 +521,7 @@ impl BoxStyle {
             let left_border = border_chars.left.to_string();
             let right_border = border_chars.right.to_string();
 
-            let line = if colors_enabled {
+            if colors_enabled {
                 if let Some(color) = self.border_color {
                     format!(
                         "{}{}{}{}{}{}",
@@ -553,8 +553,7 @@ impl BoxStyle {
                     padding_right,
                     right_border
                 )
-            };
-            line
+            }
         } else {
             format!(
                 "{}{}{}{}",
@@ -578,11 +577,7 @@ impl BoxStyle {
 
         // Calculate padding for alignment
         let line_width = UnicodeWidthStr::width(line) as u16;
-        let space_available = if inner_width > line_width {
-            inner_width - line_width
-        } else {
-            0
-        };
+        let space_available = inner_width.saturating_sub(line_width);
 
         let (left_pad, right_pad) = match self.align {
             Align::Left => (0, space_available),

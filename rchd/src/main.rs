@@ -18,6 +18,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::net::UnixListener;
+use tokio::sync::mpsc;
 use tracing::{info, warn};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
@@ -145,23 +146,48 @@ async fn main() -> Result<()> {
     // Start health monitor
     let health_config = health::HealthConfig::default();
     let health_monitor = health::HealthMonitor::new(worker_pool.clone(), health_config);
-    let _health_handle = health_monitor.start();
+    let health_handle = health_monitor.start();
     info!("Health monitor started");
+
+    // Shutdown channel
+    let (shutdown_tx, mut shutdown_rx) = mpsc::channel(1);
 
     // Main accept loop
     loop {
-        match listener.accept().await {
-            Ok((stream, _addr)) => {
-                let ctx = context.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = api::handle_connection(stream, ctx).await {
-                        warn!("Connection error: {}", e);
+        tokio::select! {
+            accept_result = listener.accept() => {
+                match accept_result {
+                    Ok((stream, _addr)) => {
+                        let ctx = context.clone();
+                        let tx = shutdown_tx.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = api::handle_connection(stream, ctx, tx).await {
+                                warn!("Connection error: {}", e);
+                            }
+                        });
                     }
-                });
+                    Err(e) => {
+                        warn!("Accept error: {}", e);
+                    }
+                }
             }
-            Err(e) => {
-                warn!("Accept error: {}", e);
+            _ = shutdown_rx.recv() => {
+                info!("Shutdown signal received");
+                break;
             }
         }
     }
+
+    // Graceful shutdown
+    info!("Stopping health monitor...");
+    health_monitor.stop().await;
+    let _ = health_handle.await;
+
+    // Clean up socket
+    if std::path::Path::new(&context.socket_path).exists() {
+        let _ = std::fs::remove_file(&context.socket_path);
+    }
+
+    info!("Daemon stopped");
+    Ok(())
 }

@@ -1,0 +1,372 @@
+//! Shell completion installation and management
+//!
+//! This module handles installing shell completion scripts to standard locations
+//! for bash, zsh, and fish shells.
+
+use anyhow::{Context, Result};
+use clap::CommandFactory;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use crate::ui::OutputContext;
+use crate::Cli;
+
+/// Standard installation paths for each shell
+#[derive(Debug, Clone)]
+pub struct InstallPaths {
+    /// Primary install location for the completion script
+    pub script_path: PathBuf,
+    /// RC file that may need modification (e.g., .bashrc, .zshrc)
+    pub rc_file: Option<PathBuf>,
+    /// Line to add to RC file if needed
+    pub rc_line: Option<String>,
+}
+
+/// Get the home directory
+fn home_dir() -> Result<PathBuf> {
+    dirs::home_dir().context("Could not determine home directory")
+}
+
+/// Determine installation paths for a given shell
+pub fn get_install_paths(shell: clap_complete::Shell) -> Result<InstallPaths> {
+    let home = home_dir()?;
+
+    match shell {
+        clap_complete::Shell::Bash => {
+            // Prefer user-local bash completion directory
+            let completion_dir = home.join(".local/share/bash-completion/completions");
+            Ok(InstallPaths {
+                script_path: completion_dir.join("rch"),
+                rc_file: None, // Modern bash-completion auto-loads from this dir
+                rc_line: None,
+            })
+        }
+        clap_complete::Shell::Zsh => {
+            // Use ~/.zfunc for user completions
+            let zfunc_dir = home.join(".zfunc");
+            Ok(InstallPaths {
+                script_path: zfunc_dir.join("_rch"),
+                rc_file: Some(home.join(".zshrc")),
+                rc_line: Some(
+                    "# RCH completions\nfpath=(~/.zfunc $fpath)\nautoload -Uz compinit && compinit"
+                        .to_string(),
+                ),
+            })
+        }
+        clap_complete::Shell::Fish => {
+            // Fish auto-loads from this directory
+            let fish_dir = home.join(".config/fish/completions");
+            Ok(InstallPaths {
+                script_path: fish_dir.join("rch.fish"),
+                rc_file: None, // Fish auto-loads
+                rc_line: None,
+            })
+        }
+        clap_complete::Shell::PowerShell => {
+            // PowerShell profile-based loading
+            let ps_dir = if cfg!(windows) {
+                home.join("Documents/PowerShell")
+            } else {
+                home.join(".config/powershell")
+            };
+            Ok(InstallPaths {
+                script_path: ps_dir.join("rch.ps1"),
+                rc_file: Some(ps_dir.join("Microsoft.PowerShell_profile.ps1")),
+                rc_line: Some(". ~/.config/powershell/rch.ps1".to_string()),
+            })
+        }
+        clap_complete::Shell::Elvish => {
+            let elvish_dir = home.join(".elvish/lib");
+            Ok(InstallPaths {
+                script_path: elvish_dir.join("rch.elv"),
+                rc_file: Some(home.join(".elvish/rc.elv")),
+                rc_line: Some("use rch".to_string()),
+            })
+        }
+        _ => anyhow::bail!("Unsupported shell for installation: {:?}", shell),
+    }
+}
+
+/// Generate completion script content for a shell
+pub fn generate_completion_script(shell: clap_complete::Shell) -> String {
+    let mut buf = Vec::new();
+    clap_complete::generate(shell, &mut Cli::command(), "rch", &mut buf);
+    String::from_utf8_lossy(&buf).to_string()
+}
+
+/// Check if an RC file already contains the RCH completion setup
+fn rc_file_has_rch_setup(rc_path: &Path) -> Result<bool> {
+    if !rc_path.exists() {
+        return Ok(false);
+    }
+
+    let content = fs::read_to_string(rc_path).context("Failed to read RC file")?;
+
+    // Check for various indicators that RCH completions are already set up
+    Ok(content.contains("# RCH completions")
+        || content.contains("rch.fish")
+        || content.contains("_rch")
+        || content.contains("rch.ps1")
+        || content.contains("rch.elv"))
+}
+
+/// Install completion script for a shell
+pub fn install_completions(
+    shell: clap_complete::Shell,
+    ctx: &OutputContext,
+    dry_run: bool,
+) -> Result<InstallResult> {
+    let paths = get_install_paths(shell)?;
+    let script_content = generate_completion_script(shell);
+
+    let mut result = InstallResult {
+        shell,
+        script_path: paths.script_path.clone(),
+        script_written: false,
+        rc_modified: false,
+        rc_file: paths.rc_file.clone(),
+        was_already_installed: false,
+    };
+
+    // Check if already installed
+    if paths.script_path.exists() {
+        let existing = fs::read_to_string(&paths.script_path).unwrap_or_default();
+        if existing == script_content {
+            result.was_already_installed = true;
+            if !ctx.is_quiet() {
+                println!(
+                    "Completions for {:?} already installed at {}",
+                    shell,
+                    paths.script_path.display()
+                );
+            }
+            return Ok(result);
+        }
+    }
+
+    if dry_run {
+        println!("Would write completion script to: {}", paths.script_path.display());
+        if let (Some(rc_file), Some(rc_line)) = (&paths.rc_file, &paths.rc_line) {
+            if !rc_file_has_rch_setup(rc_file)? {
+                println!("Would add to {}: {}", rc_file.display(), rc_line);
+            }
+        }
+        return Ok(result);
+    }
+
+    // Create parent directory if needed
+    if let Some(parent) = paths.script_path.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!("Failed to create directory: {}", parent.display())
+        })?;
+    }
+
+    // Write the completion script
+    fs::write(&paths.script_path, &script_content).with_context(|| {
+        format!(
+            "Failed to write completion script to {}",
+            paths.script_path.display()
+        )
+    })?;
+    result.script_written = true;
+
+    if !ctx.is_quiet() {
+        println!(
+            "Installed {:?} completions to {}",
+            shell,
+            paths.script_path.display()
+        );
+    }
+
+    // Modify RC file if needed (idempotent)
+    if let (Some(rc_file), Some(rc_line)) = (&paths.rc_file, &paths.rc_line) {
+        if !rc_file_has_rch_setup(rc_file)? {
+            // Append to RC file
+            let mut content = if rc_file.exists() {
+                fs::read_to_string(rc_file)?
+            } else {
+                String::new()
+            };
+
+            // Add newline separator if file doesn't end with one
+            if !content.is_empty() && !content.ends_with('\n') {
+                content.push('\n');
+            }
+            content.push('\n');
+            content.push_str(rc_line);
+            content.push('\n');
+
+            fs::write(rc_file, content)
+                .with_context(|| format!("Failed to update {}", rc_file.display()))?;
+            result.rc_modified = true;
+
+            if !ctx.is_quiet() {
+                println!("Updated {} to load completions", rc_file.display());
+            }
+        }
+    }
+
+    Ok(result)
+}
+
+/// Result of a completion installation
+#[derive(Debug)]
+pub struct InstallResult {
+    pub shell: clap_complete::Shell,
+    pub script_path: PathBuf,
+    pub script_written: bool,
+    pub rc_modified: bool,
+    pub rc_file: Option<PathBuf>,
+    pub was_already_installed: bool,
+}
+
+/// Detect the current shell from environment
+pub fn detect_current_shell() -> Option<clap_complete::Shell> {
+    // Check SHELL environment variable
+    if let Ok(shell_path) = std::env::var("SHELL") {
+        let shell_name = Path::new(&shell_path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+
+        return match shell_name {
+            "bash" => Some(clap_complete::Shell::Bash),
+            "zsh" => Some(clap_complete::Shell::Zsh),
+            "fish" => Some(clap_complete::Shell::Fish),
+            "pwsh" | "powershell" => Some(clap_complete::Shell::PowerShell),
+            "elvish" => Some(clap_complete::Shell::Elvish),
+            _ => None,
+        };
+    }
+
+    None
+}
+
+/// Uninstall completions for a shell
+pub fn uninstall_completions(
+    shell: clap_complete::Shell,
+    ctx: &OutputContext,
+    dry_run: bool,
+) -> Result<()> {
+    let paths = get_install_paths(shell)?;
+
+    if dry_run {
+        if paths.script_path.exists() {
+            println!("Would remove: {}", paths.script_path.display());
+        }
+        return Ok(());
+    }
+
+    if paths.script_path.exists() {
+        fs::remove_file(&paths.script_path).with_context(|| {
+            format!(
+                "Failed to remove completion script: {}",
+                paths.script_path.display()
+            )
+        })?;
+
+        if !ctx.is_quiet() {
+            println!("Removed {:?} completions from {}", shell, paths.script_path.display());
+        }
+    } else if !ctx.is_quiet() {
+        println!(
+            "No {:?} completions found at {}",
+            shell,
+            paths.script_path.display()
+        );
+    }
+
+    // Note: We don't remove RC file modifications to avoid breaking user configs
+    // Users can manually remove the lines if desired
+
+    Ok(())
+}
+
+/// Show installation status for all shells
+pub fn show_status(ctx: &OutputContext) -> Result<()> {
+    use clap_complete::Shell;
+
+    let shells = [
+        Shell::Bash,
+        Shell::Zsh,
+        Shell::Fish,
+        Shell::PowerShell,
+        Shell::Elvish,
+    ];
+
+    if !ctx.is_quiet() {
+        println!("Shell completion status:");
+        println!();
+    }
+
+    for shell in &shells {
+        if let Ok(paths) = get_install_paths(*shell) {
+            let installed = paths.script_path.exists();
+            let status = if installed { "installed" } else { "not installed" };
+            println!(
+                "  {:12} {} ({})",
+                format!("{:?}:", shell),
+                status,
+                paths.script_path.display()
+            );
+        }
+    }
+
+    // Show current shell detection
+    if let Some(current) = detect_current_shell() {
+        println!();
+        println!("Current shell: {:?}", current);
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_generate_bash_completions() {
+        let script = generate_completion_script(clap_complete::Shell::Bash);
+        assert!(!script.is_empty());
+        assert!(script.contains("rch") || script.contains("_rch"));
+    }
+
+    #[test]
+    fn test_generate_zsh_completions() {
+        let script = generate_completion_script(clap_complete::Shell::Zsh);
+        assert!(!script.is_empty());
+    }
+
+    #[test]
+    fn test_generate_fish_completions() {
+        let script = generate_completion_script(clap_complete::Shell::Fish);
+        assert!(!script.is_empty());
+        assert!(script.contains("rch"));
+    }
+
+    #[test]
+    fn test_get_install_paths_bash() {
+        let paths = get_install_paths(clap_complete::Shell::Bash).unwrap();
+        assert!(paths.script_path.to_string_lossy().contains("bash-completion"));
+    }
+
+    #[test]
+    fn test_get_install_paths_zsh() {
+        let paths = get_install_paths(clap_complete::Shell::Zsh).unwrap();
+        assert!(paths.script_path.to_string_lossy().contains("_rch"));
+        assert!(paths.rc_file.is_some());
+    }
+
+    #[test]
+    fn test_get_install_paths_fish() {
+        let paths = get_install_paths(clap_complete::Shell::Fish).unwrap();
+        assert!(paths.script_path.to_string_lossy().contains("rch.fish"));
+    }
+
+    #[test]
+    fn test_detect_shell_from_env() {
+        // This test depends on the environment, so we just verify it doesn't panic
+        let _ = detect_current_shell();
+    }
+}

@@ -397,12 +397,13 @@ mod tests {
 
     #[test]
     fn test_get_u64_range_out_of_range() {
-        let vars = ["RCH_TEST_U64"];
+        // Use unique var name to avoid race with test_get_u64_range_valid
+        let vars = ["RCH_TEST_U64_OOR"];
         cleanup_env(&vars);
 
-        set_env("RCH_TEST_U64", "200");
+        set_env("RCH_TEST_U64_OOR", "200");
         let mut parser = EnvParser::new();
-        let result = parser.get_u64_range("TEST_U64", 10, 0, 100);
+        let result = parser.get_u64_range("TEST_U64_OOR", 10, 0, 100);
         assert_eq!(result.value, 10); // Uses default
         assert!(parser.has_errors());
 

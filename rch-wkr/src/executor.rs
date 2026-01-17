@@ -32,6 +32,7 @@ pub async fn execute(workdir: &str, command: &str) -> Result<()> {
         .current_dir(workdir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .kill_on_drop(true)
         .spawn()?;
 
     // Stream stdout
