@@ -2203,6 +2203,7 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "whoami",
 ]
 
 [[package]]

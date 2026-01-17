@@ -106,11 +106,17 @@ fn create_worker(id: &str, host: &str, slots: u32, priority: u32) -> WorkerFixtu
     WorkerFixture {
         id: id.to_string(),
         host: host.to_string(),
-        user: whoami::username(),
+        user: current_user(),
         identity_file: "~/.ssh/id_rsa".to_string(),
         total_slots: slots,
         priority,
     }
+}
+
+fn current_user() -> String {
+    std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .unwrap_or_else(|_| "user".to_string())
 }
 
 // ============================================================================
@@ -544,7 +550,7 @@ fn test_worker_selection_all_busy() {
     let busy_worker = WorkerFixture {
         id: "busy-worker".to_string(),
         host: "localhost".to_string(),
-        user: whoami::username(),
+        user: current_user(),
         identity_file: "~/.ssh/id_rsa".to_string(),
         total_slots: 0,
         priority: 100,
