@@ -22,6 +22,7 @@ pub fn init_test_logging() {
     });
 }
 
+#[allow(dead_code)]
 pub fn fixture(name: &str) -> &'static str {
     match name {
         "proc_stat_sample.txt" => include_str!("../fixtures/proc_stat_sample.txt"),
