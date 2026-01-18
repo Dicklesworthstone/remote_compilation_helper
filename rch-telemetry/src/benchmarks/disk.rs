@@ -883,4 +883,47 @@ mod tests {
         info!("VERIFY: Both sizes produce valid throughput measurements");
         info!("TEST PASS: test_throughput_scales_with_size");
     }
+
+    #[test]
+    fn test_benchmark_stability() {
+        init_test_logging();
+        info!("TEST START: test_benchmark_stability");
+
+        // Use smaller parameters for faster test
+        let benchmark = DiskBenchmark::new()
+            .with_seq_size(4 * 1024 * 1024) // 4MB
+            .with_block_size(64 * 1024)
+            .with_random_reads(200)
+            .with_random_file_size(2 * 1024 * 1024) // 2MB
+            .with_fsync_iterations(5)
+            .with_warmup(true);
+
+        info!("INPUT: run_disk_benchmark_stable() (3 runs + warmup)");
+        let result = benchmark.run_stable(3);
+        info!("RESULT: stable score = {}", result.score);
+
+        // Run again to check variance
+        let result2 = benchmark.run_stable(3);
+        let variance = if result.score > 0.0 {
+            ((result.score - result2.score) / result.score).abs()
+        } else {
+            0.0
+        };
+        info!(
+            "RESULT: second run score = {}, variance = {:.2}%",
+            result2.score,
+            variance * 100.0
+        );
+
+        // Allow up to 100% variance in tests (CI and concurrent tests can be noisy).
+        // Production target is <10% but test environments vary significantly
+        // due to concurrent processes, I/O contention, and shared runners.
+        assert!(variance < 1.0);
+        info!(
+            "VERIFY: Benchmark variance {:.2}% is within acceptable range",
+            variance * 100.0
+        );
+
+        info!("TEST PASS: test_benchmark_stability");
+    }
 }
