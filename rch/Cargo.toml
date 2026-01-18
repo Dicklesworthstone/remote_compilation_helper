@@ -26,14 +26,14 @@ toml = { workspace = true }
 directories = { workspace = true }
 blake3 = { workspace = true }
 shellexpand = "3.1"
-dirs = "5"
+dirs = { workspace = true }
 urlencoding = "2"
 colored = "2"
 unicode-width = { workspace = true }
 is-terminal = "0.4"
-terminal_size = "0.3"
+terminal_size = "0.4"
 regex = "1"
-indicatif = { version = "0.17", features = ["tokio"] }
+indicatif = { version = "0.18", features = ["tokio"] }
 chrono = { workspace = true, features = ["serde"] }
 uuid = { workspace = true }
 
@@ -43,7 +43,7 @@ sha2 = "0.10"
 shell-escape = "0.1.5"
 
 # State detection dependencies
-which = "7"
+which = "8"
 
 # Markdown rendering
 pulldown-cmark = { workspace = true }

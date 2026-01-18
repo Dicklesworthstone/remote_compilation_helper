@@ -24,6 +24,10 @@ toml = { workspace = true }
 directories = { workspace = true }
 openssh = { workspace = true }
 chrono = { workspace = true }
+humantime = { workspace = true }
+tokio-cron-scheduler = { workspace = true }
+cron = { workspace = true }
+uuid = { workspace = true }
 
 # Metrics and Observability
 prometheus = { workspace = true }

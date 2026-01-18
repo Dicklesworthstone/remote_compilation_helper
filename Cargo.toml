@@ -45,7 +45,7 @@ regex = "1.11"
 blake3 = "1.5"
 
 # Binary/object file parsing (ELF, Mach-O, etc.)
-object = { version = "0.36", default-features = false, features = ["read", "elf", "macho"] }
+object = { version = "0.38", default-features = false, features = ["read", "elf", "macho"] }
 
 # UUID generation
 uuid = { version = "1.11", features = ["v4", "serde"] }
@@ -56,16 +56,23 @@ zstd = "0.13"
 # Time formatting for mock transport logging
 chrono = { version = "0.4", features = ["serde"] }
 
+# Human-friendly duration parsing
+humantime = "2.1"
+
+# Cron-style scheduling for daemon tasks
+tokio-cron-scheduler = "0.15"
+cron = "0.15"
+
 # SSH
 openssh = "0.11"
 
 # Configuration
-toml = "0.8"
+toml = "0.9"
 directories = "6.0"
 dirs = "6.0"
 
 # Metrics and Observability
-prometheus = "0.13"
+prometheus = "0.14"
 lazy_static = "1.5"
 
 # OpenTelemetry
@@ -85,15 +92,15 @@ anyhow = "1.0"
 miette = { version = "7", features = ["fancy"] }
 
 # Interactive CLI prompts
-dialoguer = { version = "0.11", features = ["fuzzy-select"] }
-console = "0.15"
+dialoguer = { version = "0.12", features = ["fuzzy-select"] }
+console = "0.16"
 
 # Markdown rendering
-pulldown-cmark = "0.12"
+pulldown-cmark = "0.13"
 
 # TUI (Terminal User Interface)
 ratatui = "0.29"
-crossterm = "0.28"
+crossterm = "0.29"
 
 # Internal crates
 rch-common = { path = "rch-common" }
