@@ -196,6 +196,120 @@ fn parse_test_threads(command: &str) -> Option<u32> {
     None
 }
 
+/// Detect if a cargo test command has a test name filter.
+///
+/// Filtered tests (e.g., `cargo test my_test`) typically run fewer tests
+/// and thus require fewer slots than a full test suite.
+///
+/// Returns true if the command appears to filter tests by name.
+fn is_filtered_test_command(command: &str) -> bool {
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+
+    // Find the position of "test" in the command
+    let test_pos = tokens.iter().position(|&t| t == "test");
+    let Some(test_idx) = test_pos else {
+        return false;
+    };
+
+    // Flags that take a separate argument (not using =)
+    let flags_with_args = [
+        "-p",
+        "--package",
+        "--bin",
+        "--test",
+        "--bench",
+        "--example",
+        "--features",
+        "--target",
+        "--target-dir",
+        "-j",
+        "--jobs",
+        "--color",
+        "--message-format",
+        "--manifest-path",
+    ];
+
+    // Flags that don't take arguments (standalone)
+    let standalone_flags = [
+        "--lib",
+        "--release",
+        "--all",
+        "--workspace",
+        "--no-default-features",
+        "--all-features",
+        "-v",
+        "--verbose",
+        "-q",
+        "--quiet",
+        "--frozen",
+        "--locked",
+        "--offline",
+        "--no-fail-fast",
+    ];
+
+    let mut i = test_idx + 1;
+    while i < tokens.len() {
+        let token = tokens[i];
+
+        // Stop at the separator
+        if token == "--" {
+            break;
+        }
+
+        // Check if this is a flag that takes an argument
+        if flags_with_args.iter().any(|&f| token == f) {
+            // Skip this flag and its argument
+            i += 2;
+            continue;
+        }
+
+        // Check if this is a flag=value style
+        if flags_with_args.iter().any(|&f| token.starts_with(&format!("{}=", f))) {
+            i += 1;
+            continue;
+        }
+
+        // Check if this is a standalone flag
+        if standalone_flags.iter().any(|&f| token == f) {
+            i += 1;
+            continue;
+        }
+
+        // Skip any other flag-like tokens
+        if token.starts_with('-') {
+            i += 1;
+            continue;
+        }
+
+        // Found a non-flag token - this is a test name filter
+        return true;
+    }
+
+    false
+}
+
+/// Check if the command has the --ignored flag (for running only ignored tests).
+///
+/// Tests marked with #[ignore] are typically a small subset, so they need
+/// fewer slots. However, --include-ignored runs all tests plus ignored ones.
+fn has_ignored_only_flag(command: &str) -> bool {
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+
+    // Look for "--ignored" but not "--include-ignored"
+    let has_ignored = tokens.iter().any(|&t| t == "--ignored");
+    let has_include_ignored = tokens.iter().any(|&t| t == "--include-ignored");
+
+    // Only return true for --ignored without --include-ignored
+    has_ignored && !has_include_ignored
+}
+
+/// Check if the command has the --exact flag for exact test name matching.
+///
+/// Exact matching typically results in running a single test.
+fn has_exact_flag(command: &str) -> bool {
+    command.split_whitespace().any(|t| t == "--exact")
+}
+
 fn estimate_cores_for_command(
     kind: Option<CompilationKind>,
     command: &str,
@@ -205,13 +319,38 @@ fn estimate_cores_for_command(
     let test_default = config.test_slots.max(1);
     let check_default = config.check_slots.max(1);
 
+    // Slot reduction for filtered tests (fewer tests = fewer slots needed)
+    let filtered_test_slots = (test_default / 2).max(2);
+
     match kind {
         Some(
             CompilationKind::CargoTest | CompilationKind::CargoNextest | CompilationKind::BunTest,
-        ) => parse_test_threads(command)
-            .or_else(|| parse_env_u32(command, "RUST_TEST_THREADS"))
-            .unwrap_or(test_default)
-            .max(1),
+        ) => {
+            // Priority order for test slot estimation:
+            // 1. Explicit --test-threads flag
+            // 2. RUST_TEST_THREADS environment variable
+            // 3. Inferred from test filtering (reduced slots)
+            // 4. Default test_slots from config
+            if let Some(threads) = parse_test_threads(command) {
+                return threads.max(1);
+            }
+            if let Some(threads) = parse_env_u32(command, "RUST_TEST_THREADS") {
+                return threads.max(1);
+            }
+
+            // Reduce slots for filtered tests:
+            // - Specific test name filter (cargo test my_test)
+            // - --exact flag (single test match)
+            // - --ignored only (typically few ignored tests)
+            if is_filtered_test_command(command) || has_exact_flag(command) {
+                return filtered_test_slots;
+            }
+            if has_ignored_only_flag(command) {
+                return filtered_test_slots;
+            }
+
+            test_default.max(1)
+        }
         Some(
             CompilationKind::CargoCheck
             | CompilationKind::CargoClippy
@@ -2639,5 +2778,256 @@ mod tests {
             build_patterns.len() >= test_patterns.len(),
             "Build should have at least as many patterns as test"
         );
+    }
+
+    // =========================================================================
+    // Test filtering and special flags tests (bead remote_compilation_helper-ya16)
+    // =========================================================================
+
+    #[test]
+    fn test_is_filtered_test_command_basic() {
+        // Basic test name filter
+        assert!(
+            is_filtered_test_command("cargo test my_test"),
+            "Should detect test name filter"
+        );
+        assert!(
+            is_filtered_test_command("cargo test test_foo"),
+            "Should detect test name filter"
+        );
+        assert!(
+            is_filtered_test_command("cargo test some::module::test"),
+            "Should detect module path filter"
+        );
+
+        // Full test suite (no filter)
+        assert!(
+            !is_filtered_test_command("cargo test"),
+            "No filter in basic cargo test"
+        );
+        assert!(
+            !is_filtered_test_command("cargo test --release"),
+            "Flags are not filters"
+        );
+    }
+
+    #[test]
+    fn test_is_filtered_test_command_with_flags() {
+        // Filter with flags
+        assert!(
+            is_filtered_test_command("cargo test --release my_test"),
+            "Should detect filter after flags"
+        );
+        assert!(
+            is_filtered_test_command("cargo test -p mypackage my_test"),
+            "Should detect filter after package flag"
+        );
+
+        // Only package flag (not a name filter)
+        assert!(
+            !is_filtered_test_command("cargo test -p mypackage"),
+            "Package is not a test name filter"
+        );
+        assert!(
+            !is_filtered_test_command("cargo test --lib"),
+            "--lib is not a test name filter"
+        );
+    }
+
+    #[test]
+    fn test_is_filtered_test_command_with_separator() {
+        // Filter before --
+        assert!(
+            is_filtered_test_command("cargo test my_test -- --nocapture"),
+            "Should detect filter before separator"
+        );
+
+        // No filter, args after --
+        assert!(
+            !is_filtered_test_command("cargo test -- --nocapture"),
+            "Args after -- are not test name filters"
+        );
+        assert!(
+            !is_filtered_test_command("cargo test -- --test-threads=4"),
+            "Args after -- are not test name filters"
+        );
+    }
+
+    #[test]
+    fn test_has_ignored_only_flag() {
+        // Only --ignored
+        assert!(
+            has_ignored_only_flag("cargo test -- --ignored"),
+            "Should detect --ignored"
+        );
+
+        // --include-ignored (runs all tests)
+        assert!(
+            !has_ignored_only_flag("cargo test -- --include-ignored"),
+            "--include-ignored runs all tests"
+        );
+
+        // Both flags (--include-ignored takes precedence)
+        assert!(
+            !has_ignored_only_flag("cargo test -- --ignored --include-ignored"),
+            "--include-ignored takes precedence"
+        );
+
+        // No flags
+        assert!(
+            !has_ignored_only_flag("cargo test"),
+            "No flags"
+        );
+    }
+
+    #[test]
+    fn test_has_exact_flag() {
+        assert!(has_exact_flag("cargo test my_test -- --exact"), "--exact detected");
+        assert!(!has_exact_flag("cargo test my_test"), "No --exact");
+        assert!(!has_exact_flag("cargo test -- --nocapture"), "No --exact");
+    }
+
+    #[test]
+    fn test_estimate_cores_filtered_tests() {
+        let config = rch_common::CompilationConfig {
+            build_slots: 6,
+            test_slots: 10,
+            check_slots: 3,
+            ..Default::default()
+        };
+
+        // Full test suite gets default slots
+        let full = estimate_cores_for_command(
+            Some(CompilationKind::CargoTest),
+            "cargo test",
+            &config,
+        );
+        assert_eq!(full, 10, "Full test suite uses default test_slots");
+
+        // Filtered test gets reduced slots (test_slots / 2, min 2)
+        let filtered = estimate_cores_for_command(
+            Some(CompilationKind::CargoTest),
+            "cargo test my_test",
+            &config,
+        );
+        assert_eq!(filtered, 5, "Filtered test uses reduced slots");
+
+        // --exact flag gets reduced slots
+        let exact = estimate_cores_for_command(
+            Some(CompilationKind::CargoTest),
+            "cargo test my_test -- --exact",
+            &config,
+        );
+        assert_eq!(exact, 5, "--exact uses reduced slots");
+
+        // --ignored only gets reduced slots
+        let ignored = estimate_cores_for_command(
+            Some(CompilationKind::CargoTest),
+            "cargo test -- --ignored",
+            &config,
+        );
+        assert_eq!(ignored, 5, "--ignored uses reduced slots");
+
+        // --include-ignored gets full slots (runs all tests plus ignored)
+        let include_ignored = estimate_cores_for_command(
+            Some(CompilationKind::CargoTest),
+            "cargo test -- --include-ignored",
+            &config,
+        );
+        assert_eq!(include_ignored, 10, "--include-ignored uses full slots");
+    }
+
+    #[test]
+    fn test_estimate_cores_explicit_threads_overrides_filter() {
+        let config = rch_common::CompilationConfig {
+            build_slots: 6,
+            test_slots: 10,
+            check_slots: 3,
+            ..Default::default()
+        };
+
+        // Explicit --test-threads should override filtering heuristics
+        let explicit = estimate_cores_for_command(
+            Some(CompilationKind::CargoTest),
+            "cargo test my_test -- --test-threads=8",
+            &config,
+        );
+        assert_eq!(explicit, 8, "Explicit --test-threads overrides filtering");
+
+        // RUST_TEST_THREADS also overrides
+        let env = estimate_cores_for_command(
+            Some(CompilationKind::CargoTest),
+            "RUST_TEST_THREADS=6 cargo test my_test",
+            &config,
+        );
+        assert_eq!(env, 6, "RUST_TEST_THREADS overrides filtering");
+    }
+
+    #[test]
+    fn test_estimate_cores_filtered_minimum() {
+        let config = rch_common::CompilationConfig {
+            build_slots: 6,
+            test_slots: 2, // Very low test_slots
+            check_slots: 3,
+            ..Default::default()
+        };
+
+        // With test_slots=2, filtered should be max(2/2, 2) = max(1, 2) = 2
+        let filtered = estimate_cores_for_command(
+            Some(CompilationKind::CargoTest),
+            "cargo test my_test",
+            &config,
+        );
+        assert!(filtered >= 2, "Filtered slots should be at least 2");
+    }
+
+    #[test]
+    fn test_nocapture_does_not_affect_slots() {
+        let config = rch_common::CompilationConfig {
+            build_slots: 6,
+            test_slots: 10,
+            check_slots: 3,
+            ..Default::default()
+        };
+
+        // --nocapture doesn't affect slot estimation
+        let with_nocapture = estimate_cores_for_command(
+            Some(CompilationKind::CargoTest),
+            "cargo test -- --nocapture",
+            &config,
+        );
+        let without = estimate_cores_for_command(
+            Some(CompilationKind::CargoTest),
+            "cargo test",
+            &config,
+        );
+        assert_eq!(with_nocapture, without, "--nocapture doesn't affect slots");
+
+        // --show-output also doesn't affect slots
+        let with_show = estimate_cores_for_command(
+            Some(CompilationKind::CargoTest),
+            "cargo test -- --show-output",
+            &config,
+        );
+        assert_eq!(with_show, without, "--show-output doesn't affect slots");
+    }
+
+    #[test]
+    fn test_skip_pattern_uses_full_slots() {
+        let config = rch_common::CompilationConfig {
+            build_slots: 6,
+            test_slots: 10,
+            check_slots: 3,
+            ..Default::default()
+        };
+
+        // --skip doesn't reduce the test suite significantly
+        // (still runs most tests, just skipping some)
+        let with_skip = estimate_cores_for_command(
+            Some(CompilationKind::CargoTest),
+            "cargo test -- --skip slow_test",
+            &config,
+        );
+        assert_eq!(with_skip, 10, "--skip uses full slots");
     }
 }
