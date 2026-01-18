@@ -248,12 +248,14 @@ async fn main() -> Result<()> {
         }
     };
 
-    let telemetry_store = Arc::new(TelemetryStore::new(
+    let event_bus = EventBus::new(256);
+
+    let telemetry_store = Arc::new(TelemetryStore::with_event_bus(
         Duration::from_secs(300),
         telemetry_storage.clone(),
+        event_bus.clone(),
     ));
 
-    let event_bus = EventBus::new(256);
     let benchmark_queue = Arc::new(BenchmarkQueue::new(ChronoDuration::minutes(5)));
 
     let context = DaemonContext {

@@ -1,7 +1,6 @@
 //! Telemetry storage and polling for worker metrics.
 
-#![allow(dead_code)] // Parts will be used by follow-up beads
-
+use crate::events::EventBus;
 use crate::workers::{WorkerPool, WorkerState};
 use anyhow::Context;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -26,6 +25,7 @@ pub struct TelemetryStore {
     recent: RwLock<HashMap<String, VecDeque<ReceivedTelemetry>>>,
     test_runs: RwLock<VecDeque<TestRunRecord>>,
     storage: Option<Arc<TelemetryStorage>>,
+    event_bus: Option<EventBus>,
 }
 
 impl TelemetryStore {
@@ -38,19 +38,48 @@ impl TelemetryStore {
             recent: RwLock::new(HashMap::new()),
             test_runs: RwLock::new(VecDeque::new()),
             storage,
+            event_bus: None,
+        }
+    }
+
+    /// Create a new telemetry store with an event bus for WebSocket notifications.
+    pub fn with_event_bus(
+        retention: Duration,
+        storage: Option<Arc<TelemetryStorage>>,
+        event_bus: EventBus,
+    ) -> Self {
+        let retention =
+            ChronoDuration::from_std(retention).unwrap_or_else(|_| ChronoDuration::seconds(300));
+        Self {
+            retention,
+            recent: RwLock::new(HashMap::new()),
+            test_runs: RwLock::new(VecDeque::new()),
+            storage,
+            event_bus: Some(event_bus),
         }
     }
 
     /// Ingest telemetry into the store.
+    ///
+    /// Stores the telemetry, persists to SQLite (if configured), and emits
+    /// a "telemetry:update" event for WebSocket subscribers (if configured).
     pub fn ingest(&self, telemetry: WorkerTelemetry, source: TelemetrySource) {
         let received = ReceivedTelemetry::new(telemetry, source);
         let worker_id = received.telemetry.worker_id.clone();
+
+        // Get summary for event emission before moving into storage
+        let summary = received.telemetry.summary();
 
         let mut recent = self.recent.write().unwrap();
         let entries = recent.entry(worker_id).or_default();
         entries.push_back(received);
 
         self.evict_old(entries);
+
+        // Emit WebSocket event for real-time dashboard updates
+        if let Some(event_bus) = &self.event_bus {
+            event_bus.emit("telemetry:update", &summary);
+        }
 
         if let Some(storage) = self.storage.as_ref() {
             let storage = Arc::clone(storage);
@@ -289,11 +318,13 @@ impl TelemetryPoller {
     }
 }
 
-async fn poll_worker(
-    worker: Arc<WorkerState>,
-    store: Arc<TelemetryStore>,
-    config: TelemetryPollerConfig,
-) -> anyhow::Result<()> {
+/// Collect telemetry from a worker via SSH.
+///
+/// Executes `rch-telemetry collect` on the remote worker and parses the result.
+pub async fn collect_telemetry_from_worker(
+    worker: &WorkerState,
+    ssh_timeout: Duration,
+) -> anyhow::Result<WorkerTelemetry> {
     let worker_id = worker.config.id.as_str();
     let command = format!(
         "rch-telemetry collect --format json --worker-id {}",
@@ -301,8 +332,8 @@ async fn poll_worker(
     );
 
     let options = SshOptions {
-        connect_timeout: config.ssh_timeout,
-        command_timeout: config.ssh_timeout,
+        connect_timeout: ssh_timeout,
+        command_timeout: ssh_timeout,
         ..Default::default()
     };
 
@@ -311,38 +342,40 @@ async fn poll_worker(
     let result = client.execute(&command).await;
     client.disconnect().await?;
 
-    let result = match result {
-        Ok(res) => res,
-        Err(e) => {
-            warn!(worker = worker_id, "Telemetry SSH error: {}", e);
-            return Ok(());
-        }
-    };
+    let result = result?;
 
     if !result.success() {
-        warn!(
-            worker = worker_id,
-            exit = result.exit_code,
-            stderr = %result.stderr.trim(),
-            "Telemetry command failed"
-        );
-        return Ok(());
+        return Err(anyhow::anyhow!(
+            "Telemetry command failed (exit {}): {}",
+            result.exit_code,
+            result.stderr.trim()
+        ));
     }
 
     let payload = result.stdout.trim();
     if payload.is_empty() {
-        warn!(
-            worker = worker_id,
-            "Telemetry command returned empty output"
-        );
-        return Ok(());
+        return Err(anyhow::anyhow!("Telemetry command returned empty output"));
     }
 
-    match WorkerTelemetry::from_json(payload) {
+    let telemetry = WorkerTelemetry::from_json(payload)
+        .context("Failed to parse telemetry JSON")?;
+
+    if !telemetry.is_compatible() {
+        warn!(worker = worker_id, "Telemetry protocol version mismatch");
+    }
+
+    Ok(telemetry)
+}
+
+async fn poll_worker(
+    worker: Arc<WorkerState>,
+    store: Arc<TelemetryStore>,
+    config: TelemetryPollerConfig,
+) -> anyhow::Result<()> {
+    let worker_id = worker.config.id.as_str();
+
+    match collect_telemetry_from_worker(&worker, config.ssh_timeout).await {
         Ok(telemetry) => {
-            if !telemetry.is_compatible() {
-                warn!(worker = worker_id, "Telemetry protocol version mismatch");
-            }
             debug!(
                 worker = worker_id,
                 cpu = %telemetry.cpu.overall_percent,
@@ -352,7 +385,7 @@ async fn poll_worker(
             store.ingest(telemetry, TelemetrySource::SshPoll);
         }
         Err(e) => {
-            warn!(worker = worker_id, "Failed to parse telemetry JSON: {}", e);
+            warn!(worker = worker_id, "Telemetry poll failed: {}", e);
         }
     }
 
@@ -469,5 +502,34 @@ mod tests {
         assert_eq!(stats.build_error_runs, 0);
         assert!(stats.avg_duration_ms > 0);
         assert_eq!(stats.runs_by_kind.get("cargo_test"), Some(&1));
+    }
+
+    #[test]
+    fn test_ingest_emits_websocket_event() {
+        let event_bus = EventBus::new(16);
+        let mut receiver = event_bus.subscribe();
+
+        let store = TelemetryStore::with_event_bus(Duration::from_secs(300), None, event_bus);
+
+        // Ingest telemetry - this should emit an event
+        store.ingest(make_telemetry("w1", 42.0, 50.0), TelemetrySource::Piggyback);
+
+        // Check that an event was emitted
+        let event = receiver.try_recv().expect("expected telemetry:update event");
+        assert!(event.contains("telemetry:update"));
+        assert!(event.contains("w1"));
+        assert!(event.contains("42")); // CPU percent should be in the summary
+    }
+
+    #[test]
+    fn test_store_without_event_bus_still_works() {
+        // Ensure the store works without an event bus (no panics, etc.)
+        let store = TelemetryStore::new(Duration::from_secs(300), None);
+
+        store.ingest(make_telemetry("w1", 10.0, 20.0), TelemetrySource::SshPoll);
+        store.ingest(make_telemetry("w2", 30.0, 40.0), TelemetrySource::Piggyback);
+
+        let latest = store.latest_all();
+        assert_eq!(latest.len(), 2);
     }
 }

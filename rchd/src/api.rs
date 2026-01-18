@@ -8,6 +8,7 @@ use crate::DaemonContext;
 use crate::events::EventBus;
 use crate::metrics;
 use crate::metrics::budget::{self, BudgetStatusResponse};
+use crate::telemetry::collect_telemetry_from_worker;
 use crate::workers::WorkerPool;
 use anyhow::{Result, anyhow};
 use chrono::{Duration as ChronoDuration, Utc};
@@ -1060,71 +1061,8 @@ async fn handle_telemetry_poll(ctx: &DaemonContext, worker_id: &WorkerId) -> Tel
         };
     }
 
-    let command = format!(
-        "rch-telemetry collect --format json --worker-id {}",
-        worker_id.as_str()
-    );
-    let options = rch_common::SshOptions {
-        connect_timeout: Duration::from_secs(5),
-        command_timeout: Duration::from_secs(5),
-        ..Default::default()
-    };
-
-    let mut client = rch_common::SshClient::new(worker.config.clone(), options);
-    if let Err(err) = client.connect().await {
-        return TelemetryPollResponse {
-            status: "error".to_string(),
-            telemetry: None,
-            error: Some(format!("ssh_connect_failed: {}", err)),
-            worker_id: Some(worker_id.to_string()),
-        };
-    }
-
-    let result = client.execute(&command).await;
-    client.disconnect().await.ok();
-
-    let result = match result {
-        Ok(res) => res,
-        Err(err) => {
-            return TelemetryPollResponse {
-                status: "error".to_string(),
-                telemetry: None,
-                error: Some(format!("ssh_execute_failed: {}", err)),
-                worker_id: Some(worker_id.to_string()),
-            };
-        }
-    };
-
-    if !result.success() {
-        return TelemetryPollResponse {
-            status: "error".to_string(),
-            telemetry: None,
-            error: Some(format!(
-                "telemetry_command_failed: {}",
-                result.stderr.trim()
-            )),
-            worker_id: Some(worker_id.to_string()),
-        };
-    }
-
-    let payload = result.stdout.trim();
-    if payload.is_empty() {
-        return TelemetryPollResponse {
-            status: "error".to_string(),
-            telemetry: None,
-            error: Some("empty telemetry payload".to_string()),
-            worker_id: Some(worker_id.to_string()),
-        };
-    }
-
-    match WorkerTelemetry::from_json(payload) {
+    match collect_telemetry_from_worker(&worker, Duration::from_secs(5)).await {
         Ok(telemetry) => {
-            if !telemetry.is_compatible() {
-                warn!(
-                    "Telemetry protocol version mismatch for worker {}",
-                    telemetry.worker_id
-                );
-            }
             ctx.telemetry
                 .ingest(telemetry.clone(), TelemetrySource::OnDemand);
             TelemetryPollResponse {
@@ -1134,10 +1072,10 @@ async fn handle_telemetry_poll(ctx: &DaemonContext, worker_id: &WorkerId) -> Tel
                 worker_id: None,
             }
         }
-        Err(err) => TelemetryPollResponse {
+        Err(e) => TelemetryPollResponse {
             status: "error".to_string(),
             telemetry: None,
-            error: Some(format!("invalid telemetry payload: {}", err)),
+            error: Some(e.to_string()),
             worker_id: Some(worker_id.to_string()),
         },
     }
