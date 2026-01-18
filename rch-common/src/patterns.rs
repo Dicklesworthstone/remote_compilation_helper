@@ -720,7 +720,16 @@ fn classify_cargo(cmd: &str) -> Classification {
         return Classification::not_compilation("bare cargo command");
     }
 
-    let subcommand = parts[1];
+    // Handle toolchain overrides (e.g., cargo +nightly build)
+    let subcommand = if parts[1].starts_with('+') {
+        if parts.len() < 3 {
+            return Classification::not_compilation("cargo +toolchain without subcommand");
+        }
+        parts[2]
+    } else {
+        parts[1]
+    };
+
     match subcommand {
         "build" | "b" => {
             Classification::compilation(CompilationKind::CargoBuild, 0.95, "cargo build")
@@ -743,8 +752,11 @@ fn classify_cargo(cmd: &str) -> Classification {
         "nextest" => {
             // cargo nextest has subcommands: run, list, archive, show
             // Only intercept "run" - the actual test execution
-            if parts.len() >= 3 {
-                match parts[2] {
+            // Adjust index based on whether toolchain was present
+            let args_start = if parts[1].starts_with('+') { 3 } else { 2 };
+            
+            if parts.len() > args_start {
+                match parts[args_start] {
                     "run" | "r" => Classification::compilation(
                         CompilationKind::CargoNextest,
                         0.95,
@@ -752,7 +764,7 @@ fn classify_cargo(cmd: &str) -> Classification {
                     ),
                     _ => Classification::not_compilation(format!(
                         "cargo nextest {} not interceptable",
-                        parts[2]
+                        parts[args_start]
                     )),
                 }
             } else {
@@ -767,6 +779,27 @@ fn classify_cargo(cmd: &str) -> Classification {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_cargo_build_with_toolchain() {
+        let result = classify_command("cargo +nightly build");
+        assert!(result.is_compilation);
+        assert_eq!(result.kind, Some(CompilationKind::CargoBuild));
+    }
+
+    #[test]
+    fn test_cargo_test_with_toolchain() {
+        let result = classify_command("cargo +1.80.0 test");
+        assert!(result.is_compilation);
+        assert_eq!(result.kind, Some(CompilationKind::CargoTest));
+    }
+
+    #[test]
+    fn test_cargo_nextest_with_toolchain() {
+        let result = classify_command("cargo +nightly nextest run");
+        assert!(result.is_compilation);
+        assert_eq!(result.kind, Some(CompilationKind::CargoNextest));
+    }
 
     #[test]
     fn test_cargo_build() {
@@ -794,12 +827,14 @@ mod tests {
     fn test_cargo_fmt_not_intercepted() {
         let result = classify_command("cargo fmt");
         assert!(!result.is_compilation);
+        assert!(result.reason.contains("never-intercept"));
     }
 
     #[test]
     fn test_cargo_install_not_intercepted() {
         let result = classify_command("cargo install ripgrep");
         assert!(!result.is_compilation);
+        assert!(result.reason.contains("never-intercept"));
     }
 
     #[test]
@@ -841,18 +876,21 @@ mod tests {
     fn test_make_clean_not_intercepted() {
         let result = classify_command("make clean");
         assert!(!result.is_compilation);
+        assert!(result.reason.contains("make maintenance command"));
     }
 
     #[test]
     fn test_non_compilation() {
         let result = classify_command("ls -la");
         assert!(!result.is_compilation);
+        assert!(result.reason.contains("no compilation keyword"));
     }
 
     #[test]
     fn test_empty_command() {
         let result = classify_command("");
         assert!(!result.is_compilation);
+        assert!(result.reason.contains("empty command"));
     }
 
     // Bun tests - keyword detection and never-intercept patterns
@@ -1082,6 +1120,11 @@ mod tests {
 
         let result = classify_command("bun x prettier --write .");
         assert!(!result.is_compilation);
+        assert!(result.reason.contains("bun x runs arbitrary packages"));
+
+        let result = classify_command("bun x vitest run");
+        assert!(!result.is_compilation);
+        assert!(result.reason.contains("bun x runs arbitrary packages"));
     }
 
     #[test]
