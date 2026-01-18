@@ -661,6 +661,7 @@ pub(crate) fn required_runtime_for_kind(kind: Option<CompilationKind>) -> Requir
             | CompilationKind::CargoCheck
             | CompilationKind::CargoClippy
             | CompilationKind::CargoDoc
+            | CompilationKind::CargoNextest
             | CompilationKind::Rustc => RequiredRuntime::Rust,
 
             CompilationKind::BunTest | CompilationKind::BunTypecheck => RequiredRuntime::Bun,
@@ -682,7 +683,8 @@ fn get_artifact_patterns(kind: Option<CompilationKind>) -> Vec<String> {
         | Some(CompilationKind::CargoTest)
         | Some(CompilationKind::CargoCheck)
         | Some(CompilationKind::CargoClippy)
-        | Some(CompilationKind::CargoDoc) => default_rust_artifact_patterns(),
+        | Some(CompilationKind::CargoDoc)
+        | Some(CompilationKind::CargoNextest) => default_rust_artifact_patterns(),
         Some(CompilationKind::Gcc)
         | Some(CompilationKind::Gpp)
         | Some(CompilationKind::Clang)

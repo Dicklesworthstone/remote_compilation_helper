@@ -15,7 +15,7 @@ use std::borrow::Cow;
 /// Used for SIMD-accelerated quick filtering (Tier 2).
 pub static COMPILATION_KEYWORDS: &[&str] = &[
     "cargo", "rustc", "gcc", "g++", "clang", "clang++", "make", "cmake", "ninja", "meson", "cc",
-    "c++", "bun",
+    "c++", "bun", "nextest",
 ];
 
 /// Commands that should NEVER be intercepted, even if they contain compilation keywords.
@@ -68,6 +68,10 @@ pub static NEVER_INTERCEPT: &[&str] = &[
     // Bun dev/repl - require local interactivity
     "bun dev",
     "bun repl",
+    // cargo-nextest commands that shouldn't be intercepted
+    "cargo nextest list",    // Lists tests only, doesn't run them
+    "cargo nextest archive", // Creates test archives
+    "cargo nextest show",    // Shows config/setup info
 ];
 
 /// Result of command classification.
@@ -150,6 +154,8 @@ pub enum CompilationKind {
     CargoCheck,
     CargoClippy,
     CargoDoc,
+    /// cargo nextest run - next-generation test runner
+    CargoNextest,
     /// rustc invocation
     Rustc,
 
@@ -732,6 +738,26 @@ fn classify_cargo(cmd: &str) -> Classification {
             )
         }
         "bench" => Classification::compilation(CompilationKind::CargoBuild, 0.90, "cargo bench"),
+        "nextest" => {
+            // cargo nextest has subcommands: run, list, archive, show
+            // Only intercept "run" - the actual test execution
+            if parts.len() >= 3 {
+                match parts[2] {
+                    "run" | "r" => Classification::compilation(
+                        CompilationKind::CargoNextest,
+                        0.95,
+                        "cargo nextest run",
+                    ),
+                    _ => Classification::not_compilation(format!(
+                        "cargo nextest {} not interceptable",
+                        parts[2]
+                    )),
+                }
+            } else {
+                // Bare "cargo nextest" without subcommand
+                Classification::not_compilation("bare cargo nextest without subcommand")
+            }
+        }
         _ => Classification::not_compilation(format!("cargo {subcommand} not interceptable")),
     }
 }
@@ -1378,5 +1404,158 @@ mod tests {
         let result = classify_command("cargo test --exact my_test");
         assert!(result.is_compilation, "cargo test --exact should be classified");
         assert_eq!(result.kind, Some(CompilationKind::CargoTest));
+    }
+
+    // =========================================================================
+    // cargo-nextest tests (bead remote_compilation_helper-c7ky)
+    // =========================================================================
+
+    #[test]
+    fn test_nextest_keyword_detected() {
+        // Verify "nextest" triggers keyword detection (Tier 2 passes)
+        assert!(contains_compilation_keyword("cargo nextest run"));
+        assert!(contains_compilation_keyword("cargo nextest list"));
+    }
+
+    #[test]
+    fn test_cargo_nextest_run_classification() {
+        // Basic command
+        let result = classify_command("cargo nextest run");
+        assert!(result.is_compilation, "cargo nextest run should be classified");
+        assert_eq!(result.kind, Some(CompilationKind::CargoNextest));
+        assert!((result.confidence - 0.95).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_cargo_nextest_run_with_flags() {
+        // With release flag
+        let result = classify_command("cargo nextest run --release");
+        assert!(result.is_compilation);
+        assert_eq!(result.kind, Some(CompilationKind::CargoNextest));
+
+        // With profile flag
+        let result = classify_command("cargo nextest run --cargo-profile ci");
+        assert!(result.is_compilation);
+        assert_eq!(result.kind, Some(CompilationKind::CargoNextest));
+
+        // With workspace flag
+        let result = classify_command("cargo nextest run --workspace");
+        assert!(result.is_compilation);
+        assert_eq!(result.kind, Some(CompilationKind::CargoNextest));
+
+        // With package filter
+        let result = classify_command("cargo nextest run -p rch-common");
+        assert!(result.is_compilation);
+        assert_eq!(result.kind, Some(CompilationKind::CargoNextest));
+
+        // With test filter
+        let result = classify_command("cargo nextest run test_classification");
+        assert!(result.is_compilation);
+        assert_eq!(result.kind, Some(CompilationKind::CargoNextest));
+
+        // With multiple flags
+        let result = classify_command("cargo nextest run --release --no-fail-fast -j 8");
+        assert!(result.is_compilation);
+        assert_eq!(result.kind, Some(CompilationKind::CargoNextest));
+    }
+
+    #[test]
+    fn test_cargo_nextest_run_short_alias() {
+        // cargo nextest r is an alias for cargo nextest run
+        let result = classify_command("cargo nextest r");
+        assert!(result.is_compilation, "cargo nextest r should be classified");
+        assert_eq!(result.kind, Some(CompilationKind::CargoNextest));
+    }
+
+    #[test]
+    fn test_cargo_nextest_list_not_intercepted() {
+        // cargo nextest list only shows tests, doesn't run them
+        let result = classify_command("cargo nextest list");
+        assert!(!result.is_compilation);
+        assert!(result.reason.contains("never-intercept"));
+    }
+
+    #[test]
+    fn test_cargo_nextest_archive_not_intercepted() {
+        // cargo nextest archive creates archives
+        let result = classify_command("cargo nextest archive");
+        assert!(!result.is_compilation);
+        assert!(result.reason.contains("never-intercept"));
+    }
+
+    #[test]
+    fn test_cargo_nextest_show_not_intercepted() {
+        // cargo nextest show displays config info
+        let result = classify_command("cargo nextest show");
+        assert!(!result.is_compilation);
+        assert!(result.reason.contains("never-intercept"));
+    }
+
+    #[test]
+    fn test_bare_cargo_nextest_not_intercepted() {
+        // bare "cargo nextest" without subcommand
+        let result = classify_command("cargo nextest");
+        assert!(!result.is_compilation);
+        assert!(result.reason.contains("without subcommand"));
+    }
+
+    #[test]
+    fn test_cargo_nextest_wrapped_commands() {
+        // Wrapped nextest commands should still be classified
+        let result = classify_command("time cargo nextest run");
+        assert!(result.is_compilation, "time cargo nextest run should be classified");
+        assert_eq!(result.kind, Some(CompilationKind::CargoNextest));
+
+        let result = classify_command("RUST_BACKTRACE=1 cargo nextest run");
+        assert!(result.is_compilation, "env-wrapped cargo nextest run should be classified");
+        assert_eq!(result.kind, Some(CompilationKind::CargoNextest));
+    }
+
+    #[test]
+    fn test_cargo_nextest_compilation_kind_serde() {
+        // CargoNextest serialization
+        let kind = CompilationKind::CargoNextest;
+        let json = serde_json::to_string(&kind).unwrap();
+        assert_eq!(json, "\"cargo_nextest\"");
+        let parsed: CompilationKind = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, CompilationKind::CargoNextest);
+    }
+
+    #[test]
+    fn test_cargo_nextest_vs_cargo_test_distinct() {
+        // CargoNextest and CargoTest are different
+        assert_ne!(CompilationKind::CargoNextest, CompilationKind::CargoTest);
+
+        // Both should be classified but as different kinds
+        let nextest_result = classify_command("cargo nextest run");
+        let test_result = classify_command("cargo test");
+        assert!(nextest_result.is_compilation);
+        assert!(test_result.is_compilation);
+        assert_eq!(nextest_result.kind, Some(CompilationKind::CargoNextest));
+        assert_eq!(test_result.kind, Some(CompilationKind::CargoTest));
+    }
+
+    #[test]
+    fn test_cargo_nextest_piped_not_intercepted() {
+        // Piped commands should be rejected at Tier 1
+        let result = classify_command("cargo nextest run | grep FAIL");
+        assert!(!result.is_compilation);
+        assert!(result.reason.contains("piped"));
+    }
+
+    #[test]
+    fn test_cargo_nextest_redirected_not_intercepted() {
+        // Redirected commands should be rejected at Tier 1
+        let result = classify_command("cargo nextest run > results.txt");
+        assert!(!result.is_compilation);
+        assert!(result.reason.contains("redirect"));
+    }
+
+    #[test]
+    fn test_cargo_nextest_backgrounded_not_intercepted() {
+        // Backgrounded commands should be rejected at Tier 1
+        let result = classify_command("cargo nextest run &");
+        assert!(!result.is_compilation);
+        assert!(result.reason.contains("background"));
     }
 }
