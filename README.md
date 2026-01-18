@@ -2,11 +2,41 @@
 
 <div align="center">
 
+```
+     ╭──────────────────────────────────────────────────────╮
+     │          ╔═══════════════════════════════╗           │
+     │          ║  AGENT                        ║           │
+     │          ║  cargo build --release        ║           │
+     │          ╚═══════════════════════════════╝           │
+     │                        │                             │
+     │                        ▼                             │
+     │          ╔═══════════════════════════════╗           │
+     │          ║  rch hook                     ║           │
+     │          ║  (0.3ms decision)             ║           │
+     │          ╚═══════════════════════════════╝           │
+     │                        │                             │
+     │        ┌───────────────┴───────────────┐             │
+     │        ▼                               ▼             │
+     │   ┌─────────┐                   ┌─────────────┐      │
+     │   │ LOCAL   │                   │ REMOTE      │      │
+     │   │ 99% cmds│                   │ compilation │      │
+     │   │ (<0.1ms)│                   │ offloaded   │      │
+     │   └─────────┘                   └─────────────┘      │
+     │                                        │             │
+     │                        ┌───────────────┴───────────┐ │
+     │                        ▼               ▼           ▼ │
+     │                   ┌────────┐      ┌────────┐  ┌────────┐
+     │                   │worker-1│      │worker-2│  │worker-N│
+     │                   │32 cores│      │16 cores│  │24 cores│
+     │                   └────────┘      └────────┘  └────────┘
+     ╰──────────────────────────────────────────────────────╯
+```
+
 **Transparent compilation offloading for AI coding agents**
 
+[![CI](https://github.com/Dicklesworthstone/remote_compilation_helper/actions/workflows/ci.yml/badge.svg)](https://github.com/Dicklesworthstone/remote_compilation_helper/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Rust](https://img.shields.io/badge/rust-nightly%202024-orange.svg)](https://www.rust-lang.org/)
-[![CI](https://github.com/Dicklesworthstone/remote_compilation_helper/actions/workflows/ci.yml/badge.svg)](https://github.com/Dicklesworthstone/remote_compilation_helper/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/Dicklesworthstone/remote_compilation_helper/graph/badge.svg)](https://codecov.io/gh/Dicklesworthstone/remote_compilation_helper)
 
 </div>
@@ -24,46 +54,65 @@ cargo install --git https://github.com/Dicklesworthstone/remote_compilation_help
 
 ## TL;DR
 
-**The Problem**: Running 15+ AI coding agents (Claude Code, Codex CLI) simultaneously causes compilation storms—100% CPU, kernel contention, thermal throttling, and unresponsive shells. Your workstation becomes unusable.
+**The Problem**: Running 15+ AI coding agents (Claude Code, Codex CLI) simultaneously creates compilation storms—100% CPU, kernel contention, thermal throttling, and unresponsive shells. Your workstation becomes unusable while agents wait for builds.
 
-**The Solution**: RCH intercepts compilation commands via Claude Code hooks, transparently routes them to a fleet of remote worker machines, and returns artifacts as if nothing happened. Agents never know compilation ran remotely.
+**The Solution**: RCH intercepts compilation commands via Claude Code's PreToolUse hook, transparently routes them to a fleet of remote worker machines, and returns artifacts as if compilation ran locally. Agents never know the difference.
 
 ### Why Use RCH?
 
 | Feature | What It Does |
 |---------|--------------|
 | **Transparent Interception** | Hooks into Claude Code's PreToolUse—agents think compilation ran locally |
-| **Smart Classification** | 5-tier system classifies commands in <1ms; surgical precision avoids false positives |
-| **Fleet Management** | Load-balance across 4+ workers with 48-80 total cores |
+| **Sub-Millisecond Decisions** | 5-tier classifier rejects 99% of commands in <0.1ms, compilation decisions in <1ms |
+| **Smart Worker Selection** | Load-balances across workers using speed scores, available slots, and project locality |
 | **Project Affinity** | Routes to workers with cached project copies—incremental builds stay fast |
-| **Deduplication** | Multiple agents compiling same project share results via broadcast |
+| **Multi-Agent Dedup** | Multiple agents compiling same project share results via broadcast channels |
+| **Fail-Open Design** | Any error falls back to local execution—never blocks an agent |
 
 ---
 
 ## Quick Example
 
 ```bash
-# Start the daemon
-rch daemon start
+# 1. Start the daemon
+$ rchd &
+[rchd] Listening on /tmp/rch.sock
+[rchd] 3 workers online (72 total slots)
 
-# Verify worker connectivity
-rch workers probe --all
+# 2. Configure a worker (one-time)
+$ cat >> ~/.config/rch/workers.toml << 'EOF'
+[[workers]]
+id = "build-server"
+host = "203.0.113.10"
+user = "ubuntu"
+identity_file = "~/.ssh/id_rsa"
+total_slots = 32
+EOF
 
-# Now use Claude Code normally—RCH intercepts automatically
-claude
+# 3. Verify connectivity
+$ rch workers probe --all
+build-server: OK (latency: 12ms, 32 slots, rust 1.87-nightly, bun 1.2.0)
 
-# Inside Claude Code session, compilations are transparently offloaded:
-> cargo build --release     # Runs on remote worker, artifacts returned
-> cargo test               # Same—tests run remotely, output streams back
-> bun test                 # Bun tests offloaded to worker
-> bun typecheck            # TypeScript type checking on worker
-> cargo fmt                # NOT intercepted (modifies local source)
-> bun install              # NOT intercepted (modifies local node_modules)
-> cargo --version          # NOT intercepted (too quick to benefit)
+# 4. Install the hook into Claude Code
+$ rch hook install
+Hook installed at ~/.claude/hooks/pre-tool-use.sh
 
-# Check what's happening
-rch status --jobs          # Active compilations
-rch status --workers       # Worker health and slots
+# 5. Use Claude Code normally—RCH intercepts automatically
+$ claude
+> cargo build --release     # → Runs on build-server, artifacts returned
+> cargo test               # → Tests run remotely, output streams back
+> bun test                 # → Bun tests offloaded to worker
+> cargo fmt                # → NOT intercepted (modifies source)
+> ls -la                   # → NOT intercepted (not compilation)
+
+# 6. Monitor what's happening
+$ rch status --jobs
+ACTIVE JOBS:
+  project-x/cargo build --release  →  build-server (14s elapsed)
+
+$ rch status --workers
+WORKERS:
+  build-server   ████████░░░░  (8/32 slots)  speed: 94.2
 ```
 
 ---
@@ -80,15 +129,15 @@ On any error—worker unreachable, transfer timeout, daemon down—RCH allows lo
 
 ### 3. Precision Over Recall
 
-False positives are catastrophic (intercepting `cargo fmt` breaks source files). False negatives are acceptable (missing an offload opportunity just means local compilation). The 5-tier classifier prioritizes precision.
+False positives are catastrophic (intercepting `cargo fmt` corrupts source files). False negatives are acceptable (missing an offload just means local compilation). The 5-tier classifier prioritizes precision.
 
-### 4. Sub-Millisecond Decisions
+### 4. Sub-Millisecond Non-Compilation Decisions
 
 99% of commands are non-compilation. The hook must reject them in <0.1ms. Only actual compilation commands pay the full classification cost (<5ms).
 
 ### 5. Stateless Hook, Stateful Daemon
 
-The `rch` hook is a pure function—all state lives in `rchd`. This makes the hook fast and debuggable.
+The `rch` hook is a pure function—all state lives in `rchd`. This makes the hook fast, debuggable, and crash-resistant.
 
 ---
 
@@ -96,19 +145,20 @@ The `rch` hook is a pure function—all state lives in `rchd`. This makes the ho
 
 | Capability | RCH | distcc | icecc | Local |
 |------------|-----|--------|-------|-------|
-| **Transparent to agents** | ✅ Full | ❌ Requires wrapper | ❌ Requires wrapper | ✅ |
+| **Transparent to agents** | ✅ Full | ❌ Wrapper required | ❌ Wrapper required | ✅ |
 | **Full Rust support** | ✅ cargo, rustc | ❌ C/C++ only | ❌ C/C++ only | ✅ |
-| **Bun/TypeScript support** | ✅ test, typecheck | ❌ | ❌ | ✅ |
+| **Bun/TypeScript** | ✅ test, typecheck | ❌ | ❌ | ✅ |
+| **C/C++ support** | ✅ gcc, clang, make | ✅ | ✅ | ✅ |
 | **Automatic load balancing** | ✅ Slot-aware | ⚠️ Manual | ✅ | N/A |
 | **Project caching** | ✅ Affinity routing | ❌ | ❌ | ✅ |
-| **Multi-agent dedup** | ✅ Broadcast channels | ❌ | ❌ | ❌ |
+| **Multi-agent dedup** | ✅ Broadcast | ❌ | ❌ | ❌ |
 | **Setup complexity** | ⚠️ Moderate | ✅ Simple | ⚠️ Moderate | ✅ None |
 
 **When to use RCH:**
 - Running multiple AI coding agents simultaneously
 - Your workstation CPU is the bottleneck
 - You have SSH access to remote machines with spare capacity
-- Your projects are Rust-heavy (best support), TypeScript/Bun (good support), or C/C++ (good support)
+- Projects are Rust-heavy (best support), TypeScript/Bun (good), or C/C++ (good)
 
 **When RCH might not be ideal:**
 - Single-agent workflows (local is usually fast enough)
@@ -140,8 +190,10 @@ cargo install --git https://github.com/Dicklesworthstone/remote_compilation_help
 ### Setup Workers
 
 ```bash
-# Configure worker fleet
+# Create config directory
 mkdir -p ~/.config/rch
+
+# Configure your worker fleet
 cat > ~/.config/rch/workers.toml << 'EOF'
 [[workers]]
 id = "worker1"
@@ -160,7 +212,7 @@ total_slots = 32
 priority = 100
 EOF
 
-# Install RCH on workers
+# Install RCH on workers (copies rch-wkr binary)
 rch install --fleet
 
 # Register the Claude Code hook
@@ -174,7 +226,7 @@ rch hook install
 ### 1. Start the Daemon
 
 ```bash
-rchd                           # Foreground (logs visible)
+rchd                          # Foreground (see logs)
 rch daemon start              # Background (systemd/launchd)
 ```
 
@@ -182,18 +234,8 @@ rch daemon start              # Background (systemd/launchd)
 
 ```bash
 rch workers list              # Show configured workers
-rch workers probe --all       # Test SSH connectivity and detect capabilities
-rch workers benchmark         # Measure worker speeds
-```
-
-Worker probing automatically detects installed toolchains (Rust, Bun, Node.js). For Bun/TypeScript projects, verify workers have Bun installed:
-
-```bash
-# Check capabilities on a specific worker
-ssh worker1 "bun --version"   # Should show Bun version
-
-# Or probe via RCH (requires rch-wkr installed on worker)
-rch workers probe worker1 --verbose   # Shows detected capabilities
+rch workers probe --all       # Test SSH connectivity
+rch workers benchmark         # Measure worker speeds (optional)
 ```
 
 ### 3. Use Claude Code Normally
@@ -207,7 +249,7 @@ claude                        # Start Claude Code session
 
 ```bash
 rch status                    # Daemon status
-rch status --workers          # Worker health
+rch status --workers          # Worker health and slots
 rch status --jobs             # Active compilations
 ```
 
@@ -241,7 +283,7 @@ Manage the worker fleet.
 
 ```bash
 rch workers list              # List configured workers
-rch workers probe --all       # Test connectivity
+rch workers probe --all       # Test connectivity and detect capabilities
 rch workers probe worker1     # Test specific worker
 rch workers benchmark         # Run speed benchmarks
 rch workers drain worker1     # Stop routing to worker
@@ -284,8 +326,6 @@ rch hook test                 # Simulate hook invocation
 
 ## Configuration
 
-For full configuration precedence and reference, see `docs/guides/configuration.md`.
-
 ### User Config (`~/.config/rch/config.toml`)
 
 ```toml
@@ -324,7 +364,7 @@ max_latency_ms = 50
 ```toml
 [[workers]]
 id = "css"                       # Unique identifier
-host = "203.0.113.20"           # SSH hostname or IP (example)
+host = "203.0.113.20"           # SSH hostname or IP
 user = "ubuntu"                  # SSH user
 identity_file = "~/.ssh/key.pem" # SSH private key
 total_slots = 32                 # CPU cores available
@@ -475,13 +515,13 @@ Tier 4: Full Classification (<5ms)
 ### "Connection refused to worker"
 
 ```bash
-# Check SSH connectivity
+# Check SSH connectivity directly
 ssh -i ~/.ssh/key.pem ubuntu@worker-host echo "OK"
 
 # Verify worker is configured
 rch workers list
 
-# Test specific worker
+# Test specific worker with verbose output
 rch workers probe worker1 --verbose
 ```
 
@@ -491,7 +531,7 @@ rch workers probe worker1 --verbose
 # Check if project caching is working
 rch status --jobs --verbose
 
-# Force benchmark update
+# Force benchmark update to recalculate speed scores
 rch workers benchmark
 
 # Verify network latency
@@ -512,13 +552,13 @@ cargo build
 ### "Some commands not being intercepted"
 
 ```bash
-# Test classification
+# Test classification manually
 echo '{"tool":"Bash","input":{"command":"cargo build"}}' | rch hook test
 
-# Check confidence threshold
+# Check confidence threshold (default 0.85)
 rch config show | grep confidence_threshold
 
-# Run with verbose to see decisions
+# Run with verbose to see classification decisions
 RCH_VERBOSE=1 cargo build
 ```
 
@@ -573,10 +613,14 @@ Yes—source files are transferred via rsync over SSH. If this is a concern:
 
 ### Does RCH work with non-Rust projects?
 
-Yes, with good support for multiple ecosystems:
-- **Bun/TypeScript**: `bun test` and `bun typecheck` are offloaded. Package management (`bun install`, `bun add`) and dev servers (`bun dev`) run locally.
-- **C/C++**: Compilation via `gcc`, `clang`, `make`, `cmake`, `ninja` is supported.
-- **Not supported**: Go, Python, and npm/yarn/pnpm commands are not intercepted.
+Yes, with varying levels of support:
+
+| Ecosystem | Offloaded Commands | Local Commands |
+|-----------|-------------------|----------------|
+| **Rust** | `cargo build`, `cargo test`, `cargo check`, `cargo run`, `rustc` | `cargo fmt`, `cargo clean`, `cargo install` |
+| **Bun/TypeScript** | `bun test`, `bun typecheck` | `bun install`, `bun dev`, `bun run` |
+| **C/C++** | `gcc`, `g++`, `clang`, `make`, `cmake`, `ninja` | — |
+| **Not supported** | — | Go, Python, npm, yarn, pnpm |
 
 ### What if a worker goes down mid-compilation?
 
@@ -596,12 +640,15 @@ vim ~/.config/rch/workers.toml
 [[workers]]
 id = "new-worker"
 host = "203.0.113.12"
-...
+user = "ubuntu"
+identity_file = "~/.ssh/id_rsa"
+total_slots = 24
+priority = 100
 
-# Install on new worker
+# Install rch-wkr on the new worker
 rch install --worker new-worker
 
-# Probe to verify
+# Verify connectivity
 rch workers probe new-worker
 ```
 
@@ -611,38 +658,9 @@ RCH skips commands estimated to complete locally in <2 seconds. The overhead of 
 
 ---
 
-## Contributing
+## About Contributions
 
-### Development Setup
-
-```bash
-git clone https://github.com/Dicklesworthstone/remote_compilation_helper.git
-cd remote_compilation_helper
-
-# Build all components
-cargo build
-
-# Run tests
-cargo test
-
-# Run with verbose logging
-RUST_LOG=debug cargo run --bin rch -- status
-```
-
-See `docs/TESTING.md` for the full testing guide.
-
-### Project Structure
-
-```
-remote_compilation_helper/
-├── rch/           # Hook CLI binary
-├── rchd/          # Local daemon
-├── rch-wkr/       # Worker agent
-├── rch-common/    # Shared library
-├── config/        # Example configs
-├── scripts/       # Setup scripts
-└── tests/         # Integration tests
-```
+Please don't take this the wrong way, but I do not accept outside contributions for any of my projects. I simply don't have the mental bandwidth to review anything, and it's my name on the thing, so I'm responsible for any problems it causes; thus, the risk-reward is highly asymmetric from my perspective. I'd also have to worry about other "stakeholders," which seems unwise for tools I mostly make for myself for free. Feel free to submit issues, and even PRs if you want to illustrate a proposed fix, but know I won't merge them directly. Instead, I'll have Claude or Codex review submissions via `gh` and independently decide whether and how to address them. Bug reports in particular are welcome. Sorry if this offends, but I want to avoid wasted time and hurt feelings. I understand this isn't in sync with the prevailing open-source ethos that seeks community contributions, but it's the only way I can move at this velocity and keep my sanity.
 
 ---
 
