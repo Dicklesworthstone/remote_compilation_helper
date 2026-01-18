@@ -613,9 +613,15 @@ pub fn state_to_exit_code(state: &RchState) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tracing::info;
+
+    fn log_test_start(name: &str) {
+        info!("TEST START: {}", name);
+    }
 
     #[test]
     fn test_install_status_display() {
+        log_test_start("test_install_status_display");
         assert_eq!(format!("{}", InstallStatus::Ready), "ready");
         assert_eq!(format!("{}", InstallStatus::NeedsSetup), "needs setup");
         assert_eq!(format!("{}", InstallStatus::NotInstalled), "not installed");
@@ -628,6 +634,7 @@ mod tests {
 
     #[test]
     fn test_state_serialization() {
+        log_test_start("test_state_serialization");
         let state = RchState {
             status: InstallStatus::Ready,
             components: ComponentStates {
@@ -683,6 +690,7 @@ mod tests {
 
     #[test]
     fn test_state_to_exit_code() {
+        log_test_start("test_state_to_exit_code");
         let ready_state = RchState {
             status: InstallStatus::Ready,
             components: ComponentStates {

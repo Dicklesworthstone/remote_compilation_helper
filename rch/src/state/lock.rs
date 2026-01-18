@@ -368,9 +368,15 @@ fn hostname() -> String {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+    use tracing::info;
+
+    fn log_test_start(name: &str) {
+        info!("TEST START: {}", name);
+    }
 
     #[test]
     fn test_lock_acquisition_and_release() {
+        log_test_start("test_lock_acquisition_and_release");
         let tmp = TempDir::new().unwrap();
         let lock_dir = tmp.path().join("locks");
         let lock = ConfigLock::acquire_in_dir(&lock_dir, "test_lock", "testing").unwrap();
@@ -381,6 +387,7 @@ mod tests {
 
     #[test]
     fn test_try_acquire_success() {
+        log_test_start("test_try_acquire_success");
         let tmp = TempDir::new().unwrap();
         let lock_dir = tmp.path().join("locks");
         let lock = ConfigLock::try_acquire_in_dir(&lock_dir, "try_test", "testing").unwrap();
@@ -389,6 +396,7 @@ mod tests {
 
     #[test]
     fn test_try_acquire_contended() {
+        log_test_start("test_try_acquire_contended");
         let tmp = TempDir::new().unwrap();
         let lock_dir = tmp.path().join("locks");
         let _lock1 = ConfigLock::try_acquire_in_dir(&lock_dir, "contended", "first")
@@ -402,6 +410,7 @@ mod tests {
 
     #[test]
     fn test_lock_holder() {
+        log_test_start("test_lock_holder");
         let tmp = TempDir::new().unwrap();
         let lock_dir = tmp.path().join("locks");
         let _lock = ConfigLock::acquire_in_dir(&lock_dir, "holder_test", "test operation").unwrap();
@@ -415,6 +424,7 @@ mod tests {
 
     #[test]
     fn test_no_lock_holder_when_unlocked() {
+        log_test_start("test_no_lock_holder_when_unlocked");
         let tmp = TempDir::new().unwrap();
         let lock_dir = tmp.path().join("locks");
         fs::create_dir_all(&lock_dir).unwrap();
@@ -425,6 +435,7 @@ mod tests {
 
     #[test]
     fn test_lock_info_serialization() {
+        log_test_start("test_lock_info_serialization");
         let info = LockInfo {
             pid: 12345,
             hostname: "testhost".to_string(),

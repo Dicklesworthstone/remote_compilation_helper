@@ -2,7 +2,9 @@
 
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
-use rch_common::{ConfigValueSource, OutputVisibility, RchConfig};
+use rch_common::{
+    ConfigValueSource, OutputVisibility, RchConfig, SelfTestFailureAction, SelfTestWorkers,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -112,6 +114,8 @@ struct PartialRchConfig {
     circuit: PartialCircuitConfig,
     #[serde(default)]
     output: PartialOutputConfig,
+    #[serde(default)]
+    self_test: PartialSelfTestConfig,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -147,6 +151,17 @@ struct PartialCircuitConfig {
 struct PartialOutputConfig {
     visibility: Option<OutputVisibility>,
     first_run_complete: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PartialSelfTestConfig {
+    enabled: Option<bool>,
+    schedule: Option<String>,
+    interval: Option<String>,
+    workers: Option<SelfTestWorkers>,
+    on_failure: Option<SelfTestFailureAction>,
+    retry_count: Option<u32>,
+    retry_delay: Option<String>,
 }
 
 /// Load configuration with source tracking.
@@ -442,6 +457,13 @@ fn default_sources_map() -> ConfigSourceMap {
         "circuit.half_open_max_probes",
         "output.visibility",
         "output.first_run_complete",
+        "self_test.enabled",
+        "self_test.schedule",
+        "self_test.interval",
+        "self_test.workers",
+        "self_test.on_failure",
+        "self_test.retry_count",
+        "self_test.retry_delay",
     ] {
         sources.insert(key.to_string(), ConfigValueSource::Default);
     }
@@ -551,6 +573,49 @@ fn apply_layer(
             set_source(sources, "output.first_run_complete", source.clone());
         }
     }
+
+    if let Some(enabled) = layer.self_test.enabled {
+        if enabled != defaults.self_test.enabled {
+            config.self_test.enabled = enabled;
+            set_source(sources, "self_test.enabled", source.clone());
+        }
+    }
+    if let Some(schedule) = layer.self_test.schedule.as_ref() {
+        if defaults.self_test.schedule.as_ref() != Some(schedule) {
+            config.self_test.schedule = Some(schedule.clone());
+            set_source(sources, "self_test.schedule", source.clone());
+        }
+    }
+    if let Some(interval) = layer.self_test.interval.as_ref() {
+        if defaults.self_test.interval.as_ref() != Some(interval) {
+            config.self_test.interval = Some(interval.clone());
+            set_source(sources, "self_test.interval", source.clone());
+        }
+    }
+    if let Some(workers) = layer.self_test.workers.as_ref() {
+        if workers != &defaults.self_test.workers {
+            config.self_test.workers = workers.clone();
+            set_source(sources, "self_test.workers", source.clone());
+        }
+    }
+    if let Some(on_failure) = layer.self_test.on_failure {
+        if on_failure != defaults.self_test.on_failure {
+            config.self_test.on_failure = on_failure;
+            set_source(sources, "self_test.on_failure", source.clone());
+        }
+    }
+    if let Some(retry_count) = layer.self_test.retry_count {
+        if retry_count != defaults.self_test.retry_count {
+            config.self_test.retry_count = retry_count;
+            set_source(sources, "self_test.retry_count", source.clone());
+        }
+    }
+    if let Some(retry_delay) = layer.self_test.retry_delay.as_ref() {
+        if defaults.self_test.retry_delay != *retry_delay {
+            config.self_test.retry_delay = retry_delay.clone();
+            set_source(sources, "self_test.retry_delay", source.clone());
+        }
+    }
 }
 
 fn set_source(sources: &mut ConfigSourceMap, key: &str, source: ConfigValueSource) {
@@ -584,6 +649,9 @@ fn merge_config(mut base: RchConfig, overlay: RchConfig) -> RchConfig {
 
     // Merge output section
     merge_output(&mut base.output, &overlay.output, &default.output);
+
+    // Merge self-test section
+    merge_self_test(&mut base.self_test, &overlay.self_test, &default.self_test);
 
     base
 }
@@ -677,6 +745,35 @@ fn merge_output(
     }
     if overlay.first_run_complete != default.first_run_complete {
         base.first_run_complete = overlay.first_run_complete;
+    }
+}
+
+/// Merge SelfTestConfig fields.
+fn merge_self_test(
+    base: &mut rch_common::SelfTestConfig,
+    overlay: &rch_common::SelfTestConfig,
+    default: &rch_common::SelfTestConfig,
+) {
+    if overlay.enabled != default.enabled {
+        base.enabled = overlay.enabled;
+    }
+    if overlay.schedule != default.schedule {
+        base.schedule.clone_from(&overlay.schedule);
+    }
+    if overlay.interval != default.interval {
+        base.interval.clone_from(&overlay.interval);
+    }
+    if overlay.workers != default.workers {
+        base.workers = overlay.workers.clone();
+    }
+    if overlay.on_failure != default.on_failure {
+        base.on_failure = overlay.on_failure;
+    }
+    if overlay.retry_count != default.retry_count {
+        base.retry_count = overlay.retry_count;
+    }
+    if overlay.retry_delay != default.retry_delay {
+        base.retry_delay.clone_from(&overlay.retry_delay);
     }
 }
 

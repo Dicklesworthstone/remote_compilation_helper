@@ -297,8 +297,13 @@ CHECKS PERFORMED:
     rch self-test --worker css        # Test a specific worker
     rch self-test --project ../app    # Test a different project directory
     rch self-test --timeout 600       # Increase timeout to 10 minutes
-    rch self-test --debug             # Use debug build instead of release"#)]
+    rch self-test --debug             # Use debug build instead of release
+    rch self-test status              # Show schedule and last run
+    rch self-test history --limit 10  # Show recent runs"#)]
     SelfTest {
+        /// Self-test subcommand
+        #[command(subcommand)]
+        action: Option<SelfTestAction>,
         /// Test a specific worker by id
         #[arg(long)]
         worker: Option<String>,
@@ -314,6 +319,9 @@ CHECKS PERFORMED:
         /// Use debug build instead of release
         #[arg(long)]
         debug: bool,
+        /// Run using scheduled settings (ignores worker selection flags)
+        #[arg(long)]
+        scheduled: bool,
     },
 
     /// Update RCH binaries on local machine and/or workers
@@ -395,6 +403,7 @@ configured remote workers."#)]
     rch dashboard --refresh 500        # 500ms refresh rate
     rch dashboard --no-mouse           # Disable mouse support
     rch dashboard --high-contrast      # High contrast mode
+    rch dashboard --color-blind tritanopia  # Color blind palette
 
 The dashboard provides real-time monitoring of:
   - Worker status and slot utilization
@@ -420,6 +429,10 @@ Controls:
         /// High contrast mode for accessibility
         #[arg(long)]
         high_contrast: bool,
+
+        /// Color blind palette (none, deuteranopia, protanopia, tritanopia)
+        #[arg(long, value_enum, default_value = "none")]
+        color_blind: tui::ColorBlindMode,
     },
 
     /// Launch the web-based dashboard in your browser
@@ -446,6 +459,18 @@ The web dashboard provides a modern browser-based interface for:
         /// Serve production build instead of dev server
         #[arg(long)]
         prod: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum SelfTestAction {
+    /// Show schedule and last run information
+    Status,
+    /// Show recent self-test runs
+    History {
+        /// Number of runs to show (default: 10)
+        #[arg(long, default_value = "10")]
+        limit: usize,
     },
 }
 
@@ -863,14 +888,18 @@ async fn main() -> Result<()> {
             Commands::Completions { action } => handle_completions(action, &ctx),
             Commands::Doctor { fix, install_deps } => handle_doctor(fix, install_deps, &ctx).await,
             Commands::SelfTest {
+                action,
                 worker,
                 all,
                 project,
                 timeout,
                 debug,
+                scheduled,
             } => {
-                let _ = (worker, all, project, timeout, debug);
-                Err(anyhow::anyhow!("self-test command is not implemented yet"))
+                commands::self_test(
+                    action, worker, all, project, timeout, debug, scheduled, &ctx,
+                )
+                .await
             }
             Commands::Update {
                 check,
@@ -906,11 +935,13 @@ async fn main() -> Result<()> {
                 refresh,
                 no_mouse,
                 high_contrast,
+                color_blind,
             } => {
                 let config = tui::TuiConfig {
                     refresh_interval_ms: refresh,
                     mouse_support: !no_mouse,
                     high_contrast,
+                    color_blind,
                 };
                 tui::run_tui(config).await
             }
@@ -2138,10 +2169,12 @@ mod tests {
                 refresh,
                 no_mouse,
                 high_contrast,
+                color_blind,
             }) => {
                 assert_eq!(refresh, 1000);
                 assert!(!no_mouse);
                 assert!(!high_contrast);
+                assert_eq!(color_blind, tui::ColorBlindMode::None);
             }
             _ => panic!("Expected dashboard command"),
         }

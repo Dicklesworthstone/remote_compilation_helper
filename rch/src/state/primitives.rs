@@ -439,9 +439,15 @@ pub fn ensure_directory(path: &Path) -> Result<IdempotentResult> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+    use tracing::info;
+
+    fn log_test_start(name: &str) {
+        info!("TEST START: {}", name);
+    }
 
     #[test]
     fn test_atomic_write_creates_file() {
+        log_test_start("test_atomic_write_creates_file");
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("test.txt");
 
@@ -451,6 +457,7 @@ mod tests {
 
     #[test]
     fn test_atomic_write_overwrites() {
+        log_test_start("test_atomic_write_overwrites");
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("test.txt");
 
@@ -461,6 +468,7 @@ mod tests {
 
     #[test]
     fn test_atomic_write_creates_parent_dirs() {
+        log_test_start("test_atomic_write_creates_parent_dirs");
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("a/b/c/test.txt");
 
@@ -470,6 +478,7 @@ mod tests {
 
     #[test]
     fn test_atomic_write_no_temp_files_left() {
+        log_test_start("test_atomic_write_no_temp_files_left");
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("test.txt");
 
@@ -486,6 +495,7 @@ mod tests {
 
     #[test]
     fn test_create_if_missing_creates() {
+        log_test_start("test_create_if_missing_creates");
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("config.toml");
 
@@ -496,6 +506,7 @@ mod tests {
 
     #[test]
     fn test_create_if_missing_idempotent() {
+        log_test_start("test_create_if_missing_idempotent");
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("config.toml");
 
@@ -511,6 +522,7 @@ mod tests {
 
     #[test]
     fn test_update_if_changed_creates() {
+        log_test_start("test_update_if_changed_creates");
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("config.toml");
 
@@ -520,6 +532,7 @@ mod tests {
 
     #[test]
     fn test_update_if_changed_updates() {
+        log_test_start("test_update_if_changed_updates");
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("config.toml");
 
@@ -531,6 +544,7 @@ mod tests {
 
     #[test]
     fn test_update_if_changed_unchanged() {
+        log_test_start("test_update_if_changed_unchanged");
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("config.toml");
 
@@ -541,6 +555,7 @@ mod tests {
 
     #[test]
     fn test_append_line_if_missing_creates() {
+        log_test_start("test_append_line_if_missing_creates");
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("test.txt");
 
@@ -551,6 +566,7 @@ mod tests {
 
     #[test]
     fn test_append_line_if_missing_appends() {
+        log_test_start("test_append_line_if_missing_appends");
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("test.txt");
 
@@ -565,6 +581,7 @@ mod tests {
 
     #[test]
     fn test_append_line_if_missing_idempotent() {
+        log_test_start("test_append_line_if_missing_idempotent");
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("test.txt");
 
@@ -579,6 +596,7 @@ mod tests {
 
     #[test]
     fn test_ensure_directory_creates() {
+        log_test_start("test_ensure_directory_creates");
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("new_dir");
 
@@ -589,6 +607,7 @@ mod tests {
 
     #[test]
     fn test_ensure_directory_idempotent() {
+        log_test_start("test_ensure_directory_idempotent");
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("dir");
 
@@ -600,6 +619,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_ensure_symlink_creates() {
+        log_test_start("test_ensure_symlink_creates");
         let tmp = TempDir::new().unwrap();
         let target = tmp.path().join("target");
         let link = tmp.path().join("link");
@@ -613,6 +633,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_ensure_symlink_idempotent() {
+        log_test_start("test_ensure_symlink_idempotent");
         let tmp = TempDir::new().unwrap();
         let target = tmp.path().join("target");
         let link = tmp.path().join("link");
@@ -625,6 +646,7 @@ mod tests {
 
     #[test]
     fn test_idempotent_result_display() {
+        log_test_start("test_idempotent_result_display");
         assert_eq!(format!("{}", IdempotentResult::Created), "created");
         assert_eq!(
             format!("{}", IdempotentResult::AlreadyExists),

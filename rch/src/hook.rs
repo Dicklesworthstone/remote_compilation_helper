@@ -1076,6 +1076,7 @@ mod tests {
                     speed_score: 95.0,
                 }),
                 reason: SelectionReason::Success,
+                build_id: None,
             };
             let body = serde_json::to_string(&response).unwrap();
             let http_response = format!(
@@ -1151,6 +1152,7 @@ mod tests {
                     speed_score: 1.0,
                 }),
                 reason: SelectionReason::Success,
+                build_id: None,
             };
             let body = serde_json::to_string(&response).unwrap();
             let http = format!("HTTP/1.1 200 OK\r\n\r\n{}", body);
@@ -1250,6 +1252,7 @@ mod tests {
                 speed_score: 90.0,
             }),
             reason: SelectionReason::Success,
+            build_id: None,
         };
         spawn_mock_daemon(&socket_path, response).await;
 
@@ -1306,6 +1309,7 @@ mod tests {
                 speed_score: 90.0,
             }),
             reason: SelectionReason::Success,
+            build_id: None,
         };
         spawn_mock_daemon(&socket_path, response).await;
 
@@ -1363,6 +1367,7 @@ mod tests {
                 speed_score: 90.0,
             }),
             reason: SelectionReason::Success,
+            build_id: None,
         };
         spawn_mock_daemon(&socket_path, response).await;
 
@@ -1440,6 +1445,7 @@ mod tests {
         let response = SelectionResponse {
             worker: None,
             reason: SelectionReason::NoWorkersConfigured,
+            build_id: None,
         };
         spawn_mock_daemon(&socket_path, response).await;
         tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
@@ -1482,6 +1488,7 @@ mod tests {
         let response = SelectionResponse {
             worker: None,
             reason: SelectionReason::AllWorkersUnreachable,
+            build_id: None,
         };
         spawn_mock_daemon(&socket_path, response).await;
         tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
@@ -1524,6 +1531,7 @@ mod tests {
         let response = SelectionResponse {
             worker: None,
             reason: SelectionReason::AllWorkersBusy,
+            build_id: None,
         };
         spawn_mock_daemon(&socket_path, response).await;
         tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
@@ -1566,6 +1574,7 @@ mod tests {
         let response = SelectionResponse {
             worker: None,
             reason: SelectionReason::AllCircuitsOpen,
+            build_id: None,
         };
         spawn_mock_daemon(&socket_path, response).await;
         tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
@@ -1608,6 +1617,7 @@ mod tests {
         let response = SelectionResponse {
             worker: None,
             reason: SelectionReason::SelectionError("Internal error".to_string()),
+            build_id: None,
         };
         spawn_mock_daemon(&socket_path, response).await;
         tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;

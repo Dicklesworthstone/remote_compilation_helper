@@ -96,6 +96,55 @@ pub struct BuildStatsFromApi {
     pub avg_duration_ms: u64,
 }
 
+// ============================================================================
+// Self-Test API Types
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SelfTestRunRecordFromApi {
+    pub id: u64,
+    pub run_type: String,
+    pub started_at: String,
+    pub completed_at: String,
+    pub workers_tested: usize,
+    pub workers_passed: usize,
+    pub workers_failed: usize,
+    pub duration_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SelfTestResultRecordFromApi {
+    pub run_id: u64,
+    pub worker_id: String,
+    pub passed: bool,
+    pub local_hash: Option<String>,
+    pub remote_hash: Option<String>,
+    pub local_time_ms: Option<u64>,
+    pub remote_time_ms: Option<u64>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SelfTestStatusResponse {
+    pub enabled: bool,
+    pub schedule: Option<String>,
+    pub interval: Option<String>,
+    pub last_run: Option<SelfTestRunRecordFromApi>,
+    pub next_run: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SelfTestHistoryResponse {
+    pub runs: Vec<SelfTestRunRecordFromApi>,
+    pub results: Vec<SelfTestResultRecordFromApi>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SelfTestRunResponse {
+    pub run: SelfTestRunRecordFromApi,
+    pub results: Vec<SelfTestResultRecordFromApi>,
+}
+
 /// Helper to format duration in human-readable form.
 pub fn format_duration(secs: u64) -> String {
     if secs < 60 {

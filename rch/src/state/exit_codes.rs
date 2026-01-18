@@ -101,9 +101,15 @@ pub fn is_setup_required(code: i32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tracing::info;
+
+    fn log_test_start(name: &str) {
+        info!("TEST START: {}", name);
+    }
 
     #[test]
     fn test_exit_code_values() {
+        log_test_start("test_exit_code_values");
         // Standard codes
         assert_eq!(OK, 0);
         assert_eq!(ERROR, 1);
@@ -121,6 +127,7 @@ mod tests {
 
     #[test]
     fn test_message() {
+        log_test_start("test_message");
         assert_eq!(message(OK), "Success");
         assert!(message(NEEDS_SETUP).contains("setup"));
         assert!(message(DAEMON_DOWN).contains("daemon"));
@@ -130,6 +137,7 @@ mod tests {
 
     #[test]
     fn test_is_success() {
+        log_test_start("test_is_success");
         assert!(is_success(OK));
         assert!(!is_success(ERROR));
         assert!(!is_success(NEEDS_SETUP));
@@ -137,6 +145,7 @@ mod tests {
 
     #[test]
     fn test_is_setup_required() {
+        log_test_start("test_is_setup_required");
         assert!(is_setup_required(NEEDS_SETUP));
         assert!(is_setup_required(NO_WORKERS));
         assert!(is_setup_required(NEEDS_MIGRATION));
