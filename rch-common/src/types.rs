@@ -1,6 +1,6 @@
 //! Common types used across RCH components.
 
-use crate::toolchain::ToolchainInfo;
+use crate::{CompilationKind, toolchain::ToolchainInfo};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -1096,6 +1096,22 @@ fn default_build_timeout() -> u64 {
 /// Test suites often take significantly longer than builds.
 fn default_test_timeout() -> u64 {
     1800
+}
+
+impl CompilationConfig {
+    /// Returns the appropriate timeout for the given compilation kind.
+    ///
+    /// Test commands get the longer test timeout, while all other commands
+    /// (builds, checks, clippy, etc.) use the build timeout.
+    pub fn timeout_for_kind(&self, kind: Option<CompilationKind>) -> std::time::Duration {
+        let secs = match kind {
+            Some(CompilationKind::CargoTest)
+            | Some(CompilationKind::CargoNextest)
+            | Some(CompilationKind::BunTest) => self.test_timeout_sec,
+            _ => self.build_timeout_sec,
+        };
+        std::time::Duration::from_secs(secs)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

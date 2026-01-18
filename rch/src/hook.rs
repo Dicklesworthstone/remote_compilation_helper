@@ -544,6 +544,7 @@ async fn process_hook(input: HookInput) -> HookOutput {
                 &worker,
                 command,
                 config.transfer.clone(),
+                &config.compilation,
                 toolchain.as_ref(),
                 classification.kind,
                 &reporter,
@@ -955,6 +956,7 @@ async fn execute_remote_compilation(
     worker: &SelectedWorker,
     command: &str,
     transfer_config: TransferConfig,
+    compilation_config: &rch_common::CompilationConfig,
     toolchain: Option<&ToolchainInfo>,
     kind: Option<CompilationKind>,
     reporter: &HookReporter,
@@ -979,14 +981,16 @@ async fn execute_remote_compilation(
         project_id, worker_config.id
     ));
 
-    // Create transfer pipeline with color mode for output preservation
+    // Create transfer pipeline with color mode and command timeout
+    let command_timeout = compilation_config.timeout_for_kind(kind);
     let pipeline = TransferPipeline::new(
         project_root.clone(),
         project_id.clone(),
         project_hash,
         transfer_config,
     )
-    .with_color_mode(color_mode);
+    .with_color_mode(color_mode)
+    .with_command_timeout(command_timeout);
 
     // Step 1: Sync project to remote
     info!("Syncing project to worker {}...", worker_config.id);

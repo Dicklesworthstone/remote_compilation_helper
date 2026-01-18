@@ -71,6 +71,16 @@ impl TransferPipeline {
         self
     }
 
+    /// Set command timeout for remote execution.
+    ///
+    /// Different command types may need different timeouts. For example,
+    /// test commands often need longer timeouts than build commands.
+    #[allow(dead_code)] // Reserved for future CLI/config support
+    pub fn with_command_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.ssh_options.command_timeout = timeout;
+        self
+    }
+
     /// Get the remote project path on the worker.
     pub fn remote_path(&self) -> String {
         format!("{}/{}/{}", REMOTE_BASE, self.project_id, self.project_hash)
