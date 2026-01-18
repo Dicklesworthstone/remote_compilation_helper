@@ -132,6 +132,8 @@ struct PartialCompilationConfig {
     build_slots: Option<u32>,
     test_slots: Option<u32>,
     check_slots: Option<u32>,
+    build_timeout_sec: Option<u64>,
+    test_timeout_sec: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -261,6 +263,12 @@ pub fn validate_rch_config_file(path: &Path) -> FileValidation {
     }
     if config.compilation.check_slots == 0 {
         validation.error("compilation.check_slots must be greater than 0".to_string());
+    }
+    if config.compilation.build_timeout_sec == 0 {
+        validation.error("compilation.build_timeout_sec must be greater than 0".to_string());
+    }
+    if config.compilation.test_timeout_sec == 0 {
+        validation.error("compilation.test_timeout_sec must be greater than 0".to_string());
     }
 
     if config.transfer.compression_level > 19 {
@@ -462,6 +470,8 @@ fn default_sources_map() -> ConfigSourceMap {
         "compilation.build_slots",
         "compilation.test_slots",
         "compilation.check_slots",
+        "compilation.build_timeout_sec",
+        "compilation.test_timeout_sec",
         "transfer.compression_level",
         "transfer.exclude_patterns",
         "circuit.failure_threshold",
@@ -541,6 +551,18 @@ fn apply_layer(
         if check_slots != defaults.compilation.check_slots {
             config.compilation.check_slots = check_slots;
             set_source(sources, "compilation.check_slots", source.clone());
+        }
+    }
+    if let Some(build_timeout_sec) = layer.compilation.build_timeout_sec {
+        if build_timeout_sec != defaults.compilation.build_timeout_sec {
+            config.compilation.build_timeout_sec = build_timeout_sec;
+            set_source(sources, "compilation.build_timeout_sec", source.clone());
+        }
+    }
+    if let Some(test_timeout_sec) = layer.compilation.test_timeout_sec {
+        if test_timeout_sec != defaults.compilation.test_timeout_sec {
+            config.compilation.test_timeout_sec = test_timeout_sec;
+            set_source(sources, "compilation.test_timeout_sec", source.clone());
         }
     }
 
@@ -730,6 +752,12 @@ fn merge_compilation(
     if overlay.check_slots != default.check_slots {
         base.check_slots = overlay.check_slots;
     }
+    if overlay.build_timeout_sec != default.build_timeout_sec {
+        base.build_timeout_sec = overlay.build_timeout_sec;
+    }
+    if overlay.test_timeout_sec != default.test_timeout_sec {
+        base.test_timeout_sec = overlay.test_timeout_sec;
+    }
 }
 
 /// Merge TransferConfig fields.
@@ -875,13 +903,15 @@ fn apply_env_overrides_inner(
     };
 
     if let Some(val) = get_env("RCH_ENABLED") {
-        config.general.enabled = val.parse().unwrap_or(true);
-        if let Some(ref mut sources) = sources {
-            set_source(
-                sources,
-                "general.enabled",
-                ConfigValueSource::EnvVar("RCH_ENABLED".to_string()),
-            );
+        if let Some(enabled) = parse_bool(&val) {
+            config.general.enabled = enabled;
+            if let Some(ref mut sources) = sources {
+                set_source(
+                    sources,
+                    "general.enabled",
+                    ConfigValueSource::EnvVar("RCH_ENABLED".to_string()),
+                );
+            }
         }
     }
 
@@ -951,6 +981,30 @@ fn apply_env_overrides_inner(
                     sources,
                     "compilation.check_slots",
                     ConfigValueSource::EnvVar("RCH_CHECK_SLOTS".to_string()),
+                );
+            }
+        }
+    }
+    if let Some(val) = get_env("RCH_BUILD_TIMEOUT_SEC") {
+        if let Ok(timeout) = val.parse() {
+            config.compilation.build_timeout_sec = timeout;
+            if let Some(ref mut sources) = sources {
+                set_source(
+                    sources,
+                    "compilation.build_timeout_sec",
+                    ConfigValueSource::EnvVar("RCH_BUILD_TIMEOUT_SEC".to_string()),
+                );
+            }
+        }
+    }
+    if let Some(val) = get_env("RCH_TEST_TIMEOUT_SEC") {
+        if let Ok(timeout) = val.parse() {
+            config.compilation.test_timeout_sec = timeout;
+            if let Some(ref mut sources) = sources {
+                set_source(
+                    sources,
+                    "compilation.test_timeout_sec",
+                    ConfigValueSource::EnvVar("RCH_TEST_TIMEOUT_SEC".to_string()),
                 );
             }
         }
@@ -1350,20 +1404,27 @@ identity_file = "/tmp/id_ed25519"
         base.compilation.build_slots = 6;
         base.compilation.test_slots = 10;
         base.compilation.check_slots = 3;
+        base.compilation.build_timeout_sec = 420;
+        base.compilation.test_timeout_sec = 2400;
 
         let mut overlay = RchConfig::default();
         overlay.compilation.build_slots = 12;
+        overlay.compilation.build_timeout_sec = 600;
 
         let merged = merge_config(base.clone(), overlay);
         info!(
-            "RESULT: build_slots={}, test_slots={}, check_slots={}",
+            "RESULT: build_slots={}, test_slots={}, check_slots={}, build_timeout_sec={}, test_timeout_sec={}",
             merged.compilation.build_slots,
             merged.compilation.test_slots,
-            merged.compilation.check_slots
+            merged.compilation.check_slots,
+            merged.compilation.build_timeout_sec,
+            merged.compilation.test_timeout_sec
         );
         assert_eq!(merged.compilation.build_slots, 12);
         assert_eq!(merged.compilation.test_slots, 10);
         assert_eq!(merged.compilation.check_slots, 3);
+        assert_eq!(merged.compilation.build_timeout_sec, 600);
+        assert_eq!(merged.compilation.test_timeout_sec, 2400);
         info!("TEST PASS: test_merge_compilation_slots_override");
     }
 
@@ -1848,14 +1909,14 @@ identity_file = "/tmp/id_ed25519"
         let mut config = RchConfig::default();
         let mut sources = default_sources_map();
         let mut env_overrides: HashMap<String, String> = HashMap::new();
-        env_overrides.insert("RCH_ENABLED".to_string(), "false".to_string());
+        env_overrides.insert("RCH_ENABLED".to_string(), "0".to_string());
 
         apply_env_overrides_inner(&mut config, Some(&mut sources), Some(&env_overrides));
 
         info!("RESULT: enabled={}", config.general.enabled);
         assert!(
             !config.general.enabled,
-            "expected RCH_ENABLED=false to disable"
+            "expected RCH_ENABLED=0 to disable"
         );
         let source = sources
             .get("general.enabled")

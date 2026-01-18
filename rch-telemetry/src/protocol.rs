@@ -252,7 +252,7 @@ pub struct PiggybackExtraction {
 /// Looks for the telemetry marker and parses the JSON following it.
 /// Returns the clean build output and the extracted telemetry.
 pub fn extract_piggybacked_telemetry(output: &str) -> PiggybackExtraction {
-    if let Some(marker_pos) = output.find(PIGGYBACK_MARKER) {
+    if let Some(marker_pos) = output.rfind(PIGGYBACK_MARKER) {
         let build_output = output[..marker_pos].trim_end().to_string();
         let telemetry_start = marker_pos + PIGGYBACK_MARKER.len();
         let telemetry_json = output[telemetry_start..].trim();
@@ -465,6 +465,21 @@ mod tests {
         assert!(extraction.telemetry.is_none());
         assert!(extraction.extraction_error.is_some());
         assert_eq!(extraction.build_output, "Build output");
+    }
+
+    #[test]
+    fn test_extract_piggybacked_uses_last_marker() {
+        let telemetry = make_test_worker_telemetry();
+        let build_output = format!(
+            "Build output\n{}\nnoise\nmore output",
+            PIGGYBACK_MARKER
+        );
+        let combined = format!("{}\n{}", build_output, telemetry.to_piggyback().unwrap());
+
+        let extraction = extract_piggybacked_telemetry(&combined);
+        assert!(extraction.telemetry.is_some());
+        assert!(extraction.extraction_error.is_none());
+        assert_eq!(extraction.build_output, build_output);
     }
 
     #[test]
