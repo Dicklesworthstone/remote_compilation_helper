@@ -1,6 +1,10 @@
 # rch — Remote Compilation Helper
 
 <div align="center">
+  <img src="rch_illustration.webp" alt="rch - Remote Compilation Helper for AI coding agents">
+</div>
+
+<div align="center">
 
 ```
      ╭──────────────────────────────────────────────────────╮
