@@ -650,15 +650,16 @@ mod tests {
         let test_patterns = default_rust_test_artifact_patterns();
         let full_patterns = default_rust_artifact_patterns();
 
-        // Test patterns should have fewer items than full patterns
-        // (since we're excluding the bulk of target/)
-        assert!(
-            test_patterns.len() <= full_patterns.len(),
-            "Test patterns should be minimal, not larger than full patterns"
-        );
-
-        // Full patterns should include debug/release
+        // Full patterns should include debug/release (the heavy directories)
         assert!(full_patterns.iter().any(|p| p.contains("debug")));
         assert!(full_patterns.iter().any(|p| p.contains("release")));
+
+        // Test patterns should NOT include debug/release directories
+        // (This is the key optimization - avoiding GB of data transfer)
+        assert!(!test_patterns.iter().any(|p| p.contains("debug")));
+        assert!(!test_patterns.iter().any(|p| p.contains("release")));
+
+        // Test patterns focus on results/coverage, not build artifacts
+        assert!(test_patterns.iter().any(|p| p.contains("coverage")));
     }
 }
