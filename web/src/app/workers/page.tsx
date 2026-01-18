@@ -1,9 +1,10 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import useSWR from 'swr';
 import { Server, RefreshCw } from 'lucide-react';
 import { motion } from 'motion/react';
+import { toast } from 'sonner';
 import { api } from '@/lib/api';
 import { Skeleton } from '@/components/ui/skeleton';
 import { ErrorState, errorHints } from '@/components/ui/error-state';
@@ -31,6 +32,7 @@ function WorkersPageSkeleton() {
 
 export default function WorkersPage() {
   const [isRetrying, setIsRetrying] = useState(false);
+  const hadErrorRef = useRef(false);
   const { data, error, isLoading, mutate, isValidating } = useSWR<StatusResponse>(
     'status',
     () => api.getStatus(),
@@ -40,12 +42,31 @@ export default function WorkersPage() {
     }
   );
 
+  useEffect(() => {
+    if (hadErrorRef.current && !error) {
+      toast.success('Connection restored');
+    }
+    hadErrorRef.current = Boolean(error);
+  }, [error]);
+
   const handleRetry = async () => {
     setIsRetrying(true);
+    toast('Retrying connection...');
     try {
       await mutate();
+    } catch (err) {
+      toast.error('Retry failed');
     } finally {
       setIsRetrying(false);
+    }
+  };
+
+  const handleRefresh = async () => {
+    try {
+      await mutate();
+      toast.success('Workers refreshed');
+    } catch (err) {
+      toast.error('Failed to refresh workers');
     }
   };
 
@@ -86,7 +107,7 @@ export default function WorkersPage() {
         </div>
         <button
           type="button"
-          onClick={() => mutate()}
+          onClick={handleRefresh}
           disabled={isValidating}
           className="p-2 rounded-lg hover:bg-surface-elevated transition-colors disabled:opacity-50"
           title="Refresh"
