@@ -889,7 +889,8 @@ fn compute_score(
     priority_score: f64,
 ) -> f64 {
     // Slot availability score (0.0-1.0)
-    let slot_score = worker.available_slots() as f64 / worker.config.total_slots as f64;
+    let total_slots = worker.config.total_slots.max(1) as f64;
+    let slot_score = (worker.available_slots() as f64 / total_slots).min(1.0);
 
     // Speed score (already 0-100, normalize to 0-1)
     let speed_score = worker.speed_score / 100.0;
@@ -981,6 +982,24 @@ mod tests {
         let score = compute_score(&worker, &request, &weights, 0.5);
         assert!(score > 0.0);
         assert!(score <= 1.5);
+    }
+
+    #[test]
+    fn test_selection_score_zero_slots_safe() {
+        let worker = make_worker("zero", 0, 80.0);
+        let request = SelectionRequest {
+            project: "myproject".to_string(),
+            command: None,
+            estimated_cores: 1,
+            preferred_workers: vec![],
+            toolchain: None,
+            required_runtime: RequiredRuntime::default(),
+            classification_duration_us: None,
+        };
+        let weights = SelectionWeights::default();
+
+        let score = compute_score(&worker, &request, &weights, 0.5);
+        assert!(score.is_finite());
     }
 
     #[tokio::test]
