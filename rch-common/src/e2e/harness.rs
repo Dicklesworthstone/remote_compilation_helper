@@ -8,9 +8,11 @@
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use super::logging::{LogLevel, LogSource, TestLogger, TestLoggerBuilder};
@@ -463,19 +465,17 @@ impl TestHarness {
 
     /// Execute a command with a specific timeout
     ///
-    /// Note: Timeout enforcement is not yet implemented; the parameter is reserved
-    /// for future use when async process spawning with timeouts is added.
+    /// Terminates the process if it exceeds the provided timeout.
     pub fn exec_with_timeout<I, S>(
         &self,
         program: &str,
         args: I,
-        _timeout: Duration,
+        timeout: Duration,
     ) -> HarnessResult<CommandResult>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        // TODO: Implement actual timeout enforcement with async process spawning
         let args: Vec<_> = args.into_iter().collect();
         let args_display: Vec<_> = args.iter().map(|s| s.as_ref().to_string_lossy()).collect();
 
@@ -495,13 +495,49 @@ impl TestHarness {
             cmd.env(k, v);
         }
 
-        let output = cmd.output()?;
+        let mut child = cmd.spawn()?;
+        let stdout_handle = child
+            .stdout
+            .take()
+            .map(|mut stdout| thread::spawn(move || Self::read_to_string(&mut stdout)));
+        let stderr_handle = child
+            .stderr
+            .take()
+            .map(|mut stderr| thread::spawn(move || Self::read_to_string(&mut stderr)));
+
+        let mut timed_out = false;
+        let exit_status = loop {
+            if let Some(status) = child.try_wait()? {
+                break Some(status);
+            }
+
+            if start.elapsed() >= timeout {
+                timed_out = true;
+                let _ = child.kill();
+                break child.wait().ok();
+            }
+
+            thread::sleep(Duration::from_millis(10));
+        };
+
         let duration = start.elapsed();
+        let stdout = Self::join_output(stdout_handle);
+        let mut stderr = Self::join_output(stderr_handle);
+        if timed_out {
+            if !stderr.is_empty() {
+                stderr.push('\n');
+            }
+            stderr.push_str(&format!("Process timed out after {:?}.", timeout));
+        }
+
+        let exit_code = exit_status
+            .and_then(|status| status.code())
+            .unwrap_or(if timed_out { 124 } else { -1 });
 
         let result = CommandResult {
-            exit_code: output.status.code().unwrap_or(-1),
-            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+            exit_code,
+            stdout,
+            stderr,
             duration,
         };
 
@@ -516,6 +552,7 @@ impl TestHarness {
             vec![
                 ("exit_code".to_string(), result.exit_code.to_string()),
                 ("duration_ms".to_string(), duration.as_millis().to_string()),
+                ("timed_out".to_string(), timed_out.to_string()),
             ],
         );
 
@@ -540,6 +577,22 @@ impl TestHarness {
         }
 
         Ok(result)
+    }
+
+    fn read_to_string<R: Read>(reader: &mut R) -> String {
+        let mut buffer = Vec::new();
+        if reader.read_to_end(&mut buffer).is_ok() {
+            String::from_utf8_lossy(&buffer).to_string()
+        } else {
+            String::new()
+        }
+    }
+
+    fn join_output(handle: Option<thread::JoinHandle<String>>) -> String {
+        match handle {
+            Some(handle) => handle.join().unwrap_or_default(),
+            None => String::new(),
+        }
     }
 
     /// Execute the rch binary
@@ -895,6 +948,23 @@ mod tests {
         let result = harness.exec("echo", ["hello"]).unwrap();
         assert!(result.success());
         assert!(result.stdout_contains("hello"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_harness_exec_timeout() {
+        let harness = TestHarnessBuilder::new("test_exec_timeout")
+            .cleanup_on_success(true)
+            .build()
+            .unwrap();
+
+        let result = harness
+            .exec_with_timeout("sleep", ["1"], Duration::from_millis(50))
+            .unwrap();
+
+        assert!(!result.success());
+        assert_eq!(result.exit_code, 124);
+        assert!(result.stderr_contains("timed out"));
     }
 
     #[test]

@@ -33,6 +33,8 @@ pub struct VerificationResult {
     pub local_hash: BinaryHashResult,
     /// Hash result from remote build.
     pub remote_hash: BinaryHashResult,
+    /// Time spent on local compilation in milliseconds.
+    pub local_build_ms: u64,
     /// Time spent on rsync upload in milliseconds.
     pub rsync_up_ms: u64,
     /// Time spent on remote compilation in milliseconds.
@@ -208,6 +210,7 @@ impl RemoteCompilationTest {
             success,
             local_hash,
             remote_hash,
+            local_build_ms,
             rsync_up_ms,
             compilation_ms,
             rsync_down_ms,
@@ -528,6 +531,7 @@ mod tests {
                 text_section_size: 12345,
                 is_debug: false,
             },
+            local_build_ms: 1200,
             rsync_up_ms: 100,
             compilation_ms: 5000,
             rsync_down_ms: 200,
@@ -568,6 +572,7 @@ mod tests {
                 text_section_size: 1000,
                 is_debug: false,
             },
+            local_build_ms: 900,
             rsync_up_ms: 50,
             compilation_ms: 3000,
             rsync_down_ms: 50,
@@ -806,6 +811,7 @@ mod tests {
                 text_section_size: 100,
                 is_debug: false,
             },
+            local_build_ms: 1200,
             rsync_up_ms: 150,
             compilation_ms: 8000,
             rsync_down_ms: 200,

@@ -42,7 +42,8 @@ pub use types::{
     CompilationConfig, CompilationMetrics, CompilationTimer, CompilationTimingBreakdown,
     GeneralConfig, MetricsAggregator, OutputConfig, OutputVisibility, RchConfig, ReleaseRequest,
     RequiredRuntime, SelectedWorker, SelectionReason, SelectionRequest, SelectionResponse,
-    TransferConfig, WorkerCapabilities, WorkerConfig, WorkerId, WorkerStatus, default_socket_path,
+    SelfTestConfig, SelfTestFailureAction, SelfTestWorkers, TransferConfig, WorkerCapabilities,
+    WorkerConfig, WorkerId, WorkerStatus, default_socket_path,
 };
 
 // Config module re-exports
