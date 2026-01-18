@@ -577,6 +577,7 @@ pub fn calculate_speedscore(results: &BenchmarkResults) -> SpeedScore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use tracing::Level;
     use tracing_subscriber::fmt;
 
@@ -954,5 +955,124 @@ mod tests {
         info!("VERIFY: Low values still produce valid scores");
 
         info!("TEST PASS: test_speedscore_bounds");
+    }
+
+    fn total_weight_sum(weights: SpeedScoreWeights) -> f64 {
+        weights.cpu + weights.memory + weights.disk + weights.network + weights.compilation
+    }
+
+    fn placeholder_cpu() -> CpuBenchmarkResult {
+        CpuBenchmarkResult {
+            score: 1000.0,
+            ops_per_second: 1_000_000.0,
+            ..Default::default()
+        }
+    }
+
+    fn placeholder_memory() -> MemoryBenchmarkResult {
+        MemoryBenchmarkResult {
+            seq_bandwidth_gbps: 50.0,
+            random_latency_ns: 100.0,
+            ..Default::default()
+        }
+    }
+
+    fn placeholder_disk() -> DiskBenchmarkResult {
+        DiskBenchmarkResult {
+            seq_read_mbps: 2500.0,
+            seq_write_mbps: 2000.0,
+            random_read_iops: 100_000.0,
+            ..Default::default()
+        }
+    }
+
+    fn placeholder_network() -> NetworkBenchmarkResult {
+        NetworkBenchmarkResult {
+            upload_mbps: 500.0,
+            download_mbps: 800.0,
+            latency_ms: 10.0,
+            ..Default::default()
+        }
+    }
+
+    fn placeholder_compilation() -> CompilationBenchmarkResult {
+        CompilationBenchmarkResult {
+            release_build_ms: 8000,
+            score: 1000.0,
+            ..Default::default()
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        #[test]
+        fn prop_normalize_in_bounds(
+            value in -1.0e9f64..1.0e9f64,
+            low in -1.0e6f64..1.0e6f64,
+            high in -1.0e6f64..1.0e6f64,
+            higher_is_better in any::<bool>(),
+        ) {
+            init_test_logging();
+            info!("TEST START: prop_normalize_in_bounds");
+
+            let score = normalize(value, low, high, higher_is_better);
+
+            prop_assert!(score >= 0.0);
+            prop_assert!(score <= 100.0);
+            info!("TEST PASS: prop_normalize_in_bounds");
+        }
+
+        #[test]
+        fn prop_weighted_total_in_bounds(
+            cpu_score in 0.0f64..100.0f64,
+            memory_score in 0.0f64..100.0f64,
+            disk_score in 0.0f64..100.0f64,
+            network_score in 0.0f64..100.0f64,
+            compilation_score in 0.0f64..100.0f64,
+            cpu_present in any::<bool>(),
+            memory_present in any::<bool>(),
+            disk_present in any::<bool>(),
+            network_present in any::<bool>(),
+            compilation_present in any::<bool>(),
+        ) {
+            init_test_logging();
+            info!("TEST START: prop_weighted_total_in_bounds");
+
+            let mut results = BenchmarkResults::new();
+            if cpu_present {
+                results.cpu = Some(placeholder_cpu());
+            }
+            if memory_present {
+                results.memory = Some(placeholder_memory());
+            }
+            if disk_present {
+                results.disk = Some(placeholder_disk());
+            }
+            if network_present {
+                results.network = Some(placeholder_network());
+            }
+            if compilation_present {
+                results.compilation = Some(placeholder_compilation());
+            }
+
+            let weights = SpeedScoreWeights::default();
+            let (total, effective) = calculate_weighted_total(
+                cpu_score,
+                memory_score,
+                disk_score,
+                network_score,
+                compilation_score,
+                &weights,
+                &results,
+            );
+
+            prop_assert!(total >= 0.0);
+            prop_assert!(total <= 100.0);
+
+            let sum = total_weight_sum(effective);
+            prop_assert!((sum - 1.0).abs() < 0.001);
+            info!("TEST PASS: prop_weighted_total_in_bounds");
+        }
     }
 }
