@@ -7,6 +7,7 @@
 
 mod api;
 mod benchmark_queue;
+mod benchmark_scheduler;
 mod config;
 mod events;
 mod health;
