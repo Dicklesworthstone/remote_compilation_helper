@@ -2271,6 +2271,89 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
+    // SpeedScore Subcommand Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn cli_parses_speedscore_single_worker() {
+        let cli = Cli::try_parse_from(["rch", "speedscore", "css"]).unwrap();
+        match cli.command {
+            Some(Commands::SpeedScore {
+                worker,
+                all,
+                verbose,
+                history,
+                days,
+                limit,
+            }) => {
+                assert_eq!(worker, Some("css".to_string()));
+                assert!(!all);
+                assert!(!verbose);
+                assert!(!history);
+                assert_eq!(days, 30);
+                assert_eq!(limit, 20);
+            }
+            _ => panic!("Expected speedscore command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_speedscore_all() {
+        let cli = Cli::try_parse_from(["rch", "speedscore", "--all"]).unwrap();
+        match cli.command {
+            Some(Commands::SpeedScore { all, worker, .. }) => {
+                assert!(all);
+                assert!(worker.is_none());
+            }
+            _ => panic!("Expected speedscore --all command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_speedscore_verbose() {
+        let cli = Cli::try_parse_from(["rch", "speedscore", "css", "--verbose"]).unwrap();
+        match cli.command {
+            Some(Commands::SpeedScore {
+                worker, verbose, ..
+            }) => {
+                assert_eq!(worker, Some("css".to_string()));
+                assert!(verbose);
+            }
+            _ => panic!("Expected speedscore --verbose command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_speedscore_history() {
+        let cli =
+            Cli::try_parse_from(["rch", "speedscore", "css", "--history", "--days", "7"]).unwrap();
+        match cli.command {
+            Some(Commands::SpeedScore {
+                worker,
+                history,
+                days,
+                ..
+            }) => {
+                assert_eq!(worker, Some("css".to_string()));
+                assert!(history);
+                assert_eq!(days, 7);
+            }
+            _ => panic!("Expected speedscore --history command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_speedscore_short_verbose() {
+        let cli = Cli::try_parse_from(["rch", "speedscore", "css", "-v"]).unwrap();
+        match cli.command {
+            Some(Commands::SpeedScore { verbose, .. }) => {
+                assert!(verbose);
+            }
+            _ => panic!("Expected speedscore -v command"),
+        }
+    }
+
+    // -------------------------------------------------------------------------
     // Completions Subcommand Tests
     // -------------------------------------------------------------------------
 

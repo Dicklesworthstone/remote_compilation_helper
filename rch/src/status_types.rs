@@ -145,6 +145,83 @@ pub struct SelfTestRunResponse {
     pub results: Vec<SelfTestResultRecordFromApi>,
 }
 
+// ============================================================================
+// SpeedScore API Types
+// ============================================================================
+
+/// SpeedScore view from API.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpeedScoreViewFromApi {
+    pub total: f64,
+    pub cpu_score: f64,
+    pub memory_score: f64,
+    pub disk_score: f64,
+    pub network_score: f64,
+    pub compilation_score: f64,
+    pub measured_at: String,
+    pub version: u32,
+}
+
+impl SpeedScoreViewFromApi {
+    /// Get rating based on total score.
+    pub fn rating(&self) -> &'static str {
+        match self.total {
+            x if x >= 90.0 => "Excellent",
+            x if x >= 75.0 => "Very Good",
+            x if x >= 60.0 => "Good",
+            x if x >= 45.0 => "Average",
+            x if x >= 30.0 => "Below Average",
+            _ => "Poor",
+        }
+    }
+}
+
+/// SpeedScore response for single worker.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpeedScoreResponseFromApi {
+    pub worker_id: String,
+    pub speedscore: Option<SpeedScoreViewFromApi>,
+    pub message: Option<String>,
+}
+
+/// Pagination info.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaginationInfoFromApi {
+    pub total: u64,
+    pub offset: usize,
+    pub limit: usize,
+    pub has_more: bool,
+}
+
+/// SpeedScore history response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpeedScoreHistoryResponseFromApi {
+    pub worker_id: String,
+    pub history: Vec<SpeedScoreViewFromApi>,
+    pub pagination: PaginationInfoFromApi,
+}
+
+/// Worker status for SpeedScore list.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerStatusFromSpeedScoreApi {
+    pub status: String,
+    pub circuit_state: String,
+}
+
+/// SpeedScore list entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpeedScoreWorkerFromApi {
+    pub worker_id: String,
+    pub speedscore: Option<SpeedScoreViewFromApi>,
+    pub status: WorkerStatusFromSpeedScoreApi,
+}
+
+/// SpeedScore list response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpeedScoreListResponseFromApi {
+    pub workers: Vec<SpeedScoreWorkerFromApi>,
+}
+
 /// Helper to format duration in human-readable form.
 pub fn format_duration(secs: u64) -> String {
     if secs < 60 {
