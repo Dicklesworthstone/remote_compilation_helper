@@ -21,7 +21,10 @@ export function WorkerCardSkeleton({ className }: WorkerCardSkeletonProps) {
             <Skeleton className="h-3 w-32" />
           </div>
         </div>
-        <Skeleton className="h-6 w-16 rounded-full" />
+        <div className="flex items-center gap-2">
+          <Skeleton className="h-5 w-10 rounded-full" />
+          <Skeleton className="h-6 w-16 rounded-full" />
+        </div>
       </div>
 
       <div className="mb-3 space-y-2">
