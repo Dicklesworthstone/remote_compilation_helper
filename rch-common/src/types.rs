@@ -1050,6 +1050,14 @@ pub struct CompilationConfig {
     /// These are typically faster and use fewer resources.
     #[serde(default = "default_check_slots")]
     pub check_slots: u32,
+    /// Timeout in seconds for build commands.
+    /// Build commands (cargo build, gcc, etc.) typically complete faster than tests.
+    #[serde(default = "default_build_timeout")]
+    pub build_timeout_sec: u64,
+    /// Timeout in seconds for test commands.
+    /// Test commands often need longer timeouts due to test suite execution time.
+    #[serde(default = "default_test_timeout")]
+    pub test_timeout_sec: u64,
 }
 
 impl Default for CompilationConfig {
@@ -1060,6 +1068,8 @@ impl Default for CompilationConfig {
             build_slots: default_build_slots(),
             test_slots: default_test_slots(),
             check_slots: default_check_slots(),
+            build_timeout_sec: default_build_timeout(),
+            test_timeout_sec: default_test_timeout(),
         }
     }
 }
@@ -1074,6 +1084,18 @@ fn default_test_slots() -> u32 {
 
 fn default_check_slots() -> u32 {
     2
+}
+
+/// Default build timeout: 5 minutes (300 seconds).
+/// Most builds complete well within this time.
+fn default_build_timeout() -> u64 {
+    300
+}
+
+/// Default test timeout: 30 minutes (1800 seconds).
+/// Test suites often take significantly longer than builds.
+fn default_test_timeout() -> u64 {
+    1800
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
