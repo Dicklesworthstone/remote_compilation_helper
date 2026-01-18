@@ -156,6 +156,8 @@ pub enum CompilationKind {
     CargoDoc,
     /// cargo nextest run - next-generation test runner
     CargoNextest,
+    /// cargo bench - run benchmarks
+    CargoBench,
     /// rustc invocation
     Rustc,
 
@@ -737,7 +739,7 @@ fn classify_cargo(cmd: &str) -> Classification {
                 "cargo run (includes build)",
             )
         }
-        "bench" => Classification::compilation(CompilationKind::CargoBuild, 0.90, "cargo bench"),
+        "bench" => Classification::compilation(CompilationKind::CargoBench, 0.90, "cargo bench"),
         "nextest" => {
             // cargo nextest has subcommands: run, list, archive, show
             // Only intercept "run" - the actual test execution
@@ -1557,5 +1559,93 @@ mod tests {
         let result = classify_command("cargo nextest run &");
         assert!(!result.is_compilation);
         assert!(result.reason.contains("background"));
+    }
+
+    // =========================================================================
+    // cargo bench tests (bead remote_compilation_helper-8o52)
+    // =========================================================================
+
+    #[test]
+    fn test_cargo_bench_classification() {
+        let result = classify_command("cargo bench");
+        assert!(result.is_compilation, "cargo bench should be classified");
+        assert_eq!(result.kind, Some(CompilationKind::CargoBench));
+        assert!((result.confidence - 0.90).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_cargo_bench_with_filter() {
+        // Benchmarks with name filter
+        let result = classify_command("cargo bench my_bench");
+        assert!(result.is_compilation);
+        assert_eq!(result.kind, Some(CompilationKind::CargoBench));
+    }
+
+    #[test]
+    fn test_cargo_bench_with_flags() {
+        // With release flag (benchmarks typically use release)
+        let result = classify_command("cargo bench --release");
+        assert!(result.is_compilation);
+        assert_eq!(result.kind, Some(CompilationKind::CargoBench));
+
+        // With package flag
+        let result = classify_command("cargo bench -p rch-common");
+        assert!(result.is_compilation);
+        assert_eq!(result.kind, Some(CompilationKind::CargoBench));
+
+        // With features
+        let result = classify_command("cargo bench --features benchmarks");
+        assert!(result.is_compilation);
+        assert_eq!(result.kind, Some(CompilationKind::CargoBench));
+
+        // With target filter
+        let result = classify_command("cargo bench --bench criterion_bench");
+        assert!(result.is_compilation);
+        assert_eq!(result.kind, Some(CompilationKind::CargoBench));
+    }
+
+    #[test]
+    fn test_cargo_bench_wrapped() {
+        // Wrapped with time
+        let result = classify_command("time cargo bench");
+        assert!(result.is_compilation, "time cargo bench should be classified");
+        assert_eq!(result.kind, Some(CompilationKind::CargoBench));
+
+        // With env var
+        let result = classify_command("CARGO_INCREMENTAL=0 cargo bench");
+        assert!(result.is_compilation);
+        assert_eq!(result.kind, Some(CompilationKind::CargoBench));
+    }
+
+    #[test]
+    fn test_cargo_bench_serde() {
+        // CargoBench serialization
+        let kind = CompilationKind::CargoBench;
+        let json = serde_json::to_string(&kind).unwrap();
+        assert_eq!(json, "\"cargo_bench\"");
+        let parsed: CompilationKind = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, CompilationKind::CargoBench);
+    }
+
+    #[test]
+    fn test_cargo_bench_distinct_from_test() {
+        // CargoBench and CargoTest are different
+        assert_ne!(CompilationKind::CargoBench, CompilationKind::CargoTest);
+
+        // Both should be classified but as different kinds
+        let bench_result = classify_command("cargo bench");
+        let test_result = classify_command("cargo test");
+        assert!(bench_result.is_compilation);
+        assert!(test_result.is_compilation);
+        assert_eq!(bench_result.kind, Some(CompilationKind::CargoBench));
+        assert_eq!(test_result.kind, Some(CompilationKind::CargoTest));
+    }
+
+    #[test]
+    fn test_cargo_bench_piped_not_intercepted() {
+        // Piped commands should be rejected at Tier 1
+        let result = classify_command("cargo bench | tee output.txt");
+        assert!(!result.is_compilation);
+        assert!(result.reason.contains("piped"));
     }
 }
