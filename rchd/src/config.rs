@@ -234,19 +234,25 @@ pub fn load_workers(path: Option<&Path>) -> Result<Vec<WorkerConfig>> {
 
 /// Load self-test configuration from the main config.toml.
 pub fn load_self_test_config() -> Result<SelfTestConfig> {
+    let config = load_rch_config()?;
+    Ok(config.self_test)
+}
+
+/// Load full RCH configuration from config.toml.
+pub fn load_rch_config() -> Result<RchConfig> {
     let Some(dir) = config_dir() else {
-        return Ok(SelfTestConfig::default());
+        return Ok(RchConfig::default());
     };
     let path = dir.join("config.toml");
     if !path.exists() {
-        return Ok(SelfTestConfig::default());
+        return Ok(RchConfig::default());
     }
 
     let contents = std::fs::read_to_string(&path)
         .with_context(|| format!("Failed to read config {:?}", path))?;
     let config: RchConfig =
         toml::from_str(&contents).with_context(|| format!("Failed to parse {:?}", path))?;
-    Ok(config.self_test)
+    Ok(config)
 }
 
 /// Generate an example workers.toml configuration.

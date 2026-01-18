@@ -33,6 +33,7 @@ use benchmark_queue::BenchmarkQueue;
 use events::EventBus;
 use history::BuildHistory;
 use rch_telemetry::storage::TelemetryStorage;
+use selection::WorkerSelector;
 use self_test::{DEFAULT_RESULT_CAPACITY, DEFAULT_RUN_CAPACITY, SelfTestHistory, SelfTestService};
 use telemetry::{TelemetryPoller, TelemetryPollerConfig, TelemetryStore};
 
@@ -74,6 +75,8 @@ struct Cli {
 pub struct DaemonContext {
     /// Worker pool.
     pub pool: workers::WorkerPool,
+    /// Worker selector with cache tracking.
+    pub worker_selector: Arc<WorkerSelector>,
     /// Build history.
     pub history: Arc<BuildHistory>,
     /// Telemetry store.
@@ -135,6 +138,21 @@ async fn main() -> Result<()> {
         );
         worker_pool.add_worker(worker_config).await;
     }
+
+    // Load RCH config for selection and circuit breaker settings
+    let rch_config = match config::load_rch_config() {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            warn!("Failed to load RCH config: {}, using defaults", e);
+            rch_common::RchConfig::default()
+        }
+    };
+
+    // Initialize worker selector
+    let worker_selector = Arc::new(WorkerSelector::with_config(
+        rch_config.selection,
+        rch_config.circuit,
+    ));
 
     // Initialize build history
     let history = if let Some(ref path) = cli.history_file {
@@ -240,6 +258,7 @@ async fn main() -> Result<()> {
 
     let context = DaemonContext {
         pool: worker_pool.clone(),
+        worker_selector: worker_selector.clone(),
         history,
         telemetry: telemetry_store.clone(),
         benchmark_queue: benchmark_queue.clone(),
@@ -371,11 +390,13 @@ mod tests {
         init_test_logging();
 
         let pool = workers::WorkerPool::new();
+        let selector = Arc::new(WorkerSelector::new());
         let history = Arc::new(BuildHistory::new(100));
         let started_at = Instant::now();
 
         let context = DaemonContext {
             pool: pool.clone(),
+            worker_selector: selector,
             history: history.clone(),
             telemetry: make_test_telemetry(),
             benchmark_queue: Arc::new(BenchmarkQueue::new(ChronoDuration::minutes(5))),
@@ -412,11 +433,13 @@ mod tests {
         };
         pool.add_worker(worker_config).await;
 
+        let selector = Arc::new(WorkerSelector::new());
         let history = Arc::new(BuildHistory::new(100));
         let started_at = Instant::now();
 
         let context = DaemonContext {
             pool: pool.clone(),
+            worker_selector: selector,
             history,
             telemetry: make_test_telemetry(),
             benchmark_queue: Arc::new(BenchmarkQueue::new(ChronoDuration::minutes(5))),
@@ -439,6 +462,7 @@ mod tests {
         init_test_logging();
 
         let pool = workers::WorkerPool::new();
+        let selector = Arc::new(WorkerSelector::new());
         let history = Arc::new(BuildHistory::new(100));
 
         // Add a build record
@@ -458,6 +482,7 @@ mod tests {
 
         let context = DaemonContext {
             pool: pool.clone(),
+            worker_selector: selector,
             history,
             telemetry: make_test_telemetry(),
             benchmark_queue: Arc::new(BenchmarkQueue::new(ChronoDuration::minutes(5))),
@@ -480,10 +505,12 @@ mod tests {
         init_test_logging();
 
         let pool = workers::WorkerPool::new();
+        let selector = Arc::new(WorkerSelector::new());
         let history = Arc::new(BuildHistory::new(100));
 
         let context = DaemonContext {
             pool: pool.clone(),
+            worker_selector: selector,
             history: history.clone(),
             telemetry: make_test_telemetry(),
             benchmark_queue: Arc::new(BenchmarkQueue::new(ChronoDuration::minutes(5))),
@@ -524,11 +551,13 @@ mod tests {
         init_test_logging();
 
         let pool = workers::WorkerPool::new();
+        let selector = Arc::new(WorkerSelector::new());
         let history = Arc::new(BuildHistory::new(100));
         let started_at = Instant::now();
 
         let context = DaemonContext {
             pool: pool.clone(),
+            worker_selector: selector,
             history,
             telemetry: make_test_telemetry(),
             benchmark_queue: Arc::new(BenchmarkQueue::new(ChronoDuration::minutes(5))),
@@ -568,10 +597,12 @@ mod tests {
             pool.add_worker(worker_config).await;
         }
 
+        let selector = Arc::new(WorkerSelector::new());
         let history = Arc::new(BuildHistory::new(100));
 
         let context = DaemonContext {
             pool: pool.clone(),
+            worker_selector: selector,
             history,
             telemetry: make_test_telemetry(),
             benchmark_queue: Arc::new(BenchmarkQueue::new(ChronoDuration::minutes(5))),
