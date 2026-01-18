@@ -89,6 +89,9 @@ impl Default for RequiredRuntime {
 pub struct SelectionRequest {
     /// Project identifier (usually directory name or hash).
     pub project: String,
+    /// Full command being executed (optional, for active build tracking).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
     /// Estimated CPU cores needed for this compilation.
     pub estimated_cores: u32,
     /// Preferred worker IDs (e.g., from project config).
@@ -170,6 +173,9 @@ pub struct SelectionResponse {
     pub worker: Option<SelectedWorker>,
     /// Reason for the selection result.
     pub reason: SelectionReason,
+    /// Optional build ID assigned by the daemon (for active build tracking).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_id: Option<u64>,
 }
 
 /// Request to release reserved worker slots.
@@ -179,6 +185,9 @@ pub struct ReleaseRequest {
     pub worker_id: WorkerId,
     /// Number of slots to release.
     pub slots: u32,
+    /// Optional build ID to mark complete.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_id: Option<u64>,
 }
 
 /// Configuration for a remote worker.
@@ -276,6 +285,8 @@ pub struct RchConfig {
     pub circuit: CircuitBreakerConfig,
     #[serde(default)]
     pub output: OutputConfig,
+    #[serde(default)]
+    pub self_test: SelfTestConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -356,6 +367,112 @@ impl Default for OutputConfig {
         Self {
             visibility: OutputVisibility::None,
             first_run_complete: false,
+        }
+    }
+}
+
+// ============================================================================
+// Self-Test Configuration
+// ============================================================================
+
+/// Action to take when a scheduled self-test fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SelfTestFailureAction {
+    /// Only emit an alert/log entry.
+    Alert,
+    /// Disable the failing worker automatically.
+    DisableWorker,
+    /// Alert and disable the worker.
+    AlertAndDisable,
+}
+
+impl Default for SelfTestFailureAction {
+    fn default() -> Self {
+        Self::Alert
+    }
+}
+
+/// Which workers to include in self-test runs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SelfTestWorkers {
+    /// Special value "all" (or a single worker id string).
+    All(String),
+    /// Explicit worker list.
+    List(Vec<WorkerId>),
+}
+
+impl Default for SelfTestWorkers {
+    fn default() -> Self {
+        Self::All("all".to_string())
+    }
+}
+
+impl SelfTestWorkers {
+    /// Resolve to an explicit list if configured, or None to indicate "all".
+    pub fn resolve(&self) -> Option<Vec<WorkerId>> {
+        match self {
+            SelfTestWorkers::All(value) => {
+                if value.eq_ignore_ascii_case("all") {
+                    None
+                } else {
+                    Some(vec![WorkerId::new(value.clone())])
+                }
+            }
+            SelfTestWorkers::List(list) => Some(list.clone()),
+        }
+    }
+}
+
+fn default_self_test_retry_count() -> u32 {
+    3
+}
+
+fn default_self_test_retry_delay() -> String {
+    "5m".to_string()
+}
+
+fn default_self_test_enabled() -> bool {
+    false
+}
+
+/// Self-test scheduling and behavior configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SelfTestConfig {
+    /// Enable scheduled self-tests.
+    #[serde(default = "default_self_test_enabled")]
+    pub enabled: bool,
+    /// Cron schedule (e.g., "0 3 * * *").
+    #[serde(default)]
+    pub schedule: Option<String>,
+    /// Interval duration (e.g., "24h").
+    #[serde(default)]
+    pub interval: Option<String>,
+    /// Which workers to test (default: "all").
+    #[serde(default)]
+    pub workers: SelfTestWorkers,
+    /// Action on failure.
+    #[serde(default)]
+    pub on_failure: SelfTestFailureAction,
+    /// Retry count for failed tests.
+    #[serde(default = "default_self_test_retry_count")]
+    pub retry_count: u32,
+    /// Delay between retries.
+    #[serde(default = "default_self_test_retry_delay")]
+    pub retry_delay: String,
+}
+
+impl Default for SelfTestConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_self_test_enabled(),
+            schedule: None,
+            interval: None,
+            workers: SelfTestWorkers::default(),
+            on_failure: SelfTestFailureAction::default(),
+            retry_count: default_self_test_retry_count(),
+            retry_delay: default_self_test_retry_delay(),
         }
     }
 }
@@ -1317,6 +1434,7 @@ mod tests {
                 speed_score: 75.0,
             }),
             reason: SelectionReason::Success,
+            build_id: None,
         };
 
         let json = serde_json::to_string(&response).unwrap();
@@ -1329,6 +1447,7 @@ mod tests {
         let response = SelectionResponse {
             worker: None,
             reason: SelectionReason::AllWorkersBusy,
+            build_id: None,
         };
 
         let json = serde_json::to_string(&response).unwrap();
@@ -1348,6 +1467,7 @@ mod tests {
                 speed_score: 90.5,
             }),
             reason: SelectionReason::Success,
+            build_id: None,
         };
 
         let json = serde_json::to_string(&original).unwrap();
