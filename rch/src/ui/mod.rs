@@ -51,6 +51,7 @@
 
 pub mod adaptive;
 pub mod benchmark;
+pub mod config;
 pub mod console;
 pub mod context;
 pub mod markdown;
@@ -93,6 +94,9 @@ pub use workers::WorkerTable;
 
 // Rich benchmark table display
 pub use benchmark::BenchmarkTable;
+
+// Rich config display
+pub use config::ConfigDisplay;
 
 // Test utilities are public for integration tests
 pub use test_utils::{
