@@ -735,7 +735,8 @@ EOF
             local new_hook='{"matcher": "Bash", "hooks": [{"type": "command", "command": "'"$hook_path"'"}]}'
             echo "$existing" | jq ".hooks.PreToolUse += [$new_hook]" > "$settings_path"
         else
-            echo "$existing" | jq ". + $hook_config" > "$settings_path"
+            # Use * for deep merge to preserve other hooks (e.g., PostToolUse)
+            echo "$existing" | jq ". * $hook_config" > "$settings_path"
         fi
     else
         echo "$hook_config" | jq '.' > "$settings_path"
