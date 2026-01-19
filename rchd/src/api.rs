@@ -1206,10 +1206,7 @@ async fn handle_speedscore_list(ctx: &DaemonContext) -> ApiResponse<SpeedScoreLi
         let speedscore = match ctx.telemetry.latest_speedscore(worker_id.as_str()) {
             Ok(score) => score.map(speedscore_view),
             Err(err) => {
-                warn!(
-                    "Failed to load SpeedScore for {}: {}",
-                    worker_id, err
-                );
+                warn!("Failed to load SpeedScore for {}: {}", worker_id, err);
                 None
             }
         };
@@ -1348,7 +1345,7 @@ async fn handle_select_worker(
 
     loop {
         attempts += 1;
-        
+
         // Use the configured worker selector
         let result = ctx.worker_selector.select(&ctx.pool, &request).await;
 
@@ -1380,7 +1377,10 @@ async fn handle_select_worker(
 
         warn!(
             "Failed to reserve {} slots on {} (race condition), attempt {}/{}",
-            request.estimated_cores, worker.config.read().await.id, attempts, MAX_ATTEMPTS
+            request.estimated_cores,
+            worker.config.read().await.id,
+            attempts,
+            MAX_ATTEMPTS
         );
 
         if attempts >= MAX_ATTEMPTS {
@@ -1406,9 +1406,18 @@ async fn handle_release_worker(pool: &WorkerPool, request: ReleaseRequest) -> Re
 }
 
 /// Handle a record-build request.
-async fn handle_record_build(ctx: &DaemonContext, worker_id: &WorkerId, project: &str) -> Result<()> {
-    debug!("Recording build for project '{}' on worker {}", project, worker_id);
-    ctx.worker_selector.record_build(worker_id.as_str(), project).await;
+async fn handle_record_build(
+    ctx: &DaemonContext,
+    worker_id: &WorkerId,
+    project: &str,
+) -> Result<()> {
+    debug!(
+        "Recording build for project '{}' on worker {}",
+        project, worker_id
+    );
+    ctx.worker_selector
+        .record_build(worker_id.as_str(), project)
+        .await;
     Ok(())
 }
 
@@ -1589,8 +1598,8 @@ async fn handle_status(ctx: &DaemonContext) -> Result<StatusResponse> {
 mod tests {
     use super::*;
     use crate::history::BuildHistory;
-    use crate::self_test::{SelfTestHistory, SelfTestService};
     use crate::selection::WorkerSelector;
+    use crate::self_test::{SelfTestHistory, SelfTestService};
     use crate::telemetry::TelemetryStore;
     use crate::{benchmark_queue::BenchmarkQueue, events::EventBus};
     use chrono::Duration as ChronoDuration;
@@ -2020,7 +2029,7 @@ mod tests {
         let response = handle_select_worker(&ctx, request).await.unwrap();
         assert!(response.worker.is_some());
         assert_eq!(response.reason, SelectionReason::Success);
-        
+
         let worker = response.worker.unwrap();
         assert_eq!(worker.id.as_str(), "worker1");
         // Should have reserved 2 slots

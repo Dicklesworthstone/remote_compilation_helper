@@ -398,7 +398,9 @@ configured remote workers."#)]
     },
 
     /// View and analyze worker SpeedScores
-    #[command(name = "speedscore", after_help = r#"EXAMPLES:
+    #[command(
+        name = "speedscore",
+        after_help = r#"EXAMPLES:
     rch speedscore css              # Show SpeedScore for worker 'css'
     rch speedscore css --verbose    # Show detailed component breakdown
     rch speedscore css --history    # Show score history
@@ -413,7 +415,8 @@ SpeedScore is a composite performance metric (0-100) combining:
   - Compilation speed (20%)
 
 Ratings:
-  90+ Excellent | 75+ Very Good | 60+ Good | 45+ Average | 30+ Below Average"#)]
+  90+ Excellent | 75+ Very Good | 60+ Good | 45+ Average | 30+ Below Average"#
+    )]
     SpeedScore {
         /// Worker ID to show SpeedScore for
         worker: Option<String>,

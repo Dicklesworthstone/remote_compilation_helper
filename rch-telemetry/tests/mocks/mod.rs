@@ -18,8 +18,8 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 /// A mock clock for deterministic timing in tests.
@@ -87,10 +87,10 @@ impl Default for MockFileStats {
     fn default() -> Self {
         // Default to typical SSD characteristics
         Self {
-            write_throughput_bps: 500_000_000,  // 500 MB/s
-            read_throughput_bps: 550_000_000,   // 550 MB/s
-            seek_latency_us: 100,               // 100µs seek
-            fsync_latency_us: 500,              // 0.5ms fsync
+            write_throughput_bps: 500_000_000, // 500 MB/s
+            read_throughput_bps: 550_000_000,  // 550 MB/s
+            seek_latency_us: 100,              // 100µs seek
+            fsync_latency_us: 500,             // 0.5ms fsync
         }
     }
 }
@@ -137,7 +137,9 @@ impl MockFileSystem {
         let duration_secs = bytes as f64 / self.stats.write_throughput_bps as f64;
         let duration = Duration::from_secs_f64(duration_secs);
 
-        self.files.borrow_mut().insert(path.to_string(), data.to_vec());
+        self.files
+            .borrow_mut()
+            .insert(path.to_string(), data.to_vec());
         self.clock.advance(duration);
 
         duration
@@ -209,11 +211,11 @@ impl Default for MockNetworkStats {
     fn default() -> Self {
         // Default to good network characteristics
         Self {
-            upload_bps: 100_000_000,     // 100 Mbps upload
-            download_bps: 100_000_000,   // 100 Mbps download
-            latency_ms: 10.0,            // 10ms latency
-            jitter_ms: 2.0,              // 2ms jitter
-            packet_loss_rate: 0.0,       // No packet loss
+            upload_bps: 100_000_000,   // 100 Mbps upload
+            download_bps: 100_000_000, // 100 Mbps download
+            latency_ms: 10.0,          // 10ms latency
+            jitter_ms: 2.0,            // 2ms jitter
+            packet_loss_rate: 0.0,     // No packet loss
         }
     }
 }
@@ -256,7 +258,9 @@ impl MockNetwork {
     fn next_jitter(&self) -> f64 {
         let mut state = self.rng_state.borrow_mut();
         // LCG random number generator
-        *state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+        *state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1);
         // Map to [-1.0, 1.0]
         (*state as f64 / u64::MAX as f64) * 2.0 - 1.0
     }
@@ -267,7 +271,8 @@ impl MockNetwork {
     pub fn upload(&self, bytes: u64) -> (f64, Duration) {
         let bits = bytes * 8;
         let base_secs = bits as f64 / self.stats.upload_bps as f64;
-        let latency_secs = (self.stats.latency_ms + self.next_jitter() * self.stats.jitter_ms) / 1000.0;
+        let latency_secs =
+            (self.stats.latency_ms + self.next_jitter() * self.stats.jitter_ms) / 1000.0;
         let total_secs = base_secs + latency_secs.max(0.0);
 
         let duration = Duration::from_secs_f64(total_secs);
@@ -283,7 +288,8 @@ impl MockNetwork {
     pub fn download(&self, bytes: u64) -> (f64, Duration) {
         let bits = bytes * 8;
         let base_secs = bits as f64 / self.stats.download_bps as f64;
-        let latency_secs = (self.stats.latency_ms + self.next_jitter() * self.stats.jitter_ms) / 1000.0;
+        let latency_secs =
+            (self.stats.latency_ms + self.next_jitter() * self.stats.jitter_ms) / 1000.0;
         let total_secs = base_secs + latency_secs.max(0.0);
 
         let duration = Duration::from_secs_f64(total_secs);

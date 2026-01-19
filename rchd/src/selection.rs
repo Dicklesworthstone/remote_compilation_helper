@@ -283,12 +283,14 @@ impl WorkerSelector {
                 worker.start_probe(&self.circuit_config).await;
                 debug!(
                     "Worker {} selected (half-open probe), strategy={:?}",
-                    worker.config.read().await.id, self.config.strategy
+                    worker.config.read().await.id,
+                    self.config.strategy
                 );
             } else {
                 debug!(
                     "Worker {} selected, strategy={:?}",
-                    worker.config.read().await.id, self.config.strategy
+                    worker.config.read().await.id,
+                    self.config.strategy
                 );
             }
 
@@ -495,7 +497,7 @@ impl WorkerSelector {
                     max_priority,
                 )
                 .await;
-            
+
             if score > best_score {
                 best_score = score;
                 best = Some(pair);
@@ -521,10 +523,12 @@ impl WorkerSelector {
 
         let config = worker.config.read().await;
         let total_slots = config.total_slots.max(1) as f64;
-        
+
         // Load factor: penalize heavily loaded workers (0.5-1.0)
         let load_factor = {
-            let active_slots = config.total_slots.saturating_sub(worker.available_slots().await);
+            let active_slots = config
+                .total_slots
+                .saturating_sub(worker.available_slots().await);
             let utilization = active_slots as f64 / total_slots;
             1.0 - (utilization * 0.5)
         };
@@ -553,7 +557,14 @@ impl WorkerSelector {
 
         debug!(
             "Worker {} balanced score: {:.3} (speed={:.2}, load={:.2}, slots={:.2}, cache={:.2}, priority={:.2}, half_open={:?})",
-            config.id, final_score, speed_score, load_factor, slot_score, cache_score, priority_score, circuit_state == CircuitState::HalfOpen
+            config.id,
+            final_score,
+            speed_score,
+            load_factor,
+            slot_score,
+            cache_score,
+            priority_score,
+            circuit_state == CircuitState::HalfOpen
         );
 
         final_score
@@ -767,10 +778,7 @@ pub async fn select_worker_with_config(
             CircuitState::HalfOpen => {
                 // Only allow if probe budget available
                 if !worker.can_probe(circuit_config).await {
-                    debug!(
-                        "Worker {} excluded: half-open, no probe budget",
-                        worker_id
-                    );
+                    debug!("Worker {} excluded: half-open, no probe budget", worker_id);
                     continue;
                 }
                 all_circuits_open = false;
@@ -894,12 +902,14 @@ pub async fn select_worker_with_config(
         selected_worker.start_probe(circuit_config).await;
         debug!(
             "Worker {} selected (half-open probe started), score={:.3}",
-            selected_worker.config.read().await.id, score
+            selected_worker.config.read().await.id,
+            score
         );
     } else {
         debug!(
             "Worker {} selected, score={:.3}",
-            selected_worker.config.read().await.id, score
+            selected_worker.config.read().await.id,
+            score
         );
     }
 
@@ -1046,8 +1056,14 @@ mod tests {
         let pool = WorkerPool::new();
         pool.add_worker(make_worker("healthy", 8, 50.0).config.read().await.clone())
             .await;
-        pool.add_worker(make_worker("unreachable", 16, 90.0).config.read().await.clone())
-            .await;
+        pool.add_worker(
+            make_worker("unreachable", 16, 90.0)
+                .config
+                .read()
+                .await
+                .clone(),
+        )
+        .await;
 
         // Mark the second worker unreachable
         pool.set_status(&WorkerId::new("unreachable"), WorkerStatus::Unreachable)
@@ -1074,8 +1090,14 @@ mod tests {
         let pool = WorkerPool::new();
         pool.add_worker(make_worker("full", 4, 70.0).config.read().await.clone())
             .await;
-        pool.add_worker(make_worker("available", 8, 50.0).config.read().await.clone())
-            .await;
+        pool.add_worker(
+            make_worker("available", 8, 50.0)
+                .config
+                .read()
+                .await
+                .clone(),
+        )
+        .await;
 
         // Reserve all slots on the first worker
         let full_worker = pool.get(&WorkerId::new("full")).await.unwrap();
@@ -1162,8 +1184,14 @@ mod tests {
     #[tokio::test]
     async fn test_select_worker_allows_half_open_with_probe_budget() {
         let pool = WorkerPool::new();
-        pool.add_worker(make_worker("half_open", 8, 50.0).config.read().await.clone())
-            .await;
+        pool.add_worker(
+            make_worker("half_open", 8, 50.0)
+                .config
+                .read()
+                .await
+                .clone(),
+        )
+        .await;
 
         // Put worker in half-open state
         let worker = pool.get(&WorkerId::new("half_open")).await.unwrap();
@@ -1196,8 +1224,14 @@ mod tests {
     #[tokio::test]
     async fn test_select_worker_excludes_half_open_at_probe_limit() {
         let pool = WorkerPool::new();
-        pool.add_worker(make_worker("half_open", 8, 50.0).config.read().await.clone())
-            .await;
+        pool.add_worker(
+            make_worker("half_open", 8, 50.0)
+                .config
+                .read()
+                .await
+                .clone(),
+        )
+        .await;
         pool.add_worker(make_worker("closed", 4, 40.0).config.read().await.clone())
             .await;
 
@@ -1237,8 +1271,14 @@ mod tests {
     #[tokio::test]
     async fn test_select_worker_prefers_closed_over_half_open() {
         let pool = WorkerPool::new();
-        pool.add_worker(make_worker("half_open", 16, 90.0).config.read().await.clone())
-            .await;
+        pool.add_worker(
+            make_worker("half_open", 16, 90.0)
+                .config
+                .read()
+                .await
+                .clone(),
+        )
+        .await;
         pool.add_worker(make_worker("closed", 8, 50.0).config.read().await.clone())
             .await;
 
@@ -1269,8 +1309,14 @@ mod tests {
     #[tokio::test]
     async fn test_select_worker_prefers_preferred_list() {
         let pool = WorkerPool::new();
-        pool.add_worker(make_worker("preferred", 8, 60.0).config.read().await.clone())
-            .await;
+        pool.add_worker(
+            make_worker("preferred", 8, 60.0)
+                .config
+                .read()
+                .await
+                .clone(),
+        )
+        .await;
         pool.add_worker(make_worker("other", 8, 90.0).config.read().await.clone())
             .await;
 
@@ -1294,8 +1340,14 @@ mod tests {
     #[tokio::test]
     async fn test_select_worker_falls_back_when_preferred_unavailable() {
         let pool = WorkerPool::new();
-        pool.add_worker(make_worker("available", 8, 50.0).config.read().await.clone())
-            .await;
+        pool.add_worker(
+            make_worker("available", 8, 50.0)
+                .config
+                .read()
+                .await
+                .clone(),
+        )
+        .await;
 
         let request = SelectionRequest {
             project: "myproject".to_string(),
@@ -1317,12 +1369,12 @@ mod tests {
     #[tokio::test]
     async fn test_select_worker_prefers_higher_priority() {
         let pool = WorkerPool::new();
-        let mut high = make_worker("high", 8, 70.0);
+        let high = make_worker("high", 8, 70.0);
         {
             let mut config = high.config.write().await;
             config.priority = 200;
         }
-        let mut low = make_worker("low", 8, 50.0);
+        let low = make_worker("low", 8, 50.0);
         {
             let mut config = low.config.write().await;
             config.priority = 50;
@@ -1363,8 +1415,14 @@ mod tests {
         // Closed: 0.8 (80/100)
         // Half-open: 0.8 * 0.5 = 0.4
         let pool = WorkerPool::new();
-        pool.add_worker(make_worker("half_open", 16, 80.0).config.read().await.clone())
-            .await;
+        pool.add_worker(
+            make_worker("half_open", 16, 80.0)
+                .config
+                .read()
+                .await
+                .clone(),
+        )
+        .await;
         pool.add_worker(make_worker("closed", 8, 50.0).config.read().await.clone())
             .await;
 
@@ -1475,19 +1533,21 @@ mod tests {
     async fn test_worker_selector_priority_strategy() {
         let pool = WorkerPool::new();
 
-        let mut high_priority = make_worker("high-priority", 8, 50.0);
+        let high_priority = make_worker("high-priority", 8, 50.0);
         {
             let mut config = high_priority.config.write().await;
             config.priority = 200;
         }
-        pool.add_worker(high_priority.config.read().await.clone()).await;
+        pool.add_worker(high_priority.config.read().await.clone())
+            .await;
 
-        let mut low_priority = make_worker("low-priority", 8, 90.0);
+        let low_priority = make_worker("low-priority", 8, 90.0);
         {
             let mut config = low_priority.config.write().await;
             config.priority = 50;
         }
-        pool.add_worker(low_priority.config.read().await.clone()).await;
+        pool.add_worker(low_priority.config.read().await.clone())
+            .await;
 
         let selector = WorkerSelector::with_config(
             SelectionConfig {
@@ -1518,14 +1578,14 @@ mod tests {
         let pool = WorkerPool::new();
 
         // Use add_worker_state to preserve speed_score values
-        let mut high_priority = make_worker("high-priority", 8, 50.0);
+        let high_priority = make_worker("high-priority", 8, 50.0);
         {
             let mut config = high_priority.config.write().await;
             config.priority = 200;
         }
         pool.add_worker_state(high_priority).await;
 
-        let mut fastest = make_worker("fastest", 8, 90.0);
+        let fastest = make_worker("fastest", 8, 90.0);
         {
             let mut config = fastest.config.write().await;
             config.priority = 50;
@@ -1591,10 +1651,22 @@ mod tests {
     #[tokio::test]
     async fn test_worker_selector_cache_affinity_strategy() {
         let pool = WorkerPool::new();
-        pool.add_worker(make_worker("warm-cache", 8, 50.0).config.read().await.clone())
-            .await;
-        pool.add_worker(make_worker("cold-cache", 8, 90.0).config.read().await.clone())
-            .await;
+        pool.add_worker(
+            make_worker("warm-cache", 8, 50.0)
+                .config
+                .read()
+                .await
+                .clone(),
+        )
+        .await;
+        pool.add_worker(
+            make_worker("cold-cache", 8, 90.0)
+                .config
+                .read()
+                .await
+                .clone(),
+        )
+        .await;
 
         let selector = WorkerSelector::with_config(
             SelectionConfig {
@@ -1698,8 +1770,14 @@ mod tests {
 
         // Both workers should have been selected at least once
         // (with equal speeds and fairness, distribution should be roughly even)
-        assert!(worker1_count > 0, "Worker1 should be selected at least once");
-        assert!(worker2_count > 0, "Worker2 should be selected at least once");
+        assert!(
+            worker1_count > 0,
+            "Worker1 should be selected at least once"
+        );
+        assert!(
+            worker2_count > 0,
+            "Worker2 should be selected at least once"
+        );
     }
 
     #[tokio::test]
@@ -1738,8 +1816,14 @@ mod tests {
     #[tokio::test]
     async fn test_worker_selector_respects_preferred_workers() {
         let pool = WorkerPool::new();
-        pool.add_worker(make_worker("preferred", 8, 50.0).config.read().await.clone())
-            .await;
+        pool.add_worker(
+            make_worker("preferred", 8, 50.0)
+                .config
+                .read()
+                .await
+                .clone(),
+        )
+        .await;
         pool.add_worker(make_worker("faster", 8, 90.0).config.read().await.clone())
             .await;
 

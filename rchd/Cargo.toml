@@ -45,6 +45,13 @@ axum = { workspace = true }
 tower = { workspace = true }
 hyper = { workspace = true }
 
+# Rich terminal output (optional)
+rich_rust = { workspace = true, optional = true }
+
+[features]
+default = ["rich-ui"]
+rich-ui = ["rich_rust"]
+
 [dev-dependencies]
 tempfile = "3"
 whoami = "1"

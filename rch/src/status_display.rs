@@ -677,10 +677,7 @@ mod tests {
                 failed_runs: 1,
                 build_error_runs: 0,
                 avg_duration_ms: 1200,
-                runs_by_kind: std::collections::HashMap::from([(
-                    "cargo_test".to_string(),
-                    3,
-                )]),
+                runs_by_kind: std::collections::HashMap::from([("cargo_test".to_string(), 3)]),
             }),
         }
     }

@@ -28,6 +28,13 @@ shellexpand = "3.1"
 dirs = { workspace = true }
 whoami = "1.5"
 
+# Rich terminal output (optional)
+rich_rust = { workspace = true, optional = true }
+
+[features]
+default = ["rich-ui"]
+rich-ui = ["rich_rust"]
+
 [dev-dependencies]
 tempfile = "3.19"
 criterion = { version = "0.5", features = ["html_reports"] }

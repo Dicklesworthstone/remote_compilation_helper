@@ -131,8 +131,7 @@ impl TelemetryStore {
         if let Some(storage) = self.storage.as_ref() {
             let storage = Arc::clone(storage);
             task::spawn(async move {
-                let result =
-                    task::spawn_blocking(move || storage.insert_test_run(&record)).await;
+                let result = task::spawn_blocking(move || storage.insert_test_run(&record)).await;
                 match result {
                     Ok(Ok(())) => {}
                     Ok(Err(e)) => warn!("Failed to persist test run: {}", e),
@@ -358,8 +357,8 @@ pub async fn collect_telemetry_from_worker(
         return Err(anyhow::anyhow!("Telemetry command returned empty output"));
     }
 
-    let telemetry = WorkerTelemetry::from_json(payload)
-        .context("Failed to parse telemetry JSON")?;
+    let telemetry =
+        WorkerTelemetry::from_json(payload).context("Failed to parse telemetry JSON")?;
 
     if !telemetry.is_compatible() {
         warn!(worker = worker_id, "Telemetry protocol version mismatch");
@@ -516,7 +515,9 @@ mod tests {
         store.ingest(make_telemetry("w1", 42.0, 50.0), TelemetrySource::Piggyback);
 
         // Check that an event was emitted
-        let event = receiver.try_recv().expect("expected telemetry:update event");
+        let event = receiver
+            .try_recv()
+            .expect("expected telemetry:update event");
         assert!(event.contains("telemetry:update"));
         assert!(event.contains("w1"));
         assert!(event.contains("42")); // CPU percent should be in the summary

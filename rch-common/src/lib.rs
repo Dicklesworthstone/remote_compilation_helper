@@ -39,12 +39,12 @@ pub use test_change::{TestChangeGuard, TestCodeChange};
 pub use toolchain::{ToolchainInfo, wrap_command_with_color, wrap_command_with_toolchain};
 pub use types::{
     BuildLocation, BuildRecord, BuildStats, CircuitBreakerConfig, CircuitState, CircuitStats,
-    ColorMode, CompilationConfig, CompilationMetrics, CompilationTimer,
-    CompilationTimingBreakdown, FairnessConfig, GeneralConfig, MetricsAggregator, OutputConfig,
-    OutputVisibility, RchConfig, ReleaseRequest, RequiredRuntime, SelectedWorker, SelectionConfig,
-    SelectionReason, SelectionRequest, SelectionResponse, SelectionStrategy, SelectionWeightConfig,
-    SelfTestConfig, SelfTestFailureAction, SelfTestWorkers, TransferConfig, WorkerCapabilities,
-    WorkerConfig, WorkerId, WorkerStatus, default_socket_path,
+    ColorMode, CompilationConfig, CompilationMetrics, CompilationTimer, CompilationTimingBreakdown,
+    FairnessConfig, GeneralConfig, MetricsAggregator, OutputConfig, OutputVisibility, RchConfig,
+    ReleaseRequest, RequiredRuntime, SelectedWorker, SelectionConfig, SelectionReason,
+    SelectionRequest, SelectionResponse, SelectionStrategy, SelectionWeightConfig, SelfTestConfig,
+    SelfTestFailureAction, SelfTestWorkers, TransferConfig, WorkerCapabilities, WorkerConfig,
+    WorkerId, WorkerStatus, default_socket_path,
 };
 
 // Config module re-exports

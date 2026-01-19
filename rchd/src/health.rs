@@ -429,7 +429,7 @@ async fn check_worker_health(
     let mock_env = std::env::var("RCH_MOCK_SSH").unwrap_or_default();
     let mock_enabled = is_mock_transport(worker);
     let worker_config = worker.config.read().await;
-    
+
     debug!(
         "Health check for {}: mock_enabled={}, RCH_MOCK_SSH='{}', host='{}'",
         worker_config.id, mock_enabled, mock_env, worker_config.host

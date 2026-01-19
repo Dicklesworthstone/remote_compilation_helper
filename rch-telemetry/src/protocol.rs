@@ -470,10 +470,7 @@ mod tests {
     #[test]
     fn test_extract_piggybacked_uses_last_marker() {
         let telemetry = make_test_worker_telemetry();
-        let build_output = format!(
-            "Build output\n{}\nnoise\nmore output",
-            PIGGYBACK_MARKER
-        );
+        let build_output = format!("Build output\n{}\nnoise\nmore output", PIGGYBACK_MARKER);
         let combined = format!("{}\n{}", build_output, telemetry.to_piggyback().unwrap());
 
         let extraction = extract_piggybacked_telemetry(&combined);

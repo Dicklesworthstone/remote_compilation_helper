@@ -1914,10 +1914,7 @@ identity_file = "/tmp/id_ed25519"
         apply_env_overrides_inner(&mut config, Some(&mut sources), Some(&env_overrides));
 
         info!("RESULT: enabled={}", config.general.enabled);
-        assert!(
-            !config.general.enabled,
-            "expected RCH_ENABLED=0 to disable"
-        );
+        assert!(!config.general.enabled, "expected RCH_ENABLED=0 to disable");
         let source = sources
             .get("general.enabled")
             .expect("general.enabled source present");

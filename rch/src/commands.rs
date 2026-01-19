@@ -620,7 +620,11 @@ pub async fn workers_list(show_speedscore: bool, ctx: &OutputContext) -> Result<
 
         // Add SpeedScore if available
         if let Some(ref scores) = speedscores {
-            if let Some(score_entry) = scores.workers.iter().find(|s| s.worker_id == worker.id.as_str()) {
+            if let Some(score_entry) = scores
+                .workers
+                .iter()
+                .find(|s| s.worker_id == worker.id.as_str())
+            {
                 if let Some(ref score) = score_entry.speedscore {
                     let score_color = match score.total {
                         x if x >= 75.0 => style.success(&format!("{:.0}", x)),
@@ -5679,8 +5683,8 @@ async fn query_speedscore_list() -> Result<SpeedScoreListResponseFromApi> {
     let response = send_daemon_command("GET /speedscores\n").await?;
     let json = extract_json_body(&response)
         .ok_or_else(|| anyhow::anyhow!("Invalid response format from daemon"))?;
-    let scores: SpeedScoreListResponseFromApi = serde_json::from_str(json)
-        .context("Failed to parse SpeedScore list response")?;
+    let scores: SpeedScoreListResponseFromApi =
+        serde_json::from_str(json).context("Failed to parse SpeedScore list response")?;
     Ok(scores)
 }
 
@@ -5690,8 +5694,8 @@ async fn query_speedscore(worker_id: &str) -> Result<SpeedScoreResponseFromApi> 
     let response = send_daemon_command(&command).await?;
     let json = extract_json_body(&response)
         .ok_or_else(|| anyhow::anyhow!("Invalid response format from daemon"))?;
-    let score: SpeedScoreResponseFromApi = serde_json::from_str(json)
-        .context("Failed to parse SpeedScore response")?;
+    let score: SpeedScoreResponseFromApi =
+        serde_json::from_str(json).context("Failed to parse SpeedScore response")?;
     Ok(score)
 }
 
@@ -5708,8 +5712,8 @@ async fn query_speedscore_history(
     let response = send_daemon_command(&command).await?;
     let json = extract_json_body(&response)
         .ok_or_else(|| anyhow::anyhow!("Invalid response format from daemon"))?;
-    let history: SpeedScoreHistoryResponseFromApi = serde_json::from_str(json)
-        .context("Failed to parse SpeedScore history response")?;
+    let history: SpeedScoreHistoryResponseFromApi =
+        serde_json::from_str(json).context("Failed to parse SpeedScore history response")?;
     Ok(history)
 }
 
@@ -5798,7 +5802,10 @@ pub async fn speedscore(
                 return Ok(());
             }
 
-            println!("{}", style.format_header("SpeedScore History (All Workers)"));
+            println!(
+                "{}",
+                style.format_header("SpeedScore History (All Workers)")
+            );
             println!();
 
             for w in &workers {

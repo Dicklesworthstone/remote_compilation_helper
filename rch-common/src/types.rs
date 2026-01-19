@@ -2356,8 +2356,8 @@ mod tests {
     #[test]
     fn test_compilation_config_custom_timeouts() {
         let config = CompilationConfig {
-            build_timeout_sec: 600,   // 10 minutes
-            test_timeout_sec: 3600,   // 1 hour
+            build_timeout_sec: 600, // 10 minutes
+            test_timeout_sec: 3600, // 1 hour
             ..Default::default()
         };
 

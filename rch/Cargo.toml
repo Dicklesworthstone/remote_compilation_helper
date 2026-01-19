@@ -48,6 +48,9 @@ which = "8"
 # Markdown rendering
 pulldown-cmark = { workspace = true }
 
+# Rich terminal output (optional)
+rich_rust = { workspace = true, optional = true }
+
 # TUI (Terminal User Interface)
 ratatui = { workspace = true }
 crossterm = { workspace = true }
@@ -55,6 +58,10 @@ crossterm = { workspace = true }
 # Interactive CLI prompts
 dialoguer = { workspace = true }
 console = { workspace = true }
+
+[features]
+default = ["rich-ui"]
+rich-ui = ["rich_rust"]
 
 [dev-dependencies]
 tempfile = "3"

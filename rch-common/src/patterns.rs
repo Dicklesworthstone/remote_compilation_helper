@@ -754,7 +754,7 @@ fn classify_cargo(cmd: &str) -> Classification {
             // Only intercept "run" - the actual test execution
             // Adjust index based on whether toolchain was present
             let args_start = if parts[1].starts_with('+') { 3 } else { 2 };
-            
+
             if parts.len() > args_start {
                 match parts[args_start] {
                     "run" | "r" => Classification::compilation(
@@ -1333,7 +1333,10 @@ mod tests {
     #[test]
     fn test_cargo_test_release() {
         let result = classify_command("cargo test --release");
-        assert!(result.is_compilation, "cargo test --release should be classified as compilation");
+        assert!(
+            result.is_compilation,
+            "cargo test --release should be classified as compilation"
+        );
         assert_eq!(result.kind, Some(CompilationKind::CargoTest));
         assert!(result.confidence >= 0.90);
     }
@@ -1341,21 +1344,30 @@ mod tests {
     #[test]
     fn test_cargo_test_specific_test_name() {
         let result = classify_command("cargo test my_test_function");
-        assert!(result.is_compilation, "cargo test with specific test name should be classified");
+        assert!(
+            result.is_compilation,
+            "cargo test with specific test name should be classified"
+        );
         assert_eq!(result.kind, Some(CompilationKind::CargoTest));
     }
 
     #[test]
     fn test_cargo_test_with_nocapture() {
         let result = classify_command("cargo test -- --nocapture");
-        assert!(result.is_compilation, "cargo test -- --nocapture should be classified");
+        assert!(
+            result.is_compilation,
+            "cargo test -- --nocapture should be classified"
+        );
         assert_eq!(result.kind, Some(CompilationKind::CargoTest));
     }
 
     #[test]
     fn test_cargo_test_workspace() {
         let result = classify_command("cargo test --workspace");
-        assert!(result.is_compilation, "cargo test --workspace should be classified");
+        assert!(
+            result.is_compilation,
+            "cargo test --workspace should be classified"
+        );
         assert_eq!(result.kind, Some(CompilationKind::CargoTest));
     }
 
@@ -1370,35 +1382,50 @@ mod tests {
     fn test_cargo_test_short_alias() {
         // cargo t is an alias for cargo test
         let result = classify_command("cargo t");
-        assert!(result.is_compilation, "cargo t (short alias) should be classified");
+        assert!(
+            result.is_compilation,
+            "cargo t (short alias) should be classified"
+        );
         assert_eq!(result.kind, Some(CompilationKind::CargoTest));
     }
 
     #[test]
     fn test_cargo_test_all_features() {
         let result = classify_command("cargo test --all-features");
-        assert!(result.is_compilation, "cargo test --all-features should be classified");
+        assert!(
+            result.is_compilation,
+            "cargo test --all-features should be classified"
+        );
         assert_eq!(result.kind, Some(CompilationKind::CargoTest));
     }
 
     #[test]
     fn test_cargo_test_no_default_features() {
         let result = classify_command("cargo test --no-default-features");
-        assert!(result.is_compilation, "cargo test --no-default-features should be classified");
+        assert!(
+            result.is_compilation,
+            "cargo test --no-default-features should be classified"
+        );
         assert_eq!(result.kind, Some(CompilationKind::CargoTest));
     }
 
     #[test]
     fn test_cargo_test_with_env_var() {
         let result = classify_command("RUST_BACKTRACE=1 cargo test");
-        assert!(result.is_compilation, "cargo test with env var should be classified");
+        assert!(
+            result.is_compilation,
+            "cargo test with env var should be classified"
+        );
         assert_eq!(result.kind, Some(CompilationKind::CargoTest));
     }
 
     #[test]
     fn test_cargo_test_with_multiple_flags() {
         let result = classify_command("cargo test --release --workspace -p rch -- --nocapture");
-        assert!(result.is_compilation, "cargo test with multiple flags should be classified");
+        assert!(
+            result.is_compilation,
+            "cargo test with multiple flags should be classified"
+        );
         assert_eq!(result.kind, Some(CompilationKind::CargoTest));
     }
 
@@ -1412,42 +1439,60 @@ mod tests {
     #[test]
     fn test_cargo_test_target() {
         let result = classify_command("cargo test --target x86_64-unknown-linux-gnu");
-        assert!(result.is_compilation, "cargo test --target should be classified");
+        assert!(
+            result.is_compilation,
+            "cargo test --target should be classified"
+        );
         assert_eq!(result.kind, Some(CompilationKind::CargoTest));
     }
 
     #[test]
     fn test_cargo_test_lib() {
         let result = classify_command("cargo test --lib");
-        assert!(result.is_compilation, "cargo test --lib should be classified");
+        assert!(
+            result.is_compilation,
+            "cargo test --lib should be classified"
+        );
         assert_eq!(result.kind, Some(CompilationKind::CargoTest));
     }
 
     #[test]
     fn test_cargo_test_bins() {
         let result = classify_command("cargo test --bins");
-        assert!(result.is_compilation, "cargo test --bins should be classified");
+        assert!(
+            result.is_compilation,
+            "cargo test --bins should be classified"
+        );
         assert_eq!(result.kind, Some(CompilationKind::CargoTest));
     }
 
     #[test]
     fn test_cargo_test_doc() {
         let result = classify_command("cargo test --doc");
-        assert!(result.is_compilation, "cargo test --doc should be classified");
+        assert!(
+            result.is_compilation,
+            "cargo test --doc should be classified"
+        );
         assert_eq!(result.kind, Some(CompilationKind::CargoTest));
     }
 
     #[test]
     fn test_cargo_test_filter_pattern() {
         let result = classify_command("cargo test test_classification");
-        assert!(result.is_compilation, "cargo test with filter pattern should be classified");
+        assert!(
+            result.is_compilation,
+            "cargo test with filter pattern should be classified"
+        );
         assert_eq!(result.kind, Some(CompilationKind::CargoTest));
     }
 
     #[test]
     fn test_cargo_test_exact() {
         let result = classify_command("cargo test --exact my_test");
-        assert!(result.is_compilation, "cargo test --exact should be classified");
+        assert!(
+            result.is_compilation,
+            "cargo test --exact should be classified"
+        );
         assert_eq!(result.kind, Some(CompilationKind::CargoTest));
     }
 
@@ -1466,7 +1511,10 @@ mod tests {
     fn test_cargo_nextest_run_classification() {
         // Basic command
         let result = classify_command("cargo nextest run");
-        assert!(result.is_compilation, "cargo nextest run should be classified");
+        assert!(
+            result.is_compilation,
+            "cargo nextest run should be classified"
+        );
         assert_eq!(result.kind, Some(CompilationKind::CargoNextest));
         assert!((result.confidence - 0.95).abs() < 0.001);
     }
@@ -1508,7 +1556,10 @@ mod tests {
     fn test_cargo_nextest_run_short_alias() {
         // cargo nextest r is an alias for cargo nextest run
         let result = classify_command("cargo nextest r");
-        assert!(result.is_compilation, "cargo nextest r should be classified");
+        assert!(
+            result.is_compilation,
+            "cargo nextest r should be classified"
+        );
         assert_eq!(result.kind, Some(CompilationKind::CargoNextest));
     }
 
@@ -1548,11 +1599,17 @@ mod tests {
     fn test_cargo_nextest_wrapped_commands() {
         // Wrapped nextest commands should still be classified
         let result = classify_command("time cargo nextest run");
-        assert!(result.is_compilation, "time cargo nextest run should be classified");
+        assert!(
+            result.is_compilation,
+            "time cargo nextest run should be classified"
+        );
         assert_eq!(result.kind, Some(CompilationKind::CargoNextest));
 
         let result = classify_command("RUST_BACKTRACE=1 cargo nextest run");
-        assert!(result.is_compilation, "env-wrapped cargo nextest run should be classified");
+        assert!(
+            result.is_compilation,
+            "env-wrapped cargo nextest run should be classified"
+        );
         assert_eq!(result.kind, Some(CompilationKind::CargoNextest));
     }
 
@@ -1651,7 +1708,10 @@ mod tests {
     fn test_cargo_bench_wrapped() {
         // Wrapped with time
         let result = classify_command("time cargo bench");
-        assert!(result.is_compilation, "time cargo bench should be classified");
+        assert!(
+            result.is_compilation,
+            "time cargo bench should be classified"
+        );
         assert_eq!(result.kind, Some(CompilationKind::CargoBench));
 
         // With env var

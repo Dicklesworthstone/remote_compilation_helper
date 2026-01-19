@@ -265,7 +265,10 @@ fn is_filtered_test_command(command: &str) -> bool {
         }
 
         // Check if this is a flag=value style
-        if flags_with_args.iter().any(|&f| token.starts_with(&format!("{}=", f))) {
+        if flags_with_args
+            .iter()
+            .any(|&f| token.starts_with(&format!("{}=", f)))
+        {
             i += 1;
             continue;
         }
@@ -637,10 +640,7 @@ async fn process_hook(input: HookInput) -> HookOutput {
                                 "Remote build error (exit 1) on {}, denying local re-execution",
                                 worker.id
                             );
-                            reporter.summary(&format!(
-                                "[RCH] remote {} build error",
-                                worker.id
-                            ));
+                            reporter.summary(&format!("[RCH] remote {} build error", worker.id));
                         } else {
                             // Other non-zero exit code
                             info!(
@@ -1392,11 +1392,15 @@ mod tests {
             ..Default::default()
         };
 
-        let build = estimate_cores_for_command(Some(CompilationKind::CargoBuild), "cargo build", &config);
+        let build =
+            estimate_cores_for_command(Some(CompilationKind::CargoBuild), "cargo build", &config);
         assert_eq!(build, 6);
 
-        let build_jobs =
-            estimate_cores_for_command(Some(CompilationKind::CargoBuild), "cargo build -j 12", &config);
+        let build_jobs = estimate_cores_for_command(
+            Some(CompilationKind::CargoBuild),
+            "cargo build -j 12",
+            &config,
+        );
         assert_eq!(build_jobs, 12);
 
         let test_default =
@@ -2331,13 +2335,22 @@ mod tests {
     #[test]
     fn test_is_toolchain_failure_basic() {
         // Should detect toolchain issues
-        assert!(is_toolchain_failure("error: toolchain 'nightly-2025-01-01' is not installed", 1));
+        assert!(is_toolchain_failure(
+            "error: toolchain 'nightly-2025-01-01' is not installed",
+            1
+        ));
         assert!(is_toolchain_failure("rustup: command not found", 127));
         assert!(is_toolchain_failure("error: no such command: `build`", 1));
 
         // Should not flag normal failures
-        assert!(!is_toolchain_failure("error[E0425]: cannot find value `x`", 1));
-        assert!(!is_toolchain_failure("test result: FAILED. 1 passed; 2 failed", 101));
+        assert!(!is_toolchain_failure(
+            "error[E0425]: cannot find value `x`",
+            1
+        ));
+        assert!(!is_toolchain_failure(
+            "test result: FAILED. 1 passed; 2 failed",
+            101
+        ));
 
         // Success should never be a toolchain failure
         assert!(!is_toolchain_failure("anything", 0));
@@ -2354,7 +2367,10 @@ mod tests {
         // Verify constants are what we expect
         assert_eq!(EXIT_SUCCESS, 0, "Success exit code should be 0");
         assert_eq!(EXIT_BUILD_ERROR, 1, "Build error exit code should be 1");
-        assert_eq!(EXIT_TEST_FAILURES, 101, "Test failures exit code should be 101");
+        assert_eq!(
+            EXIT_TEST_FAILURES, 101,
+            "Test failures exit code should be 101"
+        );
 
         // Verify signal detection
         let sigkill = 128 + 9;
@@ -2757,7 +2773,8 @@ mod tests {
             &socket_path,
             MockConfig {
                 default_exit_code: 1,
-                default_stderr: "error: toolchain 'nightly-2025-01-15' is not installed\n".to_string(),
+                default_stderr: "error: toolchain 'nightly-2025-01-15' is not installed\n"
+                    .to_string(),
                 ..MockConfig::default()
             },
             MockRsyncConfig::success(),
@@ -2970,15 +2987,15 @@ mod tests {
         );
 
         // No flags
-        assert!(
-            !has_ignored_only_flag("cargo test"),
-            "No flags"
-        );
+        assert!(!has_ignored_only_flag("cargo test"), "No flags");
     }
 
     #[test]
     fn test_has_exact_flag() {
-        assert!(has_exact_flag("cargo test my_test -- --exact"), "--exact detected");
+        assert!(
+            has_exact_flag("cargo test my_test -- --exact"),
+            "--exact detected"
+        );
         assert!(!has_exact_flag("cargo test my_test"), "No --exact");
         assert!(!has_exact_flag("cargo test -- --nocapture"), "No --exact");
     }
@@ -2993,11 +3010,8 @@ mod tests {
         };
 
         // Full test suite gets default slots
-        let full = estimate_cores_for_command(
-            Some(CompilationKind::CargoTest),
-            "cargo test",
-            &config,
-        );
+        let full =
+            estimate_cores_for_command(Some(CompilationKind::CargoTest), "cargo test", &config);
         assert_eq!(full, 10, "Full test suite uses default test_slots");
 
         // Filtered test gets reduced slots (test_slots / 2, min 2)
@@ -3092,11 +3106,8 @@ mod tests {
             "cargo test -- --nocapture",
             &config,
         );
-        let without = estimate_cores_for_command(
-            Some(CompilationKind::CargoTest),
-            "cargo test",
-            &config,
-        );
+        let without =
+            estimate_cores_for_command(Some(CompilationKind::CargoTest), "cargo test", &config);
         assert_eq!(with_nocapture, without, "--nocapture doesn't affect slots");
 
         // --show-output also doesn't affect slots

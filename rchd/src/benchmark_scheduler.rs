@@ -16,7 +16,7 @@ use rch_common::WorkerId;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, mpsc};
 use tracing::{debug, info, warn};
 
 use crate::events::EventBus;
@@ -114,15 +114,9 @@ pub enum BenchmarkStatus {
         worker_id: WorkerId,
     },
     /// Benchmark completed successfully.
-    Completed {
-        duration: Duration,
-        new_score: f64,
-    },
+    Completed { duration: Duration, new_score: f64 },
     /// Benchmark failed.
-    Failed {
-        error: String,
-        retryable: bool,
-    },
+    Failed { error: String, retryable: bool },
 }
 
 /// Manual benchmark trigger from API.
@@ -158,13 +152,13 @@ pub struct SchedulerConfig {
 impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
-            min_interval: Duration::from_secs(6 * 3600),       // 6 hours
-            max_age: Duration::from_secs(24 * 3600),          // 24 hours
-            idle_cpu_threshold: 20.0,                          // 20% CPU
+            min_interval: Duration::from_secs(6 * 3600), // 6 hours
+            max_age: Duration::from_secs(24 * 3600),     // 24 hours
+            idle_cpu_threshold: 20.0,                    // 20% CPU
             max_concurrent: 1,
-            drift_threshold_pct: 20.0,                         // 20% drift
-            benchmark_timeout: Duration::from_secs(5 * 60),   // 5 minutes
-            check_interval: Duration::from_secs(60),          // 1 minute
+            drift_threshold_pct: 20.0,                      // 20% drift
+            benchmark_timeout: Duration::from_secs(5 * 60), // 5 minutes
+            check_interval: Duration::from_secs(60),        // 1 minute
         }
     }
 }
@@ -306,12 +300,15 @@ impl BenchmarkScheduler {
         queue.insert(insert_pos, request.clone());
 
         // Emit event
-        self.events.emit("benchmark:queued", &serde_json::json!({
-            "request_id": request.request_id,
-            "worker_id": request.worker_id.as_str(),
-            "priority": format!("{:?}", request.priority),
-            "reason": request.reason.to_string(),
-        }));
+        self.events.emit(
+            "benchmark:queued",
+            &serde_json::json!({
+                "request_id": request.request_id,
+                "worker_id": request.worker_id.as_str(),
+                "priority": format!("{:?}", request.priority),
+                "reason": request.reason.to_string(),
+            }),
+        );
     }
 
     /// Check workers and schedule benchmarks as needed.
@@ -326,7 +323,10 @@ impl BenchmarkScheduler {
     }
 
     /// Determine if a worker should be benchmarked.
-    pub async fn should_benchmark(&self, worker: &WorkerState) -> Option<ScheduledBenchmarkRequest> {
+    pub async fn should_benchmark(
+        &self,
+        worker: &WorkerState,
+    ) -> Option<ScheduledBenchmarkRequest> {
         let config = worker.config.read().await;
         let worker_id = config.id.clone();
         drop(config); // Drop lock early
@@ -563,14 +563,20 @@ impl BenchmarkScheduler {
             request: request.clone(),
             started_at: Utc::now(),
         };
-        self.running.write().await.insert(worker_id.clone(), running);
+        self.running
+            .write()
+            .await
+            .insert(worker_id.clone(), running);
 
         // Emit started event
-        self.events.emit("benchmark:started", &serde_json::json!({
-            "request_id": request_id,
-            "worker_id": worker_id.as_str(),
-            "reason": request.reason.to_string(),
-        }));
+        self.events.emit(
+            "benchmark:started",
+            &serde_json::json!({
+                "request_id": request_id,
+                "worker_id": worker_id.as_str(),
+                "reason": request.reason.to_string(),
+            }),
+        );
 
         // TODO: Spawn actual benchmark execution task
         // For now, just mark as running - actual execution will be added
@@ -598,12 +604,15 @@ impl BenchmarkScheduler {
             self.pool.release_slots(worker_id, 1).await;
 
             // Emit completed event
-            self.events.emit("benchmark:completed", &serde_json::json!({
-                "request_id": running.request.request_id,
-                "worker_id": worker_id.as_str(),
-                "score": score,
-                "duration_ms": duration.as_millis(),
-            }));
+            self.events.emit(
+                "benchmark:completed",
+                &serde_json::json!({
+                    "request_id": running.request.request_id,
+                    "worker_id": worker_id.as_str(),
+                    "score": score,
+                    "duration_ms": duration.as_millis(),
+                }),
+            );
         }
     }
 
@@ -624,12 +633,15 @@ impl BenchmarkScheduler {
             self.pool.release_slots(worker_id, 1).await;
 
             // Emit failed event
-            self.events.emit("benchmark:failed", &serde_json::json!({
-                "request_id": running.request.request_id,
-                "worker_id": worker_id.as_str(),
-                "error": error,
-                "retryable": retryable,
-            }));
+            self.events.emit(
+                "benchmark:failed",
+                &serde_json::json!({
+                    "request_id": running.request.request_id,
+                    "worker_id": worker_id.as_str(),
+                    "error": error,
+                    "retryable": retryable,
+                }),
+            );
 
             // Re-queue if retryable (with lower priority)
             if retryable {
@@ -672,8 +684,8 @@ mod tests {
 
     fn make_test_config() -> SchedulerConfig {
         SchedulerConfig {
-            min_interval: Duration::from_secs(60),      // 1 minute for testing
-            max_age: Duration::from_secs(120),          // 2 minutes for testing
+            min_interval: Duration::from_secs(60), // 1 minute for testing
+            max_age: Duration::from_secs(120),     // 2 minutes for testing
             idle_cpu_threshold: 50.0,
             max_concurrent: 2,
             drift_threshold_pct: 20.0,
@@ -700,31 +712,33 @@ mod tests {
         let telemetry = Arc::new(TelemetryStore::new(Duration::from_secs(300), None));
         let events = EventBus::new(16);
 
-        let (scheduler, _handle) = BenchmarkScheduler::new(
-            make_test_config(),
-            pool,
-            telemetry,
-            events,
-        );
+        let (scheduler, _handle) =
+            BenchmarkScheduler::new(make_test_config(), pool, telemetry, events);
 
         // Enqueue in wrong order (Low, High, Normal)
-        scheduler.enqueue(ScheduledBenchmarkRequest::new(
-            WorkerId::new("low"),
-            BenchmarkPriority::Low,
-            BenchmarkReason::Scheduled,
-        )).await;
+        scheduler
+            .enqueue(ScheduledBenchmarkRequest::new(
+                WorkerId::new("low"),
+                BenchmarkPriority::Low,
+                BenchmarkReason::Scheduled,
+            ))
+            .await;
 
-        scheduler.enqueue(ScheduledBenchmarkRequest::new(
-            WorkerId::new("high"),
-            BenchmarkPriority::High,
-            BenchmarkReason::NewWorker,
-        )).await;
+        scheduler
+            .enqueue(ScheduledBenchmarkRequest::new(
+                WorkerId::new("high"),
+                BenchmarkPriority::High,
+                BenchmarkReason::NewWorker,
+            ))
+            .await;
 
-        scheduler.enqueue(ScheduledBenchmarkRequest::new(
-            WorkerId::new("normal"),
-            BenchmarkPriority::Normal,
-            BenchmarkReason::Scheduled,
-        )).await;
+        scheduler
+            .enqueue(ScheduledBenchmarkRequest::new(
+                WorkerId::new("normal"),
+                BenchmarkPriority::Normal,
+                BenchmarkReason::Scheduled,
+            ))
+            .await;
 
         // Check order: High > Normal > Low
         let queue = scheduler.pending_queue.lock().await;
@@ -738,12 +752,8 @@ mod tests {
         let telemetry = Arc::new(TelemetryStore::new(Duration::from_secs(300), None));
         let events = EventBus::new(16);
 
-        let (scheduler, _handle) = BenchmarkScheduler::new(
-            make_test_config(),
-            pool,
-            telemetry,
-            events,
-        );
+        let (scheduler, _handle) =
+            BenchmarkScheduler::new(make_test_config(), pool, telemetry, events);
 
         let worker_id = WorkerId::new("test-worker");
 
@@ -751,11 +761,13 @@ mod tests {
         assert!(!scheduler.is_pending_or_running(&worker_id).await);
 
         // Enqueue
-        scheduler.enqueue(ScheduledBenchmarkRequest::new(
-            worker_id.clone(),
-            BenchmarkPriority::Normal,
-            BenchmarkReason::Scheduled,
-        )).await;
+        scheduler
+            .enqueue(ScheduledBenchmarkRequest::new(
+                worker_id.clone(),
+                BenchmarkPriority::Normal,
+                BenchmarkReason::Scheduled,
+            ))
+            .await;
 
         // Now it's pending
         assert!(scheduler.is_pending_or_running(&worker_id).await);
@@ -779,36 +791,32 @@ mod tests {
         // Manually add two running benchmarks
         {
             let mut running = scheduler.running.write().await;
-            running.insert(
-                WorkerId::new("w1"),
-                RunningBenchmark {
-                    request: ScheduledBenchmarkRequest::new(
-                        WorkerId::new("w1"),
-                        BenchmarkPriority::Normal,
-                        BenchmarkReason::Scheduled,
-                    ),
-                    started_at: Utc::now(),
-                },
-            );
-            running.insert(
-                WorkerId::new("w2"),
-                RunningBenchmark {
-                    request: ScheduledBenchmarkRequest::new(
-                        WorkerId::new("w2"),
-                        BenchmarkPriority::Normal,
-                        BenchmarkReason::Scheduled,
-                    ),
-                    started_at: Utc::now(),
-                },
-            );
+            running.insert(WorkerId::new("w1"), RunningBenchmark {
+                request: ScheduledBenchmarkRequest::new(
+                    WorkerId::new("w1"),
+                    BenchmarkPriority::Normal,
+                    BenchmarkReason::Scheduled,
+                ),
+                started_at: Utc::now(),
+            });
+            running.insert(WorkerId::new("w2"), RunningBenchmark {
+                request: ScheduledBenchmarkRequest::new(
+                    WorkerId::new("w2"),
+                    BenchmarkPriority::Normal,
+                    BenchmarkReason::Scheduled,
+                ),
+                started_at: Utc::now(),
+            });
         }
 
         // Enqueue another
-        scheduler.enqueue(ScheduledBenchmarkRequest::new(
-            WorkerId::new("w3"),
-            BenchmarkPriority::Normal,
-            BenchmarkReason::Scheduled,
-        )).await;
+        scheduler
+            .enqueue(ScheduledBenchmarkRequest::new(
+                WorkerId::new("w3"),
+                BenchmarkPriority::Normal,
+                BenchmarkReason::Scheduled,
+            ))
+            .await;
 
         // Process should not start w3 (at max concurrent)
         let running_before = scheduler.running_count().await;
@@ -824,11 +832,17 @@ mod tests {
     async fn test_benchmark_reason_display() {
         assert_eq!(BenchmarkReason::NewWorker.to_string(), "new_worker");
         assert_eq!(
-            BenchmarkReason::StaleScore { age: ChronoDuration::hours(25) }.to_string(),
+            BenchmarkReason::StaleScore {
+                age: ChronoDuration::hours(25)
+            }
+            .to_string(),
             "stale_score(25h)"
         );
         assert_eq!(
-            BenchmarkReason::ManualTrigger { user: Some("admin".to_string()) }.to_string(),
+            BenchmarkReason::ManualTrigger {
+                user: Some("admin".to_string())
+            }
+            .to_string(),
             "manual(admin)"
         );
         assert_eq!(
@@ -857,24 +871,25 @@ mod tests {
         let telemetry = Arc::new(TelemetryStore::new(Duration::from_secs(300), None));
         let events = EventBus::new(16);
 
-        let (scheduler, _handle) = BenchmarkScheduler::new(
-            make_test_config(),
-            pool,
-            telemetry,
-            events,
-        );
+        let (scheduler, _handle) =
+            BenchmarkScheduler::new(make_test_config(), pool, telemetry, events);
 
-        scheduler.handle_manual_trigger(BenchmarkTrigger {
-            worker_id: WorkerId::new("manual-test"),
-            user: Some("test-user".to_string()),
-            request_id: "manual-req-123".to_string(),
-        }).await;
+        scheduler
+            .handle_manual_trigger(BenchmarkTrigger {
+                worker_id: WorkerId::new("manual-test"),
+                user: Some("test-user".to_string()),
+                request_id: "manual-req-123".to_string(),
+            })
+            .await;
 
         let queue = scheduler.pending_queue.lock().await;
         assert_eq!(queue.len(), 1);
         assert_eq!(queue[0].priority, BenchmarkPriority::High);
         assert_eq!(queue[0].request_id, "manual-req-123");
-        assert!(matches!(queue[0].reason, BenchmarkReason::ManualTrigger { .. }));
+        assert!(matches!(
+            queue[0].reason,
+            BenchmarkReason::ManualTrigger { .. }
+        ));
     }
 
     #[tokio::test]
@@ -885,29 +900,22 @@ mod tests {
         let telemetry = Arc::new(TelemetryStore::new(Duration::from_secs(300), None));
         let events = EventBus::new(16);
 
-        let (scheduler, _handle) = BenchmarkScheduler::new(
-            make_test_config(),
-            pool.clone(),
-            telemetry,
-            events,
-        );
+        let (scheduler, _handle) =
+            BenchmarkScheduler::new(make_test_config(), pool.clone(), telemetry, events);
 
         let worker_id = WorkerId::new("complete-test");
 
         // Simulate a running benchmark
         {
             let mut running = scheduler.running.write().await;
-            running.insert(
-                worker_id.clone(),
-                RunningBenchmark {
-                    request: ScheduledBenchmarkRequest::new(
-                        worker_id.clone(),
-                        BenchmarkPriority::Normal,
-                        BenchmarkReason::Scheduled,
-                    ),
-                    started_at: Utc::now(),
-                },
-            );
+            running.insert(worker_id.clone(), RunningBenchmark {
+                request: ScheduledBenchmarkRequest::new(
+                    worker_id.clone(),
+                    BenchmarkPriority::Normal,
+                    BenchmarkReason::Scheduled,
+                ),
+                started_at: Utc::now(),
+            });
         }
 
         // Reserve a slot on the worker
@@ -917,7 +925,9 @@ mod tests {
         }
 
         // Mark completed
-        scheduler.mark_completed(&worker_id, 75.0, Duration::from_secs(30)).await;
+        scheduler
+            .mark_completed(&worker_id, 75.0, Duration::from_secs(30))
+            .await;
 
         // Check running is empty
         assert_eq!(scheduler.running_count().await, 0);
@@ -936,29 +946,22 @@ mod tests {
         let telemetry = Arc::new(TelemetryStore::new(Duration::from_secs(300), None));
         let events = EventBus::new(16);
 
-        let (scheduler, _handle) = BenchmarkScheduler::new(
-            make_test_config(),
-            pool.clone(),
-            telemetry,
-            events,
-        );
+        let (scheduler, _handle) =
+            BenchmarkScheduler::new(make_test_config(), pool.clone(), telemetry, events);
 
         let worker_id = WorkerId::new("fail-test");
 
         // Simulate a running benchmark
         {
             let mut running = scheduler.running.write().await;
-            running.insert(
-                worker_id.clone(),
-                RunningBenchmark {
-                    request: ScheduledBenchmarkRequest::new(
-                        worker_id.clone(),
-                        BenchmarkPriority::High,  // Started as high priority
-                        BenchmarkReason::NewWorker,
-                    ),
-                    started_at: Utc::now(),
-                },
-            );
+            running.insert(worker_id.clone(), RunningBenchmark {
+                request: ScheduledBenchmarkRequest::new(
+                    worker_id.clone(),
+                    BenchmarkPriority::High, // Started as high priority
+                    BenchmarkReason::NewWorker,
+                ),
+                started_at: Utc::now(),
+            });
         }
 
         // Reserve a slot
@@ -967,12 +970,14 @@ mod tests {
         }
 
         // Mark failed with retryable
-        scheduler.mark_failed(&worker_id, "SSH connection failed", true).await;
+        scheduler
+            .mark_failed(&worker_id, "SSH connection failed", true)
+            .await;
 
         // Check it was re-queued with Low priority
         let queue = scheduler.pending_queue.lock().await;
         assert_eq!(queue.len(), 1);
-        assert_eq!(queue[0].priority, BenchmarkPriority::Low);  // Downgraded
+        assert_eq!(queue[0].priority, BenchmarkPriority::Low); // Downgraded
     }
 
     #[tokio::test]
@@ -983,29 +988,22 @@ mod tests {
         let telemetry = Arc::new(TelemetryStore::new(Duration::from_secs(300), None));
         let events = EventBus::new(16);
 
-        let (scheduler, _handle) = BenchmarkScheduler::new(
-            make_test_config(),
-            pool.clone(),
-            telemetry,
-            events,
-        );
+        let (scheduler, _handle) =
+            BenchmarkScheduler::new(make_test_config(), pool.clone(), telemetry, events);
 
         let worker_id = WorkerId::new("fail-test-2");
 
         // Simulate a running benchmark
         {
             let mut running = scheduler.running.write().await;
-            running.insert(
-                worker_id.clone(),
-                RunningBenchmark {
-                    request: ScheduledBenchmarkRequest::new(
-                        worker_id.clone(),
-                        BenchmarkPriority::Normal,
-                        BenchmarkReason::Scheduled,
-                    ),
-                    started_at: Utc::now(),
-                },
-            );
+            running.insert(worker_id.clone(), RunningBenchmark {
+                request: ScheduledBenchmarkRequest::new(
+                    worker_id.clone(),
+                    BenchmarkPriority::Normal,
+                    BenchmarkReason::Scheduled,
+                ),
+                started_at: Utc::now(),
+            });
         }
 
         // Reserve a slot
@@ -1014,7 +1012,9 @@ mod tests {
         }
 
         // Mark failed without retry
-        scheduler.mark_failed(&worker_id, "Worker removed", false).await;
+        scheduler
+            .mark_failed(&worker_id, "Worker removed", false)
+            .await;
 
         // Check it was NOT re-queued
         assert_eq!(scheduler.pending_count().await, 0);

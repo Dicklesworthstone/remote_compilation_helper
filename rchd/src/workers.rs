@@ -121,7 +121,11 @@ impl WorkerState {
 
     /// Check if this worker has a cached copy of a project.
     pub async fn has_cached_project(&self, project: &str) -> bool {
-        self.cached_projects.read().await.iter().any(|p| p == project)
+        self.cached_projects
+            .read()
+            .await
+            .iter()
+            .any(|p| p == project)
     }
 
     /// Add a project to the cache list.
@@ -266,7 +270,7 @@ impl WorkerPool {
     /// Add a worker to the pool.
     pub async fn add_worker(&self, config: WorkerConfig) {
         let id = config.id.clone();
-        
+
         {
             let workers = self.workers.read().await;
             if let Some(existing) = workers.get(&id) {
@@ -280,10 +284,10 @@ impl WorkerPool {
         let mut workers = self.workers.write().await;
         // Check again under write lock
         if let Some(existing) = workers.get(&id) {
-             // Race condition: added between read and write lock
-             // Just update config on the existing one, drop the new state
-             let config = state.config.read().await.clone();
-             existing.update_config(config).await;
+            // Race condition: added between read and write lock
+            // Just update config on the existing one, drop the new state
+            let config = state.config.read().await.clone();
+            existing.update_config(config).await;
         } else {
             workers.insert(id.clone(), state);
             self.worker_count.fetch_add(1, Ordering::SeqCst);

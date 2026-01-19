@@ -105,6 +105,10 @@ pulldown-cmark = "0.13"
 ratatui = "0.29"
 crossterm = "0.29"
 
+# Rich terminal output (optional, for enhanced UI)
+# During development, use path. When published, switch to version.
+rich_rust = { path = "/dp/rich_rust", features = ["full"] }
+
 # Internal crates
 rch-common = { path = "rch-common" }
 
