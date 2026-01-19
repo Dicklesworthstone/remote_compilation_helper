@@ -7,6 +7,7 @@
 //!
 //! - [`OutputContext`]: Detects and represents the current output context
 //! - [`Icons`]: Unicode icons with automatic ASCII fallbacks
+//! - [`RchTheme`]: Brand colors and semantic styles
 //!
 //! # Design Philosophy
 //!
@@ -21,14 +22,19 @@
 //! # Example
 //!
 //! ```ignore
-//! use rch_common::ui::{Icons, OutputContext};
+//! use rch_common::ui::{Icons, OutputContext, RchTheme};
 //!
 //! let ctx = OutputContext::detect();
 //! eprintln!("{} Build successful", Icons::check(ctx));
+//!
+//! // With rich-ui feature enabled:
+//! let style = RchTheme::success();
 //! ```
 
 pub mod context;
 pub mod icons;
+pub mod theme;
 
 pub use context::OutputContext;
 pub use icons::Icons;
+pub use theme::RchTheme;
