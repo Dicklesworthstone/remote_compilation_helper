@@ -372,17 +372,23 @@ See the MCP Agent Mail section in the DCG AGENTS.md for full details. Key points
 
 ---
 
-## Beads (bd) — Dependency-Aware Issue Tracking
+## Beads (br) — Dependency-Aware Issue Tracking
 
-Beads provides a lightweight, dependency-aware issue database and CLI (`bd`) for selecting "ready work," setting priorities, and tracking status.
+Beads provides a lightweight, dependency-aware issue database and CLI (`br` / beads_rust) for selecting "ready work," setting priorities, and tracking status.
+
+**Note:** `br` is non-invasive and never executes git commands. You must manually add, commit, and push `.beads/` changes.
+
+**SQLite/WAL Caution:** br uses SQLite with WAL mode. Always run `br sync --flush-only` before git operations to ensure `.beads/` files are consistent.
 
 ### Quick Start
 
 ```bash
-bd ready --json                                    # Show issues ready to work (no blockers)
-bd create "Issue title" -t bug|feature|task -p 0-4 --json
-bd update bd-42 --status in_progress --json
-bd close bd-42 --reason "Completed" --json
+br ready --json                                    # Show issues ready to work (no blockers)
+br create "Issue title" -t bug|feature|task -p 0-4 --json
+br update br-42 --status in_progress --json
+br close br-42 --reason "Completed" --json
+br sync --flush-only                               # Export to JSONL
+git add .beads/ && git commit -m "Sync beads" && git push
 ```
 
 ### Issue Types
@@ -581,33 +587,43 @@ Treat cass as a way to avoid re-solving problems other agents already handled.
 
 ## Beads Workflow Integration
 
-This project uses [beads_viewer](https://github.com/Dicklesworthstone/beads_viewer) for issue tracking. Issues are stored in `.beads/` and tracked in git.
+This project uses [beads_rust](https://github.com/Dicklesworthstone/beads_rust) for issue tracking. Issues are stored in `.beads/` and tracked in git.
+
+**Note:** `br` is non-invasive and never executes git commands. You must manually add, commit, and push `.beads/` changes.
+
+**SQLite/WAL Caution:** br uses SQLite with WAL mode. Always run `br sync --flush-only` before git operations to ensure `.beads/` files are consistent.
 
 ### Essential Commands
 
 ```bash
 # CLI commands for agents
-bd ready              # Show issues ready to work (no blockers)
-bd list --status=open # All open issues
-bd show <id>          # Full issue details with dependencies
-bd create --title="..." --type=task --priority=2
-bd update <id> --status=in_progress
-bd close <id> --reason="Completed"
-bd close <id1> <id2>  # Close multiple issues at once
-bd sync               # Commit and push changes
+br ready              # Show issues ready to work (no blockers)
+br list --status=open # All open issues
+br show <id>          # Full issue details with dependencies
+br create --title="..." --type=task --priority=2
+br update <id> --status=in_progress
+br close <id> --reason="Completed"
+br close <id1> <id2>  # Close multiple issues at once
+br sync --flush-only  # Export to JSONL (then manually git add/commit/push)
 ```
 
 ### Workflow Pattern
 
-1. **Start**: Run `bd ready` to find actionable work
-2. **Claim**: Use `bd update <id> --status=in_progress`
+1. **Start**: Run `br ready` to find actionable work
+2. **Claim**: Use `br update <id> --status=in_progress`
 3. **Work**: Implement the task
-4. **Complete**: Use `bd close <id>`
-5. **Sync**: Always run `bd sync` at session end
+4. **Complete**: Use `br close <id>`
+5. **Sync**: Always run sync workflow at session end:
+   ```bash
+   br sync --flush-only
+   git add .beads/
+   git commit -m "Sync beads"
+   git push
+   ```
 
 ### Key Concepts
 
-- **Dependencies**: Issues can block other issues. `bd ready` shows only unblocked work.
+- **Dependencies**: Issues can block other issues. `br ready` shows only unblocked work.
 - **Priority**: P0=critical, P1=high, P2=medium, P3=low, P4=backlog (use numbers, not words)
 - **Types**: task, bug, feature, epic, question, docs
 
@@ -628,7 +644,8 @@ bd sync               # Commit and push changes
 
 2. **Update beads**:
    ```bash
-   bd sync --flush-only
+   br sync --flush-only
+   git add .beads/
    ```
 
 3. **Commit and push** (if applicable):
@@ -668,7 +685,9 @@ bd sync               # Commit and push changes
 4. **PUSH TO REMOTE** - This is MANDATORY:
    ```bash
    git pull --rebase
-   bd sync
+   br sync --flush-only
+   git add .beads/
+   git commit -m "Sync beads"
    git push
    git status  # MUST show "up to date with origin"
    ```
