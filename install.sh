@@ -725,6 +725,14 @@ EOF
         local existing
         existing=$(cat "$settings_path")
 
+        # Validate existing JSON; if empty or invalid, treat as new file
+        if [[ -z "$existing" ]] || ! echo "$existing" | jq -e '.' &>/dev/null; then
+            warn "Existing settings file is empty or invalid, creating fresh config"
+            echo "$hook_config" | jq '.' > "$settings_path"
+            success "Claude Code hook configured at $settings_path"
+            return
+        fi
+
         if echo "$existing" | jq -e '.hooks.PreToolUse' &>/dev/null; then
             # Check if rch hook already exists (look for rch in any command field)
             if echo "$existing" | jq -e '.hooks.PreToolUse[] | select(.hooks[]? | .command? | contains("rch"))' &>/dev/null; then
