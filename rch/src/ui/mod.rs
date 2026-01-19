@@ -54,6 +54,7 @@ pub mod console;
 pub mod context;
 pub mod markdown;
 pub mod progress;
+pub mod status;
 pub mod styled;
 pub mod test_utils;
 pub mod theme;
@@ -81,6 +82,9 @@ pub use writer::{OutputBuffer, OutputWriter, SharedOutputBuffer};
 
 // Rich console wrapper (requires rich-ui feature for full functionality)
 pub use console::{RchConsole, console};
+
+// Rich status display
+pub use status::{StatusTable, render_daemon_offline};
 
 // Test utilities are public for integration tests
 pub use test_utils::{
