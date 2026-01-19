@@ -437,8 +437,13 @@ build_from_source() {
         cargo build --release
     fi
 
-    # Copy binaries
-    local target_dir="$project_dir/target/release"
+    # Copy binaries - respect CARGO_TARGET_DIR if set
+    local target_dir
+    if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
+        target_dir="$CARGO_TARGET_DIR/release"
+    else
+        target_dir="$project_dir/target/release"
+    fi
 
     if [[ "$MODE" == "worker" ]]; then
         if [[ -f "$target_dir/$WORKER_BIN" ]]; then
@@ -829,13 +834,23 @@ EOF
         fi
     fi
 
-    # Start the service
-    info "Starting rchd service..."
-    if systemctl --user start rchd.service; then
-        success "rchd service started"
+    # Start or restart the service
+    if systemctl --user is-active rchd.service &>/dev/null; then
+        info "Restarting rchd service..."
+        if systemctl --user restart rchd.service; then
+            success "rchd service restarted"
+        else
+            warn "Could not restart rchd service"
+            info "Restart manually with: systemctl --user restart rchd"
+        fi
     else
-        warn "Could not start rchd service automatically"
-        info "Start manually with: systemctl --user start rchd"
+        info "Starting rchd service..."
+        if systemctl --user start rchd.service; then
+            success "rchd service started"
+        else
+            warn "Could not start rchd service automatically"
+            info "Start manually with: systemctl --user start rchd"
+        fi
     fi
 
     info "Check status: systemctl --user status rchd"
