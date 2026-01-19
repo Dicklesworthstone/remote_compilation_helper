@@ -703,7 +703,12 @@ configure_hook_with_jq() {
     "PreToolUse": [
       {
         "matcher": "Bash",
-        "hooks": ["$hook_path"]
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$hook_path"
+          }
+        ]
       }
     ]
   }
@@ -716,12 +721,13 @@ EOF
         existing=$(cat "$settings_path")
 
         if echo "$existing" | jq -e '.hooks.PreToolUse' &>/dev/null; then
-            if echo "$existing" | jq -e '.hooks.PreToolUse[] | select(.hooks[] | contains("rch"))' &>/dev/null; then
+            # Check if rch hook already exists (look for rch in any command field)
+            if echo "$existing" | jq -e '.hooks.PreToolUse[] | select(.hooks[]? | .command? | contains("rch"))' &>/dev/null; then
                 info "RCH hook already configured"
                 return
             fi
 
-            local new_hook='{"matcher": "Bash", "hooks": ["'"$hook_path"'"]}'
+            local new_hook='{"matcher": "Bash", "hooks": [{"type": "command", "command": "'"$hook_path"'"}]}'
             echo "$existing" | jq ".hooks.PreToolUse += [$new_hook]" > "$settings_path"
         else
             echo "$existing" | jq ". + $hook_config" > "$settings_path"
@@ -747,7 +753,12 @@ configure_hook_manual() {
     echo '    "PreToolUse": ['
     echo '      {'
     echo '        "matcher": "Bash",'
-    echo "        \"hooks\": [\"$hook_path\"]"
+    echo '        "hooks": ['
+    echo '          {'
+    echo '            "type": "command",'
+    echo "            \"command\": \"$hook_path\""
+    echo '          }'
+    echo '        ]'
     echo '      }'
     echo '    ]'
     echo '  }'
