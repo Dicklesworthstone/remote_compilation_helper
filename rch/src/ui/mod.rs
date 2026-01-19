@@ -50,6 +50,7 @@
 //! - Detects color level (16/256/true color)
 
 pub mod adaptive;
+pub mod console;
 pub mod context;
 pub mod markdown;
 pub mod progress;
@@ -77,6 +78,9 @@ pub use styled::{
 };
 pub use theme::{SemanticColors, StatusIndicator, Symbols, Theme};
 pub use writer::{OutputBuffer, OutputWriter, SharedOutputBuffer};
+
+// Rich console wrapper (requires rich-ui feature for full functionality)
+pub use console::{RchConsole, console};
 
 // Test utilities are public for integration tests
 pub use test_utils::{
