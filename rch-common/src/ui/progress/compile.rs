@@ -82,6 +82,7 @@ pub enum BuildProfile {
 }
 
 impl BuildProfile {
+    #[allow(dead_code)] // Part of public API, may be used by consumers
     fn label(self) -> &'static str {
         match self {
             Self::Debug => "debug",
@@ -488,11 +489,6 @@ impl CompilationProgress {
         } else {
             String::new()
         };
-
-        // Build full line
-        let line = format!(
-            "{phase_icon} Building on {worker}  {bar} {percent_str}\n   {crates_str} | {elapsed} | {rate_str}{warnings_str}{memory_str}\n   {phase_label}{linking_str}: {current}"
-        );
 
         // For single-line rendering, compress to one line
         let compact_line = format!(

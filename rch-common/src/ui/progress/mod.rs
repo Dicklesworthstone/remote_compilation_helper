@@ -12,7 +12,7 @@ use crate::ui::OutputContext;
 use std::io::{IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 pub use compile::{BuildPhase, BuildProfile, CompilationProgress, CrateInfo};
 pub use transfer::{TransferDirection, TransferProgress};
