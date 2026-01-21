@@ -5,6 +5,7 @@
 //! clean teardown on interrupts. It is intentionally simple and ASCII-only
 //! to avoid leaving partial escape sequences in mixed-output scenarios.
 
+mod compile;
 mod transfer;
 
 use crate::ui::OutputContext;
@@ -13,6 +14,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+pub use compile::{BuildPhase, BuildProfile, CompilationProgress, CrateInfo};
 pub use transfer::{TransferDirection, TransferProgress};
 
 const DEFAULT_TERMINAL_WIDTH: u16 = 80;
