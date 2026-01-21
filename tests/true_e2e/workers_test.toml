@@ -1,0 +1,125 @@
+# RCH True E2E Test Worker Configuration
+#
+# This file configures real worker machines for true end-to-end testing.
+# Tests using this configuration will SSH to actual workers and execute builds.
+#
+# REQUIREMENTS FOR WORKERS:
+# - Passwordless SSH access via key authentication
+# - Rust nightly toolchain installed (matches rust-toolchain.toml)
+# - rsync available in PATH
+# - zstd available in PATH
+# - /tmp/rch_test writable directory
+#
+# USAGE:
+# 1. Copy this file or set RCH_E2E_WORKERS_CONFIG to override location
+# 2. Update worker entries with your actual worker details
+# 3. Run: cargo test --features true-e2e
+#
+# ENVIRONMENT VARIABLES:
+# - RCH_E2E_WORKERS_CONFIG: Override path to this config file
+# - RCH_E2E_SKIP_WORKER_CHECK: Skip worker availability check (for debugging)
+# - RCH_E2E_TIMEOUT_SECS: Override default command timeout (default: 300)
+#
+# CI NOTES:
+# - Tests will skip gracefully if no workers are reachable
+# - Set RCH_MOCK_SSH=1 to use mock SSH for CI (no real workers needed)
+
+# ==============================================================================
+# Test Settings
+# ==============================================================================
+
+[settings]
+# Default timeout for test commands in seconds
+default_timeout_secs = 300
+
+# SSH connection timeout in seconds
+ssh_connection_timeout_secs = 10
+
+# Remote working directory for test artifacts
+remote_work_dir = "/tmp/rch_test"
+
+# Rsync compression method
+rsync_compression = "zstd"
+
+# Whether to clean up remote artifacts after tests
+cleanup_after_test = true
+
+# Minimum required Rust version on workers (semver)
+min_rust_version = "1.85.0"
+
+# ==============================================================================
+# Worker Definitions
+# ==============================================================================
+# Add your worker machines below. At minimum, you need:
+# - id: Unique identifier (used in logs and selection)
+# - host: SSH hostname or IP address
+#
+# Optional fields with defaults:
+# - user: SSH username (default: "ubuntu")
+# - identity_file: Path to SSH key (default: "~/.ssh/id_rsa")
+# - total_slots: CPU slots available (default: 8)
+# - priority: Selection priority, higher = preferred (default: 100)
+# - tags: List of tags for filtering (default: [])
+# - enabled: Whether worker is active (default: true)
+
+# Example worker configuration (uncomment and modify for your environment):
+#
+# [[workers]]
+# id = "test-worker-1"
+# host = "192.168.1.100"
+# user = "ubuntu"
+# identity_file = "~/.ssh/id_rsa"
+# total_slots = 16
+# priority = 100
+# tags = ["rust", "test"]
+# enabled = true
+
+# ==============================================================================
+# Production Workers (Real Infrastructure)
+# ==============================================================================
+# These are the actual production workers. Uncomment if you have access.
+# IMPORTANT: These IPs are examples - replace with your actual worker IPs.
+
+# High-capacity bare metal server
+# [[workers]]
+# id = "css"
+# host = "209.145.54.164"
+# user = "ubuntu"
+# identity_file = "~/.ssh/contabo_new_baremetal_superserver_box.pem"
+# total_slots = 48
+# priority = 100
+# tags = ["baremetal", "high-capacity"]
+# enabled = true
+
+# Secondary bare metal server
+# [[workers]]
+# id = "csd"
+# host = "144.126.137.164"
+# user = "ubuntu"
+# identity_file = "~/.ssh/contabo_new_baremetal_sense_demo_box.pem"
+# total_slots = 48
+# priority = 100
+# tags = ["baremetal", "high-capacity"]
+# enabled = true
+
+# Medium-capacity VPS
+# [[workers]]
+# id = "fmd"
+# host = "51.222.245.56"
+# user = "ubuntu"
+# identity_file = "~/.ssh/je_ovh_ssh_key.pem"
+# total_slots = 16
+# priority = 90
+# tags = ["vps"]
+# enabled = true
+
+# Small VPS (lower priority)
+# [[workers]]
+# id = "yto"
+# host = "37.187.75.150"
+# user = "ubuntu"
+# identity_file = "~/.ssh/je_ovh_ssh_key.pem"
+# total_slots = 8
+# priority = 80
+# tags = ["vps", "small"]
+# enabled = true
