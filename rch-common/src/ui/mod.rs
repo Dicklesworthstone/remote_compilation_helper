@@ -40,5 +40,8 @@ pub mod theme;
 pub use context::OutputContext;
 pub use error::{ErrorContext, ErrorPanel, ErrorSeverity, show_error, show_info, show_warning};
 pub use icons::Icons;
-pub use progress::{ProgressContext, RateLimiter, TransferDirection, TransferProgress};
+pub use progress::{
+    BuildPhase, BuildProfile, CompilationProgress, CrateInfo, ProgressContext, RateLimiter,
+    TransferDirection, TransferProgress,
+};
 pub use theme::RchTheme;
