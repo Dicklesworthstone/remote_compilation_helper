@@ -32,9 +32,11 @@
 //! ```
 
 pub mod context;
+pub mod error;
 pub mod icons;
 pub mod theme;
 
 pub use context::OutputContext;
+pub use error::{ErrorContext, ErrorPanel, ErrorSeverity, show_error, show_info, show_warning};
 pub use icons::Icons;
 pub use theme::RchTheme;

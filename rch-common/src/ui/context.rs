@@ -46,38 +46,64 @@ impl OutputContext {
     /// 1. RCH_JSON=1 -> Machine
     /// 2. Hook invocation detection -> Hook
     /// 3. NO_COLOR set -> Plain
-    /// 4. stderr is TTY -> Interactive
-    /// 5. FORCE_COLOR set -> Colored
-    /// 6. Default -> Plain
+    /// 4. FORCE_COLOR=0 -> Plain
+    /// 5. stderr is TTY -> Interactive
+    /// 6. FORCE_COLOR set -> Colored
+    /// 7. Default -> Plain
     #[must_use]
     pub fn detect() -> Self {
+        let first_arg = std::env::args().nth(1);
+        Self::detect_with(
+            |key| std::env::var(key).ok(),
+            std::io::stdin().is_terminal(),
+            std::io::stderr().is_terminal(),
+            first_arg.as_deref(),
+        )
+    }
+
+    fn detect_with<F>(
+        get_env: F,
+        stdin_is_tty: bool,
+        stderr_is_tty: bool,
+        first_arg: Option<&str>,
+    ) -> Self
+    where
+        F: Fn(&str) -> Option<String>,
+    {
         // 1. Check for explicit machine output request
-        if std::env::var("RCH_JSON").is_ok() {
+        if get_env("RCH_JSON").is_some() {
             return Self::Machine;
         }
 
         // 2. Check for hook mode (CRITICAL - must detect first)
-        if Self::is_hook_invocation() {
+        if Self::is_hook_invocation_with(&get_env, stdin_is_tty, first_arg) {
             return Self::Hook;
         }
 
         // 3. Check NO_COLOR (https://no-color.org/ standard)
-        if std::env::var("NO_COLOR").is_ok() {
+        if get_env("NO_COLOR").is_some() {
             return Self::Plain;
         }
 
-        // 4. Check if stderr is a terminal (we output rich to stderr!)
+        // 4. FORCE_COLOR=0 disables colors even in TTY
+        let force_color = get_env("FORCE_COLOR");
+        let force_color_on = force_color.as_deref().map(|value| value.trim() != "0");
+        if force_color_on == Some(false) {
+            return Self::Plain;
+        }
+
+        // 5. Check if stderr is a terminal (we output rich to stderr!)
         // Note: NOT stdout! stdout is for machine data
-        if std::io::stderr().is_terminal() {
+        if stderr_is_tty {
             return Self::Interactive;
         }
 
-        // 5. Check FORCE_COLOR for piped scenarios
-        if std::env::var("FORCE_COLOR").is_ok() {
+        // 6. Check FORCE_COLOR for piped scenarios
+        if force_color_on == Some(true) {
             return Self::Colored;
         }
 
-        // 6. Default: plain text
+        // 7. Default: plain text
         Self::Plain
     }
 
@@ -105,22 +131,34 @@ impl OutputContext {
     /// 1. RCH_HOOK_MODE environment variable is set
     /// 2. Stdin is not a terminal AND no known subcommand is provided
     fn is_hook_invocation() -> bool {
+        let first_arg = std::env::args().nth(1);
+        let get_env = |key: &str| std::env::var(key).ok();
+        Self::is_hook_invocation_with(
+            &get_env,
+            std::io::stdin().is_terminal(),
+            first_arg.as_deref(),
+        )
+    }
+
+    fn is_hook_invocation_with<F>(get_env: &F, stdin_is_tty: bool, first_arg: Option<&str>) -> bool
+    where
+        F: Fn(&str) -> Option<String>,
+    {
         // Explicit hook mode flag
-        if std::env::var("RCH_HOOK_MODE").is_ok() {
+        if get_env("RCH_HOOK_MODE").is_some() {
             return true;
         }
 
         // If stdin is not a terminal and we have no subcommand args,
         // we're likely being called as a hook
-        if !std::io::stdin().is_terminal() {
+        if !stdin_is_tty {
             // Check if first arg looks like a subcommand
-            let first_arg = std::env::args().nth(1);
             match first_arg {
                 None => return true, // No args = hook mode
                 Some(arg) => {
                     // If it doesn't start with - and isn't a known subcommand,
                     // could be hook JSON on stdin
-                    if !arg.starts_with('-') && !Self::is_known_subcommand(&arg) {
+                    if !arg.starts_with('-') && !Self::is_known_subcommand(arg) {
                         return true;
                     }
                 }
@@ -228,9 +266,31 @@ impl std::fmt::Display for OutputContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
-    // Note: These tests manipulate environment variables which is unsafe in Rust 2024.
-    // The rch-common crate uses #![deny(unsafe_code)] with an allowance for this.
+    struct TestEnv {
+        vars: HashMap<&'static str, &'static str>,
+    }
+
+    impl TestEnv {
+        fn new(pairs: &[(&'static str, &'static str)]) -> Self {
+            let vars = pairs.iter().copied().collect();
+            Self { vars }
+        }
+
+        fn get(&self, key: &str) -> Option<String> {
+            self.vars.get(key).map(|value| (*value).to_string())
+        }
+    }
+
+    fn detect_with(
+        env: &TestEnv,
+        stdin_is_tty: bool,
+        stderr_is_tty: bool,
+        first_arg: Option<&str>,
+    ) -> OutputContext {
+        OutputContext::detect_with(|key| env.get(key), stdin_is_tty, stderr_is_tty, first_arg)
+    }
 
     #[test]
     fn test_supports_rich_only_interactive() {
@@ -301,5 +361,120 @@ mod tests {
     fn test_default_is_detect() {
         // Just verify default() doesn't panic
         let _ = OutputContext::default();
+    }
+
+    #[test]
+    fn test_detect_rch_json() {
+        let env = TestEnv::new(&[("RCH_JSON", "1")]);
+        let ctx = detect_with(&env, true, true, Some("status"));
+        assert_eq!(ctx, OutputContext::Machine);
+        assert!(ctx.is_machine());
+    }
+
+    #[test]
+    fn test_detect_hook_mode_env() {
+        let env = TestEnv::new(&[("RCH_HOOK_MODE", "1")]);
+        let ctx = detect_with(&env, true, true, Some("status"));
+        assert_eq!(ctx, OutputContext::Hook);
+        assert!(ctx.is_machine());
+    }
+
+    #[test]
+    fn test_detect_hook_mode_stdin_no_args() {
+        let env = TestEnv::new(&[]);
+        let ctx = detect_with(&env, false, false, None);
+        assert_eq!(ctx, OutputContext::Hook);
+    }
+
+    #[test]
+    fn test_no_color_disables_colors() {
+        let env = TestEnv::new(&[("NO_COLOR", "1")]);
+        let ctx = detect_with(&env, true, true, Some("status"));
+        assert_eq!(ctx, OutputContext::Plain);
+        assert!(!ctx.supports_color());
+    }
+
+    #[test]
+    fn test_no_color_empty_string() {
+        let env = TestEnv::new(&[("NO_COLOR", "")]);
+        let ctx = detect_with(&env, true, true, Some("status"));
+        assert_eq!(ctx, OutputContext::Plain);
+    }
+
+    #[test]
+    fn test_force_color_zero_disables_colors() {
+        let env = TestEnv::new(&[("FORCE_COLOR", "0")]);
+        let ctx = detect_with(&env, true, true, Some("status"));
+        assert_eq!(ctx, OutputContext::Plain);
+    }
+
+    #[test]
+    fn test_force_color_on_without_tty() {
+        let env = TestEnv::new(&[("FORCE_COLOR", "1")]);
+        let ctx = detect_with(&env, true, false, Some("status"));
+        assert_eq!(ctx, OutputContext::Colored);
+    }
+
+    #[test]
+    fn test_force_color_on_with_tty() {
+        let env = TestEnv::new(&[("FORCE_COLOR", "1")]);
+        let ctx = detect_with(&env, true, true, Some("status"));
+        assert_eq!(ctx, OutputContext::Interactive);
+    }
+
+    #[test]
+    fn test_force_color_empty_string_enables() {
+        let env = TestEnv::new(&[("FORCE_COLOR", "")]);
+        let ctx = detect_with(&env, true, false, Some("status"));
+        assert_eq!(ctx, OutputContext::Colored);
+    }
+
+    #[test]
+    fn test_force_color_invalid_value_enables() {
+        let env = TestEnv::new(&[("FORCE_COLOR", "yes")]);
+        let ctx = detect_with(&env, true, false, Some("status"));
+        assert_eq!(ctx, OutputContext::Colored);
+    }
+
+    #[test]
+    fn test_rch_json_takes_priority_over_force_color() {
+        let env = TestEnv::new(&[("RCH_JSON", "1"), ("FORCE_COLOR", "3")]);
+        let ctx = detect_with(&env, true, false, Some("status"));
+        assert_eq!(ctx, OutputContext::Machine);
+    }
+
+    #[test]
+    fn test_hook_mode_takes_priority_over_force_color() {
+        let env = TestEnv::new(&[("RCH_HOOK_MODE", "1"), ("FORCE_COLOR", "3")]);
+        let ctx = detect_with(&env, true, false, Some("status"));
+        assert_eq!(ctx, OutputContext::Hook);
+    }
+
+    #[test]
+    fn test_no_color_takes_priority_over_force_color() {
+        let env = TestEnv::new(&[("NO_COLOR", "1"), ("FORCE_COLOR", "3")]);
+        let ctx = detect_with(&env, true, true, Some("status"));
+        assert_eq!(ctx, OutputContext::Plain);
+    }
+
+    #[test]
+    fn test_interactive_when_tty_and_no_overrides() {
+        let env = TestEnv::new(&[]);
+        let ctx = detect_with(&env, true, true, Some("status"));
+        assert_eq!(ctx, OutputContext::Interactive);
+    }
+
+    #[test]
+    fn test_plain_when_no_tty_and_no_overrides() {
+        let env = TestEnv::new(&[]);
+        let ctx = detect_with(&env, true, false, Some("status"));
+        assert_eq!(ctx, OutputContext::Plain);
+    }
+
+    #[test]
+    fn test_hook_detection_unknown_arg_no_tty() {
+        let env = TestEnv::new(&[]);
+        let ctx = detect_with(&env, false, false, Some("unknown"));
+        assert_eq!(ctx, OutputContext::Hook);
     }
 }
