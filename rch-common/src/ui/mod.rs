@@ -41,7 +41,7 @@ pub use context::OutputContext;
 pub use error::{ErrorContext, ErrorPanel, ErrorSeverity, show_error, show_info, show_warning};
 pub use icons::Icons;
 pub use progress::{
-    BuildPhase, BuildProfile, CompilationProgress, CrateInfo, ProgressContext, RateLimiter,
-    TransferDirection, TransferProgress,
+    BuildPhase, BuildProfile, CompilationProgress, CrateInfo, PipelineProgress, PipelineStage,
+    ProgressContext, RateLimiter, StageStatus, TransferDirection, TransferProgress,
 };
 pub use theme::RchTheme;

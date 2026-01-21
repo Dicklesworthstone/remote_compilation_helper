@@ -6,6 +6,7 @@
 //! to avoid leaving partial escape sequences in mixed-output scenarios.
 
 mod compile;
+mod pipeline;
 mod transfer;
 
 use crate::ui::OutputContext;
@@ -15,6 +16,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 pub use compile::{BuildPhase, BuildProfile, CompilationProgress, CrateInfo};
+pub use pipeline::{PipelineProgress, PipelineStage, StageStatus};
 pub use transfer::{TransferDirection, TransferProgress};
 
 const DEFAULT_TERMINAL_WIDTH: u16 = 80;

@@ -472,14 +472,14 @@ impl CompilationProgress {
             String::new()
         };
 
-        // Memory indicator
-        let memory_str = self
+        // Memory indicator (reserved for future multi-line display)
+        let _memory_str = self
             .memory_mb
             .map(|mb| format!(" [{mb}MB]"))
             .unwrap_or_default();
 
-        // Linking duration (if in linking phase)
-        let linking_str = if self.phase == BuildPhase::Linking {
+        // Linking duration (reserved for future multi-line display)
+        let _linking_str = if self.phase == BuildPhase::Linking {
             if let Some(start) = self.linking_start {
                 let dur = format_duration(start.elapsed());
                 format!(" ({dur})")

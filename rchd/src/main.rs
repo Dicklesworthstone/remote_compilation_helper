@@ -17,6 +17,7 @@ mod metrics;
 mod selection;
 mod self_test;
 mod telemetry;
+mod ui;
 mod workers;
 
 use anyhow::Result;
