@@ -1,0 +1,15 @@
+[package]
+name = "workspace_app"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "workspace_app"
+path = "src/main.rs"
+
+[dependencies]
+workspace_core = { path = "../core" }
+workspace_utils = { path = "../utils" }
+
+[lints.rust]
+unsafe_code = "deny"

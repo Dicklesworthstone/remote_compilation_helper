@@ -1,0 +1,13 @@
+[package]
+name = "workspace_core"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "workspace_core"
+
+[dependencies]
+# No external dependencies - this is the foundation crate
+
+[lints.rust]
+unsafe_code = "deny"

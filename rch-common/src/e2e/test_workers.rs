@@ -334,11 +334,11 @@ pub fn get_config_path() -> PathBuf {
 
 /// Expand tilde (~) in a path to the user's home directory.
 pub fn expand_tilde_path(path: &str) -> TestConfigResult<PathBuf> {
-    if path.starts_with("~/") {
+    if let Some(rest) = path.strip_prefix("~/") {
         let home = std::env::var("HOME")
             .or_else(|_| std::env::var("USERPROFILE"))
             .map_err(|_| TestConfigError::PathExpansionFailed(path.to_string()))?;
-        Ok(PathBuf::from(home).join(&path[2..]))
+        Ok(PathBuf::from(home).join(rest))
     } else if path == "~" {
         let home = std::env::var("HOME")
             .or_else(|_| std::env::var("USERPROFILE"))
@@ -364,6 +364,7 @@ pub fn is_mock_ssh_mode() -> bool {
 }
 
 #[cfg(test)]
+#[allow(unsafe_code)] // Tests need to set/remove env vars, which is unsafe in Rust 2024
 mod tests {
     use super::*;
     use std::io::Write;

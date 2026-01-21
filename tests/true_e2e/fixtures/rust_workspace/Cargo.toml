@@ -1,0 +1,20 @@
+# RCH E2E Test Fixture - Rust Workspace Project
+#
+# This workspace fixture tests:
+# - cargo build --workspace
+# - cargo test --workspace
+# - cargo build -p <package>
+# - Inter-crate dependencies
+
+[workspace]
+members = ["crates/core", "crates/utils", "crates/app"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+# Shared dependencies across workspace
+[workspace.dependencies]
+# No external deps for this simple fixture

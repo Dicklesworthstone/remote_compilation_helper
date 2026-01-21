@@ -1,0 +1,13 @@
+[package]
+name = "workspace_utils"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "workspace_utils"
+
+[dependencies]
+workspace_core = { path = "../core" }
+
+[lints.rust]
+unsafe_code = "deny"

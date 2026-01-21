@@ -26,6 +26,7 @@ object = { workspace = true }
 shell-escape = "0.1.5"
 shellexpand = "3.1"
 dirs = { workspace = true }
+toml = { workspace = true }
 whoami = "1.5"
 
 # Rich terminal output (optional)

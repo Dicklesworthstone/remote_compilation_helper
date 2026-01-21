@@ -1,0 +1,26 @@
+[package]
+name = "hello_world"
+version = "0.1.0"
+edition = "2024"
+
+# RCH E2E Test Fixture - Rust Hello World Project
+#
+# This is a simple Rust project used for testing the Remote Compilation Helper.
+# It should compile cleanly with:
+#   - cargo build
+#   - cargo check
+#   - cargo test
+#   - cargo clippy
+
+[dependencies]
+# No external dependencies - keep it simple for fast compilation
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+
+# Empty workspace table makes this a standalone project,
+# not part of the parent RCH workspace
+[workspace]
