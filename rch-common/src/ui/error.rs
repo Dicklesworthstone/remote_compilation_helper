@@ -34,6 +34,8 @@ use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "rich-ui")]
 use rich_rust::prelude::*;
+#[cfg(feature = "rich-ui")]
+use rich_rust::r#box::HEAVY;
 
 use super::{Icons, OutputContext, RchTheme};
 
@@ -315,7 +317,7 @@ impl ErrorPanel {
         let panel = Panel::from_text(&content)
             .title(title_text.as_str())
             .border_style(border_style)
-            .box_style(BoxStyle::Heavy);
+            .box_style(&HEAVY);
 
         // Print to stderr via Console
         let console = Console::builder().force_terminal(true).build();
