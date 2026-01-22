@@ -28,13 +28,20 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+use super::logging::{LogLevel, LogSource, TestLogger};
 
 /// Environment variable to override config file location.
 pub const ENV_WORKERS_CONFIG: &str = "RCH_E2E_WORKERS_CONFIG";
 
 /// Environment variable to skip worker availability checks.
 pub const ENV_SKIP_WORKER_CHECK: &str = "RCH_E2E_SKIP_WORKER_CHECK";
+
+/// Environment variable to skip all true E2E tests.
+pub const ENV_SKIP_ALL_TESTS: &str = "RCH_E2E_SKIP";
 
 /// Environment variable to override command timeout.
 pub const ENV_TIMEOUT_SECS: &str = "RCH_E2E_TIMEOUT_SECS";
@@ -356,11 +363,234 @@ pub fn should_skip_worker_check() -> bool {
         .unwrap_or(false)
 }
 
+/// Check if all true E2E tests should be skipped.
+pub fn should_skip_all_tests() -> bool {
+    std::env::var(ENV_SKIP_ALL_TESTS)
+        .map(|v| v == "1" || v.to_lowercase() == "true")
+        .unwrap_or(false)
+}
+
 /// Check if mock SSH mode is enabled (for CI testing without real workers).
 pub fn is_mock_ssh_mode() -> bool {
     std::env::var("RCH_MOCK_SSH")
         .map(|v| v == "1" || v.to_lowercase() == "true")
         .unwrap_or(false)
+}
+
+fn is_ci() -> bool {
+    std::env::var("CI")
+        .map(|v| v == "1" || v.to_lowercase() == "true")
+        .unwrap_or(false)
+}
+
+fn log_skip_event(
+    logger: &TestLogger,
+    level: LogLevel,
+    message: &str,
+    context: Vec<(String, String)>,
+) {
+    let mut ctx = Vec::with_capacity(context.len() + 1);
+    ctx.push(("phase".to_string(), "skip_check".to_string()));
+    ctx.extend(context);
+    logger.log_with_context(level, LogSource::Custom("skip_check".to_string()), message, ctx);
+}
+
+fn ping_worker(host: &str, port: u16, timeout: Duration) -> Result<bool, std::io::Error> {
+    let addrs = (host, port).to_socket_addrs()?;
+    for addr in addrs {
+        if TcpStream::connect_timeout(&addr, timeout).is_ok() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn effective_ping_timeout(settings: &TestSettings) -> Duration {
+    let requested = settings.ssh_connection_timeout_secs.max(1);
+    let cap = if is_ci() { 3 } else { 8 };
+    Duration::from_secs(requested.min(cap))
+}
+
+/// Load worker config and verify at least one reachable worker.
+/// Returns None when tests should be skipped, with structured logs explaining why.
+pub fn require_workers(logger: &TestLogger) -> Option<TestWorkersConfig> {
+    let config_path = get_config_path();
+    log_skip_event(
+        logger,
+        LogLevel::Info,
+        "Checking worker availability",
+        vec![
+            ("config_path".to_string(), config_path.display().to_string()),
+            ("ci".to_string(), is_ci().to_string()),
+        ],
+    );
+
+    if should_skip_all_tests() {
+        log_skip_event(
+            logger,
+            LogLevel::Info,
+            "E2E tests disabled via env",
+            vec![
+                ("reason".to_string(), "env_skip_all".to_string()),
+                ("env".to_string(), ENV_SKIP_ALL_TESTS.to_string()),
+                ("skip".to_string(), "true".to_string()),
+            ],
+        );
+        return None;
+    }
+
+    let config = match TestWorkersConfig::load_from(&config_path) {
+        Ok(config) => config,
+        Err(TestConfigError::NotFound(path)) => {
+            log_skip_event(
+                logger,
+                LogLevel::Info,
+                "Workers unavailable, skipping test",
+                vec![
+                    ("reason".to_string(), "config_not_found".to_string()),
+                    ("path".to_string(), path.display().to_string()),
+                    ("skip".to_string(), "true".to_string()),
+                ],
+            );
+            return None;
+        }
+        Err(e) => {
+            log_skip_event(
+                logger,
+                LogLevel::Warn,
+                "Workers unavailable, skipping test",
+                vec![
+                    ("reason".to_string(), "config_load_failed".to_string()),
+                    ("error".to_string(), e.to_string()),
+                    ("skip".to_string(), "true".to_string()),
+                ],
+            );
+            return None;
+        }
+    };
+
+    if !config.has_enabled_workers() {
+        log_skip_event(
+            logger,
+            LogLevel::Info,
+            "Workers unavailable, skipping test",
+            vec![
+                ("reason".to_string(), "no_enabled_workers".to_string()),
+                (
+                    "configured".to_string(),
+                    config.workers.len().to_string(),
+                ),
+                ("skip".to_string(), "true".to_string()),
+            ],
+        );
+        return None;
+    }
+
+    if should_skip_worker_check() {
+        log_skip_event(
+            logger,
+            LogLevel::Info,
+            "Skipping worker reachability check via env",
+            vec![
+                ("reason".to_string(), "env_skip_check".to_string()),
+                ("env".to_string(), ENV_SKIP_WORKER_CHECK.to_string()),
+                ("skip".to_string(), "false".to_string()),
+            ],
+        );
+        return Some(config);
+    }
+
+    let timeout = effective_ping_timeout(&config.settings);
+    let mut reachable = 0usize;
+
+    for worker in config.enabled_workers() {
+        let start = Instant::now();
+        let outcome = ping_worker(&worker.host, worker.port, timeout);
+        let elapsed_ms = start.elapsed().as_millis().to_string();
+
+        match outcome {
+            Ok(true) => {
+                reachable += 1;
+                logger.log_with_context(
+                    LogLevel::Info,
+                    LogSource::Custom("skip_check".to_string()),
+                    "Worker reachable",
+                    vec![
+                        ("phase".to_string(), "skip_check".to_string()),
+                        ("worker_id".to_string(), worker.id.clone()),
+                        ("host".to_string(), worker.host.clone()),
+                        ("port".to_string(), worker.port.to_string()),
+                        ("reachable".to_string(), "true".to_string()),
+                        ("duration_ms".to_string(), elapsed_ms),
+                    ],
+                );
+            }
+            Ok(false) => {
+                logger.log_with_context(
+                    LogLevel::Warn,
+                    LogSource::Custom("skip_check".to_string()),
+                    "Worker unreachable",
+                    vec![
+                        ("phase".to_string(), "skip_check".to_string()),
+                        ("worker_id".to_string(), worker.id.clone()),
+                        ("host".to_string(), worker.host.clone()),
+                        ("port".to_string(), worker.port.to_string()),
+                        ("reachable".to_string(), "false".to_string()),
+                        ("duration_ms".to_string(), elapsed_ms),
+                    ],
+                );
+            }
+            Err(e) => {
+                logger.log_with_context(
+                    LogLevel::Warn,
+                    LogSource::Custom("skip_check".to_string()),
+                    "Worker reachability check failed",
+                    vec![
+                        ("phase".to_string(), "skip_check".to_string()),
+                        ("worker_id".to_string(), worker.id.clone()),
+                        ("host".to_string(), worker.host.clone()),
+                        ("port".to_string(), worker.port.to_string()),
+                        ("error".to_string(), e.to_string()),
+                        ("duration_ms".to_string(), elapsed_ms),
+                    ],
+                );
+            }
+        }
+    }
+
+    if reachable == 0 {
+        log_skip_event(
+            logger,
+            LogLevel::Info,
+            "Workers unavailable, skipping test",
+            vec![
+                ("reason".to_string(), "no_reachable_workers".to_string()),
+                (
+                    "configured".to_string(),
+                    config.enabled_workers().len().to_string(),
+                ),
+                ("reachable".to_string(), reachable.to_string()),
+                ("skip".to_string(), "true".to_string()),
+            ],
+        );
+        return None;
+    }
+
+    log_skip_event(
+        logger,
+        LogLevel::Info,
+        "Worker availability check complete",
+        vec![
+            (
+                "configured".to_string(),
+                config.enabled_workers().len().to_string(),
+            ),
+            ("reachable".to_string(), reachable.to_string()),
+            ("skip".to_string(), "false".to_string()),
+        ],
+    );
+
+    Some(config)
 }
 
 #[cfg(test)]
