@@ -10,6 +10,7 @@ pub mod binary_hash;
 pub mod config;
 pub mod discovery;
 pub mod e2e;
+pub mod errors;
 pub mod logging;
 pub mod mock;
 pub mod mock_worker;
@@ -62,3 +63,6 @@ pub use discovery::{
 
 // UI module re-exports
 pub use ui::{Icons, OutputContext, RchTheme};
+
+// Errors module re-exports
+pub use errors::{ErrorCategory, ErrorCode, ErrorEntry};
