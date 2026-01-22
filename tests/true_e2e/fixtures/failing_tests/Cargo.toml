@@ -1,0 +1,19 @@
+[package]
+name = "failing_tests"
+version = "0.1.0"
+edition = "2024"
+description = "Test fixture with intentionally failing tests for exit code 101 verification"
+
+[lib]
+name = "failing_tests"
+path = "src/lib.rs"
+
+[dependencies]
+# No external dependencies - keep it simple for fast compilation
+
+[lints.rust]
+unsafe_code = "deny"
+
+# Empty workspace table makes this a standalone project,
+# not part of the parent RCH workspace
+[workspace]

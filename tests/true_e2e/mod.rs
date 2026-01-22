@@ -35,6 +35,7 @@
 //! ```
 
 pub mod cargo_build_tests;
+pub mod cargo_test_tests;
 pub mod config;
 pub mod failopen_tests;
 pub mod output;

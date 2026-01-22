@@ -1,0 +1,16 @@
+[package]
+name = "broken_project"
+version = "0.1.0"
+edition = "2024"
+description = "Test fixture with compilation errors for exit code 1 verification"
+
+[lib]
+name = "broken_project"
+path = "src/lib.rs"
+
+[dependencies]
+# No external dependencies - keep it simple for fast compilation
+
+# Empty workspace table makes this a standalone project,
+# not part of the parent RCH workspace
+[workspace]
