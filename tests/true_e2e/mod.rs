@@ -34,6 +34,7 @@
 //! }
 //! ```
 
+pub mod cargo_build_tests;
 pub mod config;
 pub mod output;
 pub mod ssh_command_tests;
