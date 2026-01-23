@@ -392,7 +392,12 @@ fn log_skip_event(
     let mut ctx = Vec::with_capacity(context.len() + 1);
     ctx.push(("phase".to_string(), "skip_check".to_string()));
     ctx.extend(context);
-    logger.log_with_context(level, LogSource::Custom("skip_check".to_string()), message, ctx);
+    logger.log_with_context(
+        level,
+        LogSource::Custom("skip_check".to_string()),
+        message,
+        ctx,
+    );
 }
 
 fn ping_worker(host: &str, port: u16, timeout: Duration) -> Result<bool, std::io::Error> {
@@ -426,16 +431,11 @@ pub fn require_workers(logger: &TestLogger) -> Option<TestWorkersConfig> {
     );
 
     if should_skip_all_tests() {
-        log_skip_event(
-            logger,
-            LogLevel::Info,
-            "E2E tests disabled via env",
-            vec![
-                ("reason".to_string(), "env_skip_all".to_string()),
-                ("env".to_string(), ENV_SKIP_ALL_TESTS.to_string()),
-                ("skip".to_string(), "true".to_string()),
-            ],
-        );
+        log_skip_event(logger, LogLevel::Info, "E2E tests disabled via env", vec![
+            ("reason".to_string(), "env_skip_all".to_string()),
+            ("env".to_string(), ENV_SKIP_ALL_TESTS.to_string()),
+            ("skip".to_string(), "true".to_string()),
+        ]);
         return None;
     }
 
@@ -476,10 +476,7 @@ pub fn require_workers(logger: &TestLogger) -> Option<TestWorkersConfig> {
             "Workers unavailable, skipping test",
             vec![
                 ("reason".to_string(), "no_enabled_workers".to_string()),
-                (
-                    "configured".to_string(),
-                    config.workers.len().to_string(),
-                ),
+                ("configured".to_string(), config.workers.len().to_string()),
                 ("skip".to_string(), "true".to_string()),
             ],
         );

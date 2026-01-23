@@ -51,5 +51,7 @@ pub mod config;
 pub mod network;
 
 pub use build::{BuildErrorDisplay, SignalInfo, WorkerResourceState};
-pub use config::{ConfigErrorDisplay, ConfigLocation, ConfigSearchPaths, ConfigSnippet, TypeMismatch};
+pub use config::{
+    ConfigErrorDisplay, ConfigLocation, ConfigSearchPaths, ConfigSnippet, TypeMismatch,
+};
 pub use network::NetworkErrorDisplay;

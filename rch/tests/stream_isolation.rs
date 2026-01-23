@@ -19,8 +19,7 @@ const ANSI_ESC: &str = "\x1b[";
 /// Get the path to the rch binary.
 fn rch_binary() -> String {
     std::env::var("RCH_BINARY").unwrap_or_else(|_| {
-        let manifest_dir =
-            std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
+        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
         format!(
             "{}/target/release/rch",
             manifest_dir.trim_end_matches("/rch")
@@ -352,8 +351,8 @@ fn test_stream_isolation_summary() {
     for (name, args) in json_commands {
         let (_exit, stdout, _stderr) = run_rch(&args);
 
-        let is_valid_json = stdout.is_empty()
-            || serde_json::from_str::<serde_json::Value>(&stdout).is_ok();
+        let is_valid_json =
+            stdout.is_empty() || serde_json::from_str::<serde_json::Value>(&stdout).is_ok();
         let has_ansi = stdout.contains(ANSI_ESC);
 
         eprintln!(

@@ -28,9 +28,11 @@ const MAX_HOOK_TIME_MS: u64 = 10;
 /// Get the path to the rch binary.
 fn rch_binary() -> String {
     std::env::var("RCH_BINARY").unwrap_or_else(|_| {
-        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
-            .unwrap_or_else(|_| ".".to_string());
-        format!("{}/target/release/rch", manifest_dir.trim_end_matches("/rch"))
+        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
+        format!(
+            "{}/target/release/rch",
+            manifest_dir.trim_end_matches("/rch")
+        )
     })
 }
 
@@ -50,9 +52,7 @@ fn run_hook(input: &str) -> (i32, String, String, Duration) {
         stdin.write_all(input.as_bytes()).ok();
     }
 
-    let output = child
-        .wait_with_output()
-        .expect("Failed to wait for rch");
+    let output = child.wait_with_output().expect("Failed to wait for rch");
 
     let duration = start.elapsed();
 
@@ -74,10 +74,7 @@ fn check_binary() -> bool {
 macro_rules! require_binary {
     () => {
         if !check_binary() {
-            eprintln!(
-                "Skipping test: rch binary not found at {}",
-                rch_binary()
-            );
+            eprintln!("Skipping test: rch binary not found at {}", rch_binary());
             eprintln!("Build with: cargo build -p rch --release");
             return;
         }
@@ -343,16 +340,8 @@ fn test_hook_output_deterministic() {
         let (exit1, stdout1, _, _) = run_hook(input);
         let (exit2, stdout2, _, _) = run_hook(input);
 
-        assert_eq!(
-            exit1, exit2,
-            "Exit code not deterministic for: {}",
-            input
-        );
-        assert_eq!(
-            stdout1, stdout2,
-            "stdout not deterministic for: {}",
-            input
-        );
+        assert_eq!(exit1, exit2, "Exit code not deterministic for: {}", input);
+        assert_eq!(stdout1, stdout2, "stdout not deterministic for: {}", input);
     }
 }
 
@@ -370,8 +359,12 @@ fn test_hook_non_interference_summary() {
     // Test 1: Valid JSON
     let input = r#"{"tool_name":"Bash","tool_input":{"command":"echo hello"}}"#;
     let (exit, stdout, _stderr, dur) = run_hook(input);
-    eprintln!("Passthrough command: exit={}, stdout_len={}, time={}ms",
-              exit, stdout.len(), dur.as_millis());
+    eprintln!(
+        "Passthrough command: exit={}, stdout_len={}, time={}ms",
+        exit,
+        stdout.len(),
+        dur.as_millis()
+    );
 
     // Test 2: No ANSI codes
     let has_ansi = stdout.contains(ANSI_ESC);

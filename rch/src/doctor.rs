@@ -3,10 +3,10 @@
 //! Runs comprehensive diagnostics and optionally auto-fixes common issues.
 
 use crate::commands::{config_dir, load_workers_from_config};
-use rch_common::ApiResponse;
 use crate::ui::context::OutputContext;
 use crate::ui::theme::StatusIndicator;
 use anyhow::Result;
+use rch_common::ApiResponse;
 use serde::Serialize;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};

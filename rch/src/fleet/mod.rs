@@ -12,10 +12,10 @@ mod preflight;
 mod rollback;
 
 use crate::commands::load_workers_from_config;
-use rch_common::{ApiError, ApiResponse, ErrorCode};
 use crate::ui::context::OutputContext;
 use crate::ui::theme::StatusIndicator;
 use anyhow::Result;
+use rch_common::{ApiError, ApiResponse, ErrorCode};
 use std::path::PathBuf;
 
 pub use audit::{AuditEventType, AuditLogger, DeploymentAuditEntry};
@@ -55,7 +55,10 @@ pub async fn deploy(
         if ctx.is_json() {
             let _ = ctx.json(&ApiResponse::<()>::err(
                 "fleet deploy",
-                ApiError::new(ErrorCode::ConfigNotFound, "No workers configured. Run 'rch workers discover --add' first."),
+                ApiError::new(
+                    ErrorCode::ConfigNotFound,
+                    "No workers configured. Run 'rch workers discover --add' first.",
+                ),
             ));
         } else {
             println!(
@@ -82,7 +85,10 @@ pub async fn deploy(
         if ctx.is_json() {
             let _ = ctx.json(&ApiResponse::<()>::err(
                 "fleet deploy",
-                ApiError::new(ErrorCode::ConfigInvalidWorker, format!("Worker(s) '{}' not found", worker.unwrap_or_default())),
+                ApiError::new(
+                    ErrorCode::ConfigInvalidWorker,
+                    format!("Worker(s) '{}' not found", worker.unwrap_or_default()),
+                ),
             ));
         } else {
             println!(
@@ -511,7 +517,10 @@ pub async fn drain(
         if ctx.is_json() {
             let _ = ctx.json(&ApiResponse::<()>::err(
                 "fleet drain",
-                ApiError::new(ErrorCode::ConfigValidationError, "Specify either a worker ID or --all"),
+                ApiError::new(
+                    ErrorCode::ConfigValidationError,
+                    "Specify either a worker ID or --all",
+                ),
             ));
         } else {
             println!(

@@ -22,8 +22,8 @@
 //! ```
 
 use crate::ui::{Icons, OutputContext, ProgressContext};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 /// Spinner animation style.
@@ -55,21 +55,13 @@ impl SpinnerStyle {
         }
     }
 
-    const DOTS_FRAMES: &'static [&'static str] = &[
-        "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏",
-    ];
+    const DOTS_FRAMES: &'static [&'static str] =
+        &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
     const ARROWS_FRAMES: &'static [&'static str] = &["←", "↖", "↑", "↗", "→", "↘", "↓", "↙"];
 
     const BOUNCE_FRAMES: &'static [&'static str] = &[
-        "[=    ]",
-        "[ =   ]",
-        "[  =  ]",
-        "[   = ]",
-        "[    =]",
-        "[   = ]",
-        "[  =  ]",
-        "[ =   ]",
+        "[=    ]", "[ =   ]", "[  =  ]", "[   = ]", "[    =]", "[   = ]", "[  =  ]", "[ =   ]",
     ];
 
     const ASCII_FRAMES: &'static [&'static str] = &["|", "/", "-", "\\"];

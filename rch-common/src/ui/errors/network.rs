@@ -172,7 +172,10 @@ impl NetworkErrorDisplay {
         Self::new(ErrorCode::SshAuthFailed, host.clone())
             .auto_add_ssh_env_vars()
             .add_diagnostic("List loaded SSH keys", "ssh-add -l".to_string())
-            .add_diagnostic("Check authorized_keys", format!("ssh {host} 'cat ~/.ssh/authorized_keys'"))
+            .add_diagnostic(
+                "Check authorized_keys",
+                format!("ssh {host} 'cat ~/.ssh/authorized_keys'"),
+            )
             .add_diagnostic("Verbose SSH auth", format!("ssh -vvv {host}"))
     }
 
@@ -183,7 +186,10 @@ impl NetworkErrorDisplay {
         Self::new(ErrorCode::SshKeyError, host)
             .auto_add_ssh_env_vars()
             .add_diagnostic("List SSH keys", "ls -la ~/.ssh/".to_string())
-            .add_diagnostic("Check key format", "ssh-keygen -y -f ~/.ssh/id_ed25519".to_string())
+            .add_diagnostic(
+                "Check key format",
+                "ssh-keygen -y -f ~/.ssh/id_ed25519".to_string(),
+            )
             .add_diagnostic("List loaded keys", "ssh-add -l".to_string())
     }
 
@@ -204,7 +210,10 @@ impl NetworkErrorDisplay {
         Self::new(ErrorCode::SshTimeout, host.clone())
             .add_diagnostic("Test connectivity", format!("ping -c 3 {host}"))
             .add_diagnostic("Check route", format!("traceroute {host}"))
-            .add_diagnostic("Test SSH with timeout", format!("timeout 10 ssh -v {host} exit"))
+            .add_diagnostic(
+                "Test SSH with timeout",
+                format!("timeout 10 ssh -v {host} exit"),
+            )
     }
 
     /// Create display for SSH session dropped (E105).
@@ -213,7 +222,10 @@ impl NetworkErrorDisplay {
         let host = host.into();
         Self::new(ErrorCode::SshSessionDropped, host.clone())
             .add_diagnostic("Check host uptime", format!("ssh {host} uptime"))
-            .add_diagnostic("Test connection stability", format!("ssh {host} 'sleep 5 && echo ok'"))
+            .add_diagnostic(
+                "Test connection stability",
+                format!("ssh {host} 'sleep 5 && echo ok'"),
+            )
     }
 
     /// Create display for DNS resolution failure (E106).
@@ -241,9 +253,15 @@ impl NetworkErrorDisplay {
     pub fn connection_refused(host: impl Into<String>) -> Self {
         let host = host.into();
         Self::new(ErrorCode::NetworkConnectionRefused, host.clone())
-            .add_diagnostic("Check if SSH is running", format!("ssh {host} 'systemctl status sshd'"))
+            .add_diagnostic(
+                "Check if SSH is running",
+                format!("ssh {host} 'systemctl status sshd'"),
+            )
             .add_diagnostic("Check port", format!("nc -zv {host} 22"))
-            .add_diagnostic("Check firewall (remote)", format!("ssh {host} 'iptables -L -n'"))
+            .add_diagnostic(
+                "Check firewall (remote)",
+                format!("ssh {host} 'iptables -L -n'"),
+            )
     }
 
     /// Create display for TCP timeout (E109).
@@ -253,7 +271,10 @@ impl NetworkErrorDisplay {
         Self::new(ErrorCode::NetworkTimeout, host.clone())
             .add_diagnostic("Check latency", format!("ping -c 5 {host}"))
             .add_diagnostic("Check route", format!("traceroute {host}"))
-            .add_diagnostic("Test port with timeout", format!("timeout 5 nc -zv {host} 22"))
+            .add_diagnostic(
+                "Test port with timeout",
+                format!("timeout 5 nc -zv {host} 22"),
+            )
     }
 
     // ========================================================================
@@ -424,7 +445,11 @@ impl NetworkErrorDisplay {
 
     /// Add a diagnostic command suggestion.
     #[must_use]
-    pub fn add_diagnostic(mut self, description: impl Into<String>, command: impl Into<String>) -> Self {
+    pub fn add_diagnostic(
+        mut self,
+        description: impl Into<String>,
+        command: impl Into<String>,
+    ) -> Self {
         self.diagnostics.push(DiagnosticCommand {
             description: description.into(),
             command: command.into(),
@@ -449,10 +474,12 @@ impl NetworkErrorDisplay {
         // Detect specific error kinds
         match err.kind() {
             io::ErrorKind::ConnectionRefused => {
-                self.caused_by.push("Connection actively refused by remote host".to_string());
+                self.caused_by
+                    .push("Connection actively refused by remote host".to_string());
             }
             io::ErrorKind::ConnectionReset => {
-                self.caused_by.push("Connection was reset by remote host".to_string());
+                self.caused_by
+                    .push("Connection was reset by remote host".to_string());
             }
             io::ErrorKind::ConnectionAborted => {
                 self.caused_by.push("Connection was aborted".to_string());
@@ -672,11 +699,7 @@ impl NetworkErrorDisplay {
             lines.push(String::new());
             lines.push(format!("[{}]Suggestions:[/]", RchTheme::SECONDARY));
             for (i, step) in entry.remediation.iter().enumerate() {
-                lines.push(format!(
-                    "  [{}]{}.[/] {step}",
-                    RchTheme::SECONDARY,
-                    i + 1
-                ));
+                lines.push(format!("  [{}]{}.[/] {step}", RchTheme::SECONDARY, i + 1));
             }
         }
 
@@ -774,7 +797,11 @@ impl NetworkErrorDisplay {
 
     /// Format the network path for display.
     fn format_network_path(&self, ctx: OutputContext) -> String {
-        let arrow = if ctx.supports_unicode() { " → " } else { " -> " };
+        let arrow = if ctx.supports_unicode() {
+            " → "
+        } else {
+            " -> "
+        };
         let check = Icons::check(ctx);
         let cross = Icons::cross(ctx);
         let question = if ctx.supports_unicode() { "?" } else { "?" };
@@ -858,16 +885,19 @@ mod tests {
     fn test_resolved_ip() {
         use std::net::Ipv4Addr;
         let ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100));
-        let display = NetworkErrorDisplay::ssh_connection_failed("build1")
-            .resolved_ip(ip);
+        let display = NetworkErrorDisplay::ssh_connection_failed("build1").resolved_ip(ip);
 
         assert_eq!(display.connection.resolved_ip, Some(ip));
     }
 
     #[test]
     fn test_network_path() {
-        let display = NetworkErrorDisplay::ssh_connection_failed("build1")
-            .network_path_simple("local", "daemon", "worker", Some("worker"));
+        let display = NetworkErrorDisplay::ssh_connection_failed("build1").network_path_simple(
+            "local",
+            "daemon",
+            "worker",
+            Some("worker"),
+        );
 
         assert_eq!(display.network_path.len(), 3);
         assert_eq!(display.network_path[2].status, PathSegmentStatus::Failed);
@@ -876,8 +906,7 @@ mod tests {
     #[test]
     fn test_with_io_error() {
         let io_err = io::Error::new(io::ErrorKind::ConnectionRefused, "Connection refused");
-        let display = NetworkErrorDisplay::ssh_connection_failed("build1")
-            .with_io_error(&io_err);
+        let display = NetworkErrorDisplay::ssh_connection_failed("build1").with_io_error(&io_err);
 
         assert!(display.raw_error.is_some());
         assert!(!display.caused_by.is_empty());
@@ -898,7 +927,12 @@ mod tests {
         let display = NetworkErrorDisplay::ssh_connection_failed("build1")
             .add_diagnostic("Custom check", "custom-cmd");
 
-        assert!(display.diagnostics.iter().any(|d| d.command == "custom-cmd"));
+        assert!(
+            display
+                .diagnostics
+                .iter()
+                .any(|d| d.command == "custom-cmd")
+        );
     }
 
     #[test]
@@ -927,14 +961,15 @@ mod tests {
     #[test]
     fn test_json_compact_serialization() {
         let display = NetworkErrorDisplay::ssh_connection_failed("build1");
-        let json = display.to_json_compact().expect("JSON serialization failed");
+        let json = display
+            .to_json_compact()
+            .expect("JSON serialization failed");
         assert!(!json.contains('\n'));
     }
 
     #[test]
     fn test_display_implementation() {
-        let display = NetworkErrorDisplay::ssh_connection_failed("build1")
-            .message("Test message");
+        let display = NetworkErrorDisplay::ssh_connection_failed("build1").message("Test message");
 
         let output = format!("{display}");
         assert!(output.contains("RCH-E100"));
@@ -1021,15 +1056,15 @@ mod tests {
 
     #[test]
     fn test_path_segment_status() {
-        let display = NetworkErrorDisplay::ssh_connection_failed("build1")
-            .path_segment("seg1", PathSegmentStatus::Ok, Some("details".to_string()));
+        let display = NetworkErrorDisplay::ssh_connection_failed("build1").path_segment(
+            "seg1",
+            PathSegmentStatus::Ok,
+            Some("details".to_string()),
+        );
 
         assert_eq!(display.network_path.len(), 1);
         assert_eq!(display.network_path[0].status, PathSegmentStatus::Ok);
-        assert_eq!(
-            display.network_path[0].details,
-            Some("details".to_string())
-        );
+        assert_eq!(display.network_path[0].details, Some("details".to_string()));
     }
 
     #[test]

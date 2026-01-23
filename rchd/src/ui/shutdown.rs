@@ -29,9 +29,9 @@ use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "rich-ui")]
-use rich_rust::prelude::*;
-#[cfg(feature = "rich-ui")]
 use rich_rust::r#box::ROUNDED;
+#[cfg(feature = "rich-ui")]
+use rich_rust::prelude::*;
 
 /// Signal type that triggered shutdown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -484,7 +484,9 @@ impl ShutdownSequence {
     fn show_session_summary_plain(&self, stats: &SessionStats) {
         // Box drawing characters with ASCII fallback
         let (tl, tr, bl, br, h, v) = if self.ctx.supports_unicode() {
-            ('\u{256D}', '\u{256E}', '\u{2570}', '\u{256F}', '\u{2500}', '\u{2502}')
+            (
+                '\u{256D}', '\u{256E}', '\u{2570}', '\u{256F}', '\u{2500}', '\u{2502}',
+            )
         } else {
             ('+', '+', '+', '+', '-', '|')
         };
@@ -509,9 +511,13 @@ impl ShutdownSequence {
         let top_line = format!(
             "{}{}{}{}{}",
             tl,
-            std::iter::repeat(h).take(title_padding_left).collect::<String>(),
+            std::iter::repeat(h)
+                .take(title_padding_left)
+                .collect::<String>(),
             title,
-            std::iter::repeat(h).take(title_padding_right).collect::<String>(),
+            std::iter::repeat(h)
+                .take(title_padding_right)
+                .collect::<String>(),
             tr
         );
 
@@ -521,7 +527,9 @@ impl ShutdownSequence {
             "{} {}{} {}",
             v,
             content,
-            std::iter::repeat(' ').take(content_padding).collect::<String>(),
+            std::iter::repeat(' ')
+                .take(content_padding)
+                .collect::<String>(),
             v
         );
 
@@ -648,7 +656,8 @@ where
     Fut: std::future::Future<Output = JobDrainEvent>,
 {
     let total_jobs = in_flight_jobs.len();
-    let mut sequence = ShutdownSequence::new(signal, version, total_jobs, workers, timeout.as_secs());
+    let mut sequence =
+        ShutdownSequence::new(signal, version, total_jobs, workers, timeout.as_secs());
 
     // 1. Show signal received
     sequence.show_signal_received();
@@ -774,8 +783,8 @@ mod tests {
 
     #[test]
     fn test_shutdown_sequence_record_job() {
-        let mut seq =
-            ShutdownSequence::new(ShutdownSignal::Term, "0.5.2", 2, 1, 60).with_context(OutputContext::Plain);
+        let mut seq = ShutdownSequence::new(ShutdownSignal::Term, "0.5.2", 2, 1, 60)
+            .with_context(OutputContext::Plain);
 
         seq.record_job_drained(JobDrainEvent::success("j-001"));
         seq.record_job_drained(JobDrainEvent::failed("j-002", 1));
@@ -786,8 +795,8 @@ mod tests {
 
     #[test]
     fn test_shutdown_sequence_all_success() {
-        let mut seq =
-            ShutdownSequence::new(ShutdownSignal::Int, "0.5.2", 2, 1, 60).with_context(OutputContext::Plain);
+        let mut seq = ShutdownSequence::new(ShutdownSignal::Int, "0.5.2", 2, 1, 60)
+            .with_context(OutputContext::Plain);
 
         seq.record_job_drained(JobDrainEvent::success("j-001"));
         seq.record_job_drained(JobDrainEvent::success("j-002"));
@@ -797,8 +806,8 @@ mod tests {
 
     #[test]
     fn test_shutdown_sequence_show_functions_dont_panic() {
-        let seq =
-            ShutdownSequence::new(ShutdownSignal::Term, "0.5.2", 3, 2, 60).with_context(OutputContext::Plain);
+        let seq = ShutdownSequence::new(ShutdownSignal::Term, "0.5.2", 3, 2, 60)
+            .with_context(OutputContext::Plain);
 
         // These should not panic
         seq.show_signal_received();
@@ -812,8 +821,8 @@ mod tests {
 
     #[test]
     fn test_shutdown_sequence_workers_disconnecting() {
-        let mut seq =
-            ShutdownSequence::new(ShutdownSignal::Term, "0.5.2", 0, 5, 60).with_context(OutputContext::Plain);
+        let mut seq = ShutdownSequence::new(ShutdownSignal::Term, "0.5.2", 0, 5, 60)
+            .with_context(OutputContext::Plain);
 
         seq.show_workers_disconnecting(3);
         assert_eq!(seq.workers_disconnected, 3);
@@ -824,8 +833,8 @@ mod tests {
 
     #[test]
     fn test_shutdown_sequence_session_summary_plain() {
-        let seq =
-            ShutdownSequence::new(ShutdownSignal::Term, "0.5.2", 0, 0, 60).with_context(OutputContext::Plain);
+        let seq = ShutdownSequence::new(ShutdownSignal::Term, "0.5.2", 0, 0, 60)
+            .with_context(OutputContext::Plain);
         let stats = SessionStats::new(Duration::from_secs(3600), 100, 95, 5, 3);
 
         // Should not panic
@@ -834,8 +843,8 @@ mod tests {
 
     #[test]
     fn test_shutdown_sequence_final_message() {
-        let seq =
-            ShutdownSequence::new(ShutdownSignal::Term, "0.5.2", 0, 0, 60).with_context(OutputContext::Plain);
+        let seq = ShutdownSequence::new(ShutdownSignal::Term, "0.5.2", 0, 0, 60)
+            .with_context(OutputContext::Plain);
 
         // Should not panic
         seq.show_shutdown_complete(0);

@@ -69,4 +69,4 @@ pub use ui::{Icons, OutputContext, RchTheme};
 pub use errors::{ErrorCategory, ErrorCode, ErrorEntry};
 
 // API module re-exports (unified API types for CLI and daemon)
-pub use api::{ApiError, ApiResponse, ErrorContext, LegacyErrorCode, API_VERSION};
+pub use api::{API_VERSION, ApiError, ApiResponse, ErrorContext, LegacyErrorCode};

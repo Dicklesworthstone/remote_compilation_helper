@@ -63,7 +63,7 @@ mod error;
 mod response;
 
 pub use error::{ApiError, ErrorContext, LegacyErrorCode};
-pub use response::{ApiResponse, API_VERSION};
+pub use response::{API_VERSION, ApiResponse};
 
 #[cfg(test)]
 mod tests {

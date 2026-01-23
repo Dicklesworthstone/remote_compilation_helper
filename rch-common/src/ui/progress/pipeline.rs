@@ -177,7 +177,10 @@ impl PipelineProgress {
             None
         };
 
-        let stages = PipelineStage::all().iter().map(|_| StageInfo::default()).collect();
+        let stages = PipelineStage::all()
+            .iter()
+            .map(|_| StageInfo::default())
+            .collect();
 
         Self {
             ctx,
@@ -307,8 +310,7 @@ impl PipelineProgress {
             return None;
         }
 
-        let avg_duration: Duration =
-            completed.iter().sum::<Duration>() / completed.len() as u32;
+        let avg_duration: Duration = completed.iter().sum::<Duration>() / completed.len() as u32;
 
         let remaining_count = self
             .stages
@@ -434,14 +436,15 @@ impl PipelineProgress {
             Icons::check(self.ctx)
         };
 
-        let status = if self.has_failed() { "failed" } else { "completed" };
+        let status = if self.has_failed() {
+            "failed"
+        } else {
+            "completed"
+        };
         let elapsed = format_duration(duration);
 
         // Build summary line
-        let mut summary = format!(
-            "{icon} Pipeline {status} on {} in {elapsed}",
-            self.worker
-        );
+        let mut summary = format!("{icon} Pipeline {status} on {} in {elapsed}", self.worker);
 
         // Add cache savings if applicable
         if let Some(saved) = self.cache_saved_time {
@@ -507,7 +510,10 @@ impl PipelineProgress {
         let icon = Icons::cross(self.ctx);
         let elapsed = format_duration(self.start.elapsed());
 
-        eprintln!("{icon} Pipeline failed on {} after {elapsed}: {error}", self.worker);
+        eprintln!(
+            "{icon} Pipeline failed on {} after {elapsed}: {error}",
+            self.worker
+        );
 
         // Show completed stages for debugging
         for stage in PipelineStage::all() {
@@ -587,7 +593,10 @@ mod tests {
         assert!(!pipeline.has_failed());
 
         pipeline.start_stage(PipelineStage::WorkspaceAnalysis);
-        assert_eq!(pipeline.current_stage(), Some(PipelineStage::WorkspaceAnalysis));
+        assert_eq!(
+            pipeline.current_stage(),
+            Some(PipelineStage::WorkspaceAnalysis)
+        );
 
         pipeline.set_stage_detail("100 files");
         pipeline.complete_stage();
@@ -616,7 +625,10 @@ mod tests {
 
         assert!(pipeline.has_failed());
         assert_eq!(pipeline.stages[2].status, StageStatus::Failed);
-        assert_eq!(pipeline.stages[2].error_message.as_deref(), Some("build error"));
+        assert_eq!(
+            pipeline.stages[2].error_message.as_deref(),
+            Some("build error")
+        );
     }
 
     #[test]

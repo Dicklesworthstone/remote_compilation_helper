@@ -639,9 +639,7 @@ impl ConfigErrorDisplay {
         }
 
         // Add permission info
-        if let (Some(current), Some(required)) =
-            (&self.permission_mode, &self.required_mode)
-        {
+        if let (Some(current), Some(required)) = (&self.permission_mode, &self.required_mode) {
             panel = panel.context("Permissions", format!("{current} (need {required})"));
         }
 
@@ -756,16 +754,17 @@ impl ConfigErrorDisplay {
         // Environment variable
         if let Some(ref name) = self.env_var_name {
             lines.push(String::new());
-            lines.push(format!("[{}]Environment variable:[/] {name}", RchTheme::DIM));
+            lines.push(format!(
+                "[{}]Environment variable:[/] {name}",
+                RchTheme::DIM
+            ));
             if let Some(ref value) = self.env_var_value {
                 lines.push(format!("[{}]Current value:[/] {value}", RchTheme::DIM));
             }
         }
 
         // Permission info
-        if let (Some(current), Some(required)) =
-            (&self.permission_mode, &self.required_mode)
-        {
+        if let (Some(current), Some(required)) = (&self.permission_mode, &self.required_mode) {
             lines.push(String::new());
             lines.push(format!(
                 "[{}]Permissions:[/] {current} (need {required})",
@@ -895,9 +894,7 @@ impl ConfigErrorDisplay {
         }
 
         // Permission info
-        if let (Some(current), Some(required)) =
-            (&self.permission_mode, &self.required_mode)
-        {
+        if let (Some(current), Some(required)) = (&self.permission_mode, &self.required_mode) {
             eprintln!();
             eprintln!("Permissions: {current} (need {required})");
         }
@@ -989,12 +986,11 @@ mod tests {
 
     #[test]
     fn test_validation_error() {
-        let display =
-            ConfigErrorDisplay::validation_error("/home/user/.config/rch/workers.toml")
-                .key_path("workers.0.host")
-                .expected("non-empty string")
-                .actual("empty string")
-                .example("192.168.1.100");
+        let display = ConfigErrorDisplay::validation_error("/home/user/.config/rch/workers.toml")
+            .key_path("workers.0.host")
+            .expected("non-empty string")
+            .actual("empty string")
+            .example("192.168.1.100");
 
         assert_eq!(display.error_code, ErrorCode::ConfigValidationError);
         let tm = display.type_mismatch.as_ref().unwrap();
@@ -1124,7 +1120,9 @@ mod tests {
     #[test]
     fn test_json_compact() {
         let display = ConfigErrorDisplay::not_found("/path/to/config.toml");
-        let json = display.to_json_compact().expect("JSON serialization failed");
+        let json = display
+            .to_json_compact()
+            .expect("JSON serialization failed");
         assert!(!json.contains('\n'));
     }
 

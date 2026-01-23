@@ -144,8 +144,14 @@ async fn test_infrastructure_smoke() {
         "Worker configuration loaded",
         vec![
             ("workers_found".to_string(), worker_count.to_string()),
-            ("timeout_secs".to_string(), config.effective_timeout_secs().to_string()),
-            ("remote_work_dir".to_string(), config.settings.remote_work_dir.clone()),
+            (
+                "timeout_secs".to_string(),
+                config.effective_timeout_secs().to_string(),
+            ),
+            (
+                "remote_work_dir".to_string(),
+                config.settings.remote_work_dir.clone(),
+            ),
         ],
     );
 
@@ -193,7 +199,10 @@ async fn test_infrastructure_smoke() {
                 LogSource::Custom("smoke".to_string()),
                 "SSH connection established",
                 vec![
-                    ("connect_ms".to_string(), connect_duration.as_millis().to_string()),
+                    (
+                        "connect_ms".to_string(),
+                        connect_duration.as_millis().to_string(),
+                    ),
                     ("connected".to_string(), "true".to_string()),
                 ],
             );
@@ -317,9 +326,7 @@ async fn test_infrastructure_smoke() {
                 LogLevel::Info,
                 LogSource::Custom("smoke".to_string()),
                 "Remote sync verified",
-                vec![
-                    ("cargo_toml_exists".to_string(), has_cargo_toml.to_string()),
-                ],
+                vec![("cargo_toml_exists".to_string(), has_cargo_toml.to_string())],
             );
             if !has_cargo_toml {
                 logger.error("Cargo.toml not found on remote after sync");
@@ -356,7 +363,10 @@ async fn test_infrastructure_smoke() {
                 "Remote cargo build completed",
                 vec![
                     ("exit_code".to_string(), result.exit_code.to_string()),
-                    ("build_ms".to_string(), build_duration.as_millis().to_string()),
+                    (
+                        "build_ms".to_string(),
+                        build_duration.as_millis().to_string(),
+                    ),
                     ("success".to_string(), result.success().to_string()),
                 ],
             );
@@ -422,9 +432,10 @@ async fn test_infrastructure_smoke() {
                 LogLevel::Info,
                 LogSource::Custom("smoke".to_string()),
                 "Artifacts retrieved",
-                vec![
-                    ("retrieve_ms".to_string(), retrieve_duration.as_millis().to_string()),
-                ],
+                vec![(
+                    "retrieve_ms".to_string(),
+                    retrieve_duration.as_millis().to_string(),
+                )],
             );
         }
         Ok(output) => {
@@ -481,7 +492,10 @@ async fn test_infrastructure_smoke() {
                     LogSource::Custom("smoke".to_string()),
                     "Binary execution result",
                     vec![
-                        ("ran_successfully".to_string(), output.status.success().to_string()),
+                        (
+                            "ran_successfully".to_string(),
+                            output.status.success().to_string(),
+                        ),
                         ("output_valid".to_string(), output_ok.to_string()),
                         ("stdout".to_string(), stdout.trim().to_string()),
                     ],
@@ -499,7 +513,10 @@ async fn test_infrastructure_smoke() {
     } else {
         logger.warn("Binary not found locally - may be architecture mismatch");
         // Verify it exists on remote instead
-        match client.execute(&format!("{}/target/debug/hello_world", remote_path)).await {
+        match client
+            .execute(&format!("{}/target/debug/hello_world", remote_path))
+            .await
+        {
             Ok(result) => {
                 logger.log_with_context(
                     LogLevel::Info,
@@ -552,7 +569,10 @@ async fn test_infrastructure_smoke() {
         LogSource::Custom("smoke".to_string()),
         "=== INFRASTRUCTURE SMOKE TEST PASSED ===",
         vec![
-            ("total_ms".to_string(), total_duration.as_millis().to_string()),
+            (
+                "total_ms".to_string(),
+                total_duration.as_millis().to_string(),
+            ),
             ("errors".to_string(), logger.error_count().to_string()),
             ("warnings".to_string(), logger.warn_count().to_string()),
         ],
@@ -613,7 +633,10 @@ fn test_smoke_config_loading() {
                 "Config loaded successfully",
                 vec![
                     ("workers".to_string(), config.workers.len().to_string()),
-                    ("enabled".to_string(), config.enabled_workers().len().to_string()),
+                    (
+                        "enabled".to_string(),
+                        config.enabled_workers().len().to_string(),
+                    ),
                 ],
             );
         }
@@ -650,7 +673,10 @@ fn test_smoke_fixture_exists() {
         "Checking fixture files",
         vec![
             ("fixture_dir".to_string(), fixture_dir.display().to_string()),
-            ("cargo_toml_exists".to_string(), cargo_toml.exists().to_string()),
+            (
+                "cargo_toml_exists".to_string(),
+                cargo_toml.exists().to_string(),
+            ),
             ("main_rs_exists".to_string(), main_rs.exists().to_string()),
         ],
     );

@@ -557,7 +557,10 @@ impl BuildErrorDisplay {
         // Add signal info
         if let Some(ref sig) = self.signal_info {
             let sig_text = if sig.likely_oom {
-                format!("{} (signal {}) - likely OOM", sig.signal_name, sig.signal_number)
+                format!(
+                    "{} (signal {}) - likely OOM",
+                    sig.signal_name, sig.signal_number
+                )
             } else {
                 format!("{} (signal {})", sig.signal_name, sig.signal_number)
             };
@@ -628,7 +631,10 @@ impl BuildErrorDisplay {
 
         // Header with RCH context
         eprintln!();
-        eprintln!("{icon} [RCH] Build failed on {}", self.worker_name.as_deref().unwrap_or("remote"));
+        eprintln!(
+            "{icon} [RCH] Build failed on {}",
+            self.worker_name.as_deref().unwrap_or("remote")
+        );
 
         if let Some(ref cmd) = self.command {
             eprintln!("    Command: {cmd}");
@@ -706,7 +712,10 @@ impl BuildErrorDisplay {
         // Worker and timing
         if let Some(ref worker) = self.worker_name {
             let location = if self.is_remote { "remote" } else { "local" };
-            lines.push(format!("[{}]Worker:[/] {worker} ({location})", RchTheme::DIM));
+            lines.push(format!(
+                "[{}]Worker:[/] {worker} ({location})",
+                RchTheme::DIM
+            ));
         }
 
         if let (Some(dur), Some(timeout)) = (self.duration, self.timeout) {
@@ -717,7 +726,11 @@ impl BuildErrorDisplay {
                 timeout.as_secs()
             ));
         } else if let Some(dur) = self.duration {
-            lines.push(format!("[{}]Duration:[/] {}s", RchTheme::DIM, dur.as_secs()));
+            lines.push(format!(
+                "[{}]Duration:[/] {}s",
+                RchTheme::DIM,
+                dur.as_secs()
+            ));
         }
 
         // Last output
@@ -805,7 +818,11 @@ impl BuildErrorDisplay {
         }
 
         if let (Some(dur), Some(timeout)) = (self.duration, self.timeout) {
-            eprintln!("Duration: {}s (timeout: {}s)", dur.as_secs(), timeout.as_secs());
+            eprintln!(
+                "Duration: {}s (timeout: {}s)",
+                dur.as_secs(),
+                timeout.as_secs()
+            );
         } else if let Some(dur) = self.duration {
             eprintln!("Duration: {}s", dur.as_secs());
         }
@@ -985,7 +1002,10 @@ mod tests {
     fn test_artifact_missing() {
         let display = BuildErrorDisplay::artifact_missing("target/release/myapp");
         assert_eq!(display.error_code, ErrorCode::BuildArtifactMissing);
-        assert_eq!(display.artifact_path, Some("target/release/myapp".to_string()));
+        assert_eq!(
+            display.artifact_path,
+            Some("target/release/myapp".to_string())
+        );
     }
 
     #[test]
@@ -1063,14 +1083,16 @@ mod tests {
     #[test]
     fn test_json_compact() {
         let display = BuildErrorDisplay::compilation_failed("cargo test");
-        let json = display.to_json_compact().expect("JSON serialization failed");
+        let json = display
+            .to_json_compact()
+            .expect("JSON serialization failed");
         assert!(!json.contains('\n'));
     }
 
     #[test]
     fn test_display_implementation() {
-        let display = BuildErrorDisplay::build_timeout("cargo build")
-            .message("Custom timeout message");
+        let display =
+            BuildErrorDisplay::build_timeout("cargo build").message("Custom timeout message");
 
         let output = format!("{display}");
         assert!(output.contains("RCH-E303"));

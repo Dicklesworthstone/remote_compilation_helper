@@ -362,8 +362,7 @@ mod tests {
 
     #[test]
     fn test_from_result_err() {
-        let result: Result<String, ApiError> =
-            Err(ApiError::from_code(ErrorCode::ConfigNotFound));
+        let result: Result<String, ApiError> = Err(ApiError::from_code(ErrorCode::ConfigNotFound));
         let response: ApiResponse<String> = result.into();
         assert!(!response.success);
         assert!(response.error.is_some());
