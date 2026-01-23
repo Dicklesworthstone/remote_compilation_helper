@@ -11,7 +11,8 @@ mod plan;
 mod preflight;
 mod rollback;
 
-use crate::commands::{JsonResponse, load_workers_from_config};
+use crate::commands::load_workers_from_config;
+use rch_common::{ApiError, ApiResponse, ErrorCode};
 use crate::ui::context::OutputContext;
 use crate::ui::theme::StatusIndicator;
 use anyhow::Result;
@@ -52,10 +53,9 @@ pub async fn deploy(
     let workers = load_workers_from_config()?;
     if workers.is_empty() {
         if ctx.is_json() {
-            let _ = ctx.json(&JsonResponse::<()>::err_cmd(
+            let _ = ctx.json(&ApiResponse::<()>::err(
                 "fleet deploy",
-                "CONFIG_NOT_FOUND",
-                "No workers configured. Run 'rch workers discover --add' first.",
+                ApiError::new(ErrorCode::ConfigNotFound, "No workers configured. Run 'rch workers discover --add' first."),
             ));
         } else {
             println!(
@@ -80,10 +80,9 @@ pub async fn deploy(
 
     if target_workers.is_empty() {
         if ctx.is_json() {
-            let _ = ctx.json(&JsonResponse::<()>::err_cmd(
+            let _ = ctx.json(&ApiResponse::<()>::err(
                 "fleet deploy",
-                "WORKER_NOT_FOUND",
-                format!("Worker(s) '{}' not found", worker.unwrap_or_default()),
+                ApiError::new(ErrorCode::ConfigInvalidWorker, format!("Worker(s) '{}' not found", worker.unwrap_or_default())),
             ));
         } else {
             println!(
@@ -166,7 +165,7 @@ pub async fn deploy(
 
     // Output results
     if ctx.is_json() {
-        let _ = ctx.json(&JsonResponse::ok("fleet deploy", &result));
+        let _ = ctx.json(&ApiResponse::ok("fleet deploy", &result));
     } else {
         match result {
             FleetResult::Success {
@@ -224,10 +223,9 @@ pub async fn rollback(
     let workers = load_workers_from_config()?;
     if workers.is_empty() {
         if ctx.is_json() {
-            let _ = ctx.json(&JsonResponse::<()>::err_cmd(
+            let _ = ctx.json(&ApiResponse::<()>::err(
                 "fleet rollback",
-                "CONFIG_NOT_FOUND",
-                "No workers configured.",
+                ApiError::new(ErrorCode::ConfigNotFound, "No workers configured."),
             ));
         } else {
             println!(
@@ -296,7 +294,7 @@ pub async fn rollback(
         .await?;
 
     if ctx.is_json() {
-        let _ = ctx.json(&JsonResponse::ok("fleet rollback", &results));
+        let _ = ctx.json(&ApiResponse::ok("fleet rollback", &results));
     } else {
         let success_count = results.iter().filter(|r| r.success).count();
         let fail_count = results.len() - success_count;
@@ -324,10 +322,9 @@ pub async fn status(ctx: &OutputContext, worker: Option<String>, watch: bool) ->
     let workers = load_workers_from_config()?;
     if workers.is_empty() {
         if ctx.is_json() {
-            let _ = ctx.json(&JsonResponse::<()>::err_cmd(
+            let _ = ctx.json(&ApiResponse::<()>::err(
                 "fleet status",
-                "CONFIG_NOT_FOUND",
-                "No workers configured.",
+                ApiError::new(ErrorCode::ConfigNotFound, "No workers configured."),
             ));
         } else {
             println!(
@@ -353,7 +350,7 @@ pub async fn status(ctx: &OutputContext, worker: Option<String>, watch: bool) ->
     let status_results = preflight::get_fleet_status(&target_workers, ctx).await?;
 
     if ctx.is_json() {
-        let _ = ctx.json(&JsonResponse::ok("fleet status", &status_results));
+        let _ = ctx.json(&ApiResponse::ok("fleet status", &status_results));
         return Ok(());
     }
 
@@ -407,10 +404,9 @@ pub async fn verify(ctx: &OutputContext, worker: Option<String>) -> Result<()> {
     let workers = load_workers_from_config()?;
     if workers.is_empty() {
         if ctx.is_json() {
-            let _ = ctx.json(&JsonResponse::<()>::err_cmd(
+            let _ = ctx.json(&ApiResponse::<()>::err(
                 "fleet verify",
-                "CONFIG_NOT_FOUND",
-                "No workers configured.",
+                ApiError::new(ErrorCode::ConfigNotFound, "No workers configured."),
             ));
         } else {
             println!(
@@ -482,7 +478,7 @@ pub async fn verify(ctx: &OutputContext, worker: Option<String>) -> Result<()> {
     }
 
     if ctx.is_json() {
-        let _ = ctx.json(&JsonResponse::ok("fleet verify", &results));
+        let _ = ctx.json(&ApiResponse::ok("fleet verify", &results));
     } else {
         println!();
         if all_ok {
@@ -513,10 +509,9 @@ pub async fn drain(
 
     if worker.is_none() && !all {
         if ctx.is_json() {
-            let _ = ctx.json(&JsonResponse::<()>::err_cmd(
+            let _ = ctx.json(&ApiResponse::<()>::err(
                 "fleet drain",
-                "CONFIG_INVALID",
-                "Specify either a worker ID or --all",
+                ApiError::new(ErrorCode::ConfigValidationError, "Specify either a worker ID or --all"),
             ));
         } else {
             println!(
@@ -578,7 +573,7 @@ pub async fn drain(
     }
 
     if ctx.is_json() {
-        let _ = ctx.json(&JsonResponse::ok(
+        let _ = ctx.json(&ApiResponse::ok(
             "fleet drain",
             serde_json::json!({
                 "workers_drained": target_workers.len(),
@@ -598,7 +593,7 @@ pub async fn history(ctx: &OutputContext, limit: usize, worker: Option<String>) 
     let entries = manager.get_history(limit, worker.as_deref())?;
 
     if ctx.is_json() {
-        let _ = ctx.json(&JsonResponse::ok("fleet history", &entries));
+        let _ = ctx.json(&ApiResponse::ok("fleet history", &entries));
         return Ok(());
     }
 
