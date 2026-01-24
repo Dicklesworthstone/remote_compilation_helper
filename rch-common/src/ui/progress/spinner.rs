@@ -298,7 +298,7 @@ impl AnimatedSpinner {
         let icon = match result {
             SpinnerResult::Success => Icons::check(self.ctx),
             SpinnerResult::Error => Icons::cross(self.ctx),
-            SpinnerResult::Skipped => Icons::arrow(self.ctx),
+            SpinnerResult::Skipped => Icons::arrow_right(self.ctx),
         };
 
         let elapsed = format_duration(self.elapsed());
