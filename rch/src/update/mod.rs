@@ -77,10 +77,8 @@ pub async fn run_update(
             "Update available: {} -> {}",
             update_info.current_version, update_info.latest_version
         );
-        if show_changelog {
-            if let Some(ref notes) = update_info.release_notes {
-                println!("\nRelease notes:\n{}", notes);
-            }
+        if show_changelog && let Some(ref notes) = update_info.release_notes {
+            println!("\nRelease notes:\n{}", notes);
         }
         if !dry_run {
             println!("\nProceed with update? [y/N]");
@@ -134,10 +132,8 @@ fn display_update_check(ctx: &OutputContext, info: &UpdateCheck, show_changelog:
         );
         println!("Release URL: {}", info.release_url);
 
-        if show_changelog {
-            if let Some(ref notes) = info.release_notes {
-                println!("\nRelease notes:\n{}", notes);
-            }
+        if show_changelog && let Some(ref notes) = info.release_notes {
+            println!("\nRelease notes:\n{}", notes);
         }
     } else {
         println!("Already up to date ({})", info.current_version);

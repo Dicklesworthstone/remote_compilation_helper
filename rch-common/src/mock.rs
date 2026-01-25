@@ -234,10 +234,10 @@ impl MockConfig {
 
         let mut config = MockConfig::default();
 
-        if let Ok(val) = std::env::var("RCH_MOCK_SSH_EXIT_CODE") {
-            if let Ok(code) = val.parse() {
-                config.default_exit_code = code;
-            }
+        if let Ok(val) = std::env::var("RCH_MOCK_SSH_EXIT_CODE")
+            && let Ok(code) = val.parse()
+        {
+            config.default_exit_code = code;
         }
         if let Ok(val) = std::env::var("RCH_MOCK_SSH_STDOUT") {
             config.default_stdout = val;
@@ -245,10 +245,10 @@ impl MockConfig {
         if let Ok(val) = std::env::var("RCH_MOCK_SSH_STDERR") {
             config.default_stderr = val;
         }
-        if let Ok(val) = std::env::var("RCH_MOCK_SSH_DELAY_MS") {
-            if let Ok(delay) = val.parse() {
-                config.execution_delay_ms = delay;
-            }
+        if let Ok(val) = std::env::var("RCH_MOCK_SSH_DELAY_MS")
+            && let Ok(delay) = val.parse()
+        {
+            config.execution_delay_ms = delay;
         }
 
         config.fail_connect = env_flag("RCH_MOCK_SSH_FAIL_CONNECT");
@@ -566,15 +566,15 @@ impl MockRsyncConfig {
         config.fail_sync = env_flag("RCH_MOCK_RSYNC_FAIL_SYNC");
         config.fail_artifacts = env_flag("RCH_MOCK_RSYNC_FAIL_ARTIFACTS");
 
-        if let Ok(val) = std::env::var("RCH_MOCK_RSYNC_FILES") {
-            if let Ok(files) = val.parse() {
-                config.files_per_sync = files;
-            }
+        if let Ok(val) = std::env::var("RCH_MOCK_RSYNC_FILES")
+            && let Ok(files) = val.parse()
+        {
+            config.files_per_sync = files;
         }
-        if let Ok(val) = std::env::var("RCH_MOCK_RSYNC_BYTES") {
-            if let Ok(bytes) = val.parse() {
-                config.bytes_per_sync = bytes;
-            }
+        if let Ok(val) = std::env::var("RCH_MOCK_RSYNC_BYTES")
+            && let Ok(bytes) = val.parse()
+        {
+            config.bytes_per_sync = bytes;
         }
 
         config

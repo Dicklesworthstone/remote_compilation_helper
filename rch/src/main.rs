@@ -902,18 +902,15 @@ fn machine_output_requested(format: Option<&str>, json_flag: bool) -> bool {
 }
 
 fn resolve_output_format(format: Option<&str>, json_flag: bool) -> OutputFormat {
-    if let Some(raw) = format {
-        if let Some(parsed) = OutputFormat::parse(raw) {
-            return parsed;
-        }
+    if let Some(raw) = format && let Some(parsed) = OutputFormat::parse(raw) {
+        return parsed;
     }
 
-    if json_flag {
-        if let Ok(value) = env::var("TOON_DEFAULT_FORMAT") {
-            if let Some(parsed) = OutputFormat::parse(&value) {
-                return parsed;
-            }
-        }
+    if json_flag
+        && let Ok(value) = env::var("TOON_DEFAULT_FORMAT")
+        && let Some(parsed) = OutputFormat::parse(&value)
+    {
+        return parsed;
     }
 
     OutputFormat::Json
@@ -1392,20 +1389,18 @@ fn find_web_directory() -> Result<PathBuf> {
     }
 
     // Try relative to the executable
-    if let Ok(exe_path) = std::env::current_exe() {
-        if let Some(exe_dir) = exe_path.parent() {
-            // Check sibling web directory
-            let web_sibling = exe_dir.join("web");
-            if web_sibling.exists() && web_sibling.join("package.json").exists() {
-                return Ok(web_sibling);
-            }
+    if let Ok(exe_path) = std::env::current_exe() && let Some(exe_dir) = exe_path.parent() {
+        // Check sibling web directory
+        let web_sibling = exe_dir.join("web");
+        if web_sibling.exists() && web_sibling.join("package.json").exists() {
+            return Ok(web_sibling);
+        }
 
-            // Check parent's web directory (for dev builds)
-            if let Some(parent) = exe_dir.parent() {
-                let web_parent = parent.join("web");
-                if web_parent.exists() && web_parent.join("package.json").exists() {
-                    return Ok(web_parent);
-                }
+        // Check parent's web directory (for dev builds)
+        if let Some(parent) = exe_dir.parent() {
+            let web_parent = parent.join("web");
+            if web_parent.exists() && web_parent.join("package.json").exists() {
+                return Ok(web_parent);
             }
         }
     }

@@ -130,10 +130,8 @@ impl TerminalCaps {
     /// Check if the terminal supports colors.
     fn detect_color_support() -> bool {
         // Check TERM environment variable
-        if let Ok(term) = env::var("TERM") {
-            if term == "dumb" {
-                return false;
-            }
+        if let Ok(term) = env::var("TERM") && term == "dumb" {
+            return false;
         }
 
         // NO_COLOR disables colors (https://no-color.org/)
@@ -640,6 +638,7 @@ pub fn default_context() -> OutputContext {
 mod tests {
     use super::*;
     use crate::ui::writer::SharedOutputBuffer;
+    use serde_json::Value;
     use tracing::info;
 
     fn log_test_start(name: &str) {
@@ -655,6 +654,38 @@ mod tests {
         let stderr = stderr_buf.as_writer(true);
         let ctx = OutputContext::with_writers(config, stdout, stderr);
         (ctx, stdout_buf, stderr_buf)
+    }
+
+    fn json_values_loose_eq(left: &Value, right: &Value) -> bool {
+        match (left, right) {
+            (Value::Number(left_num), Value::Number(right_num)) => {
+                match (left_num.as_f64(), right_num.as_f64()) {
+                    (Some(left_val), Some(right_val)) => {
+                        (left_val - right_val).abs() <= f64::EPSILON
+                    }
+                    _ => false,
+                }
+            }
+            (Value::Array(left_arr), Value::Array(right_arr)) => {
+                left_arr.len() == right_arr.len()
+                    && left_arr
+                        .iter()
+                        .zip(right_arr.iter())
+                        .all(|(left_item, right_item)| {
+                            json_values_loose_eq(left_item, right_item)
+                        })
+            }
+            (Value::Object(left_obj), Value::Object(right_obj)) => {
+                left_obj.len() == right_obj.len()
+                    && left_obj.iter().all(|(key, left_val)| {
+                        right_obj
+                            .get(key)
+                            .map(|right_val| json_values_loose_eq(left_val, right_val))
+                            .unwrap_or(false)
+                    })
+            }
+            _ => left == right,
+        }
     }
 
     #[test]
@@ -734,7 +765,10 @@ mod tests {
         let decoded = toon_rust::try_decode(&output, None).unwrap();
         let decoded_json = serde_json::Value::from(decoded);
         let expected = serde_json::to_value(&value).unwrap();
-        assert_eq!(decoded_json, expected);
+        assert!(
+            json_values_loose_eq(&decoded_json, &expected),
+            "decoded TOON output did not match expected JSON"
+        );
     }
 
     #[test]

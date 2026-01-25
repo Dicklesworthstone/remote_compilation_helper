@@ -125,10 +125,8 @@ pub async fn rollback(ctx: &OutputContext, dry_run: bool) -> Result<(), UpdateEr
 /// Get the installation directory.
 fn get_install_dir() -> Result<PathBuf, UpdateError> {
     // Try to determine where rch is installed
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            return Ok(parent.to_path_buf());
-        }
+    if let Ok(exe) = std::env::current_exe() && let Some(parent) = exe.parent() {
+        return Ok(parent.to_path_buf());
     }
 
     // Default to ~/.local/bin

@@ -48,7 +48,7 @@ use rich_rust::r#box::HEAVY;
 use rich_rust::prelude::*;
 
 /// Worker resource state at the time of error.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct WorkerResourceState {
     /// CPU usage percentage (0-100).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -65,18 +65,6 @@ pub struct WorkerResourceState {
     /// Disk usage percentage.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disk_percent: Option<f64>,
-}
-
-impl Default for WorkerResourceState {
-    fn default() -> Self {
-        Self {
-            cpu_percent: None,
-            memory_used_gb: None,
-            memory_total_gb: None,
-            load_average: None,
-            disk_percent: None,
-        }
-    }
 }
 
 impl WorkerResourceState {
@@ -748,12 +736,12 @@ impl BuildErrorDisplay {
         }
 
         // Signal details
-        if let Some(ref sig) = self.signal_info {
-            if let Some(ref details) = sig.details {
-                lines.push(String::new());
-                lines.push(format!("[{}]Signal details:[/]", RchTheme::DIM));
-                lines.push(format!("  {details}"));
-            }
+        if let Some(ref sig) = self.signal_info
+            && let Some(ref details) = sig.details
+        {
+            lines.push(String::new());
+            lines.push(format!("[{}]Signal details:[/]", RchTheme::DIM));
+            lines.push(format!("  {details}"));
         }
 
         // Error chain
@@ -858,11 +846,11 @@ impl BuildErrorDisplay {
         }
 
         // Signal details
-        if let Some(ref sig) = self.signal_info {
-            if let Some(ref details) = sig.details {
-                eprintln!();
-                eprintln!("Signal details: {details}");
-            }
+        if let Some(ref sig) = self.signal_info
+            && let Some(ref details) = sig.details
+        {
+            eprintln!();
+            eprintln!("Signal details: {details}");
         }
 
         // Error chain
@@ -986,11 +974,13 @@ mod tests {
 
     #[test]
     fn test_resource_format_line() {
-        let mut resources = WorkerResourceState::default();
-        resources.cpu_percent = Some(98.0);
-        resources.memory_used_gb = Some(14.2);
-        resources.memory_total_gb = Some(16.0);
-        resources.load_average = Some(8.5);
+        let resources = WorkerResourceState {
+            cpu_percent: Some(98.0),
+            memory_used_gb: Some(14.2),
+            memory_total_gb: Some(16.0),
+            load_average: Some(8.5),
+            ..Default::default()
+        };
 
         let line = resources.format_line();
         assert!(line.contains("CPU: 98%"));
@@ -1191,8 +1181,10 @@ mod tests {
 
     #[test]
     fn test_partial_resources() {
-        let mut resources = WorkerResourceState::default();
-        resources.cpu_percent = Some(50.0);
+        let resources = WorkerResourceState {
+            cpu_percent: Some(50.0),
+            ..Default::default()
+        };
         assert!(resources.has_data());
 
         let line = resources.format_line();

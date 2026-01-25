@@ -110,22 +110,19 @@ fn check_claude_code_hook() -> Result<HookStatus> {
         serde_json::from_str(&content).context("Failed to parse Claude Code settings")?;
 
     // Check for PreToolUse hook with rch
-    if let Some(hooks) = settings.get("hooks") {
-        if let Some(pre_tool_use) = hooks.get("PreToolUse") {
-            if let Some(arr) = pre_tool_use.as_array() {
-                for hook in arr {
-                    if let Some(cmd) = hook.get("command").and_then(|c| c.as_str()) {
-                        if cmd.contains("rch") {
-                            return Ok(HookStatus::Installed);
-                        }
-                    }
-                    // Also check for string hooks
-                    if let Some(cmd) = hook.as_str() {
-                        if cmd.contains("rch") {
-                            return Ok(HookStatus::Installed);
-                        }
-                    }
-                }
+    if let Some(hooks) = settings.get("hooks")
+        && let Some(pre_tool_use) = hooks.get("PreToolUse")
+        && let Some(arr) = pre_tool_use.as_array()
+    {
+        for hook in arr {
+            if let Some(cmd) = hook.get("command").and_then(|c| c.as_str())
+                && cmd.contains("rch")
+            {
+                return Ok(HookStatus::Installed);
+            }
+            // Also check for string hooks
+            if let Some(cmd) = hook.as_str() && cmd.contains("rch") {
+                return Ok(HookStatus::Installed);
             }
         }
     }
@@ -225,18 +222,17 @@ fn uninstall_claude_code_hook(dry_run: bool) -> Result<IdempotentResult> {
     create_backup(&settings_path)?;
 
     // Remove the hook
-    if let Some(hooks) = settings.get_mut("hooks") {
-        if let Some(pre_tool_use) = hooks.get_mut("PreToolUse") {
-            if let Some(arr) = pre_tool_use.as_array_mut() {
-                arr.retain(|hook| {
-                    let cmd = hook
-                        .get("command")
-                        .and_then(|c| c.as_str())
-                        .or_else(|| hook.as_str());
-                    !cmd.map(|c| c.contains("rch")).unwrap_or(false)
-                });
-            }
-        }
+    if let Some(hooks) = settings.get_mut("hooks")
+        && let Some(pre_tool_use) = hooks.get_mut("PreToolUse")
+        && let Some(arr) = pre_tool_use.as_array_mut()
+    {
+        arr.retain(|hook| {
+            let cmd = hook
+                .get("command")
+                .and_then(|c| c.as_str())
+                .or_else(|| hook.as_str());
+            !cmd.map(|c| c.contains("rch")).unwrap_or(false)
+        });
     }
 
     // Write settings atomically
@@ -266,16 +262,15 @@ fn check_gemini_cli_hook() -> Result<HookStatus> {
     let settings: Value = serde_json::from_str(&content)?;
 
     // Check for pre_tool_use hook with rch
-    if let Some(hooks) = settings.get("hooks") {
-        if let Some(pre_tool_use) = hooks.get("pre_tool_use") {
-            if let Some(arr) = pre_tool_use.as_array() {
-                for hook in arr {
-                    if let Some(cmd) = hook.get("command").and_then(|c| c.as_str()) {
-                        if cmd.contains("rch") {
-                            return Ok(HookStatus::Installed);
-                        }
-                    }
-                }
+    if let Some(hooks) = settings.get("hooks")
+        && let Some(pre_tool_use) = hooks.get("pre_tool_use")
+        && let Some(arr) = pre_tool_use.as_array()
+    {
+        for hook in arr {
+            if let Some(cmd) = hook.get("command").and_then(|c| c.as_str())
+                && cmd.contains("rch")
+            {
+                return Ok(HookStatus::Installed);
             }
         }
     }
@@ -367,18 +362,17 @@ fn uninstall_gemini_cli_hook(dry_run: bool) -> Result<IdempotentResult> {
 
     create_backup(&settings_path)?;
 
-    if let Some(hooks) = settings.get_mut("hooks") {
-        if let Some(pre_tool_use) = hooks.get_mut("pre_tool_use") {
-            if let Some(arr) = pre_tool_use.as_array_mut() {
-                arr.retain(|hook| {
-                    !hook
-                        .get("command")
-                        .and_then(|c| c.as_str())
-                        .map(|c| c.contains("rch"))
-                        .unwrap_or(false)
-                });
-            }
-        }
+    if let Some(hooks) = settings.get_mut("hooks")
+        && let Some(pre_tool_use) = hooks.get_mut("pre_tool_use")
+        && let Some(arr) = pre_tool_use.as_array_mut()
+    {
+        arr.retain(|hook| {
+            !hook
+                .get("command")
+                .and_then(|c| c.as_str())
+                .map(|c| c.contains("rch"))
+                .unwrap_or(false)
+        });
     }
 
     let content = serde_json::to_string_pretty(&settings)?;
@@ -505,12 +499,11 @@ fn check_continue_dev_hook() -> Result<HookStatus> {
     let config: Value = serde_json::from_str(&content)?;
 
     // Check for rch in experimental features or custom commands
-    if let Some(experimental) = config.get("experimental") {
-        if let Some(pre_cmd) = experimental.get("preCompileCommand") {
-            if pre_cmd.as_str().map(|s| s.contains("rch")).unwrap_or(false) {
-                return Ok(HookStatus::Installed);
-            }
-        }
+    if let Some(experimental) = config.get("experimental")
+        && let Some(pre_cmd) = experimental.get("preCompileCommand")
+        && pre_cmd.as_str().map(|s| s.contains("rch")).unwrap_or(false)
+    {
+        return Ok(HookStatus::Installed);
     }
 
     Ok(HookStatus::NotInstalled)
@@ -586,10 +579,10 @@ fn uninstall_continue_dev_hook(dry_run: bool) -> Result<IdempotentResult> {
     let content = std::fs::read_to_string(&config_path)?;
     let mut config: Value = serde_json::from_str(&content)?;
 
-    if let Some(experimental) = config.get_mut("experimental") {
-        if let Some(exp_obj) = experimental.as_object_mut() {
-            exp_obj.remove("preCompileCommand");
-        }
+    if let Some(experimental) = config.get_mut("experimental")
+        && let Some(exp_obj) = experimental.as_object_mut()
+    {
+        exp_obj.remove("preCompileCommand");
     }
 
     let content = serde_json::to_string_pretty(&config)?;

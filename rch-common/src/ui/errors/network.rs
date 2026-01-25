@@ -804,7 +804,7 @@ impl NetworkErrorDisplay {
         };
         let check = Icons::check(ctx);
         let cross = Icons::cross(ctx);
-        let question = if ctx.supports_unicode() { "?" } else { "?" };
+        let question = "?";
 
         self.network_path
             .iter()

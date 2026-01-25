@@ -372,11 +372,11 @@ impl CompilationProgress {
         }
 
         let name = parts[0].to_string();
-        let version = parts.get(1).and_then(|v| {
+        let version = parts.get(1).map(|v| {
             if v.starts_with('v') || v.starts_with('V') {
-                Some(v[1..].to_string())
+                v[1..].to_string()
             } else {
-                Some((*v).to_string())
+                (*v).to_string()
             }
         });
 

@@ -173,7 +173,7 @@ impl RateLimiter {
         Self {
             start: Instant::now(),
             min_interval_ns,
-            last_ns: AtomicU64::new(0),
+            last_ns: AtomicU64::new(u64::MAX),
         }
     }
 
@@ -183,7 +183,7 @@ impl RateLimiter {
     }
 
     pub fn reset(&self) {
-        self.last_ns.store(0, Ordering::SeqCst);
+        self.last_ns.store(u64::MAX, Ordering::SeqCst);
     }
 
     fn now_ns(&self) -> u64 {
@@ -194,6 +194,12 @@ impl RateLimiter {
 
     fn allow_with(&self, now_ns: u64) -> bool {
         let last = self.last_ns.load(Ordering::Relaxed);
+        if last == u64::MAX {
+            return self
+                .last_ns
+                .compare_exchange(u64::MAX, now_ns, Ordering::SeqCst, Ordering::Relaxed)
+                .is_ok();
+        }
         if now_ns.saturating_sub(last) < self.min_interval_ns {
             return false;
         }

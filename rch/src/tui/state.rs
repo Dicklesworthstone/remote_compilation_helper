@@ -40,11 +40,12 @@ impl Panel {
 }
 
 /// Color blind accessibility modes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum, Default)]
 #[value(rename_all = "kebab_case")]
 #[serde(rename_all = "kebab-case")]
 pub enum ColorBlindMode {
     /// Default palette.
+    #[default]
     None,
     /// Red-green (deuteranopia) friendly palette.
     Deuteranopia,
@@ -52,12 +53,6 @@ pub enum ColorBlindMode {
     Protanopia,
     /// Blue-yellow (tritanopia) friendly palette.
     Tritanopia,
-}
-
-impl Default for ColorBlindMode {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 /// Main TUI state container.
@@ -219,10 +214,10 @@ impl TuiState {
                     return false;
                 }
                 // Apply worker filter
-                if let Some(ref worker) = self.filter.worker_filter {
-                    if b.worker.as_ref() != Some(worker) {
-                        return false;
-                    }
+                if let Some(ref worker) = self.filter.worker_filter
+                    && b.worker.as_ref() != Some(worker)
+                {
+                    return false;
                 }
                 // Apply success/failed filter
                 if self.filter.success_only && !b.success {

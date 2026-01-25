@@ -428,12 +428,12 @@ pub struct SyncResult {
 fn parse_rsync_bytes(output: &str) -> u64 {
     // rsync output contains "sent X bytes  received Y bytes"
     for line in output.lines() {
-        if line.contains("sent") && line.contains("bytes") {
-            if let Some(bytes_str) = line.split_whitespace().nth(1) {
-                if let Ok(bytes) = bytes_str.replace(',', "").parse() {
-                    return bytes;
-                }
-            }
+        if line.contains("sent")
+            && line.contains("bytes")
+            && let Some(bytes_str) = line.split_whitespace().nth(1)
+            && let Ok(bytes) = bytes_str.replace(',', "").parse()
+        {
+            return bytes;
         }
     }
     0
@@ -474,12 +474,11 @@ pub fn compute_project_hash(project_path: &Path) -> String {
     ];
 
     for filename in key_files {
-        if let Ok(metadata) = std::fs::metadata(project_path.join(filename)) {
-            if let Ok(modified) = metadata.modified() {
-                if let Ok(duration) = modified.duration_since(std::time::UNIX_EPOCH) {
-                    hasher.update(&duration.as_nanos().to_le_bytes());
-                }
-            }
+        if let Ok(metadata) = std::fs::metadata(project_path.join(filename))
+            && let Ok(modified) = metadata.modified()
+            && let Ok(duration) = modified.duration_since(std::time::UNIX_EPOCH)
+        {
+            hasher.update(&duration.as_nanos().to_le_bytes());
         }
     }
 

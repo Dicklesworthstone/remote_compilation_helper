@@ -30,12 +30,20 @@ use rch_common::ssh::{KnownHostsPolicy, SshClient, SshOptions};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-/// Project root for fixtures
-const FIXTURES_DIR: &str = "tests/true_e2e/fixtures";
+/// Resolve the repository fixtures directory.
+fn fixtures_root() -> PathBuf {
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."));
+    manifest_dir
+        .parent()
+        .unwrap_or(&manifest_dir)
+        .join("tests/true_e2e/fixtures")
+}
 
-/// Get the hello_world fixture directory
+/// Get the hello_world fixture directory.
 fn hello_world_fixture_dir() -> PathBuf {
-    PathBuf::from(FIXTURES_DIR).join("hello_world")
+    fixtures_root().join("hello_world")
 }
 
 /// Skip the test if no real workers are available.

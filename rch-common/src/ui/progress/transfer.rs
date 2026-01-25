@@ -242,14 +242,13 @@ impl TransferProgress {
         self.bytes_transferred = sample.bytes;
         self.percent = sample.percent;
 
-        if self.bytes_total.is_none() {
-            if let Some(percent) = sample.percent {
-                if percent >= MIN_PERCENT_FOR_TOTAL {
-                    let total = (self.bytes_transferred as f64 / (percent as f64 / 100.0)).round();
-                    if total.is_finite() && total > 0.0 {
-                        self.bytes_total = Some(total as u64);
-                    }
-                }
+        if self.bytes_total.is_none()
+            && let Some(percent) = sample.percent
+            && percent >= MIN_PERCENT_FOR_TOTAL
+        {
+            let total = (self.bytes_transferred as f64 / (percent as f64 / 100.0)).round();
+            if total.is_finite() && total > 0.0 {
+                self.bytes_total = Some(total as u64);
             }
         }
 

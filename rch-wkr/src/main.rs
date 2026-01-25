@@ -161,13 +161,12 @@ fn print_system_info() {
     println!("=== System Info ===");
 
     // CPU cores
-    if let Ok(output) = Command::new("nproc").output() {
-        if let Ok(cores) = String::from_utf8_lossy(&output.stdout)
+    if let Ok(output) = Command::new("nproc").output()
+        && let Ok(cores) = String::from_utf8_lossy(&output.stdout)
             .trim()
             .parse::<u32>()
-        {
-            println!("Cores: {}", cores);
-        }
+    {
+        println!("Cores: {}", cores);
     }
 
     // Memory
@@ -260,15 +259,15 @@ fn probe_capabilities() -> WorkerCapabilities {
     let mut capabilities = WorkerCapabilities::new();
 
     // Probe rustc version
-    if let Ok(output) = Command::new("rustc").args(["--version"]).output() {
-        if output.status.success() {
-            let version_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            // Extract just the version number (e.g., "rustc 1.75.0 (..." -> "1.75.0")
-            if let Some(version) = version_str.split_whitespace().nth(1) {
-                capabilities.rustc_version = Some(version.to_string());
-            } else {
-                capabilities.rustc_version = Some(version_str);
-            }
+    if let Ok(output) = Command::new("rustc").args(["--version"]).output()
+        && output.status.success()
+    {
+        let version_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        // Extract just the version number (e.g., "rustc 1.75.0 (..." -> "1.75.0")
+        if let Some(version) = version_str.split_whitespace().nth(1) {
+            capabilities.rustc_version = Some(version.to_string());
+        } else {
+            capabilities.rustc_version = Some(version_str);
         }
     }
 
@@ -289,34 +288,32 @@ fn probe_capabilities() -> WorkerCapabilities {
         }
     };
 
-    if let Some(output) = bun_cmd {
-        if output.status.success() {
-            let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !version.is_empty() {
-                capabilities.bun_version = Some(version);
-            }
+    if let Some(output) = bun_cmd && output.status.success() {
+        let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !version.is_empty() {
+            capabilities.bun_version = Some(version);
         }
     }
 
     // Probe node version
-    if let Ok(output) = Command::new("node").args(["--version"]).output() {
-        if output.status.success() {
-            let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            // Remove leading 'v' if present (e.g., "v20.10.0" -> "20.10.0")
-            let version = version.strip_prefix('v').unwrap_or(&version).to_string();
-            if !version.is_empty() {
-                capabilities.node_version = Some(version);
-            }
+    if let Ok(output) = Command::new("node").args(["--version"]).output()
+        && output.status.success()
+    {
+        let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        // Remove leading 'v' if present (e.g., "v20.10.0" -> "20.10.0")
+        let version = version.strip_prefix('v').unwrap_or(&version).to_string();
+        if !version.is_empty() {
+            capabilities.node_version = Some(version);
         }
     }
 
     // Probe npm version
-    if let Ok(output) = Command::new("npm").args(["--version"]).output() {
-        if output.status.success() {
-            let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !version.is_empty() {
-                capabilities.npm_version = Some(version);
-            }
+    if let Ok(output) = Command::new("npm").args(["--version"]).output()
+        && output.status.success()
+    {
+        let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !version.is_empty() {
+            capabilities.npm_version = Some(version);
         }
     }
 

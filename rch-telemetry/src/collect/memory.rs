@@ -210,17 +210,17 @@ impl MemoryPressureStall {
 
             let prefix = parts[0];
             for part in &parts[1..] {
-                if let Some((key, value)) = part.split_once('=') {
-                    if let Ok(v) = value.parse::<f64>() {
-                        match (prefix, key) {
-                            ("some", "avg10") => result.some_avg10 = v,
-                            ("some", "avg60") => result.some_avg60 = v,
-                            ("some", "avg300") => result.some_avg300 = v,
-                            ("full", "avg10") => result.full_avg10 = v,
-                            ("full", "avg60") => result.full_avg60 = v,
-                            ("full", "avg300") => result.full_avg300 = v,
-                            _ => {}
-                        }
+                if let Some((key, value)) = part.split_once('=')
+                    && let Ok(v) = value.parse::<f64>()
+                {
+                    match (prefix, key) {
+                        ("some", "avg10") => result.some_avg10 = v,
+                        ("some", "avg60") => result.some_avg60 = v,
+                        ("some", "avg300") => result.some_avg300 = v,
+                        ("full", "avg10") => result.full_avg10 = v,
+                        ("full", "avg60") => result.full_avg60 = v,
+                        ("full", "avg300") => result.full_avg300 = v,
+                        _ => {}
                     }
                 }
             }

@@ -331,9 +331,8 @@ fn test_daemon_shutdown() {
     // After shutdown, connecting to the socket should fail
     let connect_result = UnixStream::connect(&socket_path);
     // The daemon should have cleaned up the socket, or at least not be responding
-    if connect_result.is_ok() {
+    if let Ok(stream) = connect_result {
         // If socket still exists, try a request - it should fail or timeout
-        let stream = connect_result.unwrap();
         stream
             .set_read_timeout(Some(Duration::from_millis(500)))
             .ok();

@@ -157,32 +157,29 @@ pub mod palette {
 /// Defaults to dark background (most common for developers).
 pub fn detect_background() -> Background {
     // Check COLORFGBG env var (format: "fg;bg" e.g., "15;0" = white on black)
-    if let Ok(colorfgbg) = env::var("COLORFGBG") {
-        if let Some(bg) = colorfgbg.split(';').nth(1) {
-            if let Ok(bg_num) = bg.parse::<u8>() {
-                // Standard terminal colors: 0-7 are dark, 8 is bright black (still dark)
-                // 9-15 are light colors
-                return if bg_num <= 8 {
-                    Background::Dark
-                } else {
-                    Background::Light
-                };
-            }
-        }
+    if let Ok(colorfgbg) = env::var("COLORFGBG")
+        && let Some(bg) = colorfgbg.split(';').nth(1)
+        && let Ok(bg_num) = bg.parse::<u8>()
+    {
+        // Standard terminal colors: 0-7 are dark, 8 is bright black (still dark)
+        // 9-15 are light colors
+        return if bg_num <= 8 {
+            Background::Dark
+        } else {
+            Background::Light
+        };
     }
 
     // Check terminal-specific env vars
-    if let Ok(theme) = env::var("TERMINAL_THEME") {
-        if theme.to_lowercase().contains("light") {
-            return Background::Light;
-        }
+    if let Ok(theme) = env::var("TERMINAL_THEME")
+        && theme.to_lowercase().contains("light")
+    {
+        return Background::Light;
     }
 
     // macOS Terminal.app
-    if let Ok(bg) = env::var("TERM_BACKGROUND") {
-        if bg.to_lowercase() == "light" {
-            return Background::Light;
-        }
+    if let Ok(bg) = env::var("TERM_BACKGROUND") && bg.to_lowercase() == "light" {
+        return Background::Light;
     }
 
     // Default to dark (most common for developers)
@@ -260,20 +257,17 @@ pub fn detect_hyperlink_support() -> bool {
 
     // Check for VTE version (used by GNOME Terminal, Tilix, etc.)
     // VTE >= 0.50 supports hyperlinks
-    if let Ok(vte_version) = env::var("VTE_VERSION") {
-        if let Ok(version) = vte_version.parse::<u32>() {
-            // VTE 0.50 is version 5000
-            if version >= 5000 {
-                return true;
-            }
-        }
+    if let Ok(vte_version) = env::var("VTE_VERSION")
+        && let Ok(version) = vte_version.parse::<u32>()
+        && version >= 5000
+    {
+        // VTE 0.50 is version 5000
+        return true;
     }
 
     // Check TERM_FEATURES for hyperlink support (some terminals set this)
-    if let Ok(features) = env::var("TERM_FEATURES") {
-        if features.contains("hyperlink") {
-            return true;
-        }
+    if let Ok(features) = env::var("TERM_FEATURES") && features.contains("hyperlink") {
+        return true;
     }
 
     // Default to no hyperlink support for safety

@@ -36,18 +36,14 @@ pub enum ToolchainError {
 pub fn detect_toolchain(project_root: &Path) -> Result<ToolchainInfo, ToolchainError> {
     // 1. Check for rust-toolchain.toml override
     let toolchain_file = project_root.join("rust-toolchain.toml");
-    if toolchain_file.exists() {
-        if let Ok(info) = parse_toolchain_file(&toolchain_file) {
-            return Ok(info);
-        }
+    if toolchain_file.exists() && let Ok(info) = parse_toolchain_file(&toolchain_file) {
+        return Ok(info);
     }
 
     // 2. Check for rust-toolchain (legacy format)
     let legacy_file = project_root.join("rust-toolchain");
-    if legacy_file.exists() {
-        if let Ok(info) = parse_legacy_toolchain_file(&legacy_file) {
-            return Ok(info);
-        }
+    if legacy_file.exists() && let Ok(info) = parse_legacy_toolchain_file(&legacy_file) {
+        return Ok(info);
     }
 
     // 3. Fall back to rustc --version
@@ -81,25 +77,21 @@ fn parse_legacy_toolchain_file(path: &Path) -> Result<ToolchainInfo, ToolchainEr
 /// Parse a channel string like "nightly-2024-01-15" or "stable".
 pub fn parse_channel_string(channel: &str) -> Result<ToolchainInfo, ToolchainError> {
     // Handle nightly-YYYY-MM-DD format
-    if let Some(date) = channel.strip_prefix("nightly-") {
-        if is_valid_date(date) {
-            return Ok(ToolchainInfo {
-                channel: "nightly".to_string(),
-                date: Some(date.to_string()),
-                full_version: channel.to_string(),
-            });
-        }
+    if let Some(date) = channel.strip_prefix("nightly-") && is_valid_date(date) {
+        return Ok(ToolchainInfo {
+            channel: "nightly".to_string(),
+            date: Some(date.to_string()),
+            full_version: channel.to_string(),
+        });
     }
 
     // Handle beta-YYYY-MM-DD format
-    if let Some(date) = channel.strip_prefix("beta-") {
-        if is_valid_date(date) {
-            return Ok(ToolchainInfo {
-                channel: "beta".to_string(),
-                date: Some(date.to_string()),
-                full_version: channel.to_string(),
-            });
-        }
+    if let Some(date) = channel.strip_prefix("beta-") && is_valid_date(date) {
+        return Ok(ToolchainInfo {
+            channel: "beta".to_string(),
+            date: Some(date.to_string()),
+            full_version: channel.to_string(),
+        });
     }
 
     // Handle simple channel names
@@ -192,25 +184,24 @@ pub fn parse_rustc_version(version_str: &str) -> Result<ToolchainInfo, Toolchain
     // First try with regex for accurate parsing
     if let Ok(re) = regex::Regex::new(
         r"rustc (\d+\.\d+\.\d+)(-nightly|-beta)? \([a-f0-9]+ (\d{4}-\d{2}-\d{2})\)",
-    ) {
-        if let Some(caps) = re.captures(version_str) {
-            let _version = caps.get(1).unwrap().as_str();
-            let channel_suffix = caps.get(2).map(|m| m.as_str());
-            let date = caps.get(3).map(|m| m.as_str().to_string());
+    ) && let Some(caps) = re.captures(version_str)
+    {
+        let _version = caps.get(1).unwrap().as_str();
+        let channel_suffix = caps.get(2).map(|m| m.as_str());
+        let date = caps.get(3).map(|m| m.as_str().to_string());
 
-            let channel = match channel_suffix {
-                Some("-nightly") => "nightly".to_string(),
-                Some("-beta") => "beta".to_string(),
-                Some(other) => other.trim_start_matches('-').to_string(),
-                None => "stable".to_string(),
-            };
+        let channel = match channel_suffix {
+            Some("-nightly") => "nightly".to_string(),
+            Some("-beta") => "beta".to_string(),
+            Some(other) => other.trim_start_matches('-').to_string(),
+            None => "stable".to_string(),
+        };
 
-            return Ok(ToolchainInfo {
-                channel,
-                date,
-                full_version: version_str.to_string(),
-            });
-        }
+        return Ok(ToolchainInfo {
+            channel,
+            date,
+            full_version: version_str.to_string(),
+        });
     }
 
     // Fallback: simple parsing for edge cases
@@ -389,8 +380,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let info = detect_toolchain(tmp.path());
         // This will succeed if rustc is available, which it is in most dev environments
-        if info.is_ok() {
-            let info = info.unwrap();
+        if let Ok(info) = info {
             assert!(!info.channel.is_empty());
         }
     }

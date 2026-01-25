@@ -134,13 +134,14 @@ pub fn validate_config(config: &ConfigToValidate) -> Vec<ConfigWarning> {
     }
 
     // Validate SSH key path
-    if let Some(ref key_path) = config.ssh_key_path {
-        if !config.mock_ssh && !key_path.exists() {
-            warnings.push(ConfigWarning::error(
-                "RCH_SSH_KEY",
-                format!("SSH key not found: {:?}", key_path),
-            ));
-        }
+    if let Some(ref key_path) = config.ssh_key_path
+        && !config.mock_ssh
+        && !key_path.exists()
+    {
+        warnings.push(ConfigWarning::error(
+            "RCH_SSH_KEY",
+            format!("SSH key not found: {:?}", key_path),
+        ));
     }
 
     // Validate mock SSH usage

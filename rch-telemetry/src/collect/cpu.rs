@@ -158,11 +158,11 @@ pub fn parse_per_core_stats(content: &str) -> Result<Vec<PerCoreCpu>, CpuError> 
         if line.starts_with("cpu") && !line.starts_with("cpu ") {
             // Extract core ID from "cpuN"
             let prefix = line.split_whitespace().next().unwrap_or("");
-            if let Some(id_str) = prefix.strip_prefix("cpu") {
-                if let Ok(core_id) = id_str.parse::<u32>() {
-                    let stats = CpuStats::parse_cpu_line(line)?;
-                    cores.push(PerCoreCpu { core_id, stats });
-                }
+            if let Some(id_str) = prefix.strip_prefix("cpu")
+                && let Ok(core_id) = id_str.parse::<u32>()
+            {
+                let stats = CpuStats::parse_cpu_line(line)?;
+                cores.push(PerCoreCpu { core_id, stats });
             }
         }
     }
@@ -283,14 +283,14 @@ impl CpuPressureStall {
             }
 
             for part in &parts[1..] {
-                if let Some((key, value)) = part.split_once('=') {
-                    if let Ok(v) = value.parse::<f64>() {
-                        match key {
-                            "avg10" => result.some_avg10 = v,
-                            "avg60" => result.some_avg60 = v,
-                            "avg300" => result.some_avg300 = v,
-                            _ => {}
-                        }
+                if let Some((key, value)) = part.split_once('=')
+                    && let Ok(v) = value.parse::<f64>()
+                {
+                    match key {
+                        "avg10" => result.some_avg10 = v,
+                        "avg60" => result.some_avg60 = v,
+                        "avg300" => result.some_avg300 = v,
+                        _ => {}
                     }
                 }
             }

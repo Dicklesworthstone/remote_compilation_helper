@@ -215,7 +215,7 @@ impl<'a> ProbeResultTable<'a> {
                     .unwrap_or_else(|| "-".to_string());
                 let disk_text = result
                     .disk_space_bytes
-                    .map(|b| format_bytes(b))
+                    .map(format_bytes)
                     .unwrap_or_else(|| "-".to_string());
 
                 cells.push(Cell::new(rsync_text.as_str()));
@@ -308,9 +308,9 @@ impl<'a> ProbeResultTable<'a> {
     /// Format boolean status with icon.
     fn format_bool_status(&self, value: bool) -> String {
         if value {
-            format!("{}", Icons::check(self.context))
+            Icons::check(self.context).to_string()
         } else {
-            format!("{}", Icons::cross(self.context))
+            Icons::cross(self.context).to_string()
         }
     }
 
@@ -388,7 +388,7 @@ impl<'a> ProbeResultTable<'a> {
                     .unwrap_or_else(|| "-".to_string());
                 let disk_text = result
                     .disk_space_bytes
-                    .map(|b| format_bytes(b))
+                    .map(format_bytes)
                     .unwrap_or_else(|| "-".to_string());
 
                 console.print_plain(&format!(
@@ -543,14 +543,12 @@ impl ProbeSummary {
             }
         }
 
-        if let Some(avg_ms) = self.average_latency_ms {
-            if avg_ms > LATENCY_ACCEPTABLE_MS {
-                let warning = Icons::warning(context);
-                console.print_plain(&format!(
-                    "{} High average latency ({}ms). Consider using workers with lower latency.",
-                    warning, avg_ms
-                ));
-            }
+        if let Some(avg_ms) = self.average_latency_ms && avg_ms > LATENCY_ACCEPTABLE_MS {
+            let warning = Icons::warning(context);
+            console.print_plain(&format!(
+                "{} High average latency ({}ms). Consider using workers with lower latency.",
+                warning, avg_ms
+            ));
         }
     }
 }

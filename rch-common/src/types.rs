@@ -25,10 +25,11 @@ impl std::fmt::Display for WorkerId {
 }
 
 /// Status of a worker in the fleet.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkerStatus {
     /// Worker is healthy and accepting jobs.
+    #[default]
     Healthy,
     /// Worker is responding slowly.
     Degraded,
@@ -41,10 +42,11 @@ pub enum WorkerStatus {
 }
 
 /// Circuit breaker state for a worker.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum CircuitState {
     /// Normal operation.
+    #[default]
     Closed,
     /// Circuit is open (short-circuit).
     Open,
@@ -52,23 +54,12 @@ pub enum CircuitState {
     HalfOpen,
 }
 
-impl Default for CircuitState {
-    fn default() -> Self {
-        Self::Closed
-    }
-}
-
-impl Default for WorkerStatus {
-    fn default() -> Self {
-        Self::Healthy
-    }
-}
-
 /// Required runtime for command execution.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum RequiredRuntime {
     /// No specific runtime required (default).
+    #[default]
     None,
     /// Requires Rust toolchain.
     Rust,
@@ -78,11 +69,6 @@ pub enum RequiredRuntime {
     Node,
 }
 
-impl Default for RequiredRuntime {
-    fn default() -> Self {
-        Self::None
-    }
-}
 
 /// Worker selection request sent from hook to daemon.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -154,11 +140,12 @@ impl std::fmt::Display for SelectionReason {
 // ============================================================================
 
 /// Worker selection strategy determining how workers are chosen for jobs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SelectionStrategy {
     /// Original behavior: sort by priority, select first available.
     /// Use for backwards compatibility or manual control.
+    #[default]
     Priority,
     /// Select worker with highest SpeedScore.
     /// Best for performance-critical builds with homogeneous workers.
@@ -174,12 +161,6 @@ pub enum SelectionStrategy {
     FairFastest,
 }
 
-impl Default for SelectionStrategy {
-    fn default() -> Self {
-        // Default to Priority for backwards compatibility
-        Self::Priority
-    }
-}
 
 impl std::fmt::Display for SelectionStrategy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -501,19 +482,15 @@ impl Default for GeneralConfig {
 }
 
 /// Visibility level for hook output.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum OutputVisibility {
+    #[default]
     None,
     Summary,
     Verbose,
 }
 
-impl Default for OutputVisibility {
-    fn default() -> Self {
-        Self::None
-    }
-}
 
 impl std::fmt::Display for OutputVisibility {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -543,11 +520,12 @@ impl std::str::FromStr for OutputVisibility {
 ///
 /// Controls whether ANSI color codes are preserved when streaming
 /// output from remote compilation commands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ColorMode {
     /// Force color output regardless of terminal detection.
     /// Sets CARGO_TERM_COLOR=always and similar environment variables.
+    #[default]
     Always,
     /// Let the remote command detect terminal capabilities (may lose colors).
     Auto,
@@ -555,13 +533,6 @@ pub enum ColorMode {
     Never,
 }
 
-impl Default for ColorMode {
-    fn default() -> Self {
-        // Default to always forcing colors since remote SSH connections
-        // typically don't have a PTY and would otherwise lose colors
-        Self::Always
-    }
-}
 
 impl std::fmt::Display for ColorMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -621,21 +592,16 @@ impl Default for OutputConfig {
 // ============================================================================
 
 /// Action to take when a scheduled self-test fails.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SelfTestFailureAction {
     /// Only emit an alert/log entry.
+    #[default]
     Alert,
     /// Disable the failing worker automatically.
     DisableWorker,
     /// Alert and disable the worker.
     AlertAndDisable,
-}
-
-impl Default for SelfTestFailureAction {
-    fn default() -> Self {
-        Self::Alert
-    }
 }
 
 /// Which workers to include in self-test runs.
@@ -1167,11 +1133,11 @@ fn default_log_level() -> String {
 
 pub fn default_socket_path() -> String {
     // Prefer XDG_RUNTIME_DIR if available (per-user runtime directory).
-    if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
-        if !runtime_dir.trim().is_empty() {
-            let path = PathBuf::from(runtime_dir).join("rch.sock");
-            return path.to_string_lossy().to_string();
-        }
+    if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR")
+        && !runtime_dir.trim().is_empty()
+    {
+        let path = PathBuf::from(runtime_dir).join("rch.sock");
+        return path.to_string_lossy().to_string();
     }
 
     // Fallback to ~/.cache/rch/rch.sock (persistent across reboots).
@@ -1236,19 +1202,14 @@ fn default_excludes() -> Vec<String> {
 // ============================================================================
 
 /// Location where a build was executed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum BuildLocation {
     /// Build executed locally.
+    #[default]
     Local,
     /// Build executed on a remote worker.
     Remote,
-}
-
-impl Default for BuildLocation {
-    fn default() -> Self {
-        Self::Local
-    }
 }
 
 /// Record of a completed build.
@@ -1389,10 +1350,10 @@ mod option_duration_millis {
 impl CompilationMetrics {
     /// Calculate speedup based on local vs remote build time.
     pub fn calculate_speedup(&mut self) {
-        if let Some(local) = self.local_build_time {
-            if self.timing.total.as_millis() > 0 {
-                self.speedup = Some(local.as_secs_f64() / self.timing.total.as_secs_f64());
-            }
+        if let Some(local) = self.local_build_time
+            && self.timing.total.as_millis() > 0
+        {
+            self.speedup = Some(local.as_secs_f64() / self.timing.total.as_secs_f64());
         }
     }
 

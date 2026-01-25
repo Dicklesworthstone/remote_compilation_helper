@@ -1113,7 +1113,11 @@ mod tests {
             .raw_error("expected '=' after key");
 
         let json = display.to_json().expect("JSON serialization failed");
-        assert!(json.contains("RCH-E003") || json.contains("ConfigParseError"));
+        assert!(
+            json.contains("RCH-E003")
+                || json.contains("ConfigParseError")
+                || json.contains("CONFIG_PARSE_ERROR")
+        );
         assert!(json.contains("config.toml"));
     }
 

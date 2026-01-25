@@ -24,20 +24,15 @@ use crate::telemetry::TelemetryStore;
 use crate::workers::{WorkerPool, WorkerState};
 
 /// Priority levels for benchmark requests.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub enum BenchmarkPriority {
     /// Low priority - drift detection, speculative re-benchmark.
     Low = 0,
     /// Normal priority - scheduled re-benchmark due to age.
+    #[default]
     Normal = 1,
     /// High priority - new workers, manual triggers.
     High = 2,
-}
-
-impl Default for BenchmarkPriority {
-    fn default() -> Self {
-        Self::Normal
-    }
 }
 
 /// Reason why a benchmark was scheduled.
@@ -549,13 +544,13 @@ impl BenchmarkScheduler {
         );
 
         // Reserve a slot on the worker
-        if let Some(worker) = self.pool.get(&worker_id).await {
-            if !worker.reserve_slots(1).await {
-                warn!(worker_id = %worker_id, "Failed to reserve slot for benchmark");
-                // Re-queue the request
-                self.enqueue(request).await;
-                return;
-            }
+        if let Some(worker) = self.pool.get(&worker_id).await
+            && !worker.reserve_slots(1).await
+        {
+            warn!(worker_id = %worker_id, "Failed to reserve slot for benchmark");
+            // Re-queue the request
+            self.enqueue(request).await;
+            return;
         }
 
         // Track as running

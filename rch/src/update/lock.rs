@@ -31,12 +31,11 @@ impl UpdateLock {
         if path.exists() {
             if let Ok(mut file) = File::open(&path) {
                 let mut contents = String::new();
-                if file.read_to_string(&mut contents).is_ok() {
-                    if let Ok(pid) = contents.trim().parse::<u32>() {
-                        if is_process_running(pid) {
-                            return Err(UpdateError::LockHeld);
-                        }
-                    }
+                if file.read_to_string(&mut contents).is_ok()
+                    && let Ok(pid) = contents.trim().parse::<u32>()
+                    && is_process_running(pid)
+                {
+                    return Err(UpdateError::LockHeld);
                 }
             }
             // Stale lock file, remove it
@@ -57,16 +56,15 @@ impl UpdateLock {
     /// Check if an update is currently in progress.
     #[allow(dead_code)]
     pub fn is_locked() -> bool {
-        if let Ok(path) = get_lock_path() {
-            if path.exists() {
-                if let Ok(mut file) = File::open(&path) {
-                    let mut contents = String::new();
-                    if file.read_to_string(&mut contents).is_ok() {
-                        if let Ok(pid) = contents.trim().parse::<u32>() {
-                            return is_process_running(pid);
-                        }
-                    }
-                }
+        if let Ok(path) = get_lock_path()
+            && path.exists()
+            && let Ok(mut file) = File::open(&path)
+        {
+            let mut contents = String::new();
+            if file.read_to_string(&mut contents).is_ok()
+                && let Ok(pid) = contents.trim().parse::<u32>()
+            {
+                return is_process_running(pid);
             }
         }
         false

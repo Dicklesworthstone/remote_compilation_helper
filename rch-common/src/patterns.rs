@@ -315,23 +315,23 @@ pub fn classify_command_detailed(cmd: &str) -> ClassificationDetails {
 
     // Tier 3: Negative pattern check - never intercept these
     for pattern in NEVER_INTERCEPT {
-        if let Some(rest) = normalized.strip_prefix(pattern) {
-            if rest.is_empty() || rest.starts_with(' ') {
-                let reason = format!("matches never-intercept: {pattern}");
-                let classification = Classification::not_compilation(reason.clone());
-                tiers.push(ClassificationTier {
-                    tier: 3,
-                    name: "never_intercept".to_string(),
-                    decision: TierDecision::Reject,
-                    reason,
-                });
-                return ClassificationDetails {
-                    original,
-                    normalized: normalized.to_string(),
-                    tiers,
-                    classification,
-                };
-            }
+        if let Some(rest) = normalized.strip_prefix(pattern)
+            && (rest.is_empty() || rest.starts_with(' '))
+        {
+            let reason = format!("matches never-intercept: {pattern}");
+            let classification = Classification::not_compilation(reason.clone());
+            tiers.push(ClassificationTier {
+                tier: 3,
+                name: "never_intercept".to_string(),
+                decision: TierDecision::Reject,
+                reason,
+            });
+            return ClassificationDetails {
+                original,
+                normalized: normalized.to_string(),
+                tiers,
+                classification,
+            };
         }
     }
 
@@ -622,10 +622,20 @@ fn contains_unquoted_standalone_ampersand(cmd: &str) -> bool {
                 // Found &&. Skip both.
                 i += 2;
                 continue;
-            } else {
-                // Standalone &
-                return true;
             }
+            let prev = if i > 0 { chars[i - 1] } else { '\0' };
+            let next = if i + 1 < chars.len() {
+                chars[i + 1]
+            } else {
+                '\0'
+            };
+            // Ignore redirection patterns like 2>&1 or &>
+            if prev == '>' || next == '>' {
+                i += 1;
+                continue;
+            }
+            // Standalone &
+            return true;
         }
         i += 1;
     }
@@ -751,23 +761,23 @@ fn classify_full(cmd: &str) -> Classification {
         // bun typecheck [options]
         // Examples: "bun typecheck", "bun typecheck src/"
         // NOTE: --watch mode should NOT be intercepted (interactive)
-        if let Some(after) = rest.strip_prefix("typecheck") {
-            if after.is_empty() || after.starts_with(' ') {
-                // Check for --watch flag - don't intercept interactive mode
-                if after
-                    .split_whitespace()
-                    .any(|a| a == "-w" || a == "--watch")
-                {
-                    return Classification::not_compilation(
-                        "bun typecheck --watch is interactive (not intercepted)",
-                    );
-                }
-                return Classification::compilation(
-                    CompilationKind::BunTypecheck,
-                    0.95,
-                    "bun typecheck command",
+        if let Some(after) = rest.strip_prefix("typecheck")
+            && (after.is_empty() || after.starts_with(' '))
+        {
+            // Check for --watch flag - don't intercept interactive mode
+            if after
+                .split_whitespace()
+                .any(|a| a == "-w" || a == "--watch")
+            {
+                return Classification::not_compilation(
+                    "bun typecheck --watch is interactive (not intercepted)",
                 );
             }
+            return Classification::compilation(
+                CompilationKind::BunTypecheck,
+                0.95,
+                "bun typecheck command",
+            );
         }
 
         // bun x (alias for bunx - package runner)

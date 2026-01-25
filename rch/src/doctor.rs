@@ -1184,10 +1184,8 @@ fn print_check_result(result: &CheckResult, ctx: &OutputContext) {
         CheckStatus::Skipped => println!(" {}", style.muted(&result.message)),
     }
 
-    if let Some(ref details) = result.details {
-        if ctx.is_verbose() {
-            println!("    {}", style.muted(details));
-        }
+    if let Some(ref details) = result.details && ctx.is_verbose() {
+        println!("    {}", style.muted(details));
     }
 
     if let Some(ref suggestion) = result.suggestion {

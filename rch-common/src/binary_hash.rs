@@ -62,15 +62,14 @@ fn compute_code_hash(data: &[u8]) -> Result<String> {
         let name = section.name().unwrap_or("");
 
         // Include .text (code), .rodata (read-only data), and subsections
-        if name == ".text"
+        if (name == ".text"
             || name == ".rodata"
             || name.starts_with(".text.")
-            || name.starts_with(".rodata.")
+            || name.starts_with(".rodata."))
+            && let Ok(section_data) = section.data()
         {
-            if let Ok(section_data) = section.data() {
-                hasher.update(section_data);
-                sections_hashed += 1;
-            }
+            hasher.update(section_data);
+            sections_hashed += 1;
         }
     }
 

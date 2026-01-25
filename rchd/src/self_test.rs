@@ -529,12 +529,11 @@ impl SelfTestService {
     }
 
     fn compute_next_run(&self, last_run: &Option<SelfTestRunRecord>) -> Option<String> {
-        if let Some(schedule) = self.config.schedule.as_ref() {
-            if let Ok(expr) = cron::Schedule::from_str(schedule) {
-                if let Some(next) = expr.upcoming(Utc).next() {
-                    return Some(next.to_rfc3339());
-                }
-            }
+        if let Some(schedule) = self.config.schedule.as_ref()
+            && let Ok(expr) = cron::Schedule::from_str(schedule)
+            && let Some(next) = expr.upcoming(Utc).next()
+        {
+            return Some(next.to_rfc3339());
         }
 
         if let Some(interval) = self.config.interval.as_ref() {

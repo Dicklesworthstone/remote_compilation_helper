@@ -145,6 +145,7 @@ pub struct DaemonStatusResponse {
 ///
 /// Named `SystemOverview` to distinguish from daemon's `DaemonFullStatus` type.
 #[derive(Debug, Clone, Serialize)]
+#[allow(dead_code)]
 pub struct SystemOverview {
     pub daemon_running: bool,
     pub hook_installed: bool,
@@ -176,6 +177,7 @@ pub struct ConfigValueSourceInfo {
 
 /// Configuration export response for JSON output.
 #[derive(Debug, Clone, Serialize)]
+#[allow(dead_code)]
 pub struct ConfigExportResponse {
     pub format: String,
     pub content: String,
@@ -312,6 +314,7 @@ pub struct HookActionResponse {
 
 /// Hook test response for JSON output.
 #[derive(Debug, Clone, Serialize)]
+#[allow(dead_code)]
 pub struct HookTestResponse {
     pub classification_tests: Vec<ClassificationTestResult>,
     pub daemon_connected: bool,
@@ -323,6 +326,7 @@ pub struct HookTestResponse {
 
 /// Classification test result.
 #[derive(Debug, Clone, Serialize)]
+#[allow(dead_code)]
 pub struct ClassificationTestResult {
     pub command: String,
     pub is_compilation: bool,
@@ -442,10 +446,10 @@ pub async fn workers_list(show_speedscore: bool, ctx: &OutputContext) -> Result<
         // Enrich with speedscore data if available
         if let Some(ref scores) = speedscores {
             for info in &mut worker_infos {
-                if let Some(score_entry) = scores.workers.iter().find(|s| s.worker_id == info.id) {
-                    if let Some(ref score) = score_entry.speedscore {
-                        info.speedscore = Some(score.total);
-                    }
+                if let Some(score_entry) = scores.workers.iter().find(|s| s.worker_id == info.id)
+                    && let Some(ref score) = score_entry.speedscore
+                {
+                    info.speedscore = Some(score.total);
                 }
             }
         }
@@ -485,26 +489,24 @@ pub async fn workers_list(show_speedscore: bool, ctx: &OutputContext) -> Result<
         );
 
         // Add SpeedScore if available
-        if let Some(ref scores) = speedscores {
-            if let Some(score_entry) = scores
+        if let Some(ref scores) = speedscores
+            && let Some(score_entry) = scores
                 .workers
                 .iter()
                 .find(|s| s.worker_id == worker.id.as_str())
-            {
-                if let Some(ref score) = score_entry.speedscore {
-                    let score_color = match score.total {
-                        x if x >= 75.0 => style.success(&format!("{:.0}", x)),
-                        x if x >= 45.0 => style.warning(&format!("{:.0}", x)),
-                        x => style.error(&format!("{:.0}", x)),
-                    };
-                    stats_line.push_str(&format!(
-                        "  {} {} {}",
-                        style.key("Score"),
-                        style.muted(":"),
-                        score_color
-                    ));
-                }
-            }
+            && let Some(ref score) = score_entry.speedscore
+        {
+            let score_color = match score.total {
+                x if x >= 75.0 => style.success(&format!("{:.0}", x)),
+                x if x >= 45.0 => style.warning(&format!("{:.0}", x)),
+                x => style.error(&format!("{:.0}", x)),
+            };
+            stats_line.push_str(&format!(
+                "  {} {} {}",
+                style.key("Score"),
+                style.muted(":"),
+                score_color
+            ));
         }
 
         println!("{}", stats_line);
@@ -1949,8 +1951,7 @@ async fn setup_single_worker(
     }
 
     // Step 2: Sync toolchain
-    if !skip_toolchain {
-        if let Some(tc) = toolchain {
+    if !skip_toolchain && let Some(tc) = toolchain {
             if !ctx.is_json() {
                 print!("      {} Toolchain: ", style.muted("→"));
                 use std::io::Write;
@@ -2013,7 +2014,6 @@ async fn setup_single_worker(
                     }
                 }
             }
-        }
     }
 
     // Step 3: Verify worker health (quick SSH ping)
@@ -2075,11 +2075,9 @@ fn detect_project_toolchain() -> Result<String> {
         // Format: [toolchain]\nchannel = "nightly-2025-01-01"
         for line in content.lines() {
             let line = line.trim();
-            if line.starts_with("channel") {
-                if let Some(value) = line.split('=').nth(1) {
-                    let channel = value.trim().trim_matches('"').trim_matches('\'');
-                    return Ok(channel.to_string());
-                }
+            if line.starts_with("channel") && let Some(value) = line.split('=').nth(1) {
+                let channel = value.trim().trim_matches('"').trim_matches('\'');
+                return Ok(channel.to_string());
             }
         }
     }
@@ -3380,10 +3378,8 @@ pub fn config_show(show_sources: bool, ctx: &OutputContext) -> Result<()> {
     // Helper closure to format value with source
     let format_with_source =
         |key: &str, value: &str, sources: &Option<Vec<ConfigValueSourceInfo>>| -> String {
-            if let Some(vs) = sources {
-                if let Some(s) = vs.iter().find(|v| v.key == key) {
-                    return format!("{} {}", value, style.muted(&format!("# from {}", s.source)));
-                }
+            if let Some(vs) = sources && let Some(s) = vs.iter().find(|v| v.key == key) {
+                return format!("{} {}", value, style.muted(&format!("# from {}", s.source)));
             }
             value.to_string()
         };
@@ -4832,12 +4828,11 @@ pub async fn diagnose(command: &str, ctx: &OutputContext) -> Result<()> {
         .await
         {
             Ok(response) => {
-                if let Some(worker) = response.worker.as_ref() {
-                    if let Err(err) =
+                if let Some(worker) = response.worker.as_ref()
+                    && let Err(err) =
                         release_worker(&socket_path, &worker.id, estimated_cores).await
-                    {
-                        debug!("Failed to release worker slots: {}", err);
-                    }
+                {
+                    debug!("Failed to release worker slots: {}", err);
                 }
                 worker_selection = Some(DiagnoseWorkerSelection {
                     estimated_cores,
@@ -5211,12 +5206,10 @@ pub fn hook_uninstall(ctx: &OutputContext) -> Result<()> {
 /// Helper to get rchd path.
 fn which_rchd() -> PathBuf {
     // Try to find rchd in same directory as current executable
-    if let Ok(exe_path) = std::env::current_exe() {
-        if let Some(dir) = exe_path.parent() {
-            let rchd = dir.join("rchd");
-            if rchd.exists() {
-                return rchd;
-            }
+    if let Ok(exe_path) = std::env::current_exe() && let Some(dir) = exe_path.parent() {
+        let rchd = dir.join("rchd");
+        if rchd.exists() {
+            return rchd;
         }
     }
 
@@ -5856,10 +5849,8 @@ pub async fn speedscore(
                 score_display
             );
 
-            if verbose {
-                if let Some(ref score) = entry.speedscore {
-                    display_speedscore_verbose(score, style);
-                }
+            if verbose && let Some(ref score) = entry.speedscore {
+                display_speedscore_verbose(score, style);
             }
         }
 

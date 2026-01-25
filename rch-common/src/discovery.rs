@@ -110,10 +110,10 @@ pub fn parse_ssh_config_content(content: &str) -> Result<Vec<DiscoveredHost>> {
         match key.to_lowercase().as_str() {
             "host" => {
                 // Save previous host if valid
-                if let Some(host) = current_host.take() {
-                    if let Some(discovered) = host.into_discovered() {
-                        hosts.push(discovered);
-                    }
+                if let Some(host) = current_host.take()
+                    && let Some(discovered) = host.into_discovered()
+                {
+                    hosts.push(discovered);
                 }
 
                 // Start new host block
@@ -153,10 +153,10 @@ pub fn parse_ssh_config_content(content: &str) -> Result<Vec<DiscoveredHost>> {
     }
 
     // Don't forget the last host
-    if let Some(host) = current_host {
-        if let Some(discovered) = host.into_discovered() {
-            hosts.push(discovered);
-        }
+    if let Some(host) = current_host
+        && let Some(discovered) = host.into_discovered()
+    {
+        hosts.push(discovered);
     }
 
     // Filter out hosts that are clearly not workers
@@ -237,10 +237,10 @@ fn parse_ssh_config_line(line: &str) -> Option<(&str, &str)> {
 
 /// Expand ~ to home directory in paths.
 fn expand_tilde(path: &str) -> String {
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(rest).display().to_string();
-        }
+    if let Some(rest) = path.strip_prefix("~/")
+        && let Some(home) = dirs::home_dir()
+    {
+        return home.join(rest).display().to_string();
     }
     path.to_string()
 }
@@ -335,12 +335,10 @@ pub fn parse_shell_aliases_content(
             .filter(|s| !s.starts_with('-'))
             .filter(|s| {
                 // Also filter out values that follow -i or -p
-                if let Some(prev_idx) = ssh_args.find(s) {
-                    if prev_idx > 0 {
-                        let before = &ssh_args[..prev_idx].trim_end();
-                        if before.ends_with("-i") || before.ends_with("-p") {
-                            return false;
-                        }
+                if let Some(prev_idx) = ssh_args.find(s) && prev_idx > 0 {
+                    let before = &ssh_args[..prev_idx].trim_end();
+                    if before.ends_with("-i") || before.ends_with("-p") {
+                        return false;
                     }
                 }
                 true
@@ -392,15 +390,13 @@ pub fn discover_all() -> Result<Vec<DiscoveredHost>> {
     let mut all_hosts = Vec::new();
 
     // Parse SSH config
-    match parse_ssh_config() {
-        Ok(hosts) => all_hosts.extend(hosts),
-        Err(_) => {} // Ignore errors, continue with other sources
+    if let Ok(hosts) = parse_ssh_config() {
+        all_hosts.extend(hosts);
     }
 
     // Parse shell aliases
-    match parse_shell_aliases() {
-        Ok(hosts) => all_hosts.extend(hosts),
-        Err(_) => {} // Ignore errors
+    if let Ok(hosts) = parse_shell_aliases() {
+        all_hosts.extend(hosts);
     }
 
     // Deduplicate by hostname (keep first occurrence, which is typically SSH config)

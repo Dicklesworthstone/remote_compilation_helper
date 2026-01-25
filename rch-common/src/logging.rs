@@ -86,16 +86,14 @@ impl LogConfig {
             ..Self::default()
         };
 
-        if let Ok(format) = std::env::var("RCH_LOG_FORMAT") {
-            if let Some(parsed) = LogFormat::parse(&format) {
-                config.format = parsed;
-            }
+        if let Ok(format) = std::env::var("RCH_LOG_FORMAT")
+            && let Some(parsed) = LogFormat::parse(&format)
+        {
+            config.format = parsed;
         }
 
-        if let Ok(path) = std::env::var("RCH_LOG_FILE") {
-            if !path.trim().is_empty() {
-                config.file_path = Some(PathBuf::from(path));
-            }
+        if let Ok(path) = std::env::var("RCH_LOG_FILE") && !path.trim().is_empty() {
+            config.file_path = Some(PathBuf::from(path));
         }
 
         if let Ok(targets) = std::env::var("RCH_LOG_TARGETS") {
@@ -119,10 +117,10 @@ impl LogConfig {
 
     /// Build the effective EnvFilter, honoring RUST_LOG if set.
     pub fn env_filter(&self) -> EnvFilter {
-        if std::env::var_os("RUST_LOG").is_some() {
-            if let Ok(filter) = EnvFilter::try_from_default_env() {
-                return filter;
-            }
+        if std::env::var_os("RUST_LOG").is_some()
+            && let Ok(filter) = EnvFilter::try_from_default_env()
+        {
+            return filter;
         }
 
         let mut filter = self.level.clone();

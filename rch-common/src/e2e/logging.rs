@@ -276,11 +276,11 @@ impl TestLogger {
         }
 
         // Write to file if configured
-        if let Ok(mut writer) = self.file_writer.lock() {
-            if let Some(ref mut w) = *writer {
-                let _ = writeln!(w, "{entry}");
-                let _ = w.flush();
-            }
+        if let Ok(mut writer) = self.file_writer.lock()
+            && let Some(ref mut w) = *writer
+        {
+            let _ = writeln!(w, "{entry}");
+            let _ = w.flush();
         }
 
         // Store in memory
@@ -511,10 +511,10 @@ impl TestLogger {
         if let Some(ref err) = summary.first_error {
             println!("First error: {err}");
         }
-        if let Some(ref err) = summary.last_error {
-            if summary.first_error.as_ref() != Some(err) {
-                println!("Last error: {err}");
-            }
+        if let Some(ref err) = summary.last_error
+            && summary.first_error.as_ref() != Some(err)
+        {
+            println!("Last error: {err}");
         }
         println!("{}", "=".repeat(60));
     }

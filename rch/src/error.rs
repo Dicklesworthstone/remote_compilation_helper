@@ -6,6 +6,8 @@
 //! All public errors implement `Diagnostic` and follow the error code
 //! convention `rch::category::specific`.
 
+#![allow(unused_assignments)]
+
 use miette::{Diagnostic, NamedSource, SourceSpan};
 use std::path::PathBuf;
 use thiserror::Error;

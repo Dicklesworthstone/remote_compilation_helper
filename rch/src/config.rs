@@ -504,172 +504,168 @@ fn apply_layer(
 ) {
     const EPSILON: f64 = 0.0001;
 
-    if let Some(enabled) = layer.general.enabled {
-        if enabled != defaults.general.enabled {
-            config.general.enabled = enabled;
-            set_source(sources, "general.enabled", source.clone());
-        }
+    if let Some(enabled) = layer.general.enabled && enabled != defaults.general.enabled {
+        config.general.enabled = enabled;
+        set_source(sources, "general.enabled", source.clone());
     }
-    if let Some(log_level) = layer.general.log_level.as_ref() {
-        if log_level != &defaults.general.log_level {
-            config.general.log_level = log_level.clone();
-            set_source(sources, "general.log_level", source.clone());
-        }
+    if let Some(log_level) = layer.general.log_level.as_ref()
+        && log_level != &defaults.general.log_level
+    {
+        config.general.log_level = log_level.clone();
+        set_source(sources, "general.log_level", source.clone());
     }
-    if let Some(socket_path) = layer.general.socket_path.as_ref() {
-        if socket_path != &defaults.general.socket_path {
-            config.general.socket_path = socket_path.clone();
-            set_source(sources, "general.socket_path", source.clone());
-        }
+    if let Some(socket_path) = layer.general.socket_path.as_ref()
+        && socket_path != &defaults.general.socket_path
+    {
+        config.general.socket_path = socket_path.clone();
+        set_source(sources, "general.socket_path", source.clone());
     }
 
-    if let Some(threshold) = layer.compilation.confidence_threshold {
-        if (threshold - defaults.compilation.confidence_threshold).abs() > EPSILON {
-            config.compilation.confidence_threshold = threshold;
-            set_source(sources, "compilation.confidence_threshold", source.clone());
-        }
+    if let Some(threshold) = layer.compilation.confidence_threshold
+        && (threshold - defaults.compilation.confidence_threshold).abs() > EPSILON
+    {
+        config.compilation.confidence_threshold = threshold;
+        set_source(sources, "compilation.confidence_threshold", source.clone());
     }
-    if let Some(min_local) = layer.compilation.min_local_time_ms {
-        if min_local != defaults.compilation.min_local_time_ms {
-            config.compilation.min_local_time_ms = min_local;
-            set_source(sources, "compilation.min_local_time_ms", source.clone());
-        }
+    if let Some(min_local) = layer.compilation.min_local_time_ms
+        && min_local != defaults.compilation.min_local_time_ms
+    {
+        config.compilation.min_local_time_ms = min_local;
+        set_source(sources, "compilation.min_local_time_ms", source.clone());
     }
-    if let Some(build_slots) = layer.compilation.build_slots {
-        if build_slots != defaults.compilation.build_slots {
-            config.compilation.build_slots = build_slots;
-            set_source(sources, "compilation.build_slots", source.clone());
-        }
+    if let Some(build_slots) = layer.compilation.build_slots
+        && build_slots != defaults.compilation.build_slots
+    {
+        config.compilation.build_slots = build_slots;
+        set_source(sources, "compilation.build_slots", source.clone());
     }
-    if let Some(test_slots) = layer.compilation.test_slots {
-        if test_slots != defaults.compilation.test_slots {
-            config.compilation.test_slots = test_slots;
-            set_source(sources, "compilation.test_slots", source.clone());
-        }
+    if let Some(test_slots) = layer.compilation.test_slots
+        && test_slots != defaults.compilation.test_slots
+    {
+        config.compilation.test_slots = test_slots;
+        set_source(sources, "compilation.test_slots", source.clone());
     }
-    if let Some(check_slots) = layer.compilation.check_slots {
-        if check_slots != defaults.compilation.check_slots {
-            config.compilation.check_slots = check_slots;
-            set_source(sources, "compilation.check_slots", source.clone());
-        }
+    if let Some(check_slots) = layer.compilation.check_slots
+        && check_slots != defaults.compilation.check_slots
+    {
+        config.compilation.check_slots = check_slots;
+        set_source(sources, "compilation.check_slots", source.clone());
     }
-    if let Some(build_timeout_sec) = layer.compilation.build_timeout_sec {
-        if build_timeout_sec != defaults.compilation.build_timeout_sec {
-            config.compilation.build_timeout_sec = build_timeout_sec;
-            set_source(sources, "compilation.build_timeout_sec", source.clone());
-        }
+    if let Some(build_timeout_sec) = layer.compilation.build_timeout_sec
+        && build_timeout_sec != defaults.compilation.build_timeout_sec
+    {
+        config.compilation.build_timeout_sec = build_timeout_sec;
+        set_source(sources, "compilation.build_timeout_sec", source.clone());
     }
-    if let Some(test_timeout_sec) = layer.compilation.test_timeout_sec {
-        if test_timeout_sec != defaults.compilation.test_timeout_sec {
-            config.compilation.test_timeout_sec = test_timeout_sec;
-            set_source(sources, "compilation.test_timeout_sec", source.clone());
-        }
-    }
-
-    if let Some(compression) = layer.transfer.compression_level {
-        if compression != defaults.transfer.compression_level {
-            config.transfer.compression_level = compression;
-            set_source(sources, "transfer.compression_level", source.clone());
-        }
-    }
-    if let Some(patterns) = layer.transfer.exclude_patterns.as_ref() {
-        if patterns != &defaults.transfer.exclude_patterns {
-            config.transfer.exclude_patterns = patterns.clone();
-            set_source(sources, "transfer.exclude_patterns", source.clone());
-        }
+    if let Some(test_timeout_sec) = layer.compilation.test_timeout_sec
+        && test_timeout_sec != defaults.compilation.test_timeout_sec
+    {
+        config.compilation.test_timeout_sec = test_timeout_sec;
+        set_source(sources, "compilation.test_timeout_sec", source.clone());
     }
 
-    if let Some(failure_threshold) = layer.circuit.failure_threshold {
-        if failure_threshold != defaults.circuit.failure_threshold {
-            config.circuit.failure_threshold = failure_threshold;
-            set_source(sources, "circuit.failure_threshold", source.clone());
-        }
+    if let Some(compression) = layer.transfer.compression_level
+        && compression != defaults.transfer.compression_level
+    {
+        config.transfer.compression_level = compression;
+        set_source(sources, "transfer.compression_level", source.clone());
     }
-    if let Some(success_threshold) = layer.circuit.success_threshold {
-        if success_threshold != defaults.circuit.success_threshold {
-            config.circuit.success_threshold = success_threshold;
-            set_source(sources, "circuit.success_threshold", source.clone());
-        }
-    }
-    if let Some(error_rate_threshold) = layer.circuit.error_rate_threshold {
-        if (error_rate_threshold - defaults.circuit.error_rate_threshold).abs() > EPSILON {
-            config.circuit.error_rate_threshold = error_rate_threshold;
-            set_source(sources, "circuit.error_rate_threshold", source.clone());
-        }
-    }
-    if let Some(window_secs) = layer.circuit.window_secs {
-        if window_secs != defaults.circuit.window_secs {
-            config.circuit.window_secs = window_secs;
-            set_source(sources, "circuit.window_secs", source.clone());
-        }
-    }
-    if let Some(open_cooldown_secs) = layer.circuit.open_cooldown_secs {
-        if open_cooldown_secs != defaults.circuit.open_cooldown_secs {
-            config.circuit.open_cooldown_secs = open_cooldown_secs;
-            set_source(sources, "circuit.open_cooldown_secs", source.clone());
-        }
-    }
-    if let Some(half_open_max_probes) = layer.circuit.half_open_max_probes {
-        if half_open_max_probes != defaults.circuit.half_open_max_probes {
-            config.circuit.half_open_max_probes = half_open_max_probes;
-            set_source(sources, "circuit.half_open_max_probes", source.clone());
-        }
+    if let Some(patterns) = layer.transfer.exclude_patterns.as_ref()
+        && patterns != &defaults.transfer.exclude_patterns
+    {
+        config.transfer.exclude_patterns = patterns.clone();
+        set_source(sources, "transfer.exclude_patterns", source.clone());
     }
 
-    if let Some(visibility) = layer.output.visibility {
-        if visibility != defaults.output.visibility {
-            config.output.visibility = visibility;
-            set_source(sources, "output.visibility", source.clone());
-        }
+    if let Some(failure_threshold) = layer.circuit.failure_threshold
+        && failure_threshold != defaults.circuit.failure_threshold
+    {
+        config.circuit.failure_threshold = failure_threshold;
+        set_source(sources, "circuit.failure_threshold", source.clone());
     }
-    if let Some(first_run_complete) = layer.output.first_run_complete {
-        if first_run_complete != defaults.output.first_run_complete {
-            config.output.first_run_complete = first_run_complete;
-            set_source(sources, "output.first_run_complete", source.clone());
-        }
+    if let Some(success_threshold) = layer.circuit.success_threshold
+        && success_threshold != defaults.circuit.success_threshold
+    {
+        config.circuit.success_threshold = success_threshold;
+        set_source(sources, "circuit.success_threshold", source.clone());
+    }
+    if let Some(error_rate_threshold) = layer.circuit.error_rate_threshold
+        && (error_rate_threshold - defaults.circuit.error_rate_threshold).abs() > EPSILON
+    {
+        config.circuit.error_rate_threshold = error_rate_threshold;
+        set_source(sources, "circuit.error_rate_threshold", source.clone());
+    }
+    if let Some(window_secs) = layer.circuit.window_secs
+        && window_secs != defaults.circuit.window_secs
+    {
+        config.circuit.window_secs = window_secs;
+        set_source(sources, "circuit.window_secs", source.clone());
+    }
+    if let Some(open_cooldown_secs) = layer.circuit.open_cooldown_secs
+        && open_cooldown_secs != defaults.circuit.open_cooldown_secs
+    {
+        config.circuit.open_cooldown_secs = open_cooldown_secs;
+        set_source(sources, "circuit.open_cooldown_secs", source.clone());
+    }
+    if let Some(half_open_max_probes) = layer.circuit.half_open_max_probes
+        && half_open_max_probes != defaults.circuit.half_open_max_probes
+    {
+        config.circuit.half_open_max_probes = half_open_max_probes;
+        set_source(sources, "circuit.half_open_max_probes", source.clone());
     }
 
-    if let Some(enabled) = layer.self_test.enabled {
-        if enabled != defaults.self_test.enabled {
-            config.self_test.enabled = enabled;
-            set_source(sources, "self_test.enabled", source.clone());
-        }
+    if let Some(visibility) = layer.output.visibility
+        && visibility != defaults.output.visibility
+    {
+        config.output.visibility = visibility;
+        set_source(sources, "output.visibility", source.clone());
     }
-    if let Some(schedule) = layer.self_test.schedule.as_ref() {
-        if defaults.self_test.schedule.as_ref() != Some(schedule) {
-            config.self_test.schedule = Some(schedule.clone());
-            set_source(sources, "self_test.schedule", source.clone());
-        }
+    if let Some(first_run_complete) = layer.output.first_run_complete
+        && first_run_complete != defaults.output.first_run_complete
+    {
+        config.output.first_run_complete = first_run_complete;
+        set_source(sources, "output.first_run_complete", source.clone());
     }
-    if let Some(interval) = layer.self_test.interval.as_ref() {
-        if defaults.self_test.interval.as_ref() != Some(interval) {
-            config.self_test.interval = Some(interval.clone());
-            set_source(sources, "self_test.interval", source.clone());
-        }
+
+    if let Some(enabled) = layer.self_test.enabled && enabled != defaults.self_test.enabled {
+        config.self_test.enabled = enabled;
+        set_source(sources, "self_test.enabled", source.clone());
     }
-    if let Some(workers) = layer.self_test.workers.as_ref() {
-        if workers != &defaults.self_test.workers {
-            config.self_test.workers = workers.clone();
-            set_source(sources, "self_test.workers", source.clone());
-        }
+    if let Some(schedule) = layer.self_test.schedule.as_ref()
+        && defaults.self_test.schedule.as_ref() != Some(schedule)
+    {
+        config.self_test.schedule = Some(schedule.clone());
+        set_source(sources, "self_test.schedule", source.clone());
     }
-    if let Some(on_failure) = layer.self_test.on_failure {
-        if on_failure != defaults.self_test.on_failure {
-            config.self_test.on_failure = on_failure;
-            set_source(sources, "self_test.on_failure", source.clone());
-        }
+    if let Some(interval) = layer.self_test.interval.as_ref()
+        && defaults.self_test.interval.as_ref() != Some(interval)
+    {
+        config.self_test.interval = Some(interval.clone());
+        set_source(sources, "self_test.interval", source.clone());
     }
-    if let Some(retry_count) = layer.self_test.retry_count {
-        if retry_count != defaults.self_test.retry_count {
-            config.self_test.retry_count = retry_count;
-            set_source(sources, "self_test.retry_count", source.clone());
-        }
+    if let Some(workers) = layer.self_test.workers.as_ref()
+        && workers != &defaults.self_test.workers
+    {
+        config.self_test.workers = workers.clone();
+        set_source(sources, "self_test.workers", source.clone());
     }
-    if let Some(retry_delay) = layer.self_test.retry_delay.as_ref() {
-        if defaults.self_test.retry_delay != *retry_delay {
-            config.self_test.retry_delay = retry_delay.clone();
-            set_source(sources, "self_test.retry_delay", source.clone());
-        }
+    if let Some(on_failure) = layer.self_test.on_failure
+        && on_failure != defaults.self_test.on_failure
+    {
+        config.self_test.on_failure = on_failure;
+        set_source(sources, "self_test.on_failure", source.clone());
+    }
+    if let Some(retry_count) = layer.self_test.retry_count
+        && retry_count != defaults.self_test.retry_count
+    {
+        config.self_test.retry_count = retry_count;
+        set_source(sources, "self_test.retry_count", source.clone());
+    }
+    if let Some(retry_delay) = layer.self_test.retry_delay.as_ref()
+        && defaults.self_test.retry_delay != *retry_delay
+    {
+        config.self_test.retry_delay = retry_delay.clone();
+        set_source(sources, "self_test.retry_delay", source.clone());
     }
 }
 
@@ -902,16 +898,14 @@ fn apply_env_overrides_inner(
         }
     };
 
-    if let Some(val) = get_env("RCH_ENABLED") {
-        if let Some(enabled) = parse_bool(&val) {
-            config.general.enabled = enabled;
-            if let Some(ref mut sources) = sources {
-                set_source(
-                    sources,
-                    "general.enabled",
-                    ConfigValueSource::EnvVar("RCH_ENABLED".to_string()),
-                );
-            }
+    if let Some(val) = get_env("RCH_ENABLED") && let Some(enabled) = parse_bool(&val) {
+        config.general.enabled = enabled;
+        if let Some(ref mut sources) = sources {
+            set_source(
+                sources,
+                "general.enabled",
+                ConfigValueSource::EnvVar("RCH_ENABLED".to_string()),
+            );
         }
     }
 
@@ -937,114 +931,98 @@ fn apply_env_overrides_inner(
         }
     }
 
-    if let Some(val) = get_env("RCH_CONFIDENCE_THRESHOLD") {
-        if let Ok(threshold) = val.parse() {
-            config.compilation.confidence_threshold = threshold;
-            if let Some(ref mut sources) = sources {
-                set_source(
-                    sources,
-                    "compilation.confidence_threshold",
-                    ConfigValueSource::EnvVar("RCH_CONFIDENCE_THRESHOLD".to_string()),
-                );
-            }
+    if let Some(val) = get_env("RCH_CONFIDENCE_THRESHOLD")
+        && let Ok(threshold) = val.parse()
+    {
+        config.compilation.confidence_threshold = threshold;
+        if let Some(ref mut sources) = sources {
+            set_source(
+                sources,
+                "compilation.confidence_threshold",
+                ConfigValueSource::EnvVar("RCH_CONFIDENCE_THRESHOLD".to_string()),
+            );
         }
     }
-    if let Some(val) = get_env("RCH_BUILD_SLOTS") {
-        if let Ok(slots) = val.parse() {
-            config.compilation.build_slots = slots;
-            if let Some(ref mut sources) = sources {
-                set_source(
-                    sources,
-                    "compilation.build_slots",
-                    ConfigValueSource::EnvVar("RCH_BUILD_SLOTS".to_string()),
-                );
-            }
+    if let Some(val) = get_env("RCH_BUILD_SLOTS") && let Ok(slots) = val.parse() {
+        config.compilation.build_slots = slots;
+        if let Some(ref mut sources) = sources {
+            set_source(
+                sources,
+                "compilation.build_slots",
+                ConfigValueSource::EnvVar("RCH_BUILD_SLOTS".to_string()),
+            );
         }
     }
-    if let Some(val) = get_env("RCH_TEST_SLOTS") {
-        if let Ok(slots) = val.parse() {
-            config.compilation.test_slots = slots;
-            if let Some(ref mut sources) = sources {
-                set_source(
-                    sources,
-                    "compilation.test_slots",
-                    ConfigValueSource::EnvVar("RCH_TEST_SLOTS".to_string()),
-                );
-            }
+    if let Some(val) = get_env("RCH_TEST_SLOTS") && let Ok(slots) = val.parse() {
+        config.compilation.test_slots = slots;
+        if let Some(ref mut sources) = sources {
+            set_source(
+                sources,
+                "compilation.test_slots",
+                ConfigValueSource::EnvVar("RCH_TEST_SLOTS".to_string()),
+            );
         }
     }
-    if let Some(val) = get_env("RCH_CHECK_SLOTS") {
-        if let Ok(slots) = val.parse() {
-            config.compilation.check_slots = slots;
-            if let Some(ref mut sources) = sources {
-                set_source(
-                    sources,
-                    "compilation.check_slots",
-                    ConfigValueSource::EnvVar("RCH_CHECK_SLOTS".to_string()),
-                );
-            }
+    if let Some(val) = get_env("RCH_CHECK_SLOTS") && let Ok(slots) = val.parse() {
+        config.compilation.check_slots = slots;
+        if let Some(ref mut sources) = sources {
+            set_source(
+                sources,
+                "compilation.check_slots",
+                ConfigValueSource::EnvVar("RCH_CHECK_SLOTS".to_string()),
+            );
         }
     }
-    if let Some(val) = get_env("RCH_BUILD_TIMEOUT_SEC") {
-        if let Ok(timeout) = val.parse() {
-            config.compilation.build_timeout_sec = timeout;
-            if let Some(ref mut sources) = sources {
-                set_source(
-                    sources,
-                    "compilation.build_timeout_sec",
-                    ConfigValueSource::EnvVar("RCH_BUILD_TIMEOUT_SEC".to_string()),
-                );
-            }
+    if let Some(val) = get_env("RCH_BUILD_TIMEOUT_SEC") && let Ok(timeout) = val.parse() {
+        config.compilation.build_timeout_sec = timeout;
+        if let Some(ref mut sources) = sources {
+            set_source(
+                sources,
+                "compilation.build_timeout_sec",
+                ConfigValueSource::EnvVar("RCH_BUILD_TIMEOUT_SEC".to_string()),
+            );
         }
     }
-    if let Some(val) = get_env("RCH_TEST_TIMEOUT_SEC") {
-        if let Ok(timeout) = val.parse() {
-            config.compilation.test_timeout_sec = timeout;
-            if let Some(ref mut sources) = sources {
-                set_source(
-                    sources,
-                    "compilation.test_timeout_sec",
-                    ConfigValueSource::EnvVar("RCH_TEST_TIMEOUT_SEC".to_string()),
-                );
-            }
+    if let Some(val) = get_env("RCH_TEST_TIMEOUT_SEC") && let Ok(timeout) = val.parse() {
+        config.compilation.test_timeout_sec = timeout;
+        if let Some(ref mut sources) = sources {
+            set_source(
+                sources,
+                "compilation.test_timeout_sec",
+                ConfigValueSource::EnvVar("RCH_TEST_TIMEOUT_SEC".to_string()),
+            );
         }
     }
 
-    if let Some(val) = get_env("RCH_COMPRESSION") {
-        if let Ok(level) = val.parse() {
-            config.transfer.compression_level = level;
-            if let Some(ref mut sources) = sources {
-                set_source(
-                    sources,
-                    "transfer.compression_level",
-                    ConfigValueSource::EnvVar("RCH_COMPRESSION".to_string()),
-                );
-            }
+    if let Some(val) = get_env("RCH_COMPRESSION") && let Ok(level) = val.parse() {
+        config.transfer.compression_level = level;
+        if let Some(ref mut sources) = sources {
+            set_source(
+                sources,
+                "transfer.compression_level",
+                ConfigValueSource::EnvVar("RCH_COMPRESSION".to_string()),
+            );
         }
     }
 
     let mut visibility_override: Option<(OutputVisibility, String)> = None;
 
-    if let Some(val) = get_env("RCH_QUIET") {
-        if parse_bool(&val).unwrap_or(false) {
-            visibility_override = Some((OutputVisibility::None, "RCH_QUIET".to_string()));
-        }
+    if let Some(val) = get_env("RCH_QUIET") && parse_bool(&val).unwrap_or(false) {
+        visibility_override = Some((OutputVisibility::None, "RCH_QUIET".to_string()));
     }
 
-    if visibility_override.is_none() {
-        if let Some(val) = get_env("RCH_VISIBILITY") {
-            if let Ok(mode) = val.parse::<OutputVisibility>() {
-                visibility_override = Some((mode, "RCH_VISIBILITY".to_string()));
-            }
-        }
+    if visibility_override.is_none()
+        && let Some(val) = get_env("RCH_VISIBILITY")
+        && let Ok(mode) = val.parse::<OutputVisibility>()
+    {
+        visibility_override = Some((mode, "RCH_VISIBILITY".to_string()));
     }
 
-    if visibility_override.is_none() {
-        if let Some(val) = get_env("RCH_VERBOSE") {
-            if parse_bool(&val).unwrap_or(false) {
-                visibility_override = Some((OutputVisibility::Verbose, "RCH_VERBOSE".to_string()));
-            }
-        }
+    if visibility_override.is_none()
+        && let Some(val) = get_env("RCH_VERBOSE")
+        && parse_bool(&val).unwrap_or(false)
+    {
+        visibility_override = Some((OutputVisibility::Verbose, "RCH_VERBOSE".to_string()));
     }
 
     if let Some((mode, source_var)) = visibility_override {

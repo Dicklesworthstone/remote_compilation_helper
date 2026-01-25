@@ -160,12 +160,11 @@ fn parse_env_u32(command: &str, key: &str) -> Option<u32> {
 fn parse_jobs_flag(command: &str) -> Option<u32> {
     let tokens: Vec<&str> = command.split_whitespace().collect();
     for (idx, token) in tokens.iter().enumerate() {
-        if *token == "-j" || *token == "--jobs" {
-            if let Some(next) = tokens.get(idx + 1) {
-                if let Some(value) = parse_u32(next) {
-                    return Some(value);
-                }
-            }
+        if (*token == "-j" || *token == "--jobs")
+            && let Some(next) = tokens.get(idx + 1)
+            && let Some(value) = parse_u32(next)
+        {
+            return Some(value);
         }
         if let Some(value) = token.strip_prefix("-j=").and_then(parse_u32) {
             return Some(value);
@@ -183,12 +182,11 @@ fn parse_jobs_flag(command: &str) -> Option<u32> {
 fn parse_test_threads(command: &str) -> Option<u32> {
     let tokens: Vec<&str> = command.split_whitespace().collect();
     for (idx, token) in tokens.iter().enumerate() {
-        if *token == "--test-threads" {
-            if let Some(next) = tokens.get(idx + 1) {
-                if let Some(value) = parse_u32(next) {
-                    return Some(value);
-                }
-            }
+        if *token == "--test-threads"
+            && let Some(next) = tokens.get(idx + 1)
+            && let Some(value) = parse_u32(next)
+        {
+            return Some(value);
         }
         if let Some(value) = token.strip_prefix("--test-threads=").and_then(parse_u32) {
             return Some(value);
@@ -258,7 +256,7 @@ fn is_filtered_test_command(command: &str) -> bool {
         }
 
         // Check if this is a flag that takes an argument
-        if flags_with_args.iter().any(|&f| token == f) {
+        if flags_with_args.contains(&token) {
             // Skip this flag and its argument
             i += 2;
             continue;
@@ -274,7 +272,7 @@ fn is_filtered_test_command(command: &str) -> bool {
         }
 
         // Check if this is a standalone flag
-        if standalone_flags.iter().any(|&f| token == f) {
+        if standalone_flags.contains(&token) {
             i += 1;
             continue;
         }
@@ -300,8 +298,8 @@ fn has_ignored_only_flag(command: &str) -> bool {
     let tokens: Vec<&str> = command.split_whitespace().collect();
 
     // Look for "--ignored" but not "--include-ignored"
-    let has_ignored = tokens.iter().any(|&t| t == "--ignored");
-    let has_include_ignored = tokens.iter().any(|&t| t == "--include-ignored");
+    let has_ignored = tokens.contains(&"--ignored");
+    let has_include_ignored = tokens.contains(&"--include-ignored");
 
     // Only return true for --ignored without --include-ignored
     has_ignored && !has_include_ignored
@@ -702,10 +700,8 @@ pub(crate) async fn query_daemon(
     // Build query string
     let mut query = format!("project={}&cores={}", urlencoding_encode(project), cores);
 
-    if let Some(tc) = toolchain {
-        if let Ok(json) = serde_json::to_string(tc) {
-            query.push_str(&format!("&toolchain={}", urlencoding_encode(&json)));
-        }
+    if let Some(tc) = toolchain && let Ok(json) = serde_json::to_string(tc) {
+        query.push_str(&format!("&toolchain={}", urlencoding_encode(&json)));
     }
 
     if required_runtime != RequiredRuntime::None {
@@ -1121,25 +1117,23 @@ async fn execute_remote_compilation(
     if let Some(error) = extraction.extraction_error {
         warn!("Telemetry extraction failed: {}", error);
     }
-    if let Some(telemetry) = extraction.telemetry {
-        if let Err(e) = send_telemetry(socket_path, TelemetrySource::Piggyback, &telemetry).await {
-            warn!("Failed to forward telemetry to daemon: {}", e);
-        }
+    if let Some(telemetry) = extraction.telemetry
+        && let Err(e) = send_telemetry(socket_path, TelemetrySource::Piggyback, &telemetry).await
+    {
+        warn!("Failed to forward telemetry to daemon: {}", e);
     }
 
-    if is_test_kind(kind) {
-        if let Some(kind) = kind {
-            let record = TestRunRecord::new(
-                project_id.clone(),
-                worker_config.id.as_str().to_string(),
-                command.to_string(),
-                kind,
-                result.exit_code,
-                result.duration_ms,
-            );
-            if let Err(e) = send_test_run(socket_path, &record).await {
-                warn!("Failed to forward test run telemetry: {}", e);
-            }
+    if is_test_kind(kind) && let Some(kind) = kind {
+        let record = TestRunRecord::new(
+            project_id.clone(),
+            worker_config.id.as_str().to_string(),
+            command.to_string(),
+            kind,
+            result.exit_code,
+            result.duration_ms,
+        );
+        if let Err(e) = send_test_run(socket_path, &record).await {
+            warn!("Failed to forward test run telemetry: {}", e);
         }
     }
 

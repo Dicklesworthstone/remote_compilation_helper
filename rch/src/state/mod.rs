@@ -374,14 +374,13 @@ fn detect_project_config(_issues: &mut [StateIssue]) -> Result<ConfigState> {
     let mut valid = false;
     let mut version = None;
 
-    if exists {
-        if let Ok(content) = std::fs::read_to_string(&config_path) {
-            if let Ok(value) = toml::from_str::<toml::Value>(&content) {
-                valid = true;
-                if let Some(v) = value.get("version").and_then(|v| v.as_str()) {
-                    version = Some(v.to_string());
-                }
-            }
+    if exists
+        && let Ok(content) = std::fs::read_to_string(&config_path)
+        && let Ok(value) = toml::from_str::<toml::Value>(&content)
+    {
+        valid = true;
+        if let Some(v) = value.get("version").and_then(|v| v.as_str()) {
+            version = Some(v.to_string());
         }
     }
 

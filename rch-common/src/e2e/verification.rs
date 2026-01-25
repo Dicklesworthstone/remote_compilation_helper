@@ -545,11 +545,12 @@ impl RemoteCompilationTest {
         // Simple parser - look for name = "..."
         for line in content.lines() {
             let line = line.trim();
-            if line.starts_with("name") && line.contains('=') {
-                if let Some(name) = line.split('=').nth(1) {
-                    let name = name.trim().trim_matches('"');
-                    return Some(name.to_string());
-                }
+            if line.starts_with("name")
+                && line.contains('=')
+                && let Some(name) = line.split('=').nth(1)
+            {
+                let name = name.trim().trim_matches('"');
+                return Some(name.to_string());
             }
         }
         None

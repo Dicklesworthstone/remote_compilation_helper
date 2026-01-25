@@ -149,10 +149,10 @@ pub fn install_completions(
             "Would write completion script to: {}",
             paths.script_path.display()
         );
-        if let (Some(rc_file), Some(rc_line)) = (&paths.rc_file, &paths.rc_line) {
-            if !rc_file_has_rch_setup(rc_file)? {
-                println!("Would add to {}: {}", rc_file.display(), rc_line);
-            }
+        if let (Some(rc_file), Some(rc_line)) = (&paths.rc_file, &paths.rc_line)
+            && !rc_file_has_rch_setup(rc_file)?
+        {
+            println!("Would add to {}: {}", rc_file.display(), rc_line);
         }
         return Ok(result);
     }
@@ -181,30 +181,30 @@ pub fn install_completions(
     }
 
     // Modify RC file if needed (idempotent)
-    if let (Some(rc_file), Some(rc_line)) = (&paths.rc_file, &paths.rc_line) {
-        if !rc_file_has_rch_setup(rc_file)? {
-            // Append to RC file
-            let mut content = if rc_file.exists() {
-                fs::read_to_string(rc_file)?
-            } else {
-                String::new()
-            };
+    if let (Some(rc_file), Some(rc_line)) = (&paths.rc_file, &paths.rc_line)
+        && !rc_file_has_rch_setup(rc_file)?
+    {
+        // Append to RC file
+        let mut content = if rc_file.exists() {
+            fs::read_to_string(rc_file)?
+        } else {
+            String::new()
+        };
 
-            // Add newline separator if file doesn't end with one
-            if !content.is_empty() && !content.ends_with('\n') {
-                content.push('\n');
-            }
+        // Add newline separator if file doesn't end with one
+        if !content.is_empty() && !content.ends_with('\n') {
             content.push('\n');
-            content.push_str(rc_line);
-            content.push('\n');
+        }
+        content.push('\n');
+        content.push_str(rc_line);
+        content.push('\n');
 
-            fs::write(rc_file, content)
-                .with_context(|| format!("Failed to update {}", rc_file.display()))?;
-            result.rc_modified = true;
+        fs::write(rc_file, content)
+            .with_context(|| format!("Failed to update {}", rc_file.display()))?;
+        result.rc_modified = true;
 
-            if !ctx.is_quiet() {
-                println!("Updated {} to load completions", rc_file.display());
-            }
+        if !ctx.is_quiet() {
+            println!("Updated {} to load completions", rc_file.display());
         }
     }
 

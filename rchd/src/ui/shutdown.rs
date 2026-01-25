@@ -285,8 +285,7 @@ impl ShutdownSequence {
 
         if self.ctx.supports_color() {
             eprintln!(
-                "\x1b[{}m[{}] {} {} received, initiating graceful shutdown...\x1b[0m",
-                "33", // Yellow
+                "\x1b[33m[{}] {} {} received, initiating graceful shutdown...\x1b[0m",
                 timestamp,
                 icon,
                 signal_name
@@ -310,8 +309,7 @@ impl ShutdownSequence {
 
         if self.ctx.supports_color() {
             eprintln!(
-                "\x1b[{}m[{}] {} Draining {} in-flight job{} (timeout: {}s)\x1b[0m",
-                "33", // Yellow
+                "\x1b[33m[{}] {} Draining {} in-flight job{} (timeout: {}s)\x1b[0m",
                 timestamp,
                 icon,
                 count,
@@ -370,8 +368,7 @@ impl ShutdownSequence {
             let icon = Icons::check(self.ctx);
             if self.ctx.supports_color() {
                 eprintln!(
-                    "\x1b[{}m[{}] {} All jobs drained successfully\x1b[0m",
-                    "32", // Green
+                    "\x1b[32m[{}] {} All jobs drained successfully\x1b[0m",
                     timestamp,
                     icon
                 );
@@ -383,8 +380,7 @@ impl ShutdownSequence {
             let icon = Icons::warning(self.ctx);
             if self.ctx.supports_color() {
                 eprintln!(
-                    "\x1b[{}m[{}] {} Drain complete ({} job{} failed)\x1b[0m",
-                    "33", // Yellow
+                    "\x1b[33m[{}] {} Drain complete ({} job{} failed)\x1b[0m",
                     timestamp,
                     icon,
                     failed,
@@ -411,8 +407,7 @@ impl ShutdownSequence {
 
         if self.ctx.supports_color() {
             eprintln!(
-                "\x1b[{}m[{}] {} Drain timeout! Force-terminating {} remaining job{}\x1b[0m",
-                "31", // Red
+                "\x1b[31m[{}] {} Drain timeout! Force-terminating {} remaining job{}\x1b[0m",
                 timestamp,
                 icon,
                 remaining_jobs,
@@ -505,7 +500,7 @@ impl ShutdownSequence {
 
         // Calculate width (content + padding)
         let width = content.len().max(title.len()) + 4;
-        let h_line: String = std::iter::repeat(h).take(width - 2).collect();
+        let h_line: String = std::iter::repeat_n(h, width - 2).collect();
 
         // Top border with title
         let title_padding_left = (width - 2 - title.len()) / 2;
@@ -513,13 +508,9 @@ impl ShutdownSequence {
         let top_line = format!(
             "{}{}{}{}{}",
             tl,
-            std::iter::repeat(h)
-                .take(title_padding_left)
-                .collect::<String>(),
+            std::iter::repeat_n(h, title_padding_left).collect::<String>(),
             title,
-            std::iter::repeat(h)
-                .take(title_padding_right)
-                .collect::<String>(),
+            std::iter::repeat_n(h, title_padding_right).collect::<String>(),
             tr
         );
 
@@ -529,9 +520,7 @@ impl ShutdownSequence {
             "{} {}{} {}",
             v,
             content,
-            std::iter::repeat(' ')
-                .take(content_padding)
-                .collect::<String>(),
+            " ".repeat(content_padding),
             v
         );
 
@@ -575,8 +564,7 @@ impl ShutdownSequence {
 
         if self.ctx.supports_color() {
             eprint!(
-                "\r\x1b[{}m[{}] Waiting for {} job{} to complete ({}s remaining)...\x1b[0m\x1b[K",
-                "33", // Yellow
+                "\r\x1b[33m[{}] Waiting for {} job{} to complete ({}s remaining)...\x1b[0m\x1b[K",
                 timestamp,
                 remaining_jobs,
                 if remaining_jobs == 1 { "" } else { "s" },
@@ -758,8 +746,10 @@ mod tests {
     #[test]
     fn test_session_stats_bytes_display() {
         // GB
-        let mut stats = SessionStats::default();
-        stats.bytes_transferred = 2_500_000_000;
+        let mut stats = SessionStats {
+            bytes_transferred: 2_500_000_000,
+            ..Default::default()
+        };
         assert!(stats.bytes_display().contains("GB"));
 
         // MB

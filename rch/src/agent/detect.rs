@@ -49,12 +49,12 @@ fn detect_claude_code() -> Result<Option<DetectedAgent>> {
     }
 
     // Check for config directory
-    if let Some(config_path) = AgentKind::ClaudeCode.default_config_path() {
-        if config_path.parent().map(|p| p.exists()).unwrap_or(false) {
-            let agent = DetectedAgent::new(AgentKind::ClaudeCode)
-                .with_detection_method(DetectionMethod::ConfigFile);
-            return Ok(Some(agent));
-        }
+    if let Some(config_path) = AgentKind::ClaudeCode.default_config_path()
+        && config_path.parent().map(|p| p.exists()).unwrap_or(false)
+    {
+        let agent = DetectedAgent::new(AgentKind::ClaudeCode)
+            .with_detection_method(DetectionMethod::ConfigFile);
+        return Ok(Some(agent));
     }
 
     Ok(None)
@@ -71,12 +71,12 @@ fn detect_gemini_cli() -> Result<Option<DetectedAgent>> {
     }
 
     // Check for config directory
-    if let Some(config_path) = AgentKind::GeminiCli.default_config_path() {
-        if config_path.parent().map(|p| p.exists()).unwrap_or(false) {
-            let agent = DetectedAgent::new(AgentKind::GeminiCli)
-                .with_detection_method(DetectionMethod::ConfigFile);
-            return Ok(Some(agent));
-        }
+    if let Some(config_path) = AgentKind::GeminiCli.default_config_path()
+        && config_path.parent().map(|p| p.exists()).unwrap_or(false)
+    {
+        let agent = DetectedAgent::new(AgentKind::GeminiCli)
+            .with_detection_method(DetectionMethod::ConfigFile);
+        return Ok(Some(agent));
     }
 
     Ok(None)
@@ -93,12 +93,12 @@ fn detect_codex_cli() -> Result<Option<DetectedAgent>> {
     }
 
     // Check for config directory
-    if let Some(config_path) = AgentKind::CodexCli.default_config_path() {
-        if config_path.parent().map(|p| p.exists()).unwrap_or(false) {
-            let agent = DetectedAgent::new(AgentKind::CodexCli)
-                .with_detection_method(DetectionMethod::ConfigFile);
-            return Ok(Some(agent));
-        }
+    if let Some(config_path) = AgentKind::CodexCli.default_config_path()
+        && config_path.parent().map(|p| p.exists()).unwrap_or(false)
+    {
+        let agent = DetectedAgent::new(AgentKind::CodexCli)
+            .with_detection_method(DetectionMethod::ConfigFile);
+        return Ok(Some(agent));
     }
 
     Ok(None)
@@ -107,12 +107,10 @@ fn detect_codex_cli() -> Result<Option<DetectedAgent>> {
 /// Detect Cursor installation.
 fn detect_cursor() -> Result<Option<DetectedAgent>> {
     // Check for Cursor config directory
-    if let Some(config_path) = AgentKind::Cursor.default_config_path() {
-        if config_path.exists() {
-            let agent = DetectedAgent::new(AgentKind::Cursor)
-                .with_detection_method(DetectionMethod::ConfigFile);
-            return Ok(Some(agent));
-        }
+    if let Some(config_path) = AgentKind::Cursor.default_config_path() && config_path.exists() {
+        let agent = DetectedAgent::new(AgentKind::Cursor)
+            .with_detection_method(DetectionMethod::ConfigFile);
+        return Ok(Some(agent));
     }
 
     // Check common installation paths
@@ -135,12 +133,11 @@ fn detect_cursor() -> Result<Option<DetectedAgent>> {
 /// Detect Continue.dev installation.
 fn detect_continue_dev() -> Result<Option<DetectedAgent>> {
     // Check for Continue config directory
-    if let Some(config_path) = AgentKind::ContinueDev.default_config_path() {
-        if config_path.exists() {
-            let agent = DetectedAgent::new(AgentKind::ContinueDev)
-                .with_detection_method(DetectionMethod::ConfigFile);
-            return Ok(Some(agent));
-        }
+    if let Some(config_path) = AgentKind::ContinueDev.default_config_path() && config_path.exists()
+    {
+        let agent = DetectedAgent::new(AgentKind::ContinueDev)
+            .with_detection_method(DetectionMethod::ConfigFile);
+        return Ok(Some(agent));
     }
 
     Ok(None)
@@ -149,12 +146,10 @@ fn detect_continue_dev() -> Result<Option<DetectedAgent>> {
 /// Detect Windsurf installation.
 fn detect_windsurf() -> Result<Option<DetectedAgent>> {
     // Check for Windsurf config directory
-    if let Some(config_path) = AgentKind::Windsurf.default_config_path() {
-        if config_path.exists() {
-            let agent = DetectedAgent::new(AgentKind::Windsurf)
-                .with_detection_method(DetectionMethod::ConfigFile);
-            return Ok(Some(agent));
-        }
+    if let Some(config_path) = AgentKind::Windsurf.default_config_path() && config_path.exists() {
+        let agent = DetectedAgent::new(AgentKind::Windsurf)
+            .with_detection_method(DetectionMethod::ConfigFile);
+        return Ok(Some(agent));
     }
 
     Ok(None)
@@ -171,12 +166,10 @@ fn detect_aider() -> Result<Option<DetectedAgent>> {
     }
 
     // Check for config file
-    if let Some(config_path) = AgentKind::Aider.default_config_path() {
-        if config_path.exists() {
-            let agent = DetectedAgent::new(AgentKind::Aider)
-                .with_detection_method(DetectionMethod::ConfigFile);
-            return Ok(Some(agent));
-        }
+    if let Some(config_path) = AgentKind::Aider.default_config_path() && config_path.exists() {
+        let agent = DetectedAgent::new(AgentKind::Aider)
+            .with_detection_method(DetectionMethod::ConfigFile);
+        return Ok(Some(agent));
     }
 
     Ok(None)

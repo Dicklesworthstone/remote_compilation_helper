@@ -143,10 +143,10 @@ impl TelemetryStore {
 
     /// Fetch aggregate test run stats.
     pub fn test_run_stats(&self) -> TestRunStats {
-        if let Some(storage) = self.storage.as_ref() {
-            if let Ok(stats) = storage.test_run_stats() {
-                return stats;
-            }
+        if let Some(storage) = self.storage.as_ref()
+            && let Ok(stats) = storage.test_run_stats()
+        {
+            return stats;
         }
 
         let test_runs = self.test_runs.read().unwrap();

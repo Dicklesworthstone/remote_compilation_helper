@@ -210,10 +210,8 @@ impl TestChangeGuard {
 
 impl Drop for TestChangeGuard {
     fn drop(&mut self) {
-        if self.applied {
-            if let Err(e) = self.change.revert() {
-                error!("Failed to revert test change: {}", e);
-            }
+        if self.applied && let Err(e) = self.change.revert() {
+            error!("Failed to revert test change: {}", e);
         }
     }
 }

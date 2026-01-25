@@ -180,7 +180,7 @@ mod tests {
         let keys: Vec<_> = loaded.iter().map(|(k, _)| k.as_str()).collect();
         assert!(keys.contains(&"RCH_LOG_LEVEL"));
         assert!(keys.contains(&"RCH_ENABLED"));
-        assert!(!keys.iter().any(|k| *k == "OTHER_VAR"));
+        assert!(!keys.contains(&"OTHER_VAR"));
 
         // Clean up
         remove_env("RCH_LOG_LEVEL");
