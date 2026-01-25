@@ -40,4 +40,4 @@ pub use protocol::{TestRunRecord, TestRunStats};
 pub use speedscore::{
     BenchmarkResults, SPEEDSCORE_VERSION, SpeedScore, SpeedScoreWeights, calculate_speedscore,
 };
-pub use storage::{MaintenanceStats, SpeedScoreHistoryPage, TelemetryStorage};
+pub use storage::{MaintenanceStats, SpeedScoreHistoryPage, StorageStats, TelemetryStorage};

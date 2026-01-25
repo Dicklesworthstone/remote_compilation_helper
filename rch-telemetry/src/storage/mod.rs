@@ -55,8 +55,19 @@ impl TelemetryStorage {
 
         let conn = Connection::open(path)
             .with_context(|| format!("Failed to open telemetry database at {:?}", path))?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
-            .context("Failed to configure SQLite WAL mode")?;
+
+        // Configure SQLite for optimal performance and reliability
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA synchronous=NORMAL;
+             PRAGMA wal_autocheckpoint=1000;
+             PRAGMA foreign_keys=ON;",
+        )
+        .context("Failed to configure SQLite WAL mode")?;
+
+        // Set busy timeout for concurrent access (5 seconds)
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .context("Failed to set SQLite busy timeout")?;
 
         let storage = Self {
             conn: Mutex::new(conn),
@@ -274,11 +285,12 @@ impl TelemetryStorage {
         let conn = self.conn.lock().expect("telemetry db lock");
         let since_ts = since.timestamp();
 
-        let total: u64 = conn.query_row(
+        let total: i64 = conn.query_row(
             "SELECT COUNT(*) FROM speedscore_history WHERE worker_id = ?1 AND measured_at >= ?2",
             params![worker_id, since_ts],
             |row| row.get(0),
         )?;
+        let total = total as u64;
 
         let mut stmt = conn.prepare_cached(
             "SELECT raw_results FROM speedscore_history
@@ -423,6 +435,58 @@ impl TelemetryStorage {
         conn.execute_batch("VACUUM")?;
         Ok(true)
     }
+
+    /// Check database integrity using SQLite's built-in integrity check.
+    /// Returns Ok(()) if the database is healthy, or an error with details.
+    pub fn integrity_check(&self) -> Result<()> {
+        let conn = self.conn.lock().expect("telemetry db lock");
+        let result: String = conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+
+        if result == "ok" {
+            Ok(())
+        } else {
+            anyhow::bail!("Database integrity check failed: {}", result)
+        }
+    }
+
+    /// Get database statistics for diagnostics.
+    pub fn stats(&self) -> Result<StorageStats> {
+        let conn = self.conn.lock().expect("telemetry db lock");
+
+        let telemetry_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM telemetry_snapshots", [], |row| row.get(0))?;
+        let hourly_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM telemetry_hourly", [], |row| row.get(0))?;
+        let speedscore_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM speedscore_history", [], |row| row.get(0))?;
+        let test_run_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM test_runs", [], |row| row.get(0))?;
+
+        let db_size_bytes = self
+            .db_path
+            .as_ref()
+            .and_then(|p| std::fs::metadata(p).ok())
+            .map(|m| m.len())
+            .unwrap_or(0);
+
+        Ok(StorageStats {
+            telemetry_snapshots: telemetry_count as u64,
+            hourly_aggregates: hourly_count as u64,
+            speedscore_entries: speedscore_count as u64,
+            test_runs: test_run_count as u64,
+            db_size_bytes,
+        })
+    }
+}
+
+/// Database statistics for diagnostics.
+#[derive(Debug, Clone)]
+pub struct StorageStats {
+    pub telemetry_snapshots: u64,
+    pub hourly_aggregates: u64,
+    pub speedscore_entries: u64,
+    pub test_runs: u64,
+    pub db_size_bytes: u64,
 }
 
 #[cfg(test)]

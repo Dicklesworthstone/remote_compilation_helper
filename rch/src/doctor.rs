@@ -6,7 +6,9 @@ use crate::commands::{config_dir, load_workers_from_config};
 use crate::ui::context::OutputContext;
 use crate::ui::theme::StatusIndicator;
 use anyhow::Result;
+use directories::ProjectDirs;
 use rch_common::ApiResponse;
+use rch_telemetry::TelemetryStorage;
 use serde::Serialize;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -109,6 +111,7 @@ pub async fn run_doctor(ctx: &OutputContext, options: DoctorOptions) -> Result<(
     check_daemon(&mut checks, ctx, &options);
     check_hooks(&mut checks, ctx, &options);
     check_workers(&mut checks, ctx, &options).await;
+    check_telemetry_database(&mut checks, ctx, &options);
 
     // Calculate summary
     let summary = DoctorSummary {
@@ -1146,6 +1149,129 @@ async fn check_workers(
             "  {}",
             style.muted("(use --verbose to probe worker connectivity)")
         );
+    }
+
+    if !ctx.is_json() {
+        println!();
+    }
+}
+
+// =============================================================================
+// Telemetry Database Checks
+// =============================================================================
+
+fn check_telemetry_database(
+    checks: &mut Vec<CheckResult>,
+    ctx: &OutputContext,
+    options: &DoctorOptions,
+) {
+    let style = ctx.theme();
+
+    if !ctx.is_json() {
+        println!("{}", style.highlight("Telemetry Database"));
+        println!();
+    }
+
+    // Get the default telemetry database path
+    let db_path = match ProjectDirs::from("com", "rch", "rch") {
+        Some(dirs) => dirs.data_local_dir().join("telemetry").join("telemetry.db"),
+        None => {
+            let result = CheckResult {
+                category: "telemetry".to_string(),
+                name: "telemetry_database".to_string(),
+                status: CheckStatus::Skipped,
+                message: "Could not determine telemetry database path".to_string(),
+                details: None,
+                suggestion: None,
+                fixable: false,
+            };
+            print_check_result(&result, ctx);
+            checks.push(result);
+            return;
+        }
+    };
+
+    // Check if database file exists
+    if !db_path.exists() {
+        let result = CheckResult {
+            category: "telemetry".to_string(),
+            name: "telemetry_database".to_string(),
+            status: CheckStatus::Warning,
+            message: "Telemetry database does not exist yet".to_string(),
+            details: Some(db_path.display().to_string()),
+            suggestion: Some("Database will be created when daemon starts".to_string()),
+            fixable: false,
+        };
+        print_check_result(&result, ctx);
+        checks.push(result);
+        return;
+    }
+
+    // Try to open and check the database
+    match TelemetryStorage::new(&db_path, 30, 24, 365, 100) {
+        Ok(storage) => {
+            // Run integrity check
+            match storage.integrity_check() {
+                Ok(()) => {
+                    // Get stats if verbose
+                    let details = if options.verbose {
+                        storage.stats().ok().map(|s| {
+                            format!(
+                                "Snapshots: {}, Aggregates: {}, SpeedScores: {}, Tests: {}, Size: {} KB",
+                                s.telemetry_snapshots,
+                                s.hourly_aggregates,
+                                s.speedscore_entries,
+                                s.test_runs,
+                                s.db_size_bytes / 1024
+                            )
+                        })
+                    } else {
+                        Some(db_path.display().to_string())
+                    };
+
+                    let result = CheckResult {
+                        category: "telemetry".to_string(),
+                        name: "telemetry_database".to_string(),
+                        status: CheckStatus::Pass,
+                        message: "Telemetry database is healthy".to_string(),
+                        details,
+                        suggestion: None,
+                        fixable: false,
+                    };
+                    print_check_result(&result, ctx);
+                    checks.push(result);
+                }
+                Err(e) => {
+                    let result = CheckResult {
+                        category: "telemetry".to_string(),
+                        name: "telemetry_database".to_string(),
+                        status: CheckStatus::Fail,
+                        message: "Telemetry database integrity check failed".to_string(),
+                        details: Some(e.to_string()),
+                        suggestion: Some(
+                            "Database may be corrupted. Delete and let daemon recreate it"
+                                .to_string(),
+                        ),
+                        fixable: false,
+                    };
+                    print_check_result(&result, ctx);
+                    checks.push(result);
+                }
+            }
+        }
+        Err(e) => {
+            let result = CheckResult {
+                category: "telemetry".to_string(),
+                name: "telemetry_database".to_string(),
+                status: CheckStatus::Fail,
+                message: "Could not open telemetry database".to_string(),
+                details: Some(e.to_string()),
+                suggestion: Some("Check file permissions or delete and let daemon recreate it".to_string()),
+                fixable: false,
+            };
+            print_check_result(&result, ctx);
+            checks.push(result);
+        }
     }
 
     if !ctx.is_json() {
