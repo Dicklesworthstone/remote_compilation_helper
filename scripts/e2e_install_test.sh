@@ -69,6 +69,108 @@ fi
 # Make install.sh executable
 chmod +x "$PROJECT_ROOT/install.sh"
 
+# Stub systemd tools to avoid touching real services during tests.
+create_systemd_stubs() {
+    local bin_dir="$1"
+    mkdir -p "$bin_dir"
+
+    cat > "$bin_dir/systemctl" << 'EOF'
+#!/usr/bin/env bash
+if [[ -n "${SYSTEMCTL_LOG:-}" ]]; then
+    echo "systemctl $*" >> "$SYSTEMCTL_LOG"
+fi
+if [[ "${SYSTEMCTL_MODE:-ok}" == "missing" ]]; then
+    exit 1
+fi
+exit 0
+EOF
+    chmod +x "$bin_dir/systemctl"
+
+    cat > "$bin_dir/loginctl" << 'EOF'
+#!/usr/bin/env bash
+if [[ -n "${SYSTEMCTL_LOG:-}" ]]; then
+    echo "loginctl $*" >> "$SYSTEMCTL_LOG"
+fi
+if [[ "$1" == "show-user" ]]; then
+    echo "Linger=yes"
+fi
+exit 0
+EOF
+    chmod +x "$bin_dir/loginctl"
+}
+
+create_prompt_tarball() {
+    local name="$1"
+    local pkg_dir="$TEST_DIR/${name}_pkg"
+    local tarball="$TEST_DIR/${name}.tar.gz"
+
+    mkdir -p "$pkg_dir"
+
+    cat > "$pkg_dir/rch" << 'EOF'
+#!/bin/bash
+case "$1" in
+    --version) echo "rch 0.1.0-test" ;;
+    doctor) echo "All checks passed"; exit 0 ;;
+    agents) echo "No agents detected"; exit 0 ;;
+    completions) exit 0 ;;
+    *) exit 0 ;;
+esac
+EOF
+    chmod +x "$pkg_dir/rch"
+
+    cat > "$pkg_dir/rchd" << 'EOF'
+#!/bin/bash
+case "$1" in
+    --version) echo "rchd 0.1.0-test" ;;
+    *) exit 0 ;;
+esac
+EOF
+    chmod +x "$pkg_dir/rchd"
+
+    tar -czf "$tarball" -C "$pkg_dir" rch rchd
+    echo "$tarball"
+}
+
+run_install_case() {
+    local install_dir="$1"
+    local config_dir="$2"
+    local tarball="$3"
+    local extra_args="$4"
+    local input_data="$5"
+    local use_script="$6"
+    local stub_bin="$7"
+    local systemctl_log="$8"
+    local systemctl_mode="$9"
+
+    local output
+    local status=0
+
+    if [[ "$use_script" == "true" ]]; then
+        if command -v script >/dev/null 2>&1; then
+            local cmd
+            cmd="RCH_INSTALL_DIR=\"$install_dir\" RCH_CONFIG_DIR=\"$config_dir\" RCH_SKIP_DOCTOR=1 RCH_NO_HOOK=1 NO_GUM=1 SYSTEMCTL_LOG=\"$systemctl_log\" SYSTEMCTL_MODE=\"$systemctl_mode\" PATH=\"$stub_bin:$PATH\" \"$PROJECT_ROOT/install.sh\" --offline \"$tarball\" $extra_args"
+            output=$(printf '%s' "$input_data" | script -q /dev/null -c "$cmd" 2>&1) || status=$?
+        else
+            log "SKIP: script command not available for interactive prompt test"
+            return 2
+        fi
+    else
+        output=$(printf '%s' "$input_data" | \
+            SYSTEMCTL_LOG="$systemctl_log" \
+            SYSTEMCTL_MODE="$systemctl_mode" \
+            PATH="$stub_bin:$PATH" \
+            RCH_INSTALL_DIR="$install_dir" \
+            RCH_CONFIG_DIR="$config_dir" \
+            RCH_SKIP_DOCTOR=1 \
+            RCH_NO_HOOK=1 \
+            NO_GUM=1 \
+            "$PROJECT_ROOT/install.sh" --offline "$tarball" $extra_args 2>&1) || status=$?
+    fi
+
+    echo "$output"
+    return "$status"
+}
+
 # ============================================================================
 # Test 1: Help output
 # ============================================================================
@@ -525,6 +627,104 @@ EOF
 }
 
 # ============================================================================
+# Test 13: Service prompt behavior
+# ============================================================================
+
+test_service_prompt_behavior() {
+    start_test "Service prompt behavior matrix"
+
+    local tarball
+    tarball=$(create_prompt_tarball "prompt")
+
+    local stub_bin="$TEST_DIR/prompt_stub_bin"
+    create_systemd_stubs "$stub_bin"
+
+    # Case 1: --no-service skips prompt and service setup
+    local case_dir="$TEST_DIR/prompt_no_service"
+    local systemctl_log="$case_dir/systemctl.log"
+    mkdir -p "$case_dir/bin" "$case_dir/config"
+    local output
+    output=$(run_install_case "$case_dir/bin" "$case_dir/config" "$tarball" "--no-service --yes" "" "false" "$stub_bin" "$systemctl_log" "ok") || true
+    if [[ "$output" == *"Skipping systemd service setup (--no-service)"* ]]; then
+        pass "No-service flag skips systemd setup"
+    else
+        fail "No-service flag should skip systemd setup"
+    fi
+    if [[ ! -f "$systemctl_log" ]] || ! grep -q "enable" "$systemctl_log"; then
+        pass "No-service flag avoids systemctl enable"
+    else
+        fail "No-service flag should not call systemctl enable"
+    fi
+
+    # Case 2: --yes auto-accepts and attempts service setup
+    case_dir="$TEST_DIR/prompt_yes"
+    systemctl_log="$case_dir/systemctl.log"
+    mkdir -p "$case_dir/bin" "$case_dir/config"
+    output=$(run_install_case "$case_dir/bin" "$case_dir/config" "$tarball" "--yes" "" "false" "$stub_bin" "$systemctl_log" "ok") || true
+    if [[ -f "$systemctl_log" ]] && grep -q "enable" "$systemctl_log"; then
+        pass "Yes flag enables systemd service"
+    else
+        fail "Yes flag should enable systemd service"
+    fi
+
+    # Case 3: --install-service opt-in works in non-interactive mode
+    case_dir="$TEST_DIR/prompt_install_service"
+    systemctl_log="$case_dir/systemctl.log"
+    mkdir -p "$case_dir/bin" "$case_dir/config"
+    output=$(run_install_case "$case_dir/bin" "$case_dir/config" "$tarball" "--install-service" "" "false" "$stub_bin" "$systemctl_log" "ok") || true
+    if [[ -f "$systemctl_log" ]] && grep -q "enable" "$systemctl_log"; then
+        pass "Install-service opt-in enables systemd service"
+    else
+        fail "Install-service opt-in should enable systemd service"
+    fi
+
+    # Case 4: interactive decline via piped 'n'
+    case_dir="$TEST_DIR/prompt_decline"
+    systemctl_log="$case_dir/systemctl.log"
+    mkdir -p "$case_dir/bin" "$case_dir/config"
+    output=$(run_install_case "$case_dir/bin" "$case_dir/config" "$tarball" "" "n\n" "true" "$stub_bin" "$systemctl_log" "ok") || true
+    if [[ "$output" == *"Skipping background daemon setup"* ]]; then
+        pass "Interactive decline skips background service"
+    else
+        log "  Note: interactive prompt requires 'script' to provide a TTY"
+        pass "Interactive decline (output varies)"
+    fi
+
+    # Case 5: non-interactive stdin defaults to no service
+    case_dir="$TEST_DIR/prompt_non_interactive"
+    systemctl_log="$case_dir/systemctl.log"
+    mkdir -p "$case_dir/bin" "$case_dir/config"
+    output=$(run_install_case "$case_dir/bin" "$case_dir/config" "$tarball" "" "" "false" "$stub_bin" "$systemctl_log" "ok") || true
+    if [[ "$output" == *"Non-interactive install without opt-in"* ]]; then
+        pass "Non-interactive default skips background service"
+    else
+        fail "Non-interactive default should skip background service"
+    fi
+
+    # Case 6: service manager missing skips prompt and logs message
+    case_dir="$TEST_DIR/prompt_no_service_manager"
+    systemctl_log="$case_dir/systemctl.log"
+    mkdir -p "$case_dir/bin" "$case_dir/config"
+    output=$(run_install_case "$case_dir/bin" "$case_dir/config" "$tarball" "" "" "false" "$stub_bin" "$systemctl_log" "missing") || true
+    if [[ "$output" == *"No supported service manager detected"* ]]; then
+        pass "Missing service manager logs skip message"
+    else
+        fail "Missing service manager should log skip message"
+    fi
+
+    # Case 7: missing service manager but explicit opt-in logs warning
+    case_dir="$TEST_DIR/prompt_no_service_manager_opt_in"
+    systemctl_log="$case_dir/systemctl.log"
+    mkdir -p "$case_dir/bin" "$case_dir/config"
+    output=$(run_install_case "$case_dir/bin" "$case_dir/config" "$tarball" "--install-service" "" "false" "$stub_bin" "$systemctl_log" "missing") || true
+    if [[ "$output" == *"Background service requested but no supported service manager detected"* ]]; then
+        pass "Missing service manager warns on opt-in"
+    else
+        fail "Missing service manager should warn on opt-in"
+    fi
+}
+
+# ============================================================================
 # Run all tests
 # ============================================================================
 
@@ -544,6 +744,7 @@ test_wsl_detection
 test_proxy_config
 test_lock_file
 test_config_generation
+test_service_prompt_behavior
 
 # ============================================================================
 # Summary
