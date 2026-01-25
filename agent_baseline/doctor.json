@@ -1,0 +1,121 @@
+{
+  "version": "1",
+  "command": "doctor",
+  "success": true,
+  "data": {
+    "checks": [
+      {
+        "category": "prerequisites",
+        "name": "rsync",
+        "status": "pass",
+        "message": "File synchronization is installed",
+        "details": "rsync  version 3.4.1  protocol version 32",
+        "fixable": false
+      },
+      {
+        "category": "prerequisites",
+        "name": "zstd",
+        "status": "pass",
+        "message": "Compression tool is installed",
+        "details": "*** Zstandard CLI (64-bit) v1.5.7, by Yann Collet ***",
+        "fixable": false
+      },
+      {
+        "category": "prerequisites",
+        "name": "ssh",
+        "status": "pass",
+        "message": "SSH client is installed",
+        "details": "",
+        "fixable": false
+      },
+      {
+        "category": "prerequisites",
+        "name": "rustup",
+        "status": "pass",
+        "message": "Rust toolchain manager is installed",
+        "details": "rustup 1.28.2 (e4f3ad6f8 2025-04-28)",
+        "fixable": false
+      },
+      {
+        "category": "prerequisites",
+        "name": "cargo",
+        "status": "pass",
+        "message": "Rust build tool is installed",
+        "details": "cargo 1.85.0-nightly (c86f4b3a1 2024-12-24)",
+        "fixable": false
+      },
+      {
+        "category": "configuration",
+        "name": "config_directory",
+        "status": "pass",
+        "message": "Config directory exists",
+        "details": "/home/ubuntu/.config/rch",
+        "fixable": false
+      },
+      {
+        "category": "configuration",
+        "name": "config.toml",
+        "status": "pass",
+        "message": "config.toml is valid",
+        "details": "/home/ubuntu/.config/rch/config.toml",
+        "fixable": false
+      },
+      {
+        "category": "configuration",
+        "name": "workers.toml",
+        "status": "pass",
+        "message": "workers.toml is valid (4 workers)",
+        "details": "/home/ubuntu/.config/rch/workers.toml",
+        "fixable": false
+      },
+      {
+        "category": "ssh",
+        "name": "id_ed25519",
+        "status": "pass",
+        "message": "SSH key exists with correct permissions (0600)",
+        "details": "/home/ubuntu/.ssh/id_ed25519",
+        "fixable": false
+      },
+      {
+        "category": "ssh",
+        "name": "ssh_config",
+        "status": "pass",
+        "message": "SSH config file exists",
+        "details": "/home/ubuntu/.ssh/config",
+        "fixable": false
+      },
+      {
+        "category": "daemon",
+        "name": "daemon_socket",
+        "status": "warning",
+        "message": "Daemon is not running",
+        "details": "/tmp/rch.sock",
+        "suggestion": "Start daemon with: rch daemon start",
+        "fixable": false
+      },
+      {
+        "category": "hooks",
+        "name": "claude_code_hook",
+        "status": "pass",
+        "message": "Claude Code PreToolUse hook is installed",
+        "details": "/home/ubuntu/.claude/settings.json",
+        "fixable": false
+      },
+      {
+        "category": "workers",
+        "name": "worker_count",
+        "status": "pass",
+        "message": "4 worker(s) configured",
+        "details": "css, csd, fmd, yto",
+        "fixable": false
+      }
+    ],
+    "summary": {
+      "total": 13,
+      "passed": 12,
+      "warnings": 1,
+      "failed": 0
+    },
+    "fixes_applied": []
+  }
+}

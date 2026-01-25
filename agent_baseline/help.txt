@@ -1,0 +1,83 @@
+Remote Compilation Helper (RCH) transparently offloads compilation commands to remote workers. When invoked without a subcommand, RCH runs as a Claude Code PreToolUse hook, intercepting build commands and routing them to faster remote machines.
+
+Usage: rch [OPTIONS] [COMMAND]
+
+Commands:
+  daemon       Start, stop, and manage the local RCH daemon
+  workers      Manage remote compilation workers
+  status       Show system status overview
+  config       View and manage RCH configuration
+  hook         Install and manage the Claude Code PreToolUse hook
+  agents       Detect and manage AI coding agents (Claude Code, Gemini CLI, etc.)
+  completions  Generate and install shell completion scripts
+  doctor       Run comprehensive diagnostics and optionally auto-fix issues
+  update       Update RCH binaries on local machine and/or workers
+  help         Print this message or the help of the given subcommand(s)
+
+Options:
+  -v, --verbose
+          Enable verbose output
+
+  -q, --quiet
+          Suppress non-error output
+
+      --json
+          Output as JSON for machine parsing
+
+      --color <COLOR>
+          Color output mode: auto, always, never
+          
+          [default: auto]
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+
+EXAMPLES:
+    # Quick start - install hook and start daemon
+    rch hook install && rch daemon start
+
+    # Check system status
+    rch status --workers --jobs
+
+    # Probe worker connectivity
+    rch workers probe --all
+
+    # Show where config values come from
+    rch config show --sources
+
+    # Test hook with a sample cargo build
+    rch hook test
+
+    # Generate shell completions
+    rch completions bash > ~/.local/share/bash-completion/completions/rch
+
+HOOK MODE:
+    When invoked without arguments, RCH acts as a PreToolUse hook for Claude Code.
+    It reads JSON from stdin, decides whether to intercept the command, and writes
+    JSON to stdout. This is automatic when installed via 'rch hook install'.
+
+ENVIRONMENT VARIABLES:
+    RCH_PROFILE           Profile to use: dev, prod, test (sets defaults below)
+    RCH_LOG_LEVEL         Logging level: trace, debug, info, warn, error, off
+    RCH_LOG_FORMAT        Log format: pretty, json, compact
+    RCH_DAEMON_SOCKET     Path to daemon Unix socket
+    RCH_DAEMON_TIMEOUT_MS Timeout for daemon communication (default: 5000)
+    RCH_SSH_KEY           Path to SSH private key for worker connections
+    RCH_TRANSFER_ZSTD_LEVEL  Compression level 1-22 (default: 3)
+    RCH_MOCK_SSH          Enable mock SSH for testing (set to 1)
+    RCH_TEST_MODE         Enable test mode (set to 1)
+    RCH_ENABLE_METRICS    Enable metrics collection (set to true)
+
+CONFIG PRECEDENCE (highest to lowest):
+    1. Command-line arguments
+    2. Environment variables
+    3. Profile defaults (RCH_PROFILE)
+    4. .env / .rch.env files
+    5. Project config (.rch/config.toml)
+    6. User config (~/.config/rch/config.toml)
+    7. Built-in defaults
+
+For more information, see: https://github.com/anthropics/rch
