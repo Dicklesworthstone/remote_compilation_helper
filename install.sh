@@ -9,7 +9,7 @@
 #   2. Worker:      Install just rch-wkr on current machine
 #
 # Usage:
-#   bash install.sh                      # Install + setup systemd/launchd service
+#   bash install.sh                      # Install + optionally enable background service
 #   bash install.sh --local              # Same as above (default mode)
 #   bash install.sh --worker             # Worker-only install (no daemon)
 #   bash install.sh --from-source        # Build from source
@@ -34,7 +34,8 @@ set -euo pipefail
 # Configuration
 # ============================================================================
 
-VERSION="0.1.0"
+INSTALLER_VERSION="0.1.0"
+VERSION=""  # Set dynamically based on install mode
 REPO_URL="https://github.com/Dicklesworthstone/remote_compilation_helper"
 GITHUB_REPO="Dicklesworthstone/remote_compilation_helper"
 GITHUB_API="https://api.github.com/repos/${GITHUB_REPO}"
@@ -218,17 +219,31 @@ draw_box() {
     echo ""
 }
 
-# Header display
+# Header display with full branding
 show_header() {
+    echo ""
     if $USE_GUM; then
         gum style \
             --border double \
             --border-foreground 212 \
             --padding "1 3" \
-            "RCH Installer v$VERSION" \
+            --align center \
+            "⚡ RCH Installer v$VERSION" \
+            "" \
             "Remote Compilation Helper" \
             "Transparent compilation offloading for AI agents"
     else
+        local header_color="1;35"  # Bold magenta
+        echo -e "\033[${header_color}m"
+        cat << 'BANNER'
+    ██████╗  ██████╗██╗  ██╗
+    ██╔══██╗██╔════╝██║  ██║
+    ██████╔╝██║     ███████║
+    ██╔══██╗██║     ██╔══██║
+    ██║  ██║╚██████╗██║  ██║
+    ╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝
+BANNER
+        echo -e "\033[0m"
         draw_box "1;35" \
             "RCH Installer v$VERSION" \
             "Remote Compilation Helper" \
@@ -564,6 +579,78 @@ verify_checksum() {
     fi
 
     success "Checksum verified"
+}
+
+# ============================================================================
+# Version Detection
+# ============================================================================
+
+detect_target_version() {
+    # If VERSION already set (e.g., from environment), use it
+    if [[ -n "${VERSION:-}" ]]; then
+        return 0
+    fi
+
+    # If building from source, read from Cargo.toml
+    if [[ "${FROM_SOURCE:-false}" == "true" ]] || \
+       { [[ -f "Cargo.toml" ]] && grep -q "remote_compilation_helper" Cargo.toml 2>/dev/null; }; then
+        local cargo_version=""
+
+        # Check if this is a Cargo workspace (root Cargo.toml has [workspace])
+        # In workspaces, version is often defined in [workspace.package] section
+        if [[ -f "Cargo.toml" ]] && grep -q '^\[workspace\]' Cargo.toml 2>/dev/null; then
+            # Extract version from [workspace.package] section using awk
+            cargo_version=$(awk '
+                /^\[workspace\.package\]/ { in_section=1; next }
+                /^\[/ { in_section=0 }
+                in_section && /^version[[:space:]]*=[[:space:]]*"/ {
+                    gsub(/^version[[:space:]]*=[[:space:]]*"/, "")
+                    gsub(/".*$/, "")
+                    print
+                    exit
+                }
+            ' Cargo.toml)
+        fi
+
+        # If workspace extraction failed or not a workspace, try direct extraction
+        if [[ -z "$cargo_version" ]]; then
+            if [[ -f "rch/Cargo.toml" ]]; then
+                cargo_version=$(sed -n 's/^version = "\(.*\)"/\1/p' rch/Cargo.toml | head -1)
+            fi
+        fi
+
+        # Last resort: try root Cargo.toml with simple pattern
+        if [[ -z "$cargo_version" ]] && [[ -f "Cargo.toml" ]]; then
+            cargo_version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+        fi
+
+        if [[ -n "$cargo_version" ]]; then
+            VERSION="$cargo_version"
+            return 0
+        fi
+    fi
+
+    # If offline tarball, try to extract from filename
+    if [[ -n "${OFFLINE_TARBALL:-}" ]]; then
+        local tarball_version
+        tarball_version=$(echo "$OFFLINE_TARBALL" | sed -n 's/.*rch-v\?\([0-9][0-9.]*\).*/\1/p')
+        if [[ -n "$tarball_version" ]]; then
+            VERSION="$tarball_version"
+            return 0
+        fi
+    fi
+
+    # Try to fetch latest from GitHub (with timeout)
+    local latest
+    latest=$(curl -sL --connect-timeout 5 "${GITHUB_API}/releases/latest" 2>/dev/null | \
+             sed -n 's/.*"tag_name": *"v\?\([^"]*\)".*/\1/p' | head -1)
+    if [[ -n "$latest" ]]; then
+        VERSION="$latest"
+        return 0
+    fi
+
+    # Fallback to installer version
+    VERSION="$INSTALLER_VERSION"
 }
 
 # ============================================================================
@@ -974,6 +1061,34 @@ configure_hook_manual() {
 }
 
 # ============================================================================
+# Service Opt-In Prompt
+# ============================================================================
+
+maybe_prompt_service() {
+    if [[ "$MODE" == "worker" ]]; then
+        ENABLE_SERVICE="false"
+        return
+    fi
+
+    if [[ "${NO_SERVICE:-}" == "true" ]]; then
+        ENABLE_SERVICE="false"
+        return
+    fi
+
+    if [[ "${EASY_MODE:-}" == "true" ]] || [[ "${YES:-}" == "true" ]]; then
+        ENABLE_SERVICE="true"
+        return
+    fi
+
+    if confirm "Run rchd automatically in the background? (falls back to local if unavailable)"; then
+        ENABLE_SERVICE="true"
+    else
+        ENABLE_SERVICE="false"
+        info "Skipping background daemon setup (you can run 'rch daemon start' later)."
+    fi
+}
+
+# ============================================================================
 # Systemd/Launchd Service
 # ============================================================================
 
@@ -993,6 +1108,11 @@ setup_systemd_service() {
         return
     fi
 
+    if [[ "${ENABLE_SERVICE:-true}" != "true" ]]; then
+        info "Skipping systemd service setup (background daemon disabled)"
+        return
+    fi
+
     info "Setting up systemd service..."
 
     local service_file="$HOME/.config/systemd/user/rchd.service"
@@ -1001,7 +1121,8 @@ setup_systemd_service() {
     cat > "$service_file" << EOF
 [Unit]
 Description=RCH Remote Compilation Helper Daemon
-After=network.target
+After=network.target network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
@@ -1015,7 +1136,7 @@ WantedBy=default.target
 EOF
 
     systemctl --user daemon-reload
-    systemctl --user enable rchd.service
+    systemctl --user enable --now rchd.service || systemctl --user enable rchd.service
 
     success "Systemd service installed: rchd.service"
 
@@ -1036,16 +1157,8 @@ EOF
         fi
     fi
 
-    # Start or restart the service
-    if systemctl --user is-active rchd.service &>/dev/null; then
-        info "Restarting rchd service..."
-        if systemctl --user restart rchd.service; then
-            success "rchd service restarted"
-        else
-            warn "Could not restart rchd service"
-            info "Restart manually with: systemctl --user restart rchd"
-        fi
-    else
+    # Start or restart the service if it is not already running
+    if ! systemctl --user is-active rchd.service &>/dev/null; then
         info "Starting rchd service..."
         if systemctl --user start rchd.service; then
             success "rchd service started"
@@ -1056,6 +1169,7 @@ EOF
     fi
 
     info "Check status: systemctl --user status rchd"
+    info "Follow logs:  journalctl --user -u rchd -f"
 }
 
 setup_launchd_service() {
@@ -1070,6 +1184,11 @@ setup_launchd_service() {
     # Skip only if explicitly disabled
     if [[ "${NO_SERVICE:-}" == "true" ]]; then
         info "Skipping launchd service setup (--no-service)"
+        return
+    fi
+
+    if [[ "${ENABLE_SERVICE:-true}" != "true" ]]; then
+        info "Skipping launchd service setup (background daemon disabled)"
         return
     fi
 
@@ -1372,46 +1491,114 @@ print_summary() {
     echo ""
     if $USE_GUM; then
         gum style \
-            --border rounded \
+            --border double \
             --border-foreground 82 \
-            --padding "1 2" \
-            --foreground 82 \
-            "Installation Complete!"
+            --padding "1 3" \
+            --align center \
+            "✅ Installation Complete!"
     else
-        echo -e "${GREEN}${BOLD}Installation Complete!${NC}"
+        draw_box "1;32" \
+            "Installation Complete!" \
+            "" \
+            "RCH is ready to use"
     fi
     echo ""
-    echo "Installed to: $INSTALL_DIR"
-    echo "Config at:    $CONFIG_DIR"
+
+    # Installation details
+    if $USE_COLOR; then
+        echo -e "${BOLD}Installation Details:${NC}"
+    else
+        echo "Installation Details:"
+    fi
+    echo ""
+    echo "  📁 Binaries:    $INSTALL_DIR"
+    echo "  ⚙️  Config:      $CONFIG_DIR"
     echo ""
 
     if [[ "$MODE" == "worker" ]]; then
-        echo "Worker binary: $INSTALL_DIR/$WORKER_BIN"
+        echo "  🔧 Worker binary: $INSTALL_DIR/$WORKER_BIN"
     else
-        echo "Binaries:"
-        echo "  Hook:   $INSTALL_DIR/$HOOK_BIN"
-        echo "  Daemon: $INSTALL_DIR/$DAEMON_BIN"
+        echo "  📦 Installed:"
+        echo "      • rch     (hook CLI)"
+        echo "      • rchd    (daemon)"
         echo ""
-        if [[ "${NO_SERVICE:-}" != "true" ]]; then
+
+        if [[ "${ENABLE_SERVICE:-true}" == "true" ]] && [[ "${NO_SERVICE:-}" != "true" ]]; then
             if command_exists systemctl; then
-                echo "Service: rchd.service (systemd user service)"
-                echo "  Status:   systemctl --user status rchd"
-                echo "  Logs:     journalctl --user -u rchd -f"
-                echo "  Restart:  systemctl --user restart rchd"
+                echo "  🔄 Service: rchd.service (systemd)"
+                echo ""
+                if $USE_COLOR; then
+                    echo -e "  ${DIM}Commands:${NC}"
+                    echo -e "    ${CYAN}systemctl --user status rchd${NC}     # Check status"
+                    echo -e "    ${CYAN}journalctl --user -u rchd -f${NC}     # Follow logs"
+                    echo -e "    ${CYAN}systemctl --user restart rchd${NC}    # Restart"
+                else
+                    echo "  Commands:"
+                    echo "    systemctl --user status rchd     # Check status"
+                    echo "    journalctl --user -u rchd -f     # Follow logs"
+                    echo "    systemctl --user restart rchd    # Restart"
+                fi
             elif [[ "$(uname -s)" == "Darwin" ]]; then
-                echo "Service: com.rch.daemon (launchd)"
-                echo "  Status:   launchctl list | grep rch"
-                echo "  Logs:     tail -f $CONFIG_DIR/logs/daemon.log"
-                echo "  Restart:  launchctl stop com.rch.daemon && launchctl start com.rch.daemon"
+                echo "  🔄 Service: com.rch.daemon (launchd)"
+                echo ""
+                if $USE_COLOR; then
+                    echo -e "  ${DIM}Commands:${NC}"
+                    echo -e "    ${CYAN}launchctl list | grep rch${NC}        # Check status"
+                    echo -e "    ${CYAN}tail -f $CONFIG_DIR/logs/daemon.log${NC}"
+                else
+                    echo "  Commands:"
+                    echo "    launchctl list | grep rch        # Check status"
+                    echo "    tail -f $CONFIG_DIR/logs/daemon.log"
+                fi
             fi
             echo ""
+        else
+            echo "  🔄 Service: disabled"
+            echo "     Run 'rch daemon start' when ready"
+            echo ""
         fi
-        echo -e "${BOLD}Next steps:${NC}"
-        echo "1. Edit workers config: $CONFIG_DIR/workers.toml"
-        echo "2. Test the hook:       rch doctor"
-        echo "3. Probe workers:       rch workers probe --all"
+
+        # Next steps box
+        if $USE_GUM; then
+            gum style \
+                --border rounded \
+                --border-foreground 208 \
+                --padding "0 2" \
+                "Next Steps:" \
+                "" \
+                "1. Edit workers:   vim $CONFIG_DIR/workers.toml" \
+                "2. Run diagnostics: rch doctor" \
+                "3. Test workers:    rch workers probe --all"
+        else
+            draw_box "1;33" \
+                "Next Steps:" \
+                "" \
+                "1. Edit workers:    vim $CONFIG_DIR/workers.toml" \
+                "2. Run diagnostics: rch doctor" \
+                "3. Test workers:    rch workers probe --all"
+        fi
     fi
     echo ""
+
+    # Supported commands section
+    if [[ "$MODE" != "worker" ]]; then
+        if $USE_COLOR; then
+            echo -e "${BOLD}Supported Commands (auto-offloaded):${NC}"
+        else
+            echo "Supported Commands (auto-offloaded):"
+        fi
+        echo ""
+        echo "  🦀 Rust:    cargo build, cargo test, cargo check, rustc"
+        echo "  🍞 Bun:     bun test, bun typecheck"
+        echo "  🔨 C/C++:   gcc, g++, clang, make, cmake, ninja"
+        echo ""
+        if $USE_COLOR; then
+            echo -e "${DIM}Commands like 'cargo fmt', 'cargo install', 'ls' run locally.${NC}"
+        else
+            echo "Commands like 'cargo fmt', 'cargo install', 'ls' run locally."
+        fi
+        echo ""
+    fi
 }
 
 # ============================================================================
@@ -1448,10 +1635,10 @@ Environment:
   NO_PROXY             Hosts to bypass proxy
 
 Service Setup:
-  On Linux:  systemd user service is installed and started automatically.
-             Lingering is enabled for reboot persistence (requires sudo).
-  On macOS:  launchd service is installed and loaded automatically.
-             Service starts on login.
+  On Linux:  systemd user service is offered during install (auto-accept in --easy-mode/--yes).
+             Lingering is enabled for reboot persistence when possible (requires sudo).
+  On macOS:  launchd service is offered during install (auto-accept in --easy-mode/--yes).
+             Service starts on login when enabled.
 
 Examples:
   ./install.sh                         # Install locally (auto-detects source)
@@ -1477,6 +1664,7 @@ main() {
     VERIFY_ONLY="false"
     EASY_MODE="false"
     NO_SERVICE="false"
+    ENABLE_SERVICE="true"
     YES="false"
     OFFLINE_TARBALL=""
 
@@ -1544,6 +1732,10 @@ main() {
 
     # Setup UI
     setup_ui
+
+    # Detect target version (needed for header and upgrade banner)
+    detect_target_version
+
     show_header
 
     # Handle special modes
@@ -1586,6 +1778,7 @@ main() {
     if [[ "$MODE" == "local" ]]; then
         configure_claude_hook
         install_skill
+        maybe_prompt_service
         setup_systemd_service
         setup_launchd_service
     fi

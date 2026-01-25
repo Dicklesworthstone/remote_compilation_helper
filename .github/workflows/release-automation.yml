@@ -42,10 +42,25 @@ jobs:
       - name: Read version from Cargo.toml
         id: version
         run: |
-          # Try workspace Cargo.toml first, then rch/Cargo.toml
-          if grep -q '^\[workspace\]' Cargo.toml 2>/dev/null; then
+          # Extract version from workspace package section (handles version.workspace = true)
+          version=$(awk '
+            /^\[workspace\.package\]/ { in_section=1; next }
+            /^\[/ { in_section=0 }
+            in_section && /^version[[:space:]]*=[[:space:]]*"/ {
+              gsub(/^version[[:space:]]*=[[:space:]]*"/, "")
+              gsub(/".*$/, "")
+              print
+              exit
+            }
+          ' Cargo.toml)
+
+          # Fallback: try simple pattern in root Cargo.toml
+          if [[ -z "$version" ]]; then
             version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-          else
+          fi
+
+          # Last fallback: try rch/Cargo.toml
+          if [[ -z "$version" ]] && [[ -f "rch/Cargo.toml" ]]; then
             version=$(sed -n 's/^version = "\(.*\)"/\1/p' rch/Cargo.toml | head -1)
           fi
 

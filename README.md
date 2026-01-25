@@ -5,36 +5,20 @@
 </div>
 
 <div align="center">
+<h3>Quick Install</h3>
 
+```bash
+curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/remote_compilation_helper/main/install.sh?$(date +%s)" | bash -s -- --easy-mode
 ```
-     ╭──────────────────────────────────────────────────────╮
-     │          ╔═══════════════════════════════╗           │
-     │          ║  AGENT                        ║           │
-     │          ║  cargo build --release        ║           │
-     │          ╚═══════════════════════════════╝           │
-     │                        │                             │
-     │                        ▼                             │
-     │          ╔═══════════════════════════════╗           │
-     │          ║  rch hook                     ║           │
-     │          ║  (0.3ms decision)             ║           │
-     │          ╚═══════════════════════════════╝           │
-     │                        │                             │
-     │        ┌───────────────┴───────────────┐             │
-     │        ▼                               ▼             │
-     │   ┌─────────┐                   ┌─────────────┐      │
-     │   │ LOCAL   │                   │ REMOTE      │      │
-     │   │ 99% cmds│                   │ compilation │      │
-     │   │ (<0.1ms)│                   │ offloaded   │      │
-     │   └─────────┘                   └─────────────┘      │
-     │                                        │             │
-     │                        ┌───────────────┴───────────┐ │
-     │                        ▼               ▼           ▼ │
-     │                   ┌────────┐      ┌────────┐  ┌────────┐
-     │                   │worker-1│      │worker-2│  │worker-N│
-     │                   │32 cores│      │16 cores│  │24 cores│
-     │                   └────────┘      └────────┘  └────────┘
-     ╰──────────────────────────────────────────────────────╯
-```
+
+<p><em>Installs rch + rchd, configures the hook, and can optionally enable the background daemon. If rchd or workers are unavailable, RCH fails open to local builds.</em></p>
+</div>
+
+<div align="center">
+  <img src="rch_diagram.webp" alt="rch architecture diagram">
+</div>
+
+<div align="center">
 
 **Transparent compilation offloading for AI coding agents**
 
@@ -42,15 +26,6 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Rust](https://img.shields.io/badge/rust-nightly%202024-orange.svg)](https://www.rust-lang.org/)
 [![codecov](https://codecov.io/gh/Dicklesworthstone/remote_compilation_helper/graph/badge.svg)](https://codecov.io/gh/Dicklesworthstone/remote_compilation_helper)
-
-</div>
-
-<div align="center">
-<h3>Quick Install</h3>
-
-```bash
-cargo install --git https://github.com/Dicklesworthstone/remote_compilation_helper.git
-```
 
 </div>
 
