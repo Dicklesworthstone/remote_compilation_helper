@@ -281,6 +281,19 @@ jobs:
         with:
           subject-path: 'artifacts/*.tar.gz,artifacts/*.zip'
 
+      # Generate SBOM for supply chain transparency
+      - name: Install Syft
+        uses: anchore/sbom-action/download-syft@v0.18.0
+        with:
+          syft-version: v1.4.1
+
+      - name: Generate SBOM (SPDX)
+        run: |
+          syft dir:. -o spdx-json > artifacts/sbom.spdx.json
+          syft dir:. -o cyclonedx-json > artifacts/sbom.cdx.json
+          echo "Generated SBOMs:"
+          ls -la artifacts/sbom.*
+
       # Sigstore signing for additional verification
       - name: Install cosign
         uses: sigstore/cosign-installer@v3.7.0
@@ -603,6 +616,8 @@ jobs:
             artifacts/install.sh
             artifacts/install.ps1
             artifacts/skill.tar.gz
+            artifacts/sbom.spdx.json
+            artifacts/sbom.cdx.json
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

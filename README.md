@@ -714,6 +714,325 @@ MIT License. See [LICENSE](LICENSE) for details.
 
 ---
 
+---
+
+## Self-Update System
+
+RCH includes a built-in update mechanism that handles version checking, downloading, verification, and installation—all without requiring manual intervention.
+
+### Checking for Updates
+
+```bash
+# Check if an update is available
+rch update --check
+
+# Show detailed version information
+rch update --check --verbose
+```
+
+The update checker uses intelligent caching:
+- Version checks are cached for 24 hours to avoid hammering GitHub's API
+- Background threads warm the cache on startup without blocking your workflow
+- Set `RCH_NO_UPDATE_CHECK=1` to disable automatic checks entirely
+
+### Performing Updates
+
+```bash
+# Update to latest stable release
+rch update
+
+# Update to a specific version
+rch update --version 0.2.0
+
+# Update from beta/nightly channel
+rch update --channel beta
+```
+
+### Backup and Rollback
+
+Every update creates a backup of the current installation:
+
+```bash
+# List available backups
+rch update --list-backups
+
+# Rollback to previous version
+rch update --rollback
+
+# Rollback to specific version
+rch update --rollback --version 0.1.0
+```
+
+Backups are stored in `~/.local/share/rch/backups/` with JSON metadata files. Only the 3 most recent backups are retained to conserve disk space.
+
+### Update Verification
+
+Downloaded releases are verified using multiple mechanisms:
+- **SHA256 checksums**: Every release artifact has a corresponding `.sha256` file
+- **Sigstore signatures**: Artifacts are signed using keyless Sigstore/cosign
+- **SLSA provenance**: Level 3 supply chain attestation via GitHub Actions
+
+```bash
+# Verify a downloaded artifact manually
+cosign verify-blob --bundle rch-v0.2.0-linux.tar.gz.sigstore.json \
+  --certificate-identity-regexp=".*" \
+  --certificate-oidc-issuer-regexp=".*" \
+  rch-v0.2.0-linux.tar.gz
+```
+
+---
+
+## Algorithms and Design Principles
+
+### Worker Selection Algorithm
+
+When a compilation command is intercepted, RCH must quickly select the optimal worker. The selection algorithm considers multiple factors:
+
+```
+Score(worker) = SpeedScore × AvailabilityFactor × AffinityBonus × PriorityWeight
+
+Where:
+  SpeedScore        = Benchmark-derived CPU performance (0-100)
+  AvailabilityFactor = AvailableSlots / TotalSlots (0-1)
+  AffinityBonus     = 1.5 if worker has project cached, else 1.0
+  PriorityWeight    = ConfiguredPriority / 100 (0-1)
+```
+
+The daemon maintains real-time slot counts using atomic operations—no locks required. When a job starts, slots are decremented; when it completes, they're incremented back. This lock-free design allows concurrent worker selection without contention.
+
+### Transfer Optimization
+
+File transfers use rsync with carefully tuned parameters:
+
+```bash
+rsync -az --compress-level=3 \
+  --exclude='target/' \
+  --exclude='.git/objects/' \
+  --exclude='node_modules/' \
+  --partial --inplace \
+  --timeout=300 \
+  source/ worker:dest/
+```
+
+Key optimizations:
+- **zstd compression (level 3)**: Balances speed vs ratio—level 3 is ~400MB/s encoding
+- **Exclusion patterns**: Skip derived artifacts that will be regenerated
+- **Partial transfers**: Resume interrupted transfers instead of restarting
+- **In-place updates**: Modify files directly to reduce I/O operations
+
+For incremental builds (where worker already has an old project copy), rsync's delta algorithm transfers only changed blocks—typically <1% of total file size.
+
+### Connection Pooling
+
+SSH connections are expensive to establish (~200-500ms for handshake). RCH maintains a connection pool per worker:
+
+```
+ConnectionPool {
+  worker_id -> [Connection; max_connections]
+
+  get_connection():
+    if pool has idle connection:
+      return idle connection (reuse)
+    if pool.size < max_connections:
+      establish new connection
+      return new connection
+    else:
+      wait for connection to become available
+}
+```
+
+With SSH multiplexing enabled (`ControlMaster`), additional connections over an existing master are near-instant (~5ms).
+
+### Compilation Deduplication
+
+Multiple agents working in the same project may trigger identical builds simultaneously. RCH deduplicates these using broadcast channels:
+
+```
+InFlightCompilations {
+  key: (project_path, command_hash) -> broadcast::Sender<Result>
+}
+
+on_compilation_request(project, command):
+  key = (project, hash(command))
+
+  if key in in_flight:
+    # Another agent already running this exact build
+    return in_flight[key].subscribe().await
+
+  # First request—execute compilation
+  sender = broadcast::channel()
+  in_flight[key] = sender
+
+  result = execute_on_worker(project, command)
+  sender.send(result)
+
+  remove in_flight[key]
+  return result
+```
+
+When Agent A triggers `cargo build --release` and Agent B triggers the same command 2 seconds later, Agent B subscribes to A's result channel instead of starting a duplicate build. Both agents receive the same output and artifacts.
+
+### Output Streaming Architecture
+
+Compilation output streams back to agents in real-time via a buffered channel architecture:
+
+```
+Worker Process → SSH stdout → Daemon → Unix Socket → Hook → Agent
+
+Buffering strategy:
+  - 64KB buffer between SSH and daemon (high throughput)
+  - Line-buffered between daemon and hook (low latency)
+  - Hook outputs lines immediately to agent (no buffering)
+```
+
+The daemon performs ANSI color code translation on-the-fly to ensure terminal colors display correctly regardless of the SSH pseudo-terminal settings.
+
+---
+
+## Performance Characteristics
+
+### Latency Budget
+
+RCH is designed around strict latency budgets to remain imperceptible during normal development:
+
+| Operation | Budget | Typical |
+|-----------|--------|---------|
+| Hook invocation (non-compilation) | <1ms | 0.1ms |
+| Command classification | <5ms | 0.8ms |
+| Worker selection | <10ms | 2ms |
+| Connection (pooled) | <50ms | 5ms |
+| File sync (incremental, <100 files changed) | <2s | 500ms |
+| File sync (full project, 10K files) | <30s | 8s |
+
+### When Remote Wins vs Local
+
+Remote compilation provides speedup when:
+
+```
+T_local > T_transfer + T_remote + T_return
+
+Where:
+  T_local    = Local compilation time
+  T_transfer = Time to sync files to worker
+  T_remote   = Remote compilation time (faster due to more cores)
+  T_return   = Time to sync artifacts back
+```
+
+**Sweet spot**: Projects with >30s local compile time, where workers have 2x+ core count advantage.
+
+**Break-even point**: ~5-10 second local builds. Below this, overhead dominates.
+
+RCH automatically estimates `T_local` based on project size and historical data, skipping remote execution when it's unlikely to help.
+
+### Memory Usage
+
+| Component | Idle | Active |
+|-----------|------|--------|
+| Hook (`rch`) | N/A (exits after check) | ~8MB peak |
+| Daemon (`rchd`) | ~15MB | ~50MB (scales with concurrent jobs) |
+| Worker (`rch-wkr`) | ~10MB | ~20MB + compilation process |
+
+The daemon uses memory-mapped I/O for large file transfers, keeping resident memory low regardless of artifact size.
+
+---
+
+## Security Model
+
+### Trust Boundaries
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    AGENT WORKSTATION (trusted)                   │
+│  ┌──────────┐     ┌─────────┐     ┌──────────┐                  │
+│  │  Agent   │────▶│   rch   │────▶│   rchd   │                  │
+│  │(Claude)  │     │ (hook)  │     │ (daemon) │                  │
+│  └──────────┘     └─────────┘     └──────────┘                  │
+│                                        │                         │
+└────────────────────────────────────────┼─────────────────────────┘
+                                         │ SSH (encrypted)
+                                         ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    WORKER MACHINES (semi-trusted)                │
+│  • Has read access to source code during compilation             │
+│  • Returns artifacts (binaries, test results)                    │
+│  • No persistent storage of source (cleaned after job)           │
+│  • Isolated per-job directories                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Recommendations
+
+1. **Use workers you control**: Don't use shared infrastructure for proprietary code
+2. **Network isolation**: Workers should be on a trusted network or VPN
+3. **SSH key management**: Use dedicated keys for RCH with limited permissions
+4. **Audit logging**: Enable `RCH_LOG_LEVEL=debug` for full command tracing
+
+### What RCH Does NOT Do
+
+- Store source code persistently on workers (cleaned after each job)
+- Transmit credentials or secrets (excluded from sync by default)
+- Execute arbitrary commands (only classified compilation commands)
+- Modify source files (write-protected during remote execution)
+
+---
+
+## Integration with AI Coding Agents
+
+RCH is specifically designed for multi-agent AI coding workflows. Here's how it integrates with popular tools:
+
+### Claude Code
+
+Claude Code's PreToolUse hook mechanism is RCH's primary integration point:
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/user/.local/bin/rch"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+When Claude Code is about to execute a Bash command:
+1. It calls `rch` with the command as JSON on stdin
+2. `rch` classifies the command (<1ms for most commands)
+3. If compilation: `rch` executes remotely and returns output
+4. If not compilation: `rch` exits with code 0, letting Claude Code proceed normally
+
+The agent never knows compilation happened remotely—artifacts appear in the expected locations.
+
+### Multiple Simultaneous Agents
+
+RCH shines when running 5, 10, or 15+ agents simultaneously:
+
+| Agents | Without RCH | With RCH (4 workers, 64 total slots) |
+|--------|-------------|--------------------------------------|
+| 1 | Normal | ~Same (overhead not worth it) |
+| 3 | CPU contention begins | Distributed across workers |
+| 5 | Severe slowdown | Still responsive |
+| 10 | System unusable | Workers at 50% capacity |
+| 15+ | Crashes likely | Workers handling load |
+
+The key insight: your workstation's CPU becomes a bottleneck far before your workers' combined capacity is exhausted.
+
+### Agent-Aware Features
+
+- **Deduplication**: Agents compiling the same project share results
+- **Priority hints**: Mark urgent agent work with `RCH_PRIORITY=high`
+- **Isolation**: Each agent's jobs are tracked separately for debugging
+- **Fail-open**: If RCH has issues, agents continue with local builds
+
+---
+
 ## Acknowledgments
 
 Built with:
