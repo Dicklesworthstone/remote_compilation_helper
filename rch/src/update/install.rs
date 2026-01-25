@@ -2,8 +2,9 @@
 
 use super::download::DownloadedRelease;
 use super::lock::UpdateLock;
-use super::types::UpdateError;
+use super::types::{BackupEntry, UpdateError, MAX_BACKUPS};
 use crate::ui::OutputContext;
+use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -31,7 +32,6 @@ pub async fn install_update(
 
     // Get installation paths
     let install_dir = get_install_dir()?;
-    let backup_dir = get_backup_dir(&download.version)?;
 
     // Stop daemon if running and restart is requested
     let daemon_was_running = if restart_daemon {
@@ -40,14 +40,15 @@ pub async fn install_update(
         false
     };
 
-    // Backup current binaries
+    // Get current version for backup
+    let current_version = env!("CARGO_PKG_VERSION");
+
+    // Create backup with metadata
     if !ctx.is_json() {
-        println!(
-            "Backing up current installation to {}...",
-            backup_dir.display()
-        );
+        println!("Backing up current installation (v{})...", current_version);
     }
-    backup_current_installation(&install_dir, &backup_dir)?;
+    let backup_entry = create_backup(&install_dir, current_version)?;
+    let backup_dir = backup_entry.backup_path;
 
     // Extract new binaries to temp location
     let temp_extract = std::env::temp_dir().join("rch-extract");
@@ -84,11 +85,39 @@ pub async fn install_update(
 }
 
 /// Rollback to previous version.
-pub async fn rollback(ctx: &OutputContext, dry_run: bool) -> Result<(), UpdateError> {
-    let backup_dir = find_latest_backup()?;
+///
+/// If `target_version` is None, rolls back to the most recent backup.
+/// If `target_version` is Some, rolls back to the specified version.
+pub async fn rollback(
+    ctx: &OutputContext,
+    dry_run: bool,
+    target_version: Option<&str>,
+) -> Result<(), UpdateError> {
+    let backup_dir = if let Some(version) = target_version {
+        find_backup_by_version(version)?
+    } else {
+        find_latest_backup()?
+    };
+
+    // Try to get version info from backup metadata
+    let version_info = {
+        let metadata_path = backup_dir.join("backup.json");
+        if metadata_path.exists() {
+            fs::read_to_string(&metadata_path)
+                .ok()
+                .and_then(|s| serde_json::from_str::<BackupEntry>(&s).ok())
+                .map(|e| e.version)
+        } else {
+            None
+        }
+    };
 
     if !ctx.is_json() {
-        println!("Rolling back to backup at {}...", backup_dir.display());
+        if let Some(ref version) = version_info {
+            println!("Rolling back to version {}...", version);
+        } else {
+            println!("Rolling back to backup at {}...", backup_dir.display());
+        }
     }
 
     if dry_run {
@@ -116,10 +145,28 @@ pub async fn rollback(ctx: &OutputContext, dry_run: bool) -> Result<(), UpdateEr
     }
 
     if !ctx.is_json() {
-        println!("Rollback complete.");
+        if let Some(version) = version_info {
+            println!("Rollback to version {} complete.", version);
+        } else {
+            println!("Rollback complete.");
+        }
     }
 
     Ok(())
+}
+
+/// Find a backup by version string.
+fn find_backup_by_version(version: &str) -> Result<PathBuf, UpdateError> {
+    let backups = list_backups()?;
+    let version_clean = version.strip_prefix('v').unwrap_or(version);
+
+    for backup in backups {
+        if backup.version == version_clean || backup.version == version {
+            return Ok(backup.backup_path);
+        }
+    }
+
+    Err(UpdateError::NoBackupAvailable)
 }
 
 /// Get the installation directory.
@@ -193,6 +240,122 @@ fn backup_current_installation(
             std::fs::copy(&src, &dst).map_err(|e| {
                 UpdateError::InstallFailed(format!("Failed to backup {}: {}", binary, e))
             })?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Create a backup with JSON metadata file.
+pub fn create_backup(
+    install_dir: &std::path::Path,
+    version: &str,
+) -> Result<BackupEntry, UpdateError> {
+    let backup_dir = get_backup_dir(version)?;
+
+    // Backup the binaries
+    backup_current_installation(install_dir, &backup_dir)?;
+
+    // Create metadata
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let entry = BackupEntry {
+        version: version.to_string(),
+        created_at: now,
+        original_path: install_dir.to_path_buf(),
+        backup_path: backup_dir.clone(),
+    };
+
+    // Write metadata JSON
+    let metadata_path = backup_dir.join("backup.json");
+    let json = serde_json::to_string_pretty(&entry)
+        .map_err(|e| UpdateError::InstallFailed(format!("Failed to serialize backup metadata: {}", e)))?;
+    fs::write(&metadata_path, json)
+        .map_err(|e| UpdateError::InstallFailed(format!("Failed to write backup metadata: {}", e)))?;
+
+    // Prune old backups
+    prune_old_backups()?;
+
+    Ok(entry)
+}
+
+/// List all available backups with metadata.
+pub fn list_backups() -> Result<Vec<BackupEntry>, UpdateError> {
+    let data_dir = dirs::data_dir().ok_or_else(|| {
+        UpdateError::InstallFailed("Could not determine data directory".to_string())
+    })?;
+
+    let backup_base = data_dir.join("rch/backups");
+
+    if !backup_base.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut backups = Vec::new();
+
+    let entries = fs::read_dir(&backup_base)
+        .map_err(|e| UpdateError::InstallFailed(format!("Failed to read backup dir: {}", e)))?;
+
+    for entry in entries.filter_map(|e| e.ok()) {
+        if !entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+            continue;
+        }
+
+        let backup_path = entry.path();
+        let metadata_path = backup_path.join("backup.json");
+
+        if metadata_path.exists() {
+            // Read metadata from JSON
+            if let Ok(content) = fs::read_to_string(&metadata_path) {
+                if let Ok(mut backup_entry) = serde_json::from_str::<BackupEntry>(&content) {
+                    backup_entry.backup_path = backup_path;
+                    backups.push(backup_entry);
+                }
+            }
+        } else {
+            // Legacy backup without metadata - extract info from directory name
+            let dir_name = entry.file_name().to_string_lossy().to_string();
+            if let Some(version) = dir_name.strip_prefix('v') {
+                // Format: v{version}-{timestamp}
+                let version_part = version.split('-').next().unwrap_or(version);
+                let created_at = fs::metadata(&backup_path)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+
+                backups.push(BackupEntry {
+                    version: version_part.to_string(),
+                    created_at,
+                    original_path: PathBuf::new(),
+                    backup_path,
+                });
+            }
+        }
+    }
+
+    // Sort by creation time, newest first
+    backups.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+
+    Ok(backups)
+}
+
+/// Prune old backups, keeping only MAX_BACKUPS.
+pub fn prune_old_backups() -> Result<(), UpdateError> {
+    let backups = list_backups()?;
+
+    if backups.len() <= MAX_BACKUPS {
+        return Ok(());
+    }
+
+    // Remove oldest backups (list is sorted newest-first)
+    for backup in backups.iter().skip(MAX_BACKUPS) {
+        if backup.backup_path.exists() {
+            let _ = fs::remove_dir_all(&backup.backup_path);
         }
     }
 
