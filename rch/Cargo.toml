@@ -14,7 +14,7 @@ rch-common = { workspace = true }
 rch-telemetry = { path = "../rch-telemetry" }
 serde = { workspace = true }
 serde_json = { workspace = true }
-toon_rust = { workspace = true }
+toon-rust = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }
 clap_complete = { workspace = true }

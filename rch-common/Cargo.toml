@@ -3,6 +3,11 @@ name = "rch-common"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "Shared types and utilities for Remote Compilation Helper"
 
 [lib]
