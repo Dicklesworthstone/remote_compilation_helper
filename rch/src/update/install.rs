@@ -309,11 +309,11 @@ pub fn list_backups() -> Result<Vec<BackupEntry>, UpdateError> {
 
         if metadata_path.exists() {
             // Read metadata from JSON
-            if let Ok(content) = fs::read_to_string(&metadata_path) {
-                if let Ok(mut backup_entry) = serde_json::from_str::<BackupEntry>(&content) {
-                    backup_entry.backup_path = backup_path;
-                    backups.push(backup_entry);
-                }
+            if let Ok(content) = fs::read_to_string(&metadata_path)
+                && let Ok(mut backup_entry) = serde_json::from_str::<BackupEntry>(&content)
+            {
+                backup_entry.backup_path = backup_path;
+                backups.push(backup_entry);
             }
         } else {
             // Legacy backup without metadata - extract info from directory name

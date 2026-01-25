@@ -59,10 +59,10 @@ fn write_cache(check: &UpdateCheck) {
         cached_at_secs: now,
     };
 
-    if let Ok(json) = serde_json::to_string_pretty(&cached) {
-        if let Ok(mut file) = fs::File::create(&cache_file) {
-            let _ = file.write_all(json.as_bytes());
-        }
+    if let Ok(json) = serde_json::to_string_pretty(&cached)
+        && let Ok(mut file) = fs::File::create(&cache_file)
+    {
+        let _ = file.write_all(json.as_bytes());
     }
 }
 
@@ -93,7 +93,7 @@ pub fn spawn_update_check_if_needed() {
         };
 
         // Run the check and ignore errors (this is just cache warming)
-        let _ = rt.block_on(async {
+        rt.block_on(async {
             let _ = check_for_updates(Channel::Stable, None).await;
         });
     });
@@ -115,14 +115,14 @@ pub async fn check_for_updates(
     }
 
     // Check cache first (only for stable channel default checks)
-    if channel == Channel::Stable {
-        if let Some(cached) = read_cached_check() {
-            // Verify current version matches cached
-            if cached.current_version == current_version {
-                return Ok(cached);
-            }
-            // Version changed (e.g., after update), need fresh check
+    if channel == Channel::Stable
+        && let Some(cached) = read_cached_check()
+    {
+        // Verify current version matches cached
+        if cached.current_version == current_version {
+            return Ok(cached);
         }
+        // Version changed (e.g., after update), need fresh check
     }
 
     // Fetch releases and filter by channel
