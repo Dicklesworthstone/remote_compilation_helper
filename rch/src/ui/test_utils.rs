@@ -2,7 +2,7 @@
 //!
 //! Provides helpers for capturing and asserting on CLI output in tests.
 
-use super::context::{ColorChoice, OutputConfig, OutputContext, OutputMode};
+use super::context::{ColorChoice, OutputConfig, OutputContext, OutputFormat, OutputMode};
 use super::writer::SharedOutputBuffer;
 use regex::Regex;
 
@@ -234,6 +234,12 @@ impl OutputContextBuilder {
     /// Set JSON mode.
     pub fn json(mut self) -> Self {
         self.config.json = true;
+        self
+    }
+
+    /// Set machine output format.
+    pub fn format(mut self, format: OutputFormat) -> Self {
+        self.config.format = format;
         self
     }
 

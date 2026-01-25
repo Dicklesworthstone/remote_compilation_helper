@@ -32,7 +32,7 @@ use std::net::IpAddr;
 use std::time::Duration;
 
 use crate::errors::catalog::ErrorCode;
-use crate::ui::{ErrorPanel, ErrorSeverity, Icons, OutputContext, RchTheme};
+use crate::ui::{ErrorPanel, Icons, OutputContext, RchTheme};
 
 #[cfg(feature = "rich-ui")]
 use rich_rust::r#box::HEAVY;

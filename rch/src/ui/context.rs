@@ -28,6 +28,36 @@ pub enum OutputMode {
     Quiet,
 }
 
+/// Machine output format for JSON-mode responses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OutputFormat {
+    /// JSON output (pretty-printed).
+    #[default]
+    Json,
+    /// Token-Optimized Object Notation (TOON).
+    Toon,
+}
+
+impl OutputFormat {
+    /// Parse from CLI or environment values.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_lowercase().as_str() {
+            "json" => Some(Self::Json),
+            "toon" => Some(Self::Toon),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for OutputFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OutputFormat::Json => write!(f, "json"),
+            OutputFormat::Toon => write!(f, "toon"),
+        }
+    }
+}
+
 /// Verbosity level (orthogonal to output mode).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Verbosity {
@@ -162,6 +192,8 @@ pub struct OutputConfig {
     pub force_mode: Option<OutputMode>,
     /// Color preference from CLI flag.
     pub color: ColorChoice,
+    /// Machine output format (json or toon).
+    pub format: OutputFormat,
     /// JSON output requested.
     pub json: bool,
     /// Verbose flag.
@@ -204,6 +236,8 @@ pub struct OutputContext {
     caps: TerminalCaps,
     /// Styling configuration.
     theme: Theme,
+    /// Machine output format (json or toon).
+    format: OutputFormat,
     /// Thread-safe stdout writer.
     stdout: OutputWriter,
     /// Thread-safe stderr writer.
@@ -223,6 +257,7 @@ impl OutputContext {
         let caps = TerminalCaps::detect();
         let mode = Self::detect_mode(&config, &stdout, &caps);
         let verbosity = Self::detect_verbosity(&config);
+        let format = config.format;
 
         // Determine color and unicode support
         let colors_enabled = match config.color {
@@ -240,6 +275,7 @@ impl OutputContext {
             verbosity,
             caps,
             theme,
+            format,
             stdout,
             stderr,
         }
@@ -332,6 +368,11 @@ impl OutputContext {
         self.mode
     }
 
+    /// Get the active machine output format.
+    pub fn format(&self) -> OutputFormat {
+        self.format
+    }
+
     /// Get the current verbosity level.
     pub fn verbosity(&self) -> Verbosity {
         self.verbosity
@@ -345,6 +386,11 @@ impl OutputContext {
     /// Check if JSON output mode is active.
     pub fn is_json(&self) -> bool {
         self.mode == OutputMode::Json
+    }
+
+    /// Check if TOON output is active.
+    pub fn is_toon(&self) -> bool {
+        self.is_json() && self.format == OutputFormat::Toon
     }
 
     /// Check if quiet mode is active.
@@ -535,24 +581,47 @@ impl OutputContext {
 
     // --- JSON output ---
 
-    /// Output JSON (only in JSON mode).
+    /// Output machine format (JSON or TOON) in JSON mode.
     pub fn json<T: Serialize>(&self, value: &T) -> serde_json::Result<()> {
         if !self.is_json() {
             return Ok(());
         }
+        let output = self.encode_machine(value, true)?;
+        self.stdout.write_line(&output);
+        Ok(())
+    }
+
+    /// Output JSON regardless of current mode.
+    pub fn json_force<T: Serialize>(&self, value: &T) -> serde_json::Result<()> {
         let json = serde_json::to_string_pretty(value)?;
         self.stdout.write_line(&json);
         Ok(())
     }
 
-    /// Output compact JSON (only in JSON mode).
+    /// Output compact machine format (JSON or TOON) in JSON mode.
     pub fn json_compact<T: Serialize>(&self, value: &T) -> serde_json::Result<()> {
         if !self.is_json() {
             return Ok(());
         }
-        let json = serde_json::to_string(value)?;
-        self.stdout.write_line(&json);
+        let output = self.encode_machine(value, false)?;
+        self.stdout.write_line(&output);
         Ok(())
+    }
+
+    fn encode_machine<T: Serialize>(&self, value: &T, pretty: bool) -> serde_json::Result<String> {
+        match self.format {
+            OutputFormat::Json => {
+                if pretty {
+                    serde_json::to_string_pretty(value)
+                } else {
+                    serde_json::to_string(value)
+                }
+            }
+            OutputFormat::Toon => {
+                let json_value = serde_json::to_value(value)?;
+                Ok(toon_rust::encode(json_value, None))
+            }
+        }
     }
 
     /// Flush all output streams.
@@ -612,6 +681,13 @@ mod tests {
     }
 
     #[test]
+    fn test_output_format_default() {
+        log_test_start("test_output_format_default");
+        let config = OutputConfig::default();
+        assert_eq!(config.format, OutputFormat::Json);
+    }
+
+    #[test]
     fn test_json_mode_json_output() {
         log_test_start("test_json_mode_json_output");
         let config = OutputConfig {
@@ -631,6 +707,34 @@ mod tests {
         let output = stdout_buf.to_string_lossy();
         assert!(output.contains("42"));
         assert!(output.contains("value"));
+    }
+
+    #[test]
+    fn test_machine_mode_toon_output() {
+        log_test_start("test_machine_mode_toon_output");
+        let config = OutputConfig {
+            json: true,
+            format: OutputFormat::Toon,
+            ..Default::default()
+        };
+        let (ctx, stdout_buf, _) = make_test_context(config);
+
+        #[derive(Serialize)]
+        struct TestData {
+            name: String,
+            count: i32,
+        }
+        let value = TestData {
+            name: "alpha".to_string(),
+            count: 7,
+        };
+        ctx.json(&value).unwrap();
+
+        let output = stdout_buf.to_string_lossy();
+        let decoded = toon_rust::try_decode(&output, None).unwrap();
+        let decoded_json = serde_json::Value::from(decoded);
+        let expected = serde_json::to_value(&value).unwrap();
+        assert_eq!(decoded_json, expected);
     }
 
     #[test]
@@ -712,13 +816,10 @@ mod tests {
         let config = OutputConfig::default();
         let (ctx, stdout_buf, _) = make_test_context(config);
 
-        ctx.table(
-            &["Name", "Status"],
-            &[
-                vec!["worker-1".to_string(), "healthy".to_string()],
-                vec!["worker-2".to_string(), "degraded".to_string()],
-            ],
-        );
+        ctx.table(&["Name", "Status"], &[
+            vec!["worker-1".to_string(), "healthy".to_string()],
+            vec!["worker-2".to_string(), "degraded".to_string()],
+        ]);
 
         let output = stdout_buf.to_string_lossy();
         assert!(output.contains("Name"));

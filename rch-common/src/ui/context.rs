@@ -130,6 +130,7 @@ impl OutputContext {
     /// Hook mode is detected when:
     /// 1. RCH_HOOK_MODE environment variable is set
     /// 2. Stdin is not a terminal AND no known subcommand is provided
+    #[allow(dead_code)]
     fn is_hook_invocation() -> bool {
         let first_arg = std::env::args().nth(1);
         let get_env = |key: &str| std::env::var(key).ok();

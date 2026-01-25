@@ -197,7 +197,7 @@ pub enum LegacyErrorCode {
 impl LegacyErrorCode {
     /// Parse a legacy error code string.
     #[must_use]
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
             "WORKER_UNREACHABLE" => Some(Self::WorkerUnreachable),
             "WORKER_NOT_FOUND" => Some(Self::WorkerNotFound),
@@ -248,6 +248,14 @@ impl LegacyErrorCode {
     }
 }
 
+impl std::str::FromStr for LegacyErrorCode {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse(s).ok_or(())
+    }
+}
+
 impl std::fmt::Display for LegacyErrorCode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.as_str())
@@ -265,8 +273,9 @@ impl std::fmt::Display for LegacyErrorCode {
 ///
 /// An [`ApiError`] using the modern [`ErrorCode`] equivalent.
 #[must_use]
+#[allow(dead_code)]
 pub fn from_legacy_code(legacy_code: &str, message: impl Into<String>) -> ApiError {
-    let error_code = LegacyErrorCode::from_str(legacy_code)
+    let error_code = LegacyErrorCode::parse(legacy_code)
         .map(|l| l.to_error_code())
         .unwrap_or(ErrorCode::InternalStateError);
 

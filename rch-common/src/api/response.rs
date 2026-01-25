@@ -199,6 +199,7 @@ impl<T: Serialize, E: Into<ApiError>> From<Result<T, E>> for ApiResponse<T> {
 // =============================================================================
 
 /// Builder for constructing [`ApiResponse`] with full control.
+#[allow(dead_code)]
 pub struct ApiResponseBuilder<T: Serialize> {
     command: Option<String>,
     request_id: Option<String>,
@@ -206,6 +207,7 @@ pub struct ApiResponseBuilder<T: Serialize> {
     error: Option<ApiError>,
 }
 
+#[allow(dead_code)]
 impl<T: Serialize> ApiResponseBuilder<T> {
     /// Create a new builder.
     #[must_use]

@@ -12,4 +12,5 @@
 
 pub mod shutdown;
 
+#[allow(unused_imports)]
 pub use shutdown::{JobDrainEvent, SessionStats, ShutdownSequence};

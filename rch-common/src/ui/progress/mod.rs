@@ -217,6 +217,7 @@ impl RateLimiter {
 #[derive(Debug)]
 struct TerminalState {
     width: u16,
+    #[allow(dead_code)]
     cursor_hidden: bool,
 }
 

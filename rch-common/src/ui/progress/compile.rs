@@ -536,7 +536,7 @@ fn render_bar(
         .show_speed(false)
         .show_elapsed(false);
 
-    if let Some(total) = total {
+    if total.is_some() {
         bar.update(current);
     } else if let Some(percent) = percent {
         bar.set_progress(percent);

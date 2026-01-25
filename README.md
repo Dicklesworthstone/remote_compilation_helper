@@ -266,7 +266,8 @@ Global flags available on all commands:
 ```bash
 --verbose       # Increase logging
 --quiet         # Suppress non-error output
---format json   # Machine-readable output
+--json          # Machine-readable JSON output (legacy)
+--format json|toon   # Machine output format (json or toon)
 ```
 
 ### `rch daemon`
@@ -420,6 +421,8 @@ CARGO_BUILD_JOBS = "16"
 | `RCH_LOCAL_ONLY` | Force local execution | `false` |
 | `RCH_BYPASS` | Disable RCH entirely | `false` |
 | `RCH_VERBOSE` | Enable verbose logging | `false` |
+| `RCH_OUTPUT_FORMAT` | Machine output format: `json` or `toon` | unset |
+| `TOON_DEFAULT_FORMAT` | Default machine format when `--json` is set | unset |
 
 ---
 

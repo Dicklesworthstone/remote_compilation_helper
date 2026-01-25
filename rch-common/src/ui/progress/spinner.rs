@@ -84,8 +84,10 @@ struct SharedSpinnerState {
     /// Current frame index across all spinners.
     frame_index: AtomicUsize,
     /// Last frame update time (nanoseconds since epoch).
+    #[allow(dead_code)]
     last_frame_ns: AtomicU64,
     /// Number of active spinners.
+    #[allow(dead_code)]
     active_count: AtomicUsize,
 }
 

@@ -23,7 +23,9 @@
 //! [14:45:26] ● rchd v0.5.2 shutdown complete (exit 0)
 //! ```
 
-use chrono::{DateTime, Duration as ChronoDuration, Local, Utc};
+#![allow(dead_code)]
+
+use chrono::{DateTime, Local, Utc};
 use rch_common::ui::{Icons, OutputContext, RchTheme};
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};

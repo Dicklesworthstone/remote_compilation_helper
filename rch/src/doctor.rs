@@ -129,14 +129,11 @@ pub async fn run_doctor(ctx: &OutputContext, options: DoctorOptions) -> Result<(
 
     // Output results
     if ctx.is_json() {
-        let _ = ctx.json(&ApiResponse::ok(
-            "doctor",
-            DoctorResponse {
-                checks,
-                summary,
-                fixes_applied,
-            },
-        ));
+        let _ = ctx.json(&ApiResponse::ok("doctor", DoctorResponse {
+            checks,
+            summary,
+            fixes_applied,
+        }));
     } else {
         // Print summary
         println!();

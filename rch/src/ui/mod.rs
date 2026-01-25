@@ -37,7 +37,7 @@
 //!
 //! - **Human**: Colored output with unicode symbols
 //! - **Plain**: No colors, ASCII fallback, for dumb terminals or pipes
-//! - **JSON**: Machine-readable JSON to stdout
+//! - **JSON**: Machine-readable output to stdout (json/toon)
 //! - **Quiet**: Errors only
 //!
 //! # Standards Compliance
@@ -70,7 +70,8 @@ pub use adaptive::{
     detect_hyperlink_support, palette,
 };
 pub use context::{
-    ColorChoice, OutputConfig, OutputContext, OutputMode, TerminalCaps, Verbosity, default_context,
+    ColorChoice, OutputConfig, OutputContext, OutputFormat, OutputMode, TerminalCaps, Verbosity,
+    default_context,
 };
 pub use markdown::{render_markdown, strip_markdown};
 pub use progress::{

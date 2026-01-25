@@ -27,9 +27,10 @@ use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::CompleteEnv;
 use rch_common::{LogConfig, init_logging};
+use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
-use ui::{ColorChoice, OutputConfig, OutputContext};
+use ui::{ColorChoice, OutputConfig, OutputContext, OutputFormat};
 
 #[derive(Parser)]
 #[command(name = "rch")]
@@ -75,6 +76,8 @@ ENVIRONMENT VARIABLES:
     RCH_VISIBILITY        Hook output visibility: none, summary, verbose
     RCH_VERBOSE           Convenience: sets visibility=verbose when true
     RCH_QUIET             Force visibility=none when true
+    RCH_OUTPUT_FORMAT     Machine output format: json, toon (implies --json)
+    TOON_DEFAULT_FORMAT   Default machine format when --json is set (json/toon)
     RCH_MOCK_SSH          Enable mock SSH for testing (set to 1)
     RCH_TEST_MODE         Enable test mode (set to 1)
     RCH_ENABLE_METRICS    Enable metrics collection (set to true)
@@ -105,6 +108,16 @@ struct Cli {
     /// Output as JSON for machine parsing
     #[arg(long, global = true)]
     json: bool,
+
+    /// Machine output format: json or toon
+    #[arg(
+        long,
+        global = true,
+        value_name = "format",
+        env = "RCH_OUTPUT_FORMAT",
+        value_parser = ["json", "toon"]
+    )]
+    format: Option<String>,
 
     /// Color output mode: auto, always, never
     #[arg(long, global = true, default_value = "auto")]
@@ -884,6 +897,28 @@ enum FleetAction {
     },
 }
 
+fn machine_output_requested(format: Option<&str>, json_flag: bool) -> bool {
+    json_flag || format.is_some()
+}
+
+fn resolve_output_format(format: Option<&str>, json_flag: bool) -> OutputFormat {
+    if let Some(raw) = format {
+        if let Some(parsed) = OutputFormat::parse(raw) {
+            return parsed;
+        }
+    }
+
+    if json_flag {
+        if let Ok(value) = env::var("TOON_DEFAULT_FORMAT") {
+            if let Some(parsed) = OutputFormat::parse(&value) {
+                return parsed;
+            }
+        }
+    }
+
+    OutputFormat::Json
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Handle dynamic shell completions (exits if handling a completion request)
@@ -905,8 +940,11 @@ async fn main() -> Result<()> {
     let _logging_guards = init_logging(&log_config)?;
 
     // Create output context from CLI flags
+    let format = resolve_output_format(cli.format.as_deref(), cli.json);
+    let machine = machine_output_requested(cli.format.as_deref(), cli.json);
     let output_config = OutputConfig {
-        json: cli.json,
+        json: machine,
+        format,
         verbose: cli.verbose,
         quiet: cli.quiet,
         color: ColorChoice::parse(&cli.color),
@@ -1482,6 +1520,12 @@ mod tests {
     fn cli_parses_json_flag() {
         let cli = Cli::try_parse_from(["rch", "--json"]).unwrap();
         assert!(cli.json);
+    }
+
+    #[test]
+    fn cli_parses_format_flag() {
+        let cli = Cli::try_parse_from(["rch", "--format", "toon"]).unwrap();
+        assert_eq!(cli.format.as_deref(), Some("toon"));
     }
 
     #[test]
@@ -2559,13 +2603,17 @@ mod tests {
         assert!(!config.json);
         assert!(!config.verbose);
         assert!(!config.quiet);
+        assert_eq!(config.format, OutputFormat::Json);
     }
 
     #[test]
     fn output_config_from_cli_args_verbose() {
         let cli = Cli::try_parse_from(["rch", "-v"]).unwrap();
+        let format = resolve_output_format(cli.format.as_deref(), cli.json);
+        let machine = machine_output_requested(cli.format.as_deref(), cli.json);
         let config = OutputConfig {
-            json: cli.json,
+            json: machine,
+            format,
             verbose: cli.verbose,
             quiet: cli.quiet,
             color: ColorChoice::parse(&cli.color),
@@ -2579,8 +2627,11 @@ mod tests {
     #[test]
     fn output_config_from_cli_args_json() {
         let cli = Cli::try_parse_from(["rch", "--json"]).unwrap();
+        let format = resolve_output_format(cli.format.as_deref(), cli.json);
+        let machine = machine_output_requested(cli.format.as_deref(), cli.json);
         let config = OutputConfig {
-            json: cli.json,
+            json: machine,
+            format,
             verbose: cli.verbose,
             quiet: cli.quiet,
             color: ColorChoice::parse(&cli.color),
@@ -2593,8 +2644,11 @@ mod tests {
     #[test]
     fn output_config_from_cli_args_quiet() {
         let cli = Cli::try_parse_from(["rch", "-q"]).unwrap();
+        let format = resolve_output_format(cli.format.as_deref(), cli.json);
+        let machine = machine_output_requested(cli.format.as_deref(), cli.json);
         let config = OutputConfig {
-            json: cli.json,
+            json: machine,
+            format,
             verbose: cli.verbose,
             quiet: cli.quiet,
             color: ColorChoice::parse(&cli.color),
@@ -2602,6 +2656,14 @@ mod tests {
         };
         assert!(config.quiet);
         assert!(!config.verbose);
+    }
+
+    #[test]
+    fn output_format_resolves_to_toon() {
+        let format = resolve_output_format(Some("toon"), false);
+        let machine = machine_output_requested(Some("toon"), false);
+        assert_eq!(format, OutputFormat::Toon);
+        assert!(machine);
     }
 
     // -------------------------------------------------------------------------
