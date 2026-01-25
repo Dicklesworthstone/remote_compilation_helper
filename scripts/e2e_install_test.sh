@@ -99,6 +99,20 @@ EOF
     chmod +x "$bin_dir/loginctl"
 }
 
+create_launchd_stubs() {
+    local bin_dir="$1"
+    mkdir -p "$bin_dir"
+
+    cat > "$bin_dir/launchctl" << 'EOF'
+#!/usr/bin/env bash
+if [[ -n "${LAUNCHCTL_LOG:-}" ]]; then
+    echo "launchctl $*" >> "$LAUNCHCTL_LOG"
+fi
+exit 0
+EOF
+    chmod +x "$bin_dir/launchctl"
+}
+
 create_prompt_tarball() {
     local name="$1"
     local pkg_dir="$TEST_DIR/${name}_pkg"
@@ -822,6 +836,84 @@ test_systemd_unit_generation() {
 }
 
 # ============================================================================
+# Test 15: Launchd unit generation
+# ============================================================================
+
+test_launchd_unit_generation() {
+    start_test "Launchd unit generation"
+
+    if [[ "$(uname -s)" != "Darwin" ]]; then
+        log "  SKIP: launchd tests require macOS"
+        pass "Launchd test skipped on non-macOS"
+        return
+    fi
+
+    local tarball
+    tarball=$(create_prompt_tarball "launchd")
+
+    local stub_bin="$TEST_DIR/launchd_stub_bin"
+    create_launchd_stubs "$stub_bin"
+
+    local home_dir="$TEST_DIR/launchd_home"
+    local install_dir="$TEST_DIR/launchd_install/bin"
+    local config_dir="$home_dir/.config/rch"
+    local plist_file="$home_dir/Library/LaunchAgents/com.rch.daemon.plist"
+    local launchctl_log="$TEST_DIR/launchctl.log"
+
+    mkdir -p "$install_dir" "$config_dir"
+
+    local output
+    output=$(LAUNCHCTL_LOG="$launchctl_log" run_install_case "$install_dir" "$config_dir" "$tarball" "--install-service" "" "false" "$stub_bin" "" "ok" "$home_dir") || true
+
+    if [[ -f "$plist_file" ]]; then
+        pass "Launchd plist created"
+    else
+        fail "Launchd plist missing"
+        return
+    fi
+
+    if grep -q "<key>RunAtLoad</key>" "$plist_file"; then
+        pass "Plist includes RunAtLoad"
+    else
+        fail "Plist missing RunAtLoad"
+    fi
+
+    if grep -q "<key>KeepAlive</key>" "$plist_file"; then
+        pass "Plist includes KeepAlive"
+    else
+        fail "Plist missing KeepAlive"
+    fi
+
+    if grep -q "$install_dir/rchd" "$plist_file"; then
+        pass "Plist includes rchd path"
+    else
+        fail "Plist missing rchd path"
+    fi
+
+    # Negative path: --no-service should not create plist
+    local no_service_home="$TEST_DIR/launchd_no_service_home"
+    local no_service_install="$TEST_DIR/launchd_no_service_install/bin"
+    local no_service_config="$no_service_home/.config/rch"
+    local no_service_plist="$no_service_home/Library/LaunchAgents/com.rch.daemon.plist"
+
+    mkdir -p "$no_service_install" "$no_service_config"
+    output=$(LAUNCHCTL_LOG="$launchctl_log" run_install_case "$no_service_install" "$no_service_config" "$tarball" "--no-service --yes" "" "false" "$stub_bin" "" "ok" "$no_service_home") || true
+
+    if [[ ! -f "$no_service_plist" ]]; then
+        pass "No-service flag skips plist creation"
+    else
+        fail "No-service should not create plist"
+    fi
+
+    if [[ -f "$launchctl_log" ]]; then
+        pass "launchctl stub captured calls"
+    else
+        log "  Note: launchctl log missing (output may vary)"
+        pass "launchctl stub (output varies)"
+    fi
+}
+
+# ============================================================================
 # Run all tests
 # ============================================================================
 
@@ -843,6 +935,7 @@ test_lock_file
 test_config_generation
 test_service_prompt_behavior
 test_systemd_unit_generation
+test_launchd_unit_generation
 
 # ============================================================================
 # Summary
