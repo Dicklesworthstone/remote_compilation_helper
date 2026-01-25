@@ -544,42 +544,51 @@ fn contains_unquoted_str(cmd: &str, s: &str) -> bool {
     let mut in_single = false;
     let mut in_double = false;
     let mut escaped = false;
-    let chars: Vec<char> = cmd.chars().collect();
-    let pattern: Vec<char> = s.chars().collect();
+    let bytes = cmd.as_bytes();
+    let pattern = s.as_bytes();
 
-    for i in 0..chars.len() {
-        let c = chars[i];
+    if pattern.is_empty() {
+        return false;
+    }
+
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
 
         if escaped {
             escaped = false;
+            i += 1;
             continue;
         }
 
-        if c == '\\' {
+        if b == b'\\' {
             escaped = true;
+            i += 1;
             continue;
         }
 
-        if c == '\'' && !in_double {
+        if b == b'\'' && !in_double {
             in_single = !in_single;
-        } else if c == '"' && !in_single {
-            in_double = !in_double;
-        } else if !in_single && !in_double {
-            // Check for pattern match at this position
-            if i + pattern.len() <= chars.len() {
-                let mut matched = true;
-                for (j, &pc) in pattern.iter().enumerate() {
-                    if chars[i + j] != pc {
-                        matched = false;
-                        break;
-                    }
-                }
-                if matched {
-                    return true;
-                }
-            }
+            i += 1;
+            continue;
         }
+        if b == b'"' && !in_single {
+            in_double = !in_double;
+            i += 1;
+            continue;
+        }
+
+        if !in_single
+            && !in_double
+            && i + pattern.len() <= bytes.len()
+            && bytes[i..i + pattern.len()] == *pattern
+        {
+            return true;
+        }
+
+        i += 1;
     }
+
     false
 }
 

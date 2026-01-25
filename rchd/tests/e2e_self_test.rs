@@ -62,7 +62,9 @@ fn load_worker_from_env() -> Option<WorkerConfig> {
         return None;
     }
 
-    let user = std::env::var("RCH_E2E_WORKER_USER").unwrap_or_else(|_| whoami::username());
+    let user = std::env::var("RCH_E2E_WORKER_USER").unwrap_or_else(|_| {
+        whoami::username().unwrap_or_else(|_| "unknown".to_string())
+    });
     let identity_file =
         std::env::var("RCH_E2E_WORKER_KEY").unwrap_or_else(|_| "~/.ssh/id_rsa".to_string());
 

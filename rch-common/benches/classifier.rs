@@ -6,8 +6,9 @@
 //!
 //! In practice, we aim for microsecond-level performance.
 
-use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use rch_common::classify_command;
+use std::hint::black_box;
 
 /// Tier 0 commands that should be instantly rejected.
 /// Target: < 1 microsecond

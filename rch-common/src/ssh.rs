@@ -138,7 +138,7 @@ impl SshClient {
             let control_dir = if let Some(runtime_dir) = dirs::runtime_dir() {
                 runtime_dir.join("rch-ssh")
             } else {
-                let username = whoami::username();
+                let username = whoami::username().unwrap_or_else(|_| "unknown".to_string());
                 std::env::temp_dir().join(format!("rch-ssh-{}", username))
             };
 

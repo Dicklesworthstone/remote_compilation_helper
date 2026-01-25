@@ -22,7 +22,7 @@ impl WorkerFixture {
         Self {
             id: id.to_string(),
             host: "localhost".to_string(),
-            user: whoami::username(),
+            user: whoami::username().unwrap_or_else(|_| "unknown".to_string()),
             identity_file: "~/.ssh/id_rsa".to_string(),
             total_slots: 4,
             priority: 100,
