@@ -112,7 +112,7 @@ ratatui = "0.29"
 crossterm = "0.29"
 
 # Rich terminal output (optional, for enhanced UI)
-rich_rust = { version = "0.1.0", features = ["full"] }
+rich_rust = { version = "0.1.1", features = ["full"] }
 
 # Internal crates
 rch-common = { path = "rch-common" }
