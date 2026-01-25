@@ -255,6 +255,45 @@ command_exists() {
     command -v "$1" &> /dev/null
 }
 
+is_interactive() {
+    [[ -t 0 ]]
+}
+
+systemd_user_available() {
+    if ! command_exists systemctl; then
+        return 1
+    fi
+    if systemctl --user show-environment >/dev/null 2>&1; then
+        return 0
+    fi
+    if systemctl --user is-system-running >/dev/null 2>&1; then
+        return 0
+    fi
+    return 1
+}
+
+detect_service_manager() {
+    local os
+    os="$(uname -s)"
+    case "$os" in
+        Linux*)
+            if systemd_user_available; then
+                echo "systemd"
+                return 0
+            fi
+            ;;
+        Darwin*)
+            if command_exists launchctl; then
+                echo "launchd"
+                return 0
+            fi
+            ;;
+        *)
+            ;;
+    esac
+    return 1
+}
+
 ensure_command() {
     if ! command_exists "$1"; then
         die "Required command not found: $1. Please install it first."
@@ -1075,6 +1114,23 @@ maybe_prompt_service() {
         return
     fi
 
+    local service_manager=""
+    service_manager="$(detect_service_manager 2>/dev/null || true)"
+    if [[ -z "$service_manager" ]]; then
+        ENABLE_SERVICE="false"
+        if [[ "${EASY_MODE:-}" == "true" ]] || [[ "${YES:-}" == "true" ]] || [[ "${INSTALL_SERVICE:-}" == "true" ]]; then
+            warn "Background service requested but no supported service manager detected; continuing without service."
+        else
+            info "No supported service manager detected - skipping background service setup"
+        fi
+        return
+    fi
+
+    if [[ "${INSTALL_SERVICE:-}" == "true" ]]; then
+        ENABLE_SERVICE="true"
+        return
+    fi
+
     if [[ "${EASY_MODE:-}" == "true" ]] || [[ "${YES:-}" == "true" ]]; then
         ENABLE_SERVICE="true"
         return
@@ -1097,8 +1153,8 @@ setup_systemd_service() {
         return
     fi
 
-    if ! command_exists systemctl; then
-        info "systemd not found - skipping service setup"
+    if ! systemd_user_available; then
+        info "systemd user service unavailable - skipping service setup"
         return
     fi
 
@@ -1178,6 +1234,11 @@ setup_launchd_service() {
     fi
 
     if [[ "$(uname -s)" != "Darwin" ]]; then
+        return
+    fi
+
+    if ! command_exists launchctl; then
+        info "launchctl not found - skipping service setup"
         return
     fi
 
@@ -1524,7 +1585,7 @@ print_summary() {
         echo ""
 
         if [[ "${ENABLE_SERVICE:-true}" == "true" ]] && [[ "${NO_SERVICE:-}" != "true" ]]; then
-            if command_exists systemctl; then
+            if systemd_user_available; then
                 echo "  🔄 Service: rchd.service (systemd)"
                 echo ""
                 if $USE_COLOR; then
@@ -1538,7 +1599,7 @@ print_summary() {
                     echo "    journalctl --user -u rchd -f     # Follow logs"
                     echo "    systemctl --user restart rchd    # Restart"
                 fi
-            elif [[ "$(uname -s)" == "Darwin" ]]; then
+            elif [[ "$(uname -s)" == "Darwin" ]] && command_exists launchctl; then
                 echo "  🔄 Service: com.rch.daemon (launchd)"
                 echo ""
                 if $USE_COLOR; then
@@ -1618,7 +1679,8 @@ Options:
   --offline <tarball>  Install from local tarball (airgap mode)
   --easy-mode          Configure PATH + detect agents + run doctor
   --verify-only        Verify existing installation
-  --no-service         Skip systemd/launchd service setup (service is installed by default)
+  --install-service    Enable background service without prompting
+  --no-service         Skip systemd/launchd service setup
   --uninstall          Remove RCH installation
   --no-gum             Disable Gum UI (use ANSI fallback)
   --yes                Skip confirmation prompts
@@ -1636,8 +1698,10 @@ Environment:
 
 Service Setup:
   On Linux:  systemd user service is offered during install (auto-accept in --easy-mode/--yes).
+             Use --install-service to opt in without prompting.
              Lingering is enabled for reboot persistence when possible (requires sudo).
   On macOS:  launchd service is offered during install (auto-accept in --easy-mode/--yes).
+             Use --install-service to opt in without prompting.
              Service starts on login when enabled.
 
 Examples:
@@ -1646,6 +1710,7 @@ Examples:
   ./install.sh --worker                # Install on a worker machine
   ./install.sh --easy-mode             # Full setup with PATH and detection
   ./install.sh --offline rch.tar.gz    # Install from local tarball
+  ./install.sh --install-service       # Enable background service without prompt
   ./install.sh --no-service            # Install without system service
   ./install.sh --uninstall             # Remove installation
 
@@ -1664,6 +1729,7 @@ main() {
     VERIFY_ONLY="false"
     EASY_MODE="false"
     NO_SERVICE="false"
+    INSTALL_SERVICE="false"
     ENABLE_SERVICE="true"
     YES="false"
     OFFLINE_TARBALL=""
@@ -1699,7 +1765,7 @@ main() {
                 shift
                 ;;
             --install-service)
-                # Kept for backward compatibility - service is now installed by default
+                INSTALL_SERVICE="true"
                 shift
                 ;;
             --no-service)
