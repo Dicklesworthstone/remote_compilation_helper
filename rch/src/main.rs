@@ -591,6 +591,8 @@ enum DaemonAction {
         #[arg(short = 'n', long, default_value = "50")]
         lines: usize,
     },
+    /// Reload configuration without restart
+    Reload,
 }
 
 #[derive(Subcommand)]
@@ -993,12 +995,12 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    // Initialize logging
+    // Initialize logging - ALWAYS use stderr to keep stdout clean for hook JSON
     let base_level = match config::load_config() {
         Ok(cfg) => cfg.general.log_level,
         Err(_) => "info".to_string(),
     };
-    let mut log_config = LogConfig::from_env(&base_level);
+    let mut log_config = LogConfig::from_env(&base_level).with_stderr();
     if cli.verbose {
         log_config = log_config.with_level("debug");
     } else if cli.quiet {
@@ -1141,6 +1143,9 @@ async fn handle_daemon(action: DaemonAction, ctx: &OutputContext) -> Result<()> 
         }
         DaemonAction::Logs { lines } => {
             commands::daemon_logs(lines, ctx)?;
+        }
+        DaemonAction::Reload => {
+            commands::daemon_reload(ctx).await?;
         }
     }
     Ok(())

@@ -3816,6 +3816,179 @@ pub async fn daemon_restart(ctx: &OutputContext) -> Result<()> {
     Ok(())
 }
 
+/// Daemon reload response for JSON output.
+#[derive(Debug, Clone, Serialize)]
+pub struct DaemonReloadResponse {
+    pub success: bool,
+    pub added: usize,
+    pub updated: usize,
+    pub removed: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// Reload daemon configuration without restart.
+pub async fn daemon_reload(ctx: &OutputContext) -> Result<()> {
+    let style = ctx.theme();
+
+    // Check if daemon is running
+    if !Path::new(DEFAULT_SOCKET_PATH).exists() {
+        if ctx.is_json() {
+            let _ = ctx.json(&ApiResponse::<()>::err(
+                "daemon reload",
+                ApiError::new(ErrorCode::InternalDaemonNotRunning, "Daemon is not running"),
+            ));
+        } else {
+            println!(
+                "{} Daemon is not running. Start it with {}",
+                StatusIndicator::Error.display(style),
+                style.highlight("rch daemon start")
+            );
+        }
+        return Ok(());
+    }
+
+    if !ctx.is_json() {
+        println!(
+            "{} Reloading daemon configuration...",
+            StatusIndicator::Info.display(style)
+        );
+    }
+
+    // Send reload command to daemon
+    match send_daemon_command("POST /reload\n").await {
+        Ok(response) => {
+            // Parse response JSON
+            if let Some(json) = response.strip_prefix("HTTP/1.1 200 OK\n\n") {
+                match serde_json::from_str::<serde_json::Value>(json) {
+                    Ok(value) => {
+                        let added = value["added"].as_u64().unwrap_or(0) as usize;
+                        let updated = value["updated"].as_u64().unwrap_or(0) as usize;
+                        let removed = value["removed"].as_u64().unwrap_or(0) as usize;
+                        let warnings: Vec<String> = value["warnings"]
+                            .as_array()
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|v| v.as_str().map(String::from))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+
+                        let has_changes = added > 0 || updated > 0 || removed > 0;
+
+                        if ctx.is_json() {
+                            let _ = ctx.json(&ApiResponse::ok(
+                                "daemon reload",
+                                DaemonReloadResponse {
+                                    success: true,
+                                    added,
+                                    updated,
+                                    removed,
+                                    warnings: warnings.clone(),
+                                    message: if has_changes {
+                                        Some(format!(
+                                            "Configuration reloaded: {} added, {} updated, {} removed",
+                                            added, updated, removed
+                                        ))
+                                    } else {
+                                        Some("No configuration changes detected".to_string())
+                                    },
+                                },
+                            ));
+                        } else {
+                            if has_changes {
+                                println!(
+                                    "{} Configuration reloaded",
+                                    StatusIndicator::Success.display(style)
+                                );
+                                println!(
+                                    "  {} workers added, {} updated, {} removed",
+                                    added, updated, removed
+                                );
+                            } else {
+                                println!(
+                                    "{} No configuration changes detected",
+                                    StatusIndicator::Info.display(style)
+                                );
+                            }
+
+                            for warning in &warnings {
+                                println!(
+                                    "{} {}",
+                                    StatusIndicator::Warning.display(style),
+                                    warning
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        if ctx.is_json() {
+                            let _ = ctx.json(&ApiResponse::<()>::err(
+                                "daemon reload",
+                                ApiError::internal(&format!("Failed to parse reload response: {}", e)),
+                            ));
+                        } else {
+                            println!(
+                                "{} Failed to parse reload response: {}",
+                                StatusIndicator::Error.display(style),
+                                e
+                            );
+                        }
+                    }
+                }
+            } else if response.contains("HTTP/1.1 500") {
+                let error_msg = response
+                    .lines()
+                    .skip(2)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if ctx.is_json() {
+                    let _ = ctx.json(&ApiResponse::<()>::err(
+                        "daemon reload",
+                        ApiError::internal(&format!("Reload failed: {}", error_msg)),
+                    ));
+                } else {
+                    println!(
+                        "{} Reload failed: {}",
+                        StatusIndicator::Error.display(style),
+                        error_msg
+                    );
+                }
+            } else {
+                if ctx.is_json() {
+                    let _ = ctx.json(&ApiResponse::<()>::err(
+                        "daemon reload",
+                        ApiError::internal("Unexpected response from daemon"),
+                    ));
+                } else {
+                    println!(
+                        "{} Unexpected response from daemon",
+                        StatusIndicator::Error.display(style)
+                    );
+                }
+            }
+        }
+        Err(e) => {
+            if ctx.is_json() {
+                let _ = ctx.json(&ApiResponse::<()>::err(
+                    "daemon reload",
+                    ApiError::internal(&format!("Failed to communicate with daemon: {}", e)),
+                ));
+            } else {
+                println!(
+                    "{} Failed to communicate with daemon: {}",
+                    StatusIndicator::Error.display(style),
+                    e
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Daemon logs response for JSON output.
 #[derive(Debug, Clone, Serialize)]
 pub struct DaemonLogsResponse {
