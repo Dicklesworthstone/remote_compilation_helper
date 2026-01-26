@@ -1018,7 +1018,10 @@ mod tests {
         let input = "File at /custom/path/12345";
         let result = normalizer.normalize(input);
 
-        assert!(result.normalized.contains("<CUSTOM>"));
+        assert!(
+            result.normalized.contains("<CUSTOM>"),
+            "custom path pattern not applied: {result:?}"
+        );
     }
 
     #[test]

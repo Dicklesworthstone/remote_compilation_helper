@@ -144,6 +144,7 @@ struct PartialCompilationConfig {
 struct PartialTransferConfig {
     compression_level: Option<u32>,
     exclude_patterns: Option<Vec<String>>,
+    remote_base: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -878,6 +879,10 @@ fn merge_transfer(
     // would be confusing)
     if overlay.exclude_patterns != default.exclude_patterns {
         base.exclude_patterns.clone_from(&overlay.exclude_patterns);
+    }
+    // Override remote_base if overlay differs from default
+    if overlay.remote_base != default.remote_base {
+        base.remote_base.clone_from(&overlay.remote_base);
     }
 }
 

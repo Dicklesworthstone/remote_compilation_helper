@@ -1136,6 +1136,10 @@ pub struct TransferConfig {
     /// Patterns to exclude from transfer.
     #[serde(default = "default_excludes")]
     pub exclude_patterns: Vec<String>,
+    /// Remote base directory for project sync and build execution.
+    /// Must be an absolute path. Defaults to /tmp/rch.
+    #[serde(default = "default_remote_base")]
+    pub remote_base: String,
 }
 
 impl Default for TransferConfig {
@@ -1143,8 +1147,47 @@ impl Default for TransferConfig {
         Self {
             compression_level: 3,
             exclude_patterns: default_excludes(),
+            remote_base: default_remote_base(),
         }
     }
+}
+
+/// Default remote base path for project transfers.
+pub fn default_remote_base() -> String {
+    "/tmp/rch".to_string()
+}
+
+/// Validate and normalize a remote base path.
+/// Returns an error if the path is not absolute or contains traversal sequences.
+pub fn validate_remote_base(path: &str) -> Result<String, String> {
+    // Expand tilde for user convenience
+    let expanded = shellexpand::tilde(path).into_owned();
+
+    // Check for absolute path
+    if !expanded.starts_with('/') {
+        return Err(format!(
+            "remote_base must be an absolute path, got: {}",
+            path
+        ));
+    }
+
+    // Check for path traversal attempts
+    if expanded.contains("..") {
+        return Err(format!(
+            "remote_base must not contain path traversal (..): {}",
+            path
+        ));
+    }
+
+    // Normalize: remove trailing slashes
+    let normalized = expanded.trim_end_matches('/').to_string();
+
+    // Ensure we don't end up with empty path
+    if normalized.is_empty() {
+        return Ok("/".to_string());
+    }
+
+    Ok(normalized)
 }
 
 fn default_circuit_failure_threshold() -> u32 {
