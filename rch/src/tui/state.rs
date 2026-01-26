@@ -754,9 +754,10 @@ mod tests {
     }
 
     #[test]
-    fn test_handle_select_on_build_history_opens_logs() {
+    fn test_handle_select_on_build_history_no_op() {
         init_test_logging();
-        info!("TEST START: test_handle_select_on_build_history_opens_logs");
+        info!("TEST START: test_handle_select_on_build_history_no_op");
+        // BuildHistory select is currently a no-op (placeholder for future functionality)
         let mut state = TuiState {
             build_history: VecDeque::from([make_history("hist-1", "cargo test", Some("w1"), true)]),
             selected_panel: Panel::BuildHistory,
@@ -764,10 +765,9 @@ mod tests {
             ..Default::default()
         };
         state.handle_select();
-        assert!(state.log_view.is_some());
-        let log_view = state.log_view.as_ref().unwrap();
-        assert_eq!(log_view.build_id, "hist-1");
-        info!("TEST PASS: test_handle_select_on_build_history_opens_logs");
+        // Log view should NOT be opened for build history (unlike active builds)
+        assert!(state.log_view.is_none());
+        info!("TEST PASS: test_handle_select_on_build_history_no_op");
     }
 
     #[test]

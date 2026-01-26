@@ -27,6 +27,7 @@ use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::CompleteEnv;
 use rch_common::{LogConfig, init_logging};
+use schemars::{JsonSchema, schema_for};
 use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -1058,6 +1059,11 @@ async fn main() -> Result<()> {
         ..Default::default()
     };
     let ctx = Arc::new(OutputContext::new(output_config));
+
+    // Handle --schema flag: output JSON Schema for command's JSON output format
+    if cli.schema {
+        return handle_schema_request(&cli.command);
+    }
 
     // If no subcommand, we're being invoked as a hook
     match cli.command {
