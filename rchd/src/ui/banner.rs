@@ -8,9 +8,9 @@ use rch_common::ui::{OutputContext, RchTheme};
 use std::time::Duration;
 
 #[cfg(feature = "rich-ui")]
-use rich_rust::prelude::*;
-#[cfg(feature = "rich-ui")]
 use rich_rust::r#box::DOUBLE;
+#[cfg(feature = "rich-ui")]
+use rich_rust::prelude::*;
 
 const LOGO: &[&str] = &[
     " ____   ____ _   _ ____  ",
@@ -126,9 +126,21 @@ impl DaemonBanner {
     }
 
     fn features_summary(&self) -> String {
-        let telemetry = if self.telemetry_enabled { "telemetry" } else { "telemetry off" };
-        let metrics = if self.metrics_port > 0 { "metrics" } else { "metrics off" };
-        let otel = if self.otel_enabled { "otel" } else { "otel off" };
+        let telemetry = if self.telemetry_enabled {
+            "telemetry"
+        } else {
+            "telemetry off"
+        };
+        let metrics = if self.metrics_port > 0 {
+            "metrics"
+        } else {
+            "metrics off"
+        };
+        let otel = if self.otel_enabled {
+            "otel"
+        } else {
+            "otel off"
+        };
         format!("{telemetry} | {metrics} | {otel}")
     }
 

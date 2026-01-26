@@ -911,7 +911,9 @@ fn machine_output_requested(format: Option<&str>, json_flag: bool) -> bool {
 }
 
 fn resolve_output_format(format: Option<&str>, json_flag: bool) -> OutputFormat {
-    if let Some(raw) = format && let Some(parsed) = OutputFormat::parse(raw) {
+    if let Some(raw) = format
+        && let Some(parsed) = OutputFormat::parse(raw)
+    {
         return parsed;
     }
 
@@ -1404,7 +1406,9 @@ fn find_web_directory() -> Result<PathBuf> {
     }
 
     // Try relative to the executable
-    if let Ok(exe_path) = std::env::current_exe() && let Some(exe_dir) = exe_path.parent() {
+    if let Ok(exe_path) = std::env::current_exe()
+        && let Some(exe_dir) = exe_path.parent()
+    {
         // Check sibling web directory
         let web_sibling = exe_dir.join("web");
         if web_sibling.exists() && web_sibling.join("package.json").exists() {

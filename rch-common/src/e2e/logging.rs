@@ -645,10 +645,15 @@ mod tests {
             .print_realtime(false)
             .build();
 
-        logger.log_with_context(LogLevel::Info, LogSource::Harness, "Worker selected", vec![
-            ("worker_id".to_string(), "css".to_string()),
-            ("slots".to_string(), "4".to_string()),
-        ]);
+        logger.log_with_context(
+            LogLevel::Info,
+            LogSource::Harness,
+            "Worker selected",
+            vec![
+                ("worker_id".to_string(), "css".to_string()),
+                ("slots".to_string(), "4".to_string()),
+            ],
+        );
 
         let entries = logger.entries();
         assert_eq!(entries.len(), 1);

@@ -36,13 +36,17 @@ pub enum ToolchainError {
 pub fn detect_toolchain(project_root: &Path) -> Result<ToolchainInfo, ToolchainError> {
     // 1. Check for rust-toolchain.toml override
     let toolchain_file = project_root.join("rust-toolchain.toml");
-    if toolchain_file.exists() && let Ok(info) = parse_toolchain_file(&toolchain_file) {
+    if toolchain_file.exists()
+        && let Ok(info) = parse_toolchain_file(&toolchain_file)
+    {
         return Ok(info);
     }
 
     // 2. Check for rust-toolchain (legacy format)
     let legacy_file = project_root.join("rust-toolchain");
-    if legacy_file.exists() && let Ok(info) = parse_legacy_toolchain_file(&legacy_file) {
+    if legacy_file.exists()
+        && let Ok(info) = parse_legacy_toolchain_file(&legacy_file)
+    {
         return Ok(info);
     }
 
@@ -77,7 +81,9 @@ fn parse_legacy_toolchain_file(path: &Path) -> Result<ToolchainInfo, ToolchainEr
 /// Parse a channel string like "nightly-2024-01-15" or "stable".
 pub fn parse_channel_string(channel: &str) -> Result<ToolchainInfo, ToolchainError> {
     // Handle nightly-YYYY-MM-DD format
-    if let Some(date) = channel.strip_prefix("nightly-") && is_valid_date(date) {
+    if let Some(date) = channel.strip_prefix("nightly-")
+        && is_valid_date(date)
+    {
         return Ok(ToolchainInfo {
             channel: "nightly".to_string(),
             date: Some(date.to_string()),
@@ -86,7 +92,9 @@ pub fn parse_channel_string(channel: &str) -> Result<ToolchainInfo, ToolchainErr
     }
 
     // Handle beta-YYYY-MM-DD format
-    if let Some(date) = channel.strip_prefix("beta-") && is_valid_date(date) {
+    if let Some(date) = channel.strip_prefix("beta-")
+        && is_valid_date(date)
+    {
         return Ok(ToolchainInfo {
             channel: "beta".to_string(),
             date: Some(date.to_string()),

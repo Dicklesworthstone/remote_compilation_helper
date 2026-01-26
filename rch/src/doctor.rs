@@ -132,11 +132,14 @@ pub async fn run_doctor(ctx: &OutputContext, options: DoctorOptions) -> Result<(
 
     // Output results
     if ctx.is_json() {
-        let _ = ctx.json(&ApiResponse::ok("doctor", DoctorResponse {
-            checks,
-            summary,
-            fixes_applied,
-        }));
+        let _ = ctx.json(&ApiResponse::ok(
+            "doctor",
+            DoctorResponse {
+                checks,
+                summary,
+                fixes_applied,
+            },
+        ));
     } else {
         // Print summary
         println!();
@@ -1266,7 +1269,9 @@ fn check_telemetry_database(
                 status: CheckStatus::Fail,
                 message: "Could not open telemetry database".to_string(),
                 details: Some(e.to_string()),
-                suggestion: Some("Check file permissions or delete and let daemon recreate it".to_string()),
+                suggestion: Some(
+                    "Check file permissions or delete and let daemon recreate it".to_string(),
+                ),
                 fixable: false,
             };
             print_check_result(&result, ctx);
@@ -1310,7 +1315,9 @@ fn print_check_result(result: &CheckResult, ctx: &OutputContext) {
         CheckStatus::Skipped => println!(" {}", style.muted(&result.message)),
     }
 
-    if let Some(ref details) = result.details && ctx.is_verbose() {
+    if let Some(ref details) = result.details
+        && ctx.is_verbose()
+    {
         println!("    {}", style.muted(details));
     }
 

@@ -330,7 +330,9 @@ impl DiskTelemetry {
         }
 
         // Warn on high file descriptor usage
-        if let Some(ref fd) = telemetry.fd_stats && fd.used_pct > 80.0 {
+        if let Some(ref fd) = telemetry.fd_stats
+            && fd.used_pct > 80.0
+        {
             warn!(
                 fd_used_pct = %fd.used_pct,
                 fd_allocated = fd.allocated,

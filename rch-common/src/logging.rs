@@ -92,7 +92,9 @@ impl LogConfig {
             config.format = parsed;
         }
 
-        if let Ok(path) = std::env::var("RCH_LOG_FILE") && !path.trim().is_empty() {
+        if let Ok(path) = std::env::var("RCH_LOG_FILE")
+            && !path.trim().is_empty()
+        {
             config.file_path = Some(PathBuf::from(path));
         }
 

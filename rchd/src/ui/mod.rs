@@ -11,8 +11,11 @@
 //! - Version included in final message for troubleshooting
 
 pub mod banner;
+pub mod jobs;
 pub mod shutdown;
 
 #[allow(unused_imports)]
 pub use banner::DaemonBanner;
+#[allow(unused_imports)]
+pub use jobs::JobLifecycleLog;
 pub use shutdown::{JobDrainEvent, SessionStats, ShutdownSequence};

@@ -504,7 +504,9 @@ fn apply_layer(
 ) {
     const EPSILON: f64 = 0.0001;
 
-    if let Some(enabled) = layer.general.enabled && enabled != defaults.general.enabled {
+    if let Some(enabled) = layer.general.enabled
+        && enabled != defaults.general.enabled
+    {
         config.general.enabled = enabled;
         set_source(sources, "general.enabled", source.clone());
     }
@@ -627,7 +629,9 @@ fn apply_layer(
         set_source(sources, "output.first_run_complete", source.clone());
     }
 
-    if let Some(enabled) = layer.self_test.enabled && enabled != defaults.self_test.enabled {
+    if let Some(enabled) = layer.self_test.enabled
+        && enabled != defaults.self_test.enabled
+    {
         config.self_test.enabled = enabled;
         set_source(sources, "self_test.enabled", source.clone());
     }
@@ -898,7 +902,9 @@ fn apply_env_overrides_inner(
         }
     };
 
-    if let Some(val) = get_env("RCH_ENABLED") && let Some(enabled) = parse_bool(&val) {
+    if let Some(val) = get_env("RCH_ENABLED")
+        && let Some(enabled) = parse_bool(&val)
+    {
         config.general.enabled = enabled;
         if let Some(ref mut sources) = sources {
             set_source(
@@ -943,7 +949,9 @@ fn apply_env_overrides_inner(
             );
         }
     }
-    if let Some(val) = get_env("RCH_BUILD_SLOTS") && let Ok(slots) = val.parse() {
+    if let Some(val) = get_env("RCH_BUILD_SLOTS")
+        && let Ok(slots) = val.parse()
+    {
         config.compilation.build_slots = slots;
         if let Some(ref mut sources) = sources {
             set_source(
@@ -953,7 +961,9 @@ fn apply_env_overrides_inner(
             );
         }
     }
-    if let Some(val) = get_env("RCH_TEST_SLOTS") && let Ok(slots) = val.parse() {
+    if let Some(val) = get_env("RCH_TEST_SLOTS")
+        && let Ok(slots) = val.parse()
+    {
         config.compilation.test_slots = slots;
         if let Some(ref mut sources) = sources {
             set_source(
@@ -963,7 +973,9 @@ fn apply_env_overrides_inner(
             );
         }
     }
-    if let Some(val) = get_env("RCH_CHECK_SLOTS") && let Ok(slots) = val.parse() {
+    if let Some(val) = get_env("RCH_CHECK_SLOTS")
+        && let Ok(slots) = val.parse()
+    {
         config.compilation.check_slots = slots;
         if let Some(ref mut sources) = sources {
             set_source(
@@ -973,7 +985,9 @@ fn apply_env_overrides_inner(
             );
         }
     }
-    if let Some(val) = get_env("RCH_BUILD_TIMEOUT_SEC") && let Ok(timeout) = val.parse() {
+    if let Some(val) = get_env("RCH_BUILD_TIMEOUT_SEC")
+        && let Ok(timeout) = val.parse()
+    {
         config.compilation.build_timeout_sec = timeout;
         if let Some(ref mut sources) = sources {
             set_source(
@@ -983,7 +997,9 @@ fn apply_env_overrides_inner(
             );
         }
     }
-    if let Some(val) = get_env("RCH_TEST_TIMEOUT_SEC") && let Ok(timeout) = val.parse() {
+    if let Some(val) = get_env("RCH_TEST_TIMEOUT_SEC")
+        && let Ok(timeout) = val.parse()
+    {
         config.compilation.test_timeout_sec = timeout;
         if let Some(ref mut sources) = sources {
             set_source(
@@ -994,7 +1010,9 @@ fn apply_env_overrides_inner(
         }
     }
 
-    if let Some(val) = get_env("RCH_COMPRESSION") && let Ok(level) = val.parse() {
+    if let Some(val) = get_env("RCH_COMPRESSION")
+        && let Ok(level) = val.parse()
+    {
         config.transfer.compression_level = level;
         if let Some(ref mut sources) = sources {
             set_source(
@@ -1007,7 +1025,9 @@ fn apply_env_overrides_inner(
 
     let mut visibility_override: Option<(OutputVisibility, String)> = None;
 
-    if let Some(val) = get_env("RCH_QUIET") && parse_bool(&val).unwrap_or(false) {
+    if let Some(val) = get_env("RCH_QUIET")
+        && parse_bool(&val).unwrap_or(false)
+    {
         visibility_override = Some((OutputVisibility::None, "RCH_QUIET".to_string()));
     }
 

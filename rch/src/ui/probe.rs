@@ -543,7 +543,9 @@ impl ProbeSummary {
             }
         }
 
-        if let Some(avg_ms) = self.average_latency_ms && avg_ms > LATENCY_ACCEPTABLE_MS {
+        if let Some(avg_ms) = self.average_latency_ms
+            && avg_ms > LATENCY_ACCEPTABLE_MS
+        {
             let warning = Icons::warning(context);
             console.print_plain(&format!(
                 "{} High average latency ({}ms). Consider using workers with lower latency.",

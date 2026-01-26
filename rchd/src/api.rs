@@ -6,9 +6,9 @@
 
 use crate::DaemonContext;
 use crate::events::EventBus;
+use crate::health::{HealthConfig, probe_worker_capabilities};
 use crate::metrics;
 use crate::metrics::budget::{self, BudgetStatusResponse};
-use crate::health::{HealthConfig, probe_worker_capabilities};
 use crate::telemetry::collect_telemetry_from_worker;
 use crate::workers::WorkerPool;
 use anyhow::{Result, anyhow};
@@ -607,9 +607,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
                 let mut kv = param.splitn(2, '=');
                 let key = kv.next().unwrap_or("");
                 let value = kv.next().unwrap_or("");
-                if key == "refresh"
-                    && (value == "1" || value.eq_ignore_ascii_case("true"))
-                {
+                if key == "refresh" && (value == "1" || value.eq_ignore_ascii_case("true")) {
                     refresh = true;
                 }
             }
@@ -1046,7 +1044,9 @@ fn urlencoding_decode(s: &str) -> String {
         if c == '%' {
             // Try to read two hex digits
             let hex: String = chars.by_ref().take(2).collect();
-            if hex.len() == 2 && let Ok(byte) = u8::from_str_radix(&hex, 16) {
+            if hex.len() == 2
+                && let Ok(byte) = u8::from_str_radix(&hex, 16)
+            {
                 bytes.push(byte);
                 continue;
             }

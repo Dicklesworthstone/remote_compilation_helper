@@ -335,7 +335,9 @@ pub fn parse_shell_aliases_content(
             .filter(|s| !s.starts_with('-'))
             .filter(|s| {
                 // Also filter out values that follow -i or -p
-                if let Some(prev_idx) = ssh_args.find(s) && prev_idx > 0 {
+                if let Some(prev_idx) = ssh_args.find(s)
+                    && prev_idx > 0
+                {
                     let before = &ssh_args[..prev_idx].trim_end();
                     if before.ends_with("-i") || before.ends_with("-p") {
                         return false;

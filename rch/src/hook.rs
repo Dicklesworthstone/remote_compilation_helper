@@ -700,7 +700,9 @@ pub(crate) async fn query_daemon(
     // Build query string
     let mut query = format!("project={}&cores={}", urlencoding_encode(project), cores);
 
-    if let Some(tc) = toolchain && let Ok(json) = serde_json::to_string(tc) {
+    if let Some(tc) = toolchain
+        && let Ok(json) = serde_json::to_string(tc)
+    {
         query.push_str(&format!("&toolchain={}", urlencoding_encode(&json)));
     }
 
@@ -1123,7 +1125,9 @@ async fn execute_remote_compilation(
         warn!("Failed to forward telemetry to daemon: {}", e);
     }
 
-    if is_test_kind(kind) && let Some(kind) = kind {
+    if is_test_kind(kind)
+        && let Some(kind) = kind
+    {
         let record = TestRunRecord::new(
             project_id.clone(),
             worker_config.id.as_str().to_string(),

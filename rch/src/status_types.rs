@@ -2,8 +2,8 @@
 //!
 //! These types mirror the response structures from rchd's /status API endpoint.
 
-use serde::{Deserialize, Serialize};
 use rch_common::WorkerCapabilities;
+use serde::{Deserialize, Serialize};
 
 /// Full status response from daemon's GET /status.
 #[derive(Debug, Clone, Serialize, Deserialize)]

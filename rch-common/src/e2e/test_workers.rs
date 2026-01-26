@@ -431,11 +431,16 @@ pub fn require_workers(logger: &TestLogger) -> Option<TestWorkersConfig> {
     );
 
     if should_skip_all_tests() {
-        log_skip_event(logger, LogLevel::Info, "E2E tests disabled via env", vec![
-            ("reason".to_string(), "env_skip_all".to_string()),
-            ("env".to_string(), ENV_SKIP_ALL_TESTS.to_string()),
-            ("skip".to_string(), "true".to_string()),
-        ]);
+        log_skip_event(
+            logger,
+            LogLevel::Info,
+            "E2E tests disabled via env",
+            vec![
+                ("reason".to_string(), "env_skip_all".to_string()),
+                ("env".to_string(), ENV_SKIP_ALL_TESTS.to_string()),
+                ("skip".to_string(), "true".to_string()),
+            ],
+        );
         return None;
     }
 

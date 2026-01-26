@@ -69,7 +69,6 @@ pub enum RequiredRuntime {
     Node,
 }
 
-
 /// Worker selection request sent from hook to daemon.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SelectionRequest {
@@ -160,7 +159,6 @@ pub enum SelectionStrategy {
     /// Prevents hot-spotting when many workers are available.
     FairFastest,
 }
-
 
 impl std::fmt::Display for SelectionStrategy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -491,7 +489,6 @@ pub enum OutputVisibility {
     Verbose,
 }
 
-
 impl std::fmt::Display for OutputVisibility {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let value = match self {
@@ -532,7 +529,6 @@ pub enum ColorMode {
     /// Disable color output entirely.
     Never,
 }
-
 
 impl std::fmt::Display for ColorMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

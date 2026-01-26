@@ -53,7 +53,9 @@ pub fn is_toolchain_available(toolchain: &str) -> Result<bool> {
     // Check cache first
     {
         let cache = TOOLCHAIN_CACHE.read().unwrap();
-        if let Some(ref set) = *cache && set.contains(toolchain) {
+        if let Some(ref set) = *cache
+            && set.contains(toolchain)
+        {
             debug!("Toolchain {} found in cache", toolchain);
             return Ok(true);
         }
@@ -182,12 +184,16 @@ pub fn parse_toolchain_string(s: &str) -> ToolchainInfo {
     let s = strip_target_triple(s);
 
     // Handle nightly-YYYY-MM-DD format
-    if let Some(date) = s.strip_prefix("nightly-") && is_date_format(date) {
+    if let Some(date) = s.strip_prefix("nightly-")
+        && is_date_format(date)
+    {
         return ToolchainInfo::new("nightly", Some(date.to_string()), s);
     }
 
     // Handle beta-YYYY-MM-DD format
-    if let Some(date) = s.strip_prefix("beta-") && is_date_format(date) {
+    if let Some(date) = s.strip_prefix("beta-")
+        && is_date_format(date)
+    {
         return ToolchainInfo::new("beta", Some(date.to_string()), s);
     }
 

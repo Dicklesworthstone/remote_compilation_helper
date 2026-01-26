@@ -405,8 +405,16 @@ mod tests {
         for (context, rich, colored, machine) in cases {
             let console = RchConsole::with_context(context);
             assert_eq!(console.is_rich(), rich, "rich mismatch for {context:?}");
-            assert_eq!(console.is_colored(), colored, "color mismatch for {context:?}");
-            assert_eq!(console.is_machine(), machine, "machine mismatch for {context:?}");
+            assert_eq!(
+                console.is_colored(),
+                colored,
+                "color mismatch for {context:?}"
+            );
+            assert_eq!(
+                console.is_machine(),
+                machine,
+                "machine mismatch for {context:?}"
+            );
         }
     }
 
@@ -464,7 +472,9 @@ mod tests {
     #[test]
     fn test_rule_plain_long_title() {
         let console = RchConsole::with_context(OutputContext::Plain);
-        console.rule(Some("A Very Long Title That Exceeds The Default Width For Rules"));
+        console.rule(Some(
+            "A Very Long Title That Exceeds The Default Width For Rules",
+        ));
     }
 
     #[test]

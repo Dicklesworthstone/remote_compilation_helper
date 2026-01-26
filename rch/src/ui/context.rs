@@ -130,7 +130,9 @@ impl TerminalCaps {
     /// Check if the terminal supports colors.
     fn detect_color_support() -> bool {
         // Check TERM environment variable
-        if let Ok(term) = env::var("TERM") && term == "dumb" {
+        if let Ok(term) = env::var("TERM")
+            && term == "dumb"
+        {
             return false;
         }
 
@@ -673,9 +675,7 @@ mod tests {
                     && left_arr
                         .iter()
                         .zip(right_arr.iter())
-                        .all(|(left_item, right_item)| {
-                            json_values_loose_eq(left_item, right_item)
-                        })
+                        .all(|(left_item, right_item)| json_values_loose_eq(left_item, right_item))
             }
             (Value::Object(left_obj), Value::Object(right_obj)) => {
                 left_obj.len() == right_obj.len()
@@ -852,10 +852,13 @@ mod tests {
         let config = OutputConfig::default();
         let (ctx, stdout_buf, _) = make_test_context(config);
 
-        ctx.table(&["Name", "Status"], &[
-            vec!["worker-1".to_string(), "healthy".to_string()],
-            vec!["worker-2".to_string(), "degraded".to_string()],
-        ]);
+        ctx.table(
+            &["Name", "Status"],
+            &[
+                vec!["worker-1".to_string(), "healthy".to_string()],
+                vec!["worker-2".to_string(), "degraded".to_string()],
+            ],
+        );
 
         let output = stdout_buf.to_string_lossy();
         assert!(output.contains("Name"));

@@ -1225,12 +1225,15 @@ pub async fn workers_enable(worker_id: &str, ctx: &OutputContext) -> Result<()> 
         Ok(response) => {
             if response.contains("error") || response.contains("Error") {
                 if ctx.is_json() {
-                    let _ = ctx.json(&ApiResponse::ok("workers enable", WorkerActionResponse {
-                        worker_id: worker_id.to_string(),
-                        action: "enable".to_string(),
-                        success: false,
-                        message: Some(response),
-                    }));
+                    let _ = ctx.json(&ApiResponse::ok(
+                        "workers enable",
+                        WorkerActionResponse {
+                            worker_id: worker_id.to_string(),
+                            action: "enable".to_string(),
+                            success: false,
+                            message: Some(response),
+                        },
+                    ));
                 } else {
                     println!(
                         "{} Failed to enable worker: {}",
@@ -1239,12 +1242,15 @@ pub async fn workers_enable(worker_id: &str, ctx: &OutputContext) -> Result<()> 
                     );
                 }
             } else if ctx.is_json() {
-                let _ = ctx.json(&ApiResponse::ok("workers enable", WorkerActionResponse {
-                    worker_id: worker_id.to_string(),
-                    action: "enable".to_string(),
-                    success: true,
-                    message: Some("Worker is now enabled".to_string()),
-                }));
+                let _ = ctx.json(&ApiResponse::ok(
+                    "workers enable",
+                    WorkerActionResponse {
+                        worker_id: worker_id.to_string(),
+                        action: "enable".to_string(),
+                        success: true,
+                        message: Some("Worker is now enabled".to_string()),
+                    },
+                ));
             } else {
                 println!(
                     "{} Worker {} is now enabled.",
@@ -2092,68 +2098,68 @@ async fn setup_single_worker(
 
     // Step 2: Sync toolchain
     if !skip_toolchain && let Some(tc) = toolchain {
-            if !ctx.is_json() {
-                print!("      {} Toolchain: ", style.muted("→"));
-                use std::io::Write;
-                let _ = std::io::stdout().flush();
-            }
+        if !ctx.is_json() {
+            print!("      {} Toolchain: ", style.muted("→"));
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
+        }
 
-            if dry_run {
-                // Check if already installed for dry-run reporting
-                match check_remote_toolchain(worker, tc).await {
-                    Ok(true) => {
-                        if !ctx.is_json() {
-                            println!("{}", style.muted("already installed"));
-                        }
-                        result.toolchain_synced = true;
+        if dry_run {
+            // Check if already installed for dry-run reporting
+            match check_remote_toolchain(worker, tc).await {
+                Ok(true) => {
+                    if !ctx.is_json() {
+                        println!("{}", style.muted("already installed"));
                     }
-                    Ok(false) => {
-                        if !ctx.is_json() {
-                            println!("{}", style.muted("would install"));
-                        }
-                    }
-                    Err(e) => {
-                        if !ctx.is_json() {
-                            println!("{} ({})", style.warning("check failed"), e);
-                        }
+                    result.toolchain_synced = true;
+                }
+                Ok(false) => {
+                    if !ctx.is_json() {
+                        println!("{}", style.muted("would install"));
                     }
                 }
-            } else {
-                // Check and install
-                match check_remote_toolchain(worker, tc).await {
-                    Ok(true) => {
-                        result.toolchain_synced = true;
-                        if !ctx.is_json() {
-                            println!("{}", style.muted("already installed"));
-                        }
-                    }
-                    Ok(false) => {
-                        // Install
-                        match install_remote_toolchain(worker, tc).await {
-                            Ok(()) => {
-                                result.toolchain_synced = true;
-                                if !ctx.is_json() {
-                                    println!("{}", style.success("installed"));
-                                }
-                            }
-                            Err(e) => {
-                                result.success = false;
-                                result.errors.push(format!("Toolchain install: {}", e));
-                                if !ctx.is_json() {
-                                    println!("{} ({})", style.error("FAILED"), e);
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        result.success = false;
-                        result.errors.push(format!("Toolchain check: {}", e));
-                        if !ctx.is_json() {
-                            println!("{} ({})", style.error("FAILED"), e);
-                        }
+                Err(e) => {
+                    if !ctx.is_json() {
+                        println!("{} ({})", style.warning("check failed"), e);
                     }
                 }
             }
+        } else {
+            // Check and install
+            match check_remote_toolchain(worker, tc).await {
+                Ok(true) => {
+                    result.toolchain_synced = true;
+                    if !ctx.is_json() {
+                        println!("{}", style.muted("already installed"));
+                    }
+                }
+                Ok(false) => {
+                    // Install
+                    match install_remote_toolchain(worker, tc).await {
+                        Ok(()) => {
+                            result.toolchain_synced = true;
+                            if !ctx.is_json() {
+                                println!("{}", style.success("installed"));
+                            }
+                        }
+                        Err(e) => {
+                            result.success = false;
+                            result.errors.push(format!("Toolchain install: {}", e));
+                            if !ctx.is_json() {
+                                println!("{} ({})", style.error("FAILED"), e);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    result.success = false;
+                    result.errors.push(format!("Toolchain check: {}", e));
+                    if !ctx.is_json() {
+                        println!("{} ({})", style.error("FAILED"), e);
+                    }
+                }
+            }
+        }
     }
 
     // Step 3: Verify worker health (quick SSH ping)
@@ -2215,7 +2221,9 @@ fn detect_project_toolchain() -> Result<String> {
         // Format: [toolchain]\nchannel = "nightly-2025-01-01"
         for line in content.lines() {
             let line = line.trim();
-            if line.starts_with("channel") && let Some(value) = line.split('=').nth(1) {
+            if line.starts_with("channel")
+                && let Some(value) = line.split('=').nth(1)
+            {
                 let channel = value.trim().trim_matches('"').trim_matches('\'');
                 return Ok(channel.to_string());
             }
@@ -3018,11 +3026,14 @@ pub fn daemon_status(ctx: &OutputContext) -> Result<()> {
     };
 
     if ctx.is_json() {
-        let _ = ctx.json(&ApiResponse::ok("daemon status", DaemonStatusResponse {
-            running,
-            socket_path: DEFAULT_SOCKET_PATH.to_string(),
-            uptime_seconds,
-        }));
+        let _ = ctx.json(&ApiResponse::ok(
+            "daemon status",
+            DaemonStatusResponse {
+                running,
+                socket_path: DEFAULT_SOCKET_PATH.to_string(),
+                uptime_seconds,
+            },
+        ));
         return Ok(());
     }
 
@@ -3096,12 +3107,15 @@ pub async fn daemon_start(ctx: &OutputContext) -> Result<()> {
 
     if socket_path.exists() {
         if ctx.is_json() {
-            let _ = ctx.json(&ApiResponse::ok("daemon start", DaemonActionResponse {
-                action: "start".to_string(),
-                success: false,
-                socket_path: DEFAULT_SOCKET_PATH.to_string(),
-                message: Some("Daemon already running".to_string()),
-            }));
+            let _ = ctx.json(&ApiResponse::ok(
+                "daemon start",
+                DaemonActionResponse {
+                    action: "start".to_string(),
+                    success: false,
+                    socket_path: DEFAULT_SOCKET_PATH.to_string(),
+                    message: Some("Daemon already running".to_string()),
+                },
+            ));
         } else {
             println!(
                 "{} Daemon appears to already be running.",
@@ -3146,12 +3160,15 @@ pub async fn daemon_start(ctx: &OutputContext) -> Result<()> {
 
             if socket_path.exists() {
                 if ctx.is_json() {
-                    let _ = ctx.json(&ApiResponse::ok("daemon start", DaemonActionResponse {
-                        action: "start".to_string(),
-                        success: true,
-                        socket_path: DEFAULT_SOCKET_PATH.to_string(),
-                        message: Some("Daemon started successfully".to_string()),
-                    }));
+                    let _ = ctx.json(&ApiResponse::ok(
+                        "daemon start",
+                        DaemonActionResponse {
+                            action: "start".to_string(),
+                            success: true,
+                            socket_path: DEFAULT_SOCKET_PATH.to_string(),
+                            message: Some("Daemon started successfully".to_string()),
+                        },
+                    ));
                 } else {
                     println!(
                         "{}",
@@ -3165,12 +3182,15 @@ pub async fn daemon_start(ctx: &OutputContext) -> Result<()> {
                     );
                 }
             } else if ctx.is_json() {
-                let _ = ctx.json(&ApiResponse::ok("daemon start", DaemonActionResponse {
-                    action: "start".to_string(),
-                    success: false,
-                    socket_path: DEFAULT_SOCKET_PATH.to_string(),
-                    message: Some("Process started but socket not found".to_string()),
-                }));
+                let _ = ctx.json(&ApiResponse::ok(
+                    "daemon start",
+                    DaemonActionResponse {
+                        action: "start".to_string(),
+                        success: false,
+                        socket_path: DEFAULT_SOCKET_PATH.to_string(),
+                        message: Some("Process started but socket not found".to_string()),
+                    },
+                ));
             } else {
                 println!(
                     "{} Daemon process started but socket not found.",
@@ -3214,12 +3234,15 @@ pub async fn daemon_stop(ctx: &OutputContext) -> Result<()> {
 
     if !socket_path.exists() {
         if ctx.is_json() {
-            let _ = ctx.json(&ApiResponse::ok("daemon stop", DaemonActionResponse {
-                action: "stop".to_string(),
-                success: true,
-                socket_path: DEFAULT_SOCKET_PATH.to_string(),
-                message: Some("Daemon was not running".to_string()),
-            }));
+            let _ = ctx.json(&ApiResponse::ok(
+                "daemon stop",
+                DaemonActionResponse {
+                    action: "stop".to_string(),
+                    success: true,
+                    socket_path: DEFAULT_SOCKET_PATH.to_string(),
+                    message: Some("Daemon was not running".to_string()),
+                },
+            ));
         } else {
             println!(
                 "{} Daemon is not running {}",
@@ -3242,12 +3265,15 @@ pub async fn daemon_stop(ctx: &OutputContext) -> Result<()> {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 if !socket_path.exists() {
                     if ctx.is_json() {
-                        let _ = ctx.json(&ApiResponse::ok("daemon stop", DaemonActionResponse {
-                            action: "stop".to_string(),
-                            success: true,
-                            socket_path: DEFAULT_SOCKET_PATH.to_string(),
-                            message: Some("Daemon stopped".to_string()),
-                        }));
+                        let _ = ctx.json(&ApiResponse::ok(
+                            "daemon stop",
+                            DaemonActionResponse {
+                                action: "stop".to_string(),
+                                success: true,
+                                socket_path: DEFAULT_SOCKET_PATH.to_string(),
+                                message: Some("Daemon stopped".to_string()),
+                            },
+                        ));
                     } else {
                         println!(
                             "{}",
@@ -3258,12 +3284,15 @@ pub async fn daemon_stop(ctx: &OutputContext) -> Result<()> {
                 }
             }
             if ctx.is_json() {
-                let _ = ctx.json(&ApiResponse::ok("daemon stop", DaemonActionResponse {
-                    action: "stop".to_string(),
-                    success: false,
-                    socket_path: DEFAULT_SOCKET_PATH.to_string(),
-                    message: Some("Daemon may still be shutting down".to_string()),
-                }));
+                let _ = ctx.json(&ApiResponse::ok(
+                    "daemon stop",
+                    DaemonActionResponse {
+                        action: "stop".to_string(),
+                        success: false,
+                        socket_path: DEFAULT_SOCKET_PATH.to_string(),
+                        message: Some("Daemon may still be shutting down".to_string()),
+                    },
+                ));
             } else {
                 println!(
                     "{} Daemon may still be shutting down...",
@@ -3293,12 +3322,15 @@ pub async fn daemon_stop(ctx: &OutputContext) -> Result<()> {
                     // Remove stale socket
                     let _ = std::fs::remove_file(socket_path);
                     if ctx.is_json() {
-                        let _ = ctx.json(&ApiResponse::ok("daemon stop", DaemonActionResponse {
-                            action: "stop".to_string(),
-                            success: true,
-                            socket_path: DEFAULT_SOCKET_PATH.to_string(),
-                            message: Some("Daemon stopped via pkill".to_string()),
-                        }));
+                        let _ = ctx.json(&ApiResponse::ok(
+                            "daemon stop",
+                            DaemonActionResponse {
+                                action: "stop".to_string(),
+                                success: true,
+                                socket_path: DEFAULT_SOCKET_PATH.to_string(),
+                                message: Some("Daemon stopped via pkill".to_string()),
+                            },
+                        ));
                     } else {
                         println!(
                             "{}",
@@ -3378,11 +3410,14 @@ pub fn daemon_logs(lines: usize, ctx: &OutputContext) -> Result<()> {
             let log_lines: Vec<String> = all_lines[start..].iter().map(|s| s.to_string()).collect();
 
             if ctx.is_json() {
-                let _ = ctx.json(&ApiResponse::ok("daemon logs", DaemonLogsResponse {
-                    log_file: Some(path.display().to_string()),
-                    lines: log_lines,
-                    found: true,
-                }));
+                let _ = ctx.json(&ApiResponse::ok(
+                    "daemon logs",
+                    DaemonLogsResponse {
+                        log_file: Some(path.display().to_string()),
+                        lines: log_lines,
+                        found: true,
+                    },
+                ));
             } else {
                 println!(
                     "{} {} {}\n",
@@ -3401,11 +3436,14 @@ pub fn daemon_logs(lines: usize, ctx: &OutputContext) -> Result<()> {
     }
 
     if ctx.is_json() {
-        let _ = ctx.json(&ApiResponse::ok("daemon logs", DaemonLogsResponse {
-            log_file: None,
-            lines: vec![],
-            found: false,
-        }));
+        let _ = ctx.json(&ApiResponse::ok(
+            "daemon logs",
+            DaemonLogsResponse {
+                log_file: None,
+                lines: vec![],
+                found: false,
+            },
+        ));
     } else {
         println!(
             "{} No log file found.",
@@ -3518,7 +3556,9 @@ pub fn config_show(show_sources: bool, ctx: &OutputContext) -> Result<()> {
     // Helper closure to format value with source
     let format_with_source =
         |key: &str, value: &str, sources: &Option<Vec<ConfigValueSourceInfo>>| -> String {
-            if let Some(vs) = sources && let Some(s) = vs.iter().find(|v| v.key == key) {
+            if let Some(vs) = sources
+                && let Some(s) = vs.iter().find(|v| v.key == key)
+            {
                 return format!("{} {}", value, style.muted(&format!("# from {}", s.source)));
             }
             value.to_string()
@@ -3972,10 +4012,13 @@ pub fn config_init(ctx: &OutputContext, wizard: bool, use_defaults: bool) -> Res
 
     // JSON output
     if ctx.is_json() {
-        let _ = ctx.json(&ApiResponse::ok("config init", ConfigInitResponse {
-            created,
-            already_existed,
-        }));
+        let _ = ctx.json(&ApiResponse::ok(
+            "config init",
+            ConfigInitResponse {
+                created,
+                already_existed,
+            },
+        ));
         return Ok(());
     }
 
@@ -4112,10 +4155,13 @@ enabled = true
     }
 
     if ctx.is_json() {
-        let _ = ctx.json(&ApiResponse::ok("config init", ConfigInitResponse {
-            created,
-            already_existed,
-        }));
+        let _ = ctx.json(&ApiResponse::ok(
+            "config init",
+            ConfigInitResponse {
+                created,
+                already_existed,
+            },
+        ));
         return Ok(());
     }
 
@@ -4623,11 +4669,14 @@ fn config_set_at(config_path: &Path, key: &str, value: &str, ctx: &OutputContext
         .with_context(|| format!("Failed to write {:?}", config_path))?;
 
     if ctx.is_json() {
-        let _ = ctx.json(&ApiResponse::ok("config set", ConfigSetResponse {
-            key: key.to_string(),
-            value: value.to_string(),
-            config_path: config_path.display().to_string(),
-        }));
+        let _ = ctx.json(&ApiResponse::ok(
+            "config set",
+            ConfigSetResponse {
+                key: key.to_string(),
+                value: value.to_string(),
+                config_path: config_path.display().to_string(),
+            },
+        ));
     } else {
         println!("Updated {:?}: {} = {}", config_path, key, value);
     }
@@ -5241,12 +5290,15 @@ pub fn hook_install(ctx: &OutputContext) -> Result<()> {
     std::fs::write(&settings_path, new_content)?;
 
     if ctx.is_json() {
-        let _ = ctx.json(&ApiResponse::ok("hook install", HookActionResponse {
-            action: "install".to_string(),
-            success: true,
-            settings_path: settings_path.display().to_string(),
-            message: Some("Hook installed successfully".to_string()),
-        }));
+        let _ = ctx.json(&ApiResponse::ok(
+            "hook install",
+            HookActionResponse {
+                action: "install".to_string(),
+                success: true,
+                settings_path: settings_path.display().to_string(),
+                message: Some("Hook installed successfully".to_string()),
+            },
+        ));
     } else {
         println!(
             "{} Hook installed in {}",
@@ -5313,12 +5365,15 @@ pub fn hook_uninstall(ctx: &OutputContext) -> Result<()> {
         std::fs::write(&settings_path, new_content)?;
 
         if ctx.is_json() {
-            let _ = ctx.json(&ApiResponse::ok("hook uninstall", HookActionResponse {
-                action: "uninstall".to_string(),
-                success: true,
-                settings_path: settings_path.display().to_string(),
-                message: Some("Hook removed successfully".to_string()),
-            }));
+            let _ = ctx.json(&ApiResponse::ok(
+                "hook uninstall",
+                HookActionResponse {
+                    action: "uninstall".to_string(),
+                    success: true,
+                    settings_path: settings_path.display().to_string(),
+                    message: Some("Hook removed successfully".to_string()),
+                },
+            ));
         } else {
             println!(
                 "{} Hook removed from {}",
@@ -5327,12 +5382,15 @@ pub fn hook_uninstall(ctx: &OutputContext) -> Result<()> {
             );
         }
     } else if ctx.is_json() {
-        let _ = ctx.json(&ApiResponse::ok("hook uninstall", HookActionResponse {
-            action: "uninstall".to_string(),
-            success: false,
-            settings_path: settings_path.display().to_string(),
-            message: Some("Hook was not found".to_string()),
-        }));
+        let _ = ctx.json(&ApiResponse::ok(
+            "hook uninstall",
+            HookActionResponse {
+                action: "uninstall".to_string(),
+                success: false,
+                settings_path: settings_path.display().to_string(),
+                message: Some("Hook was not found".to_string()),
+            },
+        ));
     } else {
         println!(
             "{} Hook not found in settings.",
@@ -5346,7 +5404,9 @@ pub fn hook_uninstall(ctx: &OutputContext) -> Result<()> {
 /// Helper to get rchd path.
 fn which_rchd() -> PathBuf {
     // Try to find rchd in same directory as current executable
-    if let Ok(exe_path) = std::env::current_exe() && let Some(dir) = exe_path.parent() {
+    if let Ok(exe_path) = std::env::current_exe()
+        && let Some(dir) = exe_path.parent()
+    {
         let rchd = dir.join("rchd");
         if rchd.exists() {
             return rchd;
@@ -5704,8 +5764,8 @@ async fn query_workers_capabilities(refresh: bool) -> Result<WorkerCapabilitiesR
     let response = send_daemon_command(command).await?;
     let json = extract_json_body(&response)
         .ok_or_else(|| anyhow::anyhow!("Invalid response format from daemon"))?;
-    let capabilities: WorkerCapabilitiesResponseFromApi = serde_json::from_str(json)
-        .context("Failed to parse worker capabilities response")?;
+    let capabilities: WorkerCapabilitiesResponseFromApi =
+        serde_json::from_str(json).context("Failed to parse worker capabilities response")?;
     Ok(capabilities)
 }
 

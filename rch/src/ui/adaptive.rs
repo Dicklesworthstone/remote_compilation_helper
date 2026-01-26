@@ -178,7 +178,9 @@ pub fn detect_background() -> Background {
     }
 
     // macOS Terminal.app
-    if let Ok(bg) = env::var("TERM_BACKGROUND") && bg.to_lowercase() == "light" {
+    if let Ok(bg) = env::var("TERM_BACKGROUND")
+        && bg.to_lowercase() == "light"
+    {
         return Background::Light;
     }
 
@@ -266,7 +268,9 @@ pub fn detect_hyperlink_support() -> bool {
     }
 
     // Check TERM_FEATURES for hyperlink support (some terminals set this)
-    if let Ok(features) = env::var("TERM_FEATURES") && features.contains("hyperlink") {
+    if let Ok(features) = env::var("TERM_FEATURES")
+        && features.contains("hyperlink")
+    {
         return true;
     }
 

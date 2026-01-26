@@ -2,7 +2,7 @@
 
 use super::download::DownloadedRelease;
 use super::lock::UpdateLock;
-use super::types::{BackupEntry, UpdateError, MAX_BACKUPS};
+use super::types::{BackupEntry, MAX_BACKUPS, UpdateError};
 use crate::ui::OutputContext;
 use std::fs;
 use std::path::PathBuf;
@@ -172,7 +172,9 @@ fn find_backup_by_version(version: &str) -> Result<PathBuf, UpdateError> {
 /// Get the installation directory.
 fn get_install_dir() -> Result<PathBuf, UpdateError> {
     // Try to determine where rch is installed
-    if let Ok(exe) = std::env::current_exe() && let Some(parent) = exe.parent() {
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(parent) = exe.parent()
+    {
         return Ok(parent.to_path_buf());
     }
 
@@ -271,10 +273,12 @@ pub fn create_backup(
 
     // Write metadata JSON
     let metadata_path = backup_dir.join("backup.json");
-    let json = serde_json::to_string_pretty(&entry)
-        .map_err(|e| UpdateError::InstallFailed(format!("Failed to serialize backup metadata: {}", e)))?;
-    fs::write(&metadata_path, json)
-        .map_err(|e| UpdateError::InstallFailed(format!("Failed to write backup metadata: {}", e)))?;
+    let json = serde_json::to_string_pretty(&entry).map_err(|e| {
+        UpdateError::InstallFailed(format!("Failed to serialize backup metadata: {}", e))
+    })?;
+    fs::write(&metadata_path, json).map_err(|e| {
+        UpdateError::InstallFailed(format!("Failed to write backup metadata: {}", e))
+    })?;
 
     // Prune old backups
     prune_old_backups()?;

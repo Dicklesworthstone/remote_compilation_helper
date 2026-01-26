@@ -288,7 +288,9 @@ fn probe_capabilities() -> WorkerCapabilities {
         }
     };
 
-    if let Some(output) = bun_cmd && output.status.success() {
+    if let Some(output) = bun_cmd
+        && output.status.success()
+    {
         let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
         if !version.is_empty() {
             capabilities.bun_version = Some(version);

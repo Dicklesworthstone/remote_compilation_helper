@@ -161,7 +161,9 @@ pub fn create_if_missing(path: &Path, content: &str) -> Result<IdempotentResult>
     }
 
     // Ensure parent directory exists
-    if let Some(parent) = path.parent() && !parent.exists() {
+    if let Some(parent) = path.parent()
+        && !parent.exists()
+    {
         fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create directory: {:?}", parent))?;
     }
@@ -317,7 +319,9 @@ pub fn ensure_symlink(link: &Path, target: &Path) -> Result<IdempotentResult> {
 
     // Check if link exists (either as symlink or regular file)
     if link.symlink_metadata().is_ok() {
-        if let Ok(current_target) = fs::read_link(link) && current_target == target {
+        if let Ok(current_target) = fs::read_link(link)
+            && current_target == target
+        {
             return Ok(IdempotentResult::AlreadyExists);
         }
         fs::remove_file(link)
@@ -325,7 +329,9 @@ pub fn ensure_symlink(link: &Path, target: &Path) -> Result<IdempotentResult> {
     }
 
     // Ensure parent directory exists
-    if let Some(parent) = link.parent() && !parent.exists() {
+    if let Some(parent) = link.parent()
+        && !parent.exists()
+    {
         fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create directory: {:?}", parent))?;
     }
@@ -341,14 +347,18 @@ pub fn ensure_symlink(link: &Path, target: &Path) -> Result<IdempotentResult> {
     use std::os::windows::fs::symlink_file;
 
     if link.symlink_metadata().is_ok() {
-        if let Ok(current_target) = fs::read_link(link) && current_target == target {
+        if let Ok(current_target) = fs::read_link(link)
+            && current_target == target
+        {
             return Ok(IdempotentResult::AlreadyExists);
         }
         fs::remove_file(link)
             .with_context(|| format!("Failed to remove existing link: {:?}", link))?;
     }
 
-    if let Some(parent) = link.parent() && !parent.exists() {
+    if let Some(parent) = link.parent()
+        && !parent.exists()
+    {
         fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create directory: {:?}", parent))?;
     }

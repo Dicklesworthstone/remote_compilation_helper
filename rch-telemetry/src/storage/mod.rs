@@ -454,11 +454,17 @@ impl TelemetryStorage {
         let conn = self.conn.lock().expect("telemetry db lock");
 
         let telemetry_count: i64 =
-            conn.query_row("SELECT COUNT(*) FROM telemetry_snapshots", [], |row| row.get(0))?;
+            conn.query_row("SELECT COUNT(*) FROM telemetry_snapshots", [], |row| {
+                row.get(0)
+            })?;
         let hourly_count: i64 =
-            conn.query_row("SELECT COUNT(*) FROM telemetry_hourly", [], |row| row.get(0))?;
+            conn.query_row("SELECT COUNT(*) FROM telemetry_hourly", [], |row| {
+                row.get(0)
+            })?;
         let speedscore_count: i64 =
-            conn.query_row("SELECT COUNT(*) FROM speedscore_history", [], |row| row.get(0))?;
+            conn.query_row("SELECT COUNT(*) FROM speedscore_history", [], |row| {
+                row.get(0)
+            })?;
         let test_run_count: i64 =
             conn.query_row("SELECT COUNT(*) FROM test_runs", [], |row| row.get(0))?;
 

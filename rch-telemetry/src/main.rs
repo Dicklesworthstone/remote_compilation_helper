@@ -91,11 +91,15 @@ fn resolve_worker_id(override_id: Option<String>) -> String {
         return id;
     }
 
-    if let Ok(id) = std::env::var("RCH_WORKER_ID") && !id.trim().is_empty() {
+    if let Ok(id) = std::env::var("RCH_WORKER_ID")
+        && !id.trim().is_empty()
+    {
         return id;
     }
 
-    if let Ok(id) = std::env::var("HOSTNAME") && !id.trim().is_empty() {
+    if let Ok(id) = std::env::var("HOSTNAME")
+        && !id.trim().is_empty()
+    {
         return id;
     }
 
