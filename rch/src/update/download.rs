@@ -183,7 +183,11 @@ async fn extract_checksum(checksum_file: &PathBuf, filename: &str) -> Result<Str
         if parts.len() >= 2 {
             let checksum = parts[0];
             let file = parts.last().unwrap();
-            if *file == filename || file.ends_with(filename) {
+            // Exact match, or path prefix match (e.g., "./release/filename" matches "filename")
+            if *file == filename
+                || file.ends_with(&format!("/{}", filename))
+                || file.ends_with(&format!("\\{}", filename))
+            {
                 return Ok(checksum.to_string());
             }
         }
@@ -316,5 +320,46 @@ mod tests {
             result.unwrap(),
             "d7a8fbb307d7809469ca9abcb0082e4f8d5651e46d3cdb762d02d0bf37c9e592"
         );
+    }
+
+    #[tokio::test]
+    async fn test_extract_checksum_no_false_positive_suffix_match() {
+        let temp = TempDir::new().unwrap();
+        let checksum_file = temp.path().join("checksums.txt");
+
+        // Test that "foo-rch.tar.gz" doesn't match when looking for "rch.tar.gz"
+        std::fs::write(&checksum_file, "abc123  foo-rch.tar.gz\ndef456  rch.tar.gz").unwrap();
+
+        let result = extract_checksum(&checksum_file.to_path_buf(), "rch.tar.gz").await;
+        // Should match the exact "rch.tar.gz", not "foo-rch.tar.gz"
+        assert_eq!(result.unwrap(), "def456");
+    }
+
+    #[tokio::test]
+    async fn test_extract_checksum_path_prefix_with_slash() {
+        let temp = TempDir::new().unwrap();
+        let checksum_file = temp.path().join("checksums.txt");
+
+        // Test that path prefixes with / work correctly
+        std::fs::write(
+            &checksum_file,
+            "abc123  release/rch.tar.gz\ndef456  other/foo-rch.tar.gz",
+        )
+        .unwrap();
+
+        let result = extract_checksum(&checksum_file.to_path_buf(), "rch.tar.gz").await;
+        assert_eq!(result.unwrap(), "abc123");
+    }
+
+    #[tokio::test]
+    async fn test_extract_checksum_suffix_only_should_fail() {
+        let temp = TempDir::new().unwrap();
+        let checksum_file = temp.path().join("checksums.txt");
+
+        // If only "foo-rch.tar.gz" exists, looking for "rch.tar.gz" should fail
+        std::fs::write(&checksum_file, "abc123  foo-rch.tar.gz").unwrap();
+
+        let result = extract_checksum(&checksum_file.to_path_buf(), "rch.tar.gz").await;
+        assert!(result.is_err());
     }
 }

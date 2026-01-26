@@ -418,7 +418,8 @@ mod tests {
     use super::*;
     use crate::commands::{
         ConfigCircuitSection, ConfigCompilationSection, ConfigEnvironmentSection,
-        ConfigGeneralSection, ConfigOutputSection, ConfigTransferSection, ConfigValueSourceInfo,
+        ConfigGeneralSection, ConfigOutputSection, ConfigSelfHealingSection, ConfigTransferSection,
+        ConfigValueSourceInfo,
     };
     use rch_common::OutputVisibility;
 
@@ -451,6 +452,11 @@ mod tests {
             output: ConfigOutputSection {
                 visibility: OutputVisibility::Verbose,
                 first_run_complete: true,
+            },
+            self_healing: ConfigSelfHealingSection {
+                hook_starts_daemon: true,
+                auto_start_cooldown_secs: 60,
+                auto_start_timeout_secs: 10,
             },
             sources: vec![
                 "Environment variables (RCH_*)".to_string(),

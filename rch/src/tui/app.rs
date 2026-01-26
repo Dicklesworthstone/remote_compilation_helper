@@ -425,6 +425,7 @@ mod tests {
             duration_ms: 5000,
             location: "remote".to_string(),
             bytes_transferred: Some(1234),
+            timing: None,
         }
     }
 
