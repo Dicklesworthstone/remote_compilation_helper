@@ -5,6 +5,7 @@
 //! - Response: JSON `SelectionResponse` or error
 
 use crate::DaemonContext;
+use crate::alerts::AlertInfo;
 use crate::events::EventBus;
 use crate::health::{HealthConfig, probe_worker_capabilities};
 use crate::metrics;
@@ -70,6 +71,28 @@ enum ApiRequest {
     },
     SelfTestRun(SelfTestRunRequest),
     Shutdown,
+    CancelBuild {
+        build_id: u64,
+        force: bool,
+    },
+    CancelAllBuilds {
+        force: bool,
+    },
+    /// Drain a worker (stop sending new jobs, let existing jobs complete).
+    WorkerDrain {
+        worker_id: WorkerId,
+    },
+    /// Enable a previously disabled/draining worker.
+    WorkerEnable {
+        worker_id: WorkerId,
+    },
+    /// Disable a worker with optional reason and drain behavior.
+    WorkerDisable {
+        worker_id: WorkerId,
+        reason: Option<String>,
+        /// If true, drain existing jobs before fully disabling.
+        drain_first: bool,
+    },
 }
 
 // ============================================================================
@@ -91,6 +114,8 @@ pub struct DaemonFullStatus {
     pub recent_builds: Vec<BuildRecord>,
     /// Issues and warnings.
     pub issues: Vec<Issue>,
+    /// Active alerts from worker health monitoring.
+    pub alerts: Vec<AlertInfo>,
     /// Aggregate statistics.
     pub stats: BuildStats,
     /// Aggregate test run statistics.
@@ -254,6 +279,59 @@ pub struct SelfTestHistoryResponse {
 pub struct SelfTestRunResponse {
     pub run: crate::self_test::SelfTestRunRecord,
     pub results: Vec<crate::self_test::SelfTestResultRecord>,
+}
+
+// ============================================================================
+// Build Cancellation Response Types (per bead remote_compilation_helper-scs)
+// ============================================================================
+
+/// Response for a single build cancellation.
+#[derive(Debug, Serialize)]
+pub struct CancelBuildResponse {
+    pub status: String,
+    pub build_id: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    pub slots_released: u32,
+}
+
+/// Response for cancelling multiple builds.
+#[derive(Debug, Serialize)]
+pub struct CancelAllBuildsResponse {
+    pub status: String,
+    pub cancelled_count: usize,
+    pub cancelled: Vec<CancelledBuildInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// Info about a cancelled build.
+#[derive(Debug, Serialize)]
+pub struct CancelledBuildInfo {
+    pub build_id: u64,
+    pub worker_id: String,
+    pub project_id: String,
+    pub slots_released: u32,
+}
+
+/// Response for worker state changes (drain/enable/disable).
+#[derive(Debug, Serialize)]
+pub struct WorkerStateResponse {
+    pub status: String,
+    pub worker_id: String,
+    pub action: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_slots: Option<u32>,
 }
 
 // ============================================================================
@@ -558,6 +636,35 @@ pub async fn handle_connection(
                 "application/json",
             )
         }
+        Ok(ApiRequest::CancelBuild { build_id, force }) => {
+            metrics::inc_requests("cancel-build");
+            let response = handle_cancel_build(&ctx, build_id, force).await;
+            (serde_json::to_string(&response)?, "application/json")
+        }
+        Ok(ApiRequest::CancelAllBuilds { force }) => {
+            metrics::inc_requests("cancel-all-builds");
+            let response = handle_cancel_all_builds(&ctx, force).await;
+            (serde_json::to_string(&response)?, "application/json")
+        }
+        Ok(ApiRequest::WorkerDrain { worker_id }) => {
+            metrics::inc_requests("worker-drain");
+            let response = handle_worker_drain(&ctx, &worker_id).await;
+            (serde_json::to_string(&response)?, "application/json")
+        }
+        Ok(ApiRequest::WorkerEnable { worker_id }) => {
+            metrics::inc_requests("worker-enable");
+            let response = handle_worker_enable(&ctx, &worker_id).await;
+            (serde_json::to_string(&response)?, "application/json")
+        }
+        Ok(ApiRequest::WorkerDisable {
+            worker_id,
+            reason,
+            drain_first,
+        }) => {
+            metrics::inc_requests("worker-disable");
+            let response = handle_worker_disable(&ctx, &worker_id, reason, drain_first).await;
+            (serde_json::to_string(&response)?, "application/json")
+        }
         Err(e) => return Err(e),
     };
 
@@ -723,6 +830,55 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
 
     if path == "/shutdown" && method == "POST" {
         return Ok(ApiRequest::Shutdown);
+    }
+
+    // Build cancellation endpoints
+    if path.starts_with("/cancel-build") && method == "POST" {
+        let query = path.strip_prefix("/cancel-build").unwrap_or("");
+        let query = query.strip_prefix('?').unwrap_or("");
+
+        let mut build_id = None;
+        let mut force = false;
+
+        for param in query.split('&') {
+            if param.is_empty() {
+                continue;
+            }
+            let mut kv = param.splitn(2, '=');
+            let key = kv.next().unwrap_or("");
+            let value = kv.next().unwrap_or("");
+
+            match key {
+                "build_id" | "id" => build_id = value.parse().ok(),
+                "force" => force = value == "1" || value.eq_ignore_ascii_case("true"),
+                _ => {}
+            }
+        }
+
+        let build_id = build_id.ok_or_else(|| anyhow!("Missing 'build_id' parameter"))?;
+        return Ok(ApiRequest::CancelBuild { build_id, force });
+    }
+
+    if path.starts_with("/cancel-all-builds") && method == "POST" {
+        let query = path.strip_prefix("/cancel-all-builds").unwrap_or("");
+        let query = query.strip_prefix('?').unwrap_or("");
+
+        let mut force = false;
+
+        for param in query.split('&') {
+            if param.is_empty() {
+                continue;
+            }
+            let mut kv = param.splitn(2, '=');
+            let key = kv.next().unwrap_or("");
+            let value = kv.next().unwrap_or("");
+
+            if key == "force" {
+                force = value == "1" || value.eq_ignore_ascii_case("true");
+            }
+        }
+
+        return Ok(ApiRequest::CancelAllBuilds { force });
     }
 
     if path == "/status" {
@@ -952,6 +1108,59 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
 
         let source = source.unwrap_or(TelemetrySource::Piggyback);
         return Ok(ApiRequest::IngestTelemetry(source));
+    }
+
+    // Worker state management endpoints: POST /workers/{id}/{action}
+    if path.starts_with("/workers/") && method == "POST" {
+        let rest = path.strip_prefix("/workers/").unwrap_or("");
+        let (path_part, query) = split_path_query(rest);
+        let parts: Vec<&str> = path_part.split('/').collect();
+
+        if parts.len() == 2 {
+            let worker_id = urlencoding_decode(parts[0]);
+            let action = parts[1];
+
+            match action {
+                "drain" => {
+                    return Ok(ApiRequest::WorkerDrain {
+                        worker_id: WorkerId::new(worker_id),
+                    });
+                }
+                "enable" => {
+                    return Ok(ApiRequest::WorkerEnable {
+                        worker_id: WorkerId::new(worker_id),
+                    });
+                }
+                "disable" => {
+                    let mut reason = None;
+                    let mut drain_first = false;
+
+                    for param in query.split('&') {
+                        if param.is_empty() {
+                            continue;
+                        }
+                        let mut kv = param.splitn(2, '=');
+                        let key = kv.next().unwrap_or("");
+                        let value = kv.next().unwrap_or("");
+
+                        match key {
+                            "reason" => reason = Some(urlencoding_decode(value)),
+                            "drain" => {
+                                drain_first = value == "1" || value.eq_ignore_ascii_case("true")
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    return Ok(ApiRequest::WorkerDisable {
+                        worker_id: WorkerId::new(worker_id),
+                        reason,
+                        drain_first,
+                    });
+                }
+                _ => {}
+            }
+        }
     }
 
     if !path.starts_with("/select-worker") {
@@ -1274,10 +1483,8 @@ async fn handle_workers_capabilities(
     let timeout = HealthConfig::default().check_timeout;
 
     for worker in workers {
-        if refresh {
-            if let Some(capabilities) = probe_worker_capabilities(&worker, timeout).await {
-                worker.set_capabilities(capabilities).await;
-            }
+        if refresh && let Some(capabilities) = probe_worker_capabilities(&worker, timeout).await {
+            worker.set_capabilities(capabilities).await;
         }
 
         let config = worker.config.read().await;
@@ -1541,6 +1748,266 @@ fn handle_budget() -> BudgetStatusResponse {
     budget::get_budget_status()
 }
 
+/// Send a signal to a process using the kill command.
+///
+/// Returns true if the signal was sent successfully, false otherwise.
+fn send_signal_to_process(pid: u32, force: bool) -> bool {
+    if pid == 0 {
+        return false;
+    }
+
+    let signal = if force { "KILL" } else { "TERM" };
+
+    // Use kill command which is available on all Unix systems
+    match std::process::Command::new("kill")
+        .arg(format!("-{}", signal))
+        .arg(pid.to_string())
+        .output()
+    {
+        Ok(output) => output.status.success(),
+        Err(e) => {
+            debug!("Failed to send {} signal to process {}: {}", signal, pid, e);
+            false
+        }
+    }
+}
+
+/// Handle a build cancellation request.
+///
+/// Cancels an active build by:
+/// 1. Sending SIGTERM to the hook process (which propagates to remote)
+/// 2. Marking the build as cancelled in history
+/// 3. Releasing worker slots
+async fn handle_cancel_build(
+    ctx: &DaemonContext,
+    build_id: u64,
+    force: bool,
+) -> CancelBuildResponse {
+    // Look up the active build
+    let active_build = match ctx.history.active_build(build_id) {
+        Some(build) => build,
+        None => {
+            return CancelBuildResponse {
+                status: "error".to_string(),
+                build_id,
+                worker_id: None,
+                project_id: None,
+                message: Some("Build not found or already completed".to_string()),
+                slots_released: 0,
+            };
+        }
+    };
+
+    let worker_id = active_build.worker_id.clone();
+    let project_id = active_build.project_id.clone();
+    let slots = active_build.slots;
+    let hook_pid = active_build.hook_pid;
+
+    // Send signal to the hook process
+    // SIGTERM for graceful, SIGKILL for force
+    if hook_pid > 0 && !send_signal_to_process(hook_pid, force) {
+        debug!("Failed to send signal to hook process {}", hook_pid);
+        // Process might have already exited, continue with cleanup
+    }
+
+    // Cancel the build in history (marks as cancelled with exit code 130)
+    ctx.history.cancel_active_build(build_id, None);
+
+    // Release worker slots
+    if let Some(worker) = ctx.pool.get(&WorkerId::new(&worker_id)).await {
+        worker.release_slots(slots).await;
+    }
+
+    CancelBuildResponse {
+        status: "cancelled".to_string(),
+        build_id,
+        worker_id: Some(worker_id),
+        project_id: Some(project_id),
+        message: Some(if force {
+            "Build forcefully terminated".to_string()
+        } else {
+            "Build cancellation signal sent".to_string()
+        }),
+        slots_released: slots,
+    }
+}
+
+/// Handle cancellation of all active builds.
+async fn handle_cancel_all_builds(ctx: &DaemonContext, force: bool) -> CancelAllBuildsResponse {
+    let active_builds = ctx.history.active_builds();
+
+    if active_builds.is_empty() {
+        return CancelAllBuildsResponse {
+            status: "ok".to_string(),
+            cancelled_count: 0,
+            cancelled: vec![],
+            message: Some("No active builds to cancel".to_string()),
+        };
+    }
+
+    let mut cancelled = Vec::with_capacity(active_builds.len());
+
+    for build in active_builds {
+        let build_id = build.id;
+        let worker_id = build.worker_id.clone();
+        let project_id = build.project_id.clone();
+        let slots = build.slots;
+        let hook_pid = build.hook_pid;
+
+        // Send signal to hook process
+        if hook_pid > 0 {
+            send_signal_to_process(hook_pid, force);
+        }
+
+        // Cancel in history
+        ctx.history.cancel_active_build(build_id, None);
+
+        // Release worker slots
+        if let Some(worker) = ctx.pool.get(&WorkerId::new(&worker_id)).await {
+            worker.release_slots(slots).await;
+        }
+
+        cancelled.push(CancelledBuildInfo {
+            build_id,
+            worker_id,
+            project_id,
+            slots_released: slots,
+        });
+    }
+
+    let cancelled_count = cancelled.len();
+
+    CancelAllBuildsResponse {
+        status: "ok".to_string(),
+        cancelled_count,
+        cancelled,
+        message: Some(format!(
+            "{} build(s) {}",
+            cancelled_count,
+            if force {
+                "forcefully terminated"
+            } else {
+                "cancelled"
+            }
+        )),
+    }
+}
+
+/// Handle a worker drain request.
+async fn handle_worker_drain(ctx: &DaemonContext, worker_id: &WorkerId) -> WorkerStateResponse {
+    match ctx.pool.get(worker_id).await {
+        Some(worker) => {
+            let active_slots = worker.used_slots();
+            worker.drain().await;
+            WorkerStateResponse {
+                status: "ok".to_string(),
+                worker_id: worker_id.to_string(),
+                action: "drain".to_string(),
+                new_status: Some("draining".to_string()),
+                reason: None,
+                message: Some(format!(
+                    "Worker is draining. {} slot(s) currently in use.",
+                    active_slots
+                )),
+                active_slots: Some(active_slots),
+            }
+        }
+        None => WorkerStateResponse {
+            status: "error".to_string(),
+            worker_id: worker_id.to_string(),
+            action: "drain".to_string(),
+            new_status: None,
+            reason: None,
+            message: Some(format!("Worker '{}' not found", worker_id)),
+            active_slots: None,
+        },
+    }
+}
+
+/// Handle a worker enable request.
+async fn handle_worker_enable(ctx: &DaemonContext, worker_id: &WorkerId) -> WorkerStateResponse {
+    match ctx.pool.get(worker_id).await {
+        Some(worker) => {
+            let old_status = worker.status().await;
+            worker.enable().await;
+            WorkerStateResponse {
+                status: "ok".to_string(),
+                worker_id: worker_id.to_string(),
+                action: "enable".to_string(),
+                new_status: Some("healthy".to_string()),
+                reason: None,
+                message: Some(format!("Worker enabled (was {:?})", old_status)),
+                active_slots: None,
+            }
+        }
+        None => WorkerStateResponse {
+            status: "error".to_string(),
+            worker_id: worker_id.to_string(),
+            action: "enable".to_string(),
+            new_status: None,
+            reason: None,
+            message: Some(format!("Worker '{}' not found", worker_id)),
+            active_slots: None,
+        },
+    }
+}
+
+/// Handle a worker disable request.
+async fn handle_worker_disable(
+    ctx: &DaemonContext,
+    worker_id: &WorkerId,
+    reason: Option<String>,
+    drain_first: bool,
+) -> WorkerStateResponse {
+    match ctx.pool.get(worker_id).await {
+        Some(worker) => {
+            let active_slots = worker.used_slots();
+
+            if drain_first && active_slots > 0 {
+                // Start draining - will be fully disabled when slots reach 0
+                worker.drain().await;
+                WorkerStateResponse {
+                    status: "ok".to_string(),
+                    worker_id: worker_id.to_string(),
+                    action: "disable".to_string(),
+                    new_status: Some("draining".to_string()),
+                    reason: reason.clone(),
+                    message: Some(format!(
+                        "Worker is draining before disable. {} slot(s) in use. Reason: {}",
+                        active_slots,
+                        reason.as_deref().unwrap_or("none provided")
+                    )),
+                    active_slots: Some(active_slots),
+                }
+            } else {
+                // Disable immediately
+                worker.disable(reason.clone()).await;
+                WorkerStateResponse {
+                    status: "ok".to_string(),
+                    worker_id: worker_id.to_string(),
+                    action: "disable".to_string(),
+                    new_status: Some("disabled".to_string()),
+                    reason: reason.clone(),
+                    message: Some(format!(
+                        "Worker disabled. Reason: {}",
+                        reason.as_deref().unwrap_or("none provided")
+                    )),
+                    active_slots: Some(active_slots),
+                }
+            }
+        }
+        None => WorkerStateResponse {
+            status: "error".to_string(),
+            worker_id: worker_id.to_string(),
+            action: "disable".to_string(),
+            new_status: None,
+            reason,
+            message: Some(format!("Worker '{}' not found", worker_id)),
+            active_slots: None,
+        },
+    }
+}
+
 /// Handle a status request.
 async fn handle_status(ctx: &DaemonContext) -> Result<DaemonFullStatus> {
     let workers = ctx.pool.all_workers().await;
@@ -1646,6 +2113,9 @@ async fn handle_status(ctx: &DaemonContext) -> Result<DaemonFullStatus> {
     let stats = ctx.history.stats();
     let test_stats = ctx.telemetry.test_run_stats();
 
+    // Collect active alerts from the alert manager
+    let alerts = ctx.alert_manager.active_alerts();
+
     Ok(DaemonFullStatus {
         daemon: DaemonStatusInfo {
             pid: ctx.pid,
@@ -1659,9 +2129,21 @@ async fn handle_status(ctx: &DaemonContext) -> Result<DaemonFullStatus> {
             slots_available,
         },
         workers: worker_infos,
-        active_builds: vec![], // TODO: Implement active build tracking
+        active_builds: ctx
+            .history
+            .active_builds()
+            .into_iter()
+            .map(|b| ActiveBuild {
+                id: b.id,
+                project_id: b.project_id,
+                worker_id: b.worker_id,
+                command: b.command,
+                started_at: b.started_at,
+            })
+            .collect(),
         recent_builds,
         issues,
+        alerts,
         stats,
         test_stats,
     })
@@ -1690,6 +2172,9 @@ mod tests {
             SelfTestConfig::default(),
             history,
         ));
+        let alert_manager = Arc::new(crate::alerts::AlertManager::new(
+            crate::alerts::AlertConfig::default(),
+        ));
         DaemonContext {
             pool,
             worker_selector: Arc::new(WorkerSelector::new()),
@@ -1698,6 +2183,7 @@ mod tests {
             benchmark_queue: Arc::new(BenchmarkQueue::new(ChronoDuration::minutes(5))),
             events: EventBus::new(16),
             self_test,
+            alert_manager,
             started_at: Instant::now(),
             socket_path: "/tmp/test.sock".to_string(),
             version: "0.1.0",

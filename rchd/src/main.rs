@@ -5,6 +5,7 @@
 
 #![forbid(unsafe_code)]
 
+mod alerts;
 mod api;
 mod benchmark_queue;
 mod benchmark_scheduler;
@@ -99,6 +100,8 @@ pub struct DaemonContext {
     pub events: EventBus,
     /// Self-test service.
     pub self_test: Arc<SelfTestService>,
+    /// Alert manager for worker health alerting.
+    pub alert_manager: Arc<alerts::AlertManager>,
     /// Daemon start time.
     pub started_at: Instant,
     /// Socket path (for status reporting).
@@ -115,8 +118,8 @@ async fn main() -> Result<()> {
     let startup_started = Instant::now();
 
     if cli.debug_routing {
-        // Safety: set before any worker threads spawn; no concurrent env access.
-        unsafe { std::env::set_var("RCHD_DEBUG_ROUTING", "1") };
+        // Avoid env var mutation (unsafe in Rust 2024); use an in-process override.
+        crate::ui::workers::set_debug_routing_enabled(true);
     }
 
     // Initialize logging
@@ -174,6 +177,25 @@ async fn main() -> Result<()> {
         rch_config.selection,
         rch_config.circuit,
     ));
+
+    // Verify and install Claude Code hook if needed (self-healing)
+    match rch_common::verify_and_install_claude_code_hook() {
+        Ok(rch_common::HookResult::AlreadyInstalled) => {
+            tracing::debug!("Claude Code hook already installed");
+        }
+        Ok(rch_common::HookResult::Installed) => {
+            info!("Claude Code hook installed automatically");
+        }
+        Ok(rch_common::HookResult::NotApplicable) => {
+            tracing::debug!("Claude Code not detected, skipping hook installation");
+        }
+        Ok(rch_common::HookResult::Skipped(reason)) => {
+            tracing::debug!("Hook installation skipped: {}", reason);
+        }
+        Err(e) => {
+            warn!("Failed to verify/install Claude Code hook: {}", e);
+        }
+    }
 
     // Initialize build history
     let history = if let Some(ref path) = cli.history_file {
@@ -279,6 +301,9 @@ async fn main() -> Result<()> {
 
     let benchmark_queue = Arc::new(BenchmarkQueue::new(ChronoDuration::minutes(5)));
 
+    // Initialize alert manager for worker health alerting
+    let alert_manager = Arc::new(alerts::AlertManager::new(alerts::AlertConfig::default()));
+
     let context = DaemonContext {
         pool: worker_pool.clone(),
         worker_selector: worker_selector.clone(),
@@ -287,6 +312,7 @@ async fn main() -> Result<()> {
         benchmark_queue: benchmark_queue.clone(),
         events: event_bus.clone(),
         self_test: self_test_service.clone(),
+        alert_manager: alert_manager.clone(),
         started_at: Instant::now(),
         socket_path: cli.socket.to_string_lossy().to_string(),
         version: env!("CARGO_PKG_VERSION"),
@@ -301,12 +327,13 @@ async fn main() -> Result<()> {
     let metrics_interval = Duration::from_secs(cli.metrics_reset_interval.max(1));
     let metrics_dashboard = Arc::new(Mutex::new(MetricsDashboard::new(metrics_interval)));
 
-    // Start health monitor
+    // Start health monitor with alert manager integration
     let health_config = health::HealthConfig::default();
     let health_monitor = health::HealthMonitor::new(worker_pool.clone(), health_config)
-        .with_status_panel(worker_status_panel.clone());
+        .with_status_panel(worker_status_panel.clone())
+        .with_alert_manager(alert_manager.clone());
     let health_handle = health_monitor.start();
-    info!("Health monitor started");
+    info!("Health monitor started with alerting enabled");
 
     // Start telemetry poller
     let telemetry_poller = TelemetryPoller::new(
@@ -451,6 +478,12 @@ mod tests {
         ))
     }
 
+    fn make_test_alert_manager() -> Arc<crate::alerts::AlertManager> {
+        Arc::new(crate::alerts::AlertManager::new(
+            crate::alerts::AlertConfig::default(),
+        ))
+    }
+
     // =========================================================================
     // test_daemon_context_creation - DaemonContext initialization tests
     // =========================================================================
@@ -472,6 +505,7 @@ mod tests {
             benchmark_queue: Arc::new(BenchmarkQueue::new(ChronoDuration::minutes(5))),
             events: EventBus::new(16),
             self_test: make_test_self_test(pool.clone()),
+            alert_manager: make_test_alert_manager(),
             started_at,
             socket_path: "/tmp/test.sock".to_string(),
             version: "0.1.0-test",
@@ -515,6 +549,7 @@ mod tests {
             benchmark_queue: Arc::new(BenchmarkQueue::new(ChronoDuration::minutes(5))),
             events: EventBus::new(16),
             self_test: make_test_self_test(pool.clone()),
+            alert_manager: make_test_alert_manager(),
             started_at,
             socket_path: rch_common::default_socket_path(),
             version: env!("CARGO_PKG_VERSION"),
@@ -547,6 +582,7 @@ mod tests {
             duration_ms: 60000,
             location: rch_common::BuildLocation::Remote,
             bytes_transferred: Some(1024),
+            timing: None,
         };
         history.record(record);
 
@@ -558,6 +594,7 @@ mod tests {
             benchmark_queue: Arc::new(BenchmarkQueue::new(ChronoDuration::minutes(5))),
             events: EventBus::new(16),
             self_test: make_test_self_test(pool.clone()),
+            alert_manager: make_test_alert_manager(),
             started_at: Instant::now(),
             socket_path: rch_common::default_socket_path(),
             version: "0.1.0",
@@ -586,6 +623,7 @@ mod tests {
             benchmark_queue: Arc::new(BenchmarkQueue::new(ChronoDuration::minutes(5))),
             events: EventBus::new(16),
             self_test: make_test_self_test(pool.clone()),
+            alert_manager: make_test_alert_manager(),
             started_at: Instant::now(),
             socket_path: rch_common::default_socket_path(),
             version: "0.1.0",
@@ -633,6 +671,7 @@ mod tests {
             benchmark_queue: Arc::new(BenchmarkQueue::new(ChronoDuration::minutes(5))),
             events: EventBus::new(16),
             self_test: make_test_self_test(pool.clone()),
+            alert_manager: make_test_alert_manager(),
             started_at,
             socket_path: rch_common::default_socket_path(),
             version: "0.1.0",
@@ -678,6 +717,7 @@ mod tests {
             benchmark_queue: Arc::new(BenchmarkQueue::new(ChronoDuration::minutes(5))),
             events: EventBus::new(16),
             self_test: make_test_self_test(pool.clone()),
+            alert_manager: make_test_alert_manager(),
             started_at: Instant::now(),
             socket_path: rch_common::default_socket_path(),
             version: "0.1.0",
@@ -710,6 +750,7 @@ mod tests {
                 duration_ms: 1000,
                 location: rch_common::BuildLocation::Local,
                 bytes_transferred: None,
+                timing: None,
             };
             history.record(record);
         }
@@ -747,6 +788,7 @@ mod tests {
                 duration_ms,
                 location,
                 bytes_transferred: None,
+                timing: None,
             };
             history.record(record);
         }

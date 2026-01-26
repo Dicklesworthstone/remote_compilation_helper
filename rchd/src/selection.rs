@@ -24,6 +24,9 @@ use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::debug;
 
+const DEFAULT_NETWORK_SCORE: f64 = 0.5;
+const NETWORK_LATENCY_HALF_LIFE_MS: f64 = 200.0;
+
 /// Weights for the selection scoring algorithm (legacy compatibility).
 #[derive(Debug, Clone)]
 pub struct SelectionWeights {
@@ -431,6 +434,9 @@ impl WorkerSelector {
 
         let mut eligible: Vec<(Arc<WorkerState>, CircuitState)> = Vec::new();
         let mut preferred: Vec<(Arc<WorkerState>, CircuitState)> = Vec::new();
+        let mut eligible_without_health: Vec<(Arc<WorkerState>, CircuitState)> = Vec::new();
+        let mut preferred_without_health: Vec<(Arc<WorkerState>, CircuitState)> = Vec::new();
+        let mut filtered_by_health = 0usize;
         let mut any_has_runtime = false;
 
         for worker in workers {
@@ -474,6 +480,21 @@ impl WorkerSelector {
             any_has_runtime = true;
 
             if has_preferred && preferred_set.contains(worker_id.as_str()) {
+                preferred_without_health.push((worker.clone(), circuit_state));
+            }
+            eligible_without_health.push((worker.clone(), circuit_state));
+
+            let success_rate = self.health_score(&worker).await;
+            if success_rate < self.config.min_success_rate {
+                filtered_by_health += 1;
+                debug!(
+                    "Worker {} excluded: success_rate {:.2} < min {:.2}",
+                    worker_id, success_rate, self.config.min_success_rate
+                );
+                continue;
+            }
+
+            if has_preferred && preferred_set.contains(worker_id.as_str()) {
                 preferred.push((worker.clone(), circuit_state));
             }
             eligible.push((worker, circuit_state));
@@ -488,9 +509,23 @@ impl WorkerSelector {
 
         // Return preferred workers if available, otherwise all eligible
         if has_preferred && !preferred.is_empty() {
-            Ok(preferred)
+            return Ok(preferred);
+        }
+        if !eligible.is_empty() {
+            return Ok(eligible);
+        }
+
+        if filtered_by_health > 0 {
+            debug!(
+                "No workers meet min_success_rate {:.2}; falling back to workers below threshold",
+                self.config.min_success_rate
+            );
+        }
+
+        if has_preferred && !preferred_without_health.is_empty() {
+            Ok(preferred_without_health)
         } else {
-            Ok(eligible)
+            Ok(eligible_without_health)
         }
     }
 
@@ -607,13 +642,21 @@ impl WorkerSelector {
         // Cache affinity (0-1)
         let cache_score = cache.estimate_warmth(config.id.as_str(), project);
 
+        // Health score (0-1)
+        let health_score = self.health_score(worker).await;
+
+        // Network score (0-1)
+        let network_score = self.network_score(worker).await;
+
         // Priority normalization (0-1)
         let priority_score = Self::normalize_priority(config.priority, min_priority, max_priority);
 
         // Combine weighted scores
         let base_score = weights.speedscore * speed_score
             + weights.slots * slot_score * load_factor
+            + weights.health * health_score
             + weights.cache * cache_score
+            + weights.network * network_score
             + weights.priority * priority_score;
 
         // Apply half-open penalty if applicable
@@ -624,18 +667,39 @@ impl WorkerSelector {
         };
 
         debug!(
-            "Worker {} balanced score: {:.3} (speed={:.2}, load={:.2}, slots={:.2}, cache={:.2}, priority={:.2}, half_open={:?})",
+            "Worker {} balanced score: {:.3} (speed={:.2}, load={:.2}, slots={:.2}, health={:.2}, cache={:.2}, network={:.2}, priority={:.2}, half_open={:?})",
             config.id,
             final_score,
             speed_score,
             load_factor,
             slot_score,
+            health_score,
             cache_score,
+            network_score,
             priority_score,
             circuit_state == CircuitState::HalfOpen
         );
 
         final_score
+    }
+
+    async fn health_score(&self, worker: &WorkerState) -> f64 {
+        let stats = worker.circuit_stats().await;
+        let success_rate = 1.0 - stats.error_rate();
+        success_rate.clamp(0.0, 1.0)
+    }
+
+    async fn network_score(&self, worker: &WorkerState) -> f64 {
+        match worker.last_latency_ms().await {
+            Some(latency_ms) => Self::normalize_latency_ms(latency_ms),
+            None => DEFAULT_NETWORK_SCORE,
+        }
+    }
+
+    fn normalize_latency_ms(latency_ms: u64) -> f64 {
+        let latency = latency_ms as f64;
+        let score = 1.0 / (1.0 + (latency / NETWORK_LATENCY_HALF_LIFE_MS));
+        score.clamp(0.0, 1.0)
     }
 
     /// CacheAffinity strategy: heavily weight cache warmth.
@@ -1056,7 +1120,7 @@ mod tests {
     use super::*;
     use crate::workers::WorkerState;
     use rch_common::WorkerStatus;
-    use rch_common::{RequiredRuntime, WorkerConfig, WorkerId};
+    use rch_common::{RequiredRuntime, SelectionWeightConfig, WorkerConfig, WorkerId};
 
     fn make_worker(id: &str, total_slots: u32, speed: f64) -> WorkerState {
         let config = WorkerConfig {
@@ -1685,6 +1749,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_worker_selector_filters_low_success_rate() {
+        let pool = WorkerPool::new();
+
+        let fast_unhealthy = make_worker("fast-unhealthy", 8, 95.0);
+        // Drive success rate to 0.0 (all failures)
+        fast_unhealthy.record_failure(None).await;
+        fast_unhealthy.record_failure(None).await;
+        fast_unhealthy.record_failure(None).await;
+        pool.add_worker_state(fast_unhealthy).await;
+
+        let slow_healthy = make_worker("slow-healthy", 8, 40.0);
+        slow_healthy.record_success().await;
+        pool.add_worker_state(slow_healthy).await;
+
+        let selector = WorkerSelector::with_config(
+            SelectionConfig {
+                strategy: SelectionStrategy::Fastest,
+                min_success_rate: 0.8,
+                ..Default::default()
+            },
+            CircuitBreakerConfig::default(),
+        );
+
+        let request = SelectionRequest {
+            project: "test-project".to_string(),
+            command: None,
+            estimated_cores: 2,
+            preferred_workers: vec![],
+            toolchain: None,
+            required_runtime: RequiredRuntime::default(),
+            classification_duration_us: None,
+        };
+
+        let result = selector.select(&pool, &request).await;
+        let selected = result.worker.expect("Expected a worker");
+        assert_eq!(selected.config.read().await.id.as_str(), "slow-healthy");
+    }
+
+    #[tokio::test]
     async fn test_worker_selector_balanced_strategy() {
         let pool = WorkerPool::new();
         pool.add_worker(make_worker("worker1", 8, 70.0).config.read().await.clone())
@@ -1714,6 +1817,96 @@ mod tests {
         // Should return a worker (either one is fine for this test)
         assert!(result.worker.is_some());
         assert_eq!(result.reason, SelectionReason::Success);
+    }
+
+    #[tokio::test]
+    async fn test_worker_selector_balanced_health_weight_prefers_healthy() {
+        let pool = WorkerPool::new();
+
+        let unhealthy = make_worker("unhealthy", 8, 70.0);
+        unhealthy.record_failure(None).await;
+        pool.add_worker_state(unhealthy).await;
+
+        let healthy = make_worker("healthy", 8, 70.0);
+        healthy.record_success().await;
+        pool.add_worker_state(healthy).await;
+
+        let selector = WorkerSelector::with_config(
+            SelectionConfig {
+                strategy: SelectionStrategy::Balanced,
+                min_success_rate: 0.0,
+                weights: SelectionWeightConfig {
+                    speedscore: 0.0,
+                    slots: 0.0,
+                    health: 1.0,
+                    cache: 0.0,
+                    network: 0.0,
+                    priority: 0.0,
+                    half_open_penalty: 1.0,
+                },
+                ..Default::default()
+            },
+            CircuitBreakerConfig::default(),
+        );
+
+        let request = SelectionRequest {
+            project: "test-project".to_string(),
+            command: None,
+            estimated_cores: 2,
+            preferred_workers: vec![],
+            toolchain: None,
+            required_runtime: RequiredRuntime::default(),
+            classification_duration_us: None,
+        };
+
+        let result = selector.select(&pool, &request).await;
+        let selected = result.worker.expect("Expected a worker");
+        assert_eq!(selected.config.read().await.id.as_str(), "healthy");
+    }
+
+    #[tokio::test]
+    async fn test_worker_selector_balanced_network_weight_prefers_low_latency() {
+        let pool = WorkerPool::new();
+
+        let fast_net = make_worker("fast-net", 8, 70.0);
+        fast_net.set_last_latency_ms(Some(20)).await;
+        pool.add_worker_state(fast_net).await;
+
+        let slow_net = make_worker("slow-net", 8, 70.0);
+        slow_net.set_last_latency_ms(Some(600)).await;
+        pool.add_worker_state(slow_net).await;
+
+        let selector = WorkerSelector::with_config(
+            SelectionConfig {
+                strategy: SelectionStrategy::Balanced,
+                min_success_rate: 0.0,
+                weights: SelectionWeightConfig {
+                    speedscore: 0.0,
+                    slots: 0.0,
+                    health: 0.0,
+                    cache: 0.0,
+                    network: 1.0,
+                    priority: 0.0,
+                    half_open_penalty: 1.0,
+                },
+                ..Default::default()
+            },
+            CircuitBreakerConfig::default(),
+        );
+
+        let request = SelectionRequest {
+            project: "test-project".to_string(),
+            command: None,
+            estimated_cores: 2,
+            preferred_workers: vec![],
+            toolchain: None,
+            required_runtime: RequiredRuntime::default(),
+            classification_duration_us: None,
+        };
+
+        let result = selector.select(&pool, &request).await;
+        let selected = result.worker.expect("Expected a worker");
+        assert_eq!(selected.config.read().await.id.as_str(), "fast-net");
     }
 
     #[tokio::test]

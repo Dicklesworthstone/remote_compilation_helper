@@ -23,6 +23,8 @@ pub struct WorkerState {
     used_slots: Arc<AtomicU32>,
     /// Speed score from benchmarking (0-100).
     pub speed_score: RwLock<f64>,
+    /// Last observed worker latency in milliseconds (from health checks).
+    last_latency_ms: RwLock<Option<u64>>,
     /// Projects cached on this worker.
     pub cached_projects: RwLock<Vec<String>>,
     /// Circuit breaker statistics.
@@ -31,6 +33,10 @@ pub struct WorkerState {
     last_error_msg: RwLock<Option<String>>,
     /// Runtime capabilities (Bun, Node, Rust versions).
     capabilities: RwLock<WorkerCapabilities>,
+    /// Reason for disabling this worker (if disabled).
+    disabled_reason: RwLock<Option<String>>,
+    /// Unix timestamp when worker was disabled.
+    disabled_at: RwLock<Option<i64>>,
 }
 
 impl WorkerState {
@@ -41,10 +47,13 @@ impl WorkerState {
             status: RwLock::new(WorkerStatus::Healthy),
             used_slots: Arc::new(AtomicU32::new(0)),
             speed_score: RwLock::new(50.0), // Default mid-range score
+            last_latency_ms: RwLock::new(None),
             cached_projects: RwLock::new(Vec::new()),
             circuit: RwLock::new(CircuitStats::new()),
             last_error_msg: RwLock::new(None),
             capabilities: RwLock::new(WorkerCapabilities::new()),
+            disabled_reason: RwLock::new(None),
+            disabled_at: RwLock::new(None),
         }
     }
 
@@ -144,6 +153,16 @@ impl WorkerState {
     /// Get the current speed score.
     pub async fn get_speed_score(&self) -> f64 {
         *self.speed_score.read().await
+    }
+
+    /// Update the last observed worker latency (ms).
+    pub async fn set_last_latency_ms(&self, latency_ms: Option<u64>) {
+        *self.last_latency_ms.write().await = latency_ms;
+    }
+
+    /// Get the last observed worker latency (ms).
+    pub async fn last_latency_ms(&self) -> Option<u64> {
+        *self.last_latency_ms.read().await
     }
 
     /// Get the current circuit breaker state.
@@ -247,6 +266,57 @@ impl WorkerState {
     /// Check if this worker has Rust installed.
     pub async fn has_rust(&self) -> bool {
         self.capabilities.read().await.has_rust()
+    }
+
+    /// Disable the worker with an optional reason.
+    /// Sets status to Disabled and records the timestamp and reason.
+    pub async fn disable(&self, reason: Option<String>) {
+        *self.status.write().await = WorkerStatus::Disabled;
+        *self.disabled_reason.write().await = reason;
+        *self.disabled_at.write().await = Some(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0),
+        );
+    }
+
+    /// Start draining the worker (no new jobs, but finish existing).
+    pub async fn drain(&self) {
+        *self.status.write().await = WorkerStatus::Draining;
+    }
+
+    /// Enable a previously disabled/draining worker.
+    /// Clears disabled reason and timestamp, sets status to Healthy.
+    pub async fn enable(&self) {
+        *self.status.write().await = WorkerStatus::Healthy;
+        *self.disabled_reason.write().await = None;
+        *self.disabled_at.write().await = None;
+    }
+
+    /// Check if worker is disabled.
+    pub async fn is_disabled(&self) -> bool {
+        *self.status.read().await == WorkerStatus::Disabled
+    }
+
+    /// Check if worker is draining.
+    pub async fn is_draining(&self) -> bool {
+        *self.status.read().await == WorkerStatus::Draining
+    }
+
+    /// Get the reason this worker was disabled (if any).
+    pub async fn disabled_reason(&self) -> Option<String> {
+        self.disabled_reason.read().await.clone()
+    }
+
+    /// Get the timestamp when this worker was disabled (Unix seconds).
+    pub async fn disabled_at(&self) -> Option<i64> {
+        *self.disabled_at.read().await
+    }
+
+    /// Get the number of slots currently in use.
+    pub fn used_slots(&self) -> u32 {
+        self.used_slots.load(Ordering::Relaxed)
     }
 }
 
