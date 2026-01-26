@@ -189,9 +189,14 @@ impl Default for HarnessConfig {
             default_timeout: Duration::from_secs(30),
             cleanup_on_success: true,
             cleanup_on_failure: false,
-            rch_binary: cargo_bin_exe(&["rch"]).unwrap_or_else(|| bin_dir.join("rch")),
-            rchd_binary: cargo_bin_exe(&["rchd"]).unwrap_or_else(|| bin_dir.join("rchd")),
+            rch_binary: cargo_bin_exe(&["rch"])
+                .map(|path| if path.is_relative() { workspace_root.join(path) } else { path })
+                .unwrap_or_else(|| bin_dir.join("rch")),
+            rchd_binary: cargo_bin_exe(&["rchd"])
+                .map(|path| if path.is_relative() { workspace_root.join(path) } else { path })
+                .unwrap_or_else(|| bin_dir.join("rchd")),
             rch_wkr_binary: cargo_bin_exe(&["rch-wkr", "rch_wkr"])
+                .map(|path| if path.is_relative() { workspace_root.join(path) } else { path })
                 .unwrap_or_else(|| bin_dir.join("rch-wkr")),
             env_vars,
         }
