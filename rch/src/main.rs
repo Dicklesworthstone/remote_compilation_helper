@@ -1117,6 +1117,23 @@ async fn main() -> Result<()> {
     // Handle dynamic shell completions (exits if handling a completion request)
     CompleteEnv::with_factory(Cli::command).complete();
 
+    // Early check for --help-json to handle it before full clap parsing
+    // (which would fail on subcommands that require further arguments)
+    let args: Vec<String> = env::args().collect();
+    if args.iter().any(|a| a == "--help-json") {
+        let subcommand = args
+            .iter()
+            .skip(1)
+            .find(|a| !a.starts_with('-'))
+            .map(|s| s.as_str());
+        return handle_help_json_early(subcommand);
+    }
+
+    // Early check for --capabilities (standalone flag, no subcommand context needed)
+    if args.iter().any(|a| a == "--capabilities") {
+        return handle_capabilities();
+    }
+
     let cli = Cli::parse();
 
     // Initialize logging - ALWAYS use stderr to keep stdout clean for hook JSON
@@ -1153,15 +1170,8 @@ async fn main() -> Result<()> {
         return handle_schema_request(&cli.command);
     }
 
-    // Handle --help-json flag: output CLI structure as JSON
-    if cli.help_json {
-        return handle_help_json(&cli.command);
-    }
-
-    // Handle --capabilities flag: output RCH capabilities for machine discovery
-    if cli.capabilities {
-        return handle_capabilities();
-    }
+    // Note: --help-json and --capabilities are handled early (before Cli::parse)
+    // to avoid clap errors when subcommands require additional arguments
 
     // If no subcommand, we're being invoked as a hook
     match cli.command {
@@ -1401,53 +1411,37 @@ struct ArgHelp {
     possible_values: Vec<String>,
 }
 
-/// Handle --help-json flag: output CLI structure as JSON for machine parsing.
-fn handle_help_json(command: &Option<Commands>) -> Result<()> {
+/// Handle --help-json flag early (before full clap parsing).
+/// Takes an optional subcommand name as a string.
+fn handle_help_json_early(subcommand: Option<&str>) -> Result<()> {
     let cmd = Cli::command();
 
-    let output = match command {
+    let output = match subcommand {
         None => {
             // Full CLI structure
             build_help_json(&cmd)
         }
-        Some(subcmd) => {
-            // Find the specific subcommand
-            let subcmd_name = get_command_name(subcmd);
-            if let Some(sub) = cmd.get_subcommands().find(|s| s.get_name() == subcmd_name) {
-                build_help_json(sub)
-            } else {
-                eprintln!("Unknown subcommand: {subcmd_name}");
-                std::process::exit(1);
+        Some(subcmd_name) => {
+            // Find the specific subcommand (supporting nested lookups like "workers/list")
+            let parts: Vec<&str> = subcmd_name.split('/').collect();
+            let mut current_cmd = &cmd;
+
+            for part in &parts {
+                match current_cmd.get_subcommands().find(|s| s.get_name() == *part) {
+                    Some(sub) => current_cmd = sub,
+                    None => {
+                        eprintln!("Unknown subcommand: {subcmd_name}");
+                        std::process::exit(1);
+                    }
+                }
             }
+            build_help_json(current_cmd)
         }
     };
 
     let json = serde_json::to_string_pretty(&output)?;
     println!("{json}");
     Ok(())
-}
-
-fn get_command_name(cmd: &Commands) -> &'static str {
-    match cmd {
-        Commands::Init { .. } => "init",
-        Commands::Daemon { .. } => "daemon",
-        Commands::Workers { .. } => "workers",
-        Commands::Status { .. } => "status",
-        Commands::Queue { .. } => "queue",
-        Commands::Cancel { .. } => "cancel",
-        Commands::Config { .. } => "config",
-        Commands::Diagnose { .. } => "diagnose",
-        Commands::Hook { .. } => "hook",
-        Commands::Agents { .. } => "agents",
-        Commands::Completions { .. } => "completions",
-        Commands::Doctor { .. } => "doctor",
-        Commands::SelfTest { .. } => "self-test",
-        Commands::Update { .. } => "update",
-        Commands::Fleet { .. } => "fleet",
-        Commands::SpeedScore { .. } => "speedscore",
-        Commands::Dashboard { .. } => "dashboard",
-        Commands::Web { .. } => "web",
-    }
 }
 
 fn build_help_json(cmd: &clap::Command) -> HelpJsonOutput {
