@@ -5,7 +5,7 @@
 //!
 //! # Design Principles
 //!
-//! 1. **Unified Error Codes**: All errors use the `RCH-Exxx` format from [`ErrorCode`].
+//! 1. **Unified Error Codes**: All errors use the `RCH-Exxx` format from [`crate::ErrorCode`].
 //! 2. **Consistent Envelope**: All responses wrapped in [`ApiResponse<T>`].
 //! 3. **Machine-Readable**: Designed for programmatic parsing by AI agents.
 //! 4. **Backward Compatible**: Supports legacy error codes via mapping.
