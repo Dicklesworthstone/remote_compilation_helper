@@ -34,6 +34,7 @@
 //! }
 //! ```
 
+pub mod artifact_tests;
 pub mod build_rs_fixture_tests;
 pub mod cargo_bench_tests;
 pub mod cargo_build_tests;
