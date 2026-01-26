@@ -1815,8 +1815,10 @@ async fn execute_remote_compilation(
 
 fn wrap_command_with_telemetry(command: &str, worker_id: &WorkerId) -> String {
     let escaped_worker = shell_escape::escape(worker_id.as_str().into());
+    // Use newline instead of semicolon to ensure trailing comments in command
+    // don't comment out the status capture logic.
     format!(
-        "{cmd}; status=$?; if command -v rch-telemetry >/dev/null 2>&1; then \
+        "{cmd}\nstatus=$?; if command -v rch-telemetry >/dev/null 2>&1; then \
          telemetry=$(rch-telemetry collect --format json --worker-id {worker} 2>/dev/null || true); \
          if [ -n \"$telemetry\" ]; then echo '{marker}'; echo \"$telemetry\"; fi; \
          fi; exit $status",
@@ -3126,6 +3128,24 @@ mod tests {
     // =========================================================================
     // Cargo test integration tests (bead remote_compilation_helper-iyv1)
     // =========================================================================
+
+    #[test]
+    fn test_wrap_command_with_telemetry_handles_comments() {
+        let worker_id = rch_common::WorkerId::new("worker1");
+        let command = "echo hello # my comment";
+        let wrapped = wrap_command_with_telemetry(command, &worker_id);
+
+        // Ensure newline separation exists
+        assert!(wrapped.contains(&format!("{}\nstatus=$?", command)));
+
+        // Ensure status capture isn't commented out (it should be on a new line)
+        let lines: Vec<&str> = wrapped.lines().collect();
+        assert!(lines.iter().any(|l| l.starts_with("status=$?")));
+
+        // Basic sanity check on structure
+        assert!(wrapped.contains("rch-telemetry collect"));
+        assert!(wrapped.contains("exit $status"));
+    }
 
     #[tokio::test]
     async fn test_cargo_test_remote_success() {

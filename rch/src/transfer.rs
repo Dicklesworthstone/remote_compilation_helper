@@ -1113,8 +1113,8 @@ mod tests {
 
     #[test]
     fn test_project_id_from_path_root() {
-        // Test with root path
-        assert_eq!(project_id_from_path(Path::new("/")), "");
+        // Test with root path - falls back to "unknown" since "/" has no file_name
+        assert_eq!(project_id_from_path(Path::new("/")), "unknown");
     }
 
     #[test]
