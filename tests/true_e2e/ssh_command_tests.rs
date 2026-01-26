@@ -21,8 +21,8 @@ use rch_common::e2e::{
     LogLevel, LogSource, TestConfigError, TestLoggerBuilder, TestWorkersConfig,
     should_skip_worker_check,
 };
-use rch_common::ssh::{CommandResult, KnownHostsPolicy, SshClient, SshOptions};
-use rch_common::types::{WorkerConfig, WorkerId};
+use rch_common::ssh::{KnownHostsPolicy, SshClient, SshOptions};
+use rch_common::types::WorkerConfig;
 use std::time::{Duration, Instant};
 
 /// Skip the test if no real workers are available.

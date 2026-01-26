@@ -395,10 +395,16 @@ identity_file = "~/.ssh/id_ed25519"
         let temp_dir = TempDir::new().unwrap();
         let custom_path = temp_dir.path().join("custom_workers.toml");
 
-        std::env::set_var(ENV_WORKERS_CONFIG, custom_path.to_string_lossy().as_ref());
+        // SAFETY: Test runs in single-threaded mode, no concurrent env access
+        unsafe {
+            std::env::set_var(ENV_WORKERS_CONFIG, custom_path.to_string_lossy().as_ref());
+        }
         let path = get_config_path();
         assert_eq!(path, custom_path);
-        std::env::remove_var(ENV_WORKERS_CONFIG);
+        // SAFETY: Test runs in single-threaded mode, no concurrent env access
+        unsafe {
+            std::env::remove_var(ENV_WORKERS_CONFIG);
+        }
     }
 
     #[test]
@@ -524,9 +530,15 @@ host = "test.example.com"
         assert_eq!(config.effective_timeout_secs(), 300);
 
         // With env var, use override
-        std::env::set_var(ENV_TIMEOUT_SECS, "600");
+        // SAFETY: Test runs in single-threaded mode, no concurrent env access
+        unsafe {
+            std::env::set_var(ENV_TIMEOUT_SECS, "600");
+        }
         assert_eq!(config.effective_timeout_secs(), 600);
-        std::env::remove_var(ENV_TIMEOUT_SECS);
+        // SAFETY: Test runs in single-threaded mode, no concurrent env access
+        unsafe {
+            std::env::remove_var(ENV_TIMEOUT_SECS);
+        }
     }
 
     #[test]
@@ -556,28 +568,31 @@ total_slots = 16
 
     #[test]
     fn test_should_skip_worker_check() {
-        // Default is false
-        std::env::remove_var(ENV_SKIP_WORKER_CHECK);
-        assert!(!should_skip_worker_check());
+        // SAFETY: Test runs in single-threaded mode, no concurrent env access
+        unsafe {
+            // Default is false
+            std::env::remove_var(ENV_SKIP_WORKER_CHECK);
+            assert!(!should_skip_worker_check());
 
-        // Set to "1"
-        std::env::set_var(ENV_SKIP_WORKER_CHECK, "1");
-        assert!(should_skip_worker_check());
+            // Set to "1"
+            std::env::set_var(ENV_SKIP_WORKER_CHECK, "1");
+            assert!(should_skip_worker_check());
 
-        // Set to "true"
-        std::env::set_var(ENV_SKIP_WORKER_CHECK, "true");
-        assert!(should_skip_worker_check());
+            // Set to "true"
+            std::env::set_var(ENV_SKIP_WORKER_CHECK, "true");
+            assert!(should_skip_worker_check());
 
-        // Set to "TRUE"
-        std::env::set_var(ENV_SKIP_WORKER_CHECK, "TRUE");
-        assert!(should_skip_worker_check());
+            // Set to "TRUE"
+            std::env::set_var(ENV_SKIP_WORKER_CHECK, "TRUE");
+            assert!(should_skip_worker_check());
 
-        // Set to "0" (false)
-        std::env::set_var(ENV_SKIP_WORKER_CHECK, "0");
-        assert!(!should_skip_worker_check());
+            // Set to "0" (false)
+            std::env::set_var(ENV_SKIP_WORKER_CHECK, "0");
+            assert!(!should_skip_worker_check());
 
-        // Clean up
-        std::env::remove_var(ENV_SKIP_WORKER_CHECK);
+            // Clean up
+            std::env::remove_var(ENV_SKIP_WORKER_CHECK);
+        }
     }
 
     #[test]

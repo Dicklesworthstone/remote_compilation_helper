@@ -232,7 +232,7 @@ async fn test_cargo_nextest_run() {
     let local_duration = local_start.elapsed();
 
     let local_exit = local_result
-        .as_ref()
+        .ok()
         .and_then(|r| r.status.code())
         .unwrap_or(-1);
 
