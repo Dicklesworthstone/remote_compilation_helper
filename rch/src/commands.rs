@@ -6667,6 +6667,9 @@ mod tests {
                 compression_level: 3,
                 exclude_patterns: vec!["target/".to_string()],
             },
+            environment: ConfigEnvironmentSection {
+                allowlist: vec!["RUSTFLAGS".to_string()],
+            },
             circuit: ConfigCircuitSection {
                 failure_threshold: 3,
                 success_threshold: 2,

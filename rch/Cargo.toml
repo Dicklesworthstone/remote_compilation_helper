@@ -63,10 +63,16 @@ console = { workspace = true }
 [features]
 default = ["rich-ui"]
 rich-ui = ["rich_rust"]
+true-e2e = []
 
 [dev-dependencies]
 tempfile = "3"
 proptest = "1.4"
+
+[[test]]
+name = "true_e2e"
+path = "../tests/true_e2e/mod.rs"
+required-features = ["true-e2e"]
 
 [lints.rust]
 unsafe_code = "forbid"

@@ -622,7 +622,9 @@ mod tests {
         let state = CIRCUIT_STATE.with_label_values(&[worker_id]).get();
         let failures = CIRCUIT_FAILURES_TOTAL.with_label_values(&[worker_id]).get();
         let trips = CIRCUIT_TRIPS_TOTAL.with_label_values(&[worker_id]).get();
-        let recoveries = CIRCUIT_RECOVERIES_TOTAL.with_label_values(&[worker_id]).get();
+        let recoveries = CIRCUIT_RECOVERIES_TOTAL
+            .with_label_values(&[worker_id])
+            .get();
 
         assert_eq!(state, 0.0); // closed
         assert_eq!(failures, 2.0);
@@ -651,9 +653,7 @@ mod tests {
         set_build_queue_depth(5);
 
         let active = BUILDS_ACTIVE.with_label_values(&["remote"]).get();
-        let total = BUILDS_TOTAL
-            .with_label_values(&["success", "remote"])
-            .get();
+        let total = BUILDS_TOTAL.with_label_values(&["success", "remote"]).get();
         let queue_depth = BUILD_QUEUE_DEPTH.get();
 
         assert_eq!(active, 1.0); // 2 inc - 1 dec

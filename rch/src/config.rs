@@ -1265,6 +1265,10 @@ exclude_patterns = [
     "*.rmeta",
 ]
 
+[environment]
+# Env vars to forward to workers
+allowlist = ["RUSTFLAGS", "CARGO_TARGET_DIR"]
+
 [output]
 # Hook output visibility: none, summary, verbose
 visibility = "none"
@@ -1404,6 +1408,26 @@ mod tests {
                 .any(|e| e.contains("confidence_threshold"))
         );
         info!("TEST PASS: test_validate_threshold_range");
+    }
+
+    #[test]
+    fn test_validate_env_allowlist_invalid_key() {
+        info!("TEST START: test_validate_env_allowlist_invalid_key");
+        let mut file = NamedTempFile::new().expect("create temp file");
+        std::io::Write::write_all(
+            file.as_file_mut(),
+            b"[environment]\nallowlist = [\"BAD=KEY\"]\n",
+        )
+        .expect("write config");
+        let result = validate_rch_config_file(file.path());
+        info!("RESULT: errors={:?}", result.errors);
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.contains("environment.allowlist"))
+        );
+        info!("TEST PASS: test_validate_env_allowlist_invalid_key");
     }
 
     #[test]
@@ -2020,6 +2044,37 @@ identity_file = "/tmp/id_ed25519"
             .expect("output.visibility source present");
         assert_eq!(source, &ConfigValueSource::EnvVar("RCH_QUIET".to_string()));
         info!("PASS: RCH_QUIET takes precedence over visibility/verbose");
+    }
+
+    #[test]
+    fn test_apply_env_overrides_env_allowlist() {
+        info!("TEST: test_apply_env_overrides_env_allowlist");
+        let mut config = RchConfig::default();
+        let mut sources = default_sources_map();
+        let mut env_overrides: HashMap<String, String> = HashMap::new();
+        env_overrides.insert(
+            "RCH_ENV_ALLOWLIST".to_string(),
+            "RUSTFLAGS, CARGO_TARGET_DIR  EXTRA".to_string(),
+        );
+
+        apply_env_overrides_inner(&mut config, Some(&mut sources), Some(&env_overrides));
+
+        assert_eq!(
+            config.environment.allowlist,
+            vec![
+                "RUSTFLAGS".to_string(),
+                "CARGO_TARGET_DIR".to_string(),
+                "EXTRA".to_string()
+            ]
+        );
+        let source = sources
+            .get("environment.allowlist")
+            .expect("environment.allowlist source present");
+        assert_eq!(
+            source,
+            &ConfigValueSource::EnvVar("RCH_ENV_ALLOWLIST".to_string())
+        );
+        info!("PASS: RCH_ENV_ALLOWLIST override applied with source tracking");
     }
 
     #[test]

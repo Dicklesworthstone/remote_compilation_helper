@@ -256,9 +256,7 @@ mod tests {
         info!("INPUT: Adding 5 requests then clearing");
         for i in 0..5 {
             let worker_id = WorkerId::new(format!("worker-{}", i));
-            queue
-                .enqueue(worker_id, format!("req-{:03}", i))
-                .unwrap();
+            queue.enqueue(worker_id, format!("req-{:03}", i)).unwrap();
         }
         assert_eq!(queue.len(), 5);
 

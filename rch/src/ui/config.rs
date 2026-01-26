@@ -124,6 +124,20 @@ impl<'a> ConfigDisplay<'a> {
             "transfer.exclude_patterns",
         );
 
+        // Environment section
+        lines.push(format!(
+            "{} [environment]",
+            Icons::tree_branch(self.context)
+        ));
+        let allowlist = format!("{:?}", self.config.environment.allowlist);
+        self.push_config_line(
+            &mut lines,
+            "  ",
+            "allowlist",
+            &allowlist,
+            "environment.allowlist",
+        );
+
         // Circuit section
         lines.push(format!("{} [circuit]", Icons::tree_branch(self.context)));
         self.push_config_line(
@@ -311,6 +325,12 @@ impl<'a> ConfigDisplay<'a> {
             "transfer.exclude_patterns",
         );
 
+        // Environment section
+        console.print_plain("");
+        console.print_plain("[environment]");
+        let allowlist = format!("{:?}", self.config.environment.allowlist);
+        self.print_plain_value(console, "allowlist", &allowlist, "environment.allowlist");
+
         // Circuit section
         console.print_plain("");
         console.print_plain("[circuit]");
@@ -397,8 +417,8 @@ impl<'a> ConfigDisplay<'a> {
 mod tests {
     use super::*;
     use crate::commands::{
-        ConfigCircuitSection, ConfigCompilationSection, ConfigGeneralSection, ConfigOutputSection,
-        ConfigTransferSection, ConfigValueSourceInfo,
+        ConfigCircuitSection, ConfigCompilationSection, ConfigEnvironmentSection,
+        ConfigGeneralSection, ConfigOutputSection, ConfigTransferSection, ConfigValueSourceInfo,
     };
     use rch_common::OutputVisibility;
 
@@ -416,6 +436,9 @@ mod tests {
             transfer: ConfigTransferSection {
                 compression_level: 6,
                 exclude_patterns: vec!["target".to_string(), "node_modules".to_string()],
+            },
+            environment: ConfigEnvironmentSection {
+                allowlist: vec!["RUSTFLAGS".to_string()],
             },
             circuit: ConfigCircuitSection {
                 failure_threshold: 3,

@@ -626,10 +626,7 @@ mod tests {
     #[test]
     fn test_build_env_prefix_quotes_and_rejects() {
         let mut env = HashMap::new();
-        env.insert(
-            "RUSTFLAGS".to_string(),
-            "-C target-cpu=native".to_string(),
-        );
+        env.insert("RUSTFLAGS".to_string(), "-C target-cpu=native".to_string());
         env.insert("QUOTED".to_string(), "a'b".to_string());
         env.insert("BADVAL".to_string(), "line1\nline2".to_string());
 

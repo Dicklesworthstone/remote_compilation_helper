@@ -5,11 +5,11 @@
 
 use anyhow::{Context, Result, bail};
 use rch_common::mock::{self, MockConfig, MockRsync, MockRsyncConfig, MockSshClient};
+use rch_common::ssh::{EnvPrefix, build_env_prefix};
 use rch_common::{
     ColorMode, CommandResult, SshClient, SshOptions, ToolchainInfo, TransferConfig, WorkerConfig,
     wrap_command_with_color, wrap_command_with_toolchain,
 };
-use rch_common::ssh::{EnvPrefix, build_env_prefix};
 use shell_escape::escape;
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -750,10 +750,7 @@ mod tests {
         };
 
         let mut overrides = HashMap::new();
-        overrides.insert(
-            "RUSTFLAGS".to_string(),
-            "-C target-cpu=native".to_string(),
-        );
+        overrides.insert("RUSTFLAGS".to_string(), "-C target-cpu=native".to_string());
         overrides.insert("QUOTED".to_string(), "a'b".to_string());
         overrides.insert("BADVAL".to_string(), "line1\nline2".to_string());
 
