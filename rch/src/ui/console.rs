@@ -393,6 +393,24 @@ mod tests {
     }
 
     #[test]
+    fn test_with_context_all_modes() {
+        let cases = [
+            (OutputContext::Interactive, true, true, false),
+            (OutputContext::Colored, false, true, false),
+            (OutputContext::Plain, false, false, false),
+            (OutputContext::Machine, false, false, true),
+            (OutputContext::Hook, false, false, true),
+        ];
+
+        for (context, rich, colored, machine) in cases {
+            let console = RchConsole::with_context(context);
+            assert_eq!(console.is_rich(), rich, "rich mismatch for {context:?}");
+            assert_eq!(console.is_colored(), colored, "color mismatch for {context:?}");
+            assert_eq!(console.is_machine(), machine, "machine mismatch for {context:?}");
+        }
+    }
+
+    #[test]
     fn test_width_returns_reasonable_value() {
         let console = RchConsole::new();
         let width = console.width();
@@ -444,9 +462,21 @@ mod tests {
     }
 
     #[test]
+    fn test_rule_plain_long_title() {
+        let console = RchConsole::with_context(OutputContext::Plain);
+        console.rule(Some("A Very Long Title That Exceeds The Default Width For Rules"));
+    }
+
+    #[test]
     fn test_line_plain_mode() {
         let console = RchConsole::with_context(OutputContext::Plain);
         // Should not panic
+        console.line();
+    }
+
+    #[test]
+    fn test_line_machine_mode() {
+        let console = RchConsole::with_context(OutputContext::Machine);
         console.line();
     }
 
@@ -462,12 +492,73 @@ mod tests {
     }
 
     #[test]
+    fn test_print_or_plain_interactive() {
+        let console = RchConsole::with_context(OutputContext::Interactive);
+        console.print_or_plain("[bold]rich[/]", "plain");
+    }
+
+    #[test]
     fn test_status_messages_machine_mode() {
         let console = RchConsole::with_context(OutputContext::Machine);
         // These should be suppressed in machine mode (except print_error)
         console.print_success("success");
         console.print_warning("warning");
         console.print_info("info");
+    }
+
+    #[test]
+    fn test_status_messages_plain_and_colored() {
+        let console = RchConsole::with_context(OutputContext::Plain);
+        console.print_success("success");
+        console.print_warning("warning");
+        console.print_info("info");
+
+        let console = RchConsole::with_context(OutputContext::Colored);
+        console.print_success("success");
+        console.print_warning("warning");
+        console.print_info("info");
+    }
+
+    #[test]
+    fn test_print_plain_non_machine() {
+        let console = RchConsole::with_context(OutputContext::Plain);
+        console.print_plain("plain");
+
+        let console = RchConsole::with_context(OutputContext::Interactive);
+        console.print_plain("plain");
+    }
+
+    #[test]
+    fn test_print_json_plain_mode() {
+        let console = RchConsole::with_context(OutputContext::Plain);
+        #[derive(serde::Serialize)]
+        struct TestData {
+            label: &'static str,
+        }
+        let result = console.print_json(&TestData { label: "ok" });
+        assert!(result.is_ok());
+    }
+
+    #[cfg(feature = "rich-ui")]
+    #[test]
+    fn test_print_rich_suppressed_in_machine_mode() {
+        let console = RchConsole::with_context(OutputContext::Machine);
+        console.print_rich("[bold]test[/]");
+    }
+
+    #[cfg(feature = "rich-ui")]
+    #[test]
+    fn test_print_renderable_suppressed_in_plain_mode() {
+        let console = RchConsole::with_context(OutputContext::Plain);
+        let panel = rich_rust::renderables::Panel::from_text("renderable");
+        console.print_renderable(&panel);
+    }
+
+    #[cfg(feature = "rich-ui")]
+    #[test]
+    fn test_inner_console_access() {
+        let console = RchConsole::with_context(OutputContext::Interactive);
+        let _inner = console.inner();
     }
 
     #[test]
