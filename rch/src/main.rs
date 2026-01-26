@@ -1168,6 +1168,94 @@ async fn main() -> Result<()> {
     }
 }
 
+/// Handle --schema flag: output JSON Schema for the specified command's JSON output format.
+fn handle_schema_request(command: &Option<Commands>) -> Result<()> {
+    use commands::{
+        ConfigDiffResponse, ConfigLintResponse, ConfigShowResponse, ConfigValidationResponse,
+        DaemonStatusResponse, DiagnoseResponse, HookActionResponse, WorkersListResponse,
+    };
+
+    let schema_json = match command {
+        Some(Commands::Config { action }) => match action {
+            ConfigAction::Lint => {
+                let schema = schema_for!(ConfigLintResponse);
+                serde_json::to_string_pretty(&schema)?
+            }
+            ConfigAction::Diff => {
+                let schema = schema_for!(ConfigDiffResponse);
+                serde_json::to_string_pretty(&schema)?
+            }
+            ConfigAction::Show { .. } => {
+                let schema = schema_for!(ConfigShowResponse);
+                serde_json::to_string_pretty(&schema)?
+            }
+            ConfigAction::Validate => {
+                let schema = schema_for!(ConfigValidationResponse);
+                serde_json::to_string_pretty(&schema)?
+            }
+            _ => {
+                eprintln!("No JSON Schema available for 'config {}' output", action.as_str());
+                std::process::exit(1);
+            }
+        },
+        Some(Commands::Workers { action }) => match action {
+            WorkersAction::List { .. } => {
+                let schema = schema_for!(WorkersListResponse);
+                serde_json::to_string_pretty(&schema)?
+            }
+            _ => {
+                eprintln!("No JSON Schema available for 'workers {}' output", action.as_str());
+                std::process::exit(1);
+            }
+        },
+        Some(Commands::Daemon { action }) => match action {
+            DaemonAction::Status => {
+                let schema = schema_for!(DaemonStatusResponse);
+                serde_json::to_string_pretty(&schema)?
+            }
+            _ => {
+                eprintln!("No JSON Schema available for 'daemon {}' output", action.as_str());
+                std::process::exit(1);
+            }
+        },
+        Some(Commands::Diagnose { .. }) => {
+            let schema = schema_for!(DiagnoseResponse);
+            serde_json::to_string_pretty(&schema)?
+        }
+        Some(Commands::Hook { action }) => match action {
+            HookAction::Install | HookAction::Uninstall | HookAction::Status => {
+                let schema = schema_for!(HookActionResponse);
+                serde_json::to_string_pretty(&schema)?
+            }
+            _ => {
+                eprintln!("No JSON Schema available for 'hook {}' output", action.as_str());
+                std::process::exit(1);
+            }
+        },
+        None => {
+            eprintln!("Usage: rch --schema <command> [subcommand]");
+            eprintln!();
+            eprintln!("Available schemas:");
+            eprintln!("  rch --schema config lint       # ConfigLintResponse");
+            eprintln!("  rch --schema config diff       # ConfigDiffResponse");
+            eprintln!("  rch --schema config show       # ConfigShowResponse");
+            eprintln!("  rch --schema config validate   # ConfigValidationResponse");
+            eprintln!("  rch --schema workers list      # WorkersListResponse");
+            eprintln!("  rch --schema daemon status     # DaemonStatusResponse");
+            eprintln!("  rch --schema diagnose <cmd>    # DiagnoseResponse");
+            eprintln!("  rch --schema hook install      # HookActionResponse");
+            std::process::exit(0);
+        }
+        _ => {
+            eprintln!("No JSON Schema available for this command");
+            std::process::exit(1);
+        }
+    };
+
+    println!("{schema_json}");
+    Ok(())
+}
+
 async fn handle_daemon(action: DaemonAction, ctx: &OutputContext) -> Result<()> {
     match action {
         DaemonAction::Start => {
