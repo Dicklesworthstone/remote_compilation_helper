@@ -722,7 +722,9 @@ pub async fn select_worker_with_config(
         let mut all_unreachable = true;
 
         for worker in &all_workers {
-            if let Some(state) = worker.circuit_state().await && state != CircuitState::Open {
+            if let Some(state) = worker.circuit_state().await
+                && state != CircuitState::Open
+            {
                 all_circuits_open = false;
             }
             if worker.status().await != rch_common::WorkerStatus::Unreachable {

@@ -286,9 +286,7 @@ impl ShutdownSequence {
         if self.ctx.supports_color() {
             eprintln!(
                 "\x1b[33m[{}] {} {} received, initiating graceful shutdown...\x1b[0m",
-                timestamp,
-                icon,
-                signal_name
+                timestamp, icon, signal_name
             );
         } else {
             eprintln!(
@@ -369,8 +367,7 @@ impl ShutdownSequence {
             if self.ctx.supports_color() {
                 eprintln!(
                     "\x1b[32m[{}] {} All jobs drained successfully\x1b[0m",
-                    timestamp,
-                    icon
+                    timestamp, icon
                 );
             } else {
                 eprintln!("[{}] {} All jobs drained successfully", timestamp, icon);
@@ -516,13 +513,7 @@ impl ShutdownSequence {
 
         // Content line
         let content_padding = width - 2 - content.len();
-        let content_line = format!(
-            "{} {}{} {}",
-            v,
-            content,
-            " ".repeat(content_padding),
-            v
-        );
+        let content_line = format!("{} {}{} {}", v, content, " ".repeat(content_padding), v);
 
         // Bottom border
         let bottom_line = format!("{}{}{}", bl, h_line, br);
