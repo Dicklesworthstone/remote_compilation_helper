@@ -196,7 +196,10 @@ fn test_invalid_subcommand_fails() {
         .output()
         .expect("Failed to run rch nonexistent-command");
 
-    assert!(!output.status.success(), "Expected failure for invalid subcommand");
+    assert!(
+        !output.status.success(),
+        "Expected failure for invalid subcommand"
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     // Should contain error message about unrecognized command
@@ -218,7 +221,10 @@ fn test_invalid_flag_fails() {
         .output()
         .expect("Failed to run rch --nonexistent-flag");
 
-    assert!(!output.status.success(), "Expected failure for invalid flag");
+    assert!(
+        !output.status.success(),
+        "Expected failure for invalid flag"
+    );
     crate::test_log!("TEST PASS: test_invalid_flag_fails");
 }
 
@@ -443,7 +449,10 @@ fn test_workers_capabilities_help() {
         .output()
         .expect("Failed to run rch workers capabilities --help");
 
-    assert!(output.status.success(), "rch workers capabilities --help failed");
+    assert!(
+        output.status.success(),
+        "rch workers capabilities --help failed"
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_contains(&stdout, "capabilities");
     crate::test_log!("TEST PASS: test_workers_capabilities_help");
@@ -593,7 +602,10 @@ fn test_rch_verbose_env_var() {
         .output()
         .expect("Failed to run rch with RCH_VERBOSE=true");
 
-    assert!(output.status.success(), "rch with RCH_VERBOSE=true --help failed");
+    assert!(
+        output.status.success(),
+        "rch with RCH_VERBOSE=true --help failed"
+    );
     crate::test_log!("TEST PASS: test_rch_verbose_env_var");
 }
 
@@ -608,6 +620,9 @@ fn test_rch_output_format_env_var() {
         .output()
         .expect("Failed to run rch with RCH_OUTPUT_FORMAT=json");
 
-    assert!(output.status.success(), "rch with RCH_OUTPUT_FORMAT=json --help failed");
+    assert!(
+        output.status.success(),
+        "rch with RCH_OUTPUT_FORMAT=json --help failed"
+    );
     crate::test_log!("TEST PASS: test_rch_output_format_env_var");
 }

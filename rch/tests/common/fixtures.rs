@@ -2,6 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 use tempfile::TempDir;
 
+#[allow(dead_code)]
 pub struct TestProject {
     pub dir: TempDir,
     pub cargo_toml: PathBuf,
@@ -9,6 +10,7 @@ pub struct TestProject {
 }
 
 impl TestProject {
+    #[allow(dead_code)]
     pub fn new() -> Self {
         crate::test_log!("FIXTURE: Creating test Rust project");
 

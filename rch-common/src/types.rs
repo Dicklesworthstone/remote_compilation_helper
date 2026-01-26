@@ -446,6 +446,8 @@ pub struct RchConfig {
     #[serde(default)]
     pub transfer: TransferConfig,
     #[serde(default)]
+    pub environment: EnvironmentConfig,
+    #[serde(default)]
     pub circuit: CircuitBreakerConfig,
     #[serde(default)]
     pub output: OutputConfig,
@@ -467,6 +469,22 @@ pub struct GeneralConfig {
     /// Path to Unix socket for daemon communication.
     #[serde(default = "default_socket_path")]
     pub socket_path: String,
+}
+
+/// Environment variable passthrough configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnvironmentConfig {
+    /// Allowlist of environment variables to forward to remote workers.
+    #[serde(default)]
+    pub allowlist: Vec<String>,
+}
+
+impl Default for EnvironmentConfig {
+    fn default() -> Self {
+        Self {
+            allowlist: Vec::new(),
+        }
+    }
 }
 
 impl Default for GeneralConfig {

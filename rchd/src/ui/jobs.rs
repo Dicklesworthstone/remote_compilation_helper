@@ -7,6 +7,7 @@
 //! Bead: bd-3ndq
 
 #![forbid(unsafe_code)]
+#![allow(dead_code)]
 
 use rch_common::ui::{Icons, OutputContext, RateLimiter};
 use std::collections::HashMap;

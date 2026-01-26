@@ -7,6 +7,7 @@ pub fn assert_contains(haystack: &str, needle: &str) {
     );
 }
 
+#[allow(dead_code)]
 pub fn assert_path_exists(path: &Path) {
     assert!(path.exists(), "Expected path to exist: {}", path.display());
 }

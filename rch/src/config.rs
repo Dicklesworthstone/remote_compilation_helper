@@ -111,6 +111,8 @@ struct PartialRchConfig {
     #[serde(default)]
     transfer: PartialTransferConfig,
     #[serde(default)]
+    environment: PartialEnvironmentConfig,
+    #[serde(default)]
     circuit: PartialCircuitConfig,
     #[serde(default)]
     output: PartialOutputConfig,
@@ -140,6 +142,11 @@ struct PartialCompilationConfig {
 struct PartialTransferConfig {
     compression_level: Option<u32>,
     exclude_patterns: Option<Vec<String>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PartialEnvironmentConfig {
+    allowlist: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -275,6 +282,18 @@ pub fn validate_rch_config_file(path: &Path) -> FileValidation {
         validation.warn("transfer.compression_level should be within [1, 19]".to_string());
     } else if config.transfer.compression_level == 0 {
         validation.warn("transfer.compression_level is 0 (compression disabled)".to_string());
+    }
+
+    for entry in &config.environment.allowlist {
+        let trimmed = entry.trim();
+        if trimmed.is_empty() {
+            validation.error("environment.allowlist contains an empty entry".to_string());
+        } else if !is_valid_env_key(trimmed) {
+            validation.error(format!(
+                "environment.allowlist contains invalid key: {}",
+                trimmed
+            ));
+        }
     }
 
     if config.general.socket_path.trim().is_empty() {
@@ -474,6 +493,7 @@ fn default_sources_map() -> ConfigSourceMap {
         "compilation.test_timeout_sec",
         "transfer.compression_level",
         "transfer.exclude_patterns",
+        "environment.allowlist",
         "circuit.failure_threshold",
         "circuit.success_threshold",
         "circuit.error_rate_threshold",
@@ -577,6 +597,13 @@ fn apply_layer(
     {
         config.transfer.exclude_patterns = patterns.clone();
         set_source(sources, "transfer.exclude_patterns", source.clone());
+    }
+
+    if let Some(allowlist) = layer.environment.allowlist.as_ref()
+        && allowlist != &defaults.environment.allowlist
+    {
+        config.environment.allowlist = allowlist.clone();
+        set_source(sources, "environment.allowlist", source.clone());
     }
 
     if let Some(failure_threshold) = layer.circuit.failure_threshold
@@ -699,6 +726,13 @@ fn merge_config(mut base: RchConfig, overlay: RchConfig) -> RchConfig {
     // Merge transfer section
     merge_transfer(&mut base.transfer, &overlay.transfer, &default.transfer);
 
+    // Merge environment section
+    merge_environment(
+        &mut base.environment,
+        &overlay.environment,
+        &default.environment,
+    );
+
     // Merge circuit breaker section
     merge_circuit(&mut base.circuit, &overlay.circuit, &default.circuit);
 
@@ -774,6 +808,17 @@ fn merge_transfer(
     // would be confusing)
     if overlay.exclude_patterns != default.exclude_patterns {
         base.exclude_patterns.clone_from(&overlay.exclude_patterns);
+    }
+}
+
+/// Merge EnvironmentConfig fields.
+fn merge_environment(
+    base: &mut rch_common::EnvironmentConfig,
+    overlay: &rch_common::EnvironmentConfig,
+    default: &rch_common::EnvironmentConfig,
+) {
+    if overlay.allowlist != default.allowlist {
+        base.allowlist.clone_from(&overlay.allowlist);
     }
 }
 
@@ -1023,6 +1068,18 @@ fn apply_env_overrides_inner(
         }
     }
 
+    if let Some(val) = get_env("RCH_ENV_ALLOWLIST") {
+        let allowlist = parse_allowlist_value(&val);
+        config.environment.allowlist = allowlist;
+        if let Some(ref mut sources) = sources {
+            set_source(
+                sources,
+                "environment.allowlist",
+                ConfigValueSource::EnvVar("RCH_ENV_ALLOWLIST".to_string()),
+            );
+        }
+    }
+
     let mut visibility_override: Option<(OutputVisibility, String)> = None;
 
     if let Some(val) = get_env("RCH_QUIET")
@@ -1055,6 +1112,27 @@ fn apply_env_overrides_inner(
             );
         }
     }
+}
+
+fn parse_allowlist_value(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .flat_map(|chunk| chunk.split_whitespace())
+        .map(|item| item.trim())
+        .filter(|item| !item.is_empty())
+        .map(|item| item.to_string())
+        .collect()
+}
+
+fn is_valid_env_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        return false;
+    }
+    chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
 }
 
 /// Workers configuration file structure.

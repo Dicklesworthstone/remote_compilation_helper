@@ -1,12 +1,9 @@
-use tracing_subscriber::{fmt, EnvFilter};
+use tracing_subscriber::{EnvFilter, fmt};
 
 pub fn init_test_logging() {
     let _ = fmt()
         .with_test_writer()
-        .with_env_filter(
-            EnvFilter::from_default_env()
-                .add_directive("rch=debug".parse().unwrap()),
-        )
+        .with_env_filter(EnvFilter::from_default_env().add_directive("rch=debug".parse().unwrap()))
         .try_init();
 }
 

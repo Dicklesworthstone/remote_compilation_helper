@@ -18,4 +18,5 @@ pub mod shutdown;
 pub use banner::DaemonBanner;
 #[allow(unused_imports)]
 pub use jobs::JobLifecycleLog;
+#[allow(unused_imports)]
 pub use shutdown::{JobDrainEvent, SessionStats, ShutdownSequence};

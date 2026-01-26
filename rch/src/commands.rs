@@ -173,6 +173,7 @@ pub struct ConfigShowResponse {
     pub general: ConfigGeneralSection,
     pub compilation: ConfigCompilationSection,
     pub transfer: ConfigTransferSection,
+    pub environment: ConfigEnvironmentSection,
     pub circuit: ConfigCircuitSection,
     pub output: ConfigOutputSection,
     pub sources: Vec<String>,
@@ -216,6 +217,12 @@ pub struct ConfigCompilationSection {
 pub struct ConfigTransferSection {
     pub compression_level: u32,
     pub exclude_patterns: Vec<String>,
+}
+
+/// Environment configuration section.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConfigEnvironmentSection {
+    pub allowlist: Vec<String>,
 }
 
 /// Circuit breaker configuration section.
@@ -3553,6 +3560,9 @@ pub fn config_show(show_sources: bool, ctx: &OutputContext) -> Result<()> {
                 compression_level: config.transfer.compression_level,
                 exclude_patterns: config.transfer.exclude_patterns.clone(),
             },
+            environment: ConfigEnvironmentSection {
+                allowlist: config.environment.allowlist.clone(),
+            },
             circuit: ConfigCircuitSection {
                 failure_threshold: config.circuit.failure_threshold,
                 success_threshold: config.circuit.success_threshold,
@@ -3657,6 +3667,22 @@ pub fn config_show(show_sources: bool, ctx: &OutputContext) -> Result<()> {
     }
     for pattern in &config.transfer.exclude_patterns {
         println!("    {},", style.value(&format!("\"{}\"", pattern)));
+    }
+    println!("  ]");
+
+    println!("\n{}", style.highlight("[environment]"));
+    let allowlist_source = source_label("environment.allowlist", &value_sources);
+    if let Some(source) = allowlist_source {
+        println!(
+            "  {} = [ {}",
+            style.key("allowlist"),
+            style.muted(&format!("# from {}", source))
+        );
+    } else {
+        println!("  {} = [", style.key("allowlist"));
+    }
+    for key in &config.environment.allowlist {
+        println!("    {},", style.value(&format!("\"{}\"", key)));
     }
     println!("  ]");
 
@@ -3804,6 +3830,12 @@ fn collect_value_sources(
         &mut values,
         "transfer.exclude_patterns",
         format!("{:?}", config.transfer.exclude_patterns),
+        sources,
+    );
+    push_value_source(
+        &mut values,
+        "environment.allowlist",
+        format!("{:?}", config.environment.allowlist),
         sources,
     );
     push_value_source(

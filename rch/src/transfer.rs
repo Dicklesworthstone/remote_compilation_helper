@@ -9,8 +9,10 @@ use rch_common::{
     ColorMode, CommandResult, SshClient, SshOptions, ToolchainInfo, TransferConfig, WorkerConfig,
     wrap_command_with_color, wrap_command_with_toolchain,
 };
+use rch_common::ssh::{EnvPrefix, build_env_prefix};
 use shell_escape::escape;
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::process::Command;
@@ -37,6 +39,10 @@ pub struct TransferPipeline {
     ssh_options: SshOptions,
     /// Color mode for remote command output.
     color_mode: ColorMode,
+    /// Environment variables to forward to workers.
+    env_allowlist: Vec<String>,
+    /// Optional environment overrides for testing.
+    env_overrides: Option<HashMap<String, String>>,
 }
 
 impl TransferPipeline {
@@ -54,6 +60,8 @@ impl TransferPipeline {
             transfer_config,
             ssh_options: SshOptions::default(),
             color_mode: ColorMode::default(),
+            env_allowlist: Vec::new(),
+            env_overrides: None,
         }
     }
 
@@ -71,6 +79,18 @@ impl TransferPipeline {
         self
     }
 
+    /// Set environment allowlist for remote execution.
+    pub fn with_env_allowlist(mut self, allowlist: Vec<String>) -> Self {
+        self.env_allowlist = allowlist;
+        self
+    }
+
+    #[cfg(test)]
+    pub fn with_env_overrides(mut self, overrides: HashMap<String, String>) -> Self {
+        self.env_overrides = Some(overrides);
+        self
+    }
+
     /// Set command timeout for remote execution.
     ///
     /// Different command types may need different timeouts. For example,
@@ -79,6 +99,17 @@ impl TransferPipeline {
     pub fn with_command_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.ssh_options.command_timeout = timeout;
         self
+    }
+
+    fn build_env_prefix(&self) -> EnvPrefix {
+        build_env_prefix(&self.env_allowlist, |key| {
+            if let Some(ref overrides) = self.env_overrides
+                && let Some(value) = overrides.get(key)
+            {
+                return Some(value.clone());
+            }
+            std::env::var(key).ok()
+        })
     }
 
     /// Get the remote project path on the worker.
@@ -203,8 +234,22 @@ impl TransferPipeline {
         // Wrap command with toolchain if provided
         let toolchain_command = wrap_command_with_toolchain(command, toolchain);
 
+        // Apply environment allowlist before color wrapping
+        let env_prefix = self.build_env_prefix();
+        if !env_prefix.applied.is_empty() {
+            debug!("Forwarding env vars: {:?}", env_prefix.applied);
+        }
+        if !env_prefix.rejected.is_empty() {
+            warn!("Skipping env vars: {:?}", env_prefix.rejected);
+        }
+        let env_command = if env_prefix.prefix.is_empty() {
+            toolchain_command
+        } else {
+            format!("{}{}", env_prefix.prefix, toolchain_command)
+        };
+
         // Apply color mode environment variables
-        let colored_command = wrap_command_with_color(&toolchain_command, self.color_mode);
+        let colored_command = wrap_command_with_color(&env_command, self.color_mode);
 
         // Wrap command to run in project directory
         let wrapped_command = format!("cd {} && {}", escaped_remote_path, colored_command);
@@ -258,8 +303,22 @@ impl TransferPipeline {
         let remote_path = self.remote_path();
         let escaped_remote_path = escape(Cow::from(&remote_path));
         let toolchain_command = wrap_command_with_toolchain(command, toolchain);
+
+        let env_prefix = self.build_env_prefix();
+        if !env_prefix.applied.is_empty() {
+            debug!("Forwarding env vars: {:?}", env_prefix.applied);
+        }
+        if !env_prefix.rejected.is_empty() {
+            warn!("Skipping env vars: {:?}", env_prefix.rejected);
+        }
+        let env_command = if env_prefix.prefix.is_empty() {
+            toolchain_command
+        } else {
+            format!("{}{}", env_prefix.prefix, toolchain_command)
+        };
+
         // Apply color mode environment variables to preserve ANSI colors
-        let colored_command = wrap_command_with_color(&toolchain_command, self.color_mode);
+        let colored_command = wrap_command_with_color(&env_command, self.color_mode);
         let wrapped_command = format!("cd {} && {}", escaped_remote_path, colored_command);
 
         if use_mock_transport(worker) {
@@ -585,6 +644,10 @@ pub fn default_c_cpp_artifact_patterns() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rch_common::mock;
+    use rch_common::mock::Phase;
+    use rch_common::{ColorMode, WorkerConfig, WorkerId};
+    use std::collections::HashMap;
 
     #[test]
     fn test_remote_path() {
@@ -669,5 +732,69 @@ mod tests {
 
         // Test patterns focus on results/coverage, not build artifacts
         assert!(test_patterns.iter().any(|p| p.contains("coverage")));
+    }
+
+    #[test]
+    fn test_execute_remote_applies_env_allowlist() {
+        mock::clear_global_invocations();
+        mock::set_mock_enabled_override(Some(true));
+
+        let worker = WorkerConfig {
+            id: WorkerId::new("mock-worker"),
+            host: "mock://worker".to_string(),
+            user: "mockuser".to_string(),
+            identity_file: "~/.ssh/mock".to_string(),
+            total_slots: 4,
+            priority: 100,
+            tags: vec![],
+        };
+
+        let mut overrides = HashMap::new();
+        overrides.insert(
+            "RUSTFLAGS".to_string(),
+            "-C target-cpu=native".to_string(),
+        );
+        overrides.insert("QUOTED".to_string(), "a'b".to_string());
+        overrides.insert("BADVAL".to_string(), "line1\nline2".to_string());
+
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/tmp/project"),
+            "project".to_string(),
+            "hash".to_string(),
+            TransferConfig::default(),
+        )
+        .with_color_mode(ColorMode::Auto)
+        .with_env_allowlist(vec![
+            "RUSTFLAGS".to_string(),
+            "QUOTED".to_string(),
+            "BADVAL".to_string(),
+            "MISSING".to_string(),
+            "BAD=KEY".to_string(),
+        ])
+        .with_env_overrides(overrides);
+
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        rt.block_on(async {
+            pipeline
+                .execute_remote(&worker, "cargo build", None)
+                .await
+                .expect("execute_remote");
+        });
+
+        let invocations = mock::global_ssh_invocations_snapshot();
+        let command = invocations
+            .iter()
+            .find(|inv| inv.phase == Phase::Execute)
+            .and_then(|inv| inv.command.clone())
+            .expect("execute invocation");
+
+        assert!(command.contains("RUSTFLAGS='-C target-cpu=native'"));
+        assert!(command.contains("QUOTED='a'\"'\"'b'"));
+        assert!(!command.contains("BADVAL="));
+        assert!(!command.contains("BAD=KEY"));
+        assert!(command.contains("cargo build"));
+
+        mock::clear_mock_overrides();
+        mock::clear_global_invocations();
     }
 }

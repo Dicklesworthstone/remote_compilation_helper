@@ -545,6 +545,7 @@ async fn process_hook(input: HookInput) -> HookOutput {
                 &worker,
                 command,
                 config.transfer.clone(),
+                config.environment.allowlist.clone(),
                 &config.compilation,
                 toolchain.as_ref(),
                 classification.kind,
@@ -991,6 +992,7 @@ async fn execute_remote_compilation(
     worker: &SelectedWorker,
     command: &str,
     transfer_config: TransferConfig,
+    env_allowlist: Vec<String>,
     compilation_config: &rch_common::CompilationConfig,
     toolchain: Option<&ToolchainInfo>,
     kind: Option<CompilationKind>,
@@ -1025,6 +1027,7 @@ async fn execute_remote_compilation(
         transfer_config,
     )
     .with_color_mode(color_mode)
+    .with_env_allowlist(env_allowlist)
     .with_command_timeout(command_timeout);
 
     // Step 1: Sync project to remote

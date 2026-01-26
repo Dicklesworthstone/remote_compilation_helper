@@ -18,14 +18,21 @@ fn test_hook_allows_non_compilation() {
     {
         use std::io::Write;
         let stdin = child.stdin.as_mut().expect("Failed to open stdin");
-        stdin.write_all(input.as_bytes()).expect("Failed to write hook input");
+        stdin
+            .write_all(input.as_bytes())
+            .expect("Failed to write hook input");
     }
 
-    let output = child.wait_with_output().expect("Failed to read hook output");
+    let output = child
+        .wait_with_output()
+        .expect("Failed to read hook output");
     assert!(output.status.success(), "Hook exited with failure");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.trim().is_empty(), "Expected empty output, got: {stdout}");
+    assert!(
+        stdout.trim().is_empty(),
+        "Expected empty output, got: {stdout}"
+    );
 
     crate::test_log!("TEST PASS: test_hook_allows_non_compilation");
 }

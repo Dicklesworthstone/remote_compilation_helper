@@ -41,6 +41,91 @@ impl CommandResult {
     }
 }
 
+/// Environment variable prefix for remote command execution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvPrefix {
+    /// Shell-safe prefix (includes trailing space when non-empty).
+    pub prefix: String,
+    /// Keys applied to the command.
+    pub applied: Vec<String>,
+    /// Keys rejected due to invalid name or unsafe value.
+    pub rejected: Vec<String>,
+}
+
+/// Build a shell-safe environment variable prefix from an allowlist.
+///
+/// - Missing variables are ignored silently.
+/// - Unsafe values (newline, carriage return, NUL) are rejected.
+/// - Invalid keys are rejected.
+pub fn build_env_prefix<F>(allowlist: &[String], mut get_env: F) -> EnvPrefix
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    let mut parts = Vec::new();
+    let mut applied = Vec::new();
+    let mut rejected = Vec::new();
+
+    for raw_key in allowlist {
+        let key = raw_key.trim();
+        if key.is_empty() {
+            continue;
+        }
+        if !is_valid_env_key(key) {
+            rejected.push(key.to_string());
+            continue;
+        }
+        let Some(value) = get_env(key) else {
+            continue;
+        };
+        let Some(escaped) = shell_escape_value(&value) else {
+            rejected.push(key.to_string());
+            continue;
+        };
+        parts.push(format!("{}={}", key, escaped));
+        applied.push(key.to_string());
+    }
+
+    let prefix = if parts.is_empty() {
+        String::new()
+    } else {
+        format!("{} ", parts.join(" "))
+    };
+
+    EnvPrefix {
+        prefix,
+        applied,
+        rejected,
+    }
+}
+
+fn is_valid_env_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        return false;
+    }
+    chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+}
+
+fn shell_escape_value(value: &str) -> Option<String> {
+    if value.contains('\n') || value.contains('\r') || value.contains('\0') {
+        return None;
+    }
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('\'');
+    for ch in value.chars() {
+        if ch == '\'' {
+            out.push_str("'\"'\"'");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    Some(out)
+}
+
 /// SSH connection options.
 #[derive(Debug, Clone)]
 pub struct SshOptions {
@@ -492,6 +577,7 @@ impl Default for SshPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn test_command_result_success() {
@@ -535,5 +621,37 @@ mod tests {
         let client = SshClient::new(config.clone(), SshOptions::default());
         assert_eq!(client.worker_id().as_str(), "test-worker");
         assert!(!client.is_connected());
+    }
+
+    #[test]
+    fn test_build_env_prefix_quotes_and_rejects() {
+        let mut env = HashMap::new();
+        env.insert(
+            "RUSTFLAGS".to_string(),
+            "-C target-cpu=native".to_string(),
+        );
+        env.insert("QUOTED".to_string(), "a'b".to_string());
+        env.insert("BADVAL".to_string(), "line1\nline2".to_string());
+
+        let allowlist = vec![
+            "RUSTFLAGS".to_string(),
+            "QUOTED".to_string(),
+            "MISSING".to_string(),
+            "BADVAL".to_string(),
+            "BAD=KEY".to_string(),
+        ];
+
+        let prefix = build_env_prefix(&allowlist, |key| env.get(key).cloned());
+
+        assert!(prefix.prefix.contains("RUSTFLAGS='-C target-cpu=native'"));
+        assert!(prefix.prefix.contains("QUOTED='a'\"'\"'b'"));
+        assert!(!prefix.prefix.contains("MISSING="));
+        assert!(!prefix.prefix.contains("BADVAL="));
+        assert!(prefix.rejected.contains(&"BADVAL".to_string()));
+        assert!(prefix.rejected.contains(&"BAD=KEY".to_string()));
+        assert_eq!(
+            prefix.applied,
+            vec!["RUSTFLAGS".to_string(), "QUOTED".to_string()]
+        );
     }
 }
