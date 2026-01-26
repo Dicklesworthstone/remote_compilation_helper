@@ -475,13 +475,13 @@ pub struct ConfigTransferSection {
 }
 
 /// Environment configuration section.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct ConfigEnvironmentSection {
     pub allowlist: Vec<String>,
 }
 
 /// Circuit breaker configuration section.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct ConfigCircuitSection {
     pub failure_threshold: u32,
     pub success_threshold: u32,
@@ -492,14 +492,14 @@ pub struct ConfigCircuitSection {
 }
 
 /// Output configuration section.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct ConfigOutputSection {
     pub visibility: rch_common::OutputVisibility,
     pub first_run_complete: bool,
 }
 
 /// Self-healing configuration section.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct ConfigSelfHealingSection {
     pub hook_starts_daemon: bool,
     pub auto_start_cooldown_secs: u64,
