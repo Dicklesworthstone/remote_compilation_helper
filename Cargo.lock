@@ -3001,6 +3001,7 @@ dependencies = [
  "proptest",
  "regex",
  "rich_rust",
+ "schemars",
  "serde",
  "serde_json",
  "shell-escape",

@@ -514,7 +514,7 @@ pub struct ConfigInitResponse {
 }
 
 /// Configuration validation response for JSON output.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct ConfigValidationResponse {
     pub errors: Vec<ConfigValidationIssue>,
     pub warnings: Vec<ConfigValidationIssue>,
@@ -522,7 +522,7 @@ pub struct ConfigValidationResponse {
 }
 
 /// A single validation issue.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct ConfigValidationIssue {
     pub file: String,
     pub message: String,
@@ -537,7 +537,7 @@ pub struct ConfigSetResponse {
 }
 
 /// Diagnose command response for JSON output.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct DiagnoseResponse {
     pub classification: Classification,
     pub tiers: Vec<ClassificationTier>,
@@ -555,19 +555,19 @@ pub struct DiagnoseResponse {
     pub worker_selection: Option<DiagnoseWorkerSelection>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct DiagnoseDecision {
     pub would_intercept: bool,
     pub reason: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct DiagnoseThreshold {
     pub value: f64,
     pub source: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct DiagnoseDaemonStatus {
     pub socket_path: String,
     pub socket_exists: bool,
@@ -582,7 +582,7 @@ pub struct DiagnoseDaemonStatus {
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct DiagnoseWorkerSelection {
     pub estimated_cores: u32,
     pub worker: Option<SelectedWorker>,
@@ -590,7 +590,7 @@ pub struct DiagnoseWorkerSelection {
 }
 
 /// Hook install/uninstall response for JSON output.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct HookActionResponse {
     pub action: String,
     pub success: bool,
@@ -5470,7 +5470,7 @@ pub fn config_export(format: &str, ctx: &OutputContext) -> Result<()> {
 // =============================================================================
 
 /// Issue severity for config lint.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum LintSeverity {
     Error,
@@ -5479,7 +5479,7 @@ pub enum LintSeverity {
 }
 
 /// A single lint issue.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct LintIssue {
     pub severity: LintSeverity,
     pub code: String,
@@ -5488,7 +5488,7 @@ pub struct LintIssue {
 }
 
 /// Response for config lint command.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct ConfigLintResponse {
     pub issues: Vec<LintIssue>,
     pub error_count: usize,
@@ -5497,7 +5497,7 @@ pub struct ConfigLintResponse {
 }
 
 /// A single diff entry showing a non-default value.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct ConfigDiffEntry {
     pub key: String,
     pub current: String,
@@ -5506,7 +5506,7 @@ pub struct ConfigDiffEntry {
 }
 
 /// Response for config diff command.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct ConfigDiffResponse {
     pub entries: Vec<ConfigDiffEntry>,
     pub total_changes: usize,
@@ -6676,6 +6676,60 @@ pub fn hook_uninstall(ctx: &OutputContext) -> Result<()> {
             "{} Hook not found in settings.",
             StatusIndicator::Info.display(style)
         );
+    }
+
+    Ok(())
+}
+
+/// Display hook installation status.
+pub fn hook_status(ctx: &OutputContext) -> Result<()> {
+    use crate::agent::{AgentKind, HookStatus, check_hook_status};
+
+    let style = ctx.theme();
+
+    if !ctx.is_json() {
+        println!("{}", style.format_header("Hook Status"));
+        println!();
+    }
+
+    // Check status for supported agents
+    let supported_agents = [
+        AgentKind::ClaudeCode,
+        AgentKind::GeminiCli,
+        AgentKind::CodexCli,
+        AgentKind::ContinueDev,
+    ];
+
+    let mut statuses = Vec::new();
+    for kind in &supported_agents {
+        let status = check_hook_status(*kind).unwrap_or(HookStatus::NotSupported);
+        if !ctx.is_json() {
+            let indicator = match status {
+                HookStatus::Installed => StatusIndicator::Success,
+                HookStatus::NeedsUpdate => StatusIndicator::Warning,
+                HookStatus::NotInstalled => StatusIndicator::Info,
+                HookStatus::NotSupported => StatusIndicator::Pending,
+            };
+            println!(
+                "  {} {}: {}",
+                indicator.display(style),
+                style.key(&format!("{:?}", kind)),
+                status
+            );
+        }
+        statuses.push(serde_json::json!({
+            "agent": format!("{:?}", kind),
+            "status": status.to_string(),
+        }));
+    }
+
+    if ctx.is_json() {
+        let _ = ctx.json(&ApiResponse::ok(
+            "hook status",
+            serde_json::json!({
+                "agents": statuses,
+            }),
+        ));
     }
 
     Ok(())

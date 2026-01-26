@@ -1,11 +1,12 @@
 //! Common types used across RCH components.
 
 use crate::{CompilationKind, toolchain::ToolchainInfo};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// Unique identifier for a worker in the fleet.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub struct WorkerId(pub String);
 
 impl WorkerId {
@@ -55,7 +56,7 @@ pub enum CircuitState {
 }
 
 /// Required runtime for command execution.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum RequiredRuntime {
     /// No specific runtime required (default).
@@ -101,7 +102,7 @@ pub struct SelectionRequest {
 ///
 /// Provides context when no worker is available, enabling informative
 /// fallback messages in the hook.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SelectionReason {
     /// Worker assigned successfully.
@@ -317,7 +318,7 @@ fn default_max_consecutive_selections() -> u32 {
 }
 
 /// Details about a selected worker for remote compilation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SelectedWorker {
     /// Selected worker ID.
     pub id: WorkerId,
@@ -401,7 +402,7 @@ impl Default for WorkerConfig {
 /// These are probed during health checks and cached for routing decisions.
 /// Commands requiring specific runtimes (e.g., `bun test`) can be routed
 /// only to workers with the corresponding capability.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct WorkerCapabilities {
     /// Rust compiler version (from `rustc --version`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -495,7 +496,7 @@ impl Default for GeneralConfig {
 }
 
 /// Visibility level for hook output.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum OutputVisibility {
     #[default]

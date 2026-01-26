@@ -367,6 +367,20 @@ async fn main() -> Result<()> {
         }
     });
 
+    // Start background cleanup for drained workers
+    let cleanup_pool = worker_pool.clone();
+    let _cleanup_handle = tokio::spawn(async move {
+        // Check every minute
+        let mut ticker = interval(Duration::from_secs(60));
+        loop {
+            ticker.tick().await;
+            let pruned = cleanup_pool.prune_drained().await;
+            if pruned > 0 {
+                info!("Background cleanup: pruned {} drained workers", pruned);
+            }
+        }
+    });
+
     if let Some(storage) = telemetry_storage {
         let _maintenance = telemetry::start_storage_maintenance(storage);
         info!("Telemetry storage maintenance started");

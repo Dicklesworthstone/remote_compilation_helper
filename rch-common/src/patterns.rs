@@ -8,6 +8,7 @@
 //! - Tier 4: Full classification with confidence
 
 use memchr::memmem;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 
@@ -75,7 +76,7 @@ pub static NEVER_INTERCEPT: &[&str] = &[
 ];
 
 /// Result of command classification.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Classification {
     /// Whether this is a compilation command.
     pub is_compilation: bool,
@@ -88,7 +89,7 @@ pub struct Classification {
 }
 
 /// Decision outcome for a classification tier.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum TierDecision {
     Pass,
@@ -96,7 +97,7 @@ pub enum TierDecision {
 }
 
 /// Detailed result for a single classification tier.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ClassificationTier {
     /// Tier index (0-4).
     pub tier: u8,
@@ -109,7 +110,7 @@ pub struct ClassificationTier {
 }
 
 /// Detailed classification results with per-tier decisions.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ClassificationDetails {
     /// Original command string.
     pub original: String,
@@ -144,7 +145,7 @@ impl Classification {
 }
 
 /// Kind of compilation command detected.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CompilationKind {
     // Rust commands

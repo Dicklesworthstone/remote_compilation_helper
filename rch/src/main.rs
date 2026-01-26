@@ -27,7 +27,7 @@ use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::CompleteEnv;
 use rch_common::{LogConfig, init_logging};
-use schemars::{JsonSchema, schema_for};
+use schemars::schema_for;
 use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -759,10 +759,9 @@ impl WorkersAction {
             WorkersAction::Drain { .. } => "drain",
             WorkersAction::Enable { .. } => "enable",
             WorkersAction::Disable { .. } => "disable",
-            WorkersAction::Priority { .. } => "priority",
+            WorkersAction::DeployBinary { .. } => "deploy-binary",
             WorkersAction::Discover { .. } => "discover",
-            WorkersAction::Deploy { .. } => "deploy",
-            WorkersAction::Toolchain { .. } => "toolchain",
+            WorkersAction::SyncToolchain { .. } => "sync-toolchain",
             WorkersAction::Setup { .. } => "setup",
             WorkersAction::Init { .. } => "init",
         }
@@ -1258,7 +1257,10 @@ fn handle_schema_request(command: &Option<Commands>) -> Result<()> {
                 serde_json::to_string_pretty(&schema)?
             }
             _ => {
-                eprintln!("No JSON Schema available for 'config {}' output", action.as_str());
+                eprintln!(
+                    "No JSON Schema available for 'config {}' output",
+                    action.as_str()
+                );
                 std::process::exit(1);
             }
         },
@@ -1268,7 +1270,10 @@ fn handle_schema_request(command: &Option<Commands>) -> Result<()> {
                 serde_json::to_string_pretty(&schema)?
             }
             _ => {
-                eprintln!("No JSON Schema available for 'workers {}' output", action.as_str());
+                eprintln!(
+                    "No JSON Schema available for 'workers {}' output",
+                    action.as_str()
+                );
                 std::process::exit(1);
             }
         },
@@ -1278,7 +1283,10 @@ fn handle_schema_request(command: &Option<Commands>) -> Result<()> {
                 serde_json::to_string_pretty(&schema)?
             }
             _ => {
-                eprintln!("No JSON Schema available for 'daemon {}' output", action.as_str());
+                eprintln!(
+                    "No JSON Schema available for 'daemon {}' output",
+                    action.as_str()
+                );
                 std::process::exit(1);
             }
         },
@@ -1292,7 +1300,10 @@ fn handle_schema_request(command: &Option<Commands>) -> Result<()> {
                 serde_json::to_string_pretty(&schema)?
             }
             _ => {
-                eprintln!("No JSON Schema available for 'hook {}' output", action.as_str());
+                eprintln!(
+                    "No JSON Schema available for 'hook {}' output",
+                    action.as_str()
+                );
                 std::process::exit(1);
             }
         },
@@ -1458,6 +1469,9 @@ async fn handle_hook(action: HookAction, ctx: &OutputContext) -> Result<()> {
         }
         HookAction::Test => {
             commands::hook_test(ctx).await?;
+        }
+        HookAction::Status => {
+            commands::hook_status(ctx)?;
         }
     }
     Ok(())

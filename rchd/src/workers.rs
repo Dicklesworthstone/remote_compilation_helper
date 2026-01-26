@@ -388,6 +388,32 @@ impl WorkerPool {
         }
     }
 
+    /// Prune workers that are in Draining state and have no active slots.
+    ///
+    /// Returns the number of workers removed.
+    pub async fn prune_drained(&self) -> usize {
+        let mut workers = self.workers.write().await;
+        let mut to_remove = Vec::new();
+
+        for (id, worker) in workers.iter() {
+            if worker.is_draining().await && worker.used_slots() == 0 {
+                to_remove.push(id.clone());
+            }
+        }
+
+        let count = to_remove.len();
+        for id in to_remove {
+            workers.remove(&id);
+            debug!("Pruned drained worker: {}", id);
+        }
+
+        if count > 0 {
+            self.worker_count.fetch_sub(count, Ordering::SeqCst);
+        }
+
+        count
+    }
+
     /// Get the number of workers in the pool.
     pub fn len(&self) -> usize {
         self.worker_count.load(Ordering::SeqCst)
@@ -481,5 +507,59 @@ mod tests {
 
         state.release_slots(4).await;
         assert_eq!(state.available_slots().await, 4);
+    }
+
+    #[tokio::test]
+    async fn test_prune_drained() {
+        let pool = WorkerPool::new();
+
+        // Active worker
+        let active = WorkerState::new(WorkerConfig {
+            id: WorkerId::new("active"),
+            host: "localhost".to_string(),
+            user: "u".to_string(),
+            identity_file: "i".to_string(),
+            total_slots: 8,
+            priority: 100,
+            tags: vec![],
+        });
+        pool.add_worker_state(active).await;
+
+        // Drained worker with 0 slots used
+        let drained_empty = WorkerState::new(WorkerConfig {
+            id: WorkerId::new("drained_empty"),
+            host: "localhost".to_string(),
+            user: "u".to_string(),
+            identity_file: "i".to_string(),
+            total_slots: 8,
+            priority: 100,
+            tags: vec![],
+        });
+        drained_empty.drain().await;
+        pool.add_worker_state(drained_empty).await;
+
+        // Drained worker with slots in use (should NOT be pruned)
+        let drained_busy = WorkerState::new(WorkerConfig {
+            id: WorkerId::new("drained_busy"),
+            host: "localhost".to_string(),
+            user: "u".to_string(),
+            identity_file: "i".to_string(),
+            total_slots: 8,
+            priority: 100,
+            tags: vec![],
+        });
+        drained_busy.drain().await;
+        drained_busy.reserve_slots(1).await;
+        pool.add_worker_state(drained_busy).await;
+
+        assert_eq!(pool.len(), 3);
+
+        let pruned = pool.prune_drained().await;
+        assert_eq!(pruned, 1);
+        assert_eq!(pool.len(), 2);
+
+        assert!(pool.get(&WorkerId::new("active")).await.is_some());
+        assert!(pool.get(&WorkerId::new("drained_busy")).await.is_some());
+        assert!(pool.get(&WorkerId::new("drained_empty")).await.is_none());
     }
 }
