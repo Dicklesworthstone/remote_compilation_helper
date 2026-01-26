@@ -20,9 +20,6 @@ use tokio::process::Command;
 use tokio::time::Instant as TokioInstant;
 use tracing::{debug, info, warn};
 
-/// Remote project path prefix.
-const REMOTE_BASE: &str = "/tmp/rch";
-
 fn use_mock_transport(worker: &WorkerConfig) -> bool {
     mock::is_mock_enabled() || mock::is_mock_worker(worker)
 }
@@ -116,7 +113,10 @@ impl TransferPipeline {
 
     /// Get the remote project path on the worker.
     pub fn remote_path(&self) -> String {
-        format!("{}/{}/{}", REMOTE_BASE, self.project_id, self.project_hash)
+        format!(
+            "{}/{}/{}",
+            self.transfer_config.remote_base, self.project_id, self.project_hash
+        )
     }
 
     /// Synchronize local project to remote worker.
@@ -1252,5 +1252,35 @@ mod tests {
 
         mock::clear_mock_overrides();
         mock::clear_global_invocations();
+    }
+
+    #[test]
+    fn test_remote_path_with_custom_remote_base() {
+        let mut config = TransferConfig::default();
+        config.remote_base = "/var/rch-builds".to_string();
+
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/home/user/project"),
+            "myproject".to_string(),
+            "abc123".to_string(),
+            config,
+        );
+
+        assert_eq!(pipeline.remote_path(), "/var/rch-builds/myproject/abc123");
+    }
+
+    #[test]
+    fn test_remote_path_with_home_directory_base() {
+        let mut config = TransferConfig::default();
+        config.remote_base = "/home/builder/.rch".to_string();
+
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/workspace/project"),
+            "project".to_string(),
+            "def456".to_string(),
+            config,
+        );
+
+        assert_eq!(pipeline.remote_path(), "/home/builder/.rch/project/def456");
     }
 }

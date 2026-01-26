@@ -635,6 +635,20 @@ fn apply_layer(
         config.transfer.exclude_patterns = patterns.clone();
         set_source(sources, "transfer.exclude_patterns", source.clone());
     }
+    if let Some(remote_base) = layer.transfer.remote_base.as_ref()
+        && remote_base != &defaults.transfer.remote_base
+    {
+        // Validate and normalize the remote_base path
+        match rch_common::validate_remote_base(remote_base) {
+            Ok(validated) => {
+                config.transfer.remote_base = validated;
+                set_source(sources, "transfer.remote_base", source.clone());
+            }
+            Err(e) => {
+                warn!("Invalid remote_base in {}: {}", source, e);
+            }
+        }
+    }
 
     if let Some(allowlist) = layer.environment.allowlist.as_ref()
         && allowlist != &defaults.environment.allowlist

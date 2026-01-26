@@ -452,8 +452,14 @@ async fn test_worker_selection_timing() {
         "Starting worker selection timing test",
         vec![
             ("phase".to_string(), "setup".to_string()),
-            ("budget_us".to_string(), WORKER_SELECTION_BUDGET_US.to_string()),
-            ("panic_us".to_string(), WORKER_SELECTION_PANIC_US.to_string()),
+            (
+                "budget_us".to_string(),
+                WORKER_SELECTION_BUDGET_US.to_string(),
+            ),
+            (
+                "panic_us".to_string(),
+                WORKER_SELECTION_PANIC_US.to_string(),
+            ),
         ],
     );
 
@@ -555,7 +561,6 @@ async fn test_classification_accuracy() {
         ("clang hello.c", true, "clang"),
         ("make", true, "make"),
         ("cmake --build .", true, "cmake build"),
-
         // Clear non-compilation commands
         ("ls", false, "ls"),
         ("ls -la", false, "ls with flags"),
@@ -567,7 +572,6 @@ async fn test_classification_accuracy() {
         ("find . -name '*.rs'", false, "find"),
         ("pwd", false, "pwd"),
         ("cd /tmp", false, "cd"),
-
         // Edge cases
         ("cargo --version", false, "cargo version check"),
         ("cargo fmt", false, "cargo fmt is not compilation"),
@@ -599,12 +603,7 @@ async fn test_classification_accuracy() {
                 ("description".to_string(), desc.to_string()),
                 (
                     "expected".to_string(),
-                    if *expected {
-                        "compile"
-                    } else {
-                        "non_compile"
-                    }
-                    .to_string(),
+                    if *expected { "compile" } else { "non_compile" }.to_string(),
                 ),
                 (
                     "actual".to_string(),

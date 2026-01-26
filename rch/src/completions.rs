@@ -392,9 +392,19 @@ mod tests {
     fn test_install_paths_all_shells() {
         // Test that all supported shells have valid install paths
         use clap_complete::Shell;
-        for shell in [Shell::Bash, Shell::Zsh, Shell::Fish, Shell::PowerShell, Shell::Elvish] {
+        for shell in [
+            Shell::Bash,
+            Shell::Zsh,
+            Shell::Fish,
+            Shell::PowerShell,
+            Shell::Elvish,
+        ] {
             let result = get_install_paths(shell);
-            assert!(result.is_ok(), "Failed to get install paths for {:?}", shell);
+            assert!(
+                result.is_ok(),
+                "Failed to get install paths for {:?}",
+                shell
+            );
             let paths = result.unwrap();
             assert!(!paths.script_path.as_os_str().is_empty());
         }
@@ -414,7 +424,11 @@ mod tests {
         let rc_path = temp_dir.path().join(".zshrc");
 
         // Write file with RCH marker
-        std::fs::write(&rc_path, "# some config\n# RCH completions\nfpath=(~/.zfunc $fpath)\n").unwrap();
+        std::fs::write(
+            &rc_path,
+            "# some config\n# RCH completions\nfpath=(~/.zfunc $fpath)\n",
+        )
+        .unwrap();
         let result = rc_file_has_rch_setup(&rc_path).unwrap();
         assert!(result, "Should detect RCH completions marker");
     }
@@ -425,7 +439,11 @@ mod tests {
         let rc_path = temp_dir.path().join(".bashrc");
 
         // Write file without RCH marker
-        std::fs::write(&rc_path, "# some other config\nexport PATH=$PATH:/usr/local/bin\n").unwrap();
+        std::fs::write(
+            &rc_path,
+            "# some other config\nexport PATH=$PATH:/usr/local/bin\n",
+        )
+        .unwrap();
         let result = rc_file_has_rch_setup(&rc_path).unwrap();
         assert!(!result, "Should not detect RCH setup in unrelated config");
     }
