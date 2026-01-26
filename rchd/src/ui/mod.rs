@@ -10,7 +10,9 @@
 //! - Plain text fallback for degraded terminal state
 //! - Version included in final message for troubleshooting
 
+pub mod banner;
 pub mod shutdown;
 
 #[allow(unused_imports)]
+pub use banner::DaemonBanner;
 pub use shutdown::{JobDrainEvent, SessionStats, ShutdownSequence};

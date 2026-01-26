@@ -21,7 +21,7 @@ mod ui;
 mod workers;
 
 use anyhow::Result;
-use chrono::Duration as ChronoDuration;
+use chrono::{Duration as ChronoDuration, Local};
 use clap::Parser;
 use rch_common::{LogConfig, SelfTestConfig, init_logging};
 use std::path::PathBuf;
@@ -38,6 +38,7 @@ use rch_telemetry::storage::TelemetryStorage;
 use selection::WorkerSelector;
 use self_test::{DEFAULT_RESULT_CAPACITY, DEFAULT_RUN_CAPACITY, SelfTestHistory, SelfTestService};
 use telemetry::{TelemetryPoller, TelemetryPollerConfig, TelemetryStore};
+use ui::DaemonBanner;
 
 #[derive(Parser)]
 #[command(name = "rchd")]
@@ -102,6 +103,7 @@ pub struct DaemonContext {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    let startup_started = Instant::now();
 
     // Initialize logging
     let mut log_config = LogConfig::from_env("info");
@@ -126,9 +128,12 @@ async fn main() -> Result<()> {
             None
         }
     };
+    let otel_enabled = _otel_guard.is_some();
 
     // Load worker configuration
     let workers = config::load_workers(cli.workers_config.as_deref())?;
+    let worker_count = workers.len();
+    let total_slots: u32 = workers.iter().map(|worker| worker.total_slots).sum();
     info!("Loaded {} workers from configuration", workers.len());
 
     // Initialize worker pool
@@ -307,6 +312,29 @@ async fn main() -> Result<()> {
         info!("HTTP metrics endpoint disabled (port 0)");
         None
     };
+
+    let commit_hash = option_env!("RCH_GIT_COMMIT")
+        .or(option_env!("VERGEN_GIT_SHA"))
+        .or(option_env!("GIT_COMMIT"))
+        .or(option_env!("GITHUB_SHA"))
+        .map(|value| value.to_string());
+
+    let banner = DaemonBanner::new(
+        env!("CARGO_PKG_VERSION"),
+        option_env!("PROFILE").map(|value| value.to_string()),
+        option_env!("TARGET").map(|value| value.to_string()),
+        commit_hash,
+        cli.socket.to_string_lossy().to_string(),
+        worker_count,
+        total_slots,
+        cli.metrics_port,
+        true,
+        otel_enabled,
+        context.pid,
+        Local::now(),
+        startup_started.elapsed(),
+    );
+    banner.show();
 
     // Shutdown channel
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel(1);

@@ -543,6 +543,127 @@ pub async fn workers_list(show_speedscore: bool, ctx: &OutputContext) -> Result<
     Ok(())
 }
 
+/// Show worker runtime capabilities.
+pub async fn workers_capabilities(
+    command: Option<String>,
+    refresh: bool,
+    ctx: &OutputContext,
+) -> Result<()> {
+    let style = ctx.theme();
+    let response = query_workers_capabilities(refresh).await?;
+    let workers = response.workers;
+
+    let mut warnings = Vec::new();
+    let mut required_runtime = None;
+
+    if let Some(command) = command.as_deref() {
+        let details = classify_command_detailed(command);
+        if !details.classification.is_compilation {
+            warnings.push(format!(
+                "Command '{}' is not a compilation command: {}",
+                command, details.classification.reason
+            ));
+        }
+        let runtime = required_runtime_for_kind(details.classification.kind);
+        if runtime != RequiredRuntime::None {
+            required_runtime = Some(runtime);
+        }
+    }
+
+    if let Some(runtime) = required_runtime.clone() {
+        let missing: Vec<String> = workers
+            .iter()
+            .filter(|worker| {
+                let caps = &worker.capabilities;
+                match runtime {
+                    RequiredRuntime::Rust => !caps.has_rust(),
+                    RequiredRuntime::Bun => !caps.has_bun(),
+                    RequiredRuntime::Node => !caps.has_node(),
+                    RequiredRuntime::None => false,
+                }
+            })
+            .map(|worker| worker.id.clone())
+            .collect();
+
+        if !missing.is_empty() {
+            warnings.push(format!(
+                "Workers missing required runtime {:?}: {}",
+                runtime,
+                missing.join(", ")
+            ));
+        }
+    }
+
+    if ctx.is_json() {
+        let report = WorkersCapabilitiesReport {
+            workers,
+            local: None,
+            required_runtime,
+            warnings,
+        };
+        let _ = ctx.json(&ApiResponse::ok("workers capabilities", report));
+        return Ok(());
+    }
+
+    if workers.is_empty() {
+        println!("{}", style.warning("No workers configured"));
+        return Ok(());
+    }
+
+    println!("{}", style.format_header("Worker Capabilities"));
+    println!();
+
+    if let Some(runtime) = required_runtime.as_ref() {
+        println!(
+            "{} {}",
+            style.key("Required runtime:"),
+            style.value(&format!("{runtime:?}"))
+        );
+        println!();
+    }
+
+    for worker in &workers {
+        println!(
+            "  {} {} {}@{}",
+            style.symbols.bullet_filled,
+            style.highlight(&worker.id),
+            style.muted(&worker.user),
+            style.info(&worker.host)
+        );
+
+        let caps = &worker.capabilities;
+        let render = |label: &str, value: Option<&String>| {
+            let (indicator, display) = if let Some(ver) = value {
+                (StatusIndicator::Success, style.value(ver))
+            } else {
+                (StatusIndicator::Error, style.error("missing"))
+            };
+            println!(
+                "    {} {} {} {}",
+                indicator.display(style),
+                style.key(label),
+                style.muted(":"),
+                display
+            );
+        };
+
+        render("Rust", caps.rustc_version.as_ref());
+        render("Bun", caps.bun_version.as_ref());
+        render("Node", caps.node_version.as_ref());
+        render("npm", caps.npm_version.as_ref());
+        println!();
+    }
+
+    if !warnings.is_empty() {
+        println!("{}", style.warning("Warnings"));
+        for warning in warnings {
+            println!("  {} {}", StatusIndicator::Warning.display(style), warning);
+        }
+    }
+
+    Ok(())
+}
+
 /// Probe worker connectivity.
 pub async fn workers_probe(
     worker_id: Option<String>,
@@ -5572,6 +5693,21 @@ pub fn agents_uninstall_hook(_agent: &str, _dry_run: bool, _ctx: &OutputContext)
 // =============================================================================
 // SpeedScore Commands
 // =============================================================================
+
+/// Query the daemon for worker capabilities.
+async fn query_workers_capabilities(refresh: bool) -> Result<WorkerCapabilitiesResponseFromApi> {
+    let command = if refresh {
+        "GET /workers/capabilities?refresh=true\n"
+    } else {
+        "GET /workers/capabilities\n"
+    };
+    let response = send_daemon_command(command).await?;
+    let json = extract_json_body(&response)
+        .ok_or_else(|| anyhow::anyhow!("Invalid response format from daemon"))?;
+    let capabilities: WorkerCapabilitiesResponseFromApi = serde_json::from_str(json)
+        .context("Failed to parse worker capabilities response")?;
+    Ok(capabilities)
+}
 
 /// Query the daemon for all worker SpeedScores.
 async fn query_speedscore_list() -> Result<SpeedScoreListResponseFromApi> {
