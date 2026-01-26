@@ -278,7 +278,7 @@ fn test_global_color_flag_accepted() {
         let output = Command::new(env!("CARGO_BIN_EXE_rch"))
             .args(["--color", mode, "--help"])
             .output()
-            .expect(&format!("Failed to run rch --color {} --help", mode));
+            .unwrap_or_else(|_| panic!("Failed to run rch --color {} --help", mode));
 
         assert!(
             output.status.success(),
@@ -298,7 +298,7 @@ fn test_global_format_flag_accepted() {
         let output = Command::new(env!("CARGO_BIN_EXE_rch"))
             .args(["--format", format, "--help"])
             .output()
-            .expect(&format!("Failed to run rch --format {} --help", format));
+            .unwrap_or_else(|_| panic!("Failed to run rch --format {} --help", format));
 
         assert!(
             output.status.success(),
