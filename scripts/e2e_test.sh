@@ -1,514 +1,423 @@
 #!/usr/bin/env bash
 #
-# e2e_test.sh - End-to-end pipeline test for Remote Compilation Helper (RCH)
+# e2e_test.sh - Master E2E test orchestration for RCH
 #
 # Usage:
 #   ./scripts/e2e_test.sh [OPTIONS]
 #
 # Options:
-#   --mock                 Run with mock SSH/rsync (default)
-#   --real                 Run with real workers (requires env below)
-#   --fail MODE            Inject failure: sync|exec|artifacts|worker-down|remote-exit|toolchain-install|no-rustup|circuit-open
-#   --run-all              In mock mode, run success + failure scenarios
-#   --unit                 Also run `cargo test --workspace`
-#   --verbose              Enable verbose output
-#   --help                 Show this help message
+#   --filter PATTERN     Run tests matching PATTERN (name or path)
+#   --list               List discovered tests and exit
+#   --junit FILE         Write JUnit XML to FILE (default: $LOG_DIR/junit.xml)
+#   --log-dir DIR        Directory for per-test logs (default: /tmp/rch-e2e-logs)
+#   --parallel N         Max parallel tests (default: auto)
+#   --serial             Run all tests serially
+#   --verbose, -v        Stream test output to stdout
+#   --help, -h           Show this help message
 #
-# Environment (real mode):
-#   RCH_E2E_WORKERS_FILE    Path to workers.toml (preferred)
-#   RCH_E2E_WORKER_HOST     Worker host
-#   RCH_E2E_WORKER_USER     SSH user (default: ubuntu)
-#   RCH_E2E_WORKER_KEY      SSH key path (default: ~/.ssh/id_rsa)
-#   RCH_E2E_WORKER_ID       Worker id (default: e2e-worker)
-#   RCH_E2E_WORKER_SLOTS    Total slots (default: 8)
+# Legacy behavior:
+#   If invoked with pipeline flags (--mock/--real/--fail/--run-all/--unit),
+#   delegates to scripts/e2e_pipeline.sh to preserve old behavior.
 #
-# Notes:
-# - Mock mode uses RCH_MOCK_SSH=1 and does NOT create real artifacts.
-# - For mock runs we validate that the artifact phase executed via hook logs.
+# Exit codes:
+#   0 - All tests passed
+#   1 - Some tests failed
+#   2 - Infrastructure error
 #
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-MODE="mock"
-FAIL_MODE=""
-RUN_ALL="0"
-RUN_UNIT="0"
-VERBOSE="${RCH_E2E_VERBOSE:-0}"
+LIB_PATH="$SCRIPT_DIR/lib/e2e_common.sh"
+LEGACY_SCRIPT="$SCRIPT_DIR/e2e_pipeline.sh"
 
-timestamp() { date -u '+%Y-%m-%dT%H:%M:%S.%3NZ'; }
+if [[ ! -f "$LIB_PATH" ]]; then
+    echo "[E2E] ERROR: Missing $LIB_PATH" >&2
+    exit 2
+fi
 
-log() {
-    local level="$1" phase="$2"; shift 2
-    local ts; ts="$(timestamp)"
-    echo "[$ts] [$level] [$phase] $*"
-}
+# shellcheck disable=SC1090
+source "$LIB_PATH"
 
-die() { log "FAIL" "SETUP" "$*"; exit 2; }
+LOG_DIR="${E2E_LOG_DIR:-/tmp/rch-e2e-logs}"
+VERBOSE="${E2E_VERBOSE:-0}"
+FILTER="${E2E_FILTER:-}"
+JUNIT_FILE="${E2E_JUNIT_FILE:-}"
+PARALLELISM="${E2E_PARALLELISM:-}"
+SERIAL_ONLY=0
+LIST_ONLY=0
 
 usage() {
     sed -n '1,40p' "$0" | sed 's/^# \{0,1\}//'
 }
 
+legacy_args_detected() {
+    for arg in "$@"; do
+        case "$arg" in
+            --mock|--real|--fail|--run-all|--unit)
+                return 0
+                ;;
+        esac
+    done
+    return 1
+}
+
+if legacy_args_detected "$@"; then
+    if [[ ! -x "$LEGACY_SCRIPT" ]]; then
+        echo "[E2E] ERROR: Missing legacy script $LEGACY_SCRIPT" >&2
+        exit 2
+    fi
+    exec "$LEGACY_SCRIPT" "$@"
+fi
+
 parse_args() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --mock) MODE="mock"; shift ;;
-            --real) MODE="real"; shift ;;
-            --fail) FAIL_MODE="${2:-}"; shift 2 ;;
-            --run-all) RUN_ALL="1"; shift ;;
-            --unit) RUN_UNIT="1"; shift ;;
-            --verbose|-v) VERBOSE="1"; shift ;;
-            --help|-h) usage; exit 0 ;;
-            *) log "FAIL" "ARGS" "Unknown option: $1"; exit 3 ;;
+            --filter)
+                FILTER="${2:-}"
+                shift 2
+                ;;
+            --list)
+                LIST_ONLY=1
+                shift
+                ;;
+            --junit)
+                JUNIT_FILE="${2:-}"
+                shift 2
+                ;;
+            --log-dir)
+                LOG_DIR="${2:-}"
+                shift 2
+                ;;
+            --parallel)
+                PARALLELISM="${2:-}"
+                shift 2
+                ;;
+            --serial)
+                SERIAL_ONLY=1
+                shift
+                ;;
+            --verbose|-v)
+                VERBOSE=1
+                shift
+                ;;
+            --help|-h)
+                usage
+                exit 0
+                ;;
+            *)
+                echo "[E2E] ERROR: Unknown option: $1" >&2
+                usage
+                exit 2
+                ;;
         esac
     done
-    [[ "${RCH_MOCK_SSH:-}" == "1" ]] && MODE="mock" || true
-    if [[ "$MODE" == "mock" && "$RUN_ALL" == "0" ]]; then
-        RUN_ALL="1"
+}
+
+test_name() {
+    local file="$1"
+    local name
+    name="$(sed -n 's/^# E2E_NAME=//p' "$file" | head -n 1)"
+    if [[ -z "$name" ]]; then
+        name="$(basename "$file" .sh)"
     fi
+    echo "$name"
 }
 
-check_dependencies() {
-    log "INFO" "SETUP" "Checking dependencies..."
-    for cmd in cargo rustc; do
-        command -v "$cmd" >/dev/null 2>&1 || die "Missing: $cmd"
-    done
-    log "INFO" "SETUP" "Dependencies OK"
+test_serial() {
+    local file="$1"
+    /bin/grep -q '^# E2E_SERIAL=1' "$file"
 }
 
-build_binaries() {
-    log "INFO" "BUILD" "Building rch + rchd (debug)..."
-    cd "$PROJECT_ROOT"
-    cargo build -p rch -p rchd >/dev/null 2>&1 || die "Build failed"
-    [[ -x "$PROJECT_ROOT/target/debug/rch" ]] || die "Binary missing: rch"
-    [[ -x "$PROJECT_ROOT/target/debug/rchd" ]] || die "Binary missing: rchd"
-    log "INFO" "BUILD" "Build OK"
+test_args() {
+    local file="$1"
+    sed -n 's/^# E2E_ARGS=//p' "$file" | head -n 1
 }
 
-make_test_project() {
-    TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/rch-e2e-XXXXXX")"
-    PROJECT_DIR="$TEST_ROOT/project"
-    LOG_DIR="$TEST_ROOT/logs"
-    mkdir -p "$PROJECT_DIR/src" "$LOG_DIR"
+run_test() {
+    local file="$1"
+    local name="$2"
+    local args_raw="$3"
+    local slug="$4"
+    local log_file="$LOG_DIR/${slug}.log"
+    local result_file="$RESULTS_DIR/${slug}.result"
+    local start_ms
+    local end_ms
+    local duration_ms
+    local status
 
-    cat >"$PROJECT_DIR/Cargo.toml" <<'EOF'
-[package]
-name = "rch_e2e_app"
-version = "0.1.0"
-edition = "2024"
+    start_ms="$(e2e_now_ms)"
 
-[dependencies]
-EOF
+    e2e_log "Running: $name"
+    e2e_log "TEST START: $name"
 
-    cat >"$PROJECT_DIR/src/main.rs" <<'EOF'
-fn main() {
-    println!("rch e2e ok");
-}
-EOF
-
-    log "INFO" "SETUP" "Test project: $PROJECT_DIR"
-    log "INFO" "SETUP" "Logs: $LOG_DIR"
-}
-
-write_workers_config() {
-    WORKERS_FILE="$TEST_ROOT/workers.toml"
-
-    if [[ "$MODE" == "mock" ]]; then
-        cat >"$WORKERS_FILE" <<'EOF'
-[[workers]]
-id = "mock-worker"
-host = "mock.host"
-user = "mockuser"
-identity_file = "~/.ssh/mock"
-total_slots = 64
-priority = 100
-enabled = true
-EOF
-        return
+    local -a args=()
+    if [[ -n "$args_raw" ]]; then
+        # shellcheck disable=SC2206
+        args=($args_raw)
     fi
 
-    if [[ -n "${RCH_E2E_WORKERS_FILE:-}" ]]; then
-        if [[ ! -f "$RCH_E2E_WORKERS_FILE" ]]; then
-            die "RCH_E2E_WORKERS_FILE not found: $RCH_E2E_WORKERS_FILE"
+    set +e
+    if [[ "$VERBOSE" == "1" ]]; then
+        if [[ ${#args[@]} -gt 0 ]]; then
+            "$file" "${args[@]}" 2>&1 | tee "$log_file"
+        else
+            "$file" 2>&1 | tee "$log_file"
         fi
-        WORKERS_FILE="$RCH_E2E_WORKERS_FILE"
-        return
+        status=${PIPESTATUS[0]}
+    else
+        if [[ ${#args[@]} -gt 0 ]]; then
+            "$file" "${args[@]}" >"$log_file" 2>&1
+        else
+            "$file" >"$log_file" 2>&1
+        fi
+        status=$?
     fi
+    set -e
 
-    local host="${RCH_E2E_WORKER_HOST:-}"
-    local user="${RCH_E2E_WORKER_USER:-ubuntu}"
-    local key="${RCH_E2E_WORKER_KEY:-~/.ssh/id_rsa}"
-    local wid="${RCH_E2E_WORKER_ID:-e2e-worker}"
-    local slots="${RCH_E2E_WORKER_SLOTS:-8}"
+    end_ms="$(e2e_now_ms)"
+    duration_ms=$((end_ms - start_ms))
 
-    [[ -n "$host" ]] || die "RCH_E2E_WORKER_HOST is required for --real"
+    printf '%s|%s|%s|%s\n' "$name" "$status" "$duration_ms" "$log_file" > "$result_file"
 
-    cat >"$WORKERS_FILE" <<EOF
-[[workers]]
-id = "$wid"
-host = "$host"
-user = "$user"
-identity_file = "$key"
-total_slots = $slots
-priority = 100
-enabled = true
-EOF
+    local duration_s
+    duration_s=$(awk "BEGIN { printf \"%.2f\", ${duration_ms}/1000 }")
+
+    if [[ "$status" -eq 0 ]]; then
+        e2e_log "TEST PASS: $name (${duration_s}s)"
+    elif [[ "$status" -eq "$E2E_SKIP_EXIT" ]]; then
+        e2e_log "TEST SKIP: $name (${duration_s}s)"
+    else
+        e2e_log "TEST FAIL: $name (${duration_s}s)"
+    fi
 }
 
-start_daemon() {
-    SOCKET_PATH="$TEST_ROOT/rch.sock"
-    DAEMON_LOG="$LOG_DIR/rchd.log"
+run_parallel_group() {
+    local -a tests=("$@")
+    local -a pids=()
+    local pid
+    local test_file
 
-    log "INFO" "DAEMON" "Starting rchd (socket: $SOCKET_PATH)"
-    if [[ "$MODE" == "mock" ]]; then
-        env RCH_MOCK_SSH=1 RCH_MOCK_SSH_STDOUT=health_check \
-            "$PROJECT_ROOT/target/debug/rchd" \
-            --socket "$SOCKET_PATH" \
-            --workers-config "$WORKERS_FILE" \
-            --foreground \
-            >>"$DAEMON_LOG" 2>&1 &
-    else
-        "$PROJECT_ROOT/target/debug/rchd" \
-            --socket "$SOCKET_PATH" \
-            --workers-config "$WORKERS_FILE" \
-            --foreground \
-            >>"$DAEMON_LOG" 2>&1 &
-    fi
-    RCHD_PID=$!
+    for test_file in "${tests[@]}"; do
+        local name
+        local args
+        local slug
+        name="$(test_name "$test_file")"
+        args="$(test_args "$test_file")"
+        slug="$(e2e_slug "$name")"
 
-    local waited=0
-    while [[ ! -S "$SOCKET_PATH" && $waited -lt 50 ]]; do
-        sleep 0.1
-        waited=$((waited + 1))
+        run_test "$test_file" "$name" "$args" "$slug" &
+        pids+=("$!")
+
+        if [[ ${#pids[@]} -ge "$PARALLELISM" ]]; then
+            pid="${pids[0]}"
+            wait "$pid" || true
+            pids=("${pids[@]:1}")
+        fi
     done
 
-    if [[ ! -S "$SOCKET_PATH" ]]; then
-        die "Daemon socket not found after startup (log: $DAEMON_LOG)"
-    fi
-    log "INFO" "DAEMON" "Daemon ready (pid: $RCHD_PID)"
+    for pid in "${pids[@]}"; do
+        wait "$pid" || true
+    done
 }
 
-stop_daemon() {
-    if [[ -n "${RCHD_PID:-}" ]]; then
-        log "INFO" "DAEMON" "Stopping rchd (pid: $RCHD_PID)"
-        kill "$RCHD_PID" >/dev/null 2>&1 || true
-    fi
+run_serial_group() {
+    local -a tests=("$@")
+    local test_file
+    for test_file in "${tests[@]}"; do
+        local name
+        local args
+        local slug
+        name="$(test_name "$test_file")"
+        args="$(test_args "$test_file")"
+        slug="$(e2e_slug "$name")"
+        run_test "$test_file" "$name" "$args" "$slug"
+    done
 }
 
-hook_json() {
-    cat <<'JSON'
-{
-  "tool_name": "Bash",
-  "tool_input": {
-    "command": "cargo build",
-    "description": "rch e2e build"
-  }
-}
-JSON
-}
+generate_junit() {
+    local junit_path="$1"
+    local total_tests="$2"
+    local total_failures="$3"
+    local total_skips="$4"
+    local total_ms="$5"
+    local total_seconds
+    total_seconds=$(awk "BEGIN { printf \"%.3f\", ${total_ms}/1000 }")
 
-# Hook JSON with toolchain specification for toolchain sync tests
-hook_json_with_toolchain() {
-    local toolchain="${1:-nightly-2024-01-15}"
-    cat <<JSON
-{
-  "tool_name": "Bash",
-  "tool_input": {
-    "command": "cargo build",
-    "description": "rch e2e build with toolchain",
-    "toolchain": "$toolchain"
-  }
-}
-JSON
-}
+    mkdir -p "$(dirname "$junit_path")"
 
-run_hook() {
-    local scenario="$1"; shift
-    local hook_out="$LOG_DIR/hook_${scenario}.out"
-    local hook_err="$LOG_DIR/hook_${scenario}.err"
-    local env_args=("$@")
+    {
+        echo '<?xml version="1.0" encoding="UTF-8"?>'
+        echo "<testsuite name=\"rch-e2e\" tests=\"$total_tests\" failures=\"$total_failures\" skipped=\"$total_skips\" time=\"$total_seconds\">"
 
-    log "INFO" "HOOK" "Running hook ($scenario)" >&2
-    (
-        cd "$PROJECT_DIR"
-        printf '%s\n' "$(hook_json)" | \
-            env RCH_SOCKET_PATH="$SOCKET_PATH" "${env_args[@]}" \
-            "$PROJECT_ROOT/target/debug/rch" >"$hook_out" 2>"$hook_err"
-    )
+        local result_file
+        for result_file in "$RESULTS_DIR"/*.result; do
+            local name
+            local status
+            local duration_ms
+            local log_file
+            IFS='|' read -r name status duration_ms log_file < "$result_file"
 
-    if /bin/grep -q '"permissionDecision":"deny"' "$hook_out"; then
-        echo "deny"
-    else
-        echo "allow"
-    fi
-}
+            local case_seconds
+            case_seconds=$(awk "BEGIN { printf \"%.3f\", ${duration_ms}/1000 }")
 
-# Run hook with toolchain specification (for toolchain sync tests)
-run_hook_with_toolchain() {
-    local scenario="$1"
-    local toolchain="$2"
-    shift 2
-    local hook_out="$LOG_DIR/hook_${scenario}.out"
-    local hook_err="$LOG_DIR/hook_${scenario}.err"
-    local env_args=("$@")
+            local name_xml
+            local log_xml
+            name_xml="$(e2e_xml_escape "$name")"
+            log_xml="$(e2e_xml_escape "$log_file")"
 
-    log "INFO" "HOOK" "Running hook with toolchain ($scenario, tc=$toolchain)" >&2
-    (
-        cd "$PROJECT_DIR"
-        printf '%s\n' "$(hook_json_with_toolchain "$toolchain")" | \
-            env RCH_SOCKET_PATH="$SOCKET_PATH" "${env_args[@]}" \
-            "$PROJECT_ROOT/target/debug/rch" >"$hook_out" 2>"$hook_err"
-    )
+            echo "  <testcase classname=\"rch-e2e\" name=\"$name_xml\" time=\"$case_seconds\">"
 
-    if /bin/grep -q '"permissionDecision":"deny"' "$hook_out"; then
-        echo "deny"
-    else
-        echo "allow"
-    fi
-}
-
-check_artifacts_real() {
-    local bin_path="$PROJECT_DIR/target/debug/rch_e2e_app"
-    [[ -x "$bin_path" ]]
-}
-
-check_artifacts_mock() {
-    local hook_err="$1"
-    local hook_out="${hook_err%.err}.out"
-    /bin/grep -q "Artifacts retrieved" "$hook_err" || /bin/grep -q "Artifacts retrieved" "$hook_out"
-}
-
-check_artifacts_mock_failure() {
-    local hook_err="$1"
-    local hook_out="${hook_err%.err}.out"
-    /bin/grep -q "Failed to retrieve artifacts" "$hook_err" || \
-        /bin/grep -q "Failed to retrieve artifacts" "$hook_out"
-}
-
-# Check that toolchain failure was logged with decision path
-check_toolchain_failure_logged() {
-    local hook_err="$1"
-    local hook_out="${hook_err%.err}.out"
-    # Look for toolchain-related log messages
-    /bin/grep -qi "toolchain" "$hook_err" || \
-        /bin/grep -qi "toolchain" "$hook_out" || \
-        /bin/grep -qi "rustup" "$hook_err" || \
-        /bin/grep -qi "rustup" "$hook_out"
-}
-
-# Check that no-rustup fallback was logged
-check_no_rustup_logged() {
-    local hook_err="$1"
-    local hook_out="${hook_err%.err}.out"
-    /bin/grep -qi "rustup not available\|no rustup\|Continuing with default" "$hook_err" || \
-        /bin/grep -qi "rustup not available\|no rustup\|Continuing with default" "$hook_out"
-}
-
-run_scenario() {
-    local scenario="$1"
-    local expect="$2"
-    local fail="$3"
-    local envs=()
-
-    if [[ "$MODE" == "mock" ]]; then
-        envs+=("RCH_MOCK_SSH=1")
-    fi
-
-    case "$fail" in
-        sync) envs+=("RCH_MOCK_RSYNC_FAIL_SYNC=1") ;;
-        exec) envs+=("RCH_MOCK_SSH_FAIL_EXECUTE=1") ;;
-        artifacts) envs+=("RCH_MOCK_RSYNC_FAIL_ARTIFACTS=1") ;;
-        worker-down) envs+=("RCH_MOCK_SSH_FAIL_CONNECT=1") ;;
-        remote-exit) envs+=("RCH_MOCK_SSH_EXIT_CODE=2") ;;
-        toolchain-install) envs+=("RCH_MOCK_TOOLCHAIN_INSTALL_FAIL=1") ;;
-        no-rustup) envs+=("RCH_MOCK_NO_RUSTUP=1") ;;
-        circuit-open) envs+=("RCH_MOCK_CIRCUIT_OPEN=1") ;;
-        "") ;;
-        *) die "Unknown failure mode: $fail" ;;
-    esac
-
-    local result
-    result="$(run_hook "$scenario" "${envs[@]}")"
-
-    if [[ "$result" != "$expect" ]]; then
-        log "FAIL" "SCENARIO" "$scenario expected $expect, got $result"
-        return 1
-    fi
-
-    if [[ "$MODE" == "real" && "$expect" == "deny" && "$fail" != "artifacts" ]]; then
-        if check_artifacts_real; then
-            log "INFO" "ARTIFACTS" "$scenario artifacts present"
-        else
-            log "FAIL" "ARTIFACTS" "$scenario artifacts missing"
-            return 1
-        fi
-    fi
-
-    if [[ "$MODE" == "mock" && "$expect" == "deny" && "$fail" != "sync" && "$fail" != "exec" && "$fail" != "worker-down" && "$fail" != "remote-exit" && "$fail" != "toolchain-install" && "$fail" != "no-rustup" ]]; then
-        if [[ "$fail" == "artifacts" ]]; then
-            if check_artifacts_mock_failure "$LOG_DIR/hook_${scenario}.err"; then
-                log "INFO" "ARTIFACTS" "$scenario artifact failure logged"
-            else
-                log "FAIL" "ARTIFACTS" "$scenario artifact failure missing"
-                return 1
+            if [[ "$status" -eq "$E2E_SKIP_EXIT" ]]; then
+                echo "    <skipped message=\"Skipped\"/>"
+            elif [[ "$status" -ne 0 ]]; then
+                echo "    <failure message=\"Exit $status\">Log: $log_xml</failure>"
             fi
-        else
-            if check_artifacts_mock "$LOG_DIR/hook_${scenario}.err"; then
-                log "INFO" "ARTIFACTS" "$scenario artifact phase logged"
-            else
-                log "FAIL" "ARTIFACTS" "$scenario artifact phase missing"
-                return 1
-            fi
-        fi
-    fi
 
-    # Toolchain-specific checks (allow fallback expected)
-    if [[ "$MODE" == "mock" && "$fail" == "toolchain-install" ]]; then
-        log "INFO" "TOOLCHAIN" "$scenario: toolchain install failure triggered local fallback"
-    fi
+            echo "    <system-out>Log: $log_xml</system-out>"
+            echo "  </testcase>"
+        done
 
-    if [[ "$MODE" == "mock" && "$fail" == "no-rustup" ]]; then
-        log "INFO" "TOOLCHAIN" "$scenario: no-rustup triggered local fallback"
-    fi
-
-    log "INFO" "SCENARIO" "$scenario OK"
-}
-
-# Run a scenario with explicit toolchain specification
-run_toolchain_scenario() {
-    local scenario="$1"
-    local toolchain="$2"
-    local expect="$3"
-    local fail="$4"
-    local envs=()
-
-    if [[ "$MODE" == "mock" ]]; then
-        envs+=("RCH_MOCK_SSH=1")
-    fi
-
-    case "$fail" in
-        toolchain-install) envs+=("RCH_MOCK_TOOLCHAIN_INSTALL_FAIL=1") ;;
-        no-rustup) envs+=("RCH_MOCK_NO_RUSTUP=1") ;;
-        "") ;;
-        *) die "Unknown toolchain failure mode: $fail" ;;
-    esac
-
-    local result
-    result="$(run_hook_with_toolchain "$scenario" "$toolchain" "${envs[@]}")"
-
-    if [[ "$result" != "$expect" ]]; then
-        log "FAIL" "TOOLCHAIN" "$scenario expected $expect, got $result"
-        return 1
-    fi
-
-    # Verify decision path logging
-    local hook_err="$LOG_DIR/hook_${scenario}.err"
-    local hook_out="$LOG_DIR/hook_${scenario}.out"
-
-    if [[ "$fail" == "toolchain-install" ]]; then
-        if check_toolchain_failure_logged "$hook_err"; then
-            log "INFO" "TOOLCHAIN" "$scenario: toolchain failure properly logged"
-        else
-            log "WARN" "TOOLCHAIN" "$scenario: toolchain failure not explicitly logged (may be hidden)"
-        fi
-    fi
-
-    if [[ "$fail" == "no-rustup" ]]; then
-        if check_no_rustup_logged "$hook_err"; then
-            log "INFO" "TOOLCHAIN" "$scenario: no-rustup properly logged"
-        else
-            log "WARN" "TOOLCHAIN" "$scenario: no-rustup not explicitly logged (may be hidden)"
-        fi
-    fi
-
-    log "INFO" "TOOLCHAIN" "$scenario OK (tc=$toolchain)"
-}
-
-run_e2e() {
-    log "INFO" "E2E" "Mode: $MODE"
-    log "INFO" "E2E" "Scenario: ${FAIL_MODE:-success}"
-
-    if [[ "$RUN_ALL" == "1" && "$MODE" == "mock" ]]; then
-        run_scenario "success" "deny" ""
-        run_scenario "sync_fail" "allow" "sync"
-        run_scenario "exec_fail" "allow" "exec"
-        run_scenario "worker_down" "allow" "worker-down"
-        run_scenario "artifact_fail" "deny" "artifacts"
-        run_scenario "remote_exit" "deny" "remote-exit"
-
-        # Toolchain synchronization scenarios with explicit toolchain specification
-        log "INFO" "E2E" "Running toolchain synchronization scenarios..."
-
-        # Test 1: Nightly toolchain with date - install failure should fall back
-        run_toolchain_scenario "tc_nightly_install_fail" "nightly-2024-01-15" "allow" "toolchain-install"
-
-        # Test 2: Stable toolchain - no rustup should fall back
-        run_toolchain_scenario "tc_stable_no_rustup" "stable" "allow" "no-rustup"
-
-        # Test 3: Beta with date - install failure should fall back
-        run_toolchain_scenario "tc_beta_install_fail" "beta-2024-02-01" "allow" "toolchain-install"
-
-        # Test 4: Specific version - no rustup should fall back
-        run_toolchain_scenario "tc_version_no_rustup" "1.75.0" "allow" "no-rustup"
-
-        # Legacy tests without explicit toolchain (backward compatibility)
-        run_scenario "toolchain_install_fail" "allow" "toolchain-install"
-        run_scenario "no_rustup" "allow" "no-rustup"
-
-        log "INFO" "E2E" "Toolchain scenarios complete"
-
-        # Circuit breaker scenarios
-        log "INFO" "E2E" "Running circuit breaker scenarios..."
-
-        # Test: All circuits open triggers local fallback
-        # When RCH_MOCK_CIRCUIT_OPEN is set, daemon returns AllCircuitsOpen
-        run_scenario "circuit_open" "allow" "circuit-open"
-
-        log "INFO" "E2E" "Circuit breaker scenarios complete"
-        return
-    fi
-
-    if [[ -n "$FAIL_MODE" ]]; then
-        case "$FAIL_MODE" in
-            sync|exec|worker-down|toolchain-install|no-rustup|circuit-open) run_scenario "$FAIL_MODE" "allow" "$FAIL_MODE" ;;
-            artifacts|remote-exit) run_scenario "$FAIL_MODE" "deny" "$FAIL_MODE" ;;
-            *) die "Unknown failure mode: $FAIL_MODE" ;;
-        esac
-    else
-        run_scenario "success" "deny" ""
-    fi
-}
-
-run_unit_tests() {
-    log "INFO" "UNIT" "Running cargo test --workspace"
-    cd "$PROJECT_ROOT"
-    cargo test --workspace
+        echo "</testsuite>"
+    } > "$junit_path"
 }
 
 main() {
     parse_args "$@"
-    check_dependencies
-    build_binaries
-    make_test_project
-    write_workers_config
-    start_daemon
 
-    trap stop_daemon EXIT
-
-    if [[ "$MODE" == "mock" ]]; then
-        export RUST_LOG="${RUST_LOG:-info}"
+    if [[ -z "$PARALLELISM" ]]; then
+        PARALLELISM="$(e2e_default_parallelism)"
     fi
 
-    run_e2e
-
-    if [[ "$RUN_UNIT" == "1" ]]; then
-        run_unit_tests
+    if [[ "$PARALLELISM" -lt 1 ]]; then
+        PARALLELISM=1
     fi
 
-    log "INFO" "DONE" "E2E complete. Logs in $LOG_DIR"
-    log "INFO" "DONE" "Temp project kept at $TEST_ROOT"
+    if [[ -z "$JUNIT_FILE" ]]; then
+        JUNIT_FILE="$LOG_DIR/junit.xml"
+    fi
+
+    local test_dir="$PROJECT_ROOT/tests/e2e"
+    if [[ ! -d "$test_dir" ]]; then
+        e2e_log "ERROR: Missing tests/e2e directory"
+        exit 2
+    fi
+
+    mkdir -p "$LOG_DIR"
+    RESULTS_DIR="$LOG_DIR/results"
+    mkdir -p "$RESULTS_DIR"
+
+    local -a discovered=()
+    local test_file
+    while IFS= read -r test_file; do
+        discovered+=("$test_file")
+    done < <(find "$test_dir" -maxdepth 1 -type f -name '*.sh' | sort)
+
+    if [[ ${#discovered[@]} -eq 0 ]]; then
+        e2e_log "ERROR: No tests found in $test_dir"
+        exit 2
+    fi
+
+    local -a selected=()
+    local test_file
+    for test_file in "${discovered[@]}"; do
+        local name
+        name="$(test_name "$test_file")"
+
+        if [[ -n "$FILTER" ]]; then
+            if [[ "$name" != *"$FILTER"* && "$test_file" != *"$FILTER"* ]]; then
+                continue
+            fi
+        fi
+
+        selected+=("$test_file")
+    done
+
+    if [[ ${#selected[@]} -eq 0 ]]; then
+        e2e_log "ERROR: No tests matched filter '$FILTER'"
+        exit 2
+    fi
+
+    if [[ "$LIST_ONLY" == "1" ]]; then
+        for test_file in "${selected[@]}"; do
+            echo "$(test_name "$test_file")"
+        done
+        exit 0
+    fi
+
+    e2e_log "====== TEST SUITE START ======"
+    e2e_log "Discovered tests: ${#selected[@]}"
+    e2e_log "Log dir: $LOG_DIR"
+
+    local -a serial_tests=()
+    local -a parallel_tests=()
+
+    if [[ "$SERIAL_ONLY" == "1" || "$PARALLELISM" -le 1 ]]; then
+        serial_tests=("${selected[@]}")
+    else
+        for test_file in "${selected[@]}"; do
+            if test_serial "$test_file"; then
+                serial_tests+=("$test_file")
+            else
+                parallel_tests+=("$test_file")
+            fi
+        done
+    fi
+
+    if [[ ${#parallel_tests[@]} -gt 0 ]]; then
+        e2e_log "Running ${#parallel_tests[@]} parallel-safe test(s) with concurrency=$PARALLELISM"
+        run_parallel_group "${parallel_tests[@]}"
+    fi
+
+    if [[ ${#serial_tests[@]} -gt 0 ]]; then
+        e2e_log "Running ${#serial_tests[@]} serial test(s)"
+        run_serial_group "${serial_tests[@]}"
+    fi
+
+    local total=0
+    local passed=0
+    local failed=0
+    local skipped=0
+    local infra=0
+    local total_ms=0
+
+    local result_file
+    for result_file in "$RESULTS_DIR"/*.result; do
+        local name
+        local status
+        local duration_ms
+        local log_file
+
+        IFS='|' read -r name status duration_ms log_file < "$result_file"
+        total=$((total + 1))
+        total_ms=$((total_ms + duration_ms))
+
+        if [[ "$status" -eq 0 ]]; then
+            passed=$((passed + 1))
+        elif [[ "$status" -eq "$E2E_SKIP_EXIT" ]]; then
+            skipped=$((skipped + 1))
+        else
+            failed=$((failed + 1))
+            if [[ "$status" -eq 2 ]]; then
+                infra=1
+            fi
+        fi
+    done
+
+    generate_junit "$JUNIT_FILE" "$total" "$failed" "$skipped" "$total_ms"
+
+    e2e_log "====== SUMMARY ======"
+    e2e_log "Passed: $passed, Failed: $failed, Skipped: $skipped"
+    e2e_log "JUnit: $JUNIT_FILE"
+
+    if [[ "$infra" -eq 1 ]]; then
+        exit 2
+    fi
+    if [[ "$failed" -gt 0 ]]; then
+        exit 1
+    fi
+    exit 0
 }
 
 main "$@"
