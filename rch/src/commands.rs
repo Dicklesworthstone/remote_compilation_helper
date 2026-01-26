@@ -606,21 +606,38 @@ pub async fn workers_capabilities(
     }
 
     if workers.is_empty() {
-        println!("{}", style.warning("No workers configured"));
+        println!(
+            "{} {}",
+            StatusIndicator::Warning.display(style),
+            style.warning("No workers configured")
+        );
         return Ok(());
     }
 
     println!("{}", style.format_header("Worker Capabilities"));
     println!();
 
+    let runtime_label = |runtime: &RequiredRuntime| match runtime {
+        RequiredRuntime::Rust => "rust",
+        RequiredRuntime::Bun => "bun",
+        RequiredRuntime::Node => "node",
+        RequiredRuntime::None => "none",
+    };
+
     if let Some(runtime) = required_runtime.as_ref() {
         println!(
             "{} {}",
             style.key("Required runtime:"),
-            style.value(&format!("{runtime:?}"))
+            style.value(runtime_label(runtime))
         );
         println!();
     }
+
+    let key_width = ["Rust", "Bun", "Node", "npm"]
+        .iter()
+        .map(|label| label.len())
+        .max()
+        .unwrap_or(4);
 
     for worker in &workers {
         println!(
@@ -638,10 +655,11 @@ pub async fn workers_capabilities(
             } else {
                 (StatusIndicator::Error, style.error("missing"))
             };
+            let padded_label = format!("{label:width$}", width = key_width);
             println!(
                 "    {} {} {} {}",
                 indicator.display(style),
-                style.key(label),
+                style.key(&padded_label),
                 style.muted(":"),
                 display
             );
@@ -655,9 +673,13 @@ pub async fn workers_capabilities(
     }
 
     if !warnings.is_empty() {
-        println!("{}", style.warning("Warnings"));
+        println!("{}", style.format_header("Warnings"));
         for warning in warnings {
-            println!("  {} {}", StatusIndicator::Warning.display(style), warning);
+            println!(
+                "  {} {}",
+                StatusIndicator::Warning.display(style),
+                style.warning(&warning)
+            );
         }
     }
 
