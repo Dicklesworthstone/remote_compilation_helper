@@ -6502,7 +6502,8 @@ pub async fn cancel_build(
             if force { "true" } else { "false" }
         )
     } else {
-        let build_id = build_id.ok_or_else(|| anyhow::anyhow!("Missing build id (or use --all)"))?;
+        let build_id =
+            build_id.ok_or_else(|| anyhow::anyhow!("Missing build id (or use --all)"))?;
         format!(
             "POST /cancel-build?build_id={}&force={}\n",
             build_id,
@@ -6530,7 +6531,10 @@ pub async fn cancel_build(
     match status {
         "cancelled" => {
             let id = payload.get("build_id").and_then(|v| v.as_u64());
-            let msg = payload.get("message").and_then(|v| v.as_str()).unwrap_or("");
+            let msg = payload
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             if let Some(id) = id {
                 println!(
                     "{} {} {}",
@@ -6554,7 +6558,10 @@ pub async fn cancel_build(
             }
         }
         "error" => {
-            let msg = payload.get("message").and_then(|v| v.as_str()).unwrap_or("error");
+            let msg = payload
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("error");
             println!("{} {}", style.error("Error:"), style.value(msg));
         }
         other => {

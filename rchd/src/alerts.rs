@@ -201,8 +201,7 @@ impl AlertManager {
             WorkerStatus::Unreachable => {
                 self.clear_alert(&degraded_key);
                 let reason = last_error.unwrap_or("worker unreachable");
-                let message =
-                    format!("Worker '{}' is offline: {}", worker_id, reason.trim());
+                let message = format!("Worker '{}' is offline: {}", worker_id, reason.trim());
                 let alert = Alert::new(
                     AlertKind::WorkerOffline,
                     AlertSeverity::Error,
