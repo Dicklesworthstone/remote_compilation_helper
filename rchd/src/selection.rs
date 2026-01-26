@@ -1153,6 +1153,7 @@ mod tests {
                 toolchain: None,
                 required_runtime: RequiredRuntime::default(),
                 classification_duration_us: None,
+                hook_pid: None,
             };
             let weights = SelectionWeights::default();
 
@@ -1175,6 +1176,7 @@ mod tests {
                 toolchain: None,
                 required_runtime: RequiredRuntime::default(),
                 classification_duration_us: None,
+                hook_pid: None,
             };
             let weights = SelectionWeights::default();
 
@@ -1209,6 +1211,7 @@ mod tests {
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
+            hook_pid: None,
         };
         let weights = SelectionWeights::default();
 
@@ -1244,6 +1247,7 @@ mod tests {
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
+            hook_pid: None,
         };
         let weights = SelectionWeights::default();
 
@@ -1272,6 +1276,7 @@ mod tests {
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
+            hook_pid: None,
         };
         let weights = SelectionWeights::default();
         let config = CircuitBreakerConfig::default();
@@ -1304,6 +1309,7 @@ mod tests {
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
+            hook_pid: None,
         };
         let weights = SelectionWeights::default();
         let config = CircuitBreakerConfig::default();
@@ -1338,6 +1344,7 @@ mod tests {
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
+            hook_pid: None,
         };
         let weights = SelectionWeights::default();
         let config = CircuitBreakerConfig {
@@ -1388,6 +1395,7 @@ mod tests {
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
+            hook_pid: None,
         };
         let weights = SelectionWeights::default();
 
@@ -1427,6 +1435,7 @@ mod tests {
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
+            hook_pid: None,
         };
         let weights = SelectionWeights::default();
         let config = CircuitBreakerConfig::default();
@@ -1460,6 +1469,7 @@ mod tests {
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
+            hook_pid: None,
         };
         let weights = SelectionWeights::default();
         let config = CircuitBreakerConfig::default();
@@ -1489,6 +1499,7 @@ mod tests {
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
+            hook_pid: None,
         };
         let weights = SelectionWeights::default();
         let config = CircuitBreakerConfig::default();
@@ -1523,6 +1534,7 @@ mod tests {
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
+            hook_pid: None,
         };
         let weights = SelectionWeights::default();
         let config = CircuitBreakerConfig::default();
@@ -1571,6 +1583,7 @@ mod tests {
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
+            hook_pid: None,
         };
         let config = CircuitBreakerConfig::default();
 
@@ -1697,6 +1710,7 @@ mod tests {
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
+            hook_pid: None,
         };
 
         let result = selector.select(&pool, &request).await;
@@ -1740,6 +1754,7 @@ mod tests {
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
+            hook_pid: None,
         };
 
         let result = selector.select(&pool, &request).await;
@@ -1780,6 +1795,7 @@ mod tests {
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
+            hook_pid: None,
         };
 
         let result = selector.select(&pool, &request).await;
@@ -1811,6 +1827,7 @@ mod tests {
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
+            hook_pid: None,
         };
 
         let result = selector.select(&pool, &request).await;
@@ -1857,6 +1874,7 @@ mod tests {
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
+            hook_pid: None,
         };
 
         let result = selector.select(&pool, &request).await;
@@ -1902,6 +1920,7 @@ mod tests {
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
+            hook_pid: None,
         };
 
         let result = selector.select(&pool, &request).await;
@@ -1948,6 +1967,7 @@ mod tests {
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
+            hook_pid: None,
         };
 
         let result = selector.select(&pool, &request).await;
@@ -1980,6 +2000,7 @@ mod tests {
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
+            hook_pid: None,
         };
 
         let result = selector.select(&pool, &request).await;
@@ -2012,6 +2033,7 @@ mod tests {
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
+            hook_pid: None,
         };
 
         // Run multiple selections and verify distribution
@@ -2067,6 +2089,7 @@ mod tests {
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
+            hook_pid: None,
         };
 
         let result = selector.select(&pool, &request).await;
@@ -2104,6 +2127,7 @@ mod tests {
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
+            hook_pid: None,
         };
 
         let result = selector.select(&pool, &request).await;

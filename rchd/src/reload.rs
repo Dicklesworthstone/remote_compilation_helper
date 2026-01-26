@@ -10,7 +10,6 @@ use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use rch_common::{WorkerConfig, WorkerId};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -218,7 +217,9 @@ pub async fn apply_worker_diff(pool: &WorkerPool, diff: &ConfigDiff) -> Result<R
                 ));
             } else {
                 info!("Worker {} removed (no active jobs)", id);
-                worker.disable(Some("Removed from configuration".to_string())).await;
+                worker
+                    .disable(Some("Removed from configuration".to_string()))
+                    .await;
             }
             result.removed += 1;
         }
@@ -236,13 +237,14 @@ pub async fn reload_workers(
     info!("Reloading workers configuration...");
 
     // Load new configuration
-    let new_config = config::load_workers_config(config_path)
-        .context("Failed to load workers configuration")?;
+    let new_config =
+        config::load_workers_config(config_path).context("Failed to load workers configuration")?;
 
     // Validate if requested
     let mut warnings = Vec::new();
     if validate {
-        warnings = validate_workers_config(&new_config).context("Configuration validation failed")?;
+        warnings =
+            validate_workers_config(&new_config).context("Configuration validation failed")?;
         for warning in &warnings {
             warn!("Config warning: {}", warning);
         }
@@ -318,7 +320,10 @@ impl ConfigWatcher {
     }
 
     /// Start watching configuration files.
-    pub async fn start(mut self, tx: mpsc::Sender<ReloadMessage>) -> Result<tokio::task::JoinHandle<()>> {
+    pub async fn start(
+        mut self,
+        tx: mpsc::Sender<ReloadMessage>,
+    ) -> Result<tokio::task::JoinHandle<()>> {
         // Determine paths to watch
         let workers_path = self.config.workers_config_path.clone();
         let config_dir = config::config_dir();
@@ -337,7 +342,9 @@ impl ConfigWatcher {
                                 let name = filename.to_string_lossy();
                                 if name == "workers.toml" || name == "config.toml" {
                                     debug!("Config file changed: {:?}", path);
-                                    if let Err(e) = watcher_tx.blocking_send(ReloadMessage::ConfigChanged(path.clone())) {
+                                    if let Err(e) = watcher_tx
+                                        .blocking_send(ReloadMessage::ConfigChanged(path.clone()))
+                                    {
                                         error!("Failed to send reload message: {}", e);
                                     }
                                 }
@@ -671,7 +678,9 @@ enabled = true
         };
         pool.add_worker(initial).await;
 
-        let result = reload_workers(&pool, Some(&workers_path), true).await.unwrap();
+        let result = reload_workers(&pool, Some(&workers_path), true)
+            .await
+            .unwrap();
         assert!(!result.has_changes());
     }
 
@@ -711,7 +720,9 @@ enabled = true
         };
         pool.add_worker(initial).await;
 
-        let result = reload_workers(&pool, Some(&workers_path), true).await.unwrap();
+        let result = reload_workers(&pool, Some(&workers_path), true)
+            .await
+            .unwrap();
         assert!(result.has_changes());
         assert_eq!(result.added, 1); // worker2
         assert_eq!(result.updated, 1); // worker1

@@ -2529,6 +2529,7 @@ mod tests {
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
+            hook_pid: None,
         };
 
         let response = handle_select_worker(&ctx, request).await.unwrap();
@@ -2557,6 +2558,7 @@ mod tests {
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
+            hook_pid: None,
         };
 
         let response = handle_select_worker(&ctx, request).await.unwrap();
@@ -2582,6 +2584,7 @@ mod tests {
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
+            hook_pid: None,
         };
 
         let response = handle_select_worker(&ctx, request).await.unwrap();
@@ -2603,6 +2606,7 @@ mod tests {
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
+            hook_pid: None,
         };
 
         let response = handle_select_worker(&ctx, request).await.unwrap();
@@ -2630,6 +2634,7 @@ mod tests {
             toolchain: None,
             required_runtime: RequiredRuntime::default(),
             classification_duration_us: None,
+            hook_pid: None,
         };
 
         let response = handle_select_worker(&ctx, request).await.unwrap();

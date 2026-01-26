@@ -411,12 +411,7 @@ async fn main() -> Result<()> {
 
     // Start config hot-reload watcher (unless disabled)
     let reload_tx = if !cli.no_hot_reload {
-        match reload::start_config_watcher(
-            worker_pool.clone(),
-            cli.workers_config.clone(),
-        )
-        .await
-        {
+        match reload::start_config_watcher(worker_pool.clone(), cli.workers_config.clone()).await {
             Ok((handle, tx)) => {
                 info!("Configuration hot-reload enabled");
                 // Store handle to keep watcher alive

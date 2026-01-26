@@ -971,6 +971,7 @@ mod tests {
                 toolchain: None,
                 required_runtime: RequiredRuntime::default(),
                 classification_duration_us: None,
+                hook_pid: None,
             }
         }
 
