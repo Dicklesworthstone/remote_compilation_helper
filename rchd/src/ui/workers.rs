@@ -14,6 +14,7 @@ use rch_common::ui::{Icons, OutputContext};
 use rch_common::{SelectionStrategy, WorkerStatus};
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "rich-ui")]
@@ -26,6 +27,16 @@ use rich_rust::renderables::{Column, Row, Table};
 const DEFAULT_REFRESH_SECS: u64 = 30;
 const BULK_CHANGE_THRESHOLD: usize = 4;
 const DEFAULT_TABLE_WIDTH: usize = 72;
+
+static DEBUG_ROUTING_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Enable routing debug output from within the daemon process.
+///
+/// We prefer this over mutating environment variables, which is `unsafe` in
+/// Rust 2024 due to potential races with other threads reading env.
+pub fn set_debug_routing_enabled(enabled: bool) {
+    DEBUG_ROUTING_ENABLED.store(enabled, AtomicOrdering::Relaxed);
+}
 
 #[derive(Debug, Clone)]
 pub struct WorkerSnapshot {
@@ -437,7 +448,7 @@ pub fn log_routing_decision(
 }
 
 pub fn debug_routing_enabled() -> bool {
-    env_flag("RCHD_DEBUG_ROUTING")
+    DEBUG_ROUTING_ENABLED.load(AtomicOrdering::Relaxed) || env_flag("RCHD_DEBUG_ROUTING")
 }
 
 fn is_online(status: WorkerStatus) -> bool {
@@ -563,7 +574,7 @@ mod tests {
             50.0,
             vec![],
         )];
-        panel.render_update(&first, 0);
+        let _ = panel.render_update(&first, 0);
 
         let second = vec![WorkerSnapshot::new(
             "w1",

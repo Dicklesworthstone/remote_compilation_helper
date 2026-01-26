@@ -18,9 +18,9 @@ use std::time::{Duration, Instant};
 #[cfg(feature = "rich-ui")]
 use rich_rust::prelude::*;
 #[cfg(feature = "rich-ui")]
-use rich_rust::text::JustifyMethod;
-#[cfg(feature = "rich-ui")]
 use rich_rust::renderables::{Column, Row, Table};
+#[cfg(feature = "rich-ui")]
+use rich_rust::text::JustifyMethod;
 
 const DEFAULT_INTERVAL_SECS: u64 = 300;
 const SPARKLINE_SAMPLES: usize = 6;
@@ -123,10 +123,7 @@ impl MetricsDashboard {
             return false;
         }
 
-        match rich_override() {
-            Some(false) => false,
-            _ => true,
-        }
+        !matches!(rich_override(), Some(false))
     }
 
     fn reset_window(&mut self) {
@@ -440,9 +437,9 @@ fn format_duration_ms(ms: f64) -> String {
 
 fn format_interval(duration: Duration) -> String {
     let secs = duration.as_secs();
-    if secs % 3600 == 0 {
+    if secs.is_multiple_of(3600) {
         format!("{}h", secs / 3600)
-    } else if secs % 60 == 0 {
+    } else if secs.is_multiple_of(60) {
         format!("{}m", secs / 60)
     } else {
         format!("{}s", secs)

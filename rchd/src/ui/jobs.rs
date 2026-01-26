@@ -162,10 +162,10 @@ impl JobLifecycleLog {
 
         // Keep START lines short; detailed mode adds a second line with source.
         let mut lines = vec![line];
-        if self.mode == JobLifecycleMode::Detailed {
-            if let Some(source) = ev.source.as_deref() {
-                lines.push(format!("{}   src: {source}", prefix_now(&ev.job_id)));
-            }
+        if self.mode == JobLifecycleMode::Detailed
+            && let Some(source) = ev.source.as_deref()
+        {
+            lines.push(format!("{}   src: {source}", prefix_now(&ev.job_id)));
         }
         lines
     }
@@ -194,10 +194,10 @@ impl JobLifecycleLog {
             ev.message
         )];
 
-        if self.mode == JobLifecycleMode::Detailed {
-            if let Some(usage) = ev.resource_usage.as_deref() {
-                lines.push(format!("{}   res: {usage}", prefix_now(&ev.job_id)));
-            }
+        if self.mode == JobLifecycleMode::Detailed
+            && let Some(usage) = ev.resource_usage.as_deref()
+        {
+            lines.push(format!("{}   res: {usage}", prefix_now(&ev.job_id)));
         }
 
         Some(lines)
@@ -247,10 +247,10 @@ impl JobLifecycleLog {
         );
         let mut lines = vec![format!("{} {}{}", prefix_now(&ev.job_id), status, tail)];
 
-        if self.mode == JobLifecycleMode::Detailed {
-            if let Some(remediation) = ev.remediation.as_deref() {
-                lines.push(format!("{}   fix: {remediation}", prefix_now(&ev.job_id)));
-            }
+        if self.mode == JobLifecycleMode::Detailed
+            && let Some(remediation) = ev.remediation.as_deref()
+        {
+            lines.push(format!("{}   fix: {remediation}", prefix_now(&ev.job_id)));
         }
 
         lines
