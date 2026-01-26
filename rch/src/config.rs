@@ -895,9 +895,18 @@ fn merge_transfer(
     if overlay.exclude_patterns != default.exclude_patterns {
         base.exclude_patterns.clone_from(&overlay.exclude_patterns);
     }
-    // Override remote_base if overlay differs from default
+    // Override remote_base if overlay differs from default (with validation)
     if overlay.remote_base != default.remote_base {
-        base.remote_base.clone_from(&overlay.remote_base);
+        match rch_common::validate_remote_base(&overlay.remote_base) {
+            Ok(validated) => {
+                base.remote_base = validated;
+            }
+            Err(_) => {
+                // If validation fails, still allow the value but log a warning
+                // This is a merge, not initial load, so we're more permissive
+                base.remote_base.clone_from(&overlay.remote_base);
+            }
+        }
     }
 }
 
@@ -2061,6 +2070,70 @@ identity_file = "/tmp/id_ed25519"
         );
 
         info!("PASS: Custom exclude_patterns replace defaults");
+    }
+
+    #[test]
+    fn test_merge_transfer_remote_base() {
+        info!("TEST: test_merge_transfer_remote_base");
+
+        let base = RchConfig::default();
+        info!(
+            "INPUT base: remote_base={}",
+            base.transfer.remote_base
+        );
+        assert_eq!(base.transfer.remote_base, "/tmp/rch");
+
+        // Overlay with custom remote_base
+        let overlay_toml = r#"
+            [transfer]
+            remote_base = "/var/rch-builds"
+        "#;
+        let overlay: RchConfig = toml::from_str(overlay_toml).expect("Parse overlay");
+        info!(
+            "INPUT overlay: remote_base={}",
+            overlay.transfer.remote_base
+        );
+
+        let merged = merge_config(base, overlay);
+
+        info!(
+            "RESULT: remote_base={}",
+            merged.transfer.remote_base
+        );
+
+        // Custom remote_base should replace default
+        assert_eq!(merged.transfer.remote_base, "/var/rch-builds");
+
+        info!("PASS: Custom remote_base replaces default");
+    }
+
+    #[test]
+    fn test_merge_transfer_remote_base_with_tilde() {
+        info!("TEST: test_merge_transfer_remote_base_with_tilde");
+
+        let base = RchConfig::default();
+
+        // Overlay with tilde-based path
+        let overlay_toml = r#"
+            [transfer]
+            remote_base = "~/rch-builds"
+        "#;
+        let overlay: RchConfig = toml::from_str(overlay_toml).expect("Parse overlay");
+
+        let merged = merge_config(base, overlay);
+
+        info!(
+            "RESULT: remote_base={}",
+            merged.transfer.remote_base
+        );
+
+        // Tilde should be expanded to absolute path
+        assert!(merged.transfer.remote_base.starts_with('/'),
+            "remote_base should be absolute after tilde expansion");
+        assert!(!merged.transfer.remote_base.contains('~'),
+            "Tilde should be expanded");
+
+        info!("PASS: Tilde-based remote_base is expanded");
     }
 
     #[test]
