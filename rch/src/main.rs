@@ -608,6 +608,20 @@ enum DaemonAction {
     Reload,
 }
 
+impl DaemonAction {
+    /// Return the subcommand name as a string for error messages.
+    fn as_str(&self) -> &'static str {
+        match self {
+            DaemonAction::Start => "start",
+            DaemonAction::Stop => "stop",
+            DaemonAction::Restart => "restart",
+            DaemonAction::Status => "status",
+            DaemonAction::Logs { .. } => "logs",
+            DaemonAction::Reload => "reload",
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum WorkersAction {
     /// List configured workers
@@ -734,6 +748,27 @@ This wizard will guide you through adding a worker:
     },
 }
 
+impl WorkersAction {
+    /// Return the subcommand name as a string for error messages.
+    fn as_str(&self) -> &'static str {
+        match self {
+            WorkersAction::List { .. } => "list",
+            WorkersAction::Capabilities { .. } => "capabilities",
+            WorkersAction::Probe { .. } => "probe",
+            WorkersAction::Benchmark => "benchmark",
+            WorkersAction::Drain { .. } => "drain",
+            WorkersAction::Enable { .. } => "enable",
+            WorkersAction::Disable { .. } => "disable",
+            WorkersAction::Priority { .. } => "priority",
+            WorkersAction::Discover { .. } => "discover",
+            WorkersAction::Deploy { .. } => "deploy",
+            WorkersAction::Toolchain { .. } => "toolchain",
+            WorkersAction::Setup { .. } => "setup",
+            WorkersAction::Init { .. } => "init",
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum ConfigAction {
     /// Show effective configuration
@@ -798,6 +833,21 @@ Shows:
   • Default value
   • Source (env, project, user)"#)]
     Diff,
+}
+
+impl ConfigAction {
+    /// Return the subcommand name as a string for error messages.
+    fn as_str(&self) -> &'static str {
+        match self {
+            ConfigAction::Show { .. } => "show",
+            ConfigAction::Init { .. } => "init",
+            ConfigAction::Validate => "validate",
+            ConfigAction::Set { .. } => "set",
+            ConfigAction::Export { .. } => "export",
+            ConfigAction::Lint => "lint",
+            ConfigAction::Diff => "diff",
+        }
+    }
 }
 
 #[derive(Subcommand)]
