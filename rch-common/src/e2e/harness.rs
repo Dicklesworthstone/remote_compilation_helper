@@ -156,16 +156,25 @@ impl Default for HarnessConfig {
             None
         }
 
-        // Find binaries in target/debug or target/release
-        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let workspace_root = manifest_dir.parent().unwrap_or(manifest_dir.as_path());
+        // Find binaries in target/debug or target/release.
+        //
+        // NOTE: The harness spawns processes with `current_dir = test_dir`, so we must resolve
+        // binary paths relative to the workspace root (not the per-test temp dir).
+        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+        let manifest_dir = manifest_dir.canonicalize().unwrap_or(manifest_dir);
+        let workspace_root = manifest_dir
+            .parent()
+            .unwrap_or(manifest_dir.as_path())
+            .to_path_buf();
         let cargo_target = std::env::var("CARGO_TARGET_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|_| workspace_root.join("target"));
-        let cargo_target = if cargo_target.is_relative() {
-            workspace_root.join(cargo_target)
-        } else {
+        let cargo_target = if cargo_target.is_absolute() {
             cargo_target
+        } else {
+            workspace_root.join(cargo_target)
         };
 
         let profile = if cfg!(debug_assertions) {
@@ -190,13 +199,31 @@ impl Default for HarnessConfig {
             cleanup_on_success: true,
             cleanup_on_failure: false,
             rch_binary: cargo_bin_exe(&["rch"])
-                .map(|path| if path.is_relative() { workspace_root.join(path) } else { path })
+                .map(|path| {
+                    if path.is_relative() {
+                        workspace_root.join(path)
+                    } else {
+                        path
+                    }
+                })
                 .unwrap_or_else(|| bin_dir.join("rch")),
             rchd_binary: cargo_bin_exe(&["rchd"])
-                .map(|path| if path.is_relative() { workspace_root.join(path) } else { path })
+                .map(|path| {
+                    if path.is_relative() {
+                        workspace_root.join(path)
+                    } else {
+                        path
+                    }
+                })
                 .unwrap_or_else(|| bin_dir.join("rchd")),
             rch_wkr_binary: cargo_bin_exe(&["rch-wkr", "rch_wkr"])
-                .map(|path| if path.is_relative() { workspace_root.join(path) } else { path })
+                .map(|path| {
+                    if path.is_relative() {
+                        workspace_root.join(path)
+                    } else {
+                        path
+                    }
+                })
                 .unwrap_or_else(|| bin_dir.join("rch-wkr")),
             env_vars,
         }

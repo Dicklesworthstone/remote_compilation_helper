@@ -305,12 +305,7 @@ mod tests {
         // F2-F12 should be Tick (no action)
         for i in 2..=12 {
             let f_key = KeyEvent::new(KeyCode::F(i), KeyModifiers::NONE);
-            assert_eq!(
-                handle_key(f_key),
-                Action::Tick,
-                "F{} should be Tick",
-                i
-            );
+            assert_eq!(handle_key(f_key), Action::Tick, "F{} should be Tick", i);
         }
         info!("TEST PASS: test_handle_key_other_function_keys_tick");
     }
