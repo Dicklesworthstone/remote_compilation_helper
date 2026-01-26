@@ -3,13 +3,14 @@
 import { useState } from 'react';
 import { Server, AlertCircle, CheckCircle, Clock, Zap, Play } from 'lucide-react';
 import { motion } from 'motion/react';
-import type { WorkerStatusInfo, CircuitState, WorkerStatus } from '@/lib/types';
+import type { WorkerStatusInfo, CircuitState, WorkerStatus, SpeedScoreView } from '@/lib/types';
 import { Button } from '@/components/ui/button';
 import { BenchmarkProgressModal } from './benchmark-progress-modal';
 import { SpeedScoreBadge } from './speed-score-badge';
 
 interface WorkerCardProps {
   worker: WorkerStatusInfo;
+  speedScoreView?: SpeedScoreView | null;
   /** Callback when a benchmark completes successfully */
   onBenchmarkCompleted?: () => void;
   /** Whether to show the benchmark trigger button */
@@ -32,6 +33,7 @@ const circuitConfig: Record<CircuitState, { label: string; color: string }> = {
 
 export function WorkerCard({
   worker,
+  speedScoreView = null,
   onBenchmarkCompleted,
   showBenchmarkTrigger = true,
 }: WorkerCardProps) {
@@ -42,6 +44,16 @@ export function WorkerCard({
   const StatusIcon = status.icon;
   const speedScore = Number.isFinite(worker.speed_score) ? worker.speed_score : null;
   const previousScore = typeof worker.speed_score_prev === 'number' ? worker.speed_score_prev : null;
+  const breakdown = speedScoreView
+    ? {
+        cpu_score: speedScoreView.cpu_score,
+        memory_score: speedScoreView.memory_score,
+        disk_score: speedScoreView.disk_score,
+        network_score: speedScoreView.network_score,
+        compilation_score: speedScoreView.compilation_score,
+        measured_at: speedScoreView.measured_at,
+      }
+    : null;
 
   // Benchmark can only be triggered on healthy or degraded workers
   const canBenchmark = worker.status === 'healthy' || worker.status === 'degraded';
@@ -66,7 +78,7 @@ export function WorkerCard({
           </div>
         </div>
         <div className="flex items-center gap-2 flex-wrap justify-end">
-          <SpeedScoreBadge score={speedScore} previousScore={previousScore} size="sm" />
+          <SpeedScoreBadge score={speedScore} previousScore={previousScore} breakdown={breakdown} size="sm" />
           <div
             className={`flex items-center gap-1.5 px-2 py-1 rounded-full text-xs font-medium ${status.color}`}
             data-testid="worker-status"
