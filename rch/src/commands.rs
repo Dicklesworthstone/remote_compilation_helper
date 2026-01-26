@@ -4,7 +4,7 @@
 
 use crate::error::{ConfigError, SshError};
 use crate::status_types::{
-    SelfTestHistoryResponse, SelfTestRunResponse, SelfTestStatusResponse,
+    DaemonFullStatusResponse, SelfTestHistoryResponse, SelfTestRunResponse, SelfTestStatusResponse,
     SpeedScoreHistoryResponseFromApi, SpeedScoreListResponseFromApi, SpeedScoreResponseFromApi,
     SpeedScoreViewFromApi, WorkerCapabilitiesFromApi, WorkerCapabilitiesResponseFromApi,
     extract_json_body,
@@ -429,6 +429,7 @@ pub struct ConfigShowResponse {
     pub environment: ConfigEnvironmentSection,
     pub circuit: ConfigCircuitSection,
     pub output: ConfigOutputSection,
+    pub self_healing: ConfigSelfHealingSection,
     pub sources: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub value_sources: Option<Vec<ConfigValueSourceInfo>>,
@@ -494,6 +495,14 @@ pub struct ConfigCircuitSection {
 pub struct ConfigOutputSection {
     pub visibility: rch_common::OutputVisibility,
     pub first_run_complete: bool,
+}
+
+/// Self-healing configuration section.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConfigSelfHealingSection {
+    pub hook_starts_daemon: bool,
+    pub auto_start_cooldown_secs: u64,
+    pub auto_start_timeout_secs: u64,
 }
 
 /// Configuration init response for JSON output.
@@ -836,7 +845,7 @@ pub async fn workers_capabilities(
         }
     }
 
-    if let Some(runtime) = required_runtime.clone() {
+    if let Some(runtime) = required_runtime {
         let missing: Vec<String> = workers
             .iter()
             .filter(|worker| {
@@ -1564,6 +1573,134 @@ pub async fn workers_enable(worker_id: &str, ctx: &OutputContext) -> Result<()> 
             if ctx.is_json() {
                 let _ = ctx.json(&ApiResponse::<()>::err(
                     "workers enable",
+                    ApiError::new(ErrorCode::InternalStateError, e.to_string()),
+                ));
+            } else {
+                println!(
+                    "{} Failed to communicate with daemon: {}",
+                    StatusIndicator::Error.display(style),
+                    style.muted(&e.to_string())
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Disable a worker (requires daemon).
+pub async fn workers_disable(
+    worker_id: &str,
+    reason: Option<String>,
+    drain_first: bool,
+    ctx: &OutputContext,
+) -> Result<()> {
+    let style = ctx.theme();
+
+    if !Path::new(DEFAULT_SOCKET_PATH).exists() {
+        if ctx.is_json() {
+            let _ = ctx.json(&ApiResponse::<()>::err(
+                "workers disable",
+                ApiError::new(ErrorCode::InternalDaemonNotRunning, "Daemon is not running"),
+            ));
+        } else {
+            println!(
+                "{} Daemon is not running. Start it with {}",
+                StatusIndicator::Error.display(style),
+                style.highlight("rch daemon start")
+            );
+        }
+        return Ok(());
+    }
+
+    // Build the request URL with optional reason and drain flag
+    let mut url = format!("POST /workers/{}/disable", worker_id);
+    let mut query_parts = Vec::new();
+    if let Some(ref r) = reason {
+        query_parts.push(format!("reason={}", urlencoding_encode(r)));
+    }
+    if drain_first {
+        query_parts.push("drain=true".to_string());
+    }
+    if !query_parts.is_empty() {
+        url = format!("{}?{}", url, query_parts.join("&"));
+    }
+    url.push('\n');
+
+    match send_daemon_command(&url).await {
+        Ok(response) => {
+            if response.contains("error") || response.contains("Error") {
+                if ctx.is_json() {
+                    let _ = ctx.json(&ApiResponse::ok(
+                        "workers disable",
+                        WorkerActionResponse {
+                            worker_id: worker_id.to_string(),
+                            action: "disable".to_string(),
+                            success: false,
+                            message: Some(response),
+                        },
+                    ));
+                } else {
+                    println!(
+                        "{} Failed to disable worker: {}",
+                        StatusIndicator::Error.display(style),
+                        style.muted(&response)
+                    );
+                }
+            } else if ctx.is_json() {
+                let _ = ctx.json(&ApiResponse::ok(
+                    "workers disable",
+                    WorkerActionResponse {
+                        worker_id: worker_id.to_string(),
+                        action: "disable".to_string(),
+                        success: true,
+                        message: Some(if drain_first {
+                            "Worker is draining before disable".to_string()
+                        } else {
+                            "Worker is now disabled".to_string()
+                        }),
+                    },
+                ));
+            } else if drain_first {
+                println!(
+                    "{} Worker {} is draining before disable.",
+                    StatusIndicator::Success.display(style),
+                    style.highlight(worker_id)
+                );
+                println!(
+                    "  {} Existing jobs will complete, then worker will be disabled.",
+                    StatusIndicator::Info.display(style)
+                );
+                if let Some(ref r) = reason {
+                    println!(
+                        "  {} Reason: {}",
+                        StatusIndicator::Info.display(style),
+                        style.muted(r)
+                    );
+                }
+            } else {
+                println!(
+                    "{} Worker {} is now disabled.",
+                    StatusIndicator::Success.display(style),
+                    style.highlight(worker_id)
+                );
+                println!(
+                    "  {} No jobs will be sent to this worker.",
+                    StatusIndicator::Info.display(style)
+                );
+                if let Some(ref r) = reason {
+                    println!(
+                        "  {} Reason: {}",
+                        StatusIndicator::Info.display(style),
+                        style.muted(r)
+                    );
+                }
+            }
+        }
+        Err(e) => {
+            if ctx.is_json() {
+                let _ = ctx.json(&ApiResponse::<()>::err(
+                    "workers disable",
                     ApiError::new(ErrorCode::InternalStateError, e.to_string()),
                 ));
             } else {
@@ -3847,6 +3984,11 @@ pub fn config_show(show_sources: bool, ctx: &OutputContext) -> Result<()> {
                 visibility: config.output.visibility,
                 first_run_complete: config.output.first_run_complete,
             },
+            self_healing: ConfigSelfHealingSection {
+                hook_starts_daemon: config.self_healing.hook_starts_daemon,
+                auto_start_cooldown_secs: config.self_healing.auto_start_cooldown_secs,
+                auto_start_timeout_secs: config.self_healing.auto_start_timeout_secs,
+            },
             sources,
             value_sources,
         };
@@ -4034,6 +4176,35 @@ pub fn config_show(show_sources: bool, ctx: &OutputContext) -> Result<()> {
         )
     );
 
+    println!("\n{}", style.highlight("[self_healing]"));
+    println!(
+        "  {} = {}",
+        style.key("hook_starts_daemon"),
+        format_with_source(
+            "self_healing.hook_starts_daemon",
+            &style.value(&config.self_healing.hook_starts_daemon.to_string()),
+            &value_sources
+        )
+    );
+    println!(
+        "  {} = {}",
+        style.key("auto_start_cooldown_secs"),
+        format_with_source(
+            "self_healing.auto_start_cooldown_secs",
+            &style.value(&config.self_healing.auto_start_cooldown_secs.to_string()),
+            &value_sources
+        )
+    );
+    println!(
+        "  {} = {}",
+        style.key("auto_start_timeout_secs"),
+        format_with_source(
+            "self_healing.auto_start_timeout_secs",
+            &style.value(&config.self_healing.auto_start_timeout_secs.to_string()),
+            &value_sources
+        )
+    );
+
     // Show config file locations
     println!(
         "\n{}",
@@ -4156,6 +4327,24 @@ fn collect_value_sources(
         &mut values,
         "output.first_run_complete",
         config.output.first_run_complete.to_string(),
+        sources,
+    );
+    push_value_source(
+        &mut values,
+        "self_healing.hook_starts_daemon",
+        config.self_healing.hook_starts_daemon.to_string(),
+        sources,
+    );
+    push_value_source(
+        &mut values,
+        "self_healing.auto_start_cooldown_secs",
+        config.self_healing.auto_start_cooldown_secs.to_string(),
+        sources,
+    );
+    push_value_source(
+        &mut values,
+        "self_healing.auto_start_timeout_secs",
+        config.self_healing.auto_start_timeout_secs.to_string(),
         sources,
     );
 
@@ -5354,7 +5543,7 @@ pub async fn diagnose(command: &str, ctx: &OutputContext) -> Result<()> {
             &project,
             estimated_cores,
             toolchain.as_ref(),
-            required_runtime.clone(),
+            required_runtime,
             0,
         )
         .await
@@ -5448,7 +5637,7 @@ pub async fn diagnose(command: &str, ctx: &OutputContext) -> Result<()> {
                 source: threshold_source,
             },
             daemon: daemon_status,
-            required_runtime: required_runtime.clone(),
+            required_runtime,
             local_capabilities: local_has_any.then(|| local_capabilities.clone()),
             capabilities_warnings: capabilities_warnings.clone(),
             worker_selection,
@@ -6133,6 +6322,263 @@ fn urlencoding_encode(s: &str) -> String {
 pub async fn status_overview(_workers: bool, _jobs: bool) -> Result<()> {
     // Implementation placeholder
     Ok(())
+}
+
+/// Display build queue - active builds and worker availability.
+pub async fn queue_status(watch: bool, ctx: &OutputContext) -> Result<()> {
+    loop {
+        // Query daemon for full status
+        let response = send_daemon_command("GET /status\n").await?;
+        let json = extract_json_body(&response)
+            .ok_or_else(|| anyhow::anyhow!("Invalid response format from daemon"))?;
+        let status: DaemonFullStatusResponse =
+            serde_json::from_str(json).context("Failed to parse daemon status response")?;
+
+        // In watch mode, clear screen
+        if watch {
+            print!("\x1B[2J\x1B[H"); // ANSI clear screen and move cursor to top
+        }
+
+        let style = ctx.style();
+
+        // Header
+        println!(
+            "{} {}",
+            style.highlight("Build Queue"),
+            style.muted(&format!("({})", chrono::Local::now().format("%H:%M:%S")))
+        );
+        println!("{}", style.muted(&"─".repeat(40)));
+        println!();
+
+        // Active builds section
+        if status.active_builds.is_empty() {
+            println!("{}", style.muted("  No active builds"));
+        } else {
+            println!(
+                "  {} {}",
+                style.success("●"),
+                style.key(&format!("{} Active Build(s)", status.active_builds.len()))
+            );
+            println!();
+
+            for build in &status.active_builds {
+                // Calculate elapsed time
+                let elapsed =
+                    if let Ok(started) = chrono::DateTime::parse_from_rfc3339(&build.started_at) {
+                        let duration = chrono::Utc::now().signed_duration_since(started);
+                        format_build_duration(duration.num_seconds().max(0) as u64)
+                    } else {
+                        "?".to_string()
+                    };
+
+                // Truncate command for display
+                let cmd_display = if build.command.len() > 50 {
+                    format!("{}...", &build.command[..47])
+                } else {
+                    build.command.clone()
+                };
+
+                println!(
+                    "  {} {} {} {} {} {}",
+                    style.info(&format!("#{}", build.id)),
+                    style.muted("on"),
+                    style.key(&build.worker_id),
+                    style.muted("|"),
+                    style.value(&cmd_display),
+                    style.warning(&format!("[{}]", elapsed))
+                );
+
+                // Show project
+                let project_display = if build.project_id.len() > 30 {
+                    format!("...{}", &build.project_id[build.project_id.len() - 27..])
+                } else {
+                    build.project_id.clone()
+                };
+                println!(
+                    "      {} {}",
+                    style.muted("project:"),
+                    style.value(&project_display)
+                );
+            }
+        }
+        println!();
+
+        // Worker availability summary
+        println!("{}", style.key("Worker Availability"));
+        println!();
+
+        let mut healthy_count = 0;
+        let mut busy_count = 0;
+        let mut offline_count = 0;
+
+        for worker in &status.workers {
+            match worker.status.as_str() {
+                "healthy" | "available" => {
+                    if worker.used_slots >= worker.total_slots {
+                        busy_count += 1;
+                    } else {
+                        healthy_count += 1;
+                    }
+                }
+                "offline" | "unreachable" | "error" => offline_count += 1,
+                _ => {}
+            }
+        }
+
+        println!(
+            "  {} {} available  {} {} busy  {} {} offline",
+            style.success("●"),
+            healthy_count,
+            style.warning("●"),
+            busy_count,
+            style.error("●"),
+            offline_count
+        );
+        println!();
+
+        // Slot summary
+        println!(
+            "  {} {} / {} slots free",
+            style.info("→"),
+            status.daemon.slots_available,
+            status.daemon.slots_total
+        );
+
+        // JSON output for scripting
+        if ctx.is_json() {
+            let queue_data = serde_json::json!({
+                "active_builds": status.active_builds,
+                "workers_available": healthy_count,
+                "workers_busy": busy_count,
+                "workers_offline": offline_count,
+                "slots_available": status.daemon.slots_available,
+                "slots_total": status.daemon.slots_total,
+                "timestamp": chrono::Utc::now().to_rfc3339()
+            });
+            let _ = ctx.json(&queue_data);
+            return Ok(());
+        }
+
+        if !watch {
+            break;
+        }
+
+        // Wait 1 second before refresh
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+
+    Ok(())
+}
+
+/// Cancel an active build (or all builds) via the daemon API.
+pub async fn cancel_build(
+    build_id: Option<u64>,
+    all: bool,
+    force: bool,
+    yes: bool,
+    ctx: &OutputContext,
+) -> Result<()> {
+    use dialoguer::Confirm;
+
+    if all && build_id.is_some() {
+        tracing::debug!("Ignoring build_id since --all was provided");
+    }
+
+    if all && !yes && !ctx.is_json() {
+        let confirmed = Confirm::new()
+            .with_prompt("Cancel all active builds?")
+            .default(false)
+            .interact()
+            .unwrap_or(false);
+        if !confirmed {
+            println!("{}", ctx.style().muted("No builds cancelled."));
+            return Ok(());
+        }
+    }
+
+    let command = if all {
+        format!(
+            "POST /cancel-all-builds?force={}\n",
+            if force { "true" } else { "false" }
+        )
+    } else {
+        let build_id = build_id.ok_or_else(|| anyhow::anyhow!("Missing build id (or use --all)"))?;
+        format!(
+            "POST /cancel-build?build_id={}&force={}\n",
+            build_id,
+            if force { "true" } else { "false" }
+        )
+    };
+
+    let response = send_daemon_command(&command).await?;
+    let json = extract_json_body(&response)
+        .ok_or_else(|| anyhow::anyhow!("Invalid response format from daemon"))?;
+    let payload: serde_json::Value =
+        serde_json::from_str(json).context("Failed to parse cancellation response")?;
+
+    let _ = ctx.json(&payload);
+    if ctx.is_json() {
+        return Ok(());
+    }
+
+    let style = ctx.style();
+    let status = payload
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+
+    match status {
+        "cancelled" => {
+            let id = payload.get("build_id").and_then(|v| v.as_u64());
+            let msg = payload.get("message").and_then(|v| v.as_str()).unwrap_or("");
+            if let Some(id) = id {
+                println!(
+                    "{} {} {}",
+                    style.success("Cancelled"),
+                    style.muted("build"),
+                    style.value(&id.to_string())
+                );
+            } else {
+                println!("{}", style.success("Cancelled build"));
+            }
+            if !msg.is_empty() {
+                println!("  {}", style.muted(msg));
+            }
+        }
+        "ok" => {
+            // cancel-all response when nothing to do, or generic success
+            if let Some(msg) = payload.get("message").and_then(|v| v.as_str()) {
+                println!("{}", style.info(msg));
+            } else {
+                println!("{}", style.success("OK"));
+            }
+        }
+        "error" => {
+            let msg = payload.get("message").and_then(|v| v.as_str()).unwrap_or("error");
+            println!("{} {}", style.error("Error:"), style.value(msg));
+        }
+        other => {
+            println!("{} {}", style.key("Status:"), style.value(other));
+            if let Some(msg) = payload.get("message").and_then(|v| v.as_str()) {
+                println!("  {}", style.muted(msg));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Format build duration in human-readable form.
+fn format_build_duration(secs: u64) -> String {
+    if secs < 60 {
+        format!("{}s", secs)
+    } else if secs < 3600 {
+        format!("{}m {}s", secs / 60, secs % 60)
+    } else {
+        let hours = secs / 3600;
+        let mins = (secs % 3600) / 60;
+        format!("{}h {}m", hours, mins)
+    }
 }
 
 // Stub for hook_test
@@ -7028,6 +7474,11 @@ mod tests {
             output: ConfigOutputSection {
                 visibility: rch_common::OutputVisibility::None,
                 first_run_complete: false,
+            },
+            self_healing: ConfigSelfHealingSection {
+                hook_starts_daemon: true,
+                auto_start_cooldown_secs: 30,
+                auto_start_timeout_secs: 3,
             },
             sources: vec!["~/.config/rch/config.toml".to_string()],
             value_sources: None,

@@ -201,6 +201,48 @@ For more control, use the individual commands:
         jobs: bool,
     },
 
+    /// Show build queue - active and waiting compilations
+    #[command(after_help = r#"EXAMPLES:
+    rch queue                 # Show active builds and queue
+    rch queue --watch         # Watch queue in real-time (updates every second)
+    rch queue --json          # Output as JSON for scripting
+
+The queue shows:
+  - Currently running builds with worker, elapsed time
+  - Queued builds waiting for workers
+  - Worker availability summary"#)]
+    Queue {
+        /// Watch mode - continuously update (1s interval)
+        #[arg(long, short = 'w')]
+        watch: bool,
+    },
+
+    /// Cancel active builds
+    #[command(after_help = r#"EXAMPLES:
+    rch cancel 42             # Cancel build with ID 42
+    rch cancel --all          # Cancel all active builds (with confirmation)
+    rch cancel --all --yes    # Cancel all without confirmation
+    rch cancel 42 --force     # Force kill (SIGKILL instead of SIGTERM)
+
+Graceful cancellation sends SIGTERM to the build process, allowing it
+to clean up. Use --force to immediately terminate with SIGKILL."#)]
+    Cancel {
+        /// Build ID to cancel (use 'rch queue' to see active builds)
+        build_id: Option<u64>,
+
+        /// Cancel all active builds
+        #[arg(long)]
+        all: bool,
+
+        /// Force termination (SIGKILL instead of SIGTERM)
+        #[arg(long, short = 'f')]
+        force: bool,
+
+        /// Skip confirmation prompt for --all
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+
     /// View and manage RCH configuration
     #[command(after_help = r#"EXAMPLES:
     rch config show           # Display effective config
@@ -284,6 +326,7 @@ INSTALL LOCATIONS:
     #[command(after_help = r#"EXAMPLES:
     rch doctor              # Run all diagnostic checks
     rch doctor --fix        # Attempt to fix safe issues
+    rch doctor --fix --dry-run  # Show what would be fixed
     rch doctor -v           # Show detailed output
     rch doctor --json       # Output as JSON for scripting
 
@@ -298,6 +341,10 @@ CHECKS PERFORMED:
         /// Attempt to fix safe issues (e.g., key permissions)
         #[arg(long)]
         fix: bool,
+
+        /// Show what would be fixed without making changes
+        #[arg(long)]
+        dry_run: bool,
 
         /// Allow installing missing prerequisites (requires confirmation)
         #[arg(long)]
@@ -577,6 +624,17 @@ enum WorkersAction {
     Drain { worker: String },
     /// Enable a worker
     Enable { worker: String },
+    /// Disable a worker (exclude from job assignment)
+    Disable {
+        /// Worker ID to disable
+        worker: String,
+        /// Reason for disabling (e.g., "maintenance window")
+        #[arg(long)]
+        reason: Option<String>,
+        /// Drain active builds before fully disabling
+        #[arg(long)]
+        drain: bool,
+    },
     /// Deploy rch-wkr binary to remote workers
     DeployBinary {
         /// Worker ID to deploy to, or --all for all workers
@@ -975,12 +1033,23 @@ async fn main() -> Result<()> {
             Commands::Daemon { action } => handle_daemon(action, &ctx).await,
             Commands::Workers { action } => handle_workers(action, &ctx).await,
             Commands::Status { workers, jobs } => handle_status(workers, jobs, &ctx).await,
+            Commands::Queue { watch } => commands::queue_status(watch, &ctx).await,
+            Commands::Cancel {
+                build_id,
+                all,
+                force,
+                yes,
+            } => commands::cancel_build(build_id, all, force, yes, &ctx).await,
             Commands::Config { action } => handle_config(action, &ctx).await,
             Commands::Diagnose { command } => handle_diagnose(command, &ctx).await,
             Commands::Hook { action } => handle_hook(action, &ctx).await,
             Commands::Agents { action } => handle_agents(action, &ctx).await,
             Commands::Completions { action } => handle_completions(action, &ctx),
-            Commands::Doctor { fix, install_deps } => handle_doctor(fix, install_deps, &ctx).await,
+            Commands::Doctor {
+                fix,
+                dry_run,
+                install_deps,
+            } => handle_doctor(fix, dry_run, install_deps, &ctx).await,
             Commands::SelfTest {
                 action,
                 worker,
@@ -1097,6 +1166,13 @@ async fn handle_workers(action: WorkersAction, ctx: &OutputContext) -> Result<()
         WorkersAction::Enable { worker } => {
             commands::workers_enable(&worker, ctx).await?;
         }
+        WorkersAction::Disable {
+            worker,
+            reason,
+            drain,
+        } => {
+            commands::workers_disable(&worker, reason, drain, ctx).await?;
+        }
         WorkersAction::DeployBinary {
             worker,
             all,
@@ -1201,10 +1277,16 @@ async fn handle_agents(action: AgentsAction, ctx: &OutputContext) -> Result<()> 
     Ok(())
 }
 
-async fn handle_doctor(fix: bool, install_deps: bool, ctx: &OutputContext) -> Result<()> {
+async fn handle_doctor(
+    fix: bool,
+    dry_run: bool,
+    install_deps: bool,
+    ctx: &OutputContext,
+) -> Result<()> {
     use crate::doctor::DoctorOptions;
     let options = DoctorOptions {
         fix,
+        dry_run,
         install_deps,
         verbose: ctx.is_verbose(),
     };
@@ -2031,8 +2113,13 @@ mod tests {
     fn cli_parses_doctor_default() {
         let cli = Cli::try_parse_from(["rch", "doctor"]).unwrap();
         match cli.command {
-            Some(Commands::Doctor { fix, install_deps }) => {
+            Some(Commands::Doctor {
+                fix,
+                dry_run,
+                install_deps,
+            }) => {
                 assert!(!fix);
+                assert!(!dry_run);
                 assert!(!install_deps);
             }
             _ => panic!("Expected doctor command"),
@@ -2043,8 +2130,30 @@ mod tests {
     fn cli_parses_doctor_with_fix() {
         let cli = Cli::try_parse_from(["rch", "doctor", "--fix"]).unwrap();
         match cli.command {
-            Some(Commands::Doctor { fix, install_deps }) => {
+            Some(Commands::Doctor {
+                fix,
+                dry_run,
+                install_deps,
+            }) => {
                 assert!(fix);
+                assert!(!dry_run);
+                assert!(!install_deps);
+            }
+            _ => panic!("Expected doctor command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_doctor_with_dry_run() {
+        let cli = Cli::try_parse_from(["rch", "doctor", "--dry-run"]).unwrap();
+        match cli.command {
+            Some(Commands::Doctor {
+                fix,
+                dry_run,
+                install_deps,
+            }) => {
+                assert!(!fix);
+                assert!(dry_run);
                 assert!(!install_deps);
             }
             _ => panic!("Expected doctor command"),
@@ -2055,8 +2164,13 @@ mod tests {
     fn cli_parses_doctor_install_deps() {
         let cli = Cli::try_parse_from(["rch", "doctor", "--install-deps"]).unwrap();
         match cli.command {
-            Some(Commands::Doctor { fix, install_deps }) => {
+            Some(Commands::Doctor {
+                fix,
+                dry_run,
+                install_deps,
+            }) => {
                 assert!(!fix);
+                assert!(!dry_run);
                 assert!(install_deps);
             }
             _ => panic!("Expected doctor command"),
