@@ -170,6 +170,7 @@ fn signal_state_flags() {
 
 #[test]
 fn progress_context_rate_limit_respects_interval() {
+    let _guard = TEST_LOCK.lock();
     let mut ctx = ProgressContext::new_for_test(true);
     ctx.rate_limiter = RateLimiter::new(10);
 

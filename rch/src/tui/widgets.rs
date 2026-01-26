@@ -1101,7 +1101,11 @@ mod tests {
             workers: vec![
                 sample_worker("healthy-w", WorkerStatus::Healthy, CircuitState::Closed),
                 sample_worker("degraded-w", WorkerStatus::Degraded, CircuitState::Closed),
-                sample_worker("unreachable-w", WorkerStatus::Unreachable, CircuitState::Closed),
+                sample_worker(
+                    "unreachable-w",
+                    WorkerStatus::Unreachable,
+                    CircuitState::Closed,
+                ),
                 sample_worker("draining-w", WorkerStatus::Draining, CircuitState::Closed),
             ],
             ..Default::default()
@@ -1470,7 +1474,11 @@ mod tests {
         init_test_logging();
         info!("TEST START: test_render_at_narrow_width");
         let state = TuiState {
-            workers: vec![sample_worker("w1", WorkerStatus::Healthy, CircuitState::Closed)],
+            workers: vec![sample_worker(
+                "w1",
+                WorkerStatus::Healthy,
+                CircuitState::Closed,
+            )],
             active_builds: vec![sample_active_build("b1", "cargo build")],
             ..Default::default()
         };
@@ -1487,7 +1495,11 @@ mod tests {
         init_test_logging();
         info!("TEST START: test_render_at_wide_width");
         let state = TuiState {
-            workers: vec![sample_worker("w1", WorkerStatus::Healthy, CircuitState::Closed)],
+            workers: vec![sample_worker(
+                "w1",
+                WorkerStatus::Healthy,
+                CircuitState::Closed,
+            )],
             active_builds: vec![sample_active_build("b1", "cargo build")],
             ..Default::default()
         };
@@ -1541,7 +1553,11 @@ mod tests {
         init_test_logging();
         info!("TEST START: test_render_main_content_normal_layout");
         let state = TuiState {
-            workers: vec![sample_worker("main-worker", WorkerStatus::Healthy, CircuitState::Closed)],
+            workers: vec![sample_worker(
+                "main-worker",
+                WorkerStatus::Healthy,
+                CircuitState::Closed,
+            )],
             ..Default::default()
         };
         let content = render_to_string(100, 30, |f| {
@@ -1589,26 +1605,30 @@ mod tests {
             selected_panel: Panel::BuildHistory,
             ..Default::default()
         };
-        state.build_history.push_back(crate::tui::state::HistoricalBuild {
-            id: "h1".to_string(),
-            command: "success cmd".to_string(),
-            worker: Some("w1".to_string()),
-            started_at: Utc::now(),
-            completed_at: Utc::now(),
-            duration_ms: 1200,
-            success: true,
-            exit_code: Some(0),
-        });
-        state.build_history.push_back(crate::tui::state::HistoricalBuild {
-            id: "h2".to_string(),
-            command: "failed cmd".to_string(),
-            worker: Some("w1".to_string()),
-            started_at: Utc::now(),
-            completed_at: Utc::now(),
-            duration_ms: 500,
-            success: false,
-            exit_code: Some(1),
-        });
+        state
+            .build_history
+            .push_back(crate::tui::state::HistoricalBuild {
+                id: "h1".to_string(),
+                command: "success cmd".to_string(),
+                worker: Some("w1".to_string()),
+                started_at: Utc::now(),
+                completed_at: Utc::now(),
+                duration_ms: 1200,
+                success: true,
+                exit_code: Some(0),
+            });
+        state
+            .build_history
+            .push_back(crate::tui::state::HistoricalBuild {
+                id: "h2".to_string(),
+                command: "failed cmd".to_string(),
+                worker: Some("w1".to_string()),
+                started_at: Utc::now(),
+                completed_at: Utc::now(),
+                duration_ms: 500,
+                success: false,
+                exit_code: Some(1),
+            });
         let content = render_to_string(80, 10, |f| {
             let colors = get_colors(false, ColorBlindMode::None);
             render_build_history_panel(f, Rect::new(0, 0, 80, 10), &state, &colors);
@@ -1626,16 +1646,18 @@ mod tests {
             selected_panel: Panel::BuildHistory,
             ..Default::default()
         };
-        state.build_history.push_back(crate::tui::state::HistoricalBuild {
-            id: "h1".to_string(),
-            command: "local build".to_string(),
-            worker: None, // Local build, no worker assigned
-            started_at: Utc::now(),
-            completed_at: Utc::now(),
-            duration_ms: 1200,
-            success: true,
-            exit_code: Some(0),
-        });
+        state
+            .build_history
+            .push_back(crate::tui::state::HistoricalBuild {
+                id: "h1".to_string(),
+                command: "local build".to_string(),
+                worker: None, // Local build, no worker assigned
+                started_at: Utc::now(),
+                completed_at: Utc::now(),
+                duration_ms: 1200,
+                success: true,
+                exit_code: Some(0),
+            });
         let content = render_to_string(80, 8, |f| {
             let colors = get_colors(false, ColorBlindMode::None);
             render_build_history_panel(f, Rect::new(0, 0, 80, 8), &state, &colors);

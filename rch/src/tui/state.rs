@@ -597,4 +597,411 @@ mod tests {
         assert!(!filtered[0].success);
         info!("TEST PASS: test_filtered_build_history_filters");
     }
+
+    // ==================== Selection bounds for all panel types ====================
+
+    #[test]
+    fn test_selection_bounds_for_active_builds() {
+        init_test_logging();
+        info!("TEST START: test_selection_bounds_for_active_builds");
+        let mut state = TuiState {
+            active_builds: vec![
+                make_active_build("b1", "cmd1"),
+                make_active_build("b2", "cmd2"),
+                make_active_build("b3", "cmd3"),
+            ],
+            selected_panel: Panel::ActiveBuilds,
+            selected_index: 0,
+            ..Default::default()
+        };
+        // Try to go above first item
+        state.select_up();
+        assert_eq!(state.selected_index, 0);
+        // Navigate down to last item
+        state.select_down();
+        assert_eq!(state.selected_index, 1);
+        state.select_down();
+        assert_eq!(state.selected_index, 2);
+        // Try to go beyond last item
+        state.select_down();
+        assert_eq!(state.selected_index, 2);
+        info!("TEST PASS: test_selection_bounds_for_active_builds");
+    }
+
+    #[test]
+    fn test_selection_bounds_for_build_history() {
+        init_test_logging();
+        info!("TEST START: test_selection_bounds_for_build_history");
+        let mut state = TuiState {
+            build_history: VecDeque::from([
+                make_history("h1", "cmd1", Some("w1"), true),
+                make_history("h2", "cmd2", Some("w1"), true),
+            ]),
+            selected_panel: Panel::BuildHistory,
+            selected_index: 0,
+            ..Default::default()
+        };
+        state.select_up();
+        assert_eq!(state.selected_index, 0);
+        state.select_down();
+        assert_eq!(state.selected_index, 1);
+        state.select_down();
+        assert_eq!(state.selected_index, 1);
+        info!("TEST PASS: test_selection_bounds_for_build_history");
+    }
+
+    #[test]
+    fn test_selection_bounds_for_logs() {
+        init_test_logging();
+        info!("TEST START: test_selection_bounds_for_logs");
+        let mut log_view = LogViewState::default();
+        for i in 0..50 {
+            log_view.lines.push_back(format!("line {}", i));
+        }
+        let mut state = TuiState {
+            log_view: Some(log_view),
+            selected_panel: Panel::Logs,
+            selected_index: 0,
+            ..Default::default()
+        };
+        // In logs panel, navigation should work (scroll)
+        state.select_up();
+        state.select_down();
+        info!("TEST PASS: test_selection_bounds_for_logs");
+    }
+
+    // ==================== Empty panel behavior ====================
+
+    #[test]
+    fn test_selection_on_empty_workers() {
+        init_test_logging();
+        info!("TEST START: test_selection_on_empty_workers");
+        let mut state = TuiState {
+            workers: vec![],
+            selected_panel: Panel::Workers,
+            selected_index: 0,
+            ..Default::default()
+        };
+        state.select_up();
+        assert_eq!(state.selected_index, 0);
+        state.select_down();
+        assert_eq!(state.selected_index, 0);
+        info!("TEST PASS: test_selection_on_empty_workers");
+    }
+
+    #[test]
+    fn test_selection_on_empty_active_builds() {
+        init_test_logging();
+        info!("TEST START: test_selection_on_empty_active_builds");
+        let mut state = TuiState {
+            active_builds: vec![],
+            selected_panel: Panel::ActiveBuilds,
+            selected_index: 0,
+            ..Default::default()
+        };
+        state.select_down();
+        assert_eq!(state.selected_index, 0);
+        info!("TEST PASS: test_selection_on_empty_active_builds");
+    }
+
+    #[test]
+    fn test_selection_on_empty_build_history() {
+        init_test_logging();
+        info!("TEST START: test_selection_on_empty_build_history");
+        let mut state = TuiState {
+            build_history: VecDeque::new(),
+            selected_panel: Panel::BuildHistory,
+            selected_index: 0,
+            ..Default::default()
+        };
+        state.select_down();
+        assert_eq!(state.selected_index, 0);
+        info!("TEST PASS: test_selection_on_empty_build_history");
+    }
+
+    // ==================== Panel switch resets index ====================
+
+    #[test]
+    fn test_panel_switch_resets_selected_index() {
+        init_test_logging();
+        info!("TEST START: test_panel_switch_resets_selected_index");
+        let mut state = TuiState {
+            workers: vec![make_worker("w1"), make_worker("w2"), make_worker("w3")],
+            active_builds: vec![make_active_build("b1", "cmd")],
+            selected_panel: Panel::Workers,
+            selected_index: 2,
+            ..Default::default()
+        };
+        assert_eq!(state.selected_index, 2);
+        state.next_panel();
+        assert_eq!(state.selected_panel, Panel::ActiveBuilds);
+        assert_eq!(state.selected_index, 0);
+        info!("TEST PASS: test_panel_switch_resets_selected_index");
+    }
+
+    // ==================== Log view state tests ====================
+
+    #[test]
+    fn test_log_view_state_default() {
+        init_test_logging();
+        info!("TEST START: test_log_view_state_default");
+        let log_view = LogViewState::default();
+        assert!(log_view.build_id.is_empty());
+        assert!(log_view.lines.is_empty());
+        assert_eq!(log_view.scroll_offset, 0);
+        assert!(log_view.auto_scroll);
+        info!("TEST PASS: test_log_view_state_default");
+    }
+
+    #[test]
+    fn test_handle_select_on_build_history_opens_logs() {
+        init_test_logging();
+        info!("TEST START: test_handle_select_on_build_history_opens_logs");
+        let mut state = TuiState {
+            build_history: VecDeque::from([make_history("hist-1", "cargo test", Some("w1"), true)]),
+            selected_panel: Panel::BuildHistory,
+            selected_index: 0,
+            ..Default::default()
+        };
+        state.handle_select();
+        assert!(state.log_view.is_some());
+        let log_view = state.log_view.as_ref().unwrap();
+        assert_eq!(log_view.build_id, "hist-1");
+        info!("TEST PASS: test_handle_select_on_build_history_opens_logs");
+    }
+
+    #[test]
+    fn test_handle_select_on_workers_no_op() {
+        init_test_logging();
+        info!("TEST START: test_handle_select_on_workers_no_op");
+        let mut state = TuiState {
+            workers: vec![make_worker("w1")],
+            selected_panel: Panel::Workers,
+            ..Default::default()
+        };
+        state.handle_select();
+        // Selecting a worker doesn't open log view
+        assert!(state.log_view.is_none());
+        info!("TEST PASS: test_handle_select_on_workers_no_op");
+    }
+
+    // ==================== Filter state tests ====================
+
+    #[test]
+    fn test_filter_state_default() {
+        init_test_logging();
+        info!("TEST START: test_filter_state_default");
+        let filter = FilterState::default();
+        assert!(filter.query.is_empty());
+        assert!(filter.worker_filter.is_none());
+        assert!(!filter.success_only);
+        assert!(!filter.failed_only);
+        info!("TEST PASS: test_filter_state_default");
+    }
+
+    #[test]
+    fn test_filtered_build_history_case_insensitive() {
+        init_test_logging();
+        info!("TEST START: test_filtered_build_history_case_insensitive");
+        let mut state = TuiState {
+            build_history: VecDeque::from([
+                make_history("h1", "CARGO BUILD", Some("w1"), true),
+                make_history("h2", "cargo test", Some("w2"), false),
+            ]),
+            ..Default::default()
+        };
+        state.filter.query = "cargo".to_string();
+        let filtered = state.filtered_build_history();
+        // Should match both due to case-insensitive search
+        assert_eq!(filtered.len(), 2);
+        info!("TEST PASS: test_filtered_build_history_case_insensitive");
+    }
+
+    #[test]
+    fn test_filtered_build_history_empty_query() {
+        init_test_logging();
+        info!("TEST START: test_filtered_build_history_empty_query");
+        let mut state = TuiState {
+            build_history: VecDeque::from([
+                make_history("h1", "cmd1", Some("w1"), true),
+                make_history("h2", "cmd2", Some("w2"), false),
+            ]),
+            ..Default::default()
+        };
+        state.filter.query = "".to_string();
+        let filtered = state.filtered_build_history();
+        // Empty query returns all
+        assert_eq!(filtered.len(), 2);
+        info!("TEST PASS: test_filtered_build_history_empty_query");
+    }
+
+    #[test]
+    fn test_filtered_build_history_combined_filters() {
+        init_test_logging();
+        info!("TEST START: test_filtered_build_history_combined_filters");
+        let mut state = TuiState {
+            build_history: VecDeque::from([
+                make_history("h1", "cargo build", Some("worker-a"), true),
+                make_history("h2", "cargo test", Some("worker-a"), false),
+                make_history("h3", "cargo build", Some("worker-b"), true),
+            ]),
+            ..Default::default()
+        };
+        // Filter by query + worker + success
+        state.filter.query = "build".to_string();
+        state.filter.worker_filter = Some("worker-a".to_string());
+        state.filter.success_only = true;
+        let filtered = state.filtered_build_history();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, "h1");
+        info!("TEST PASS: test_filtered_build_history_combined_filters");
+    }
+
+    // ==================== Copy selected tests ====================
+
+    #[test]
+    fn test_copy_selected_empty_panels() {
+        init_test_logging();
+        info!("TEST START: test_copy_selected_empty_panels");
+        let mut state = TuiState {
+            workers: vec![],
+            active_builds: vec![],
+            build_history: VecDeque::new(),
+            selected_panel: Panel::Workers,
+            ..Default::default()
+        };
+        state.copy_selected();
+        assert!(state.last_copied.is_none());
+
+        state.selected_panel = Panel::ActiveBuilds;
+        state.copy_selected();
+        assert!(state.last_copied.is_none());
+
+        state.selected_panel = Panel::BuildHistory;
+        state.copy_selected();
+        assert!(state.last_copied.is_none());
+        info!("TEST PASS: test_copy_selected_empty_panels");
+    }
+
+    #[test]
+    fn test_copy_selected_empty_log_view() {
+        init_test_logging();
+        info!("TEST START: test_copy_selected_empty_log_view");
+        let log_view = LogViewState::default();
+        let mut state = TuiState {
+            log_view: Some(log_view),
+            selected_panel: Panel::Logs,
+            ..Default::default()
+        };
+        state.copy_selected();
+        // Empty lines joins to empty string
+        assert_eq!(state.last_copied.as_deref(), Some(""));
+        info!("TEST PASS: test_copy_selected_empty_log_view");
+    }
+
+    // ==================== Status enum tests ====================
+
+    #[test]
+    fn test_status_enum_variants() {
+        init_test_logging();
+        info!("TEST START: test_status_enum_variants");
+        let running = Status::Running;
+        let stopped = Status::Stopped;
+        let error = Status::Error;
+        let unknown = Status::Unknown;
+        // Test that variants are distinct
+        assert_ne!(running, stopped);
+        assert_ne!(stopped, error);
+        assert_ne!(error, unknown);
+        info!("TEST PASS: test_status_enum_variants");
+    }
+
+    // ==================== WorkerStatus enum tests ====================
+
+    #[test]
+    fn test_worker_status_enum_variants() {
+        init_test_logging();
+        info!("TEST START: test_worker_status_enum_variants");
+        let healthy = WorkerStatus::Healthy;
+        let degraded = WorkerStatus::Degraded;
+        let unreachable = WorkerStatus::Unreachable;
+        let draining = WorkerStatus::Draining;
+        assert_ne!(healthy, degraded);
+        assert_ne!(unreachable, draining);
+        info!("TEST PASS: test_worker_status_enum_variants");
+    }
+
+    // ==================== CircuitState enum tests ====================
+
+    #[test]
+    fn test_circuit_state_enum_variants() {
+        init_test_logging();
+        info!("TEST START: test_circuit_state_enum_variants");
+        let closed = CircuitState::Closed;
+        let half_open = CircuitState::HalfOpen;
+        let open = CircuitState::Open;
+        assert_ne!(closed, half_open);
+        assert_ne!(half_open, open);
+        info!("TEST PASS: test_circuit_state_enum_variants");
+    }
+
+    // ==================== BuildStatus enum tests ====================
+
+    #[test]
+    fn test_build_status_enum_variants() {
+        init_test_logging();
+        info!("TEST START: test_build_status_enum_variants");
+        let pending = BuildStatus::Pending;
+        let syncing = BuildStatus::Syncing;
+        let compiling = BuildStatus::Compiling;
+        let downloading = BuildStatus::Downloading;
+        let completed = BuildStatus::Completed;
+        let failed = BuildStatus::Failed;
+        assert_ne!(pending, syncing);
+        assert_ne!(compiling, downloading);
+        assert_ne!(completed, failed);
+        info!("TEST PASS: test_build_status_enum_variants");
+    }
+
+    // ==================== ColorBlindMode enum tests ====================
+
+    #[test]
+    fn test_color_blind_mode_enum_variants() {
+        init_test_logging();
+        info!("TEST START: test_color_blind_mode_enum_variants");
+        let none = ColorBlindMode::None;
+        let deuter = ColorBlindMode::Deuteranopia;
+        let proto = ColorBlindMode::Protanopia;
+        let tritan = ColorBlindMode::Tritanopia;
+        assert_ne!(none, deuter);
+        assert_ne!(proto, tritan);
+        info!("TEST PASS: test_color_blind_mode_enum_variants");
+    }
+
+    // ==================== Panel enum tests ====================
+
+    #[test]
+    fn test_panel_enum_variants() {
+        init_test_logging();
+        info!("TEST START: test_panel_enum_variants");
+        let workers = Panel::Workers;
+        let active = Panel::ActiveBuilds;
+        let history = Panel::BuildHistory;
+        let logs = Panel::Logs;
+        assert_ne!(workers, active);
+        assert_ne!(history, logs);
+        info!("TEST PASS: test_panel_enum_variants");
+    }
+
+    // ==================== DaemonState tests ====================
+
+    #[test]
+    fn test_daemon_state_default() {
+        init_test_logging();
+        info!("TEST START: test_daemon_state_default");
+        let daemon = DaemonState::default();
+        assert_eq!(daemon.status, Status::Unknown);
+        assert!(daemon.version.is_empty());
+        info!("TEST PASS: test_daemon_state_default");
+    }
 }

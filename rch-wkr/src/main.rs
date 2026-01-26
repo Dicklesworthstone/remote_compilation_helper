@@ -107,7 +107,7 @@ async fn main() -> Result<()> {
                             e
                         );
                         // Fall through to execute without toolchain wrapping
-                        
+
                         // Touch the project cache to prevent cleanup
                         cache::touch_project(std::path::Path::new(&workdir));
 
