@@ -1,6 +1,6 @@
 use std::process::{Command, Stdio};
 
-use crate::common::init_test_logging;
+use super::common::init_test_logging;
 
 #[test]
 fn test_hook_allows_non_compilation() {
@@ -14,7 +14,7 @@ fn test_hook_allows_non_compilation() {
         .spawn()
         .expect("Failed to start rch hook");
 
-    let input = r#"{"tool_name":"Bash","tool_input":{"command":"ls"}}\n"#;
+    let input = "{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"ls\"}}\n";
     {
         use std::io::Write;
         let stdin = child.stdin.as_mut().expect("Failed to open stdin");

@@ -1,6 +1,6 @@
 use rch_common::RchConfig;
 
-use crate::common::init_test_logging;
+use super::common::init_test_logging;
 
 #[test]
 fn test_default_config_enabled() {

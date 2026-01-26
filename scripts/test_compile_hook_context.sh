@@ -27,7 +27,9 @@ fi
 # ============================================================================
 TEST_LOG="${PROJECT_ROOT}/target/test_compile_hook_context.log"
 TEST_PROJECT="/tmp/rch_compile_test_$$"
-RCH="${PROJECT_ROOT}/target/release/rch"
+# Support CARGO_TARGET_DIR or use default location
+CARGO_TARGET="${CARGO_TARGET_DIR:-${PROJECT_ROOT}/target}"
+RCH="${RCH:-${CARGO_TARGET}/release/rch}"
 
 # Ensure directories exist
 mkdir -p "${PROJECT_ROOT}/target"

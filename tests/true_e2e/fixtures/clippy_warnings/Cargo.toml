@@ -1,0 +1,22 @@
+[package]
+name = "clippy_warnings"
+version = "0.1.0"
+edition = "2024"
+
+# RCH E2E Test Fixture - Project with warnings
+#
+# Intended to produce warnings for:
+#   - cargo check
+#   - cargo clippy
+
+[dependencies]
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+
+# Empty workspace table makes this a standalone project,
+# not part of the parent RCH workspace
+[workspace]

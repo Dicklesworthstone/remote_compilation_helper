@@ -556,6 +556,13 @@ pub async fn workers_capabilities(
     let mut warnings = Vec::new();
     let mut required_runtime = None;
 
+    let runtime_label = |runtime: &RequiredRuntime| match runtime {
+        RequiredRuntime::Rust => "rust",
+        RequiredRuntime::Bun => "bun",
+        RequiredRuntime::Node => "node",
+        RequiredRuntime::None => "none",
+    };
+
     if let Some(command) = command.as_deref() {
         let details = classify_command_detailed(command);
         if !details.classification.is_compilation {
@@ -587,8 +594,8 @@ pub async fn workers_capabilities(
 
         if !missing.is_empty() {
             warnings.push(format!(
-                "Workers missing required runtime {:?}: {}",
-                runtime,
+                "Workers missing required runtime {}: {}",
+                runtime_label(&runtime),
                 missing.join(", ")
             ));
         }
@@ -616,13 +623,6 @@ pub async fn workers_capabilities(
 
     println!("{}", style.format_header("Worker Capabilities"));
     println!();
-
-    let runtime_label = |runtime: &RequiredRuntime| match runtime {
-        RequiredRuntime::Rust => "rust",
-        RequiredRuntime::Bun => "bun",
-        RequiredRuntime::Node => "node",
-        RequiredRuntime::None => "none",
-    };
 
     if let Some(runtime) = required_runtime.as_ref() {
         println!(

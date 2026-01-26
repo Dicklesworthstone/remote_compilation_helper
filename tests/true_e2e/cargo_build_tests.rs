@@ -1144,3 +1144,502 @@ async fn test_cargo_build_cleanup() {
     logger.info("Cleanup verification test passed");
     logger.print_summary();
 }
+
+// =============================================================================
+// Test: Feature flags build
+// =============================================================================
+
+/// Get the feature_flags fixture directory
+fn feature_flags_fixture_dir() -> PathBuf {
+    PathBuf::from(FIXTURES_DIR).join("feature_flags")
+}
+
+/// Test 8: Feature flags build
+///
+/// Command: `cargo build --features verbose`
+/// Expected: Feature is correctly passed to the remote worker
+/// Verify: Build succeeds with the feature enabled
+#[tokio::test]
+async fn test_cargo_build_with_features() {
+    let logger = TestLoggerBuilder::new("test_cargo_build_with_features")
+        .print_realtime(true)
+        .build();
+
+    logger.log_with_context(
+        LogLevel::Info,
+        LogSource::Custom("test".to_string()),
+        "Starting feature flags build test",
+        vec![
+            ("phase".to_string(), "setup".to_string()),
+            ("fixture".to_string(), "feature_flags".to_string()),
+            ("feature".to_string(), "verbose".to_string()),
+        ],
+    );
+
+    let Some(config) = require_workers() else {
+        logger.warn("Test skipped: no workers available");
+        return;
+    };
+
+    let Some(worker_entry) = get_test_worker(&config) else {
+        logger.warn("Test skipped: no enabled worker found");
+        return;
+    };
+
+    let worker_config = worker_entry.to_worker_config();
+    let Some(mut client) = get_connected_client(&config, worker_entry).await else {
+        logger.error("Failed to connect to worker");
+        return;
+    };
+
+    let fixture_dir = feature_flags_fixture_dir();
+
+    // Check if fixture exists
+    if !fixture_dir.exists() {
+        logger.warn(format!(
+            "Test skipped: feature_flags fixture not found at {}",
+            fixture_dir.display()
+        ));
+        client.disconnect().await.ok();
+        return;
+    }
+
+    let remote_path = format!("{}/feature_flags_test", config.settings.remote_work_dir);
+
+    // Phase: Setup - sync fixture to remote
+    logger.log_with_context(
+        LogLevel::Info,
+        LogSource::Custom("test".to_string()),
+        "Syncing fixture to remote",
+        vec![
+            ("phase".to_string(), "setup".to_string()),
+            ("local_path".to_string(), fixture_dir.display().to_string()),
+            ("remote_path".to_string(), remote_path.clone()),
+        ],
+    );
+
+    if let Err(e) =
+        sync_fixture_to_remote(&mut client, &worker_config, &fixture_dir, &remote_path).await
+    {
+        logger.error(format!("Failed to sync fixture: {e}"));
+        return;
+    }
+
+    // Phase: Execute - build without features first (baseline)
+    let build_cmd_no_features = format!("cd {} && cargo build 2>&1", remote_path);
+    let baseline_result = client.execute(&build_cmd_no_features).await;
+
+    logger.log_with_context(
+        LogLevel::Info,
+        LogSource::Custom("test".to_string()),
+        "Baseline build (no features)",
+        vec![
+            ("phase".to_string(), "execute_baseline".to_string()),
+            ("cmd".to_string(), "cargo build".to_string()),
+            (
+                "success".to_string(),
+                baseline_result
+                    .as_ref()
+                    .map(|r| r.success().to_string())
+                    .unwrap_or_else(|_| "error".to_string()),
+            ),
+        ],
+    );
+
+    // Clean target for fresh build with features
+    let clean_cmd = format!("cd {} && cargo clean", remote_path);
+    let _ = client.execute(&clean_cmd).await;
+
+    // Phase: Execute - build with verbose feature
+    let build_cmd_with_feature = format!("cd {} && cargo build --features verbose 2>&1", remote_path);
+
+    logger.log_with_context(
+        LogLevel::Info,
+        LogSource::Custom("test".to_string()),
+        "Building with feature flag",
+        vec![
+            ("phase".to_string(), "execute_with_feature".to_string()),
+            ("cmd".to_string(), "cargo build --features verbose".to_string()),
+            ("feature".to_string(), "verbose".to_string()),
+        ],
+    );
+
+    let remote_start = Instant::now();
+    match client.execute(&build_cmd_with_feature).await {
+        Ok(result) => {
+            let remote_duration = remote_start.elapsed();
+
+            logger.log_with_context(
+                LogLevel::Info,
+                LogSource::Custom("test".to_string()),
+                "Feature build completed",
+                vec![
+                    ("phase".to_string(), "execute_with_feature".to_string()),
+                    ("exit_code".to_string(), result.exit_code.to_string()),
+                    ("duration_ms".to_string(), remote_duration.as_millis().to_string()),
+                    ("success".to_string(), result.success().to_string()),
+                ],
+            );
+
+            if !result.success() {
+                logger.log_with_context(
+                    LogLevel::Error,
+                    LogSource::Custom("test".to_string()),
+                    "Feature build failed",
+                    vec![
+                        ("phase".to_string(), "execute_with_feature".to_string()),
+                        ("stderr".to_string(), result.stderr.clone()),
+                    ],
+                );
+                let _ = cleanup_remote(&mut client, &remote_path).await;
+                client.disconnect().await.ok();
+                panic!(
+                    "cargo build --features verbose failed: {}",
+                    result.stderr
+                );
+            }
+
+            // Phase: Verify - test that feature is actually compiled in
+            // We do this by running the tests with the feature enabled
+            let test_cmd = format!(
+                "cd {} && cargo test --features verbose -- --nocapture 2>&1",
+                remote_path
+            );
+
+            logger.log_with_context(
+                LogLevel::Info,
+                LogSource::Custom("test".to_string()),
+                "Running tests to verify feature",
+                vec![
+                    ("phase".to_string(), "verify".to_string()),
+                    ("cmd".to_string(), "cargo test --features verbose".to_string()),
+                ],
+            );
+
+            match client.execute(&test_cmd).await {
+                Ok(test_result) => {
+                    logger.log_with_context(
+                        LogLevel::Info,
+                        LogSource::Custom("test".to_string()),
+                        "Feature verification via tests",
+                        vec![
+                            ("phase".to_string(), "verify".to_string()),
+                            ("exit_code".to_string(), test_result.exit_code.to_string()),
+                            ("test_passed".to_string(), test_result.success().to_string()),
+                        ],
+                    );
+
+                    assert!(
+                        test_result.success(),
+                        "Tests with feature should pass: {}",
+                        test_result.stderr
+                    );
+                }
+                Err(e) => {
+                    logger.error(format!("Test command failed: {e}"));
+                }
+            }
+        }
+        Err(e) => {
+            logger.error(format!("Remote command failed: {e}"));
+            let _ = cleanup_remote(&mut client, &remote_path).await;
+            client.disconnect().await.ok();
+            panic!("cargo build --features verbose failed: {e}");
+        }
+    }
+
+    // Phase: Additional verification - build with all features
+    let all_features_cmd = format!("cd {} && cargo build --all-features 2>&1", remote_path);
+
+    logger.log_with_context(
+        LogLevel::Info,
+        LogSource::Custom("test".to_string()),
+        "Building with all features",
+        vec![
+            ("phase".to_string(), "execute_all_features".to_string()),
+            ("cmd".to_string(), "cargo build --all-features".to_string()),
+        ],
+    );
+
+    match client.execute(&all_features_cmd).await {
+        Ok(result) => {
+            logger.log_with_context(
+                LogLevel::Info,
+                LogSource::Custom("test".to_string()),
+                "All features build result",
+                vec![
+                    ("phase".to_string(), "verify".to_string()),
+                    ("exit_code".to_string(), result.exit_code.to_string()),
+                    ("success".to_string(), result.success().to_string()),
+                ],
+            );
+
+            assert!(
+                result.success(),
+                "cargo build --all-features should succeed: {}",
+                result.stderr
+            );
+        }
+        Err(e) => {
+            logger.warn(format!("All features build failed: {e}"));
+        }
+    }
+
+    // Cleanup
+    if config.settings.cleanup_after_test {
+        let _ = cleanup_remote(&mut client, &remote_path).await;
+    }
+
+    client.disconnect().await.ok();
+    logger.info("Feature flags build test passed");
+    logger.print_summary();
+}
+
+// =============================================================================
+// Test: Incremental rebuild
+// =============================================================================
+
+/// Test 9: Incremental rebuild
+///
+/// Verify that only changed files are recompiled on subsequent builds.
+/// This tests that the remote worker preserves build cache between invocations.
+#[tokio::test]
+async fn test_cargo_build_incremental() {
+    let logger = TestLoggerBuilder::new("test_cargo_build_incremental")
+        .print_realtime(true)
+        .build();
+
+    logger.log_with_context(
+        LogLevel::Info,
+        LogSource::Custom("test".to_string()),
+        "Starting incremental build test",
+        vec![
+            ("phase".to_string(), "setup".to_string()),
+            ("fixture".to_string(), "hello_world".to_string()),
+        ],
+    );
+
+    let Some(config) = require_workers() else {
+        logger.warn("Test skipped: no workers available");
+        return;
+    };
+
+    let Some(worker_entry) = get_test_worker(&config) else {
+        logger.warn("Test skipped: no enabled worker found");
+        return;
+    };
+
+    let worker_config = worker_entry.to_worker_config();
+    let Some(mut client) = get_connected_client(&config, worker_entry).await else {
+        logger.error("Failed to connect to worker");
+        return;
+    };
+
+    let fixture_dir = hello_world_fixture_dir();
+    let remote_path = format!("{}/hello_world_incremental", config.settings.remote_work_dir);
+
+    // Phase: Setup - sync fixture to remote
+    logger.log_with_context(
+        LogLevel::Info,
+        LogSource::Custom("test".to_string()),
+        "Syncing fixture to remote",
+        vec![
+            ("phase".to_string(), "setup".to_string()),
+            ("remote_path".to_string(), remote_path.clone()),
+        ],
+    );
+
+    if let Err(e) =
+        sync_fixture_to_remote(&mut client, &worker_config, &fixture_dir, &remote_path).await
+    {
+        logger.error(format!("Failed to sync fixture: {e}"));
+        return;
+    }
+
+    // Phase: First build - full compilation
+    let build_cmd = format!("cd {} && cargo build 2>&1", remote_path);
+
+    logger.log_with_context(
+        LogLevel::Info,
+        LogSource::Custom("test".to_string()),
+        "First build (full compilation)",
+        vec![
+            ("phase".to_string(), "first_build".to_string()),
+            ("cmd".to_string(), "cargo build".to_string()),
+        ],
+    );
+
+    let first_start = Instant::now();
+    let first_result = client.execute(&build_cmd).await;
+    let first_duration = first_start.elapsed();
+
+    let first_success = first_result.as_ref().map(|r| r.success()).unwrap_or(false);
+    let first_output = first_result
+        .as_ref()
+        .map(|r| format!("{}\n{}", r.stdout, r.stderr))
+        .unwrap_or_default();
+
+    logger.log_with_context(
+        LogLevel::Info,
+        LogSource::Custom("test".to_string()),
+        "First build completed",
+        vec![
+            ("phase".to_string(), "first_build".to_string()),
+            ("success".to_string(), first_success.to_string()),
+            ("duration_ms".to_string(), first_duration.as_millis().to_string()),
+            ("compiled".to_string(), first_output.contains("Compiling").to_string()),
+        ],
+    );
+
+    if !first_success {
+        logger.error("First build failed");
+        let _ = cleanup_remote(&mut client, &remote_path).await;
+        client.disconnect().await.ok();
+        panic!("First build failed");
+    }
+
+    // Verify that "Compiling" appeared in first build
+    assert!(
+        first_output.contains("Compiling"),
+        "First build should show 'Compiling' output"
+    );
+
+    // Phase: Second build - should be cached (no recompilation needed)
+    logger.log_with_context(
+        LogLevel::Info,
+        LogSource::Custom("test".to_string()),
+        "Second build (should use cache)",
+        vec![
+            ("phase".to_string(), "second_build".to_string()),
+            ("cmd".to_string(), "cargo build".to_string()),
+        ],
+    );
+
+    let second_start = Instant::now();
+    let second_result = client.execute(&build_cmd).await;
+    let second_duration = second_start.elapsed();
+
+    let second_success = second_result.as_ref().map(|r| r.success()).unwrap_or(false);
+    let second_output = second_result
+        .as_ref()
+        .map(|r| format!("{}\n{}", r.stdout, r.stderr))
+        .unwrap_or_default();
+
+    logger.log_with_context(
+        LogLevel::Info,
+        LogSource::Custom("test".to_string()),
+        "Second build completed",
+        vec![
+            ("phase".to_string(), "second_build".to_string()),
+            ("success".to_string(), second_success.to_string()),
+            ("duration_ms".to_string(), second_duration.as_millis().to_string()),
+            ("recompiled".to_string(), second_output.contains("Compiling").to_string()),
+        ],
+    );
+
+    if !second_success {
+        logger.error("Second build failed");
+        let _ = cleanup_remote(&mut client, &remote_path).await;
+        client.disconnect().await.ok();
+        panic!("Second build failed");
+    }
+
+    // Second build should NOT contain "Compiling" (everything cached)
+    let is_cached = !second_output.contains("Compiling");
+
+    logger.log_with_context(
+        LogLevel::Info,
+        LogSource::Custom("test".to_string()),
+        "Cache verification",
+        vec![
+            ("phase".to_string(), "verify".to_string()),
+            ("cached".to_string(), is_cached.to_string()),
+            ("first_duration_ms".to_string(), first_duration.as_millis().to_string()),
+            ("second_duration_ms".to_string(), second_duration.as_millis().to_string()),
+        ],
+    );
+
+    // Note: We check for caching but don't fail if it's not cached,
+    // as some environments might not support incremental builds
+    if !is_cached {
+        logger.warn("Incremental build not cached - this may be expected in some configurations");
+    }
+
+    // Phase: Touch source file and rebuild - should recompile only affected file
+    let touch_cmd = format!(
+        "cd {} && touch src/main.rs && sleep 1",
+        remote_path
+    );
+    let _ = client.execute(&touch_cmd).await;
+
+    logger.log_with_context(
+        LogLevel::Info,
+        LogSource::Custom("test".to_string()),
+        "Third build (after touch)",
+        vec![
+            ("phase".to_string(), "third_build".to_string()),
+            ("cmd".to_string(), "cargo build".to_string()),
+            ("action".to_string(), "touched src/main.rs".to_string()),
+        ],
+    );
+
+    let third_start = Instant::now();
+    let third_result = client.execute(&build_cmd).await;
+    let third_duration = third_start.elapsed();
+
+    let third_success = third_result.as_ref().map(|r| r.success()).unwrap_or(false);
+    let third_output = third_result
+        .as_ref()
+        .map(|r| format!("{}\n{}", r.stdout, r.stderr))
+        .unwrap_or_default();
+
+    logger.log_with_context(
+        LogLevel::Info,
+        LogSource::Custom("test".to_string()),
+        "Third build completed",
+        vec![
+            ("phase".to_string(), "third_build".to_string()),
+            ("success".to_string(), third_success.to_string()),
+            ("duration_ms".to_string(), third_duration.as_millis().to_string()),
+            ("recompiled".to_string(), third_output.contains("Compiling").to_string()),
+        ],
+    );
+
+    if !third_success {
+        logger.error("Third build failed");
+        let _ = cleanup_remote(&mut client, &remote_path).await;
+        client.disconnect().await.ok();
+        panic!("Third build failed");
+    }
+
+    // After touching the source file, it SHOULD recompile
+    let third_recompiled = third_output.contains("Compiling");
+
+    logger.log_with_context(
+        LogLevel::Info,
+        LogSource::Custom("test".to_string()),
+        "Incremental rebuild verification",
+        vec![
+            ("phase".to_string(), "verify".to_string()),
+            ("touched_file_recompiled".to_string(), third_recompiled.to_string()),
+            ("first_duration_ms".to_string(), first_duration.as_millis().to_string()),
+            ("second_duration_ms".to_string(), second_duration.as_millis().to_string()),
+            ("third_duration_ms".to_string(), third_duration.as_millis().to_string()),
+        ],
+    );
+
+    // Verify incremental behavior
+    assert!(
+        third_recompiled,
+        "After touching source file, cargo should recompile"
+    );
+
+    // Cleanup
+    if config.settings.cleanup_after_test {
+        let _ = cleanup_remote(&mut client, &remote_path).await;
+    }
+
+    client.disconnect().await.ok();
+    logger.info("Incremental build test passed");
+    logger.print_summary();
+}

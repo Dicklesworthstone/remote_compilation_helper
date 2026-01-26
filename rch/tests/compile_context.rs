@@ -32,13 +32,7 @@ const ANSI_ESC: &str = "\x1b[";
 const MAX_COMPILATION_HOOK_TIME_MS: u64 = 5;
 
 /// RCH-specific rich output patterns that must NEVER appear in stdout.
-const RCH_RICH_PATTERNS: &[&str] = &[
-    "[rch]",
-    "[RCH]",
-    "╔═",
-    "║",
-    "╚═",
-];
+const RCH_RICH_PATTERNS: &[&str] = &["[rch]", "[RCH]", "╔═", "║", "╚═"];
 
 /// Get the path to the rch binary.
 fn rch_binary() -> String {

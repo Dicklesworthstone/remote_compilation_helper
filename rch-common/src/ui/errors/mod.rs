@@ -1,7 +1,7 @@
 //! Specialized error display components for RCH.
 //!
 //! This module provides error display components specialized for different
-//! error categories. Each component builds on [`ErrorPanel`] but adds
+//! error categories. Each component builds on [`super::ErrorPanel`] but adds
 //! domain-specific context extraction and formatting.
 //!
 //! # Components

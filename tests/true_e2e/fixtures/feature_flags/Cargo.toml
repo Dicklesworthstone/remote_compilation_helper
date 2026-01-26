@@ -1,0 +1,25 @@
+[package]
+name = "feature_flags"
+version = "0.1.0"
+edition = "2024"
+
+# RCH E2E Test Fixture - Feature Flags Testing
+#
+# This fixture is used to test that feature flags are correctly
+# passed to remote compilation workers.
+#
+# Test commands:
+#   - cargo build                      # Builds with no features
+#   - cargo build --features verbose   # Enables verbose feature
+#   - cargo build --features extra     # Enables extra feature
+#   - cargo build --all-features       # Enables all features
+
+[features]
+default = []
+verbose = []
+extra = ["dep:log"]
+
+[dependencies]
+log = { version = "0.4", optional = true }
+
+[workspace]

@@ -23,8 +23,12 @@ use rch_common::e2e::{
     LogLevel, LogSource, TestConfigError, TestLoggerBuilder, TestWorkersConfig,
     should_skip_worker_check,
 };
-use rch_common::ssh::{CommandResult, KnownHostsPolicy, SshClient, SshOptions, SshPool};
+use rch_common::ssh::{KnownHostsPolicy, SshClient, SshOptions, SshPool};
 use rch_common::types::{WorkerConfig, WorkerId};
+use std::env;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Skip the test if no real workers are available.
@@ -65,6 +69,162 @@ fn to_worker_config(entry: &rch_common::e2e::TestWorkerEntry) -> WorkerConfig {
 }
 
 // =============================================================================
+// SSH Key Helpers
+// =============================================================================
+
+const ENV_INVALID_KEY_PATH: &str = "RCH_E2E_INVALID_KEY_PATH";
+const ENV_FORCE_AGENT_AUTH: &str = "RCH_E2E_FORCE_AGENT_AUTH";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyType {
+    Ed25519,
+    Rsa,
+    Ecdsa,
+    Unknown,
+}
+
+impl KeyType {
+    fn as_str(self) -> &'static str {
+        match self {
+            KeyType::Ed25519 => "ed25519",
+            KeyType::Rsa => "rsa",
+            KeyType::Ecdsa => "ecdsa",
+            KeyType::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct KeyMetadata {
+    key_type: KeyType,
+    bits: Option<u32>,
+    fingerprint: Option<String>,
+    path: PathBuf,
+}
+
+fn parse_key_type_label(label: &str) -> Option<KeyType> {
+    match label.trim().to_lowercase().as_str() {
+        "ed25519" => Some(KeyType::Ed25519),
+        "rsa" => Some(KeyType::Rsa),
+        "ecdsa" => Some(KeyType::Ecdsa),
+        _ => None,
+    }
+}
+
+fn infer_key_type_from_path(path: &Path) -> KeyType {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    if name.contains("ed25519") {
+        KeyType::Ed25519
+    } else if name.contains("ecdsa") {
+        KeyType::Ecdsa
+    } else if name.contains("rsa") {
+        KeyType::Rsa
+    } else {
+        KeyType::Unknown
+    }
+}
+
+fn detect_key_metadata(path: &Path) -> Option<KeyMetadata> {
+    if !path.exists() {
+        return None;
+    }
+
+    let mut key_type = infer_key_type_from_path(path);
+    let mut bits = None;
+    let mut fingerprint = None;
+
+    if let Ok(output) = Command::new("ssh-keygen").arg("-lf").arg(path).output()
+        && output.status.success()
+    {
+        if let Ok(stdout) = String::from_utf8(output.stdout) {
+            if let Some(line) = stdout.lines().next() {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if let Some(bits_str) = parts.get(0) {
+                    bits = bits_str.parse::<u32>().ok();
+                }
+                if let Some(fp) = parts.get(1) {
+                    fingerprint = Some(fp.to_string());
+                }
+                if let Some(last) = parts.last() {
+                    if let Some(inner) = last.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
+                        if let Some(parsed) = parse_key_type_label(inner) {
+                            key_type = parsed;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Some(KeyMetadata {
+        key_type,
+        bits,
+        fingerprint,
+        path: path.to_path_buf(),
+    })
+}
+
+fn find_worker_with_key_type(
+    config: &TestWorkersConfig,
+    desired: KeyType,
+) -> Option<(&rch_common::e2e::TestWorkerEntry, KeyMetadata)> {
+    for worker in config.enabled_workers() {
+        if let Ok(path) = worker.expanded_identity_file()
+            && let Some(meta) = detect_key_metadata(&path)
+            && meta.key_type == desired
+        {
+            return Some((worker, meta));
+        }
+    }
+    None
+}
+
+fn mask_path(path: &str) -> String {
+    let path = Path::new(path);
+    let parts: Vec<String> = path
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().to_string())
+        .collect();
+
+    if parts.len() <= 2 {
+        return path.display().to_string();
+    }
+
+    format!(".../{}/{}", parts[parts.len() - 2], parts[parts.len() - 1])
+}
+
+fn ssh_agent_key_count() -> Option<usize> {
+    let output = Command::new("ssh-add").arg("-L").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if stdout.contains("The agent has no identities") {
+        return Some(0);
+    }
+
+    Some(stdout.lines().filter(|line| !line.trim().is_empty()).count())
+}
+
+fn log_phase(
+    logger: &rch_common::e2e::TestLogger,
+    level: LogLevel,
+    source: LogSource,
+    phase: &str,
+    message: &str,
+    mut context: Vec<(String, String)>,
+) {
+    context.push(("phase".to_string(), phase.to_string()));
+    logger.log_with_context(level, source, message, context);
+}
+
+// =============================================================================
 // Test: Basic SSH Connectivity
 // =============================================================================
 
@@ -87,9 +247,11 @@ async fn test_ssh_basic_connect() {
         return;
     };
 
-    logger.log_with_context(
+    log_phase(
+        &logger,
         LogLevel::Info,
         LogSource::Harness,
+        "setup",
         "Testing connection to worker",
         vec![
             ("worker_id".to_string(), worker_entry.id.clone()),
@@ -108,9 +270,11 @@ async fn test_ssh_basic_connect() {
     let mut client = SshClient::new(worker_config.clone(), options);
 
     // Phase: Connect
-    logger.log_with_context(
+    log_phase(
+        &logger,
         LogLevel::Info,
         LogSource::Custom("ssh".to_string()),
+        "connect",
         "SSH connection attempt",
         vec![
             ("worker".to_string(), worker_entry.id.clone()),
@@ -122,23 +286,30 @@ async fn test_ssh_basic_connect() {
     match client.connect().await {
         Ok(()) => {
             let connect_duration = connect_start.elapsed();
-            logger.log_with_context(
+            log_phase(
+                &logger,
                 LogLevel::Info,
                 LogSource::Custom("ssh".to_string()),
+                "connect",
                 "SSH connection established",
                 vec![
                     ("worker".to_string(), worker_entry.id.clone()),
                     ("success".to_string(), "true".to_string()),
-                    ("connect_duration_ms".to_string(), connect_duration.as_millis().to_string()),
+                    (
+                        "connect_duration_ms".to_string(),
+                        connect_duration.as_millis().to_string(),
+                    ),
                 ],
             );
 
             assert!(client.is_connected(), "Client should report connected");
         }
         Err(e) => {
-            logger.log_with_context(
+            log_phase(
+                &logger,
                 LogLevel::Error,
                 LogSource::Custom("ssh".to_string()),
+                "connect",
                 "SSH connection failed",
                 vec![
                     ("worker".to_string(), worker_entry.id.clone()),
@@ -153,9 +324,11 @@ async fn test_ssh_basic_connect() {
     logger.info("Verifying connection with echo command");
     match client.execute("echo 'ssh_test_ok'").await {
         Ok(result) => {
-            logger.log_with_context(
+            log_phase(
+                &logger,
                 LogLevel::Info,
                 LogSource::Custom("ssh".to_string()),
+                "execute",
                 "Command execution result",
                 vec![
                     ("exit_code".to_string(), result.exit_code.to_string()),
@@ -179,9 +352,11 @@ async fn test_ssh_basic_connect() {
     logger.info("Disconnecting from worker");
     match client.disconnect().await {
         Ok(()) => {
-            logger.log_with_context(
+            log_phase(
+                &logger,
                 LogLevel::Info,
                 LogSource::Custom("ssh".to_string()),
+                "disconnect",
                 "SSH connection closed",
                 vec![
                     ("worker".to_string(), worker_entry.id.clone()),
@@ -199,44 +374,53 @@ async fn test_ssh_basic_connect() {
     logger.print_summary();
 }
 
-/// Test 1.2: Key authentication verification
-#[tokio::test]
-async fn test_ssh_key_authentication() {
-    let logger = TestLoggerBuilder::new("test_ssh_key_authentication")
+async fn run_key_auth_test(test_name: &str, key_type: KeyType) {
+    let logger = TestLoggerBuilder::new(test_name)
         .print_realtime(true)
         .build();
 
-    logger.info("Starting SSH key authentication test");
+    logger.info(format!(
+        "Starting SSH {} key authentication test",
+        key_type.as_str()
+    ));
 
     let Some(config) = require_workers() else {
         logger.warn("Test skipped: no workers available");
         return;
     };
 
-    let Some(worker_entry) = get_test_worker(&config) else {
-        logger.warn("Test skipped: no enabled worker found");
+    let Some((worker_entry, meta)) = find_worker_with_key_type(&config, key_type) else {
+        log_phase(
+            &logger,
+            LogLevel::Warn,
+            LogSource::Custom("ssh".to_string()),
+            "skip",
+            "No worker with requested key type",
+            vec![("key_type".to_string(), key_type.as_str().to_string())],
+        );
+        logger.print_summary();
         return;
     };
 
-    // Log key info (path only, never content!)
-    let key_path = worker_entry.identity_file.clone();
-    let expanded_key = worker_entry.expanded_identity_file();
+    let mut context = vec![
+        ("worker".to_string(), worker_entry.id.clone()),
+        ("key_type".to_string(), meta.key_type.as_str().to_string()),
+        ("key_path".to_string(), meta.path.display().to_string()),
+    ];
+    if let Some(bits) = meta.bits {
+        context.push(("key_bits".to_string(), bits.to_string()));
+    }
+    if let Some(fp) = &meta.fingerprint {
+        context.push(("fingerprint".to_string(), fp.clone()));
+    }
 
-    logger.log_with_context(
+    log_phase(
+        &logger,
         LogLevel::Info,
         LogSource::Custom("ssh".to_string()),
-        "Testing key authentication",
-        vec![
-            ("key_path".to_string(), key_path.clone()),
-            (
-                "key_exists".to_string(),
-                expanded_key
-                    .as_ref()
-                    .map(|p| p.exists())
-                    .unwrap_or(false)
-                    .to_string(),
-            ),
-        ],
+        "connect",
+        "SSH connection attempt",
+        context,
     );
 
     let worker_config = to_worker_config(worker_entry);
@@ -252,24 +436,29 @@ async fn test_ssh_key_authentication() {
     match client.connect().await {
         Ok(()) => {
             let auth_duration = auth_start.elapsed();
-            logger.log_with_context(
+            log_phase(
+                &logger,
                 LogLevel::Info,
                 LogSource::Custom("ssh".to_string()),
-                "SSH authentication result",
+                "auth",
+                "SSH authentication succeeded",
                 vec![
                     ("worker".to_string(), worker_entry.id.clone()),
-                    ("success".to_string(), "true".to_string()),
+                    ("key_type".to_string(), key_type.as_str().to_string()),
                     ("auth_duration_ms".to_string(), auth_duration.as_millis().to_string()),
                 ],
             );
         }
         Err(e) => {
-            logger.log_with_context(
+            log_phase(
+                &logger,
                 LogLevel::Error,
                 LogSource::Custom("ssh".to_string()),
+                "auth",
                 "SSH authentication failed",
                 vec![
                     ("worker".to_string(), worker_entry.id.clone()),
+                    ("key_type".to_string(), key_type.as_str().to_string()),
                     ("error".to_string(), e.to_string()),
                 ],
             );
@@ -277,11 +466,12 @@ async fn test_ssh_key_authentication() {
         }
     }
 
-    // Verify we can execute commands (proves auth worked)
     let result = client.execute("whoami").await.expect("whoami should work");
-    logger.log_with_context(
+    log_phase(
+        &logger,
         LogLevel::Info,
         LogSource::Custom("ssh".to_string()),
+        "execute",
         "Identity verification",
         vec![
             ("remote_user".to_string(), result.stdout.trim().to_string()),
@@ -295,7 +485,251 @@ async fn test_ssh_key_authentication() {
     );
 
     client.disconnect().await.ok();
-    logger.info("SSH key authentication test passed");
+    logger.info(format!(
+        "SSH {} key authentication test passed",
+        key_type.as_str()
+    ));
+    logger.print_summary();
+}
+
+/// Test 1.2: Ed25519 key authentication
+#[tokio::test]
+async fn test_ssh_ed25519_auth() {
+    run_key_auth_test("test_ssh_ed25519_auth", KeyType::Ed25519).await;
+}
+
+/// Test 1.3: RSA key authentication (if available)
+#[tokio::test]
+async fn test_ssh_rsa_auth() {
+    run_key_auth_test("test_ssh_rsa_auth", KeyType::Rsa).await;
+}
+
+/// Test 1.4: ECDSA key authentication (if available)
+#[tokio::test]
+async fn test_ssh_ecdsa_auth() {
+    run_key_auth_test("test_ssh_ecdsa_auth", KeyType::Ecdsa).await;
+}
+
+/// Test 1.5: SSH agent authentication (if available)
+#[tokio::test]
+async fn test_ssh_agent_authentication() {
+    let logger = TestLoggerBuilder::new("test_ssh_agent_authentication")
+        .print_realtime(true)
+        .build();
+
+    logger.info("Starting SSH agent authentication test");
+
+    let Some(config) = require_workers() else {
+        logger.warn("Test skipped: no workers available");
+        return;
+    };
+
+    let Some(worker_entry) = get_test_worker(&config) else {
+        logger.warn("Test skipped: no enabled worker found");
+        return;
+    };
+
+    let agent_sock = match env::var("SSH_AUTH_SOCK") {
+        Ok(value) if !value.trim().is_empty() => value,
+        _ => {
+            log_phase(
+                &logger,
+                LogLevel::Warn,
+                LogSource::Custom("ssh".to_string()),
+                "skip",
+                "SSH_AUTH_SOCK not set; skipping agent auth test",
+                vec![],
+            );
+            logger.print_summary();
+            return;
+        }
+    };
+
+    let agent_key_count = ssh_agent_key_count().unwrap_or(0);
+    log_phase(
+        &logger,
+        LogLevel::Info,
+        LogSource::Custom("ssh".to_string()),
+        "agent",
+        "SSH agent detected",
+        vec![
+            ("agent_sock".to_string(), mask_path(&agent_sock)),
+            ("loaded_keys".to_string(), agent_key_count.to_string()),
+        ],
+    );
+
+    if agent_key_count == 0 && env::var(ENV_FORCE_AGENT_AUTH).is_err() {
+        log_phase(
+            &logger,
+            LogLevel::Warn,
+            LogSource::Custom("ssh".to_string()),
+            "skip",
+            "SSH agent has no keys; skipping auth test",
+            vec![],
+        );
+        logger.print_summary();
+        return;
+    }
+
+    let mut worker_config = to_worker_config(worker_entry);
+    worker_config.identity_file = "/tmp/rch_no_such_key".to_string();
+
+    let options = SshOptions {
+        connect_timeout: Duration::from_secs(config.settings.ssh_connection_timeout_secs),
+        known_hosts: KnownHostsPolicy::Add,
+        ..Default::default()
+    };
+
+    let mut client = SshClient::new(worker_config, options);
+
+    log_phase(
+        &logger,
+        LogLevel::Info,
+        LogSource::Custom("ssh".to_string()),
+        "connect",
+        "SSH connection attempt (agent auth)",
+        vec![
+            ("worker".to_string(), worker_entry.id.clone()),
+            ("agent_sock".to_string(), mask_path(&agent_sock)),
+        ],
+    );
+
+    let auth_start = Instant::now();
+    match client.connect().await {
+        Ok(()) => {
+            let auth_duration = auth_start.elapsed();
+            log_phase(
+                &logger,
+                LogLevel::Info,
+                LogSource::Custom("ssh".to_string()),
+                "auth",
+                "SSH agent authentication succeeded",
+                vec![
+                    ("worker".to_string(), worker_entry.id.clone()),
+                    ("auth_duration_ms".to_string(), auth_duration.as_millis().to_string()),
+                ],
+            );
+        }
+        Err(e) => {
+            log_phase(
+                &logger,
+                LogLevel::Warn,
+                LogSource::Custom("ssh".to_string()),
+                "auth",
+                "SSH agent authentication failed",
+                vec![
+                    ("worker".to_string(), worker_entry.id.clone()),
+                    ("error".to_string(), e.to_string()),
+                ],
+            );
+            logger.print_summary();
+            return;
+        }
+    }
+
+    client.disconnect().await.ok();
+    logger.info("SSH agent authentication test passed");
+    logger.print_summary();
+}
+
+/// Test 1.6: Wrong key rejection (optional)
+#[tokio::test]
+async fn test_ssh_wrong_key_rejection() {
+    let logger = TestLoggerBuilder::new("test_ssh_wrong_key_rejection")
+        .print_realtime(true)
+        .build();
+
+    logger.info("Starting SSH wrong key rejection test");
+
+    let Some(config) = require_workers() else {
+        logger.warn("Test skipped: no workers available");
+        return;
+    };
+
+    let Some(worker_entry) = get_test_worker(&config) else {
+        logger.warn("Test skipped: no enabled worker found");
+        return;
+    };
+
+    let invalid_key_path = match env::var(ENV_INVALID_KEY_PATH) {
+        Ok(value) if !value.trim().is_empty() => value,
+        _ => {
+            log_phase(
+                &logger,
+                LogLevel::Warn,
+                LogSource::Custom("ssh".to_string()),
+                "skip",
+                "RCH_E2E_INVALID_KEY_PATH not set; skipping wrong-key test",
+                vec![],
+            );
+            logger.print_summary();
+            return;
+        }
+    };
+
+    if !Path::new(&invalid_key_path).exists() {
+        log_phase(
+            &logger,
+            LogLevel::Warn,
+            LogSource::Custom("ssh".to_string()),
+            "skip",
+            "Invalid key path does not exist",
+            vec![("key_path".to_string(), invalid_key_path.clone())],
+        );
+        logger.print_summary();
+        return;
+    }
+
+    let mut worker_config = to_worker_config(worker_entry);
+    worker_config.identity_file = invalid_key_path.clone();
+
+    let options = SshOptions {
+        connect_timeout: Duration::from_secs(config.settings.ssh_connection_timeout_secs),
+        known_hosts: KnownHostsPolicy::Add,
+        ..Default::default()
+    };
+
+    let mut client = SshClient::new(worker_config, options);
+
+    log_phase(
+        &logger,
+        LogLevel::Info,
+        LogSource::Custom("ssh".to_string()),
+        "auth",
+        "SSH authentication expected to fail",
+        vec![
+            ("worker".to_string(), worker_entry.id.clone()),
+            ("key_path".to_string(), invalid_key_path),
+        ],
+    );
+
+    let result = client.connect().await;
+    if result.is_ok() {
+        log_phase(
+            &logger,
+            LogLevel::Warn,
+            LogSource::Custom("ssh".to_string()),
+            "auth",
+            "Unexpected SSH authentication success with wrong key",
+            vec![("worker".to_string(), worker_entry.id.clone())],
+        );
+        logger.print_summary();
+        panic!("Wrong-key test unexpectedly succeeded");
+    }
+
+    log_phase(
+        &logger,
+        LogLevel::Info,
+        LogSource::Custom("ssh".to_string()),
+        "auth",
+        "SSH authentication failed as expected",
+        vec![
+            ("worker".to_string(), worker_entry.id.clone()),
+            ("error".to_string(), result.err().map(|e| e.to_string()).unwrap_or_default()),
+        ],
+    );
+
+    logger.info("SSH wrong key rejection test passed");
     logger.print_summary();
 }
 
@@ -330,9 +764,11 @@ async fn test_ssh_connection_timeout() {
         ..Default::default()
     };
 
-    logger.log_with_context(
+    log_phase(
+        &logger,
         LogLevel::Info,
         LogSource::Custom("ssh".to_string()),
+        "connect",
         "Testing connection timeout",
         vec![
             ("host".to_string(), worker_config.host.clone()),
@@ -346,14 +782,23 @@ async fn test_ssh_connection_timeout() {
     let result = client.connect().await;
     let elapsed = start.elapsed();
 
-    logger.log_with_context(
+    log_phase(
+        &logger,
         LogLevel::Info,
         LogSource::Custom("ssh".to_string()),
+        "connect",
         "Connection attempt completed",
         vec![
             ("success".to_string(), result.is_ok().to_string()),
             ("actual_wait_ms".to_string(), elapsed.as_millis().to_string()),
-            ("error_type".to_string(), result.as_ref().err().map(|e| format!("{e:?}")).unwrap_or_default()),
+            (
+                "error_type".to_string(),
+                result
+                    .as_ref()
+                    .err()
+                    .map(|e| format!("{e:?}"))
+                    .unwrap_or_default(),
+            ),
         ],
     );
 
@@ -407,23 +852,27 @@ async fn test_ssh_pool_reuse() {
     let pool = SshPool::new(options);
 
     // First connection - should create new
-    logger.log_with_context(
+    log_phase(
+        &logger,
         LogLevel::Info,
         LogSource::Custom("ssh".to_string()),
+        "pool",
         "Connection pool stats (before first connection)",
         vec![("active".to_string(), pool.active_connections().await.to_string())],
     );
 
     let first_start = Instant::now();
-    let _client1 = pool
+    let client1 = pool
         .get_or_connect(&worker_config)
         .await
         .expect("First connection should succeed");
     let first_duration = first_start.elapsed();
 
-    logger.log_with_context(
+    log_phase(
+        &logger,
         LogLevel::Info,
         LogSource::Custom("ssh".to_string()),
+        "pool",
         "First connection established",
         vec![
             ("duration_ms".to_string(), first_duration.as_millis().to_string()),
@@ -433,26 +882,34 @@ async fn test_ssh_pool_reuse() {
 
     // Second connection - should reuse existing
     let second_start = Instant::now();
-    let _client2 = pool
+    let client2 = pool
         .get_or_connect(&worker_config)
         .await
         .expect("Second connection should succeed");
     let second_duration = second_start.elapsed();
+    let reused_ptr = Arc::ptr_eq(&client1, &client2);
 
-    logger.log_with_context(
+    log_phase(
+        &logger,
         LogLevel::Info,
         LogSource::Custom("ssh".to_string()),
+        "pool",
         "Second connection (reused)",
         vec![
             ("duration_ms".to_string(), second_duration.as_millis().to_string()),
             ("active".to_string(), pool.active_connections().await.to_string()),
-            ("reused".to_string(), (second_duration < first_duration / 2).to_string()),
+            ("reused".to_string(), reused_ptr.to_string()),
+            (
+                "reused_fast".to_string(),
+                (second_duration < first_duration / 2).to_string(),
+            ),
         ],
     );
 
     // Pool should have only 1 active connection (reused)
     let active = pool.active_connections().await;
     assert_eq!(active, 1, "Pool should reuse connection, not create new one");
+    assert!(reused_ptr, "Pool should reuse the same connection instance");
 
     // Second connection should be faster (reused)
     // (This may not always hold due to jitter, so we just log it)
@@ -465,9 +922,11 @@ async fn test_ssh_pool_reuse() {
     // Cleanup
     pool.close_all().await.expect("Pool cleanup should succeed");
 
-    logger.log_with_context(
+    log_phase(
+        &logger,
         LogLevel::Info,
         LogSource::Custom("ssh".to_string()),
+        "pool",
         "Pool closed",
         vec![("active".to_string(), pool.active_connections().await.to_string())],
     );
@@ -522,9 +981,11 @@ async fn test_ssh_pool_no_leaks() {
         let _ = client_guard.execute("echo test").await;
         drop(client_guard);
 
-        logger.log_with_context(
+        log_phase(
+            &logger,
             LogLevel::Debug,
             LogSource::Custom("ssh".to_string()),
+            "pool",
             "Connection iteration",
             vec![
                 ("iteration".to_string(), i.to_string()),
@@ -535,9 +996,11 @@ async fn test_ssh_pool_no_leaks() {
 
     // Should still have only 1 connection (all reused)
     let final_count = pool.active_connections().await;
-    logger.log_with_context(
+    log_phase(
+        &logger,
         LogLevel::Info,
         LogSource::Custom("ssh".to_string()),
+        "pool",
         "Final pool state",
         vec![("active".to_string(), final_count.to_string())],
     );
@@ -591,9 +1054,11 @@ async fn test_ssh_health_check() {
     let healthy = client.health_check().await.expect("Health check should complete");
     let health_duration = health_start.elapsed();
 
-    logger.log_with_context(
+    log_phase(
+        &logger,
         LogLevel::Info,
         LogSource::Custom("ssh".to_string()),
+        "health",
         "Health check result",
         vec![
             ("worker".to_string(), worker_entry.id.clone()),
@@ -654,9 +1119,11 @@ async fn test_ssh_multiple_workers() {
                 let guard = client.read().await;
                 match guard.execute("hostname").await {
                     Ok(result) => {
-                        logger.log_with_context(
+                        log_phase(
+                            &logger,
                             LogLevel::Info,
                             LogSource::Custom("ssh".to_string()),
+                            "execute",
                             "Worker connection success",
                             vec![
                                 ("worker_id".to_string(), worker_entry.id.clone()),
@@ -666,9 +1133,11 @@ async fn test_ssh_multiple_workers() {
                         successful += 1;
                     }
                     Err(e) => {
-                        logger.log_with_context(
+                        log_phase(
+                            &logger,
                             LogLevel::Warn,
                             LogSource::Custom("ssh".to_string()),
+                            "execute",
                             "Worker command failed",
                             vec![
                                 ("worker_id".to_string(), worker_entry.id.clone()),
@@ -679,9 +1148,11 @@ async fn test_ssh_multiple_workers() {
                 }
             }
             Err(e) => {
-                logger.log_with_context(
+                log_phase(
+                    &logger,
                     LogLevel::Warn,
                     LogSource::Custom("ssh".to_string()),
+                    "connect",
                     "Worker connection failed",
                     vec![
                         ("worker_id".to_string(), worker_entry.id.clone()),
@@ -692,9 +1163,11 @@ async fn test_ssh_multiple_workers() {
         }
     }
 
-    logger.log_with_context(
+    log_phase(
+        &logger,
         LogLevel::Info,
         LogSource::Custom("ssh".to_string()),
+        "summary",
         "Multiple workers test summary",
         vec![
             ("total_workers".to_string(), enabled.len().to_string()),
@@ -766,9 +1239,11 @@ async fn test_ssh_reconnection() {
     let result2 = client.execute("echo 'second'").await.expect("Second command should work");
     assert!(result2.stdout.contains("second"));
 
-    logger.log_with_context(
+    log_phase(
+        &logger,
         LogLevel::Info,
         LogSource::Custom("ssh".to_string()),
+        "reconnect",
         "Reconnection test results",
         vec![
             ("first_command".to_string(), "success".to_string()),

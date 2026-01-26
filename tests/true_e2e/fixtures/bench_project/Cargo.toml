@@ -1,0 +1,10 @@
+[package]
+name = "bench_project"
+version = "0.1.0"
+edition = "2024"
+
+# RCH E2E Test Fixture - Bench Project
+#
+# Used to verify `cargo bench` runs correctly on remote workers.
+
+[workspace]

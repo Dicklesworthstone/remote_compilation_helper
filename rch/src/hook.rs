@@ -1446,6 +1446,88 @@ mod tests {
     }
 
     #[test]
+    fn test_classification_bun_commands() {
+        // Bun compilation commands should be intercepted
+        let result = classify_command("bun test");
+        assert!(result.is_compilation);
+
+        let result = classify_command("bun typecheck");
+        assert!(result.is_compilation);
+
+        // Bun watch modes should NOT be intercepted
+        let result = classify_command("bun test --watch");
+        assert!(!result.is_compilation);
+
+        let result = classify_command("bun typecheck --watch");
+        assert!(!result.is_compilation);
+
+        // Bun package management should NOT be intercepted
+        let result = classify_command("bun install");
+        assert!(!result.is_compilation);
+
+        let result = classify_command("bun add react");
+        assert!(!result.is_compilation);
+
+        let result = classify_command("bun remove react");
+        assert!(!result.is_compilation);
+
+        let result = classify_command("bun link");
+        assert!(!result.is_compilation);
+
+        // Bun execution helpers should NOT be intercepted
+        let result = classify_command("bun run build");
+        assert!(!result.is_compilation);
+
+        let result = classify_command("bun build");
+        assert!(!result.is_compilation);
+
+        let result = classify_command("bun dev");
+        assert!(!result.is_compilation);
+
+        let result = classify_command("bun repl");
+        assert!(!result.is_compilation);
+
+        let result = classify_command("bun x vite build");
+        assert!(!result.is_compilation);
+
+        let result = classify_command("bunx vite build");
+        assert!(!result.is_compilation);
+    }
+
+    #[test]
+    fn test_classification_c_compilers_and_build_systems() {
+        let result = classify_command("gcc -O2 -o hello hello.c");
+        assert!(result.is_compilation);
+
+        let result = classify_command("g++ -std=c++20 -o hello hello.cpp");
+        assert!(result.is_compilation);
+
+        let result = classify_command("clang -o hello hello.c");
+        assert!(result.is_compilation);
+
+        let result = classify_command("clang++ -o hello hello.cpp");
+        assert!(result.is_compilation);
+
+        let result = classify_command("make");
+        assert!(result.is_compilation);
+
+        let result = classify_command("ninja -C build");
+        assert!(result.is_compilation);
+
+        let result = classify_command("cmake --build build");
+        assert!(result.is_compilation);
+    }
+
+    #[test]
+    fn test_classification_env_wrapped_commands() {
+        let result = classify_command("RUST_BACKTRACE=1 cargo test");
+        assert!(result.is_compilation);
+
+        let result = classify_command("RUST_TEST_THREADS=4 cargo test");
+        assert!(result.is_compilation);
+    }
+
+    #[test]
     fn test_classification_rejects_shell_metachars() {
         // Piped commands should not be intercepted
         let result = classify_command("cargo build | tee log.txt");
