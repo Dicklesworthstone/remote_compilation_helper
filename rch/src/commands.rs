@@ -145,6 +145,259 @@ pub struct WorkersCapabilitiesReport {
     pub warnings: Vec<String>,
 }
 
+fn runtime_label(runtime: &RequiredRuntime) -> &'static str {
+    match runtime {
+        RequiredRuntime::Rust => "rust",
+        RequiredRuntime::Bun => "bun",
+        RequiredRuntime::Node => "node",
+        RequiredRuntime::None => "none",
+    }
+}
+
+fn has_any_capabilities(capabilities: &WorkerCapabilities) -> bool {
+    capabilities.rustc_version.is_some()
+        || capabilities.bun_version.is_some()
+        || capabilities.node_version.is_some()
+        || capabilities.npm_version.is_some()
+}
+
+fn probe_local_capabilities() -> WorkerCapabilities {
+    fn run_version(cmd: &str, args: &[&str]) -> Option<String> {
+        let output = std::process::Command::new(cmd).args(args).output().ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let trimmed = stdout.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    }
+
+    let mut caps = WorkerCapabilities::new();
+    caps.rustc_version = run_version("rustc", &["--version"]);
+    caps.bun_version = run_version("bun", &["--version"]);
+    caps.node_version = run_version("node", &["--version"]);
+    caps.npm_version = run_version("npm", &["--version"]);
+    caps
+}
+
+fn extract_version_numbers(version: &str) -> Vec<u64> {
+    let mut numbers = Vec::new();
+    let mut current: Option<u64> = None;
+    for ch in version.chars() {
+        if let Some(digit) = ch.to_digit(10) {
+            let next = current
+                .unwrap_or(0)
+                .saturating_mul(10)
+                .saturating_add(digit as u64);
+            current = Some(next);
+        } else if let Some(value) = current.take() {
+            numbers.push(value);
+        }
+    }
+    if let Some(value) = current {
+        numbers.push(value);
+    }
+    numbers
+}
+
+fn major_version(version: &str) -> Option<u64> {
+    extract_version_numbers(version).into_iter().next()
+}
+
+fn major_minor_version(version: &str) -> Option<(u64, u64)> {
+    let numbers = extract_version_numbers(version);
+    if numbers.len() >= 2 {
+        Some((numbers[0], numbers[1]))
+    } else {
+        None
+    }
+}
+
+fn rust_version_mismatch(local: &str, remote: &str) -> bool {
+    match (major_minor_version(local), major_minor_version(remote)) {
+        (Some((lmaj, lmin)), Some((rmaj, rmin))) => lmaj != rmaj || lmin != rmin,
+        _ => false,
+    }
+}
+
+fn major_version_mismatch(local: &str, remote: &str) -> bool {
+    match (major_version(local), major_version(remote)) {
+        (Some(lmaj), Some(rmaj)) => lmaj != rmaj,
+        _ => false,
+    }
+}
+
+fn collect_local_capability_warnings(
+    workers: &[WorkerCapabilitiesFromApi],
+    local: &WorkerCapabilities,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+
+    if let Some(local_rust) = local.rustc_version.as_ref() {
+        let missing: Vec<String> = workers
+            .iter()
+            .filter(|worker| !worker.capabilities.has_rust())
+            .map(|worker| worker.id.clone())
+            .collect();
+        if !missing.is_empty() {
+            warnings.push(format!(
+                "Workers missing Rust runtime (local: {}): {}",
+                local_rust,
+                missing.join(", ")
+            ));
+        }
+
+        let mismatched: Vec<String> = workers
+            .iter()
+            .filter_map(|worker| {
+                let remote = worker.capabilities.rustc_version.as_ref()?;
+                if rust_version_mismatch(local_rust, remote) {
+                    Some(format!("{} ({})", worker.id, remote))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if !mismatched.is_empty() {
+            warnings.push(format!(
+                "Rust version mismatch vs local {}: {}",
+                local_rust,
+                mismatched.join(", ")
+            ));
+        }
+    }
+
+    if let Some(local_bun) = local.bun_version.as_ref() {
+        let missing: Vec<String> = workers
+            .iter()
+            .filter(|worker| !worker.capabilities.has_bun())
+            .map(|worker| worker.id.clone())
+            .collect();
+        if !missing.is_empty() {
+            warnings.push(format!(
+                "Workers missing Bun runtime (local: {}): {}",
+                local_bun,
+                missing.join(", ")
+            ));
+        }
+
+        let mismatched: Vec<String> = workers
+            .iter()
+            .filter_map(|worker| {
+                let remote = worker.capabilities.bun_version.as_ref()?;
+                if major_version_mismatch(local_bun, remote) {
+                    Some(format!("{} ({})", worker.id, remote))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if !mismatched.is_empty() {
+            warnings.push(format!(
+                "Bun major version mismatch vs local {}: {}",
+                local_bun,
+                mismatched.join(", ")
+            ));
+        }
+    }
+
+    if let Some(local_node) = local.node_version.as_ref() {
+        let missing: Vec<String> = workers
+            .iter()
+            .filter(|worker| !worker.capabilities.has_node())
+            .map(|worker| worker.id.clone())
+            .collect();
+        if !missing.is_empty() {
+            warnings.push(format!(
+                "Workers missing Node runtime (local: {}): {}",
+                local_node,
+                missing.join(", ")
+            ));
+        }
+
+        let mismatched: Vec<String> = workers
+            .iter()
+            .filter_map(|worker| {
+                let remote = worker.capabilities.node_version.as_ref()?;
+                if major_version_mismatch(local_node, remote) {
+                    Some(format!("{} ({})", worker.id, remote))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if !mismatched.is_empty() {
+            warnings.push(format!(
+                "Node major version mismatch vs local {}: {}",
+                local_node,
+                mismatched.join(", ")
+            ));
+        }
+    }
+
+    if let Some(local_npm) = local.npm_version.as_ref() {
+        let missing: Vec<String> = workers
+            .iter()
+            .filter(|worker| worker.capabilities.npm_version.is_none())
+            .map(|worker| worker.id.clone())
+            .collect();
+        if !missing.is_empty() {
+            warnings.push(format!(
+                "Workers missing npm runtime (local: {}): {}",
+                local_npm,
+                missing.join(", ")
+            ));
+        }
+
+        let mismatched: Vec<String> = workers
+            .iter()
+            .filter_map(|worker| {
+                let remote = worker.capabilities.npm_version.as_ref()?;
+                if major_version_mismatch(local_npm, remote) {
+                    Some(format!("{} ({})", worker.id, remote))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if !mismatched.is_empty() {
+            warnings.push(format!(
+                "npm major version mismatch vs local {}: {}",
+                local_npm,
+                mismatched.join(", ")
+            ));
+        }
+    }
+
+    warnings
+}
+
+fn summarize_capabilities(capabilities: &WorkerCapabilities) -> String {
+    let mut parts = Vec::new();
+    if let Some(rustc) = capabilities.rustc_version.as_ref() {
+        parts.push(format!("rustc {}", rustc));
+    }
+    if let Some(bun) = capabilities.bun_version.as_ref() {
+        parts.push(format!("bun {}", bun));
+    }
+    if let Some(node) = capabilities.node_version.as_ref() {
+        parts.push(format!("node {}", node));
+    }
+    if let Some(npm) = capabilities.npm_version.as_ref() {
+        parts.push(format!("npm {}", npm));
+    }
+
+    if parts.is_empty() {
+        "unknown".to_string()
+    } else {
+        parts.join(", ")
+    }
+}
+
 /// Daemon status response.
 #[derive(Debug, Clone, Serialize)]
 pub struct DaemonStatusResponse {
@@ -284,6 +537,10 @@ pub struct DiagnoseResponse {
     pub threshold: DiagnoseThreshold,
     pub daemon: DiagnoseDaemonStatus,
     pub required_runtime: RequiredRuntime,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_capabilities: Option<WorkerCapabilities>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub capabilities_warnings: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worker_selection: Option<DiagnoseWorkerSelection>,
 }
@@ -559,16 +816,11 @@ pub async fn workers_capabilities(
     let style = ctx.theme();
     let response = query_workers_capabilities(refresh).await?;
     let workers = response.workers;
+    let local_capabilities = probe_local_capabilities();
+    let local_has_any = has_any_capabilities(&local_capabilities);
 
     let mut warnings = Vec::new();
     let mut required_runtime = None;
-
-    let runtime_label = |runtime: &RequiredRuntime| match runtime {
-        RequiredRuntime::Rust => "rust",
-        RequiredRuntime::Bun => "bun",
-        RequiredRuntime::Node => "node",
-        RequiredRuntime::None => "none",
-    };
 
     if let Some(command) = command.as_deref() {
         let details = classify_command_detailed(command);
@@ -608,10 +860,17 @@ pub async fn workers_capabilities(
         }
     }
 
+    if local_has_any {
+        warnings.extend(collect_local_capability_warnings(
+            &workers,
+            &local_capabilities,
+        ));
+    }
+
     if ctx.is_json() {
         let report = WorkersCapabilitiesReport {
             workers,
-            local: None,
+            local: Some(local_capabilities),
             required_runtime,
             warnings,
         };
@@ -631,6 +890,41 @@ pub async fn workers_capabilities(
     println!("{}", style.format_header("Worker Capabilities"));
     println!();
 
+    let key_width = ["Rust", "Bun", "Node", "npm"]
+        .iter()
+        .map(|label| label.len())
+        .max()
+        .unwrap_or(4);
+
+    println!("{}", style.highlight("Local Capabilities"));
+    let render = |label: &str, value: Option<&String>| {
+        let (indicator, display) = if let Some(ver) = value {
+            (StatusIndicator::Success, style.value(ver))
+        } else {
+            (StatusIndicator::Warning, style.warning("unknown"))
+        };
+        let padded_label = format!("{label:width$}", width = key_width);
+        println!(
+            "    {} {} {} {}",
+            indicator.display(style),
+            style.key(&padded_label),
+            style.muted(":"),
+            display
+        );
+    };
+    render("Rust", local_capabilities.rustc_version.as_ref());
+    render("Bun", local_capabilities.bun_version.as_ref());
+    render("Node", local_capabilities.node_version.as_ref());
+    render("npm", local_capabilities.npm_version.as_ref());
+    if !local_has_any {
+        println!(
+            "    {} {}",
+            StatusIndicator::Warning.display(style),
+            style.warning("No local runtimes detected")
+        );
+    }
+    println!();
+
     if let Some(runtime) = required_runtime.as_ref() {
         println!(
             "{} {}",
@@ -639,12 +933,6 @@ pub async fn workers_capabilities(
         );
         println!();
     }
-
-    let key_width = ["Rust", "Bun", "Node", "npm"]
-        .iter()
-        .map(|label| label.len())
-        .max()
-        .unwrap_or(4);
 
     for worker in &workers {
         println!(
@@ -656,22 +944,6 @@ pub async fn workers_capabilities(
         );
 
         let caps = &worker.capabilities;
-        let render = |label: &str, value: Option<&String>| {
-            let (indicator, display) = if let Some(ver) = value {
-                (StatusIndicator::Success, style.value(ver))
-            } else {
-                (StatusIndicator::Error, style.error("missing"))
-            };
-            let padded_label = format!("{label:width$}", width = key_width);
-            println!(
-                "    {} {} {} {}",
-                indicator.display(style),
-                style.key(&padded_label),
-                style.muted(":"),
-                display
-            );
-        };
-
         render("Rust", caps.rustc_version.as_ref());
         render("Bun", caps.bun_version.as_ref());
         render("Node", caps.node_version.as_ref());
@@ -5025,6 +5297,9 @@ pub async fn diagnose(command: &str, ctx: &OutputContext) -> Result<()> {
     }
 
     let required_runtime = required_runtime_for_kind(details.classification.kind);
+    let local_capabilities = probe_local_capabilities();
+    let local_has_any = has_any_capabilities(&local_capabilities);
+    let mut capabilities_warnings = Vec::new();
 
     let socket_path = config.general.socket_path.clone();
     let socket_exists = Path::new(&socket_path).exists();
@@ -5112,6 +5387,52 @@ pub async fn diagnose(command: &str, ctx: &OutputContext) -> Result<()> {
         }
     }
 
+    if details.classification.is_compilation {
+        if daemon_status.reachable {
+            match query_workers_capabilities(false).await {
+                Ok(response) => {
+                    if required_runtime != RequiredRuntime::None {
+                        let missing: Vec<String> = response
+                            .workers
+                            .iter()
+                            .filter(|worker| {
+                                let caps = &worker.capabilities;
+                                match &required_runtime {
+                                    RequiredRuntime::Rust => !caps.has_rust(),
+                                    RequiredRuntime::Bun => !caps.has_bun(),
+                                    RequiredRuntime::Node => !caps.has_node(),
+                                    RequiredRuntime::None => false,
+                                }
+                            })
+                            .map(|worker| worker.id.clone())
+                            .collect();
+
+                        if !missing.is_empty() {
+                            capabilities_warnings.push(format!(
+                                "Workers missing required runtime {}: {}",
+                                runtime_label(&required_runtime),
+                                missing.join(", ")
+                            ));
+                        }
+                    }
+
+                    if local_has_any {
+                        capabilities_warnings.extend(collect_local_capability_warnings(
+                            &response.workers,
+                            &local_capabilities,
+                        ));
+                    }
+                }
+                Err(err) => {
+                    capabilities_warnings.push(format!("Worker capabilities unavailable: {}", err));
+                }
+            }
+        } else if required_runtime != RequiredRuntime::None {
+            capabilities_warnings
+                .push("Worker capabilities unavailable (daemon not reachable)".to_string());
+        }
+    }
+
     if ctx.is_json() {
         let response = DiagnoseResponse {
             classification: details.classification.clone(),
@@ -5128,6 +5449,8 @@ pub async fn diagnose(command: &str, ctx: &OutputContext) -> Result<()> {
             },
             daemon: daemon_status,
             required_runtime: required_runtime.clone(),
+            local_capabilities: local_has_any.then(|| local_capabilities.clone()),
+            capabilities_warnings: capabilities_warnings.clone(),
             worker_selection,
         };
         let _ = ctx.json(&ApiResponse::ok("diagnose", response));
@@ -5184,6 +5507,30 @@ pub async fn diagnose(command: &str, ctx: &OutputContext) -> Result<()> {
         style.key("Reason:"),
         style.value(&decision.reason)
     );
+    println!();
+
+    println!("{}", style.highlight("Runtime Capabilities"));
+    println!(
+        "  {} {}",
+        style.key("Required runtime:"),
+        style.value(runtime_label(&required_runtime))
+    );
+    println!(
+        "  {} {}",
+        style.key("Local runtimes:"),
+        style.value(&summarize_capabilities(&local_capabilities))
+    );
+    if capabilities_warnings.is_empty() {
+        println!("  {} {}", style.key("Warnings:"), style.value("none"));
+    } else {
+        for warning in &capabilities_warnings {
+            println!(
+                "  {} {}",
+                StatusIndicator::Warning.display(style),
+                style.warning(warning)
+            );
+        }
+    }
     println!();
 
     println!("{}", style.highlight("Tier Decisions"));
@@ -6802,6 +7149,8 @@ mod tests {
                 error: Some("daemon socket not found".to_string()),
             },
             required_runtime: RequiredRuntime::Rust,
+            local_capabilities: None,
+            capabilities_warnings: Vec::new(),
             worker_selection: None,
         };
 
@@ -6809,6 +7158,57 @@ mod tests {
         assert_eq!(json["command"], "cargo build");
         assert_eq!(json["classification"]["confidence"], 0.95);
         assert_eq!(json["threshold"]["value"], 0.85);
+    }
+
+    #[test]
+    fn workers_capabilities_report_serializes_with_local() {
+        let report = WorkersCapabilitiesReport {
+            workers: vec![],
+            local: Some(WorkerCapabilities {
+                rustc_version: Some("rustc 1.87.0-nightly".to_string()),
+                bun_version: None,
+                node_version: None,
+                npm_version: None,
+            }),
+            required_runtime: Some(RequiredRuntime::Rust),
+            warnings: vec!["warn".to_string()],
+        };
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["local"]["rustc_version"], "rustc 1.87.0-nightly");
+        assert_eq!(json["required_runtime"], "rust");
+        assert!(json["warnings"].is_array());
+    }
+
+    #[test]
+    fn local_capability_warnings_include_missing_and_mismatch() {
+        let local = WorkerCapabilities {
+            rustc_version: Some("rustc 1.87.0-nightly".to_string()),
+            bun_version: None,
+            node_version: None,
+            npm_version: None,
+        };
+        let workers = vec![
+            WorkerCapabilitiesFromApi {
+                id: "w-missing".to_string(),
+                host: "host".to_string(),
+                user: "user".to_string(),
+                capabilities: WorkerCapabilities::new(),
+            },
+            WorkerCapabilitiesFromApi {
+                id: "w-old".to_string(),
+                host: "host".to_string(),
+                user: "user".to_string(),
+                capabilities: WorkerCapabilities {
+                    rustc_version: Some("rustc 1.86.0-nightly".to_string()),
+                    bun_version: None,
+                    node_version: None,
+                    npm_version: None,
+                },
+            },
+        ];
+        let warnings = collect_local_capability_warnings(&workers, &local);
+        assert!(warnings.iter().any(|w| w.contains("missing Rust runtime")));
+        assert!(warnings.iter().any(|w| w.contains("Rust version mismatch")));
     }
 
     #[test]
