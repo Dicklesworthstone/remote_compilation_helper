@@ -193,6 +193,8 @@ jobs:
         env:
           RCH_MOCK_SSH: '1'
           RCH_LOG_LEVEL: debug
+          E2E_LOG_DIR: test-results/e2e-logs
+          E2E_JUNIT_FILE: test-results/e2e-logs/junit.xml
         run: |
           chmod +x scripts/e2e_test.sh
           ./scripts/e2e_test.sh 2>&1 | tee e2e-output.log
@@ -201,7 +203,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: e2e-logs
-          path: e2e-output.log
+          path: |
+            e2e-output.log
+            test-results/e2e-logs/
           retention-days: 14
 
   # Performance benchmark - verify latency budgets from AGENTS.md
