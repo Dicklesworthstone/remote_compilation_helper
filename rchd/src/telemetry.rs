@@ -534,4 +534,377 @@ mod tests {
         let latest = store.latest_all();
         assert_eq!(latest.len(), 2);
     }
+
+    #[test]
+    fn test_telemetry_poller_config_default() {
+        let config = TelemetryPollerConfig::default();
+        assert_eq!(config.poll_interval, Duration::from_secs(30));
+        assert_eq!(config.ssh_timeout, Duration::from_secs(5));
+        assert_eq!(config.skip_after, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn test_telemetry_poller_config_custom() {
+        let config = TelemetryPollerConfig {
+            poll_interval: Duration::from_secs(60),
+            ssh_timeout: Duration::from_secs(10),
+            skip_after: Duration::from_secs(120),
+        };
+        assert_eq!(config.poll_interval, Duration::from_secs(60));
+        assert_eq!(config.ssh_timeout, Duration::from_secs(10));
+        assert_eq!(config.skip_after, Duration::from_secs(120));
+    }
+
+    #[test]
+    fn test_telemetry_poller_config_clone() {
+        let config = TelemetryPollerConfig::default();
+        let cloned = config.clone();
+        assert_eq!(config.poll_interval, cloned.poll_interval);
+        assert_eq!(config.ssh_timeout, cloned.ssh_timeout);
+        assert_eq!(config.skip_after, cloned.skip_after);
+    }
+
+    #[test]
+    fn test_telemetry_poller_config_debug() {
+        let config = TelemetryPollerConfig::default();
+        let debug_str = format!("{:?}", config);
+        assert!(debug_str.contains("TelemetryPollerConfig"));
+        assert!(debug_str.contains("poll_interval"));
+        assert!(debug_str.contains("ssh_timeout"));
+    }
+
+    #[test]
+    fn test_store_latest_nonexistent_worker() {
+        let store = TelemetryStore::new(Duration::from_secs(300), None);
+        assert!(store.latest("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_store_last_received_at_nonexistent_worker() {
+        let store = TelemetryStore::new(Duration::from_secs(300), None);
+        assert!(store.last_received_at("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_store_latest_all_empty() {
+        let store = TelemetryStore::new(Duration::from_secs(300), None);
+        let latest = store.latest_all();
+        assert!(latest.is_empty());
+    }
+
+    #[test]
+    fn test_store_latest_speedscore_no_storage() {
+        let store = TelemetryStore::new(Duration::from_secs(300), None);
+        let result = store.latest_speedscore("w1");
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn test_store_speedscore_history_no_storage() {
+        let store = TelemetryStore::new(Duration::from_secs(300), None);
+        let result = store.speedscore_history("w1", Utc::now() - ChronoDuration::hours(1), 10, 0);
+        assert!(result.is_ok());
+        let page = result.unwrap();
+        assert_eq!(page.total, 0);
+        assert!(page.entries.is_empty());
+    }
+
+    #[test]
+    fn test_store_test_run_stats_empty() {
+        let store = TelemetryStore::new(Duration::from_secs(300), None);
+        let stats = store.test_run_stats();
+        assert_eq!(stats.total_runs, 0);
+        assert_eq!(stats.passed_runs, 0);
+        assert_eq!(stats.failed_runs, 0);
+    }
+
+    #[test]
+    fn test_test_run_stats_multiple_runs() {
+        let store = TelemetryStore::new(Duration::from_secs(300), None);
+
+        // Successful run
+        let success_run = TestRunRecord::new(
+            "proj".to_string(),
+            "worker-1".to_string(),
+            "cargo test".to_string(),
+            CompilationKind::CargoTest,
+            0,
+            1000,
+        );
+        store.record_test_run(success_run);
+
+        // Failed run
+        let failed_run = TestRunRecord::new(
+            "proj".to_string(),
+            "worker-2".to_string(),
+            "cargo test".to_string(),
+            CompilationKind::CargoTest,
+            1,
+            500,
+        );
+        store.record_test_run(failed_run);
+
+        let stats = store.test_run_stats();
+        assert_eq!(stats.total_runs, 2);
+        assert_eq!(stats.passed_runs, 1);
+        assert_eq!(stats.failed_runs, 1);
+    }
+
+    #[test]
+    fn test_test_run_stats_max_capacity() {
+        let store = TelemetryStore::new(Duration::from_secs(300), None);
+
+        // Add more than 200 runs (the capacity limit)
+        for i in 0..205 {
+            let record = TestRunRecord::new(
+                format!("proj{}", i),
+                "worker-1".to_string(),
+                "cargo test".to_string(),
+                CompilationKind::CargoTest,
+                0,
+                100,
+            );
+            store.record_test_run(record);
+        }
+
+        // Should only retain the latest 200
+        let test_runs = store.test_runs.read().unwrap();
+        assert_eq!(test_runs.len(), 200);
+    }
+
+    #[test]
+    fn test_store_with_invalid_retention_duration() {
+        // Test that an invalid retention is handled gracefully
+        let store = TelemetryStore::new(Duration::from_secs(0), None);
+        // Should fall back to a default of 300 seconds if conversion fails
+        // The new store should still be functional
+        store.ingest(make_telemetry("w1", 10.0, 20.0), TelemetrySource::SshPoll);
+        assert!(store.latest("w1").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_telemetry_poller_creation() {
+        use crate::workers::WorkerPool;
+
+        let pool = WorkerPool::new();
+        let store = Arc::new(TelemetryStore::new(Duration::from_secs(300), None));
+        let config = TelemetryPollerConfig::default();
+
+        let poller = TelemetryPoller::new(pool, store, config);
+        // Verify poller was created (can't easily test start without running)
+        assert_eq!(poller.config.poll_interval, Duration::from_secs(30));
+    }
+
+    fn create_worker_config(id: &str) -> rch_common::WorkerConfig {
+        rch_common::WorkerConfig {
+            id: rch_common::WorkerId::new(id),
+            host: "localhost".to_string(),
+            user: "test".to_string(),
+            identity_file: "/tmp/key".to_string(),
+            total_slots: 8,
+            priority: 50,
+            tags: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn test_should_poll_worker_healthy() {
+        use crate::workers::WorkerPool;
+        use rch_common::WorkerId;
+
+        let pool = WorkerPool::new();
+        pool.add_worker(create_worker_config("test-worker")).await;
+
+        let store = Arc::new(TelemetryStore::new(Duration::from_secs(300), None));
+        let poller_config = TelemetryPollerConfig::default();
+        let poller = TelemetryPoller::new(pool.clone(), store, poller_config);
+
+        let worker = pool.get(&WorkerId::new("test-worker")).await.unwrap();
+        // Worker is healthy and no recent telemetry, should poll
+        let should_poll = poller.should_poll_worker(&worker).await;
+        assert!(should_poll);
+    }
+
+    #[tokio::test]
+    async fn test_should_poll_worker_unreachable() {
+        use crate::workers::WorkerPool;
+        use rch_common::WorkerId;
+
+        let pool = WorkerPool::new();
+        pool.add_worker(create_worker_config("unreachable-worker"))
+            .await;
+
+        let worker = pool
+            .get(&WorkerId::new("unreachable-worker"))
+            .await
+            .unwrap();
+        worker.set_status(WorkerStatus::Unreachable).await;
+
+        let store = Arc::new(TelemetryStore::new(Duration::from_secs(300), None));
+        let poller_config = TelemetryPollerConfig::default();
+        let poller = TelemetryPoller::new(pool, store, poller_config);
+
+        // Unreachable workers should not be polled
+        let should_poll = poller.should_poll_worker(&worker).await;
+        assert!(!should_poll);
+    }
+
+    #[tokio::test]
+    async fn test_should_poll_worker_disabled() {
+        use crate::workers::WorkerPool;
+        use rch_common::WorkerId;
+
+        let pool = WorkerPool::new();
+        pool.add_worker(create_worker_config("disabled-worker"))
+            .await;
+
+        let worker = pool.get(&WorkerId::new("disabled-worker")).await.unwrap();
+        worker.set_status(WorkerStatus::Disabled).await;
+
+        let store = Arc::new(TelemetryStore::new(Duration::from_secs(300), None));
+        let poller_config = TelemetryPollerConfig::default();
+        let poller = TelemetryPoller::new(pool, store, poller_config);
+
+        // Disabled workers should not be polled
+        let should_poll = poller.should_poll_worker(&worker).await;
+        assert!(!should_poll);
+    }
+
+    #[tokio::test]
+    async fn test_should_poll_worker_recent_telemetry() {
+        use crate::workers::WorkerPool;
+        use rch_common::WorkerId;
+
+        let pool = WorkerPool::new();
+        pool.add_worker(create_worker_config("recent-telemetry-worker"))
+            .await;
+
+        let store = Arc::new(TelemetryStore::new(Duration::from_secs(300), None));
+
+        // Ingest recent telemetry for this worker
+        store.ingest(
+            make_telemetry("recent-telemetry-worker", 50.0, 60.0),
+            TelemetrySource::SshPoll,
+        );
+
+        let poller_config = TelemetryPollerConfig {
+            skip_after: Duration::from_secs(60), // Skip if telemetry < 60s old
+            ..Default::default()
+        };
+        let poller = TelemetryPoller::new(pool.clone(), store, poller_config);
+
+        let worker = pool
+            .get(&WorkerId::new("recent-telemetry-worker"))
+            .await
+            .unwrap();
+
+        // Should skip polling because we just received telemetry
+        let should_poll = poller.should_poll_worker(&worker).await;
+        assert!(!should_poll);
+    }
+
+    #[tokio::test]
+    async fn test_poll_once_empty_pool() {
+        use crate::workers::WorkerPool;
+
+        let pool = WorkerPool::new();
+        let store = Arc::new(TelemetryStore::new(Duration::from_secs(300), None));
+        let config = TelemetryPollerConfig::default();
+        let poller = TelemetryPoller::new(pool, store, config);
+
+        // Poll with empty pool should succeed
+        let result = poller.poll_once().await;
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_telemetry_source_variants() {
+        // Verify all telemetry source variants can be used
+        let _ssh_poll = TelemetrySource::SshPoll;
+        let _piggyback = TelemetrySource::Piggyback;
+
+        // Test that they can be compared
+        assert_ne!(TelemetrySource::SshPoll, TelemetrySource::Piggyback);
+    }
+
+    #[test]
+    fn test_received_telemetry_creation() {
+        let telemetry = make_telemetry("test-worker", 25.0, 35.0);
+        let received = ReceivedTelemetry::new(telemetry.clone(), TelemetrySource::SshPoll);
+
+        assert_eq!(received.telemetry.worker_id, "test-worker");
+        assert_eq!(received.source, TelemetrySource::SshPoll);
+        // received_at should be close to now
+        let elapsed = (Utc::now() - received.received_at).num_seconds();
+        assert!(elapsed.abs() < 2); // Within 2 seconds
+    }
+
+    #[test]
+    fn test_evict_old_removes_multiple() {
+        let store = TelemetryStore::new(Duration::from_secs(1), None);
+
+        // Add multiple entries
+        store.ingest(make_telemetry("w1", 10.0, 20.0), TelemetrySource::SshPoll);
+        store.ingest(make_telemetry("w1", 20.0, 30.0), TelemetrySource::SshPoll);
+        store.ingest(make_telemetry("w1", 30.0, 40.0), TelemetrySource::SshPoll);
+
+        // Make all entries old
+        {
+            let mut recent = store.recent.write().unwrap();
+            let entries = recent.get_mut("w1").unwrap();
+            for entry in entries.iter_mut() {
+                entry.received_at = Utc::now() - ChronoDuration::seconds(120);
+            }
+        }
+
+        // Ingest a new one to trigger eviction
+        store.ingest(make_telemetry("w1", 50.0, 60.0), TelemetrySource::SshPoll);
+
+        let recent = store.recent.read().unwrap();
+        let entries = recent.get("w1").unwrap();
+        // Only the newest should remain
+        assert_eq!(entries.len(), 1);
+        assert!((entries[0].telemetry.cpu.overall_percent - 50.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_test_run_different_kinds() {
+        let store = TelemetryStore::new(Duration::from_secs(300), None);
+
+        // Different compilation kinds
+        store.record_test_run(TestRunRecord::new(
+            "proj".to_string(),
+            "w1".to_string(),
+            "cargo build".to_string(),
+            CompilationKind::CargoBuild,
+            0,
+            1000,
+        ));
+
+        store.record_test_run(TestRunRecord::new(
+            "proj".to_string(),
+            "w1".to_string(),
+            "cargo check".to_string(),
+            CompilationKind::CargoCheck,
+            0,
+            500,
+        ));
+
+        store.record_test_run(TestRunRecord::new(
+            "proj".to_string(),
+            "w1".to_string(),
+            "cargo clippy".to_string(),
+            CompilationKind::CargoClippy,
+            0,
+            800,
+        ));
+
+        let stats = store.test_run_stats();
+        assert_eq!(stats.total_runs, 3);
+        assert_eq!(stats.passed_runs, 3);
+        assert!(stats.runs_by_kind.contains_key("cargo_build"));
+        assert!(stats.runs_by_kind.contains_key("cargo_check"));
+        assert!(stats.runs_by_kind.contains_key("cargo_clippy"));
+    }
 }

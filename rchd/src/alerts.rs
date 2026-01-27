@@ -290,6 +290,110 @@ impl AlertManager {
 mod tests {
     use super::*;
 
+    // ============== AlertConfig Tests ==============
+
+    #[test]
+    fn test_alert_config_default() {
+        let config = AlertConfig::default();
+        assert!(config.enabled);
+        assert_eq!(config.suppress_duplicates, ChronoDuration::seconds(300));
+    }
+
+    #[test]
+    fn test_alert_config_custom() {
+        let config = AlertConfig {
+            enabled: false,
+            suppress_duplicates: ChronoDuration::seconds(60),
+        };
+        assert!(!config.enabled);
+        assert_eq!(config.suppress_duplicates, ChronoDuration::seconds(60));
+    }
+
+    // ============== AlertSeverity Tests ==============
+
+    #[test]
+    fn test_severity_rank_ordering() {
+        // Critical < Error < Warning < Info (lower rank = higher priority)
+        assert!(AlertSeverity::Critical.rank() < AlertSeverity::Error.rank());
+        assert!(AlertSeverity::Error.rank() < AlertSeverity::Warning.rank());
+        assert!(AlertSeverity::Warning.rank() < AlertSeverity::Info.rank());
+    }
+
+    #[test]
+    fn test_severity_as_str() {
+        assert_eq!(AlertSeverity::Info.as_str(), "info");
+        assert_eq!(AlertSeverity::Warning.as_str(), "warning");
+        assert_eq!(AlertSeverity::Error.as_str(), "error");
+        assert_eq!(AlertSeverity::Critical.as_str(), "critical");
+    }
+
+    // ============== AlertKind Tests ==============
+
+    #[test]
+    fn test_alert_kind_as_str() {
+        assert_eq!(AlertKind::WorkerOffline.as_str(), "worker_offline");
+        assert_eq!(AlertKind::WorkerDegraded.as_str(), "worker_degraded");
+        assert_eq!(AlertKind::CircuitOpen.as_str(), "circuit_open");
+        assert_eq!(AlertKind::AllWorkersOffline.as_str(), "all_workers_offline");
+    }
+
+    // ============== Alert Tests ==============
+
+    #[test]
+    fn test_alert_new() {
+        let alert = Alert::new(
+            AlertKind::WorkerOffline,
+            AlertSeverity::Error,
+            "Worker 'w1' is offline".to_string(),
+            Some("w1".to_string()),
+        );
+
+        assert!(!alert.id.is_empty());
+        assert_eq!(alert.kind, AlertKind::WorkerOffline);
+        assert_eq!(alert.severity, AlertSeverity::Error);
+        assert_eq!(alert.message, "Worker 'w1' is offline");
+        assert_eq!(alert.worker_id, Some("w1".to_string()));
+    }
+
+    #[test]
+    fn test_alert_to_info() {
+        let alert = Alert::new(
+            AlertKind::CircuitOpen,
+            AlertSeverity::Warning,
+            "Circuit opened".to_string(),
+            Some("worker-1".to_string()),
+        );
+
+        let info = alert.to_info();
+        assert_eq!(info.id, alert.id);
+        assert_eq!(info.kind, "circuit_open");
+        assert_eq!(info.severity, "warning");
+        assert_eq!(info.message, "Circuit opened");
+        assert_eq!(info.worker_id, Some("worker-1".to_string()));
+        assert!(!info.created_at.is_empty());
+    }
+
+    #[test]
+    fn test_alert_to_info_no_worker_id() {
+        let alert = Alert::new(
+            AlertKind::AllWorkersOffline,
+            AlertSeverity::Critical,
+            "All workers are offline".to_string(),
+            None,
+        );
+
+        let info = alert.to_info();
+        assert!(info.worker_id.is_none());
+    }
+
+    // ============== AlertManager Tests ==============
+
+    #[test]
+    fn test_manager_new_empty() {
+        let manager = AlertManager::new(AlertConfig::default());
+        assert!(manager.active_alerts().is_empty());
+    }
+
     #[test]
     fn test_alert_suppression() {
         let config = AlertConfig {
@@ -336,5 +440,309 @@ mod tests {
             None,
         );
         assert_eq!(manager.active_alerts().len(), 0);
+    }
+
+    #[test]
+    fn test_disabled_config_no_alerts() {
+        let config = AlertConfig {
+            enabled: false,
+            suppress_duplicates: ChronoDuration::seconds(300),
+        };
+        let manager = AlertManager::new(config);
+
+        manager.handle_worker_status_change(
+            "w1",
+            WorkerStatus::Healthy,
+            WorkerStatus::Unreachable,
+            None,
+        );
+
+        assert!(manager.active_alerts().is_empty());
+    }
+
+    #[test]
+    fn test_same_status_no_alert() {
+        let manager = AlertManager::new(AlertConfig::default());
+
+        manager.handle_worker_status_change(
+            "w1",
+            WorkerStatus::Healthy,
+            WorkerStatus::Healthy,
+            None,
+        );
+
+        assert!(manager.active_alerts().is_empty());
+    }
+
+    #[test]
+    fn test_healthy_to_unreachable() {
+        let manager = AlertManager::new(AlertConfig::default());
+
+        manager.handle_worker_status_change(
+            "w1",
+            WorkerStatus::Healthy,
+            WorkerStatus::Unreachable,
+            Some("SSH timeout"),
+        );
+
+        let alerts = manager.active_alerts();
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].kind, "worker_offline");
+        assert_eq!(alerts[0].severity, "error");
+        assert!(alerts[0].message.contains("w1"));
+        assert!(alerts[0].message.contains("SSH timeout"));
+    }
+
+    #[test]
+    fn test_healthy_to_degraded() {
+        let manager = AlertManager::new(AlertConfig::default());
+
+        manager.handle_worker_status_change(
+            "w1",
+            WorkerStatus::Healthy,
+            WorkerStatus::Degraded,
+            None,
+        );
+
+        let alerts = manager.active_alerts();
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].kind, "worker_degraded");
+        assert_eq!(alerts[0].severity, "warning");
+    }
+
+    #[test]
+    fn test_unreachable_to_degraded() {
+        let manager = AlertManager::new(AlertConfig::default());
+
+        // First become unreachable
+        manager.handle_worker_status_change(
+            "w1",
+            WorkerStatus::Healthy,
+            WorkerStatus::Unreachable,
+            None,
+        );
+        assert_eq!(manager.active_alerts().len(), 1);
+        assert_eq!(manager.active_alerts()[0].kind, "worker_offline");
+
+        // Then become degraded (offline alert should be cleared, degraded added)
+        manager.handle_worker_status_change(
+            "w1",
+            WorkerStatus::Unreachable,
+            WorkerStatus::Degraded,
+            None,
+        );
+        let alerts = manager.active_alerts();
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].kind, "worker_degraded");
+    }
+
+    #[test]
+    fn test_degraded_to_unreachable() {
+        let manager = AlertManager::new(AlertConfig::default());
+
+        // First become degraded
+        manager.handle_worker_status_change(
+            "w1",
+            WorkerStatus::Healthy,
+            WorkerStatus::Degraded,
+            None,
+        );
+        assert_eq!(manager.active_alerts()[0].kind, "worker_degraded");
+
+        // Then become unreachable (degraded alert should be cleared, offline added)
+        manager.handle_worker_status_change(
+            "w1",
+            WorkerStatus::Degraded,
+            WorkerStatus::Unreachable,
+            Some("connection lost"),
+        );
+        let alerts = manager.active_alerts();
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].kind, "worker_offline");
+    }
+
+    #[test]
+    fn test_draining_no_alert() {
+        let manager = AlertManager::new(AlertConfig::default());
+
+        manager.handle_worker_status_change(
+            "w1",
+            WorkerStatus::Healthy,
+            WorkerStatus::Draining,
+            None,
+        );
+
+        assert!(manager.active_alerts().is_empty());
+    }
+
+    #[test]
+    fn test_disabled_no_alert() {
+        let manager = AlertManager::new(AlertConfig::default());
+
+        manager.handle_worker_status_change(
+            "w1",
+            WorkerStatus::Healthy,
+            WorkerStatus::Disabled,
+            None,
+        );
+
+        assert!(manager.active_alerts().is_empty());
+    }
+
+    #[test]
+    fn test_circuit_open() {
+        let manager = AlertManager::new(AlertConfig::default());
+
+        manager.handle_circuit_open("worker-1");
+
+        let alerts = manager.active_alerts();
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].kind, "circuit_open");
+        assert_eq!(alerts[0].severity, "warning");
+        assert!(alerts[0].message.contains("worker-1"));
+    }
+
+    #[test]
+    fn test_circuit_open_disabled() {
+        let config = AlertConfig {
+            enabled: false,
+            suppress_duplicates: ChronoDuration::seconds(300),
+        };
+        let manager = AlertManager::new(config);
+
+        manager.handle_circuit_open("worker-1");
+
+        assert!(manager.active_alerts().is_empty());
+    }
+
+    #[test]
+    fn test_all_workers_offline() {
+        let manager = AlertManager::new(AlertConfig::default());
+
+        manager.handle_all_workers_offline(3, 3); // All 3 workers offline
+
+        let alerts = manager.active_alerts();
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].kind, "all_workers_offline");
+        assert_eq!(alerts[0].severity, "critical");
+    }
+
+    #[test]
+    fn test_all_workers_offline_clears_on_recovery() {
+        let manager = AlertManager::new(AlertConfig::default());
+
+        manager.handle_all_workers_offline(3, 3); // All offline
+        assert_eq!(manager.active_alerts().len(), 1);
+
+        manager.handle_all_workers_offline(3, 2); // One recovered
+        assert!(manager.active_alerts().is_empty());
+    }
+
+    #[test]
+    fn test_all_workers_offline_zero_total() {
+        let manager = AlertManager::new(AlertConfig::default());
+
+        manager.handle_all_workers_offline(0, 0); // No workers configured
+
+        assert!(manager.active_alerts().is_empty());
+    }
+
+    #[test]
+    fn test_all_workers_offline_disabled() {
+        let config = AlertConfig {
+            enabled: false,
+            suppress_duplicates: ChronoDuration::seconds(300),
+        };
+        let manager = AlertManager::new(config);
+
+        manager.handle_all_workers_offline(3, 3);
+
+        assert!(manager.active_alerts().is_empty());
+    }
+
+    #[test]
+    fn test_multiple_workers_multiple_alerts() {
+        let manager = AlertManager::new(AlertConfig::default());
+
+        manager.handle_worker_status_change(
+            "w1",
+            WorkerStatus::Healthy,
+            WorkerStatus::Unreachable,
+            None,
+        );
+        manager.handle_worker_status_change(
+            "w2",
+            WorkerStatus::Healthy,
+            WorkerStatus::Degraded,
+            None,
+        );
+        manager.handle_circuit_open("w3");
+
+        let alerts = manager.active_alerts();
+        assert_eq!(alerts.len(), 3);
+    }
+
+    #[test]
+    fn test_alerts_sorted_by_severity() {
+        let manager = AlertManager::new(AlertConfig::default());
+
+        // Add in non-priority order: warning, error, critical
+        manager.handle_worker_status_change(
+            "w1",
+            WorkerStatus::Healthy,
+            WorkerStatus::Degraded, // Warning
+            None,
+        );
+        manager.handle_worker_status_change(
+            "w2",
+            WorkerStatus::Healthy,
+            WorkerStatus::Unreachable, // Error
+            None,
+        );
+        manager.handle_all_workers_offline(3, 3); // Critical
+
+        let alerts = manager.active_alerts();
+        assert_eq!(alerts.len(), 3);
+
+        // Should be sorted: Critical, Error, Warning
+        assert_eq!(alerts[0].severity, "critical");
+        assert_eq!(alerts[1].severity, "error");
+        assert_eq!(alerts[2].severity, "warning");
+    }
+
+    #[test]
+    fn test_unreachable_default_reason() {
+        let manager = AlertManager::new(AlertConfig::default());
+
+        manager.handle_worker_status_change(
+            "w1",
+            WorkerStatus::Healthy,
+            WorkerStatus::Unreachable,
+            None, // No specific error
+        );
+
+        let alerts = manager.active_alerts();
+        assert!(alerts[0].message.contains("worker unreachable"));
+    }
+
+    #[test]
+    fn test_alert_unique_ids() {
+        let manager = AlertManager::new(AlertConfig::default());
+
+        manager.handle_worker_status_change(
+            "w1",
+            WorkerStatus::Healthy,
+            WorkerStatus::Unreachable,
+            None,
+        );
+        manager.handle_worker_status_change(
+            "w2",
+            WorkerStatus::Healthy,
+            WorkerStatus::Degraded,
+            None,
+        );
+
+        let alerts = manager.active_alerts();
+        assert_ne!(alerts[0].id, alerts[1].id);
     }
 }
