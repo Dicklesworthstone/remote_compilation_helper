@@ -5173,4 +5173,152 @@ mod tests {
         );
         // TEST PASS: Cooldown file update
     }
+
+    // =========================================================================
+    // Timing History Tests
+    // =========================================================================
+
+    #[test]
+    fn test_timing_record_creation() {
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let record = super::TimingRecord {
+            timestamp: now_secs,
+            duration_ms: 5000,
+            remote: true,
+        };
+
+        assert_eq!(record.duration_ms, 5000);
+        assert!(record.remote);
+        assert!(record.timestamp >= now_secs - 1 && record.timestamp <= now_secs + 1);
+    }
+
+    #[test]
+    fn test_project_timing_data_add_sample() {
+        let mut data = super::ProjectTimingData::default();
+
+        // Add local sample
+        data.add_sample(1000, false);
+        assert_eq!(data.local_samples.len(), 1);
+        assert_eq!(data.remote_samples.len(), 0);
+        assert_eq!(data.local_samples[0].duration_ms, 1000);
+
+        // Add remote sample
+        data.add_sample(500, true);
+        assert_eq!(data.local_samples.len(), 1);
+        assert_eq!(data.remote_samples.len(), 1);
+        assert_eq!(data.remote_samples[0].duration_ms, 500);
+    }
+
+    #[test]
+    fn test_project_timing_data_median_odd_count() {
+        let mut data = super::ProjectTimingData::default();
+        data.add_sample(100, false);
+        data.add_sample(300, false);
+        data.add_sample(200, false);
+
+        // Median of [100, 200, 300] = 200
+        assert_eq!(data.median_duration(false), Some(200));
+    }
+
+    #[test]
+    fn test_project_timing_data_median_even_count() {
+        let mut data = super::ProjectTimingData::default();
+        data.add_sample(100, true);
+        data.add_sample(300, true);
+        data.add_sample(200, true);
+        data.add_sample(400, true);
+
+        // Median of [100, 200, 300, 400] = (200 + 300) / 2 = 250
+        assert_eq!(data.median_duration(true), Some(250));
+    }
+
+    #[test]
+    fn test_project_timing_data_median_empty() {
+        let data = super::ProjectTimingData::default();
+        assert_eq!(data.median_duration(false), None);
+        assert_eq!(data.median_duration(true), None);
+    }
+
+    #[test]
+    fn test_project_timing_data_speedup_ratio() {
+        let mut data = super::ProjectTimingData::default();
+        // Local takes 1000ms
+        data.add_sample(1000, false);
+        // Remote takes 500ms
+        data.add_sample(500, true);
+
+        // Speedup = local / remote = 1000 / 500 = 2.0
+        assert_eq!(data.speedup_ratio(), Some(2.0));
+    }
+
+    #[test]
+    fn test_project_timing_data_speedup_no_data() {
+        let mut data = super::ProjectTimingData::default();
+        data.add_sample(1000, false);
+
+        // No remote data, can't compute speedup
+        assert_eq!(data.speedup_ratio(), None);
+    }
+
+    #[test]
+    fn test_project_timing_data_sample_truncation() {
+        let mut data = super::ProjectTimingData::default();
+
+        // Add more than MAX_TIMING_SAMPLES
+        for i in 0..25 {
+            data.add_sample(i * 100, false);
+        }
+
+        // Should be capped at MAX_TIMING_SAMPLES (20)
+        assert_eq!(data.local_samples.len(), super::MAX_TIMING_SAMPLES);
+        // First sample should be removed (FIFO)
+        assert_eq!(data.local_samples[0].duration_ms, 500); // Started at 0, removed 0-4
+    }
+
+    #[test]
+    fn test_timing_history_key() {
+        let key = super::TimingHistory::key("my_project", Some(CompilationKind::CargoTest));
+        assert!(key.contains("my_project"));
+        assert!(key.contains("CargoTest"));
+
+        let key_unknown = super::TimingHistory::key("project2", None);
+        assert!(key_unknown.contains("project2"));
+        assert!(key_unknown.contains("Unknown"));
+    }
+
+    #[test]
+    fn test_timing_history_record_and_get() {
+        let mut history = super::TimingHistory::default();
+
+        history.record("proj1", Some(CompilationKind::CargoBuild), 1000, true);
+        history.record("proj1", Some(CompilationKind::CargoBuild), 800, true);
+
+        let data = history.get("proj1", Some(CompilationKind::CargoBuild));
+        assert!(data.is_some());
+        let data = data.unwrap();
+        assert_eq!(data.remote_samples.len(), 2);
+        assert_eq!(data.median_duration(true), Some(900)); // (800 + 1000) / 2
+
+        // Different kind should be separate
+        let data2 = history.get("proj1", Some(CompilationKind::CargoTest));
+        assert!(data2.is_none());
+    }
+
+    #[test]
+    fn test_timing_history_serialization() {
+        let mut history = super::TimingHistory::default();
+        history.record("proj", Some(CompilationKind::CargoCheck), 500, false);
+        history.record("proj", Some(CompilationKind::CargoCheck), 250, true);
+
+        let json = serde_json::to_string(&history).unwrap();
+        let loaded: super::TimingHistory = serde_json::from_str(&json).unwrap();
+
+        let data = loaded.get("proj", Some(CompilationKind::CargoCheck)).unwrap();
+        assert_eq!(data.local_samples.len(), 1);
+        assert_eq!(data.remote_samples.len(), 1);
+    }
 }
