@@ -56,6 +56,17 @@ jobs:
           chmod +x tests/manifest_sync_test.sh
           ./tests/manifest_sync_test.sh
 
+  # Validate GitHub Actions workflow syntax
+  workflow_lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Dependabot automerge workflow
+        run: |
+          chmod +x scripts/test_dependabot_automerge_workflow.sh
+          ./scripts/test_dependabot_automerge_workflow.sh
+
   # Ensure consistent formatting
   fmt:
     runs-on: ubuntu-latest
