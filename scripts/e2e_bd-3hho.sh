@@ -61,9 +61,9 @@ write_transfer_config() {
     mkdir -p "$project_dir/.rch"
     {
         echo "[transfer]"
-        [[ -n "$max_transfer_mb" ]] && echo "max_transfer_mb = $max_transfer_mb"
-        [[ -n "$max_transfer_time_ms" ]] && echo "max_transfer_time_ms = $max_transfer_time_ms"
-        [[ -n "$bwlimit_kbps" ]] && echo "bwlimit_kbps = $bwlimit_kbps"
+        [[ -n "$max_transfer_mb" ]] && echo "max_transfer_mb = $max_transfer_mb" || true
+        [[ -n "$max_transfer_time_ms" ]] && echo "max_transfer_time_ms = $max_transfer_time_ms" || true
+        [[ -n "$bwlimit_kbps" ]] && echo "bwlimit_kbps = $bwlimit_kbps" || true
     } > "$project_dir/.rch/config.toml"
 }
 

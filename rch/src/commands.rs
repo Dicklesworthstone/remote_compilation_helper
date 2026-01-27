@@ -8412,6 +8412,7 @@ pub async fn init_wizard(yes: bool, skip_test: bool, ctx: &OutputContext) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::status_types::format_bytes;
     use rch_common::CompilationKind;
 
     // -------------------------------------------------------------------------
@@ -8857,6 +8858,7 @@ mod tests {
                 bun_version: None,
                 node_version: None,
                 npm_version: None,
+                ..Default::default()
             }),
             required_runtime: Some(RequiredRuntime::Rust),
             warnings: vec!["warn".to_string()],
@@ -8874,6 +8876,7 @@ mod tests {
             bun_version: None,
             node_version: None,
             npm_version: None,
+            ..Default::default()
         };
         let workers = vec![
             WorkerCapabilitiesFromApi {
@@ -8891,6 +8894,7 @@ mod tests {
                     bun_version: None,
                     node_version: None,
                     npm_version: None,
+                    ..Default::default()
                 },
             },
         ];
@@ -9173,14 +9177,14 @@ mod tests {
     #[test]
     fn format_bytes_basic() {
         assert_eq!(format_bytes(500), "500 B");
-        assert_eq!(format_bytes(1024), "1.00 KB");
-        assert_eq!(format_bytes(1024 * 1024), "1.00 MB");
-        assert_eq!(format_bytes(1024 * 1024 * 1024), "1.00 GB");
+        assert_eq!(format_bytes(1024), "1.0 KB");
+        assert_eq!(format_bytes(1024 * 1024), "1.0 MB");
+        assert_eq!(format_bytes(1024 * 1024 * 1024), "1.0 GB");
     }
 
     #[test]
     fn format_bytes_fractional() {
-        assert_eq!(format_bytes(1536), "1.50 KB");
-        assert_eq!(format_bytes(1024 * 1024 + 512 * 1024), "1.50 MB");
+        assert_eq!(format_bytes(1536), "1.5 KB");
+        assert_eq!(format_bytes(1024 * 1024 + 512 * 1024), "1.5 MB");
     }
 }

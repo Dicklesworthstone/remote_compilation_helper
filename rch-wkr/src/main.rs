@@ -326,7 +326,126 @@ fn probe_capabilities() -> WorkerCapabilities {
         }
     }
 
+    // Probe system health metrics (bd-3eaa)
+    capabilities.num_cpus = probe_num_cpus();
+    if let Some((load1, load5, load15)) = probe_load_average() {
+        capabilities.load_avg_1 = Some(load1);
+        capabilities.load_avg_5 = Some(load5);
+        capabilities.load_avg_15 = Some(load15);
+    }
+    if let Some((free_gb, total_gb)) = probe_disk_space() {
+        capabilities.disk_free_gb = Some(free_gb);
+        capabilities.disk_total_gb = Some(total_gb);
+    }
+
     capabilities
+}
+
+/// Probe number of CPU cores.
+fn probe_num_cpus() -> Option<u32> {
+    use std::process::Command;
+
+    // Try nproc first (Linux)
+    if let Ok(output) = Command::new("nproc").output()
+        && output.status.success()
+    {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if let Ok(n) = stdout.trim().parse::<u32>() {
+            return Some(n);
+        }
+    }
+
+    // Fallback: sysctl on macOS
+    if let Ok(output) = Command::new("sysctl").args(["-n", "hw.ncpu"]).output()
+        && output.status.success()
+    {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if let Ok(n) = stdout.trim().parse::<u32>() {
+            return Some(n);
+        }
+    }
+
+    None
+}
+
+/// Probe load average (1, 5, 15 minute averages).
+fn probe_load_average() -> Option<(f64, f64, f64)> {
+    // Try /proc/loadavg first (Linux)
+    if let Ok(contents) = std::fs::read_to_string("/proc/loadavg") {
+        let parts: Vec<&str> = contents.split_whitespace().collect();
+        if parts.len() >= 3
+            && let (Ok(l1), Ok(l5), Ok(l15)) = (
+                parts[0].parse::<f64>(),
+                parts[1].parse::<f64>(),
+                parts[2].parse::<f64>(),
+            )
+        {
+            return Some((l1, l5, l15));
+        }
+    }
+
+    // Fallback: uptime command (macOS and Linux)
+    if let Ok(output) = std::process::Command::new("uptime").output()
+        && output.status.success()
+    {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // Parse "load average: 1.23, 4.56, 7.89" or similar
+        if let Some(idx) = stdout
+            .find("load average:")
+            .or_else(|| stdout.find("load averages:"))
+        {
+            let after = &stdout[idx..];
+            // Find numbers after the colon
+            if let Some(colon_idx) = after.find(':') {
+                let numbers_part = &after[colon_idx + 1..];
+                let parts: Vec<&str> = numbers_part
+                    .split(|c: char| c == ',' || c.is_whitespace())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if parts.len() >= 3
+                    && let (Ok(l1), Ok(l5), Ok(l15)) = (
+                        parts[0].parse::<f64>(),
+                        parts[1].parse::<f64>(),
+                        parts[2].parse::<f64>(),
+                    )
+                {
+                    return Some((l1, l5, l15));
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Probe disk space for /tmp (free and total in GB).
+fn probe_disk_space() -> Option<(f64, f64)> {
+    use std::process::Command;
+
+    // Use df to get disk space for /tmp
+    // Try POSIX format first (works on Linux and macOS)
+    if let Ok(output) = Command::new("df").args(["-P", "-k", "/tmp"]).output()
+        && output.status.success()
+    {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // Skip header line, parse second line
+        // Format: Filesystem 1024-blocks Used Available Capacity Mounted
+        for line in stdout.lines().skip(1) {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 4 {
+                // parts[1] = total 1K blocks, parts[3] = available 1K blocks
+                if let (Ok(total_kb), Ok(avail_kb)) =
+                    (parts[1].parse::<u64>(), parts[3].parse::<u64>())
+                {
+                    let total_gb = total_kb as f64 / (1024.0 * 1024.0);
+                    let free_gb = avail_kb as f64 / (1024.0 * 1024.0);
+                    return Some((free_gb, total_gb));
+                }
+            }
+        }
+    }
+
+    None
 }
 
 async fn run_benchmark() -> Result<()> {

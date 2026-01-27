@@ -260,6 +260,16 @@ pub struct SelectionConfig {
     /// Cache affinity settings for project-to-worker pinning.
     #[serde(default)]
     pub affinity: AffinityConfig,
+
+    // Preflight health guards (bd-3eaa)
+    /// Maximum load-per-core threshold. Workers exceeding this are skipped.
+    /// Set to None to disable load-based filtering.
+    #[serde(default = "default_max_load_per_core")]
+    pub max_load_per_core: Option<f64>,
+    /// Minimum free disk space in GB. Workers below this are skipped.
+    /// Set to None to disable disk-based filtering.
+    #[serde(default = "default_min_free_gb")]
+    pub min_free_gb: Option<f64>,
 }
 
 impl Default for SelectionConfig {
@@ -270,12 +280,22 @@ impl Default for SelectionConfig {
             weights: SelectionWeightConfig::default(),
             fairness: FairnessConfig::default(),
             affinity: AffinityConfig::default(),
+            max_load_per_core: default_max_load_per_core(),
+            min_free_gb: default_min_free_gb(),
         }
     }
 }
 
 fn default_min_success_rate() -> f64 {
     0.8
+}
+
+fn default_max_load_per_core() -> Option<f64> {
+    Some(2.0) // Skip workers with load/core > 2.0
+}
+
+fn default_min_free_gb() -> Option<f64> {
+    Some(10.0) // Skip workers with < 10 GB free
 }
 
 /// Weight configuration for the balanced selection strategy.
@@ -526,6 +546,26 @@ pub struct WorkerCapabilities {
     /// npm version (from `npm --version`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub npm_version: Option<String>,
+
+    // Health metrics (bd-3eaa)
+    /// Number of CPU cores on the worker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub num_cpus: Option<u32>,
+    /// 1-minute load average.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load_avg_1: Option<f64>,
+    /// 5-minute load average.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load_avg_5: Option<f64>,
+    /// 15-minute load average.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load_avg_15: Option<f64>,
+    /// Free disk space in GB (on /tmp or build directory).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_free_gb: Option<f64>,
+    /// Total disk space in GB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_total_gb: Option<f64>,
 }
 
 impl WorkerCapabilities {
@@ -557,6 +597,27 @@ impl WorkerCapabilities {
     /// Check if this worker has Rust installed.
     pub fn has_rust(&self) -> bool {
         self.rustc_version.is_some()
+    }
+
+    /// Calculate load per core (1-minute load average / num_cpus).
+    /// Returns None if metrics are unavailable.
+    pub fn load_per_core(&self) -> Option<f64> {
+        match (self.load_avg_1, self.num_cpus) {
+            (Some(load), Some(cpus)) if cpus > 0 => Some(load / cpus as f64),
+            _ => None,
+        }
+    }
+
+    /// Check if worker has high load (exceeds threshold).
+    /// Returns None if metrics unavailable (fail-open).
+    pub fn is_high_load(&self, max_load_per_core: f64) -> Option<bool> {
+        self.load_per_core().map(|lpc| lpc > max_load_per_core)
+    }
+
+    /// Check if worker has low disk space (below threshold).
+    /// Returns None if metrics unavailable (fail-open).
+    pub fn is_low_disk(&self, min_free_gb: f64) -> Option<bool> {
+        self.disk_free_gb.map(|free| free < min_free_gb)
     }
 }
 
@@ -2370,6 +2431,7 @@ mod tests {
             bun_version: Some("1.0.25".to_string()),
             node_version: Some("v20.11.0".to_string()),
             npm_version: Some("10.2.4".to_string()),
+            ..Default::default()
         };
 
         assert!(caps.has_rust());
@@ -2398,6 +2460,7 @@ mod tests {
             bun_version: Some("1.0.25".to_string()),
             node_version: None,
             npm_version: None,
+            ..Default::default()
         };
 
         let json = serde_json::to_string(&caps).unwrap();
@@ -2434,6 +2497,7 @@ mod tests {
             bun_version: None,
             node_version: Some("v20".to_string()),
             npm_version: None,
+            ..Default::default()
         };
 
         let cloned = caps.clone();
