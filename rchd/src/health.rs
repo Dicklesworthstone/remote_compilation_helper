@@ -1501,4 +1501,426 @@ mod tests {
         assert!(result.checked_at >= before);
         assert!(result.checked_at <= after);
     }
+
+    // ============================================================================
+    // Additional coverage tests for HealthMonitor async methods
+    // ============================================================================
+
+    #[tokio::test]
+    async fn test_health_monitor_stop() {
+        let _lock = test_lock().lock().await;
+        let pool = WorkerPool::new();
+        let config = HealthConfig::default();
+        let monitor = HealthMonitor::new(pool, config);
+
+        // Verify initial state
+        assert!(!*monitor.running.read().await);
+
+        // Stop should set running to false (idempotent when not started)
+        monitor.stop().await;
+        assert!(!*monitor.running.read().await);
+    }
+
+    #[tokio::test]
+    async fn test_health_monitor_get_health_empty() {
+        let _lock = test_lock().lock().await;
+        let pool = WorkerPool::new();
+        let config = HealthConfig::default();
+        let monitor = HealthMonitor::new(pool, config);
+
+        // No workers tracked yet
+        let health = monitor.get_health("nonexistent-worker").await;
+        assert!(health.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_health_monitor_get_health_after_manual_insert() {
+        let _lock = test_lock().lock().await;
+        let pool = WorkerPool::new();
+        let config = HealthConfig::default();
+        let monitor = HealthMonitor::new(pool, config);
+
+        // Manually insert a health state
+        {
+            let mut states = monitor.health_states.write().await;
+            let health = WorkerHealth {
+                current_status: WorkerStatus::Degraded,
+                ..Default::default()
+            };
+            states.insert("test-worker".to_string(), health);
+        }
+
+        // Now get_health should find it
+        let health = monitor.get_health("test-worker").await;
+        assert_eq!(health, Some(WorkerStatus::Degraded));
+    }
+
+    #[tokio::test]
+    async fn test_health_monitor_all_health_states_empty() {
+        let _lock = test_lock().lock().await;
+        let pool = WorkerPool::new();
+        let config = HealthConfig::default();
+        let monitor = HealthMonitor::new(pool, config);
+
+        let states = monitor.all_health_states().await;
+        assert!(states.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_health_monitor_all_health_states_multiple() {
+        let _lock = test_lock().lock().await;
+        let pool = WorkerPool::new();
+        let config = HealthConfig::default();
+        let monitor = HealthMonitor::new(pool, config);
+
+        // Insert multiple health states
+        {
+            let mut states = monitor.health_states.write().await;
+
+            let health1 = WorkerHealth {
+                current_status: WorkerStatus::Healthy,
+                ..Default::default()
+            };
+            states.insert("worker-1".to_string(), health1);
+
+            let health2 = WorkerHealth {
+                current_status: WorkerStatus::Degraded,
+                ..Default::default()
+            };
+            states.insert("worker-2".to_string(), health2);
+
+            let health3 = WorkerHealth {
+                current_status: WorkerStatus::Unreachable,
+                ..Default::default()
+            };
+            states.insert("worker-3".to_string(), health3);
+        }
+
+        let all_states = monitor.all_health_states().await;
+        assert_eq!(all_states.len(), 3);
+
+        // Check that all expected workers are present
+        let worker_ids: Vec<&str> = all_states.iter().map(|(id, _)| id.as_str()).collect();
+        assert!(worker_ids.contains(&"worker-1"));
+        assert!(worker_ids.contains(&"worker-2"));
+        assert!(worker_ids.contains(&"worker-3"));
+    }
+
+    // ============================================================================
+    // Tests for probe_worker function
+    // ============================================================================
+
+    #[tokio::test]
+    async fn test_probe_worker_mock_success() {
+        let _lock = test_lock().lock().await;
+        set_mock_enabled_override(Some(true));
+        // Health check expects "health_check" as the response
+        set_mock_ssh_config_override(Some(MockConfig::success().with_stdout("health_check")));
+
+        let worker = WorkerState::new(WorkerConfig {
+            id: WorkerId::new("probe-test"),
+            host: "probe.host".to_string(),
+            user: "probeuser".to_string(),
+            identity_file: "~/.ssh/probe".to_string(),
+            total_slots: 8,
+            priority: 100,
+            tags: vec![],
+        });
+
+        let result = probe_worker(&worker).await;
+
+        clear_mock_overrides();
+
+        assert!(result.healthy);
+        assert!(result.response_time_ms > 0);
+    }
+
+    #[tokio::test]
+    async fn test_probe_worker_mock_failure() {
+        let _lock = test_lock().lock().await;
+        set_mock_enabled_override(Some(true));
+        set_mock_ssh_config_override(Some(MockConfig::connection_failure()));
+
+        let worker = WorkerState::new(WorkerConfig {
+            id: WorkerId::new("probe-fail"),
+            host: "fail.host".to_string(),
+            user: "failuser".to_string(),
+            identity_file: "~/.ssh/fail".to_string(),
+            total_slots: 4,
+            priority: 50,
+            tags: vec![],
+        });
+
+        let result = probe_worker(&worker).await;
+
+        clear_mock_overrides();
+
+        assert!(!result.healthy);
+        assert!(result.error.is_some());
+    }
+
+    // ============================================================================
+    // Tests for probe_worker_capabilities function
+    // ============================================================================
+
+    #[tokio::test]
+    async fn test_probe_worker_capabilities_mock_mode() {
+        let _lock = test_lock().lock().await;
+        set_mock_enabled_override(Some(true));
+
+        let worker_config = WorkerConfig {
+            id: WorkerId::new("cap-mock"),
+            host: "cap.mock.host".to_string(),
+            user: "capuser".to_string(),
+            identity_file: "~/.ssh/cap".to_string(),
+            total_slots: 8,
+            priority: 100,
+            tags: vec![],
+        };
+        let worker = Arc::new(WorkerState::new(worker_config));
+
+        let capabilities = probe_worker_capabilities(&worker, Duration::from_secs(5)).await;
+
+        clear_mock_overrides();
+
+        // In mock mode, should return mock capabilities
+        assert!(capabilities.is_some());
+        let caps = capabilities.unwrap();
+        // Mock capabilities include Rust
+        assert!(caps.rustc_version.is_some());
+    }
+
+    // ============================================================================
+    // Tests for check_worker_health edge cases
+    // ============================================================================
+
+    #[tokio::test]
+    async fn test_check_worker_health_mock_command_failure() {
+        let _lock = test_lock().lock().await;
+        set_mock_enabled_override(Some(true));
+        set_mock_ssh_config_override(Some(MockConfig::command_failure(42, "command failed")));
+
+        let worker_config = WorkerConfig {
+            id: WorkerId::new("cmd-fail"),
+            host: "cmdfail.host".to_string(),
+            user: "cmduser".to_string(),
+            identity_file: "~/.ssh/cmd".to_string(),
+            total_slots: 4,
+            priority: 50,
+            tags: vec![],
+        };
+        let worker = Arc::new(WorkerState::new(worker_config));
+
+        let result = check_worker_health(&worker, &HealthConfig::default()).await;
+
+        clear_mock_overrides();
+
+        // Command failure should result in unhealthy
+        assert!(!result.healthy);
+        assert!(result.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_check_worker_health_mock_unexpected_output() {
+        let _lock = test_lock().lock().await;
+        set_mock_enabled_override(Some(true));
+        // Create a mock config that returns success but with wrong output
+        let config = MockConfig::success().with_stdout("wrong_output");
+        set_mock_ssh_config_override(Some(config));
+
+        let worker_config = WorkerConfig {
+            id: WorkerId::new("bad-output"),
+            host: "badout.host".to_string(),
+            user: "baduser".to_string(),
+            identity_file: "~/.ssh/bad".to_string(),
+            total_slots: 4,
+            priority: 50,
+            tags: vec![],
+        };
+        let worker = Arc::new(WorkerState::new(worker_config));
+
+        let result = check_worker_health(&worker, &HealthConfig::default()).await;
+
+        clear_mock_overrides();
+
+        // Wrong output should result in failure
+        assert!(!result.healthy);
+        assert!(result.error.is_some());
+        assert!(result.error.unwrap().contains("Unexpected response"));
+    }
+
+    // ============================================================================
+    // Tests for WorkerHealth new() method
+    // ============================================================================
+
+    #[test]
+    fn test_worker_health_new() {
+        let _guard = test_guard!();
+        let health = WorkerHealth::new();
+
+        assert!(health.last_result.is_none());
+        assert_eq!(health.current_status, WorkerStatus::Healthy);
+        assert_eq!(health.circuit.state(), CircuitState::Closed);
+        assert!(health.last_error.is_none());
+    }
+
+    // ============================================================================
+    // Tests for circuit stats accessor
+    // ============================================================================
+
+    #[test]
+    fn test_worker_health_circuit_stats() {
+        let _guard = test_guard!();
+        let config = HealthConfig::default();
+        let mut health = WorkerHealth::default();
+
+        // Record some failures to change stats
+        health.update(
+            HealthCheckResult::failure("Error 1".to_string()),
+            &config,
+            "test-worker",
+        );
+        health.update(
+            HealthCheckResult::failure("Error 2".to_string()),
+            &config,
+            "test-worker",
+        );
+
+        let stats = health.circuit_stats();
+        assert_eq!(stats.consecutive_failures(), 2);
+    }
+
+    // ============================================================================
+    // Tests for is_mock_transport helper
+    // ============================================================================
+
+    #[test]
+    fn test_is_mock_transport_disabled() {
+        let _guard = test_guard!();
+        clear_mock_overrides();
+
+        let worker = WorkerState::new(WorkerConfig {
+            id: WorkerId::new("transport-test"),
+            host: "transport.host".to_string(),
+            user: "user".to_string(),
+            identity_file: "~/.ssh/key".to_string(),
+            total_slots: 4,
+            priority: 100,
+            tags: vec![],
+        });
+
+        // When mock is not enabled, is_mock_transport returns false
+        set_mock_enabled_override(Some(false));
+        assert!(!is_mock_transport(&worker));
+        clear_mock_overrides();
+    }
+
+    #[test]
+    fn test_is_mock_transport_enabled() {
+        let _guard = test_guard!();
+
+        let worker = WorkerState::new(WorkerConfig {
+            id: WorkerId::new("transport-test-2"),
+            host: "transport2.host".to_string(),
+            user: "user".to_string(),
+            identity_file: "~/.ssh/key".to_string(),
+            total_slots: 4,
+            priority: 100,
+            tags: vec![],
+        });
+
+        set_mock_enabled_override(Some(true));
+        assert!(is_mock_transport(&worker));
+        clear_mock_overrides();
+    }
+
+    // ============================================================================
+    // Edge case tests for circuit state transitions
+    // ============================================================================
+
+    #[test]
+    fn test_circuit_stays_open_with_long_cooldown() {
+        let _guard = test_guard!();
+        let config = HealthConfig {
+            circuit: CircuitBreakerConfig {
+                failure_threshold: 2,
+                open_cooldown_secs: 3600, // Long cooldown
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut health = WorkerHealth::default();
+
+        // Fail enough to open circuit
+        for _ in 0..2 {
+            health.update(
+                HealthCheckResult::failure("Error".to_string()),
+                &config,
+                "test-worker",
+            );
+        }
+
+        // Circuit should be Open (not HalfOpen) because cooldown hasn't elapsed
+        assert_eq!(health.circuit_state(), CircuitState::Open);
+        assert_eq!(health.status(), WorkerStatus::Unreachable);
+    }
+
+    #[test]
+    fn test_success_clears_consecutive_failures() {
+        let _guard = test_guard!();
+        let config = HealthConfig {
+            circuit: CircuitBreakerConfig {
+                failure_threshold: 5, // High threshold
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut health = WorkerHealth::default();
+
+        // Record 3 failures
+        for _ in 0..3 {
+            health.update(
+                HealthCheckResult::failure("Error".to_string()),
+                &config,
+                "test-worker",
+            );
+        }
+        assert_eq!(health.circuit_stats().consecutive_failures(), 3);
+
+        // Success should reset consecutive failures
+        health.update(HealthCheckResult::success(50), &config, "test-worker");
+        assert_eq!(health.circuit_stats().consecutive_failures(), 0);
+    }
+
+    #[test]
+    fn test_degraded_status_on_slow_response() {
+        let _guard = test_guard!();
+        let config = HealthConfig {
+            degraded_threshold_ms: 1000, // 1 second threshold
+            ..Default::default()
+        };
+        let mut health = WorkerHealth::default();
+
+        // Slow but successful response
+        health.update(HealthCheckResult::success(1500), &config, "test-worker");
+
+        assert_eq!(health.circuit_state(), CircuitState::Closed);
+        assert_eq!(health.status(), WorkerStatus::Degraded);
+    }
+
+    #[test]
+    fn test_healthy_status_on_fast_response() {
+        let _guard = test_guard!();
+        let config = HealthConfig {
+            degraded_threshold_ms: 1000,
+            ..Default::default()
+        };
+        let mut health = WorkerHealth::default();
+
+        // Fast successful response
+        health.update(HealthCheckResult::success(500), &config, "test-worker");
+
+        assert_eq!(health.circuit_state(), CircuitState::Closed);
+        assert_eq!(health.status(), WorkerStatus::Healthy);
+    }
 }

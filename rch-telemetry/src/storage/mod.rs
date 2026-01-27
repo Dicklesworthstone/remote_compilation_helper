@@ -603,4 +603,400 @@ mod tests {
         assert!(stats.avg_duration_ms > 0);
         assert_eq!(stats.runs_by_kind.get("cargo_test"), Some(&1));
     }
+
+    // -------------------------------------------------------------------------
+    // MaintenanceStats tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_maintenance_stats_debug() {
+        let stats = MaintenanceStats {
+            aggregated_hours: 10,
+            deleted_raw: 100,
+            deleted_hourly: 5,
+            vacuumed: true,
+        };
+        let debug_str = format!("{:?}", stats);
+        assert!(debug_str.contains("MaintenanceStats"));
+        assert!(debug_str.contains("aggregated_hours"));
+        assert!(debug_str.contains("10"));
+    }
+
+    #[test]
+    fn test_maintenance_stats_clone() {
+        let stats = MaintenanceStats {
+            aggregated_hours: 10,
+            deleted_raw: 100,
+            deleted_hourly: 5,
+            vacuumed: false,
+        };
+        let cloned = stats;
+        assert_eq!(cloned.aggregated_hours, 10);
+        assert_eq!(cloned.deleted_raw, 100);
+        assert_eq!(cloned.deleted_hourly, 5);
+        assert!(!cloned.vacuumed);
+    }
+
+    // -------------------------------------------------------------------------
+    // SpeedScoreHistoryPage tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_speedscore_history_page_debug() {
+        let page = SpeedScoreHistoryPage {
+            total: 100,
+            entries: vec![],
+        };
+        let debug_str = format!("{:?}", page);
+        assert!(debug_str.contains("SpeedScoreHistoryPage"));
+        assert!(debug_str.contains("total"));
+        assert!(debug_str.contains("100"));
+    }
+
+    #[test]
+    fn test_speedscore_history_page_clone() {
+        let page = SpeedScoreHistoryPage {
+            total: 50,
+            entries: vec![],
+        };
+        let cloned = page.clone();
+        assert_eq!(cloned.total, 50);
+        assert!(cloned.entries.is_empty());
+    }
+
+    // -------------------------------------------------------------------------
+    // StorageStats tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_storage_stats_debug() {
+        let stats = StorageStats {
+            telemetry_snapshots: 1000,
+            hourly_aggregates: 24,
+            speedscore_entries: 10,
+            test_runs: 500,
+            db_size_bytes: 1048576,
+        };
+        let debug_str = format!("{:?}", stats);
+        assert!(debug_str.contains("StorageStats"));
+        assert!(debug_str.contains("telemetry_snapshots"));
+        assert!(debug_str.contains("1000"));
+    }
+
+    #[test]
+    fn test_storage_stats_clone() {
+        let stats = StorageStats {
+            telemetry_snapshots: 1000,
+            hourly_aggregates: 24,
+            speedscore_entries: 10,
+            test_runs: 500,
+            db_size_bytes: 1048576,
+        };
+        let cloned = stats.clone();
+        assert_eq!(cloned.telemetry_snapshots, 1000);
+        assert_eq!(cloned.hourly_aggregates, 24);
+        assert_eq!(cloned.speedscore_entries, 10);
+        assert_eq!(cloned.test_runs, 500);
+        assert_eq!(cloned.db_size_bytes, 1048576);
+    }
+
+    // -------------------------------------------------------------------------
+    // speedscore_history tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_speedscore_history_empty() {
+        let storage = TelemetryStorage::new_in_memory().expect("storage");
+        let since = Utc::now() - ChronoDuration::days(30);
+
+        let page = storage
+            .speedscore_history("nonexistent-worker", since, 10, 0)
+            .expect("history");
+
+        assert_eq!(page.total, 0);
+        assert!(page.entries.is_empty());
+    }
+
+    #[test]
+    fn test_speedscore_history_with_entries() {
+        let storage = TelemetryStorage::new_in_memory().expect("storage");
+
+        // Insert multiple scores
+        for i in 0..5 {
+            let score = SpeedScore {
+                total: 70.0 + i as f64,
+                cpu_score: 80.0,
+                memory_score: 75.0,
+                disk_score: 70.0,
+                network_score: 65.0,
+                compilation_score: 60.0,
+                calculated_at: Utc::now(),
+                ..SpeedScore::default()
+            };
+            storage
+                .insert_speedscore("worker-history", &score)
+                .expect("insert");
+        }
+
+        let since = Utc::now() - ChronoDuration::hours(1);
+        let page = storage
+            .speedscore_history("worker-history", since, 10, 0)
+            .expect("history");
+
+        assert_eq!(page.total, 5);
+        assert_eq!(page.entries.len(), 5);
+    }
+
+    #[test]
+    fn test_speedscore_history_pagination() {
+        let storage = TelemetryStorage::new_in_memory().expect("storage");
+
+        // Insert 10 scores
+        for i in 0..10 {
+            let score = SpeedScore {
+                total: 50.0 + i as f64,
+                calculated_at: Utc::now(),
+                ..SpeedScore::default()
+            };
+            storage
+                .insert_speedscore("worker-paginate", &score)
+                .expect("insert");
+        }
+
+        let since = Utc::now() - ChronoDuration::hours(1);
+
+        // First page
+        let page1 = storage
+            .speedscore_history("worker-paginate", since, 3, 0)
+            .expect("page 1");
+        assert_eq!(page1.total, 10);
+        assert_eq!(page1.entries.len(), 3);
+
+        // Second page
+        let page2 = storage
+            .speedscore_history("worker-paginate", since, 3, 3)
+            .expect("page 2");
+        assert_eq!(page2.total, 10);
+        assert_eq!(page2.entries.len(), 3);
+
+        // Last page
+        let page4 = storage
+            .speedscore_history("worker-paginate", since, 3, 9)
+            .expect("page 4");
+        assert_eq!(page4.total, 10);
+        assert_eq!(page4.entries.len(), 1);
+    }
+
+    // -------------------------------------------------------------------------
+    // integrity_check tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_integrity_check_healthy_db() {
+        let storage = TelemetryStorage::new_in_memory().expect("storage");
+        let result = storage.integrity_check();
+        assert!(result.is_ok(), "healthy DB should pass integrity check");
+    }
+
+    // -------------------------------------------------------------------------
+    // stats tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_stats_empty_db() {
+        let storage = TelemetryStorage::new_in_memory().expect("storage");
+        let stats = storage.stats().expect("stats");
+
+        assert_eq!(stats.telemetry_snapshots, 0);
+        assert_eq!(stats.hourly_aggregates, 0);
+        assert_eq!(stats.speedscore_entries, 0);
+        assert_eq!(stats.test_runs, 0);
+        // In-memory DB has no file size
+        assert_eq!(stats.db_size_bytes, 0);
+    }
+
+    #[test]
+    fn test_stats_with_data() {
+        let storage = TelemetryStorage::new_in_memory().expect("storage");
+
+        // Insert some telemetry
+        let telemetry = make_telemetry("worker-stats");
+        storage.insert_telemetry(&telemetry).expect("insert");
+
+        // Insert some speedscores
+        let score = SpeedScore::default();
+        storage
+            .insert_speedscore("worker-stats", &score)
+            .expect("insert speedscore");
+
+        // Insert a test run
+        let record = TestRunRecord {
+            project_id: "proj".to_string(),
+            worker_id: "worker-stats".to_string(),
+            command: "cargo test".to_string(),
+            kind: "cargo_test".to_string(),
+            exit_code: 0,
+            duration_ms: 1000,
+            completed_at: Utc::now(),
+        };
+        storage.insert_test_run(&record).expect("insert test run");
+
+        let stats = storage.stats().expect("stats");
+
+        assert_eq!(stats.telemetry_snapshots, 1);
+        assert_eq!(stats.speedscore_entries, 1);
+        assert_eq!(stats.test_runs, 1);
+    }
+
+    // -------------------------------------------------------------------------
+    // maintenance tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_maintenance_on_empty_db() {
+        let storage = TelemetryStorage::new_in_memory().expect("storage");
+        let stats = storage.maintenance().expect("maintenance");
+
+        // Nothing to aggregate or delete
+        assert_eq!(stats.aggregated_hours, 0);
+        assert_eq!(stats.deleted_raw, 0);
+        assert_eq!(stats.deleted_hourly, 0);
+        assert!(!stats.vacuumed); // In-memory DB doesn't vacuum
+    }
+
+    // -------------------------------------------------------------------------
+    // test_run_stats edge cases
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_test_run_stats_multiple_kinds() {
+        let storage = TelemetryStorage::new_in_memory().expect("storage");
+
+        let kinds = ["cargo_test", "cargo_bench", "cargo_clippy"];
+        for kind in kinds {
+            let record = TestRunRecord {
+                project_id: "proj".to_string(),
+                worker_id: "worker-1".to_string(),
+                command: format!("cargo {}", kind),
+                kind: kind.to_string(),
+                exit_code: 0,
+                duration_ms: 1000,
+                completed_at: Utc::now(),
+            };
+            storage.insert_test_run(&record).expect("insert");
+        }
+
+        let stats = storage.test_run_stats().expect("stats");
+        assert_eq!(stats.total_runs, 3);
+        assert_eq!(stats.runs_by_kind.len(), 3);
+        assert_eq!(stats.runs_by_kind.get("cargo_test"), Some(&1));
+        assert_eq!(stats.runs_by_kind.get("cargo_bench"), Some(&1));
+        assert_eq!(stats.runs_by_kind.get("cargo_clippy"), Some(&1));
+    }
+
+    #[test]
+    fn test_test_run_stats_exit_codes() {
+        let storage = TelemetryStorage::new_in_memory().expect("storage");
+
+        // Exit code 0 = passed
+        let record_pass = TestRunRecord {
+            project_id: "proj".to_string(),
+            worker_id: "w".to_string(),
+            command: "cargo test".to_string(),
+            kind: "cargo_test".to_string(),
+            exit_code: 0,
+            duration_ms: 1000,
+            completed_at: Utc::now(),
+        };
+        storage.insert_test_run(&record_pass).expect("insert");
+
+        // Exit code 101 = test failure
+        let record_fail = TestRunRecord {
+            exit_code: 101,
+            ..record_pass.clone()
+        };
+        storage.insert_test_run(&record_fail).expect("insert");
+
+        // Exit code 1 = build error
+        let record_build_error = TestRunRecord {
+            exit_code: 1,
+            ..record_pass.clone()
+        };
+        storage
+            .insert_test_run(&record_build_error)
+            .expect("insert");
+
+        let stats = storage.test_run_stats().expect("stats");
+        assert_eq!(stats.total_runs, 3);
+        assert_eq!(stats.passed_runs, 1);
+        assert_eq!(stats.failed_runs, 1);
+        assert_eq!(stats.build_error_runs, 1);
+    }
+
+    // -------------------------------------------------------------------------
+    // latest_speedscore edge cases
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_latest_speedscore_nonexistent_worker() {
+        let storage = TelemetryStorage::new_in_memory().expect("storage");
+        let result = storage
+            .latest_speedscore("nonexistent-worker")
+            .expect("query");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_latest_speedscore_updates_on_insert() {
+        let storage = TelemetryStorage::new_in_memory().expect("storage");
+
+        // Insert first score
+        let score1 = SpeedScore {
+            total: 50.0,
+            calculated_at: Utc::now(),
+            ..SpeedScore::default()
+        };
+        storage
+            .insert_speedscore("worker-update", &score1)
+            .expect("insert 1");
+
+        let latest1 = storage
+            .latest_speedscore("worker-update")
+            .expect("query")
+            .expect("present");
+        assert!((latest1.total - 50.0).abs() < 0.01);
+
+        // Insert second score (higher)
+        let score2 = SpeedScore {
+            total: 90.0,
+            calculated_at: Utc::now(),
+            ..SpeedScore::default()
+        };
+        storage
+            .insert_speedscore("worker-update", &score2)
+            .expect("insert 2");
+
+        let latest2 = storage
+            .latest_speedscore("worker-update")
+            .expect("query")
+            .expect("present");
+        assert!((latest2.total - 90.0).abs() < 0.01);
+    }
+
+    // -------------------------------------------------------------------------
+    // Multiple telemetry inserts
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_insert_multiple_telemetry_snapshots() {
+        let storage = TelemetryStorage::new_in_memory().expect("storage");
+
+        for i in 0..5 {
+            let telemetry = make_telemetry(&format!("worker-{}", i));
+            storage.insert_telemetry(&telemetry).expect("insert");
+        }
+
+        let stats = storage.stats().expect("stats");
+        assert_eq!(stats.telemetry_snapshots, 5);
+    }
 }

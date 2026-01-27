@@ -612,6 +612,7 @@ mod tests {
         // At least some should be distinct
         assert_ne!(branch, end);
         assert_ne!(end, horizontal);
+        assert_ne!(vertical, horizontal);
     }
 
     #[test]
@@ -756,10 +757,10 @@ mod tests {
     }
 
     #[test]
-    fn test_quiet_mode_uses_ascii() {
-        let ctx = OutputContext::Quiet;
+    fn test_plain_mode_uses_ascii() {
+        let ctx = OutputContext::Plain;
 
-        // Quiet mode should use ASCII fallbacks
+        // Plain mode should use ASCII fallbacks
         assert!(Icons::check(ctx).is_ascii());
         assert!(Icons::cross(ctx).is_ascii());
         assert!(Icons::warning(ctx).is_ascii());
@@ -805,7 +806,7 @@ mod tests {
         let contexts = [
             OutputContext::Interactive,
             OutputContext::Plain,
-            OutputContext::Quiet,
+            OutputContext::Colored,
             OutputContext::Hook,
             OutputContext::Machine,
         ];

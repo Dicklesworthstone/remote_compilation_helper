@@ -168,4 +168,186 @@ mod tests {
 
         clear_mock_overrides();
     }
+
+    // -------------------------------------------------------------------------
+    // MockWorkerServer trait tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_mock_worker_server_debug() {
+        let server = MockWorkerServer::builder().bind("debug-worker").build();
+        let debug_str = format!("{:?}", server);
+        assert!(debug_str.contains("MockWorkerServer"));
+        assert!(debug_str.contains("uri"));
+        assert!(debug_str.contains("mock://debug-worker"));
+    }
+
+    #[test]
+    fn test_mock_worker_server_clone() {
+        let server = MockWorkerServer::builder().bind("clone-worker").build();
+        let cloned = server.clone();
+        assert_eq!(cloned.uri(), "mock://clone-worker");
+    }
+
+    // -------------------------------------------------------------------------
+    // MockWorkerServerBuilder trait tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_builder_debug() {
+        let builder = MockWorkerServer::builder().bind("builder-debug");
+        let debug_str = format!("{:?}", builder);
+        assert!(debug_str.contains("MockWorkerServerBuilder"));
+    }
+
+    #[test]
+    fn test_builder_clone() {
+        let builder = MockWorkerServer::builder().bind("builder-clone");
+        let cloned = builder.clone();
+        let server = cloned.build();
+        assert_eq!(server.uri(), "mock://builder-clone");
+    }
+
+    #[test]
+    fn test_builder_default() {
+        let builder = MockWorkerServerBuilder::default();
+        let server = builder.build();
+        // Default should generate unique mock://worker-N URI
+        assert!(server.uri().starts_with("mock://worker-"));
+    }
+
+    // -------------------------------------------------------------------------
+    // Builder method tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_builder_ssh_config() {
+        let custom_config = MockConfig::connection_failure();
+        let server = MockWorkerServer::builder()
+            .ssh_config(custom_config.clone())
+            .build();
+        // Verify the config was set (we can't easily inspect it, but at least it compiles)
+        let debug_str = format!("{:?}", server);
+        assert!(debug_str.contains("ssh_config"));
+    }
+
+    #[test]
+    fn test_builder_rsync_config() {
+        let custom_config = MockRsyncConfig::sync_failure();
+        let server = MockWorkerServer::builder()
+            .rsync_config(custom_config.clone())
+            .build();
+        // Verify the config was set
+        let debug_str = format!("{:?}", server);
+        assert!(debug_str.contains("rsync_config"));
+    }
+
+    #[test]
+    fn test_builder_method_chaining() {
+        let server = MockWorkerServer::builder()
+            .bind("chained-worker")
+            .ssh_config(MockConfig::success())
+            .rsync_config(MockRsyncConfig::success())
+            .build();
+        assert_eq!(server.uri(), "mock://chained-worker");
+    }
+
+    // -------------------------------------------------------------------------
+    // Idempotent start/stop tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_start_is_idempotent() {
+        clear_env();
+        clear_mock_overrides();
+
+        let mut server = MockWorkerServer::builder().bind("idempotent-start").build();
+
+        // Start multiple times should be safe
+        server.start();
+        assert!(is_mock_enabled());
+        server.start(); // Second start should be no-op
+        assert!(is_mock_enabled());
+        server.start(); // Third start should be no-op
+        assert!(is_mock_enabled());
+
+        server.stop();
+        clear_mock_overrides();
+    }
+
+    #[test]
+    fn test_stop_is_idempotent() {
+        clear_env();
+        clear_mock_overrides();
+
+        let mut server = MockWorkerServer::builder().bind("idempotent-stop").build();
+
+        // Stop without start should be safe
+        server.stop();
+        assert!(!is_mock_enabled());
+        server.stop(); // Second stop should be no-op
+        assert!(!is_mock_enabled());
+
+        clear_mock_overrides();
+    }
+
+    #[test]
+    fn test_stop_without_start_is_safe() {
+        clear_env();
+        clear_mock_overrides();
+
+        let mut server = MockWorkerServer::builder().bind("no-start-stop").build();
+        // Never started, stop should be a no-op
+        server.stop();
+        assert!(!is_mock_enabled());
+
+        clear_mock_overrides();
+    }
+
+    // -------------------------------------------------------------------------
+    // Drop behavior tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_drop_clears_mock_state() {
+        clear_env();
+        clear_mock_overrides();
+
+        {
+            let mut server = MockWorkerServer::builder().bind("drop-test").build();
+            server.start();
+            assert!(is_mock_enabled());
+            // Server is dropped here
+        }
+
+        // After drop, mock should be disabled
+        assert!(!is_mock_enabled());
+
+        clear_mock_overrides();
+    }
+
+    // -------------------------------------------------------------------------
+    // URI normalization tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_normalize_uri_without_prefix() {
+        assert_eq!(
+            normalize_uri("localhost:9900".to_string()),
+            "mock://localhost:9900"
+        );
+    }
+
+    #[test]
+    fn test_normalize_uri_with_prefix() {
+        assert_eq!(
+            normalize_uri("mock://already-prefixed".to_string()),
+            "mock://already-prefixed"
+        );
+    }
+
+    #[test]
+    fn test_normalize_uri_empty() {
+        assert_eq!(normalize_uri("".to_string()), "mock://");
+    }
 }
