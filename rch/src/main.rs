@@ -1935,8 +1935,8 @@ async fn handle_workers(action: WorkersAction, ctx: &OutputContext) -> Result<()
     Ok(())
 }
 
-async fn handle_status(workers: bool, jobs: bool, _ctx: &OutputContext) -> Result<()> {
-    commands::status_overview(workers, jobs).await?;
+async fn handle_status(workers: bool, jobs: bool, ctx: &OutputContext) -> Result<()> {
+    commands::status_overview(workers, jobs, ctx).await?;
     Ok(())
 }
 

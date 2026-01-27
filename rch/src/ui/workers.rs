@@ -80,8 +80,11 @@ impl<'a> WorkerTable<'a> {
         // Add rows
         for worker in self.workers {
             let status_text = self.format_status_rich(worker);
-            let slots_text = format!("{}/{}", worker.used_slots, worker.total_slots);
-            let speed_text = format!("{:.1}", worker.speed_score);
+            // Visual slot bar with ratio (e.g., "██░░░░░░ 2/8")
+            let slot_bar = format_slot_bar(worker.used_slots, worker.total_slots, self.context);
+            let slots_text = format!("{} {}/{}", slot_bar, worker.used_slots, worker.total_slots);
+            // Speed with context indicator
+            let speed_text = format_speed_score(worker.speed_score, self.context);
             let circuit_text = self.format_circuit_state(worker);
 
             let row = Row::new(vec![
@@ -183,20 +186,23 @@ impl<'a> WorkerTable<'a> {
 
         // Header
         console.print_plain(&format!(
-            "{:12} {:20} {:12} {:8} {:6} {:10}",
+            "{:12} {:20} {:12} {:16} {:8} {:10}",
             "ID", "Host", "Status", "Slots", "Speed", "Circuit"
         ));
-        console.print_plain(&"-".repeat(70));
+        console.print_plain(&"-".repeat(80));
 
         // Rows
         for worker in self.workers {
             let status_text = self.format_status_plain(worker);
-            let slots_text = format!("{}/{}", worker.used_slots, worker.total_slots);
-            let speed_text = format!("{:.1}", worker.speed_score);
+            // Visual slot bar with ratio
+            let slot_bar = format_slot_bar(worker.used_slots, worker.total_slots, self.context);
+            let slots_text = format!("{} {}/{}", slot_bar, worker.used_slots, worker.total_slots);
+            // Speed with context
+            let speed_text = format_speed_score(worker.speed_score, self.context);
             let circuit_text = self.format_circuit_state(worker);
 
             console.print_plain(&format!(
-                "{:12} {:20} {:12} {:8} {:6} {:10}",
+                "{:12} {:20} {:12} {:16} {:8} {:10}",
                 truncate_str(&worker.id, 12),
                 truncate_str(&worker.host, 20),
                 status_text,
@@ -262,6 +268,63 @@ fn truncate_str(s: &str, max_len: usize) -> String {
         s.to_string()
     } else {
         format!("{}...", &s[..max_len.saturating_sub(3)])
+    }
+}
+
+/// Create a visual slot bar showing used vs total slots.
+///
+/// Example: 2/8 slots → "██░░░░░░" (8 chars)
+fn format_slot_bar(used: u32, total: u32, ctx: OutputContext) -> String {
+    if total == 0 {
+        return "-".to_string();
+    }
+
+    let filled = Icons::slot_filled(ctx);
+    let empty = Icons::slot_empty(ctx);
+
+    // Cap at 8 characters for consistent width
+    let bar_width = total.min(8) as usize;
+    let filled_count = if total <= 8 {
+        used as usize
+    } else {
+        // Scale proportionally for workers with many slots
+        ((used as f64 / total as f64) * bar_width as f64).round() as usize
+    };
+
+    let mut bar = String::new();
+    for i in 0..bar_width {
+        if i < filled_count {
+            bar.push_str(filled);
+        } else {
+            bar.push_str(empty);
+        }
+    }
+    bar
+}
+
+/// Format speed score with visual indicator and context.
+///
+/// Speed scores are relative: 1.0 = baseline, >1.0 = faster, <1.0 = slower.
+/// Example: 1.5 → "⚡1.5x" (fast), 0.5 → "🐢0.5x" (slow)
+fn format_speed_score(score: f64, ctx: OutputContext) -> String {
+    if score <= 0.0 {
+        return "-".to_string();
+    }
+
+    let indicator = if score >= 1.5 {
+        Icons::lightning(ctx) // ⚡ Fast
+    } else if score >= 1.0 {
+        "" // Normal, no indicator
+    } else if score >= 0.5 {
+        "~" // Slow-ish
+    } else {
+        "!" // Very slow
+    };
+
+    if indicator.is_empty() {
+        format!("{score:.1}x")
+    } else {
+        format!("{indicator}{score:.1}x")
     }
 }
 
@@ -387,5 +450,62 @@ mod tests {
         let table = WorkerTable::new(&workers, OutputContext::Plain);
         let result = table.format_status_plain(&workers[1]);
         assert!(result.contains("Offline"));
+    }
+
+    #[test]
+    fn test_format_slot_bar_full() {
+        let bar = format_slot_bar(8, 8, OutputContext::Plain);
+        // All slots used - should be all filled characters
+        assert!(!bar.is_empty());
+        assert!(!bar.contains('-')); // No empty slots in ASCII mode
+    }
+
+    #[test]
+    fn test_format_slot_bar_empty() {
+        let bar = format_slot_bar(0, 8, OutputContext::Plain);
+        // No slots used - should be all empty characters
+        assert!(!bar.is_empty());
+        assert!(!bar.contains('#')); // No filled slots in ASCII mode
+    }
+
+    #[test]
+    fn test_format_slot_bar_partial() {
+        let bar = format_slot_bar(2, 8, OutputContext::Plain);
+        // 2 of 8 slots used
+        assert_eq!(bar.len(), 8); // 8 characters
+        assert!(bar.starts_with("##")); // 2 filled
+        assert!(bar.ends_with("-")); // Rest empty
+    }
+
+    #[test]
+    fn test_format_slot_bar_zero_total() {
+        let bar = format_slot_bar(0, 0, OutputContext::Plain);
+        assert_eq!(bar, "-");
+    }
+
+    #[test]
+    fn test_format_speed_score_fast() {
+        let speed = format_speed_score(1.8, OutputContext::Plain);
+        assert!(speed.contains("1.8x"));
+        assert!(speed.contains("!")); // Lightning ASCII fallback
+    }
+
+    #[test]
+    fn test_format_speed_score_normal() {
+        let speed = format_speed_score(1.0, OutputContext::Plain);
+        assert_eq!(speed, "1.0x");
+    }
+
+    #[test]
+    fn test_format_speed_score_slow() {
+        let speed = format_speed_score(0.5, OutputContext::Plain);
+        assert!(speed.contains("0.5x"));
+        assert!(speed.contains("~")); // Slow indicator
+    }
+
+    #[test]
+    fn test_format_speed_score_zero() {
+        let speed = format_speed_score(0.0, OutputContext::Plain);
+        assert_eq!(speed, "-");
     }
 }
