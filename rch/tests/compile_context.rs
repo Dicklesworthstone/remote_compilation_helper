@@ -58,7 +58,7 @@ fn run_hook(input: &str) -> (i32, String, String, Duration) {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .unwrap_or_else(|e| panic!("Failed to spawn {}: {}", rch, e));
+        .expect("Failed to spawn rch");
 
     // Write input to stdin
     if let Some(ref mut stdin) = child.stdin {

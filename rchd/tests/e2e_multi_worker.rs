@@ -177,12 +177,14 @@ fn test_load_balance_distribution() {
         )
         .unwrap();
 
-        if let Some(body) = extract_json_body(&response) {
-            if let Some(json) = parse_selection_response(body) {
-                if let Some(worker) = json.get("worker").and_then(|w| w.get("id")).and_then(|id| id.as_str()) {
-                    *distribution.entry(worker.to_string()).or_insert(0) += 1;
-                }
-            }
+        if let Some(body) = extract_json_body(&response)
+            && let Some(json) = parse_selection_response(body)
+            && let Some(worker) = json
+                .get("worker")
+                .and_then(|w| w.get("id"))
+                .and_then(|id| id.as_str())
+        {
+            *distribution.entry(worker.to_string()).or_insert(0) += 1;
         }
     }
 
@@ -255,14 +257,15 @@ fn test_worker_prioritization() {
         )
         .unwrap();
 
-        if let Some(body) = extract_json_body(&response) {
-            if let Some(json) = parse_selection_response(body) {
-                if let Some(worker_id) = json.get("worker").and_then(|w| w.get("id")).and_then(|id| id.as_str()) {
-                    if worker_id == "high-priority" {
-                        high_priority_count += 1;
-                    }
-                }
-            }
+        if let Some(body) = extract_json_body(&response)
+            && let Some(json) = parse_selection_response(body)
+            && let Some(worker_id) = json
+                .get("worker")
+                .and_then(|w| w.get("id"))
+                .and_then(|id| id.as_str())
+            && worker_id == "high-priority"
+        {
+            high_priority_count += 1;
         }
     }
 
@@ -327,7 +330,12 @@ fn test_cached_project_locality() {
 
     let first_worker = extract_json_body(&response)
         .and_then(parse_selection_response)
-        .and_then(|json| json.get("worker").and_then(|w| w.get("id")).and_then(|id| id.as_str()).map(|s| s.to_string()));
+        .and_then(|json| {
+            json.get("worker")
+                .and_then(|w| w.get("id"))
+                .and_then(|id| id.as_str())
+                .map(|s| s.to_string())
+        });
 
     harness.logger.info(format!(
         "[e2e::multi_worker] First selection: {:?}",
@@ -345,14 +353,15 @@ fn test_cached_project_locality() {
         )
         .unwrap();
 
-        if let Some(body) = extract_json_body(&response) {
-            if let Some(json) = parse_selection_response(body) {
-                if let Some(worker_id) = json.get("worker").and_then(|w| w.get("id")).and_then(|id| id.as_str()) {
-                    if first_worker.as_deref() == Some(worker_id) {
-                        same_worker_count += 1;
-                    }
-                }
-            }
+        if let Some(body) = extract_json_body(&response)
+            && let Some(json) = parse_selection_response(body)
+            && let Some(worker_id) = json
+                .get("worker")
+                .and_then(|w| w.get("id"))
+                .and_then(|id| id.as_str())
+            && first_worker.as_deref() == Some(worker_id)
+        {
+            same_worker_count += 1;
         }
     }
 
@@ -558,13 +567,12 @@ fn test_selection_avoids_unhealthy() {
         .info(format!("[e2e::multi_worker] Selection result: {}", body));
 
     // Verify a worker was selected
-    if let Some(json) = parse_selection_response(body) {
-        if let Some(worker) = json.get("worker") {
-            harness.logger.info(format!(
-                "[e2e::multi_worker] Selected worker: {}",
-                worker
-            ));
-        }
+    if let Some(json) = parse_selection_response(body)
+        && let Some(worker) = json.get("worker")
+    {
+        harness
+            .logger
+            .info(format!("[e2e::multi_worker] Selected worker: {}", worker));
     }
 
     harness
@@ -641,9 +649,10 @@ fn test_fleet_single_worker_fallback() {
     assert!(response.contains("200 OK"), "Got: {}", response);
 
     let body = extract_json_body(&response).unwrap();
-    harness
-        .logger
-        .info(format!("[e2e::multi_worker] Single worker selection: {}", body));
+    harness.logger.info(format!(
+        "[e2e::multi_worker] Single worker selection: {}",
+        body
+    ));
 
     // Verify selection succeeded
     assert!(body.contains("reason"), "Expected reason in response");

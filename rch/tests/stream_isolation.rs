@@ -50,7 +50,7 @@ fn run_rch(args: &[&str]) -> (i32, String, String) {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
-        .unwrap_or_else(|e| panic!("Failed to run {}: {}", rch, e));
+        .expect("Failed to run rch");
 
     (
         output.status.code().unwrap_or(-1),
@@ -69,7 +69,7 @@ fn run_rch_with_env(args: &[&str], env_key: &str, env_val: &str) -> (i32, String
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
-        .unwrap_or_else(|e| panic!("Failed to run {}: {}", rch, e));
+        .expect("Failed to run rch");
 
     (
         output.status.code().unwrap_or(-1),
@@ -87,7 +87,7 @@ fn run_hook(input: &str) -> (i32, String, String) {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .unwrap_or_else(|e| panic!("Failed to spawn {}: {}", rch, e));
+        .expect("Failed to spawn rch");
 
     if let Some(mut stdin) = child.stdin.take() {
         stdin.write_all(input.as_bytes()).ok();

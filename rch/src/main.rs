@@ -28,7 +28,7 @@ mod update;
 use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::CompleteEnv;
-use rch_common::{LogConfig, init_logging};
+use rch_common::{ApiResponse, LogConfig, init_logging};
 use schemars::schema_for;
 use std::env;
 use std::path::PathBuf;
@@ -607,6 +607,37 @@ The web dashboard provides a modern browser-based interface for:
         #[arg(long)]
         prod: bool,
     },
+
+    /// Export API schemas and error code documentation
+    #[command(after_help = r#"EXAMPLES:
+    rch schema export                     # Export to docs/api/schemas/
+    rch schema export --output ./schemas  # Custom output directory
+    rch schema export --json              # Output summary as JSON
+    rch schema list                       # List available schemas
+
+The schema command generates machine-readable API documentation:
+  - api-response.schema.json    JSON Schema for API response envelope
+  - api-error.schema.json       JSON Schema for error structure
+  - error-codes.json            Complete error code catalog
+
+These files enable agents and tooling to validate RCH output
+and understand error codes programmatically."#)]
+    Schema {
+        #[command(subcommand)]
+        action: SchemaAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum SchemaAction {
+    /// Export all schemas to a directory
+    Export {
+        /// Output directory (default: docs/api/schemas/)
+        #[arg(long, short = 'o')]
+        output: Option<PathBuf>,
+    },
+    /// List available schemas
+    List,
 }
 
 #[derive(Subcommand)]
@@ -1282,7 +1313,90 @@ async fn main() -> Result<()> {
                 no_open,
                 prod,
             } => handle_web(port, no_open, prod, &ctx).await,
+            Commands::Schema { action } => handle_schema_command(action, &ctx),
         },
+    }
+}
+
+/// Handle 'rch schema' subcommands.
+fn handle_schema_command(action: SchemaAction, ctx: &OutputContext) -> Result<()> {
+    use rch_common::api::{export_schemas, generate_error_catalog};
+
+    match action {
+        SchemaAction::Export { output } => {
+            let output_dir = output.unwrap_or_else(|| {
+                // Default to docs/api/schemas/ relative to project root
+                // Try to find project root via Cargo.toml or use current dir
+                let cwd = std::env::current_dir().unwrap_or_default();
+                cwd.join("docs").join("api").join("schemas")
+            });
+
+            let result = export_schemas(&output_dir)?;
+
+            if ctx.is_json() {
+                let response = ApiResponse::ok("schema export", result);
+                println!("{}", serde_json::to_string_pretty(&response)?);
+            } else {
+                println!(
+                    "Exported {} schema files to {}",
+                    result.files_generated, result.output_dir
+                );
+                for file in &result.files {
+                    println!("  - {}", file);
+                }
+            }
+            Ok(())
+        }
+        SchemaAction::List => {
+            #[derive(serde::Serialize, schemars::JsonSchema)]
+            struct SchemaListResponse {
+                schemas: Vec<SchemaInfo>,
+            }
+
+            #[derive(serde::Serialize, schemars::JsonSchema)]
+            struct SchemaInfo {
+                name: String,
+                description: String,
+                filename: String,
+            }
+
+            let schemas = vec![
+                SchemaInfo {
+                    name: "API Response".to_string(),
+                    description: "JSON Schema for the unified API response envelope".to_string(),
+                    filename: "api-response.schema.json".to_string(),
+                },
+                SchemaInfo {
+                    name: "API Error".to_string(),
+                    description: "JSON Schema for error response structure".to_string(),
+                    filename: "api-error.schema.json".to_string(),
+                },
+                SchemaInfo {
+                    name: "Error Codes".to_string(),
+                    description: "Machine-readable error code catalog with all RCH-Exxx codes"
+                        .to_string(),
+                    filename: "error-codes.json".to_string(),
+                },
+            ];
+
+            if ctx.is_json() {
+                let response = ApiResponse::ok("schema list", SchemaListResponse { schemas });
+                println!("{}", serde_json::to_string_pretty(&response)?);
+            } else {
+                println!("Available RCH API Schemas:\n");
+                for schema in &schemas {
+                    println!("  {} ({})", schema.name, schema.filename);
+                    println!("    {}\n", schema.description);
+                }
+
+                // Also show error catalog stats
+                let catalog = generate_error_catalog();
+                println!("Error Catalog Statistics:");
+                println!("  Categories: {}", catalog.categories.len());
+                println!("  Error codes: {}", catalog.errors.len());
+            }
+            Ok(())
+        }
     }
 }
 

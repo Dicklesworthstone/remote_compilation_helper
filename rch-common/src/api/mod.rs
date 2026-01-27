@@ -61,9 +61,14 @@
 
 mod error;
 mod response;
+pub mod schema;
 
 pub use error::{ApiError, ErrorContext, LegacyErrorCode};
 pub use response::{API_VERSION, ApiResponse};
+pub use schema::{
+    ErrorCatalog, ErrorCategoryEntry, ErrorCodeEntry, SchemaExportResult, export_schemas,
+    generate_api_error_schema, generate_api_response_schema, generate_error_catalog,
+};
 
 #[cfg(test)]
 mod tests {

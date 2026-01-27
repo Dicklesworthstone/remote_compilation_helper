@@ -103,3 +103,54 @@ Module breakdown (missing `init_test_logging`):
 2. Prioritize high-test-count files above for compliance updates.
 3. Re-run the audit and track compliance rate over time.
 
+---
+
+## Update: 2026-01-27 (bd-2zsu)
+
+### Infrastructure Status: ✅ Complete
+
+**Rust Logging Infrastructure** (`rch-common/src/testing/`):
+- `TestLogger` with JSONL output to `target/test-logs/`
+- `TestPhase` enum: Setup, Execute, Verify, Teardown
+- `TerminalInfo` for TTY/color status capture
+- TEST START/PASS/FAIL markers via tracing
+- Path resolution fixed to find workspace target/ directory
+
+**Bash Logging Infrastructure** (`scripts/test_lib.sh`):
+- `init_test_log <name>` - creates log file, logs TEST START
+- `log_json <phase> <message> [<data>]` - JSONL logging
+- `log_terminal_info` - captures terminal metadata
+- `test_pass`, `test_fail`, `test_skip` - standard exit functions
+
+**Test Convenience Layer** (`rch/tests/common/logging.rs`):
+- Re-exports `TestLogger`, `TestPhase`, etc. from rch_common::testing
+- `init_test_logging()` for tracing setup
+- `test_log!` macro for backwards compatibility
+
+### Current Adoption
+
+**High Adoption Areas:**
+- `tests/true_e2e/`: 124 TestLogger occurrences across 13 files
+- `rch/tests/compile_context.rs`: Uses TestLogger
+- `rch/tests/stream_isolation.rs`: Updated to use TestLogger
+- `rch/tests/hook_integration.rs`: Uses TestLogger
+
+**Lower Priority Areas:**
+- Unit tests within source files (e.g., `rch/src/main.rs`)
+  - These are small, focused tests where TEST START/PASS overhead may be unnecessary
+  - Consider updating only integration/E2E style tests
+
+### JSONL Output Format
+
+```json
+{"timestamp":"2026-01-27T06:04:31.845Z","test_name":"test_example","phase":"setup","message":"TEST START","duration_ms":0}
+{"timestamp":"2026-01-27T06:04:31.860Z","test_name":"test_example","phase":"execute","message":"Running command","duration_ms":15}
+{"timestamp":"2026-01-27T06:04:31.862Z","test_name":"test_example","phase":"verify","message":"TEST PASS","duration_ms":17}
+```
+
+### Recommendations
+
+1. **For new tests**: Use `TestLogger::for_test("test_name")` with explicit pass()/fail()
+2. **For existing E2E tests**: Migrate to TestLogger when touching the file
+3. **For unit tests in source files**: Optional - use only if debugging needs arise
+

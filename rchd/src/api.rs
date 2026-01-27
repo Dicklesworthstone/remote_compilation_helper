@@ -2399,19 +2399,16 @@ mod tests {
     #[test]
     fn test_parse_request_status() {
         let req = parse_request("GET /status").unwrap();
-        match req {
-            ApiRequest::Status => {} // Correct
-            _ => panic!("expected status request"),
-        }
+        assert!(matches!(req, ApiRequest::Status), "expected status request");
     }
 
     #[test]
     fn test_parse_request_test_run() {
         let req = parse_request("POST /test-run").unwrap();
-        match req {
-            ApiRequest::TestRun => {}
-            _ => panic!("expected test run request"),
-        }
+        assert!(
+            matches!(req, ApiRequest::TestRun),
+            "expected test run request"
+        );
     }
 
     #[test]
@@ -2421,7 +2418,7 @@ mod tests {
             ApiRequest::SpeedScore { worker_id } => {
                 assert_eq!(worker_id.as_str(), "css");
             }
-            _ => panic!("expected speedscore request"),
+            _ => panic!( "expected speedscore request"),
         }
     }
 
@@ -2440,17 +2437,17 @@ mod tests {
                 assert_eq!(limit, 25);
                 assert_eq!(offset, 5);
             }
-            _ => panic!("expected speedscore history request"),
+            _ => panic!( "expected speedscore history request"),
         }
     }
 
     #[test]
     fn test_parse_request_speedscores() {
         let req = parse_request("GET /speedscores").unwrap();
-        match req {
-            ApiRequest::SpeedScores => {}
-            _ => panic!("expected speedscores request"),
-        }
+        assert!(
+            matches!(req, ApiRequest::SpeedScores),
+            "expected speedscores request"
+        );
     }
 
     #[test]
@@ -2460,7 +2457,7 @@ mod tests {
             ApiRequest::WorkersCapabilities { refresh } => {
                 assert!(!refresh);
             }
-            _ => panic!("expected workers capabilities request"),
+            _ => panic!( "expected workers capabilities request"),
         }
 
         let req = parse_request("GET /workers/capabilities?refresh=true").unwrap();
@@ -2468,7 +2465,7 @@ mod tests {
             ApiRequest::WorkersCapabilities { refresh } => {
                 assert!(refresh);
             }
-            _ => panic!("expected workers capabilities request"),
+            _ => panic!( "expected workers capabilities request"),
         }
     }
 
@@ -2479,26 +2476,20 @@ mod tests {
             ApiRequest::BenchmarkTrigger { worker_id } => {
                 assert_eq!(worker_id.as_str(), "css");
             }
-            _ => panic!("expected benchmark trigger request"),
+            _ => panic!( "expected benchmark trigger request"),
         }
     }
 
     #[test]
     fn test_parse_request_events() {
         let req = parse_request("GET /events").unwrap();
-        match req {
-            ApiRequest::Events => {}
-            _ => panic!("expected events request"),
-        }
+        assert!(matches!(req, ApiRequest::Events), "expected events request");
     }
 
     #[test]
     fn test_parse_request_reload() {
         let req = parse_request("POST /reload").unwrap();
-        match req {
-            ApiRequest::Reload => {}
-            _ => panic!("expected reload request"),
-        }
+        assert!(matches!(req, ApiRequest::Reload), "expected reload request");
     }
 
     #[test]
@@ -2515,17 +2506,17 @@ mod tests {
             ApiRequest::TelemetryPoll { worker_id } => {
                 assert_eq!(worker_id.as_str(), "css");
             }
-            _ => panic!("expected telemetry poll request"),
+            _ => panic!( "expected telemetry poll request"),
         }
     }
 
     #[test]
     fn test_parse_request_self_test_status() {
         let req = parse_request("GET /self-test/status").unwrap();
-        match req {
-            ApiRequest::SelfTestStatus => {}
-            _ => panic!("expected self-test status request"),
-        }
+        assert!(
+            matches!(req, ApiRequest::SelfTestStatus),
+            "expected self-test status request"
+        );
     }
 
     #[test]
@@ -2533,7 +2524,7 @@ mod tests {
         let req = parse_request("GET /self-test/history?limit=5").unwrap();
         match req {
             ApiRequest::SelfTestHistory { limit } => assert_eq!(limit, 5),
-            _ => panic!("expected self-test history request"),
+            _ => panic!( "expected self-test history request"),
         }
     }
 
@@ -2900,10 +2891,10 @@ mod tests {
         // Only POST should work for reload
         let result = parse_request("POST /reload");
         assert!(result.is_ok());
-        match result.unwrap() {
-            ApiRequest::Reload => {}
-            _ => panic!("expected reload request"),
-        }
+        assert!(
+            matches!(result.unwrap(), ApiRequest::Reload),
+            "expected reload request"
+        );
 
         // GET should fail
         let result = parse_request("GET /reload");
