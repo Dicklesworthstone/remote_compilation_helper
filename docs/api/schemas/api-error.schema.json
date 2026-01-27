@@ -1,0 +1,113 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ApiError",
+  "description": "Unified API error structure.\n\nThis type is used for all error responses in both CLI and daemon APIs. It uses the [`ErrorCode`] enum for consistent error identification.\n\n# Example\n\n```rust use rch_common::api::ApiError; use rch_common::ErrorCode;\n\nlet error = ApiError::from_code(ErrorCode::SshConnectionFailed) .with_message(\"Connection refused\") .with_context(\"worker_id\", \"worker-1\") .with_context(\"host\", \"192.168.1.100\");\n\nassert_eq!(error.code, \"RCH-E100\"); ```",
+  "type": "object",
+  "required": [
+    "category",
+    "code",
+    "message"
+  ],
+  "properties": {
+    "category": {
+      "description": "Error category for quick classification.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/ErrorCategory"
+        }
+      ]
+    },
+    "code": {
+      "description": "Error code in RCH-Exxx format (e.g., \"RCH-E100\").",
+      "type": "string"
+    },
+    "context": {
+      "description": "Additional context information.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/ErrorContext"
+        }
+      ]
+    },
+    "details": {
+      "description": "Detailed description of what went wrong.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "message": {
+      "description": "Human-readable error message.",
+      "type": "string"
+    },
+    "remediation": {
+      "description": "Suggested remediation steps.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "retry_after_secs": {
+      "description": "Optional retry-after hint in seconds (for rate limiting).",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "minimum": 0.0
+    }
+  },
+  "definitions": {
+    "ErrorCategory": {
+      "description": "Error category for grouping related errors.",
+      "oneOf": [
+        {
+          "description": "Configuration and setup errors (E001-E099)",
+          "type": "string",
+          "enum": [
+            "config"
+          ]
+        },
+        {
+          "description": "Network and SSH connectivity errors (E100-E199)",
+          "type": "string",
+          "enum": [
+            "network"
+          ]
+        },
+        {
+          "description": "Worker selection and management errors (E200-E299)",
+          "type": "string",
+          "enum": [
+            "worker"
+          ]
+        },
+        {
+          "description": "Compilation and build errors (E300-E399)",
+          "type": "string",
+          "enum": [
+            "build"
+          ]
+        },
+        {
+          "description": "File transfer and sync errors (E400-E499)",
+          "type": "string",
+          "enum": [
+            "transfer"
+          ]
+        },
+        {
+          "description": "Internal/unexpected errors (E500-E599)",
+          "type": "string",
+          "enum": [
+            "internal"
+          ]
+        }
+      ]
+    },
+    "ErrorContext": {
+      "description": "Context information for an API error.\n\nContains key-value pairs providing additional context about the error, such as worker IDs, file paths, or other relevant identifiers.",
+      "type": "object"
+    }
+  }
+}

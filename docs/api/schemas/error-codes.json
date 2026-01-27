@@ -1,0 +1,766 @@
+{
+  "schema_version": "1.0",
+  "api_version": "1.0",
+  "categories": [
+    {
+      "id": "config",
+      "name": "Configuration",
+      "description": "Configuration file and environment setup issues",
+      "code_range": "001-099"
+    },
+    {
+      "id": "network",
+      "name": "Network",
+      "description": "SSH connectivity and network communication issues",
+      "code_range": "100-199"
+    },
+    {
+      "id": "worker",
+      "name": "Worker",
+      "description": "Remote worker selection, health, and management issues",
+      "code_range": "200-299"
+    },
+    {
+      "id": "build",
+      "name": "Build",
+      "description": "Remote compilation and build process issues",
+      "code_range": "300-399"
+    },
+    {
+      "id": "transfer",
+      "name": "Transfer",
+      "description": "File synchronization and transfer issues",
+      "code_range": "400-499"
+    },
+    {
+      "id": "internal",
+      "name": "Internal",
+      "description": "Internal errors that may indicate bugs",
+      "code_range": "500-599"
+    }
+  ],
+  "errors": [
+    {
+      "code": "RCH-E001",
+      "number": 1,
+      "category": "config",
+      "message": "Configuration file not found",
+      "remediation": [
+        "Run 'rch init' to create a default configuration",
+        "Check if ~/.config/rch/config.toml exists",
+        "Set RCH_CONFIG environment variable to specify custom path"
+      ],
+      "doc_url": "https://rch.dev/docs/config"
+    },
+    {
+      "code": "RCH-E002",
+      "number": 2,
+      "category": "config",
+      "message": "Failed to read configuration file",
+      "remediation": [
+        "Check file permissions on the configuration file",
+        "Verify the file is not corrupted",
+        "Ensure no other process has locked the file"
+      ],
+      "doc_url": "https://rch.dev/docs/config"
+    },
+    {
+      "code": "RCH-E003",
+      "number": 3,
+      "category": "config",
+      "message": "Configuration file contains invalid TOML syntax",
+      "remediation": [
+        "Run 'rch config validate' to identify syntax errors",
+        "Check TOML syntax at the indicated line",
+        "Ensure all strings are properly quoted"
+      ],
+      "doc_url": "https://rch.dev/docs/config"
+    },
+    {
+      "code": "RCH-E004",
+      "number": 4,
+      "category": "config",
+      "message": "Configuration contains invalid values",
+      "remediation": [
+        "Run 'rch config validate' for detailed diagnostics",
+        "Check that all required fields are present",
+        "Verify values are within allowed ranges"
+      ],
+      "doc_url": "https://rch.dev/docs/config"
+    },
+    {
+      "code": "RCH-E005",
+      "number": 5,
+      "category": "config",
+      "message": "Environment variable has invalid value",
+      "remediation": [
+        "Check the environment variable value format",
+        "Unset the variable to use config file defaults",
+        "See 'rch help env' for valid environment variables"
+      ],
+      "doc_url": "https://rch.dev/docs/config"
+    },
+    {
+      "code": "RCH-E006",
+      "number": 6,
+      "category": "config",
+      "message": "Profile not found in configuration",
+      "remediation": [
+        "List available profiles with 'rch config profiles'",
+        "Create the profile in your configuration file",
+        "Check for typos in the profile name"
+      ],
+      "doc_url": "https://rch.dev/docs/config"
+    },
+    {
+      "code": "RCH-E007",
+      "number": 7,
+      "category": "config",
+      "message": "No workers are configured",
+      "remediation": [
+        "Add at least one worker to your configuration",
+        "Run 'rch discover' to find available workers",
+        "Check the [workers] section in your config"
+      ],
+      "doc_url": "https://rch.dev/docs/config"
+    },
+    {
+      "code": "RCH-E008",
+      "number": 8,
+      "category": "config",
+      "message": "Worker configuration is invalid",
+      "remediation": [
+        "Verify worker hostname is correct",
+        "Check SSH username and key configuration",
+        "Ensure remote_base_dir is a valid path"
+      ],
+      "doc_url": "https://rch.dev/docs/config"
+    },
+    {
+      "code": "RCH-E009",
+      "number": 9,
+      "category": "config",
+      "message": "SSH key path is invalid or inaccessible",
+      "remediation": [
+        "Check that the SSH key file exists",
+        "Verify file permissions (should be 600)",
+        "Ensure the key format is valid (ssh-keygen -y -f KEY)"
+      ],
+      "doc_url": "https://rch.dev/docs/config"
+    },
+    {
+      "code": "RCH-E010",
+      "number": 10,
+      "category": "config",
+      "message": "Socket path is invalid or inaccessible",
+      "remediation": [
+        "Check directory permissions for socket path",
+        "Ensure parent directory exists",
+        "Try using the default socket path"
+      ],
+      "doc_url": "https://rch.dev/docs/config"
+    },
+    {
+      "code": "RCH-E100",
+      "number": 100,
+      "category": "network",
+      "message": "SSH connection to worker failed",
+      "remediation": [
+        "Verify the worker host is reachable: ping <host>",
+        "Check that SSH service is running on the worker",
+        "Verify firewall allows SSH (port 22)",
+        "Try connecting manually: ssh <user>@<host>"
+      ],
+      "doc_url": "https://rch.dev/docs/ssh"
+    },
+    {
+      "code": "RCH-E101",
+      "number": 101,
+      "category": "network",
+      "message": "SSH authentication failed",
+      "remediation": [
+        "Verify SSH key is in authorized_keys on the worker",
+        "Check SSH key passphrase if applicable",
+        "Ensure ssh-agent is running with key loaded",
+        "Try: ssh-add -l to list loaded keys"
+      ],
+      "doc_url": "https://rch.dev/docs/ssh"
+    },
+    {
+      "code": "RCH-E102",
+      "number": 102,
+      "category": "network",
+      "message": "SSH key not found or has invalid format",
+      "remediation": [
+        "Check that the SSH key file exists at the configured path",
+        "Verify key file permissions are 600",
+        "Regenerate key if format is corrupted"
+      ],
+      "doc_url": "https://rch.dev/docs/ssh"
+    },
+    {
+      "code": "RCH-E103",
+      "number": 103,
+      "category": "network",
+      "message": "SSH host key verification failed",
+      "remediation": [
+        "Accept the host key: ssh <user>@<host> (confirm fingerprint)",
+        "Check known_hosts for conflicting entries",
+        "Update known_hosts_policy in config if appropriate"
+      ],
+      "doc_url": "https://rch.dev/docs/ssh"
+    },
+    {
+      "code": "RCH-E104",
+      "number": 104,
+      "category": "network",
+      "message": "SSH command execution timed out",
+      "remediation": [
+        "Check network connectivity to the worker",
+        "Increase timeout in configuration",
+        "Verify worker is not overloaded"
+      ],
+      "doc_url": "https://rch.dev/docs/ssh"
+    },
+    {
+      "code": "RCH-E105",
+      "number": 105,
+      "category": "network",
+      "message": "SSH session terminated unexpectedly",
+      "remediation": [
+        "Check network stability",
+        "Verify worker has not rebooted",
+        "Look for keepalive settings in SSH config"
+      ],
+      "doc_url": "https://rch.dev/docs/ssh"
+    },
+    {
+      "code": "RCH-E106",
+      "number": 106,
+      "category": "network",
+      "message": "DNS resolution failed for worker host",
+      "remediation": [
+        "Verify worker hostname is correct",
+        "Check DNS server configuration",
+        "Try using IP address instead of hostname"
+      ],
+      "doc_url": "https://rch.dev/docs/ssh"
+    },
+    {
+      "code": "RCH-E107",
+      "number": 107,
+      "category": "network",
+      "message": "Network is unreachable",
+      "remediation": [
+        "Check network connection on local machine",
+        "Verify VPN connection if required",
+        "Check routing to worker network"
+      ],
+      "doc_url": "https://rch.dev/docs/ssh"
+    },
+    {
+      "code": "RCH-E108",
+      "number": 108,
+      "category": "network",
+      "message": "Connection refused by remote host",
+      "remediation": [
+        "Verify SSH service is running on worker",
+        "Check if worker firewall allows connections",
+        "Ensure correct port is being used"
+      ],
+      "doc_url": "https://rch.dev/docs/ssh"
+    },
+    {
+      "code": "RCH-E109",
+      "number": 109,
+      "category": "network",
+      "message": "TCP connection timed out",
+      "remediation": [
+        "Check network latency to worker",
+        "Verify worker is responsive",
+        "Increase connection timeout in config"
+      ],
+      "doc_url": "https://rch.dev/docs/ssh"
+    },
+    {
+      "code": "RCH-E200",
+      "number": 200,
+      "category": "worker",
+      "message": "No workers available for selection",
+      "remediation": [
+        "Configure at least one worker in config.toml",
+        "Run 'rch discover' to find available workers",
+        "Check that configured workers are enabled"
+      ],
+      "doc_url": "https://rch.dev/docs/workers"
+    },
+    {
+      "code": "RCH-E201",
+      "number": 201,
+      "category": "worker",
+      "message": "All configured workers are unhealthy",
+      "remediation": [
+        "Run 'rch doctor' to diagnose worker issues",
+        "Check individual worker connectivity",
+        "Review worker health check logs"
+      ],
+      "doc_url": "https://rch.dev/docs/workers"
+    },
+    {
+      "code": "RCH-E202",
+      "number": 202,
+      "category": "worker",
+      "message": "Worker failed health check",
+      "remediation": [
+        "Verify SSH connectivity to worker",
+        "Check worker disk space and load",
+        "Review health check timeout settings"
+      ],
+      "doc_url": "https://rch.dev/docs/workers"
+    },
+    {
+      "code": "RCH-E203",
+      "number": 203,
+      "category": "worker",
+      "message": "Worker self-test failed",
+      "remediation": [
+        "Run 'rch self-test --worker <name>' for details",
+        "Verify Rust toolchain on worker",
+        "Check worker has required dependencies"
+      ],
+      "doc_url": "https://rch.dev/docs/workers"
+    },
+    {
+      "code": "RCH-E204",
+      "number": 204,
+      "category": "worker",
+      "message": "Worker is at maximum capacity",
+      "remediation": [
+        "Wait for current builds to complete",
+        "Add more workers to distribute load",
+        "Increase max_concurrent_builds on worker"
+      ],
+      "doc_url": "https://rch.dev/docs/workers"
+    },
+    {
+      "code": "RCH-E205",
+      "number": 205,
+      "category": "worker",
+      "message": "Worker is missing required toolchain",
+      "remediation": [
+        "Install required toolchain on worker",
+        "Run 'rustup show' on worker to verify",
+        "Update worker toolchain configuration"
+      ],
+      "doc_url": "https://rch.dev/docs/workers"
+    },
+    {
+      "code": "RCH-E206",
+      "number": 206,
+      "category": "worker",
+      "message": "Worker state is inconsistent",
+      "remediation": [
+        "Restart the RCH daemon: rchd restart",
+        "Check for stale lock files",
+        "Review daemon logs for details"
+      ],
+      "doc_url": "https://rch.dev/docs/workers"
+    },
+    {
+      "code": "RCH-E207",
+      "number": 207,
+      "category": "worker",
+      "message": "Worker circuit breaker is open",
+      "remediation": [
+        "Wait for circuit breaker reset period",
+        "Check worker health manually",
+        "Review recent build failures on worker"
+      ],
+      "doc_url": "https://rch.dev/docs/workers"
+    },
+    {
+      "code": "RCH-E208",
+      "number": 208,
+      "category": "worker",
+      "message": "Worker selection strategy failed",
+      "remediation": [
+        "Verify at least one worker is healthy",
+        "Check selection strategy configuration",
+        "Review worker weights and priorities"
+      ],
+      "doc_url": "https://rch.dev/docs/workers"
+    },
+    {
+      "code": "RCH-E209",
+      "number": 209,
+      "category": "worker",
+      "message": "Failed to query worker load",
+      "remediation": [
+        "Verify SSH connectivity to worker",
+        "Check that load query command works on worker",
+        "Review timeout settings for load queries"
+      ],
+      "doc_url": "https://rch.dev/docs/workers"
+    },
+    {
+      "code": "RCH-E300",
+      "number": 300,
+      "category": "build",
+      "message": "Remote compilation failed",
+      "remediation": [
+        "Review compilation errors in output",
+        "Verify code compiles locally first",
+        "Check for missing dependencies on worker"
+      ],
+      "doc_url": "https://rch.dev/docs/builds"
+    },
+    {
+      "code": "RCH-E301",
+      "number": 301,
+      "category": "build",
+      "message": "Build command not recognized",
+      "remediation": [
+        "Check that the command is supported",
+        "Verify cargo/rustc version compatibility",
+        "Review RCH command pattern configuration"
+      ],
+      "doc_url": "https://rch.dev/docs/builds"
+    },
+    {
+      "code": "RCH-E302",
+      "number": 302,
+      "category": "build",
+      "message": "Build process was killed by signal",
+      "remediation": [
+        "Check worker system logs for OOM killer",
+        "Review build memory requirements",
+        "Check if build was manually interrupted"
+      ],
+      "doc_url": "https://rch.dev/docs/builds"
+    },
+    {
+      "code": "RCH-E303",
+      "number": 303,
+      "category": "build",
+      "message": "Build operation timed out",
+      "remediation": [
+        "Increase build timeout in configuration",
+        "Check for infinite loops or hangs",
+        "Verify worker is not overloaded"
+      ],
+      "doc_url": "https://rch.dev/docs/builds"
+    },
+    {
+      "code": "RCH-E304",
+      "number": 304,
+      "category": "build",
+      "message": "Failed to capture build output",
+      "remediation": [
+        "Check worker disk space",
+        "Verify PTY allocation settings",
+        "Review output buffer configuration"
+      ],
+      "doc_url": "https://rch.dev/docs/builds"
+    },
+    {
+      "code": "RCH-E305",
+      "number": 305,
+      "category": "build",
+      "message": "Remote working directory error",
+      "remediation": [
+        "Verify remote_base_dir is writable",
+        "Check directory permissions on worker",
+        "Ensure path does not contain special characters"
+      ],
+      "doc_url": "https://rch.dev/docs/builds"
+    },
+    {
+      "code": "RCH-E306",
+      "number": 306,
+      "category": "build",
+      "message": "Toolchain wrapper failed",
+      "remediation": [
+        "Verify toolchain is installed on worker",
+        "Check rustup default toolchain",
+        "Review toolchain override settings"
+      ],
+      "doc_url": "https://rch.dev/docs/builds"
+    },
+    {
+      "code": "RCH-E307",
+      "number": 307,
+      "category": "build",
+      "message": "Build environment setup failed",
+      "remediation": [
+        "Check environment variable configuration",
+        "Verify required environment is set on worker",
+        "Review shell initialization on worker"
+      ],
+      "doc_url": "https://rch.dev/docs/builds"
+    },
+    {
+      "code": "RCH-E308",
+      "number": 308,
+      "category": "build",
+      "message": "Incremental build state is corrupted",
+      "remediation": [
+        "Run 'cargo clean' on remote workspace",
+        "Delete incremental compilation cache",
+        "Try full rebuild with --release"
+      ],
+      "doc_url": "https://rch.dev/docs/builds"
+    },
+    {
+      "code": "RCH-E309",
+      "number": 309,
+      "category": "build",
+      "message": "Build artifact not found",
+      "remediation": [
+        "Verify build completed successfully",
+        "Check artifact path configuration",
+        "Review build output for artifact location"
+      ],
+      "doc_url": "https://rch.dev/docs/builds"
+    },
+    {
+      "code": "RCH-E400",
+      "number": 400,
+      "category": "transfer",
+      "message": "Rsync transfer failed",
+      "remediation": [
+        "Verify rsync is installed on both ends",
+        "Check SSH connectivity to worker",
+        "Review rsync exclude patterns"
+      ],
+      "doc_url": "https://rch.dev/docs/sync"
+    },
+    {
+      "code": "RCH-E401",
+      "number": 401,
+      "category": "transfer",
+      "message": "File sync operation timed out",
+      "remediation": [
+        "Increase transfer timeout in configuration",
+        "Check network bandwidth to worker",
+        "Consider using incremental sync"
+      ],
+      "doc_url": "https://rch.dev/docs/sync"
+    },
+    {
+      "code": "RCH-E402",
+      "number": 402,
+      "category": "transfer",
+      "message": "Source files not found",
+      "remediation": [
+        "Verify source files exist locally",
+        "Check file patterns in configuration",
+        "Review .rchignore exclusions"
+      ],
+      "doc_url": "https://rch.dev/docs/sync"
+    },
+    {
+      "code": "RCH-E403",
+      "number": 403,
+      "category": "transfer",
+      "message": "Destination path error",
+      "remediation": [
+        "Check remote directory permissions",
+        "Verify remote_base_dir is valid",
+        "Ensure sufficient disk space on worker"
+      ],
+      "doc_url": "https://rch.dev/docs/sync"
+    },
+    {
+      "code": "RCH-E404",
+      "number": 404,
+      "category": "transfer",
+      "message": "Insufficient disk space on worker",
+      "remediation": [
+        "Clean up old builds on worker",
+        "Check disk usage: df -h on worker",
+        "Increase disk allocation for worker"
+      ],
+      "doc_url": "https://rch.dev/docs/sync"
+    },
+    {
+      "code": "RCH-E405",
+      "number": 405,
+      "category": "transfer",
+      "message": "Permission denied during file transfer",
+      "remediation": [
+        "Check file ownership on worker",
+        "Verify SSH user has write permissions",
+        "Review umask settings"
+      ],
+      "doc_url": "https://rch.dev/docs/sync"
+    },
+    {
+      "code": "RCH-E406",
+      "number": 406,
+      "category": "transfer",
+      "message": "Transfer checksum mismatch",
+      "remediation": [
+        "Retry the transfer",
+        "Check for network issues",
+        "Verify file integrity on source"
+      ],
+      "doc_url": "https://rch.dev/docs/sync"
+    },
+    {
+      "code": "RCH-E407",
+      "number": 407,
+      "category": "transfer",
+      "message": "Binary download failed",
+      "remediation": [
+        "Check network connectivity",
+        "Verify binary URL is accessible",
+        "Try manual download to diagnose"
+      ],
+      "doc_url": "https://rch.dev/docs/sync"
+    },
+    {
+      "code": "RCH-E408",
+      "number": 408,
+      "category": "transfer",
+      "message": "Transfer completed partially",
+      "remediation": [
+        "Retry the transfer operation",
+        "Check for network interruptions",
+        "Review transfer logs for details"
+      ],
+      "doc_url": "https://rch.dev/docs/sync"
+    },
+    {
+      "code": "RCH-E409",
+      "number": 409,
+      "category": "transfer",
+      "message": "Transfer protocol error",
+      "remediation": [
+        "Verify rsync version compatibility",
+        "Check SSH protocol settings",
+        "Review transfer configuration"
+      ],
+      "doc_url": "https://rch.dev/docs/sync"
+    },
+    {
+      "code": "RCH-E500",
+      "number": 500,
+      "category": "internal",
+      "message": "Failed to connect to daemon socket",
+      "remediation": [
+        "Start the daemon: rchd start",
+        "Check socket path permissions",
+        "Verify no stale socket file exists"
+      ],
+      "doc_url": "https://rch.dev/docs/troubleshooting"
+    },
+    {
+      "code": "RCH-E501",
+      "number": 501,
+      "category": "internal",
+      "message": "Daemon protocol error",
+      "remediation": [
+        "Restart the daemon: rchd restart",
+        "Check for version mismatch between rch and rchd",
+        "Review daemon logs for details"
+      ],
+      "doc_url": "https://rch.dev/docs/troubleshooting"
+    },
+    {
+      "code": "RCH-E502",
+      "number": 502,
+      "category": "internal",
+      "message": "RCH daemon is not running",
+      "remediation": [
+        "Start the daemon: rchd start",
+        "Check if daemon crashed: journalctl -u rchd",
+        "Verify daemon configuration"
+      ],
+      "doc_url": "https://rch.dev/docs/troubleshooting"
+    },
+    {
+      "code": "RCH-E503",
+      "number": 503,
+      "category": "internal",
+      "message": "Inter-process communication error",
+      "remediation": [
+        "Restart the daemon",
+        "Check system message queue limits",
+        "Review logs for detailed error"
+      ],
+      "doc_url": "https://rch.dev/docs/troubleshooting"
+    },
+    {
+      "code": "RCH-E504",
+      "number": 504,
+      "category": "internal",
+      "message": "Unexpected internal state",
+      "remediation": [
+        "Restart the daemon",
+        "Clear any lock files",
+        "Report bug if persists"
+      ],
+      "doc_url": "https://rch.dev/docs/troubleshooting"
+    },
+    {
+      "code": "RCH-E505",
+      "number": 505,
+      "category": "internal",
+      "message": "Serialization/deserialization error",
+      "remediation": [
+        "Check for corrupted state files",
+        "Clear cache and restart",
+        "Report bug with reproduction steps"
+      ],
+      "doc_url": "https://rch.dev/docs/troubleshooting"
+    },
+    {
+      "code": "RCH-E506",
+      "number": 506,
+      "category": "internal",
+      "message": "Hook execution failed",
+      "remediation": [
+        "Verify hook script exists and is executable",
+        "Check hook script for errors",
+        "Review hook timeout settings"
+      ],
+      "doc_url": "https://rch.dev/docs/troubleshooting"
+    },
+    {
+      "code": "RCH-E507",
+      "number": 507,
+      "category": "internal",
+      "message": "Metrics collection error",
+      "remediation": [
+        "Check metrics file permissions",
+        "Verify disk space for metrics",
+        "Review metrics configuration"
+      ],
+      "doc_url": "https://rch.dev/docs/troubleshooting"
+    },
+    {
+      "code": "RCH-E508",
+      "number": 508,
+      "category": "internal",
+      "message": "Logging system error",
+      "remediation": [
+        "Check log directory permissions",
+        "Verify disk space for logs",
+        "Review logging configuration"
+      ],
+      "doc_url": "https://rch.dev/docs/troubleshooting"
+    },
+    {
+      "code": "RCH-E509",
+      "number": 509,
+      "category": "internal",
+      "message": "Update check failed",
+      "remediation": [
+        "Check network connectivity",
+        "Verify update server is reachable",
+        "Try manual update check"
+      ],
+      "doc_url": "https://rch.dev/docs/troubleshooting"
+    }
+  ]
+}
