@@ -613,15 +613,14 @@ impl TransferPipeline {
         let identity_file = shellexpand::tilde(&worker.identity_file);
         let escaped_identity = escape(Cow::from(identity_file.as_ref()));
 
+        let ssh_command = self.build_rsync_ssh_command(escaped_identity.as_ref());
+
         cmd.arg("-az") // Archive mode + compression
             .arg("--delete") // Remove extraneous files from destination
             .arg("--info=progress2")
             .arg("--info=stats2")
             .arg("-e")
-            .arg(format!(
-                "ssh -i {} -o StrictHostKeyChecking=no -o BatchMode=yes",
-                escaped_identity
-            ));
+            .arg(ssh_command);
 
         // Create remote directory implicitly using rsync-path wrapper
         cmd.arg("--rsync-path")
@@ -1005,14 +1004,13 @@ impl TransferPipeline {
         let identity_file = shellexpand::tilde(&worker.identity_file);
         let escaped_identity = escape(Cow::from(identity_file.as_ref()));
 
+        let ssh_command = self.build_rsync_ssh_command(escaped_identity.as_ref());
+
         cmd.arg("-az")
             .arg("--info=progress2")
             .arg("--info=stats2")
             .arg("-e")
-            .arg(format!(
-                "ssh -i {} -o StrictHostKeyChecking=no -o BatchMode=yes",
-                escaped_identity
-            ));
+            .arg(ssh_command);
 
         // Add zstd compression
         if self.transfer_config.compression_level > 0 {
