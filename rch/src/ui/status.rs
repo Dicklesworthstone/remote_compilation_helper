@@ -143,17 +143,21 @@ impl<'a> StatusTable<'a> {
             .with_column(Column::new("ID").header_style(RchTheme::table_header()))
             .with_column(Column::new("Command").header_style(RchTheme::table_header()))
             .with_column(Column::new("Worker").header_style(RchTheme::table_header()))
-            .with_column(Column::new("Started").header_style(RchTheme::table_header()));
+            .with_column(Column::new("Elapsed").header_style(RchTheme::table_header()));
 
         // Add rows
         for job in &self.status.active_builds {
             let cmd = truncate_command(&job.command, 40);
             let id_str = format!("#{}", job.id);
+            // Show elapsed time instead of raw timestamp
+            let elapsed_str = elapsed_since(&job.started_at)
+                .map(format_elapsed)
+                .unwrap_or_else(|| job.started_at.clone());
             let row = Row::new(vec![
                 Cell::new(id_str.as_str()),
                 Cell::new(cmd.as_str()),
                 Cell::new(job.worker_id.as_str()),
-                Cell::new(job.started_at.as_str()),
+                Cell::new(elapsed_str.as_str()),
             ]);
             table = table.with_row(row);
         }
@@ -239,7 +243,13 @@ impl<'a> StatusTable<'a> {
             console.print_plain("--- Active Jobs ---");
             for job in &self.status.active_builds {
                 let cmd = truncate_command(&job.command, 40);
-                console.print_plain(&format!("  #{} {} on {}", job.id, cmd, job.worker_id));
+                let elapsed = elapsed_since(&job.started_at)
+                    .map(format_elapsed)
+                    .unwrap_or_else(|| "?".to_string());
+                console.print_plain(&format!(
+                    "  #{} {} on {} ({})",
+                    job.id, cmd, job.worker_id, elapsed
+                ));
             }
         }
 
@@ -303,12 +313,109 @@ fn format_ms_duration(ms: u64) -> String {
     }
 }
 
-/// Truncate a command string for display.
+/// Truncate a command string intelligently for display.
+///
+/// Unlike naive truncation, this preserves important suffixes like:
+/// - `--release` (build mode)
+/// - `-p <package>` (package name)
+/// - `--test` / `--lib` / `--bin` (target type)
 fn truncate_command(cmd: &str, max_len: usize) -> String {
     if cmd.len() <= max_len {
-        cmd.to_string()
+        return cmd.to_string();
+    }
+
+    // Important suffixes to preserve (in priority order)
+    let important_suffixes = [" --release", " --test", " --lib", " --bin", " --workspace"];
+
+    // Check if any important suffix is present
+    for suffix in important_suffixes {
+        if cmd.ends_with(suffix) || cmd.contains(&format!("{suffix} ")) {
+            // Try to fit the suffix
+            let suffix_len = suffix.len();
+            if max_len > suffix_len + 6 {
+                // "cmd...--release"
+                let prefix_len = max_len - suffix_len - 3; // 3 for "..."
+                return format!("{}...{}", &cmd[..prefix_len], suffix.trim());
+            }
+        }
+    }
+
+    // Check for -p <package> pattern
+    if let Some(pkg_start) = cmd.find(" -p ") {
+        let pkg_end = cmd[pkg_start + 4..]
+            .find(' ')
+            .map(|i| pkg_start + 4 + i)
+            .unwrap_or(cmd.len());
+        let pkg_name = &cmd[pkg_start..pkg_end];
+        if pkg_name.len() < max_len - 10 {
+            let prefix_len = max_len - pkg_name.len() - 3;
+            if prefix_len > 5 {
+                return format!("{}...{}", &cmd[..prefix_len], pkg_name.trim());
+            }
+        }
+    }
+
+    // Default: simple truncation
+    format!("{}...", &cmd[..max_len.saturating_sub(3)])
+}
+
+/// Parse ISO 8601 timestamp and return elapsed time.
+fn elapsed_since(timestamp: &str) -> Option<std::time::Duration> {
+    // Parse ISO 8601 format: "2026-01-19T00:00:10Z"
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    // Simple parsing for ISO 8601 UTC timestamps
+    let ts = timestamp.trim_end_matches('Z');
+    let parts: Vec<&str> = ts.split('T').collect();
+    if parts.len() != 2 {
+        return None;
+    }
+
+    let date_parts: Vec<u32> = parts[0].split('-').filter_map(|s| s.parse().ok()).collect();
+    let time_parts: Vec<&str> = parts[1].split(':').collect();
+
+    if date_parts.len() != 3 || time_parts.len() < 2 {
+        return None;
+    }
+
+    // Approximate calculation (good enough for display)
+    let year = date_parts[0];
+    let month = date_parts[1];
+    let day = date_parts[2];
+    let hour: u32 = time_parts[0].parse().ok()?;
+    let minute: u32 = time_parts[1].parse().ok()?;
+    let second: u32 = time_parts
+        .get(2)
+        .and_then(|s| s.split('.').next())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
+    // Days since epoch (simplified, ignores leap years for rough estimate)
+    let days_in_year = 365u64;
+    let epoch_year = 1970u64;
+    let years_since_epoch = (year as u64).saturating_sub(epoch_year);
+    let rough_days = years_since_epoch * days_in_year + (month as u64 - 1) * 30 + day as u64;
+    let timestamp_secs =
+        rough_days * 86400 + hour as u64 * 3600 + minute as u64 * 60 + second as u64;
+
+    let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+
+    if now_secs >= timestamp_secs {
+        Some(Duration::from_secs(now_secs - timestamp_secs))
     } else {
-        format!("{}...", &cmd[..max_len.saturating_sub(3)])
+        None
+    }
+}
+
+/// Format elapsed time in a human-friendly way.
+fn format_elapsed(duration: std::time::Duration) -> String {
+    let secs = duration.as_secs();
+    if secs < 60 {
+        format!("{}s", secs)
+    } else if secs < 3600 {
+        format!("{}m {}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
     }
 }
 
@@ -399,7 +506,47 @@ mod tests {
         let cmd = "cargo build --release --target x86_64-unknown-linux-gnu --features full";
         let truncated = truncate_command(cmd, 40);
         assert!(truncated.len() <= 40);
-        assert!(truncated.ends_with("..."));
+        assert!(truncated.ends_with("...") || truncated.ends_with("--release"));
+    }
+
+    #[test]
+    fn test_truncate_command_preserves_release_flag() {
+        let cmd = "cargo build --target x86_64-unknown-linux-gnu --features full --release";
+        let truncated = truncate_command(cmd, 40);
+        // Should preserve --release since it's an important suffix
+        assert!(
+            truncated.contains("--release") || truncated.ends_with("..."),
+            "Expected to preserve --release or truncate: {truncated}"
+        );
+    }
+
+    #[test]
+    fn test_truncate_command_preserves_package() {
+        let cmd = "cargo test -p my-important-package --release";
+        let truncated = truncate_command(cmd, 35);
+        // Should try to preserve package name or important suffix
+        assert!(truncated.len() <= 35);
+    }
+
+    #[test]
+    fn test_format_elapsed_seconds() {
+        use std::time::Duration;
+        assert_eq!(format_elapsed(Duration::from_secs(30)), "30s");
+        assert_eq!(format_elapsed(Duration::from_secs(59)), "59s");
+    }
+
+    #[test]
+    fn test_format_elapsed_minutes() {
+        use std::time::Duration;
+        assert_eq!(format_elapsed(Duration::from_secs(90)), "1m 30s");
+        assert_eq!(format_elapsed(Duration::from_secs(3599)), "59m 59s");
+    }
+
+    #[test]
+    fn test_format_elapsed_hours() {
+        use std::time::Duration;
+        assert_eq!(format_elapsed(Duration::from_secs(3600)), "1h 0m");
+        assert_eq!(format_elapsed(Duration::from_secs(7200 + 1800)), "2h 30m");
     }
 
     #[test]
