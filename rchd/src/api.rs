@@ -500,15 +500,21 @@ pub async fn handle_connection(
         Ok(ApiRequest::ReleaseWorker(mut request)) => {
             metrics::inc_requests("release-worker");
             // Read optional JSON body line for timing breakdown
-            // Use read_line instead of read_to_string to avoid blocking on EOF
+            // Use a short timeout to avoid blocking when no body is sent
             let mut body_line = String::new();
-            let _ = reader.read_line(&mut body_line).await;
-            let body = body_line.trim();
-            if !body.is_empty() {
-                if let Ok(timing) =
-                    serde_json::from_str::<rch_common::CommandTimingBreakdown>(body)
-                {
-                    request.timing = Some(timing);
+            if let Ok(Ok(_)) = tokio::time::timeout(
+                Duration::from_millis(50),
+                reader.read_line(&mut body_line),
+            )
+            .await
+            {
+                let body = body_line.trim();
+                if !body.is_empty() {
+                    if let Ok(timing) =
+                        serde_json::from_str::<rch_common::CommandTimingBreakdown>(body)
+                    {
+                        request.timing = Some(timing);
+                    }
                 }
             }
             handle_release_worker(&ctx, request).await?;
