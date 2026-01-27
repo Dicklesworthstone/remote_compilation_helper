@@ -434,7 +434,7 @@ mod tests {
     // regular test runs.
 
     #[test]
-    #[ignore]
+    #[ignore = "requires rustup"]
     fn test_rustup_available_integration() {
         // This test requires rustup to be installed
         let available = rustup_available();
@@ -443,7 +443,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "requires rustup"]
     fn test_is_toolchain_available_stable() {
         // This test requires rustup and stable toolchain
         clear_cache();
@@ -452,7 +452,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "requires rustup"]
     fn test_ensure_toolchain_stable() {
         // This test requires rustup
         clear_cache();
@@ -597,7 +597,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "requires rustup"]
     fn test_cache_population_on_availability_check() {
         // This test requires rustup
         clear_cache();
@@ -616,7 +616,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "requires rustup"]
     fn test_cache_miss_then_hit() {
         // This test requires rustup
         clear_cache();
@@ -634,7 +634,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "requires rustup"]
     fn test_cache_invalidation() {
         // This test requires rustup
         // Check stable is available and cached
@@ -651,7 +651,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "requires rustup"]
     fn test_ensure_toolchain_caches_on_success() {
         // This test requires rustup
         clear_cache();
