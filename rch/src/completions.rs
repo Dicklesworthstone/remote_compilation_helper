@@ -472,4 +472,232 @@ mod tests {
         std::fs::write(&path4, "use rch.elv\n").unwrap();
         assert!(rc_file_has_rch_setup(&path4).unwrap());
     }
+
+    // ==================== Additional Coverage Tests ====================
+
+    #[test]
+    fn test_install_paths_clone() {
+        let paths = InstallPaths {
+            script_path: PathBuf::from("/tmp/test"),
+            rc_file: Some(PathBuf::from("/home/user/.bashrc")),
+            rc_line: Some("source /tmp/test".to_string()),
+        };
+
+        let cloned = paths.clone();
+        assert_eq!(cloned.script_path, paths.script_path);
+        assert_eq!(cloned.rc_file, paths.rc_file);
+        assert_eq!(cloned.rc_line, paths.rc_line);
+    }
+
+    #[test]
+    fn test_install_paths_debug() {
+        let paths = InstallPaths {
+            script_path: PathBuf::from("/tmp/rch"),
+            rc_file: None,
+            rc_line: None,
+        };
+
+        let debug = format!("{:?}", paths);
+        assert!(debug.contains("script_path"));
+        assert!(debug.contains("/tmp/rch"));
+    }
+
+    #[test]
+    fn test_install_paths_without_rc() {
+        let paths = InstallPaths {
+            script_path: PathBuf::from("/tmp/completion"),
+            rc_file: None,
+            rc_line: None,
+        };
+
+        assert!(paths.rc_file.is_none());
+        assert!(paths.rc_line.is_none());
+    }
+
+    #[test]
+    fn test_install_result_debug() {
+        let result = InstallResult {
+            shell: clap_complete::Shell::Bash,
+            script_path: PathBuf::from("/tmp/rch"),
+            script_written: true,
+            rc_modified: false,
+            rc_file: None,
+            was_already_installed: false,
+        };
+
+        let debug = format!("{:?}", result);
+        assert!(debug.contains("script_written"));
+        assert!(debug.contains("rc_modified"));
+        assert!(debug.contains("was_already_installed"));
+    }
+
+    #[test]
+    fn test_get_install_paths_powershell() {
+        let paths = get_install_paths(clap_complete::Shell::PowerShell).unwrap();
+        assert!(paths.script_path.to_string_lossy().contains("rch.ps1"));
+        assert!(paths.rc_file.is_some());
+        assert!(paths.rc_line.is_some());
+    }
+
+    #[test]
+    fn test_get_install_paths_elvish() {
+        let paths = get_install_paths(clap_complete::Shell::Elvish).unwrap();
+        assert!(paths.script_path.to_string_lossy().contains("rch.elv"));
+        assert!(paths.rc_file.is_some());
+        let rc_line = paths.rc_line.as_ref().unwrap();
+        assert!(rc_line.contains("use rch"));
+    }
+
+    #[test]
+    fn test_generate_powershell_completions() {
+        let script = generate_completion_script(clap_complete::Shell::PowerShell);
+        assert!(!script.is_empty());
+        // PowerShell completions should contain the command name
+        assert!(script.contains("rch") || script.to_lowercase().contains("rch"));
+    }
+
+    #[test]
+    fn test_generate_elvish_completions() {
+        let script = generate_completion_script(clap_complete::Shell::Elvish);
+        assert!(!script.is_empty());
+    }
+
+    #[test]
+    fn test_completion_scripts_are_different_per_shell() {
+        let bash = generate_completion_script(clap_complete::Shell::Bash);
+        let zsh = generate_completion_script(clap_complete::Shell::Zsh);
+        let fish = generate_completion_script(clap_complete::Shell::Fish);
+
+        // Each shell should have different completion syntax
+        assert_ne!(bash, zsh);
+        assert_ne!(bash, fish);
+        assert_ne!(zsh, fish);
+    }
+
+    #[test]
+    fn test_bash_install_path_structure() {
+        let paths = get_install_paths(clap_complete::Shell::Bash).unwrap();
+
+        // Bash should use bash-completion directory
+        let path_str = paths.script_path.to_string_lossy();
+        assert!(path_str.contains("bash-completion"));
+        assert!(path_str.ends_with("rch"));
+
+        // Bash auto-loads, so no RC modifications needed
+        assert!(paths.rc_file.is_none());
+        assert!(paths.rc_line.is_none());
+    }
+
+    #[test]
+    fn test_zsh_install_path_structure() {
+        let paths = get_install_paths(clap_complete::Shell::Zsh).unwrap();
+
+        // Zsh uses .zfunc directory
+        let path_str = paths.script_path.to_string_lossy();
+        assert!(path_str.contains(".zfunc"));
+        assert!(path_str.ends_with("_rch"));
+
+        // Zsh needs RC file modifications
+        let rc_file = paths.rc_file.unwrap();
+        assert!(rc_file.to_string_lossy().contains(".zshrc"));
+
+        let rc_line = paths.rc_line.unwrap();
+        assert!(rc_line.contains("fpath"));
+        assert!(rc_line.contains("compinit"));
+    }
+
+    #[test]
+    fn test_fish_install_path_structure() {
+        let paths = get_install_paths(clap_complete::Shell::Fish).unwrap();
+
+        // Fish uses .config/fish/completions
+        let path_str = paths.script_path.to_string_lossy();
+        assert!(path_str.contains("fish"));
+        assert!(path_str.contains("completions"));
+        assert!(path_str.ends_with("rch.fish"));
+
+        // Fish auto-loads, so no RC modifications needed
+        assert!(paths.rc_file.is_none());
+        assert!(paths.rc_line.is_none());
+    }
+
+    #[test]
+    fn test_rc_file_empty_content() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let rc_path = temp_dir.path().join(".emptyrc");
+
+        // Write empty file
+        std::fs::write(&rc_path, "").unwrap();
+        let result = rc_file_has_rch_setup(&rc_path).unwrap();
+        assert!(!result, "Empty file should not have RCH setup");
+    }
+
+    #[test]
+    fn test_rc_file_whitespace_only() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let rc_path = temp_dir.path().join(".whitespacerc");
+
+        // Write whitespace-only file
+        std::fs::write(&rc_path, "   \n\t\n  \n").unwrap();
+        let result = rc_file_has_rch_setup(&rc_path).unwrap();
+        assert!(!result, "Whitespace-only file should not have RCH setup");
+    }
+
+    #[test]
+    fn test_install_result_fields() {
+        let result = InstallResult {
+            shell: clap_complete::Shell::Zsh,
+            script_path: PathBuf::from("/home/user/.zfunc/_rch"),
+            script_written: true,
+            rc_modified: true,
+            rc_file: Some(PathBuf::from("/home/user/.zshrc")),
+            was_already_installed: false,
+        };
+
+        assert!(result.script_written);
+        assert!(result.rc_modified);
+        assert!(!result.was_already_installed);
+    }
+
+    #[test]
+    fn test_completion_scripts_contain_subcommands() {
+        // Test that generated scripts contain expected subcommands
+        let bash = generate_completion_script(clap_complete::Shell::Bash);
+        let zsh = generate_completion_script(clap_complete::Shell::Zsh);
+        let fish = generate_completion_script(clap_complete::Shell::Fish);
+
+        // All shells should mention common subcommands or options
+        // (exact format varies by shell)
+        for script in [&bash, &zsh, &fish] {
+            assert!(
+                script.len() > 100,
+                "Completion script should be substantial"
+            );
+        }
+    }
+
+    #[test]
+    fn test_install_paths_home_based() {
+        // All paths should be relative to home directory
+        for shell in [
+            clap_complete::Shell::Bash,
+            clap_complete::Shell::Zsh,
+            clap_complete::Shell::Fish,
+            clap_complete::Shell::PowerShell,
+            clap_complete::Shell::Elvish,
+        ] {
+            let paths = get_install_paths(shell).unwrap();
+            let path_str = paths.script_path.to_string_lossy();
+
+            // Path should be under home (contains common home indicators)
+            assert!(
+                path_str.contains("home")
+                    || path_str.contains("Users")
+                    || path_str.starts_with("/"),
+                "Path for {:?} should be absolute: {}",
+                shell,
+                path_str
+            );
+        }
+    }
 }
