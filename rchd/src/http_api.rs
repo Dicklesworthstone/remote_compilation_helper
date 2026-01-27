@@ -277,4 +277,144 @@ mod tests {
         // Should contain Prometheus format markers
         assert!(text.contains("# HELP") || text.is_empty());
     }
+
+    #[tokio::test]
+    async fn test_ready_endpoint_with_healthy_worker() {
+        use rch_common::{WorkerConfig, WorkerId};
+
+        let pool = WorkerPool::new();
+
+        // Add a healthy worker with available slots
+        let worker_config = WorkerConfig {
+            id: WorkerId::new("test-worker-1"),
+            host: "localhost".to_string(),
+            user: "testuser".to_string(),
+            identity_file: "~/.ssh/id_rsa".to_string(),
+            total_slots: 8,
+            priority: 100,
+            tags: vec![],
+        };
+        pool.add_worker(worker_config).await;
+
+        let state = HttpState {
+            pool,
+            version: "0.1.0-test",
+            started_at: Instant::now(),
+            pid: 12345,
+        };
+        let router = create_router(state);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/ready")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Worker is healthy by default and has slots available
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["status"], "ready");
+        assert_eq!(json["workers_available"], true);
+        assert_eq!(json["available_workers"], 1);
+        assert_eq!(json["total_available_slots"], 8);
+    }
+
+    #[tokio::test]
+    async fn test_ready_endpoint_with_multiple_workers() {
+        use rch_common::{WorkerConfig, WorkerId};
+
+        let pool = WorkerPool::new();
+
+        // Add multiple workers
+        for i in 1..=3 {
+            let worker_config = WorkerConfig {
+                id: WorkerId::new(format!("worker-{}", i)),
+                host: format!("host{}.example.com", i),
+                user: "testuser".to_string(),
+                identity_file: "~/.ssh/id_rsa".to_string(),
+                total_slots: 4 * i as u32,
+                priority: 100 - i as u32,
+                tags: vec![format!("tag-{}", i)],
+            };
+            pool.add_worker(worker_config).await;
+        }
+
+        let state = HttpState {
+            pool,
+            version: "0.1.0-test",
+            started_at: Instant::now(),
+            pid: 12345,
+        };
+        let router = create_router(state);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/ready")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["status"], "ready");
+        assert_eq!(json["workers_available"], true);
+        assert_eq!(json["available_workers"], 3);
+        // Total slots: 4 + 8 + 12 = 24
+        assert_eq!(json["total_available_slots"], 24);
+    }
+
+    #[tokio::test]
+    async fn test_health_endpoint_uptime() {
+        use std::time::Duration;
+
+        let started_at = Instant::now() - Duration::from_secs(100);
+        let state = HttpState {
+            pool: WorkerPool::new(),
+            version: "0.2.0",
+            started_at,
+            pid: 99999,
+        };
+        let router = create_router(state);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["status"], "healthy");
+        assert_eq!(json["version"], "0.2.0");
+        assert_eq!(json["pid"], 99999);
+        // Uptime should be around 100 seconds (allow some tolerance)
+        let uptime = json["uptime_seconds"].as_u64().unwrap();
+        assert!((100..=105).contains(&uptime));
+    }
 }

@@ -4057,4 +4057,374 @@ mod tests {
             _ => panic!("expected error response"),
         }
     }
+
+    // =========================================================================
+    // SpeedScore history tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_handle_speedscore_history_worker_not_found() {
+        let _guard = test_guard!();
+        let pool = WorkerPool::new();
+        let ctx = make_test_context(pool);
+
+        let response =
+            handle_speedscore_history(&ctx, &WorkerId::new("nonexistent"), 7, 20, 0).await;
+        match response {
+            ApiResponse::Error(e) => {
+                assert!(
+                    e.details
+                        .as_deref()
+                        .unwrap_or_default()
+                        .contains("not found")
+                );
+            }
+            _ => panic!("expected error response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_speedscore_history_success_empty() {
+        let _guard = test_guard!();
+        let pool = WorkerPool::new();
+        pool.add_worker(make_test_worker("worker1", 8)).await;
+        let ctx = make_test_context(pool);
+
+        let response = handle_speedscore_history(&ctx, &WorkerId::new("worker1"), 7, 20, 0).await;
+        match response {
+            ApiResponse::Ok(r) => {
+                assert_eq!(r.worker_id, "worker1");
+                assert!(r.history.is_empty()); // No history entries yet
+                assert!(!r.pagination.has_more);
+            }
+            _ => panic!("expected ok response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_speedscore_history_clamps_days() {
+        let _guard = test_guard!();
+        let pool = WorkerPool::new();
+        pool.add_worker(make_test_worker("worker1", 8)).await;
+        let ctx = make_test_context(pool);
+
+        // Request 0 days - should be clamped to 1
+        let response = handle_speedscore_history(&ctx, &WorkerId::new("worker1"), 0, 20, 0).await;
+        match response {
+            ApiResponse::Ok(r) => {
+                assert_eq!(r.worker_id, "worker1");
+            }
+            _ => panic!("expected ok response"),
+        }
+
+        // Request 1000 days - should be clamped to 365
+        let response =
+            handle_speedscore_history(&ctx, &WorkerId::new("worker1"), 1000, 20, 0).await;
+        match response {
+            ApiResponse::Ok(r) => {
+                assert_eq!(r.worker_id, "worker1");
+            }
+            _ => panic!("expected ok response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_speedscore_history_clamps_limit() {
+        let _guard = test_guard!();
+        let pool = WorkerPool::new();
+        pool.add_worker(make_test_worker("worker1", 8)).await;
+        let ctx = make_test_context(pool);
+
+        // Request limit of 0 - should be clamped to 1
+        let response = handle_speedscore_history(&ctx, &WorkerId::new("worker1"), 7, 0, 0).await;
+        match response {
+            ApiResponse::Ok(r) => {
+                assert_eq!(r.pagination.limit, 1);
+            }
+            _ => panic!("expected ok response"),
+        }
+
+        // Request limit of 5000 - should be clamped to 1000
+        let response =
+            handle_speedscore_history(&ctx, &WorkerId::new("worker1"), 7, 5000, 0).await;
+        match response {
+            ApiResponse::Ok(r) => {
+                assert_eq!(r.pagination.limit, 1000);
+            }
+            _ => panic!("expected ok response"),
+        }
+    }
+
+    // =========================================================================
+    // Workers capabilities tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_handle_workers_capabilities_empty_pool() {
+        let _guard = test_guard!();
+        let pool = WorkerPool::new();
+        let ctx = make_test_context(pool);
+
+        let response = handle_workers_capabilities(&ctx, false).await;
+        match response {
+            ApiResponse::Ok(r) => {
+                assert!(r.workers.is_empty());
+            }
+            _ => panic!("expected ok response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_workers_capabilities_with_workers() {
+        let _guard = test_guard!();
+        let pool = WorkerPool::new();
+        pool.add_worker(make_test_worker("worker1", 8)).await;
+        pool.add_worker(make_test_worker("worker2", 4)).await;
+        let ctx = make_test_context(pool);
+
+        let response = handle_workers_capabilities(&ctx, false).await;
+        match response {
+            ApiResponse::Ok(r) => {
+                assert_eq!(r.workers.len(), 2);
+                // Check worker info is populated
+                let w1 = r.workers.iter().find(|w| w.id == "worker1").unwrap();
+                assert_eq!(w1.host, "localhost");
+                assert_eq!(w1.user, "user");
+            }
+            _ => panic!("expected ok response"),
+        }
+    }
+
+    // =========================================================================
+    // Release worker tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_handle_release_worker_basic() {
+        let _guard = test_guard!();
+        let pool = WorkerPool::new();
+        pool.add_worker(make_test_worker("worker1", 8)).await;
+
+        // Reserve some slots first
+        let worker = pool.get(&WorkerId::new("worker1")).await.unwrap();
+        let reserved = worker.reserve_slots(4).await;
+        assert!(reserved);
+
+        let ctx = make_test_context(pool.clone());
+
+        let request = ReleaseRequest {
+            worker_id: WorkerId::new("worker1"),
+            slots: 4,
+            build_id: None,
+            exit_code: None,
+            duration_ms: None,
+            bytes_transferred: None,
+            timing: None,
+        };
+
+        let result = handle_release_worker(&ctx, request).await;
+        assert!(result.is_ok());
+
+        // Verify slots were released
+        let available = worker.available_slots().await;
+        assert_eq!(available, 8);
+    }
+
+    #[tokio::test]
+    async fn test_handle_release_worker_with_build_completion() {
+        let _guard = test_guard!();
+        let pool = WorkerPool::new();
+        pool.add_worker(make_test_worker("worker1", 8)).await;
+
+        let ctx = make_test_context(pool.clone());
+
+        // Start a build first using the correct API
+        let build = ctx.history.start_active_build(
+            "test-project".to_string(),
+            "worker1".to_string(),
+            "cargo build".to_string(),
+            12345,
+            4,
+            rch_common::BuildLocation::Remote,
+        );
+        let build_id = build.id;
+
+        // Reserve slots
+        let worker = pool.get(&WorkerId::new("worker1")).await.unwrap();
+        worker.reserve_slots(4).await;
+
+        let request = ReleaseRequest {
+            worker_id: WorkerId::new("worker1"),
+            slots: 4,
+            build_id: Some(build_id),
+            exit_code: Some(0),
+            duration_ms: Some(5000),
+            bytes_transferred: Some(1024 * 1024),
+            timing: None,
+        };
+
+        let result = handle_release_worker(&ctx, request).await;
+        assert!(result.is_ok());
+
+        // Verify build was completed in history
+        let recent = ctx.history.recent(10);
+        let completed = recent.iter().find(|b| b.id == build_id);
+        assert!(completed.is_some());
+        assert_eq!(completed.unwrap().exit_code, 0);
+    }
+
+    // =========================================================================
+    // Record build tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_handle_record_build_basic() {
+        let _guard = test_guard!();
+        let pool = WorkerPool::new();
+        pool.add_worker(make_test_worker("worker1", 8)).await;
+        let ctx = make_test_context(pool);
+
+        let result =
+            handle_record_build(&ctx, &WorkerId::new("worker1"), "my-project", false).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_handle_record_build_test_flag() {
+        let _guard = test_guard!();
+        let pool = WorkerPool::new();
+        pool.add_worker(make_test_worker("worker1", 8)).await;
+        let ctx = make_test_context(pool);
+
+        // Record a test build
+        let result =
+            handle_record_build(&ctx, &WorkerId::new("worker1"), "my-project", true).await;
+        assert!(result.is_ok());
+    }
+
+    // =========================================================================
+    // Status handler tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_handle_status_empty_pool() {
+        let _guard = test_guard!();
+        let pool = WorkerPool::new();
+        let ctx = make_test_context(pool);
+
+        let result = handle_status(&ctx).await;
+        assert!(result.is_ok());
+
+        let status = result.unwrap();
+        assert!(status.workers.is_empty());
+        assert!(status.active_builds.is_empty());
+        assert!(status.queued_builds.is_empty());
+        assert_eq!(status.daemon.workers_total, 0);
+        assert_eq!(status.daemon.workers_healthy, 0);
+    }
+
+    #[tokio::test]
+    async fn test_handle_status_with_workers() {
+        let _guard = test_guard!();
+        let pool = WorkerPool::new();
+        pool.add_worker(make_test_worker("worker1", 8)).await;
+        pool.add_worker(make_test_worker("worker2", 4)).await;
+        let ctx = make_test_context(pool);
+
+        let result = handle_status(&ctx).await;
+        assert!(result.is_ok());
+
+        let status = result.unwrap();
+        assert_eq!(status.workers.len(), 2);
+        assert_eq!(status.daemon.workers_total, 2);
+        assert_eq!(status.daemon.slots_total, 12); // 8 + 4
+        assert_eq!(status.daemon.version, "0.1.0");
+        assert_eq!(status.daemon.pid, 1234);
+    }
+
+    #[tokio::test]
+    async fn test_handle_status_with_active_build() {
+        let _guard = test_guard!();
+        let pool = WorkerPool::new();
+        pool.add_worker(make_test_worker("worker1", 8)).await;
+        let ctx = make_test_context(pool);
+
+        // Start a build using the correct API
+        ctx.history.start_active_build(
+            "test-project".to_string(),
+            "worker1".to_string(),
+            "cargo build".to_string(),
+            12345,
+            4,
+            rch_common::BuildLocation::Remote,
+        );
+
+        let result = handle_status(&ctx).await;
+        assert!(result.is_ok());
+
+        let status = result.unwrap();
+        assert_eq!(status.active_builds.len(), 1);
+        assert_eq!(status.active_builds[0].project_id, "test-project");
+        assert_eq!(status.active_builds[0].command, "cargo build");
+    }
+
+    // =========================================================================
+    // Format wait time tests
+    // =========================================================================
+
+    #[test]
+    fn test_format_wait_time_edge_cases() {
+        let _guard = test_guard!();
+
+        // Exactly 60 seconds
+        assert_eq!(format_wait_time(60), "1m");
+
+        // Exactly 1 hour
+        assert_eq!(format_wait_time(3600), "1h");
+
+        // 1 hour and 30 minutes
+        assert_eq!(format_wait_time(5400), "1h 30m");
+
+        // 2 hours exactly
+        assert_eq!(format_wait_time(7200), "2h");
+
+        // Zero seconds
+        assert_eq!(format_wait_time(0), "0s");
+
+        // 59 seconds
+        assert_eq!(format_wait_time(59), "59s");
+
+        // 61 seconds
+        assert_eq!(format_wait_time(61), "1m 1s");
+    }
+
+    // =========================================================================
+    // Health handler test
+    // =========================================================================
+
+    #[test]
+    fn test_handle_health() {
+        let _guard = test_guard!();
+        let pool = WorkerPool::new();
+        let ctx = make_test_context(pool);
+
+        let response = handle_health(&ctx);
+        assert_eq!(response.status, "healthy");
+        assert_eq!(response.version, "0.1.0");
+        // Uptime should be small since we just created the context
+        assert!(response.uptime_seconds < 10);
+    }
+
+    // =========================================================================
+    // Budget handler test
+    // =========================================================================
+
+    #[test]
+    fn test_handle_budget() {
+        let _guard = test_guard!();
+        let response = handle_budget();
+        // Just verify it returns without panic and has expected structure
+        // Response has status, budgets, and computed_at fields
+        assert!(!response.computed_at.is_empty());
+    }
 }
