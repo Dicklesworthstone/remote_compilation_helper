@@ -7253,7 +7253,9 @@ async fn send_daemon_command(_command: &str) -> Result<String> {
 
 #[cfg(unix)]
 async fn send_daemon_command(command: &str) -> Result<String> {
-    let socket_path = Path::new(DEFAULT_SOCKET_PATH);
+    let config = crate::config::load_config()?;
+    let expanded = shellexpand::tilde(&config.general.socket_path);
+    let socket_path = Path::new(expanded.as_ref());
     if !socket_path.exists() {
         bail!("Daemon socket not found at {:?}", socket_path);
     }
