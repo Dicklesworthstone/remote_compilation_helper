@@ -482,6 +482,38 @@ impl Default for WorkerPool {
 mod tests {
     use super::*;
 
+    /// Helper to create a test worker config with given id.
+    fn test_config(id: &str) -> WorkerConfig {
+        WorkerConfig {
+            id: WorkerId::new(id),
+            host: "localhost".to_string(),
+            user: "user".to_string(),
+            identity_file: "~/.ssh/id_rsa".to_string(),
+            total_slots: 8,
+            priority: 100,
+            tags: vec![],
+        }
+    }
+
+    // ============== WorkerState Tests ==============
+
+    #[tokio::test]
+    async fn test_worker_state_new_defaults() {
+        let state = WorkerState::new(test_config("test-worker"));
+
+        // Check default values
+        assert_eq!(state.status().await, WorkerStatus::Healthy);
+        assert_eq!(state.available_slots().await, 8);
+        assert_eq!(state.used_slots(), 0);
+        assert_eq!(state.get_speed_score().await, 50.0);
+        assert!(state.last_latency_ms().await.is_none());
+        assert!(state.last_error().await.is_none());
+        assert!(!state.is_disabled().await);
+        assert!(!state.is_draining().await);
+        assert!(state.disabled_reason().await.is_none());
+        assert!(state.disabled_at().await.is_none());
+    }
+
     #[tokio::test]
     async fn test_slot_reservation() {
         let config = WorkerConfig {
@@ -507,6 +539,418 @@ mod tests {
 
         state.release_slots(4).await;
         assert_eq!(state.available_slots().await, 4);
+    }
+
+    #[tokio::test]
+    async fn test_slot_reservation_exact_boundary() {
+        let state = WorkerState::new(test_config("test"));
+
+        // Reserve exactly all slots
+        assert!(state.reserve_slots(8).await);
+        assert_eq!(state.available_slots().await, 0);
+        assert_eq!(state.used_slots(), 8);
+
+        // Trying to reserve even 0 more fails when full
+        assert!(!state.reserve_slots(1).await);
+
+        // Release all
+        state.release_slots(8).await;
+        assert_eq!(state.available_slots().await, 8);
+    }
+
+    #[tokio::test]
+    async fn test_release_slots_more_than_used() {
+        let state = WorkerState::new(test_config("test"));
+
+        // Reserve 2 slots
+        assert!(state.reserve_slots(2).await);
+        assert_eq!(state.used_slots(), 2);
+
+        // Release more than reserved - should saturate to 0
+        state.release_slots(10).await;
+        assert_eq!(state.used_slots(), 0);
+        assert_eq!(state.available_slots().await, 8);
+    }
+
+    #[tokio::test]
+    async fn test_status_transitions() {
+        let state = WorkerState::new(test_config("test"));
+
+        assert_eq!(state.status().await, WorkerStatus::Healthy);
+
+        state.set_status(WorkerStatus::Degraded).await;
+        assert_eq!(state.status().await, WorkerStatus::Degraded);
+
+        state.set_status(WorkerStatus::Unreachable).await;
+        assert_eq!(state.status().await, WorkerStatus::Unreachable);
+
+        state.set_status(WorkerStatus::Healthy).await;
+        assert_eq!(state.status().await, WorkerStatus::Healthy);
+    }
+
+    #[tokio::test]
+    async fn test_disable_enable_cycle() {
+        let state = WorkerState::new(test_config("test"));
+
+        // Disable with reason
+        state.disable(Some("Maintenance".to_string())).await;
+        assert!(state.is_disabled().await);
+        assert_eq!(state.status().await, WorkerStatus::Disabled);
+        assert_eq!(
+            state.disabled_reason().await,
+            Some("Maintenance".to_string())
+        );
+        assert!(state.disabled_at().await.is_some());
+
+        // Enable again
+        state.enable().await;
+        assert!(!state.is_disabled().await);
+        assert_eq!(state.status().await, WorkerStatus::Healthy);
+        assert!(state.disabled_reason().await.is_none());
+        assert!(state.disabled_at().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_disable_without_reason() {
+        let state = WorkerState::new(test_config("test"));
+
+        state.disable(None).await;
+        assert!(state.is_disabled().await);
+        assert!(state.disabled_reason().await.is_none());
+        assert!(state.disabled_at().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_drain_state() {
+        let state = WorkerState::new(test_config("test"));
+
+        state.drain().await;
+        assert!(state.is_draining().await);
+        assert_eq!(state.status().await, WorkerStatus::Draining);
+        assert!(!state.is_disabled().await);
+
+        // Enable clears draining
+        state.enable().await;
+        assert!(!state.is_draining().await);
+        assert_eq!(state.status().await, WorkerStatus::Healthy);
+    }
+
+    #[tokio::test]
+    async fn test_cached_projects() {
+        let state = WorkerState::new(test_config("test"));
+
+        assert!(!state.has_cached_project("project-a").await);
+
+        state.add_cached_project("project-a".to_string()).await;
+        assert!(state.has_cached_project("project-a").await);
+        assert!(!state.has_cached_project("project-b").await);
+
+        // Adding same project again should not duplicate
+        state.add_cached_project("project-a".to_string()).await;
+        let projects = state.cached_projects.read().await;
+        assert_eq!(projects.len(), 1);
+        drop(projects);
+
+        state.add_cached_project("project-b".to_string()).await;
+        assert!(state.has_cached_project("project-b").await);
+        let projects = state.cached_projects.read().await;
+        assert_eq!(projects.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_speed_score() {
+        let state = WorkerState::new(test_config("test"));
+
+        // Default is 50.0
+        assert_eq!(state.get_speed_score().await, 50.0);
+
+        state.set_speed_score(85.5).await;
+        assert_eq!(state.get_speed_score().await, 85.5);
+
+        state.set_speed_score(0.0).await;
+        assert_eq!(state.get_speed_score().await, 0.0);
+
+        state.set_speed_score(100.0).await;
+        assert_eq!(state.get_speed_score().await, 100.0);
+    }
+
+    #[tokio::test]
+    async fn test_latency_tracking() {
+        let state = WorkerState::new(test_config("test"));
+
+        assert!(state.last_latency_ms().await.is_none());
+
+        state.set_last_latency_ms(Some(42)).await;
+        assert_eq!(state.last_latency_ms().await, Some(42));
+
+        state.set_last_latency_ms(Some(100)).await;
+        assert_eq!(state.last_latency_ms().await, Some(100));
+
+        state.set_last_latency_ms(None).await;
+        assert!(state.last_latency_ms().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_error_tracking() {
+        let state = WorkerState::new(test_config("test"));
+
+        assert!(state.last_error().await.is_none());
+
+        state.set_error("Connection refused".to_string()).await;
+        assert_eq!(
+            state.last_error().await,
+            Some("Connection refused".to_string())
+        );
+
+        // Recording failure with error message updates last_error
+        state.record_failure(Some("Timeout".to_string())).await;
+        assert_eq!(state.last_error().await, Some("Timeout".to_string()));
+
+        // Recording failure without message keeps previous error
+        state.record_failure(None).await;
+        assert_eq!(state.last_error().await, Some("Timeout".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_circuit_breaker_basic() {
+        let state = WorkerState::new(test_config("test"));
+
+        // Initial state is Closed
+        assert_eq!(state.circuit_state().await, Some(CircuitState::Closed));
+
+        // Record success
+        state.record_success().await;
+        assert_eq!(state.circuit_state().await, Some(CircuitState::Closed));
+
+        // Open circuit
+        state.open_circuit().await;
+        assert_eq!(state.circuit_state().await, Some(CircuitState::Open));
+
+        // Half-open
+        state.half_open_circuit().await;
+        assert_eq!(state.circuit_state().await, Some(CircuitState::HalfOpen));
+
+        // Close circuit clears error
+        state.set_error("Test error".to_string()).await;
+        state.close_circuit().await;
+        assert_eq!(state.circuit_state().await, Some(CircuitState::Closed));
+        assert!(state.last_error().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_capabilities() {
+        let state = WorkerState::new(test_config("test"));
+
+        // Default capabilities: nothing installed
+        assert!(!state.has_bun().await);
+        assert!(!state.has_node().await);
+        assert!(!state.has_rust().await);
+
+        // Set capabilities with Rust
+        let mut caps = WorkerCapabilities::new();
+        caps.rustc_version = Some("1.87.0-nightly".to_string());
+        state.set_capabilities(caps).await;
+
+        assert!(state.has_rust().await);
+        assert!(!state.has_bun().await);
+        assert!(!state.has_node().await);
+
+        // Set capabilities with all runtimes
+        let mut caps = WorkerCapabilities::new();
+        caps.rustc_version = Some("1.87.0".to_string());
+        caps.bun_version = Some("1.2.0".to_string());
+        caps.node_version = Some("22.0.0".to_string());
+        state.set_capabilities(caps.clone()).await;
+
+        assert!(state.has_rust().await);
+        assert!(state.has_bun().await);
+        assert!(state.has_node().await);
+
+        // Verify capabilities retrieval
+        let retrieved = state.capabilities().await;
+        assert_eq!(retrieved.rustc_version, Some("1.87.0".to_string()));
+        assert_eq!(retrieved.bun_version, Some("1.2.0".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_update_config() {
+        let state = WorkerState::new(test_config("test"));
+
+        {
+            let config = state.config.read().await;
+            assert_eq!(config.total_slots, 8);
+            assert_eq!(config.priority, 100);
+        }
+
+        // Update config
+        let mut new_config = test_config("test");
+        new_config.total_slots = 16;
+        new_config.priority = 200;
+        state.update_config(new_config).await;
+
+        let config = state.config.read().await;
+        assert_eq!(config.total_slots, 16);
+        assert_eq!(config.priority, 200);
+    }
+
+    // ============== WorkerPool Tests ==============
+
+    #[tokio::test]
+    async fn test_pool_new_empty() {
+        let pool = WorkerPool::new();
+        assert!(pool.is_empty());
+        assert_eq!(pool.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_pool_add_and_get() {
+        let pool = WorkerPool::new();
+
+        pool.add_worker(test_config("worker-1")).await;
+        assert_eq!(pool.len(), 1);
+        assert!(!pool.is_empty());
+
+        let worker = pool.get(&WorkerId::new("worker-1")).await;
+        assert!(worker.is_some());
+        let worker = worker.unwrap();
+        assert_eq!(worker.config.read().await.total_slots, 8);
+
+        // Non-existent worker
+        assert!(pool.get(&WorkerId::new("worker-2")).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_pool_add_duplicate_updates() {
+        let pool = WorkerPool::new();
+
+        pool.add_worker(test_config("worker-1")).await;
+        assert_eq!(pool.len(), 1);
+
+        // Adding same id again updates config, doesn't add new worker
+        let mut updated_config = test_config("worker-1");
+        updated_config.total_slots = 16;
+        pool.add_worker(updated_config).await;
+
+        assert_eq!(pool.len(), 1);
+
+        let worker = pool.get(&WorkerId::new("worker-1")).await.unwrap();
+        assert_eq!(worker.config.read().await.total_slots, 16);
+    }
+
+    #[tokio::test]
+    async fn test_pool_remove_worker() {
+        let pool = WorkerPool::new();
+
+        pool.add_worker(test_config("worker-1")).await;
+        pool.add_worker(test_config("worker-2")).await;
+        assert_eq!(pool.len(), 2);
+
+        // Remove existing
+        assert!(pool.remove_worker(&WorkerId::new("worker-1")).await);
+        assert_eq!(pool.len(), 1);
+        assert!(pool.get(&WorkerId::new("worker-1")).await.is_none());
+        assert!(pool.get(&WorkerId::new("worker-2")).await.is_some());
+
+        // Remove non-existent
+        assert!(!pool.remove_worker(&WorkerId::new("worker-1")).await);
+        assert_eq!(pool.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_pool_all_workers() {
+        let pool = WorkerPool::new();
+
+        pool.add_worker(test_config("worker-1")).await;
+        pool.add_worker(test_config("worker-2")).await;
+
+        // Disable one
+        pool.get(&WorkerId::new("worker-1"))
+            .await
+            .unwrap()
+            .disable(None)
+            .await;
+
+        let all = pool.all_workers().await;
+        assert_eq!(all.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_pool_healthy_workers() {
+        let pool = WorkerPool::new();
+
+        pool.add_worker(test_config("healthy")).await;
+        pool.add_worker(test_config("degraded")).await;
+        pool.add_worker(test_config("unreachable")).await;
+        pool.add_worker(test_config("disabled")).await;
+        pool.add_worker(test_config("draining")).await;
+
+        // Set statuses
+        pool.get(&WorkerId::new("degraded"))
+            .await
+            .unwrap()
+            .set_status(WorkerStatus::Degraded)
+            .await;
+        pool.get(&WorkerId::new("unreachable"))
+            .await
+            .unwrap()
+            .set_status(WorkerStatus::Unreachable)
+            .await;
+        pool.get(&WorkerId::new("disabled"))
+            .await
+            .unwrap()
+            .disable(None)
+            .await;
+        pool.get(&WorkerId::new("draining"))
+            .await
+            .unwrap()
+            .drain()
+            .await;
+
+        let healthy = pool.healthy_workers().await;
+
+        // Should include Healthy and Degraded only
+        assert_eq!(healthy.len(), 2);
+
+        // Collect worker ids manually
+        let mut ids = Vec::new();
+        for w in &healthy {
+            ids.push(w.config.read().await.id.clone());
+        }
+
+        assert!(ids.contains(&WorkerId::new("healthy")));
+        assert!(ids.contains(&WorkerId::new("degraded")));
+    }
+
+    #[tokio::test]
+    async fn test_pool_set_status() {
+        let pool = WorkerPool::new();
+        pool.add_worker(test_config("worker-1")).await;
+
+        pool.set_status(&WorkerId::new("worker-1"), WorkerStatus::Unreachable)
+            .await;
+
+        let worker = pool.get(&WorkerId::new("worker-1")).await.unwrap();
+        assert_eq!(worker.status().await, WorkerStatus::Unreachable);
+
+        // Setting status on non-existent worker is a no-op
+        pool.set_status(&WorkerId::new("nonexistent"), WorkerStatus::Healthy)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_pool_release_slots() {
+        let pool = WorkerPool::new();
+        pool.add_worker(test_config("worker-1")).await;
+
+        let worker = pool.get(&WorkerId::new("worker-1")).await.unwrap();
+        worker.reserve_slots(4).await;
+        assert_eq!(worker.available_slots().await, 4);
+
+        pool.release_slots(&WorkerId::new("worker-1"), 2).await;
+        assert_eq!(worker.available_slots().await, 6);
+
+        // Release on non-existent worker is a no-op
+        pool.release_slots(&WorkerId::new("nonexistent"), 10).await;
     }
 
     #[tokio::test]
@@ -561,5 +1005,29 @@ mod tests {
         assert!(pool.get(&WorkerId::new("active")).await.is_some());
         assert!(pool.get(&WorkerId::new("drained_busy")).await.is_some());
         assert!(pool.get(&WorkerId::new("drained_empty")).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_prune_drained_empty_pool() {
+        let pool = WorkerPool::new();
+        let pruned = pool.prune_drained().await;
+        assert_eq!(pruned, 0);
+    }
+
+    #[tokio::test]
+    async fn test_prune_drained_no_draining_workers() {
+        let pool = WorkerPool::new();
+        pool.add_worker(test_config("worker-1")).await;
+        pool.add_worker(test_config("worker-2")).await;
+
+        let pruned = pool.prune_drained().await;
+        assert_eq!(pruned, 0);
+        assert_eq!(pool.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_pool_default() {
+        let pool = WorkerPool::default();
+        assert!(pool.is_empty());
     }
 }

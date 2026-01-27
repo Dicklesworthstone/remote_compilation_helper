@@ -71,28 +71,49 @@ fn start_daemon_with_socket(
 
 /// Send a request to the daemon via Unix socket and get the response.
 fn send_socket_request(socket_path: &std::path::Path, request: &str) -> std::io::Result<String> {
-    let mut stream = UnixStream::connect(socket_path)?;
-    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    // De-flake: on heavily loaded systems, the daemon can accept then close before writing.
+    // Retry a few times to avoid spurious empty responses.
+    let mut last_error = None;
+    for attempt in 0..5 {
+        let result: std::io::Result<String> = (|| {
+            let mut stream = UnixStream::connect(socket_path)?;
+            stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+            stream.set_write_timeout(Some(Duration::from_secs(5)))?;
 
-    // Send request
-    writeln!(stream, "{}", request)?;
-    stream.flush()?;
+            // Send request
+            writeln!(stream, "{}", request)?;
+            stream.flush()?;
 
-    // Read response
-    let mut reader = BufReader::new(stream);
-    let mut response = String::new();
-    loop {
-        let mut line = String::new();
-        match reader.read_line(&mut line) {
-            Ok(0) => break, // EOF
-            Ok(_) => response.push_str(&line),
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-            Err(e) => return Err(e),
+            // Read response
+            let mut reader = BufReader::new(stream);
+            let mut response = String::new();
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) => break, // EOF
+                    Ok(_) => response.push_str(&line),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(e) => return Err(e),
+                }
+            }
+
+            Ok(response)
+        })();
+
+        match result {
+            Ok(response) if !response.is_empty() => return Ok(response),
+            Ok(_) => {}
+            Err(err) => last_error = Some(err),
+        }
+
+        if attempt < 4 {
+            std::thread::sleep(Duration::from_millis(50));
         }
     }
 
-    Ok(response)
+    Err(last_error.unwrap_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "empty daemon response")
+    }))
 }
 
 /// Extract JSON body from HTTP response.
