@@ -2732,8 +2732,8 @@ mod tests {
         let result = selector.select(&pool, &request).await;
         assert!(result.worker.is_none());
 
-        // BUG: Currently returns NoWorkersWithRuntime because runtime check is after slot check
-        // Correct behavior should be AllWorkersBusy
+        // BUG FIX VERIFIED: Runtime check now happens before slot check,
+        // so busy workers correctly return AllWorkersBusy (not NoWorkersWithRuntime)
         assert_eq!(
             result.reason,
             SelectionReason::AllWorkersBusy,
