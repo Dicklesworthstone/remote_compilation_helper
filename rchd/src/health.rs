@@ -674,7 +674,7 @@ pub async fn probe_worker_capabilities(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+        use rch_common::test_guard;
     use rch_common::mock::{
         MockConfig, clear_mock_overrides, set_mock_enabled_override, set_mock_ssh_config_override,
     };
@@ -705,6 +705,7 @@ mod tests {
 
     #[test]
     fn test_health_config_default() {
+        let _guard = test_guard!();
         let config = HealthConfig::default();
         assert_eq!(config.check_interval, Duration::from_secs(30));
         assert_eq!(config.failure_threshold, 3);
@@ -712,6 +713,7 @@ mod tests {
 
     #[test]
     fn test_health_check_result_success() {
+        let _guard = test_guard!();
         let result = HealthCheckResult::success(100);
         assert!(result.healthy);
         assert_eq!(result.response_time_ms, 100);
@@ -720,6 +722,7 @@ mod tests {
 
     #[test]
     fn test_health_check_result_failure() {
+        let _guard = test_guard!();
         let result = HealthCheckResult::failure("Connection timeout".to_string());
         assert!(!result.healthy);
         assert!(result.error.is_some());
@@ -727,6 +730,7 @@ mod tests {
 
     #[test]
     fn test_worker_health_update_success() {
+        let _guard = test_guard!();
         let config = HealthConfig::default();
         let mut health = WorkerHealth::default();
 
@@ -739,6 +743,7 @@ mod tests {
 
     #[test]
     fn test_worker_health_update_degraded() {
+        let _guard = test_guard!();
         let config = HealthConfig::default();
         let mut health = WorkerHealth::default();
 
@@ -750,6 +755,7 @@ mod tests {
 
     #[test]
     fn test_worker_health_update_unreachable() {
+        let _guard = test_guard!();
         let config = HealthConfig {
             failure_threshold: 3,
             ..Default::default()
@@ -768,6 +774,7 @@ mod tests {
 
     #[test]
     fn test_worker_health_recovery() {
+        let _guard = test_guard!();
         let config = HealthConfig::default();
         let mut health = WorkerHealth::default();
 
@@ -787,6 +794,7 @@ mod tests {
 
     #[test]
     fn test_circuit_opens_on_failure_threshold() {
+        let _guard = test_guard!();
         let config = HealthConfig {
             circuit: CircuitBreakerConfig {
                 failure_threshold: 3,
@@ -816,6 +824,7 @@ mod tests {
 
     #[test]
     fn test_circuit_transitions_to_half_open() {
+        let _guard = test_guard!();
         let config = HealthConfig {
             circuit: CircuitBreakerConfig {
                 failure_threshold: 2,
@@ -838,6 +847,7 @@ mod tests {
 
     #[test]
     fn test_circuit_closes_after_success_in_half_open() {
+        let _guard = test_guard!();
         let config = HealthConfig {
             circuit: CircuitBreakerConfig {
                 failure_threshold: 2,
@@ -868,6 +878,7 @@ mod tests {
 
     #[test]
     fn test_circuit_reopens_on_failure_in_half_open() {
+        let _guard = test_guard!();
         // Use two configs: one with cooldown=0 to quickly get to half-open,
         // then one with longer cooldown to verify reopen stays open
         let config_fast = HealthConfig {
@@ -905,6 +916,7 @@ mod tests {
 
     #[test]
     fn test_circuit_stats_accessors() {
+        let _guard = test_guard!();
         let config = HealthConfig::default();
         let mut health = WorkerHealth::default();
 

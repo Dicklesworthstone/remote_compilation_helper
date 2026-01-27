@@ -322,12 +322,13 @@ fn pipe(ctx: OutputContext) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+        use rch_common::test_guard;
 
     // ==================== format_elapsed tests ====================
 
     #[test]
     fn test_format_elapsed_sub_10_seconds() {
+        let _guard = test_guard!();
         assert_eq!(format_elapsed(Duration::from_secs_f64(1.23)), "1.23s");
         assert_eq!(format_elapsed(Duration::from_secs_f64(5.5)), "5.50s");
         assert_eq!(format_elapsed(Duration::from_secs_f64(9.99)), "9.99s");
@@ -335,6 +336,7 @@ mod tests {
 
     #[test]
     fn test_format_elapsed_10_seconds_and_above() {
+        let _guard = test_guard!();
         assert_eq!(format_elapsed(Duration::from_secs_f64(10.0)), "10.0s");
         assert_eq!(format_elapsed(Duration::from_secs_f64(44.25)), "44.2s");
         assert_eq!(format_elapsed(Duration::from_secs_f64(100.0)), "100.0s");
@@ -342,6 +344,7 @@ mod tests {
 
     #[test]
     fn test_format_elapsed_zero() {
+        let _guard = test_guard!();
         assert_eq!(format_elapsed(Duration::ZERO), "0.00s");
     }
 
@@ -349,18 +352,21 @@ mod tests {
 
     #[test]
     fn test_pad_command_short() {
+        let _guard = test_guard!();
         let cmd = "cargo build";
         assert_eq!(pad_command(cmd), cmd);
     }
 
     #[test]
     fn test_pad_command_exactly_60() {
+        let _guard = test_guard!();
         let cmd = "a".repeat(60);
         assert_eq!(pad_command(&cmd), cmd);
     }
 
     #[test]
     fn test_pad_command_long_truncates() {
+        let _guard = test_guard!();
         let cmd = "a".repeat(100);
         let result = pad_command(&cmd);
         assert!(result.len() <= 60);
@@ -369,6 +375,7 @@ mod tests {
 
     #[test]
     fn test_pad_command_unicode() {
+        let _guard = test_guard!();
         // Unicode command with emojis
         let cmd = "🚀".repeat(70);
         let result = pad_command(&cmd);
@@ -379,12 +386,14 @@ mod tests {
 
     #[test]
     fn test_pipe_unicode() {
+        let _guard = test_guard!();
         let ctx = OutputContext::interactive();
         assert_eq!(pipe(ctx), "│");
     }
 
     #[test]
     fn test_pipe_ascii() {
+        let _guard = test_guard!();
         let ctx = OutputContext::plain();
         assert_eq!(pipe(ctx), "|");
     }
@@ -393,6 +402,7 @@ mod tests {
 
     #[test]
     fn test_job_phase_labels() {
+        let _guard = test_guard!();
         assert_eq!(JobPhase::TransferUp.label(), "SYNC");
         assert_eq!(JobPhase::Build.label(), "BUILD");
         assert_eq!(JobPhase::TransferDown.label(), "PULL");
@@ -401,6 +411,7 @@ mod tests {
 
     #[test]
     fn test_job_phase_equality() {
+        let _guard = test_guard!();
         assert_eq!(JobPhase::Build, JobPhase::Build);
         assert_ne!(JobPhase::Build, JobPhase::TransferUp);
     }
@@ -409,6 +420,7 @@ mod tests {
 
     #[test]
     fn test_lifecycle_mode_equality() {
+        let _guard = test_guard!();
         assert_eq!(JobLifecycleMode::Compact, JobLifecycleMode::Compact);
         assert_eq!(JobLifecycleMode::Detailed, JobLifecycleMode::Detailed);
         assert_ne!(JobLifecycleMode::Compact, JobLifecycleMode::Detailed);
@@ -418,12 +430,14 @@ mod tests {
 
     #[test]
     fn test_lifecycle_log_default_mode() {
+        let _guard = test_guard!();
         let log = JobLifecycleLog::with_context(OutputContext::plain());
         assert_eq!(log.mode, JobLifecycleMode::Compact);
     }
 
     #[test]
     fn test_lifecycle_log_with_mode() {
+        let _guard = test_guard!();
         let log = JobLifecycleLog::with_context(OutputContext::plain())
             .with_mode(JobLifecycleMode::Detailed);
         assert_eq!(log.mode, JobLifecycleMode::Detailed);
@@ -431,6 +445,7 @@ mod tests {
 
     #[test]
     fn start_line_contains_timestamp_and_job_id() {
+        let _guard = test_guard!();
         let mut log = JobLifecycleLog::with_context(OutputContext::plain());
         let lines = log
             .render(JobEvent::Start(JobStart {
@@ -448,6 +463,7 @@ mod tests {
 
     #[test]
     fn test_start_detailed_mode_shows_source() {
+        let _guard = test_guard!();
         let mut log = JobLifecycleLog::with_context(OutputContext::plain())
             .with_mode(JobLifecycleMode::Detailed);
         let lines = log
@@ -465,6 +481,7 @@ mod tests {
 
     #[test]
     fn test_start_no_source() {
+        let _guard = test_guard!();
         let mut log = JobLifecycleLog::with_context(OutputContext::plain())
             .with_mode(JobLifecycleMode::Detailed);
         let lines = log
@@ -481,6 +498,7 @@ mod tests {
 
     #[test]
     fn progress_is_rate_limited_per_job() {
+        let _guard = test_guard!();
         let mut log = JobLifecycleLog::with_context(OutputContext::plain());
         let ev = JobEvent::Progress(JobProgress {
             job_id: "j-a3f2".to_string(),
@@ -497,6 +515,7 @@ mod tests {
 
     #[test]
     fn test_progress_different_jobs_not_limited() {
+        let _guard = test_guard!();
         let mut log = JobLifecycleLog::with_context(OutputContext::plain());
 
         let ev1 = JobEvent::Progress(JobProgress {
@@ -521,6 +540,7 @@ mod tests {
 
     #[test]
     fn test_progress_contains_phase() {
+        let _guard = test_guard!();
         let mut log = JobLifecycleLog::with_context(OutputContext::plain());
         let lines = log
             .render(JobEvent::Progress(JobProgress {
@@ -536,6 +556,7 @@ mod tests {
 
     #[test]
     fn test_done_renders() {
+        let _guard = test_guard!();
         let mut log = JobLifecycleLog::with_context(OutputContext::plain());
         let lines = log
             .render(JobEvent::Done(JobDone {
@@ -552,6 +573,7 @@ mod tests {
 
     #[test]
     fn test_done_no_artifacts_no_note() {
+        let _guard = test_guard!();
         let mut log = JobLifecycleLog::with_context(OutputContext::plain());
         let lines = log
             .render(JobEvent::Done(JobDone {
@@ -567,6 +589,7 @@ mod tests {
 
     #[test]
     fn test_fail_renders() {
+        let _guard = test_guard!();
         let mut log = JobLifecycleLog::with_context(OutputContext::plain());
         let lines = log
             .render(JobEvent::Fail(JobFail {
@@ -583,6 +606,7 @@ mod tests {
 
     #[test]
     fn test_fail_detailed_mode_shows_remediation() {
+        let _guard = test_guard!();
         let mut log = JobLifecycleLog::with_context(OutputContext::plain())
             .with_mode(JobLifecycleMode::Detailed);
         let lines = log
@@ -600,6 +624,7 @@ mod tests {
 
     #[test]
     fn test_fail_no_extras() {
+        let _guard = test_guard!();
         let mut log = JobLifecycleLog::with_context(OutputContext::plain());
         let lines = log
             .render(JobEvent::Fail(JobFail {
@@ -617,6 +642,7 @@ mod tests {
 
     #[test]
     fn test_colorize_with_color_support() {
+        let _guard = test_guard!();
         let log = JobLifecycleLog::with_context(OutputContext::interactive());
         let result = log.colorize_segment(JobEventKind::Start, "TEST");
         assert!(result.contains("\x1b[")); // Contains ANSI escape
@@ -625,6 +651,7 @@ mod tests {
 
     #[test]
     fn test_colorize_without_color_support() {
+        let _guard = test_guard!();
         let log = JobLifecycleLog::with_context(OutputContext::plain());
         let result = log.colorize_segment(JobEventKind::Start, "TEST");
         assert_eq!(result, "TEST"); // No ANSI escapes
@@ -634,6 +661,7 @@ mod tests {
 
     #[test]
     fn test_job_start_fields() {
+        let _guard = test_guard!();
         let start = JobStart {
             job_id: "j-123".to_string(),
             source: Some("src".to_string()),
@@ -646,6 +674,7 @@ mod tests {
 
     #[test]
     fn test_job_progress_fields() {
+        let _guard = test_guard!();
         let progress = JobProgress {
             job_id: "j-123".to_string(),
             phase: JobPhase::Build,
@@ -659,6 +688,7 @@ mod tests {
 
     #[test]
     fn test_job_done_fields() {
+        let _guard = test_guard!();
         let done = JobDone {
             job_id: "j-123".to_string(),
             elapsed: Duration::from_secs(60),
@@ -670,6 +700,7 @@ mod tests {
 
     #[test]
     fn test_job_fail_fields() {
+        let _guard = test_guard!();
         let fail = JobFail {
             job_id: "j-123".to_string(),
             elapsed: Duration::from_secs(30),

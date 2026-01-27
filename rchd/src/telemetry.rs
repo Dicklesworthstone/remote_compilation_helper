@@ -394,7 +394,7 @@ async fn poll_worker(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+        use rch_common::test_guard;
     use rch_common::CompilationKind;
     use rch_telemetry::collect::cpu::{CpuTelemetry, LoadAverage};
     use rch_telemetry::collect::memory::MemoryTelemetry;
@@ -431,6 +431,7 @@ mod tests {
 
     #[test]
     fn test_ingest_and_latest() {
+        let _guard = test_guard!();
         let store = TelemetryStore::new(Duration::from_secs(300), None);
 
         store.ingest(make_telemetry("w1", 10.0, 20.0), TelemetrySource::SshPoll);
@@ -444,6 +445,7 @@ mod tests {
 
     #[test]
     fn test_latest_all_returns_one_per_worker() {
+        let _guard = test_guard!();
         let store = TelemetryStore::new(Duration::from_secs(300), None);
 
         store.ingest(make_telemetry("w1", 12.0, 22.0), TelemetrySource::Piggyback);
@@ -463,6 +465,7 @@ mod tests {
 
     #[test]
     fn test_eviction_removes_old_entries() {
+        let _guard = test_guard!();
         let store = TelemetryStore::new(Duration::from_secs(1), None);
 
         store.ingest(make_telemetry("w1", 10.0, 20.0), TelemetrySource::SshPoll);
@@ -483,6 +486,7 @@ mod tests {
 
     #[test]
     fn test_record_test_run_stats() {
+        let _guard = test_guard!();
         let store = TelemetryStore::new(Duration::from_secs(300), None);
         let record = TestRunRecord::new(
             "proj".to_string(),
@@ -506,6 +510,7 @@ mod tests {
 
     #[test]
     fn test_ingest_emits_websocket_event() {
+        let _guard = test_guard!();
         let event_bus = EventBus::new(16);
         let mut receiver = event_bus.subscribe();
 
@@ -525,6 +530,7 @@ mod tests {
 
     #[test]
     fn test_store_without_event_bus_still_works() {
+        let _guard = test_guard!();
         // Ensure the store works without an event bus (no panics, etc.)
         let store = TelemetryStore::new(Duration::from_secs(300), None);
 
@@ -537,6 +543,7 @@ mod tests {
 
     #[test]
     fn test_telemetry_poller_config_default() {
+        let _guard = test_guard!();
         let config = TelemetryPollerConfig::default();
         assert_eq!(config.poll_interval, Duration::from_secs(30));
         assert_eq!(config.ssh_timeout, Duration::from_secs(5));
@@ -545,6 +552,7 @@ mod tests {
 
     #[test]
     fn test_telemetry_poller_config_custom() {
+        let _guard = test_guard!();
         let config = TelemetryPollerConfig {
             poll_interval: Duration::from_secs(60),
             ssh_timeout: Duration::from_secs(10),
@@ -557,6 +565,7 @@ mod tests {
 
     #[test]
     fn test_telemetry_poller_config_clone() {
+        let _guard = test_guard!();
         let config = TelemetryPollerConfig::default();
         let cloned = config.clone();
         assert_eq!(config.poll_interval, cloned.poll_interval);
@@ -566,6 +575,7 @@ mod tests {
 
     #[test]
     fn test_telemetry_poller_config_debug() {
+        let _guard = test_guard!();
         let config = TelemetryPollerConfig::default();
         let debug_str = format!("{:?}", config);
         assert!(debug_str.contains("TelemetryPollerConfig"));
@@ -575,18 +585,21 @@ mod tests {
 
     #[test]
     fn test_store_latest_nonexistent_worker() {
+        let _guard = test_guard!();
         let store = TelemetryStore::new(Duration::from_secs(300), None);
         assert!(store.latest("nonexistent").is_none());
     }
 
     #[test]
     fn test_store_last_received_at_nonexistent_worker() {
+        let _guard = test_guard!();
         let store = TelemetryStore::new(Duration::from_secs(300), None);
         assert!(store.last_received_at("nonexistent").is_none());
     }
 
     #[test]
     fn test_store_latest_all_empty() {
+        let _guard = test_guard!();
         let store = TelemetryStore::new(Duration::from_secs(300), None);
         let latest = store.latest_all();
         assert!(latest.is_empty());
@@ -594,6 +607,7 @@ mod tests {
 
     #[test]
     fn test_store_latest_speedscore_no_storage() {
+        let _guard = test_guard!();
         let store = TelemetryStore::new(Duration::from_secs(300), None);
         let result = store.latest_speedscore("w1");
         assert!(result.is_ok());
@@ -602,6 +616,7 @@ mod tests {
 
     #[test]
     fn test_store_speedscore_history_no_storage() {
+        let _guard = test_guard!();
         let store = TelemetryStore::new(Duration::from_secs(300), None);
         let result = store.speedscore_history("w1", Utc::now() - ChronoDuration::hours(1), 10, 0);
         assert!(result.is_ok());
@@ -612,6 +627,7 @@ mod tests {
 
     #[test]
     fn test_store_test_run_stats_empty() {
+        let _guard = test_guard!();
         let store = TelemetryStore::new(Duration::from_secs(300), None);
         let stats = store.test_run_stats();
         assert_eq!(stats.total_runs, 0);
@@ -621,6 +637,7 @@ mod tests {
 
     #[test]
     fn test_test_run_stats_multiple_runs() {
+        let _guard = test_guard!();
         let store = TelemetryStore::new(Duration::from_secs(300), None);
 
         // Successful run (exit code 0)
@@ -653,6 +670,7 @@ mod tests {
 
     #[test]
     fn test_test_run_stats_max_capacity() {
+        let _guard = test_guard!();
         let store = TelemetryStore::new(Duration::from_secs(300), None);
 
         // Add more than 200 runs (the capacity limit)
@@ -675,6 +693,7 @@ mod tests {
 
     #[test]
     fn test_store_with_short_retention_duration() {
+        let _guard = test_guard!();
         // Test that very short retention still works (immediate eviction)
         let store = TelemetryStore::new(Duration::from_millis(1), None);
 
@@ -836,6 +855,7 @@ mod tests {
 
     #[test]
     fn test_telemetry_source_variants() {
+        let _guard = test_guard!();
         // Verify all telemetry source variants can be used
         let _ssh_poll = TelemetrySource::SshPoll;
         let _piggyback = TelemetrySource::Piggyback;
@@ -846,6 +866,7 @@ mod tests {
 
     #[test]
     fn test_received_telemetry_creation() {
+        let _guard = test_guard!();
         let telemetry = make_telemetry("test-worker", 25.0, 35.0);
         let received = ReceivedTelemetry::new(telemetry.clone(), TelemetrySource::SshPoll);
 
@@ -858,6 +879,7 @@ mod tests {
 
     #[test]
     fn test_evict_old_removes_multiple() {
+        let _guard = test_guard!();
         let store = TelemetryStore::new(Duration::from_secs(1), None);
 
         // Add multiple entries
@@ -886,6 +908,7 @@ mod tests {
 
     #[test]
     fn test_test_run_different_kinds() {
+        let _guard = test_guard!();
         let store = TelemetryStore::new(Duration::from_secs(300), None);
 
         // Different compilation kinds

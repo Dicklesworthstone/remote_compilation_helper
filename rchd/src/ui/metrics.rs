@@ -527,7 +527,7 @@ fn rich_override() -> Option<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+        use rch_common::test_guard;
     use chrono::Datelike;
     use std::collections::VecDeque;
 
@@ -535,22 +535,26 @@ mod tests {
 
     #[test]
     fn test_delta_counter_positive_delta() {
+        let _guard = test_guard!();
         assert_eq!(delta_counter(100.0, 50.0), 50);
     }
 
     #[test]
     fn test_delta_counter_zero_delta() {
+        let _guard = test_guard!();
         assert_eq!(delta_counter(100.0, 100.0), 0);
     }
 
     #[test]
     fn test_delta_counter_baseline_higher_returns_current() {
+        let _guard = test_guard!();
         // When current < baseline (counter wrapped), return current
         assert_eq!(delta_counter(50.0, 100.0), 50);
     }
 
     #[test]
     fn test_delta_counter_rounds_correctly() {
+        let _guard = test_guard!();
         assert_eq!(delta_counter(100.6, 50.0), 51);
         assert_eq!(delta_counter(100.4, 50.0), 50);
     }
@@ -559,6 +563,7 @@ mod tests {
 
     #[test]
     fn test_parse_timestamp_valid_rfc3339() {
+        let _guard = test_guard!();
         let result = parse_timestamp("2024-01-15T10:30:00Z");
         assert!(result.is_some());
         let ts = result.unwrap();
@@ -569,12 +574,14 @@ mod tests {
 
     #[test]
     fn test_parse_timestamp_with_offset() {
+        let _guard = test_guard!();
         let result = parse_timestamp("2024-01-15T10:30:00+05:00");
         assert!(result.is_some());
     }
 
     #[test]
     fn test_parse_timestamp_invalid_format() {
+        let _guard = test_guard!();
         assert!(parse_timestamp("not-a-timestamp").is_none());
         assert!(parse_timestamp("2024/01/15").is_none());
         assert!(parse_timestamp("").is_none());
@@ -584,21 +591,25 @@ mod tests {
 
     #[test]
     fn test_average_ms_empty_returns_none() {
+        let _guard = test_guard!();
         assert!(average_ms(&[]).is_none());
     }
 
     #[test]
     fn test_average_ms_single_value() {
+        let _guard = test_guard!();
         assert_eq!(average_ms(&[100]), Some(100.0));
     }
 
     #[test]
     fn test_average_ms_multiple_values() {
+        let _guard = test_guard!();
         assert_eq!(average_ms(&[100, 200, 300]), Some(200.0));
     }
 
     #[test]
     fn test_average_ms_with_zeros() {
+        let _guard = test_guard!();
         assert_eq!(average_ms(&[0, 100, 200]), Some(100.0));
     }
 
@@ -606,29 +617,34 @@ mod tests {
 
     #[test]
     fn test_percentile_ms_empty_returns_none() {
+        let _guard = test_guard!();
         assert!(percentile_ms(&[], 0.5).is_none());
     }
 
     #[test]
     fn test_percentile_ms_p50() {
+        let _guard = test_guard!();
         let values = vec![10, 20, 30, 40, 50];
         assert_eq!(percentile_ms(&values, 0.5), Some(30.0));
     }
 
     #[test]
     fn test_percentile_ms_p0() {
+        let _guard = test_guard!();
         let values = vec![10, 20, 30, 40, 50];
         assert_eq!(percentile_ms(&values, 0.0), Some(10.0));
     }
 
     #[test]
     fn test_percentile_ms_p100() {
+        let _guard = test_guard!();
         let values = vec![10, 20, 30, 40, 50];
         assert_eq!(percentile_ms(&values, 1.0), Some(50.0));
     }
 
     #[test]
     fn test_percentile_ms_p95_interpolation() {
+        let _guard = test_guard!();
         // With 5 values, index 4 * 0.95 = 3.8, rounds to 4
         let values = vec![10, 20, 30, 40, 50];
         assert_eq!(percentile_ms(&values, 0.95), Some(50.0));
@@ -638,6 +654,7 @@ mod tests {
 
     #[test]
     fn test_format_duration_ms_milliseconds() {
+        let _guard = test_guard!();
         assert_eq!(format_duration_ms(500.0), "500ms");
         assert_eq!(format_duration_ms(50.0), "50ms");
         assert_eq!(format_duration_ms(999.0), "999ms");
@@ -645,6 +662,7 @@ mod tests {
 
     #[test]
     fn test_format_duration_ms_seconds() {
+        let _guard = test_guard!();
         assert_eq!(format_duration_ms(1000.0), "1.0s");
         assert_eq!(format_duration_ms(1500.0), "1.5s");
         assert_eq!(format_duration_ms(60000.0), "60.0s");
@@ -652,6 +670,7 @@ mod tests {
 
     #[test]
     fn test_format_duration_ms_zero() {
+        let _guard = test_guard!();
         assert_eq!(format_duration_ms(0.0), "0ms");
     }
 
@@ -659,12 +678,14 @@ mod tests {
 
     #[test]
     fn test_format_interval_seconds() {
+        let _guard = test_guard!();
         assert_eq!(format_interval(Duration::from_secs(30)), "30s");
         assert_eq!(format_interval(Duration::from_secs(45)), "45s");
     }
 
     #[test]
     fn test_format_interval_minutes() {
+        let _guard = test_guard!();
         assert_eq!(format_interval(Duration::from_secs(60)), "1m");
         assert_eq!(format_interval(Duration::from_secs(300)), "5m");
         assert_eq!(format_interval(Duration::from_secs(900)), "15m");
@@ -672,6 +693,7 @@ mod tests {
 
     #[test]
     fn test_format_interval_hours() {
+        let _guard = test_guard!();
         assert_eq!(format_interval(Duration::from_secs(3600)), "1h");
         assert_eq!(format_interval(Duration::from_secs(7200)), "2h");
     }
@@ -680,6 +702,7 @@ mod tests {
 
     #[test]
     fn test_format_bytes_bytes() {
+        let _guard = test_guard!();
         assert_eq!(format_bytes(0), "0 B");
         assert_eq!(format_bytes(500), "500 B");
         assert_eq!(format_bytes(1023), "1023 B");
@@ -687,6 +710,7 @@ mod tests {
 
     #[test]
     fn test_format_bytes_kilobytes() {
+        let _guard = test_guard!();
         assert_eq!(format_bytes(1024), "1.0 KB");
         assert_eq!(format_bytes(1536), "1.5 KB");
         assert_eq!(format_bytes(10240), "10.0 KB");
@@ -694,12 +718,14 @@ mod tests {
 
     #[test]
     fn test_format_bytes_megabytes() {
+        let _guard = test_guard!();
         assert_eq!(format_bytes(1024 * 1024), "1.0 MB");
         assert_eq!(format_bytes(5 * 1024 * 1024), "5.0 MB");
     }
 
     #[test]
     fn test_format_bytes_gigabytes() {
+        let _guard = test_guard!();
         assert_eq!(format_bytes(1024 * 1024 * 1024), "1.0 GB");
         assert_eq!(format_bytes(2 * 1024 * 1024 * 1024), "2.0 GB");
     }
@@ -708,18 +734,21 @@ mod tests {
 
     #[test]
     fn test_trend_arrow_no_previous() {
+        let _guard = test_guard!();
         let ctx = OutputContext::plain();
         assert_eq!(trend_arrow(None, Some(100.0), ctx), Icons::arrow_right(ctx));
     }
 
     #[test]
     fn test_trend_arrow_no_current() {
+        let _guard = test_guard!();
         let ctx = OutputContext::plain();
         assert_eq!(trend_arrow(Some(100.0), None, ctx), Icons::arrow_right(ctx));
     }
 
     #[test]
     fn test_trend_arrow_stable() {
+        let _guard = test_guard!();
         let ctx = OutputContext::plain();
         // Within threshold (5%)
         assert_eq!(
@@ -730,6 +759,7 @@ mod tests {
 
     #[test]
     fn test_trend_arrow_increasing() {
+        let _guard = test_guard!();
         let ctx = OutputContext::plain();
         // Above threshold
         assert_eq!(
@@ -740,6 +770,7 @@ mod tests {
 
     #[test]
     fn test_trend_arrow_decreasing() {
+        let _guard = test_guard!();
         let ctx = OutputContext::plain();
         // Below threshold (negative)
         assert_eq!(
@@ -750,6 +781,7 @@ mod tests {
 
     #[test]
     fn test_trend_arrow_zero_previous() {
+        let _guard = test_guard!();
         let ctx = OutputContext::plain();
         assert_eq!(
             trend_arrow(Some(0.0), Some(100.0), ctx),
@@ -761,6 +793,7 @@ mod tests {
 
     #[test]
     fn test_sparkline_empty() {
+        let _guard = test_guard!();
         let values: VecDeque<f64> = VecDeque::new();
         let ctx = OutputContext::plain();
         assert_eq!(sparkline(&values, ctx), "");
@@ -768,6 +801,7 @@ mod tests {
 
     #[test]
     fn test_sparkline_single_value() {
+        let _guard = test_guard!();
         let mut values = VecDeque::new();
         values.push_back(50.0);
         let ctx = OutputContext::plain();
@@ -777,6 +811,7 @@ mod tests {
 
     #[test]
     fn test_sparkline_uniform_values() {
+        let _guard = test_guard!();
         let mut values = VecDeque::new();
         values.push_back(100.0);
         values.push_back(100.0);
@@ -789,6 +824,7 @@ mod tests {
 
     #[test]
     fn test_sparkline_increasing() {
+        let _guard = test_guard!();
         let mut values = VecDeque::new();
         values.push_back(0.0);
         values.push_back(50.0);
@@ -800,6 +836,7 @@ mod tests {
 
     #[test]
     fn test_sparkline_unicode_vs_ascii() {
+        let _guard = test_guard!();
         let mut values = VecDeque::new();
         values.push_back(0.0);
         values.push_back(100.0);
@@ -815,6 +852,7 @@ mod tests {
 
     #[test]
     fn test_transfer_counters_default() {
+        let _guard = test_guard!();
         let tc = TransferCounters::default();
         assert_eq!(tc.up, 0.0);
         assert_eq!(tc.down, 0.0);
@@ -824,6 +862,7 @@ mod tests {
 
     #[test]
     fn test_metrics_snapshot_default() {
+        let _guard = test_guard!();
         let snapshot = MetricsSnapshot::default();
         assert_eq!(snapshot.total_jobs, 0);
         assert_eq!(snapshot.success_jobs, 0);
@@ -836,12 +875,14 @@ mod tests {
 
     #[test]
     fn test_metrics_dashboard_new() {
+        let _guard = test_guard!();
         let dashboard = MetricsDashboard::new(Duration::from_secs(60));
         assert_eq!(dashboard.refresh_interval, Duration::from_secs(60));
     }
 
     #[test]
     fn test_metrics_dashboard_zero_interval_uses_default() {
+        let _guard = test_guard!();
         let dashboard = MetricsDashboard::new(Duration::ZERO);
         assert_eq!(
             dashboard.refresh_interval,
@@ -851,6 +892,7 @@ mod tests {
 
     #[test]
     fn test_metrics_dashboard_with_context() {
+        let _guard = test_guard!();
         let ctx = OutputContext::plain();
         let dashboard = MetricsDashboard::with_context(ctx, Duration::from_secs(120));
         assert_eq!(dashboard.refresh_interval, Duration::from_secs(120));
@@ -858,6 +900,7 @@ mod tests {
 
     #[test]
     fn test_metrics_dashboard_reset_window() {
+        let _guard = test_guard!();
         let mut dashboard = MetricsDashboard::new(Duration::from_secs(60));
         dashboard.avg_history.push_back(100.0);
         dashboard.avg_history.push_back(200.0);

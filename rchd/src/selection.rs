@@ -1846,7 +1846,7 @@ fn normalize_priority(priority: u32, min_priority: u32, max_priority: u32) -> f6
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+        use rch_common::test_guard;
     use crate::workers::WorkerState;
     use rch_common::WorkerStatus;
     use rch_common::{
@@ -1873,6 +1873,7 @@ mod tests {
 
     #[test]
     fn test_selection_score() {
+        let _guard = test_guard!();
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let worker = make_worker("test", 16, 80.0);
@@ -1897,6 +1898,7 @@ mod tests {
 
     #[test]
     fn test_selection_score_zero_slots_safe() {
+        let _guard = test_guard!();
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let worker = make_worker("zero", 0, 80.0);
@@ -2345,6 +2347,7 @@ mod tests {
 
     #[test]
     fn test_cache_tracker_record_and_warmth() {
+        let _guard = test_guard!();
         let mut tracker = CacheTracker::new();
         tracker.record_build("worker1", "project-a", CacheUse::Build);
 
@@ -2363,6 +2366,7 @@ mod tests {
 
     #[test]
     fn test_cache_tracker_has_recent_build() {
+        let _guard = test_guard!();
         let mut tracker = CacheTracker::new();
         tracker.record_build("worker1", "project-a", CacheUse::Build);
 
@@ -2385,6 +2389,7 @@ mod tests {
 
     #[test]
     fn test_cache_tracker_has_recent_build_fallback_for_test() {
+        let _guard = test_guard!();
         let mut tracker = CacheTracker::new();
         // Record only a build (not a test)
         tracker.record_build("worker1", "project-a", CacheUse::Build);
@@ -2404,6 +2409,7 @@ mod tests {
 
     #[test]
     fn test_selection_history_record_and_count() {
+        let _guard = test_guard!();
         let mut history = SelectionHistory::new();
 
         // Record some selections
@@ -2425,6 +2431,7 @@ mod tests {
 
     #[test]
     fn test_selection_history_prune() {
+        let _guard = test_guard!();
         let mut history = SelectionHistory::new();
         history.record_selection("worker1");
 
@@ -3053,6 +3060,7 @@ mod tests {
 
     #[test]
     fn test_audit_log_push_and_retrieve() {
+        let _guard = test_guard!();
         let mut log = SelectionAuditLog::new(10);
         assert!(log.is_empty());
         assert_eq!(log.len(), 0);
@@ -3086,6 +3094,7 @@ mod tests {
 
     #[test]
     fn test_audit_log_eviction() {
+        let _guard = test_guard!();
         let mut log = SelectionAuditLog::new(3);
 
         // Add 5 entries to a log with capacity 3
@@ -3120,6 +3129,7 @@ mod tests {
 
     #[test]
     fn test_audit_log_last_n() {
+        let _guard = test_guard!();
         let mut log = SelectionAuditLog::new(10);
 
         for i in 0..5 {
@@ -3150,6 +3160,7 @@ mod tests {
 
     #[test]
     fn test_audit_log_get_by_id() {
+        let _guard = test_guard!();
         let mut log = SelectionAuditLog::new(10);
 
         for i in 0..3 {
@@ -3182,6 +3193,7 @@ mod tests {
 
     #[test]
     fn test_audit_log_clear() {
+        let _guard = test_guard!();
         let mut log = SelectionAuditLog::new(10);
 
         let entry = SelectionAuditEntry {
@@ -3209,6 +3221,7 @@ mod tests {
 
     #[test]
     fn test_worker_score_breakdown_serialization() {
+        let _guard = test_guard!();
         let breakdown = WorkerScoreBreakdown {
             worker_id: "worker-1".to_string(),
             total_score: 0.85,
@@ -3277,6 +3290,7 @@ mod tests {
 
     #[test]
     fn test_cache_tracker_record_success() {
+        let _guard = test_guard!();
         let mut tracker = CacheTracker::new();
         let pin_window = Duration::from_secs(3600);
 
@@ -3294,6 +3308,7 @@ mod tests {
 
     #[test]
     fn test_cache_tracker_last_success_entry() {
+        let _guard = test_guard!();
         let mut tracker = CacheTracker::new();
 
         // No entry initially
@@ -3311,6 +3326,7 @@ mod tests {
 
     #[test]
     fn test_cache_tracker_pin_updates_on_new_success() {
+        let _guard = test_guard!();
         let mut tracker = CacheTracker::new();
         let pin_window = Duration::from_secs(3600);
 
@@ -3407,6 +3423,7 @@ mod tests {
             /// Output is always in [0.0, 1.0] for any latency value.
             #[test]
             fn test_normalize_latency_output_range(latency_ms in 0u64..=u64::MAX) {
+        let _guard = test_guard!();
                 let score = WorkerSelector::normalize_latency_ms(latency_ms);
                 prop_assert!(score >= 0.0, "Score {score} below 0.0 for latency {latency_ms}");
                 prop_assert!(score <= 1.0, "Score {score} above 1.0 for latency {latency_ms}");
@@ -3418,6 +3435,7 @@ mod tests {
                 latency_a in 0u64..=1_000_000_000u64,
                 latency_b in 0u64..=1_000_000_000u64,
             ) {
+        let _guard = test_guard!();
                 let score_a = WorkerSelector::normalize_latency_ms(latency_a);
                 let score_b = WorkerSelector::normalize_latency_ms(latency_b);
 
@@ -3432,6 +3450,7 @@ mod tests {
             /// Zero latency gives maximum score of 1.0.
             #[test]
             fn test_normalize_latency_zero(_seed in 0u64..100u64) {
+        let _guard = test_guard!();
                 let score = WorkerSelector::normalize_latency_ms(0);
                 prop_assert!(
                     (score - 1.0).abs() < f64::EPSILON,
@@ -3442,6 +3461,7 @@ mod tests {
             /// At half-life (200ms), score should be 0.5.
             #[test]
             fn test_normalize_latency_half_life(_seed in 0u64..100u64) {
+        let _guard = test_guard!();
                 let score = WorkerSelector::normalize_latency_ms(200);
                 prop_assert!(
                     (score - 0.5).abs() < 0.01,
@@ -3464,6 +3484,7 @@ mod tests {
                 min_priority in 0u32..=500u32,
                 max_priority in 500u32..=1000u32,
             ) {
+        let _guard = test_guard!();
                 // Ensure priority is within the range
                 let clamped_priority = priority.clamp(min_priority, max_priority);
                 let score = WorkerSelector::normalize_priority(clamped_priority, min_priority, max_priority);
@@ -3474,6 +3495,7 @@ mod tests {
             /// When min == max, should return 1.0.
             #[test]
             fn test_normalize_priority_equal_bounds(value in 0u32..=1000u32) {
+        let _guard = test_guard!();
                 let score = WorkerSelector::normalize_priority(value, value, value);
                 prop_assert!(
                     (score - 1.0).abs() < f64::EPSILON,
@@ -3487,6 +3509,7 @@ mod tests {
                 min_priority in 0u32..=500u32,
                 max_priority in 501u32..=1000u32,
             ) {
+        let _guard = test_guard!();
                 let min_score = WorkerSelector::normalize_priority(min_priority, min_priority, max_priority);
                 let max_score = WorkerSelector::normalize_priority(max_priority, min_priority, max_priority);
 
@@ -3508,6 +3531,7 @@ mod tests {
                 min_priority in 0u32..=100u32,
                 max_priority in 900u32..=1000u32,
             ) {
+        let _guard = test_guard!();
                 let clamped_a = priority_a.clamp(min_priority, max_priority);
                 let clamped_b = priority_b.clamp(min_priority, max_priority);
                 let score_a = WorkerSelector::normalize_priority(clamped_a, min_priority, max_priority);
@@ -3538,6 +3562,7 @@ mod tests {
                 priority in 0.0f64..=1.0f64,
                 half_open_penalty in 0.0f64..=1.0f64,
             ) {
+        let _guard = test_guard!();
                 let config = SelectionWeightConfig {
                     slots,
                     speedscore,
@@ -3570,6 +3595,7 @@ mod tests {
                 max_entries in 1usize..=100usize,
                 num_entries in 0usize..=200usize,
             ) {
+        let _guard = test_guard!();
                 let mut log = SelectionAuditLog::new(max_entries);
 
                 for i in 0..num_entries {
@@ -3601,6 +3627,7 @@ mod tests {
             /// Audit log IDs are monotonically increasing.
             #[test]
             fn test_audit_log_ids_increasing(num_entries in 2usize..=50usize) {
+        let _guard = test_guard!();
                 let mut log = SelectionAuditLog::new(100);
 
                 for i in 0..num_entries {
@@ -3639,6 +3666,7 @@ mod tests {
                 num_entries in 0usize..=50usize,
                 n in 0usize..=100usize,
             ) {
+        let _guard = test_guard!();
                 let mut log = SelectionAuditLog::new(100);
 
                 for i in 0..num_entries {
@@ -3683,6 +3711,7 @@ mod tests {
             /// History respects max_history_per_worker limit.
             #[test]
             fn test_selection_history_capacity(num_selections in 0usize..=200usize) {
+        let _guard = test_guard!();
                 let mut history = SelectionHistory::default();
 
                 for _ in 0..num_selections {
@@ -3702,6 +3731,7 @@ mod tests {
             fn test_selection_history_unknown_worker(
                 worker_id in "[a-z]{5,10}",
             ) {
+        let _guard = test_guard!();
                 let history = SelectionHistory::new();
                 let count = history.recent_selections(&worker_id, Duration::from_secs(3600));
                 prop_assert_eq!(count, 0, "Unknown worker should have 0 selections");
@@ -3712,6 +3742,7 @@ mod tests {
             fn test_selection_history_counts_match(
                 num_selections in 1usize..=50usize,
             ) {
+        let _guard = test_guard!();
                 let mut history = SelectionHistory::new();
 
                 for _ in 0..num_selections {
@@ -3740,6 +3771,7 @@ mod tests {
                 worker_id in "[a-z]{3,8}",
                 project_id in "[a-z]{3,8}",
             ) {
+        let _guard = test_guard!();
                 let mut tracker = CacheTracker::new();
                 tracker.record_build(&worker_id, &project_id, CacheUse::Build);
 
@@ -3754,6 +3786,7 @@ mod tests {
                 worker_id in "[a-z]{3,8}",
                 project_id in "[a-z]{3,8}",
             ) {
+        let _guard = test_guard!();
                 let tracker = CacheTracker::new();
                 let warmth = tracker.estimate_warmth(&worker_id, &project_id, CacheUse::Build);
                 prop_assert!(
@@ -3765,6 +3798,7 @@ mod tests {
             /// CacheTracker respects max_projects_per_worker limit.
             #[test]
             fn test_cache_tracker_project_limit(num_projects in 40usize..=100usize) {
+        let _guard = test_guard!();
                 let mut tracker = CacheTracker::new();
 
                 for i in 0..num_projects {
@@ -3785,6 +3819,7 @@ mod tests {
                 worker_id in "[a-z]{3,8}",
                 project_id in "[a-z]{3,8}",
             ) {
+        let _guard = test_guard!();
                 let mut tracker = CacheTracker::new();
                 tracker.record_build(&worker_id, &project_id, CacheUse::Build);
 
@@ -3803,12 +3838,14 @@ mod tests {
 
         #[test]
         fn test_cache_state_last_activity_none() {
+        let _guard = test_guard!();
             let state = CacheState::default();
             assert!(state.last_activity().is_none());
         }
 
         #[test]
         fn test_cache_state_last_activity_build_only() {
+        let _guard = test_guard!();
             let now = Instant::now();
             let state = CacheState {
                 last_build: Some(now),
@@ -3820,6 +3857,7 @@ mod tests {
 
         #[test]
         fn test_cache_state_last_activity_test_only() {
+        let _guard = test_guard!();
             let now = Instant::now();
             let state = CacheState {
                 last_build: None,
@@ -3831,6 +3869,7 @@ mod tests {
 
         #[test]
         fn test_cache_state_last_activity_both_returns_max() {
+        let _guard = test_guard!();
             let earlier = Instant::now();
             // Sleep briefly to ensure later > earlier
             std::thread::sleep(Duration::from_millis(1));
@@ -3857,6 +3896,7 @@ mod tests {
 
         #[test]
         fn test_normalize_latency_extreme_values() {
+        let _guard = test_guard!();
             // Test u64::MAX doesn't panic or produce NaN
             let score = WorkerSelector::normalize_latency_ms(u64::MAX);
             assert!(score >= 0.0);
@@ -3866,6 +3906,7 @@ mod tests {
 
         #[test]
         fn test_normalize_priority_edge_cases() {
+        let _guard = test_guard!();
             // Priority below min (saturating_sub handles this)
             let score = WorkerSelector::normalize_priority(0, 100, 200);
             assert!((score - 0.0).abs() < f64::EPSILON);
@@ -3877,6 +3918,7 @@ mod tests {
 
         #[test]
         fn test_selection_history_prune() {
+        let _guard = test_guard!();
             let mut history = SelectionHistory::new();
 
             // Record some selections
@@ -3895,6 +3937,7 @@ mod tests {
 
         #[test]
         fn test_audit_log_empty_operations() {
+        let _guard = test_guard!();
             let log = SelectionAuditLog::new(10);
             assert!(log.is_empty());
             assert_eq!(log.len(), 0);

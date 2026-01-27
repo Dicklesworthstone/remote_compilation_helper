@@ -107,6 +107,7 @@ impl BenchmarkQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rch_common::test_guard;
     use tracing::info;
 
     fn setup_tracing() {
@@ -118,6 +119,7 @@ mod tests {
 
     #[test]
     fn test_queue_creation() {
+        let _guard = test_guard!();
         setup_tracing();
         info!("TEST START: test_queue_creation");
 
@@ -135,6 +137,7 @@ mod tests {
 
     #[test]
     fn test_enqueue_success() {
+        let _guard = test_guard!();
         setup_tracing();
         info!("TEST START: test_enqueue_success");
 
@@ -161,6 +164,7 @@ mod tests {
 
     #[test]
     fn test_enqueue_rate_limited() {
+        let _guard = test_guard!();
         setup_tracing();
         info!("TEST START: test_enqueue_rate_limited");
 
@@ -191,6 +195,7 @@ mod tests {
 
     #[test]
     fn test_multiple_workers_not_rate_limited() {
+        let _guard = test_guard!();
         setup_tracing();
         info!("TEST START: test_multiple_workers_not_rate_limited");
 
@@ -216,6 +221,7 @@ mod tests {
 
     #[test]
     fn test_pop_fifo_order() {
+        let _guard = test_guard!();
         setup_tracing();
         info!("TEST START: test_pop_fifo_order");
 
@@ -248,6 +254,7 @@ mod tests {
 
     #[test]
     fn test_clear_queue() {
+        let _guard = test_guard!();
         setup_tracing();
         info!("TEST START: test_clear_queue");
 
@@ -270,6 +277,7 @@ mod tests {
 
     #[test]
     fn test_zero_interval_allows_rapid_enqueue() {
+        let _guard = test_guard!();
         setup_tracing();
         info!("TEST START: test_zero_interval_allows_rapid_enqueue");
 
@@ -293,6 +301,7 @@ mod tests {
 
     #[test]
     fn test_request_contains_timestamp() {
+        let _guard = test_guard!();
         setup_tracing();
         info!("TEST START: test_request_contains_timestamp");
 

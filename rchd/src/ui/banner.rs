@@ -231,7 +231,7 @@ impl DaemonBanner {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+        use rch_common::test_guard;
 
     fn test_banner() -> DaemonBanner {
         DaemonBanner::new(
@@ -276,6 +276,7 @@ mod tests {
 
     #[test]
     fn build_info_includes_commit() {
+        let _guard = test_guard!();
         let banner = test_banner();
         let info = banner.build_info();
         assert!(info.contains("commit"));
@@ -286,6 +287,7 @@ mod tests {
 
     #[test]
     fn test_commit_short_truncates_to_8_chars() {
+        let _guard = test_guard!();
         let banner = test_banner();
         let short = banner.commit_short();
         assert_eq!(short, "abcdef12");
@@ -293,6 +295,7 @@ mod tests {
 
     #[test]
     fn test_commit_short_no_commit() {
+        let _guard = test_guard!();
         let banner = banner_with_options(true, 9100, true, None);
         let short = banner.commit_short();
         assert_eq!(short, "unknown");
@@ -300,6 +303,7 @@ mod tests {
 
     #[test]
     fn test_commit_short_short_hash() {
+        let _guard = test_guard!();
         let banner = banner_with_options(true, 9100, true, Some("abc".to_string()));
         let short = banner.commit_short();
         assert_eq!(short, "abc");
@@ -309,6 +313,7 @@ mod tests {
 
     #[test]
     fn test_build_info_with_profile_and_target() {
+        let _guard = test_guard!();
         let banner = test_banner();
         let info = banner.build_info();
         assert!(info.contains("profile debug"));
@@ -317,6 +322,7 @@ mod tests {
 
     #[test]
     fn test_build_info_without_profile_or_target() {
+        let _guard = test_guard!();
         let banner = banner_with_options(true, 9100, true, Some("deadbeef".to_string()));
         let info = banner.build_info();
         assert!(!info.contains("profile"));
@@ -328,6 +334,7 @@ mod tests {
 
     #[test]
     fn test_features_summary_all_enabled() {
+        let _guard = test_guard!();
         let banner = banner_with_options(true, 9100, true, None);
         let summary = banner.features_summary();
         assert!(summary.contains("telemetry"));
@@ -338,6 +345,7 @@ mod tests {
 
     #[test]
     fn test_features_summary_all_disabled() {
+        let _guard = test_guard!();
         let banner = banner_with_options(false, 0, false, None);
         let summary = banner.features_summary();
         assert!(summary.contains("telemetry off"));
@@ -347,6 +355,7 @@ mod tests {
 
     #[test]
     fn test_features_summary_mixed() {
+        let _guard = test_guard!();
         let banner = banner_with_options(true, 0, false, None);
         let summary = banner.features_summary();
         assert!(!summary.contains("telemetry off"));
@@ -358,12 +367,14 @@ mod tests {
 
     #[test]
     fn test_startup_ms() {
+        let _guard = test_guard!();
         let banner = test_banner();
         assert_eq!(banner.startup_ms(), 10);
     }
 
     #[test]
     fn test_startup_ms_larger_value() {
+        let _guard = test_guard!();
         let banner = banner_with_options(true, 9100, true, None);
         assert_eq!(banner.startup_ms(), 150);
     }
@@ -372,6 +383,7 @@ mod tests {
 
     #[test]
     fn test_show_plain_does_not_panic() {
+        let _guard = test_guard!();
         let banner = test_banner();
         // Just verify it doesn't panic - output goes to stderr
         banner.show_plain();
@@ -379,6 +391,7 @@ mod tests {
 
     #[test]
     fn test_show_plain_with_metrics_disabled() {
+        let _guard = test_guard!();
         let banner = banner_with_options(false, 0, false, None);
         banner.show_plain();
     }
@@ -387,6 +400,7 @@ mod tests {
 
     #[test]
     fn test_show_does_not_panic() {
+        let _guard = test_guard!();
         let banner = test_banner();
         // This should fall back to plain in test environment
         banner.show();
@@ -396,6 +410,7 @@ mod tests {
 
     #[test]
     fn test_daemon_banner_fields() {
+        let _guard = test_guard!();
         let banner = test_banner();
         assert_eq!(banner.version, "0.1.0");
         assert_eq!(banner.socket_path, "/tmp/rch.sock");

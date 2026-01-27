@@ -112,10 +112,11 @@ impl Drop for OtelGuard {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+        use rch_common::test_guard;
 
     #[test]
     fn test_otel_config_default() {
+        let _guard = test_guard!();
         let config = OtelConfig::default();
         assert!(!config.enabled);
         assert!(config.endpoint.is_none());
@@ -124,6 +125,7 @@ mod tests {
 
     #[test]
     fn test_otel_config_from_env() {
+        let _guard = test_guard!();
         // Test reads current env state without modifying it
         // (env::remove_var is unsafe in Rust 2024 edition)
         let config = OtelConfig::from_env();
@@ -133,6 +135,7 @@ mod tests {
 
     #[test]
     fn test_init_otel_returns_result() {
+        let _guard = test_guard!();
         // Test that init_otel returns a valid result without modifying env
         // (env::remove_var is unsafe in Rust 2024 edition)
         let result = init_otel();

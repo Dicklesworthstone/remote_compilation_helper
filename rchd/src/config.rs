@@ -447,7 +447,7 @@ log_level = "info"
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+        use rch_common::test_guard;
     use tempfile::TempDir;
 
     fn init_test_logging() {
@@ -459,6 +459,7 @@ mod tests {
 
     #[test]
     fn test_default_daemon_config() {
+        let _guard = test_guard!();
         let config = DaemonConfig::default();
         let expected_socket = PathBuf::from(rch_common::default_socket_path());
         assert_eq!(config.socket_path, expected_socket);
@@ -468,6 +469,7 @@ mod tests {
 
     #[test]
     fn test_parse_workers_config() {
+        let _guard = test_guard!();
         let toml = r#"
 [[workers]]
 id = "test"
@@ -487,6 +489,7 @@ enabled = true
 
     #[test]
     fn test_worker_entry_to_config() {
+        let _guard = test_guard!();
         let entry = WorkerEntry {
             id: "worker1".to_string(),
             host: "192.168.1.100".to_string(),
@@ -506,6 +509,7 @@ enabled = true
 
     #[test]
     fn test_example_configs_valid() {
+        let _guard = test_guard!();
         let workers_toml = example_workers_config();
         let _: WorkersConfig =
             toml::from_str(&workers_toml).expect("Example workers config should parse");
@@ -521,6 +525,7 @@ enabled = true
 
     #[test]
     fn test_daemon_config_loading_from_file() {
+        let _guard = test_guard!();
         init_test_logging();
 
         let temp_dir = TempDir::new().unwrap();
@@ -548,6 +553,7 @@ log_level = "debug"
 
     #[test]
     fn test_daemon_config_parses_cache_cleanup_section() {
+        let _guard = test_guard!();
         init_test_logging();
 
         let temp_dir = TempDir::new().unwrap();
@@ -575,6 +581,7 @@ remote_base = "/var/rch-builds"
 
     #[test]
     fn test_daemon_config_loading_missing_file_uses_defaults() {
+        let _guard = test_guard!();
         init_test_logging();
 
         let temp_dir = TempDir::new().unwrap();
@@ -594,6 +601,7 @@ remote_base = "/var/rch-builds"
 
     #[test]
     fn test_daemon_config_loading_partial_file() {
+        let _guard = test_guard!();
         init_test_logging();
 
         let temp_dir = TempDir::new().unwrap();
@@ -621,6 +629,7 @@ log_level = "warn"
 
     #[test]
     fn test_daemon_config_loading_invalid_toml() {
+        let _guard = test_guard!();
         init_test_logging();
 
         let temp_dir = TempDir::new().unwrap();
@@ -639,6 +648,7 @@ log_level = "warn"
 
     #[test]
     fn test_worker_loading_from_file() {
+        let _guard = test_guard!();
         init_test_logging();
 
         let temp_dir = TempDir::new().unwrap();
@@ -679,6 +689,7 @@ enabled = true
 
     #[test]
     fn test_worker_loading_disabled_workers_filtered() {
+        let _guard = test_guard!();
         init_test_logging();
 
         let temp_dir = TempDir::new().unwrap();
@@ -705,6 +716,7 @@ enabled = false
 
     #[test]
     fn test_worker_loading_missing_file_returns_empty() {
+        let _guard = test_guard!();
         init_test_logging();
 
         let temp_dir = TempDir::new().unwrap();
@@ -717,6 +729,7 @@ enabled = false
 
     #[test]
     fn test_worker_loading_default_values() {
+        let _guard = test_guard!();
         init_test_logging();
 
         let temp_dir = TempDir::new().unwrap();
@@ -748,6 +761,7 @@ host = "192.168.1.100"
 
     #[test]
     fn test_worker_loading_missing_required_id_fails() {
+        let _guard = test_guard!();
         init_test_logging();
 
         let temp_dir = TempDir::new().unwrap();
@@ -767,6 +781,7 @@ user = "ubuntu"
 
     #[test]
     fn test_worker_loading_missing_required_host_fails() {
+        let _guard = test_guard!();
         init_test_logging();
 
         let temp_dir = TempDir::new().unwrap();
@@ -786,6 +801,7 @@ user = "ubuntu"
 
     #[test]
     fn test_worker_loading_invalid_toml_fails() {
+        let _guard = test_guard!();
         init_test_logging();
 
         let temp_dir = TempDir::new().unwrap();
@@ -800,6 +816,7 @@ user = "ubuntu"
 
     #[test]
     fn test_worker_loading_empty_workers_array() {
+        let _guard = test_guard!();
         init_test_logging();
 
         let temp_dir = TempDir::new().unwrap();
@@ -814,6 +831,7 @@ user = "ubuntu"
 
     #[test]
     fn test_worker_loading_multiple_tags() {
+        let _guard = test_guard!();
         init_test_logging();
 
         let temp_dir = TempDir::new().unwrap();
@@ -836,6 +854,7 @@ tags = ["rust", "go", "python", "fast", "production"]
 
     #[test]
     fn test_worker_entry_conversion_preserves_all_fields() {
+        let _guard = test_guard!();
         init_test_logging();
 
         let entry = WorkerEntry {
@@ -864,6 +883,7 @@ tags = ["rust", "go", "python", "fast", "production"]
 
     #[test]
     fn test_worker_loading_zero_slots() {
+        let _guard = test_guard!();
         init_test_logging();
 
         let temp_dir = TempDir::new().unwrap();
@@ -883,6 +903,7 @@ total_slots = 0
 
     #[test]
     fn test_worker_loading_high_priority() {
+        let _guard = test_guard!();
         init_test_logging();
 
         let temp_dir = TempDir::new().unwrap();

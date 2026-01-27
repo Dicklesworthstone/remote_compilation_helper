@@ -469,7 +469,7 @@ pub async fn start_config_watcher(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+        use rch_common::test_guard;
     use tempfile::TempDir;
 
     fn init_test_logging() {
@@ -569,6 +569,7 @@ mod tests {
 
     #[test]
     fn test_validate_workers_config_duplicate_ids() {
+        let _guard = test_guard!();
         init_test_logging();
 
         let config = WorkersConfig {
@@ -602,6 +603,7 @@ mod tests {
 
     #[test]
     fn test_validate_workers_config_zero_slots_warning() {
+        let _guard = test_guard!();
         init_test_logging();
 
         let config = WorkersConfig {

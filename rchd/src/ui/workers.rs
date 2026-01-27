@@ -543,11 +543,12 @@ fn env_flag(key: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+        use rch_common::test_guard;
     use rch_common::WorkerStatus;
 
     #[test]
     fn test_summary_format() {
+        let _guard = test_guard!();
         let mut panel = WorkerStatusPanel::with_context(OutputContext::Plain)
             .with_refresh_interval(Duration::from_secs(1));
         let snapshot = vec![
@@ -564,6 +565,7 @@ mod tests {
 
     #[test]
     fn test_change_line_includes_transition() {
+        let _guard = test_guard!();
         let mut panel = WorkerStatusPanel::with_context(OutputContext::Plain)
             .with_refresh_interval(Duration::from_secs(1));
         let first = vec![WorkerSnapshot::new(
@@ -595,6 +597,7 @@ mod tests {
     // WorkerSnapshot tests
     #[test]
     fn test_worker_snapshot_new() {
+        let _guard = test_guard!();
         let snapshot = WorkerSnapshot::new(
             "worker-1",
             WorkerStatus::Healthy,
@@ -613,12 +616,14 @@ mod tests {
 
     #[test]
     fn test_worker_snapshot_empty_tags() {
+        let _guard = test_guard!();
         let snapshot = WorkerSnapshot::new("w1", WorkerStatus::Degraded, 0, 4, 50.0, vec![]);
         assert!(snapshot.tags.is_empty());
     }
 
     #[test]
     fn test_worker_snapshot_clone() {
+        let _guard = test_guard!();
         let original = WorkerSnapshot::new(
             "w1",
             WorkerStatus::Healthy,
@@ -635,58 +640,69 @@ mod tests {
     // status_label tests
     #[test]
     fn test_status_label_healthy() {
+        let _guard = test_guard!();
         assert_eq!(status_label(WorkerStatus::Healthy), "HEALTHY");
     }
 
     #[test]
     fn test_status_label_degraded() {
+        let _guard = test_guard!();
         assert_eq!(status_label(WorkerStatus::Degraded), "DEGRADED");
     }
 
     #[test]
     fn test_status_label_unreachable() {
+        let _guard = test_guard!();
         assert_eq!(status_label(WorkerStatus::Unreachable), "DOWN");
     }
 
     #[test]
     fn test_status_label_draining() {
+        let _guard = test_guard!();
         assert_eq!(status_label(WorkerStatus::Draining), "DRAINING");
     }
 
     #[test]
     fn test_status_label_disabled() {
+        let _guard = test_guard!();
         assert_eq!(status_label(WorkerStatus::Disabled), "DISABLED");
     }
 
     // is_online tests
     #[test]
     fn test_is_online_healthy() {
+        let _guard = test_guard!();
         assert!(is_online(WorkerStatus::Healthy));
     }
 
     #[test]
     fn test_is_online_degraded() {
+        let _guard = test_guard!();
         assert!(is_online(WorkerStatus::Degraded));
     }
 
     #[test]
     fn test_is_online_draining() {
+        let _guard = test_guard!();
         assert!(is_online(WorkerStatus::Draining));
     }
 
     #[test]
     fn test_is_online_unreachable() {
+        let _guard = test_guard!();
         assert!(!is_online(WorkerStatus::Unreachable));
     }
 
     #[test]
     fn test_is_online_disabled() {
+        let _guard = test_guard!();
         assert!(!is_online(WorkerStatus::Disabled));
     }
 
     // connection_event tests
     #[test]
     fn test_connection_event_new_healthy() {
+        let _guard = test_guard!();
         assert_eq!(
             connection_event(None, WorkerStatus::Healthy),
             Some("connected")
@@ -695,6 +711,7 @@ mod tests {
 
     #[test]
     fn test_connection_event_new_degraded() {
+        let _guard = test_guard!();
         assert_eq!(
             connection_event(None, WorkerStatus::Degraded),
             Some("connected")
@@ -703,6 +720,7 @@ mod tests {
 
     #[test]
     fn test_connection_event_reconnected_from_unreachable_to_healthy() {
+        let _guard = test_guard!();
         assert_eq!(
             connection_event(Some(WorkerStatus::Unreachable), WorkerStatus::Healthy),
             Some("reconnected")
@@ -711,6 +729,7 @@ mod tests {
 
     #[test]
     fn test_connection_event_reconnected_from_unreachable_to_degraded() {
+        let _guard = test_guard!();
         assert_eq!(
             connection_event(Some(WorkerStatus::Unreachable), WorkerStatus::Degraded),
             Some("reconnected")
@@ -719,6 +738,7 @@ mod tests {
 
     #[test]
     fn test_connection_event_disconnected_from_healthy() {
+        let _guard = test_guard!();
         assert_eq!(
             connection_event(Some(WorkerStatus::Healthy), WorkerStatus::Unreachable),
             Some("disconnected")
@@ -727,6 +747,7 @@ mod tests {
 
     #[test]
     fn test_connection_event_disconnected_from_degraded() {
+        let _guard = test_guard!();
         assert_eq!(
             connection_event(Some(WorkerStatus::Degraded), WorkerStatus::Unreachable),
             Some("disconnected")
@@ -735,6 +756,7 @@ mod tests {
 
     #[test]
     fn test_connection_event_no_event_healthy_to_degraded() {
+        let _guard = test_guard!();
         assert_eq!(
             connection_event(Some(WorkerStatus::Healthy), WorkerStatus::Degraded),
             None
@@ -743,11 +765,13 @@ mod tests {
 
     #[test]
     fn test_connection_event_no_event_new_unreachable() {
+        let _guard = test_guard!();
         assert_eq!(connection_event(None, WorkerStatus::Unreachable), None);
     }
 
     #[test]
     fn test_connection_event_no_event_draining_to_disabled() {
+        let _guard = test_guard!();
         assert_eq!(
             connection_event(Some(WorkerStatus::Draining), WorkerStatus::Disabled),
             None
@@ -757,30 +781,35 @@ mod tests {
     // truncate tests
     #[test]
     fn test_truncate_short_string() {
+        let _guard = test_guard!();
         let result = truncate("hello", 10);
         assert_eq!(result, "hello");
     }
 
     #[test]
     fn test_truncate_exact_length() {
+        let _guard = test_guard!();
         let result = truncate("hello", 5);
         assert_eq!(result, "hello");
     }
 
     #[test]
     fn test_truncate_long_string() {
+        let _guard = test_guard!();
         let result = truncate("hello world", 8);
         assert_eq!(result, "hello...");
     }
 
     #[test]
     fn test_truncate_very_short_max() {
+        let _guard = test_guard!();
         let result = truncate("hello", 3);
         assert_eq!(result, "...");
     }
 
     #[test]
     fn test_truncate_empty_string() {
+        let _guard = test_guard!();
         let result = truncate("", 10);
         assert_eq!(result, "");
     }
@@ -788,6 +817,7 @@ mod tests {
     // rule_line tests
     #[test]
     fn test_rule_line_basic() {
+        let _guard = test_guard!();
         let result = rule_line("Test", 40);
         assert!(result.contains("Test"));
         assert!(result.contains("-"));
@@ -795,6 +825,7 @@ mod tests {
 
     #[test]
     fn test_rule_line_minimum_width() {
+        let _guard = test_guard!();
         let result = rule_line("Title", 10);
         // Function uses max(width, 20) for calculation
         // With width=20 and "Title" (5 chars), padding = (20-5-2)/2 = 6
@@ -808,6 +839,7 @@ mod tests {
 
     #[test]
     fn test_rule_line_contains_dashes() {
+        let _guard = test_guard!();
         let result = rule_line("Workers", 72);
         assert!(result.starts_with('-') || result.contains("- "));
     }
@@ -815,12 +847,14 @@ mod tests {
     // WorkerStatusPanel builder tests
     #[test]
     fn test_panel_with_context() {
+        let _guard = test_guard!();
         let panel = WorkerStatusPanel::with_context(OutputContext::Plain);
         assert!(!panel.verbose);
     }
 
     #[test]
     fn test_panel_with_refresh_interval() {
+        let _guard = test_guard!();
         let panel = WorkerStatusPanel::with_context(OutputContext::Plain)
             .with_refresh_interval(Duration::from_secs(60));
         assert_eq!(panel.refresh_interval, Duration::from_secs(60));
@@ -828,6 +862,7 @@ mod tests {
 
     #[test]
     fn test_panel_with_refresh_interval_minimum() {
+        let _guard = test_guard!();
         let panel = WorkerStatusPanel::with_context(OutputContext::Plain)
             .with_refresh_interval(Duration::from_millis(100));
         // Should enforce minimum of 1 second
@@ -836,18 +871,21 @@ mod tests {
 
     #[test]
     fn test_panel_with_verbose() {
+        let _guard = test_guard!();
         let panel = WorkerStatusPanel::with_context(OutputContext::Plain).with_verbose(true);
         assert!(panel.verbose);
     }
 
     #[test]
     fn test_panel_with_debug_routing() {
+        let _guard = test_guard!();
         let panel = WorkerStatusPanel::with_context(OutputContext::Plain).with_debug_routing(true);
         assert!(panel.debug_routing);
     }
 
     #[test]
     fn test_panel_set_verbose() {
+        let _guard = test_guard!();
         let mut panel = WorkerStatusPanel::with_context(OutputContext::Plain);
         assert!(!panel.verbose);
         panel.set_verbose(true);
@@ -856,6 +894,7 @@ mod tests {
 
     #[test]
     fn test_panel_set_debug_routing() {
+        let _guard = test_guard!();
         let mut panel = WorkerStatusPanel::with_context(OutputContext::Plain);
         panel.set_debug_routing(true);
         assert!(panel.debug_routing);
@@ -864,6 +903,7 @@ mod tests {
     // render_summary tests
     #[test]
     fn test_render_summary_empty_snapshot() {
+        let _guard = test_guard!();
         let panel = WorkerStatusPanel::with_context(OutputContext::Plain);
         let summary = panel.render_summary(&[], 5);
         assert!(summary.contains("[WORKERS] 0/0 online"));
@@ -872,6 +912,7 @@ mod tests {
 
     #[test]
     fn test_render_summary_single_job() {
+        let _guard = test_guard!();
         let panel = WorkerStatusPanel::with_context(OutputContext::Plain);
         let summary = panel.render_summary(&[], 1);
         assert!(summary.contains("queue: 1 job"));
@@ -879,6 +920,7 @@ mod tests {
 
     #[test]
     fn test_render_summary_with_mixed_workers() {
+        let _guard = test_guard!();
         let panel = WorkerStatusPanel::with_context(OutputContext::Plain);
         let snapshot = vec![
             WorkerSnapshot::new("w1", WorkerStatus::Healthy, 2, 4, 80.0, vec![]),
@@ -892,6 +934,7 @@ mod tests {
     // render_table_plain tests
     #[test]
     fn test_render_table_plain_empty() {
+        let _guard = test_guard!();
         let panel = WorkerStatusPanel::with_context(OutputContext::Plain);
         let lines = panel.render_table_plain(&[]);
         assert!(lines.iter().any(|l| l.contains("No workers configured")));
@@ -899,6 +942,7 @@ mod tests {
 
     #[test]
     fn test_render_table_plain_with_workers() {
+        let _guard = test_guard!();
         let panel = WorkerStatusPanel::with_context(OutputContext::Plain);
         let snapshot = vec![WorkerSnapshot::new(
             "worker-1",
@@ -917,6 +961,7 @@ mod tests {
 
     #[test]
     fn test_render_table_plain_with_empty_tags() {
+        let _guard = test_guard!();
         let panel = WorkerStatusPanel::with_context(OutputContext::Plain);
         let snapshot = vec![WorkerSnapshot::new(
             "w1",
@@ -933,6 +978,7 @@ mod tests {
 
     #[test]
     fn test_render_table_plain_verbose() {
+        let _guard = test_guard!();
         let panel = WorkerStatusPanel::with_context(OutputContext::Plain).with_verbose(true);
         let snapshot = vec![WorkerSnapshot::new(
             "w1",
@@ -950,6 +996,7 @@ mod tests {
     // detect_changes tests
     #[test]
     fn test_detect_changes_new_worker() {
+        let _guard = test_guard!();
         let mut panel = WorkerStatusPanel::with_context(OutputContext::Plain);
         let snapshot = vec![WorkerSnapshot::new(
             "w1",
@@ -967,6 +1014,7 @@ mod tests {
 
     #[test]
     fn test_detect_changes_no_change() {
+        let _guard = test_guard!();
         let mut panel = WorkerStatusPanel::with_context(OutputContext::Plain);
         let snapshot = vec![WorkerSnapshot::new(
             "w1",
@@ -985,6 +1033,7 @@ mod tests {
 
     #[test]
     fn test_detect_changes_status_transition() {
+        let _guard = test_guard!();
         let mut panel = WorkerStatusPanel::with_context(OutputContext::Plain);
         let initial = vec![WorkerSnapshot::new(
             "w1",
@@ -1013,6 +1062,7 @@ mod tests {
     // render_changes tests
     #[test]
     fn test_render_changes_few() {
+        let _guard = test_guard!();
         let panel = WorkerStatusPanel::with_context(OutputContext::Plain);
         let changes = vec![WorkerChange {
             id: "w1".to_string(),
@@ -1026,6 +1076,7 @@ mod tests {
 
     #[test]
     fn test_render_changes_bulk_threshold() {
+        let _guard = test_guard!();
         let panel = WorkerStatusPanel::with_context(OutputContext::Plain);
         // Create more than BULK_CHANGE_THRESHOLD changes
         let changes: Vec<WorkerChange> = (0..5)
@@ -1043,6 +1094,7 @@ mod tests {
     // render_change_line tests
     #[test]
     fn test_render_change_line_with_event() {
+        let _guard = test_guard!();
         let panel = WorkerStatusPanel::with_context(OutputContext::Plain);
         let change = WorkerChange {
             id: "w1".to_string(),
@@ -1057,6 +1109,7 @@ mod tests {
 
     #[test]
     fn test_render_change_line_without_event() {
+        let _guard = test_guard!();
         let panel = WorkerStatusPanel::with_context(OutputContext::Plain);
         let change = WorkerChange {
             id: "w1".to_string(),
@@ -1071,6 +1124,7 @@ mod tests {
 
     #[test]
     fn test_render_change_line_new_worker() {
+        let _guard = test_guard!();
         let panel = WorkerStatusPanel::with_context(OutputContext::Plain);
         let change = WorkerChange {
             id: "w1".to_string(),
@@ -1085,6 +1139,7 @@ mod tests {
     // render_update tests
     #[test]
     fn test_render_update_machine_mode() {
+        let _guard = test_guard!();
         let mut panel = WorkerStatusPanel::with_context(OutputContext::Machine);
         let snapshot = vec![WorkerSnapshot::new(
             "w1",
@@ -1102,6 +1157,7 @@ mod tests {
 
     #[test]
     fn test_render_update_initial() {
+        let _guard = test_guard!();
         let mut panel = WorkerStatusPanel::with_context(OutputContext::Plain)
             .with_refresh_interval(Duration::from_secs(1));
         let snapshot = vec![WorkerSnapshot::new(
@@ -1120,30 +1176,35 @@ mod tests {
     // format_status_rich tests
     #[test]
     fn test_format_status_rich_healthy() {
+        let _guard = test_guard!();
         let result = format_status_rich(OutputContext::Plain, WorkerStatus::Healthy);
         assert!(result.contains("Healthy"));
     }
 
     #[test]
     fn test_format_status_rich_degraded() {
+        let _guard = test_guard!();
         let result = format_status_rich(OutputContext::Plain, WorkerStatus::Degraded);
         assert!(result.contains("Degraded"));
     }
 
     #[test]
     fn test_format_status_rich_unreachable() {
+        let _guard = test_guard!();
         let result = format_status_rich(OutputContext::Plain, WorkerStatus::Unreachable);
         assert!(result.contains("Down"));
     }
 
     #[test]
     fn test_format_status_rich_draining() {
+        let _guard = test_guard!();
         let result = format_status_rich(OutputContext::Plain, WorkerStatus::Draining);
         assert!(result.contains("Draining"));
     }
 
     #[test]
     fn test_format_status_rich_disabled() {
+        let _guard = test_guard!();
         let result = format_status_rich(OutputContext::Plain, WorkerStatus::Disabled);
         assert!(result.contains("Disabled"));
     }
@@ -1151,6 +1212,7 @@ mod tests {
     // prefix_now test
     #[test]
     fn test_prefix_now_format() {
+        let _guard = test_guard!();
         let result = prefix_now();
         assert!(result.contains("[WORKERS]"));
         assert!(result.starts_with('['));
@@ -1159,6 +1221,7 @@ mod tests {
     // set_debug_routing_enabled tests
     #[test]
     fn test_set_debug_routing_enabled() {
+        let _guard = test_guard!();
         // Save original state
         let original = DEBUG_ROUTING_ENABLED.load(AtomicOrdering::Relaxed);
 
@@ -1175,6 +1238,7 @@ mod tests {
     // WorkerChange struct tests
     #[test]
     fn test_worker_change_clone() {
+        let _guard = test_guard!();
         let change = WorkerChange {
             id: "worker-1".to_string(),
             previous: Some(WorkerStatus::Healthy),
@@ -1189,6 +1253,7 @@ mod tests {
     // WorkerStatusPlan struct tests
     #[test]
     fn test_worker_status_plan_fields() {
+        let _guard = test_guard!();
         let plan = WorkerStatusPlan {
             lines: vec!["line1".to_string(), "line2".to_string()],
             render_table: true,
@@ -1200,6 +1265,7 @@ mod tests {
     // env_flag tests
     #[test]
     fn test_env_flag_missing() {
+        let _guard = test_guard!();
         // Non-existent env var should return false
         let result = env_flag("RCHD_TEST_NONEXISTENT_VAR_12345");
         assert!(!result);
@@ -1208,6 +1274,7 @@ mod tests {
     // render_changes_aggregated tests
     #[test]
     fn test_render_changes_aggregated() {
+        let _guard = test_guard!();
         let panel = WorkerStatusPanel::with_context(OutputContext::Plain);
         let changes: Vec<WorkerChange> = (0..5)
             .map(|i| WorkerChange {
@@ -1224,6 +1291,7 @@ mod tests {
 
     #[test]
     fn test_render_changes_aggregated_mixed() {
+        let _guard = test_guard!();
         let panel = WorkerStatusPanel::with_context(OutputContext::Plain);
         let changes = vec![
             WorkerChange {
@@ -1250,6 +1318,7 @@ mod tests {
     // log_routing_decision tests (when debug is disabled)
     #[test]
     fn test_log_routing_decision_disabled() {
+        let _guard = test_guard!();
         // Save original state
         let original = DEBUG_ROUTING_ENABLED.load(AtomicOrdering::Relaxed);
         DEBUG_ROUTING_ENABLED.store(false, AtomicOrdering::Relaxed);
@@ -1270,6 +1339,7 @@ mod tests {
     // Constants tests
     #[test]
     fn test_constants() {
+        let _guard = test_guard!();
         assert_eq!(DEFAULT_REFRESH_SECS, 30);
         assert_eq!(BULK_CHANGE_THRESHOLD, 4);
         assert_eq!(DEFAULT_TABLE_WIDTH, 72);

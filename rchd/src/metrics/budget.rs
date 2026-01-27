@@ -138,9 +138,11 @@ pub fn has_critical_violations() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rch_common::test_guard;
 
     #[test]
     fn test_budget_status_display() {
+        let _guard = test_guard!();
         assert_eq!(BudgetStatus::Passing.to_string(), "passing");
         assert_eq!(BudgetStatus::Warning.to_string(), "warning");
         assert_eq!(BudgetStatus::Failing.to_string(), "failing");
@@ -148,6 +150,7 @@ mod tests {
 
     #[test]
     fn test_get_budget_status() {
+        let _guard = test_guard!();
         let status = get_budget_status();
 
         // Verify structure
@@ -171,6 +174,7 @@ mod tests {
 
     #[test]
     fn test_budget_info_serialization() {
+        let _guard = test_guard!();
         let info = BudgetInfo {
             budget_ms: 1.0,
             panic_threshold_ms: 5.0,
@@ -187,6 +191,7 @@ mod tests {
 
     #[test]
     fn test_budget_breakdown() {
+        let _guard = test_guard!();
         let breakdown = BudgetBreakdown {
             non_compilation: BudgetInfo {
                 budget_ms: NON_COMPILATION_BUDGET_MS,

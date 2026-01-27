@@ -669,7 +669,7 @@ impl Default for BuildHistory {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+        use rch_common::test_guard;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tempfile::TempDir;
 
@@ -699,6 +699,7 @@ mod tests {
 
     #[test]
     fn test_ring_buffer_capacity() {
+        let _guard = test_guard!();
         let history = BuildHistory::new(3);
 
         for i in 1..=5 {
@@ -713,6 +714,7 @@ mod tests {
 
     #[test]
     fn test_recent_ordering() {
+        let _guard = test_guard!();
         let history = BuildHistory::new(10);
         history.record(make_build_record(1));
         history.record(make_build_record(2));
@@ -726,6 +728,7 @@ mod tests {
 
     #[test]
     fn test_by_worker_filter() {
+        let _guard = test_guard!();
         let history = BuildHistory::new(10);
 
         let mut record1 = make_build_record(1);
@@ -751,6 +754,7 @@ mod tests {
 
     #[test]
     fn test_by_project_filter() {
+        let _guard = test_guard!();
         let history = BuildHistory::new(10);
 
         let mut record1 = make_build_record(1);
@@ -772,6 +776,7 @@ mod tests {
 
     #[test]
     fn test_stats_calculation() {
+        let _guard = test_guard!();
         let history = BuildHistory::new(10);
 
         // 2 successes, 1 failure, 2 remote, 1 local
@@ -804,6 +809,7 @@ mod tests {
 
     #[test]
     fn test_empty_history() {
+        let _guard = test_guard!();
         let history = BuildHistory::new(10);
 
         assert!(history.recent(10).is_empty());
@@ -816,6 +822,7 @@ mod tests {
 
     #[test]
     fn test_next_id() {
+        let _guard = test_guard!();
         let history = BuildHistory::new(10);
 
         assert_eq!(history.next_id(), 1);
@@ -923,6 +930,7 @@ mod tests {
 
     #[test]
     fn test_clear() {
+        let _guard = test_guard!();
         let history = BuildHistory::new(10);
         history.record(make_build_record(1));
         history.record(make_build_record(2));
@@ -941,6 +949,7 @@ mod tests {
 
     #[test]
     fn test_enqueue_dequeue_fifo() {
+        let _guard = test_guard!();
         let history = BuildHistory::new(10);
 
         // Enqueue three builds
@@ -973,6 +982,7 @@ mod tests {
 
     #[test]
     fn test_queue_depth_limit() {
+        let _guard = test_guard!();
         let history = BuildHistory::new(10).with_max_queue_depth(2);
 
         // First two should succeed
@@ -1005,6 +1015,7 @@ mod tests {
 
     #[test]
     fn test_queue_position() {
+        let _guard = test_guard!();
         let history = BuildHistory::new(10);
 
         let b1 = history
@@ -1026,6 +1037,7 @@ mod tests {
 
     #[test]
     fn test_remove_queued_build() {
+        let _guard = test_guard!();
         let history = BuildHistory::new(10);
 
         let b1 = history
@@ -1055,6 +1067,7 @@ mod tests {
 
     #[test]
     fn test_queued_builds_list() {
+        let _guard = test_guard!();
         let history = BuildHistory::new(10);
 
         history.enqueue_build("proj-a".into(), "build".into(), 1, 4);
@@ -1068,6 +1081,7 @@ mod tests {
 
     #[test]
     fn test_queued_build_lookup() {
+        let _guard = test_guard!();
         let history = BuildHistory::new(10);
 
         let b = history
@@ -1084,6 +1098,7 @@ mod tests {
 
     #[test]
     fn test_queue_unlimited_depth() {
+        let _guard = test_guard!();
         // max_queue_depth = 0 means unlimited
         let history = BuildHistory::new(10).with_max_queue_depth(0);
 
@@ -1105,6 +1120,7 @@ mod tests {
 
     #[test]
     fn test_saved_time_stats_empty_history() {
+        let _guard = test_guard!();
         let history = BuildHistory::new(10);
         let stats = history.saved_time_stats();
 
@@ -1116,6 +1132,7 @@ mod tests {
 
     #[test]
     fn test_saved_time_stats_only_local_builds() {
+        let _guard = test_guard!();
         let history = BuildHistory::new(10);
 
         // Add local builds only
@@ -1133,6 +1150,7 @@ mod tests {
 
     #[test]
     fn test_saved_time_stats_only_remote_builds_default_speedup() {
+        let _guard = test_guard!();
         let history = BuildHistory::new(10);
 
         // Add remote builds only (no local for comparison, uses default 2x speedup)
@@ -1155,6 +1173,7 @@ mod tests {
 
     #[test]
     fn test_saved_time_stats_mixed_builds() {
+        let _guard = test_guard!();
         let history = BuildHistory::new(10);
 
         // Add local builds
@@ -1185,6 +1204,7 @@ mod tests {
 
     #[test]
     fn test_saved_time_stats_failed_builds_excluded() {
+        let _guard = test_guard!();
         let history = BuildHistory::new(10);
 
         // Add successful remote build
@@ -1211,6 +1231,7 @@ mod tests {
 
     #[test]
     fn test_saved_time_stats_no_negative_savings() {
+        let _guard = test_guard!();
         let history = BuildHistory::new(10);
 
         // Add fast local builds (500ms)

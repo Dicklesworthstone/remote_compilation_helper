@@ -456,7 +456,7 @@ pub fn inc_requests(endpoint: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+        use rch_common::test_guard;
     use ::tracing::info;
 
     fn setup_tracing() {
@@ -468,6 +468,7 @@ mod tests {
 
     #[test]
     fn test_metrics_registration() {
+        let _guard = test_guard!();
         setup_tracing();
         info!("TEST START: test_metrics_registration");
 
@@ -495,6 +496,7 @@ mod tests {
 
     #[test]
     fn test_histogram_observe() {
+        let _guard = test_guard!();
         setup_tracing();
         info!("TEST START: test_histogram_observe");
 
@@ -519,6 +521,7 @@ mod tests {
 
     #[test]
     fn test_gauge_set() {
+        let _guard = test_guard!();
         setup_tracing();
         info!("TEST START: test_gauge_set");
 
@@ -542,6 +545,7 @@ mod tests {
 
     #[test]
     fn test_encode_format() {
+        let _guard = test_guard!();
         setup_tracing();
         info!("TEST START: test_encode_format");
 
@@ -570,6 +574,7 @@ mod tests {
 
     #[test]
     fn test_worker_metric_helpers() {
+        let _guard = test_guard!();
         setup_tracing();
         info!("TEST START: test_worker_metric_helpers");
 
@@ -604,6 +609,7 @@ mod tests {
 
     #[test]
     fn test_circuit_breaker_metric_helpers() {
+        let _guard = test_guard!();
         setup_tracing();
         info!("TEST START: test_circuit_breaker_metric_helpers");
 
@@ -640,6 +646,7 @@ mod tests {
 
     #[test]
     fn test_build_metric_helpers() {
+        let _guard = test_guard!();
         setup_tracing();
         info!("TEST START: test_build_metric_helpers");
 
@@ -669,6 +676,7 @@ mod tests {
 
     #[test]
     fn test_transfer_metric_helpers() {
+        let _guard = test_guard!();
         setup_tracing();
         info!("TEST START: test_transfer_metric_helpers");
 
@@ -691,6 +699,7 @@ mod tests {
 
     #[test]
     fn test_daemon_metric_helpers() {
+        let _guard = test_guard!();
         setup_tracing();
         info!("TEST START: test_daemon_metric_helpers");
 
@@ -726,6 +735,7 @@ mod tests {
 
     #[test]
     fn test_classification_metric_helpers() {
+        let _guard = test_guard!();
         setup_tracing();
         info!("TEST START: test_classification_metric_helpers");
 

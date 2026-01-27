@@ -670,10 +670,11 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+        use rch_common::test_guard;
 
     #[test]
     fn test_shutdown_signal_names() {
+        let _guard = test_guard!();
         assert_eq!(ShutdownSignal::Term.name(), "SIGTERM");
         assert_eq!(ShutdownSignal::Int.name(), "SIGINT");
         assert_eq!(ShutdownSignal::Quit.name(), "SIGQUIT");
@@ -682,11 +683,13 @@ mod tests {
 
     #[test]
     fn test_shutdown_signal_display() {
+        let _guard = test_guard!();
         assert_eq!(format!("{}", ShutdownSignal::Term), "SIGTERM");
     }
 
     #[test]
     fn test_job_drain_event_success() {
+        let _guard = test_guard!();
         let event = JobDrainEvent::success("j-abc123");
         assert!(event.success);
         assert_eq!(event.exit_code, Some(0));
@@ -695,6 +698,7 @@ mod tests {
 
     #[test]
     fn test_job_drain_event_failed() {
+        let _guard = test_guard!();
         let event = JobDrainEvent::failed("j-xyz789", 1);
         assert!(!event.success);
         assert_eq!(event.exit_code, Some(1));
@@ -702,6 +706,7 @@ mod tests {
 
     #[test]
     fn test_job_drain_event_cancelled() {
+        let _guard = test_guard!();
         let event = JobDrainEvent::cancelled("j-cancelled");
         assert!(!event.success);
         assert!(event.exit_code.is_none());
@@ -709,18 +714,21 @@ mod tests {
 
     #[test]
     fn test_session_stats_success_rate() {
+        let _guard = test_guard!();
         let stats = SessionStats::new(Duration::from_secs(3600), 100, 95, 5, 3);
         assert!((stats.success_rate() - 95.0).abs() < 0.01);
     }
 
     #[test]
     fn test_session_stats_success_rate_zero_jobs() {
+        let _guard = test_guard!();
         let stats = SessionStats::new(Duration::from_secs(3600), 0, 0, 0, 3);
         assert!((stats.success_rate() - 100.0).abs() < 0.01);
     }
 
     #[test]
     fn test_session_stats_uptime_display() {
+        let _guard = test_guard!();
         // Hours and minutes
         let stats = SessionStats::new(Duration::from_secs(4 * 3600 + 15 * 60), 0, 0, 0, 0);
         assert_eq!(stats.uptime_display(), "4h 15m");
@@ -736,6 +744,7 @@ mod tests {
 
     #[test]
     fn test_session_stats_bytes_display() {
+        let _guard = test_guard!();
         // GB
         let mut stats = SessionStats {
             bytes_transferred: 2_500_000_000,
@@ -758,6 +767,7 @@ mod tests {
 
     #[test]
     fn test_shutdown_sequence_creation() {
+        let _guard = test_guard!();
         let seq = ShutdownSequence::new(ShutdownSignal::Term, "0.5.2", 3, 2, 60);
         assert_eq!(seq.total_jobs_to_drain, 3);
         assert_eq!(seq.total_workers, 2);
@@ -766,6 +776,7 @@ mod tests {
 
     #[test]
     fn test_shutdown_sequence_record_job() {
+        let _guard = test_guard!();
         let mut seq = ShutdownSequence::new(ShutdownSignal::Term, "0.5.2", 2, 1, 60)
             .with_context(OutputContext::Plain);
 
@@ -778,6 +789,7 @@ mod tests {
 
     #[test]
     fn test_shutdown_sequence_all_success() {
+        let _guard = test_guard!();
         let mut seq = ShutdownSequence::new(ShutdownSignal::Int, "0.5.2", 2, 1, 60)
             .with_context(OutputContext::Plain);
 
@@ -789,6 +801,7 @@ mod tests {
 
     #[test]
     fn test_shutdown_sequence_show_functions_dont_panic() {
+        let _guard = test_guard!();
         let seq = ShutdownSequence::new(ShutdownSignal::Term, "0.5.2", 3, 2, 60)
             .with_context(OutputContext::Plain);
 
@@ -804,6 +817,7 @@ mod tests {
 
     #[test]
     fn test_shutdown_sequence_workers_disconnecting() {
+        let _guard = test_guard!();
         let mut seq = ShutdownSequence::new(ShutdownSignal::Term, "0.5.2", 0, 5, 60)
             .with_context(OutputContext::Plain);
 
@@ -816,6 +830,7 @@ mod tests {
 
     #[test]
     fn test_shutdown_sequence_session_summary_plain() {
+        let _guard = test_guard!();
         let seq = ShutdownSequence::new(ShutdownSignal::Term, "0.5.2", 0, 0, 60)
             .with_context(OutputContext::Plain);
         let stats = SessionStats::new(Duration::from_secs(3600), 100, 95, 5, 3);
@@ -826,6 +841,7 @@ mod tests {
 
     #[test]
     fn test_shutdown_sequence_final_message() {
+        let _guard = test_guard!();
         let seq = ShutdownSequence::new(ShutdownSignal::Term, "0.5.2", 0, 0, 60)
             .with_context(OutputContext::Plain);
 
@@ -836,6 +852,7 @@ mod tests {
 
     #[test]
     fn test_session_stats_builder() {
+        let _guard = test_guard!();
         let stats = SessionStats::new(Duration::from_secs(3600), 100, 95, 5, 3)
             .with_bytes(1_000_000)
             .with_avg_duration(500);
@@ -846,6 +863,7 @@ mod tests {
 
     #[test]
     fn test_shutdown_sequence_elapsed() {
+        let _guard = test_guard!();
         let seq = ShutdownSequence::new(ShutdownSignal::Term, "0.5.2", 0, 0, 60);
         std::thread::sleep(Duration::from_millis(10));
         assert!(seq.elapsed().as_millis() >= 10);

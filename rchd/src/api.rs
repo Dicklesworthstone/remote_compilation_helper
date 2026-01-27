@@ -2565,6 +2565,7 @@ async fn handle_status(ctx: &DaemonContext) -> Result<DaemonFullStatus> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rch_common::test_guard;
     use crate::history::BuildHistory;
     use crate::selection::WorkerSelector;
     use crate::self_test::{SelfTestHistory, SelfTestService};
@@ -2607,6 +2608,7 @@ mod tests {
 
     #[test]
     fn test_parse_request_basic() {
+        let _guard = test_guard!();
         let req = parse_request("GET /select-worker?project=myproject&cores=4").unwrap();
         let ApiRequest::SelectWorker { request: req, .. } = req else {
             panic!("expected select-worker request");
@@ -2617,6 +2619,7 @@ mod tests {
 
     #[test]
     fn test_parse_request_project_only() {
+        let _guard = test_guard!();
         let req = parse_request("GET /select-worker?project=test").unwrap();
         let ApiRequest::SelectWorker { request: req, .. } = req else {
             panic!("expected select-worker request");
@@ -2627,6 +2630,7 @@ mod tests {
 
     #[test]
     fn test_parse_request_with_spaces() {
+        let _guard = test_guard!();
         let req = parse_request("GET /select-worker?project=my%20project&cores=2").unwrap();
         let ApiRequest::SelectWorker { request: req, .. } = req else {
             panic!("expected select-worker request");
@@ -2637,6 +2641,7 @@ mod tests {
 
     #[test]
     fn test_parse_request_with_priority_hint() {
+        let _guard = test_guard!();
         let req = parse_request("GET /select-worker?project=test&cores=2&priority=high").unwrap();
         let ApiRequest::SelectWorker { request: req, .. } = req else {
             panic!("expected select-worker request");
@@ -2646,6 +2651,7 @@ mod tests {
 
     #[test]
     fn test_parse_request_invalid_priority_defaults_to_normal() {
+        let _guard = test_guard!();
         let req = parse_request("GET /select-worker?project=test&cores=2&priority=urgent").unwrap();
         let ApiRequest::SelectWorker { request: req, .. } = req else {
             panic!("expected select-worker request");
@@ -2655,12 +2661,14 @@ mod tests {
 
     #[test]
     fn test_parse_request_status() {
+        let _guard = test_guard!();
         let req = parse_request("GET /status").unwrap();
         assert!(matches!(req, ApiRequest::Status), "expected status request");
     }
 
     #[test]
     fn test_parse_request_test_run() {
+        let _guard = test_guard!();
         let req = parse_request("POST /test-run").unwrap();
         assert!(
             matches!(req, ApiRequest::TestRun),
@@ -2670,6 +2678,7 @@ mod tests {
 
     #[test]
     fn test_parse_request_speedscore() {
+        let _guard = test_guard!();
         let req = parse_request("GET /speedscore/css").unwrap();
         match req {
             ApiRequest::SpeedScore { worker_id } => {
@@ -2681,6 +2690,7 @@ mod tests {
 
     #[test]
     fn test_parse_request_speedscore_history() {
+        let _guard = test_guard!();
         let req = parse_request("GET /speedscore/css/history?days=7&limit=25&offset=5").unwrap();
         match req {
             ApiRequest::SpeedScoreHistory {
@@ -2700,6 +2710,7 @@ mod tests {
 
     #[test]
     fn test_parse_request_speedscores() {
+        let _guard = test_guard!();
         let req = parse_request("GET /speedscores").unwrap();
         assert!(
             matches!(req, ApiRequest::SpeedScores),
@@ -2709,6 +2720,7 @@ mod tests {
 
     #[test]
     fn test_parse_request_workers_capabilities() {
+        let _guard = test_guard!();
         let req = parse_request("GET /workers/capabilities").unwrap();
         match req {
             ApiRequest::WorkersCapabilities { refresh } => {
@@ -2728,6 +2740,7 @@ mod tests {
 
     #[test]
     fn test_parse_request_benchmark_trigger() {
+        let _guard = test_guard!();
         let req = parse_request("POST /benchmark/trigger/css").unwrap();
         match req {
             ApiRequest::BenchmarkTrigger { worker_id } => {
@@ -2739,18 +2752,21 @@ mod tests {
 
     #[test]
     fn test_parse_request_events() {
+        let _guard = test_guard!();
         let req = parse_request("GET /events").unwrap();
         assert!(matches!(req, ApiRequest::Events), "expected events request");
     }
 
     #[test]
     fn test_parse_request_reload() {
+        let _guard = test_guard!();
         let req = parse_request("POST /reload").unwrap();
         assert!(matches!(req, ApiRequest::Reload), "expected reload request");
     }
 
     #[test]
     fn test_parse_request_reload_get_fails() {
+        let _guard = test_guard!();
         // GET method should not work for reload
         let result = parse_request("GET /reload");
         assert!(result.is_err());
@@ -2758,6 +2774,7 @@ mod tests {
 
     #[test]
     fn test_parse_request_telemetry_poll() {
+        let _guard = test_guard!();
         let req = parse_request("POST /telemetry/poll?worker=css").unwrap();
         match req {
             ApiRequest::TelemetryPoll { worker_id } => {
@@ -2769,6 +2786,7 @@ mod tests {
 
     #[test]
     fn test_parse_request_self_test_status() {
+        let _guard = test_guard!();
         let req = parse_request("GET /self-test/status").unwrap();
         assert!(
             matches!(req, ApiRequest::SelfTestStatus),
@@ -2778,6 +2796,7 @@ mod tests {
 
     #[test]
     fn test_parse_request_self_test_history() {
+        let _guard = test_guard!();
         let req = parse_request("GET /self-test/history?limit=5").unwrap();
         match req {
             ApiRequest::SelfTestHistory { limit } => assert_eq!(limit, 5),
@@ -2787,6 +2806,7 @@ mod tests {
 
     #[test]
     fn test_parse_request_self_test_run() {
+        let _guard = test_guard!();
         let req =
             parse_request("POST /self-test/run?worker=css&timeout=120&debug=1&scheduled=false")
                 .unwrap();
@@ -2801,6 +2821,7 @@ mod tests {
 
     #[test]
     fn test_parse_request_with_toolchain() {
+        let _guard = test_guard!();
         // Create a toolchain JSON and URL encode it
         let toolchain_json = r###"{"channel":"nightly","date":"2024-01-01","full_version":"rustc 1.76.0-nightly"}"###;
         let encoded = urlencoding_encode(toolchain_json);
@@ -2825,6 +2846,7 @@ mod tests {
 
     #[test]
     fn test_parse_request_with_runtime() {
+        let _guard = test_guard!();
         let query = "GET /select-worker?project=test&runtime=bun";
         let req = parse_request(query).unwrap();
         let ApiRequest::SelectWorker { request: req, .. } = req else {
@@ -2850,24 +2872,28 @@ mod tests {
 
     #[test]
     fn test_parse_request_missing_project() {
+        let _guard = test_guard!();
         let result = parse_request("GET /select-worker?cores=4");
         assert!(result.is_err());
     }
 
     #[test]
     fn test_parse_request_invalid_method() {
+        let _guard = test_guard!();
         let result = parse_request("PUT /select-worker?project=test");
         assert!(result.is_err());
     }
 
     #[test]
     fn test_parse_request_unknown_endpoint() {
+        let _guard = test_guard!();
         let result = parse_request("GET /unknown?project=test");
         assert!(result.is_err());
     }
 
     #[test]
     fn test_urlencoding_decode_basic() {
+        let _guard = test_guard!();
         assert_eq!(urlencoding_decode("hello%20world"), "hello world");
         assert_eq!(urlencoding_decode("path%2Fto%2Ffile"), "path/to/file");
         assert_eq!(urlencoding_decode("foo%3Abar"), "foo:bar");
@@ -2875,6 +2901,7 @@ mod tests {
 
     #[test]
     fn test_urlencoding_decode_special_chars() {
+        let _guard = test_guard!();
         assert_eq!(urlencoding_decode("a%26b%3Dc"), "a&b=c");
         assert_eq!(urlencoding_decode("100%25"), "100%");
         assert_eq!(urlencoding_decode("hello%2Bworld"), "hello+world");
@@ -2882,11 +2909,13 @@ mod tests {
 
     #[test]
     fn test_urlencoding_decode_plus_as_space() {
+        let _guard = test_guard!();
         assert_eq!(urlencoding_decode("hello+world"), "hello world");
     }
 
     #[test]
     fn test_urlencoding_decode_no_encoding() {
+        let _guard = test_guard!();
         assert_eq!(urlencoding_decode("simple"), "simple");
         assert_eq!(
             urlencoding_decode("with-dash_underscore"),
@@ -2896,6 +2925,7 @@ mod tests {
 
     #[test]
     fn test_urlencoding_decode_invalid() {
+        let _guard = test_guard!();
         // Invalid hex should be preserved
         assert_eq!(urlencoding_decode("foo%GGbar"), "foo%GGbar");
         // Incomplete sequence at end
@@ -2904,6 +2934,7 @@ mod tests {
 
     #[test]
     fn test_urlencoding_decode_utf8() {
+        let _guard = test_guard!();
         // "é" is %C3%A9 in UTF-8
         assert_eq!(urlencoding_decode("%C3%A9"), "é");
         // "こんにちは" (Konnichiwa)
@@ -3146,6 +3177,7 @@ mod tests {
 
     #[test]
     fn test_parse_request_reload_requires_post() {
+        let _guard = test_guard!();
         // Only POST should work for reload
         let result = parse_request("POST /reload");
         assert!(result.is_ok());
@@ -3165,6 +3197,7 @@ mod tests {
 
     #[test]
     fn test_format_wait_time_seconds_only() {
+        let _guard = test_guard!();
         assert_eq!(format_wait_time(0), "0s");
         assert_eq!(format_wait_time(1), "1s");
         assert_eq!(format_wait_time(30), "30s");
@@ -3173,6 +3206,7 @@ mod tests {
 
     #[test]
     fn test_format_wait_time_minutes() {
+        let _guard = test_guard!();
         assert_eq!(format_wait_time(60), "1m");
         assert_eq!(format_wait_time(61), "1m 1s");
         assert_eq!(format_wait_time(90), "1m 30s");
@@ -3182,6 +3216,7 @@ mod tests {
 
     #[test]
     fn test_format_wait_time_hours() {
+        let _guard = test_guard!();
         assert_eq!(format_wait_time(3600), "1h");
         assert_eq!(format_wait_time(3660), "1h 1m");
         assert_eq!(format_wait_time(7200), "2h");
@@ -3195,6 +3230,7 @@ mod tests {
 
     #[test]
     fn test_daemon_status_info_serialization() {
+        let _guard = test_guard!();
         let info = DaemonStatusInfo {
             pid: 1234,
             uptime_secs: 3600,
@@ -3214,6 +3250,7 @@ mod tests {
 
     #[test]
     fn test_worker_status_info_serialization() {
+        let _guard = test_guard!();
         let info = WorkerStatusInfo {
             id: "worker1".to_string(),
             host: "localhost".to_string(),
@@ -3236,6 +3273,7 @@ mod tests {
 
     #[test]
     fn test_health_response_serialization() {
+        let _guard = test_guard!();
         let response = HealthResponse {
             status: "healthy".to_string(),
             version: "1.0.0".to_string(),
@@ -3248,6 +3286,7 @@ mod tests {
 
     #[test]
     fn test_ready_response_serialization_ready() {
+        let _guard = test_guard!();
         let response = ReadyResponse {
             status: "ready".to_string(),
             workers_available: true,
@@ -3262,6 +3301,7 @@ mod tests {
 
     #[test]
     fn test_ready_response_serialization_not_ready() {
+        let _guard = test_guard!();
         let response = ReadyResponse {
             status: "not_ready".to_string(),
             workers_available: false,
@@ -3274,6 +3314,7 @@ mod tests {
 
     #[test]
     fn test_active_build_serialization() {
+        let _guard = test_guard!();
         let build = ActiveBuild {
             id: 42,
             project_id: "my-project".to_string(),
@@ -3289,6 +3330,7 @@ mod tests {
 
     #[test]
     fn test_queued_build_serialization() {
+        let _guard = test_guard!();
         let build = QueuedBuild {
             id: 1,
             project_id: "test".to_string(),
@@ -3307,6 +3349,7 @@ mod tests {
 
     #[test]
     fn test_issue_serialization() {
+        let _guard = test_guard!();
         let issue = Issue {
             severity: "warning".to_string(),
             summary: "Worker w1 is unreachable".to_string(),
@@ -3319,6 +3362,7 @@ mod tests {
 
     #[test]
     fn test_cancel_build_response_serialization() {
+        let _guard = test_guard!();
         let response = CancelBuildResponse {
             status: "cancelled".to_string(),
             build_id: 123,
@@ -3334,6 +3378,7 @@ mod tests {
 
     #[test]
     fn test_cancel_all_builds_response_serialization() {
+        let _guard = test_guard!();
         let response = CancelAllBuildsResponse {
             status: "ok".to_string(),
             cancelled_count: 2,
@@ -3351,6 +3396,7 @@ mod tests {
 
     #[test]
     fn test_worker_state_response_serialization() {
+        let _guard = test_guard!();
         let response = WorkerStateResponse {
             status: "ok".to_string(),
             worker_id: "worker1".to_string(),
@@ -3367,6 +3413,7 @@ mod tests {
 
     #[test]
     fn test_speedscore_view_serialization() {
+        let _guard = test_guard!();
         let view = SpeedScoreView {
             total: 85.5,
             cpu_score: 90.0,
@@ -3384,6 +3431,7 @@ mod tests {
 
     #[test]
     fn test_speedscore_response_serialization() {
+        let _guard = test_guard!();
         let response = SpeedScoreResponse {
             worker_id: "worker1".to_string(),
             speedscore: None,
@@ -3395,6 +3443,7 @@ mod tests {
 
     #[test]
     fn test_pagination_info_serialization() {
+        let _guard = test_guard!();
         let info = PaginationInfo {
             total: 100,
             offset: 10,
@@ -3408,6 +3457,7 @@ mod tests {
 
     #[test]
     fn test_benchmark_trigger_response_serialization() {
+        let _guard = test_guard!();
         let response = BenchmarkTriggerResponse {
             status: "queued".to_string(),
             worker_id: "worker1".to_string(),
@@ -3424,36 +3474,42 @@ mod tests {
 
     #[test]
     fn test_parse_request_health() {
+        let _guard = test_guard!();
         let req = parse_request("GET /health").unwrap();
         assert!(matches!(req, ApiRequest::Health));
     }
 
     #[test]
     fn test_parse_request_ready() {
+        let _guard = test_guard!();
         let req = parse_request("GET /ready").unwrap();
         assert!(matches!(req, ApiRequest::Ready));
     }
 
     #[test]
     fn test_parse_request_metrics() {
+        let _guard = test_guard!();
         let req = parse_request("GET /metrics").unwrap();
         assert!(matches!(req, ApiRequest::Metrics));
     }
 
     #[test]
     fn test_parse_request_budget() {
+        let _guard = test_guard!();
         let req = parse_request("GET /budget").unwrap();
         assert!(matches!(req, ApiRequest::Budget));
     }
 
     #[test]
     fn test_parse_request_shutdown() {
+        let _guard = test_guard!();
         let req = parse_request("POST /shutdown").unwrap();
         assert!(matches!(req, ApiRequest::Shutdown));
     }
 
     #[test]
     fn test_parse_request_cancel_build() {
+        let _guard = test_guard!();
         let req = parse_request("POST /builds/123/cancel").unwrap();
         match req {
             ApiRequest::CancelBuild { build_id, force } => {
@@ -3475,6 +3531,7 @@ mod tests {
 
     #[test]
     fn test_parse_request_cancel_all_builds() {
+        let _guard = test_guard!();
         let req = parse_request("POST /builds/cancel-all").unwrap();
         match req {
             ApiRequest::CancelAllBuilds { force } => {
@@ -3494,6 +3551,7 @@ mod tests {
 
     #[test]
     fn test_parse_request_worker_drain() {
+        let _guard = test_guard!();
         let req = parse_request("POST /workers/css/drain").unwrap();
         match req {
             ApiRequest::WorkerDrain { worker_id } => {
@@ -3505,6 +3563,7 @@ mod tests {
 
     #[test]
     fn test_parse_request_worker_enable() {
+        let _guard = test_guard!();
         let req = parse_request("POST /workers/css/enable").unwrap();
         match req {
             ApiRequest::WorkerEnable { worker_id } => {
@@ -3516,6 +3575,7 @@ mod tests {
 
     #[test]
     fn test_parse_request_worker_disable() {
+        let _guard = test_guard!();
         let req = parse_request("POST /workers/css/disable").unwrap();
         match req {
             ApiRequest::WorkerDisable {
@@ -3547,6 +3607,7 @@ mod tests {
 
     #[test]
     fn test_parse_request_release_worker() {
+        let _guard = test_guard!();
         let req = parse_request("POST /release-worker?worker=css&slots=4").unwrap();
         match req {
             ApiRequest::ReleaseWorker(req) => {
@@ -3559,6 +3620,7 @@ mod tests {
 
     #[test]
     fn test_parse_request_release_worker_with_build_id() {
+        let _guard = test_guard!();
         let req = parse_request("POST /release-worker?worker=css&slots=4&build_id=123").unwrap();
         match req {
             ApiRequest::ReleaseWorker(req) => {
@@ -3572,6 +3634,7 @@ mod tests {
 
     #[test]
     fn test_parse_request_release_worker_with_exit_code() {
+        let _guard = test_guard!();
         let req = parse_request("POST /release-worker?worker=css&slots=4&exit_code=0").unwrap();
         match req {
             ApiRequest::ReleaseWorker(req) => {
@@ -3583,6 +3646,7 @@ mod tests {
 
     #[test]
     fn test_parse_request_record_build() {
+        let _guard = test_guard!();
         let req =
             parse_request("POST /record-build?worker=css&project=myproject&is_test=true").unwrap();
         match req {
@@ -3601,6 +3665,7 @@ mod tests {
 
     #[test]
     fn test_parse_request_ingest_telemetry() {
+        let _guard = test_guard!();
         let req = parse_request("POST /telemetry/ingest?source=piggyback").unwrap();
         match req {
             ApiRequest::IngestTelemetry(source) => {
@@ -3620,6 +3685,7 @@ mod tests {
 
     #[test]
     fn test_parse_request_wait_for_worker() {
+        let _guard = test_guard!();
         let req = parse_request("GET /select-worker?project=test&wait=true").unwrap();
         match req {
             ApiRequest::SelectWorker {
@@ -3808,6 +3874,7 @@ mod tests {
 
     #[test]
     fn test_worker_capabilities_info_serialization() {
+        let _guard = test_guard!();
         let info = WorkerCapabilitiesInfo {
             id: "worker1".to_string(),
             host: "localhost".to_string(),
@@ -3820,6 +3887,7 @@ mod tests {
 
     #[test]
     fn test_worker_capabilities_response_serialization() {
+        let _guard = test_guard!();
         let response = WorkerCapabilitiesResponse { workers: vec![] };
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("\"workers\":[]"));
@@ -3831,6 +3899,7 @@ mod tests {
 
     #[test]
     fn test_self_test_status_response_serialization() {
+        let _guard = test_guard!();
         let response = SelfTestStatusResponse {
             enabled: true,
             schedule: Some("daily".to_string()),
@@ -3849,6 +3918,7 @@ mod tests {
 
     #[test]
     fn test_speedscore_list_response_serialization() {
+        let _guard = test_guard!();
         let response = SpeedScoreListResponse {
             workers: vec![SpeedScoreWorker {
                 worker_id: "worker1".to_string(),
@@ -3862,6 +3932,7 @@ mod tests {
 
     #[test]
     fn test_speedscore_history_response_serialization() {
+        let _guard = test_guard!();
         let response = SpeedScoreHistoryResponse {
             worker_id: "worker1".to_string(),
             history: vec![],
@@ -3883,6 +3954,7 @@ mod tests {
 
     #[test]
     fn test_api_response_ok_serialization() {
+        let _guard = test_guard!();
         let response: ApiResponse<HealthResponse> = ApiResponse::Ok(HealthResponse {
             status: "healthy".to_string(),
             version: "1.0.0".to_string(),
@@ -3894,6 +3966,7 @@ mod tests {
 
     #[test]
     fn test_api_response_error_serialization() {
+        let _guard = test_guard!();
         let response: ApiResponse<HealthResponse> =
             ApiResponse::Error(ApiError::new(ErrorCode::ConfigNotFound, "Not found"));
         let json = serde_json::to_string(&response).unwrap();

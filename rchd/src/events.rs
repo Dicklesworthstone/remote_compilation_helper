@@ -51,6 +51,7 @@ impl EventBus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rch_common::test_guard;
     use std::time::Duration;
 
     #[tokio::test]
@@ -430,6 +431,7 @@ mod tests {
 
     #[test]
     fn default_buffer_has_expected_value() {
+        let _guard = test_guard!();
         assert_eq!(DEFAULT_BUFFER, 256);
     }
 

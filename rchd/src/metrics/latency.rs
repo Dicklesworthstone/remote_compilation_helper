@@ -208,12 +208,13 @@ impl TierTimer {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+        use rch_common::test_guard;
     use std::thread;
     use std::time::Duration;
 
     #[test]
     fn test_decision_type_budget() {
+        let _guard = test_guard!();
         assert_eq!(DecisionType::NonCompilation.budget_ms(), 1.0);
         assert_eq!(DecisionType::Compilation.budget_ms(), 5.0);
         assert_eq!(DecisionType::WorkerSelection.budget_ms(), 10.0);
@@ -221,6 +222,7 @@ mod tests {
 
     #[test]
     fn test_decision_type_label() {
+        let _guard = test_guard!();
         assert_eq!(DecisionType::NonCompilation.label(), "non_compilation");
         assert_eq!(DecisionType::Compilation.label(), "compilation");
         assert_eq!(DecisionType::WorkerSelection.label(), "worker_selection");
@@ -228,6 +230,7 @@ mod tests {
 
     #[test]
     fn test_record_decision_latency() {
+        let _guard = test_guard!();
         let start = Instant::now();
         // Simulate some work
         thread::sleep(Duration::from_micros(100));
@@ -240,6 +243,7 @@ mod tests {
 
     #[test]
     fn test_decision_timer() {
+        let _guard = test_guard!();
         let timer = DecisionTimer::new(DecisionType::Compilation);
         thread::sleep(Duration::from_micros(50));
 
@@ -252,6 +256,7 @@ mod tests {
 
     #[test]
     fn test_tier_timer() {
+        let _guard = test_guard!();
         let timer = TierTimer::new(2);
         thread::sleep(Duration::from_micros(10));
         timer.stop();
@@ -261,6 +266,7 @@ mod tests {
 
     #[test]
     fn test_panic_thresholds() {
+        let _guard = test_guard!();
         assert!(
             DecisionType::NonCompilation.panic_threshold_ms()
                 > DecisionType::NonCompilation.budget_ms()

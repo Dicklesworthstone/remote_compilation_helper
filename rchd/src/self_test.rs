@@ -598,42 +598,48 @@ pub fn default_history_path() -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+        use rch_common::test_guard;
 
     // ==================== parse_duration tests ====================
 
     #[test]
     fn test_parse_duration_minutes() {
+        let _guard = test_guard!();
         let duration = parse_duration("5m").expect("parse duration");
         assert_eq!(duration, Duration::from_secs(300));
     }
 
     #[test]
     fn test_parse_duration_hours() {
+        let _guard = test_guard!();
         let duration = parse_duration("2h").expect("parse duration");
         assert_eq!(duration, Duration::from_secs(7200));
     }
 
     #[test]
     fn test_parse_duration_days() {
+        let _guard = test_guard!();
         let duration = parse_duration("1d").expect("parse duration");
         assert_eq!(duration, Duration::from_secs(86400));
     }
 
     #[test]
     fn test_parse_duration_seconds() {
+        let _guard = test_guard!();
         let duration = parse_duration("30s").expect("parse duration");
         assert_eq!(duration, Duration::from_secs(30));
     }
 
     #[test]
     fn test_parse_duration_combined() {
+        let _guard = test_guard!();
         let duration = parse_duration("1h 30m").expect("parse duration");
         assert_eq!(duration, Duration::from_secs(5400));
     }
 
     #[test]
     fn test_parse_duration_invalid() {
+        let _guard = test_guard!();
         assert!(parse_duration("invalid").is_none());
         assert!(parse_duration("").is_none());
     }
@@ -642,6 +648,7 @@ mod tests {
 
     #[test]
     fn test_self_test_run_options_default() {
+        let _guard = test_guard!();
         let options = SelfTestRunOptions::default();
         assert_eq!(options.run_type, SelfTestRunType::Manual);
         assert!(options.worker_ids.is_none());
@@ -655,6 +662,7 @@ mod tests {
 
     #[test]
     fn test_self_test_run_options_custom() {
+        let _guard = test_guard!();
         let options = SelfTestRunOptions {
             run_type: SelfTestRunType::Scheduled,
             worker_ids: Some(vec![WorkerId::new("w1")]),
@@ -672,6 +680,7 @@ mod tests {
 
     #[test]
     fn test_self_test_history_new() {
+        let _guard = test_guard!();
         let history = SelfTestHistory::new(10, 50);
         assert_eq!(history.capacity, 10);
         assert_eq!(history.result_capacity, 50);
@@ -680,6 +689,7 @@ mod tests {
 
     #[test]
     fn test_self_test_history_with_persistence() {
+        let _guard = test_guard!();
         let history =
             SelfTestHistory::new(10, 50).with_persistence(PathBuf::from("/tmp/history.jsonl"));
         assert!(history.persistence_path.is_some());
@@ -691,6 +701,7 @@ mod tests {
 
     #[test]
     fn test_self_test_history_next_id() {
+        let _guard = test_guard!();
         let history = SelfTestHistory::new(10, 50);
         assert_eq!(history.next_id(), 1);
         assert_eq!(history.next_id(), 2);
@@ -699,6 +710,7 @@ mod tests {
 
     #[test]
     fn test_self_test_history_push_and_latest_run() {
+        let _guard = test_guard!();
         let history = SelfTestHistory::new(10, 50);
         assert!(history.latest_run().is_none());
 
@@ -721,6 +733,7 @@ mod tests {
 
     #[test]
     fn test_self_test_history_recent_runs() {
+        let _guard = test_guard!();
         let history = SelfTestHistory::new(10, 50);
 
         for i in 1..=5 {
@@ -746,6 +759,7 @@ mod tests {
 
     #[test]
     fn test_self_test_history_capacity_eviction() {
+        let _guard = test_guard!();
         let history = SelfTestHistory::new(3, 50);
 
         for i in 1..=5 {
@@ -770,6 +784,7 @@ mod tests {
 
     #[test]
     fn test_self_test_history_results_for_runs() {
+        let _guard = test_guard!();
         let history = SelfTestHistory::new(10, 50);
 
         history.push_result(SelfTestResultRecord {
@@ -819,6 +834,7 @@ mod tests {
 
     #[test]
     fn test_self_test_history_result_capacity_eviction() {
+        let _guard = test_guard!();
         let history = SelfTestHistory::new(10, 3);
 
         for i in 1..=5 {
@@ -843,6 +859,7 @@ mod tests {
 
     #[test]
     fn test_self_test_run_type_equality() {
+        let _guard = test_guard!();
         assert_eq!(SelfTestRunType::Manual, SelfTestRunType::Manual);
         assert_eq!(SelfTestRunType::Scheduled, SelfTestRunType::Scheduled);
         assert_ne!(SelfTestRunType::Manual, SelfTestRunType::Scheduled);
@@ -850,6 +867,7 @@ mod tests {
 
     #[test]
     fn test_self_test_run_type_serialization() {
+        let _guard = test_guard!();
         let manual = serde_json::to_string(&SelfTestRunType::Manual).unwrap();
         assert_eq!(manual, "\"manual\"");
 
@@ -859,6 +877,7 @@ mod tests {
 
     #[test]
     fn test_self_test_run_type_deserialization() {
+        let _guard = test_guard!();
         let manual: SelfTestRunType = serde_json::from_str("\"manual\"").unwrap();
         assert_eq!(manual, SelfTestRunType::Manual);
 
@@ -870,6 +889,7 @@ mod tests {
 
     #[test]
     fn test_self_test_run_record_serialization() {
+        let _guard = test_guard!();
         let record = SelfTestRunRecord {
             id: 42,
             run_type: SelfTestRunType::Scheduled,
@@ -893,6 +913,7 @@ mod tests {
 
     #[test]
     fn test_self_test_result_record_serialization() {
+        let _guard = test_guard!();
         let record = SelfTestResultRecord {
             run_id: 1,
             worker_id: "test-worker".to_string(),
@@ -915,6 +936,7 @@ mod tests {
 
     #[test]
     fn test_status_next_run_interval() {
+        let _guard = test_guard!();
         let pool = WorkerPool::new();
         let history = Arc::new(SelfTestHistory::new(5, 5));
         let config = SelfTestConfig {
@@ -930,6 +952,7 @@ mod tests {
 
     #[test]
     fn test_status_disabled() {
+        let _guard = test_guard!();
         let pool = WorkerPool::new();
         let history = Arc::new(SelfTestHistory::new(5, 5));
         let config = SelfTestConfig {
@@ -944,6 +967,7 @@ mod tests {
 
     #[test]
     fn test_service_history_clone() {
+        let _guard = test_guard!();
         let pool = WorkerPool::new();
         let history = Arc::new(SelfTestHistory::new(5, 5));
         let config = SelfTestConfig::default();
@@ -959,6 +983,7 @@ mod tests {
 
     #[test]
     fn test_self_test_status_serialization() {
+        let _guard = test_guard!();
         let status = SelfTestStatus {
             enabled: true,
             schedule: Some("0 0 * * *".to_string()),
@@ -977,6 +1002,7 @@ mod tests {
 
     #[test]
     fn test_default_constants() {
+        let _guard = test_guard!();
         assert_eq!(DEFAULT_RUN_CAPACITY, 100);
         assert_eq!(DEFAULT_RESULT_CAPACITY, 500);
         assert_eq!(DEFAULT_SELF_TEST_TIMEOUT_SECS, 300);
