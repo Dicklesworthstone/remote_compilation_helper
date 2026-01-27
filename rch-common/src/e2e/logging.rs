@@ -13,6 +13,54 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
+/// Find the workspace root by walking up from a path until we find a Cargo.toml
+/// that contains `[workspace]` or has a `target/` subdirectory with actual builds.
+fn find_workspace_root(start: &Path) -> Option<PathBuf> {
+    let mut current = start.to_path_buf();
+    // Handle case where start is a file (e.g., manifest path)
+    if current.is_file() {
+        current = current.parent()?.to_path_buf();
+    }
+
+    // First pass: look for workspace root marker
+    let mut candidate = current.clone();
+    loop {
+        let cargo_toml = candidate.join("Cargo.toml");
+        if cargo_toml.exists() {
+            // Check if this is the workspace root by looking for [workspace]
+            if let Ok(contents) = std::fs::read_to_string(&cargo_toml)
+                && contents.contains("[workspace]")
+            {
+                return Some(candidate);
+            }
+            // Also check if target/debug or target/release exists (indicates build root)
+            let target = candidate.join("target");
+            if target.join("debug").exists() || target.join("release").exists() {
+                return Some(candidate);
+            }
+        }
+        // Move up one level
+        match candidate.parent() {
+            Some(parent) if parent != candidate => candidate = parent.to_path_buf(),
+            _ => break,
+        }
+    }
+
+    // Fallback: walk up and find first directory with target/
+    loop {
+        if current.join("target").exists() {
+            return Some(current);
+        }
+        match current.parent() {
+            Some(parent) if parent != current => current = parent.to_path_buf(),
+            _ => break,
+        }
+    }
+
+    // Last resort: just use the start directory
+    start.parent().map(|p| p.to_path_buf())
+}
+
 /// Log severity levels for E2E tests
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -538,12 +586,44 @@ pub struct TestLoggerBuilder {
 }
 
 impl TestLoggerBuilder {
-    /// Create a new builder for the given test name
+    /// Create a new builder for the given test name.
+    ///
+    /// By default, logs are written to `target/test-logs/` relative to the
+    /// workspace root (auto-detected via CARGO_MANIFEST_DIR).
     pub fn new(test_name: &str) -> Self {
+        // Auto-set log directory for standardized JSONL output
+        let config = LoggerConfig {
+            log_dir: Self::auto_detect_log_dir(),
+            ..Default::default()
+        };
         Self {
             test_name: test_name.to_string(),
-            config: LoggerConfig::default(),
+            config,
         }
+    }
+
+    /// Auto-detect the log directory based on cargo workspace.
+    /// Returns `target/test-logs/` relative to workspace root.
+    fn auto_detect_log_dir() -> Option<PathBuf> {
+        // Try CARGO_MANIFEST_DIR first (set during cargo test)
+        if let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") {
+            let manifest_path = PathBuf::from(&manifest_dir);
+            // Walk up to find workspace root (has target/ directory)
+            let workspace_root = find_workspace_root(&manifest_path)?;
+            let log_dir = workspace_root.join("target").join("test-logs");
+            // Create directory if it doesn't exist
+            let _ = fs::create_dir_all(&log_dir);
+            return Some(log_dir);
+        }
+        // Fallback: try current directory
+        if let Ok(cwd) = std::env::current_dir() {
+            let log_dir = cwd.join("target").join("test-logs");
+            if log_dir.parent().map(|p| p.exists()).unwrap_or(false) {
+                let _ = fs::create_dir_all(&log_dir);
+                return Some(log_dir);
+            }
+        }
+        None
     }
 
     /// Set the minimum log level
@@ -717,5 +797,66 @@ mod tests {
         assert!(s.contains("harness"));
         assert!(s.contains("Test message"));
         assert!(s.contains("key=value"));
+    }
+
+    #[test]
+    fn test_auto_detect_log_dir() {
+        // Verify auto-detection finds a log directory
+        let log_dir = TestLoggerBuilder::auto_detect_log_dir();
+        eprintln!("Auto-detected log_dir: {:?}", log_dir);
+
+        // Should find something when running in cargo test context
+        if std::env::var("CARGO_MANIFEST_DIR").is_ok() {
+            assert!(
+                log_dir.is_some(),
+                "Should auto-detect log_dir with CARGO_MANIFEST_DIR set"
+            );
+            let dir = log_dir.unwrap();
+            eprintln!("Log directory: {}", dir.display());
+            assert!(dir.ends_with("test-logs"), "Should end with test-logs");
+        }
+    }
+
+    #[test]
+    fn test_logger_writes_to_file() {
+        // Create logger with explicit temp directory
+        let temp_dir = tempfile::tempdir().expect("temp dir should be creatable");
+        let temp_dir_path = temp_dir.path();
+
+        let logger = TestLoggerBuilder::new("test_file_write")
+            .log_dir(temp_dir_path)
+            .print_realtime(false)
+            .build();
+
+        logger.info("Test file write message");
+        logger.warn("Another message");
+
+        // Drop logger to flush file
+        drop(logger);
+
+        // Check for log file
+        let entries: Vec<_> = fs::read_dir(temp_dir_path)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("test_file_write")
+            })
+            .collect();
+
+        assert!(
+            !entries.is_empty(),
+            "Should have created a log file in {:?}",
+            temp_dir_path
+        );
+
+        // Read and verify contents
+        let log_path = &entries[0].path();
+        let contents = fs::read_to_string(log_path).expect("Should read log file");
+        assert!(
+            contents.contains("Test file write message"),
+            "Log should contain message"
+        );
     }
 }

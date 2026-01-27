@@ -1435,7 +1435,12 @@ async fn handle_selection_response(
         .as_ref()
         .map(|ok| ok.exit_code)
         .unwrap_or(EXIT_BUILD_ERROR);
-    let release_timing = result.as_ref().ok().map(|ok| &ok.timing);
+    // Add total elapsed time to the timing breakdown
+    let release_timing = result.as_ref().ok().map(|ok| {
+        let mut timing = ok.timing.clone();
+        timing.total = Some(remote_elapsed);
+        timing
+    });
     if let Err(e) = release_worker(
         &config.general.socket_path,
         &worker.id,
@@ -1444,7 +1449,7 @@ async fn handle_selection_response(
         Some(release_exit_code),
         None,
         None,
-        release_timing,
+        release_timing.as_ref(),
     )
     .await
     {

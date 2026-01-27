@@ -969,7 +969,8 @@ mod tests {
     // Integration test placeholder - requires actual SSH connection
     // This would be run with a real worker in CI or manual testing
     #[tokio::test]
-    #[ignore = "Requires real SSH connection to worker"]
+    // Ignored: Requires a real SSH connection to a worker.
+    #[ignore]
     async fn test_network_benchmark_real_worker() {
         init_test_logging();
         info!("TEST START: test_network_benchmark_real_worker");

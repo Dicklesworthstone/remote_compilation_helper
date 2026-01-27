@@ -761,7 +761,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Flaky in CI: run-to-run variance is inherently unpredictable on shared infrastructure"]
+    // Ignored: Flaky in CI; run-to-run variance is inherently unpredictable on shared infrastructure.
+    #[ignore]
     fn test_benchmark_stability() {
         init_test_logging();
         info!("TEST START: test_benchmark_stability");

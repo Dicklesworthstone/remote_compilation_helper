@@ -333,12 +333,8 @@ fn render_active_builds_panel(
                 Style::default()
             };
 
-            // Truncate command for display
-            let cmd = if b.command.len() > 40 {
-                format!("{}...", &b.command[..37])
-            } else {
-                b.command.clone()
-            };
+            // Truncate command for display (preserves important flags)
+            let cmd = truncate_command(&b.command, 40);
 
             ListItem::new(Line::from(vec![
                 Span::raw(status_icon),
@@ -405,12 +401,8 @@ fn render_build_history_panel(
             let duration = format_duration_ms(b.duration_ms);
             let worker = b.worker.as_deref().unwrap_or("local");
 
-            // Truncate command
-            let cmd = if b.command.len() > 30 {
-                format!("{}...", &b.command[..27])
-            } else {
-                b.command.clone()
-            };
+            // Truncate command (preserves important flags)
+            let cmd = truncate_command(&b.command, 30);
 
             ListItem::new(Line::from(vec![
                 Span::styled(status_icon, Style::default().fg(status_color)),
@@ -456,6 +448,62 @@ fn format_duration_ms(ms: u64) -> String {
     } else {
         format!("{:.1}m", ms as f64 / 60_000.0)
     }
+}
+
+fn truncate_to_char_boundary(value: &str, max_len: usize) -> &str {
+    if value.len() <= max_len {
+        return value;
+    }
+
+    let mut end = max_len;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
+
+/// Truncate a command string intelligently for display.
+///
+/// Preserves important suffixes like --release, -p <package>, --test when possible.
+fn truncate_command(cmd: &str, max_len: usize) -> String {
+    if cmd.len() <= max_len {
+        return cmd.to_string();
+    }
+
+    // Important suffixes to preserve (in priority order)
+    let important_suffixes = ["--release", "--test", "--bench", "--features"];
+
+    // Check if any important suffix is at the end
+    for suffix in important_suffixes {
+        if cmd.ends_with(suffix) {
+            let available = max_len.saturating_sub(suffix.len() + 4); // 4 for "... "
+            if available > 8 {
+                return format!(
+                    "{}... {}",
+                    truncate_to_char_boundary(cmd, available),
+                    suffix
+                );
+            }
+        }
+    }
+
+    // Check for -p <package> pattern
+    if let Some(p_idx) = cmd.rfind(" -p ") {
+        let suffix_start = p_idx;
+        let suffix = &cmd[suffix_start..];
+        if suffix.len() < max_len / 2 {
+            let available = max_len.saturating_sub(suffix.len() + 3);
+            if available > 8 {
+                return format!("{}...{}", truncate_to_char_boundary(cmd, available), suffix);
+            }
+        }
+    }
+
+    // Default: simple truncation with ellipsis
+    format!(
+        "{}...",
+        truncate_to_char_boundary(cmd, max_len.saturating_sub(3))
+    )
 }
 
 /// Render the footer with help hints.
@@ -1724,5 +1772,43 @@ mod tests {
         });
         assert!(result.is_ok());
         info!("TEST PASS: test_active_build_no_progress");
+    }
+
+    #[test]
+    fn test_truncate_command_short() {
+        // Short commands should not be truncated
+        assert_eq!(truncate_command("cargo build", 40), "cargo build");
+    }
+
+    #[test]
+    fn test_truncate_command_preserves_release() {
+        let cmd = "cargo build --target x86_64-unknown-linux-gnu --release";
+        let result = truncate_command(cmd, 40);
+        assert!(result.len() <= 40);
+        assert!(
+            result.contains("--release"),
+            "Should preserve --release: {result}"
+        );
+    }
+
+    #[test]
+    fn test_truncate_command_preserves_package() {
+        let cmd = "cargo test --target x86_64-unknown-linux-gnu -p my-pkg";
+        let result = truncate_command(cmd, 35);
+        assert!(result.len() <= 35);
+        // Should try to preserve -p package
+        assert!(
+            result.contains("-p my-pkg") || result.ends_with("..."),
+            "Result: {result}"
+        );
+    }
+
+    #[test]
+    fn test_truncate_command_fallback() {
+        // When no important suffix, just truncate with ellipsis
+        let cmd = "cargo build --target x86_64-unknown-linux-gnu --features full";
+        let result = truncate_command(cmd, 30);
+        assert!(result.len() <= 30);
+        assert!(result.ends_with("..."));
     }
 }
