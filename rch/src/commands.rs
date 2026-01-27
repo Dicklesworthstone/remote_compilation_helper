@@ -9865,8 +9865,8 @@ mod tests {
 
     #[test]
     fn parse_f64_decimal() {
-        let result = parse_f64("3.14", "test_key").unwrap();
-        assert!((result - 3.14).abs() < 0.001);
+        let result = parse_f64("2.71", "test_key").unwrap();
+        assert!((result - 2.71).abs() < 0.001);
     }
 
     #[test]

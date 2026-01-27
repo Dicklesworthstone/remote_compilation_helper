@@ -3846,10 +3846,7 @@ mod tests {
         let cli = Cli::try_parse_from(["rch", "cancel", "42", "-f"]).unwrap();
         match cli.command {
             Some(Commands::Cancel {
-                build_id,
-                all,
-                force,
-                yes,
+                build_id, force, ..
             }) => {
                 assert_eq!(build_id, Some(42));
                 assert!(force);
@@ -3902,9 +3899,7 @@ mod tests {
     fn cli_parses_self_test_worker() {
         let cli = Cli::try_parse_from(["rch", "self-test", "--worker", "css"]).unwrap();
         match cli.command {
-            Some(Commands::SelfTest {
-                worker, all, ..
-            }) => {
+            Some(Commands::SelfTest { worker, all, .. }) => {
                 assert_eq!(worker.as_deref(), Some("css"));
                 assert!(!all);
             }
@@ -3972,7 +3967,10 @@ mod tests {
         let cli = Cli::try_parse_from(["rch", "self-test", "history"]).unwrap();
         match cli.command {
             Some(Commands::SelfTest { action, .. }) => {
-                assert!(matches!(action, Some(SelfTestAction::History { limit: 10 })));
+                assert!(matches!(
+                    action,
+                    Some(SelfTestAction::History { limit: 10 })
+                ));
             }
             _ => panic!("Expected self-test history command"),
         }
@@ -3983,7 +3981,10 @@ mod tests {
         let cli = Cli::try_parse_from(["rch", "self-test", "history", "--limit", "20"]).unwrap();
         match cli.command {
             Some(Commands::SelfTest { action, .. }) => {
-                assert!(matches!(action, Some(SelfTestAction::History { limit: 20 })));
+                assert!(matches!(
+                    action,
+                    Some(SelfTestAction::History { limit: 20 })
+                ));
             }
             _ => panic!("Expected self-test history --limit command"),
         }
