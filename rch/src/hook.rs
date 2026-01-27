@@ -919,6 +919,25 @@ async fn process_hook(input: HookInput) -> HookOutput {
         return HookOutput::allow();
     }
 
+    // Per-project overrides (bd-1vzb)
+    //
+    // - force_local: always allow local execution for compilation commands (skip daemon + transfer)
+    // - force_remote: always attempt remote execution when safe (bypass confidence threshold)
+    //
+    // Conflicting flags should be caught by config validation, but handle defensively here.
+    if config.general.force_local && config.general.force_remote {
+        warn!(
+            "Invalid config: both general.force_local and general.force_remote are set; allowing local execution"
+        );
+        reporter.summary("[RCH] local (invalid config: force_local+force_remote)");
+        return HookOutput::allow();
+    }
+    if config.general.force_local {
+        debug!("RCH force_local enabled, allowing local execution");
+        reporter.summary("[RCH] local (force_local)");
+        return HookOutput::allow();
+    }
+
     // Log compilation decision latency (budget: <5ms per AGENTS.md)
     let duration_ms = classification_duration_us as f64 / 1000.0;
     if duration_ms > 5.0 {
@@ -938,7 +957,12 @@ async fn process_hook(input: HookInput) -> HookOutput {
     ));
 
     // Check confidence threshold
-    let confidence_threshold = config.compilation.confidence_threshold;
+    let confidence_threshold = if config.general.force_remote {
+        reporter.verbose("[RCH] force_remote enabled: bypassing confidence threshold");
+        0.0
+    } else {
+        config.compilation.confidence_threshold
+    };
     if classification.confidence < confidence_threshold {
         debug!(
             "Confidence {:.2} below threshold {:.2}, allowing local execution",
@@ -982,6 +1006,7 @@ async fn process_hook(input: HookInput) -> HookOutput {
         toolchain.as_ref(),
         required_runtime,
         classification_duration_us,
+        Some(std::process::id()),
     )
     .await
     {
@@ -1018,6 +1043,7 @@ async fn process_hook(input: HookInput) -> HookOutput {
                     toolchain.as_ref(),
                     required_runtime,
                     classification_duration_us,
+                    Some(std::process::id()),
                 )
                 .await
                 {
@@ -1109,7 +1135,21 @@ async fn handle_selection_response(
     let remote_elapsed = remote_start.elapsed();
 
     // Always release slots after execution
-    if let Err(e) = release_worker(&config.general.socket_path, &worker.id, estimated_cores).await {
+    let release_exit_code = result
+        .as_ref()
+        .map(|ok| ok.exit_code)
+        .unwrap_or(EXIT_BUILD_ERROR);
+    if let Err(e) = release_worker(
+        &config.general.socket_path,
+        &worker.id,
+        estimated_cores,
+        response.build_id,
+        Some(release_exit_code),
+        None,
+        None,
+    )
+    .await
+    {
         warn!("Failed to release worker slots: {}", e);
     }
 
@@ -1221,6 +1261,7 @@ async fn handle_selection_response(
 }
 
 /// Query the daemon for a worker.
+#[allow(clippy::too_many_arguments)] // Command routing query wires many independent fields.
 pub(crate) async fn query_daemon(
     socket_path: &str,
     project: &str,
@@ -1229,6 +1270,7 @@ pub(crate) async fn query_daemon(
     toolchain: Option<&ToolchainInfo>,
     required_runtime: RequiredRuntime,
     classification_duration_us: u64,
+    hook_pid: Option<u32>,
 ) -> anyhow::Result<SelectionResponse> {
     // Check if socket exists
     if !Path::new(socket_path).exists() {
@@ -1267,6 +1309,10 @@ pub(crate) async fn query_daemon(
         classification_duration_us
     ));
 
+    if let Some(pid) = hook_pid {
+        query.push_str(&format!("&hook_pid={}", pid));
+    }
+
     // Send request
     let request = format!("GET /select-worker?{}\n", query);
     writer.write_all(request.as_bytes()).await?;
@@ -1301,6 +1347,10 @@ pub(crate) async fn release_worker(
     socket_path: &str,
     worker_id: &WorkerId,
     slots: u32,
+    build_id: Option<u64>,
+    exit_code: Option<i32>,
+    duration_ms: Option<u64>,
+    bytes_transferred: Option<u64>,
 ) -> anyhow::Result<()> {
     if !Path::new(socket_path).exists() {
         return Ok(()); // Ignore if daemon gone
@@ -1310,11 +1360,24 @@ pub(crate) async fn release_worker(
     let (reader, mut writer) = stream.into_split();
 
     // Send request
-    let request = format!(
-        "POST /release-worker?worker={}&slots={}\n",
+    let mut request = format!(
+        "POST /release-worker?worker={}&slots={}",
         urlencoding_encode(worker_id.as_str()),
         slots
     );
+    if let Some(build_id) = build_id {
+        request.push_str(&format!("&build_id={}", build_id));
+    }
+    if let Some(exit_code) = exit_code {
+        request.push_str(&format!("&exit_code={}", exit_code));
+    }
+    if let Some(duration_ms) = duration_ms {
+        request.push_str(&format!("&duration_ms={}", duration_ms));
+    }
+    if let Some(bytes_transferred) = bytes_transferred {
+        request.push_str(&format!("&bytes_transferred={}", bytes_transferred));
+    }
+    request.push('\n');
     writer.write_all(request.as_bytes()).await?;
     writer.flush().await?;
 
@@ -2372,6 +2435,7 @@ mod tests {
             None,
             RequiredRuntime::None,
             100, // 100µs classification time
+            None,
         )
         .await;
         assert!(result.is_err());
@@ -2450,6 +2514,7 @@ mod tests {
             None,
             RequiredRuntime::None,
             100,
+            None,
         )
         .await;
 
@@ -2517,6 +2582,7 @@ mod tests {
             None,
             RequiredRuntime::None,
             150, // 150µs classification time
+            None,
         )
         .await;
         daemon_handle.await.expect("Daemon task");
@@ -2624,6 +2690,132 @@ mod tests {
         let rsync_logs = mock::global_rsync_invocations_snapshot();
         let ssh_logs = mock::global_ssh_invocations_snapshot();
 
+        assert!(rsync_logs.iter().any(|i| i.phase == Phase::Sync));
+        assert!(rsync_logs.iter().any(|i| i.phase == Phase::Artifacts));
+        assert!(ssh_logs.iter().any(|i| i.phase == Phase::Execute));
+    }
+
+    #[tokio::test]
+    async fn test_force_local_allows_even_when_remote_available() {
+        let _lock = test_lock().lock().await;
+        let socket_path = format!(
+            "/tmp/rch_test_hook_force_local_{}_{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+
+        let _overrides = TestOverridesGuard::set(
+            &socket_path,
+            MockConfig::default(),
+            MockRsyncConfig::success(),
+        );
+        mock::clear_global_invocations();
+
+        let mut config = rch_common::RchConfig::default();
+        config.general.socket_path = socket_path.to_string();
+        config.general.force_local = true;
+        crate::config::set_test_config_override(Some(config));
+
+        let response = SelectionResponse {
+            worker: Some(SelectedWorker {
+                id: rch_common::WorkerId::new("mock-worker"),
+                host: "mock.host.local".to_string(),
+                user: "mockuser".to_string(),
+                identity_file: "~/.ssh/mock_key".to_string(),
+                slots_available: 8,
+                speed_score: 90.0,
+            }),
+            reason: SelectionReason::Success,
+            build_id: None,
+        };
+        spawn_mock_daemon(&socket_path, response).await;
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
+
+        let input = HookInput {
+            tool_name: "Bash".to_string(),
+            tool_input: ToolInput {
+                command: "cargo build".to_string(),
+                description: None,
+            },
+            session_id: None,
+        };
+
+        let output = process_hook(input).await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        assert!(output.is_allow());
+
+        let rsync_logs = mock::global_rsync_invocations_snapshot();
+        let ssh_logs = mock::global_ssh_invocations_snapshot();
+        assert!(rsync_logs.is_empty());
+        assert!(ssh_logs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_force_remote_bypasses_confidence_threshold() {
+        let _lock = test_lock().lock().await;
+        let socket_path = format!(
+            "/tmp/rch_test_hook_force_remote_threshold_{}_{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+
+        let _overrides = TestOverridesGuard::set(
+            &socket_path,
+            MockConfig::default(),
+            MockRsyncConfig::success(),
+        );
+        mock::clear_global_invocations();
+
+        let classification = classify_command("cargo build");
+        assert!(classification.is_compilation);
+        let high_threshold = (classification.confidence + 0.01).min(1.0);
+
+        let mut config = rch_common::RchConfig::default();
+        config.general.socket_path = socket_path.to_string();
+        config.general.force_remote = true;
+        config.compilation.confidence_threshold = high_threshold;
+        crate::config::set_test_config_override(Some(config));
+
+        let response = SelectionResponse {
+            worker: Some(SelectedWorker {
+                id: rch_common::WorkerId::new("mock-worker"),
+                host: "mock.host.local".to_string(),
+                user: "mockuser".to_string(),
+                identity_file: "~/.ssh/mock_key".to_string(),
+                slots_available: 8,
+                speed_score: 90.0,
+            }),
+            reason: SelectionReason::Success,
+            build_id: None,
+        };
+        spawn_mock_daemon(&socket_path, response).await;
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
+
+        let input = HookInput {
+            tool_name: "Bash".to_string(),
+            tool_input: ToolInput {
+                command: "cargo build".to_string(),
+                description: None,
+            },
+            session_id: None,
+        };
+
+        let output = process_hook(input).await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        assert!(!output.is_allow());
+
+        let rsync_logs = mock::global_rsync_invocations_snapshot();
+        let ssh_logs = mock::global_ssh_invocations_snapshot();
         assert!(rsync_logs.iter().any(|i| i.phase == Phase::Sync));
         assert!(rsync_logs.iter().any(|i| i.phase == Phase::Artifacts));
         assert!(ssh_logs.iter().any(|i| i.phase == Phase::Execute));

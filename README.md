@@ -468,6 +468,8 @@ enabled = false
 # Or customize behavior
 [general]
 enabled = true
+force_local = false           # Never offload for this project (mutually exclusive with force_remote)
+force_remote = false          # Always attempt offload for this project (still respects safety gates)
 preferred_workers = ["css"]     # Always try these first
 
 [transfer]

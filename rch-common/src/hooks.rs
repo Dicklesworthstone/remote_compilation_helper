@@ -76,6 +76,17 @@ fn check_claude_code_hook_installed() -> Result<bool> {
         && let Some(arr) = pre_tool_use.as_array()
     {
         for hook in arr {
+            // Check new format: {"matcher": "Bash", "hooks": [{"type": "command", "command": "rch"}]}
+            if let Some(inner_hooks) = hook.get("hooks").and_then(|h| h.as_array()) {
+                for inner in inner_hooks {
+                    if let Some(cmd) = inner.get("command").and_then(|c| c.as_str())
+                        && cmd.contains("rch")
+                    {
+                        return Ok(true);
+                    }
+                }
+            }
+            // Check old format: {"command": "rch"} (for backwards compatibility)
             if let Some(cmd) = hook.get("command").and_then(|c| c.as_str())
                 && cmd.contains("rch")
             {
@@ -213,10 +224,15 @@ pub fn verify_and_install_claude_code_hook() -> Result<HookResult> {
         // Continue anyway - the backup is nice to have but not critical
     }
 
-    // Add the hook
+    // Add the hook using the new Claude Code hooks format
     let hook_entry = serde_json::json!({
-        "command": "rch",
-        "description": "Remote Compilation Helper - routes builds to remote workers"
+        "matcher": "Bash",
+        "hooks": [
+            {
+                "type": "command",
+                "command": "rch"
+            }
+        ]
     });
 
     let hooks = settings
@@ -254,6 +270,17 @@ fn settings_has_rch_hook(settings: &Value) -> bool {
         && let Some(arr) = pre_tool_use.as_array()
     {
         for hook in arr {
+            // Check new format: {"matcher": "Bash", "hooks": [{"type": "command", "command": "rch"}]}
+            if let Some(inner_hooks) = hook.get("hooks").and_then(|h| h.as_array()) {
+                for inner in inner_hooks {
+                    if let Some(cmd) = inner.get("command").and_then(|c| c.as_str())
+                        && cmd.contains("rch")
+                    {
+                        return true;
+                    }
+                }
+            }
+            // Check old format: {"command": "rch"} (for backwards compatibility)
             if let Some(cmd) = hook.get("command").and_then(|c| c.as_str())
                 && cmd.contains("rch")
             {
@@ -274,8 +301,13 @@ fn settings_has_rch_hook(settings: &Value) -> bool {
 #[allow(dead_code)]
 fn add_rch_hook_to_settings(mut settings: Value) -> Result<Value> {
     let hook_entry = serde_json::json!({
-        "command": "rch",
-        "description": "Remote Compilation Helper - routes builds to remote workers"
+        "matcher": "Bash",
+        "hooks": [
+            {
+                "type": "command",
+                "command": "rch"
+            }
+        ]
     });
 
     let hooks = settings
@@ -428,6 +460,23 @@ mod tests {
 
     #[test]
     fn test_settings_has_rch_hook_with_object_hook() {
+        // New format with nested hooks array
+        let settings = json!({
+            "hooks": {
+                "PreToolUse": [
+                    {
+                        "matcher": "Bash",
+                        "hooks": [{"type": "command", "command": "rch"}]
+                    }
+                ]
+            }
+        });
+        assert!(settings_has_rch_hook(&settings));
+    }
+
+    #[test]
+    fn test_settings_has_rch_hook_with_old_format() {
+        // Old format for backwards compatibility
         let settings = json!({
             "hooks": {
                 "PreToolUse": [
@@ -450,11 +499,14 @@ mod tests {
 
     #[test]
     fn test_settings_has_rch_hook_partial_match() {
-        // Test that a command containing "rch" is detected
+        // Test that a command containing "rch" is detected (new format)
         let settings = json!({
             "hooks": {
                 "PreToolUse": [
-                    {"command": "/usr/local/bin/rch", "description": "Full path"}
+                    {
+                        "matcher": "Bash",
+                        "hooks": [{"type": "command", "command": "/usr/local/bin/rch"}]
+                    }
                 ]
             }
         });
@@ -508,8 +560,8 @@ mod tests {
         let settings = json!({
             "hooks": {
                 "PreToolUse": [
-                    {"command": "dcg", "description": "DCG"},
-                    {"command": "rch", "description": "RCH"}
+                    {"matcher": "Bash", "hooks": [{"type": "command", "command": "dcg"}]},
+                    {"matcher": "Bash", "hooks": [{"type": "command", "command": "rch"}]}
                 ]
             }
         });
@@ -529,7 +581,10 @@ mod tests {
 
         let hooks = result["hooks"]["PreToolUse"].as_array().unwrap();
         assert_eq!(hooks.len(), 1);
-        assert_eq!(hooks[0]["command"], "rch");
+        // New format: check nested hooks array
+        assert_eq!(hooks[0]["matcher"], "Bash");
+        let inner_hooks = hooks[0]["hooks"].as_array().unwrap();
+        assert_eq!(inner_hooks[0]["command"], "rch");
     }
 
     #[test]
@@ -559,10 +614,10 @@ mod tests {
         let hooks = result["hooks"]["PreToolUse"].as_array().unwrap();
         assert_eq!(hooks.len(), 2);
 
-        // Both hooks should be present
-        let commands: Vec<&str> = hooks.iter().filter_map(|h| h["command"].as_str()).collect();
-        assert!(commands.contains(&"dcg"));
-        assert!(commands.contains(&"rch"));
+        // Old format dcg hook should be preserved
+        assert!(hooks.iter().any(|h| h["command"].as_str() == Some("dcg")));
+        // New format rch hook should be added
+        assert!(settings_has_rch_hook(&result));
     }
 
     #[test]
@@ -666,11 +721,14 @@ mod tests {
         let env = MockClaudeEnv::new();
         env.create_claude_dir();
 
-        // Start with RCH already installed
+        // Start with RCH already installed (new format)
         let settings = json!({
             "hooks": {
                 "PreToolUse": [
-                    {"command": "rch", "description": "Already here"}
+                    {
+                        "matcher": "Bash",
+                        "hooks": [{"type": "command", "command": "rch"}]
+                    }
                 ]
             }
         });
@@ -728,10 +786,11 @@ mod tests {
         assert_eq!(final_settings["enabled"], true);
         assert_eq!(final_settings["customPrompts"].as_array().unwrap().len(), 2);
 
-        // DCG hook preserved
+        // DCG hook preserved (old format)
         let pre_hooks = final_settings["hooks"]["PreToolUse"].as_array().unwrap();
         assert!(pre_hooks.iter().any(|h| h["command"] == "dcg"));
-        assert!(pre_hooks.iter().any(|h| h["command"] == "rch"));
+        // RCH hook added (new format)
+        assert!(settings_has_rch_hook(&final_settings));
 
         // PostToolUse preserved
         let post_hooks = final_settings["hooks"]["PostToolUse"].as_array().unwrap();

@@ -456,6 +456,8 @@ pub struct ConfigExportResponse {
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct ConfigGeneralSection {
     pub enabled: bool,
+    pub force_local: bool,
+    pub force_remote: bool,
     pub log_level: String,
     pub socket_path: String,
 }
@@ -4126,6 +4128,8 @@ pub fn config_show(show_sources: bool, ctx: &OutputContext) -> Result<()> {
         let response = ConfigShowResponse {
             general: ConfigGeneralSection {
                 enabled: config.general.enabled,
+                force_local: config.general.force_local,
+                force_remote: config.general.force_remote,
                 log_level: config.general.log_level.clone(),
                 socket_path: config.general.socket_path.clone(),
             },
@@ -4186,6 +4190,24 @@ pub fn config_show(show_sources: bool, ctx: &OutputContext) -> Result<()> {
         format_with_source(
             "general.enabled",
             &style.value(&config.general.enabled.to_string()),
+            &value_sources
+        )
+    );
+    println!(
+        "  {} = {}",
+        style.key("force_local"),
+        format_with_source(
+            "general.force_local",
+            &style.value(&config.general.force_local.to_string()),
+            &value_sources
+        )
+    );
+    println!(
+        "  {} = {}",
+        style.key("force_remote"),
+        format_with_source(
+            "general.force_remote",
+            &style.value(&config.general.force_remote.to_string()),
             &value_sources
         )
     );
@@ -4415,6 +4437,18 @@ fn collect_value_sources(
         &mut values,
         "general.enabled",
         config.general.enabled.to_string(),
+        sources,
+    );
+    push_value_source(
+        &mut values,
+        "general.force_local",
+        config.general.force_local.to_string(),
+        sources,
+    );
+    push_value_source(
+        &mut values,
+        "general.force_remote",
+        config.general.force_remote.to_string(),
         sources,
     );
     push_value_source(
@@ -5311,6 +5345,12 @@ fn config_set_at(config_path: &Path, key: &str, value: &str, ctx: &OutputContext
         "general.enabled" => {
             config.general.enabled = parse_bool(value, key)?;
         }
+        "general.force_local" => {
+            config.general.force_local = parse_bool(value, key)?;
+        }
+        "general.force_remote" => {
+            config.general.force_remote = parse_bool(value, key)?;
+        }
         "general.log_level" => {
             config.general.log_level = value.trim().trim_matches(|c| c == '"').to_string();
         }
@@ -5354,10 +5394,14 @@ fn config_set_at(config_path: &Path, key: &str, value: &str, ctx: &OutputContext
         }
         _ => {
             bail!(
-                "Unknown config key: {}. Supported keys: general.enabled, general.log_level, general.socket_path, compilation.confidence_threshold, compilation.min_local_time_ms, transfer.compression_level, transfer.exclude_patterns, environment.allowlist, output.visibility, output.first_run_complete, first_run_complete",
+                "Unknown config key: {}. Supported keys: general.enabled, general.force_local, general.force_remote, general.log_level, general.socket_path, compilation.confidence_threshold, compilation.min_local_time_ms, transfer.compression_level, transfer.exclude_patterns, environment.allowlist, output.visibility, output.first_run_complete, first_run_complete",
                 key
             );
         }
+    }
+
+    if config.general.force_local && config.general.force_remote {
+        bail!("general.force_local and general.force_remote cannot both be true");
     }
 
     let contents = toml::to_string_pretty(&config)?;
@@ -6232,13 +6276,22 @@ pub async fn diagnose(command: &str, ctx: &OutputContext) -> Result<()> {
             toolchain.as_ref(),
             required_runtime,
             0,
+            None,
         )
         .await
         {
             Ok(response) => {
                 if let Some(worker) = response.worker.as_ref()
-                    && let Err(err) =
-                        release_worker(&socket_path, &worker.id, estimated_cores).await
+                    && let Err(err) = release_worker(
+                        &socket_path,
+                        &worker.id,
+                        estimated_cores,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
                 {
                     debug!("Failed to release worker slots: {}", err);
                 }
@@ -8242,6 +8295,8 @@ mod tests {
         let response = ConfigShowResponse {
             general: ConfigGeneralSection {
                 enabled: true,
+                force_local: false,
+                force_remote: false,
                 log_level: "info".to_string(),
                 socket_path: "/tmp/rch.sock".to_string(),
             },

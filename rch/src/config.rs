@@ -126,6 +126,8 @@ struct PartialRchConfig {
 #[derive(Debug, Default, Deserialize)]
 struct PartialGeneralConfig {
     enabled: Option<bool>,
+    force_local: Option<bool>,
+    force_remote: Option<bool>,
     log_level: Option<String>,
     socket_path: Option<String>,
 }
@@ -338,6 +340,16 @@ pub fn validate_rch_config_file(path: &Path) -> FileValidation {
         }
     }
 
+    if config.general.force_local && config.general.force_remote {
+        validation
+            .error("general.force_local and general.force_remote cannot both be true".to_string());
+    }
+    if !config.general.enabled && (config.general.force_local || config.general.force_remote) {
+        validation.warn(
+            "general.force_local/force_remote has no effect when general.enabled=false".to_string(),
+        );
+    }
+
     if !is_valid_log_level(&config.general.log_level) {
         validation.error(
             "general.log_level must be one of: trace, debug, info, warn, error, off".to_string(),
@@ -517,6 +529,8 @@ fn default_sources_map() -> ConfigSourceMap {
     let mut sources = HashMap::new();
     for key in [
         "general.enabled",
+        "general.force_local",
+        "general.force_remote",
         "general.log_level",
         "general.socket_path",
         "compilation.confidence_threshold",
@@ -567,6 +581,18 @@ fn apply_layer(
     {
         config.general.enabled = enabled;
         set_source(sources, "general.enabled", source.clone());
+    }
+    if let Some(force_local) = layer.general.force_local
+        && force_local != defaults.general.force_local
+    {
+        config.general.force_local = force_local;
+        set_source(sources, "general.force_local", source.clone());
+    }
+    if let Some(force_remote) = layer.general.force_remote
+        && force_remote != defaults.general.force_remote
+    {
+        config.general.force_remote = force_remote;
+        set_source(sources, "general.force_remote", source.clone());
     }
     if let Some(log_level) = layer.general.log_level.as_ref()
         && log_level != &defaults.general.log_level
@@ -840,6 +866,12 @@ fn merge_general(
     // Only override if overlay differs from default
     if overlay.enabled != default.enabled {
         base.enabled = overlay.enabled;
+    }
+    if overlay.force_local != default.force_local {
+        base.force_local = overlay.force_local;
+    }
+    if overlay.force_remote != default.force_remote {
+        base.force_remote = overlay.force_remote;
     }
     if overlay.log_level != default.log_level {
         base.log_level.clone_from(&overlay.log_level);
@@ -1550,6 +1582,26 @@ mod tests {
         );
         assert!(result.errors.is_empty());
         info!("TEST PASS: test_validate_valid_config");
+    }
+
+    #[test]
+    fn test_validate_force_override_conflict() {
+        info!("TEST START: test_validate_force_override_conflict");
+        let mut file = NamedTempFile::new().expect("create temp file");
+        std::io::Write::write_all(
+            file.as_file_mut(),
+            b"[general]\nforce_local = true\nforce_remote = true\n",
+        )
+        .expect("write config");
+        let result = validate_rch_config_file(file.path());
+        info!("RESULT: errors={:?}", result.errors);
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.contains("general.force_local") && e.contains("general.force_remote"))
+        );
+        info!("TEST PASS: test_validate_force_override_conflict");
     }
 
     #[test]

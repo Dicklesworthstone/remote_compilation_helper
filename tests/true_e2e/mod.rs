@@ -36,6 +36,7 @@
 
 pub mod artifact_tests;
 pub mod build_rs_fixture_tests;
+pub mod c_cpp_compiler_tests;
 pub mod cargo_bench_tests;
 pub mod cargo_build_tests;
 pub mod cargo_check_clippy_tests;

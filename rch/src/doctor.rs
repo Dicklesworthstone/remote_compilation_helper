@@ -2478,8 +2478,7 @@ mod tests {
         let socket_path = tmp.path().join("daemon.sock");
         let fake_rchd = tmp.path().join("rchd");
 
-        let script = format!(
-            "#!/usr/bin/env sh\n\
+        let script = "#!/usr/bin/env sh\n\
 sock=\"\"\n\
 while [ \"$#\" -gt 0 ]; do\n\
   if [ \"$1\" = \"-s\" ] || [ \"$1\" = \"--socket\" ]; then\n\
@@ -2491,7 +2490,7 @@ done\n\
 [ -n \"$sock\" ] || exit 1\n\
 : > \"$sock\"\n\
 exit 0\n"
-        );
+            .to_string();
         std::fs::write(&fake_rchd, script).unwrap();
         let mut perms = std::fs::metadata(&fake_rchd).unwrap().permissions();
         perms.set_mode(0o755);

@@ -356,6 +356,17 @@ pub struct ReleaseRequest {
     /// Optional build ID to mark complete.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_id: Option<u64>,
+    /// Optional exit code for the build (used to finalize active build tracking).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// Optional total duration in milliseconds (pipeline or execution).
+    ///
+    /// If omitted, the daemon will compute duration from the active build's start time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    /// Optional bytes transferred during the pipeline (upload + artifact download).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes_transferred: Option<u64>,
 }
 
 /// Configuration for a remote worker.
@@ -469,6 +480,17 @@ pub struct GeneralConfig {
     /// Whether RCH is enabled.
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Force local execution for this project (never offload), even if the command is classified.
+    ///
+    /// Intended for sensitive projects or cases where local state must be authoritative.
+    #[serde(default)]
+    pub force_local: bool,
+    /// Force remote execution for this project (always attempt offload) when safe.
+    ///
+    /// This bypasses heuristic gating (e.g. confidence threshold overrides) but still respects
+    /// structural safety checks and NEVER_INTERCEPT patterns.
+    #[serde(default)]
+    pub force_remote: bool,
     /// Log level (trace, debug, info, warn, error).
     #[serde(default = "default_log_level")]
     pub log_level: String,
@@ -489,6 +511,8 @@ impl Default for GeneralConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            force_local: false,
+            force_remote: false,
             log_level: "info".to_string(),
             socket_path: default_socket_path(),
         }

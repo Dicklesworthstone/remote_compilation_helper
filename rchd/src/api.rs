@@ -11,7 +11,6 @@ use crate::health::{HealthConfig, probe_worker_capabilities};
 use crate::metrics;
 use crate::metrics::budget::{self, BudgetStatusResponse};
 use crate::telemetry::collect_telemetry_from_worker;
-use crate::workers::WorkerPool;
 use anyhow::{Result, anyhow};
 use chrono::{Duration as ChronoDuration, Utc};
 use rch_common::{
@@ -438,7 +437,7 @@ pub async fn handle_connection(
         }
         Ok(ApiRequest::ReleaseWorker(request)) => {
             metrics::inc_requests("release-worker");
-            handle_release_worker(&ctx.pool, request).await?;
+            handle_release_worker(&ctx, request).await?;
             ("{}".to_string(), "application/json")
         }
         Ok(ApiRequest::RecordBuild {
@@ -991,6 +990,9 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
         let mut worker_id = None;
         let mut slots = None;
         let mut build_id = None;
+        let mut exit_code = None;
+        let mut duration_ms = None;
+        let mut bytes_transferred = None;
 
         for param in query.split('&') {
             if param.is_empty() {
@@ -1004,6 +1006,9 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
                 "worker" => worker_id = Some(urlencoding_decode(value)),
                 "slots" => slots = value.parse().ok(),
                 "build_id" => build_id = value.parse().ok(),
+                "exit_code" => exit_code = value.parse().ok(),
+                "duration_ms" => duration_ms = value.parse().ok(),
+                "bytes_transferred" => bytes_transferred = value.parse().ok(),
                 _ => {} // Ignore unknown parameters
             }
         }
@@ -1015,6 +1020,9 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
             worker_id: rch_common::WorkerId::new(worker_id),
             slots,
             build_id,
+            exit_code,
+            duration_ms,
+            bytes_transferred,
         }));
     }
 
@@ -1188,6 +1196,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
     let mut toolchain = None;
     let mut required_runtime = RequiredRuntime::default();
     let mut classification_duration_us = None;
+    let mut hook_pid = None;
 
     for param in query.split('&') {
         if param.is_empty() {
@@ -1218,6 +1227,9 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
                 // Classification latency from hook (for AGENTS.md compliance tracking)
                 classification_duration_us = value.parse().ok();
             }
+            "hook_pid" => {
+                hook_pid = value.parse().ok();
+            }
             _ => {} // Ignore unknown parameters
         }
     }
@@ -1233,7 +1245,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
         toolchain,
         required_runtime,
         classification_duration_us,
-        hook_pid: None,
+        hook_pid,
     }))
 }
 
@@ -1499,13 +1511,20 @@ async fn handle_workers_capabilities(
             worker.set_capabilities(capabilities).await;
         }
 
-        let config = worker.config.read().await;
+        let (id, host, user) = {
+            let config = worker.config.read().await;
+            (
+                config.id.to_string(),
+                config.host.clone(),
+                config.user.clone(),
+            )
+        };
         let capabilities = worker.capabilities().await;
 
         entries.push(WorkerCapabilitiesInfo {
-            id: config.id.to_string(),
-            host: config.host.clone(),
-            user: config.user.clone(),
+            id,
+            host,
+            user,
             capabilities,
         });
     }
@@ -1652,18 +1671,49 @@ async fn handle_select_worker(
 
         // Reserve the slots
         if worker.reserve_slots(request.estimated_cores).await {
-            let config = worker.config.read().await;
+            let (id, host, user, identity_file) = {
+                let config = worker.config.read().await;
+                (
+                    config.id.clone(),
+                    config.host.clone(),
+                    config.user.clone(),
+                    config.identity_file.clone(),
+                )
+            };
+            let build_id = if let Some(hook_pid) = request.hook_pid.filter(|pid| *pid > 0) {
+                let command = request
+                    .command
+                    .clone()
+                    .unwrap_or_else(|| "<unknown>".to_string());
+                let state = ctx.history.start_active_build(
+                    request.project.clone(),
+                    id.as_str().to_string(),
+                    command,
+                    hook_pid,
+                    request.estimated_cores,
+                    rch_common::BuildLocation::Remote,
+                );
+                if !cfg!(test) {
+                    metrics::inc_active_builds("remote");
+                }
+                Some(state.id)
+            } else {
+                None
+            };
+
+            let slots_available = worker.available_slots().await;
+            let speed_score = worker.get_speed_score().await;
             return Ok(SelectionResponse {
                 worker: Some(SelectedWorker {
-                    id: config.id.clone(),
-                    host: config.host.clone(),
-                    user: config.user.clone(),
-                    identity_file: config.identity_file.clone(),
-                    slots_available: worker.available_slots().await,
-                    speed_score: worker.get_speed_score().await,
+                    id,
+                    host,
+                    user,
+                    identity_file,
+                    slots_available,
+                    speed_score,
                 }),
                 reason: SelectionReason::Success,
-                build_id: None,
+                build_id,
             });
         }
 
@@ -1688,12 +1738,29 @@ async fn handle_select_worker(
 }
 
 /// Handle a release-worker request.
-async fn handle_release_worker(pool: &WorkerPool, request: ReleaseRequest) -> Result<()> {
+async fn handle_release_worker(ctx: &DaemonContext, request: ReleaseRequest) -> Result<()> {
     debug!(
         "Releasing {} slots on worker {}",
         request.slots, request.worker_id
     );
-    pool.release_slots(&request.worker_id, request.slots).await;
+    ctx.pool
+        .release_slots(&request.worker_id, request.slots)
+        .await;
+
+    if let Some(build_id) = request.build_id {
+        let exit_code = request.exit_code.unwrap_or(0);
+        let record = ctx.history.finish_active_build(
+            build_id,
+            exit_code,
+            request.duration_ms,
+            request.bytes_transferred,
+        );
+        if record.is_some() && !cfg!(test) {
+            metrics::dec_active_builds("remote");
+            let outcome = if exit_code == 0 { "success" } else { "failure" };
+            metrics::inc_build_total(outcome, "remote");
+        }
+    }
     Ok(())
 }
 
@@ -1824,7 +1891,10 @@ async fn handle_cancel_build(
     }
 
     // Cancel the build in history (marks as cancelled with exit code 130)
-    ctx.history.cancel_active_build(build_id, None);
+    if ctx.history.cancel_active_build(build_id, None).is_some() && !cfg!(test) {
+        metrics::dec_active_builds("remote");
+        metrics::inc_build_total("cancelled", "remote");
+    }
 
     // Release worker slots
     if let Some(worker) = ctx.pool.get(&WorkerId::new(&worker_id)).await {
@@ -1873,7 +1943,10 @@ async fn handle_cancel_all_builds(ctx: &DaemonContext, force: bool) -> CancelAll
         }
 
         // Cancel in history
-        ctx.history.cancel_active_build(build_id, None);
+        if ctx.history.cancel_active_build(build_id, None).is_some() && !cfg!(test) {
+            metrics::dec_active_builds("remote");
+            metrics::inc_build_total("cancelled", "remote");
+        }
 
         // Release worker slots
         if let Some(worker) = ctx.pool.get(&WorkerId::new(&worker_id)).await {
@@ -2034,16 +2107,24 @@ async fn handle_status(ctx: &DaemonContext) -> Result<DaemonFullStatus> {
 
     for worker in &workers {
         let status = worker.status().await;
-        let config = worker.config.read().await;
+        let (worker_id, host, user, total_slots) = {
+            let config = worker.config.read().await;
+            (
+                config.id.to_string(),
+                config.host.clone(),
+                config.user.clone(),
+                config.total_slots,
+            )
+        };
         let available_slots = worker.available_slots().await;
-        let used_slots = config.total_slots - available_slots;
+        let used_slots = total_slots - available_slots;
 
         // Count healthy workers
         if status == WorkerStatus::Healthy {
             workers_healthy += 1;
         }
 
-        slots_total = slots_total.saturating_add(config.total_slots);
+        slots_total = slots_total.saturating_add(total_slots);
         slots_available = slots_available.saturating_add(available_slots);
 
         // Build worker status info
@@ -2069,13 +2150,13 @@ async fn handle_status(ctx: &DaemonContext) -> Result<DaemonFullStatus> {
         let recovery_in_secs = circuit_stats.recovery_remaining_secs(&circuit_config);
 
         worker_infos.push(WorkerStatusInfo {
-            id: config.id.to_string(),
-            host: config.host.clone(),
-            user: config.user.clone(),
+            id: worker_id.clone(),
+            host,
+            user,
             status: status_str.to_string(),
             circuit_state: circuit_str.to_string(),
             used_slots,
-            total_slots: config.total_slots,
+            total_slots,
             speed_score: worker.get_speed_score().await,
             last_error: worker.last_error().await,
             consecutive_failures: circuit_stats.consecutive_failures(),
@@ -2087,19 +2168,19 @@ async fn handle_status(ctx: &DaemonContext) -> Result<DaemonFullStatus> {
         if circuit_state == CircuitState::Open {
             issues.push(Issue {
                 severity: "error".to_string(),
-                summary: format!("Circuit open for worker '{}'", config.id),
-                remediation: Some(format!("rch workers probe {} --force", config.id)),
+                summary: format!("Circuit open for worker '{}'", worker_id),
+                remediation: Some(format!("rch workers probe {} --force", worker_id)),
             });
         } else if status == WorkerStatus::Unreachable {
             issues.push(Issue {
                 severity: "error".to_string(),
-                summary: format!("Worker '{}' is unreachable", config.id),
-                remediation: Some(format!("rch workers probe {}", config.id)),
+                summary: format!("Worker '{}' is unreachable", worker_id),
+                remediation: Some(format!("rch workers probe {}", worker_id)),
             });
         } else if status == WorkerStatus::Degraded {
             issues.push(Issue {
                 severity: "warning".to_string(),
-                summary: format!("Worker '{}' is degraded (slow response)", config.id),
+                summary: format!("Worker '{}' is degraded (slow response)", worker_id),
                 remediation: None,
             });
         }
@@ -2169,6 +2250,7 @@ mod tests {
     use crate::selection::WorkerSelector;
     use crate::self_test::{SelfTestHistory, SelfTestService};
     use crate::telemetry::TelemetryStore;
+    use crate::workers::WorkerPool;
     use crate::{benchmark_queue::BenchmarkQueue, events::EventBus};
     use chrono::Duration as ChronoDuration;
     use rch_common::SelfTestConfig;
@@ -2629,6 +2711,59 @@ mod tests {
         assert_eq!(worker.id.as_str(), "worker1");
         // Should have reserved 2 slots
         assert_eq!(worker.slots_available, 6);
+    }
+
+    #[tokio::test]
+    async fn test_handle_select_worker_tracks_active_build_when_hook_pid_present() {
+        let pool = WorkerPool::new();
+        pool.add_worker(make_test_worker("worker1", 8)).await;
+
+        let ctx = make_test_context(pool);
+        let request = SelectionRequest {
+            project: "test-project".to_string(),
+            command: Some("cargo build --release".to_string()),
+            estimated_cores: 2,
+            preferred_workers: vec![],
+            toolchain: None,
+            required_runtime: RequiredRuntime::default(),
+            classification_duration_us: None,
+            hook_pid: Some(4242),
+        };
+
+        let response = handle_select_worker(&ctx, request).await.unwrap();
+        assert_eq!(response.reason, SelectionReason::Success);
+        let build_id = response.build_id.expect("build_id should be assigned");
+
+        let active = ctx.history.active_build(build_id).expect("active build");
+        assert_eq!(active.project_id, "test-project");
+        assert_eq!(active.worker_id, "worker1");
+        assert_eq!(active.command, "cargo build --release");
+        assert_eq!(active.hook_pid, 4242);
+        assert_eq!(active.slots, 2);
+
+        // Release should finalize the active build and move it into history
+        handle_release_worker(
+            &ctx,
+            ReleaseRequest {
+                worker_id: WorkerId::new("worker1"),
+                slots: 2,
+                build_id: Some(build_id),
+                exit_code: Some(0),
+                duration_ms: None,
+                bytes_transferred: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(ctx.history.active_build(build_id).is_none());
+        let recent = ctx.history.recent(10);
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].id, build_id);
+        assert_eq!(recent[0].project_id, "test-project");
+        assert_eq!(recent[0].worker_id.as_deref(), Some("worker1"));
+        assert_eq!(recent[0].exit_code, 0);
+        assert_eq!(recent[0].location, rch_common::BuildLocation::Remote);
     }
 
     #[tokio::test]

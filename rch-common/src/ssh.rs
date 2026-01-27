@@ -21,6 +21,54 @@ const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Default command execution timeout.
 const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(300);
 
+// ============================================================================
+// Retry Classification
+// ============================================================================
+
+/// True if an SSH/transport error looks retryable (transient network / transport).
+///
+/// This is intentionally conservative: false negatives are acceptable (fail-open
+/// to local execution), false positives can cause needless retries.
+pub fn is_retryable_transport_error(err: &anyhow::Error) -> bool {
+    let mut parts = Vec::new();
+    for cause in err.chain() {
+        parts.push(cause.to_string());
+    }
+    is_retryable_transport_error_text(&parts.join(": "))
+}
+
+/// Message-only variant of [`is_retryable_transport_error`] (useful for tests).
+pub fn is_retryable_transport_error_text(message: &str) -> bool {
+    let message = message.to_lowercase();
+
+    // Fail-fast: non-retryable authentication / host trust issues.
+    if message.contains("permission denied")
+        || message.contains("host key verification failed")
+        || message.contains("could not resolve hostname")
+        || message.contains("no such file or directory")
+        || message.contains("identity file")
+        || message.contains("keyfile")
+        || message.contains("invalid format")
+        || message.contains("unknown option")
+    {
+        return false;
+    }
+
+    // Common transient transport failures.
+    message.contains("connection timed out")
+        || message.contains("timed out")
+        || message.contains("connection reset")
+        || message.contains("broken pipe")
+        || message.contains("connection refused")
+        || message.contains("network is unreachable")
+        || message.contains("no route to host")
+        || message.contains("connection closed")
+        || message.contains("connection lost")
+        || message.contains("ssh_exchange_identification")
+        || message.contains("kex_exchange_identification")
+        || message.contains("temporary failure in name resolution")
+}
+
 /// Result of a remote command execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommandResult {
@@ -159,6 +207,39 @@ pub enum KnownHostsPolicy {
     Add,
     /// Accept all hosts without verification (INSECURE - testing only).
     AcceptAll,
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+
+    #[test]
+    fn test_retryable_transport_error_text() {
+        assert!(is_retryable_transport_error_text(
+            "ssh: connect to host 1.2.3.4 port 22: Connection timed out"
+        ));
+        assert!(is_retryable_transport_error_text(
+            "kex_exchange_identification: Connection reset by peer"
+        ));
+        assert!(is_retryable_transport_error_text("Broken pipe"));
+        assert!(is_retryable_transport_error_text("Network is unreachable"));
+    }
+
+    #[test]
+    fn test_non_retryable_transport_error_text() {
+        assert!(!is_retryable_transport_error_text(
+            "Permission denied (publickey)."
+        ));
+        assert!(!is_retryable_transport_error_text(
+            "Host key verification failed."
+        ));
+        assert!(!is_retryable_transport_error_text(
+            "Could not resolve hostname worker.example.com: Name or service not known"
+        ));
+        assert!(!is_retryable_transport_error_text(
+            "Identity file /nope/id_rsa not accessible: No such file or directory"
+        ));
+    }
 }
 
 /// SSH client for a single worker connection.

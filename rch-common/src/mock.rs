@@ -8,6 +8,7 @@
 use crate::ssh::CommandResult;
 use crate::types::{WorkerConfig, WorkerId};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 use tracing::{debug, info};
@@ -178,8 +179,12 @@ pub struct MockConfig {
     pub default_stderr: String,
     /// Simulate connection failure.
     pub fail_connect: bool,
+    /// Simulate transient connection failures for N attempts (then succeed).
+    pub fail_connect_attempts: u32,
     /// Simulate command failure.
     pub fail_execute: bool,
+    /// Simulate transient execution failures for N attempts (then succeed).
+    pub fail_execute_attempts: u32,
     /// Simulated execution time in milliseconds.
     pub execution_delay_ms: u64,
     /// Command-specific results (command -> result).
@@ -197,7 +202,9 @@ impl Default for MockConfig {
             default_stdout: String::new(),
             default_stderr: String::new(),
             fail_connect: false,
+            fail_connect_attempts: 0,
             fail_execute: false,
+            fail_execute_attempts: 0,
             execution_delay_ms: 10,
             command_results: HashMap::new(),
             fail_toolchain_install: false,
@@ -269,6 +276,18 @@ impl MockConfig {
 
         config.fail_connect = env_flag("RCH_MOCK_SSH_FAIL_CONNECT");
         config.fail_execute = env_flag("RCH_MOCK_SSH_FAIL_EXECUTE");
+
+        if let Ok(val) = std::env::var("RCH_MOCK_SSH_FAIL_CONNECT_ATTEMPTS")
+            && let Ok(count) = val.parse()
+        {
+            config.fail_connect_attempts = count;
+        }
+        if let Ok(val) = std::env::var("RCH_MOCK_SSH_FAIL_EXECUTE_ATTEMPTS")
+            && let Ok(count) = val.parse()
+        {
+            config.fail_execute_attempts = count;
+        }
+
         config.fail_toolchain_install = env_flag("RCH_MOCK_TOOLCHAIN_INSTALL_FAIL");
         config.no_rustup = env_flag("RCH_MOCK_NO_RUSTUP");
 
@@ -302,6 +321,10 @@ pub struct MockSshClient {
     connected: bool,
     /// Recorded invocations.
     invocations: Arc<Mutex<Vec<MockInvocation>>>,
+    /// Remaining transient connect failures to simulate.
+    connect_failures_remaining: AtomicU32,
+    /// Remaining transient execute failures to simulate.
+    execute_failures_remaining: AtomicU32,
 }
 
 impl MockSshClient {
@@ -309,6 +332,8 @@ impl MockSshClient {
     pub fn new(config: WorkerConfig, mock_config: MockConfig) -> Self {
         Self {
             config,
+            connect_failures_remaining: AtomicU32::new(mock_config.fail_connect_attempts),
+            execute_failures_remaining: AtomicU32::new(mock_config.fail_execute_attempts),
             mock_config,
             connected: false,
             invocations: Arc::new(Mutex::new(Vec::new())),
@@ -374,6 +399,24 @@ impl MockSshClient {
             ));
         }
 
+        // Transient connect failures (retryable)
+        if self
+            .connect_failures_remaining
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                current.checked_sub(1)
+            })
+            .is_ok()
+        {
+            log_phase(
+                Phase::Connect,
+                &format!("Mock transient connect failure for {}", self.config.id),
+            );
+            return Err(anyhow::anyhow!(
+                "Mock: Connection timed out to {}",
+                self.config.id
+            ));
+        }
+
         // Simulate connection delay
         tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
 
@@ -414,6 +457,21 @@ impl MockSshClient {
                 &format!("Mock execution failed for {}", self.config.id),
             );
             return Err(anyhow::anyhow!("Mock: Command execution failed"));
+        }
+
+        // Transient execute failures (retryable)
+        if self
+            .execute_failures_remaining
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                current.checked_sub(1)
+            })
+            .is_ok()
+        {
+            log_phase(
+                Phase::Execute,
+                &format!("Mock transient execute failure for {}", self.config.id),
+            );
+            return Err(anyhow::anyhow!("Mock: Broken pipe"));
         }
 
         // Simulate execution delay
@@ -529,6 +587,10 @@ pub struct MockRsync {
     sync_invocations: Arc<Mutex<Vec<MockSyncInvocation>>>,
     /// Mock configuration.
     config: MockRsyncConfig,
+    /// Remaining transient sync failures to simulate.
+    sync_failures_remaining: AtomicU32,
+    /// Remaining transient artifact failures to simulate.
+    artifacts_failures_remaining: AtomicU32,
 }
 
 /// Configuration for mock rsync behavior.
@@ -536,8 +598,12 @@ pub struct MockRsync {
 pub struct MockRsyncConfig {
     /// Simulate sync failure.
     pub fail_sync: bool,
+    /// Simulate transient sync failures for N attempts (then succeed).
+    pub fail_sync_attempts: u32,
     /// Simulate artifact retrieval failure.
     pub fail_artifacts: bool,
+    /// Simulate transient artifact failures for N attempts (then succeed).
+    pub fail_artifacts_attempts: u32,
     /// Simulated files per sync.
     pub files_per_sync: u32,
     /// Simulated bytes per sync.
@@ -549,7 +615,9 @@ impl MockRsyncConfig {
     pub fn success() -> Self {
         Self {
             fail_sync: false,
+            fail_sync_attempts: 0,
             fail_artifacts: false,
+            fail_artifacts_attempts: 0,
             files_per_sync: 10,
             bytes_per_sync: 1024 * 100,
         }
@@ -582,6 +650,17 @@ impl MockRsyncConfig {
         config.fail_sync = env_flag("RCH_MOCK_RSYNC_FAIL_SYNC");
         config.fail_artifacts = env_flag("RCH_MOCK_RSYNC_FAIL_ARTIFACTS");
 
+        if let Ok(val) = std::env::var("RCH_MOCK_RSYNC_FAIL_SYNC_ATTEMPTS")
+            && let Ok(count) = val.parse()
+        {
+            config.fail_sync_attempts = count;
+        }
+        if let Ok(val) = std::env::var("RCH_MOCK_RSYNC_FAIL_ARTIFACTS_ATTEMPTS")
+            && let Ok(count) = val.parse()
+        {
+            config.fail_artifacts_attempts = count;
+        }
+
         if let Ok(val) = std::env::var("RCH_MOCK_RSYNC_FILES")
             && let Ok(files) = val.parse()
         {
@@ -613,8 +692,12 @@ pub struct MockSyncInvocation {
 impl MockRsync {
     /// Create new mock rsync.
     pub fn new(config: MockRsyncConfig) -> Self {
+        let sync_failures_remaining = AtomicU32::new(config.fail_sync_attempts);
+        let artifacts_failures_remaining = AtomicU32::new(config.fail_artifacts_attempts);
         Self {
             sync_invocations: Arc::new(Mutex::new(Vec::new())),
+            sync_failures_remaining,
+            artifacts_failures_remaining,
             config,
         }
     }
@@ -656,6 +739,20 @@ impl MockRsync {
         if self.config.fail_sync {
             log_phase(Phase::Sync, "Mock sync failed");
             return Err(anyhow::anyhow!("Mock: Sync failed"));
+        }
+
+        // Transient failures (retryable)
+        if self
+            .sync_failures_remaining
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                current.checked_sub(1)
+            })
+            .is_ok()
+        {
+            log_phase(Phase::Sync, "Mock transient sync failure");
+            return Err(anyhow::anyhow!(
+                "Mock: Sync failed (transient) - Connection timed out"
+            ));
         }
 
         // Simulate transfer delay
@@ -706,6 +803,23 @@ impl MockRsync {
         if self.config.fail_artifacts {
             log_phase(Phase::Artifacts, "Mock artifact retrieval failed");
             return Err(anyhow::anyhow!("Mock: Artifact retrieval failed"));
+        }
+
+        // Transient failures (retryable)
+        if self
+            .artifacts_failures_remaining
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                current.checked_sub(1)
+            })
+            .is_ok()
+        {
+            log_phase(
+                Phase::Artifacts,
+                "Mock transient artifact retrieval failure",
+            );
+            return Err(anyhow::anyhow!(
+                "Mock: Artifact retrieval failed (transient) - Connection reset by peer"
+            ));
         }
 
         // Simulate transfer delay

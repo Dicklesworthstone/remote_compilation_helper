@@ -427,6 +427,8 @@ mod tests {
         ConfigShowResponse {
             general: ConfigGeneralSection {
                 enabled: true,
+                force_local: false,
+                force_remote: false,
                 log_level: "info".to_string(),
                 socket_path: "/tmp/rch.sock".to_string(),
             },

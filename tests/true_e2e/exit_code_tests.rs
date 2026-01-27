@@ -34,8 +34,12 @@ use rch_common::e2e::{
 };
 use rch_common::ssh::{KnownHostsPolicy, SshClient, SshOptions};
 use rch_common::types::WorkerConfig;
+use rch_common::{CompilationKind, TierDecision, classify_command_detailed};
+use std::ffi::OsStr;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use tempfile::TempDir;
 
 /// Project root for fixtures
 const FIXTURES_DIR: &str = "tests/true_e2e/fixtures";
@@ -187,6 +191,186 @@ fn run_local_command(cmd: &str, args: &[&str], dir: &Path) -> Option<i32> {
         .output()
         .ok()
         .and_then(|out| out.status.code())
+}
+
+fn local_tool_version(tool: &str) -> Option<String> {
+    let output = std::process::Command::new(tool)
+        .arg("--version")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    stdout
+        .lines()
+        .next()
+        .or_else(|| stderr.lines().next())
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty())
+}
+
+async fn remote_tool_version(client: &mut SshClient, tool: &str) -> Option<String> {
+    let cmd = format!("command -v {tool} >/dev/null 2>&1 && {tool} --version 2>&1 | head -1");
+    let result = client.execute(&cmd).await.ok()?;
+    if result.exit_code != 0 {
+        return None;
+    }
+    result
+        .stdout
+        .lines()
+        .next()
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty())
+}
+
+fn log_and_assert_classification(
+    logger: &rch_common::e2e::TestLogger,
+    cmd: &str,
+    expected_kind: CompilationKind,
+) {
+    let details = classify_command_detailed(cmd);
+    let tier4 = details
+        .tiers
+        .iter()
+        .find(|t| t.tier == 4)
+        .map(|t| t.decision);
+
+    logger.log_with_context(
+        LogLevel::Debug,
+        LogSource::Custom("test".to_string()),
+        "Command classified",
+        vec![
+            ("phase".to_string(), "classify".to_string()),
+            ("cmd".to_string(), cmd.to_string()),
+            (
+                "is_compilation".to_string(),
+                details.classification.is_compilation.to_string(),
+            ),
+            (
+                "kind".to_string(),
+                details
+                    .classification
+                    .kind
+                    .map(|k| format!("{k:?}"))
+                    .unwrap_or_else(|| "none".to_string()),
+            ),
+            (
+                "tier4".to_string(),
+                tier4
+                    .map(|d| format!("{d:?}"))
+                    .unwrap_or_else(|| "missing".to_string()),
+            ),
+        ],
+    );
+
+    assert!(
+        details.classification.is_compilation,
+        "Expected compilation classification for: {cmd}"
+    );
+    assert_eq!(
+        details.classification.kind,
+        Some(expected_kind),
+        "Unexpected classification kind for: {cmd}"
+    );
+    assert_eq!(
+        tier4,
+        Some(TierDecision::Pass),
+        "Expected Tier 4 pass for: {cmd}"
+    );
+}
+
+fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
+    fs::create_dir_all(dst).map_err(|e| format!("Failed to create dir {}: {e}", dst.display()))?;
+    for entry in
+        fs::read_dir(src).map_err(|e| format!("Failed to read dir {}: {e}", src.display()))?
+    {
+        let entry = entry.map_err(|e| format!("Failed to read entry in {}: {e}", src.display()))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|e| format!("Failed to stat entry in {}: {e}", src.display()))?;
+        let name = entry.file_name();
+        if file_type.is_dir() && name.as_os_str() == OsStr::new("target") {
+            continue;
+        }
+        let dst_path = dst.join(&name);
+        if file_type.is_dir() {
+            copy_dir_recursive(&entry.path(), &dst_path)?;
+        } else if file_type.is_file() {
+            fs::copy(entry.path(), &dst_path).map_err(|e| {
+                format!(
+                    "Failed to copy {} -> {}: {e}",
+                    entry.path().display(),
+                    dst_path.display()
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn temp_copy_fixture(src: &Path) -> Result<(TempDir, PathBuf), String> {
+    let temp = TempDir::new().map_err(|e| format!("Failed to create temp dir: {e}"))?;
+    let dst = temp.path().join("fixture");
+    copy_dir_recursive(src, &dst)?;
+    Ok((temp, dst))
+}
+
+fn run_binary_capture_stdout(path: &Path) -> Result<String, String> {
+    let output = std::process::Command::new(path)
+        .output()
+        .map_err(|e| format!("Failed to run {}: {e}", path.display()))?;
+    if !output.status.success() {
+        return Err(format!(
+            "Binary {} failed (code {:?}): {}",
+            path.display(),
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn sync_file_from_remote(
+    worker_config: &WorkerConfig,
+    remote_file: &str,
+    local_dir: &Path,
+) -> Result<PathBuf, String> {
+    fs::create_dir_all(local_dir)
+        .map_err(|e| format!("Failed to create local dir {}: {e}", local_dir.display()))?;
+
+    let ssh_cmd = format!(
+        "ssh -o StrictHostKeyChecking=accept-new -i {}",
+        worker_config.identity_file
+    );
+    let remote_spec = format!(
+        "{}@{}:{}",
+        worker_config.user, worker_config.host, remote_file
+    );
+
+    let output = std::process::Command::new("rsync")
+        .args([
+            "-avz",
+            "-e",
+            &ssh_cmd,
+            &remote_spec,
+            &format!("{}/", local_dir.display()),
+        ])
+        .output()
+        .map_err(|e| format!("Failed to run rsync: {e}"))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "rsync failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+
+    let file_name = Path::new(remote_file)
+        .file_name()
+        .ok_or_else(|| format!("Remote file has no basename: {remote_file}"))?;
+    Ok(local_dir.join(file_name))
 }
 
 // =============================================================================
@@ -1250,6 +1434,876 @@ async fn test_exit_code_gcc_error() {
 
     client.disconnect().await.ok();
     logger.info("gcc error exit code test passed");
+    logger.print_summary();
+}
+
+// =============================================================================
+// Test 6b: clang / g++ / clang++ Exit Codes + Artifact Verification
+// =============================================================================
+
+/// Test that clang via make returns exit code 0 on both local and remote, and
+/// that the remotely-built artifact can be copied back and executed locally.
+#[tokio::test]
+async fn test_exit_code_clang_make_success() {
+    let logger = TestLoggerBuilder::new("test_exit_code_clang_make_success")
+        .print_realtime(true)
+        .build();
+
+    logger.log_with_context(
+        LogLevel::Info,
+        LogSource::Custom("test".to_string()),
+        "Starting clang(make) success exit code test",
+        vec![
+            ("phase".to_string(), "setup".to_string()),
+            ("expected_exit_code".to_string(), "0".to_string()),
+        ],
+    );
+
+    let Some(local_clang) = local_tool_version("clang") else {
+        logger.warn("Test skipped: clang not available locally");
+        return;
+    };
+
+    logger.log_with_context(
+        LogLevel::Info,
+        LogSource::Custom("test".to_string()),
+        "Local compiler detected",
+        vec![
+            ("phase".to_string(), "setup".to_string()),
+            ("compiler".to_string(), "clang".to_string()),
+            ("version".to_string(), local_clang),
+        ],
+    );
+
+    let Some(config) = require_workers() else {
+        logger.warn("Test skipped: no workers available");
+        return;
+    };
+
+    let Some(worker_entry) = get_test_worker(&config) else {
+        logger.warn("Test skipped: no enabled worker found");
+        return;
+    };
+
+    let worker_config = worker_entry.to_worker_config();
+    let Some(mut client) = get_connected_client(&config, worker_entry).await else {
+        logger.error("Failed to connect to worker");
+        return;
+    };
+
+    let Some(remote_clang) = remote_tool_version(&mut client, "clang").await else {
+        logger.warn("Test skipped: clang not available on worker");
+        client.disconnect().await.ok();
+        return;
+    };
+
+    logger.log_with_context(
+        LogLevel::Info,
+        LogSource::Custom("test".to_string()),
+        "Remote compiler detected",
+        vec![
+            ("phase".to_string(), "setup".to_string()),
+            ("compiler".to_string(), "clang".to_string()),
+            ("worker".to_string(), worker_entry.id.clone()),
+            ("version".to_string(), remote_clang),
+        ],
+    );
+
+    let fixture_src = hello_c_fixture_dir();
+    if !fixture_src.exists() {
+        logger.warn(format!(
+            "Test skipped: fixture not found at {}",
+            fixture_src.display()
+        ));
+        client.disconnect().await.ok();
+        return;
+    }
+
+    let (_local_tmp, local_fixture) = match temp_copy_fixture(&fixture_src) {
+        Ok(v) => v,
+        Err(e) => {
+            logger.error(format!("Failed to create temp fixture copy: {e}"));
+            client.disconnect().await.ok();
+            return;
+        }
+    };
+
+    let remote_path = format!(
+        "{}/exit_code_clang_make_success",
+        config.settings.remote_work_dir
+    );
+
+    // Classification check (Tier 4 expected)
+    log_and_assert_classification(&logger, "make clean all CC=clang", CompilationKind::Make);
+
+    // Phase: Local baseline
+    let local_exit_code = run_local_command("make", &["clean", "all", "CC=clang"], &local_fixture);
+
+    logger.log_with_context(
+        LogLevel::Info,
+        LogSource::Custom("test".to_string()),
+        "Local execution",
+        vec![
+            ("phase".to_string(), "local_baseline".to_string()),
+            ("cmd".to_string(), "make clean all CC=clang".to_string()),
+            (
+                "exit_code".to_string(),
+                local_exit_code
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "error".to_string()),
+            ),
+        ],
+    );
+
+    // Setup remote
+    if let Err(e) =
+        sync_fixture_to_remote(&mut client, &worker_config, &fixture_src, &remote_path).await
+    {
+        logger.error(format!("Failed to sync fixture: {e}"));
+        return;
+    }
+
+    // Phase: Remote execution
+    let remote_cmd = format!("cd {} && make clean all CC=clang 2>&1", remote_path);
+    let remote_result = client.execute(&remote_cmd).await;
+    let remote_exit_code = match &remote_result {
+        Ok(result) => result.exit_code,
+        Err(_) => -1,
+    };
+
+    logger.log_with_context(
+        LogLevel::Info,
+        LogSource::Custom("test".to_string()),
+        "Remote execution",
+        vec![
+            ("phase".to_string(), "remote_execution".to_string()),
+            ("cmd".to_string(), "make clean all CC=clang".to_string()),
+            ("worker".to_string(), worker_entry.id.clone()),
+            ("exit_code".to_string(), remote_exit_code.to_string()),
+        ],
+    );
+
+    // Phase: Verify exit codes
+    let local_code = local_exit_code.unwrap_or(-1);
+    let codes_match = local_code == remote_exit_code;
+
+    logger.log_with_context(
+        LogLevel::Info,
+        LogSource::Custom("test".to_string()),
+        "Exit code comparison",
+        vec![
+            ("phase".to_string(), "verify_exit_code".to_string()),
+            ("local".to_string(), local_code.to_string()),
+            ("remote".to_string(), remote_exit_code.to_string()),
+            ("match".to_string(), codes_match.to_string()),
+        ],
+    );
+
+    assert_eq!(local_code, 0, "Local clang build should succeed");
+    assert_eq!(remote_exit_code, 0, "Remote clang build should succeed");
+    assert!(codes_match, "Exit codes should match");
+
+    // Phase: Verify artifacts (local + remote copy)
+    let local_bin = local_fixture.join("hello");
+    let local_out = match run_binary_capture_stdout(&local_bin) {
+        Ok(out) => out,
+        Err(e) => {
+            logger.error(e);
+            panic!("Local clang-built binary failed to run");
+        }
+    };
+    assert!(
+        local_out.contains("Hello from rch test fixture!"),
+        "Local output missing expected greeting"
+    );
+
+    let remote_artifacts = TempDir::new().expect("tempdir");
+    let remote_bin = match sync_file_from_remote(
+        &worker_config,
+        &format!("{}/hello", remote_path),
+        remote_artifacts.path(),
+    ) {
+        Ok(path) => path,
+        Err(e) => {
+            logger.error(format!("Failed to copy remote artifact: {e}"));
+            panic!("Remote artifact copy failed");
+        }
+    };
+
+    let remote_out = match run_binary_capture_stdout(&remote_bin) {
+        Ok(out) => out,
+        Err(e) => {
+            logger.error(e);
+            panic!("Remote clang-built artifact failed to run locally");
+        }
+    };
+
+    logger.log_with_context(
+        LogLevel::Info,
+        LogSource::Custom("test".to_string()),
+        "Artifact verification",
+        vec![
+            ("phase".to_string(), "verify_artifact".to_string()),
+            ("local_path".to_string(), local_bin.display().to_string()),
+            ("remote_copy".to_string(), remote_bin.display().to_string()),
+            (
+                "local_size".to_string(),
+                fs::metadata(&local_bin)
+                    .map(|m| m.len())
+                    .unwrap_or(0)
+                    .to_string(),
+            ),
+            (
+                "remote_size".to_string(),
+                fs::metadata(&remote_bin)
+                    .map(|m| m.len())
+                    .unwrap_or(0)
+                    .to_string(),
+            ),
+        ],
+    );
+
+    assert!(
+        remote_out.contains("Hello from rch test fixture!"),
+        "Remote artifact output missing expected greeting"
+    );
+
+    // Cleanup
+    if config.settings.cleanup_after_test {
+        let _ = cleanup_remote(&mut client, &remote_path).await;
+    }
+
+    client.disconnect().await.ok();
+    logger.info("clang(make) success exit code test passed");
+    logger.print_summary();
+}
+
+/// Test that g++ compilation success returns exit code 0 on both local and remote.
+#[tokio::test]
+async fn test_exit_code_gpp_success() {
+    let logger = TestLoggerBuilder::new("test_exit_code_gpp_success")
+        .print_realtime(true)
+        .build();
+
+    logger.log_with_context(
+        LogLevel::Info,
+        LogSource::Custom("test".to_string()),
+        "Starting g++ success exit code test",
+        vec![
+            ("phase".to_string(), "setup".to_string()),
+            ("expected_exit_code".to_string(), "0".to_string()),
+        ],
+    );
+
+    let Some(local_gpp) = local_tool_version("g++") else {
+        logger.warn("Test skipped: g++ not available locally");
+        return;
+    };
+
+    logger.log_with_context(
+        LogLevel::Info,
+        LogSource::Custom("test".to_string()),
+        "Local compiler detected",
+        vec![
+            ("phase".to_string(), "setup".to_string()),
+            ("compiler".to_string(), "g++".to_string()),
+            ("version".to_string(), local_gpp),
+        ],
+    );
+
+    let Some(config) = require_workers() else {
+        logger.warn("Test skipped: no workers available");
+        return;
+    };
+
+    let Some(worker_entry) = get_test_worker(&config) else {
+        logger.warn("Test skipped: no enabled worker found");
+        return;
+    };
+
+    let worker_config = worker_entry.to_worker_config();
+    let Some(mut client) = get_connected_client(&config, worker_entry).await else {
+        logger.error("Failed to connect to worker");
+        return;
+    };
+
+    let Some(remote_gpp) = remote_tool_version(&mut client, "g++").await else {
+        logger.warn("Test skipped: g++ not available on worker");
+        client.disconnect().await.ok();
+        return;
+    };
+
+    logger.log_with_context(
+        LogLevel::Info,
+        LogSource::Custom("test".to_string()),
+        "Remote compiler detected",
+        vec![
+            ("phase".to_string(), "setup".to_string()),
+            ("compiler".to_string(), "g++".to_string()),
+            ("worker".to_string(), worker_entry.id.clone()),
+            ("version".to_string(), remote_gpp),
+        ],
+    );
+
+    // Create an ephemeral C++ fixture (no repo file proliferation)
+    let local_fixture_tmp = TempDir::new().expect("tempdir");
+    let local_fixture = local_fixture_tmp.path().join("cpp_fixture");
+    fs::create_dir_all(&local_fixture).expect("create fixture dir");
+    fs::write(
+        local_fixture.join("main.cpp"),
+        r#"#include <iostream>
+int main() {
+  std::cout << "Hello from rch C++ test fixture!" << std::endl;
+  std::cout << "2 + 2 = " << (2 + 2) << std::endl;
+  return 0;
+}
+"#,
+    )
+    .expect("write main.cpp");
+
+    let remote_path = format!("{}/exit_code_gpp_success", config.settings.remote_work_dir);
+
+    let compile_cmd = "g++ -std=c++20 -O2 -Wall -Werror -o hello_cpp main.cpp";
+    log_and_assert_classification(&logger, compile_cmd, CompilationKind::Gpp);
+
+    // Phase: Local baseline
+    let local_exit_code = run_local_command(
+        "g++",
+        &[
+            "-std=c++20",
+            "-O2",
+            "-Wall",
+            "-Werror",
+            "-o",
+            "hello_cpp",
+            "main.cpp",
+        ],
+        &local_fixture,
+    );
+
+    // Setup remote
+    if let Err(e) =
+        sync_fixture_to_remote(&mut client, &worker_config, &local_fixture, &remote_path).await
+    {
+        logger.error(format!("Failed to sync fixture: {e}"));
+        return;
+    }
+
+    // Phase: Remote execution
+    let remote_cmd = format!("cd {} && {} 2>&1", remote_path, compile_cmd);
+    let remote_result = client.execute(&remote_cmd).await;
+    let remote_exit_code = match &remote_result {
+        Ok(result) => result.exit_code,
+        Err(_) => -1,
+    };
+
+    // Phase: Verify
+    let local_code = local_exit_code.unwrap_or(-1);
+    let codes_match = local_code == remote_exit_code;
+
+    logger.log_with_context(
+        LogLevel::Info,
+        LogSource::Custom("test".to_string()),
+        "Exit code comparison",
+        vec![
+            ("phase".to_string(), "verify_exit_code".to_string()),
+            ("local".to_string(), local_code.to_string()),
+            ("remote".to_string(), remote_exit_code.to_string()),
+            ("match".to_string(), codes_match.to_string()),
+        ],
+    );
+
+    assert_eq!(local_code, 0, "Local g++ build should succeed");
+    assert_eq!(remote_exit_code, 0, "Remote g++ build should succeed");
+    assert!(codes_match, "Exit codes should match");
+
+    // Artifact verification: run local binary and remote-copied binary
+    let local_bin = local_fixture.join("hello_cpp");
+    let local_out = run_binary_capture_stdout(&local_bin).expect("run local binary");
+    assert!(
+        local_out.contains("Hello from rch C++ test fixture!"),
+        "Local output missing expected greeting"
+    );
+
+    let remote_artifacts = TempDir::new().expect("tempdir");
+    let remote_bin = sync_file_from_remote(
+        &worker_config,
+        &format!("{}/hello_cpp", remote_path),
+        remote_artifacts.path(),
+    )
+    .expect("copy remote binary");
+
+    let remote_out = run_binary_capture_stdout(&remote_bin).expect("run remote-copied binary");
+    assert!(
+        remote_out.contains("Hello from rch C++ test fixture!"),
+        "Remote artifact output missing expected greeting"
+    );
+
+    // Cleanup
+    if config.settings.cleanup_after_test {
+        let _ = cleanup_remote(&mut client, &remote_path).await;
+    }
+
+    client.disconnect().await.ok();
+    logger.info("g++ success exit code test passed");
+    logger.print_summary();
+}
+
+/// Test that clang++ compilation success returns exit code 0 on both local and remote.
+#[tokio::test]
+async fn test_exit_code_clangpp_success() {
+    let logger = TestLoggerBuilder::new("test_exit_code_clangpp_success")
+        .print_realtime(true)
+        .build();
+
+    logger.log_with_context(
+        LogLevel::Info,
+        LogSource::Custom("test".to_string()),
+        "Starting clang++ success exit code test",
+        vec![
+            ("phase".to_string(), "setup".to_string()),
+            ("expected_exit_code".to_string(), "0".to_string()),
+        ],
+    );
+
+    let Some(local_clangpp) = local_tool_version("clang++") else {
+        logger.warn("Test skipped: clang++ not available locally");
+        return;
+    };
+
+    logger.log_with_context(
+        LogLevel::Info,
+        LogSource::Custom("test".to_string()),
+        "Local compiler detected",
+        vec![
+            ("phase".to_string(), "setup".to_string()),
+            ("compiler".to_string(), "clang++".to_string()),
+            ("version".to_string(), local_clangpp),
+        ],
+    );
+
+    let Some(config) = require_workers() else {
+        logger.warn("Test skipped: no workers available");
+        return;
+    };
+
+    let Some(worker_entry) = get_test_worker(&config) else {
+        logger.warn("Test skipped: no enabled worker found");
+        return;
+    };
+
+    let worker_config = worker_entry.to_worker_config();
+    let Some(mut client) = get_connected_client(&config, worker_entry).await else {
+        logger.error("Failed to connect to worker");
+        return;
+    };
+
+    let Some(remote_clangpp) = remote_tool_version(&mut client, "clang++").await else {
+        logger.warn("Test skipped: clang++ not available on worker");
+        client.disconnect().await.ok();
+        return;
+    };
+
+    logger.log_with_context(
+        LogLevel::Info,
+        LogSource::Custom("test".to_string()),
+        "Remote compiler detected",
+        vec![
+            ("phase".to_string(), "setup".to_string()),
+            ("compiler".to_string(), "clang++".to_string()),
+            ("worker".to_string(), worker_entry.id.clone()),
+            ("version".to_string(), remote_clangpp),
+        ],
+    );
+
+    let local_fixture_tmp = TempDir::new().expect("tempdir");
+    let local_fixture = local_fixture_tmp.path().join("cpp_fixture");
+    fs::create_dir_all(&local_fixture).expect("create fixture dir");
+    fs::write(
+        local_fixture.join("main.cpp"),
+        r#"#include <iostream>
+int main() {
+  std::cout << "Hello from rch C++ test fixture!" << std::endl;
+  std::cout << "3 * 4 = " << (3 * 4) << std::endl;
+  return 0;
+}
+"#,
+    )
+    .expect("write main.cpp");
+
+    let remote_path = format!(
+        "{}/exit_code_clangpp_success",
+        config.settings.remote_work_dir
+    );
+    let compile_cmd = "clang++ -std=c++20 -O2 -Wall -Werror -o hello_cpp main.cpp";
+    log_and_assert_classification(&logger, compile_cmd, CompilationKind::Clangpp);
+
+    let local_exit_code = run_local_command(
+        "clang++",
+        &[
+            "-std=c++20",
+            "-O2",
+            "-Wall",
+            "-Werror",
+            "-o",
+            "hello_cpp",
+            "main.cpp",
+        ],
+        &local_fixture,
+    );
+
+    if let Err(e) =
+        sync_fixture_to_remote(&mut client, &worker_config, &local_fixture, &remote_path).await
+    {
+        logger.error(format!("Failed to sync fixture: {e}"));
+        return;
+    }
+
+    let remote_cmd = format!("cd {} && {} 2>&1", remote_path, compile_cmd);
+    let remote_result = client.execute(&remote_cmd).await;
+    let remote_exit_code = match &remote_result {
+        Ok(result) => result.exit_code,
+        Err(_) => -1,
+    };
+
+    let local_code = local_exit_code.unwrap_or(-1);
+    assert_eq!(local_code, 0, "Local clang++ build should succeed");
+    assert_eq!(remote_exit_code, 0, "Remote clang++ build should succeed");
+
+    let remote_artifacts = TempDir::new().expect("tempdir");
+    let remote_bin = sync_file_from_remote(
+        &worker_config,
+        &format!("{}/hello_cpp", remote_path),
+        remote_artifacts.path(),
+    )
+    .expect("copy remote binary");
+
+    let out = run_binary_capture_stdout(&remote_bin).expect("run remote-copied binary");
+    assert!(
+        out.contains("Hello from rch C++ test fixture!"),
+        "Remote artifact output missing expected greeting"
+    );
+
+    if config.settings.cleanup_after_test {
+        let _ = cleanup_remote(&mut client, &remote_path).await;
+    }
+
+    client.disconnect().await.ok();
+    logger.info("clang++ success exit code test passed");
+    logger.print_summary();
+}
+
+// =============================================================================
+// Test 6c: cmake/ninja Build Exit Codes + Artifact Verification
+// =============================================================================
+
+/// Test that `cmake --build` succeeds locally and remotely and the produced binary runs.
+#[tokio::test]
+async fn test_exit_code_cmake_build_success() {
+    let logger = TestLoggerBuilder::new("test_exit_code_cmake_build_success")
+        .print_realtime(true)
+        .build();
+
+    logger.log_with_context(
+        LogLevel::Info,
+        LogSource::Custom("test".to_string()),
+        "Starting cmake build success exit code test",
+        vec![
+            ("phase".to_string(), "setup".to_string()),
+            ("expected_exit_code".to_string(), "0".to_string()),
+        ],
+    );
+
+    let Some(local_cmake) = local_tool_version("cmake") else {
+        logger.warn("Test skipped: cmake not available locally");
+        return;
+    };
+    logger.log_with_context(
+        LogLevel::Info,
+        LogSource::Custom("test".to_string()),
+        "Local cmake detected",
+        vec![
+            ("phase".to_string(), "setup".to_string()),
+            ("tool".to_string(), "cmake".to_string()),
+            ("version".to_string(), local_cmake),
+        ],
+    );
+
+    let Some(config) = require_workers() else {
+        logger.warn("Test skipped: no workers available");
+        return;
+    };
+
+    let Some(worker_entry) = get_test_worker(&config) else {
+        logger.warn("Test skipped: no enabled worker found");
+        return;
+    };
+
+    let worker_config = worker_entry.to_worker_config();
+    let Some(mut client) = get_connected_client(&config, worker_entry).await else {
+        logger.error("Failed to connect to worker");
+        return;
+    };
+
+    let Some(remote_cmake) = remote_tool_version(&mut client, "cmake").await else {
+        logger.warn("Test skipped: cmake not available on worker");
+        client.disconnect().await.ok();
+        return;
+    };
+    logger.log_with_context(
+        LogLevel::Info,
+        LogSource::Custom("test".to_string()),
+        "Remote cmake detected",
+        vec![
+            ("phase".to_string(), "setup".to_string()),
+            ("tool".to_string(), "cmake".to_string()),
+            ("worker".to_string(), worker_entry.id.clone()),
+            ("version".to_string(), remote_cmake),
+        ],
+    );
+
+    let fixture_src = hello_c_fixture_dir();
+    if !fixture_src.exists() {
+        logger.warn(format!(
+            "Test skipped: fixture not found at {}",
+            fixture_src.display()
+        ));
+        client.disconnect().await.ok();
+        return;
+    }
+
+    let (_local_tmp, local_fixture) = match temp_copy_fixture(&fixture_src) {
+        Ok(v) => v,
+        Err(e) => {
+            logger.error(format!("Failed to create temp fixture copy: {e}"));
+            client.disconnect().await.ok();
+            return;
+        }
+    };
+
+    let build_dir = local_fixture.join("build");
+    let local_configure = run_local_command(
+        "cmake",
+        &["-S", ".", "-B", "build", "-G", "Unix Makefiles"],
+        &local_fixture,
+    )
+    .unwrap_or(-1);
+    assert_eq!(local_configure, 0, "Local cmake configure should succeed");
+    assert!(
+        build_dir.exists(),
+        "Local build dir should exist after configure"
+    );
+
+    log_and_assert_classification(&logger, "cmake --build build", CompilationKind::CmakeBuild);
+    let local_build = run_local_command("cmake", &["--build", "build"], &local_fixture);
+
+    let remote_path = format!(
+        "{}/exit_code_cmake_build_success",
+        config.settings.remote_work_dir
+    );
+    if let Err(e) =
+        sync_fixture_to_remote(&mut client, &worker_config, &fixture_src, &remote_path).await
+    {
+        logger.error(format!("Failed to sync fixture: {e}"));
+        return;
+    }
+
+    let remote_configure = format!(
+        "cd {} && cmake -S . -B build -G 'Unix Makefiles' 2>&1",
+        remote_path
+    );
+    let remote_configure_result = client.execute(&remote_configure).await;
+    let remote_configure_code = match &remote_configure_result {
+        Ok(r) => r.exit_code,
+        Err(_) => -1,
+    };
+    assert_eq!(
+        remote_configure_code, 0,
+        "Remote cmake configure should succeed"
+    );
+
+    let remote_build_cmd = format!("cd {} && cmake --build build 2>&1", remote_path);
+    let remote_build_result = client.execute(&remote_build_cmd).await;
+    let remote_build_code = match &remote_build_result {
+        Ok(r) => r.exit_code,
+        Err(_) => -1,
+    };
+
+    let local_code = local_build.unwrap_or(-1);
+    assert_eq!(local_code, 0, "Local cmake --build should succeed");
+    assert_eq!(remote_build_code, 0, "Remote cmake --build should succeed");
+    assert_eq!(local_code, remote_build_code, "Exit codes should match");
+
+    // Artifact verification: copy remote build output and run
+    let remote_artifacts = TempDir::new().expect("tempdir");
+    let remote_bin = sync_file_from_remote(
+        &worker_config,
+        &format!("{}/build/hello_app", remote_path),
+        remote_artifacts.path(),
+    )
+    .expect("copy remote hello_app");
+    let out = run_binary_capture_stdout(&remote_bin).expect("run remote-copied hello_app");
+    assert!(
+        out.contains("Hello from rch test fixture!"),
+        "Remote CMake artifact output missing expected greeting"
+    );
+
+    if config.settings.cleanup_after_test {
+        let _ = cleanup_remote(&mut client, &remote_path).await;
+    }
+    client.disconnect().await.ok();
+    logger.info("cmake build success exit code test passed");
+    logger.print_summary();
+}
+
+/// Test that `ninja` builds succeed (when available) and produced artifacts run locally.
+#[tokio::test]
+async fn test_exit_code_ninja_build_success() {
+    let logger = TestLoggerBuilder::new("test_exit_code_ninja_build_success")
+        .print_realtime(true)
+        .build();
+
+    logger.log_with_context(
+        LogLevel::Info,
+        LogSource::Custom("test".to_string()),
+        "Starting ninja build success exit code test",
+        vec![
+            ("phase".to_string(), "setup".to_string()),
+            ("expected_exit_code".to_string(), "0".to_string()),
+        ],
+    );
+
+    let Some(_local_cmake) = local_tool_version("cmake") else {
+        logger.warn("Test skipped: cmake not available locally");
+        return;
+    };
+    let Some(local_ninja) = local_tool_version("ninja") else {
+        logger.warn("Test skipped: ninja not available locally");
+        return;
+    };
+    logger.log_with_context(
+        LogLevel::Info,
+        LogSource::Custom("test".to_string()),
+        "Local ninja detected",
+        vec![
+            ("phase".to_string(), "setup".to_string()),
+            ("tool".to_string(), "ninja".to_string()),
+            ("version".to_string(), local_ninja),
+        ],
+    );
+
+    let Some(config) = require_workers() else {
+        logger.warn("Test skipped: no workers available");
+        return;
+    };
+
+    let Some(worker_entry) = get_test_worker(&config) else {
+        logger.warn("Test skipped: no enabled worker found");
+        return;
+    };
+
+    let worker_config = worker_entry.to_worker_config();
+    let Some(mut client) = get_connected_client(&config, worker_entry).await else {
+        logger.error("Failed to connect to worker");
+        return;
+    };
+
+    if remote_tool_version(&mut client, "ninja").await.is_none() {
+        logger.warn("Test skipped: ninja not available on worker");
+        client.disconnect().await.ok();
+        return;
+    }
+    if remote_tool_version(&mut client, "cmake").await.is_none() {
+        logger.warn("Test skipped: cmake not available on worker");
+        client.disconnect().await.ok();
+        return;
+    }
+
+    let fixture_src = hello_c_fixture_dir();
+    if !fixture_src.exists() {
+        logger.warn(format!(
+            "Test skipped: fixture not found at {}",
+            fixture_src.display()
+        ));
+        client.disconnect().await.ok();
+        return;
+    }
+
+    let (_local_tmp, local_fixture) = match temp_copy_fixture(&fixture_src) {
+        Ok(v) => v,
+        Err(e) => {
+            logger.error(format!("Failed to create temp fixture copy: {e}"));
+            client.disconnect().await.ok();
+            return;
+        }
+    };
+
+    let local_configure = run_local_command(
+        "cmake",
+        &["-S", ".", "-B", "build_ninja", "-G", "Ninja"],
+        &local_fixture,
+    )
+    .unwrap_or(-1);
+    assert_eq!(local_configure, 0, "Local ninja configure should succeed");
+
+    log_and_assert_classification(&logger, "ninja -C build_ninja", CompilationKind::Ninja);
+    let local_build = run_local_command("ninja", &["-C", "build_ninja"], &local_fixture);
+
+    let remote_path = format!(
+        "{}/exit_code_ninja_build_success",
+        config.settings.remote_work_dir
+    );
+    if let Err(e) =
+        sync_fixture_to_remote(&mut client, &worker_config, &fixture_src, &remote_path).await
+    {
+        logger.error(format!("Failed to sync fixture: {e}"));
+        return;
+    }
+
+    let remote_configure = format!(
+        "cd {} && cmake -S . -B build_ninja -G Ninja 2>&1",
+        remote_path
+    );
+    let remote_configure_result = client.execute(&remote_configure).await;
+    let remote_configure_code = match &remote_configure_result {
+        Ok(r) => r.exit_code,
+        Err(_) => -1,
+    };
+    assert_eq!(
+        remote_configure_code, 0,
+        "Remote ninja configure should succeed"
+    );
+
+    let remote_build_cmd = format!("cd {} && ninja -C build_ninja 2>&1", remote_path);
+    let remote_build_result = client.execute(&remote_build_cmd).await;
+    let remote_build_code = match &remote_build_result {
+        Ok(r) => r.exit_code,
+        Err(_) => -1,
+    };
+
+    let local_code = local_build.unwrap_or(-1);
+    assert_eq!(local_code, 0, "Local ninja build should succeed");
+    assert_eq!(remote_build_code, 0, "Remote ninja build should succeed");
+    assert_eq!(local_code, remote_build_code, "Exit codes should match");
+
+    let remote_artifacts = TempDir::new().expect("tempdir");
+    let remote_bin = sync_file_from_remote(
+        &worker_config,
+        &format!("{}/build_ninja/hello_app", remote_path),
+        remote_artifacts.path(),
+    )
+    .expect("copy remote hello_app");
+    let out = run_binary_capture_stdout(&remote_bin).expect("run remote-copied hello_app");
+    assert!(
+        out.contains("Hello from rch test fixture!"),
+        "Remote Ninja artifact output missing expected greeting"
+    );
+
+    if config.settings.cleanup_after_test {
+        let _ = cleanup_remote(&mut client, &remote_path).await;
+    }
+    client.disconnect().await.ok();
+    logger.info("ninja build success exit code test passed");
     logger.print_summary();
 }
 
