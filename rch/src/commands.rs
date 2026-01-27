@@ -475,6 +475,27 @@ pub struct ConfigTransferSection {
     pub compression_level: u32,
     pub exclude_patterns: Vec<String>,
     pub remote_base: String,
+    // Transfer optimization (bd-3hho)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_transfer_mb: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_transfer_time_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bwlimit_kbps: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub estimated_bandwidth_bps: Option<u64>,
+    // Adaptive compression (bd-243w)
+    pub adaptive_compression: bool,
+    pub min_compression_level: u32,
+    pub max_compression_level: u32,
+    // Artifact verification (bd-377q)
+    pub verify_artifacts: bool,
+    #[serde(skip_serializing_if = "is_default_verify_size")]
+    pub verify_max_size_bytes: u64,
+}
+
+fn is_default_verify_size(val: &u64) -> bool {
+    *val == 100 * 1024 * 1024 // 100 MB default
 }
 
 /// Environment configuration section.
@@ -557,6 +578,9 @@ pub struct DiagnoseResponse {
     pub capabilities_warnings: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worker_selection: Option<DiagnoseWorkerSelection>,
+    /// Dry-run summary showing the full pipeline (only present when --dry-run is used).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dry_run: Option<DryRunSummary>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -591,6 +615,60 @@ pub struct DiagnoseWorkerSelection {
     pub estimated_cores: u32,
     pub worker: Option<SelectedWorker>,
     pub reason: SelectionReason,
+}
+
+/// Pipeline step for dry-run output.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct DryRunPipelineStep {
+    /// Step number (1-based).
+    pub step: u32,
+    /// Step name (e.g., "classify", "select", "sync_up", "exec", "sync_down").
+    pub name: String,
+    /// Human-readable description of what would happen.
+    pub description: String,
+    /// Whether this step would be skipped.
+    pub skipped: bool,
+    /// Reason for skipping (if skipped).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skip_reason: Option<String>,
+    /// Estimated duration in milliseconds (if available).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub estimated_duration_ms: Option<u64>,
+}
+
+/// Transfer size estimation for dry-run.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct DryRunTransferEstimate {
+    /// Estimated bytes to transfer.
+    pub bytes: u64,
+    /// Human-readable size (e.g., "12.5 MB").
+    pub human_size: String,
+    /// Estimated number of files.
+    pub files: u32,
+    /// Estimated transfer time in milliseconds.
+    pub estimated_time_ms: u64,
+    /// Whether transfer would be skipped due to size limits.
+    pub would_skip: bool,
+    /// Reason for skipping (if would_skip is true).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skip_reason: Option<String>,
+}
+
+/// Dry-run summary showing the full pipeline.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct DryRunSummary {
+    /// Whether the command would be offloaded remotely.
+    pub would_offload: bool,
+    /// Reason for the offload decision.
+    pub reason: String,
+    /// Pipeline steps that would be executed.
+    pub pipeline_steps: Vec<DryRunPipelineStep>,
+    /// Transfer size estimation (if available).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transfer_estimate: Option<DryRunTransferEstimate>,
+    /// Total estimated time in milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_estimated_ms: Option<u64>,
 }
 
 /// Hook install/uninstall response for JSON output.
@@ -4142,6 +4220,18 @@ pub fn config_show(show_sources: bool, ctx: &OutputContext) -> Result<()> {
                 compression_level: config.transfer.compression_level,
                 exclude_patterns: config.transfer.exclude_patterns.clone(),
                 remote_base: config.transfer.remote_base.clone(),
+                // Transfer optimization (bd-3hho)
+                max_transfer_mb: config.transfer.max_transfer_mb,
+                max_transfer_time_ms: config.transfer.max_transfer_time_ms,
+                bwlimit_kbps: config.transfer.bwlimit_kbps,
+                estimated_bandwidth_bps: config.transfer.estimated_bandwidth_bps,
+                // Adaptive compression (bd-243w)
+                adaptive_compression: config.transfer.adaptive_compression,
+                min_compression_level: config.transfer.min_compression_level,
+                max_compression_level: config.transfer.max_compression_level,
+                // Artifact verification (bd-377q)
+                verify_artifacts: config.transfer.verify_artifacts,
+                verify_max_size_bytes: config.transfer.verify_max_size_bytes,
             },
             environment: ConfigEnvironmentSection {
                 allowlist: config.environment.allowlist.clone(),
@@ -6200,8 +6290,186 @@ fn build_diagnose_decision(classification: &Classification, threshold: f64) -> D
     }
 }
 
+/// Build a dry-run summary showing the full offload pipeline.
+fn build_dry_run_summary(
+    would_intercept: bool,
+    reason: &str,
+    worker_selection: &Option<DiagnoseWorkerSelection>,
+    daemon_reachable: bool,
+) -> DryRunSummary {
+    let mut steps = Vec::new();
+    let mut total_estimated_ms: u64 = 0;
+
+    // Step 1: Classification (always happens)
+    steps.push(DryRunPipelineStep {
+        step: 1,
+        name: "classify".to_string(),
+        description: "Analyze command to determine if it's a compilation".to_string(),
+        skipped: false,
+        skip_reason: None,
+        estimated_duration_ms: Some(2), // Classification is fast (<5ms budget)
+    });
+    total_estimated_ms += 2;
+
+    if !would_intercept {
+        // Command won't be offloaded - remaining steps are skipped
+        steps.push(DryRunPipelineStep {
+            step: 2,
+            name: "select".to_string(),
+            description: "Select optimal worker for remote execution".to_string(),
+            skipped: true,
+            skip_reason: Some(reason.to_string()),
+            estimated_duration_ms: None,
+        });
+        steps.push(DryRunPipelineStep {
+            step: 3,
+            name: "sync_up".to_string(),
+            description: "Sync project files to remote worker via rsync".to_string(),
+            skipped: true,
+            skip_reason: Some("command not offloaded".to_string()),
+            estimated_duration_ms: None,
+        });
+        steps.push(DryRunPipelineStep {
+            step: 4,
+            name: "exec".to_string(),
+            description: "Execute compilation command on remote worker".to_string(),
+            skipped: true,
+            skip_reason: Some("command not offloaded".to_string()),
+            estimated_duration_ms: None,
+        });
+        steps.push(DryRunPipelineStep {
+            step: 5,
+            name: "sync_down".to_string(),
+            description: "Retrieve build artifacts from remote worker".to_string(),
+            skipped: true,
+            skip_reason: Some("command not offloaded".to_string()),
+            estimated_duration_ms: None,
+        });
+
+        return DryRunSummary {
+            would_offload: false,
+            reason: reason.to_string(),
+            pipeline_steps: steps,
+            transfer_estimate: None,
+            total_estimated_ms: Some(total_estimated_ms),
+        };
+    }
+
+    // Step 2: Worker selection
+    let (worker_selected, selection_reason) = if !daemon_reachable {
+        (false, "daemon not reachable".to_string())
+    } else if let Some(ws) = worker_selection {
+        if ws.worker.is_some() {
+            (true, format!("{:?}", ws.reason))
+        } else {
+            (false, format!("{:?}", ws.reason))
+        }
+    } else {
+        (false, "selection not performed".to_string())
+    };
+
+    steps.push(DryRunPipelineStep {
+        step: 2,
+        name: "select".to_string(),
+        description: if worker_selected {
+            format!(
+                "Worker selected: {}",
+                worker_selection
+                    .as_ref()
+                    .and_then(|ws| ws.worker.as_ref())
+                    .map(|w| w.id.as_str())
+                    .unwrap_or("unknown")
+            )
+        } else {
+            "Select optimal worker for remote execution".to_string()
+        },
+        skipped: !worker_selected,
+        skip_reason: if worker_selected {
+            None
+        } else {
+            Some(selection_reason.clone())
+        },
+        estimated_duration_ms: Some(5),
+    });
+    total_estimated_ms += 5;
+
+    if !worker_selected {
+        // No worker available - remaining steps are skipped
+        steps.push(DryRunPipelineStep {
+            step: 3,
+            name: "sync_up".to_string(),
+            description: "Sync project files to remote worker via rsync".to_string(),
+            skipped: true,
+            skip_reason: Some("no worker available".to_string()),
+            estimated_duration_ms: None,
+        });
+        steps.push(DryRunPipelineStep {
+            step: 4,
+            name: "exec".to_string(),
+            description: "Execute compilation command on remote worker".to_string(),
+            skipped: true,
+            skip_reason: Some("no worker available".to_string()),
+            estimated_duration_ms: None,
+        });
+        steps.push(DryRunPipelineStep {
+            step: 5,
+            name: "sync_down".to_string(),
+            description: "Retrieve build artifacts from remote worker".to_string(),
+            skipped: true,
+            skip_reason: Some("no worker available".to_string()),
+            estimated_duration_ms: None,
+        });
+
+        return DryRunSummary {
+            would_offload: false,
+            reason: format!("no worker available: {}", selection_reason),
+            pipeline_steps: steps,
+            transfer_estimate: None,
+            total_estimated_ms: Some(total_estimated_ms),
+        };
+    }
+
+    // Step 3: Sync up (transfer estimate not available in diagnose mode)
+    steps.push(DryRunPipelineStep {
+        step: 3,
+        name: "sync_up".to_string(),
+        description: "Sync project files to remote worker via rsync".to_string(),
+        skipped: false,
+        skip_reason: None,
+        estimated_duration_ms: None, // Would need rsync dry-run
+    });
+
+    // Step 4: Execute
+    steps.push(DryRunPipelineStep {
+        step: 4,
+        name: "exec".to_string(),
+        description: "Execute compilation command on remote worker".to_string(),
+        skipped: false,
+        skip_reason: None,
+        estimated_duration_ms: None, // Depends on build complexity
+    });
+
+    // Step 5: Sync down
+    steps.push(DryRunPipelineStep {
+        step: 5,
+        name: "sync_down".to_string(),
+        description: "Retrieve build artifacts from remote worker".to_string(),
+        skipped: false,
+        skip_reason: None,
+        estimated_duration_ms: None, // Would need rsync dry-run
+    });
+
+    DryRunSummary {
+        would_offload: true,
+        reason: "compilation command meets threshold, worker available".to_string(),
+        pipeline_steps: steps,
+        transfer_estimate: None,  // Would need actual rsync dry-run
+        total_estimated_ms: None, // Total unknown without transfer estimates
+    }
+}
+
 /// Diagnose command classification and selection decisions.
-pub async fn diagnose(command: &str, ctx: &OutputContext) -> Result<()> {
+pub async fn diagnose(command: &str, dry_run: bool, ctx: &OutputContext) -> Result<()> {
     let style = ctx.theme();
     let loaded = crate::config::load_config_with_sources()?;
     let config = loaded.config;
@@ -6386,6 +6654,18 @@ pub async fn diagnose(command: &str, ctx: &OutputContext) -> Result<()> {
         }
     }
 
+    // Build dry-run summary if requested
+    let dry_run_summary = if dry_run {
+        Some(build_dry_run_summary(
+            would_intercept,
+            &decision.reason,
+            &worker_selection,
+            daemon_status.reachable,
+        ))
+    } else {
+        None
+    };
+
     if ctx.is_json() {
         let response = DiagnoseResponse {
             classification: details.classification.clone(),
@@ -6398,15 +6678,88 @@ pub async fn diagnose(command: &str, ctx: &OutputContext) -> Result<()> {
             },
             threshold: DiagnoseThreshold {
                 value: threshold,
-                source: threshold_source,
+                source: threshold_source.clone(),
             },
             daemon: daemon_status,
             required_runtime,
             local_capabilities: local_has_any.then(|| local_capabilities.clone()),
             capabilities_warnings: capabilities_warnings.clone(),
             worker_selection,
+            dry_run: dry_run_summary.clone(),
         };
         let _ = ctx.json(&ApiResponse::ok("diagnose", response));
+        return Ok(());
+    }
+
+    // Display dry-run pipeline if requested
+    if dry_run {
+        println!("{}", style.format_header("RCH Dry Run"));
+        println!();
+        if let Some(ref summary) = dry_run_summary {
+            let offload_label = if summary.would_offload {
+                style.format_success("YES")
+            } else {
+                style.format_warning("NO")
+            };
+            println!(
+                "{} {} {}",
+                style.key("Would offload:"),
+                offload_label,
+                style.muted(&format!("({})", summary.reason))
+            );
+            println!();
+            println!("{}", style.highlight("Pipeline Steps"));
+            for step in &summary.pipeline_steps {
+                let status = if step.skipped {
+                    style.muted("[SKIP]")
+                } else {
+                    style.success("[RUN]")
+                };
+                println!(
+                    "  {} {} {}",
+                    status,
+                    style.value(&format!("{}.", step.step)),
+                    style.highlight(&step.name)
+                );
+                println!("     {}", style.muted(&step.description));
+                if let Some(ref reason) = step.skip_reason {
+                    println!("     {} {}", style.warning("Skip:"), style.muted(reason));
+                }
+                if let Some(ms) = step.estimated_duration_ms {
+                    println!("     {} ~{}ms", style.muted("Est:"), ms);
+                }
+            }
+            if let Some(ref transfer) = summary.transfer_estimate {
+                println!();
+                println!("{}", style.highlight("Transfer Estimate"));
+                println!(
+                    "  {} {} ({} files)",
+                    style.key("Size:"),
+                    style.value(&transfer.human_size),
+                    transfer.files
+                );
+                println!("  {} ~{}ms", style.key("Time:"), transfer.estimated_time_ms);
+                if transfer.would_skip {
+                    println!(
+                        "  {} {}",
+                        style.warning("Would skip:"),
+                        transfer
+                            .skip_reason
+                            .as_deref()
+                            .unwrap_or("threshold exceeded")
+                    );
+                }
+            }
+            if let Some(total_ms) = summary.total_estimated_ms {
+                println!();
+                println!("{} ~{}ms", style.key("Total estimated:"), total_ms);
+            }
+        }
+        println!();
+        println!(
+            "  {} This is a dry run. No network calls were made.",
+            style.muted("ℹ")
+        );
         return Ok(());
     }
 
@@ -8332,6 +8685,15 @@ mod tests {
                 compression_level: 3,
                 exclude_patterns: vec!["target/".to_string()],
                 remote_base: "/tmp/rch".to_string(),
+                max_transfer_mb: None,
+                max_transfer_time_ms: None,
+                bwlimit_kbps: None,
+                estimated_bandwidth_bps: None,
+                adaptive_compression: false,
+                min_compression_level: 1,
+                max_compression_level: 19,
+                verify_artifacts: false,
+                verify_max_size_bytes: 100 * 1024 * 1024,
             },
             environment: ConfigEnvironmentSection {
                 allowlist: vec!["RUSTFLAGS".to_string()],
@@ -8477,6 +8839,7 @@ mod tests {
             local_capabilities: None,
             capabilities_warnings: Vec::new(),
             worker_selection: None,
+            dry_run: None,
         };
 
         let json = serde_json::to_value(&response).unwrap();
@@ -8649,5 +9012,175 @@ mod tests {
     #[test]
     fn default_socket_path_is_expected() {
         assert_eq!(DEFAULT_SOCKET_PATH, "/tmp/rch.sock");
+    }
+
+    // -------------------------------------------------------------------------
+    // Dry Run Summary Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn dry_run_summary_not_intercepted() {
+        let summary = build_dry_run_summary(false, "not a compilation command", &None, false);
+        assert!(!summary.would_offload);
+        assert_eq!(summary.reason, "not a compilation command");
+        assert_eq!(summary.pipeline_steps.len(), 5);
+        // First step (classify) should not be skipped
+        assert!(!summary.pipeline_steps[0].skipped);
+        // Remaining steps should be skipped
+        for step in &summary.pipeline_steps[1..] {
+            assert!(step.skipped);
+        }
+    }
+
+    #[test]
+    fn dry_run_summary_intercepted_no_daemon() {
+        let summary = build_dry_run_summary(
+            true,
+            "meets confidence threshold",
+            &None,
+            false, // daemon not reachable
+        );
+        assert!(!summary.would_offload);
+        assert!(summary.reason.contains("no worker available"));
+        assert_eq!(summary.pipeline_steps.len(), 5);
+        // Classify should run
+        assert!(!summary.pipeline_steps[0].skipped);
+        // Select should be skipped (no daemon)
+        assert!(summary.pipeline_steps[1].skipped);
+        assert_eq!(summary.pipeline_steps[1].name, "select");
+    }
+
+    #[test]
+    fn dry_run_summary_intercepted_with_worker() {
+        let worker = SelectedWorker {
+            id: WorkerId::new("test-worker"),
+            host: "worker.example.com".to_string(),
+            user: "rch".to_string(),
+            identity_file: "~/.ssh/id_rsa".to_string(),
+            slots_available: 4,
+            speed_score: 1.5,
+        };
+        let worker_selection = DiagnoseWorkerSelection {
+            estimated_cores: 4,
+            worker: Some(worker),
+            reason: SelectionReason::Success,
+        };
+        let summary = build_dry_run_summary(
+            true,
+            "meets confidence threshold",
+            &Some(worker_selection),
+            true, // daemon reachable
+        );
+        assert!(summary.would_offload);
+        assert!(summary.reason.contains("worker available"));
+        assert_eq!(summary.pipeline_steps.len(), 5);
+        // All steps should run (not skipped)
+        for step in &summary.pipeline_steps {
+            assert!(!step.skipped, "Step {} should not be skipped", step.name);
+        }
+    }
+
+    #[test]
+    fn dry_run_pipeline_step_serializes() {
+        let step = DryRunPipelineStep {
+            step: 1,
+            name: "classify".to_string(),
+            description: "Analyze command".to_string(),
+            skipped: false,
+            skip_reason: None,
+            estimated_duration_ms: Some(2),
+        };
+        let json = serde_json::to_value(&step).unwrap();
+        assert_eq!(json["step"], 1);
+        assert_eq!(json["name"], "classify");
+        assert_eq!(json["skipped"], false);
+        assert_eq!(json["estimated_duration_ms"], 2);
+        assert!(json.get("skip_reason").is_none());
+    }
+
+    #[test]
+    fn dry_run_pipeline_step_skipped_serializes() {
+        let step = DryRunPipelineStep {
+            step: 2,
+            name: "select".to_string(),
+            description: "Select worker".to_string(),
+            skipped: true,
+            skip_reason: Some("daemon not reachable".to_string()),
+            estimated_duration_ms: None,
+        };
+        let json = serde_json::to_value(&step).unwrap();
+        assert_eq!(json["skipped"], true);
+        assert_eq!(json["skip_reason"], "daemon not reachable");
+        assert!(json.get("estimated_duration_ms").is_none());
+    }
+
+    #[test]
+    fn dry_run_transfer_estimate_serializes() {
+        let estimate = DryRunTransferEstimate {
+            bytes: 1024 * 1024 * 10, // 10 MB
+            human_size: "10.00 MB".to_string(),
+            files: 150,
+            estimated_time_ms: 2500,
+            would_skip: false,
+            skip_reason: None,
+        };
+        let json = serde_json::to_value(&estimate).unwrap();
+        assert_eq!(json["bytes"], 10485760);
+        assert_eq!(json["human_size"], "10.00 MB");
+        assert_eq!(json["files"], 150);
+        assert_eq!(json["estimated_time_ms"], 2500);
+        assert_eq!(json["would_skip"], false);
+    }
+
+    #[test]
+    fn dry_run_transfer_estimate_would_skip_serializes() {
+        let estimate = DryRunTransferEstimate {
+            bytes: 1024 * 1024 * 500, // 500 MB
+            human_size: "500.00 MB".to_string(),
+            files: 5000,
+            estimated_time_ms: 60000,
+            would_skip: true,
+            skip_reason: Some("exceeds max_transfer_mb threshold".to_string()),
+        };
+        let json = serde_json::to_value(&estimate).unwrap();
+        assert_eq!(json["would_skip"], true);
+        assert_eq!(json["skip_reason"], "exceeds max_transfer_mb threshold");
+    }
+
+    #[test]
+    fn dry_run_summary_serializes() {
+        let summary = DryRunSummary {
+            would_offload: true,
+            reason: "compilation command meets threshold".to_string(),
+            pipeline_steps: vec![DryRunPipelineStep {
+                step: 1,
+                name: "classify".to_string(),
+                description: "Analyze command".to_string(),
+                skipped: false,
+                skip_reason: None,
+                estimated_duration_ms: Some(2),
+            }],
+            transfer_estimate: None,
+            total_estimated_ms: Some(100),
+        };
+        let json = serde_json::to_value(&summary).unwrap();
+        assert_eq!(json["would_offload"], true);
+        assert_eq!(json["reason"], "compilation command meets threshold");
+        assert_eq!(json["pipeline_steps"].as_array().unwrap().len(), 1);
+        assert_eq!(json["total_estimated_ms"], 100);
+    }
+
+    #[test]
+    fn format_bytes_basic() {
+        assert_eq!(format_bytes(500), "500 B");
+        assert_eq!(format_bytes(1024), "1.00 KB");
+        assert_eq!(format_bytes(1024 * 1024), "1.00 MB");
+        assert_eq!(format_bytes(1024 * 1024 * 1024), "1.00 GB");
+    }
+
+    #[test]
+    fn format_bytes_fractional() {
+        assert_eq!(format_bytes(1536), "1.50 KB");
+        assert_eq!(format_bytes(1024 * 1024 + 512 * 1024), "1.50 MB");
     }
 }

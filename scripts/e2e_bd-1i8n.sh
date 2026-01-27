@@ -42,11 +42,11 @@ check_dependencies() {
 build_rch() {
     local rch_bin="${PROJECT_ROOT}/target/debug/rch"
     if [[ -x "$rch_bin" ]]; then
-        log_json "setup" "Using existing rch binary" "{\"path\":\"$rch_bin\"}"
+        log_json "setup" "Using existing rch binary" "{\"path\":\"$rch_bin\"}" >&2
         echo "$rch_bin"
         return
     fi
-    log_json "setup" "Building rch (debug)"
+    log_json "setup" "Building rch (debug)" >&2
     (cd "$PROJECT_ROOT" && cargo build -p rch >/dev/null 2>&1) || die "cargo build failed"
     [[ -x "$rch_bin" ]] || die "rch binary missing after build"
     echo "$rch_bin"
@@ -65,7 +65,7 @@ EOF
 read_allowlist() {
     local rch_bin="$1"
     local project_dir="$2"
-    (cd "$project_dir" && "$rch_bin" config show --json) | jq -r '.result.environment.allowlist | join(",")'
+    (cd "$project_dir" && "$rch_bin" config show --json) | jq -r '.data.environment.allowlist | join(",")'
 }
 
 main() {

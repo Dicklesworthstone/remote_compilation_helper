@@ -150,6 +150,18 @@ struct PartialTransferConfig {
     remote_base: Option<String>,
     ssh_server_alive_interval_secs: Option<u64>,
     ssh_control_persist_secs: Option<u64>,
+    // Transfer optimization (bd-3hho)
+    max_transfer_mb: Option<u64>,
+    max_transfer_time_ms: Option<u64>,
+    bwlimit_kbps: Option<u64>,
+    estimated_bandwidth_bps: Option<u64>,
+    // Adaptive compression (bd-243w)
+    adaptive_compression: Option<bool>,
+    min_compression_level: Option<u32>,
+    max_compression_level: Option<u32>,
+    // Artifact verification (bd-377q)
+    verify_artifacts: Option<bool>,
+    verify_max_size_bytes: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -721,6 +733,45 @@ fn apply_layer(
         config.transfer.ssh_control_persist_secs = Some(persist);
         set_source(sources, "transfer.ssh_control_persist_secs", source.clone());
     }
+    // Transfer optimization (bd-3hho)
+    if let Some(max_mb) = layer.transfer.max_transfer_mb {
+        config.transfer.max_transfer_mb = Some(max_mb);
+        set_source(sources, "transfer.max_transfer_mb", source.clone());
+    }
+    if let Some(max_time) = layer.transfer.max_transfer_time_ms {
+        config.transfer.max_transfer_time_ms = Some(max_time);
+        set_source(sources, "transfer.max_transfer_time_ms", source.clone());
+    }
+    if let Some(bwlimit) = layer.transfer.bwlimit_kbps {
+        config.transfer.bwlimit_kbps = Some(bwlimit);
+        set_source(sources, "transfer.bwlimit_kbps", source.clone());
+    }
+    if let Some(bandwidth) = layer.transfer.estimated_bandwidth_bps {
+        config.transfer.estimated_bandwidth_bps = Some(bandwidth);
+        set_source(sources, "transfer.estimated_bandwidth_bps", source.clone());
+    }
+    // Adaptive compression (bd-243w)
+    if let Some(adaptive) = layer.transfer.adaptive_compression {
+        config.transfer.adaptive_compression = adaptive;
+        set_source(sources, "transfer.adaptive_compression", source.clone());
+    }
+    if let Some(min_level) = layer.transfer.min_compression_level {
+        config.transfer.min_compression_level = min_level;
+        set_source(sources, "transfer.min_compression_level", source.clone());
+    }
+    if let Some(max_level) = layer.transfer.max_compression_level {
+        config.transfer.max_compression_level = max_level;
+        set_source(sources, "transfer.max_compression_level", source.clone());
+    }
+    // Artifact verification (bd-377q)
+    if let Some(verify) = layer.transfer.verify_artifacts {
+        config.transfer.verify_artifacts = verify;
+        set_source(sources, "transfer.verify_artifacts", source.clone());
+    }
+    if let Some(max_size) = layer.transfer.verify_max_size_bytes {
+        config.transfer.verify_max_size_bytes = max_size;
+        set_source(sources, "transfer.verify_max_size_bytes", source.clone());
+    }
 
     if let Some(allowlist) = layer.environment.allowlist.as_ref()
         && allowlist != &defaults.environment.allowlist
@@ -1000,6 +1051,36 @@ fn merge_transfer(
                 warn!("Ignoring invalid remote_base in overlay config: {}", e);
             }
         }
+    }
+    // Transfer optimization (bd-3hho)
+    if overlay.max_transfer_mb != default.max_transfer_mb {
+        base.max_transfer_mb = overlay.max_transfer_mb;
+    }
+    if overlay.max_transfer_time_ms != default.max_transfer_time_ms {
+        base.max_transfer_time_ms = overlay.max_transfer_time_ms;
+    }
+    if overlay.bwlimit_kbps != default.bwlimit_kbps {
+        base.bwlimit_kbps = overlay.bwlimit_kbps;
+    }
+    if overlay.estimated_bandwidth_bps != default.estimated_bandwidth_bps {
+        base.estimated_bandwidth_bps = overlay.estimated_bandwidth_bps;
+    }
+    // Adaptive compression (bd-243w)
+    if overlay.adaptive_compression != default.adaptive_compression {
+        base.adaptive_compression = overlay.adaptive_compression;
+    }
+    if overlay.min_compression_level != default.min_compression_level {
+        base.min_compression_level = overlay.min_compression_level;
+    }
+    if overlay.max_compression_level != default.max_compression_level {
+        base.max_compression_level = overlay.max_compression_level;
+    }
+    // Artifact verification (bd-377q)
+    if overlay.verify_artifacts != default.verify_artifacts {
+        base.verify_artifacts = overlay.verify_artifacts;
+    }
+    if overlay.verify_max_size_bytes != default.verify_max_size_bytes {
+        base.verify_max_size_bytes = overlay.verify_max_size_bytes;
     }
 }
 

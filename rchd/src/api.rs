@@ -1774,10 +1774,21 @@ async fn handle_release_worker(ctx: &DaemonContext, request: ReleaseRequest) -> 
             request.duration_ms,
             request.bytes_transferred,
         );
-        if record.is_some() && !cfg!(test) {
-            metrics::dec_active_builds("remote");
-            let outcome = if exit_code == 0 { "success" } else { "failure" };
-            metrics::inc_build_total(outcome, "remote");
+        if let Some(ref rec) = record {
+            if !cfg!(test) {
+                metrics::dec_active_builds("remote");
+                let outcome = if exit_code == 0 { "success" } else { "failure" };
+                metrics::inc_build_total(outcome, "remote");
+            }
+
+            // Record successful builds for affinity pinning
+            if exit_code == 0
+                && let Some(ref worker_id) = rec.worker_id
+            {
+                ctx.worker_selector
+                    .record_success(worker_id, &rec.project_id)
+                    .await;
+            }
         }
     }
     Ok(())

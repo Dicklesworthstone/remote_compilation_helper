@@ -302,11 +302,15 @@ to clean up. Use --force to immediately terminate with SIGKILL."#)]
     rch diagnose "cargo build --release"
     rch diagnose cargo build --release
     rch diagnose "bun test"
-    rch diagnose "ls -la""#)]
+    rch diagnose "ls -la"
+    rch diagnose --dry-run "cargo build"  # Show full pipeline without side effects"#)]
     Diagnose {
         /// Command to analyze (quote or pass as multiple args)
         #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
         command: Vec<String>,
+        /// Show full offload pipeline steps without any network side effects
+        #[arg(long, short = 'n')]
+        dry_run: bool,
     },
 
     /// Install and manage the Claude Code PreToolUse hook
@@ -1195,7 +1199,9 @@ async fn main() -> Result<()> {
                 yes,
             } => commands::cancel_build(build_id, all, force, yes, &ctx).await,
             Commands::Config { action } => handle_config(action, &ctx).await,
-            Commands::Diagnose { command } => handle_diagnose(command, &ctx).await,
+            Commands::Diagnose { command, dry_run } => {
+                handle_diagnose(command, dry_run, &ctx).await
+            }
             Commands::Hook { action } => handle_hook(action, &ctx).await,
             Commands::Agents { action } => handle_agents(action, &ctx).await,
             Commands::Completions { action } => handle_completions(action, &ctx),
@@ -1851,9 +1857,9 @@ async fn handle_config(action: ConfigAction, ctx: &OutputContext) -> Result<()> 
     Ok(())
 }
 
-async fn handle_diagnose(command: Vec<String>, ctx: &OutputContext) -> Result<()> {
+async fn handle_diagnose(command: Vec<String>, dry_run: bool, ctx: &OutputContext) -> Result<()> {
     let joined = command.join(" ");
-    commands::diagnose(&joined, ctx).await?;
+    commands::diagnose(&joined, dry_run, ctx).await?;
     Ok(())
 }
 
@@ -2595,8 +2601,9 @@ mod tests {
     fn cli_parses_diagnose_single_arg() {
         let cli = Cli::try_parse_from(["rch", "diagnose", "cargo build --release"]).unwrap();
         match cli.command {
-            Some(Commands::Diagnose { command }) => {
+            Some(Commands::Diagnose { command, dry_run }) => {
                 assert_eq!(command, vec!["cargo build --release"]);
+                assert!(!dry_run);
             }
             _ => panic!("Expected diagnose command"),
         }
@@ -2606,8 +2613,33 @@ mod tests {
     fn cli_parses_diagnose_multi_arg() {
         let cli = Cli::try_parse_from(["rch", "diagnose", "cargo", "build", "--release"]).unwrap();
         match cli.command {
-            Some(Commands::Diagnose { command }) => {
+            Some(Commands::Diagnose { command, dry_run }) => {
                 assert_eq!(command, vec!["cargo", "build", "--release"]);
+                assert!(!dry_run);
+            }
+            _ => panic!("Expected diagnose command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_diagnose_dry_run() {
+        let cli = Cli::try_parse_from(["rch", "diagnose", "--dry-run", "cargo", "build"]).unwrap();
+        match cli.command {
+            Some(Commands::Diagnose { command, dry_run }) => {
+                assert_eq!(command, vec!["cargo", "build"]);
+                assert!(dry_run);
+            }
+            _ => panic!("Expected diagnose command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_diagnose_dry_run_short() {
+        let cli = Cli::try_parse_from(["rch", "diagnose", "-n", "cargo", "build"]).unwrap();
+        match cli.command {
+            Some(Commands::Diagnose { command, dry_run }) => {
+                assert_eq!(command, vec!["cargo", "build"]);
+                assert!(dry_run);
             }
             _ => panic!("Expected diagnose command"),
         }

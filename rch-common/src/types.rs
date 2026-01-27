@@ -162,6 +162,10 @@ pub enum SelectionReason {
     NoWorkersWithRuntime(String),
     /// Internal error during selection.
     SelectionError(String),
+    /// Worker assigned via affinity pinning (recent successful build).
+    AffinityPinned,
+    /// Worker assigned via last-success fallback (all others unavailable).
+    AffinityFallback,
 }
 
 impl std::fmt::Display for SelectionReason {
@@ -175,6 +179,8 @@ impl std::fmt::Display for SelectionReason {
             Self::NoMatchingWorkers => write!(f, "no matching workers found"),
             Self::NoWorkersWithRuntime(rt) => write!(f, "no workers with {} installed", rt),
             Self::SelectionError(e) => write!(f, "selection error: {}", e),
+            Self::AffinityPinned => write!(f, "worker assigned via affinity pinning"),
+            Self::AffinityFallback => write!(f, "worker assigned via last-success fallback"),
         }
     }
 }

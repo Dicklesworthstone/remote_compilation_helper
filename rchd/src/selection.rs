@@ -15,7 +15,8 @@ use crate::workers::{WorkerPool, WorkerState};
 use rand::Rng;
 use rch_common::{
     CircuitBreakerConfig, CircuitState, CommandPriority, RequiredRuntime, SelectionConfig,
-    SelectionReason, SelectionRequest, SelectionStrategy, SelectionWeightConfig, classify_command,
+    SelectionReason, SelectionRequest, SelectionStrategy, SelectionWeightConfig, WorkerId,
+    classify_command,
 };
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -284,12 +285,7 @@ impl CacheTracker {
     }
 
     /// Check if a worker has had a recent successful build for a project.
-    pub fn has_recent_success(
-        &self,
-        worker_id: &str,
-        project_id: &str,
-        max_age: Duration,
-    ) -> bool {
+    pub fn has_recent_success(&self, worker_id: &str, project_id: &str, max_age: Duration) -> bool {
         self.workers
             .get(worker_id)
             .and_then(|c| c.get(project_id))
@@ -595,6 +591,30 @@ impl WorkerSelector {
         };
 
         if eligible.is_empty() {
+            // Try last-success fallback if enabled
+            if let Some(fallback_worker_id) = self.try_fallback(pool, request).await {
+                // Record fallback selection in audit log
+                self.record_audit_entry(
+                    request,
+                    Vec::new(),
+                    Some(fallback_worker_id.clone()),
+                    &SelectionReason::AffinityFallback,
+                    select_start.elapsed(),
+                )
+                .await;
+                let worker_id = WorkerId::new(&fallback_worker_id);
+                if let Some(worker) = pool.get(&worker_id).await {
+                    debug!(
+                        "Using affinity fallback worker {} for project {}",
+                        fallback_worker_id, request.project
+                    );
+                    return SelectionResult {
+                        worker: Some(worker),
+                        reason: SelectionReason::AffinityFallback,
+                    };
+                }
+            }
+
             // Record empty selection in audit log
             self.record_audit_entry(
                 request,
@@ -607,6 +627,43 @@ impl WorkerSelector {
             return SelectionResult {
                 worker: None,
                 reason: SelectionReason::AllWorkersBusy,
+            };
+        }
+
+        // Check for affinity-pinned worker (if enabled)
+        let pinned_selection = self.try_pinned_worker(&eligible, request).await;
+        if let Some((worker, circuit_state)) = pinned_selection {
+            let worker_id = worker.config.read().await.id.as_str().to_string();
+            debug!(
+                "Using affinity-pinned worker {} for project {}",
+                worker_id, request.project
+            );
+
+            // Record the selection for fairness tracking
+            let mut history = self.selection_history.write().await;
+            history.record_selection(&worker_id);
+
+            // Record in audit log
+            let breakdowns = self
+                .build_score_breakdowns(&eligible, request, cache_use, Some(&worker_id))
+                .await;
+            self.record_audit_entry(
+                request,
+                breakdowns,
+                Some(worker_id.clone()),
+                &SelectionReason::AffinityPinned,
+                select_start.elapsed(),
+            )
+            .await;
+
+            // If selecting a half-open worker, start the probe
+            if circuit_state == CircuitState::HalfOpen {
+                worker.start_probe(&self.circuit_config).await;
+            }
+
+            return SelectionResult {
+                worker: Some(worker),
+                reason: SelectionReason::AffinityPinned,
             };
         }
 
@@ -760,6 +817,66 @@ impl WorkerSelector {
         cache
             .get_last_success_worker(project_id)
             .map(|entry| entry.worker_id.clone())
+    }
+
+    /// Try to select an affinity-pinned worker from the eligible list.
+    ///
+    /// Returns the pinned worker if:
+    /// - Affinity is enabled
+    /// - Project has a pinned worker within the pin window
+    /// - The pinned worker is in the eligible list
+    async fn try_pinned_worker(
+        &self,
+        eligible: &[(Arc<WorkerState>, CircuitState)],
+        request: &SelectionRequest,
+    ) -> Option<(Arc<WorkerState>, CircuitState)> {
+        if !self.config.affinity.enabled {
+            return None;
+        }
+
+        let pinned_worker_id = self.get_pinned_worker(&request.project).await?;
+
+        // Find the pinned worker in the eligible list
+        for (worker, circuit_state) in eligible {
+            let config = worker.config.read().await;
+            if config.id.as_str() == pinned_worker_id {
+                return Some((worker.clone(), *circuit_state));
+            }
+        }
+
+        None
+    }
+
+    /// Try to find a fallback worker when no eligible workers exist.
+    ///
+    /// Returns the last-success worker if:
+    /// - Last-success fallback is enabled
+    /// - The worker still exists in the pool
+    /// - The worker has available slots
+    /// - The worker's circuit is not open
+    async fn try_fallback(&self, pool: &WorkerPool, request: &SelectionRequest) -> Option<String> {
+        if !self.config.affinity.enable_last_success_fallback {
+            return None;
+        }
+
+        let fallback_id = self.get_fallback_worker(&request.project).await?;
+
+        // Check if the fallback worker is viable
+        let worker_id = WorkerId::new(&fallback_id);
+        let worker = pool.get(&worker_id).await?;
+        let available = worker.available_slots().await;
+        if available == 0 {
+            return None;
+        }
+
+        // Check circuit state (don't use if open)
+        if let Some(circuit_state) = worker.circuit_state().await
+            && circuit_state == CircuitState::Open
+        {
+            return None;
+        }
+
+        Some(fallback_id)
     }
 
     /// Build score breakdowns for all workers in a selection decision (bd-37hc).
@@ -3122,5 +3239,122 @@ mod tests {
         assert_eq!(entry.command, Some("cargo test".to_string()));
         assert_eq!(entry.strategy, "Priority"); // Default strategy
         assert_eq!(entry.classification_duration_us, Some(250));
+    }
+
+    // ========================================================================
+    // Affinity Pinning Tests (bd-5a5k)
+    // ========================================================================
+
+    #[test]
+    fn test_cache_tracker_record_success() {
+        let mut tracker = CacheTracker::new();
+        let pin_window = Duration::from_secs(3600);
+
+        // Initially no pinned worker
+        assert!(tracker.get_pinned_worker("project-a", pin_window).is_none());
+
+        // Record a success
+        tracker.record_build("worker1", "project-a", CacheUse::Build);
+        tracker.record_success("worker1", "project-a");
+
+        // Now should have pinned worker
+        let pinned = tracker.get_pinned_worker("project-a", pin_window);
+        assert_eq!(pinned, Some("worker1"));
+    }
+
+    #[test]
+    fn test_cache_tracker_last_success_entry() {
+        let mut tracker = CacheTracker::new();
+
+        // No entry initially
+        assert!(tracker.get_last_success_worker("project-x").is_none());
+
+        // Record success
+        tracker.record_build("worker2", "project-x", CacheUse::Build);
+        tracker.record_success("worker2", "project-x");
+
+        // Should have last success entry
+        let entry = tracker.get_last_success_worker("project-x");
+        assert!(entry.is_some());
+        assert_eq!(entry.unwrap().worker_id, "worker2");
+    }
+
+    #[test]
+    fn test_cache_tracker_pin_updates_on_new_success() {
+        let mut tracker = CacheTracker::new();
+        let pin_window = Duration::from_secs(3600);
+
+        // First success
+        tracker.record_build("worker1", "project-a", CacheUse::Build);
+        tracker.record_success("worker1", "project-a");
+
+        // Second success on different worker
+        tracker.record_build("worker2", "project-a", CacheUse::Build);
+        tracker.record_success("worker2", "project-a");
+
+        // Pinned worker should be the most recent
+        let pinned = tracker.get_pinned_worker("project-a", pin_window);
+        assert_eq!(pinned, Some("worker2"));
+    }
+
+    #[tokio::test]
+    async fn test_selector_record_success_updates_cache() {
+        let selector = WorkerSelector::new();
+
+        // Record a success
+        selector.record_build("worker1", "project-a", false).await;
+        selector.record_success("worker1", "project-a").await;
+
+        // Check pinned worker
+        let pinned = selector.get_pinned_worker("project-a").await;
+        assert_eq!(pinned, Some("worker1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_selector_affinity_disabled_returns_none() {
+        use rch_common::AffinityConfig;
+
+        let selector = WorkerSelector::with_config(
+            SelectionConfig {
+                affinity: AffinityConfig {
+                    enabled: false,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            CircuitBreakerConfig::default(),
+        );
+
+        // Record a success
+        selector.record_build("worker1", "project-a", false).await;
+        selector.record_success("worker1", "project-a").await;
+
+        // Affinity disabled, should return None
+        let pinned = selector.get_pinned_worker("project-a").await;
+        assert!(pinned.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_selector_fallback_disabled_returns_none() {
+        use rch_common::AffinityConfig;
+
+        let selector = WorkerSelector::with_config(
+            SelectionConfig {
+                affinity: AffinityConfig {
+                    enable_last_success_fallback: false,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            CircuitBreakerConfig::default(),
+        );
+
+        // Record a success
+        selector.record_build("worker1", "project-a", false).await;
+        selector.record_success("worker1", "project-a").await;
+
+        // Fallback disabled, should return None
+        let fallback = selector.get_fallback_worker("project-a").await;
+        assert!(fallback.is_none());
     }
 }

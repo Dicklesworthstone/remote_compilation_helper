@@ -1271,6 +1271,18 @@ async fn handle_selection_response(
             }
         }
         Err(e) => {
+            // Check if this is a transfer skip (not a failure, just too large/slow)
+            if let Some(skip_err) = e.downcast_ref::<TransferError>()
+                && let TransferError::TransferSkipped { reason } = skip_err
+            {
+                info!(
+                    "Transfer skipped ({}), falling back to local execution",
+                    reason
+                );
+                reporter.summary(&format!("[RCH] local ({})", reason));
+                return HookOutput::allow();
+            }
+
             // Pipeline failed - fall back to local execution
             warn!(
                 "Remote execution pipeline failed: {}, falling back to local",
@@ -1698,6 +1710,19 @@ async fn execute_remote_compilation(
     .with_color_mode(color_mode)
     .with_env_allowlist(env_allowlist)
     .with_command_timeout(command_timeout);
+
+    // Check if transfer should be skipped based on size/time estimation
+    if let Some(skip_reason) = pipeline.should_skip_transfer(&worker_config).await {
+        info!(
+            "Transfer estimation indicates skip: {} (worker {})",
+            skip_reason, worker_config.id
+        );
+        reporter.verbose(&format!("[RCH] skip transfer: {}", skip_reason));
+        return Err(TransferError::TransferSkipped {
+            reason: skip_reason,
+        }
+        .into());
+    }
 
     // Step 1: Sync project to remote
     info!("Syncing project to worker {}...", worker_config.id);

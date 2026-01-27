@@ -442,6 +442,17 @@ pub enum TransferError {
         #[source]
         source: std::io::Error,
     },
+
+    /// Transfer estimation indicates transfer should be skipped.
+    ///
+    /// This is not a fatal error - it indicates that the transfer would exceed
+    /// configured limits (size, time) and local execution should be used instead.
+    #[error("Transfer skipped: {reason}")]
+    #[diagnostic(
+        code("RCH-W410"),
+        help("Adjust transfer limits in config: max_transfer_mb, max_transfer_time_ms")
+    )]
+    TransferSkipped { reason: String },
 }
 
 // =============================================================================
