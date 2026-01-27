@@ -14,7 +14,9 @@ use rch_telemetry::TelemetryStorage;
 use serde::Serialize;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+use which::which;
 
 /// Default socket path (XDG_RUNTIME_DIR -> ~/.cache/rch -> /tmp fallback).
 fn default_socket_path() -> PathBuf {
@@ -117,8 +119,8 @@ pub async fn run_doctor(ctx: &OutputContext, options: DoctorOptions) -> Result<(
     check_prerequisites(&mut checks, ctx, &options);
     check_configuration(&mut checks, ctx, &options);
     check_ssh_keys(&mut checks, ctx, &options, &mut fixes_applied);
-    check_daemon(&mut checks, ctx, &options);
     check_hooks(&mut checks, ctx, &options, &mut fixes_applied);
+    check_daemon(&mut checks, ctx, &options, &mut fixes_applied);
     check_workers(&mut checks, ctx, &options).await;
     check_telemetry_database(&mut checks, ctx, &options);
 
@@ -1033,7 +1035,79 @@ fn check_ssh_config() -> CheckResult {
 // Daemon Checks
 // =============================================================================
 
-fn check_daemon(checks: &mut Vec<CheckResult>, ctx: &OutputContext, _options: &DoctorOptions) {
+fn which_rchd_path() -> PathBuf {
+    // Try to find rchd in same directory as current executable
+    if let Ok(exe_path) = std::env::current_exe()
+        && let Some(dir) = exe_path.parent()
+    {
+        let rchd = dir.join("rchd");
+        if rchd.exists() {
+            return rchd;
+        }
+    }
+
+    // Fallback to path lookup
+    which("rchd").unwrap_or_else(|_| PathBuf::from("rchd"))
+}
+
+fn spawn_rchd(rchd_path: &Path, socket_path: &Path) -> Result<(), String> {
+    let mut cmd = Command::new("nohup");
+    cmd.arg(rchd_path)
+        .arg("-s")
+        .arg(socket_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .stdin(Stdio::null());
+
+    cmd.spawn().map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => "rchd not found in PATH".to_string(),
+        _ => e.to_string(),
+    })?;
+    Ok(())
+}
+
+fn wait_for_socket(socket_path: &Path, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if socket_path.exists() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    socket_path.exists()
+}
+
+fn start_daemon_with_binary(
+    socket_path: &Path,
+    rchd_path: &Path,
+    timeout: Duration,
+) -> Result<(), String> {
+    if let Some(parent) = socket_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+
+    spawn_rchd(rchd_path, socket_path)?;
+
+    if wait_for_socket(socket_path, timeout) {
+        return Ok(());
+    }
+
+    Err(format!(
+        "daemon process started but socket not found after {}s",
+        timeout.as_secs()
+    ))
+}
+
+fn start_daemon_for_doctor(socket_path: &Path, timeout: Duration) -> Result<(), String> {
+    start_daemon_with_binary(socket_path, &which_rchd_path(), timeout)
+}
+
+fn check_daemon(
+    checks: &mut Vec<CheckResult>,
+    ctx: &OutputContext,
+    options: &DoctorOptions,
+    fixes_applied: &mut Vec<FixApplied>,
+) {
     let style = ctx.theme();
 
     if !ctx.is_json() {
@@ -1042,7 +1116,7 @@ fn check_daemon(checks: &mut Vec<CheckResult>, ctx: &OutputContext, _options: &D
     }
 
     let socket_path = default_socket_path();
-    let result = if socket_path.exists() {
+    let mut result = if socket_path.exists() {
         CheckResult {
             category: "daemon".to_string(),
             name: "daemon_socket".to_string(),
@@ -1062,11 +1136,63 @@ fn check_daemon(checks: &mut Vec<CheckResult>, ctx: &OutputContext, _options: &D
             message: "Daemon is not running".to_string(),
             details: Some(socket_path.to_string_lossy().to_string()),
             suggestion: Some("Start daemon with: rch daemon start".to_string()),
-            fixable: false,
+            fixable: true,
             fix_applied: false,
             fix_message: None,
         }
     };
+
+    let mut fix_line: Option<(StatusIndicator, String)> = None;
+    if options.fix && result.fixable && result.status != CheckStatus::Pass {
+        if options.dry_run {
+            let msg = "Would start RCH daemon".to_string();
+            result.fix_message = Some(msg.clone());
+            fix_line = Some((StatusIndicator::Pending, format!("Would fix: {}", msg)));
+        } else {
+            match start_daemon_for_doctor(&socket_path, Duration::from_secs(3)) {
+                Ok(()) => {
+                    let msg = "Started RCH daemon".to_string();
+                    result.status = CheckStatus::Pass;
+                    result.message = "Daemon started (fixed)".to_string();
+                    result.details = Some(socket_path.to_string_lossy().to_string());
+                    result.suggestion = None;
+                    result.fixable = false;
+                    result.fix_applied = true;
+                    result.fix_message = Some(msg.clone());
+                    fix_line = Some((StatusIndicator::Success, format!("Fixed: {}", msg)));
+                    fixes_applied.push(FixApplied {
+                        check_name: "daemon_socket".to_string(),
+                        action: msg,
+                        success: true,
+                        error: None,
+                    });
+                }
+                Err(e) => {
+                    let msg = format!("Failed to start daemon: {}", e);
+                    result.fix_message = Some(msg.clone());
+                    fix_line = Some((StatusIndicator::Error, msg.clone()));
+                    fixes_applied.push(FixApplied {
+                        check_name: "daemon_socket".to_string(),
+                        action: "Start RCH daemon".to_string(),
+                        success: false,
+                        error: Some(e),
+                    });
+                }
+            }
+        }
+    }
+
+    if let Some((indicator, line)) = fix_line
+        && !ctx.is_json()
+    {
+        let rendered = match indicator {
+            StatusIndicator::Success => style.success(&line),
+            StatusIndicator::Pending => style.muted(&line),
+            StatusIndicator::Error => style.error(&line),
+            _ => style.info(&line),
+        };
+        println!("  {} {}", indicator.display(style), rendered);
+    }
 
     print_check_result(&result, ctx);
     checks.push(result);
@@ -1551,6 +1677,7 @@ fn print_check_result(result: &CheckResult, ctx: &OutputContext) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     #[test]
     fn test_check_command_exists_which() {
@@ -2321,9 +2448,10 @@ mod tests {
             install_deps: false,
             verbose: false,
         };
+        let mut fixes_applied = Vec::new();
 
         let mut checks = Vec::new();
-        check_daemon(&mut checks, &ctx, &options);
+        check_daemon(&mut checks, &ctx, &options, &mut fixes_applied);
 
         // Should check at least daemon socket
         assert!(!checks.is_empty(), "Should have daemon checks");
@@ -2332,6 +2460,46 @@ mod tests {
             assert_eq!(check.category, "daemon");
         }
         // TEST PASS: Daemon check runs
+    }
+
+    #[test]
+    fn test_wait_for_socket_times_out() {
+        // TEST START: wait_for_socket times out when socket never appears
+        let tmp = TempDir::new().unwrap();
+        let socket_path = tmp.path().join("missing.sock");
+        assert!(!wait_for_socket(&socket_path, Duration::from_millis(50)));
+        // TEST PASS: wait_for_socket timeout
+    }
+
+    #[test]
+    fn test_start_daemon_with_fake_rchd_creates_socket_file() {
+        // TEST START: start_daemon_with_binary uses -s socket path and waits for file
+        let tmp = TempDir::new().unwrap();
+        let socket_path = tmp.path().join("daemon.sock");
+        let fake_rchd = tmp.path().join("rchd");
+
+        let script = format!(
+            "#!/usr/bin/env sh\n\
+sock=\"\"\n\
+while [ \"$#\" -gt 0 ]; do\n\
+  if [ \"$1\" = \"-s\" ] || [ \"$1\" = \"--socket\" ]; then\n\
+    shift\n\
+    sock=\"$1\"\n\
+  fi\n\
+  shift\n\
+done\n\
+[ -n \"$sock\" ] || exit 1\n\
+: > \"$sock\"\n\
+exit 0\n"
+        );
+        std::fs::write(&fake_rchd, script).unwrap();
+        let mut perms = std::fs::metadata(&fake_rchd).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_rchd, perms).unwrap();
+
+        start_daemon_with_binary(&socket_path, &fake_rchd, Duration::from_secs(1)).unwrap();
+        assert!(socket_path.exists());
+        // TEST PASS: start_daemon_with_binary creates socket file
     }
 
     #[test]
