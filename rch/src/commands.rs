@@ -9943,7 +9943,8 @@ mod tests {
 
     #[test]
     fn indent_lines_empty() {
-        assert_eq!(indent_lines("", "  "), "  ");
+        // Empty string has no lines, so output is also empty
+        assert_eq!(indent_lines("", "  "), "");
     }
 
     #[test]
