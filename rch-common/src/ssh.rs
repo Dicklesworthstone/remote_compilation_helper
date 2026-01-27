@@ -772,4 +772,276 @@ mod tests {
             vec!["RUSTFLAGS".to_string(), "QUOTED".to_string()]
         );
     }
+
+    // ==========================================================================
+    // Proptest: SSH command escaping with special chars (bd-2elj)
+    // ==========================================================================
+
+    mod proptest_ssh_escaping {
+        use super::*;
+        use proptest::prelude::*;
+        use std::collections::HashMap;
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(1000))]
+
+            // Test 1: is_valid_env_key never panics on arbitrary strings
+            #[test]
+            fn test_is_valid_env_key_no_panic(s in ".*") {
+                let _ = is_valid_env_key(&s);
+            }
+
+            // Test 2: Valid env keys start with letter/_ and contain only alphanum/_
+            #[test]
+            fn test_is_valid_env_key_accepts_valid(
+                first in "[a-zA-Z_]",
+                rest in "[a-zA-Z0-9_]{0,50}"
+            ) {
+                let key = format!("{}{}", first, rest);
+                prop_assert!(is_valid_env_key(&key), "Should accept valid key: {}", key);
+            }
+
+            // Test 3: Env keys starting with digit are invalid
+            #[test]
+            fn test_is_valid_env_key_rejects_digit_start(
+                digit in "[0-9]",
+                rest in "[a-zA-Z0-9_]{0,20}"
+            ) {
+                let key = format!("{}{}", digit, rest);
+                prop_assert!(!is_valid_env_key(&key), "Should reject digit-start key: {}", key);
+            }
+
+            // Test 4: shell_escape_value never panics on arbitrary strings
+            #[test]
+            fn test_shell_escape_value_no_panic(s in ".*") {
+                let _ = shell_escape_value(&s);
+            }
+
+            // Test 5: shell_escape_value rejects newlines/carriage returns/NUL
+            #[test]
+            fn test_shell_escape_value_rejects_unsafe(
+                prefix in "[a-zA-Z0-9 ]{0,10}",
+                bad_char in "[\n\r\0]",
+                suffix in "[a-zA-Z0-9 ]{0,10}"
+            ) {
+                let value = format!("{}{}{}", prefix, bad_char, suffix);
+                prop_assert!(shell_escape_value(&value).is_none(),
+                    "Should reject value with unsafe char: {:?}", value);
+            }
+
+            // Test 6: shell_escape_value handles safe values
+            #[test]
+            fn test_shell_escape_value_accepts_safe(s in "[a-zA-Z0-9 !@#$%^&*()_+=\\-\\[\\]{}|;:,./<>?]{0,100}") {
+                // These don't contain \n, \r, or \0
+                let result = shell_escape_value(&s);
+                prop_assert!(result.is_some(), "Should accept safe value: {:?}", s);
+
+                // Result should be quoted
+                let escaped = result.unwrap();
+                prop_assert!(escaped.starts_with('\''), "Should start with quote");
+                prop_assert!(escaped.ends_with('\''), "Should end with quote");
+            }
+
+            // Test 7: shell_escape_value properly escapes single quotes
+            #[test]
+            fn test_shell_escape_value_escapes_quotes(
+                prefix in "[a-zA-Z0-9]{0,10}",
+                suffix in "[a-zA-Z0-9]{0,10}"
+            ) {
+                let value = format!("{}'{}", prefix, suffix);
+                let result = shell_escape_value(&value);
+                prop_assert!(result.is_some());
+
+                let escaped = result.unwrap();
+                // Single quote should be replaced with '\"'\"' pattern
+                prop_assert!(escaped.contains("'\"'\"'"),
+                    "Should escape single quote: {} -> {}", value, escaped);
+            }
+
+            // Test 8: build_env_prefix never panics
+            #[test]
+            fn test_build_env_prefix_no_panic(
+                keys in prop::collection::vec("[a-zA-Z_][a-zA-Z0-9_]{0,10}", 0..10),
+                values in prop::collection::vec(".*", 0..10)
+            ) {
+                let mut env = HashMap::new();
+                for (i, key) in keys.iter().enumerate() {
+                    if let Some(val) = values.get(i) {
+                        env.insert(key.clone(), val.clone());
+                    }
+                }
+
+                let allowlist: Vec<String> = keys;
+                let _ = build_env_prefix(&allowlist, |k| env.get(k).cloned());
+            }
+
+            // Test 9: build_env_prefix rejects invalid keys (non-empty after trim)
+            #[test]
+            fn test_build_env_prefix_rejects_invalid_keys(
+                // Generate keys that are invalid even after trimming
+                invalid_key in "[0-9][a-zA-Z0-9_]{0,10}"  // Starts with digit
+            ) {
+                let mut env = HashMap::new();
+                env.insert(invalid_key.clone(), "value".to_string());
+
+                let allowlist = vec![invalid_key.clone()];
+                let prefix = build_env_prefix(&allowlist, |k| env.get(k).cloned());
+
+                // Key should be rejected since it starts with a digit
+                prop_assert!(!is_valid_env_key(&invalid_key),
+                    "Key should be invalid: {}", invalid_key);
+                prop_assert!(prefix.rejected.contains(&invalid_key),
+                    "Should reject invalid key: {}", invalid_key);
+                prop_assert!(prefix.prefix.is_empty());
+            }
+
+            // Test 10: build_env_prefix handles missing values gracefully
+            #[test]
+            fn test_build_env_prefix_missing_values(
+                keys in prop::collection::vec("[A-Z_][A-Z0-9_]{0,10}", 1..5)
+            ) {
+                // Empty env - all keys missing
+                let env: HashMap<String, String> = HashMap::new();
+                let prefix = build_env_prefix(&keys, |k| env.get(k).cloned());
+
+                // Should be empty prefix since no values found
+                prop_assert!(prefix.prefix.is_empty(), "Should be empty when no values");
+                prop_assert!(prefix.applied.is_empty());
+                // Missing values don't count as rejected
+                prop_assert!(prefix.rejected.is_empty());
+            }
+        }
+
+        // Targeted edge case tests
+        #[test]
+        fn test_shell_escape_edge_cases() {
+            // Empty string
+            let result = shell_escape_value("");
+            assert_eq!(result, Some("''".to_string()));
+
+            // Just single quote
+            let result = shell_escape_value("'");
+            assert_eq!(result, Some("''\"'\"''".to_string()));
+
+            // Multiple single quotes
+            let result = shell_escape_value("'''");
+            assert!(result.is_some());
+            let escaped = result.unwrap();
+            assert_eq!(escaped.matches("'\"'\"'").count(), 3);
+
+            // Unicode
+            let result = shell_escape_value("日本語");
+            assert!(result.is_some());
+
+            // Emoji
+            let result = shell_escape_value("🔥🚀");
+            assert!(result.is_some());
+
+            // Mixed quotes and special chars
+            let result = shell_escape_value("it's a \"test\" with $vars");
+            assert!(result.is_some());
+        }
+
+        #[test]
+        fn test_is_valid_env_key_edge_cases() {
+            // Empty
+            assert!(!is_valid_env_key(""));
+
+            // Single underscore
+            assert!(is_valid_env_key("_"));
+
+            // Single letter
+            assert!(is_valid_env_key("A"));
+
+            // Typical env vars
+            assert!(is_valid_env_key("PATH"));
+            assert!(is_valid_env_key("HOME"));
+            assert!(is_valid_env_key("RUSTFLAGS"));
+            assert!(is_valid_env_key("CC"));
+            assert!(is_valid_env_key("_PRIVATE"));
+            assert!(is_valid_env_key("MY_VAR_123"));
+
+            // Invalid: starts with number
+            assert!(!is_valid_env_key("1VAR"));
+            assert!(!is_valid_env_key("123"));
+
+            // Invalid: contains special chars
+            assert!(!is_valid_env_key("MY-VAR"));
+            assert!(!is_valid_env_key("MY.VAR"));
+            assert!(!is_valid_env_key("MY VAR"));
+            assert!(!is_valid_env_key("MY=VAR"));
+
+            // Invalid: Unicode
+            assert!(!is_valid_env_key("日本語"));
+            assert!(!is_valid_env_key("VAR🔥"));
+        }
+
+        #[test]
+        fn test_build_env_prefix_integration() {
+            // Complex scenario with mixed valid/invalid
+            let mut env = HashMap::new();
+            env.insert("VALID".to_string(), "simple".to_string());
+            env.insert("WITH_QUOTE".to_string(), "it's here".to_string());
+            env.insert("NEWLINE".to_string(), "line1\nline2".to_string());
+            env.insert("UNICODE".to_string(), "日本語".to_string());
+            env.insert("EMPTY".to_string(), String::new());
+            env.insert("123INVALID".to_string(), "value".to_string());
+
+            let allowlist = vec![
+                "VALID".to_string(),
+                "WITH_QUOTE".to_string(),
+                "NEWLINE".to_string(),
+                "UNICODE".to_string(),
+                "EMPTY".to_string(),
+                "123INVALID".to_string(),
+                "MISSING".to_string(),
+            ];
+
+            let prefix = build_env_prefix(&allowlist, |k| env.get(k).cloned());
+
+            // VALID should be applied
+            assert!(prefix.applied.contains(&"VALID".to_string()));
+            assert!(prefix.prefix.contains("VALID='simple'"));
+
+            // WITH_QUOTE should be applied with escaped quote
+            assert!(prefix.applied.contains(&"WITH_QUOTE".to_string()));
+
+            // NEWLINE should be rejected (unsafe value)
+            assert!(prefix.rejected.contains(&"NEWLINE".to_string()));
+
+            // UNICODE should be applied (safe unicode)
+            assert!(prefix.applied.contains(&"UNICODE".to_string()));
+
+            // EMPTY should be applied
+            assert!(prefix.applied.contains(&"EMPTY".to_string()));
+
+            // 123INVALID should be rejected (invalid key)
+            assert!(prefix.rejected.contains(&"123INVALID".to_string()));
+
+            // MISSING should not appear in either list (not found = silently ignored)
+            assert!(!prefix.applied.contains(&"MISSING".to_string()));
+            assert!(!prefix.rejected.contains(&"MISSING".to_string()));
+        }
+
+        #[test]
+        fn test_shell_escape_roundtrip_safety() {
+            // Values that when escaped and passed through shell should reconstruct original
+            let test_values = [
+                "simple",
+                "with spaces",
+                "with\ttab",
+                "special!@#$%^&*()",
+                "quoted\"value",
+                "path/to/file",
+                "-flag",
+                "--long-flag=value",
+                "",
+            ];
+
+            for value in &test_values {
+                let escaped = shell_escape_value(value);
+                assert!(escaped.is_some(), "Should escape: {:?}", value);
+            }
+        }
+    }
 }
