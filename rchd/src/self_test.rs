@@ -1008,4 +1008,264 @@ mod tests {
         assert_eq!(DEFAULT_RESULT_CAPACITY, 500);
         assert_eq!(DEFAULT_SELF_TEST_TIMEOUT_SECS, 300);
     }
+
+    // ==================== Additional SelfTestHistory tests ====================
+
+    #[test]
+    fn test_self_test_history_capacity_limit_runs() {
+        let _guard = test_guard!();
+        let history = SelfTestHistory::new(3, 50); // Small capacity for testing
+
+        // Add more runs than capacity
+        for i in 1..=5 {
+            let run = SelfTestRunRecord {
+                id: i,
+                run_type: SelfTestRunType::Manual,
+                started_at: format!("2024-01-0{}T00:00:00Z", i),
+                completed_at: format!("2024-01-0{}T00:01:00Z", i),
+                workers_tested: 1,
+                workers_passed: 1,
+                workers_failed: 0,
+                duration_ms: 60000,
+            };
+            history.push_run(run);
+        }
+
+        // Should only have the last 3 runs (capacity limit)
+        let recent = history.recent_runs(10);
+        assert_eq!(recent.len(), 3);
+        // Most recent first
+        assert_eq!(recent[0].id, 5);
+        assert_eq!(recent[1].id, 4);
+        assert_eq!(recent[2].id, 3);
+    }
+
+    #[test]
+    fn test_self_test_history_load_from_file_nonexistent() {
+        let _guard = test_guard!();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("nonexistent.jsonl");
+
+        // Loading from non-existent file should succeed with empty history
+        let history = SelfTestHistory::load_from_file(&path, 10, 50).unwrap();
+        assert!(history.latest_run().is_none());
+        assert!(history.persistence_path.is_some());
+    }
+
+    #[test]
+    fn test_self_test_history_load_from_file_with_data() {
+        let _guard = test_guard!();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("history.jsonl");
+
+        // Write some test data
+        let run_entry = SelfTestHistoryEntry::Run(SelfTestRunRecord {
+            id: 42,
+            run_type: SelfTestRunType::Scheduled,
+            started_at: "2024-01-01T00:00:00Z".to_string(),
+            completed_at: "2024-01-01T00:01:00Z".to_string(),
+            workers_tested: 2,
+            workers_passed: 2,
+            workers_failed: 0,
+            duration_ms: 60000,
+        });
+        let result_entry = SelfTestHistoryEntry::Result(SelfTestResultRecord {
+            run_id: 42,
+            worker_id: "worker1".to_string(),
+            passed: true,
+            local_hash: Some("abc123".to_string()),
+            remote_hash: Some("abc123".to_string()),
+            local_time_ms: Some(100),
+            remote_time_ms: Some(150),
+            error: None,
+        });
+
+        let mut content = serde_json::to_string(&run_entry).unwrap();
+        content.push('\n');
+        content.push_str(&serde_json::to_string(&result_entry).unwrap());
+        content.push('\n');
+        fs::write(&path, &content).unwrap();
+
+        // Load and verify
+        let history = SelfTestHistory::load_from_file(&path, 10, 50).unwrap();
+        let latest = history.latest_run();
+        assert!(latest.is_some());
+        assert_eq!(latest.unwrap().id, 42);
+
+        // Next ID should be 43 (max_id + 1)
+        assert_eq!(history.next_id(), 43);
+
+        let results = history.results_for_runs(&[42]);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].worker_id, "worker1");
+    }
+
+    #[test]
+    fn test_self_test_history_load_from_file_with_invalid_lines() {
+        let _guard = test_guard!();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("history_invalid.jsonl");
+
+        // Write mix of valid and invalid data
+        let run_entry = SelfTestHistoryEntry::Run(SelfTestRunRecord {
+            id: 1,
+            run_type: SelfTestRunType::Manual,
+            started_at: "2024-01-01T00:00:00Z".to_string(),
+            completed_at: "2024-01-01T00:01:00Z".to_string(),
+            workers_tested: 1,
+            workers_passed: 1,
+            workers_failed: 0,
+            duration_ms: 1000,
+        });
+
+        let mut content = serde_json::to_string(&run_entry).unwrap();
+        content.push_str("\ninvalid json line\n");
+        content.push_str("{\"not_a_valid_entry\": true}\n");
+        content.push('\n'); // Empty line
+        fs::write(&path, &content).unwrap();
+
+        // Should still load valid entries and skip invalid ones
+        let history = SelfTestHistory::load_from_file(&path, 10, 50).unwrap();
+        let latest = history.latest_run();
+        assert!(latest.is_some());
+        assert_eq!(latest.unwrap().id, 1);
+    }
+
+    #[test]
+    fn test_self_test_history_record_run_without_persistence() {
+        let _guard = test_guard!();
+        let history = SelfTestHistory::new(10, 50);
+
+        let run = SelfTestRunRecord {
+            id: 1,
+            run_type: SelfTestRunType::Manual,
+            started_at: "2024-01-01T00:00:00Z".to_string(),
+            completed_at: "2024-01-01T00:01:00Z".to_string(),
+            workers_tested: 1,
+            workers_passed: 1,
+            workers_failed: 0,
+            duration_ms: 1000,
+        };
+
+        history.record_run(run.clone());
+        let latest = history.latest_run();
+        assert!(latest.is_some());
+        assert_eq!(latest.unwrap().id, 1);
+    }
+
+    #[test]
+    fn test_self_test_history_record_result_without_persistence() {
+        let _guard = test_guard!();
+        let history = SelfTestHistory::new(10, 50);
+
+        let result = SelfTestResultRecord {
+            run_id: 1,
+            worker_id: "worker1".to_string(),
+            passed: true,
+            local_hash: Some("hash".to_string()),
+            remote_hash: Some("hash".to_string()),
+            local_time_ms: Some(100),
+            remote_time_ms: Some(150),
+            error: None,
+        };
+
+        history.record_result(result);
+        let results = history.results_for_runs(&[1]);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].worker_id, "worker1");
+    }
+
+    #[test]
+    fn test_self_test_run_report_serialization() {
+        let _guard = test_guard!();
+        let report = SelfTestRunReport {
+            run: SelfTestRunRecord {
+                id: 1,
+                run_type: SelfTestRunType::Manual,
+                started_at: "2024-01-01T00:00:00Z".to_string(),
+                completed_at: "2024-01-01T00:01:00Z".to_string(),
+                workers_tested: 2,
+                workers_passed: 1,
+                workers_failed: 1,
+                duration_ms: 60000,
+            },
+            results: vec![
+                SelfTestResultRecord {
+                    run_id: 1,
+                    worker_id: "worker1".to_string(),
+                    passed: true,
+                    local_hash: None,
+                    remote_hash: None,
+                    local_time_ms: None,
+                    remote_time_ms: None,
+                    error: None,
+                },
+                SelfTestResultRecord {
+                    run_id: 1,
+                    worker_id: "worker2".to_string(),
+                    passed: false,
+                    local_hash: None,
+                    remote_hash: None,
+                    local_time_ms: None,
+                    remote_time_ms: None,
+                    error: Some("timeout".to_string()),
+                },
+            ],
+        };
+
+        let json = serde_json::to_string(&report).unwrap();
+        let deserialized: SelfTestRunReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.run.id, 1);
+        assert_eq!(deserialized.results.len(), 2);
+        assert!(deserialized.results[0].passed);
+        assert!(!deserialized.results[1].passed);
+    }
+
+    #[test]
+    fn test_status_with_cron_schedule() {
+        let _guard = test_guard!();
+        let pool = WorkerPool::new();
+        let history = Arc::new(SelfTestHistory::new(5, 5));
+        let config = SelfTestConfig {
+            enabled: true,
+            schedule: Some("0 0 * * *".to_string()),
+            ..Default::default()
+        };
+
+        let service = SelfTestService::new(pool, config, history);
+        let status = service.status();
+        assert!(status.enabled);
+        assert_eq!(status.schedule, Some("0 0 * * *".to_string()));
+    }
+
+    #[test]
+    fn test_status_with_last_run() {
+        let _guard = test_guard!();
+        let pool = WorkerPool::new();
+        let history = Arc::new(SelfTestHistory::new(5, 5));
+
+        // Add a run to history
+        let run = SelfTestRunRecord {
+            id: 1,
+            run_type: SelfTestRunType::Scheduled,
+            started_at: "2024-01-01T00:00:00Z".to_string(),
+            completed_at: "2024-01-01T00:01:00Z".to_string(),
+            workers_tested: 3,
+            workers_passed: 3,
+            workers_failed: 0,
+            duration_ms: 60000,
+        };
+        history.record_run(run);
+
+        let config = SelfTestConfig {
+            enabled: true,
+            interval: Some("1h".to_string()),
+            ..Default::default()
+        };
+
+        let service = SelfTestService::new(pool, config, history);
+        let status = service.status();
+        assert!(status.last_run.is_some());
+        assert_eq!(status.last_run.unwrap().id, 1);
+    }
 }
