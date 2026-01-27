@@ -499,6 +499,12 @@ impl RemoteCompilationTest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mock::{
+        MockConfig, MockRsyncConfig, clear_global_invocations, clear_mock_overrides,
+        global_rsync_invocations_snapshot, global_ssh_invocations_snapshot, is_mock_enabled,
+        set_mock_enabled_override, set_mock_rsync_config_override, set_mock_ssh_config_override,
+    };
+    use crate::testing::{TestLogger, TestPhase};
     use crate::types::WorkerId;
 
     fn init_test_logging() {
@@ -514,8 +520,7 @@ mod tests {
 
     #[test]
     fn verification_result_serializes_roundtrip() {
-        init_test_logging();
-        info!("TEST START: verification_result_serializes_roundtrip");
+        let logger = TestLogger::for_test("verification_result_serializes_roundtrip");
 
         let result = VerificationResult {
             success: true,
@@ -540,23 +545,28 @@ mod tests {
             test_marker: "RCH_TEST_12345".to_string(),
         };
 
+        logger.log(TestPhase::Execute, "Serializing VerificationResult to JSON");
         let json = serde_json::to_string(&result).unwrap();
-        info!("RESULT: serialized={}", &json[..json.len().min(100)]);
+        logger.log_with_data(
+            TestPhase::Execute,
+            "Serialized result",
+            serde_json::json!({ "json_len": json.len() }),
+        );
 
         let restored: VerificationResult = serde_json::from_str(&json).unwrap();
+
+        logger.log(TestPhase::Verify, "Checking restored fields");
         assert!(restored.success);
         assert_eq!(restored.rsync_up_ms, 100);
         assert_eq!(restored.compilation_ms, 5000);
         assert_eq!(restored.test_marker, "RCH_TEST_12345");
 
-        info!("VERIFY: Serialization roundtrip successful");
-        info!("TEST PASS: verification_result_serializes_roundtrip");
+        logger.pass();
     }
 
     #[test]
     fn verification_result_with_error() {
-        init_test_logging();
-        info!("TEST START: verification_result_with_error");
+        let logger = TestLogger::for_test("verification_result_with_error");
 
         let result = VerificationResult {
             success: false,
@@ -581,12 +591,65 @@ mod tests {
             test_marker: "RCH_TEST_99999".to_string(),
         };
 
+        logger.log(TestPhase::Verify, "Checking failed verification result");
         assert!(!result.success);
         assert!(result.error.is_some());
         assert_eq!(result.error.as_ref().unwrap(), "Binary hash mismatch");
 
-        info!("VERIFY: Error result correctly captured");
-        info!("TEST PASS: verification_result_with_error");
+        logger.log_with_data(
+            TestPhase::Verify,
+            "Error captured correctly",
+            serde_json::json!({ "error": result.error }),
+        );
+        logger.pass();
+    }
+
+    #[test]
+    fn verification_result_serializes_with_all_fields() {
+        let logger = TestLogger::for_test("verification_result_serializes_with_all_fields");
+
+        let result = VerificationResult {
+            success: false,
+            local_hash: BinaryHashResult {
+                full_hash: "full_local".to_string(),
+                code_hash: "code_local".to_string(),
+                text_section_size: 5000,
+                is_debug: true,
+            },
+            remote_hash: BinaryHashResult {
+                full_hash: "full_remote".to_string(),
+                code_hash: "code_remote".to_string(),
+                text_section_size: 5001,
+                is_debug: true,
+            },
+            local_build_ms: 2500,
+            rsync_up_ms: 300,
+            compilation_ms: 15000,
+            rsync_down_ms: 400,
+            total_ms: 18200,
+            error: Some("Size mismatch: 5000 vs 5001".to_string()),
+            test_marker: "RCH_FULL_TEST".to_string(),
+        };
+
+        logger.log(TestPhase::Execute, "Serializing result with all fields");
+        let json = serde_json::to_string_pretty(&result).unwrap();
+
+        // Verify all fields are present in serialization
+        assert!(json.contains("\"success\": false"));
+        assert!(json.contains("\"local_build_ms\": 2500"));
+        assert!(json.contains("\"rsync_up_ms\": 300"));
+        assert!(json.contains("\"compilation_ms\": 15000"));
+        assert!(json.contains("\"rsync_down_ms\": 400"));
+        assert!(json.contains("\"total_ms\": 18200"));
+        assert!(json.contains("RCH_FULL_TEST"));
+        assert!(json.contains("Size mismatch"));
+
+        logger.log_with_data(
+            TestPhase::Verify,
+            "All fields serialized",
+            serde_json::json!({ "fields_checked": 8 }),
+        );
+        logger.pass();
     }
 
     // ========================
@@ -595,24 +658,31 @@ mod tests {
 
     #[test]
     fn remote_compilation_test_default_values() {
-        init_test_logging();
-        info!("TEST START: remote_compilation_test_default_values");
+        let logger = TestLogger::for_test("remote_compilation_test_default_values");
 
         let test = RemoteCompilationTest::default();
 
+        logger.log(TestPhase::Verify, "Checking default values");
         assert_eq!(test.timeout, Duration::from_secs(300));
         assert!(test.release_mode);
         assert!(test.binary_name.is_none());
         assert_eq!(test.remote_base, "/tmp/rch_self_test");
 
-        info!("VERIFY: Default values are correct");
-        info!("TEST PASS: remote_compilation_test_default_values");
+        logger.log_with_data(
+            TestPhase::Verify,
+            "Default values correct",
+            serde_json::json!({
+                "timeout_secs": 300,
+                "release_mode": true,
+                "remote_base": "/tmp/rch_self_test"
+            }),
+        );
+        logger.pass();
     }
 
     #[test]
     fn remote_compilation_test_builder_pattern() {
-        init_test_logging();
-        info!("TEST START: remote_compilation_test_builder_pattern");
+        let logger = TestLogger::for_test("remote_compilation_test_builder_pattern");
 
         let worker = WorkerConfig {
             id: WorkerId::new("test-worker"),
@@ -623,24 +693,54 @@ mod tests {
             ..Default::default()
         };
 
+        logger.log(TestPhase::Execute, "Building test with custom options");
         let test = RemoteCompilationTest::new(worker.clone(), PathBuf::from("/tmp/project"))
             .with_timeout(Duration::from_secs(120))
             .with_release_mode(false)
             .with_binary_name("my_binary");
 
+        logger.log(TestPhase::Verify, "Checking builder-set values");
         assert_eq!(test.timeout, Duration::from_secs(120));
         assert!(!test.release_mode);
         assert_eq!(test.binary_name, Some("my_binary".to_string()));
         assert_eq!(test.worker.id.as_str(), "test-worker");
 
-        info!("VERIFY: Builder pattern works correctly");
-        info!("TEST PASS: remote_compilation_test_builder_pattern");
+        logger.pass();
+    }
+
+    #[test]
+    fn remote_compilation_test_with_ssh_options() {
+        let logger = TestLogger::for_test("remote_compilation_test_with_ssh_options");
+
+        let worker = WorkerConfig {
+            id: WorkerId::new("w1"),
+            host: "host".to_string(),
+            user: "user".to_string(),
+            identity_file: "~/.ssh/id_rsa".to_string(),
+            total_slots: 1,
+            ..Default::default()
+        };
+
+        let ssh_opts = SshOptions {
+            connect_timeout: Duration::from_secs(30),
+            command_timeout: Duration::from_secs(600),
+            ..Default::default()
+        };
+
+        logger.log(TestPhase::Execute, "Creating test with custom SSH options");
+        let test = RemoteCompilationTest::new(worker, PathBuf::from("/tmp/project"))
+            .with_ssh_options(ssh_opts);
+
+        logger.log(TestPhase::Verify, "Checking SSH options");
+        assert_eq!(test.ssh_options.connect_timeout, Duration::from_secs(30));
+        assert_eq!(test.ssh_options.command_timeout, Duration::from_secs(600));
+
+        logger.pass();
     }
 
     #[test]
     fn remote_compilation_test_binary_path_release() {
-        init_test_logging();
-        info!("TEST START: remote_compilation_test_binary_path_release");
+        let logger = TestLogger::for_test("remote_compilation_test_binary_path_release");
 
         let worker = WorkerConfig {
             id: WorkerId::new("w1"),
@@ -658,8 +758,14 @@ mod tests {
         let local_path = test.local_binary_path();
         let remote_path = test.remote_binary_path();
 
-        info!("RESULT: local_path={:?}", local_path);
-        info!("RESULT: remote_path={:?}", remote_path);
+        logger.log_with_data(
+            TestPhase::Execute,
+            "Computed binary paths",
+            serde_json::json!({
+                "local": local_path.to_string_lossy(),
+                "remote": remote_path.to_string_lossy()
+            }),
+        );
 
         assert!(
             local_path
@@ -672,14 +778,12 @@ mod tests {
                 .contains("target/release_remote/my_binary")
         );
 
-        info!("VERIFY: Binary paths are correct for release mode");
-        info!("TEST PASS: remote_compilation_test_binary_path_release");
+        logger.pass();
     }
 
     #[test]
     fn remote_compilation_test_binary_path_debug() {
-        init_test_logging();
-        info!("TEST START: remote_compilation_test_binary_path_debug");
+        let logger = TestLogger::for_test("remote_compilation_test_binary_path_debug");
 
         let worker = WorkerConfig {
             id: WorkerId::new("w1"),
@@ -697,8 +801,14 @@ mod tests {
         let local_path = test.local_binary_path();
         let remote_path = test.remote_binary_path();
 
-        info!("RESULT: local_path={:?}", local_path);
-        info!("RESULT: remote_path={:?}", remote_path);
+        logger.log_with_data(
+            TestPhase::Execute,
+            "Computed debug binary paths",
+            serde_json::json!({
+                "local": local_path.to_string_lossy(),
+                "remote": remote_path.to_string_lossy()
+            }),
+        );
 
         assert!(
             local_path
@@ -711,14 +821,12 @@ mod tests {
                 .contains("target/debug_remote/my_binary")
         );
 
-        info!("VERIFY: Binary paths are correct for debug mode");
-        info!("TEST PASS: remote_compilation_test_binary_path_debug");
+        logger.pass();
     }
 
     #[test]
     fn remote_compilation_test_infers_binary_name() {
-        init_test_logging();
-        info!("TEST START: remote_compilation_test_infers_binary_name");
+        let logger = TestLogger::for_test("remote_compilation_test_infers_binary_name");
 
         let worker = WorkerConfig {
             id: WorkerId::new("w1"),
@@ -733,18 +841,60 @@ mod tests {
         let test = RemoteCompilationTest::new(worker, PathBuf::from("/home/user/my-cool-project"));
 
         let binary_name = test.get_binary_name();
-        info!("RESULT: binary_name={}", binary_name);
+        logger.log_with_data(
+            TestPhase::Execute,
+            "Inferred binary name",
+            serde_json::json!({ "binary_name": &binary_name }),
+        );
 
         assert_eq!(binary_name, "my_cool_project");
 
-        info!("VERIFY: Binary name inferred and converted correctly");
-        info!("TEST PASS: remote_compilation_test_infers_binary_name");
+        logger.pass();
+    }
+
+    #[test]
+    fn remote_compilation_test_infers_binary_name_edge_cases() {
+        let logger = TestLogger::for_test("remote_compilation_test_infers_binary_name_edge_cases");
+
+        let worker = WorkerConfig {
+            id: WorkerId::new("w1"),
+            host: "host".to_string(),
+            user: "user".to_string(),
+            identity_file: "~/.ssh/id_rsa".to_string(),
+            total_slots: 1,
+            ..Default::default()
+        };
+
+        // Test with multiple hyphens
+        let test1 =
+            RemoteCompilationTest::new(worker.clone(), PathBuf::from("/a/b/my-very-cool-project"));
+        assert_eq!(test1.get_binary_name(), "my_very_cool_project");
+
+        // Test with underscores (should remain unchanged)
+        let test2 =
+            RemoteCompilationTest::new(worker.clone(), PathBuf::from("/a/b/my_project_name"));
+        assert_eq!(test2.get_binary_name(), "my_project_name");
+
+        // Test with mixed
+        let test3 = RemoteCompilationTest::new(worker.clone(), PathBuf::from("/a/b/my-project_v2"));
+        assert_eq!(test3.get_binary_name(), "my_project_v2");
+
+        // Test with explicit binary name (should override)
+        let test4 = RemoteCompilationTest::new(worker.clone(), PathBuf::from("/a/b/my-project"))
+            .with_binary_name("custom");
+        assert_eq!(test4.get_binary_name(), "custom");
+
+        logger.log_with_data(
+            TestPhase::Verify,
+            "All edge cases handled",
+            serde_json::json!({ "cases_tested": 4 }),
+        );
+        logger.pass();
     }
 
     #[test]
     fn remote_compilation_test_remote_project_path() {
-        init_test_logging();
-        info!("TEST START: remote_compilation_test_remote_project_path");
+        let logger = TestLogger::for_test("remote_compilation_test_remote_project_path");
 
         let worker = WorkerConfig {
             id: WorkerId::new("w1"),
@@ -758,18 +908,20 @@ mod tests {
         let test = RemoteCompilationTest::new(worker, PathBuf::from("/home/user/test-project"));
 
         let remote_path = test.remote_project_path();
-        info!("RESULT: remote_path={}", remote_path);
+        logger.log_with_data(
+            TestPhase::Execute,
+            "Computed remote path",
+            serde_json::json!({ "remote_path": &remote_path }),
+        );
 
         assert_eq!(remote_path, "/tmp/rch_self_test/test-project");
 
-        info!("VERIFY: Remote project path is correct");
-        info!("TEST PASS: remote_compilation_test_remote_project_path");
+        logger.pass();
     }
 
     #[test]
     fn remote_compilation_test_with_custom_remote_base() {
-        init_test_logging();
-        info!("TEST START: remote_compilation_test_with_custom_remote_base");
+        let logger = TestLogger::for_test("remote_compilation_test_with_custom_remote_base");
 
         let worker = WorkerConfig {
             id: WorkerId::new("w1"),
@@ -784,18 +936,23 @@ mod tests {
         test.remote_base = "/custom/build/dir".to_string();
 
         let remote_path = test.remote_project_path();
-        info!("RESULT: remote_path={}", remote_path);
+        logger.log_with_data(
+            TestPhase::Execute,
+            "Computed remote path with custom base",
+            serde_json::json!({
+                "remote_base": "/custom/build/dir",
+                "remote_path": &remote_path
+            }),
+        );
 
         assert_eq!(remote_path, "/custom/build/dir/project");
 
-        info!("VERIFY: Custom remote base is used");
-        info!("TEST PASS: remote_compilation_test_with_custom_remote_base");
+        logger.pass();
     }
 
     #[test]
     fn verification_result_timing_fields() {
-        init_test_logging();
-        info!("TEST START: verification_result_timing_fields");
+        let logger = TestLogger::for_test("verification_result_timing_fields");
 
         let result = VerificationResult {
             success: true,
@@ -822,12 +979,518 @@ mod tests {
 
         // Verify timing breakdown makes sense
         let sum = result.rsync_up_ms + result.compilation_ms + result.rsync_down_ms;
-        info!("RESULT: sum={}, total={}", sum, result.total_ms);
+        logger.log_with_data(
+            TestPhase::Verify,
+            "Checking timing consistency",
+            serde_json::json!({
+                "sum_of_phases": sum,
+                "total_reported": result.total_ms
+            }),
+        );
 
         // Total should be >= sum (may include overhead)
         assert!(result.total_ms >= sum - 100); // Allow some timing variance
 
-        info!("VERIFY: Timing fields are consistent");
-        info!("TEST PASS: verification_result_timing_fields");
+        logger.pass();
+    }
+
+    // ========================
+    // use_mock_transport tests
+    // ========================
+
+    #[test]
+    fn use_mock_transport_with_mock_host() {
+        let logger = TestLogger::for_test("use_mock_transport_with_mock_host");
+
+        let worker = WorkerConfig {
+            id: WorkerId::new("mock-worker"),
+            host: "mock://localhost".to_string(),
+            user: "user".to_string(),
+            identity_file: "~/.ssh/id".to_string(),
+            total_slots: 4,
+            ..Default::default()
+        };
+
+        logger.log(TestPhase::Execute, "Testing mock:// host detection");
+        assert!(use_mock_transport(&worker));
+
+        logger.pass();
+    }
+
+    #[test]
+    fn use_mock_transport_with_real_host() {
+        let logger = TestLogger::for_test("use_mock_transport_with_real_host");
+
+        // Ensure mock mode is disabled
+        set_mock_enabled_override(Some(false));
+
+        let worker = WorkerConfig {
+            id: WorkerId::new("real-worker"),
+            host: "192.168.1.100".to_string(),
+            user: "user".to_string(),
+            identity_file: "~/.ssh/id".to_string(),
+            total_slots: 4,
+            ..Default::default()
+        };
+
+        logger.log(TestPhase::Execute, "Testing real host (mock disabled)");
+        assert!(!use_mock_transport(&worker));
+
+        clear_mock_overrides();
+        logger.pass();
+    }
+
+    #[test]
+    fn use_mock_transport_with_global_override() {
+        let logger = TestLogger::for_test("use_mock_transport_with_global_override");
+
+        // Enable mock mode globally
+        set_mock_enabled_override(Some(true));
+
+        let worker = WorkerConfig {
+            id: WorkerId::new("real-worker"),
+            host: "192.168.1.100".to_string(),
+            user: "user".to_string(),
+            identity_file: "~/.ssh/id".to_string(),
+            total_slots: 4,
+            ..Default::default()
+        };
+
+        logger.log(
+            TestPhase::Execute,
+            "Testing real host with global mock override",
+        );
+        assert!(use_mock_transport(&worker));
+
+        clear_mock_overrides();
+        logger.pass();
+    }
+
+    // ========================
+    // Async transport tests (using mock)
+    // ========================
+
+    #[tokio::test]
+    async fn rsync_to_worker_mock_success() {
+        init_test_logging();
+        let logger = TestLogger::for_test("rsync_to_worker_mock_success");
+
+        // Enable mock mode
+        set_mock_enabled_override(Some(true));
+        set_mock_ssh_config_override(Some(MockConfig::success()));
+        set_mock_rsync_config_override(Some(MockRsyncConfig::success()));
+        clear_global_invocations();
+
+        let worker = WorkerConfig {
+            id: WorkerId::new("mock-worker"),
+            host: "mock://localhost".to_string(),
+            user: "testuser".to_string(),
+            identity_file: "~/.ssh/mock_key".to_string(),
+            total_slots: 4,
+            ..Default::default()
+        };
+
+        // Create a temporary directory for testing
+        let temp_dir = tempfile::tempdir().unwrap();
+        let test_project = temp_dir.path().to_path_buf();
+
+        let test = RemoteCompilationTest::new(worker, test_project);
+
+        logger.log(
+            TestPhase::Execute,
+            "Calling rsync_to_worker with mock transport",
+        );
+        let result = test.rsync_to_worker().await;
+
+        logger.log_with_data(
+            TestPhase::Verify,
+            "Checking rsync result",
+            serde_json::json!({ "success": result.is_ok() }),
+        );
+
+        assert!(result.is_ok());
+
+        // Verify invocations were recorded
+        let ssh_invocations = global_ssh_invocations_snapshot();
+        let rsync_invocations = global_rsync_invocations_snapshot();
+
+        logger.log_with_data(
+            TestPhase::Verify,
+            "Mock invocations recorded",
+            serde_json::json!({
+                "ssh_calls": ssh_invocations.len(),
+                "rsync_calls": rsync_invocations.len()
+            }),
+        );
+
+        // Should have SSH calls (connect, mkdir, disconnect) and rsync call
+        assert!(!ssh_invocations.is_empty());
+        assert!(!rsync_invocations.is_empty());
+
+        clear_mock_overrides();
+        logger.pass();
+    }
+
+    #[tokio::test]
+    async fn rsync_to_worker_mock_ssh_failure() {
+        init_test_logging();
+        let logger = TestLogger::for_test("rsync_to_worker_mock_ssh_failure");
+
+        // Enable mock mode with SSH connection failure
+        set_mock_enabled_override(Some(true));
+        set_mock_ssh_config_override(Some(MockConfig::connection_failure()));
+        clear_global_invocations();
+
+        let worker = WorkerConfig {
+            id: WorkerId::new("mock-worker"),
+            host: "mock://localhost".to_string(),
+            user: "testuser".to_string(),
+            identity_file: "~/.ssh/mock_key".to_string(),
+            total_slots: 4,
+            ..Default::default()
+        };
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let test_project = temp_dir.path().to_path_buf();
+
+        let test = RemoteCompilationTest::new(worker, test_project);
+
+        logger.log(
+            TestPhase::Execute,
+            "Calling rsync_to_worker with failing SSH",
+        );
+        let result = test.rsync_to_worker().await;
+
+        logger.log_with_data(
+            TestPhase::Verify,
+            "Checking failure result",
+            serde_json::json!({
+                "is_err": result.is_err(),
+                "error": result.as_ref().err().map(|e| e.to_string())
+            }),
+        );
+
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("Connection failed") || err_msg.contains("failed"));
+
+        clear_mock_overrides();
+        logger.pass();
+    }
+
+    #[tokio::test]
+    async fn build_remote_mock_success() {
+        init_test_logging();
+        let logger = TestLogger::for_test("build_remote_mock_success");
+
+        set_mock_enabled_override(Some(true));
+        set_mock_ssh_config_override(Some(MockConfig::success()));
+        clear_global_invocations();
+
+        let worker = WorkerConfig {
+            id: WorkerId::new("mock-worker"),
+            host: "mock://localhost".to_string(),
+            user: "testuser".to_string(),
+            identity_file: "~/.ssh/mock_key".to_string(),
+            total_slots: 4,
+            ..Default::default()
+        };
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let test_project = temp_dir.path().to_path_buf();
+
+        let test = RemoteCompilationTest::new(worker, test_project);
+
+        logger.log(
+            TestPhase::Execute,
+            "Calling build_remote with mock transport",
+        );
+        let result = test.build_remote().await;
+
+        logger.log_with_data(
+            TestPhase::Verify,
+            "Checking build result",
+            serde_json::json!({ "success": result.is_ok() }),
+        );
+
+        assert!(result.is_ok());
+
+        // Verify SSH execution happened
+        let ssh_invocations = global_ssh_invocations_snapshot();
+        assert!(ssh_invocations.iter().any(|inv| {
+            inv.command
+                .as_ref()
+                .is_some_and(|c| c.contains("cargo build"))
+        }));
+
+        clear_mock_overrides();
+        logger.pass();
+    }
+
+    #[tokio::test]
+    async fn build_remote_mock_command_failure() {
+        init_test_logging();
+        let logger = TestLogger::for_test("build_remote_mock_command_failure");
+
+        // Configure mock to fail command execution
+        set_mock_enabled_override(Some(true));
+        set_mock_ssh_config_override(Some(MockConfig::command_failure(1, "compilation error")));
+        clear_global_invocations();
+
+        let worker = WorkerConfig {
+            id: WorkerId::new("mock-worker"),
+            host: "mock://localhost".to_string(),
+            user: "testuser".to_string(),
+            identity_file: "~/.ssh/mock_key".to_string(),
+            total_slots: 4,
+            ..Default::default()
+        };
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let test_project = temp_dir.path().to_path_buf();
+
+        let test = RemoteCompilationTest::new(worker, test_project);
+
+        logger.log(
+            TestPhase::Execute,
+            "Calling build_remote with failing command",
+        );
+        let result = test.build_remote().await;
+
+        logger.log_with_data(
+            TestPhase::Verify,
+            "Checking failure",
+            serde_json::json!({
+                "is_err": result.is_err(),
+                "error": result.as_ref().err().map(|e| e.to_string())
+            }),
+        );
+
+        // Note: command_failure sets fail_execute=true, which returns Err
+        assert!(result.is_err());
+
+        clear_mock_overrides();
+        logger.pass();
+    }
+
+    #[tokio::test]
+    async fn rsync_from_worker_mock_success() {
+        init_test_logging();
+        let logger = TestLogger::for_test("rsync_from_worker_mock_success");
+
+        set_mock_enabled_override(Some(true));
+        set_mock_rsync_config_override(Some(MockRsyncConfig::success()));
+        clear_global_invocations();
+
+        let worker = WorkerConfig {
+            id: WorkerId::new("mock-worker"),
+            host: "mock://localhost".to_string(),
+            user: "testuser".to_string(),
+            identity_file: "~/.ssh/mock_key".to_string(),
+            total_slots: 4,
+            ..Default::default()
+        };
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let test_project = temp_dir.path().to_path_buf();
+
+        let test = RemoteCompilationTest::new(worker, test_project);
+
+        logger.log(
+            TestPhase::Execute,
+            "Calling rsync_from_worker with mock transport",
+        );
+        let result = test.rsync_from_worker().await;
+
+        logger.log_with_data(
+            TestPhase::Verify,
+            "Checking rsync result",
+            serde_json::json!({ "success": result.is_ok() }),
+        );
+
+        assert!(result.is_ok());
+
+        // Verify artifact retrieval was called
+        let rsync_invocations = global_rsync_invocations_snapshot();
+        assert!(!rsync_invocations.is_empty());
+
+        clear_mock_overrides();
+        logger.pass();
+    }
+
+    #[tokio::test]
+    async fn rsync_from_worker_mock_artifact_failure() {
+        init_test_logging();
+        let logger = TestLogger::for_test("rsync_from_worker_mock_artifact_failure");
+
+        set_mock_enabled_override(Some(true));
+        set_mock_rsync_config_override(Some(MockRsyncConfig::artifact_failure()));
+        clear_global_invocations();
+
+        let worker = WorkerConfig {
+            id: WorkerId::new("mock-worker"),
+            host: "mock://localhost".to_string(),
+            user: "testuser".to_string(),
+            identity_file: "~/.ssh/mock_key".to_string(),
+            total_slots: 4,
+            ..Default::default()
+        };
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let test_project = temp_dir.path().to_path_buf();
+
+        let test = RemoteCompilationTest::new(worker, test_project);
+
+        logger.log(
+            TestPhase::Execute,
+            "Calling rsync_from_worker with failing artifacts",
+        );
+        let result = test.rsync_from_worker().await;
+
+        logger.log_with_data(
+            TestPhase::Verify,
+            "Checking failure",
+            serde_json::json!({
+                "is_err": result.is_err(),
+                "error": result.as_ref().err().map(|e| e.to_string())
+            }),
+        );
+
+        assert!(result.is_err());
+
+        clear_mock_overrides();
+        logger.pass();
+    }
+
+    // ========================
+    // Edge case tests
+    // ========================
+
+    #[test]
+    fn remote_compilation_test_empty_project_path() {
+        let logger = TestLogger::for_test("remote_compilation_test_empty_project_path");
+
+        let worker = WorkerConfig {
+            id: WorkerId::new("w1"),
+            host: "host".to_string(),
+            user: "user".to_string(),
+            identity_file: "~/.ssh/id_rsa".to_string(),
+            total_slots: 1,
+            ..Default::default()
+        };
+
+        // Empty path should still work (uses "unknown" as fallback)
+        let test = RemoteCompilationTest::new(worker, PathBuf::new());
+
+        let binary_name = test.get_binary_name();
+        logger.log_with_data(
+            TestPhase::Execute,
+            "Binary name for empty path",
+            serde_json::json!({ "binary_name": &binary_name }),
+        );
+
+        // Should fall back to "unknown"
+        assert_eq!(binary_name, "unknown");
+
+        logger.pass();
+    }
+
+    #[test]
+    fn verification_result_zero_timings() {
+        let logger = TestLogger::for_test("verification_result_zero_timings");
+
+        let result = VerificationResult {
+            success: true,
+            local_hash: BinaryHashResult {
+                full_hash: "h".to_string(),
+                code_hash: "c".to_string(),
+                text_section_size: 0,
+                is_debug: false,
+            },
+            remote_hash: BinaryHashResult {
+                full_hash: "h".to_string(),
+                code_hash: "c".to_string(),
+                text_section_size: 0,
+                is_debug: false,
+            },
+            local_build_ms: 0,
+            rsync_up_ms: 0,
+            compilation_ms: 0,
+            rsync_down_ms: 0,
+            total_ms: 0,
+            error: None,
+            test_marker: "ZERO".to_string(),
+        };
+
+        logger.log(TestPhase::Execute, "Serializing zero-timing result");
+        let json = serde_json::to_string(&result).unwrap();
+        let restored: VerificationResult = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored.local_build_ms, 0);
+        assert_eq!(restored.total_ms, 0);
+        assert!(restored.success);
+
+        logger.pass();
+    }
+
+    #[test]
+    fn verification_result_max_timings() {
+        let logger = TestLogger::for_test("verification_result_max_timings");
+
+        let result = VerificationResult {
+            success: true,
+            local_hash: BinaryHashResult {
+                full_hash: "h".to_string(),
+                code_hash: "c".to_string(),
+                text_section_size: u64::MAX,
+                is_debug: false,
+            },
+            remote_hash: BinaryHashResult {
+                full_hash: "h".to_string(),
+                code_hash: "c".to_string(),
+                text_section_size: u64::MAX,
+                is_debug: false,
+            },
+            local_build_ms: u64::MAX,
+            rsync_up_ms: u64::MAX,
+            compilation_ms: u64::MAX,
+            rsync_down_ms: u64::MAX,
+            total_ms: u64::MAX,
+            error: None,
+            test_marker: "MAX".to_string(),
+        };
+
+        logger.log(TestPhase::Execute, "Serializing max-timing result");
+        let json = serde_json::to_string(&result).unwrap();
+        let restored: VerificationResult = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored.total_ms, u64::MAX);
+        assert!(restored.success);
+
+        logger.pass();
+    }
+
+    #[test]
+    fn is_mock_enabled_respects_overrides() {
+        let logger = TestLogger::for_test("is_mock_enabled_respects_overrides");
+
+        // Start with clean state
+        clear_mock_overrides();
+
+        // Without override, depends on env (we'll set it false)
+        set_mock_enabled_override(Some(false));
+        assert!(!is_mock_enabled());
+
+        // With override true
+        set_mock_enabled_override(Some(true));
+        assert!(is_mock_enabled());
+
+        // Clear and test again
+        clear_mock_overrides();
+        set_mock_enabled_override(Some(false));
+        assert!(!is_mock_enabled());
+
+        clear_mock_overrides();
+        logger.pass();
     }
 }
