@@ -1754,7 +1754,7 @@ pub(crate) async fn record_build(
         urlencoding_encode(project)
     );
     if is_test {
-        request.push_str("&test=1");
+        request.push_str("&is_test=1");
     }
     request.push('\n');
     writer.write_all(request.as_bytes()).await?;
@@ -2429,7 +2429,7 @@ async fn send_telemetry(
 
     let body = telemetry.to_json()?;
     let request = format!(
-        "POST /telemetry?source={}\n{}\n",
+        "POST /telemetry/ingest?source={}\n{}\n",
         urlencoding_encode(&source.to_string()),
         body
     );

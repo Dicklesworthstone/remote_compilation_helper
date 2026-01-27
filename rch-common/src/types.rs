@@ -649,6 +649,33 @@ pub struct RchConfig {
     /// Execution allowlist configuration (bd-785w).
     #[serde(default)]
     pub execution: ExecutionConfig,
+    /// Worker health alerting configuration (daemon).
+    #[serde(default)]
+    pub alerts: AlertsConfig,
+}
+
+/// Worker health alerting configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AlertsConfig {
+    /// Enable or disable alert generation in the daemon.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Suppress duplicate alerts for this many seconds.
+    #[serde(default = "default_alert_suppress_duplicates_secs")]
+    pub suppress_duplicates_secs: u64,
+}
+
+fn default_alert_suppress_duplicates_secs() -> u64 {
+    300
+}
+
+impl Default for AlertsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            suppress_duplicates_secs: default_alert_suppress_duplicates_secs(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1996,6 +2023,30 @@ pub struct BuildStats {
     pub local_count: usize,
     /// Average build duration in milliseconds.
     pub avg_duration_ms: u64,
+}
+
+/// Saved time statistics from remote builds.
+///
+/// Tracks estimated time savings from offloading builds to remote workers.
+/// Uses local build history to estimate what remote builds would have taken locally.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SavedTimeStats {
+    /// Total time spent on remote builds (milliseconds).
+    pub total_remote_duration_ms: u64,
+    /// Estimated total time if those builds ran locally (milliseconds).
+    pub estimated_local_duration_ms: u64,
+    /// Time saved by offloading (milliseconds).
+    /// Computed as max(0, estimated_local - remote).
+    pub time_saved_ms: u64,
+    /// Number of remote builds included in calculation.
+    pub builds_counted: usize,
+    /// Average speedup factor (local_estimate / remote_duration).
+    /// A value of 2.0 means remote builds are ~2x faster than local.
+    pub avg_speedup: f64,
+    /// Total time saved today (milliseconds).
+    pub today_saved_ms: u64,
+    /// Total time saved this week (milliseconds).
+    pub week_saved_ms: u64,
 }
 
 // ============================================================================

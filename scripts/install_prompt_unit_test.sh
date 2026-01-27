@@ -6,8 +6,14 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+export PROJECT_ROOT
 TEST_DIR=$(mktemp -d)
 LOG_FILE="$TEST_DIR/install_prompt_unit.log"
+
+# Structured JSONL logging
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/test_lib.sh"
+init_test_log "$(basename "${BASH_SOURCE[0]}" .sh)"
 
 TESTS_RUN=0
 TESTS_PASSED=0
@@ -15,6 +21,7 @@ TESTS_FAILED=0
 
 log() {
     echo "[$(date -Iseconds)] $*" | tee -a "$LOG_FILE"
+    log_json execute "$*"
 }
 
 pass() {
@@ -37,7 +44,7 @@ cleanup() {
     rm -rf "$TEST_DIR"
 }
 
-trap cleanup EXIT
+trap '_test_lib_cleanup; cleanup' EXIT
 
 log "=== RCH Installer Prompt Unit Tests ==="
 log "Project root: $PROJECT_ROOT"
@@ -46,7 +53,7 @@ log "Log file: $LOG_FILE"
 
 if [[ ! -f "$PROJECT_ROOT/install.sh" ]]; then
     log "ERROR: install.sh not found at $PROJECT_ROOT/install.sh"
-    exit 1
+    test_fail "install.sh missing"
 fi
 
 # Source installer in library mode
@@ -195,5 +202,7 @@ log "Failed:    $TESTS_FAILED"
 log "Log file:  $LOG_FILE"
 
 if [[ $TESTS_FAILED -ne 0 ]]; then
-    exit 1
+    test_fail "One or more installer prompt unit tests failed"
 fi
+
+test_pass

@@ -367,15 +367,38 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
-      - name: Run coverage
+      - name: Generate LCOV coverage
         env:
           RCH_MOCK_SSH: '1'
         run: cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info
+      - name: Generate HTML coverage report
+        env:
+          RCH_MOCK_SSH: '1'
+        run: cargo llvm-cov --all-features --workspace --html --output-dir coverage-html
+      - name: Generate per-crate coverage summary
+        env:
+          RCH_MOCK_SSH: '1'
+        run: |
+          echo "## Coverage Summary" > coverage-summary.md
+          echo "" >> coverage-summary.md
+          cargo llvm-cov --all-features --workspace --text 2>&1 | tee -a coverage-summary.md
       - uses: codecov/codecov-action@v4
         with:
           files: lcov.info
           fail_ci_if_error: false
           token: ${{ secrets.CODECOV_TOKEN }}
+      - name: Upload HTML coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-html
+          path: coverage-html/
+          retention-days: 30
+      - name: Upload coverage summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-summary
+          path: coverage-summary.md
+          retention-days: 30
 
   # Final status check - useful for branch protection rules
   ci-success:

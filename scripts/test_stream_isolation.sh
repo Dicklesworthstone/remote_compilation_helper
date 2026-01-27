@@ -15,17 +15,33 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+export PROJECT_ROOT
 TEST_LOG="${PROJECT_ROOT}/target/test_stream_isolation.log"
+
+# Structured JSONL logging
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/test_lib.sh"
+init_test_log "$(basename "${BASH_SOURCE[0]}" .sh)"
 
 # Ensure target directory exists
 mkdir -p "${PROJECT_ROOT}/target"
 
-log() { echo "[$(date +%H:%M:%S)] $*" | tee -a "$TEST_LOG"; }
-pass() { log "PASS: $*"; }
-fail() { log "FAIL: $*"; exit 1; }
+log() {
+    echo "[$(date +%H:%M:%S)] $*" | tee -a "$TEST_LOG"
+    log_json execute "$*"
+}
+pass() {
+    log "PASS: $*"
+    log_json verify "PASS $*"
+}
+fail() {
+    log "FAIL: $*"
+    log_json verify "FAIL $*"
+    test_fail "$*"
+}
 
 # Clean up previous log
-> "$TEST_LOG"
+: > "$TEST_LOG"
 
 log "Starting Stream Isolation Tests"
 log "Project root: $PROJECT_ROOT"
@@ -60,7 +76,7 @@ log ""
 # Create temp files for stdout/stderr capture
 STDOUT_FILE="$(mktemp)"
 STDERR_FILE="$(mktemp)"
-trap "rm -f $STDOUT_FILE $STDERR_FILE" EXIT
+trap '_test_lib_cleanup; rm -f "$STDOUT_FILE" "$STDERR_FILE"' EXIT
 
 # =============================================================================
 # TEST 1: rch status --json outputs ONLY to stdout
@@ -260,3 +276,5 @@ log "  4. All JSON commands produce parseable output"
 log "  5. Error messages go to stderr"
 log "  6. Piped output works correctly"
 log ""
+
+test_pass

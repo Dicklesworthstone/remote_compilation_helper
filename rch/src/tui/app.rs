@@ -375,6 +375,7 @@ mod tests {
                 summary: "all good".to_string(),
                 remediation: None,
             }],
+            alerts: vec![],
             stats: BuildStatsFromApi {
                 total_builds: 42,
                 success_count: 40,
@@ -384,6 +385,7 @@ mod tests {
                 avg_duration_ms: 1200,
             },
             test_stats: None,
+            saved_time: None,
         }
     }
 

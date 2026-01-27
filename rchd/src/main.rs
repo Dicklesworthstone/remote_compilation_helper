@@ -348,7 +348,15 @@ async fn main() -> Result<()> {
     let benchmark_queue = Arc::new(BenchmarkQueue::new(ChronoDuration::minutes(5)));
 
     // Initialize alert manager for worker health alerting
-    let alert_manager = Arc::new(alerts::AlertManager::new(alerts::AlertConfig::default()));
+    let suppress_secs = rch_config
+        .alerts
+        .suppress_duplicates_secs
+        .min(i64::MAX as u64) as i64;
+    let alert_config = alerts::AlertConfig {
+        enabled: rch_config.alerts.enabled,
+        suppress_duplicates: ChronoDuration::seconds(suppress_secs),
+    };
+    let alert_manager = Arc::new(alerts::AlertManager::new(alert_config));
 
     let context = DaemonContext {
         pool: worker_pool.clone(),

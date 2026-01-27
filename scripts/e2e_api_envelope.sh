@@ -23,8 +23,14 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+export PROJECT_ROOT
 VERBOSE="${RCH_E2E_VERBOSE:-0}"
 LOG_FILE="/tmp/rch_e2e_envelope_$(date +%Y%m%d_%H%M%S).log"
+
+# Structured JSONL logging
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/test_lib.sh"
+init_test_log "$(basename "${BASH_SOURCE[0]}" .sh)"
 
 # Counters
 TESTS_RUN=0
@@ -33,11 +39,28 @@ TESTS_FAILED=0
 
 timestamp() { date -u '+%Y-%m-%dT%H:%M:%S.%3NZ'; }
 
+fail_with_code() {
+    local exit_code="$1"
+    shift
+    local reason="$*"
+    log_json verify "TEST FAIL" "{\"reason\":\"$reason\"}"
+    exit "$exit_code"
+}
+
 log() {
     local level="$1"; shift
     local ts; ts="$(timestamp)"
     local msg="[$ts] [$level] $*"
     echo "$msg" | tee -a "$LOG_FILE"
+
+    local phase="execute"
+    case "$level" in
+        INFO|DEBUG) phase="setup" ;;
+        PASS|FAIL) phase="verify" ;;
+        ERROR) phase="verify" ;;
+        TEST) phase="execute" ;;
+    esac
+    log_json "$phase" "$msg"
 }
 
 log_pass() {
@@ -50,7 +73,7 @@ log_fail() {
     log "FAIL" "$*"
 }
 
-die() { log "ERROR" "$*"; exit 2; }
+die() { log "ERROR" "$*"; fail_with_code 2 "$*"; }
 
 usage() {
     sed -n '1,20p' "$0" | sed 's/^# \{0,1\}//'
@@ -437,11 +460,11 @@ print_summary() {
 
     if [[ "$TESTS_FAILED" -gt 0 ]]; then
         log "FAIL" "Some tests failed!"
-        return 1
+        test_fail "Some tests failed"
     fi
 
     log "INFO" "All API envelope tests passed!"
-    return 0
+    test_pass
 }
 
 main() {

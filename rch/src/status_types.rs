@@ -2,7 +2,7 @@
 //!
 //! These types mirror the response structures from rchd's /status API endpoint.
 
-use rch_common::{CommandTimingBreakdown, WorkerCapabilities};
+use rch_common::{CommandTimingBreakdown, SavedTimeStats, WorkerCapabilities};
 use serde::{Deserialize, Serialize};
 
 /// Full status response from daemon's GET /status.
@@ -15,9 +15,15 @@ pub struct DaemonFullStatusResponse {
     pub queued_builds: Vec<QueuedBuildFromApi>,
     pub recent_builds: Vec<BuildRecordFromApi>,
     pub issues: Vec<IssueFromApi>,
+    /// Active alerts from the daemon (worker health, circuits, etc.).
+    #[serde(default)]
+    pub alerts: Vec<AlertInfoFromApi>,
     pub stats: BuildStatsFromApi,
     #[serde(default)]
     pub test_stats: Option<TestRunStatsFromApi>,
+    /// Saved time statistics from remote builds.
+    #[serde(default)]
+    pub saved_time: Option<SavedTimeStats>,
 }
 
 /// Daemon metadata from API.
@@ -118,6 +124,18 @@ pub struct IssueFromApi {
     pub severity: String,
     pub summary: String,
     pub remediation: Option<String>,
+}
+
+/// Alert information from API.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AlertInfoFromApi {
+    pub id: String,
+    pub kind: String,
+    pub severity: String,
+    pub message: String,
+    #[serde(default)]
+    pub worker_id: Option<String>,
+    pub created_at: String,
 }
 
 /// Build statistics from API.

@@ -2,8 +2,8 @@
 //!
 //! Maintains a ring buffer of recent builds for status reporting and analytics.
 
-use chrono::Utc;
-use rch_common::{BuildLocation, BuildRecord, BuildStats, CommandTimingBreakdown};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use rch_common::{BuildLocation, BuildRecord, BuildStats, CommandTimingBreakdown, SavedTimeStats};
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
@@ -468,6 +468,98 @@ impl BuildHistory {
             remote_count: remote,
             local_count: total - remote,
             avg_duration_ms: avg_duration,
+        }
+    }
+
+    /// Calculate saved time statistics from remote builds.
+    ///
+    /// Uses local build history to estimate what remote builds would have taken
+    /// locally, then computes time saved. If no local builds exist, uses a
+    /// default speedup factor (2.0x) based on typical remote worker performance.
+    pub fn saved_time_stats(&self) -> SavedTimeStats {
+        const DEFAULT_SPEEDUP: f64 = 2.0;
+
+        let records = self.records.read().unwrap();
+        let now = Utc::now();
+        let today_start = now.date_naive().and_hms_opt(0, 0, 0).unwrap();
+        let week_start = today_start - ChronoDuration::days(7);
+
+        // Separate local and remote builds
+        let local_builds: Vec<_> = records
+            .iter()
+            .filter(|r| r.location == BuildLocation::Local && r.exit_code == 0)
+            .collect();
+        let remote_builds: Vec<_> = records
+            .iter()
+            .filter(|r| r.location == BuildLocation::Remote && r.exit_code == 0)
+            .collect();
+
+        if remote_builds.is_empty() {
+            return SavedTimeStats::default();
+        }
+
+        // Calculate average local build duration (if we have local builds)
+        let avg_local_duration_ms = if !local_builds.is_empty() {
+            let total_local: u64 = local_builds.iter().map(|r| r.duration_ms).sum();
+            total_local / local_builds.len() as u64
+        } else {
+            0
+        };
+
+        // Calculate totals and time saved
+        let mut total_remote_duration_ms: u64 = 0;
+        let mut estimated_local_duration_ms: u64 = 0;
+        let mut today_remote_ms: u64 = 0;
+        let mut today_estimated_local_ms: u64 = 0;
+        let mut week_remote_ms: u64 = 0;
+        let mut week_estimated_local_ms: u64 = 0;
+
+        for build in &remote_builds {
+            let remote_ms = build.duration_ms;
+            total_remote_duration_ms += remote_ms;
+
+            // Estimate local duration: use exec time * speedup or avg_local
+            let estimated_local_ms = if avg_local_duration_ms > 0 {
+                // Use the ratio of this build's exec time to average, then scale
+                avg_local_duration_ms
+            } else {
+                // No local builds: use remote exec time * default speedup
+                (remote_ms as f64 * DEFAULT_SPEEDUP) as u64
+            };
+            estimated_local_duration_ms += estimated_local_ms;
+
+            // Parse timestamp for daily/weekly aggregation
+            if let Ok(completed) = DateTime::parse_from_rfc3339(&build.completed_at) {
+                let completed_naive = completed.naive_utc();
+                if completed_naive >= today_start.and_utc().naive_utc() {
+                    today_remote_ms += remote_ms;
+                    today_estimated_local_ms += estimated_local_ms;
+                }
+                if completed_naive >= week_start.and_utc().naive_utc() {
+                    week_remote_ms += remote_ms;
+                    week_estimated_local_ms += estimated_local_ms;
+                }
+            }
+        }
+
+        let time_saved_ms = estimated_local_duration_ms.saturating_sub(total_remote_duration_ms);
+        let today_saved_ms = today_estimated_local_ms.saturating_sub(today_remote_ms);
+        let week_saved_ms = week_estimated_local_ms.saturating_sub(week_remote_ms);
+
+        let avg_speedup = if total_remote_duration_ms > 0 {
+            estimated_local_duration_ms as f64 / total_remote_duration_ms as f64
+        } else {
+            0.0
+        };
+
+        SavedTimeStats {
+            total_remote_duration_ms,
+            estimated_local_duration_ms,
+            time_saved_ms,
+            builds_counted: remote_builds.len(),
+            avg_speedup,
+            today_saved_ms,
+            week_saved_ms,
         }
     }
 
@@ -1005,5 +1097,142 @@ mod tests {
         }
 
         assert_eq!(history.queue_depth(), 1000);
+    }
+
+    // =========================================================================
+    // Saved Time Stats Tests
+    // =========================================================================
+
+    #[test]
+    fn test_saved_time_stats_empty_history() {
+        let history = BuildHistory::new(10);
+        let stats = history.saved_time_stats();
+
+        assert_eq!(stats.builds_counted, 0);
+        assert_eq!(stats.time_saved_ms, 0);
+        assert_eq!(stats.total_remote_duration_ms, 0);
+        assert_eq!(stats.estimated_local_duration_ms, 0);
+    }
+
+    #[test]
+    fn test_saved_time_stats_only_local_builds() {
+        let history = BuildHistory::new(10);
+
+        // Add local builds only
+        for i in 1..=3 {
+            let mut record = make_build_record(i);
+            record.location = BuildLocation::Local;
+            record.duration_ms = 1000;
+            history.record(record);
+        }
+
+        let stats = history.saved_time_stats();
+        assert_eq!(stats.builds_counted, 0);
+        assert_eq!(stats.time_saved_ms, 0);
+    }
+
+    #[test]
+    fn test_saved_time_stats_only_remote_builds_default_speedup() {
+        let history = BuildHistory::new(10);
+
+        // Add remote builds only (no local for comparison, uses default 2x speedup)
+        for i in 1..=3 {
+            let mut record = make_build_record(i);
+            record.location = BuildLocation::Remote;
+            record.worker_id = Some("worker-1".to_string());
+            record.duration_ms = 1000;
+            history.record(record);
+        }
+
+        let stats = history.saved_time_stats();
+        assert_eq!(stats.builds_counted, 3);
+        assert_eq!(stats.total_remote_duration_ms, 3000);
+        // With default 2x speedup: estimated local = 3 * 1000 * 2 = 6000
+        assert_eq!(stats.estimated_local_duration_ms, 6000);
+        assert_eq!(stats.time_saved_ms, 3000);
+        assert!((stats.avg_speedup - 2.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_saved_time_stats_mixed_builds() {
+        let history = BuildHistory::new(10);
+
+        // Add local builds
+        for i in 1..=2 {
+            let mut record = make_build_record(i);
+            record.location = BuildLocation::Local;
+            record.duration_ms = 2000; // Local takes 2s
+            history.record(record);
+        }
+
+        // Add remote builds
+        for i in 3..=4 {
+            let mut record = make_build_record(i);
+            record.location = BuildLocation::Remote;
+            record.worker_id = Some("worker-1".to_string());
+            record.duration_ms = 1000; // Remote takes 1s
+            history.record(record);
+        }
+
+        let stats = history.saved_time_stats();
+        assert_eq!(stats.builds_counted, 2);
+        assert_eq!(stats.total_remote_duration_ms, 2000);
+        // With avg local duration 2000ms: estimated local = 2 * 2000 = 4000
+        assert_eq!(stats.estimated_local_duration_ms, 4000);
+        assert_eq!(stats.time_saved_ms, 2000);
+        assert!((stats.avg_speedup - 2.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_saved_time_stats_failed_builds_excluded() {
+        let history = BuildHistory::new(10);
+
+        // Add successful remote build
+        let mut record1 = make_build_record(1);
+        record1.location = BuildLocation::Remote;
+        record1.worker_id = Some("worker-1".to_string());
+        record1.duration_ms = 1000;
+        record1.exit_code = 0;
+        history.record(record1);
+
+        // Add failed remote build
+        let mut record2 = make_build_record(2);
+        record2.location = BuildLocation::Remote;
+        record2.worker_id = Some("worker-1".to_string());
+        record2.duration_ms = 5000;
+        record2.exit_code = 1;
+        history.record(record2);
+
+        let stats = history.saved_time_stats();
+        // Only successful remote builds are counted
+        assert_eq!(stats.builds_counted, 1);
+        assert_eq!(stats.total_remote_duration_ms, 1000);
+    }
+
+    #[test]
+    fn test_saved_time_stats_no_negative_savings() {
+        let history = BuildHistory::new(10);
+
+        // Add fast local builds (500ms)
+        for i in 1..=2 {
+            let mut record = make_build_record(i);
+            record.location = BuildLocation::Local;
+            record.duration_ms = 500;
+            history.record(record);
+        }
+
+        // Add slow remote builds (1000ms - slower than local!)
+        for i in 3..=4 {
+            let mut record = make_build_record(i);
+            record.location = BuildLocation::Remote;
+            record.worker_id = Some("worker-1".to_string());
+            record.duration_ms = 1000;
+            history.record(record);
+        }
+
+        let stats = history.saved_time_stats();
+        // estimated_local = 500ms * 2 = 1000ms
+        // time_saved = max(0, 1000 - 2000) = 0 (no negative savings)
+        assert_eq!(stats.time_saved_ms, 0);
     }
 }

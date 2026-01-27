@@ -61,6 +61,12 @@ impl<'a> StatusTable<'a> {
         // Status header panel
         self.render_status_panel(console);
 
+        // Alerts if any
+        if !self.status.alerts.is_empty() {
+            console.line();
+            self.render_alerts_panel(console);
+        }
+
         // Active jobs table
         if !self.status.active_builds.is_empty() {
             console.line();
@@ -89,12 +95,17 @@ impl<'a> StatusTable<'a> {
         );
 
         let workers_line = format!(
-            "{} Workers: {}/{} healthy | Slots: {}/{} available",
+            "{} Workers: {}/{} healthy | Slots: {}/{} available{}",
             worker_icon,
             daemon.workers_healthy,
             daemon.workers_total,
             daemon.slots_available,
-            daemon.slots_total
+            daemon.slots_total,
+            if self.status.alerts.is_empty() {
+                String::new()
+            } else {
+                format!(" | Alerts: {}", self.status.alerts.len())
+            }
         );
 
         let stats = &self.status.stats;
@@ -197,6 +208,39 @@ impl<'a> StatusTable<'a> {
         console.print_renderable(&panel);
     }
 
+    /// Render alerts panel.
+    #[cfg(feature = "rich-ui")]
+    fn render_alerts_panel(&self, console: &RchConsole) {
+        let mut lines = Vec::new();
+        for alert in &self.status.alerts {
+            let severity_prefix = match alert.severity.as_str() {
+                "critical" | "error" => Icons::cross(self.context),
+                "warning" => Icons::warning(self.context),
+                _ => Icons::info(self.context),
+            };
+
+            if let Some(worker_id) = &alert.worker_id {
+                lines.push(format!(
+                    "{} [{}] {} ({})",
+                    severity_prefix, alert.severity, alert.message, worker_id
+                ));
+            } else {
+                lines.push(format!(
+                    "{} [{}] {}",
+                    severity_prefix, alert.severity, alert.message
+                ));
+            }
+        }
+
+        let content = lines.join("\n");
+        let panel = Panel::from_text(&content)
+            .title("Alerts")
+            .border_style(RchTheme::warning())
+            .rounded();
+
+        console.print_renderable(&panel);
+    }
+
     /// Render plain text output (no rich formatting).
     fn render_plain(&self, console: &RchConsole) {
         let daemon = &self.status.daemon;
@@ -236,6 +280,30 @@ impl<'a> StatusTable<'a> {
             success_rate,
             format_ms_duration(stats.avg_duration_ms)
         ));
+
+        // Alerts
+        if !self.status.alerts.is_empty() {
+            console.print_plain("");
+            console.print_plain("--- Alerts ---");
+            for alert in &self.status.alerts {
+                let prefix = match alert.severity.as_str() {
+                    "critical" | "error" => Icons::cross(self.context),
+                    "warning" => Icons::warning(self.context),
+                    _ => Icons::info(self.context),
+                };
+                if let Some(worker_id) = &alert.worker_id {
+                    console.print_plain(&format!(
+                        "  {} [{}] {} ({})",
+                        prefix, alert.severity, alert.message, worker_id
+                    ));
+                } else {
+                    console.print_plain(&format!(
+                        "  {} [{}] {}",
+                        prefix, alert.severity, alert.message
+                    ));
+                }
+            }
+        }
 
         // Active jobs
         if !self.status.active_builds.is_empty() {
@@ -455,6 +523,7 @@ mod tests {
                 summary: "Worker-2 has high latency".to_string(),
                 remediation: Some("Check network connection".to_string()),
             }],
+            alerts: vec![],
             stats: BuildStatsFromApi {
                 total_builds: 100,
                 success_count: 95,
@@ -464,6 +533,7 @@ mod tests {
                 avg_duration_ms: 5500,
             },
             test_stats: None,
+            saved_time: None,
         }
     }
 

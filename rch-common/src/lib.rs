@@ -54,11 +54,11 @@ pub use types::{
     CircuitStats, ColorMode, CommandPriority, CommandTimingBreakdown, CompilationConfig,
     CompilationMetrics, CompilationTimer, CompilationTimingBreakdown, EnvironmentConfig,
     ExecutionConfig, FairnessConfig, GeneralConfig, MetricsAggregator, OutputConfig,
-    OutputVisibility, RchConfig, ReleaseRequest, RequiredRuntime, RetryConfig, SelectedWorker,
-    SelectionConfig, SelectionReason, SelectionRequest, SelectionResponse, SelectionStrategy,
-    SelectionWeightConfig, SelfHealingConfig, SelfTestConfig, SelfTestFailureAction,
-    SelfTestWorkers, TransferConfig, WorkerCapabilities, WorkerConfig, WorkerId, WorkerStatus,
-    default_socket_path, validate_remote_base,
+    OutputVisibility, RchConfig, ReleaseRequest, RequiredRuntime, RetryConfig, SavedTimeStats,
+    SelectedWorker, SelectionConfig, SelectionReason, SelectionRequest, SelectionResponse,
+    SelectionStrategy, SelectionWeightConfig, SelfHealingConfig, SelfTestConfig,
+    SelfTestFailureAction, SelfTestWorkers, TransferConfig, WorkerCapabilities, WorkerConfig,
+    WorkerId, WorkerStatus, default_socket_path, validate_remote_base,
 };
 
 // Testing module re-exports

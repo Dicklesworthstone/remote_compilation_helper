@@ -18,7 +18,13 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+export PROJECT_ROOT
 LOG_FILE="${PROJECT_ROOT}/target/e2e_ui_foundation_$(date +%Y%m%d_%H%M%S).log"
+
+# Structured JSONL logging
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/test_lib.sh"
+init_test_log "$(basename "${BASH_SOURCE[0]}" .sh)"
 
 # Ensure target directory exists
 mkdir -p "${PROJECT_ROOT}/target"
@@ -26,10 +32,23 @@ mkdir -p "${PROJECT_ROOT}/target"
 # ============================================================================
 # Logging
 # ============================================================================
-log() { echo "[$(date +%H:%M:%S)] $*" | tee -a "$LOG_FILE"; }
-log_pass() { echo "[$(date +%H:%M:%S)] PASS $*" | tee -a "$LOG_FILE"; }
-log_fail() { echo "[$(date +%H:%M:%S)] FAIL $*" | tee -a "$LOG_FILE"; exit 1; }
-log_skip() { echo "[$(date +%H:%M:%S)] SKIP $*" | tee -a "$LOG_FILE"; }
+log() {
+    echo "[$(date +%H:%M:%S)] $*" | tee -a "$LOG_FILE"
+    log_json execute "$*"
+}
+log_pass() {
+    echo "[$(date +%H:%M:%S)] PASS $*" | tee -a "$LOG_FILE"
+    log_json verify "PASS $*"
+}
+log_fail() {
+    echo "[$(date +%H:%M:%S)] FAIL $*" | tee -a "$LOG_FILE"
+    log_json verify "FAIL $*"
+    test_fail "$*"
+}
+log_skip() {
+    echo "[$(date +%H:%M:%S)] SKIP $*" | tee -a "$LOG_FILE"
+    log_json setup "SKIP $*"
+}
 
 PASS_COUNT=0
 FAIL_COUNT=0
@@ -210,8 +229,8 @@ log "Full log: $LOG_FILE"
 
 if [[ $FAIL_COUNT -gt 0 ]]; then
     log "RESULT: FAILED"
-    exit 1
+    test_fail "UI foundation E2E failed"
 else
     log "RESULT: PASSED"
-    exit 0
+    test_pass
 fi

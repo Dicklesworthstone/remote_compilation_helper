@@ -16,8 +16,8 @@ use anyhow::{Result, anyhow};
 use chrono::{Duration as ChronoDuration, Utc};
 use rch_common::{
     ApiError, BuildRecord, BuildStats, CircuitBreakerConfig, CircuitState, CommandPriority,
-    ErrorCode, ReleaseRequest, RequiredRuntime, SelectedWorker, SelectionReason, SelectionRequest,
-    SelectionResponse, WorkerCapabilities, WorkerId, WorkerStatus,
+    ErrorCode, ReleaseRequest, RequiredRuntime, SavedTimeStats, SelectedWorker, SelectionReason,
+    SelectionRequest, SelectionResponse, WorkerCapabilities, WorkerId, WorkerStatus,
 };
 use rch_telemetry::protocol::{TelemetrySource, TestRunRecord, TestRunStats, WorkerTelemetry};
 use rch_telemetry::speedscore::SpeedScore;
@@ -156,6 +156,8 @@ pub struct DaemonFullStatus {
     pub stats: BuildStats,
     /// Aggregate test run statistics.
     pub test_stats: TestRunStats,
+    /// Saved time statistics from remote builds.
+    pub saved_time: SavedTimeStats,
 }
 
 /// Daemon metadata.
@@ -943,52 +945,49 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
     }
 
     // Build cancellation endpoints
-    if path.starts_with("/cancel-build") && method == "POST" {
-        let query = path.strip_prefix("/cancel-build").unwrap_or("");
-        let query = query.strip_prefix('?').unwrap_or("");
+    if method == "POST" && path.starts_with("/builds") {
+        let (path_only, query) = split_path_query(path);
 
-        let mut build_id = None;
-        let mut force = false;
-
-        for param in query.split('&') {
-            if param.is_empty() {
-                continue;
+        if path_only == "/builds/cancel-all" {
+            let mut force = false;
+            for param in query.split('&') {
+                if param.is_empty() {
+                    continue;
+                }
+                let mut kv = param.splitn(2, '=');
+                let key = kv.next().unwrap_or("");
+                let value = kv.next().unwrap_or("");
+                if key == "force" {
+                    force = value == "1" || value.eq_ignore_ascii_case("true");
+                }
             }
-            let mut kv = param.splitn(2, '=');
-            let key = kv.next().unwrap_or("");
-            let value = kv.next().unwrap_or("");
-
-            match key {
-                "build_id" | "id" => build_id = value.parse().ok(),
-                "force" => force = value == "1" || value.eq_ignore_ascii_case("true"),
-                _ => {}
-            }
+            return Ok(ApiRequest::CancelAllBuilds { force });
         }
 
-        let build_id = build_id.ok_or_else(|| anyhow!("Missing 'build_id' parameter"))?;
-        return Ok(ApiRequest::CancelBuild { build_id, force });
-    }
+        if let Some(rest) = path_only.strip_prefix("/builds/") {
+            let rest = rest.trim_matches('/');
+            let parts: Vec<&str> = rest.split('/').collect();
+            if parts.len() == 2 && parts[1] == "cancel" {
+                let build_id = parts[0]
+                    .parse::<u64>()
+                    .map_err(|_| anyhow!("Invalid build id: {}", parts[0]))?;
 
-    if path.starts_with("/cancel-all-builds") && method == "POST" {
-        let query = path.strip_prefix("/cancel-all-builds").unwrap_or("");
-        let query = query.strip_prefix('?').unwrap_or("");
+                let mut force = false;
+                for param in query.split('&') {
+                    if param.is_empty() {
+                        continue;
+                    }
+                    let mut kv = param.splitn(2, '=');
+                    let key = kv.next().unwrap_or("");
+                    let value = kv.next().unwrap_or("");
+                    if key == "force" {
+                        force = value == "1" || value.eq_ignore_ascii_case("true");
+                    }
+                }
 
-        let mut force = false;
-
-        for param in query.split('&') {
-            if param.is_empty() {
-                continue;
-            }
-            let mut kv = param.splitn(2, '=');
-            let key = kv.next().unwrap_or("");
-            let value = kv.next().unwrap_or("");
-
-            if key == "force" {
-                force = value == "1" || value.eq_ignore_ascii_case("true");
+                return Ok(ApiRequest::CancelBuild { build_id, force });
             }
         }
-
-        return Ok(ApiRequest::CancelAllBuilds { force });
     }
 
     if path == "/status" {
@@ -1156,7 +1155,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
             match key {
                 "worker" => worker_id = Some(urlencoding_decode(value)),
                 "project" => project = Some(urlencoding_decode(value)),
-                "test" => {
+                "is_test" => {
                     let decoded = urlencoding_decode(value);
                     is_test = matches!(decoded.as_str(), "1" | "true" | "yes" | "y" | "on");
                 }
@@ -1182,58 +1181,58 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
     }
 
     if path.starts_with("/telemetry") {
-        if path.starts_with("/telemetry/poll") {
-            if method != "POST" {
-                return Err(anyhow!("Only POST method supported for telemetry polling"));
-            }
+        let (path_only, query) = split_path_query(path);
 
-            let query = path.strip_prefix("/telemetry/poll").unwrap_or("");
-            let query = query.strip_prefix('?').unwrap_or("");
-            let mut worker_id = None;
-
-            for param in query.split('&') {
-                if param.is_empty() {
-                    continue;
+        return match path_only {
+            "/telemetry/poll" => {
+                if method != "POST" {
+                    return Err(anyhow!("Only POST method supported for telemetry polling"));
                 }
-                let mut kv = param.splitn(2, '=');
-                let key = kv.next().unwrap_or("");
-                let value = kv.next().unwrap_or("");
-                if key == "worker" {
-                    worker_id = Some(urlencoding_decode(value));
+
+                let mut worker_id = None;
+                for param in query.split('&') {
+                    if param.is_empty() {
+                        continue;
+                    }
+                    let mut kv = param.splitn(2, '=');
+                    let key = kv.next().unwrap_or("");
+                    let value = kv.next().unwrap_or("");
+                    if key == "worker" {
+                        worker_id = Some(urlencoding_decode(value));
+                    }
                 }
+
+                let worker_id = worker_id.ok_or_else(|| anyhow!("Missing 'worker' parameter"))?;
+                Ok(ApiRequest::TelemetryPoll {
+                    worker_id: WorkerId::new(worker_id),
+                })
             }
+            "/telemetry/ingest" => {
+                if method != "POST" {
+                    return Err(anyhow!(
+                        "Only POST method supported for telemetry ingestion"
+                    ));
+                }
 
-            let worker_id = worker_id.ok_or_else(|| anyhow!("Missing 'worker' parameter"))?;
-            return Ok(ApiRequest::TelemetryPoll {
-                worker_id: WorkerId::new(worker_id),
-            });
-        }
+                let mut source = None;
+                for param in query.split('&') {
+                    if param.is_empty() {
+                        continue;
+                    }
+                    let mut kv = param.splitn(2, '=');
+                    let key = kv.next().unwrap_or("");
+                    let value = kv.next().unwrap_or("");
+                    if key == "source" {
+                        source = parse_telemetry_source(&urlencoding_decode(value));
+                    }
+                }
 
-        if method != "POST" {
-            return Err(anyhow!(
-                "Only POST method supported for telemetry ingestion"
-            ));
-        }
-
-        let query = path.strip_prefix("/telemetry").unwrap_or("");
-        let query = query.strip_prefix('?').unwrap_or("");
-
-        let mut source = None;
-        for param in query.split('&') {
-            if param.is_empty() {
-                continue;
+                Ok(ApiRequest::IngestTelemetry(
+                    source.unwrap_or(TelemetrySource::Piggyback),
+                ))
             }
-            let mut kv = param.splitn(2, '=');
-            let key = kv.next().unwrap_or("");
-            let value = kv.next().unwrap_or("");
-
-            if key == "source" {
-                source = parse_telemetry_source(&urlencoding_decode(value));
-            }
-        }
-
-        let source = source.unwrap_or(TelemetrySource::Piggyback);
-        return Ok(ApiRequest::IngestTelemetry(source));
+            _ => Err(anyhow!("Unknown endpoint: {}", path_only)),
+        };
     }
 
     // Worker state management endpoints: POST /workers/{id}/{action}
@@ -1437,7 +1436,7 @@ async fn handle_telemetry_poll(ctx: &DaemonContext, worker_id: &WorkerId) -> Tel
             return TelemetryPollResponse {
                 status: "error".to_string(),
                 telemetry: None,
-                error: Some("worker_not_found".to_string()),
+                error: Some("worker not found".to_string()),
                 worker_id: Some(worker_id.to_string()),
             };
         }
@@ -1448,7 +1447,7 @@ async fn handle_telemetry_poll(ctx: &DaemonContext, worker_id: &WorkerId) -> Tel
         return TelemetryPollResponse {
             status: "error".to_string(),
             telemetry: None,
-            error: Some("worker_unreachable".to_string()),
+            error: Some("worker unreachable".to_string()),
             worker_id: Some(worker_id.to_string()),
         };
     }
@@ -1512,7 +1511,7 @@ async fn handle_speedscore(
     if ctx.pool.get(worker_id).await.is_none() {
         return ApiResponse::Error(error_response(
             ErrorCode::ConfigInvalidWorker,
-            format!("Worker '{}' does not exist", worker_id),
+            format!("Worker '{}' not found", worker_id),
             Some(worker_id),
             None,
         ));
@@ -1551,7 +1550,7 @@ async fn handle_speedscore_history(
     if ctx.pool.get(worker_id).await.is_none() {
         return ApiResponse::Error(error_response(
             ErrorCode::ConfigInvalidWorker,
-            format!("Worker '{}' does not exist", worker_id),
+            format!("Worker '{}' not found", worker_id),
             Some(worker_id),
             None,
         ));
@@ -1659,7 +1658,7 @@ async fn handle_benchmark_trigger(
     if ctx.pool.get(worker_id).await.is_none() {
         return ApiResponse::Error(error_response(
             ErrorCode::ConfigInvalidWorker,
-            format!("Worker '{}' does not exist", worker_id),
+            format!("Worker '{}' not found", worker_id),
             Some(worker_id),
             None,
         ));
@@ -2559,6 +2558,7 @@ async fn handle_status(ctx: &DaemonContext) -> Result<DaemonFullStatus> {
         alerts,
         stats,
         test_stats,
+        saved_time: ctx.history.saved_time_stats(),
     })
 }
 
@@ -3337,14 +3337,12 @@ mod tests {
         let response = CancelAllBuildsResponse {
             status: "ok".to_string(),
             cancelled_count: 2,
-            cancelled: vec![
-                CancelledBuildInfo {
-                    build_id: 1,
-                    worker_id: "w1".to_string(),
-                    project_id: "p1".to_string(),
-                    slots_released: 4,
-                },
-            ],
+            cancelled: vec![CancelledBuildInfo {
+                build_id: 1,
+                worker_id: "w1".to_string(),
+                project_id: "p1".to_string(),
+                slots_released: 4,
+            }],
             message: None,
         };
         let json = serde_json::to_string(&response).unwrap();
@@ -3520,7 +3518,11 @@ mod tests {
     fn test_parse_request_worker_disable() {
         let req = parse_request("POST /workers/css/disable").unwrap();
         match req {
-            ApiRequest::WorkerDisable { worker_id, reason, drain_first } => {
+            ApiRequest::WorkerDisable {
+                worker_id,
+                reason,
+                drain_first,
+            } => {
                 assert_eq!(worker_id.as_str(), "css");
                 assert!(reason.is_none());
                 assert!(!drain_first);
@@ -3530,7 +3532,11 @@ mod tests {
 
         let req = parse_request("POST /workers/css/disable?reason=maintenance&drain=true").unwrap();
         match req {
-            ApiRequest::WorkerDisable { worker_id, reason, drain_first } => {
+            ApiRequest::WorkerDisable {
+                worker_id,
+                reason,
+                drain_first,
+            } => {
                 assert_eq!(worker_id.as_str(), "css");
                 assert_eq!(reason, Some("maintenance".to_string()));
                 assert!(drain_first);
@@ -3577,9 +3583,14 @@ mod tests {
 
     #[test]
     fn test_parse_request_record_build() {
-        let req = parse_request("POST /record-build?worker=css&project=myproject&is_test=true").unwrap();
+        let req =
+            parse_request("POST /record-build?worker=css&project=myproject&is_test=true").unwrap();
         match req {
-            ApiRequest::RecordBuild { worker_id, project, is_test } => {
+            ApiRequest::RecordBuild {
+                worker_id,
+                project,
+                is_test,
+            } => {
                 assert_eq!(worker_id.as_str(), "css");
                 assert_eq!(project, "myproject");
                 assert!(is_test);
@@ -3590,18 +3601,18 @@ mod tests {
 
     #[test]
     fn test_parse_request_ingest_telemetry() {
-        let req = parse_request("POST /telemetry/ingest?source=poll").unwrap();
+        let req = parse_request("POST /telemetry/ingest?source=piggyback").unwrap();
         match req {
             ApiRequest::IngestTelemetry(source) => {
-                assert_eq!(source, TelemetrySource::Poll);
+                assert_eq!(source, TelemetrySource::Piggyback);
             }
             _ => panic!("expected ingest telemetry request"),
         }
 
-        let req = parse_request("POST /telemetry/ingest?source=push").unwrap();
+        let req = parse_request("POST /telemetry/ingest?source=ssh_poll").unwrap();
         match req {
             ApiRequest::IngestTelemetry(source) => {
-                assert_eq!(source, TelemetrySource::Push);
+                assert_eq!(source, TelemetrySource::SshPoll);
             }
             _ => panic!("expected ingest telemetry request"),
         }
@@ -3611,7 +3622,9 @@ mod tests {
     fn test_parse_request_wait_for_worker() {
         let req = parse_request("GET /select-worker?project=test&wait=true").unwrap();
         match req {
-            ApiRequest::SelectWorker { wait_for_worker, .. } => {
+            ApiRequest::SelectWorker {
+                wait_for_worker, ..
+            } => {
                 assert!(wait_for_worker);
             }
             _ => panic!("expected select worker request"),
@@ -3619,7 +3632,9 @@ mod tests {
 
         let req = parse_request("GET /select-worker?project=test&wait=false").unwrap();
         match req {
-            ApiRequest::SelectWorker { wait_for_worker, .. } => {
+            ApiRequest::SelectWorker {
+                wait_for_worker, ..
+            } => {
                 assert!(!wait_for_worker);
             }
             _ => panic!("expected select worker request"),
@@ -3729,7 +3744,8 @@ mod tests {
         let pool = WorkerPool::new();
         pool.add_worker(make_test_worker("worker1", 8)).await;
         // Set to draining first
-        pool.set_status(&WorkerId::new("worker1"), WorkerStatus::Draining).await;
+        pool.set_status(&WorkerId::new("worker1"), WorkerStatus::Draining)
+            .await;
         let ctx = make_test_context(pool);
 
         let response = handle_worker_enable(&ctx, &WorkerId::new("worker1")).await;
@@ -3744,7 +3760,8 @@ mod tests {
         let pool = WorkerPool::new();
         let ctx = make_test_context(pool);
 
-        let response = handle_worker_disable(&ctx, &WorkerId::new("nonexistent"), None, false).await;
+        let response =
+            handle_worker_disable(&ctx, &WorkerId::new("nonexistent"), None, false).await;
         assert_eq!(response.status, "error");
         assert!(response.message.unwrap().contains("not found"));
     }
@@ -3755,7 +3772,13 @@ mod tests {
         pool.add_worker(make_test_worker("worker1", 8)).await;
         let ctx = make_test_context(pool);
 
-        let response = handle_worker_disable(&ctx, &WorkerId::new("worker1"), Some("maintenance".to_string()), false).await;
+        let response = handle_worker_disable(
+            &ctx,
+            &WorkerId::new("worker1"),
+            Some("maintenance".to_string()),
+            false,
+        )
+        .await;
         assert_eq!(response.status, "ok");
         assert_eq!(response.worker_id, "worker1");
         assert_eq!(response.action, "disable");
@@ -3767,6 +3790,10 @@ mod tests {
         let pool = WorkerPool::new();
         pool.add_worker(make_test_worker("worker1", 8)).await;
         let ctx = make_test_context(pool);
+
+        // Simulate an active build so drain_first takes the draining branch.
+        let worker = ctx.pool.get(&WorkerId::new("worker1")).await.unwrap();
+        assert!(worker.reserve_slots(1).await);
 
         let response = handle_worker_disable(&ctx, &WorkerId::new("worker1"), None, true).await;
         assert_eq!(response.status, "ok");
@@ -3793,9 +3820,7 @@ mod tests {
 
     #[test]
     fn test_worker_capabilities_response_serialization() {
-        let response = WorkerCapabilitiesResponse {
-            workers: vec![],
-        };
+        let response = WorkerCapabilitiesResponse { workers: vec![] };
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("\"workers\":[]"));
     }
@@ -3825,13 +3850,11 @@ mod tests {
     #[test]
     fn test_speedscore_list_response_serialization() {
         let response = SpeedScoreListResponse {
-            workers: vec![
-                SpeedScoreWorker {
-                    worker_id: "worker1".to_string(),
-                    speedscore: None,
-                    status: WorkerStatus::Healthy,
-                },
-            ],
+            workers: vec![SpeedScoreWorker {
+                worker_id: "worker1".to_string(),
+                speedscore: None,
+                status: WorkerStatus::Healthy,
+            }],
         };
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("\"worker_id\":\"worker1\""));
@@ -3871,13 +3894,10 @@ mod tests {
 
     #[test]
     fn test_api_response_error_serialization() {
-        let response: ApiResponse<HealthResponse> = ApiResponse::Error(ApiError {
-            code: ErrorCode::NotFound,
-            message: "Not found".to_string(),
-            details: None,
-        });
+        let response: ApiResponse<HealthResponse> =
+            ApiResponse::Error(ApiError::new(ErrorCode::ConfigNotFound, "Not found"));
         let json = serde_json::to_string(&response).unwrap();
-        assert!(json.contains("\"message\":\"Not found\""));
+        assert!(json.contains("\"details\":\"Not found\""));
     }
 
     // =========================================================================
@@ -3902,7 +3922,12 @@ mod tests {
         let response = handle_speedscore(&ctx, &WorkerId::new("nonexistent")).await;
         match response {
             ApiResponse::Error(e) => {
-                assert!(e.message.contains("not found"));
+                assert!(
+                    e.details
+                        .as_deref()
+                        .unwrap_or_default()
+                        .contains("not found")
+                );
             }
             _ => panic!("expected error response"),
         }
@@ -3949,7 +3974,12 @@ mod tests {
         let response = handle_benchmark_trigger(&ctx, &WorkerId::new("nonexistent")).await;
         match response {
             ApiResponse::Error(e) => {
-                assert!(e.message.contains("not found"));
+                assert!(
+                    e.details
+                        .as_deref()
+                        .unwrap_or_default()
+                        .contains("not found")
+                );
             }
             _ => panic!("expected error response"),
         }

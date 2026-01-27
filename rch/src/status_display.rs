@@ -20,6 +20,31 @@ fn default_socket_path() -> PathBuf {
     PathBuf::from(rch_common::default_socket_path())
 }
 
+/// Format milliseconds as human-readable duration.
+fn format_duration_ms(ms: u64) -> String {
+    if ms < 1000 {
+        format!("{}ms", ms)
+    } else if ms < 60_000 {
+        format!("{:.1}s", ms as f64 / 1000.0)
+    } else if ms < 3_600_000 {
+        let mins = ms / 60_000;
+        let secs = (ms % 60_000) / 1000;
+        if secs == 0 {
+            format!("{}m", mins)
+        } else {
+            format!("{}m {}s", mins, secs)
+        }
+    } else {
+        let hours = ms / 3_600_000;
+        let mins = (ms % 3_600_000) / 60_000;
+        if mins == 0 {
+            format!("{}h", hours)
+        } else {
+            format!("{}h {}m", hours, mins)
+        }
+    }
+}
+
 /// Query daemon's /status API for comprehensive status.
 pub async fn query_daemon_full_status() -> Result<DaemonFullStatusResponse> {
     let response = send_status_command().await?;
@@ -174,6 +199,68 @@ fn render_full_status_to<W: Write>(
             style.warning("Not installed")
         }
     )?;
+
+    // Saved time statistics
+    if let Some(saved_time) = &status.saved_time
+        && saved_time.builds_counted > 0
+    {
+        let time_saved_str = format_duration_ms(saved_time.time_saved_ms);
+        let speedup_str = if saved_time.avg_speedup > 0.0 {
+            format!("{:.1}x", saved_time.avg_speedup)
+        } else {
+            "-".to_string()
+        };
+        writeln!(
+            out,
+            "  {} {} {} saved ({} speedup, {} builds)",
+            style.key("Saved"),
+            style.muted(":"),
+            style.success(&time_saved_str),
+            style.info(&speedup_str),
+            saved_time.builds_counted
+        )?;
+
+        // Show daily stats if significant
+        if saved_time.today_saved_ms > 0 {
+            let today_str = format_duration_ms(saved_time.today_saved_ms);
+            let week_str = format_duration_ms(saved_time.week_saved_ms);
+            writeln!(
+                out,
+                "           {} today, {} this week",
+                style.highlight(&today_str),
+                style.info(&week_str)
+            )?;
+        }
+    }
+
+    // Alerts section if any
+    if !status.alerts.is_empty() {
+        writeln!(out, "\n{}", style.format_header("Alerts"))?;
+        for alert in &status.alerts {
+            let severity_style = match alert.severity.as_str() {
+                "critical" | "error" => style.error(&alert.severity),
+                "warning" => style.warning(&alert.severity),
+                _ => style.info(&alert.severity),
+            };
+
+            if let Some(worker_id) = &alert.worker_id {
+                writeln!(
+                    out,
+                    "  {} [{}] {} {}",
+                    style.symbols.bullet_filled,
+                    severity_style,
+                    alert.message,
+                    style.muted(&format!("({worker_id})")),
+                )?;
+            } else {
+                writeln!(
+                    out,
+                    "  {} [{}] {}",
+                    style.symbols.bullet_filled, severity_style, alert.message
+                )?;
+            }
+        }
+    }
 
     // Issues section if any
     if !status.issues.is_empty() {
@@ -673,6 +760,7 @@ mod tests {
                 summary: "worker-b unreachable".to_string(),
                 remediation: Some("Check SSH connectivity".to_string()),
             }],
+            alerts: vec![],
             stats: BuildStatsFromApi {
                 total_builds: 2,
                 success_count: 1,
@@ -689,6 +777,7 @@ mod tests {
                 avg_duration_ms: 1200,
                 runs_by_kind: std::collections::HashMap::from([("cargo_test".to_string(), 3)]),
             }),
+            saved_time: None,
         }
     }
 

@@ -31,21 +31,45 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+export PROJECT_ROOT
 MODE="mock"
 FAIL_MODE=""
 RUN_ALL="0"
 RUN_UNIT="0"
 VERBOSE="${RCH_E2E_VERBOSE:-0}"
 
+# Structured JSONL logging
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/test_lib.sh"
+init_test_log "$(basename "${BASH_SOURCE[0]}" .sh)"
+
 timestamp() { date -u '+%Y-%m-%dT%H:%M:%S.%3NZ'; }
+
+fail_with_code() {
+    local exit_code="$1"
+    shift
+    local reason="$*"
+    log_json verify "TEST FAIL" "{\"reason\":\"$reason\"}"
+    exit "$exit_code"
+}
 
 log() {
     local level="$1" phase="$2"; shift 2
     local ts; ts="$(timestamp)"
-    echo "[$ts] [$level] [$phase] $*"
+    local msg="[$ts] [$level] [$phase] $*"
+    echo "$msg"
+
+    local json_phase="execute"
+    case "$phase" in
+        SETUP|ARGS|PREFLIGHT) json_phase="setup" ;;
+        VERIFY) json_phase="verify" ;;
+        CLEANUP|TEARDOWN) json_phase="teardown" ;;
+        *) json_phase="execute" ;;
+    esac
+    log_json "$json_phase" "$msg"
 }
 
-die() { log "FAIL" "SETUP" "$*"; exit 2; }
+die() { log "FAIL" "SETUP" "$*"; fail_with_code 2 "$*"; }
 
 usage() {
     sed -n '1,40p' "$0" | sed 's/^# \{0,1\}//'
@@ -61,7 +85,7 @@ parse_args() {
             --unit) RUN_UNIT="1"; shift ;;
             --verbose|-v) VERBOSE="1"; shift ;;
             --help|-h) usage; exit 0 ;;
-            *) log "FAIL" "ARGS" "Unknown option: $1"; exit 3 ;;
+            *) log "FAIL" "ARGS" "Unknown option: $1"; fail_with_code 3 "Unknown option: $1" ;;
         esac
     done
     [[ "${RCH_MOCK_SSH:-}" == "1" ]] && MODE="mock" || true
@@ -495,7 +519,7 @@ main() {
     write_workers_config
     start_daemon
 
-    trap stop_daemon EXIT
+    trap '_test_lib_cleanup; stop_daemon' EXIT
 
     if [[ "$MODE" == "mock" ]]; then
         export RUST_LOG="${RUST_LOG:-info}"
@@ -509,6 +533,7 @@ main() {
 
     log "INFO" "DONE" "E2E complete. Logs in $LOG_DIR"
     log "INFO" "DONE" "Temp project kept at $TEST_ROOT"
+    test_pass
 }
 
 main "$@"

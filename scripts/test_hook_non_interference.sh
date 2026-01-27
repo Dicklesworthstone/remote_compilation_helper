@@ -10,17 +10,33 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+export PROJECT_ROOT
 TEST_LOG="${PROJECT_ROOT}/target/test_hook_interference.log"
+
+# Structured JSONL logging
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/test_lib.sh"
+init_test_log "$(basename "${BASH_SOURCE[0]}" .sh)"
 
 # Ensure target directory exists
 mkdir -p "${PROJECT_ROOT}/target"
 
-log() { echo "[$(date +%H:%M:%S)] $*" | tee -a "$TEST_LOG"; }
-pass() { log "PASS: $*"; }
-fail() { log "FAIL: $*"; exit 1; }
+log() {
+    echo "[$(date +%H:%M:%S)] $*" | tee -a "$TEST_LOG"
+    log_json execute "$*"
+}
+pass() {
+    log "PASS: $*"
+    log_json verify "PASS $*"
+}
+fail() {
+    log "FAIL: $*"
+    log_json verify "FAIL $*"
+    test_fail "$*"
+}
 
 # Clean up previous log
-> "$TEST_LOG"
+: > "$TEST_LOG"
 
 log "Starting Hook Non-Interference Tests"
 log "Project root: $PROJECT_ROOT"
@@ -68,7 +84,7 @@ PASSTHROUGH_INPUT='{"tool_name":"Bash","tool_input":{"command":"echo hello"}}'
 # Capture stdout and stderr separately
 STDOUT_FILE="$(mktemp)"
 STDERR_FILE="$(mktemp)"
-trap "rm -f $STDOUT_FILE $STDERR_FILE" EXIT
+trap '_test_lib_cleanup; rm -f "$STDOUT_FILE" "$STDERR_FILE"' EXIT
 
 # Test passthrough command (should allow, which means empty or {} output)
 echo "$PASSTHROUGH_INPUT" | "$RCH" > "$STDOUT_FILE" 2> "$STDERR_FILE"
@@ -270,3 +286,5 @@ log "  - Correct exit codes"
 log "  - Fast response times (<10ms)"
 log "  - Fail-open behavior for edge cases"
 log ""
+
+test_pass

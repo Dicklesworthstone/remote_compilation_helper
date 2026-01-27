@@ -12,8 +12,14 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+export PROJECT_ROOT
 TEST_DIR=$(mktemp -d)
 LOG_FILE="$TEST_DIR/e2e_install.log"
+
+# Structured JSONL logging
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/test_lib.sh"
+init_test_log "$(basename "${BASH_SOURCE[0]}" .sh)"
 
 # Test counters
 TESTS_RUN=0
@@ -26,6 +32,7 @@ TESTS_FAILED=0
 
 log() {
     echo "[$(date -Iseconds)] $*" | tee -a "$LOG_FILE"
+    log_json execute "$*"
 }
 
 pass() {
@@ -48,7 +55,7 @@ cleanup() {
     rm -rf "$TEST_DIR"
 }
 
-trap cleanup EXIT
+trap '_test_lib_cleanup; cleanup' EXIT
 
 # ============================================================================
 # Setup
@@ -63,7 +70,7 @@ echo ""
 # Verify install.sh exists
 if [[ ! -f "$PROJECT_ROOT/install.sh" ]]; then
     log "ERROR: install.sh not found at $PROJECT_ROOT/install.sh"
-    exit 1
+    test_fail "install.sh missing"
 fi
 
 # Make install.sh executable
@@ -175,7 +182,7 @@ run_install_case() {
         if command -v script >/dev/null 2>&1; then
             local cmd
             cmd="RCH_INSTALL_DIR=\"$install_dir\" RCH_CONFIG_DIR=\"$config_dir\" RCH_SKIP_DOCTOR=1 RCH_NO_HOOK=1 NO_GUM=1 SYSTEMCTL_LOG=\"$systemctl_log\" SYSTEMCTL_MODE=\"$systemctl_mode\" PATH=\"$stub_bin:$PATH\""
-            if [[ -n \"$home_dir\" ]]; then
+            if [[ -n "$home_dir" ]]; then
                 cmd="$cmd HOME=\"$home_dir\""
             fi
             cmd="$cmd \"$PROJECT_ROOT/install.sh\" --offline \"$tarball\" $extra_args"
@@ -1043,8 +1050,8 @@ log "Full log at: $LOG_FILE"
 
 if [[ $TESTS_FAILED -gt 0 ]]; then
     log "SOME TESTS FAILED"
-    exit 1
+    test_fail "One or more installer E2E tests failed"
 else
     log "ALL TESTS PASSED"
-    exit 0
+    test_pass
 fi

@@ -29,12 +29,26 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+export PROJECT_ROOT
 LIB_PATH="$SCRIPT_DIR/lib/e2e_common.sh"
 LEGACY_SCRIPT="$SCRIPT_DIR/e2e_pipeline.sh"
 
+# Structured JSONL logging
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/test_lib.sh"
+init_test_log "$(basename "${BASH_SOURCE[0]}" .sh)"
+
+fail_with_code() {
+    local exit_code="$1"
+    shift
+    local reason="$*"
+    log_json verify "TEST FAIL" "{\"reason\":\"$reason\"}"
+    exit "$exit_code"
+}
+
 if [[ ! -f "$LIB_PATH" ]]; then
     echo "[E2E] ERROR: Missing $LIB_PATH" >&2
-    exit 2
+    fail_with_code 2 "Missing $LIB_PATH"
 fi
 
 # shellcheck disable=SC1090
@@ -109,7 +123,7 @@ parse_args() {
             *)
                 echo "[E2E] ERROR: Unknown option: $1" >&2
                 usage
-                exit 2
+                fail_with_code 2 "Unknown option: $1"
                 ;;
         esac
     done
@@ -349,6 +363,7 @@ main() {
     e2e_log "====== TEST SUITE START ======"
     e2e_log "Discovered tests: ${#selected[@]}"
     e2e_log "Log dir: $LOG_DIR"
+    log_json setup "Discovered tests: ${#selected[@]} (log_dir=$LOG_DIR)"
 
     local -a serial_tests=()
     local -a parallel_tests=()
@@ -410,14 +425,15 @@ main() {
     e2e_log "====== SUMMARY ======"
     e2e_log "Passed: $passed, Failed: $failed, Skipped: $skipped"
     e2e_log "JUnit: $JUNIT_FILE"
+    log_json verify "Summary: passed=$passed failed=$failed skipped=$skipped junit=$JUNIT_FILE"
 
     if [[ "$infra" -eq 1 ]]; then
-        exit 2
+        fail_with_code 2 "Infra failure"
     fi
     if [[ "$failed" -gt 0 ]]; then
-        exit 1
+        test_fail "Some E2E tests failed"
     fi
-    exit 0
+    test_pass
 }
 
 main "$@"
