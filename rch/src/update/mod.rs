@@ -195,6 +195,7 @@ async fn update_fleet(ctx: &OutputContext, _info: &UpdateCheck, dry_run: bool) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::{OutputConfig, OutputMode};
     use types::Version;
 
     #[test]
@@ -212,6 +213,19 @@ mod tests {
         assert_ne!(stable, beta);
         assert_ne!(beta, nightly);
         assert_ne!(stable, nightly);
+    }
+
+    fn create_test_output_context(json: bool) -> OutputContext {
+        let config = OutputConfig {
+            force_mode: Some(if json {
+                OutputMode::Json
+            } else {
+                OutputMode::Plain
+            }),
+            json,
+            ..Default::default()
+        };
+        OutputContext::new(config)
     }
 
     fn create_test_update_check(update_available: bool) -> UpdateCheck {
@@ -260,7 +274,7 @@ mod tests {
 
     #[test]
     fn test_display_update_check_json_mode() {
-        let ctx = OutputContext::new_json();
+        let ctx = create_test_output_context(true);
         let info = create_test_update_check(true);
 
         // This function prints to stdout - just verify it doesn't panic
@@ -269,7 +283,7 @@ mod tests {
 
     #[test]
     fn test_display_update_check_no_update() {
-        let ctx = OutputContext::new_plain();
+        let ctx = create_test_output_context(false);
         let info = create_test_update_check(false);
 
         // Verify it doesn't panic
@@ -278,7 +292,7 @@ mod tests {
 
     #[test]
     fn test_display_update_check_with_update() {
-        let ctx = OutputContext::new_plain();
+        let ctx = create_test_output_context(false);
         let info = create_test_update_check(true);
 
         // Verify it doesn't panic
@@ -287,7 +301,7 @@ mod tests {
 
     #[test]
     fn test_display_update_check_with_changelog() {
-        let ctx = OutputContext::new_plain();
+        let ctx = create_test_output_context(false);
         let info = create_test_update_check(true);
 
         // Verify it doesn't panic with changelog display
@@ -309,7 +323,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_verify_installation_plain_mode() {
-        let ctx = OutputContext::new_plain();
+        let ctx = create_test_output_context(false);
 
         // This will run the current executable with --version
         // It may fail in test environment but shouldn't panic
@@ -318,7 +332,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_verify_installation_json_mode() {
-        let ctx = OutputContext::new_json();
+        let ctx = create_test_output_context(true);
 
         // Verify it doesn't panic in JSON mode
         let _ = verify_installation(&ctx).await;
@@ -326,7 +340,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_fleet_dry_run() {
-        let ctx = OutputContext::new_plain();
+        let ctx = create_test_output_context(false);
         let info = create_test_update_check(true);
 
         // Dry run should succeed
@@ -336,7 +350,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_fleet_json_mode() {
-        let ctx = OutputContext::new_json();
+        let ctx = create_test_output_context(true);
         let info = create_test_update_check(true);
 
         // Should succeed but report not implemented

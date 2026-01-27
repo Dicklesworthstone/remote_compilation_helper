@@ -715,15 +715,15 @@ pub fn config_dir() -> Option<PathBuf> {
 // =============================================================================
 
 /// Load workers from configuration file.
+///
+/// Returns an empty vector if no workers are configured. Does not print
+/// any messages - callers should handle the empty case appropriately.
 pub fn load_workers_from_config() -> Result<Vec<WorkerConfig>> {
     let config_path = config_dir()
         .map(|d| d.join("workers.toml"))
         .context("Could not determine config directory")?;
 
     if !config_path.exists() {
-        eprintln!("No workers configured.");
-        eprintln!("Create a workers config at: {:?}", config_path);
-        eprintln!("\nRun `rch config init` to generate example configuration.");
         return Ok(vec![]);
     }
 
@@ -832,6 +832,23 @@ pub async fn workers_list(show_speedscore: bool, ctx: &OutputContext) -> Result<
     }
 
     if workers.is_empty() {
+        let config_path = config_dir()
+            .map(|d| d.join("workers.toml"))
+            .unwrap_or_else(|| PathBuf::from("~/.config/rch/workers.toml"));
+        println!(
+            "  {} No workers configured.",
+            style.symbols.info
+        );
+        println!();
+        println!(
+            "  Create a workers config at: {}",
+            style.value(&config_path.display().to_string())
+        );
+        println!();
+        println!(
+            "  Run {} to generate example configuration.",
+            style.highlight("rch config init")
+        );
         return Ok(());
     }
 
@@ -7559,7 +7576,7 @@ pub async fn status_overview(workers: bool, jobs: bool, ctx: &OutputContext) -> 
         serde_json::from_str(json).context("Failed to parse daemon status response")?;
 
     if ctx.is_json() {
-        let _ = ctx.json(&status);
+        let _ = ctx.json(&ApiResponse::ok("status", &status));
         return Ok(());
     }
 
@@ -7610,7 +7627,7 @@ pub async fn queue_status(watch: bool, ctx: &OutputContext) -> Result<()> {
                 "slots_total": status.daemon.slots_total,
                 "timestamp": chrono::Utc::now().to_rfc3339()
             });
-            let _ = ctx.json(&queue_data);
+            let _ = ctx.json(&ApiResponse::ok("queue", queue_data));
             return Ok(());
         }
 
