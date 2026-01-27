@@ -847,8 +847,8 @@ impl SelfHealingConfig {
     /// - `RCH_NO_SELF_HEALING=1` - Master switch to disable all self-healing
     /// - `RCH_HOOK_STARTS_DAEMON=0|1` - Control hook auto-starting daemon
     /// - `RCH_DAEMON_INSTALLS_HOOKS=0|1` - Control daemon auto-installing hooks
-    /// - `RCH_DAEMON_START_TIMEOUT=<seconds>` - Max wait for daemon start
-    /// - `RCH_AUTO_START_COOLDOWN=<seconds>` - Min time between auto-starts
+    /// - `RCH_AUTO_START_TIMEOUT_SECS=<seconds>` - Max wait for daemon start
+    /// - `RCH_AUTO_START_COOLDOWN_SECS=<seconds>` - Min time between auto-starts
     pub fn with_env_overrides(mut self) -> Self {
         // Master disable switch
         if let Ok(val) = std::env::var("RCH_NO_SELF_HEALING")
@@ -868,12 +868,12 @@ impl SelfHealingConfig {
         }
 
         // Numeric settings
-        if let Ok(val) = std::env::var("RCH_DAEMON_START_TIMEOUT")
+        if let Ok(val) = std::env::var("RCH_AUTO_START_TIMEOUT_SECS")
             && let Ok(secs) = val.parse()
         {
             self.auto_start_timeout_secs = secs;
         }
-        if let Ok(val) = std::env::var("RCH_AUTO_START_COOLDOWN")
+        if let Ok(val) = std::env::var("RCH_AUTO_START_COOLDOWN_SECS")
             && let Ok(secs) = val.parse()
         {
             self.auto_start_cooldown_secs = secs;
@@ -3689,6 +3689,203 @@ mod tests {
         assert!(parsed.adaptive_compression);
         assert_eq!(parsed.min_compression_level, 2);
         assert_eq!(parsed.max_compression_level, 8);
+    }
+
+    // -------------------------------------------------------------------------
+    // Self-Healing Config Tests (bd-59kg)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_self_healing_config_defaults() {
+        // TEST START: SelfHealingConfig::default() returns expected values
+        let config = SelfHealingConfig::default();
+
+        // Both self-healing behaviors enabled by default
+        assert!(
+            config.hook_starts_daemon,
+            "hook_starts_daemon should be true by default"
+        );
+        assert!(
+            config.daemon_installs_hooks,
+            "daemon_installs_hooks should be true by default"
+        );
+
+        // Timing defaults
+        assert_eq!(
+            config.auto_start_cooldown_secs, 30,
+            "auto_start_cooldown_secs should default to 30"
+        );
+        assert_eq!(
+            config.auto_start_timeout_secs, 3,
+            "auto_start_timeout_secs should default to 3"
+        );
+        // TEST PASS: SelfHealingConfig defaults
+    }
+
+    #[test]
+    fn test_self_healing_config_serde_full() {
+        // TEST START: Full SelfHealingConfig serialization/deserialization
+        let config = SelfHealingConfig {
+            hook_starts_daemon: false,
+            daemon_installs_hooks: false,
+            auto_start_cooldown_secs: 60,
+            auto_start_timeout_secs: 10,
+        };
+
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains("\"hook_starts_daemon\":false"));
+        assert!(json.contains("\"daemon_installs_hooks\":false"));
+        assert!(json.contains("\"auto_start_cooldown_secs\":60"));
+        assert!(json.contains("\"auto_start_timeout_secs\":10"));
+
+        let parsed: SelfHealingConfig = serde_json::from_str(&json).unwrap();
+        assert!(!parsed.hook_starts_daemon);
+        assert!(!parsed.daemon_installs_hooks);
+        assert_eq!(parsed.auto_start_cooldown_secs, 60);
+        assert_eq!(parsed.auto_start_timeout_secs, 10);
+        // TEST PASS: Full SelfHealingConfig serde
+    }
+
+    #[test]
+    fn test_self_healing_config_serde_partial_uses_defaults() {
+        // TEST START: Partial TOML/JSON uses defaults for missing fields
+        let json = r#"{"hook_starts_daemon": false}"#;
+        let config: SelfHealingConfig = serde_json::from_str(json).unwrap();
+
+        assert!(
+            !config.hook_starts_daemon,
+            "Explicit false should be parsed"
+        );
+        assert!(
+            config.daemon_installs_hooks,
+            "Missing field should use default (true)"
+        );
+        assert_eq!(
+            config.auto_start_cooldown_secs, 30,
+            "Missing field should use default (30)"
+        );
+        assert_eq!(
+            config.auto_start_timeout_secs, 3,
+            "Missing field should use default (3)"
+        );
+        // TEST PASS: Partial SelfHealingConfig uses defaults
+    }
+
+    #[test]
+    fn test_self_healing_config_toml_with_alias() {
+        // TEST START: daemon_start_timeout alias works for auto_start_timeout_secs
+        let toml_str = r#"
+            hook_starts_daemon = true
+            daemon_installs_hooks = false
+            auto_start_cooldown_secs = 45
+            daemon_start_timeout = 7
+        "#;
+
+        let config: SelfHealingConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.hook_starts_daemon);
+        assert!(!config.daemon_installs_hooks);
+        assert_eq!(config.auto_start_cooldown_secs, 45);
+        assert_eq!(
+            config.auto_start_timeout_secs, 7,
+            "daemon_start_timeout alias should set auto_start_timeout_secs"
+        );
+        // TEST PASS: TOML alias works
+    }
+
+    #[allow(unsafe_code)]
+    mod self_healing_env_override_tests {
+        use super::*;
+        use crate::config::env_test_lock;
+
+        fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+            env_test_lock()
+        }
+
+        fn set_env(key: &str, value: &str) {
+            // SAFETY: Tests are serialized with env_guard().
+            unsafe { std::env::set_var(key, value) };
+        }
+
+        fn remove_env(key: &str) {
+            // SAFETY: Tests are serialized with env_guard().
+            unsafe { std::env::remove_var(key) };
+        }
+
+        struct EnvVarGuard {
+            key: &'static str,
+            old: Option<String>,
+        }
+
+        impl EnvVarGuard {
+            fn set(key: &'static str, value: &str) -> Self {
+                let old = std::env::var(key).ok();
+                set_env(key, value);
+                Self { key, old }
+            }
+        }
+
+        impl Drop for EnvVarGuard {
+            fn drop(&mut self) {
+                if let Some(old) = &self.old {
+                    set_env(self.key, old);
+                } else {
+                    remove_env(self.key);
+                }
+            }
+        }
+
+        #[test]
+        fn test_self_healing_config_with_env_overrides_master_disable() {
+            let _guard = env_guard();
+
+            let _no_self_healing = EnvVarGuard::set("RCH_NO_SELF_HEALING", "1");
+            let _hook_starts_daemon = EnvVarGuard::set("RCH_HOOK_STARTS_DAEMON", "1");
+            let _daemon_installs_hooks = EnvVarGuard::set("RCH_DAEMON_INSTALLS_HOOKS", "1");
+            let _cooldown = EnvVarGuard::set("RCH_AUTO_START_COOLDOWN_SECS", "99");
+            let _timeout = EnvVarGuard::set("RCH_AUTO_START_TIMEOUT_SECS", "99");
+
+            let config = SelfHealingConfig::default().with_env_overrides();
+            assert!(
+                !config.hook_starts_daemon,
+                "RCH_NO_SELF_HEALING should disable hook auto-start"
+            );
+            assert!(
+                !config.daemon_installs_hooks,
+                "RCH_NO_SELF_HEALING should disable daemon hook installation"
+            );
+
+            // Master disable returns early; numeric overrides should not apply.
+            assert_eq!(config.auto_start_cooldown_secs, 30);
+            assert_eq!(config.auto_start_timeout_secs, 3);
+        }
+
+        #[test]
+        fn test_self_healing_config_with_env_overrides_toggles_and_numbers() {
+            let _guard = env_guard();
+
+            let _hook_starts_daemon = EnvVarGuard::set("RCH_HOOK_STARTS_DAEMON", "0");
+            let _daemon_installs_hooks = EnvVarGuard::set("RCH_DAEMON_INSTALLS_HOOKS", "false");
+            let _cooldown = EnvVarGuard::set("RCH_AUTO_START_COOLDOWN_SECS", "45");
+            let _timeout = EnvVarGuard::set("RCH_AUTO_START_TIMEOUT_SECS", "7");
+
+            let config = SelfHealingConfig::default().with_env_overrides();
+            assert!(!config.hook_starts_daemon);
+            assert!(!config.daemon_installs_hooks);
+            assert_eq!(config.auto_start_cooldown_secs, 45);
+            assert_eq!(config.auto_start_timeout_secs, 7);
+        }
+
+        #[test]
+        fn test_self_healing_config_with_env_overrides_invalid_numbers_ignored() {
+            let _guard = env_guard();
+
+            let _cooldown = EnvVarGuard::set("RCH_AUTO_START_COOLDOWN_SECS", "not-a-number");
+            let _timeout = EnvVarGuard::set("RCH_AUTO_START_TIMEOUT_SECS", "nope");
+
+            let config = SelfHealingConfig::default().with_env_overrides();
+            assert_eq!(config.auto_start_cooldown_secs, 30);
+            assert_eq!(config.auto_start_timeout_secs, 3);
+        }
     }
 
     // -------------------------------------------------------------------------

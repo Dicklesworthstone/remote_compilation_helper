@@ -4813,4 +4813,140 @@ mod tests {
             "Cooldown path should end with hook_autostart.cooldown"
         );
     }
+
+    // =========================================================================
+    // Cooldown Integration Tests (bd-59kg)
+    // =========================================================================
+    //
+    // Note: Full integration tests for cooldown behavior in try_auto_start_daemon
+    // would require manipulating the state directory via env vars, which is unsafe
+    // in Rust 2024 (data races in parallel tests). The cooldown logic is tested via:
+    //
+    // 1. test_read_cooldown_timestamp_valid - validates reading timestamps works
+    // 2. test_read_cooldown_timestamp_missing - validates missing file returns None
+    // 3. test_write_cooldown_timestamp_creates_file - validates writing timestamps
+    // 4. test_auto_start_config_disabled - validates early exit when disabled
+    //
+    // The integration flow in try_auto_start_daemon is:
+    //   cooldown_path = autostart_cooldown_path()
+    //   if read_cooldown_timestamp(path).elapsed() < config.cooldown_secs:
+    //       return Err(CooldownActive)
+    //   ... proceed with daemon start ...
+    //   write_cooldown_timestamp(path)
+
+    #[test]
+    fn test_autostart_error_cooldown_active_variant() {
+        // TEST START: AutoStartError::CooldownActive has expected structure
+        let error = super::AutoStartError::CooldownActive(15, 30);
+
+        // Verify debug formatting includes timing info
+        let debug = format!("{:?}", error);
+        assert!(
+            debug.contains("CooldownActive"),
+            "Debug should contain variant name"
+        );
+        assert!(debug.contains("15"), "Debug should contain elapsed seconds");
+        assert!(
+            debug.contains("30"),
+            "Debug should contain cooldown threshold"
+        );
+
+        // Verify it's a distinct error variant
+        assert!(
+            !matches!(error, super::AutoStartError::Disabled),
+            "Should not be Disabled"
+        );
+        assert!(
+            !matches!(error, super::AutoStartError::LockHeld),
+            "Should not be LockHeld"
+        );
+        // TEST PASS: CooldownActive error variant
+    }
+
+    #[test]
+    fn test_cooldown_logic_simulation() {
+        // TEST START: Simulate cooldown logic without touching real state files
+        // This mirrors the logic in try_auto_start_daemon lines 628-640
+
+        let temp_dir = create_test_state_dir();
+        let cooldown_path = temp_dir.path().join("cooldown");
+        let cooldown_secs: u64 = 30;
+
+        // Case 1: No cooldown file -> should proceed
+        let last_attempt = super::read_cooldown_timestamp(&cooldown_path);
+        assert!(
+            last_attempt.is_none(),
+            "No file means no cooldown active - should proceed"
+        );
+
+        // Case 2: Recent cooldown file -> should block
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        // Write timestamp from 10 seconds ago (within 30s cooldown)
+        std::fs::write(&cooldown_path, format!("{}", now - 10)).unwrap();
+
+        let last_attempt = super::read_cooldown_timestamp(&cooldown_path).unwrap();
+        let elapsed = last_attempt
+            .elapsed()
+            .unwrap_or(std::time::Duration::ZERO)
+            .as_secs();
+        assert!(
+            elapsed < cooldown_secs,
+            "Elapsed {} should be < cooldown {} - should block",
+            elapsed,
+            cooldown_secs
+        );
+
+        // Case 3: Old cooldown file -> should proceed
+        // Write timestamp from 60 seconds ago (outside 30s cooldown)
+        std::fs::write(&cooldown_path, format!("{}", now - 60)).unwrap();
+
+        let last_attempt = super::read_cooldown_timestamp(&cooldown_path).unwrap();
+        let elapsed = last_attempt
+            .elapsed()
+            .unwrap_or(std::time::Duration::ZERO)
+            .as_secs();
+        assert!(
+            elapsed >= cooldown_secs,
+            "Elapsed {} should be >= cooldown {} - should proceed",
+            elapsed,
+            cooldown_secs
+        );
+        // TEST PASS: Cooldown logic simulation
+    }
+
+    #[test]
+    fn test_cooldown_file_update_after_attempt() {
+        // TEST START: Verify cooldown timestamp is updated after write
+        let temp_dir = create_test_state_dir();
+        let cooldown_path = temp_dir.path().join("subdir/cooldown");
+
+        // Write initial cooldown
+        let result = super::write_cooldown_timestamp(&cooldown_path);
+        assert!(result.is_ok(), "First write should succeed");
+
+        let timestamp1 = std::fs::read_to_string(&cooldown_path).unwrap();
+        let ts1: u64 = timestamp1
+            .trim()
+            .parse()
+            .expect("cooldown timestamp must be a unix seconds integer");
+
+        // Sleep briefly and write again
+        let result = super::write_cooldown_timestamp(&cooldown_path);
+        assert!(result.is_ok(), "Second write should succeed");
+
+        let timestamp2 = std::fs::read_to_string(&cooldown_path).unwrap();
+        let ts2: u64 = timestamp2
+            .trim()
+            .parse()
+            .expect("cooldown timestamp must be a unix seconds integer");
+
+        assert!(
+            ts2 >= ts1,
+            "Second write should be >= first write (ts2={ts2} >= ts1={ts1})"
+        );
+        // TEST PASS: Cooldown file update
+    }
 }
