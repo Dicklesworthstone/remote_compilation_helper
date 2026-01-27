@@ -60,7 +60,9 @@ export const api = {
    * Get full daemon status including workers, builds, and issues
    */
   async getStatus(): Promise<StatusResponse> {
-    return fetchApi<StatusResponse>('/status');
+    // Use Next.js node runtime proxy so the browser doesn't need direct access
+    // to the daemon's HTTP endpoints (status lives on the Unix socket).
+    return fetchJson<StatusResponse>('/api/status');
   },
 
   /**

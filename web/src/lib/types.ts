@@ -36,15 +36,30 @@ export interface ActiveBuild {
   started_at: string;
 }
 
+export interface QueuedBuild {
+  id: number;
+  project_id: string;
+  command: string;
+  queued_at: string;
+  position: number;
+  slots_needed: number;
+  estimated_start: string | null;
+  wait_time: string;
+}
+
+export type BuildLocation = 'local' | 'remote';
+
 export interface BuildRecord {
   id: number;
   project_id: string;
-  worker_id: string;
+  worker_id: string | null;
   command: string;
   exit_code: number;
   duration_ms: number;
   started_at: string;
   completed_at: string;
+  location: BuildLocation;
+  bytes_transferred?: number | null;
 }
 
 export interface Issue {
@@ -55,9 +70,10 @@ export interface Issue {
 
 export interface BuildStats {
   total_builds: number;
-  successful_builds: number;
-  failed_builds: number;
-  total_duration_ms: number;
+  success_count: number;
+  failure_count: number;
+  remote_count: number;
+  local_count: number;
   avg_duration_ms: number;
 }
 
@@ -65,6 +81,7 @@ export interface StatusResponse {
   daemon: DaemonStatusInfo;
   workers: WorkerStatusInfo[];
   active_builds: ActiveBuild[];
+  queued_builds: QueuedBuild[];
   recent_builds: BuildRecord[];
   issues: Issue[];
   stats: BuildStats;
