@@ -55,6 +55,10 @@ proptest = "1.7.0"
 name = "classifier"
 harness = false
 
+[[bench]]
+name = "ui_bench"
+harness = false
+
 [lints.rust]
 # Use "deny" instead of "forbid" to allow tests to manipulate environment variables
 # (set_var/remove_var are unsafe in Rust 2024 edition)

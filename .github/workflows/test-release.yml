@@ -1,0 +1,141 @@
+name: Test Release
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+# Cancel in-progress runs for the same branch/PR to save resources.
+concurrency:
+  group: test-release-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: 2
+
+jobs:
+  build:
+    name: Build (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            runs-on: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            checksum_cmd: sha256sum
+          - name: linux-aarch64
+            runs-on: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            checksum_cmd: sha256sum
+          - name: macos-x86_64
+            runs-on: macos-13
+            target: x86_64-apple-darwin
+            checksum_cmd: shasum -a 256
+          - name: macos-aarch64
+            runs-on: macos-latest
+            target: aarch64-apple-darwin
+            checksum_cmd: shasum -a 256
+          - name: windows-x86_64
+            runs-on: windows-latest
+            target: x86_64-pc-windows-msvc
+
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2025-01-01
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test-release-${{ matrix.target }}
+          cache-on-failure: true
+
+      - name: Build (release)
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Verify binaries exist (unix)
+        if: runner.os != 'Windows'
+        run: |
+          test -x "target/${{ matrix.target }}/release/rch"
+          test -x "target/${{ matrix.target }}/release/rchd"
+          test -x "target/${{ matrix.target }}/release/rch-wkr"
+
+      - name: Verify binaries exist (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (!(Test-Path "target/${{ matrix.target }}/release/rch.exe")) { throw "missing rch.exe" }
+          if (!(Test-Path "target/${{ matrix.target }}/release/rchd.exe")) { throw "missing rchd.exe" }
+          if (!(Test-Path "target/${{ matrix.target }}/release/rch-wkr.exe")) { throw "missing rch-wkr.exe" }
+
+      - name: Smoke test (version) (unix)
+        if: runner.os != 'Windows'
+        run: |
+          "target/${{ matrix.target }}/release/rch" --version
+          "target/${{ matrix.target }}/release/rchd" --version
+          "target/${{ matrix.target }}/release/rch-wkr" --version
+
+      - name: Smoke test (version) (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & "target/${{ matrix.target }}/release/rch.exe" --version
+          & "target/${{ matrix.target }}/release/rchd.exe" --version
+          & "target/${{ matrix.target }}/release/rch-wkr.exe" --version
+
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        run: |
+          TAG="pr-${{ github.event.pull_request.number || github.run_id }}-${GITHUB_SHA:0:7}"
+          mkdir -p dist
+          cd "target/${{ matrix.target }}/release"
+          tar -czf "../../../dist/rch-${TAG}-${{ matrix.target }}.tar.gz" rch rchd rch-wkr
+          cd ../../../dist
+          ${{ matrix.checksum_cmd }} "rch-${TAG}-${{ matrix.target }}.tar.gz" > "rch-${TAG}-${{ matrix.target }}.tar.gz.sha256"
+
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $Tag = "pr-${{ github.event.pull_request.number || github.run_id }}-$($env:GITHUB_SHA.Substring(0,7))"
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $Archive = "dist/rch-$Tag-${{ matrix.target }}.zip"
+          Compress-Archive -Path target/${{ matrix.target }}/release/rch.exe,target/${{ matrix.target }}/release/rchd.exe,target/${{ matrix.target }}/release/rch-wkr.exe -DestinationPath $Archive
+          $Hash = (Get-FileHash $Archive -Algorithm SHA256).Hash.ToLower()
+          "$Hash  rch-$Tag-${{ matrix.target }}.zip" | Out-File -FilePath "$Archive.sha256" -Encoding ascii -NoNewline
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.name }}
+          path: dist/*
+          retention-days: 7
+
+  verify:
+    name: Verify packaged artifacts
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: dist-*
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -la artifacts/
+
+      - name: Verify checksums
+        run: |
+          cd artifacts
+          sha256sum -c *.sha256
