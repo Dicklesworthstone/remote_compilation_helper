@@ -249,9 +249,13 @@ pub fn verify_and_install_claude_code_hook() -> Result<HookResult> {
         .entry("PreToolUse")
         .or_insert_with(|| serde_json::json!([]));
 
-    if let Some(arr) = pre_tool_use.as_array_mut() {
-        arr.push(hook_entry);
+    if !pre_tool_use.is_array() {
+        *pre_tool_use = serde_json::json!([]);
     }
+    pre_tool_use
+        .as_array_mut()
+        .expect("PreToolUse is an array")
+        .push(hook_entry);
 
     // Write settings atomically
     let content = serde_json::to_string_pretty(&settings)?;
@@ -324,9 +328,13 @@ fn add_rch_hook_to_settings(mut settings: Value) -> Result<Value> {
         .entry("PreToolUse")
         .or_insert_with(|| serde_json::json!([]));
 
-    if let Some(arr) = pre_tool_use.as_array_mut() {
-        arr.push(hook_entry);
+    if !pre_tool_use.is_array() {
+        *pre_tool_use = serde_json::json!([]);
     }
+    pre_tool_use
+        .as_array_mut()
+        .expect("PreToolUse is an array")
+        .push(hook_entry);
 
     Ok(settings)
 }
@@ -368,6 +376,174 @@ mod tests {
             HookResult::Skipped("a".to_string()),
             HookResult::Skipped("b".to_string())
         );
+    }
+
+    #[allow(unsafe_code)]
+    mod install_tests {
+        use super::*;
+        use crate::config::env_test_lock;
+
+        fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+            env_test_lock()
+        }
+
+        fn set_env(key: &str, value: &str) {
+            // SAFETY: Tests are serialized with env_guard().
+            unsafe { std::env::set_var(key, value) };
+        }
+
+        fn remove_env(key: &str) {
+            // SAFETY: Tests are serialized with env_guard().
+            unsafe { std::env::remove_var(key) };
+        }
+
+        struct EnvVarGuard {
+            key: &'static str,
+            old: Option<String>,
+        }
+
+        impl EnvVarGuard {
+            fn set(key: &'static str, value: &str) -> Self {
+                let old = std::env::var(key).ok();
+                set_env(key, value);
+                Self { key, old }
+            }
+        }
+
+        impl Drop for EnvVarGuard {
+            fn drop(&mut self) {
+                if let Some(old) = &self.old {
+                    set_env(self.key, old);
+                } else {
+                    remove_env(self.key);
+                }
+            }
+        }
+
+        #[test]
+        fn test_verify_and_install_not_applicable_does_not_create_claude_dir() {
+            let _guard = env_guard();
+
+            let tmp = TempDir::new().unwrap();
+            let home = tmp.path().to_string_lossy().to_string();
+            let _home = EnvVarGuard::set("HOME", &home);
+
+            let claude_dir = tmp.path().join(".claude");
+            assert!(!claude_dir.exists());
+
+            let result = verify_and_install_claude_code_hook().unwrap();
+            assert_eq!(result, HookResult::NotApplicable);
+
+            // Critical: the function must NOT create ~/.claude when absent.
+            assert!(!claude_dir.exists(), "Should not create ~/.claude");
+        }
+
+        #[test]
+        fn test_verify_and_install_installs_hook_when_claude_dir_exists() {
+            let _guard = env_guard();
+
+            let tmp = TempDir::new().unwrap();
+            let home = tmp.path().to_string_lossy().to_string();
+            let _home = EnvVarGuard::set("HOME", &home);
+
+            let claude_dir = tmp.path().join(".claude");
+            fs::create_dir_all(&claude_dir).unwrap();
+            let settings_path = claude_dir.join("settings.json");
+            assert!(!settings_path.exists());
+
+            let result = verify_and_install_claude_code_hook().unwrap();
+            assert_eq!(result, HookResult::Installed);
+
+            let settings_str = fs::read_to_string(&settings_path).unwrap();
+            let settings: Value = serde_json::from_str(&settings_str).unwrap();
+            assert!(
+                settings_has_rch_hook(&settings),
+                "Installed settings should contain rch hook"
+            );
+        }
+
+        #[test]
+        fn test_verify_and_install_already_installed_does_not_modify_file() {
+            let _guard = env_guard();
+
+            let tmp = TempDir::new().unwrap();
+            let home = tmp.path().to_string_lossy().to_string();
+            let _home = EnvVarGuard::set("HOME", &home);
+
+            let claude_dir = tmp.path().join(".claude");
+            fs::create_dir_all(&claude_dir).unwrap();
+            let settings_path = claude_dir.join("settings.json");
+
+            let settings = json!({
+                "hooks": {
+                    "PreToolUse": [
+                        {
+                            "matcher": "Bash",
+                            "hooks": [
+                                { "type": "command", "command": "rch" }
+                            ]
+                        }
+                    ]
+                }
+            });
+            fs::write(
+                &settings_path,
+                serde_json::to_string_pretty(&settings).unwrap(),
+            )
+            .unwrap();
+            let before = fs::read_to_string(&settings_path).unwrap();
+
+            let result = verify_and_install_claude_code_hook().unwrap();
+            assert_eq!(result, HookResult::AlreadyInstalled);
+
+            let after = fs::read_to_string(&settings_path).unwrap();
+            assert_eq!(
+                after, before,
+                "AlreadyInstalled should not rewrite settings.json"
+            );
+        }
+
+        #[test]
+        fn test_verify_and_install_coerces_pre_tool_use_to_array() {
+            let _guard = env_guard();
+
+            let tmp = TempDir::new().unwrap();
+            let home = tmp.path().to_string_lossy().to_string();
+            let _home = EnvVarGuard::set("HOME", &home);
+
+            let claude_dir = tmp.path().join(".claude");
+            fs::create_dir_all(&claude_dir).unwrap();
+            let settings_path = claude_dir.join("settings.json");
+
+            let settings = json!({
+                "hooks": {
+                    "PreToolUse": { "not": "an array" }
+                }
+            });
+            fs::write(
+                &settings_path,
+                serde_json::to_string_pretty(&settings).unwrap(),
+            )
+            .unwrap();
+
+            let result = verify_and_install_claude_code_hook().unwrap();
+            assert_eq!(result, HookResult::Installed);
+
+            let settings_str = fs::read_to_string(&settings_path).unwrap();
+            let settings: Value = serde_json::from_str(&settings_str).unwrap();
+            assert!(
+                settings
+                    .get("hooks")
+                    .and_then(|h| h.get("PreToolUse"))
+                    .and_then(|v| v.as_array())
+                    .is_some(),
+                "PreToolUse should be coerced to an array"
+            );
+            assert!(
+                settings_has_rch_hook(&settings),
+                "Installed settings should contain rch hook"
+            );
+        }
     }
 
     // =========================================================================

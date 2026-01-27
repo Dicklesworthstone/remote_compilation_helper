@@ -110,8 +110,13 @@ fn check_claude_code_hook_at_path(settings_path: &std::path::Path) -> Result<Hoo
     let content =
         std::fs::read_to_string(settings_path).context("Failed to read Claude Code settings")?;
 
-    let settings: Value =
-        serde_json::from_str(&content).context("Failed to parse Claude Code settings")?;
+    let settings: Value = match serde_json::from_str(&content) {
+        Ok(settings) => settings,
+        Err(_) => {
+            // Malformed JSON should not crash status checks. Treat as misconfigured.
+            return Ok(HookStatus::NeedsUpdate);
+        }
+    };
 
     // Check for PreToolUse hook with rch
     if let Some(hooks) = settings.get("hooks")
@@ -1244,28 +1249,19 @@ mod tests {
     }
 
     // ===== TEST: Self-Healing Hook Installation (bd-59kg) =====
+    //
+    // These tests use the internal `_at_path` functions directly to avoid
+    // needing to manipulate HOME env var (which requires unsafe in Rust 2024).
 
     /// Test environment helper for isolated hook tests.
     struct TestEnv {
         temp_dir: tempfile::TempDir,
-        original_home: String,
     }
 
     impl TestEnv {
-        // NOTE: In Rust 2024 edition, std::env::set_var is unsafe (data races).
-        // Tests using this TestEnv are marked #[ignore] because they require env
-        // var manipulation which conflicts with #![forbid(unsafe_code)].
-        // The same hook functionality is fully tested via MockClaudeEnv in
-        // rch-common/src/hooks.rs which tests the internal helper functions.
-        #[allow(dead_code)]
         fn new() -> Self {
-            let temp = tempfile::TempDir::new().expect("Failed to create temp dir");
-            let original_home = std::env::var("HOME").unwrap_or_default();
-            // Cannot set HOME here - would require unsafe block
-
             Self {
-                temp_dir: temp,
-                original_home,
+                temp_dir: tempfile::TempDir::new().expect("Failed to create temp dir"),
             }
         }
 
@@ -1290,29 +1286,17 @@ mod tests {
         }
 
         fn read_settings_json(&self) -> serde_json::Value {
-            let content =
-                std::fs::read_to_string(self.settings_path()).expect("Failed to read settings.json");
+            let content = std::fs::read_to_string(self.settings_path())
+                .expect("Failed to read settings.json");
             serde_json::from_str(&content).expect("Failed to parse settings.json")
-        }
-    }
-
-    impl Drop for TestEnv {
-        fn drop(&mut self) {
-            // Cannot restore HOME - would require unsafe block
-            // Tests using this are marked #[ignore]
-            let _ = &self.original_home; // suppress unused field warning
         }
     }
 
     /// CRITICAL TEST: When ~/.claude directory doesn't exist, return NotApplicable
     /// and do NOT create the directory.
-    ///
-    /// NOTE: Ignored in Rust 2024 edition because env var manipulation requires unsafe.
-    /// This functionality is tested via MockClaudeEnv in rch-common/src/hooks.rs.
     #[test]
-    #[ignore = "Requires HOME env var manipulation (unsafe in Rust 2024)"]
-    fn test_install_hook_no_claude_dir_returns_not_applicable() {
-        eprintln!("TEST START: test_install_hook_no_claude_dir_returns_not_applicable");
+    fn test_install_hook_at_path_no_claude_dir_returns_not_applicable() {
+        eprintln!("TEST START: test_install_hook_at_path_no_claude_dir_returns_not_applicable");
         let test_env = TestEnv::new();
 
         // Verify .claude doesn't exist
@@ -1321,8 +1305,8 @@ mod tests {
             ".claude should not exist initially"
         );
 
-        // Action: call install_hook
-        let result = install_hook(AgentKind::ClaudeCode, false);
+        // Action: call install_claude_code_hook_at_path
+        let result = install_claude_code_hook_at_path(&test_env.settings_path(), false);
         eprintln!("  Result: {:?}", result);
 
         // Assert: returns NotApplicable (not error)
@@ -1340,14 +1324,13 @@ mod tests {
             ".claude should NOT be created"
         );
 
-        eprintln!("TEST PASS: test_install_hook_no_claude_dir_returns_not_applicable");
+        eprintln!("TEST PASS: test_install_hook_at_path_no_claude_dir_returns_not_applicable");
     }
 
     /// When .claude exists but settings.json doesn't, hook should be installed.
     #[test]
-    #[ignore = "Requires HOME env var manipulation (unsafe in Rust 2024)"]
-    fn test_install_hook_claude_dir_exists_no_settings() {
-        eprintln!("TEST START: test_install_hook_claude_dir_exists_no_settings");
+    fn test_install_hook_at_path_claude_dir_exists_no_settings() {
+        eprintln!("TEST START: test_install_hook_at_path_claude_dir_exists_no_settings");
         let test_env = TestEnv::new();
 
         // Setup: create .claude directory (user uses Claude Code)
@@ -1355,7 +1338,7 @@ mod tests {
         assert!(!test_env.settings_path().exists());
 
         // Action: install hook
-        let result = install_hook(AgentKind::ClaudeCode, false);
+        let result = install_claude_code_hook_at_path(&test_env.settings_path(), false);
         eprintln!("  Result: {:?}", result);
 
         // Assert: returns Changed
@@ -1388,14 +1371,13 @@ mod tests {
         });
         assert!(has_rch, "RCH hook should be present");
 
-        eprintln!("TEST PASS: test_install_hook_claude_dir_exists_no_settings");
+        eprintln!("TEST PASS: test_install_hook_at_path_claude_dir_exists_no_settings");
     }
 
     /// When hook is already installed, return Unchanged.
     #[test]
-    #[ignore = "Requires HOME env var manipulation (unsafe in Rust 2024)"]
-    fn test_install_hook_already_installed() {
-        eprintln!("TEST START: test_install_hook_already_installed");
+    fn test_install_hook_at_path_already_installed() {
+        eprintln!("TEST START: test_install_hook_at_path_already_installed");
         let test_env = TestEnv::new();
 
         // Setup: create .claude directory and settings with RCH hook
@@ -1417,7 +1399,7 @@ mod tests {
         }));
 
         // Action: install hook (should detect already installed)
-        let result = install_hook(AgentKind::ClaudeCode, false);
+        let result = install_claude_code_hook_at_path(&test_env.settings_path(), false);
         eprintln!("  Result: {:?}", result);
 
         // Assert: returns Unchanged
@@ -1434,14 +1416,13 @@ mod tests {
         let hooks = settings["hooks"]["PreToolUse"].as_array().unwrap();
         assert_eq!(hooks.len(), 1, "Should still have exactly one hook");
 
-        eprintln!("TEST PASS: test_install_hook_already_installed");
+        eprintln!("TEST PASS: test_install_hook_at_path_already_installed");
     }
 
     /// When other hooks exist, RCH hook should be added while preserving others.
     #[test]
-    #[ignore = "Requires HOME env var manipulation (unsafe in Rust 2024)"]
-    fn test_install_hook_preserves_existing_hooks() {
-        eprintln!("TEST START: test_install_hook_preserves_existing_hooks");
+    fn test_install_hook_at_path_preserves_existing_hooks() {
+        eprintln!("TEST START: test_install_hook_at_path_preserves_existing_hooks");
         let test_env = TestEnv::new();
 
         // Setup: settings.json with other hooks (e.g., DCG)
@@ -1464,7 +1445,7 @@ mod tests {
         }));
 
         // Action: install RCH hook
-        let result = install_hook(AgentKind::ClaudeCode, false);
+        let result = install_claude_code_hook_at_path(&test_env.settings_path(), false);
         eprintln!("  Result: {:?}", result);
 
         // Assert: returns Changed
@@ -1512,14 +1493,13 @@ mod tests {
             "Other settings should be preserved"
         );
 
-        eprintln!("TEST PASS: test_install_hook_preserves_existing_hooks");
+        eprintln!("TEST PASS: test_install_hook_at_path_preserves_existing_hooks");
     }
 
-    /// When settings.json has malformed JSON, return error and don't modify file.
+    /// When settings.json has malformed JSON, silently replace with valid JSON.
     #[test]
-    #[ignore = "Requires HOME env var manipulation (unsafe in Rust 2024)"]
-    fn test_install_hook_malformed_json_errors() {
-        eprintln!("TEST START: test_install_hook_malformed_json_errors");
+    fn test_install_hook_at_path_malformed_json_recovers() {
+        eprintln!("TEST START: test_install_hook_at_path_malformed_json_recovers");
         let test_env = TestEnv::new();
 
         // Setup: settings.json with invalid JSON
@@ -1527,27 +1507,23 @@ mod tests {
         std::fs::write(test_env.settings_path(), "{ invalid json }").unwrap();
 
         // Action: install hook
-        let result = install_hook(AgentKind::ClaudeCode, false);
+        let result = install_claude_code_hook_at_path(&test_env.settings_path(), false);
         eprintln!("  Result: {:?}", result);
 
         // The current implementation silently replaces invalid JSON with {}
-        // This is a reasonable behavior - let's just verify it doesn't crash
-        // and the file ends up valid
-        if result.is_ok() {
-            let content = std::fs::read_to_string(test_env.settings_path()).unwrap();
-            // Should be valid JSON now
-            let parsed: Result<serde_json::Value, _> = serde_json::from_str(&content);
-            assert!(parsed.is_ok(), "File should be valid JSON after install");
-        }
+        // This is reasonable behavior - verify it doesn't crash and file ends up valid
+        assert!(result.is_ok(), "Should not error on malformed JSON");
+        let content = std::fs::read_to_string(test_env.settings_path()).unwrap();
+        let parsed: Result<serde_json::Value, _> = serde_json::from_str(&content);
+        assert!(parsed.is_ok(), "File should be valid JSON after install");
 
-        eprintln!("TEST PASS: test_install_hook_malformed_json_errors");
+        eprintln!("TEST PASS: test_install_hook_at_path_malformed_json_recovers");
     }
 
     /// Dry run should return WouldChange without modifying anything.
     #[test]
-    #[ignore = "Requires HOME env var manipulation (unsafe in Rust 2024)"]
-    fn test_install_hook_dry_run_no_changes() {
-        eprintln!("TEST START: test_install_hook_dry_run_no_changes");
+    fn test_install_hook_at_path_dry_run_no_changes() {
+        eprintln!("TEST START: test_install_hook_at_path_dry_run_no_changes");
         let test_env = TestEnv::new();
 
         // Setup: .claude directory exists but no settings
@@ -1555,7 +1531,7 @@ mod tests {
         assert!(!test_env.settings_path().exists());
 
         // Action: install hook with dry_run = true
-        let result = install_hook(AgentKind::ClaudeCode, true);
+        let result = install_claude_code_hook_at_path(&test_env.settings_path(), true);
         eprintln!("  Result: {:?}", result);
 
         // Assert: returns WouldChange
@@ -1573,6 +1549,74 @@ mod tests {
             "settings.json should NOT be created in dry run"
         );
 
-        eprintln!("TEST PASS: test_install_hook_dry_run_no_changes");
+        eprintln!("TEST PASS: test_install_hook_at_path_dry_run_no_changes");
+    }
+
+    /// Check hook status on non-existent settings file returns NotInstalled.
+    #[test]
+    fn test_check_hook_at_path_not_exists() {
+        eprintln!("TEST START: test_check_hook_at_path_not_exists");
+        let test_env = TestEnv::new();
+        test_env.create_claude_dir();
+
+        let result = check_claude_code_hook_at_path(&test_env.settings_path());
+        eprintln!("  Result: {:?}", result);
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), HookStatus::NotInstalled);
+
+        eprintln!("TEST PASS: test_check_hook_at_path_not_exists");
+    }
+
+    /// Check hook status when installed returns Installed.
+    #[test]
+    fn test_check_hook_at_path_installed() {
+        eprintln!("TEST START: test_check_hook_at_path_installed");
+        let test_env = TestEnv::new();
+        test_env.create_claude_dir();
+        test_env.write_settings_json(&serde_json::json!({
+            "hooks": {
+                "PreToolUse": [
+                    {
+                        "matcher": "Bash",
+                        "hooks": [
+                            { "type": "command", "command": "rch" }
+                        ]
+                    }
+                ]
+            }
+        }));
+
+        let result = check_claude_code_hook_at_path(&test_env.settings_path());
+        eprintln!("  Result: {:?}", result);
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), HookStatus::Installed);
+
+        eprintln!("TEST PASS: test_check_hook_at_path_installed");
+    }
+
+    /// Check hook status with obsolete format returns NeedsUpdate.
+    #[test]
+    fn test_check_hook_at_path_needs_update() {
+        eprintln!("TEST START: test_check_hook_at_path_needs_update");
+        let test_env = TestEnv::new();
+        test_env.create_claude_dir();
+        // Obsolete format: command at top level without matcher
+        test_env.write_settings_json(&serde_json::json!({
+            "hooks": {
+                "PreToolUse": [
+                    { "command": "rch", "description": "Old format" }
+                ]
+            }
+        }));
+
+        let result = check_claude_code_hook_at_path(&test_env.settings_path());
+        eprintln!("  Result: {:?}", result);
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), HookStatus::NeedsUpdate);
+
+        eprintln!("TEST PASS: test_check_hook_at_path_needs_update");
     }
 }

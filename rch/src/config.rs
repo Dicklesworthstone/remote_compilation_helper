@@ -1443,8 +1443,30 @@ fn apply_env_overrides_inner(
         }
     }
 
+    let mut self_healing_master_disabled = false;
+    if let Some(val) = get_env("RCH_NO_SELF_HEALING")
+        && parse_bool(&val).unwrap_or(false)
+    {
+        self_healing_master_disabled = true;
+        config.self_healing.hook_starts_daemon = false;
+        config.self_healing.daemon_installs_hooks = false;
+        if let Some(ref mut sources) = sources {
+            set_source(
+                sources,
+                "self_healing.hook_starts_daemon",
+                ConfigValueSource::EnvVar("RCH_NO_SELF_HEALING".to_string()),
+            );
+            set_source(
+                sources,
+                "self_healing.daemon_installs_hooks",
+                ConfigValueSource::EnvVar("RCH_NO_SELF_HEALING".to_string()),
+            );
+        }
+    }
+
     if let Some(val) = get_env("RCH_HOOK_STARTS_DAEMON")
         && let Some(enabled) = parse_bool(&val)
+        && !self_healing_master_disabled
     {
         config.self_healing.hook_starts_daemon = enabled;
         if let Some(ref mut sources) = sources {
@@ -1458,6 +1480,7 @@ fn apply_env_overrides_inner(
 
     if let Some(val) = get_env("RCH_DAEMON_INSTALLS_HOOKS")
         && let Some(enabled) = parse_bool(&val)
+        && !self_healing_master_disabled
     {
         config.self_healing.daemon_installs_hooks = enabled;
         if let Some(ref mut sources) = sources {
@@ -1471,6 +1494,7 @@ fn apply_env_overrides_inner(
 
     if let Some(val) = get_env("RCH_AUTO_START_COOLDOWN_SECS")
         && let Ok(secs) = val.parse()
+        && !self_healing_master_disabled
     {
         config.self_healing.auto_start_cooldown_secs = secs;
         if let Some(ref mut sources) = sources {
@@ -1484,6 +1508,7 @@ fn apply_env_overrides_inner(
 
     if let Some(val) = get_env("RCH_AUTO_START_TIMEOUT_SECS")
         && let Ok(secs) = val.parse()
+        && !self_healing_master_disabled
     {
         config.self_healing.auto_start_timeout_secs = secs;
         if let Some(ref mut sources) = sources {
@@ -2586,6 +2611,45 @@ identity_file = "/tmp/id_ed25519"
         );
 
         info!("PASS: self_healing env overrides applied with source tracking");
+    }
+
+    #[test]
+    fn test_apply_env_overrides_self_healing_master_disable_precedence() {
+        info!("TEST: test_apply_env_overrides_self_healing_master_disable_precedence");
+        let mut config = RchConfig::default();
+        let mut sources = default_sources_map();
+        let mut env_overrides: HashMap<String, String> = HashMap::new();
+        env_overrides.insert("RCH_NO_SELF_HEALING".to_string(), "1".to_string());
+        env_overrides.insert("RCH_HOOK_STARTS_DAEMON".to_string(), "true".to_string());
+        env_overrides.insert("RCH_DAEMON_INSTALLS_HOOKS".to_string(), "true".to_string());
+        env_overrides.insert("RCH_AUTO_START_COOLDOWN_SECS".to_string(), "45".to_string());
+        env_overrides.insert("RCH_AUTO_START_TIMEOUT_SECS".to_string(), "7".to_string());
+
+        apply_env_overrides_inner(&mut config, Some(&mut sources), Some(&env_overrides));
+
+        // Master disable wins over all other self-healing env vars.
+        assert!(!config.self_healing.hook_starts_daemon);
+        assert!(!config.self_healing.daemon_installs_hooks);
+        assert_eq!(config.self_healing.auto_start_cooldown_secs, 30);
+        assert_eq!(config.self_healing.auto_start_timeout_secs, 3);
+
+        let source = sources
+            .get("self_healing.hook_starts_daemon")
+            .expect("self_healing.hook_starts_daemon source present");
+        assert_eq!(
+            source,
+            &ConfigValueSource::EnvVar("RCH_NO_SELF_HEALING".to_string())
+        );
+
+        let source = sources
+            .get("self_healing.daemon_installs_hooks")
+            .expect("self_healing.daemon_installs_hooks source present");
+        assert_eq!(
+            source,
+            &ConfigValueSource::EnvVar("RCH_NO_SELF_HEALING".to_string())
+        );
+
+        info!("PASS: RCH_NO_SELF_HEALING takes precedence for self-healing config");
     }
 
     #[test]
