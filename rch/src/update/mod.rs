@@ -195,9 +195,152 @@ async fn update_fleet(ctx: &OutputContext, _info: &UpdateCheck, dry_run: bool) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use types::Version;
 
     #[test]
     fn test_channel_default() {
         assert_eq!(Channel::default(), Channel::Stable);
+    }
+
+    #[test]
+    fn test_channel_variants() {
+        // Test all channel variants exist
+        let stable = Channel::Stable;
+        let beta = Channel::Beta;
+        let nightly = Channel::Nightly;
+
+        assert_ne!(stable, beta);
+        assert_ne!(beta, nightly);
+        assert_ne!(stable, nightly);
+    }
+
+    fn create_test_update_check(update_available: bool) -> UpdateCheck {
+        UpdateCheck {
+            current_version: Version::parse("1.0.0").unwrap(),
+            latest_version: if update_available {
+                Version::parse("2.0.0").unwrap()
+            } else {
+                Version::parse("1.0.0").unwrap()
+            },
+            update_available,
+            release_url: "https://github.com/test/releases/v2.0.0".to_string(),
+            release_notes: Some("Test release notes".to_string()),
+            changelog_diff: None,
+            assets: vec![],
+        }
+    }
+
+    #[test]
+    fn test_update_check_creation_no_update() {
+        let check = create_test_update_check(false);
+        assert!(!check.update_available);
+        assert_eq!(check.current_version, check.latest_version);
+    }
+
+    #[test]
+    fn test_update_check_creation_with_update() {
+        let check = create_test_update_check(true);
+        assert!(check.update_available);
+        assert!(check.latest_version > check.current_version);
+    }
+
+    #[test]
+    fn test_update_check_has_release_notes() {
+        let check = create_test_update_check(true);
+        assert!(check.release_notes.is_some());
+        assert!(check.release_notes.as_ref().unwrap().contains("Test"));
+    }
+
+    #[test]
+    fn test_update_check_release_url() {
+        let check = create_test_update_check(true);
+        assert!(!check.release_url.is_empty());
+        assert!(check.release_url.contains("github"));
+    }
+
+    #[test]
+    fn test_display_update_check_json_mode() {
+        let ctx = OutputContext::new_json();
+        let info = create_test_update_check(true);
+
+        // This function prints to stdout - just verify it doesn't panic
+        display_update_check(&ctx, &info, false);
+    }
+
+    #[test]
+    fn test_display_update_check_no_update() {
+        let ctx = OutputContext::new_plain();
+        let info = create_test_update_check(false);
+
+        // Verify it doesn't panic
+        display_update_check(&ctx, &info, false);
+    }
+
+    #[test]
+    fn test_display_update_check_with_update() {
+        let ctx = OutputContext::new_plain();
+        let info = create_test_update_check(true);
+
+        // Verify it doesn't panic
+        display_update_check(&ctx, &info, false);
+    }
+
+    #[test]
+    fn test_display_update_check_with_changelog() {
+        let ctx = OutputContext::new_plain();
+        let info = create_test_update_check(true);
+
+        // Verify it doesn't panic with changelog display
+        display_update_check(&ctx, &info, true);
+    }
+
+    #[test]
+    fn test_update_check_empty_assets() {
+        let check = create_test_update_check(true);
+        assert!(check.assets.is_empty());
+    }
+
+    #[test]
+    fn test_update_check_with_changelog_diff() {
+        let mut check = create_test_update_check(true);
+        check.changelog_diff = Some("## Changes\n- Feature A\n- Bug fix B".to_string());
+        assert!(check.changelog_diff.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_verify_installation_plain_mode() {
+        let ctx = OutputContext::new_plain();
+
+        // This will run the current executable with --version
+        // It may fail in test environment but shouldn't panic
+        let _ = verify_installation(&ctx).await;
+    }
+
+    #[tokio::test]
+    async fn test_verify_installation_json_mode() {
+        let ctx = OutputContext::new_json();
+
+        // Verify it doesn't panic in JSON mode
+        let _ = verify_installation(&ctx).await;
+    }
+
+    #[tokio::test]
+    async fn test_update_fleet_dry_run() {
+        let ctx = OutputContext::new_plain();
+        let info = create_test_update_check(true);
+
+        // Dry run should succeed
+        let result = update_fleet(&ctx, &info, true).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_update_fleet_json_mode() {
+        let ctx = OutputContext::new_json();
+        let info = create_test_update_check(true);
+
+        // Should succeed but report not implemented
+        let result = update_fleet(&ctx, &info, false).await;
+        assert!(result.is_ok());
     }
 }
