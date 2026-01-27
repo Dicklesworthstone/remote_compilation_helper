@@ -64,6 +64,6 @@
 mod log;
 
 pub use log::{
-    init_global_test_logging, TerminalInfo, TestGuard, TestLogEntry, TestLogger, TestPhase,
-    TestResult,
+    TerminalInfo, TestGuard, TestLogEntry, TestLogger, TestPhase, TestResult,
+    init_global_test_logging,
 };

@@ -663,6 +663,37 @@ pub struct AlertsConfig {
     /// Suppress duplicate alerts for this many seconds.
     #[serde(default = "default_alert_suppress_duplicates_secs")]
     pub suppress_duplicates_secs: u64,
+    /// Webhook configuration for external notifications.
+    #[serde(default)]
+    pub webhook: Option<WebhookConfig>,
+}
+
+/// Webhook configuration for alert dispatch.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WebhookConfig {
+    /// Webhook endpoint URL (e.g., Slack/Discord webhook URL).
+    pub url: Option<String>,
+    /// Secret for HMAC-SHA256 signing (optional).
+    #[serde(default)]
+    pub secret: Option<String>,
+    /// Timeout in seconds for webhook requests.
+    #[serde(default = "default_webhook_timeout_secs")]
+    pub timeout_secs: u64,
+    /// Number of retries on failure.
+    #[serde(default = "default_webhook_retry_count")]
+    pub retry_count: u32,
+    /// Events to send (empty = all events).
+    /// Supported: worker_offline, worker_degraded, circuit_open, all_workers_offline
+    #[serde(default)]
+    pub events: Vec<String>,
+}
+
+fn default_webhook_timeout_secs() -> u64 {
+    5
+}
+
+fn default_webhook_retry_count() -> u32 {
+    3
 }
 
 fn default_alert_suppress_duplicates_secs() -> u64 {
@@ -674,6 +705,7 @@ impl Default for AlertsConfig {
         Self {
             enabled: true,
             suppress_duplicates_secs: default_alert_suppress_duplicates_secs(),
+            webhook: None,
         }
     }
 }

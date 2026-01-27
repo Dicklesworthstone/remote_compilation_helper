@@ -679,10 +679,16 @@ mod tests {
 
     #[test]
     fn pipeline_stage_labels() {
-        assert_eq!(PipelineStage::WorkspaceAnalysis.label(), "Workspace analysis");
+        assert_eq!(
+            PipelineStage::WorkspaceAnalysis.label(),
+            "Workspace analysis"
+        );
         assert_eq!(PipelineStage::Upload.label(), "Upload to worker");
         assert_eq!(PipelineStage::Compilation.label(), "Remote compilation");
-        assert_eq!(PipelineStage::ArtifactRetrieval.label(), "Artifact retrieval");
+        assert_eq!(
+            PipelineStage::ArtifactRetrieval.label(),
+            "Artifact retrieval"
+        );
         assert_eq!(PipelineStage::CacheUpdate.label(), "Cache update");
     }
 

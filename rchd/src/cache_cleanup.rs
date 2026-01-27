@@ -281,10 +281,12 @@ impl CacheCleanupScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rch_common::test_guard;
     use rch_common::{CircuitState, WorkerConfig};
 
     #[test]
     fn test_cleanup_config_defaults() {
+        let _guard = test_guard!();
         let config = CacheCleanupConfig::default();
         assert!(config.enabled);
         assert_eq!(config.interval_secs, 3600);
@@ -296,6 +298,7 @@ mod tests {
 
     #[test]
     fn test_cleanup_stats_default() {
+        let _guard = test_guard!();
         let stats = CleanupStats::default();
         assert_eq!(stats.workers_checked, 0);
         assert_eq!(stats.workers_cleaned, 0);
@@ -306,6 +309,7 @@ mod tests {
 
     #[test]
     fn test_cleanup_result_creation() {
+        let _guard = test_guard!();
         let result = CleanupResult {
             worker_id: WorkerId::new("test-worker"),
             success: true,
@@ -322,6 +326,7 @@ mod tests {
 
     #[test]
     fn test_cleanup_result_failure() {
+        let _guard = test_guard!();
         let result = CleanupResult {
             worker_id: WorkerId::new("failing-worker"),
             success: false,
@@ -340,6 +345,7 @@ mod tests {
 
     #[test]
     fn test_cleanup_result_partial_info() {
+        let _guard = test_guard!();
         // Result where we got some info but not all
         let result = CleanupResult {
             worker_id: WorkerId::new("partial-worker"),
@@ -357,6 +363,7 @@ mod tests {
 
     #[test]
     fn test_cleanup_result_debug_format() {
+        let _guard = test_guard!();
         let result = CleanupResult {
             worker_id: WorkerId::new("debug-worker"),
             success: true,
@@ -373,6 +380,7 @@ mod tests {
 
     #[test]
     fn test_cleanup_result_clone() {
+        let _guard = test_guard!();
         let result = CleanupResult {
             worker_id: WorkerId::new("clone-worker"),
             success: true,
@@ -391,6 +399,7 @@ mod tests {
 
     #[test]
     fn test_cleanup_stats_accumulation() {
+        let _guard = test_guard!();
         let mut stats = CleanupStats::default();
 
         // Simulate checking workers
@@ -409,6 +418,7 @@ mod tests {
 
     #[test]
     fn test_cleanup_stats_with_errors() {
+        let _guard = test_guard!();
         let stats = CleanupStats {
             workers_checked: 5,
             workers_cleaned: 2,
@@ -425,6 +435,7 @@ mod tests {
 
     #[test]
     fn test_cleanup_stats_debug_format() {
+        let _guard = test_guard!();
         let stats = CleanupStats {
             workers_checked: 10,
             workers_cleaned: 8,
@@ -750,6 +761,7 @@ mod tests {
 
     #[test]
     fn test_cleanup_config_custom_values() {
+        let _guard = test_guard!();
         let config = CacheCleanupConfig {
             enabled: false,
             interval_secs: 7200,
@@ -769,6 +781,7 @@ mod tests {
 
     #[test]
     fn test_cleanup_result_with_large_values() {
+        let _guard = test_guard!();
         let result = CleanupResult {
             worker_id: WorkerId::new("large-cleanup"),
             success: true,
@@ -786,6 +799,7 @@ mod tests {
 
     #[test]
     fn test_cleanup_stats_large_accumulation() {
+        let _guard = test_guard!();
         // Simulate large-scale cleanup
         let stats = CleanupStats {
             workers_checked: 100,

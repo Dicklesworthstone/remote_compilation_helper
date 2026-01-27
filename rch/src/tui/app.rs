@@ -8,7 +8,7 @@ use crate::tui::{
     event::{Action, poll_event_with_mode},
     state::{
         ActiveBuild, BuildProgress, BuildStatus, CircuitState, ColorBlindMode, DaemonState,
-        HistoricalBuild, Status, TuiState, WorkerState, WorkerStatus,
+        HistoricalBuild, Panel, Status, TuiState, WorkerState, WorkerStatus,
     },
     widgets,
 };
@@ -31,6 +31,12 @@ pub struct TuiConfig {
     pub refresh_interval_ms: u64,
     /// Enable mouse support.
     pub mouse_support: bool,
+    /// Render once and exit (CI-friendly).
+    pub test_mode: bool,
+    /// Populate dashboard state with deterministic mock data (no daemon required).
+    pub mock_data: bool,
+    /// Dump dashboard state as JSON and exit (automation).
+    pub dump_state: bool,
     /// High contrast mode for accessibility.
     pub high_contrast: bool,
     /// Color blind palette selection.
@@ -42,6 +48,9 @@ impl Default for TuiConfig {
         Self {
             refresh_interval_ms: 1000,
             mouse_support: true,
+            test_mode: false,
+            mock_data: false,
+            dump_state: false,
             high_contrast: false,
             color_blind: ColorBlindMode::None,
         }
@@ -50,6 +59,21 @@ impl Default for TuiConfig {
 
 /// Run the TUI dashboard.
 pub async fn run_tui(config: TuiConfig) -> Result<()> {
+    // Non-interactive modes MUST NOT manipulate the terminal.
+    if config.dump_state {
+        let state = build_initial_state(&config).await;
+        let json = state_to_json(&state);
+        println!("{}", serde_json::to_string_pretty(&json)?);
+        return Ok(());
+    }
+    if config.test_mode {
+        let state = build_initial_state(&config).await;
+        let (width, height) = test_backend_size();
+        let snapshot = render_snapshot(&state, width, height);
+        print!("{snapshot}");
+        return Ok(());
+    }
+
     // Setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -65,7 +89,7 @@ pub async fn run_tui(config: TuiConfig) -> Result<()> {
     let mut state = TuiState::new();
     state.high_contrast = config.high_contrast;
     state.color_blind = config.color_blind;
-    refresh_state(&mut state).await;
+    refresh_state(&mut state, &config).await;
 
     // Run main loop
     let result = run_app(&mut terminal, &mut state, &config).await;
@@ -82,7 +106,14 @@ pub async fn run_tui(config: TuiConfig) -> Result<()> {
 }
 
 /// Fetch fresh data from daemon and update TUI state.
-async fn refresh_state(state: &mut TuiState) {
+async fn refresh_state(state: &mut TuiState, config: &TuiConfig) {
+    if config.mock_data {
+        apply_mock_data(state);
+        state.error = None;
+        state.last_update = Instant::now();
+        return;
+    }
+
     match query_daemon_full_status().await {
         Ok(response) => {
             update_state_from_daemon(state, response);
@@ -94,6 +125,173 @@ async fn refresh_state(state: &mut TuiState) {
         }
     }
     state.last_update = Instant::now();
+}
+
+async fn build_initial_state(config: &TuiConfig) -> TuiState {
+    let mut state = TuiState::new();
+    state.high_contrast = config.high_contrast;
+    state.color_blind = config.color_blind;
+    refresh_state(&mut state, config).await;
+    state
+}
+
+fn test_backend_size() -> (u16, u16) {
+    let width = std::env::var("COLUMNS")
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok())
+        .unwrap_or(80);
+    let height = std::env::var("LINES")
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok())
+        .unwrap_or(24);
+    (width.max(40), height.max(12))
+}
+
+fn render_snapshot(state: &TuiState, width: u16, height: u16) -> String {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("create test terminal");
+    terminal
+        .draw(|f| widgets::render(f, state))
+        .expect("render snapshot");
+    buffer_to_string(terminal.backend().buffer())
+}
+
+fn buffer_to_string(buffer: &ratatui::buffer::Buffer) -> String {
+    let mut out = String::new();
+    let width = buffer.area.width;
+    let height = buffer.area.height;
+    for y in 0..height {
+        for x in 0..width {
+            if let Some(cell) = buffer.cell((x, y)) {
+                out.push_str(cell.symbol());
+            } else {
+                out.push(' ');
+            }
+        }
+        out.push('\n');
+    }
+    out
+}
+
+fn state_to_json(state: &TuiState) -> serde_json::Value {
+    let daemon_status = match state.daemon.status {
+        Status::Unknown => "unknown",
+        Status::Running => "running",
+        Status::Stopped => "stopped",
+        Status::Error => "error",
+    };
+    let selected_panel = match state.selected_panel {
+        Panel::Workers => "workers",
+        Panel::ActiveBuilds => "active_builds",
+        Panel::BuildHistory => "build_history",
+        Panel::Logs => "logs",
+    };
+
+    serde_json::json!({
+        "daemon": {
+            "status": daemon_status,
+            "version": &state.daemon.version,
+            "uptime_ms": state.daemon.uptime.as_millis() as u64,
+            "socket_path": state.daemon.socket_path.display().to_string(),
+            "builds_today": state.daemon.builds_today,
+            "bytes_transferred": state.daemon.bytes_transferred,
+        },
+        "workers": &state.workers,
+        "active_builds": &state.active_builds,
+        "build_history": state.build_history.iter().cloned().collect::<Vec<_>>(),
+        "selected_panel": selected_panel,
+        "selected_index": state.selected_index,
+        "filter": {
+            "query": &state.filter.query,
+            "worker_filter": &state.filter.worker_filter,
+            "success_only": state.filter.success_only,
+            "failed_only": state.filter.failed_only,
+        },
+        "high_contrast": state.high_contrast,
+        "color_blind": state.color_blind,
+        "error": &state.error,
+    })
+}
+
+fn apply_mock_data(state: &mut TuiState) {
+    use crate::tui::state::{BuildStatus, CircuitState, WorkerStatus};
+    use chrono::Utc;
+
+    state.daemon = DaemonState {
+        status: Status::Running,
+        uptime: Duration::from_secs(123),
+        version: "mock".to_string(),
+        config_path: PathBuf::new(),
+        socket_path: PathBuf::from("/tmp/rch.sock"),
+        builds_today: 7,
+        bytes_transferred: 42_000_000,
+    };
+
+    state.workers = vec![
+        WorkerState {
+            id: "worker-1".to_string(),
+            host: "127.0.0.1".to_string(),
+            status: WorkerStatus::Healthy,
+            circuit: CircuitState::Closed,
+            total_slots: 16,
+            used_slots: 4,
+            latency_ms: 12,
+            last_seen: Utc::now(),
+            builds_completed: 3,
+        },
+        WorkerState {
+            id: "worker-2".to_string(),
+            host: "127.0.0.2".to_string(),
+            status: WorkerStatus::Degraded,
+            circuit: CircuitState::HalfOpen,
+            total_slots: 32,
+            used_slots: 20,
+            latency_ms: 25,
+            last_seen: Utc::now(),
+            builds_completed: 9,
+        },
+        WorkerState {
+            id: "worker-3".to_string(),
+            host: "127.0.0.3".to_string(),
+            status: WorkerStatus::Draining,
+            circuit: CircuitState::Open,
+            total_slots: 8,
+            used_slots: 7,
+            latency_ms: 40,
+            last_seen: Utc::now(),
+            builds_completed: 1,
+        },
+    ];
+
+    state.active_builds = vec![ActiveBuild {
+        id: "1234".to_string(),
+        command: "cargo build --release".to_string(),
+        worker: Some("worker-2".to_string()),
+        started_at: Utc::now(),
+        progress: Some(BuildProgress {
+            phase: "compiling".to_string(),
+            percent: Some(42),
+            current_file: Some("serde_derive".to_string()),
+        }),
+        status: BuildStatus::Compiling,
+    }];
+
+    state.build_history.clear();
+    for i in 0..5 {
+        state.build_history.push_back(HistoricalBuild {
+            id: format!("h{}", 1000 + i),
+            command: "cargo test".to_string(),
+            worker: Some("worker-1".to_string()),
+            started_at: Utc::now(),
+            completed_at: Utc::now(),
+            duration_ms: 1200 + (i as u64 * 100),
+            success: true,
+            exit_code: Some(0),
+        });
+    }
 }
 
 /// Convert daemon API response to TUI state types.
@@ -267,7 +465,7 @@ async fn run_app(
                 }
                 Action::Refresh => {
                     // Fetch fresh data from daemon
-                    refresh_state(state).await;
+                    refresh_state(state, config).await;
                 }
                 Action::Select => {
                     if state.filter_mode {
@@ -319,7 +517,7 @@ async fn run_app(
                 Action::Tick => {
                     // Regular tick - refresh data periodically
                     if state.last_update.elapsed() >= refresh_interval {
-                        refresh_state(state).await;
+                        refresh_state(state, config).await;
                     }
                 }
             }
@@ -446,9 +644,39 @@ mod tests {
         );
         assert_eq!(config.refresh_interval_ms, 1000);
         assert!(config.mouse_support);
+        assert!(!config.test_mode);
+        assert!(!config.mock_data);
+        assert!(!config.dump_state);
         assert!(!config.high_contrast);
         assert_eq!(config.color_blind, ColorBlindMode::None);
         info!("TEST PASS: test_tui_config_default");
+    }
+
+    #[test]
+    fn test_dump_state_json_mock_data_has_expected_shape() {
+        init_test_logging();
+        info!("TEST START: test_dump_state_json_mock_data_has_expected_shape");
+        let mut state = TuiState::new();
+        apply_mock_data(&mut state);
+        let json = state_to_json(&state);
+        info!("VERIFY: daemon.status=running and workers array present");
+        assert_eq!(json["daemon"]["status"], "running");
+        assert!(json["workers"].is_array());
+        assert!(json["active_builds"].is_array());
+        assert!(json["build_history"].is_array());
+        info!("TEST PASS: test_dump_state_json_mock_data_has_expected_shape");
+    }
+
+    #[test]
+    fn test_render_snapshot_contains_header() {
+        init_test_logging();
+        info!("TEST START: test_render_snapshot_contains_header");
+        let mut state = TuiState::new();
+        apply_mock_data(&mut state);
+        let snapshot = render_snapshot(&state, 80, 24);
+        info!("VERIFY: snapshot contains dashboard title");
+        assert!(snapshot.contains("RCH Dashboard"));
+        info!("TEST PASS: test_render_snapshot_contains_header");
     }
 
     #[test]

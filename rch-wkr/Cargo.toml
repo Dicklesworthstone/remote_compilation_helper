@@ -21,5 +21,8 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 blake3 = { workspace = true }
 
+[dev-dependencies]
+ctor = { workspace = true }
+
 [lints.rust]
 unsafe_code = "forbid"

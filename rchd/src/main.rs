@@ -352,10 +352,24 @@ async fn main() -> Result<()> {
         .alerts
         .suppress_duplicates_secs
         .min(i64::MAX as u64) as i64;
+
+    // Convert webhook config from rch_common to alerts module format
+    let webhook_config = rch_config
+        .alerts
+        .webhook
+        .as_ref()
+        .map(|w| alerts::WebhookConfig {
+            url: w.url.clone(),
+            secret: w.secret.clone(),
+            timeout_secs: w.timeout_secs,
+            retry_count: w.retry_count,
+            events: w.events.clone(),
+        });
+
     let alert_config = alerts::AlertConfig {
         enabled: rch_config.alerts.enabled,
         suppress_duplicates: ChronoDuration::seconds(suppress_secs),
-        webhook: None, // TODO: Load from config when webhook support is added
+        webhook: webhook_config,
     };
     let alert_manager = Arc::new(alerts::AlertManager::new(alert_config));
 
@@ -596,7 +610,7 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+        use rch_common::test_guard;
     use crate::self_test::{SelfTestHistory, SelfTestService};
     use crate::telemetry::TelemetryStore;
     use crate::{benchmark_queue::BenchmarkQueue, events::EventBus};
@@ -607,13 +621,6 @@ mod tests {
 
     fn make_test_telemetry() -> Arc<TelemetryStore> {
         Arc::new(TelemetryStore::new(Duration::from_secs(300), None))
-    }
-
-    fn init_test_logging() {
-        let _ = tracing_subscriber::fmt()
-            .with_test_writer()
-            .with_max_level(tracing::Level::DEBUG)
-            .try_init();
     }
 
     fn make_test_self_test(pool: workers::WorkerPool) -> Arc<SelfTestService> {
@@ -640,6 +647,7 @@ mod tests {
 
     #[test]
     fn test_cli_parsing_defaults() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rchd"]).unwrap();
 
         assert_eq!(cli.socket, crate::config::default_socket_path());
@@ -655,6 +663,7 @@ mod tests {
 
     #[test]
     fn test_cli_parsing_overrides() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from([
             "rchd",
             "--socket",
@@ -943,6 +952,7 @@ mod tests {
 
     #[test]
     fn test_daemon_build_history_capacity() {
+        let _guard = test_guard!();
         init_test_logging();
 
         // Test that BuildHistory respects capacity limits
@@ -974,6 +984,7 @@ mod tests {
 
     #[test]
     fn test_daemon_build_history_stats() {
+        let _guard = test_guard!();
         init_test_logging();
 
         let history = BuildHistory::new(100);
@@ -1011,4 +1022,11 @@ mod tests {
         assert_eq!(stats.local_count, 2);
         assert_eq!(stats.avg_duration_ms, 1250); // (1000+2000+500+1500)/4
     }
+}
+
+// Global test logging initialization - enables JSONL output for all unit tests
+#[cfg(test)]
+#[ctor::ctor]
+fn init_test_logging() {
+    rch_common::testing::init_global_test_logging();
 }

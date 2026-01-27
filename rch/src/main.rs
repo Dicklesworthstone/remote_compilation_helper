@@ -545,12 +545,17 @@ Ratings:
     },
 
     /// Interactive TUI dashboard for real-time monitoring
-    #[command(after_help = r#"EXAMPLES:
+    #[command(
+        alias = "tui",
+        after_help = r#"EXAMPLES:
     rch dashboard                      # Launch TUI dashboard
     rch dashboard --refresh 500        # 500ms refresh rate
     rch dashboard --no-mouse           # Disable mouse support
     rch dashboard --high-contrast      # High contrast mode
     rch dashboard --color-blind tritanopia  # Color blind palette
+    rch dashboard --test-mode          # Render once and exit (CI-friendly)
+    rch dashboard --mock-data          # Use deterministic mock data (no daemon required)
+    rch dashboard --dump-state         # Print JSON state and exit (automation)
 
 The dashboard provides real-time monitoring of:
   - Worker status and slot utilization
@@ -563,15 +568,32 @@ Controls:
   ↑/↓      - Navigate
   Tab      - Switch panels
   r        - Refresh data
-  ?        - Help"#)]
+  ?        - Help"#
+    )]
     Dashboard {
         /// Refresh interval in milliseconds (default: 1000)
-        #[arg(long, default_value = "1000")]
+        #[arg(long, default_value = "1000", alias = "refresh-ms")]
         refresh: u64,
 
         /// Disable mouse support
         #[arg(long)]
         no_mouse: bool,
+
+        /// Render once and exit (no raw mode / alt-screen).
+        ///
+        /// Useful for CI/scripting where an interactive terminal isn't available.
+        #[arg(long)]
+        test_mode: bool,
+
+        /// Populate the dashboard with deterministic mock data (no daemon required).
+        #[arg(long)]
+        mock_data: bool,
+
+        /// Dump dashboard state as JSON to stdout and exit (no terminal control).
+        ///
+        /// Intended for automation and E2E scripts.
+        #[arg(long)]
+        dump_state: bool,
 
         /// High contrast mode for accessibility
         #[arg(long)]
@@ -1297,12 +1319,18 @@ async fn main() -> Result<()> {
             Commands::Dashboard {
                 refresh,
                 no_mouse,
+                test_mode,
+                mock_data,
+                dump_state,
                 high_contrast,
                 color_blind,
             } => {
                 let config = tui::TuiConfig {
                     refresh_interval_ms: refresh,
                     mouse_support: !no_mouse,
+                    test_mode,
+                    mock_data,
+                    dump_state,
                     high_contrast,
                     color_blind,
                 };
@@ -2305,6 +2333,13 @@ fn open_browser(url: &str) -> Result<()> {
 // Unit Tests
 // =============================================================================
 
+// Global test logging initialization - enables JSONL output for all unit tests
+#[cfg(test)]
+#[ctor::ctor]
+fn init_test_logging() {
+    rch_common::testing::init_global_test_logging();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3216,11 +3251,17 @@ mod tests {
             Some(Commands::Dashboard {
                 refresh,
                 no_mouse,
+                test_mode,
+                mock_data,
+                dump_state,
                 high_contrast,
                 color_blind,
             }) => {
                 assert_eq!(refresh, 1000);
                 assert!(!no_mouse);
+                assert!(!test_mode);
+                assert!(!mock_data);
+                assert!(!dump_state);
                 assert!(!high_contrast);
                 assert_eq!(color_blind, tui::ColorBlindMode::None);
             }
@@ -4030,23 +4071,35 @@ mod tests {
 
     #[test]
     fn resolve_output_format_explicit_json() {
-        assert_eq!(resolve_output_format(Some("json"), false), OutputFormat::Json);
+        assert_eq!(
+            resolve_output_format(Some("json"), false),
+            OutputFormat::Json
+        );
     }
 
     #[test]
     fn resolve_output_format_explicit_toon() {
-        assert_eq!(resolve_output_format(Some("toon"), false), OutputFormat::Toon);
+        assert_eq!(
+            resolve_output_format(Some("toon"), false),
+            OutputFormat::Toon
+        );
     }
 
     #[test]
     fn resolve_output_format_explicit_with_json_flag() {
         // Explicit format takes precedence over json flag
-        assert_eq!(resolve_output_format(Some("toon"), true), OutputFormat::Toon);
+        assert_eq!(
+            resolve_output_format(Some("toon"), true),
+            OutputFormat::Toon
+        );
     }
 
     #[test]
     fn resolve_output_format_invalid_format_falls_back() {
         // Invalid format string should fall back to Json default
-        assert_eq!(resolve_output_format(Some("invalid"), false), OutputFormat::Json);
+        assert_eq!(
+            resolve_output_format(Some("invalid"), false),
+            OutputFormat::Json
+        );
     }
 }

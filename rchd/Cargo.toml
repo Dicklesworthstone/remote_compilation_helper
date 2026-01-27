@@ -63,6 +63,7 @@ tempfile = "3.22.0"
 whoami = "2"
 rch-common = { workspace = true }
 proptest = "1.7.0"
+ctor = { workspace = true }
 
 [lints.rust]
 unsafe_code = "forbid"

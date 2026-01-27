@@ -485,7 +485,10 @@ mod tests {
             secret: Some("test-secret".to_string()),
             timeout_secs: 5,
             retry_count: 3,
-            events: vec!["worker_offline".to_string(), "all_workers_offline".to_string()],
+            events: vec![
+                "worker_offline".to_string(),
+                "all_workers_offline".to_string(),
+            ],
         };
 
         let json = serde_json::to_string(&config).unwrap();

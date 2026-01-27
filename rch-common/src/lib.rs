@@ -91,3 +91,10 @@ pub use api::{API_VERSION, ApiError, ApiResponse, ErrorContext, LegacyErrorCode}
 
 // Hooks module re-exports (daemon self-healing)
 pub use hooks::{HookResult, is_claude_code_installed, verify_and_install_claude_code_hook};
+
+// Global test logging initialization - enables JSONL output for all unit tests
+#[cfg(test)]
+#[ctor::ctor]
+fn init_test_logging() {
+    testing::init_global_test_logging();
+}

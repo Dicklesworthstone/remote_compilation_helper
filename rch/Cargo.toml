@@ -74,6 +74,7 @@ tempfile = "3.22.0"
 proptest = "1.7.0"
 insta = "1.42"
 serial_test = "3.2"
+ctor = "0.2.9"
 
 [[test]]
 name = "true_e2e"
