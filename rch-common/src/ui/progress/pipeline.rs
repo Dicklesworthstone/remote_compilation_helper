@@ -672,4 +672,75 @@ mod tests {
 
         assert_eq!(pipeline.count_completed(), 2);
     }
+
+    // -------------------------------------------------------------------------
+    // PipelineStage label tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn pipeline_stage_labels() {
+        assert_eq!(PipelineStage::WorkspaceAnalysis.label(), "Workspace analysis");
+        assert_eq!(PipelineStage::Upload.label(), "Upload to worker");
+        assert_eq!(PipelineStage::Compilation.label(), "Remote compilation");
+        assert_eq!(PipelineStage::ArtifactRetrieval.label(), "Artifact retrieval");
+        assert_eq!(PipelineStage::CacheUpdate.label(), "Cache update");
+    }
+
+    #[test]
+    fn pipeline_stage_short_labels() {
+        assert_eq!(PipelineStage::WorkspaceAnalysis.short_label(), "Workspace");
+        assert_eq!(PipelineStage::Upload.short_label(), "Upload");
+        assert_eq!(PipelineStage::Compilation.short_label(), "Compile");
+        assert_eq!(PipelineStage::ArtifactRetrieval.short_label(), "Download");
+        assert_eq!(PipelineStage::CacheUpdate.short_label(), "Cache");
+    }
+
+    #[test]
+    fn stage_status_in_progress_icon() {
+        let ctx = OutputContext::Plain;
+        assert_eq!(StageStatus::InProgress.icon(ctx), "[...]");
+    }
+
+    #[test]
+    fn stage_status_skipped_icon() {
+        let ctx = OutputContext::Plain;
+        assert_eq!(StageStatus::Skipped.icon(ctx), "[x]");
+    }
+
+    #[test]
+    fn stage_status_default() {
+        assert_eq!(StageStatus::default(), StageStatus::Pending);
+    }
+
+    #[test]
+    fn pipeline_progress_worker_info() {
+        let ctx = OutputContext::Plain;
+        let pipeline = PipelineProgress::new(ctx, "my-worker", false);
+        assert_eq!(pipeline.worker, "my-worker");
+        // enabled=true when quiet=false and not machine context
+        assert!(pipeline.enabled);
+    }
+
+    #[test]
+    fn pipeline_progress_quiet_mode() {
+        let ctx = OutputContext::Plain;
+        let pipeline = PipelineProgress::new(ctx, "worker", true);
+        // enabled=false when quiet=true
+        assert!(!pipeline.enabled);
+    }
+
+    #[test]
+    fn format_duration_zero() {
+        assert_eq!(format_duration(Duration::ZERO), "0ms");
+    }
+
+    #[test]
+    fn format_duration_exact_minute() {
+        assert_eq!(format_duration(Duration::from_secs(60)), "1:00");
+    }
+
+    #[test]
+    fn format_duration_exact_hour() {
+        assert_eq!(format_duration(Duration::from_secs(3600)), "1:00:00");
+    }
 }

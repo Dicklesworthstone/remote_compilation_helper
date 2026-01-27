@@ -687,4 +687,128 @@ mod tests {
         assert!(truncated.len() <= 12);
         assert!(truncated.contains("..."));
     }
+
+    #[test]
+    fn truncate_middle_no_change_when_short() {
+        let value = "short.rs";
+        let truncated = truncate_middle(value, 20);
+        assert_eq!(truncated, value);
+    }
+
+    #[test]
+    fn truncate_middle_exact_length() {
+        let value = "exactly_12c";
+        let truncated = truncate_middle(value, 11);
+        assert_eq!(truncated.len(), 11);
+    }
+
+    #[test]
+    fn transfer_direction_label() {
+        assert_eq!(TransferDirection::Upload.label(), "Syncing");
+        assert_eq!(TransferDirection::Download.label(), "Fetching");
+    }
+
+    #[test]
+    fn transfer_direction_arrow_plain() {
+        // Plain context doesn't support rich output, so gets ASCII arrows
+        let ctx = OutputContext::plain();
+        assert_eq!(TransferDirection::Upload.arrow(ctx), "^");
+        assert_eq!(TransferDirection::Download.arrow(ctx), "v");
+    }
+
+    #[test]
+    fn speed_smoother_empty() {
+        let smoother = SpeedSmoother::default();
+        assert!(smoother.average().is_none());
+    }
+
+    #[test]
+    fn speed_smoother_single_value() {
+        let mut smoother = SpeedSmoother::default();
+        smoother.push(100.0);
+        assert_eq!(smoother.average(), Some(100.0));
+    }
+
+    #[test]
+    fn speed_smoother_ignores_zero() {
+        let mut smoother = SpeedSmoother::default();
+        smoother.push(0.0);
+        assert!(smoother.average().is_none());
+    }
+
+    #[test]
+    fn speed_smoother_ignores_negative() {
+        let mut smoother = SpeedSmoother::default();
+        smoother.push(-50.0);
+        assert!(smoother.average().is_none());
+    }
+
+    #[test]
+    fn speed_smoother_computes_average() {
+        let mut smoother = SpeedSmoother::default();
+        smoother.push(100.0);
+        smoother.push(200.0);
+        smoother.push(300.0);
+        assert_eq!(smoother.average(), Some(200.0));
+    }
+
+    #[test]
+    fn speed_smoother_sparkline_empty() {
+        let smoother = SpeedSmoother::default();
+        let ctx = OutputContext::plain();
+        assert!(smoother.sparkline(ctx).is_empty());
+    }
+
+    #[test]
+    fn speed_smoother_sparkline_plain() {
+        let mut smoother = SpeedSmoother::default();
+        smoother.push(10.0);
+        smoother.push(50.0);
+        smoother.push(100.0);
+        let ctx = OutputContext::plain();
+        // Plain context still generates sparkline with ASCII fallback
+        let sparkline = smoother.sparkline(ctx);
+        assert!(!sparkline.is_empty());
+    }
+
+    #[test]
+    fn parse_progress_line_minimal() {
+        let line = "1024  50%  1.0MB/s  0:00:10";
+        let sample = parse_progress_line(line).expect("parse");
+        assert_eq!(sample.bytes, 1024);
+        assert_eq!(sample.percent, Some(50));
+    }
+
+    #[test]
+    fn parse_progress_line_kilobytes() {
+        let line = "1.5K  10%  500.0KB/s  0:00:05";
+        let sample = parse_progress_line(line).expect("parse");
+        assert_eq!(sample.bytes, 1536); // 1.5 * 1024
+        assert_eq!(sample.percent, Some(10));
+    }
+
+    #[test]
+    fn parse_progress_line_megabytes() {
+        let line = "2.5M  25%  10.0MB/s  0:00:30";
+        let sample = parse_progress_line(line).expect("parse");
+        assert_eq!(sample.bytes, 2_621_440); // 2.5 * 1024 * 1024
+    }
+
+    #[test]
+    fn parse_progress_line_gigabytes() {
+        let line = "1.0G  75%  100.0MB/s  0:00:10";
+        let sample = parse_progress_line(line).expect("parse");
+        assert_eq!(sample.bytes, 1_073_741_824); // 1.0 * 1024^3
+    }
+
+    #[test]
+    fn parse_progress_line_invalid() {
+        let line = "not valid progress";
+        assert!(parse_progress_line(line).is_none());
+    }
+
+    #[test]
+    fn parse_progress_line_empty() {
+        assert!(parse_progress_line("").is_none());
+    }
 }

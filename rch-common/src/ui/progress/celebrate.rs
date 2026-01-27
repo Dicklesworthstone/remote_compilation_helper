@@ -647,4 +647,141 @@ mod tests {
 
         assert_eq!(history.entries.len(), HISTORY_LIMIT);
     }
+
+    // -------------------------------------------------------------------------
+    // Format utility tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn format_duration_ms_milliseconds() {
+        assert_eq!(format_duration_ms(500), "500ms");
+        assert_eq!(format_duration_ms(0), "0ms");
+        assert_eq!(format_duration_ms(999), "999ms");
+    }
+
+    #[test]
+    fn format_duration_ms_seconds() {
+        assert_eq!(format_duration_ms(1000), "1.0s");
+        assert_eq!(format_duration_ms(1500), "1.5s");
+        assert_eq!(format_duration_ms(59_999), "60.0s");
+    }
+
+    #[test]
+    fn format_duration_ms_minutes() {
+        assert_eq!(format_duration_ms(60_000), "1.0m");
+        assert_eq!(format_duration_ms(90_000), "1.5m");
+        assert_eq!(format_duration_ms(120_000), "2.0m");
+    }
+
+    #[test]
+    fn format_bytes_plain_bytes() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(512), "512 B");
+        assert_eq!(format_bytes(1023), "1023 B");
+    }
+
+    #[test]
+    fn format_bytes_kilobytes() {
+        assert_eq!(format_bytes(1024), "1.0 KB");
+        assert_eq!(format_bytes(1536), "1.5 KB");
+        assert_eq!(format_bytes(10_240), "10.0 KB");
+    }
+
+    #[test]
+    fn format_bytes_megabytes() {
+        assert_eq!(format_bytes(1_048_576), "1.0 MB");
+        assert_eq!(format_bytes(5_242_880), "5.0 MB");
+    }
+
+    #[test]
+    fn format_bytes_gigabytes() {
+        assert_eq!(format_bytes(1_073_741_824), "1.0 GB");
+        assert_eq!(format_bytes(2_684_354_560), "2.5 GB");
+    }
+
+    #[test]
+    fn format_ordinal_first_ten() {
+        assert_eq!(format_ordinal(1), "1st");
+        assert_eq!(format_ordinal(2), "2nd");
+        assert_eq!(format_ordinal(3), "3rd");
+        assert_eq!(format_ordinal(4), "4th");
+        assert_eq!(format_ordinal(5), "5th");
+    }
+
+    #[test]
+    fn format_ordinal_teens() {
+        assert_eq!(format_ordinal(11), "11th");
+        assert_eq!(format_ordinal(12), "12th");
+        assert_eq!(format_ordinal(13), "13th");
+    }
+
+    #[test]
+    fn format_ordinal_twenties() {
+        assert_eq!(format_ordinal(21), "21st");
+        assert_eq!(format_ordinal(22), "22nd");
+        assert_eq!(format_ordinal(23), "23rd");
+        assert_eq!(format_ordinal(24), "24th");
+    }
+
+    #[test]
+    fn format_ordinal_hundreds() {
+        assert_eq!(format_ordinal(100), "100th");
+        assert_eq!(format_ordinal(101), "101st");
+        assert_eq!(format_ordinal(111), "111th");
+        assert_eq!(format_ordinal(112), "112th");
+        assert_eq!(format_ordinal(113), "113th");
+    }
+
+    #[test]
+    fn truncate_line_short_string() {
+        let line = "hello";
+        assert_eq!(truncate_line(line, 10), "hello");
+    }
+
+    #[test]
+    fn truncate_line_exact_width() {
+        let line = "hello";
+        assert_eq!(truncate_line(line, 5), "hello");
+    }
+
+    #[test]
+    fn truncate_line_long_string() {
+        let line = "this is a very long string";
+        let truncated = truncate_line(line, 15);
+        assert!(truncated.width() <= 15);
+    }
+
+    #[test]
+    fn star_icon_plain() {
+        let ctx = OutputContext::plain();
+        assert_eq!(star_icon(ctx), "*");
+    }
+
+    #[test]
+    fn celebration_summary_builder() {
+        let summary = CelebrationSummary::new("myproject", 1000)
+            .worker("worker1")
+            .crates_compiled(Some(10))
+            .cache_hit(Some(true))
+            .target(Some("x86_64".to_string()))
+            .quiet(false);
+
+        assert_eq!(summary.project_id, "myproject");
+        assert_eq!(summary.duration_ms, 1000);
+        assert_eq!(summary.worker, Some("worker1".to_string()));
+        assert_eq!(summary.crates_compiled, Some(10));
+        assert_eq!(summary.cache_hit, Some(true));
+        assert_eq!(summary.target, Some("x86_64".to_string()));
+        assert!(!summary.quiet);
+    }
+
+    #[test]
+    fn artifact_summary_stores_values() {
+        let artifact = ArtifactSummary {
+            files: 42,
+            bytes: 1_000_000,
+        };
+        assert_eq!(artifact.files, 42);
+        assert_eq!(artifact.bytes, 1_000_000);
+    }
 }

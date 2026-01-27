@@ -4003,4 +4003,50 @@ mod tests {
             _ => panic!("Expected self-test --project command"),
         }
     }
+
+    // -------------------------------------------------------------------------
+    // Output Format Utility Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn machine_output_requested_json_flag_true() {
+        assert!(machine_output_requested(None, true));
+    }
+
+    #[test]
+    fn machine_output_requested_format_some() {
+        assert!(machine_output_requested(Some("toon"), false));
+    }
+
+    #[test]
+    fn machine_output_requested_both_set() {
+        assert!(machine_output_requested(Some("json"), true));
+    }
+
+    #[test]
+    fn machine_output_requested_neither_set() {
+        assert!(!machine_output_requested(None, false));
+    }
+
+    #[test]
+    fn resolve_output_format_explicit_json() {
+        assert_eq!(resolve_output_format(Some("json"), false), OutputFormat::Json);
+    }
+
+    #[test]
+    fn resolve_output_format_explicit_toon() {
+        assert_eq!(resolve_output_format(Some("toon"), false), OutputFormat::Toon);
+    }
+
+    #[test]
+    fn resolve_output_format_explicit_with_json_flag() {
+        // Explicit format takes precedence over json flag
+        assert_eq!(resolve_output_format(Some("toon"), true), OutputFormat::Toon);
+    }
+
+    #[test]
+    fn resolve_output_format_invalid_format_falls_back() {
+        // Invalid format string should fall back to Json default
+        assert_eq!(resolve_output_format(Some("invalid"), false), OutputFormat::Json);
+    }
 }
