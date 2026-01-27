@@ -492,4 +492,471 @@ mod tests {
 
         info!("TEST PASS: test_create_manifest");
     }
+
+    #[test]
+    fn test_file_hash_equality() {
+        init_test_logging();
+        info!("TEST START: test_file_hash_equality");
+
+        let hash1 = FileHash {
+            hash: "abc123".to_string(),
+            size: 100,
+        };
+        let hash2 = FileHash {
+            hash: "abc123".to_string(),
+            size: 100,
+        };
+        let hash3 = FileHash {
+            hash: "def456".to_string(),
+            size: 100,
+        };
+
+        assert_eq!(hash1, hash2);
+        assert_ne!(hash1, hash3);
+
+        info!("TEST PASS: test_file_hash_equality");
+    }
+
+    #[test]
+    fn test_file_hash_serialization() {
+        init_test_logging();
+        info!("TEST START: test_file_hash_serialization");
+
+        let hash = FileHash {
+            hash: "0".repeat(64),
+            size: 1024,
+        };
+
+        let json = serde_json::to_string(&hash).unwrap();
+        let deserialized: FileHash = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(hash, deserialized);
+        assert!(json.contains("\"hash\""));
+        assert!(json.contains("\"size\""));
+
+        info!("TEST PASS: test_file_hash_serialization");
+    }
+
+    #[test]
+    fn test_file_hash_clone() {
+        init_test_logging();
+        info!("TEST START: test_file_hash_clone");
+
+        let original = FileHash {
+            hash: "test_hash".to_string(),
+            size: 500,
+        };
+        let cloned = original.clone();
+
+        assert_eq!(original.hash, cloned.hash);
+        assert_eq!(original.size, cloned.size);
+
+        info!("TEST PASS: test_file_hash_clone");
+    }
+
+    #[test]
+    fn test_artifact_manifest_default() {
+        init_test_logging();
+        info!("TEST START: test_artifact_manifest_default");
+
+        let manifest = ArtifactManifest::default();
+
+        assert!(manifest.files.is_empty());
+        assert_eq!(manifest.created_at, 0);
+        assert!(manifest.worker_id.is_none());
+
+        info!("TEST PASS: test_artifact_manifest_default");
+    }
+
+    #[test]
+    fn test_artifact_manifest_serialization() {
+        init_test_logging();
+        info!("TEST START: test_artifact_manifest_serialization");
+
+        let mut manifest = ArtifactManifest::default();
+        manifest.created_at = 1706380800;
+        manifest.worker_id = Some("worker-1".to_string());
+        manifest.files.insert(
+            "test.bin".to_string(),
+            FileHash {
+                hash: "a".repeat(64),
+                size: 256,
+            },
+        );
+
+        let json = serde_json::to_string(&manifest).unwrap();
+        let deserialized: ArtifactManifest = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(manifest.created_at, deserialized.created_at);
+        assert_eq!(manifest.worker_id, deserialized.worker_id);
+        assert_eq!(manifest.files.len(), deserialized.files.len());
+
+        info!("TEST PASS: test_artifact_manifest_serialization");
+    }
+
+    #[test]
+    fn test_artifact_manifest_without_worker_id() {
+        init_test_logging();
+        info!("TEST START: test_artifact_manifest_without_worker_id");
+
+        let manifest = ArtifactManifest {
+            files: HashMap::new(),
+            created_at: 0,
+            worker_id: None,
+        };
+
+        let json = serde_json::to_string(&manifest).unwrap();
+        // worker_id should be skipped when None
+        assert!(!json.contains("worker_id"));
+
+        info!("TEST PASS: test_artifact_manifest_without_worker_id");
+    }
+
+    #[test]
+    fn test_verification_result_all_passed_empty() {
+        init_test_logging();
+        info!("TEST START: test_verification_result_all_passed_empty");
+
+        let result = VerificationResult {
+            passed: vec![],
+            failed: vec![],
+            skipped: vec![],
+        };
+
+        assert!(result.all_passed());
+        assert_eq!(result.summary(), "0 passed, 0 failed, 0 skipped");
+
+        info!("TEST PASS: test_verification_result_all_passed_empty");
+    }
+
+    #[test]
+    fn test_verification_result_format_failures_empty() {
+        init_test_logging();
+        info!("TEST START: test_verification_result_format_failures_empty");
+
+        let result = VerificationResult {
+            passed: vec!["a.txt".to_string()],
+            failed: vec![],
+            skipped: vec![],
+        };
+
+        let failures = result.format_failures();
+        assert!(failures.is_empty());
+
+        info!("TEST PASS: test_verification_result_format_failures_empty");
+    }
+
+    #[test]
+    fn test_verification_result_format_failures_content() {
+        init_test_logging();
+        info!("TEST START: test_verification_result_format_failures_content");
+
+        let result = VerificationResult {
+            passed: vec![],
+            failed: vec![VerificationFailure::new(
+                "binary.exe",
+                "a".repeat(64),
+                "b".repeat(64),
+                1000,
+                1001,
+            )],
+            skipped: vec![],
+        };
+
+        let failures = result.format_failures();
+        assert!(failures.contains("binary.exe"));
+        assert!(failures.contains("HASH MISMATCH"));
+        assert!(failures.contains("Expected:"));
+        assert!(failures.contains("Actual:"));
+        assert!(failures.contains("1000 bytes"));
+        assert!(failures.contains("1001 bytes"));
+        assert!(failures.contains("Suggested actions"));
+        assert!(failures.contains("rch diagnose"));
+
+        info!("TEST PASS: test_verification_result_format_failures_content");
+    }
+
+    #[test]
+    fn test_verification_failure_new() {
+        init_test_logging();
+        info!("TEST START: test_verification_failure_new");
+
+        let failure = VerificationFailure::new(
+            "path/to/file.bin",
+            "expected_hash_value",
+            "actual_hash_value",
+            500,
+            600,
+        );
+
+        assert_eq!(failure.path, "path/to/file.bin");
+        assert_eq!(failure.expected_hash, "expected_hash_value");
+        assert_eq!(failure.actual_hash, "actual_hash_value");
+        assert_eq!(failure.expected_size, 500);
+        assert_eq!(failure.actual_size, 600);
+
+        info!("TEST PASS: test_verification_failure_new");
+    }
+
+    #[test]
+    fn test_verification_failure_from_string() {
+        init_test_logging();
+        info!("TEST START: test_verification_failure_from_string");
+
+        // Test that Into<String> works (owned strings)
+        let failure = VerificationFailure::new(
+            String::from("owned_path"),
+            String::from("owned_expected"),
+            String::from("owned_actual"),
+            100,
+            200,
+        );
+
+        assert_eq!(failure.path, "owned_path");
+        assert_eq!(failure.expected_hash, "owned_expected");
+        assert_eq!(failure.actual_hash, "owned_actual");
+
+        info!("TEST PASS: test_verification_failure_from_string");
+    }
+
+    #[test]
+    fn test_verification_failure_serialization() {
+        init_test_logging();
+        info!("TEST START: test_verification_failure_serialization");
+
+        let failure = VerificationFailure::new("test.bin", "hash1", "hash2", 100, 200);
+
+        let json = serde_json::to_string(&failure).unwrap();
+        let deserialized: VerificationFailure = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(failure.path, deserialized.path);
+        assert_eq!(failure.expected_hash, deserialized.expected_hash);
+        assert_eq!(failure.actual_hash, deserialized.actual_hash);
+        assert_eq!(failure.expected_size, deserialized.expected_size);
+        assert_eq!(failure.actual_size, deserialized.actual_size);
+
+        info!("TEST PASS: test_verification_failure_serialization");
+    }
+
+    #[test]
+    fn test_verification_result_serialization() {
+        init_test_logging();
+        info!("TEST START: test_verification_result_serialization");
+
+        let result = VerificationResult {
+            passed: vec!["a.txt".to_string()],
+            failed: vec![VerificationFailure::new("b.txt", "h1", "h2", 10, 20)],
+            skipped: vec!["c.txt".to_string()],
+        };
+
+        let json = serde_json::to_string(&result).unwrap();
+        let deserialized: VerificationResult = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(result.passed, deserialized.passed);
+        assert_eq!(result.failed.len(), deserialized.failed.len());
+        assert_eq!(result.skipped, deserialized.skipped);
+
+        info!("TEST PASS: test_verification_result_serialization");
+    }
+
+    #[test]
+    fn test_compute_file_hash_deterministic() {
+        init_test_logging();
+        info!("TEST START: test_compute_file_hash_deterministic");
+
+        let temp_dir = TempDir::new().unwrap();
+        let file1 = temp_dir.path().join("file1.txt");
+        let file2 = temp_dir.path().join("file2.txt");
+
+        // Same content in different files
+        let content = b"Identical content for hashing test";
+        std::fs::write(&file1, content).unwrap();
+        std::fs::write(&file2, content).unwrap();
+
+        let hash1 = compute_file_hash(&file1).unwrap();
+        let hash2 = compute_file_hash(&file2).unwrap();
+
+        assert_eq!(hash1.hash, hash2.hash);
+        assert_eq!(hash1.size, hash2.size);
+
+        info!("TEST PASS: test_compute_file_hash_deterministic");
+    }
+
+    #[test]
+    fn test_compute_file_hash_different_content() {
+        init_test_logging();
+        info!("TEST START: test_compute_file_hash_different_content");
+
+        let temp_dir = TempDir::new().unwrap();
+        let file1 = temp_dir.path().join("file1.txt");
+        let file2 = temp_dir.path().join("file2.txt");
+
+        std::fs::write(&file1, b"content one").unwrap();
+        std::fs::write(&file2, b"content two").unwrap();
+
+        let hash1 = compute_file_hash(&file1).unwrap();
+        let hash2 = compute_file_hash(&file2).unwrap();
+
+        assert_ne!(hash1.hash, hash2.hash);
+
+        info!("TEST PASS: test_compute_file_hash_different_content");
+    }
+
+    #[test]
+    fn test_verification_with_size_mismatch() {
+        init_test_logging();
+        info!("TEST START: test_verification_with_size_mismatch");
+
+        let temp_dir = TempDir::new().unwrap();
+        std::fs::write(temp_dir.path().join("test.txt"), b"content").unwrap();
+
+        // Create manifest with wrong size
+        let hash = compute_file_hash(&temp_dir.path().join("test.txt")).unwrap();
+        let mut manifest = ArtifactManifest::default();
+        manifest.files.insert(
+            "test.txt".to_string(),
+            FileHash {
+                hash: hash.hash, // Same hash
+                size: 9999,      // Wrong size
+            },
+        );
+
+        let result = verify_artifacts(temp_dir.path(), &manifest, 1024 * 1024);
+
+        // Should fail due to size mismatch
+        assert!(!result.all_passed());
+        assert_eq!(result.failed.len(), 1);
+
+        info!("TEST PASS: test_verification_with_size_mismatch");
+    }
+
+    #[test]
+    fn test_create_manifest_empty_list() {
+        init_test_logging();
+        info!("TEST START: test_create_manifest_empty_list");
+
+        let temp_dir = TempDir::new().unwrap();
+        let manifest = create_manifest(temp_dir.path(), &[], None);
+
+        assert!(manifest.files.is_empty());
+        assert!(manifest.worker_id.is_none());
+
+        info!("TEST PASS: test_create_manifest_empty_list");
+    }
+
+    #[test]
+    fn test_verification_clone_traits() {
+        init_test_logging();
+        info!("TEST START: test_verification_clone_traits");
+
+        let result = VerificationResult {
+            passed: vec!["a.txt".to_string()],
+            failed: vec![],
+            skipped: vec![],
+        };
+
+        let cloned = result.clone();
+        assert_eq!(result.passed, cloned.passed);
+        assert_eq!(result.failed.len(), cloned.failed.len());
+        assert_eq!(result.skipped, cloned.skipped);
+
+        info!("TEST PASS: test_verification_clone_traits");
+    }
+
+    #[test]
+    fn test_verification_failure_clone() {
+        init_test_logging();
+        info!("TEST START: test_verification_failure_clone");
+
+        let failure = VerificationFailure::new("path", "h1", "h2", 10, 20);
+        let cloned = failure.clone();
+
+        assert_eq!(failure.path, cloned.path);
+        assert_eq!(failure.expected_hash, cloned.expected_hash);
+        assert_eq!(failure.actual_hash, cloned.actual_hash);
+
+        info!("TEST PASS: test_verification_failure_clone");
+    }
+
+    #[test]
+    fn test_artifact_manifest_clone() {
+        init_test_logging();
+        info!("TEST START: test_artifact_manifest_clone");
+
+        let mut manifest = ArtifactManifest::default();
+        manifest.created_at = 12345;
+        manifest.worker_id = Some("worker".to_string());
+        manifest.files.insert(
+            "f.txt".to_string(),
+            FileHash {
+                hash: "h".to_string(),
+                size: 1,
+            },
+        );
+
+        let cloned = manifest.clone();
+        assert_eq!(manifest.created_at, cloned.created_at);
+        assert_eq!(manifest.worker_id, cloned.worker_id);
+        assert_eq!(manifest.files.len(), cloned.files.len());
+
+        info!("TEST PASS: test_artifact_manifest_clone");
+    }
+
+    #[test]
+    fn test_file_hash_debug() {
+        init_test_logging();
+        info!("TEST START: test_file_hash_debug");
+
+        let hash = FileHash {
+            hash: "abc".to_string(),
+            size: 100,
+        };
+
+        let debug = format!("{:?}", hash);
+        assert!(debug.contains("FileHash"));
+        assert!(debug.contains("abc"));
+        assert!(debug.contains("100"));
+
+        info!("TEST PASS: test_file_hash_debug");
+    }
+
+    #[test]
+    fn test_verification_result_debug() {
+        init_test_logging();
+        info!("TEST START: test_verification_result_debug");
+
+        let result = VerificationResult {
+            passed: vec!["a.txt".to_string()],
+            failed: vec![],
+            skipped: vec![],
+        };
+
+        let debug = format!("{:?}", result);
+        assert!(debug.contains("VerificationResult"));
+        assert!(debug.contains("a.txt"));
+
+        info!("TEST PASS: test_verification_result_debug");
+    }
+
+    #[test]
+    fn test_multiple_failures_format() {
+        init_test_logging();
+        info!("TEST START: test_multiple_failures_format");
+
+        let result = VerificationResult {
+            passed: vec![],
+            failed: vec![
+                VerificationFailure::new("file1.bin", "a".repeat(64), "b".repeat(64), 100, 101),
+                VerificationFailure::new("file2.bin", "c".repeat(64), "d".repeat(64), 200, 201),
+            ],
+            skipped: vec![],
+        };
+
+        let failures = result.format_failures();
+        assert!(failures.contains("file1.bin"));
+        assert!(failures.contains("file2.bin"));
+        assert!(failures.contains("HASH MISMATCH"));
+
+        info!("TEST PASS: test_multiple_failures_format");
+    }
 }
