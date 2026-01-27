@@ -50,15 +50,15 @@ pub use ssh::{CommandResult, KnownHostsPolicy, SshClient, SshOptions, SshPool};
 pub use test_change::{TestChangeGuard, TestCodeChange};
 pub use toolchain::{ToolchainInfo, wrap_command_with_color, wrap_command_with_toolchain};
 pub use types::{
-    BuildLocation, BuildRecord, BuildStats, CircuitBreakerConfig, CircuitState, CircuitStats,
-    ColorMode, CommandPriority, CommandTimingBreakdown, CompilationConfig, CompilationMetrics,
-    CompilationTimer, CompilationTimingBreakdown, EnvironmentConfig, ExecutionConfig,
-    FairnessConfig, GeneralConfig, MetricsAggregator, OutputConfig, OutputVisibility, RchConfig,
-    ReleaseRequest, RequiredRuntime, RetryConfig, SelectedWorker, SelectionConfig, SelectionReason,
-    SelectionRequest, SelectionResponse, SelectionStrategy, SelectionWeightConfig,
-    SelfHealingConfig, SelfTestConfig, SelfTestFailureAction, SelfTestWorkers, TransferConfig,
-    WorkerCapabilities, WorkerConfig, WorkerId, WorkerStatus, default_socket_path,
-    validate_remote_base,
+    AffinityConfig, BuildLocation, BuildRecord, BuildStats, CircuitBreakerConfig, CircuitState,
+    CircuitStats, ColorMode, CommandPriority, CommandTimingBreakdown, CompilationConfig,
+    CompilationMetrics, CompilationTimer, CompilationTimingBreakdown, EnvironmentConfig,
+    ExecutionConfig, FairnessConfig, GeneralConfig, MetricsAggregator, OutputConfig,
+    OutputVisibility, RchConfig, ReleaseRequest, RequiredRuntime, RetryConfig, SelectedWorker,
+    SelectionConfig, SelectionReason, SelectionRequest, SelectionResponse, SelectionStrategy,
+    SelectionWeightConfig, SelfHealingConfig, SelfTestConfig, SelfTestFailureAction,
+    SelfTestWorkers, TransferConfig, WorkerCapabilities, WorkerConfig, WorkerId, WorkerStatus,
+    default_socket_path, validate_remote_base,
 };
 
 // Testing module re-exports
