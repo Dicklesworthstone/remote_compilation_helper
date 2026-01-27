@@ -1771,22 +1771,24 @@ pub(crate) async fn record_build(
 /// URL percent-encoding for query parameters.
 ///
 /// Encodes characters that are not URL-safe (RFC 3986 unreserved characters).
+/// Optimized to avoid allocations by using direct hex conversion.
 fn urlencoding_encode(s: &str) -> String {
+    // Hex digits lookup table for zero-allocation encoding
+    const HEX_DIGITS: &[u8; 16] = b"0123456789ABCDEF";
+
     let mut result = String::with_capacity(s.len() * 3); // Worst case: all encoded
 
-    for c in s.chars() {
-        match c {
+    for byte in s.as_bytes() {
+        match *byte {
             // Unreserved characters (RFC 3986) - don't encode
-            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => {
-                result.push(c);
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                result.push(*byte as char);
             }
             // Everything else needs encoding
             _ => {
-                // Encode as UTF-8 bytes
-                for byte in c.to_string().as_bytes() {
-                    result.push('%');
-                    result.push_str(&format!("{:02X}", byte));
-                }
+                result.push('%');
+                result.push(HEX_DIGITS[(byte >> 4) as usize] as char);
+                result.push(HEX_DIGITS[(byte & 0x0F) as usize] as char);
             }
         }
     }
