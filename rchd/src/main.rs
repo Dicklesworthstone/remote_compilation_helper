@@ -355,6 +355,7 @@ async fn main() -> Result<()> {
     let alert_config = alerts::AlertConfig {
         enabled: rch_config.alerts.enabled,
         suppress_duplicates: ChronoDuration::seconds(suppress_secs),
+        webhook: None, // TODO: Load from config when webhook support is added
     };
     let alert_manager = Arc::new(alerts::AlertManager::new(alert_config));
 

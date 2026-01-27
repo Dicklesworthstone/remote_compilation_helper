@@ -438,26 +438,102 @@ struct WebhookDetails {
 fn send_webhook_sync(url: &str, payload: &WebhookPayload, timeout_secs: u64) -> Result<(), String> {
     let body = serde_json::to_string(payload).map_err(|e| e.to_string())?;
 
-    // Use ureq for simple synchronous HTTP requests
-    let response = ureq::AgentBuilder::new()
-        .timeout(std::time::Duration::from_secs(timeout_secs))
-        .build()
-        .post(url)
-        .set("Content-Type", "application/json")
-        .set("User-Agent", "rchd-alerts/1.0")
-        .send_string(&body)
-        .map_err(|e| e.to_string())?;
+    // Build agent with timeout configuration
+    let config = ureq::config::Config::builder()
+        .timeout_global(Some(std::time::Duration::from_secs(timeout_secs)))
+        .build();
+    let agent = ureq::Agent::new_with_config(config);
 
-    if response.status() >= 200 && response.status() < 300 {
+    let response = agent
+        .post(url)
+        .content_type("application/json")
+        .header("User-Agent", "rchd-alerts/1.0")
+        .send(&body)
+        .map_err(|e: ureq::Error| e.to_string())?;
+
+    let status = response.status();
+    if status.is_success() {
         Ok(())
     } else {
-        Err(format!("HTTP {}", response.status()))
+        Err(format!("HTTP {}", status))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ============== WebhookConfig Tests ==============
+
+    #[test]
+    fn test_webhook_config_default() {
+        let config = WebhookConfig::default();
+        assert!(config.url.is_none());
+        assert!(config.secret.is_none());
+        assert_eq!(config.timeout_secs, 0);
+        assert_eq!(config.retry_count, 0);
+        assert!(config.events.is_empty());
+    }
+
+    #[test]
+    fn test_webhook_config_serialization() {
+        let config = WebhookConfig {
+            url: Some("https://hooks.example.com/rch".to_string()),
+            secret: Some("test-secret".to_string()),
+            timeout_secs: 5,
+            retry_count: 3,
+            events: vec!["worker_offline".to_string(), "all_workers_offline".to_string()],
+        };
+
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains("hooks.example.com"));
+        assert!(json.contains("worker_offline"));
+
+        // Round-trip
+        let parsed: WebhookConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.url, config.url);
+        assert_eq!(parsed.events.len(), 2);
+    }
+
+    // ============== WebhookPayload Tests ==============
+
+    #[test]
+    fn test_webhook_payload_format() {
+        let payload = WebhookPayload {
+            event: "worker_offline".to_string(),
+            timestamp: "2026-01-27T10:30:00Z".to_string(),
+            severity: "error".to_string(),
+            message: "Worker 'gpu-1' is offline".to_string(),
+            worker_id: Some("gpu-1".to_string()),
+            details: WebhookDetails {
+                alert_id: "abc-123".to_string(),
+            },
+        };
+
+        let json = serde_json::to_string(&payload).unwrap();
+        assert!(json.contains("worker_offline"));
+        assert!(json.contains("gpu-1"));
+        assert!(json.contains("abc-123"));
+    }
+
+    #[test]
+    fn test_webhook_payload_without_worker_id() {
+        let payload = WebhookPayload {
+            event: "all_workers_offline".to_string(),
+            timestamp: "2026-01-27T10:30:00Z".to_string(),
+            severity: "critical".to_string(),
+            message: "All workers are offline".to_string(),
+            worker_id: None,
+            details: WebhookDetails {
+                alert_id: "xyz-789".to_string(),
+            },
+        };
+
+        let json = serde_json::to_string(&payload).unwrap();
+        // worker_id should be skipped due to skip_serializing_if
+        assert!(!json.contains("worker_id"));
+        assert!(json.contains("critical"));
+    }
 
     // ============== AlertConfig Tests ==============
 
@@ -466,6 +542,27 @@ mod tests {
         let config = AlertConfig::default();
         assert!(config.enabled);
         assert_eq!(config.suppress_duplicates, ChronoDuration::seconds(300));
+        assert!(config.webhook.is_none());
+    }
+
+    #[test]
+    fn test_alert_config_with_webhook() {
+        let webhook = WebhookConfig {
+            url: Some("https://example.com/webhook".to_string()),
+            secret: None,
+            timeout_secs: 10,
+            retry_count: 2,
+            events: vec!["worker_offline".to_string()],
+        };
+
+        let config = AlertConfig {
+            enabled: true,
+            suppress_duplicates: ChronoDuration::seconds(60),
+            webhook: Some(webhook),
+        };
+
+        assert!(config.webhook.is_some());
+        assert_eq!(config.webhook.as_ref().unwrap().timeout_secs, 10);
     }
 
     #[test]
@@ -473,6 +570,7 @@ mod tests {
         let config = AlertConfig {
             enabled: false,
             suppress_duplicates: ChronoDuration::seconds(60),
+            webhook: None,
         };
         assert!(!config.enabled);
         assert_eq!(config.suppress_duplicates, ChronoDuration::seconds(60));
@@ -568,6 +666,7 @@ mod tests {
         let config = AlertConfig {
             enabled: true,
             suppress_duplicates: ChronoDuration::seconds(300),
+            webhook: None,
         };
         let manager = AlertManager::new(config);
         manager.handle_worker_status_change(
@@ -616,6 +715,7 @@ mod tests {
         let config = AlertConfig {
             enabled: false,
             suppress_duplicates: ChronoDuration::seconds(300),
+            webhook: None,
         };
         let manager = AlertManager::new(config);
 
@@ -776,6 +876,7 @@ mod tests {
         let config = AlertConfig {
             enabled: false,
             suppress_duplicates: ChronoDuration::seconds(300),
+            webhook: None,
         };
         let manager = AlertManager::new(config);
 
@@ -821,6 +922,7 @@ mod tests {
         let config = AlertConfig {
             enabled: false,
             suppress_duplicates: ChronoDuration::seconds(300),
+            webhook: None,
         };
         let manager = AlertManager::new(config);
 

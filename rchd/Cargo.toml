@@ -47,6 +47,9 @@ axum = { workspace = true }
 tower = { workspace = true }
 hyper = { workspace = true }
 
+# HTTP client for webhook dispatch
+ureq = { workspace = true }
+
 # Rich terminal output (optional)
 rich_rust = { workspace = true, optional = true }
 

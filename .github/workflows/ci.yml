@@ -222,6 +222,7 @@ jobs:
           RCH_MOCK_SSH: '1'
           RCH_LOG_LEVEL: debug
           RCH_E2E_SKIP_WORKER_CHECK: '1'
+          RCH_TEST_LOGGING: '1'
         run: |
           mkdir -p test-results/cargo-e2e
           # Run E2E tests via cargo test with true-e2e feature
@@ -230,11 +231,16 @@ jobs:
         env:
           RCH_MOCK_SSH: '1'
           RCH_LOG_LEVEL: debug
+          RCH_TEST_LOGGING: '1'
           E2E_LOG_DIR: test-results/e2e-logs
           E2E_JUNIT_FILE: test-results/e2e-logs/junit.xml
         run: |
           chmod +x scripts/e2e_test.sh
           ./scripts/e2e_test.sh 2>&1 | tee e2e-output.log
+      - name: Check test performance regression
+        if: always()
+        run: |
+          python3 scripts/check_test_regression.py --verbose --json-output target/test-regression-report.json || true
       - name: Upload E2E logs
         if: always()
         uses: actions/upload-artifact@v4
@@ -243,6 +249,8 @@ jobs:
           path: |
             e2e-output.log
             test-results/
+            target/test-logs/
+            target/test-regression-report.json
           retention-days: 14
 
   # Performance benchmark - verify latency budgets from AGENTS.md

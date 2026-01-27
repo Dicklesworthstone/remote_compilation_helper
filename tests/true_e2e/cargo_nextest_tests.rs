@@ -212,6 +212,7 @@ async fn test_cargo_nextest_run() {
     }
 
     // Local baseline
+    logger.log(TestPhase::Execute, "Running local cargo nextest baseline");
     let local_start = Instant::now();
     let local_result = std::process::Command::new("cargo")
         .args(["nextest", "run"])
@@ -224,33 +225,23 @@ async fn test_cargo_nextest_run() {
         .and_then(|r| r.status.code())
         .unwrap_or(-1);
 
-    logger.log_with_context(
-        LogLevel::Info,
-        LogSource::Custom("test".to_string()),
-        "Local cargo nextest baseline",
-        vec![
-            ("phase".to_string(), "execute_local".to_string()),
-            ("cmd".to_string(), "cargo nextest run".to_string()),
-            ("exit_code".to_string(), local_exit.to_string()),
-            (
-                "duration_ms".to_string(),
-                local_duration.as_millis().to_string(),
-            ),
-        ],
+    logger.log_with_data(
+        TestPhase::Execute,
+        "Local cargo nextest completed",
+        serde_json::json!({
+            "cmd": "cargo nextest run",
+            "exit_code": local_exit,
+            "duration_ms": local_duration.as_millis() as u64
+        }),
     );
 
     // Remote nextest
     let nextest_cmd = format!("cd {} && cargo nextest run 2>&1", remote_path);
 
-    logger.log_with_context(
-        LogLevel::Info,
-        LogSource::Custom("test".to_string()),
+    logger.log_with_data(
+        TestPhase::Execute,
         "Executing remote cargo nextest run",
-        vec![
-            ("phase".to_string(), "execute_remote".to_string()),
-            ("cmd".to_string(), "cargo nextest run".to_string()),
-            ("worker".to_string(), worker_entry.id.clone()),
-        ],
+        serde_json::json!({"cmd": "cargo nextest run", "worker": &worker_entry.id}),
     );
 
     let remote_start = Instant::now();
@@ -258,19 +249,14 @@ async fn test_cargo_nextest_run() {
         Ok(result) => {
             let remote_duration = remote_start.elapsed();
 
-            logger.log_with_context(
-                LogLevel::Info,
-                LogSource::Custom("test".to_string()),
+            logger.log_with_data(
+                TestPhase::Execute,
                 "Remote cargo nextest completed",
-                vec![
-                    ("phase".to_string(), "execute_remote".to_string()),
-                    ("exit_code".to_string(), result.exit_code.to_string()),
-                    (
-                        "duration_ms".to_string(),
-                        remote_duration.as_millis().to_string(),
-                    ),
-                    ("worker".to_string(), worker_entry.id.clone()),
-                ],
+                serde_json::json!({
+                    "exit_code": result.exit_code,
+                    "duration_ms": remote_duration.as_millis() as u64,
+                    "worker": &worker_entry.id
+                }),
             );
 
             assert_eq!(
@@ -280,18 +266,20 @@ async fn test_cargo_nextest_run() {
             );
         }
         Err(e) => {
-            logger.error(format!("Remote cargo nextest failed: {e}"));
             let _ = cleanup_remote(&mut client, &remote_path).await;
             client.disconnect().await.ok();
+            logger.fail(format!("Remote cargo nextest command failed: {e}"));
             panic!("Remote cargo nextest command failed: {e}");
         }
     }
 
+    // Teardown
     if config.settings.cleanup_after_test {
+        logger.log(TestPhase::Teardown, "Cleaning up remote directory");
         let _ = cleanup_remote(&mut client, &remote_path).await;
     }
 
     client.disconnect().await.ok();
-    logger.info("Cargo nextest run test completed");
-    logger.print_summary();
+    logger.log(TestPhase::Verify, "Exit code verification passed");
+    logger.pass();
 }
