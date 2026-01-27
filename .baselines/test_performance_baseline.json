@@ -1,0 +1,665 @@
+{
+  "version": "1.0",
+  "generated_at": "2026-01-27T19:48:13.347513Z",
+  "platform": "linux-x64",
+  "threshold": 1.2,
+  "tests": {
+    "test_ssh_pool_no_leaks": {
+      "mean_ms": 23,
+      "median_ms": 23,
+      "p95_ms": 23.0,
+      "stddev_ms": 0,
+      "sample_count": 1,
+      "last_updated": "2026-01-27T19:48:13.347513Z",
+      "platform": "linux-x64"
+    },
+    "test_failopen_transfer_failure": {
+      "mean_ms": 525,
+      "median_ms": 525,
+      "p95_ms": 525.0,
+      "stddev_ms": 0,
+      "sample_count": 1,
+      "last_updated": "2026-01-27T19:48:13.347513Z",
+      "platform": "linux-x64"
+    },
+    "test_exit_code_arbitrary": {
+      "mean_ms": 1,
+      "median_ms": 1,
+      "p95_ms": 1.0,
+      "stddev_ms": 0,
+      "sample_count": 1,
+      "last_updated": "2026-01-27T19:48:13.347513Z",
+      "platform": "linux-x64"
+    },
+    "test_worker_rsync_availability": {
+      "mean_ms": 2,
+      "median_ms": 2,
+      "p95_ms": 2.0,
+      "stddev_ms": 0,
+      "sample_count": 1,
+      "last_updated": "2026-01-27T19:48:13.347513Z",
+      "platform": "linux-x64"
+    },
+    "test_ssh_basic_connect": {
+      "mean_ms": 24,
+      "median_ms": 24,
+      "p95_ms": 24.0,
+      "stddev_ms": 0,
+      "sample_count": 1,
+      "last_updated": "2026-01-27T19:48:13.347513Z",
+      "platform": "linux-x64"
+    },
+    "integration_test": {
+      "mean_ms": 12.67,
+      "median_ms": 12,
+      "p95_ms": 13.8,
+      "stddev_ms": 1.15,
+      "sample_count": 3,
+      "last_updated": "2026-01-27T19:48:13.347513Z",
+      "platform": "linux-x64"
+    },
+    "test_ssh_wrong_key_rejection": {
+      "mean_ms": 23,
+      "median_ms": 23,
+      "p95_ms": 23.0,
+      "stddev_ms": 0,
+      "sample_count": 1,
+      "last_updated": "2026-01-27T19:48:13.347513Z",
+      "platform": "linux-x64"
+    },
+    "test_cargo_test_filter_by_name": {
+      "mean_ms": 2,
+      "median_ms": 2,
+      "p95_ms": 2.0,
+      "stddev_ms": 0,
+      "sample_count": 1,
+      "last_updated": "2026-01-27T19:48:13.347513Z",
+      "platform": "linux-x64"
+    },
+    "test_large_artifact_handling": {
+      "mean_ms": 62,
+      "median_ms": 62,
+      "p95_ms": 62.0,
+      "stddev_ms": 0,
+      "sample_count": 1,
+      "last_updated": "2026-01-27T19:48:13.347513Z",
+      "platform": "linux-x64"
+    },
+    "test_hook_classification_compile": {
+      "mean_ms": 40,
+      "median_ms": 40,
+      "p95_ms": 40.0,
+      "stddev_ms": 0,
+      "sample_count": 1,
+      "last_updated": "2026-01-27T19:48:13.347513Z",
+      "platform": "linux-x64"
+    },
+    "test_failopen_daemon_not_running": {
+      "mean_ms": 23,
+      "median_ms": 23,
+      "p95_ms": 23.0,
+      "stddev_ms": 0,
+      "sample_count": 1,
+      "last_updated": "2026-01-27T19:48:13.347513Z",
+      "platform": "linux-x64"
+    },
+    "test_exit_code_signal_sigterm": {
+      "mean_ms": 18,
+      "median_ms": 18,
+      "p95_ms": 18.0,
+      "stddev_ms": 0,
+      "sample_count": 1,
+      "last_updated": "2026-01-27T19:48:13.347513Z",
+      "platform": "linux-x64"
+    },
+    "test_exit_code_cargo_build_success": {
+      "mean_ms": 2,
+      "median_ms": 2,
+      "p95_ms": 2.0,
+      "stddev_ms": 0,
+      "sample_count": 1,
+      "last_updated": "2026-01-27T19:48:13.347513Z",
+      "platform": "linux-x64"
+    },
+    "test_cargo_build_workspace": {
+      "mean_ms": 2,
+      "median_ms": 2,
+      "p95_ms": 2.0,
+      "stddev_ms": 0,
+      "sample_count": 1,
+      "last_updated": "2026-01-27T19:48:13.347513Z",
+      "platform": "linux-x64"
+    },
+    "test_cargo_build_package_specific": {
+      "mean_ms": 18,
+      "median_ms": 18,
+      "p95_ms": 18.0,
+      "stddev_ms": 0,
+      "sample_count": 1,
+      "last_updated": "2026-01-27T19:48:13.347513Z",
+      "platform": "linux-x64"
+    },
+    "test_exit_code_make_error": {
+      "mean_ms": 1,
+      "median_ms": 1,
+      "p95_ms": 1.0,
+      "stddev_ms": 0,
+      "sample_count": 1,
+      "last_updated": "2026-01-27T19:48:13.347513Z",
+      "platform": "linux-x64"
+    },
+    "test_ssh_rsa_auth": {
+      "mean_ms": 23,
+      "median_ms": 23,
+      "p95_ms": 23.0,
+      "stddev_ms": 0,
+      "sample_count": 1,
+      "last_updated": "2026-01-27T19:48:13.347513Z",
+      "platform": "linux-x64"
+    },
+    "test_exit_code_gpp_success": {
+      "mean_ms": 21,
+      "median_ms": 21,
+      "p95_ms": 21.0,
+      "stddev_ms": 0,
+      "sample_count": 1,
+      "last_updated": "2026-01-27T19:48:13.347513Z",
+      "platform": "linux-x64"
+    },
+    "test_build_rs_binary_output": {
+      "mean_ms": 176,
+      "median_ms": 176,
+      "p95_ms": 176.0,
+      "stddev_ms": 0,
+      "sample_count": 1,
+      "last_updated": "2026-01-27T19:48:13.347513Z",
+      "platform": "linux-x64"
+    },
+    "test_exit_code_cargo_test_success": {
+      "mean_ms": 2,
+      "median_ms": 2,
+      "p95_ms": 2.0,
+      "stddev_ms": 0,
+      "sample_count": 1,
+      "last_updated": "2026-01-27T19:48:13.347513Z",
+      "platform": "linux-x64"
+    },
+    "test_exit_code_signal_sigkill": {
+      "mean_ms": 18,
+      "median_ms": 18,
+      "p95_ms": 18.0,
+      "stddev_ms": 0,
+      "sample_count": 1,
+      "last_updated": "2026-01-27T19:48:13.347513Z",
+      "platform": "linux-x64"
+    },
+    "test_cmd_long_output": {
+      "mean_ms": 2,
+      "median_ms": 2,
+      "p95_ms": 2.0,
+      "stddev_ms": 0,
+      "sample_count": 1,
+      "last_updated": "2026-01-27T19:48:13.347513Z",
+      "platform": "linux-x64"
+    },
+    "test_true_e2e_gcc_error_propagation": {
+      "mean_ms": 20,
+      "median_ms": 20,
+      "p95_ms": 20.0,
+      "stddev_ms": 0,
+      "sample_count": 1,
+      "last_updated": "2026-01-27T19:48:13.347513Z",
+      "platform": "linux-x64"
+    },
+    "test_true_e2e_ninja_build_and_sync": {
+      "mean_ms": 1,
+      "median_ms": 1,
+      "p95_ms": 1.0,
+      "stddev_ms": 0,
+      "sample_count": 1,
+      "last_updated": "2026-01-27T19:48:13.347513Z",
+      "platform": "linux-x64"
+    },
+    "test_toolchain_missing_detection": {
+      "mean_ms": 1,
+      "median_ms": 1,
+      "p95_ms": 1.0,
+      "stddev_ms": 0,
+      "sample_count": 1,
+      "last_updated": "2026-01-27T19:48:13.347513Z",
+      "platform": "linux-x64"
+    },
+    "test_circuit_breaker_state_tracking": {
+      "mean_ms": 1,
+      "median_ms": 1,
+      "p95_ms": 1.0,
+      "stddev_ms": 0,
+      "sample_count": 1,
+      "last_updated": "2026-01-27T19:48:13.347513Z",
+      "platform": "linux-x64"
+    },
+    "test_ssh_connection_timeout": {
+      "mean_ms": 2024.5,
+      "median_ms": 2024.5,
+      "p95_ms": 2032.15,
+      "stddev_ms": 12.02,
+      "sample_count": 2,
+      "last_updated": "2026-01-27T19:48:13.347513Z",
+      "platform": "linux-x64"
+    },
+    "test_exit_code_rustc_error": {
+      "mean_ms": 2,
+      "median_ms": 2,
+      "p95_ms": 2.0,
+      "stddev_ms": 0,
+      "sample_count": 1,
+      "last_updated": "2026-01-27T19:48:13.347513Z",
+      "platform": "linux-x64"
+    },
+    "test_cargo_test_workspace": {
+      "mean_ms": 1,
+      "median_ms": 1,
+      "p95_ms": 1.0,
+      "stddev_ms": 0,
+      "sample_count": 1,
+      "last_updated": "2026-01-27T19:48:13.347513Z",
+      "platform": "linux-x64"
+    },
+    "test_cargo_build_basic": {
+      "mean_ms": 1,
+      "median_ms": 1,
+      "p95_ms": 1.0,
+      "stddev_ms": 0,
+      "sample_count": 1,
+      "last_updated": "2026-01-27T19:48:13.347513Z",
+      "platform": "linux-x64"
+    },
+    "test_toolchain_c_availability": {
+      "mean_ms": 1,
+      "median_ms": 1,
+      "p95_ms": 1.0,
+      "stddev_ms": 0,
+      "sample_count": 1,
+      "last_updated": "2026-01-27T19:48:13.347513Z",
+      "platform": "linux-x64"
+    },
+    "test_cargo_test_run_ignored": {
+      "mean_ms": 2,
+      "median_ms": 2,
+      "p95_ms": 2.0,
+      "stddev_ms": 0,
+      "sample_count": 1,
+      "last_updated": "2026-01-27T19:48:13.347513Z",
+      "platform": "linux-x64"
+    },
+    "test_exit_code_cmake_build_success": {
+      "mean_ms": 21,
+      "median_ms": 21,
+      "p95_ms": 21.0,
+      "stddev_ms": 0,
+      "sample_count": 1,
+      "last_updated": "2026-01-27T19:48:13.347513Z",
+      "platform": "linux-x64"
+    },
+    "test_cargo_test_build_error": {
+      "mean_ms": 2,
+      "median_ms": 2,
+      "p95_ms": 2.0,
+      "stddev_ms": 0,
+      "sample_count": 1,
+      "last_updated": "2026-01-27T19:48:13.347513Z",
+      "platform": "linux-x64"
+    },
+    "test_exit_code_clang_make_success": {
+      "mean_ms": 42,
+      "median_ms": 42,
+      "p95_ms": 42.0,
+      "stddev_ms": 0,
+      "sample_count": 1,
+      "last_updated": "2026-01-27T19:48:13.347513Z",
+      "platform": "linux-x64"
+    },
+    "test_cargo_clippy_deny_warnings": {
+      "mean_ms": 1,
+      "median_ms": 1,
+      "p95_ms": 1.0,
+      "stddev_ms": 0,
+      "sample_count": 1,
+      "last_updated": "2026-01-27T19:48:13.347513Z",
+      "platform": "linux-x64"
+    },
+    "test_toolchain_rust_availability": {
+      "mean_ms": 2,
+      "median_ms": 2,
+      "p95_ms": 2.0,
+      "stddev_ms": 0,
+      "sample_count": 1,
+      "last_updated": "2026-01-27T19:48:13.347513Z",
+      "platform": "linux-x64"
+    },
+    "test_ssh_ed25519_auth": {
+      "mean_ms": 12,
+      "median_ms": 12.0,
+      "p95_ms": 21.9,
+      "stddev_ms": 15.56,
+      "sample_count": 2,
+      "last_updated": "2026-01-27T19:48:13.347513Z",
+      "platform": "linux-x64"
+    },
+    "test_build_rs_tests_pass": {
+      "mean_ms": 167,
+      "median_ms": 167,
+      "p95_ms": 167.0,
+      "stddev_ms": 0,
+      "sample_count": 1,
+      "last_updated": "2026-01-27T19:48:13.347513Z",
+      "platform": "linux-x64"
+    },
+    "test_disconnect_reconnect": {
+      "mean_ms": 1,
+      "median_ms": 1,
+      "p95_ms": 1.0,
+      "stddev_ms": 0,
+      "sample_count": 1,
+      "last_updated": "2026-01-27T19:48:13.347513Z",
+      "platform": "linux-x64"
+    },
+    "test_failopen_daemon_recovery": {
+      "mean_ms": 16279,
+      "median_ms": 16279,
+      "p95_ms": 16279.0,
+      "stddev_ms": 0,
+      "sample_count": 1,
+      "last_updated": "2026-01-27T19:48:13.347513Z",
+      "platform": "linux-x64"
+    },
+    "test_failopen_all_workers_busy": {
+      "mean_ms": 527,
+      "median_ms": 527,
+      "p95_ms": 527.0,
+      "stddev_ms": 0,
+      "sample_count": 1,
+      "last_updated": "2026-01-27T19:48:13.347513Z",
+      "platform": "linux-x64"
+    },
+    "test_build_rs_fixture_compiles": {
+      "mean_ms": 144,
+      "median_ms": 144,
+      "p95_ms": 144.0,
+      "stddev_ms": 0,
+      "sample_count": 1,
+      "last_updated": "2026-01-27T19:48:13.347513Z",
+      "platform": "linux-x64"
+    },
+    "test_cargo_test_doc": {
+      "mean_ms": 2,
+      "median_ms": 2,
+      "p95_ms": 2.0,
+      "stddev_ms": 0,
+      "sample_count": 1,
+      "last_updated": "2026-01-27T19:48:13.347513Z",
+      "platform": "linux-x64"
+    },
+    "test_worker_disk_space_check": {
+      "mean_ms": 1,
+      "median_ms": 1,
+      "p95_ms": 1.0,
+      "stddev_ms": 0,
+      "sample_count": 1,
+      "last_updated": "2026-01-27T19:48:13.347513Z",
+      "platform": "linux-x64"
+    },
+    "test_transient_error_recovery": {
+      "mean_ms": 2,
+      "median_ms": 2,
+      "p95_ms": 2.0,
+      "stddev_ms": 0,
+      "sample_count": 1,
+      "last_updated": "2026-01-27T19:48:13.347513Z",
+      "platform": "linux-x64"
+    },
+    "test_classification_timing_consistency": {
+      "mean_ms": 12,
+      "median_ms": 12,
+      "p95_ms": 12.0,
+      "stddev_ms": 0,
+      "sample_count": 1,
+      "last_updated": "2026-01-27T19:48:13.347513Z",
+      "platform": "linux-x64"
+    },
+    "test_hook_classification_non_compile": {
+      "mean_ms": 30,
+      "median_ms": 30,
+      "p95_ms": 30.0,
+      "stddev_ms": 0,
+      "sample_count": 1,
+      "last_updated": "2026-01-27T19:48:13.347513Z",
+      "platform": "linux-x64"
+    },
+    "test_cargo_check_with_errors": {
+      "mean_ms": 62,
+      "median_ms": 62,
+      "p95_ms": 62.0,
+      "stddev_ms": 0,
+      "sample_count": 1,
+      "last_updated": "2026-01-27T19:48:13.347513Z",
+      "platform": "linux-x64"
+    },
+    "test_exit_code_clangpp_success": {
+      "mean_ms": 43,
+      "median_ms": 43,
+      "p95_ms": 43.0,
+      "stddev_ms": 0,
+      "sample_count": 1,
+      "last_updated": "2026-01-27T19:48:13.347513Z",
+      "platform": "linux-x64"
+    },
+    "test_true_e2e_gcc_direct_compile_and_sync": {
+      "mean_ms": 22,
+      "median_ms": 22,
+      "p95_ms": 22.0,
+      "stddev_ms": 0,
+      "sample_count": 1,
+      "last_updated": "2026-01-27T19:48:13.347513Z",
+      "platform": "linux-x64"
+    },
+    "test_true_e2e_cmake_build_and_sync": {
+      "mean_ms": 42,
+      "median_ms": 42,
+      "p95_ms": 42.0,
+      "stddev_ms": 0,
+      "sample_count": 1,
+      "last_updated": "2026-01-27T19:48:13.347513Z",
+      "platform": "linux-x64"
+    },
+    "test_failopen_no_workers_configured": {
+      "mean_ms": 528,
+      "median_ms": 528,
+      "p95_ms": 528.0,
+      "stddev_ms": 0,
+      "sample_count": 1,
+      "last_updated": "2026-01-27T19:48:13.347513Z",
+      "platform": "linux-x64"
+    },
+    "test_hook_classification_complex_commands": {
+      "mean_ms": 45,
+      "median_ms": 45,
+      "p95_ms": 45.0,
+      "stddev_ms": 0,
+      "sample_count": 1,
+      "last_updated": "2026-01-27T19:48:13.347513Z",
+      "platform": "linux-x64"
+    },
+    "test_cargo_nextest_run": {
+      "mean_ms": 115,
+      "median_ms": 115,
+      "p95_ms": 115.0,
+      "stddev_ms": 0,
+      "sample_count": 1,
+      "last_updated": "2026-01-27T19:48:13.347513Z",
+      "platform": "linux-x64"
+    },
+    "test_failopen_all_workers_offline": {
+      "mean_ms": 528,
+      "median_ms": 528,
+      "p95_ms": 528.0,
+      "stddev_ms": 0,
+      "sample_count": 1,
+      "last_updated": "2026-01-27T19:48:13.347513Z",
+      "platform": "linux-x64"
+    },
+    "test_circuit_breaker_failure_detection": {
+      "mean_ms": 1,
+      "median_ms": 1,
+      "p95_ms": 1.0,
+      "stddev_ms": 0,
+      "sample_count": 1,
+      "last_updated": "2026-01-27T19:48:13.347513Z",
+      "platform": "linux-x64"
+    },
+    "test_cargo_build_incremental": {
+      "mean_ms": 22,
+      "median_ms": 22,
+      "p95_ms": 22.0,
+      "stddev_ms": 0,
+      "sample_count": 1,
+      "last_updated": "2026-01-27T19:48:13.347513Z",
+      "platform": "linux-x64"
+    },
+    "test_ssh_multiple_workers": {
+      "mean_ms": 23,
+      "median_ms": 23,
+      "p95_ms": 23.0,
+      "stddev_ms": 0,
+      "sample_count": 1,
+      "last_updated": "2026-01-27T19:48:13.347513Z",
+      "platform": "linux-x64"
+    },
+    "test_cargo_clippy_with_warnings": {
+      "mean_ms": 2,
+      "median_ms": 2,
+      "p95_ms": 2.0,
+      "stddev_ms": 0,
+      "sample_count": 1,
+      "last_updated": "2026-01-27T19:48:13.347513Z",
+      "platform": "linux-x64"
+    },
+    "test_cmd_simple_echo": {
+      "mean_ms": 1,
+      "median_ms": 1,
+      "p95_ms": 1.0,
+      "stddev_ms": 0,
+      "sample_count": 1,
+      "last_updated": "2026-01-27T19:48:13.347513Z",
+      "platform": "linux-x64"
+    },
+    "test_true_e2e_make_build_and_sync": {
+      "mean_ms": 2,
+      "median_ms": 2,
+      "p95_ms": 2.0,
+      "stddev_ms": 0,
+      "sample_count": 1,
+      "last_updated": "2026-01-27T19:48:13.347513Z",
+      "platform": "linux-x64"
+    },
+    "test_exit_code_ninja_build_success": {
+      "mean_ms": 25,
+      "median_ms": 25,
+      "p95_ms": 25.0,
+      "stddev_ms": 0,
+      "sample_count": 1,
+      "last_updated": "2026-01-27T19:48:13.347513Z",
+      "platform": "linux-x64"
+    },
+    "test_classification_accuracy": {
+      "mean_ms": 2,
+      "median_ms": 2,
+      "p95_ms": 2.0,
+      "stddev_ms": 0,
+      "sample_count": 1,
+      "last_updated": "2026-01-27T19:48:13.347513Z",
+      "platform": "linux-x64"
+    },
+    "test_exit_code_rustc_success": {
+      "mean_ms": 19,
+      "median_ms": 19,
+      "p95_ms": 19.0,
+      "stddev_ms": 0,
+      "sample_count": 1,
+      "last_updated": "2026-01-27T19:48:13.347513Z",
+      "platform": "linux-x64"
+    },
+    "test_binary_artifact_integrity": {
+      "mean_ms": 47,
+      "median_ms": 47,
+      "p95_ms": 47.0,
+      "stddev_ms": 0,
+      "sample_count": 1,
+      "last_updated": "2026-01-27T19:48:13.347513Z",
+      "platform": "linux-x64"
+    },
+    "test_cargo_build_specific_target": {
+      "mean_ms": 1,
+      "median_ms": 1,
+      "p95_ms": 1.0,
+      "stddev_ms": 0,
+      "sample_count": 1,
+      "last_updated": "2026-01-27T19:48:13.347513Z",
+      "platform": "linux-x64"
+    },
+    "test_cmd_subshell": {
+      "mean_ms": 1,
+      "median_ms": 1,
+      "p95_ms": 1.0,
+      "stddev_ms": 0,
+      "sample_count": 1,
+      "last_updated": "2026-01-27T19:48:13.347513Z",
+      "platform": "linux-x64"
+    },
+    "test_failopen_ssh_connection_refused": {
+      "mean_ms": 531,
+      "median_ms": 531,
+      "p95_ms": 531.0,
+      "stddev_ms": 0,
+      "sample_count": 1,
+      "last_updated": "2026-01-27T19:48:13.347513Z",
+      "platform": "linux-x64"
+    },
+    "test_failopen_daemon_timeout": {
+      "mean_ms": 530,
+      "median_ms": 530,
+      "p95_ms": 530.0,
+      "stddev_ms": 0,
+      "sample_count": 1,
+      "last_updated": "2026-01-27T19:48:13.347513Z",
+      "platform": "linux-x64"
+    },
+    "test_build_rs_generates_code": {
+      "mean_ms": 148,
+      "median_ms": 148,
+      "p95_ms": 148.0,
+      "stddev_ms": 0,
+      "sample_count": 1,
+      "last_updated": "2026-01-27T19:48:13.347513Z",
+      "platform": "linux-x64"
+    },
+    "test_exit_code_gcc_success": {
+      "mean_ms": 2,
+      "median_ms": 2,
+      "p95_ms": 2.0,
+      "stddev_ms": 0,
+      "sample_count": 1,
+      "last_updated": "2026-01-27T19:48:13.347513Z",
+      "platform": "linux-x64"
+    },
+    "test_failopen_hook_graceful_degradation": {
+      "mean_ms": 54,
+      "median_ms": 54,
+      "p95_ms": 54.0,
+      "stddev_ms": 0,
+      "sample_count": 1,
+      "last_updated": "2026-01-27T19:48:13.347513Z",
+      "platform": "linux-x64"
+    }
+  }
+}
