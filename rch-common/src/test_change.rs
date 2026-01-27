@@ -394,4 +394,302 @@ mod tests {
         info!("VERIFY: Nonexistent file returns error");
         info!("TEST PASS: test_nonexistent_file_error");
     }
+
+    #[test]
+    fn test_change_debug() {
+        init_test_logging();
+        info!("TEST START: test_change_debug");
+
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test.rs");
+        fs::write(&file_path, "fn main() {}\n").unwrap();
+
+        let change = TestCodeChange::for_file(&file_path).unwrap();
+        let debug = format!("{:?}", change);
+
+        assert!(debug.contains("TestCodeChange"));
+        assert!(debug.contains("RCH_TEST_"));
+
+        info!("TEST PASS: test_change_debug");
+    }
+
+    #[test]
+    fn test_change_clone() {
+        init_test_logging();
+        info!("TEST START: test_change_clone");
+
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test.rs");
+        fs::write(&file_path, "fn main() {}\n").unwrap();
+
+        let change = TestCodeChange::for_file(&file_path).unwrap();
+        let cloned = change.clone();
+
+        assert_eq!(change.change_id, cloned.change_id);
+        assert_eq!(change.file_path, cloned.file_path);
+        assert_eq!(change.original_content, cloned.original_content);
+        assert_eq!(change.modified_content, cloned.modified_content);
+
+        info!("TEST PASS: test_change_clone");
+    }
+
+    #[test]
+    fn test_for_lib_rs() {
+        init_test_logging();
+        info!("TEST START: test_for_lib_rs");
+
+        let temp_dir = TempDir::new().unwrap();
+        let src_dir = temp_dir.path().join("src");
+        fs::create_dir(&src_dir).unwrap();
+        let lib_rs = src_dir.join("lib.rs");
+        fs::write(&lib_rs, "pub fn hello() {}\n").unwrap();
+
+        let change = TestCodeChange::for_lib_rs(temp_dir.path()).unwrap();
+
+        assert_eq!(change.file_path, lib_rs);
+        assert!(change.change_id.starts_with("RCH_TEST_"));
+
+        info!("TEST PASS: test_for_lib_rs");
+    }
+
+    #[test]
+    fn test_for_lib_rs_nonexistent() {
+        init_test_logging();
+        info!("TEST START: test_for_lib_rs_nonexistent");
+
+        let temp_dir = TempDir::new().unwrap();
+        // Don't create src/lib.rs
+
+        let result = TestCodeChange::for_lib_rs(temp_dir.path());
+        assert!(result.is_err());
+
+        info!("TEST PASS: test_for_lib_rs_nonexistent");
+    }
+
+    #[test]
+    fn test_change_with_hello_world_pattern() {
+        init_test_logging();
+        info!("TEST START: test_change_with_hello_world_pattern");
+
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("main.rs");
+        let original = r#"fn main() {
+    println!("Hello, world!");
+}"#;
+        fs::write(&file_path, original).unwrap();
+
+        let change = TestCodeChange::for_file(&file_path).unwrap();
+
+        // Should replace in println, not append function
+        assert!(change.modified_content.contains("Hello, world!"));
+        assert!(change.modified_content.contains(&change.change_id));
+        assert!(!change.modified_content.contains("// RCH Self-Test Marker"));
+
+        info!("TEST PASS: test_change_with_hello_world_pattern");
+    }
+
+    #[test]
+    fn test_change_with_hello_from_test_project_pattern() {
+        init_test_logging();
+        info!("TEST START: test_change_with_hello_from_test_project_pattern");
+
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("main.rs");
+        let original = r#"fn main() {
+    println!("Hello from test project!");
+}"#;
+        fs::write(&file_path, original).unwrap();
+
+        let change = TestCodeChange::for_file(&file_path).unwrap();
+
+        // Should replace in println, not append function
+        assert!(change.modified_content.contains("Hello from test project!"));
+        assert!(change.modified_content.contains(&change.change_id));
+        assert!(!change.modified_content.contains("// RCH Self-Test Marker"));
+
+        info!("TEST PASS: test_change_with_hello_from_test_project_pattern");
+    }
+
+    #[test]
+    fn test_guard_change_id() {
+        init_test_logging();
+        info!("TEST START: test_guard_change_id");
+
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test.rs");
+        fs::write(&file_path, "fn main() {}\n").unwrap();
+
+        let change = TestCodeChange::for_file(&file_path).unwrap();
+        let expected_id = change.change_id.clone();
+        let guard = TestChangeGuard::new(change).unwrap();
+
+        assert_eq!(guard.change_id(), expected_id);
+
+        info!("TEST PASS: test_guard_change_id");
+    }
+
+    #[test]
+    fn test_guard_file_path() {
+        init_test_logging();
+        info!("TEST START: test_guard_file_path");
+
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test.rs");
+        fs::write(&file_path, "fn main() {}\n").unwrap();
+
+        let change = TestCodeChange::for_file(&file_path).unwrap();
+        let guard = TestChangeGuard::new(change).unwrap();
+
+        assert_eq!(guard.file_path(), file_path);
+
+        info!("TEST PASS: test_guard_file_path");
+    }
+
+    #[test]
+    fn test_guard_manual_revert() {
+        init_test_logging();
+        info!("TEST START: test_guard_manual_revert");
+
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test.rs");
+        let original_content = "fn main() {}\n";
+        fs::write(&file_path, original_content).unwrap();
+
+        let change = TestCodeChange::for_file(&file_path).unwrap();
+        let guard = TestChangeGuard::new(change).unwrap();
+
+        // File is modified
+        let during = fs::read_to_string(&file_path).unwrap();
+        assert!(during.contains("RCH_TEST_"));
+
+        // Manually revert
+        guard.revert().unwrap();
+
+        // File is back to original
+        let after = fs::read_to_string(&file_path).unwrap();
+        assert_eq!(after, original_content);
+
+        info!("TEST PASS: test_guard_manual_revert");
+    }
+
+    #[test]
+    fn test_change_with_empty_file() {
+        init_test_logging();
+        info!("TEST START: test_change_with_empty_file");
+
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("empty.rs");
+        fs::write(&file_path, "").unwrap();
+
+        let change = TestCodeChange::for_file(&file_path).unwrap();
+
+        // Should append marker function
+        assert!(change.modified_content.contains("// RCH Self-Test Marker"));
+        assert!(change.modified_content.contains(&change.change_id));
+        assert!(change.original_content.is_empty());
+
+        info!("TEST PASS: test_change_with_empty_file");
+    }
+
+    #[test]
+    fn test_multiple_apply_same_change() {
+        init_test_logging();
+        info!("TEST START: test_multiple_apply_same_change");
+
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test.rs");
+        fs::write(&file_path, "fn main() {}\n").unwrap();
+
+        let change = TestCodeChange::for_file(&file_path).unwrap();
+
+        // Apply twice should work (idempotent write)
+        change.apply().unwrap();
+        change.apply().unwrap();
+
+        let content = fs::read_to_string(&file_path).unwrap();
+        assert!(content.contains(&change.change_id));
+
+        info!("TEST PASS: test_multiple_apply_same_change");
+    }
+
+    #[test]
+    fn test_apply_revert_apply() {
+        init_test_logging();
+        info!("TEST START: test_apply_revert_apply");
+
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test.rs");
+        let original = "fn main() {}\n";
+        fs::write(&file_path, original).unwrap();
+
+        let change = TestCodeChange::for_file(&file_path).unwrap();
+
+        // Apply
+        change.apply().unwrap();
+        assert!(
+            fs::read_to_string(&file_path)
+                .unwrap()
+                .contains(&change.change_id)
+        );
+
+        // Revert
+        change.revert().unwrap();
+        assert_eq!(fs::read_to_string(&file_path).unwrap(), original);
+
+        // Apply again
+        change.apply().unwrap();
+        assert!(
+            fs::read_to_string(&file_path)
+                .unwrap()
+                .contains(&change.change_id)
+        );
+
+        info!("TEST PASS: test_apply_revert_apply");
+    }
+
+    #[test]
+    fn test_guard_preserves_change() {
+        init_test_logging();
+        info!("TEST START: test_guard_preserves_change");
+
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test.rs");
+        fs::write(&file_path, "fn main() {}\n").unwrap();
+
+        let change = TestCodeChange::for_file(&file_path).unwrap();
+        let original_content = change.original_content.clone();
+        let modified_content = change.modified_content.clone();
+
+        let guard = TestChangeGuard::new(change).unwrap();
+
+        // Guard should give us the same change_id as the original change
+        assert!(modified_content.contains(guard.change_id()));
+
+        drop(guard);
+
+        // After drop, file should be restored to original
+        let after = fs::read_to_string(&file_path).unwrap();
+        assert_eq!(after, original_content);
+
+        info!("TEST PASS: test_guard_preserves_change");
+    }
+
+    #[test]
+    fn test_change_id_format() {
+        init_test_logging();
+        info!("TEST START: test_change_id_format");
+
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("test.rs");
+        fs::write(&file_path, "fn main() {}\n").unwrap();
+
+        let change = TestCodeChange::for_file(&file_path).unwrap();
+
+        // Change ID should be RCH_TEST_ followed by a timestamp (number)
+        assert!(change.change_id.starts_with("RCH_TEST_"));
+        let timestamp_part = &change.change_id["RCH_TEST_".len()..];
+        assert!(timestamp_part.parse::<i64>().is_ok());
+
+        info!("TEST PASS: test_change_id_format");
+    }
 }
