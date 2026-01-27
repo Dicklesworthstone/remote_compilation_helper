@@ -128,7 +128,7 @@ export default function DashboardPage() {
 
   const status = data!;
   const successRate = status.stats.total_builds > 0
-    ? Math.round((status.stats.successful_builds / status.stats.total_builds) * 100)
+    ? Math.round((status.stats.success_count / status.stats.total_builds) * 100)
     : 100;
 
   return (

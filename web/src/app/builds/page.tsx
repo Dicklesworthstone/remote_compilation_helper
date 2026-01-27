@@ -79,7 +79,7 @@ export default function BuildsPage() {
     'status',
     () => api.getStatus(),
     {
-      refreshInterval: 2000,
+      refreshInterval: 1000,
       revalidateOnFocus: true,
     }
   );
@@ -111,9 +111,9 @@ export default function BuildsPage() {
     );
   }
 
-  const { active_builds, recent_builds, stats } = data;
+  const { active_builds, queued_builds, recent_builds, stats } = data;
   const successRate = stats.total_builds > 0
-    ? Math.round((stats.successful_builds / stats.total_builds) * 100)
+    ? Math.round((stats.success_count / stats.total_builds) * 100)
     : 100;
 
   return (
@@ -155,13 +155,13 @@ export default function BuildsPage() {
           <div className="text-sm text-muted-foreground flex items-center gap-1">
             <CheckCircle className="w-3 h-3 text-healthy" /> Successful
           </div>
-          <div className="text-2xl font-bold text-healthy">{stats.successful_builds}</div>
+          <div className="text-2xl font-bold text-healthy">{stats.success_count}</div>
         </div>
         <div className="bg-surface border border-border rounded-lg p-4">
           <div className="text-sm text-muted-foreground flex items-center gap-1">
             <XCircle className="w-3 h-3 text-error" /> Failed
           </div>
-          <div className="text-2xl font-bold text-error">{stats.failed_builds}</div>
+          <div className="text-2xl font-bold text-error">{stats.failure_count}</div>
         </div>
         <div className="bg-surface border border-border rounded-lg p-4">
           <div className="text-sm text-muted-foreground flex items-center gap-1">
@@ -201,6 +201,37 @@ export default function BuildsPage() {
         </div>
       )}
 
+      {/* Queued Builds */}
+      {queued_builds.length > 0 && (
+        <div>
+          <h2 className="text-lg font-semibold mb-3">Queued Builds</h2>
+          <div className="bg-surface border border-border rounded-lg divide-y divide-border">
+            {queued_builds.map((build) => (
+              <motion.div
+                key={build.id}
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                className="p-4 flex items-center justify-between"
+                data-testid="queued-build"
+                data-queue-id={build.id}
+              >
+                <div className="flex items-center gap-3 min-w-0">
+                  <div className="w-2 h-2 rounded-full bg-warning/70" />
+                  <div className="min-w-0">
+                    <div className="font-mono text-sm truncate">{build.project_id}</div>
+                    <div className="text-xs text-muted-foreground truncate">{build.command}</div>
+                  </div>
+                </div>
+                <div className="text-right text-sm text-muted-foreground shrink-0">
+                  <div className="font-mono">{build.wait_time}</div>
+                  <div className="text-xs">pos {build.position}</div>
+                </div>
+              </motion.div>
+            ))}
+          </div>
+        </div>
+      )}
+
       {/* Recent Builds */}
       <div>
         <h2 className="text-lg font-semibold mb-3">Recent Builds</h2>
@@ -230,7 +261,9 @@ export default function BuildsPage() {
                     data-build-id={build.id}
                   >
                     <td className="p-3 font-mono">{build.project_id}</td>
-                    <td className="p-3 text-muted-foreground">{build.worker_id}</td>
+                    <td className="p-3 text-muted-foreground">
+                      {build.worker_id ?? (build.location === 'local' ? 'local' : 'unknown')}
+                    </td>
                     <td className="p-3 font-mono">{formatDuration(build.duration_ms)}</td>
                     <td className="p-3">
                       {build.exit_code === 0 ? (
