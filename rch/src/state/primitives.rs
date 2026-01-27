@@ -17,6 +17,7 @@ use std::path::Path;
 /// - Updating something that changed
 /// - Finding no changes needed
 /// - Dry-run mode (no action taken)
+/// - Not applicable (e.g., user doesn't use this tool)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IdempotentResult {
     /// A new file/resource was created.
@@ -33,6 +34,8 @@ pub enum IdempotentResult {
     Changed,
     /// Dry-run mode: describes what would change without doing it.
     WouldChange(String),
+    /// Operation not applicable (e.g., user doesn't have the tool installed).
+    NotApplicable(String),
 }
 
 impl std::fmt::Display for IdempotentResult {
@@ -45,6 +48,7 @@ impl std::fmt::Display for IdempotentResult {
             IdempotentResult::DryRun => write!(f, "dry-run"),
             IdempotentResult::Changed => write!(f, "changed"),
             IdempotentResult::WouldChange(msg) => write!(f, "would change: {}", msg),
+            IdempotentResult::NotApplicable(msg) => write!(f, "not applicable: {}", msg),
         }
     }
 }
