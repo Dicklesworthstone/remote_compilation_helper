@@ -1319,4 +1319,188 @@ mod tests {
             assert_eq!(health.status(), WorkerStatus::Healthy);
         }
     }
+
+    // ============================================================================
+    // Additional coverage tests for WorkerHealth methods
+    // ============================================================================
+
+    #[test]
+    fn test_worker_health_last_result() {
+        let _guard = test_guard!();
+        let config = HealthConfig::default();
+        let mut health = WorkerHealth::default();
+
+        // Initially no result
+        assert!(health.last_result().is_none());
+
+        // After update, result is stored
+        let result = HealthCheckResult::success(100);
+        health.update(result, &config, "test-worker");
+
+        let last = health.last_result();
+        assert!(last.is_some());
+        assert!(last.unwrap().healthy);
+        assert_eq!(last.unwrap().response_time_ms, 100);
+    }
+
+    #[test]
+    fn test_worker_health_last_result_failure() {
+        let _guard = test_guard!();
+        let config = HealthConfig::default();
+        let mut health = WorkerHealth::default();
+
+        let result = HealthCheckResult::failure("Connection failed".to_string());
+        health.update(result, &config, "test-worker");
+
+        let last = health.last_result();
+        assert!(last.is_some());
+        assert!(!last.unwrap().healthy);
+        assert!(last.unwrap().error.is_some());
+    }
+
+    #[test]
+    fn test_worker_health_can_probe_closed() {
+        let _guard = test_guard!();
+        let config = HealthConfig::default();
+        let health = WorkerHealth::default();
+
+        // Closed circuit does NOT probe (probing is only for half-open)
+        assert!(!health.can_probe(&config));
+    }
+
+    #[test]
+    fn test_worker_health_can_probe_half_open() {
+        let _guard = test_guard!();
+        let config = HealthConfig {
+            circuit: CircuitBreakerConfig {
+                failure_threshold: 2,
+                open_cooldown_secs: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut health = WorkerHealth::default();
+
+        // Open the circuit, then transition to half-open
+        for _ in 0..2 {
+            health.update(
+                HealthCheckResult::failure("Error".to_string()),
+                &config,
+                "test-worker",
+            );
+        }
+        assert_eq!(health.circuit_state(), CircuitState::HalfOpen);
+
+        // Half-open circuit can probe (limited)
+        assert!(health.can_probe(&config));
+    }
+
+    #[test]
+    fn test_worker_health_start_probe() {
+        let _guard = test_guard!();
+        let config = HealthConfig {
+            circuit: CircuitBreakerConfig {
+                failure_threshold: 2,
+                open_cooldown_secs: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut health = WorkerHealth::default();
+
+        // Get to half-open state
+        for _ in 0..2 {
+            health.update(
+                HealthCheckResult::failure("Error".to_string()),
+                &config,
+                "test-worker",
+            );
+        }
+        assert_eq!(health.circuit_state(), CircuitState::HalfOpen);
+
+        // First probe should succeed
+        assert!(health.start_probe(&config));
+    }
+
+    #[test]
+    fn test_health_monitor_new() {
+        let _guard = test_guard!();
+        let pool = WorkerPool::new();
+        let config = HealthConfig::default();
+        let _monitor = HealthMonitor::new(pool, config);
+        // Just verify it can be created without panic
+    }
+
+    #[test]
+    fn test_health_monitor_with_status_panel() {
+        let _guard = test_guard!();
+        let pool = WorkerPool::new();
+        let config = HealthConfig::default();
+        let panel = Arc::new(Mutex::new(WorkerStatusPanel::new()));
+
+        let monitor = HealthMonitor::new(pool, config).with_status_panel(panel.clone());
+
+        // Verify panel is attached
+        assert!(monitor.status_panel.is_some());
+    }
+
+    #[test]
+    fn test_health_monitor_with_alert_manager() {
+        let _guard = test_guard!();
+        let pool = WorkerPool::new();
+        let config = HealthConfig::default();
+        let alert_manager = Arc::new(AlertManager::new(
+            crate::alerts::AlertConfig::default(),
+        ));
+
+        let monitor = HealthMonitor::new(pool, config).with_alert_manager(alert_manager.clone());
+
+        // Verify alert manager is attached
+        assert!(monitor.alert_manager.is_some());
+    }
+
+    #[test]
+    fn test_health_check_result_record_metrics() {
+        let _guard = test_guard!();
+        // Test success case - should not panic
+        let success = HealthCheckResult::success(100);
+        success.record_metrics("test-worker-1");
+
+        // Test failure case - should not panic
+        let failure = HealthCheckResult::failure("Error".to_string());
+        failure.record_metrics("test-worker-2");
+    }
+
+    #[test]
+    fn test_health_config_custom() {
+        let _guard = test_guard!();
+        let config = HealthConfig {
+            check_interval: Duration::from_secs(60),
+            check_timeout: Duration::from_secs(5),
+            degraded_threshold_ms: 3000,
+            failure_threshold: 5,
+            circuit: CircuitBreakerConfig {
+                failure_threshold: 10,
+                ..Default::default()
+            },
+        };
+
+        assert_eq!(config.check_interval, Duration::from_secs(60));
+        assert_eq!(config.check_timeout, Duration::from_secs(5));
+        assert_eq!(config.degraded_threshold_ms, 3000);
+        assert_eq!(config.failure_threshold, 5);
+        assert_eq!(config.circuit.failure_threshold, 10);
+    }
+
+    #[test]
+    fn test_health_check_result_checked_at() {
+        let _guard = test_guard!();
+        let before = Instant::now();
+        let result = HealthCheckResult::success(50);
+        let after = Instant::now();
+
+        // checked_at should be between before and after
+        assert!(result.checked_at >= before);
+        assert!(result.checked_at <= after);
+    }
 }
