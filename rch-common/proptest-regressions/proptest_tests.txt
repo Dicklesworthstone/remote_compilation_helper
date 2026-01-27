@@ -8,3 +8,5 @@ cc b15a043f403f7793359e5315ad1188951ef0dfd2e5d654ce8e2044d845223bef # shrinks to
 cc 80a953dd36c039810127d5559459bc04846d1ec541e440c769f1e9685ed3c0dc # shrinks to command = "ஒ𜰀⁴𑜀AAퟋ0 A00a\u{11c38} 𑘀΄a𝟎🤀 0𑻠"
 cc 98a32a73cb0fd6327a503ecc3d28d44fd7b218a3fe8ff2bbf542f3c247efc220 # shrinks to content = "𐀀  ࠀ¡𐀀A0𐀀¡  𐀀0A ¡ 000𐀀𐀀\u{80}ࠀ"
 cc b7e2f77aa18252ea1cb22e0f4da75b428639f3dd7f80e1ffec6c0c75ee0e5dd3 # shrinks to path = "~//"
+cc d815a3220091e7bf85bb95f5c812112d7b69bdce5d3126c718354853cfc87867 # shrinks to key = "a_", injection = "'; rm -rf /; echo '"
+cc 20a52e7ce51606bc05a54c37209732de8625f9eb9a788f695e5fdf6117388e5b # shrinks to key = "_A", value = " `"
