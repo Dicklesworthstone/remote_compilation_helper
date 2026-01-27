@@ -32,6 +32,30 @@ pub struct ActiveBuildState {
     pub location: BuildLocation,
 }
 
+/// Queued build state for builds waiting for available workers.
+///
+/// When all workers are busy and `queue_when_busy` is enabled,
+/// builds are queued here instead of falling back to local execution.
+#[derive(Debug, Clone)]
+pub struct QueuedBuildState {
+    /// Queue position ID (monotonically increasing).
+    pub id: u64,
+    /// Project identifier (hash or path).
+    pub project_id: String,
+    /// Command to execute.
+    pub command: String,
+    /// When the build was queued (ISO 8601).
+    pub queued_at: String,
+    /// Monotonic timestamp for duration calculations.
+    pub queued_at_mono: Instant,
+    /// Hook process ID (for cancellation).
+    pub hook_pid: u32,
+    /// Number of slots needed.
+    pub slots_needed: u32,
+    /// Estimated start time (ISO 8601), updated as queue advances.
+    pub estimated_start: Option<String>,
+}
+
 /// Build history manager.
 ///
 /// Thread-safe ring buffer of recent builds with optional persistence.
@@ -40,13 +64,22 @@ pub struct BuildHistory {
     records: RwLock<VecDeque<BuildRecord>>,
     /// Active builds (in-flight).
     active: RwLock<HashMap<u64, ActiveBuildState>>,
-    /// Maximum capacity.
+    /// Queued builds (waiting for workers).
+    queued: RwLock<VecDeque<QueuedBuildState>>,
+    /// Maximum capacity for history.
     capacity: usize,
+    /// Maximum queue depth (0 = unlimited).
+    max_queue_depth: usize,
     /// Next build ID.
     next_id: AtomicU64,
+    /// Next queue ID.
+    next_queue_id: AtomicU64,
     /// Persistence path (optional).
     persistence_path: Option<PathBuf>,
 }
+
+/// Default maximum queue depth.
+const DEFAULT_MAX_QUEUE_DEPTH: usize = 100;
 
 impl BuildHistory {
     /// Create a new build history with the given capacity.
@@ -54,8 +87,11 @@ impl BuildHistory {
         Self {
             records: RwLock::new(VecDeque::with_capacity(capacity)),
             active: RwLock::new(HashMap::new()),
+            queued: RwLock::new(VecDeque::new()),
             capacity,
+            max_queue_depth: DEFAULT_MAX_QUEUE_DEPTH,
             next_id: AtomicU64::new(1),
+            next_queue_id: AtomicU64::new(1),
             persistence_path: None,
         }
     }
@@ -63,6 +99,12 @@ impl BuildHistory {
     /// Create a new build history with default capacity.
     pub fn with_default_capacity() -> Self {
         Self::new(DEFAULT_CAPACITY)
+    }
+
+    /// Set the maximum queue depth.
+    pub fn with_max_queue_depth(mut self, depth: usize) -> Self {
+        self.max_queue_depth = depth;
+        self
     }
 
     /// Enable persistence to the given path.
@@ -217,6 +259,155 @@ impl BuildHistory {
         self.active.read().unwrap().values().cloned().collect()
     }
 
+    // =========================================================================
+    // Queue Management
+    // =========================================================================
+
+    /// Get the next queue ID.
+    pub fn next_queue_id(&self) -> u64 {
+        self.next_queue_id.fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// Enqueue a build waiting for an available worker.
+    ///
+    /// Returns `None` if the queue is full (when max_queue_depth > 0).
+    pub fn enqueue_build(
+        &self,
+        project_id: String,
+        command: String,
+        hook_pid: u32,
+        slots_needed: u32,
+    ) -> Option<QueuedBuildState> {
+        let mut queue = self.queued.write().unwrap();
+
+        // Check queue depth limit
+        if self.max_queue_depth > 0 && queue.len() >= self.max_queue_depth {
+            debug!(
+                "Queue full ({}/{}), rejecting build for {}",
+                queue.len(),
+                self.max_queue_depth,
+                project_id
+            );
+            return None;
+        }
+
+        let id = self.next_queue_id();
+        let queued_at = Utc::now().to_rfc3339();
+        let state = QueuedBuildState {
+            id,
+            project_id,
+            command,
+            queued_at,
+            queued_at_mono: Instant::now(),
+            hook_pid,
+            slots_needed,
+            estimated_start: None,
+        };
+
+        queue.push_back(state.clone());
+        debug!(
+            "Build queued: id={}, position={}, project={}",
+            id,
+            queue.len(),
+            state.project_id
+        );
+
+        Some(state)
+    }
+
+    /// Dequeue the next build (FIFO).
+    ///
+    /// Called when a worker becomes available.
+    pub fn dequeue_build(&self) -> Option<QueuedBuildState> {
+        let mut queue = self.queued.write().unwrap();
+        let state = queue.pop_front()?;
+        debug!(
+            "Build dequeued: id={}, waited {:?}, project={}",
+            state.id,
+            state.queued_at_mono.elapsed(),
+            state.project_id
+        );
+        Some(state)
+    }
+
+    /// Remove a specific queued build by ID (e.g., for cancellation).
+    pub fn remove_queued_build(&self, queue_id: u64) -> Option<QueuedBuildState> {
+        let mut queue = self.queued.write().unwrap();
+        let pos = queue.iter().position(|b| b.id == queue_id)?;
+        queue.remove(pos)
+    }
+
+    /// Remove a queued build by hook PID.
+    pub fn remove_queued_build_by_pid(&self, hook_pid: u32) -> Option<QueuedBuildState> {
+        let mut queue = self.queued.write().unwrap();
+        let pos = queue.iter().position(|b| b.hook_pid == hook_pid)?;
+        queue.remove(pos)
+    }
+
+    /// Get all queued builds (in queue order).
+    pub fn queued_builds(&self) -> Vec<QueuedBuildState> {
+        self.queued.read().unwrap().iter().cloned().collect()
+    }
+
+    /// Get a specific queued build by ID.
+    pub fn queued_build(&self, queue_id: u64) -> Option<QueuedBuildState> {
+        self.queued
+            .read()
+            .unwrap()
+            .iter()
+            .find(|b| b.id == queue_id)
+            .cloned()
+    }
+
+    /// Get the queue position of a build (1-indexed, None if not found).
+    pub fn queue_position(&self, queue_id: u64) -> Option<usize> {
+        self.queued
+            .read()
+            .unwrap()
+            .iter()
+            .position(|b| b.id == queue_id)
+            .map(|p| p + 1)
+    }
+
+    /// Get the current queue depth.
+    pub fn queue_depth(&self) -> usize {
+        self.queued.read().unwrap().len()
+    }
+
+    /// Check if the queue is empty.
+    pub fn queue_is_empty(&self) -> bool {
+        self.queued.read().unwrap().is_empty()
+    }
+
+    /// Update estimated start times for all queued builds.
+    ///
+    /// Uses average build duration from history and active build state.
+    pub fn update_queue_estimates(&self) {
+        let avg_duration = self.stats().avg_duration_ms;
+        let active_count = self.active.read().unwrap().len();
+
+        let mut queue = self.queued.write().unwrap();
+
+        // Estimate when each queued build will start
+        let now = Utc::now();
+        for (i, build) in queue.iter_mut().enumerate() {
+            // Simple estimate: position * avg_duration, adjusted for active builds
+            let position = i + 1;
+            let wait_ms = if active_count > 0 {
+                // Assume active builds are half-done on average
+                let remaining_active_ms = (avg_duration / 2) as i64;
+                let queue_wait_ms = (position as u64 * avg_duration) as i64;
+                remaining_active_ms + queue_wait_ms
+            } else {
+                0 // No active builds, next in queue starts immediately
+            };
+
+            let estimated =
+                now + chrono::Duration::milliseconds(wait_ms.max(0));
+            build.estimated_start = Some(estimated.to_rfc3339());
+        }
+    }
+
     /// Get recent builds (most recent first).
     pub fn recent(&self, limit: usize) -> Vec<BuildRecord> {
         let records = self.records.read().unwrap();
@@ -330,8 +521,11 @@ impl BuildHistory {
         Ok(Self {
             records: RwLock::new(records),
             active: RwLock::new(HashMap::new()),
+            queued: RwLock::new(VecDeque::new()),
             capacity,
+            max_queue_depth: DEFAULT_MAX_QUEUE_DEPTH,
             next_id: AtomicU64::new(max_id + 1),
+            next_queue_id: AtomicU64::new(1),
             persistence_path: Some(path.to_path_buf()),
         })
     }
@@ -647,5 +841,159 @@ mod tests {
 
         assert_eq!(history.len(), 0);
         assert!(history.is_empty());
+    }
+
+    // =========================================================================
+    // Queue Tests
+    // =========================================================================
+
+    #[test]
+    fn test_enqueue_dequeue_fifo() {
+        let history = BuildHistory::new(10);
+
+        // Enqueue three builds
+        let b1 = history
+            .enqueue_build("proj-a".into(), "cargo build".into(), 1001, 4)
+            .unwrap();
+        let b2 = history
+            .enqueue_build("proj-b".into(), "cargo test".into(), 1002, 8)
+            .unwrap();
+        let b3 = history
+            .enqueue_build("proj-c".into(), "cargo check".into(), 1003, 2)
+            .unwrap();
+
+        assert_eq!(history.queue_depth(), 3);
+
+        // Dequeue in FIFO order
+        let d1 = history.dequeue_build().unwrap();
+        assert_eq!(d1.id, b1.id);
+        assert_eq!(d1.project_id, "proj-a");
+
+        let d2 = history.dequeue_build().unwrap();
+        assert_eq!(d2.id, b2.id);
+
+        let d3 = history.dequeue_build().unwrap();
+        assert_eq!(d3.id, b3.id);
+
+        assert!(history.queue_is_empty());
+        assert!(history.dequeue_build().is_none());
+    }
+
+    #[test]
+    fn test_queue_depth_limit() {
+        let history = BuildHistory::new(10).with_max_queue_depth(2);
+
+        // First two should succeed
+        assert!(history
+            .enqueue_build("proj-a".into(), "build".into(), 1, 4)
+            .is_some());
+        assert!(history
+            .enqueue_build("proj-b".into(), "build".into(), 2, 4)
+            .is_some());
+
+        // Third should fail
+        assert!(history
+            .enqueue_build("proj-c".into(), "build".into(), 3, 4)
+            .is_none());
+
+        // Dequeue one, then third should succeed
+        history.dequeue_build();
+        assert!(history
+            .enqueue_build("proj-c".into(), "build".into(), 3, 4)
+            .is_some());
+    }
+
+    #[test]
+    fn test_queue_position() {
+        let history = BuildHistory::new(10);
+
+        let b1 = history
+            .enqueue_build("proj-a".into(), "build".into(), 1, 4)
+            .unwrap();
+        let b2 = history
+            .enqueue_build("proj-b".into(), "build".into(), 2, 4)
+            .unwrap();
+        let b3 = history
+            .enqueue_build("proj-c".into(), "build".into(), 3, 4)
+            .unwrap();
+
+        // Positions are 1-indexed
+        assert_eq!(history.queue_position(b1.id), Some(1));
+        assert_eq!(history.queue_position(b2.id), Some(2));
+        assert_eq!(history.queue_position(b3.id), Some(3));
+        assert_eq!(history.queue_position(999), None);
+    }
+
+    #[test]
+    fn test_remove_queued_build() {
+        let history = BuildHistory::new(10);
+
+        let b1 = history
+            .enqueue_build("proj-a".into(), "build".into(), 1001, 4)
+            .unwrap();
+        let b2 = history
+            .enqueue_build("proj-b".into(), "build".into(), 1002, 4)
+            .unwrap();
+        let b3 = history
+            .enqueue_build("proj-c".into(), "build".into(), 1003, 4)
+            .unwrap();
+
+        // Remove middle build by ID
+        let removed = history.remove_queued_build(b2.id).unwrap();
+        assert_eq!(removed.project_id, "proj-b");
+        assert_eq!(history.queue_depth(), 2);
+
+        // Remove by PID
+        let removed = history.remove_queued_build_by_pid(1003).unwrap();
+        assert_eq!(removed.id, b3.id);
+        assert_eq!(history.queue_depth(), 1);
+
+        // Only b1 remains
+        let d = history.dequeue_build().unwrap();
+        assert_eq!(d.id, b1.id);
+    }
+
+    #[test]
+    fn test_queued_builds_list() {
+        let history = BuildHistory::new(10);
+
+        history.enqueue_build("proj-a".into(), "build".into(), 1, 4);
+        history.enqueue_build("proj-b".into(), "test".into(), 2, 8);
+
+        let queued = history.queued_builds();
+        assert_eq!(queued.len(), 2);
+        assert_eq!(queued[0].project_id, "proj-a");
+        assert_eq!(queued[1].project_id, "proj-b");
+    }
+
+    #[test]
+    fn test_queued_build_lookup() {
+        let history = BuildHistory::new(10);
+
+        let b = history
+            .enqueue_build("proj-a".into(), "cargo build".into(), 1001, 4)
+            .unwrap();
+
+        let found = history.queued_build(b.id).unwrap();
+        assert_eq!(found.command, "cargo build");
+        assert_eq!(found.hook_pid, 1001);
+        assert_eq!(found.slots_needed, 4);
+
+        assert!(history.queued_build(999).is_none());
+    }
+
+    #[test]
+    fn test_queue_unlimited_depth() {
+        // max_queue_depth = 0 means unlimited
+        let history = BuildHistory::new(10).with_max_queue_depth(0);
+
+        // Should be able to enqueue many
+        for i in 0..1000 {
+            assert!(history
+                .enqueue_build(format!("proj-{}", i), "build".into(), i, 4)
+                .is_some());
+        }
+
+        assert_eq!(history.queue_depth(), 1000);
     }
 }
