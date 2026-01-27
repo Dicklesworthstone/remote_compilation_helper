@@ -1067,4 +1067,431 @@ mod tests {
         let result = client.execute("cargo build").await.unwrap();
         assert_eq!(result.exit_code, 0);
     }
+
+    #[test]
+    fn test_is_mock_host() {
+        assert!(is_mock_host("mock://localhost"));
+        assert!(is_mock_host("mock://worker-1"));
+        assert!(!is_mock_host("localhost"));
+        assert!(!is_mock_host("192.168.1.1"));
+        assert!(!is_mock_host(""));
+    }
+
+    #[test]
+    fn test_is_mock_worker() {
+        let mock_worker = WorkerConfig {
+            id: WorkerId::new("mock-worker"),
+            host: "mock://localhost".to_string(),
+            user: "user".to_string(),
+            identity_file: "~/.ssh/id_rsa".to_string(),
+            total_slots: 4,
+            priority: 100,
+            tags: vec![],
+        };
+        assert!(is_mock_worker(&mock_worker));
+
+        let real_worker = WorkerConfig {
+            id: WorkerId::new("real-worker"),
+            host: "192.168.1.1".to_string(),
+            user: "user".to_string(),
+            identity_file: "~/.ssh/id_rsa".to_string(),
+            total_slots: 4,
+            priority: 100,
+            tags: vec![],
+        };
+        assert!(!is_mock_worker(&real_worker));
+    }
+
+    #[test]
+    fn test_mock_config_success() {
+        let config = MockConfig::success();
+        assert_eq!(config.default_exit_code, 0);
+        assert!(!config.fail_connect);
+        assert!(!config.fail_execute);
+        assert!(config.default_stdout.is_empty());
+        assert!(config.default_stderr.is_empty());
+    }
+
+    #[test]
+    fn test_mock_config_with_command_result() {
+        let custom_result = CommandResult {
+            exit_code: 42,
+            stdout: "custom stdout".to_string(),
+            stderr: "custom stderr".to_string(),
+            duration_ms: 100,
+        };
+
+        let config = MockConfig::success().with_command_result("special_cmd", custom_result.clone());
+
+        assert!(config.command_results.contains_key("special_cmd"));
+        let result = config.command_results.get("special_cmd").unwrap();
+        assert_eq!(result.exit_code, 42);
+        assert_eq!(result.stdout, "custom stdout");
+    }
+
+    #[test]
+    fn test_mock_config_with_stdout() {
+        let config = MockConfig::default().with_stdout("hello world");
+        assert_eq!(config.default_stdout, "hello world");
+    }
+
+    #[test]
+    fn test_mock_rsync_config_success() {
+        let config = MockRsyncConfig::success();
+        assert!(!config.fail_sync);
+        assert!(!config.fail_artifacts);
+        assert_eq!(config.files_per_sync, 10);
+        assert_eq!(config.bytes_per_sync, 1024 * 100);
+    }
+
+    #[test]
+    fn test_mock_rsync_config_default() {
+        let config = MockRsyncConfig::default();
+        assert!(!config.fail_sync);
+        assert!(!config.fail_artifacts);
+        assert_eq!(config.fail_sync_attempts, 0);
+        assert_eq!(config.fail_artifacts_attempts, 0);
+    }
+
+    #[test]
+    fn test_mock_rsync_config_artifact_failure() {
+        let config = MockRsyncConfig::artifact_failure();
+        assert!(config.fail_artifacts);
+        assert!(!config.fail_sync);
+    }
+
+    #[tokio::test]
+    async fn test_mock_rsync_retrieve_artifacts() {
+        let rsync = MockRsync::new_default();
+
+        let result = rsync
+            .retrieve_artifacts("user@host:/remote/path", "/local/path", &[])
+            .await
+            .unwrap();
+
+        assert!(result.files_transferred > 0);
+        assert!(result.bytes_transferred > 0);
+
+        let invocations = rsync.invocations();
+        assert_eq!(invocations.len(), 1);
+        assert_eq!(invocations[0].phase, Phase::Artifacts);
+    }
+
+    #[tokio::test]
+    async fn test_mock_rsync_artifact_failure() {
+        let rsync = MockRsync::new(MockRsyncConfig::artifact_failure());
+
+        let result = rsync
+            .retrieve_artifacts("user@host:/remote/path", "/local/path", &[])
+            .await;
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_phase_equality() {
+        assert_eq!(Phase::Sync, Phase::Sync);
+        assert_eq!(Phase::Execute, Phase::Execute);
+        assert_ne!(Phase::Sync, Phase::Execute);
+        assert_ne!(Phase::Artifacts, Phase::Connect);
+    }
+
+    #[test]
+    fn test_phase_copy() {
+        let phase = Phase::Disconnect;
+        let copy = phase; // Copy trait
+        assert_eq!(phase, copy);
+    }
+
+    #[test]
+    fn test_phase_clone() {
+        let phase = Phase::Connect;
+        let cloned = phase.clone();
+        assert_eq!(phase, cloned);
+    }
+
+    #[test]
+    fn test_phase_display_all_variants() {
+        assert_eq!(format!("{}", Phase::Sync), "SYNC");
+        assert_eq!(format!("{}", Phase::Execute), "EXEC");
+        assert_eq!(format!("{}", Phase::Artifacts), "ARTIFACTS");
+        assert_eq!(format!("{}", Phase::Connect), "CONNECT");
+        assert_eq!(format!("{}", Phase::Disconnect), "DISCONNECT");
+    }
+
+    #[test]
+    fn test_mock_invocation_debug() {
+        let invocation = MockInvocation {
+            worker_id: WorkerId::new("test-worker"),
+            command: Some("echo hello".to_string()),
+            phase: Phase::Execute,
+            timestamp: std::time::SystemTime::now(),
+        };
+
+        let debug = format!("{:?}", invocation);
+        assert!(debug.contains("MockInvocation"));
+        assert!(debug.contains("test-worker"));
+    }
+
+    #[test]
+    fn test_mock_invocation_clone() {
+        let invocation = MockInvocation {
+            worker_id: WorkerId::new("worker-1"),
+            command: None,
+            phase: Phase::Connect,
+            timestamp: std::time::SystemTime::now(),
+        };
+
+        let cloned = invocation.clone();
+        assert_eq!(invocation.phase, cloned.phase);
+    }
+
+    #[test]
+    fn test_mock_sync_invocation_debug() {
+        let invocation = MockSyncInvocation {
+            source: "/local/path".to_string(),
+            destination: "user@host:/remote".to_string(),
+            phase: Phase::Sync,
+            timestamp: std::time::SystemTime::now(),
+        };
+
+        let debug = format!("{:?}", invocation);
+        assert!(debug.contains("MockSyncInvocation"));
+        assert!(debug.contains("/local/path"));
+    }
+
+    #[test]
+    fn test_mock_sync_invocation_clone() {
+        let invocation = MockSyncInvocation {
+            source: "src".to_string(),
+            destination: "dst".to_string(),
+            phase: Phase::Artifacts,
+            timestamp: std::time::SystemTime::now(),
+        };
+
+        let cloned = invocation.clone();
+        assert_eq!(invocation.source, cloned.source);
+        assert_eq!(invocation.destination, cloned.destination);
+        assert_eq!(invocation.phase, cloned.phase);
+    }
+
+    #[test]
+    fn test_mock_rsync_result_debug() {
+        let result = MockRsyncResult {
+            files_transferred: 5,
+            bytes_transferred: 1024,
+            duration_ms: 50,
+        };
+
+        let debug = format!("{:?}", result);
+        assert!(debug.contains("MockRsyncResult"));
+        assert!(debug.contains("1024"));
+    }
+
+    #[test]
+    fn test_mock_rsync_result_clone() {
+        let result = MockRsyncResult {
+            files_transferred: 10,
+            bytes_transferred: 2048,
+            duration_ms: 100,
+        };
+
+        let cloned = result.clone();
+        assert_eq!(result.files_transferred, cloned.files_transferred);
+        assert_eq!(result.bytes_transferred, cloned.bytes_transferred);
+        assert_eq!(result.duration_ms, cloned.duration_ms);
+    }
+
+    #[test]
+    fn test_global_invocations_clear() {
+        // Clear any existing invocations
+        clear_global_invocations();
+
+        let ssh = global_ssh_invocations_snapshot();
+        let rsync = global_rsync_invocations_snapshot();
+
+        assert!(ssh.is_empty());
+        assert!(rsync.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_mock_ssh_client_execute_not_connected() {
+        let worker_config = WorkerConfig {
+            id: WorkerId::new("mock-worker"),
+            host: "mock.host".to_string(),
+            user: "mockuser".to_string(),
+            identity_file: "~/.ssh/mock".to_string(),
+            total_slots: 8,
+            priority: 100,
+            tags: vec![],
+        };
+
+        let client = MockSshClient::new_default(worker_config);
+        // Don't call connect()
+
+        let result = client.execute("echo test").await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("Not connected"));
+    }
+
+    #[tokio::test]
+    async fn test_mock_ssh_client_streaming() {
+        let worker_config = WorkerConfig {
+            id: WorkerId::new("mock-worker"),
+            host: "mock.host".to_string(),
+            user: "mockuser".to_string(),
+            identity_file: "~/.ssh/mock".to_string(),
+            total_slots: 8,
+            priority: 100,
+            tags: vec![],
+        };
+
+        let mut client = MockSshClient::new(
+            worker_config,
+            MockConfig::default().with_stdout("line1\nline2\nline3"),
+        );
+        client.connect().await.unwrap();
+
+        let mut stdout_lines = Vec::new();
+        let mut stderr_lines = Vec::new();
+
+        let result = client
+            .execute_streaming(
+                "echo test",
+                |line| stdout_lines.push(line.to_string()),
+                |line| stderr_lines.push(line.to_string()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(stdout_lines.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_mock_ssh_client_health_check_success() {
+        let worker_config = WorkerConfig {
+            id: WorkerId::new("mock-worker"),
+            host: "mock.host".to_string(),
+            user: "mockuser".to_string(),
+            identity_file: "~/.ssh/mock".to_string(),
+            total_slots: 8,
+            priority: 100,
+            tags: vec![],
+        };
+
+        let mut client = MockSshClient::new_default(worker_config);
+        client.connect().await.unwrap();
+
+        let healthy = client.health_check().await.unwrap();
+        assert!(healthy);
+    }
+
+    #[tokio::test]
+    async fn test_mock_ssh_client_health_check_failure() {
+        let worker_config = WorkerConfig {
+            id: WorkerId::new("mock-worker"),
+            host: "mock.host".to_string(),
+            user: "mockuser".to_string(),
+            identity_file: "~/.ssh/mock".to_string(),
+            total_slots: 8,
+            priority: 100,
+            tags: vec![],
+        };
+
+        let mut client = MockSshClient::new(
+            worker_config,
+            MockConfig::command_failure(1, "health check failed"),
+        );
+        client.connect().await.unwrap();
+
+        let healthy = client.health_check().await.unwrap();
+        assert!(!healthy);
+    }
+
+    #[test]
+    fn test_mock_ssh_client_worker_id() {
+        let worker_config = WorkerConfig {
+            id: WorkerId::new("my-worker-id"),
+            host: "mock.host".to_string(),
+            user: "mockuser".to_string(),
+            identity_file: "~/.ssh/mock".to_string(),
+            total_slots: 8,
+            priority: 100,
+            tags: vec![],
+        };
+
+        let client = MockSshClient::new_default(worker_config);
+        assert_eq!(client.worker_id().as_str(), "my-worker-id");
+    }
+
+    #[test]
+    fn test_mock_ssh_client_clear_invocations() {
+        let worker_config = WorkerConfig {
+            id: WorkerId::new("mock-worker"),
+            host: "mock.host".to_string(),
+            user: "mockuser".to_string(),
+            identity_file: "~/.ssh/mock".to_string(),
+            total_slots: 8,
+            priority: 100,
+            tags: vec![],
+        };
+
+        let client = MockSshClient::new_default(worker_config);
+        // Invocations would be empty initially
+        assert!(client.invocations().is_empty());
+        client.clear_invocations();
+        assert!(client.invocations().is_empty());
+    }
+
+    #[test]
+    fn test_mock_config_clone() {
+        let config = MockConfig::default()
+            .with_stdout("test")
+            .with_command_result(
+                "cmd",
+                CommandResult {
+                    exit_code: 0,
+                    stdout: "out".to_string(),
+                    stderr: "err".to_string(),
+                    duration_ms: 10,
+                },
+            );
+
+        let cloned = config.clone();
+        assert_eq!(config.default_stdout, cloned.default_stdout);
+        assert_eq!(config.command_results.len(), cloned.command_results.len());
+    }
+
+    #[test]
+    fn test_mock_config_debug() {
+        let config = MockConfig::default();
+        let debug = format!("{:?}", config);
+        assert!(debug.contains("MockConfig"));
+    }
+
+    #[test]
+    fn test_mock_rsync_config_debug() {
+        let config = MockRsyncConfig::default();
+        let debug = format!("{:?}", config);
+        assert!(debug.contains("MockRsyncConfig"));
+    }
+
+    #[test]
+    fn test_mock_rsync_config_clone() {
+        let config = MockRsyncConfig {
+            fail_sync: true,
+            fail_sync_attempts: 3,
+            fail_artifacts: false,
+            fail_artifacts_attempts: 0,
+            files_per_sync: 20,
+            bytes_per_sync: 5000,
+        };
+
+        let cloned = config.clone();
+        assert_eq!(config.fail_sync, cloned.fail_sync);
+        assert_eq!(config.fail_sync_attempts, cloned.fail_sync_attempts);
+        assert_eq!(config.files_per_sync, cloned.files_per_sync);
+    }
 }
