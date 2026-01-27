@@ -535,9 +535,10 @@ async fn run_app(
 mod tests {
     use super::*;
     use crate::status_types::{
-        ActiveBuildFromApi, BuildRecordFromApi, BuildStatsFromApi, DaemonFullStatusResponse,
-        DaemonInfoFromApi, IssueFromApi, WorkerStatusFromApi,
+        ActiveBuildFromApi, BuildRecordFromApi, BuildStatsFromApi, DaemonInfoFromApi, IssueFromApi,
+        WorkerStatusFromApi,
     };
+    use rch_common::test_guard;
     use tracing::info;
 
     fn init_test_logging() {
@@ -632,6 +633,7 @@ mod tests {
 
     #[test]
     fn test_tui_config_default() {
+        let _guard = test_guard!();
         init_test_logging();
         info!("TEST START: test_tui_config_default");
         let config = TuiConfig::default();
@@ -654,6 +656,7 @@ mod tests {
 
     #[test]
     fn test_dump_state_json_mock_data_has_expected_shape() {
+        let _guard = test_guard!();
         init_test_logging();
         info!("TEST START: test_dump_state_json_mock_data_has_expected_shape");
         let mut state = TuiState::new();
@@ -669,6 +672,7 @@ mod tests {
 
     #[test]
     fn test_render_snapshot_contains_header() {
+        let _guard = test_guard!();
         init_test_logging();
         info!("TEST START: test_render_snapshot_contains_header");
         let mut state = TuiState::new();
@@ -681,6 +685,7 @@ mod tests {
 
     #[test]
     fn test_update_state_sets_daemon_running() {
+        let _guard = test_guard!();
         init_test_logging();
         info!("TEST START: test_update_state_sets_daemon_running");
         let response = make_response(vec![], vec![], vec![]);
@@ -697,6 +702,7 @@ mod tests {
 
     #[test]
     fn test_update_state_worker_status_mapping() {
+        let _guard = test_guard!();
         init_test_logging();
         info!("TEST START: test_update_state_worker_status_mapping");
         let workers = vec![
@@ -719,6 +725,7 @@ mod tests {
 
     #[test]
     fn test_update_state_circuit_mapping() {
+        let _guard = test_guard!();
         init_test_logging();
         info!("TEST START: test_update_state_circuit_mapping");
         let workers = vec![
@@ -739,6 +746,7 @@ mod tests {
 
     #[test]
     fn test_update_state_active_builds_mapping() {
+        let _guard = test_guard!();
         init_test_logging();
         info!("TEST START: test_update_state_active_builds_mapping");
         let active = vec![active_build(1, "worker-1", "cargo build --release")];
@@ -758,6 +766,7 @@ mod tests {
 
     #[test]
     fn test_update_state_build_history_limit() {
+        let _guard = test_guard!();
         init_test_logging();
         info!("TEST START: test_update_state_build_history_limit");
         let mut history = Vec::new();
@@ -774,6 +783,7 @@ mod tests {
 
     #[test]
     fn test_update_state_build_history_success_flag() {
+        let _guard = test_guard!();
         init_test_logging();
         info!("TEST START: test_update_state_build_history_success_flag");
         let history = vec![
@@ -791,6 +801,7 @@ mod tests {
 
     #[test]
     fn test_update_state_daemon_socket_path() {
+        let _guard = test_guard!();
         init_test_logging();
         info!("TEST START: test_update_state_daemon_socket_path");
         let response = make_response(vec![], vec![], vec![]);

@@ -112,7 +112,8 @@ impl Drop for OtelGuard {
 
 #[cfg(test)]
 mod tests {
-        use rch_common::test_guard;
+    use super::*;
+    use rch_common::test_guard;
 
     #[test]
     fn test_otel_config_default() {

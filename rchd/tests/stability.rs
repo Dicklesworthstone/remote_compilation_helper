@@ -39,6 +39,7 @@ fn send_request(socket_path: &Path, request: &str) -> std::io::Result<String> {
 
 #[test]
 fn test_daemon_startup_shutdown_cycles() -> HarnessResult<()> {
+    let _guard = rch_common::test_guard!();
     let harness = TestHarnessBuilder::new("daemon_stability_cycles")
         .cleanup_on_success(true)
         .cleanup_on_failure(false)
@@ -82,6 +83,7 @@ total_slots = 4
 
 #[test]
 fn test_daemon_request_burst() -> HarnessResult<()> {
+    let _guard = rch_common::test_guard!();
     let harness = TestHarnessBuilder::new("daemon_stability_burst")
         .cleanup_on_success(true)
         .cleanup_on_failure(false)

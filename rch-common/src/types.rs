@@ -2431,14 +2431,17 @@ impl Default for MetricsAggregator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_guard;
 
     #[test]
     fn test_circuit_state_default() {
+        let _guard = test_guard!();
         assert_eq!(CircuitState::default(), CircuitState::Closed);
     }
 
     #[test]
     fn test_circuit_config_defaults() {
+        let _guard = test_guard!();
         let config = CircuitBreakerConfig::default();
         assert_eq!(config.failure_threshold, 3);
         assert_eq!(config.success_threshold, 2);
@@ -2450,12 +2453,14 @@ mod tests {
 
     #[test]
     fn test_rch_config_has_circuit_defaults() {
+        let _guard = test_guard!();
         let config = RchConfig::default();
         assert_eq!(config.circuit.failure_threshold, 3);
     }
 
     #[test]
     fn test_circuit_config_serde_roundtrip() {
+        let _guard = test_guard!();
         let config = CircuitBreakerConfig {
             failure_threshold: 5,
             success_threshold: 3,
@@ -2480,6 +2485,7 @@ mod tests {
 
     #[test]
     fn test_worker_capabilities_default() {
+        let _guard = test_guard!();
         let caps = WorkerCapabilities::default();
         assert!(caps.rustc_version.is_none());
         assert!(caps.bun_version.is_none());
@@ -2489,6 +2495,7 @@ mod tests {
 
     #[test]
     fn test_worker_capabilities_new() {
+        let _guard = test_guard!();
         let caps = WorkerCapabilities::new();
         assert!(caps.rustc_version.is_none());
         assert!(!caps.has_rust());
@@ -2498,6 +2505,7 @@ mod tests {
 
     #[test]
     fn test_worker_capabilities_has_rust() {
+        let _guard = test_guard!();
         let mut caps = WorkerCapabilities::new();
         assert!(!caps.has_rust());
 
@@ -2507,6 +2515,7 @@ mod tests {
 
     #[test]
     fn test_worker_capabilities_has_bun() {
+        let _guard = test_guard!();
         let mut caps = WorkerCapabilities::new();
         assert!(!caps.has_bun());
 
@@ -2516,6 +2525,7 @@ mod tests {
 
     #[test]
     fn test_worker_capabilities_has_node() {
+        let _guard = test_guard!();
         let mut caps = WorkerCapabilities::new();
         assert!(!caps.has_node());
 
@@ -2525,6 +2535,7 @@ mod tests {
 
     #[test]
     fn test_worker_capabilities_multiple_runtimes() {
+        let _guard = test_guard!();
         let caps = WorkerCapabilities {
             rustc_version: Some("rustc 1.76.0".to_string()),
             bun_version: Some("1.0.25".to_string()),
@@ -2540,6 +2551,7 @@ mod tests {
 
     #[test]
     fn test_worker_capabilities_serialization_empty() {
+        let _guard = test_guard!();
         let caps = WorkerCapabilities::new();
         let json = serde_json::to_string(&caps).unwrap();
         // Empty capabilities should serialize to {}
@@ -2554,6 +2566,7 @@ mod tests {
 
     #[test]
     fn test_worker_capabilities_serialization_with_versions() {
+        let _guard = test_guard!();
         let caps = WorkerCapabilities {
             rustc_version: Some("rustc 1.76.0-nightly".to_string()),
             bun_version: Some("1.0.25".to_string()),
@@ -2579,6 +2592,7 @@ mod tests {
 
     #[test]
     fn test_worker_capabilities_deserialization_partial() {
+        let _guard = test_guard!();
         // Deserialize JSON with only some fields
         let json = r#"{"bun_version": "1.0.0"}"#;
         let caps: WorkerCapabilities = serde_json::from_str(json).unwrap();
@@ -2591,6 +2605,7 @@ mod tests {
 
     #[test]
     fn test_worker_capabilities_clone() {
+        let _guard = test_guard!();
         let caps = WorkerCapabilities {
             rustc_version: Some("1.76.0".to_string()),
             bun_version: None,
@@ -2608,6 +2623,7 @@ mod tests {
 
     #[test]
     fn test_selection_reason_serialization() {
+        let _guard = test_guard!();
         // Test that all variants serialize to snake_case
         assert_eq!(
             serde_json::to_string(&SelectionReason::Success).unwrap(),
@@ -2637,6 +2653,7 @@ mod tests {
 
     #[test]
     fn test_selection_reason_with_error() {
+        let _guard = test_guard!();
         let reason = SelectionReason::SelectionError("test error".to_string());
         let json = serde_json::to_string(&reason).unwrap();
         assert!(json.contains("selection_error"));
@@ -2645,6 +2662,7 @@ mod tests {
 
     #[test]
     fn test_selection_reason_deserialization() {
+        let _guard = test_guard!();
         assert_eq!(
             serde_json::from_str::<SelectionReason>("\"success\"").unwrap(),
             SelectionReason::Success
@@ -2657,6 +2675,7 @@ mod tests {
 
     #[test]
     fn test_selection_reason_display() {
+        let _guard = test_guard!();
         assert_eq!(
             SelectionReason::Success.to_string(),
             "worker assigned successfully"
@@ -2681,6 +2700,7 @@ mod tests {
 
     #[test]
     fn test_selection_response_with_worker() {
+        let _guard = test_guard!();
         let response = SelectionResponse {
             worker: Some(SelectedWorker {
                 id: WorkerId::new("test"),
@@ -2701,6 +2721,7 @@ mod tests {
 
     #[test]
     fn test_selection_response_without_worker() {
+        let _guard = test_guard!();
         let response = SelectionResponse {
             worker: None,
             reason: SelectionReason::AllWorkersBusy,
@@ -2714,6 +2735,7 @@ mod tests {
 
     #[test]
     fn test_selection_response_roundtrip() {
+        let _guard = test_guard!();
         let original = SelectionResponse {
             worker: Some(SelectedWorker {
                 id: WorkerId::new("worker-1"),
@@ -2742,6 +2764,7 @@ mod tests {
 
     #[test]
     fn test_circuit_stats_new() {
+        let _guard = test_guard!();
         let stats = CircuitStats::new();
         assert_eq!(stats.state(), CircuitState::Closed);
         assert_eq!(stats.consecutive_failures(), 0);
@@ -2751,6 +2774,7 @@ mod tests {
 
     #[test]
     fn test_circuit_stats_record_success() {
+        let _guard = test_guard!();
         let mut stats = CircuitStats::new();
         stats.record_success();
         stats.record_success();
@@ -2760,6 +2784,7 @@ mod tests {
 
     #[test]
     fn test_circuit_stats_record_failure() {
+        let _guard = test_guard!();
         let mut stats = CircuitStats::new();
         stats.record_failure();
         stats.record_failure();
@@ -2769,6 +2794,7 @@ mod tests {
 
     #[test]
     fn test_circuit_stats_error_rate() {
+        let _guard = test_guard!();
         let mut stats = CircuitStats::new();
         stats.record_success();
         stats.record_success();
@@ -2779,6 +2805,7 @@ mod tests {
 
     #[test]
     fn test_circuit_stats_should_open_consecutive_failures() {
+        let _guard = test_guard!();
         let mut stats = CircuitStats::new();
         let config = CircuitBreakerConfig::default(); // threshold = 3
 
@@ -2794,6 +2821,7 @@ mod tests {
 
     #[test]
     fn test_circuit_stats_should_open_error_rate() {
+        let _guard = test_guard!();
         let mut stats = CircuitStats::new();
         let config = CircuitBreakerConfig {
             error_rate_threshold: 0.5,
@@ -2813,6 +2841,7 @@ mod tests {
 
     #[test]
     fn test_circuit_stats_success_resets_consecutive_failures() {
+        let _guard = test_guard!();
         let mut stats = CircuitStats::new();
         stats.record_failure();
         stats.record_failure();
@@ -2824,6 +2853,7 @@ mod tests {
 
     #[test]
     fn test_circuit_stats_open_transition() {
+        let _guard = test_guard!();
         let mut stats = CircuitStats::new();
         stats.open();
 
@@ -2833,6 +2863,7 @@ mod tests {
 
     #[test]
     fn test_circuit_stats_half_open_transition() {
+        let _guard = test_guard!();
         let mut stats = CircuitStats::new();
         stats.open();
         stats.half_open();
@@ -2842,6 +2873,7 @@ mod tests {
 
     #[test]
     fn test_circuit_stats_close_transition() {
+        let _guard = test_guard!();
         let mut stats = CircuitStats::new();
         stats.open();
         stats.half_open();
@@ -2854,6 +2886,7 @@ mod tests {
 
     #[test]
     fn test_circuit_stats_should_close() {
+        let _guard = test_guard!();
         let mut stats = CircuitStats::new();
         let config = CircuitBreakerConfig {
             success_threshold: 2,
@@ -2874,6 +2907,7 @@ mod tests {
 
     #[test]
     fn test_circuit_stats_can_probe() {
+        let _guard = test_guard!();
         let mut stats = CircuitStats::new();
         let config = CircuitBreakerConfig {
             half_open_max_probes: 1,
@@ -2900,6 +2934,7 @@ mod tests {
 
     #[test]
     fn test_circuit_stats_probe_completion() {
+        let _guard = test_guard!();
         let mut stats = CircuitStats::new();
         let config = CircuitBreakerConfig {
             half_open_max_probes: 1,
@@ -2919,6 +2954,7 @@ mod tests {
 
     #[test]
     fn test_circuit_stats_failure_in_half_open() {
+        let _guard = test_guard!();
         let mut stats = CircuitStats::new();
         let config = CircuitBreakerConfig {
             success_threshold: 2,
@@ -2943,6 +2979,7 @@ mod tests {
 
     #[test]
     fn test_circuit_stats_reset_window() {
+        let _guard = test_guard!();
         let mut stats = CircuitStats::new();
         stats.record_success();
         stats.record_failure();
@@ -2955,6 +2992,7 @@ mod tests {
 
     #[test]
     fn test_circuit_state_transitions_are_deterministic() {
+        let _guard = test_guard!();
         let config = CircuitBreakerConfig::default();
         let mut stats = CircuitStats::new();
 
@@ -3012,6 +3050,7 @@ mod tests {
 
     #[test]
     fn test_compilation_timing_breakdown_default() {
+        let _guard = test_guard!();
         let timing = CompilationTimingBreakdown::default();
         assert_eq!(timing.rsync_up, Duration::ZERO);
         assert_eq!(timing.remote_build, Duration::ZERO);
@@ -3021,6 +3060,7 @@ mod tests {
 
     #[test]
     fn test_compilation_timing_breakdown_serialization() {
+        let _guard = test_guard!();
         let timing = CompilationTimingBreakdown {
             rsync_up: Duration::from_millis(100),
             remote_build: Duration::from_millis(2000),
@@ -3043,6 +3083,7 @@ mod tests {
 
     #[test]
     fn test_command_timing_breakdown_serialization() {
+        let _guard = test_guard!();
         let timing = CommandTimingBreakdown {
             classify: Some(Duration::from_millis(2)),
             select: None,
@@ -3074,6 +3115,7 @@ mod tests {
 
     #[test]
     fn test_compilation_metrics_calculate_speedup() {
+        let _guard = test_guard!();
         let mut metrics = CompilationMetrics {
             timing: CompilationTimingBreakdown {
                 total: Duration::from_secs(10),
@@ -3096,6 +3138,7 @@ mod tests {
 
     #[test]
     fn test_compilation_metrics_is_beneficial() {
+        let _guard = test_guard!();
         let mut metrics = CompilationMetrics::default();
 
         // No speedup calculated
@@ -3116,6 +3159,7 @@ mod tests {
 
     #[test]
     fn test_compilation_metrics_serialization() {
+        let _guard = test_guard!();
         let metrics = make_test_metrics(Some(2.5), 10, true);
         let json = serde_json::to_string(&metrics).unwrap();
 
@@ -3131,6 +3175,7 @@ mod tests {
 
     #[test]
     fn test_compilation_timer_new() {
+        let _guard = test_guard!();
         let timer = CompilationTimer::new("my-project", "my-worker");
         assert_eq!(timer.project_id, "my-project");
         assert_eq!(timer.worker_id, "my-worker");
@@ -3141,6 +3186,7 @@ mod tests {
 
     #[test]
     fn test_compilation_timer_phases() {
+        let _guard = test_guard!();
         let mut timer = CompilationTimer::new("test", "worker");
 
         // Simulate rsync up
@@ -3173,6 +3219,7 @@ mod tests {
 
     #[test]
     fn test_metrics_aggregator_new() {
+        let _guard = test_guard!();
         let agg = MetricsAggregator::new(100);
         assert_eq!(agg.count(), 0);
         assert!(agg.average_speedup().is_none());
@@ -3180,6 +3227,7 @@ mod tests {
 
     #[test]
     fn test_metrics_aggregator_record() {
+        let _guard = test_guard!();
         let mut agg = MetricsAggregator::new(3);
 
         // Record first metric
@@ -3198,6 +3246,7 @@ mod tests {
 
     #[test]
     fn test_metrics_aggregator_average_speedup() {
+        let _guard = test_guard!();
         let mut agg = MetricsAggregator::new(100);
 
         // Empty case
@@ -3214,6 +3263,7 @@ mod tests {
 
     #[test]
     fn test_metrics_aggregator_average_speedup_with_none() {
+        let _guard = test_guard!();
         let mut agg = MetricsAggregator::new(100);
 
         // Mix of Some and None speedups
@@ -3228,6 +3278,7 @@ mod tests {
 
     #[test]
     fn test_metrics_aggregator_percentiles() {
+        let _guard = test_guard!();
         let mut agg = MetricsAggregator::new(100);
 
         // Add metrics with total times 1s, 2s, 3s, ..., 10s
@@ -3250,6 +3301,7 @@ mod tests {
 
     #[test]
     fn test_metrics_aggregator_success_rate() {
+        let _guard = test_guard!();
         let mut agg = MetricsAggregator::new(100);
 
         // Empty case
@@ -3268,6 +3320,7 @@ mod tests {
 
     #[test]
     fn test_metrics_aggregator_clear() {
+        let _guard = test_guard!();
         let mut agg = MetricsAggregator::new(100);
         agg.record(make_test_metrics(Some(1.0), 10, true));
         agg.record(make_test_metrics(Some(2.0), 20, true));
@@ -3283,6 +3336,7 @@ mod tests {
 
     #[test]
     fn test_compilation_config_default_timeouts() {
+        let _guard = test_guard!();
         let config = CompilationConfig::default();
         // Default build timeout: 5 minutes
         assert_eq!(config.build_timeout_sec, 300);
@@ -3292,6 +3346,7 @@ mod tests {
 
     #[test]
     fn test_compilation_config_timeout_for_test_kinds() {
+        let _guard = test_guard!();
         let config = CompilationConfig::default();
 
         // Test commands should get test_timeout_sec
@@ -3311,6 +3366,7 @@ mod tests {
 
     #[test]
     fn test_compilation_config_timeout_for_build_kinds() {
+        let _guard = test_guard!();
         let config = CompilationConfig::default();
 
         // Build/check commands should get build_timeout_sec
@@ -3334,6 +3390,7 @@ mod tests {
 
     #[test]
     fn test_compilation_config_custom_timeouts() {
+        let _guard = test_guard!();
         let config = CompilationConfig {
             build_timeout_sec: 600, // 10 minutes
             test_timeout_sec: 3600, // 1 hour
@@ -3352,6 +3409,7 @@ mod tests {
 
     #[test]
     fn test_compilation_config_speedup_threshold_default() {
+        let _guard = test_guard!();
         let config = CompilationConfig::default();
         // Default speedup threshold: 1.2 (20% faster required)
         assert!((config.remote_speedup_threshold - 1.2).abs() < 0.001);
@@ -3359,6 +3417,7 @@ mod tests {
 
     #[test]
     fn test_compilation_config_speedup_threshold_custom() {
+        let _guard = test_guard!();
         let config = CompilationConfig {
             remote_speedup_threshold: 1.5, // Require 50% faster
             ..Default::default()
@@ -3368,6 +3427,7 @@ mod tests {
 
     #[test]
     fn test_compilation_config_speedup_threshold_no_minimum() {
+        let _guard = test_guard!();
         // Setting to 1.0 means "always offload when other criteria met"
         let config = CompilationConfig {
             remote_speedup_threshold: 1.0,
@@ -3378,6 +3438,7 @@ mod tests {
 
     #[test]
     fn test_compilation_config_min_local_time_ms_default() {
+        let _guard = test_guard!();
         let config = CompilationConfig::default();
         // Default min_local_time_ms: 2000ms
         assert_eq!(config.min_local_time_ms, 2000);
@@ -3385,6 +3446,7 @@ mod tests {
 
     #[test]
     fn test_compilation_config_serde_roundtrip_speedup_threshold() {
+        let _guard = test_guard!();
         let config = CompilationConfig {
             remote_speedup_threshold: 2.5,
             min_local_time_ms: 5000,
@@ -3402,6 +3464,7 @@ mod tests {
 
     #[test]
     fn test_validate_remote_base_absolute_path() {
+        let _guard = test_guard!();
         assert_eq!(validate_remote_base("/tmp/rch").unwrap(), "/tmp/rch");
         assert_eq!(
             validate_remote_base("/var/rch-builds").unwrap(),
@@ -3415,6 +3478,7 @@ mod tests {
 
     #[test]
     fn test_validate_remote_base_tilde_expansion() {
+        let _guard = test_guard!();
         // Tilde expansion should work
         let result = validate_remote_base("~/rch");
         assert!(result.is_ok());
@@ -3429,6 +3493,7 @@ mod tests {
 
     #[test]
     fn test_validate_remote_base_rejects_relative_path() {
+        let _guard = test_guard!();
         let result = validate_remote_base("tmp/rch");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("absolute path"));
@@ -3436,6 +3501,7 @@ mod tests {
 
     #[test]
     fn test_validate_remote_base_rejects_path_traversal() {
+        let _guard = test_guard!();
         let result = validate_remote_base("/tmp/../etc/rch");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("path traversal"));
@@ -3447,12 +3513,14 @@ mod tests {
 
     #[test]
     fn test_validate_remote_base_normalizes_trailing_slash() {
+        let _guard = test_guard!();
         assert_eq!(validate_remote_base("/tmp/rch/").unwrap(), "/tmp/rch");
         assert_eq!(validate_remote_base("/tmp/rch///").unwrap(), "/tmp/rch");
     }
 
     #[test]
     fn test_validate_remote_base_root_path() {
+        let _guard = test_guard!();
         // Root path should be rejected
         let result = validate_remote_base("/");
         assert!(result.is_err());
@@ -3461,6 +3529,7 @@ mod tests {
 
     #[test]
     fn test_validate_remote_base_rejects_top_level() {
+        let _guard = test_guard!();
         // Top-level directories should be rejected (depth 1)
         let result = validate_remote_base("/tmp");
         assert!(result.is_err());
@@ -3475,11 +3544,13 @@ mod tests {
 
     #[test]
     fn test_default_remote_base() {
+        let _guard = test_guard!();
         assert_eq!(default_remote_base(), "/tmp/rch");
     }
 
     #[test]
     fn test_transfer_config_default_has_remote_base() {
+        let _guard = test_guard!();
         let config = TransferConfig::default();
         assert_eq!(config.remote_base, "/tmp/rch");
     }
@@ -3490,6 +3561,7 @@ mod tests {
 
     #[test]
     fn test_retry_config_default() {
+        let _guard = test_guard!();
         let config = RetryConfig::default();
         assert_eq!(config.max_attempts, 3);
         assert_eq!(config.base_delay_ms, 100);
@@ -3500,18 +3572,21 @@ mod tests {
 
     #[test]
     fn test_retry_config_no_retry() {
+        let _guard = test_guard!();
         let config = RetryConfig::no_retry();
         assert_eq!(config.max_attempts, 1);
     }
 
     #[test]
     fn test_retry_config_delay_for_attempt_zero() {
+        let _guard = test_guard!();
         let config = RetryConfig::default();
         assert_eq!(config.delay_for_attempt(0), std::time::Duration::ZERO);
     }
 
     #[test]
     fn test_retry_config_delay_for_attempt_exponential() {
+        let _guard = test_guard!();
         let config = RetryConfig {
             base_delay_ms: 100,
             max_delay_ms: 10000,
@@ -3538,6 +3613,7 @@ mod tests {
 
     #[test]
     fn test_retry_config_delay_capped_at_max() {
+        let _guard = test_guard!();
         let config = RetryConfig {
             base_delay_ms: 1000,
             max_delay_ms: 2000,
@@ -3559,6 +3635,7 @@ mod tests {
 
     #[test]
     fn test_retry_config_should_retry() {
+        let _guard = test_guard!();
         let config = RetryConfig {
             max_attempts: 3,
             total_timeout_ms: 1000,
@@ -3579,6 +3656,7 @@ mod tests {
 
     #[test]
     fn test_retry_config_serde_roundtrip() {
+        let _guard = test_guard!();
         let config = RetryConfig {
             max_attempts: 5,
             base_delay_ms: 200,
@@ -3597,6 +3675,7 @@ mod tests {
 
     #[test]
     fn test_transfer_config_includes_retry() {
+        let _guard = test_guard!();
         let config = TransferConfig::default();
         assert_eq!(config.retry.max_attempts, 3);
     }
@@ -3607,6 +3686,7 @@ mod tests {
 
     #[test]
     fn test_execution_config_default_allowlist() {
+        let _guard = test_guard!();
         let config = ExecutionConfig::default();
         // All supported compilers should be in the default allowlist
         assert!(config.is_allowed("cargo"));
@@ -3627,6 +3707,7 @@ mod tests {
 
     #[test]
     fn test_execution_config_is_allowed_case_insensitive() {
+        let _guard = test_guard!();
         let config = ExecutionConfig::default();
         // Should be case-insensitive
         assert!(config.is_allowed("CARGO"));
@@ -3637,6 +3718,7 @@ mod tests {
 
     #[test]
     fn test_execution_config_is_not_allowed() {
+        let _guard = test_guard!();
         let config = ExecutionConfig::default();
         // Unknown commands should not be allowed
         assert!(!config.is_allowed("python"));
@@ -3647,6 +3729,7 @@ mod tests {
 
     #[test]
     fn test_execution_config_empty_allowlist() {
+        let _guard = test_guard!();
         let config = ExecutionConfig { allowlist: vec![] };
         // Empty allowlist should block everything
         assert!(!config.is_allowed("cargo"));
@@ -3655,6 +3738,7 @@ mod tests {
 
     #[test]
     fn test_execution_config_custom_allowlist() {
+        let _guard = test_guard!();
         let config = ExecutionConfig {
             allowlist: vec!["cargo".to_string(), "custom_tool".to_string()],
         };
@@ -3665,6 +3749,7 @@ mod tests {
 
     #[test]
     fn test_execution_config_serde() {
+        let _guard = test_guard!();
         let config = ExecutionConfig {
             allowlist: vec!["cargo".to_string(), "rustc".to_string()],
         };
@@ -3675,6 +3760,7 @@ mod tests {
 
     #[test]
     fn test_rch_config_includes_execution() {
+        let _guard = test_guard!();
         let config = RchConfig::default();
         // RchConfig should include ExecutionConfig with default allowlist
         assert!(config.execution.is_allowed("cargo"));
@@ -3686,6 +3772,7 @@ mod tests {
 
     #[test]
     fn test_adaptive_compression_disabled_by_default() {
+        let _guard = test_guard!();
         let config = TransferConfig::default();
         assert!(!config.adaptive_compression);
         // Should use fixed level when disabled
@@ -3695,6 +3782,7 @@ mod tests {
 
     #[test]
     fn test_adaptive_compression_small_payload() {
+        let _guard = test_guard!();
         let config = TransferConfig {
             adaptive_compression: true,
             ..Default::default()
@@ -3707,6 +3795,7 @@ mod tests {
 
     #[test]
     fn test_adaptive_compression_medium_payload() {
+        let _guard = test_guard!();
         let config = TransferConfig {
             adaptive_compression: true,
             ..Default::default()
@@ -3719,6 +3808,7 @@ mod tests {
 
     #[test]
     fn test_adaptive_compression_large_payload() {
+        let _guard = test_guard!();
         let config = TransferConfig {
             adaptive_compression: true,
             ..Default::default()
@@ -3731,6 +3821,7 @@ mod tests {
 
     #[test]
     fn test_adaptive_compression_no_estimate() {
+        let _guard = test_guard!();
         let config = TransferConfig {
             adaptive_compression: true,
             compression_level: 5,
@@ -3742,6 +3833,7 @@ mod tests {
 
     #[test]
     fn test_adaptive_compression_respects_min_level() {
+        let _guard = test_guard!();
         let config = TransferConfig {
             adaptive_compression: true,
             min_compression_level: 3,
@@ -3753,6 +3845,7 @@ mod tests {
 
     #[test]
     fn test_adaptive_compression_respects_max_level() {
+        let _guard = test_guard!();
         let config = TransferConfig {
             adaptive_compression: true,
             max_compression_level: 5,
@@ -3764,6 +3857,7 @@ mod tests {
 
     #[test]
     fn test_adaptive_compression_serde_roundtrip() {
+        let _guard = test_guard!();
         let config = TransferConfig {
             adaptive_compression: true,
             min_compression_level: 2,
@@ -3783,6 +3877,7 @@ mod tests {
 
     #[test]
     fn test_self_healing_config_defaults() {
+        let _guard = test_guard!();
         // TEST START: SelfHealingConfig::default() returns expected values
         let config = SelfHealingConfig::default();
 
@@ -3810,6 +3905,7 @@ mod tests {
 
     #[test]
     fn test_self_healing_config_serde_full() {
+        let _guard = test_guard!();
         // TEST START: Full SelfHealingConfig serialization/deserialization
         let config = SelfHealingConfig {
             hook_starts_daemon: false,
@@ -3834,6 +3930,7 @@ mod tests {
 
     #[test]
     fn test_self_healing_config_serde_partial_uses_defaults() {
+        let _guard = test_guard!();
         // TEST START: Partial TOML/JSON uses defaults for missing fields
         let json = r#"{"hook_starts_daemon": false}"#;
         let config: SelfHealingConfig = serde_json::from_str(json).unwrap();
@@ -3859,6 +3956,7 @@ mod tests {
 
     #[test]
     fn test_self_healing_config_toml_with_alias() {
+        let _guard = test_guard!();
         // TEST START: daemon_start_timeout alias works for auto_start_timeout_secs
         let toml_str = r#"
             hook_starts_daemon = true
@@ -3922,6 +4020,7 @@ mod tests {
 
         #[test]
         fn test_self_healing_config_with_env_overrides_master_disable() {
+            let _guard = test_guard!();
             let _guard = env_guard();
 
             let _no_self_healing = EnvVarGuard::set("RCH_NO_SELF_HEALING", "1");
@@ -3947,6 +4046,7 @@ mod tests {
 
         #[test]
         fn test_self_healing_config_with_env_overrides_toggles_and_numbers() {
+            let _guard = test_guard!();
             let _guard = env_guard();
 
             let _hook_starts_daemon = EnvVarGuard::set("RCH_HOOK_STARTS_DAEMON", "0");
@@ -3963,6 +4063,7 @@ mod tests {
 
         #[test]
         fn test_self_healing_config_with_env_overrides_invalid_numbers_ignored() {
+            let _guard = test_guard!();
             let _guard = env_guard();
 
             let _cooldown = EnvVarGuard::set("RCH_AUTO_START_COOLDOWN_SECS", "not-a-number");
@@ -3980,6 +4081,7 @@ mod tests {
 
     #[test]
     fn test_load_per_core_calculation() {
+        let _guard = test_guard!();
         let mut caps = WorkerCapabilities::new();
         // No metrics -> None
         assert!(caps.load_per_core().is_none());
@@ -3999,6 +4101,7 @@ mod tests {
 
     #[test]
     fn test_is_high_load() {
+        let _guard = test_guard!();
         let mut caps = WorkerCapabilities::new();
         caps.load_avg_1 = Some(8.0);
         caps.num_cpus = Some(4);
@@ -4018,6 +4121,7 @@ mod tests {
 
     #[test]
     fn test_is_low_disk() {
+        let _guard = test_guard!();
         let mut caps = WorkerCapabilities::new();
         caps.disk_free_gb = Some(15.0);
 
@@ -4035,6 +4139,7 @@ mod tests {
 
     #[test]
     fn test_selection_config_preflight_defaults() {
+        let _guard = test_guard!();
         let config = SelectionConfig::default();
         // Default thresholds
         assert_eq!(config.max_load_per_core, Some(2.0));
@@ -4043,6 +4148,7 @@ mod tests {
 
     #[test]
     fn test_selection_config_preflight_serde() {
+        let _guard = test_guard!();
         let config = SelectionConfig {
             max_load_per_core: Some(3.5),
             min_free_gb: Some(25.0),
@@ -4056,6 +4162,7 @@ mod tests {
 
     #[test]
     fn test_worker_capabilities_health_metrics_serde() {
+        let _guard = test_guard!();
         let caps = WorkerCapabilities {
             num_cpus: Some(8),
             load_avg_1: Some(1.5),

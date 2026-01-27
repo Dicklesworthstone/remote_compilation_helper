@@ -670,7 +670,8 @@ where
 
 #[cfg(test)]
 mod tests {
-        use rch_common::test_guard;
+    use super::*;
+    use rch_common::test_guard;
 
     #[test]
     fn test_shutdown_signal_names() {

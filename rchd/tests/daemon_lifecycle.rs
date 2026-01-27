@@ -85,6 +85,7 @@ fn get_json_field(json: &str, field: &str) -> Option<String> {
 
 #[test]
 fn test_daemon_startup_creates_socket() -> HarnessResult<()> {
+    let _guard = rch_common::test_guard!();
     let harness = TestHarnessBuilder::new("daemon_startup_socket")
         .cleanup_on_success(true)
         .cleanup_on_failure(false)
@@ -123,6 +124,7 @@ total_slots = 4
 
 #[test]
 fn test_daemon_health_endpoint() -> HarnessResult<()> {
+    let _guard = rch_common::test_guard!();
     let harness = TestHarnessBuilder::new("daemon_health")
         .cleanup_on_success(true)
         .cleanup_on_failure(false)
@@ -179,6 +181,7 @@ total_slots = 4
 
 #[test]
 fn test_daemon_ready_endpoint() -> HarnessResult<()> {
+    let _guard = rch_common::test_guard!();
     let harness = TestHarnessBuilder::new("daemon_ready")
         .cleanup_on_success(true)
         .cleanup_on_failure(false)
@@ -230,6 +233,7 @@ total_slots = 4
 
 #[test]
 fn test_daemon_status_endpoint() -> HarnessResult<()> {
+    let _guard = rch_common::test_guard!();
     let harness = TestHarnessBuilder::new("daemon_status")
         .cleanup_on_success(true)
         .cleanup_on_failure(false)
@@ -294,6 +298,7 @@ total_slots = 8
 
 #[test]
 fn test_daemon_budget_endpoint() -> HarnessResult<()> {
+    let _guard = rch_common::test_guard!();
     let harness = TestHarnessBuilder::new("daemon_budget")
         .cleanup_on_success(true)
         .cleanup_on_failure(false)
@@ -340,6 +345,7 @@ total_slots = 4
 
 #[test]
 fn test_daemon_graceful_shutdown() -> HarnessResult<()> {
+    let _guard = rch_common::test_guard!();
     let harness = TestHarnessBuilder::new("daemon_shutdown")
         .cleanup_on_success(true)
         .cleanup_on_failure(false)
@@ -409,6 +415,7 @@ total_slots = 4
 
 #[test]
 fn test_daemon_metrics_endpoint() -> HarnessResult<()> {
+    let _guard = rch_common::test_guard!();
     let harness = TestHarnessBuilder::new("daemon_metrics")
         .cleanup_on_success(true)
         .cleanup_on_failure(false)
@@ -454,6 +461,7 @@ total_slots = 4
 
 #[test]
 fn test_daemon_unknown_endpoint_error() -> HarnessResult<()> {
+    let _guard = rch_common::test_guard!();
     let harness = TestHarnessBuilder::new("daemon_unknown_endpoint")
         .cleanup_on_success(true)
         .cleanup_on_failure(false)
@@ -502,6 +510,7 @@ total_slots = 4
 
 #[test]
 fn test_daemon_config_fixture_integration() -> HarnessResult<()> {
+    let _guard = rch_common::test_guard!();
     use rch_common::e2e::fixtures::{WorkerFixture, WorkersFixture};
 
     let harness = TestHarnessBuilder::new("daemon_config_fixture")

@@ -671,9 +671,10 @@ fn render_basic_status_to<W: Write>(
 mod tests {
     use super::*;
     use crate::status_types::{
-        ActiveBuildFromApi, BuildRecordFromApi, BuildStatsFromApi, DaemonFullStatusResponse,
-        DaemonInfoFromApi, IssueFromApi, TestRunStatsFromApi, WorkerStatusFromApi,
+        ActiveBuildFromApi, BuildRecordFromApi, BuildStatsFromApi, DaemonInfoFromApi, IssueFromApi,
+        TestRunStatsFromApi, WorkerStatusFromApi,
     };
+    use rch_common::test_guard;
     use tracing::info;
 
     fn sample_status() -> DaemonFullStatusResponse {
@@ -783,21 +784,25 @@ mod tests {
 
     #[test]
     fn test_format_failure_history_empty() {
+        let _guard = test_guard!();
         assert_eq!(format_failure_history(&[]), "(no history)");
     }
 
     #[test]
     fn test_format_failure_history_all_success() {
+        let _guard = test_guard!();
         assert_eq!(format_failure_history(&[true, true, true]), "✓✓✓");
     }
 
     #[test]
     fn test_format_failure_history_all_failure() {
+        let _guard = test_guard!();
         assert_eq!(format_failure_history(&[false, false, false]), "✗✗✗");
     }
 
     #[test]
     fn test_format_failure_history_mixed() {
+        let _guard = test_guard!();
         assert_eq!(
             format_failure_history(&[false, false, true, false, true]),
             "✗✗✓✗✓"
@@ -806,6 +811,7 @@ mod tests {
 
     #[test]
     fn test_circuit_state_explanation_closed() {
+        let _guard = test_guard!();
         let (state, explanation, help) = circuit_state_explanation("closed", 0, None, None);
         assert_eq!(state, "CLOSED");
         assert!(explanation.contains("Normal operation"));
@@ -814,6 +820,7 @@ mod tests {
 
     #[test]
     fn test_circuit_state_explanation_open_with_recovery() {
+        let _guard = test_guard!();
         let (state, explanation, help) =
             circuit_state_explanation("open", 3, Some(45), Some("SSH timeout"));
         assert_eq!(state, "OPEN");
@@ -824,6 +831,7 @@ mod tests {
 
     #[test]
     fn test_circuit_state_explanation_open_no_recovery() {
+        let _guard = test_guard!();
         let (state, explanation, _help) = circuit_state_explanation("open", 5, None, None);
         assert_eq!(state, "OPEN");
         assert!(explanation.contains("5 consecutive failures"));
@@ -832,6 +840,7 @@ mod tests {
 
     #[test]
     fn test_circuit_state_explanation_half_open() {
+        let _guard = test_guard!();
         let (state, explanation, help) = circuit_state_explanation("half_open", 0, None, None);
         assert_eq!(state, "HALF-OPEN");
         assert!(explanation.contains("Testing recovery"));
@@ -840,6 +849,7 @@ mod tests {
 
     #[test]
     fn test_circuit_state_explanation_unknown() {
+        let _guard = test_guard!();
         let (state, explanation, _help) = circuit_state_explanation("weird_state", 0, None, None);
         assert_eq!(state, "UNKNOWN");
         assert!(explanation.contains("Unknown"));
@@ -847,6 +857,7 @@ mod tests {
 
     #[test]
     fn test_render_full_status_includes_workers_and_circuits() {
+        let _guard = test_guard!();
         info!("TEST: test_render_full_status_includes_workers_and_circuits");
         let status = sample_status();
         let style = Theme::new(false, true, false);
@@ -864,6 +875,7 @@ mod tests {
 
     #[test]
     fn test_render_full_status_includes_build_sections() {
+        let _guard = test_guard!();
         info!("TEST: test_render_full_status_includes_build_sections");
         let status = sample_status();
         let style = Theme::new(false, true, false);
@@ -882,6 +894,7 @@ mod tests {
 
     #[test]
     fn test_render_full_status_includes_circuit_details() {
+        let _guard = test_guard!();
         info!("TEST: test_render_full_status_includes_circuit_details");
         let status = sample_status();
         let style = Theme::new(false, true, false);
@@ -898,6 +911,7 @@ mod tests {
 
     #[test]
     fn test_render_basic_status_stopped() {
+        let _guard = test_guard!();
         info!("TEST: test_render_basic_status_stopped");
         let style = Theme::new(false, true, false);
         let mut buf = Vec::new();
@@ -912,6 +926,7 @@ mod tests {
 
     #[test]
     fn test_render_basic_status_running() {
+        let _guard = test_guard!();
         info!("TEST: test_render_basic_status_running");
         let style = Theme::new(false, true, false);
         let mut buf = Vec::new();

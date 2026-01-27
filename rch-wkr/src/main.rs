@@ -541,6 +541,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rch_common::test_guard;
 
     fn approx_eq(lhs: f64, rhs: f64) -> bool {
         (lhs - rhs).abs() < 1e-9
@@ -548,6 +549,7 @@ mod tests {
 
     #[test]
     fn test_cli_parses_health() {
+        let _guard = test_guard!();
         println!("TEST START: test_cli_parses_health");
         let cli = Cli::try_parse_from(["rch-wkr", "health"]).expect("cli parse should succeed");
         assert!(!cli.verbose);
@@ -557,6 +559,7 @@ mod tests {
 
     #[test]
     fn test_cli_parses_execute_with_toolchain() {
+        let _guard = test_guard!();
         println!("TEST START: test_cli_parses_execute_with_toolchain");
         let cli = Cli::try_parse_from([
             "rch-wkr",
@@ -589,6 +592,7 @@ mod tests {
 
     #[test]
     fn test_cli_parses_cleanup_default_age() {
+        let _guard = test_guard!();
         println!("TEST START: test_cli_parses_cleanup_default_age");
         let cli = Cli::try_parse_from(["rch-wkr", "cleanup"]).expect("cli parse should succeed");
         match cli.command {
@@ -602,6 +606,7 @@ mod tests {
 
     #[test]
     fn test_parse_rustc_version_stdout_extracts_semver() {
+        let _guard = test_guard!();
         println!("TEST START: test_parse_rustc_version_stdout_extracts_semver");
         let parsed = parse_rustc_version_stdout("rustc 1.87.0-nightly (abc 2026-01-01)\n");
         assert_eq!(parsed.as_deref(), Some("1.87.0-nightly"));
@@ -610,6 +615,7 @@ mod tests {
 
     #[test]
     fn test_parse_node_version_stdout_strips_v_prefix() {
+        let _guard = test_guard!();
         println!("TEST START: test_parse_node_version_stdout_strips_v_prefix");
         let parsed = parse_node_version_stdout("v20.10.0\n");
         assert_eq!(parsed.as_deref(), Some("20.10.0"));
@@ -618,6 +624,7 @@ mod tests {
 
     #[test]
     fn test_parse_proc_loadavg_parses_first_three_numbers() {
+        let _guard = test_guard!();
         println!("TEST START: test_parse_proc_loadavg_parses_first_three_numbers");
         let parsed = parse_proc_loadavg("0.11 0.22 0.33 1/234 5678\n");
         let (l1, l5, l15) = parsed.expect("should parse");
@@ -629,6 +636,7 @@ mod tests {
 
     #[test]
     fn test_parse_uptime_loadavg_parses_comma_format() {
+        let _guard = test_guard!();
         println!("TEST START: test_parse_uptime_loadavg_parses_comma_format");
         let sample = " 10:30:00 up 1 day,  2 users,  load average: 0.30, 0.20, 0.10\n";
         let (l1, l5, l15) = parse_uptime_loadavg(sample).expect("should parse");
@@ -640,6 +648,7 @@ mod tests {
 
     #[test]
     fn test_parse_uptime_loadavg_parses_space_format() {
+        let _guard = test_guard!();
         println!("TEST START: test_parse_uptime_loadavg_parses_space_format");
         let sample = " 10:30:00 up 1 day,  2 users,  load averages: 2.05 1.90 1.50\n";
         let (l1, l5, l15) = parse_uptime_loadavg(sample).expect("should parse");
@@ -651,6 +660,7 @@ mod tests {
 
     #[test]
     fn test_parse_df_posix_kb_parses_total_and_available() {
+        let _guard = test_guard!();
         println!("TEST START: test_parse_df_posix_kb_parses_total_and_available");
         let sample = "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/sda1 1048576 524288 524288 50% /tmp\n";
         let (total_kb, avail_kb) = parse_df_posix_kb(sample).expect("should parse");

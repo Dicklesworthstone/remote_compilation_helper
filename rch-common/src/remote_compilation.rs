@@ -504,6 +504,7 @@ mod tests {
         global_rsync_invocations_snapshot, global_ssh_invocations_snapshot, is_mock_enabled,
         set_mock_enabled_override, set_mock_rsync_config_override, set_mock_ssh_config_override,
     };
+    use crate::test_guard;
     use crate::testing::{TestLogger, TestPhase};
     use crate::types::WorkerId;
 
@@ -520,6 +521,7 @@ mod tests {
 
     #[test]
     fn verification_result_serializes_roundtrip() {
+        let _guard = test_guard!();
         let logger = TestLogger::for_test("verification_result_serializes_roundtrip");
 
         let result = VerificationResult {
@@ -566,6 +568,7 @@ mod tests {
 
     #[test]
     fn verification_result_with_error() {
+        let _guard = test_guard!();
         let logger = TestLogger::for_test("verification_result_with_error");
 
         let result = VerificationResult {
@@ -606,6 +609,7 @@ mod tests {
 
     #[test]
     fn verification_result_serializes_with_all_fields() {
+        let _guard = test_guard!();
         let logger = TestLogger::for_test("verification_result_serializes_with_all_fields");
 
         let result = VerificationResult {
@@ -658,6 +662,7 @@ mod tests {
 
     #[test]
     fn remote_compilation_test_default_values() {
+        let _guard = test_guard!();
         let logger = TestLogger::for_test("remote_compilation_test_default_values");
 
         let test = RemoteCompilationTest::default();
@@ -682,6 +687,7 @@ mod tests {
 
     #[test]
     fn remote_compilation_test_builder_pattern() {
+        let _guard = test_guard!();
         let logger = TestLogger::for_test("remote_compilation_test_builder_pattern");
 
         let worker = WorkerConfig {
@@ -710,6 +716,7 @@ mod tests {
 
     #[test]
     fn remote_compilation_test_with_ssh_options() {
+        let _guard = test_guard!();
         let logger = TestLogger::for_test("remote_compilation_test_with_ssh_options");
 
         let worker = WorkerConfig {
@@ -740,6 +747,7 @@ mod tests {
 
     #[test]
     fn remote_compilation_test_binary_path_release() {
+        let _guard = test_guard!();
         let logger = TestLogger::for_test("remote_compilation_test_binary_path_release");
 
         let worker = WorkerConfig {
@@ -783,6 +791,7 @@ mod tests {
 
     #[test]
     fn remote_compilation_test_binary_path_debug() {
+        let _guard = test_guard!();
         let logger = TestLogger::for_test("remote_compilation_test_binary_path_debug");
 
         let worker = WorkerConfig {
@@ -826,6 +835,7 @@ mod tests {
 
     #[test]
     fn remote_compilation_test_infers_binary_name() {
+        let _guard = test_guard!();
         let logger = TestLogger::for_test("remote_compilation_test_infers_binary_name");
 
         let worker = WorkerConfig {
@@ -854,6 +864,7 @@ mod tests {
 
     #[test]
     fn remote_compilation_test_infers_binary_name_edge_cases() {
+        let _guard = test_guard!();
         let logger = TestLogger::for_test("remote_compilation_test_infers_binary_name_edge_cases");
 
         let worker = WorkerConfig {
@@ -894,6 +905,7 @@ mod tests {
 
     #[test]
     fn remote_compilation_test_remote_project_path() {
+        let _guard = test_guard!();
         let logger = TestLogger::for_test("remote_compilation_test_remote_project_path");
 
         let worker = WorkerConfig {
@@ -921,6 +933,7 @@ mod tests {
 
     #[test]
     fn remote_compilation_test_with_custom_remote_base() {
+        let _guard = test_guard!();
         let logger = TestLogger::for_test("remote_compilation_test_with_custom_remote_base");
 
         let worker = WorkerConfig {
@@ -952,6 +965,7 @@ mod tests {
 
     #[test]
     fn verification_result_timing_fields() {
+        let _guard = test_guard!();
         let logger = TestLogger::for_test("verification_result_timing_fields");
 
         let result = VerificationResult {
@@ -1000,6 +1014,7 @@ mod tests {
 
     #[test]
     fn use_mock_transport_with_mock_host() {
+        let _guard = test_guard!();
         let logger = TestLogger::for_test("use_mock_transport_with_mock_host");
 
         let worker = WorkerConfig {
@@ -1387,6 +1402,7 @@ mod tests {
 
     #[test]
     fn remote_compilation_test_empty_project_path() {
+        let _guard = test_guard!();
         let logger = TestLogger::for_test("remote_compilation_test_empty_project_path");
 
         let worker = WorkerConfig {
@@ -1416,6 +1432,7 @@ mod tests {
 
     #[test]
     fn verification_result_zero_timings() {
+        let _guard = test_guard!();
         let logger = TestLogger::for_test("verification_result_zero_timings");
 
         let result = VerificationResult {
@@ -1454,6 +1471,7 @@ mod tests {
 
     #[test]
     fn verification_result_max_timings() {
+        let _guard = test_guard!();
         let logger = TestLogger::for_test("verification_result_max_timings");
 
         let result = VerificationResult {
@@ -1491,6 +1509,7 @@ mod tests {
 
     #[test]
     fn is_mock_enabled_respects_overrides() {
+        let _guard = test_guard!();
         let logger = TestLogger::for_test("is_mock_enabled_respects_overrides");
 
         // Start with clean state

@@ -920,9 +920,11 @@ fn classify_cargo(cmd: &str) -> Classification {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_guard;
 
     #[test]
     fn test_cargo_build_with_toolchain() {
+        let _guard = test_guard!();
         let result = classify_command("cargo +nightly build");
         assert!(result.is_compilation);
         assert_eq!(result.kind, Some(CompilationKind::CargoBuild));
@@ -930,6 +932,7 @@ mod tests {
 
     #[test]
     fn test_cargo_test_with_toolchain() {
+        let _guard = test_guard!();
         let result = classify_command("cargo +1.80.0 test");
         assert!(result.is_compilation);
         assert_eq!(result.kind, Some(CompilationKind::CargoTest));
@@ -937,6 +940,7 @@ mod tests {
 
     #[test]
     fn test_cargo_nextest_with_toolchain() {
+        let _guard = test_guard!();
         let result = classify_command("cargo +nightly nextest run");
         assert!(result.is_compilation);
         assert_eq!(result.kind, Some(CompilationKind::CargoNextest));
@@ -944,6 +948,7 @@ mod tests {
 
     #[test]
     fn test_cargo_build() {
+        let _guard = test_guard!();
         let result = classify_command("cargo build");
         assert!(result.is_compilation);
         assert_eq!(result.kind, Some(CompilationKind::CargoBuild));
@@ -952,6 +957,7 @@ mod tests {
 
     #[test]
     fn test_cargo_build_release() {
+        let _guard = test_guard!();
         let result = classify_command("cargo build --release");
         assert!(result.is_compilation);
         assert_eq!(result.kind, Some(CompilationKind::CargoBuild));
@@ -959,6 +965,7 @@ mod tests {
 
     #[test]
     fn test_cargo_test() {
+        let _guard = test_guard!();
         let result = classify_command("cargo test");
         assert!(result.is_compilation);
         assert_eq!(result.kind, Some(CompilationKind::CargoTest));
@@ -966,6 +973,7 @@ mod tests {
 
     #[test]
     fn test_cargo_fmt_not_intercepted() {
+        let _guard = test_guard!();
         let result = classify_command("cargo fmt");
         assert!(!result.is_compilation);
         assert!(result.reason.contains("never-intercept"));
@@ -973,6 +981,7 @@ mod tests {
 
     #[test]
     fn test_cargo_install_not_intercepted() {
+        let _guard = test_guard!();
         let result = classify_command("cargo install ripgrep");
         assert!(!result.is_compilation);
         assert!(result.reason.contains("never-intercept"));
@@ -980,6 +989,7 @@ mod tests {
 
     #[test]
     fn test_piped_command_not_intercepted() {
+        let _guard = test_guard!();
         let result = classify_command("cargo build 2>&1 | grep error");
         assert!(!result.is_compilation);
         assert!(result.reason.contains("piped"));
@@ -987,6 +997,7 @@ mod tests {
 
     #[test]
     fn test_backgrounded_not_intercepted() {
+        let _guard = test_guard!();
         let result = classify_command("cargo build &");
         assert!(!result.is_compilation);
         assert!(result.reason.contains("background"));
@@ -994,6 +1005,7 @@ mod tests {
 
     #[test]
     fn test_redirected_not_intercepted() {
+        let _guard = test_guard!();
         let result = classify_command("cargo build > log.txt");
         assert!(!result.is_compilation);
         assert!(result.reason.contains("redirect"));
@@ -1001,6 +1013,7 @@ mod tests {
 
     #[test]
     fn test_input_redirected_not_intercepted() {
+        let _guard = test_guard!();
         let result = classify_command("cargo build < input.txt");
         assert!(!result.is_compilation);
         assert!(result.reason.contains("input redirected"));
@@ -1008,6 +1021,7 @@ mod tests {
 
     #[test]
     fn test_process_substitution_not_intercepted() {
+        let _guard = test_guard!();
         let result = classify_command("cargo build --config <(echo ...)");
         assert!(!result.is_compilation);
         assert!(result.reason.contains("subshell execution"));
@@ -1015,6 +1029,7 @@ mod tests {
 
     #[test]
     fn test_subshell_not_intercepted() {
+        let _guard = test_guard!();
         let result = classify_command("(cargo build)");
         assert!(!result.is_compilation);
         assert!(result.reason.contains("subshell execution"));
@@ -1022,6 +1037,7 @@ mod tests {
 
     #[test]
     fn test_gcc_compile() {
+        let _guard = test_guard!();
         let result = classify_command("gcc -c main.c -o main.o");
         assert!(result.is_compilation);
         assert_eq!(result.kind, Some(CompilationKind::Gcc));
@@ -1029,6 +1045,7 @@ mod tests {
 
     #[test]
     fn test_make() {
+        let _guard = test_guard!();
         let result = classify_command("make -j8");
         assert!(result.is_compilation);
         assert_eq!(result.kind, Some(CompilationKind::Make));
@@ -1036,6 +1053,7 @@ mod tests {
 
     #[test]
     fn test_make_clean_not_intercepted() {
+        let _guard = test_guard!();
         let result = classify_command("make clean");
         assert!(!result.is_compilation);
         assert!(result.reason.contains("make maintenance command"));
@@ -1043,6 +1061,7 @@ mod tests {
 
     #[test]
     fn test_non_compilation() {
+        let _guard = test_guard!();
         let result = classify_command("ls -la");
         assert!(!result.is_compilation);
         assert!(result.reason.contains("no compilation keyword"));
@@ -1050,6 +1069,7 @@ mod tests {
 
     #[test]
     fn test_empty_command() {
+        let _guard = test_guard!();
         let result = classify_command("");
         assert!(!result.is_compilation);
         assert!(result.reason.contains("empty command"));
@@ -1059,6 +1079,7 @@ mod tests {
 
     #[test]
     fn test_bun_keyword_detected() {
+        let _guard = test_guard!();
         // Verify "bun" triggers keyword detection (Tier 2 passes)
         assert!(contains_compilation_keyword("bun test"));
         assert!(contains_compilation_keyword("bun typecheck"));
@@ -1067,6 +1088,7 @@ mod tests {
 
     #[test]
     fn test_bun_install_not_intercepted() {
+        let _guard = test_guard!();
         // Package management - modifies node_modules
         let result = classify_command("bun install");
         assert!(!result.is_compilation);
@@ -1075,6 +1097,7 @@ mod tests {
 
     #[test]
     fn test_bun_add_not_intercepted() {
+        let _guard = test_guard!();
         // Adding packages - modifies package.json and node_modules
         let result = classify_command("bun add lodash");
         assert!(!result.is_compilation);
@@ -1083,6 +1106,7 @@ mod tests {
 
     #[test]
     fn test_bun_remove_not_intercepted() {
+        let _guard = test_guard!();
         let result = classify_command("bun remove lodash");
         assert!(!result.is_compilation);
         assert!(result.reason.contains("never-intercept"));
@@ -1090,6 +1114,7 @@ mod tests {
 
     #[test]
     fn test_bun_run_not_intercepted() {
+        let _guard = test_guard!();
         // Generic script runner - could do anything
         let result = classify_command("bun run build");
         assert!(!result.is_compilation);
@@ -1098,6 +1123,7 @@ mod tests {
 
     #[test]
     fn test_bun_build_not_intercepted() {
+        let _guard = test_guard!();
         // Creates bundles in local directory
         let result = classify_command("bun build ./src/index.ts");
         assert!(!result.is_compilation);
@@ -1106,6 +1132,7 @@ mod tests {
 
     #[test]
     fn test_bun_version_not_intercepted() {
+        let _guard = test_guard!();
         let result = classify_command("bun --version");
         assert!(!result.is_compilation);
         assert!(result.reason.contains("never-intercept"));
@@ -1117,6 +1144,7 @@ mod tests {
 
     #[test]
     fn test_bun_dev_not_intercepted() {
+        let _guard = test_guard!();
         // Development server needs local ports
         let result = classify_command("bun dev");
         assert!(!result.is_compilation);
@@ -1125,6 +1153,7 @@ mod tests {
 
     #[test]
     fn test_bun_repl_not_intercepted() {
+        let _guard = test_guard!();
         // Interactive REPL
         let result = classify_command("bun repl");
         assert!(!result.is_compilation);
@@ -1133,6 +1162,7 @@ mod tests {
 
     #[test]
     fn test_bun_link_not_intercepted() {
+        let _guard = test_guard!();
         let result = classify_command("bun link");
         assert!(!result.is_compilation);
         assert!(result.reason.contains("never-intercept"));
@@ -1140,6 +1170,7 @@ mod tests {
 
     #[test]
     fn test_bun_init_not_intercepted() {
+        let _guard = test_guard!();
         let result = classify_command("bun init");
         assert!(!result.is_compilation);
         assert!(result.reason.contains("never-intercept"));
@@ -1147,6 +1178,7 @@ mod tests {
 
     #[test]
     fn test_bun_create_not_intercepted() {
+        let _guard = test_guard!();
         let result = classify_command("bun create next-app");
         assert!(!result.is_compilation);
         assert!(result.reason.contains("never-intercept"));
@@ -1154,6 +1186,7 @@ mod tests {
 
     #[test]
     fn test_bun_pm_not_intercepted() {
+        let _guard = test_guard!();
         let result = classify_command("bun pm cache");
         assert!(!result.is_compilation);
         assert!(result.reason.contains("never-intercept"));
@@ -1161,6 +1194,7 @@ mod tests {
 
     #[test]
     fn test_bun_help_not_intercepted() {
+        let _guard = test_guard!();
         let result = classify_command("bun --help");
         assert!(!result.is_compilation);
         assert!(result.reason.contains("never-intercept"));
@@ -1174,6 +1208,7 @@ mod tests {
 
     #[test]
     fn test_bun_test_classification() {
+        let _guard = test_guard!();
         // Basic command
         let result = classify_command("bun test");
         assert!(result.is_compilation);
@@ -1208,6 +1243,7 @@ mod tests {
 
     #[test]
     fn test_bun_test_watch_not_intercepted() {
+        let _guard = test_guard!();
         // --watch mode is interactive and should NOT be intercepted
         let result = classify_command("bun test --watch");
         assert!(!result.is_compilation);
@@ -1233,6 +1269,7 @@ mod tests {
 
     #[test]
     fn test_bun_typecheck_watch_not_intercepted() {
+        let _guard = test_guard!();
         // --watch mode is interactive and should NOT be intercepted
         let result = classify_command("bun typecheck --watch");
         assert!(!result.is_compilation);
@@ -1245,6 +1282,7 @@ mod tests {
 
     #[test]
     fn test_bun_typecheck_classification() {
+        let _guard = test_guard!();
         // Basic command
         let result = classify_command("bun typecheck");
         assert!(result.is_compilation);
@@ -1262,6 +1300,7 @@ mod tests {
 
     #[test]
     fn test_bun_edge_cases_not_matched() {
+        let _guard = test_guard!();
         // Invalid commands should not match
         let result = classify_command("bun testing");
         assert!(!result.is_compilation);
@@ -1291,6 +1330,7 @@ mod tests {
 
     #[test]
     fn test_bun_test_vs_never_intercept() {
+        let _guard = test_guard!();
         // bun test should NOT be blocked by never-intercept
         let result = classify_command("bun test");
         assert!(!result.reason.contains("never-intercept"));
@@ -1299,6 +1339,7 @@ mod tests {
 
     #[test]
     fn test_bun_typecheck_vs_never_intercept() {
+        let _guard = test_guard!();
         // bun typecheck should NOT be blocked by never-intercept
         let result = classify_command("bun typecheck");
         assert!(!result.reason.contains("never-intercept"));
@@ -1309,6 +1350,7 @@ mod tests {
 
     #[test]
     fn test_bun_compilation_kind_serde() {
+        let _guard = test_guard!();
         // BunTest serialization
         let kind = CompilationKind::BunTest;
         let json = serde_json::to_string(&kind).unwrap();
@@ -1326,6 +1368,7 @@ mod tests {
 
     #[test]
     fn test_bun_kinds_are_distinct() {
+        let _guard = test_guard!();
         // BunTest and BunTypecheck are different
         assert_ne!(CompilationKind::BunTest, CompilationKind::BunTypecheck);
         // BunTest is different from CargoTest (different ecosystems)
@@ -1334,6 +1377,7 @@ mod tests {
 
     #[test]
     fn test_wrapped_command_classification_repro() {
+        let _guard = test_guard!();
         // This fails currently because classify_full expects command to start with "cargo"
         // Wrapper tools like "time", "sudo", "env" break this logic
         let result = classify_command("time cargo build");
@@ -1362,6 +1406,7 @@ mod tests {
 
     #[test]
     fn test_bun_piped_commands_not_intercepted() {
+        let _guard = test_guard!();
         // Piped commands should be rejected at Tier 1 (structure analysis)
         let result = classify_command("bun test | grep error");
         assert!(!result.is_compilation);
@@ -1383,6 +1428,7 @@ mod tests {
 
     #[test]
     fn test_bunx_tsc_not_intercepted() {
+        let _guard = test_guard!();
         // bunx (bun x) runs arbitrary packages - should NOT be intercepted
         // even for typecheck-like commands like tsc
         let result = classify_command("bun x tsc --noEmit");
@@ -1402,6 +1448,7 @@ mod tests {
 
     #[test]
     fn test_bun_redirected_not_intercepted() {
+        let _guard = test_guard!();
         // Output redirection should be rejected at Tier 1
         let result = classify_command("bun test > results.txt");
         assert!(!result.is_compilation);
@@ -1413,6 +1460,7 @@ mod tests {
 
     #[test]
     fn test_bun_backgrounded_not_intercepted() {
+        let _guard = test_guard!();
         // Backgrounded commands should be rejected at Tier 1
         let result = classify_command("bun test &");
         assert!(!result.is_compilation);
@@ -1421,6 +1469,7 @@ mod tests {
 
     #[test]
     fn test_bun_chained_commands_not_intercepted() {
+        let _guard = test_guard!();
         // Chained commands should be rejected at Tier 1
         let result = classify_command("bun test && echo done");
         assert!(!result.is_compilation);
@@ -1432,6 +1481,7 @@ mod tests {
 
     #[test]
     fn test_bun_subshell_capture_not_intercepted() {
+        let _guard = test_guard!();
         // Subshell capture should be rejected at Tier 1
         let result = classify_command("bun test $(echo src/)");
         assert!(!result.is_compilation);
@@ -1440,6 +1490,7 @@ mod tests {
 
     #[test]
     fn test_bun_wrapped_commands() {
+        let _guard = test_guard!();
         // Wrapped bun commands should still be classified
         // (requires normalize_command to handle wrappers)
         let result = classify_command("time bun test");
@@ -1457,6 +1508,7 @@ mod tests {
 
     #[test]
     fn test_classify_command_detailed_matches_basic() {
+        let _guard = test_guard!();
         let commands = [
             "cargo build",
             "cargo test --release",
@@ -1474,6 +1526,7 @@ mod tests {
 
     #[test]
     fn test_classify_command_detailed_rejects_piped() {
+        let _guard = test_guard!();
         let detailed = classify_command_detailed("cargo build | tee log.txt");
         assert!(!detailed.classification.is_compilation);
         let tier1 = detailed.tiers.iter().find(|t| t.tier == 1).unwrap();
@@ -1483,6 +1536,7 @@ mod tests {
 
     #[test]
     fn test_classify_command_detailed_normalizes_wrappers() {
+        let _guard = test_guard!();
         let detailed = classify_command_detailed("sudo cargo check");
         assert_eq!(detailed.normalized, "cargo check");
         assert!(detailed.classification.is_compilation);
@@ -1494,6 +1548,7 @@ mod tests {
 
     #[test]
     fn test_cargo_test_release() {
+        let _guard = test_guard!();
         let result = classify_command("cargo test --release");
         assert!(
             result.is_compilation,
@@ -1505,6 +1560,7 @@ mod tests {
 
     #[test]
     fn test_cargo_test_specific_test_name() {
+        let _guard = test_guard!();
         let result = classify_command("cargo test my_test_function");
         assert!(
             result.is_compilation,
@@ -1515,6 +1571,7 @@ mod tests {
 
     #[test]
     fn test_cargo_test_with_nocapture() {
+        let _guard = test_guard!();
         let result = classify_command("cargo test -- --nocapture");
         assert!(
             result.is_compilation,
@@ -1525,6 +1582,7 @@ mod tests {
 
     #[test]
     fn test_cargo_test_workspace() {
+        let _guard = test_guard!();
         let result = classify_command("cargo test --workspace");
         assert!(
             result.is_compilation,
@@ -1535,6 +1593,7 @@ mod tests {
 
     #[test]
     fn test_cargo_test_package() {
+        let _guard = test_guard!();
         let result = classify_command("cargo test -p rch-common");
         assert!(result.is_compilation, "cargo test -p should be classified");
         assert_eq!(result.kind, Some(CompilationKind::CargoTest));
@@ -1542,6 +1601,7 @@ mod tests {
 
     #[test]
     fn test_cargo_test_short_alias() {
+        let _guard = test_guard!();
         // cargo t is an alias for cargo test
         let result = classify_command("cargo t");
         assert!(
@@ -1553,6 +1613,7 @@ mod tests {
 
     #[test]
     fn test_cargo_test_all_features() {
+        let _guard = test_guard!();
         let result = classify_command("cargo test --all-features");
         assert!(
             result.is_compilation,
@@ -1563,6 +1624,7 @@ mod tests {
 
     #[test]
     fn test_cargo_test_no_default_features() {
+        let _guard = test_guard!();
         let result = classify_command("cargo test --no-default-features");
         assert!(
             result.is_compilation,
@@ -1573,6 +1635,7 @@ mod tests {
 
     #[test]
     fn test_cargo_test_with_env_var() {
+        let _guard = test_guard!();
         let result = classify_command("RUST_BACKTRACE=1 cargo test");
         assert!(
             result.is_compilation,
@@ -1583,6 +1646,7 @@ mod tests {
 
     #[test]
     fn test_cargo_test_with_multiple_flags() {
+        let _guard = test_guard!();
         let result = classify_command("cargo test --release --workspace -p rch -- --nocapture");
         assert!(
             result.is_compilation,
@@ -1593,6 +1657,7 @@ mod tests {
 
     #[test]
     fn test_cargo_test_with_jobs() {
+        let _guard = test_guard!();
         let result = classify_command("cargo test -j 8");
         assert!(result.is_compilation, "cargo test -j should be classified");
         assert_eq!(result.kind, Some(CompilationKind::CargoTest));
@@ -1600,6 +1665,7 @@ mod tests {
 
     #[test]
     fn test_cargo_test_target() {
+        let _guard = test_guard!();
         let result = classify_command("cargo test --target x86_64-unknown-linux-gnu");
         assert!(
             result.is_compilation,
@@ -1610,6 +1676,7 @@ mod tests {
 
     #[test]
     fn test_cargo_test_lib() {
+        let _guard = test_guard!();
         let result = classify_command("cargo test --lib");
         assert!(
             result.is_compilation,
@@ -1620,6 +1687,7 @@ mod tests {
 
     #[test]
     fn test_cargo_test_bins() {
+        let _guard = test_guard!();
         let result = classify_command("cargo test --bins");
         assert!(
             result.is_compilation,
@@ -1630,6 +1698,7 @@ mod tests {
 
     #[test]
     fn test_cargo_test_doc() {
+        let _guard = test_guard!();
         let result = classify_command("cargo test --doc");
         assert!(
             result.is_compilation,
@@ -1640,6 +1709,7 @@ mod tests {
 
     #[test]
     fn test_cargo_test_filter_pattern() {
+        let _guard = test_guard!();
         let result = classify_command("cargo test test_classification");
         assert!(
             result.is_compilation,
@@ -1650,6 +1720,7 @@ mod tests {
 
     #[test]
     fn test_cargo_test_exact() {
+        let _guard = test_guard!();
         let result = classify_command("cargo test --exact my_test");
         assert!(
             result.is_compilation,
@@ -1664,6 +1735,7 @@ mod tests {
 
     #[test]
     fn test_nextest_keyword_detected() {
+        let _guard = test_guard!();
         // Verify "nextest" triggers keyword detection (Tier 2 passes)
         assert!(contains_compilation_keyword("cargo nextest run"));
         assert!(contains_compilation_keyword("cargo nextest list"));
@@ -1671,6 +1743,7 @@ mod tests {
 
     #[test]
     fn test_cargo_nextest_run_classification() {
+        let _guard = test_guard!();
         // Basic command
         let result = classify_command("cargo nextest run");
         assert!(
@@ -1683,6 +1756,7 @@ mod tests {
 
     #[test]
     fn test_cargo_nextest_run_with_flags() {
+        let _guard = test_guard!();
         // With release flag
         let result = classify_command("cargo nextest run --release");
         assert!(result.is_compilation);
@@ -1716,6 +1790,7 @@ mod tests {
 
     #[test]
     fn test_cargo_nextest_run_short_alias() {
+        let _guard = test_guard!();
         // cargo nextest r is an alias for cargo nextest run
         let result = classify_command("cargo nextest r");
         assert!(
@@ -1727,6 +1802,7 @@ mod tests {
 
     #[test]
     fn test_cargo_nextest_list_not_intercepted() {
+        let _guard = test_guard!();
         // cargo nextest list only shows tests, doesn't run them
         let result = classify_command("cargo nextest list");
         assert!(!result.is_compilation);
@@ -1735,6 +1811,7 @@ mod tests {
 
     #[test]
     fn test_cargo_nextest_archive_not_intercepted() {
+        let _guard = test_guard!();
         // cargo nextest archive creates archives
         let result = classify_command("cargo nextest archive");
         assert!(!result.is_compilation);
@@ -1743,6 +1820,7 @@ mod tests {
 
     #[test]
     fn test_cargo_nextest_show_not_intercepted() {
+        let _guard = test_guard!();
         // cargo nextest show displays config info
         let result = classify_command("cargo nextest show");
         assert!(!result.is_compilation);
@@ -1751,6 +1829,7 @@ mod tests {
 
     #[test]
     fn test_bare_cargo_nextest_not_intercepted() {
+        let _guard = test_guard!();
         // bare "cargo nextest" without subcommand
         let result = classify_command("cargo nextest");
         assert!(!result.is_compilation);
@@ -1759,6 +1838,7 @@ mod tests {
 
     #[test]
     fn test_cargo_nextest_wrapped_commands() {
+        let _guard = test_guard!();
         // Wrapped nextest commands should still be classified
         let result = classify_command("time cargo nextest run");
         assert!(
@@ -1777,6 +1857,7 @@ mod tests {
 
     #[test]
     fn test_cargo_nextest_compilation_kind_serde() {
+        let _guard = test_guard!();
         // CargoNextest serialization
         let kind = CompilationKind::CargoNextest;
         let json = serde_json::to_string(&kind).unwrap();
@@ -1787,6 +1868,7 @@ mod tests {
 
     #[test]
     fn test_cargo_nextest_vs_cargo_test_distinct() {
+        let _guard = test_guard!();
         // CargoNextest and CargoTest are different
         assert_ne!(CompilationKind::CargoNextest, CompilationKind::CargoTest);
 
@@ -1801,6 +1883,7 @@ mod tests {
 
     #[test]
     fn test_cargo_nextest_piped_not_intercepted() {
+        let _guard = test_guard!();
         // Piped commands should be rejected at Tier 1
         let result = classify_command("cargo nextest run | grep FAIL");
         assert!(!result.is_compilation);
@@ -1809,6 +1892,7 @@ mod tests {
 
     #[test]
     fn test_cargo_nextest_redirected_not_intercepted() {
+        let _guard = test_guard!();
         // Redirected commands should be rejected at Tier 1
         let result = classify_command("cargo nextest run > results.txt");
         assert!(!result.is_compilation);
@@ -1817,6 +1901,7 @@ mod tests {
 
     #[test]
     fn test_cargo_nextest_backgrounded_not_intercepted() {
+        let _guard = test_guard!();
         // Backgrounded commands should be rejected at Tier 1
         let result = classify_command("cargo nextest run &");
         assert!(!result.is_compilation);
@@ -1829,6 +1914,7 @@ mod tests {
 
     #[test]
     fn test_cargo_bench_classification() {
+        let _guard = test_guard!();
         let result = classify_command("cargo bench");
         assert!(result.is_compilation, "cargo bench should be classified");
         assert_eq!(result.kind, Some(CompilationKind::CargoBench));
@@ -1837,6 +1923,7 @@ mod tests {
 
     #[test]
     fn test_cargo_bench_with_filter() {
+        let _guard = test_guard!();
         // Benchmarks with name filter
         let result = classify_command("cargo bench my_bench");
         assert!(result.is_compilation);
@@ -1845,6 +1932,7 @@ mod tests {
 
     #[test]
     fn test_cargo_bench_with_flags() {
+        let _guard = test_guard!();
         // With release flag (benchmarks typically use release)
         let result = classify_command("cargo bench --release");
         assert!(result.is_compilation);
@@ -1868,6 +1956,7 @@ mod tests {
 
     #[test]
     fn test_cargo_bench_wrapped() {
+        let _guard = test_guard!();
         // Wrapped with time
         let result = classify_command("time cargo bench");
         assert!(
@@ -1884,6 +1973,7 @@ mod tests {
 
     #[test]
     fn test_cargo_bench_serde() {
+        let _guard = test_guard!();
         // CargoBench serialization
         let kind = CompilationKind::CargoBench;
         let json = serde_json::to_string(&kind).unwrap();
@@ -1894,6 +1984,7 @@ mod tests {
 
     #[test]
     fn test_cargo_bench_distinct_from_test() {
+        let _guard = test_guard!();
         // CargoBench and CargoTest are different
         assert_ne!(CompilationKind::CargoBench, CompilationKind::CargoTest);
 
@@ -1908,6 +1999,7 @@ mod tests {
 
     #[test]
     fn test_cargo_bench_piped_not_intercepted() {
+        let _guard = test_guard!();
         // Piped commands should be rejected at Tier 1
         let result = classify_command("cargo bench | tee output.txt");
         assert!(!result.is_compilation);
@@ -1917,6 +2009,7 @@ mod tests {
     #[test]
 
     fn test_normalize_path_and_wrapper_bug_repro() {
+        let _guard = test_guard!();
         // Case: /usr/bin/time cargo build
 
         // Current behavior: strips path -> "time cargo build", then returns.
@@ -1940,6 +2033,7 @@ mod tests {
 
     #[test]
     fn test_command_base_rust() {
+        let _guard = test_guard!();
         assert_eq!(CompilationKind::CargoBuild.command_base(), "cargo");
         assert_eq!(CompilationKind::CargoTest.command_base(), "cargo");
         assert_eq!(CompilationKind::CargoCheck.command_base(), "cargo");
@@ -1952,6 +2046,7 @@ mod tests {
 
     #[test]
     fn test_command_base_c_cpp() {
+        let _guard = test_guard!();
         assert_eq!(CompilationKind::Gcc.command_base(), "gcc");
         assert_eq!(CompilationKind::Gpp.command_base(), "g++");
         assert_eq!(CompilationKind::Clang.command_base(), "clang");
@@ -1960,6 +2055,7 @@ mod tests {
 
     #[test]
     fn test_command_base_build_systems() {
+        let _guard = test_guard!();
         assert_eq!(CompilationKind::Make.command_base(), "make");
         assert_eq!(CompilationKind::CmakeBuild.command_base(), "cmake");
         assert_eq!(CompilationKind::Ninja.command_base(), "ninja");
@@ -1968,6 +2064,7 @@ mod tests {
 
     #[test]
     fn test_command_base_bun() {
+        let _guard = test_guard!();
         assert_eq!(CompilationKind::BunTest.command_base(), "bun");
         assert_eq!(CompilationKind::BunTypecheck.command_base(), "bun");
     }
@@ -2156,6 +2253,7 @@ mod tests {
             // Test 8: Empty-ish strings handled correctly
             #[test]
             fn test_classify_whitespace_variants(s in "[ \t\n\r]{0,20}") {
+        let _guard = test_guard!();
                 let result = classify_command(&s);
                 prop_assert!(!result.is_compilation,
                     "Whitespace-only command should not be classified as compilation: {:?}", s);
@@ -2253,6 +2351,7 @@ mod tests {
         // Regression test: ensure specific problematic inputs are handled
         #[test]
         fn test_known_edge_cases() {
+            let _guard = test_guard!();
             // These are edge cases that might have caused issues
             let edge_cases = [
                 "",
@@ -2302,6 +2401,7 @@ mod tests {
         // Test that detailed classification matches simple classification
         #[test]
         fn test_detailed_matches_simple_proptest() {
+            let _guard = test_guard!();
             let test_cases = [
                 "cargo build --release",
                 "cargo test",

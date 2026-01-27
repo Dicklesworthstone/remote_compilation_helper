@@ -491,9 +491,9 @@ fn format_elapsed(duration: std::time::Duration) -> String {
 mod tests {
     use super::*;
     use crate::status_types::{
-        ActiveBuildFromApi, BuildStatsFromApi, DaemonFullStatusResponse, DaemonInfoFromApi,
-        IssueFromApi,
+        ActiveBuildFromApi, BuildStatsFromApi, DaemonInfoFromApi, IssueFromApi,
     };
+    use rch_common::test_guard;
 
     fn sample_status() -> DaemonFullStatusResponse {
         DaemonFullStatusResponse {
@@ -539,6 +539,7 @@ mod tests {
 
     #[test]
     fn test_status_table_creation() {
+        let _guard = test_guard!();
         let status = sample_status();
         let ctx = OutputContext::Plain;
         let table = StatusTable::new(&status, ctx);
@@ -547,6 +548,7 @@ mod tests {
 
     #[test]
     fn test_status_table_from_status() {
+        let _guard = test_guard!();
         let status = sample_status();
         let table = StatusTable::from_status(&status);
         // Should not panic, context is auto-detected
@@ -555,24 +557,28 @@ mod tests {
 
     #[test]
     fn test_format_ms_duration_milliseconds() {
+        let _guard = test_guard!();
         assert_eq!(format_ms_duration(500), "500ms");
         assert_eq!(format_ms_duration(999), "999ms");
     }
 
     #[test]
     fn test_format_ms_duration_seconds() {
+        let _guard = test_guard!();
         assert_eq!(format_ms_duration(1000), "1.0s");
         assert_eq!(format_ms_duration(5500), "5.5s");
     }
 
     #[test]
     fn test_truncate_command_short() {
+        let _guard = test_guard!();
         let cmd = "cargo build";
         assert_eq!(truncate_command(cmd, 40), "cargo build");
     }
 
     #[test]
     fn test_truncate_command_long() {
+        let _guard = test_guard!();
         let cmd = "cargo build --release --target x86_64-unknown-linux-gnu --features full";
         let truncated = truncate_command(cmd, 40);
         assert!(truncated.len() <= 40);
@@ -581,6 +587,7 @@ mod tests {
 
     #[test]
     fn test_truncate_command_preserves_release_flag() {
+        let _guard = test_guard!();
         let cmd = "cargo build --target x86_64-unknown-linux-gnu --features full --release";
         let truncated = truncate_command(cmd, 40);
         // Should preserve --release since it's an important suffix
@@ -592,6 +599,7 @@ mod tests {
 
     #[test]
     fn test_truncate_command_preserves_package() {
+        let _guard = test_guard!();
         let cmd = "cargo test -p my-important-package --release";
         let truncated = truncate_command(cmd, 35);
         // Should try to preserve package name or important suffix
@@ -600,6 +608,7 @@ mod tests {
 
     #[test]
     fn test_format_elapsed_seconds() {
+        let _guard = test_guard!();
         use std::time::Duration;
         assert_eq!(format_elapsed(Duration::from_secs(30)), "30s");
         assert_eq!(format_elapsed(Duration::from_secs(59)), "59s");
@@ -607,6 +616,7 @@ mod tests {
 
     #[test]
     fn test_format_elapsed_minutes() {
+        let _guard = test_guard!();
         use std::time::Duration;
         assert_eq!(format_elapsed(Duration::from_secs(90)), "1m 30s");
         assert_eq!(format_elapsed(Duration::from_secs(3599)), "59m 59s");
@@ -614,6 +624,7 @@ mod tests {
 
     #[test]
     fn test_format_elapsed_hours() {
+        let _guard = test_guard!();
         use std::time::Duration;
         assert_eq!(format_elapsed(Duration::from_secs(3600)), "1h 0m");
         assert_eq!(format_elapsed(Duration::from_secs(7200 + 1800)), "2h 30m");
@@ -621,6 +632,7 @@ mod tests {
 
     #[test]
     fn test_render_plain_mode() {
+        let _guard = test_guard!();
         let status = sample_status();
         let console = RchConsole::with_context(OutputContext::Plain);
         let table = StatusTable::new(&status, OutputContext::Plain);
@@ -630,6 +642,7 @@ mod tests {
 
     #[test]
     fn test_render_machine_mode_no_output() {
+        let _guard = test_guard!();
         let status = sample_status();
         let console = RchConsole::with_context(OutputContext::Machine);
         let table = StatusTable::new(&status, OutputContext::Machine);
@@ -639,6 +652,7 @@ mod tests {
 
     #[test]
     fn test_daemon_offline_plain() {
+        let _guard = test_guard!();
         let console = RchConsole::with_context(OutputContext::Plain);
         // Should not panic
         render_daemon_offline(&console);
@@ -646,6 +660,7 @@ mod tests {
 
     #[test]
     fn test_daemon_offline_machine_mode() {
+        let _guard = test_guard!();
         let console = RchConsole::with_context(OutputContext::Machine);
         // Should not panic, should do nothing
         render_daemon_offline(&console);

@@ -1412,13 +1412,13 @@ pub fn default_c_cpp_artifact_patterns() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rch_common::mock;
+    use rch_common::WorkerId;
     use rch_common::mock::Phase;
-    use rch_common::{ColorMode, WorkerConfig, WorkerId};
-    use std::collections::HashMap;
+    use rch_common::test_guard;
 
     #[test]
     fn test_remote_path() {
+        let _guard = test_guard!();
         let pipeline = TransferPipeline::new(
             PathBuf::from("/home/user/project"),
             "myproject".to_string(),
@@ -1431,6 +1431,7 @@ mod tests {
 
     #[test]
     fn test_project_id_from_path() {
+        let _guard = test_guard!();
         assert_eq!(
             project_id_from_path(Path::new("/home/user/my-project")),
             "my-project"
@@ -1443,6 +1444,7 @@ mod tests {
 
     #[test]
     fn test_parse_rsync_bytes() {
+        let _guard = test_guard!();
         let output = "sent 1,234 bytes  received 567 bytes  1800.50 bytes/sec";
         assert_eq!(parse_rsync_bytes(output), 1234);
 
@@ -1452,6 +1454,7 @@ mod tests {
 
     #[test]
     fn test_parse_rsync_bytes_total_format() {
+        let _guard = test_guard!();
         // Test "Total bytes sent:" format (newer rsync versions)
         let output = "Total bytes sent: 45,678\nTotal bytes received: 123";
         assert_eq!(parse_rsync_bytes(output), 45678);
@@ -1459,18 +1462,21 @@ mod tests {
 
     #[test]
     fn test_parse_rsync_bytes_no_commas() {
+        let _guard = test_guard!();
         let output = "sent 999 bytes  received 100 bytes  1000.00 bytes/sec";
         assert_eq!(parse_rsync_bytes(output), 999);
     }
 
     #[test]
     fn test_parse_rsync_bytes_large_number() {
+        let _guard = test_guard!();
         let output = "sent 1,234,567,890 bytes  received 100 bytes  total";
         assert_eq!(parse_rsync_bytes(output), 1234567890);
     }
 
     #[test]
     fn test_parse_rsync_files() {
+        let _guard = test_guard!();
         // Test "Number of files transferred:" format
         let output = "Number of files transferred: 42";
         assert_eq!(parse_rsync_files(output), 42);
@@ -1478,12 +1484,14 @@ mod tests {
 
     #[test]
     fn test_parse_rsync_files_with_comma() {
+        let _guard = test_guard!();
         let output = "Number of files transferred: 1,234";
         assert_eq!(parse_rsync_files(output), 1234);
     }
 
     #[test]
     fn test_parse_rsync_files_number_of_files_format() {
+        let _guard = test_guard!();
         // Test "Number of files:" format (alternate rsync output)
         let output = "Number of files: 100\nsome other line";
         assert_eq!(parse_rsync_files(output), 100);
@@ -1491,12 +1499,14 @@ mod tests {
 
     #[test]
     fn test_parse_rsync_files_empty() {
+        let _guard = test_guard!();
         let empty = "";
         assert_eq!(parse_rsync_files(empty), 0);
     }
 
     #[test]
     fn test_parse_rsync_files_fallback_count() {
+        let _guard = test_guard!();
         // When no "Number of files" line exists, count non-empty non-"sent" lines
         let output = "file1.txt\nfile2.txt\nfile3.txt";
         assert_eq!(parse_rsync_files(output), 3);
@@ -1504,6 +1514,7 @@ mod tests {
 
     #[test]
     fn test_parse_rsync_files_fallback_excludes_sent_line() {
+        let _guard = test_guard!();
         // The fallback should exclude lines containing "sent"
         let output = "file1.txt\nfile2.txt\nsent 100 bytes";
         assert_eq!(parse_rsync_files(output), 2);
@@ -1511,6 +1522,7 @@ mod tests {
 
     #[test]
     fn test_default_artifact_patterns() {
+        let _guard = test_guard!();
         let patterns = default_rust_artifact_patterns();
         assert!(!patterns.is_empty());
         assert!(patterns.iter().any(|p| p.contains("debug")));
@@ -1519,6 +1531,7 @@ mod tests {
 
     #[test]
     fn test_default_bun_artifact_patterns() {
+        let _guard = test_guard!();
         let patterns = default_bun_artifact_patterns();
         assert!(!patterns.is_empty());
         assert!(patterns.iter().any(|p| p.contains("coverage")));
@@ -1527,6 +1540,7 @@ mod tests {
 
     #[test]
     fn test_default_rust_test_artifact_patterns() {
+        let _guard = test_guard!();
         let patterns = default_rust_test_artifact_patterns();
         // Test patterns should be non-empty but minimal
         assert!(!patterns.is_empty());
@@ -1545,6 +1559,7 @@ mod tests {
 
     #[test]
     fn test_rust_test_patterns_vs_full_patterns() {
+        let _guard = test_guard!();
         let test_patterns = default_rust_test_artifact_patterns();
         let full_patterns = default_rust_artifact_patterns();
 
@@ -1563,6 +1578,7 @@ mod tests {
 
     #[test]
     fn test_compute_project_hash_basic() {
+        let _guard = test_guard!();
         use std::fs;
         use tempfile::tempdir;
 
@@ -1579,6 +1595,7 @@ mod tests {
 
     #[test]
     fn test_compute_project_hash_different_paths() {
+        let _guard = test_guard!();
         use tempfile::tempdir;
 
         let dir1 = tempdir().expect("create temp dir 1");
@@ -1593,6 +1610,7 @@ mod tests {
 
     #[test]
     fn test_compute_project_hash_includes_key_files() {
+        let _guard = test_guard!();
         use std::fs;
         use std::thread::sleep;
         use std::time::Duration;
@@ -1615,12 +1633,14 @@ mod tests {
 
     #[test]
     fn test_project_id_from_path_root() {
+        let _guard = test_guard!();
         // Test with root path - falls back to "unknown" since "/" has no file_name
         assert_eq!(project_id_from_path(Path::new("/")), "unknown");
     }
 
     #[test]
     fn test_project_id_from_path_with_special_chars() {
+        let _guard = test_guard!();
         // Test with path containing underscores and dashes
         assert_eq!(
             project_id_from_path(Path::new("/home/user/my_project-v2")),
@@ -1630,6 +1650,7 @@ mod tests {
 
     #[test]
     fn test_default_c_cpp_artifact_patterns() {
+        let _guard = test_guard!();
         let patterns = default_c_cpp_artifact_patterns();
         assert!(!patterns.is_empty());
         assert!(patterns.iter().any(|p| p.contains("build")));
@@ -1639,6 +1660,7 @@ mod tests {
 
     #[test]
     fn test_transfer_pipeline_builder_methods() {
+        let _guard = test_guard!();
         let pipeline = TransferPipeline::new(
             PathBuf::from("/tmp/test"),
             "test-project".to_string(),
@@ -1653,6 +1675,7 @@ mod tests {
 
     #[test]
     fn test_transfer_pipeline_with_ssh_options() {
+        let _guard = test_guard!();
         let custom_options = SshOptions {
             connect_timeout: std::time::Duration::from_secs(30),
             command_timeout: std::time::Duration::from_secs(120),
@@ -1674,6 +1697,7 @@ mod tests {
 
     #[test]
     fn test_build_sync_command_includes_keepalive_and_controlpersist_when_set() {
+        let _guard = test_guard!();
         let custom_options = SshOptions {
             server_alive_interval: Some(std::time::Duration::from_secs(30)),
             control_persist_idle: Some(std::time::Duration::from_secs(60)),
@@ -1723,6 +1747,7 @@ mod tests {
 
     #[test]
     fn test_sync_result_struct() {
+        let _guard = test_guard!();
         let result = SyncResult {
             bytes_transferred: 1024,
             files_transferred: 10,
@@ -1740,6 +1765,7 @@ mod tests {
 
     #[test]
     fn test_execute_remote_applies_env_allowlist() {
+        let _guard = test_guard!();
         mock::clear_global_invocations();
         mock::set_mock_enabled_override(Some(true));
 
@@ -1801,6 +1827,7 @@ mod tests {
 
     #[test]
     fn test_remote_path_with_custom_remote_base() {
+        let _guard = test_guard!();
         let config = TransferConfig {
             remote_base: "/var/rch-builds".to_string(),
             ..Default::default()
@@ -1818,6 +1845,7 @@ mod tests {
 
     #[test]
     fn test_remote_path_with_home_directory_base() {
+        let _guard = test_guard!();
         let config = TransferConfig {
             remote_base: "/home/builder/.rch".to_string(),
             ..Default::default()
@@ -1839,6 +1867,7 @@ mod tests {
 
     #[test]
     fn test_parse_rchignore_content_basic() {
+        let _guard = test_guard!();
         let content = "target/\n.git/objects/\nnode_modules/";
         let patterns = parse_rchignore_content(content);
         assert_eq!(patterns, vec!["target/", ".git/objects/", "node_modules/"]);
@@ -1846,6 +1875,7 @@ mod tests {
 
     #[test]
     fn test_parse_rchignore_content_with_comments() {
+        let _guard = test_guard!();
         let content = r#"# Build artifacts
 target/
 # Git internals
@@ -1858,6 +1888,7 @@ node_modules/"#;
 
     #[test]
     fn test_parse_rchignore_content_with_blank_lines() {
+        let _guard = test_guard!();
         let content = r#"
 target/
 
@@ -1872,6 +1903,7 @@ node_modules/
 
     #[test]
     fn test_parse_rchignore_content_trims_whitespace() {
+        let _guard = test_guard!();
         let content = "  target/  \n\t.git/objects/\t\n   node_modules/   ";
         let patterns = parse_rchignore_content(content);
         assert_eq!(patterns, vec!["target/", ".git/objects/", "node_modules/"]);
@@ -1879,6 +1911,7 @@ node_modules/
 
     #[test]
     fn test_parse_rchignore_content_empty() {
+        let _guard = test_guard!();
         let content = "";
         let patterns = parse_rchignore_content(content);
         assert!(patterns.is_empty());
@@ -1886,6 +1919,7 @@ node_modules/
 
     #[test]
     fn test_parse_rchignore_content_only_comments() {
+        let _guard = test_guard!();
         let content = "# This is a comment\n# Another comment";
         let patterns = parse_rchignore_content(content);
         assert!(patterns.is_empty());
@@ -1893,6 +1927,7 @@ node_modules/
 
     #[test]
     fn test_parse_rchignore_content_preserves_negation_literal() {
+        let _guard = test_guard!();
         // Note: Unlike .gitignore, negation is not supported, ! is literal
         let content = "target/\n!important.txt\n.git/";
         let patterns = parse_rchignore_content(content);
@@ -1901,12 +1936,14 @@ node_modules/
 
     #[test]
     fn test_parse_rchignore_file_not_found() {
+        let _guard = test_guard!();
         let result = parse_rchignore(Path::new("/nonexistent/.rchignore"));
         assert!(result.is_err());
     }
 
     #[test]
     fn test_get_effective_excludes_without_rchignore() {
+        let _guard = test_guard!();
         // When no .rchignore exists, should return config defaults
         let config = TransferConfig::default();
         let default_count = config.exclude_patterns.len();
@@ -1924,6 +1961,7 @@ node_modules/
 
     #[test]
     fn test_get_effective_excludes_with_rchignore() {
+        let _guard = test_guard!();
         // Create a temp dir with .rchignore
         let temp_dir = tempfile::tempdir().expect("create temp dir");
         let rchignore_path = temp_dir.path().join(".rchignore");
@@ -1948,6 +1986,7 @@ node_modules/
 
     #[test]
     fn test_get_effective_excludes_deduplicates() {
+        let _guard = test_guard!();
         // Create a temp dir with .rchignore that overlaps with defaults
         let temp_dir = tempfile::tempdir().expect("create temp dir");
         let rchignore_path = temp_dir.path().join(".rchignore");
@@ -1979,6 +2018,7 @@ node_modules/
 
     #[test]
     fn test_parse_rsync_total_size_standard() {
+        let _guard = test_guard!();
         let output = "Number of files: 1,234
 Total file size: 56,789,012 bytes
 Total transferred file size: 1,234,567 bytes";
@@ -1987,24 +2027,28 @@ Total transferred file size: 1,234,567 bytes";
 
     #[test]
     fn test_parse_rsync_total_size_no_commas() {
+        let _guard = test_guard!();
         let output = "Total file size: 123456 bytes";
         assert_eq!(parse_rsync_total_size(output), Some(123456));
     }
 
     #[test]
     fn test_parse_rsync_total_size_transferred() {
+        let _guard = test_guard!();
         let output = "Total transferred file size: 9,876,543 bytes";
         assert_eq!(parse_rsync_total_size(output), Some(9876543));
     }
 
     #[test]
     fn test_parse_rsync_total_size_missing() {
+        let _guard = test_guard!();
         let output = "sent 100 bytes received 200 bytes";
         assert_eq!(parse_rsync_total_size(output), None);
     }
 
     #[test]
     fn test_parse_rsync_total_files_standard() {
+        let _guard = test_guard!();
         let output = "Number of files: 1,234 (reg: 1,000, dir: 234)
 Total file size: 56,789,012 bytes";
         assert_eq!(parse_rsync_total_files(output), Some(1234));
@@ -2012,6 +2056,7 @@ Total file size: 56,789,012 bytes";
 
     #[test]
     fn test_parse_rsync_total_files_no_commas() {
+        let _guard = test_guard!();
         let output = "Number of files: 456
 Total file size: 123 bytes";
         assert_eq!(parse_rsync_total_files(output), Some(456));
@@ -2019,18 +2064,21 @@ Total file size: 123 bytes";
 
     #[test]
     fn test_parse_rsync_total_files_transferred() {
+        let _guard = test_guard!();
         let output = "Number of regular files transferred: 789";
         assert_eq!(parse_rsync_total_files(output), Some(789));
     }
 
     #[test]
     fn test_parse_rsync_total_files_missing() {
+        let _guard = test_guard!();
         let output = "Total file size: 100 bytes";
         assert_eq!(parse_rsync_total_files(output), None);
     }
 
     #[test]
     fn test_transfer_config_optimization_defaults() {
+        let _guard = test_guard!();
         let config = TransferConfig::default();
         assert!(config.max_transfer_mb.is_none());
         assert!(config.max_transfer_time_ms.is_none());
@@ -2040,6 +2088,7 @@ Total file size: 123 bytes";
 
     #[test]
     fn test_transfer_config_with_optimization_options() {
+        let _guard = test_guard!();
         let config = TransferConfig {
             max_transfer_mb: Some(500),
             max_transfer_time_ms: Some(5000),
@@ -2055,6 +2104,7 @@ Total file size: 123 bytes";
 
     #[test]
     fn test_transfer_estimate_struct() {
+        let _guard = test_guard!();
         let estimate = TransferEstimate {
             bytes: 1024 * 1024 * 50, // 50 MB
             files: 100,
@@ -2069,6 +2119,7 @@ Total file size: 123 bytes";
 
     #[test]
     fn test_build_sync_command_with_bwlimit() {
+        let _guard = test_guard!();
         let config = TransferConfig {
             bwlimit_kbps: Some(5000),
             ..Default::default()
@@ -2109,6 +2160,7 @@ Total file size: 123 bytes";
 
     #[test]
     fn test_build_sync_command_without_bwlimit() {
+        let _guard = test_guard!();
         let config = TransferConfig::default();
 
         let pipeline = TransferPipeline::new(
@@ -2147,6 +2199,7 @@ Total file size: 123 bytes";
 
     #[test]
     fn test_build_sync_command_bwlimit_zero_disabled() {
+        let _guard = test_guard!();
         let config = TransferConfig {
             bwlimit_kbps: Some(0), // Explicitly 0 = disabled
             ..Default::default()

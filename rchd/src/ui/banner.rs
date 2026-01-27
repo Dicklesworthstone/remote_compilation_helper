@@ -231,7 +231,8 @@ impl DaemonBanner {
 
 #[cfg(test)]
 mod tests {
-        use rch_common::test_guard;
+    use super::*;
+    use rch_common::test_guard;
 
     fn test_banner() -> DaemonBanner {
         DaemonBanner::new(

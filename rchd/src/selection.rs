@@ -1846,9 +1846,10 @@ fn normalize_priority(priority: u32, min_priority: u32, max_priority: u32) -> f6
 
 #[cfg(test)]
 mod tests {
-        use rch_common::test_guard;
+    use super::*;
     use crate::workers::WorkerState;
     use rch_common::WorkerStatus;
+    use rch_common::test_guard;
     use rch_common::{
         CommandPriority, RequiredRuntime, SelectionWeightConfig, WorkerConfig, WorkerId,
     };
@@ -3838,14 +3839,14 @@ mod tests {
 
         #[test]
         fn test_cache_state_last_activity_none() {
-        let _guard = test_guard!();
+            let _guard = test_guard!();
             let state = CacheState::default();
             assert!(state.last_activity().is_none());
         }
 
         #[test]
         fn test_cache_state_last_activity_build_only() {
-        let _guard = test_guard!();
+            let _guard = test_guard!();
             let now = Instant::now();
             let state = CacheState {
                 last_build: Some(now),
@@ -3857,7 +3858,7 @@ mod tests {
 
         #[test]
         fn test_cache_state_last_activity_test_only() {
-        let _guard = test_guard!();
+            let _guard = test_guard!();
             let now = Instant::now();
             let state = CacheState {
                 last_build: None,
@@ -3869,7 +3870,7 @@ mod tests {
 
         #[test]
         fn test_cache_state_last_activity_both_returns_max() {
-        let _guard = test_guard!();
+            let _guard = test_guard!();
             let earlier = Instant::now();
             // Sleep briefly to ensure later > earlier
             std::thread::sleep(Duration::from_millis(1));
@@ -3896,7 +3897,7 @@ mod tests {
 
         #[test]
         fn test_normalize_latency_extreme_values() {
-        let _guard = test_guard!();
+            let _guard = test_guard!();
             // Test u64::MAX doesn't panic or produce NaN
             let score = WorkerSelector::normalize_latency_ms(u64::MAX);
             assert!(score >= 0.0);
@@ -3906,7 +3907,7 @@ mod tests {
 
         #[test]
         fn test_normalize_priority_edge_cases() {
-        let _guard = test_guard!();
+            let _guard = test_guard!();
             // Priority below min (saturating_sub handles this)
             let score = WorkerSelector::normalize_priority(0, 100, 200);
             assert!((score - 0.0).abs() < f64::EPSILON);
@@ -3918,7 +3919,7 @@ mod tests {
 
         #[test]
         fn test_selection_history_prune() {
-        let _guard = test_guard!();
+            let _guard = test_guard!();
             let mut history = SelectionHistory::new();
 
             // Record some selections
@@ -3937,7 +3938,7 @@ mod tests {
 
         #[test]
         fn test_audit_log_empty_operations() {
-        let _guard = test_guard!();
+            let _guard = test_guard!();
             let log = SelectionAuditLog::new(10);
             assert!(log.is_empty());
             assert_eq!(log.len(), 0);

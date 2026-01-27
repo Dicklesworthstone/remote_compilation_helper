@@ -7,6 +7,7 @@ use rch_common::e2e::{
     HarnessError, HarnessResult, LogLevel, LogSource, TestHarness, TestHarnessBuilder,
     WorkersFixture,
 };
+use rch_common::test_guard;
 use serde_json::Value;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -98,6 +99,7 @@ fn assert_json_success(harness: &TestHarness, json: &Value, context: &str) -> Ha
 
 #[test]
 fn test_fleet_deploy_all_workers() {
+    let _guard = test_guard!();
     let mut harness = create_fleet_harness("fleet_deploy_all_workers").unwrap();
     let _env = setup_fleet_env(&mut harness, 3).unwrap();
 
@@ -137,6 +139,7 @@ fn test_fleet_deploy_all_workers() {
 
 #[test]
 fn test_fleet_partial_deploy() {
+    let _guard = test_guard!();
     let mut harness = create_fleet_harness("fleet_partial_deploy").unwrap();
     let _env = setup_fleet_env(&mut harness, 3).unwrap();
 
@@ -166,6 +169,7 @@ fn test_fleet_partial_deploy() {
 
 #[test]
 fn test_fleet_rollback_to_version() {
+    let _guard = test_guard!();
     let mut harness = create_fleet_harness("fleet_rollback_to_version").unwrap();
     let _env = setup_fleet_env(&mut harness, 2).unwrap();
 
@@ -218,6 +222,7 @@ fn test_fleet_rollback_to_version() {
 
 #[test]
 fn test_fleet_status_health() {
+    let _guard = test_guard!();
     let mut harness = create_fleet_harness("fleet_status_health").unwrap();
     let _env = setup_fleet_env(&mut harness, 2).unwrap();
 
@@ -255,6 +260,7 @@ fn test_fleet_status_health() {
 
 #[test]
 fn test_fleet_concurrent_operations() {
+    let _guard = test_guard!();
     let mut harness = create_fleet_harness("fleet_concurrent_ops").unwrap();
     let _env = setup_fleet_env(&mut harness, 2).unwrap();
 

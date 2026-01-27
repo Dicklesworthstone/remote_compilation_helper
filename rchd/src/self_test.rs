@@ -598,7 +598,8 @@ pub fn default_history_path() -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-        use rch_common::test_guard;
+    use super::*;
+    use rch_common::test_guard;
 
     // ==================== parse_duration tests ====================
 

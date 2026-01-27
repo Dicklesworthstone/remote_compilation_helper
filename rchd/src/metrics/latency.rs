@@ -208,9 +208,9 @@ impl TierTimer {
 
 #[cfg(test)]
 mod tests {
-        use rch_common::test_guard;
+    use super::*;
+    use rch_common::test_guard;
     use std::thread;
-    use std::time::Duration;
 
     #[test]
     fn test_decision_type_budget() {

@@ -14,6 +14,7 @@ use rch_common::e2e::{
     DaemonConfigFixture, HarnessResult, RustProjectFixture, TestHarness, TestHarnessBuilder,
     WorkersFixture,
 };
+use rch_common::test_guard;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
@@ -160,6 +161,7 @@ fn create_lib_project(harness: &TestHarness, name: &str) -> HarnessResult<PathBu
 /// - Pipeline completes without errors
 #[test]
 fn test_cargo_build_release() {
+    let _guard = test_guard!();
     let harness = create_pipeline_harness("cargo_build_release").unwrap();
     harness
         .logger
@@ -225,6 +227,7 @@ fn test_cargo_build_release() {
 /// Test cargo test command through the pipeline.
 #[test]
 fn test_cargo_test() {
+    let _guard = test_guard!();
     let harness = create_pipeline_harness("cargo_test").unwrap();
     harness
         .logger
@@ -271,6 +274,7 @@ fn test_cargo_test() {
 /// Test incremental builds work correctly.
 #[test]
 fn test_incremental_build() {
+    let _guard = test_guard!();
     let harness = create_pipeline_harness("incremental_build").unwrap();
     harness
         .logger
@@ -328,6 +332,7 @@ fn test_incremental_build() {
 /// Test build failure handling.
 #[test]
 fn test_build_failure() {
+    let _guard = test_guard!();
     let harness = create_pipeline_harness("build_failure").unwrap();
     harness
         .logger
@@ -388,6 +393,7 @@ edition = "2024"
 /// Test .rchignore file handling.
 #[test]
 fn test_rchignore_handling() {
+    let _guard = test_guard!();
     let harness = create_pipeline_harness("rchignore_handling").unwrap();
     harness
         .logger
@@ -443,6 +449,7 @@ node_modules/
 /// Test handling of large projects.
 #[test]
 fn test_large_project() {
+    let _guard = test_guard!();
     let harness = create_pipeline_harness("large_project").unwrap();
     harness
         .logger
@@ -507,6 +514,7 @@ fn test_large_project() {
 /// Test symlink handling in projects.
 #[test]
 fn test_symlink_handling() {
+    let _guard = test_guard!();
     let harness = create_pipeline_harness("symlink_handling").unwrap();
     harness
         .logger
@@ -558,6 +566,7 @@ fn test_symlink_handling() {
 /// Test parallel builds on the same daemon.
 #[test]
 fn test_parallel_builds() {
+    let _guard = test_guard!();
     let harness = create_pipeline_harness("parallel_builds").unwrap();
     harness
         .logger
@@ -623,6 +632,7 @@ fn test_parallel_builds() {
 /// Test interrupted transfer handling.
 #[test]
 fn test_interrupted_transfer() {
+    let _guard = test_guard!();
     let harness = create_pipeline_harness("interrupted_transfer").unwrap();
     harness
         .logger
@@ -654,6 +664,7 @@ fn test_interrupted_transfer() {
 /// Test worker crash handling.
 #[test]
 fn test_worker_crash_handling() {
+    let _guard = test_guard!();
     let harness = create_pipeline_harness("worker_crash").unwrap();
     harness
         .logger
@@ -685,6 +696,7 @@ fn test_worker_crash_handling() {
 /// Test concurrent builds on the same project.
 #[test]
 fn test_concurrent_same_project() {
+    let _guard = test_guard!();
     let harness = create_pipeline_harness("concurrent_same_project").unwrap();
     harness
         .logger
@@ -740,6 +752,7 @@ fn test_concurrent_same_project() {
 /// Test graceful degradation when workers become unavailable.
 #[test]
 fn test_graceful_degradation() {
+    let _guard = test_guard!();
     let harness = create_pipeline_harness("graceful_degradation").unwrap();
     harness
         .logger

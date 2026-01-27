@@ -10,6 +10,7 @@ use rch_common::e2e::{
     DaemonConfigFixture, HarnessResult, TestHarness, TestHarnessBuilder, WorkerFixture,
     WorkersFixture,
 };
+use rch_common::test_guard;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
@@ -148,6 +149,7 @@ fn current_user() -> String {
 /// Test worker probe success - verifies that a healthy worker is detected.
 #[test]
 fn test_worker_probe_success() {
+    let _guard = test_guard!();
     let harness = create_worker_harness("worker_probe_success").unwrap();
     harness
         .logger
@@ -196,6 +198,7 @@ fn test_worker_probe_success() {
 /// Test worker probe failure - verifies that unreachable workers are detected.
 #[test]
 fn test_worker_probe_failure() {
+    let _guard = test_guard!();
     let harness = create_worker_harness("worker_probe_failure").unwrap();
     harness
         .logger
@@ -246,6 +249,7 @@ fn test_worker_probe_failure() {
 /// Test worker probe timeout - verifies timeout handling.
 #[test]
 fn test_worker_probe_timeout() {
+    let _guard = test_guard!();
     let harness = create_worker_harness("worker_probe_timeout").unwrap();
     harness
         .logger
@@ -298,6 +302,7 @@ fn test_worker_probe_timeout() {
 /// Test that circuit breaker opens after consecutive failures.
 #[test]
 fn test_worker_circuit_breaker_opens() {
+    let _guard = test_guard!();
     let harness = create_worker_harness("circuit_breaker_opens").unwrap();
     harness
         .logger
@@ -342,6 +347,7 @@ fn test_worker_circuit_breaker_opens() {
 /// Test circuit breaker half-open state transition.
 #[test]
 fn test_worker_circuit_breaker_half_open() {
+    let _guard = test_guard!();
     let harness = create_worker_harness("circuit_breaker_half_open").unwrap();
     harness
         .logger
@@ -380,6 +386,7 @@ fn test_worker_circuit_breaker_half_open() {
 /// Test full circuit breaker recovery cycle.
 #[test]
 fn test_worker_circuit_breaker_recovery() {
+    let _guard = test_guard!();
     let harness = create_worker_harness("circuit_breaker_recovery").unwrap();
     harness
         .logger
@@ -422,6 +429,7 @@ fn test_worker_circuit_breaker_recovery() {
 /// Test remote command execution success.
 #[test]
 fn test_remote_command_success() {
+    let _guard = test_guard!();
     let harness = create_worker_harness("remote_command_success").unwrap();
     harness
         .logger
@@ -466,6 +474,7 @@ fn test_remote_command_success() {
 /// Test remote command failure handling.
 #[test]
 fn test_remote_command_failure() {
+    let _guard = test_guard!();
     let harness = create_worker_harness("remote_command_failure").unwrap();
     harness
         .logger
@@ -496,6 +505,7 @@ fn test_remote_command_failure() {
 /// Test remote command timeout handling.
 #[test]
 fn test_remote_command_timeout() {
+    let _guard = test_guard!();
     let harness = create_worker_harness("remote_command_timeout").unwrap();
     harness
         .logger
@@ -532,6 +542,7 @@ fn test_remote_command_timeout() {
 /// Test remote command output streaming for large outputs.
 #[test]
 fn test_remote_command_output_streaming() {
+    let _guard = test_guard!();
     let harness = create_worker_harness("remote_command_streaming").unwrap();
     harness
         .logger
@@ -566,6 +577,7 @@ fn test_remote_command_output_streaming() {
 /// Test worker selection with a single worker.
 #[test]
 fn test_worker_selection_single() {
+    let _guard = test_guard!();
     let harness = create_worker_harness("worker_selection_single").unwrap();
     harness
         .logger
@@ -610,6 +622,7 @@ fn test_worker_selection_single() {
 /// Test worker selection with multiple workers.
 #[test]
 fn test_worker_selection_multiple() {
+    let _guard = test_guard!();
     let harness = create_worker_harness("worker_selection_multiple").unwrap();
     harness
         .logger
@@ -663,6 +676,7 @@ fn test_worker_selection_multiple() {
 /// Test worker selection when all workers are busy.
 #[test]
 fn test_worker_selection_all_busy() {
+    let _guard = test_guard!();
     let harness = create_worker_harness("worker_selection_all_busy").unwrap();
     harness
         .logger
@@ -713,6 +727,7 @@ fn test_worker_selection_all_busy() {
 /// Test worker selection with runtime filtering.
 #[test]
 fn test_worker_selection_tag_filtering() {
+    let _guard = test_guard!();
     let harness = create_worker_harness("worker_selection_tags").unwrap();
     harness
         .logger
@@ -760,6 +775,7 @@ fn test_worker_selection_tag_filtering() {
 /// Test SSH key authentication support.
 #[test]
 fn test_ssh_key_auth() {
+    let _guard = test_guard!();
     let harness = create_worker_harness("ssh_key_auth").unwrap();
     harness
         .logger
@@ -791,6 +807,7 @@ fn test_ssh_key_auth() {
 /// Test SSH agent authentication support.
 #[test]
 fn test_ssh_agent_auth() {
+    let _guard = test_guard!();
     let harness = create_worker_harness("ssh_agent_auth").unwrap();
     harness
         .logger
@@ -825,6 +842,7 @@ fn test_ssh_agent_auth() {
 /// Test worker reconnection after network issues.
 #[test]
 fn test_worker_reconnect_after_network_blip() {
+    let _guard = test_guard!();
     let harness = create_worker_harness("worker_reconnect").unwrap();
     harness
         .logger
@@ -862,6 +880,7 @@ fn test_worker_reconnect_after_network_blip() {
 /// Test handling of UTF-8 output from workers.
 #[test]
 fn test_worker_handles_utf8_output() {
+    let _guard = test_guard!();
     let harness = create_worker_harness("worker_utf8_output").unwrap();
     harness
         .logger
@@ -896,6 +915,7 @@ fn test_worker_handles_utf8_output() {
 /// Test handling of binary output from workers.
 #[test]
 fn test_worker_handles_binary_output() {
+    let _guard = test_guard!();
     let harness = create_worker_harness("worker_binary_output").unwrap();
     harness
         .logger
@@ -930,6 +950,7 @@ fn test_worker_handles_binary_output() {
 /// Test releasing a worker slot.
 #[test]
 fn test_release_worker() {
+    let _guard = test_guard!();
     let harness = create_worker_harness("release_worker").unwrap();
     harness
         .logger
@@ -962,6 +983,7 @@ fn test_release_worker() {
 /// Test releasing worker with invalid parameters.
 #[test]
 fn test_release_worker_invalid() {
+    let _guard = test_guard!();
     let harness = create_worker_harness("release_worker_invalid").unwrap();
     harness
         .logger

@@ -1741,11 +1741,13 @@ pub fn validate_config(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rch_common::test_guard;
     use tempfile::NamedTempFile;
     use tracing::info;
 
     #[test]
     fn test_default_config() {
+        let _guard = test_guard!();
         info!("TEST: test_default_config");
         let config = RchConfig::default();
         info!(
@@ -1762,6 +1764,7 @@ mod tests {
 
     #[test]
     fn test_example_project_config_valid() {
+        let _guard = test_guard!();
         info!("TEST: test_example_project_config_valid");
         let toml_str = example_project_config();
         let _: RchConfig = toml::from_str(&toml_str).expect("Example project config should parse");
@@ -1770,6 +1773,7 @@ mod tests {
 
     #[test]
     fn test_example_workers_config_valid() {
+        let _guard = test_guard!();
         info!("TEST: test_example_workers_config_valid");
         let toml_str = example_workers_config();
         let _: WorkersConfig =
@@ -1779,6 +1783,7 @@ mod tests {
 
     #[test]
     fn test_validate_valid_config() {
+        let _guard = test_guard!();
         info!("TEST START: test_validate_valid_config");
         let mut file = NamedTempFile::new().expect("create temp file");
         std::io::Write::write_all(file.as_file_mut(), example_project_config().as_bytes())
@@ -1795,6 +1800,7 @@ mod tests {
 
     #[test]
     fn test_validate_force_override_conflict() {
+        let _guard = test_guard!();
         info!("TEST START: test_validate_force_override_conflict");
         let mut file = NamedTempFile::new().expect("create temp file");
         std::io::Write::write_all(
@@ -1815,6 +1821,7 @@ mod tests {
 
     #[test]
     fn test_validate_invalid_toml_syntax() {
+        let _guard = test_guard!();
         info!("TEST START: test_validate_invalid_toml_syntax");
         let mut file = NamedTempFile::new().expect("create temp file");
         std::io::Write::write_all(file.as_file_mut(), b"invalid [ toml").expect("write config");
@@ -1826,6 +1833,7 @@ mod tests {
 
     #[test]
     fn test_validate_threshold_range() {
+        let _guard = test_guard!();
         info!("TEST START: test_validate_threshold_range");
         let mut file = NamedTempFile::new().expect("create temp file");
         std::io::Write::write_all(
@@ -1846,6 +1854,7 @@ mod tests {
 
     #[test]
     fn test_validate_env_allowlist_invalid_key() {
+        let _guard = test_guard!();
         info!("TEST START: test_validate_env_allowlist_invalid_key");
         let mut file = NamedTempFile::new().expect("create temp file");
         std::io::Write::write_all(
@@ -1866,6 +1875,7 @@ mod tests {
 
     #[test]
     fn test_validate_file_path_exists() {
+        let _guard = test_guard!();
         info!("TEST START: test_validate_file_path_exists");
         let mut file = NamedTempFile::new().expect("create temp file");
         let workers_toml = r#"
@@ -1886,6 +1896,7 @@ total_slots = 4
 
     #[test]
     fn test_validate_workers_missing_user() {
+        let _guard = test_guard!();
         info!("TEST START: test_validate_workers_missing_user");
         let mut file = NamedTempFile::new().expect("create temp file");
         let workers_toml = r#"
@@ -1905,6 +1916,7 @@ total_slots = 8
 
     #[test]
     fn test_validate_workers_missing_total_slots_warns() {
+        let _guard = test_guard!();
         info!("TEST START: test_validate_workers_missing_total_slots_warns");
         let mut file = NamedTempFile::new().expect("create temp file");
         let workers_toml = r#"
@@ -1933,6 +1945,7 @@ identity_file = "/tmp/id_ed25519"
 
     #[test]
     fn test_merge_compilation_slots_override() {
+        let _guard = test_guard!();
         info!("TEST START: test_merge_compilation_slots_override");
         let mut base = RchConfig::default();
         base.compilation.build_slots = 6;
@@ -1964,6 +1977,7 @@ identity_file = "/tmp/id_ed25519"
 
     #[test]
     fn test_merge_preserves_base_fields() {
+        let _guard = test_guard!();
         info!("TEST: test_merge_preserves_base_fields");
 
         // Base config with non-default values
@@ -2026,6 +2040,7 @@ identity_file = "/tmp/id_ed25519"
 
     #[test]
     fn test_merge_overlay_wins() {
+        let _guard = test_guard!();
         info!("TEST: test_merge_overlay_wins");
 
         let base = RchConfig::default();
@@ -2076,6 +2091,7 @@ identity_file = "/tmp/id_ed25519"
 
     #[test]
     fn test_merge_nested_sections() {
+        let _guard = test_guard!();
         info!("TEST: test_merge_nested_sections");
 
         // Base with non-default circuit breaker settings
@@ -2134,6 +2150,7 @@ identity_file = "/tmp/id_ed25519"
 
     #[test]
     fn test_source_tracking_default() {
+        let _guard = test_guard!();
         info!("TEST: test_source_tracking_default");
         let env_overrides: HashMap<String, String> = HashMap::new();
 
@@ -2150,6 +2167,7 @@ identity_file = "/tmp/id_ed25519"
 
     #[test]
     fn test_source_tracking_user_file() {
+        let _guard = test_guard!();
         info!("TEST: test_source_tracking_user_file");
         let temp_dir = std::env::temp_dir().join(format!(
             "rch_test_config_user_{}_{}",
@@ -2186,6 +2204,7 @@ identity_file = "/tmp/id_ed25519"
 
     #[test]
     fn test_source_tracking_env_override() {
+        let _guard = test_guard!();
         info!("TEST: test_source_tracking_env_override");
         let mut env_overrides: HashMap<String, String> = HashMap::new();
         env_overrides.insert("RCH_LOG_LEVEL".to_string(), "warn".to_string());
@@ -2209,6 +2228,7 @@ identity_file = "/tmp/id_ed25519"
 
     #[test]
     fn test_source_tracking_env_visibility_override() {
+        let _guard = test_guard!();
         info!("TEST: test_source_tracking_env_visibility_override");
         let mut env_overrides: HashMap<String, String> = HashMap::new();
         env_overrides.insert("RCH_VISIBILITY".to_string(), "summary".to_string());
@@ -2232,6 +2252,7 @@ identity_file = "/tmp/id_ed25519"
 
     #[test]
     fn test_merge_empty_overlay() {
+        let _guard = test_guard!();
         info!("TEST: test_merge_empty_overlay");
 
         // Base with custom values
@@ -2279,6 +2300,7 @@ identity_file = "/tmp/id_ed25519"
 
     #[test]
     fn test_merge_transfer_exclude_patterns() {
+        let _guard = test_guard!();
         info!("TEST: test_merge_transfer_exclude_patterns");
 
         let base = RchConfig::default();
@@ -2335,6 +2357,7 @@ identity_file = "/tmp/id_ed25519"
 
     #[test]
     fn test_merge_transfer_remote_base() {
+        let _guard = test_guard!();
         info!("TEST: test_merge_transfer_remote_base");
 
         let base = RchConfig::default();
@@ -2364,6 +2387,7 @@ identity_file = "/tmp/id_ed25519"
 
     #[test]
     fn test_merge_transfer_remote_base_with_tilde() {
+        let _guard = test_guard!();
         info!("TEST: test_merge_transfer_remote_base_with_tilde");
 
         let base = RchConfig::default();
@@ -2394,6 +2418,7 @@ identity_file = "/tmp/id_ed25519"
 
     #[test]
     fn test_merge_boolean_enabled_field() {
+        let _guard = test_guard!();
         info!("TEST: test_merge_boolean_enabled_field");
 
         // Base has enabled=true (default)
@@ -2427,6 +2452,7 @@ identity_file = "/tmp/id_ed25519"
 
     #[test]
     fn test_merge_real_world_project_config() {
+        let _guard = test_guard!();
         info!("TEST: test_merge_real_world_project_config");
 
         // User config with customizations
@@ -2498,6 +2524,7 @@ identity_file = "/tmp/id_ed25519"
 
     #[test]
     fn test_apply_env_overrides_enabled_false() {
+        let _guard = test_guard!();
         info!("TEST: test_apply_env_overrides_enabled_false");
         let mut config = RchConfig::default();
         let mut sources = default_sources_map();
@@ -2520,6 +2547,7 @@ identity_file = "/tmp/id_ed25519"
 
     #[test]
     fn test_apply_env_overrides_visibility_precedence() {
+        let _guard = test_guard!();
         info!("TEST: test_apply_env_overrides_visibility_precedence");
         let mut config = RchConfig::default();
         let mut sources = default_sources_map();
@@ -2541,6 +2569,7 @@ identity_file = "/tmp/id_ed25519"
 
     #[test]
     fn test_apply_env_overrides_env_allowlist() {
+        let _guard = test_guard!();
         info!("TEST: test_apply_env_overrides_env_allowlist");
         let mut config = RchConfig::default();
         let mut sources = default_sources_map();
@@ -2572,6 +2601,7 @@ identity_file = "/tmp/id_ed25519"
 
     #[test]
     fn test_apply_env_overrides_self_healing() {
+        let _guard = test_guard!();
         info!("TEST: test_apply_env_overrides_self_healing");
         let mut config = RchConfig::default();
         let mut sources = default_sources_map();
@@ -2615,6 +2645,7 @@ identity_file = "/tmp/id_ed25519"
 
     #[test]
     fn test_apply_env_overrides_self_healing_master_disable_precedence() {
+        let _guard = test_guard!();
         info!("TEST: test_apply_env_overrides_self_healing_master_disable_precedence");
         let mut config = RchConfig::default();
         let mut sources = default_sources_map();
@@ -2654,6 +2685,7 @@ identity_file = "/tmp/id_ed25519"
 
     #[test]
     fn test_validate_workers_duplicate_ids() {
+        let _guard = test_guard!();
         info!("TEST: test_validate_workers_duplicate_ids");
         let identity = NamedTempFile::new().expect("create identity file");
         let mut file = NamedTempFile::new().expect("create workers config file");
@@ -2697,6 +2729,7 @@ total_slots = 8
 
     #[test]
     fn test_validate_compression_level_negative() {
+        let _guard = test_guard!();
         info!("TEST: test_validate_compression_level_negative");
         let mut file = NamedTempFile::new().expect("create temp file");
         // Negative compression level should be invalid
@@ -2716,6 +2749,7 @@ total_slots = 8
 
     #[test]
     fn test_validate_compression_level_too_high() {
+        let _guard = test_guard!();
         info!("TEST: test_validate_compression_level_too_high");
         let mut file = NamedTempFile::new().expect("create temp file");
         // Compression level > 22 (zstd max) should be invalid
@@ -2735,6 +2769,7 @@ total_slots = 8
 
     #[test]
     fn test_validate_invalid_timeout_negative() {
+        let _guard = test_guard!();
         info!("TEST: test_validate_invalid_timeout_negative");
         let mut file = NamedTempFile::new().expect("create temp file");
         std::io::Write::write_all(
@@ -2754,6 +2789,7 @@ total_slots = 8
 
     #[test]
     fn test_validate_invalid_log_level() {
+        let _guard = test_guard!();
         info!("TEST: test_validate_invalid_log_level");
         let mut file = NamedTempFile::new().expect("create temp file");
         std::io::Write::write_all(
@@ -2775,6 +2811,7 @@ total_slots = 8
 
     #[test]
     fn test_config_file_not_found_graceful_fallback() {
+        let _guard = test_guard!();
         info!("TEST: test_config_file_not_found_graceful_fallback");
         let nonexistent_path = std::path::PathBuf::from("/nonexistent/config/path/config.toml");
         let env_overrides: HashMap<String, String> = HashMap::new();
@@ -2801,6 +2838,7 @@ total_slots = 8
 
     #[test]
     fn test_invalid_toml_type_mismatch() {
+        let _guard = test_guard!();
         info!("TEST: test_invalid_toml_type_mismatch");
         let mut file = NamedTempFile::new().expect("create temp file");
         // String where integer expected
@@ -2820,6 +2858,7 @@ total_slots = 8
 
     #[test]
     fn test_empty_config_sections() {
+        let _guard = test_guard!();
         info!("TEST: test_empty_config_sections");
         let mut file = NamedTempFile::new().expect("create temp file");
         // Empty sections should be valid
@@ -2846,6 +2885,7 @@ total_slots = 8
 
     #[test]
     fn test_unknown_toml_fields_ignored() {
+        let _guard = test_guard!();
         info!("TEST: test_unknown_toml_fields_ignored");
         let mut file = NamedTempFile::new().expect("create temp file");
         // Unknown fields should be gracefully ignored (serde default behavior)
@@ -2876,6 +2916,7 @@ extra_field = 123
 
     #[test]
     fn test_apply_env_overrides_socket_path() {
+        let _guard = test_guard!();
         info!("TEST: test_apply_env_overrides_socket_path");
         let mut config = RchConfig::default();
         let mut sources = default_sources_map();
@@ -2901,6 +2942,7 @@ extra_field = 123
 
     #[test]
     fn test_apply_env_overrides_compression_level() {
+        let _guard = test_guard!();
         info!("TEST: test_apply_env_overrides_compression_level");
         let mut config = RchConfig::default();
         let mut sources = default_sources_map();
@@ -2926,6 +2968,7 @@ extra_field = 123
 
     #[test]
     fn test_apply_env_overrides_ssh_keepalive_and_controlpersist() {
+        let _guard = test_guard!();
         info!("TEST: test_apply_env_overrides_ssh_keepalive_and_controlpersist");
         let mut config = RchConfig::default();
         let mut sources = default_sources_map();
@@ -2957,6 +3000,7 @@ extra_field = 123
 
     #[test]
     fn test_full_config_cascade_user_then_project() {
+        let _guard = test_guard!();
         info!("TEST: test_full_config_cascade_user_then_project");
 
         let temp_dir = std::env::temp_dir().join(format!(
@@ -3043,6 +3087,7 @@ build_timeout_sec = 900
 
     #[test]
     fn test_full_config_cascade_with_env_override() {
+        let _guard = test_guard!();
         info!("TEST: test_full_config_cascade_with_env_override");
 
         let temp_dir = std::env::temp_dir().join(format!(
@@ -3100,6 +3145,7 @@ confidence_threshold = 0.90
 
     #[test]
     fn test_workers_config_valid_tilde_path() {
+        let _guard = test_guard!();
         info!("TEST: test_workers_config_valid_tilde_path");
         let mut file = NamedTempFile::new().expect("create temp file");
         // Tilde paths should be accepted (expanded at runtime)
@@ -3134,6 +3180,7 @@ total_slots = 4
 
     #[test]
     fn test_workers_config_empty_workers_array() {
+        let _guard = test_guard!();
         info!("TEST: test_workers_config_empty_workers_array");
         let mut file = NamedTempFile::new().expect("create temp file");
         // Empty workers array should be valid
@@ -3156,6 +3203,7 @@ total_slots = 4
 
     #[test]
     fn test_validate_slots_zero_value() {
+        let _guard = test_guard!();
         info!("TEST: test_validate_slots_zero_value");
         let identity = NamedTempFile::new().expect("create identity file");
         let mut file = NamedTempFile::new().expect("create config file");
@@ -3189,6 +3237,7 @@ total_slots = 0
 
     #[test]
     fn test_validate_circuit_breaker_thresholds() {
+        let _guard = test_guard!();
         info!("TEST: test_validate_circuit_breaker_thresholds");
         let mut file = NamedTempFile::new().expect("create temp file");
         // Invalid circuit breaker configuration
@@ -3222,6 +3271,7 @@ total_slots = 0
 
     #[test]
     fn test_parse_workers_with_all_fields() {
+        let _guard = test_guard!();
         info!("TEST: test_parse_workers_with_all_fields");
         let identity = NamedTempFile::new().expect("create identity file");
 
@@ -3259,6 +3309,7 @@ enabled = true
 
     #[test]
     fn test_validate_confidence_threshold_boundary() {
+        let _guard = test_guard!();
         info!("TEST: test_validate_confidence_threshold_boundary");
 
         // Test lower boundary (0.0)
@@ -3305,6 +3356,7 @@ enabled = true
 
     #[test]
     fn test_source_tracking_project_config() {
+        let _guard = test_guard!();
         info!("TEST: test_source_tracking_project_config");
 
         let temp_dir = std::env::temp_dir().join(format!(

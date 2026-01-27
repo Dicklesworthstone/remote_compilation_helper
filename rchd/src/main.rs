@@ -610,14 +610,8 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-        use rch_common::test_guard;
-    use crate::self_test::{SelfTestHistory, SelfTestService};
-    use crate::telemetry::TelemetryStore;
-    use crate::{benchmark_queue::BenchmarkQueue, events::EventBus};
-    use chrono::Duration as ChronoDuration;
-    use rch_common::SelfTestConfig;
-    use std::time::Duration;
-    use std::time::Instant;
+    use super::*;
+    use rch_common::test_guard;
 
     fn make_test_telemetry() -> Arc<TelemetryStore> {
         Arc::new(TelemetryStore::new(Duration::from_secs(300), None))

@@ -469,7 +469,8 @@ pub async fn start_config_watcher(
 
 #[cfg(test)]
 mod tests {
-        use rch_common::test_guard;
+    use super::*;
+    use rch_common::test_guard;
     use tempfile::TempDir;
 
     fn init_test_logging() {

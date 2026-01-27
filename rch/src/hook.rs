@@ -2472,9 +2472,10 @@ mod tests {
         self, MockConfig, MockRsyncConfig, Phase, clear_mock_overrides, set_mock_enabled_override,
         set_mock_rsync_config_override, set_mock_ssh_config_override,
     };
+    use rch_common::test_guard;
     use rch_common::{SelectionReason, ToolInput};
     use std::sync::OnceLock;
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
+    use tokio::io::BufReader as TokioBufReader;
     use tokio::net::UnixListener;
     use tokio::sync::Mutex;
 
@@ -2584,6 +2585,7 @@ mod tests {
 
     #[test]
     fn test_timing_estimate_struct() {
+        let _guard = test_guard!();
         let estimate = TimingEstimate {
             predicted_local_ms: 5000,
             predicted_speedup: Some(2.5),
@@ -2594,6 +2596,7 @@ mod tests {
 
     #[test]
     fn test_timing_estimate_no_speedup() {
+        let _guard = test_guard!();
         let estimate = TimingEstimate {
             predicted_local_ms: 3000,
             predicted_speedup: None,
@@ -2604,6 +2607,7 @@ mod tests {
 
     #[test]
     fn test_estimate_timing_returns_none_without_history() {
+        let _guard = test_guard!();
         // Currently returns None (fail-open) since no timing history exists
         let config = rch_common::RchConfig::default();
         let estimate =
@@ -2613,6 +2617,7 @@ mod tests {
 
     #[test]
     fn test_timing_gating_thresholds_default() {
+        let _guard = test_guard!();
         let config = rch_common::CompilationConfig::default();
         // Default min_local_time_ms: 2000ms
         assert_eq!(config.min_local_time_ms, 2000);
@@ -2622,6 +2627,7 @@ mod tests {
 
     #[test]
     fn test_urlencoding_encode_basic() {
+        let _guard = test_guard!();
         assert_eq!(urlencoding_encode("hello world"), "hello%20world");
         assert_eq!(urlencoding_encode("path/to/file"), "path%2Fto%2Ffile");
         assert_eq!(urlencoding_encode("foo:bar"), "foo%3Abar");
@@ -2629,6 +2635,7 @@ mod tests {
 
     #[test]
     fn test_urlencoding_encode_special_chars() {
+        let _guard = test_guard!();
         assert_eq!(urlencoding_encode("a&b=c"), "a%26b%3Dc");
         assert_eq!(urlencoding_encode("100%"), "100%25");
         assert_eq!(urlencoding_encode("hello+world"), "hello%2Bworld");
@@ -2636,6 +2643,7 @@ mod tests {
 
     #[test]
     fn test_urlencoding_encode_no_encoding_needed() {
+        let _guard = test_guard!();
         assert_eq!(urlencoding_encode("simple"), "simple");
         assert_eq!(
             urlencoding_encode("with-dash_underscore.dot~tilde"),
@@ -2646,6 +2654,7 @@ mod tests {
 
     #[test]
     fn test_urlencoding_encode_unicode() {
+        let _guard = test_guard!();
         // Unicode characters should be encoded as UTF-8 bytes
         let encoded = urlencoding_encode("café");
         assert!(encoded.contains("%")); // 'é' should be encoded
@@ -2654,6 +2663,7 @@ mod tests {
 
     #[test]
     fn test_parse_jobs_flag_variants() {
+        let _guard = test_guard!();
         assert_eq!(parse_jobs_flag("cargo build -j 8"), Some(8));
         assert_eq!(parse_jobs_flag("cargo build -j8"), Some(8));
         assert_eq!(parse_jobs_flag("cargo build --jobs 4"), Some(4));
@@ -2666,6 +2676,7 @@ mod tests {
 
     #[test]
     fn test_parse_test_threads_variants() {
+        let _guard = test_guard!();
         assert_eq!(
             parse_test_threads("cargo test -- --test-threads=4"),
             Some(4)
@@ -2679,6 +2690,7 @@ mod tests {
 
     #[test]
     fn test_estimate_cores_for_command() {
+        let _guard = test_guard!();
         let config = rch_common::CompilationConfig {
             build_slots: 6,
             test_slots: 10,
@@ -2726,6 +2738,7 @@ mod tests {
 
     #[test]
     fn test_classification_confidence_levels() {
+        let _guard = test_guard!();
         // High confidence: explicit cargo build
         let result = classify_command("cargo build");
         assert!(result.is_compilation);
@@ -2743,6 +2756,7 @@ mod tests {
 
     #[test]
     fn test_classification_bun_commands() {
+        let _guard = test_guard!();
         // Bun compilation commands should be intercepted
         let result = classify_command("bun test");
         assert!(result.is_compilation);
@@ -2792,6 +2806,7 @@ mod tests {
 
     #[test]
     fn test_classification_c_compilers_and_build_systems() {
+        let _guard = test_guard!();
         let result = classify_command("gcc -O2 -o hello hello.c");
         assert!(result.is_compilation);
 
@@ -2816,6 +2831,7 @@ mod tests {
 
     #[test]
     fn test_classification_env_wrapped_commands() {
+        let _guard = test_guard!();
         let result = classify_command("RUST_BACKTRACE=1 cargo test");
         assert!(result.is_compilation);
 
@@ -2825,6 +2841,7 @@ mod tests {
 
     #[test]
     fn test_classification_rejects_shell_metachars() {
+        let _guard = test_guard!();
         // Piped commands should not be intercepted
         let result = classify_command("cargo build | tee log.txt");
         assert!(!result.is_compilation);
@@ -2848,6 +2865,7 @@ mod tests {
 
     #[test]
     fn test_extract_project_name() {
+        let _guard = test_guard!();
         // The function uses current directory, but we can test it runs
         let project = extract_project_name();
         // Should return something (either actual dir name or "unknown")
@@ -2860,6 +2878,7 @@ mod tests {
 
     #[test]
     fn test_hook_output_allow_is_empty() {
+        let _guard = test_guard!();
         // Allow output should serialize to nothing (empty stdout = allow)
         let output = HookOutput::allow();
         assert!(output.is_allow());
@@ -2867,6 +2886,7 @@ mod tests {
 
     #[test]
     fn test_hook_output_deny_serializes() {
+        let _guard = test_guard!();
         let output = HookOutput::deny("Test denial reason".to_string());
         let json = serde_json::to_string(&output).expect("Should serialize");
         assert!(json.contains("deny"));
@@ -2875,6 +2895,7 @@ mod tests {
 
     #[test]
     fn test_selected_worker_to_config() {
+        let _guard = test_guard!();
         let worker = SelectedWorker {
             id: rch_common::WorkerId::new("test-worker"),
             host: "192.168.1.100".to_string(),
@@ -3157,7 +3178,7 @@ mod tests {
             session_id: None,
         };
 
-        let output = process_hook(input).await;
+        let output: HookOutput = process_hook(input).await;
         let _ = std::fs::remove_file(&socket_path);
 
         assert!(!output.is_allow());
@@ -3406,6 +3427,7 @@ mod tests {
 
     #[test]
     fn test_transfer_config_defaults() {
+        let _guard = test_guard!();
         // Verify TransferConfig has sensible defaults
         let config = TransferConfig::default();
         assert!(!config.exclude_patterns.is_empty());
@@ -3414,6 +3436,7 @@ mod tests {
 
     #[test]
     fn test_worker_config_from_selected_worker() {
+        let _guard = test_guard!();
         // Test the conversion preserves all fields correctly
         let worker = SelectedWorker {
             id: rch_common::WorkerId::new("worker-alpha"),
@@ -3812,6 +3835,7 @@ mod tests {
 
     #[test]
     fn test_is_signal_killed() {
+        let _guard = test_guard!();
         // Normal exit codes should not be signal-killed
         assert!(is_signal_killed(0).is_none());
         assert!(is_signal_killed(1).is_none());
@@ -3828,6 +3852,7 @@ mod tests {
 
     #[test]
     fn test_signal_name() {
+        let _guard = test_guard!();
         assert_eq!(signal_name(1), "SIGHUP");
         assert_eq!(signal_name(2), "SIGINT");
         assert_eq!(signal_name(9), "SIGKILL");
@@ -3838,6 +3863,7 @@ mod tests {
 
     #[test]
     fn test_exit_code_constants() {
+        let _guard = test_guard!();
         // Verify exit code constants match cargo's documented behavior
         assert_eq!(EXIT_SUCCESS, 0);
         assert_eq!(EXIT_BUILD_ERROR, 1);
@@ -3847,6 +3873,7 @@ mod tests {
 
     #[test]
     fn test_is_toolchain_failure_basic() {
+        let _guard = test_guard!();
         // Should detect toolchain issues
         assert!(is_toolchain_failure(
             "error: toolchain 'nightly-2025-01-01' is not installed",
@@ -3871,6 +3898,7 @@ mod tests {
 
     #[test]
     fn test_exit_code_semantics_documented() {
+        let _guard = test_guard!();
         // This test documents the expected behavior for different exit codes
         // Exit 0: Success - should deny local (verified in other tests)
         // Exit 101: Test failures - should deny local (re-running won't help)
@@ -3897,6 +3925,7 @@ mod tests {
 
     #[test]
     fn test_wrap_command_with_telemetry_handles_comments() {
+        let _guard = test_guard!();
         let worker_id = rch_common::WorkerId::new("worker1");
         let command = "echo hello # my comment";
         let wrapped = wrap_command_with_telemetry(command, &worker_id);
@@ -4350,6 +4379,7 @@ mod tests {
 
     #[test]
     fn test_cargo_test_classification() {
+        let _guard = test_guard!();
         // Verify cargo test commands are classified correctly
         let result = classify_command("cargo test");
         assert!(result.is_compilation, "cargo test should be compilation");
@@ -4378,6 +4408,7 @@ mod tests {
 
     #[test]
     fn test_cargo_nextest_classification() {
+        let _guard = test_guard!();
         // Verify cargo nextest commands are classified correctly
         let result = classify_command("cargo nextest run");
         assert!(result.is_compilation, "cargo nextest should be compilation");
@@ -4394,6 +4425,7 @@ mod tests {
 
     #[test]
     fn test_artifact_patterns_for_test_commands() {
+        let _guard = test_guard!();
         // Verify test commands use minimal artifact patterns
         let test_patterns = get_artifact_patterns(Some(CompilationKind::CargoTest));
         let build_patterns = get_artifact_patterns(Some(CompilationKind::CargoBuild));
@@ -4430,6 +4462,7 @@ mod tests {
 
     #[test]
     fn test_is_filtered_test_command_basic() {
+        let _guard = test_guard!();
         // Basic test name filter
         assert!(
             is_filtered_test_command("cargo test my_test"),
@@ -4457,6 +4490,7 @@ mod tests {
 
     #[test]
     fn test_is_filtered_test_command_with_flags() {
+        let _guard = test_guard!();
         // Filter with flags
         assert!(
             is_filtered_test_command("cargo test --release my_test"),
@@ -4480,6 +4514,7 @@ mod tests {
 
     #[test]
     fn test_is_filtered_test_command_with_separator() {
+        let _guard = test_guard!();
         // Filter before --
         assert!(
             is_filtered_test_command("cargo test my_test -- --nocapture"),
@@ -4499,6 +4534,7 @@ mod tests {
 
     #[test]
     fn test_has_ignored_only_flag() {
+        let _guard = test_guard!();
         // Only --ignored
         assert!(
             has_ignored_only_flag("cargo test -- --ignored"),
@@ -4523,6 +4559,7 @@ mod tests {
 
     #[test]
     fn test_has_exact_flag() {
+        let _guard = test_guard!();
         assert!(
             has_exact_flag("cargo test my_test -- --exact"),
             "--exact detected"
@@ -4533,6 +4570,7 @@ mod tests {
 
     #[test]
     fn test_estimate_cores_filtered_tests() {
+        let _guard = test_guard!();
         let config = rch_common::CompilationConfig {
             build_slots: 6,
             test_slots: 10,
@@ -4580,6 +4618,7 @@ mod tests {
 
     #[test]
     fn test_estimate_cores_explicit_threads_overrides_filter() {
+        let _guard = test_guard!();
         let config = rch_common::CompilationConfig {
             build_slots: 6,
             test_slots: 10,
@@ -4606,6 +4645,7 @@ mod tests {
 
     #[test]
     fn test_estimate_cores_filtered_minimum() {
+        let _guard = test_guard!();
         let config = rch_common::CompilationConfig {
             build_slots: 6,
             test_slots: 2, // Very low test_slots
@@ -4624,6 +4664,7 @@ mod tests {
 
     #[test]
     fn test_nocapture_does_not_affect_slots() {
+        let _guard = test_guard!();
         let config = rch_common::CompilationConfig {
             build_slots: 6,
             test_slots: 10,
@@ -4652,6 +4693,7 @@ mod tests {
 
     #[test]
     fn test_skip_pattern_uses_full_slots() {
+        let _guard = test_guard!();
         let config = rch_common::CompilationConfig {
             build_slots: 6,
             test_slots: 10,
@@ -4707,7 +4749,7 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
 
         // Query should timeout since daemon never responds
-        let result = query_daemon(
+        let result: anyhow::Result<SelectionResponse> = query_daemon(
             &socket_path,
             "test-project",
             4,
@@ -4841,6 +4883,7 @@ mod tests {
 
     #[test]
     fn test_timeout_constants_are_reasonable() {
+        let _guard = test_guard!();
         // Document and verify the timeout values used in the hook
         // Connection timeout: 300ms (quick enough to not block agents, long enough for local socket)
         // Read timeout: 300ms (same reasoning)
@@ -4866,6 +4909,7 @@ mod tests {
 
     #[test]
     fn test_read_cooldown_timestamp_valid() {
+        let _guard = test_guard!();
         let temp_dir = create_test_state_dir();
         let cooldown_path = temp_dir.path().join("cooldown");
 
@@ -4889,6 +4933,7 @@ mod tests {
 
     #[test]
     fn test_read_cooldown_timestamp_missing() {
+        let _guard = test_guard!();
         let temp_dir = create_test_state_dir();
         let cooldown_path = temp_dir.path().join("nonexistent");
 
@@ -4898,6 +4943,7 @@ mod tests {
 
     #[test]
     fn test_read_cooldown_timestamp_invalid_content() {
+        let _guard = test_guard!();
         let temp_dir = create_test_state_dir();
         let cooldown_path = temp_dir.path().join("cooldown");
 
@@ -4909,6 +4955,7 @@ mod tests {
 
     #[test]
     fn test_write_cooldown_timestamp_creates_file() {
+        let _guard = test_guard!();
         let temp_dir = create_test_state_dir();
         let cooldown_path = temp_dir.path().join("subdir/cooldown");
 
@@ -4927,6 +4974,7 @@ mod tests {
 
     #[test]
     fn test_acquire_autostart_lock_success() {
+        let _guard = test_guard!();
         let temp_dir = create_test_state_dir();
         let lock_path = temp_dir.path().join("autostart.lock");
 
@@ -4937,6 +4985,7 @@ mod tests {
 
     #[test]
     fn test_acquire_autostart_lock_contention() {
+        let _guard = test_guard!();
         let temp_dir = create_test_state_dir();
         let lock_path = temp_dir.path().join("autostart.lock");
 
@@ -4955,6 +5004,7 @@ mod tests {
 
     #[test]
     fn test_autostart_lock_released_on_drop() {
+        let _guard = test_guard!();
         let temp_dir = create_test_state_dir();
         let lock_path = temp_dir.path().join("autostart.lock");
 
@@ -4979,6 +5029,7 @@ mod tests {
 
     #[test]
     fn test_acquire_autostart_lock_creates_parent_dirs() {
+        let _guard = test_guard!();
         let temp_dir = create_test_state_dir();
         let lock_path = temp_dir.path().join("deep/nested/dir/autostart.lock");
 
@@ -5012,6 +5063,7 @@ mod tests {
 
     #[test]
     fn test_autostart_state_dir_returns_path() {
+        let _guard = test_guard!();
         // Basic test that autostart_state_dir returns a valid path
         // (without manipulating env vars which is unsafe)
         let dir = super::autostart_state_dir();
@@ -5024,6 +5076,7 @@ mod tests {
 
     #[test]
     fn test_autostart_lock_path_ends_with_expected_name() {
+        let _guard = test_guard!();
         let path = super::autostart_lock_path();
         assert!(
             path.file_name()
@@ -5035,6 +5088,7 @@ mod tests {
 
     #[test]
     fn test_autostart_cooldown_path_ends_with_expected_name() {
+        let _guard = test_guard!();
         let path = super::autostart_cooldown_path();
         assert!(
             path.file_name()
@@ -5066,6 +5120,7 @@ mod tests {
 
     #[test]
     fn test_autostart_error_cooldown_active_variant() {
+        let _guard = test_guard!();
         // TEST START: AutoStartError::CooldownActive has expected structure
         let error = super::AutoStartError::CooldownActive(15, 30);
 
@@ -5095,6 +5150,7 @@ mod tests {
 
     #[test]
     fn test_cooldown_logic_simulation() {
+        let _guard = test_guard!();
         // TEST START: Simulate cooldown logic without touching real state files
         // This mirrors the logic in try_auto_start_daemon lines 628-640
 
@@ -5149,6 +5205,7 @@ mod tests {
 
     #[test]
     fn test_cooldown_file_update_after_attempt() {
+        let _guard = test_guard!();
         // TEST START: Verify cooldown timestamp is updated after write
         let temp_dir = create_test_state_dir();
         let cooldown_path = temp_dir.path().join("subdir/cooldown");
@@ -5186,6 +5243,7 @@ mod tests {
 
     #[test]
     fn test_timing_record_creation() {
+        let _guard = test_guard!();
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -5204,6 +5262,7 @@ mod tests {
 
     #[test]
     fn test_project_timing_data_add_sample() {
+        let _guard = test_guard!();
         let mut data = super::ProjectTimingData::default();
 
         // Add local sample
@@ -5221,6 +5280,7 @@ mod tests {
 
     #[test]
     fn test_project_timing_data_median_odd_count() {
+        let _guard = test_guard!();
         let mut data = super::ProjectTimingData::default();
         data.add_sample(100, false);
         data.add_sample(300, false);
@@ -5232,6 +5292,7 @@ mod tests {
 
     #[test]
     fn test_project_timing_data_median_even_count() {
+        let _guard = test_guard!();
         let mut data = super::ProjectTimingData::default();
         data.add_sample(100, true);
         data.add_sample(300, true);
@@ -5244,6 +5305,7 @@ mod tests {
 
     #[test]
     fn test_project_timing_data_median_empty() {
+        let _guard = test_guard!();
         let data = super::ProjectTimingData::default();
         assert_eq!(data.median_duration(false), None);
         assert_eq!(data.median_duration(true), None);
@@ -5251,6 +5313,7 @@ mod tests {
 
     #[test]
     fn test_project_timing_data_speedup_ratio() {
+        let _guard = test_guard!();
         let mut data = super::ProjectTimingData::default();
         // Local takes 1000ms
         data.add_sample(1000, false);
@@ -5263,6 +5326,7 @@ mod tests {
 
     #[test]
     fn test_project_timing_data_speedup_no_data() {
+        let _guard = test_guard!();
         let mut data = super::ProjectTimingData::default();
         data.add_sample(1000, false);
 
@@ -5272,6 +5336,7 @@ mod tests {
 
     #[test]
     fn test_project_timing_data_sample_truncation() {
+        let _guard = test_guard!();
         let mut data = super::ProjectTimingData::default();
 
         // Add more than MAX_TIMING_SAMPLES
@@ -5287,6 +5352,7 @@ mod tests {
 
     #[test]
     fn test_timing_history_key() {
+        let _guard = test_guard!();
         let key = super::TimingHistory::key("my_project", Some(CompilationKind::CargoTest));
         assert!(key.contains("my_project"));
         assert!(key.contains("CargoTest"));
@@ -5298,6 +5364,7 @@ mod tests {
 
     #[test]
     fn test_timing_history_record_and_get() {
+        let _guard = test_guard!();
         let mut history = super::TimingHistory::default();
 
         history.record("proj1", Some(CompilationKind::CargoBuild), 1000, true);
@@ -5316,6 +5383,7 @@ mod tests {
 
     #[test]
     fn test_timing_history_serialization() {
+        let _guard = test_guard!();
         let mut history = super::TimingHistory::default();
         history.record("proj", Some(CompilationKind::CargoCheck), 500, false);
         history.record("proj", Some(CompilationKind::CargoCheck), 250, true);

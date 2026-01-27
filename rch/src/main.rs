@@ -2343,7 +2343,7 @@ fn init_test_logging() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::Parser;
+    use rch_common::test_guard;
 
     // -------------------------------------------------------------------------
     // CLI Parsing Tests
@@ -2351,6 +2351,7 @@ mod tests {
 
     #[test]
     fn cli_parses_no_args() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch"]).unwrap();
         assert!(cli.command.is_none());
         assert!(!cli.verbose);
@@ -2361,6 +2362,7 @@ mod tests {
 
     #[test]
     fn cli_parses_verbose_flag() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "-v"]).unwrap();
         assert!(cli.verbose);
         assert!(!cli.quiet);
@@ -2368,12 +2370,14 @@ mod tests {
 
     #[test]
     fn cli_parses_verbose_long_flag() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "--verbose"]).unwrap();
         assert!(cli.verbose);
     }
 
     #[test]
     fn cli_parses_quiet_flag() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "-q"]).unwrap();
         assert!(cli.quiet);
         assert!(!cli.verbose);
@@ -2381,36 +2385,42 @@ mod tests {
 
     #[test]
     fn cli_parses_quiet_long_flag() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "--quiet"]).unwrap();
         assert!(cli.quiet);
     }
 
     #[test]
     fn cli_parses_json_flag() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "--json"]).unwrap();
         assert!(cli.json);
     }
 
     #[test]
     fn cli_parses_format_flag() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "--format", "toon"]).unwrap();
         assert_eq!(cli.format.as_deref(), Some("toon"));
     }
 
     #[test]
     fn cli_parses_color_always() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "--color", "always"]).unwrap();
         assert_eq!(cli.color, "always");
     }
 
     #[test]
     fn cli_parses_color_never() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "--color", "never"]).unwrap();
         assert_eq!(cli.color, "never");
     }
 
     #[test]
     fn cli_parses_color_auto() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "--color", "auto"]).unwrap();
         assert_eq!(cli.color, "auto");
     }
@@ -2421,6 +2431,7 @@ mod tests {
 
     #[test]
     fn cli_parses_daemon_start() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "daemon", "start"]).unwrap();
         match cli.command {
             Some(Commands::Daemon {
@@ -2432,6 +2443,7 @@ mod tests {
 
     #[test]
     fn cli_parses_daemon_stop() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "daemon", "stop"]).unwrap();
         match cli.command {
             Some(Commands::Daemon {
@@ -2443,6 +2455,7 @@ mod tests {
 
     #[test]
     fn cli_parses_daemon_restart() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "daemon", "restart"]).unwrap();
         match cli.command {
             Some(Commands::Daemon {
@@ -2454,6 +2467,7 @@ mod tests {
 
     #[test]
     fn cli_parses_daemon_status() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "daemon", "status"]).unwrap();
         match cli.command {
             Some(Commands::Daemon {
@@ -2465,6 +2479,7 @@ mod tests {
 
     #[test]
     fn cli_parses_daemon_logs_default() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "daemon", "logs"]).unwrap();
         match cli.command {
             Some(Commands::Daemon {
@@ -2478,6 +2493,7 @@ mod tests {
 
     #[test]
     fn cli_parses_daemon_logs_custom_lines() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "daemon", "logs", "-n", "100"]).unwrap();
         match cli.command {
             Some(Commands::Daemon {
@@ -2495,6 +2511,7 @@ mod tests {
 
     #[test]
     fn cli_parses_workers_list() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "workers", "list"]).unwrap();
         match cli.command {
             Some(Commands::Workers {
@@ -2508,6 +2525,7 @@ mod tests {
 
     #[test]
     fn cli_parses_workers_capabilities() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "workers", "capabilities"]).unwrap();
         match cli.command {
             Some(Commands::Workers {
@@ -2522,6 +2540,7 @@ mod tests {
 
     #[test]
     fn cli_parses_workers_capabilities_with_flags() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from([
             "rch",
             "workers",
@@ -2544,6 +2563,7 @@ mod tests {
 
     #[test]
     fn cli_parses_workers_probe_specific() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "workers", "probe", "css"]).unwrap();
         match cli.command {
             Some(Commands::Workers {
@@ -2558,6 +2578,7 @@ mod tests {
 
     #[test]
     fn cli_parses_workers_probe_all() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "workers", "probe", "--all"]).unwrap();
         match cli.command {
             Some(Commands::Workers {
@@ -2572,6 +2593,7 @@ mod tests {
 
     #[test]
     fn cli_parses_workers_benchmark() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "workers", "benchmark"]).unwrap();
         match cli.command {
             Some(Commands::Workers {
@@ -2583,6 +2605,7 @@ mod tests {
 
     #[test]
     fn cli_parses_workers_drain() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "workers", "drain", "css"]).unwrap();
         match cli.command {
             Some(Commands::Workers {
@@ -2596,6 +2619,7 @@ mod tests {
 
     #[test]
     fn cli_parses_workers_enable() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "workers", "enable", "css"]).unwrap();
         match cli.command {
             Some(Commands::Workers {
@@ -2609,6 +2633,7 @@ mod tests {
 
     #[test]
     fn cli_parses_workers_discover() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "workers", "discover", "--probe", "--add"]).unwrap();
         match cli.command {
             Some(Commands::Workers {
@@ -2624,6 +2649,7 @@ mod tests {
 
     #[test]
     fn cli_parses_workers_init() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "workers", "init"]).unwrap();
         match cli.command {
             Some(Commands::Workers {
@@ -2637,6 +2663,7 @@ mod tests {
 
     #[test]
     fn cli_parses_workers_init_with_yes() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "workers", "init", "--yes"]).unwrap();
         match cli.command {
             Some(Commands::Workers {
@@ -2650,6 +2677,7 @@ mod tests {
 
     #[test]
     fn cli_parses_workers_init_short_yes_flag() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "workers", "init", "-y"]).unwrap();
         match cli.command {
             Some(Commands::Workers {
@@ -2667,6 +2695,7 @@ mod tests {
 
     #[test]
     fn cli_parses_status_default() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "status"]).unwrap();
         match cli.command {
             Some(Commands::Status { workers, jobs }) => {
@@ -2679,6 +2708,7 @@ mod tests {
 
     #[test]
     fn cli_parses_status_with_workers() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "status", "--workers"]).unwrap();
         match cli.command {
             Some(Commands::Status { workers, jobs }) => {
@@ -2691,6 +2721,7 @@ mod tests {
 
     #[test]
     fn cli_parses_status_with_jobs() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "status", "--jobs"]).unwrap();
         match cli.command {
             Some(Commands::Status { workers, jobs }) => {
@@ -2703,6 +2734,7 @@ mod tests {
 
     #[test]
     fn cli_parses_status_with_both() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "status", "--workers", "--jobs"]).unwrap();
         match cli.command {
             Some(Commands::Status { workers, jobs }) => {
@@ -2719,6 +2751,7 @@ mod tests {
 
     #[test]
     fn cli_parses_config_show() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "config", "show"]).unwrap();
         match cli.command {
             Some(Commands::Config {
@@ -2732,6 +2765,7 @@ mod tests {
 
     #[test]
     fn cli_parses_config_show_sources() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "config", "show", "--sources"]).unwrap();
         match cli.command {
             Some(Commands::Config {
@@ -2749,6 +2783,7 @@ mod tests {
 
     #[test]
     fn cli_parses_diagnose_single_arg() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "diagnose", "cargo build --release"]).unwrap();
         match cli.command {
             Some(Commands::Diagnose { command, dry_run }) => {
@@ -2761,6 +2796,7 @@ mod tests {
 
     #[test]
     fn cli_parses_diagnose_multi_arg() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "diagnose", "cargo", "build", "--release"]).unwrap();
         match cli.command {
             Some(Commands::Diagnose { command, dry_run }) => {
@@ -2773,6 +2809,7 @@ mod tests {
 
     #[test]
     fn cli_parses_diagnose_dry_run() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "diagnose", "--dry-run", "cargo", "build"]).unwrap();
         match cli.command {
             Some(Commands::Diagnose { command, dry_run }) => {
@@ -2785,6 +2822,7 @@ mod tests {
 
     #[test]
     fn cli_parses_diagnose_dry_run_short() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "diagnose", "-n", "cargo", "build"]).unwrap();
         match cli.command {
             Some(Commands::Diagnose { command, dry_run }) => {
@@ -2797,6 +2835,7 @@ mod tests {
 
     #[test]
     fn cli_parses_config_init() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "config", "init"]).unwrap();
         match cli.command {
             Some(Commands::Config {
@@ -2817,6 +2856,7 @@ mod tests {
 
     #[test]
     fn cli_parses_config_init_wizard() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "config", "init", "--wizard"]).unwrap();
         match cli.command {
             Some(Commands::Config {
@@ -2830,6 +2870,7 @@ mod tests {
 
     #[test]
     fn cli_parses_config_validate() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "config", "validate"]).unwrap();
         match cli.command {
             Some(Commands::Config {
@@ -2841,6 +2882,7 @@ mod tests {
 
     #[test]
     fn cli_parses_config_set() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "config", "set", "log_level", "debug"]).unwrap();
         match cli.command {
             Some(Commands::Config {
@@ -2855,6 +2897,7 @@ mod tests {
 
     #[test]
     fn cli_parses_config_export() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "config", "export"]).unwrap();
         match cli.command {
             Some(Commands::Config {
@@ -2868,6 +2911,7 @@ mod tests {
 
     #[test]
     fn cli_parses_config_lint() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "config", "lint"]).unwrap();
         match cli.command {
             Some(Commands::Config {
@@ -2879,6 +2923,7 @@ mod tests {
 
     #[test]
     fn cli_parses_config_diff() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "config", "diff"]).unwrap();
         match cli.command {
             Some(Commands::Config {
@@ -2894,6 +2939,7 @@ mod tests {
 
     #[test]
     fn cli_parses_hook_install() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "hook", "install"]).unwrap();
         match cli.command {
             Some(Commands::Hook {
@@ -2905,6 +2951,7 @@ mod tests {
 
     #[test]
     fn cli_parses_hook_uninstall() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "hook", "uninstall"]).unwrap();
         match cli.command {
             Some(Commands::Hook {
@@ -2916,6 +2963,7 @@ mod tests {
 
     #[test]
     fn cli_parses_hook_test() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "hook", "test"]).unwrap();
         match cli.command {
             Some(Commands::Hook {
@@ -2931,6 +2979,7 @@ mod tests {
 
     #[test]
     fn cli_parses_doctor_default() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "doctor"]).unwrap();
         match cli.command {
             Some(Commands::Doctor {
@@ -2948,6 +2997,7 @@ mod tests {
 
     #[test]
     fn cli_parses_doctor_with_fix() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "doctor", "--fix"]).unwrap();
         match cli.command {
             Some(Commands::Doctor {
@@ -2965,6 +3015,7 @@ mod tests {
 
     #[test]
     fn cli_parses_doctor_with_dry_run() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "doctor", "--dry-run"]).unwrap();
         match cli.command {
             Some(Commands::Doctor {
@@ -2982,6 +3033,7 @@ mod tests {
 
     #[test]
     fn cli_parses_doctor_install_deps() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "doctor", "--install-deps"]).unwrap();
         match cli.command {
             Some(Commands::Doctor {
@@ -3003,6 +3055,7 @@ mod tests {
 
     #[test]
     fn cli_parses_init_default() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "init"]).unwrap();
         match cli.command {
             Some(Commands::Init { yes, skip_test }) => {
@@ -3015,6 +3068,7 @@ mod tests {
 
     #[test]
     fn cli_parses_init_yes() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "init", "--yes"]).unwrap();
         match cli.command {
             Some(Commands::Init { yes, skip_test }) => {
@@ -3027,6 +3081,7 @@ mod tests {
 
     #[test]
     fn cli_parses_init_skip_test() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "init", "--skip-test"]).unwrap();
         match cli.command {
             Some(Commands::Init { yes, skip_test }) => {
@@ -3039,6 +3094,7 @@ mod tests {
 
     #[test]
     fn cli_parses_setup_as_alias_for_init() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "setup"]).unwrap();
         match cli.command {
             Some(Commands::Init { yes, skip_test }) => {
@@ -3051,6 +3107,7 @@ mod tests {
 
     #[test]
     fn cli_parses_setup_with_flags() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "setup", "--yes", "--skip-test"]).unwrap();
         match cli.command {
             Some(Commands::Init { yes, skip_test }) => {
@@ -3067,6 +3124,7 @@ mod tests {
 
     #[test]
     fn cli_parses_update_default() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "update"]).unwrap();
         match cli.command {
             Some(Commands::Update {
@@ -3087,6 +3145,7 @@ mod tests {
 
     #[test]
     fn cli_parses_update_check() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "update", "--check"]).unwrap();
         match cli.command {
             Some(Commands::Update { check, .. }) => {
@@ -3098,6 +3157,7 @@ mod tests {
 
     #[test]
     fn cli_parses_update_version() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "update", "--version", "v0.2.0"]).unwrap();
         match cli.command {
             Some(Commands::Update { version, .. }) => {
@@ -3109,6 +3169,7 @@ mod tests {
 
     #[test]
     fn cli_parses_update_channel() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "update", "--channel", "beta"]).unwrap();
         match cli.command {
             Some(Commands::Update { channel, .. }) => {
@@ -3120,6 +3181,7 @@ mod tests {
 
     #[test]
     fn cli_parses_update_fleet() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "update", "--fleet"]).unwrap();
         match cli.command {
             Some(Commands::Update { fleet, .. }) => {
@@ -3135,6 +3197,7 @@ mod tests {
 
     #[test]
     fn cli_parses_fleet_deploy_default() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "fleet", "deploy"]).unwrap();
         match cli.command {
             Some(Commands::Fleet {
@@ -3158,6 +3221,7 @@ mod tests {
 
     #[test]
     fn cli_parses_fleet_deploy_worker() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "fleet", "deploy", "--worker", "css"]).unwrap();
         match cli.command {
             Some(Commands::Fleet {
@@ -3171,6 +3235,7 @@ mod tests {
 
     #[test]
     fn cli_parses_fleet_deploy_canary() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "fleet", "deploy", "--canary", "25"]).unwrap();
         match cli.command {
             Some(Commands::Fleet {
@@ -3184,6 +3249,7 @@ mod tests {
 
     #[test]
     fn cli_parses_fleet_rollback() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "fleet", "rollback"]).unwrap();
         match cli.command {
             Some(Commands::Fleet {
@@ -3201,6 +3267,7 @@ mod tests {
 
     #[test]
     fn cli_parses_fleet_status() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "fleet", "status"]).unwrap();
         match cli.command {
             Some(Commands::Fleet {
@@ -3215,6 +3282,7 @@ mod tests {
 
     #[test]
     fn cli_parses_fleet_verify() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "fleet", "verify"]).unwrap();
         match cli.command {
             Some(Commands::Fleet {
@@ -3228,6 +3296,7 @@ mod tests {
 
     #[test]
     fn cli_parses_fleet_history() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "fleet", "history", "--limit", "20"]).unwrap();
         match cli.command {
             Some(Commands::Fleet {
@@ -3246,6 +3315,7 @@ mod tests {
 
     #[test]
     fn cli_parses_dashboard_default() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "dashboard"]).unwrap();
         match cli.command {
             Some(Commands::Dashboard {
@@ -3271,6 +3341,7 @@ mod tests {
 
     #[test]
     fn cli_parses_dashboard_custom_refresh() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "dashboard", "--refresh", "500"]).unwrap();
         match cli.command {
             Some(Commands::Dashboard { refresh, .. }) => {
@@ -3282,6 +3353,7 @@ mod tests {
 
     #[test]
     fn cli_parses_web_default() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "web"]).unwrap();
         match cli.command {
             Some(Commands::Web {
@@ -3299,6 +3371,7 @@ mod tests {
 
     #[test]
     fn cli_parses_web_custom_port() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "web", "--port", "3001"]).unwrap();
         match cli.command {
             Some(Commands::Web { port, .. }) => {
@@ -3314,6 +3387,7 @@ mod tests {
 
     #[test]
     fn cli_parses_speedscore_single_worker() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "speedscore", "css"]).unwrap();
         match cli.command {
             Some(Commands::SpeedScore {
@@ -3337,6 +3411,7 @@ mod tests {
 
     #[test]
     fn cli_parses_speedscore_all() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "speedscore", "--all"]).unwrap();
         match cli.command {
             Some(Commands::SpeedScore { all, worker, .. }) => {
@@ -3349,6 +3424,7 @@ mod tests {
 
     #[test]
     fn cli_parses_speedscore_verbose() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "speedscore", "css", "--verbose"]).unwrap();
         match cli.command {
             Some(Commands::SpeedScore {
@@ -3363,6 +3439,7 @@ mod tests {
 
     #[test]
     fn cli_parses_speedscore_history() {
+        let _guard = test_guard!();
         let cli =
             Cli::try_parse_from(["rch", "speedscore", "css", "--history", "--days", "7"]).unwrap();
         match cli.command {
@@ -3382,6 +3459,7 @@ mod tests {
 
     #[test]
     fn cli_parses_speedscore_short_verbose() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "speedscore", "css", "-v"]).unwrap();
         match cli.command {
             Some(Commands::SpeedScore { verbose, .. }) => {
@@ -3397,6 +3475,7 @@ mod tests {
 
     #[test]
     fn cli_parses_completions_generate_bash() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "completions", "generate", "bash"]).unwrap();
         match cli.command {
             Some(Commands::Completions {
@@ -3410,6 +3489,7 @@ mod tests {
 
     #[test]
     fn cli_parses_completions_install() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "completions", "install", "zsh"]).unwrap();
         match cli.command {
             Some(Commands::Completions {
@@ -3424,6 +3504,7 @@ mod tests {
 
     #[test]
     fn cli_parses_completions_status() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "completions", "status"]).unwrap();
         match cli.command {
             Some(Commands::Completions {
@@ -3439,6 +3520,7 @@ mod tests {
 
     #[test]
     fn cli_parses_agents_list() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "agents", "list"]).unwrap();
         match cli.command {
             Some(Commands::Agents {
@@ -3452,6 +3534,7 @@ mod tests {
 
     #[test]
     fn cli_parses_agents_list_all() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "agents", "list", "--all"]).unwrap();
         match cli.command {
             Some(Commands::Agents {
@@ -3465,6 +3548,7 @@ mod tests {
 
     #[test]
     fn cli_parses_agents_status() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "agents", "status"]).unwrap();
         match cli.command {
             Some(Commands::Agents {
@@ -3478,6 +3562,7 @@ mod tests {
 
     #[test]
     fn cli_parses_agents_install_hook() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "agents", "install-hook", "claude-code"]).unwrap();
         match cli.command {
             Some(Commands::Agents {
@@ -3496,6 +3581,7 @@ mod tests {
 
     #[test]
     fn cli_global_flags_with_subcommand() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "-v", "--json", "daemon", "status"]).unwrap();
         assert!(cli.verbose);
         assert!(cli.json);
@@ -3509,6 +3595,7 @@ mod tests {
 
     #[test]
     fn cli_global_flags_after_subcommand() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "daemon", "status", "-v", "--json"]).unwrap();
         assert!(cli.verbose);
         assert!(cli.json);
@@ -3520,12 +3607,14 @@ mod tests {
 
     #[test]
     fn cli_rejects_unknown_subcommand() {
+        let _guard = test_guard!();
         let result = Cli::try_parse_from(["rch", "unknown"]);
         assert!(result.is_err());
     }
 
     #[test]
     fn cli_rejects_invalid_color_option() {
+        let _guard = test_guard!();
         // Note: clap accepts any string for color, the validation happens at runtime
         // with ColorChoice::parse, so this test verifies clap accepts it
         let cli = Cli::try_parse_from(["rch", "--color", "invalid"]).unwrap();
@@ -3534,24 +3623,28 @@ mod tests {
 
     #[test]
     fn cli_daemon_requires_action() {
+        let _guard = test_guard!();
         let result = Cli::try_parse_from(["rch", "daemon"]);
         assert!(result.is_err());
     }
 
     #[test]
     fn cli_workers_requires_action() {
+        let _guard = test_guard!();
         let result = Cli::try_parse_from(["rch", "workers"]);
         assert!(result.is_err());
     }
 
     #[test]
     fn cli_config_requires_action() {
+        let _guard = test_guard!();
         let result = Cli::try_parse_from(["rch", "config"]);
         assert!(result.is_err());
     }
 
     #[test]
     fn cli_hook_requires_action() {
+        let _guard = test_guard!();
         let result = Cli::try_parse_from(["rch", "hook"]);
         assert!(result.is_err());
     }
@@ -3562,24 +3655,28 @@ mod tests {
 
     #[test]
     fn color_choice_parse_auto() {
+        let _guard = test_guard!();
         let choice = ColorChoice::parse("auto");
         assert_eq!(choice, ColorChoice::Auto);
     }
 
     #[test]
     fn color_choice_parse_always() {
+        let _guard = test_guard!();
         let choice = ColorChoice::parse("always");
         assert_eq!(choice, ColorChoice::Always);
     }
 
     #[test]
     fn color_choice_parse_never() {
+        let _guard = test_guard!();
         let choice = ColorChoice::parse("never");
         assert_eq!(choice, ColorChoice::Never);
     }
 
     #[test]
     fn color_choice_parse_unknown_defaults_to_auto() {
+        let _guard = test_guard!();
         let choice = ColorChoice::parse("invalid");
         assert_eq!(choice, ColorChoice::Auto);
     }
@@ -3590,6 +3687,7 @@ mod tests {
 
     #[test]
     fn output_config_default_values() {
+        let _guard = test_guard!();
         let config = OutputConfig::default();
         assert!(!config.json);
         assert!(!config.verbose);
@@ -3599,6 +3697,7 @@ mod tests {
 
     #[test]
     fn output_config_from_cli_args_verbose() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "-v"]).unwrap();
         let format = resolve_output_format(cli.format.as_deref(), cli.json);
         let machine = machine_output_requested(cli.format.as_deref(), cli.json);
@@ -3617,6 +3716,7 @@ mod tests {
 
     #[test]
     fn output_config_from_cli_args_json() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "--json"]).unwrap();
         let format = resolve_output_format(cli.format.as_deref(), cli.json);
         let machine = machine_output_requested(cli.format.as_deref(), cli.json);
@@ -3634,6 +3734,7 @@ mod tests {
 
     #[test]
     fn output_config_from_cli_args_quiet() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "-q"]).unwrap();
         let format = resolve_output_format(cli.format.as_deref(), cli.json);
         let machine = machine_output_requested(cli.format.as_deref(), cli.json);
@@ -3651,6 +3752,7 @@ mod tests {
 
     #[test]
     fn output_format_resolves_to_toon() {
+        let _guard = test_guard!();
         let format = resolve_output_format(Some("toon"), false);
         let machine = machine_output_requested(Some("toon"), false);
         assert_eq!(format, OutputFormat::Toon);
@@ -3663,6 +3765,7 @@ mod tests {
 
     #[test]
     fn output_context_creation_from_config() {
+        let _guard = test_guard!();
         let config = OutputConfig {
             json: true,
             verbose: true,
@@ -3678,12 +3781,14 @@ mod tests {
 
     #[test]
     fn output_context_is_verbose_false_by_default() {
+        let _guard = test_guard!();
         let ctx = OutputContext::new(OutputConfig::default());
         assert!(!ctx.is_verbose());
     }
 
     #[test]
     fn output_context_is_quiet_false_by_default() {
+        let _guard = test_guard!();
         let ctx = OutputContext::new(OutputConfig::default());
         assert!(!ctx.is_quiet());
     }
@@ -3694,6 +3799,7 @@ mod tests {
 
     #[test]
     fn find_web_directory_error_message_is_helpful() {
+        let _guard = test_guard!();
         let temp_dir = std::env::temp_dir().join("rch_test_no_web");
         let _ = std::fs::create_dir_all(&temp_dir);
         let original_dir = std::env::current_dir().unwrap();
@@ -3715,12 +3821,14 @@ mod tests {
 
     #[test]
     fn cli_command_debug_assert_passes() {
+        let _guard = test_guard!();
         use clap::CommandFactory;
         Cli::command().debug_assert();
     }
 
     #[test]
     fn cli_has_version() {
+        let _guard = test_guard!();
         use clap::CommandFactory;
         let cmd = Cli::command();
         assert!(cmd.get_version().is_some());
@@ -3728,6 +3836,7 @@ mod tests {
 
     #[test]
     fn cli_has_about() {
+        let _guard = test_guard!();
         use clap::CommandFactory;
         let cmd = Cli::command();
         assert!(cmd.get_about().is_some());
@@ -3735,6 +3844,7 @@ mod tests {
 
     #[test]
     fn cli_has_after_help_with_examples() {
+        let _guard = test_guard!();
         use clap::CommandFactory;
         let cmd = Cli::command();
         let after_help = cmd
@@ -3748,6 +3858,7 @@ mod tests {
 
     #[test]
     fn cli_subcommands_have_help() {
+        let _guard = test_guard!();
         use clap::CommandFactory;
         let cmd = Cli::command();
         let subcommands: Vec<_> = cmd.get_subcommands().collect();
@@ -3771,6 +3882,7 @@ mod tests {
 
     #[test]
     fn cli_parses_queue_default() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "queue"]).unwrap();
         match cli.command {
             Some(Commands::Queue { watch }) => {
@@ -3782,6 +3894,7 @@ mod tests {
 
     #[test]
     fn cli_parses_queue_watch() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "queue", "--watch"]).unwrap();
         match cli.command {
             Some(Commands::Queue { watch }) => {
@@ -3793,6 +3906,7 @@ mod tests {
 
     #[test]
     fn cli_parses_queue_watch_short() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "queue", "-w"]).unwrap();
         match cli.command {
             Some(Commands::Queue { watch }) => {
@@ -3808,6 +3922,7 @@ mod tests {
 
     #[test]
     fn cli_parses_cancel_by_id() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "cancel", "42"]).unwrap();
         match cli.command {
             Some(Commands::Cancel {
@@ -3827,6 +3942,7 @@ mod tests {
 
     #[test]
     fn cli_parses_cancel_all() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "cancel", "--all"]).unwrap();
         match cli.command {
             Some(Commands::Cancel {
@@ -3846,6 +3962,7 @@ mod tests {
 
     #[test]
     fn cli_parses_cancel_all_yes() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "cancel", "--all", "--yes"]).unwrap();
         match cli.command {
             Some(Commands::Cancel {
@@ -3865,6 +3982,7 @@ mod tests {
 
     #[test]
     fn cli_parses_cancel_force() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "cancel", "42", "--force"]).unwrap();
         match cli.command {
             Some(Commands::Cancel {
@@ -3884,6 +4002,7 @@ mod tests {
 
     #[test]
     fn cli_parses_cancel_force_short() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "cancel", "42", "-f"]).unwrap();
         match cli.command {
             Some(Commands::Cancel {
@@ -3898,6 +4017,7 @@ mod tests {
 
     #[test]
     fn cli_parses_cancel_yes_short() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "cancel", "--all", "-y"]).unwrap();
         match cli.command {
             Some(Commands::Cancel { yes, .. }) => {
@@ -3913,6 +4033,7 @@ mod tests {
 
     #[test]
     fn cli_parses_self_test_default() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "self-test"]).unwrap();
         match cli.command {
             Some(Commands::SelfTest {
@@ -3938,6 +4059,7 @@ mod tests {
 
     #[test]
     fn cli_parses_self_test_worker() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "self-test", "--worker", "css"]).unwrap();
         match cli.command {
             Some(Commands::SelfTest { worker, all, .. }) => {
@@ -3950,6 +4072,7 @@ mod tests {
 
     #[test]
     fn cli_parses_self_test_all() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "self-test", "--all"]).unwrap();
         match cli.command {
             Some(Commands::SelfTest { all, .. }) => {
@@ -3961,6 +4084,7 @@ mod tests {
 
     #[test]
     fn cli_parses_self_test_timeout() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "self-test", "--timeout", "600"]).unwrap();
         match cli.command {
             Some(Commands::SelfTest { timeout, .. }) => {
@@ -3972,6 +4096,7 @@ mod tests {
 
     #[test]
     fn cli_parses_self_test_debug() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "self-test", "--debug"]).unwrap();
         match cli.command {
             Some(Commands::SelfTest { debug, .. }) => {
@@ -3983,6 +4108,7 @@ mod tests {
 
     #[test]
     fn cli_parses_self_test_scheduled() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "self-test", "--scheduled"]).unwrap();
         match cli.command {
             Some(Commands::SelfTest { scheduled, .. }) => {
@@ -3994,6 +4120,7 @@ mod tests {
 
     #[test]
     fn cli_parses_self_test_status() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "self-test", "status"]).unwrap();
         match cli.command {
             Some(Commands::SelfTest { action, .. }) => {
@@ -4005,6 +4132,7 @@ mod tests {
 
     #[test]
     fn cli_parses_self_test_history() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "self-test", "history"]).unwrap();
         match cli.command {
             Some(Commands::SelfTest { action, .. }) => {
@@ -4019,6 +4147,7 @@ mod tests {
 
     #[test]
     fn cli_parses_self_test_history_limit() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "self-test", "history", "--limit", "20"]).unwrap();
         match cli.command {
             Some(Commands::SelfTest { action, .. }) => {
@@ -4033,6 +4162,7 @@ mod tests {
 
     #[test]
     fn cli_parses_self_test_project() {
+        let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "self-test", "--project", "/tmp/test"]).unwrap();
         match cli.command {
             Some(Commands::SelfTest { project, .. }) => {
@@ -4051,26 +4181,31 @@ mod tests {
 
     #[test]
     fn machine_output_requested_json_flag_true() {
+        let _guard = test_guard!();
         assert!(machine_output_requested(None, true));
     }
 
     #[test]
     fn machine_output_requested_format_some() {
+        let _guard = test_guard!();
         assert!(machine_output_requested(Some("toon"), false));
     }
 
     #[test]
     fn machine_output_requested_both_set() {
+        let _guard = test_guard!();
         assert!(machine_output_requested(Some("json"), true));
     }
 
     #[test]
     fn machine_output_requested_neither_set() {
+        let _guard = test_guard!();
         assert!(!machine_output_requested(None, false));
     }
 
     #[test]
     fn resolve_output_format_explicit_json() {
+        let _guard = test_guard!();
         assert_eq!(
             resolve_output_format(Some("json"), false),
             OutputFormat::Json
@@ -4079,6 +4214,7 @@ mod tests {
 
     #[test]
     fn resolve_output_format_explicit_toon() {
+        let _guard = test_guard!();
         assert_eq!(
             resolve_output_format(Some("toon"), false),
             OutputFormat::Toon
@@ -4087,6 +4223,7 @@ mod tests {
 
     #[test]
     fn resolve_output_format_explicit_with_json_flag() {
+        let _guard = test_guard!();
         // Explicit format takes precedence over json flag
         assert_eq!(
             resolve_output_format(Some("toon"), true),
@@ -4096,6 +4233,7 @@ mod tests {
 
     #[test]
     fn resolve_output_format_invalid_format_falls_back() {
+        let _guard = test_guard!();
         // Invalid format string should fall back to Json default
         assert_eq!(
             resolve_output_format(Some("invalid"), false),

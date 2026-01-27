@@ -394,8 +394,9 @@ async fn poll_worker(
 
 #[cfg(test)]
 mod tests {
-        use rch_common::test_guard;
+    use super::*;
     use rch_common::CompilationKind;
+    use rch_common::test_guard;
     use rch_telemetry::collect::cpu::{CpuTelemetry, LoadAverage};
     use rch_telemetry::collect::memory::MemoryTelemetry;
 

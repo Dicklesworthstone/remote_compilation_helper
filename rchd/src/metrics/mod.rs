@@ -456,8 +456,9 @@ pub fn inc_requests(endpoint: &str) {
 
 #[cfg(test)]
 mod tests {
-        use rch_common::test_guard;
+    use super::*;
     use ::tracing::info;
+    use rch_common::test_guard;
 
     fn setup_tracing() {
         let _ = tracing_subscriber::fmt()

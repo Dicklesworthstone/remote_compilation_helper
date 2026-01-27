@@ -669,7 +669,8 @@ impl Default for BuildHistory {
 
 #[cfg(test)]
 mod tests {
-        use rch_common::test_guard;
+    use super::*;
+    use rch_common::test_guard;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tempfile::TempDir;
 

@@ -160,6 +160,7 @@ fn parse_selection_response(body: &str) -> Option<serde_json::Value> {
 /// Workers with more slots should receive proportionally more jobs.
 #[test]
 fn test_load_balance_distribution() {
+    let _guard = rch_common::test_guard!();
     let harness = create_multi_worker_harness("load_balance_distribution").unwrap();
     harness
         .logger
@@ -252,6 +253,7 @@ fn test_load_balance_distribution() {
 /// that high-priority worker is selected for the majority of requests.
 #[test]
 fn test_worker_prioritization() {
+    let _guard = rch_common::test_guard!();
     let harness = create_multi_worker_harness("worker_prioritization").unwrap();
     harness
         .logger
@@ -331,6 +333,7 @@ fn test_worker_prioritization() {
 /// Test that repeat builds for the same project prefer the same worker.
 #[test]
 fn test_cached_project_locality() {
+    let _guard = rch_common::test_guard!();
     let harness = create_multi_worker_harness("cached_project_locality").unwrap();
     harness
         .logger
@@ -427,6 +430,7 @@ fn test_cached_project_locality() {
 /// Test capability-based routing with Rust-only and Bun-only workers.
 #[test]
 fn test_heterogeneous_workers() {
+    let _guard = rch_common::test_guard!();
     let harness = create_multi_worker_harness("heterogeneous_workers").unwrap();
     harness
         .logger
@@ -493,6 +497,7 @@ fn test_heterogeneous_workers() {
 /// Test worker registration - fresh worker joins fleet.
 #[test]
 fn test_worker_registration() {
+    let _guard = rch_common::test_guard!();
     let harness = create_multi_worker_harness("worker_registration").unwrap();
     harness
         .logger
@@ -529,6 +534,7 @@ fn test_worker_registration() {
 /// Test worker health monitoring - health check success and failure paths.
 #[test]
 fn test_worker_health_monitoring() {
+    let _guard = rch_common::test_guard!();
     let harness = create_multi_worker_harness("worker_health_monitoring").unwrap();
     harness
         .logger
@@ -570,6 +576,7 @@ fn test_worker_health_monitoring() {
 /// Test that job selection avoids unhealthy workers.
 #[test]
 fn test_selection_avoids_unhealthy() {
+    let _guard = rch_common::test_guard!();
     let harness = create_multi_worker_harness("selection_avoids_unhealthy").unwrap();
     harness
         .logger
@@ -620,6 +627,7 @@ fn test_selection_avoids_unhealthy() {
 /// Test graceful worker shutdown - worker removed from pool.
 #[test]
 fn test_worker_graceful_shutdown() {
+    let _guard = rch_common::test_guard!();
     let harness = create_multi_worker_harness("worker_graceful_shutdown").unwrap();
     harness
         .logger
@@ -660,6 +668,7 @@ fn test_worker_graceful_shutdown() {
 /// Test fleet down to single worker scenario.
 #[test]
 fn test_fleet_single_worker_fallback() {
+    let _guard = rch_common::test_guard!();
     let harness = create_multi_worker_harness("fleet_single_worker_fallback").unwrap();
     harness
         .logger
@@ -702,6 +711,7 @@ fn test_fleet_single_worker_fallback() {
 /// Test that no workers available returns appropriate response.
 #[test]
 fn test_no_workers_available() {
+    let _guard = rch_common::test_guard!();
     let harness = create_multi_worker_harness("no_workers_available").unwrap();
     harness
         .logger

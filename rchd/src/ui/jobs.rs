@@ -322,7 +322,8 @@ fn pipe(ctx: OutputContext) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-        use rch_common::test_guard;
+    use super::*;
+    use rch_common::test_guard;
 
     // ==================== format_elapsed tests ====================
 

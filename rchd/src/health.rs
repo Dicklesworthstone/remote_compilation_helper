@@ -674,13 +674,13 @@ pub async fn probe_worker_capabilities(
 
 #[cfg(test)]
 mod tests {
-        use rch_common::test_guard;
+    use super::*;
     use rch_common::mock::{
-        MockConfig, clear_mock_overrides, set_mock_enabled_override, set_mock_ssh_config_override,
+        clear_mock_overrides, set_mock_enabled_override, set_mock_ssh_config_override,
     };
+    use rch_common::test_guard;
     use rch_common::{WorkerConfig, WorkerId};
     use std::sync::OnceLock;
-    use tokio::sync::Mutex;
 
     fn test_lock() -> &'static Mutex<()> {
         static ENV_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();

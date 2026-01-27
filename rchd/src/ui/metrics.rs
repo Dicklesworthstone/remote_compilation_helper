@@ -527,9 +527,9 @@ fn rich_override() -> Option<bool> {
 
 #[cfg(test)]
 mod tests {
-        use rch_common::test_guard;
+    use super::*;
     use chrono::Datelike;
-    use std::collections::VecDeque;
+    use rch_common::test_guard;
 
     // ==================== delta_counter tests ====================
 

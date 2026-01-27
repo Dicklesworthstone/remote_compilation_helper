@@ -242,9 +242,11 @@ pub fn strip_target_triple(toolchain: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rch_common::test_guard;
 
     #[test]
     fn test_strip_target_triple_linux() {
+        let _guard = test_guard!();
         assert_eq!(
             strip_target_triple("nightly-x86_64-unknown-linux-gnu"),
             "nightly"
@@ -261,6 +263,7 @@ mod tests {
 
     #[test]
     fn test_strip_target_triple_macos() {
+        let _guard = test_guard!();
         assert_eq!(strip_target_triple("stable-x86_64-apple-darwin"), "stable");
         assert_eq!(
             strip_target_triple("nightly-aarch64-apple-darwin"),
@@ -270,6 +273,7 @@ mod tests {
 
     #[test]
     fn test_strip_target_triple_no_triple() {
+        let _guard = test_guard!();
         assert_eq!(strip_target_triple("nightly"), "nightly");
         assert_eq!(strip_target_triple("stable"), "stable");
         assert_eq!(
@@ -280,6 +284,7 @@ mod tests {
 
     #[test]
     fn test_cache_operations() {
+        let _guard = test_guard!();
         // Start with a clean cache
         clear_cache();
         assert!(get_cached_toolchains().is_empty());
@@ -291,6 +296,7 @@ mod tests {
 
     #[test]
     fn test_cache_clear_behavior() {
+        let _guard = test_guard!();
         // Verify cache clears correctly
         clear_cache();
         let cached = get_cached_toolchains();
@@ -299,6 +305,7 @@ mod tests {
 
     #[test]
     fn test_toolchain_error_display() {
+        let _guard = test_guard!();
         // Test error message formatting
         let err = ToolchainError::InstallFailed("rustup failed".to_string());
         assert!(err.to_string().contains("rustup failed"));
@@ -312,6 +319,7 @@ mod tests {
 
     #[test]
     fn test_parse_toolchain_string_edge_cases() {
+        let _guard = test_guard!();
         // Test empty string
         let tc = parse_toolchain_string("");
         assert_eq!(tc.channel, "");
@@ -332,6 +340,7 @@ mod tests {
 
     #[test]
     fn test_strip_target_triple_windows() {
+        let _guard = test_guard!();
         assert_eq!(
             strip_target_triple("stable-x86_64-pc-windows-msvc"),
             "stable"
@@ -344,6 +353,7 @@ mod tests {
 
     #[test]
     fn test_strip_target_triple_aarch64() {
+        let _guard = test_guard!();
         assert_eq!(
             strip_target_triple("stable-aarch64-unknown-linux-gnu"),
             "stable"
@@ -352,6 +362,7 @@ mod tests {
 
     #[test]
     fn test_parse_toolchain_preserves_full_version() {
+        let _guard = test_guard!();
         let tc = parse_toolchain_string("nightly-2024-01-15");
         assert_eq!(tc.full_version, "nightly-2024-01-15");
 
@@ -361,6 +372,7 @@ mod tests {
 
     #[test]
     fn test_toolchain_info_rustup_toolchain() {
+        let _guard = test_guard!();
         let tc = ToolchainInfo::new("nightly", Some("2024-01-15".to_string()), "");
         assert_eq!(tc.rustup_toolchain(), "nightly-2024-01-15");
 
@@ -370,6 +382,7 @@ mod tests {
 
     #[test]
     fn test_parse_toolchain_string_stable() {
+        let _guard = test_guard!();
         let tc = parse_toolchain_string("stable");
         assert_eq!(tc.channel, "stable");
         assert_eq!(tc.date, None);
@@ -377,6 +390,7 @@ mod tests {
 
     #[test]
     fn test_parse_toolchain_string_nightly() {
+        let _guard = test_guard!();
         let tc = parse_toolchain_string("nightly");
         assert_eq!(tc.channel, "nightly");
         assert_eq!(tc.date, None);
@@ -384,6 +398,7 @@ mod tests {
 
     #[test]
     fn test_parse_toolchain_string_nightly_with_date() {
+        let _guard = test_guard!();
         let tc = parse_toolchain_string("nightly-2024-01-15");
         assert_eq!(tc.channel, "nightly");
         assert_eq!(tc.date, Some("2024-01-15".to_string()));
@@ -392,6 +407,7 @@ mod tests {
 
     #[test]
     fn test_parse_toolchain_string_beta_with_date() {
+        let _guard = test_guard!();
         let tc = parse_toolchain_string("beta-2024-02-01");
         assert_eq!(tc.channel, "beta");
         assert_eq!(tc.date, Some("2024-02-01".to_string()));
@@ -399,6 +415,7 @@ mod tests {
 
     #[test]
     fn test_parse_toolchain_string_version() {
+        let _guard = test_guard!();
         let tc = parse_toolchain_string("1.75.0");
         assert_eq!(tc.channel, "1.75.0");
         assert_eq!(tc.date, None);
@@ -406,6 +423,7 @@ mod tests {
 
     #[test]
     fn test_parse_toolchain_string_with_target() {
+        let _guard = test_guard!();
         let tc = parse_toolchain_string("nightly-x86_64-unknown-linux-gnu");
         assert_eq!(tc.channel, "nightly");
         assert_eq!(tc.date, None);
@@ -413,6 +431,7 @@ mod tests {
 
     #[test]
     fn test_parse_toolchain_string_nightly_date_with_target() {
+        let _guard = test_guard!();
         let tc = parse_toolchain_string("nightly-2024-01-15-x86_64-unknown-linux-gnu");
         assert_eq!(tc.channel, "nightly");
         assert_eq!(tc.date, Some("2024-01-15".to_string()));
@@ -420,6 +439,7 @@ mod tests {
 
     #[test]
     fn test_is_date_format() {
+        let _guard = test_guard!();
         assert!(is_date_format("2024-01-15"));
         assert!(is_date_format("2023-12-31"));
         assert!(!is_date_format("2024-1-15")); // Missing leading zero
@@ -465,6 +485,7 @@ mod tests {
 
     #[test]
     fn test_cache_starts_empty() {
+        let _guard = test_guard!();
         // Clear first to ensure clean state
         clear_cache();
         let cached = get_cached_toolchains();
@@ -473,6 +494,7 @@ mod tests {
 
     #[test]
     fn test_cache_clear_is_thorough() {
+        let _guard = test_guard!();
         // Simulate adding to cache by directly manipulating (if possible)
         // Since we can't easily add without rustup, just verify clear works
         clear_cache();
@@ -487,6 +509,7 @@ mod tests {
 
     #[test]
     fn test_cache_independent_of_clear_order() {
+        let _guard = test_guard!();
         // Multiple clears should all succeed
         for _ in 0..5 {
             clear_cache();
@@ -496,6 +519,7 @@ mod tests {
 
     #[test]
     fn test_toolchain_error_variants() {
+        let _guard = test_guard!();
         // Test all error variants for coverage
         let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "test");
         let tc_err: ToolchainError = io_err.into();
@@ -513,6 +537,7 @@ mod tests {
 
     #[test]
     fn test_parse_toolchain_string_beta() {
+        let _guard = test_guard!();
         let tc = parse_toolchain_string("beta");
         assert_eq!(tc.channel, "beta");
         assert_eq!(tc.date, None);
@@ -520,6 +545,7 @@ mod tests {
 
     #[test]
     fn test_parse_toolchain_string_custom_channel() {
+        let _guard = test_guard!();
         // Unknown formats should be parsed as-is
         let tc = parse_toolchain_string("my-custom-toolchain");
         assert_eq!(tc.channel, "my-custom-toolchain");
@@ -528,6 +554,7 @@ mod tests {
 
     #[test]
     fn test_is_date_format_edge_cases() {
+        let _guard = test_guard!();
         // Valid boundary dates
         assert!(is_date_format("1970-01-01"));
         assert!(is_date_format("2099-12-31"));
@@ -542,6 +569,7 @@ mod tests {
 
     #[test]
     fn test_strip_target_triple_unknown_target() {
+        let _guard = test_guard!();
         // Unknown targets should be left as-is
         assert_eq!(
             strip_target_triple("nightly-unknown-target-triple"),
@@ -552,6 +580,7 @@ mod tests {
 
     #[test]
     fn test_parse_toolchain_string_with_all_targets() {
+        let _guard = test_guard!();
         // Test all supported target triples
         let targets = [
             "x86_64-unknown-linux-gnu",
@@ -572,6 +601,7 @@ mod tests {
 
     #[test]
     fn test_toolchain_info_new_constructor() {
+        let _guard = test_guard!();
         let tc = ToolchainInfo::new(
             "nightly",
             Some("2024-01-15".to_string()),
@@ -584,6 +614,7 @@ mod tests {
 
     #[test]
     fn test_toolchain_info_channel_detection() {
+        let _guard = test_guard!();
         let nightly = ToolchainInfo::new("nightly", None, "");
         assert!(nightly.is_nightly());
         assert!(!nightly.is_stable());
@@ -675,6 +706,7 @@ mod tests {
 
     #[test]
     fn test_ensure_toolchain_returns_rustup_not_available_error() {
+        let _guard = test_guard!();
         // Test error type when rustup is not available
         // (This would happen on systems without rustup)
         let err = ToolchainError::RustupNotAvailable;
@@ -684,6 +716,7 @@ mod tests {
 
     #[test]
     fn test_ensure_toolchain_returns_install_failed_error() {
+        let _guard = test_guard!();
         // Test error type when installation fails
         let err = ToolchainError::InstallFailed("network timeout".to_string());
         assert!(matches!(err, ToolchainError::InstallFailed(_)));
@@ -692,6 +725,7 @@ mod tests {
 
     #[test]
     fn test_parse_toolchain_for_ensure() {
+        let _guard = test_guard!();
         // Test that parse_toolchain_string produces valid input for ensure_toolchain
         let tc_str = "nightly-2024-01-15";
         let tc_info = parse_toolchain_string(tc_str);
@@ -704,6 +738,7 @@ mod tests {
 
     #[test]
     fn test_parse_toolchain_for_ensure_stable() {
+        let _guard = test_guard!();
         let tc_info = parse_toolchain_string("stable");
         assert_eq!(tc_info.channel, "stable");
         assert_eq!(tc_info.date, None);
@@ -712,6 +747,7 @@ mod tests {
 
     #[test]
     fn test_parse_toolchain_for_ensure_beta_with_date() {
+        let _guard = test_guard!();
         let tc_info = parse_toolchain_string("beta-2024-03-01");
         assert_eq!(tc_info.channel, "beta");
         assert_eq!(tc_info.date, Some("2024-03-01".to_string()));
@@ -720,6 +756,7 @@ mod tests {
 
     #[test]
     fn test_parse_toolchain_strips_target_before_ensure() {
+        let _guard = test_guard!();
         // Toolchains with target triples should be normalized
         let tc_info = parse_toolchain_string("nightly-2024-01-15-x86_64-unknown-linux-gnu");
         assert_eq!(tc_info.channel, "nightly");
@@ -730,6 +767,7 @@ mod tests {
 
     #[test]
     fn test_toolchain_error_from_io() {
+        let _guard = test_guard!();
         // Test From<std::io::Error> for ToolchainError
         let io_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "access denied");
         let tc_err: ToolchainError = io_err.into();
@@ -739,6 +777,7 @@ mod tests {
 
     #[test]
     fn test_toolchain_error_debug_format() {
+        let _guard = test_guard!();
         // Test Debug implementation
         let err = ToolchainError::RustupNotAvailable;
         let debug_str = format!("{:?}", err);
@@ -751,6 +790,7 @@ mod tests {
 
     #[test]
     fn test_command_wrapping_for_toolchain() {
+        let _guard = test_guard!();
         // Test that wrap_command_with_toolchain from rch_common works correctly
         use rch_common::wrap_command_with_toolchain;
 
@@ -765,6 +805,7 @@ mod tests {
 
     #[test]
     fn test_fallback_path_on_toolchain_error() {
+        let _guard = test_guard!();
         // Simulate the fallback decision path when toolchain fails
         // In the actual code, this triggers execution without toolchain wrapping
         let result: Result<()> = Err(ToolchainError::InstallFailed("test".to_string()));
@@ -782,6 +823,7 @@ mod tests {
 
     #[test]
     fn test_nightly_with_invalid_date_parsed_as_custom() {
+        let _guard = test_guard!();
         // If the date part doesn't look like a date, treat as custom channel
         let tc = parse_toolchain_string("nightly-foobar");
         // This should be parsed as channel="nightly-foobar" with no date
@@ -792,6 +834,7 @@ mod tests {
 
     #[test]
     fn test_beta_with_invalid_date_parsed_as_custom() {
+        let _guard = test_guard!();
         let tc = parse_toolchain_string("beta-invalid");
         assert_eq!(tc.channel, "beta-invalid");
         assert_eq!(tc.date, None);
@@ -799,6 +842,7 @@ mod tests {
 
     #[test]
     fn test_version_number_as_channel() {
+        let _guard = test_guard!();
         // Specific versions should be parsed as channels
         let tc = parse_toolchain_string("1.75.0");
         assert_eq!(tc.channel, "1.75.0");
@@ -808,6 +852,7 @@ mod tests {
 
     #[test]
     fn test_two_digit_version() {
+        let _guard = test_guard!();
         let tc = parse_toolchain_string("1.75");
         assert_eq!(tc.channel, "1.75");
         assert_eq!(tc.date, None);

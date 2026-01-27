@@ -10,6 +10,7 @@
 //! Uses the E2E test harness from rch-common.
 
 use rch_common::e2e::{HarnessResult, HookInputFixture, TestHarness, TestHarnessBuilder};
+use rch_common::test_guard;
 use rch_common::{Classification, TierDecision, classify_command, classify_command_detailed};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -115,6 +116,7 @@ fn classify_and_log(harness: &TestHarness, command: &str) -> Classification {
 
 #[test]
 fn test_hook_intercepts_cargo_build() {
+    let _guard = test_guard!();
     let harness = create_hook_harness("hook_intercepts_cargo_build").unwrap();
 
     harness
@@ -158,6 +160,7 @@ fn test_hook_intercepts_cargo_build() {
 
 #[test]
 fn test_hook_intercepts_cargo_test() {
+    let _guard = test_guard!();
     let harness = create_hook_harness("hook_intercepts_cargo_test").unwrap();
 
     harness
@@ -194,6 +197,7 @@ fn test_hook_intercepts_cargo_test() {
 
 #[test]
 fn test_hook_intercepts_cargo_check() {
+    let _guard = test_guard!();
     let harness = create_hook_harness("hook_intercepts_cargo_check").unwrap();
 
     harness
@@ -214,6 +218,7 @@ fn test_hook_intercepts_cargo_check() {
 
 #[test]
 fn test_hook_intercepts_rustc() {
+    let _guard = test_guard!();
     let harness = create_hook_harness("hook_intercepts_rustc").unwrap();
 
     harness
@@ -232,6 +237,7 @@ fn test_hook_intercepts_rustc() {
 
 #[test]
 fn test_hook_intercepts_bun_test() {
+    let _guard = test_guard!();
     let harness = create_hook_harness("hook_intercepts_bun_test").unwrap();
 
     harness
@@ -261,6 +267,7 @@ fn test_hook_intercepts_bun_test() {
 
 #[test]
 fn test_hook_intercepts_bun_typecheck() {
+    let _guard = test_guard!();
     let harness = create_hook_harness("hook_intercepts_bun_typecheck").unwrap();
 
     harness
@@ -281,6 +288,7 @@ fn test_hook_intercepts_bun_typecheck() {
 
 #[test]
 fn test_hook_intercepts_gcc() {
+    let _guard = test_guard!();
     let harness = create_hook_harness("hook_intercepts_gcc").unwrap();
 
     harness.logger.info("TEST START: test_hook_intercepts_gcc");
@@ -300,6 +308,7 @@ fn test_hook_intercepts_gcc() {
 
 #[test]
 fn test_hook_intercepts_make() {
+    let _guard = test_guard!();
     let harness = create_hook_harness("hook_intercepts_make").unwrap();
 
     harness.logger.info("TEST START: test_hook_intercepts_make");
@@ -316,6 +325,7 @@ fn test_hook_intercepts_make() {
 
 #[test]
 fn test_hook_intercepts_cmake_build() {
+    let _guard = test_guard!();
     let harness = create_hook_harness("hook_intercepts_cmake_build").unwrap();
 
     harness
@@ -340,6 +350,7 @@ fn test_hook_intercepts_cmake_build() {
 
 #[test]
 fn test_hook_ignores_non_compilation() {
+    let _guard = test_guard!();
     let harness = create_hook_harness("hook_ignores_non_compilation").unwrap();
 
     harness
@@ -384,6 +395,7 @@ fn test_hook_ignores_non_compilation() {
 
 #[test]
 fn test_hook_ignores_piped_commands() {
+    let _guard = test_guard!();
     let harness = create_hook_harness("hook_ignores_piped").unwrap();
 
     harness
@@ -429,6 +441,7 @@ fn test_hook_ignores_piped_commands() {
 
 #[test]
 fn test_hook_ignores_redirected_commands() {
+    let _guard = test_guard!();
     let harness = create_hook_harness("hook_ignores_redirected").unwrap();
 
     harness
@@ -474,6 +487,7 @@ fn test_hook_ignores_redirected_commands() {
 
 #[test]
 fn test_hook_ignores_background_commands() {
+    let _guard = test_guard!();
     let harness = create_hook_harness("hook_ignores_background").unwrap();
 
     harness
@@ -510,6 +524,7 @@ fn test_hook_ignores_background_commands() {
 
 #[test]
 fn test_hook_ignores_chained_commands() {
+    let _guard = test_guard!();
     let harness = create_hook_harness("hook_ignores_chained").unwrap();
 
     harness
@@ -555,6 +570,7 @@ fn test_hook_ignores_chained_commands() {
 
 #[test]
 fn test_hook_ignores_cargo_fmt() {
+    let _guard = test_guard!();
     let harness = create_hook_harness("hook_ignores_cargo_fmt").unwrap();
 
     harness
@@ -581,6 +597,7 @@ fn test_hook_ignores_cargo_fmt() {
 
 #[test]
 fn test_hook_ignores_bun_install() {
+    let _guard = test_guard!();
     let harness = create_hook_harness("hook_ignores_bun_install").unwrap();
 
     harness
@@ -613,6 +630,7 @@ fn test_hook_ignores_bun_install() {
 
 #[test]
 fn test_hook_ignores_bun_watch_mode() {
+    let _guard = test_guard!();
     let harness = create_hook_harness("hook_ignores_bun_watch").unwrap();
 
     harness
@@ -652,6 +670,7 @@ fn test_hook_ignores_bun_watch_mode() {
 
 #[test]
 fn test_hook_timing_budget() {
+    let _guard = test_guard!();
     let harness = create_hook_harness("hook_timing_budget").unwrap();
 
     harness.logger.info("TEST START: test_hook_timing_budget");
@@ -750,6 +769,7 @@ fn test_hook_timing_budget() {
 
 #[test]
 fn test_hook_classification_details() {
+    let _guard = test_guard!();
     let harness = create_hook_harness("hook_classification_details").unwrap();
 
     harness
@@ -790,6 +810,7 @@ fn test_hook_classification_details() {
 
 #[test]
 fn test_hook_classification_details_piped_rejection() {
+    let _guard = test_guard!();
     let harness = create_hook_harness("hook_classification_details_piped").unwrap();
 
     harness
@@ -821,6 +842,7 @@ fn test_hook_classification_details_piped_rejection() {
 
 #[test]
 fn test_hook_classification_details_never_intercept() {
+    let _guard = test_guard!();
     let harness = create_hook_harness("hook_classification_details_never_intercept").unwrap();
 
     harness
@@ -855,6 +877,7 @@ fn test_hook_classification_details_never_intercept() {
 
 #[test]
 fn test_hook_wrapped_commands() {
+    let _guard = test_guard!();
     let harness = create_hook_harness("hook_wrapped_commands").unwrap();
 
     harness
@@ -896,6 +919,7 @@ fn test_hook_wrapped_commands() {
 
 #[test]
 fn test_hook_input_fixture_format() {
+    let _guard = test_guard!();
     let harness = create_hook_harness("hook_input_fixture").unwrap();
 
     harness
@@ -926,6 +950,7 @@ fn test_hook_input_fixture_format() {
 
 #[test]
 fn test_hook_env_rch_disabled() {
+    let _guard = test_guard!();
     let harness = create_hook_harness("hook_env_disabled").unwrap();
 
     harness
@@ -952,6 +977,7 @@ fn test_hook_env_rch_disabled() {
 
 #[test]
 fn test_hook_empty_command() {
+    let _guard = test_guard!();
     let harness = create_hook_harness("hook_empty_command").unwrap();
 
     harness.logger.info("TEST START: test_hook_empty_command");
@@ -978,6 +1004,7 @@ fn test_hook_empty_command() {
 
 #[test]
 fn test_hook_subshell_capture() {
+    let _guard = test_guard!();
     let harness = create_hook_harness("hook_subshell_capture").unwrap();
 
     harness
@@ -1008,6 +1035,7 @@ fn test_hook_subshell_capture() {
 
 #[test]
 fn test_hook_version_checks_not_intercepted() {
+    let _guard = test_guard!();
     let harness = create_hook_harness("hook_version_checks").unwrap();
 
     harness

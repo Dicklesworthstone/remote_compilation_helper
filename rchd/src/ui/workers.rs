@@ -543,8 +543,8 @@ fn env_flag(key: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-        use rch_common::test_guard;
-    use rch_common::WorkerStatus;
+    use super::*;
+    use rch_common::test_guard;
 
     #[test]
     fn test_summary_format() {

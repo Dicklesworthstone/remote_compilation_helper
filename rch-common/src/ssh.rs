@@ -224,9 +224,11 @@ pub enum KnownHostsPolicy {
 #[cfg(test)]
 mod retry_tests {
     use super::*;
+    use crate::test_guard;
 
     #[test]
     fn test_retryable_transport_error_text() {
+        let _guard = test_guard!();
         assert!(is_retryable_transport_error_text(
             "ssh: connect to host 1.2.3.4 port 22: Connection timed out"
         ));
@@ -239,6 +241,7 @@ mod retry_tests {
 
     #[test]
     fn test_non_retryable_transport_error_text() {
+        let _guard = test_guard!();
         assert!(!is_retryable_transport_error_text(
             "Permission denied (publickey)."
         ));
@@ -696,10 +699,11 @@ impl Default for SshPool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use crate::test_guard;
 
     #[test]
     fn test_command_result_success() {
+        let _guard = test_guard!();
         let result = CommandResult {
             exit_code: 0,
             stdout: "output".to_string(),
@@ -719,6 +723,7 @@ mod tests {
 
     #[test]
     fn test_ssh_options_default() {
+        let _guard = test_guard!();
         let options = SshOptions::default();
         assert_eq!(options.connect_timeout, Duration::from_secs(10));
         assert_eq!(options.command_timeout, Duration::from_secs(300));
@@ -729,6 +734,7 @@ mod tests {
 
     #[test]
     fn test_ssh_client_creation() {
+        let _guard = test_guard!();
         let config = WorkerConfig {
             id: WorkerId::new("test-worker"),
             host: "192.168.1.100".to_string(),
@@ -746,6 +752,7 @@ mod tests {
 
     #[test]
     fn test_build_env_prefix_quotes_and_rejects() {
+        let _guard = test_guard!();
         let mut env = HashMap::new();
         env.insert("RUSTFLAGS".to_string(), "-C target-cpu=native".to_string());
         env.insert("QUOTED".to_string(), "a'b".to_string());
@@ -788,6 +795,7 @@ mod tests {
             // Test 1: is_valid_env_key never panics on arbitrary strings
             #[test]
             fn test_is_valid_env_key_no_panic(s in ".*") {
+        let _guard = test_guard!();
                 let _ = is_valid_env_key(&s);
             }
 
@@ -797,6 +805,7 @@ mod tests {
                 first in "[a-zA-Z_]",
                 rest in "[a-zA-Z0-9_]{0,50}"
             ) {
+        let _guard = test_guard!();
                 let key = format!("{}{}", first, rest);
                 prop_assert!(is_valid_env_key(&key), "Should accept valid key: {}", key);
             }
@@ -807,6 +816,7 @@ mod tests {
                 digit in "[0-9]",
                 rest in "[a-zA-Z0-9_]{0,20}"
             ) {
+        let _guard = test_guard!();
                 let key = format!("{}{}", digit, rest);
                 prop_assert!(!is_valid_env_key(&key), "Should reject digit-start key: {}", key);
             }
@@ -814,6 +824,7 @@ mod tests {
             // Test 4: shell_escape_value never panics on arbitrary strings
             #[test]
             fn test_shell_escape_value_no_panic(s in ".*") {
+        let _guard = test_guard!();
                 let _ = shell_escape_value(&s);
             }
 
@@ -824,6 +835,7 @@ mod tests {
                 bad_char in "[\n\r\0]",
                 suffix in "[a-zA-Z0-9 ]{0,10}"
             ) {
+        let _guard = test_guard!();
                 let value = format!("{}{}{}", prefix, bad_char, suffix);
                 prop_assert!(shell_escape_value(&value).is_none(),
                     "Should reject value with unsafe char: {:?}", value);
@@ -848,6 +860,7 @@ mod tests {
                 prefix in "[a-zA-Z0-9]{0,10}",
                 suffix in "[a-zA-Z0-9]{0,10}"
             ) {
+        let _guard = test_guard!();
                 let value = format!("{}'{}", prefix, suffix);
                 let result = shell_escape_value(&value);
                 prop_assert!(result.is_some());
@@ -881,6 +894,7 @@ mod tests {
                 // Generate keys that are invalid even after trimming
                 invalid_key in "[0-9][a-zA-Z0-9_]{0,10}"  // Starts with digit
             ) {
+        let _guard = test_guard!();
                 let mut env = HashMap::new();
                 env.insert(invalid_key.clone(), "value".to_string());
 
@@ -915,6 +929,7 @@ mod tests {
         // Targeted edge case tests
         #[test]
         fn test_shell_escape_edge_cases() {
+            let _guard = test_guard!();
             // Empty string
             let result = shell_escape_value("");
             assert_eq!(result, Some("''".to_string()));
@@ -944,6 +959,7 @@ mod tests {
 
         #[test]
         fn test_is_valid_env_key_edge_cases() {
+            let _guard = test_guard!();
             // Empty
             assert!(!is_valid_env_key(""));
 
@@ -978,6 +994,7 @@ mod tests {
 
         #[test]
         fn test_build_env_prefix_integration() {
+            let _guard = test_guard!();
             // Complex scenario with mixed valid/invalid
             let mut env = HashMap::new();
             env.insert("VALID".to_string(), "simple".to_string());
@@ -1025,6 +1042,7 @@ mod tests {
 
         #[test]
         fn test_shell_escape_roundtrip_safety() {
+            let _guard = test_guard!();
             // Values that when escaped and passed through shell should reconstruct original
             let test_values = [
                 "simple",

@@ -334,9 +334,11 @@ pub fn extract_json_body(response: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rch_common::test_guard;
 
     #[test]
     fn test_format_duration() {
+        let _guard = test_guard!();
         assert_eq!(format_duration(30), "30s");
         assert_eq!(format_duration(90), "1m 30s");
         assert_eq!(format_duration(3661), "1h 1m");
@@ -344,6 +346,7 @@ mod tests {
 
     #[test]
     fn test_format_bytes() {
+        let _guard = test_guard!();
         assert_eq!(format_bytes(500), "500 B");
         assert_eq!(format_bytes(1500), "1.5 KB");
         assert_eq!(format_bytes(1_500_000), "1.4 MB");
@@ -352,12 +355,14 @@ mod tests {
 
     #[test]
     fn test_extract_json_body() {
+        let _guard = test_guard!();
         let response = "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n{\"test\": 1}";
         assert_eq!(extract_json_body(response), Some("{\"test\": 1}"));
     }
 
     #[test]
     fn test_deserialize_daemon_status() {
+        let _guard = test_guard!();
         let socket_path = rch_common::default_socket_path();
         let json = serde_json::json!({
             "daemon": {

@@ -2565,7 +2565,6 @@ async fn handle_status(ctx: &DaemonContext) -> Result<DaemonFullStatus> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rch_common::test_guard;
     use crate::history::BuildHistory;
     use crate::selection::WorkerSelector;
     use crate::self_test::{SelfTestHistory, SelfTestService};
@@ -2574,6 +2573,7 @@ mod tests {
     use crate::{benchmark_queue::BenchmarkQueue, events::EventBus};
     use chrono::Duration as ChronoDuration;
     use rch_common::SelfTestConfig;
+    use rch_common::test_guard;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 

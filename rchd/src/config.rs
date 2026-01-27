@@ -447,7 +447,8 @@ log_level = "info"
 
 #[cfg(test)]
 mod tests {
-        use rch_common::test_guard;
+    use super::*;
+    use rch_common::test_guard;
     use tempfile::TempDir;
 
     fn init_test_logging() {

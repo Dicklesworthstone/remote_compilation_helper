@@ -134,6 +134,7 @@ fn extract_json_body(response: &str) -> Option<&str> {
 
 #[test]
 fn test_daemon_startup_and_socket_creation() {
+    let _guard = rch_common::test_guard!();
     let harness = create_daemon_harness("daemon_startup").unwrap();
     let socket_path = setup_daemon_configs(&harness).unwrap();
 
@@ -157,6 +158,7 @@ fn test_daemon_startup_and_socket_creation() {
 
 #[test]
 fn test_daemon_health_endpoint() {
+    let _guard = rch_common::test_guard!();
     let harness = create_daemon_harness("daemon_health").unwrap();
     let socket_path = setup_daemon_configs(&harness).unwrap();
 
@@ -183,6 +185,7 @@ fn test_daemon_health_endpoint() {
 
 #[test]
 fn test_daemon_ready_endpoint() {
+    let _guard = rch_common::test_guard!();
     let harness = create_daemon_harness("daemon_ready").unwrap();
     let socket_path = setup_daemon_configs(&harness).unwrap();
 
@@ -214,6 +217,7 @@ fn test_daemon_ready_endpoint() {
 
 #[test]
 fn test_daemon_status_endpoint() {
+    let _guard = rch_common::test_guard!();
     let harness = create_daemon_harness("daemon_status").unwrap();
     let socket_path = setup_daemon_configs(&harness).unwrap();
 
@@ -249,6 +253,7 @@ fn test_daemon_status_endpoint() {
 
 #[test]
 fn test_daemon_metrics_endpoint() {
+    let _guard = rch_common::test_guard!();
     let harness = create_daemon_harness("daemon_metrics").unwrap();
     let socket_path = setup_daemon_configs(&harness).unwrap();
 
@@ -278,6 +283,7 @@ fn test_daemon_metrics_endpoint() {
 
 #[test]
 fn test_daemon_budget_endpoint() {
+    let _guard = rch_common::test_guard!();
     let harness = create_daemon_harness("daemon_budget").unwrap();
     let socket_path = setup_daemon_configs(&harness).unwrap();
 
@@ -322,6 +328,7 @@ fn test_daemon_budget_endpoint() {
 
 #[test]
 fn test_daemon_shutdown() {
+    let _guard = rch_common::test_guard!();
     let harness = create_daemon_harness("daemon_shutdown").unwrap();
     let socket_path = setup_daemon_configs(&harness).unwrap();
 
@@ -370,6 +377,7 @@ fn test_daemon_shutdown() {
 
 #[test]
 fn test_select_worker_basic() {
+    let _guard = rch_common::test_guard!();
     let harness = create_daemon_harness("select_worker_basic").unwrap();
     let socket_path = setup_daemon_configs(&harness).unwrap();
 
@@ -402,6 +410,7 @@ fn test_select_worker_basic() {
 
 #[test]
 fn test_select_worker_with_runtime() {
+    let _guard = rch_common::test_guard!();
     let harness = create_daemon_harness("select_worker_runtime").unwrap();
     let socket_path = setup_daemon_configs(&harness).unwrap();
 
@@ -432,6 +441,7 @@ fn test_select_worker_with_runtime() {
 
 #[test]
 fn test_select_worker_missing_project() {
+    let _guard = rch_common::test_guard!();
     let harness = create_daemon_harness("select_worker_missing_project").unwrap();
     let socket_path = setup_daemon_configs(&harness).unwrap();
 
@@ -466,6 +476,7 @@ fn test_select_worker_missing_project() {
 
 #[test]
 fn test_release_worker() {
+    let _guard = rch_common::test_guard!();
     let harness = create_daemon_harness("release_worker").unwrap();
     let socket_path = setup_daemon_configs(&harness).unwrap();
 
@@ -498,6 +509,7 @@ fn test_release_worker() {
 
 #[test]
 fn test_unknown_endpoint() {
+    let _guard = rch_common::test_guard!();
     let harness = create_daemon_harness("unknown_endpoint").unwrap();
     let socket_path = setup_daemon_configs(&harness).unwrap();
 
@@ -528,6 +540,7 @@ fn test_unknown_endpoint() {
 
 #[test]
 fn test_invalid_method() {
+    let _guard = rch_common::test_guard!();
     let harness = create_daemon_harness("invalid_method").unwrap();
     let socket_path = setup_daemon_configs(&harness).unwrap();
 
@@ -562,6 +575,7 @@ fn test_invalid_method() {
 
 #[test]
 fn test_daemon_custom_socket_path() {
+    let _guard = rch_common::test_guard!();
     let harness = create_daemon_harness("daemon_custom_socket").unwrap();
 
     // Create custom socket path
@@ -599,6 +613,7 @@ fn test_daemon_custom_socket_path() {
 
 #[test]
 fn test_daemon_verbose_mode() {
+    let _guard = rch_common::test_guard!();
     let harness = create_daemon_harness("daemon_verbose").unwrap();
     let socket_path = setup_daemon_configs(&harness).unwrap();
 
@@ -621,6 +636,7 @@ fn test_daemon_verbose_mode() {
 
 #[test]
 fn test_concurrent_requests() {
+    let _guard = rch_common::test_guard!();
     let harness = create_daemon_harness("concurrent_requests").unwrap();
     let socket_path = setup_daemon_configs(&harness).unwrap();
 
@@ -672,6 +688,7 @@ fn test_concurrent_requests() {
 
 #[test]
 fn test_daemon_with_history_file() {
+    let _guard = rch_common::test_guard!();
     let harness = create_daemon_harness("daemon_history").unwrap();
     let socket_path = setup_daemon_configs(&harness).unwrap();
     let history_file = harness.test_dir().join("history.jsonl");
@@ -706,6 +723,7 @@ fn test_daemon_with_history_file() {
 /// when a test completes successfully.
 #[test]
 fn test_cleanup_verification() {
+    let _guard = rch_common::test_guard!();
     // Create a harness that WILL cleanup on success (create_daemon_harness sets this)
     let harness = create_daemon_harness("cleanup_test").unwrap();
 
@@ -771,6 +789,7 @@ fn test_cleanup_verification() {
 /// This test verifies that the wait_for_socket_with_backoff method works correctly.
 #[test]
 fn test_startup_synchronization_backoff() {
+    let _guard = rch_common::test_guard!();
     let harness = create_daemon_harness("startup_backoff").unwrap();
     let socket_path = setup_daemon_configs(&harness).unwrap();
 
@@ -822,6 +841,7 @@ fn test_startup_synchronization_backoff() {
 /// This simulates what happens when running `cargo test` repeatedly.
 #[test]
 fn test_isolation_between_runs() {
+    let _guard = rch_common::test_guard!();
     // Run a "test" that creates resources
     {
         let harness = create_daemon_harness("isolation_run1").unwrap();

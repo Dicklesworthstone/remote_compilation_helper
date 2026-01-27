@@ -8719,6 +8719,7 @@ mod tests {
     use super::*;
     use crate::status_types::format_bytes;
     use rch_common::CompilationKind;
+    use rch_common::test_guard;
 
     // -------------------------------------------------------------------------
     // ApiResponse Tests
@@ -8726,6 +8727,7 @@ mod tests {
 
     #[test]
     fn api_response_ok_creates_success_response() {
+        let _guard = test_guard!();
         let response = ApiResponse::ok("test cmd", "test data".to_string());
         assert!(response.success);
         assert_eq!(response.command, Some("test cmd".to_string()));
@@ -8737,6 +8739,7 @@ mod tests {
 
     #[test]
     fn api_response_err_creates_error_response() {
+        let _guard = test_guard!();
         let response: ApiResponse<()> =
             ApiResponse::err("failed cmd", ApiError::internal("error message"));
         assert!(!response.success);
@@ -8749,6 +8752,7 @@ mod tests {
 
     #[test]
     fn api_response_err_with_specific_error_code() {
+        let _guard = test_guard!();
         let response: ApiResponse<()> = ApiResponse::err(
             "cmd",
             ApiError::new(ErrorCode::SshConnectionFailed, "Worker not available"),
@@ -8761,6 +8765,7 @@ mod tests {
 
     #[test]
     fn api_response_ok_serializes_without_error_field() {
+        let _guard = test_guard!();
         let response = ApiResponse::ok("test", "data".to_string());
         let json = serde_json::to_value(&response).unwrap();
         assert!(json.get("error").is_none());
@@ -8770,6 +8775,7 @@ mod tests {
 
     #[test]
     fn api_response_err_serializes_without_data_field() {
+        let _guard = test_guard!();
         let response: ApiResponse<String> =
             ApiResponse::err("test", ApiError::internal("error msg"));
         let json = serde_json::to_value(&response).unwrap();
@@ -8780,6 +8786,7 @@ mod tests {
 
     #[test]
     fn api_response_with_complex_data_serializes() {
+        let _guard = test_guard!();
         #[derive(Serialize)]
         struct ComplexData {
             name: String,
@@ -8804,6 +8811,7 @@ mod tests {
 
     #[test]
     fn worker_info_from_worker_config_converts_all_fields() {
+        let _guard = test_guard!();
         let config = WorkerConfig {
             id: WorkerId::new("test-worker"),
             host: "192.168.1.100".to_string(),
@@ -8824,6 +8832,7 @@ mod tests {
 
     #[test]
     fn worker_info_from_worker_config_with_empty_tags() {
+        let _guard = test_guard!();
         let config = WorkerConfig {
             id: WorkerId::new("minimal"),
             host: "host.example.com".to_string(),
@@ -8839,6 +8848,7 @@ mod tests {
 
     #[test]
     fn worker_info_serializes_correctly() {
+        let _guard = test_guard!();
         let config = WorkerConfig {
             id: WorkerId::new("w1"),
             host: "host".to_string(),
@@ -8862,6 +8872,7 @@ mod tests {
 
     #[test]
     fn workers_list_response_serializes() {
+        let _guard = test_guard!();
         let response = WorkersListResponse {
             workers: vec![],
             count: 0,
@@ -8873,6 +8884,7 @@ mod tests {
 
     #[test]
     fn workers_list_response_with_workers_serializes() {
+        let _guard = test_guard!();
         let workers = vec![
             WorkerInfo {
                 id: "w1".to_string(),
@@ -8904,6 +8916,7 @@ mod tests {
 
     #[test]
     fn worker_probe_result_success_serializes() {
+        let _guard = test_guard!();
         let result = WorkerProbeResult {
             id: "worker1".to_string(),
             host: "192.168.1.1".to_string(),
@@ -8920,6 +8933,7 @@ mod tests {
 
     #[test]
     fn worker_probe_result_failure_serializes() {
+        let _guard = test_guard!();
         let result = WorkerProbeResult {
             id: "worker2".to_string(),
             host: "192.168.1.2".to_string(),
@@ -8935,6 +8949,7 @@ mod tests {
 
     #[test]
     fn daemon_status_response_running_serializes() {
+        let _guard = test_guard!();
         let response = DaemonStatusResponse {
             running: true,
             socket_path: "/tmp/rch.sock".to_string(),
@@ -8948,6 +8963,7 @@ mod tests {
 
     #[test]
     fn daemon_status_response_not_running_serializes() {
+        let _guard = test_guard!();
         let response = DaemonStatusResponse {
             running: false,
             socket_path: "/tmp/rch.sock".to_string(),
@@ -8960,6 +8976,7 @@ mod tests {
 
     #[test]
     fn system_overview_serializes() {
+        let _guard = test_guard!();
         let response = SystemOverview {
             daemon_running: true,
             hook_installed: true,
@@ -8975,6 +8992,7 @@ mod tests {
 
     #[test]
     fn config_show_response_serializes() {
+        let _guard = test_guard!();
         let response = ConfigShowResponse {
             general: ConfigGeneralSection {
                 enabled: true,
@@ -9034,6 +9052,7 @@ mod tests {
 
     #[test]
     fn config_init_response_serializes() {
+        let _guard = test_guard!();
         let response = ConfigInitResponse {
             created: vec!["config.toml".to_string()],
             already_existed: vec!["workers.toml".to_string()],
@@ -9045,6 +9064,7 @@ mod tests {
 
     #[test]
     fn config_validation_response_valid_serializes() {
+        let _guard = test_guard!();
         let response = ConfigValidationResponse {
             errors: vec![],
             warnings: vec![],
@@ -9057,6 +9077,7 @@ mod tests {
 
     #[test]
     fn config_validation_response_with_issues_serializes() {
+        let _guard = test_guard!();
         let response = ConfigValidationResponse {
             errors: vec![ConfigValidationIssue {
                 file: "config.toml".to_string(),
@@ -9076,6 +9097,7 @@ mod tests {
 
     #[test]
     fn config_set_response_serializes() {
+        let _guard = test_guard!();
         let response = ConfigSetResponse {
             key: "general.log_level".to_string(),
             value: "debug".to_string(),
@@ -9088,6 +9110,7 @@ mod tests {
 
     #[test]
     fn config_export_response_serializes() {
+        let _guard = test_guard!();
         let response = ConfigExportResponse {
             format: "toml".to_string(),
             content: "[general]\nenabled = true".to_string(),
@@ -9099,6 +9122,7 @@ mod tests {
 
     #[test]
     fn diagnose_decision_intercepts_when_confident() {
+        let _guard = test_guard!();
         let classification =
             Classification::compilation(CompilationKind::CargoBuild, 0.95, "cargo build");
         let decision = build_diagnose_decision(&classification, 0.85);
@@ -9108,6 +9132,7 @@ mod tests {
 
     #[test]
     fn diagnose_decision_rejects_when_below_threshold() {
+        let _guard = test_guard!();
         let classification =
             Classification::compilation(CompilationKind::CargoCheck, 0.80, "cargo check");
         let decision = build_diagnose_decision(&classification, 0.85);
@@ -9117,6 +9142,7 @@ mod tests {
 
     #[test]
     fn diagnose_response_serializes() {
+        let _guard = test_guard!();
         let classification =
             Classification::compilation(CompilationKind::CargoBuild, 0.95, "cargo build");
         let response = DiagnoseResponse {
@@ -9156,6 +9182,7 @@ mod tests {
 
     #[test]
     fn workers_capabilities_report_serializes_with_local() {
+        let _guard = test_guard!();
         let report = WorkersCapabilitiesReport {
             workers: vec![],
             local: Some(WorkerCapabilities {
@@ -9176,6 +9203,7 @@ mod tests {
 
     #[test]
     fn local_capability_warnings_include_missing_and_mismatch() {
+        let _guard = test_guard!();
         let local = WorkerCapabilities {
             rustc_version: Some("rustc 1.87.0-nightly".to_string()),
             bun_version: None,
@@ -9210,6 +9238,7 @@ mod tests {
 
     #[test]
     fn hook_action_response_success_serializes() {
+        let _guard = test_guard!();
         let response = HookActionResponse {
             action: "install".to_string(),
             success: true,
@@ -9224,6 +9253,7 @@ mod tests {
 
     #[test]
     fn hook_action_response_without_message_serializes() {
+        let _guard = test_guard!();
         let response = HookActionResponse {
             action: "uninstall".to_string(),
             success: true,
@@ -9236,6 +9266,7 @@ mod tests {
 
     #[test]
     fn hook_test_response_serializes() {
+        let _guard = test_guard!();
         let response = HookTestResponse {
             classification_tests: vec![ClassificationTestResult {
                 command: "cargo build".to_string(),
@@ -9259,6 +9290,7 @@ mod tests {
 
     #[test]
     fn classification_test_result_serializes() {
+        let _guard = test_guard!();
         let result = ClassificationTestResult {
             command: "bun test".to_string(),
             is_compilation: true,
@@ -9278,6 +9310,7 @@ mod tests {
 
     #[test]
     fn error_code_codes_have_rch_prefix() {
+        let _guard = test_guard!();
         // Verify error codes follow RCH-Exxx format
         assert_eq!(ErrorCode::ConfigNotFound.code_string(), "RCH-E001");
         assert_eq!(ErrorCode::ConfigValidationError.code_string(), "RCH-E004");
@@ -9296,6 +9329,7 @@ mod tests {
 
     #[test]
     fn config_dir_returns_some() {
+        let _guard = test_guard!();
         // config_dir should return a path on most systems
         let dir = config_dir();
         // We can't guarantee it returns Some on all systems, but if it does,
@@ -9311,6 +9345,7 @@ mod tests {
 
     #[test]
     fn api_version_is_expected_value() {
+        let _guard = test_guard!();
         assert_eq!(rch_common::API_VERSION, "1.0");
     }
 
@@ -9320,6 +9355,7 @@ mod tests {
 
     #[test]
     fn default_socket_path_is_expected() {
+        let _guard = test_guard!();
         assert_eq!(DEFAULT_SOCKET_PATH, "/tmp/rch.sock");
     }
 
@@ -9329,6 +9365,7 @@ mod tests {
 
     #[test]
     fn dry_run_summary_not_intercepted() {
+        let _guard = test_guard!();
         let summary = build_dry_run_summary(false, "not a compilation command", &None, false);
         assert!(!summary.would_offload);
         assert_eq!(summary.reason, "not a compilation command");
@@ -9343,6 +9380,7 @@ mod tests {
 
     #[test]
     fn dry_run_summary_intercepted_no_daemon() {
+        let _guard = test_guard!();
         let summary = build_dry_run_summary(
             true,
             "meets confidence threshold",
@@ -9361,6 +9399,7 @@ mod tests {
 
     #[test]
     fn dry_run_summary_intercepted_with_worker() {
+        let _guard = test_guard!();
         let worker = SelectedWorker {
             id: WorkerId::new("test-worker"),
             host: "worker.example.com".to_string(),
@@ -9391,6 +9430,7 @@ mod tests {
 
     #[test]
     fn dry_run_pipeline_step_serializes() {
+        let _guard = test_guard!();
         let step = DryRunPipelineStep {
             step: 1,
             name: "classify".to_string(),
@@ -9409,6 +9449,7 @@ mod tests {
 
     #[test]
     fn dry_run_pipeline_step_skipped_serializes() {
+        let _guard = test_guard!();
         let step = DryRunPipelineStep {
             step: 2,
             name: "select".to_string(),
@@ -9425,6 +9466,7 @@ mod tests {
 
     #[test]
     fn dry_run_transfer_estimate_serializes() {
+        let _guard = test_guard!();
         let estimate = DryRunTransferEstimate {
             bytes: 1024 * 1024 * 10, // 10 MB
             human_size: "10.00 MB".to_string(),
@@ -9443,6 +9485,7 @@ mod tests {
 
     #[test]
     fn dry_run_transfer_estimate_would_skip_serializes() {
+        let _guard = test_guard!();
         let estimate = DryRunTransferEstimate {
             bytes: 1024 * 1024 * 500, // 500 MB
             human_size: "500.00 MB".to_string(),
@@ -9458,6 +9501,7 @@ mod tests {
 
     #[test]
     fn dry_run_summary_serializes() {
+        let _guard = test_guard!();
         let summary = DryRunSummary {
             would_offload: true,
             reason: "compilation command meets threshold".to_string(),
@@ -9481,6 +9525,7 @@ mod tests {
 
     #[test]
     fn format_bytes_basic() {
+        let _guard = test_guard!();
         assert_eq!(format_bytes(500), "500 B");
         assert_eq!(format_bytes(1024), "1.0 KB");
         assert_eq!(format_bytes(1024 * 1024), "1.0 MB");
@@ -9489,6 +9534,7 @@ mod tests {
 
     #[test]
     fn format_bytes_fractional() {
+        let _guard = test_guard!();
         assert_eq!(format_bytes(1536), "1.5 KB");
         assert_eq!(format_bytes(1024 * 1024 + 512 * 1024), "1.5 MB");
     }
@@ -9499,21 +9545,25 @@ mod tests {
 
     #[test]
     fn runtime_label_rust() {
+        let _guard = test_guard!();
         assert_eq!(runtime_label(&RequiredRuntime::Rust), "rust");
     }
 
     #[test]
     fn runtime_label_bun() {
+        let _guard = test_guard!();
         assert_eq!(runtime_label(&RequiredRuntime::Bun), "bun");
     }
 
     #[test]
     fn runtime_label_node() {
+        let _guard = test_guard!();
         assert_eq!(runtime_label(&RequiredRuntime::Node), "node");
     }
 
     #[test]
     fn runtime_label_none() {
+        let _guard = test_guard!();
         assert_eq!(runtime_label(&RequiredRuntime::None), "none");
     }
 
@@ -9523,12 +9573,14 @@ mod tests {
 
     #[test]
     fn has_any_capabilities_empty() {
+        let _guard = test_guard!();
         let caps = WorkerCapabilities::new();
         assert!(!has_any_capabilities(&caps));
     }
 
     #[test]
     fn has_any_capabilities_with_rust() {
+        let _guard = test_guard!();
         let caps = WorkerCapabilities {
             rustc_version: Some("rustc 1.87.0".to_string()),
             ..Default::default()
@@ -9538,6 +9590,7 @@ mod tests {
 
     #[test]
     fn has_any_capabilities_with_bun() {
+        let _guard = test_guard!();
         let caps = WorkerCapabilities {
             bun_version: Some("1.2.3".to_string()),
             ..Default::default()
@@ -9547,6 +9600,7 @@ mod tests {
 
     #[test]
     fn has_any_capabilities_with_node() {
+        let _guard = test_guard!();
         let caps = WorkerCapabilities {
             node_version: Some("v20.0.0".to_string()),
             ..Default::default()
@@ -9556,6 +9610,7 @@ mod tests {
 
     #[test]
     fn has_any_capabilities_with_npm() {
+        let _guard = test_guard!();
         let caps = WorkerCapabilities {
             npm_version: Some("10.0.0".to_string()),
             ..Default::default()
@@ -9565,6 +9620,7 @@ mod tests {
 
     #[test]
     fn has_any_capabilities_with_all() {
+        let _guard = test_guard!();
         let caps = WorkerCapabilities {
             rustc_version: Some("rustc 1.87.0".to_string()),
             bun_version: Some("1.2.3".to_string()),
@@ -9581,11 +9637,13 @@ mod tests {
 
     #[test]
     fn extract_version_numbers_simple() {
+        let _guard = test_guard!();
         assert_eq!(extract_version_numbers("1.2.3"), vec![1, 2, 3]);
     }
 
     #[test]
     fn extract_version_numbers_with_prefix() {
+        let _guard = test_guard!();
         assert_eq!(
             extract_version_numbers("rustc 1.87.0-nightly"),
             vec![1, 87, 0]
@@ -9594,16 +9652,19 @@ mod tests {
 
     #[test]
     fn extract_version_numbers_node_format() {
+        let _guard = test_guard!();
         assert_eq!(extract_version_numbers("v20.11.1"), vec![20, 11, 1]);
     }
 
     #[test]
     fn extract_version_numbers_empty() {
+        let _guard = test_guard!();
         assert_eq!(extract_version_numbers(""), Vec::<u64>::new());
     }
 
     #[test]
     fn extract_version_numbers_no_numbers() {
+        let _guard = test_guard!();
         assert_eq!(
             extract_version_numbers("no numbers here"),
             Vec::<u64>::new()
@@ -9612,11 +9673,13 @@ mod tests {
 
     #[test]
     fn extract_version_numbers_single() {
+        let _guard = test_guard!();
         assert_eq!(extract_version_numbers("version 42"), vec![42]);
     }
 
     #[test]
     fn extract_version_numbers_large() {
+        let _guard = test_guard!();
         assert_eq!(extract_version_numbers("2024.01.15"), vec![2024, 1, 15]);
     }
 
@@ -9626,21 +9689,25 @@ mod tests {
 
     #[test]
     fn major_version_extracts_first() {
+        let _guard = test_guard!();
         assert_eq!(major_version("rustc 1.87.0-nightly"), Some(1));
     }
 
     #[test]
     fn major_version_node() {
+        let _guard = test_guard!();
         assert_eq!(major_version("v20.11.1"), Some(20));
     }
 
     #[test]
     fn major_version_empty() {
+        let _guard = test_guard!();
         assert_eq!(major_version(""), None);
     }
 
     #[test]
     fn major_version_no_numbers() {
+        let _guard = test_guard!();
         assert_eq!(major_version("no version"), None);
     }
 
@@ -9650,21 +9717,25 @@ mod tests {
 
     #[test]
     fn major_minor_version_extracts_both() {
+        let _guard = test_guard!();
         assert_eq!(major_minor_version("rustc 1.87.0-nightly"), Some((1, 87)));
     }
 
     #[test]
     fn major_minor_version_node() {
+        let _guard = test_guard!();
         assert_eq!(major_minor_version("v20.11.1"), Some((20, 11)));
     }
 
     #[test]
     fn major_minor_version_single_number() {
+        let _guard = test_guard!();
         assert_eq!(major_minor_version("version 42"), None);
     }
 
     #[test]
     fn major_minor_version_empty() {
+        let _guard = test_guard!();
         assert_eq!(major_minor_version(""), None);
     }
 
@@ -9674,6 +9745,7 @@ mod tests {
 
     #[test]
     fn rust_version_mismatch_same_version() {
+        let _guard = test_guard!();
         assert!(!rust_version_mismatch(
             "rustc 1.87.0-nightly",
             "rustc 1.87.0-nightly"
@@ -9682,28 +9754,33 @@ mod tests {
 
     #[test]
     fn rust_version_mismatch_different_patch() {
+        let _guard = test_guard!();
         // Same major.minor, different patch - should NOT be a mismatch
         assert!(!rust_version_mismatch("rustc 1.87.0", "rustc 1.87.1"));
     }
 
     #[test]
     fn rust_version_mismatch_different_minor() {
+        let _guard = test_guard!();
         assert!(rust_version_mismatch("rustc 1.87.0", "rustc 1.86.0"));
     }
 
     #[test]
     fn rust_version_mismatch_different_major() {
+        let _guard = test_guard!();
         assert!(rust_version_mismatch("rustc 1.87.0", "rustc 2.0.0"));
     }
 
     #[test]
     fn rust_version_mismatch_invalid_local() {
+        let _guard = test_guard!();
         // If local can't be parsed, returns false (no mismatch detectable)
         assert!(!rust_version_mismatch("invalid", "rustc 1.87.0"));
     }
 
     #[test]
     fn rust_version_mismatch_invalid_remote() {
+        let _guard = test_guard!();
         assert!(!rust_version_mismatch("rustc 1.87.0", "invalid"));
     }
 
@@ -9713,21 +9790,25 @@ mod tests {
 
     #[test]
     fn major_version_mismatch_same() {
+        let _guard = test_guard!();
         assert!(!major_version_mismatch("bun 1.2.3", "bun 1.5.0"));
     }
 
     #[test]
     fn major_version_mismatch_different() {
+        let _guard = test_guard!();
         assert!(major_version_mismatch("bun 1.2.3", "bun 2.0.0"));
     }
 
     #[test]
     fn major_version_mismatch_invalid_local() {
+        let _guard = test_guard!();
         assert!(!major_version_mismatch("no version", "bun 1.2.3"));
     }
 
     #[test]
     fn major_version_mismatch_invalid_remote() {
+        let _guard = test_guard!();
         assert!(!major_version_mismatch("bun 1.2.3", "no version"));
     }
 
@@ -9737,12 +9818,14 @@ mod tests {
 
     #[test]
     fn summarize_capabilities_empty() {
+        let _guard = test_guard!();
         let caps = WorkerCapabilities::new();
         assert_eq!(summarize_capabilities(&caps), "unknown");
     }
 
     #[test]
     fn summarize_capabilities_rust_only() {
+        let _guard = test_guard!();
         let caps = WorkerCapabilities {
             rustc_version: Some("rustc 1.87.0".to_string()),
             ..Default::default()
@@ -9752,6 +9835,7 @@ mod tests {
 
     #[test]
     fn summarize_capabilities_all() {
+        let _guard = test_guard!();
         let caps = WorkerCapabilities {
             rustc_version: Some("1.87".to_string()),
             bun_version: Some("1.2".to_string()),
@@ -9772,21 +9856,25 @@ mod tests {
 
     #[test]
     fn parse_bool_true() {
+        let _guard = test_guard!();
         assert!(parse_bool("true", "test_key").unwrap());
     }
 
     #[test]
     fn parse_bool_false() {
+        let _guard = test_guard!();
         assert!(!parse_bool("false", "test_key").unwrap());
     }
 
     #[test]
     fn parse_bool_with_whitespace() {
+        let _guard = test_guard!();
         assert!(parse_bool("  true  ", "test_key").unwrap());
     }
 
     #[test]
     fn parse_bool_invalid() {
+        let _guard = test_guard!();
         let result = parse_bool("yes", "test_key");
         assert!(result.is_err());
     }
@@ -9797,33 +9885,39 @@ mod tests {
 
     #[test]
     fn parse_u32_valid() {
+        let _guard = test_guard!();
         assert_eq!(parse_u32("42", "test_key").unwrap(), 42);
     }
 
     #[test]
     fn parse_u32_zero() {
+        let _guard = test_guard!();
         assert_eq!(parse_u32("0", "test_key").unwrap(), 0);
     }
 
     #[test]
     fn parse_u32_with_whitespace() {
+        let _guard = test_guard!();
         assert_eq!(parse_u32("  123  ", "test_key").unwrap(), 123);
     }
 
     #[test]
     fn parse_u32_negative() {
+        let _guard = test_guard!();
         let result = parse_u32("-1", "test_key");
         assert!(result.is_err());
     }
 
     #[test]
     fn parse_u32_non_numeric() {
+        let _guard = test_guard!();
         let result = parse_u32("abc", "test_key");
         assert!(result.is_err());
     }
 
     #[test]
     fn parse_u32_overflow() {
+        let _guard = test_guard!();
         let result = parse_u32("4294967296", "test_key"); // u32::MAX + 1
         assert!(result.is_err());
     }
@@ -9834,21 +9928,25 @@ mod tests {
 
     #[test]
     fn parse_u64_valid() {
+        let _guard = test_guard!();
         assert_eq!(parse_u64("9999999999", "test_key").unwrap(), 9999999999);
     }
 
     #[test]
     fn parse_u64_zero() {
+        let _guard = test_guard!();
         assert_eq!(parse_u64("0", "test_key").unwrap(), 0);
     }
 
     #[test]
     fn parse_u64_with_whitespace() {
+        let _guard = test_guard!();
         assert_eq!(parse_u64("  456  ", "test_key").unwrap(), 456);
     }
 
     #[test]
     fn parse_u64_negative() {
+        let _guard = test_guard!();
         let result = parse_u64("-1", "test_key");
         assert!(result.is_err());
     }
@@ -9859,30 +9957,35 @@ mod tests {
 
     #[test]
     fn parse_f64_integer() {
+        let _guard = test_guard!();
         let result = parse_f64("42", "test_key").unwrap();
         assert!((result - 42.0).abs() < f64::EPSILON);
     }
 
     #[test]
     fn parse_f64_decimal() {
+        let _guard = test_guard!();
         let result = parse_f64("2.71", "test_key").unwrap();
         assert!((result - 2.71).abs() < 0.001);
     }
 
     #[test]
     fn parse_f64_with_whitespace() {
+        let _guard = test_guard!();
         let result = parse_f64("  0.5  ", "test_key").unwrap();
         assert!((result - 0.5).abs() < f64::EPSILON);
     }
 
     #[test]
     fn parse_f64_negative() {
+        let _guard = test_guard!();
         let result = parse_f64("-1.5", "test_key").unwrap();
         assert!((result - (-1.5)).abs() < f64::EPSILON);
     }
 
     #[test]
     fn parse_f64_invalid() {
+        let _guard = test_guard!();
         let result = parse_f64("not a number", "test_key");
         assert!(result.is_err());
     }
@@ -9893,36 +9996,42 @@ mod tests {
 
     #[test]
     fn parse_string_list_empty() {
+        let _guard = test_guard!();
         let result = parse_string_list("", "test_key").unwrap();
         assert!(result.is_empty());
     }
 
     #[test]
     fn parse_string_list_single() {
+        let _guard = test_guard!();
         let result = parse_string_list("item", "test_key").unwrap();
         assert_eq!(result, vec!["item"]);
     }
 
     #[test]
     fn parse_string_list_comma_separated() {
+        let _guard = test_guard!();
         let result = parse_string_list("a, b, c", "test_key").unwrap();
         assert_eq!(result, vec!["a", "b", "c"]);
     }
 
     #[test]
     fn parse_string_list_toml_array() {
+        let _guard = test_guard!();
         let result = parse_string_list(r#"["foo", "bar"]"#, "test_key").unwrap();
         assert_eq!(result, vec!["foo", "bar"]);
     }
 
     #[test]
     fn parse_string_list_toml_array_empty() {
+        let _guard = test_guard!();
         let result = parse_string_list("[]", "test_key").unwrap();
         assert!(result.is_empty());
     }
 
     #[test]
     fn parse_string_list_with_whitespace() {
+        let _guard = test_guard!();
         let result = parse_string_list("  a  ,  b  ", "test_key").unwrap();
         assert_eq!(result, vec!["a", "b"]);
     }
@@ -9933,22 +10042,26 @@ mod tests {
 
     #[test]
     fn indent_lines_single() {
+        let _guard = test_guard!();
         assert_eq!(indent_lines("hello", "  "), "  hello");
     }
 
     #[test]
     fn indent_lines_multiple() {
+        let _guard = test_guard!();
         assert_eq!(indent_lines("a\nb\nc", ">> "), ">> a\n>> b\n>> c");
     }
 
     #[test]
     fn indent_lines_empty() {
+        let _guard = test_guard!();
         // Empty string has no lines, so output is also empty
         assert_eq!(indent_lines("", "  "), "");
     }
 
     #[test]
     fn indent_lines_empty_prefix() {
+        let _guard = test_guard!();
         assert_eq!(indent_lines("a\nb", ""), "a\nb");
     }
 
@@ -9958,36 +10071,43 @@ mod tests {
 
     #[test]
     fn format_build_duration_seconds() {
+        let _guard = test_guard!();
         assert_eq!(format_build_duration(45), "45s");
     }
 
     #[test]
     fn format_build_duration_zero() {
+        let _guard = test_guard!();
         assert_eq!(format_build_duration(0), "0s");
     }
 
     #[test]
     fn format_build_duration_minutes() {
+        let _guard = test_guard!();
         assert_eq!(format_build_duration(90), "1m 30s");
     }
 
     #[test]
     fn format_build_duration_exact_minute() {
+        let _guard = test_guard!();
         assert_eq!(format_build_duration(60), "1m 0s");
     }
 
     #[test]
     fn format_build_duration_hours() {
+        let _guard = test_guard!();
         assert_eq!(format_build_duration(3661), "1h 1m");
     }
 
     #[test]
     fn format_build_duration_exact_hour() {
+        let _guard = test_guard!();
         assert_eq!(format_build_duration(3600), "1h 0m");
     }
 
     #[test]
     fn format_build_duration_multiple_hours() {
+        let _guard = test_guard!();
         assert_eq!(format_build_duration(7380), "2h 3m"); // 2h 3m
     }
 
@@ -9997,26 +10117,31 @@ mod tests {
 
     #[test]
     fn urlencoding_encode_alphanumeric() {
+        let _guard = test_guard!();
         assert_eq!(urlencoding_encode("abc123"), "abc123");
     }
 
     #[test]
     fn urlencoding_encode_safe_chars() {
+        let _guard = test_guard!();
         assert_eq!(urlencoding_encode("a-b_c.d~e"), "a-b_c.d~e");
     }
 
     #[test]
     fn urlencoding_encode_spaces() {
+        let _guard = test_guard!();
         assert_eq!(urlencoding_encode("hello world"), "hello%20world");
     }
 
     #[test]
     fn urlencoding_encode_special() {
+        let _guard = test_guard!();
         assert_eq!(urlencoding_encode("a=b&c"), "a%3Db%26c");
     }
 
     #[test]
     fn urlencoding_encode_unicode() {
+        let _guard = test_guard!();
         // Multi-byte UTF-8 characters should be percent-encoded
         let result = urlencoding_encode("hello\u{00E9}"); // é
         assert!(result.starts_with("hello%"));
@@ -10025,6 +10150,7 @@ mod tests {
 
     #[test]
     fn urlencoding_encode_empty() {
+        let _guard = test_guard!();
         assert_eq!(urlencoding_encode(""), "");
     }
 
@@ -10034,6 +10160,7 @@ mod tests {
 
     #[test]
     fn generate_config_toml_contains_all_sections() {
+        let _guard = test_guard!();
         let values = ConfigValues {
             log_level: "info".to_string(),
             socket_path: "/tmp/rch.sock".to_string(),
@@ -10058,6 +10185,7 @@ mod tests {
 
     #[test]
     fn generate_workers_toml_single_worker() {
+        let _guard = test_guard!();
         let workers = vec![WizardWorker {
             id: "worker-1".to_string(),
             host: "192.168.1.100".to_string(),
@@ -10077,6 +10205,7 @@ mod tests {
 
     #[test]
     fn generate_workers_toml_multiple_workers() {
+        let _guard = test_guard!();
         let workers = vec![
             WizardWorker {
                 id: "w1".to_string(),
@@ -10105,6 +10234,7 @@ mod tests {
 
     #[test]
     fn generate_workers_toml_empty() {
+        let _guard = test_guard!();
         let workers: Vec<WizardWorker> = vec![];
         let toml = generate_workers_toml(&workers);
         // Should have header but no [[workers]] blocks
@@ -10118,11 +10248,13 @@ mod tests {
 
     #[test]
     fn is_default_verify_size_true() {
+        let _guard = test_guard!();
         assert!(is_default_verify_size(&(100 * 1024 * 1024)));
     }
 
     #[test]
     fn is_default_verify_size_false() {
+        let _guard = test_guard!();
         assert!(!is_default_verify_size(&0));
         assert!(!is_default_verify_size(&(50 * 1024 * 1024)));
     }
