@@ -5,11 +5,29 @@
 //!
 //! # Features
 //!
-//! This module is gated behind the `true-e2e` feature flag:
+//! This module is gated behind the `true-e2e` feature flag.
+//!
+//! ## Running All E2E Tests
 //!
 //! ```bash
-//! cargo test --features true-e2e
+//! # Full command with feature flag
+//! cargo test --features true-e2e -p rch --test true_e2e
 //! ```
+//!
+//! ## Filtering Tests
+//!
+//! ```bash
+//! # Run only cargo_build tests
+//! cargo test --features true-e2e -p rch --test true_e2e cargo_build
+//!
+//! # Run SSH tests
+//! cargo test --features true-e2e -p rch --test true_e2e ssh_tests
+//! ```
+//!
+//! ## CI Integration
+//!
+//! E2E tests run in a dedicated CI job (`e2e`) separate from regular unit tests.
+//! Regular `cargo test --workspace` does NOT run E2E tests.
 //!
 //! # Configuration
 //!

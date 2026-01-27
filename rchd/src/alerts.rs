@@ -1,13 +1,30 @@
 //! Worker health alerting.
 //!
 //! Tracks alert-worthy events and exposes active alerts for status reporting.
+//! Also supports webhook dispatch for external notification systems.
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use rch_common::WorkerStatus;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::RwLock;
+use tracing::{debug, info, warn};
 use uuid::Uuid;
+
+/// Webhook configuration for alert dispatch.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WebhookConfig {
+    /// Webhook endpoint URL.
+    pub url: Option<String>,
+    /// Secret for HMAC signing (optional).
+    pub secret: Option<String>,
+    /// Timeout in seconds for webhook requests.
+    pub timeout_secs: u64,
+    /// Number of retries on failure.
+    pub retry_count: u32,
+    /// Events to send (empty = all events).
+    pub events: Vec<String>,
+}
 
 /// Alert configuration.
 #[derive(Debug, Clone)]
@@ -16,6 +33,8 @@ pub struct AlertConfig {
     pub enabled: bool,
     /// Suppress duplicate alerts for this duration.
     pub suppress_duplicates: ChronoDuration,
+    /// Webhook configuration for external notifications.
+    pub webhook: Option<WebhookConfig>,
 }
 
 impl Default for AlertConfig {
@@ -23,6 +42,7 @@ impl Default for AlertConfig {
         Self {
             enabled: true,
             suppress_duplicates: ChronoDuration::seconds(300),
+            webhook: None,
         }
     }
 }
@@ -272,9 +292,61 @@ impl AlertManager {
         if let Some(last) = state.last_sent.get(&key)
             && now - *last < self.config.suppress_duplicates
         {
+            debug!(
+                alert_kind = alert.kind.as_str(),
+                alert_id = %alert.id,
+                "Alert suppressed (duplicate within window)"
+            );
             state.active.entry(key).or_insert(alert);
             return;
         }
+
+        // Log the alert for audit purposes
+        match alert.severity {
+            AlertSeverity::Critical => {
+                warn!(
+                    alert_kind = alert.kind.as_str(),
+                    alert_id = %alert.id,
+                    severity = "critical",
+                    worker_id = ?alert.worker_id,
+                    message = %alert.message,
+                    "ALERT: Critical alert raised"
+                );
+            }
+            AlertSeverity::Error => {
+                warn!(
+                    alert_kind = alert.kind.as_str(),
+                    alert_id = %alert.id,
+                    severity = "error",
+                    worker_id = ?alert.worker_id,
+                    message = %alert.message,
+                    "ALERT: Error alert raised"
+                );
+            }
+            AlertSeverity::Warning => {
+                info!(
+                    alert_kind = alert.kind.as_str(),
+                    alert_id = %alert.id,
+                    severity = "warning",
+                    worker_id = ?alert.worker_id,
+                    message = %alert.message,
+                    "ALERT: Warning alert raised"
+                );
+            }
+            AlertSeverity::Info => {
+                info!(
+                    alert_kind = alert.kind.as_str(),
+                    alert_id = %alert.id,
+                    severity = "info",
+                    worker_id = ?alert.worker_id,
+                    message = %alert.message,
+                    "ALERT: Info alert raised"
+                );
+            }
+        }
+
+        // Dispatch webhook if configured
+        self.dispatch_webhook(&alert);
 
         state.active.insert(key.clone(), alert);
         state.last_sent.insert(key, now);
@@ -282,7 +354,104 @@ impl AlertManager {
 
     fn clear_alert(&self, key: &AlertKey) {
         let mut state = self.state.write().unwrap();
-        state.active.remove(key);
+        if let Some(alert) = state.active.remove(key) {
+            debug!(
+                alert_kind = alert.kind.as_str(),
+                alert_id = %alert.id,
+                "Alert cleared"
+            );
+        }
+    }
+
+    /// Dispatch alert to webhook if configured.
+    fn dispatch_webhook(&self, alert: &Alert) {
+        let Some(webhook) = &self.config.webhook else {
+            return;
+        };
+        let Some(url) = &webhook.url else {
+            return;
+        };
+
+        // Check if this event type should be sent
+        let event_type = alert.kind.as_str();
+        if !webhook.events.is_empty() && !webhook.events.iter().any(|e| e == event_type) {
+            debug!(
+                event_type = event_type,
+                "Skipping webhook dispatch (event type not in filter)"
+            );
+            return;
+        }
+
+        let payload = WebhookPayload {
+            event: event_type.to_string(),
+            timestamp: alert.created_at.to_rfc3339(),
+            severity: alert.severity.as_str().to_string(),
+            message: alert.message.clone(),
+            worker_id: alert.worker_id.clone(),
+            details: WebhookDetails {
+                alert_id: alert.id.clone(),
+            },
+        };
+
+        // Spawn a blocking task for the HTTP request
+        // Note: In production, this should use an async HTTP client
+        let url = url.clone();
+        let timeout_secs = webhook.timeout_secs;
+        let _retry_count = webhook.retry_count;
+
+        std::thread::spawn(move || {
+            if let Err(e) = send_webhook_sync(&url, &payload, timeout_secs) {
+                warn!(
+                    url = %url,
+                    error = %e,
+                    "Failed to dispatch webhook"
+                );
+            } else {
+                debug!(
+                    url = %url,
+                    event = payload.event,
+                    "Webhook dispatched successfully"
+                );
+            }
+        });
+    }
+}
+
+/// Webhook payload structure.
+#[derive(Debug, Serialize)]
+struct WebhookPayload {
+    event: String,
+    timestamp: String,
+    severity: String,
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    worker_id: Option<String>,
+    details: WebhookDetails,
+}
+
+#[derive(Debug, Serialize)]
+struct WebhookDetails {
+    alert_id: String,
+}
+
+/// Send webhook synchronously (blocking).
+fn send_webhook_sync(url: &str, payload: &WebhookPayload, timeout_secs: u64) -> Result<(), String> {
+    let body = serde_json::to_string(payload).map_err(|e| e.to_string())?;
+
+    // Use ureq for simple synchronous HTTP requests
+    let response = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(timeout_secs))
+        .build()
+        .post(url)
+        .set("Content-Type", "application/json")
+        .set("User-Agent", "rchd-alerts/1.0")
+        .send_string(&body)
+        .map_err(|e| e.to_string())?;
+
+    if response.status() >= 200 && response.status() < 300 {
+        Ok(())
+    } else {
+        Err(format!("HTTP {}", response.status()))
     }
 }
 

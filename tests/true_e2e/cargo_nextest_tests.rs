@@ -13,10 +13,8 @@
 //!
 //! This implements part of bead bd-12hi: True E2E Cargo Compilation Tests (nextest component)
 
-use rch_common::e2e::{
-    LogLevel, LogSource, TestConfigError, TestLoggerBuilder, TestWorkersConfig,
-    should_skip_worker_check,
-};
+use rch_common::e2e::{TestConfigError, TestWorkersConfig, should_skip_worker_check};
+use rch_common::testing::{TestLogger, TestPhase};
 use rch_common::ssh::{KnownHostsPolicy, SshClient, SshOptions};
 use rch_common::types::WorkerConfig;
 use std::path::{Path, PathBuf};
@@ -154,72 +152,62 @@ async fn nextest_available_remote(client: &mut SshClient) -> bool {
 /// Test: cargo nextest run on hello_world fixture
 #[tokio::test]
 async fn test_cargo_nextest_run() {
-    let logger = TestLoggerBuilder::new("test_cargo_nextest_run")
-        .print_realtime(true)
-        .build();
+    let logger = TestLogger::for_test("test_cargo_nextest_run");
 
-    logger.log_with_context(
-        LogLevel::Info,
-        LogSource::Custom("test".to_string()),
+    logger.log_with_data(
+        TestPhase::Setup,
         "Starting cargo nextest run test",
-        vec![
-            ("phase".to_string(), "setup".to_string()),
-            ("fixture".to_string(), "hello_world".to_string()),
-        ],
+        serde_json::json!({"fixture": "hello_world"}),
     );
 
     if !nextest_available_local() {
-        logger.warn("Test skipped: cargo nextest not installed locally");
+        logger.log(TestPhase::Setup, "Test skipped: cargo nextest not installed locally");
         return;
     }
 
     let Some(config) = require_workers() else {
-        logger.warn("Test skipped: no workers available");
+        logger.log(TestPhase::Setup, "Test skipped: no workers available");
         return;
     };
 
     let Some(worker_entry) = get_test_worker(&config) else {
-        logger.warn("Test skipped: no enabled worker found");
+        logger.log(TestPhase::Setup, "Test skipped: no enabled worker found");
         return;
     };
 
     let fixture_dir = hello_world_fixture_dir();
     if !fixture_dir.exists() {
-        logger.warn(format!(
-            "Test skipped: hello_world fixture not found at {}",
-            fixture_dir.display()
-        ));
+        logger.log(
+            TestPhase::Setup,
+            format!("Test skipped: hello_world fixture not found at {}", fixture_dir.display()),
+        );
         return;
     }
 
     let worker_config = worker_entry.to_worker_config();
     let Some(mut client) = get_connected_client(&config, worker_entry).await else {
-        logger.error("Failed to connect to worker");
+        logger.fail("Failed to connect to worker");
         return;
     };
 
     if !nextest_available_remote(&mut client).await {
-        logger.warn("Test skipped: cargo nextest not installed on worker");
+        logger.log(TestPhase::Setup, "Test skipped: cargo nextest not installed on worker");
         client.disconnect().await.ok();
         return;
     }
 
     let remote_path = format!("{}/cargo_nextest_run", config.settings.remote_work_dir);
 
-    logger.log_with_context(
-        LogLevel::Info,
-        LogSource::Custom("test".to_string()),
+    logger.log_with_data(
+        TestPhase::Setup,
         "Syncing fixture to remote",
-        vec![
-            ("phase".to_string(), "setup".to_string()),
-            ("worker".to_string(), worker_entry.id.clone()),
-        ],
+        serde_json::json!({"worker": &worker_entry.id}),
     );
 
     if let Err(e) =
         sync_fixture_to_remote(&mut client, &worker_config, &fixture_dir, &remote_path).await
     {
-        logger.error(format!("Failed to sync fixture: {e}"));
+        logger.fail(format!("Failed to sync fixture: {e}"));
         return;
     }
 
