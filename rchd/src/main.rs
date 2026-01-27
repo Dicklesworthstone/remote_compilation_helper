@@ -216,26 +216,46 @@ async fn main() -> Result<()> {
         tracing::debug!("Hook auto-installation disabled via config");
     }
 
+    // Load daemon config for queue + cache cleanup settings
+    let daemon_config = match config::load_daemon_config(None) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            warn!("Failed to load daemon config: {}, using defaults", e);
+            config::DaemonConfig::default()
+        }
+    };
+
     // Initialize build history
     let history = if let Some(ref path) = cli.history_file {
         if path.exists() {
             match BuildHistory::load_from_file(path, cli.history_capacity) {
                 Ok(h) => {
                     info!("Loaded build history from {:?} ({} entries)", path, h.len());
-                    Arc::new(h)
+                    Arc::new(h.with_max_queue_depth(daemon_config.queue.max_depth))
                 }
                 Err(e) => {
                     warn!("Failed to load history from {:?}: {}", path, e);
-                    Arc::new(BuildHistory::new(cli.history_capacity).with_persistence(path.clone()))
+                    Arc::new(
+                        BuildHistory::new(cli.history_capacity)
+                            .with_persistence(path.clone())
+                            .with_max_queue_depth(daemon_config.queue.max_depth),
+                    )
                 }
             }
         } else {
             info!("Creating new build history at {:?}", path);
-            Arc::new(BuildHistory::new(cli.history_capacity).with_persistence(path.clone()))
+            Arc::new(
+                BuildHistory::new(cli.history_capacity)
+                    .with_persistence(path.clone())
+                    .with_max_queue_depth(daemon_config.queue.max_depth),
+            )
         }
     } else {
         info!("Build history in-memory only (no persistence)");
-        Arc::new(BuildHistory::new(cli.history_capacity))
+        Arc::new(
+            BuildHistory::new(cli.history_capacity)
+                .with_max_queue_depth(daemon_config.queue.max_depth),
+        )
     };
 
     // Initialize self-test config and history
@@ -279,15 +299,6 @@ async fn main() -> Result<()> {
     if let Err(e) = self_test_service.clone().start().await {
         warn!("Failed to start self-test scheduler: {}", e);
     }
-
-    // Load daemon config for cache cleanup settings
-    let daemon_config = match config::load_daemon_config(None) {
-        Ok(cfg) => cfg,
-        Err(e) => {
-            warn!("Failed to load daemon config: {}, using defaults", e);
-            config::DaemonConfig::default()
-        }
-    };
 
     // Start cache cleanup scheduler
     let cache_cleanup_scheduler = Arc::new(cache_cleanup::CacheCleanupScheduler::new(

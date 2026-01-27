@@ -502,19 +502,16 @@ pub async fn handle_connection(
             // Read optional JSON body line for timing breakdown
             // Use a short timeout to avoid blocking when no body is sent
             let mut body_line = String::new();
-            if let Ok(Ok(_)) = tokio::time::timeout(
-                Duration::from_millis(50),
-                reader.read_line(&mut body_line),
-            )
-            .await
+            if let Ok(Ok(_)) =
+                tokio::time::timeout(Duration::from_millis(50), reader.read_line(&mut body_line))
+                    .await
             {
                 let body = body_line.trim();
-                if !body.is_empty() {
-                    if let Ok(timing) =
+                if !body.is_empty()
+                    && let Ok(timing) =
                         serde_json::from_str::<rch_common::CommandTimingBreakdown>(body)
-                    {
-                        request.timing = Some(timing);
-                    }
+                {
+                    request.timing = Some(timing);
                 }
             }
             handle_release_worker(&ctx, request).await?;

@@ -850,7 +850,7 @@ impl ProjectTimingData {
         let mut durations: Vec<u64> = samples.iter().map(|r| r.duration_ms).collect();
         durations.sort_unstable();
         let mid = durations.len() / 2;
-        Some(if durations.len() % 2 == 0 {
+        Some(if durations.len().is_multiple_of(2) {
             (durations[mid - 1] + durations[mid]) / 2
         } else {
             durations[mid]
@@ -902,10 +902,10 @@ impl TimingHistory {
 
         // Write atomically using temp file
         let temp_path = path.with_extension("tmp");
-        if let Ok(content) = serde_json::to_string_pretty(self) {
-            if std::fs::write(&temp_path, &content).is_ok() {
-                let _ = std::fs::rename(temp_path, path);
-            }
+        if let Ok(content) = serde_json::to_string_pretty(self)
+            && std::fs::write(&temp_path, &content).is_ok()
+        {
+            let _ = std::fs::rename(temp_path, path);
         }
     }
 
@@ -1671,6 +1671,7 @@ pub(crate) async fn query_daemon(
 }
 
 /// Release reserved slots on a worker.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn release_worker(
     socket_path: &str,
     worker_id: &WorkerId,
@@ -1709,11 +1710,11 @@ pub(crate) async fn release_worker(
     request.push('\n');
 
     // Add timing breakdown as JSON body if present
-    if let Some(timing) = timing {
-        if let Ok(json) = serde_json::to_string(timing) {
-            request.push_str(&json);
-            request.push('\n');
-        }
+    if let Some(timing) = timing
+        && let Ok(json) = serde_json::to_string(timing)
+    {
+        request.push_str(&json);
+        request.push('\n');
     }
 
     writer.write_all(request.as_bytes()).await?;
@@ -5317,7 +5318,9 @@ mod tests {
         let json = serde_json::to_string(&history).unwrap();
         let loaded: super::TimingHistory = serde_json::from_str(&json).unwrap();
 
-        let data = loaded.get("proj", Some(CompilationKind::CargoCheck)).unwrap();
+        let data = loaded
+            .get("proj", Some(CompilationKind::CargoCheck))
+            .unwrap();
         assert_eq!(data.local_samples.len(), 1);
         assert_eq!(data.remote_samples.len(), 1);
     }
