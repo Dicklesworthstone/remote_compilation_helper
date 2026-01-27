@@ -768,24 +768,24 @@ mod tests {
 
             // Test cases that might cause issues
             let malformed_values = [
-                "",                          // Empty
-                " ",                         // Whitespace only
-                "\t\n\r",                    // Control chars
-                "null",                      // Common null value
-                "undefined",                 // JS undefined
-                "None",                      // Python None
-                "nil",                       // Ruby nil
-                "\0",                        // Null byte
-                "\x00\x01\x02",              // Binary data
-                "🔥",                        // Emoji
-                "日本語",                    // Unicode
-                long_string.as_str(),        // Very long string (heap allocation)
-                "-",                         // Just minus sign
-                "+",                         // Just plus sign
-                ".",                         // Just decimal point
-                "e",                         // Just exponent marker
-                "0x",                        // Incomplete hex
-                "0b",                        // Incomplete binary
+                "",                   // Empty
+                " ",                  // Whitespace only
+                "\t\n\r",             // Control chars
+                "null",               // Common null value
+                "undefined",          // JS undefined
+                "None",               // Python None
+                "nil",                // Ruby nil
+                "\0",                 // Null byte
+                "\x00\x01\x02",       // Binary data
+                "🔥",                 // Emoji
+                "日本語",             // Unicode
+                long_string.as_str(), // Very long string (heap allocation)
+                "-",                  // Just minus sign
+                "+",                  // Just plus sign
+                ".",                  // Just decimal point
+                "e",                  // Just exponent marker
+                "0x",                 // Incomplete hex
+                "0b",                 // Incomplete binary
             ];
 
             for value in &malformed_values {
@@ -859,17 +859,17 @@ mod tests {
             cleanup_env(&vars);
 
             let edge_case_paths = [
-                "",                      // Empty
-                "~",                     // Just tilde
-                "~/",                    // Tilde with slash
-                "~user/file",            // Tilde with username (not expanded)
-                "/absolute/path",        // Absolute path
-                "./relative/path",       // Relative path
-                "../parent/path",        // Parent path
-                "path with spaces",      // Spaces
-                "path\twith\ttabs",      // Tabs
-                "path/with/日本語",      // Unicode
-                "/dev/null",             // Special file
+                "",                 // Empty
+                "~",                // Just tilde
+                "~/",               // Tilde with slash
+                "~user/file",       // Tilde with username (not expanded)
+                "/absolute/path",   // Absolute path
+                "./relative/path",  // Relative path
+                "../parent/path",   // Parent path
+                "path with spaces", // Spaces
+                "path\twith\ttabs", // Tabs
+                "path/with/日本語", // Unicode
+                "/dev/null",        // Special file
             ];
 
             for path in &edge_case_paths {

@@ -835,10 +835,7 @@ pub async fn workers_list(show_speedscore: bool, ctx: &OutputContext) -> Result<
         let config_path = config_dir()
             .map(|d| d.join("workers.toml"))
             .unwrap_or_else(|| PathBuf::from("~/.config/rch/workers.toml"));
-        println!(
-            "  {} No workers configured.",
-            style.symbols.info
-        );
+        println!("  {} No workers configured.", style.symbols.info);
         println!();
         println!(
             "  Create a workers config at: {}",
@@ -8052,8 +8049,13 @@ pub fn agents_status(agent: Option<String>, ctx: &OutputContext) -> Result<()> {
 
     // If specific agent requested, show only that one
     if let Some(ref agent_name) = agent {
-        let kind = AgentKind::from_id(agent_name)
-            .ok_or_else(|| anyhow::anyhow!("Unknown agent: {}. Valid agents: {:?}", agent_name, AgentKind::ALL.iter().map(|k| k.id()).collect::<Vec<_>>()))?;
+        let kind = AgentKind::from_id(agent_name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Unknown agent: {}. Valid agents: {:?}",
+                agent_name,
+                AgentKind::ALL.iter().map(|k| k.id()).collect::<Vec<_>>()
+            )
+        })?;
 
         let detected = detect_single_agent(kind)?;
         let hook_status = check_hook_status(kind).unwrap_or(HookStatus::NotSupported);
@@ -8075,25 +8077,48 @@ pub fn agents_status(agent: Option<String>, ctx: &OutputContext) -> Result<()> {
             return Ok(());
         }
 
-        println!("{}", style.format_header(&format!("Agent: {}", kind.name())));
+        println!(
+            "{}",
+            style.format_header(&format!("Agent: {}", kind.name()))
+        );
         println!();
-        println!("  {} {}", style.key("Detected:"), if detected.is_some() { style.success("Yes") } else { style.warning("No") });
+        println!(
+            "  {} {}",
+            style.key("Detected:"),
+            if detected.is_some() {
+                style.success("Yes")
+            } else {
+                style.warning("No")
+            }
+        );
         if let Some(ref d) = detected {
             if let Some(ref version) = d.version {
                 println!("  {} {}", style.key("Version:"), style.value(version));
             }
             if let Some(ref path) = d.config_path {
-                println!("  {} {}", style.key("Config:"), style.value(&path.display().to_string()));
+                println!(
+                    "  {} {}",
+                    style.key("Config:"),
+                    style.value(&path.display().to_string())
+                );
             }
             println!("  {} {:?}", style.key("Detection:"), d.detection_method);
         }
-        println!("  {} {}", style.key("Hook Support:"), style.value(&format!("{}", kind.hook_support())));
-        println!("  {} {}", style.key("Hook Status:"), match hook_status {
-            HookStatus::Installed => style.success(&hook_status.to_string()),
-            HookStatus::NeedsUpdate => style.warning(&hook_status.to_string()),
-            HookStatus::NotInstalled => style.value(&hook_status.to_string()),
-            HookStatus::NotSupported => style.muted(&hook_status.to_string()),
-        });
+        println!(
+            "  {} {}",
+            style.key("Hook Support:"),
+            style.value(&format!("{}", kind.hook_support()))
+        );
+        println!(
+            "  {} {}",
+            style.key("Hook Status:"),
+            match hook_status {
+                HookStatus::Installed => style.success(&hook_status.to_string()),
+                HookStatus::NeedsUpdate => style.warning(&hook_status.to_string()),
+                HookStatus::NotInstalled => style.value(&hook_status.to_string()),
+                HookStatus::NotSupported => style.muted(&hook_status.to_string()),
+            }
+        );
 
         return Ok(());
     }
@@ -9466,5 +9491,638 @@ mod tests {
     fn format_bytes_fractional() {
         assert_eq!(format_bytes(1536), "1.5 KB");
         assert_eq!(format_bytes(1024 * 1024 + 512 * 1024), "1.5 MB");
+    }
+
+    // -------------------------------------------------------------------------
+    // runtime_label Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn runtime_label_rust() {
+        assert_eq!(runtime_label(&RequiredRuntime::Rust), "rust");
+    }
+
+    #[test]
+    fn runtime_label_bun() {
+        assert_eq!(runtime_label(&RequiredRuntime::Bun), "bun");
+    }
+
+    #[test]
+    fn runtime_label_node() {
+        assert_eq!(runtime_label(&RequiredRuntime::Node), "node");
+    }
+
+    #[test]
+    fn runtime_label_none() {
+        assert_eq!(runtime_label(&RequiredRuntime::None), "none");
+    }
+
+    // -------------------------------------------------------------------------
+    // has_any_capabilities Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn has_any_capabilities_empty() {
+        let caps = WorkerCapabilities::new();
+        assert!(!has_any_capabilities(&caps));
+    }
+
+    #[test]
+    fn has_any_capabilities_with_rust() {
+        let caps = WorkerCapabilities {
+            rustc_version: Some("rustc 1.87.0".to_string()),
+            ..Default::default()
+        };
+        assert!(has_any_capabilities(&caps));
+    }
+
+    #[test]
+    fn has_any_capabilities_with_bun() {
+        let caps = WorkerCapabilities {
+            bun_version: Some("1.2.3".to_string()),
+            ..Default::default()
+        };
+        assert!(has_any_capabilities(&caps));
+    }
+
+    #[test]
+    fn has_any_capabilities_with_node() {
+        let caps = WorkerCapabilities {
+            node_version: Some("v20.0.0".to_string()),
+            ..Default::default()
+        };
+        assert!(has_any_capabilities(&caps));
+    }
+
+    #[test]
+    fn has_any_capabilities_with_npm() {
+        let caps = WorkerCapabilities {
+            npm_version: Some("10.0.0".to_string()),
+            ..Default::default()
+        };
+        assert!(has_any_capabilities(&caps));
+    }
+
+    #[test]
+    fn has_any_capabilities_with_all() {
+        let caps = WorkerCapabilities {
+            rustc_version: Some("rustc 1.87.0".to_string()),
+            bun_version: Some("1.2.3".to_string()),
+            node_version: Some("v20.0.0".to_string()),
+            npm_version: Some("10.0.0".to_string()),
+            ..Default::default()
+        };
+        assert!(has_any_capabilities(&caps));
+    }
+
+    // -------------------------------------------------------------------------
+    // extract_version_numbers Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn extract_version_numbers_simple() {
+        assert_eq!(extract_version_numbers("1.2.3"), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn extract_version_numbers_with_prefix() {
+        assert_eq!(
+            extract_version_numbers("rustc 1.87.0-nightly"),
+            vec![1, 87, 0]
+        );
+    }
+
+    #[test]
+    fn extract_version_numbers_node_format() {
+        assert_eq!(extract_version_numbers("v20.11.1"), vec![20, 11, 1]);
+    }
+
+    #[test]
+    fn extract_version_numbers_empty() {
+        assert_eq!(extract_version_numbers(""), Vec::<u64>::new());
+    }
+
+    #[test]
+    fn extract_version_numbers_no_numbers() {
+        assert_eq!(
+            extract_version_numbers("no numbers here"),
+            Vec::<u64>::new()
+        );
+    }
+
+    #[test]
+    fn extract_version_numbers_single() {
+        assert_eq!(extract_version_numbers("version 42"), vec![42]);
+    }
+
+    #[test]
+    fn extract_version_numbers_large() {
+        assert_eq!(extract_version_numbers("2024.01.15"), vec![2024, 1, 15]);
+    }
+
+    // -------------------------------------------------------------------------
+    // major_version Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn major_version_extracts_first() {
+        assert_eq!(major_version("rustc 1.87.0-nightly"), Some(1));
+    }
+
+    #[test]
+    fn major_version_node() {
+        assert_eq!(major_version("v20.11.1"), Some(20));
+    }
+
+    #[test]
+    fn major_version_empty() {
+        assert_eq!(major_version(""), None);
+    }
+
+    #[test]
+    fn major_version_no_numbers() {
+        assert_eq!(major_version("no version"), None);
+    }
+
+    // -------------------------------------------------------------------------
+    // major_minor_version Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn major_minor_version_extracts_both() {
+        assert_eq!(major_minor_version("rustc 1.87.0-nightly"), Some((1, 87)));
+    }
+
+    #[test]
+    fn major_minor_version_node() {
+        assert_eq!(major_minor_version("v20.11.1"), Some((20, 11)));
+    }
+
+    #[test]
+    fn major_minor_version_single_number() {
+        assert_eq!(major_minor_version("version 42"), None);
+    }
+
+    #[test]
+    fn major_minor_version_empty() {
+        assert_eq!(major_minor_version(""), None);
+    }
+
+    // -------------------------------------------------------------------------
+    // rust_version_mismatch Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn rust_version_mismatch_same_version() {
+        assert!(!rust_version_mismatch(
+            "rustc 1.87.0-nightly",
+            "rustc 1.87.0-nightly"
+        ));
+    }
+
+    #[test]
+    fn rust_version_mismatch_different_patch() {
+        // Same major.minor, different patch - should NOT be a mismatch
+        assert!(!rust_version_mismatch("rustc 1.87.0", "rustc 1.87.1"));
+    }
+
+    #[test]
+    fn rust_version_mismatch_different_minor() {
+        assert!(rust_version_mismatch("rustc 1.87.0", "rustc 1.86.0"));
+    }
+
+    #[test]
+    fn rust_version_mismatch_different_major() {
+        assert!(rust_version_mismatch("rustc 1.87.0", "rustc 2.0.0"));
+    }
+
+    #[test]
+    fn rust_version_mismatch_invalid_local() {
+        // If local can't be parsed, returns false (no mismatch detectable)
+        assert!(!rust_version_mismatch("invalid", "rustc 1.87.0"));
+    }
+
+    #[test]
+    fn rust_version_mismatch_invalid_remote() {
+        assert!(!rust_version_mismatch("rustc 1.87.0", "invalid"));
+    }
+
+    // -------------------------------------------------------------------------
+    // major_version_mismatch Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn major_version_mismatch_same() {
+        assert!(!major_version_mismatch("bun 1.2.3", "bun 1.5.0"));
+    }
+
+    #[test]
+    fn major_version_mismatch_different() {
+        assert!(major_version_mismatch("bun 1.2.3", "bun 2.0.0"));
+    }
+
+    #[test]
+    fn major_version_mismatch_invalid_local() {
+        assert!(!major_version_mismatch("no version", "bun 1.2.3"));
+    }
+
+    #[test]
+    fn major_version_mismatch_invalid_remote() {
+        assert!(!major_version_mismatch("bun 1.2.3", "no version"));
+    }
+
+    // -------------------------------------------------------------------------
+    // summarize_capabilities Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn summarize_capabilities_empty() {
+        let caps = WorkerCapabilities::new();
+        assert_eq!(summarize_capabilities(&caps), "unknown");
+    }
+
+    #[test]
+    fn summarize_capabilities_rust_only() {
+        let caps = WorkerCapabilities {
+            rustc_version: Some("rustc 1.87.0".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(summarize_capabilities(&caps), "rustc rustc 1.87.0");
+    }
+
+    #[test]
+    fn summarize_capabilities_all() {
+        let caps = WorkerCapabilities {
+            rustc_version: Some("1.87".to_string()),
+            bun_version: Some("1.2".to_string()),
+            node_version: Some("20.0".to_string()),
+            npm_version: Some("10.0".to_string()),
+            ..Default::default()
+        };
+        let result = summarize_capabilities(&caps);
+        assert!(result.contains("rustc 1.87"));
+        assert!(result.contains("bun 1.2"));
+        assert!(result.contains("node 20.0"));
+        assert!(result.contains("npm 10.0"));
+    }
+
+    // -------------------------------------------------------------------------
+    // parse_bool Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn parse_bool_true() {
+        assert!(parse_bool("true", "test_key").unwrap());
+    }
+
+    #[test]
+    fn parse_bool_false() {
+        assert!(!parse_bool("false", "test_key").unwrap());
+    }
+
+    #[test]
+    fn parse_bool_with_whitespace() {
+        assert!(parse_bool("  true  ", "test_key").unwrap());
+    }
+
+    #[test]
+    fn parse_bool_invalid() {
+        let result = parse_bool("yes", "test_key");
+        assert!(result.is_err());
+    }
+
+    // -------------------------------------------------------------------------
+    // parse_u32 Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn parse_u32_valid() {
+        assert_eq!(parse_u32("42", "test_key").unwrap(), 42);
+    }
+
+    #[test]
+    fn parse_u32_zero() {
+        assert_eq!(parse_u32("0", "test_key").unwrap(), 0);
+    }
+
+    #[test]
+    fn parse_u32_with_whitespace() {
+        assert_eq!(parse_u32("  123  ", "test_key").unwrap(), 123);
+    }
+
+    #[test]
+    fn parse_u32_negative() {
+        let result = parse_u32("-1", "test_key");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_u32_non_numeric() {
+        let result = parse_u32("abc", "test_key");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_u32_overflow() {
+        let result = parse_u32("4294967296", "test_key"); // u32::MAX + 1
+        assert!(result.is_err());
+    }
+
+    // -------------------------------------------------------------------------
+    // parse_u64 Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn parse_u64_valid() {
+        assert_eq!(parse_u64("9999999999", "test_key").unwrap(), 9999999999);
+    }
+
+    #[test]
+    fn parse_u64_zero() {
+        assert_eq!(parse_u64("0", "test_key").unwrap(), 0);
+    }
+
+    #[test]
+    fn parse_u64_with_whitespace() {
+        assert_eq!(parse_u64("  456  ", "test_key").unwrap(), 456);
+    }
+
+    #[test]
+    fn parse_u64_negative() {
+        let result = parse_u64("-1", "test_key");
+        assert!(result.is_err());
+    }
+
+    // -------------------------------------------------------------------------
+    // parse_f64 Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn parse_f64_integer() {
+        let result = parse_f64("42", "test_key").unwrap();
+        assert!((result - 42.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn parse_f64_decimal() {
+        let result = parse_f64("3.14", "test_key").unwrap();
+        assert!((result - 3.14).abs() < 0.001);
+    }
+
+    #[test]
+    fn parse_f64_with_whitespace() {
+        let result = parse_f64("  0.5  ", "test_key").unwrap();
+        assert!((result - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn parse_f64_negative() {
+        let result = parse_f64("-1.5", "test_key").unwrap();
+        assert!((result - (-1.5)).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn parse_f64_invalid() {
+        let result = parse_f64("not a number", "test_key");
+        assert!(result.is_err());
+    }
+
+    // -------------------------------------------------------------------------
+    // parse_string_list Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn parse_string_list_empty() {
+        let result = parse_string_list("", "test_key").unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn parse_string_list_single() {
+        let result = parse_string_list("item", "test_key").unwrap();
+        assert_eq!(result, vec!["item"]);
+    }
+
+    #[test]
+    fn parse_string_list_comma_separated() {
+        let result = parse_string_list("a, b, c", "test_key").unwrap();
+        assert_eq!(result, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn parse_string_list_toml_array() {
+        let result = parse_string_list(r#"["foo", "bar"]"#, "test_key").unwrap();
+        assert_eq!(result, vec!["foo", "bar"]);
+    }
+
+    #[test]
+    fn parse_string_list_toml_array_empty() {
+        let result = parse_string_list("[]", "test_key").unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn parse_string_list_with_whitespace() {
+        let result = parse_string_list("  a  ,  b  ", "test_key").unwrap();
+        assert_eq!(result, vec!["a", "b"]);
+    }
+
+    // -------------------------------------------------------------------------
+    // indent_lines Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn indent_lines_single() {
+        assert_eq!(indent_lines("hello", "  "), "  hello");
+    }
+
+    #[test]
+    fn indent_lines_multiple() {
+        assert_eq!(indent_lines("a\nb\nc", ">> "), ">> a\n>> b\n>> c");
+    }
+
+    #[test]
+    fn indent_lines_empty() {
+        assert_eq!(indent_lines("", "  "), "  ");
+    }
+
+    #[test]
+    fn indent_lines_empty_prefix() {
+        assert_eq!(indent_lines("a\nb", ""), "a\nb");
+    }
+
+    // -------------------------------------------------------------------------
+    // format_build_duration Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn format_build_duration_seconds() {
+        assert_eq!(format_build_duration(45), "45s");
+    }
+
+    #[test]
+    fn format_build_duration_zero() {
+        assert_eq!(format_build_duration(0), "0s");
+    }
+
+    #[test]
+    fn format_build_duration_minutes() {
+        assert_eq!(format_build_duration(90), "1m 30s");
+    }
+
+    #[test]
+    fn format_build_duration_exact_minute() {
+        assert_eq!(format_build_duration(60), "1m 0s");
+    }
+
+    #[test]
+    fn format_build_duration_hours() {
+        assert_eq!(format_build_duration(3661), "1h 1m");
+    }
+
+    #[test]
+    fn format_build_duration_exact_hour() {
+        assert_eq!(format_build_duration(3600), "1h 0m");
+    }
+
+    #[test]
+    fn format_build_duration_multiple_hours() {
+        assert_eq!(format_build_duration(7380), "2h 3m"); // 2h 3m
+    }
+
+    // -------------------------------------------------------------------------
+    // urlencoding_encode Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn urlencoding_encode_alphanumeric() {
+        assert_eq!(urlencoding_encode("abc123"), "abc123");
+    }
+
+    #[test]
+    fn urlencoding_encode_safe_chars() {
+        assert_eq!(urlencoding_encode("a-b_c.d~e"), "a-b_c.d~e");
+    }
+
+    #[test]
+    fn urlencoding_encode_spaces() {
+        assert_eq!(urlencoding_encode("hello world"), "hello%20world");
+    }
+
+    #[test]
+    fn urlencoding_encode_special() {
+        assert_eq!(urlencoding_encode("a=b&c"), "a%3Db%26c");
+    }
+
+    #[test]
+    fn urlencoding_encode_unicode() {
+        // Multi-byte UTF-8 characters should be percent-encoded
+        let result = urlencoding_encode("hello\u{00E9}"); // é
+        assert!(result.starts_with("hello%"));
+        assert!(result.len() > 6); // Should be longer due to encoding
+    }
+
+    #[test]
+    fn urlencoding_encode_empty() {
+        assert_eq!(urlencoding_encode(""), "");
+    }
+
+    // -------------------------------------------------------------------------
+    // generate_config_toml Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn generate_config_toml_contains_all_sections() {
+        let values = ConfigValues {
+            log_level: "info".to_string(),
+            socket_path: "/tmp/rch.sock".to_string(),
+            confidence_threshold: 0.85,
+            min_local_time_ms: 2000,
+            compression_level: 3,
+        };
+        let toml = generate_config_toml(&values);
+        assert!(toml.contains("[general]"));
+        assert!(toml.contains("[compilation]"));
+        assert!(toml.contains("[transfer]"));
+        assert!(toml.contains("enabled = true"));
+        assert!(toml.contains("log_level = \"info\""));
+        assert!(toml.contains("confidence_threshold = 0.85"));
+        assert!(toml.contains("min_local_time_ms = 2000"));
+        assert!(toml.contains("compression_level = 3"));
+    }
+
+    // -------------------------------------------------------------------------
+    // generate_workers_toml Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn generate_workers_toml_single_worker() {
+        let workers = vec![WizardWorker {
+            id: "worker-1".to_string(),
+            host: "192.168.1.100".to_string(),
+            user: "ubuntu".to_string(),
+            identity_file: "~/.ssh/id_rsa".to_string(),
+            total_slots: 8,
+            priority: 100,
+        }];
+        let toml = generate_workers_toml(&workers);
+        assert!(toml.contains("[[workers]]"));
+        assert!(toml.contains("id = \"worker-1\""));
+        assert!(toml.contains("host = \"192.168.1.100\""));
+        assert!(toml.contains("user = \"ubuntu\""));
+        assert!(toml.contains("total_slots = 8"));
+        assert!(toml.contains("priority = 100"));
+    }
+
+    #[test]
+    fn generate_workers_toml_multiple_workers() {
+        let workers = vec![
+            WizardWorker {
+                id: "w1".to_string(),
+                host: "host1".to_string(),
+                user: "user1".to_string(),
+                identity_file: "key1".to_string(),
+                total_slots: 4,
+                priority: 100,
+            },
+            WizardWorker {
+                id: "w2".to_string(),
+                host: "host2".to_string(),
+                user: "user2".to_string(),
+                identity_file: "key2".to_string(),
+                total_slots: 8,
+                priority: 50,
+            },
+        ];
+        let toml = generate_workers_toml(&workers);
+        // Should contain two [[workers]] blocks
+        let worker_count = toml.matches("[[workers]]").count();
+        assert_eq!(worker_count, 2);
+        assert!(toml.contains("id = \"w1\""));
+        assert!(toml.contains("id = \"w2\""));
+    }
+
+    #[test]
+    fn generate_workers_toml_empty() {
+        let workers: Vec<WizardWorker> = vec![];
+        let toml = generate_workers_toml(&workers);
+        // Should have header but no [[workers]] blocks
+        assert!(toml.contains("RCH Workers Configuration"));
+        assert!(!toml.contains("[[workers]]"));
+    }
+
+    // -------------------------------------------------------------------------
+    // is_default_verify_size Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn is_default_verify_size_true() {
+        assert!(is_default_verify_size(&(100 * 1024 * 1024)));
+    }
+
+    #[test]
+    fn is_default_verify_size_false() {
+        assert!(!is_default_verify_size(&0));
+        assert!(!is_default_verify_size(&(50 * 1024 * 1024)));
     }
 }

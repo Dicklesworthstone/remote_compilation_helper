@@ -623,7 +623,7 @@ mod tests {
     fn test_test_run_stats_multiple_runs() {
         let store = TelemetryStore::new(Duration::from_secs(300), None);
 
-        // Successful run
+        // Successful run (exit code 0)
         let success_run = TestRunRecord::new(
             "proj".to_string(),
             "worker-1".to_string(),
@@ -634,13 +634,13 @@ mod tests {
         );
         store.record_test_run(success_run);
 
-        // Failed run
+        // Failed run (exit code 101 is Rust's test failure exit code)
         let failed_run = TestRunRecord::new(
             "proj".to_string(),
             "worker-2".to_string(),
             "cargo test".to_string(),
             CompilationKind::CargoTest,
-            1,
+            101, // Rust test failure exit code
             500,
         );
         store.record_test_run(failed_run);
@@ -674,13 +674,29 @@ mod tests {
     }
 
     #[test]
-    fn test_store_with_invalid_retention_duration() {
-        // Test that an invalid retention is handled gracefully
-        let store = TelemetryStore::new(Duration::from_secs(0), None);
-        // Should fall back to a default of 300 seconds if conversion fails
-        // The new store should still be functional
+    fn test_store_with_short_retention_duration() {
+        // Test that very short retention still works (immediate eviction)
+        let store = TelemetryStore::new(Duration::from_millis(1), None);
+
+        // Ingest one entry
         store.ingest(make_telemetry("w1", 10.0, 20.0), TelemetrySource::SshPoll);
+
+        // The entry should exist immediately after insertion
         assert!(store.latest("w1").is_some());
+
+        // Make the entry old
+        {
+            let mut recent = store.recent.write().unwrap();
+            let entries = recent.get_mut("w1").unwrap();
+            entries[0].received_at = Utc::now() - ChronoDuration::seconds(60);
+        }
+
+        // Ingest another entry - should trigger eviction
+        store.ingest(make_telemetry("w1", 20.0, 30.0), TelemetrySource::SshPoll);
+
+        // Only the new entry should remain
+        let latest = store.latest("w1").unwrap();
+        assert!((latest.telemetry.cpu.overall_percent - 20.0).abs() < f64::EPSILON);
     }
 
     #[tokio::test]
