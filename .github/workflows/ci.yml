@@ -132,16 +132,26 @@ jobs:
 
   # Cross-platform test matrix
   test:
+    name: test (${{ matrix.name }})
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-          - os: macos-latest
-            target: x86_64-apple-darwin
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
+          - name: linux-x64
+            os: ubuntu-latest
+            cargo_args: --all-features --workspace
+          - name: linux-arm64
+            os: ubuntu-24.04-arm
+            cargo_args: --all-features --workspace
+          - name: macos-x64
+            os: macos-15-intel
+            cargo_args: --all-features --workspace
+          - name: macos-arm64
+            os: macos-14
+            cargo_args: --all-features --workspace
+          - name: windows-x64
+            os: windows-latest
+            cargo_args: --no-default-features --workspace
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     needs: check
@@ -158,23 +168,17 @@ jobs:
           toolchain: nightly-2025-01-01
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: test-${{ matrix.os }}
+          shared-key: test-${{ matrix.name }}
           cache-on-failure: true
-      - name: Run tests (Unix)
-        if: runner.os != 'Windows'
+      - name: Run tests
         env:
           RCH_MOCK_SSH: '1'
-        run: cargo test --all-features --workspace
-      - name: Run tests (Windows - skip rich-ui)
-        if: runner.os == 'Windows'
-        env:
-          RCH_MOCK_SSH: '1'
-        run: cargo test --no-default-features --workspace
+        run: cargo test ${{ matrix.cargo_args }}
       - name: Upload test logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: test-logs-${{ matrix.os }}
+          name: test-logs-${{ matrix.name }}
           path: |
             target/debug/deps/*.log
             **/test-output.log
