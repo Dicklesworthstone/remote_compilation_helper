@@ -486,6 +486,9 @@ pub struct ReleaseRequest {
     /// Optional bytes transferred during the pipeline (upload + artifact download).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bytes_transferred: Option<u64>,
+    /// Optional per-phase timing breakdown for the build pipeline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timing: Option<CommandTimingBreakdown>,
 }
 
 /// Configuration for a remote worker.

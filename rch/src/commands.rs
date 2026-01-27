@@ -6589,6 +6589,7 @@ pub async fn diagnose(command: &str, dry_run: bool, ctx: &OutputContext) -> Resu
                         None,
                         None,
                         None,
+                        None, // timing
                     )
                     .await
                 {
@@ -7547,9 +7548,20 @@ fn urlencoding_encode(s: &str) -> String {
     result
 }
 
-// Stub for status_overview
-pub async fn status_overview(_workers: bool, _jobs: bool) -> Result<()> {
-    // Implementation placeholder
+pub async fn status_overview(workers: bool, jobs: bool, ctx: &OutputContext) -> Result<()> {
+    // Query daemon for full status.
+    let response = send_daemon_command("GET /status\n").await?;
+    let json = extract_json_body(&response)
+        .ok_or_else(|| anyhow::anyhow!("Invalid response format from daemon"))?;
+    let status: DaemonFullStatusResponse =
+        serde_json::from_str(json).context("Failed to parse daemon status response")?;
+
+    if ctx.is_json() {
+        let _ = ctx.json(&status);
+        return Ok(());
+    }
+
+    crate::status_display::render_full_status(&status, workers, jobs, ctx.style());
     Ok(())
 }
 
@@ -7562,6 +7574,43 @@ pub async fn queue_status(watch: bool, ctx: &OutputContext) -> Result<()> {
             .ok_or_else(|| anyhow::anyhow!("Invalid response format from daemon"))?;
         let status: DaemonFullStatusResponse =
             serde_json::from_str(json).context("Failed to parse daemon status response")?;
+
+        // JSON output for scripting (pure JSON on stdout; no other output).
+        if ctx.is_json() {
+            let mut workers_available = 0;
+            let mut workers_busy = 0;
+            let mut workers_offline = 0;
+
+            for worker in &status.workers {
+                match worker.status.as_str() {
+                    "healthy" | "degraded" | "draining" => {
+                        if worker.used_slots >= worker.total_slots {
+                            workers_busy += 1;
+                        } else {
+                            workers_available += 1;
+                        }
+                    }
+                    "unreachable" | "disabled" => workers_offline += 1,
+                    _ => {}
+                }
+            }
+
+            let queue_data = serde_json::json!({
+                "active_builds": status.active_builds,
+                "queued_builds": status.queued_builds,
+                "queue_depth": status.queued_builds.len(),
+                "workers_available": workers_available,
+                "workers_busy": workers_busy,
+                "workers_offline": workers_offline,
+                "workers_total": status.daemon.workers_total,
+                "workers_healthy": status.daemon.workers_healthy,
+                "slots_available": status.daemon.slots_available,
+                "slots_total": status.daemon.slots_total,
+                "timestamp": chrono::Utc::now().to_rfc3339()
+            });
+            let _ = ctx.json(&queue_data);
+            return Ok(());
+        }
 
         // In watch mode, clear screen
         if watch {
@@ -7658,7 +7707,7 @@ pub async fn queue_status(watch: bool, ctx: &OutputContext) -> Result<()> {
 
                 println!(
                     "  {} {} {} {} {}",
-                    style.info(&format!("#{}", build.position)),
+                    style.info(&format!("#{}", build.id)),
                     style.muted("|"),
                     style.value(&cmd_display),
                     style.muted("waiting"),
@@ -7672,9 +7721,11 @@ pub async fn queue_status(watch: bool, ctx: &OutputContext) -> Result<()> {
                     build.project_id.clone()
                 };
                 println!(
-                    "      {} {}",
+                    "      {} {}  {} {}",
                     style.muted("project:"),
-                    style.value(&project_display)
+                    style.value(&project_display),
+                    style.muted("position:"),
+                    style.value(&build.position.to_string())
                 );
             }
             println!();
@@ -7690,14 +7741,14 @@ pub async fn queue_status(watch: bool, ctx: &OutputContext) -> Result<()> {
 
         for worker in &status.workers {
             match worker.status.as_str() {
-                "healthy" | "available" => {
+                "healthy" | "degraded" | "draining" => {
                     if worker.used_slots >= worker.total_slots {
                         busy_count += 1;
                     } else {
                         healthy_count += 1;
                     }
                 }
-                "offline" | "unreachable" | "error" => offline_count += 1,
+                "unreachable" | "disabled" => offline_count += 1,
                 _ => {}
             }
         }
@@ -7720,23 +7771,6 @@ pub async fn queue_status(watch: bool, ctx: &OutputContext) -> Result<()> {
             status.daemon.slots_available,
             status.daemon.slots_total
         );
-
-        // JSON output for scripting
-        if ctx.is_json() {
-            let queue_data = serde_json::json!({
-                "active_builds": status.active_builds,
-                "queued_builds": status.queued_builds,
-                "queue_depth": status.queued_builds.len(),
-                "workers_available": healthy_count,
-                "workers_busy": busy_count,
-                "workers_offline": offline_count,
-                "slots_available": status.daemon.slots_available,
-                "slots_total": status.daemon.slots_total,
-                "timestamp": chrono::Utc::now().to_rfc3339()
-            });
-            let _ = ctx.json(&queue_data);
-            return Ok(());
-        }
 
         if !watch {
             break;

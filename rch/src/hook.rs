@@ -14,9 +14,9 @@ use crate::transfer::{
 };
 use crate::ui::console::RchConsole;
 use rch_common::{
-    ColorMode, CommandPriority, CompilationKind, HookInput, HookOutput, OutputVisibility,
-    RequiredRuntime, SelectedWorker, SelectionResponse, SelfHealingConfig, ToolchainInfo,
-    TransferConfig, WorkerConfig, WorkerId, classify_command,
+    ColorMode, CommandPriority, CommandTimingBreakdown, CompilationKind, HookInput, HookOutput,
+    OutputVisibility, RequiredRuntime, SelectedWorker, SelectionResponse, SelfHealingConfig,
+    ToolchainInfo, TransferConfig, WorkerConfig, WorkerId, classify_command,
     ui::{
         ArtifactSummary, CelebrationSummary, CompilationProgress, CompletionCelebration, Icons,
         OutputContext, RchTheme, TransferProgress,
@@ -779,6 +779,183 @@ fn has_exact_flag(command: &str) -> bool {
     command.split_whitespace().any(|t| t == "--exact")
 }
 
+// ============================================================================
+// Timing History (bd-2m7j Phase 2)
+// ============================================================================
+
+use serde::Serialize;
+use std::collections::HashMap;
+
+/// Maximum number of timing samples to retain per project+kind.
+const MAX_TIMING_SAMPLES: usize = 20;
+
+/// A single timing record for a completed build.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TimingRecord {
+    /// Timestamp when the build completed (Unix seconds).
+    pub timestamp: u64,
+    /// Duration in milliseconds.
+    pub duration_ms: u64,
+    /// Whether this was a remote build (true) or local (false).
+    pub remote: bool,
+}
+
+/// Timing data for a specific project+kind combination.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct ProjectTimingData {
+    /// Recent local build durations (ring buffer).
+    pub local_samples: Vec<TimingRecord>,
+    /// Recent remote build durations (ring buffer).
+    pub remote_samples: Vec<TimingRecord>,
+}
+
+impl ProjectTimingData {
+    /// Add a timing sample, maintaining ring buffer size.
+    fn add_sample(&mut self, duration_ms: u64, remote: bool) {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        let record = TimingRecord {
+            timestamp,
+            duration_ms,
+            remote,
+        };
+
+        let samples = if remote {
+            &mut self.remote_samples
+        } else {
+            &mut self.local_samples
+        };
+
+        samples.push(record);
+        if samples.len() > MAX_TIMING_SAMPLES {
+            samples.remove(0);
+        }
+    }
+
+    /// Calculate median duration from samples.
+    fn median_duration(&self, remote: bool) -> Option<u64> {
+        let samples = if remote {
+            &self.remote_samples
+        } else {
+            &self.local_samples
+        };
+
+        if samples.is_empty() {
+            return None;
+        }
+
+        let mut durations: Vec<u64> = samples.iter().map(|r| r.duration_ms).collect();
+        durations.sort_unstable();
+        let mid = durations.len() / 2;
+        Some(if durations.len() % 2 == 0 {
+            (durations[mid - 1] + durations[mid]) / 2
+        } else {
+            durations[mid]
+        })
+    }
+
+    /// Calculate speedup ratio (local_time / remote_time).
+    fn speedup_ratio(&self) -> Option<f64> {
+        let local_median = self.median_duration(false)?;
+        let remote_median = self.median_duration(true)?;
+        if remote_median == 0 {
+            return None;
+        }
+        Some(local_median as f64 / remote_median as f64)
+    }
+}
+
+/// Full timing history, keyed by project+kind.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct TimingHistory {
+    /// Map from "project_id:kind" to timing data.
+    #[serde(default)]
+    pub entries: HashMap<String, ProjectTimingData>,
+}
+
+impl TimingHistory {
+    /// Load timing history from disk. Returns empty history on error.
+    fn load() -> Self {
+        let Some(path) = timing_history_path() else {
+            return Self::default();
+        };
+
+        match std::fs::read_to_string(&path) {
+            Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
+            Err(_) => Self::default(),
+        }
+    }
+
+    /// Save timing history to disk. Silently fails on error.
+    fn save(&self) {
+        let Some(path) = timing_history_path() else {
+            return;
+        };
+
+        // Ensure parent directory exists
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        // Write atomically using temp file
+        let temp_path = path.with_extension("tmp");
+        if let Ok(content) = serde_json::to_string_pretty(self) {
+            if std::fs::write(&temp_path, &content).is_ok() {
+                let _ = std::fs::rename(temp_path, path);
+            }
+        }
+    }
+
+    /// Get the key for a project+kind combination.
+    fn key(project: &str, kind: Option<CompilationKind>) -> String {
+        let kind_str = kind
+            .map(|k| format!("{:?}", k))
+            .unwrap_or_else(|| "Unknown".to_string());
+        format!("{}:{}", project, kind_str)
+    }
+
+    /// Get timing data for a project+kind.
+    fn get(&self, project: &str, kind: Option<CompilationKind>) -> Option<&ProjectTimingData> {
+        self.entries.get(&Self::key(project, kind))
+    }
+
+    /// Record a timing sample.
+    fn record(
+        &mut self,
+        project: &str,
+        kind: Option<CompilationKind>,
+        duration_ms: u64,
+        remote: bool,
+    ) {
+        let key = Self::key(project, kind);
+        let data = self.entries.entry(key).or_default();
+        data.add_sample(duration_ms, remote);
+    }
+}
+
+/// Get the path to the timing history file.
+fn timing_history_path() -> Option<PathBuf> {
+    dirs::cache_dir().map(|dir| dir.join("rch").join("timing_history.json"))
+}
+
+/// Record a build timing to the history store.
+///
+/// Called after a build completes to update the timing history.
+/// This is used by `estimate_timing_for_build` for future predictions.
+pub fn record_build_timing(
+    project: &str,
+    kind: Option<CompilationKind>,
+    duration_ms: u64,
+    remote: bool,
+) {
+    let mut history = TimingHistory::load();
+    history.record(project, kind, duration_ms, remote);
+    history.save();
+}
+
 /// Timing estimate for offload gating decisions.
 ///
 /// Used to determine whether a build is worth offloading based on
@@ -797,31 +974,33 @@ struct TimingEstimate {
 /// This function attempts to estimate how long a build would take locally
 /// and what speedup we might achieve by offloading. The estimation uses
 /// this fallback order:
-/// 1. Historical timing data for this project/kind (TODO: implement history)
-/// 2. Worker speed scores (TODO: implement)
-/// 3. Conservative defaults (allow offload)
+/// 1. Historical timing data for this project/kind
+/// 2. Conservative defaults (allow offload)
 ///
 /// When no historical data is available, returns None to trigger fail-open
 /// behavior (allow offload attempt).
-#[allow(unused_variables)] // project, kind used when history is implemented
+#[allow(unused_variables)] // config used for future speedscore integration
 fn estimate_timing_for_build(
     project: &str,
     kind: Option<CompilationKind>,
     config: &rch_common::RchConfig,
 ) -> Option<TimingEstimate> {
-    // TODO: Implement timing history store (bd-2m7j phase 2)
-    // For now, return None to fail-open (allow offload)
-    //
-    // Future implementation will:
-    // 1. Check local timing history for this project+kind
-    // 2. If found, return median local time and predicted speedup
-    // 3. If not found, optionally use worker speed scores
-    // 4. Fall back to None (conservative default)
-    //
-    // The timing history will be stored in XDG_DATA_HOME/rch/timing_history.json
-    // and updated after each build completes.
+    // Load timing history from disk
+    let history = TimingHistory::load();
 
-    None
+    // Look up timing data for this project+kind
+    let data = history.get(project, kind)?;
+
+    // Need at least local samples to estimate
+    let local_median = data.median_duration(false)?;
+
+    // Speedup is optional (requires both local and remote history)
+    let speedup = data.speedup_ratio();
+
+    Some(TimingEstimate {
+        predicted_local_ms: local_median,
+        predicted_speedup: speedup,
+    })
 }
 
 fn estimate_cores_for_command(
@@ -1256,6 +1435,7 @@ async fn handle_selection_response(
         .as_ref()
         .map(|ok| ok.exit_code)
         .unwrap_or(EXIT_BUILD_ERROR);
+    let release_timing = result.as_ref().ok().map(|ok| &ok.timing);
     if let Err(e) = release_worker(
         &config.general.socket_path,
         &worker.id,
@@ -1264,6 +1444,7 @@ async fn handle_selection_response(
         Some(release_exit_code),
         None,
         None,
+        release_timing,
     )
     .await
     {
@@ -1291,6 +1472,9 @@ async fn handle_selection_response(
                 {
                     warn!("Failed to record build: {}", e);
                 }
+
+                // Record timing for future gating decisions
+                record_build_timing(project, classification_kind, result.duration_ms, true);
 
                 if !config.output.first_run_complete {
                     let local_estimate =
@@ -1358,6 +1542,9 @@ async fn handle_selection_response(
                         worker.id, exit_code
                     ));
                 }
+
+                // Still record timing for failed builds (useful for predictions)
+                record_build_timing(project, classification_kind, result.duration_ms, true);
 
                 HookOutput::deny(format!(
                     "RCH: Remote compilation failed with exit code {}",
@@ -1448,6 +1635,12 @@ pub(crate) async fn query_daemon(
         query.push_str(&format!("&hook_pid={}", pid));
     }
 
+    // When all workers are at capacity, queue the build on the daemon instead of
+    // falling back to a local compilation storm. Disable with RCH_QUEUE_WHEN_BUSY=0.
+    if queue_when_busy_enabled() {
+        query.push_str("&wait=1");
+    }
+
     // Send request
     let request = format!("GET /select-worker?{}\n", query);
     writer.write_all(request.as_bytes()).await?;
@@ -1486,6 +1679,7 @@ pub(crate) async fn release_worker(
     exit_code: Option<i32>,
     duration_ms: Option<u64>,
     bytes_transferred: Option<u64>,
+    timing: Option<&CommandTimingBreakdown>,
 ) -> anyhow::Result<()> {
     if !Path::new(socket_path).exists() {
         return Ok(()); // Ignore if daemon gone
@@ -1513,6 +1707,15 @@ pub(crate) async fn release_worker(
         request.push_str(&format!("&bytes_transferred={}", bytes_transferred));
     }
     request.push('\n');
+
+    // Add timing breakdown as JSON body if present
+    if let Some(timing) = timing {
+        if let Ok(json) = serde_json::to_string(timing) {
+            request.push_str(&json);
+            request.push('\n');
+        }
+    }
+
     writer.write_all(request.as_bytes()).await?;
     writer.flush().await?;
 
@@ -1585,6 +1788,14 @@ fn urlencoding_encode(s: &str) -> String {
     result
 }
 
+fn queue_when_busy_enabled() -> bool {
+    let Ok(value) = std::env::var("RCH_QUEUE_WHEN_BUSY") else {
+        return true;
+    };
+    let value = value.trim().to_lowercase();
+    !matches!(value.as_str(), "0" | "false" | "no" | "off")
+}
+
 /// Extract project name from current working directory.
 fn extract_project_name() -> String {
     std::env::current_dir()
@@ -1632,6 +1843,8 @@ struct RemoteExecutionResult {
     stderr: String,
     /// Remote command duration in milliseconds.
     duration_ms: u64,
+    /// Per-phase timing breakdown.
+    timing: CommandTimingBreakdown,
 }
 
 /// Check if the failure is a toolchain-related infrastructure failure.
@@ -2163,10 +2376,21 @@ async fn execute_remote_compilation(
         CompletionCelebration::new(summary).record_and_render(output_ctx);
     }
 
+    // Construct per-phase timing breakdown
+    let timing = CommandTimingBreakdown {
+        sync_up: Some(Duration::from_millis(sync_result.duration_ms)),
+        exec: Some(Duration::from_millis(result.duration_ms)),
+        sync_down: artifacts_result
+            .as_ref()
+            .map(|ar| Duration::from_millis(ar.duration_ms)),
+        ..Default::default()
+    };
+
     Ok(RemoteExecutionResult {
         exit_code: result.exit_code,
         stderr: stderr_capture,
         duration_ms: result.duration_ms,
+        timing,
     })
 }
 
