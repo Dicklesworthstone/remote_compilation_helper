@@ -304,6 +304,10 @@ to clean up. Use --force to immediately terminate with SIGKILL."#)]
         /// Skip confirmation prompt for --all
         #[arg(long, short = 'y')]
         yes: bool,
+
+        /// Preview what would be cancelled without actually cancelling
+        #[arg(long, short = 'n')]
+        dry_run: bool,
     },
 
     /// View and manage RCH configuration
@@ -1318,7 +1322,8 @@ async fn main() -> Result<()> {
                 all,
                 force,
                 yes,
-            } => commands::cancel_build(build_id, all, force, yes, &ctx).await,
+                dry_run,
+            } => commands::cancel_build(build_id, all, force, yes, dry_run, &ctx).await,
             Commands::Config { action } => handle_config(action, &ctx).await,
             Commands::Diagnose { command, dry_run } => {
                 handle_diagnose(command, dry_run, &ctx).await
