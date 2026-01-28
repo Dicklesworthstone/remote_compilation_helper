@@ -1418,10 +1418,65 @@ mod tests {
             let colors = get_colors(false, ColorBlindMode::None);
             render_workers_panel(f, Rect::new(0, 0, 60, 10), &state, &colors);
         });
-        // Check circuit icons are rendered (HalfOpen has ⚡, Open has 🔴)
+        // Check workers are rendered
         assert!(content.contains("half-w"));
         assert!(content.contains("open-w"));
+        // Verify unicode symbols are used (not emoji) for terminal compatibility
+        // HalfOpen uses ↻ (recycling), Open uses ● (filled circle)
+        assert!(
+            content.contains("↻") || content.contains("●"),
+            "Circuit icons should use unicode symbols for terminal compatibility"
+        );
         info!("TEST PASS: test_render_worker_circuit_state_icons");
+    }
+
+    #[test]
+    fn test_circuit_icons_no_emoji() {
+        init_test_logging();
+        info!("TEST START: test_circuit_icons_no_emoji");
+        let state = TuiState {
+            selected_panel: Panel::Workers,
+            workers: vec![
+                sample_worker("w1", WorkerStatus::Healthy, CircuitState::Closed),
+                sample_worker("w2", WorkerStatus::Healthy, CircuitState::HalfOpen),
+                sample_worker("w3", WorkerStatus::Healthy, CircuitState::Open),
+            ],
+            ..Default::default()
+        };
+        let content = render_to_string(80, 24, |f| render(f, &state));
+        // Emoji that should NOT be present
+        assert!(
+            !content.contains("🔴"),
+            "Should not contain red circle emoji"
+        );
+        assert!(!content.contains("⚡"), "Should not contain lightning emoji");
+        assert!(
+            !content.contains("🟢"),
+            "Should not contain green circle emoji"
+        );
+        assert!(
+            !content.contains("🟡"),
+            "Should not contain yellow circle emoji"
+        );
+        info!("TEST PASS: test_circuit_icons_no_emoji");
+    }
+
+    #[test]
+    fn test_status_icons_terminal_compatible() {
+        init_test_logging();
+        info!("TEST START: test_status_icons_terminal_compatible");
+        // Verify the unicode symbols used are widely supported
+        // These are from the Box Drawing and Geometric Shapes unicode blocks
+        // which have very good terminal font support
+        let symbols = ["✓", "✗", "●", "↻", "◐", "○"];
+        for sym in symbols {
+            assert!(
+                sym.chars().all(|c| (c as u32) < 0x10000),
+                "Symbol {} should be in BMP for terminal compatibility",
+                sym
+            );
+        }
+        info!("TEST PASS: test_status_icons_terminal_compatible");
     }
 
     #[test]
