@@ -228,14 +228,13 @@ For more control, use the individual commands:
 WORKER STATES:
     HEALTHY    Normal operation - accepting and running jobs
     DRAINING   Not accepting new jobs, finishing current ones
+    DRAINED    Idle after drain completes (no active jobs)
     DISABLED   Completely offline, skipped by job assignment
 
 STATE TRANSITIONS:
-    [HEALTHY] --drain--> [DRAINING] ---(jobs finish)---> [DRAINED]
-                                                              |
-                         <--enable-- [DRAINED]                |
-                                        |                     |
-                         <--enable-- [DISABLED] <--disable----
+    drain:   HEALTHY -> DRAINING -> DRAINED (automatic when jobs finish)
+    disable: DRAINED -> DISABLED (or use --drain flag from any state)
+    enable:  DRAINING/DRAINED/DISABLED -> HEALTHY
 
 Use 'drain' to gracefully stop a worker before maintenance.
 Use 'enable' to bring a drained/disabled worker back online.
