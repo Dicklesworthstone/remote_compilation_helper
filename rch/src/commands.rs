@@ -7760,7 +7760,67 @@ pub async fn status_overview(workers: bool, jobs: bool, ctx: &OutputContext) -> 
         return Ok(());
     }
 
-    crate::status_display::render_full_status(&status, workers, jobs, ctx.style());
+    // In verbose mode, always show all sections (workers and jobs)
+    let show_workers = workers || ctx.is_verbose();
+    let show_jobs = jobs || ctx.is_verbose();
+
+    crate::status_display::render_full_status(&status, show_workers, show_jobs, ctx.style());
+
+    // Verbose mode: show additional details not in standard display
+    if ctx.is_verbose() {
+        let style = ctx.theme();
+        println!();
+        println!("{}", style.format_header("Verbose Details"));
+        println!();
+
+        // Config source info
+        println!(
+            "  {} {} {}",
+            style.key("Socket"),
+            style.muted(":"),
+            style.value(&status.daemon.socket_path)
+        );
+        println!(
+            "  {} {} {}",
+            style.key("Started"),
+            style.muted(":"),
+            style.value(&status.daemon.started_at)
+        );
+
+        // Show alerts if any
+        if !status.alerts.is_empty() {
+            println!();
+            println!("  {}", style.key("Active Alerts:"));
+            for alert in &status.alerts {
+                let severity_style = match alert.severity.as_str() {
+                    "critical" | "error" => style.error(&alert.severity),
+                    "warning" => style.warning(&alert.severity),
+                    _ => style.info(&alert.severity),
+                };
+                println!(
+                    "    {} [{}] {}",
+                    severity_style,
+                    style.muted(&alert.created_at),
+                    style.value(&alert.message)
+                );
+            }
+        }
+
+        // Show issues if any
+        if !status.issues.is_empty() {
+            println!();
+            println!("  {}", style.key("Known Issues:"));
+            for issue in &status.issues {
+                println!(
+                    "    {} {} - {}",
+                    style.warning("⚠"),
+                    style.key(&issue.summary),
+                    style.muted(issue.remediation.as_deref().unwrap_or(""))
+                );
+            }
+        }
+    }
+
     Ok(())
 }
 
