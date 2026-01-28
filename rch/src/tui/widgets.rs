@@ -553,7 +553,7 @@ fn render_help_overlay(frame: &mut Frame, colors: &ColorScheme) {
     let area = frame.area();
     // Center the help box
     let width = 60.min(area.width.saturating_sub(4));
-    let height = 18.min(area.height.saturating_sub(4));
+    let height = 20.min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(width)) / 2;
     let y = (area.height.saturating_sub(height)) / 2;
     let help_area = Rect::new(x, y, width, height);
@@ -585,6 +585,8 @@ fn render_help_overlay(frame: &mut Frame, colors: &ColorScheme) {
         Line::from("  r           Refresh data from daemon"),
         Line::from("  /           Filter build history"),
         Line::from("  y           Copy selected item"),
+        Line::from("  d           Drain selected worker"),
+        Line::from("  e           Enable selected worker"),
         Line::from(""),
         Line::from(vec![Span::styled(
             "General",
