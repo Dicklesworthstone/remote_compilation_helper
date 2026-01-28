@@ -846,6 +846,17 @@ pub async fn workers_list(show_speedscore: bool, ctx: &OutputContext) -> Result<
         None
     };
 
+    // In verbose mode, fetch live daemon status for circuit breaker state, slot usage, etc.
+    let daemon_status = if ctx.is_verbose() {
+        match send_daemon_command("GET /status\n").await {
+            Ok(response) => extract_json_body(&response)
+                .and_then(|json| serde_json::from_str::<DaemonFullStatusResponse>(json).ok()),
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+
     // JSON output mode
     if ctx.is_json() {
         let mut worker_infos: Vec<WorkerInfo> = workers.iter().map(WorkerInfo::from).collect();
@@ -939,6 +950,105 @@ pub async fn workers_list(show_speedscore: bool, ctx: &OutputContext) -> Result<
                 style.muted(&worker.tags.join(", "))
             );
         }
+
+        // Verbose mode: show live daemon status (circuit breaker, slot usage, etc.)
+        if ctx.is_verbose() {
+            if let Some(ref status) = daemon_status {
+                if let Some(worker_status) =
+                    status.workers.iter().find(|w| w.id == worker.id.as_str())
+                {
+                    // Circuit breaker state
+                    let circuit_display = match worker_status.circuit_state.as_str() {
+                        "closed" => style.success("Closed"),
+                        "half_open" => style.warning("HalfOpen"),
+                        "open" => style.error("Open"),
+                        other => style.muted(other),
+                    };
+                    println!(
+                        "    {} {} {}",
+                        style.key("Circuit"),
+                        style.muted(":"),
+                        circuit_display
+                    );
+
+                    // Slot usage
+                    let slots_display = if worker_status.used_slots > 0 {
+                        style.warning(&format!(
+                            "{}/{}",
+                            worker_status.used_slots, worker_status.total_slots
+                        ))
+                    } else {
+                        style.success(&format!(
+                            "{}/{}",
+                            worker_status.used_slots, worker_status.total_slots
+                        ))
+                    };
+                    println!(
+                        "    {} {} {}",
+                        style.key("In Use"),
+                        style.muted(":"),
+                        slots_display
+                    );
+
+                    // Status
+                    let status_display = match worker_status.status.as_str() {
+                        "healthy" => style.success("Healthy"),
+                        "degraded" => style.warning("Degraded"),
+                        "unreachable" => style.error("Unreachable"),
+                        "draining" => style.warning("Draining"),
+                        "disabled" => style.muted("Disabled"),
+                        other => style.muted(other),
+                    };
+                    println!(
+                        "    {} {} {}",
+                        style.key("Status"),
+                        style.muted(":"),
+                        status_display
+                    );
+
+                    // Show last error if any
+                    if let Some(ref last_error) = worker_status.last_error {
+                        println!(
+                            "    {} {} {}",
+                            style.key("LastErr"),
+                            style.muted(":"),
+                            style.error(last_error)
+                        );
+                    }
+
+                    // Show recovery time if circuit is open
+                    if let Some(recovery_secs) = worker_status.recovery_in_secs {
+                        println!(
+                            "    {} {} {}s",
+                            style.key("Recover"),
+                            style.muted(":"),
+                            style.info(&recovery_secs.to_string())
+                        );
+                    }
+                } else {
+                    println!(
+                        "    {} {}",
+                        style.muted("Live status:"),
+                        style.muted("(not in daemon)")
+                    );
+                }
+            } else {
+                println!(
+                    "    {} {}",
+                    style.muted("Live status:"),
+                    style.muted("(daemon not running)")
+                );
+            }
+
+            // Also show SSH key path in verbose mode
+            println!(
+                "    {} {} {}",
+                style.key("SSH Key"),
+                style.muted(":"),
+                style.muted(&worker.identity_file)
+            );
+        }
+
         println!();
     }
 
@@ -1495,7 +1605,10 @@ pub async fn workers_benchmark(ctx: &OutputContext) -> Result<()> {
                             error: Some(report.clone()),
                         });
                         if let Some(ref pb) = spinner {
-                            pb.finish_with_message(format!("✗ {}", report.lines().next().unwrap_or("Error")));
+                            pb.finish_with_message(format!(
+                                "✗ {}",
+                                report.lines().next().unwrap_or("Error")
+                            ));
                         }
                     }
                 }
@@ -1512,7 +1625,10 @@ pub async fn workers_benchmark(ctx: &OutputContext) -> Result<()> {
                     error: Some(report.clone()),
                 });
                 if let Some(ref pb) = spinner {
-                    pb.finish_with_message(format!("✗ Connection failed: {}", report.lines().next().unwrap_or("Error")));
+                    pb.finish_with_message(format!(
+                        "✗ Connection failed: {}",
+                        report.lines().next().unwrap_or("Error")
+                    ));
                 }
             }
         }
@@ -7530,7 +7646,10 @@ async fn self_test_run(
         } else {
             worker_ids.join(", ")
         };
-        Some(Spinner::new(ctx, &format!("Running self-test on {}...", target_desc)))
+        Some(Spinner::new(
+            ctx,
+            &format!("Running self-test on {}...", target_desc),
+        ))
     } else {
         None
     };
@@ -7757,6 +7876,20 @@ pub async fn queue_status(watch: bool, ctx: &OutputContext) -> Result<()> {
                     style.muted("project:"),
                     style.value(&project_display)
                 );
+
+                // Verbose mode: show full command and started_at timestamp
+                if ctx.is_verbose() {
+                    println!(
+                        "      {} {}",
+                        style.muted("command:"),
+                        style.value(&build.command)
+                    );
+                    println!(
+                        "      {} {}",
+                        style.muted("started:"),
+                        style.value(&build.started_at)
+                    );
+                }
             }
         }
         println!();
@@ -7807,6 +7940,22 @@ pub async fn queue_status(watch: bool, ctx: &OutputContext) -> Result<()> {
                     style.muted("position:"),
                     style.value(&build.position.to_string())
                 );
+
+                // Verbose mode: show full command, slots needed, queued timestamp
+                if ctx.is_verbose() {
+                    println!(
+                        "      {} {}",
+                        style.muted("command:"),
+                        style.value(&build.command)
+                    );
+                    println!(
+                        "      {} {}  {} {}",
+                        style.muted("slots:"),
+                        style.value(&build.slots_needed.to_string()),
+                        style.muted("queued:"),
+                        style.value(&build.queued_at)
+                    );
+                }
             }
             println!();
         }
@@ -7843,6 +7992,36 @@ pub async fn queue_status(watch: bool, ctx: &OutputContext) -> Result<()> {
             offline_count
         );
         println!();
+
+        // Verbose mode: show each worker's status individually
+        if ctx.is_verbose() {
+            for worker in &status.workers {
+                let status_indicator = match worker.status.as_str() {
+                    "healthy" => style.success("●"),
+                    "degraded" => style.warning("●"),
+                    "draining" => style.warning("◐"),
+                    "unreachable" => style.error("○"),
+                    "disabled" => style.muted("○"),
+                    _ => style.muted("?"),
+                };
+                let slots_display = format!("{}/{}", worker.used_slots, worker.total_slots);
+                let circuit_display = match worker.circuit_state.as_str() {
+                    "closed" => style.success("ok"),
+                    "half_open" => style.warning("half"),
+                    "open" => style.error("open"),
+                    _ => style.muted(&worker.circuit_state),
+                };
+                println!(
+                    "    {} {} {} {} {}",
+                    status_indicator,
+                    style.key(&worker.id),
+                    style.muted(&format!("[{}]", slots_display)),
+                    style.muted("circuit:"),
+                    circuit_display
+                );
+            }
+            println!();
+        }
 
         // Slot summary
         println!(
