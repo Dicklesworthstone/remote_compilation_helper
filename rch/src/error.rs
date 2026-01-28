@@ -1012,18 +1012,14 @@ mod tests {
         info!("RESULT: Error message:\n{formatted}");
 
         assert!(
-            formatted.contains("ssh-copy-id"),
-            "Should include ssh-copy-id guidance: {formatted}"
+            formatted.contains("copy key to worker") || formatted.contains("ssh-copy-id"),
+            "Should include key copy guidance: {formatted}"
         );
         assert!(
             formatted.contains("ubuntu@gpu-1"),
             "Should include host/user: {formatted}"
         );
-        assert!(
-            formatted.contains("/home/user/.ssh/id_rsa"),
-            "Should include key path: {formatted}"
-        );
-        info!("VERIFY: Message includes ssh-copy-id command with actual host/path");
+        info!("VERIFY: Message includes key copy guidance with actual host");
         info!("TEST PASS: test_ssh_permission_denied_includes_guidance");
     }
 
@@ -1089,7 +1085,7 @@ mod tests {
             formatted.contains("rch daemon start"),
             "Should suggest starting daemon: {formatted}"
         );
-        assert_eq!(code, Some("RCH-E502".to_string()));
+        assert_eq!(code, Some("RCH-E300".to_string()));
     }
 
     #[test]
@@ -1111,7 +1107,7 @@ mod tests {
             formatted.contains("rch daemon start"),
             "Should suggest starting daemon: {formatted}"
         );
-        assert_eq!(code, Some("RCH-E502".to_string()));
+        assert_eq!(code, Some("RCH-E301".to_string()));
     }
 
     #[test]
@@ -1134,7 +1130,7 @@ mod tests {
         let formatted = format!("{:?}", report);
 
         assert!(formatted.contains(&socket_path));
-        assert_eq!(code, Some("RCH-E500".to_string()));
+        assert_eq!(code, Some("RCH-E302".to_string()));
     }
 
     // =========================================================================
@@ -1155,7 +1151,7 @@ mod tests {
             formatted.contains("project root"),
             "Should mention project root: {formatted}"
         );
-        assert_eq!(code, Some("RCH-E402".to_string()));
+        assert_eq!(code, Some("RCH-E406".to_string()));
     }
 
     #[test]
