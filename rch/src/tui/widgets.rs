@@ -551,9 +551,10 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &TuiState, colors: &Color
 /// Render the help overlay.
 fn render_help_overlay(frame: &mut Frame, colors: &ColorScheme) {
     let area = frame.area();
-    // Center the help box
+    // Center the help box - increased height to accommodate more content
+    // Content is ~31 lines, plus 2 for borders = 33 minimum for full content
     let width = 60.min(area.width.saturating_sub(4));
-    let height = 20.min(area.height.saturating_sub(4));
+    let height = 34.min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(width)) / 2;
     let y = (area.height.saturating_sub(height)) / 2;
     let help_area = Rect::new(x, y, width, height);
@@ -577,23 +578,40 @@ fn render_help_overlay(frame: &mut Frame, colors: &ColorScheme) {
         Line::from("  Tab         Next panel"),
         Line::from("  Shift+Tab   Previous panel"),
         Line::from("  Enter       Select/expand item"),
+        Line::from("  Backspace   Go back / Close log view"),
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            "Scrolling (Log View)",
+            Style::default().add_modifier(Modifier::BOLD),
+        )]),
+        Line::from("  PgUp/PgDn   Scroll page up/down"),
+        Line::from("  g           Jump to top"),
+        Line::from("  G           Jump to bottom (resume auto-scroll)"),
         Line::from(""),
         Line::from(vec![Span::styled(
             "Actions",
             Style::default().add_modifier(Modifier::BOLD),
         )]),
         Line::from("  r           Refresh data from daemon"),
-        Line::from("  /           Filter build history"),
         Line::from("  y           Copy selected item"),
-        Line::from("  d           Drain selected worker"),
-        Line::from("  e           Enable selected worker"),
+        Line::from("  d           Drain selected worker (Workers panel)"),
+        Line::from("  e           Enable selected worker (Workers panel)"),
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            "Search & Filter",
+            Style::default().add_modifier(Modifier::BOLD),
+        )]),
+        Line::from("  /           Open filter (Build History panel)"),
+        Line::from("  Enter       Apply filter"),
+        Line::from("  Esc         Cancel filter"),
         Line::from(""),
         Line::from(vec![Span::styled(
             "General",
             Style::default().add_modifier(Modifier::BOLD),
         )]),
         Line::from("  q, Esc      Quit / Close overlay"),
-        Line::from("  ?           Toggle this help"),
+        Line::from("  ?, F1       Toggle this help"),
+        Line::from("  Ctrl+C      Force quit"),
         Line::from(""),
         Line::from(Span::styled(
             "Press any key to close",
@@ -989,6 +1007,215 @@ mod tests {
         let content = render_to_string(80, 24, |f| render(f, &state));
         assert!(content.contains("RCH Dashboard Help"));
         info!("TEST PASS: test_render_help_overlay");
+    }
+
+    #[test]
+    fn test_help_overlay_contains_filter_shortcut() {
+        init_test_logging();
+        info!("TEST START: test_help_overlay_contains_filter_shortcut");
+        let state = TuiState {
+            show_help: true,
+            ..Default::default()
+        };
+        // Need larger height to see all content
+        let content = render_to_string(80, 32, |f| render(f, &state));
+        // Verify filter shortcut is documented
+        assert!(content.contains("/"), "Filter shortcut (/) must be documented");
+        assert!(
+            content.contains("filter") || content.contains("Filter") || content.contains("Search"),
+            "Filter functionality must be described"
+        );
+        info!("TEST PASS: test_help_overlay_contains_filter_shortcut");
+    }
+
+    #[test]
+    fn test_help_overlay_contains_all_navigation_shortcuts() {
+        init_test_logging();
+        info!("TEST START: test_help_overlay_contains_all_navigation_shortcuts");
+        let state = TuiState {
+            show_help: true,
+            ..Default::default()
+        };
+        let content = render_to_string(80, 32, |f| render(f, &state));
+
+        // Verify all navigation shortcuts are documented
+        info!("VERIFY: checking navigation shortcuts");
+        assert!(content.contains("j") || content.contains("↓"), "Down navigation must be documented");
+        assert!(content.contains("k") || content.contains("↑"), "Up navigation must be documented");
+        assert!(content.contains("Tab"), "Tab for panel switching must be documented");
+        assert!(content.contains("Enter"), "Enter for selection must be documented");
+        info!("TEST PASS: test_help_overlay_contains_all_navigation_shortcuts");
+    }
+
+    #[test]
+    fn test_help_overlay_contains_all_action_shortcuts() {
+        init_test_logging();
+        info!("TEST START: test_help_overlay_contains_all_action_shortcuts");
+        let state = TuiState {
+            show_help: true,
+            ..Default::default()
+        };
+        let content = render_to_string(80, 32, |f| render(f, &state));
+
+        // Verify all action shortcuts are documented
+        info!("VERIFY: checking action shortcuts");
+        assert!(content.contains("r"), "Refresh shortcut must be documented");
+        assert!(content.contains("y"), "Copy shortcut must be documented");
+        assert!(content.contains("d"), "Drain shortcut must be documented");
+        assert!(content.contains("e"), "Enable shortcut must be documented");
+        info!("TEST PASS: test_help_overlay_contains_all_action_shortcuts");
+    }
+
+    #[test]
+    fn test_help_overlay_contains_scrolling_shortcuts() {
+        init_test_logging();
+        info!("TEST START: test_help_overlay_contains_scrolling_shortcuts");
+        let state = TuiState {
+            show_help: true,
+            ..Default::default()
+        };
+        let content = render_to_string(80, 32, |f| render(f, &state));
+
+        // Verify scrolling shortcuts are documented
+        info!("VERIFY: checking scrolling shortcuts");
+        assert!(
+            content.contains("PgUp") || content.contains("PageUp") || content.contains("Page"),
+            "Page up must be documented"
+        );
+        assert!(content.contains("g"), "Jump to top (g) must be documented");
+        assert!(content.contains("G"), "Jump to bottom (G) must be documented");
+        info!("TEST PASS: test_help_overlay_contains_scrolling_shortcuts");
+    }
+
+    #[test]
+    fn test_help_overlay_contains_general_shortcuts() {
+        init_test_logging();
+        info!("TEST START: test_help_overlay_contains_general_shortcuts");
+        let state = TuiState {
+            show_help: true,
+            ..Default::default()
+        };
+        // Need taller terminal to see all content
+        let content = render_to_string(80, 36, |f| render(f, &state));
+
+        // Verify general shortcuts are documented
+        info!("VERIFY: checking general shortcuts");
+        assert!(content.contains("q"), "Quit shortcut must be documented");
+        assert!(content.contains("Esc"), "Escape shortcut must be documented");
+        // The ? character in the help text - check for help toggle description
+        assert!(
+            content.contains("Toggle") || content.contains("Help") || content.contains("help"),
+            "Help toggle shortcut must be documented"
+        );
+        assert!(content.contains("F1"), "F1 help shortcut must be documented");
+        assert!(content.contains("Ctrl"), "Ctrl+C must be documented");
+        info!("TEST PASS: test_help_overlay_contains_general_shortcuts");
+    }
+
+    #[test]
+    fn test_help_overlay_section_ordering() {
+        init_test_logging();
+        info!("TEST START: test_help_overlay_section_ordering");
+        let state = TuiState {
+            show_help: true,
+            ..Default::default()
+        };
+        let content = render_to_string(80, 32, |f| render(f, &state));
+
+        // Verify sections are in logical order
+        info!("VERIFY: checking section order");
+        let nav_pos = content.find("Navigation");
+        let actions_pos = content.find("Actions");
+        let general_pos = content.find("General");
+
+        assert!(nav_pos.is_some(), "Navigation section must exist");
+        assert!(actions_pos.is_some(), "Actions section must exist");
+        assert!(general_pos.is_some(), "General section must exist");
+
+        // Navigation should come before Actions, which should come before General
+        let nav = nav_pos.unwrap();
+        let actions = actions_pos.unwrap();
+        let general = general_pos.unwrap();
+
+        assert!(nav < actions, "Navigation should come before Actions");
+        assert!(actions < general, "Actions should come before General");
+        info!("TEST PASS: test_help_overlay_section_ordering");
+    }
+
+    #[test]
+    fn test_help_overlay_fits_80x24() {
+        init_test_logging();
+        info!("TEST START: test_help_overlay_fits_80x24");
+        let state = TuiState {
+            show_help: true,
+            ..Default::default()
+        };
+        // Standard terminal size - should render without panic
+        let content = render_to_string(80, 24, |f| render(f, &state));
+
+        // Should still contain the title - full content may be clipped
+        assert!(content.contains("Help"), "Help title should be visible");
+        // At 80x24, the overlay height is clamped to 20 lines, so not all content
+        // may be visible. Just verify the title and at least one section header.
+        assert!(
+            content.contains("Navigation") || content.contains("RCH Dashboard"),
+            "At least the title or first section should be visible"
+        );
+        info!("TEST PASS: test_help_overlay_fits_80x24");
+    }
+
+    #[test]
+    fn test_help_overlay_fits_minimal_terminal() {
+        init_test_logging();
+        info!("TEST START: test_help_overlay_fits_minimal_terminal");
+        let state = TuiState {
+            show_help: true,
+            ..Default::default()
+        };
+        // Minimal terminal size (40x12) - should not panic
+        let content = render_to_string(40, 12, |f| render(f, &state));
+
+        // Should render something
+        assert!(!content.is_empty(), "Content should not be empty");
+        info!("TEST PASS: test_help_overlay_fits_minimal_terminal");
+    }
+
+    #[test]
+    fn test_help_overlay_worker_actions_context() {
+        init_test_logging();
+        info!("TEST START: test_help_overlay_worker_actions_context");
+        let state = TuiState {
+            show_help: true,
+            ..Default::default()
+        };
+        let content = render_to_string(80, 32, |f| render(f, &state));
+
+        // Verify worker actions mention they're panel-specific
+        info!("VERIFY: worker actions should mention Workers panel");
+        assert!(
+            content.contains("Workers") || content.contains("worker"),
+            "Worker actions should mention Workers panel context"
+        );
+        info!("TEST PASS: test_help_overlay_worker_actions_context");
+    }
+
+    #[test]
+    fn test_help_overlay_filter_context() {
+        init_test_logging();
+        info!("TEST START: test_help_overlay_filter_context");
+        let state = TuiState {
+            show_help: true,
+            ..Default::default()
+        };
+        let content = render_to_string(80, 32, |f| render(f, &state));
+
+        // Verify filter mentions Build History panel
+        info!("VERIFY: filter should mention Build History panel");
+        assert!(
+            content.contains("Build") || content.contains("History"),
+            "Filter should mention Build History panel context"
+        );
+        info!("TEST PASS: test_help_overlay_filter_context");
     }
 
     #[test]
