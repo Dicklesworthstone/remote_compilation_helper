@@ -3,6 +3,7 @@
 //! Custom widgets for workers, builds, and status display.
 
 use crate::tui::state::{BuildStatus, CircuitState, ColorBlindMode, Panel, TuiState, WorkerStatus};
+use crate::ui::theme::{StatusIndicator, Symbols};
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -10,6 +11,21 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
 };
+
+/// Standard unicode symbols shared with the CLI for consistent display.
+const SYMBOLS: Symbols = Symbols::UNICODE;
+
+/// Get the ratatui color for a StatusIndicator from the TUI color scheme.
+fn indicator_color(indicator: StatusIndicator, colors: &ColorScheme) -> Color {
+    match indicator {
+        StatusIndicator::Success => colors.success,
+        StatusIndicator::Error => colors.error,
+        StatusIndicator::Warning => colors.warning,
+        StatusIndicator::Info => colors.info,
+        StatusIndicator::Pending | StatusIndicator::Disabled => colors.muted,
+        StatusIndicator::InProgress => colors.info,
+    }
+}
 
 /// Get color scheme based on high contrast mode.
 fn get_colors(high_contrast: bool, color_blind: ColorBlindMode) -> ColorScheme {
@@ -152,19 +168,25 @@ fn render_filter_input(frame: &mut Frame, state: &TuiState, colors: &ColorScheme
 
 /// Render the header with daemon status.
 fn render_header(frame: &mut Frame, area: Rect, state: &TuiState, colors: &ColorScheme) {
-    let status_text = match state.daemon.status {
-        crate::tui::state::Status::Running => "● Running",
-        crate::tui::state::Status::Stopped => "○ Stopped",
-        crate::tui::state::Status::Error => "✗ Error",
-        crate::tui::state::Status::Unknown => "? Unknown",
+    let (status_sym, status_indicator) = match state.daemon.status {
+        crate::tui::state::Status::Running => (SYMBOLS.bullet_filled, StatusIndicator::Success),
+        crate::tui::state::Status::Stopped => (SYMBOLS.bullet_empty, StatusIndicator::Pending),
+        crate::tui::state::Status::Error => (SYMBOLS.failure, StatusIndicator::Error),
+        crate::tui::state::Status::Unknown => (SYMBOLS.bullet_empty, StatusIndicator::Pending),
     };
-
-    let status_style = match state.daemon.status {
-        crate::tui::state::Status::Running => Style::default().fg(colors.success),
-        crate::tui::state::Status::Stopped => Style::default().fg(colors.warning),
-        crate::tui::state::Status::Error => Style::default().fg(colors.error),
-        crate::tui::state::Status::Unknown => Style::default().fg(colors.muted),
+    let status_label = match state.daemon.status {
+        crate::tui::state::Status::Running => "Running",
+        crate::tui::state::Status::Stopped => "Stopped",
+        crate::tui::state::Status::Error => "Error",
+        crate::tui::state::Status::Unknown => "Unknown",
     };
+    let status_text = format!("{} {}", status_sym, status_label);
+    let status_color = match state.daemon.status {
+        // Stopped uses warning (yellow) to signal attention, not semantic "pending" color
+        crate::tui::state::Status::Stopped => colors.warning,
+        _ => indicator_color(status_indicator, colors),
+    };
+    let status_style = Style::default().fg(status_color);
 
     let header = Paragraph::new(Line::from(vec![
         Span::styled(
@@ -234,17 +256,23 @@ fn render_workers_panel(frame: &mut Frame, area: Rect, state: &TuiState, colors:
         .iter()
         .enumerate()
         .map(|(i, w)| {
-            let status_icon = match w.status {
-                WorkerStatus::Healthy => "●",
-                WorkerStatus::Degraded => "◐",
-                WorkerStatus::Unreachable => "○",
-                WorkerStatus::Draining => "◑",
-            };
-            let status_color = match w.status {
-                WorkerStatus::Healthy => colors.success,
-                WorkerStatus::Degraded => colors.warning,
-                WorkerStatus::Unreachable => colors.error,
-                WorkerStatus::Draining => colors.info,
+            let (status_icon, status_color) = match w.status {
+                WorkerStatus::Healthy => (
+                    SYMBOLS.bullet_filled,
+                    indicator_color(StatusIndicator::Success, colors),
+                ),
+                WorkerStatus::Degraded => (
+                    SYMBOLS.bullet_half,
+                    indicator_color(StatusIndicator::Warning, colors),
+                ),
+                WorkerStatus::Unreachable => (
+                    SYMBOLS.bullet_empty,
+                    indicator_color(StatusIndicator::Error, colors),
+                ),
+                WorkerStatus::Draining => (
+                    SYMBOLS.bullet_half,
+                    indicator_color(StatusIndicator::Info, colors),
+                ),
             };
             // Use unicode symbols instead of emoji for terminal compatibility
             let circuit_icon = match w.circuit {
@@ -304,14 +332,15 @@ fn render_active_builds_panel(
         .iter()
         .enumerate()
         .map(|(i, b)| {
-            // Use unicode symbols instead of emoji for terminal compatibility
+            // Use centralized symbols: StatusIndicator for success/error,
+            // build-phase-specific symbols for intermediate states.
             let status_icon = match b.status {
-                BuildStatus::Pending => "◷",
+                BuildStatus::Pending => SYMBOLS.bullet_empty,
                 BuildStatus::Syncing => "↑",
-                BuildStatus::Compiling => "⚙",
+                BuildStatus::Compiling => SYMBOLS.bullet_half,
                 BuildStatus::Downloading => "↓",
-                BuildStatus::Completed => "✓",
-                BuildStatus::Failed => "✗",
+                BuildStatus::Completed => StatusIndicator::Success.symbol(&SYMBOLS),
+                BuildStatus::Failed => StatusIndicator::Error.symbol(&SYMBOLS),
             };
 
             let progress = b
@@ -385,12 +414,12 @@ fn render_build_history_panel(
         .iter()
         .enumerate()
         .map(|(i, b)| {
-            let status_icon = if b.success { "✓" } else { "✗" };
-            let status_color = if b.success {
-                colors.success
+            let (build_indicator, status_icon) = if b.success {
+                (StatusIndicator::Success, StatusIndicator::Success.symbol(&SYMBOLS))
             } else {
-                colors.error
+                (StatusIndicator::Error, StatusIndicator::Error.symbol(&SYMBOLS))
             };
+            let status_color = indicator_color(build_indicator, colors);
 
             let style = if is_selected && i == state.selected_index {
                 Style::default()
