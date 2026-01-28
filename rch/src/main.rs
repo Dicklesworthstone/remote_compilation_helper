@@ -753,7 +753,7 @@ enum WorkersAction {
         /// Worker ID to probe, or --all for all workers
         worker: Option<String>,
         /// Probe all workers
-        #[arg(long)]
+        #[arg(short = 'a', long)]
         all: bool,
     },
     /// Run speed benchmarks
