@@ -5,6 +5,7 @@ use crate::fleet::preflight::Severity;
 use crate::ui::context::OutputContext;
 use crate::ui::theme::StatusIndicator;
 use anyhow::Result;
+use rch_common::api::ApiResponse;
 use serde::Serialize;
 
 #[derive(Debug, Clone, Serialize)]
@@ -147,10 +148,10 @@ fn estimate_total_duration(predictions: &[WorkerPrediction], strategy: &Deployme
     }
 }
 
-pub fn display_dry_run(result: &DryRunResult, ctx: &OutputContext) -> Result<()> {
+pub fn display_dry_run(result: &DryRunResult, ctx: &OutputContext, command: &str) -> Result<()> {
     let style = ctx.theme();
     if ctx.is_json() {
-        let _ = ctx.json(&serde_json::json!({"dry_run": true, "result": result}));
+        let _ = ctx.json(&ApiResponse::ok(command, result));
         return Ok(());
     }
 

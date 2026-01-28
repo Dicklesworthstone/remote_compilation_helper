@@ -741,7 +741,7 @@ fn test_config_dir_override() -> Option<PathBuf> {
 }
 
 #[cfg(test)]
-fn set_test_config_dir_override(path: Option<PathBuf>) {
+pub(crate) fn set_test_config_dir_override(path: Option<PathBuf>) {
     TEST_CONFIG_DIR_OVERRIDE.with(|override_path| *override_path.borrow_mut() = path);
 }
 

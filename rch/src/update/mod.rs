@@ -195,6 +195,7 @@ async fn update_fleet(ctx: &OutputContext, _info: &UpdateCheck, dry_run: bool) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::set_test_config_dir_override;
     use crate::ui::{OutputConfig, OutputMode};
     use types::Version;
 
@@ -340,21 +341,39 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_fleet_dry_run() {
+        // Set up a temp config directory for the test
+        let temp_dir = std::env::temp_dir().join("rch_test_update_fleet_dry_run");
+        let _ = std::fs::create_dir_all(&temp_dir);
+        set_test_config_dir_override(Some(temp_dir.clone()));
+
         let ctx = create_test_output_context(false);
         let info = create_test_update_check(true);
 
-        // Dry run should succeed
+        // Dry run should succeed (workers will be empty but that returns Ok)
         let result = update_fleet(&ctx, &info, true).await;
         assert!(result.is_ok());
+
+        // Clean up
+        set_test_config_dir_override(None);
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     #[tokio::test]
     async fn test_update_fleet_json_mode() {
+        // Set up a temp config directory for the test
+        let temp_dir = std::env::temp_dir().join("rch_test_update_fleet_json_mode");
+        let _ = std::fs::create_dir_all(&temp_dir);
+        set_test_config_dir_override(Some(temp_dir.clone()));
+
         let ctx = create_test_output_context(true);
         let info = create_test_update_check(true);
 
-        // Should succeed but report not implemented
+        // Should succeed (workers will be empty but that returns Ok)
         let result = update_fleet(&ctx, &info, false).await;
         assert!(result.is_ok());
+
+        // Clean up
+        set_test_config_dir_override(None);
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

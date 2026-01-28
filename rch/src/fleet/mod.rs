@@ -154,7 +154,7 @@ pub async fn deploy(
     // Handle dry run
     if dry_run {
         let dry_run_result = dry_run::compute_dry_run(&plan, ctx).await?;
-        dry_run::display_dry_run(&dry_run_result, ctx)?;
+        dry_run::display_dry_run(&dry_run_result, ctx, "fleet deploy")?;
         return Ok(());
     }
 
@@ -274,7 +274,22 @@ pub async fn rollback(
     }
 
     if dry_run {
-        if !ctx.is_json() {
+        if ctx.is_json() {
+            #[derive(serde::Serialize)]
+            struct RollbackDryRun<'a> {
+                dry_run: bool,
+                worker_count: usize,
+                workers: Vec<&'a str>,
+                target_version: Option<&'a str>,
+            }
+            let dry_run_result = RollbackDryRun {
+                dry_run: true,
+                worker_count: target_workers.len(),
+                workers: target_workers.iter().map(|w| w.id.0.as_str()).collect(),
+                target_version: to_version.as_deref(),
+            };
+            let _ = ctx.json(&ApiResponse::ok("fleet rollback", &dry_run_result));
+        } else {
             println!(
                 "  {} Would rollback {} worker(s)",
                 style.muted("DRY RUN:"),
