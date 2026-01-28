@@ -552,9 +552,9 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &TuiState, colors: &Color
 fn render_help_overlay(frame: &mut Frame, colors: &ColorScheme) {
     let area = frame.area();
     // Center the help box - increased height to accommodate more content
-    // Content is ~31 lines, plus 2 for borders = 33 minimum for full content
+    // Content is ~34 lines, plus 2 for borders = 36 minimum for full content
     let width = 60.min(area.width.saturating_sub(4));
-    let height = 34.min(area.height.saturating_sub(4));
+    let height = 38.min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(width)) / 2;
     let y = (area.height.saturating_sub(height)) / 2;
     let help_area = Rect::new(x, y, width, height);
@@ -575,8 +575,11 @@ fn render_help_overlay(frame: &mut Frame, colors: &ColorScheme) {
             Style::default().add_modifier(Modifier::BOLD),
         )]),
         Line::from("  ↑/k, ↓/j    Move selection up/down"),
-        Line::from("  Tab         Next panel"),
-        Line::from("  Shift+Tab   Previous panel"),
+        Line::from("  →/l, Tab    Next panel"),
+        Line::from("  ←/h, S-Tab  Previous panel"),
+        Line::from("  1-4         Jump to panel by number"),
+        Line::from("  H / L       Jump to first / last panel"),
+        Line::from("  g / G       Jump to first / last item"),
         Line::from("  Enter       Select/expand item"),
         Line::from("  Backspace   Go back / Close log view"),
         Line::from(""),
@@ -1113,8 +1116,8 @@ mod tests {
             show_help: true,
             ..Default::default()
         };
-        // Need taller terminal to see all content
-        let content = render_to_string(80, 36, |f| render(f, &state));
+        // Need taller terminal to see all content (expanded for vim keybindings)
+        let content = render_to_string(80, 42, |f| render(f, &state));
 
         // Verify general shortcuts are documented
         info!("VERIFY: checking general shortcuts");
@@ -1144,7 +1147,7 @@ mod tests {
             show_help: true,
             ..Default::default()
         };
-        let content = render_to_string(80, 32, |f| render(f, &state));
+        let content = render_to_string(80, 42, |f| render(f, &state));
 
         // Verify sections are in logical order
         info!("VERIFY: checking section order");

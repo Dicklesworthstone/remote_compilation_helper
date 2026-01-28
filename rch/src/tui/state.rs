@@ -156,6 +156,28 @@ impl TuiState {
         self.selected_index = 0;
     }
 
+    /// Jump to a specific panel by index (0=Workers, 1=ActiveBuilds, 2=BuildHistory, 3=Logs).
+    pub fn jump_to_panel(&mut self, index: u8) {
+        let panel = match index {
+            0 => Panel::Workers,
+            1 => Panel::ActiveBuilds,
+            2 => Panel::BuildHistory,
+            _ => Panel::Logs,
+        };
+        self.selected_panel = panel;
+        self.selected_index = 0;
+    }
+
+    /// Jump selection to first item in current list.
+    pub fn select_first(&mut self) {
+        self.selected_index = 0;
+    }
+
+    /// Jump selection to last item in current list.
+    pub fn select_last(&mut self) {
+        self.selected_index = self.current_list_len().saturating_sub(1);
+    }
+
     /// Handle selection action on current item.
     pub fn handle_select(&mut self) {
         match self.selected_panel {
@@ -1073,5 +1095,125 @@ mod tests {
         let selected = state.selected_worker();
         assert!(selected.is_none());
         info!("TEST PASS: test_selected_worker_empty_list");
+    }
+
+    // ==================== Vim navigation: jump_to_panel ====================
+
+    #[test]
+    fn test_jump_to_panel_workers() {
+        init_test_logging();
+        info!("TEST START: test_jump_to_panel_workers");
+        let mut state = TuiState {
+            selected_panel: Panel::Logs,
+            selected_index: 5,
+            ..Default::default()
+        };
+        state.jump_to_panel(0);
+        assert_eq!(state.selected_panel, Panel::Workers);
+        assert_eq!(state.selected_index, 0);
+        info!("TEST PASS: test_jump_to_panel_workers");
+    }
+
+    #[test]
+    fn test_jump_to_panel_active_builds() {
+        init_test_logging();
+        info!("TEST START: test_jump_to_panel_active_builds");
+        let mut state = TuiState::default();
+        state.jump_to_panel(1);
+        assert_eq!(state.selected_panel, Panel::ActiveBuilds);
+        assert_eq!(state.selected_index, 0);
+        info!("TEST PASS: test_jump_to_panel_active_builds");
+    }
+
+    #[test]
+    fn test_jump_to_panel_build_history() {
+        init_test_logging();
+        info!("TEST START: test_jump_to_panel_build_history");
+        let mut state = TuiState::default();
+        state.jump_to_panel(2);
+        assert_eq!(state.selected_panel, Panel::BuildHistory);
+        info!("TEST PASS: test_jump_to_panel_build_history");
+    }
+
+    #[test]
+    fn test_jump_to_panel_logs() {
+        init_test_logging();
+        info!("TEST START: test_jump_to_panel_logs");
+        let mut state = TuiState::default();
+        state.jump_to_panel(3);
+        assert_eq!(state.selected_panel, Panel::Logs);
+        info!("TEST PASS: test_jump_to_panel_logs");
+    }
+
+    #[test]
+    fn test_jump_to_panel_invalid_index_defaults_to_logs() {
+        init_test_logging();
+        info!("TEST START: test_jump_to_panel_invalid_index_defaults_to_logs");
+        let mut state = TuiState::default();
+        state.jump_to_panel(99);
+        assert_eq!(state.selected_panel, Panel::Logs);
+        info!("TEST PASS: test_jump_to_panel_invalid_index_defaults_to_logs");
+    }
+
+    // ==================== Vim navigation: select_first / select_last ====================
+
+    #[test]
+    fn test_select_first() {
+        init_test_logging();
+        info!("TEST START: test_select_first");
+        let mut state = TuiState {
+            workers: vec![make_worker("w1"), make_worker("w2"), make_worker("w3")],
+            selected_panel: Panel::Workers,
+            selected_index: 2,
+            ..Default::default()
+        };
+        state.select_first();
+        assert_eq!(state.selected_index, 0);
+        info!("TEST PASS: test_select_first");
+    }
+
+    #[test]
+    fn test_select_last() {
+        init_test_logging();
+        info!("TEST START: test_select_last");
+        let mut state = TuiState {
+            workers: vec![make_worker("w1"), make_worker("w2"), make_worker("w3")],
+            selected_panel: Panel::Workers,
+            selected_index: 0,
+            ..Default::default()
+        };
+        state.select_last();
+        assert_eq!(state.selected_index, 2);
+        info!("TEST PASS: test_select_last");
+    }
+
+    #[test]
+    fn test_select_last_empty_list() {
+        init_test_logging();
+        info!("TEST START: test_select_last_empty_list");
+        let mut state = TuiState {
+            workers: vec![],
+            selected_panel: Panel::Workers,
+            selected_index: 0,
+            ..Default::default()
+        };
+        state.select_last();
+        assert_eq!(state.selected_index, 0);
+        info!("TEST PASS: test_select_last_empty_list");
+    }
+
+    #[test]
+    fn test_select_first_already_at_first() {
+        init_test_logging();
+        info!("TEST START: test_select_first_already_at_first");
+        let mut state = TuiState {
+            workers: vec![make_worker("w1")],
+            selected_panel: Panel::Workers,
+            selected_index: 0,
+            ..Default::default()
+        };
+        state.select_first();
+        assert_eq!(state.selected_index, 0);
+        info!("TEST PASS: test_select_first_already_at_first");
     }
 }

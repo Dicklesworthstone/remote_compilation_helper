@@ -444,6 +444,8 @@ async fn run_app(
                     if let Some(ref mut log_view) = state.log_view {
                         log_view.scroll_offset = 0;
                         log_view.auto_scroll = false;
+                    } else if !state.show_help && !state.filter_mode {
+                        state.select_first();
                     }
                 }
                 Action::JumpBottom => {
@@ -451,6 +453,13 @@ async fn run_app(
                         // Set to max, will be clamped on render
                         log_view.scroll_offset = usize::MAX;
                         log_view.auto_scroll = true;
+                    } else if !state.show_help && !state.filter_mode {
+                        state.select_last();
+                    }
+                }
+                Action::JumpToPanel(index) => {
+                    if !state.show_help && !state.filter_mode {
+                        state.jump_to_panel(index);
                     }
                 }
                 Action::NextPanel => {

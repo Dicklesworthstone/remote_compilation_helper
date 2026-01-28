@@ -46,6 +46,8 @@ pub enum Action {
     JumpTop,
     /// Jump to bottom.
     JumpBottom,
+    /// Jump to a specific panel by index (0=Workers, 1=ActiveBuilds, 2=BuildHistory, 3=Logs).
+    JumpToPanel(u8),
     /// No action (tick).
     Tick,
 }
@@ -61,8 +63,8 @@ fn handle_key(key: KeyEvent) -> Action {
         KeyCode::Char('q') | KeyCode::Esc => Action::Quit,
         KeyCode::Up | KeyCode::Char('k') => Action::Up,
         KeyCode::Down | KeyCode::Char('j') => Action::Down,
-        KeyCode::Tab => Action::NextPanel,
-        KeyCode::BackTab => Action::PrevPanel,
+        KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => Action::NextPanel,
+        KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => Action::PrevPanel,
         KeyCode::Enter => Action::Select,
         KeyCode::Backspace => Action::Back,
         KeyCode::Char('r') => Action::Refresh,
@@ -75,6 +77,12 @@ fn handle_key(key: KeyEvent) -> Action {
         KeyCode::PageDown => Action::PageDown,
         KeyCode::Char('g') => Action::JumpTop,
         KeyCode::Char('G') => Action::JumpBottom,
+        KeyCode::Char('H') => Action::JumpToPanel(0),
+        KeyCode::Char('L') => Action::JumpToPanel(3),
+        KeyCode::Char('1') => Action::JumpToPanel(0),
+        KeyCode::Char('2') => Action::JumpToPanel(1),
+        KeyCode::Char('3') => Action::JumpToPanel(2),
+        KeyCode::Char('4') => Action::JumpToPanel(3),
         _ => Action::Tick,
     }
 }
@@ -617,5 +625,109 @@ mod tests {
         assert_ne!(Action::DrainWorker, Action::EnableWorker);
         assert_ne!(Action::DrainWorker, Action::Tick);
         info!("TEST PASS: test_drain_enable_action_equality");
+    }
+
+    // ==================== Vim panel navigation tests ====================
+
+    #[test]
+    fn test_handle_key_vim_h_prev_panel() {
+        init_test_logging();
+        info!("TEST START: test_handle_key_vim_h_prev_panel");
+        let h = KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE);
+        assert_eq!(handle_key(h), Action::PrevPanel);
+        info!("TEST PASS: test_handle_key_vim_h_prev_panel");
+    }
+
+    #[test]
+    fn test_handle_key_vim_l_next_panel() {
+        init_test_logging();
+        info!("TEST START: test_handle_key_vim_l_next_panel");
+        let l = KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE);
+        assert_eq!(handle_key(l), Action::NextPanel);
+        info!("TEST PASS: test_handle_key_vim_l_next_panel");
+    }
+
+    #[test]
+    fn test_handle_key_left_arrow_prev_panel() {
+        init_test_logging();
+        info!("TEST START: test_handle_key_left_arrow_prev_panel");
+        let left = KeyEvent::new(KeyCode::Left, KeyModifiers::NONE);
+        assert_eq!(handle_key(left), Action::PrevPanel);
+        info!("TEST PASS: test_handle_key_left_arrow_prev_panel");
+    }
+
+    #[test]
+    fn test_handle_key_right_arrow_next_panel() {
+        init_test_logging();
+        info!("TEST START: test_handle_key_right_arrow_next_panel");
+        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+        assert_eq!(handle_key(right), Action::NextPanel);
+        info!("TEST PASS: test_handle_key_right_arrow_next_panel");
+    }
+
+    #[test]
+    fn test_handle_key_shift_h_jump_first_panel() {
+        init_test_logging();
+        info!("TEST START: test_handle_key_shift_h_jump_first_panel");
+        let shift_h = KeyEvent::new(KeyCode::Char('H'), KeyModifiers::SHIFT);
+        assert_eq!(handle_key(shift_h), Action::JumpToPanel(0));
+        info!("TEST PASS: test_handle_key_shift_h_jump_first_panel");
+    }
+
+    #[test]
+    fn test_handle_key_shift_l_jump_last_panel() {
+        init_test_logging();
+        info!("TEST START: test_handle_key_shift_l_jump_last_panel");
+        let shift_l = KeyEvent::new(KeyCode::Char('L'), KeyModifiers::SHIFT);
+        assert_eq!(handle_key(shift_l), Action::JumpToPanel(3));
+        info!("TEST PASS: test_handle_key_shift_l_jump_last_panel");
+    }
+
+    // ==================== Number key panel jump tests ====================
+
+    #[test]
+    fn test_handle_key_number_1_jump_workers() {
+        init_test_logging();
+        info!("TEST START: test_handle_key_number_1_jump_workers");
+        let key = KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE);
+        assert_eq!(handle_key(key), Action::JumpToPanel(0));
+        info!("TEST PASS: test_handle_key_number_1_jump_workers");
+    }
+
+    #[test]
+    fn test_handle_key_number_2_jump_active_builds() {
+        init_test_logging();
+        info!("TEST START: test_handle_key_number_2_jump_active_builds");
+        let key = KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE);
+        assert_eq!(handle_key(key), Action::JumpToPanel(1));
+        info!("TEST PASS: test_handle_key_number_2_jump_active_builds");
+    }
+
+    #[test]
+    fn test_handle_key_number_3_jump_build_history() {
+        init_test_logging();
+        info!("TEST START: test_handle_key_number_3_jump_build_history");
+        let key = KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE);
+        assert_eq!(handle_key(key), Action::JumpToPanel(2));
+        info!("TEST PASS: test_handle_key_number_3_jump_build_history");
+    }
+
+    #[test]
+    fn test_handle_key_number_4_jump_logs() {
+        init_test_logging();
+        info!("TEST START: test_handle_key_number_4_jump_logs");
+        let key = KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE);
+        assert_eq!(handle_key(key), Action::JumpToPanel(3));
+        info!("TEST PASS: test_handle_key_number_4_jump_logs");
+    }
+
+    #[test]
+    fn test_jump_to_panel_action_equality() {
+        init_test_logging();
+        info!("TEST START: test_jump_to_panel_action_equality");
+        assert_eq!(Action::JumpToPanel(0), Action::JumpToPanel(0));
+        assert_ne!(Action::JumpToPanel(0), Action::JumpToPanel(1));
+        assert_ne!(Action::JumpToPanel(0), Action::Tick);
+        info!("TEST PASS: test_jump_to_panel_action_equality");
     }
 }
