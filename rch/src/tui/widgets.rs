@@ -415,9 +415,15 @@ fn render_build_history_panel(
         .enumerate()
         .map(|(i, b)| {
             let (build_indicator, status_icon) = if b.success {
-                (StatusIndicator::Success, StatusIndicator::Success.symbol(&SYMBOLS))
+                (
+                    StatusIndicator::Success,
+                    StatusIndicator::Success.symbol(&SYMBOLS),
+                )
             } else {
-                (StatusIndicator::Error, StatusIndicator::Error.symbol(&SYMBOLS))
+                (
+                    StatusIndicator::Error,
+                    StatusIndicator::Error.symbol(&SYMBOLS),
+                )
             };
             let status_color = indicator_color(build_indicator, colors);
 
