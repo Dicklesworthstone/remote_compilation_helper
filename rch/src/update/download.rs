@@ -1,7 +1,7 @@
 //! Download release artifacts with verification.
 
 use super::types::{UpdateCheck, UpdateError, current_target};
-use super::verify::verify_checksum;
+use super::verify::{verify_checksum, verify_checksum_and_signature};
 use crate::ui::OutputContext;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -16,6 +16,7 @@ pub type DownloadProgress = Box<dyn Fn(u64, u64) + Send>;
 pub struct DownloadedRelease {
     pub archive_path: PathBuf,
     pub checksum_verified: bool,
+    pub signature_verified: Option<bool>,
     pub version: String,
 }
 
@@ -58,7 +59,7 @@ pub async fn download_release(
     download_with_retry(&archive_asset.browser_download_url, &archive_path, 3).await?;
 
     // Verify checksum if available
-    let checksum_verified = if let Some(checksum_asset) = checksum_asset {
+    let (checksum_verified, signature_verified) = if let Some(checksum_asset) = checksum_asset {
         if !ctx.is_json() {
             println!("Verifying checksum...");
         }
@@ -67,18 +68,43 @@ pub async fn download_release(
         download_with_retry(&checksum_asset.browser_download_url, &checksum_path, 3).await?;
 
         let expected_checksum = extract_checksum(&checksum_path, &archive_asset.name).await?;
-        verify_checksum(&archive_path, &expected_checksum).await?;
-        true
+        let signature_bundle_asset = update
+            .assets
+            .iter()
+            .find(|a| a.name == format!("{}.sigstore.json", archive_asset.name));
+
+        let signature_bundle_path = if let Some(sig_asset) = signature_bundle_asset {
+            if !ctx.is_json() {
+                println!("Verifying signature (sigstore bundle)...");
+            }
+            let sig_path = temp_dir.join(&sig_asset.name);
+            download_with_retry(&sig_asset.browser_download_url, &sig_path, 3).await?;
+            Some(sig_path)
+        } else {
+            if !ctx.is_json() {
+                println!("Warning: No sigstore bundle available, skipping signature verification");
+            }
+            None
+        };
+
+        let verification = if let Some(bundle_path) = signature_bundle_path.as_deref() {
+            verify_checksum_and_signature(&archive_path, &expected_checksum, Some(bundle_path))
+                .await?
+        } else {
+            verify_checksum(&archive_path, &expected_checksum).await?
+        };
+        (verification.checksum_valid, verification.signature_valid)
     } else {
         if !ctx.is_json() {
             println!("Warning: No checksum file available, skipping verification");
         }
-        false
+        (false, None)
     };
 
     Ok(DownloadedRelease {
         archive_path,
         checksum_verified,
+        signature_verified,
         version: update.latest_version.to_string(),
     })
 }

@@ -43,6 +43,9 @@ pub enum UpdateError {
 
     #[error("Unsupported platform: {0}")]
     UnsupportedPlatform(String),
+
+    #[error("Signature verification failed: {0}")]
+    SignatureVerificationFailed(String),
 }
 
 /// Release channel for updates.

@@ -2,6 +2,8 @@
 
 use super::types::UpdateError;
 use tokio::io::AsyncReadExt;
+use tokio::process::Command;
+use which::which;
 
 /// Result of verification.
 #[derive(Debug)]
@@ -15,6 +17,15 @@ pub struct VerificationResult {
 pub async fn verify_checksum(
     file_path: &std::path::Path,
     expected: &str,
+) -> Result<VerificationResult, UpdateError> {
+    verify_checksum_and_signature(file_path, expected, None).await
+}
+
+/// Verify checksum and optional signature bundle of a file.
+pub async fn verify_checksum_and_signature(
+    file_path: &std::path::Path,
+    expected: &str,
+    signature_bundle: Option<&std::path::Path>,
 ) -> Result<VerificationResult, UpdateError> {
     let mut file = tokio::fs::File::open(file_path)
         .await
@@ -52,9 +63,15 @@ pub async fn verify_checksum(
         });
     }
 
+    let signature_valid = if let Some(bundle_path) = signature_bundle {
+        Some(verify_signature(file_path, bundle_path).await?)
+    } else {
+        None
+    };
+
     Ok(VerificationResult {
         checksum_valid: true,
-        signature_valid: None, // TODO: Implement signature verification
+        signature_valid,
     })
 }
 
@@ -89,6 +106,47 @@ async fn compute_sha256(file_path: &std::path::Path) -> Result<String, UpdateErr
     })
     .await
     .map_err(|e| UpdateError::InstallFailed(format!("Task failed: {}", e)))?
+}
+
+/// Verify Sigstore/cosign signature bundle for a file.
+async fn verify_signature(
+    file_path: &std::path::Path,
+    bundle_path: &std::path::Path,
+) -> Result<bool, UpdateError> {
+    let cosign_path = which("cosign").map_err(|_| {
+        UpdateError::SignatureVerificationFailed("cosign not found in PATH".to_string())
+    })?;
+
+    let output = Command::new(cosign_path)
+        .arg("verify-blob")
+        .arg("--bundle")
+        .arg(bundle_path)
+        .arg("--certificate-identity-regexp")
+        .arg(".*")
+        .arg("--certificate-oidc-issuer-regexp")
+        .arg(".*")
+        .arg(file_path)
+        .output()
+        .await
+        .map_err(|e| {
+            UpdateError::SignatureVerificationFailed(format!("Failed to execute cosign: {}", e))
+        })?;
+
+    if output.status.success() {
+        Ok(true)
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        Err(UpdateError::SignatureVerificationFailed(format!(
+            "cosign verify-blob failed: {}{}",
+            stderr.trim(),
+            if stdout.trim().is_empty() {
+                String::new()
+            } else {
+                format!(" | {}", stdout.trim())
+            }
+        )))
+    }
 }
 
 /// Verify a byte slice against expected checksum.
