@@ -10,6 +10,7 @@ use crate::status_types::{
     extract_json_body,
 };
 use crate::ui::context::OutputContext;
+use crate::ui::progress::{MultiProgressManager, Spinner};
 use crate::ui::theme::StatusIndicator;
 use anyhow::{Context, Result, bail};
 use directories::ProjectDirs;
@@ -1408,7 +1409,11 @@ pub async fn workers_benchmark(ctx: &OutputContext) -> Result<()> {
 
     let mut results = Vec::new();
 
-    if !ctx.is_json() {
+    // Use MultiProgressManager for animated spinners per worker
+    let mp = MultiProgressManager::new(ctx);
+
+    if !ctx.is_json() && !mp.is_visible() {
+        // Fallback for non-TTY: print static header
         println!(
             "Running benchmarks on {} worker(s)...\n",
             style.highlight(&workers.len().to_string())
@@ -1416,20 +1421,22 @@ pub async fn workers_benchmark(ctx: &OutputContext) -> Result<()> {
     }
 
     for worker in &workers {
-        if !ctx.is_json() {
-            print!(
-                "  {} {}@{}... ",
-                style.highlight(worker.id.as_str()),
-                style.muted(&worker.user),
-                style.info(&worker.host)
-            );
-        }
+        let spinner = if !ctx.is_json() {
+            let pb = mp.add_spinner(worker.id.as_str(), "Connecting...");
+            Some(pb)
+        } else {
+            None
+        };
 
         let ssh_options = SshOptions::default();
         let mut client = SshClient::new(worker.clone(), ssh_options.clone());
 
         match client.connect().await {
             Ok(()) => {
+                if let Some(ref pb) = spinner {
+                    pb.set_message("Running benchmark...");
+                }
+
                 let bench_id = uuid::Uuid::new_v4();
                 let bench_dir = format!("rch_bench_{}", bench_id);
 
@@ -1454,57 +1461,41 @@ pub async fn workers_benchmark(ctx: &OutputContext) -> Result<()> {
                 match result {
                     Ok(r) if r.success() => {
                         let duration_ms = duration.as_millis() as u64;
-                        if ctx.is_json() {
-                            results.push(WorkerBenchmarkResult {
-                                id: worker.id.as_str().to_string(),
-                                host: worker.host.clone(),
-                                status: "ok".to_string(),
-                                duration_ms: Some(duration_ms),
-                                error: None,
-                            });
-                        } else {
-                            println!(
-                                "{} {}ms {}",
-                                StatusIndicator::Success.display(style),
-                                style.highlight(&duration_ms.to_string()),
-                                style.muted("total")
-                            );
+                        results.push(WorkerBenchmarkResult {
+                            id: worker.id.as_str().to_string(),
+                            host: worker.host.clone(),
+                            status: "ok".to_string(),
+                            duration_ms: Some(duration_ms),
+                            error: None,
+                        });
+                        if let Some(ref pb) = spinner {
+                            pb.finish_with_message(format!("✓ {}ms", duration_ms));
                         }
                     }
                     Ok(r) => {
-                        if ctx.is_json() {
-                            results.push(WorkerBenchmarkResult {
-                                id: worker.id.as_str().to_string(),
-                                host: worker.host.clone(),
-                                status: "failed".to_string(),
-                                duration_ms: None,
-                                error: Some(format!("exit code {}", r.exit_code)),
-                            });
-                        } else {
-                            println!(
-                                "{} (exit={})",
-                                StatusIndicator::Error.with_label(style, "Failed"),
-                                style.muted(&r.exit_code.to_string())
-                            );
+                        results.push(WorkerBenchmarkResult {
+                            id: worker.id.as_str().to_string(),
+                            host: worker.host.clone(),
+                            status: "failed".to_string(),
+                            duration_ms: None,
+                            error: Some(format!("exit code {}", r.exit_code)),
+                        });
+                        if let Some(ref pb) = spinner {
+                            pb.finish_with_message(format!("✗ Failed (exit={})", r.exit_code));
                         }
                     }
                     Err(e) => {
                         let ssh_error = classify_ssh_error(worker, &e, ssh_options.command_timeout);
                         let report = format_ssh_report(ssh_error);
-                        if ctx.is_json() {
-                            results.push(WorkerBenchmarkResult {
-                                id: worker.id.as_str().to_string(),
-                                host: worker.host.clone(),
-                                status: "error".to_string(),
-                                duration_ms: None,
-                                error: Some(report),
-                            });
-                        } else {
-                            println!(
-                                "{}\n{}",
-                                StatusIndicator::Error.display(style),
-                                indent_lines(&report, "    ")
-                            );
+                        results.push(WorkerBenchmarkResult {
+                            id: worker.id.as_str().to_string(),
+                            host: worker.host.clone(),
+                            status: "error".to_string(),
+                            duration_ms: None,
+                            error: Some(report.clone()),
+                        });
+                        if let Some(ref pb) = spinner {
+                            pb.finish_with_message(format!("✗ {}", report.lines().next().unwrap_or("Error")));
                         }
                     }
                 }
@@ -1513,20 +1504,15 @@ pub async fn workers_benchmark(ctx: &OutputContext) -> Result<()> {
             Err(e) => {
                 let ssh_error = classify_ssh_error(worker, &e, ssh_options.connect_timeout);
                 let report = format_ssh_report(ssh_error);
-                if ctx.is_json() {
-                    results.push(WorkerBenchmarkResult {
-                        id: worker.id.as_str().to_string(),
-                        host: worker.host.clone(),
-                        status: "connection_failed".to_string(),
-                        duration_ms: None,
-                        error: Some(report),
-                    });
-                } else {
-                    println!(
-                        "{}\n{}",
-                        StatusIndicator::Error.with_label(style, "Connection failed:"),
-                        indent_lines(&report, "    ")
-                    );
+                results.push(WorkerBenchmarkResult {
+                    id: worker.id.as_str().to_string(),
+                    host: worker.host.clone(),
+                    status: "connection_failed".to_string(),
+                    duration_ms: None,
+                    error: Some(report.clone()),
+                });
+                if let Some(ref pb) = spinner {
+                    pb.finish_with_message(format!("✗ Connection failed: {}", report.lines().next().unwrap_or("Error")));
                 }
             }
         }
@@ -2819,24 +2805,21 @@ async fn sync_toolchain_to_worker(
     dry_run: bool,
     ctx: &OutputContext,
 ) -> ToolchainSyncResult {
-    let style = ctx.theme();
     let worker_id = &worker.id.0;
 
-    if !ctx.is_json() {
-        print!(
-            "  {} {}... ",
-            StatusIndicator::Info.display(style),
-            style.highlight(worker_id)
-        );
-        use std::io::Write;
-        let _ = std::io::stdout().flush();
-    }
+    // Use a spinner for progress indication during toolchain sync
+    let spinner = if !ctx.is_json() {
+        let s = Spinner::new(ctx, &format!("{}: Checking toolchain...", worker_id));
+        Some(s)
+    } else {
+        None
+    };
 
     // Check if toolchain is already installed
     match check_remote_toolchain(worker, toolchain).await {
         Ok(true) => {
-            if !ctx.is_json() {
-                println!("{} (already installed)", style.muted("skipped"));
+            if let Some(s) = spinner {
+                s.finish_success(&format!("{}: Already installed", worker_id));
             }
             return ToolchainSyncResult {
                 worker_id: worker_id.clone(),
@@ -2847,11 +2830,14 @@ async fn sync_toolchain_to_worker(
             };
         }
         Ok(false) => {
-            // Need to install
+            // Need to install - update spinner message
+            if let Some(ref s) = spinner {
+                s.set_message(&format!("{}: Installing {}...", worker_id, toolchain));
+            }
         }
         Err(e) => {
-            if !ctx.is_json() {
-                println!("{} ({})", style.error("FAILED"), e);
+            if let Some(s) = spinner {
+                s.finish_error(&format!("{}: {}", worker_id, e));
             }
             return ToolchainSyncResult {
                 worker_id: worker_id.clone(),
@@ -2864,8 +2850,8 @@ async fn sync_toolchain_to_worker(
     }
 
     if dry_run {
-        if !ctx.is_json() {
-            println!("{} (would install {})", style.muted("dry-run"), toolchain);
+        if let Some(s) = spinner {
+            s.finish_warning(&format!("{}: Would install {}", worker_id, toolchain));
         }
         return ToolchainSyncResult {
             worker_id: worker_id.clone(),
@@ -2879,8 +2865,8 @@ async fn sync_toolchain_to_worker(
     // Install the toolchain
     match install_remote_toolchain(worker, toolchain).await {
         Ok(()) => {
-            if !ctx.is_json() {
-                println!("{} (installed)", StatusIndicator::Success.display(style));
+            if let Some(s) = spinner {
+                s.finish_success(&format!("{}: Installed {}", worker_id, toolchain));
             }
             ToolchainSyncResult {
                 worker_id: worker_id.clone(),
@@ -2891,8 +2877,8 @@ async fn sync_toolchain_to_worker(
             }
         }
         Err(e) => {
-            if !ctx.is_json() {
-                println!("{} ({})", style.error("FAILED"), e);
+            if let Some(s) = spinner {
+                s.finish_error(&format!("{}: {}", worker_id, e));
             }
             ToolchainSyncResult {
                 worker_id: worker_id.clone(),
@@ -7535,7 +7521,38 @@ async fn self_test_run(
         format!("POST /self-test/run?{}\n", query.join("&"))
     };
 
-    let response = send_daemon_command(&command).await?;
+    // Use a spinner while waiting for the daemon to complete self-tests
+    let spinner = if !ctx.is_json() {
+        let target_desc = if all {
+            "all workers".to_string()
+        } else if worker_ids.is_empty() {
+            "default worker".to_string()
+        } else {
+            worker_ids.join(", ")
+        };
+        Some(Spinner::new(ctx, &format!("Running self-test on {}...", target_desc)))
+    } else {
+        None
+    };
+
+    let response = send_daemon_command(&command).await;
+
+    // Handle response with spinner
+    let response = match response {
+        Ok(r) => {
+            if let Some(ref s) = spinner {
+                s.finish_and_clear();
+            }
+            r
+        }
+        Err(e) => {
+            if let Some(s) = spinner {
+                s.finish_error(&format!("Failed: {}", e));
+            }
+            return Err(e);
+        }
+    };
+
     let json = extract_json_body(&response).ok_or_else(|| anyhow::anyhow!("Invalid response"))?;
     let run: SelfTestRunResponse = serde_json::from_str(json)?;
 

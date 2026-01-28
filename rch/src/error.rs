@@ -21,9 +21,16 @@ pub type Result<T> = std::result::Result<T, miette::Report>;
 // =============================================================================
 
 /// Errors related to configuration file parsing and validation.
+///
+/// Error code range: RCH-E001 to RCH-E012
 #[allow(unused_assignments)]
 #[derive(Error, Diagnostic, Debug)]
 pub enum ConfigError {
+    /// Configuration file not found at expected location.
+    #[error("Config file not found: {path}")]
+    #[diagnostic(code("RCH-E001"), help("Create a config file with: rch config init"))]
+    NotFound { path: PathBuf },
+
     /// Failed to read the configuration file from disk.
     #[error("Failed to read config file: {path}")]
     #[diagnostic(
@@ -47,11 +54,6 @@ pub enum ConfigError {
         message: String,
     },
 
-    /// Missing required configuration field.
-    #[error("Missing required field: {field}")]
-    #[diagnostic(code("RCH-E004"), help("Add the '{field}' field to your config file"))]
-    MissingField { field: String },
-
     /// Invalid configuration value.
     #[error("Invalid value for '{field}': {reason}")]
     #[diagnostic(code("RCH-E004"), help("{suggestion}"))]
@@ -61,20 +63,69 @@ pub enum ConfigError {
         suggestion: String,
     },
 
-    /// Configuration file not found at expected location.
-    #[error("Config file not found: {path}")]
-    #[diagnostic(code("RCH-E001"), help("Create a config file with: rch config init"))]
-    NotFound { path: PathBuf },
-
     /// Workers configuration file not found.
     #[error("Workers config not found: {path}")]
     #[diagnostic(
-        code("RCH-E001"),
+        code("RCH-E005"),
         help(
             "Create a workers config at ~/.config/rch/workers.toml\nExample:\n\n[[workers]]\nid = \"worker1\"\nhost = \"192.168.1.100\"\nuser = \"ubuntu\"\nidentity_file = \"~/.ssh/id_rsa\"\ntotal_slots = 16\n"
         )
     )]
     WorkersNotFound { path: PathBuf },
+
+    /// Workers configuration file parse error.
+    #[error("Failed to parse workers config: {path}")]
+    #[diagnostic(
+        code("RCH-E006"),
+        help("Check the TOML syntax in your workers.toml file")
+    )]
+    WorkersParseError {
+        path: PathBuf,
+        message: String,
+    },
+
+    /// No workers are configured.
+    #[error("No workers configured")]
+    #[diagnostic(
+        code("RCH-E007"),
+        help("Configure workers in ~/.config/rch/workers.toml")
+    )]
+    NoWorkers,
+
+    /// Worker not found by ID.
+    #[error("Worker '{worker_id}' not found in configuration")]
+    #[diagnostic(code("RCH-E008"), help("List available workers: rch workers list"))]
+    WorkerNotFound { worker_id: String },
+
+    /// Duplicate worker ID in configuration.
+    #[error("Duplicate worker ID: {worker_id}")]
+    #[diagnostic(
+        code("RCH-E009"),
+        help("Each worker must have a unique ID in workers.toml")
+    )]
+    DuplicateWorkerId { worker_id: String },
+
+    /// Invalid worker configuration.
+    #[error("Invalid worker configuration for '{worker_id}': {reason}")]
+    #[diagnostic(code("RCH-E010"), help("{suggestion}"))]
+    InvalidWorker {
+        worker_id: String,
+        reason: String,
+        suggestion: String,
+    },
+
+    /// Missing required configuration field.
+    #[error("Missing required field: {field}")]
+    #[diagnostic(code("RCH-E011"), help("Add the '{field}' field to your config file"))]
+    MissingField { field: String },
+
+    /// Configuration migration required.
+    #[error("Configuration migration required: {reason}")]
+    #[diagnostic(
+        code("RCH-E012"),
+        help("Run 'rch config migrate' to update your configuration")
+    )]
+    MigrationRequired { reason: String },
 }
 
 impl ConfigError {
@@ -94,15 +145,25 @@ impl ConfigError {
 // =============================================================================
 
 /// Errors related to worker connectivity and management.
+///
+/// Error code range: RCH-E200 to RCH-E210
 #[derive(Error, Diagnostic, Debug)]
 pub enum WorkerError {
-    /// SSH connection to worker failed.
-    #[error("Connection to worker '{worker_id}' failed")]
+    /// Worker probe failed.
+    #[error("Probe failed for worker '{worker_id}': {reason}")]
     #[diagnostic(
-        code("RCH-E100"),
+        code("RCH-E200"),
+        help("Check worker connectivity: rch workers probe {worker_id}")
+    )]
+    ProbeFailed { worker_id: String, reason: String },
+
+    /// Worker is unreachable.
+    #[error("Worker '{worker_id}' is unreachable")]
+    #[diagnostic(
+        code("RCH-E201"),
         help("Verify SSH access with:\n  ssh -i {identity_file} {user}@{host}")
     )]
-    ConnectionFailed {
+    Unreachable {
         worker_id: String,
         host: String,
         user: String,
@@ -119,18 +180,13 @@ pub enum WorkerError {
     )]
     Unhealthy { worker_id: String, reason: String },
 
-    /// Worker not found in configuration.
-    #[error("Worker '{worker_id}' not found in configuration")]
-    #[diagnostic(code("RCH-E008"), help("List available workers: rch workers list"))]
-    NotFound { worker_id: String },
-
-    /// No workers are configured.
-    #[error("No workers configured")]
+    /// Worker is at capacity (all slots busy).
+    #[error("Worker '{worker_id}' is at capacity (all {total_slots} slots busy)")]
     #[diagnostic(
-        code("RCH-E007"),
-        help("Configure workers in ~/.config/rch/workers.toml")
+        code("RCH-E203"),
+        help("Wait for running jobs to complete or use a different worker")
     )]
-    NoneConfigured,
+    AtCapacity { worker_id: String, total_slots: u32 },
 
     /// All workers are busy (at capacity).
     #[error("All workers are at capacity")]
@@ -139,6 +195,22 @@ pub enum WorkerError {
         help("Wait for running jobs to complete or add more workers")
     )]
     AllBusy,
+
+    /// Worker circuit breaker is open.
+    #[error("Circuit breaker open for worker '{worker_id}'")]
+    #[diagnostic(
+        code("RCH-E205"),
+        help("Worker has experienced repeated failures. Wait for recovery or check health.")
+    )]
+    CircuitOpen { worker_id: String },
+
+    /// Worker circuit breaker is half-open.
+    #[error("Circuit breaker half-open for worker '{worker_id}' (testing recovery)")]
+    #[diagnostic(
+        code("RCH-E206"),
+        help("Worker is recovering from failures. A test request is in progress.")
+    )]
+    CircuitHalfOpen { worker_id: String },
 
     /// All workers have their circuit breakers open.
     #[error("All worker circuit breakers are open")]
@@ -150,18 +222,29 @@ pub enum WorkerError {
     )]
     AllCircuitsOpen,
 
-    /// SSH key file not found.
-    #[error("SSH identity file not found: {path}")]
+    /// Worker selection failed.
+    #[error("Failed to select a worker: {reason}")]
     #[diagnostic(
-        code("RCH-E009"),
-        help("Verify the identity_file path in your workers.toml")
+        code("RCH-E208"),
+        help("Check worker availability: rch workers list")
     )]
-    IdentityNotFound { path: PathBuf },
+    SelectionFailed { reason: String },
 
-    /// SSH key has wrong permissions.
-    #[error("SSH key has insecure permissions: {}", path.display())]
-    #[diagnostic(code("RCH-E009"), help("Fix with: chmod 600 <key_path>"))]
-    InsecurePermissions { path: PathBuf },
+    /// Worker drain timeout.
+    #[error("Drain timeout for worker '{worker_id}' after {timeout_secs}s")]
+    #[diagnostic(
+        code("RCH-E209"),
+        help("Active jobs are still running. Consider increasing timeout or force-draining.")
+    )]
+    DrainTimeout { worker_id: String, timeout_secs: u64 },
+
+    /// Worker benchmark failed.
+    #[error("Benchmark failed for worker '{worker_id}': {reason}")]
+    #[diagnostic(
+        code("RCH-E210"),
+        help("Check worker status: rch workers probe {worker_id}")
+    )]
+    BenchmarkFailed { worker_id: String, reason: String },
 }
 
 // =============================================================================
@@ -169,8 +252,29 @@ pub enum WorkerError {
 // =============================================================================
 
 /// Errors related to SSH connectivity and authentication.
+///
+/// Error code range: RCH-E100 to RCH-E111
 #[derive(Error, Diagnostic, Debug)]
 pub enum SshError {
+    /// Generic SSH connection failure.
+    #[error("SSH connection failed for {user}@{host}: {message}")]
+    #[diagnostic(
+        code("RCH-E100"),
+        help(
+            "SSH Troubleshooting:\n\
+  1. Verify host/user/key in workers.toml.\n\
+  2. Try a manual connection with verbose logs:\n\
+     ssh -vvv -i {key_path:?} {user}@{host}\n\n\
+Run 'rch doctor' for comprehensive SSH diagnostics."
+        )
+    )]
+    ConnectionFailed {
+        host: String,
+        user: String,
+        key_path: PathBuf,
+        message: String,
+    },
+
     /// SSH authentication failed (permission denied).
     #[error("SSH authentication failed for {user}@{host}")]
     #[diagnostic(
@@ -192,10 +296,86 @@ pub enum SshError {
 Run 'rch doctor' for comprehensive SSH diagnostics."
         )
     )]
-    PermissionDenied {
+    AuthFailed {
         host: String,
         user: String,
         key_path: PathBuf,
+    },
+
+    /// SSH key file not found.
+    #[error("SSH identity file not found: {key_path}")]
+    #[diagnostic(
+        code("RCH-E102"),
+        help("Verify the identity_file path in your workers.toml")
+    )]
+    KeyNotFound { key_path: PathBuf },
+
+    /// SSH key has wrong permissions.
+    #[error("SSH key has insecure permissions: {}", key_path.display())]
+    #[diagnostic(code("RCH-E103"), help("Fix with: chmod 600 <key_path>"))]
+    KeyInsecurePermissions { key_path: PathBuf },
+
+    /// SSH host key verification failed.
+    #[error("SSH host key verification failed for {host}")]
+    #[diagnostic(
+        code("RCH-E104"),
+        help(
+            "SSH Troubleshooting:\n\
+  1. Remove the old host key:\n\
+     ssh-keygen -R {host}\n\n\
+  2. Fetch and trust the new host key:\n\
+     ssh-keyscan -H {host} >> ~/.ssh/known_hosts\n\n\
+  3. Retry with verbose logs:\n\
+     ssh -vvv -i {key_path:?} {user}@{host}\n\n\
+Run 'rch doctor' for comprehensive SSH diagnostics."
+        )
+    )]
+    HostKeyVerificationFailed {
+        host: String,
+        user: String,
+        key_path: PathBuf,
+    },
+
+    /// SSH connection timed out.
+    #[error("SSH connection to {host} timed out after {timeout_secs}s")]
+    #[diagnostic(
+        code("RCH-E105"),
+        help(
+            "SSH Troubleshooting:\n\
+  1. Check network connectivity and firewall rules.\n\
+  2. Verify the host is reachable:\n\
+     ssh -vvv -i {key_path:?} {user}@{host}\n\n\
+Run 'rch doctor' for comprehensive SSH diagnostics."
+        )
+    )]
+    ConnectionTimeout {
+        host: String,
+        user: String,
+        key_path: PathBuf,
+        timeout_secs: u64,
+    },
+
+    /// SSH command execution failed.
+    #[error("SSH command execution failed on {host}: {message}")]
+    #[diagnostic(
+        code("RCH-E106"),
+        help("Check the command output and worker logs for details")
+    )]
+    CommandFailed {
+        host: String,
+        message: String,
+    },
+
+    /// SSH channel error.
+    #[error("SSH channel error for {user}@{host}: {message}")]
+    #[diagnostic(
+        code("RCH-E107"),
+        help("The SSH session encountered a channel error. Try reconnecting.")
+    )]
+    ChannelError {
+        host: String,
+        user: String,
+        message: String,
     },
 
     /// SSH connection was refused by the host.
@@ -217,41 +397,53 @@ Run 'rch doctor' for comprehensive SSH diagnostics."
         key_path: PathBuf,
     },
 
-    /// SSH connection timed out.
-    #[error("SSH connection to {host} timed out after {timeout_secs}s")]
+    /// Binary not found on remote worker.
+    #[error("Required binary '{binary}' not found on worker {host}")]
     #[diagnostic(
-        code("RCH-E104"),
-        help(
-            "SSH Troubleshooting:\n\
-  1. Check network connectivity and firewall rules.\n\
-  2. Verify the host is reachable:\n\
-     ssh -vvv -i {key_path:?} {user}@{host}\n\n\
-Run 'rch doctor' for comprehensive SSH diagnostics."
-        )
+        code("RCH-E109"),
+        help("Install the required binary on the worker: {install_hint}")
     )]
-    ConnectionTimeout {
+    BinaryNotFound {
         host: String,
-        user: String,
-        key_path: PathBuf,
-        timeout_secs: u64,
+        binary: String,
+        install_hint: String,
     },
 
-    /// SSH host key verification failed.
-    #[error("SSH host key verification failed for {host}")]
+    /// Toolchain installation failed on remote worker.
+    #[error("Toolchain installation failed on {host}: {message}")]
     #[diagnostic(
-        code("RCH-E103"),
+        code("RCH-E110"),
+        help("Try installing the toolchain manually: rustup toolchain install {toolchain}")
+    )]
+    ToolchainInstallFailed {
+        host: String,
+        toolchain: String,
+        message: String,
+    },
+
+    /// Remote file permission error.
+    #[error("Permission denied for file on {host}: {path}")]
+    #[diagnostic(
+        code("RCH-E111"),
+        help("Check file permissions on the remote worker")
+    )]
+    RemotePermissionDenied {
+        host: String,
+        path: String,
+    },
+
+    /// SSH authentication failed (permission denied) - legacy alias.
+    #[error("SSH authentication failed for {user}@{host}")]
+    #[diagnostic(
+        code("RCH-E101"),
         help(
             "SSH Troubleshooting:\n\
-  1. Remove the old host key:\n\
-     ssh-keygen -R {host}\n\n\
-  2. Fetch and trust the new host key:\n\
-     ssh-keyscan -H {host} >> ~/.ssh/known_hosts\n\n\
-  3. Retry with verbose logs:\n\
-     ssh -vvv -i {key_path:?} {user}@{host}\n\n\
+  1. Verify key exists and copy key to worker if needed.\n\
+  2. Debug with verbose logs: ssh -vvv -i <key> {user}@{host}\n\n\
 Run 'rch doctor' for comprehensive SSH diagnostics."
         )
     )]
-    HostKeyVerificationFailed {
+    PermissionDenied {
         host: String,
         user: String,
         key_path: PathBuf,
@@ -260,15 +452,13 @@ Run 'rch doctor' for comprehensive SSH diagnostics."
     /// SSH agent is unavailable or has no keys.
     #[error("SSH agent unavailable for key {key_path:?}")]
     #[diagnostic(
-        code("RCH-E101"),
+        code("RCH-E112"),
         help(
             "SSH Troubleshooting:\n\
   1. Start the SSH agent and add your key:\n\
      eval $(ssh-agent) && ssh-add {key_path:?}\n\n\
   2. Verify agent has keys:\n\
      ssh-add -L\n\n\
-  3. Retry with verbose logs:\n\
-     ssh -vvv -i {key_path:?} {user}@{host}\n\n\
 Run 'rch doctor' for comprehensive SSH diagnostics."
         )
     )]
@@ -277,25 +467,6 @@ Run 'rch doctor' for comprehensive SSH diagnostics."
         user: String,
         key_path: PathBuf,
     },
-
-    /// Generic SSH connection failure.
-    #[error("SSH connection failed for {user}@{host}: {message}")]
-    #[diagnostic(
-        code("RCH-E100"),
-        help(
-            "SSH Troubleshooting:\n\
-  1. Verify host/user/key in workers.toml.\n\
-  2. Try a manual connection with verbose logs:\n\
-     ssh -vvv -i {key_path:?} {user}@{host}\n\n\
-Run 'rch doctor' for comprehensive SSH diagnostics."
-        )
-    )]
-    ConnectionFailed {
-        host: String,
-        user: String,
-        key_path: PathBuf,
-        message: String,
-    },
 }
 
 // =============================================================================
@@ -303,27 +474,29 @@ Run 'rch doctor' for comprehensive SSH diagnostics."
 // =============================================================================
 
 /// Errors related to the RCH daemon.
+///
+/// Error code range: RCH-E300 to RCH-E308
 #[derive(Error, Diagnostic, Debug)]
 pub enum DaemonError {
     /// Daemon is not running.
     #[error("RCH daemon is not running")]
-    #[diagnostic(code("RCH-E502"), help("Start the daemon with: rch daemon start"))]
+    #[diagnostic(code("RCH-E300"), help("Start the daemon with: rch daemon start"))]
     NotRunning,
 
     /// Daemon socket file not found.
     #[error("Daemon socket not found at {socket_path}")]
     #[diagnostic(
-        code("RCH-E502"),
+        code("RCH-E301"),
         help(
             "The daemon socket file does not exist. This usually means:\n  1. The daemon is not running\n  2. The socket path is misconfigured\n\nStart the daemon: rch daemon start\nOr check config: rch config show | grep socket"
         )
     )]
     SocketNotFound { socket_path: String },
 
-    /// Failed to connect to daemon.
+    /// Daemon socket connection refused.
     #[error("Failed to connect to daemon at {socket_path}")]
     #[diagnostic(
-        code("RCH-E500"),
+        code("RCH-E302"),
         help(
             "The daemon socket exists but connection failed.\n\nCheck daemon status: rch daemon status\nView daemon logs: rch daemon logs\nRestart daemon: rch daemon restart"
         )
@@ -334,111 +507,161 @@ pub enum DaemonError {
         source: std::io::Error,
     },
 
-    /// Daemon port is already in use.
-    #[error("Port {port} is already in use")]
+    /// Daemon socket permission denied.
+    #[error("Permission denied connecting to daemon socket at {socket_path}")]
     #[diagnostic(
-        code("RCH-E504"),
-        help("Stop the existing process or use RCH_SOCKET_PATH to specify a different socket")
+        code("RCH-E303"),
+        help("Check socket permissions or run with appropriate privileges")
     )]
-    PortInUse { port: u16 },
+    SocketPermissionDenied { socket_path: String },
 
     /// Daemon startup failed.
     #[error("Daemon startup failed")]
-    #[diagnostic(code("RCH-E504"), help("Check the logs for details: rch daemon logs"))]
+    #[diagnostic(code("RCH-E304"), help("Check the logs for details: rch daemon logs"))]
     StartupFailed {
         #[source]
         source: std::io::Error,
     },
 
-    /// Daemon protocol error.
-    #[error("Daemon protocol error: {message}")]
-    #[diagnostic(code("RCH-E501"))]
+    /// Daemon already running.
+    #[error("RCH daemon is already running (PID: {pid})")]
+    #[diagnostic(
+        code("RCH-E305"),
+        help("Stop the existing daemon first: rch daemon stop")
+    )]
+    AlreadyRunning { pid: u32 },
+
+    /// Daemon communication timeout.
+    #[error("Daemon communication timed out after {timeout_secs}s")]
+    #[diagnostic(
+        code("RCH-E306"),
+        help("The daemon may be overloaded. Try again or restart the daemon.")
+    )]
+    CommunicationTimeout { timeout_secs: u64 },
+
+    /// Daemon returned an error.
+    #[error("Daemon returned error: {message}")]
+    #[diagnostic(code("RCH-E307"))]
     ProtocolError { message: String },
 
-    /// Daemon returned an unexpected response.
-    #[error("Unexpected daemon response: {response}")]
+    /// Daemon version mismatch.
+    #[error("Daemon version mismatch: expected {expected}, got {actual}")]
     #[diagnostic(
-        code("RCH-E501"),
-        help("This may indicate a version mismatch between rch and rchd")
+        code("RCH-E308"),
+        help("Restart the daemon to load the new version: rch daemon restart")
     )]
-    UnexpectedResponse { response: String },
+    VersionMismatch { expected: String, actual: String },
 }
 
 // =============================================================================
-// Transfer Errors
+// Build/Transfer Errors
 // =============================================================================
 
-/// Errors related to file transfer operations.
+/// Errors related to build and file transfer operations.
+///
+/// Error code range: RCH-E400 to RCH-E408
 #[derive(Error, Diagnostic, Debug)]
 pub enum TransferError {
-    /// Failed to determine project root.
-    #[error("Failed to determine project root directory")]
+    /// Build failed on remote worker.
+    #[error("Build failed on {worker_id}")]
+    #[diagnostic(
+        code("RCH-E400"),
+        help("Check the build output for errors")
+    )]
+    BuildFailed {
+        worker_id: String,
+        stderr: String,
+    },
+
+    /// Build timed out.
+    #[error("Build timed out after {seconds}s")]
+    #[diagnostic(
+        code("RCH-E401"),
+        help("Consider increasing the build timeout or optimizing the build")
+    )]
+    Timeout { seconds: u64 },
+
+    /// Build cancelled.
+    #[error("Build cancelled")]
     #[diagnostic(
         code("RCH-E402"),
-        help(
-            "Could not get the current working directory.\n\nEnsure you are running from a valid directory:\n  pwd\n  ls -la"
-        )
+        help("The build was cancelled before completion")
     )]
-    NoProjectRoot {
+    Cancelled,
+
+    /// Build output missing.
+    #[error("Build output missing: expected {expected_path}")]
+    #[diagnostic(
+        code("RCH-E403"),
+        help("The build may have failed silently. Check build logs.")
+    )]
+    OutputMissing { expected_path: String },
+
+    /// Artifact transfer failed.
+    #[error("Failed to retrieve build artifacts from {worker_id}")]
+    #[diagnostic(
+        code("RCH-E404"),
+        help("Check that the build completed successfully on the worker")
+    )]
+    ArtifactFailed {
+        worker_id: String,
         #[source]
         source: std::io::Error,
     },
 
-    /// rsync command failed.
-    #[error("rsync failed with exit code {exit_code:?}")]
+    /// Project sync failed.
+    #[error("Project sync failed: {reason}")]
     #[diagnostic(
-        code("RCH-E400"),
+        code("RCH-E405"),
         help(
             "Ensure rsync is installed on both local and remote machines:\n  which rsync\n  ssh worker which rsync"
         )
     )]
-    RsyncFailed {
+    SyncFailed {
+        reason: String,
         exit_code: Option<i32>,
         stderr: String,
     },
 
-    /// SSH authentication failed during transfer.
-    #[error("SSH authentication failed for {user}@{host}")]
+    /// Working directory not found.
+    #[error("Working directory not found: {path}")]
     #[diagnostic(
-        code("RCH-E101"),
+        code("RCH-E406"),
         help(
-            "Verify SSH key permissions (chmod 600) and that the key is added to remote authorized_keys:\n  ssh-copy-id -i {identity_file} {user}@{host}"
+            "Could not access the working directory.\n\nEnsure you are running from a valid directory:\n  pwd\n  ls -la"
         )
     )]
-    SshAuthFailed {
-        host: String,
-        user: String,
-        identity_file: String,
-    },
-
-    /// Transfer timed out.
-    #[error("Transfer timed out after {seconds}s")]
-    #[diagnostic(
-        code("RCH-E401"),
-        help("Consider increasing the transfer timeout or checking network connectivity")
-    )]
-    Timeout { seconds: u64 },
-
-    /// Failed to create remote directory.
-    #[error("Failed to create remote directory: {path}")]
-    #[diagnostic(
-        code("RCH-E403"),
-        help("Check disk space and permissions on the remote worker")
-    )]
-    MkdirFailed {
+    WorkingDirNotFound {
         path: String,
         #[source]
         source: std::io::Error,
     },
 
-    /// Artifact retrieval failed.
-    #[error("Failed to retrieve build artifacts from {worker_id}")]
+    /// Command classification failed.
+    #[error("Failed to classify command: {command}")]
     #[diagnostic(
-        code("RCH-E309"),
-        help("Check that the build completed successfully on the worker")
+        code("RCH-E407"),
+        help("The command could not be classified for remote execution")
     )]
-    ArtifactFailed {
-        worker_id: String,
+    ClassificationFailed { command: String },
+
+    /// Build queue full.
+    #[error("Build queue is full ({queue_size} pending)")]
+    #[diagnostic(
+        code("RCH-E408"),
+        help("Wait for pending builds to complete or add more workers")
+    )]
+    QueueFull { queue_size: usize },
+
+    /// Failed to determine project root - legacy variant.
+    #[error("Failed to determine project root directory")]
+    #[diagnostic(
+        code("RCH-E406"),
+        help(
+            "Could not get the current working directory.\n\nEnsure you are running from a valid directory:\n  pwd\n  ls -la"
+        )
+    )]
+    NoProjectRoot {
         #[source]
         source: std::io::Error,
     },
@@ -449,7 +672,7 @@ pub enum TransferError {
     /// configured limits (size, time) and local execution should be used instead.
     #[error("Transfer skipped: {reason}")]
     #[diagnostic(
-        code("RCH-W410"),
+        code("RCH-W409"),
         help("Adjust transfer limits in config: max_transfer_mb, max_transfer_time_ms")
     )]
     TransferSkipped { reason: String },
@@ -460,22 +683,14 @@ pub enum TransferError {
 // =============================================================================
 
 /// Errors related to the Claude Code hook.
+///
+/// Error code range: RCH-E500 to RCH-E505
 #[derive(Error, Diagnostic, Debug)]
 pub enum HookError {
-    /// Invalid hook input JSON.
-    #[error("Invalid hook input: {message}")]
-    #[diagnostic(
-        code("RCH-E506"),
-        help(
-            "This error indicates a problem with the hook protocol.\nExpected JSON with tool_name and tool_input fields."
-        )
-    )]
-    InvalidInput { message: String },
-
     /// Hook installation failed.
     #[error("Failed to install Claude Code hook")]
     #[diagnostic(
-        code("RCH-E506"),
+        code("RCH-E500"),
         help(
             "Manual installation:\n  Add to ~/.config/claude-code/settings.json:\n  \"hooks\": {{\n    \"PreToolUse\": [{{ \"command\": \"rch\" }}]\n  }}"
         )
@@ -488,10 +703,46 @@ pub enum HookError {
     /// Claude Code settings file not found.
     #[error("Claude Code settings not found: {path}")]
     #[diagnostic(
-        code("RCH-E506"),
+        code("RCH-E501"),
         help("Ensure Claude Code is installed and has been run at least once")
     )]
     SettingsNotFound { path: PathBuf },
+
+    /// Hook settings parse error.
+    #[error("Failed to parse Claude Code settings: {message}")]
+    #[diagnostic(
+        code("RCH-E502"),
+        help("Check the JSON syntax in your Claude Code settings file")
+    )]
+    SettingsParseError { message: String },
+
+    /// Hook settings write error.
+    #[error("Failed to write Claude Code settings: {path}")]
+    #[diagnostic(
+        code("RCH-E503"),
+        help("Check file permissions for the settings file")
+    )]
+    SettingsWriteFailed {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// Hook already installed.
+    #[error("RCH hook is already installed")]
+    #[diagnostic(
+        code("RCH-E504"),
+        help("Use 'rch uninstall' to remove and reinstall if needed")
+    )]
+    AlreadyInstalled,
+
+    /// Hook not installed.
+    #[error("RCH hook is not installed")]
+    #[diagnostic(
+        code("RCH-E505"),
+        help("Install the hook with: rch install")
+    )]
+    NotInstalled,
 }
 
 // =============================================================================
@@ -499,11 +750,13 @@ pub enum HookError {
 // =============================================================================
 
 /// Errors related to self-update functionality.
+///
+/// Error code range: RCH-E506 to RCH-E510
 #[derive(Error, Diagnostic, Debug)]
 pub enum UpdateError {
     /// Failed to fetch release information.
     #[error("Failed to fetch release info from GitHub")]
-    #[diagnostic(code("RCH-E509"), help("Check your internet connection and try again"))]
+    #[diagnostic(code("RCH-E506"), help("Check your internet connection and try again"))]
     FetchFailed {
         #[source]
         source: Box<dyn std::error::Error + Send + Sync>,
@@ -512,7 +765,7 @@ pub enum UpdateError {
     /// No compatible release found.
     #[error("No compatible release found for {platform}")]
     #[diagnostic(
-        code("RCH-E509"),
+        code("RCH-E507"),
         help(
             "Build from source: cargo install --git https://github.com/Dicklesworthstone/remote_compilation_helper.git"
         )
@@ -522,7 +775,7 @@ pub enum UpdateError {
     /// Checksum verification failed.
     #[error("Checksum verification failed for downloaded binary")]
     #[diagnostic(
-        code("RCH-E406"),
+        code("RCH-E508"),
         help("The download may be corrupted. Try again or download manually from GitHub.")
     )]
     ChecksumFailed { expected: String, actual: String },
@@ -541,7 +794,7 @@ pub enum UpdateError {
     /// Rollback not available.
     #[error("No backup available for rollback")]
     #[diagnostic(
-        code("RCH-E509"),
+        code("RCH-E510"),
         help("Rollback is only available after a successful update")
     )]
     NoBackup,
@@ -1018,8 +1271,8 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_hook_invalid_input() {
-        let err = HookError::InvalidInput {
+    fn test_hook_settings_parse_error() {
+        let err = HookError::SettingsParseError {
             message: "missing tool_name".to_string(),
         };
 
@@ -1028,7 +1281,7 @@ mod tests {
         let formatted = format!("{:?}", report);
 
         assert!(formatted.contains("missing tool_name"));
-        assert_eq!(code, Some("RCH-E506".to_string()));
+        assert_eq!(code, Some("RCH-E502".to_string()));
     }
 
     #[test]
@@ -1042,7 +1295,7 @@ mod tests {
         let formatted = format!("{:?}", report);
 
         assert!(formatted.contains("settings.json"));
-        assert_eq!(code, Some("RCH-E506".to_string()));
+        assert_eq!(code, Some("RCH-E501".to_string()));
     }
 
     // =========================================================================
@@ -1064,7 +1317,7 @@ mod tests {
             formatted.contains("cargo install") || formatted.contains("source"),
             "Should suggest building from source: {formatted}"
         );
-        assert_eq!(code, Some("RCH-E509".to_string()));
+        assert_eq!(code, Some("RCH-E507".to_string()));
     }
 
     #[test]
@@ -1078,7 +1331,7 @@ mod tests {
         let report = Report::new(err);
         let formatted = format!("{:?}", report);
 
-        assert_eq!(code, Some("RCH-E406".to_string()));
+        assert_eq!(code, Some("RCH-E508".to_string()));
         assert!(
             formatted.contains("corrupted") || formatted.contains("download"),
             "Should suggest redownload: {formatted}"
@@ -1157,7 +1410,9 @@ user = "test"
 
     #[test]
     fn test_display_vs_debug_formats() {
-        let err = WorkerError::NoneConfigured;
+        let err = WorkerError::SelectionFailed {
+            reason: "no workers available".to_string(),
+        };
         let report = Report::new(err);
 
         let debug = format!("{:?}", report);
@@ -1166,7 +1421,7 @@ user = "test"
         // Display should be simpler
         assert!(display.len() <= debug.len());
         // Both should contain the core message
-        assert!(display.contains("No workers configured"));
+        assert!(display.contains("no workers available"));
     }
 
     // =========================================================================
