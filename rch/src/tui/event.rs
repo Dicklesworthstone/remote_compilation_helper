@@ -30,6 +30,10 @@ pub enum Action {
     Filter,
     /// Copy to clipboard.
     Copy,
+    /// Drain the selected worker.
+    DrainWorker,
+    /// Enable/undrain the selected worker.
+    EnableWorker,
     /// Text input character (for filter/search).
     TextInput(char),
     /// Delete last character (backspace in text mode).
@@ -65,6 +69,8 @@ fn handle_key(key: KeyEvent) -> Action {
         KeyCode::Char('?') | KeyCode::F(1) => Action::Help,
         KeyCode::Char('/') => Action::Filter,
         KeyCode::Char('y') => Action::Copy,
+        KeyCode::Char('d') => Action::DrainWorker,
+        KeyCode::Char('e') => Action::EnableWorker,
         KeyCode::PageUp => Action::PageUp,
         KeyCode::PageDown => Action::PageDown,
         KeyCode::Char('g') => Action::JumpTop,
@@ -580,5 +586,36 @@ mod tests {
         let end = KeyEvent::new(KeyCode::End, KeyModifiers::NONE);
         assert_eq!(handle_key(end), Action::Tick);
         info!("TEST PASS: test_handle_key_home_end_tick");
+    }
+
+    // ==================== Drain/Enable worker tests ====================
+
+    #[test]
+    fn test_handle_key_drain_worker() {
+        init_test_logging();
+        info!("TEST START: test_handle_key_drain_worker");
+        let d = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE);
+        assert_eq!(handle_key(d), Action::DrainWorker);
+        info!("TEST PASS: test_handle_key_drain_worker");
+    }
+
+    #[test]
+    fn test_handle_key_enable_worker() {
+        init_test_logging();
+        info!("TEST START: test_handle_key_enable_worker");
+        let e = KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE);
+        assert_eq!(handle_key(e), Action::EnableWorker);
+        info!("TEST PASS: test_handle_key_enable_worker");
+    }
+
+    #[test]
+    fn test_drain_enable_action_equality() {
+        init_test_logging();
+        info!("TEST START: test_drain_enable_action_equality");
+        assert_eq!(Action::DrainWorker, Action::DrainWorker);
+        assert_eq!(Action::EnableWorker, Action::EnableWorker);
+        assert_ne!(Action::DrainWorker, Action::EnableWorker);
+        assert_ne!(Action::DrainWorker, Action::Tick);
+        info!("TEST PASS: test_drain_enable_action_equality");
     }
 }

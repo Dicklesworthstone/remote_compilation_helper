@@ -92,6 +92,84 @@ async fn send_status_command() -> Result<String> {
     Ok(response)
 }
 
+/// Send a worker drain command to the daemon.
+#[cfg(unix)]
+pub async fn drain_worker(worker_id: &str) -> Result<()> {
+    let stream = UnixStream::connect(default_socket_path())
+        .await
+        .context("Failed to connect to daemon socket")?;
+
+    let (reader, mut writer) = stream.into_split();
+    let command = format!("POST /workers/{}/drain\n", worker_id);
+    writer.write_all(command.as_bytes()).await?;
+    writer.flush().await?;
+    writer.shutdown().await?;
+
+    let mut buf_reader = BufReader::new(reader);
+    let mut response = String::new();
+
+    loop {
+        let mut line = String::new();
+        match buf_reader.read_line(&mut line).await {
+            Ok(0) => break,
+            Ok(_) => response.push_str(&line),
+            Err(e) => return Err(e.into()),
+        }
+    }
+
+    // Check if response indicates success
+    if response.contains("\"status\":\"ok\"") {
+        Ok(())
+    } else {
+        anyhow::bail!("Drain failed: {}", response)
+    }
+}
+
+/// Send a worker drain command to the daemon (non-Unix fallback).
+#[cfg(not(unix))]
+pub async fn drain_worker(_worker_id: &str) -> Result<()> {
+    anyhow::bail!("worker drain is only supported on Unix-like platforms");
+}
+
+/// Send a worker enable command to the daemon.
+#[cfg(unix)]
+pub async fn enable_worker(worker_id: &str) -> Result<()> {
+    let stream = UnixStream::connect(default_socket_path())
+        .await
+        .context("Failed to connect to daemon socket")?;
+
+    let (reader, mut writer) = stream.into_split();
+    let command = format!("POST /workers/{}/enable\n", worker_id);
+    writer.write_all(command.as_bytes()).await?;
+    writer.flush().await?;
+    writer.shutdown().await?;
+
+    let mut buf_reader = BufReader::new(reader);
+    let mut response = String::new();
+
+    loop {
+        let mut line = String::new();
+        match buf_reader.read_line(&mut line).await {
+            Ok(0) => break,
+            Ok(_) => response.push_str(&line),
+            Err(e) => return Err(e.into()),
+        }
+    }
+
+    // Check if response indicates success
+    if response.contains("\"status\":\"ok\"") {
+        Ok(())
+    } else {
+        anyhow::bail!("Enable failed: {}", response)
+    }
+}
+
+/// Send a worker enable command to the daemon (non-Unix fallback).
+#[cfg(not(unix))]
+pub async fn enable_worker(_worker_id: &str) -> Result<()> {
+    anyhow::bail!("worker enable is only supported on Unix-like platforms");
+}
+
 /// Render comprehensive status from daemon API response.
 pub fn render_full_status(
     status: &DaemonFullStatusResponse,

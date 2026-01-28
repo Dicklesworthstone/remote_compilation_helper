@@ -135,6 +135,15 @@ impl TuiState {
         }
     }
 
+    /// Get the currently selected worker, if Workers panel is selected and has items.
+    pub fn selected_worker(&self) -> Option<&WorkerState> {
+        if self.selected_panel == Panel::Workers {
+            self.workers.get(self.selected_index)
+        } else {
+            None
+        }
+    }
+
     /// Switch to next panel.
     pub fn next_panel(&mut self) {
         self.selected_panel = self.selected_panel.next();
@@ -1003,5 +1012,66 @@ mod tests {
         assert_eq!(daemon.status, Status::Unknown);
         assert!(daemon.version.is_empty());
         info!("TEST PASS: test_daemon_state_default");
+    }
+
+    // ==================== Selected worker tests ====================
+
+    #[test]
+    fn test_selected_worker_when_workers_panel() {
+        init_test_logging();
+        info!("TEST START: test_selected_worker_when_workers_panel");
+        let mut state = TuiState::new();
+        state.workers.push(WorkerState {
+            id: "worker-1".to_string(),
+            host: "localhost".to_string(),
+            status: WorkerStatus::Healthy,
+            circuit: CircuitState::Closed,
+            total_slots: 8,
+            used_slots: 2,
+            latency_ms: 10,
+            last_seen: chrono::Utc::now(),
+            builds_completed: 5,
+        });
+        state.selected_panel = Panel::Workers;
+        state.selected_index = 0;
+
+        let selected = state.selected_worker();
+        assert!(selected.is_some());
+        assert_eq!(selected.unwrap().id, "worker-1");
+        info!("TEST PASS: test_selected_worker_when_workers_panel");
+    }
+
+    #[test]
+    fn test_selected_worker_when_other_panel() {
+        init_test_logging();
+        info!("TEST START: test_selected_worker_when_other_panel");
+        let mut state = TuiState::new();
+        state.workers.push(WorkerState {
+            id: "worker-1".to_string(),
+            host: "localhost".to_string(),
+            status: WorkerStatus::Healthy,
+            circuit: CircuitState::Closed,
+            total_slots: 8,
+            used_slots: 2,
+            latency_ms: 10,
+            last_seen: chrono::Utc::now(),
+            builds_completed: 5,
+        });
+        state.selected_panel = Panel::ActiveBuilds;
+        state.selected_index = 0;
+
+        let selected = state.selected_worker();
+        assert!(selected.is_none());
+        info!("TEST PASS: test_selected_worker_when_other_panel");
+    }
+
+    #[test]
+    fn test_selected_worker_empty_list() {
+        init_test_logging();
+        info!("TEST START: test_selected_worker_empty_list");
+        let state = TuiState::new();
+        let selected = state.selected_worker();
+        assert!(selected.is_none());
+        info!("TEST PASS: test_selected_worker_empty_list");
     }
 }

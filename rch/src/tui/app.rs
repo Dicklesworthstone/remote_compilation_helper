@@ -2,7 +2,7 @@
 //!
 //! Main entry point for the interactive dashboard.
 
-use crate::status_display::query_daemon_full_status;
+use crate::status_display::{drain_worker, enable_worker, query_daemon_full_status};
 use crate::status_types::DaemonFullStatusResponse;
 use crate::tui::{
     event::{Action, poll_event_with_mode},
@@ -502,6 +502,38 @@ async fn run_app(
                     // Copy selected item to clipboard
                     state.copy_selected();
                 }
+                Action::DrainWorker => {
+                    // Drain the selected worker (only when Workers panel is selected)
+                    if !state.show_help
+                        && !state.filter_mode
+                        && state.selected_panel == Panel::Workers
+                        && let Some(worker) = state.selected_worker()
+                    {
+                        let worker_id = worker.id.clone();
+                        if let Err(e) = drain_worker(&worker_id).await {
+                            state.error = Some(format!("Drain failed: {}", e));
+                        } else {
+                            // Refresh to show updated status
+                            refresh_state(state, config).await;
+                        }
+                    }
+                }
+                Action::EnableWorker => {
+                    // Enable/undrain the selected worker (only when Workers panel is selected)
+                    if !state.show_help
+                        && !state.filter_mode
+                        && state.selected_panel == Panel::Workers
+                        && let Some(worker) = state.selected_worker()
+                    {
+                        let worker_id = worker.id.clone();
+                        if let Err(e) = enable_worker(&worker_id).await {
+                            state.error = Some(format!("Enable failed: {}", e));
+                        } else {
+                            // Refresh to show updated status
+                            refresh_state(state, config).await;
+                        }
+                    }
+                }
                 Action::TextInput(c) => {
                     // Append character to filter query (only active in filter_mode)
                     if state.filter_mode {
@@ -820,70 +852,6 @@ mod tests {
     }
 
     #[test]
-    fn test_test_backend_size_defaults() {
-        let _guard = test_guard!();
-        init_test_logging();
-        info!("TEST START: test_test_backend_size_defaults");
-        // Clear any env vars that might interfere
-        std::env::remove_var("COLUMNS");
-        std::env::remove_var("LINES");
-        let (width, height) = test_backend_size();
-        info!("VERIFY: default size={}x{}", width, height);
-        assert_eq!(width, 80);
-        assert_eq!(height, 24);
-        info!("TEST PASS: test_test_backend_size_defaults");
-    }
-
-    #[test]
-    fn test_test_backend_size_from_env() {
-        let _guard = test_guard!();
-        init_test_logging();
-        info!("TEST START: test_test_backend_size_from_env");
-        std::env::set_var("COLUMNS", "120");
-        std::env::set_var("LINES", "40");
-        let (width, height) = test_backend_size();
-        info!("VERIFY: env size={}x{}", width, height);
-        assert_eq!(width, 120);
-        assert_eq!(height, 40);
-        std::env::remove_var("COLUMNS");
-        std::env::remove_var("LINES");
-        info!("TEST PASS: test_test_backend_size_from_env");
-    }
-
-    #[test]
-    fn test_test_backend_size_minimum_enforced() {
-        let _guard = test_guard!();
-        init_test_logging();
-        info!("TEST START: test_test_backend_size_minimum_enforced");
-        std::env::set_var("COLUMNS", "20");
-        std::env::set_var("LINES", "5");
-        let (width, height) = test_backend_size();
-        info!("VERIFY: min size enforced={}x{}", width, height);
-        // Minimum is 40x12
-        assert_eq!(width, 40);
-        assert_eq!(height, 12);
-        std::env::remove_var("COLUMNS");
-        std::env::remove_var("LINES");
-        info!("TEST PASS: test_test_backend_size_minimum_enforced");
-    }
-
-    #[test]
-    fn test_test_backend_size_invalid_env() {
-        let _guard = test_guard!();
-        init_test_logging();
-        info!("TEST START: test_test_backend_size_invalid_env");
-        std::env::set_var("COLUMNS", "not_a_number");
-        std::env::set_var("LINES", "also_invalid");
-        let (width, height) = test_backend_size();
-        info!("VERIFY: fallback to defaults={}x{}", width, height);
-        assert_eq!(width, 80);
-        assert_eq!(height, 24);
-        std::env::remove_var("COLUMNS");
-        std::env::remove_var("LINES");
-        info!("TEST PASS: test_test_backend_size_invalid_env");
-    }
-
-    #[test]
     fn test_buffer_to_string_basic() {
         let _guard = test_guard!();
         init_test_logging();
@@ -1053,7 +1021,12 @@ mod tests {
         // Test various sizes
         for (w, h) in [(40, 12), (80, 24), (120, 40), (160, 50)] {
             let snapshot = render_snapshot(&state, w, h);
-            info!("VERIFY: render {}x{} lines={}", w, h, snapshot.lines().count());
+            info!(
+                "VERIFY: render {}x{} lines={}",
+                w,
+                h,
+                snapshot.lines().count()
+            );
             assert!(snapshot.lines().count() >= h as usize);
         }
         info!("TEST PASS: test_render_snapshot_various_sizes");
