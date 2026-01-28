@@ -7720,6 +7720,39 @@ async fn self_test_run(
             style.highlight(&result.worker_id),
             detail
         );
+
+        // Verbose mode: show timing breakdown and additional info
+        if ctx.is_verbose() {
+            if result.passed {
+                // Calculate speedup
+                if let (Some(remote), Some(local)) = (result.remote_time_ms, result.local_time_ms) {
+                    let speedup = if remote > 0 {
+                        local as f64 / remote as f64
+                    } else {
+                        1.0
+                    };
+                    println!("      {} {:.1}x speedup", style.muted("→"), speedup);
+                    // Show hash comparison in verbose mode
+                    if let (Some(local_hash), Some(remote_hash)) =
+                        (&result.local_hash, &result.remote_hash)
+                    {
+                        let hash_match = if local_hash == remote_hash {
+                            style.success("match")
+                        } else {
+                            style.error("MISMATCH")
+                        };
+                        println!("      {} hash {}", style.muted("→"), hash_match);
+                    }
+                }
+            } else {
+                // For failed tests, show more error context
+                if let Some(ref err) = result.error
+                    && err.len() > 50
+                {
+                    println!("      {} {}", style.muted("error:"), style.error(err));
+                }
+            }
+        }
     }
 
     Ok(())
