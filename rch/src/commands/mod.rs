@@ -1,6 +1,17 @@
 //! CLI command handler implementations.
 //!
 //! This module contains the actual business logic for each CLI subcommand.
+//!
+//! ## Module Organization
+//!
+//! - `types` - Response types for JSON output (WorkerInfo, etc.)
+//! - Command handlers are implemented directly in this module
+
+// Sub-modules
+pub mod types;
+
+// Re-export types for backward compatibility
+pub use types::*;
 
 use crate::error::{ConfigError, SshError};
 use crate::status_types::{
@@ -90,63 +101,9 @@ fn print_file_validation(
         );
     }
 }
-/// Worker information for JSON output.
-#[derive(Debug, Clone, Serialize, JsonSchema)]
-pub struct WorkerInfo {
-    pub id: String,
-    pub host: String,
-    pub user: String,
-    pub total_slots: u32,
-    pub priority: u32,
-    pub tags: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub speedscore: Option<f64>,
-}
 
-impl From<&WorkerConfig> for WorkerInfo {
-    fn from(w: &WorkerConfig) -> Self {
-        Self {
-            id: w.id.as_str().to_string(),
-            host: w.host.clone(),
-            user: w.user.clone(),
-            total_slots: w.total_slots,
-            priority: w.priority,
-            tags: w.tags.clone(),
-            speedscore: None,
-        }
-    }
-}
-
-/// Workers list response.
-#[derive(Debug, Clone, Serialize, JsonSchema)]
-pub struct WorkersListResponse {
-    pub workers: Vec<WorkerInfo>,
-    pub count: usize,
-}
-
-/// Worker probe result.
-#[derive(Debug, Clone, Serialize)]
-pub struct WorkerProbeResult {
-    pub id: String,
-    pub host: String,
-    pub status: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub latency_ms: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}
-
-/// Worker capabilities report for JSON output.
-#[derive(Debug, Clone, Serialize)]
-pub struct WorkersCapabilitiesReport {
-    pub workers: Vec<WorkerCapabilitiesFromApi>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub local: Option<WorkerCapabilities>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub required_runtime: Option<RequiredRuntime>,
-    #[serde(skip_serializing_if = "Vec::is_empty", default)]
-    pub warnings: Vec<String>,
-}
+// Note: Response types (WorkerInfo, WorkersListResponse, etc.) are now in types.rs
+// and re-exported via `pub use types::*` at the top of this module.
 
 fn runtime_label(runtime: &RequiredRuntime) -> &'static str {
     match runtime {
