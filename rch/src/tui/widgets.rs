@@ -246,10 +246,11 @@ fn render_workers_panel(frame: &mut Frame, area: Rect, state: &TuiState, colors:
                 WorkerStatus::Unreachable => colors.error,
                 WorkerStatus::Draining => colors.info,
             };
+            // Use unicode symbols instead of emoji for terminal compatibility
             let circuit_icon = match w.circuit {
                 CircuitState::Closed => "",
-                CircuitState::HalfOpen => " ⚡",
-                CircuitState::Open => " 🔴",
+                CircuitState::HalfOpen => " ↻",
+                CircuitState::Open => " ●",
             };
 
             let style = if is_selected && i == state.selected_index {
@@ -303,13 +304,14 @@ fn render_active_builds_panel(
         .iter()
         .enumerate()
         .map(|(i, b)| {
+            // Use unicode symbols instead of emoji for terminal compatibility
             let status_icon = match b.status {
-                BuildStatus::Pending => "⏳",
-                BuildStatus::Syncing => "📤",
-                BuildStatus::Compiling => "🔨",
-                BuildStatus::Downloading => "📥",
-                BuildStatus::Completed => "✅",
-                BuildStatus::Failed => "❌",
+                BuildStatus::Pending => "◷",
+                BuildStatus::Syncing => "↑",
+                BuildStatus::Compiling => "⚙",
+                BuildStatus::Downloading => "↓",
+                BuildStatus::Completed => "✓",
+                BuildStatus::Failed => "✗",
             };
 
             let progress = b
