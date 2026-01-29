@@ -260,6 +260,31 @@ Use 'disable' to mark a worker as unavailable (optionally with --reason)."#)]
         jobs: bool,
     },
 
+    /// Quick health check - is RCH working?
+    ///
+    /// Single command to answer: "Is RCH working right now?"
+    /// Exit codes: 0=ready, 1=degraded (partial), 2=not ready.
+    #[command(after_help = r#"EXAMPLES:
+    rch check               # Quick status check
+    rch check --verbose     # Detailed health report
+    rch check --json        # Machine-readable output
+
+EXIT CODES:
+    0   Ready - daemon running, all workers healthy
+    1   Degraded - daemon running, some workers unreachable
+    2   Not ready - daemon not running or fatal issues
+
+USAGE:
+    # CI/CD health gate
+    rch check || exit 1
+
+    # Monitoring integration
+    rch check --json | jq '.data.status'
+
+    # Quick troubleshooting
+    rch check --verbose"#)]
+    Check,
+
     /// Show build queue - active and waiting compilations
     #[command(after_help = r#"EXAMPLES:
     rch queue                 # Show active builds and queue
@@ -1314,6 +1339,7 @@ async fn main() -> Result<()> {
             Commands::Daemon { action } => handle_daemon(action, &ctx).await,
             Commands::Workers { action } => handle_workers(action, &ctx).await,
             Commands::Status { workers, jobs } => handle_status(workers, jobs, &ctx).await,
+            Commands::Check => commands::check(&ctx).await,
             Commands::Queue { watch, follow } => {
                 commands::queue_status(watch, follow, &ctx).await
             }
