@@ -136,12 +136,51 @@ pub fn validate_config(config: &ConfigToValidate) -> Vec<ConfigWarning> {
     // Validate SSH key path
     if let Some(ref key_path) = config.ssh_key_path
         && !config.mock_ssh
-        && !key_path.exists()
     {
-        warnings.push(ConfigWarning::error(
-            "RCH_SSH_KEY",
-            format!("SSH key not found: {:?}", key_path),
-        ));
+        if !key_path.exists() {
+            warnings.push(ConfigWarning::error(
+                "RCH_SSH_KEY",
+                format!("SSH key not found: {:?}", key_path),
+            ));
+        } else if key_path.is_dir() {
+            warnings.push(ConfigWarning::error(
+                "RCH_SSH_KEY",
+                format!("SSH key path is a directory, not a file: {:?}", key_path),
+            ));
+        } else if key_path.is_symlink() {
+            // Resolve symlink and verify it points to a valid file
+            match key_path.canonicalize() {
+                Ok(canonical) => {
+                    if !canonical.is_file() {
+                        warnings.push(ConfigWarning::error(
+                            "RCH_SSH_KEY",
+                            format!(
+                                "SSH key symlink {:?} resolves to non-file: {:?}",
+                                key_path, canonical
+                            ),
+                        ));
+                    }
+                    // Note: We don't restrict symlink targets - users may have valid
+                    // reasons to symlink keys from different locations
+                }
+                Err(e) => {
+                    warnings.push(ConfigWarning::error(
+                        "RCH_SSH_KEY",
+                        format!("SSH key symlink {:?} cannot be resolved: {}", key_path, e),
+                    ));
+                }
+            }
+        } else if !key_path.is_file() {
+            // Not a regular file (could be a socket, device, etc.)
+            warnings.push(ConfigWarning::error(
+                "RCH_SSH_KEY",
+                format!("SSH key path is not a regular file: {:?}", key_path),
+            ));
+        }
+        // Note: We don't check read permissions here because:
+        // 1. SSH will give a clear error if the key is unreadable
+        // 2. Permission checks have TOCTOU issues (permissions could change)
+        // 3. The file might be readable by the user but not by the process checking
     }
 
     // Validate mock SSH usage

@@ -120,13 +120,22 @@ where
             continue;
         }
         if !is_valid_env_key(key) {
+            info!(
+                "Rejecting env var '{}': invalid key name (must start with letter/underscore, contain only alphanumeric/underscore)",
+                key
+            );
             rejected.push(key.to_string());
             continue;
         }
         let Some(value) = get_env(key) else {
+            // Variable not set - this is normal, don't log
             continue;
         };
         let Some(escaped) = shell_escape_value(&value) else {
+            info!(
+                "Rejecting env var '{}': value contains unsafe characters (newline, carriage return, or NUL)",
+                key
+            );
             rejected.push(key.to_string());
             continue;
         };
@@ -159,6 +168,8 @@ fn is_valid_env_key(key: &str) -> bool {
 }
 
 fn shell_escape_value(value: &str) -> Option<String> {
+    // Reject values with control characters that could break shell parsing
+    // Note: These are logged at the call site with the variable name for debugging
     if value.contains('\n') || value.contains('\r') || value.contains('\0') {
         return None;
     }
