@@ -3,7 +3,10 @@
 //! Runs comprehensive diagnostics and optionally auto-fixes common issues.
 
 use crate::agent::{AgentKind, install_hook};
-use crate::commands::{config_dir, load_workers_from_config};
+use crate::commands::{
+    DoctorCheck, DoctorCheckStatus, DoctorFixApplied, DoctorResponse, DoctorSummary, config_dir,
+    load_workers_from_config,
+};
 use crate::state::primitives::IdempotentResult;
 use crate::ui::context::OutputContext;
 use crate::ui::theme::StatusIndicator;
@@ -11,7 +14,6 @@ use anyhow::Result;
 use directories::ProjectDirs;
 use rch_common::ApiResponse;
 use rch_telemetry::TelemetryStorage;
-use serde::Serialize;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -24,65 +26,10 @@ fn default_socket_path() -> PathBuf {
     PathBuf::from(rch_common::default_socket_path())
 }
 
-// =============================================================================
-// JSON Response Types
-// =============================================================================
-
-/// Overall doctor command response for JSON output.
-#[derive(Debug, Clone, Serialize)]
-pub struct DoctorResponse {
-    pub checks: Vec<CheckResult>,
-    pub summary: DoctorSummary,
-    pub fixes_applied: Vec<FixApplied>,
-}
-
-/// Summary of all checks.
-#[derive(Debug, Clone, Serialize)]
-pub struct DoctorSummary {
-    pub total: usize,
-    pub passed: usize,
-    pub warnings: usize,
-    pub failed: usize,
-    pub fixed: usize,
-    pub would_fix: usize,
-}
-
-/// Result of a single diagnostic check.
-#[derive(Debug, Clone, Serialize)]
-pub struct CheckResult {
-    pub category: String,
-    pub name: String,
-    pub status: CheckStatus,
-    pub message: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub details: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub suggestion: Option<String>,
-    pub fixable: bool,
-    pub fix_applied: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub fix_message: Option<String>,
-}
-
-/// Status of a check.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum CheckStatus {
-    Pass,
-    Warning,
-    Fail,
-    Skipped,
-}
-
-/// A fix that was applied.
-#[derive(Debug, Clone, Serialize)]
-pub struct FixApplied {
-    pub check_name: String,
-    pub action: String,
-    pub success: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}
+// Type aliases for backward compatibility within this module
+type CheckResult = DoctorCheck;
+type CheckStatus = DoctorCheckStatus;
+type FixApplied = DoctorFixApplied;
 
 // =============================================================================
 // Doctor Command Options
