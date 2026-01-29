@@ -2269,13 +2269,31 @@ mod tests {
         init_test_logging();
         info!("TEST START: test_indicator_color_maps_all_variants");
         let colors = get_colors(false, ColorBlindMode::None);
-        assert_eq!(indicator_color(StatusIndicator::Success, &colors), colors.success);
-        assert_eq!(indicator_color(StatusIndicator::Error, &colors), colors.error);
-        assert_eq!(indicator_color(StatusIndicator::Warning, &colors), colors.warning);
+        assert_eq!(
+            indicator_color(StatusIndicator::Success, &colors),
+            colors.success
+        );
+        assert_eq!(
+            indicator_color(StatusIndicator::Error, &colors),
+            colors.error
+        );
+        assert_eq!(
+            indicator_color(StatusIndicator::Warning, &colors),
+            colors.warning
+        );
         assert_eq!(indicator_color(StatusIndicator::Info, &colors), colors.info);
-        assert_eq!(indicator_color(StatusIndicator::Pending, &colors), colors.muted);
-        assert_eq!(indicator_color(StatusIndicator::InProgress, &colors), colors.info);
-        assert_eq!(indicator_color(StatusIndicator::Disabled, &colors), colors.muted);
+        assert_eq!(
+            indicator_color(StatusIndicator::Pending, &colors),
+            colors.muted
+        );
+        assert_eq!(
+            indicator_color(StatusIndicator::InProgress, &colors),
+            colors.info
+        );
+        assert_eq!(
+            indicator_color(StatusIndicator::Disabled, &colors),
+            colors.muted
+        );
         info!("TEST PASS: test_indicator_color_maps_all_variants");
     }
 
@@ -2315,9 +2333,18 @@ mod tests {
         assert_eq!(SYMBOLS.success, StatusIndicator::Success.symbol(&SYMBOLS));
         assert_eq!(SYMBOLS.failure, StatusIndicator::Error.symbol(&SYMBOLS));
         assert_eq!(SYMBOLS.warning, StatusIndicator::Warning.symbol(&SYMBOLS));
-        assert_eq!(SYMBOLS.bullet_filled, StatusIndicator::Info.symbol(&SYMBOLS));
-        assert_eq!(SYMBOLS.bullet_empty, StatusIndicator::Pending.symbol(&SYMBOLS));
-        assert_eq!(SYMBOLS.bullet_half, StatusIndicator::InProgress.symbol(&SYMBOLS));
+        assert_eq!(
+            SYMBOLS.bullet_filled,
+            StatusIndicator::Info.symbol(&SYMBOLS)
+        );
+        assert_eq!(
+            SYMBOLS.bullet_empty,
+            StatusIndicator::Pending.symbol(&SYMBOLS)
+        );
+        assert_eq!(
+            SYMBOLS.bullet_half,
+            StatusIndicator::InProgress.symbol(&SYMBOLS)
+        );
         assert_eq!(SYMBOLS.disabled, StatusIndicator::Disabled.symbol(&SYMBOLS));
         info!("TEST PASS: test_symbols_match_status_indicator");
     }
@@ -2330,26 +2357,30 @@ mod tests {
             selected_panel: Panel::BuildHistory,
             ..Default::default()
         };
-        state.build_history.push_back(crate::tui::state::HistoricalBuild {
-            id: "b1".to_string(),
-            command: "cargo build".to_string(),
-            worker: Some("w1".to_string()),
-            started_at: Utc::now(),
-            completed_at: Utc::now(),
-            duration_ms: 1000,
-            success: true,
-            exit_code: Some(0),
-        });
-        state.build_history.push_back(crate::tui::state::HistoricalBuild {
-            id: "b2".to_string(),
-            command: "cargo test".to_string(),
-            worker: Some("w1".to_string()),
-            started_at: Utc::now(),
-            completed_at: Utc::now(),
-            duration_ms: 2000,
-            success: false,
-            exit_code: Some(1),
-        });
+        state
+            .build_history
+            .push_back(crate::tui::state::HistoricalBuild {
+                id: "b1".to_string(),
+                command: "cargo build".to_string(),
+                worker: Some("w1".to_string()),
+                started_at: Utc::now(),
+                completed_at: Utc::now(),
+                duration_ms: 1000,
+                success: true,
+                exit_code: Some(0),
+            });
+        state
+            .build_history
+            .push_back(crate::tui::state::HistoricalBuild {
+                id: "b2".to_string(),
+                command: "cargo test".to_string(),
+                worker: Some("w1".to_string()),
+                started_at: Utc::now(),
+                completed_at: Utc::now(),
+                duration_ms: 2000,
+                success: false,
+                exit_code: Some(1),
+            });
         let content = render_to_string(80, 12, |f| {
             let colors = get_colors(false, ColorBlindMode::None);
             render_build_history_panel(f, Rect::new(0, 0, 80, 12), &state, &colors);

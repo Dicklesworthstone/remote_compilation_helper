@@ -1412,12 +1412,14 @@ mod tests {
     #[test]
     fn test_confirm_dialog_can_be_set() {
         init_test_logging();
-        let mut state = TuiState::default();
-        state.confirm_dialog = Some(ConfirmDialog {
-            title: "Drain worker 'css'?".into(),
-            message: "This will stop routing new\njobs to this worker.".into(),
-            action: ConfirmAction::DrainWorker("css".into()),
-        });
+        let state = TuiState {
+            confirm_dialog: Some(ConfirmDialog {
+                title: "Drain worker 'css'?".into(),
+                message: "This will stop routing new\njobs to this worker.".into(),
+                action: ConfirmAction::DrainWorker("css".into()),
+            }),
+            ..Default::default()
+        };
         assert!(state.confirm_dialog.is_some());
         let dialog = state.confirm_dialog.as_ref().unwrap();
         assert_eq!(dialog.title, "Drain worker 'css'?");
@@ -1430,12 +1432,14 @@ mod tests {
     #[test]
     fn test_confirm_dialog_take_clears() {
         init_test_logging();
-        let mut state = TuiState::default();
-        state.confirm_dialog = Some(ConfirmDialog {
-            title: "Test".into(),
-            message: "Test message".into(),
-            action: ConfirmAction::DrainAllWorkers,
-        });
+        let mut state = TuiState {
+            confirm_dialog: Some(ConfirmDialog {
+                title: "Test".into(),
+                message: "Test message".into(),
+                action: ConfirmAction::DrainAllWorkers,
+            }),
+            ..Default::default()
+        };
         let dialog = state.confirm_dialog.take();
         assert!(dialog.is_some());
         assert!(state.confirm_dialog.is_none());

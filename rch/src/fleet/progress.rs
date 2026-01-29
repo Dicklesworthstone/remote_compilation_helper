@@ -280,8 +280,6 @@ mod tests {
         let progress = FleetProgress::new(&ctx, &ids);
 
         // Set custom progress within upload phase
-        progress
-            .set_progress("w1", 50, "uploading 50%...")
-            .await;
+        progress.set_progress("w1", 50, "uploading 50%...").await;
     }
 }

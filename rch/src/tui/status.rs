@@ -47,7 +47,7 @@ pub fn worker_symbol(status: &WorkerStatus) -> &'static str {
         WorkerStatus::Healthy => StatusIndicator::Info.unicode_symbol(), // ●
         WorkerStatus::Degraded => StatusIndicator::InProgress.unicode_symbol(), // ◐
         WorkerStatus::Unreachable => StatusIndicator::Pending.unicode_symbol(), // ○
-        WorkerStatus::Draining => Symbols::UNICODE.draining, // ◑
+        WorkerStatus::Draining => Symbols::UNICODE.draining,             // ◑
         WorkerStatus::Drained => StatusIndicator::Pending.unicode_symbol(), // ○ (empty)
         WorkerStatus::Disabled => StatusIndicator::Disabled.unicode_symbol(), // ⊘ (disabled)
     }
@@ -128,19 +128,49 @@ mod tests {
 
     #[test]
     fn test_worker_indicator_mappings() {
-        assert_eq!(worker_indicator(&WorkerStatus::Healthy), StatusIndicator::Success);
-        assert_eq!(worker_indicator(&WorkerStatus::Degraded), StatusIndicator::Warning);
-        assert_eq!(worker_indicator(&WorkerStatus::Unreachable), StatusIndicator::Error);
-        assert_eq!(worker_indicator(&WorkerStatus::Draining), StatusIndicator::InProgress);
+        assert_eq!(
+            worker_indicator(&WorkerStatus::Healthy),
+            StatusIndicator::Success
+        );
+        assert_eq!(
+            worker_indicator(&WorkerStatus::Degraded),
+            StatusIndicator::Warning
+        );
+        assert_eq!(
+            worker_indicator(&WorkerStatus::Unreachable),
+            StatusIndicator::Error
+        );
+        assert_eq!(
+            worker_indicator(&WorkerStatus::Draining),
+            StatusIndicator::InProgress
+        );
     }
 
     #[test]
     fn test_build_indicator_mappings() {
-        assert_eq!(build_indicator(&BuildStatus::Pending), StatusIndicator::Pending);
-        assert_eq!(build_indicator(&BuildStatus::Syncing), StatusIndicator::InProgress);
-        assert_eq!(build_indicator(&BuildStatus::Compiling), StatusIndicator::InProgress);
-        assert_eq!(build_indicator(&BuildStatus::Downloading), StatusIndicator::InProgress);
-        assert_eq!(build_indicator(&BuildStatus::Completed), StatusIndicator::Success);
-        assert_eq!(build_indicator(&BuildStatus::Failed), StatusIndicator::Error);
+        assert_eq!(
+            build_indicator(&BuildStatus::Pending),
+            StatusIndicator::Pending
+        );
+        assert_eq!(
+            build_indicator(&BuildStatus::Syncing),
+            StatusIndicator::InProgress
+        );
+        assert_eq!(
+            build_indicator(&BuildStatus::Compiling),
+            StatusIndicator::InProgress
+        );
+        assert_eq!(
+            build_indicator(&BuildStatus::Downloading),
+            StatusIndicator::InProgress
+        );
+        assert_eq!(
+            build_indicator(&BuildStatus::Completed),
+            StatusIndicator::Success
+        );
+        assert_eq!(
+            build_indicator(&BuildStatus::Failed),
+            StatusIndicator::Error
+        );
     }
 }

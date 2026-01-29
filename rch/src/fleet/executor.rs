@@ -93,7 +93,13 @@ impl FleetExecutor {
         match strategy {
             DeploymentStrategy::AllAtOnce { parallelism } => {
                 let results = self
-                    .deploy_batch(&mut plan, 0..worker_count, parallelism, ctx, progress.clone())
+                    .deploy_batch(
+                        &mut plan,
+                        0..worker_count,
+                        parallelism,
+                        ctx,
+                        progress.clone(),
+                    )
                     .await?;
                 for (idx, success) in results {
                     if success {
@@ -124,7 +130,13 @@ impl FleetExecutor {
 
                 // Deploy to canary workers
                 let canary_results = self
-                    .deploy_batch(&mut plan, 0..canary_count, self.parallelism, ctx, progress.clone())
+                    .deploy_batch(
+                        &mut plan,
+                        0..canary_count,
+                        self.parallelism,
+                        ctx,
+                        progress.clone(),
+                    )
                     .await?;
                 let canary_failed = canary_results.iter().filter(|(_, s)| !s).count();
 
@@ -150,7 +162,13 @@ impl FleetExecutor {
                         println!("  {} Deploying to remaining workers...", style.muted("→"));
                     }
                     let remaining_results = self
-                        .deploy_batch(&mut plan, canary_count..worker_count, self.parallelism, ctx, progress.clone())
+                        .deploy_batch(
+                            &mut plan,
+                            canary_count..worker_count,
+                            self.parallelism,
+                            ctx,
+                            progress.clone(),
+                        )
                         .await?;
 
                     for (idx, success) in canary_results
@@ -261,12 +279,16 @@ impl FleetExecutor {
 
                 // Check if we need to deploy
                 if !force && current_version.as_ref() == Some(&target_version) {
-                    progress.worker_skipped(&worker_id, "already at version").await;
+                    progress
+                        .worker_skipped(&worker_id, "already at version")
+                        .await;
                     return (idx, worker_id, true, DeploymentStatus::Skipped);
                 }
 
                 // Connecting phase
-                progress.set_phase(&worker_id, DeployPhase::Connecting).await;
+                progress
+                    .set_phase(&worker_id, DeployPhase::Connecting)
+                    .await;
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
                 // Upload phase
@@ -274,7 +296,9 @@ impl FleetExecutor {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
                 // Install phase
-                progress.set_phase(&worker_id, DeployPhase::Installing).await;
+                progress
+                    .set_phase(&worker_id, DeployPhase::Installing)
+                    .await;
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
                 // Verify phase
@@ -292,7 +316,7 @@ impl FleetExecutor {
         let mut results = Vec::new();
         for handle in handles {
             let (idx, worker_id, success, status) = handle.await?;
-            plan.workers[idx].status = status.clone();
+            plan.workers[idx].status = status;
 
             // In JSON mode, also print status (progress bars are hidden)
             if is_json {

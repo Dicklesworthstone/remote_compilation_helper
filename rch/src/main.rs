@@ -1340,9 +1340,7 @@ async fn main() -> Result<()> {
             Commands::Workers { action } => handle_workers(action, &ctx).await,
             Commands::Status { workers, jobs } => handle_status(workers, jobs, &ctx).await,
             Commands::Check => commands::check(&ctx).await,
-            Commands::Queue { watch, follow } => {
-                commands::queue_status(watch, follow, &ctx).await
-            }
+            Commands::Queue { watch, follow } => commands::queue_status(watch, follow, &ctx).await,
             Commands::Cancel {
                 build_id,
                 all,

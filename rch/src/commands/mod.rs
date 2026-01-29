@@ -27,9 +27,9 @@ use anyhow::{Context, Result, bail};
 use directories::ProjectDirs;
 use rch_common::{
     ApiError, ApiResponse, Classification, ClassificationDetails, CommandPriority,
-    ConfigValueSource, DiscoveredHost, ErrorCode, RchConfig, RequiredRuntime, SelectedWorker,
-    SelectionReason, SshClient, SshOptions, WorkerCapabilities, WorkerConfig, WorkerId,
-    classify_command_detailed, discover_all,
+    ConfigValueSource, DiscoveredHost, ErrorCode, RchConfig, RequiredRuntime, SshClient,
+    SshOptions, WorkerCapabilities, WorkerConfig, WorkerId, classify_command_detailed,
+    discover_all,
 };
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -7582,7 +7582,13 @@ pub async fn check(ctx: &OutputContext) -> Result<()> {
                                     vec!["No workers configured".to_string()],
                                 )
                             } else if healthy_count == total_count {
-                                ("ready".to_string(), 0, daemon_info, workers_info, issues_list)
+                                (
+                                    "ready".to_string(),
+                                    0,
+                                    daemon_info,
+                                    workers_info,
+                                    issues_list,
+                                )
                             } else if healthy_count > 0 {
                                 (
                                     "degraded".to_string(),
@@ -7592,8 +7598,7 @@ pub async fn check(ctx: &OutputContext) -> Result<()> {
                                     issues_list,
                                 )
                             } else {
-                                issues_list
-                                    .insert(0, "All workers are unreachable".to_string());
+                                issues_list.insert(0, "All workers are unreachable".to_string());
                                 (
                                     "not_ready".to_string(),
                                     2,
@@ -7669,8 +7674,11 @@ pub async fn check(ctx: &OutputContext) -> Result<()> {
 
     // Check if hook is installed
     let hook_installed = {
-        use crate::agent::{AgentKind, check_hook_status, HookStatus};
-        matches!(check_hook_status(AgentKind::ClaudeCode), Ok(HookStatus::Installed))
+        use crate::agent::{AgentKind, HookStatus, check_hook_status};
+        matches!(
+            check_hook_status(AgentKind::ClaudeCode),
+            Ok(HookStatus::Installed)
+        )
     };
 
     let hook_info = HookCheckInfo {
@@ -7717,7 +7725,10 @@ pub async fn check(ctx: &OutputContext) -> Result<()> {
             );
         }
         "not_ready" => {
-            let issue = issues.first().map(|s| s.as_str()).unwrap_or("unknown error");
+            let issue = issues
+                .first()
+                .map(|s| s.as_str())
+                .unwrap_or("unknown error");
             println!("{} RCH not ready: {}", style.error("\u{2717}"), issue);
         }
         _ => {}
@@ -7741,7 +7752,12 @@ pub async fn check(ctx: &OutputContext) -> Result<()> {
             } else {
                 format!("{} not running", style.error("\u{2717}"))
             };
-            println!("  {} {} {}", style.key("Daemon"), style.muted(":"), daemon_status);
+            println!(
+                "  {} {} {}",
+                style.key("Daemon"),
+                style.muted(":"),
+                daemon_status
+            );
         }
 
         // Workers status
@@ -7775,7 +7791,12 @@ pub async fn check(ctx: &OutputContext) -> Result<()> {
         } else {
             format!("{} not installed", style.warning("\u{26A0}"))
         };
-        println!("  {} {} {}", style.key("Hook"), style.muted(":"), hook_status);
+        println!(
+            "  {} {} {}",
+            style.key("Hook"),
+            style.muted(":"),
+            hook_status
+        );
 
         // Issues
         if !issues.is_empty() {
@@ -8181,10 +8202,10 @@ async fn queue_follow(ctx: &OutputContext) -> Result<()> {
                 continue;
             }
 
-            if let Ok(event) = serde_json::from_str::<serde_json::Value>(trimmed) {
-                if let Some(formatted) = format_build_event(&event, &style) {
-                    println!("{formatted}");
-                }
+            if let Ok(event) = serde_json::from_str::<serde_json::Value>(trimmed)
+                && let Some(formatted) = format_build_event(&event, style)
+            {
+                println!("{formatted}");
             }
         }
     }
@@ -8206,7 +8227,11 @@ fn format_build_event(
         .get("timestamp")
         .and_then(|t| t.as_str())
         .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
-        .map(|dt| dt.with_timezone(&chrono::Local).format("%H:%M:%S").to_string())
+        .map(|dt| {
+            dt.with_timezone(&chrono::Local)
+                .format("%H:%M:%S")
+                .to_string()
+        })
         .unwrap_or_else(|| "??:??:??".to_string());
 
     let ts_display = style.muted(&format!("[{ts}]"));
@@ -8236,7 +8261,10 @@ fn format_build_event(
                 .and_then(|v| v.as_u64())
                 .map(|n| format!("b-{n}"))
                 .unwrap_or_else(|| "?".to_string());
-            let worker = data.get("worker_id").and_then(|v| v.as_str()).unwrap_or("?");
+            let worker = data
+                .get("worker_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
             Some(format!(
                 "{ts_display} {} {id} {cmd} {} {worker}",
                 style.success("STARTED   "),
@@ -8399,11 +8427,7 @@ pub async fn cancel_build(
 }
 
 /// Dry-run mode: preview what builds would be cancelled.
-async fn cancel_build_dry_run(
-    build_id: Option<u64>,
-    all: bool,
-    ctx: &OutputContext,
-) -> Result<()> {
+async fn cancel_build_dry_run(build_id: Option<u64>, all: bool, ctx: &OutputContext) -> Result<()> {
     let style = ctx.style();
 
     // Query daemon for current active builds
@@ -8457,8 +8481,7 @@ async fn cancel_build_dry_run(
     );
     let now = chrono::Utc::now();
     for build in &builds {
-        let elapsed = if let Ok(started) = chrono::DateTime::parse_from_rfc3339(&build.started_at)
-        {
+        let elapsed = if let Ok(started) = chrono::DateTime::parse_from_rfc3339(&build.started_at) {
             let secs = (now - started.with_timezone(&chrono::Utc))
                 .num_seconds()
                 .max(0) as u64;
@@ -8474,10 +8497,7 @@ async fn cancel_build_dry_run(
             style.muted(&elapsed),
         );
     }
-    println!(
-        "\n{}",
-        style.muted("Run without --dry-run to cancel.")
-    );
+    println!("\n{}", style.muted("Run without --dry-run to cancel."));
 
     Ok(())
 }
@@ -9299,6 +9319,7 @@ mod tests {
     use crate::ui::writer::SharedOutputBuffer;
     use rch_common::CompilationKind;
     use rch_common::test_guard;
+    use rch_common::{SelectedWorker, SelectionReason};
 
     struct TestConfigDirGuard;
 
@@ -10832,10 +10853,22 @@ mod tests {
             "timestamp": "2026-01-28T14:32:15+00:00",
         });
         let formatted = format_build_event(&event, &style).unwrap();
-        assert!(formatted.contains("STARTED"), "should contain STARTED: {formatted}");
-        assert!(formatted.contains("b-42"), "should contain build id: {formatted}");
-        assert!(formatted.contains("cargo build"), "should contain command: {formatted}");
-        assert!(formatted.contains("css"), "should contain worker: {formatted}");
+        assert!(
+            formatted.contains("STARTED"),
+            "should contain STARTED: {formatted}"
+        );
+        assert!(
+            formatted.contains("b-42"),
+            "should contain build id: {formatted}"
+        );
+        assert!(
+            formatted.contains("cargo build"),
+            "should contain command: {formatted}"
+        );
+        assert!(
+            formatted.contains("css"),
+            "should contain worker: {formatted}"
+        );
     }
 
     #[test]
@@ -10856,10 +10889,22 @@ mod tests {
             "timestamp": "2026-01-28T14:33:45+00:00",
         });
         let formatted = format_build_event(&event, &style).unwrap();
-        assert!(formatted.contains("COMPLETE"), "should contain COMPLETE: {formatted}");
-        assert!(formatted.contains("b-42"), "should contain build id: {formatted}");
-        assert!(formatted.contains("1m 30s"), "should contain duration: {formatted}");
-        assert!(formatted.contains("✓"), "should contain check mark: {formatted}");
+        assert!(
+            formatted.contains("COMPLETE"),
+            "should contain COMPLETE: {formatted}"
+        );
+        assert!(
+            formatted.contains("b-42"),
+            "should contain build id: {formatted}"
+        );
+        assert!(
+            formatted.contains("1m 30s"),
+            "should contain duration: {formatted}"
+        );
+        assert!(
+            formatted.contains("✓"),
+            "should contain check mark: {formatted}"
+        );
     }
 
     #[test]
@@ -10880,10 +10925,22 @@ mod tests {
             "timestamp": "2026-01-28T14:34:02+00:00",
         });
         let formatted = format_build_event(&event, &style).unwrap();
-        assert!(formatted.contains("FAILED"), "should contain FAILED: {formatted}");
-        assert!(formatted.contains("b-43"), "should contain build id: {formatted}");
-        assert!(formatted.contains("exit 1"), "should contain exit code: {formatted}");
-        assert!(formatted.contains("✗"), "should contain cross mark: {formatted}");
+        assert!(
+            formatted.contains("FAILED"),
+            "should contain FAILED: {formatted}"
+        );
+        assert!(
+            formatted.contains("b-43"),
+            "should contain build id: {formatted}"
+        );
+        assert!(
+            formatted.contains("exit 1"),
+            "should contain exit code: {formatted}"
+        );
+        assert!(
+            formatted.contains("✗"),
+            "should contain cross mark: {formatted}"
+        );
     }
 
     #[test]
@@ -10903,10 +10960,22 @@ mod tests {
             "timestamp": "2026-01-28T14:30:00+00:00",
         });
         let formatted = format_build_event(&event, &style).unwrap();
-        assert!(formatted.contains("QUEUED"), "should contain QUEUED: {formatted}");
-        assert!(formatted.contains("q-10"), "should contain queue id: {formatted}");
-        assert!(formatted.contains("cargo check"), "should contain command: {formatted}");
-        assert!(formatted.contains("pos 2"), "should contain position: {formatted}");
+        assert!(
+            formatted.contains("QUEUED"),
+            "should contain QUEUED: {formatted}"
+        );
+        assert!(
+            formatted.contains("q-10"),
+            "should contain queue id: {formatted}"
+        );
+        assert!(
+            formatted.contains("cargo check"),
+            "should contain command: {formatted}"
+        );
+        assert!(
+            formatted.contains("pos 2"),
+            "should contain position: {formatted}"
+        );
     }
 
     #[test]
@@ -10923,9 +10992,18 @@ mod tests {
             "timestamp": "2026-01-28T14:31:00+00:00",
         });
         let formatted = format_build_event(&event, &style).unwrap();
-        assert!(formatted.contains("DEQUEUED"), "should contain DEQUEUED: {formatted}");
-        assert!(formatted.contains("q-10"), "should contain queue id: {formatted}");
-        assert!(formatted.contains("hook_exited"), "should contain reason: {formatted}");
+        assert!(
+            formatted.contains("DEQUEUED"),
+            "should contain DEQUEUED: {formatted}"
+        );
+        assert!(
+            formatted.contains("q-10"),
+            "should contain queue id: {formatted}"
+        );
+        assert!(
+            formatted.contains("hook_exited"),
+            "should contain reason: {formatted}"
+        );
     }
 
     #[test]

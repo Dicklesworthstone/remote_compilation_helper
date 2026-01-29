@@ -644,8 +644,7 @@ async fn run_app(
                                 let mut had_error = false;
                                 for wid in &worker_ids {
                                     if let Err(e) = drain_worker(wid).await {
-                                        state.error =
-                                            Some(format!("Drain {} failed: {}", wid, e));
+                                        state.error = Some(format!("Drain {} failed: {}", wid, e));
                                         had_error = true;
                                         break;
                                     }
