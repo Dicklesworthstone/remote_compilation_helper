@@ -669,6 +669,9 @@ pub struct RchConfig {
     /// Worker health alerting configuration (daemon).
     #[serde(default)]
     pub alerts: AlertsConfig,
+    /// Fleet operation configuration (bd-rs7w.2).
+    #[serde(default)]
+    pub fleet: FleetConfig,
 }
 
 /// Worker health alerting configuration.
@@ -724,6 +727,94 @@ impl Default for AlertsConfig {
             suppress_duplicates_secs: default_alert_suppress_duplicates_secs(),
             webhook: None,
         }
+    }
+}
+
+/// Fleet operation configuration.
+///
+/// Controls timeouts, thresholds, and behavior for fleet management commands
+/// like `rch fleet preflight`, `rch fleet status`, and `rch fleet deploy`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FleetConfig {
+    /// SSH connection timeout in seconds.
+    #[serde(default = "default_fleet_ssh_connect_timeout_secs")]
+    pub ssh_connect_timeout_secs: u64,
+    /// SSH command execution timeout in seconds.
+    #[serde(default = "default_fleet_ssh_command_timeout_secs")]
+    pub ssh_command_timeout_secs: u64,
+    /// Minimum required disk space in MB for worker health.
+    #[serde(default = "default_fleet_min_disk_space_mb")]
+    pub min_disk_space_mb: u64,
+    /// Maximum acceptable load average for worker health.
+    #[serde(default = "default_fleet_max_load_average")]
+    pub max_load_average: f64,
+    /// Maximum number of concurrent SSH connections.
+    #[serde(default = "default_fleet_max_concurrent_workers")]
+    pub max_concurrent_workers: usize,
+    /// Number of retry attempts for transient failures.
+    #[serde(default = "default_fleet_retry_count")]
+    pub retry_count: u32,
+    /// Delay between retries in milliseconds.
+    #[serde(default = "default_fleet_retry_delay_ms")]
+    pub retry_delay_ms: u64,
+}
+
+fn default_fleet_ssh_connect_timeout_secs() -> u64 {
+    10
+}
+
+fn default_fleet_ssh_command_timeout_secs() -> u64 {
+    30
+}
+
+fn default_fleet_min_disk_space_mb() -> u64 {
+    500
+}
+
+fn default_fleet_max_load_average() -> f64 {
+    10.0
+}
+
+fn default_fleet_max_concurrent_workers() -> usize {
+    10
+}
+
+fn default_fleet_retry_count() -> u32 {
+    2
+}
+
+fn default_fleet_retry_delay_ms() -> u64 {
+    1000
+}
+
+impl Default for FleetConfig {
+    fn default() -> Self {
+        Self {
+            ssh_connect_timeout_secs: default_fleet_ssh_connect_timeout_secs(),
+            ssh_command_timeout_secs: default_fleet_ssh_command_timeout_secs(),
+            min_disk_space_mb: default_fleet_min_disk_space_mb(),
+            max_load_average: default_fleet_max_load_average(),
+            max_concurrent_workers: default_fleet_max_concurrent_workers(),
+            retry_count: default_fleet_retry_count(),
+            retry_delay_ms: default_fleet_retry_delay_ms(),
+        }
+    }
+}
+
+impl FleetConfig {
+    /// Get SSH connect timeout as Duration.
+    pub fn ssh_connect_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.ssh_connect_timeout_secs)
+    }
+
+    /// Get SSH command timeout as Duration.
+    pub fn ssh_command_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.ssh_command_timeout_secs)
+    }
+
+    /// Get retry delay as Duration.
+    pub fn retry_delay(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.retry_delay_ms)
     }
 }
 

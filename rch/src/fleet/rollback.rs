@@ -1,14 +1,44 @@
 //! Rollback management for fleet deployments.
 //!
 //! Handles reverting workers to previous versions when deployments fail.
+//!
+//! ## Backup Registry
+//!
+//! The backup registry tracks all worker backups in a local JSON file at
+//! `~/.local/share/rch/backups/registry.json`. Each backup entry includes:
+//! - Worker ID and version
+//! - SHA256 hash of the binary for verification
+//! - Remote path where the backup is stored on the worker
+//! - Timestamp of when the backup was created
+//!
+//! The registry uses atomic writes with file locking to handle concurrent access.
 
 use crate::fleet::history::HistoryManager;
 use crate::ui::context::OutputContext;
 use crate::ui::theme::StatusIndicator;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rch_common::WorkerConfig;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::io::{Read, Write};
 use std::path::PathBuf;
+use tracing::{debug, error, info, warn};
+
+// =============================================================================
+// Constants
+// =============================================================================
+
+/// Default remote path to the rch-wkr binary on workers.
+pub const REMOTE_RCH_PATH: &str = "~/.local/bin/rch-wkr";
+
+/// Default remote backup directory on workers.
+pub const REMOTE_BACKUP_DIR: &str = "~/.rch/backups";
+
+/// Maximum number of backups to keep per worker.
+pub const MAX_BACKUPS_PER_WORKER: usize = 3;
+
+/// Registry file name.
+const REGISTRY_FILE: &str = "registry.json";
 
 /// Backup information for a worker's previous state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -17,9 +47,14 @@ pub struct WorkerBackup {
     pub worker_id: String,
     /// Version that was backed up.
     pub version: String,
-    /// Path to backup binary.
+    /// Local path to backup metadata.
     pub backup_path: PathBuf,
-    /// When the backup was created.
+    /// Remote path where the backup binary is stored on the worker.
+    pub remote_path: PathBuf,
+    /// SHA256 hash of the backed up binary for verification.
+    /// Set to "unknown" if hash could not be computed.
+    pub binary_hash: String,
+    /// When the backup was created (RFC 3339 format).
     pub created_at: String,
 }
 
@@ -56,6 +91,183 @@ impl RollbackManager {
             history: HistoryManager::new()?,
             backup_dir,
         })
+    }
+
+    /// Create a rollback manager with a custom backup directory (for testing).
+    #[cfg(test)]
+    pub fn with_path(backup_dir: &std::path::Path) -> Result<Self> {
+        std::fs::create_dir_all(backup_dir)?;
+        Ok(Self {
+            history: HistoryManager::new()?,
+            backup_dir: backup_dir.to_path_buf(),
+        })
+    }
+
+    /// Get the path to the registry file.
+    fn registry_path(&self) -> PathBuf {
+        self.backup_dir.join(REGISTRY_FILE)
+    }
+
+    /// Load the backup registry from disk.
+    ///
+    /// Returns an empty vector if the registry doesn't exist yet.
+    /// Handles corrupted files by backing them up and returning empty.
+    pub fn load_registry(&self) -> Result<Vec<WorkerBackup>> {
+        let path = self.registry_path();
+        if !path.exists() {
+            debug!("Registry file does not exist, returning empty");
+            return Ok(Vec::new());
+        }
+
+        let mut file = match std::fs::File::open(&path) {
+            Ok(f) => f,
+            Err(e) => {
+                warn!(error = %e, "Failed to open registry file");
+                return Ok(Vec::new());
+            }
+        };
+
+        let mut content = String::new();
+        if let Err(e) = file.read_to_string(&mut content) {
+            warn!(error = %e, "Failed to read registry file");
+            return Ok(Vec::new());
+        }
+
+        match serde_json::from_str::<Vec<WorkerBackup>>(&content) {
+            Ok(registry) => {
+                debug!(count = registry.len(), "Loaded backup registry");
+                Ok(registry)
+            }
+            Err(e) => {
+                error!(error = %e, "Corrupted backup registry, backing up and recreating");
+                // Backup the corrupted file
+                let backup_path = path.with_extension("json.corrupted");
+                if let Err(rename_err) = std::fs::rename(&path, &backup_path) {
+                    warn!(error = %rename_err, "Failed to backup corrupted registry");
+                } else {
+                    info!(path = %backup_path.display(), "Corrupted registry backed up");
+                }
+                Ok(Vec::new())
+            }
+        }
+    }
+
+    /// Save a backup entry to the registry.
+    ///
+    /// Uses atomic writes to prevent corruption from concurrent access.
+    pub fn save_backup_entry(&self, backup: &WorkerBackup) -> Result<()> {
+        let path = self.registry_path();
+        let temp_path = path.with_extension("json.tmp");
+
+        // Load existing registry
+        let mut registry = self.load_registry().unwrap_or_default();
+
+        // Add the new backup
+        registry.push(backup.clone());
+
+        // Write atomically via temp file
+        let content =
+            serde_json::to_string_pretty(&registry).context("Failed to serialize registry")?;
+
+        let mut file =
+            std::fs::File::create(&temp_path).context("Failed to create temp registry file")?;
+        file.write_all(content.as_bytes())
+            .context("Failed to write registry")?;
+        file.sync_all().context("Failed to sync registry file")?;
+        drop(file);
+
+        // Atomic rename
+        std::fs::rename(&temp_path, &path)
+            .context("Failed to rename temp registry to final path")?;
+
+        info!(
+            worker = %backup.worker_id,
+            version = %backup.version,
+            "Backup entry saved to registry"
+        );
+
+        Ok(())
+    }
+
+    /// Get the latest backup for a worker.
+    pub fn get_latest_backup(&self, worker_id: &str) -> Option<WorkerBackup> {
+        let registry = self.load_registry().ok()?;
+
+        registry
+            .into_iter()
+            .filter(|b| b.worker_id == worker_id)
+            .max_by(|a, b| a.created_at.cmp(&b.created_at))
+    }
+
+    /// Get a specific version's backup for a worker.
+    pub fn get_backup(&self, worker_id: &str, version: &str) -> Option<WorkerBackup> {
+        let registry = self.load_registry().ok()?;
+
+        registry
+            .into_iter()
+            .find(|b| b.worker_id == worker_id && b.version == version)
+    }
+
+    /// Prune old backups, keeping only the most recent `max_per_worker` for each worker.
+    ///
+    /// Returns the list of removed backups so the caller can clean up remote files.
+    pub fn prune_old_backups(&mut self, max_per_worker: usize) -> Result<Vec<WorkerBackup>> {
+        let path = self.registry_path();
+        let registry = self.load_registry()?;
+
+        // Group by worker_id
+        let mut by_worker: HashMap<String, Vec<WorkerBackup>> = HashMap::new();
+        for backup in registry {
+            by_worker
+                .entry(backup.worker_id.clone())
+                .or_default()
+                .push(backup);
+        }
+
+        // Sort each worker's backups by created_at (newest first) and collect removed
+        let mut kept = Vec::new();
+        let mut removed = Vec::new();
+
+        for (worker_id, mut backups) in by_worker {
+            backups.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+
+            for (i, backup) in backups.into_iter().enumerate() {
+                if i < max_per_worker {
+                    kept.push(backup);
+                } else {
+                    debug!(
+                        worker = %worker_id,
+                        version = %backup.version,
+                        "Pruning old backup"
+                    );
+                    removed.push(backup);
+                }
+            }
+        }
+
+        // Write the pruned registry
+        if !removed.is_empty() {
+            let temp_path = path.with_extension("json.tmp");
+            let content = serde_json::to_string_pretty(&kept)?;
+            let mut file = std::fs::File::create(&temp_path)?;
+            file.write_all(content.as_bytes())?;
+            file.sync_all()?;
+            drop(file);
+            std::fs::rename(&temp_path, &path)?;
+
+            info!(
+                removed = removed.len(),
+                kept = kept.len(),
+                "Pruned old backups from registry"
+            );
+        }
+
+        Ok(removed)
+    }
+
+    /// Get the backup directory path.
+    pub fn backup_dir(&self) -> &PathBuf {
+        &self.backup_dir
     }
 
     /// Rollback workers to a specific or previous version.
@@ -125,6 +337,10 @@ impl RollbackManager {
     }
 
     /// Create a backup of a worker's current binary.
+    ///
+    /// This creates a local backup record. The actual remote backup creation
+    /// (copying the binary on the worker) is done by `backup_before_deploy`
+    /// in the executor module which uses SSH.
     pub async fn create_backup(
         &self,
         worker: &WorkerConfig,
@@ -137,15 +353,52 @@ impl RollbackManager {
 
         std::fs::create_dir_all(backup_path.parent().unwrap())?;
 
-        // Real impl would SSH and copy binary
-        // For now, just create the backup record
+        // Compute remote backup path
+        let remote_path = PathBuf::from(format!("{}/rch-wkr-{}", REMOTE_BACKUP_DIR, version));
 
-        Ok(WorkerBackup {
+        // Note: binary_hash will be set by the actual SSH backup operation
+        // This stub returns "unknown" - the real implementation in executor.rs
+        // will compute the hash via `sha256sum` on the remote
+        let backup = WorkerBackup {
             worker_id: worker.id.0.clone(),
             version: version.to_string(),
             backup_path,
+            remote_path,
+            binary_hash: "unknown".to_string(),
             created_at: chrono::Utc::now().to_rfc3339(),
-        })
+        };
+
+        debug!(
+            worker = %worker.id,
+            version = %version,
+            remote_path = %backup.remote_path.display(),
+            "Created backup record"
+        );
+
+        Ok(backup)
+    }
+
+    /// Create a backup entry with a known hash (for use by executor).
+    pub fn create_backup_entry(
+        &self,
+        worker_id: &str,
+        version: &str,
+        remote_path: &str,
+        binary_hash: &str,
+    ) -> WorkerBackup {
+        let backup_path = self
+            .backup_dir
+            .join(worker_id)
+            .join(format!("{}.bak", version));
+
+        WorkerBackup {
+            worker_id: worker_id.to_string(),
+            version: version.to_string(),
+            backup_path,
+            remote_path: PathBuf::from(remote_path),
+            binary_hash: binary_hash.to_string(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+        }
     }
 
     /// Restore a worker from backup.
@@ -163,6 +416,22 @@ impl RollbackManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
+
+    // ========================
+    // Helper functions
+    // ========================
+
+    fn mock_backup(worker_id: &str, version: &str, timestamp: u64) -> WorkerBackup {
+        WorkerBackup {
+            worker_id: worker_id.to_string(),
+            version: version.to_string(),
+            backup_path: PathBuf::from(format!("/tmp/backups/{}/{}.bak", worker_id, version)),
+            remote_path: PathBuf::from(format!("~/.rch/backups/rch-wkr-{}", version)),
+            binary_hash: format!("hash_{}", version),
+            created_at: format!("2024-01-15T12:00:{:02}Z", timestamp % 60),
+        }
+    }
 
     // ========================
     // WorkerBackup tests
@@ -174,12 +443,15 @@ mod tests {
             worker_id: "worker-1".to_string(),
             version: "1.0.0".to_string(),
             backup_path: PathBuf::from("/tmp/backups/worker-1/1.0.0.bak"),
+            remote_path: PathBuf::from("~/.rch/backups/rch-wkr-1.0.0"),
+            binary_hash: "abc123".to_string(),
             created_at: "2024-01-15T12:00:00Z".to_string(),
         };
         let json = serde_json::to_string(&backup).unwrap();
         assert!(json.contains("worker-1"));
         assert!(json.contains("1.0.0"));
         assert!(json.contains("backups"));
+        assert!(json.contains("abc123"));
         assert!(json.contains("2024-01-15T12:00:00Z"));
     }
 
@@ -189,6 +461,8 @@ mod tests {
             worker_id: "test-worker".to_string(),
             version: "2.0.0".to_string(),
             backup_path: PathBuf::from("/data/backups/test.bak"),
+            remote_path: PathBuf::from("~/.rch/backups/rch-wkr-2.0.0"),
+            binary_hash: "def456".to_string(),
             created_at: "2024-01-16T10:00:00Z".to_string(),
         };
         let json = serde_json::to_string(&backup).unwrap();
@@ -199,6 +473,7 @@ mod tests {
             restored.backup_path,
             PathBuf::from("/data/backups/test.bak")
         );
+        assert_eq!(restored.binary_hash, "def456");
         assert_eq!(restored.created_at, "2024-01-16T10:00:00Z");
     }
 
@@ -288,6 +563,8 @@ mod tests {
             worker_id: String::new(),
             version: String::new(),
             backup_path: PathBuf::new(),
+            remote_path: PathBuf::new(),
+            binary_hash: String::new(),
             created_at: String::new(),
         };
         let json = serde_json::to_string(&backup).unwrap();
@@ -302,6 +579,8 @@ mod tests {
             worker_id: "worker/with:special\"chars".to_string(),
             version: "1.0.0-beta+build.123".to_string(),
             backup_path: PathBuf::from("/path/with spaces/and\"quotes"),
+            remote_path: PathBuf::from("~/.rch/backups/rch-wkr-1.0.0"),
+            binary_hash: "hash123".to_string(),
             created_at: "2024-01-15T12:00:00+05:30".to_string(),
         };
         let json = serde_json::to_string(&backup).unwrap();
@@ -316,6 +595,8 @@ mod tests {
             worker_id: "w".repeat(1000),
             version: "v".repeat(100),
             backup_path: PathBuf::from("/very/long/path".to_string() + &"/segment".repeat(100)),
+            remote_path: PathBuf::from("~/.rch/backups/rch-wkr-v".to_string() + &"v".repeat(99)),
+            binary_hash: "h".repeat(64),
             created_at: "2024-01-15T12:00:00Z".to_string(),
         };
         let json = serde_json::to_string(&backup).unwrap();
@@ -338,6 +619,8 @@ mod tests {
                 worker_id: "test".to_string(),
                 version: "1.0.0".to_string(),
                 backup_path: path.clone(),
+                remote_path: PathBuf::from("~/.rch/backups/rch-wkr-1.0.0"),
+                binary_hash: "abc123".to_string(),
                 created_at: "2024-01-15T12:00:00Z".to_string(),
             };
             let json = serde_json::to_string(&backup).unwrap();

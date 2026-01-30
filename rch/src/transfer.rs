@@ -8,8 +8,8 @@ use anyhow::{Context, Result};
 use rch_common::mock::{self, MockConfig, MockRsync, MockRsyncConfig, MockSshClient};
 use rch_common::ssh::{EnvPrefix, build_env_prefix, is_retryable_transport_error};
 use rch_common::{
-    ColorMode, CommandResult, RetryConfig, SshClient, SshOptions, ToolchainInfo, TransferConfig,
-    WorkerConfig, wrap_command_with_color, wrap_command_with_toolchain,
+    ColorMode, CommandResult, CompilationKind, RetryConfig, SshClient, SshOptions, ToolchainInfo,
+    TransferConfig, WorkerConfig, wrap_command_with_color, wrap_command_with_toolchain,
 };
 use shell_escape::escape;
 use std::borrow::Cow;
@@ -51,14 +51,29 @@ fn mask_sensitive_in_log(cmd: &str) -> String {
 
     let mut result = cmd.to_string();
     for prefix in sensitive_prefixes {
-        if let Some(start) = result.find(prefix) {
-            let value_start = start + prefix.len();
+        // Loop to handle multiple occurrences of the same pattern
+        // Track search position to avoid infinite loop (replacement contains pattern)
+        let mut search_start = 0;
+        let replacement = format!("{}***", prefix);
+        while search_start < result.len() {
+            let Some(start) = result[search_start..].find(prefix) else {
+                break;
+            };
+            let abs_start = search_start + start;
+            let value_start = abs_start + prefix.len();
             let rest = &result[value_start..];
             let value_end = rest
                 .find(|c: char| c.is_whitespace())
                 .map(|i| value_start + i)
                 .unwrap_or(result.len());
-            result = format!("{}{}***{}", &result[..start], prefix, &result[value_end..]);
+            result = format!(
+                "{}{}{}",
+                &result[..abs_start],
+                replacement,
+                &result[value_end..]
+            );
+            // Move past the replacement to avoid re-matching
+            search_start = abs_start + replacement.len();
         }
     }
     result
@@ -216,6 +231,11 @@ pub struct TransferPipeline {
     env_allowlist: Vec<String>,
     /// Optional environment overrides for testing.
     env_overrides: Option<HashMap<String, String>>,
+    /// Compilation kind for command-specific handling.
+    ///
+    /// Used to apply appropriate timeouts and wrappers (e.g., external timeout
+    /// for bun test to protect against known CPU hang issues).
+    compilation_kind: Option<CompilationKind>,
 }
 
 /// Validate a project hash for safe use in file paths.
@@ -287,6 +307,7 @@ impl TransferPipeline {
             color_mode: ColorMode::default(),
             env_allowlist: Vec::new(),
             env_overrides: None,
+            compilation_kind: None,
         }
     }
 
@@ -1439,7 +1460,13 @@ fn sanitize_project_id(name: &str) -> String {
             .collect();
 
         // Remove leading dots after sanitization
-        sanitized.trim_start_matches('.').to_string()
+        let result = sanitized.trim_start_matches('.');
+        // If result is empty after trimming, return "unknown"
+        if result.is_empty() {
+            "unknown".to_string()
+        } else {
+            result.to_string()
+        }
     }
 }
 

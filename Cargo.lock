@@ -1171,6 +1171,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "futures"
+version = "0.3.31"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "65bc07b1a8bc7c85c5f2e110c476c7389b4554ba72af57d8445ea63a576b0876"
+dependencies = [
+ "futures-channel",
+ "futures-core",
+ "futures-executor",
+ "futures-io",
+ "futures-sink",
+ "futures-task",
+ "futures-util",
+]
+
+[[package]]
 name = "futures-channel"
 version = "0.3.31"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1232,6 +1247,7 @@ version = "0.3.31"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9fa08315bb612088cc391249efdc3bc77536f16c91f6cf495e6fbe85b20a4a81"
 dependencies = [
+ "futures-channel",
  "futures-core",
  "futures-io",
  "futures-macro",
@@ -3060,6 +3076,7 @@ dependencies = [
  "dialoguer",
  "directories",
  "dirs",
+ "futures",
  "indicatif",
  "insta",
  "is-terminal",
@@ -3159,6 +3176,7 @@ dependencies = [
  "clap",
  "ctor",
  "rch-common",
+ "rch-telemetry",
  "serde",
  "serde_json",
  "thiserror 2.0.18",

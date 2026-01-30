@@ -314,6 +314,14 @@ async fn main() -> Result<()> {
 
     // Create Unix socket listener
     let listener = UnixListener::bind(&cli.socket)?;
+
+    // Set socket permissions to 600 (owner read/write only) to prevent unauthorized access
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cli.socket, std::fs::Permissions::from_mode(0o600))?;
+    }
+
     info!("Listening on {:?}", cli.socket);
 
     // Create daemon context

@@ -14,10 +14,11 @@ mod rollback;
 pub mod ssh;
 
 use crate::commands::load_workers_from_config;
+use crate::config::load_config;
 use crate::ui::context::OutputContext;
 use crate::ui::theme::StatusIndicator;
 use anyhow::{Result, bail};
-use rch_common::{ApiError, ApiResponse, ErrorCode};
+use rch_common::{ApiError, ApiResponse, ErrorCode, FleetConfig};
 use std::path::PathBuf;
 
 pub use audit::{AuditEventType, AuditLogger, DeploymentAuditEntry};
@@ -358,6 +359,10 @@ pub async fn rollback(
 pub async fn status(ctx: &OutputContext, worker: Option<String>, watch: bool) -> Result<()> {
     let style = ctx.theme();
 
+    // Load configuration for fleet operations
+    let config = load_config().unwrap_or_default();
+    let fleet_config = &config.fleet;
+
     // Load workers configuration
     let workers = load_workers_from_config()?;
     if workers.is_empty() {
@@ -387,7 +392,7 @@ pub async fn status(ctx: &OutputContext, worker: Option<String>, watch: bool) ->
     };
 
     // Get status for each worker
-    let status_results = preflight::get_fleet_status(&target_workers, ctx).await?;
+    let status_results = preflight::get_fleet_status(&target_workers, ctx, fleet_config).await?;
 
     if ctx.is_json() {
         let _ = ctx.json(&ApiResponse::ok("fleet status", &status_results));
@@ -440,6 +445,10 @@ pub async fn status(ctx: &OutputContext, worker: Option<String>, watch: bool) ->
 pub async fn verify(ctx: &OutputContext, worker: Option<String>) -> Result<()> {
     let style = ctx.theme();
 
+    // Load configuration for fleet operations
+    let config = load_config().unwrap_or_default();
+    let fleet_config = &config.fleet;
+
     // Load workers configuration
     let workers = load_workers_from_config()?;
     if workers.is_empty() {
@@ -478,7 +487,7 @@ pub async fn verify(ctx: &OutputContext, worker: Option<String>) -> Result<()> {
     let mut results = Vec::new();
 
     for w in &target_workers {
-        let result = preflight::run_preflight(w, ctx).await?;
+        let result = preflight::run_preflight(w, ctx, fleet_config).await?;
         let ok = result.ssh_ok && result.disk_ok && result.rsync_ok && result.issues.is_empty();
 
         if !ctx.is_json() {

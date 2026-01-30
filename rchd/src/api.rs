@@ -59,11 +59,11 @@ async fn read_line_with_limit<R: AsyncBufReadExt + Unpin>(
             Err(e) => return Err(e.into()),
         }
     }
-    
+
     if count >= limit && bytes.last() != Some(&b'\n') {
-         return Err(anyhow!("Request line exceeded limit of {} bytes", limit));
+        return Err(anyhow!("Request line exceeded limit of {} bytes", limit));
     }
-    
+
     let s = String::from_utf8(bytes).map_err(|e| anyhow!("Invalid UTF-8 in request: {}", e))?;
     buf.push_str(&s);
     Ok(count)
@@ -1558,7 +1558,7 @@ async fn handle_speedscore(
         ));
     }
 
-    match ctx.telemetry.latest_speedscore(worker_id.as_str()) {
+    match ctx.telemetry.latest_speedscore(worker_id.as_str()).await {
         Ok(Some(score)) => ApiResponse::Ok(SpeedScoreResponse {
             worker_id: worker_id.to_string(),
             speedscore: Some(speedscore_view(score)),
@@ -1604,6 +1604,7 @@ async fn handle_speedscore_history(
     match ctx
         .telemetry
         .speedscore_history(worker_id.as_str(), since, limit, offset)
+        .await
     {
         Ok(page) => {
             let has_more = ((offset + page.entries.len()) as u64) < page.total;
@@ -1640,7 +1641,7 @@ async fn handle_speedscore_list(ctx: &DaemonContext) -> ApiResponse<SpeedScoreLi
     for worker in workers {
         let status = worker.status().await;
         let worker_id = worker.config.read().await.id.clone();
-        let speedscore = match ctx.telemetry.latest_speedscore(worker_id.as_str()) {
+        let speedscore = match ctx.telemetry.latest_speedscore(worker_id.as_str()).await {
             Ok(score) => score.map(speedscore_view),
             Err(err) => {
                 warn!("Failed to load SpeedScore for {}: {}", worker_id, err);

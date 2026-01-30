@@ -339,7 +339,11 @@ impl BenchmarkScheduler {
         }
 
         // Try to get current SpeedScore
-        let speedscore = self.telemetry.latest_speedscore(worker_id.as_str()).ok()?;
+        let speedscore = self
+            .telemetry
+            .latest_speedscore(worker_id.as_str())
+            .await
+            .ok()?;
 
         // New worker without score?
         if speedscore.is_none() {
@@ -853,6 +857,8 @@ async fn execute_benchmark_on_worker(
     cmd.arg("-i").arg(&identity_file);
     cmd.arg(format!("{}@{}", worker.user, worker.host));
     cmd.arg("~/.local/bin/rch-wkr benchmark --json");
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
 
     debug!(
         worker_id = %worker.id,
@@ -860,39 +866,69 @@ async fn execute_benchmark_on_worker(
         "Executing benchmark via SSH"
     );
 
-    let output = tokio::time::timeout(timeout, cmd.output())
-        .await
-        .map_err(|_| anyhow::anyhow!("Benchmark timed out after {:?}", timeout))?
-        .map_err(|e| anyhow::anyhow!("Failed to execute SSH command: {}", e))?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("Failed to spawn SSH command: {}", e))?;
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
 
+    let mut stdout_buf = Vec::new();
+    let mut stderr_buf = Vec::new();
+
+    // Read with 1MB limit
+    const MAX_BENCHMARK_OUTPUT: u64 = 1024 * 1024; // 1MB
+
+    let read_future = async {
+        use tokio::io::AsyncReadExt;
+        let mut stdout_limited = stdout.take(MAX_BENCHMARK_OUTPUT);
+        let mut stderr_limited = stderr.take(MAX_BENCHMARK_OUTPUT);
+        let t1 = stdout_limited.read_to_end(&mut stdout_buf);
+        let t2 = stderr_limited.read_to_end(&mut stderr_buf);
+        tokio::try_join!(t1, t2)
+    };
+
+    // Wait for output or timeout
+    match tokio::time::timeout(timeout, read_future).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            let _ = child.kill().await;
+            return Err(anyhow::anyhow!("Failed to read benchmark output: {}", e));
+        }
+        Err(_) => {
+            let _ = child.kill().await;
+            return Err(anyhow::anyhow!("Benchmark timed out after {:?}", timeout));
+        }
+    }
+
+    let status = child.wait().await?;
     let exec_duration = start.elapsed();
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+    if !status.success() {
+        let stderr_str = String::from_utf8_lossy(&stderr_buf);
         return Err(anyhow::anyhow!(
             "Benchmark command failed with status {}: {}",
-            output.status,
-            stderr.trim()
+            status,
+            stderr_str.trim()
         ));
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout_str = String::from_utf8_lossy(&stdout_buf);
 
     // Try to parse JSON output first
-    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&stdout)
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&stdout_str)
         && let Some(score) = json.get("score").and_then(|s| s.as_f64())
     {
         return Ok((score, exec_duration));
     }
 
     // Fall back to line-based parsing for non-JSON output
-    if let Some(score) = parse_benchmark_score(&stdout) {
+    if let Some(score) = parse_benchmark_score(&stdout_str) {
         return Ok((score, exec_duration));
     }
 
     Err(anyhow::anyhow!(
         "Failed to parse benchmark score from output: {}",
-        stdout.chars().take(200).collect::<String>()
+        stdout_str.chars().take(200).collect::<String>()
     ))
 }
 

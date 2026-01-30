@@ -158,28 +158,33 @@ impl TelemetryStore {
     }
 
     /// Fetch latest SpeedScore for a worker from persistent storage.
-    pub fn latest_speedscore(&self, worker_id: &str) -> anyhow::Result<Option<SpeedScore>> {
-        let Some(storage) = self.storage.as_ref() else {
+    pub async fn latest_speedscore(&self, worker_id: &str) -> anyhow::Result<Option<SpeedScore>> {
+        let Some(storage) = self.storage.clone() else {
             return Ok(None);
         };
-        storage.latest_speedscore(worker_id)
+        let worker_id = worker_id.to_string();
+        tokio::task::spawn_blocking(move || storage.latest_speedscore(&worker_id)).await?
     }
 
     /// Fetch SpeedScore history for a worker from persistent storage.
-    pub fn speedscore_history(
+    pub async fn speedscore_history(
         &self,
         worker_id: &str,
         since: DateTime<Utc>,
         limit: usize,
         offset: usize,
     ) -> anyhow::Result<SpeedScoreHistoryPage> {
-        let Some(storage) = self.storage.as_ref() else {
+        let Some(storage) = self.storage.clone() else {
             return Ok(SpeedScoreHistoryPage {
                 total: 0,
                 entries: Vec::new(),
             });
         };
-        storage.speedscore_history(worker_id, since, limit, offset)
+        let worker_id = worker_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            storage.speedscore_history(&worker_id, since, limit, offset)
+        })
+        .await?
     }
 
     fn evict_old(&self, entries: &mut VecDeque<ReceivedTelemetry>) {

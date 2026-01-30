@@ -711,14 +711,23 @@ impl MockSshExecutor {
     pub fn all_healthy() -> Self {
         Self::new()
             .with_connectivity(MockConnectivity::Connected)
-            .with_command("df", MockCommandResult::ok(
-                "Filesystem     1B-blocks         Used    Available Use% Mounted on\n\
-                 /dev/sda1  500000000000 400000000000 100000000000  80% /"
-            ))
+            .with_command(
+                "df",
+                MockCommandResult::ok(
+                    "Filesystem     1B-blocks         Used    Available Use% Mounted on\n\
+                 /dev/sda1  500000000000 400000000000 100000000000  80% /",
+                ),
+            )
             .with_command("which rsync", MockCommandResult::ok("/usr/bin/rsync"))
             .with_command("which zstd", MockCommandResult::ok("/usr/bin/zstd"))
-            .with_command("which rustup", MockCommandResult::ok("/home/user/.cargo/bin/rustup"))
-            .with_command("rustc --version", MockCommandResult::ok("rustc 1.75.0 (82e1608df 2024-01-01)"))
+            .with_command(
+                "which rustup",
+                MockCommandResult::ok("/home/user/.cargo/bin/rustup"),
+            )
+            .with_command(
+                "rustc --version",
+                MockCommandResult::ok("rustc 1.75.0 (82e1608df 2024-01-01)"),
+            )
             .with_command("rch-wkr --version", MockCommandResult::ok("rch-wkr 1.0.0"))
             .with_command("rch-wkr health", MockCommandResult::ok("ok"))
     }
@@ -758,27 +767,30 @@ impl MockSshExecutor {
 
     /// Worker is missing rsync.
     pub fn missing_rsync() -> Self {
-        Self::all_healthy()
-            .with_command("which rsync", MockCommandResult::err(1, ""))
+        Self::all_healthy().with_command("which rsync", MockCommandResult::err(1, ""))
     }
 
     /// Worker is missing zstd.
     pub fn missing_zstd() -> Self {
-        Self::all_healthy()
-            .with_command("which zstd", MockCommandResult::err(1, ""))
+        Self::all_healthy().with_command("which zstd", MockCommandResult::err(1, ""))
     }
 
     /// Worker is missing rustup.
     pub fn missing_rustup() -> Self {
-        Self::all_healthy()
-            .with_command("which rustup", MockCommandResult::err(1, ""))
+        Self::all_healthy().with_command("which rustup", MockCommandResult::err(1, ""))
     }
 
     /// Worker has rch-wkr not installed.
     pub fn missing_rch_wkr() -> Self {
         Self::all_healthy()
-            .with_command("rch-wkr --version", MockCommandResult::err(127, "command not found: rch-wkr"))
-            .with_command("rch-wkr health", MockCommandResult::err(127, "command not found: rch-wkr"))
+            .with_command(
+                "rch-wkr --version",
+                MockCommandResult::err(127, "command not found: rch-wkr"),
+            )
+            .with_command(
+                "rch-wkr health",
+                MockCommandResult::err(127, "command not found: rch-wkr"),
+            )
     }
 
     // =========================================================================

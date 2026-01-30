@@ -178,6 +178,10 @@ impl WorkerState {
     pub async fn add_cached_project(&self, project: String) {
         let mut cache = self.cached_projects.write().await;
         if !cache.contains(&project) {
+            // Limit cache size to prevent unbounded growth
+            if cache.len() >= 100 {
+                cache.remove(0);
+            }
             cache.push(project);
         }
     }

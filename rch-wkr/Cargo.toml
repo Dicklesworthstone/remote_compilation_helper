@@ -20,6 +20,7 @@ tracing-subscriber = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 blake3 = { workspace = true }
+rch-telemetry = { path = "../rch-telemetry" }
 
 [dev-dependencies]
 ctor = { workspace = true }

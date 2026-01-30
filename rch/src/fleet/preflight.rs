@@ -3,10 +3,17 @@
 use crate::fleet::ssh::SshExecutor;
 use crate::ui::context::OutputContext;
 use anyhow::Result;
-use rch_common::WorkerConfig;
+use futures::stream::{self, StreamExt};
+use rch_common::{FleetConfig, WorkerConfig};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tracing::{debug, info, warn};
+
+/// Maximum concurrent SSH queries to workers (prevents overwhelming network/SSH agent).
+const MAX_CONCURRENT_QUERIES: usize = 10;
+
+/// Default timeout for individual worker queries in seconds.
+const DEFAULT_QUERY_TIMEOUT_SECS: u64 = 30;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Severity {
@@ -47,8 +54,17 @@ pub struct WorkerStatus {
 pub async fn run_preflight(
     worker: &WorkerConfig,
     _ctx: &OutputContext,
+    config: &FleetConfig,
 ) -> Result<PreflightResult> {
     let mut issues = Vec::new();
+
+    // Log config values being used
+    debug!(
+        ssh_connect_timeout = config.ssh_connect_timeout_secs,
+        ssh_command_timeout = config.ssh_command_timeout_secs,
+        min_disk_space_mb = config.min_disk_space_mb,
+        "Using fleet configuration for preflight"
+    );
 
     // =========================================================================
     // SSH Connectivity Check
@@ -59,8 +75,7 @@ pub async fn run_preflight(
         "Checking SSH connectivity"
     );
 
-    let ssh_executor = SshExecutor::new(worker)
-        .connect_timeout(Duration::from_secs(SSH_CONNECT_TIMEOUT_SECS));
+    let ssh_executor = SshExecutor::new(worker).connect_timeout(config.ssh_connect_timeout());
 
     let ssh_result = ssh_executor.check_connectivity().await;
 
@@ -134,12 +149,12 @@ pub async fn run_preflight(
                 if output.success() {
                     match output.stdout.trim().parse::<u64>() {
                         Ok(mb) => {
-                            let ok = mb >= MIN_DISK_SPACE_MB;
+                            let ok = mb >= config.min_disk_space_mb;
                             if !ok {
                                 warn!(
                                     worker = %worker.id,
                                     disk_mb = %mb,
-                                    threshold_mb = %MIN_DISK_SPACE_MB,
+                                    threshold_mb = %config.min_disk_space_mb,
                                     "Low disk space warning"
                                 );
                                 issues.push(PreflightIssue {
@@ -147,7 +162,7 @@ pub async fn run_preflight(
                                     check: "disk_space".to_string(),
                                     message: format!(
                                         "Low disk space: {}MB available, {}MB required",
-                                        mb, MIN_DISK_SPACE_MB
+                                        mb, config.min_disk_space_mb
                                     ),
                                     remediation: Some(format!(
                                         "Free up disk space on {}: rm -rf /tmp/rch-* or expand volume",
@@ -158,7 +173,7 @@ pub async fn run_preflight(
                             info!(
                                 worker = %worker.id,
                                 disk_mb = %mb,
-                                threshold_mb = %MIN_DISK_SPACE_MB,
+                                threshold_mb = %config.min_disk_space_mb,
                                 ok = %ok,
                                 "Disk space check complete"
                             );
@@ -190,7 +205,10 @@ pub async fn run_preflight(
                     issues.push(PreflightIssue {
                         severity: Severity::Warning,
                         check: "disk_space".to_string(),
-                        message: format!("Disk space check failed with exit code {}", output.exit_code),
+                        message: format!(
+                            "Disk space check failed with exit code {}",
+                            output.exit_code
+                        ),
                         remediation: None,
                     });
                     (0, false)
@@ -218,37 +236,417 @@ pub async fn run_preflight(
     };
 
     // =========================================================================
-    // Other checks (stubs - to be implemented in subsequent beads)
+    // rsync/zstd Availability Check
     // =========================================================================
-    // TODO(bd-3029.3): Implement rsync/zstd availability checks
-    // TODO(bd-3029.4): Implement rustup check and version detection
+    let (rsync_ok, zstd_ok) = if ssh_ok {
+        debug!(worker = %worker.id, "Checking rsync availability");
+
+        // Check rsync using POSIX-compliant `command -v`
+        let rsync_result = ssh_executor.run_command("command -v rsync").await;
+        let rsync_ok = rsync_result.as_ref().map(|o| o.success()).unwrap_or(false);
+
+        if !rsync_ok {
+            warn!(worker = %worker.id, tool = "rsync", "Required tool not found");
+            issues.push(PreflightIssue {
+                severity: Severity::Error,
+                check: "rsync".to_string(),
+                message: "rsync is not installed or not in PATH".to_string(),
+                remediation: Some(format!(
+                    "Install rsync on {}: sudo apt install rsync (Debian/Ubuntu) or sudo yum install rsync (RHEL/CentOS)",
+                    worker.host
+                )),
+            });
+        } else {
+            debug!(worker = %worker.id, "rsync found");
+            // Optionally collect version for diagnostics
+            if let Ok(output) = ssh_executor
+                .run_command("rsync --version 2>/dev/null | head -1")
+                .await
+            {
+                if output.success() && !output.stdout.trim().is_empty() {
+                    debug!(
+                        worker = %worker.id,
+                        version = %output.stdout.trim(),
+                        "rsync version"
+                    );
+                }
+            }
+        }
+
+        debug!(worker = %worker.id, "Checking zstd availability");
+
+        // Check zstd using POSIX-compliant `command -v`
+        let zstd_result = ssh_executor.run_command("command -v zstd").await;
+        let zstd_ok = zstd_result.as_ref().map(|o| o.success()).unwrap_or(false);
+
+        if !zstd_ok {
+            warn!(worker = %worker.id, tool = "zstd", "Required tool not found");
+            issues.push(PreflightIssue {
+                severity: Severity::Error,
+                check: "zstd".to_string(),
+                message: "zstd is not installed or not in PATH".to_string(),
+                remediation: Some(format!(
+                    "Install zstd on {}: sudo apt install zstd (Debian/Ubuntu) or sudo yum install zstd (RHEL/CentOS)",
+                    worker.host
+                )),
+            });
+        } else {
+            debug!(worker = %worker.id, "zstd found");
+            // Optionally collect version for diagnostics
+            if let Ok(output) = ssh_executor.run_command("zstd --version 2>/dev/null").await {
+                if output.success() && !output.stdout.trim().is_empty() {
+                    debug!(
+                        worker = %worker.id,
+                        version = %output.stdout.trim(),
+                        "zstd version"
+                    );
+                }
+            }
+        }
+
+        info!(
+            worker = %worker.id,
+            rsync = %rsync_ok,
+            zstd = %zstd_ok,
+            "Tool availability check complete"
+        );
+
+        (rsync_ok, zstd_ok)
+    } else {
+        // SSH failed, can't check tools
+        debug!(
+            worker = %worker.id,
+            "Skipping rsync/zstd check - SSH not available"
+        );
+        (false, false)
+    };
+
+    // =========================================================================
+    // rustup Check and Version Detection
+    // =========================================================================
+    let (rustup_ok, current_version) = if ssh_ok {
+        debug!(worker = %worker.id, "Checking rustup availability");
+
+        // Check rustup using POSIX-compliant `command -v`
+        let rustup_result = ssh_executor.run_command("command -v rustup").await;
+        let rustup_ok = rustup_result.as_ref().map(|o| o.success()).unwrap_or(false);
+
+        if !rustup_ok {
+            warn!(worker = %worker.id, tool = "rustup", "Required tool not found");
+            issues.push(PreflightIssue {
+                severity: Severity::Error,
+                check: "rustup".to_string(),
+                message: "rustup is not installed or not in PATH".to_string(),
+                remediation: Some(format!(
+                    "Install rustup on {}: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh",
+                    worker.host
+                )),
+            });
+        } else {
+            debug!(worker = %worker.id, "rustup found");
+            // Check rustc version for diagnostics
+            if let Ok(output) = ssh_executor
+                .run_command("rustc --version 2>/dev/null")
+                .await
+            {
+                if output.success() && !output.stdout.trim().is_empty() {
+                    debug!(
+                        worker = %worker.id,
+                        version = %output.stdout.trim(),
+                        "rustc version"
+                    );
+                }
+            }
+        }
+
+        // Check rch-wkr version if rustup is available (worker can compile)
+        debug!(worker = %worker.id, "Checking rch-wkr version");
+        let version = if let Ok(output) = ssh_executor
+            .run_command(
+                "~/.local/bin/rch-wkr --version 2>/dev/null || rch-wkr --version 2>/dev/null",
+            )
+            .await
+        {
+            if output.success() && !output.stdout.trim().is_empty() {
+                let version_str = output.stdout.trim();
+                // Extract version number (e.g., "rch-wkr 1.0.0" -> "1.0.0")
+                let version = version_str.split_whitespace().last().map(|s| s.to_string());
+                info!(
+                    worker = %worker.id,
+                    version = ?version,
+                    "rch-wkr version detected"
+                );
+                version
+            } else {
+                debug!(worker = %worker.id, "rch-wkr not installed (will be deployed)");
+                None
+            }
+        } else {
+            debug!(worker = %worker.id, "rch-wkr not installed (will be deployed)");
+            None
+        };
+
+        info!(
+            worker = %worker.id,
+            rustup = %rustup_ok,
+            rch_wkr_version = ?version,
+            "rustup and rch-wkr check complete"
+        );
+
+        (rustup_ok, version)
+    } else {
+        // SSH failed, can't check rustup
+        debug!(
+            worker = %worker.id,
+            "Skipping rustup/rch-wkr check - SSH not available"
+        );
+        (false, None)
+    };
 
     Ok(PreflightResult {
         ssh_ok,
         disk_space_mb,
         disk_ok,
-        rsync_ok: false,   // Stub: will be implemented in bd-3029.3
-        zstd_ok: false,    // Stub: will be implemented in bd-3029.3
-        rustup_ok: false,  // Stub: will be implemented in bd-3029.4
-        current_version: None,
+        rsync_ok,
+        zstd_ok,
+        rustup_ok,
+        current_version,
         issues,
     })
 }
 
+/// Query a single worker's status with timeout handling.
+///
+/// This function is designed to be called concurrently for multiple workers.
+/// It handles individual worker timeouts gracefully, returning a WorkerStatus
+/// with reachable=false if the query times out.
+async fn query_single_worker(
+    worker: &WorkerConfig,
+    config: &FleetConfig,
+    timeout: Duration,
+) -> WorkerStatus {
+    debug!(
+        worker = %worker.id,
+        host = %worker.host,
+        timeout_ms = %timeout.as_millis(),
+        "Querying worker status"
+    );
+
+    // Wrap the entire query in a timeout
+    match tokio::time::timeout(timeout, query_worker_inner(worker, config)).await {
+        Ok(status) => {
+            debug!(
+                worker = %worker.id,
+                reachable = %status.reachable,
+                healthy = %status.healthy,
+                version = ?status.version,
+                issues = ?status.issues,
+                "Worker query completed"
+            );
+            status
+        }
+        Err(_) => {
+            warn!(
+                worker = %worker.id,
+                host = %worker.host,
+                timeout_ms = %timeout.as_millis(),
+                "Worker query timed out"
+            );
+            WorkerStatus {
+                worker_id: worker.id.0.clone(),
+                reachable: false,
+                healthy: false,
+                version: None,
+                issues: vec![format!("Query timed out after {}s", timeout.as_secs())],
+            }
+        }
+    }
+}
+
+/// Inner worker query logic (without timeout wrapper).
+async fn query_worker_inner(worker: &WorkerConfig, config: &FleetConfig) -> WorkerStatus {
+    let ssh_executor = SshExecutor::new(worker).connect_timeout(config.ssh_connect_timeout());
+
+    // Check SSH connectivity
+    let reachable = ssh_executor.check_connectivity().await.unwrap_or(false);
+
+    let mut issues = Vec::new();
+    let mut version = None;
+    let mut healthy = reachable;
+
+    if reachable {
+        // Check rch-wkr version
+        if let Ok(output) = ssh_executor
+            .run_command(
+                "~/.local/bin/rch-wkr --version 2>/dev/null || rch-wkr --version 2>/dev/null",
+            )
+            .await
+        {
+            if output.success() && !output.stdout.trim().is_empty() {
+                version = output
+                    .stdout
+                    .trim()
+                    .split_whitespace()
+                    .last()
+                    .map(|s| s.to_string());
+            }
+        }
+
+        // Check disk space
+        let disk_cmd = "df -Pm /tmp 2>/dev/null | tail -1 | awk '{print $4}'";
+        if let Ok(output) = ssh_executor.run_command(disk_cmd).await {
+            if output.success() {
+                if let Ok(mb) = output.stdout.trim().parse::<u64>() {
+                    if mb < config.min_disk_space_mb {
+                        issues.push(format!("Low disk space: {}MB", mb));
+                        healthy = false;
+                    }
+                }
+            }
+        }
+    } else {
+        issues.push("Unreachable".to_string());
+    }
+
+    WorkerStatus {
+        worker_id: worker.id.0.clone(),
+        reachable,
+        healthy,
+        version,
+        issues,
+    }
+}
+
+/// Query fleet status for all workers with parallel execution.
+///
+/// Queries all workers concurrently with bounded parallelism to prevent
+/// overwhelming the network or SSH agent. Each worker query has an individual
+/// timeout to ensure fast overall completion even if some workers are slow.
+///
+/// # Arguments
+///
+/// * `workers` - Slice of worker configurations to query
+/// * `ctx` - Output context for progress display
+/// * `config` - Fleet configuration with timeouts and thresholds
+///
+/// # Returns
+///
+/// A vector of `WorkerStatus` for each worker, in the same order as input.
+/// Workers that timeout or fail are marked as unreachable with appropriate issues.
 pub async fn get_fleet_status(
     workers: &[&WorkerConfig],
-    _ctx: &OutputContext,
+    ctx: &OutputContext,
+    config: &FleetConfig,
 ) -> Result<Vec<WorkerStatus>> {
-    Ok(workers
-        .iter()
-        .map(|w| WorkerStatus {
-            worker_id: w.id.0.clone(),
-            reachable: true,
-            healthy: true,
-            version: Some("0.1.0".into()),
-            issues: vec![],
+    use indicatif::{ProgressBar, ProgressStyle};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    // Handle empty workers case
+    if workers.is_empty() {
+        debug!("No workers to query");
+        return Ok(vec![]);
+    }
+
+    // Determine concurrency limit (use config or default)
+    let max_concurrent = config.max_concurrent_workers.min(MAX_CONCURRENT_QUERIES);
+    let query_timeout = Duration::from_secs(
+        config
+            .ssh_command_timeout_secs
+            .min(DEFAULT_QUERY_TIMEOUT_SECS),
+    );
+
+    // Log config values being used
+    info!(
+        workers = %workers.len(),
+        max_concurrent = %max_concurrent,
+        ssh_timeout = %config.ssh_connect_timeout_secs,
+        query_timeout_secs = %query_timeout.as_secs(),
+        "Starting parallel fleet status check"
+    );
+
+    // Human-readable progress output (non-JSON mode)
+    if !ctx.is_json() {
+        eprintln!("Querying {} workers...", workers.len());
+    }
+
+    // Create progress bar for multi-worker operations (non-JSON mode only)
+    let progress_bar = if !ctx.is_json() && workers.len() > 1 {
+        let pb = ProgressBar::new(workers.len() as u64);
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("{spinner:.green} [{bar:40}] {pos}/{len} workers ({eta})")
+                .unwrap_or_else(|_| ProgressStyle::default_bar())
+                .progress_chars("=>-"),
+        );
+        Some(Arc::new(pb))
+    } else {
+        None
+    };
+
+    let start = std::time::Instant::now();
+    let completed = Arc::new(AtomicUsize::new(0));
+
+    // Clone config for use in async closures
+    let config = config.clone();
+
+    // Query all workers in parallel with bounded concurrency
+    // Note: We collect into Vec<(usize, WorkerStatus)> to preserve order
+    let results: Vec<(usize, WorkerStatus)> = stream::iter(workers.iter().enumerate())
+        .map(|(idx, worker)| {
+            let config = config.clone();
+            let pb = progress_bar.clone();
+            let completed = completed.clone();
+
+            async move {
+                let status = query_single_worker(worker, &config, query_timeout).await;
+
+                // Update progress
+                let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                if let Some(ref pb) = pb {
+                    pb.set_position(done as u64);
+                }
+
+                (idx, status)
+            }
         })
-        .collect())
+        .buffer_unordered(max_concurrent)
+        .collect()
+        .await;
+
+    // Sort by original index to preserve order
+    let mut results: Vec<WorkerStatus> = {
+        let mut sorted: Vec<(usize, WorkerStatus)> = results;
+        sorted.sort_by_key(|(idx, _)| *idx);
+        sorted.into_iter().map(|(_, status)| status).collect()
+    };
+
+    // Finish progress bar
+    if let Some(pb) = progress_bar {
+        pb.finish_with_message("Done");
+    }
+
+    // Log summary
+    let duration = start.elapsed();
+    let reachable_count = results.iter().filter(|r| r.reachable).count();
+    let healthy_count = results.iter().filter(|r| r.healthy).count();
+    let unreachable_count = results.len() - reachable_count;
+
+    info!(
+        total = %results.len(),
+        reachable = %reachable_count,
+        healthy = %healthy_count,
+        unreachable = %unreachable_count,
+        duration_ms = %duration.as_millis(),
+        "Fleet status query complete"
+    );
+
+    // Human-readable summary (non-JSON mode)
+    if !ctx.is_json() && unreachable_count > 0 {
+        eprintln!("Warning: {} worker(s) unreachable", unreachable_count);
+    }
+
+    Ok(results)
 }
 
 /// Minimum disk space required in MB.

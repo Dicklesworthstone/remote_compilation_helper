@@ -973,20 +973,29 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         // Create an empty manifest first
         let mut manifest = create_manifest(temp_dir.path(), &[], None);
-        
+
         // Manually inject unsafe paths
         manifest.files.insert(
             "../outside.txt".to_string(),
-            FileHash { hash: "abc".to_string(), size: 100 }
+            FileHash {
+                hash: "abc".to_string(),
+                size: 100,
+            },
         );
         manifest.files.insert(
             "/etc/passwd".to_string(),
-            FileHash { hash: "abc".to_string(), size: 100 }
+            FileHash {
+                hash: "abc".to_string(),
+                size: 100,
+            },
         );
         // Valid path
         manifest.files.insert(
             "safe.txt".to_string(),
-            FileHash { hash: "abc".to_string(), size: 100 }
+            FileHash {
+                hash: "abc".to_string(),
+                size: 100,
+            },
         );
         // Create the safe file so it passes verification (if we cared, but here we expect skip/fail)
         // Actually since we faked the hash "abc", safe.txt will fail verification (file doesn't exist or hash mismatch)
@@ -997,7 +1006,7 @@ mod tests {
         // Unsafe paths should be SKIPPED
         assert!(result.skipped.contains(&"../outside.txt".to_string()));
         assert!(result.skipped.contains(&"/etc/passwd".to_string()));
-        
+
         // Safe path should be processed (either failed or passed, but NOT skipped due to path safety)
         // It might be skipped due to missing file if we didn't create it.
         // Let's create it to be sure it's not skipped for missing file reason (although verify_artifacts skips missing files too...)
@@ -1005,10 +1014,10 @@ mod tests {
         // if !full_path.exists() { skipped.push(...) }
         // So safe.txt will be skipped.
         // But we want to ensure unsafe ones are skipped due to *safety check* which happens BEFORE exists check.
-        
+
         // We can check logs, or just rely on the fact that we injected them.
         // Let's trust the logic we wrote: safety check is first.
-        
+
         info!("TEST PASS: test_verify_artifacts_rejects_unsafe_paths");
     }
 }

@@ -53,7 +53,7 @@ pub use types::{
     AffinityConfig, BuildLocation, BuildRecord, BuildStats, CircuitBreakerConfig, CircuitState,
     CircuitStats, ColorMode, CommandPriority, CommandTimingBreakdown, CompilationConfig,
     CompilationMetrics, CompilationTimer, CompilationTimingBreakdown, EnvironmentConfig,
-    ExecutionConfig, FairnessConfig, GeneralConfig, MetricsAggregator, OutputConfig,
+    ExecutionConfig, FairnessConfig, FleetConfig, GeneralConfig, MetricsAggregator, OutputConfig,
     OutputVisibility, RchConfig, ReleaseRequest, RequiredRuntime, RetryConfig, SavedTimeStats,
     SelectedWorker, SelectionConfig, SelectionReason, SelectionRequest, SelectionResponse,
     SelectionStrategy, SelectionWeightConfig, SelfHealingConfig, SelfTestConfig,

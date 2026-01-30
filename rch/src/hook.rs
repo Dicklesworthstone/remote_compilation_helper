@@ -114,23 +114,29 @@ fn mask_sensitive_command(cmd: &str) -> String {
 
     let mut result = cmd.to_string();
     for (pattern, replacement) in patterns {
-        // Simple case-sensitive replacement; for better matching consider regex
-        if result.contains(pattern) {
-            // Find pattern and mask everything until next space or end
-            if let Some(start) = result.find(pattern) {
-                let value_start = start + pattern.len();
-                // Find end of value (next unquoted space or end of string)
-                let rest = &result[value_start..];
-                let value_end = rest
-                    .find(|c: char| c.is_whitespace())
-                    .map(|i| value_start + i)
-                    .unwrap_or(result.len());
+        // Loop to handle multiple occurrences of the same pattern
+        // Track search position to avoid infinite loop (replacement contains pattern)
+        let mut search_start = 0;
+        while search_start < result.len() {
+            let Some(start) = result[search_start..].find(pattern) else {
+                break;
+            };
+            let abs_start = search_start + start;
+            let value_start = abs_start + pattern.len();
+            // Find end of value (next unquoted space or end of string)
+            let rest = &result[value_start..];
+            let value_end = rest
+                .find(|c: char| c.is_whitespace())
+                .map(|i| value_start + i)
+                .unwrap_or(result.len());
 
-                // Replace the value portion
-                let prefix = &result[..start];
-                let suffix = &result[value_end..];
-                result = format!("{}{}{}", prefix, replacement, suffix);
-            }
+            // Replace the value portion
+            let prefix = &result[..abs_start];
+            let suffix = &result[value_end..];
+            result = format!("{}{}{}", prefix, replacement, suffix);
+
+            // Move past the replacement to avoid re-matching
+            search_start = abs_start + replacement.len();
         }
     }
 

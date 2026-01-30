@@ -422,7 +422,10 @@ impl SshClient {
                 if let Some(out) = stdout_handle {
                     let reader = BufReader::new(out);
                     let mut buf = String::new();
-                    reader.take(MAX_OUTPUT_SIZE).read_to_string(&mut buf).await?;
+                    reader
+                        .take(MAX_OUTPUT_SIZE)
+                        .read_to_string(&mut buf)
+                        .await?;
                     Ok::<String, anyhow::Error>(buf)
                 } else {
                     Ok(String::new())
@@ -433,7 +436,10 @@ impl SshClient {
                 if let Some(err) = stderr_handle {
                     let reader = BufReader::new(err);
                     let mut buf = String::new();
-                    reader.take(MAX_OUTPUT_SIZE).read_to_string(&mut buf).await?;
+                    reader
+                        .take(MAX_OUTPUT_SIZE)
+                        .read_to_string(&mut buf)
+                        .await?;
                     Ok::<String, anyhow::Error>(buf)
                 } else {
                     Ok(String::new())
