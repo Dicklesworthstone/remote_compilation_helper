@@ -1123,8 +1123,10 @@ generate_default_config() {
 # RCH Daemon Configuration
 # See: https://github.com/Dicklesworthstone/remote_compilation_helper
 
-# Unix socket path for hook communication
-socket_path = "/tmp/rch.sock"
+# Unix socket path for hook communication.
+# Default: $XDG_RUNTIME_DIR/rch.sock (if available), else ~/.cache/rch/rch.sock
+# Uncomment to override:
+# socket_path = "/tmp/rch.sock"
 
 # Health check interval in seconds
 health_check_interval_secs = 30
@@ -1802,30 +1804,58 @@ print_summary() {
 
         if [[ "${ENABLE_SERVICE:-true}" == "true" ]] && [[ "${NO_SERVICE:-}" != "true" ]]; then
             if systemd_user_available; then
-                echo "  🔄 Service: rchd.service (systemd)"
+                # Check if daemon is actually running
+                local daemon_status="unknown"
+                if systemctl --user is-active rchd.service &>/dev/null; then
+                    daemon_status="running"
+                else
+                    daemon_status="stopped"
+                fi
+
+                if [[ "$daemon_status" == "running" ]]; then
+                    echo "  🔄 Service: rchd.service (systemd) - ✅ RUNNING"
+                else
+                    echo "  🔄 Service: rchd.service (systemd) - ⚠️ NOT RUNNING"
+                fi
                 echo ""
                 if $USE_COLOR; then
                     echo -e "  ${DIM}Commands:${NC}"
                     echo -e "    ${CYAN}systemctl --user status rchd${NC}     # Check status"
                     echo -e "    ${CYAN}journalctl --user -u rchd -f${NC}     # Follow logs"
                     echo -e "    ${CYAN}systemctl --user restart rchd${NC}    # Restart"
+                    echo -e "    ${CYAN}systemctl --user stop rchd${NC}       # Stop daemon"
                 else
                     echo "  Commands:"
                     echo "    systemctl --user status rchd     # Check status"
                     echo "    journalctl --user -u rchd -f     # Follow logs"
                     echo "    systemctl --user restart rchd    # Restart"
+                    echo "    systemctl --user stop rchd       # Stop daemon"
                 fi
             elif [[ "$(uname -s)" == "Darwin" ]] && command_exists launchctl; then
-                echo "  🔄 Service: com.rch.daemon (launchd)"
+                # Check if daemon is running on macOS
+                local daemon_status="unknown"
+                if launchctl list 2>/dev/null | grep -q "com.rch.daemon"; then
+                    daemon_status="running"
+                else
+                    daemon_status="stopped"
+                fi
+
+                if [[ "$daemon_status" == "running" ]]; then
+                    echo "  🔄 Service: com.rch.daemon (launchd) - ✅ RUNNING"
+                else
+                    echo "  🔄 Service: com.rch.daemon (launchd) - ⚠️ NOT RUNNING"
+                fi
                 echo ""
                 if $USE_COLOR; then
                     echo -e "  ${DIM}Commands:${NC}"
                     echo -e "    ${CYAN}launchctl list | grep rch${NC}        # Check status"
                     echo -e "    ${CYAN}tail -f $CONFIG_DIR/logs/daemon.log${NC}"
+                    echo -e "    ${CYAN}launchctl unload ~/Library/LaunchAgents/com.rch.daemon.plist${NC}  # Stop"
                 else
                     echo "  Commands:"
                     echo "    launchctl list | grep rch        # Check status"
                     echo "    tail -f $CONFIG_DIR/logs/daemon.log"
+                    echo "    launchctl unload ~/Library/LaunchAgents/com.rch.daemon.plist  # Stop"
                 fi
             fi
             echo ""
