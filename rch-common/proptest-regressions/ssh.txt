@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 946cb61f015ca682a1f4a172343a1dc089b42a620efb41a78e6b9e870c9543d6 # shrinks to invalid_key = " "
+cc cf7dd77b82627a35b8ce1e621b81b37858456907725e8038053bb513bbec6aff # shrinks to s = "a"

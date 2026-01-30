@@ -10,3 +10,4 @@ cc 98a32a73cb0fd6327a503ecc3d28d44fd7b218a3fe8ff2bbf542f3c247efc220 # shrinks to
 cc b7e2f77aa18252ea1cb22e0f4da75b428639f3dd7f80e1ffec6c0c75ee0e5dd3 # shrinks to path = "~//"
 cc d815a3220091e7bf85bb95f5c812112d7b69bdce5d3126c718354853cfc87867 # shrinks to key = "a_", injection = "'; rm -rf /; echo '"
 cc 20a52e7ce51606bc05a54c37209732de8625f9eb9a788f695e5fdf6117388e5b # shrinks to key = "_A", value = " `"
+cc de076c78f5c5c34810a5818addeacc37348f280f725be1c3e3fd65bd11564e9b # shrinks to key = "aA", value = "A"

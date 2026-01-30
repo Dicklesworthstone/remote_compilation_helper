@@ -110,7 +110,11 @@ pub fn ssh_key_path_from_identity(identity_file: Option<&str>) -> PathBuf {
 }
 
 /// Classify an SSH error based on the error message and context.
-pub fn classify_ssh_error(worker: &WorkerConfig, err: &anyhow::Error, timeout: Duration) -> SshError {
+pub fn classify_ssh_error(
+    worker: &WorkerConfig,
+    err: &anyhow::Error,
+    timeout: Duration,
+) -> SshError {
     let key_path = ssh_key_path(worker);
     classify_ssh_error_message(
         &worker.host,
@@ -251,7 +255,10 @@ mod tests {
 
     #[test]
     fn test_extract_version_numbers() {
-        assert_eq!(extract_version_numbers("rustc 1.84.0-nightly"), vec![1, 84, 0]);
+        assert_eq!(
+            extract_version_numbers("rustc 1.84.0-nightly"),
+            vec![1, 84, 0]
+        );
         assert_eq!(extract_version_numbers("v22.3.1"), vec![22, 3, 1]);
         assert_eq!(extract_version_numbers("1.0"), vec![1, 0]);
         assert_eq!(extract_version_numbers("no numbers"), Vec::<u64>::new());
