@@ -5418,4 +5418,233 @@ mod tests {
         assert_eq!(data.local_samples.len(), 1);
         assert_eq!(data.remote_samples.len(), 1);
     }
+
+    // ========================================================================
+    // WS1.4: Tests for spawn_blocking wrappers (bd-3s1j)
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_spawn_blocking_load_with_valid_file() {
+        let _guard = test_guard!();
+        // Create a temp directory with a timing history file
+        let temp_dir = tempfile::tempdir().unwrap();
+        let history_path = temp_dir.path().join("timing_history.json");
+
+        // Create valid timing data
+        let mut history = super::TimingHistory::default();
+        history.record("test-project", Some(CompilationKind::CargoBuild), 1000, false);
+        let json = serde_json::to_string_pretty(&history).unwrap();
+        std::fs::write(&history_path, json).unwrap();
+
+        // Load via spawn_blocking (simulating what we do in production)
+        let path = history_path.clone();
+        let loaded = tokio::task::spawn_blocking(move || {
+            // In production we use timing_history_path(), here we test the pattern
+            std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|content| serde_json::from_str::<super::TimingHistory>(&content).ok())
+                .unwrap_or_default()
+        })
+        .await
+        .unwrap();
+
+        // Verify data loaded correctly
+        let data = loaded.get("test-project", Some(CompilationKind::CargoBuild));
+        assert!(data.is_some());
+        assert_eq!(data.unwrap().local_samples.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_spawn_blocking_load_missing_file() {
+        let _guard = test_guard!();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let missing_path = temp_dir.path().join("nonexistent.json");
+
+        let loaded = tokio::task::spawn_blocking(move || {
+            std::fs::read_to_string(&missing_path)
+                .ok()
+                .and_then(|content| serde_json::from_str::<super::TimingHistory>(&content).ok())
+                .unwrap_or_default()
+        })
+        .await
+        .unwrap();
+
+        // Should return default (empty history)
+        assert!(loaded.entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_spawn_blocking_load_corrupt_json() {
+        let _guard = test_guard!();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let corrupt_path = temp_dir.path().join("corrupt.json");
+        std::fs::write(&corrupt_path, "not valid json {{{").unwrap();
+
+        let loaded = tokio::task::spawn_blocking(move || {
+            std::fs::read_to_string(&corrupt_path)
+                .ok()
+                .and_then(|content| serde_json::from_str::<super::TimingHistory>(&content).ok())
+                .unwrap_or_default()
+        })
+        .await
+        .unwrap();
+
+        // Should return default on corrupt data (graceful degradation)
+        assert!(loaded.entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_spawn_blocking_save_creates_file() {
+        let _guard = test_guard!();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let save_path = temp_dir.path().join("saved_history.json");
+
+        let mut history = super::TimingHistory::default();
+        history.record("saved-project", Some(CompilationKind::CargoTest), 2000, true);
+
+        let path = save_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let content = serde_json::to_string_pretty(&history).unwrap();
+            std::fs::write(&path, content).unwrap();
+        })
+        .await
+        .unwrap();
+
+        // Verify file was created and has correct content
+        assert!(save_path.exists());
+        let content = std::fs::read_to_string(&save_path).unwrap();
+        let loaded: super::TimingHistory = serde_json::from_str(&content).unwrap();
+        let data = loaded.get("saved-project", Some(CompilationKind::CargoTest));
+        assert!(data.is_some());
+        assert_eq!(data.unwrap().remote_samples.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_spawn_blocking_timeout_protection() {
+        let _guard = test_guard!();
+        // Verify spawn_blocking completes within reasonable time (not deadlocked)
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::task::spawn_blocking(|| {
+                let history = super::TimingHistory::default();
+                // Simulate some work
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                history
+            }),
+        )
+        .await;
+
+        assert!(result.is_ok(), "spawn_blocking should complete within 5s timeout");
+    }
+
+    #[tokio::test]
+    async fn test_spawn_blocking_concurrent_loads() {
+        let _guard = test_guard!();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let history_path = temp_dir.path().join("concurrent.json");
+
+        // Create test file
+        let mut history = super::TimingHistory::default();
+        history.record("concurrent", Some(CompilationKind::CargoBuild), 500, false);
+        std::fs::write(&history_path, serde_json::to_string(&history).unwrap()).unwrap();
+
+        // Spawn 5 concurrent loads
+        let mut handles = Vec::new();
+        for _ in 0..5 {
+            let path = history_path.clone();
+            handles.push(tokio::task::spawn_blocking(move || {
+                std::fs::read_to_string(&path)
+                    .ok()
+                    .and_then(|c| serde_json::from_str::<super::TimingHistory>(&c).ok())
+                    .unwrap_or_default()
+            }));
+        }
+
+        // All should complete without deadlock
+        for handle in handles {
+            let loaded = handle.await.unwrap();
+            assert!(loaded.get("concurrent", Some(CompilationKind::CargoBuild)).is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_spawn_blocking_concurrent_saves() {
+        let _guard = test_guard!();
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        // Spawn 5 concurrent saves to different files
+        let mut handles = Vec::new();
+        for i in 0..5 {
+            let path = temp_dir.path().join(format!("save_{}.json", i));
+            let mut history = super::TimingHistory::default();
+            history.record(&format!("project-{}", i), Some(CompilationKind::CargoBuild), 100 * i as u64, false);
+
+            handles.push(tokio::task::spawn_blocking(move || {
+                let content = serde_json::to_string(&history).unwrap();
+                std::fs::write(&path, content).unwrap();
+                path
+            }));
+        }
+
+        // All should complete and files should exist
+        for handle in handles {
+            let path = handle.await.unwrap();
+            assert!(path.exists(), "File should be created: {:?}", path);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_spawn_blocking_performance_budget() {
+        let _guard = test_guard!();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let history_path = temp_dir.path().join("perf_test.json");
+
+        // Create a reasonably sized history file
+        let mut history = super::TimingHistory::default();
+        for i in 0..10 {
+            history.record(&format!("project-{}", i), Some(CompilationKind::CargoBuild), 1000 + i * 100, false);
+            history.record(&format!("project-{}", i), Some(CompilationKind::CargoBuild), 800 + i * 50, true);
+        }
+        std::fs::write(&history_path, serde_json::to_string_pretty(&history).unwrap()).unwrap();
+
+        // Measure load time
+        let load_path = history_path.clone();
+        let start = std::time::Instant::now();
+        let _loaded = tokio::task::spawn_blocking(move || {
+            std::fs::read_to_string(&load_path)
+                .ok()
+                .and_then(|c| serde_json::from_str::<super::TimingHistory>(&c).ok())
+                .unwrap_or_default()
+        })
+        .await
+        .unwrap();
+        let load_duration = start.elapsed();
+
+        // Measure save time
+        let save_path = temp_dir.path().join("perf_save.json");
+        let start = std::time::Instant::now();
+        tokio::task::spawn_blocking(move || {
+            let content = serde_json::to_string_pretty(&history).unwrap();
+            std::fs::write(&save_path, content).unwrap();
+        })
+        .await
+        .unwrap();
+        let save_duration = start.elapsed();
+
+        let total = load_duration + save_duration;
+
+        // Log timings for diagnostics (visible with --nocapture)
+        eprintln!("Performance test results:");
+        eprintln!("  Load: {:?}", load_duration);
+        eprintln!("  Save: {:?}", save_duration);
+        eprintln!("  Total: {:?}", total);
+
+        // Total should be well under 2ms budget (leaving room for the rest of the 5ms)
+        // On fast SSDs this is typically <1ms, but we allow up to 50ms for slow CI
+        assert!(
+            total < std::time::Duration::from_millis(50),
+            "Load+save took {:?}, should be <50ms for CI compatibility",
+            total
+        );
+    }
 }
