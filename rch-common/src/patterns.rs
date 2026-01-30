@@ -12,6 +12,13 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 
+// Tier name constants (avoid allocations on hot path).
+const TIER_INSTANT_REJECT: &str = "instant_reject";
+const TIER_STRUCTURE_ANALYSIS: &str = "structure_analysis";
+const TIER_KEYWORD_FILTER: &str = "keyword_filter";
+const TIER_NEVER_INTERCEPT: &str = "never_intercept";
+const TIER_FULL_CLASSIFICATION: &str = "full_classification";
+
 /// Keywords that indicate a potential compilation command.
 /// Used for SIMD-accelerated quick filtering (Tier 2).
 pub static COMPILATION_KEYWORDS: &[&str] = &[
@@ -85,7 +92,7 @@ pub struct Classification {
     /// The kind of compilation if detected.
     pub kind: Option<CompilationKind>,
     /// Reason for the classification decision.
-    pub reason: String,
+    pub reason: Cow<'static, str>,
 }
 
 /// Decision outcome for a classification tier.
@@ -102,11 +109,11 @@ pub struct ClassificationTier {
     /// Tier index (0-4).
     pub tier: u8,
     /// Tier name.
-    pub name: String,
+    pub name: Cow<'static, str>,
     /// Decision for this tier.
     pub decision: TierDecision,
     /// Reason for the decision.
-    pub reason: String,
+    pub reason: Cow<'static, str>,
 }
 
 /// Detailed classification results with per-tier decisions.
@@ -124,7 +131,7 @@ pub struct ClassificationDetails {
 
 impl Classification {
     /// Create a non-compilation classification.
-    pub fn not_compilation(reason: impl Into<String>) -> Self {
+    pub fn not_compilation(reason: impl Into<Cow<'static, str>>) -> Self {
         Self {
             is_compilation: false,
             confidence: 0.0,
@@ -134,7 +141,11 @@ impl Classification {
     }
 
     /// Create a compilation classification.
-    pub fn compilation(kind: CompilationKind, confidence: f64, reason: impl Into<String>) -> Self {
+    pub fn compilation(
+        kind: CompilationKind,
+        confidence: f64,
+        reason: impl Into<Cow<'static, str>>,
+    ) -> Self {
         Self {
             is_compilation: true,
             confidence,
@@ -240,12 +251,42 @@ impl CompilationKind {
 ///
 /// Implements the 5-tier classification system for maximum precision with
 /// minimal latency on non-compilation commands.
+///
+/// Multi-command strings (joined by `&&`, `||`, or `;`) are split and each
+/// sub-command is classified independently. If any sub-command is compilation,
+/// the result with the highest confidence is returned.
 pub fn classify_command(cmd: &str) -> Classification {
+    classify_command_inner(cmd, 0)
+}
+
+/// Maximum recursion depth for multi-command splitting.
+/// Depth 0 = top-level call that may split; depth 1 = sub-command (no further splitting).
+const MAX_CLASSIFY_DEPTH: u8 = 1;
+
+/// Maximum command length for multi-command splitting (10 KB).
+/// Commands longer than this skip splitting and are classified as a single command.
+const MAX_SPLIT_INPUT_LEN: usize = 10 * 1024;
+
+fn classify_command_inner(cmd: &str, depth: u8) -> Classification {
     let cmd = cmd.trim();
 
     // Tier 0: Instant reject - empty command
     if cmd.is_empty() {
         return Classification::not_compilation("empty command");
+    }
+
+    // Multi-command splitting (only at top level to prevent infinite recursion)
+    if depth < MAX_CLASSIFY_DEPTH && cmd.len() <= MAX_SPLIT_INPUT_LEN {
+        // Panic safety: catch_unwind ensures a splitter bug never crashes classification.
+        // On panic, fall through to single-command classification (fail-open).
+        let split_result = std::panic::catch_unwind(|| split_shell_commands(cmd));
+        if let Ok(segments) = split_result
+            && segments.len() > 1
+        {
+            return classify_multi_command(&segments, depth);
+        }
+        // If catch_unwind returned Err (panic), we silently fall through to
+        // single-command classification — fail-open behavior.
     }
 
     // Tier 1: Structure analysis - reject complex shell structures
@@ -279,6 +320,33 @@ pub fn classify_command(cmd: &str) -> Classification {
     classify_full(normalized)
 }
 
+/// Classify a multi-command string by evaluating each sub-command independently.
+///
+/// Returns compilation if ANY sub-command is compilation (highest confidence wins).
+/// Returns non-compilation only if ALL sub-commands are non-compilation.
+fn classify_multi_command(segments: &[&str], depth: u8) -> Classification {
+    let mut best_compilation: Option<Classification> = None;
+
+    for &segment in segments {
+        let result = classify_command_inner(segment, depth + 1);
+        if result.is_compilation {
+            let dominated = match &best_compilation {
+                Some(prev) => result.confidence > prev.confidence,
+                None => true,
+            };
+            if dominated {
+                best_compilation = Some(result);
+            }
+        }
+    }
+
+    if let Some(compilation) = best_compilation {
+        return compilation;
+    }
+
+    Classification::not_compilation("no sub-command is compilation")
+}
+
 /// Classify a shell command with detailed tier decisions for diagnostics.
 pub fn classify_command_detailed(cmd: &str) -> ClassificationDetails {
     let original = cmd.to_string();
@@ -290,9 +358,9 @@ pub fn classify_command_detailed(cmd: &str) -> ClassificationDetails {
         let classification = Classification::not_compilation("empty command");
         tiers.push(ClassificationTier {
             tier: 0,
-            name: "instant_reject".to_string(),
+            name: Cow::Borrowed(TIER_INSTANT_REJECT),
             decision: TierDecision::Reject,
-            reason: "empty command".to_string(),
+            reason: Cow::Borrowed("empty command"),
         });
         return ClassificationDetails {
             original,
@@ -304,9 +372,9 @@ pub fn classify_command_detailed(cmd: &str) -> ClassificationDetails {
 
     tiers.push(ClassificationTier {
         tier: 0,
-        name: "instant_reject".to_string(),
+        name: Cow::Borrowed(TIER_INSTANT_REJECT),
         decision: TierDecision::Pass,
-        reason: "command present".to_string(),
+        reason: Cow::Borrowed("command present"),
     });
 
     // Tier 1: Structure analysis
@@ -314,9 +382,9 @@ pub fn classify_command_detailed(cmd: &str) -> ClassificationDetails {
         let classification = Classification::not_compilation(reason);
         tiers.push(ClassificationTier {
             tier: 1,
-            name: "structure_analysis".to_string(),
+            name: Cow::Borrowed(TIER_STRUCTURE_ANALYSIS),
             decision: TierDecision::Reject,
-            reason: reason.to_string(),
+            reason: Cow::Borrowed(reason),
         });
         return ClassificationDetails {
             original,
@@ -328,9 +396,9 @@ pub fn classify_command_detailed(cmd: &str) -> ClassificationDetails {
 
     tiers.push(ClassificationTier {
         tier: 1,
-        name: "structure_analysis".to_string(),
+        name: Cow::Borrowed(TIER_STRUCTURE_ANALYSIS),
         decision: TierDecision::Pass,
-        reason: "no pipes/redirects/backgrounding".to_string(),
+        reason: Cow::Borrowed("no pipes/redirects/backgrounding"),
     });
 
     // Tier 2: SIMD keyword filter
@@ -338,9 +406,9 @@ pub fn classify_command_detailed(cmd: &str) -> ClassificationDetails {
         let classification = Classification::not_compilation("no compilation keyword");
         tiers.push(ClassificationTier {
             tier: 2,
-            name: "keyword_filter".to_string(),
+            name: Cow::Borrowed(TIER_KEYWORD_FILTER),
             decision: TierDecision::Reject,
-            reason: "no compilation keyword".to_string(),
+            reason: Cow::Borrowed("no compilation keyword"),
         });
         return ClassificationDetails {
             original,
@@ -352,9 +420,9 @@ pub fn classify_command_detailed(cmd: &str) -> ClassificationDetails {
 
     tiers.push(ClassificationTier {
         tier: 2,
-        name: "keyword_filter".to_string(),
+        name: Cow::Borrowed(TIER_KEYWORD_FILTER),
         decision: TierDecision::Pass,
-        reason: "keyword present".to_string(),
+        reason: Cow::Borrowed("keyword present"),
     });
 
     // Normalize command for Tier 3 and 4
@@ -366,11 +434,12 @@ pub fn classify_command_detailed(cmd: &str) -> ClassificationDetails {
         if let Some(rest) = normalized.strip_prefix(pattern)
             && (rest.is_empty() || rest.starts_with(' '))
         {
-            let reason = format!("matches never-intercept: {pattern}");
+            let reason: Cow<'static, str> =
+                Cow::Owned(format!("matches never-intercept: {pattern}"));
             let classification = Classification::not_compilation(reason.clone());
             tiers.push(ClassificationTier {
                 tier: 3,
-                name: "never_intercept".to_string(),
+                name: Cow::Borrowed(TIER_NEVER_INTERCEPT),
                 decision: TierDecision::Reject,
                 reason,
             });
@@ -385,9 +454,9 @@ pub fn classify_command_detailed(cmd: &str) -> ClassificationDetails {
 
     tiers.push(ClassificationTier {
         tier: 3,
-        name: "never_intercept".to_string(),
+        name: Cow::Borrowed(TIER_NEVER_INTERCEPT),
         decision: TierDecision::Pass,
-        reason: "no never-intercept match".to_string(),
+        reason: Cow::Borrowed("no never-intercept match"),
     });
 
     // Tier 4: Full classification
@@ -399,7 +468,7 @@ pub fn classify_command_detailed(cmd: &str) -> ClassificationDetails {
     };
     tiers.push(ClassificationTier {
         tier: 4,
-        name: "full_classification".to_string(),
+        name: Cow::Borrowed(TIER_FULL_CLASSIFICATION),
         decision,
         reason: classification.reason.clone(),
     });
@@ -915,6 +984,112 @@ fn classify_cargo(cmd: &str) -> Classification {
         }
         _ => Classification::not_compilation(format!("cargo {subcommand} not interceptable")),
     }
+}
+
+/// Split a shell command string on unquoted `;`, `&&`, and `||` operators.
+///
+/// Returns a list of sub-commands with each segment trimmed of whitespace.
+/// Characters inside single quotes, double quotes, or backticks are treated
+/// as literal and are never split. Escaped quotes (`\'`, `\"`) do not toggle
+/// quote state. Pipes (`|`) within a segment are preserved (they are part of
+/// one command, not a command separator).
+///
+/// Performance: single-pass O(n) character state machine, no regex, no heap
+/// allocation for the common single-command case.
+pub fn split_shell_commands(cmd: &str) -> Vec<&str> {
+    let bytes = cmd.as_bytes();
+    let len = bytes.len();
+    let mut segments: Vec<&str> = Vec::new();
+    let mut start = 0;
+    let mut i = 0;
+
+    // Quote state
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut in_backtick = false;
+    let mut escaped = false;
+
+    while i < len {
+        let b = bytes[i];
+
+        if escaped {
+            escaped = false;
+            i += 1;
+            continue;
+        }
+
+        if b == b'\\' {
+            escaped = true;
+            i += 1;
+            continue;
+        }
+
+        // Toggle quote state
+        if !in_double && !in_backtick && b == b'\'' {
+            in_single = !in_single;
+            i += 1;
+            continue;
+        }
+        if !in_single && !in_backtick && b == b'"' {
+            in_double = !in_double;
+            i += 1;
+            continue;
+        }
+        if !in_single && !in_double && b == b'`' {
+            in_backtick = !in_backtick;
+            i += 1;
+            continue;
+        }
+
+        // Only split when outside all quotes
+        if in_single || in_double || in_backtick {
+            i += 1;
+            continue;
+        }
+
+        // Check for `&&`
+        if b == b'&' && i + 1 < len && bytes[i + 1] == b'&' {
+            let seg = cmd[start..i].trim();
+            if !seg.is_empty() {
+                segments.push(seg);
+            }
+            i += 2;
+            start = i;
+            continue;
+        }
+
+        // Check for `||`
+        if b == b'|' && i + 1 < len && bytes[i + 1] == b'|' {
+            let seg = cmd[start..i].trim();
+            if !seg.is_empty() {
+                segments.push(seg);
+            }
+            i += 2;
+            start = i;
+            continue;
+        }
+
+        // Check for `;`
+        if b == b';' {
+            let seg = cmd[start..i].trim();
+            if !seg.is_empty() {
+                segments.push(seg);
+            }
+            i += 1;
+            start = i;
+            continue;
+        }
+
+        i += 1;
+    }
+
+    // Push the final segment
+    let seg = cmd[start..].trim();
+    if !seg.is_empty() {
+        segments.push(seg);
+    }
+
+    segments
 }
 
 #[cfg(test)]
@@ -1468,15 +1643,14 @@ mod tests {
     }
 
     #[test]
-    fn test_bun_chained_commands_not_intercepted() {
+    fn test_bun_chained_commands_classified() {
         let _guard = test_guard!();
-        // Chained commands should be rejected at Tier 1
+        // Multi-command strings are split; compilation sub-commands are detected
         let result = classify_command("bun test && echo done");
-        assert!(!result.is_compilation);
-        assert!(result.reason.contains("chained"));
+        assert!(result.is_compilation, "bun test sub-command should be detected");
 
         let result = classify_command("bun typecheck; bun test");
-        assert!(!result.is_compilation);
+        assert!(result.is_compilation, "bun typecheck/test sub-commands should be detected");
     }
 
     #[test]
@@ -2415,6 +2589,383 @@ mod tests {
                 let detailed = classify_command_detailed(cmd);
                 assert_eq!(simple, detailed.classification, "Mismatch for: {}", cmd);
             }
+        }
+
+        // =================== split_shell_commands tests ===================
+
+        #[test]
+        fn test_split_single_command() {
+            let _guard = test_guard!();
+            assert_eq!(split_shell_commands("cargo build"), vec!["cargo build"]);
+        }
+
+        #[test]
+        fn test_split_and_operator() {
+            let _guard = test_guard!();
+            assert_eq!(
+                split_shell_commands("cargo fmt && cargo build"),
+                vec!["cargo fmt", "cargo build"]
+            );
+        }
+
+        #[test]
+        fn test_split_quoted_operator() {
+            let _guard = test_guard!();
+            assert_eq!(
+                split_shell_commands("echo '&&' && cargo build"),
+                vec!["echo '&&'", "cargo build"]
+            );
+        }
+
+        #[test]
+        fn test_split_mixed_operators() {
+            let _guard = test_guard!();
+            assert_eq!(
+                split_shell_commands("cd /tmp && make -j4 || echo fail"),
+                vec!["cd /tmp", "make -j4", "echo fail"]
+            );
+        }
+
+        #[test]
+        fn test_split_semicolons() {
+            let _guard = test_guard!();
+            assert_eq!(
+                split_shell_commands("a ; b ; c"),
+                vec!["a", "b", "c"]
+            );
+        }
+
+        #[test]
+        fn test_split_quoted_semicolon() {
+            let _guard = test_guard!();
+            assert_eq!(
+                split_shell_commands("echo 'hello;world' && make"),
+                vec!["echo 'hello;world'", "make"]
+            );
+        }
+
+        #[test]
+        fn test_split_pipe_preserved() {
+            let _guard = test_guard!();
+            // Single pipe is NOT a command separator
+            assert_eq!(
+                split_shell_commands("cargo build 2>&1 | tee log"),
+                vec!["cargo build 2>&1 | tee log"]
+            );
+        }
+
+        #[test]
+        fn test_split_double_quoted_operator() {
+            let _guard = test_guard!();
+            assert_eq!(
+                split_shell_commands(r#"echo "&&" && cargo build"#),
+                vec![r#"echo "&&""#, "cargo build"]
+            );
+        }
+
+        #[test]
+        fn test_split_nested_quotes() {
+            let _guard = test_guard!();
+            assert_eq!(
+                split_shell_commands("echo \"he said 'hello && bye'\" && cargo test"),
+                vec!["echo \"he said 'hello && bye'\"", "cargo test"]
+            );
+        }
+
+        #[test]
+        fn test_split_escaped_quote() {
+            let _guard = test_guard!();
+            // Escaped quotes don't toggle state
+            assert_eq!(
+                split_shell_commands(r"echo it\'s && cargo build"),
+                vec![r"echo it\'s", "cargo build"]
+            );
+        }
+
+        #[test]
+        fn test_split_empty_string() {
+            let _guard = test_guard!();
+            assert!(split_shell_commands("").is_empty());
+        }
+
+        #[test]
+        fn test_split_only_whitespace() {
+            let _guard = test_guard!();
+            assert!(split_shell_commands("   ").is_empty());
+        }
+
+        #[test]
+        fn test_split_backtick_quoting() {
+            let _guard = test_guard!();
+            assert_eq!(
+                split_shell_commands("echo `echo && fail` && cargo build"),
+                vec!["echo `echo && fail`", "cargo build"]
+            );
+        }
+
+        #[test]
+        fn test_split_trailing_operator() {
+            let _guard = test_guard!();
+            // Trailing && with nothing after should yield just the first segment
+            assert_eq!(
+                split_shell_commands("cargo build &&"),
+                vec!["cargo build"]
+            );
+        }
+
+        // =================== fail-open safeguard tests (bd-16t3) ===================
+
+        #[test]
+        fn test_split_unclosed_single_quote() {
+            let _guard = test_guard!();
+            // Unclosed quote: everything stays "inside quotes", no split found
+            let result = split_shell_commands("echo 'hello && cargo build");
+            assert_eq!(result, vec!["echo 'hello && cargo build"]);
+        }
+
+        #[test]
+        fn test_split_unclosed_double_quote() {
+            let _guard = test_guard!();
+            let result = split_shell_commands("echo \"hello && cargo build");
+            assert_eq!(result, vec!["echo \"hello && cargo build"]);
+        }
+
+        #[test]
+        fn test_split_unclosed_backtick() {
+            let _guard = test_guard!();
+            let result = split_shell_commands("echo `hello && cargo build");
+            assert_eq!(result, vec!["echo `hello && cargo build"]);
+        }
+
+        #[test]
+        fn test_split_embedded_nulls() {
+            let _guard = test_guard!();
+            // Embedded null bytes should not cause panic
+            let input = "cargo build\0 && echo done";
+            let result = split_shell_commands(input);
+            assert_eq!(result.len(), 2);
+        }
+
+        #[test]
+        fn test_split_unicode_input() {
+            let _guard = test_guard!();
+            let result = split_shell_commands("echo 'こんにちは' && cargo build");
+            assert_eq!(result, vec!["echo 'こんにちは'", "cargo build"]);
+        }
+
+        #[test]
+        fn test_split_extremely_long_input() {
+            let _guard = test_guard!();
+            // 20KB string should still work (split_shell_commands has no length limit)
+            let long_cmd = format!("echo {} && cargo build", "x".repeat(20_000));
+            let result = split_shell_commands(&long_cmd);
+            assert_eq!(result.len(), 2);
+        }
+
+        #[test]
+        fn test_classify_long_input_skips_splitting() {
+            let _guard = test_guard!();
+            // Commands >10KB skip multi-command splitting in classify_command
+            let long_cmd = format!("cargo build && echo {}", "x".repeat(11_000));
+            let result = classify_command(&long_cmd);
+            // Falls through to single-command classification which rejects at check_structure
+            assert!(!result.is_compilation);
+            assert!(
+                result.reason.to_string().contains("chained"),
+                "long input should be rejected by check_structure, not split"
+            );
+        }
+
+        #[test]
+        fn test_split_only_operators() {
+            let _guard = test_guard!();
+            // Just operators with no commands
+            let result = split_shell_commands("&& || ;");
+            assert!(result.is_empty(), "only operators should yield empty result");
+        }
+
+        #[test]
+        fn test_split_consecutive_operators() {
+            let _guard = test_guard!();
+            let result = split_shell_commands("cargo build && && echo done");
+            // Middle empty segment is dropped, yielding 2 segments
+            assert_eq!(result, vec!["cargo build", "echo done"]);
+        }
+
+        #[test]
+        fn test_classify_empty_after_split() {
+            let _guard = test_guard!();
+            // All sub-commands are non-compilation
+            let result = classify_command("echo hello && ls -la || pwd");
+            assert!(!result.is_compilation);
+        }
+
+        // =================== comprehensive multi-command tests (bd-1q0e) ===================
+
+        // --- Split edge cases ---
+
+        #[test]
+        fn test_split_three_segment_chain() {
+            let _guard = test_guard!();
+            assert_eq!(
+                split_shell_commands("cd /proj && cmake .. && make"),
+                vec!["cd /proj", "cmake ..", "make"]
+            );
+        }
+
+        #[test]
+        fn test_split_single_with_flags() {
+            let _guard = test_guard!();
+            assert_eq!(
+                split_shell_commands("cargo build --release"),
+                vec!["cargo build --release"]
+            );
+        }
+
+        #[test]
+        fn test_split_nested_quotes_semicolon() {
+            let _guard = test_guard!();
+            assert_eq!(
+                split_shell_commands("echo \"it's && done\" && make"),
+                vec!["echo \"it's && done\"", "make"]
+            );
+        }
+
+        #[test]
+        fn test_split_pipe_then_and() {
+            let _guard = test_guard!();
+            // Single pipe within segment, && between segments
+            assert_eq!(
+                split_shell_commands("make 2>&1 | grep error && echo done"),
+                vec!["make 2>&1 | grep error", "echo done"]
+            );
+        }
+
+        #[test]
+        fn test_split_leading_operator() {
+            let _guard = test_guard!();
+            // Leading && with nothing before
+            assert_eq!(
+                split_shell_commands("&& cargo build"),
+                vec!["cargo build"]
+            );
+        }
+
+        // --- Classification integration: should classify as COMPILATION ---
+
+        #[test]
+        fn test_classify_cargo_fmt_and_build() {
+            let _guard = test_guard!();
+            let result = classify_command("cargo fmt && cargo build");
+            assert!(result.is_compilation, "cargo build sub-command should be detected");
+            assert_eq!(result.kind, Some(CompilationKind::CargoBuild));
+        }
+
+        #[test]
+        fn test_classify_cd_and_make() {
+            let _guard = test_guard!();
+            let result = classify_command("cd /project && make -j8");
+            assert!(result.is_compilation, "make sub-command should be detected");
+            assert_eq!(result.kind, Some(CompilationKind::Make));
+        }
+
+        #[test]
+        fn test_classify_export_and_cargo_build() {
+            let _guard = test_guard!();
+            let result = classify_command(
+                "export RUSTFLAGS='-C opt-level=3' && cargo build --release",
+            );
+            assert!(result.is_compilation, "cargo build --release should be detected");
+            assert_eq!(result.kind, Some(CompilationKind::CargoBuild));
+        }
+
+        #[test]
+        fn test_classify_mkdir_cmake_chain() {
+            let _guard = test_guard!();
+            let result = classify_command("mkdir -p build && cmake -B build && cmake --build build");
+            assert!(result.is_compilation, "cmake sub-command should be detected");
+            assert_eq!(result.kind, Some(CompilationKind::CmakeBuild));
+        }
+
+        #[test]
+        fn test_classify_echo_and_cargo_test() {
+            let _guard = test_guard!();
+            let result = classify_command("echo 'Starting...' && cargo test");
+            assert!(result.is_compilation, "cargo test sub-command should be detected");
+            assert_eq!(result.kind, Some(CompilationKind::CargoTest));
+        }
+
+        #[test]
+        fn test_classify_semicolon_chain_with_compilation() {
+            let _guard = test_guard!();
+            let result = classify_command("cargo fmt; cargo build; cargo test");
+            assert!(result.is_compilation, "compilation sub-commands should be detected");
+        }
+
+        // --- Classification integration: should classify as NON-COMPILATION ---
+
+        #[test]
+        fn test_classify_echo_chain_non_compilation() {
+            let _guard = test_guard!();
+            let result = classify_command("echo hello && echo world");
+            assert!(!result.is_compilation);
+        }
+
+        #[test]
+        fn test_classify_ls_cat_non_compilation() {
+            let _guard = test_guard!();
+            let result = classify_command("ls -la && cat file.txt");
+            assert!(!result.is_compilation);
+        }
+
+        #[test]
+        fn test_classify_git_chain_non_compilation() {
+            let _guard = test_guard!();
+            let result = classify_command("git status && git log");
+            assert!(!result.is_compilation);
+        }
+
+        // --- Performance test ---
+
+        #[test]
+        fn test_classify_multi_command_performance() {
+            let _guard = test_guard!();
+            let start = std::time::Instant::now();
+            for _ in 0..100 {
+                let _ = classify_command("cargo fmt && cargo build && cargo test");
+            }
+            let elapsed = start.elapsed();
+            let per_call_us = elapsed.as_micros() / 100;
+            // Each classify_command call should be well under 5ms
+            assert!(
+                per_call_us < 5_000,
+                "classify_command took {}us per call, should be <5000us",
+                per_call_us
+            );
+            eprintln!(
+                "[perf] classify_command multi-command: {}us avg per call",
+                per_call_us
+            );
+        }
+
+        // --- Pipe preservation with split ---
+
+        #[test]
+        fn test_classify_pipe_preserved_in_segment() {
+            let _guard = test_guard!();
+            // Pipe within a segment is NOT a split point; segment stays whole
+            // and gets rejected by check_structure (piped command)
+            let result = classify_command("cargo build 2>&1 | tee log");
+            assert!(!result.is_compilation, "piped command should be rejected");
+        }
+
+        #[test]
+        fn test_classify_pipe_segment_and_operator() {
+            let _guard = test_guard!();
+            // Pipe within first segment, && separates from second
+            let result = classify_command("make 2>&1 | grep error && cargo build");
+            // First segment has pipe (rejected), but second is cargo build (compilation)
+            assert!(result.is_compilation, "cargo build sub-command should be detected");
         }
     }
 }

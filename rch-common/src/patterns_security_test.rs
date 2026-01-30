@@ -3,24 +3,22 @@ mod tests {
     use crate::patterns::classify_command;
 
     #[test]
-    fn test_chained_semicolon_rejected() {
+    fn test_chained_semicolon_classified() {
+        // Multi-command strings are split; compilation sub-commands detected
         let result = classify_command("cargo build ; echo malicious");
-        assert!(!result.is_compilation);
-        assert!(result.reason.contains("chained"));
+        assert!(result.is_compilation, "cargo build sub-command should be detected");
     }
 
     #[test]
-    fn test_chained_and_rejected() {
+    fn test_chained_and_classified() {
         let result = classify_command("cargo build && echo malicious");
-        assert!(!result.is_compilation);
-        assert!(result.reason.contains("chained"));
+        assert!(result.is_compilation, "cargo build sub-command should be detected");
     }
 
     #[test]
-    fn test_chained_or_rejected() {
+    fn test_chained_or_classified() {
         let result = classify_command("cargo build || echo failed");
-        assert!(!result.is_compilation);
-        assert!(result.reason.contains("chained"));
+        assert!(result.is_compilation, "cargo build sub-command should be detected");
     }
 
     #[test]

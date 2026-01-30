@@ -43,7 +43,7 @@ pub use logging::{LogConfig, LogFormat, LoggingGuards, init_logging};
 pub use mock_worker::MockWorkerServer;
 pub use patterns::{
     Classification, ClassificationDetails, ClassificationTier, CompilationKind, TierDecision,
-    classify_command, classify_command_detailed,
+    classify_command, classify_command_detailed, split_shell_commands,
 };
 pub use protocol::{HookInput, HookOutput, ToolInput};
 pub use ssh::{CommandResult, KnownHostsPolicy, SshClient, SshOptions, SshPool};
