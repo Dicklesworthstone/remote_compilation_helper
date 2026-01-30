@@ -1823,12 +1823,13 @@ mod tests {
         let worker = mock_worker("worker1");
         let backup = mock_backup_with_hash("worker1", "0.9.0", 1000, "abc123");
 
+        // Note: mock returns just the hash since the real command uses `| cut -d' ' -f1`
         let mock = MockSshExecutor::new()
             .with_command("pkill", MockCommandResult::ok(""))
             .with_command("test -f", MockCommandResult::ok(""))
             .with_command("cp --preserve", MockCommandResult::ok(""))
             .with_command("chmod", MockCommandResult::ok(""))
-            .with_command("sha256sum", MockCommandResult::ok("abc123  /path"))
+            .with_command("sha256sum", MockCommandResult::ok("abc123"))
             .with_command("--version", MockCommandResult::ok("rch-wkr 0.9.0"))
             .with_command("nohup", MockCommandResult::ok(""));
 
@@ -1932,13 +1933,13 @@ mod tests {
         let worker = mock_worker("worker1");
         let backup = mock_backup_with_hash("worker1", "0.9.0", 1000, "correct_hash");
 
+        // Note: mock returns just the hash since the real command uses `| cut -d' ' -f1`
         let mock = MockSshExecutor::new()
             .with_command("pkill", MockCommandResult::ok(""))
             .with_command("test -f", MockCommandResult::ok(""))
             .with_command("cp --preserve", MockCommandResult::ok(""))
             .with_command("chmod", MockCommandResult::ok(""))
-            // Hash matches exactly
-            .with_command("sha256sum", MockCommandResult::ok("correct_hash  /path"))
+            .with_command("sha256sum", MockCommandResult::ok("correct_hash"))
             .with_command("--version", MockCommandResult::ok("rch-wkr 0.9.0"))
             .with_command("nohup", MockCommandResult::ok(""));
 
@@ -1977,7 +1978,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_backup_registry_concurrent_writes() {
-        use std::sync::Arc;
         use tokio::task::JoinSet;
 
         let temp_dir = tempfile::tempdir().unwrap();
@@ -2035,19 +2035,16 @@ mod tests {
         let worker = mock_worker("worker1");
         let backup = mock_backup_with_hash("worker1", "0.9.0", 1000, "abc123");
 
-        // Track command order
-        let call_order = Arc::new(Mutex::new(Vec::<String>::new()));
-        let order_pkill = call_order.clone();
-        let order_cp = call_order.clone();
-        let order_nohup = call_order.clone();
+        // Track command order (variables intentionally unused - Arc/Mutex kept for future extension)
+        let _call_order = Arc::new(Mutex::new(Vec::<String>::new()));
 
-        // Use default mock but we'll track order via pattern matching
+        // Note: mock returns just the hash since the real command uses `| cut -d' ' -f1`
         let mock = MockSshExecutor::new()
             .with_command("pkill", MockCommandResult::ok(""))
             .with_command("test -f", MockCommandResult::ok(""))
             .with_command("cp --preserve", MockCommandResult::ok(""))
             .with_command("chmod", MockCommandResult::ok(""))
-            .with_command("sha256sum", MockCommandResult::ok("abc123  /path"))
+            .with_command("sha256sum", MockCommandResult::ok("abc123"))
             .with_command("--version", MockCommandResult::ok("rch-wkr 0.9.0"))
             .with_command("nohup", MockCommandResult::ok(""));
 
