@@ -15,7 +15,6 @@ pub mod types;
 pub use types::*;
 
 // Re-export commonly used helpers
-use helpers::{humanize_duration, indent_lines, urlencoding_encode};
 use crate::error::{ConfigError, DaemonError, SshError};
 use crate::status_types::{
     ActiveBuildFromApi, DaemonFullStatusResponse, SelfTestHistoryResponse, SelfTestRunResponse,
@@ -28,6 +27,7 @@ use crate::ui::progress::{MultiProgressManager, Spinner};
 use crate::ui::theme::StatusIndicator;
 use anyhow::{Context, Result, bail};
 use directories::ProjectDirs;
+use helpers::{humanize_duration, indent_lines, urlencoding_encode};
 use rch_common::{
     ApiError, ApiResponse, Classification, ClassificationDetails, CommandPriority,
     ConfigValueSource, DiscoveredHost, ErrorCode, RchConfig, RequiredRuntime, SshClient,
@@ -3983,7 +3983,14 @@ pub fn daemon_logs(lines: usize, ctx: &OutputContext) -> Result<()> {
 
     // No log files found - try journald (for systemd service)
     if let Ok(output) = std::process::Command::new("journalctl")
-        .args(["--user", "-u", "rchd", "-n", &lines.to_string(), "--no-pager"])
+        .args([
+            "--user",
+            "-u",
+            "rchd",
+            "-n",
+            &lines.to_string(),
+            "--no-pager",
+        ])
         .output()
         && output.status.success()
     {
@@ -8642,7 +8649,11 @@ pub async fn hook_test(ctx: &OutputContext) -> Result<()> {
 
         let decision = if stdout.is_empty() {
             "allow"
-        } else if output_json.as_ref().map(|v| v.get("hookSpecificOutput").is_some()).unwrap_or(false) {
+        } else if output_json
+            .as_ref()
+            .map(|v| v.get("hookSpecificOutput").is_some())
+            .unwrap_or(false)
+        {
             "deny"
         } else {
             "allow"
@@ -8684,7 +8695,10 @@ pub async fn hook_test(ctx: &OutputContext) -> Result<()> {
                     );
                     println!("\nThe hook intercepted the command.");
 
-                    if let Some(reason) = hook_output.get("permissionDecisionReason").and_then(|r| r.as_str()) {
+                    if let Some(reason) = hook_output
+                        .get("permissionDecisionReason")
+                        .and_then(|r| r.as_str())
+                    {
                         println!("Reason: {}", reason);
                     }
                 } else {
@@ -8983,18 +8997,10 @@ pub fn agents_install_hook(agent: &str, dry_run: bool, ctx: &OutputContext) -> R
                 );
             }
             IdempotentResult::WouldChange(msg) => {
-                println!(
-                    "{} {}",
-                    StatusIndicator::Info.display(style),
-                    msg
-                );
+                println!("{} {}", StatusIndicator::Info.display(style), msg);
             }
             IdempotentResult::NotApplicable(msg) => {
-                println!(
-                    "{} {}",
-                    StatusIndicator::Warning.display(style),
-                    msg
-                );
+                println!("{} {}", StatusIndicator::Warning.display(style), msg);
             }
             // Other variants (Created, AlreadyExists, Updated, DryRun) not returned by hook install
             other => {
@@ -9064,18 +9070,10 @@ pub fn agents_uninstall_hook(agent: &str, dry_run: bool, ctx: &OutputContext) ->
                 );
             }
             IdempotentResult::WouldChange(msg) => {
-                println!(
-                    "{} {}",
-                    StatusIndicator::Info.display(style),
-                    msg
-                );
+                println!("{} {}", StatusIndicator::Info.display(style), msg);
             }
             IdempotentResult::NotApplicable(msg) => {
-                println!(
-                    "{} {}",
-                    StatusIndicator::Warning.display(style),
-                    msg
-                );
+                println!("{} {}", StatusIndicator::Warning.display(style), msg);
             }
             // Other variants (Created, AlreadyExists, Updated, DryRun) not returned by hook uninstall
             other => {
@@ -10449,9 +10447,17 @@ mod tests {
         let _guard = test_guard!();
         let path = default_socket_path();
         // Should end with rch.sock regardless of prefix
-        assert!(path.ends_with("rch.sock"), "Socket path should end with rch.sock, got: {}", path);
+        assert!(
+            path.ends_with("rch.sock"),
+            "Socket path should end with rch.sock, got: {}",
+            path
+        );
         // Should be an absolute path
-        assert!(path.starts_with('/'), "Socket path should be absolute, got: {}", path);
+        assert!(
+            path.starts_with('/'),
+            "Socket path should be absolute, got: {}",
+            path
+        );
     }
 
     // -------------------------------------------------------------------------

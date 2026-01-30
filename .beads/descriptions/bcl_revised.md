@@ -22,9 +22,9 @@ Add comprehensive GitHub Actions CI with quality gates, security scanning, cross
 ```yaml
 on:
   push:
-    branches: [master, main]
+    branches: [main]
   pull_request:
-    branches: [master, main]
+    branches: [main]
   schedule:
     - cron: '0 6 * * 1'  # Weekly security scan
 ```
@@ -141,7 +141,7 @@ name: CI
 
 on:
   push:
-    branches: [master, main]
+    branches: [main]
   pull_request:
   schedule:
     - cron: '0 6 * * 1'

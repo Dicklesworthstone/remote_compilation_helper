@@ -8,7 +8,7 @@ use crate::fleet::plan::{DeploymentPlan, DeploymentStatus, DeploymentStrategy};
 use crate::fleet::progress::{DeployPhase, FleetProgress};
 use crate::ui::context::OutputContext;
 use crate::ui::theme::StatusIndicator;
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use rch_common::mock;
 use rch_common::{WorkerConfig, WorkerId};
 use serde::{Deserialize, Serialize};
@@ -424,7 +424,10 @@ impl FleetExecutor {
 async fn test_ssh_connectivity(worker: &WorkerConfig) -> Result<()> {
     // Mock mode: skip actual SSH
     if mock::is_mock_enabled() || mock::is_mock_worker(worker) {
-        debug!("Mock mode: skipping SSH connectivity test for {}", worker.id);
+        debug!(
+            "Mock mode: skipping SSH connectivity test for {}",
+            worker.id
+        );
         return Ok(());
     }
 

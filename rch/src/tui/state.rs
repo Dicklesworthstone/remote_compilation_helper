@@ -245,10 +245,7 @@ impl TuiState {
                     .and_then(|p| p.percent)
                     .map(|p| format!(" ({}%)", p))
                     .unwrap_or_default();
-                Some(format!(
-                    "{} → {} | {}{}",
-                    b.command, worker, b.id, progress,
-                ))
+                Some(format!("{} → {} | {}{}", b.command, worker, b.id, progress,))
             }
             Panel::BuildHistory => {
                 let b = self.build_history.get(self.selected_index)?;

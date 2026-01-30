@@ -475,7 +475,6 @@ impl SelfTestService {
         Ok(result)
     }
 
-
     async fn apply_failure_actions(&self, results: &[SelfTestResultRecord]) {
         if results.is_empty() {
             return;
@@ -593,10 +592,7 @@ async fn run_single_worker_test(
                 remote_hash: None,
                 local_time_ms: None,
                 remote_time_ms: None,
-                error: Some(format!(
-                    "Self-test timed out after {:?}",
-                    options.timeout
-                )),
+                error: Some(format!("Self-test timed out after {:?}", options.timeout)),
             },
         };
 

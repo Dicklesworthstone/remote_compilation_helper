@@ -490,7 +490,10 @@ mod tests {
     fn regression_chained_semicolon_classified() {
         // Multi-command splitting detects cargo build sub-command
         let result = classify_command("cargo build; rm -rf /");
-        assert!(result.is_compilation, "cargo build sub-command should be detected");
+        assert!(
+            result.is_compilation,
+            "cargo build sub-command should be detected"
+        );
     }
 
     #[test]

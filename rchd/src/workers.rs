@@ -447,7 +447,7 @@ impl WorkerPool {
         }
     }
 
-    /// Prune workers that are in Draining state and have no active slots.
+    /// Prune workers that are in Draining or Drained state and have no active slots.
     ///
     /// Returns the number of workers removed.
     pub async fn prune_drained(&self) -> usize {
@@ -455,7 +455,11 @@ impl WorkerPool {
         let mut to_remove = Vec::new();
 
         for (id, worker) in workers.iter() {
-            if worker.is_draining().await && worker.used_slots() == 0 {
+            let status = worker.status().await;
+            let is_draining_or_drained =
+                status == WorkerStatus::Draining || status == WorkerStatus::Drained;
+
+            if is_draining_or_drained && worker.used_slots() == 0 {
                 to_remove.push(id.clone());
             }
         }
@@ -644,7 +648,10 @@ mod tests {
         // NaN roundtrips via to_bits/from_bits (NaN != NaN, so check bits)
         state.set_speed_score(f64::NAN);
         let retrieved = state.get_speed_score();
-        assert!(retrieved.is_nan(), "NaN should roundtrip via to_bits/from_bits");
+        assert!(
+            retrieved.is_nan(),
+            "NaN should roundtrip via to_bits/from_bits"
+        );
         assert_eq!(
             f64::NAN.to_bits(),
             retrieved.to_bits(),

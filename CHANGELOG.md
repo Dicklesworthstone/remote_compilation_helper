@@ -271,7 +271,7 @@ rch update check/install/rollback  # Self-update system
 
 **One-Line Install**:
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/remote_compilation_helper/master/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/remote_compilation_helper/main/install.sh | bash
 ```
 
 **Installation Features**:

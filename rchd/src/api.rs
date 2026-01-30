@@ -2489,9 +2489,10 @@ async fn handle_status(ctx: &DaemonContext) -> Result<DaemonFullStatus> {
     // Get started_at as ISO 8601 (approximation using current time - uptime)
     let started_at = {
         use std::time::{SystemTime, UNIX_EPOCH};
+        // Use unwrap_or_default to handle edge case of system time before UNIX_EPOCH
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
         let start = now - uptime_secs;
         // Format as ISO 8601

@@ -24,6 +24,40 @@ use tokio::time::sleep;
 use tracing::{debug, info, warn};
 
 // =============================================================================
+// Sensitive Data Masking
+// =============================================================================
+
+/// Mask sensitive patterns in a command string before logging.
+///
+/// Prevents accidental exposure of API keys, passwords, and tokens.
+fn mask_sensitive_in_log(cmd: &str) -> String {
+    // Quick check: if no '=' sign, no env vars to mask
+    if !cmd.contains('=') && !cmd.contains("--token") && !cmd.contains("--password") {
+        return cmd.to_string();
+    }
+
+    let sensitive_prefixes = [
+        "TOKEN=", "PASSWORD=", "SECRET=", "API_KEY=", "PASS=",
+        "CARGO_REGISTRY_TOKEN=", "GITHUB_TOKEN=", "DATABASE_URL=",
+        "AWS_SECRET_ACCESS_KEY=", "AWS_ACCESS_KEY_ID=",
+    ];
+
+    let mut result = cmd.to_string();
+    for prefix in sensitive_prefixes {
+        if let Some(start) = result.find(prefix) {
+            let value_start = start + prefix.len();
+            let rest = &result[value_start..];
+            let value_end = rest
+                .find(|c: char| c.is_whitespace())
+                .map(|i| value_start + i)
+                .unwrap_or(result.len());
+            result = format!("{}{}***{}", &result[..start], prefix, &result[value_end..]);
+        }
+    }
+    result
+}
+
+// =============================================================================
 // Retry Logic (bd-x1ek)
 // =============================================================================
 
@@ -177,14 +211,56 @@ pub struct TransferPipeline {
     env_overrides: Option<HashMap<String, String>>,
 }
 
+/// Validate a project hash for safe use in file paths.
+///
+/// The hash should be a hex string (output of BLAKE3). This function
+/// validates that it contains only hex digits to prevent path traversal
+/// or shell injection attacks.
+fn validate_project_hash(hash: &str) -> String {
+    // Hash should be hex digits only
+    if hash.is_empty() {
+        return "0000000000000000".to_string();
+    }
+
+    // Reject if it contains anything other than hex digits
+    if !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        warn!(
+            "Project hash contains non-hex characters, sanitizing: {:?}",
+            hash
+        );
+        // Filter to only hex characters
+        let sanitized: String = hash.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+        if sanitized.is_empty() {
+            return "0000000000000000".to_string();
+        }
+        return sanitized;
+    }
+
+    hash.to_string()
+}
+
 impl TransferPipeline {
     /// Create a new transfer pipeline.
+    ///
+    /// The project_id and project_hash are sanitized to prevent path traversal
+    /// and shell injection attacks.
     pub fn new(
         project_root: PathBuf,
         project_id: String,
         project_hash: String,
         transfer_config: TransferConfig,
     ) -> Self {
+        // Sanitize inputs to prevent path traversal and injection attacks
+        let safe_project_id = sanitize_project_id(&project_id);
+        let safe_project_hash = validate_project_hash(&project_hash);
+
+        if safe_project_id != project_id {
+            warn!(
+                "Project ID sanitized: {:?} -> {:?}",
+                project_id, safe_project_id
+            );
+        }
+
         let ssh_options = SshOptions {
             server_alive_interval: transfer_config
                 .ssh_server_alive_interval_secs
@@ -197,8 +273,8 @@ impl TransferPipeline {
 
         Self {
             project_root,
-            project_id,
-            project_hash,
+            project_id: safe_project_id,
+            project_hash: safe_project_hash,
             transfer_config,
             ssh_options,
             color_mode: ColorMode::default(),
@@ -287,9 +363,37 @@ impl TransferPipeline {
 
     /// Get the remote project path on the worker.
     pub fn remote_path(&self) -> String {
+        let base = self.transfer_config.remote_base.trim_end_matches('/');
+        format!("{}/{}/{}", base, self.project_id, self.project_hash)
+    }
+
+    /// Build the full remote command string with all wrappers.
+    fn build_remote_command(&self, command: &str, toolchain: Option<&ToolchainInfo>) -> String {
+        let remote_path = self.remote_path();
+        let escaped_remote_path = escape(Cow::from(&remote_path));
+        let toolchain_command = wrap_command_with_toolchain(command, toolchain);
+
+        let env_prefix = self.build_env_prefix();
+        if !env_prefix.applied.is_empty() {
+            debug!("Forwarding env vars: {:?}", env_prefix.applied);
+        }
+        if !env_prefix.rejected.is_empty() {
+            warn!("Skipping env vars: {:?}", env_prefix.rejected);
+        }
+        let env_command = if env_prefix.prefix.is_empty() {
+            toolchain_command
+        } else {
+            format!("{}{}", env_prefix.prefix, toolchain_command)
+        };
+
+        // Apply color mode environment variables
+        let colored_command = wrap_command_with_color(&env_command, self.color_mode);
+
+        // Force LC_ALL=C to ensure English output for error parsing
+        // Wrap command to run in project directory
         format!(
-            "{}/{}/{}",
-            self.transfer_config.remote_base, self.project_id, self.project_hash
+            "export LC_ALL=C; cd {} && {}",
+            escaped_remote_path, colored_command
         )
     }
 
@@ -683,31 +787,7 @@ impl TransferPipeline {
         command: &str,
         toolchain: Option<&ToolchainInfo>,
     ) -> Result<CommandResult> {
-        let remote_path = self.remote_path();
-        let escaped_remote_path = escape(Cow::from(&remote_path));
-
-        // Wrap command with toolchain if provided
-        let toolchain_command = wrap_command_with_toolchain(command, toolchain);
-
-        // Apply environment allowlist before color wrapping
-        let env_prefix = self.build_env_prefix();
-        if !env_prefix.applied.is_empty() {
-            debug!("Forwarding env vars: {:?}", env_prefix.applied);
-        }
-        if !env_prefix.rejected.is_empty() {
-            warn!("Skipping env vars: {:?}", env_prefix.rejected);
-        }
-        let env_command = if env_prefix.prefix.is_empty() {
-            toolchain_command
-        } else {
-            format!("{}{}", env_prefix.prefix, toolchain_command)
-        };
-
-        // Apply color mode environment variables
-        let colored_command = wrap_command_with_color(&env_command, self.color_mode);
-
-        // Wrap command to run in project directory
-        let wrapped_command = format!("cd {} && {}", escaped_remote_path, colored_command);
+        let wrapped_command = self.build_remote_command(command, toolchain);
 
         if use_mock_transport(worker) {
             let mut client = MockSshClient::new(worker.clone(), MockConfig::from_env());
@@ -717,7 +797,8 @@ impl TransferPipeline {
             return Ok(result);
         }
 
-        info!("Executing on {}: {}", worker.id, command);
+        // Mask sensitive data (API keys, tokens) before logging
+        info!("Executing on {}: {}", worker.id, mask_sensitive_in_log(command));
 
         let mut client = SshClient::new(worker.clone(), self.ssh_options.clone());
         client.connect().await?;
@@ -755,26 +836,7 @@ impl TransferPipeline {
         F: FnMut(&str),
         G: FnMut(&str),
     {
-        let remote_path = self.remote_path();
-        let escaped_remote_path = escape(Cow::from(&remote_path));
-        let toolchain_command = wrap_command_with_toolchain(command, toolchain);
-
-        let env_prefix = self.build_env_prefix();
-        if !env_prefix.applied.is_empty() {
-            debug!("Forwarding env vars: {:?}", env_prefix.applied);
-        }
-        if !env_prefix.rejected.is_empty() {
-            warn!("Skipping env vars: {:?}", env_prefix.rejected);
-        }
-        let env_command = if env_prefix.prefix.is_empty() {
-            toolchain_command
-        } else {
-            format!("{}{}", env_prefix.prefix, toolchain_command)
-        };
-
-        // Apply color mode environment variables to preserve ANSI colors
-        let colored_command = wrap_command_with_color(&env_command, self.color_mode);
-        let wrapped_command = format!("cd {} && {}", escaped_remote_path, colored_command);
+        let wrapped_command = self.build_remote_command(command, toolchain);
 
         if use_mock_transport(worker) {
             let mut client = MockSshClient::new(worker.clone(), MockConfig::from_env());
@@ -1316,12 +1378,66 @@ pub fn compute_project_hash(project_path: &Path) -> String {
     hasher.finalize().to_hex()[..16].to_string()
 }
 
+/// Validate a project identifier for safe use in file paths.
+///
+/// Rejects:
+/// - Path traversal sequences (.., ./)
+/// - Null bytes
+/// - Shell metacharacters that could cause injection
+/// - Names starting with hyphen (could be interpreted as flags)
+///
+/// Returns the sanitized name or "unknown" if invalid.
+fn sanitize_project_id(name: &str) -> String {
+    // Reject obviously dangerous patterns
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains("..")
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains('\0')
+        || name.starts_with('-')
+    {
+        return "unknown".to_string();
+    }
+
+    // Reject shell metacharacters that could cause injection
+    // Allow: alphanumeric, underscore, hyphen, dot (but not leading dot for hidden files)
+    let is_safe = name.chars().all(|c| {
+        c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.'
+    }) && !name.starts_with('.');
+
+    if is_safe {
+        name.to_string()
+    } else {
+        // Replace unsafe characters with underscores
+        let sanitized: String = name
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+
+        // Remove leading dots after sanitization
+        sanitized.trim_start_matches('.').to_string()
+    }
+}
+
 /// Get the project identifier from a path.
+///
+/// Extracts the directory name and sanitizes it for safe use in remote paths.
+/// Returns "unknown" if the path is invalid or the name contains dangerous characters.
 pub fn project_id_from_path(path: &Path) -> String {
-    path.file_name()
+    let name = path
+        .file_name()
         .and_then(|n| n.to_str())
-        .unwrap_or("unknown")
-        .to_string()
+        .unwrap_or("unknown");
+
+    sanitize_project_id(name)
 }
 
 /// Default artifact patterns for Rust projects.

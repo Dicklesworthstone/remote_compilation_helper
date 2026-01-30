@@ -74,6 +74,69 @@ const EXIT_TEST_FAILURES: i32 = 101;
 /// Exit code = 128 + signal number (e.g., 137 = 128 + 9 = SIGKILL).
 const EXIT_SIGNAL_BASE: i32 = 128;
 
+// ============================================================================
+// Sensitive Data Masking
+// ============================================================================
+
+/// Mask sensitive patterns in a command string before logging.
+///
+/// This prevents accidental exposure of API keys, passwords, and tokens
+/// that may be present in environment variables or command arguments.
+fn mask_sensitive_command(cmd: &str) -> String {
+    // Patterns to mask (case-insensitive matching would be better, but this is simple)
+    let patterns = [
+        // Environment variable patterns
+        ("CARGO_REGISTRY_TOKEN=", "CARGO_REGISTRY_TOKEN=***"),
+        ("GITHUB_TOKEN=", "GITHUB_TOKEN=***"),
+        ("GH_TOKEN=", "GH_TOKEN=***"),
+        ("DATABASE_URL=", "DATABASE_URL=***"),
+        ("DB_PASSWORD=", "DB_PASSWORD=***"),
+        ("API_KEY=", "API_KEY=***"),
+        ("API_SECRET=", "API_SECRET=***"),
+        ("SECRET_KEY=", "SECRET_KEY=***"),
+        ("PASSWORD=", "PASSWORD=***"),
+        ("PASS=", "PASS=***"),
+        ("TOKEN=", "TOKEN=***"),
+        ("AUTH_TOKEN=", "AUTH_TOKEN=***"),
+        ("ACCESS_TOKEN=", "ACCESS_TOKEN=***"),
+        ("PRIVATE_KEY=", "PRIVATE_KEY=***"),
+        ("AWS_SECRET_ACCESS_KEY=", "AWS_SECRET_ACCESS_KEY=***"),
+        ("AWS_ACCESS_KEY_ID=", "AWS_ACCESS_KEY_ID=***"),
+        ("STRIPE_SECRET_KEY=", "STRIPE_SECRET_KEY=***"),
+        ("OPENAI_API_KEY=", "OPENAI_API_KEY=***"),
+        ("ANTHROPIC_API_KEY=", "ANTHROPIC_API_KEY=***"),
+        // Command-line argument patterns (--token, --password, etc.)
+        ("--token ", "--token ***"),
+        ("--password ", "--password ***"),
+        ("--api-key ", "--api-key ***"),
+        ("--secret ", "--secret ***"),
+    ];
+
+    let mut result = cmd.to_string();
+    for (pattern, replacement) in patterns {
+        // Simple case-sensitive replacement; for better matching consider regex
+        if result.contains(pattern) {
+            // Find pattern and mask everything until next space or end
+            if let Some(start) = result.find(pattern) {
+                let value_start = start + pattern.len();
+                // Find end of value (next unquoted space or end of string)
+                let rest = &result[value_start..];
+                let value_end = rest
+                    .find(|c: char| c.is_whitespace())
+                    .map(|i| value_start + i)
+                    .unwrap_or(result.len());
+
+                // Replace the value portion
+                let prefix = &result[..start];
+                let suffix = &result[value_end..];
+                result = format!("{}{}{}", prefix, replacement, suffix);
+            }
+        }
+    }
+
+    result
+}
+
 /// Run the hook, reading from stdin and writing to stdout.
 pub async fn run_hook() -> anyhow::Result<()> {
     let stdin = io::stdin();
@@ -1041,13 +1104,17 @@ fn estimate_cores_for_command(
         ) => {
             // Priority order for test slot estimation:
             // 1. Explicit --test-threads flag
-            // 2. RUST_TEST_THREADS environment variable
+            // 2. RUST_TEST_THREADS environment variable (inline or ambient)
             // 3. Inferred from test filtering (reduced slots)
             // 4. Default test_slots from config
             if let Some(threads) = parse_test_threads(command) {
                 return threads.max(1);
             }
-            if let Some(threads) = parse_env_u32(command, "RUST_TEST_THREADS") {
+            if let Some(threads) = parse_env_u32(command, "RUST_TEST_THREADS").or_else(|| {
+                std::env::var("RUST_TEST_THREADS")
+                    .ok()
+                    .and_then(|v| parse_u32(&v))
+            }) {
                 return threads.max(1);
             }
 
@@ -1070,10 +1137,20 @@ fn estimate_cores_for_command(
             | CompilationKind::BunTypecheck,
         ) => parse_jobs_flag(command)
             .or_else(|| parse_env_u32(command, "CARGO_BUILD_JOBS"))
+            .or_else(|| {
+                std::env::var("CARGO_BUILD_JOBS")
+                    .ok()
+                    .and_then(|v| parse_u32(&v))
+            })
             .unwrap_or(check_default)
             .max(1),
         Some(_) => parse_jobs_flag(command)
             .or_else(|| parse_env_u32(command, "CARGO_BUILD_JOBS"))
+            .or_else(|| {
+                std::env::var("CARGO_BUILD_JOBS")
+                    .ok()
+                    .and_then(|v| parse_u32(&v))
+            })
             .unwrap_or(build_default)
             .max(1),
         None => build_default,
@@ -1138,7 +1215,8 @@ async fn process_hook(input: HookInput) -> HookOutput {
     }
 
     let command = &input.tool_input.command;
-    debug!("Processing command: {}", command);
+    // Mask sensitive data in debug logs (API keys, tokens, passwords)
+    debug!("Processing command: {}", mask_sensitive_command(command));
 
     // Classify the command using 5-tier system with LRU cache (bd-17cn)
     // Per AGENTS.md: non-compilation decisions must complete in <1ms, compilation in <5ms
@@ -1252,8 +1330,7 @@ async fn process_hook(input: HookInput) -> HookOutput {
         .ok()
         .flatten();
 
-        if let Some(timing_estimate) = timing_estimate
-        {
+        if let Some(timing_estimate) = timing_estimate {
             // Gate on min_local_time_ms: skip remote if build is too small
             if timing_estimate.predicted_local_ms < config.compilation.min_local_time_ms {
                 debug!(
@@ -2113,8 +2190,10 @@ async fn execute_remote_compilation(
     }
 
     // Step 2: Execute command remotely with streaming output
-    info!("Executing command remotely: {}", command);
-    reporter.verbose(&format!("[RCH] exec start: {}", command));
+    // Mask sensitive data (API keys, tokens, passwords) before logging
+    let masked_command = mask_sensitive_command(command);
+    info!("Executing command remotely: {}", masked_command);
+    reporter.verbose(&format!("[RCH] exec start: {}", masked_command));
 
     // Capture stderr for toolchain failure detection
     //
@@ -5452,7 +5531,12 @@ mod tests {
 
         // Create valid timing data
         let mut history = super::TimingHistory::default();
-        history.record("test-project", Some(CompilationKind::CargoBuild), 1000, false);
+        history.record(
+            "test-project",
+            Some(CompilationKind::CargoBuild),
+            1000,
+            false,
+        );
         let json = serde_json::to_string_pretty(&history).unwrap();
         std::fs::write(&history_path, json).unwrap();
 
@@ -5520,7 +5604,12 @@ mod tests {
         let save_path = temp_dir.path().join("saved_history.json");
 
         let mut history = super::TimingHistory::default();
-        history.record("saved-project", Some(CompilationKind::CargoTest), 2000, true);
+        history.record(
+            "saved-project",
+            Some(CompilationKind::CargoTest),
+            2000,
+            true,
+        );
 
         let path = save_path.clone();
         tokio::task::spawn_blocking(move || {
@@ -5554,7 +5643,10 @@ mod tests {
         )
         .await;
 
-        assert!(result.is_ok(), "spawn_blocking should complete within 5s timeout");
+        assert!(
+            result.is_ok(),
+            "spawn_blocking should complete within 5s timeout"
+        );
     }
 
     #[tokio::test]
@@ -5583,7 +5675,11 @@ mod tests {
         // All should complete without deadlock
         for handle in handles {
             let loaded = handle.await.unwrap();
-            assert!(loaded.get("concurrent", Some(CompilationKind::CargoBuild)).is_some());
+            assert!(
+                loaded
+                    .get("concurrent", Some(CompilationKind::CargoBuild))
+                    .is_some()
+            );
         }
     }
 
@@ -5597,7 +5693,12 @@ mod tests {
         for i in 0..5 {
             let path = temp_dir.path().join(format!("save_{}.json", i));
             let mut history = super::TimingHistory::default();
-            history.record(&format!("project-{}", i), Some(CompilationKind::CargoBuild), 100 * i as u64, false);
+            history.record(
+                &format!("project-{}", i),
+                Some(CompilationKind::CargoBuild),
+                100 * i as u64,
+                false,
+            );
 
             handles.push(tokio::task::spawn_blocking(move || {
                 let content = serde_json::to_string(&history).unwrap();
@@ -5622,10 +5723,24 @@ mod tests {
         // Create a reasonably sized history file
         let mut history = super::TimingHistory::default();
         for i in 0..10 {
-            history.record(&format!("project-{}", i), Some(CompilationKind::CargoBuild), 1000 + i * 100, false);
-            history.record(&format!("project-{}", i), Some(CompilationKind::CargoBuild), 800 + i * 50, true);
+            history.record(
+                &format!("project-{}", i),
+                Some(CompilationKind::CargoBuild),
+                1000 + i * 100,
+                false,
+            );
+            history.record(
+                &format!("project-{}", i),
+                Some(CompilationKind::CargoBuild),
+                800 + i * 50,
+                true,
+            );
         }
-        std::fs::write(&history_path, serde_json::to_string_pretty(&history).unwrap()).unwrap();
+        std::fs::write(
+            &history_path,
+            serde_json::to_string_pretty(&history).unwrap(),
+        )
+        .unwrap();
 
         // Measure load time
         let load_path = history_path.clone();

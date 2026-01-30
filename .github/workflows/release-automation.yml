@@ -4,7 +4,7 @@
 # Inspired by DCG-style release automation.
 #
 # This workflow:
-# - Triggers on pushes to master/main
+# - Triggers on pushes to main
 # - Reads the version from Cargo.toml
 # - Checks if a tag already exists for that version
 # - Creates a new annotated tag if needed
@@ -14,7 +14,7 @@ name: Release Automation
 
 on:
   push:
-    branches: [master, main]
+    branches: [main]
     paths:
       - 'Cargo.toml'
       - 'rch/Cargo.toml'

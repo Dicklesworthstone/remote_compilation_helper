@@ -15,7 +15,7 @@ mod rollback;
 use crate::commands::load_workers_from_config;
 use crate::ui::context::OutputContext;
 use crate::ui::theme::StatusIndicator;
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use rch_common::{ApiError, ApiResponse, ErrorCode};
 use std::path::PathBuf;
 

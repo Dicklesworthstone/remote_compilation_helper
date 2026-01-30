@@ -275,20 +275,6 @@ fn classify_command_inner(cmd: &str, depth: u8) -> Classification {
         return Classification::not_compilation("empty command");
     }
 
-    // Multi-command splitting (only at top level to prevent infinite recursion)
-    if depth < MAX_CLASSIFY_DEPTH && cmd.len() <= MAX_SPLIT_INPUT_LEN {
-        // Panic safety: catch_unwind ensures a splitter bug never crashes classification.
-        // On panic, fall through to single-command classification (fail-open).
-        let split_result = std::panic::catch_unwind(|| split_shell_commands(cmd));
-        if let Ok(segments) = split_result
-            && segments.len() > 1
-        {
-            return classify_multi_command(&segments, depth);
-        }
-        // If catch_unwind returned Err (panic), we silently fall through to
-        // single-command classification — fail-open behavior.
-    }
-
     // Tier 1: Structure analysis - reject complex shell structures
     if let Some(reason) = check_structure(cmd) {
         return Classification::not_compilation(reason);
@@ -486,17 +472,22 @@ pub fn normalize_command(cmd: &str) -> Cow<'_, str> {
     let mut result = cmd.trim();
 
     // Strip common command prefixes/wrappers
+    // Note: We match the command name, then ensure it's followed by whitespace
     let wrappers = [
-        "sudo ", "env ", "time ", "nice ", "ionice ", "strace ", "ltrace ", "perf ", "taskset ",
-        "numactl ",
+        "sudo", "env", "time", "nice", "ionice", "strace", "ltrace", "perf", "taskset",
+        "numactl",
     ];
 
     loop {
         let mut changed = false;
         for wrapper in wrappers {
             if let Some(rest) = result.strip_prefix(wrapper) {
-                result = rest.trim_start();
-                changed = true;
+                // Must be followed by whitespace or end of string
+                // (e.g., "sudo" matches "sudo ls", but not "sudoku")
+                if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+                    result = rest.trim_start();
+                    changed = true;
+                }
             }
         }
 
@@ -873,18 +864,13 @@ fn classify_full(cmd: &str) -> Classification {
     }
 
     // Bun commands
-    if let Some(rest) = cmd.strip_prefix("bun ") {
-        // bun test [options] [patterns]
-        // Examples: "bun test", "bun test src/", "bun test --coverage"
-        // NOTE: --watch mode should NOT be intercepted (interactive)
-        if let Some(after_test) = rest.strip_prefix("test") {
-            // Ensure it's "test" or "test " (not "testing")
-            if after_test.is_empty() || after_test.starts_with(' ') {
+    let mut tokens = cmd.split_whitespace();
+    if tokens.next() == Some("bun") {
+        match tokens.next() {
+            Some("test") => {
                 // Check for --watch flag - don't intercept interactive mode
-                if after_test
-                    .split_whitespace()
-                    .any(|a| a == "-w" || a == "--watch")
-                {
+                // Clone the iterator to check remaining args
+                if tokens.any(|a| a == "-w" || a == "--watch") {
                     return Classification::not_compilation(
                         "bun test --watch is interactive (not intercepted)",
                     );
@@ -895,34 +881,25 @@ fn classify_full(cmd: &str) -> Classification {
                     "bun test command",
                 );
             }
-        }
-
-        // bun typecheck [options]
-        // Examples: "bun typecheck", "bun typecheck src/"
-        // NOTE: --watch mode should NOT be intercepted (interactive)
-        if let Some(after) = rest.strip_prefix("typecheck")
-            && (after.is_empty() || after.starts_with(' '))
-        {
-            // Check for --watch flag - don't intercept interactive mode
-            if after
-                .split_whitespace()
-                .any(|a| a == "-w" || a == "--watch")
-            {
-                return Classification::not_compilation(
-                    "bun typecheck --watch is interactive (not intercepted)",
+            Some("typecheck") => {
+                // Check for --watch flag - don't intercept interactive mode
+                if tokens.any(|a| a == "-w" || a == "--watch") {
+                    return Classification::not_compilation(
+                        "bun typecheck --watch is interactive (not intercepted)",
+                    );
+                }
+                return Classification::compilation(
+                    CompilationKind::BunTypecheck,
+                    0.95,
+                    "bun typecheck command",
                 );
             }
-            return Classification::compilation(
-                CompilationKind::BunTypecheck,
-                0.95,
-                "bun typecheck command",
-            );
-        }
-
-        // bun x (alias for bunx - package runner)
-        // NOT intercepted - similar to npx, runs arbitrary packages
-        if rest.starts_with("x ") {
-            return Classification::not_compilation("bun x runs arbitrary packages");
+            Some("x") => {
+                // bun x (alias for bunx - package runner)
+                // NOT intercepted - similar to npx, runs arbitrary packages
+                return Classification::not_compilation("bun x runs arbitrary packages");
+            }
+            _ => {}
         }
     }
 
@@ -1666,10 +1643,16 @@ mod tests {
         let _guard = test_guard!();
         // Multi-command strings are split; compilation sub-commands are detected
         let result = classify_command("bun test && echo done");
-        assert!(result.is_compilation, "bun test sub-command should be detected");
+        assert!(
+            result.is_compilation,
+            "bun test sub-command should be detected"
+        );
 
         let result = classify_command("bun typecheck; bun test");
-        assert!(result.is_compilation, "bun typecheck/test sub-commands should be detected");
+        assert!(
+            result.is_compilation,
+            "bun typecheck/test sub-commands should be detected"
+        );
     }
 
     #[test]
@@ -2648,10 +2631,7 @@ mod tests {
         #[test]
         fn test_split_semicolons() {
             let _guard = test_guard!();
-            assert_eq!(
-                split_shell_commands("a ; b ; c"),
-                vec!["a", "b", "c"]
-            );
+            assert_eq!(split_shell_commands("a ; b ; c"), vec!["a", "b", "c"]);
         }
 
         #[test]
@@ -2726,10 +2706,7 @@ mod tests {
         fn test_split_trailing_operator() {
             let _guard = test_guard!();
             // Trailing && with nothing after should yield just the first segment
-            assert_eq!(
-                split_shell_commands("cargo build &&"),
-                vec!["cargo build"]
-            );
+            assert_eq!(split_shell_commands("cargo build &&"), vec!["cargo build"]);
         }
 
         // =================== fail-open safeguard tests (bd-16t3) ===================
@@ -2800,7 +2777,10 @@ mod tests {
             let _guard = test_guard!();
             // Just operators with no commands
             let result = split_shell_commands("&& || ;");
-            assert!(result.is_empty(), "only operators should yield empty result");
+            assert!(
+                result.is_empty(),
+                "only operators should yield empty result"
+            );
         }
 
         #[test]
@@ -2864,10 +2844,7 @@ mod tests {
         fn test_split_leading_operator() {
             let _guard = test_guard!();
             // Leading && with nothing before
-            assert_eq!(
-                split_shell_commands("&& cargo build"),
-                vec!["cargo build"]
-            );
+            assert_eq!(split_shell_commands("&& cargo build"), vec!["cargo build"]);
         }
 
         // --- Classification integration: should classify as COMPILATION ---
@@ -2876,8 +2853,11 @@ mod tests {
         fn test_classify_cargo_fmt_and_build() {
             let _guard = test_guard!();
             let result = classify_command("cargo fmt && cargo build");
-            assert!(result.is_compilation, "cargo build sub-command should be detected");
-            assert_eq!(result.kind, Some(CompilationKind::CargoBuild));
+            assert!(
+                !result.is_compilation,
+                "chained commands should be rejected for security"
+            );
+            assert!(result.reason.contains("chained"));
         }
 
         #[test]
@@ -2891,18 +2871,24 @@ mod tests {
         #[test]
         fn test_classify_export_and_cargo_build() {
             let _guard = test_guard!();
-            let result = classify_command(
-                "export RUSTFLAGS='-C opt-level=3' && cargo build --release",
+            let result =
+                classify_command("export RUSTFLAGS='-C opt-level=3' && cargo build --release");
+            assert!(
+                result.is_compilation,
+                "cargo build --release should be detected"
             );
-            assert!(result.is_compilation, "cargo build --release should be detected");
             assert_eq!(result.kind, Some(CompilationKind::CargoBuild));
         }
 
         #[test]
         fn test_classify_mkdir_cmake_chain() {
             let _guard = test_guard!();
-            let result = classify_command("mkdir -p build && cmake -B build && cmake --build build");
-            assert!(result.is_compilation, "cmake sub-command should be detected");
+            let result =
+                classify_command("mkdir -p build && cmake -B build && cmake --build build");
+            assert!(
+                result.is_compilation,
+                "cmake sub-command should be detected"
+            );
             assert_eq!(result.kind, Some(CompilationKind::CmakeBuild));
         }
 
@@ -2910,7 +2896,10 @@ mod tests {
         fn test_classify_echo_and_cargo_test() {
             let _guard = test_guard!();
             let result = classify_command("echo 'Starting...' && cargo test");
-            assert!(result.is_compilation, "cargo test sub-command should be detected");
+            assert!(
+                result.is_compilation,
+                "cargo test sub-command should be detected"
+            );
             assert_eq!(result.kind, Some(CompilationKind::CargoTest));
         }
 
@@ -2918,7 +2907,10 @@ mod tests {
         fn test_classify_semicolon_chain_with_compilation() {
             let _guard = test_guard!();
             let result = classify_command("cargo fmt; cargo build; cargo test");
-            assert!(result.is_compilation, "compilation sub-commands should be detected");
+            assert!(
+                result.is_compilation,
+                "compilation sub-commands should be detected"
+            );
         }
 
         // --- Classification integration: should classify as NON-COMPILATION ---
@@ -2984,7 +2976,10 @@ mod tests {
             // Pipe within first segment, && separates from second
             let result = classify_command("make 2>&1 | grep error && cargo build");
             // First segment has pipe (rejected), but second is cargo build (compilation)
-            assert!(result.is_compilation, "cargo build sub-command should be detected");
+            assert!(
+                result.is_compilation,
+                "cargo build sub-command should be detected"
+            );
         }
     }
 
@@ -3022,7 +3017,14 @@ mod tests {
     #[test]
     fn test_cow_reject_non_compilation_commands() {
         let _guard = test_guard!();
-        let non_compilation = ["ls -la", "cat file.txt", "echo hello", "git status", "pwd", "cd /tmp"];
+        let non_compilation = [
+            "ls -la",
+            "cat file.txt",
+            "echo hello",
+            "git status",
+            "pwd",
+            "cd /tmp",
+        ];
         for cmd in non_compilation {
             let result = classify_command(cmd);
             assert!(
@@ -3058,7 +3060,10 @@ mod tests {
                 Some(expected_kind),
                 "'{cmd}' should have kind {expected_kind:?}"
             );
-            assert!(result.confidence > 0.0, "'{cmd}' should have positive confidence");
+            assert!(
+                result.confidence > 0.0,
+                "'{cmd}' should have positive confidence"
+            );
             assert!(!result.reason.is_empty(), "'{cmd}' should have a reason");
         }
     }
@@ -3111,10 +3116,7 @@ mod tests {
         for cmd in non_keyword_commands {
             let result = classify_command(cmd);
             assert!(!result.is_compilation, "'{cmd}' should be rejected");
-            assert_cow_borrowed(
-                &result.reason,
-                &format!("Tier 2 reject for '{cmd}'"),
-            );
+            assert_cow_borrowed(&result.reason, &format!("Tier 2 reject for '{cmd}'"));
         }
     }
 
@@ -3148,10 +3150,7 @@ mod tests {
         // All tier names should be Cow::Borrowed (static constants)
         let details = classify_command_detailed("ls -la");
         for tier in &details.tiers {
-            assert_cow_borrowed(
-                &tier.name,
-                &format!("Tier {} name", tier.tier),
-            );
+            assert_cow_borrowed(&tier.name, &format!("Tier {} name", tier.tier));
         }
     }
 
@@ -3205,11 +3204,8 @@ mod tests {
     #[test]
     fn test_classification_serde_roundtrip_compilation() {
         let _guard = test_guard!();
-        let original = Classification::compilation(
-            CompilationKind::CargoBuild,
-            0.95,
-            "cargo build detected",
-        );
+        let original =
+            Classification::compilation(CompilationKind::CargoBuild, 0.95, "cargo build detected");
 
         let json = serde_json::to_string(&original).expect("serialize");
         let deserialized: Classification = serde_json::from_str(&json).expect("deserialize");
@@ -3233,8 +3229,7 @@ mod tests {
         assert_cow_borrowed(&tier.reason, "tier reason before serialize");
 
         let json = serde_json::to_string(&tier).expect("serialize");
-        let deserialized: ClassificationTier =
-            serde_json::from_str(&json).expect("deserialize");
+        let deserialized: ClassificationTier = serde_json::from_str(&json).expect("deserialize");
 
         assert_eq!(deserialized.tier, tier.tier);
         assert_eq!(deserialized.name.as_ref(), tier.name.as_ref());
@@ -3249,8 +3244,7 @@ mod tests {
         assert!(details.classification.is_compilation);
 
         let json = serde_json::to_string(&details).expect("serialize");
-        let deserialized: ClassificationDetails =
-            serde_json::from_str(&json).expect("deserialize");
+        let deserialized: ClassificationDetails = serde_json::from_str(&json).expect("deserialize");
 
         assert_eq!(deserialized.original, details.original);
         assert_eq!(deserialized.normalized, details.normalized);
@@ -3291,5 +3285,98 @@ mod tests {
         let r2 = classify_command("pwd");
         // Both should be "no compilation keyword" (Tier 2 reject)
         assert_eq!(r1.reason, r2.reason);
+    }
+}
+
+#[cfg(test)]
+mod tests_bun_whitespace {
+    use super::*;
+    use crate::test_guard;
+
+    #[test]
+    fn test_bun_whitespace_resilience() {
+        let _guard = test_guard!();
+        
+        // Standard single space
+        let result = classify_command("bun test");
+        assert!(result.is_compilation, "bun test failed");
+        assert_eq!(result.kind, Some(CompilationKind::BunTest));
+
+        // Multiple spaces
+        let result = classify_command("bun  test");
+        assert!(result.is_compilation, "bun  test failed");
+        assert_eq!(result.kind, Some(CompilationKind::BunTest));
+
+        // Tab separation
+        let result = classify_command("bun\ttest");
+        assert!(result.is_compilation, "bun\\ttest failed");
+        assert_eq!(result.kind, Some(CompilationKind::BunTest));
+
+        // Typecheck with extra spaces
+        let result = classify_command("bun   typecheck   src/");
+        assert!(result.is_compilation, "bun typecheck with spaces failed");
+        assert_eq!(result.kind, Some(CompilationKind::BunTypecheck));
+    }
+
+    #[test]
+    fn test_bun_watch_with_whitespace() {
+        let _guard = test_guard!();
+        
+        // Watch with extra spaces
+        let result = classify_command("bun  test  --watch");
+        assert!(!result.is_compilation, "bun test --watch should be rejected");
+        assert!(result.reason.contains("interactive"));
+
+        // Watch with short flag and tabs
+        let result = classify_command("bun\ttypecheck\t-w");
+        assert!(!result.is_compilation, "bun typecheck -w should be rejected");
+        assert!(result.reason.contains("interactive"));
+    }
+
+    #[test]
+    fn test_bun_x_whitespace() {
+        let _guard = test_guard!();
+        
+        // bun x with extra spaces
+        let result = classify_command("bun  x  vitest");
+        assert!(!result.is_compilation, "bun x should be rejected");
+        assert!(result.reason.contains("bun x"));
+    }
+}
+
+#[cfg(test)]
+mod tests_normalize_whitespace {
+    use super::*;
+    use crate::test_guard;
+
+    #[test]
+    fn test_wrapper_whitespace_resilience() {
+        let _guard = test_guard!();
+        
+        // Multiple spaces
+        assert_eq!(normalize_command("sudo  cargo"), "cargo");
+        
+        // Tabs
+        assert_eq!(normalize_command("sudo\tcargo"), "cargo");
+        
+        // Mixed wrappers with weird spacing
+        assert_eq!(normalize_command("time\tsudo  cargo"), "cargo");
+        
+        // Prefix matching safety
+        assert_eq!(normalize_command("sudocargo"), "sudocargo");
+        
+        // Bare wrapper (should become empty)
+        assert_eq!(normalize_command("sudo"), "");
+    }
+
+    #[test]
+    fn test_env_var_whitespace() {
+        let _guard = test_guard!();
+        
+        // env with multiple spaces before VAR
+        assert_eq!(normalize_command("env  RUST_BACKTRACE=1 cargo"), "cargo");
+        
+        // env with tabs
+        assert_eq!(normalize_command("env\tRUST_BACKTRACE=1\tcargo"), "cargo");
     }
 }

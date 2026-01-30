@@ -14,8 +14,8 @@
 //! their respective crates; this file covers the cross-cutting E2E scenarios.
 
 use rch_common::{
-    classify_command, classify_command_detailed, split_shell_commands, Classification,
-    CompilationKind, TierDecision,
+    Classification, CompilationKind, TierDecision, classify_command, classify_command_detailed,
+    split_shell_commands,
 };
 use std::borrow::Cow;
 use std::time::Instant;
@@ -345,13 +345,7 @@ fn test_ws4_multi_command_classification_correctness() {
 fn test_ws4_long_multi_command_chain() {
     // Stress test: long chain of commands
     let long_chain = (0..20)
-        .map(|i| {
-            if i == 10 {
-                "cargo build"
-            } else {
-                "echo step"
-            }
-        })
+        .map(|i| if i == 10 { "cargo build" } else { "echo step" })
         .collect::<Vec<_>>()
         .join(" && ");
 
@@ -466,8 +460,7 @@ fn test_classification_compilation_commands() {
         assert!(
             result.is_compilation,
             "'{}' should be classified as compilation, got reason={:?}",
-            cmd,
-            result.reason,
+            cmd, result.reason,
         );
         assert_eq!(
             result.kind,
@@ -516,9 +509,7 @@ fn test_classification_non_compilation_commands() {
         assert!(
             !result.is_compilation,
             "'{}' should NOT be classified as compilation (got kind={:?}, reason={:?})",
-            cmd,
-            result.kind,
-            result.reason,
+            cmd, result.kind, result.reason,
         );
     }
 }
@@ -605,7 +596,9 @@ fn test_audit_summary() {
     eprintln!("Section 2: WS2 zero-alloc — verified via test_ws2_* tests");
     eprintln!("Section 3: WS1 blocking I/O — verified via rch unit tests (spawn_blocking)");
     eprintln!("Section 4: WS4 multi-command — verified via test_ws4_* tests");
-    eprintln!("Section 5: WS3 atomics — verified via rchd unit tests (speed_score, latency, disabled_at)");
+    eprintln!(
+        "Section 5: WS3 atomics — verified via rchd unit tests (speed_score, latency, disabled_at)"
+    );
     eprintln!("Section 6: Fail-open — verified via test_failopen_* tests");
     eprintln!("Section 7: Classification correctness — verified via test_classification_* tests");
     eprintln!("Section 8: Serde roundtrip — verified via test_*_serde_* tests");

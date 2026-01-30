@@ -168,10 +168,10 @@ pub struct BenchmarkScheduler {
 
     /// Priority queue of pending benchmark requests.
     /// Ordered by priority (High > Normal > Low), then by requested_at.
-    pending_queue: Mutex<VecDeque<ScheduledBenchmarkRequest>>,
+    pending_queue: Arc<Mutex<VecDeque<ScheduledBenchmarkRequest>>>,
 
     /// Currently running benchmarks.
-    running: RwLock<HashMap<WorkerId, RunningBenchmark>>,
+    running: Arc<RwLock<HashMap<WorkerId, RunningBenchmark>>>,
 
     /// Channel receiver for manual triggers.
     trigger_rx: Mutex<mpsc::Receiver<BenchmarkTrigger>>,
@@ -186,7 +186,7 @@ pub struct BenchmarkScheduler {
     events: EventBus,
 
     /// Consecutive failure count per worker for alerting.
-    consecutive_failures: RwLock<HashMap<WorkerId, u32>>,
+    consecutive_failures: Arc<RwLock<HashMap<WorkerId, u32>>>,
 }
 
 /// Internal tracking of a running benchmark.
@@ -234,13 +234,13 @@ impl BenchmarkScheduler {
 
         let scheduler = Self {
             config,
-            pending_queue: Mutex::new(VecDeque::new()),
-            running: RwLock::new(HashMap::new()),
+            pending_queue: Arc::new(Mutex::new(VecDeque::new())),
+            running: Arc::new(RwLock::new(HashMap::new())),
             trigger_rx: Mutex::new(rx),
             pool,
             telemetry,
             events,
-            consecutive_failures: RwLock::new(HashMap::new()),
+            consecutive_failures: Arc::new(RwLock::new(HashMap::new())),
         };
 
         let handle = BenchmarkTriggerHandle { tx };
@@ -551,14 +551,21 @@ impl BenchmarkScheduler {
         );
 
         // Reserve a slot on the worker
-        if let Some(worker) = self.pool.get(&worker_id).await
-            && !worker.reserve_slots(1).await
-        {
+        let worker_opt = self.pool.get(&worker_id).await;
+        let Some(worker) = worker_opt else {
+            warn!(worker_id = %worker_id, "Worker not found for benchmark");
+            return;
+        };
+
+        if !worker.reserve_slots(1).await {
             warn!(worker_id = %worker_id, "Failed to reserve slot for benchmark");
             // Re-queue the request
             self.enqueue(request).await;
             return;
         }
+
+        // Get worker config for SSH connection
+        let worker_config = worker.config.read().await.clone();
 
         // Track as running
         let running = RunningBenchmark {
@@ -580,13 +587,119 @@ impl BenchmarkScheduler {
             }),
         );
 
-        // TODO: Spawn actual benchmark execution task
-        // For now, just mark as running - actual execution will be added
-        // when rch-benchmark remote execution is implemented
-        debug!(
-            worker_id = %worker_id,
-            "Benchmark execution placeholder - awaiting rch-benchmark integration"
-        );
+        // Spawn benchmark execution task
+        let pool = self.pool.clone();
+        let events = self.events.clone();
+        let timeout = self.config.benchmark_timeout;
+        let consecutive_failures = self.consecutive_failures.clone();
+        let running_map = self.running.clone();
+        let pending_queue = self.pending_queue.clone();
+        let alert_threshold = self.config.consecutive_failure_alert_threshold;
+
+        tokio::spawn(async move {
+            let start_time = std::time::Instant::now();
+            let result = execute_benchmark_on_worker(&worker_config, timeout).await;
+            let duration = start_time.elapsed();
+
+            match result {
+                Ok((score, _exec_duration)) => {
+                    info!(
+                        worker_id = %worker_id,
+                        request_id = %request_id,
+                        score = score,
+                        duration_ms = duration.as_millis(),
+                        "Benchmark completed successfully"
+                    );
+
+                    // Remove from running
+                    running_map.write().await.remove(&worker_id);
+
+                    // Release slot
+                    pool.release_slots(&worker_id, 1).await;
+
+                    // Reset consecutive failure counter on success
+                    consecutive_failures.write().await.remove(&worker_id);
+
+                    // Emit completed event
+                    events.emit(
+                        "benchmark:completed",
+                        &serde_json::json!({
+                            "request_id": request_id,
+                            "worker_id": worker_id.as_str(),
+                            "score": score,
+                            "duration_ms": duration.as_millis(),
+                        }),
+                    );
+                }
+                Err(e) => {
+                    let error_msg = e.to_string();
+                    let retryable = is_retryable_error(&error_msg);
+
+                    warn!(
+                        worker_id = %worker_id,
+                        request_id = %request_id,
+                        error = %error_msg,
+                        retryable = retryable,
+                        "Benchmark failed"
+                    );
+
+                    // Remove from running
+                    let running = running_map.write().await.remove(&worker_id);
+
+                    // Release slot
+                    pool.release_slots(&worker_id, 1).await;
+
+                    // Track consecutive failures
+                    let consecutive_count = {
+                        let mut failures = consecutive_failures.write().await;
+                        let count = failures.entry(worker_id.clone()).or_insert(0);
+                        *count += 1;
+                        *count
+                    };
+
+                    // Emit failed event
+                    events.emit(
+                        "benchmark:failed",
+                        &serde_json::json!({
+                            "request_id": request_id,
+                            "worker_id": worker_id.as_str(),
+                            "error": error_msg,
+                            "retryable": retryable,
+                            "consecutive_failures": consecutive_count,
+                        }),
+                    );
+
+                    // Emit alert if threshold exceeded
+                    if consecutive_count >= alert_threshold {
+                        warn!(
+                            worker_id = %worker_id,
+                            consecutive_failures = consecutive_count,
+                            threshold = alert_threshold,
+                            "Worker benchmark repeatedly failing - alerting"
+                        );
+                        events.emit(
+                            "benchmark:alert:repeated_failures",
+                            &serde_json::json!({
+                                "worker_id": worker_id.as_str(),
+                                "consecutive_failures": consecutive_count,
+                                "threshold": alert_threshold,
+                                "last_error": error_msg,
+                            }),
+                        );
+                    }
+
+                    // Re-queue if retryable
+                    if retryable && let Some(running) = running {
+                        let mut req = running.request;
+                        req.priority = BenchmarkPriority::Low;
+                        req.requested_at = Utc::now();
+
+                        let mut queue = pending_queue.lock().await;
+                        queue.push_back(req);
+                    }
+                }
+            }
+        });
     }
 
     /// Mark a benchmark as completed.
@@ -707,6 +820,147 @@ impl BenchmarkScheduler {
             }
         }
     }
+}
+
+/// Execute a benchmark on a remote worker via SSH.
+///
+/// Runs `~/.local/bin/rch-wkr benchmark` on the worker and parses the score.
+async fn execute_benchmark_on_worker(
+    worker: &rch_common::WorkerConfig,
+    timeout: Duration,
+) -> anyhow::Result<(f64, Duration)> {
+    use tokio::process::Command;
+
+    // Expand tilde in identity file path
+    let identity_file = if worker.identity_file.starts_with("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            format!("{}{}", home, &worker.identity_file[1..])
+        } else {
+            worker.identity_file.clone()
+        }
+    } else {
+        worker.identity_file.clone()
+    };
+
+    let start = std::time::Instant::now();
+
+    // Build SSH command to run benchmark on worker
+    let mut cmd = Command::new("ssh");
+    cmd.arg("-o").arg("BatchMode=yes");
+    cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
+    cmd.arg("-o")
+        .arg(format!("ConnectTimeout={}", timeout.as_secs().min(30)));
+    cmd.arg("-i").arg(&identity_file);
+    cmd.arg(format!("{}@{}", worker.user, worker.host));
+    cmd.arg("~/.local/bin/rch-wkr benchmark --json");
+
+    debug!(
+        worker_id = %worker.id,
+        host = %worker.host,
+        "Executing benchmark via SSH"
+    );
+
+    let output = tokio::time::timeout(timeout, cmd.output())
+        .await
+        .map_err(|_| anyhow::anyhow!("Benchmark timed out after {:?}", timeout))?
+        .map_err(|e| anyhow::anyhow!("Failed to execute SSH command: {}", e))?;
+
+    let exec_duration = start.elapsed();
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow::anyhow!(
+            "Benchmark command failed with status {}: {}",
+            output.status,
+            stderr.trim()
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Try to parse JSON output first
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&stdout)
+        && let Some(score) = json.get("score").and_then(|s| s.as_f64())
+    {
+        return Ok((score, exec_duration));
+    }
+
+    // Fall back to line-based parsing for non-JSON output
+    if let Some(score) = parse_benchmark_score(&stdout) {
+        return Ok((score, exec_duration));
+    }
+
+    Err(anyhow::anyhow!(
+        "Failed to parse benchmark score from output: {}",
+        stdout.chars().take(200).collect::<String>()
+    ))
+}
+
+/// Parse benchmark score from text output.
+///
+/// Looks for patterns like "Score: 123.45" or "score: 123.45".
+fn parse_benchmark_score(output: &str) -> Option<f64> {
+    for line in output.lines() {
+        // Try "Score: X" pattern (case insensitive)
+        let line_lower = line.to_lowercase();
+        if let Some(rest) = line_lower.strip_prefix("score:")
+            && let Ok(score) = rest.trim().parse::<f64>()
+        {
+            return Some(score);
+        }
+
+        // Try "score = X" pattern
+        if let Some(rest) = line_lower.strip_prefix("score =")
+            && let Ok(score) = rest.trim().parse::<f64>()
+        {
+            return Some(score);
+        }
+
+        // Try extracting from JSON-like "score": 123.45
+        if line.contains("\"score\"") {
+            // Simple extraction: find number after "score":
+            if let Some(idx) = line.find("\"score\"") {
+                // "score" is 7 chars, skip one more to get past any immediate colon
+                let skip_to = idx + 8;
+                if skip_to <= line.len() {
+                    let after_key = &line[skip_to..];
+                    let trimmed =
+                        after_key.trim_start_matches(|c: char| c == ':' || c.is_whitespace());
+                    // Extract the number portion
+                    let num_str: String = trimmed
+                        .chars()
+                        .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
+                        .collect();
+                    if let Ok(score) = num_str.parse::<f64>() {
+                        return Some(score);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Determine if a benchmark error is retryable.
+fn is_retryable_error(error: &str) -> bool {
+    let retryable_patterns = [
+        "timed out",
+        "timeout",
+        "connection refused",
+        "connection reset",
+        "no route to host",
+        "network unreachable",
+        "temporary failure",
+        "resource temporarily unavailable",
+        "broken pipe",
+        "ssh_exchange_identification",
+        "connection closed by remote host",
+    ];
+
+    let error_lower = error.to_lowercase();
+    retryable_patterns
+        .iter()
+        .any(|pattern| error_lower.contains(pattern))
 }
 
 #[cfg(test)]
@@ -1717,5 +1971,88 @@ mod tests {
         let cloned = running.clone();
         assert_eq!(cloned.request.worker_id, running.request.worker_id);
         assert_eq!(cloned.started_at, running.started_at);
+    }
+
+    // ==================== Tests for Helper Functions ====================
+
+    #[test]
+    fn test_parse_benchmark_score_colon_format() {
+        // "Score: 123.45" format
+        assert_eq!(super::parse_benchmark_score("Score: 123.45"), Some(123.45));
+        assert_eq!(super::parse_benchmark_score("score: 99.9"), Some(99.9));
+        assert_eq!(super::parse_benchmark_score("SCORE: 0.5"), Some(0.5));
+        assert_eq!(super::parse_benchmark_score("Score:   45.67"), Some(45.67));
+    }
+
+    #[test]
+    fn test_parse_benchmark_score_equals_format() {
+        // "score = 123.45" format
+        assert_eq!(super::parse_benchmark_score("score = 75.0"), Some(75.0));
+        assert_eq!(super::parse_benchmark_score("Score = 100"), Some(100.0));
+    }
+
+    #[test]
+    fn test_parse_benchmark_score_json_format() {
+        // JSON-like format
+        assert_eq!(
+            super::parse_benchmark_score(r#"{"score": 88.5}"#),
+            Some(88.5)
+        );
+        assert_eq!(
+            super::parse_benchmark_score(r#"  "score": 42.0,  "#),
+            Some(42.0)
+        );
+    }
+
+    #[test]
+    fn test_parse_benchmark_score_multiline() {
+        let output = r#"
+Benchmark started
+Running tests...
+Score: 87.3
+Benchmark complete
+"#;
+        assert_eq!(super::parse_benchmark_score(output), Some(87.3));
+    }
+
+    #[test]
+    fn test_parse_benchmark_score_no_match() {
+        assert_eq!(super::parse_benchmark_score("no score here"), None);
+        assert_eq!(super::parse_benchmark_score(""), None);
+        assert_eq!(super::parse_benchmark_score("points: 100"), None);
+    }
+
+    #[test]
+    fn test_is_retryable_error_timeouts() {
+        assert!(super::is_retryable_error("connection timed out"));
+        assert!(super::is_retryable_error("Timeout waiting for response"));
+        assert!(super::is_retryable_error("Operation timed out"));
+    }
+
+    #[test]
+    fn test_is_retryable_error_network() {
+        assert!(super::is_retryable_error("Connection refused by host"));
+        assert!(super::is_retryable_error("connection reset by peer"));
+        assert!(super::is_retryable_error("No route to host"));
+        assert!(super::is_retryable_error("Network unreachable"));
+        assert!(super::is_retryable_error("Broken pipe"));
+    }
+
+    #[test]
+    fn test_is_retryable_error_ssh() {
+        assert!(super::is_retryable_error(
+            "ssh_exchange_identification failed"
+        ));
+        assert!(super::is_retryable_error(
+            "Connection closed by remote host"
+        ));
+    }
+
+    #[test]
+    fn test_is_retryable_error_not_retryable() {
+        assert!(!super::is_retryable_error("Permission denied"));
+        assert!(!super::is_retryable_error("File not found"));
+        assert!(!super::is_retryable_error("Invalid command"));
+        assert!(!super::is_retryable_error("Authentication failed"));
     }
 }

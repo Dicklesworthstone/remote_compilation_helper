@@ -1436,31 +1436,81 @@ user = "test"
 
         // ConfigError codes (E001-E012)
         let config_errors: Vec<(&str, Box<dyn Diagnostic>)> = vec![
-            ("NotFound", Box::new(ConfigError::NotFound { path: PathBuf::from("x") })),
-            ("ReadFailed", Box::new(ConfigError::ReadFailed {
-                path: PathBuf::from("x"),
-                source: std::io::Error::other(""),
-            })),
-            ("ParseError", Box::new(ConfigError::ParseError {
-                src: NamedSource::new("x", String::new()),
-                span: (0, 0).into(),
-                message: String::new(),
-            })),
-            ("InvalidValue", Box::new(ConfigError::InvalidValue {
-                field: String::new(), reason: String::new(), suggestion: String::new(),
-            })),
-            ("WorkersNotFound", Box::new(ConfigError::WorkersNotFound { path: PathBuf::from("x") })),
-            ("WorkersParseError", Box::new(ConfigError::WorkersParseError {
-                path: PathBuf::from("x"), message: String::new(),
-            })),
+            (
+                "NotFound",
+                Box::new(ConfigError::NotFound {
+                    path: PathBuf::from("x"),
+                }),
+            ),
+            (
+                "ReadFailed",
+                Box::new(ConfigError::ReadFailed {
+                    path: PathBuf::from("x"),
+                    source: std::io::Error::other(""),
+                }),
+            ),
+            (
+                "ParseError",
+                Box::new(ConfigError::ParseError {
+                    src: NamedSource::new("x", String::new()),
+                    span: (0, 0).into(),
+                    message: String::new(),
+                }),
+            ),
+            (
+                "InvalidValue",
+                Box::new(ConfigError::InvalidValue {
+                    field: String::new(),
+                    reason: String::new(),
+                    suggestion: String::new(),
+                }),
+            ),
+            (
+                "WorkersNotFound",
+                Box::new(ConfigError::WorkersNotFound {
+                    path: PathBuf::from("x"),
+                }),
+            ),
+            (
+                "WorkersParseError",
+                Box::new(ConfigError::WorkersParseError {
+                    path: PathBuf::from("x"),
+                    message: String::new(),
+                }),
+            ),
             ("NoWorkers", Box::new(ConfigError::NoWorkers)),
-            ("WorkerNotFound", Box::new(ConfigError::WorkerNotFound { worker_id: String::new() })),
-            ("DuplicateWorkerId", Box::new(ConfigError::DuplicateWorkerId { worker_id: String::new() })),
-            ("InvalidWorker", Box::new(ConfigError::InvalidWorker {
-                worker_id: String::new(), reason: String::new(), suggestion: String::new(),
-            })),
-            ("MissingField", Box::new(ConfigError::MissingField { field: String::new() })),
-            ("MigrationRequired", Box::new(ConfigError::MigrationRequired { reason: String::new() })),
+            (
+                "WorkerNotFound",
+                Box::new(ConfigError::WorkerNotFound {
+                    worker_id: String::new(),
+                }),
+            ),
+            (
+                "DuplicateWorkerId",
+                Box::new(ConfigError::DuplicateWorkerId {
+                    worker_id: String::new(),
+                }),
+            ),
+            (
+                "InvalidWorker",
+                Box::new(ConfigError::InvalidWorker {
+                    worker_id: String::new(),
+                    reason: String::new(),
+                    suggestion: String::new(),
+                }),
+            ),
+            (
+                "MissingField",
+                Box::new(ConfigError::MissingField {
+                    field: String::new(),
+                }),
+            ),
+            (
+                "MigrationRequired",
+                Box::new(ConfigError::MigrationRequired {
+                    reason: String::new(),
+                }),
+            ),
         ];
         for (name, err) in &config_errors {
             if let Some(code) = extract_code(err.as_ref()) {
@@ -1471,21 +1521,52 @@ user = "test"
         // DaemonError codes (E300-E308)
         let daemon_errors: Vec<(&str, Box<dyn Diagnostic>)> = vec![
             ("NotRunning", Box::new(DaemonError::NotRunning)),
-            ("SocketNotFound", Box::new(DaemonError::SocketNotFound { socket_path: String::new() })),
-            ("ConnectionFailed", Box::new(DaemonError::ConnectionFailed {
-                socket_path: String::new(),
-                source: std::io::Error::other(""),
-            })),
-            ("SocketPermissionDenied", Box::new(DaemonError::SocketPermissionDenied { socket_path: String::new() })),
-            ("StartupFailed", Box::new(DaemonError::StartupFailed {
-                source: std::io::Error::other(""),
-            })),
-            ("AlreadyRunning", Box::new(DaemonError::AlreadyRunning { pid: 0 })),
-            ("CommunicationTimeout", Box::new(DaemonError::CommunicationTimeout { timeout_secs: 0 })),
-            ("ProtocolError", Box::new(DaemonError::ProtocolError { message: String::new() })),
-            ("VersionMismatch", Box::new(DaemonError::VersionMismatch {
-                expected: String::new(), actual: String::new(),
-            })),
+            (
+                "SocketNotFound",
+                Box::new(DaemonError::SocketNotFound {
+                    socket_path: String::new(),
+                }),
+            ),
+            (
+                "ConnectionFailed",
+                Box::new(DaemonError::ConnectionFailed {
+                    socket_path: String::new(),
+                    source: std::io::Error::other(""),
+                }),
+            ),
+            (
+                "SocketPermissionDenied",
+                Box::new(DaemonError::SocketPermissionDenied {
+                    socket_path: String::new(),
+                }),
+            ),
+            (
+                "StartupFailed",
+                Box::new(DaemonError::StartupFailed {
+                    source: std::io::Error::other(""),
+                }),
+            ),
+            (
+                "AlreadyRunning",
+                Box::new(DaemonError::AlreadyRunning { pid: 0 }),
+            ),
+            (
+                "CommunicationTimeout",
+                Box::new(DaemonError::CommunicationTimeout { timeout_secs: 0 }),
+            ),
+            (
+                "ProtocolError",
+                Box::new(DaemonError::ProtocolError {
+                    message: String::new(),
+                }),
+            ),
+            (
+                "VersionMismatch",
+                Box::new(DaemonError::VersionMismatch {
+                    expected: String::new(),
+                    actual: String::new(),
+                }),
+            ),
         ];
         for (name, err) in &daemon_errors {
             if let Some(code) = extract_code(err.as_ref()) {

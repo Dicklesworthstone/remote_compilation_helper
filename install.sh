@@ -933,40 +933,57 @@ verify_sigstore_bundle() {
 # ============================================================================
 
 install_skill() {
-    local skill_dest="$HOME/.claude/skills/rch"
+    local claude_dest="$HOME/.claude/skills/rch"
+    local codex_dest="$HOME/.codex/skills/rch"
+    local installed_claude=false
+    local installed_codex=false
 
-    info "Installing RCH skill for Claude Code..."
+    info "Installing RCH skill for AI coding agents..."
 
-    mkdir -p "$skill_dest"
-    mkdir -p "$skill_dest/references"
+    # Create both skill directories
+    mkdir -p "$claude_dest/references"
+    mkdir -p "$codex_dest/references"
 
     # Try to download skill from release assets
     local skill_url="https://github.com/${GITHUB_REPO}/releases/latest/download/skill.tar.gz"
     local skill_temp="${TEMP_DIR:-/tmp}/skill.tar.gz"
 
     if curl -fsSL $PROXY_ARGS "$skill_url" -o "$skill_temp" 2>/dev/null; then
+        # Install to Claude skills folder
         if tar -xzf "$skill_temp" -C "$HOME/.claude/skills" 2>/dev/null; then
-            success "Installed RCH skill to $skill_dest"
-            rm -f "$skill_temp"
-            show_skill_info
-            return 0
+            installed_claude=true
+        fi
+        # Install to Codex skills folder
+        if tar -xzf "$skill_temp" -C "$HOME/.codex/skills" 2>/dev/null; then
+            installed_codex=true
         fi
         rm -f "$skill_temp"
+
+        if $installed_claude || $installed_codex; then
+            [[ $installed_claude == true ]] && success "Installed RCH skill to $claude_dest"
+            [[ $installed_codex == true ]] && success "Installed RCH skill to $codex_dest"
+            show_skill_info "$installed_claude" "$installed_codex"
+            return 0
+        fi
     fi
 
     # Fallback: create minimal skill inline
     info "Creating minimal skill (download failed)..."
-    cat > "$skill_dest/SKILL.md" << 'SKILL_EOF'
+
+    local skill_content
+    skill_content=$(cat << 'SKILL_EOF'
 ---
 name: rch
 description: >-
-  Remote compilation helper (rch). Use when: rch doctor, rch setup, configuring
-  workers.toml, "no workers available", "compilation slow", offload cargo/gcc/bun.
+  Remote compilation helper. Use when: rch doctor, workers.toml, "no workers",
+  "compilation slow", fleet deploy, self-test, or offload cargo/gcc/bun.
 ---
 
 # RCH — Remote Compilation Helper
 
 Transparently offloads `cargo build`, `bun test`, `gcc` to remote workers. Same commands, faster builds.
+
+<!-- TOC: Diagnosis | Quick Fixes | Worker Config | Install | Commands | Debug | References -->
 
 ## Diagnosis Loop
 
@@ -976,6 +993,10 @@ rch doctor --fix        # Auto-fix common issues
 rch doctor --verbose    # All checks passed? Ready to use
 ```
 
+**If `--fix` can't solve it → see Quick Fixes or references.**
+
+---
+
 ## Quick Fixes (Copy-Paste)
 
 | Symptom | Command |
@@ -984,18 +1005,40 @@ rch doctor --verbose    # All checks passed? Ready to use
 | Daemon not running | `rm -f /tmp/rch.sock && rchd &` |
 | Hook not installed | `rch hook install --force` |
 | No workers available | `vim ~/.config/rch/workers.toml` (add workers) |
+| Socket permission | `rm /tmp/rch.sock && rchd` |
+| Stale socket | `lsof /tmp/rch.sock` → kill stale process |
+
+---
 
 ## Worker Config (`~/.config/rch/workers.toml`)
 
 ```toml
 [[workers]]
 id = "builder"
-host = "192.168.1.100"
+host = "192.168.1.100"        # IP or hostname
 user = "ubuntu"
 identity_file = "~/.ssh/id_ed25519"
-total_slots = 8
-priority = 100
+total_slots = 8               # ≈ CPU cores - 2
+priority = 100                # Higher = preferred
+tags = ["rust", "bun"]        # Optional capabilities
 ```
+
+### Auto-Discover from SSH Config
+
+```bash
+rch workers discover --from-ssh-config --dry-run  # Preview
+rch workers discover --from-ssh-config            # Add to config
+```
+
+### Verify Workers
+
+```bash
+rch workers probe --all         # Test all workers
+rch workers probe worker1 -v    # Test single, verbose
+rch workers list                # Show status
+```
+
+---
 
 ## Commands
 
@@ -1003,45 +1046,145 @@ priority = 100
 - `rch status` - Show daemon status
 - `rch workers probe --all` - Test all workers
 - `rch workers discover --from-ssh-config` - Auto-discover workers
+- `rch fleet status` - Show all workers
+- `rch self-test` - Full end-to-end verification
+
+---
+
+## Fleet Operations
+
+```bash
+rch fleet status             # Show all workers
+rch fleet preflight --all    # Verify workers ready
+rch fleet deploy --all       # Deploy rch-wkr to workers
+rch self-test                # Full end-to-end verification
+```
+
+---
+
+## Anti-Patterns
+
+| Don't | Why | Do Instead |
+|-------|-----|------------|
+| Run daemon as root | Security risk | `systemctl --user start rchd` |
+| Skip `rch doctor` | Miss config issues | Always verify first |
+| Use `--force` blindly | May break hook | Check `rch hook status` first |
+| Ignore transfer errors | Indicates network/disk issues | Check worker disk space, network |
+
+---
+
+## Debug
+
+```bash
+RCH_LOG=debug cargo build    # Show hook decisions
+RCH_DRY_RUN=1 cargo check    # Test without remote execution
+rch doctor --json > diag.json  # Export diagnostics
+```
+
+---
 
 ## Docs
 
 Full documentation: https://github.com/Dicklesworthstone/remote_compilation_helper
 SKILL_EOF
+)
 
-    success "Created minimal RCH skill at $skill_dest"
-    show_skill_info
+    # Write to both destinations
+    echo "$skill_content" > "$claude_dest/SKILL.md"
+    installed_claude=true
+    echo "$skill_content" > "$codex_dest/SKILL.md"
+    installed_codex=true
+
+    success "Created RCH skill at $claude_dest"
+    success "Created RCH skill at $codex_dest"
+    show_skill_info "$installed_claude" "$installed_codex"
 }
 
 # Show info about the installed skill
 show_skill_info() {
+    local installed_claude="${1:-true}"
+    local installed_codex="${2:-false}"
+
     echo ""
+
+    # Build location lines based on what was installed
+    local loc_lines=()
+    [[ "$installed_claude" == "true" ]] && loc_lines+=("  📂 Claude Code:  ~/.claude/skills/rch/")
+    [[ "$installed_codex" == "true" ]] && loc_lines+=("  📂 Codex CLI:    ~/.codex/skills/rch/")
+
     if $USE_GUM; then
         gum style \
             --border rounded \
             --border-foreground 141 \
-            --padding "0 2" \
+            --padding "1 2" \
             --align left \
-            "🤖 Claude Code Skill Installed" \
+            "🤖 AI Agent Skills Installed" \
             "" \
-            "The /rch skill is now available in Claude Code." \
-            "It provides troubleshooting guidance and quick fixes." \
+            "The RCH skill is now available to AI coding agents." \
+            "It provides setup guidance, troubleshooting, and quick fixes." \
             "" \
-            "How to use:" \
-            "  • Ask Claude about RCH issues" \
-            "  • Say 'rch doctor failing' or 'no workers'" \
-            "  • The skill auto-activates on RCH topics"
+            "Installed to:" \
+            "${loc_lines[@]}" \
+            "" \
+            "How Skills Work:" \
+            "  When you describe an RCH problem to your AI agent," \
+            "  the skill activates automatically. No slash commands" \
+            "  needed—just describe the issue naturally:" \
+            "" \
+            "    \"rch doctor is showing errors\"" \
+            "    \"no workers available\"" \
+            "    \"how do I add a new worker?\"" \
+            "" \
+            "Trigger phrases: rch doctor, workers.toml, fleet deploy," \
+            "                 no workers, compilation slow, self-test"
     else
-        draw_box "1;36" \
-            "Claude Code Skill Installed" \
-            "" \
-            "The /rch skill is now available in Claude Code." \
-            "It provides troubleshooting guidance and quick fixes." \
-            "" \
-            "How to use:" \
-            "  - Ask Claude about RCH issues" \
-            "  - Say 'rch doctor failing' or 'no workers'" \
-            "  - The skill auto-activates on RCH topics"
+        echo ""
+        if $USE_COLOR; then
+            echo -e "${BOLD}${CYAN}╭───────────────────────────────────────────────────────────╮${NC}"
+            echo -e "${BOLD}${CYAN}│${NC}  ${BOLD}🤖 AI Agent Skills Installed${NC}                             ${BOLD}${CYAN}│${NC}"
+            echo -e "${BOLD}${CYAN}╰───────────────────────────────────────────────────────────╯${NC}"
+        else
+            echo "╭───────────────────────────────────────────────────────────╮"
+            echo "│  AI Agent Skills Installed                                │"
+            echo "╰───────────────────────────────────────────────────────────╯"
+        fi
+        echo ""
+        echo "  The RCH skill is now available to AI coding agents."
+        echo "  It provides setup guidance, troubleshooting, and quick fixes."
+        echo ""
+        echo "  Installed to:"
+        for line in "${loc_lines[@]}"; do
+            echo "$line"
+        done
+        echo ""
+        if $USE_COLOR; then
+            echo -e "  ${BOLD}How Skills Work:${NC}"
+        else
+            echo "  How Skills Work:"
+        fi
+        echo "  ─────────────────"
+        echo "  When you describe an RCH problem to your AI agent,"
+        echo "  the skill activates automatically. No slash commands"
+        echo "  needed—just describe the issue naturally:"
+        echo ""
+        if $USE_COLOR; then
+            echo -e "    ${DIM}\"rch doctor is showing errors\"${NC}"
+            echo -e "    ${DIM}\"no workers available\"${NC}"
+            echo -e "    ${DIM}\"how do I add a new worker?\"${NC}"
+        else
+            echo "    \"rch doctor is showing errors\""
+            echo "    \"no workers available\""
+            echo "    \"how do I add a new worker?\""
+        fi
+        echo ""
+        echo "  The agent will use the skill's knowledge to help."
+        echo ""
+        if $USE_COLOR; then
+            echo -e "  ${BOLD}Trigger phrases:${NC} rch doctor, workers.toml, fleet deploy,"
+        else
+            echo "  Trigger phrases: rch doctor, workers.toml, fleet deploy,"
+        fi
+        echo "                   no workers, compilation slow, self-test"
     fi
 }
 
@@ -1910,31 +2053,52 @@ print_summary() {
         fi
         echo ""
 
-        # Claude Code skill info
-        if [[ -f "$HOME/.claude/skills/rch/SKILL.md" ]]; then
+        # AI Agent skill info
+        local has_claude_skill=false
+        local has_codex_skill=false
+        [[ -f "$HOME/.claude/skills/rch/SKILL.md" ]] && has_claude_skill=true
+        [[ -f "$HOME/.codex/skills/rch/SKILL.md" ]] && has_codex_skill=true
+
+        if $has_claude_skill || $has_codex_skill; then
+            local skill_locations=""
+            $has_claude_skill && skill_locations+="Claude Code (~/.claude/skills/rch/)"
+            if $has_codex_skill; then
+                [[ -n "$skill_locations" ]] && skill_locations+=", "
+                skill_locations+="Codex CLI (~/.codex/skills/rch/)"
+            fi
+
             if $USE_GUM; then
                 gum style \
                     --border rounded \
                     --border-foreground 141 \
                     --padding "0 2" \
-                    "🤖 Claude Code Integration" \
+                    "🤖 AI Agent Integration" \
                     "" \
-                    "Skill installed: ~/.claude/skills/rch/" \
+                    "Skills installed for: $skill_locations" \
                     "" \
-                    "When you ask Claude about RCH issues, it will" \
-                    "automatically use the skill for troubleshooting." \
+                    "Your AI coding agents now have RCH expertise built-in." \
+                    "Just describe your issue naturally—no commands needed:" \
                     "" \
-                    "Try: 'rch doctor is failing' or 'no workers available'"
+                    "  \"rch doctor is failing\"" \
+                    "  \"no workers available\"" \
+                    "  \"how do I configure a new worker?\"" \
+                    "" \
+                    "The agent's skill auto-activates on RCH topics."
             else
                 draw_box "1;36" \
-                    "Claude Code Integration" \
+                    "AI Agent Integration" \
                     "" \
-                    "Skill installed: ~/.claude/skills/rch/" \
+                    "Skills installed for:" \
+                    "  $skill_locations" \
                     "" \
-                    "When you ask Claude about RCH issues, it will" \
-                    "automatically use the skill for troubleshooting." \
+                    "Your AI coding agents now have RCH expertise built-in." \
+                    "Just describe your issue naturally—no commands needed:" \
                     "" \
-                    "Try: 'rch doctor is failing' or 'no workers available'"
+                    "  \"rch doctor is failing\"" \
+                    "  \"no workers available\"" \
+                    "  \"how do I configure a new worker?\"" \
+                    "" \
+                    "The agent's skill auto-activates on RCH topics."
             fi
             echo ""
         fi

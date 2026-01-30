@@ -167,7 +167,11 @@ fn is_valid_env_key(key: &str) -> bool {
     chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
 }
 
-fn shell_escape_value(value: &str) -> Option<String> {
+/// Escape a string for use in a shell command.
+///
+/// Wraps the string in single quotes and escapes internal single quotes.
+/// Returns None if the string contains unsafe control characters (newline, carriage return, NUL).
+pub fn shell_escape_value(value: &str) -> Option<String> {
     // Reject values with control characters that could break shell parsing
     // Note: These are logged at the call site with the variable name for debugging
     if value.contains('\n') || value.contains('\r') || value.contains('\0') {

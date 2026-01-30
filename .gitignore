@@ -23,6 +23,7 @@ test_screenshot.png
 perf.data
 perf.data.old
 *.profraw
+bun_space_test.rs
 
 # macOS resource fork files
 ._*

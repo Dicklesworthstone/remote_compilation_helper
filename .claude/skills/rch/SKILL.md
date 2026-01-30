@@ -1,13 +1,15 @@
 ---
 name: rch
 description: >-
-  Remote compilation helper (rch). Use when: rch doctor, rch setup, configuring
-  workers.toml, "no workers available", "compilation slow", offload cargo/gcc/bun.
+  Remote compilation helper. Use when: rch doctor, workers.toml, "no workers",
+  "compilation slow", fleet deploy, self-test, or offload cargo/gcc/bun.
 ---
 
 # RCH — Remote Compilation Helper
 
 Transparently offloads `cargo build`, `bun test`, `gcc` to remote workers. Same commands, faster builds.
+
+<!-- TOC: Diagnosis | Quick Fixes | Worker Config | Install | Commands | Debug | References -->
 
 ## Diagnosis Loop
 
@@ -93,6 +95,28 @@ RCH_LOG=debug cargo build    # Show hook decisions
 RCH_DRY_RUN=1 cargo check    # Test without remote execution
 rch doctor --json > diag.json  # Export diagnostics
 ```
+
+---
+
+## Fleet Operations
+
+```bash
+rch fleet status             # Show all workers
+rch fleet preflight --all    # Verify workers ready
+rch fleet deploy --all       # Deploy rch-wkr to workers
+rch self-test                # Full end-to-end verification
+```
+
+---
+
+## Anti-Patterns
+
+| Don't | Why | Do Instead |
+|-------|-----|------------|
+| Run daemon as root | Security risk | `systemctl --user start rchd` |
+| Skip `rch doctor` | Miss config issues | Always verify first |
+| Use `--force` blindly | May break hook | Check `rch hook status` first |
+| Ignore transfer errors | Indicates network/disk issues | Check worker disk space, network |
 
 ---
 

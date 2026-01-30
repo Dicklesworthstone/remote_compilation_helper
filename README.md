@@ -8,7 +8,7 @@
 <h3>Quick Install</h3>
 
 ```bash
-curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/remote_compilation_helper/master/install.sh?$(date +%s)" | bash -s -- --easy-mode
+curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/remote_compilation_helper/main/install.sh?$(date +%s)" | bash -s -- --easy-mode
 ```
 
 <p><em>Installs rch + rchd, configures the hook, and can optionally enable the background daemon. If rchd or workers are unavailable, RCH fails open to local builds.</em></p>

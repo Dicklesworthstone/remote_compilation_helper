@@ -1770,7 +1770,15 @@ pub async fn select_worker_with_config(
     // Select worker with highest score
     scored.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(Ordering::Equal));
 
-    let (selected_worker, circuit_state, score) = scored.into_iter().next().unwrap();
+    // Defensive check: scored should never be empty since candidates was non-empty
+    // and every candidate was pushed to scored. But handle gracefully just in case.
+    let Some((selected_worker, circuit_state, score)) = scored.into_iter().next() else {
+        warn!("Bug: scored list empty despite non-empty candidates - this should not happen");
+        return SelectionResult {
+            worker: None,
+            reason: SelectionReason::AllWorkersBusy,
+        };
+    };
 
     // If selecting a half-open worker, start the probe
     if circuit_state == CircuitState::HalfOpen {

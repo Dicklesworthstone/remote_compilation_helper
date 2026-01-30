@@ -3,7 +3,7 @@
 use anyhow::Result;
 use std::process::Stdio;
 use thiserror::Error;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tracing::{debug, error, info};
 
@@ -36,22 +36,54 @@ pub async fn execute(workdir: &str, command: &str) -> Result<()> {
         .spawn()?;
 
     // Stream stdout
-    let stdout = child.stdout.take().expect("Failed to capture stdout");
-    let stderr = child.stderr.take().expect("Failed to capture stderr");
+    let mut stdout = child.stdout.take().expect("Failed to capture stdout");
+    let mut stderr = child.stderr.take().expect("Failed to capture stderr");
 
     let stdout_task = tokio::spawn(async move {
-        let reader = BufReader::new(stdout);
-        let mut lines = reader.lines();
-        while let Some(line) = lines.next_line().await.ok().flatten() {
-            println!("{}", line);
+        let mut buffer = [0u8; 4096];
+        let mut out = tokio::io::stdout();
+        loop {
+            match stdout.read(&mut buffer).await {
+                Ok(0) => break, // EOF
+                Ok(n) => {
+                    if let Err(e) = out.write_all(&buffer[..n]).await {
+                        error!("Failed to write to stdout: {}", e);
+                        break;
+                    }
+                    if let Err(e) = out.flush().await {
+                        error!("Failed to flush stdout: {}", e);
+                        break;
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to read from command stdout: {}", e);
+                    break;
+                }
+            }
         }
     });
 
     let stderr_task = tokio::spawn(async move {
-        let reader = BufReader::new(stderr);
-        let mut lines = reader.lines();
-        while let Some(line) = lines.next_line().await.ok().flatten() {
-            eprintln!("{}", line);
+        let mut buffer = [0u8; 4096];
+        let mut err = tokio::io::stderr();
+        loop {
+            match stderr.read(&mut buffer).await {
+                Ok(0) => break, // EOF
+                Ok(n) => {
+                    if let Err(e) = err.write_all(&buffer[..n]).await {
+                        error!("Failed to write to stderr: {}", e);
+                        break;
+                    }
+                    if let Err(e) = err.flush().await {
+                        error!("Failed to flush stderr: {}", e);
+                        break;
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to read from command stderr: {}", e);
+                    break;
+                }
+            }
         }
     });
 
@@ -66,7 +98,18 @@ pub async fn execute(workdir: &str, command: &str) -> Result<()> {
         debug!("Command completed successfully");
         Ok(())
     } else {
+        #[cfg(unix)]
+        let code = {
+            use std::os::unix::process::ExitStatusExt;
+            status
+                .code()
+                .or_else(|| status.signal().map(|s| 128 + s))
+                .unwrap_or(-1)
+        };
+
+        #[cfg(not(unix))]
         let code = status.code().unwrap_or(-1);
+
         error!("Command failed with exit code: {}", code);
         Err(CommandFailed { exit_code: code }.into())
     }

@@ -174,7 +174,6 @@ impl ClassificationCache {
 
         CacheStats { hits, misses, len }
     }
-
 }
 
 impl Default for ClassificationCache {
