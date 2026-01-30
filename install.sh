@@ -577,8 +577,9 @@ build_from_source() {
 }
 
 download_binaries() {
-    # For future: download pre-built binaries with checksum verification
-    die "Binary downloads not yet available. Use --from-source to build from source."
+    # Return 1 to signal failure - caller handles fallback to source build
+    warn "Binary downloads not yet available."
+    return 1
 }
 
 # ============================================================================
