@@ -665,22 +665,30 @@ pub async fn history(ctx: &OutputContext, limit: usize, worker: Option<String>) 
 
 /// Find a local binary in common locations.
 fn find_local_binary(name: &str) -> Result<PathBuf> {
-    let locations = [
-        // Target directory (development)
-        std::env::current_dir()
-            .ok()
-            .map(|p| p.join("target/release").join(name)),
-        std::env::current_dir()
-            .ok()
-            .map(|p| p.join("target/debug").join(name)),
-        // Cargo install location
-        dirs::home_dir().map(|h| h.join(".cargo/bin").join(name)),
-        // User local bin
-        dirs::home_dir().map(|h| h.join(".local/bin").join(name)),
-        // System paths
-        Some(PathBuf::from("/usr/local/bin").join(name)),
-        Some(PathBuf::from("/usr/bin").join(name)),
-    ];
+    let mut locations: Vec<Option<PathBuf>> = Vec::new();
+
+    // Check CARGO_TARGET_DIR first if set (development with custom target dir)
+    if let Ok(target_dir) = std::env::var("CARGO_TARGET_DIR") {
+        let target_path = PathBuf::from(target_dir);
+        locations.push(Some(target_path.join("release").join(name)));
+        locations.push(Some(target_path.join("debug").join(name)));
+    }
+
+    // Target directory (development)
+    if let Ok(cwd) = std::env::current_dir() {
+        locations.push(Some(cwd.join("target/release").join(name)));
+        locations.push(Some(cwd.join("target/debug").join(name)));
+    }
+
+    // Cargo install location
+    locations.push(dirs::home_dir().map(|h| h.join(".cargo/bin").join(name)));
+
+    // User local bin
+    locations.push(dirs::home_dir().map(|h| h.join(".local/bin").join(name)));
+
+    // System paths
+    locations.push(Some(PathBuf::from("/usr/local/bin").join(name)));
+    locations.push(Some(PathBuf::from("/usr/bin").join(name)));
 
     for loc in locations.into_iter().flatten() {
         if loc.exists() && loc.is_file() {

@@ -8574,9 +8574,153 @@ fn format_build_duration(secs: u64) -> String {
     }
 }
 
-// Stub for hook_test
-pub async fn hook_test(_ctx: &OutputContext) -> Result<()> {
-    // Implementation placeholder
+/// Test the hook with a sample 'cargo build' command.
+///
+/// This spawns `rch` in hook mode (no arguments) and passes a sample
+/// PreToolUse hook input, showing what the hook would do in response.
+pub async fn hook_test(ctx: &OutputContext) -> Result<()> {
+    use rch_common::{HookInput, ToolInput, HookOutput};
+    use std::process::Stdio;
+    use tokio::io::AsyncWriteExt;
+    use tokio::process::Command;
+
+    let style = ctx.theme();
+
+    if !ctx.is_json() {
+        println!("Testing RCH hook with sample 'cargo build' command...\n");
+    }
+
+    // Create a sample hook input
+    let sample_input = HookInput {
+        tool_name: "Bash".to_string(),
+        tool_input: ToolInput {
+            command: "cargo build".to_string(),
+            description: Some("Build the Rust project".to_string()),
+        },
+        session_id: Some("hook-test-session".to_string()),
+    };
+
+    let input_json = serde_json::to_string_pretty(&sample_input)?;
+
+    if !ctx.is_json() {
+        println!("Input (sent to hook):");
+        println!("{}\n", input_json);
+    }
+
+    // Find the rch binary
+    let rch_path = std::env::current_exe()?;
+
+    // Spawn rch in hook mode (no arguments = hook mode)
+    let mut child = Command::new(&rch_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("Failed to spawn rch in hook mode")?;
+
+    // Write input to stdin
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(input_json.as_bytes()).await?;
+        stdin.shutdown().await?;
+    }
+
+    // Wait for completion with timeout
+    let timeout = tokio::time::Duration::from_secs(30);
+    let output = tokio::time::timeout(timeout, child.wait_with_output())
+        .await
+        .context("Hook test timed out after 30 seconds")?
+        .context("Failed to wait for hook process")?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    if ctx.is_json() {
+        let result = if stdout.is_empty() {
+            // Empty stdout = allow
+            serde_json::json!({
+                "input": sample_input,
+                "decision": "allow",
+                "output": null,
+                "exit_code": output.status.code(),
+                "stderr": if stderr.is_empty() { None } else { Some(stderr.trim()) }
+            })
+        } else {
+            // Parse the hook output
+            let hook_output: Option<HookOutput> = serde_json::from_str(stdout.trim()).ok();
+            serde_json::json!({
+                "input": sample_input,
+                "decision": if hook_output.as_ref().map(|o| matches!(o, HookOutput::Deny(_))).unwrap_or(false) { "deny" } else { "allow" },
+                "output": hook_output,
+                "exit_code": output.status.code(),
+                "stderr": if stderr.is_empty() { None } else { Some(stderr.trim()) }
+            })
+        };
+        let _ = ctx.json(&result);
+        return Ok(());
+    }
+
+    // Display results in human-readable format
+    if stdout.is_empty() {
+        // Empty stdout = allow (local execution)
+        println!(
+            "{} Hook decision: ALLOW (local execution)",
+            StatusIndicator::Success.display(style)
+        );
+        println!("\nThis means the command would run locally (not offloaded).");
+        println!("Reasons this might happen:");
+        println!("  - RCH is disabled in config");
+        println!("  - No daemon is running");
+        println!("  - No workers are available");
+        println!("  - The command wasn't classified as a compilation command");
+    } else {
+        // Parse the hook output
+        match serde_json::from_str::<HookOutput>(stdout.trim()) {
+            Ok(HookOutput::Deny(deny)) => {
+                println!(
+                    "{} Hook decision: DENY (remote execution)",
+                    StatusIndicator::Success.display(style)
+                );
+                println!("\nThe hook intercepted the command for remote execution.");
+                println!("Modified command: {}", deny.command);
+                if let Some(output) = &deny.output {
+                    if !output.is_empty() {
+                        println!("Hook output: {}", output);
+                    }
+                }
+            }
+            Ok(HookOutput::Allow) => {
+                println!(
+                    "{} Hook decision: ALLOW (local execution)",
+                    StatusIndicator::Success.display(style)
+                );
+                println!("\nThe command would run locally.");
+            }
+            Err(e) => {
+                println!(
+                    "{} Failed to parse hook output: {}",
+                    StatusIndicator::Warning.display(style),
+                    e
+                );
+                println!("Raw output: {}", stdout);
+            }
+        }
+    }
+
+    if !stderr.is_empty() {
+        println!("\nHook stderr:");
+        for line in stderr.lines() {
+            println!("  {}", line);
+        }
+    }
+
+    if !output.status.success() {
+        println!(
+            "\n{} Hook process exited with code: {:?}",
+            StatusIndicator::Warning.display(style),
+            output.status.code()
+        );
+    }
+
     Ok(())
 }
 
