@@ -520,9 +520,9 @@ async fn query_worker_inner(worker: &WorkerConfig, config: &FleetConfig) -> Work
             && output.success()
             && !output.stdout.trim().is_empty()
         {
+            // split_whitespace() already handles leading/trailing whitespace
             version = output
                 .stdout
-                .trim()
                 .split_whitespace()
                 .last()
                 .map(|s| s.to_string());

@@ -7,6 +7,7 @@ use crate::types::{WorkerConfig, WorkerId};
 use anyhow::{Context, Result};
 use openssh::{ControlPersist, KnownHosts, Session, SessionBuilder, Stdio};
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::path::Path;
@@ -180,17 +181,7 @@ pub fn shell_escape_value(value: &str) -> Option<String> {
     if value.contains('\n') || value.contains('\r') || value.contains('\0') {
         return None;
     }
-    let mut out = String::with_capacity(value.len() + 2);
-    out.push('\'');
-    for ch in value.chars() {
-        if ch == '\'' {
-            out.push_str("'\"'\"'");
-        } else {
-            out.push(ch);
-        }
-    }
-    out.push('\'');
-    Some(out)
+    Some(shell_escape::escape(Cow::Borrowed(value)).into_owned())
 }
 
 /// SSH connection options.
