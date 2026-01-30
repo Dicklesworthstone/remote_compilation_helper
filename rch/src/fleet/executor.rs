@@ -15,10 +15,11 @@ use crate::fleet::progress::{DeployPhase, FleetProgress};
 use crate::fleet::rollback::{
     MAX_BACKUPS_PER_WORKER, REMOTE_BACKUP_DIR, REMOTE_RCH_PATH, RollbackManager, WorkerBackup,
 };
-use crate::fleet::ssh::SshExecutor;
+use crate::fleet::ssh::{CommandOutput, FleetSshError, SshExecutor};
 use crate::ui::context::OutputContext;
 use crate::ui::theme::StatusIndicator;
 use anyhow::{Result, bail};
+use futures::future::BoxFuture;
 use rch_common::{WorkerConfig, WorkerId};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -536,11 +537,44 @@ pub async fn backup_before_deploy(
     rollback_manager: &mut RollbackManager,
 ) -> Result<Option<WorkerBackup>> {
     let ssh = SshExecutor::new(worker);
+    backup_before_deploy_with_runner(worker, rollback_manager, &ssh).await
+}
 
+trait CommandRunner {
+    fn run_command<'a>(
+        &'a self,
+        cmd: &'a str,
+    ) -> BoxFuture<'a, Result<CommandOutput, FleetSshError>>;
+}
+
+impl<'a> CommandRunner for SshExecutor<'a> {
+    fn run_command<'b>(
+        &'b self,
+        cmd: &'b str,
+    ) -> BoxFuture<'b, Result<CommandOutput, FleetSshError>> {
+        Box::pin(SshExecutor::run_command(self, cmd))
+    }
+}
+
+#[cfg(test)]
+impl CommandRunner for crate::fleet::ssh::MockSshExecutor {
+    fn run_command<'a>(
+        &'a self,
+        cmd: &'a str,
+    ) -> BoxFuture<'a, Result<CommandOutput, FleetSshError>> {
+        Box::pin(crate::fleet::ssh::MockSshExecutor::run_command(self, cmd))
+    }
+}
+
+async fn backup_before_deploy_with_runner<R: CommandRunner>(
+    worker: &WorkerConfig,
+    rollback_manager: &mut RollbackManager,
+    runner: &R,
+) -> Result<Option<WorkerBackup>> {
     // 1. Get current version before deploying
     debug!(worker = %worker.id, "Checking for existing version to backup");
     let version_cmd = format!("{} --version 2>/dev/null", REMOTE_RCH_PATH);
-    let current_version = match ssh.run_command(&version_cmd).await {
+    let current_version = match runner.run_command(&version_cmd).await {
         Ok(output) if output.success() => output.stdout.split_whitespace().nth(1).map(String::from),
         Ok(_) => None,
         Err(e) => {
@@ -561,14 +595,25 @@ pub async fn backup_before_deploy(
 
     // 2. Create backup directory
     let mkdir_cmd = format!("mkdir -p {}", REMOTE_BACKUP_DIR);
-    if let Err(e) = ssh.run_command(&mkdir_cmd).await {
-        warn!(worker = %worker.id, error = %e, "Failed to create backup directory");
-        return Ok(None); // Non-fatal
+    match runner.run_command(&mkdir_cmd).await {
+        Ok(output) if output.success() => {}
+        Ok(output) => {
+            warn!(
+                worker = %worker.id,
+                stderr = %output.stderr.trim(),
+                "Failed to create backup directory"
+            );
+            return Ok(None);
+        }
+        Err(e) => {
+            warn!(worker = %worker.id, error = %e, "Failed to create backup directory");
+            return Ok(None); // Non-fatal
+        }
     }
 
     // 3. Check disk space before backup (prevent silent failures)
     // Use portable df command that works on both Linux and macOS
-    let df_output = ssh
+    let df_output = runner
         .run_command("df -Pm ~/.rch 2>/dev/null | tail -1 | awk '{print $4}'")
         .await;
     if let Ok(output) = df_output
@@ -588,9 +633,20 @@ pub async fn backup_before_deploy(
     // 4. Copy current binary to backup location
     let remote_backup_path = format!("{}/rch-wkr-{}", REMOTE_BACKUP_DIR, version);
     let copy_cmd = format!("cp {} {}", REMOTE_RCH_PATH, remote_backup_path);
-    if let Err(e) = ssh.run_command(&copy_cmd).await {
-        warn!(worker = %worker.id, error = %e, "Failed to copy binary to backup");
-        return Ok(None); // Non-fatal
+    match runner.run_command(&copy_cmd).await {
+        Ok(output) if output.success() => {}
+        Ok(output) => {
+            warn!(
+                worker = %worker.id,
+                stderr = %output.stderr.trim(),
+                "Failed to copy binary to backup"
+            );
+            return Ok(None);
+        }
+        Err(e) => {
+            warn!(worker = %worker.id, error = %e, "Failed to copy binary to backup");
+            return Ok(None); // Non-fatal
+        }
     }
 
     // 5. Calculate hash for verification
@@ -598,7 +654,7 @@ pub async fn backup_before_deploy(
         "sha256sum {} 2>/dev/null | cut -d' ' -f1",
         remote_backup_path
     );
-    let binary_hash = match ssh.run_command(&hash_cmd).await {
+    let binary_hash = match runner.run_command(&hash_cmd).await {
         Ok(output) if output.success() => {
             let hash = output.stdout.trim().to_string();
             if hash.len() == 64 {
@@ -638,7 +694,7 @@ pub async fn backup_before_deploy(
                 );
                 // Best-effort cleanup of remote file
                 let rm_cmd = format!("rm -f {}", old_backup.remote_path.display());
-                let _ = ssh.run_command(&rm_cmd).await;
+                let _ = runner.run_command(&rm_cmd).await;
             }
         }
         Err(e) => {
@@ -950,5 +1006,52 @@ mod tests {
         assert_eq!(executor.worker_configs.len(), 2);
         assert!(executor.worker_configs.contains_key("worker-1"));
         assert!(executor.worker_configs.contains_key("worker-2"));
+    }
+
+    // ========================
+    // Backup Before Deploy tests
+    // ========================
+
+    #[tokio::test]
+    async fn backup_before_deploy_skips_on_low_disk() {
+        use crate::fleet::ssh::{MockCommandResult, MockSshExecutor};
+
+        let worker = test_worker_config();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut manager = RollbackManager::with_path(temp_dir.path()).unwrap();
+
+        let mock = MockSshExecutor::new()
+            .with_command("--version", MockCommandResult::ok("rch-wkr 1.0.0"))
+            .with_command("mkdir -p", MockCommandResult::ok(""))
+            .with_command("df -Pm", MockCommandResult::ok("49"));
+
+        let result = backup_before_deploy_with_runner(&worker, &mut manager, &mock)
+            .await
+            .unwrap();
+
+        assert!(result.is_none());
+        assert!(manager.get_latest_backup(&worker.id.0).is_none());
+    }
+
+    #[tokio::test]
+    async fn backup_before_deploy_copy_failure_is_non_fatal() {
+        use crate::fleet::ssh::{MockCommandResult, MockSshExecutor};
+
+        let worker = test_worker_config();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut manager = RollbackManager::with_path(temp_dir.path()).unwrap();
+
+        let mock = MockSshExecutor::new()
+            .with_command("--version", MockCommandResult::ok("rch-wkr 1.0.0"))
+            .with_command("mkdir -p", MockCommandResult::ok(""))
+            .with_command("df -Pm", MockCommandResult::ok("500"))
+            .with_command("cp ", MockCommandResult::err(1, "Permission denied"));
+
+        let result = backup_before_deploy_with_runner(&worker, &mut manager, &mock)
+            .await
+            .unwrap();
+
+        assert!(result.is_none());
+        assert!(manager.get_latest_backup(&worker.id.0).is_none());
     }
 }
