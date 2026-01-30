@@ -6,16 +6,15 @@
 use crate::fleet::audit::AuditLogger;
 use crate::fleet::plan::{DeploymentPlan, DeploymentStatus, DeploymentStrategy};
 use crate::fleet::progress::{DeployPhase, FleetProgress};
+use crate::fleet::ssh::SshExecutor;
 use crate::ui::context::OutputContext;
 use crate::ui::theme::StatusIndicator;
-use anyhow::{Context, Result, bail};
-use rch_common::mock;
+use anyhow::{Result, bail};
 use rch_common::{WorkerConfig, WorkerId};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::process::Command;
 use tokio::sync::Mutex;
 use tracing::debug;
 
@@ -417,162 +416,74 @@ impl FleetExecutor {
 }
 
 // =============================================================================
-// SSH/SCP deployment helper functions
+// SSH/SCP deployment helper functions (using SshExecutor)
 // =============================================================================
 
 /// Test SSH connectivity to a worker.
+///
+/// Uses `SshExecutor::check_connectivity()` for consistent behavior and logging.
 async fn test_ssh_connectivity(worker: &WorkerConfig) -> Result<()> {
-    // Mock mode: skip actual SSH
-    if mock::is_mock_enabled() || mock::is_mock_worker(worker) {
-        debug!(
-            "Mock mode: skipping SSH connectivity test for {}",
-            worker.id
-        );
-        return Ok(());
+    let ssh = SshExecutor::new(worker);
+
+    if ssh.check_connectivity().await? {
+        Ok(())
+    } else {
+        bail!("SSH connection failed to {}", worker.host)
     }
-
-    let mut cmd = Command::new("ssh");
-    cmd.arg("-o").arg("BatchMode=yes");
-    cmd.arg("-o").arg("ConnectTimeout=10");
-    cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
-    cmd.arg("-i").arg(&worker.identity_file);
-    cmd.arg(format!("{}@{}", worker.user, worker.host));
-    cmd.arg("true");
-
-    let output = cmd.output().await.context("Failed to execute SSH")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("SSH connection failed: {}", stderr.trim());
-    }
-
-    Ok(())
 }
 
 /// Create the remote directory for rch-wkr binary.
+///
+/// Uses `SshExecutor::create_directory()` for consistent behavior and logging.
 async fn create_remote_directory(worker: &WorkerConfig) -> Result<()> {
-    // Mock mode: skip actual SSH
-    if mock::is_mock_enabled() || mock::is_mock_worker(worker) {
-        debug!("Mock mode: skipping mkdir for {}", worker.id);
-        return Ok(());
-    }
-
-    let target = format!("{}@{}", worker.user, worker.host);
-    let remote_dir = ".local/bin";
-
-    let mut cmd = Command::new("ssh");
-    cmd.arg("-o").arg("BatchMode=yes");
-    cmd.arg("-o").arg("ConnectTimeout=10");
-    cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
-    cmd.arg("-i").arg(&worker.identity_file);
-    cmd.arg(&target);
-    cmd.arg(format!("mkdir -p ~/{}", remote_dir));
-
-    let output = cmd
-        .output()
+    let ssh = SshExecutor::new(worker);
+    ssh.create_directory("~/.local/bin")
         .await
-        .context("Failed to create remote directory")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("mkdir failed: {}", stderr.trim());
-    }
-
-    Ok(())
+        .map_err(|e| anyhow::anyhow!("mkdir failed: {}", e))
 }
 
 /// Copy the binary to the worker via SCP.
+///
+/// Uses `SshExecutor::copy_file()` for consistent behavior and logging.
 async fn copy_binary_via_scp(worker: &WorkerConfig, local_binary: &Path) -> Result<()> {
-    // Mock mode: skip actual SCP
-    if mock::is_mock_enabled() || mock::is_mock_worker(worker) {
-        debug!("Mock mode: skipping SCP for {}", worker.id);
-        return Ok(());
-    }
-
-    let target = format!("{}@{}", worker.user, worker.host);
+    let ssh = SshExecutor::new(worker);
     let remote_path = "~/.local/bin/rch-wkr";
 
-    let mut cmd = Command::new("scp");
-    cmd.arg("-o").arg("BatchMode=yes");
-    cmd.arg("-o").arg("ConnectTimeout=30");
-    cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
-    cmd.arg("-i").arg(&worker.identity_file);
-    cmd.arg(local_binary);
-    cmd.arg(format!("{}:{}", target, remote_path));
-
     debug!(
-        "SCP: {} -> {}:{}",
+        "SCP: {} -> {}@{}:{}",
         local_binary.display(),
-        target,
+        worker.user,
+        worker.host,
         remote_path
     );
 
-    let output = cmd.output().await.context("Failed to execute SCP")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("scp failed: {}", stderr.trim());
-    }
-
-    Ok(())
+    ssh.copy_file(local_binary, remote_path)
+        .await
+        .map_err(|e| anyhow::anyhow!("scp failed: {}", e))
 }
 
 /// Set executable permissions on the remote binary.
+///
+/// Uses `SshExecutor::set_executable()` for consistent behavior and logging.
 async fn set_executable_permissions(worker: &WorkerConfig) -> Result<()> {
-    // Mock mode: skip actual chmod
-    if mock::is_mock_enabled() || mock::is_mock_worker(worker) {
-        debug!("Mock mode: skipping chmod for {}", worker.id);
-        return Ok(());
-    }
-
-    let target = format!("{}@{}", worker.user, worker.host);
-    let remote_path = "~/.local/bin/rch-wkr";
-
-    let mut cmd = Command::new("ssh");
-    cmd.arg("-o").arg("BatchMode=yes");
-    cmd.arg("-o").arg("ConnectTimeout=10");
-    cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
-    cmd.arg("-i").arg(&worker.identity_file);
-    cmd.arg(&target);
-    cmd.arg(format!("chmod +x {}", remote_path));
-
-    let output = cmd.output().await.context("Failed to chmod binary")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("chmod failed: {}", stderr.trim());
-    }
-
-    Ok(())
+    let ssh = SshExecutor::new(worker);
+    ssh.set_executable("~/.local/bin/rch-wkr")
+        .await
+        .map_err(|e| anyhow::anyhow!("chmod failed: {}", e))
 }
 
 /// Verify the installation by running health check.
+///
+/// Uses `SshExecutor::run_command()` for consistent behavior and logging.
 async fn verify_installation(worker: &WorkerConfig) -> Result<()> {
-    // Mock mode: skip actual verification
-    if mock::is_mock_enabled() || mock::is_mock_worker(worker) {
-        debug!("Mock mode: skipping verification for {}", worker.id);
-        return Ok(());
-    }
-
-    let target = format!("{}@{}", worker.user, worker.host);
-    let remote_path = "~/.local/bin/rch-wkr";
-
-    let mut cmd = Command::new("ssh");
-    cmd.arg("-o").arg("BatchMode=yes");
-    cmd.arg("-o").arg("ConnectTimeout=10");
-    cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
-    cmd.arg("-i").arg(&worker.identity_file);
-    cmd.arg(&target);
-    cmd.arg(format!("{} health", remote_path));
-
-    let output = cmd
-        .output()
+    let ssh = SshExecutor::new(worker);
+    let output = ssh
+        .run_command("~/.local/bin/rch-wkr health")
         .await
-        .context("Failed to verify installation")?;
+        .map_err(|e| anyhow::anyhow!("health check failed: {}", e))?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("health check failed: {}", stderr.trim());
+    if !output.success() {
+        bail!("health check failed: {}", output.stderr.trim());
     }
 
     Ok(())

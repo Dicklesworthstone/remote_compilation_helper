@@ -28,7 +28,7 @@ use rch_telemetry::protocol::{
 };
 use serde::Deserialize;
 use std::fs::OpenOptions;
-use std::io::{self, BufRead, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};

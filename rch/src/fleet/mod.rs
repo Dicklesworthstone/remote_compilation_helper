@@ -11,6 +11,7 @@ mod plan;
 mod preflight;
 mod progress;
 mod rollback;
+pub mod ssh;
 
 use crate::commands::load_workers_from_config;
 use crate::ui::context::OutputContext;
@@ -30,6 +31,7 @@ pub use plan::{
 pub use preflight::{PreflightIssue, PreflightResult, Severity};
 pub use progress::{DeployPhase, FleetProgress};
 pub use rollback::{RollbackManager, WorkerBackup};
+pub use ssh::{CommandOutput, FleetSshError, SshExecutor, parse_disk_space, parse_version_string};
 
 /// Deploy rch-wkr to workers.
 #[allow(clippy::too_many_arguments)]

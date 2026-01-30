@@ -1135,6 +1135,8 @@ show_skill_info() {
             "    \"no workers available\"" \
             "    \"how do I add a new worker?\"" \
             "" \
+            "  The agent will use the skill's knowledge to help." \
+            "" \
             "Trigger phrases: rch doctor, workers.toml, fleet deploy," \
             "                 no workers, compilation slow, self-test"
     else

@@ -105,9 +105,8 @@ mod tests {
                 normalized, command);
         }
 
-        /// Property: commands with non-chainable shell metacharacters are not classified as compilation.
-        /// Note: chaining operators (;, &&, ||) are handled by multi-command splitting,
-        /// so compilation sub-commands are correctly detected in chained strings.
+        /// Property: commands with shell metacharacters are not classified as compilation.
+        /// All shell operators (pipes, redirects, subshells, chaining) are rejected for security.
         #[test]
         fn shell_metachar_rejected(
             prefix in "(cargo build|gcc -c|make|rustc) ",
@@ -132,10 +131,10 @@ mod tests {
             );
         }
 
-        /// Property: chained commands with compilation prefix are classified as compilation
-        /// because multi-command splitting detects the compilation sub-command.
+        /// Property: chained commands are rejected for security, even with compilation prefix.
+        /// We don't split chained commands because that would allow malicious payloads.
         #[test]
-        fn chained_compilation_detected(
+        fn chained_commands_rejected(
             prefix in "(cargo build|cargo test|make -j4|rustc main\\.rs) ",
             chain in prop::sample::select(vec![
                 "; echo done",
@@ -148,10 +147,16 @@ mod tests {
 
             let result = classify_command(&chained);
 
-            // Invariant: compilation sub-command detected through splitting
+            // Invariant: chained commands are rejected for security
             prop_assert!(
-                result.is_compilation,
-                "Chained compilation not detected: {} -> {:?}",
+                !result.is_compilation,
+                "Chained command should be rejected: {} -> {:?}",
+                chained,
+                result
+            );
+            prop_assert!(
+                result.reason.contains("chained"),
+                "Reason should mention chaining: {} -> {:?}",
                 chained,
                 result
             );
@@ -487,13 +492,14 @@ mod tests {
     }
 
     #[test]
-    fn regression_chained_semicolon_classified() {
-        // Multi-command splitting detects cargo build sub-command
+    fn regression_chained_semicolon_rejected() {
+        // Chained commands are rejected for security
         let result = classify_command("cargo build; rm -rf /");
         assert!(
-            result.is_compilation,
-            "cargo build sub-command should be detected"
+            !result.is_compilation,
+            "chained commands should be rejected"
         );
+        assert!(result.reason.contains("chained"));
     }
 
     #[test]
