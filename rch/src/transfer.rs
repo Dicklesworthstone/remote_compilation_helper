@@ -2231,7 +2231,8 @@ mod tests {
             .expect("execute invocation");
 
         assert!(command.contains("RUSTFLAGS='-C target-cpu=native'"));
-        assert!(command.contains("QUOTED='a'\"'\"'b'"));
+        // shell_escape uses '\'' style (end string, escaped quote, start string)
+        assert!(command.contains("QUOTED='a'\\''b'"));
         assert!(!command.contains("BADVAL="));
         assert!(!command.contains("BAD=KEY"));
         assert!(command.contains("cargo build"));

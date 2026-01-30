@@ -3240,6 +3240,9 @@ mod tests {
     #[tokio::test]
     async fn test_fail_open_on_invalid_json() {
         let _lock = test_lock().lock().await;
+        // Disable mock mode to test real fail-open behavior
+        mock::set_mock_enabled_override(Some(false));
+
         // If hook input is invalid JSON, should allow (fail-open)
         // This tests the run_hook behavior implicitly through process_hook
         // We can't easily test run_hook directly as it reads stdin
@@ -3257,12 +3260,16 @@ mod tests {
 
         // With no daemon running, should fail-open to allow
         let output = process_hook(input).await;
+        mock::clear_mock_overrides();
         assert!(output.is_allow());
     }
 
     #[tokio::test]
     async fn test_fail_open_on_config_error() {
         let _lock = test_lock().lock().await;
+        // Disable mock mode to test real fail-open behavior
+        mock::set_mock_enabled_override(Some(false));
+
         // If config is missing or invalid, should allow
         // This is tested implicitly by process_hook when config can't load
         // The current implementation falls back to allow
@@ -3276,6 +3283,7 @@ mod tests {
         };
 
         let output = process_hook(input).await;
+        mock::clear_mock_overrides();
         // Should allow because daemon isn't running (fail-open)
         assert!(output.is_allow());
     }
