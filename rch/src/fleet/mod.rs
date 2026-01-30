@@ -29,7 +29,7 @@ pub use plan::{
     DeployOptions, DeployStep, DeploymentPlan, DeploymentStatus, DeploymentStrategy,
     WorkerDeployment,
 };
-pub use preflight::{PreflightIssue, PreflightResult, Severity};
+pub use preflight::{PreflightIssue, PreflightResult, Severity, with_retry};
 pub use progress::{DeployPhase, FleetProgress};
 pub use rollback::{RollbackManager, WorkerBackup};
 pub use ssh::{

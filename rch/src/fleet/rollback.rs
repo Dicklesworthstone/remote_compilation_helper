@@ -29,12 +29,14 @@ use tracing::{debug, error, info, warn};
 // =============================================================================
 
 /// Default remote path to the rch-wkr binary on workers.
+#[allow(dead_code)] // Used by planned rollback commands
 pub const REMOTE_RCH_PATH: &str = "~/.local/bin/rch-wkr";
 
 /// Default remote backup directory on workers.
 pub const REMOTE_BACKUP_DIR: &str = "~/.rch/backups";
 
 /// Maximum number of backups to keep per worker.
+#[allow(dead_code)] // Enforced when backup retention is implemented
 pub const MAX_BACKUPS_PER_WORKER: usize = 3;
 
 /// Registry file name.
@@ -421,6 +423,7 @@ mod tests {
     // Helper functions
     // ========================
 
+    #[allow(dead_code)] // Shared test helper for future rollback cases
     fn mock_backup(worker_id: &str, version: &str, timestamp: u64) -> WorkerBackup {
         WorkerBackup {
             worker_id: worker_id.to_string(),

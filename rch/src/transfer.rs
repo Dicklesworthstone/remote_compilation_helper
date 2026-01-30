@@ -1024,8 +1024,9 @@ impl TransferPipeline {
             }
 
             let control_path = control_dir.join("rch-rsync-%C");
+            let escaped_control_path = escape(Cow::from(control_path.to_string_lossy()));
             command.push_str(" -o ControlMaster=auto");
-            command.push_str(&format!(" -o ControlPath={}", control_path.display()));
+            command.push_str(&format!(" -o ControlPath={}", escaped_control_path));
 
             if idle.is_zero() {
                 command.push_str(" -o ControlPersist=no");
