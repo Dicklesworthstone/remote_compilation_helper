@@ -35,3 +35,4 @@ bun_space_test.rs
 target_dusty/
 target_dusty_eagle/
 target-upgrade/
+logs/
