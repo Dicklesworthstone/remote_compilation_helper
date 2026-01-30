@@ -1134,9 +1134,9 @@ fn estimate_cores_for_command(
             if let Some(threads) = parse_test_threads(command) {
                 return threads.max(1);
             }
-            if let Some(threads) = parse_env_u32(command, "RUST_TEST_THREADS").or_else(|| {
-                read_env_u32("RUST_TEST_THREADS")
-            }) {
+            if let Some(threads) = parse_env_u32(command, "RUST_TEST_THREADS")
+                .or_else(|| read_env_u32("RUST_TEST_THREADS"))
+            {
                 return threads.max(1);
             }
 
