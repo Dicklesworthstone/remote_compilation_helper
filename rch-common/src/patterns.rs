@@ -582,6 +582,12 @@ pub fn normalize_command(cmd: &str) -> Cow<'_, str> {
 
 /// Check command structure for patterns that shouldn't be intercepted.
 fn check_structure(cmd: &str) -> Option<&'static str> {
+    // Check for embedded newlines or carriage returns - these would execute
+    // multiple commands when passed to `sh -c` (command injection risk)
+    if cmd.contains('\n') || cmd.contains('\r') {
+        return Some("contains embedded newline");
+    }
+
     // Check for backgrounding (ends with & or contains & not part of &&)
     if contains_unquoted_standalone_ampersand(cmd) {
         return Some("backgrounded command");
@@ -1176,6 +1182,19 @@ mod tests {
         let result = classify_command("cargo build &");
         assert!(!result.is_compilation);
         assert!(result.reason.contains("background"));
+    }
+
+    #[test]
+    fn test_newline_injection_not_intercepted() {
+        let _guard = test_guard!();
+        // Newlines could cause command injection via `sh -c`
+        let result = classify_command("cargo build\nrm -rf /");
+        assert!(!result.is_compilation);
+        assert!(result.reason.contains("newline"));
+
+        let result = classify_command("cargo build\r\nrm -rf /");
+        assert!(!result.is_compilation);
+        assert!(result.reason.contains("newline"));
     }
 
     #[test]
