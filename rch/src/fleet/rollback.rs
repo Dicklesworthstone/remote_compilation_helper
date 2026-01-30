@@ -2106,7 +2106,7 @@ mod tests {
 
         // No backups registered, so all should fail
         let results = manager
-            .rollback_workers(&worker_refs, None, 4, false, &*ctx)
+            .rollback_workers(&worker_refs, None, 4, false, &ctx)
             .await
             .unwrap();
 
