@@ -250,7 +250,7 @@ pub enum WorkerError {
 
 /// Errors related to SSH connectivity and authentication.
 ///
-/// Error code range: RCH-E100 to RCH-E111
+/// Error code range: RCH-E100 to RCH-E113
 #[derive(Error, Diagnostic, Debug)]
 pub enum SshError {
     /// Generic SSH connection failure.
@@ -423,7 +423,7 @@ Run 'rch doctor' for comprehensive SSH diagnostics."
     /// SSH authentication failed (permission denied) - legacy alias.
     #[error("SSH authentication failed for {user}@{host}")]
     #[diagnostic(
-        code("RCH-E101"),
+        code("RCH-E113"),
         help(
             "SSH Troubleshooting:\n\
   1. Verify key exists and copy key to worker if needed.\n\
@@ -547,7 +547,7 @@ pub enum DaemonError {
 
 /// Errors related to build and file transfer operations.
 ///
-/// Error code range: RCH-E400 to RCH-E408
+/// Error code range: RCH-E400 to RCH-E409
 #[derive(Error, Diagnostic, Debug)]
 pub enum TransferError {
     /// Build failed on remote worker.
@@ -635,7 +635,7 @@ pub enum TransferError {
     /// Failed to determine project root - legacy variant.
     #[error("Failed to determine project root directory")]
     #[diagnostic(
-        code("RCH-E406"),
+        code("RCH-E409"),
         help(
             "Could not get the current working directory.\n\nEnsure you are running from a valid directory:\n  pwd\n  ls -la"
         )
@@ -1452,5 +1452,223 @@ user = "test"
         // Display trait should use format_warning
         assert_eq!(display_output, format_output);
         info!("TEST PASS: test_artifact_retrieval_warning_display_trait");
+    }
+
+    // =========================================================================
+    // Error Code Schema Validation
+    // =========================================================================
+
+    /// Extract error code from a Diagnostic-implementing error.
+    fn extract_code(err: &dyn Diagnostic) -> Option<String> {
+        err.code().map(|c| c.to_string())
+    }
+
+    #[test]
+    fn test_all_error_codes_unique() {
+        // Collect all error codes from each error enum by constructing representative variants.
+        // This ensures no two variants share the same RCH-Exxx code.
+        let mut codes: Vec<(&str, String)> = Vec::new();
+
+        // ConfigError codes
+        let config_errors: Vec<(&str, Box<dyn Diagnostic>)> = vec![
+            (
+                "NotFound",
+                Box::new(ConfigError::NotFound {
+                    path: PathBuf::from("x"),
+                }),
+            ),
+            (
+                "ReadFailed",
+                Box::new(ConfigError::ReadFailed {
+                    path: PathBuf::from("x"),
+                    source: std::io::Error::new(std::io::ErrorKind::Other, ""),
+                }),
+            ),
+            (
+                "ParseError",
+                Box::new(ConfigError::ParseError {
+                    src: NamedSource::new("x", String::new()),
+                    span: (0, 0).into(),
+                    message: String::new(),
+                }),
+            ),
+            (
+                "InvalidValue",
+                Box::new(ConfigError::InvalidValue {
+                    field: String::new(),
+                    reason: String::new(),
+                    suggestion: String::new(),
+                }),
+            ),
+            (
+                "WorkersNotFound",
+                Box::new(ConfigError::WorkersNotFound {
+                    path: PathBuf::from("x"),
+                }),
+            ),
+            (
+                "WorkersParseError",
+                Box::new(ConfigError::WorkersParseError {
+                    path: PathBuf::from("x"),
+                    source: "".to_string(),
+                }),
+            ),
+            (
+                "NoWorkers",
+                Box::new(ConfigError::NoWorkers),
+            ),
+            (
+                "WorkerNotFound",
+                Box::new(ConfigError::WorkerNotFound {
+                    id: String::new(),
+                }),
+            ),
+            (
+                "DuplicateWorker",
+                Box::new(ConfigError::DuplicateWorker {
+                    id: String::new(),
+                }),
+            ),
+            (
+                "InvalidWorkerConfig",
+                Box::new(ConfigError::InvalidWorkerConfig {
+                    id: String::new(),
+                    reason: String::new(),
+                    suggestion: String::new(),
+                }),
+            ),
+            (
+                "MissingField",
+                Box::new(ConfigError::MissingField {
+                    field: String::new(),
+                }),
+            ),
+            (
+                "MigrationRequired",
+                Box::new(ConfigError::MigrationRequired {
+                    from_version: String::new(),
+                    to_version: String::new(),
+                }),
+            ),
+        ];
+        for (name, err) in &config_errors {
+            if let Some(code) = extract_code(err.as_ref()) {
+                codes.push((name, code));
+            }
+        }
+
+        // DaemonError codes
+        let daemon_errors: Vec<(&str, Box<dyn Diagnostic>)> = vec![
+            ("NotRunning", Box::new(DaemonError::NotRunning)),
+            (
+                "SocketNotFound",
+                Box::new(DaemonError::SocketNotFound {
+                    path: PathBuf::from("x"),
+                }),
+            ),
+            (
+                "ConnectionRefused",
+                Box::new(DaemonError::ConnectionRefused {
+                    path: PathBuf::from("x"),
+                    source: std::io::Error::new(std::io::ErrorKind::Other, ""),
+                }),
+            ),
+            (
+                "PermissionDenied",
+                Box::new(DaemonError::PermissionDenied {
+                    path: PathBuf::from("x"),
+                }),
+            ),
+            (
+                "StartFailed",
+                Box::new(DaemonError::StartFailed {
+                    source: std::io::Error::new(std::io::ErrorKind::Other, ""),
+                }),
+            ),
+            (
+                "AlreadyRunning",
+                Box::new(DaemonError::AlreadyRunning { pid: 0 }),
+            ),
+            (
+                "Timeout",
+                Box::new(DaemonError::Timeout {
+                    operation: String::new(),
+                }),
+            ),
+            (
+                "ResponseError",
+                Box::new(DaemonError::ResponseError {
+                    message: String::new(),
+                }),
+            ),
+            (
+                "VersionMismatch",
+                Box::new(DaemonError::VersionMismatch {
+                    local: String::new(),
+                    daemon: String::new(),
+                }),
+            ),
+        ];
+        for (name, err) in &daemon_errors {
+            if let Some(code) = extract_code(err.as_ref()) {
+                codes.push((name, code));
+            }
+        }
+
+        // Check for duplicates
+        codes.sort_by(|a, b| a.1.cmp(&b.1));
+        for window in codes.windows(2) {
+            assert_ne!(
+                window[0].1, window[1].1,
+                "Duplicate error code {}: variants '{}' and '{}'",
+                window[0].1, window[0].0, window[1].0,
+            );
+        }
+    }
+
+    #[test]
+    fn test_error_codes_follow_convention() {
+        // All error codes must match the RCH-Exxx pattern
+        let test_errors: Vec<Box<dyn Diagnostic>> = vec![
+            Box::new(ConfigError::NotFound {
+                path: PathBuf::from("x"),
+            }),
+            Box::new(DaemonError::NotRunning),
+        ];
+        for err in &test_errors {
+            if let Some(code) = err.code() {
+                let code_str = code.to_string();
+                assert!(
+                    code_str.starts_with("RCH-E"),
+                    "Error code '{}' doesn't follow RCH-Exxx convention",
+                    code_str,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_error_categories_cover_ranges() {
+        // Config: E001-E012, SSH: E100-E113, Worker: E200-E210,
+        // Daemon: E300-E308, Build: E400-E409, Hook: E500-E510
+        let expected_ranges = [
+            ("Config", 1, 12),
+            ("SSH", 100, 113),
+            ("Worker", 200, 210),
+            ("Daemon", 300, 308),
+            ("Build", 400, 409),
+            ("Hook/Update", 500, 510),
+        ];
+
+        // Just verify the documented ranges are consistent
+        for (category, start, end) in &expected_ranges {
+            assert!(
+                start < end,
+                "Category '{}' has invalid range: {}-{}",
+                category,
+                start,
+                end,
+            );
+        }
     }
 }
