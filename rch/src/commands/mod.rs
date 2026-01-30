@@ -28,9 +28,8 @@ use crate::ui::theme::StatusIndicator;
 use anyhow::{Context, Result, bail};
 use directories::ProjectDirs;
 use helpers::{
-    classify_ssh_error, classify_ssh_error_message, default_socket_path, extract_version_numbers,
-    format_ssh_report, humanize_duration, indent_lines, major_version, major_version_mismatch,
-    major_minor_version, runtime_label, rust_version_mismatch, ssh_key_path,
+    classify_ssh_error, classify_ssh_error_message, default_socket_path, format_ssh_report,
+    humanize_duration, indent_lines, major_version_mismatch, runtime_label, rust_version_mismatch,
     ssh_key_path_from_identity, urlencoding_encode,
 };
 use rch_common::{
@@ -995,92 +994,6 @@ pub async fn workers_probe(
     }
 
     Ok(())
-}
-
-fn classify_ssh_error(worker: &WorkerConfig, err: &anyhow::Error, timeout: Duration) -> SshError {
-    let key_path = ssh_key_path(worker);
-    classify_ssh_error_message(
-        &worker.host,
-        &worker.user,
-        key_path,
-        &err.to_string(),
-        timeout,
-    )
-}
-
-fn classify_ssh_error_message(
-    host: &str,
-    user: &str,
-    key_path: PathBuf,
-    message: &str,
-    timeout: Duration,
-) -> SshError {
-    let message_lower = message.to_lowercase();
-
-    if message_lower.contains("permission denied") || message_lower.contains("publickey") {
-        return SshError::PermissionDenied {
-            host: host.to_string(),
-            user: user.to_string(),
-            key_path: key_path.clone(),
-        };
-    }
-
-    if message_lower.contains("connection refused") {
-        return SshError::ConnectionRefused {
-            host: host.to_string(),
-            user: user.to_string(),
-            key_path: key_path.clone(),
-        };
-    }
-
-    if message_lower.contains("timed out") || message_lower.contains("timeout") {
-        return SshError::ConnectionTimeout {
-            host: host.to_string(),
-            user: user.to_string(),
-            key_path: key_path.clone(),
-            timeout_secs: timeout.as_secs().max(1),
-        };
-    }
-
-    if message_lower.contains("host key verification failed")
-        || message_lower.contains("known_hosts")
-    {
-        return SshError::HostKeyVerificationFailed {
-            host: host.to_string(),
-            user: user.to_string(),
-            key_path: key_path.clone(),
-        };
-    }
-
-    if message_lower.contains("authentication agent")
-        || (message_lower.contains("agent") && message_lower.contains("no identities"))
-    {
-        return SshError::AgentUnavailable {
-            host: host.to_string(),
-            user: user.to_string(),
-            key_path: key_path.clone(),
-        };
-    }
-
-    SshError::ConnectionFailed {
-        host: host.to_string(),
-        user: user.to_string(),
-        key_path,
-        message: message.to_string(),
-    }
-}
-
-fn ssh_key_path(worker: &WorkerConfig) -> PathBuf {
-    ssh_key_path_from_identity(Some(worker.identity_file.as_str()))
-}
-
-fn ssh_key_path_from_identity(identity_file: Option<&str>) -> PathBuf {
-    let path = identity_file.unwrap_or("~/.ssh/id_rsa");
-    PathBuf::from(shellexpand::tilde(path).to_string())
-}
-
-fn format_ssh_report(error: SshError) -> String {
-    format!("{:?}", miette::Report::new(error))
 }
 
 // WorkerBenchmarkResult is defined in types.rs
