@@ -955,10 +955,9 @@ enum ConfigAction {
     },
     /// Initialize configuration files with optional interactive wizard
     #[command(after_help = r#"EXAMPLES:
-    rch config init               # Create config files with defaults
-    rch config init --wizard      # Interactive wizard with prompts
-    rch config init --wizard --non-interactive  # Wizard with defaults (no prompts)
-    rch config init --wizard --defaults         # Same as above
+    rch config init                    # Create config files with defaults
+    rch config init --wizard           # Interactive wizard with prompts
+    rch config init --non-interactive  # Generate full config without prompts
 
 The wizard helps you configure:
   • General settings (log level, socket path)
@@ -969,12 +968,9 @@ The wizard helps you configure:
         /// Run interactive configuration wizard
         #[arg(long)]
         wizard: bool,
-        /// Run wizard with defaults (no interactive prompts); requires --wizard
-        #[arg(long, requires = "wizard")]
+        /// Generate full wizard config with defaults (no interactive prompts)
+        #[arg(long)]
         non_interactive: bool,
-        /// Use default values without prompting (alias for --non-interactive); requires --wizard
-        #[arg(long, requires = "wizard")]
-        defaults: bool,
     },
     /// Validate configuration
     Validate,
@@ -2071,10 +2067,10 @@ async fn handle_config(action: ConfigAction, ctx: &OutputContext) -> Result<()> 
         ConfigAction::Init {
             wizard,
             non_interactive,
-            defaults,
         } => {
-            let use_defaults = non_interactive || defaults;
-            commands::config_init(ctx, wizard, use_defaults)?;
+            // --non-interactive implies wizard mode (generates full config)
+            let run_wizard = wizard || non_interactive;
+            commands::config_init(ctx, run_wizard, non_interactive)?;
         }
         ConfigAction::Validate => {
             commands::config_validate(ctx)?;
@@ -2970,12 +2966,10 @@ mod tests {
                     ConfigAction::Init {
                         wizard,
                         non_interactive,
-                        defaults,
                     },
             }) => {
                 assert!(!wizard);
                 assert!(!non_interactive);
-                assert!(!defaults);
             }
             _ => panic!("Expected config init command"),
         }
