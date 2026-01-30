@@ -298,14 +298,14 @@ pub async fn run_preflight(
             if let Ok(output) = ssh_executor
                 .run_command("rsync --version 2>/dev/null | head -1")
                 .await
+                && output.success()
+                && !output.stdout.trim().is_empty()
             {
-                if output.success() && !output.stdout.trim().is_empty() {
-                    debug!(
-                        worker = %worker.id,
-                        version = %output.stdout.trim(),
-                        "rsync version"
-                    );
-                }
+                debug!(
+                    worker = %worker.id,
+                    version = %output.stdout.trim(),
+                    "rsync version"
+                );
             }
         }
 
@@ -329,14 +329,15 @@ pub async fn run_preflight(
         } else {
             debug!(worker = %worker.id, "zstd found");
             // Optionally collect version for diagnostics
-            if let Ok(output) = ssh_executor.run_command("zstd --version 2>/dev/null").await {
-                if output.success() && !output.stdout.trim().is_empty() {
-                    debug!(
-                        worker = %worker.id,
-                        version = %output.stdout.trim(),
-                        "zstd version"
-                    );
-                }
+            if let Ok(output) = ssh_executor.run_command("zstd --version 2>/dev/null").await
+                && output.success()
+                && !output.stdout.trim().is_empty()
+            {
+                debug!(
+                    worker = %worker.id,
+                    version = %output.stdout.trim(),
+                    "zstd version"
+                );
             }
         }
 
@@ -384,14 +385,14 @@ pub async fn run_preflight(
             if let Ok(output) = ssh_executor
                 .run_command("rustc --version 2>/dev/null")
                 .await
+                && output.success()
+                && !output.stdout.trim().is_empty()
             {
-                if output.success() && !output.stdout.trim().is_empty() {
-                    debug!(
-                        worker = %worker.id,
-                        version = %output.stdout.trim(),
-                        "rustc version"
-                    );
-                }
+                debug!(
+                    worker = %worker.id,
+                    version = %output.stdout.trim(),
+                    "rustc version"
+                );
             }
         }
 
