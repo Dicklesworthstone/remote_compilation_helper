@@ -133,13 +133,20 @@ pub async fn check_for_updates(
     let latest_version = Version::parse(&latest.tag_name)?;
     let update_available = latest_version > current_version;
 
+    // Compute changelog diff from intermediate releases
+    let changelog_diff = if update_available {
+        compute_changelog_diff(&releases, &current_version, &latest_version)
+    } else {
+        None
+    };
+
     let check = UpdateCheck {
         current_version,
         latest_version,
         update_available,
         release_url: latest.html_url.clone(),
         release_notes: latest.body.clone(),
-        changelog_diff: None, // TODO: Compute diff
+        changelog_diff,
         assets: latest.assets.clone(),
     };
 
@@ -263,6 +270,45 @@ fn filter_by_channel(releases: &[ReleaseInfo], channel: Channel) -> Option<&Rele
             Channel::Nightly => true, // Accept any, prefer latest
         }
     })
+}
+
+/// Compute changelog diff by collecting release notes from versions between current and target.
+fn compute_changelog_diff(
+    releases: &[ReleaseInfo],
+    current: &Version,
+    target: &Version,
+) -> Option<String> {
+    // Collect release notes from all releases between current (exclusive) and target (inclusive)
+    let mut notes = Vec::new();
+
+    for release in releases {
+        // Skip drafts
+        if release.draft {
+            continue;
+        }
+
+        // Parse version
+        let Ok(version) = Version::parse(&release.tag_name) else {
+            continue;
+        };
+
+        // Only include releases > current and <= target with non-empty body
+        if version > *current
+            && version <= *target
+            && let Some(ref body) = release.body
+            && !body.trim().is_empty()
+        {
+            notes.push(format!("## {}\n{}", release.tag_name, body));
+        }
+    }
+
+    if notes.is_empty() {
+        None
+    } else {
+        // Reverse to show oldest first (chronological order)
+        notes.reverse();
+        Some(notes.join("\n\n---\n\n"))
+    }
 }
 
 /// Build an HTTP client with appropriate timeouts.
