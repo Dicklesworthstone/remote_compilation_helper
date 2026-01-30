@@ -8,10 +8,14 @@
 //! - Command handlers are implemented directly in this module
 
 // Sub-modules
+mod helpers;
 pub mod types;
 
 // Re-export types for backward compatibility
 pub use types::*;
+
+// Re-export commonly used helpers
+use helpers::{humanize_duration, indent_lines, urlencoding_encode};
 
 use crate::error::{ConfigError, DaemonError, SshError};
 use crate::status_types::{
@@ -1134,18 +1138,6 @@ fn ssh_key_path_from_identity(identity_file: Option<&str>) -> PathBuf {
 
 fn format_ssh_report(error: SshError) -> String {
     format!("{:?}", miette::Report::new(error))
-}
-
-fn indent_lines(text: &str, prefix: &str) -> String {
-    let mut out = String::new();
-    for (idx, line) in text.lines().enumerate() {
-        if idx > 0 {
-            out.push('\n');
-        }
-        out.push_str(prefix);
-        out.push_str(line);
-    }
-    out
 }
 
 // WorkerBenchmarkResult is defined in types.rs
@@ -7493,28 +7485,6 @@ async fn self_test_run(
     Ok(())
 }
 
-/// URL percent-encoding for query parameters.
-/// Optimized to avoid allocations by using direct hex conversion.
-fn urlencoding_encode(s: &str) -> String {
-    // Hex digits lookup table for zero-allocation encoding
-    const HEX_DIGITS: &[u8; 16] = b"0123456789ABCDEF";
-
-    let mut result = String::with_capacity(s.len() * 3);
-    for byte in s.as_bytes() {
-        match *byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                result.push(*byte as char);
-            }
-            _ => {
-                result.push('%');
-                result.push(HEX_DIGITS[(byte >> 4) as usize] as char);
-                result.push(HEX_DIGITS[(byte & 0x0F) as usize] as char);
-            }
-        }
-    }
-    result
-}
-
 pub async fn status_overview(workers: bool, jobs: bool, ctx: &OutputContext) -> Result<()> {
     // Query daemon for full status.
     let response = send_daemon_command("GET /status\n").await?;
@@ -7926,19 +7896,6 @@ pub async fn check(ctx: &OutputContext) -> Result<()> {
     }
 
     Ok(())
-}
-
-/// Format a duration in seconds as a human-readable string.
-fn humanize_duration(secs: u64) -> String {
-    if secs < 60 {
-        format!("{}s", secs)
-    } else if secs < 3600 {
-        format!("{}m {}s", secs / 60, secs % 60)
-    } else if secs < 86400 {
-        format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
-    } else {
-        format!("{}d {}h", secs / 86400, (secs % 86400) / 3600)
-    }
 }
 
 /// Display build queue - active builds and worker availability.
