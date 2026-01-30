@@ -784,7 +784,8 @@ mod tests {
         let prefix = build_env_prefix(&allowlist, |key| env.get(key).cloned());
 
         assert!(prefix.prefix.contains("RUSTFLAGS='-C target-cpu=native'"));
-        assert!(prefix.prefix.contains("QUOTED='a'\"'\"'b'"));
+        // shell_escape uses '\'' style (end string, escaped quote, start string)
+        assert!(prefix.prefix.contains("QUOTED='a'\\''b'"));
         assert!(!prefix.prefix.contains("MISSING="));
         assert!(!prefix.prefix.contains("BADVAL="));
         assert!(prefix.rejected.contains(&"BADVAL".to_string()));
@@ -863,10 +864,14 @@ mod tests {
                 let result = shell_escape_value(&s);
                 prop_assert!(result.is_some(), "Should accept safe value: {:?}", s);
 
-                // Result should be quoted
+                // shell_escape only quotes values that need it (contain special chars)
+                // Simple alphanumeric strings may be returned unquoted
                 let escaped = result.unwrap();
-                prop_assert!(escaped.starts_with('\''), "Should start with quote");
-                prop_assert!(escaped.ends_with('\''), "Should end with quote");
+                if s.chars().any(|c| !c.is_ascii_alphanumeric() && c != '_') {
+                    // Values with special chars should be quoted
+                    prop_assert!(escaped.starts_with('\'') || escaped.contains('\''),
+                        "Value with special chars should be quoted: {:?} -> {:?}", s, escaped);
+                }
             }
 
             // Test 7: shell_escape_value properly escapes single quotes
@@ -881,8 +886,8 @@ mod tests {
                 prop_assert!(result.is_some());
 
                 let escaped = result.unwrap();
-                // Single quote should be replaced with '\"'\"' pattern
-                prop_assert!(escaped.contains("'\"'\"'"),
+                // shell_escape uses '\'' style (end string, escaped quote, start string)
+                prop_assert!(escaped.contains("'\\''"),
                     "Should escape single quote: {} -> {}", value, escaped);
             }
 
@@ -949,15 +954,16 @@ mod tests {
             let result = shell_escape_value("");
             assert_eq!(result, Some("''".to_string()));
 
-            // Just single quote
+            // Just single quote - shell_escape uses '\'' style (end string, escaped quote, start string)
             let result = shell_escape_value("'");
-            assert_eq!(result, Some("''\"'\"''".to_string()));
+            assert_eq!(result, Some("''\\'''".to_string()));
 
             // Multiple single quotes
             let result = shell_escape_value("'''");
             assert!(result.is_some());
             let escaped = result.unwrap();
-            assert_eq!(escaped.matches("'\"'\"'").count(), 3);
+            // shell_escape uses '\'' style for each single quote
+            assert_eq!(escaped.matches("'\\''").count(), 3);
 
             // Unicode
             let result = shell_escape_value("日本語");
@@ -1033,7 +1039,8 @@ mod tests {
 
             // VALID should be applied
             assert!(prefix.applied.contains(&"VALID".to_string()));
-            assert!(prefix.prefix.contains("VALID='simple'"));
+            // shell_escape doesn't quote simple alphanumeric strings
+            assert!(prefix.prefix.contains("VALID=simple"));
 
             // WITH_QUOTE should be applied with escaped quote
             assert!(prefix.applied.contains(&"WITH_QUOTE".to_string()));

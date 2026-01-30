@@ -1157,7 +1157,8 @@ mod tests {
                 let _ = build_env_prefix(&allowlist, |k| env.get(k).cloned());
             }
 
-            /// Property: prefix output has correct structure (KEY='value' format).
+            /// Property: prefix output has correct structure (KEY=value format).
+            /// Note: shell_escape only quotes values that need it (contain special chars).
             #[test]
             fn prefix_has_correct_structure(
                 key in "[A-Za-z_][A-Za-z0-9_]{1,10}",
@@ -1172,27 +1173,32 @@ mod tests {
                 let result = build_env_prefix(&allowlist, |k| env.get(k).cloned());
 
                 if !result.prefix.is_empty() {
-                    // Prefix should have format: KEY='...' with trailing space
+                    // Prefix should have format: KEY=value with trailing space
                     prop_assert!(
                         result.prefix.ends_with(' '),
                         "Prefix should end with space: {:?}",
                         result.prefix
                     );
 
-                    // Should contain the key followed by ='
+                    // Should contain the key followed by =
                     prop_assert!(
-                        result.prefix.contains(&format!("{}='", key)),
-                        "Prefix should contain KEY=': {:?}",
+                        result.prefix.contains(&format!("{}=", key)),
+                        "Prefix should contain KEY=: {:?}",
                         result.prefix
                     );
 
-                    // The value portion should end with a single quote
-                    let after_eq = result.prefix.split(&format!("{}=", key)).last().unwrap_or("");
-                    prop_assert!(
-                        after_eq.trim().ends_with('\''),
-                        "Value portion should end with quote: {:?}",
-                        after_eq
-                    );
+                    // For values with special characters, shell_escape quotes them
+                    // For simple alphanumeric values, they remain unquoted
+                    let needs_quoting = value.chars().any(|c| !c.is_ascii_alphanumeric() && c != '_');
+                    if needs_quoting {
+                        let after_eq = result.prefix.split(&format!("{}=", key)).last().unwrap_or("");
+                        // Quoted values should end with a single quote
+                        prop_assert!(
+                            after_eq.trim().ends_with('\''),
+                            "Quoted value should end with quote: {:?}",
+                            after_eq
+                        );
+                    }
                 }
             }
 
@@ -1321,17 +1327,17 @@ mod tests {
                     result
                 );
 
-                // Verify the structure is correct
+                // Verify the structure is correct - should contain KEY=
                 prop_assert!(
-                    result.prefix.contains(&format!("{}='", key)),
-                    "Prefix should have KEY=' structure: {:?}",
+                    result.prefix.contains(&format!("{}=", key)),
+                    "Prefix should have KEY= structure: {:?}",
                     result.prefix
                 );
 
-                // Verify single quotes in the injection are escaped
+                // Verify single quotes in the injection are escaped with '\'' style
                 if injection.contains('\'') {
                     prop_assert!(
-                        result.prefix.contains("'\"'\"'"),
+                        result.prefix.contains("'\\''"),
                         "Single quotes should be escaped with '\"'\"' pattern: {:?}",
                         result.prefix
                     );
@@ -1491,7 +1497,8 @@ mod tests {
             assert_eq!(result.applied, vec!["VALID".to_string()]);
             assert!(result.rejected.contains(&"123BAD".to_string()));
             assert!(result.rejected.contains(&"DANGEROUS".to_string()));
-            assert_eq!(result.prefix, "VALID='good' ");
+            // shell_escape doesn't quote simple alphanumeric values
+            assert_eq!(result.prefix, "VALID=good ");
         }
 
         #[test]
