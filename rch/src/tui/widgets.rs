@@ -104,19 +104,40 @@ struct ColorScheme {
 pub fn render(frame: &mut Frame, state: &TuiState) {
     let colors = get_colors(state.high_contrast, state.color_blind);
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .margin(1)
-        .constraints([
-            Constraint::Length(3), // Header
-            Constraint::Min(10),   // Main content
-            Constraint::Length(3), // Footer
-        ])
-        .split(frame.area());
+    let has_detail = state.show_detail && state.selected_detail().is_some();
+
+    let chunks = if has_detail {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .margin(1)
+            .constraints([
+                Constraint::Length(3), // Header
+                Constraint::Min(10),   // Main content
+                Constraint::Length(3), // Detail bar
+                Constraint::Length(3), // Footer
+            ])
+            .split(frame.area())
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .margin(1)
+            .constraints([
+                Constraint::Length(3), // Header
+                Constraint::Min(10),   // Main content
+                Constraint::Length(3), // Footer
+            ])
+            .split(frame.area())
+    };
 
     render_header(frame, chunks[0], state, &colors);
     render_main_content(frame, chunks[1], state, &colors);
-    render_footer(frame, chunks[2], state, &colors);
+
+    if has_detail {
+        render_detail_bar(frame, chunks[2], state, &colors);
+        render_footer(frame, chunks[3], state, &colors);
+    } else {
+        render_footer(frame, chunks[2], state, &colors);
+    }
 
     // Render overlays on top
     if state.show_help {
@@ -626,6 +647,22 @@ fn truncate_command(cmd: &str, max_len: usize) -> String {
         "{}...",
         truncate_to_char_boundary(cmd, max_len.saturating_sub(3))
     )
+}
+
+/// Render the detail bar showing full content of the selected item.
+fn render_detail_bar(frame: &mut Frame, area: Rect, state: &TuiState, colors: &ColorScheme) {
+    let detail = state.selected_detail().unwrap_or_default();
+    let paragraph = Paragraph::new(Line::from(Span::styled(
+        detail,
+        Style::default().fg(colors.fg),
+    )))
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("Selected")
+            .border_style(Style::default().fg(colors.muted)),
+    );
+    frame.render_widget(paragraph, area);
 }
 
 /// Render the footer with help hints.

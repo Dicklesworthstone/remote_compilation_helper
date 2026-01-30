@@ -139,6 +139,8 @@ pub struct TuiState {
     pub confirm_dialog: Option<ConfirmDialog>,
     /// Build history sort order.
     pub build_history_sort: BuildHistorySort,
+    /// Show detail bar for selected item (full untruncated content).
+    pub show_detail: bool,
 }
 
 impl Default for TuiState {
@@ -162,6 +164,7 @@ impl Default for TuiState {
             color_blind: ColorBlindMode::None,
             last_copied: None,
             confirm_dialog: None,
+            show_detail: true,
         }
     }
 }
@@ -212,6 +215,55 @@ impl TuiState {
             self.active_builds.get(self.selected_index)
         } else {
             None
+        }
+    }
+
+    /// Get detail text for the currently selected item (untruncated).
+    ///
+    /// Returns `None` if no item is selected or the panel is empty.
+    pub fn selected_detail(&self) -> Option<String> {
+        match self.selected_panel {
+            Panel::Workers => {
+                let w = self.workers.get(self.selected_index)?;
+                Some(format!(
+                    "{} | host: {} | status: {:?} | slots: {}/{} | latency: {}ms | builds: {}",
+                    w.id,
+                    w.host,
+                    w.status,
+                    w.used_slots,
+                    w.total_slots,
+                    w.latency_ms,
+                    w.builds_completed,
+                ))
+            }
+            Panel::ActiveBuilds => {
+                let b = self.active_builds.get(self.selected_index)?;
+                let worker = b.worker.as_deref().unwrap_or("pending");
+                let progress = b
+                    .progress
+                    .as_ref()
+                    .and_then(|p| p.percent)
+                    .map(|p| format!(" ({}%)", p))
+                    .unwrap_or_default();
+                Some(format!(
+                    "{} → {} | {}{}",
+                    b.command, worker, b.id, progress,
+                ))
+            }
+            Panel::BuildHistory => {
+                let b = self.build_history.get(self.selected_index)?;
+                let worker = b.worker.as_deref().unwrap_or("local");
+                let status = if b.success { "ok" } else { "FAIL" };
+                let exit = b
+                    .exit_code
+                    .map(|c| format!(" exit={}", c))
+                    .unwrap_or_default();
+                Some(format!(
+                    "{} @ {} | {} | {}ms{}",
+                    b.command, worker, status, b.duration_ms, exit,
+                ))
+            }
+            Panel::Logs => None,
         }
     }
 
