@@ -538,10 +538,10 @@ build_from_source() {
 
     # Build release binaries
     if $USE_GUM; then
-        spin "Building release binaries..." cargo build --release
+        spin "Building release binaries..." cargo +nightly build --release
     else
         info "Building release binaries (this may take a while)..."
-        cargo build --release
+        cargo +nightly build --release
     fi
 
     # Copy binaries - respect CARGO_TARGET_DIR if set
@@ -691,13 +691,13 @@ clone_and_build_from_source() {
 
     # Build release binaries
     if $USE_GUM; then
-        if ! spin "Building release binaries (this may take a few minutes)..." cargo build --release; then
-            die "Build failed. Check that Rust nightly is installed: rustup default nightly"
+        if ! spin "Building release binaries (this may take a few minutes)..." cargo +nightly build --release; then
+            die "Build failed. Check that Rust nightly is installed: rustup toolchain install nightly"
         fi
     else
         info "Building release binaries (this may take a few minutes)..."
-        if ! cargo build --release; then
-            die "Build failed. Check that Rust nightly is installed: rustup default nightly"
+        if ! cargo +nightly build --release; then
+            die "Build failed. Check that Rust nightly is installed: rustup toolchain install nightly"
         fi
     fi
 
