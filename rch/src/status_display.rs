@@ -6,6 +6,7 @@
 
 #![allow(dead_code)]
 
+use crate::error::DaemonError;
 use crate::status_types::{DaemonFullStatusResponse, extract_json_body, format_duration};
 use crate::ui::theme::Theme;
 use anyhow::{Context, Result};
@@ -121,7 +122,10 @@ pub async fn drain_worker(worker_id: &str) -> Result<()> {
     if response.contains("\"status\":\"ok\"") {
         Ok(())
     } else {
-        anyhow::bail!("Drain failed: {}", response)
+        Err(DaemonError::ProtocolError {
+            message: format!("Drain failed: {}", response),
+        }
+        .into())
     }
 }
 
@@ -160,7 +164,10 @@ pub async fn enable_worker(worker_id: &str) -> Result<()> {
     if response.contains("\"status\":\"ok\"") {
         Ok(())
     } else {
-        anyhow::bail!("Enable failed: {}", response)
+        Err(DaemonError::ProtocolError {
+            message: format!("Enable failed: {}", response),
+        }
+        .into())
     }
 }
 
@@ -198,7 +205,10 @@ pub async fn cancel_build(build_id: &str) -> Result<()> {
     if response.contains("\"status\":\"ok\"") {
         Ok(())
     } else {
-        anyhow::bail!("Cancel failed: {}", response)
+        Err(DaemonError::ProtocolError {
+            message: format!("Cancel failed: {}", response),
+        }
+        .into())
     }
 }
 
@@ -236,7 +246,10 @@ pub async fn force_kill_build(build_id: &str) -> Result<()> {
     if response.contains("\"status\":\"ok\"") {
         Ok(())
     } else {
-        anyhow::bail!("Force kill failed: {}", response)
+        Err(DaemonError::ProtocolError {
+            message: format!("Force kill failed: {}", response),
+        }
+        .into())
     }
 }
 

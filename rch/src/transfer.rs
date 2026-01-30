@@ -3,7 +3,8 @@
 //! Handles synchronizing project files to remote workers, executing compilation
 //! commands, and retrieving build artifacts.
 
-use anyhow::{Context, Result, bail};
+use crate::error::TransferError;
+use anyhow::{Context, Result};
 use rch_common::mock::{self, MockConfig, MockRsync, MockRsyncConfig, MockSshClient};
 use rch_common::ssh::{EnvPrefix, build_env_prefix, is_retryable_transport_error};
 use rch_common::{
@@ -547,11 +548,12 @@ impl TransferPipeline {
             } else {
                 warn!("rsync failed: {}", stderr);
             }
-            bail!(
-                "rsync failed with exit code {:?}: {}",
-                output.status.code(),
-                stderr
-            );
+            return Err(TransferError::SyncFailed {
+                reason: "rsync failed".to_string(),
+                exit_code: output.status.code(),
+                stderr: stderr.to_string(),
+            }
+            .into());
         }
 
         info!("Sync completed in {}ms", duration.as_millis());
@@ -947,11 +949,12 @@ impl TransferPipeline {
 
         if !output.status.success() {
             warn!("Artifact retrieval failed: {}", stderr);
-            bail!(
-                "rsync artifact retrieval failed with exit code {:?}: {}",
-                output.status.code(),
-                stderr
-            );
+            return Err(TransferError::SyncFailed {
+                reason: "rsync artifact retrieval failed".to_string(),
+                exit_code: output.status.code(),
+                stderr: stderr.clone(),
+            }
+            .into());
         }
 
         info!("Artifacts retrieved in {}ms", duration.as_millis());
@@ -1265,11 +1268,12 @@ where
 
     let status = child.wait().await.context("Failed to wait on rsync")?;
     if !status.success() {
-        bail!(
-            "rsync failed with exit code {:?}: {}",
-            status.code(),
-            combined.trim()
-        );
+        return Err(TransferError::SyncFailed {
+            reason: "rsync failed".to_string(),
+            exit_code: status.code(),
+            stderr: combined.trim().to_string(),
+        }
+        .into());
     }
 
     Ok((combined, start.elapsed().as_millis() as u64))

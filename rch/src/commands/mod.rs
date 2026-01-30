@@ -13,7 +13,7 @@ pub mod types;
 // Re-export types for backward compatibility
 pub use types::*;
 
-use crate::error::{ConfigError, DaemonError, SshError, WorkerError};
+use crate::error::{ConfigError, DaemonError, SshError};
 use crate::status_types::{
     ActiveBuildFromApi, DaemonFullStatusResponse, SelfTestHistoryResponse, SelfTestRunResponse,
     SelfTestStatusResponse, SpeedScoreHistoryResponseFromApi, SpeedScoreListResponseFromApi,
@@ -3293,8 +3293,7 @@ echo "ARCH:$(uname -m 2>/dev/null || echo unknown)""#;
             message,
             Duration::from_secs(10),
         );
-        let report = format_ssh_report(ssh_error);
-        bail!(report);
+        return Err(ssh_error.into());
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -8958,13 +8957,28 @@ pub async fn speedscore(
 
     // Validate arguments
     if all && worker.is_some() {
-        bail!("Cannot specify both --all and a worker ID");
+        return Err(ConfigError::InvalidValue {
+            field: "worker".to_string(),
+            reason: "Cannot specify both --all and a worker ID".to_string(),
+            suggestion: "Remove either --all or the worker ID".to_string(),
+        }
+        .into());
     }
     if history && worker.is_none() && !all {
-        bail!("--history requires a worker ID or --all");
+        return Err(ConfigError::InvalidValue {
+            field: "--history".to_string(),
+            reason: "--history requires a worker ID or --all".to_string(),
+            suggestion: "Add a worker ID or use --all".to_string(),
+        }
+        .into());
     }
     if !all && worker.is_none() {
-        bail!("Specify a worker ID or use --all to show all workers");
+        return Err(ConfigError::InvalidValue {
+            field: "worker".to_string(),
+            reason: "No worker specified".to_string(),
+            suggestion: "Specify a worker ID or use --all to show all workers".to_string(),
+        }
+        .into());
     }
 
     // Handle history mode
