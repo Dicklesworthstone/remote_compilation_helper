@@ -106,14 +106,16 @@ impl ClassificationCache {
             return None;
         }
 
-        let key = Self::normalize_key(command);
+        // Use &str directly for lookup — LruCache supports Borrow<str> on
+        // String keys, avoiding a String allocation on every cache probe.
+        let key = command.trim();
         let mut cache = self.cache.lock().ok()?;
 
         // Check if entry exists and is not expired
-        if let Some(entry) = cache.get(&key) {
+        if let Some(entry) = cache.get(key) {
             if entry.is_expired() {
                 // Remove expired entry
-                cache.pop(&key);
+                cache.pop(key);
                 if let Ok(mut misses) = self.misses.lock() {
                     *misses += 1;
                 }
@@ -141,7 +143,8 @@ impl ClassificationCache {
             return;
         }
 
-        let key = Self::normalize_key(command);
+        // Only put() needs an owned String for the LRU key.
+        let key = command.trim().to_string();
         let entry = CachedClassification {
             classification,
             inserted_at: Instant::now(),
@@ -172,14 +175,6 @@ impl ClassificationCache {
         CacheStats { hits, misses, len }
     }
 
-    /// Normalize the cache key by trimming whitespace.
-    ///
-    /// We intentionally don't normalize env vars or wrappers here because
-    /// the `classify_command` function handles that internally, and we want
-    /// to cache the pre-normalized command for accurate hit rates.
-    fn normalize_key(command: &str) -> String {
-        command.trim().to_string()
-    }
 }
 
 impl Default for ClassificationCache {

@@ -2968,4 +2968,307 @@ mod tests {
             assert!(result.is_compilation, "cargo build sub-command should be detected");
         }
     }
+
+    // =========================================================================
+    // WS2.4: Zero-allocation reject path tests (bd-3mog)
+    //
+    // Verify that the Cow<'static, str> conversion in Classification and
+    // ClassificationTier produces Cow::Borrowed on the reject path (zero heap
+    // allocations) and that serde roundtrips work correctly.
+    // =========================================================================
+
+    /// Helper: assert that a Cow is the Borrowed variant (no heap allocation).
+    fn assert_cow_borrowed(cow: &Cow<'static, str>, context: &str) {
+        assert!(
+            matches!(cow, Cow::Borrowed(_)),
+            "{context}: expected Cow::Borrowed, got Cow::Owned({:?})",
+            cow,
+        );
+    }
+
+    // --- 1. Classification correctness after Cow conversion ---
+
+    #[test]
+    fn test_cow_reject_empty_command_correctness() {
+        let _guard = test_guard!();
+        let result = classify_command("");
+        assert!(!result.is_compilation);
+        assert_eq!(result.confidence, 0.0);
+        assert_eq!(result.kind, None);
+        assert!(result.reason.contains("empty"), "reason: {}", result.reason);
+    }
+
+    #[test]
+    fn test_cow_reject_non_compilation_commands() {
+        let _guard = test_guard!();
+        let non_compilation = ["ls -la", "cat file.txt", "echo hello", "git status", "pwd", "cd /tmp"];
+        for cmd in non_compilation {
+            let result = classify_command(cmd);
+            assert!(
+                !result.is_compilation,
+                "'{cmd}' should NOT be classified as compilation"
+            );
+            assert_eq!(result.confidence, 0.0, "'{cmd}' should have 0.0 confidence");
+            assert_eq!(result.kind, None, "'{cmd}' should have no CompilationKind");
+            assert!(!result.reason.is_empty(), "'{cmd}' should have a reason");
+        }
+    }
+
+    #[test]
+    fn test_cow_accept_compilation_commands() {
+        let _guard = test_guard!();
+        let cases: &[(&str, CompilationKind)] = &[
+            ("cargo build", CompilationKind::CargoBuild),
+            ("cargo test", CompilationKind::CargoTest),
+            ("cargo check", CompilationKind::CargoCheck),
+            ("cargo clippy", CompilationKind::CargoClippy),
+            ("gcc -o hello hello.c", CompilationKind::Gcc),
+            ("make", CompilationKind::Make),
+            ("bun test", CompilationKind::BunTest),
+        ];
+        for &(cmd, expected_kind) in cases {
+            let result = classify_command(cmd);
+            assert!(
+                result.is_compilation,
+                "'{cmd}' should be classified as compilation"
+            );
+            assert_eq!(
+                result.kind,
+                Some(expected_kind),
+                "'{cmd}' should have kind {expected_kind:?}"
+            );
+            assert!(result.confidence > 0.0, "'{cmd}' should have positive confidence");
+            assert!(!result.reason.is_empty(), "'{cmd}' should have a reason");
+        }
+    }
+
+    // --- 2. Zero-allocation verification on reject path ---
+
+    #[test]
+    fn test_cow_borrowed_on_tier0_reject() {
+        let _guard = test_guard!();
+        // Empty command -> Tier 0 instant reject
+        let result = classify_command("");
+        assert_cow_borrowed(&result.reason, "Tier 0 empty command reason");
+    }
+
+    #[test]
+    fn test_cow_borrowed_on_tier1_reject() {
+        let _guard = test_guard!();
+        // Piped command -> Tier 1 structure analysis reject
+        let result = classify_command("cargo build | tee log");
+        assert!(!result.is_compilation);
+        assert_cow_borrowed(&result.reason, "Tier 1 piped command reason");
+
+        // Backgrounded command
+        let result = classify_command("cargo build &");
+        assert!(!result.is_compilation);
+        assert_cow_borrowed(&result.reason, "Tier 1 backgrounded command reason");
+
+        // Output redirected
+        let result = classify_command("cargo build > log.txt");
+        assert!(!result.is_compilation);
+        assert_cow_borrowed(&result.reason, "Tier 1 redirected command reason");
+    }
+
+    #[test]
+    fn test_cow_borrowed_on_tier2_reject() {
+        let _guard = test_guard!();
+        // Commands with no compilation keyword -> Tier 2 keyword filter reject
+        let non_keyword_commands = [
+            "ls -la",
+            "cat file.txt",
+            "echo hello world",
+            "git status",
+            "pwd",
+            "cd /tmp",
+            "grep pattern file",
+            "find . -name '*.rs'",
+            "cp src dst",
+            "rm file.txt",
+        ];
+        for cmd in non_keyword_commands {
+            let result = classify_command(cmd);
+            assert!(!result.is_compilation, "'{cmd}' should be rejected");
+            assert_cow_borrowed(
+                &result.reason,
+                &format!("Tier 2 reject for '{cmd}'"),
+            );
+        }
+    }
+
+    #[test]
+    fn test_cow_owned_on_tier3_reject_is_expected() {
+        let _guard = test_guard!();
+        // Never-intercept commands produce a format!() string -> Cow::Owned is expected
+        let never_intercept = ["cargo fmt", "cargo install ripgrep", "cargo clean"];
+        for cmd in never_intercept {
+            let result = classify_command(cmd);
+            assert!(!result.is_compilation, "'{cmd}' should be rejected");
+            assert!(
+                result.reason.contains("never-intercept"),
+                "'{cmd}' reason should mention never-intercept: {}",
+                result.reason
+            );
+            // Tier 3 uses format!() for the pattern name -> Cow::Owned is expected
+            assert!(
+                matches!(&result.reason, Cow::Owned(_)),
+                "Tier 3 '{cmd}' should produce Cow::Owned (format string)"
+            );
+        }
+    }
+
+    // --- 3. ClassificationDetails tier Cow verification ---
+
+    #[test]
+    fn test_detailed_tiers_use_borrowed_names() {
+        let _guard = test_guard!();
+        // classify_command_detailed produces ClassificationTier entries
+        // All tier names should be Cow::Borrowed (static constants)
+        let details = classify_command_detailed("ls -la");
+        for tier in &details.tiers {
+            assert_cow_borrowed(
+                &tier.name,
+                &format!("Tier {} name", tier.tier),
+            );
+        }
+    }
+
+    #[test]
+    fn test_detailed_tier_reasons_borrowed_on_reject() {
+        let _guard = test_guard!();
+        // Non-compilation commands should have Cow::Borrowed reasons on all tiers
+        let details = classify_command_detailed("ls -la");
+        assert!(!details.classification.is_compilation);
+        for tier in &details.tiers {
+            assert_cow_borrowed(
+                &tier.reason,
+                &format!("Tier {} reason for 'ls -la'", tier.tier),
+            );
+        }
+    }
+
+    #[test]
+    fn test_detailed_compilation_tier_names_borrowed() {
+        let _guard = test_guard!();
+        // Even for compilation commands, tier NAMES should always be Cow::Borrowed
+        let details = classify_command_detailed("cargo build");
+        assert!(details.classification.is_compilation);
+        for tier in &details.tiers {
+            assert_cow_borrowed(
+                &tier.name,
+                &format!("Tier {} name for 'cargo build'", tier.tier),
+            );
+        }
+    }
+
+    // --- 4. Serde roundtrip tests for Cow fields ---
+
+    #[test]
+    fn test_classification_serde_roundtrip_borrowed() {
+        let _guard = test_guard!();
+        let original = Classification::not_compilation("no compilation keyword");
+        assert_cow_borrowed(&original.reason, "before serialize");
+
+        let json = serde_json::to_string(&original).expect("serialize");
+        let deserialized: Classification = serde_json::from_str(&json).expect("deserialize");
+
+        assert_eq!(deserialized.is_compilation, original.is_compilation);
+        assert_eq!(deserialized.confidence, original.confidence);
+        assert_eq!(deserialized.kind, original.kind);
+        assert_eq!(deserialized.reason, original.reason);
+        // Note: after deserialization, Cow will be Owned (serde deserializes into String)
+        // This is correct behavior — only the pre-serialization path needs to be allocation-free
+    }
+
+    #[test]
+    fn test_classification_serde_roundtrip_compilation() {
+        let _guard = test_guard!();
+        let original = Classification::compilation(
+            CompilationKind::CargoBuild,
+            0.95,
+            "cargo build detected",
+        );
+
+        let json = serde_json::to_string(&original).expect("serialize");
+        let deserialized: Classification = serde_json::from_str(&json).expect("deserialize");
+
+        assert_eq!(deserialized.is_compilation, original.is_compilation);
+        assert_eq!(deserialized.confidence, original.confidence);
+        assert_eq!(deserialized.kind, original.kind);
+        assert_eq!(deserialized.reason.as_ref(), original.reason.as_ref());
+    }
+
+    #[test]
+    fn test_classification_tier_serde_roundtrip() {
+        let _guard = test_guard!();
+        let tier = ClassificationTier {
+            tier: 2,
+            name: Cow::Borrowed(TIER_KEYWORD_FILTER),
+            decision: TierDecision::Reject,
+            reason: Cow::Borrowed("no compilation keyword"),
+        };
+        assert_cow_borrowed(&tier.name, "tier name before serialize");
+        assert_cow_borrowed(&tier.reason, "tier reason before serialize");
+
+        let json = serde_json::to_string(&tier).expect("serialize");
+        let deserialized: ClassificationTier =
+            serde_json::from_str(&json).expect("deserialize");
+
+        assert_eq!(deserialized.tier, tier.tier);
+        assert_eq!(deserialized.name.as_ref(), tier.name.as_ref());
+        assert_eq!(deserialized.decision, tier.decision);
+        assert_eq!(deserialized.reason.as_ref(), tier.reason.as_ref());
+    }
+
+    #[test]
+    fn test_classification_details_serde_roundtrip() {
+        let _guard = test_guard!();
+        let details = classify_command_detailed("cargo build");
+        assert!(details.classification.is_compilation);
+
+        let json = serde_json::to_string(&details).expect("serialize");
+        let deserialized: ClassificationDetails =
+            serde_json::from_str(&json).expect("deserialize");
+
+        assert_eq!(deserialized.original, details.original);
+        assert_eq!(deserialized.normalized, details.normalized);
+        assert_eq!(deserialized.tiers.len(), details.tiers.len());
+        assert_eq!(
+            deserialized.classification.is_compilation,
+            details.classification.is_compilation
+        );
+        assert_eq!(
+            deserialized.classification.kind,
+            details.classification.kind
+        );
+    }
+
+    // --- 5. Cow display and comparison tests ---
+
+    #[test]
+    fn test_cow_reason_display() {
+        let _guard = test_guard!();
+        let result = classify_command("ls");
+        // Cow<str> should Display/Debug correctly
+        let displayed = format!("{}", result.reason);
+        assert!(!displayed.is_empty());
+        let debugged = format!("{:?}", result.reason);
+        assert!(!debugged.is_empty());
+    }
+
+    #[test]
+    fn test_cow_reason_comparison() {
+        let _guard = test_guard!();
+        // Cow::Borrowed and Cow::Owned with same content should be equal
+        let borrowed: Cow<'static, str> = Cow::Borrowed("no compilation keyword");
+        let owned: Cow<'static, str> = Cow::Owned("no compilation keyword".to_string());
+        assert_eq!(borrowed, owned);
+
+        // Classification reasons should be comparable
+        let r1 = classify_command("ls");
+        let r2 = classify_command("pwd");
+        // Both should be "no compilation keyword" (Tier 2 reject)
+        assert_eq!(r1.reason, r2.reason);
+    }
 }
