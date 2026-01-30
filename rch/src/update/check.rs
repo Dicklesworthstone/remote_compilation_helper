@@ -185,13 +185,24 @@ async fn fetch_specific_version(
     let target_version = Version::parse(&release.tag_name)?;
     let update_available = target_version != *current;
 
+    // Fetch all releases to compute changelog diff if updating
+    let changelog_diff = if update_available && target_version > *current {
+        // Fetch all releases to get intermediate versions
+        match fetch_releases().await {
+            Ok(releases) => compute_changelog_diff(&releases, current, &target_version),
+            Err(_) => None, // Fall back to no diff if we can't fetch all releases
+        }
+    } else {
+        None
+    };
+
     Ok(UpdateCheck {
         current_version: current.clone(),
         latest_version: target_version,
         update_available,
         release_url: release.html_url.clone(),
         release_notes: release.body.clone(),
-        changelog_diff: None,
+        changelog_diff,
         assets: release.assets.clone(),
     })
 }
@@ -433,5 +444,197 @@ mod tests {
 
         // Beta channel requires prerelease flag
         assert!(filter_by_channel(&releases, Channel::Beta).is_none());
+    }
+
+    #[test]
+    fn test_compute_changelog_diff_collects_intermediate_releases() {
+        let releases = vec![
+            ReleaseInfo {
+                tag_name: "v1.3.0".to_string(),
+                name: "Latest".to_string(),
+                prerelease: false,
+                draft: false,
+                html_url: "".to_string(),
+                body: Some("Added feature C".to_string()),
+                assets: vec![],
+                published_at: None,
+            },
+            ReleaseInfo {
+                tag_name: "v1.2.0".to_string(),
+                name: "Middle".to_string(),
+                prerelease: false,
+                draft: false,
+                html_url: "".to_string(),
+                body: Some("Added feature B".to_string()),
+                assets: vec![],
+                published_at: None,
+            },
+            ReleaseInfo {
+                tag_name: "v1.1.0".to_string(),
+                name: "Old".to_string(),
+                prerelease: false,
+                draft: false,
+                html_url: "".to_string(),
+                body: Some("Added feature A".to_string()),
+                assets: vec![],
+                published_at: None,
+            },
+            ReleaseInfo {
+                tag_name: "v1.0.0".to_string(),
+                name: "Current".to_string(),
+                prerelease: false,
+                draft: false,
+                html_url: "".to_string(),
+                body: Some("Initial release".to_string()),
+                assets: vec![],
+                published_at: None,
+            },
+        ];
+
+        let current = Version::parse("v1.0.0").unwrap();
+        let target = Version::parse("v1.3.0").unwrap();
+
+        let diff = compute_changelog_diff(&releases, &current, &target);
+        assert!(diff.is_some());
+
+        let diff = diff.unwrap();
+        // Should include v1.1.0, v1.2.0, v1.3.0 but not v1.0.0 (current)
+        assert!(diff.contains("v1.1.0"));
+        assert!(diff.contains("v1.2.0"));
+        assert!(diff.contains("v1.3.0"));
+        assert!(diff.contains("feature A"));
+        assert!(diff.contains("feature B"));
+        assert!(diff.contains("feature C"));
+        assert!(!diff.contains("Initial release"));
+    }
+
+    #[test]
+    fn test_compute_changelog_diff_empty_when_no_intermediate() {
+        let releases = vec![
+            ReleaseInfo {
+                tag_name: "v1.1.0".to_string(),
+                name: "Target".to_string(),
+                prerelease: false,
+                draft: false,
+                html_url: "".to_string(),
+                body: None, // No body
+                assets: vec![],
+                published_at: None,
+            },
+            ReleaseInfo {
+                tag_name: "v1.0.0".to_string(),
+                name: "Current".to_string(),
+                prerelease: false,
+                draft: false,
+                html_url: "".to_string(),
+                body: Some("Current release".to_string()),
+                assets: vec![],
+                published_at: None,
+            },
+        ];
+
+        let current = Version::parse("v1.0.0").unwrap();
+        let target = Version::parse("v1.1.0").unwrap();
+
+        // v1.1.0 has no body, so diff should be None
+        let diff = compute_changelog_diff(&releases, &current, &target);
+        assert!(diff.is_none());
+    }
+
+    #[test]
+    fn test_compute_changelog_diff_skips_drafts() {
+        let releases = vec![
+            ReleaseInfo {
+                tag_name: "v1.2.0".to_string(),
+                name: "Target".to_string(),
+                prerelease: false,
+                draft: false,
+                html_url: "".to_string(),
+                body: Some("Target release".to_string()),
+                assets: vec![],
+                published_at: None,
+            },
+            ReleaseInfo {
+                tag_name: "v1.1.0".to_string(),
+                name: "Draft".to_string(),
+                prerelease: false,
+                draft: true, // Draft should be skipped
+                html_url: "".to_string(),
+                body: Some("Draft notes".to_string()),
+                assets: vec![],
+                published_at: None,
+            },
+            ReleaseInfo {
+                tag_name: "v1.0.0".to_string(),
+                name: "Current".to_string(),
+                prerelease: false,
+                draft: false,
+                html_url: "".to_string(),
+                body: Some("Current release".to_string()),
+                assets: vec![],
+                published_at: None,
+            },
+        ];
+
+        let current = Version::parse("v1.0.0").unwrap();
+        let target = Version::parse("v1.2.0").unwrap();
+
+        let diff = compute_changelog_diff(&releases, &current, &target);
+        assert!(diff.is_some());
+
+        let diff = diff.unwrap();
+        // Should include v1.2.0 but not v1.1.0 (draft)
+        assert!(diff.contains("v1.2.0"));
+        assert!(diff.contains("Target release"));
+        assert!(!diff.contains("Draft notes"));
+    }
+
+    #[test]
+    fn test_compute_changelog_diff_chronological_order() {
+        let releases = vec![
+            ReleaseInfo {
+                tag_name: "v1.3.0".to_string(),
+                name: "Latest".to_string(),
+                prerelease: false,
+                draft: false,
+                html_url: "".to_string(),
+                body: Some("Third".to_string()),
+                assets: vec![],
+                published_at: None,
+            },
+            ReleaseInfo {
+                tag_name: "v1.2.0".to_string(),
+                name: "Middle".to_string(),
+                prerelease: false,
+                draft: false,
+                html_url: "".to_string(),
+                body: Some("Second".to_string()),
+                assets: vec![],
+                published_at: None,
+            },
+            ReleaseInfo {
+                tag_name: "v1.1.0".to_string(),
+                name: "First".to_string(),
+                prerelease: false,
+                draft: false,
+                html_url: "".to_string(),
+                body: Some("First".to_string()),
+                assets: vec![],
+                published_at: None,
+            },
+        ];
+
+        let current = Version::parse("v1.0.0").unwrap();
+        let target = Version::parse("v1.3.0").unwrap();
+
+        let diff = compute_changelog_diff(&releases, &current, &target).unwrap();
+
+        // Should be in chronological order (oldest first)
+        let first_pos = diff.find("v1.1.0").unwrap();
+        let second_pos = diff.find("v1.2.0").unwrap();
+        let third_pos = diff.find("v1.3.0").unwrap();
+
+        assert!(first_pos < second_pos);
+        assert!(second_pos < third_pos);
     }
 }

@@ -154,9 +154,17 @@ fn display_update_check(ctx: &OutputContext, info: &UpdateCheck, show_changelog:
         );
         println!("Release URL: {}", info.release_url);
 
-        if show_changelog && let Some(ref notes) = info.release_notes {
-            println!("\nRelease notes:\n{}", notes);
+        if show_changelog {
+            // Prefer changelog_diff (aggregated changes from all intermediate releases)
+            // Fall back to release_notes (just the latest release) if diff isn't available
+            if let Some(ref diff) = info.changelog_diff {
+                println!("\nChanges since {}:\n{}", info.current_version, diff);
+            } else if let Some(ref notes) = info.release_notes {
+                println!("\nRelease notes:\n{}", notes);
+            }
         }
+
+        println!("\nRun 'rch update' to update.");
     } else {
         println!("Already up to date ({})", info.current_version);
     }
