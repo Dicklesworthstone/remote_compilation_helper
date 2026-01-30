@@ -322,6 +322,15 @@ cleanup_lock() {
     rm -f "$LOCK_FILE"
 }
 
+# Cleanup helper for clone directory (called from trap)
+cleanup_clone_dir() {
+    local dir="$1"
+    if [[ -n "$dir" ]] && [[ -d "$dir" ]]; then
+        # Safe recursive removal of temp clone directory
+        find "$dir" -delete 2>/dev/null || true
+    fi
+}
+
 # ============================================================================
 # Platform Detection
 # ============================================================================
@@ -580,6 +589,76 @@ download_binaries() {
     # Return 1 to signal failure - caller handles fallback to source build
     warn "Binary downloads not yet available."
     return 1
+}
+
+
+# Clone repository and build from source (for curl|bash installs when no binaries available)
+clone_and_build() {
+    info "No local source found. Cloning repository and building from source..."
+    
+    # Check for git
+    if ! command_exists git; then
+        die "git is required to clone the repository. Please install git first."
+    fi
+    
+    # Create temp directory for clone
+    local clone_dir
+    clone_dir=$(mktemp -d)
+    
+    # Set trap to clean up clone directory on exit (uses same pattern as install_from_tarball)
+    trap 'cleanup_clone_dir "$clone_dir"; cleanup_lock' EXIT
+    
+    # Clone the repository
+    if $USE_GUM; then
+        spin "Cloning repository..." git clone --depth 1 "$REPO_URL" "$clone_dir"
+    else
+        info "Cloning repository from $REPO_URL..."
+        git clone --depth 1 "$REPO_URL" "$clone_dir"
+    fi
+    
+    if [[ ! -f "$clone_dir/Cargo.toml" ]]; then
+        die "Clone failed or repository structure unexpected"
+    fi
+    
+    # Change to clone directory and build
+    cd "$clone_dir"
+    
+    # Build release binaries
+    if $USE_GUM; then
+        spin "Building release binaries..." cargo build --release
+    else
+        info "Building release binaries (this may take a while)..."
+        cargo build --release
+    fi
+    
+    # Copy binaries from the cloned repo's target directory
+    local target_dir="$clone_dir/target/release"
+    
+    if [[ "$MODE" == "worker" ]]; then
+        if [[ -f "$target_dir/$WORKER_BIN" ]]; then
+            cp "$target_dir/$WORKER_BIN" "$INSTALL_DIR/"
+            chmod +x "$INSTALL_DIR/$WORKER_BIN"
+            success "Installed $WORKER_BIN"
+        else
+            die "Worker binary not found: $target_dir/$WORKER_BIN"
+        fi
+    else
+        # Local mode: install hook and daemon
+        for binary in "$HOOK_BIN" "$DAEMON_BIN"; do
+            if [[ -f "$target_dir/$binary" ]]; then
+                cp "$target_dir/$binary" "$INSTALL_DIR/"
+                chmod +x "$INSTALL_DIR/$binary"
+                success "Installed $binary"
+            else
+                die "Binary not found: $target_dir/$binary"
+            fi
+        done
+    fi
+    
+    success "Build from cloned repository complete"
+    
+    # Reset trap to just lock cleanup
+    trap 'cleanup_lock' EXIT
 }
 
 # ============================================================================
@@ -942,7 +1021,11 @@ install_binaries() {
             FROM_SOURCE=true
             build_from_source
         else
-            download_binaries
+            # Try binary download first, fallback to clone and build from source
+            if ! download_binaries; then
+                info "Falling back to building from source..."
+                clone_and_build
+            fi
         fi
     fi
 }
