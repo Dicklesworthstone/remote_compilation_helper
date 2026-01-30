@@ -8,11 +8,15 @@ use crate::fleet::plan::{DeploymentPlan, DeploymentStatus, DeploymentStrategy};
 use crate::fleet::progress::{DeployPhase, FleetProgress};
 use crate::ui::context::OutputContext;
 use crate::ui::theme::StatusIndicator;
-use anyhow::Result;
-use rch_common::WorkerId;
+use anyhow::{bail, Context, Result};
+use rch_common::{WorkerConfig, WorkerId};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tokio::process::Command;
 use tokio::sync::Mutex;
+use tracing::debug;
 
 /// Result of a fleet deployment operation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,14 +38,36 @@ pub enum FleetResult {
 pub struct FleetExecutor {
     parallelism: usize,
     audit: Option<Arc<Mutex<AuditLogger>>>,
+    /// Worker configurations indexed by worker ID.
+    worker_configs: Arc<HashMap<String, WorkerConfig>>,
+    /// Path to the local binary to deploy.
+    local_binary: PathBuf,
 }
 
 impl FleetExecutor {
     /// Create a new fleet executor.
-    pub fn new(parallelism: usize, audit: Option<AuditLogger>) -> Result<Self> {
+    ///
+    /// # Arguments
+    /// * `parallelism` - Maximum number of concurrent deployments
+    /// * `audit` - Optional audit logger for deployment events
+    /// * `workers` - Worker configurations to deploy to
+    /// * `local_binary` - Path to the local rch-wkr binary to deploy
+    pub fn new(
+        parallelism: usize,
+        audit: Option<AuditLogger>,
+        workers: &[&WorkerConfig],
+        local_binary: PathBuf,
+    ) -> Result<Self> {
+        let worker_configs: HashMap<String, WorkerConfig> = workers
+            .iter()
+            .map(|w| (w.id.0.clone(), (*w).clone()))
+            .collect();
+
         Ok(Self {
             parallelism,
             audit: audit.map(|a| Arc::new(Mutex::new(a))),
+            worker_configs: Arc::new(worker_configs),
+            local_binary,
         })
     }
 
@@ -141,6 +167,7 @@ impl FleetExecutor {
                 let canary_failed = canary_results.iter().filter(|(_, s)| !s).count();
 
                 if canary_failed > 0 {
+                    progress.finish();
                     return Ok(FleetResult::CanaryFailed {
                         reason: format!("{} canary worker(s) failed", canary_failed),
                     });
@@ -157,6 +184,20 @@ impl FleetExecutor {
                 // Wait before promoting
                 tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
 
+                // Count canary results
+                for (idx, success) in &canary_results {
+                    if *success {
+                        if plan.workers[*idx].status == DeploymentStatus::Skipped {
+                            skipped += 1;
+                        } else {
+                            deployed += 1;
+                        }
+                    } else {
+                        failed += 1;
+                    }
+                }
+
+                // Deploy to remaining workers if auto_promote is enabled
                 if auto_promote && canary_count < worker_count {
                     if !ctx.is_json() {
                         println!("  {} Deploying to remaining workers...", style.muted("→"));
@@ -171,10 +212,7 @@ impl FleetExecutor {
                         )
                         .await?;
 
-                    for (idx, success) in canary_results
-                        .into_iter()
-                        .chain(remaining_results.into_iter())
-                    {
+                    for (idx, success) in remaining_results {
                         if success {
                             if plan.workers[idx].status == DeploymentStatus::Skipped {
                                 skipped += 1;
@@ -261,7 +299,9 @@ impl FleetExecutor {
     ) -> Result<Vec<(usize, bool)>> {
         use tokio::sync::Semaphore;
 
-        let semaphore = Arc::new(Semaphore::new(parallelism));
+        // Ensure parallelism is at least 1 to avoid deadlock
+        let effective_parallelism = parallelism.max(1);
+        let semaphore = Arc::new(Semaphore::new(effective_parallelism));
         let mut handles = Vec::new();
         let style = ctx.theme();
         let is_json = ctx.is_json();
@@ -273,9 +313,22 @@ impl FleetExecutor {
             let current_version = plan.workers[idx].current_version.clone();
             let force = plan.options.force;
             let progress = progress.clone();
+            let worker_configs = self.worker_configs.clone();
+            let local_binary = self.local_binary.clone();
 
             let handle = tokio::spawn(async move {
                 let _permit = permit;
+
+                // Get worker config
+                let worker_config = match worker_configs.get(&worker_id) {
+                    Some(cfg) => cfg.clone(),
+                    None => {
+                        progress
+                            .worker_failed(&worker_id, "worker config not found")
+                            .await;
+                        return (idx, worker_id, false, DeploymentStatus::Failed);
+                    }
+                };
 
                 // Check if we need to deploy
                 if !force && current_version.as_ref() == Some(&target_version) {
@@ -285,28 +338,63 @@ impl FleetExecutor {
                     return (idx, worker_id, true, DeploymentStatus::Skipped);
                 }
 
-                // Connecting phase
+                // Connecting phase - test SSH connectivity
                 progress
                     .set_phase(&worker_id, DeployPhase::Connecting)
                     .await;
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-                // Upload phase
+                if let Err(e) = test_ssh_connectivity(&worker_config).await {
+                    progress
+                        .worker_failed(&worker_id, &format!("SSH failed: {}", e))
+                        .await;
+                    return (idx, worker_id, false, DeploymentStatus::Failed);
+                }
+
+                // Upload phase - create remote directory and copy binary
                 progress.set_phase(&worker_id, DeployPhase::Uploading).await;
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-                // Install phase
+                if let Err(e) = create_remote_directory(&worker_config).await {
+                    progress
+                        .worker_failed(&worker_id, &format!("mkdir failed: {}", e))
+                        .await;
+                    return (idx, worker_id, false, DeploymentStatus::Failed);
+                }
+
+                if let Err(e) = copy_binary_via_scp(&worker_config, &local_binary).await {
+                    progress
+                        .worker_failed(&worker_id, &format!("scp failed: {}", e))
+                        .await;
+                    return (idx, worker_id, false, DeploymentStatus::Failed);
+                }
+
+                // Install phase - set permissions
                 progress
                     .set_phase(&worker_id, DeployPhase::Installing)
                     .await;
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-                // Verify phase
+                if let Err(e) = set_executable_permissions(&worker_config).await {
+                    progress
+                        .worker_failed(&worker_id, &format!("chmod failed: {}", e))
+                        .await;
+                    return (idx, worker_id, false, DeploymentStatus::Failed);
+                }
+
+                // Verify phase - run health check
                 progress.set_phase(&worker_id, DeployPhase::Verifying).await;
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+                if let Err(e) = verify_installation(&worker_config).await {
+                    progress
+                        .worker_failed(&worker_id, &format!("verify failed: {}", e))
+                        .await;
+                    return (idx, worker_id, false, DeploymentStatus::Failed);
+                }
 
                 // Complete
                 progress.worker_complete(&worker_id, &target_version).await;
+                debug!(
+                    "Successfully deployed {} to worker {}",
+                    target_version, worker_id
+                );
                 (idx, worker_id, true, DeploymentStatus::Completed)
             });
 
@@ -315,26 +403,145 @@ impl FleetExecutor {
 
         let mut results = Vec::new();
         for handle in handles {
-            let (idx, worker_id, success, status) = handle.await?;
+            let (idx, _worker_id, success, status) = handle.await?;
             plan.workers[idx].status = status;
-
-            // In JSON mode, also print status (progress bars are hidden)
-            if is_json {
-                let status_str = match status {
-                    DeploymentStatus::Completed => "deployed",
-                    DeploymentStatus::Skipped => "skipped",
-                    DeploymentStatus::Failed => "failed",
-                    _ => "unknown",
-                };
-                // Progress bars handle display in non-JSON mode
-                let _ = (style, worker_id, status_str); // suppress unused warnings
-            }
-
             results.push((idx, success));
         }
 
+        // Suppress unused variable warnings (style is used for JSON mode output in caller)
+        let _ = (style, is_json);
+
         Ok(results)
     }
+}
+
+// =============================================================================
+// SSH/SCP deployment helper functions
+// =============================================================================
+
+/// Test SSH connectivity to a worker.
+async fn test_ssh_connectivity(worker: &WorkerConfig) -> Result<()> {
+    let mut cmd = Command::new("ssh");
+    cmd.arg("-o").arg("BatchMode=yes");
+    cmd.arg("-o").arg("ConnectTimeout=10");
+    cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
+    cmd.arg("-i").arg(&worker.identity_file);
+    cmd.arg(format!("{}@{}", worker.user, worker.host));
+    cmd.arg("true");
+
+    let output = cmd.output().await.context("Failed to execute SSH")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("SSH connection failed: {}", stderr.trim());
+    }
+
+    Ok(())
+}
+
+/// Create the remote directory for rch-wkr binary.
+async fn create_remote_directory(worker: &WorkerConfig) -> Result<()> {
+    let target = format!("{}@{}", worker.user, worker.host);
+    let remote_dir = ".local/bin";
+
+    let mut cmd = Command::new("ssh");
+    cmd.arg("-o").arg("BatchMode=yes");
+    cmd.arg("-o").arg("ConnectTimeout=10");
+    cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
+    cmd.arg("-i").arg(&worker.identity_file);
+    cmd.arg(&target);
+    cmd.arg(format!("mkdir -p ~/{}", remote_dir));
+
+    let output = cmd
+        .output()
+        .await
+        .context("Failed to create remote directory")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("mkdir failed: {}", stderr.trim());
+    }
+
+    Ok(())
+}
+
+/// Copy the binary to the worker via SCP.
+async fn copy_binary_via_scp(worker: &WorkerConfig, local_binary: &Path) -> Result<()> {
+    let target = format!("{}@{}", worker.user, worker.host);
+    let remote_path = "~/.local/bin/rch-wkr";
+
+    let mut cmd = Command::new("scp");
+    cmd.arg("-o").arg("BatchMode=yes");
+    cmd.arg("-o").arg("ConnectTimeout=30");
+    cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
+    cmd.arg("-i").arg(&worker.identity_file);
+    cmd.arg(local_binary);
+    cmd.arg(format!("{}:{}", target, remote_path));
+
+    debug!(
+        "SCP: {} -> {}:{}",
+        local_binary.display(),
+        target,
+        remote_path
+    );
+
+    let output = cmd.output().await.context("Failed to execute SCP")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("scp failed: {}", stderr.trim());
+    }
+
+    Ok(())
+}
+
+/// Set executable permissions on the remote binary.
+async fn set_executable_permissions(worker: &WorkerConfig) -> Result<()> {
+    let target = format!("{}@{}", worker.user, worker.host);
+    let remote_path = "~/.local/bin/rch-wkr";
+
+    let mut cmd = Command::new("ssh");
+    cmd.arg("-o").arg("BatchMode=yes");
+    cmd.arg("-o").arg("ConnectTimeout=10");
+    cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
+    cmd.arg("-i").arg(&worker.identity_file);
+    cmd.arg(&target);
+    cmd.arg(format!("chmod +x {}", remote_path));
+
+    let output = cmd.output().await.context("Failed to chmod binary")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("chmod failed: {}", stderr.trim());
+    }
+
+    Ok(())
+}
+
+/// Verify the installation by running health check.
+async fn verify_installation(worker: &WorkerConfig) -> Result<()> {
+    let target = format!("{}@{}", worker.user, worker.host);
+    let remote_path = "~/.local/bin/rch-wkr";
+
+    let mut cmd = Command::new("ssh");
+    cmd.arg("-o").arg("BatchMode=yes");
+    cmd.arg("-o").arg("ConnectTimeout=10");
+    cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
+    cmd.arg("-i").arg(&worker.identity_file);
+    cmd.arg(&target);
+    cmd.arg(format!("{} health", remote_path));
+
+    let output = cmd
+        .output()
+        .await
+        .context("Failed to verify installation")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("health check failed: {}", stderr.trim());
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -419,9 +626,26 @@ mod tests {
     // FleetExecutor tests
     // ========================
 
+    fn test_worker_config() -> WorkerConfig {
+        WorkerConfig {
+            id: WorkerId("test-worker".to_string()),
+            host: "localhost".to_string(),
+            user: "test".to_string(),
+            identity_file: "/tmp/test_key".to_string(),
+            total_slots: 4,
+            priority: 1,
+            tags: vec![],
+        }
+    }
+
+    fn test_binary_path() -> PathBuf {
+        PathBuf::from("/tmp/rch-wkr")
+    }
+
     #[test]
     fn fleet_executor_new_without_audit() {
-        let executor = FleetExecutor::new(4, None);
+        let worker = test_worker_config();
+        let executor = FleetExecutor::new(4, None, &[&worker], test_binary_path());
         assert!(executor.is_ok());
         let executor = executor.unwrap();
         assert_eq!(executor.parallelism, 4);
@@ -429,14 +653,31 @@ mod tests {
 
     #[test]
     fn fleet_executor_new_with_parallelism_one() {
-        let executor = FleetExecutor::new(1, None).unwrap();
+        let worker = test_worker_config();
+        let executor = FleetExecutor::new(1, None, &[&worker], test_binary_path()).unwrap();
         assert_eq!(executor.parallelism, 1);
     }
 
     #[test]
     fn fleet_executor_new_with_high_parallelism() {
-        let executor = FleetExecutor::new(100, None).unwrap();
+        let worker = test_worker_config();
+        let executor = FleetExecutor::new(100, None, &[&worker], test_binary_path()).unwrap();
         assert_eq!(executor.parallelism, 100);
+    }
+
+    #[test]
+    fn fleet_executor_stores_worker_configs() {
+        let worker = test_worker_config();
+        let executor = FleetExecutor::new(4, None, &[&worker], test_binary_path()).unwrap();
+        assert!(executor.worker_configs.contains_key("test-worker"));
+    }
+
+    #[test]
+    fn fleet_executor_stores_binary_path() {
+        let worker = test_worker_config();
+        let binary_path = PathBuf::from("/custom/path/rch-wkr");
+        let executor = FleetExecutor::new(4, None, &[&worker], binary_path.clone()).unwrap();
+        assert_eq!(executor.local_binary, binary_path);
     }
 
     // ========================
@@ -565,14 +806,37 @@ mod tests {
     #[test]
     fn fleet_executor_parallelism_zero() {
         // Zero parallelism should still construct (validation happens at execute time)
-        let executor = FleetExecutor::new(0, None);
+        let worker = test_worker_config();
+        let executor = FleetExecutor::new(0, None, &[&worker], test_binary_path());
         assert!(executor.is_ok());
         assert_eq!(executor.unwrap().parallelism, 0);
     }
 
     #[test]
     fn fleet_executor_very_large_parallelism() {
-        let executor = FleetExecutor::new(usize::MAX, None).unwrap();
+        let worker = test_worker_config();
+        let executor =
+            FleetExecutor::new(usize::MAX, None, &[&worker], test_binary_path()).unwrap();
         assert_eq!(executor.parallelism, usize::MAX);
+    }
+
+    #[test]
+    fn fleet_executor_empty_workers() {
+        let executor = FleetExecutor::new(4, None, &[], test_binary_path()).unwrap();
+        assert!(executor.worker_configs.is_empty());
+    }
+
+    #[test]
+    fn fleet_executor_multiple_workers() {
+        let mut worker1 = test_worker_config();
+        worker1.id = WorkerId("worker-1".to_string());
+        let mut worker2 = test_worker_config();
+        worker2.id = WorkerId("worker-2".to_string());
+
+        let executor =
+            FleetExecutor::new(4, None, &[&worker1, &worker2], test_binary_path()).unwrap();
+        assert_eq!(executor.worker_configs.len(), 2);
+        assert!(executor.worker_configs.contains_key("worker-1"));
+        assert!(executor.worker_configs.contains_key("worker-2"));
     }
 }

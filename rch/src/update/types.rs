@@ -26,6 +26,9 @@ pub enum UpdateError {
     #[error("Checksum verification failed: expected {expected}, got {actual}")]
     ChecksumMismatch { expected: String, actual: String },
 
+    #[error("Checksum file missing for release asset: {asset}. Use --skip-verify to override.")]
+    ChecksumMissing { asset: String },
+
     #[error("Installation failed: {0}")]
     InstallFailed(String),
 

@@ -96,7 +96,7 @@ pub async fn download_release(
         (verification.checksum_valid, verification.signature_valid)
     } else {
         if !ctx.is_json() {
-            println!("Warning: No checksum file available, skipping verification");
+            println!("Warning: No checksum file available for this release asset");
         }
         (false, None)
     };

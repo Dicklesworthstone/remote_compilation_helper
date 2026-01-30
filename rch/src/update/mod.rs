@@ -22,6 +22,7 @@ pub use types::{Channel, UpdateCheck};
 use crate::commands;
 use crate::ui::OutputContext;
 use anyhow::Result;
+use types::UpdateError;
 
 /// Main entry point for the update command.
 #[allow(clippy::too_many_arguments)]
@@ -35,6 +36,7 @@ pub async fn run_update(
     verify_only: bool,
     dry_run: bool,
     yes: bool,
+    skip_verify: bool,
     no_restart: bool,
     drain_timeout: u64,
     show_changelog: bool,
@@ -100,6 +102,25 @@ pub async fn run_update(
     // Download and verify
     let download = download_release(ctx, &update_info).await?;
 
+    if !download.checksum_verified {
+        let asset = download
+            .archive_path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+
+        if skip_verify {
+            if !ctx.is_json() {
+                println!(
+                    "Warning: proceeding without checksum verification for {} (--skip-verify)",
+                    asset
+                );
+            }
+        } else {
+            return Err(UpdateError::ChecksumMissing { asset }.into());
+        }
+    }
+
     // Install
     let result = install_update(ctx, &download, !no_restart, drain_timeout).await?;
 
@@ -159,7 +180,7 @@ async fn verify_installation(ctx: &OutputContext) -> Result<()> {
         }
     }
 
-    // TODO: Verify checksums against known good values if available
+    // Note: checksum verification is enforced during update downloads.
 
     if !ctx.is_json() {
         println!("Installation verified.");

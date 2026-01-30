@@ -15,7 +15,7 @@ mod rollback;
 use crate::commands::load_workers_from_config;
 use crate::ui::context::OutputContext;
 use crate::ui::theme::StatusIndicator;
-use anyhow::Result;
+use anyhow::{bail, Result};
 use rch_common::{ApiError, ApiResponse, ErrorCode};
 use std::path::PathBuf;
 
@@ -167,8 +167,20 @@ pub async fn deploy(
         None
     };
 
+    // Find local rch-wkr binary to deploy
+    let local_binary = find_local_binary("rch-wkr")?;
+
+    if !ctx.is_json() {
+        println!(
+            "  {} Binary: {}",
+            style.muted("→"),
+            style.value(&local_binary.display().to_string())
+        );
+        println!();
+    }
+
     // Execute deployment
-    let executor = FleetExecutor::new(parallel, audit_logger)?;
+    let executor = FleetExecutor::new(parallel, audit_logger, &target_workers, local_binary)?;
     let result = executor.execute(plan, ctx).await?;
 
     // Output results
@@ -649,6 +661,37 @@ pub async fn history(ctx: &OutputContext, limit: usize, worker: Option<String>) 
     }
 
     Ok(())
+}
+
+/// Find a local binary in common locations.
+fn find_local_binary(name: &str) -> Result<PathBuf> {
+    let locations = [
+        // Target directory (development)
+        std::env::current_dir()
+            .ok()
+            .map(|p| p.join("target/release").join(name)),
+        std::env::current_dir()
+            .ok()
+            .map(|p| p.join("target/debug").join(name)),
+        // Cargo install location
+        dirs::home_dir().map(|h| h.join(".cargo/bin").join(name)),
+        // User local bin
+        dirs::home_dir().map(|h| h.join(".local/bin").join(name)),
+        // System paths
+        Some(PathBuf::from("/usr/local/bin").join(name)),
+        Some(PathBuf::from("/usr/bin").join(name)),
+    ];
+
+    for loc in locations.into_iter().flatten() {
+        if loc.exists() && loc.is_file() {
+            return Ok(loc);
+        }
+    }
+
+    bail!(
+        "Could not find {} binary. Build with 'cargo build --release -p rch-wkr'",
+        name
+    )
 }
 
 #[cfg(test)]

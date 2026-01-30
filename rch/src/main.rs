@@ -490,7 +490,8 @@ CHECKS PERFORMED:
     rch update --fleet          # Update all workers too
     rch update --dry-run        # Preview what would happen
     rch update --rollback       # Restore previous version
-    rch update --verify         # Check installation integrity"#)]
+    rch update --verify         # Check installation integrity
+    rch update --skip-verify    # Skip checksum verification (dangerous)"#)]
     Update {
         /// Check for updates without installing
         #[arg(long)]
@@ -515,6 +516,10 @@ CHECKS PERFORMED:
         /// Verify current installation integrity
         #[arg(long)]
         verify: bool,
+
+        /// Skip checksum verification (dangerous, not recommended)
+        #[arg(long)]
+        skip_verify: bool,
 
         /// Skip confirmation prompts
         #[arg(long, short = 'y')]
@@ -1377,6 +1382,7 @@ async fn main() -> Result<()> {
                 fleet,
                 rollback,
                 verify,
+                skip_verify,
                 yes,
                 dry_run,
                 no_restart,
@@ -1393,6 +1399,7 @@ async fn main() -> Result<()> {
                     verify,
                     yes,
                     dry_run,
+                    skip_verify,
                     no_restart,
                     drain_timeout,
                     show_changelog,
@@ -2160,6 +2167,7 @@ async fn handle_update(
     verify_only: bool,
     yes: bool,
     dry_run: bool,
+    skip_verify: bool,
     no_restart: bool,
     drain_timeout: u64,
     show_changelog: bool,
@@ -2178,6 +2186,7 @@ async fn handle_update(
         verify_only,
         dry_run,
         yes,
+        skip_verify,
         no_restart,
         drain_timeout,
         show_changelog,
@@ -3307,6 +3316,18 @@ mod tests {
         match cli.command {
             Some(Commands::Update { fleet, .. }) => {
                 assert!(fleet);
+            }
+            _ => panic!("Expected update command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_update_skip_verify() {
+        let _guard = test_guard!();
+        let cli = Cli::try_parse_from(["rch", "update", "--skip-verify"]).unwrap();
+        match cli.command {
+            Some(Commands::Update { skip_verify, .. }) => {
+                assert!(skip_verify);
             }
             _ => panic!("Expected update command"),
         }

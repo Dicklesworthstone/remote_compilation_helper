@@ -16,7 +16,6 @@ pub use types::*;
 
 // Re-export commonly used helpers
 use helpers::{humanize_duration, indent_lines, urlencoding_encode};
-
 use crate::error::{ConfigError, DaemonError, SshError};
 use crate::status_types::{
     ActiveBuildFromApi, DaemonFullStatusResponse, SelfTestHistoryResponse, SelfTestRunResponse,
@@ -3367,7 +3366,7 @@ pub fn daemon_status(ctx: &OutputContext) -> Result<()> {
             "daemon status",
             DaemonStatusResponse {
                 running,
-                socket_path: default_socket_path(),
+                socket_path: socket_path_str.clone(),
                 uptime_seconds,
             },
         ));
@@ -3388,7 +3387,7 @@ pub fn daemon_status(ctx: &OutputContext) -> Result<()> {
             "  {} {} {}",
             style.key("Socket"),
             style.muted(":"),
-            style.value(&default_socket_path())
+            style.value(&socket_path_str)
         );
 
         if let Some(secs) = uptime_seconds {
@@ -3413,7 +3412,7 @@ pub fn daemon_status(ctx: &OutputContext) -> Result<()> {
             "  {} {} {} {}",
             style.key("Socket"),
             style.muted(":"),
-            style.muted(&default_socket_path()),
+            style.muted(&socket_path_str),
             style.muted("(not found)")
         );
         println!();
@@ -3442,7 +3441,7 @@ pub async fn daemon_start(ctx: &OutputContext) -> Result<()> {
                 DaemonActionResponse {
                     action: "start".to_string(),
                     success: false,
-                    socket_path: default_socket_path(),
+                    socket_path: socket_path_str.clone(),
                     message: Some("Daemon already running".to_string()),
                 },
             ));
@@ -3455,7 +3454,7 @@ pub async fn daemon_start(ctx: &OutputContext) -> Result<()> {
                 "  {} {} {}",
                 style.key("Socket"),
                 style.muted(":"),
-                style.value(&default_socket_path())
+                style.value(&socket_path_str)
             );
             println!(
                 "\n{} Use {} to restart it.",
@@ -3495,7 +3494,7 @@ pub async fn daemon_start(ctx: &OutputContext) -> Result<()> {
                         DaemonActionResponse {
                             action: "start".to_string(),
                             success: true,
-                            socket_path: default_socket_path(),
+                            socket_path: socket_path_str.clone(),
                             message: Some("Daemon started successfully".to_string()),
                         },
                     ));
@@ -3508,7 +3507,7 @@ pub async fn daemon_start(ctx: &OutputContext) -> Result<()> {
                         "  {} {} {}",
                         style.key("Socket"),
                         style.muted(":"),
-                        style.value(&default_socket_path())
+                        style.value(&socket_path_str)
                     );
                 }
             } else if ctx.is_json() {
@@ -3517,7 +3516,7 @@ pub async fn daemon_start(ctx: &OutputContext) -> Result<()> {
                     DaemonActionResponse {
                         action: "start".to_string(),
                         success: false,
-                        socket_path: default_socket_path(),
+                        socket_path: socket_path_str.clone(),
                         message: Some("Process started but socket not found".to_string()),
                     },
                 ));
@@ -3574,7 +3573,7 @@ pub async fn daemon_stop(skip_confirm: bool, ctx: &OutputContext) -> Result<()> 
                 DaemonActionResponse {
                     action: "stop".to_string(),
                     success: true,
-                    socket_path: default_socket_path(),
+                    socket_path: socket_path_str.clone(),
                     message: Some("Daemon was not running".to_string()),
                 },
             ));
@@ -3631,7 +3630,7 @@ pub async fn daemon_stop(skip_confirm: bool, ctx: &OutputContext) -> Result<()> 
                             DaemonActionResponse {
                                 action: "stop".to_string(),
                                 success: true,
-                                socket_path: default_socket_path(),
+                                socket_path: socket_path_str.clone(),
                                 message: Some("Daemon stopped".to_string()),
                             },
                         ));
@@ -3650,7 +3649,7 @@ pub async fn daemon_stop(skip_confirm: bool, ctx: &OutputContext) -> Result<()> 
                     DaemonActionResponse {
                         action: "stop".to_string(),
                         success: false,
-                        socket_path: default_socket_path(),
+                        socket_path: socket_path_str.clone(),
                         message: Some("Daemon may still be shutting down".to_string()),
                     },
                 ));
@@ -3688,7 +3687,7 @@ pub async fn daemon_stop(skip_confirm: bool, ctx: &OutputContext) -> Result<()> 
                             DaemonActionResponse {
                                 action: "stop".to_string(),
                                 success: true,
-                                socket_path: default_socket_path(),
+                                socket_path: socket_path_str.clone(),
                                 message: Some("Daemon stopped via pkill".to_string()),
                             },
                         ));
@@ -8785,15 +8784,165 @@ pub fn agents_status(agent: Option<String>, ctx: &OutputContext) -> Result<()> {
     agents_list(false, ctx)
 }
 
-// Stub for agents_install_hook
-pub fn agents_install_hook(_agent: &str, _dry_run: bool, _ctx: &OutputContext) -> Result<()> {
-    // Implementation placeholder
+/// Install the RCH hook for a specified AI coding agent.
+pub fn agents_install_hook(agent: &str, dry_run: bool, ctx: &OutputContext) -> Result<()> {
+    use crate::agent::{AgentKind, install_hook};
+    use crate::state::primitives::IdempotentResult;
+
+    let style = ctx.theme();
+
+    // Parse the agent name
+    let kind = AgentKind::from_id(agent).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Unknown agent '{}'. Supported agents: {}",
+            agent,
+            AgentKind::ALL
+                .iter()
+                .map(|k| k.id())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })?;
+
+    if !ctx.is_json() {
+        if dry_run {
+            println!("Dry run: checking hook installation for {}...", kind.name());
+        } else {
+            println!("Installing RCH hook for {}...", kind.name());
+        }
+    }
+
+    let result = install_hook(kind, dry_run)?;
+
+    if ctx.is_json() {
+        let _ = ctx.json(&serde_json::json!({
+            "agent": kind.id(),
+            "action": "install",
+            "result": format!("{:?}", result),
+            "dry_run": dry_run
+        }));
+    } else {
+        match result {
+            IdempotentResult::Changed => {
+                println!(
+                    "{} RCH hook installed for {}",
+                    StatusIndicator::Success.display(style),
+                    kind.name()
+                );
+            }
+            IdempotentResult::Unchanged => {
+                println!(
+                    "{} RCH hook already installed for {}",
+                    StatusIndicator::Success.display(style),
+                    kind.name()
+                );
+            }
+            IdempotentResult::WouldChange(msg) => {
+                println!(
+                    "{} {}",
+                    StatusIndicator::Info.display(style),
+                    msg
+                );
+            }
+            IdempotentResult::NotApplicable(msg) => {
+                println!(
+                    "{} {}",
+                    StatusIndicator::Warning.display(style),
+                    msg
+                );
+            }
+            // Other variants (Created, AlreadyExists, Updated, DryRun) not returned by hook install
+            other => {
+                println!(
+                    "{} Hook installation result: {:?}",
+                    StatusIndicator::Info.display(style),
+                    other
+                );
+            }
+        }
+    }
+
     Ok(())
 }
 
-// Stub for agents_uninstall_hook
-pub fn agents_uninstall_hook(_agent: &str, _dry_run: bool, _ctx: &OutputContext) -> Result<()> {
-    // Implementation placeholder
+/// Uninstall the RCH hook from a specified AI coding agent.
+pub fn agents_uninstall_hook(agent: &str, dry_run: bool, ctx: &OutputContext) -> Result<()> {
+    use crate::agent::{AgentKind, uninstall_hook};
+    use crate::state::primitives::IdempotentResult;
+
+    let style = ctx.theme();
+
+    // Parse the agent name
+    let kind = AgentKind::from_id(agent).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Unknown agent '{}'. Supported agents: {}",
+            agent,
+            AgentKind::ALL
+                .iter()
+                .map(|k| k.id())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })?;
+
+    if !ctx.is_json() {
+        if dry_run {
+            println!("Dry run: checking hook removal for {}...", kind.name());
+        } else {
+            println!("Uninstalling RCH hook from {}...", kind.name());
+        }
+    }
+
+    let result = uninstall_hook(kind, dry_run)?;
+
+    if ctx.is_json() {
+        let _ = ctx.json(&serde_json::json!({
+            "agent": kind.id(),
+            "action": "uninstall",
+            "result": format!("{:?}", result),
+            "dry_run": dry_run
+        }));
+    } else {
+        match result {
+            IdempotentResult::Changed => {
+                println!(
+                    "{} RCH hook removed from {}",
+                    StatusIndicator::Success.display(style),
+                    kind.name()
+                );
+            }
+            IdempotentResult::Unchanged => {
+                println!(
+                    "{} RCH hook was not installed for {}",
+                    StatusIndicator::Info.display(style),
+                    kind.name()
+                );
+            }
+            IdempotentResult::WouldChange(msg) => {
+                println!(
+                    "{} {}",
+                    StatusIndicator::Info.display(style),
+                    msg
+                );
+            }
+            IdempotentResult::NotApplicable(msg) => {
+                println!(
+                    "{} {}",
+                    StatusIndicator::Warning.display(style),
+                    msg
+                );
+            }
+            // Other variants (Created, AlreadyExists, Updated, DryRun) not returned by hook uninstall
+            other => {
+                println!(
+                    "{} Hook uninstallation result: {:?}",
+                    StatusIndicator::Info.display(style),
+                    other
+                );
+            }
+        }
+    }
+
     Ok(())
 }
 

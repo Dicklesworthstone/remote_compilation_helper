@@ -370,13 +370,50 @@ impl SelfTestService {
             None => ensure_self_test_project()?,
         };
 
-        let mut results = Vec::new();
-
+        // Run all workers in PARALLEL to avoid sequential timeout accumulation
+        // Each worker test runs concurrently with its own timeout
+        let mut handles = Vec::new();
         for worker in workers {
-            let result = self
-                .run_worker_with_retries(run_id, &worker, &project_path, &options)
-                .await;
-            results.push(result);
+            let worker_clone = worker.clone();
+            let project_path_clone = project_path.clone();
+            let options_clone = options.clone();
+            let config_clone = self.config.clone();
+            let pool_clone = self.pool.clone();
+
+            let handle = tokio::spawn(async move {
+                run_single_worker_test(
+                    run_id,
+                    &worker_clone,
+                    &project_path_clone,
+                    &options_clone,
+                    &config_clone,
+                    &pool_clone,
+                )
+                .await
+            });
+            handles.push(handle);
+        }
+
+        // Collect all results (parallel execution means total time ≈ slowest worker)
+        let mut results = Vec::new();
+        for handle in handles {
+            match handle.await {
+                Ok(result) => results.push(result),
+                Err(join_err) => {
+                    // Task panicked - create a failure record
+                    warn!("Self-test task panicked: {}", join_err);
+                    results.push(SelfTestResultRecord {
+                        run_id,
+                        worker_id: "unknown".to_string(),
+                        passed: false,
+                        local_hash: None,
+                        remote_hash: None,
+                        local_time_ms: None,
+                        remote_time_ms: None,
+                        error: Some(format!("Task panicked: {}", join_err)),
+                    });
+                }
+            }
         }
 
         let workers_tested = results.len();
@@ -438,58 +475,6 @@ impl SelfTestService {
         Ok(result)
     }
 
-    async fn run_worker_with_retries(
-        &self,
-        run_id: u64,
-        worker: &WorkerConfig,
-        project_path: &Path,
-        options: &SelfTestRunOptions,
-    ) -> SelfTestResultRecord {
-        let retry_delay =
-            parse_duration(&self.config.retry_delay).unwrap_or_else(|| Duration::from_secs(300));
-
-        let mut attempt = 0;
-        loop {
-            attempt += 1;
-            let test = RemoteCompilationTest::new(worker.clone(), project_path.to_path_buf())
-                .with_timeout(options.timeout)
-                .with_release_mode(options.release_mode);
-
-            let result = test.run().await;
-            let record = match result {
-                Ok(outcome) => SelfTestResultRecord {
-                    run_id,
-                    worker_id: worker.id.to_string(),
-                    passed: outcome.success,
-                    local_hash: Some(outcome.local_hash.code_hash),
-                    remote_hash: Some(outcome.remote_hash.code_hash),
-                    local_time_ms: Some(outcome.local_build_ms),
-                    remote_time_ms: Some(outcome.compilation_ms),
-                    error: outcome.error,
-                },
-                Err(err) => SelfTestResultRecord {
-                    run_id,
-                    worker_id: worker.id.to_string(),
-                    passed: false,
-                    local_hash: None,
-                    remote_hash: None,
-                    local_time_ms: None,
-                    remote_time_ms: None,
-                    error: Some(err.to_string()),
-                },
-            };
-
-            if record.passed || attempt > self.config.retry_count {
-                return record;
-            }
-
-            warn!(
-                "Self-test failed for worker {} (attempt {}/{}), retrying in {:?}",
-                worker.id, attempt, self.config.retry_count, retry_delay
-            );
-            sleep(retry_delay).await;
-        }
-    }
 
     async fn apply_failure_actions(&self, results: &[SelfTestResultRecord]) {
         if results.is_empty() {
@@ -553,6 +538,78 @@ impl SelfTestService {
 
 fn parse_duration(value: &str) -> Option<Duration> {
     humantime::parse_duration(value).ok()
+}
+
+/// Run a single worker self-test with retries and timeout enforcement.
+/// This is a standalone function to allow parallel execution via tokio::spawn.
+async fn run_single_worker_test(
+    run_id: u64,
+    worker: &WorkerConfig,
+    project_path: &Path,
+    options: &SelfTestRunOptions,
+    config: &SelfTestConfig,
+    _pool: &WorkerPool, // Reserved for future use (e.g., status updates)
+) -> SelfTestResultRecord {
+    let retry_delay =
+        parse_duration(&config.retry_delay).unwrap_or_else(|| Duration::from_secs(300));
+
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let test = RemoteCompilationTest::new(worker.clone(), project_path.to_path_buf())
+            .with_timeout(options.timeout)
+            .with_release_mode(options.release_mode);
+
+        // CRITICAL: Actually enforce the timeout using tokio::time::timeout
+        // The RemoteCompilationTest.timeout field wasn't being applied!
+        let result = tokio::time::timeout(options.timeout, test.run()).await;
+
+        let record = match result {
+            Ok(Ok(outcome)) => SelfTestResultRecord {
+                run_id,
+                worker_id: worker.id.to_string(),
+                passed: outcome.success,
+                local_hash: Some(outcome.local_hash.code_hash),
+                remote_hash: Some(outcome.remote_hash.code_hash),
+                local_time_ms: Some(outcome.local_build_ms),
+                remote_time_ms: Some(outcome.compilation_ms),
+                error: outcome.error,
+            },
+            Ok(Err(err)) => SelfTestResultRecord {
+                run_id,
+                worker_id: worker.id.to_string(),
+                passed: false,
+                local_hash: None,
+                remote_hash: None,
+                local_time_ms: None,
+                remote_time_ms: None,
+                error: Some(err.to_string()),
+            },
+            Err(_elapsed) => SelfTestResultRecord {
+                run_id,
+                worker_id: worker.id.to_string(),
+                passed: false,
+                local_hash: None,
+                remote_hash: None,
+                local_time_ms: None,
+                remote_time_ms: None,
+                error: Some(format!(
+                    "Self-test timed out after {:?}",
+                    options.timeout
+                )),
+            },
+        };
+
+        if record.passed || attempt > config.retry_count {
+            return record;
+        }
+
+        warn!(
+            "Self-test failed for worker {} (attempt {}/{}), retrying in {:?}",
+            worker.id, attempt, config.retry_count, retry_delay
+        );
+        sleep(retry_delay).await;
+    }
 }
 
 fn ensure_self_test_project() -> Result<PathBuf> {
