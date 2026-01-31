@@ -28,8 +28,13 @@ fn project_root() -> PathBuf {
 
 /// Get the path to the rchd binary
 fn rchd_binary_path() -> PathBuf {
-    let root = project_root();
-    root.join("target").join("debug").join("rchd")
+    // Respect CARGO_TARGET_DIR if set, otherwise use default target/debug
+    let target_dir = if let Ok(target_dir) = std::env::var("CARGO_TARGET_DIR") {
+        PathBuf::from(target_dir)
+    } else {
+        project_root().join("target")
+    };
+    target_dir.join("debug").join("rchd")
 }
 
 /// Send a request to the daemon via Unix socket and get the response body
