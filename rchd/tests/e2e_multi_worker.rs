@@ -27,11 +27,16 @@ use std::time::Duration;
 
 /// Create a test harness configured for multi-worker tests.
 fn create_multi_worker_harness(test_name: &str) -> HarnessResult<TestHarness> {
-    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("."));
-    let project_root = manifest_dir.parent().unwrap_or(&manifest_dir);
-    let target_dir = project_root.join("target/debug");
+    // Respect CARGO_TARGET_DIR if set, otherwise use default target/debug
+    let target_dir = if let Ok(target_dir) = std::env::var("CARGO_TARGET_DIR") {
+        PathBuf::from(target_dir).join("debug")
+    } else {
+        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("."));
+        let project_root = manifest_dir.parent().unwrap_or(&manifest_dir);
+        project_root.join("target/debug")
+    };
 
     TestHarnessBuilder::new(test_name)
         .cleanup_on_success(true)
