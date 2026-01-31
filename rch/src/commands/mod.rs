@@ -48,8 +48,8 @@ pub use agents::{agents_install_hook, agents_list, agents_status, agents_uninsta
 
 // Re-export config commands for backward compatibility
 pub use config::{
-    config_diff, config_export, config_get, config_init, config_lint, config_reset, config_set,
-    config_show, config_validate,
+    ConfigDoctorResponse, config_diff, config_doctor, config_edit, config_export, config_get,
+    config_init, config_lint, config_reset, config_set, config_show, config_validate,
 };
 
 // Re-export speedscore command for backward compatibility

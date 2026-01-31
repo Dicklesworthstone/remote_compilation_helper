@@ -3077,6 +3077,7 @@ dependencies = [
  "directories",
  "dirs",
  "futures",
+ "glob",
  "indicatif",
  "insta",
  "is-terminal",

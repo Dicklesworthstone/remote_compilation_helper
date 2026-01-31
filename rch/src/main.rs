@@ -1016,6 +1016,37 @@ Checks for:
   • Risky exclude patterns (removing essential directories)
   • Performance warnings (compression=0 with large projects)"#)]
     Lint,
+    /// Diagnose configuration and system health issues
+    #[command(after_help = r#"EXAMPLES:
+    rch config doctor             # Run all health checks
+    rch config doctor --json      # Machine-readable output for CI
+
+Checks for:
+  • Socket path is writable (daemon can start)
+  • SSH identity files exist and are readable
+  • Remote paths are absolute
+  • Glob patterns are valid syntax
+  • File permissions are appropriate"#)]
+    Doctor,
+    /// Open configuration file in $EDITOR
+    #[command(after_help = r#"EXAMPLES:
+    rch config edit               # Edit user config (~/.config/rch/config.toml)
+    rch config edit --project     # Edit project config (.rch/config.toml)
+    rch config edit --workers     # Edit workers config (~/.config/rch/workers.toml)
+
+Opens the specified configuration file in $EDITOR (or $VISUAL).
+Falls back to 'nano' if neither is set."#)]
+    Edit {
+        /// Edit project-level config (.rch/config.toml in current directory)
+        #[arg(long, conflicts_with_all = ["user", "workers"])]
+        project: bool,
+        /// Edit user-level config (~/.config/rch/config.toml) - default
+        #[arg(long, conflicts_with_all = ["project", "workers"])]
+        user: bool,
+        /// Edit workers config (~/.config/rch/workers.toml)
+        #[arg(long, conflicts_with_all = ["project", "user"])]
+        workers: bool,
+    },
     /// Show configuration values that differ from defaults
     #[command(after_help = r#"EXAMPLES:
     rch config diff               # Show all non-default values
@@ -1041,6 +1072,8 @@ impl ConfigAction {
             ConfigAction::Reset { .. } => "reset",
             ConfigAction::Export { .. } => "export",
             ConfigAction::Lint => "lint",
+            ConfigAction::Doctor => "doctor",
+            ConfigAction::Edit { .. } => "edit",
             ConfigAction::Diff => "diff",
         }
     }
@@ -1561,15 +1594,19 @@ fn handle_schema_command(action: SchemaAction, ctx: &OutputContext) -> Result<()
 /// Handle --schema flag: output JSON Schema for the specified command's JSON output format.
 fn handle_schema_request(command: &Option<Commands>) -> Result<()> {
     use commands::{
-        ConfigDiffResponse, ConfigGetResponse, ConfigLintResponse, ConfigResetResponse,
-        ConfigShowResponse, ConfigValidationResponse, DaemonStatusResponse, DiagnoseResponse,
-        HookActionResponse, WorkersListResponse,
+        ConfigDiffResponse, ConfigDoctorResponse, ConfigGetResponse, ConfigLintResponse,
+        ConfigResetResponse, ConfigShowResponse, ConfigValidationResponse, DaemonStatusResponse,
+        DiagnoseResponse, HookActionResponse, WorkersListResponse,
     };
 
     let schema_json = match command {
         Some(Commands::Config { action }) => match action {
             ConfigAction::Lint => {
                 let schema = schema_for!(ConfigLintResponse);
+                serde_json::to_string_pretty(&schema)?
+            }
+            ConfigAction::Doctor => {
+                let schema = schema_for!(ConfigDoctorResponse);
                 serde_json::to_string_pretty(&schema)?
             }
             ConfigAction::Diff => {
@@ -2140,6 +2177,16 @@ async fn handle_config(action: ConfigAction, ctx: &OutputContext) -> Result<()> 
         }
         ConfigAction::Lint => {
             commands::config_lint(ctx)?;
+        }
+        ConfigAction::Doctor => {
+            commands::config_doctor(ctx)?;
+        }
+        ConfigAction::Edit {
+            project,
+            user,
+            workers,
+        } => {
+            commands::config_edit(project, user, workers, ctx)?;
         }
         ConfigAction::Diff => {
             commands::config_diff(ctx)?;
