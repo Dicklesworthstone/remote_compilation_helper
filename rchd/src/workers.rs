@@ -112,10 +112,15 @@ impl WorkerState {
     }
 
     /// Reserve slots for a job. Returns true if successful.
+    ///
+    /// Re-reads total_slots on each CAS iteration to handle concurrent config changes.
+    /// This prevents overallocation if total_slots is reduced while reserving.
     pub async fn reserve_slots(&self, count: u32) -> bool {
-        let total_slots = self.config.read().await.total_slots;
         let mut current = self.used_slots.load(Ordering::Relaxed);
         loop {
+            // Re-read total_slots on each iteration to handle concurrent config changes.
+            // This is safe because CAS loops typically succeed in 1-2 iterations.
+            let total_slots = self.config.read().await.total_slots;
             if current + count > total_slots {
                 return false;
             }
@@ -359,7 +364,10 @@ impl WorkerState {
     pub async fn check_drain_complete(&self) {
         let mut status = self.status.write().await;
         if *status == WorkerStatus::Draining {
-            let used = self.used_slots.load(Ordering::Relaxed);
+            // Use Acquire ordering to ensure we see any concurrent reserve_slots writes.
+            // This prevents a race where we transition to Drained while another thread
+            // has just reserved slots (their SeqCst write must happen-before our read).
+            let used = self.used_slots.load(Ordering::Acquire);
             if used == 0 {
                 *status = WorkerStatus::Drained;
             }

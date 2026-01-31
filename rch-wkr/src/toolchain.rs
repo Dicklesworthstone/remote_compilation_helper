@@ -50,14 +50,19 @@ pub fn rustup_available() -> bool {
 ///
 /// First checks the cache, then falls back to rustup.
 pub fn is_toolchain_available(toolchain: &str) -> Result<bool> {
-    // Check cache first
+    // Check cache first (gracefully handle poisoned lock)
     {
-        let cache = TOOLCHAIN_CACHE.read().unwrap();
-        if let Some(ref set) = *cache
-            && set.contains(toolchain)
-        {
-            debug!("Toolchain {} found in cache", toolchain);
-            return Ok(true);
+        // If the lock is poisoned, treat as cache miss and proceed to rustup check.
+        // This is safe because the cache is just an optimization.
+        if let Ok(cache) = TOOLCHAIN_CACHE.read() {
+            if let Some(ref set) = *cache
+                && set.contains(toolchain)
+            {
+                debug!("Toolchain {} found in cache", toolchain);
+                return Ok(true);
+            }
+        } else {
+            debug!("Toolchain cache poisoned, treating as cache miss");
         }
     }
 
@@ -69,12 +74,18 @@ pub fn is_toolchain_available(toolchain: &str) -> Result<bool> {
 
     let available = output.status.success();
 
-    // Update cache if available
+    // Update cache if available (skip caching if lock is poisoned)
     if available {
-        let mut cache = TOOLCHAIN_CACHE.write().unwrap();
-        let set = cache.get_or_insert_with(HashSet::new);
-        set.insert(toolchain.to_string());
-        debug!("Cached toolchain {} as available", toolchain);
+        match TOOLCHAIN_CACHE.write() {
+            Ok(mut cache) => {
+                let set = cache.get_or_insert_with(HashSet::new);
+                set.insert(toolchain.to_string());
+                debug!("Cached toolchain {} as available", toolchain);
+            }
+            Err(_) => {
+                debug!("Toolchain cache poisoned, skipping cache update");
+            }
+        }
     }
 
     Ok(available)
@@ -93,10 +104,16 @@ pub fn install_toolchain(toolchain: &str) -> Result<()> {
     if output.status.success() {
         info!("Successfully installed toolchain {}", toolchain);
 
-        // Update cache
-        let mut cache = TOOLCHAIN_CACHE.write().unwrap();
-        let set = cache.get_or_insert_with(HashSet::new);
-        set.insert(toolchain.to_string());
+        // Update cache (skip if lock is poisoned - cache is just an optimization)
+        match TOOLCHAIN_CACHE.write() {
+            Ok(mut cache) => {
+                let set = cache.get_or_insert_with(HashSet::new);
+                set.insert(toolchain.to_string());
+            }
+            Err(_) => {
+                debug!("Toolchain cache poisoned, skipping cache update after install");
+            }
+        }
 
         Ok(())
     } else {
@@ -159,18 +176,33 @@ pub fn ensure_toolchain(toolchain: &ToolchainInfo) -> Result<()> {
 /// Useful for testing or when toolchains may have been removed.
 #[allow(dead_code)]
 pub fn clear_cache() {
-    let mut cache = TOOLCHAIN_CACHE.write().unwrap();
-    *cache = None;
-    debug!("Toolchain cache cleared");
+    match TOOLCHAIN_CACHE.write() {
+        Ok(mut cache) => {
+            *cache = None;
+            debug!("Toolchain cache cleared");
+        }
+        Err(poisoned) => {
+            // Recover from poisoned lock by clearing it
+            let mut cache = poisoned.into_inner();
+            *cache = None;
+            debug!("Toolchain cache cleared (recovered from poisoned lock)");
+        }
+    }
 }
 
 /// Get the current cache contents for debugging.
 #[allow(dead_code)]
 pub fn get_cached_toolchains() -> Vec<String> {
-    let cache = TOOLCHAIN_CACHE.read().unwrap();
-    match &*cache {
-        Some(set) => set.iter().cloned().collect(),
-        None => Vec::new(),
+    match TOOLCHAIN_CACHE.read() {
+        Ok(cache) => match &*cache {
+            Some(set) => set.iter().cloned().collect(),
+            None => Vec::new(),
+        },
+        Err(_) => {
+            // If lock is poisoned, return empty (can't safely read cache)
+            debug!("Toolchain cache poisoned, returning empty list");
+            Vec::new()
+        }
     }
 }
 

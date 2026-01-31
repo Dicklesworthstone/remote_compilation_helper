@@ -34,7 +34,7 @@ use std::time::{Duration, Instant};
 use tokio::net::UnixListener;
 use tokio::sync::{Mutex, mpsc};
 use tokio::time::interval;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 #[cfg(unix)]
 use tokio::signal::unix::{SignalKind, signal};
@@ -430,7 +430,7 @@ async fn main() -> Result<()> {
     let metrics_history = context.history.clone();
     let metrics_selector = worker_selector.clone();
     let metrics_dashboard_handle = metrics_dashboard.clone();
-    let metrics_handle = tokio::spawn(async move {
+    let mut metrics_handle: Option<tokio::task::JoinHandle<()>> = Some(tokio::spawn(async move {
         let mut ticker = interval(metrics_interval);
         loop {
             ticker.tick().await;
@@ -439,11 +439,11 @@ async fn main() -> Result<()> {
                 .emit_update(&metrics_pool, &metrics_history, &metrics_selector)
                 .await;
         }
-    });
+    }));
 
     // Start background cleanup for drained workers
     let cleanup_pool = worker_pool.clone();
-    let cleanup_handle = tokio::spawn(async move {
+    let mut cleanup_handle: Option<tokio::task::JoinHandle<()>> = Some(tokio::spawn(async move {
         // Check every minute
         let mut ticker = interval(Duration::from_secs(60));
         loop {
@@ -453,7 +453,7 @@ async fn main() -> Result<()> {
                 info!("Background cleanup: pruned {} drained workers", pruned);
             }
         }
-    });
+    }));
 
     if let Some(storage) = telemetry_storage {
         let _maintenance = telemetry::start_storage_maintenance(storage);
@@ -575,6 +575,24 @@ async fn main() -> Result<()> {
                         }
                     }
                 }
+                // Monitor background tasks for unexpected termination (panics)
+                // Use Option to avoid polling completed handles repeatedly
+                result = async { metrics_handle.as_mut().unwrap().await }, if metrics_handle.is_some() => {
+                    metrics_handle = None; // Don't poll again
+                    match result {
+                        Ok(_) => error!("Metrics task unexpectedly terminated"),
+                        Err(e) => error!("Metrics task panicked: {}", e),
+                    }
+                    // Task is non-critical, continue running daemon
+                }
+                result = async { cleanup_handle.as_mut().unwrap().await }, if cleanup_handle.is_some() => {
+                    cleanup_handle = None; // Don't poll again
+                    match result {
+                        Ok(_) => error!("Cleanup task unexpectedly terminated"),
+                        Err(e) => error!("Cleanup task panicked: {}", e),
+                    }
+                    // Task is non-critical, continue running daemon
+                }
             }
         }
     }
@@ -603,6 +621,23 @@ async fn main() -> Result<()> {
                     info!("Shutdown signal received");
                     break;
                 }
+                // Monitor background tasks for unexpected termination (panics)
+                result = async { metrics_handle.as_mut().unwrap().await }, if metrics_handle.is_some() => {
+                    metrics_handle = None; // Don't poll again
+                    match result {
+                        Ok(_) => error!("Metrics task unexpectedly terminated"),
+                        Err(e) => error!("Metrics task panicked: {}", e),
+                    }
+                    // Task is non-critical, continue running daemon
+                }
+                result = async { cleanup_handle.as_mut().unwrap().await }, if cleanup_handle.is_some() => {
+                    cleanup_handle = None; // Don't poll again
+                    match result {
+                        Ok(_) => error!("Cleanup task unexpectedly terminated"),
+                        Err(e) => error!("Cleanup task panicked: {}", e),
+                    }
+                    // Task is non-critical, continue running daemon
+                }
             }
         }
     }
@@ -614,8 +649,12 @@ async fn main() -> Result<()> {
 
     // Abort background tasks that have no cancellation mechanism
     info!("Stopping background tasks...");
-    metrics_handle.abort();
-    cleanup_handle.abort();
+    if let Some(handle) = metrics_handle {
+        handle.abort();
+    }
+    if let Some(handle) = cleanup_handle {
+        handle.abort();
+    }
 
     // Clean up socket
     if std::path::Path::new(&context.socket_path).exists() {

@@ -291,14 +291,13 @@ fn classify_command_inner(cmd: &str, _depth: u8) -> Classification {
     let normalized = normalized_cow.as_ref();
 
     // Tier 3: Negative pattern check - never intercept these
+    // Performance: use static string to avoid format! allocation on hot rejection path
     for pattern in NEVER_INTERCEPT {
         if let Some(rest) = normalized.strip_prefix(pattern) {
             // Ensure exact match or boundary match (e.g. "cargo clean" matches "cargo clean"
             // or "cargo clean ", but NOT "cargo cleanup")
             if rest.is_empty() || rest.starts_with(' ') {
-                return Classification::not_compilation(format!(
-                    "matches never-intercept: {pattern}"
-                ));
+                return Classification::not_compilation("matches never-intercept pattern");
             }
         }
     }
@@ -673,53 +672,173 @@ pub fn normalize_command(cmd: &str) -> Cow<'_, str> {
 }
 
 /// Check command structure for patterns that shouldn't be intercepted.
+/// Check command structure for patterns that shouldn't be intercepted.
+///
+/// Performance: single-pass O(n) state machine instead of 11+ separate scans.
+/// This is critical because structure analysis runs on EVERY command.
+///
+/// Detection priority (matches original behavior):
+/// 1. Embedded newlines (security - command injection)
+/// 2. Standalone & (backgrounding)
+/// 3. Single | pipe (not ||)
+/// 4. Subshell ( or >( or <(
+/// 5. Output redirection >
+/// 6. Input redirection <
+/// 7. Semicolon ;
+/// 8. && chaining
+/// 9. || chaining
+/// 10. Subshell capture $( or backtick
 fn check_structure(cmd: &str) -> Option<&'static str> {
-    // Check for embedded newlines or carriage returns - these would execute
-    // multiple commands when passed to `sh -c` (command injection risk)
-    if cmd.contains('\n') || cmd.contains('\r') {
-        return Some("contains embedded newline");
+    let bytes = cmd.as_bytes();
+    let len = bytes.len();
+
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+
+    // Track what we find (in priority order, lower = higher priority)
+    // Using Option to track if found, with priority encoded by check order
+    let mut found_backgrounded = false;
+    let mut found_piped = false;
+    let mut found_subshell = false;
+    let mut found_output_redirect = false;
+    let mut found_input_redirect = false;
+    let mut found_semicolon = false;
+    let mut found_and_chain = false;
+    let mut found_or_chain = false;
+    let mut found_subshell_capture = false;
+
+    let mut i = 0;
+    while i < len {
+        let b = bytes[i];
+
+        // Handle escape sequences
+        if escaped {
+            escaped = false;
+            i += 1;
+            continue;
+        }
+        if b == b'\\' {
+            escaped = true;
+            i += 1;
+            continue;
+        }
+
+        // Handle quote state transitions
+        if b == b'\'' && !in_double {
+            in_single = !in_single;
+            i += 1;
+            continue;
+        }
+        if b == b'"' && !in_single {
+            in_double = !in_double;
+            i += 1;
+            continue;
+        }
+
+        // Skip quoted content
+        if in_single || in_double {
+            i += 1;
+            continue;
+        }
+
+        // Check for problematic characters/patterns (unquoted)
+        match b {
+            // Embedded newlines - return immediately (highest priority, security issue)
+            b'\n' | b'\r' => return Some("contains embedded newline"),
+
+            // Ampersand: check for && vs standalone &
+            b'&' => {
+                if i + 1 < len && bytes[i + 1] == b'&' {
+                    found_and_chain = true;
+                    i += 1; // Skip second &
+                } else {
+                    // Check for redirection patterns like 2>&1 or &>
+                    let prev = if i > 0 { bytes[i - 1] } else { 0 };
+                    let next = if i + 1 < len { bytes[i + 1] } else { 0 };
+                    if prev != b'>' && next != b'>' {
+                        found_backgrounded = true;
+                    }
+                }
+            }
+
+            // Pipe: check for || vs single |
+            b'|' => {
+                if i + 1 < len && bytes[i + 1] == b'|' {
+                    found_or_chain = true;
+                    i += 1; // Skip second |
+                } else {
+                    found_piped = true;
+                }
+            }
+
+            // Subshell/process substitution
+            b'(' => found_subshell = true,
+
+            // Output redirection (>( is process substitution, caught by ( check)
+            b'>' => {
+                if i + 1 < len && bytes[i + 1] == b'(' {
+                    found_subshell = true;
+                } else {
+                    found_output_redirect = true;
+                }
+            }
+
+            // Input redirection (<( is process substitution, caught by ( check)
+            b'<' => {
+                if i + 1 < len && bytes[i + 1] == b'(' {
+                    found_subshell = true;
+                } else {
+                    found_input_redirect = true;
+                }
+            }
+
+            // Semicolon chaining
+            b';' => found_semicolon = true,
+
+            // Backtick subshell capture
+            b'`' => found_subshell_capture = true,
+
+            // Dollar sign: check for $( subshell capture
+            b'$' => {
+                if i + 1 < len && bytes[i + 1] == b'(' {
+                    found_subshell_capture = true;
+                }
+            }
+
+            _ => {}
+        }
+
+        i += 1;
     }
 
-    // Check for backgrounding (ends with & or contains & not part of &&)
-    if contains_unquoted_standalone_ampersand(cmd) {
+    // Return in priority order (matches original check_structure behavior)
+    if found_backgrounded {
         return Some("backgrounded command");
     }
-
-    // Check for pipes (output format matters)
-    if contains_unquoted(cmd, '|') && !contains_unquoted_str(cmd, "||") {
+    // Pipe check: only if not ||
+    if found_piped && !found_or_chain {
         return Some("piped command");
     }
-
-    // Check for subshell/process substitution (unquoted open paren)
-    // Covers (cmd), <(cmd), >(cmd)
-    // Must come BEFORE redirection checks so <( and >( are detected as process substitution
-    if contains_unquoted(cmd, '(') {
+    if found_subshell {
         return Some("subshell execution");
     }
-
-    // Check for output redirection (after subshell check to not match >( )
-    if contains_unquoted(cmd, '>') {
+    if found_output_redirect {
         return Some("output redirected");
     }
-
-    // Check for input redirection (after subshell check to not match <( )
-    if contains_unquoted(cmd, '<') {
+    if found_input_redirect {
         return Some("input redirected");
     }
-
-    // Check for command chaining
-    if contains_unquoted(cmd, ';') {
+    if found_semicolon {
         return Some("chained command (;)");
     }
-    if contains_unquoted_str(cmd, "&&") {
+    if found_and_chain {
         return Some("chained command (&&)");
     }
-    if contains_unquoted_str(cmd, "||") {
+    if found_or_chain {
         return Some("chained command (||)");
     }
-
-    // Check for subshell capture
-    if cmd.contains("$(") || cmd.contains('`') {
+    if found_subshell_capture {
         return Some("subshell capture");
     }
 
@@ -1008,20 +1127,28 @@ fn classify_full(cmd: &str) -> Classification {
 }
 
 /// Classify cargo subcommands.
+///
+/// Performance: uses iterator `.nth()` to avoid Vec allocation on the hot path.
+/// We only need tokens 0-3 (cargo, [+toolchain], subcommand, [nextest-subcommand]).
 fn classify_cargo(cmd: &str) -> Classification {
-    let parts: Vec<&str> = cmd.split_whitespace().collect();
-    if parts.len() < 2 {
+    let mut tokens = cmd.split_whitespace();
+
+    // Token 0: "cargo" (already validated by caller)
+    let _cargo = tokens.next();
+
+    // Token 1: subcommand or +toolchain
+    let Some(token1) = tokens.next() else {
         return Classification::not_compilation("bare cargo command");
-    }
+    };
 
     // Handle toolchain overrides (e.g., cargo +nightly build)
-    let subcommand = if parts[1].starts_with('+') {
-        if parts.len() < 3 {
+    let subcommand = if token1.starts_with('+') {
+        let Some(sub) = tokens.next() else {
             return Classification::not_compilation("cargo +toolchain without subcommand");
-        }
-        parts[2]
+        };
+        sub
     } else {
-        parts[1]
+        token1
     };
 
     match subcommand {
@@ -1046,27 +1173,21 @@ fn classify_cargo(cmd: &str) -> Classification {
         "nextest" => {
             // cargo nextest has subcommands: run, list, archive, show
             // Only intercept "run" - the actual test execution
-            // Adjust index based on whether toolchain was present
-            let args_start = if parts[1].starts_with('+') { 3 } else { 2 };
+            // Next token is the nextest subcommand (e.g., "run", "list")
+            let Some(nextest_sub) = tokens.next() else {
+                return Classification::not_compilation("bare cargo nextest without subcommand");
+            };
 
-            if parts.len() > args_start {
-                match parts[args_start] {
-                    "run" | "r" => Classification::compilation(
-                        CompilationKind::CargoNextest,
-                        0.95,
-                        "cargo nextest run",
-                    ),
-                    _ => Classification::not_compilation(format!(
-                        "cargo nextest {} not interceptable",
-                        parts[args_start]
-                    )),
-                }
-            } else {
-                // Bare "cargo nextest" without subcommand
-                Classification::not_compilation("bare cargo nextest without subcommand")
+            match nextest_sub {
+                "run" | "r" => Classification::compilation(
+                    CompilationKind::CargoNextest,
+                    0.95,
+                    "cargo nextest run",
+                ),
+                _ => Classification::not_compilation("cargo nextest subcommand not interceptable"),
             }
         }
-        _ => Classification::not_compilation(format!("cargo {subcommand} not interceptable")),
+        _ => Classification::not_compilation("cargo subcommand not interceptable"),
     }
 }
 
@@ -3228,9 +3349,9 @@ mod tests {
     }
 
     #[test]
-    fn test_cow_owned_on_tier3_reject_is_expected() {
+    fn test_cow_borrowed_on_tier3_reject() {
         let _guard = test_guard!();
-        // Never-intercept commands produce a format!() string -> Cow::Owned is expected
+        // Never-intercept commands now use static strings for performance (no format! allocation)
         let never_intercept = ["cargo fmt", "cargo install ripgrep", "cargo clean"];
         for cmd in never_intercept {
             let result = classify_command(cmd);
@@ -3240,11 +3361,8 @@ mod tests {
                 "'{cmd}' reason should mention never-intercept: {}",
                 result.reason
             );
-            // Tier 3 uses format!() for the pattern name -> Cow::Owned is expected
-            assert!(
-                matches!(&result.reason, Cow::Owned(_)),
-                "Tier 3 '{cmd}' should produce Cow::Owned (format string)"
-            );
+            // Tier 3 now uses static string for performance -> Cow::Borrowed
+            assert_cow_borrowed(&result.reason, &format!("Tier 3 reject for '{cmd}'"));
         }
     }
 

@@ -8,9 +8,9 @@ use clap::CommandFactory;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::Cli;
 use crate::error::CompletionError;
 use crate::ui::OutputContext;
-use crate::Cli;
 
 /// Standard installation paths for each shell
 #[derive(Debug, Clone)]

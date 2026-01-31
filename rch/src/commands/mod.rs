@@ -53,7 +53,7 @@ pub use config::{
     config_diff, config_edit, config_export, config_get, config_lint, config_reset, config_set,
     config_show, config_validate,
 };
-pub use config_doctor::{config_doctor, ConfigDoctorResponse};
+pub use config_doctor::{ConfigDoctorResponse, config_doctor};
 pub use config_init::config_init;
 
 // Re-export speedscore command for backward compatibility

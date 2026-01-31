@@ -13,6 +13,7 @@ use anyhow::{Context, Result};
 use crate::error::FleetError;
 use rch_common::WorkerConfig;
 use rch_common::mock;
+use rch_common::ssh::shell_escape_value;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -470,7 +471,14 @@ impl<'a> SshExecutor<'a> {
 
     /// Create a directory on the remote worker.
     pub async fn create_directory(&self, path: &str) -> Result<(), FleetSshError> {
-        let cmd = format!("mkdir -p {}", path);
+        // Escape path to prevent command injection
+        let escaped_path =
+            shell_escape_value(path).ok_or_else(|| FleetSshError::CommandFailed {
+                host: self.worker.host.clone(),
+                exit_code: -1,
+                stderr: format!("Invalid path contains control characters: {}", path),
+            })?;
+        let cmd = format!("mkdir -p {}", escaped_path);
         let output = self.run_command(&cmd).await?;
 
         if !output.success() {
@@ -492,7 +500,14 @@ impl<'a> SshExecutor<'a> {
 
     /// Set executable permissions on a remote file.
     pub async fn set_executable(&self, path: &str) -> Result<(), FleetSshError> {
-        let cmd = format!("chmod +x {}", path);
+        // Escape path to prevent command injection
+        let escaped_path =
+            shell_escape_value(path).ok_or_else(|| FleetSshError::CommandFailed {
+                host: self.worker.host.clone(),
+                exit_code: -1,
+                stderr: format!("Invalid path contains control characters: {}", path),
+            })?;
+        let cmd = format!("chmod +x {}", escaped_path);
         let output = self.run_command(&cmd).await?;
 
         if !output.success() {
@@ -537,11 +552,24 @@ impl<'a> SshExecutor<'a> {
             "Copying file via SCP"
         );
 
+        // Validate remote_path doesn't contain dangerous characters for SCP
+        // Note: SCP remote path parsing differs from shell, but escaping is still prudent
+        let escaped_remote =
+            shell_escape_value(remote_path).ok_or_else(|| FleetSshError::ScpFailed {
+                host: self.worker.host.clone(),
+                reason: format!(
+                    "Invalid remote path contains control characters: {}",
+                    remote_path
+                ),
+            })?;
+
         let start = Instant::now();
         let mut cmd = Command::new("scp");
         self.build_scp_args(&mut cmd);
         cmd.arg(local_path);
-        cmd.arg(format!("{}:{}", self.destination(), remote_path));
+        // For SCP, the remote path after the colon is interpreted by the remote shell,
+        // so we need to escape it properly
+        cmd.arg(format!("{}:{}", self.destination(), escaped_remote));
 
         let output = match tokio::time::timeout(self.scp_timeout, cmd.output()).await {
             Ok(Ok(output)) => output,

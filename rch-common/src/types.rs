@@ -2538,6 +2538,9 @@ impl MetricsAggregator {
     }
 
     /// Get a percentile of total compilation times.
+    ///
+    /// Uses the "inclusive" percentile method (matching numpy.percentile, Excel PERCENTILE.INC):
+    /// index = (n - 1) * percentile, where n is the number of samples.
     fn percentile_total_time(&self, percentile: f64) -> Option<Duration> {
         let mut times: Vec<_> = self.history.iter().map(|m| m.timing.total).collect();
 
@@ -2546,7 +2549,10 @@ impl MetricsAggregator {
         }
 
         times.sort();
-        let idx = ((times.len() as f64 * percentile) as usize).min(times.len() - 1);
+        // Use inclusive percentile: index = (n - 1) * p
+        // For p50 with 100 items: (99 * 0.50) = 49.5 -> 49 (true median position)
+        // For p99 with 100 items: (99 * 0.99) = 98.01 -> 98
+        let idx = (((times.len() - 1) as f64 * percentile).round() as usize).min(times.len() - 1);
         Some(times[idx])
     }
 

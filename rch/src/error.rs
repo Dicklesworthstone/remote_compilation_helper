@@ -721,7 +721,9 @@ pub enum HookError {
     #[error("{agent} does not support hook {operation}: {reason}")]
     #[diagnostic(
         code("RCH-E506"),
-        help("Not all AI coding agents support hook integration. Check 'rch agent list' for supported agents.")
+        help(
+            "Not all AI coding agents support hook integration. Check 'rch agent list' for supported agents."
+        )
     )]
     NotSupported {
         agent: String,
@@ -733,7 +735,9 @@ pub enum HookError {
     #[error("{agent} hook {operation} is not yet implemented")]
     #[diagnostic(
         code("RCH-E507"),
-        help("This agent may be supported in a future release. Check for updates with 'rch update'.")
+        help(
+            "This agent may be supported in a future release. Check for updates with 'rch update'."
+        )
     )]
     NotImplemented { agent: String, operation: String },
 }
@@ -1073,7 +1077,9 @@ pub enum WebError {
     #[error("Web server exited with error (exit code: {exit_code:?})")]
     #[diagnostic(
         code("RCH-E901"),
-        help("Check the server logs for details. The web server may have encountered a startup error.")
+        help(
+            "Check the server logs for details. The web server may have encountered a startup error."
+        )
     )]
     ServerExitedWithError { exit_code: Option<i32> },
 
@@ -1133,7 +1139,9 @@ pub enum EditorError {
     #[error("Editor exited with non-zero status (exit code: {exit_code:?})")]
     #[diagnostic(
         code("RCH-E920"),
-        help("The editor process exited with an error. Check that your $EDITOR is configured correctly.")
+        help(
+            "The editor process exited with an error. Check that your $EDITOR is configured correctly."
+        )
     )]
     ExitedWithError { exit_code: Option<i32> },
 

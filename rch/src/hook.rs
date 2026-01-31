@@ -805,6 +805,9 @@ use std::collections::HashMap;
 /// Maximum number of timing samples to retain per project+kind.
 const MAX_TIMING_SAMPLES: usize = 20;
 
+/// Maximum number of projects to track in timing history (LRU eviction above this).
+const MAX_TIMING_PROJECTS: usize = 500;
+
 /// A single timing record for a completed build.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct TimingRecord {
@@ -882,6 +885,23 @@ impl ProjectTimingData {
         }
         Some(local_median as f64 / remote_median as f64)
     }
+
+    /// Get the most recent timestamp from any sample (used for LRU eviction).
+    fn most_recent_timestamp(&self) -> u64 {
+        let local_max = self
+            .local_samples
+            .iter()
+            .map(|r| r.timestamp)
+            .max()
+            .unwrap_or(0);
+        let remote_max = self
+            .remote_samples
+            .iter()
+            .map(|r| r.timestamp)
+            .max()
+            .unwrap_or(0);
+        local_max.max(remote_max)
+    }
 }
 
 /// Full timing history, keyed by project+kind.
@@ -954,6 +974,9 @@ impl TimingHistory {
     }
 
     /// Record a timing sample.
+    ///
+    /// Implements LRU eviction to prevent unbounded memory growth:
+    /// if entries exceed MAX_TIMING_PROJECTS, evicts the least recently used entry.
     fn record(
         &mut self,
         project: &str,
@@ -964,6 +987,19 @@ impl TimingHistory {
         let key = Self::key(project, kind);
         let data = self.entries.entry(key).or_default();
         data.add_sample(duration_ms, remote);
+
+        // LRU eviction: if over limit, remove the entry with oldest timestamp
+        if self.entries.len() > MAX_TIMING_PROJECTS {
+            // Find the key with the oldest most_recent_timestamp
+            if let Some(oldest_key) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, data)| data.most_recent_timestamp())
+                .map(|(k, _)| k.clone())
+            {
+                self.entries.remove(&oldest_key);
+            }
+        }
     }
 }
 

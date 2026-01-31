@@ -113,8 +113,7 @@ const GITHUB_ACTIONS_OIDC_ISSUER: &str = "https://token.actions.githubuserconten
 
 /// Expected certificate identity pattern for official RCH releases.
 /// This must match the GitHub Actions workflow that signs the releases.
-const RCH_RELEASE_IDENTITY_PATTERN: &str =
-    "https://github.com/Dicklesworthstone/remote_compilation_helper/.github/workflows/release.yml@refs/.*";
+const RCH_RELEASE_IDENTITY_PATTERN: &str = "https://github.com/Dicklesworthstone/remote_compilation_helper/.github/workflows/release.yml@refs/.*";
 
 /// Verify Sigstore/cosign signature bundle for a file.
 ///

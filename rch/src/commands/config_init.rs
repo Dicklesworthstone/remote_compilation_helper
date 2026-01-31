@@ -6,9 +6,9 @@
 use anyhow::{Context, Result};
 use rch_common::ApiResponse;
 
+use crate::ui;
 use crate::ui::context::OutputContext;
 use crate::ui::theme::StatusIndicator;
-use crate::ui;
 
 use super::helpers::config_dir;
 use super::types::ConfigInitResponse;

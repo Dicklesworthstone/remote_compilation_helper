@@ -12,10 +12,10 @@ use crate::{config, ui};
 use super::helpers::{config_dir, load_workers_from_config};
 use super::types::{
     ConfigCircuitSection, ConfigCompilationSection, ConfigDiffEntry, ConfigDiffResponse,
-    ConfigEnvironmentSection, ConfigGeneralSection, ConfigGetResponse,
-    ConfigLintResponse, ConfigOutputSection, ConfigResetResponse, ConfigSelfHealingSection,
-    ConfigSetResponse, ConfigShowResponse, ConfigTransferSection, ConfigValidationIssue,
-    ConfigValidationResponse, ConfigValueSourceInfo, LintIssue, LintSeverity,
+    ConfigEnvironmentSection, ConfigGeneralSection, ConfigGetResponse, ConfigLintResponse,
+    ConfigOutputSection, ConfigResetResponse, ConfigSelfHealingSection, ConfigSetResponse,
+    ConfigShowResponse, ConfigTransferSection, ConfigValidationIssue, ConfigValidationResponse,
+    ConfigValueSourceInfo, LintIssue, LintSeverity,
 };
 
 fn print_file_validation(
