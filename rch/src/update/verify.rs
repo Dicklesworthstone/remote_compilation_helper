@@ -108,7 +108,25 @@ async fn compute_sha256(file_path: &std::path::Path) -> Result<String, UpdateErr
     .map_err(|e| UpdateError::InstallFailed(format!("Task failed: {}", e)))?
 }
 
+/// Expected GitHub Actions OIDC issuer for sigstore verification.
+const GITHUB_ACTIONS_OIDC_ISSUER: &str = "https://token.actions.githubusercontent.com";
+
+/// Expected certificate identity pattern for official RCH releases.
+/// This must match the GitHub Actions workflow that signs the releases.
+const RCH_RELEASE_IDENTITY_PATTERN: &str =
+    "https://github.com/Dicklesworthstone/remote_compilation_helper/.github/workflows/release.yml@refs/.*";
+
 /// Verify Sigstore/cosign signature bundle for a file.
+///
+/// # Security
+///
+/// This verifies that binaries were signed by the official RCH GitHub Actions
+/// release workflow. It checks:
+/// - OIDC issuer is GitHub Actions (`https://token.actions.githubusercontent.com`)
+/// - Certificate identity matches the release workflow URL pattern
+///
+/// Wildcard patterns (`.*`) are intentionally NOT used as they would accept
+/// any sigstore signature, defeating supply chain security.
 async fn verify_signature(
     file_path: &std::path::Path,
     bundle_path: &std::path::Path,
@@ -122,9 +140,9 @@ async fn verify_signature(
         .arg("--bundle")
         .arg(bundle_path)
         .arg("--certificate-identity-regexp")
-        .arg(".*")
-        .arg("--certificate-oidc-issuer-regexp")
-        .arg(".*")
+        .arg(RCH_RELEASE_IDENTITY_PATTERN)
+        .arg("--certificate-oidc-issuer")
+        .arg(GITHUB_ACTIONS_OIDC_ISSUER)
         .arg(file_path)
         .output()
         .await
