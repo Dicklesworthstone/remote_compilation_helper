@@ -18,6 +18,7 @@ mod speedscore;
 mod status;
 pub mod types;
 mod workers;
+mod workers_init;
 
 // Re-export daemon commands for backward compatibility
 pub use daemon::{
@@ -49,6 +50,9 @@ pub use config::{
 
 // Re-export speedscore command for backward compatibility
 pub use speedscore::speedscore;
+
+// Re-export workers init/discover commands for backward compatibility
+pub use workers_init::{workers_discover, workers_init};
 
 // Re-export types for backward compatibility
 pub use types::*;
