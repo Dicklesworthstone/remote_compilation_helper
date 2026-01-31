@@ -13,9 +13,9 @@ use super::helpers::{config_dir, load_workers_from_config};
 use super::types::{
     ConfigCircuitSection, ConfigCompilationSection, ConfigDiffEntry, ConfigDiffResponse,
     ConfigEnvironmentSection, ConfigGeneralSection, ConfigGetResponse, ConfigInitResponse,
-    ConfigLintResponse, ConfigOutputSection, ConfigSelfHealingSection, ConfigSetResponse,
-    ConfigShowResponse, ConfigTransferSection, ConfigValidationIssue, ConfigValidationResponse,
-    ConfigValueSourceInfo, LintIssue, LintSeverity,
+    ConfigLintResponse, ConfigOutputSection, ConfigResetResponse, ConfigSelfHealingSection,
+    ConfigSetResponse, ConfigShowResponse, ConfigTransferSection, ConfigValidationIssue,
+    ConfigValidationResponse, ConfigValueSourceInfo, LintIssue, LintSeverity,
 };
 
 fn print_file_validation(
@@ -1500,6 +1500,116 @@ fn config_set_at(config_path: &Path, key: &str, value: &str, ctx: &OutputContext
     } else {
         println!("Updated {:?}: {} = {}", config_path, key, value);
     }
+    Ok(())
+}
+
+/// Reset a configuration value to its default.
+pub fn config_reset(key: &str, ctx: &OutputContext) -> Result<()> {
+    let config_dir = config_dir().context("Could not determine config directory")?;
+    std::fs::create_dir_all(&config_dir)
+        .with_context(|| format!("Failed to create config directory: {:?}", config_dir))?;
+    let config_path = config_dir.join("config.toml");
+    config_reset_at(&config_path, key, ctx)
+}
+
+fn config_reset_at(config_path: &Path, key: &str, ctx: &OutputContext) -> Result<()> {
+    let mut config = if config_path.exists() {
+        let contents = std::fs::read_to_string(config_path)
+            .with_context(|| format!("Failed to read {:?}", config_path))?;
+        toml::from_str::<RchConfig>(&contents)
+            .with_context(|| format!("Failed to parse {:?}", config_path))?
+    } else {
+        RchConfig::default()
+    };
+
+    let defaults = RchConfig::default();
+    let mut value = String::new();
+
+    match key {
+        "general.enabled" => {
+            config.general.enabled = defaults.general.enabled;
+            value = config.general.enabled.to_string();
+        }
+        "general.force_local" => {
+            config.general.force_local = defaults.general.force_local;
+            value = config.general.force_local.to_string();
+        }
+        "general.force_remote" => {
+            config.general.force_remote = defaults.general.force_remote;
+            value = config.general.force_remote.to_string();
+        }
+        "general.log_level" => {
+            config.general.log_level = defaults.general.log_level;
+            value = config.general.log_level.clone();
+        }
+        "general.socket_path" => {
+            config.general.socket_path = defaults.general.socket_path;
+            value = config.general.socket_path.clone();
+        }
+        "compilation.confidence_threshold" => {
+            config.compilation.confidence_threshold = defaults.compilation.confidence_threshold;
+            value = config.compilation.confidence_threshold.to_string();
+        }
+        "compilation.min_local_time_ms" => {
+            config.compilation.min_local_time_ms = defaults.compilation.min_local_time_ms;
+            value = config.compilation.min_local_time_ms.to_string();
+        }
+        "transfer.compression_level" => {
+            config.transfer.compression_level = defaults.transfer.compression_level;
+            value = config.transfer.compression_level.to_string();
+        }
+        "transfer.exclude_patterns" => {
+            config.transfer.exclude_patterns = defaults.transfer.exclude_patterns;
+            value = format!("{:?}", config.transfer.exclude_patterns);
+        }
+        "environment.allowlist" => {
+            config.environment.allowlist = defaults.environment.allowlist;
+            value = format!("{:?}", config.environment.allowlist);
+        }
+        "output.visibility" => {
+            config.output.visibility = defaults.output.visibility;
+            value = config.output.visibility.to_string();
+        }
+        "output.first_run_complete" | "first_run_complete" => {
+            config.output.first_run_complete = defaults.output.first_run_complete;
+            value = config.output.first_run_complete.to_string();
+        }
+        _ => {
+            return Err(ConfigError::InvalidValue {
+                field: key.to_string(),
+                reason: "unknown configuration key".to_string(),
+                suggestion: "Supported keys: general.enabled, general.force_local, general.force_remote, general.log_level, general.socket_path, compilation.confidence_threshold, compilation.min_local_time_ms, transfer.compression_level, transfer.exclude_patterns, environment.allowlist, output.visibility, output.first_run_complete".to_string(),
+            }
+            .into());
+        }
+    }
+
+    if config.general.force_local && config.general.force_remote {
+        return Err(ConfigError::InvalidValue {
+            field: "general.force_local / general.force_remote".to_string(),
+            reason: "both options cannot be true simultaneously".to_string(),
+            suggestion: "Set only one of force_local or force_remote to true".to_string(),
+        }
+        .into());
+    }
+
+    let contents = toml::to_string_pretty(&config)?;
+    std::fs::write(config_path, format!("{}\n", contents))
+        .with_context(|| format!("Failed to write {:?}", config_path))?;
+
+    if ctx.is_json() {
+        let _ = ctx.json(&ApiResponse::ok(
+            "config reset",
+            ConfigResetResponse {
+                key: key.to_string(),
+                value,
+                config_path: config_path.display().to_string(),
+            },
+        ));
+    } else {
+        println!("Reset {:?}: {} = {}", config_path, key, value);
+    }
+
     Ok(())
 }
 

@@ -996,6 +996,8 @@ The wizard helps you configure:
     Validate,
     /// Set a configuration value
     Set { key: String, value: String },
+    /// Reset a configuration value to its default
+    Reset { key: String },
     /// Export configuration as shell script (for sourcing)
     Export {
         /// Output format: shell (default) or env
@@ -1036,6 +1038,7 @@ impl ConfigAction {
             ConfigAction::Init { .. } => "init",
             ConfigAction::Validate => "validate",
             ConfigAction::Set { .. } => "set",
+            ConfigAction::Reset { .. } => "reset",
             ConfigAction::Export { .. } => "export",
             ConfigAction::Lint => "lint",
             ConfigAction::Diff => "diff",
@@ -1558,9 +1561,9 @@ fn handle_schema_command(action: SchemaAction, ctx: &OutputContext) -> Result<()
 /// Handle --schema flag: output JSON Schema for the specified command's JSON output format.
 fn handle_schema_request(command: &Option<Commands>) -> Result<()> {
     use commands::{
-        ConfigDiffResponse, ConfigGetResponse, ConfigLintResponse, ConfigShowResponse,
-        ConfigValidationResponse, DaemonStatusResponse, DiagnoseResponse, HookActionResponse,
-        WorkersListResponse,
+        ConfigDiffResponse, ConfigGetResponse, ConfigLintResponse, ConfigResetResponse,
+        ConfigShowResponse, ConfigValidationResponse, DaemonStatusResponse, DiagnoseResponse,
+        HookActionResponse, WorkersListResponse,
     };
 
     let schema_json = match command {
@@ -1579,6 +1582,10 @@ fn handle_schema_request(command: &Option<Commands>) -> Result<()> {
             }
             ConfigAction::Get { .. } => {
                 let schema = schema_for!(ConfigGetResponse);
+                serde_json::to_string_pretty(&schema)?
+            }
+            ConfigAction::Reset { .. } => {
+                let schema = schema_for!(ConfigResetResponse);
                 serde_json::to_string_pretty(&schema)?
             }
             ConfigAction::Validate => {
@@ -2123,6 +2130,9 @@ async fn handle_config(action: ConfigAction, ctx: &OutputContext) -> Result<()> 
         }
         ConfigAction::Set { key, value } => {
             commands::config_set(&key, &value, ctx)?;
+        }
+        ConfigAction::Reset { key } => {
+            commands::config_reset(&key, ctx)?;
         }
         ConfigAction::Export { format } => {
             commands::config_export(&format, ctx)?;

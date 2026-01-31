@@ -309,6 +309,14 @@ pub struct ConfigSetResponse {
     pub config_path: String,
 }
 
+/// Configuration reset response for JSON output.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConfigResetResponse {
+    pub key: String,
+    pub value: String,
+    pub config_path: String,
+}
+
 /// Issue severity for config lint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
