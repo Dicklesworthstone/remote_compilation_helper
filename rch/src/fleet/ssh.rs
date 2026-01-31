@@ -8,7 +8,9 @@
 //! and system-wide SSH settings. It complements the `rch-common/src/ssh.rs`
 //! module which uses the `openssh` crate for the compilation pipeline.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
+
+use crate::error::FleetError;
 use rch_common::WorkerConfig;
 use rch_common::mock;
 use serde::{Deserialize, Serialize};
@@ -924,13 +926,22 @@ pub fn parse_disk_space(df_output: &str) -> Result<u64> {
     // /dev/sda1  1234567890123 123456789 1111111101234  11% /
     let lines: Vec<&str> = df_output.lines().collect();
     if lines.len() < 2 {
-        bail!("Unexpected df output format: too few lines");
+        return Err(FleetError::UnexpectedOutput {
+            context: "df output: too few lines (expected header + data row)".to_string(),
+        }
+        .into());
     }
 
     let data_line = lines[1];
     let fields: Vec<&str> = data_line.split_whitespace().collect();
     if fields.len() < 4 {
-        bail!("Unexpected df output format: too few fields");
+        return Err(FleetError::UnexpectedOutput {
+            context: format!(
+                "df output: too few fields (expected at least 4, got {})",
+                fields.len()
+            ),
+        }
+        .into());
     }
 
     // Available is the 4th field (index 3)

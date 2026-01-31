@@ -18,7 +18,9 @@ use crate::fleet::ssh::SshExecutor;
 use crate::state::lock::ConfigLock;
 use crate::ui::context::OutputContext;
 use crate::ui::theme::StatusIndicator;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
+
+use crate::error::FleetError;
 use futures::stream::{self, StreamExt};
 use rch_common::WorkerConfig;
 use serde::{Deserialize, Serialize};
@@ -569,11 +571,10 @@ impl RollbackManager {
             .context("Failed to check if backup exists")?;
 
         if !check_result.success() {
-            bail!(
-                "Backup file {} does not exist on worker {}",
-                remote_backup_path,
-                worker_id
-            );
+            return Err(FleetError::NoBackupAvailable {
+                worker_id: worker_id.to_string(),
+            }
+            .into());
         }
 
         debug!(
@@ -594,11 +595,11 @@ impl RollbackManager {
             .context("Failed to copy backup to main location")?;
 
         if !restore_result.success() {
-            bail!(
-                "Failed to restore backup on worker {}: {}",
-                worker_id,
-                restore_result.stderr.trim()
-            );
+            return Err(FleetError::RollbackFailed {
+                worker_id: worker_id.to_string(),
+                reason: format!("cp command failed: {}", restore_result.stderr.trim()),
+            }
+            .into());
         }
 
         // Step 3: Ensure executable permissions (redundant with --preserve but safe)
@@ -635,12 +636,14 @@ impl RollbackManager {
             } else {
                 let actual_hash = hash_result.stdout.trim();
                 if actual_hash != backup.binary_hash {
-                    bail!(
-                        "Hash mismatch after restore on worker {}: expected {}, got {}",
-                        worker_id,
-                        backup.binary_hash,
-                        actual_hash
-                    );
+                    return Err(FleetError::RollbackFailed {
+                        worker_id: worker_id.to_string(),
+                        reason: format!(
+                            "hash mismatch: expected {}, got {}",
+                            backup.binary_hash, actual_hash
+                        ),
+                    }
+                    .into());
                 }
 
                 info!(

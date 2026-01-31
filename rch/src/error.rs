@@ -716,6 +716,26 @@ pub enum HookError {
     #[error("RCH hook is not installed")]
     #[diagnostic(code("RCH-E505"), help("Install the hook with: rch install"))]
     NotInstalled,
+
+    /// Hook operation not supported for this agent.
+    #[error("{agent} does not support hook {operation}: {reason}")]
+    #[diagnostic(
+        code("RCH-E506"),
+        help("Not all AI coding agents support hook integration. Check 'rch agent list' for supported agents.")
+    )]
+    NotSupported {
+        agent: String,
+        operation: String,
+        reason: String,
+    },
+
+    /// Hook operation not yet implemented for this agent.
+    #[error("{agent} hook {operation} is not yet implemented")]
+    #[diagnostic(
+        code("RCH-E507"),
+        help("This agent may be supported in a future release. Check for updates with 'rch update'.")
+    )]
+    NotImplemented { agent: String, operation: String },
 }
 
 // =============================================================================
@@ -724,12 +744,12 @@ pub enum HookError {
 
 /// Errors related to self-update functionality.
 ///
-/// Error code range: RCH-E506 to RCH-E510
+/// Error code range: RCH-E520 to RCH-E524
 #[derive(Error, Diagnostic, Debug)]
 pub enum UpdateError {
     /// Failed to fetch release information.
     #[error("Failed to fetch release info from GitHub")]
-    #[diagnostic(code("RCH-E506"), help("Check your internet connection and try again"))]
+    #[diagnostic(code("RCH-E520"), help("Check your internet connection and try again"))]
     FetchFailed {
         #[source]
         source: Box<dyn std::error::Error + Send + Sync>,
@@ -738,7 +758,7 @@ pub enum UpdateError {
     /// No compatible release found.
     #[error("No compatible release found for {platform}")]
     #[diagnostic(
-        code("RCH-E507"),
+        code("RCH-E521"),
         help(
             "Build from source: cargo install --git https://github.com/Dicklesworthstone/remote_compilation_helper.git"
         )
@@ -748,7 +768,7 @@ pub enum UpdateError {
     /// Checksum verification failed.
     #[error("Checksum verification failed for downloaded binary")]
     #[diagnostic(
-        code("RCH-E508"),
+        code("RCH-E522"),
         help("The download may be corrupted. Try again or download manually from GitHub.")
     )]
     ChecksumFailed { expected: String, actual: String },
@@ -756,7 +776,7 @@ pub enum UpdateError {
     /// Installation failed.
     #[error("Failed to install update")]
     #[diagnostic(
-        code("RCH-E509"),
+        code("RCH-E523"),
         help("Check that you have write permissions to the installation directory")
     )]
     InstallFailed {
@@ -767,7 +787,7 @@ pub enum UpdateError {
     /// Rollback not available.
     #[error("No backup available for rollback")]
     #[diagnostic(
-        code("RCH-E510"),
+        code("RCH-E524"),
         help("Rollback is only available after a successful update")
     )]
     NoBackup,
@@ -1024,6 +1044,110 @@ pub enum FleetError {
         help("The remote command returned unexpected output. Check worker compatibility.")
     )]
     UnexpectedOutput { context: String },
+}
+
+// =============================================================================
+// Web Dashboard Errors
+// =============================================================================
+
+/// Errors related to the web dashboard functionality.
+///
+/// Error code range: RCH-E900 to RCH-E905
+#[derive(Error, Diagnostic, Debug)]
+pub enum WebError {
+    /// Web dashboard directory not found.
+    #[error("Web dashboard directory not found")]
+    #[diagnostic(
+        code("RCH-E900"),
+        help(
+            "Expected to find the web dashboard at one of:\n  \
+            - ./web\n  \
+            - ~/.local/share/rch/web\n  \
+            - /usr/local/share/rch/web\n\n\
+            If you installed from source, run 'rch web' from the project root."
+        )
+    )]
+    DashboardNotFound,
+
+    /// Web server exited with error.
+    #[error("Web server exited with error (exit code: {exit_code:?})")]
+    #[diagnostic(
+        code("RCH-E901"),
+        help("Check the server logs for details. The web server may have encountered a startup error.")
+    )]
+    ServerExitedWithError { exit_code: Option<i32> },
+
+    /// Web server failed to start.
+    #[error("Failed to start web server: {reason}")]
+    #[diagnostic(
+        code("RCH-E902"),
+        help("Ensure bun or npm is installed and the web dependencies are available")
+    )]
+    ServerStartFailed { reason: String },
+}
+
+// =============================================================================
+// Completion Errors
+// =============================================================================
+
+/// Errors related to shell completion functionality.
+///
+/// Error code range: RCH-E910 to RCH-E915
+#[derive(Error, Diagnostic, Debug)]
+pub enum CompletionError {
+    /// Shell not supported for completion installation.
+    #[error("Shell '{shell}' is not supported for automatic completion installation")]
+    #[diagnostic(
+        code("RCH-E910"),
+        help(
+            "Supported shells for automatic installation: bash, zsh, fish, elvish, powershell\n\n\
+            For other shells, generate completions manually:\n  \
+            rch completions <shell> > ~/.rch-completions"
+        )
+    )]
+    UnsupportedShell { shell: String },
+
+    /// Completion file write failed.
+    #[error("Failed to write completion file: {path}")]
+    #[diagnostic(
+        code("RCH-E911"),
+        help("Check that you have write permissions to the completion directory")
+    )]
+    WriteFailed {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+// =============================================================================
+// Editor Errors
+// =============================================================================
+
+/// Errors related to external editor operations.
+///
+/// Error code range: RCH-E920 to RCH-E925
+#[derive(Error, Diagnostic, Debug)]
+pub enum EditorError {
+    /// Editor exited with non-zero status.
+    #[error("Editor exited with non-zero status (exit code: {exit_code:?})")]
+    #[diagnostic(
+        code("RCH-E920"),
+        help("The editor process exited with an error. Check that your $EDITOR is configured correctly.")
+    )]
+    ExitedWithError { exit_code: Option<i32> },
+
+    /// Failed to launch editor.
+    #[error("Failed to launch editor '{editor}'")]
+    #[diagnostic(
+        code("RCH-E921"),
+        help("Ensure your $EDITOR environment variable points to a valid editor")
+    )]
+    LaunchFailed {
+        editor: String,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 // =============================================================================
@@ -1333,7 +1457,7 @@ mod tests {
             formatted.contains("cargo install") || formatted.contains("source"),
             "Should suggest building from source: {formatted}"
         );
-        assert_eq!(code, Some("RCH-E507".to_string()));
+        assert_eq!(code, Some("RCH-E521".to_string()));
     }
 
     #[test]
@@ -1347,7 +1471,7 @@ mod tests {
         let report = Report::new(err);
         let formatted = format!("{:?}", report);
 
-        assert_eq!(code, Some("RCH-E508".to_string()));
+        assert_eq!(code, Some("RCH-E522".to_string()));
         assert!(
             formatted.contains("corrupted") || formatted.contains("download"),
             "Should suggest redownload: {formatted}"

@@ -3,6 +3,7 @@
 //! Provides idempotent hook installation and management for supported agents.
 
 use super::types::AgentKind;
+use crate::error::HookError;
 use crate::state::primitives::{IdempotentResult, atomic_write, create_backup};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -52,11 +53,12 @@ pub fn check_hook_status(kind: AgentKind) -> Result<HookStatus> {
 /// Install the RCH hook for an agent.
 pub fn install_hook(kind: AgentKind, dry_run: bool) -> Result<IdempotentResult> {
     if !kind.hook_support().can_install_hook() {
-        anyhow::bail!(
-            "{} does not support hook installation ({})",
-            kind.name(),
-            kind.hook_support()
-        );
+        return Err(HookError::NotSupported {
+            agent: kind.name().to_string(),
+            operation: "installation".to_string(),
+            reason: kind.hook_support().to_string(),
+        }
+        .into());
     }
 
     match kind {
@@ -64,18 +66,23 @@ pub fn install_hook(kind: AgentKind, dry_run: bool) -> Result<IdempotentResult> 
         AgentKind::GeminiCli => install_gemini_cli_hook(dry_run),
         AgentKind::CodexCli => install_codex_cli_hook(dry_run),
         AgentKind::ContinueDev => install_continue_dev_hook(dry_run),
-        _ => anyhow::bail!("{} hook installation not implemented", kind.name()),
+        _ => Err(HookError::NotImplemented {
+            agent: kind.name().to_string(),
+            operation: "installation".to_string(),
+        }
+        .into()),
     }
 }
 
 /// Uninstall the RCH hook from an agent.
 pub fn uninstall_hook(kind: AgentKind, dry_run: bool) -> Result<IdempotentResult> {
     if !kind.hook_support().can_install_hook() {
-        anyhow::bail!(
-            "{} does not support hook uninstallation ({})",
-            kind.name(),
-            kind.hook_support()
-        );
+        return Err(HookError::NotSupported {
+            agent: kind.name().to_string(),
+            operation: "uninstallation".to_string(),
+            reason: kind.hook_support().to_string(),
+        }
+        .into());
     }
 
     match kind {
@@ -83,7 +90,11 @@ pub fn uninstall_hook(kind: AgentKind, dry_run: bool) -> Result<IdempotentResult
         AgentKind::GeminiCli => uninstall_gemini_cli_hook(dry_run),
         AgentKind::CodexCli => uninstall_codex_cli_hook(dry_run),
         AgentKind::ContinueDev => uninstall_continue_dev_hook(dry_run),
-        _ => anyhow::bail!("{} hook uninstallation not implemented", kind.name()),
+        _ => Err(HookError::NotImplemented {
+            agent: kind.name().to_string(),
+            operation: "uninstallation".to_string(),
+        }
+        .into()),
     }
 }
 

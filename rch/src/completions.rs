@@ -8,8 +8,9 @@ use clap::CommandFactory;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::Cli;
+use crate::error::CompletionError;
 use crate::ui::OutputContext;
+use crate::Cli;
 
 /// Standard installation paths for each shell
 #[derive(Debug, Clone)]
@@ -83,7 +84,10 @@ pub fn get_install_paths(shell: clap_complete::Shell) -> Result<InstallPaths> {
                 rc_line: Some("use rch".to_string()),
             })
         }
-        _ => anyhow::bail!("Unsupported shell for installation: {:?}", shell),
+        _ => Err(CompletionError::UnsupportedShell {
+            shell: format!("{:?}", shell),
+        }
+        .into()),
     }
 }
 

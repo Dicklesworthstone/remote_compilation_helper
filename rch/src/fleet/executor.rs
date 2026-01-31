@@ -18,7 +18,9 @@ use crate::fleet::rollback::{
 use crate::fleet::ssh::{CommandOutput, FleetSshError, SshExecutor};
 use crate::ui::context::OutputContext;
 use crate::ui::theme::StatusIndicator;
-use anyhow::{Result, bail};
+use anyhow::Result;
+
+use crate::error::{FleetError, SshError};
 use futures::future::BoxFuture;
 use rch_common::{WorkerConfig, WorkerId};
 use serde::{Deserialize, Serialize};
@@ -458,7 +460,13 @@ async fn test_ssh_connectivity(worker: &WorkerConfig) -> Result<()> {
     if ssh.check_connectivity().await? {
         Ok(())
     } else {
-        bail!("SSH connection failed to {}", worker.host)
+        Err(SshError::ConnectionFailed {
+            host: worker.host.clone(),
+            user: worker.user.clone(),
+            key_path: worker.identity_file.clone().into(),
+            message: "connectivity check returned false".to_string(),
+        }
+        .into())
     }
 }
 
@@ -513,7 +521,10 @@ async fn verify_installation(worker: &WorkerConfig) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("health check failed: {}", e))?;
 
     if !output.success() {
-        bail!("health check failed: {}", output.stderr.trim());
+        return Err(FleetError::HealthCheckFailed {
+            reason: output.stderr.trim().to_string(),
+        }
+        .into());
     }
 
     Ok(())

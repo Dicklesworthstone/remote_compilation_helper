@@ -17,7 +17,9 @@ use crate::commands::load_workers_from_config;
 use crate::config::load_config;
 use crate::ui::context::OutputContext;
 use crate::ui::theme::StatusIndicator;
-use anyhow::{Result, bail};
+use anyhow::Result;
+
+use crate::error::BinaryError;
 use rch_common::{ApiError, ApiResponse, ErrorCode};
 use std::path::PathBuf;
 
@@ -799,10 +801,10 @@ fn find_local_binary(name: &str) -> Result<PathBuf> {
         }
     }
 
-    bail!(
-        "Could not find {} binary. Build with 'cargo build --release -p rch-wkr'",
-        name
-    )
+    Err(BinaryError::NotFound {
+        name: name.to_string(),
+    }
+    .into())
 }
 
 #[cfg(test)]
