@@ -163,12 +163,12 @@ pub(super) fn find_local_binary(name: &str) -> Result<PathBuf> {
     }
 
     // Check if it's in PATH
-    if let Ok(output) = std::process::Command::new("which").arg(name).output() {
-        if output.status.success() {
-            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !path.is_empty() {
-                return Ok(PathBuf::from(path));
-            }
+    if let Ok(output) = std::process::Command::new("which").arg(name).output()
+        && output.status.success()
+    {
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !path.is_empty() {
+            return Ok(PathBuf::from(path));
         }
     }
 
@@ -233,10 +233,7 @@ async fn deploy_binary_to_worker(
     }
 
     // Check remote version
-    let remote_version = match get_remote_version(worker).await {
-        Ok(v) => Some(v),
-        Err(_) => None,
-    };
+    let remote_version = get_remote_version(worker).await.ok();
 
     // Determine if we need to deploy
     let needs_deploy = if force {

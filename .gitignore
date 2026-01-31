@@ -5,6 +5,7 @@
 # Build artifacts
 /target/
 **/target/
+dist/
 tests/true_e2e/fixtures/**/target/
 **/*.rs.bk
 Cargo.lock

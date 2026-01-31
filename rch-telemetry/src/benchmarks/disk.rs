@@ -904,8 +904,9 @@ mod tests {
 
         // Run again to check variance
         let result2 = benchmark.run_stable(3);
-        let variance = if result.score > 0.0 {
-            ((result.score - result2.score) / result.score).abs()
+        let baseline = (result.score + result2.score) / 2.0;
+        let variance = if baseline > 0.0 {
+            ((result.score - result2.score) / baseline).abs()
         } else {
             0.0
         };
@@ -915,7 +916,7 @@ mod tests {
             variance * 100.0
         );
 
-        // Allow up to 100% variance in tests (CI and concurrent tests can be noisy).
+        // Allow up to 100% variance in tests (relative to the average score).
         // Production target is <10% but test environments vary significantly
         // due to concurrent processes, I/O contention, and shared runners.
         assert!(variance < 1.0);
