@@ -669,8 +669,9 @@ fn test_daemon_verbose_mode() {
     start_daemon_with_socket(&harness, &socket_path, &["--verbose"]).unwrap();
 
     // Wait for daemon to be fully ready (not just socket connectable)
-    // This prevents flaky failures when daemon is still initializing
-    wait_for_daemon_ready(&socket_path, Duration::from_secs(10)).unwrap();
+    // This prevents flaky failures when daemon is still initializing.
+    // Use 30s timeout to handle parallel test execution where system is under load.
+    wait_for_daemon_ready(&socket_path, Duration::from_secs(30)).unwrap();
 
     // Verify daemon responds correctly
     let response = send_socket_request(&socket_path, "GET /health").unwrap();

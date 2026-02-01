@@ -49,7 +49,7 @@ shell-escape = "0.1.5"
 which = "8"
 
 # LRU cache for classification decisions
-lru = "0.12"
+lru = "0.16"
 
 # Async stream utilities for parallel operations
 futures = "0.3"
