@@ -158,10 +158,12 @@ jobs:
             cargo_args: --workspace
           - name: macos-x64
             os: macos-15-intel
-            cargo_args: --workspace
+            # macOS: exclude rchd (daemon) tests due to CI environment issues with Unix sockets
+            cargo_args: --workspace --exclude rchd
           - name: macos-arm64
             os: macos-14
-            cargo_args: --workspace
+            # macOS: exclude rchd (daemon) tests due to CI environment issues with Unix sockets
+            cargo_args: --workspace --exclude rchd
           - name: windows-x64
             os: windows-latest
             # Windows: only test rch-wkr (cross-platform worker) - other crates have Unix/rich_rust deps
