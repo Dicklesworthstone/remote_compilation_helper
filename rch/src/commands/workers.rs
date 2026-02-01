@@ -3,6 +3,8 @@
 //! This module contains commands for listing, probing, benchmarking, and managing
 //! the worker fleet.
 
+#[cfg(not(unix))]
+use crate::error::PlatformError;
 use anyhow::{Context, Result};
 use rch_common::{
     ApiError, ApiResponse, ErrorCode, RequiredRuntime, WorkerCapabilities, WorkerConfig,
@@ -10,8 +12,6 @@ use rch_common::{
 };
 #[cfg(unix)]
 use rch_common::{SshClient, SshOptions};
-#[cfg(not(unix))]
-use crate::error::PlatformError;
 use std::path::{Path, PathBuf};
 
 use crate::status_types::{
@@ -803,8 +803,7 @@ pub async fn workers_probe(
                         }
                     }
                     Err(e) => {
-                        let ssh_error =
-                            classify_ssh_error(worker, &e, ssh_options.connect_timeout);
+                        let ssh_error = classify_ssh_error(worker, &e, ssh_options.connect_timeout);
                         let report = format_ssh_report(ssh_error);
                         if ctx.is_json() {
                             results.push(WorkerProbeResult {

@@ -70,6 +70,7 @@ whoami = "2"
 rch-common = { workspace = true, features = ["rich-ui"] }
 proptest = "1.7.0"
 ctor = { workspace = true }
+serial_test = "3.2"
 
 [lints.rust]
 unsafe_code = "forbid"

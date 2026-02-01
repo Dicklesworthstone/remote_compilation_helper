@@ -297,6 +297,7 @@ impl TransferPipeline {
     ///
     /// Different command types may need different timeouts. For example,
     /// test commands often need longer timeouts than build commands.
+    #[cfg(unix)]
     #[allow(dead_code)] // Reserved for future CLI/config support
     pub fn with_command_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.ssh_options.command_timeout = timeout;
@@ -1027,31 +1028,34 @@ impl TransferPipeline {
             escaped_identity
         );
 
-        if let Some(interval) = self.ssh_options.server_alive_interval {
-            let secs = interval.as_secs();
-            if secs > 0 {
-                command.push_str(&format!(" -o ServerAliveInterval={secs}"));
-            }
-        }
-
-        if let Some(idle) = self.ssh_options.control_persist_idle {
-            let control_dir = self.rsync_control_dir();
-            if let Err(e) = std::fs::create_dir_all(&control_dir) {
-                warn!(
-                    "Failed to create rsync SSH control dir {:?}: {}",
-                    control_dir, e
-                );
+        #[cfg(unix)]
+        {
+            if let Some(interval) = self.ssh_options.server_alive_interval {
+                let secs = interval.as_secs();
+                if secs > 0 {
+                    command.push_str(&format!(" -o ServerAliveInterval={secs}"));
+                }
             }
 
-            let control_path = control_dir.join("rch-rsync-%C");
-            let escaped_control_path = escape(control_path.to_string_lossy());
-            command.push_str(" -o ControlMaster=auto");
-            command.push_str(&format!(" -o ControlPath={}", escaped_control_path));
+            if let Some(idle) = self.ssh_options.control_persist_idle {
+                let control_dir = self.rsync_control_dir();
+                if let Err(e) = std::fs::create_dir_all(&control_dir) {
+                    warn!(
+                        "Failed to create rsync SSH control dir {:?}: {}",
+                        control_dir, e
+                    );
+                }
 
-            if idle.is_zero() {
-                command.push_str(" -o ControlPersist=no");
-            } else {
-                command.push_str(&format!(" -o ControlPersist={}s", idle.as_secs()));
+                let control_path = control_dir.join("rch-rsync-%C");
+                let escaped_control_path = escape(control_path.to_string_lossy());
+                command.push_str(" -o ControlMaster=auto");
+                command.push_str(&format!(" -o ControlPath={}", escaped_control_path));
+
+                if idle.is_zero() {
+                    command.push_str(" -o ControlPersist=no");
+                } else {
+                    command.push_str(&format!(" -o ControlPersist={}s", idle.as_secs()));
+                }
             }
         }
 

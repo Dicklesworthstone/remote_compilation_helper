@@ -422,10 +422,14 @@ impl TestHarness {
         S: AsRef<OsStr>,
     {
         let mut cmd = Command::new(program);
+        // Use Stdio::null() to prevent pipe buffer blocking. Long-running
+        // daemon processes can fill the 64KB pipe buffer on Linux, blocking
+        // on write and becoming unresponsive to socket requests. Since no
+        // test reads from the daemon's piped stdout/stderr, null is correct.
         cmd.args(args)
             .current_dir(&self.test_dir)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
 
         // Set default environment variables
         for (k, v) in &self.config.env_vars {

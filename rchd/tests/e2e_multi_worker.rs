@@ -10,11 +10,16 @@
 //! - Worker lifecycle (registration, health monitoring, removal)
 //!
 //! These tests use the E2E test harness from rch-common.
+//!
+//! All tests are serialized because each spawns a daemon process, and running
+//! 10 daemons concurrently causes resource contention that leads to flaky
+//! socket timeouts.
 
 use rch_common::e2e::{
     DaemonConfigFixture, HarnessResult, TestHarness, TestHarnessBuilder, WorkerFixture,
     WorkersFixture,
 };
+use serial_test::serial;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -81,14 +86,12 @@ fn start_daemon_with_socket(
 /// Send a request to the daemon via Unix socket and get the response.
 fn send_socket_request(socket_path: &std::path::Path, request: &str) -> std::io::Result<String> {
     // De-flake: on heavily loaded systems, the daemon can accept then close before writing.
-    // The daemon binds its socket before reaching the accept loop, so the socket may be
-    // connectable before the daemon is ready to process requests. Use exponential backoff
-    // with generous timeouts to handle slow startup (especially with multiple workers).
+    // Retry a few times to avoid spurious empty responses.
     let mut last_error = None;
-    for attempt in 0..8 {
+    for attempt in 0..5 {
         let result: std::io::Result<String> = (|| {
             let mut stream = UnixStream::connect(socket_path)?;
-            stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+            stream.set_read_timeout(Some(Duration::from_secs(5)))?;
             stream.set_write_timeout(Some(Duration::from_secs(5)))?;
 
             writeln!(stream, "{}", request)?;
@@ -115,10 +118,8 @@ fn send_socket_request(socket_path: &std::path::Path, request: &str) -> std::io:
             Err(err) => last_error = Some(err),
         }
 
-        if attempt < 7 {
-            // Exponential backoff: 200ms, 400ms, 800ms, 1600ms, 3200ms, 6400ms, 12800ms
-            let delay = Duration::from_millis(200 << attempt);
-            std::thread::sleep(delay);
+        if attempt < 4 {
+            std::thread::sleep(Duration::from_millis(50));
         }
     }
 
@@ -136,25 +137,6 @@ fn extract_json_body(response: &str) -> Option<&str> {
     } else {
         None
     }
-}
-
-/// Wait for the daemon API to be fully responsive (not just the socket to exist).
-/// The socket is bound before the daemon reaches its accept loop, so we need to
-/// verify the daemon can actually process and respond to requests.
-fn wait_for_daemon_ready(socket_path: &std::path::Path, timeout: Duration) {
-    let start = std::time::Instant::now();
-    while start.elapsed() < timeout {
-        if let Ok(response) = send_socket_request(socket_path, "GET /status") {
-            if response.contains("200 OK") {
-                return;
-            }
-        }
-        std::thread::sleep(Duration::from_millis(500));
-    }
-    panic!(
-        "Daemon did not become ready within {:?}",
-        timeout
-    );
 }
 
 /// Create a custom worker fixture for testing.
@@ -187,6 +169,7 @@ fn parse_selection_response(body: &str) -> Option<serde_json::Value> {
 /// Test that jobs are distributed across workers based on slot capacity.
 /// Workers with more slots should receive proportionally more jobs.
 #[test]
+#[serial]
 fn test_load_balance_distribution() {
     let _guard = rch_common::test_guard!();
     let harness = create_multi_worker_harness("load_balance_distribution").unwrap();
@@ -215,9 +198,6 @@ fn test_load_balance_distribution() {
     harness
         .wait_for_socket(&socket_path, Duration::from_secs(10))
         .unwrap();
-
-    // Wait for daemon API to be fully responsive (socket exists before accept loop)
-    wait_for_daemon_ready(&socket_path, Duration::from_secs(30));
 
     // Submit multiple selection requests and track distribution
     let mut distribution: HashMap<String, u32> = HashMap::new();
@@ -283,6 +263,7 @@ fn test_load_balance_distribution() {
 /// worker should be selected when slots are available. The test verifies
 /// that high-priority worker is selected for the majority of requests.
 #[test]
+#[serial]
 fn test_worker_prioritization() {
     let _guard = rch_common::test_guard!();
     let harness = create_multi_worker_harness("worker_prioritization").unwrap();
@@ -363,6 +344,7 @@ fn test_worker_prioritization() {
 
 /// Test that repeat builds for the same project prefer the same worker.
 #[test]
+#[serial]
 fn test_cached_project_locality() {
     let _guard = rch_common::test_guard!();
     let harness = create_multi_worker_harness("cached_project_locality").unwrap();
@@ -390,9 +372,6 @@ fn test_cached_project_locality() {
     harness
         .wait_for_socket(&socket_path, Duration::from_secs(10))
         .unwrap();
-
-    // Wait for daemon API to be fully responsive (socket exists before accept loop)
-    wait_for_daemon_ready(&socket_path, Duration::from_secs(30));
 
     // Make first selection for a project
     let response = send_socket_request(
@@ -463,6 +442,7 @@ fn test_cached_project_locality() {
 
 /// Test capability-based routing with Rust-only and Bun-only workers.
 #[test]
+#[serial]
 fn test_heterogeneous_workers() {
     let _guard = rch_common::test_guard!();
     let harness = create_multi_worker_harness("heterogeneous_workers").unwrap();
@@ -530,6 +510,7 @@ fn test_heterogeneous_workers() {
 
 /// Test worker registration - fresh worker joins fleet.
 #[test]
+#[serial]
 fn test_worker_registration() {
     let _guard = rch_common::test_guard!();
     let harness = create_multi_worker_harness("worker_registration").unwrap();
@@ -567,6 +548,7 @@ fn test_worker_registration() {
 
 /// Test worker health monitoring - health check success and failure paths.
 #[test]
+#[serial]
 fn test_worker_health_monitoring() {
     let _guard = rch_common::test_guard!();
     let harness = create_multi_worker_harness("worker_health_monitoring").unwrap();
@@ -609,6 +591,7 @@ fn test_worker_health_monitoring() {
 
 /// Test that job selection avoids unhealthy workers.
 #[test]
+#[serial]
 fn test_selection_avoids_unhealthy() {
     let _guard = rch_common::test_guard!();
     let harness = create_multi_worker_harness("selection_avoids_unhealthy").unwrap();
@@ -660,6 +643,7 @@ fn test_selection_avoids_unhealthy() {
 
 /// Test graceful worker shutdown - worker removed from pool.
 #[test]
+#[serial]
 fn test_worker_graceful_shutdown() {
     let _guard = rch_common::test_guard!();
     let harness = create_multi_worker_harness("worker_graceful_shutdown").unwrap();
@@ -701,6 +685,7 @@ fn test_worker_graceful_shutdown() {
 
 /// Test fleet down to single worker scenario.
 #[test]
+#[serial]
 fn test_fleet_single_worker_fallback() {
     let _guard = rch_common::test_guard!();
     let harness = create_multi_worker_harness("fleet_single_worker_fallback").unwrap();
@@ -744,6 +729,7 @@ fn test_fleet_single_worker_fallback() {
 
 /// Test that no workers available returns appropriate response.
 #[test]
+#[serial]
 fn test_no_workers_available() {
     let _guard = rch_common::test_guard!();
     let harness = create_multi_worker_harness("no_workers_available").unwrap();
