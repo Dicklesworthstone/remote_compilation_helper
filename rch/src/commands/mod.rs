@@ -164,7 +164,7 @@ mod tests {
         collect_local_capability_warnings, has_any_capabilities, summarize_capabilities,
     };
     use super::*;
-    use crate::status_types::{format_bytes, WorkerCapabilitiesFromApi};
+    use crate::status_types::{WorkerCapabilitiesFromApi, format_bytes};
     use crate::ui::context::{OutputConfig, OutputContext, OutputMode};
     use crate::ui::writer::SharedOutputBuffer;
     use rch_common::test_guard;

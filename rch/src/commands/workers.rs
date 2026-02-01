@@ -1361,4 +1361,3 @@ pub async fn workers_disable(
 
     Ok(())
 }
-
