@@ -5,11 +5,13 @@
 
 use anyhow::{Context, Result};
 use rch_common::{
-    ApiError, ApiResponse, ErrorCode, RequiredRuntime, WorkerCapabilities,
-    WorkerConfig, classify_command_detailed,
+    ApiError, ApiResponse, ErrorCode, RequiredRuntime, WorkerCapabilities, WorkerConfig,
+    classify_command_detailed,
 };
 #[cfg(unix)]
 use rch_common::{SshClient, SshOptions};
+#[cfg(not(unix))]
+use crate::error::PlatformError;
 use std::path::{Path, PathBuf};
 
 use crate::status_types::{
@@ -664,7 +666,20 @@ pub async fn workers_capabilities(
     Ok(())
 }
 
+/// Probe worker connectivity (not available on non-Unix platforms).
+#[cfg(not(unix))]
+pub async fn workers_probe(
+    _worker_id: Option<String>,
+    _all: bool,
+    _ctx: &OutputContext,
+) -> Result<()> {
+    Err(PlatformError::UnixOnly {
+        feature: "worker probe".to_string(),
+    })?
+}
+
 /// Probe worker connectivity.
+#[cfg(unix)]
 pub async fn workers_probe(
     worker_id: Option<String>,
     all: bool,
@@ -788,7 +803,8 @@ pub async fn workers_probe(
                         }
                     }
                     Err(e) => {
-                        let ssh_error = classify_ssh_error(worker, &e, ssh_options.connect_timeout);
+                        let ssh_error =
+                            classify_ssh_error(worker, &e, ssh_options.connect_timeout);
                         let report = format_ssh_report(ssh_error);
                         if ctx.is_json() {
                             results.push(WorkerProbeResult {
@@ -838,7 +854,16 @@ pub async fn workers_probe(
     Ok(())
 }
 
+/// Run worker benchmarks (not available on non-Unix platforms).
+#[cfg(not(unix))]
+pub async fn workers_benchmark(_ctx: &OutputContext) -> Result<()> {
+    Err(PlatformError::UnixOnly {
+        feature: "worker benchmark".to_string(),
+    })?
+}
+
 /// Run worker benchmarks.
+#[cfg(unix)]
 pub async fn workers_benchmark(ctx: &OutputContext) -> Result<()> {
     let workers = load_workers_from_config()?;
     let style = ctx.theme();

@@ -7,6 +7,7 @@
 
 use crate::ssh_utils::CommandResult;
 use crate::types::{WorkerConfig, WorkerId};
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -24,12 +25,12 @@ struct MockOverrides {
     enabled: Option<bool>,
     ssh_config: Option<MockConfig>,
     rsync_config: Option<MockRsyncConfig>,
-    /// Active "override scopes" to reduce cross-test flakiness.
+    /// Active "override scopes" to prevent premature clearing.
     ///
-    /// Some workspace tests run in parallel and share these global overrides.
-    /// We treat `set_mock_enabled_override(Some(_))` + `clear_mock_overrides()`
-    /// as a push/pop pair so one test can't accidentally disable mock mode
-    /// while another is still running.
+    /// Workspace tests run in parallel and share these global overrides.
+    /// `set_mock_enabled_override(Some(_))` + `clear_mock_overrides()`
+    /// form a push/pop pair so `clear_mock_overrides` doesn't wipe SSH/rsync
+    /// configs while another test still needs them.
     active_scopes: usize,
 }
 
@@ -38,13 +39,53 @@ fn overrides() -> &'static Mutex<MockOverrides> {
     OVERRIDES.get_or_init(|| Mutex::new(MockOverrides::default()))
 }
 
-/// Set or clear the mock enabled override (test helper).
+// ---------------------------------------------------------------------------
+// Thread-local mock override
+// ---------------------------------------------------------------------------
+//
+// The global `MockOverrides` is shared across all test threads in a crate.
+// When parallel tests write conflicting values to the `enabled` field, they
+// race: test A sets `Some(true)`, test B sets `Some(false)`, and whichever
+// runs last wins — breaking the other test's assertion.
+//
+// A thread-local override eliminates this: each test thread has its own
+// `Option<bool>` that `is_mock_enabled()` checks first, before falling
+// back to the global state. Tests that need deterministic mock-enabled
+// behavior should use `set_thread_mock_override` instead of — or in
+// addition to — the global `set_mock_enabled_override`.
+
+thread_local! {
+    static THREAD_MOCK_ENABLED: Cell<Option<bool>> = const { Cell::new(None) };
+}
+
+/// Set a thread-local mock-enabled override.
+///
+/// Takes priority over the global override and environment variable in
+/// `is_mock_enabled()`. Automatically scoped to the calling thread's
+/// lifetime, so each `#[test]` gets independent control.
+pub fn set_thread_mock_override(enabled: Option<bool>) {
+    THREAD_MOCK_ENABLED.with(|c| c.set(enabled));
+}
+
+/// Clear the thread-local mock-enabled override.
+pub fn clear_thread_mock_override() {
+    THREAD_MOCK_ENABLED.with(|c| c.set(None));
+}
+
+/// Set or clear the global mock enabled override (test helper).
+///
+/// Also sets the thread-local override so that `is_mock_enabled()` returns
+/// the correct value for the calling test thread even when parallel tests
+/// write conflicting values to the global `enabled` field.
 pub fn set_mock_enabled_override(enabled: Option<bool>) {
     let mut guard = overrides().lock().unwrap();
     if enabled.is_some() {
         guard.active_scopes = guard.active_scopes.saturating_add(1);
     }
     guard.enabled = enabled;
+    drop(guard);
+    // Mirror into thread-local so the calling thread sees its own value.
+    THREAD_MOCK_ENABLED.with(|c| c.set(enabled));
 }
 
 /// Set or clear the mock SSH config override (test helper).
@@ -57,7 +98,7 @@ pub fn set_mock_rsync_config_override(config: Option<MockRsyncConfig>) {
     overrides().lock().unwrap().rsync_config = config;
 }
 
-/// Clear all mock overrides.
+/// Clear all mock overrides (global and thread-local).
 pub fn clear_mock_overrides() {
     let mut guard = overrides().lock().unwrap();
     if guard.active_scopes > 0 {
@@ -68,10 +109,23 @@ pub fn clear_mock_overrides() {
         guard.ssh_config = None;
         guard.rsync_config = None;
     }
+    drop(guard);
+    // Clear the thread-local override so the calling thread falls back to
+    // the global state (or env var) on subsequent checks.
+    THREAD_MOCK_ENABLED.with(|c| c.set(None));
 }
 
-/// Check if mock mode is enabled via override or environment variable.
+/// Check if mock mode is enabled.
+///
+/// Priority order:
+/// 1. Thread-local override (parallel-safe, set by the calling test)
+/// 2. Global `enabled` field (shared across threads)
+/// 3. `RCH_MOCK_SSH` environment variable
 pub fn is_mock_enabled() -> bool {
+    // Thread-local override is checked first — immune to parallel clobbering.
+    if let Some(enabled) = THREAD_MOCK_ENABLED.with(|c| c.get()) {
+        return enabled;
+    }
     if let Some(enabled) = overrides().lock().unwrap().enabled {
         return enabled;
     }
@@ -850,7 +904,8 @@ mod tests {
 
     #[test]
     fn test_is_mock_enabled_default() {
-        // With override disabled, should be false
+        // Thread-local override makes this parallel-safe: the calling thread
+        // sees its own value regardless of what other threads write.
         set_mock_enabled_override(Some(false));
         assert!(!is_mock_enabled());
         clear_mock_overrides();

@@ -20,6 +20,7 @@ pub mod state;
 mod status_display;
 mod status_types;
 mod toolchain;
+#[cfg_attr(not(unix), path = "transfer_stub.rs")]
 mod transfer;
 pub mod tui;
 pub mod ui;

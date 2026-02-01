@@ -8,8 +8,8 @@ use anyhow::{Context, Result};
 use rch_common::mock::{self, MockConfig, MockRsync, MockRsyncConfig, MockSshClient};
 use rch_common::ssh_utils::{EnvPrefix, build_env_prefix, is_retryable_transport_error};
 use rch_common::{
-    ColorMode, CommandResult, CompilationKind, RetryConfig, ToolchainInfo,
-    TransferConfig, WorkerConfig, wrap_command_with_color, wrap_command_with_toolchain,
+    ColorMode, CommandResult, CompilationKind, RetryConfig, ToolchainInfo, TransferConfig,
+    WorkerConfig, wrap_command_with_color, wrap_command_with_toolchain,
 };
 #[cfg(unix)]
 use rch_common::{SshClient, SshOptions};
@@ -170,6 +170,7 @@ pub struct TransferPipeline {
     /// Transfer configuration.
     transfer_config: TransferConfig,
     /// SSH options.
+    #[cfg(unix)]
     ssh_options: SshOptions,
     /// Color mode for remote command output.
     color_mode: ColorMode,
@@ -239,6 +240,7 @@ impl TransferPipeline {
             );
         }
 
+        #[cfg(unix)]
         let ssh_options = SshOptions {
             server_alive_interval: transfer_config
                 .ssh_server_alive_interval_secs
@@ -254,6 +256,7 @@ impl TransferPipeline {
             project_id: safe_project_id,
             project_hash: safe_project_hash,
             transfer_config,
+            #[cfg(unix)]
             ssh_options,
             color_mode: ColorMode::default(),
             env_allowlist: Vec::new(),
@@ -264,6 +267,7 @@ impl TransferPipeline {
     }
 
     /// Set custom SSH options.
+    #[cfg(unix)]
     #[allow(dead_code)] // Reserved for future CLI/config support
     pub fn with_ssh_options(mut self, options: SshOptions) -> Self {
         self.ssh_options = options;
@@ -875,23 +879,34 @@ impl TransferPipeline {
             rch_common::util::mask_sensitive_command(command)
         );
 
-        let mut client = SshClient::new(worker.clone(), self.ssh_options.clone());
-        client.connect().await?;
-
-        let result = client.execute(&wrapped_command).await?;
-
-        client.disconnect().await?;
-
-        if result.success() {
-            info!("Command succeeded in {}ms", result.duration_ms);
-        } else {
-            warn!(
-                "Command failed (exit={}) in {}ms",
-                result.exit_code, result.duration_ms
-            );
+        #[cfg(not(unix))]
+        {
+            return Err(crate::error::PlatformError::UnixOnly {
+                feature: "SSH remote execution".to_string(),
+            }
+            .into());
         }
 
-        Ok(result)
+        #[cfg(unix)]
+        {
+            let mut client = SshClient::new(worker.clone(), self.ssh_options.clone());
+            client.connect().await?;
+
+            let result = client.execute(&wrapped_command).await?;
+
+            client.disconnect().await?;
+
+            if result.success() {
+                info!("Command succeeded in {}ms", result.duration_ms);
+            } else {
+                warn!(
+                    "Command failed (exit={}) in {}ms",
+                    result.exit_code, result.duration_ms
+                );
+            }
+
+            Ok(result)
+        }
     }
 
     /// Execute a command and stream output in real-time.
@@ -923,16 +938,27 @@ impl TransferPipeline {
             return Ok(result);
         }
 
-        let mut client = SshClient::new(worker.clone(), self.ssh_options.clone());
-        client.connect().await?;
+        #[cfg(not(unix))]
+        {
+            return Err(crate::error::PlatformError::UnixOnly {
+                feature: "SSH remote streaming".to_string(),
+            }
+            .into());
+        }
 
-        let result = client
-            .execute_streaming(&wrapped_command, on_stdout, on_stderr)
-            .await?;
+        #[cfg(unix)]
+        {
+            let mut client = SshClient::new(worker.clone(), self.ssh_options.clone());
+            client.connect().await?;
 
-        client.disconnect().await?;
+            let result = client
+                .execute_streaming(&wrapped_command, on_stdout, on_stderr)
+                .await?;
 
-        Ok(result)
+            client.disconnect().await?;
+
+            Ok(result)
+        }
     }
 
     /// Build rsync command for retrieve_artifacts.
@@ -1220,20 +1246,31 @@ impl TransferPipeline {
 
         info!("Cleaning up {} on {}", remote_path, worker.id);
 
-        let mut client = SshClient::new(worker.clone(), self.ssh_options.clone());
-        client.connect().await?;
-
-        let result = client
-            .execute(&format!("rm -rf {}", escaped_remote_path))
-            .await?;
-
-        client.disconnect().await?;
-
-        if !result.success() {
-            warn!("Cleanup failed: {}", result.stderr);
+        #[cfg(not(unix))]
+        {
+            return Err(crate::error::PlatformError::UnixOnly {
+                feature: "SSH remote cleanup".to_string(),
+            }
+            .into());
         }
 
-        Ok(())
+        #[cfg(unix)]
+        {
+            let mut client = SshClient::new(worker.clone(), self.ssh_options.clone());
+            client.connect().await?;
+
+            let result = client
+                .execute(&format!("rm -rf {}", escaped_remote_path))
+                .await?;
+
+            client.disconnect().await?;
+
+            if !result.success() {
+                warn!("Cleanup failed: {}", result.stderr);
+            }
+
+            Ok(())
+        }
     }
 }
 

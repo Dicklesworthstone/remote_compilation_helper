@@ -120,12 +120,13 @@ fn normalize_uri(uri: String) -> String {
 #[allow(unsafe_code)]
 mod tests {
     use super::*;
-    use crate::mock::{clear_mock_overrides, is_mock_enabled};
+    use crate::mock::{clear_mock_overrides, clear_thread_mock_override, is_mock_enabled};
     use std::env;
 
     fn clear_env() {
         // SAFETY: Tests control env var lifecycle within the module.
         unsafe { env::remove_var("RCH_MOCK_SSH") };
+        clear_thread_mock_override();
     }
 
     #[test]

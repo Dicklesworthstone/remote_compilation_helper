@@ -6,7 +6,8 @@
 
 use crate::error::PlatformError;
 use rch_common::{
-    CommandPriority, CompilationKind, RequiredRuntime, SelectionResponse, ToolchainInfo, WorkerId,
+    CommandPriority, CommandTimingBreakdown, CompilationKind, RequiredRuntime, SelectionResponse,
+    ToolchainInfo, WorkerId,
 };
 use std::io::Read;
 
@@ -52,6 +53,7 @@ pub(crate) async fn release_worker(
     _exit_code: Option<i32>,
     _duration_ms: Option<u64>,
     _bytes_transferred: Option<u64>,
+    _timing: Option<&CommandTimingBreakdown>,
 ) -> anyhow::Result<()> {
     Ok(())
 }

@@ -336,7 +336,8 @@ fn check_daemon_status(diagnostics: &mut Vec<DoctorDiagnostic>) {
         diagnostics.push(DoctorDiagnostic {
             severity: DoctorSeverity::Info,
             code: "DOC-I062".to_string(),
-            message: "Daemon status check skipped (Unix sockets not available on this platform)".to_string(),
+            message: "Daemon status check skipped (Unix sockets not available on this platform)"
+                .to_string(),
             detail: None,
             remediation: None,
         });
