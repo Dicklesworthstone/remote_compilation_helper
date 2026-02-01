@@ -164,7 +164,8 @@ jobs:
             cargo_args: --workspace
           - name: windows-x64
             os: windows-latest
-            cargo_args: --no-default-features --workspace
+            # Windows: only test rch-wkr (cross-platform worker) - other crates have Unix/rich_rust deps
+            cargo_args: --no-default-features -p rch-wkr -p rch-telemetry
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     needs: check
