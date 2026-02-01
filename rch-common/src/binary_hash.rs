@@ -6,7 +6,8 @@
 
 use anyhow::{Context, Result, anyhow};
 use blake3::Hasher;
-use object::{Object, ObjectSection};
+use object::read::macho::{FatArch, MachOFatFile32, MachOFatFile64};
+use object::{Architecture, Object, ObjectSection};
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::{BufReader, Read};
@@ -47,6 +48,91 @@ fn compute_full_hash(path: &Path) -> Result<String> {
     Ok(hasher.finalize().to_hex().to_string())
 }
 
+/// Get the current architecture for selecting the right slice from a fat binary.
+#[cfg(target_arch = "x86_64")]
+fn native_architecture() -> Architecture {
+    Architecture::X86_64
+}
+
+#[cfg(target_arch = "aarch64")]
+fn native_architecture() -> Architecture {
+    Architecture::Aarch64
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+fn native_architecture() -> Architecture {
+    Architecture::Unknown
+}
+
+/// Try to extract a slice from a fat binary using the given arch list.
+fn try_extract_from_fat<'a, F: FatArch>(
+    data: &'a [u8],
+    arches: &[F],
+    native_arch: Architecture,
+) -> Option<&'a [u8]> {
+    // First try to find a slice matching our native architecture
+    for arch in arches {
+        if arch.architecture() == native_arch {
+            if let Ok(slice) = arch.data(data) {
+                info!("Extracted {:?} slice from fat binary", native_arch);
+                return Some(slice);
+            }
+        }
+    }
+
+    // No exact match found, use the first valid slice
+    if let Some(arch) = arches.first() {
+        if let Ok(slice) = arch.data(data) {
+            info!("Using first available slice from fat binary");
+            return Some(slice);
+        }
+    }
+
+    None
+}
+
+/// Extract the appropriate binary slice from a fat/universal binary.
+///
+/// macOS universal binaries (fat binaries) contain multiple architecture slices.
+/// This function extracts the slice matching the current native architecture,
+/// or the first available slice if no exact match is found.
+///
+/// For non-fat binaries, returns the original data unchanged.
+fn extract_binary_slice(data: &[u8]) -> Result<&[u8]> {
+    // Try parsing as 32-bit fat binary first (more common)
+    if let Ok(fat) = MachOFatFile32::parse(data) {
+        let arches = fat.arches();
+        if arches.is_empty() {
+            return Err(anyhow!("Fat binary contains no architecture slices"));
+        }
+
+        let native_arch = native_architecture();
+        if let Some(slice) = try_extract_from_fat(data, arches, native_arch) {
+            return Ok(slice);
+        }
+        return Err(anyhow!("Failed to extract any valid slice from fat binary"));
+    }
+
+    // Try parsing as 64-bit fat binary
+    if let Ok(fat) = MachOFatFile64::parse(data) {
+        let arches = fat.arches();
+        if arches.is_empty() {
+            return Err(anyhow!("Fat64 binary contains no architecture slices"));
+        }
+
+        let native_arch = native_architecture();
+        if let Some(slice) = try_extract_from_fat(data, arches, native_arch) {
+            return Ok(slice);
+        }
+        return Err(anyhow!(
+            "Failed to extract any valid slice from fat64 binary"
+        ));
+    }
+
+    // Not a fat binary, return as-is
+    Ok(data)
+}
+
 /// Check if a section name represents code or read-only data.
 ///
 /// Supports both ELF (.text, .rodata) and Mach-O (__text, __const) section names.
@@ -70,9 +156,12 @@ fn is_code_section(name: &str) -> bool {
 /// ignoring non-deterministic metadata. This provides a more reliable
 /// comparison between builds of the same source code.
 ///
-/// Supports both ELF (Linux) and Mach-O (macOS) binary formats.
+/// Supports both ELF (Linux) and Mach-O (macOS) binary formats,
+/// including macOS universal (fat) binaries.
 fn compute_code_hash(data: &[u8]) -> Result<String> {
-    let file = object::File::parse(data).context("Failed to parse binary format")?;
+    // Handle fat/universal binaries by extracting the appropriate slice
+    let binary_data = extract_binary_slice(data)?;
+    let file = object::File::parse(binary_data).context("Failed to parse binary format")?;
     let mut hasher = Hasher::new();
     let mut sections_hashed = 0;
 
@@ -114,9 +203,12 @@ fn is_debug_section(name: &str) -> bool {
 /// Extract metadata about the binary.
 ///
 /// Returns (text_section_size, has_debug_info).
-/// Supports both ELF (Linux) and Mach-O (macOS) binary formats.
+/// Supports both ELF (Linux) and Mach-O (macOS) binary formats,
+/// including macOS universal (fat) binaries.
 fn extract_metadata(data: &[u8]) -> Result<(u64, bool)> {
-    let file = object::File::parse(data).context("Failed to parse binary for metadata")?;
+    // Handle fat/universal binaries by extracting the appropriate slice
+    let binary_data = extract_binary_slice(data)?;
+    let file = object::File::parse(binary_data).context("Failed to parse binary for metadata")?;
 
     let text_size: u64 = file
         .sections()
@@ -548,9 +640,18 @@ mod tests {
             }
         };
 
-        // Look for a common string that should exist in any ELF binary
-        // Most binaries contain "ELF" or common library strings
+        // Look for a common string that should exist in any binary
+        // ELF binaries contain "ELF", Mach-O binaries don't have that marker
+        // so we test for common strings that appear in most system binaries
+        #[cfg(target_os = "linux")]
         let marker = "ELF";
+        #[cfg(target_os = "macos")]
+        let marker = "__TEXT"; // Mach-O segment name commonly found in binaries
+        #[cfg(target_os = "windows")]
+        let marker = "PE"; // PE header marker (though this test may be skipped on Windows)
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+        let marker = "ELF";
+
         info!(
             "INPUT: binary_contains_marker({:?}, '{}')",
             binary_path, marker
@@ -559,9 +660,9 @@ mod tests {
         let result = binary_contains_marker(&binary_path, marker).unwrap();
         info!("RESULT: contains_marker = {}", result);
 
-        // ELF binaries start with the ELF magic number which includes "ELF"
-        assert!(result, "ELF binary should contain 'ELF' string");
-        info!("VERIFY: Marker 'ELF' found in binary");
+        // The marker should be found in the binary
+        assert!(result, "Binary should contain '{}' string", marker);
+        info!("VERIFY: Marker '{}' found in binary", marker);
         info!("TEST PASS: test_binary_contains_marker_found");
     }
 

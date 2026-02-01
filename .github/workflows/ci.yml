@@ -403,10 +403,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
+      - name: Build binaries for E2E tests
+        run: cargo build --workspace
       - name: Generate LCOV coverage
         env:
           RCH_MOCK_SSH: '1'
-        # Exclude true-e2e feature which requires pre-built binaries
+        # Build debug binaries first for E2E tests that need them
         run: cargo llvm-cov --features rich-ui --workspace --lcov --output-path lcov.info
       - name: Generate HTML coverage report
         env:
