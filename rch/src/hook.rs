@@ -38,7 +38,7 @@ use tokio::time::{sleep, timeout};
 use tracing::{debug, info, warn};
 use which::which;
 
-#[cfg(feature = "rich-ui")]
+#[cfg(all(feature = "rich-ui", unix))]
 use rich_rust::renderables::Panel;
 
 // ============================================================================
@@ -235,7 +235,7 @@ fn emit_job_banner(
         worker.speed_score
     );
 
-    #[cfg(feature = "rich-ui")]
+    #[cfg(all(feature = "rich-ui", unix))]
     if console.is_rich() {
         let rich = format!(
             "[bold {}]{}[/] Job {} submitted to {} (slots {}, speed {:.1})",

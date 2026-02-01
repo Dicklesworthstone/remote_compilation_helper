@@ -6,9 +6,9 @@
 use crate::commands::WorkerBenchmarkResult;
 use crate::ui::console::RchConsole;
 
-#[cfg(feature = "rich-ui")]
+#[cfg(all(feature = "rich-ui", unix))]
 use rich_rust::prelude::*;
-#[cfg(feature = "rich-ui")]
+#[cfg(all(feature = "rich-ui", unix))]
 use rich_rust::renderables::{Column, Row, Table};
 
 use rch_common::ui::{Icons, OutputContext, RchTheme};
@@ -46,7 +46,7 @@ impl<'a> BenchmarkTable<'a> {
             return;
         }
 
-        #[cfg(feature = "rich-ui")]
+        #[cfg(all(feature = "rich-ui", unix))]
         if console.is_rich() {
             self.render_rich(console);
             return;
@@ -61,7 +61,7 @@ impl<'a> BenchmarkTable<'a> {
     }
 
     /// Render rich output using rich_rust.
-    #[cfg(feature = "rich-ui")]
+    #[cfg(all(feature = "rich-ui", unix))]
     fn render_rich(&self, console: &RchConsole) {
         if self.results.is_empty() {
             self.render_empty_rich(console);
@@ -105,7 +105,7 @@ impl<'a> BenchmarkTable<'a> {
     }
 
     /// Render empty state with rich formatting.
-    #[cfg(feature = "rich-ui")]
+    #[cfg(all(feature = "rich-ui", unix))]
     fn render_empty_rich(&self, console: &RchConsole) {
         let info = Icons::info(self.context);
         let content = format!(
@@ -120,7 +120,7 @@ impl<'a> BenchmarkTable<'a> {
     }
 
     /// Format status for rich display.
-    #[cfg(feature = "rich-ui")]
+    #[cfg(all(feature = "rich-ui", unix))]
     fn format_status_rich(&self, result: &WorkerBenchmarkResult) -> String {
         match result.status.as_str() {
             "ok" => format!("{} OK", Icons::check(self.context)),
@@ -160,7 +160,7 @@ impl<'a> BenchmarkTable<'a> {
     }
 
     /// Render summary panel.
-    #[cfg(feature = "rich-ui")]
+    #[cfg(all(feature = "rich-ui", unix))]
     fn render_summary_rich(&self, console: &RchConsole) {
         let total = self.results.len();
         let successful = self.results.iter().filter(|r| r.status == "ok").count();

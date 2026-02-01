@@ -6,7 +6,7 @@
 use crate::commands::ConfigShowResponse;
 use crate::ui::console::RchConsole;
 
-#[cfg(feature = "rich-ui")]
+#[cfg(all(feature = "rich-ui", unix))]
 use rich_rust::prelude::*;
 
 use rch_common::ui::{Icons, OutputContext, RchTheme};
@@ -47,7 +47,7 @@ impl<'a> ConfigDisplay<'a> {
             return;
         }
 
-        #[cfg(feature = "rich-ui")]
+        #[cfg(all(feature = "rich-ui", unix))]
         if console.is_rich() {
             self.render_rich(console);
             return;
@@ -57,7 +57,7 @@ impl<'a> ConfigDisplay<'a> {
     }
 
     /// Render rich output using rich_rust.
-    #[cfg(feature = "rich-ui")]
+    #[cfg(all(feature = "rich-ui", unix))]
     fn render_rich(&self, console: &RchConsole) {
         // Build the configuration tree as a string
         let mut lines = Vec::new();
@@ -254,7 +254,7 @@ impl<'a> ConfigDisplay<'a> {
     }
 
     /// Render sources summary panel.
-    #[cfg(feature = "rich-ui")]
+    #[cfg(all(feature = "rich-ui", unix))]
     fn render_sources_rich(&self, console: &RchConsole) {
         let info = Icons::info(self.context);
         let mut lines = vec![format!("{info} Configuration sources (priority order):")];
