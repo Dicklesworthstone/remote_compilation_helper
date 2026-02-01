@@ -81,12 +81,14 @@ fn start_daemon_with_socket(
 /// Send a request to the daemon via Unix socket and get the response.
 fn send_socket_request(socket_path: &std::path::Path, request: &str) -> std::io::Result<String> {
     // De-flake: on heavily loaded systems, the daemon can accept then close before writing.
-    // Retry a few times to avoid spurious empty responses.
+    // The daemon binds its socket before reaching the accept loop, so the socket may be
+    // connectable before the daemon is ready to process requests. Use exponential backoff
+    // with generous timeouts to handle slow startup (especially with multiple workers).
     let mut last_error = None;
-    for attempt in 0..5 {
+    for attempt in 0..8 {
         let result: std::io::Result<String> = (|| {
             let mut stream = UnixStream::connect(socket_path)?;
-            stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+            stream.set_read_timeout(Some(Duration::from_secs(10)))?;
             stream.set_write_timeout(Some(Duration::from_secs(5)))?;
 
             writeln!(stream, "{}", request)?;
@@ -113,8 +115,10 @@ fn send_socket_request(socket_path: &std::path::Path, request: &str) -> std::io:
             Err(err) => last_error = Some(err),
         }
 
-        if attempt < 4 {
-            std::thread::sleep(Duration::from_millis(50));
+        if attempt < 7 {
+            // Exponential backoff: 200ms, 400ms, 800ms, 1600ms, 3200ms, 6400ms, 12800ms
+            let delay = Duration::from_millis(200 << attempt);
+            std::thread::sleep(delay);
         }
     }
 
@@ -132,6 +136,25 @@ fn extract_json_body(response: &str) -> Option<&str> {
     } else {
         None
     }
+}
+
+/// Wait for the daemon API to be fully responsive (not just the socket to exist).
+/// The socket is bound before the daemon reaches its accept loop, so we need to
+/// verify the daemon can actually process and respond to requests.
+fn wait_for_daemon_ready(socket_path: &std::path::Path, timeout: Duration) {
+    let start = std::time::Instant::now();
+    while start.elapsed() < timeout {
+        if let Ok(response) = send_socket_request(socket_path, "GET /status") {
+            if response.contains("200 OK") {
+                return;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    panic!(
+        "Daemon did not become ready within {:?}",
+        timeout
+    );
 }
 
 /// Create a custom worker fixture for testing.
@@ -192,6 +215,9 @@ fn test_load_balance_distribution() {
     harness
         .wait_for_socket(&socket_path, Duration::from_secs(10))
         .unwrap();
+
+    // Wait for daemon API to be fully responsive (socket exists before accept loop)
+    wait_for_daemon_ready(&socket_path, Duration::from_secs(30));
 
     // Submit multiple selection requests and track distribution
     let mut distribution: HashMap<String, u32> = HashMap::new();
@@ -364,6 +390,9 @@ fn test_cached_project_locality() {
     harness
         .wait_for_socket(&socket_path, Duration::from_secs(10))
         .unwrap();
+
+    // Wait for daemon API to be fully responsive (socket exists before accept loop)
+    wait_for_daemon_ready(&socket_path, Duration::from_secs(30));
 
     // Make first selection for a project
     let response = send_socket_request(
