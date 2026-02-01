@@ -1697,8 +1697,10 @@ pub(crate) async fn query_daemon(
         .into());
     }
 
-    // Connect to daemon
-    let stream = UnixStream::connect(socket_path).await?;
+    // Connect to daemon (with timeout to avoid hanging if socket is stuck)
+    let stream = timeout(Duration::from_secs(5), UnixStream::connect(socket_path))
+        .await
+        .map_err(|_| anyhow::anyhow!("Daemon connect timed out after 5s"))??;
     let (reader, mut writer) = stream.into_split();
 
     // Build query string
@@ -1746,27 +1748,42 @@ pub(crate) async fn query_daemon(
     writer.write_all(request.as_bytes()).await?;
     writer.flush().await?;
 
-    // Read response (skip HTTP headers)
-    let mut reader = BufReader::new(reader);
-    let mut line = String::new();
-    let mut body = String::new();
-    let mut in_body = false;
+    // Read response (skip HTTP headers) with timeout and body size limit.
+    // The daemon should respond within 30s even when queuing builds.
+    // Body is capped at 64KB to prevent unbounded memory growth.
+    const MAX_RESPONSE_BODY: usize = 64 * 1024;
+    const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 
-    loop {
-        line.clear();
-        let n = reader.read_line(&mut line).await?;
-        if n == 0 {
-            break;
-        }
-        if in_body {
-            body.push_str(&line);
-        } else if line.trim().is_empty() {
-            in_body = true;
-        }
-    }
+    let read_response = async {
+        let mut reader = BufReader::new(reader);
+        let mut line = String::new();
+        let mut body = String::new();
+        let mut in_body = false;
 
-    // Parse response
-    let response: SelectionResponse = serde_json::from_str(body.trim())?;
+        loop {
+            line.clear();
+            let n = reader.read_line(&mut line).await?;
+            if n == 0 {
+                break;
+            }
+            if in_body {
+                if body.len() + line.len() > MAX_RESPONSE_BODY {
+                    return Err(anyhow::anyhow!("Daemon response body exceeded {}KB limit", MAX_RESPONSE_BODY / 1024));
+                }
+                body.push_str(&line);
+            } else if line.trim().is_empty() {
+                in_body = true;
+            }
+        }
+
+        serde_json::from_str::<SelectionResponse>(body.trim())
+            .map_err(|e| anyhow::anyhow!("Failed to parse daemon response: {}", e))
+    };
+
+    let response = timeout(RESPONSE_TIMEOUT, read_response)
+        .await
+        .map_err(|_| anyhow::anyhow!("Daemon response timed out after 30s"))??;
+
     Ok(response)
 }
 
@@ -1786,7 +1803,11 @@ pub(crate) async fn release_worker(
         return Ok(()); // Ignore if daemon gone
     }
 
-    let stream = UnixStream::connect(socket_path).await?;
+    let stream = match timeout(Duration::from_secs(2), UnixStream::connect(socket_path)).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => return Err(e.into()),
+        Err(_) => return Ok(()), // Timeout connecting — daemon likely busy, don't block hook
+    };
     let (reader, mut writer) = stream.into_split();
 
     // Send request
@@ -1820,10 +1841,10 @@ pub(crate) async fn release_worker(
     writer.write_all(request.as_bytes()).await?;
     writer.flush().await?;
 
-    // Read response line (to ensure daemon processed it)
+    // Read response line (to ensure daemon processed it) with timeout
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
-    reader.read_line(&mut line).await?;
+    let _ = timeout(Duration::from_secs(5), reader.read_line(&mut line)).await;
 
     Ok(())
 }
@@ -1839,7 +1860,11 @@ pub(crate) async fn record_build(
         return Ok(()); // Ignore if daemon gone
     }
 
-    let stream = UnixStream::connect(socket_path).await?;
+    let stream = match timeout(Duration::from_secs(2), UnixStream::connect(socket_path)).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => return Err(e.into()),
+        Err(_) => return Ok(()), // Timeout connecting — daemon likely busy, don't block hook
+    };
     let (reader, mut writer) = stream.into_split();
 
     // Send request
@@ -1855,10 +1880,10 @@ pub(crate) async fn record_build(
     writer.write_all(request.as_bytes()).await?;
     writer.flush().await?;
 
-    // Read response line
+    // Read response line with timeout
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
-    reader.read_line(&mut line).await?;
+    let _ = timeout(Duration::from_secs(5), reader.read_line(&mut line)).await;
 
     Ok(())
 }
