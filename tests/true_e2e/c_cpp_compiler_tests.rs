@@ -316,7 +316,10 @@ fn log_classification(logger: &rch_common::e2e::TestLogger, cmd: &str) {
             ),
             ("kind".to_string(), kind),
             ("duration_us".to_string(), elapsed.as_micros().to_string()),
-            ("reason".to_string(), detailed.classification.reason.clone()),
+            (
+                "reason".to_string(),
+                detailed.classification.reason.to_string(),
+            ),
         ],
     );
 }

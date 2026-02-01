@@ -2702,7 +2702,10 @@ mod tests {
 
         // With mock mode enabled, remote execution succeeds and denies local execution
         let output = process_hook(input).await;
-        assert!(!output.is_allow(), "Expected deny after successful remote compilation");
+        assert!(
+            !output.is_allow(),
+            "Expected deny after successful remote compilation"
+        );
 
         // Reset mock override
         mock::set_mock_enabled_override(None);
