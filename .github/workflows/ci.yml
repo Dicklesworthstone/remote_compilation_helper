@@ -164,11 +164,9 @@ jobs:
             os: macos-14
             # macOS: exclude rchd (daemon) tests due to CI environment issues with Unix sockets
             cargo_args: --workspace --exclude rchd
-          - name: windows-x64
-            os: windows-latest
-            # Windows: only test rch-wkr (cross-platform worker)
-            # rch-telemetry tests require rusqlite/storage which is complex to build on Windows
-            cargo_args: --no-default-features -p rch-wkr
+          # Note: Windows tests disabled - rch-wkr tests use Unix shell commands (echo, /tmp paths)
+          # and other workspace crates have Unix-only dependencies (openssh, rich_rust)
+          # The Windows build-release job still validates that binaries can be built for Windows
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     needs: check
