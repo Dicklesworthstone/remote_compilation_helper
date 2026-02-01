@@ -39,7 +39,8 @@ pub use collect::network::{
 };
 pub use protocol::{TestRunRecord, TestRunStats};
 pub use speedscore::{
-    BenchmarkResults, SPEEDSCORE_VERSION, SpeedScore, SpeedScoreWeights, calculate_speedscore,
+    BenchmarkConditions, BenchmarkResults, SPEEDSCORE_VERSION, SpeedScore, SpeedScoreWeights,
+    calculate_speedscore,
 };
 #[cfg(feature = "storage")]
 pub use storage::{MaintenanceStats, SpeedScoreHistoryPage, StorageStats, TelemetryStorage};

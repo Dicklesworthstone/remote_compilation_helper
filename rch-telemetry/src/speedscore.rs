@@ -32,6 +32,21 @@ use crate::benchmarks::{
 /// Increment when calculation methodology changes to invalidate cached scores.
 pub const SPEEDSCORE_VERSION: u32 = 1;
 
+/// Snapshot of system conditions at benchmark time.
+///
+/// Used for drift detection: comparing current telemetry against conditions
+/// that were present when the benchmark ran. Without this context, drift
+/// detection cannot distinguish "worker is idle" from "worker conditions changed".
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BenchmarkConditions {
+    /// CPU utilization percentage at benchmark time (0-100).
+    pub cpu_percent: f64,
+    /// Memory usage percentage at benchmark time (0-100).
+    pub memory_used_percent: f64,
+    /// 1-minute load average at benchmark time.
+    pub load_1m: f64,
+}
+
 /// Unified SpeedScore combining all benchmark components.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpeedScore {
@@ -57,6 +72,13 @@ pub struct SpeedScore {
 
     /// Algorithm version for cache invalidation.
     pub version: u32,
+
+    /// System conditions at the time the benchmark was run.
+    ///
+    /// `None` for scores calculated before this field was introduced,
+    /// or when telemetry was unavailable during benchmarking.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub benchmark_conditions: Option<BenchmarkConditions>,
 }
 
 impl Default for SpeedScore {
@@ -71,6 +93,7 @@ impl Default for SpeedScore {
             weights: SpeedScoreWeights::default(),
             calculated_at: Utc::now(),
             version: SPEEDSCORE_VERSION,
+            benchmark_conditions: None,
         }
     }
 }
@@ -144,12 +167,19 @@ impl SpeedScore {
             weights: effective_weights,
             calculated_at: Utc::now(),
             version: SPEEDSCORE_VERSION,
+            benchmark_conditions: None,
         }
     }
 
     /// Check if this score is outdated (different algorithm version).
     pub fn is_outdated(&self) -> bool {
         self.version != SPEEDSCORE_VERSION
+    }
+
+    /// Attach system conditions that were observed during the benchmark.
+    pub fn with_conditions(mut self, conditions: BenchmarkConditions) -> Self {
+        self.benchmark_conditions = Some(conditions);
+        self
     }
 
     /// Get a human-readable rating based on the total score.
@@ -950,6 +980,7 @@ mod tests {
             weights: SpeedScoreWeights::default(),
             calculated_at: Utc::now(),
             version: SPEEDSCORE_VERSION,
+            benchmark_conditions: None,
         };
 
         let json = serde_json::to_string(&score).expect("serialization should succeed");

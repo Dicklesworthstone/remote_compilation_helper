@@ -396,25 +396,69 @@ impl BenchmarkScheduler {
     }
 
     /// Detect performance drift by comparing current telemetry to benchmark-time conditions.
+    ///
+    /// Returns `Some(drift_pct)` if conditions have worsened enough since the benchmark
+    /// was taken that the score may be too optimistic. Returns `None` if:
+    /// - No benchmark conditions were recorded (legacy scores)
+    /// - No current telemetry is available
+    /// - Conditions have improved or stayed within the threshold
+    ///
+    /// Only flags drift when conditions have **worsened** (higher load now than at
+    /// benchmark time). If the benchmark was taken under high load and conditions
+    /// have since improved, the score is conservative — no re-benchmark needed.
     async fn detect_drift(
         &self,
-        _worker: &WorkerState,
-        _score: &rch_telemetry::speedscore::SpeedScore,
+        worker: &WorkerState,
+        score: &rch_telemetry::speedscore::SpeedScore,
     ) -> Option<f64> {
-        // TODO: Implement robust drift detection (bd-219).
-        //
-        // The previous heuristic (comparing current load to a static 30% baseline)
-        // incorrectly flagged idle workers (0.0 load) as having 100% drift, causing
-        // constant re-benchmarking loops for idle fleets.
-        //
-        // Future implementation should:
-        // 1. Record load/conditions *during* the benchmark in SpeedScore.
-        // 2. Compare current conditions to those recorded conditions.
-        // 3. Only trigger if current conditions suggest the score is invalid
-        //    (e.g., load was low during benchmark, but is consistently high now).
-        //
-        // For now, we rely on `max_age` (periodic) and `ManualTrigger` for updates.
-        None
+        // Need recorded benchmark conditions to compare against
+        let conditions = score.benchmark_conditions.as_ref()?;
+
+        // Need current telemetry for the worker
+        let config = worker.config.read().await;
+        let worker_id = config.id.clone();
+        drop(config);
+
+        let current = self.telemetry.latest(worker_id.as_str())?;
+        let current_cpu = current.telemetry.cpu.overall_percent;
+        let current_mem = current.telemetry.memory.used_percent;
+        let current_load = current.telemetry.cpu.load_average.one_min;
+
+        // Calculate per-metric drift (positive = conditions worsened)
+        // CPU: higher utilization now means score may be too optimistic
+        let cpu_drift = current_cpu - conditions.cpu_percent;
+        // Memory: higher usage now means more pressure
+        let mem_drift = current_mem - conditions.memory_used_percent;
+        // Load: higher load average means more contention
+        let load_drift = if conditions.load_1m > 0.01 {
+            ((current_load - conditions.load_1m) / conditions.load_1m) * 100.0
+        } else if current_load > 1.0 {
+            // Benchmark was at ~zero load, now significant load — flag it
+            100.0
+        } else {
+            // Both near zero — no drift
+            0.0
+        };
+
+        // Weighted composite: CPU matters most for compilation workloads
+        let composite_drift = cpu_drift * 0.5 + mem_drift * 0.2 + load_drift * 0.3;
+
+        // Only trigger if conditions have WORSENED past the threshold.
+        // Negative drift (conditions improved) is never flagged.
+        if composite_drift >= self.config.drift_threshold_pct {
+            debug!(
+                worker_id = %worker_id,
+                cpu_drift = format!("{:.1}", cpu_drift),
+                mem_drift = format!("{:.1}", mem_drift),
+                load_drift = format!("{:.1}", load_drift),
+                composite = format!("{:.1}", composite_drift),
+                threshold = self.config.drift_threshold_pct,
+                "Drift detected: conditions worsened since benchmark"
+            );
+            Some(composite_drift)
+        } else {
+            None
+        }
     }
 
     /// Check if a worker is eligible for benchmarking (idle and healthy).
@@ -2091,5 +2135,300 @@ Benchmark complete
         assert!(!super::is_retryable_error("File not found"));
         assert!(!super::is_retryable_error("Invalid command"));
         assert!(!super::is_retryable_error("Authentication failed"));
+    }
+
+    // ==================== Drift Detection Tests ====================
+
+    use rch_telemetry::collect::cpu::{CpuTelemetry, LoadAverage};
+    use rch_telemetry::collect::memory::MemoryTelemetry;
+    use rch_telemetry::protocol::{TelemetrySource, WorkerTelemetry};
+    use rch_telemetry::speedscore::{BenchmarkConditions, SpeedScore};
+
+    /// Build a WorkerTelemetry with specific CPU, memory, and load values.
+    fn make_telemetry_with_load(
+        worker_id: &str,
+        cpu_pct: f64,
+        mem_pct: f64,
+        load_1m: f64,
+    ) -> WorkerTelemetry {
+        let cpu = CpuTelemetry {
+            timestamp: Utc::now(),
+            overall_percent: cpu_pct,
+            per_core_percent: vec![cpu_pct],
+            num_cores: 4,
+            load_average: LoadAverage {
+                one_min: load_1m,
+                five_min: load_1m * 0.8,
+                fifteen_min: load_1m * 0.6,
+                running_processes: 2,
+                total_processes: 200,
+            },
+            psi: None,
+        };
+        let memory = MemoryTelemetry {
+            timestamp: Utc::now(),
+            total_gb: 32.0,
+            available_gb: 32.0 * (1.0 - mem_pct / 100.0),
+            used_percent: mem_pct,
+            pressure_score: mem_pct,
+            swap_used_gb: 0.0,
+            dirty_mb: 0.0,
+            psi: None,
+        };
+        WorkerTelemetry::new(worker_id.to_string(), cpu, memory, None, None, 1)
+    }
+
+    /// Build a SpeedScore with attached BenchmarkConditions.
+    fn make_score_with_conditions(cpu_pct: f64, mem_pct: f64, load_1m: f64) -> SpeedScore {
+        SpeedScore::default().with_conditions(BenchmarkConditions {
+            cpu_percent: cpu_pct,
+            memory_used_percent: mem_pct,
+            load_1m,
+        })
+    }
+
+    #[tokio::test]
+    async fn test_detect_drift_no_conditions_returns_none() {
+        let pool = WorkerPool::new();
+        pool.add_worker(make_worker_config("drift-none")).await;
+        let telemetry = Arc::new(TelemetryStore::new(Duration::from_secs(300), None));
+        let events = EventBus::new(16);
+
+        // Ingest current telemetry
+        telemetry.ingest(
+            make_telemetry_with_load("drift-none", 80.0, 70.0, 4.0),
+            TelemetrySource::SshPoll,
+        );
+
+        let (scheduler, _handle) =
+            BenchmarkScheduler::new(make_test_config(), pool.clone(), telemetry, events);
+
+        let worker = pool.get(&WorkerId::new("drift-none")).await.unwrap();
+        let score = SpeedScore::default(); // No benchmark_conditions
+
+        let result = scheduler.detect_drift(&worker, &score).await;
+        assert!(
+            result.is_none(),
+            "Should return None when no conditions recorded"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_detect_drift_no_telemetry_returns_none() {
+        let pool = WorkerPool::new();
+        pool.add_worker(make_worker_config("drift-notel")).await;
+        let telemetry = Arc::new(TelemetryStore::new(Duration::from_secs(300), None));
+        let events = EventBus::new(16);
+
+        // No telemetry ingested
+
+        let (scheduler, _handle) =
+            BenchmarkScheduler::new(make_test_config(), pool.clone(), telemetry, events);
+
+        let worker = pool.get(&WorkerId::new("drift-notel")).await.unwrap();
+        let score = make_score_with_conditions(10.0, 30.0, 0.5);
+
+        let result = scheduler.detect_drift(&worker, &score).await;
+        assert!(
+            result.is_none(),
+            "Should return None when no current telemetry"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_detect_drift_conditions_worsened() {
+        let pool = WorkerPool::new();
+        pool.add_worker(make_worker_config("drift-worse")).await;
+        let telemetry = Arc::new(TelemetryStore::new(Duration::from_secs(300), None));
+        let events = EventBus::new(16);
+
+        // Benchmark was taken at low load; current load is much higher
+        telemetry.ingest(
+            make_telemetry_with_load("drift-worse", 80.0, 70.0, 6.0),
+            TelemetrySource::SshPoll,
+        );
+
+        let mut config = make_test_config();
+        config.drift_threshold_pct = 20.0;
+        let (scheduler, _handle) = BenchmarkScheduler::new(config, pool.clone(), telemetry, events);
+
+        let worker = pool.get(&WorkerId::new("drift-worse")).await.unwrap();
+        // Benchmark was at CPU 10%, mem 30%, load 0.5
+        let score = make_score_with_conditions(10.0, 30.0, 0.5);
+
+        let result = scheduler.detect_drift(&worker, &score).await;
+        assert!(
+            result.is_some(),
+            "Should detect drift when conditions worsened significantly"
+        );
+        let drift = result.unwrap();
+        assert!(
+            drift >= 20.0,
+            "Drift should exceed threshold, got {}",
+            drift
+        );
+    }
+
+    #[tokio::test]
+    async fn test_detect_drift_conditions_improved_returns_none() {
+        let pool = WorkerPool::new();
+        pool.add_worker(make_worker_config("drift-better")).await;
+        let telemetry = Arc::new(TelemetryStore::new(Duration::from_secs(300), None));
+        let events = EventBus::new(16);
+
+        // Benchmark was taken at high load; current load is much lower
+        telemetry.ingest(
+            make_telemetry_with_load("drift-better", 10.0, 30.0, 0.5),
+            TelemetrySource::SshPoll,
+        );
+
+        let (scheduler, _handle) =
+            BenchmarkScheduler::new(make_test_config(), pool.clone(), telemetry, events);
+
+        let worker = pool.get(&WorkerId::new("drift-better")).await.unwrap();
+        // Benchmark was at CPU 80%, mem 70%, load 6.0
+        let score = make_score_with_conditions(80.0, 70.0, 6.0);
+
+        let result = scheduler.detect_drift(&worker, &score).await;
+        assert!(
+            result.is_none(),
+            "Should not flag drift when conditions improved"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_detect_drift_conditions_unchanged_returns_none() {
+        let pool = WorkerPool::new();
+        pool.add_worker(make_worker_config("drift-same")).await;
+        let telemetry = Arc::new(TelemetryStore::new(Duration::from_secs(300), None));
+        let events = EventBus::new(16);
+
+        // Current conditions match benchmark-time conditions
+        telemetry.ingest(
+            make_telemetry_with_load("drift-same", 30.0, 40.0, 1.0),
+            TelemetrySource::SshPoll,
+        );
+
+        let (scheduler, _handle) =
+            BenchmarkScheduler::new(make_test_config(), pool.clone(), telemetry, events);
+
+        let worker = pool.get(&WorkerId::new("drift-same")).await.unwrap();
+        let score = make_score_with_conditions(30.0, 40.0, 1.0);
+
+        let result = scheduler.detect_drift(&worker, &score).await;
+        assert!(
+            result.is_none(),
+            "Should not flag drift when conditions are stable"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_detect_drift_idle_benchmark_no_false_positive() {
+        // This is the exact scenario that broke the old heuristic:
+        // worker was idle during benchmark AND is still idle now.
+        let pool = WorkerPool::new();
+        pool.add_worker(make_worker_config("drift-idle")).await;
+        let telemetry = Arc::new(TelemetryStore::new(Duration::from_secs(300), None));
+        let events = EventBus::new(16);
+
+        // Both benchmark and current: idle
+        telemetry.ingest(
+            make_telemetry_with_load("drift-idle", 0.5, 15.0, 0.01),
+            TelemetrySource::SshPoll,
+        );
+
+        let (scheduler, _handle) =
+            BenchmarkScheduler::new(make_test_config(), pool.clone(), telemetry, events);
+
+        let worker = pool.get(&WorkerId::new("drift-idle")).await.unwrap();
+        let score = make_score_with_conditions(0.5, 15.0, 0.01);
+
+        let result = scheduler.detect_drift(&worker, &score).await;
+        assert!(
+            result.is_none(),
+            "Must not re-benchmark idle workers (old bug)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_detect_drift_below_threshold_returns_none() {
+        let pool = WorkerPool::new();
+        pool.add_worker(make_worker_config("drift-small")).await;
+        let telemetry = Arc::new(TelemetryStore::new(Duration::from_secs(300), None));
+        let events = EventBus::new(16);
+
+        // Small increase: CPU 10→15, mem 30→32, load 0.5→0.6
+        // composite = (15-10)*0.5 + (32-30)*0.2 + ((0.6-0.5)/0.5*100)*0.3
+        //           = 2.5 + 0.4 + 6.0 = 8.9 → below 20% threshold
+        telemetry.ingest(
+            make_telemetry_with_load("drift-small", 15.0, 32.0, 0.6),
+            TelemetrySource::SshPoll,
+        );
+
+        let mut config = make_test_config();
+        config.drift_threshold_pct = 20.0;
+        let (scheduler, _handle) = BenchmarkScheduler::new(config, pool.clone(), telemetry, events);
+
+        let worker = pool.get(&WorkerId::new("drift-small")).await.unwrap();
+        let score = make_score_with_conditions(10.0, 30.0, 0.5);
+
+        let result = scheduler.detect_drift(&worker, &score).await;
+        assert!(
+            result.is_none(),
+            "Small drift below threshold should not trigger re-benchmark"
+        );
+    }
+
+    #[test]
+    fn test_benchmark_conditions_serialization() {
+        let conditions = BenchmarkConditions {
+            cpu_percent: 25.5,
+            memory_used_percent: 45.0,
+            load_1m: 1.2,
+        };
+
+        let json = serde_json::to_string(&conditions).unwrap();
+        let deser: BenchmarkConditions = serde_json::from_str(&json).unwrap();
+
+        assert!((deser.cpu_percent - 25.5).abs() < 0.01);
+        assert!((deser.memory_used_percent - 45.0).abs() < 0.01);
+        assert!((deser.load_1m - 1.2).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_speedscore_with_conditions_roundtrip() {
+        let score = make_score_with_conditions(30.0, 50.0, 2.0);
+
+        // Verify conditions attached
+        assert!(score.benchmark_conditions.is_some());
+        let cond = score.benchmark_conditions.as_ref().unwrap();
+        assert!((cond.cpu_percent - 30.0).abs() < 0.01);
+
+        // Serialize and deserialize
+        let json = serde_json::to_string(&score).unwrap();
+        let deser: SpeedScore = serde_json::from_str(&json).unwrap();
+        assert!(deser.benchmark_conditions.is_some());
+    }
+
+    #[test]
+    fn test_speedscore_without_conditions_backwards_compat() {
+        // Simulate a legacy score JSON without benchmark_conditions field
+        let legacy_json = r#"{
+            "total": 75.0,
+            "cpu_score": 80.0,
+            "memory_score": 70.0,
+            "disk_score": 65.0,
+            "network_score": 60.0,
+            "compilation_score": 75.0,
+            "weights": {"cpu": 0.3, "memory": 0.15, "disk": 0.2, "network": 0.15, "compilation": 0.2},
+            "calculated_at": "2026-01-15T12:00:00Z",
+            "version": 1
+        }"#;
+
+        let score: SpeedScore = serde_json::from_str(legacy_json).unwrap();
+        assert!(
+            score.benchmark_conditions.is_none(),
+            "Legacy scores without conditions should deserialize with None"
+        );
     }
 }
