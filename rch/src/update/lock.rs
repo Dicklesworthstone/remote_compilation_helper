@@ -89,21 +89,32 @@ fn get_lock_path() -> Result<PathBuf, UpdateError> {
 
 /// Check if a process is still running.
 fn is_process_running(pid: u32) -> bool {
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     {
-        // On Unix, we can check /proc or use kill with signal 0
+        // On Linux, check /proc filesystem
         let proc_path = format!("/proc/{}", pid);
         std::path::Path::new(&proc_path).exists()
     }
 
-    #[cfg(windows)]
+    #[cfg(target_os = "macos")]
     {
-        // On Windows, attempt to open the process
-        // This is a simplified check
-        false // Assume not running if we can't check
+        // On macOS, use ps command to check if process exists
+        // This is less efficient but avoids unsafe code and works reliably
+        std::process::Command::new("ps")
+            .args(["-p", &pid.to_string()])
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
     }
 
-    #[cfg(not(any(unix, windows)))]
+    #[cfg(windows)]
+    {
+        // On Windows, assume not running - conservative approach
+        // that allows stale locks to be cleaned up
+        false
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
         false
     }
