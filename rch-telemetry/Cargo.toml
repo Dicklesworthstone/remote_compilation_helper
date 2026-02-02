@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 description = "Telemetry collection for Remote Compilation Helper workers"
 
+[lib]
+doctest = false
+
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true }

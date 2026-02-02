@@ -32,6 +32,10 @@ pub struct ToolInput {
 pub enum HookOutput {
     /// Allow the command to proceed (empty object or no output).
     Allow(AllowOutput),
+    /// Allow with a modified/replaced command (for transparent interception).
+    /// Used when RCH has already executed the command remotely and wants to
+    /// replace the original command with a no-op for transparency.
+    AllowWithModifiedCommand(AllowWithModifiedCommandOutput),
     /// Deny the command with a reason.
     Deny(DenyOutput),
 }
@@ -39,6 +43,33 @@ pub enum HookOutput {
 /// Empty output to allow command execution.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct AllowOutput {}
+
+/// Output to allow with a modified command (for transparent interception).
+/// This tells Claude Code "allow this tool, but replace the command with this one".
+/// Used when RCH has already executed remotely and wants to substitute a no-op.
+#[derive(Debug, Clone, Serialize)]
+pub struct AllowWithModifiedCommandOutput {
+    #[serde(rename = "hookSpecificOutput")]
+    pub hook_specific_output: AllowWithModifiedHookSpecificOutput,
+}
+
+/// Hook-specific output for allow-with-modification responses.
+#[derive(Debug, Clone, Serialize)]
+pub struct AllowWithModifiedHookSpecificOutput {
+    #[serde(rename = "hookEventName")]
+    pub hook_event_name: String,
+    #[serde(rename = "permissionDecision")]
+    pub permission_decision: String,
+    #[serde(rename = "updatedInput")]
+    pub updated_input: UpdatedInput,
+}
+
+/// The modified input to substitute.
+#[derive(Debug, Clone, Serialize)]
+pub struct UpdatedInput {
+    /// The replacement command (typically a no-op like "true" or "exit 0").
+    pub command: String,
+}
 
 /// Output to deny/block command execution.
 #[derive(Debug, Clone, Serialize)]
@@ -63,6 +94,26 @@ impl HookOutput {
         Self::Allow(AllowOutput {})
     }
 
+    /// Create an allow output with a modified/replaced command.
+    ///
+    /// This is used for transparent interception: RCH has already executed the
+    /// command remotely, so we replace it with a no-op to prevent double execution.
+    /// The agent sees the remote output but thinks the command ran locally.
+    ///
+    /// # Arguments
+    /// * `replacement_command` - The command to substitute (typically "true" for a no-op)
+    pub fn allow_with_modified_command(replacement_command: impl Into<String>) -> Self {
+        Self::AllowWithModifiedCommand(AllowWithModifiedCommandOutput {
+            hook_specific_output: AllowWithModifiedHookSpecificOutput {
+                hook_event_name: "PreToolUse".to_string(),
+                permission_decision: "allow".to_string(),
+                updated_input: UpdatedInput {
+                    command: replacement_command.into(),
+                },
+            },
+        })
+    }
+
     /// Create a deny output with a reason.
     pub fn deny(reason: impl Into<String>) -> Self {
         Self::Deny(DenyOutput {
@@ -76,7 +127,7 @@ impl HookOutput {
 
     /// Check if this output allows the command.
     pub fn is_allow(&self) -> bool {
-        matches!(self, Self::Allow(_))
+        matches!(self, Self::Allow(_) | Self::AllowWithModifiedCommand(_))
     }
 }
 
@@ -338,5 +389,84 @@ mod tests {
         let output = AllowOutput {};
         let debug_str = format!("{:?}", output);
         assert!(debug_str.contains("AllowOutput"));
+    }
+
+    // Tests for AllowWithModifiedCommand (transparent interception)
+
+    #[test]
+    fn test_allow_with_modified_command_serializes() {
+        let output = HookOutput::allow_with_modified_command("true");
+        let json = serde_json::to_string(&output).unwrap();
+
+        // Verify the JSON structure expected by Claude Code
+        assert!(json.contains("hookSpecificOutput"));
+        assert!(json.contains("hookEventName"));
+        assert!(json.contains("PreToolUse"));
+        assert!(json.contains("permissionDecision"));
+        assert!(json.contains("\"allow\""));
+        assert!(json.contains("updatedInput"));
+        assert!(json.contains("\"command\""));
+        assert!(json.contains("\"true\""));
+    }
+
+    #[test]
+    fn test_allow_with_modified_command_is_allow() {
+        let output = HookOutput::allow_with_modified_command("true");
+        assert!(output.is_allow());
+    }
+
+    #[test]
+    fn test_allow_with_modified_command_preserves_replacement() {
+        let output = HookOutput::allow_with_modified_command("exit 101");
+        if let HookOutput::AllowWithModifiedCommand(allow_mod) = output {
+            assert_eq!(
+                allow_mod.hook_specific_output.updated_input.command,
+                "exit 101"
+            );
+            assert_eq!(allow_mod.hook_specific_output.permission_decision, "allow");
+        } else {
+            panic!("Expected AllowWithModifiedCommand variant");
+        }
+    }
+
+    #[test]
+    fn test_allow_with_modified_command_from_string() {
+        let output = HookOutput::allow_with_modified_command(String::from("echo done"));
+        if let HookOutput::AllowWithModifiedCommand(allow_mod) = output {
+            assert_eq!(
+                allow_mod.hook_specific_output.updated_input.command,
+                "echo done"
+            );
+        } else {
+            panic!("Expected AllowWithModifiedCommand variant");
+        }
+    }
+
+    #[test]
+    fn test_allow_with_modified_command_clone() {
+        let original = HookOutput::allow_with_modified_command("true");
+        let cloned = original.clone();
+        assert!(cloned.is_allow());
+        if let HookOutput::AllowWithModifiedCommand(allow_mod) = cloned {
+            assert_eq!(allow_mod.hook_specific_output.updated_input.command, "true");
+        } else {
+            panic!("Expected AllowWithModifiedCommand variant");
+        }
+    }
+
+    #[test]
+    fn test_allow_with_modified_command_json_structure() {
+        // Verify exact JSON format expected by Claude Code
+        let output = HookOutput::allow_with_modified_command("true");
+        let json = serde_json::to_string(&output).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert!(parsed.get("hookSpecificOutput").is_some());
+        let hook_output = parsed.get("hookSpecificOutput").unwrap();
+        assert_eq!(hook_output.get("hookEventName").unwrap(), "PreToolUse");
+        assert_eq!(hook_output.get("permissionDecision").unwrap(), "allow");
+        assert!(hook_output.get("updatedInput").is_some());
+        let updated_input = hook_output.get("updatedInput").unwrap();
+        assert_eq!(updated_input.get("command").unwrap(), "true");
     }
 }

@@ -15,8 +15,8 @@ use crate::transfer::{
 use crate::ui::console::RchConsole;
 use rch_common::{
     ColorMode, CommandPriority, CommandTimingBreakdown, CompilationKind, HookInput, HookOutput,
-    OutputVisibility, RequiredRuntime, SelectedWorker, SelectionResponse, SelfHealingConfig,
-    ToolchainInfo, TransferConfig, WorkerConfig, WorkerId, classify_command,
+    OutputVisibility, RequiredRuntime, SelectedWorker, SelectionReason, SelectionResponse,
+    SelfHealingConfig, ToolchainInfo, TransferConfig, WorkerConfig, WorkerId, classify_command,
     ui::{
         ArtifactSummary, CelebrationSummary, CompilationProgress, CompletionCelebration, Icons,
         OutputContext, RchTheme, TransferProgress,
@@ -110,11 +110,18 @@ pub async fn run_hook() -> anyhow::Result<()> {
     let output = process_hook(hook_input).await;
 
     // Write output
-    if let HookOutput::Deny(_) = &output {
-        let json = serde_json::to_string(&output)?;
-        writeln!(stdout, "{}", json)?;
+    // - Deny: write JSON to block the command
+    // - AllowWithModifiedCommand: write JSON to replace the command (transparent interception)
+    // - Allow: output nothing (empty stdout = allow unchanged)
+    match &output {
+        HookOutput::Deny(_) | HookOutput::AllowWithModifiedCommand(_) => {
+            let json = serde_json::to_string(&output)?;
+            writeln!(stdout, "{}", json)?;
+        }
+        HookOutput::Allow(_) => {
+            // Empty stdout = allow command unchanged
+        }
     }
-    // For Allow, we output nothing (empty stdout = allow)
 
     Ok(())
 }
@@ -1570,9 +1577,10 @@ async fn handle_selection_response(
     match result {
         Ok(result) => {
             if result.exit_code == 0 {
-                // Command succeeded remotely - deny local execution
-                // The agent sees output via stderr, artifacts are local
-                info!("Remote compilation succeeded, denying local execution");
+                // Command succeeded remotely - replace with no-op for transparency
+                // The agent already saw output via stderr, artifacts are local
+                // Using allow+modified_command makes this completely transparent to the agent
+                info!("Remote compilation succeeded, replacing with no-op for transparency");
                 reporter.summary(&format!(
                     "[RCH] remote {} ({})",
                     worker.id,
@@ -1605,7 +1613,8 @@ async fn handle_selection_response(
                     }
                 }
 
-                HookOutput::deny("RCH: Command executed successfully on remote worker".to_string())
+                // Replace original command with a no-op - agent thinks command ran locally
+                HookOutput::allow_with_modified_command("true")
             } else if is_toolchain_failure(&result.stderr, result.exit_code) {
                 // Toolchain failure - fall back to local execution
                 warn!(
@@ -1627,7 +1636,7 @@ async fn handle_selection_response(
                 // Check for signal-killed processes (OOM, etc.)
                 if let Some(signal) = is_signal_killed(exit_code) {
                     warn!(
-                        "Remote command killed by signal {} ({}) on {}, denying local execution",
+                        "Remote command killed by signal {} ({}) on {}, replacing with exit code for transparency",
                         signal,
                         signal_name(signal),
                         worker.id
@@ -1640,21 +1649,21 @@ async fn handle_selection_response(
                 } else if exit_code == EXIT_TEST_FAILURES {
                     // Cargo test exit 101: tests ran but some failed
                     info!(
-                        "Remote tests failed (exit 101) on {}, denying local re-execution",
+                        "Remote tests failed (exit 101) on {}, replacing with exit code for transparency",
                         worker.id
                     );
                     reporter.summary(&format!("[RCH] remote {} tests failed", worker.id));
                 } else if exit_code == EXIT_BUILD_ERROR {
                     // Build/compilation error
                     info!(
-                        "Remote build error (exit 1) on {}, denying local re-execution",
+                        "Remote build error (exit 1) on {}, replacing with exit code for transparency",
                         worker.id
                     );
                     reporter.summary(&format!("[RCH] remote {} build error", worker.id));
                 } else {
                     // Other non-zero exit code
                     info!(
-                        "Remote command failed (exit {}) on {}, denying local execution",
+                        "Remote command failed (exit {}) on {}, replacing with exit code for transparency",
                         exit_code, worker.id
                     );
                     reporter.summary(&format!(
@@ -1671,10 +1680,9 @@ async fn handle_selection_response(
                     record_build_timing(&project_for_timing, classification_kind, duration, true);
                 });
 
-                HookOutput::deny(format!(
-                    "RCH: Remote compilation failed with exit code {}",
-                    exit_code
-                ))
+                // Replace with exit command to preserve the exit code transparently
+                // Agent already saw the error output, now they see the correct exit code
+                HookOutput::allow_with_modified_command(format!("exit {}", exit_code))
             }
         }
         Err(e) => {
@@ -1714,6 +1722,18 @@ pub(crate) async fn query_daemon(
     classification_duration_us: u64,
     hook_pid: Option<u32>,
 ) -> anyhow::Result<SelectionResponse> {
+    // Mock support: RCH_MOCK_CIRCUIT_OPEN simulates all circuits open
+    // This needs to be checked in the hook since the daemon may be started
+    // before this environment variable is set for the test scenario.
+    if std::env::var("RCH_MOCK_CIRCUIT_OPEN").is_ok() {
+        debug!("RCH_MOCK_CIRCUIT_OPEN set, returning AllCircuitsOpen");
+        return Ok(SelectionResponse {
+            worker: None,
+            reason: SelectionReason::AllCircuitsOpen,
+            build_id: None,
+        });
+    }
+
     // Check if socket exists
     if !Path::new(socket_path).exists() {
         return Err(DaemonError::SocketNotFound {
@@ -3390,7 +3410,13 @@ mod tests {
         let output: HookOutput = process_hook(input).await;
         let _ = std::fs::remove_file(&socket_path);
 
-        assert!(!output.is_allow());
+        // Remote success should return AllowWithModifiedCommand (transparent interception)
+        // This is considered "allow" because we're allowing a modified (no-op) command
+        assert!(output.is_allow());
+        assert!(
+            matches!(output, HookOutput::AllowWithModifiedCommand(_)),
+            "Expected AllowWithModifiedCommand for successful remote execution"
+        );
 
         let rsync_logs = mock::global_rsync_invocations_snapshot();
         let ssh_logs = mock::global_ssh_invocations_snapshot();
@@ -3519,7 +3545,12 @@ mod tests {
         let output = process_hook(input).await;
         let _ = std::fs::remove_file(&socket_path);
 
-        assert!(!output.is_allow());
+        // force_remote should result in transparent interception (AllowWithModifiedCommand)
+        assert!(output.is_allow());
+        assert!(
+            matches!(output, HookOutput::AllowWithModifiedCommand(_)),
+            "force_remote should use transparent interception"
+        );
 
         let rsync_logs = mock::global_rsync_invocations_snapshot();
         let ssh_logs = mock::global_ssh_invocations_snapshot();
@@ -3586,7 +3617,7 @@ mod tests {
 
     #[tokio::test]
     #[serial(mock_global)]
-    async fn test_process_hook_remote_nonzero_exit_denies() {
+    async fn test_process_hook_remote_nonzero_exit_uses_transparent_interception() {
         let _lock = test_lock().lock().await;
         let socket_path = format!(
             "/tmp/rch_test_hook_exit_nonzero_{}_{}.sock",
@@ -3635,7 +3666,13 @@ mod tests {
         let output = process_hook(input).await;
         let _ = std::fs::remove_file(&socket_path);
 
-        assert!(!output.is_allow());
+        // Remote failure should still use transparent interception (AllowWithModifiedCommand)
+        // with "exit <code>" to preserve the exit code for the agent
+        assert!(output.is_allow());
+        assert!(
+            matches!(output, HookOutput::AllowWithModifiedCommand(_)),
+            "Expected AllowWithModifiedCommand for remote execution with non-zero exit"
+        );
     }
 
     #[test]
@@ -4208,10 +4245,14 @@ mod tests {
         let output = process_hook(input).await;
         let _ = std::fs::remove_file(&socket_path);
 
-        // Successful remote test should deny local execution
+        // Successful remote test should use transparent interception
         assert!(
-            !output.is_allow(),
-            "Successful cargo test should deny local execution"
+            output.is_allow(),
+            "Successful cargo test should use transparent interception"
+        );
+        assert!(
+            matches!(output, HookOutput::AllowWithModifiedCommand(_)),
+            "Successful cargo test should return AllowWithModifiedCommand"
         );
 
         // Verify the pipeline phases executed correctly
@@ -4287,11 +4328,15 @@ mod tests {
         let output = process_hook(input).await;
         let _ = std::fs::remove_file(&socket_path);
 
-        // Test failures (exit 101) should still deny local execution
-        // Re-running locally won't help - the tests already ran and failed
+        // Test failures (exit 101) should use transparent interception with exit code
+        // Agent sees the failure output and gets correct exit code
         assert!(
-            !output.is_allow(),
-            "cargo test with failures (exit 101) should deny local execution"
+            output.is_allow(),
+            "cargo test with failures should use transparent interception"
+        );
+        assert!(
+            matches!(output, HookOutput::AllowWithModifiedCommand(_)),
+            "cargo test failures should return AllowWithModifiedCommand"
         );
 
         // Verify pipeline executed
@@ -4355,11 +4400,15 @@ mod tests {
         let output = process_hook(input).await;
         let _ = std::fs::remove_file(&socket_path);
 
-        // Build failure (exit 1) should deny local execution
-        // Same compilation error would occur locally
+        // Build failure (exit 1) should use transparent interception with exit code
+        // Agent sees the error output and gets correct exit code
         assert!(
-            !output.is_allow(),
-            "cargo test build failure (exit 1) should deny local execution"
+            output.is_allow(),
+            "cargo test build failure should use transparent interception"
+        );
+        assert!(
+            matches!(output, HookOutput::AllowWithModifiedCommand(_)),
+            "cargo test build failure should return AllowWithModifiedCommand"
         );
     }
 
@@ -4412,10 +4461,14 @@ mod tests {
         let output = process_hook(input).await;
         let _ = std::fs::remove_file(&socket_path);
 
-        // Filtered test command should also work
+        // Filtered test command should use transparent interception
         assert!(
-            !output.is_allow(),
-            "Filtered cargo test should deny local execution on success"
+            output.is_allow(),
+            "Filtered cargo test should use transparent interception"
+        );
+        assert!(
+            matches!(output, HookOutput::AllowWithModifiedCommand(_)),
+            "Filtered cargo test should return AllowWithModifiedCommand"
         );
     }
 
@@ -4468,10 +4521,14 @@ mod tests {
         let output = process_hook(input).await;
         let _ = std::fs::remove_file(&socket_path);
 
-        // Should work regardless of thread count
+        // Should use transparent interception regardless of thread count
         assert!(
-            !output.is_allow(),
-            "cargo test with --test-threads should work"
+            output.is_allow(),
+            "cargo test with --test-threads should use transparent interception"
+        );
+        assert!(
+            matches!(output, HookOutput::AllowWithModifiedCommand(_)),
+            "cargo test with --test-threads should return AllowWithModifiedCommand"
         );
     }
 
@@ -4528,10 +4585,14 @@ mod tests {
         let output = process_hook(input).await;
         let _ = std::fs::remove_file(&socket_path);
 
-        // Signal killed (likely OOM) should deny local execution
+        // Signal killed (likely OOM) should use transparent interception with exit code
         assert!(
-            !output.is_allow(),
-            "Signal-killed cargo test should deny local execution"
+            output.is_allow(),
+            "Signal-killed cargo test should use transparent interception"
+        );
+        assert!(
+            matches!(output, HookOutput::AllowWithModifiedCommand(_)),
+            "Signal-killed cargo test should return AllowWithModifiedCommand"
         );
     }
 
