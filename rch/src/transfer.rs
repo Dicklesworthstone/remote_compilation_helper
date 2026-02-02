@@ -1080,7 +1080,9 @@ impl TransferPipeline {
             runtime_dir.join("rch-ssh")
         } else {
             // Include username in fallback path to prevent cross-user conflicts
-            let username = whoami::username().unwrap_or_else(|_| "unknown".to_string());
+            let username = std::env::var("USER")
+                .or_else(|_| std::env::var("LOGNAME"))
+                .unwrap_or_else(|_| "unknown".to_string());
             std::env::temp_dir().join(format!("rch-ssh-{}", username))
         }
     }
