@@ -736,6 +736,30 @@ impl TransferPipeline {
             .into());
         }
 
+        // Verify transfer completed successfully by checking for partial transfer indicators.
+        // rsync can exit with code 0 even if interrupted mid-file in some edge cases.
+        // Look for warning signs in stderr that indicate incomplete transfer.
+        let partial_indicators = [
+            "partial transfer",
+            "connection unexpectedly closed",
+            "write error",
+            "read error",
+            "truncated file",
+        ];
+        for indicator in partial_indicators {
+            if stderr.to_lowercase().contains(indicator) {
+                warn!(
+                    "rsync reported potential partial transfer: {}",
+                    stderr
+                        .lines()
+                        .find(|l| l.to_lowercase().contains(indicator))
+                        .unwrap_or(&stderr)
+                );
+                // Don't fail here as rsync exited successfully - just warn for visibility.
+                // The caller can decide if they need to verify file integrity.
+            }
+        }
+
         info!("Sync completed in {}ms", duration.as_millis());
 
         Ok(SyncResult {
@@ -1146,11 +1170,30 @@ impl TransferPipeline {
             .into());
         }
 
-        info!("Artifacts retrieved in {}ms", duration.as_millis());
+        let bytes_transferred = parse_rsync_bytes(&stdout);
+        let files_transferred = parse_rsync_files(&stdout);
+
+        // Warn if no artifacts were retrieved - this may indicate a build failure
+        // or misconfigured artifact patterns. We don't fail here because some
+        // commands (e.g., cargo check) don't produce artifacts.
+        if files_transferred == 0 && bytes_transferred == 0 {
+            warn!(
+                "No artifacts retrieved from {} - build may have failed or artifact patterns may be misconfigured",
+                worker.id
+            );
+            debug!("Artifact patterns used: {:?}", artifact_patterns);
+        }
+
+        info!(
+            "Artifacts retrieved in {}ms ({} files, {} bytes)",
+            duration.as_millis(),
+            files_transferred,
+            bytes_transferred
+        );
 
         Ok(SyncResult {
-            bytes_transferred: parse_rsync_bytes(&stdout),
-            files_transferred: parse_rsync_files(&stdout),
+            bytes_transferred,
+            files_transferred,
             duration_ms: duration.as_millis() as u64,
         })
     }

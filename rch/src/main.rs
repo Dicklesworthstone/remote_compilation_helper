@@ -1331,6 +1331,19 @@ fn resolve_output_format(format: Option<&str>, json_flag: bool) -> OutputFormat 
     OutputFormat::Json
 }
 
+fn base_log_level_for_cli(cli: &Cli) -> String {
+    if cli.command.is_none() {
+        // Hook mode runs for every shell command; avoid config file I/O on the hot path.
+        // Config will be loaded later only if we intercept a compilation command.
+        "info".to_string()
+    } else {
+        match config::load_config() {
+            Ok(cfg) => cfg.general.log_level,
+            Err(_) => "info".to_string(),
+        }
+    }
+}
+
 /// Use current-thread runtime for CLI commands to minimize startup overhead.
 /// Multi-threaded runtime spawns one thread per CPU core (64 cores = 128MB stack allocations).
 /// Current-thread runtime uses a single thread, drastically reducing startup time.
@@ -1359,10 +1372,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // Initialize logging - ALWAYS use stderr to keep stdout clean for hook JSON
-    let base_level = match config::load_config() {
-        Ok(cfg) => cfg.general.log_level,
-        Err(_) => "info".to_string(),
-    };
+    let base_level = base_log_level_for_cli(&cli);
     let mut log_config = LogConfig::from_env(&base_level).with_stderr();
     if cli.verbose {
         log_config = log_config.with_level("debug");
