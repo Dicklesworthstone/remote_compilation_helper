@@ -34,7 +34,7 @@ set -euo pipefail
 # Configuration
 # ============================================================================
 
-INSTALLER_VERSION="0.1.0"
+INSTALLER_VERSION="1.0.1"
 VERSION=""  # Set dynamically based on install mode
 REPO_URL="https://github.com/Dicklesworthstone/remote_compilation_helper"
 GITHUB_REPO="Dicklesworthstone/remote_compilation_helper"
@@ -701,8 +701,13 @@ clone_and_build_from_source() {
         fi
     fi
 
-    # Install binaries
-    local target_dir="$TEMP_DIR/rch/target/release"
+    # Install binaries - respect CARGO_TARGET_DIR if set
+    local target_dir
+    if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
+        target_dir="$CARGO_TARGET_DIR/release"
+    else
+        target_dir="$TEMP_DIR/rch/target/release"
+    fi
 
     if [[ "$MODE" == "worker" ]]; then
         if [[ -f "$target_dir/$WORKER_BIN" ]]; then
