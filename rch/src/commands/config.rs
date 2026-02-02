@@ -918,56 +918,54 @@ fn config_reset_at(config_path: &Path, key: &str, ctx: &OutputContext) -> Result
     };
 
     let defaults = RchConfig::default();
-    let mut value = String::new();
-
-    match key {
+    let value = match key {
         "general.enabled" => {
             config.general.enabled = defaults.general.enabled;
-            value = config.general.enabled.to_string();
+            config.general.enabled.to_string()
         }
         "general.force_local" => {
             config.general.force_local = defaults.general.force_local;
-            value = config.general.force_local.to_string();
+            config.general.force_local.to_string()
         }
         "general.force_remote" => {
             config.general.force_remote = defaults.general.force_remote;
-            value = config.general.force_remote.to_string();
+            config.general.force_remote.to_string()
         }
         "general.log_level" => {
             config.general.log_level = defaults.general.log_level;
-            value = config.general.log_level.clone();
+            config.general.log_level.clone()
         }
         "general.socket_path" => {
             config.general.socket_path = defaults.general.socket_path;
-            value = config.general.socket_path.clone();
+            config.general.socket_path.clone()
         }
         "compilation.confidence_threshold" => {
             config.compilation.confidence_threshold = defaults.compilation.confidence_threshold;
-            value = config.compilation.confidence_threshold.to_string();
+            config.compilation.confidence_threshold.to_string()
         }
         "compilation.min_local_time_ms" => {
             config.compilation.min_local_time_ms = defaults.compilation.min_local_time_ms;
-            value = config.compilation.min_local_time_ms.to_string();
+            config.compilation.min_local_time_ms.to_string()
         }
         "transfer.compression_level" => {
             config.transfer.compression_level = defaults.transfer.compression_level;
-            value = config.transfer.compression_level.to_string();
+            config.transfer.compression_level.to_string()
         }
         "transfer.exclude_patterns" => {
             config.transfer.exclude_patterns = defaults.transfer.exclude_patterns;
-            value = format!("{:?}", config.transfer.exclude_patterns);
+            format!("{:?}", config.transfer.exclude_patterns)
         }
         "environment.allowlist" => {
             config.environment.allowlist = defaults.environment.allowlist;
-            value = format!("{:?}", config.environment.allowlist);
+            format!("{:?}", config.environment.allowlist)
         }
         "output.visibility" => {
             config.output.visibility = defaults.output.visibility;
-            value = config.output.visibility.to_string();
+            config.output.visibility.to_string()
         }
         "output.first_run_complete" | "first_run_complete" => {
             config.output.first_run_complete = defaults.output.first_run_complete;
-            value = config.output.first_run_complete.to_string();
+            config.output.first_run_complete.to_string()
         }
         _ => {
             return Err(ConfigError::InvalidValue {
@@ -977,7 +975,7 @@ fn config_reset_at(config_path: &Path, key: &str, ctx: &OutputContext) -> Result
             }
             .into());
         }
-    }
+    };
 
     if config.general.force_local && config.general.force_remote {
         return Err(ConfigError::InvalidValue {

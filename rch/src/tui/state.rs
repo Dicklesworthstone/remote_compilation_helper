@@ -405,20 +405,16 @@ impl TuiState {
                 history.reverse();
             }
             BuildHistorySort::DurationDesc => {
-                history.sort_by(|a, b| b.duration_ms.cmp(&a.duration_ms));
+                history.sort_by_key(|b| std::cmp::Reverse(b.duration_ms));
             }
             BuildHistorySort::DurationAsc => {
-                history.sort_by(|a, b| a.duration_ms.cmp(&b.duration_ms));
+                history.sort_by_key(|b| b.duration_ms);
             }
             BuildHistorySort::WorkerAsc => {
-                history.sort_by(|a, b| {
-                    let a_worker = a.worker.as_deref().unwrap_or("");
-                    let b_worker = b.worker.as_deref().unwrap_or("");
-                    a_worker.cmp(b_worker)
-                });
+                history.sort_by_key(|b| b.worker.as_deref().unwrap_or(""));
             }
             BuildHistorySort::StatusFailFirst => {
-                history.sort_by(|a, b| a.success.cmp(&b.success));
+                history.sort_by_key(|b| b.success);
             }
         }
 

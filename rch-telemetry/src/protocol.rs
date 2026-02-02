@@ -214,9 +214,7 @@ impl TestRunStats {
         let total_duration =
             self.avg_duration_ms.saturating_mul(self.total_runs) + record.duration_ms;
         self.total_runs = self.total_runs.saturating_add(1);
-        if self.total_runs > 0 {
-            self.avg_duration_ms = total_duration / self.total_runs;
-        }
+        self.avg_duration_ms = total_duration / self.total_runs;
 
         match record.exit_code {
             0 => self.passed_runs = self.passed_runs.saturating_add(1),
