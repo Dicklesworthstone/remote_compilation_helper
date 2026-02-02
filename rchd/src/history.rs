@@ -252,12 +252,21 @@ impl BuildHistory {
 
     /// Get a specific active build by ID.
     pub fn active_build(&self, build_id: u64) -> Option<ActiveBuildState> {
-        self.active.read().unwrap_or_else(|e| e.into_inner()).get(&build_id).cloned()
+        self.active
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&build_id)
+            .cloned()
     }
 
     /// Get all active builds.
     pub fn active_builds(&self) -> Vec<ActiveBuildState> {
-        self.active.read().unwrap_or_else(|e| e.into_inner()).values().cloned().collect()
+        self.active
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect()
     }
 
     // =========================================================================
@@ -347,7 +356,12 @@ impl BuildHistory {
 
     /// Get all queued builds (in queue order).
     pub fn queued_builds(&self) -> Vec<QueuedBuildState> {
-        self.queued.read().unwrap_or_else(|e| e.into_inner()).iter().cloned().collect()
+        self.queued
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .cloned()
+            .collect()
     }
 
     /// Get a specific queued build by ID.
@@ -377,7 +391,10 @@ impl BuildHistory {
 
     /// Check if the queue is empty.
     pub fn queue_is_empty(&self) -> bool {
-        self.queued.read().unwrap_or_else(|e| e.into_inner()).is_empty()
+        self.queued
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
     }
 
     /// Update estimated start times for all queued builds.
@@ -570,7 +587,10 @@ impl BuildHistory {
 
     /// Check if history is empty.
     pub fn is_empty(&self) -> bool {
-        self.records.read().unwrap_or_else(|e| e.into_inner()).is_empty()
+        self.records
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
     }
 
     /// Clear all build records.

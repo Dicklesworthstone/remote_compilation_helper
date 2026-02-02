@@ -1203,21 +1203,6 @@ async fn process_hook(input: HookInput) -> HookOutput {
         return HookOutput::allow();
     }
 
-    let config = match load_config() {
-        Ok(cfg) => cfg,
-        Err(e) => {
-            warn!("Failed to load config: {}, allowing local execution", e);
-            return HookOutput::allow();
-        }
-    };
-
-    let reporter = HookReporter::new(config.output.visibility);
-
-    if !config.general.enabled {
-        debug!("RCH disabled via config, allowing local execution");
-        return HookOutput::allow();
-    }
-
     let command = &input.tool_input.command;
     // Mask sensitive data in debug logs (API keys, tokens, passwords)
     debug!("Processing command: {}", mask_sensitive_command(command));
@@ -1244,6 +1229,21 @@ async fn process_hook(input: HookInput) -> HookOutput {
                 duration_ms, command, classification.reason
             );
         }
+        return HookOutput::allow();
+    }
+
+    let config = match load_config() {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            warn!("Failed to load config: {}, allowing local execution", e);
+            return HookOutput::allow();
+        }
+    };
+
+    let reporter = HookReporter::new(config.output.visibility);
+
+    if !config.general.enabled {
+        debug!("RCH disabled via config, allowing local execution");
         return HookOutput::allow();
     }
 

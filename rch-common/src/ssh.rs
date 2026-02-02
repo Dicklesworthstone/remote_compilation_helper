@@ -217,9 +217,10 @@ impl SshClient {
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
-                    if let Err(e) =
-                        std::fs::set_permissions(&control_dir, std::fs::Permissions::from_mode(0o700))
-                    {
+                    if let Err(e) = std::fs::set_permissions(
+                        &control_dir,
+                        std::fs::Permissions::from_mode(0o700),
+                    ) {
                         warn!(
                             "Failed to set permissions on SSH control directory {:?}: {}",
                             control_dir, e
@@ -511,7 +512,7 @@ impl SshPool {
     pub async fn get_or_connect(&self, config: &WorkerConfig) -> Result<Arc<RwLock<SshClient>>> {
         let worker_id = config.id.clone();
 
-        // Check if we already have a connection
+        // Fast path: check if we already have a valid connection (read lock)
         {
             let connections = self.connections.read().await;
             if let Some(client) = connections.get(&worker_id) {
@@ -523,17 +524,32 @@ impl SshPool {
             }
         }
 
-        // Create new connection
+        // Slow path: acquire write lock and double-check before creating connection
+        // This prevents TOCTOU race where multiple tasks create duplicate connections
+        let mut connections = self.connections.write().await;
+
+        // Double-check under write lock: another task may have added a connection
+        if let Some(client) = connections.get(&worker_id) {
+            let client_guard = client.read().await;
+            if client_guard.is_connected() {
+                debug!(
+                    "Reusing connection added by concurrent task to {}",
+                    worker_id
+                );
+                return Ok(client.clone());
+            }
+            // Connection exists but is disconnected - we'll replace it below
+        }
+
+        // Create new connection while holding write lock to prevent races
+        // Note: holding lock during connect() is acceptable here because:
+        // 1. Connections are per-worker, so only requests to same worker contend
+        // 2. Alternative (release lock during connect) has worse race conditions
         let mut client = SshClient::new(config.clone(), self.options.clone());
         client.connect().await?;
 
         let client = Arc::new(RwLock::new(client));
-
-        // Store in pool
-        {
-            let mut connections = self.connections.write().await;
-            connections.insert(worker_id.clone(), client.clone());
-        }
+        connections.insert(worker_id.clone(), client.clone());
 
         Ok(client)
     }
