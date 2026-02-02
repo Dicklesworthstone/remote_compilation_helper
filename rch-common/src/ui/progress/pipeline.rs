@@ -310,19 +310,25 @@ impl PipelineProgress {
             return None;
         }
 
-        let avg_duration: Duration = completed.iter().sum::<Duration>() / completed.len() as u32;
+        let completed_count: u32 = completed.len().try_into().unwrap_or(u32::MAX);
+        if completed_count == 0 {
+            return None;
+        }
+        let avg_duration: Duration = completed.iter().sum::<Duration>() / completed_count;
 
-        let remaining_count = self
+        let remaining_count: u32 = self
             .stages
             .iter()
             .filter(|s| matches!(s.status, StageStatus::Pending | StageStatus::InProgress))
-            .count();
+            .count()
+            .try_into()
+            .unwrap_or(u32::MAX);
 
         if remaining_count == 0 {
             return None;
         }
 
-        Some(avg_duration * remaining_count as u32)
+        Some(avg_duration.saturating_mul(remaining_count))
     }
 
     /// Render the pipeline progress display.

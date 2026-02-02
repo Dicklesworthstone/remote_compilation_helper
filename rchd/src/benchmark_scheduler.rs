@@ -346,16 +346,15 @@ impl BenchmarkScheduler {
             .ok()?;
 
         // New worker without score?
-        if speedscore.is_none() {
+        let Some(score) = speedscore else {
             debug!(worker_id = %worker_id, "New worker without SpeedScore");
             return Some(ScheduledBenchmarkRequest::new(
                 worker_id,
                 BenchmarkPriority::High,
                 BenchmarkReason::NewWorker,
             ));
-        }
+        };
 
-        let score = speedscore.unwrap();
         let age = Utc::now() - score.calculated_at;
         let age_duration = age.to_std().unwrap_or_default();
 
@@ -905,8 +904,14 @@ async fn execute_benchmark_on_worker(
     let mut child = cmd
         .spawn()
         .map_err(|e| anyhow::anyhow!("Failed to spawn SSH command: {}", e))?;
-    let stdout = child.stdout.take().unwrap();
-    let stderr = child.stderr.take().unwrap();
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("Failed to capture stdout from SSH command"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("Failed to capture stderr from SSH command"))?;
 
     let mut stdout_buf = Vec::new();
     let mut stderr_buf = Vec::new();

@@ -1401,11 +1401,10 @@ fn parse_rsync_files(output: &str) -> u32 {
         }
     }
 
-    // rsync verbose output lists files, count them
-    output
-        .lines()
-        .filter(|l| !l.trim().is_empty() && !l.contains("sent"))
-        .count() as u32
+    // If we couldn't parse structured stats, return 0 rather than guessing.
+    // The previous heuristic of counting non-empty lines was unreliable as it
+    // would count progress lines, stats, and error messages as files.
+    0
 }
 
 // =============================================================================
@@ -1814,19 +1813,19 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_rsync_files_fallback_count() {
+    fn test_parse_rsync_files_no_structured_stats_returns_zero() {
         let _guard = test_guard!();
-        // When no "Number of files" line exists, count non-empty non-"sent" lines
+        // When no "Number of files" line exists, return 0 rather than guessing.
         let output = "file1.txt\nfile2.txt\nfile3.txt";
-        assert_eq!(parse_rsync_files(output), 3);
+        assert_eq!(parse_rsync_files(output), 0);
     }
 
     #[test]
-    fn test_parse_rsync_files_fallback_excludes_sent_line() {
+    fn test_parse_rsync_files_no_structured_stats_ignores_sent_line() {
         let _guard = test_guard!();
-        // The fallback should exclude lines containing "sent"
+        // No structured stats: still return 0, even if "sent" appears.
         let output = "file1.txt\nfile2.txt\nsent 100 bytes";
-        assert_eq!(parse_rsync_files(output), 2);
+        assert_eq!(parse_rsync_files(output), 0);
     }
 
     #[test]
@@ -2269,7 +2268,14 @@ mod tests {
             .and_then(|inv| inv.command.clone())
             .expect("execute invocation");
 
-        assert!(command.contains("RUSTFLAGS='-C target-cpu=native'"));
+        let env_prefix = pipeline.build_env_prefix();
+        assert!(env_prefix.applied.contains(&"RUSTFLAGS".to_string()));
+        assert!(env_prefix.applied.contains(&"QUOTED".to_string()));
+        assert!(env_prefix.rejected.contains(&"BADVAL".to_string()));
+        assert!(env_prefix.rejected.contains(&"BAD=KEY".to_string()));
+
+        assert!(command.contains("RUSTFLAGS="));
+        assert!(command.contains("target-cpu=native"));
         // shell_escape uses '\'' style (end string, escaped quote, start string)
         assert!(command.contains("QUOTED='a'\\''b'"));
         assert!(!command.contains("BADVAL="));

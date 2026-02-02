@@ -254,7 +254,7 @@ pub fn verify_and_install_claude_code_hook() -> Result<HookResult> {
     }
     pre_tool_use
         .as_array_mut()
-        .expect("PreToolUse is an array")
+        .ok_or_else(|| anyhow::anyhow!("PreToolUse should be an array after initialization"))?
         .push(hook_entry);
 
     // Write settings atomically
@@ -333,7 +333,7 @@ fn add_rch_hook_to_settings(mut settings: Value) -> Result<Value> {
     }
     pre_tool_use
         .as_array_mut()
-        .expect("PreToolUse is an array")
+        .ok_or_else(|| anyhow::anyhow!("PreToolUse should be an array after initialization"))?
         .push(hook_entry);
 
     Ok(settings)
