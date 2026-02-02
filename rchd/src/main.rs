@@ -120,6 +120,8 @@ pub struct DaemonContext {
     pub version: &'static str,
     /// Daemon process ID.
     pub pid: u32,
+    /// Maximum time a build can wait in queue (seconds) before timing out.
+    pub queue_timeout_secs: u64,
 }
 
 #[tokio::main]
@@ -395,6 +397,7 @@ async fn main() -> Result<()> {
         socket_path: cli.socket.to_string_lossy().to_string(),
         version: env!("CARGO_PKG_VERSION"),
         pid: std::process::id(),
+        queue_timeout_secs: daemon_config.queue.timeout_secs,
     };
 
     // Start active build cleanup background task
@@ -780,6 +783,7 @@ mod tests {
             socket_path: "/tmp/test.sock".to_string(),
             version: "0.1.0-test",
             pid: std::process::id(),
+            queue_timeout_secs: 300,
         };
 
         assert_eq!(context.socket_path, "/tmp/test.sock");
@@ -824,6 +828,7 @@ mod tests {
             socket_path: rch_common::default_socket_path(),
             version: env!("CARGO_PKG_VERSION"),
             pid: std::process::id(),
+            queue_timeout_secs: 300,
         };
 
         assert_eq!(context.pool.len(), 1);
@@ -869,6 +874,7 @@ mod tests {
             socket_path: rch_common::default_socket_path(),
             version: "0.1.0",
             pid: 12345,
+            queue_timeout_secs: 300,
         };
 
         assert_eq!(context.history.len(), 1);
@@ -898,6 +904,7 @@ mod tests {
             socket_path: rch_common::default_socket_path(),
             version: "0.1.0",
             pid: 1234,
+            queue_timeout_secs: 300,
         };
 
         // Clone the context
