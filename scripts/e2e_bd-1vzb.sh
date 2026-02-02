@@ -14,7 +14,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-LOG_FILE="${PROJECT_ROOT}/target/e2e_bd-1vzb.jsonl"
+# Use CARGO_TARGET_DIR if set, otherwise default to $PROJECT_ROOT/target
+RCH_TARGET_DIR="${CARGO_TARGET_DIR:-$PROJECT_ROOT/target}"
+LOG_FILE="${RCH_TARGET_DIR}/e2e_bd-1vzb.jsonl"
 
 timestamp() {
     date -u '+%Y-%m-%dT%H:%M:%S.%3NZ' 2>/dev/null || date -u '+%Y-%m-%dT%H:%M:%SZ'
@@ -60,8 +62,8 @@ check_dependencies() {
 build_binaries() {
     log_json "build" "Building rch + rchd (debug)"
     (cd "$PROJECT_ROOT" && cargo build -p rch -p rchd >/dev/null 2>&1) || die "cargo build failed"
-    [[ -x "$PROJECT_ROOT/target/debug/rch" ]] || die "rch binary missing after build"
-    [[ -x "$PROJECT_ROOT/target/debug/rchd" ]] || die "rchd binary missing after build"
+    [[ -x "$RCH_TARGET_DIR/debug/rch" ]] || die "rch binary missing after build"
+    [[ -x "$RCH_TARGET_DIR/debug/rchd" ]] || die "rchd binary missing after build"
 }
 
 make_test_project() {
@@ -108,7 +110,7 @@ start_daemon() {
 
     log_json "daemon" "Starting rchd (mock transport)" "{\"socket\":\"$SOCKET_PATH\"}"
     env RCH_MOCK_SSH=1 RCH_MOCK_SSH_STDOUT=health_check \
-        "$PROJECT_ROOT/target/debug/rchd" \
+        "$RCH_TARGET_DIR/debug/rchd" \
         --socket "$SOCKET_PATH" \
         --workers-config "$WORKERS_FILE" \
         --foreground \
@@ -158,14 +160,19 @@ run_hook() {
 
     (
         cd "$PROJECT_DIR"
-        printf '%s\n' "$(hook_json)" | env RCH_SOCKET_PATH="$SOCKET_PATH" RCH_MOCK_SSH=1 "$PROJECT_ROOT/target/debug/rch" \
+        printf '%s\n' "$(hook_json)" | env RCH_SOCKET_PATH="$SOCKET_PATH" RCH_MOCK_SSH=1 "$RCH_TARGET_DIR/debug/rch" \
             >"$hook_out" 2>"$hook_err"
     )
 
-    if /bin/grep -q '"permissionDecision":"deny"' "$hook_out"; then
-        echo "deny"
+    # Check for RCH interception:
+    # - "updatedInput" means RCH ran remotely and replaced the command (transparent interception)
+    # - "permissionDecision":"deny" means blocked (legacy, still used for actual denials)
+    if /bin/grep -q '"updatedInput"' "$hook_out"; then
+        echo "intercepted"  # RCH handled it remotely
+    elif /bin/grep -q '"permissionDecision":"deny"' "$hook_out"; then
+        echo "deny"  # Blocked
     else
-        echo "allow"
+        echo "allow"  # Pass-through to local
     fi
 }
 
@@ -188,9 +195,9 @@ main() {
     trap stop_daemon EXIT
     start_daemon
 
-    log_json "test" "Baseline: remote available -> deny"
+    log_json "test" "Baseline: remote available -> intercepted"
     write_project_config $'[general]\nenabled = true\n'
-    expect_decision "baseline" "deny"
+    expect_decision "baseline" "intercepted"
 
     log_json "test" "force_local: allow even when remote would succeed"
     write_project_config $'[general]\nenabled = true\nforce_local = true\n'
@@ -200,9 +207,9 @@ main() {
     write_project_config $'[general]\nenabled = true\n\n[compilation]\nconfidence_threshold = 1.0\n'
     expect_decision "high_threshold" "allow"
 
-    log_json "test" "force_remote: deny even with high confidence threshold"
+    log_json "test" "force_remote: intercepted even with high confidence threshold"
     write_project_config $'[general]\nenabled = true\nforce_remote = true\n\n[compilation]\nconfidence_threshold = 1.0\n'
-    expect_decision "force_remote" "deny"
+    expect_decision "force_remote" "intercepted"
 
     log_json "summary" "All bd-1vzb checks passed" '{"result":"pass"}'
 }

@@ -32,6 +32,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 export PROJECT_ROOT
+# Use CARGO_TARGET_DIR if set, otherwise default to $PROJECT_ROOT/target
+RCH_TARGET_DIR="${CARGO_TARGET_DIR:-$PROJECT_ROOT/target}"
+export RCH_TARGET_DIR
 MODE="mock"
 FAIL_MODE=""
 RUN_ALL="0"
@@ -106,8 +109,8 @@ build_binaries() {
     log "INFO" "BUILD" "Building rch + rchd (debug)..."
     cd "$PROJECT_ROOT"
     cargo build -p rch -p rchd >/dev/null 2>&1 || die "Build failed"
-    [[ -x "$PROJECT_ROOT/target/debug/rch" ]] || die "Binary missing: rch"
-    [[ -x "$PROJECT_ROOT/target/debug/rchd" ]] || die "Binary missing: rchd"
+    [[ -x "$RCH_TARGET_DIR/debug/rch" ]] || die "Binary missing: rch"
+    [[ -x "$RCH_TARGET_DIR/debug/rchd" ]] || die "Binary missing: rchd"
     log "INFO" "BUILD" "Build OK"
 }
 
@@ -188,13 +191,13 @@ start_daemon() {
     log "INFO" "DAEMON" "Starting rchd (socket: $SOCKET_PATH)"
     if [[ "$MODE" == "mock" ]]; then
         env RCH_MOCK_SSH=1 RCH_MOCK_SSH_STDOUT=health_check \
-            "$PROJECT_ROOT/target/debug/rchd" \
+            "$RCH_TARGET_DIR/debug/rchd" \
             --socket "$SOCKET_PATH" \
             --workers-config "$WORKERS_FILE" \
             --foreground \
             >>"$DAEMON_LOG" 2>&1 &
     else
-        "$PROJECT_ROOT/target/debug/rchd" \
+        "$RCH_TARGET_DIR/debug/rchd" \
             --socket "$SOCKET_PATH" \
             --workers-config "$WORKERS_FILE" \
             --foreground \
@@ -259,13 +262,18 @@ run_hook() {
         cd "$PROJECT_DIR"
         printf '%s\n' "$(hook_json)" | \
             env RCH_SOCKET_PATH="$SOCKET_PATH" "${env_args[@]}" \
-            "$PROJECT_ROOT/target/debug/rch" >"$hook_out" 2>"$hook_err"
+            "$RCH_TARGET_DIR/debug/rch" >"$hook_out" 2>"$hook_err"
     )
 
-    if /bin/grep -q '"permissionDecision":"deny"' "$hook_out"; then
-        echo "deny"
+    # Check for RCH interception:
+    # - "updatedInput" means RCH ran remotely and replaced the command (transparent interception)
+    # - "permissionDecision":"deny" means blocked (legacy, still used for actual denials)
+    if /bin/grep -q '"updatedInput"' "$hook_out"; then
+        echo "intercepted"  # RCH handled it remotely
+    elif /bin/grep -q '"permissionDecision":"deny"' "$hook_out"; then
+        echo "deny"  # Blocked
     else
-        echo "allow"
+        echo "allow"  # Pass-through to local
     fi
 }
 
@@ -283,13 +291,18 @@ run_hook_with_toolchain() {
         cd "$PROJECT_DIR"
         printf '%s\n' "$(hook_json_with_toolchain "$toolchain")" | \
             env RCH_SOCKET_PATH="$SOCKET_PATH" "${env_args[@]}" \
-            "$PROJECT_ROOT/target/debug/rch" >"$hook_out" 2>"$hook_err"
+            "$RCH_TARGET_DIR/debug/rch" >"$hook_out" 2>"$hook_err"
     )
 
-    if /bin/grep -q '"permissionDecision":"deny"' "$hook_out"; then
-        echo "deny"
+    # Check for RCH interception:
+    # - "updatedInput" means RCH ran remotely and replaced the command (transparent interception)
+    # - "permissionDecision":"deny" means blocked (legacy, still used for actual denials)
+    if /bin/grep -q '"updatedInput"' "$hook_out"; then
+        echo "intercepted"  # RCH handled it remotely
+    elif /bin/grep -q '"permissionDecision":"deny"' "$hook_out"; then
+        echo "deny"  # Blocked
     else
-        echo "allow"
+        echo "allow"  # Pass-through to local
     fi
 }
 
@@ -361,7 +374,7 @@ run_scenario() {
         return 1
     fi
 
-    if [[ "$MODE" == "real" && "$expect" == "deny" && "$fail" != "artifacts" ]]; then
+    if [[ "$MODE" == "real" && "$expect" == "intercepted" && "$fail" != "artifacts" ]]; then
         if check_artifacts_real; then
             log "INFO" "ARTIFACTS" "$scenario artifacts present"
         else
@@ -370,7 +383,7 @@ run_scenario() {
         fi
     fi
 
-    if [[ "$MODE" == "mock" && "$expect" == "deny" && "$fail" != "sync" && "$fail" != "exec" && "$fail" != "worker-down" && "$fail" != "remote-exit" && "$fail" != "toolchain-install" && "$fail" != "no-rustup" ]]; then
+    if [[ "$MODE" == "mock" && "$expect" == "intercepted" && "$fail" != "sync" && "$fail" != "exec" && "$fail" != "worker-down" && "$fail" != "remote-exit" && "$fail" != "toolchain-install" && "$fail" != "no-rustup" ]]; then
         if [[ "$fail" == "artifacts" ]]; then
             if check_artifacts_mock_failure "$LOG_DIR/hook_${scenario}.err"; then
                 log "INFO" "ARTIFACTS" "$scenario artifact failure logged"
@@ -455,12 +468,12 @@ run_e2e() {
     log "INFO" "E2E" "Scenario: ${FAIL_MODE:-success}"
 
     if [[ "$RUN_ALL" == "1" && "$MODE" == "mock" ]]; then
-        run_scenario "success" "deny" ""
+        run_scenario "success" "intercepted" ""
         run_scenario "sync_fail" "allow" "sync"
         run_scenario "exec_fail" "allow" "exec"
         run_scenario "worker_down" "allow" "worker-down"
-        run_scenario "artifact_fail" "deny" "artifacts"
-        run_scenario "remote_exit" "deny" "remote-exit"
+        run_scenario "artifact_fail" "intercepted" "artifacts"
+        run_scenario "remote_exit" "intercepted" "remote-exit"
 
         # Toolchain synchronization scenarios with explicit toolchain specification
         log "INFO" "E2E" "Running toolchain synchronization scenarios..."
@@ -497,11 +510,11 @@ run_e2e() {
     if [[ -n "$FAIL_MODE" ]]; then
         case "$FAIL_MODE" in
             sync|exec|worker-down|toolchain-install|no-rustup|circuit-open) run_scenario "$FAIL_MODE" "allow" "$FAIL_MODE" ;;
-            artifacts|remote-exit) run_scenario "$FAIL_MODE" "deny" "$FAIL_MODE" ;;
+            artifacts|remote-exit) run_scenario "$FAIL_MODE" "intercepted" "$FAIL_MODE" ;;
             *) die "Unknown failure mode: $FAIL_MODE" ;;
         esac
     else
-        run_scenario "success" "deny" ""
+        run_scenario "success" "intercepted" ""
     fi
 }
 

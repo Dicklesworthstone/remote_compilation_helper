@@ -13,7 +13,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-LOG_FILE="${PROJECT_ROOT}/target/e2e_bd-x1ek.jsonl"
+# Use CARGO_TARGET_DIR if set, otherwise default to $PROJECT_ROOT/target
+RCH_TARGET_DIR="${CARGO_TARGET_DIR:-$PROJECT_ROOT/target}"
+LOG_FILE="${RCH_TARGET_DIR}/e2e_bd-x1ek.jsonl"
 
 timestamp() {
     date -u '+%Y-%m-%dT%H:%M:%S.%3NZ' 2>/dev/null || date -u '+%Y-%m-%dT%H:%M:%SZ'
@@ -59,8 +61,8 @@ check_dependencies() {
 build_binaries() {
     log_json "build" "Building rch + rchd (debug)"
     (cd "$PROJECT_ROOT" && cargo build -p rch -p rchd >/dev/null 2>&1) || die "cargo build failed"
-    [[ -x "$PROJECT_ROOT/target/debug/rch" ]] || die "rch binary missing after build"
-    [[ -x "$PROJECT_ROOT/target/debug/rchd" ]] || die "rchd binary missing after build"
+    [[ -x "$RCH_TARGET_DIR/debug/rch" ]] || die "rch binary missing after build"
+    [[ -x "$RCH_TARGET_DIR/debug/rchd" ]] || die "rchd binary missing after build"
 }
 
 make_test_project() {
@@ -107,7 +109,7 @@ start_daemon() {
 
     log_json "daemon" "Starting rchd (mock transport)" "{\"socket\":\"$SOCKET_PATH\"}"
     env RCH_MOCK_SSH=1 RCH_MOCK_SSH_STDOUT=health_check \
-        "$PROJECT_ROOT/target/debug/rchd" \
+        "$RCH_TARGET_DIR/debug/rchd" \
         --socket "$SOCKET_PATH" \
         --workers-config "$WORKERS_FILE" \
         --foreground \
@@ -159,14 +161,19 @@ run_hook() {
     (
         cd "$PROJECT_DIR"
         # shellcheck disable=SC2086
-        printf '%s\n' "$(hook_json)" | env RCH_SOCKET_PATH="$SOCKET_PATH" RCH_MOCK_SSH=1 $extra_env "$PROJECT_ROOT/target/debug/rch" \
+        printf '%s\n' "$(hook_json)" | env RCH_SOCKET_PATH="$SOCKET_PATH" RCH_MOCK_SSH=1 $extra_env "$RCH_TARGET_DIR/debug/rch" \
             >"$hook_out" 2>"$hook_err"
     )
 
-    if /bin/grep -q '"permissionDecision":"deny"' "$hook_out"; then
-        echo "deny"
+    # Check for RCH interception:
+    # - "updatedInput" means RCH ran remotely and replaced the command (transparent interception)
+    # - "permissionDecision":"deny" means blocked (legacy, still used for actual denials)
+    if /bin/grep -q '"updatedInput"' "$hook_out"; then
+        echo "intercepted"  # RCH handled it remotely
+    elif /bin/grep -q '"permissionDecision":"deny"' "$hook_out"; then
+        echo "deny"  # Blocked
     else
-        echo "allow"
+        echo "allow"  # Pass-through to local
     fi
 }
 
@@ -195,9 +202,9 @@ expect_decision() {
 # =============================================================================
 
 test_baseline_remote_works() {
-    log_json "test" "Baseline: remote available -> deny (offload to remote)"
+    log_json "test" "Baseline: remote available -> intercepted (offload to remote)"
     write_project_config $'[general]\nenabled = true\n'
-    expect_decision "baseline" "deny"
+    expect_decision "baseline" "intercepted"
 }
 
 test_transient_failures_succeed() {
@@ -205,7 +212,7 @@ test_transient_failures_succeed() {
     write_project_config $'[general]\nenabled = true\n'
     # Mock rsync will fail first 2 attempts, then succeed
     # The mock has built-in transient failure support that decrements on each call
-    expect_decision "transient_2_attempts" "deny" "RCH_MOCK_RSYNC_FAIL_SYNC_ATTEMPTS=2"
+    expect_decision "transient_2_attempts" "intercepted" "RCH_MOCK_RSYNC_FAIL_SYNC_ATTEMPTS=2"
 }
 
 test_force_local_bypasses_retry() {
