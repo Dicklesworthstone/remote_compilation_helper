@@ -1851,29 +1851,40 @@ detect_agents() {
 
     local rch_bin="$INSTALL_DIR/$HOOK_BIN"
     if [[ -x "$rch_bin" ]]; then
-        "$rch_bin" agents detect 2>&1 || true
-    else
-        # Manual detection
-        local agents_found=0
-
-        if command_exists claude; then
-            success "Claude Code: detected"
-            ((agents_found++))
+        local detect_output=""
+        if detect_output=$("$rch_bin" agents detect 2>&1); then
+            [[ -n "$detect_output" ]] && echo "$detect_output"
+            return
         fi
 
-        if [[ -d "$HOME/.cursor" ]] || command_exists cursor; then
-            success "Cursor: detected"
-            ((agents_found++))
+        if echo "$detect_output" | grep -qi "unrecognized subcommand"; then
+            warn "Built-in agent detection unavailable; using heuristics"
+        else
+            warn "Agent detection failed; using heuristics"
+            [[ -n "$detect_output" ]] && echo "$detect_output"
         fi
+    fi
 
-        if command_exists codex; then
-            success "Codex CLI: detected"
-            ((agents_found++))
-        fi
+    # Manual detection
+    local agents_found=0
 
-        if [[ $agents_found -eq 0 ]]; then
-            warn "No AI coding agents detected"
-        fi
+    if command_exists claude; then
+        success "Claude Code: detected"
+        ((agents_found++))
+    fi
+
+    if [[ -d "$HOME/.cursor" ]] || command_exists cursor; then
+        success "Cursor: detected"
+        ((agents_found++))
+    fi
+
+    if command_exists codex; then
+        success "Codex CLI: detected"
+        ((agents_found++))
+    fi
+
+    if [[ $agents_found -eq 0 ]]; then
+        warn "No AI coding agents detected"
     fi
 }
 
