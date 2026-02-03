@@ -2255,7 +2255,7 @@ print_summary() {
                 --border-foreground 196 \
                 --padding "1 3" \
                 --align center \
-                "⚠️  IMPORTANT: Restart Required  ⚠️" \
+                "!! IMPORTANT: Restart Required !!" \
                 "" \
                 "You MUST start a NEW Claude Code session" \
                 "for the RCH hook to be active." \
