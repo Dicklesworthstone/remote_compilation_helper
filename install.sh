@@ -629,42 +629,41 @@ download_binaries() {
 
     info "Checking for pre-built binaries..."
 
-    # Try to fetch the latest release
-    local release_url="${GITHUB_API}/releases/latest"
-    local release_info
-    release_info=$(curl -sL --connect-timeout 10 $PROXY_ARGS "$release_url" 2>/dev/null || echo "")
-
-    if [[ -z "$release_info" ]] || ! echo "$release_info" | grep -q '"tag_name"'; then
-        warn "No pre-built binaries available yet"
-        info "Falling back to building from source..."
-        clone_and_build_from_source
-        return
-    fi
-
     # Check if there are assets for our platform
     local asset_name="rch-${TARGET}.tar.gz"
-    if ! echo "$release_info" | grep -q "$asset_name"; then
-        warn "No pre-built binary for $TARGET"
-        info "Falling back to building from source..."
-        clone_and_build_from_source
-        return
-    fi
-
-    # Download and install the binary
-    local tag_name
-    tag_name=$(echo "$release_info" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1)
-    local download_url="https://github.com/${GITHUB_REPO}/releases/download/${tag_name}/${asset_name}"
+    local latest_url="https://github.com/${GITHUB_REPO}/releases/latest/download/${asset_name}"
 
     TEMP_DIR=$(mktemp -d)
     trap 'rm -rf "$TEMP_DIR"; cleanup_lock' EXIT
 
-    info "Downloading $asset_name..."
-    if ! curl -fsSL $PROXY_ARGS "$download_url" -o "$TEMP_DIR/$asset_name" 2>/dev/null; then
-        warn "Download failed"
-        info "Falling back to building from source..."
-        rm -rf "$TEMP_DIR"  # Clean up before fallback to avoid leak
-        clone_and_build_from_source
-        return
+    info "Downloading $asset_name from latest release..."
+    if ! curl -fsSL $PROXY_ARGS "$latest_url" -o "$TEMP_DIR/$asset_name" 2>/dev/null; then
+        # Try to fetch the latest release via API (fallback)
+        local release_url="${GITHUB_API}/releases/latest"
+        local release_info
+        release_info=$(curl -sL --connect-timeout 10 $PROXY_ARGS "$release_url" 2>/dev/null || echo "")
+
+        if [[ -z "$release_info" ]] || ! echo "$release_info" | grep -q '"tag_name"'; then
+            warn "No pre-built binaries available yet"
+            info "Falling back to building from source..."
+            rm -rf "$TEMP_DIR"  # Clean up before fallback to avoid leak
+            clone_and_build_from_source
+            return
+        fi
+
+        # Download and install the binary from the resolved tag
+        local tag_name
+        tag_name=$(echo "$release_info" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1)
+        local download_url="https://github.com/${GITHUB_REPO}/releases/download/${tag_name}/${asset_name}"
+
+        info "Downloading $asset_name from $tag_name..."
+        if ! curl -fsSL $PROXY_ARGS "$download_url" -o "$TEMP_DIR/$asset_name" 2>/dev/null; then
+            warn "Download failed"
+            info "Falling back to building from source..."
+            rm -rf "$TEMP_DIR"  # Clean up before fallback to avoid leak
+            clone_and_build_from_source
+            return
+        fi
     fi
 
     # Extract and install
