@@ -1884,17 +1884,17 @@ detect_agents() {
 
     if command_exists claude; then
         success "Claude Code: detected"
-        ((agents_found++))
+        agents_found=$((agents_found + 1))
     fi
 
     if [[ -d "$HOME/.cursor" ]] || command_exists cursor; then
         success "Cursor: detected"
-        ((agents_found++))
+        agents_found=$((agents_found + 1))
     fi
 
     if command_exists codex; then
         success "Codex CLI: detected"
-        ((agents_found++))
+        agents_found=$((agents_found + 1))
     fi
 
     if [[ $agents_found -eq 0 ]]; then
