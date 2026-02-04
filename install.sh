@@ -1985,19 +1985,19 @@ harmonize_workers() {
     fi
 
     info "Upgrading worker fleet (rch-wkr)..."
-    if "$rch_bin" fleet deploy --all 2>&1; then
+    if "$rch_bin" fleet deploy --yes --verify 2>&1; then
         success "Worker fleet deployed"
     else
         warn "Fleet deploy failed (workers may be offline or misconfigured)"
     fi
 
-    info "Running worker health checks..."
-    if "$rch_bin" fleet preflight --all 2>&1; then
-        success "Worker preflight passed"
+    info "Verifying worker fleet..."
+    if "$rch_bin" fleet verify 2>&1; then
+        success "Worker fleet verified"
         return 0
     fi
 
-    warn "Fleet preflight failed; falling back to workers probe"
+    warn "Fleet verify failed; falling back to workers probe"
     if "$rch_bin" workers probe --all 2>&1; then
         success "Worker probe passed"
     else
