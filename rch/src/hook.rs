@@ -68,10 +68,12 @@ const EXIT_SUCCESS: i32 = 0;
 const EXIT_BUILD_ERROR: i32 = 1;
 
 /// Exit code for cargo test when tests ran but some failed.
+#[allow(dead_code)] // Used in run_exec
 const EXIT_TEST_FAILURES: i32 = 101;
 
 /// Minimum exit code indicating the process was killed by a signal.
 /// Exit code = 128 + signal number (e.g., 137 = 128 + 9 = SIGKILL).
+#[allow(dead_code)] // Used in run_exec
 const EXIT_SIGNAL_BASE: i32 = 128;
 
 use rch_common::util::mask_sensitive_command;
@@ -124,6 +126,244 @@ pub async fn run_hook() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Execute a compilation command on a remote worker.
+///
+/// This is called by `rch exec -- <command>` which is invoked after the hook
+/// rewrites the original compilation command. This separation allows the hook
+/// to return immediately (<50ms) while the actual compilation runs as a
+/// normal command invocation.
+pub async fn run_exec(command_parts: Vec<String>) -> anyhow::Result<()> {
+    let command = command_parts.join(" ");
+    if command.is_empty() {
+        anyhow::bail!("No command provided to exec");
+    }
+
+    // Classify the command
+    let classification = classify_command(&command);
+    if !classification.is_compilation {
+        // Not a compilation command - just run locally
+        // This shouldn't normally happen since the hook only rewrites compilations
+        warn!("exec called with non-compilation command: {}", command);
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&command)
+            .status()?;
+        std::process::exit(status.code().unwrap_or(1));
+    }
+
+    let config = match load_config() {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            warn!("Failed to load config: {}, running locally", e);
+            let status = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&command)
+                .status()?;
+            std::process::exit(status.code().unwrap_or(1));
+        }
+    };
+
+    let reporter = HookReporter::new(config.output.visibility);
+
+    // Extract project name
+    let project = extract_project_name();
+
+    // Estimate cores needed
+    let estimated_cores =
+        estimate_cores_for_command(classification.kind, &command, &config.compilation);
+
+    // Detect toolchain
+    let project_root = std::env::current_dir().ok();
+    let toolchain = if let Some(root) = &project_root {
+        detect_toolchain(root).ok()
+    } else {
+        None
+    };
+
+    // Determine required runtime
+    let required_runtime = required_runtime_for_kind(classification.kind);
+    let command_priority = command_priority_from_env(&reporter);
+
+    // Query daemon for worker selection
+    let response = match query_daemon(
+        &config.general.socket_path,
+        &project,
+        estimated_cores,
+        &command,
+        toolchain.as_ref(),
+        required_runtime,
+        command_priority,
+        0, // classification duration not relevant here
+        Some(std::process::id()),
+    )
+    .await
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            warn!("Failed to query daemon: {}, running locally", e);
+            // Try auto-start daemon
+            if let Ok(()) = try_auto_start_daemon(
+                &config.self_healing,
+                Path::new(&config.general.socket_path),
+            )
+            .await
+            {
+                // Retry query
+                match query_daemon(
+                    &config.general.socket_path,
+                    &project,
+                    estimated_cores,
+                    &command,
+                    toolchain.as_ref(),
+                    required_runtime,
+                    command_priority,
+                    0,
+                    Some(std::process::id()),
+                )
+                .await
+                {
+                    Ok(resp) => resp,
+                    Err(_) => {
+                        reporter.summary("[RCH] local (daemon unavailable)");
+                        let status = std::process::Command::new("sh")
+                            .arg("-c")
+                            .arg(&command)
+                            .status()?;
+                        std::process::exit(status.code().unwrap_or(1));
+                    }
+                }
+            } else {
+                reporter.summary("[RCH] local (daemon unavailable)");
+                let status = std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(&command)
+                    .status()?;
+                std::process::exit(status.code().unwrap_or(1));
+            }
+        }
+    };
+
+    // Check if a worker was assigned
+    let Some(worker) = response.worker else {
+        reporter.summary(&format!("[RCH] local ({})", response.reason));
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&command)
+            .status()?;
+        std::process::exit(status.code().unwrap_or(1));
+    };
+
+    info!(
+        "Selected worker: {} at {}@{} ({} slots, speed {:.1})",
+        worker.id, worker.user, worker.host, worker.slots_available, worker.speed_score
+    );
+
+    // Execute remote compilation pipeline
+    let remote_start = Instant::now();
+    let result = execute_remote_compilation(
+        &worker,
+        &command,
+        config.transfer.clone(),
+        config.environment.allowlist.clone(),
+        &config.compilation,
+        toolchain.as_ref(),
+        classification.kind,
+        &reporter,
+        &config.general.socket_path,
+        config.output.color_mode,
+        response.build_id,
+    )
+    .await;
+    let remote_elapsed = remote_start.elapsed();
+
+    // Release worker slots
+    let release_exit_code = result
+        .as_ref()
+        .map(|ok| ok.exit_code)
+        .unwrap_or(EXIT_BUILD_ERROR);
+    let release_timing = result.as_ref().ok().map(|ok| {
+        let mut timing = ok.timing.clone();
+        timing.total = Some(remote_elapsed);
+        timing
+    });
+    if let Err(e) = release_worker(
+        &config.general.socket_path,
+        &worker.id,
+        estimated_cores,
+        response.build_id,
+        Some(release_exit_code),
+        None,
+        None,
+        release_timing.as_ref(),
+    )
+    .await
+    {
+        warn!("Failed to release worker slots: {}", e);
+    }
+
+    // Handle result and exit with appropriate code
+    match result {
+        Ok(result) => {
+            if result.exit_code == 0 {
+                reporter.summary(&format!(
+                    "[RCH] remote {} ({})",
+                    worker.id,
+                    format_duration_ms(remote_elapsed)
+                ));
+                // Record successful build
+                let is_test = classification
+                    .kind
+                    .map(|kind| kind.is_test_command())
+                    .unwrap_or(false);
+                if let Err(e) =
+                    record_build(&config.general.socket_path, &worker.id, &project, is_test).await
+                {
+                    warn!("Failed to record build: {}", e);
+                }
+                std::process::exit(0);
+            } else if is_toolchain_failure(&result.stderr, result.exit_code) {
+                // Toolchain failure - fall back to local
+                warn!("Remote toolchain failure, falling back to local");
+                reporter.summary(&format!("[RCH] local (toolchain missing on {})", worker.id));
+                let status = std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(&command)
+                    .status()?;
+                std::process::exit(status.code().unwrap_or(1));
+            } else {
+                // Command failed remotely - exit with the same code
+                reporter.summary(&format!(
+                    "[RCH] remote {} failed (exit {})",
+                    worker.id, result.exit_code
+                ));
+                std::process::exit(result.exit_code);
+            }
+        }
+        Err(e) => {
+            // Check for transfer skip (not a failure)
+            if let Some(skip_err) = e.downcast_ref::<TransferError>()
+                && let TransferError::TransferSkipped { reason } = skip_err
+            {
+                reporter.summary(&format!("[RCH] local ({})", reason));
+                let status = std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(&command)
+                    .status()?;
+                std::process::exit(status.code().unwrap_or(1));
+            }
+
+            // Other errors - run locally
+            warn!("Remote execution failed: {}, running locally", e);
+            reporter.summary("[RCH] local (remote execution failed)");
+            let status = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&command)
+                .status()?;
+            std::process::exit(status.code().unwrap_or(1));
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -373,6 +613,7 @@ fn render_compile_summary(
     console.print_plain(&content_plain);
 }
 
+#[allow(dead_code)] // May be used for timing estimates in run_exec
 fn estimate_local_time_ms(remote_ms: u64, worker_speed_score: f64) -> Option<u64> {
     if remote_ms == 0 || worker_speed_score <= 0.0 {
         return None;
@@ -809,13 +1050,17 @@ fn has_exact_flag(command: &str) -> bool {
 use serde::Serialize;
 use std::collections::HashMap;
 
-/// Maximum number of timing samples to retain per project+kind.
+// Timing infrastructure - currently used only for metrics collection and future
+// timing-based build gating. Allow dead_code until timing estimates are wired
+// into run_exec for smarter offload decisions.
+#[allow(dead_code)]
 const MAX_TIMING_SAMPLES: usize = 20;
 
-/// Maximum number of projects to track in timing history (LRU eviction above this).
+#[allow(dead_code)]
 const MAX_TIMING_PROJECTS: usize = 500;
 
 /// A single timing record for a completed build.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct TimingRecord {
     /// Timestamp when the build completed (Unix seconds).
@@ -827,6 +1072,7 @@ struct TimingRecord {
 }
 
 /// Timing data for a specific project+kind combination.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct ProjectTimingData {
     /// Recent local build durations (ring buffer).
@@ -835,6 +1081,7 @@ struct ProjectTimingData {
     pub remote_samples: Vec<TimingRecord>,
 }
 
+#[allow(dead_code)]
 impl ProjectTimingData {
     /// Add a timing sample, maintaining ring buffer size.
     fn add_sample(&mut self, duration_ms: u64, remote: bool) {
@@ -912,6 +1159,7 @@ impl ProjectTimingData {
 }
 
 /// Full timing history, keyed by project+kind.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct TimingHistory {
     /// Map from "project_id:kind" to timing data.
@@ -924,16 +1172,19 @@ struct TimingHistory {
 /// After first load from disk, all reads come from memory (zero disk I/O).
 /// Writes update the cache first, then persist to disk asynchronously.
 /// This eliminates disk I/O from the estimate_timing_for_build hot path.
+#[allow(dead_code)]
 static TIMING_CACHE: std::sync::OnceLock<std::sync::RwLock<TimingHistory>> =
     std::sync::OnceLock::new();
 
 /// Get or initialize the global TimingHistory cache.
 ///
 /// First call loads from disk (blocking); subsequent calls return the cached copy.
+#[allow(dead_code)]
 fn timing_cache() -> &'static std::sync::RwLock<TimingHistory> {
     TIMING_CACHE.get_or_init(|| std::sync::RwLock::new(TimingHistory::load_from_disk()))
 }
 
+#[allow(dead_code)]
 impl TimingHistory {
     /// Load timing history from disk. Returns empty history on error.
     fn load_from_disk() -> Self {
@@ -1045,6 +1296,7 @@ fn timing_history_path() -> Option<PathBuf> {
 /// Updates the in-memory cache immediately, then persists to disk.
 /// Called after a build completes to update the timing history.
 /// This is used by `estimate_timing_for_build` for future predictions.
+#[allow(dead_code)]
 pub fn record_build_timing(
     project: &str,
     kind: Option<CompilationKind>,
@@ -1063,6 +1315,7 @@ pub fn record_build_timing(
 ///
 /// Used to determine whether a build is worth offloading based on
 /// predicted local execution time and expected speedup.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct TimingEstimate {
     /// Predicted local build time in milliseconds.
@@ -1082,6 +1335,7 @@ struct TimingEstimate {
 ///
 /// When no historical data is available, returns None to trigger fail-open
 /// behavior (allow offload attempt).
+#[allow(dead_code)]
 #[allow(unused_variables)] // config used for future speedscore integration
 fn estimate_timing_for_build(
     project: &str,
@@ -1175,6 +1429,7 @@ fn is_test_kind(kind: Option<CompilationKind>) -> bool {
     )
 }
 
+#[allow(dead_code)]
 fn emit_first_run_message(worker: &SelectedWorker, remote_ms: u64, local_ms: Option<u64>) {
     let divider = "----------------------------------------";
     let remote = format_duration_ms(Duration::from_millis(remote_ms));
@@ -1324,181 +1579,39 @@ async fn process_hook(input: HookInput) -> HookOutput {
         }
     }
 
-    // Extract project for timing estimation and daemon query
-    let project = extract_project_name();
+    // CRITICAL: Return immediately with delegated command to avoid hook timeout.
+    //
+    // Claude Code hooks have a tight timeout budget (~50-100ms). The full remote
+    // compilation pipeline (daemon query + rsync + SSH + rsync back) takes 3+ seconds.
+    // If we do that work here, the hook times out and Claude Code ignores our response.
+    //
+    // Solution: Return immediately with `rch exec -- <command>`. The hook completes
+    // in <10ms, and the actual remote compilation happens when Claude Code executes
+    // the modified command.
+    //
+    // For compound commands like "cd /path && cargo build", we preserve the prefix
+    // and only wrap the compilation part: "cd /path && rch exec -- cargo build"
+    info!(
+        "Delegating compilation to rch exec (classification: {:?}, compound: {})",
+        classification.kind,
+        classification.command_prefix.is_some()
+    );
+    reporter.verbose("[RCH] delegating to rch exec...");
 
-    // Check timing thresholds (min_local_time_ms and remote_speedup_threshold)
-    // This gating prevents offloading tiny builds where overhead dominates.
-    // Note: spawn_blocking moves file I/O off the async runtime (bd-1gz8)
-    if !config.general.force_remote {
-        let project_clone = project.clone();
-        let kind = classification.kind;
-        let config_clone = config.clone();
-        let timing_estimate = tokio::task::spawn_blocking(move || {
-            estimate_timing_for_build(&project_clone, kind, &config_clone)
-        })
-        .await
-        .ok()
-        .flatten();
-
-        if let Some(timing_estimate) = timing_estimate {
-            // Gate on min_local_time_ms: skip remote if build is too small
-            if timing_estimate.predicted_local_ms < config.compilation.min_local_time_ms {
-                debug!(
-                    "Predicted local time {}ms < threshold {}ms, allowing local execution",
-                    timing_estimate.predicted_local_ms, config.compilation.min_local_time_ms
-                );
-                reporter.verbose(&format!(
-                    "[RCH] local (predicted {}ms < min {}ms)",
-                    timing_estimate.predicted_local_ms, config.compilation.min_local_time_ms
-                ));
-                reporter.summary("[RCH] local (build too small for offload)");
-                return HookOutput::allow();
-            }
-
-            // Gate on remote_speedup_threshold: skip remote if speedup isn't worth it
-            if let Some(predicted_speedup) = timing_estimate.predicted_speedup
-                && predicted_speedup < config.compilation.remote_speedup_threshold
-            {
-                debug!(
-                    "Predicted speedup {:.2}x < threshold {:.2}x, allowing local execution",
-                    predicted_speedup, config.compilation.remote_speedup_threshold
-                );
-                reporter.verbose(&format!(
-                    "[RCH] local (predicted speedup {:.1}x < {:.1}x threshold)",
-                    predicted_speedup, config.compilation.remote_speedup_threshold
-                ));
-                reporter.summary("[RCH] local (remote speedup insufficient)");
-                return HookOutput::allow();
-            }
-
-            debug!(
-                "Timing check passed: predicted_local={}ms, predicted_speedup={:?}",
-                timing_estimate.predicted_local_ms, timing_estimate.predicted_speedup
-            );
-        } else {
-            // No timing history available - fail-open (allow offload)
-            debug!(
-                "No timing history for {}/{:?}, allowing offload attempt",
-                project, classification.kind
-            );
-        }
-    }
-
-    let estimated_cores =
-        estimate_cores_for_command(classification.kind, command, &config.compilation);
-    reporter.verbose("[RCH] selecting worker...");
-
-    // Detect toolchain to send to daemon
-    let project_root_for_detection = std::env::current_dir().ok();
-    let toolchain = if let Some(root) = &project_root_for_detection {
-        match detect_toolchain(root) {
-            Ok(tc) => {
-                debug!("Detected toolchain: {}", tc);
-                Some(tc)
-            }
-            Err(e) => {
-                warn!("Failed to detect toolchain: {}", e);
-                None
-            }
-        }
+    let modified_command = if let (Some(prefix), Some(extracted)) =
+        (&classification.command_prefix, &classification.extracted_command)
+    {
+        // Compound command: preserve prefix, wrap only the compilation part
+        format!("{}rch exec -- {}", prefix, extracted)
     } else {
-        None
+        // Simple command: wrap the entire command
+        format!("rch exec -- {}", command)
     };
 
-    // Determine required runtime
-    let required_runtime = required_runtime_for_kind(classification.kind);
-    let command_priority = command_priority_from_env(&reporter);
-
-    match query_daemon(
-        &config.general.socket_path,
-        &project,
-        estimated_cores,
-        command,
-        toolchain.as_ref(),
-        required_runtime,
-        command_priority,
-        classification_duration_us,
-        Some(std::process::id()),
-    )
-    .await
-    {
-        Ok(response) => {
-            handle_selection_response(
-                response,
-                command,
-                &config,
-                &reporter,
-                toolchain.as_ref(),
-                classification.kind,
-                &project,
-                estimated_cores,
-            )
-            .await
-        }
-        Err(e) => {
-            warn!(
-                target: "rch::hook::autostart",
-                "Failed to query daemon: {}",
-                e
-            );
-            match try_auto_start_daemon(
-                &config.self_healing,
-                Path::new(&config.general.socket_path),
-            )
-            .await
-            {
-                Ok(()) => match query_daemon(
-                    &config.general.socket_path,
-                    &project,
-                    estimated_cores,
-                    command,
-                    toolchain.as_ref(),
-                    required_runtime,
-                    command_priority,
-                    classification_duration_us,
-                    Some(std::process::id()),
-                )
-                .await
-                {
-                    Ok(response) => {
-                        handle_selection_response(
-                            response,
-                            command,
-                            &config,
-                            &reporter,
-                            toolchain.as_ref(),
-                            classification.kind,
-                            &project,
-                            estimated_cores,
-                        )
-                        .await
-                    }
-                    Err(err) => {
-                        warn!(
-                            target: "rch::hook::autostart",
-                            "Failed to query daemon after auto-start: {}",
-                            err
-                        );
-                        reporter.summary("[RCH] local (daemon unavailable)");
-                        HookOutput::allow()
-                    }
-                },
-                Err(auto_err) => {
-                    warn!(
-                        target: "rch::hook::autostart",
-                        "Failed to auto-start daemon: {}",
-                        auto_err
-                    );
-                    warn!("Original daemon error: {}", e);
-                    reporter.summary("[RCH] local (daemon unavailable)");
-                    HookOutput::allow()
-                }
-            }
-        }
-    }
+    HookOutput::allow_with_modified_command(modified_command)
 }
 
+#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)] // Pipeline wiring favors explicit params.
 async fn handle_selection_response(
     response: SelectionResponse,
@@ -2065,6 +2178,7 @@ fn is_toolchain_failure(stderr: &str, exit_code: i32) -> bool {
 /// - 137 (SIGKILL = 9): Typically OOM killer
 /// - 143 (SIGTERM = 15): Graceful termination request
 /// - 139 (SIGSEGV = 11): Segmentation fault
+#[allow(dead_code)]
 fn is_signal_killed(exit_code: i32) -> Option<i32> {
     if exit_code > EXIT_SIGNAL_BASE {
         Some(exit_code - EXIT_SIGNAL_BASE)
@@ -2074,6 +2188,7 @@ fn is_signal_killed(exit_code: i32) -> Option<i32> {
 }
 
 /// Format a signal number as a human-readable name.
+#[allow(dead_code)]
 fn signal_name(signal: i32) -> &'static str {
     match signal {
         1 => "SIGHUP",
@@ -3410,20 +3525,34 @@ mod tests {
         let output: HookOutput = process_hook(input).await;
         let _ = std::fs::remove_file(&socket_path);
 
-        // Remote success should return AllowWithModifiedCommand (transparent interception)
-        // This is considered "allow" because we're allowing a modified (no-op) command
+        // Hook should return AllowWithModifiedCommand delegating to `rch exec`
+        // The actual remote compilation happens when `rch exec` runs, not in the hook
         assert!(output.is_allow());
-        assert!(
-            matches!(output, HookOutput::AllowWithModifiedCommand(_)),
-            "Expected AllowWithModifiedCommand for successful remote execution"
-        );
+        match &output {
+            HookOutput::AllowWithModifiedCommand(modified) => {
+                let cmd = &modified.hook_specific_output.updated_input.command;
+                assert!(
+                    cmd.starts_with("rch exec -- "),
+                    "Modified command should delegate to rch exec: {}",
+                    cmd
+                );
+                assert!(
+                    cmd.contains("cargo build"),
+                    "Modified command should contain original command: {}",
+                    cmd
+                );
+            }
+            _ => panic!("Expected AllowWithModifiedCommand"),
+        }
 
+        // No rsync/SSH should be invoked during the hook - that happens in run_exec
         let rsync_logs = mock::global_rsync_invocations_snapshot();
         let ssh_logs = mock::global_ssh_invocations_snapshot();
-
-        assert!(rsync_logs.iter().any(|i| i.phase == Phase::Sync));
-        assert!(rsync_logs.iter().any(|i| i.phase == Phase::Artifacts));
-        assert!(ssh_logs.iter().any(|i| i.phase == Phase::Execute));
+        assert!(
+            rsync_logs.is_empty(),
+            "Hook should not invoke rsync directly"
+        );
+        assert!(ssh_logs.is_empty(), "Hook should not invoke SSH directly");
     }
 
     #[tokio::test]
@@ -3546,25 +3675,39 @@ mod tests {
         let _ = std::fs::remove_file(&socket_path);
 
         // force_remote should result in transparent interception (AllowWithModifiedCommand)
+        // with delegation to `rch exec`
         assert!(output.is_allow());
-        assert!(
-            matches!(output, HookOutput::AllowWithModifiedCommand(_)),
-            "force_remote should use transparent interception"
-        );
+        match &output {
+            HookOutput::AllowWithModifiedCommand(modified) => {
+                let cmd = &modified.hook_specific_output.updated_input.command;
+                assert!(
+                    cmd.starts_with("rch exec -- "),
+                    "Should delegate to rch exec: {}",
+                    cmd
+                );
+            }
+            _ => panic!("force_remote should use transparent interception"),
+        }
 
+        // No rsync/SSH should be invoked during the hook - that happens in run_exec
         let rsync_logs = mock::global_rsync_invocations_snapshot();
         let ssh_logs = mock::global_ssh_invocations_snapshot();
-        assert!(rsync_logs.iter().any(|i| i.phase == Phase::Sync));
-        assert!(rsync_logs.iter().any(|i| i.phase == Phase::Artifacts));
-        assert!(ssh_logs.iter().any(|i| i.phase == Phase::Execute));
+        assert!(
+            rsync_logs.is_empty(),
+            "Hook should not invoke rsync directly"
+        );
+        assert!(ssh_logs.is_empty(), "Hook should not invoke SSH directly");
     }
 
     #[tokio::test]
     #[serial(mock_global)]
-    async fn test_process_hook_remote_sync_failure_allows() {
+    async fn test_process_hook_delegates_to_rch_exec() {
+        // Test that process_hook always delegates to `rch exec` without doing
+        // any remote operations itself. Sync failures (if any) would happen
+        // in run_exec, not in process_hook.
         let _lock = test_lock().lock().await;
         let socket_path = format!(
-            "/tmp/rch_test_hook_sync_fail_{}_{}.sock",
+            "/tmp/rch_test_hook_delegate_{}_{}.sock",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -3572,28 +3715,14 @@ mod tests {
                 .as_nanos()
         );
 
+        // Even with sync_failure mock config, the hook should succeed
+        // because it doesn't do sync - it just delegates to rch exec
         let _overrides = TestOverridesGuard::set(
             &socket_path,
             MockConfig::default(),
             MockRsyncConfig::sync_failure(),
         );
         mock::clear_global_invocations();
-
-        let response = SelectionResponse {
-            worker: Some(SelectedWorker {
-                id: rch_common::WorkerId::new("mock-worker"),
-                host: "mock.host.local".to_string(),
-                user: "mockuser".to_string(),
-                identity_file: "~/.ssh/mock_key".to_string(),
-                slots_available: 8,
-                speed_score: 90.0,
-            }),
-            reason: SelectionReason::Success,
-            build_id: None,
-        };
-        spawn_mock_daemon(&socket_path, response).await;
-
-        tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
 
         let input = HookInput {
             tool_name: "Bash".to_string(),
@@ -3607,12 +3736,28 @@ mod tests {
         let output = process_hook(input).await;
         let _ = std::fs::remove_file(&socket_path);
 
+        // Hook should return AllowWithModifiedCommand delegating to rch exec
         assert!(output.is_allow());
+        match &output {
+            HookOutput::AllowWithModifiedCommand(modified) => {
+                let cmd = &modified.hook_specific_output.updated_input.command;
+                assert!(
+                    cmd.starts_with("rch exec -- "),
+                    "Should delegate to rch exec: {}",
+                    cmd
+                );
+            }
+            _ => panic!("Expected AllowWithModifiedCommand"),
+        }
 
+        // No rsync/SSH should be invoked during the hook
         let rsync_logs = mock::global_rsync_invocations_snapshot();
         let ssh_logs = mock::global_ssh_invocations_snapshot();
-        assert!(rsync_logs.iter().any(|i| i.phase == Phase::Sync));
-        assert!(ssh_logs.is_empty());
+        assert!(
+            rsync_logs.is_empty(),
+            "Hook should not invoke rsync directly"
+        );
+        assert!(ssh_logs.is_empty(), "Hook should not invoke SSH directly");
     }
 
     #[tokio::test]
@@ -4194,44 +4339,10 @@ mod tests {
 
     #[tokio::test]
     #[serial(mock_global)]
-    async fn test_cargo_test_remote_success() {
+    async fn test_cargo_test_delegates_to_rch_exec() {
+        // Test that cargo test commands are delegated to rch exec
         let _lock = test_lock().lock().await;
-        let socket_path = format!(
-            "/tmp/rch_test_cargo_test_success_{}_{}.sock",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
-
-        // Configure mock for successful test execution (exit 0)
-        let _overrides = TestOverridesGuard::set(
-            &socket_path,
-            MockConfig {
-                default_exit_code: 0,
-                default_stdout: "running 5 tests\ntest test_one ... ok\ntest test_two ... ok\n\ntest result: ok. 5 passed; 0 failed; 0 ignored\n".to_string(),
-                ..MockConfig::default()
-            },
-            MockRsyncConfig::success(),
-        );
         mock::clear_global_invocations();
-
-        let response = SelectionResponse {
-            worker: Some(SelectedWorker {
-                id: rch_common::WorkerId::new("test-worker"),
-                host: "test.host.local".to_string(),
-                user: "testuser".to_string(),
-                identity_file: "~/.ssh/test_key".to_string(),
-                slots_available: 8,
-                speed_score: 85.0,
-            }),
-            reason: SelectionReason::Success,
-            build_id: None,
-        };
-        spawn_mock_daemon(&socket_path, response).await;
-
-        tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
 
         let input = HookInput {
             tool_name: "Bash".to_string(),
@@ -4243,108 +4354,60 @@ mod tests {
         };
 
         let output = process_hook(input).await;
-        let _ = std::fs::remove_file(&socket_path);
 
-        // Successful remote test should use transparent interception
+        // Hook should delegate to rch exec
         assert!(
             output.is_allow(),
-            "Successful cargo test should use transparent interception"
+            "cargo test should be allowed via delegation"
         );
-        assert!(
-            matches!(output, HookOutput::AllowWithModifiedCommand(_)),
-            "Successful cargo test should return AllowWithModifiedCommand"
-        );
+        match &output {
+            HookOutput::AllowWithModifiedCommand(modified) => {
+                let cmd = &modified.hook_specific_output.updated_input.command;
+                assert_eq!(cmd, "rch exec -- cargo test");
+            }
+            _ => panic!("Expected AllowWithModifiedCommand"),
+        }
 
-        // Verify the pipeline phases executed correctly
+        // No rsync/SSH during hook - that happens in run_exec
         let rsync_logs = mock::global_rsync_invocations_snapshot();
         let ssh_logs = mock::global_ssh_invocations_snapshot();
-
-        assert!(
-            rsync_logs.iter().any(|i| i.phase == Phase::Sync),
-            "Should have synced project"
-        );
-        assert!(
-            ssh_logs.iter().any(|i| i.phase == Phase::Execute),
-            "Should have executed remote command"
-        );
-        // Artifacts should be retrieved on success (but with test-specific patterns)
-        assert!(
-            rsync_logs.iter().any(|i| i.phase == Phase::Artifacts),
-            "Should have retrieved artifacts"
-        );
+        assert!(rsync_logs.is_empty(), "Hook should not invoke rsync");
+        assert!(ssh_logs.is_empty(), "Hook should not invoke SSH");
     }
 
     #[tokio::test]
     #[serial(mock_global)]
-    async fn test_cargo_test_remote_test_failures() {
+    async fn test_cargo_test_with_args_delegates_correctly() {
+        // Test that cargo test with arguments is delegated correctly
         let _lock = test_lock().lock().await;
-        let socket_path = format!(
-            "/tmp/rch_test_cargo_test_failures_{}_{}.sock",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
-
-        // Configure mock for test failures (exit 101)
-        let _overrides = TestOverridesGuard::set(
-            &socket_path,
-            MockConfig {
-                default_exit_code: 101,
-                default_stdout: "running 5 tests\ntest test_one ... ok\ntest test_two ... FAILED\n\ntest result: FAILED. 4 passed; 1 failed; 0 ignored\n".to_string(),
-                default_stderr: "thread 'test_two' panicked at 'assertion failed'\n".to_string(),
-                ..MockConfig::default()
-            },
-            MockRsyncConfig::success(),
-        );
         mock::clear_global_invocations();
-
-        let response = SelectionResponse {
-            worker: Some(SelectedWorker {
-                id: rch_common::WorkerId::new("test-worker"),
-                host: "test.host.local".to_string(),
-                user: "testuser".to_string(),
-                identity_file: "~/.ssh/test_key".to_string(),
-                slots_available: 8,
-                speed_score: 85.0,
-            }),
-            reason: SelectionReason::Success,
-            build_id: None,
-        };
-        spawn_mock_daemon(&socket_path, response).await;
-
-        tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
 
         let input = HookInput {
             tool_name: "Bash".to_string(),
             tool_input: ToolInput {
-                command: "cargo test".to_string(),
+                command: "cargo test --release -- --nocapture".to_string(),
                 description: None,
             },
             session_id: None,
         };
 
         let output = process_hook(input).await;
-        let _ = std::fs::remove_file(&socket_path);
 
-        // Test failures (exit 101) should use transparent interception with exit code
-        // Agent sees the failure output and gets correct exit code
-        assert!(
-            output.is_allow(),
-            "cargo test with failures should use transparent interception"
-        );
-        assert!(
-            matches!(output, HookOutput::AllowWithModifiedCommand(_)),
-            "cargo test failures should return AllowWithModifiedCommand"
-        );
+        // Hook should delegate with all arguments preserved
+        assert!(output.is_allow());
+        match &output {
+            HookOutput::AllowWithModifiedCommand(modified) => {
+                let cmd = &modified.hook_specific_output.updated_input.command;
+                assert_eq!(cmd, "rch exec -- cargo test --release -- --nocapture");
+            }
+            _ => panic!("Expected AllowWithModifiedCommand"),
+        }
 
-        // Verify pipeline executed
+        // No rsync/SSH during hook
+        let rsync_logs = mock::global_rsync_invocations_snapshot();
         let ssh_logs = mock::global_ssh_invocations_snapshot();
-        assert!(
-            ssh_logs.iter().any(|i| i.phase == Phase::Execute),
-            "Should have executed remote command"
-        );
+        assert!(rsync_logs.is_empty(), "Hook should not invoke rsync");
+        assert!(ssh_logs.is_empty(), "Hook should not invoke SSH");
     }
 
     #[tokio::test]

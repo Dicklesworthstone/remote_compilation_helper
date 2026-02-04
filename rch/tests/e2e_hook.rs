@@ -528,25 +528,34 @@ fn test_hook_ignores_background_commands() {
 }
 
 #[test]
-fn test_hook_rejects_chained_commands() {
+fn test_hook_handles_chained_commands() {
     let _guard = test_guard!();
-    let harness = create_hook_harness("hook_rejects_chained").unwrap();
+    let harness = create_hook_harness("hook_handles_chained").unwrap();
 
     harness
         .logger
-        .info("TEST START: test_hook_rejects_chained_commands");
+        .info("TEST START: test_hook_handles_chained_commands");
 
-    // && chained - should be rejected for safety
+    // && chained with compilation at end - NOW ACCEPTED for patterns like "cd && cargo build"
     let result = classify_and_log(&harness, "cargo build && cargo test");
     harness
         .assert(
-            !result.is_compilation,
-            "&& chained commands should be rejected",
+            result.is_compilation,
+            "&& chained commands with compilation suffix should be accepted",
         )
         .unwrap();
-    assert!(result.reason.contains("chained"));
+    assert!(result.reason.contains("compound"));
 
-    // ; chained
+    // && chained with non-compilation at end - should be rejected
+    let result = classify_and_log(&harness, "cargo build && echo done");
+    harness
+        .assert(
+            !result.is_compilation,
+            "&& chained commands with non-compilation suffix should be rejected",
+        )
+        .unwrap();
+
+    // ; chained - always rejected (not supported)
     let result = classify_and_log(&harness, "cargo build; cargo test");
     harness
         .assert(
@@ -556,7 +565,7 @@ fn test_hook_rejects_chained_commands() {
         .unwrap();
     assert!(result.reason.contains("chained"));
 
-    // || chained
+    // || chained - always rejected (not supported)
     let result = classify_and_log(&harness, "cargo build || echo failed");
     harness
         .assert(
@@ -568,7 +577,7 @@ fn test_hook_rejects_chained_commands() {
 
     harness
         .logger
-        .info("TEST PASS: test_hook_rejects_chained_commands");
+        .info("TEST PASS: test_hook_handles_chained_commands");
     harness.mark_passed();
 }
 

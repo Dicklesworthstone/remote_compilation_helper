@@ -365,6 +365,29 @@ to clean up. Use --force to immediately terminate with SIGKILL."#)]
         dry_run: bool,
     },
 
+    /// Execute a compilation command on a remote worker
+    ///
+    /// This command is typically invoked by the PreToolUse hook to perform
+    /// the actual remote compilation. The hook returns immediately with
+    /// `rch exec -- <command>` to avoid timeout issues.
+    #[command(after_help = r#"EXAMPLES:
+    rch exec -- cargo build --release
+    rch exec -- cargo test
+    rch exec -- bun test
+
+USAGE:
+    This command is primarily used internally by the PreToolUse hook.
+    The hook intercepts compilation commands and rewrites them as:
+        cargo build --release  →  rch exec -- cargo build --release
+
+    This allows the hook to return immediately (<50ms) while the actual
+    compilation runs as a normal command invocation."#)]
+    Exec {
+        /// The compilation command to execute remotely
+        #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
+        command: Vec<String>,
+    },
+
     /// Install and manage the Claude Code PreToolUse hook
     #[command(after_help = r#"EXAMPLES:
     rch hook install    # Register RCH as PreToolUse hook
@@ -1429,6 +1452,7 @@ async fn main() -> Result<()> {
             Commands::Diagnose { command, dry_run } => {
                 handle_diagnose(command, dry_run, &ctx).await
             }
+            Commands::Exec { command } => hook::run_exec(command).await,
             Commands::Hook { action } => handle_hook(action, &ctx).await,
             Commands::Agents { action } => handle_agents(action, &ctx).await,
             Commands::Completions { action } => handle_completions(action, &ctx),

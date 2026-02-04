@@ -257,6 +257,8 @@ mod tests {
                 None
             },
             reason: Cow::Borrowed("test"),
+            command_prefix: None,
+            extracted_command: None,
         }
     }
 

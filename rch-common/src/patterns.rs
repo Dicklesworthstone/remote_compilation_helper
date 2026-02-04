@@ -93,6 +93,14 @@ pub struct Classification {
     pub kind: Option<CompilationKind>,
     /// Reason for the classification decision.
     pub reason: Cow<'static, str>,
+    /// For compound commands (e.g., "cd /path && cargo build"), this contains
+    /// the prefix that should run before the compilation ("cd /path && ").
+    /// None for simple commands.
+    pub command_prefix: Option<String>,
+    /// For compound commands, this contains the extracted compilation command
+    /// (e.g., "cargo build --release"). None for simple commands where the
+    /// entire input is the compilation command.
+    pub extracted_command: Option<String>,
 }
 
 /// Decision outcome for a classification tier.
@@ -137,6 +145,8 @@ impl Classification {
             confidence: 0.0,
             kind: None,
             reason: reason.into(),
+            command_prefix: None,
+            extracted_command: None,
         }
     }
 
@@ -151,6 +161,28 @@ impl Classification {
             confidence,
             kind: Some(kind),
             reason: reason.into(),
+            command_prefix: None,
+            extracted_command: None,
+        }
+    }
+
+    /// Create a compilation classification for a compound command.
+    /// The prefix contains everything before the compilation command (including the final "&&" or ";").
+    /// The extracted_command is the actual compilation command to intercept.
+    pub fn compound_compilation(
+        kind: CompilationKind,
+        confidence: f64,
+        reason: impl Into<Cow<'static, str>>,
+        prefix: String,
+        extracted: String,
+    ) -> Self {
+        Self {
+            is_compilation: true,
+            confidence,
+            kind: Some(kind),
+            reason: reason.into(),
+            command_prefix: Some(prefix),
+            extracted_command: Some(extracted),
         }
     }
 }
@@ -268,12 +300,22 @@ const MAX_CLASSIFY_DEPTH: u8 = 1;
 #[allow(dead_code)] // Reserved for future multi-command classification
 const MAX_SPLIT_INPUT_LEN: usize = 10 * 1024;
 
-fn classify_command_inner(cmd: &str, _depth: u8) -> Classification {
+fn classify_command_inner(cmd: &str, depth: u8) -> Classification {
     let cmd = cmd.trim();
 
     // Tier 0: Instant reject - empty command
     if cmd.is_empty() {
         return Classification::not_compilation("empty command");
+    }
+
+    // Tier 0.5: Compound command handling (only at depth 0)
+    // For commands like "cd /path && cargo build", extract and classify the last segment.
+    // We only handle && chains (not || or ;) at depth 0 to avoid complex rewriting.
+    if depth == 0
+        && cmd.len() < MAX_SPLIT_INPUT_LEN
+        && let Some(result) = try_classify_compound_command(cmd)
+    {
+        return result;
     }
 
     // Tier 1: Structure analysis - reject complex shell structures
@@ -306,11 +348,145 @@ fn classify_command_inner(cmd: &str, _depth: u8) -> Classification {
     classify_full(normalized)
 }
 
+/// Try to classify a compound command (e.g., "cd /path && cargo build").
+///
+/// For && chains, we check if the LAST segment is a compilation command.
+/// If so, we return a compound_compilation with the prefix (everything before
+/// the compilation) and the extracted compilation command.
+///
+/// This allows commands like:
+/// - "cd /path && cargo build" → prefix="cd /path && ", extracted="cargo build"
+/// - "touch file && cargo test" → prefix="touch file && ", extracted="cargo test"
+///
+/// We only handle && chains, not || or ; for safety (those have different semantics).
+/// We also reject commands with pipes, redirects, or subshells in ANY segment.
+fn try_classify_compound_command(cmd: &str) -> Option<Classification> {
+    // Quick check: must contain && but not other problematic operators
+    if !cmd.contains("&&") {
+        return None;
+    }
+
+    // Reject if command contains pipes, redirects, or subshells (anywhere)
+    // These make command rewriting unsafe
+    if cmd.contains('|') && !cmd.contains("||") {
+        return None; // Pipe (but not ||)
+    }
+    if cmd.contains('>') || cmd.contains('<') {
+        return None; // Redirects
+    }
+    if cmd.contains('(') || cmd.contains('`') || cmd.contains("$(") {
+        return None; // Subshells
+    }
+    if cmd.contains("||") || cmd.contains(';') {
+        return None; // Only handle pure && chains for now
+    }
+
+    // Split on && (simple split, respects quotes via split_and_chain)
+    let segments = split_and_chain(cmd)?;
+    if segments.is_empty() {
+        return None;
+    }
+
+    // Get the last segment and classify it
+    let last_segment = segments.last()?.trim();
+    if last_segment.is_empty() {
+        return None;
+    }
+
+    // Classify the last segment at depth 1 (prevents infinite recursion)
+    let last_classification = classify_command_inner(last_segment, 1);
+
+    if !last_classification.is_compilation {
+        return None;
+    }
+
+    // Build the prefix (everything before the last segment, including the final "&&")
+    let prefix = if segments.len() == 1 {
+        // No prefix, just the command itself
+        return None;
+    } else {
+        // Find where the last segment starts in the original command
+        // and take everything before it
+        let last_pos = cmd.rfind(last_segment)?;
+        cmd[..last_pos].to_string()
+    };
+
+    // Return compound classification
+    Some(Classification::compound_compilation(
+        last_classification.kind?,
+        last_classification.confidence,
+        "compound command with compilation suffix",
+        prefix,
+        last_segment.to_string(),
+    ))
+}
+
+/// Split a command on && only (simpler than split_multi_command).
+/// Returns None if no && found.
+fn split_and_chain(cmd: &str) -> Option<Vec<&str>> {
+    if !cmd.contains("&&") {
+        return None;
+    }
+
+    let mut segments = Vec::new();
+    let mut current_start = 0;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    let bytes = cmd.as_bytes();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+
+        if escaped {
+            escaped = false;
+            i += 1;
+            continue;
+        }
+
+        if b == b'\\' {
+            escaped = true;
+            i += 1;
+            continue;
+        }
+
+        if b == b'\'' && !in_double {
+            in_single = !in_single;
+        } else if b == b'"' && !in_single {
+            in_double = !in_double;
+        } else if !in_single && !in_double && b == b'&' && i + 1 < bytes.len() && bytes[i + 1] == b'&' {
+            let segment = &cmd[current_start..i];
+            let trimmed = segment.trim();
+            if !trimmed.is_empty() {
+                segments.push(trimmed);
+            }
+            current_start = i + 2;
+            i += 1; // Skip second '&'
+        }
+
+        i += 1;
+    }
+
+    // Add final segment
+    let final_segment = &cmd[current_start..];
+    let trimmed = final_segment.trim();
+    if !trimmed.is_empty() {
+        segments.push(trimmed);
+    }
+
+    if segments.len() > 1 {
+        Some(segments)
+    } else {
+        None
+    }
+}
+
 /// Split a multi-command string on `&&`, `||`, and `;` while respecting quotes.
 ///
 /// Returns `None` if no multi-command operators are found.
 /// Returns `Some(segments)` where each segment is a trimmed sub-command.
-#[allow(dead_code)] // Reserved for future multi-command classification
+#[allow(dead_code)] // May be used for future enhancements
 fn split_multi_command(cmd: &str) -> Option<Vec<&str>> {
     // Quick check: if no operators, return None early
     if !cmd.contains("&&") && !cmd.contains("||") && !cmd.contains(';') {
@@ -2973,68 +3149,76 @@ mod tests {
             assert_eq!(split_shell_commands("&& cargo build"), vec!["cargo build"]);
         }
 
-        // --- Classification integration: should classify as COMPILATION ---
+        // --- Compound command classification tests ---
+        // Compound && commands with compilation suffix are now ACCEPTED
+        // This enables patterns like "cd /path && cargo build"
 
         #[test]
         fn test_classify_cargo_fmt_and_build() {
             let _guard = test_guard!();
+            // Last segment is "cargo build" (compilation) → accepted
             let result = classify_command("cargo fmt && cargo build");
             assert!(
-                !result.is_compilation,
-                "chained commands should be rejected for security"
+                result.is_compilation,
+                "compound command with compilation suffix should be accepted"
             );
-            assert!(result.reason.contains("chained"));
+            assert!(result.reason.contains("compound"));
         }
 
         #[test]
         fn test_classify_cd_and_make() {
             let _guard = test_guard!();
+            // Last segment is "make -j8" (compilation) → accepted
             let result = classify_command("cd /project && make -j8");
             assert!(
-                !result.is_compilation,
-                "chained commands should be rejected"
+                result.is_compilation,
+                "compound command with compilation suffix should be accepted"
             );
-            assert!(result.reason.contains("chained"));
+            assert!(result.reason.contains("compound"));
         }
         #[test]
         fn test_classify_export_and_cargo_build() {
             let _guard = test_guard!();
+            // Last segment is "cargo build --release" (compilation) → accepted
             let result =
                 classify_command("export RUSTFLAGS='-C opt-level=3' && cargo build --release");
             assert!(
-                !result.is_compilation,
-                "chained commands should be rejected"
+                result.is_compilation,
+                "compound command with compilation suffix should be accepted"
             );
-            assert!(result.reason.contains("chained"));
+            assert!(result.reason.contains("compound"));
         }
         #[test]
         fn test_classify_mkdir_cmake_chain() {
             let _guard = test_guard!();
+            // Last segment is "cmake --build build" (compilation) → accepted
             let result =
                 classify_command("mkdir -p build && cmake -B build && cmake --build build");
             assert!(
-                !result.is_compilation,
-                "chained commands should be rejected"
+                result.is_compilation,
+                "compound command with compilation suffix should be accepted"
             );
-            assert!(result.reason.contains("chained"));
+            assert!(result.reason.contains("compound"));
         }
         #[test]
         fn test_classify_echo_and_cargo_test() {
             let _guard = test_guard!();
+            // Last segment is "cargo test" (compilation) → accepted
             let result = classify_command("echo 'Starting...' && cargo test");
             assert!(
-                !result.is_compilation,
-                "chained commands should be rejected"
+                result.is_compilation,
+                "compound command with compilation suffix should be accepted"
             );
-            assert!(result.reason.contains("chained"));
+            assert!(result.reason.contains("compound"));
         }
         #[test]
         fn test_classify_semicolon_chain_with_compilation() {
             let _guard = test_guard!();
+            // Semicolon chains are NOT supported (only && is supported)
             let result = classify_command("cargo fmt; cargo build; cargo test");
             assert!(
                 !result.is_compilation,
-                "chained commands should be rejected"
+                "semicolon chained commands should be rejected"
             );
             assert!(result.reason.contains("chained"));
         }

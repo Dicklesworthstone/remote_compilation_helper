@@ -297,21 +297,22 @@ fn test_ws4_multi_command_classification_correctness() {
     // Multi-command with compilation: should detect compilation
     let test_cases: &[(&str, bool)] = &[
         // Pure compilation
-        // Chained commands should be rejected (security policy)
-        ("cargo build && cargo test", false),
-        ("cargo build || echo failed", false),
-        ("cargo build; cargo test", false),
-        ("echo starting && cargo build", false),
-        ("cargo test && echo done", false),
-        ("ls && cargo build && pwd", false),
-        // Pure non-compilation (also rejected if chained)
+        // Compound && commands with compilation LAST segment are accepted
+        // This enables patterns like "cd /path && cargo build"
+        ("cargo build && cargo test", true),  // last=cargo test (compilation)
+        ("cargo build || echo failed", false),  // || not supported
+        ("cargo build; cargo test", false),  // ; not supported
+        ("echo starting && cargo build", true),  // last=cargo build (compilation)
+        ("cargo test && echo done", false),  // last=echo done (not compilation)
+        ("ls && cargo build && pwd", false),  // last=pwd (not compilation)
+        // Pure non-compilation chains
         ("ls && pwd", false),
-        ("echo hello; echo world", false),
+        ("echo hello; echo world", false),  // ; not supported anyway
         ("git status && git diff", false),
-        ("cd /tmp || echo failed", false),
+        ("cd /tmp || echo failed", false),  // || not supported
         // Edge cases
-        ("cargo build --release && cargo test -p my_crate", false),
-        ("make -j8 && echo done", false),
+        ("cargo build --release && cargo test -p my_crate", true),  // last is cargo test
+        ("make -j8 && echo done", false),  // last=echo done (not compilation)
     ];
 
     let mut passed = 0;
