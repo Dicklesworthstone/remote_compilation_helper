@@ -163,6 +163,13 @@ confirm() {
     fi
 }
 
+# Return a width estimate for a line that won't undercount emoji/wide chars.
+# We intentionally count bytes (C locale) to avoid too-narrow boxes.
+line_width() {
+    local line="$1"
+    LC_ALL=C printf '%s' "$line" | wc -c | tr -d ' '
+}
+
 # Draw a Unicode box with auto-calculated width (DCG-style)
 # Usage: draw_box "color_code" "line1" "line2" ...
 draw_box() {
@@ -173,7 +180,8 @@ draw_box() {
 
     # Calculate maximum line length
     for line in "${lines[@]}"; do
-        local len=${#line}
+        local len
+        len=$(line_width "$line")
         [[ $len -gt $max_len ]] && max_len=$len
     done
 
@@ -199,7 +207,7 @@ draw_box() {
     if $USE_COLOR; then
         echo -e "\033[${color}m${top_border}\033[0m"
         for line in "${lines[@]}"; do
-            local padding=$((inner_width - ${#line} - 2))
+            local padding=$((inner_width - $(line_width "$line") - 2))
             local pad_str=""
             for ((i=0; i<padding; i++)); do pad_str+=" "; done
             echo -e "\033[${color}m${v}\033[0m ${line}${pad_str} \033[${color}m${v}\033[0m"
@@ -208,7 +216,7 @@ draw_box() {
     else
         echo "${top_border}"
         for line in "${lines[@]}"; do
-            local padding=$((inner_width - ${#line} - 2))
+            local padding=$((inner_width - $(line_width "$line") - 2))
             local pad_str=""
             for ((i=0; i<padding; i++)); do pad_str+=" "; done
             echo "${v} ${line}${pad_str} ${v}"
@@ -227,7 +235,8 @@ draw_double_box() {
     local max_len=0
 
     for line in "${lines[@]}"; do
-        local len=${#line}
+        local len
+        len=$(line_width "$line")
         [[ $len -gt $max_len ]] && max_len=$len
     done
 
@@ -247,7 +256,7 @@ draw_double_box() {
     if $USE_COLOR; then
         echo -e "\033[${color}m${top_border}\033[0m"
         for line in "${lines[@]}"; do
-            local padding=$((inner_width - ${#line} - 2))
+            local padding=$((inner_width - $(line_width "$line") - 2))
             local pad_str=""
             for ((i=0; i<padding; i++)); do pad_str+=" "; done
             echo -e "\033[${color}m${v}\033[0m ${line}${pad_str} \033[${color}m${v}\033[0m"
@@ -256,7 +265,7 @@ draw_double_box() {
     else
         echo "${top_border}"
         for line in "${lines[@]}"; do
-            local padding=$((inner_width - ${#line} - 2))
+            local padding=$((inner_width - $(line_width "$line") - 2))
             local pad_str=""
             for ((i=0; i<padding; i++)); do pad_str+=" "; done
             echo "${v} ${line}${pad_str} ${v}"
