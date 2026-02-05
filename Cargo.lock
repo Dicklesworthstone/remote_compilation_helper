@@ -3036,7 +3036,7 @@ dependencies = [
 
 [[package]]
 name = "rch"
-version = "1.0.6"
+version = "1.0.7"
 dependencies = [
  "anyhow",
  "blake3",
@@ -3088,7 +3088,7 @@ dependencies = [
 
 [[package]]
 name = "rch-common"
-version = "1.0.6"
+version = "1.0.7"
 dependencies = [
  "anyhow",
  "blake3",
@@ -3123,7 +3123,7 @@ dependencies = [
 
 [[package]]
 name = "rch-telemetry"
-version = "1.0.6"
+version = "1.0.7"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3144,7 +3144,7 @@ dependencies = [
 
 [[package]]
 name = "rch-wkr"
-version = "1.0.6"
+version = "1.0.7"
 dependencies = [
  "anyhow",
  "blake3",
@@ -3162,7 +3162,7 @@ dependencies = [
 
 [[package]]
 name = "rchd"
-version = "1.0.6"
+version = "1.0.7"
 dependencies = [
  "anyhow",
  "axum",

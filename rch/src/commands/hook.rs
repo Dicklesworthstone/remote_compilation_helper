@@ -6,6 +6,7 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
 use rch_common::{ApiError, ApiResponse, ErrorCode};
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -86,9 +87,12 @@ fn create_hook_command_with_dcg_support(rch_path: &str, ctx: &OutputContext) -> 
     std::fs::write(&wrapper_path, wrapper_content)?;
 
     // Make executable (chmod +x)
-    let mut perms = std::fs::metadata(&wrapper_path)?.permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&wrapper_path, perms)?;
+    #[cfg(unix)]
+    {
+        let mut perms = std::fs::metadata(&wrapper_path)?.permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&wrapper_path, perms)?;
+    }
 
     if !ctx.is_json() {
         println!(
