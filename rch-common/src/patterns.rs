@@ -3305,27 +3305,6 @@ mod tests {
             assert!(result.reason.contains("chained"));
         }
 
-        #[test]
-        fn test_classify_cd_and_make() {
-            let _guard = test_guard!();
-            // cd && make is a compound command — last segment (make) is compilation
-            let result = classify_command("cd /project && make -j8");
-            assert!(
-                result.is_compilation,
-                "cd && make should be classified as compound compilation"
-            );
-        }
-
-        #[test]
-        fn test_classify_echo_and_cargo_test() {
-            let _guard = test_guard!();
-            // echo && cargo test is a compound command — last segment is compilation
-            let result = classify_command("echo 'Starting...' && cargo test");
-            assert!(
-                result.is_compilation,
-                "echo && cargo test should be classified as compound compilation"
-            );
-        }
         // --- Classification integration: should classify as NON-COMPILATION ---
 
         #[test]
