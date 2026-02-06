@@ -371,8 +371,8 @@ fn try_classify_compound_command(cmd: &str) -> Option<Classification> {
     if cmd.contains('|') && !cmd.contains("||") {
         return None; // Pipe (but not ||)
     }
-    if cmd.contains('>') || cmd.contains('<') {
-        return None; // Redirects
+    if has_file_redirect(cmd) {
+        return None; // File redirects (but NOT fd-to-fd like 2>&1)
     }
     if cmd.contains('(') || cmd.contains('`') || cmd.contains("$(") {
         return None; // Subshells
@@ -847,7 +847,76 @@ pub fn normalize_command(cmd: &str) -> Cow<'_, str> {
     }
 }
 
-/// Check command structure for patterns that shouldn't be intercepted.
+/// Check if a command contains file redirects (NOT fd-to-fd redirects like `2>&1`).
+///
+/// Returns true for file redirects: `> file`, `>> file`, `2> file`, `&> file`
+/// Returns false for fd-to-fd redirects: `2>&1`, `>&2`, `1>&2`
+/// Also returns true for input redirects: `< file`
+///
+/// This is used by `try_classify_compound_command` which needs a quick text-level
+/// check before doing more expensive parsing.
+fn has_file_redirect(cmd: &str) -> bool {
+    let bytes = cmd.as_bytes();
+    let len = bytes.len();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    let mut i = 0;
+
+    while i < len {
+        let b = bytes[i];
+
+        if escaped {
+            escaped = false;
+            i += 1;
+            continue;
+        }
+        if b == b'\\' {
+            escaped = true;
+            i += 1;
+            continue;
+        }
+        match b {
+            b'\'' if !in_double => {
+                in_single = !in_single;
+            }
+            b'"' if !in_single => {
+                in_double = !in_double;
+            }
+            b'>' if !in_single && !in_double => {
+                // Check if this is a fd-to-fd redirect (N>&M or >&N)
+                if i + 1 < len && bytes[i + 1] == b'&' {
+                    // >&N or N>&M — fd-to-fd, skip
+                    i += 2; // skip > and &
+                    // skip optional digit
+                    if i < len && bytes[i].is_ascii_digit() {
+                        i += 1;
+                    }
+                    continue;
+                }
+                // >( is process substitution, not a file redirect per se,
+                // but it's caught by the subshell check separately
+                if i + 1 < len && bytes[i + 1] == b'(' {
+                    i += 1;
+                    continue;
+                }
+                return true; // File redirect: > file, >> file, N> file
+            }
+            b'<' if !in_single && !in_double => {
+                // <( is process substitution, caught separately
+                if i + 1 < len && bytes[i + 1] == b'(' {
+                    i += 1;
+                    continue;
+                }
+                return true; // Input redirect: < file
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
 /// Check command structure for patterns that shouldn't be intercepted.
 ///
 /// Performance: single-pass O(n) state machine instead of 11+ separate scans.
@@ -952,9 +1021,22 @@ fn check_structure(cmd: &str) -> Option<&'static str> {
             b'(' => found_subshell = true,
 
             // Output redirection (>( is process substitution, caught by ( check)
+            // fd-to-fd redirects like 2>&1, >&2 are safe to intercept
             b'>' => {
                 if i + 1 < len && bytes[i + 1] == b'(' {
                     found_subshell = true;
+                } else if i + 1 < len && bytes[i + 1] == b'&' {
+                    // Pattern: N>&M or >&N (fd-to-fd redirect) — safe, skip
+                    // e.g. 2>&1, 1>&2, >&2
+                    // Skip the '&' and any following digit
+                    i += 1; // skip '&'
+                    if i + 1 < len && bytes[i + 1].is_ascii_digit() {
+                        i += 1; // skip digit after &
+                    }
+                } else if i + 1 < len && bytes[i + 1] == b'>' {
+                    // Append redirect >> (to file) — NOT safe
+                    found_output_redirect = true;
+                    i += 1; // skip second >
                 } else {
                     found_output_redirect = true;
                 }
@@ -3221,6 +3303,28 @@ mod tests {
                 "semicolon chained commands should be rejected"
             );
             assert!(result.reason.contains("chained"));
+        }
+
+        #[test]
+        fn test_classify_cd_and_make() {
+            let _guard = test_guard!();
+            // cd && make is a compound command — last segment (make) is compilation
+            let result = classify_command("cd /project && make -j8");
+            assert!(
+                result.is_compilation,
+                "cd && make should be classified as compound compilation"
+            );
+        }
+
+        #[test]
+        fn test_classify_echo_and_cargo_test() {
+            let _guard = test_guard!();
+            // echo && cargo test is a compound command — last segment is compilation
+            let result = classify_command("echo 'Starting...' && cargo test");
+            assert!(
+                result.is_compilation,
+                "echo && cargo test should be classified as compound compilation"
+            );
         }
         // --- Classification integration: should classify as NON-COMPILATION ---
 
