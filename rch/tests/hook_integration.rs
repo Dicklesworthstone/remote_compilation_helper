@@ -31,6 +31,10 @@ const MAX_HOOK_TIME_MS: u64 = 25;
 /// Get the path to the rch binary.
 fn rch_binary() -> String {
     std::env::var("RCH_BINARY").unwrap_or_else(|_| {
+        // Respect CARGO_TARGET_DIR if set (avoids finding stale cross-compiled binaries)
+        if let Ok(target_dir) = std::env::var("CARGO_TARGET_DIR") {
+            return format!("{target_dir}/release/rch");
+        }
         let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
         format!(
             "{}/target/release/rch",
