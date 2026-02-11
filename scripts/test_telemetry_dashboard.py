@@ -15,13 +15,12 @@ This tool parses JSONL log files from test runs and provides:
 
 import argparse
 import json
-import os
 import sys
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional
 
 
 @dataclass
@@ -146,7 +145,7 @@ def parse_aggregated_log(entry: dict, summary: TelemetrySummary) -> None:
         summary.tests[test_name].log_count += 1
 
     # Track errors/warnings for any test context
-    thread_id = entry.get('threadId', '')
+    entry.get('threadId', '')
     if level == 'ERROR':
         # Try to attribute to a test if we can
         for test in summary.tests.values():

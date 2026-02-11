@@ -26,14 +26,12 @@ Exit codes:
 """
 import argparse
 import json
-import os
 import sys
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from statistics import mean, median, stdev
-from typing import Any
 
 
 # Configuration
