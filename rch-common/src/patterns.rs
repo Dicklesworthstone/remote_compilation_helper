@@ -455,7 +455,12 @@ fn split_and_chain(cmd: &str) -> Option<Vec<&str>> {
             in_single = !in_single;
         } else if b == b'"' && !in_single {
             in_double = !in_double;
-        } else if !in_single && !in_double && b == b'&' && i + 1 < bytes.len() && bytes[i + 1] == b'&' {
+        } else if !in_single
+            && !in_double
+            && b == b'&'
+            && i + 1 < bytes.len()
+            && bytes[i + 1] == b'&'
+        {
             let segment = &cmd[current_start..i];
             let trimmed = segment.trim();
             if !trimmed.is_empty() {

@@ -49,7 +49,10 @@ echo "$input" | dcg 2>/dev/null
 
 /// Check if DCG is installed and create wrapper script if needed.
 /// Returns (hook_command, wrapper_created) where hook_command is the command to use in settings.json.
-fn create_hook_command_with_dcg_support(rch_path: &str, ctx: &OutputContext) -> Result<(String, bool)> {
+fn create_hook_command_with_dcg_support(
+    rch_path: &str,
+    ctx: &OutputContext,
+) -> Result<(String, bool)> {
     let style = ctx.theme();
 
     // Check if DCG is available

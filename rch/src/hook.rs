@@ -204,11 +204,9 @@ pub async fn run_exec(command_parts: Vec<String>) -> anyhow::Result<()> {
         Err(e) => {
             warn!("Failed to query daemon: {}, running locally", e);
             // Try auto-start daemon
-            if let Ok(()) = try_auto_start_daemon(
-                &config.self_healing,
-                Path::new(&config.general.socket_path),
-            )
-            .await
+            if let Ok(()) =
+                try_auto_start_daemon(&config.self_healing, Path::new(&config.general.socket_path))
+                    .await
             {
                 // Retry query
                 match query_daemon(
@@ -1598,9 +1596,10 @@ async fn process_hook(input: HookInput) -> HookOutput {
     );
     reporter.verbose("[RCH] delegating to rch exec...");
 
-    let modified_command = if let (Some(prefix), Some(extracted)) =
-        (&classification.command_prefix, &classification.extracted_command)
-    {
+    let modified_command = if let (Some(prefix), Some(extracted)) = (
+        &classification.command_prefix,
+        &classification.extracted_command,
+    ) {
         // Compound command: preserve prefix, wrap only the compilation part
         format!("{}rch exec -- {}", prefix, extracted)
     } else {

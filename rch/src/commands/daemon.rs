@@ -8,6 +8,7 @@ use crate::ui::context::OutputContext;
 use crate::ui::theme::StatusIndicator;
 use anyhow::Result;
 use rch_common::{ApiError, ApiResponse, ErrorCode};
+use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::process::Command;
@@ -17,6 +18,26 @@ use super::types::{
     DaemonActionResponse, DaemonLogsResponse, DaemonReloadResponse, DaemonStatusResponse,
 };
 use super::{config_dir, send_daemon_command};
+
+#[derive(Debug, Deserialize)]
+struct ReloadApiResponse {
+    #[serde(default = "reload_success_default")]
+    success: bool,
+    #[serde(default)]
+    added: usize,
+    #[serde(default)]
+    updated: usize,
+    #[serde(default)]
+    removed: usize,
+    #[serde(default)]
+    warnings: Vec<String>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+fn reload_success_default() -> bool {
+    true
+}
 
 // =============================================================================
 // Helper Functions
@@ -500,107 +521,87 @@ pub async fn daemon_reload(ctx: &OutputContext) -> Result<()> {
     // Send reload command to daemon
     match send_daemon_command("POST /reload\n").await {
         Ok(response) => {
-            // Parse response JSON
-            if let Some(json) = response.strip_prefix("HTTP/1.1 200 OK\n\n") {
-                match serde_json::from_str::<serde_json::Value>(json) {
-                    Ok(value) => {
-                        let added = value["added"].as_u64().unwrap_or(0) as usize;
-                        let updated = value["updated"].as_u64().unwrap_or(0) as usize;
-                        let removed = value["removed"].as_u64().unwrap_or(0) as usize;
-                        let warnings: Vec<String> = value["warnings"]
-                            .as_array()
-                            .map(|arr| {
-                                arr.iter()
-                                    .filter_map(|v| v.as_str().map(String::from))
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-
-                        let has_changes = added > 0 || updated > 0 || removed > 0;
-
-                        if ctx.is_json() {
-                            let _ = ctx.json(&ApiResponse::ok(
-                                "daemon reload",
-                                DaemonReloadResponse {
-                                    success: true,
-                                    added,
-                                    updated,
-                                    removed,
-                                    warnings: warnings.clone(),
-                                    message: if has_changes {
-                                        Some(format!(
-                                            "Configuration reloaded: {} added, {} updated, {} removed",
-                                            added, updated, removed
-                                        ))
-                                    } else {
-                                        Some("No configuration changes detected".to_string())
-                                    },
-                                },
-                            ));
-                        } else {
-                            if has_changes {
-                                println!(
-                                    "{} Configuration reloaded",
-                                    StatusIndicator::Success.display(style)
-                                );
-                                println!(
-                                    "  {} workers added, {} updated, {} removed",
-                                    added, updated, removed
-                                );
-                            } else {
-                                println!(
-                                    "{} No configuration changes detected",
-                                    StatusIndicator::Info.display(style)
-                                );
-                            }
-
-                            for warning in &warnings {
-                                println!("{} {}", StatusIndicator::Warning.display(style), warning);
-                            }
-                        }
-                    }
-                    Err(e) => {
+            let json = extract_json_body(&response)
+                .unwrap_or(response.as_str())
+                .trim();
+            match serde_json::from_str::<ReloadApiResponse>(json) {
+                Ok(reload) => {
+                    if !reload.success {
+                        let error_msg = reload
+                            .error
+                            .unwrap_or_else(|| "unknown reload error".to_string());
                         if ctx.is_json() {
                             let _ = ctx.json(&ApiResponse::<()>::err(
                                 "daemon reload",
-                                ApiError::internal(format!(
-                                    "Failed to parse reload response: {}",
-                                    e
-                                )),
+                                ApiError::internal(format!("Reload failed: {}", error_msg)),
                             ));
                         } else {
                             println!(
-                                "{} Failed to parse reload response: {}",
+                                "{} Reload failed: {}",
                                 StatusIndicator::Error.display(style),
-                                e
+                                error_msg
                             );
+                        }
+                        return Ok(());
+                    }
+
+                    let has_changes = reload.added > 0 || reload.updated > 0 || reload.removed > 0;
+
+                    if ctx.is_json() {
+                        let _ = ctx.json(&ApiResponse::ok(
+                            "daemon reload",
+                            DaemonReloadResponse {
+                                success: true,
+                                added: reload.added,
+                                updated: reload.updated,
+                                removed: reload.removed,
+                                warnings: reload.warnings.clone(),
+                                message: if has_changes {
+                                    Some(format!(
+                                        "Configuration reloaded: {} added, {} updated, {} removed",
+                                        reload.added, reload.updated, reload.removed
+                                    ))
+                                } else {
+                                    Some("No configuration changes detected".to_string())
+                                },
+                            },
+                        ));
+                    } else {
+                        if has_changes {
+                            println!(
+                                "{} Configuration reloaded",
+                                StatusIndicator::Success.display(style)
+                            );
+                            println!(
+                                "  {} workers added, {} updated, {} removed",
+                                reload.added, reload.updated, reload.removed
+                            );
+                        } else {
+                            println!(
+                                "{} No configuration changes detected",
+                                StatusIndicator::Info.display(style)
+                            );
+                        }
+
+                        for warning in &reload.warnings {
+                            println!("{} {}", StatusIndicator::Warning.display(style), warning);
                         }
                     }
                 }
-            } else if response.contains("HTTP/1.1 500") {
-                let error_msg = response.lines().skip(2).collect::<Vec<_>>().join("\n");
-                if ctx.is_json() {
-                    let _ = ctx.json(&ApiResponse::<()>::err(
-                        "daemon reload",
-                        ApiError::internal(format!("Reload failed: {}", error_msg)),
-                    ));
-                } else {
-                    println!(
-                        "{} Reload failed: {}",
-                        StatusIndicator::Error.display(style),
-                        error_msg
-                    );
+                Err(e) => {
+                    if ctx.is_json() {
+                        let _ = ctx.json(&ApiResponse::<()>::err(
+                            "daemon reload",
+                            ApiError::internal(format!("Failed to parse reload response: {}", e)),
+                        ));
+                    } else {
+                        println!(
+                            "{} Failed to parse reload response: {}",
+                            StatusIndicator::Error.display(style),
+                            e
+                        );
+                    }
                 }
-            } else if ctx.is_json() {
-                let _ = ctx.json(&ApiResponse::<()>::err(
-                    "daemon reload",
-                    ApiError::internal("Unexpected response from daemon"),
-                ));
-            } else {
-                println!(
-                    "{} Unexpected response from daemon",
-                    StatusIndicator::Error.display(style)
-                );
             }
         }
         Err(e) => {
@@ -620,6 +621,48 @@ pub async fn daemon_reload(ctx: &OutputContext) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rch_common::test_guard;
+
+    #[test]
+    fn reload_api_response_parses_http_10_with_headers() {
+        let _guard = test_guard!();
+        let response = "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n{\"success\":true,\"added\":1,\"updated\":2,\"removed\":3,\"warnings\":[\"warn\"]}\n";
+        let json = extract_json_body(response).unwrap().trim();
+        let parsed: ReloadApiResponse = serde_json::from_str(json).unwrap();
+        assert!(parsed.success);
+        assert_eq!(parsed.added, 1);
+        assert_eq!(parsed.updated, 2);
+        assert_eq!(parsed.removed, 3);
+        assert_eq!(parsed.warnings, vec!["warn".to_string()]);
+    }
+
+    #[test]
+    fn reload_api_response_uses_default_success_for_legacy_payloads() {
+        let _guard = test_guard!();
+        let response = "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n{\"added\":0,\"updated\":0,\"removed\":0,\"warnings\":[]}\n";
+        let json = extract_json_body(response).unwrap().trim();
+        let parsed: ReloadApiResponse = serde_json::from_str(json).unwrap();
+        assert!(parsed.success);
+        assert_eq!(parsed.added, 0);
+        assert_eq!(parsed.updated, 0);
+        assert_eq!(parsed.removed, 0);
+        assert!(parsed.warnings.is_empty());
+    }
+
+    #[test]
+    fn reload_api_response_parses_failure_payload() {
+        let _guard = test_guard!();
+        let response = "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n{\"success\":false,\"error\":\"bad config\"}\n";
+        let json = extract_json_body(response).unwrap().trim();
+        let parsed: ReloadApiResponse = serde_json::from_str(json).unwrap();
+        assert!(!parsed.success);
+        assert_eq!(parsed.error.as_deref(), Some("bad config"));
+    }
 }
 
 /// Show daemon logs.

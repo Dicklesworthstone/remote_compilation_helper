@@ -308,7 +308,10 @@ mod tests {
             shell_escape_path_with_home("~/.local/bin"),
             Some("\"$HOME/.local/bin\"".to_string())
         );
-        assert_eq!(shell_escape_path_with_home("~"), Some("\"$HOME\"".to_string()));
+        assert_eq!(
+            shell_escape_path_with_home("~"),
+            Some("\"$HOME\"".to_string())
+        );
         assert_eq!(
             shell_escape_path_with_home("/usr/local/bin"),
             Some("'/usr/local/bin'".to_string())
