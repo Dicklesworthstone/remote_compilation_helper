@@ -119,7 +119,7 @@ ratatui = "0.30.0"
 crossterm = "0.29"
 
 # Rich terminal output (optional, for enhanced UI)
-rich_rust = { version = "0.1.1", features = ["full"] }
+rich_rust = { version = "0.2.0", features = ["full"] }
 
 # Test utilities
 ctor = "0.2"
