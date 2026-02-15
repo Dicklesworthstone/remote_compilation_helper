@@ -1132,7 +1132,11 @@ impl TransferPipeline {
     }
 
     fn rsync_control_dir(&self) -> PathBuf {
-        if let Some(runtime_dir) = dirs::runtime_dir() {
+        // Prefer ~/.ssh/rch to avoid exceeding the Unix socket path limit
+        // (104 bytes on macOS). See rch-common/src/ssh.rs for rationale.
+        if let Some(home) = dirs::home_dir() {
+            home.join(".ssh").join("rch")
+        } else if let Some(runtime_dir) = dirs::runtime_dir() {
             runtime_dir.join("rch-ssh")
         } else {
             // Include username in fallback path to prevent cross-user conflicts

@@ -199,11 +199,26 @@ impl SshClient {
 
         // Enable control master for connection reuse
         if self.options.control_master {
-            let control_dir = if let Some(runtime_dir) = dirs::runtime_dir() {
-                runtime_dir.join("rch-ssh")
-            } else {
-                let username = whoami::username().unwrap_or_else(|_| "unknown".to_string());
-                std::env::temp_dir().join(format!("rch-ssh-{}", username))
+            // Use a short control directory path to stay within the Unix domain
+            // socket path limit (104 bytes on macOS, 108 on Linux).  The openssh
+            // crate appends a `%C` hash (~32 chars) to form the socket filename,
+            // so the directory path itself must be short.
+            //
+            // On macOS `std::env::temp_dir()` returns a long path under
+            // /var/folders/…/T/ which, combined with the hash, exceeds 104 bytes.
+            // We therefore prefer `~/.ssh/rch` (short, stable, correct perms).
+            let control_dir = {
+                let home_ssh = dirs::home_dir()
+                    .map(|h| h.join(".ssh").join("rch"));
+
+                if let Some(ref dir) = home_ssh {
+                    dir.clone()
+                } else if let Some(runtime_dir) = dirs::runtime_dir() {
+                    runtime_dir.join("rch-ssh")
+                } else {
+                    let username = whoami::username().unwrap_or_else(|_| "unknown".to_string());
+                    std::env::temp_dir().join(format!("rch-ssh-{}", username))
+                }
             };
 
             if let Err(e) = std::fs::create_dir_all(&control_dir) {
