@@ -1084,6 +1084,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "fancy-regex"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e24cb5a94bcae1e5408b0effca5cd7172ea3c5755049c5f3af4cd283a165298"
+dependencies = [
+ "bit-set 0.8.0",
+ "regex-automata",
+ "regex-syntax",
+]
+
+[[package]]
 name = "fastrand"
 version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2404,6 +2415,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "os_pipe"
+version = "1.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d8fae84b431384b68627d0f9b3b1245fcf9f46f6c0e3dc902e9dce64edd1967"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "owo-colors"
 version = "4.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3329,19 +3350,25 @@ dependencies = [
 
 [[package]]
 name = "rich_rust"
-version = "0.1.1"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8a7c2ecb6193f75fc8143648beb454f8b1d3a4fbd2fe13813a504760867d91b1"
+checksum = "77a3675ba77f298090ec08e0b16484a9691f763f8d40c3bd6aa578ed8ac1019c"
 dependencies = [
+ "backtrace",
  "bitflags 2.10.0",
  "crossterm",
+ "fancy-regex 0.14.0",
  "log",
  "lru",
  "num-rational",
  "once_cell",
+ "os_pipe",
  "pulldown-cmark",
  "regex",
+ "serde",
  "serde_json",
+ "smallvec",
+ "stdio-override",
  "syntect",
  "time",
  "unicode-width 0.2.2",
@@ -3881,6 +3908,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
+name = "stdio-override"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cffa8a2e517b4e9f270c47e1c4120df90506d9451c1efa67e3698d66446d30ce"
+dependencies = [
+ "libc",
+ "winapi",
+]
+
+[[package]]
 name = "strsim"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4071,7 +4108,7 @@ dependencies = [
  "anyhow",
  "base64",
  "bitflags 2.10.0",
- "fancy-regex",
+ "fancy-regex 0.11.0",
  "filedescriptor",
  "finl_unicode",
  "fixedbitset",

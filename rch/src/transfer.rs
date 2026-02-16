@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::time::Instant as TokioInstant;
 use tokio::time::sleep;
@@ -934,19 +934,9 @@ impl TransferPipeline {
 
         #[cfg(unix)]
         {
-            let mut client = SshClient::new(worker.clone(), self.ssh_options.clone());
-            client.connect().await?;
-
-            // Always disconnect after execution, even on error (e.g., timeout).
-            // Without this, a timed-out command would leak the SSH session and
-            // the remote process would continue running indefinitely.
-            let result = client.execute(&wrapped_command).await;
-
-            if let Err(e) = client.disconnect().await {
-                warn!("Failed to disconnect SSH client after execution: {}", e);
-            }
-
-            let result = result?;
+            let result = self
+                .execute_over_ssh_streaming(worker, &wrapped_command, |_| {}, |_| {})
+                .await?;
 
             if result.success() {
                 info!("Command succeeded in {}ms", result.duration_ms);
@@ -959,6 +949,158 @@ impl TransferPipeline {
 
             Ok(result)
         }
+    }
+
+    #[cfg(unix)]
+    async fn execute_over_ssh_streaming<F, G>(
+        &self,
+        worker: &WorkerConfig,
+        remote_script: &str,
+        mut on_stdout: F,
+        mut on_stderr: G,
+    ) -> Result<CommandResult>
+    where
+        F: FnMut(&str),
+        G: FnMut(&str),
+    {
+        let destination = format!("{}@{}", worker.user, worker.host);
+        let identity_file = shellexpand::tilde(&worker.identity_file);
+
+        let mut cmd = Command::new("ssh");
+        cmd.arg("-o").arg("BatchMode=yes");
+        cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
+        cmd.arg("-o").arg(format!(
+            "ConnectTimeout={}",
+            self.ssh_options.connect_timeout.as_secs().max(1)
+        ));
+        cmd.arg("-i").arg(identity_file.as_ref());
+
+        if let Some(interval) = self.ssh_options.server_alive_interval {
+            let secs = interval.as_secs();
+            if secs > 0 {
+                cmd.arg("-o").arg(format!("ServerAliveInterval={secs}"));
+            }
+        }
+
+        // IMPORTANT: pass the script via stdin (`sh -s`) to avoid quoting issues with
+        // newlines/comments in `remote_script`. This preserves the prior mux behavior
+        // where the script is an argv payload, not re-parsed by the user's login shell.
+        cmd.arg(&destination).arg("sh").arg("-s");
+
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let start = std::time::Instant::now();
+        let mut child = cmd
+            .spawn()
+            .with_context(|| format!("Failed to spawn ssh to {}", destination))?;
+
+        if let Some(mut stdin) = child.stdin.take() {
+            // Feed the script, then close stdin so `sh -s` begins execution.
+            stdin
+                .write_all(remote_script.as_bytes())
+                .await
+                .context("Failed to write remote script to ssh stdin")?;
+            stdin
+                .write_all(b"\n")
+                .await
+                .context("Failed to finalize remote script")?;
+            drop(stdin);
+        }
+
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+
+        enum StreamEvent {
+            Stdout(String),
+            Stderr(String),
+        }
+
+        // Spawn stdout reader
+        if let Some(out) = stdout {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let mut reader = BufReader::new(out);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match reader.read_line(&mut line).await {
+                        Ok(0) => break,
+                        Ok(_) => {
+                            if tx.send(StreamEvent::Stdout(line.clone())).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+        }
+
+        // Spawn stderr reader
+        if let Some(err) = stderr {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let mut reader = BufReader::new(err);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match reader.read_line(&mut line).await {
+                        Ok(0) => break,
+                        Ok(_) => {
+                            if tx.send(StreamEvent::Stderr(line.clone())).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+        }
+
+        drop(tx);
+
+        let mut stdout_acc = String::new();
+        let mut stderr_acc = String::new();
+
+        let command_timeout = self.ssh_options.command_timeout;
+
+        let status = match tokio::time::timeout(command_timeout, async {
+            while let Some(event) = rx.recv().await {
+                match event {
+                    StreamEvent::Stdout(line) => {
+                        on_stdout(&line);
+                        stdout_acc.push_str(&line);
+                    }
+                    StreamEvent::Stderr(line) => {
+                        on_stderr(&line);
+                        stderr_acc.push_str(&line);
+                    }
+                }
+            }
+
+            child.wait().await.context("Failed to wait for ssh command")
+        })
+        .await
+        {
+            Ok(status) => status?,
+            Err(_) => {
+                // Best-effort: kill local ssh process so the remote command is terminated.
+                let _ = child.kill().await;
+                anyhow::bail!("SSH command timed out after {:?}", command_timeout);
+            }
+        };
+
+        let duration = start.elapsed();
+        Ok(CommandResult {
+            exit_code: status.code().unwrap_or(-1),
+            stdout: stdout_acc,
+            stderr: stderr_acc,
+            duration_ms: duration.as_millis() as u64,
+        })
     }
 
     /// Execute a command and stream output in real-time.
@@ -1002,21 +1144,8 @@ impl TransferPipeline {
 
         #[cfg(unix)]
         {
-            let mut client = SshClient::new(worker.clone(), self.ssh_options.clone());
-            client.connect().await?;
-
-            // Always disconnect after execution, even on error (e.g., timeout).
-            // Without this, a timed-out command would leak the SSH session and
-            // the remote process would continue running indefinitely.
-            let result = client
-                .execute_streaming(&wrapped_command, on_stdout, on_stderr)
-                .await;
-
-            if let Err(e) = client.disconnect().await {
-                warn!("Failed to disconnect SSH client after streaming: {}", e);
-            }
-
-            result
+            self.execute_over_ssh_streaming(worker, &wrapped_command, on_stdout, on_stderr)
+                .await
         }
     }
 
