@@ -30,6 +30,7 @@ pub mod protocol;
 pub mod remote_compilation;
 #[cfg(unix)]
 pub mod remote_verification;
+pub mod repo_updater_contract;
 #[cfg(unix)]
 pub mod ssh;
 #[cfg(all(test, unix))]
@@ -72,6 +73,18 @@ pub use patterns::{
     classify_command, classify_command_detailed, split_shell_commands,
 };
 pub use protocol::{HookInput, HookOutput, ToolInput};
+pub use repo_updater_contract::{
+    MockRepoUpdaterAdapter, REPO_UPDATER_ALIAS_PROJECTS_ROOT, REPO_UPDATER_CANONICAL_PROJECTS_ROOT,
+    REPO_UPDATER_CONTRACT_SCHEMA_VERSION, REPO_UPDATER_DEFAULT_BINARY,
+    REPO_UPDATER_MIN_SUPPORTED_VERSION, RepoUpdaterAdapter, RepoUpdaterAdapterCommand,
+    RepoUpdaterAdapterContract, RepoUpdaterAdapterRequest, RepoUpdaterAdapterResponse,
+    RepoUpdaterFailure, RepoUpdaterFailureKind, RepoUpdaterFallbackMode,
+    RepoUpdaterIdempotencyGuarantee, RepoUpdaterJsonEnvelope, RepoUpdaterOutputFormat,
+    RepoUpdaterResponseStatus, RepoUpdaterVersionCompatibility, RepoUpdaterVersionPolicy,
+    build_invocation, classify_exit_code, evaluate_version_compatibility,
+    map_failure_kind_to_error_code, repo_updater_envelope_schema, repo_updater_request_schema,
+    repo_updater_response_schema,
+};
 // Platform-independent SSH utilities (available everywhere)
 pub use ssh_utils::{
     CommandResult, EnvPrefix, build_env_prefix, is_retryable_transport_error,
