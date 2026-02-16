@@ -15,7 +15,12 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use super::logging::{LogLevel, LogSource, TestLogger, TestLoggerBuilder};
+use serde::{Deserialize, Serialize};
+
+use super::logging::{
+    LogLevel, LogSource, RELIABILITY_EVENT_SCHEMA_VERSION, ReliabilityContext,
+    ReliabilityEventInput, ReliabilityPhase, TestLogger, TestLoggerBuilder,
+};
 
 /// Error type for test harness operations
 #[derive(Debug, thiserror::Error)]
@@ -243,6 +248,248 @@ impl Default for HarnessConfig {
     }
 }
 
+/// Failure hooks that can be explicitly injected into reliability scenarios.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReliabilityFailureHook {
+    NetworkCut,
+    SyncTimeout,
+    PartialUpdate,
+    DaemonRestart,
+}
+
+impl std::fmt::Display for ReliabilityFailureHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let label = match self {
+            Self::NetworkCut => "network_cut",
+            Self::SyncTimeout => "sync_timeout",
+            Self::PartialUpdate => "partial_update",
+            Self::DaemonRestart => "daemon_restart",
+        };
+        write!(f, "{label}")
+    }
+}
+
+/// Explicit allowlist for failure hooks. Hooks are denied unless enabled here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ReliabilityFailureHookFlags {
+    pub allow_network_cut: bool,
+    pub allow_sync_timeout: bool,
+    pub allow_partial_update: bool,
+    pub allow_daemon_restart: bool,
+}
+
+impl ReliabilityFailureHookFlags {
+    /// Enable all hooks for explicit high-risk test scenarios.
+    pub fn allow_all() -> Self {
+        Self {
+            allow_network_cut: true,
+            allow_sync_timeout: true,
+            allow_partial_update: true,
+            allow_daemon_restart: true,
+        }
+    }
+
+    /// Returns true when the provided hook is explicitly enabled.
+    pub fn allows(&self, hook: ReliabilityFailureHook) -> bool {
+        match hook {
+            ReliabilityFailureHook::NetworkCut => self.allow_network_cut,
+            ReliabilityFailureHook::SyncTimeout => self.allow_sync_timeout,
+            ReliabilityFailureHook::PartialUpdate => self.allow_partial_update,
+            ReliabilityFailureHook::DaemonRestart => self.allow_daemon_restart,
+        }
+    }
+}
+
+fn default_required_success() -> bool {
+    true
+}
+
+/// One deterministic lifecycle command invoked by the reliability scenario runner.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReliabilityLifecycleCommand {
+    pub name: String,
+    pub program: String,
+    pub args: Vec<String>,
+    pub timeout_secs: Option<u64>,
+    #[serde(default = "default_required_success")]
+    pub required_success: bool,
+    #[serde(default)]
+    pub via_rch_exec: bool,
+}
+
+impl ReliabilityLifecycleCommand {
+    /// Build a command with required-success semantics.
+    pub fn new(
+        name: impl Into<String>,
+        program: impl Into<String>,
+        args: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            program: program.into(),
+            args: args.into_iter().map(Into::into).collect(),
+            timeout_secs: None,
+            required_success: true,
+            via_rch_exec: false,
+        }
+    }
+
+    /// Override timeout in seconds for this command.
+    pub fn with_timeout_secs(mut self, timeout_secs: u64) -> Self {
+        self.timeout_secs = Some(timeout_secs);
+        self
+    }
+
+    /// Marks this command optional; failures are logged but do not fail the scenario.
+    pub fn optional(mut self) -> Self {
+        self.required_success = false;
+        self
+    }
+
+    /// Run command via `rch exec -- <program> <args...>`.
+    pub fn via_rch_exec(mut self) -> Self {
+        self.via_rch_exec = true;
+        self
+    }
+}
+
+/// Worker lifecycle hooks consumed by reliability scenario suites.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ReliabilityWorkerLifecycleHooks {
+    pub pre_checks: Vec<ReliabilityLifecycleCommand>,
+    pub remote_probes: Vec<ReliabilityLifecycleCommand>,
+    pub post_checks: Vec<ReliabilityLifecycleCommand>,
+    pub cleanup_verification: Vec<ReliabilityLifecycleCommand>,
+}
+
+/// Full reliability scenario definition used by the deterministic runner.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReliabilityScenarioSpec {
+    pub scenario_id: String,
+    pub worker_id: Option<String>,
+    pub repo_set: Vec<String>,
+    pub pressure_state: Option<String>,
+    pub triage_actions: Vec<String>,
+    pub lifecycle: ReliabilityWorkerLifecycleHooks,
+    pub execute_commands: Vec<ReliabilityLifecycleCommand>,
+    pub requested_failure_hooks: Vec<ReliabilityFailureHook>,
+    pub failure_hook_flags: ReliabilityFailureHookFlags,
+}
+
+impl ReliabilityScenarioSpec {
+    /// Creates a new scenario with deterministic defaults.
+    pub fn new(scenario_id: impl Into<String>) -> Self {
+        Self {
+            scenario_id: scenario_id.into(),
+            worker_id: None,
+            repo_set: Vec::new(),
+            pressure_state: None,
+            triage_actions: Vec::new(),
+            lifecycle: ReliabilityWorkerLifecycleHooks::default(),
+            execute_commands: Vec::new(),
+            requested_failure_hooks: Vec::new(),
+            failure_hook_flags: ReliabilityFailureHookFlags::default(),
+        }
+    }
+
+    pub fn with_worker_id(mut self, worker_id: impl Into<String>) -> Self {
+        self.worker_id = Some(worker_id.into());
+        self
+    }
+
+    pub fn with_repo_set(mut self, repos: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.repo_set = repos.into_iter().map(Into::into).collect();
+        self
+    }
+
+    pub fn with_pressure_state(mut self, pressure_state: impl Into<String>) -> Self {
+        self.pressure_state = Some(pressure_state.into());
+        self
+    }
+
+    pub fn add_triage_action(mut self, action: impl Into<String>) -> Self {
+        self.triage_actions.push(action.into());
+        self
+    }
+
+    pub fn add_pre_check(mut self, command: ReliabilityLifecycleCommand) -> Self {
+        self.lifecycle.pre_checks.push(command);
+        self
+    }
+
+    pub fn add_remote_probe(mut self, command: ReliabilityLifecycleCommand) -> Self {
+        self.lifecycle.remote_probes.push(command);
+        self
+    }
+
+    pub fn add_post_check(mut self, command: ReliabilityLifecycleCommand) -> Self {
+        self.lifecycle.post_checks.push(command);
+        self
+    }
+
+    pub fn add_cleanup_verification(mut self, command: ReliabilityLifecycleCommand) -> Self {
+        self.lifecycle.cleanup_verification.push(command);
+        self
+    }
+
+    pub fn add_execute_command(mut self, command: ReliabilityLifecycleCommand) -> Self {
+        self.execute_commands.push(command);
+        self
+    }
+
+    pub fn request_failure_hook(mut self, hook: ReliabilityFailureHook) -> Self {
+        self.requested_failure_hooks.push(hook);
+        self
+    }
+
+    pub fn with_failure_hook_flags(mut self, flags: ReliabilityFailureHookFlags) -> Self {
+        self.failure_hook_flags = flags;
+        self
+    }
+}
+
+/// Recorded result of one lifecycle command execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReliabilityCommandRecord {
+    pub phase: ReliabilityPhase,
+    pub stage: String,
+    pub command_name: String,
+    pub invoked_program: String,
+    pub invoked_args: Vec<String>,
+    pub exit_code: i32,
+    pub duration_ms: u64,
+    pub required_success: bool,
+    pub succeeded: bool,
+    pub artifact_paths: Vec<String>,
+}
+
+/// Replay-focused artifact index for one scenario run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReliabilityScenarioReport {
+    pub schema_version: String,
+    pub scenario_id: String,
+    pub phase_order: Vec<ReliabilityPhase>,
+    pub activated_failure_hooks: Vec<ReliabilityFailureHook>,
+    pub command_records: Vec<ReliabilityCommandRecord>,
+    pub artifact_paths: Vec<String>,
+    pub manifest_path: Option<PathBuf>,
+}
+
+impl ReliabilityScenarioReport {
+    fn new(scenario_id: &str) -> Self {
+        Self {
+            schema_version: RELIABILITY_EVENT_SCHEMA_VERSION.to_string(),
+            scenario_id: scenario_id.to_string(),
+            phase_order: Vec::new(),
+            activated_failure_hooks: Vec::new(),
+            command_records: Vec::new(),
+            artifact_paths: Vec::new(),
+            manifest_path: None,
+        }
+    }
+}
+
 /// Clean up stale sockets and test directories from previous test runs.
 ///
 /// This function should be called during test harness setup to prevent
@@ -343,6 +590,21 @@ impl TestHarness {
 
         logger.info(format!("Test harness initialized: {test_name}"));
         logger.debug(format!("Test directory: {}", test_dir.display()));
+        logger.log_reliability_event(ReliabilityEventInput {
+            level: LogLevel::Info,
+            phase: ReliabilityPhase::Setup,
+            scenario_id: test_name.to_string(),
+            message: "Test harness initialized".to_string(),
+            context: ReliabilityContext {
+                worker_id: None,
+                repo_set: vec![test_dir.display().to_string()],
+                pressure_state: None,
+                triage_actions: Vec::new(),
+                decision_code: "HARNESS_INIT".to_string(),
+                fallback_reason: None,
+            },
+            artifact_paths: Vec::new(),
+        });
 
         Ok(Self {
             config,
@@ -363,6 +625,596 @@ impl TestHarness {
     /// Get the test directory path
     pub fn test_dir(&self) -> &Path {
         &self.test_dir
+    }
+
+    /// Run a reliability scenario with deterministic setup/execute/verify/cleanup phases.
+    ///
+    /// This is the shared foundation consumed by scenario-specific suites (path dependencies,
+    /// repo convergence, disk pressure, and process triage) so they can reuse one orchestration
+    /// engine instead of bespoke scaffolding.
+    pub fn run_reliability_scenario(
+        &self,
+        scenario: &ReliabilityScenarioSpec,
+    ) -> HarnessResult<ReliabilityScenarioReport> {
+        let mut report = ReliabilityScenarioReport::new(&scenario.scenario_id);
+        let mut triage_actions = scenario.triage_actions.clone();
+
+        report.phase_order.push(ReliabilityPhase::Setup);
+        self.log_scenario_event(
+            scenario,
+            ReliabilityPhase::Setup,
+            LogLevel::Info,
+            "Reliability setup phase started",
+            "SCENARIO_SETUP_START",
+            &triage_actions,
+            None,
+            Vec::new(),
+        );
+
+        let setup_result: HarnessResult<()> = (|| {
+            report.activated_failure_hooks =
+                self.activate_failure_hooks(scenario, &mut report, &mut triage_actions)?;
+
+            self.run_phase_lifecycle_commands(
+                scenario,
+                ReliabilityPhase::Setup,
+                "pre_checks",
+                &scenario.lifecycle.pre_checks,
+                &mut report,
+                &mut triage_actions,
+            )
+        })();
+
+        if let Err(error) = setup_result.as_ref() {
+            self.log_scenario_event(
+                scenario,
+                ReliabilityPhase::Setup,
+                LogLevel::Error,
+                format!("Reliability setup phase failed: {error}"),
+                "SCENARIO_SETUP_FAIL",
+                &triage_actions,
+                Some(error.to_string()),
+                Vec::new(),
+            );
+        } else {
+            self.log_scenario_event(
+                scenario,
+                ReliabilityPhase::Setup,
+                LogLevel::Info,
+                "Reliability setup phase completed",
+                "SCENARIO_SETUP_DONE",
+                &triage_actions,
+                None,
+                Vec::new(),
+            );
+        }
+
+        report.phase_order.push(ReliabilityPhase::Execute);
+        let execute_result: HarnessResult<()> = if setup_result.is_ok() {
+            self.log_scenario_event(
+                scenario,
+                ReliabilityPhase::Execute,
+                LogLevel::Info,
+                "Reliability execute phase started",
+                "SCENARIO_EXECUTE_START",
+                &triage_actions,
+                None,
+                Vec::new(),
+            );
+
+            let result = (|| {
+                self.run_phase_lifecycle_commands(
+                    scenario,
+                    ReliabilityPhase::Execute,
+                    "execute",
+                    &scenario.execute_commands,
+                    &mut report,
+                    &mut triage_actions,
+                )?;
+                self.run_phase_lifecycle_commands(
+                    scenario,
+                    ReliabilityPhase::Execute,
+                    "remote_probes",
+                    &scenario.lifecycle.remote_probes,
+                    &mut report,
+                    &mut triage_actions,
+                )
+            })();
+
+            if let Err(error) = result.as_ref() {
+                self.log_scenario_event(
+                    scenario,
+                    ReliabilityPhase::Execute,
+                    LogLevel::Error,
+                    format!("Reliability execute phase failed: {error}"),
+                    "SCENARIO_EXECUTE_FAIL",
+                    &triage_actions,
+                    Some(error.to_string()),
+                    Vec::new(),
+                );
+            } else {
+                self.log_scenario_event(
+                    scenario,
+                    ReliabilityPhase::Execute,
+                    LogLevel::Info,
+                    "Reliability execute phase completed",
+                    "SCENARIO_EXECUTE_DONE",
+                    &triage_actions,
+                    None,
+                    Vec::new(),
+                );
+            }
+
+            result
+        } else {
+            self.log_scenario_event(
+                scenario,
+                ReliabilityPhase::Execute,
+                LogLevel::Warn,
+                "Reliability execute phase skipped due setup failure",
+                "SCENARIO_EXECUTE_SKIPPED",
+                &triage_actions,
+                Some("setup phase failed".to_string()),
+                Vec::new(),
+            );
+            Ok(())
+        };
+
+        report.phase_order.push(ReliabilityPhase::Verify);
+        let verify_result: HarnessResult<()> = if setup_result.is_ok() && execute_result.is_ok() {
+            self.log_scenario_event(
+                scenario,
+                ReliabilityPhase::Verify,
+                LogLevel::Info,
+                "Reliability verify phase started",
+                "SCENARIO_VERIFY_START",
+                &triage_actions,
+                None,
+                Vec::new(),
+            );
+
+            let result = self.run_phase_lifecycle_commands(
+                scenario,
+                ReliabilityPhase::Verify,
+                "post_checks",
+                &scenario.lifecycle.post_checks,
+                &mut report,
+                &mut triage_actions,
+            );
+
+            if let Err(error) = result.as_ref() {
+                self.log_scenario_event(
+                    scenario,
+                    ReliabilityPhase::Verify,
+                    LogLevel::Error,
+                    format!("Reliability verify phase failed: {error}"),
+                    "SCENARIO_VERIFY_FAIL",
+                    &triage_actions,
+                    Some(error.to_string()),
+                    Vec::new(),
+                );
+            } else {
+                self.log_scenario_event(
+                    scenario,
+                    ReliabilityPhase::Verify,
+                    LogLevel::Info,
+                    "Reliability verify phase completed",
+                    "SCENARIO_VERIFY_DONE",
+                    &triage_actions,
+                    None,
+                    Vec::new(),
+                );
+            }
+
+            result
+        } else {
+            self.log_scenario_event(
+                scenario,
+                ReliabilityPhase::Verify,
+                LogLevel::Warn,
+                "Reliability verify phase skipped due earlier failure",
+                "SCENARIO_VERIFY_SKIPPED",
+                &triage_actions,
+                Some("setup or execute phase failed".to_string()),
+                Vec::new(),
+            );
+            Ok(())
+        };
+
+        report.phase_order.push(ReliabilityPhase::Cleanup);
+        self.log_scenario_event(
+            scenario,
+            ReliabilityPhase::Cleanup,
+            LogLevel::Info,
+            "Reliability cleanup phase started",
+            "SCENARIO_CLEANUP_START",
+            &triage_actions,
+            None,
+            Vec::new(),
+        );
+
+        let cleanup_result = self.run_phase_lifecycle_commands(
+            scenario,
+            ReliabilityPhase::Cleanup,
+            "cleanup_verification",
+            &scenario.lifecycle.cleanup_verification,
+            &mut report,
+            &mut triage_actions,
+        );
+
+        let manifest_payload = serde_json::json!({
+            "schema_version": report.schema_version,
+            "scenario_id": report.scenario_id,
+            "phase_order": report.phase_order.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "activated_failure_hooks": report
+                .activated_failure_hooks
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            "command_records": report.command_records,
+            "artifact_paths": report.artifact_paths,
+        });
+        let mut cleanup_artifacts = Vec::new();
+        if let Ok(path) = self.logger.capture_artifact_json(
+            &scenario.scenario_id,
+            "scenario_artifact_index",
+            &manifest_payload,
+        ) {
+            let as_string = path.display().to_string();
+            report.manifest_path = Some(path);
+            Self::push_unique_string(&mut report.artifact_paths, as_string.clone());
+            cleanup_artifacts.push(as_string);
+        }
+
+        if let Err(error) = cleanup_result.as_ref() {
+            self.log_scenario_event(
+                scenario,
+                ReliabilityPhase::Cleanup,
+                LogLevel::Error,
+                format!("Reliability cleanup phase failed: {error}"),
+                "SCENARIO_CLEANUP_FAIL",
+                &triage_actions,
+                Some(error.to_string()),
+                cleanup_artifacts,
+            );
+        } else {
+            self.log_scenario_event(
+                scenario,
+                ReliabilityPhase::Cleanup,
+                LogLevel::Info,
+                "Reliability cleanup phase completed",
+                "SCENARIO_CLEANUP_DONE",
+                &triage_actions,
+                None,
+                cleanup_artifacts,
+            );
+        }
+
+        setup_result?;
+        execute_result?;
+        verify_result?;
+        cleanup_result?;
+
+        Ok(report)
+    }
+
+    fn run_phase_lifecycle_commands(
+        &self,
+        scenario: &ReliabilityScenarioSpec,
+        phase: ReliabilityPhase,
+        stage: &str,
+        commands: &[ReliabilityLifecycleCommand],
+        report: &mut ReliabilityScenarioReport,
+        triage_actions: &mut Vec<String>,
+    ) -> HarnessResult<()> {
+        for command in commands {
+            self.execute_lifecycle_command(
+                scenario,
+                phase,
+                stage,
+                command,
+                report,
+                triage_actions,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn execute_lifecycle_command(
+        &self,
+        scenario: &ReliabilityScenarioSpec,
+        phase: ReliabilityPhase,
+        stage: &str,
+        command: &ReliabilityLifecycleCommand,
+        report: &mut ReliabilityScenarioReport,
+        triage_actions: &mut Vec<String>,
+    ) -> HarnessResult<()> {
+        let mut invoked_args = command.args.clone();
+        let invoked_program = if command.via_rch_exec {
+            let mut wrapped = vec![
+                "exec".to_string(),
+                "--".to_string(),
+                command.program.clone(),
+            ];
+            wrapped.extend(invoked_args);
+            invoked_args = wrapped;
+            "rch".to_string()
+        } else {
+            command.program.clone()
+        };
+
+        let timeout = command
+            .timeout_secs
+            .map(Duration::from_secs)
+            .unwrap_or(self.config.default_timeout);
+        let result = self.exec_with_timeout(
+            &invoked_program,
+            invoked_args.iter().map(String::as_str),
+            timeout,
+        )?;
+
+        let artifact_prefix = format!(
+            "{}_{}_{}",
+            Self::sanitize_artifact_component(stage),
+            Self::sanitize_artifact_component(&command.name),
+            chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f")
+        );
+        let mut command_artifacts = Vec::new();
+        let trace_payload = serde_json::json!({
+            "scenario_id": scenario.scenario_id,
+            "phase": phase.to_string(),
+            "stage": stage,
+            "command_name": command.name,
+            "invoked_program": invoked_program,
+            "invoked_args": invoked_args,
+            "required_success": command.required_success,
+            "exit_code": result.exit_code,
+            "duration_ms": result.duration.as_millis(),
+        });
+        if let Ok(path) = self.logger.capture_artifact_json(
+            &scenario.scenario_id,
+            &format!("{artifact_prefix}_trace"),
+            &trace_payload,
+        ) {
+            command_artifacts.push(path.display().to_string());
+        }
+        if !result.stdout.is_empty()
+            && let Ok(path) = self.logger.capture_artifact_text(
+                &scenario.scenario_id,
+                &format!("{artifact_prefix}_stdout"),
+                &result.stdout,
+            )
+        {
+            command_artifacts.push(path.display().to_string());
+        }
+        if !result.stderr.is_empty()
+            && let Ok(path) = self.logger.capture_artifact_text(
+                &scenario.scenario_id,
+                &format!("{artifact_prefix}_stderr"),
+                &result.stderr,
+            )
+        {
+            command_artifacts.push(path.display().to_string());
+        }
+
+        for artifact_path in &command_artifacts {
+            Self::push_unique_string(&mut report.artifact_paths, artifact_path.clone());
+        }
+
+        let mut event_triage = triage_actions.clone();
+        if result.success() {
+            Self::push_unique_string(
+                &mut event_triage,
+                format!("{}_{}_pass", stage, command.name),
+            );
+        } else {
+            Self::push_unique_string(
+                &mut event_triage,
+                format!("{}_{}_fail", stage, command.name),
+            );
+        }
+
+        let decision_code = format!(
+            "{}_{}",
+            Self::sanitize_decision_token(stage),
+            if result.success() { "PASS" } else { "FAIL" }
+        );
+
+        self.log_scenario_event(
+            scenario,
+            phase,
+            if result.success() {
+                LogLevel::Info
+            } else {
+                LogLevel::Warn
+            },
+            format!(
+                "Lifecycle command '{}' in stage '{}' finished with exit {}",
+                command.name, stage, result.exit_code
+            ),
+            decision_code,
+            &event_triage,
+            if result.success() {
+                None
+            } else {
+                Some(format!(
+                    "lifecycle command '{}' failed with exit {}",
+                    command.name, result.exit_code
+                ))
+            },
+            command_artifacts.clone(),
+        );
+
+        report.command_records.push(ReliabilityCommandRecord {
+            phase,
+            stage: stage.to_string(),
+            command_name: command.name.clone(),
+            invoked_program: invoked_program.clone(),
+            invoked_args: invoked_args.clone(),
+            exit_code: result.exit_code,
+            duration_ms: result.duration.as_millis() as u64,
+            required_success: command.required_success,
+            succeeded: result.success(),
+            artifact_paths: command_artifacts,
+        });
+
+        if !result.success() && command.required_success {
+            return Err(HarnessError::AssertionFailed(format!(
+                "required lifecycle command '{}' failed in stage '{}' (exit={})",
+                command.name, stage, result.exit_code
+            )));
+        }
+        if !result.success() && !command.required_success {
+            Self::push_unique_string(
+                triage_actions,
+                format!("optional_command_failed:{}:{}", stage, command.name),
+            );
+        }
+
+        Ok(())
+    }
+
+    fn activate_failure_hooks(
+        &self,
+        scenario: &ReliabilityScenarioSpec,
+        report: &mut ReliabilityScenarioReport,
+        triage_actions: &mut Vec<String>,
+    ) -> HarnessResult<Vec<ReliabilityFailureHook>> {
+        let mut activated = Vec::new();
+        if scenario.requested_failure_hooks.is_empty() {
+            return Ok(activated);
+        }
+
+        let marker_dir = self.test_dir.join(".reliability-hooks");
+        std::fs::create_dir_all(&marker_dir)?;
+
+        for hook in &scenario.requested_failure_hooks {
+            if !scenario.failure_hook_flags.allows(*hook) {
+                self.log_scenario_event(
+                    scenario,
+                    ReliabilityPhase::Setup,
+                    LogLevel::Error,
+                    format!("Failure hook denied: {hook}"),
+                    "FAILURE_HOOK_DENIED",
+                    triage_actions,
+                    Some(format!("hook {hook} requested without explicit allow flag")),
+                    Vec::new(),
+                );
+                return Err(HarnessError::SetupFailed(format!(
+                    "failure hook '{hook}' requested but not enabled"
+                )));
+            }
+
+            let marker_path = marker_dir.join(format!("{hook}.enabled"));
+            std::fs::write(
+                &marker_path,
+                format!(
+                    "scenario_id={}\nhook={hook}\narmed_at={}\n",
+                    scenario.scenario_id,
+                    chrono::Utc::now().to_rfc3339()
+                ),
+            )?;
+
+            let mut hook_artifacts = Vec::new();
+            if let Ok(path) = self.logger.capture_artifact_text(
+                &scenario.scenario_id,
+                &format!("failure_hook_{hook}_marker"),
+                &format!("marker_path={}", marker_path.display()),
+            ) {
+                hook_artifacts.push(path.display().to_string());
+            }
+            let hook_payload = serde_json::json!({
+                "scenario_id": scenario.scenario_id,
+                "hook": hook.to_string(),
+                "marker_path": marker_path.display().to_string(),
+                "armed_at": chrono::Utc::now().to_rfc3339(),
+            });
+            if let Ok(path) = self.logger.capture_artifact_json(
+                &scenario.scenario_id,
+                &format!("failure_hook_{hook}_payload"),
+                &hook_payload,
+            ) {
+                hook_artifacts.push(path.display().to_string());
+            }
+
+            for artifact_path in &hook_artifacts {
+                Self::push_unique_string(&mut report.artifact_paths, artifact_path.clone());
+            }
+
+            Self::push_unique_string(triage_actions, format!("failure_hook:{hook}:armed"));
+
+            self.log_scenario_event(
+                scenario,
+                ReliabilityPhase::Setup,
+                LogLevel::Info,
+                format!("Failure hook armed: {hook}"),
+                "FAILURE_HOOK_ARMED",
+                triage_actions,
+                None,
+                hook_artifacts,
+            );
+
+            activated.push(*hook);
+        }
+
+        Ok(activated)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn log_scenario_event(
+        &self,
+        scenario: &ReliabilityScenarioSpec,
+        phase: ReliabilityPhase,
+        level: LogLevel,
+        message: impl Into<String>,
+        decision_code: impl Into<String>,
+        triage_actions: &[String],
+        fallback_reason: Option<String>,
+        artifact_paths: Vec<String>,
+    ) {
+        let repo_set = if scenario.repo_set.is_empty() {
+            vec![self.test_dir.display().to_string()]
+        } else {
+            scenario.repo_set.clone()
+        };
+
+        self.logger.log_reliability_event(ReliabilityEventInput {
+            level,
+            phase,
+            scenario_id: scenario.scenario_id.clone(),
+            message: message.into(),
+            context: ReliabilityContext {
+                worker_id: scenario.worker_id.clone(),
+                repo_set,
+                pressure_state: scenario.pressure_state.clone(),
+                triage_actions: triage_actions.to_vec(),
+                decision_code: decision_code.into(),
+                fallback_reason,
+            },
+            artifact_paths,
+        });
+    }
+
+    fn push_unique_string(values: &mut Vec<String>, value: String) {
+        if !values.iter().any(|existing| existing == &value) {
+            values.push(value);
+        }
+    }
+
+    fn sanitize_decision_token(raw: &str) -> String {
+        let mut token = String::with_capacity(raw.len());
+        for ch in raw.chars() {
+            if ch.is_ascii_alphanumeric() {
+                token.push(ch.to_ascii_uppercase());
+            } else {
+                token.push('_');
+            }
+        }
+        if token.is_empty() {
+            "PHASE".to_string()
+        } else {
+            token
+        }
     }
 
     /// Create a subdirectory in the test directory
@@ -611,6 +1463,49 @@ impl TestHarness {
             duration,
         };
 
+        let command_line = format!("{} {}", program, args_display.join(" "));
+        let artifact_prefix = format!(
+            "{}_{}",
+            Self::sanitize_artifact_component(program),
+            chrono::Utc::now().format("%Y%m%d_%H%M%S_%3f")
+        );
+        let mut artifact_paths = Vec::new();
+        let trace_payload = serde_json::json!({
+            "command": command_line,
+            "program": program,
+            "args": args_display,
+            "exit_code": result.exit_code,
+            "duration_ms": duration.as_millis(),
+            "timed_out": timed_out,
+            "stdout_len_bytes": result.stdout.len(),
+            "stderr_len_bytes": result.stderr.len(),
+        });
+        if let Ok(path) = self.logger.capture_artifact_json(
+            self.logger.test_name(),
+            &format!("{artifact_prefix}_trace"),
+            &trace_payload,
+        ) {
+            artifact_paths.push(path.display().to_string());
+        }
+        if !result.stdout.is_empty()
+            && let Ok(path) = self.logger.capture_artifact_text(
+                self.logger.test_name(),
+                &format!("{artifact_prefix}_stdout"),
+                &result.stdout,
+            )
+        {
+            artifact_paths.push(path.display().to_string());
+        }
+        if !result.stderr.is_empty()
+            && let Ok(path) = self.logger.capture_artifact_text(
+                self.logger.test_name(),
+                &format!("{artifact_prefix}_stderr"),
+                &result.stderr,
+            )
+        {
+            artifact_paths.push(path.display().to_string());
+        }
+
         self.logger.log_with_context(
             if result.success() {
                 LogLevel::Debug
@@ -625,6 +1520,41 @@ impl TestHarness {
                 ("timed_out".to_string(), timed_out.to_string()),
             ],
         );
+
+        let decision_code = if timed_out {
+            "CMD_TIMEOUT"
+        } else if result.success() {
+            "CMD_SUCCESS"
+        } else {
+            "CMD_FAILURE"
+        };
+        self.logger.log_reliability_event(ReliabilityEventInput {
+            level: if result.success() {
+                LogLevel::Info
+            } else {
+                LogLevel::Warn
+            },
+            phase: ReliabilityPhase::Execute,
+            scenario_id: self.logger.test_name().to_string(),
+            message: format!("Command execution finished: {program}"),
+            context: ReliabilityContext {
+                worker_id: None,
+                repo_set: vec![self.test_dir.display().to_string()],
+                pressure_state: None,
+                triage_actions: if timed_out {
+                    vec!["process_killed_after_timeout".to_string()]
+                } else {
+                    Vec::new()
+                },
+                decision_code: decision_code.to_string(),
+                fallback_reason: if timed_out {
+                    Some(format!("command exceeded timeout {:?}", timeout))
+                } else {
+                    None
+                },
+            },
+            artifact_paths,
+        });
 
         if !result.stdout.is_empty() {
             for line in result.stdout.lines() {
@@ -662,6 +1592,22 @@ impl TestHarness {
         match handle {
             Some(handle) => handle.join().unwrap_or_default(),
             None => String::new(),
+        }
+    }
+
+    fn sanitize_artifact_component(raw: &str) -> String {
+        let mut sanitized = String::with_capacity(raw.len());
+        for ch in raw.chars() {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                sanitized.push(ch);
+            } else {
+                sanitized.push('_');
+            }
+        }
+        if sanitized.is_empty() {
+            "artifact".to_string()
+        } else {
+            sanitized
         }
     }
 
@@ -826,9 +1772,23 @@ impl TestHarness {
     pub fn assert(&self, condition: bool, message: &str) -> HarnessResult<()> {
         if condition {
             self.logger.debug(format!("Assertion passed: {message}"));
+            self.logger
+                .log_reliability_event(ReliabilityEventInput::with_decision(
+                    ReliabilityPhase::Verify,
+                    self.logger.test_name().to_string(),
+                    format!("Assertion passed: {message}"),
+                    "ASSERT_PASS",
+                ));
             Ok(())
         } else {
             self.logger.error(format!("Assertion failed: {message}"));
+            self.logger
+                .log_reliability_event(ReliabilityEventInput::with_decision(
+                    ReliabilityPhase::Verify,
+                    self.logger.test_name().to_string(),
+                    format!("Assertion failed: {message}"),
+                    "ASSERT_FAIL",
+                ));
             Err(HarnessError::AssertionFailed(message.to_string()))
         }
     }
@@ -842,10 +1802,24 @@ impl TestHarness {
     ) -> HarnessResult<()> {
         if actual == expected {
             self.logger.debug(format!("Assertion passed: {message}"));
+            self.logger
+                .log_reliability_event(ReliabilityEventInput::with_decision(
+                    ReliabilityPhase::Verify,
+                    self.logger.test_name().to_string(),
+                    format!("Equality assertion passed: {message}"),
+                    "ASSERT_EQ_PASS",
+                ));
             Ok(())
         } else {
             let msg = format!("{}: expected {:?}, got {:?}", message, expected, actual);
             self.logger.error(format!("Assertion failed: {msg}"));
+            self.logger
+                .log_reliability_event(ReliabilityEventInput::with_decision(
+                    ReliabilityPhase::Verify,
+                    self.logger.test_name().to_string(),
+                    format!("Equality assertion failed: {msg}"),
+                    "ASSERT_EQ_FAIL",
+                ));
             Err(HarnessError::AssertionFailed(msg))
         }
     }
@@ -854,6 +1828,13 @@ impl TestHarness {
     pub fn assert_success(&self, result: &CommandResult, context: &str) -> HarnessResult<()> {
         if result.success() {
             self.logger.debug(format!("Command succeeded: {context}"));
+            self.logger
+                .log_reliability_event(ReliabilityEventInput::with_decision(
+                    ReliabilityPhase::Verify,
+                    self.logger.test_name().to_string(),
+                    format!("Command success assertion passed: {context}"),
+                    "CMD_ASSERT_SUCCESS",
+                ));
             Ok(())
         } else {
             let msg = format!(
@@ -864,6 +1845,13 @@ impl TestHarness {
                 result.stderr.trim()
             );
             self.logger.error(&msg);
+            self.logger
+                .log_reliability_event(ReliabilityEventInput::with_decision(
+                    ReliabilityPhase::Verify,
+                    self.logger.test_name().to_string(),
+                    format!("Command success assertion failed: {msg}"),
+                    "CMD_ASSERT_FAIL",
+                ));
             Err(HarnessError::AssertionFailed(msg))
         }
     }
@@ -879,6 +1867,13 @@ impl TestHarness {
             self.logger.debug(format!(
                 "Stdout contains expected pattern: {context} -> {pattern}"
             ));
+            self.logger
+                .log_reliability_event(ReliabilityEventInput::with_decision(
+                    ReliabilityPhase::Verify,
+                    self.logger.test_name().to_string(),
+                    format!("Stdout assertion passed for pattern '{pattern}'"),
+                    "STDOUT_PATTERN_PASS",
+                ));
             Ok(())
         } else {
             let msg = format!(
@@ -888,6 +1883,13 @@ impl TestHarness {
                 result.stdout.trim()
             );
             self.logger.error(&msg);
+            self.logger
+                .log_reliability_event(ReliabilityEventInput::with_decision(
+                    ReliabilityPhase::Verify,
+                    self.logger.test_name().to_string(),
+                    format!("Stdout assertion failed for pattern '{pattern}'"),
+                    "STDOUT_PATTERN_FAIL",
+                ));
             Err(HarnessError::AssertionFailed(msg))
         }
     }
@@ -895,6 +1897,13 @@ impl TestHarness {
     /// Perform cleanup
     pub fn cleanup(&self) {
         self.logger.info("Starting cleanup");
+        self.logger
+            .log_reliability_event(ReliabilityEventInput::with_decision(
+                ReliabilityPhase::Cleanup,
+                self.logger.test_name().to_string(),
+                "Cleanup started",
+                "CLEANUP_START",
+            ));
 
         // Stop all managed processes
         self.stop_all_processes();
@@ -921,6 +1930,14 @@ impl TestHarness {
                 self.test_dir.display()
             ));
         }
+
+        self.logger
+            .log_reliability_event(ReliabilityEventInput::with_decision(
+                ReliabilityPhase::Cleanup,
+                self.logger.test_name().to_string(),
+                "Cleanup finished",
+                "CLEANUP_DONE",
+            ));
 
         self.logger.print_summary();
     }
@@ -1095,5 +2112,190 @@ mod tests {
 
         harness.mark_passed();
         assert!(harness.passed());
+    }
+
+    #[test]
+    fn test_reliability_harness_phase_order_and_manifest_index() {
+        let harness = TestHarnessBuilder::new("reliability_harness_phase_order")
+            .cleanup_on_success(true)
+            .build()
+            .unwrap();
+
+        let scenario = ReliabilityScenarioSpec::new("reliability_harness_phase_order")
+            .with_worker_id("worker-a")
+            .with_repo_set([harness.test_dir().display().to_string()])
+            .with_pressure_state("disk:normal,memory:normal")
+            .add_triage_action("initial_context")
+            .add_pre_check(ReliabilityLifecycleCommand::new(
+                "pre-check",
+                "echo",
+                ["pre-check"],
+            ))
+            .add_execute_command(ReliabilityLifecycleCommand::new(
+                "execute-build",
+                "echo",
+                ["execute-build"],
+            ))
+            .add_remote_probe(ReliabilityLifecycleCommand::new(
+                "remote-probe",
+                "echo",
+                ["remote-probe"],
+            ))
+            .add_post_check(ReliabilityLifecycleCommand::new(
+                "post-check",
+                "echo",
+                ["post-check"],
+            ))
+            .add_cleanup_verification(ReliabilityLifecycleCommand::new(
+                "cleanup-check",
+                "echo",
+                ["cleanup-check"],
+            ));
+
+        let report = harness.run_reliability_scenario(&scenario).unwrap();
+        assert_eq!(
+            report.phase_order,
+            vec![
+                ReliabilityPhase::Setup,
+                ReliabilityPhase::Execute,
+                ReliabilityPhase::Verify,
+                ReliabilityPhase::Cleanup
+            ]
+        );
+        let stages: Vec<_> = report
+            .command_records
+            .iter()
+            .map(|record| record.stage.as_str())
+            .collect();
+        assert_eq!(
+            stages,
+            vec![
+                "pre_checks",
+                "execute",
+                "remote_probes",
+                "post_checks",
+                "cleanup_verification"
+            ]
+        );
+
+        let manifest_path = report.manifest_path.expect("manifest path should exist");
+        assert!(manifest_path.exists());
+        let manifest = std::fs::read_to_string(manifest_path).unwrap();
+        assert!(manifest.contains("\"scenario_id\": \"reliability_harness_phase_order\""));
+    }
+
+    #[test]
+    fn test_reliability_harness_denies_unflagged_failure_hooks() {
+        let harness = TestHarnessBuilder::new("reliability_harness_hook_denied")
+            .cleanup_on_success(true)
+            .build()
+            .unwrap();
+
+        let scenario = ReliabilityScenarioSpec::new("reliability_harness_hook_denied")
+            .request_failure_hook(ReliabilityFailureHook::NetworkCut);
+
+        let err = harness
+            .run_reliability_scenario(&scenario)
+            .expect_err("unflagged failure hook must be rejected");
+        assert!(matches!(err, HarnessError::SetupFailed(_)));
+        assert!(err.to_string().contains("not enabled"));
+    }
+
+    #[test]
+    fn test_reliability_harness_arms_explicit_failure_hooks() {
+        let harness = TestHarnessBuilder::new("reliability_harness_hook_enabled")
+            .cleanup_on_success(true)
+            .build()
+            .unwrap();
+
+        let flags = ReliabilityFailureHookFlags::allow_all();
+
+        let scenario = ReliabilityScenarioSpec::new("reliability_harness_hook_enabled")
+            .with_repo_set([harness.test_dir().display().to_string()])
+            .request_failure_hook(ReliabilityFailureHook::NetworkCut)
+            .request_failure_hook(ReliabilityFailureHook::SyncTimeout)
+            .request_failure_hook(ReliabilityFailureHook::PartialUpdate)
+            .request_failure_hook(ReliabilityFailureHook::DaemonRestart)
+            .with_failure_hook_flags(flags)
+            .add_cleanup_verification(ReliabilityLifecycleCommand::new(
+                "cleanup-check",
+                "echo",
+                ["cleanup-check"],
+            ));
+
+        let report = harness.run_reliability_scenario(&scenario).unwrap();
+        assert_eq!(
+            report.activated_failure_hooks,
+            vec![
+                ReliabilityFailureHook::NetworkCut,
+                ReliabilityFailureHook::SyncTimeout,
+                ReliabilityFailureHook::PartialUpdate,
+                ReliabilityFailureHook::DaemonRestart
+            ]
+        );
+        assert!(
+            report
+                .artifact_paths
+                .iter()
+                .any(|path| path.contains("failure_hook_network_cut"))
+        );
+        assert!(
+            harness
+                .test_dir()
+                .join(".reliability-hooks/network_cut.enabled")
+                .exists()
+        );
+        assert!(
+            harness
+                .test_dir()
+                .join(".reliability-hooks/sync_timeout.enabled")
+                .exists()
+        );
+        assert!(
+            harness
+                .test_dir()
+                .join(".reliability-hooks/partial_update.enabled")
+                .exists()
+        );
+        assert!(
+            harness
+                .test_dir()
+                .join(".reliability-hooks/daemon_restart.enabled")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn test_reliability_harness_primitives_cover_downstream_scenarios() {
+        let harness = TestHarnessBuilder::new("reliability_harness_downstream")
+            .cleanup_on_success(true)
+            .build()
+            .unwrap();
+
+        let scenario_ids = ["bd-vvmd.2.8", "bd-vvmd.3.6", "bd-vvmd.4.6", "bd-vvmd.5.6"];
+        for scenario_id in scenario_ids {
+            let scenario = ReliabilityScenarioSpec::new(scenario_id)
+                .with_repo_set([harness.test_dir().display().to_string()])
+                .add_execute_command(ReliabilityLifecycleCommand::new(
+                    "smoke",
+                    "echo",
+                    [format!("scenario={scenario_id}")],
+                ));
+
+            let report = harness
+                .run_reliability_scenario(&scenario)
+                .unwrap_or_else(|error| panic!("scenario {scenario_id} failed: {error}"));
+            assert!(
+                report.manifest_path.is_some(),
+                "missing manifest for {scenario_id}"
+            );
+            assert!(
+                report
+                    .command_records
+                    .iter()
+                    .any(|record| record.stage == "execute"),
+                "missing execute stage record for {scenario_id}"
+            );
+        }
     }
 }

@@ -208,8 +208,7 @@ impl SshClient {
             // /var/folders/…/T/ which, combined with the hash, exceeds 104 bytes.
             // We therefore prefer `~/.ssh/rch` (short, stable, correct perms).
             let control_dir = {
-                let home_ssh = dirs::home_dir()
-                    .map(|h| h.join(".ssh").join("rch"));
+                let home_ssh = dirs::home_dir().map(|h| h.join(".ssh").join("rch"));
 
                 if let Some(ref dir) = home_ssh {
                     dir.clone()

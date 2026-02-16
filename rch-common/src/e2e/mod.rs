@@ -60,15 +60,23 @@ pub mod verification;
 
 // Re-export commonly used items
 pub use fixtures::{
-    DaemonConfigFixture, HookInputFixture, RustProjectFixture, TestCaseFixture, WorkerFixture,
-    WorkersFixture,
+    DEFAULT_MULTI_REPO_ALIAS_ROOT, DEFAULT_MULTI_REPO_CANONICAL_ROOT,
+    DEFAULT_MULTI_REPO_FIXTURE_NAMESPACE, DaemonConfigFixture, FixtureFailureMode, FixtureLayer,
+    FixtureReadiness, HookInputFixture, MultiRepoFixtureConfig, MultiRepoFixtureError,
+    MultiRepoFixtureMetadata, MultiRepoFixtureResult, MultiRepoFixtureSet, RustProjectFixture,
+    TestCaseFixture, WorkerFixture, WorkersFixture, reset_default_multi_repo_fixtures,
+    reset_multi_repo_fixtures,
 };
 pub use harness::{
-    CommandResult, HarnessConfig, HarnessError, HarnessResult, ProcessInfo, TestHarness,
-    TestHarnessBuilder, cleanup_stale_test_artifacts,
+    CommandResult, HarnessConfig, HarnessError, HarnessResult, ProcessInfo,
+    ReliabilityCommandRecord, ReliabilityFailureHook, ReliabilityFailureHookFlags,
+    ReliabilityLifecycleCommand, ReliabilityScenarioReport, ReliabilityScenarioSpec,
+    ReliabilityWorkerLifecycleHooks, TestHarness, TestHarnessBuilder, cleanup_stale_test_artifacts,
 };
 pub use logging::{
-    LogEntry, LogLevel, LogSource, LoggerConfig, TestLogSummary, TestLogger, TestLoggerBuilder,
+    LogEntry, LogLevel, LogSource, LoggerConfig, RELIABILITY_EVENT_SCHEMA_VERSION,
+    ReliabilityContext, ReliabilityEventInput, ReliabilityPhase, ReliabilityPhaseEvent,
+    TestLogSummary, TestLogger, TestLoggerBuilder,
 };
 pub use test_workers::{
     ENV_SKIP_WORKER_CHECK, ENV_TIMEOUT_SECS, ENV_WORKERS_CONFIG, TestConfigError, TestConfigResult,

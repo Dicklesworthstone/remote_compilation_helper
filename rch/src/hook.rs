@@ -17,6 +17,7 @@ use rch_common::{
     ColorMode, CommandPriority, CommandTimingBreakdown, CompilationKind, HookInput, HookOutput,
     OutputVisibility, RequiredRuntime, SelectedWorker, SelectionReason, SelectionResponse,
     SelfHealingConfig, ToolchainInfo, TransferConfig, WorkerConfig, WorkerId, classify_command,
+    normalize_project_path,
     ui::{
         ArtifactSummary, CelebrationSummary, CompilationProgress, CompletionCelebration, Icons,
         OutputContext, RchTheme, TransferProgress,
@@ -2085,16 +2086,40 @@ fn queue_when_busy_enabled() -> bool {
 }
 
 /// Extract project name from current working directory.
-fn extract_project_name() -> String {
+pub(crate) fn extract_project_name() -> String {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("unknown"));
-    let name = cwd
+    let normalized_cwd = match normalize_project_path(&cwd) {
+        Ok(normalized) => {
+            for decision in normalized.decision_trace() {
+                debug!("[RCH] project identity normalization: {}", decision);
+            }
+            normalized.canonical_path().to_path_buf()
+        }
+        Err(err) => {
+            warn!(
+                "Project path normalization failed for {}: {}",
+                cwd.display(),
+                err
+            );
+            for decision in err.decision_trace() {
+                debug!(
+                    "[RCH] project identity normalization failed at: {}",
+                    decision
+                );
+            }
+            cwd.clone()
+        }
+    };
+
+    let name = normalized_cwd
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "unknown".to_string());
 
-    // Compute short hash of the absolute path to ensure uniqueness
+    // Compute short hash of the canonical project path to ensure stable identity
+    // across equivalent aliases (for example /dp/repo and /data/projects/repo).
     // This prevents cache affinity collisions for projects with same dir name (e.g. "app")
-    let hash = blake3::hash(cwd.to_string_lossy().as_bytes()).to_hex();
+    let hash = blake3::hash(normalized_cwd.to_string_lossy().as_bytes()).to_hex();
     let short_hash = &hash[..8];
 
     format!("{}-{}", name, short_hash)
@@ -2279,12 +2304,23 @@ async fn execute_remote_compilation(
 ) -> anyhow::Result<RemoteExecutionResult> {
     let worker_config = selected_worker_to_config(worker);
 
-    // Get current working directory as project root
+    // Get current working directory and normalize it to the canonical project root.
     let project_root =
         std::env::current_dir().map_err(|e| TransferError::NoProjectRoot { source: e })?;
+    let normalized_project = normalize_project_path(&project_root).map_err(|e| {
+        anyhow::anyhow!(
+            "Project path normalization failed for {}: {}",
+            project_root.display(),
+            e
+        )
+    })?;
+    for decision in normalized_project.decision_trace() {
+        reporter.verbose(&format!("[RCH] project path normalized: {}", decision));
+    }
+    let normalized_project_root = normalized_project.canonical_path().to_path_buf();
 
-    let project_id = project_id_from_path(&project_root);
-    let project_hash = compute_project_hash(&project_root);
+    let project_id = project_id_from_path(&normalized_project_root);
+    let project_hash = compute_project_hash(&normalized_project_root);
 
     let output_ctx = OutputContext::detect();
     let console = RchConsole::with_context(output_ctx);
@@ -2308,7 +2344,7 @@ async fn execute_remote_compilation(
     // Create transfer pipeline with color mode, command timeout, and compilation kind
     let command_timeout = compilation_config.timeout_for_kind(kind);
     let mut pipeline = TransferPipeline::new(
-        project_root.clone(),
+        normalized_project_root.clone(),
         project_id.clone(),
         project_hash,
         transfer_config,
@@ -2772,7 +2808,7 @@ async fn send_test_run(socket_path: &str, record: &TestRunRecord) -> anyhow::Res
 mod tests {
     use super::*;
     use rch_common::mock::{
-        self, MockConfig, MockRsyncConfig, Phase, clear_mock_overrides, set_mock_enabled_override,
+        self, MockConfig, MockRsyncConfig, clear_mock_overrides, set_mock_enabled_override,
         set_mock_rsync_config_override, set_mock_ssh_config_override,
     };
     use rch_common::test_guard;

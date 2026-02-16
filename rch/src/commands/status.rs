@@ -3,18 +3,17 @@
 //! This module contains commands for diagnosing RCH behavior, running self-tests,
 //! and checking overall system status.
 
-use crate::hook::{query_daemon, release_worker, required_runtime_for_kind};
+use crate::hook::{extract_project_name, query_daemon, release_worker, required_runtime_for_kind};
 use crate::status_types::{
     DaemonFullStatusResponse, SelfTestHistoryResponse, SelfTestRunResponse, SelfTestStatusResponse,
     extract_json_body,
 };
 use crate::toolchain::detect_toolchain;
-use crate::transfer::project_id_from_path;
 use crate::ui::context::OutputContext;
 use crate::ui::progress::Spinner;
 use crate::ui::theme::StatusIndicator;
 use anyhow::{Context, Result};
-use rch_common::{ApiResponse, CommandPriority, RequiredRuntime};
+use rch_common::{ApiResponse, CommandPriority, RequiredRuntime, normalize_project_path};
 use std::path::Path;
 use tracing::debug;
 
@@ -302,12 +301,15 @@ pub async fn diagnose(command: &str, dry_run: bool, ctx: &OutputContext) -> Resu
     if would_intercept && daemon_status.reachable {
         let estimated_cores = 4;
         let project_root = std::env::current_dir().ok();
-        let project = project_root
+        let normalized_project_root = project_root.as_ref().and_then(|path| {
+            normalize_project_path(path)
+                .map(|normalized| normalized.canonical_path().to_path_buf())
+                .ok()
+        });
+        let project = extract_project_name();
+        let toolchain = normalized_project_root
             .as_ref()
-            .map(|path| project_id_from_path(path))
-            .unwrap_or_else(|| "unknown".to_string());
-        let toolchain = project_root
-            .as_ref()
+            .or(project_root.as_ref())
             .and_then(|root| detect_toolchain(root).ok());
 
         match query_daemon(

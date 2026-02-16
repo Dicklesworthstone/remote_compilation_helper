@@ -9,7 +9,9 @@
 pub mod api;
 pub mod artifact_verify;
 pub mod binary_hash;
+pub mod cargo_path_deps;
 pub mod config;
+pub mod dependency_closure_planner;
 pub mod discovery;
 pub mod e2e;
 pub mod errors;
@@ -17,6 +19,7 @@ pub mod hooks;
 pub mod logging;
 pub mod mock;
 pub mod mock_worker;
+pub mod path_topology;
 pub mod patterns;
 #[cfg(test)]
 mod patterns_security_test;
@@ -46,8 +49,24 @@ pub use artifact_verify::{
 pub use binary_hash::{
     BinaryHashResult, binaries_equivalent, binary_contains_marker, compute_binary_hash,
 };
+pub use cargo_path_deps::{
+    CargoPathDependencyEdge, CargoPathDependencyError, CargoPathDependencyErrorKind,
+    CargoPathDependencyGraph, CargoPathDependencyPackage, resolve_cargo_path_dependency_graph,
+    resolve_cargo_path_dependency_graph_with_policy,
+};
+pub use dependency_closure_planner::{
+    DependencyClosurePlan, DependencyClosurePlanState, DependencyPlanIssue, DependencyRiskClass,
+    DependencySyncAction, DependencySyncMetadata, DependencySyncReason,
+    build_dependency_closure_plan, build_dependency_closure_plan_with_policy,
+    plan_dependency_closure_from_graph,
+};
 pub use logging::{LogConfig, LogFormat, LoggingGuards, init_logging};
 pub use mock_worker::MockWorkerServer;
+pub use path_topology::{
+    DEFAULT_ALIAS_PROJECT_ROOT, DEFAULT_CANONICAL_PROJECT_ROOT, NormalizationDecision,
+    NormalizedProjectPath, PathNormalizationError, PathNormalizationErrorKind, PathTopologyPolicy,
+    normalize_project_path, normalize_project_path_with_policy,
+};
 pub use patterns::{
     Classification, ClassificationDetails, ClassificationTier, CompilationKind, TierDecision,
     classify_command, classify_command_detailed, split_shell_commands,

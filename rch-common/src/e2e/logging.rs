@@ -203,6 +203,100 @@ impl LogEntry {
     }
 }
 
+/// Stable schema version for reliability phase events.
+pub const RELIABILITY_EVENT_SCHEMA_VERSION: &str = "1.0.0";
+
+/// Reliability test phase used for lifecycle-oriented logging.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReliabilityPhase {
+    Setup,
+    Execute,
+    Verify,
+    Cleanup,
+}
+
+impl fmt::Display for ReliabilityPhase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let phase = match self {
+            Self::Setup => "setup",
+            Self::Execute => "execute",
+            Self::Verify => "verify",
+            Self::Cleanup => "cleanup",
+        };
+        write!(f, "{phase}")
+    }
+}
+
+/// Context payload attached to each reliability phase event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReliabilityContext {
+    pub worker_id: Option<String>,
+    pub repo_set: Vec<String>,
+    pub pressure_state: Option<String>,
+    pub triage_actions: Vec<String>,
+    pub decision_code: String,
+    pub fallback_reason: Option<String>,
+}
+
+impl ReliabilityContext {
+    /// Build a context with required decision code and no optional fields.
+    pub fn decision_only(decision_code: impl Into<String>) -> Self {
+        Self {
+            worker_id: None,
+            repo_set: Vec::new(),
+            pressure_state: None,
+            triage_actions: Vec::new(),
+            decision_code: decision_code.into(),
+            fallback_reason: None,
+        }
+    }
+}
+
+/// Machine-readable reliability phase event schema.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReliabilityPhaseEvent {
+    pub schema_version: String,
+    pub timestamp: DateTime<Utc>,
+    pub elapsed_ms: u64,
+    pub level: LogLevel,
+    pub phase: ReliabilityPhase,
+    pub scenario_id: String,
+    pub message: String,
+    pub context: ReliabilityContext,
+    pub artifact_paths: Vec<String>,
+}
+
+/// Input contract for emitting reliability phase events.
+#[derive(Debug, Clone)]
+pub struct ReliabilityEventInput {
+    pub level: LogLevel,
+    pub phase: ReliabilityPhase,
+    pub scenario_id: String,
+    pub message: String,
+    pub context: ReliabilityContext,
+    pub artifact_paths: Vec<String>,
+}
+
+impl ReliabilityEventInput {
+    /// Convenience constructor for phase+scenario+decision-only events.
+    pub fn with_decision(
+        phase: ReliabilityPhase,
+        scenario_id: impl Into<String>,
+        message: impl Into<String>,
+        decision_code: impl Into<String>,
+    ) -> Self {
+        Self {
+            level: LogLevel::Info,
+            phase,
+            scenario_id: scenario_id.into(),
+            message: message.into(),
+            context: ReliabilityContext::decision_only(decision_code),
+            artifact_paths: Vec::new(),
+        }
+    }
+}
+
 /// Configuration for the test logger
 #[derive(Debug, Clone)]
 pub struct LoggerConfig {
@@ -238,32 +332,57 @@ pub struct TestLogger {
     start_time: Instant,
     test_name: Arc<String>,
     file_writer: Arc<Mutex<Option<BufWriter<File>>>>,
+    reliability_writer: Arc<Mutex<Option<BufWriter<File>>>>,
+    reliability_log_path: Arc<Option<PathBuf>>,
+    artifact_root: Arc<Option<PathBuf>>,
 }
 
 impl TestLogger {
     /// Create a new test logger with the given configuration
     pub fn new(test_name: &str, config: LoggerConfig) -> Self {
-        let file_writer = if let Some(ref dir) = config.log_dir {
-            if fs::create_dir_all(dir).is_ok() {
-                let filename = format!(
-                    "{}_{}.jsonl",
-                    test_name.replace("::", "_").replace(" ", "_"),
-                    Utc::now().format("%Y%m%d_%H%M%S")
-                );
-                let path = dir.join(filename);
-                match File::create(&path) {
-                    Ok(f) => Some(BufWriter::new(f)),
-                    Err(e) => {
-                        eprintln!("Warning: Failed to create log file {}: {e}", path.display());
-                        None
-                    }
+        let mut file_writer = None;
+        let mut reliability_writer = None;
+        let mut reliability_log_path = None;
+        let mut artifact_root = None;
+
+        if let Some(ref dir) = config.log_dir
+            && fs::create_dir_all(dir).is_ok()
+        {
+            let sanitized_test_name = test_name.replace("::", "_").replace(' ', "_");
+            let timestamp = Utc::now().format("%Y%m%d_%H%M%S");
+
+            let log_path = dir.join(format!("{sanitized_test_name}_{timestamp}.jsonl"));
+            match File::create(&log_path) {
+                Ok(file) => file_writer = Some(BufWriter::new(file)),
+                Err(error) => {
+                    eprintln!(
+                        "Warning: Failed to create log file {}: {error}",
+                        log_path.display()
+                    );
                 }
-            } else {
-                None
             }
-        } else {
-            None
-        };
+
+            let reliability_path = dir.join(format!(
+                "reliability_{sanitized_test_name}_{timestamp}.jsonl"
+            ));
+            match File::create(&reliability_path) {
+                Ok(file) => {
+                    reliability_writer = Some(BufWriter::new(file));
+                    reliability_log_path = Some(reliability_path);
+                }
+                Err(error) => {
+                    eprintln!(
+                        "Warning: Failed to create reliability log file {}: {error}",
+                        reliability_path.display()
+                    );
+                }
+            }
+
+            let artifacts_dir = dir.join("artifacts");
+            if fs::create_dir_all(&artifacts_dir).is_ok() {
+                artifact_root = Some(artifacts_dir);
+            }
+        }
 
         Self {
             config: Arc::new(RwLock::new(config)),
@@ -271,6 +390,9 @@ impl TestLogger {
             start_time: Instant::now(),
             test_name: Arc::new(test_name.to_string()),
             file_writer: Arc::new(Mutex::new(file_writer)),
+            reliability_writer: Arc::new(Mutex::new(reliability_writer)),
+            reliability_log_path: Arc::new(reliability_log_path),
+            artifact_root: Arc::new(artifact_root),
         }
     }
 
@@ -339,6 +461,139 @@ impl TestLogger {
         entries.push_back(entry);
         if config.max_entries > 0 && entries.len() > config.max_entries {
             entries.pop_front();
+        }
+    }
+
+    /// Returns the reliability JSONL path if reliability logging is enabled.
+    pub fn reliability_log_path(&self) -> Option<&Path> {
+        self.reliability_log_path.as_deref()
+    }
+
+    /// Emit a structured reliability event using the stable schema contract.
+    pub fn log_reliability_event(&self, input: ReliabilityEventInput) -> ReliabilityPhaseEvent {
+        let event = ReliabilityPhaseEvent {
+            schema_version: RELIABILITY_EVENT_SCHEMA_VERSION.to_string(),
+            timestamp: Utc::now(),
+            elapsed_ms: self.start_time.elapsed().as_millis() as u64,
+            level: input.level,
+            phase: input.phase,
+            scenario_id: input.scenario_id,
+            message: input.message,
+            context: input.context,
+            artifact_paths: input.artifact_paths,
+        };
+
+        let mut log_context = vec![
+            ("schema_version".to_string(), event.schema_version.clone()),
+            ("phase".to_string(), event.phase.to_string()),
+            ("scenario_id".to_string(), event.scenario_id.clone()),
+            (
+                "decision_code".to_string(),
+                event.context.decision_code.clone(),
+            ),
+        ];
+        if let Some(worker_id) = event.context.worker_id.as_ref() {
+            log_context.push(("worker_id".to_string(), worker_id.clone()));
+        }
+        if !event.context.repo_set.is_empty() {
+            log_context.push(("repo_set".to_string(), event.context.repo_set.join(",")));
+        }
+        if let Some(pressure_state) = event.context.pressure_state.as_ref() {
+            log_context.push(("pressure_state".to_string(), pressure_state.clone()));
+        }
+        if !event.context.triage_actions.is_empty() {
+            log_context.push((
+                "triage_actions".to_string(),
+                event.context.triage_actions.join(","),
+            ));
+        }
+        if let Some(fallback_reason) = event.context.fallback_reason.as_ref() {
+            log_context.push(("fallback_reason".to_string(), fallback_reason.clone()));
+        }
+        if !event.artifact_paths.is_empty() {
+            log_context.push(("artifact_paths".to_string(), event.artifact_paths.join(",")));
+        }
+
+        self.log_with_context(
+            event.level,
+            LogSource::Harness,
+            format!("[{}] {}", event.phase, event.message),
+            log_context,
+        );
+
+        if let Ok(mut writer_guard) = self.reliability_writer.lock()
+            && let Some(ref mut writer) = *writer_guard
+            && let Ok(serialized) = serde_json::to_string(&event)
+        {
+            let _ = writeln!(writer, "{serialized}");
+            let _ = writer.flush();
+        }
+
+        event
+    }
+
+    /// Persist a text artifact for replay/postmortem analysis.
+    pub fn capture_artifact_text(
+        &self,
+        scenario_id: &str,
+        artifact_name: &str,
+        content: &str,
+    ) -> std::io::Result<PathBuf> {
+        let Some(artifact_root) = self.artifact_root.as_deref() else {
+            return Err(std::io::Error::other(
+                "artifact capture requires logger log_dir to be configured",
+            ));
+        };
+
+        let scenario_dir = artifact_root.join(Self::sanitize_artifact_component(scenario_id));
+        fs::create_dir_all(&scenario_dir)?;
+        let artifact_path = scenario_dir.join(format!(
+            "{}.txt",
+            Self::sanitize_artifact_component(artifact_name)
+        ));
+        fs::write(&artifact_path, content)?;
+        Ok(artifact_path)
+    }
+
+    /// Persist a JSON artifact for replay/postmortem analysis.
+    pub fn capture_artifact_json<T: Serialize>(
+        &self,
+        scenario_id: &str,
+        artifact_name: &str,
+        value: &T,
+    ) -> std::io::Result<PathBuf> {
+        let serialized = serde_json::to_string_pretty(value).map_err(|error| {
+            std::io::Error::other(format!("failed to serialize artifact json: {error}"))
+        })?;
+        let Some(artifact_root) = self.artifact_root.as_deref() else {
+            return Err(std::io::Error::other(
+                "artifact capture requires logger log_dir to be configured",
+            ));
+        };
+
+        let scenario_dir = artifact_root.join(Self::sanitize_artifact_component(scenario_id));
+        fs::create_dir_all(&scenario_dir)?;
+        let artifact_path = scenario_dir.join(format!(
+            "{}.json",
+            Self::sanitize_artifact_component(artifact_name)
+        ));
+        fs::write(&artifact_path, serialized)?;
+        Ok(artifact_path)
+    }
+
+    fn sanitize_artifact_component(raw: &str) -> String {
+        let mut cleaned = String::with_capacity(raw.len());
+        for ch in raw.chars() {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
+                cleaned.push(ch);
+            } else {
+                cleaned.push('_');
+            }
+        }
+        if cleaned.is_empty() {
+            "artifact".to_string()
+        } else {
+            cleaned
         }
     }
 
@@ -862,5 +1117,109 @@ mod tests {
             contents.contains("Test file write message"),
             "Log should contain message"
         );
+    }
+
+    #[test]
+    fn test_reliability_event_schema_contract() {
+        let temp_dir = tempfile::tempdir().expect("temp dir should be creatable");
+        let logger = TestLoggerBuilder::new("test_reliability_schema")
+            .log_dir(temp_dir.path())
+            .print_realtime(false)
+            .build();
+
+        let event = logger.log_reliability_event(ReliabilityEventInput {
+            level: LogLevel::Info,
+            phase: ReliabilityPhase::Execute,
+            scenario_id: "scenario-path-deps".to_string(),
+            message: "remote execution complete".to_string(),
+            context: ReliabilityContext {
+                worker_id: Some("worker-a".to_string()),
+                repo_set: vec!["/data/projects/repo-a".to_string()],
+                pressure_state: Some("disk:normal,memory:normal".to_string()),
+                triage_actions: vec!["none".to_string()],
+                decision_code: "REMOTE_OK".to_string(),
+                fallback_reason: None,
+            },
+            artifact_paths: vec!["/tmp/a.json".to_string()],
+        });
+
+        assert_eq!(event.schema_version, RELIABILITY_EVENT_SCHEMA_VERSION);
+        assert_eq!(event.phase, ReliabilityPhase::Execute);
+        assert_eq!(event.scenario_id, "scenario-path-deps");
+        assert_eq!(event.context.decision_code, "REMOTE_OK");
+
+        let reliability_path = logger
+            .reliability_log_path()
+            .expect("reliability log path should exist")
+            .to_path_buf();
+        let reliability_contents =
+            fs::read_to_string(&reliability_path).expect("should read reliability log");
+        let first_line = reliability_contents
+            .lines()
+            .next()
+            .expect("reliability log should contain one event");
+        let parsed: ReliabilityPhaseEvent =
+            serde_json::from_str(first_line).expect("reliability event should parse");
+        assert_eq!(parsed.schema_version, RELIABILITY_EVENT_SCHEMA_VERSION);
+        assert_eq!(parsed.phase, ReliabilityPhase::Execute);
+        assert_eq!(parsed.context.worker_id, Some("worker-a".to_string()));
+        assert_eq!(parsed.context.repo_set, vec!["/data/projects/repo-a"]);
+    }
+
+    #[test]
+    fn test_reliability_event_parser_compatibility() {
+        let json = r#"{
+            "schema_version":"1.0.0",
+            "timestamp":"2026-02-16T00:00:00Z",
+            "elapsed_ms":42,
+            "level":"info",
+            "phase":"verify",
+            "scenario_id":"scenario-x",
+            "message":"verify finished",
+            "context":{
+                "worker_id":"worker-1",
+                "repo_set":["/data/projects/repo-x","/dp/repo-y"],
+                "pressure_state":"disk:high",
+                "triage_actions":["trim-cache","kill-stuck-procs"],
+                "decision_code":"VERIFY_OK",
+                "fallback_reason":null
+            },
+            "artifact_paths":["/tmp/trace.json"]
+        }"#;
+
+        let event: ReliabilityPhaseEvent =
+            serde_json::from_str(json).expect("contract payload should deserialize");
+        assert_eq!(event.schema_version, "1.0.0");
+        assert_eq!(event.phase, ReliabilityPhase::Verify);
+        assert_eq!(event.context.decision_code, "VERIFY_OK");
+        assert_eq!(event.context.triage_actions.len(), 2);
+    }
+
+    #[test]
+    fn test_reliability_artifact_capture_text_and_json() {
+        let temp_dir = tempfile::tempdir().expect("temp dir should be creatable");
+        let logger = TestLoggerBuilder::new("test_reliability_artifacts")
+            .log_dir(temp_dir.path())
+            .print_realtime(false)
+            .build();
+
+        let text_path = logger
+            .capture_artifact_text("scenario-alpha", "stdout_capture", "hello world")
+            .expect("text artifact capture should succeed");
+        assert!(text_path.exists());
+        let text_contents = fs::read_to_string(&text_path).expect("read text artifact");
+        assert_eq!(text_contents, "hello world");
+
+        let json_path = logger
+            .capture_artifact_json(
+                "scenario-alpha",
+                "command_trace",
+                &serde_json::json!({ "cmd": "cargo test", "exit_code": 0 }),
+            )
+            .expect("json artifact capture should succeed");
+        assert!(json_path.exists());
+        let json_contents = fs::read_to_string(&json_path).expect("read json artifact");
+        assert!(json_contents.contains("\"cmd\""));
+        assert!(json_contents.contains("\"cargo test\""));
     }
 }
