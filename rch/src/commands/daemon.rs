@@ -623,48 +623,6 @@ pub async fn daemon_reload(ctx: &OutputContext) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use rch_common::test_guard;
-
-    #[test]
-    fn reload_api_response_parses_http_10_with_headers() {
-        let _guard = test_guard!();
-        let response = "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n{\"success\":true,\"added\":1,\"updated\":2,\"removed\":3,\"warnings\":[\"warn\"]}\n";
-        let json = extract_json_body(response).unwrap().trim();
-        let parsed: ReloadApiResponse = serde_json::from_str(json).unwrap();
-        assert!(parsed.success);
-        assert_eq!(parsed.added, 1);
-        assert_eq!(parsed.updated, 2);
-        assert_eq!(parsed.removed, 3);
-        assert_eq!(parsed.warnings, vec!["warn".to_string()]);
-    }
-
-    #[test]
-    fn reload_api_response_uses_default_success_for_legacy_payloads() {
-        let _guard = test_guard!();
-        let response = "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n{\"added\":0,\"updated\":0,\"removed\":0,\"warnings\":[]}\n";
-        let json = extract_json_body(response).unwrap().trim();
-        let parsed: ReloadApiResponse = serde_json::from_str(json).unwrap();
-        assert!(parsed.success);
-        assert_eq!(parsed.added, 0);
-        assert_eq!(parsed.updated, 0);
-        assert_eq!(parsed.removed, 0);
-        assert!(parsed.warnings.is_empty());
-    }
-
-    #[test]
-    fn reload_api_response_parses_failure_payload() {
-        let _guard = test_guard!();
-        let response = "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n{\"success\":false,\"error\":\"bad config\"}\n";
-        let json = extract_json_body(response).unwrap().trim();
-        let parsed: ReloadApiResponse = serde_json::from_str(json).unwrap();
-        assert!(!parsed.success);
-        assert_eq!(parsed.error.as_deref(), Some("bad config"));
-    }
-}
-
 /// Show daemon logs.
 pub fn daemon_logs(lines: usize, ctx: &OutputContext) -> Result<()> {
     let style = ctx.theme();
@@ -794,4 +752,46 @@ pub fn daemon_logs(lines: usize, ctx: &OutputContext) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rch_common::test_guard;
+
+    #[test]
+    fn reload_api_response_parses_http_10_with_headers() {
+        let _guard = test_guard!();
+        let response = "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n{\"success\":true,\"added\":1,\"updated\":2,\"removed\":3,\"warnings\":[\"warn\"]}\n";
+        let json = extract_json_body(response).unwrap().trim();
+        let parsed: ReloadApiResponse = serde_json::from_str(json).unwrap();
+        assert!(parsed.success);
+        assert_eq!(parsed.added, 1);
+        assert_eq!(parsed.updated, 2);
+        assert_eq!(parsed.removed, 3);
+        assert_eq!(parsed.warnings, vec!["warn".to_string()]);
+    }
+
+    #[test]
+    fn reload_api_response_uses_default_success_for_legacy_payloads() {
+        let _guard = test_guard!();
+        let response = "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n{\"added\":0,\"updated\":0,\"removed\":0,\"warnings\":[]}\n";
+        let json = extract_json_body(response).unwrap().trim();
+        let parsed: ReloadApiResponse = serde_json::from_str(json).unwrap();
+        assert!(parsed.success);
+        assert_eq!(parsed.added, 0);
+        assert_eq!(parsed.updated, 0);
+        assert_eq!(parsed.removed, 0);
+        assert!(parsed.warnings.is_empty());
+    }
+
+    #[test]
+    fn reload_api_response_parses_failure_payload() {
+        let _guard = test_guard!();
+        let response = "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n{\"success\":false,\"error\":\"bad config\"}\n";
+        let json = extract_json_body(response).unwrap().trim();
+        let parsed: ReloadApiResponse = serde_json::from_str(json).unwrap();
+        assert!(!parsed.success);
+        assert_eq!(parsed.error.as_deref(), Some("bad config"));
+    }
 }

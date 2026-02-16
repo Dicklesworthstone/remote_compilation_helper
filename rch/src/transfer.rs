@@ -6,7 +6,9 @@
 use crate::error::TransferError;
 use anyhow::{Context, Result};
 use rch_common::mock::{self, MockConfig, MockRsync, MockRsyncConfig, MockSshClient};
-use rch_common::ssh_utils::{EnvPrefix, build_env_prefix, is_retryable_transport_error};
+use rch_common::ssh_utils::{
+    EnvPrefix, is_retryable_transport_error, is_valid_env_key, shell_escape_value,
+};
 use rch_common::{
     ColorMode, CommandResult, CompilationKind, RetryConfig, ToolchainInfo, TransferConfig,
     WorkerConfig, wrap_command_with_color, wrap_command_with_toolchain,
@@ -222,6 +224,15 @@ fn validate_project_hash(hash: &str) -> String {
     hash.to_string()
 }
 
+/// Remote environment application plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RemoteEnvPlan {
+    /// Shell-safe environment variable prefix.
+    env_prefix: EnvPrefix,
+    /// Directories that must exist before command execution.
+    ensure_dirs: Vec<String>,
+}
+
 impl TransferPipeline {
     /// Create a new transfer pipeline.
     ///
@@ -335,15 +346,113 @@ impl TransferPipeline {
         self
     }
 
-    fn build_env_prefix(&self) -> EnvPrefix {
-        build_env_prefix(&self.env_allowlist, |key| {
-            if let Some(ref overrides) = self.env_overrides
-                && let Some(value) = overrides.get(key)
-            {
-                return Some(value.clone());
+    fn env_value(&self, key: &str) -> Option<String> {
+        if let Some(ref overrides) = self.env_overrides
+            && let Some(value) = overrides.get(key)
+        {
+            return Some(value.clone());
+        }
+        std::env::var(key).ok()
+    }
+
+    fn rewrite_remote_env_value(
+        &self,
+        key: &str,
+        value: &str,
+        remote_path: &str,
+    ) -> (String, Option<String>, bool) {
+        match key {
+            // Absolute or host-specific target directories are brittle on workers.
+            // Force a remote-scoped target dir rooted in the synchronized project.
+            "CARGO_TARGET_DIR" => {
+                let target_dir = format!("{remote_path}/.rch-target");
+                (
+                    target_dir.clone(),
+                    Some(target_dir.clone()),
+                    target_dir != value,
+                )
             }
-            std::env::var(key).ok()
-        })
+            // Temporary directories may point to host-only volatile mounts (e.g. /data/tmp).
+            // Keep temp files project-scoped on the worker for stability.
+            "TMPDIR" | "TMP" | "TEMP" => {
+                let temp_dir = format!("{remote_path}/.rch-tmp");
+                (temp_dir.clone(), Some(temp_dir.clone()), temp_dir != value)
+            }
+            _ => (value.to_string(), None, false),
+        }
+    }
+
+    fn build_remote_env_plan(&self, remote_path: &str) -> RemoteEnvPlan {
+        let mut parts = Vec::new();
+        let mut applied = Vec::new();
+        let mut rejected = Vec::new();
+        let mut ensure_dirs = Vec::new();
+
+        for raw_key in &self.env_allowlist {
+            let key = raw_key.trim();
+            if key.is_empty() {
+                continue;
+            }
+            if !is_valid_env_key(key) {
+                info!(
+                    "Rejecting env var '{}': invalid key name (must start with letter/underscore, contain only alphanumeric/underscore)",
+                    key
+                );
+                rejected.push(key.to_string());
+                continue;
+            }
+
+            let Some(original_value) = self.env_value(key) else {
+                continue;
+            };
+
+            let (effective_value, ensure_dir, rewritten) =
+                self.rewrite_remote_env_value(key, &original_value, remote_path);
+            if rewritten {
+                info!(
+                    "Rewriting {} for remote execution (worker-scoped path): {} -> {}",
+                    key, original_value, effective_value
+                );
+            }
+
+            let Some(escaped) = shell_escape_value(&effective_value) else {
+                info!(
+                    "Rejecting env var '{}': value contains unsafe characters (newline, carriage return, or NUL)",
+                    key
+                );
+                rejected.push(key.to_string());
+                continue;
+            };
+
+            if let Some(dir) = ensure_dir
+                && !ensure_dirs.iter().any(|existing| existing == &dir)
+            {
+                ensure_dirs.push(dir);
+            }
+
+            parts.push(format!("{key}={escaped}"));
+            applied.push(key.to_string());
+        }
+
+        let prefix = if parts.is_empty() {
+            String::new()
+        } else {
+            format!("{} ", parts.join(" "))
+        };
+
+        RemoteEnvPlan {
+            env_prefix: EnvPrefix {
+                prefix,
+                applied,
+                rejected,
+            },
+            ensure_dirs,
+        }
+    }
+
+    #[cfg(test)]
+    fn build_env_prefix(&self) -> EnvPrefix {
+        self.build_remote_env_plan(&self.remote_path()).env_prefix
     }
 
     /// Get the effective exclude patterns by merging config defaults with .rchignore.
@@ -394,17 +503,17 @@ impl TransferPipeline {
         let escaped_remote_path = escape(Cow::from(&remote_path));
         let toolchain_command = wrap_command_with_toolchain(command, toolchain);
 
-        let env_prefix = self.build_env_prefix();
-        if !env_prefix.applied.is_empty() {
-            debug!("Forwarding env vars: {:?}", env_prefix.applied);
+        let env_plan = self.build_remote_env_plan(&remote_path);
+        if !env_plan.env_prefix.applied.is_empty() {
+            debug!("Forwarding env vars: {:?}", env_plan.env_prefix.applied);
         }
-        if !env_prefix.rejected.is_empty() {
-            warn!("Skipping env vars: {:?}", env_prefix.rejected);
+        if !env_plan.env_prefix.rejected.is_empty() {
+            warn!("Skipping env vars: {:?}", env_plan.env_prefix.rejected);
         }
-        let env_command = if env_prefix.prefix.is_empty() {
+        let env_command = if env_plan.env_prefix.prefix.is_empty() {
             toolchain_command
         } else {
-            format!("{}{}", env_prefix.prefix, toolchain_command)
+            format!("{}{}", env_plan.env_prefix.prefix, toolchain_command)
         };
 
         // Apply color mode environment variables
@@ -417,11 +526,26 @@ impl TransferPipeline {
         // The `timeout` command provides a hard kill that works even for CPU-bound loops.
         let timeout_wrapped_command = self.wrap_with_external_timeout(&colored_command);
 
-        // Force LC_ALL=C to ensure English output for error parsing
-        // Wrap command to run in project directory
+        // Ensure remote-scoped env directories exist before build execution.
+        let ensure_dirs_command = if env_plan.ensure_dirs.is_empty() {
+            String::new()
+        } else {
+            let escaped_dirs = env_plan
+                .ensure_dirs
+                .iter()
+                .map(|dir| escape(Cow::from(dir.as_str())).to_string())
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!("mkdir -p {} && ", escaped_dirs)
+        };
+
+        // Force LC_ALL=C to ensure English output for error parsing.
+        // Touching the remote root refreshes directory mtime so age-based cleanup
+        // treats actively used caches as hot.
+        // Wrap command to run in project directory.
         format!(
-            "export LC_ALL=C; cd {} && {}",
-            escaped_remote_path, timeout_wrapped_command
+            "export LC_ALL=C; touch {} && cd {} && {}{}",
+            escaped_remote_path, escaped_remote_path, ensure_dirs_command, timeout_wrapped_command
         )
     }
 
@@ -2499,6 +2623,66 @@ mod tests {
 
         mock::clear_mock_overrides();
         mock::clear_global_invocations();
+    }
+
+    #[test]
+    fn test_build_remote_command_rewrites_cargo_target_dir_and_tmpdir() {
+        let _guard = test_guard!();
+        let mut overrides = HashMap::new();
+        overrides.insert(
+            "CARGO_TARGET_DIR".to_string(),
+            "/data/tmp/pi_agent_rust/pearleagle".to_string(),
+        );
+        overrides.insert(
+            "TMPDIR".to_string(),
+            "/data/tmp/pi_agent_rust/pearleagle/tmp".to_string(),
+        );
+
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/tmp/project"),
+            "project".to_string(),
+            "hash".to_string(),
+            TransferConfig::default(),
+        )
+        .with_env_allowlist(vec!["CARGO_TARGET_DIR".to_string(), "TMPDIR".to_string()])
+        .with_env_overrides(overrides);
+
+        let worker_scoped_root = pipeline.remote_path();
+        let command = pipeline.build_remote_command("cargo test --no-run", None);
+        assert!(command.contains(&format!(
+            "CARGO_TARGET_DIR='{}/.rch-target'",
+            worker_scoped_root
+        )));
+        assert!(command.contains(&format!("TMPDIR='{}/.rch-tmp'", worker_scoped_root)));
+        assert!(command.contains("mkdir -p"));
+        assert!(command.contains(&format!("{}/.rch-target", worker_scoped_root)));
+        assert!(command.contains(&format!("{}/.rch-tmp", worker_scoped_root)));
+        assert!(command.contains("touch "));
+        assert!(
+            !command.contains("/data/tmp/pi_agent_rust/pearleagle"),
+            "host-local tmpfs path should not be forwarded to worker"
+        );
+        assert!(command.contains(&worker_scoped_root));
+    }
+
+    #[test]
+    fn test_build_remote_command_keeps_non_special_env_values() {
+        let _guard = test_guard!();
+        let mut overrides = HashMap::new();
+        overrides.insert("RUSTFLAGS".to_string(), "-C target-cpu=native".to_string());
+
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/tmp/project"),
+            "project".to_string(),
+            "hash".to_string(),
+            TransferConfig::default(),
+        )
+        .with_env_allowlist(vec!["RUSTFLAGS".to_string()])
+        .with_env_overrides(overrides);
+
+        let command = pipeline.build_remote_command("cargo build", None);
+        assert!(command.contains("RUSTFLAGS='-C target-cpu=native'"));
+        assert!(command.contains("cargo build"));
     }
 
     #[test]

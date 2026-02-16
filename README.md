@@ -508,6 +508,9 @@ exclude_patterns = [            # Additional excludes
 
 [environment]
 allowlist = ["RUSTFLAGS", "CARGO_TARGET_DIR"]
+# Reliability note:
+# If forwarded, CARGO_TARGET_DIR/TMPDIR/TMP/TEMP are remapped by RCH
+# to worker-scoped directories under the remote project root.
 ```
 
 ### Environment Variables

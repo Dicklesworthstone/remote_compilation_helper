@@ -1847,7 +1847,9 @@ exclude_patterns = [
 ]
 
 [environment]
-# Env vars to forward to workers
+# Env vars to forward to workers.
+# Note: CARGO_TARGET_DIR/TMPDIR/TMP/TEMP are automatically rewritten
+# to worker-scoped paths under the remote project root for reliability.
 allowlist = ["RUSTFLAGS", "CARGO_TARGET_DIR"]
 
 [output]
