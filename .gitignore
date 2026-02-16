@@ -38,3 +38,32 @@ target_dusty_eagle/
 target-upgrade/
 target-local/
 logs/
+
+# Ephemeral files (agent-generated, build artifacts, test detritus)
+ci-artifacts/
+proptest-regressions/
+test_meminfo
+
+# Agent session ephemeral files
+SESSION_TODO.md
+SESSION_REPORT.md
+SESSION_*.md
+verify_*.sh
+newfile.txt
+repro_*.rs
+
+# Local scratch DBs
+storage.sqlite3
+storage.sqlite3-*
+
+# bv graph output
+--graph-format.svg
+
+# Agent coordination config
+.agent-mail.yaml
+
+# Beads history snapshots
+.beads/.br_history/
+
+# Claude local settings
+.claude/settings.local.json
