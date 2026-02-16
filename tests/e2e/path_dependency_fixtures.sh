@@ -39,6 +39,14 @@ run_fixture_tests() {
   )
 }
 
+run_bootstrap_topology_tests() {
+  log "running worker bootstrap topology enforcement tests"
+  (
+    cd "$PROJECT_ROOT"
+    cargo test -p rch topology_bootstrap_ -- --nocapture
+  )
+}
+
 main() {
   require_cmd cargo
   require_cmd readlink
@@ -47,6 +55,7 @@ main() {
   assert_topology
 
   run_fixture_tests
+  run_bootstrap_topology_tests
 
   log "PASS: path dependency fixture generation/reset checks are healthy"
 }
