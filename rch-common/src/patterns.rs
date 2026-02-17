@@ -3309,7 +3309,6 @@ mod tests {
             );
             assert!(result.reason.contains("chained"));
         }
-
         // --- Classification integration: should classify as NON-COMPILATION ---
 
         #[test]

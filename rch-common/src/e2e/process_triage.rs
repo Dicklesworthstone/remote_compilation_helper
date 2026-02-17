@@ -657,6 +657,7 @@ pub fn process_triage_response_schema() -> RootSchema {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
 
     fn sample_request() -> ProcessTriageRequest {
         ProcessTriageRequest {
@@ -696,6 +697,93 @@ mod tests {
                 signal: Some("TERM".to_string()),
             }],
         }
+    }
+
+    fn extract_ref_name(schema: &Value) -> Option<String> {
+        if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+            return reference.rsplit('/').next().map(str::to_string);
+        }
+
+        for key in ["anyOf", "oneOf", "allOf"] {
+            if let Some(reference) =
+                schema
+                    .get(key)
+                    .and_then(Value::as_array)
+                    .and_then(|variants| {
+                        variants
+                            .iter()
+                            .find_map(|variant| variant.get("$ref").and_then(Value::as_str))
+                    })
+            {
+                return reference.rsplit('/').next().map(str::to_string);
+            }
+        }
+
+        None
+    }
+
+    fn find_schema_properties(
+        schema_json: &Value,
+        required: &[&str],
+    ) -> serde_json::Map<String, Value> {
+        let root_properties = schema_json
+            .get("properties")
+            .and_then(Value::as_object)
+            .filter(|properties| required.iter().all(|key| properties.contains_key(*key)))
+            .cloned();
+        if let Some(properties) = root_properties {
+            return properties;
+        }
+
+        let definition_properties = schema_json
+            .get("definitions")
+            .and_then(Value::as_object)
+            .and_then(|definitions| {
+                definitions.values().find_map(|node| {
+                    let properties = node.get("properties")?.as_object()?;
+                    if required.iter().all(|key| properties.contains_key(*key)) {
+                        Some(properties.clone())
+                    } else {
+                        None
+                    }
+                })
+            });
+        if let Some(properties) = definition_properties {
+            return properties;
+        }
+
+        panic!("schema properties not found for required keys: {required:?}");
+    }
+
+    fn definition_properties(
+        schema_json: &Value,
+        definition_name: &str,
+    ) -> serde_json::Map<String, Value> {
+        schema_json
+            .get("definitions")
+            .and_then(Value::as_object)
+            .and_then(|definitions| definitions.get(definition_name))
+            .and_then(|definition| definition.get("properties"))
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_else(|| panic!("definition '{definition_name}' missing properties"))
+    }
+
+    fn definition_enum(schema_json: &Value, definition_name: &str) -> Vec<String> {
+        schema_json
+            .get("definitions")
+            .and_then(Value::as_object)
+            .and_then(|definitions| definitions.get(definition_name))
+            .and_then(|definition| definition.get("enum"))
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_else(|| panic!("definition '{definition_name}' missing enum values"))
     }
 
     #[test]
@@ -829,6 +917,77 @@ mod tests {
         assert!(properties.contains_key("schema_version"));
         assert!(properties.contains_key("worker_id"));
         assert!(properties.contains_key("requested_actions"));
+    }
+
+    #[test]
+    fn process_triage_contract_response_schema_requires_audit_record() {
+        let schema = process_triage_response_schema();
+        let schema_json = serde_json::to_value(&schema).expect("schema to json");
+        let response_properties =
+            find_schema_properties(&schema_json, &["status", "executed_actions", "audit"]);
+        let audit_schema = response_properties
+            .get("audit")
+            .expect("response schema should contain audit field");
+        let audit_properties = if let Some(definition_name) = extract_ref_name(audit_schema) {
+            definition_properties(&schema_json, &definition_name)
+        } else {
+            audit_schema
+                .get("properties")
+                .and_then(Value::as_object)
+                .cloned()
+                .expect("audit schema should provide properties")
+        };
+
+        assert!(audit_properties.contains_key("policy_version"));
+        assert!(audit_properties.contains_key("decision_code"));
+        assert!(audit_properties.contains_key("audit_required"));
+    }
+
+    #[test]
+    fn process_triage_contract_response_schema_exposes_failure_kind_taxonomy() {
+        let schema = process_triage_response_schema();
+        let schema_json = serde_json::to_value(&schema).expect("schema to json");
+        let response_properties = find_schema_properties(&schema_json, &["status", "failure"]);
+        let failure_schema = response_properties
+            .get("failure")
+            .expect("response schema should contain failure field");
+        let failure_definition = extract_ref_name(failure_schema)
+            .expect("failure field should reference ProcessTriageFailure schema");
+        let failure_properties = definition_properties(&schema_json, &failure_definition);
+        let kind_schema = failure_properties
+            .get("kind")
+            .expect("failure schema should contain kind field");
+        let kind_values = if let Some(definition_name) = extract_ref_name(kind_schema) {
+            definition_enum(&schema_json, &definition_name)
+        } else {
+            kind_schema
+                .get("enum")
+                .and_then(Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .expect("kind schema should expose enum values")
+        };
+
+        for expected in [
+            "detector_uncertain",
+            "policy_violation",
+            "transport_error",
+            "executor_runtime_error",
+            "timeout",
+            "partial_result",
+            "invalid_request",
+        ] {
+            assert!(
+                kind_values.iter().any(|value| value == expected),
+                "missing failure kind: {}",
+                expected
+            );
+        }
     }
 
     #[test]
