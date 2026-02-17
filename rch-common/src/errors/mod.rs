@@ -9,9 +9,13 @@
 //! | Range      | Category    | Description                          |
 //! |------------|-------------|--------------------------------------|
 //! | E001-E099  | Config      | Configuration and setup errors       |
+//! | E013-E018  |   PathDeps  |   Path-dependency resolution errors  |
+//! | E019-E024  |   Closure   |   Dependency-closure planner errors  |
 //! | E100-E199  | Network     | Network and SSH connectivity         |
 //! | E200-E299  | Worker      | Worker selection and management      |
+//! | E210-E219  |   Storage   |   Disk pressure and storage errors   |
 //! | E300-E399  | Build       | Compilation and build errors         |
+//! | E310-E319  |   Triage    |   Process triage integration errors  |
 //! | E400-E499  | Transfer    | File transfer and sync errors        |
 //! | E500-E599  | Internal    | Internal/unexpected errors           |
 

@@ -914,6 +914,292 @@ impl std::fmt::Display for ArtifactRetrievalWarning {
 }
 
 // =============================================================================
+// Path-Dependency Errors
+// =============================================================================
+
+/// Errors related to Cargo path-dependency resolution.
+///
+/// Error code range: RCH-E013 to RCH-E018
+#[derive(Error, Diagnostic, Debug)]
+pub enum PathDepError {
+    /// Cargo manifest could not be parsed during dependency resolution.
+    #[error("Manifest parse failure in {manifest_path}: {detail}")]
+    #[diagnostic(
+        code("RCH-E013"),
+        help("Check Cargo.toml syntax with 'cargo verify-project'")
+    )]
+    ManifestParseFailed {
+        manifest_path: String,
+        detail: String,
+    },
+
+    /// Path dependency target directory not found.
+    #[error("Path dependency '{dep_name}' not found at {dep_path}")]
+    #[diagnostic(
+        code("RCH-E014"),
+        help("Verify the path in Cargo.toml [dependencies] exists on disk")
+    )]
+    Missing {
+        dep_name: String,
+        dep_path: String,
+        manifest_path: String,
+    },
+
+    /// Cyclic path dependency detected.
+    #[error("Cyclic path dependency: {cycle_desc}")]
+    #[diagnostic(
+        code("RCH-E015"),
+        help("Break the dependency cycle by restructuring crate boundaries")
+    )]
+    Cyclic { cycle_desc: String },
+
+    /// Path dependency violates canonical-root topology policy.
+    #[error("Path dependency at {dep_path} violates canonical-root policy: {reason}")]
+    #[diagnostic(
+        code("RCH-E016"),
+        help("Ensure all path dependencies are under the canonical root (/data/projects)")
+    )]
+    PolicyViolation { dep_path: String, reason: String },
+
+    /// cargo metadata invocation failed.
+    #[error("cargo metadata failed for {manifest_path}: {detail}")]
+    #[diagnostic(
+        code("RCH-E017"),
+        help("Try running 'cargo metadata --format-version=1' manually")
+    )]
+    MetadataFailed {
+        manifest_path: String,
+        detail: String,
+    },
+
+    /// cargo metadata output could not be parsed.
+    #[error("cargo metadata parse failure for {manifest_path}: {detail}")]
+    #[diagnostic(
+        code("RCH-E018"),
+        help("Check cargo version compatibility with the workspace layout")
+    )]
+    MetadataParseFailed {
+        manifest_path: String,
+        detail: String,
+    },
+}
+
+// =============================================================================
+// Dependency-Closure Errors
+// =============================================================================
+
+/// Errors related to dependency-closure planning.
+///
+/// Error code range: RCH-E019 to RCH-E024
+#[derive(Error, Diagnostic, Debug)]
+pub enum ClosureError {
+    /// Closure plan computation failed entirely.
+    #[error("Dependency closure plan failed: {reason}")]
+    #[diagnostic(
+        code("RCH-E019"),
+        help("Check path dependency graph health with 'cargo metadata'")
+    )]
+    PlanFailed { reason: String },
+
+    /// Closure entered fail-open state.
+    #[error("Dependency closure fail-open: {reason}")]
+    #[diagnostic(
+        code("RCH-E020"),
+        help("Transfer will proceed with project root only (fail-open semantics)")
+    )]
+    FailOpen { reason: String },
+
+    /// High-risk dependencies in closure.
+    #[error("High-risk path dependencies in closure: {detail}")]
+    #[diagnostic(
+        code("RCH-E021"),
+        help("Review the high-risk dependencies flagged in the plan")
+    )]
+    HighRisk { detail: String },
+
+    /// Missing closure data.
+    #[error("Required closure data missing: {detail}")]
+    #[diagnostic(
+        code("RCH-E022"),
+        help("Ensure Cargo.toml and Cargo.lock are present and valid")
+    )]
+    MissingData { detail: String },
+
+    /// Non-deterministic ordering.
+    #[error("Closure sync ordering is non-deterministic")]
+    #[diagnostic(
+        code("RCH-E023"),
+        help("Report this as a bug — closure ordering must be deterministic")
+    )]
+    NonDeterministic,
+
+    /// Fingerprint mismatch.
+    #[error("Closure manifest fingerprint mismatch: {detail}")]
+    #[diagnostic(
+        code("RCH-E024"),
+        help("Recompute the closure plan to pick up latest manifests")
+    )]
+    FingerprintMismatch { detail: String },
+}
+
+// =============================================================================
+// Disk Pressure / Storage Errors
+// =============================================================================
+
+/// Errors related to worker disk pressure and storage management.
+///
+/// Error code range: RCH-E210 to RCH-E217
+#[derive(Error, Diagnostic, Debug)]
+pub enum StorageError {
+    /// Worker disk usage is critically high.
+    #[error("Worker '{worker_id}' disk pressure critical ({disk_free_gb:.1} GB free)")]
+    #[diagnostic(
+        code("RCH-E210"),
+        help("Clean up old builds: rch cache clean --worker {worker_id}")
+    )]
+    DiskPressureCritical {
+        worker_id: String,
+        disk_free_gb: f64,
+    },
+
+    /// Worker disk usage warning.
+    #[error("Worker '{worker_id}' disk pressure warning ({disk_free_gb:.1} GB free)")]
+    #[diagnostic(
+        code("RCH-E211"),
+        help("Monitor disk usage trend to prevent critical state")
+    )]
+    DiskPressureWarning {
+        worker_id: String,
+        disk_free_gb: f64,
+    },
+
+    /// Telemetry gap — pressure assessment unreliable.
+    #[error("Worker '{worker_id}' disk telemetry stale (age: {age_secs}s)")]
+    #[diagnostic(
+        code("RCH-E212"),
+        help("Check worker health: rch workers probe {worker_id}")
+    )]
+    TelemetryGap { worker_id: String, age_secs: u64 },
+
+    /// Disk I/O utilization too high.
+    #[error("Worker '{worker_id}' disk I/O utilization at {io_util_pct:.0}%")]
+    #[diagnostic(
+        code("RCH-E213"),
+        help("Wait for I/O-heavy operations to complete on the worker")
+    )]
+    DiskIoHigh { worker_id: String, io_util_pct: f64 },
+
+    /// Memory pressure exceeds threshold.
+    #[error("Worker '{worker_id}' memory pressure high ({pressure:.1}%)")]
+    #[diagnostic(
+        code("RCH-E214"),
+        help("Review worker slot count to prevent over-scheduling")
+    )]
+    MemoryPressureHigh { worker_id: String, pressure: f64 },
+
+    /// Reclaim operation failed.
+    #[error("Disk reclaim failed on worker '{worker_id}': {reason}")]
+    #[diagnostic(
+        code("RCH-E215"),
+        help("Check worker filesystem health and permissions")
+    )]
+    ReclaimFailed { worker_id: String, reason: String },
+
+    /// Insufficient headroom for build.
+    #[error(
+        "Insufficient disk headroom on '{worker_id}': need {needed_gb:.1} GB, have {free_gb:.1} GB"
+    )]
+    #[diagnostic(code("RCH-E216"), help("Try a different worker with more headroom"))]
+    HeadroomInsufficient {
+        worker_id: String,
+        needed_gb: f64,
+        free_gb: f64,
+    },
+
+    /// Active build protection prevented reclaim.
+    #[error("Active build on '{worker_id}' prevented reclaim of {protected_path}")]
+    #[diagnostic(
+        code("RCH-E217"),
+        help("Wait for current builds to complete before retrying reclaim")
+    )]
+    ReclaimProtected {
+        worker_id: String,
+        protected_path: String,
+    },
+}
+
+// =============================================================================
+// Process Triage Errors
+// =============================================================================
+
+/// Errors related to process triage integration.
+///
+/// Error code range: RCH-E310 to RCH-E317
+#[derive(Error, Diagnostic, Debug)]
+pub enum ProcessTriageError {
+    /// Adapter binary unavailable.
+    #[error("Process triage adapter unavailable: {detail}")]
+    #[diagnostic(
+        code("RCH-E310"),
+        help("Ensure the process triage adapter binary is installed")
+    )]
+    AdapterUnavailable { detail: String },
+
+    /// Detector classification uncertain.
+    #[error("Process detector uncertain: {detail}")]
+    #[diagnostic(
+        code("RCH-E311"),
+        help("Review the process list manually for suspicious entries")
+    )]
+    DetectorUncertain { detail: String },
+
+    /// Action violates safe-action policy.
+    #[error("Process triage policy violation: {action} blocked by {policy_rule}")]
+    #[diagnostic(
+        code("RCH-E312"),
+        help("Use a lower-risk action class or request manual approval")
+    )]
+    PolicyViolation { action: String, policy_rule: String },
+
+    /// Transport error.
+    #[error("Process triage transport error: {detail}")]
+    #[diagnostic(
+        code("RCH-E313"),
+        help("Verify the adapter process is running and responsive")
+    )]
+    TransportError { detail: String },
+
+    /// Executor runtime error.
+    #[error("Process triage executor error: {detail}")]
+    #[diagnostic(code("RCH-E314"), help("Check adapter logs for detailed error output"))]
+    ExecutorError { detail: String },
+
+    /// Operation timed out.
+    #[error("Process triage timed out after {timeout_secs}s")]
+    #[diagnostic(
+        code("RCH-E315"),
+        help("Increase timeout in ProcessTriageTimeoutPolicy if needed")
+    )]
+    Timeout { timeout_secs: u64 },
+
+    /// Partial/incomplete results.
+    #[error("Process triage partial result: {completed}/{total} actions completed")]
+    #[diagnostic(
+        code("RCH-E316"),
+        help("Retry failed actions individually for better diagnostics")
+    )]
+    PartialResult { completed: usize, total: usize },
+
+    /// Invalid request.
+    #[error("Invalid process triage request: {detail}")]
+    #[diagnostic(
+        code("RCH-E317"),
+        help("Validate request against the ProcessTriage contract schema")
+    )]
+    InvalidRequest { detail: String },
+}
+
+// =============================================================================
 // Platform Errors
 // =============================================================================
 

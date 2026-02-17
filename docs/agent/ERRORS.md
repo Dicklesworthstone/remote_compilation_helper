@@ -12,17 +12,20 @@ For full remediation details and the JSON error envelope, see `docs/api/error-co
 
 ## Error Code Ranges (Authoritative)
 
-| Range     | Category    | Source Type in Code       |
-|-----------|-------------|---------------------------|
-| E001-E012 | Config      | `ConfigError`             |
-| E100-E113 | SSH         | `SshError`                |
-| E200-E210 | Worker      | `WorkerError`             |
-| E300-E308 | Daemon      | `DaemonError`             |
-| E400-E409 | Transfer    | `TransferError`           |
-| E500-E505 | Hook        | `HookError`               |
-| E506-E510 | Update      | `UpdateError`             |
+| Range     | Category         | Source Type in Code       |
+|-----------|------------------|---------------------------|
+| E001-E012 | Config           | `ConfigError`             |
+| E013-E018 | Config/PathDeps  | `PathDepError`            |
+| E019-E024 | Config/Closure   | `ClosureError`            |
+| E100-E113 | SSH              | `SshError`                |
+| E200-E209 | Worker           | `WorkerError`             |
+| E210-E217 | Worker/Storage   | `StorageError`            |
+| E300-E309 | Build            | `BuildCompilationFailed`  |
+| E310-E317 | Build/Triage     | `ProcessTriageError`      |
+| E400-E409 | Transfer         | `TransferError`           |
+| E500-E509 | Internal         | `InternalDaemonSocket`    |
 
-> **Note:** The table below may include legacy codes. For authoritative definitions, see `rch/src/error.rs`.
+> **Note:** For authoritative definitions, see `rch-common/src/errors/catalog.rs` and `rch/src/error.rs`.
 
 ## Registry
 
@@ -38,6 +41,18 @@ For full remediation details and the JSON error envelope, see `docs/api/error-co
 | `RCH-E008` | `config` | `ConfigInvalidWorker` | Worker configuration is invalid | Verify worker hostname is correct |
 | `RCH-E009` | `config` | `ConfigSshKeyError` | SSH key path is invalid or inaccessible | Check that the SSH key file exists |
 | `RCH-E010` | `config` | `ConfigSocketPathError` | Socket path is invalid or inaccessible | Check directory permissions for socket path |
+| `RCH-E013` | `config` | `PathDepManifestParseFailed` | Cargo manifest parse failure during path-dependency resolution | Check Cargo.toml syntax with `cargo verify-project` |
+| `RCH-E014` | `config` | `PathDepMissing` | Path dependency declared but target directory not found | Verify the path in Cargo.toml `[dependencies]` exists on disk |
+| `RCH-E015` | `config` | `PathDepCyclic` | Cyclic path dependency detected in dependency graph | Break the cycle by restructuring crate boundaries |
+| `RCH-E016` | `config` | `PathDepPolicyViolation` | Path dependency violates canonical-root topology policy | Ensure all path dependencies are under `/data/projects` |
+| `RCH-E017` | `config` | `PathDepMetadataFailed` | cargo metadata invocation failed | Try running `cargo metadata --format-version=1` manually |
+| `RCH-E018` | `config` | `PathDepMetadataParseFailed` | cargo metadata output could not be parsed | Check cargo version compatibility |
+| `RCH-E019` | `config` | `ClosurePlanFailed` | Dependency closure plan computation failed | Check path dependency graph health with `cargo metadata` |
+| `RCH-E020` | `config` | `ClosureFailOpen` | Dependency closure entered fail-open state | Transfer proceeds with project root only (fail-open) |
+| `RCH-E021` | `config` | `ClosureHighRisk` | High-risk path dependencies in closure plan | Review flagged dependencies in the plan |
+| `RCH-E022` | `config` | `ClosureMissingData` | Required dependency closure data missing | Ensure Cargo.toml and Cargo.lock are present |
+| `RCH-E023` | `config` | `ClosureNonDeterministic` | Closure sync ordering is non-deterministic | Report as bug — closure ordering must be deterministic |
+| `RCH-E024` | `config` | `ClosureFingerprintMismatch` | Closure manifest fingerprint mismatch | Recompute the closure plan |
 | `RCH-E100` | `network` | `SshConnectionFailed` | SSH connection to worker failed | Verify the worker host is reachable: `ping <host>` |
 | `RCH-E101` | `network` | `SshAuthFailed` | SSH authentication failed | Verify SSH key is in `authorized_keys` on the worker |
 | `RCH-E102` | `network` | `SshKeyError` | SSH key not found or has invalid format | Check that the SSH key file exists at the configured path |
@@ -58,6 +73,14 @@ For full remediation details and the JSON error envelope, see `docs/api/error-co
 | `RCH-E207` | `worker` | `WorkerCircuitOpen` | Worker circuit breaker is open | Wait for circuit breaker reset period |
 | `RCH-E208` | `worker` | `WorkerSelectionFailed` | Worker selection strategy failed | Verify at least one worker is healthy |
 | `RCH-E209` | `worker` | `WorkerLoadQueryFailed` | Failed to query worker load | Verify SSH connectivity to worker |
+| `RCH-E210` | `worker` | `WorkerDiskPressureCritical` | Worker disk usage is critically high | Clean up old builds: `rch cache clean --worker <id>` |
+| `RCH-E211` | `worker` | `WorkerDiskPressureWarning` | Worker disk usage exceeded warning threshold | Monitor disk usage trend |
+| `RCH-E212` | `worker` | `WorkerTelemetryGap` | Worker disk telemetry stale or missing | Check worker health: `rch workers probe <id>` |
+| `RCH-E213` | `worker` | `WorkerDiskIoHigh` | Worker disk I/O utilization too high | Wait for I/O-heavy operations to complete |
+| `RCH-E214` | `worker` | `WorkerMemoryPressureHigh` | Worker memory pressure exceeds threshold | Review worker slot count |
+| `RCH-E215` | `worker` | `WorkerReclaimFailed` | Disk reclaim operation failed | Check worker filesystem health |
+| `RCH-E216` | `worker` | `WorkerDiskHeadroomInsufficient` | Insufficient disk headroom for build | Try a different worker with more headroom |
+| `RCH-E217` | `worker` | `WorkerReclaimProtected` | Active build protection prevented reclaim | Wait for builds to complete |
 | `RCH-E300` | `build` | `BuildCompilationFailed` | Remote compilation failed | Review compilation errors in output |
 | `RCH-E301` | `build` | `BuildUnknownCommand` | Build command not recognized | Check that the command is supported |
 | `RCH-E302` | `build` | `BuildKilledBySignal` | Build process was killed by signal | Check worker system logs for OOM killer |
@@ -68,6 +91,14 @@ For full remediation details and the JSON error envelope, see `docs/api/error-co
 | `RCH-E307` | `build` | `BuildEnvError` | Build environment setup failed | Check environment variable configuration |
 | `RCH-E308` | `build` | `BuildIncrementalError` | Incremental build state is corrupted | Run `cargo clean` on remote workspace |
 | `RCH-E309` | `build` | `BuildArtifactMissing` | Build artifact not found | Verify build completed successfully |
+| `RCH-E310` | `build` | `ProcessTriageAdapterUnavailable` | Process triage adapter unavailable | Ensure process triage adapter binary is installed |
+| `RCH-E311` | `build` | `ProcessTriageDetectorUncertain` | Process detector could not classify with confidence | Review process list manually |
+| `RCH-E312` | `build` | `ProcessTriagePolicyViolation` | Process triage action violates safe-action policy | Use lower-risk action class or request approval |
+| `RCH-E313` | `build` | `ProcessTriageTransportError` | Transport error with process triage adapter | Verify adapter process is running |
+| `RCH-E314` | `build` | `ProcessTriageExecutorError` | Process triage executor runtime error | Check adapter logs |
+| `RCH-E315` | `build` | `ProcessTriageTimeout` | Process triage operation timed out | Increase timeout in ProcessTriageTimeoutPolicy |
+| `RCH-E316` | `build` | `ProcessTriagePartialResult` | Process triage returned partial results | Retry failed actions individually |
+| `RCH-E317` | `build` | `ProcessTriageInvalidRequest` | Invalid process triage request | Validate request against contract schema |
 | `RCH-E400` | `transfer` | `TransferRsyncFailed` | Rsync transfer failed | Verify rsync is installed on both ends |
 | `RCH-E401` | `transfer` | `TransferTimeout` | File sync operation timed out | Increase transfer timeout in configuration |
 | `RCH-E402` | `transfer` | `TransferSourceMissing` | Source files not found | Verify source files exist locally |
@@ -89,4 +120,4 @@ For full remediation details and the JSON error envelope, see `docs/api/error-co
 | `RCH-E508` | `internal` | `InternalLoggingError` | Logging system error | Check log directory permissions |
 | `RCH-E509` | `internal` | `InternalUpdateError` | Update check failed | Check network connectivity |
 
-_Total: 60 error codes._
+_Total: 88 error codes._

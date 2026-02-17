@@ -161,6 +161,150 @@
       "doc_url": "https://rch.dev/docs/config"
     },
     {
+      "code": "RCH-E013",
+      "number": 13,
+      "category": "config",
+      "message": "Cargo manifest parse failure during path-dependency resolution",
+      "remediation": [
+        "Check Cargo.toml syntax with 'cargo verify-project'",
+        "Ensure all path-dependency Cargo.toml files are valid TOML",
+        "Run 'cargo metadata' manually to see detailed parse errors"
+      ],
+      "doc_url": "https://rch.dev/docs/path-deps"
+    },
+    {
+      "code": "RCH-E014",
+      "number": 14,
+      "category": "config",
+      "message": "Path dependency declared but target directory not found",
+      "remediation": [
+        "Verify the path in Cargo.toml [dependencies] exists on disk",
+        "Check for typos in the dependency path value",
+        "Ensure all workspace members are checked out"
+      ],
+      "doc_url": "https://rch.dev/docs/path-deps"
+    },
+    {
+      "code": "RCH-E015",
+      "number": 15,
+      "category": "config",
+      "message": "Cyclic path dependency detected in dependency graph",
+      "remediation": [
+        "Review the path dependency graph for cycles",
+        "Run 'cargo metadata' to visualize the dependency tree",
+        "Break the cycle by restructuring crate boundaries"
+      ],
+      "doc_url": "https://rch.dev/docs/path-deps"
+    },
+    {
+      "code": "RCH-E016",
+      "number": 16,
+      "category": "config",
+      "message": "Path dependency violates canonical-root topology policy",
+      "remediation": [
+        "Ensure all path dependencies are under the canonical root (/data/projects)",
+        "Check that paths resolve within allowed topology prefixes",
+        "Review the PathTopologyPolicy configuration"
+      ],
+      "doc_url": "https://rch.dev/docs/path-deps"
+    },
+    {
+      "code": "RCH-E017",
+      "number": 17,
+      "category": "config",
+      "message": "cargo metadata invocation failed",
+      "remediation": [
+        "Verify 'cargo' is installed and on PATH",
+        "Check that Cargo.toml is a valid project manifest",
+        "Try running 'cargo metadata --format-version=1' manually"
+      ],
+      "doc_url": "https://rch.dev/docs/path-deps"
+    },
+    {
+      "code": "RCH-E018",
+      "number": 18,
+      "category": "config",
+      "message": "cargo metadata output could not be parsed",
+      "remediation": [
+        "Run 'cargo metadata --format-version=1' and check JSON output",
+        "Ensure cargo version is recent enough for the workspace layout",
+        "Check for toolchain incompatibilities with rust-toolchain.toml"
+      ],
+      "doc_url": "https://rch.dev/docs/path-deps"
+    },
+    {
+      "code": "RCH-E019",
+      "number": 19,
+      "category": "config",
+      "message": "Dependency closure plan computation failed",
+      "remediation": [
+        "Check that all path dependencies are resolvable",
+        "Run 'cargo metadata' to verify dependency graph health",
+        "Review dependency closure planner logs for specific failures"
+      ],
+      "doc_url": "https://rch.dev/docs/dependency-closure"
+    },
+    {
+      "code": "RCH-E020",
+      "number": 20,
+      "category": "config",
+      "message": "Dependency closure entered fail-open state due to unverifiable data",
+      "remediation": [
+        "Transfer will proceed with project root only (fail-open semantics)",
+        "Check path dependency graph health to restore full closure",
+        "Review the fail-open reason in structured diagnostics output"
+      ],
+      "doc_url": "https://rch.dev/docs/dependency-closure"
+    },
+    {
+      "code": "RCH-E021",
+      "number": 21,
+      "category": "config",
+      "message": "High-risk path dependencies detected in closure plan",
+      "remediation": [
+        "Review the high-risk dependencies flagged in the plan",
+        "Ensure all dependency paths are canonical and stable",
+        "Consider pinning dependency versions to reduce risk"
+      ],
+      "doc_url": "https://rch.dev/docs/dependency-closure"
+    },
+    {
+      "code": "RCH-E022",
+      "number": 22,
+      "category": "config",
+      "message": "Required dependency closure data is missing or incomplete",
+      "remediation": [
+        "Ensure Cargo.toml and Cargo.lock are present and valid",
+        "Check that all workspace members are accessible",
+        "Run 'cargo update' to regenerate lock file if needed"
+      ],
+      "doc_url": "https://rch.dev/docs/dependency-closure"
+    },
+    {
+      "code": "RCH-E023",
+      "number": 23,
+      "category": "config",
+      "message": "Closure sync action ordering is non-deterministic",
+      "remediation": [
+        "Report this as a bug — closure ordering must be deterministic",
+        "Check for filesystem race conditions or concurrent modifications",
+        "Retry the operation to see if the ordering stabilizes"
+      ],
+      "doc_url": "https://rch.dev/docs/dependency-closure"
+    },
+    {
+      "code": "RCH-E024",
+      "number": 24,
+      "category": "config",
+      "message": "Closure manifest fingerprint mismatch detected",
+      "remediation": [
+        "A dependency manifest changed since the plan was computed",
+        "Recompute the closure plan to pick up the latest manifests",
+        "Check for concurrent modifications to Cargo.toml files"
+      ],
+      "doc_url": "https://rch.dev/docs/dependency-closure"
+    },
+    {
       "code": "RCH-E100",
       "number": 100,
       "category": "network",
@@ -403,6 +547,102 @@
       "doc_url": "https://rch.dev/docs/workers"
     },
     {
+      "code": "RCH-E210",
+      "number": 210,
+      "category": "worker",
+      "message": "Worker disk usage is critically high",
+      "remediation": [
+        "Clean up old builds: rch cache clean --worker <id>",
+        "Check disk usage: df -h on worker",
+        "Remove unused toolchains or build artifacts"
+      ],
+      "doc_url": "https://rch.dev/docs/disk-pressure"
+    },
+    {
+      "code": "RCH-E211",
+      "number": 211,
+      "category": "worker",
+      "message": "Worker disk usage exceeded warning threshold",
+      "remediation": [
+        "Monitor disk usage trend for further degradation",
+        "Schedule proactive cleanup of old build artifacts",
+        "Review disk pressure thresholds in daemon configuration"
+      ],
+      "doc_url": "https://rch.dev/docs/disk-pressure"
+    },
+    {
+      "code": "RCH-E212",
+      "number": 212,
+      "category": "worker",
+      "message": "Worker disk telemetry is stale or missing",
+      "remediation": [
+        "Check worker health: rch workers probe <id>",
+        "Verify SSH connectivity to the worker",
+        "Review telemetry polling interval in daemon configuration"
+      ],
+      "doc_url": "https://rch.dev/docs/disk-pressure"
+    },
+    {
+      "code": "RCH-E213",
+      "number": 213,
+      "category": "worker",
+      "message": "Worker disk I/O utilization is too high",
+      "remediation": [
+        "Wait for I/O-heavy operations to complete",
+        "Check for concurrent builds saturating disk bandwidth",
+        "Review I/O scheduling and worker slot limits"
+      ],
+      "doc_url": "https://rch.dev/docs/disk-pressure"
+    },
+    {
+      "code": "RCH-E214",
+      "number": 214,
+      "category": "worker",
+      "message": "Worker memory pressure exceeds threshold",
+      "remediation": [
+        "Review worker slot count — fewer concurrent builds reduces memory pressure",
+        "Check for memory leaks in long-running builds",
+        "Increase worker memory or reduce max_concurrent_builds"
+      ],
+      "doc_url": "https://rch.dev/docs/disk-pressure"
+    },
+    {
+      "code": "RCH-E215",
+      "number": 215,
+      "category": "worker",
+      "message": "Disk reclaim operation failed on worker",
+      "remediation": [
+        "Check worker filesystem health",
+        "Verify permissions on build artifact directories",
+        "Review reclaim policy configuration in daemon settings"
+      ],
+      "doc_url": "https://rch.dev/docs/disk-pressure"
+    },
+    {
+      "code": "RCH-E216",
+      "number": 216,
+      "category": "worker",
+      "message": "Insufficient disk headroom for build",
+      "remediation": [
+        "Try a different worker with more available headroom",
+        "Clean up build artifacts: rch cache clean --worker <id>",
+        "Review headroom requirements for the current build profile"
+      ],
+      "doc_url": "https://rch.dev/docs/disk-pressure"
+    },
+    {
+      "code": "RCH-E217",
+      "number": 217,
+      "category": "worker",
+      "message": "Active build protection prevented disk reclaim",
+      "remediation": [
+        "Wait for in-progress builds to complete before reclaiming",
+        "Review active build list with rch status",
+        "Consider cancelling lower-priority builds if disk is critical"
+      ],
+      "doc_url": "https://rch.dev/docs/disk-pressure"
+    },
+    {
       "code": "RCH-E300",
       "number": 300,
       "category": "build",
@@ -521,6 +761,102 @@
         "Review build output for artifact location"
       ],
       "doc_url": "https://rch.dev/docs/builds"
+    },
+    {
+      "code": "RCH-E310",
+      "number": 310,
+      "category": "build",
+      "message": "Process triage adapter is unavailable",
+      "remediation": [
+        "Ensure the process triage adapter binary is installed on the worker",
+        "Check adapter path configuration in daemon settings",
+        "Verify the adapter process is running: rch workers probe <id>"
+      ],
+      "doc_url": "https://rch.dev/docs/process-triage"
+    },
+    {
+      "code": "RCH-E311",
+      "number": 311,
+      "category": "build",
+      "message": "Process detector could not classify with confidence",
+      "remediation": [
+        "Review the process list manually on the worker",
+        "Lower the confidence threshold if appropriate",
+        "Add process signatures to the detector knowledge base"
+      ],
+      "doc_url": "https://rch.dev/docs/process-triage"
+    },
+    {
+      "code": "RCH-E312",
+      "number": 312,
+      "category": "build",
+      "message": "Process triage action violates safe-action policy",
+      "remediation": [
+        "Use a lower-risk action class or request explicit approval",
+        "Review the safe-action policy boundaries in configuration",
+        "Escalate to operator if the action is genuinely needed"
+      ],
+      "doc_url": "https://rch.dev/docs/process-triage"
+    },
+    {
+      "code": "RCH-E313",
+      "number": 313,
+      "category": "build",
+      "message": "Transport error communicating with process triage adapter",
+      "remediation": [
+        "Verify the adapter process is running on the worker",
+        "Check IPC socket or pipe connectivity to the adapter",
+        "Restart the adapter and retry the operation"
+      ],
+      "doc_url": "https://rch.dev/docs/process-triage"
+    },
+    {
+      "code": "RCH-E314",
+      "number": 314,
+      "category": "build",
+      "message": "Process triage executor encountered a runtime error",
+      "remediation": [
+        "Check adapter logs for detailed error output",
+        "Verify worker OS compatibility with triage actions",
+        "Review executor permissions and capabilities"
+      ],
+      "doc_url": "https://rch.dev/docs/process-triage"
+    },
+    {
+      "code": "RCH-E315",
+      "number": 315,
+      "category": "build",
+      "message": "Process triage operation timed out",
+      "remediation": [
+        "Increase timeout in ProcessTriageTimeoutPolicy configuration",
+        "Check worker load — triage may be slow under heavy I/O",
+        "Retry the operation after worker load decreases"
+      ],
+      "doc_url": "https://rch.dev/docs/process-triage"
+    },
+    {
+      "code": "RCH-E316",
+      "number": 316,
+      "category": "build",
+      "message": "Process triage returned partial results",
+      "remediation": [
+        "Retry failed actions individually",
+        "Review which actions succeeded vs. failed in the result",
+        "Check adapter logs for root cause of partial failures"
+      ],
+      "doc_url": "https://rch.dev/docs/process-triage"
+    },
+    {
+      "code": "RCH-E317",
+      "number": 317,
+      "category": "build",
+      "message": "Invalid process triage request",
+      "remediation": [
+        "Validate the request against the contract schema",
+        "Check that all required fields are populated",
+        "Review the process triage API contract documentation"
+      ],
+      "doc_url": "https://rch.dev/docs/process-triage"
     },
     {
       "code": "RCH-E400",

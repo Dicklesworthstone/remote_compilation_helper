@@ -18,6 +18,15 @@
 //! | E400-E499  | Transfer    | File transfer and sync errors        |
 //! | E500-E599  | Internal    | Internal/unexpected errors           |
 //!
+//! ## Extended Sub-Ranges (within existing categories)
+//!
+//! | Range      | Subcategory        | Description                           |
+//! |------------|--------------------|---------------------------------------|
+//! | E013-E018  | Config/PathDeps    | Path-dependency resolution errors     |
+//! | E019-E024  | Config/Closure     | Dependency-closure planner errors     |
+//! | E210-E219  | Worker/Storage     | Disk pressure and storage errors      |
+//! | E310-E319  | Build/Triage       | Process triage integration errors     |
+//!
 //! # Example
 //!
 //! ```rust
@@ -65,6 +74,34 @@ pub enum ErrorCode {
     ConfigSshKeyError,
     /// Socket path is invalid
     ConfigSocketPathError,
+
+    // -- Path-Dependency Resolution (E013-E018) --
+    /// Cargo manifest parse failure during path-dependency resolution
+    PathDepManifestParseFailed,
+    /// Path dependency declared but target directory not found
+    PathDepMissing,
+    /// Cyclic path dependency detected
+    PathDepCyclic,
+    /// Path dependency violates canonical-root policy
+    PathDepPolicyViolation,
+    /// cargo metadata invocation failed
+    PathDepMetadataFailed,
+    /// cargo metadata output could not be parsed
+    PathDepMetadataParseFailed,
+
+    // -- Dependency-Closure Planner (E019-E024) --
+    /// Dependency closure plan computation failed
+    ClosurePlanFailed,
+    /// Closure entered fail-open state (unverifiable dependency data)
+    ClosureFailOpen,
+    /// High-risk path dependencies in closure
+    ClosureHighRisk,
+    /// Required closure data is missing or incomplete
+    ClosureMissingData,
+    /// Closure sync action ordering is non-deterministic
+    ClosureNonDeterministic,
+    /// Closure manifest fingerprint mismatch
+    ClosureFingerprintMismatch,
 
     // =========================================================================
     // Network Errors (E100-E199)
@@ -114,6 +151,24 @@ pub enum ErrorCode {
     /// Worker load query failed
     WorkerLoadQueryFailed,
 
+    // -- Disk Pressure / Storage (E210-E219) --
+    /// Worker disk usage is critically high
+    WorkerDiskPressureCritical,
+    /// Worker disk usage is elevated (warning threshold)
+    WorkerDiskPressureWarning,
+    /// Worker disk pressure telemetry is stale or missing
+    WorkerTelemetryGap,
+    /// Worker disk I/O utilization is too high for scheduling
+    WorkerDiskIoHigh,
+    /// Worker memory pressure exceeds scheduling threshold
+    WorkerMemoryPressureHigh,
+    /// Disk reclaim/ballast eviction failed on worker
+    WorkerReclaimFailed,
+    /// Disk headroom estimation too low for build reservation
+    WorkerDiskHeadroomInsufficient,
+    /// Active build protection prevented reclaim operation
+    WorkerReclaimProtected,
+
     // =========================================================================
     // Build Errors (E300-E399)
     // =========================================================================
@@ -137,6 +192,24 @@ pub enum ErrorCode {
     BuildIncrementalError,
     /// Build artifact not found
     BuildArtifactMissing,
+
+    // -- Process Triage (E310-E319) --
+    /// Process triage adapter binary unavailable or not installed
+    ProcessTriageAdapterUnavailable,
+    /// Process detector could not classify process with sufficient confidence
+    ProcessTriageDetectorUncertain,
+    /// Process triage action violates safe-action policy
+    ProcessTriagePolicyViolation,
+    /// Transport error communicating with process triage adapter
+    ProcessTriageTransportError,
+    /// Process triage executor encountered a runtime error
+    ProcessTriageExecutorError,
+    /// Process triage operation timed out
+    ProcessTriageTimeout,
+    /// Process triage returned partial or incomplete results
+    ProcessTriagePartialResult,
+    /// Invalid process triage request (malformed input)
+    ProcessTriageInvalidRequest,
 
     // =========================================================================
     // Transfer Errors (E400-E499)
@@ -204,6 +277,22 @@ impl ErrorCode {
             Self::ConfigSshKeyError => 9,
             Self::ConfigSocketPathError => 10,
 
+            // Path-Dependency (013-018)
+            Self::PathDepManifestParseFailed => 13,
+            Self::PathDepMissing => 14,
+            Self::PathDepCyclic => 15,
+            Self::PathDepPolicyViolation => 16,
+            Self::PathDepMetadataFailed => 17,
+            Self::PathDepMetadataParseFailed => 18,
+
+            // Dependency-Closure (019-024)
+            Self::ClosurePlanFailed => 19,
+            Self::ClosureFailOpen => 20,
+            Self::ClosureHighRisk => 21,
+            Self::ClosureMissingData => 22,
+            Self::ClosureNonDeterministic => 23,
+            Self::ClosureFingerprintMismatch => 24,
+
             // Network (100-199)
             Self::SshConnectionFailed => 100,
             Self::SshAuthFailed => 101,
@@ -228,6 +317,16 @@ impl ErrorCode {
             Self::WorkerSelectionFailed => 208,
             Self::WorkerLoadQueryFailed => 209,
 
+            // Disk Pressure / Storage (210-219)
+            Self::WorkerDiskPressureCritical => 210,
+            Self::WorkerDiskPressureWarning => 211,
+            Self::WorkerTelemetryGap => 212,
+            Self::WorkerDiskIoHigh => 213,
+            Self::WorkerMemoryPressureHigh => 214,
+            Self::WorkerReclaimFailed => 215,
+            Self::WorkerDiskHeadroomInsufficient => 216,
+            Self::WorkerReclaimProtected => 217,
+
             // Build (300-399)
             Self::BuildCompilationFailed => 300,
             Self::BuildUnknownCommand => 301,
@@ -239,6 +338,16 @@ impl ErrorCode {
             Self::BuildEnvError => 307,
             Self::BuildIncrementalError => 308,
             Self::BuildArtifactMissing => 309,
+
+            // Process Triage (310-319)
+            Self::ProcessTriageAdapterUnavailable => 310,
+            Self::ProcessTriageDetectorUncertain => 311,
+            Self::ProcessTriagePolicyViolation => 312,
+            Self::ProcessTriageTransportError => 313,
+            Self::ProcessTriageExecutorError => 314,
+            Self::ProcessTriageTimeout => 315,
+            Self::ProcessTriagePartialResult => 316,
+            Self::ProcessTriageInvalidRequest => 317,
 
             // Transfer (400-499)
             Self::TransferRsyncFailed => 400,
@@ -318,6 +427,28 @@ impl ErrorCode {
             Self::ConfigSshKeyError => "SSH key path is invalid or inaccessible",
             Self::ConfigSocketPathError => "Socket path is invalid or inaccessible",
 
+            // Path-Dependency
+            Self::PathDepManifestParseFailed => {
+                "Cargo manifest parse failure during path-dependency resolution"
+            }
+            Self::PathDepMissing => "Path dependency declared but target directory not found",
+            Self::PathDepCyclic => "Cyclic path dependency detected in dependency graph",
+            Self::PathDepPolicyViolation => {
+                "Path dependency violates canonical-root topology policy"
+            }
+            Self::PathDepMetadataFailed => "cargo metadata invocation failed",
+            Self::PathDepMetadataParseFailed => "cargo metadata output could not be parsed",
+
+            // Dependency-Closure
+            Self::ClosurePlanFailed => "Dependency closure plan computation failed",
+            Self::ClosureFailOpen => {
+                "Dependency closure entered fail-open state due to unverifiable data"
+            }
+            Self::ClosureHighRisk => "High-risk path dependencies detected in closure plan",
+            Self::ClosureMissingData => "Required dependency closure data is missing or incomplete",
+            Self::ClosureNonDeterministic => "Closure sync action ordering is non-deterministic",
+            Self::ClosureFingerprintMismatch => "Closure manifest fingerprint mismatch detected",
+
             // Network
             Self::SshConnectionFailed => "SSH connection to worker failed",
             Self::SshAuthFailed => "SSH authentication failed",
@@ -342,6 +473,18 @@ impl ErrorCode {
             Self::WorkerSelectionFailed => "Worker selection strategy failed",
             Self::WorkerLoadQueryFailed => "Failed to query worker load",
 
+            // Disk Pressure / Storage
+            Self::WorkerDiskPressureCritical => "Worker disk usage is critically high",
+            Self::WorkerDiskPressureWarning => "Worker disk usage has exceeded warning threshold",
+            Self::WorkerTelemetryGap => "Worker disk pressure telemetry is stale or missing",
+            Self::WorkerDiskIoHigh => "Worker disk I/O utilization is too high for scheduling",
+            Self::WorkerMemoryPressureHigh => "Worker memory pressure exceeds scheduling threshold",
+            Self::WorkerReclaimFailed => "Disk reclaim operation failed on worker",
+            Self::WorkerDiskHeadroomInsufficient => {
+                "Insufficient disk headroom for build reservation"
+            }
+            Self::WorkerReclaimProtected => "Active build protection prevented reclaim operation",
+
             // Build
             Self::BuildCompilationFailed => "Remote compilation failed",
             Self::BuildUnknownCommand => "Build command not recognized",
@@ -353,6 +496,28 @@ impl ErrorCode {
             Self::BuildEnvError => "Build environment setup failed",
             Self::BuildIncrementalError => "Incremental build state is corrupted",
             Self::BuildArtifactMissing => "Build artifact not found",
+
+            // Process Triage
+            Self::ProcessTriageAdapterUnavailable => {
+                "Process triage adapter is unavailable or not installed"
+            }
+            Self::ProcessTriageDetectorUncertain => {
+                "Process detector could not classify with sufficient confidence"
+            }
+            Self::ProcessTriagePolicyViolation => {
+                "Process triage action violates safe-action policy"
+            }
+            Self::ProcessTriageTransportError => {
+                "Transport error communicating with process triage adapter"
+            }
+            Self::ProcessTriageExecutorError => {
+                "Process triage executor encountered a runtime error"
+            }
+            Self::ProcessTriageTimeout => "Process triage operation timed out",
+            Self::ProcessTriagePartialResult => {
+                "Process triage returned partial or incomplete results"
+            }
+            Self::ProcessTriageInvalidRequest => "Invalid process triage request",
 
             // Transfer
             Self::TransferRsyncFailed => "Rsync transfer failed",
@@ -434,6 +599,70 @@ impl ErrorCode {
                 "Check directory permissions for socket path",
                 "Ensure parent directory exists",
                 "Try using the default socket path",
+            ],
+
+            // Path-Dependency
+            Self::PathDepManifestParseFailed => &[
+                "Check Cargo.toml syntax with 'cargo verify-project'",
+                "Ensure all path-dependency Cargo.toml files are valid TOML",
+                "Run 'cargo metadata' manually to see detailed parse errors",
+            ],
+            Self::PathDepMissing => &[
+                "Verify the path in Cargo.toml [dependencies] exists on disk",
+                "Check for typos in the dependency path value",
+                "Ensure all workspace members are checked out",
+            ],
+            Self::PathDepCyclic => &[
+                "Review the path dependency graph for cycles",
+                "Run 'cargo metadata' to visualize the dependency tree",
+                "Break the cycle by restructuring crate boundaries",
+            ],
+            Self::PathDepPolicyViolation => &[
+                "Ensure all path dependencies are under the canonical root (/data/projects)",
+                "Check that paths resolve within allowed topology prefixes",
+                "Review the PathTopologyPolicy configuration",
+            ],
+            Self::PathDepMetadataFailed => &[
+                "Verify 'cargo' is installed and on PATH",
+                "Check that Cargo.toml is a valid project manifest",
+                "Try running 'cargo metadata --format-version=1' manually",
+            ],
+            Self::PathDepMetadataParseFailed => &[
+                "Run 'cargo metadata --format-version=1' and check JSON output",
+                "Ensure cargo version is recent enough for the workspace layout",
+                "Check for toolchain incompatibilities with rust-toolchain.toml",
+            ],
+
+            // Dependency-Closure
+            Self::ClosurePlanFailed => &[
+                "Check that all path dependencies are resolvable",
+                "Run 'cargo metadata' to verify dependency graph health",
+                "Review dependency closure planner logs for specific failures",
+            ],
+            Self::ClosureFailOpen => &[
+                "The transfer will proceed with project root only (fail-open semantics)",
+                "Check path dependency graph health to restore full closure",
+                "Review the fail-open reason in structured diagnostics output",
+            ],
+            Self::ClosureHighRisk => &[
+                "Review the high-risk dependencies flagged in the plan",
+                "Ensure all dependency paths are canonical and stable",
+                "Consider pinning dependency versions to reduce risk",
+            ],
+            Self::ClosureMissingData => &[
+                "Ensure Cargo.toml and Cargo.lock are present and valid",
+                "Check that all workspace members are accessible",
+                "Run 'cargo update' to regenerate lock file if needed",
+            ],
+            Self::ClosureNonDeterministic => &[
+                "Report this as a bug — closure ordering must be deterministic",
+                "Check for filesystem race conditions or concurrent modifications",
+                "Retry the operation to see if the ordering stabilizes",
+            ],
+            Self::ClosureFingerprintMismatch => &[
+                "A dependency manifest changed since the plan was computed",
+                "Recompute the closure plan to pick up the latest manifests",
+                "Check for concurrent modifications to Cargo.toml files",
             ],
 
             // Network
@@ -542,6 +771,48 @@ impl ErrorCode {
                 "Review timeout settings for load queries",
             ],
 
+            // Disk Pressure / Storage
+            Self::WorkerDiskPressureCritical => &[
+                "Worker disk usage is above 95% — builds will not be scheduled here",
+                "Clean up old build caches: rch cache clean --worker <id>",
+                "Check disk usage on worker: ssh <worker> df -h",
+            ],
+            Self::WorkerDiskPressureWarning => &[
+                "Worker disk usage is above 80% — scheduling priority reduced",
+                "Consider cleaning old caches: rch cache clean --worker <id>",
+                "Monitor disk usage trend to prevent critical state",
+            ],
+            Self::WorkerTelemetryGap => &[
+                "Worker disk telemetry is stale — pressure assessment is unreliable",
+                "Check worker health: rch workers probe <id>",
+                "Verify telemetry collection is running on the worker",
+            ],
+            Self::WorkerDiskIoHigh => &[
+                "Worker disk I/O is saturated — builds may experience latency",
+                "Wait for current I/O-heavy operations to complete",
+                "Check for stuck or runaway processes: rch workers probe <id>",
+            ],
+            Self::WorkerMemoryPressureHigh => &[
+                "Worker memory pressure is high — scheduling priority reduced",
+                "Check for memory leaks or over-committed builds on the worker",
+                "Review worker slot count to prevent over-scheduling",
+            ],
+            Self::WorkerReclaimFailed => &[
+                "Disk space reclaim operation failed on the worker",
+                "Check worker filesystem health and permissions",
+                "Try manual cleanup: ssh <worker> du -sh /tmp/rch/",
+            ],
+            Self::WorkerDiskHeadroomInsufficient => &[
+                "Estimated build disk requirement exceeds available free space",
+                "Try a different worker with more headroom",
+                "Clean up old build artifacts to free space",
+            ],
+            Self::WorkerReclaimProtected => &[
+                "Active build artifacts were protected from reclaim",
+                "Wait for current builds to complete before retrying reclaim",
+                "Only idle cache entries are eligible for eviction",
+            ],
+
             // Build
             Self::BuildCompilationFailed => &[
                 "Review compilation errors in output",
@@ -592,6 +863,48 @@ impl ErrorCode {
                 "Verify build completed successfully",
                 "Check artifact path configuration",
                 "Review build output for artifact location",
+            ],
+
+            // Process Triage
+            Self::ProcessTriageAdapterUnavailable => &[
+                "Ensure the process triage adapter binary is installed",
+                "Check PATH includes the adapter binary location",
+                "Verify the adapter version is compatible with this RCH version",
+            ],
+            Self::ProcessTriageDetectorUncertain => &[
+                "Process classification was inconclusive — no action taken",
+                "Review the process list manually for suspicious entries",
+                "Adjust detector confidence threshold if false negatives are common",
+            ],
+            Self::ProcessTriagePolicyViolation => &[
+                "The requested action is blocked by safe-action policy",
+                "Review the escalation level required for this action class",
+                "Use a lower-risk action class or request manual approval",
+            ],
+            Self::ProcessTriageTransportError => &[
+                "Communication with the process triage adapter failed",
+                "Verify the adapter process is running and responsive",
+                "Check for socket/pipe errors in adapter logs",
+            ],
+            Self::ProcessTriageExecutorError => &[
+                "The process triage executor encountered a runtime error",
+                "Check adapter logs for detailed error output",
+                "Verify the target process is still running",
+            ],
+            Self::ProcessTriageTimeout => &[
+                "Process triage operation exceeded the configured timeout",
+                "Increase timeout in ProcessTriageTimeoutPolicy if needed",
+                "Check for adapter hangs or system-level resource contention",
+            ],
+            Self::ProcessTriagePartialResult => &[
+                "Not all requested triage actions completed successfully",
+                "Review the partial result for which actions succeeded",
+                "Retry failed actions individually for better diagnostics",
+            ],
+            Self::ProcessTriageInvalidRequest => &[
+                "The process triage request is malformed or missing required fields",
+                "Validate request against the ProcessTriage contract schema",
+                "Check the contract schema version compatibility",
             ],
 
             // Transfer
@@ -703,13 +1016,48 @@ impl ErrorCode {
     /// Returns documentation URL for this error, if available.
     #[must_use]
     pub const fn doc_url(&self) -> Option<&'static str> {
-        match self.category() {
-            ErrorCategory::Config => Some("https://rch.dev/docs/config"),
-            ErrorCategory::Network => Some("https://rch.dev/docs/ssh"),
-            ErrorCategory::Worker => Some("https://rch.dev/docs/workers"),
-            ErrorCategory::Build => Some("https://rch.dev/docs/builds"),
-            ErrorCategory::Transfer => Some("https://rch.dev/docs/sync"),
-            ErrorCategory::Internal => Some("https://rch.dev/docs/troubleshooting"),
+        // Use specific doc pages for new sub-ranges when available
+        match self {
+            Self::PathDepManifestParseFailed
+            | Self::PathDepMissing
+            | Self::PathDepCyclic
+            | Self::PathDepPolicyViolation
+            | Self::PathDepMetadataFailed
+            | Self::PathDepMetadataParseFailed => Some("https://rch.dev/docs/path-deps"),
+
+            Self::ClosurePlanFailed
+            | Self::ClosureFailOpen
+            | Self::ClosureHighRisk
+            | Self::ClosureMissingData
+            | Self::ClosureNonDeterministic
+            | Self::ClosureFingerprintMismatch => Some("https://rch.dev/docs/dependency-closure"),
+
+            Self::WorkerDiskPressureCritical
+            | Self::WorkerDiskPressureWarning
+            | Self::WorkerTelemetryGap
+            | Self::WorkerDiskIoHigh
+            | Self::WorkerMemoryPressureHigh
+            | Self::WorkerReclaimFailed
+            | Self::WorkerDiskHeadroomInsufficient
+            | Self::WorkerReclaimProtected => Some("https://rch.dev/docs/disk-pressure"),
+
+            Self::ProcessTriageAdapterUnavailable
+            | Self::ProcessTriageDetectorUncertain
+            | Self::ProcessTriagePolicyViolation
+            | Self::ProcessTriageTransportError
+            | Self::ProcessTriageExecutorError
+            | Self::ProcessTriageTimeout
+            | Self::ProcessTriagePartialResult
+            | Self::ProcessTriageInvalidRequest => Some("https://rch.dev/docs/process-triage"),
+
+            _ => match self.category() {
+                ErrorCategory::Config => Some("https://rch.dev/docs/config"),
+                ErrorCategory::Network => Some("https://rch.dev/docs/ssh"),
+                ErrorCategory::Worker => Some("https://rch.dev/docs/workers"),
+                ErrorCategory::Build => Some("https://rch.dev/docs/builds"),
+                ErrorCategory::Transfer => Some("https://rch.dev/docs/sync"),
+                ErrorCategory::Internal => Some("https://rch.dev/docs/troubleshooting"),
+            },
         }
     }
 
@@ -728,6 +1076,20 @@ impl ErrorCode {
             Self::ConfigInvalidWorker,
             Self::ConfigSshKeyError,
             Self::ConfigSocketPathError,
+            // Path-Dependency
+            Self::PathDepManifestParseFailed,
+            Self::PathDepMissing,
+            Self::PathDepCyclic,
+            Self::PathDepPolicyViolation,
+            Self::PathDepMetadataFailed,
+            Self::PathDepMetadataParseFailed,
+            // Dependency-Closure
+            Self::ClosurePlanFailed,
+            Self::ClosureFailOpen,
+            Self::ClosureHighRisk,
+            Self::ClosureMissingData,
+            Self::ClosureNonDeterministic,
+            Self::ClosureFingerprintMismatch,
             // Network
             Self::SshConnectionFailed,
             Self::SshAuthFailed,
@@ -750,6 +1112,15 @@ impl ErrorCode {
             Self::WorkerCircuitOpen,
             Self::WorkerSelectionFailed,
             Self::WorkerLoadQueryFailed,
+            // Disk Pressure / Storage
+            Self::WorkerDiskPressureCritical,
+            Self::WorkerDiskPressureWarning,
+            Self::WorkerTelemetryGap,
+            Self::WorkerDiskIoHigh,
+            Self::WorkerMemoryPressureHigh,
+            Self::WorkerReclaimFailed,
+            Self::WorkerDiskHeadroomInsufficient,
+            Self::WorkerReclaimProtected,
             // Build
             Self::BuildCompilationFailed,
             Self::BuildUnknownCommand,
@@ -761,6 +1132,15 @@ impl ErrorCode {
             Self::BuildEnvError,
             Self::BuildIncrementalError,
             Self::BuildArtifactMissing,
+            // Process Triage
+            Self::ProcessTriageAdapterUnavailable,
+            Self::ProcessTriageDetectorUncertain,
+            Self::ProcessTriagePolicyViolation,
+            Self::ProcessTriageTransportError,
+            Self::ProcessTriageExecutorError,
+            Self::ProcessTriageTimeout,
+            Self::ProcessTriagePartialResult,
+            Self::ProcessTriageInvalidRequest,
             // Transfer
             Self::TransferRsyncFailed,
             Self::TransferTimeout,
@@ -919,6 +1299,21 @@ mod tests {
         assert_eq!(ErrorCode::BuildCompilationFailed.code_string(), "RCH-E300");
         assert_eq!(ErrorCode::TransferRsyncFailed.code_string(), "RCH-E400");
         assert_eq!(ErrorCode::InternalDaemonSocket.code_string(), "RCH-E500");
+
+        // New subcategory codes
+        assert_eq!(
+            ErrorCode::PathDepManifestParseFailed.code_string(),
+            "RCH-E013"
+        );
+        assert_eq!(ErrorCode::ClosurePlanFailed.code_string(), "RCH-E019");
+        assert_eq!(
+            ErrorCode::WorkerDiskPressureCritical.code_string(),
+            "RCH-E210"
+        );
+        assert_eq!(
+            ErrorCode::ProcessTriageAdapterUnavailable.code_string(),
+            "RCH-E310"
+        );
     }
 
     #[test]
@@ -1043,5 +1438,149 @@ mod tests {
                 }
             }
         }
+    }
+
+    // =========================================================================
+    // Contract Tests — Code Stability (bd-vvmd.6.1)
+    // =========================================================================
+
+    /// Contract test: path-dependency error codes are stable across versions.
+    #[test]
+    fn test_path_dep_error_codes_stable() {
+        assert_eq!(ErrorCode::PathDepManifestParseFailed.code_number(), 13);
+        assert_eq!(ErrorCode::PathDepMissing.code_number(), 14);
+        assert_eq!(ErrorCode::PathDepCyclic.code_number(), 15);
+        assert_eq!(ErrorCode::PathDepPolicyViolation.code_number(), 16);
+        assert_eq!(ErrorCode::PathDepMetadataFailed.code_number(), 17);
+        assert_eq!(ErrorCode::PathDepMetadataParseFailed.code_number(), 18);
+    }
+
+    /// Contract test: dependency-closure error codes are stable.
+    #[test]
+    fn test_closure_error_codes_stable() {
+        assert_eq!(ErrorCode::ClosurePlanFailed.code_number(), 19);
+        assert_eq!(ErrorCode::ClosureFailOpen.code_number(), 20);
+        assert_eq!(ErrorCode::ClosureHighRisk.code_number(), 21);
+        assert_eq!(ErrorCode::ClosureMissingData.code_number(), 22);
+        assert_eq!(ErrorCode::ClosureNonDeterministic.code_number(), 23);
+        assert_eq!(ErrorCode::ClosureFingerprintMismatch.code_number(), 24);
+    }
+
+    /// Contract test: disk pressure/storage error codes are stable.
+    #[test]
+    fn test_disk_pressure_error_codes_stable() {
+        assert_eq!(ErrorCode::WorkerDiskPressureCritical.code_number(), 210);
+        assert_eq!(ErrorCode::WorkerDiskPressureWarning.code_number(), 211);
+        assert_eq!(ErrorCode::WorkerTelemetryGap.code_number(), 212);
+        assert_eq!(ErrorCode::WorkerDiskIoHigh.code_number(), 213);
+        assert_eq!(ErrorCode::WorkerMemoryPressureHigh.code_number(), 214);
+        assert_eq!(ErrorCode::WorkerReclaimFailed.code_number(), 215);
+        assert_eq!(ErrorCode::WorkerDiskHeadroomInsufficient.code_number(), 216);
+        assert_eq!(ErrorCode::WorkerReclaimProtected.code_number(), 217);
+    }
+
+    /// Contract test: process triage error codes are stable.
+    #[test]
+    fn test_process_triage_error_codes_stable() {
+        assert_eq!(
+            ErrorCode::ProcessTriageAdapterUnavailable.code_number(),
+            310
+        );
+        assert_eq!(ErrorCode::ProcessTriageDetectorUncertain.code_number(), 311);
+        assert_eq!(ErrorCode::ProcessTriagePolicyViolation.code_number(), 312);
+        assert_eq!(ErrorCode::ProcessTriageTransportError.code_number(), 313);
+        assert_eq!(ErrorCode::ProcessTriageExecutorError.code_number(), 314);
+        assert_eq!(ErrorCode::ProcessTriageTimeout.code_number(), 315);
+        assert_eq!(ErrorCode::ProcessTriagePartialResult.code_number(), 316);
+        assert_eq!(ErrorCode::ProcessTriageInvalidRequest.code_number(), 317);
+    }
+
+    /// Contract test: new error codes belong to correct categories.
+    #[test]
+    fn test_new_error_codes_correct_categories() {
+        // Path-dep and closure are in Config range (E001-E099)
+        assert_eq!(ErrorCode::PathDepCyclic.category(), ErrorCategory::Config);
+        assert_eq!(
+            ErrorCode::ClosurePlanFailed.category(),
+            ErrorCategory::Config
+        );
+
+        // Disk pressure in Worker range (E200-E299)
+        assert_eq!(
+            ErrorCode::WorkerDiskPressureCritical.category(),
+            ErrorCategory::Worker
+        );
+        assert_eq!(
+            ErrorCode::WorkerReclaimProtected.category(),
+            ErrorCategory::Worker
+        );
+
+        // Process triage in Build range (E300-E399)
+        assert_eq!(
+            ErrorCode::ProcessTriageTimeout.category(),
+            ErrorCategory::Build
+        );
+        assert_eq!(
+            ErrorCode::ProcessTriageInvalidRequest.category(),
+            ErrorCategory::Build
+        );
+    }
+
+    /// Contract test: all new error codes have doc URLs pointing to correct sections.
+    #[test]
+    fn test_new_error_codes_doc_urls() {
+        assert_eq!(
+            ErrorCode::PathDepCyclic.doc_url(),
+            Some("https://rch.dev/docs/path-deps")
+        );
+        assert_eq!(
+            ErrorCode::ClosureFailOpen.doc_url(),
+            Some("https://rch.dev/docs/dependency-closure")
+        );
+        assert_eq!(
+            ErrorCode::WorkerDiskPressureCritical.doc_url(),
+            Some("https://rch.dev/docs/disk-pressure")
+        );
+        assert_eq!(
+            ErrorCode::ProcessTriageTimeout.doc_url(),
+            Some("https://rch.dev/docs/process-triage")
+        );
+    }
+
+    /// Contract test: new error codes roundtrip through JSON serialization.
+    #[test]
+    fn test_new_error_codes_json_roundtrip() {
+        let new_codes = [
+            ErrorCode::PathDepManifestParseFailed,
+            ErrorCode::ClosurePlanFailed,
+            ErrorCode::WorkerDiskPressureCritical,
+            ErrorCode::ProcessTriageAdapterUnavailable,
+        ];
+
+        for code in new_codes {
+            let json = serde_json::to_string(&code).expect("serialization failed");
+            let parsed: ErrorCode = serde_json::from_str(&json).expect("deserialization failed");
+            assert_eq!(parsed, code, "Roundtrip failed for {:?}", code);
+
+            // Entry should also roundtrip
+            let entry = code.entry();
+            let entry_json = serde_json::to_string(&entry).expect("entry serialization failed");
+            let parsed_entry: ErrorEntry =
+                serde_json::from_str(&entry_json).expect("entry deserialization failed");
+            assert_eq!(parsed_entry.code, code.code_string());
+        }
+    }
+
+    /// Contract test: total error code count is as expected (guards against accidental removal).
+    #[test]
+    fn test_total_error_code_count() {
+        let total = ErrorCode::all().len();
+        // 10 config + 12 path-dep/closure + 10 network + 10 worker + 8 storage
+        // + 10 build + 8 process-triage + 10 transfer + 10 internal = 88
+        assert!(
+            total >= 88,
+            "Expected at least 88 error codes (was {}); did a code get accidentally removed?",
+            total,
+        );
     }
 }

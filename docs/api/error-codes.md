@@ -4,16 +4,20 @@ This document provides a comprehensive reference for all error codes used in the
 
 ## Error Code Ranges
 
-| Range     | Category    | Description                          |
-|-----------|-------------|--------------------------------------|
-| E001-E012 | Config      | Configuration and setup errors       |
-| E100-E113 | SSH         | SSH connectivity and authentication  |
-| E200-E210 | Worker      | Worker selection and management      |
-| E300-E308 | Daemon      | Daemon operations and communication  |
-| E400-E409 | Transfer    | Build execution and file transfer    |
-| E500-E510 | Hook/Update | Hook installation and self-update    |
+| Range     | Category         | Description                          |
+|-----------|------------------|--------------------------------------|
+| E001-E012 | Config           | Configuration and setup errors       |
+| E013-E018 | Config/PathDeps  | Path-dependency resolution errors    |
+| E019-E024 | Config/Closure   | Dependency-closure planner errors    |
+| E100-E113 | SSH              | SSH connectivity and authentication  |
+| E200-E209 | Worker           | Worker selection and management      |
+| E210-E217 | Worker/Storage   | Disk pressure and storage errors     |
+| E300-E309 | Build            | Compilation and build errors         |
+| E310-E317 | Build/Triage     | Process triage integration errors    |
+| E400-E409 | Transfer         | File transfer and sync errors        |
+| E500-E509 | Internal         | Internal/unexpected errors           |
 
-> **Note:** Error codes are defined in `rch/src/error.rs`. Some sections below may use legacy code numbers that differ from the actual implementation. See the source code for authoritative error codes.
+> **Note:** Authoritative definitions are in `rch-common/src/errors/catalog.rs` and `rch/src/error.rs`.
 
 ## Configuration Errors (E001-E099)
 
@@ -96,6 +100,106 @@ This document provides a comprehensive reference for all error codes used in the
 1. Check directory permissions for socket path
 2. Ensure parent directory exists
 3. Try using the default socket path
+
+## Path-Dependency Errors (E013-E018)
+
+### RCH-E013: PathDepManifestParseFailed
+**Message:** Cargo manifest parse failure during path-dependency resolution
+
+**Remediation:**
+1. Check Cargo.toml syntax with `cargo verify-project`
+2. Ensure all path-dependency Cargo.toml files are valid TOML
+3. Run `cargo metadata` manually to see detailed parse errors
+
+### RCH-E014: PathDepMissing
+**Message:** Path dependency declared but target directory not found
+
+**Remediation:**
+1. Verify the path in Cargo.toml `[dependencies]` exists on disk
+2. Check for typos in the dependency path value
+3. Ensure all workspace members are checked out
+
+### RCH-E015: PathDepCyclic
+**Message:** Cyclic path dependency detected in dependency graph
+
+**Remediation:**
+1. Review the path dependency graph for cycles
+2. Run `cargo metadata` to visualize the dependency tree
+3. Break the cycle by restructuring crate boundaries
+
+### RCH-E016: PathDepPolicyViolation
+**Message:** Path dependency violates canonical-root topology policy
+
+**Remediation:**
+1. Ensure all path dependencies are under the canonical root (`/data/projects`)
+2. Check that paths resolve within allowed topology prefixes
+3. Review the `PathTopologyPolicy` configuration
+
+### RCH-E017: PathDepMetadataFailed
+**Message:** cargo metadata invocation failed
+
+**Remediation:**
+1. Verify `cargo` is installed and on PATH
+2. Check that Cargo.toml is a valid project manifest
+3. Try running `cargo metadata --format-version=1` manually
+
+### RCH-E018: PathDepMetadataParseFailed
+**Message:** cargo metadata output could not be parsed
+
+**Remediation:**
+1. Run `cargo metadata --format-version=1` and check JSON output
+2. Ensure cargo version is recent enough for the workspace layout
+3. Check for toolchain incompatibilities with `rust-toolchain.toml`
+
+## Dependency-Closure Errors (E019-E024)
+
+### RCH-E019: ClosurePlanFailed
+**Message:** Dependency closure plan computation failed
+
+**Remediation:**
+1. Check that all path dependencies are resolvable
+2. Run `cargo metadata` to verify dependency graph health
+3. Review dependency closure planner logs for specific failures
+
+### RCH-E020: ClosureFailOpen
+**Message:** Dependency closure entered fail-open state due to unverifiable data
+
+**Remediation:**
+1. The transfer will proceed with project root only (fail-open semantics)
+2. Check path dependency graph health to restore full closure
+3. Review the fail-open reason in structured diagnostics output
+
+### RCH-E021: ClosureHighRisk
+**Message:** High-risk path dependencies detected in closure plan
+
+**Remediation:**
+1. Review the high-risk dependencies flagged in the plan
+2. Ensure all dependency paths are canonical and stable
+3. Consider pinning dependency versions to reduce risk
+
+### RCH-E022: ClosureMissingData
+**Message:** Required dependency closure data is missing or incomplete
+
+**Remediation:**
+1. Ensure Cargo.toml and Cargo.lock are present and valid
+2. Check that all workspace members are accessible
+3. Run `cargo update` to regenerate lock file if needed
+
+### RCH-E023: ClosureNonDeterministic
+**Message:** Closure sync action ordering is non-deterministic
+
+**Remediation:**
+1. Report this as a bug — closure ordering must be deterministic
+2. Check for filesystem race conditions or concurrent modifications
+3. Retry the operation to see if the ordering stabilizes
+
+### RCH-E024: ClosureFingerprintMismatch
+**Message:** Closure manifest fingerprint mismatch detected
+
+**Remediation:**
+1. A dependency manifest changed since the plan was computed
+2. Recompute the closure plan to pick up the latest manifests
+3. Check for concurrent modifications to Cargo.toml files
 
 ## Network Errors (E100-E199)
 
@@ -263,6 +367,72 @@ This document provides a comprehensive reference for all error codes used in the
 2. Check that load query command works on worker
 3. Review timeout settings for load queries
 
+## Disk Pressure / Storage Errors (E210-E217)
+
+### RCH-E210: WorkerDiskPressureCritical
+**Message:** Worker disk usage is critically high
+
+**Remediation:**
+1. Clean up old builds: `rch cache clean --worker <id>`
+2. Check disk usage: `df -h` on worker
+3. Remove unused toolchains or build artifacts
+
+### RCH-E211: WorkerDiskPressureWarning
+**Message:** Worker disk usage exceeded warning threshold
+
+**Remediation:**
+1. Monitor disk usage trend for further degradation
+2. Schedule proactive cleanup of old build artifacts
+3. Review disk pressure thresholds in daemon configuration
+
+### RCH-E212: WorkerTelemetryGap
+**Message:** Worker disk telemetry is stale or missing
+
+**Remediation:**
+1. Check worker health: `rch workers probe <id>`
+2. Verify SSH connectivity to the worker
+3. Review telemetry polling interval in daemon configuration
+
+### RCH-E213: WorkerDiskIoHigh
+**Message:** Worker disk I/O utilization is too high
+
+**Remediation:**
+1. Wait for I/O-heavy operations to complete
+2. Check for concurrent builds saturating disk bandwidth
+3. Review I/O scheduling and worker slot limits
+
+### RCH-E214: WorkerMemoryPressureHigh
+**Message:** Worker memory pressure exceeds threshold
+
+**Remediation:**
+1. Review worker slot count — fewer concurrent builds reduces memory pressure
+2. Check for memory leaks in long-running builds
+3. Increase worker memory or reduce `max_concurrent_builds`
+
+### RCH-E215: WorkerReclaimFailed
+**Message:** Disk reclaim operation failed on worker
+
+**Remediation:**
+1. Check worker filesystem health with `fsck` or `btrfs scrub`
+2. Verify permissions on build artifact directories
+3. Review reclaim policy configuration in daemon settings
+
+### RCH-E216: WorkerDiskHeadroomInsufficient
+**Message:** Insufficient disk headroom for build
+
+**Remediation:**
+1. Try a different worker with more available headroom
+2. Clean up build artifacts: `rch cache clean --worker <id>`
+3. Review headroom requirements for the current build profile
+
+### RCH-E217: WorkerReclaimProtected
+**Message:** Active build protection prevented disk reclaim
+
+**Remediation:**
+1. Wait for in-progress builds to complete before reclaiming
+2. Review active build list with `rch status`
+3. Consider cancelling lower-priority builds if disk is critical
+
 ## Build Errors (E300-E399)
 
 ### RCH-E300: BuildCompilationFailed
@@ -344,6 +514,72 @@ This document provides a comprehensive reference for all error codes used in the
 1. Verify build completed successfully
 2. Check artifact path configuration
 3. Review build output for artifact location
+
+## Process Triage Errors (E310-E317)
+
+### RCH-E310: ProcessTriageAdapterUnavailable
+**Message:** Process triage adapter is unavailable
+
+**Remediation:**
+1. Ensure the process triage adapter binary is installed on the worker
+2. Check adapter path configuration in daemon settings
+3. Verify the adapter process is running: `rch workers probe <id>`
+
+### RCH-E311: ProcessTriageDetectorUncertain
+**Message:** Process detector could not classify with confidence
+
+**Remediation:**
+1. Review the process list manually on the worker
+2. Lower the confidence threshold if appropriate
+3. Add process signatures to the detector knowledge base
+
+### RCH-E312: ProcessTriagePolicyViolation
+**Message:** Process triage action violates safe-action policy
+
+**Remediation:**
+1. Use a lower-risk action class or request explicit approval
+2. Review the safe-action policy boundaries in configuration
+3. Escalate to operator if the action is genuinely needed
+
+### RCH-E313: ProcessTriageTransportError
+**Message:** Transport error communicating with process triage adapter
+
+**Remediation:**
+1. Verify the adapter process is running on the worker
+2. Check IPC socket or pipe connectivity to the adapter
+3. Restart the adapter and retry the operation
+
+### RCH-E314: ProcessTriageExecutorError
+**Message:** Process triage executor encountered a runtime error
+
+**Remediation:**
+1. Check adapter logs for detailed error output
+2. Verify worker OS compatibility with triage actions
+3. Review executor permissions and capabilities
+
+### RCH-E315: ProcessTriageTimeout
+**Message:** Process triage operation timed out
+
+**Remediation:**
+1. Increase timeout in `ProcessTriageTimeoutPolicy` configuration
+2. Check worker load — triage may be slow under heavy I/O
+3. Retry the operation after worker load decreases
+
+### RCH-E316: ProcessTriagePartialResult
+**Message:** Process triage returned partial results
+
+**Remediation:**
+1. Retry failed actions individually
+2. Review which actions succeeded vs. failed in the result
+3. Check adapter logs for root cause of partial failures
+
+### RCH-E317: ProcessTriageInvalidRequest
+**Message:** Invalid process triage request
+
+**Remediation:**
+1. Validate the request against the contract schema
+2. Check that all required fields are populated
+3. Review the process triage API contract documentation
 
 ## Transfer Errors (E400-E499)
 
