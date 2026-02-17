@@ -5,6 +5,7 @@
 
 #![forbid(unsafe_code)]
 
+mod admission;
 mod alerts;
 mod api;
 mod benchmark_queue;

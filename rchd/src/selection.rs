@@ -9,6 +9,7 @@
 
 #![allow(dead_code)] // Scaffold code - methods will be used in future beads
 
+use crate::admission::AdmissionGate;
 use crate::disk_pressure::PressureState;
 use crate::metrics::latency::{DecisionTimer, DecisionType};
 use crate::ui::workers::{debug_routing_enabled, log_routing_decision};
@@ -523,6 +524,8 @@ pub struct WorkerSelector {
     pub selection_history: Arc<RwLock<SelectionHistory>>,
     /// Selection audit log (bd-37hc).
     pub audit_log: Arc<RwLock<SelectionAuditLog>>,
+    /// Optional admission gate for disk-pressure risk evaluation (bd-vvmd.4.4).
+    pub admission_gate: Option<Arc<AdmissionGate>>,
 }
 
 /// Result of worker selection with reason.
@@ -559,6 +562,7 @@ impl WorkerSelector {
             cache_tracker: Arc::new(RwLock::new(CacheTracker::new())),
             selection_history: Arc::new(RwLock::new(SelectionHistory::new())),
             audit_log: Arc::new(RwLock::new(SelectionAuditLog::default())),
+            admission_gate: None,
         }
     }
 
@@ -570,7 +574,13 @@ impl WorkerSelector {
             cache_tracker: Arc::new(RwLock::new(CacheTracker::new())),
             selection_history: Arc::new(RwLock::new(SelectionHistory::new())),
             audit_log: Arc::new(RwLock::new(SelectionAuditLog::default())),
+            admission_gate: None,
         }
+    }
+
+    /// Set the admission gate for disk-pressure risk evaluation (bd-vvmd.4.4).
+    pub fn set_admission_gate(&mut self, gate: Arc<AdmissionGate>) {
+        self.admission_gate = Some(gate);
     }
 
     /// Get a read-only view of the audit log entries.
@@ -1052,6 +1062,11 @@ impl WorkerSelector {
         pool: &WorkerPool,
         request: &SelectionRequest,
     ) -> Result<Vec<(Arc<WorkerState>, CircuitState)>, SelectionReason> {
+        // Clear per-round admission verdict cache (bd-vvmd.4.4).
+        if let Some(ref gate) = self.admission_gate {
+            gate.begin_round().await;
+        }
+
         let workers = pool.healthy_workers().await;
 
         if workers.is_empty() {
@@ -1184,34 +1199,78 @@ impl WorkerSelector {
                 passes_preflight = false;
             }
 
-            // Daemon-side disk-pressure policy evaluation (bd-vvmd.4.2)
-            let pressure = worker.pressure_assessment().await;
-            match pressure.state {
-                PressureState::Critical => {
-                    debug!(
-                        "Worker {} excluded: pressure {} (confidence={}, reason={}, rule={})",
-                        worker_id,
-                        pressure.state,
-                        pressure.confidence,
-                        pressure.reason_code,
-                        pressure.policy_rule
-                    );
-                    passes_preflight = false;
-                    hard_preflight_block = true;
+            // Disk-pressure and headroom admission gate (bd-vvmd.4.4)
+            //
+            // When an admission gate is configured, it replaces the basic
+            // pressure check with a composite evaluation that also considers
+            // headroom estimates and hysteresis.  When no gate is configured,
+            // fall back to the original pressure-state filter (bd-vvmd.4.2).
+            if let Some(ref gate) = self.admission_gate {
+                use crate::admission::AdmissionVerdict;
+                let verdict = gate
+                    .evaluate(worker.as_ref(), worker_id.as_str(), &request.project)
+                    .await;
+                match verdict {
+                    AdmissionVerdict::Reject {
+                        reason_code,
+                        reason,
+                    } => {
+                        debug!(
+                            "Worker {} admission rejected: {} ({})",
+                            worker_id, reason, reason_code
+                        );
+                        if reason_code == "admission_critical_pressure" {
+                            // Critical pressure: hard exclusion (not even in fallback)
+                            hard_preflight_block = true;
+                        }
+                        passes_preflight = false;
+                    }
+                    AdmissionVerdict::Admit {
+                        pressure_penalty,
+                        headroom_score,
+                    } => {
+                        debug!(
+                            "Worker {} admitted: penalty={:.2}, headroom={:.2}",
+                            worker_id, pressure_penalty, headroom_score
+                        );
+                    }
                 }
-                PressureState::Warning => {
-                    debug!(
-                        "Worker {} pressure warning (confidence={}, reason={}, rule={})",
-                        worker_id, pressure.confidence, pressure.reason_code, pressure.policy_rule
-                    );
+            } else {
+                // Legacy path: basic pressure-state filter (bd-vvmd.4.2)
+                let pressure = worker.pressure_assessment().await;
+                match pressure.state {
+                    PressureState::Critical => {
+                        debug!(
+                            "Worker {} excluded: pressure {} (confidence={}, reason={}, rule={})",
+                            worker_id,
+                            pressure.state,
+                            pressure.confidence,
+                            pressure.reason_code,
+                            pressure.policy_rule
+                        );
+                        passes_preflight = false;
+                        hard_preflight_block = true;
+                    }
+                    PressureState::Warning => {
+                        debug!(
+                            "Worker {} pressure warning (confidence={}, reason={}, rule={})",
+                            worker_id,
+                            pressure.confidence,
+                            pressure.reason_code,
+                            pressure.policy_rule
+                        );
+                    }
+                    PressureState::TelemetryGap => {
+                        debug!(
+                            "Worker {} pressure telemetry gap (confidence={}, reason={}, rule={}); fail-open keeps worker eligible",
+                            worker_id,
+                            pressure.confidence,
+                            pressure.reason_code,
+                            pressure.policy_rule
+                        );
+                    }
+                    PressureState::Healthy => {}
                 }
-                PressureState::TelemetryGap => {
-                    debug!(
-                        "Worker {} pressure telemetry gap (confidence={}, reason={}, rule={}); fail-open keeps worker eligible",
-                        worker_id, pressure.confidence, pressure.reason_code, pressure.policy_rule
-                    );
-                }
-                PressureState::Healthy => {}
             }
 
             // Critical pressure is a hard preflight exclusion. We do not
@@ -1456,14 +1515,29 @@ impl WorkerSelector {
             + weights.priority * priority_score;
 
         // Apply half-open penalty if applicable
-        let final_score = if circuit_state == CircuitState::HalfOpen {
+        let mut final_score = if circuit_state == CircuitState::HalfOpen {
             base_score * weights.half_open_penalty
         } else {
             base_score
         };
 
+        // Apply admission pressure penalty (bd-vvmd.4.4).
+        // Workers under Warning pressure or with stale telemetry receive a
+        // scoring reduction proportional to the penalty (0.0-1.0) from the
+        // admission gate.  Workers not evaluated by the gate are unaffected
+        // (fail-open: penalty defaults to 0.0).
+        let admission_penalty = if let Some(ref gate) = self.admission_gate {
+            let p = gate.get_pressure_penalty(config.id.as_str()).await;
+            if p > 0.0 {
+                final_score *= 1.0 - p;
+            }
+            p
+        } else {
+            0.0
+        };
+
         debug!(
-            "Worker {} balanced score: {:.3} (speed={:.2}, load={:.2}, slots={:.2}, health={:.2}, cache={:.2}, network={:.2}, priority={:.2}, half_open={:?}, cache_use={:?})",
+            "Worker {} balanced score: {:.3} (speed={:.2}, load={:.2}, slots={:.2}, health={:.2}, cache={:.2}, network={:.2}, priority={:.2}, half_open={:?}, admission_penalty={:.2}, cache_use={:?})",
             config.id,
             final_score,
             speed_score,
@@ -1474,6 +1548,7 @@ impl WorkerSelector {
             network_score,
             priority_score,
             circuit_state == CircuitState::HalfOpen,
+            admission_penalty,
             cache_use
         );
 
