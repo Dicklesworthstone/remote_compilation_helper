@@ -13,6 +13,8 @@ mod benchmark_scheduler;
 mod cache_cleanup;
 mod cleanup;
 mod config;
+#[cfg(test)]
+mod disk_full_prevention_tests;
 mod disk_pressure;
 mod events;
 mod headroom;
