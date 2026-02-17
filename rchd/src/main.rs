@@ -18,6 +18,7 @@ mod health;
 mod history;
 mod http_api;
 mod metrics;
+mod reclaim;
 mod reload;
 mod selection;
 mod self_test;
