@@ -9,6 +9,7 @@
 
 #![allow(dead_code)] // Scaffold code - methods will be used in future beads
 
+use crate::disk_pressure::PressureState;
 use crate::metrics::latency::{DecisionTimer, DecisionType};
 use crate::ui::workers::{debug_routing_enabled, log_routing_decision};
 use crate::workers::{WorkerPool, WorkerState};
@@ -1159,6 +1160,7 @@ impl WorkerSelector {
             }
 
             let mut passes_preflight = true;
+            let mut hard_preflight_block = false;
             if let Some(max_load) = self.config.max_load_per_core
                 && let Some(true) = capabilities.is_high_load(max_load)
             {
@@ -1180,6 +1182,43 @@ impl WorkerSelector {
                     worker_id, free_gb, min_disk
                 );
                 passes_preflight = false;
+            }
+
+            // Daemon-side disk-pressure policy evaluation (bd-vvmd.4.2)
+            let pressure = worker.pressure_assessment().await;
+            match pressure.state {
+                PressureState::Critical => {
+                    debug!(
+                        "Worker {} excluded: pressure {} (confidence={}, reason={}, rule={})",
+                        worker_id,
+                        pressure.state,
+                        pressure.confidence,
+                        pressure.reason_code,
+                        pressure.policy_rule
+                    );
+                    passes_preflight = false;
+                    hard_preflight_block = true;
+                }
+                PressureState::Warning => {
+                    debug!(
+                        "Worker {} pressure warning (confidence={}, reason={}, rule={})",
+                        worker_id, pressure.confidence, pressure.reason_code, pressure.policy_rule
+                    );
+                }
+                PressureState::TelemetryGap => {
+                    debug!(
+                        "Worker {} pressure telemetry gap (confidence={}, reason={}, rule={}); fail-open keeps worker eligible",
+                        worker_id, pressure.confidence, pressure.reason_code, pressure.policy_rule
+                    );
+                }
+                PressureState::Healthy => {}
+            }
+
+            // Critical pressure is a hard preflight exclusion. We do not
+            // include these workers in fail-open remote fallback candidates.
+            if hard_preflight_block {
+                filtered_by_hard_preflight += 1;
+                continue;
             }
 
             // Track workers for fail-open fallback even if they fail preflight
@@ -2944,6 +2983,107 @@ mod tests {
             .expect("expected worker to recover after explicit revalidation");
         assert_eq!(selected.config.read().await.id.as_str(), "flapping");
         assert_eq!(second.reason, SelectionReason::Success);
+    }
+
+    #[tokio::test]
+    async fn test_pressure_preflight_rejects_critical_worker_only_pool() {
+        let pool = WorkerPool::new();
+        let critical = make_worker("critical-pressure", 8, 80.0);
+        critical
+            .set_capabilities(rch_common::WorkerCapabilities {
+                rustc_version: Some("1.87.0".to_string()),
+                projects_root_ok: Some(true),
+                projects_root_checked_at_unix_ms: Some(1_700_000_000_000),
+                ..Default::default()
+            })
+            .await;
+        critical
+            .set_pressure_assessment(crate::disk_pressure::PressureAssessment {
+                state: crate::disk_pressure::PressureState::Critical,
+                confidence: crate::disk_pressure::PressureConfidence::High,
+                reason_code: "disk_free_below_critical_gb".to_string(),
+                policy_rule: "disk_free_gb<=critical_free_gb".to_string(),
+                disk_free_gb: Some(4.0),
+                disk_total_gb: Some(120.0),
+                disk_free_ratio: Some(0.033),
+                disk_io_util_pct: Some(80.0),
+                memory_pressure: Some(55.0),
+                telemetry_age_secs: Some(8),
+                telemetry_fresh: true,
+                evaluated_at_unix_ms: 1_700_000_000_000,
+            })
+            .await;
+        pool.add_worker_state(critical).await;
+
+        let selector = WorkerSelector::default();
+        let request = SelectionRequest {
+            project: "pressure-critical".to_string(),
+            command: Some("cargo build".to_string()),
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 2,
+            preferred_workers: vec![],
+            toolchain: None,
+            required_runtime: RequiredRuntime::Rust,
+            classification_duration_us: None,
+            hook_pid: None,
+        };
+
+        let result = selector.select(&pool, &request).await;
+        assert!(result.worker.is_none());
+        assert_eq!(result.reason, SelectionReason::AllWorkersFailedPreflight);
+    }
+
+    #[tokio::test]
+    async fn test_pressure_preflight_allows_telemetry_gap_fail_open() {
+        let pool = WorkerPool::new();
+        let telemetry_gap = make_worker("telemetry-gap", 8, 80.0);
+        telemetry_gap
+            .set_capabilities(rch_common::WorkerCapabilities {
+                rustc_version: Some("1.87.0".to_string()),
+                projects_root_ok: Some(true),
+                projects_root_checked_at_unix_ms: Some(1_700_000_000_000),
+                disk_free_gb: Some(60.0),
+                disk_total_gb: Some(120.0),
+                ..Default::default()
+            })
+            .await;
+        telemetry_gap
+            .set_pressure_assessment(crate::disk_pressure::PressureAssessment {
+                state: crate::disk_pressure::PressureState::TelemetryGap,
+                confidence: crate::disk_pressure::PressureConfidence::Low,
+                reason_code: "telemetry_unavailable".to_string(),
+                policy_rule: "fail_open_telemetry_gap".to_string(),
+                disk_free_gb: Some(60.0),
+                disk_total_gb: Some(120.0),
+                disk_free_ratio: Some(0.5),
+                disk_io_util_pct: None,
+                memory_pressure: None,
+                telemetry_age_secs: Some(600),
+                telemetry_fresh: false,
+                evaluated_at_unix_ms: 1_700_000_000_000,
+            })
+            .await;
+        pool.add_worker_state(telemetry_gap).await;
+
+        let selector = WorkerSelector::default();
+        let request = SelectionRequest {
+            project: "pressure-gap".to_string(),
+            command: Some("cargo build".to_string()),
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 2,
+            preferred_workers: vec![],
+            toolchain: None,
+            required_runtime: RequiredRuntime::Rust,
+            classification_duration_us: None,
+            hook_pid: None,
+        };
+
+        let result = selector.select(&pool, &request).await;
+        let selected = result
+            .worker
+            .expect("expected telemetry-gap worker to remain eligible (fail-open)");
+        assert_eq!(selected.config.read().await.id.as_str(), "telemetry-gap");
+        assert_eq!(result.reason, SelectionReason::Success);
     }
 
     #[tokio::test]

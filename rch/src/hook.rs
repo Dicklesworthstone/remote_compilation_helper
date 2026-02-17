@@ -2352,13 +2352,17 @@ async fn run_worker_ssh_command(
     ));
     cmd.arg("-i").arg(identity_file.as_ref());
     cmd.arg(destination);
-    cmd.arg("sh").arg("-lc").arg(remote_cmd);
+    cmd.arg(build_remote_shell_command(remote_cmd));
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     let output = timeout(timeout_duration, cmd.output())
         .await
         .map_err(|_| anyhow::anyhow!("SSH command timed out after {:?}", timeout_duration))??;
     Ok(output)
+}
+
+fn build_remote_shell_command(remote_cmd: &str) -> String {
+    format!("sh -lc {}", shell_escape::escape(remote_cmd.into()))
 }
 
 async fn ensure_worker_projects_topology(
@@ -3160,21 +3164,8 @@ async fn verify_remote_dependency_manifests(
         return Ok(());
     }
 
-    let checks = sync_roots
-        .iter()
-        .map(|root| root.join("Cargo.toml"))
-        .map(|manifest| {
-            let escaped = shell_escape::escape(manifest.to_string_lossy().to_string().into());
-            format!(
-                "if [ ! -f {manifest} ]; then echo MISSING_DEP_MANIFEST:{manifest}; missing=1; fi",
-                manifest = escaped
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(" ");
-    let verify_cmd = format!(
-        "missing=0; {checks}; if [ \"$missing\" -ne 0 ]; then exit 43; fi; echo RCH_REMOTE_DEPENDENCIES_OK"
-    );
+    let verify_cmd = build_remote_dependency_preflight_command(sync_roots)
+        .expect("sync_roots is non-empty due early return");
 
     let output = run_worker_ssh_command(worker, &verify_cmd, Duration::from_secs(20)).await?;
     if !output.status.success() {
@@ -3194,6 +3185,29 @@ async fn verify_remote_dependency_manifests(
         worker.id
     ));
     Ok(())
+}
+
+fn build_remote_dependency_preflight_command(sync_roots: &[PathBuf]) -> Option<String> {
+    if sync_roots.is_empty() {
+        return None;
+    }
+
+    let checks = sync_roots
+        .iter()
+        .map(|root| root.join("Cargo.toml"))
+        .map(|manifest| {
+            let escaped = shell_escape::escape(manifest.to_string_lossy().to_string().into());
+            format!(
+                "if [ ! -f {manifest} ]; then echo MISSING_DEP_MANIFEST:{manifest}; missing=1; fi",
+                manifest = escaped
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+
+    Some(format!(
+        "missing=0; {checks}; if [ \"$missing\" -ne 0 ]; then exit 43; fi; echo RCH_REMOTE_DEPENDENCIES_OK"
+    ))
 }
 
 /// Result of remote compilation execution.
@@ -5718,6 +5732,55 @@ mod tests {
         assert_ne!(dry_run_key, status_key);
         assert_ne!(apply_key, status_key);
         assert!(apply_key.starts_with("rch-repo-sync-"));
+    }
+
+    #[test]
+    fn test_build_remote_dependency_preflight_command_empty_roots() {
+        let _guard = test_guard!();
+        assert!(build_remote_dependency_preflight_command(&[]).is_none());
+    }
+
+    #[test]
+    fn test_build_remote_dependency_preflight_command_separates_checks() {
+        let _guard = test_guard!();
+        let sync_roots = vec![
+            PathBuf::from("/data/projects/repo-a"),
+            PathBuf::from("/data/projects/repo-b"),
+        ];
+
+        let command = build_remote_dependency_preflight_command(&sync_roots)
+            .expect("command should be constructed");
+
+        assert!(
+            command.contains("fi; if [ ! -f"),
+            "generated command must separate consecutive if/fi checks with ';'"
+        );
+        assert!(
+            !command.contains("fi if ["),
+            "generated command must not concatenate checks without separator"
+        );
+    }
+
+    #[test]
+    fn test_build_remote_shell_command_wraps_and_escapes_script() {
+        let _guard = test_guard!();
+        let command = "missing=0; if [ \"$missing\" -ne 0 ]; then echo 'bad'; fi";
+
+        let wrapped = build_remote_shell_command(command);
+
+        assert!(wrapped.starts_with("sh -lc "));
+        assert!(
+            wrapped.starts_with("sh -lc '"),
+            "shell wrapper must quote the script as a single argument"
+        );
+        assert!(
+            !wrapped.starts_with("sh -lc missing=0"),
+            "script must not be passed unquoted"
+        );
+        assert!(
+            wrapped.contains("if ["),
+            "wrapped command should preserve the full script"
+        );
     }
 
     #[test]

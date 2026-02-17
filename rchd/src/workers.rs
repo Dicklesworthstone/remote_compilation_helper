@@ -3,6 +3,7 @@
 #![allow(dead_code)] // Scaffold code - methods will be used in future beads
 
 use crate::DaemonContext;
+use crate::disk_pressure::PressureAssessment;
 use crate::health::{HealthConfig, probe_worker_capabilities};
 use rch_common::{
     CircuitBreakerConfig, CircuitState, CircuitStats, WorkerCapabilities, WorkerConfig, WorkerId,
@@ -57,6 +58,8 @@ pub struct WorkerState {
     last_error_msg: RwLock<Option<String>>,
     /// Runtime capabilities (Bun, Node, Rust versions).
     capabilities: RwLock<WorkerCapabilities>,
+    /// Latest daemon-side pressure policy assessment for this worker.
+    pressure_assessment: RwLock<PressureAssessment>,
     /// Reason for disabling this worker (if disabled).
     disabled_reason: RwLock<Option<String>>,
     /// Unix timestamp (seconds since epoch) when worker was disabled.
@@ -86,6 +89,7 @@ impl WorkerState {
             circuit: RwLock::new(CircuitStats::new()),
             last_error_msg: RwLock::new(None),
             capabilities: RwLock::new(WorkerCapabilities::new()),
+            pressure_assessment: RwLock::new(PressureAssessment::default()),
             disabled_reason: RwLock::new(None),
             disabled_at: AtomicI64::new(0),
         }
@@ -302,6 +306,16 @@ impl WorkerState {
     /// Get worker capabilities.
     pub async fn capabilities(&self) -> WorkerCapabilities {
         self.capabilities.read().await.clone()
+    }
+
+    /// Update the latest disk-pressure policy assessment.
+    pub async fn set_pressure_assessment(&self, assessment: PressureAssessment) {
+        *self.pressure_assessment.write().await = assessment;
+    }
+
+    /// Get the latest disk-pressure policy assessment.
+    pub async fn pressure_assessment(&self) -> PressureAssessment {
+        self.pressure_assessment.read().await.clone()
     }
 
     /// Check if this worker has Bun installed.
@@ -567,6 +581,7 @@ pub struct WorkerCapabilitiesInfo {
     pub host: String,
     pub user: String,
     pub capabilities: WorkerCapabilities,
+    pub pressure_assessment: PressureAssessment,
 }
 
 /// Worker capabilities response.
@@ -618,12 +633,14 @@ pub async fn get_workers_capabilities(
             )
         };
         let capabilities = worker.capabilities().await;
+        let pressure_assessment = worker.pressure_assessment().await;
 
         entries.push(WorkerCapabilitiesInfo {
             id,
             host,
             user,
             capabilities,
+            pressure_assessment,
         });
     }
 

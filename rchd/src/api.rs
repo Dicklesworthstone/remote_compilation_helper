@@ -250,6 +250,28 @@ pub struct WorkerStatusInfo {
     /// Recent health check results (true=success, false=failure).
     /// Most recent result is at the end. Used for history visualization.
     pub failure_history: Vec<bool>,
+    /// Normalized storage pressure state.
+    pub pressure_state: String,
+    /// Confidence level for the pressure decision.
+    pub pressure_confidence: String,
+    /// Stable pressure reason code.
+    pub pressure_reason_code: String,
+    /// Policy rule provenance for pressure classification.
+    pub pressure_policy_rule: String,
+    /// Measured free disk (GB), if available.
+    pub pressure_disk_free_gb: Option<f64>,
+    /// Measured total disk (GB), if available.
+    pub pressure_disk_total_gb: Option<f64>,
+    /// Measured free-disk ratio, if available.
+    pub pressure_disk_free_ratio: Option<f64>,
+    /// Last disk I/O utilization sample, if available.
+    pub pressure_disk_io_util_pct: Option<f64>,
+    /// Last memory pressure sample, if available.
+    pub pressure_memory_pressure: Option<f64>,
+    /// Age of latest telemetry sample in seconds, if available.
+    pub pressure_telemetry_age_secs: Option<u64>,
+    /// Whether the latest telemetry sample is fresh enough for high-confidence policy decisions.
+    pub pressure_telemetry_fresh: bool,
 }
 
 /// Active build information (placeholder).
@@ -2384,6 +2406,7 @@ async fn handle_status(ctx: &DaemonContext) -> Result<DaemonFullStatus> {
             CircuitState::Open => "open",
             CircuitState::HalfOpen => "half_open",
         };
+        let pressure = worker.pressure_assessment().await;
 
         // Use default circuit config for recovery time calculation
         let circuit_config = CircuitBreakerConfig::default();
@@ -2402,6 +2425,17 @@ async fn handle_status(ctx: &DaemonContext) -> Result<DaemonFullStatus> {
             consecutive_failures: circuit_stats.consecutive_failures(),
             recovery_in_secs,
             failure_history: circuit_stats.recent_results().to_vec(),
+            pressure_state: pressure.state.to_string(),
+            pressure_confidence: pressure.confidence.to_string(),
+            pressure_reason_code: pressure.reason_code.clone(),
+            pressure_policy_rule: pressure.policy_rule.clone(),
+            pressure_disk_free_gb: pressure.disk_free_gb,
+            pressure_disk_total_gb: pressure.disk_total_gb,
+            pressure_disk_free_ratio: pressure.disk_free_ratio,
+            pressure_disk_io_util_pct: pressure.disk_io_util_pct,
+            pressure_memory_pressure: pressure.memory_pressure,
+            pressure_telemetry_age_secs: pressure.telemetry_age_secs,
+            pressure_telemetry_fresh: pressure.telemetry_fresh,
         });
 
         // Generate issues based on worker state
@@ -2410,6 +2444,29 @@ async fn handle_status(ctx: &DaemonContext) -> Result<DaemonFullStatus> {
                 severity: "error".to_string(),
                 summary: format!("Circuit open for worker '{}'", worker_id),
                 remediation: Some(format!("rch workers probe {} --force", worker_id)),
+            });
+        } else if pressure.state == crate::disk_pressure::PressureState::Critical {
+            issues.push(Issue {
+                severity: "error".to_string(),
+                summary: format!(
+                    "Worker '{}' in critical pressure state ({})",
+                    worker_id, pressure.reason_code
+                ),
+                remediation: Some(
+                    "rch workers capabilities --refresh (inspect pressure metrics and ballast policy)"
+                        .to_string(),
+                ),
+            });
+        } else if pressure.state == crate::disk_pressure::PressureState::TelemetryGap {
+            issues.push(Issue {
+                severity: "warning".to_string(),
+                summary: format!(
+                    "Worker '{}' has stale/missing pressure telemetry ({})",
+                    worker_id, pressure.reason_code
+                ),
+                remediation: Some(
+                    "rch workers capabilities --refresh (re-probe worker metrics)".to_string(),
+                ),
             });
         } else if status == WorkerStatus::Unreachable {
             issues.push(Issue {
@@ -2513,6 +2570,7 @@ async fn handle_status(ctx: &DaemonContext) -> Result<DaemonFullStatus> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::disk_pressure::{PressureAssessment, PressureConfidence, PressureState};
     use crate::history::BuildHistory;
     use crate::selection::WorkerSelector;
     use crate::self_test::{SelfTestHistory, SelfTestService};
@@ -3234,6 +3292,17 @@ mod tests {
             consecutive_failures: 0,
             recovery_in_secs: None,
             failure_history: vec![true, true, true],
+            pressure_state: "healthy".to_string(),
+            pressure_confidence: "high".to_string(),
+            pressure_reason_code: "pressure_healthy".to_string(),
+            pressure_policy_rule: "all_pressure_rules_within_threshold".to_string(),
+            pressure_disk_free_gb: Some(42.0),
+            pressure_disk_total_gb: Some(128.0),
+            pressure_disk_free_ratio: Some(0.328),
+            pressure_disk_io_util_pct: Some(18.0),
+            pressure_memory_pressure: Some(44.0),
+            pressure_telemetry_age_secs: Some(7),
+            pressure_telemetry_fresh: true,
         };
         let json = serde_json::to_string(&info).unwrap();
         assert!(json.contains("\"id\":\"worker1\""));
@@ -3850,6 +3919,7 @@ mod tests {
             host: "localhost".to_string(),
             user: "test".to_string(),
             capabilities: WorkerCapabilities::default(),
+            pressure_assessment: crate::disk_pressure::PressureAssessment::default(),
         };
         let json = serde_json::to_string(&info).unwrap();
         assert!(json.contains("\"id\":\"worker1\""));
@@ -4349,6 +4419,92 @@ mod tests {
         assert_eq!(status.daemon.slots_total, 12); // 8 + 4
         assert_eq!(status.daemon.version, "0.1.0");
         assert_eq!(status.daemon.pid, 1234);
+    }
+
+    #[tokio::test]
+    async fn test_handle_status_includes_pressure_metadata() {
+        let _guard = test_guard!();
+        let pool = WorkerPool::new();
+        pool.add_worker(make_test_worker("worker1", 8)).await;
+
+        let worker = pool
+            .get(&WorkerId::new("worker1"))
+            .await
+            .expect("worker should exist");
+        worker
+            .set_pressure_assessment(PressureAssessment {
+                state: PressureState::Warning,
+                confidence: PressureConfidence::High,
+                reason_code: "disk_free_below_warning_gb".to_string(),
+                policy_rule: "disk_free_gb<=warning_free_gb".to_string(),
+                disk_free_gb: Some(18.0),
+                disk_total_gb: Some(120.0),
+                disk_free_ratio: Some(0.15),
+                disk_io_util_pct: Some(72.0),
+                memory_pressure: Some(44.0),
+                telemetry_age_secs: Some(8),
+                telemetry_fresh: true,
+                evaluated_at_unix_ms: 1_700_000_000_000,
+            })
+            .await;
+
+        let ctx = make_test_context(pool);
+        let status = handle_status(&ctx).await.expect("status should succeed");
+        let worker = status
+            .workers
+            .iter()
+            .find(|entry| entry.id == "worker1")
+            .expect("worker1 status entry should exist");
+
+        assert_eq!(worker.pressure_state, "warning");
+        assert_eq!(worker.pressure_confidence, "high");
+        assert_eq!(worker.pressure_reason_code, "disk_free_below_warning_gb");
+        assert_eq!(worker.pressure_policy_rule, "disk_free_gb<=warning_free_gb");
+        assert_eq!(worker.pressure_disk_free_gb, Some(18.0));
+        assert_eq!(worker.pressure_disk_total_gb, Some(120.0));
+        assert_eq!(worker.pressure_disk_free_ratio, Some(0.15));
+        assert_eq!(worker.pressure_disk_io_util_pct, Some(72.0));
+        assert_eq!(worker.pressure_memory_pressure, Some(44.0));
+        assert_eq!(worker.pressure_telemetry_age_secs, Some(8));
+        assert!(worker.pressure_telemetry_fresh);
+    }
+
+    #[tokio::test]
+    async fn test_handle_status_emits_critical_pressure_issue() {
+        let _guard = test_guard!();
+        let pool = WorkerPool::new();
+        pool.add_worker(make_test_worker("worker1", 8)).await;
+
+        let worker = pool
+            .get(&WorkerId::new("worker1"))
+            .await
+            .expect("worker should exist");
+        worker
+            .set_pressure_assessment(PressureAssessment {
+                state: PressureState::Critical,
+                confidence: PressureConfidence::High,
+                reason_code: "disk_free_below_critical_gb".to_string(),
+                policy_rule: "disk_free_gb<=critical_free_gb".to_string(),
+                disk_free_gb: Some(4.0),
+                disk_total_gb: Some(120.0),
+                disk_free_ratio: Some(0.033),
+                disk_io_util_pct: Some(91.0),
+                memory_pressure: Some(82.0),
+                telemetry_age_secs: Some(7),
+                telemetry_fresh: true,
+                evaluated_at_unix_ms: 1_700_000_000_000,
+            })
+            .await;
+
+        let ctx = make_test_context(pool);
+        let status = handle_status(&ctx).await.expect("status should succeed");
+        assert!(
+            status
+                .issues
+                .iter()
+                .any(|issue| issue.summary.contains("critical pressure state")),
+            "status issues should include critical pressure signal"
+        );
     }
 
     #[tokio::test]

@@ -12,6 +12,7 @@ mod benchmark_scheduler;
 mod cache_cleanup;
 mod cleanup;
 mod config;
+mod disk_pressure;
 mod events;
 mod health;
 mod history;
@@ -41,6 +42,7 @@ use tokio::signal::unix::{SignalKind, signal};
 
 use benchmark_queue::BenchmarkQueue;
 use benchmark_scheduler::{BenchmarkScheduler, BenchmarkTriggerHandle, SchedulerConfig};
+use disk_pressure::{DiskPressureMonitor, DiskPressurePolicyConfig};
 use events::EventBus;
 use history::BuildHistory;
 use rch_telemetry::storage::TelemetryStorage;
@@ -441,6 +443,15 @@ async fn main() -> Result<()> {
     );
     let _telemetry_handle = telemetry_poller.start();
     info!("Telemetry poller started");
+
+    // Start daemon-side disk pressure monitor + policy evaluator (bd-vvmd.4.2)
+    let disk_pressure_monitor = DiskPressureMonitor::new(
+        worker_pool.clone(),
+        telemetry_store.clone(),
+        DiskPressurePolicyConfig::default(),
+    );
+    let _disk_pressure_handle = disk_pressure_monitor.start();
+    info!("Disk pressure monitor started");
 
     let metrics_pool = worker_pool.clone();
     let metrics_history = context.history.clone();
