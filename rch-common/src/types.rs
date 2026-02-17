@@ -173,6 +173,8 @@ pub enum SelectionReason {
     AllCircuitsOpen,
     /// All workers are at capacity (no available slots).
     AllWorkersBusy,
+    /// All candidate workers failed hard preflight checks.
+    AllWorkersFailedPreflight,
     /// No workers match required tags or preferences.
     NoMatchingWorkers,
     /// No workers have the required runtime (e.g., Bun, Node).
@@ -193,6 +195,7 @@ impl std::fmt::Display for SelectionReason {
             Self::AllWorkersUnreachable => write!(f, "all workers unreachable"),
             Self::AllCircuitsOpen => write!(f, "all worker circuits open"),
             Self::AllWorkersBusy => write!(f, "all workers at capacity"),
+            Self::AllWorkersFailedPreflight => write!(f, "all workers failed preflight checks"),
             Self::NoMatchingWorkers => write!(f, "no matching workers found"),
             Self::NoWorkersWithRuntime(rt) => write!(f, "no workers with {} installed", rt),
             Self::SelectionError(e) => write!(f, "selection error: {}", e),
@@ -586,6 +589,18 @@ pub struct WorkerCapabilities {
     /// Total disk space in GB.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disk_total_gb: Option<f64>,
+    /// Canonical path-topology preflight status (`/data/projects` + `/dp` alias).
+    ///
+    /// `Some(false)` indicates a hard preflight failure that should exclude this
+    /// worker from remote scheduling until a subsequent successful revalidation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projects_root_ok: Option<bool>,
+    /// Machine-readable failure reason for path-topology preflight.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projects_root_issue: Option<String>,
+    /// Unix timestamp (ms) when topology preflight last executed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projects_root_checked_at_unix_ms: Option<i64>,
 }
 
 impl WorkerCapabilities {
@@ -600,6 +615,7 @@ impl WorkerCapabilities {
     pub fn mock_with_rust() -> Self {
         Self {
             rustc_version: Some("1.85.0-nightly (mock)".to_string()),
+            projects_root_ok: Some(true),
             ..Self::default()
         }
     }
@@ -638,6 +654,13 @@ impl WorkerCapabilities {
     /// Returns None if metrics unavailable (fail-open).
     pub fn is_low_disk(&self, min_free_gb: f64) -> Option<bool> {
         self.disk_free_gb.map(|free| free < min_free_gb)
+    }
+
+    /// Check if canonical path-topology preflight is healthy.
+    ///
+    /// Returns `None` when probe data is unavailable (fail-open behavior).
+    pub fn is_topology_healthy(&self) -> Option<bool> {
+        self.projects_root_ok
     }
 }
 
@@ -2650,6 +2673,9 @@ mod tests {
         assert!(caps.bun_version.is_none());
         assert!(caps.node_version.is_none());
         assert!(caps.npm_version.is_none());
+        assert!(caps.projects_root_ok.is_none());
+        assert!(caps.projects_root_issue.is_none());
+        assert!(caps.projects_root_checked_at_unix_ms.is_none());
     }
 
     #[test]
@@ -2660,6 +2686,7 @@ mod tests {
         assert!(!caps.has_rust());
         assert!(!caps.has_bun());
         assert!(!caps.has_node());
+        assert!(caps.is_topology_healthy().is_none());
     }
 
     #[test]
@@ -2770,6 +2797,9 @@ mod tests {
             bun_version: None,
             node_version: Some("v20".to_string()),
             npm_version: None,
+            projects_root_ok: Some(false),
+            projects_root_issue: Some("alias_missing".to_string()),
+            projects_root_checked_at_unix_ms: Some(123),
             ..Default::default()
         };
 
@@ -2778,6 +2808,25 @@ mod tests {
         assert_eq!(cloned.bun_version, caps.bun_version);
         assert_eq!(cloned.node_version, caps.node_version);
         assert_eq!(cloned.npm_version, caps.npm_version);
+        assert_eq!(cloned.projects_root_ok, caps.projects_root_ok);
+        assert_eq!(cloned.projects_root_issue, caps.projects_root_issue);
+        assert_eq!(
+            cloned.projects_root_checked_at_unix_ms,
+            caps.projects_root_checked_at_unix_ms
+        );
+    }
+
+    #[test]
+    fn test_worker_capabilities_topology_health_helper() {
+        let _guard = test_guard!();
+        let mut caps = WorkerCapabilities::new();
+        assert_eq!(caps.is_topology_healthy(), None);
+
+        caps.projects_root_ok = Some(true);
+        assert_eq!(caps.is_topology_healthy(), Some(true));
+
+        caps.projects_root_ok = Some(false);
+        assert_eq!(caps.is_topology_healthy(), Some(false));
     }
 
     #[test]
@@ -2805,6 +2854,10 @@ mod tests {
             "\"all_workers_busy\""
         );
         assert_eq!(
+            serde_json::to_string(&SelectionReason::AllWorkersFailedPreflight).unwrap(),
+            "\"all_workers_failed_preflight\""
+        );
+        assert_eq!(
             serde_json::to_string(&SelectionReason::NoMatchingWorkers).unwrap(),
             "\"no_matching_workers\""
         );
@@ -2830,6 +2883,10 @@ mod tests {
             serde_json::from_str::<SelectionReason>("\"all_workers_busy\"").unwrap(),
             SelectionReason::AllWorkersBusy
         );
+        assert_eq!(
+            serde_json::from_str::<SelectionReason>("\"all_workers_failed_preflight\"").unwrap(),
+            SelectionReason::AllWorkersFailedPreflight
+        );
     }
 
     #[test]
@@ -2850,6 +2907,10 @@ mod tests {
         assert_eq!(
             SelectionReason::AllWorkersBusy.to_string(),
             "all workers at capacity"
+        );
+        assert_eq!(
+            SelectionReason::AllWorkersFailedPreflight.to_string(),
+            "all workers failed preflight checks"
         );
         assert_eq!(
             SelectionReason::SelectionError("oops".to_string()).to_string(),

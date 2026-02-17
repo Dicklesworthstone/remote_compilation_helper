@@ -10,14 +10,15 @@ use rch_common::ssh_utils::{
     EnvPrefix, is_retryable_transport_error, is_valid_env_key, shell_escape_value,
 };
 use rch_common::{
-    ColorMode, CommandResult, CompilationKind, RetryConfig, ToolchainInfo, TransferConfig,
-    WorkerConfig, wrap_command_with_color, wrap_command_with_toolchain,
+    ColorMode, CommandResult, CompilationKind, PathTopologyPolicy, RetryConfig, ToolchainInfo,
+    TransferConfig, WorkerConfig, normalize_project_path_with_policy, wrap_command_with_color,
+    wrap_command_with_toolchain,
 };
 #[cfg(unix)]
 use rch_common::{SshClient, SshOptions};
 use shell_escape::escape;
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -26,6 +27,24 @@ use tokio::process::Command;
 use tokio::time::Instant as TokioInstant;
 use tokio::time::sleep;
 use tracing::{debug, info, warn};
+
+const PROJECT_HASH_CONTENT_LIMIT_BYTES: u64 = 2 * 1024 * 1024;
+const PROJECT_HASH_KEY_FILES: &[&str] = &[
+    // Rust project files
+    "Cargo.toml",
+    "Cargo.lock",
+    // Bun/Node.js project files
+    "package.json",
+    "bun.lockb",
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    // TypeScript config
+    "tsconfig.json",
+    // Bun config
+    "bunfig.toml",
+];
+const REMOTE_RUNTIME_EXCLUDE_PATTERNS: &[&str] = &[".rch-target/", ".rch-tmp/"];
 
 // =============================================================================
 // Retry Logic (bd-x1ek)
@@ -194,6 +213,11 @@ pub struct TransferPipeline {
     ///
     /// Populated by `should_skip_transfer` when estimation is performed.
     estimated_transfer_bytes: Option<u64>,
+    /// Optional explicit remote path override.
+    ///
+    /// When set, transfer and execution use this path directly instead of
+    /// deriving `<remote_base>/<project_id>/<project_hash>`.
+    remote_path_override: Option<String>,
 }
 
 /// Validate a project hash for safe use in file paths.
@@ -279,6 +303,7 @@ impl TransferPipeline {
             compilation_kind: None,
             compilation_config: rch_common::CompilationConfig::default(),
             estimated_transfer_bytes: None,
+            remote_path_override: None,
         }
     }
 
@@ -343,6 +368,38 @@ impl TransferPipeline {
     #[cfg(test)]
     pub fn with_estimated_transfer_bytes(mut self, bytes: Option<u64>) -> Self {
         self.estimated_transfer_bytes = bytes;
+        self
+    }
+
+    /// Override the remote project path used for sync and command execution.
+    ///
+    /// Intended for canonical multi-repo layouts where the remote path must
+    /// match deterministic host topology (for example `/data/projects/<repo>`).
+    pub fn with_remote_path_override(mut self, remote_path: impl Into<String>) -> Self {
+        let remote_path = remote_path.into();
+        let trimmed = remote_path.trim();
+        if trimmed.is_empty() {
+            warn!("Ignoring empty remote path override");
+            return self;
+        }
+        if !trimmed.starts_with('/') {
+            warn!(
+                "Ignoring remote path override that is not absolute: {}",
+                trimmed
+            );
+            return self;
+        }
+        if trimmed.contains('\n') || trimmed.contains('\r') || trimmed.contains('\0') {
+            warn!("Ignoring unsafe remote path override containing control characters");
+            return self;
+        }
+
+        let normalized = if trimmed.len() > 1 {
+            trimmed.trim_end_matches('/').to_string()
+        } else {
+            "/".to_string()
+        };
+        self.remote_path_override = Some(normalized);
         self
     }
 
@@ -464,6 +521,15 @@ impl TransferPipeline {
     fn get_effective_excludes(&self) -> Vec<String> {
         let mut excludes = self.transfer_config.exclude_patterns.clone();
 
+        // Always protect remote-only runtime scratch/output directories from rsync --delete.
+        // Without this, concurrent builds targeting the same remote root can remove each
+        // other's in-flight compiler state (e.g. incremental dep-graph.part files).
+        for pattern in REMOTE_RUNTIME_EXCLUDE_PATTERNS {
+            if !excludes.iter().any(|existing| existing == pattern) {
+                excludes.push((*pattern).to_string());
+            }
+        }
+
         // Read and merge .rchignore if present
         let rchignore_path = self.project_root.join(".rchignore");
         if let Ok(patterns) = parse_rchignore(&rchignore_path) {
@@ -493,6 +559,9 @@ impl TransferPipeline {
 
     /// Get the remote project path on the worker.
     pub fn remote_path(&self) -> String {
+        if let Some(remote_path) = &self.remote_path_override {
+            return remote_path.clone();
+        }
         let base = self.transfer_config.remote_base.trim_end_matches('/');
         format!("{}/{}/{}", base, self.project_id, self.project_hash)
     }
@@ -767,6 +836,7 @@ impl TransferPipeline {
         let ssh_command = self.build_rsync_ssh_command(escaped_identity.as_ref());
 
         cmd.arg("-az") // Archive mode + compression
+            .arg("--stats") // Structured output for parse_rsync_bytes/files
             .arg("--delete") // Remove extraneous files from destination
             .arg("-e")
             .arg(ssh_command);
@@ -1288,8 +1358,12 @@ impl TransferPipeline {
         let escaped_identity = escape(Cow::from(identity_file.as_ref()));
         let ssh_command = self.build_rsync_ssh_command(escaped_identity.as_ref());
 
-        // Use --safe-links to prevent symlink traversal attacks from malicious workers
+        // Use --safe-links to prevent symlink traversal attacks from malicious workers.
+        // --stats is required so parse_rsync_bytes/parse_rsync_files can read transfer
+        // counts from stdout; without it rsync produces no output and the parsers
+        // return 0, causing a false "No artifacts retrieved" warning.
         cmd.arg("-az")
+            .arg("--stats")
             .arg("--safe-links")
             .arg("-e")
             .arg(ssh_command);
@@ -1812,41 +1886,68 @@ where
     Ok((combined, start.elapsed().as_millis() as u64))
 }
 
-/// Compute a hash of the project for cache invalidation.
-pub fn compute_project_hash(project_path: &Path) -> String {
+fn normalize_hash_root(path: &Path) -> PathBuf {
+    normalize_project_path_with_policy(path, &PathTopologyPolicy::default())
+        .map(|normalized| normalized.canonical_path().to_path_buf())
+        .or_else(|_| std::fs::canonicalize(path))
+        .unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn update_hasher_with_file_fingerprint(hasher: &mut blake3::Hasher, file_path: &Path, label: &str) {
+    let Ok(metadata) = std::fs::metadata(file_path) else {
+        return;
+    };
+
+    hasher.update(label.as_bytes());
+    hasher.update(&metadata.len().to_le_bytes());
+    if let Ok(modified) = metadata.modified()
+        && let Ok(duration) = modified.duration_since(std::time::UNIX_EPOCH)
+    {
+        hasher.update(&duration.as_nanos().to_le_bytes());
+    }
+
+    if metadata.len() <= PROJECT_HASH_CONTENT_LIMIT_BYTES
+        && let Ok(bytes) = std::fs::read(file_path)
+    {
+        hasher.update(&(bytes.len() as u64).to_le_bytes());
+        hasher.update(&bytes);
+    }
+}
+
+fn collect_hash_roots(project_path: &Path, dependency_roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut roots = BTreeSet::new();
+    roots.insert(normalize_hash_root(project_path));
+    for root in dependency_roots {
+        roots.insert(normalize_hash_root(root));
+    }
+    roots.into_iter().collect()
+}
+
+/// Compute a project hash that includes dependency-closure fingerprints.
+///
+/// The resulting value is deterministic across `/dp` vs `/data/projects` alias
+/// forms and changes when any tracked key file for any closure member changes.
+pub fn compute_project_hash_with_dependency_roots(
+    project_path: &Path,
+    dependency_roots: &[PathBuf],
+) -> String {
     let mut hasher = blake3::Hasher::new();
+    hasher.update(b"rch-project-hash-v2");
 
-    // Hash path
-    hasher.update(project_path.to_string_lossy().as_bytes());
-
-    // Hash modification time of key files to detect configuration changes
-    // This helps route to workers with cached copies when dependencies haven't changed
-    let key_files = [
-        // Rust project files
-        "Cargo.toml",
-        "Cargo.lock",
-        // Bun/Node.js project files
-        "package.json",
-        "bun.lockb",
-        "package-lock.json",
-        "pnpm-lock.yaml",
-        "yarn.lock",
-        // TypeScript config
-        "tsconfig.json",
-        // Bun config
-        "bunfig.toml",
-    ];
-
-    for filename in key_files {
-        if let Ok(metadata) = std::fs::metadata(project_path.join(filename))
-            && let Ok(modified) = metadata.modified()
-            && let Ok(duration) = modified.duration_since(std::time::UNIX_EPOCH)
-        {
-            hasher.update(&duration.as_nanos().to_le_bytes());
+    for root in collect_hash_roots(project_path, dependency_roots) {
+        hasher.update(b"\0root\0");
+        hasher.update(root.to_string_lossy().as_bytes());
+        for filename in PROJECT_HASH_KEY_FILES {
+            update_hasher_with_file_fingerprint(&mut hasher, &root.join(filename), filename);
         }
     }
 
     hasher.finalize().to_hex()[..16].to_string()
+}
+
+/// Compute a hash of the project for cache invalidation.
+pub fn compute_project_hash(project_path: &Path) -> String {
+    compute_project_hash_with_dependency_roots(project_path, &[])
 }
 
 /// Validate a project identifier for safe use in file paths.
@@ -2229,6 +2330,131 @@ mod tests {
 
         // Hash should change when key file is added
         assert_ne!(hash_before, hash_after);
+    }
+
+    #[test]
+    fn test_compute_project_hash_with_dependency_roots_changes_on_dependency_manifest_change() {
+        let _guard = test_guard!();
+        use std::fs;
+        use tempfile::tempdir;
+
+        let root = tempdir().expect("create root dir");
+        let dep = tempdir().expect("create dep dir");
+        fs::write(root.path().join("Cargo.toml"), "[package]\nname = \"root\"")
+            .expect("write root cargo");
+        fs::write(dep.path().join("Cargo.toml"), "[package]\nname = \"dep\"")
+            .expect("write dep cargo");
+
+        let hash_before =
+            compute_project_hash_with_dependency_roots(root.path(), &[dep.path().to_path_buf()]);
+
+        fs::write(
+            dep.path().join("Cargo.toml"),
+            "[package]\nname = \"dep\"\nversion = \"0.2.0\"",
+        )
+        .expect("rewrite dep cargo");
+        let hash_after =
+            compute_project_hash_with_dependency_roots(root.path(), &[dep.path().to_path_buf()]);
+
+        assert_ne!(
+            hash_before, hash_after,
+            "dependency manifest changes must invalidate closure hash"
+        );
+    }
+
+    #[test]
+    fn test_compute_project_hash_with_dependency_roots_ignores_non_key_noise_changes() {
+        let _guard = test_guard!();
+        use std::fs;
+        use tempfile::tempdir;
+
+        let root = tempdir().expect("create root dir");
+        let dep = tempdir().expect("create dep dir");
+        fs::write(root.path().join("Cargo.toml"), "[package]\nname = \"root\"")
+            .expect("write root cargo");
+        fs::write(dep.path().join("Cargo.toml"), "[package]\nname = \"dep\"")
+            .expect("write dep cargo");
+
+        let hash_before =
+            compute_project_hash_with_dependency_roots(root.path(), &[dep.path().to_path_buf()]);
+
+        fs::create_dir_all(dep.path().join("src")).expect("create dep src");
+        fs::write(
+            dep.path().join("src/lib.rs"),
+            "pub fn unchanged_policy() {}",
+        )
+        .expect("write dep source");
+        let hash_after =
+            compute_project_hash_with_dependency_roots(root.path(), &[dep.path().to_path_buf()]);
+
+        assert_eq!(
+            hash_before, hash_after,
+            "non-key file noise should not perturb closure hash policy"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_compute_project_hash_with_dependency_roots_normalizes_alias_equivalence() {
+        let _guard = test_guard!();
+        use std::fs;
+        use tempfile::tempdir;
+
+        let base = tempdir().expect("create temp base");
+        let root = base.path().join("root");
+        let dep = base.path().join("dep");
+        let dep_alias = base.path().join("dep_alias");
+        fs::create_dir_all(&root).expect("create root");
+        fs::create_dir_all(&dep).expect("create dep");
+        fs::write(root.join("Cargo.toml"), "[package]\nname = \"root\"").expect("write root cargo");
+        fs::write(dep.join("Cargo.toml"), "[package]\nname = \"dep\"").expect("write dep cargo");
+        std::os::unix::fs::symlink(&dep, &dep_alias).expect("create dep alias symlink");
+
+        let canonical_hash =
+            compute_project_hash_with_dependency_roots(&root, std::slice::from_ref(&dep));
+        let alias_hash = compute_project_hash_with_dependency_roots(&root, &[dep_alias]);
+
+        assert_eq!(
+            canonical_hash, alias_hash,
+            "alias and canonical dependency roots must produce identical closure hash"
+        );
+    }
+
+    #[test]
+    fn test_compute_project_hash_with_dependency_roots_perf_budget_smoke() {
+        let _guard = test_guard!();
+        use std::fs;
+        use std::time::{Duration, Instant};
+        use tempfile::tempdir;
+
+        let base = tempdir().expect("create perf temp base");
+        let root = base.path().join("root");
+        fs::create_dir_all(&root).expect("create root");
+        fs::write(root.join("Cargo.toml"), "[package]\nname = \"root\"").expect("write root cargo");
+
+        let mut deps = Vec::new();
+        for idx in 0..4 {
+            let dep = base.path().join(format!("dep-{idx}"));
+            fs::create_dir_all(&dep).expect("create dep root");
+            fs::write(
+                dep.join("Cargo.toml"),
+                format!("[package]\nname = \"dep-{idx}\"\nversion = \"0.1.{idx}\""),
+            )
+            .expect("write dep cargo");
+            deps.push(dep);
+        }
+
+        let start = Instant::now();
+        for _ in 0..100 {
+            let _ = compute_project_hash_with_dependency_roots(&root, &deps);
+        }
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "closure hash computation too slow: {:?}",
+            elapsed
+        );
     }
 
     #[test]
@@ -2721,6 +2947,34 @@ mod tests {
         assert_eq!(pipeline.remote_path(), "/home/builder/.rch/project/def456");
     }
 
+    #[test]
+    fn test_remote_path_override_absolute() {
+        let _guard = test_guard!();
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/workspace/project"),
+            "project".to_string(),
+            "def456".to_string(),
+            TransferConfig::default(),
+        )
+        .with_remote_path_override("/data/projects/project");
+
+        assert_eq!(pipeline.remote_path(), "/data/projects/project");
+    }
+
+    #[test]
+    fn test_remote_path_override_rejects_relative() {
+        let _guard = test_guard!();
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/workspace/project"),
+            "project".to_string(),
+            "def456".to_string(),
+            TransferConfig::default(),
+        )
+        .with_remote_path_override("relative/path");
+
+        assert_eq!(pipeline.remote_path(), "/tmp/rch/project/def456");
+    }
+
     // ==========================================================================
     // .rchignore Parser Tests
     // ==========================================================================
@@ -2804,9 +3058,9 @@ node_modules/
     #[test]
     fn test_get_effective_excludes_without_rchignore() {
         let _guard = test_guard!();
-        // When no .rchignore exists, should return config defaults
+        // When no .rchignore exists, should return config defaults + remote runtime guards.
         let config = TransferConfig::default();
-        let default_count = config.exclude_patterns.len();
+        let default_excludes = config.exclude_patterns.clone();
 
         let pipeline = TransferPipeline::new(
             PathBuf::from("/nonexistent/project"),
@@ -2816,7 +3070,11 @@ node_modules/
         );
 
         let effective = pipeline.get_effective_excludes();
-        assert_eq!(effective.len(), default_count);
+        for pattern in &default_excludes {
+            assert!(effective.contains(pattern));
+        }
+        assert!(effective.contains(&".rch-target/".to_string()));
+        assert!(effective.contains(&".rch-tmp/".to_string()));
     }
 
     #[test]
@@ -2828,7 +3086,7 @@ node_modules/
         std::fs::write(&rchignore_path, "large_data/\nsecrets/").expect("write .rchignore");
 
         let config = TransferConfig::default();
-        let default_count = config.exclude_patterns.len();
+        let default_excludes = config.exclude_patterns.clone();
 
         let pipeline = TransferPipeline::new(
             temp_dir.path().to_path_buf(),
@@ -2838,8 +3096,11 @@ node_modules/
         );
 
         let effective = pipeline.get_effective_excludes();
-        // Should have defaults + 2 new patterns
-        assert_eq!(effective.len(), default_count + 2);
+        for pattern in &default_excludes {
+            assert!(effective.contains(pattern));
+        }
+        assert!(effective.contains(&".rch-target/".to_string()));
+        assert!(effective.contains(&".rch-tmp/".to_string()));
         assert!(effective.contains(&"large_data/".to_string()));
         assert!(effective.contains(&"secrets/".to_string()));
     }
@@ -2854,7 +3115,7 @@ node_modules/
         std::fs::write(&rchignore_path, "target/\ncustom/").expect("write .rchignore");
 
         let config = TransferConfig::default();
-        let default_count = config.exclude_patterns.len();
+        let default_excludes = config.exclude_patterns.clone();
 
         let pipeline = TransferPipeline::new(
             temp_dir.path().to_path_buf(),
@@ -2864,12 +3125,20 @@ node_modules/
         );
 
         let effective = pipeline.get_effective_excludes();
-        // Should have defaults + 1 new pattern (target/ is already there)
-        assert_eq!(effective.len(), default_count + 1);
+        for pattern in &default_excludes {
+            assert!(effective.contains(pattern));
+        }
+        assert!(effective.contains(&".rch-target/".to_string()));
+        assert!(effective.contains(&".rch-tmp/".to_string()));
         assert!(effective.contains(&"custom/".to_string()));
         // target/ should appear only once
         let target_count = effective.iter().filter(|p| *p == "target/").count();
         assert_eq!(target_count, 1);
+        // Runtime guards should appear only once too.
+        let runtime_target_count = effective.iter().filter(|p| *p == ".rch-target/").count();
+        assert_eq!(runtime_target_count, 1);
+        let runtime_tmp_count = effective.iter().filter(|p| *p == ".rch-tmp/").count();
+        assert_eq!(runtime_tmp_count, 1);
     }
 
     // ==========================================================================

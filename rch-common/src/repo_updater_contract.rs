@@ -26,6 +26,50 @@ pub const REPO_UPDATER_ALIAS_PROJECTS_ROOT: &str = "/dp";
 pub const REPO_UPDATER_DEFAULT_BINARY: &str = "ru";
 /// Known-good minimum ru version for this contract.
 pub const REPO_UPDATER_MIN_SUPPORTED_VERSION: &str = "1.2.0";
+/// Env flag enabling operator override handling in trust policy.
+pub const REPO_UPDATER_ALLOW_OVERRIDE_ENV: &str = "RCH_REPO_CONVERGENCE_ALLOW_OVERRIDE";
+/// Env var for comma-separated repo allowlist used by repo convergence.
+pub const REPO_UPDATER_ALLOWLIST_ENV: &str = "RCH_REPO_CONVERGENCE_ALLOWLIST";
+/// Env var for comma-separated host allowlist used by repo convergence.
+pub const REPO_UPDATER_ALLOWED_HOSTS_ENV: &str = "RCH_REPO_CONVERGENCE_ALLOWED_HOSTS";
+/// Override metadata env: operator identifier.
+pub const REPO_UPDATER_OVERRIDE_OPERATOR_ID_ENV: &str = "RCH_REPO_OVERRIDE_OPERATOR_ID";
+/// Override metadata env: human-readable justification.
+pub const REPO_UPDATER_OVERRIDE_JUSTIFICATION_ENV: &str = "RCH_REPO_OVERRIDE_JUSTIFICATION";
+/// Override metadata env: ticket or change-request identifier.
+pub const REPO_UPDATER_OVERRIDE_TICKET_REF_ENV: &str = "RCH_REPO_OVERRIDE_TICKET_REF";
+/// Override metadata env: durable audit event identifier.
+pub const REPO_UPDATER_OVERRIDE_AUDIT_EVENT_ID_ENV: &str = "RCH_REPO_OVERRIDE_AUDIT_EVENT_ID";
+/// Override metadata env: approval timestamp (unix ms).
+pub const REPO_UPDATER_OVERRIDE_APPROVED_AT_MS_ENV: &str = "RCH_REPO_OVERRIDE_APPROVED_AT_MS";
+/// Auth metadata env: credential source (`gh_cli`, `token_env`, `ssh_agent`).
+pub const REPO_UPDATER_AUTH_SOURCE_ENV: &str = "RCH_REPO_AUTH_SOURCE";
+/// Auth policy env: required auth mode (`inherit_environment|require_gh_auth|require_token_env`).
+pub const REPO_UPDATER_AUTH_MODE_ENV: &str = "RCH_REPO_AUTH_MODE";
+/// Auth metadata env: credential identifier/fingerprint.
+pub const REPO_UPDATER_AUTH_CREDENTIAL_ID_ENV: &str = "RCH_REPO_AUTH_CREDENTIAL_ID";
+/// Auth metadata env: credential issued-at timestamp (unix ms).
+pub const REPO_UPDATER_AUTH_ISSUED_AT_MS_ENV: &str = "RCH_REPO_AUTH_ISSUED_AT_MS";
+/// Auth metadata env: credential expires-at timestamp (unix ms).
+pub const REPO_UPDATER_AUTH_EXPIRES_AT_MS_ENV: &str = "RCH_REPO_AUTH_EXPIRES_AT_MS";
+/// Auth metadata env: comma-separated granted scopes.
+pub const REPO_UPDATER_AUTH_SCOPES_ENV: &str = "RCH_REPO_AUTH_SCOPES";
+/// Auth metadata env: explicit revocation flag.
+pub const REPO_UPDATER_AUTH_REVOKED_ENV: &str = "RCH_REPO_AUTH_REVOKED";
+/// Auth metadata env: comma-separated `host=fingerprint` verified identities.
+pub const REPO_UPDATER_AUTH_VERIFIED_HOSTS_ENV: &str = "RCH_REPO_AUTH_VERIFIED_HOSTS";
+/// Auth policy env: comma-separated required scopes.
+pub const REPO_UPDATER_REQUIRED_SCOPES_ENV: &str = "RCH_REPO_REQUIRED_SCOPES";
+/// Auth policy env: max credential age in seconds before rotation is required.
+pub const REPO_UPDATER_ROTATION_MAX_AGE_SECS_ENV: &str = "RCH_REPO_AUTH_ROTATION_MAX_AGE_SECS";
+/// Auth policy env: require host identity verification (`1|true|yes|on`).
+pub const REPO_UPDATER_REQUIRE_HOST_IDENTITY_ENV: &str = "RCH_REPO_REQUIRE_HOST_IDENTITY";
+/// Auth policy env: comma-separated `host=fingerprint` trusted host identities.
+pub const REPO_UPDATER_TRUSTED_HOST_IDENTITIES_ENV: &str = "RCH_REPO_TRUSTED_HOST_IDENTITIES";
+
+const fn default_enforce_repo_spec_allowlist() -> bool {
+    true
+}
 
 /// Stable command surface used by RCH to invoke repo_updater.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
@@ -170,8 +214,14 @@ pub struct RepoUpdaterTrustBoundaryPolicy {
     pub canonical_projects_root: PathBuf,
     pub required_aliases: Vec<RepoPathAliasRequirement>,
     pub allowed_repo_hosts: Vec<String>,
+    #[serde(default = "default_enforce_repo_spec_allowlist")]
+    pub enforce_repo_spec_allowlist: bool,
+    #[serde(default)]
+    pub allowlisted_repo_specs: Vec<String>,
     pub allow_owner_repo_shorthand: bool,
     pub reject_local_path_specs: bool,
+    #[serde(default)]
+    pub allow_operator_override: bool,
 }
 
 impl Default for RepoUpdaterTrustBoundaryPolicy {
@@ -183,8 +233,11 @@ impl Default for RepoUpdaterTrustBoundaryPolicy {
                 canonical_target: PathBuf::from(REPO_UPDATER_CANONICAL_PROJECTS_ROOT),
             }],
             allowed_repo_hosts: vec!["github.com".to_string()],
+            enforce_repo_spec_allowlist: true,
+            allowlisted_repo_specs: Vec::new(),
             allow_owner_repo_shorthand: true,
             reject_local_path_specs: true,
+            allow_operator_override: false,
         }
     }
 }
@@ -198,20 +251,67 @@ pub enum RepoUpdaterAuthMode {
     RequireTokenEnv,
 }
 
+/// Credential source asserted for a convergence request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RepoUpdaterCredentialSource {
+    GhCli,
+    TokenEnv,
+    SshAgent,
+}
+
+/// Trusted host key binding used for identity verification.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RepoUpdaterTrustedHostIdentity {
+    pub host: String,
+    pub key_fingerprint: String,
+}
+
+/// Verified host identity record observed for a specific request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RepoUpdaterVerifiedHostIdentity {
+    pub host: String,
+    pub key_fingerprint: String,
+    pub verified_at_unix_ms: i64,
+}
+
+/// Request-scoped credential and identity context.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RepoUpdaterAuthContext {
+    pub source: RepoUpdaterCredentialSource,
+    pub credential_id: String,
+    pub issued_at_unix_ms: i64,
+    pub expires_at_unix_ms: i64,
+    pub granted_scopes: Vec<String>,
+    pub revoked: bool,
+    pub verified_hosts: Vec<RepoUpdaterVerifiedHostIdentity>,
+}
+
 /// Auth-related policy constraints.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct RepoUpdaterAuthPolicy {
     pub mode: RepoUpdaterAuthMode,
     pub required_env_vars: Vec<String>,
     pub redacted_env_vars: Vec<String>,
+    pub required_scopes: Vec<String>,
+    pub rotation_max_age_secs: u64,
+    pub require_host_identity_verification: bool,
+    pub trusted_host_identities: Vec<RepoUpdaterTrustedHostIdentity>,
 }
 
 impl Default for RepoUpdaterAuthPolicy {
     fn default() -> Self {
         Self {
-            mode: RepoUpdaterAuthMode::InheritEnvironment,
+            mode: RepoUpdaterAuthMode::RequireTokenEnv,
             required_env_vars: Vec::new(),
             redacted_env_vars: vec!["GH_TOKEN".to_string(), "GITHUB_TOKEN".to_string()],
+            required_scopes: vec!["repo:read".to_string()],
+            rotation_max_age_secs: 86_400,
+            require_host_identity_verification: true,
+            trusted_host_identities: vec![RepoUpdaterTrustedHostIdentity {
+                host: "github.com".to_string(),
+                key_fingerprint: "SHA256:+DiY3wvvV6TuJJhbpZisF/J84OHwY2l7uxD9f4HBlz8".to_string(),
+            }],
         }
     }
 }
@@ -391,6 +491,20 @@ pub struct RepoUpdaterAdapterRequest {
     pub retry_attempt: u32,
     pub timeout_secs: u64,
     pub expected_output_format: RepoUpdaterOutputFormat,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_context: Option<RepoUpdaterAuthContext>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_override: Option<RepoUpdaterOperatorOverride>,
+}
+
+/// Explicit operator override metadata for convergence-scope exceptions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct RepoUpdaterOperatorOverride {
+    pub operator_id: String,
+    pub justification: String,
+    pub ticket_ref: String,
+    pub audit_event_id: String,
+    pub approved_at_unix_ms: i64,
 }
 
 /// Optional envelope metadata from ru output.
@@ -491,6 +605,41 @@ pub enum RepoUpdaterContractError {
     InvalidProjectsRoot(String),
     #[error("unsupported repo host: {0}")]
     UnsupportedRepoHost(String),
+    #[error("repo spec is not allowlisted: {0}")]
+    RepoSpecNotAllowlisted(String),
+    #[error("local path repo spec denied by policy: {0}")]
+    LocalPathSpecDenied(String),
+    #[error("operator override is required for unallowlisted repo specs")]
+    OperatorOverrideRequired,
+    #[error("operator override is disabled by policy")]
+    OperatorOverrideDisabled,
+    #[error("operator override metadata is malformed: {0}")]
+    MalformedOperatorOverride(String),
+    #[error("malformed trust policy: {0}")]
+    MalformedTrustPolicy(String),
+    #[error("missing auth context for mutating convergence command")]
+    MissingAuthContext,
+    #[error("credential source {actual:?} is not permitted for auth mode {mode:?}")]
+    AuthSourceMismatch {
+        mode: RepoUpdaterAuthMode,
+        actual: RepoUpdaterCredentialSource,
+    },
+    #[error("credential has been explicitly revoked")]
+    AuthCredentialRevoked,
+    #[error("credential expired at {expires_at_unix_ms}")]
+    AuthCredentialExpired { expires_at_unix_ms: i64 },
+    #[error("credential age exceeds rotation policy (age={age_secs}s max={max_age_secs}s)")]
+    AuthCredentialTooOld { age_secs: u64, max_age_secs: u64 },
+    #[error("credential is missing required scope: {0}")]
+    AuthScopeDenied(String),
+    #[error("host identity missing for {0}")]
+    HostIdentityMissing(String),
+    #[error("host identity mismatch for {host} (expected {expected}, got {actual})")]
+    HostIdentityMismatch {
+        host: String,
+        expected: String,
+        actual: String,
+    },
     #[error("missing idempotency key")]
     MissingIdempotencyKey,
     #[error("invalid timeout_secs: {0}")]
@@ -503,11 +652,184 @@ pub enum RepoUpdaterContractError {
     DuplicateCommandBudget(RepoUpdaterAdapterCommand),
 }
 
+impl RepoUpdaterContractError {
+    /// Stable deterministic reason code for diagnostics and automation.
+    #[must_use]
+    pub const fn reason_code(&self) -> &'static str {
+        match self {
+            Self::SchemaVersionMismatch { .. } => "RU_POLICY_SCHEMA_VERSION_MISMATCH",
+            Self::InvalidProjectsRoot(_) => "RU_POLICY_PROJECTS_ROOT_OUT_OF_SCOPE",
+            Self::UnsupportedRepoHost(_) => "RU_POLICY_REPO_HOST_DENIED",
+            Self::RepoSpecNotAllowlisted(_) => "RU_POLICY_REPO_SPEC_NOT_ALLOWLISTED",
+            Self::LocalPathSpecDenied(_) => "RU_POLICY_LOCAL_PATH_SPEC_DENIED",
+            Self::OperatorOverrideRequired => "RU_POLICY_OPERATOR_OVERRIDE_REQUIRED",
+            Self::OperatorOverrideDisabled => "RU_POLICY_OPERATOR_OVERRIDE_DISABLED",
+            Self::MalformedOperatorOverride(_) => "RU_POLICY_OPERATOR_OVERRIDE_MALFORMED",
+            Self::MalformedTrustPolicy(_) => "RU_POLICY_TRUST_POLICY_MALFORMED",
+            Self::MissingAuthContext => "RU_AUTH_CONTEXT_MISSING",
+            Self::AuthSourceMismatch { .. } => "RU_AUTH_SOURCE_MISMATCH",
+            Self::AuthCredentialRevoked => "RU_AUTH_CREDENTIAL_REVOKED",
+            Self::AuthCredentialExpired { .. } => "RU_AUTH_CREDENTIAL_EXPIRED",
+            Self::AuthCredentialTooOld { .. } => "RU_AUTH_ROTATION_REQUIRED",
+            Self::AuthScopeDenied(_) => "RU_AUTH_SCOPE_DENIED",
+            Self::HostIdentityMissing(_) => "RU_HOST_IDENTITY_MISSING",
+            Self::HostIdentityMismatch { .. } => "RU_HOST_IDENTITY_MISMATCH",
+            Self::MissingIdempotencyKey => "RU_POLICY_MISSING_IDEMPOTENCY_KEY",
+            Self::InvalidTimeout(_) => "RU_POLICY_INVALID_TIMEOUT",
+            Self::RetryAttemptExceeded { .. } => "RU_POLICY_RETRY_ATTEMPT_EXCEEDED",
+            Self::EmptyHostAllowlist => "RU_POLICY_EMPTY_HOST_ALLOWLIST",
+            Self::DuplicateCommandBudget(_) => "RU_POLICY_DUPLICATE_COMMAND_BUDGET",
+        }
+    }
+
+    /// Operator-facing remediation guidance aligned with reason_code().
+    #[must_use]
+    pub const fn remediation(&self) -> &'static str {
+        match self {
+            Self::SchemaVersionMismatch { .. } => {
+                "Align repo_updater and RCH contract schema versions before retrying."
+            }
+            Self::InvalidProjectsRoot(_) => {
+                "Use /data/projects (or /dp alias) as projects_root; traversal and out-of-scope paths are denied."
+            }
+            Self::UnsupportedRepoHost(_) => {
+                "Add the repo host to the trust-policy host allowlist or use an approved host."
+            }
+            Self::RepoSpecNotAllowlisted(_) => {
+                "Add the repo spec to the explicit convergence allowlist, or provide an operator override."
+            }
+            Self::LocalPathSpecDenied(_) => {
+                "Use remote repo specs (hosted) or relax local-path policy explicitly."
+            }
+            Self::OperatorOverrideRequired => {
+                "Provide explicit operator override metadata with audit fields for this request."
+            }
+            Self::OperatorOverrideDisabled => {
+                "Enable operator overrides in trust policy before sending override metadata."
+            }
+            Self::MalformedOperatorOverride(_) => {
+                "Populate all required override fields: operator_id, justification, ticket_ref, audit_event_id, approved_at_unix_ms."
+            }
+            Self::MalformedTrustPolicy(_) => {
+                "Fix malformed trust policy entries (empty allowlist rows, unsupported host mappings, or invalid values)."
+            }
+            Self::MissingAuthContext => {
+                "Provide authenticated credential context for mutating repo convergence operations."
+            }
+            Self::AuthSourceMismatch { .. } => {
+                "Use the credential source required by auth policy (gh_cli/token_env) before retrying."
+            }
+            Self::AuthCredentialRevoked => {
+                "Rotate to a non-revoked credential and update the worker-side secret source."
+            }
+            Self::AuthCredentialExpired { .. } => {
+                "Refresh credentials and retry with a non-expired token/key."
+            }
+            Self::AuthCredentialTooOld { .. } => {
+                "Rotate credentials to satisfy the maximum credential age policy."
+            }
+            Self::AuthScopeDenied(_) => {
+                "Grant the missing scope (least privilege) or adjust policy requirements."
+            }
+            Self::HostIdentityMissing(_) => {
+                "Collect and attach verified host identity metadata for each repo host."
+            }
+            Self::HostIdentityMismatch { .. } => {
+                "Fix host-key trust configuration or re-verify host identity before convergence."
+            }
+            Self::MissingIdempotencyKey => "Set a stable idempotency_key for convergence requests.",
+            Self::InvalidTimeout(_) => "Use a timeout_secs value greater than zero.",
+            Self::RetryAttemptExceeded { .. } => {
+                "Reset retry_attempt or increase max_attempts in retry policy."
+            }
+            Self::EmptyHostAllowlist => "Configure at least one allowed repo host.",
+            Self::DuplicateCommandBudget(_) => {
+                "Remove duplicate command budgets so each command has a single timeout policy."
+            }
+        }
+    }
+
+    /// Canonical failure taxonomy bucket for this validation error.
+    #[must_use]
+    pub const fn failure_kind(&self) -> RepoUpdaterFailureKind {
+        match self {
+            Self::MissingAuthContext
+            | Self::AuthSourceMismatch { .. }
+            | Self::AuthCredentialRevoked
+            | Self::AuthCredentialExpired { .. }
+            | Self::AuthCredentialTooOld { .. }
+            | Self::AuthScopeDenied(_) => RepoUpdaterFailureKind::AuthFailure,
+            Self::HostIdentityMissing(_) | Self::HostIdentityMismatch { .. } => {
+                RepoUpdaterFailureKind::HostValidationFailed
+            }
+            _ => RepoUpdaterFailureKind::TrustBoundaryViolation,
+        }
+    }
+}
+
 impl RepoUpdaterAdapterContract {
     /// Validate contract-level invariants.
     pub fn validate(&self) -> Result<(), RepoUpdaterContractError> {
         if self.trust_policy.allowed_repo_hosts.is_empty() {
             return Err(RepoUpdaterContractError::EmptyHostAllowlist);
+        }
+
+        for allowlisted_spec in &self.trust_policy.allowlisted_repo_specs {
+            if allowlisted_spec.trim().is_empty() {
+                return Err(RepoUpdaterContractError::MalformedTrustPolicy(
+                    "allowlisted_repo_specs contains empty entry".to_string(),
+                ));
+            }
+
+            if let Some(host) = extract_repo_host(
+                allowlisted_spec,
+                self.trust_policy.allow_owner_repo_shorthand,
+            ) {
+                let host_allowed = self
+                    .trust_policy
+                    .allowed_repo_hosts
+                    .iter()
+                    .any(|allowed_host| allowed_host.eq_ignore_ascii_case(&host));
+                if !host_allowed {
+                    return Err(RepoUpdaterContractError::MalformedTrustPolicy(format!(
+                        "allowlisted spec '{}' references host '{}' not present in allowed_repo_hosts",
+                        allowlisted_spec, host
+                    )));
+                }
+            } else if self.trust_policy.reject_local_path_specs {
+                return Err(RepoUpdaterContractError::MalformedTrustPolicy(format!(
+                    "allowlisted spec '{}' is local-path-like but reject_local_path_specs=true",
+                    allowlisted_spec
+                )));
+            }
+        }
+
+        if self.auth_policy.rotation_max_age_secs == 0 {
+            return Err(RepoUpdaterContractError::MalformedTrustPolicy(
+                "auth_policy.rotation_max_age_secs must be > 0".to_string(),
+            ));
+        }
+        for scope in &self.auth_policy.required_scopes {
+            if scope.trim().is_empty() {
+                return Err(RepoUpdaterContractError::MalformedTrustPolicy(
+                    "auth_policy.required_scopes contains empty entry".to_string(),
+                ));
+            }
+        }
+        if self.auth_policy.require_host_identity_verification
+            && self.auth_policy.trusted_host_identities.is_empty()
+        {
+            return Err(RepoUpdaterContractError::MalformedTrustPolicy(
+                "auth_policy.require_host_identity_verification=true but trusted_host_identities is empty".to_string(),
+            ));
+        }
+        for identity in &self.auth_policy.trusted_host_identities {
+            if identity.host.trim().is_empty() || identity.key_fingerprint.trim().is_empty() {
+                return Err(RepoUpdaterContractError::MalformedTrustPolicy(
+                    "auth_policy.trusted_host_identities contains empty host or fingerprint"
+                        .to_string(),
+                ));
+            }
         }
 
         let mut seen: Vec<RepoUpdaterAdapterCommand> = Vec::new();
@@ -533,6 +855,7 @@ impl RepoUpdaterAdapterRequest {
         &self,
         contract: &RepoUpdaterAdapterContract,
     ) -> Result<(), RepoUpdaterContractError> {
+        contract.validate()?;
         if self.schema_version != REPO_UPDATER_CONTRACT_SCHEMA_VERSION {
             return Err(RepoUpdaterContractError::SchemaVersionMismatch {
                 expected: REPO_UPDATER_CONTRACT_SCHEMA_VERSION.to_string(),
@@ -557,10 +880,32 @@ impl RepoUpdaterAdapterRequest {
             ));
         }
 
+        let operator_override_active = if let Some(override_metadata) = &self.operator_override {
+            if !contract.trust_policy.allow_operator_override {
+                return Err(RepoUpdaterContractError::OperatorOverrideDisabled);
+            }
+            validate_operator_override(override_metadata)?;
+            true
+        } else {
+            false
+        };
+
+        if self.command.mutating() {
+            validate_auth_context(self, contract)?;
+        }
+
         for spec in &self.repo_specs {
-            if let Some(host) =
-                extract_repo_host(spec, contract.trust_policy.allow_owner_repo_shorthand)
-            {
+            let normalized_spec = spec.trim();
+            if normalized_spec.is_empty() {
+                return Err(RepoUpdaterContractError::MalformedTrustPolicy(
+                    "repo_specs contains empty entry".to_string(),
+                ));
+            }
+
+            if let Some(host) = extract_repo_host(
+                normalized_spec,
+                contract.trust_policy.allow_owner_repo_shorthand,
+            ) {
                 let allowed = contract
                     .trust_policy
                     .allowed_repo_hosts
@@ -570,12 +915,174 @@ impl RepoUpdaterAdapterRequest {
                     return Err(RepoUpdaterContractError::UnsupportedRepoHost(host));
                 }
             } else if contract.trust_policy.reject_local_path_specs {
-                return Err(RepoUpdaterContractError::UnsupportedRepoHost(spec.clone()));
+                return Err(RepoUpdaterContractError::LocalPathSpecDenied(
+                    normalized_spec.to_string(),
+                ));
+            }
+
+            if contract.trust_policy.enforce_repo_spec_allowlist
+                && !repo_spec_is_allowlisted(
+                    normalized_spec,
+                    &contract.trust_policy.allowlisted_repo_specs,
+                )
+            {
+                if operator_override_active {
+                    continue;
+                }
+                if contract.trust_policy.allow_operator_override {
+                    return Err(RepoUpdaterContractError::OperatorOverrideRequired);
+                }
+                return Err(RepoUpdaterContractError::RepoSpecNotAllowlisted(
+                    normalized_spec.to_string(),
+                ));
             }
         }
 
         Ok(())
     }
+}
+
+fn validate_auth_context(
+    request: &RepoUpdaterAdapterRequest,
+    contract: &RepoUpdaterAdapterContract,
+) -> Result<(), RepoUpdaterContractError> {
+    let Some(auth_context) = request.auth_context.as_ref() else {
+        return Err(RepoUpdaterContractError::MissingAuthContext);
+    };
+
+    if auth_context.credential_id.trim().is_empty() {
+        return Err(RepoUpdaterContractError::MalformedTrustPolicy(
+            "auth_context.credential_id is empty".to_string(),
+        ));
+    }
+    if auth_context.revoked {
+        return Err(RepoUpdaterContractError::AuthCredentialRevoked);
+    }
+    if auth_context.expires_at_unix_ms <= request.requested_at_unix_ms {
+        return Err(RepoUpdaterContractError::AuthCredentialExpired {
+            expires_at_unix_ms: auth_context.expires_at_unix_ms,
+        });
+    }
+    if auth_context.issued_at_unix_ms <= 0 {
+        return Err(RepoUpdaterContractError::MalformedTrustPolicy(
+            "auth_context.issued_at_unix_ms must be > 0".to_string(),
+        ));
+    }
+    let credential_age_ms = request.requested_at_unix_ms - auth_context.issued_at_unix_ms;
+    if credential_age_ms < 0 {
+        return Err(RepoUpdaterContractError::MalformedTrustPolicy(
+            "auth_context.issued_at_unix_ms cannot be in the future".to_string(),
+        ));
+    }
+    let credential_age_secs = (credential_age_ms / 1_000) as u64;
+    if credential_age_secs > contract.auth_policy.rotation_max_age_secs {
+        return Err(RepoUpdaterContractError::AuthCredentialTooOld {
+            age_secs: credential_age_secs,
+            max_age_secs: contract.auth_policy.rotation_max_age_secs,
+        });
+    }
+
+    match contract.auth_policy.mode {
+        RepoUpdaterAuthMode::InheritEnvironment => {}
+        RepoUpdaterAuthMode::RequireGhAuth => {
+            if auth_context.source != RepoUpdaterCredentialSource::GhCli {
+                return Err(RepoUpdaterContractError::AuthSourceMismatch {
+                    mode: RepoUpdaterAuthMode::RequireGhAuth,
+                    actual: auth_context.source,
+                });
+            }
+        }
+        RepoUpdaterAuthMode::RequireTokenEnv => {
+            if auth_context.source != RepoUpdaterCredentialSource::TokenEnv {
+                return Err(RepoUpdaterContractError::AuthSourceMismatch {
+                    mode: RepoUpdaterAuthMode::RequireTokenEnv,
+                    actual: auth_context.source,
+                });
+            }
+        }
+    }
+
+    for required_scope in &contract.auth_policy.required_scopes {
+        let has_scope = auth_context
+            .granted_scopes
+            .iter()
+            .any(|granted_scope| granted_scope.eq_ignore_ascii_case(required_scope));
+        if !has_scope {
+            return Err(RepoUpdaterContractError::AuthScopeDenied(
+                required_scope.clone(),
+            ));
+        }
+    }
+
+    if contract.auth_policy.require_host_identity_verification {
+        for spec in &request.repo_specs {
+            let Some(host) =
+                extract_repo_host(spec, contract.trust_policy.allow_owner_repo_shorthand)
+            else {
+                continue;
+            };
+            let Some(verified_host) = auth_context
+                .verified_hosts
+                .iter()
+                .find(|identity| identity.host.eq_ignore_ascii_case(&host))
+            else {
+                return Err(RepoUpdaterContractError::HostIdentityMissing(host));
+            };
+            let Some(trusted_host) = contract
+                .auth_policy
+                .trusted_host_identities
+                .iter()
+                .find(|identity| identity.host.eq_ignore_ascii_case(&host))
+            else {
+                return Err(RepoUpdaterContractError::HostIdentityMissing(
+                    verified_host.host.clone(),
+                ));
+            };
+            if !verified_host
+                .key_fingerprint
+                .eq_ignore_ascii_case(&trusted_host.key_fingerprint)
+            {
+                return Err(RepoUpdaterContractError::HostIdentityMismatch {
+                    host: host.clone(),
+                    expected: trusted_host.key_fingerprint.clone(),
+                    actual: verified_host.key_fingerprint.clone(),
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_operator_override(
+    metadata: &RepoUpdaterOperatorOverride,
+) -> Result<(), RepoUpdaterContractError> {
+    if metadata.operator_id.trim().is_empty() {
+        return Err(RepoUpdaterContractError::MalformedOperatorOverride(
+            "operator_id is empty".to_string(),
+        ));
+    }
+    if metadata.justification.trim().is_empty() {
+        return Err(RepoUpdaterContractError::MalformedOperatorOverride(
+            "justification is empty".to_string(),
+        ));
+    }
+    if metadata.ticket_ref.trim().is_empty() {
+        return Err(RepoUpdaterContractError::MalformedOperatorOverride(
+            "ticket_ref is empty".to_string(),
+        ));
+    }
+    if metadata.audit_event_id.trim().is_empty() {
+        return Err(RepoUpdaterContractError::MalformedOperatorOverride(
+            "audit_event_id is empty".to_string(),
+        ));
+    }
+    if metadata.approved_at_unix_ms <= 0 {
+        return Err(RepoUpdaterContractError::MalformedOperatorOverride(
+            "approved_at_unix_ms must be > 0".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Adapter interface that can be mocked in deterministic tests.
@@ -621,18 +1128,13 @@ impl RepoUpdaterAdapter for MockRepoUpdaterAdapter {
         contract: &RepoUpdaterAdapterContract,
     ) -> Result<RepoUpdaterAdapterResponse, RepoUpdaterFailure> {
         if let Err(error) = request.validate(contract) {
+            let failure_kind = error.failure_kind();
             return Err(RepoUpdaterFailure {
-                kind: RepoUpdaterFailureKind::TrustBoundaryViolation,
-                code: "RU_REQ_INVALID".to_string(),
+                kind: failure_kind,
+                code: error.reason_code().to_string(),
                 message: error.to_string(),
-                mapped_rch_error: map_failure_kind_to_error_code(
-                    RepoUpdaterFailureKind::TrustBoundaryViolation,
-                )
-                .code_string(),
-                remediation: vec![
-                    "Verify projects root is canonicalized to /data/projects".to_string(),
-                    "Validate repo specs against host allowlist".to_string(),
-                ],
+                mapped_rch_error: map_failure_kind_to_error_code(failure_kind).code_string(),
+                remediation: vec![error.remediation().to_string()],
                 adapter_exit_code: None,
             });
         }
@@ -686,7 +1188,7 @@ pub fn build_invocation(
         args.extend(request.repo_specs.iter().cloned());
     }
 
-    let env = vec![
+    let mut env = vec![
         (
             "RU_PROJECTS_DIR".to_string(),
             normalize_projects_root(&request.projects_root, &contract.trust_policy)
@@ -699,6 +1201,67 @@ pub fn build_invocation(
             request.idempotency_key.clone(),
         ),
     ];
+
+    if let Some(override_metadata) = &request.operator_override {
+        env.push((
+            REPO_UPDATER_OVERRIDE_OPERATOR_ID_ENV.to_string(),
+            override_metadata.operator_id.clone(),
+        ));
+        env.push((
+            REPO_UPDATER_OVERRIDE_JUSTIFICATION_ENV.to_string(),
+            override_metadata.justification.clone(),
+        ));
+        env.push((
+            REPO_UPDATER_OVERRIDE_TICKET_REF_ENV.to_string(),
+            override_metadata.ticket_ref.clone(),
+        ));
+        env.push((
+            REPO_UPDATER_OVERRIDE_AUDIT_EVENT_ID_ENV.to_string(),
+            override_metadata.audit_event_id.clone(),
+        ));
+        env.push((
+            REPO_UPDATER_OVERRIDE_APPROVED_AT_MS_ENV.to_string(),
+            override_metadata.approved_at_unix_ms.to_string(),
+        ));
+    }
+    if let Some(auth_context) = &request.auth_context {
+        let source = match auth_context.source {
+            RepoUpdaterCredentialSource::GhCli => "gh_cli",
+            RepoUpdaterCredentialSource::TokenEnv => "token_env",
+            RepoUpdaterCredentialSource::SshAgent => "ssh_agent",
+        };
+        env.push((REPO_UPDATER_AUTH_SOURCE_ENV.to_string(), source.to_string()));
+        env.push((
+            REPO_UPDATER_AUTH_CREDENTIAL_ID_ENV.to_string(),
+            auth_context.credential_id.clone(),
+        ));
+        env.push((
+            REPO_UPDATER_AUTH_ISSUED_AT_MS_ENV.to_string(),
+            auth_context.issued_at_unix_ms.to_string(),
+        ));
+        env.push((
+            REPO_UPDATER_AUTH_EXPIRES_AT_MS_ENV.to_string(),
+            auth_context.expires_at_unix_ms.to_string(),
+        ));
+        env.push((
+            REPO_UPDATER_AUTH_SCOPES_ENV.to_string(),
+            auth_context.granted_scopes.join(","),
+        ));
+        env.push((
+            REPO_UPDATER_AUTH_REVOKED_ENV.to_string(),
+            auth_context.revoked.to_string(),
+        ));
+        let verified_hosts = auth_context
+            .verified_hosts
+            .iter()
+            .map(|identity| format!("{}={}", identity.host, identity.key_fingerprint))
+            .collect::<Vec<_>>()
+            .join(",");
+        env.push((
+            REPO_UPDATER_AUTH_VERIFIED_HOSTS_ENV.to_string(),
+            verified_hosts,
+        ));
+    }
 
     RepoUpdaterInvocation {
         binary: contract.adapter_binary.clone(),
@@ -889,6 +1452,20 @@ fn extract_repo_host(spec: &str, allow_owner_repo_shorthand: bool) -> Option<Str
     None
 }
 
+fn normalize_repo_spec_for_allowlist(spec: &str) -> String {
+    spec.trim()
+        .trim_end_matches('/')
+        .trim_end_matches(".git")
+        .to_string()
+}
+
+fn repo_spec_is_allowlisted(spec: &str, allowlist: &[String]) -> bool {
+    let normalized = normalize_repo_spec_for_allowlist(spec);
+    allowlist.iter().any(|allowlisted| {
+        normalize_repo_spec_for_allowlist(allowlisted).eq_ignore_ascii_case(&normalized)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -909,6 +1486,45 @@ mod tests {
             retry_attempt: 0,
             timeout_secs: 30,
             expected_output_format: RepoUpdaterOutputFormat::Json,
+            auth_context: None,
+            operator_override: None,
+        }
+    }
+
+    fn contract_with_allowlisted_sample_specs() -> RepoUpdaterAdapterContract {
+        let mut contract = RepoUpdaterAdapterContract::default();
+        contract.trust_policy.allowlisted_repo_specs = sample_request().repo_specs;
+        contract
+    }
+
+    fn sample_sync_apply_request_with_auth() -> RepoUpdaterAdapterRequest {
+        RepoUpdaterAdapterRequest {
+            schema_version: REPO_UPDATER_CONTRACT_SCHEMA_VERSION.to_string(),
+            correlation_id: "corr-ru-auth-001".to_string(),
+            worker_id: "worker-a".to_string(),
+            command: RepoUpdaterAdapterCommand::SyncApply,
+            requested_at_unix_ms: 1_770_000_500_000,
+            projects_root: PathBuf::from(REPO_UPDATER_CANONICAL_PROJECTS_ROOT),
+            repo_specs: vec!["https://github.com/Dicklesworthstone/repo_updater".to_string()],
+            idempotency_key: "idemp-auth-001".to_string(),
+            retry_attempt: 0,
+            timeout_secs: 60,
+            expected_output_format: RepoUpdaterOutputFormat::Json,
+            auth_context: Some(RepoUpdaterAuthContext {
+                source: RepoUpdaterCredentialSource::TokenEnv,
+                credential_id: "cred-123".to_string(),
+                issued_at_unix_ms: 1_770_000_000_000,
+                expires_at_unix_ms: 1_770_100_000_000,
+                granted_scopes: vec!["repo:read".to_string(), "repo:status".to_string()],
+                revoked: false,
+                verified_hosts: vec![RepoUpdaterVerifiedHostIdentity {
+                    host: "github.com".to_string(),
+                    key_fingerprint: "SHA256:+DiY3wvvV6TuJJhbpZisF/J84OHwY2l7uxD9f4HBlz8"
+                        .to_string(),
+                    verified_at_unix_ms: 1_770_000_500_000,
+                }],
+            }),
+            operator_override: None,
         }
     }
 
@@ -958,7 +1574,7 @@ mod tests {
 
     #[test]
     fn repo_updater_contract_accepts_dp_alias_projects_root() {
-        let contract = RepoUpdaterAdapterContract::default();
+        let contract = contract_with_allowlisted_sample_specs();
         let request = RepoUpdaterAdapterRequest {
             projects_root: PathBuf::from(REPO_UPDATER_ALIAS_PROJECTS_ROOT),
             ..sample_request()
@@ -980,6 +1596,280 @@ mod tests {
             err,
             RepoUpdaterContractError::UnsupportedRepoHost(_)
         ));
+    }
+
+    #[test]
+    fn repo_updater_contract_default_deny_rejects_unallowlisted_specs() {
+        let contract = RepoUpdaterAdapterContract::default();
+        let request = sample_request();
+        let err = request
+            .validate(&contract)
+            .expect_err("default policy should deny unallowlisted repos");
+        assert!(matches!(
+            err,
+            RepoUpdaterContractError::RepoSpecNotAllowlisted(_)
+        ));
+        assert_eq!(err.reason_code(), "RU_POLICY_REPO_SPEC_NOT_ALLOWLISTED");
+    }
+
+    #[test]
+    fn repo_updater_contract_allowlist_allows_explicit_spec_set() {
+        let contract = contract_with_allowlisted_sample_specs();
+        sample_request()
+            .validate(&contract)
+            .expect("allowlisted repo specs should pass validation");
+    }
+
+    #[test]
+    fn repo_updater_contract_rejects_projects_root_traversal() {
+        let contract = contract_with_allowlisted_sample_specs();
+        let request = RepoUpdaterAdapterRequest {
+            projects_root: PathBuf::from("/dp/../tmp"),
+            ..sample_request()
+        };
+        let err = request
+            .validate(&contract)
+            .expect_err("traversal/out-of-scope roots must be rejected");
+        assert!(matches!(
+            err,
+            RepoUpdaterContractError::InvalidProjectsRoot(_)
+        ));
+        assert_eq!(err.reason_code(), "RU_POLICY_PROJECTS_ROOT_OUT_OF_SCOPE");
+    }
+
+    #[test]
+    fn repo_updater_contract_operator_override_allows_exception_with_audit_metadata() {
+        let mut contract = RepoUpdaterAdapterContract::default();
+        contract.trust_policy.allow_operator_override = true;
+
+        let request = RepoUpdaterAdapterRequest {
+            operator_override: Some(RepoUpdaterOperatorOverride {
+                operator_id: "ops-user".to_string(),
+                justification: "Emergency sync required for release gate".to_string(),
+                ticket_ref: "OPS-42".to_string(),
+                audit_event_id: "audit-evt-0001".to_string(),
+                approved_at_unix_ms: 1_770_000_123_000,
+            }),
+            ..sample_request()
+        };
+
+        request
+            .validate(&contract)
+            .expect("valid operator override should satisfy default-deny allowlist");
+    }
+
+    #[test]
+    fn repo_updater_contract_operator_override_requires_enablement() {
+        let request = RepoUpdaterAdapterRequest {
+            operator_override: Some(RepoUpdaterOperatorOverride {
+                operator_id: "ops-user".to_string(),
+                justification: "Approved".to_string(),
+                ticket_ref: "OPS-43".to_string(),
+                audit_event_id: "audit-evt-0002".to_string(),
+                approved_at_unix_ms: 1_770_000_223_000,
+            }),
+            ..sample_request()
+        };
+
+        let err = request
+            .validate(&RepoUpdaterAdapterContract::default())
+            .expect_err("override must be rejected when allow_operator_override=false");
+        assert!(matches!(
+            err,
+            RepoUpdaterContractError::OperatorOverrideDisabled
+        ));
+        assert_eq!(err.reason_code(), "RU_POLICY_OPERATOR_OVERRIDE_DISABLED");
+    }
+
+    #[test]
+    fn repo_updater_contract_rejects_malformed_operator_override() {
+        let mut contract = RepoUpdaterAdapterContract::default();
+        contract.trust_policy.allow_operator_override = true;
+
+        let request = RepoUpdaterAdapterRequest {
+            operator_override: Some(RepoUpdaterOperatorOverride {
+                operator_id: "ops-user".to_string(),
+                justification: "".to_string(),
+                ticket_ref: "OPS-44".to_string(),
+                audit_event_id: "audit-evt-0003".to_string(),
+                approved_at_unix_ms: 1_770_000_323_000,
+            }),
+            ..sample_request()
+        };
+
+        let err = request
+            .validate(&contract)
+            .expect_err("malformed override metadata must be rejected");
+        assert!(matches!(
+            err,
+            RepoUpdaterContractError::MalformedOperatorOverride(_)
+        ));
+        assert_eq!(err.reason_code(), "RU_POLICY_OPERATOR_OVERRIDE_MALFORMED");
+    }
+
+    #[test]
+    fn repo_updater_contract_rejects_malformed_allowlist_policy() {
+        let mut contract = RepoUpdaterAdapterContract::default();
+        contract.trust_policy.allowlisted_repo_specs = vec![" ".to_string()];
+        let err = contract
+            .validate()
+            .expect_err("empty allowlist entries should fail validation");
+        assert!(matches!(
+            err,
+            RepoUpdaterContractError::MalformedTrustPolicy(_)
+        ));
+        assert_eq!(err.reason_code(), "RU_POLICY_TRUST_POLICY_MALFORMED");
+    }
+
+    #[test]
+    fn repo_updater_contract_requires_auth_context_for_sync_apply() {
+        let mut contract = RepoUpdaterAdapterContract::default();
+        contract.trust_policy.allowlisted_repo_specs =
+            vec!["https://github.com/Dicklesworthstone/repo_updater".to_string()];
+        let mut request = sample_sync_apply_request_with_auth();
+        request.auth_context = None;
+
+        let err = request
+            .validate(&contract)
+            .expect_err("mutating convergence must require auth context");
+        assert!(matches!(err, RepoUpdaterContractError::MissingAuthContext));
+        assert_eq!(err.reason_code(), "RU_AUTH_CONTEXT_MISSING");
+        assert_eq!(err.failure_kind(), RepoUpdaterFailureKind::AuthFailure);
+    }
+
+    #[test]
+    fn repo_updater_contract_rejects_expired_credentials() {
+        let mut contract = RepoUpdaterAdapterContract::default();
+        contract.trust_policy.allowlisted_repo_specs =
+            vec!["https://github.com/Dicklesworthstone/repo_updater".to_string()];
+        let mut request = sample_sync_apply_request_with_auth();
+        request
+            .auth_context
+            .as_mut()
+            .expect("auth context present")
+            .expires_at_unix_ms = 1_769_999_999_000;
+
+        let err = request
+            .validate(&contract)
+            .expect_err("expired credentials must be rejected");
+        assert!(matches!(
+            err,
+            RepoUpdaterContractError::AuthCredentialExpired { .. }
+        ));
+        assert_eq!(err.reason_code(), "RU_AUTH_CREDENTIAL_EXPIRED");
+    }
+
+    #[test]
+    fn repo_updater_contract_rejects_revoked_credentials() {
+        let mut contract = RepoUpdaterAdapterContract::default();
+        contract.trust_policy.allowlisted_repo_specs =
+            vec!["https://github.com/Dicklesworthstone/repo_updater".to_string()];
+        let mut request = sample_sync_apply_request_with_auth();
+        request
+            .auth_context
+            .as_mut()
+            .expect("auth context present")
+            .revoked = true;
+
+        let err = request
+            .validate(&contract)
+            .expect_err("revoked credentials must be rejected");
+        assert!(matches!(
+            err,
+            RepoUpdaterContractError::AuthCredentialRevoked
+        ));
+        assert_eq!(err.reason_code(), "RU_AUTH_CREDENTIAL_REVOKED");
+    }
+
+    #[test]
+    fn repo_updater_contract_rejects_missing_required_scope() {
+        let mut contract = RepoUpdaterAdapterContract::default();
+        contract.trust_policy.allowlisted_repo_specs =
+            vec!["https://github.com/Dicklesworthstone/repo_updater".to_string()];
+        contract.auth_policy.required_scopes = vec!["repo:write".to_string()];
+        let request = sample_sync_apply_request_with_auth();
+
+        let err = request
+            .validate(&contract)
+            .expect_err("missing scope should fail auth validation");
+        assert!(matches!(err, RepoUpdaterContractError::AuthScopeDenied(_)));
+        assert_eq!(err.reason_code(), "RU_AUTH_SCOPE_DENIED");
+    }
+
+    #[test]
+    fn repo_updater_contract_rejects_invalid_credential_source() {
+        let mut contract = RepoUpdaterAdapterContract::default();
+        contract.trust_policy.allowlisted_repo_specs =
+            vec!["https://github.com/Dicklesworthstone/repo_updater".to_string()];
+        contract.auth_policy.mode = RepoUpdaterAuthMode::RequireGhAuth;
+        let request = sample_sync_apply_request_with_auth();
+
+        let err = request
+            .validate(&contract)
+            .expect_err("source mismatch should fail auth-mode checks");
+        assert!(matches!(
+            err,
+            RepoUpdaterContractError::AuthSourceMismatch { .. }
+        ));
+        assert_eq!(err.reason_code(), "RU_AUTH_SOURCE_MISMATCH");
+    }
+
+    #[test]
+    fn repo_updater_contract_rejects_host_identity_mismatch() {
+        let mut contract = RepoUpdaterAdapterContract::default();
+        contract.trust_policy.allowlisted_repo_specs =
+            vec!["https://github.com/Dicklesworthstone/repo_updater".to_string()];
+        let mut request = sample_sync_apply_request_with_auth();
+        request
+            .auth_context
+            .as_mut()
+            .expect("auth context present")
+            .verified_hosts[0]
+            .key_fingerprint = "SHA256:INVALID".to_string();
+
+        let err = request
+            .validate(&contract)
+            .expect_err("host-key mismatch must be rejected");
+        assert!(matches!(
+            err,
+            RepoUpdaterContractError::HostIdentityMismatch { .. }
+        ));
+        assert_eq!(err.reason_code(), "RU_HOST_IDENTITY_MISMATCH");
+        assert_eq!(
+            err.failure_kind(),
+            RepoUpdaterFailureKind::HostValidationFailed
+        );
+    }
+
+    #[test]
+    fn repo_updater_contract_accepts_valid_sync_apply_auth_context() {
+        let mut contract = RepoUpdaterAdapterContract::default();
+        contract.trust_policy.allowlisted_repo_specs =
+            vec!["https://github.com/Dicklesworthstone/repo_updater".to_string()];
+        let request = sample_sync_apply_request_with_auth();
+        request
+            .validate(&contract)
+            .expect("valid credential + host identity context should pass");
+    }
+
+    #[test]
+    fn repo_updater_contract_mock_adapter_classifies_auth_failures() {
+        let adapter = MockRepoUpdaterAdapter::default();
+        let mut contract = RepoUpdaterAdapterContract::default();
+        contract.trust_policy.allowlisted_repo_specs =
+            vec!["https://github.com/Dicklesworthstone/repo_updater".to_string()];
+        let mut request = sample_sync_apply_request_with_auth();
+        request
+            .auth_context
+            .as_mut()
+            .expect("auth context present")
+            .revoked = true;
+
+        let err = adapter
+            .execute(&request, &contract)
+            .expect_err("revoked credentials should fail before adapter execution");
+        assert_eq!(err.kind, RepoUpdaterFailureKind::AuthFailure);
+        assert_eq!(err.code, "RU_AUTH_CREDENTIAL_REVOKED");
     }
 
     #[test]
@@ -1053,9 +1943,55 @@ mod tests {
     }
 
     #[test]
+    fn repo_updater_contract_build_invocation_includes_override_audit_env() {
+        let contract = RepoUpdaterAdapterContract::default();
+        let request = RepoUpdaterAdapterRequest {
+            operator_override: Some(RepoUpdaterOperatorOverride {
+                operator_id: "ops-user".to_string(),
+                justification: "approved exception".to_string(),
+                ticket_ref: "OPS-45".to_string(),
+                audit_event_id: "audit-evt-0004".to_string(),
+                approved_at_unix_ms: 1_770_000_423_000,
+            }),
+            ..sample_request()
+        };
+        let invocation = build_invocation(&request, &contract);
+
+        assert!(
+            invocation
+                .env
+                .iter()
+                .any(|(k, v)| { k == REPO_UPDATER_OVERRIDE_OPERATOR_ID_ENV && v == "ops-user" })
+        );
+        assert!(invocation.env.iter().any(|(k, v)| {
+            k == REPO_UPDATER_OVERRIDE_AUDIT_EVENT_ID_ENV && v == "audit-evt-0004"
+        }));
+    }
+
+    #[test]
+    fn repo_updater_contract_build_invocation_includes_auth_env_context() {
+        let contract = RepoUpdaterAdapterContract::default();
+        let request = sample_sync_apply_request_with_auth();
+        let invocation = build_invocation(&request, &contract);
+
+        assert!(
+            invocation
+                .env
+                .iter()
+                .any(|(k, v)| k == REPO_UPDATER_AUTH_SOURCE_ENV && v == "token_env")
+        );
+        assert!(
+            invocation
+                .env
+                .iter()
+                .any(|(k, v)| k == REPO_UPDATER_AUTH_CREDENTIAL_ID_ENV && v == "cred-123")
+        );
+    }
+
+    #[test]
     fn repo_updater_contract_mock_adapter_records_calls_and_returns_scripted_result() {
         let adapter = MockRepoUpdaterAdapter::default();
-        let contract = RepoUpdaterAdapterContract::default();
+        let contract = contract_with_allowlisted_sample_specs();
         let request = sample_request();
 
         let scripted = RepoUpdaterAdapterResponse {

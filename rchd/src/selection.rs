@@ -1100,6 +1100,7 @@ impl WorkerSelector {
         let mut eligible_without_health: Vec<(Arc<WorkerState>, CircuitState)> = Vec::new();
         let mut preferred_without_health: Vec<(Arc<WorkerState>, CircuitState)> = Vec::new();
         let mut filtered_by_health = 0usize;
+        let mut filtered_by_hard_preflight = 0usize;
         let mut any_has_runtime = false;
 
         for worker in workers {
@@ -1144,6 +1145,19 @@ impl WorkerSelector {
 
             // Filter by load-per-core threshold (bd-3eaa)
             let capabilities = worker.capabilities().await;
+            if let Some(false) = capabilities.is_topology_healthy() {
+                let reason = capabilities
+                    .projects_root_issue
+                    .clone()
+                    .unwrap_or_else(|| "unknown_topology_error".to_string());
+                debug!(
+                    "Worker {} excluded: topology preflight failed ({})",
+                    worker_id, reason
+                );
+                filtered_by_hard_preflight += 1;
+                continue;
+            }
+
             let mut passes_preflight = true;
             if let Some(max_load) = self.config.max_load_per_core
                 && let Some(true) = capabilities.is_high_load(max_load)
@@ -1208,6 +1222,19 @@ impl WorkerSelector {
         }
         if !eligible.is_empty() {
             return Ok(eligible);
+        }
+
+        // Hard preflight failures (for example topology invariants) must not
+        // fall back to unhealthy worker assignment; force fail-open local execution.
+        if filtered_by_hard_preflight > 0
+            && preferred_without_health.is_empty()
+            && eligible_without_health.is_empty()
+        {
+            debug!(
+                "All candidate workers failed hard preflight checks (count={})",
+                filtered_by_hard_preflight
+            );
+            return Err(SelectionReason::AllWorkersFailedPreflight);
         }
 
         if filtered_by_health > 0 {
@@ -2786,6 +2813,137 @@ mod tests {
             "Expected AllWorkersBusy, got {:?}",
             result.reason
         );
+    }
+
+    #[tokio::test]
+    async fn test_topology_preflight_prefers_healthy_worker() {
+        let pool = WorkerPool::new();
+
+        let missing_alias = make_worker("missing-alias", 8, 95.0);
+        missing_alias
+            .set_capabilities(rch_common::WorkerCapabilities {
+                rustc_version: Some("1.87.0".to_string()),
+                projects_root_ok: Some(false),
+                projects_root_issue: Some("alias_missing".to_string()),
+                projects_root_checked_at_unix_ms: Some(1_700_000_000_000),
+                ..Default::default()
+            })
+            .await;
+        pool.add_worker_state(missing_alias).await;
+
+        let healthy = make_worker("healthy-topology", 8, 80.0);
+        healthy
+            .set_capabilities(rch_common::WorkerCapabilities {
+                rustc_version: Some("1.87.0".to_string()),
+                projects_root_ok: Some(true),
+                projects_root_checked_at_unix_ms: Some(1_700_000_000_000),
+                ..Default::default()
+            })
+            .await;
+        pool.add_worker_state(healthy).await;
+
+        let selector = WorkerSelector::default();
+        let request = SelectionRequest {
+            project: "topology-project".to_string(),
+            command: Some("cargo test --no-run".to_string()),
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 2,
+            preferred_workers: vec![],
+            toolchain: None,
+            required_runtime: RequiredRuntime::Rust,
+            classification_duration_us: None,
+            hook_pid: None,
+        };
+
+        let result = selector.select(&pool, &request).await;
+        let selected = result.worker.expect("expected healthy topology worker");
+        assert_eq!(selected.config.read().await.id.as_str(), "healthy-topology");
+        assert_eq!(result.reason, SelectionReason::Success);
+    }
+
+    #[tokio::test]
+    async fn test_topology_preflight_rejects_wrong_target_only_pool() {
+        let pool = WorkerPool::new();
+
+        let wrong_target = make_worker("wrong-target", 8, 95.0);
+        wrong_target
+            .set_capabilities(rch_common::WorkerCapabilities {
+                rustc_version: Some("1.87.0".to_string()),
+                projects_root_ok: Some(false),
+                projects_root_issue: Some("alias_wrong_target:/tmp/other".to_string()),
+                projects_root_checked_at_unix_ms: Some(1_700_000_000_123),
+                ..Default::default()
+            })
+            .await;
+        pool.add_worker_state(wrong_target).await;
+
+        let selector = WorkerSelector::default();
+        let request = SelectionRequest {
+            project: "topology-project".to_string(),
+            command: Some("cargo build".to_string()),
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 2,
+            preferred_workers: vec![],
+            toolchain: None,
+            required_runtime: RequiredRuntime::Rust,
+            classification_duration_us: None,
+            hook_pid: None,
+        };
+
+        let result = selector.select(&pool, &request).await;
+        assert!(result.worker.is_none());
+        assert_eq!(result.reason, SelectionReason::AllWorkersFailedPreflight);
+    }
+
+    #[tokio::test]
+    async fn test_topology_preflight_flapping_recovery_requires_revalidation() {
+        let pool = WorkerPool::new();
+        let flapping = make_worker("flapping", 8, 70.0);
+        flapping
+            .set_capabilities(rch_common::WorkerCapabilities {
+                rustc_version: Some("1.87.0".to_string()),
+                projects_root_ok: Some(false),
+                projects_root_issue: Some("alias_missing".to_string()),
+                projects_root_checked_at_unix_ms: Some(1_700_000_000_200),
+                ..Default::default()
+            })
+            .await;
+        pool.add_worker_state(flapping).await;
+
+        let selector = WorkerSelector::default();
+        let request = SelectionRequest {
+            project: "topology-flap".to_string(),
+            command: Some("cargo check".to_string()),
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 1,
+            preferred_workers: vec![],
+            toolchain: None,
+            required_runtime: RequiredRuntime::Rust,
+            classification_duration_us: None,
+            hook_pid: None,
+        };
+
+        let first = selector.select(&pool, &request).await;
+        assert!(first.worker.is_none());
+        assert_eq!(first.reason, SelectionReason::AllWorkersFailedPreflight);
+
+        // Explicit revalidation updates capabilities and allows scheduling again.
+        let state = pool.get(&WorkerId::new("flapping")).await.unwrap();
+        state
+            .set_capabilities(rch_common::WorkerCapabilities {
+                rustc_version: Some("1.87.0".to_string()),
+                projects_root_ok: Some(true),
+                projects_root_checked_at_unix_ms: Some(1_700_000_100_000),
+                ..Default::default()
+            })
+            .await;
+
+        let second = selector.select(&pool, &request).await;
+        let selected = second
+            .worker
+            .expect("expected worker to recover after explicit revalidation");
+        assert_eq!(selected.config.read().await.id.as_str(), "flapping");
+        assert_eq!(second.reason, SelectionReason::Success);
     }
 
     #[tokio::test]

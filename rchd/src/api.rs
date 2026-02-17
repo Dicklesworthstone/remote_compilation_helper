@@ -1681,6 +1681,27 @@ async fn handle_benchmark_trigger(
         .enqueue(worker_id.clone(), request_id.clone())
     {
         Ok(request) => {
+            if let Err(err) = ctx
+                .benchmark_trigger
+                .trigger(worker_id.clone(), request.request_id.clone(), None)
+                .await
+            {
+                warn!(
+                    worker = %worker_id,
+                    request_id = %request.request_id,
+                    "Benchmark trigger dispatch failed: {}",
+                    err
+                );
+                let _ = ctx.benchmark_queue.pop();
+                return ApiResponse::Error(error_response(
+                    ErrorCode::InternalStateError,
+                    "Benchmark scheduler unavailable",
+                    Some(worker_id),
+                    None,
+                ));
+            }
+
+            let _ = ctx.benchmark_queue.pop();
             ctx.events.emit(
                 "benchmark_queued",
                 &serde_json::json!({
@@ -2497,7 +2518,11 @@ mod tests {
     use crate::self_test::{SelfTestHistory, SelfTestService};
     use crate::telemetry::TelemetryStore;
     use crate::workers::{WorkerCapabilitiesInfo, WorkerPool, WorkerStateResponse};
-    use crate::{benchmark_queue::BenchmarkQueue, events::EventBus};
+    use crate::{
+        benchmark_queue::BenchmarkQueue,
+        benchmark_scheduler::{BenchmarkScheduler, BenchmarkTriggerHandle, SchedulerConfig},
+        events::EventBus,
+    };
     use chrono::Duration as ChronoDuration;
     use rch_common::test_guard;
     use rch_common::{SelfTestConfig, WorkerCapabilities};
@@ -2523,6 +2548,7 @@ mod tests {
             history: Arc::new(BuildHistory::new(100)),
             telemetry: Arc::new(TelemetryStore::new(Duration::from_secs(300), None)),
             benchmark_queue: Arc::new(BenchmarkQueue::new(ChronoDuration::minutes(5))),
+            benchmark_trigger: make_test_benchmark_trigger(),
             events: EventBus::new(16),
             self_test,
             alert_manager,
@@ -2532,6 +2558,22 @@ mod tests {
             pid: 1234,
             queue_timeout_secs: 300,
         }
+    }
+
+    fn make_test_benchmark_trigger() -> BenchmarkTriggerHandle {
+        let pool = WorkerPool::new();
+        let telemetry = Arc::new(TelemetryStore::new(Duration::from_secs(300), None));
+        let (scheduler, handle) = BenchmarkScheduler::new(
+            SchedulerConfig::default(),
+            pool,
+            telemetry,
+            EventBus::new(16),
+        );
+        let scheduler = Arc::new(scheduler);
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(scheduler.run());
+        }
+        handle
     }
 
     #[test]
@@ -3983,6 +4025,47 @@ mod tests {
                 );
             }
             _ => panic!("expected error response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_benchmark_trigger_success() {
+        let pool = WorkerPool::new();
+        pool.add_worker(make_test_worker("worker1", 8)).await;
+        let ctx = make_test_context(pool);
+
+        let response = handle_benchmark_trigger(&ctx, &WorkerId::new("worker1")).await;
+        match response {
+            ApiResponse::Ok(r) => {
+                assert_eq!(r.status, "queued");
+                assert_eq!(r.worker_id, "worker1");
+                assert!(!r.request_id.is_empty());
+            }
+            _ => panic!("expected ok response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_benchmark_trigger_rate_limited() {
+        let pool = WorkerPool::new();
+        pool.add_worker(make_test_worker("worker1", 8)).await;
+        let ctx = make_test_context(pool);
+
+        let first = handle_benchmark_trigger(&ctx, &WorkerId::new("worker1")).await;
+        assert!(matches!(first, ApiResponse::Ok(_)));
+
+        let second = handle_benchmark_trigger(&ctx, &WorkerId::new("worker1")).await;
+        match second {
+            ApiResponse::Error(err) => {
+                assert!(
+                    err.details
+                        .as_deref()
+                        .unwrap_or_default()
+                        .contains("rate limited")
+                );
+                assert!(err.retry_after_secs.is_some());
+            }
+            _ => panic!("expected rate-limited error response"),
         }
     }
 

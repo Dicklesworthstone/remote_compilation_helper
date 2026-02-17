@@ -8,16 +8,35 @@ use crate::error::{ArtifactRetrievalWarning, DaemonError, TransferError};
 use crate::status_types::format_bytes;
 use crate::toolchain::detect_toolchain;
 use crate::transfer::{
-    SyncResult, TransferPipeline, compute_project_hash, default_bun_artifact_patterns,
-    default_c_cpp_artifact_patterns, default_rust_artifact_patterns,
+    SyncResult, TransferPipeline, compute_project_hash, compute_project_hash_with_dependency_roots,
+    default_bun_artifact_patterns, default_c_cpp_artifact_patterns, default_rust_artifact_patterns,
     default_rust_test_artifact_patterns, project_id_from_path,
 };
 use crate::ui::console::RchConsole;
+use rch_common::repo_updater_contract::{
+    REPO_UPDATER_ALLOW_OVERRIDE_ENV, REPO_UPDATER_ALLOWED_HOSTS_ENV, REPO_UPDATER_ALLOWLIST_ENV,
+    REPO_UPDATER_AUTH_CREDENTIAL_ID_ENV, REPO_UPDATER_AUTH_EXPIRES_AT_MS_ENV,
+    REPO_UPDATER_AUTH_ISSUED_AT_MS_ENV, REPO_UPDATER_AUTH_MODE_ENV, REPO_UPDATER_AUTH_REVOKED_ENV,
+    REPO_UPDATER_AUTH_SCOPES_ENV, REPO_UPDATER_AUTH_SOURCE_ENV,
+    REPO_UPDATER_AUTH_VERIFIED_HOSTS_ENV, REPO_UPDATER_OVERRIDE_APPROVED_AT_MS_ENV,
+    REPO_UPDATER_OVERRIDE_AUDIT_EVENT_ID_ENV, REPO_UPDATER_OVERRIDE_JUSTIFICATION_ENV,
+    REPO_UPDATER_OVERRIDE_OPERATOR_ID_ENV, REPO_UPDATER_OVERRIDE_TICKET_REF_ENV,
+    REPO_UPDATER_REQUIRE_HOST_IDENTITY_ENV, REPO_UPDATER_REQUIRED_SCOPES_ENV,
+    REPO_UPDATER_ROTATION_MAX_AGE_SECS_ENV, REPO_UPDATER_TRUSTED_HOST_IDENTITIES_ENV,
+    RepoUpdaterAuthContext, RepoUpdaterAuthMode, RepoUpdaterCredentialSource,
+    RepoUpdaterOperatorOverride, RepoUpdaterTrustedHostIdentity, RepoUpdaterVerifiedHostIdentity,
+};
 use rch_common::{
     ColorMode, CommandPriority, CommandTimingBreakdown, CompilationKind, HookInput, HookOutput,
-    OutputVisibility, RequiredRuntime, SelectedWorker, SelectionReason, SelectionResponse,
-    SelfHealingConfig, ToolchainInfo, TransferConfig, WorkerConfig, WorkerId, classify_command,
-    normalize_project_path,
+    OutputVisibility, REPO_UPDATER_CANONICAL_PROJECTS_ROOT, RepoUpdaterAdapterCommand,
+    RepoUpdaterAdapterContract, RepoUpdaterAdapterRequest, RepoUpdaterOutputFormat,
+    RequiredRuntime, SelectedWorker, SelectionReason, SelectionResponse, SelfHealingConfig,
+    ToolchainInfo, TransferConfig, WorkerConfig, WorkerId,
+    build_dependency_closure_plan_with_policy, build_invocation, classify_command, mock,
+    normalize_project_path, normalize_project_path_with_policy,
+    path_topology::{
+        DEFAULT_ALIAS_PROJECT_ROOT, DEFAULT_CANONICAL_PROJECT_ROOT, PathTopologyPolicy,
+    },
     ui::{
         ArtifactSummary, CelebrationSummary, CompilationProgress, CompletionCelebration, Icons,
         OutputContext, RchTheme, TransferProgress,
@@ -27,14 +46,15 @@ use rch_telemetry::protocol::{
     PIGGYBACK_MARKER, TelemetrySource, TestRunRecord, WorkerTelemetry,
     extract_piggybacked_telemetry,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{Output, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
+use tokio::process::Command;
 use tokio::time::{sleep, timeout};
 use tracing::{debug, info, warn};
 use which::which;
@@ -182,6 +202,11 @@ pub async fn run_exec(command_parts: Vec<String>) -> anyhow::Result<()> {
     } else {
         None
     };
+    let forwarded_cargo_target_dir = resolve_forwarded_cargo_target_dir(
+        &config.environment.allowlist,
+        project_root.as_deref().unwrap_or_else(|| Path::new(".")),
+        &reporter,
+    );
 
     // Determine required runtime
     let required_runtime = required_runtime_for_kind(classification.kind);
@@ -266,6 +291,7 @@ pub async fn run_exec(command_parts: Vec<String>) -> anyhow::Result<()> {
         &command,
         config.transfer.clone(),
         config.environment.allowlist.clone(),
+        forwarded_cargo_target_dir,
         &config.compilation,
         toolchain.as_ref(),
         classification.kind,
@@ -1046,7 +1072,6 @@ fn has_exact_flag(command: &str) -> bool {
 // Timing History (bd-2m7j Phase 2)
 // ============================================================================
 
-use serde::Serialize;
 use std::collections::HashMap;
 
 // Timing infrastructure - currently used only for metrics collection and future
@@ -1642,6 +1667,12 @@ async fn handle_selection_response(
         "[RCH] selected {}@{} (slots {}, speed {:.1})",
         worker.user, worker.host, worker.slots_available, worker.speed_score
     ));
+    let invocation_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let forwarded_cargo_target_dir = resolve_forwarded_cargo_target_dir(
+        &config.environment.allowlist,
+        &invocation_cwd,
+        reporter,
+    );
 
     // Execute remote compilation pipeline
     let remote_start = Instant::now();
@@ -1650,6 +1681,7 @@ async fn handle_selection_response(
         command,
         config.transfer.clone(),
         config.environment.allowlist.clone(),
+        forwarded_cargo_target_dir,
         &config.compilation,
         toolchain,
         classification_kind,
@@ -2155,6 +2187,1015 @@ fn selected_worker_to_config(worker: &SelectedWorker) -> WorkerConfig {
     }
 }
 
+#[derive(Debug, Clone)]
+struct DependencyRuntimePlan {
+    sync_roots: Vec<PathBuf>,
+}
+
+fn command_uses_cargo_dependency_graph(kind: Option<CompilationKind>) -> bool {
+    matches!(
+        kind,
+        Some(
+            CompilationKind::CargoBuild
+                | CompilationKind::CargoCheck
+                | CompilationKind::CargoClippy
+                | CompilationKind::CargoDoc
+                | CompilationKind::CargoTest
+                | CompilationKind::CargoNextest
+                | CompilationKind::CargoBench
+        )
+    )
+}
+
+fn normalize_dependency_root_for_runtime(root: &Path) -> Option<PathBuf> {
+    normalize_project_path_with_policy(root, &PathTopologyPolicy::default())
+        .ok()
+        .map(|normalized| normalized.canonical_path().to_path_buf())
+}
+
+fn build_dependency_runtime_plan(
+    normalized_project_root: &Path,
+    kind: Option<CompilationKind>,
+    reporter: &HookReporter,
+) -> DependencyRuntimePlan {
+    if !command_uses_cargo_dependency_graph(kind) {
+        return DependencyRuntimePlan {
+            sync_roots: vec![normalized_project_root.to_path_buf()],
+        };
+    }
+
+    let plan = build_dependency_closure_plan_with_policy(
+        normalized_project_root,
+        &PathTopologyPolicy::default(),
+    );
+    if !plan.is_ready() {
+        if let Some(reason) = &plan.fail_open_reason {
+            reporter.verbose(&format!(
+                "[RCH] dependency closure planner fail-open: {}",
+                reason
+            ));
+        }
+        for issue in &plan.issues {
+            reporter.verbose(&format!(
+                "[RCH] dependency closure issue {} ({:?}): {}",
+                issue.code, issue.risk, issue.message
+            ));
+        }
+        return DependencyRuntimePlan {
+            sync_roots: vec![normalized_project_root.to_path_buf()],
+        };
+    }
+
+    let mut seen = std::collections::BTreeSet::<PathBuf>::new();
+    let mut ordered = Vec::<PathBuf>::new();
+    for action in &plan.sync_order {
+        if let Some(root) = normalize_dependency_root_for_runtime(&action.package_root)
+            && seen.insert(root.clone())
+        {
+            reporter.verbose(&format!(
+                "[RCH] dependency root {} ({:?})",
+                root.display(),
+                action.metadata.reason
+            ));
+            ordered.push(root);
+        }
+    }
+
+    if ordered.is_empty() {
+        ordered.push(normalized_project_root.to_path_buf());
+    }
+    if !ordered.iter().any(|root| root == normalized_project_root) {
+        ordered.push(normalized_project_root.to_path_buf());
+    }
+
+    DependencyRuntimePlan {
+        sync_roots: ordered,
+    }
+}
+
+fn env_allowlist_contains(env_allowlist: &[String], key: &str) -> bool {
+    env_allowlist
+        .iter()
+        .map(|item| item.trim())
+        .any(|item| item == key)
+}
+
+fn resolve_forwarded_cargo_target_dir_with_lookup<F>(
+    env_allowlist: &[String],
+    invocation_cwd: &Path,
+    reporter: &HookReporter,
+    mut lookup_env: F,
+) -> Option<PathBuf>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    if !env_allowlist_contains(env_allowlist, "CARGO_TARGET_DIR") {
+        return None;
+    }
+
+    let raw = match lookup_env("CARGO_TARGET_DIR") {
+        Some(value) => value,
+        None => {
+            reporter.verbose("[RCH] CARGO_TARGET_DIR is allowlisted but unset locally");
+            return None;
+        }
+    };
+
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        reporter.verbose("[RCH] CARGO_TARGET_DIR is allowlisted but empty");
+        return None;
+    }
+
+    let requested = PathBuf::from(trimmed);
+    let resolved = if requested.is_absolute() {
+        requested
+    } else {
+        invocation_cwd.join(requested)
+    };
+
+    reporter.verbose(&format!(
+        "[RCH] CARGO_TARGET_DIR forwarding detected; syncing worker .rch-target to {}",
+        resolved.display()
+    ));
+    Some(resolved)
+}
+
+fn resolve_forwarded_cargo_target_dir(
+    env_allowlist: &[String],
+    invocation_cwd: &Path,
+    reporter: &HookReporter,
+) -> Option<PathBuf> {
+    resolve_forwarded_cargo_target_dir_with_lookup(env_allowlist, invocation_cwd, reporter, |key| {
+        std::env::var(key).ok()
+    })
+}
+
+fn should_skip_remote_preflight(worker: &WorkerConfig) -> bool {
+    mock::is_mock_enabled() || mock::is_mock_worker(worker)
+}
+
+async fn run_worker_ssh_command(
+    worker: &WorkerConfig,
+    remote_cmd: &str,
+    timeout_duration: Duration,
+) -> anyhow::Result<Output> {
+    let identity_file = shellexpand::tilde(&worker.identity_file);
+    let destination = format!("{}@{}", worker.user, worker.host);
+
+    let mut cmd = Command::new("ssh");
+    cmd.arg("-o").arg("BatchMode=yes");
+    cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
+    cmd.arg("-o").arg(format!(
+        "ConnectTimeout={}",
+        timeout_duration.as_secs().max(1)
+    ));
+    cmd.arg("-i").arg(identity_file.as_ref());
+    cmd.arg(destination);
+    cmd.arg("sh").arg("-lc").arg(remote_cmd);
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    let output = timeout(timeout_duration, cmd.output())
+        .await
+        .map_err(|_| anyhow::anyhow!("SSH command timed out after {:?}", timeout_duration))??;
+    Ok(output)
+}
+
+async fn ensure_worker_projects_topology(
+    worker: &WorkerConfig,
+    reporter: &HookReporter,
+) -> anyhow::Result<()> {
+    if should_skip_remote_preflight(worker) {
+        reporter.verbose("[RCH] topology preflight skipped in mock mode");
+        return Ok(());
+    }
+
+    let topology_cmd = format!(
+        "set -e; \
+         if [ ! -e {canonical} ] && [ ! -L {canonical} ]; then mkdir -p {canonical}; fi; \
+         if [ -e {canonical} ] && [ ! -d {canonical} ]; then echo 'RCH_TOPOLOGY_ERR_CANONICAL_NOT_DIRECTORY' >&2; exit 41; fi; \
+         if [ -L {alias} ]; then \
+           target=$(readlink {alias} 2>/dev/null || true); \
+           if [ \"$target\" != {canonical} ] && [ \"$target\" != {canonical_slash} ]; then ln -sfn {canonical} {alias}; fi; \
+         elif [ -e {alias} ]; then \
+           echo 'RCH_TOPOLOGY_ERR_ALIAS_NOT_SYMLINK' >&2; exit 42; \
+         else \
+           ln -s {canonical} {alias}; \
+         fi; \
+         echo RCH_TOPOLOGY_OK",
+        canonical = shell_escape::escape(DEFAULT_CANONICAL_PROJECT_ROOT.into()),
+        canonical_slash =
+            shell_escape::escape(format!("{}/", DEFAULT_CANONICAL_PROJECT_ROOT).into()),
+        alias = shell_escape::escape(DEFAULT_ALIAS_PROJECT_ROOT.into())
+    );
+
+    let output = run_worker_ssh_command(worker, &topology_cmd, Duration::from_secs(20)).await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        anyhow::bail!(
+            "remote topology preflight failed on {} (status {:?}): stdout='{}' stderr='{}'",
+            worker.id,
+            output.status.code(),
+            stdout,
+            stderr
+        );
+    }
+    reporter.verbose(&format!(
+        "[RCH] topology preflight ok on {} (/dp -> /data/projects enforced)",
+        worker.id
+    ));
+    Ok(())
+}
+
+async fn collect_repo_updater_specs(sync_roots: &[PathBuf]) -> Vec<String> {
+    let mut specs = std::collections::BTreeSet::new();
+
+    for root in sync_roots {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .arg("remote")
+            .arg("get-url")
+            .arg("origin")
+            .output()
+            .await;
+
+        let Ok(output) = output else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
+        let remote = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !remote.is_empty() {
+            specs.insert(remote);
+        }
+    }
+
+    specs.into_iter().collect()
+}
+
+fn repo_updater_timeout_for(
+    contract: &RepoUpdaterAdapterContract,
+    command: RepoUpdaterAdapterCommand,
+) -> u64 {
+    contract
+        .command_budgets
+        .iter()
+        .find(|budget| budget.command == command)
+        .map(|budget| budget.timeout_secs)
+        .unwrap_or(contract.timeout_policy.sync_timeout_secs)
+        .max(1)
+}
+
+fn build_repo_updater_remote_command(
+    invocation: &rch_common::repo_updater_contract::RepoUpdaterInvocation,
+) -> String {
+    let env_prefix = invocation
+        .env
+        .iter()
+        .map(|(k, v)| format!("{k}={}", shell_escape::escape(v.as_str().into())))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let escaped_binary = shell_escape::escape(invocation.binary.as_str().into()).to_string();
+    let escaped_args = invocation
+        .args
+        .iter()
+        .map(|arg| shell_escape::escape(arg.as_str().into()).to_string())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if env_prefix.is_empty() {
+        format!("{escaped_binary} {escaped_args}")
+    } else {
+        format!("{env_prefix} {escaped_binary} {escaped_args}")
+    }
+}
+
+fn build_repo_sync_idempotency_key(worker_id: &WorkerId, sync_roots: &[PathBuf]) -> String {
+    build_repo_sync_idempotency_key_for_command(
+        worker_id,
+        sync_roots,
+        RepoUpdaterAdapterCommand::SyncApply,
+    )
+}
+
+fn repo_updater_command_name(command: RepoUpdaterAdapterCommand) -> &'static str {
+    match command {
+        RepoUpdaterAdapterCommand::ListPaths => "list-paths",
+        RepoUpdaterAdapterCommand::StatusNoFetch => "status-no-fetch",
+        RepoUpdaterAdapterCommand::SyncDryRun => "sync-dry-run",
+        RepoUpdaterAdapterCommand::SyncApply => "sync-apply",
+        RepoUpdaterAdapterCommand::RobotDocsSchemas => "robot-docs-schemas",
+        RepoUpdaterAdapterCommand::Version => "version",
+    }
+}
+
+fn build_repo_sync_idempotency_key_for_command(
+    worker_id: &WorkerId,
+    sync_roots: &[PathBuf],
+    command: RepoUpdaterAdapterCommand,
+) -> String {
+    let mut material = worker_id.as_str().to_string();
+    material.push('|');
+    material.push_str(repo_updater_command_name(command));
+    for root in sync_roots {
+        material.push('|');
+        material.push_str(&root.to_string_lossy());
+    }
+    let hash = blake3::hash(material.as_bytes()).to_hex();
+    format!("rch-repo-sync-{}", &hash[..16])
+}
+
+async fn execute_repo_updater_command(
+    worker: &WorkerConfig,
+    contract: &RepoUpdaterAdapterContract,
+    base_request: &RepoUpdaterAdapterRequest,
+    sync_roots: &[PathBuf],
+    command: RepoUpdaterAdapterCommand,
+    reporter: &HookReporter,
+) -> bool {
+    let mut request = base_request.clone();
+    let timeout_secs = repo_updater_timeout_for(contract, command);
+    request.command = command;
+    request.timeout_secs = timeout_secs;
+    request.idempotency_key =
+        build_repo_sync_idempotency_key_for_command(&worker.id, sync_roots, command);
+
+    if let Err(err) = request.validate(contract) {
+        let failure_kind = err.failure_kind();
+        warn!(
+            "repo_updater {} validation failed for {} [{} {:?}]: {}",
+            repo_updater_command_name(command),
+            worker.id,
+            err.reason_code(),
+            failure_kind,
+            err
+        );
+        reporter.verbose(&format!(
+            "[RCH] repo_updater {} skipped (validation failed [{} {:?}]): {} | remediation: {}",
+            repo_updater_command_name(command),
+            err.reason_code(),
+            failure_kind,
+            err,
+            err.remediation()
+        ));
+        return false;
+    }
+
+    let invocation = build_invocation(&request, contract);
+    let remote_cmd = build_repo_updater_remote_command(&invocation);
+    match run_worker_ssh_command(worker, &remote_cmd, Duration::from_secs(timeout_secs)).await {
+        Ok(output) if output.status.success() => {
+            reporter.verbose(&format!(
+                "[RCH] repo_updater {} succeeded for {} repositories on {}",
+                repo_updater_command_name(command),
+                request.repo_specs.len(),
+                worker.id
+            ));
+            true
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            warn!(
+                "repo_updater {} failed on {} (status {:?}): {}",
+                repo_updater_command_name(command),
+                worker.id,
+                output.status.code(),
+                stderr
+            );
+            reporter.verbose(&format!(
+                "[RCH] repo_updater {} failed on {} (continuing with direct sync)",
+                repo_updater_command_name(command),
+                worker.id
+            ));
+            false
+        }
+        Err(err) => {
+            warn!(
+                "repo_updater {} transport failure on {}: {}",
+                repo_updater_command_name(command),
+                worker.id,
+                err
+            );
+            reporter.verbose(&format!(
+                "[RCH] repo_updater {} unavailable on {} (continuing with direct sync)",
+                repo_updater_command_name(command),
+                worker.id
+            ));
+            false
+        }
+    }
+}
+
+fn parse_csv_env_var(var_name: &str) -> Option<Vec<String>> {
+    let raw = std::env::var(var_name).ok()?;
+    let entries = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(std::string::ToString::to_string)
+        .collect::<Vec<_>>();
+    (!entries.is_empty()).then_some(entries)
+}
+
+fn parse_host_identity_pairs(raw: &str) -> Vec<(String, String)> {
+    raw.split(',')
+        .filter_map(|entry| {
+            let trimmed = entry.trim();
+            let (host, fingerprint) = trimmed.split_once('=')?;
+            let host = host.trim();
+            let fingerprint = fingerprint.trim();
+            if host.is_empty() || fingerprint.is_empty() {
+                return None;
+            }
+            Some((host.to_string(), fingerprint.to_string()))
+        })
+        .collect()
+}
+
+fn parse_auth_source(raw: &str) -> Option<RepoUpdaterCredentialSource> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "gh_cli" | "gh" => Some(RepoUpdaterCredentialSource::GhCli),
+        "token_env" | "token" => Some(RepoUpdaterCredentialSource::TokenEnv),
+        "ssh_agent" | "ssh" => Some(RepoUpdaterCredentialSource::SshAgent),
+        _ => None,
+    }
+}
+
+fn parse_auth_mode(raw: &str) -> Option<RepoUpdaterAuthMode> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "inherit_environment" | "inherit" => Some(RepoUpdaterAuthMode::InheritEnvironment),
+        "require_gh_auth" | "gh" | "gh_cli" => Some(RepoUpdaterAuthMode::RequireGhAuth),
+        "require_token_env" | "token_env" | "token" => Some(RepoUpdaterAuthMode::RequireTokenEnv),
+        _ => None,
+    }
+}
+
+fn env_flag_is_truthy(var_name: &str) -> bool {
+    std::env::var(var_name)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn env_var_present(var_name: &str) -> bool {
+    std::env::var(var_name)
+        .ok()
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false)
+}
+
+fn apply_repo_updater_contract_env_policy(contract: &mut RepoUpdaterAdapterContract) {
+    if let Some(hosts) = parse_csv_env_var(REPO_UPDATER_ALLOWED_HOSTS_ENV) {
+        contract.trust_policy.allowed_repo_hosts = hosts;
+    }
+    if let Some(spec_allowlist) = parse_csv_env_var(REPO_UPDATER_ALLOWLIST_ENV) {
+        contract.trust_policy.allowlisted_repo_specs = spec_allowlist;
+    }
+    if let Ok(raw_mode) = std::env::var(REPO_UPDATER_AUTH_MODE_ENV)
+        && let Some(mode) = parse_auth_mode(&raw_mode)
+    {
+        contract.auth_policy.mode = mode;
+    }
+    if env_flag_is_truthy(REPO_UPDATER_ALLOW_OVERRIDE_ENV) {
+        contract.trust_policy.allow_operator_override = true;
+    }
+    if let Some(required_scopes) = parse_csv_env_var(REPO_UPDATER_REQUIRED_SCOPES_ENV) {
+        contract.auth_policy.required_scopes = required_scopes;
+    }
+    if let Ok(rotation_max_age_secs) = std::env::var(REPO_UPDATER_ROTATION_MAX_AGE_SECS_ENV)
+        && let Ok(parsed) = rotation_max_age_secs.trim().parse::<u64>()
+    {
+        contract.auth_policy.rotation_max_age_secs = parsed.max(1);
+    }
+    if env_flag_is_truthy(REPO_UPDATER_REQUIRE_HOST_IDENTITY_ENV) {
+        contract.auth_policy.require_host_identity_verification = true;
+    }
+    if let Ok(raw_identities) = std::env::var(REPO_UPDATER_TRUSTED_HOST_IDENTITIES_ENV) {
+        let trusted = parse_host_identity_pairs(&raw_identities)
+            .into_iter()
+            .map(|(host, key_fingerprint)| RepoUpdaterTrustedHostIdentity {
+                host,
+                key_fingerprint,
+            })
+            .collect::<Vec<_>>();
+        if !trusted.is_empty() {
+            contract.auth_policy.trusted_host_identities = trusted;
+        }
+    }
+}
+
+fn repo_updater_auth_context_env_supplied() -> bool {
+    [
+        REPO_UPDATER_AUTH_SOURCE_ENV,
+        REPO_UPDATER_AUTH_CREDENTIAL_ID_ENV,
+        REPO_UPDATER_AUTH_ISSUED_AT_MS_ENV,
+        REPO_UPDATER_AUTH_EXPIRES_AT_MS_ENV,
+        REPO_UPDATER_AUTH_SCOPES_ENV,
+        REPO_UPDATER_AUTH_REVOKED_ENV,
+        REPO_UPDATER_AUTH_VERIFIED_HOSTS_ENV,
+    ]
+    .iter()
+    .any(|var_name| std::env::var(var_name).is_ok())
+}
+
+fn infer_repo_updater_auth_context(requested_at_unix_ms: i64) -> RepoUpdaterAuthContext {
+    let (source, credential_id, granted_scopes) = if env_var_present("GH_TOKEN") {
+        (
+            RepoUpdaterCredentialSource::TokenEnv,
+            "env:GH_TOKEN".to_string(),
+            vec!["repo:read".to_string()],
+        )
+    } else if env_var_present("GITHUB_TOKEN") {
+        (
+            RepoUpdaterCredentialSource::TokenEnv,
+            "env:GITHUB_TOKEN".to_string(),
+            vec!["repo:read".to_string()],
+        )
+    } else if env_var_present("SSH_AUTH_SOCK") {
+        (
+            RepoUpdaterCredentialSource::SshAgent,
+            "ssh-agent".to_string(),
+            Vec::new(),
+        )
+    } else {
+        (
+            RepoUpdaterCredentialSource::SshAgent,
+            "implicit-no-auth".to_string(),
+            Vec::new(),
+        )
+    };
+
+    let issued_at_unix_ms = if requested_at_unix_ms > 1_000 {
+        requested_at_unix_ms - 1_000
+    } else {
+        1
+    };
+    let expires_at_unix_ms = requested_at_unix_ms.saturating_add(86_400_000);
+
+    RepoUpdaterAuthContext {
+        source,
+        credential_id,
+        issued_at_unix_ms,
+        expires_at_unix_ms,
+        granted_scopes,
+        revoked: false,
+        verified_hosts: Vec::new(),
+    }
+}
+
+fn auto_tune_repo_updater_contract(
+    contract: &mut RepoUpdaterAdapterContract,
+    repo_specs: &[String],
+    auth_context: Option<&RepoUpdaterAuthContext>,
+    has_explicit_allowlist: bool,
+    has_explicit_auth_mode: bool,
+    reporter: &HookReporter,
+) {
+    if !has_explicit_allowlist
+        && contract.trust_policy.enforce_repo_spec_allowlist
+        && contract.trust_policy.allowlisted_repo_specs.is_empty()
+    {
+        contract.trust_policy.allowlisted_repo_specs = repo_specs.to_vec();
+        reporter.verbose(&format!(
+            "[RCH] repo_updater allowlist auto-seeded from dependency closure ({} repos)",
+            contract.trust_policy.allowlisted_repo_specs.len()
+        ));
+    }
+
+    if !has_explicit_auth_mode {
+        contract.auth_policy.mode = match auth_context.map(|ctx| ctx.source) {
+            Some(RepoUpdaterCredentialSource::TokenEnv) => RepoUpdaterAuthMode::RequireTokenEnv,
+            Some(RepoUpdaterCredentialSource::GhCli) => RepoUpdaterAuthMode::RequireGhAuth,
+            Some(RepoUpdaterCredentialSource::SshAgent) | None => {
+                RepoUpdaterAuthMode::InheritEnvironment
+            }
+        };
+        reporter.verbose(&format!(
+            "[RCH] repo_updater auth mode auto-selected: {:?}",
+            contract.auth_policy.mode
+        ));
+    }
+}
+
+fn hydrate_repo_updater_auth_context_defaults(
+    auth_context: &mut RepoUpdaterAuthContext,
+    requested_at_unix_ms: i64,
+    contract: &RepoUpdaterAdapterContract,
+) {
+    if auth_context.credential_id.trim().is_empty() {
+        auth_context.credential_id = match auth_context.source {
+            RepoUpdaterCredentialSource::GhCli => "gh-cli",
+            RepoUpdaterCredentialSource::TokenEnv => "token-env",
+            RepoUpdaterCredentialSource::SshAgent => "ssh-agent",
+        }
+        .to_string();
+    }
+
+    if auth_context.issued_at_unix_ms <= 0 || auth_context.issued_at_unix_ms > requested_at_unix_ms
+    {
+        auth_context.issued_at_unix_ms = if requested_at_unix_ms > 1_000 {
+            requested_at_unix_ms - 1_000
+        } else {
+            1
+        };
+    }
+
+    if auth_context.expires_at_unix_ms <= requested_at_unix_ms {
+        let ttl_ms_u64 = contract
+            .auth_policy
+            .rotation_max_age_secs
+            .saturating_mul(1_000)
+            .max(60_000);
+        let ttl_ms = i64::try_from(ttl_ms_u64).unwrap_or(i64::MAX / 2);
+        auth_context.expires_at_unix_ms = requested_at_unix_ms.saturating_add(ttl_ms);
+    }
+
+    if auth_context.granted_scopes.is_empty() && !contract.auth_policy.required_scopes.is_empty() {
+        auth_context.granted_scopes = contract.auth_policy.required_scopes.clone();
+    }
+
+    if auth_context.verified_hosts.is_empty()
+        && contract.auth_policy.require_host_identity_verification
+    {
+        auth_context.verified_hosts = contract
+            .auth_policy
+            .trusted_host_identities
+            .iter()
+            .map(|identity| RepoUpdaterVerifiedHostIdentity {
+                host: identity.host.clone(),
+                key_fingerprint: identity.key_fingerprint.clone(),
+                verified_at_unix_ms: requested_at_unix_ms,
+            })
+            .collect();
+    }
+}
+
+fn repo_updater_operator_override_from_env() -> Option<RepoUpdaterOperatorOverride> {
+    let operator_id = std::env::var(REPO_UPDATER_OVERRIDE_OPERATOR_ID_ENV).ok();
+    let justification = std::env::var(REPO_UPDATER_OVERRIDE_JUSTIFICATION_ENV).ok();
+    let ticket_ref = std::env::var(REPO_UPDATER_OVERRIDE_TICKET_REF_ENV).ok();
+    let audit_event_id = std::env::var(REPO_UPDATER_OVERRIDE_AUDIT_EVENT_ID_ENV).ok();
+    let approved_at_unix_ms = std::env::var(REPO_UPDATER_OVERRIDE_APPROVED_AT_MS_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .unwrap_or_default();
+
+    if operator_id.is_none()
+        && justification.is_none()
+        && ticket_ref.is_none()
+        && audit_event_id.is_none()
+        && approved_at_unix_ms == 0
+    {
+        return None;
+    }
+
+    Some(RepoUpdaterOperatorOverride {
+        operator_id: operator_id.unwrap_or_default(),
+        justification: justification.unwrap_or_default(),
+        ticket_ref: ticket_ref.unwrap_or_default(),
+        audit_event_id: audit_event_id.unwrap_or_default(),
+        approved_at_unix_ms,
+    })
+}
+
+fn repo_updater_auth_context_from_env(requested_at_unix_ms: i64) -> Option<RepoUpdaterAuthContext> {
+    let source = std::env::var(REPO_UPDATER_AUTH_SOURCE_ENV)
+        .ok()
+        .and_then(|raw| parse_auth_source(&raw));
+    let credential_id = std::env::var(REPO_UPDATER_AUTH_CREDENTIAL_ID_ENV).ok();
+    let issued_at_unix_ms = std::env::var(REPO_UPDATER_AUTH_ISSUED_AT_MS_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<i64>().ok());
+    let expires_at_unix_ms = std::env::var(REPO_UPDATER_AUTH_EXPIRES_AT_MS_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<i64>().ok());
+    let scopes = parse_csv_env_var(REPO_UPDATER_AUTH_SCOPES_ENV).unwrap_or_default();
+    let revoked = env_flag_is_truthy(REPO_UPDATER_AUTH_REVOKED_ENV);
+    let verified_hosts = std::env::var(REPO_UPDATER_AUTH_VERIFIED_HOSTS_ENV)
+        .ok()
+        .map(|raw| {
+            parse_host_identity_pairs(&raw)
+                .into_iter()
+                .map(|(host, key_fingerprint)| RepoUpdaterVerifiedHostIdentity {
+                    host,
+                    key_fingerprint,
+                    verified_at_unix_ms: requested_at_unix_ms,
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    if source.is_none()
+        && credential_id.is_none()
+        && issued_at_unix_ms.is_none()
+        && expires_at_unix_ms.is_none()
+        && scopes.is_empty()
+        && !revoked
+        && verified_hosts.is_empty()
+    {
+        return None;
+    }
+
+    Some(RepoUpdaterAuthContext {
+        source: source.unwrap_or(RepoUpdaterCredentialSource::TokenEnv),
+        credential_id: credential_id.unwrap_or_default(),
+        issued_at_unix_ms: issued_at_unix_ms.unwrap_or_default(),
+        expires_at_unix_ms: expires_at_unix_ms.unwrap_or_default(),
+        granted_scopes: scopes,
+        revoked,
+        verified_hosts,
+    })
+}
+
+async fn maybe_sync_repo_set_with_repo_updater(
+    worker: &WorkerConfig,
+    sync_roots: &[PathBuf],
+    reporter: &HookReporter,
+) {
+    if sync_roots.len() <= 1 {
+        return;
+    }
+    if should_skip_remote_preflight(worker) {
+        reporter.verbose("[RCH] repo_updater pre-sync skipped in mock mode");
+        return;
+    }
+
+    let repo_specs = collect_repo_updater_specs(sync_roots).await;
+    if repo_specs.is_empty() {
+        reporter.verbose("[RCH] repo_updater pre-sync skipped (no git origin remotes found)");
+        return;
+    }
+
+    let mut contract = RepoUpdaterAdapterContract::default();
+    apply_repo_updater_contract_env_policy(&mut contract);
+    let has_explicit_allowlist = env_var_present(REPO_UPDATER_ALLOWLIST_ENV);
+    let has_explicit_auth_mode = env_var_present(REPO_UPDATER_AUTH_MODE_ENV);
+
+    let command = RepoUpdaterAdapterCommand::SyncApply;
+    let timeout_secs = repo_updater_timeout_for(&contract, command);
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or_default();
+
+    let mut auth_context = if repo_updater_auth_context_env_supplied() {
+        repo_updater_auth_context_from_env(now_ms)
+    } else {
+        None
+    };
+    if auth_context.is_none() {
+        auth_context = Some(infer_repo_updater_auth_context(now_ms));
+        reporter.verbose("[RCH] repo_updater auth context inferred from runtime environment");
+    }
+
+    auto_tune_repo_updater_contract(
+        &mut contract,
+        &repo_specs,
+        auth_context.as_ref(),
+        has_explicit_allowlist,
+        has_explicit_auth_mode,
+        reporter,
+    );
+    if let Some(context) = auth_context.as_mut() {
+        hydrate_repo_updater_auth_context_defaults(context, now_ms, &contract);
+    }
+
+    let request = RepoUpdaterAdapterRequest {
+        schema_version: rch_common::REPO_UPDATER_CONTRACT_SCHEMA_VERSION.to_string(),
+        correlation_id: format!("rch-{}-{}", worker.id, now_ms),
+        worker_id: worker.id.to_string(),
+        command,
+        requested_at_unix_ms: now_ms,
+        projects_root: PathBuf::from(REPO_UPDATER_CANONICAL_PROJECTS_ROOT),
+        repo_specs,
+        idempotency_key: build_repo_sync_idempotency_key(&worker.id, sync_roots),
+        retry_attempt: 0,
+        timeout_secs,
+        expected_output_format: RepoUpdaterOutputFormat::Json,
+        auth_context,
+        operator_override: repo_updater_operator_override_from_env(),
+    };
+
+    if let Err(err) = request.validate(&contract) {
+        let failure_kind = err.failure_kind();
+        warn!(
+            "repo_updater request validation failed for {} [{} {:?}]: {}",
+            worker.id,
+            err.reason_code(),
+            failure_kind,
+            err
+        );
+        reporter.verbose(&format!(
+            "[RCH] repo_updater pre-sync skipped (validation failed [{} {:?}]): {} | remediation: {}",
+            err.reason_code(),
+            failure_kind,
+            err,
+            err.remediation()
+        ));
+        return;
+    }
+
+    // Read-only convergence preflight to surface policy/auth/drift issues before mutation.
+    let dry_run_ok = execute_repo_updater_command(
+        worker,
+        &contract,
+        &request,
+        sync_roots,
+        RepoUpdaterAdapterCommand::SyncDryRun,
+        reporter,
+    )
+    .await;
+    if !dry_run_ok {
+        reporter.verbose(
+            "[RCH] repo_updater dry-run did not complete cleanly; attempting sync apply anyway",
+        );
+    }
+
+    let sync_apply_ok = execute_repo_updater_command(
+        worker,
+        &contract,
+        &request,
+        sync_roots,
+        RepoUpdaterAdapterCommand::SyncApply,
+        reporter,
+    )
+    .await;
+    if sync_apply_ok {
+        // Post-apply non-mutating snapshot for diagnostics and observability.
+        let _ = execute_repo_updater_command(
+            worker,
+            &contract,
+            &request,
+            sync_roots,
+            RepoUpdaterAdapterCommand::StatusNoFetch,
+            reporter,
+        )
+        .await;
+    }
+}
+
+fn merge_sync_result(base: &SyncResult, extra: &SyncResult) -> SyncResult {
+    SyncResult {
+        bytes_transferred: base
+            .bytes_transferred
+            .saturating_add(extra.bytes_transferred),
+        files_transferred: base
+            .files_transferred
+            .saturating_add(extra.files_transferred),
+        duration_ms: base.duration_ms.saturating_add(extra.duration_ms),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SyncClosurePlanEntry {
+    local_root: PathBuf,
+    remote_root: String,
+    project_id: String,
+    root_hash: String,
+    is_primary: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct SyncClosureManifest {
+    schema_version: &'static str,
+    generated_at_unix_ms: i64,
+    project_root: String,
+    entries: Vec<SyncClosureManifestEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct SyncClosureManifestEntry {
+    order: usize,
+    local_root: String,
+    remote_root: String,
+    project_id: String,
+    root_hash: String,
+    is_primary: bool,
+}
+
+fn canonicalize_sync_root_for_plan(root: &Path) -> PathBuf {
+    normalize_dependency_root_for_runtime(root)
+        .or_else(|| std::fs::canonicalize(root).ok())
+        .unwrap_or_else(|| root.to_path_buf())
+}
+
+fn build_sync_closure_plan(
+    sync_roots: &[PathBuf],
+    normalized_project_root: &Path,
+    project_hash: &str,
+) -> Vec<SyncClosurePlanEntry> {
+    let mut ordered_roots = std::collections::BTreeSet::<PathBuf>::new();
+    for root in sync_roots {
+        ordered_roots.insert(canonicalize_sync_root_for_plan(root));
+    }
+
+    let primary_root = canonicalize_sync_root_for_plan(normalized_project_root);
+    ordered_roots.insert(primary_root.clone());
+
+    ordered_roots
+        .into_iter()
+        .map(|root| {
+            let is_primary = root == primary_root;
+            let root_hash = if is_primary {
+                project_hash.to_string()
+            } else {
+                compute_project_hash(&root)
+            };
+            SyncClosurePlanEntry {
+                remote_root: root.to_string_lossy().to_string(),
+                project_id: project_id_from_path(&root),
+                root_hash,
+                is_primary,
+                local_root: root,
+            }
+        })
+        .collect()
+}
+
+fn build_sync_closure_manifest(
+    plan: &[SyncClosurePlanEntry],
+    normalized_project_root: &Path,
+) -> SyncClosureManifest {
+    let generated_at_unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or_default();
+    let entries = plan
+        .iter()
+        .enumerate()
+        .map(|(idx, entry)| SyncClosureManifestEntry {
+            order: idx + 1,
+            local_root: entry.local_root.to_string_lossy().to_string(),
+            remote_root: entry.remote_root.clone(),
+            project_id: entry.project_id.clone(),
+            root_hash: entry.root_hash.clone(),
+            is_primary: entry.is_primary,
+        })
+        .collect();
+    SyncClosureManifest {
+        schema_version: "rch.sync_closure_manifest.v1",
+        generated_at_unix_ms,
+        project_root: normalized_project_root.to_string_lossy().to_string(),
+        entries,
+    }
+}
+
+async fn verify_remote_dependency_manifests(
+    worker: &WorkerConfig,
+    sync_roots: &[PathBuf],
+    reporter: &HookReporter,
+) -> anyhow::Result<()> {
+    if should_skip_remote_preflight(worker) {
+        reporter.verbose("[RCH] remote dependency preflight skipped in mock mode");
+        return Ok(());
+    }
+    if sync_roots.is_empty() {
+        return Ok(());
+    }
+
+    let checks = sync_roots
+        .iter()
+        .map(|root| root.join("Cargo.toml"))
+        .map(|manifest| {
+            let escaped = shell_escape::escape(manifest.to_string_lossy().to_string().into());
+            format!(
+                "if [ ! -f {manifest} ]; then echo MISSING_DEP_MANIFEST:{manifest}; missing=1; fi",
+                manifest = escaped
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let verify_cmd = format!(
+        "missing=0; {checks}; if [ \"$missing\" -ne 0 ]; then exit 43; fi; echo RCH_REMOTE_DEPENDENCIES_OK"
+    );
+
+    let output = run_worker_ssh_command(worker, &verify_cmd, Duration::from_secs(20)).await?;
+    if !output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        anyhow::bail!(
+            "remote dependency preflight failed on {}: stdout='{}' stderr='{}'",
+            worker.id,
+            stdout,
+            stderr
+        );
+    }
+
+    reporter.verbose(&format!(
+        "[RCH] remote dependency preflight verified {} manifests on {}",
+        sync_roots.len(),
+        worker.id
+    ));
+    Ok(())
+}
+
 /// Result of remote compilation execution.
 #[derive(Debug)]
 struct RemoteExecutionResult {
@@ -2294,6 +3335,7 @@ async fn execute_remote_compilation(
     command: &str,
     transfer_config: TransferConfig,
     env_allowlist: Vec<String>,
+    forwarded_cargo_target_dir: Option<PathBuf>,
     compilation_config: &rch_common::CompilationConfig,
     toolchain: Option<&ToolchainInfo>,
     kind: Option<CompilationKind>,
@@ -2319,8 +3361,18 @@ async fn execute_remote_compilation(
     }
     let normalized_project_root = normalized_project.canonical_path().to_path_buf();
 
+    let dependency_plan = build_dependency_runtime_plan(&normalized_project_root, kind, reporter);
+    let raw_sync_roots = dependency_plan.sync_roots;
     let project_id = project_id_from_path(&normalized_project_root);
-    let project_hash = compute_project_hash(&normalized_project_root);
+    let project_hash =
+        compute_project_hash_with_dependency_roots(&normalized_project_root, &raw_sync_roots);
+    let sync_plan =
+        build_sync_closure_plan(&raw_sync_roots, &normalized_project_root, &project_hash);
+    let sync_roots = sync_plan
+        .iter()
+        .map(|entry| entry.local_root.clone())
+        .collect::<Vec<_>>();
+    let sync_manifest = build_sync_closure_manifest(&sync_plan, &normalized_project_root);
 
     let output_ctx = OutputContext::detect();
     let console = RchConsole::with_context(output_ctx);
@@ -2337,56 +3389,122 @@ async fn execute_remote_compilation(
         project_id, project_hash
     );
     reporter.verbose(&format!(
+        "[RCH] dependency sync roots planned: {}",
+        sync_plan.len()
+    ));
+    for (idx, entry) in sync_plan.iter().enumerate() {
+        reporter.verbose(&format!(
+            "[RCH] dependency sync root {}/{}: {}",
+            idx + 1,
+            sync_plan.len(),
+            entry.local_root.display()
+        ));
+    }
+    match serde_json::to_string(&sync_manifest) {
+        Ok(manifest_json) => {
+            reporter.verbose(&format!(
+                "[RCH] dependency sync manifest: {}",
+                manifest_json
+            ));
+            info!(
+                "Prepared dependency sync manifest for {} roots",
+                sync_manifest.entries.len()
+            );
+        }
+        Err(err) => warn!("Failed to serialize dependency sync manifest: {}", err),
+    }
+    reporter.verbose(&format!(
         "[RCH] sync start (project {} on {})",
         project_id, worker_config.id
     ));
 
-    // Create transfer pipeline with color mode, command timeout, and compilation kind
-    let command_timeout = compilation_config.timeout_for_kind(kind);
-    let mut pipeline = TransferPipeline::new(
-        normalized_project_root.clone(),
-        project_id.clone(),
-        project_hash,
-        transfer_config,
-    )
-    .with_color_mode(color_mode)
-    .with_env_allowlist(env_allowlist)
-    .with_command_timeout(command_timeout)
-    .with_compilation_kind(kind);
+    // Ensure deterministic remote topology before any repo synchronization.
+    ensure_worker_projects_topology(&worker_config, reporter).await?;
 
-    // Check if transfer should be skipped based on size/time estimation
-    if let Some(skip_reason) = pipeline.should_skip_transfer(&worker_config).await {
-        info!(
-            "Transfer estimation indicates skip: {} (worker {})",
-            skip_reason, worker_config.id
-        );
-        reporter.verbose(&format!("[RCH] skip transfer: {}", skip_reason));
-        return Err(TransferError::TransferSkipped {
-            reason: skip_reason,
-        }
-        .into());
-    }
+    // Best-effort repo convergence for multi-repo dependency graphs.
+    maybe_sync_repo_set_with_repo_updater(&worker_config, &sync_roots, reporter).await;
+
+    // Build transfer pipelines with color mode, command timeout, and compilation kind.
+    let command_timeout = compilation_config.timeout_for_kind(kind);
+    let mut primary_pipeline: Option<TransferPipeline> = None;
+    let mut aggregate_sync_result: Option<SyncResult> = None;
 
     // Step 1: Sync project to remote
     info!("Syncing project to worker {}...", worker_config.id);
     let mut upload_progress = if progress_enabled {
         Some(TransferProgress::upload(
             output_ctx,
-            "Syncing workspace",
+            "Syncing workspace closure",
             reporter.visibility == OutputVisibility::None,
         ))
     } else {
         None
     };
-    let sync_result = if let Some(progress) = &mut upload_progress {
-        pipeline
-            .sync_to_remote_streaming(&worker_config, |line| {
-                progress.update_from_line(line);
-            })
-            .await?
-    } else {
-        pipeline.sync_to_remote(&worker_config).await?
-    };
+    for entry in &sync_plan {
+        let mut root_pipeline = TransferPipeline::new(
+            entry.local_root.clone(),
+            entry.project_id.clone(),
+            entry.root_hash.clone(),
+            transfer_config.clone(),
+        )
+        .with_color_mode(color_mode)
+        .with_command_timeout(command_timeout)
+        .with_compilation_kind(kind)
+        .with_remote_path_override(entry.remote_root.clone());
+        if entry.is_primary {
+            root_pipeline = root_pipeline.with_env_allowlist(env_allowlist.clone());
+        }
+
+        // Check if transfer should be skipped based on size/time estimation.
+        if let Some(skip_reason) = root_pipeline.should_skip_transfer(&worker_config).await {
+            info!(
+                "Transfer estimation indicates skip for {}: {} (worker {})",
+                entry.local_root.display(),
+                skip_reason,
+                worker_config.id
+            );
+            reporter.verbose(&format!(
+                "[RCH] skip transfer for {}: {}",
+                entry.local_root.display(),
+                skip_reason
+            ));
+            return Err(TransferError::TransferSkipped {
+                reason: skip_reason,
+            }
+            .into());
+        }
+
+        reporter.verbose(&format!(
+            "[RCH] syncing dependency root {} to remote {}",
+            entry.local_root.display(),
+            entry.remote_root.as_str()
+        ));
+        let root_sync_result = if let Some(progress) = &mut upload_progress {
+            root_pipeline
+                .sync_to_remote_streaming(&worker_config, |line| {
+                    progress.update_from_line(line);
+                })
+                .await?
+        } else {
+            root_pipeline.sync_to_remote(&worker_config).await?
+        };
+        aggregate_sync_result = Some(match &aggregate_sync_result {
+            Some(existing) => merge_sync_result(existing, &root_sync_result),
+            None => root_sync_result,
+        });
+
+        if entry.is_primary {
+            primary_pipeline = Some(root_pipeline);
+        }
+    }
+    let sync_result = aggregate_sync_result
+        .ok_or_else(|| anyhow::anyhow!("dependency sync produced no transfer result"))?;
+    let pipeline = primary_pipeline.ok_or_else(|| {
+        anyhow::anyhow!(
+            "dependency sync did not include primary project root {}",
+            normalized_project_root.display()
+        )
+    })?;
     info!(
         "Sync complete: {} files, {} bytes in {}ms",
         sync_result.files_transferred, sync_result.bytes_transferred, sync_result.duration_ms
@@ -2398,6 +3516,10 @@ async fn execute_remote_compilation(
     if let Some(progress) = &mut upload_progress {
         progress.apply_summary(sync_result.bytes_transferred, sync_result.files_transferred);
         progress.finish();
+    }
+
+    if command_uses_cargo_dependency_graph(kind) {
+        verify_remote_dependency_manifests(&worker_config, &sync_roots, reporter).await?;
     }
 
     // Step 2: Execute command remotely with streaming output
@@ -2600,7 +3722,10 @@ async fn execute_remote_compilation(
                     );
                     progress.finish();
                 }
-                artifacts_result = Some(artifact_result);
+                artifacts_result = Some(match artifacts_result.take() {
+                    Some(existing) => merge_sync_result(&existing, &artifact_result),
+                    None => artifact_result,
+                });
             }
             Err(e) => {
                 artifacts_failed = true;
@@ -2644,6 +3769,85 @@ async fn execute_remote_compilation(
                     progress.finish_error(&e.to_string());
                 }
                 // Continue anyway - compilation succeeded
+            }
+        }
+
+        if let Some(local_target_dir) = forwarded_cargo_target_dir.as_ref() {
+            let remote_target_path = format!("{}/.rch-target", pipeline.remote_path());
+            let custom_patterns = vec!["**".to_string()];
+            let target_pipeline = TransferPipeline::new(
+                local_target_dir.clone(),
+                project_id_from_path(local_target_dir),
+                compute_project_hash(local_target_dir),
+                transfer_config.clone(),
+            )
+            .with_color_mode(color_mode)
+            .with_command_timeout(command_timeout)
+            .with_compilation_kind(kind)
+            .with_remote_path_override(remote_target_path.clone());
+
+            let mut target_progress = if progress_enabled {
+                Some(TransferProgress::download(
+                    output_ctx,
+                    "Syncing custom CARGO_TARGET_DIR artifacts",
+                    reporter.visibility == OutputVisibility::None,
+                ))
+            } else {
+                None
+            };
+
+            let target_retrieval = if let Some(progress) = &mut target_progress {
+                target_pipeline
+                    .retrieve_artifacts_streaming(&worker_config, &custom_patterns, |line| {
+                        progress.update_from_line(line);
+                    })
+                    .await
+            } else {
+                target_pipeline
+                    .retrieve_artifacts(&worker_config, &custom_patterns)
+                    .await
+            };
+
+            match target_retrieval {
+                Ok(target_result) => {
+                    info!(
+                        "Custom CARGO_TARGET_DIR artifacts retrieved: {} files, {} bytes in {}ms",
+                        target_result.files_transferred,
+                        target_result.bytes_transferred,
+                        target_result.duration_ms
+                    );
+                    reporter.verbose(&format!(
+                        "[RCH] custom target dir sync done: {} -> {} ({} files, {} bytes in {}ms)",
+                        remote_target_path,
+                        local_target_dir.display(),
+                        target_result.files_transferred,
+                        target_result.bytes_transferred,
+                        target_result.duration_ms
+                    ));
+                    if let Some(progress) = &mut target_progress {
+                        progress.apply_summary(
+                            target_result.bytes_transferred,
+                            target_result.files_transferred,
+                        );
+                        progress.finish();
+                    }
+                    artifacts_result = Some(match artifacts_result.take() {
+                        Some(existing) => merge_sync_result(&existing, &target_result),
+                        None => target_result,
+                    });
+                }
+                Err(e) => {
+                    artifacts_failed = true;
+                    warn!("Failed to sync custom CARGO_TARGET_DIR artifacts: {}", e);
+                    reporter.verbose(&format!(
+                        "[RCH] custom target dir sync failed for {}: {}",
+                        local_target_dir.display(),
+                        e
+                    ));
+                    if let Some(progress) = &mut target_progress {
+                        progress.finish_error(&e.to_string());
+                    }
+                }
             }
         }
     }
@@ -4372,12 +5576,287 @@ mod tests {
         assert!(wrapped.contains("exit $status"));
     }
 
+    #[test]
+    fn test_resolve_forwarded_cargo_target_dir_requires_allowlist() {
+        let _guard = test_guard!();
+        let reporter = HookReporter::new(OutputVisibility::Verbose);
+        let resolved = resolve_forwarded_cargo_target_dir_with_lookup(
+            &[],
+            Path::new("/tmp/rch"),
+            &reporter,
+            |_| Some("/tmp/rch-target-no-allowlist".to_string()),
+        );
+
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn test_resolve_forwarded_cargo_target_dir_resolves_relative_path() {
+        let _guard = test_guard!();
+        let reporter = HookReporter::new(OutputVisibility::Verbose);
+        let resolved = resolve_forwarded_cargo_target_dir_with_lookup(
+            &[String::from(" CARGO_TARGET_DIR ")],
+            Path::new("/data/projects/remote_compilation_helper"),
+            &reporter,
+            |_| Some("tmp/custom-target".to_string()),
+        );
+
+        assert_eq!(
+            resolved,
+            Some(PathBuf::from(
+                "/data/projects/remote_compilation_helper/tmp/custom-target"
+            ))
+        );
+    }
+
+    #[test]
+    fn test_auto_tune_repo_updater_contract_autoseeds_allowlist_and_mode() {
+        let _guard = test_guard!();
+        let mut contract = RepoUpdaterAdapterContract::default();
+        let repo_specs = vec!["github.com/example/repo".to_string()];
+        let auth_context = RepoUpdaterAuthContext {
+            source: RepoUpdaterCredentialSource::SshAgent,
+            credential_id: "ssh-agent".to_string(),
+            issued_at_unix_ms: 1_700_000_000_000,
+            expires_at_unix_ms: 1_700_000_060_000,
+            granted_scopes: vec![],
+            revoked: false,
+            verified_hosts: vec![],
+        };
+        let reporter = HookReporter::new(OutputVisibility::None);
+
+        auto_tune_repo_updater_contract(
+            &mut contract,
+            &repo_specs,
+            Some(&auth_context),
+            false,
+            false,
+            &reporter,
+        );
+
+        assert_eq!(contract.trust_policy.allowlisted_repo_specs, repo_specs);
+        assert_eq!(
+            contract.auth_policy.mode,
+            RepoUpdaterAuthMode::InheritEnvironment
+        );
+    }
+
+    #[test]
+    fn test_hydrate_repo_updater_auth_context_defaults_populates_required_fields() {
+        let _guard = test_guard!();
+        let contract = RepoUpdaterAdapterContract::default();
+        let now_ms = 1_700_000_000_000_i64;
+        let mut auth_context = RepoUpdaterAuthContext {
+            source: RepoUpdaterCredentialSource::TokenEnv,
+            credential_id: String::new(),
+            issued_at_unix_ms: 0,
+            expires_at_unix_ms: 0,
+            granted_scopes: vec![],
+            revoked: false,
+            verified_hosts: vec![],
+        };
+
+        hydrate_repo_updater_auth_context_defaults(&mut auth_context, now_ms, &contract);
+
+        assert_eq!(auth_context.credential_id, "token-env");
+        assert!(auth_context.issued_at_unix_ms > 0);
+        assert!(auth_context.issued_at_unix_ms <= now_ms);
+        assert!(auth_context.expires_at_unix_ms > now_ms);
+        assert_eq!(
+            auth_context.granted_scopes,
+            contract.auth_policy.required_scopes
+        );
+        assert_eq!(
+            auth_context.verified_hosts.len(),
+            contract.auth_policy.trusted_host_identities.len()
+        );
+    }
+
+    #[test]
+    fn test_repo_updater_command_name_is_stable() {
+        let _guard = test_guard!();
+        assert_eq!(
+            repo_updater_command_name(RepoUpdaterAdapterCommand::SyncApply),
+            "sync-apply"
+        );
+        assert_eq!(
+            repo_updater_command_name(RepoUpdaterAdapterCommand::SyncDryRun),
+            "sync-dry-run"
+        );
+        assert_eq!(
+            repo_updater_command_name(RepoUpdaterAdapterCommand::StatusNoFetch),
+            "status-no-fetch"
+        );
+    }
+
+    #[test]
+    fn test_build_repo_sync_idempotency_key_for_command_distinguishes_commands() {
+        let _guard = test_guard!();
+        let worker_id = WorkerId::new("worker-a");
+        let sync_roots = vec![
+            PathBuf::from("/data/projects/repo-a"),
+            PathBuf::from("/data/projects/repo-b"),
+        ];
+
+        let apply_key = build_repo_sync_idempotency_key_for_command(
+            &worker_id,
+            &sync_roots,
+            RepoUpdaterAdapterCommand::SyncApply,
+        );
+        let dry_run_key = build_repo_sync_idempotency_key_for_command(
+            &worker_id,
+            &sync_roots,
+            RepoUpdaterAdapterCommand::SyncDryRun,
+        );
+        let status_key = build_repo_sync_idempotency_key_for_command(
+            &worker_id,
+            &sync_roots,
+            RepoUpdaterAdapterCommand::StatusNoFetch,
+        );
+
+        assert_ne!(apply_key, dry_run_key);
+        assert_ne!(dry_run_key, status_key);
+        assert_ne!(apply_key, status_key);
+        assert!(apply_key.starts_with("rch-repo-sync-"));
+    }
+
+    #[test]
+    fn test_build_sync_closure_plan_deterministic_under_permutation() {
+        let _guard = test_guard!();
+        let temp_dir = tempfile::tempdir().expect("create tempdir");
+        let project_root = temp_dir.path().join("project");
+        let dep_a = temp_dir.path().join("dep_a");
+        let dep_b = temp_dir.path().join("dep_b");
+        std::fs::create_dir_all(&project_root).expect("create project root");
+        std::fs::create_dir_all(&dep_a).expect("create dep_a");
+        std::fs::create_dir_all(&dep_b).expect("create dep_b");
+
+        let project_hash = "1234abcd";
+        let plan_a = build_sync_closure_plan(
+            &[dep_b.clone(), project_root.clone(), dep_a.clone()],
+            &project_root,
+            project_hash,
+        );
+        let plan_b = build_sync_closure_plan(
+            &[dep_a.clone(), dep_b.clone(), project_root.clone()],
+            &project_root,
+            project_hash,
+        );
+
+        assert_eq!(plan_a, plan_b, "sync closure plan should be deterministic");
+        assert!(
+            plan_a
+                .iter()
+                .any(|entry| entry.is_primary && entry.root_hash == project_hash),
+            "primary root must retain the closure hash"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_build_sync_closure_plan_dedupes_alias_entries() {
+        let _guard = test_guard!();
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempfile::tempdir().expect("create tempdir");
+        let project_root = temp_dir.path().join("project");
+        let dep = temp_dir.path().join("dep");
+        let dep_alias = temp_dir.path().join("dep_alias");
+        std::fs::create_dir_all(&project_root).expect("create project root");
+        std::fs::create_dir_all(&dep).expect("create dep root");
+        symlink(&dep, &dep_alias).expect("create dep alias symlink");
+
+        let dep_canonical = std::fs::canonicalize(&dep).expect("canonicalize dep");
+        let plan = build_sync_closure_plan(
+            &[dep_alias.clone(), dep.clone(), project_root.clone()],
+            &project_root,
+            "beefcafe",
+        );
+
+        let dep_entries = plan
+            .iter()
+            .filter(|entry| {
+                std::fs::canonicalize(&entry.local_root)
+                    .map(|canonical| canonical == dep_canonical)
+                    .unwrap_or(false)
+            })
+            .count();
+        assert_eq!(dep_entries, 1, "alias/canonical roots should deduplicate");
+    }
+
+    #[tokio::test]
+    #[serial(mock_global)]
+    async fn test_execute_remote_compilation_syncs_custom_cargo_target_dir_artifacts() {
+        let _lock = test_lock().lock().await;
+        let _guard = test_guard!();
+
+        let socket_path = format!(
+            "/tmp/rch_test_custom_target_artifacts_{}_{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be after epoch")
+                .as_nanos()
+        );
+
+        let _overrides = TestOverridesGuard::set(
+            &socket_path,
+            MockConfig::default(),
+            MockRsyncConfig::success(),
+        );
+        mock::clear_global_invocations();
+
+        let custom_target_dir = "/data/projects/remote_compilation_helper/.rch-test-target-cache";
+
+        let worker = SelectedWorker {
+            id: rch_common::WorkerId::new("mock-worker"),
+            host: "mock.host.local".to_string(),
+            user: "mockuser".to_string(),
+            identity_file: "~/.ssh/mock_key".to_string(),
+            slots_available: 8,
+            speed_score: 90.0,
+        };
+
+        let reporter = HookReporter::new(OutputVisibility::None);
+        let result = execute_remote_compilation(
+            &worker,
+            "cargo build",
+            TransferConfig::default(),
+            Vec::new(),
+            Some(PathBuf::from(custom_target_dir)),
+            &rch_common::CompilationConfig::default(),
+            None,
+            Some(CompilationKind::CargoBuild),
+            &reporter,
+            &socket_path,
+            ColorMode::Auto,
+            None,
+        )
+        .await;
+
+        let execution = result.expect("remote execution should succeed in mock mode");
+        assert_eq!(execution.exit_code, 0);
+
+        let rsync_logs = mock::global_rsync_invocations_snapshot();
+        let has_custom_target_artifact_sync = rsync_logs.iter().any(|entry| {
+            entry.phase == mock::Phase::Artifacts
+                && entry.destination == custom_target_dir
+                && entry.source.contains(".rch-target")
+        });
+        assert!(
+            has_custom_target_artifact_sync,
+            "expected artifact retrieval into custom CARGO_TARGET_DIR from worker .rch-target path"
+        );
+    }
+
     #[tokio::test]
     #[serial(mock_global)]
     async fn test_cargo_test_delegates_to_rch_exec() {
         // Test that cargo test commands are delegated to rch exec
         let _lock = test_lock().lock().await;
+        let _guard = test_guard!();
         mock::clear_global_invocations();
+        crate::config::set_test_config_override(Some(rch_common::RchConfig::default()));
 
         let input = HookInput {
             tool_name: "Bash".to_string(),
@@ -4389,6 +5868,7 @@ mod tests {
         };
 
         let output = process_hook(input).await;
+        crate::config::set_test_config_override(None);
 
         // Hook should delegate to rch exec
         assert!(
@@ -4415,7 +5895,9 @@ mod tests {
     async fn test_cargo_test_with_args_delegates_correctly() {
         // Test that cargo test with arguments is delegated correctly
         let _lock = test_lock().lock().await;
+        let _guard = test_guard!();
         mock::clear_global_invocations();
+        crate::config::set_test_config_override(Some(rch_common::RchConfig::default()));
 
         let input = HookInput {
             tool_name: "Bash".to_string(),
@@ -4427,6 +5909,7 @@ mod tests {
         };
 
         let output = process_hook(input).await;
+        crate::config::set_test_config_override(None);
 
         // Hook should delegate with all arguments preserved
         assert!(output.is_allow());

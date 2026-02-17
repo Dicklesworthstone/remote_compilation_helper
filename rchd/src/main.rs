@@ -40,6 +40,7 @@ use tracing::{error, info, warn};
 use tokio::signal::unix::{SignalKind, signal};
 
 use benchmark_queue::BenchmarkQueue;
+use benchmark_scheduler::{BenchmarkScheduler, BenchmarkTriggerHandle, SchedulerConfig};
 use events::EventBus;
 use history::BuildHistory;
 use rch_telemetry::storage::TelemetryStorage;
@@ -106,6 +107,8 @@ pub struct DaemonContext {
     pub telemetry: Arc<TelemetryStore>,
     /// Benchmark trigger queue.
     pub benchmark_queue: Arc<BenchmarkQueue>,
+    /// Live benchmark scheduler trigger handle.
+    pub benchmark_trigger: BenchmarkTriggerHandle,
     /// Event broadcast bus.
     pub events: EventBus,
     /// Self-test service.
@@ -357,6 +360,15 @@ async fn main() -> Result<()> {
     ));
 
     let benchmark_queue = Arc::new(BenchmarkQueue::new(ChronoDuration::minutes(5)));
+    let (benchmark_scheduler, benchmark_trigger) = BenchmarkScheduler::new(
+        SchedulerConfig::default(),
+        worker_pool.clone(),
+        telemetry_store.clone(),
+        event_bus.clone(),
+    );
+    let benchmark_scheduler = Arc::new(benchmark_scheduler);
+    let _benchmark_scheduler_handle = tokio::spawn(benchmark_scheduler.run());
+    info!("Benchmark scheduler started");
 
     // Initialize alert manager for worker health alerting
     let suppress_secs = rch_config
@@ -390,6 +402,7 @@ async fn main() -> Result<()> {
         history,
         telemetry: telemetry_store.clone(),
         benchmark_queue: benchmark_queue.clone(),
+        benchmark_trigger: benchmark_trigger.clone(),
         events: event_bus.clone(),
         self_test: self_test_service.clone(),
         alert_manager: alert_manager.clone(),
@@ -695,6 +708,18 @@ mod tests {
         ))
     }
 
+    fn make_test_benchmark_trigger(pool: workers::WorkerPool) -> BenchmarkTriggerHandle {
+        let (scheduler, trigger) = BenchmarkScheduler::new(
+            SchedulerConfig::default(),
+            pool,
+            make_test_telemetry(),
+            EventBus::new(16),
+        );
+        let scheduler = Arc::new(scheduler);
+        tokio::spawn(scheduler.run());
+        trigger
+    }
+
     // =========================================================================
     // test_cli_parsing - CLI argument parsing sanity checks
     // =========================================================================
@@ -776,6 +801,7 @@ mod tests {
             history: history.clone(),
             telemetry: make_test_telemetry(),
             benchmark_queue: Arc::new(BenchmarkQueue::new(ChronoDuration::minutes(5))),
+            benchmark_trigger: make_test_benchmark_trigger(pool.clone()),
             events: EventBus::new(16),
             self_test: make_test_self_test(pool.clone()),
             alert_manager: make_test_alert_manager(),
@@ -821,6 +847,7 @@ mod tests {
             history,
             telemetry: make_test_telemetry(),
             benchmark_queue: Arc::new(BenchmarkQueue::new(ChronoDuration::minutes(5))),
+            benchmark_trigger: make_test_benchmark_trigger(pool.clone()),
             events: EventBus::new(16),
             self_test: make_test_self_test(pool.clone()),
             alert_manager: make_test_alert_manager(),
@@ -867,6 +894,7 @@ mod tests {
             history,
             telemetry: make_test_telemetry(),
             benchmark_queue: Arc::new(BenchmarkQueue::new(ChronoDuration::minutes(5))),
+            benchmark_trigger: make_test_benchmark_trigger(pool.clone()),
             events: EventBus::new(16),
             self_test: make_test_self_test(pool.clone()),
             alert_manager: make_test_alert_manager(),
@@ -897,6 +925,7 @@ mod tests {
             history: history.clone(),
             telemetry: make_test_telemetry(),
             benchmark_queue: Arc::new(BenchmarkQueue::new(ChronoDuration::minutes(5))),
+            benchmark_trigger: make_test_benchmark_trigger(pool.clone()),
             events: EventBus::new(16),
             self_test: make_test_self_test(pool.clone()),
             alert_manager: make_test_alert_manager(),
@@ -946,6 +975,7 @@ mod tests {
             history,
             telemetry: make_test_telemetry(),
             benchmark_queue: Arc::new(BenchmarkQueue::new(ChronoDuration::minutes(5))),
+            benchmark_trigger: make_test_benchmark_trigger(pool.clone()),
             events: EventBus::new(16),
             self_test: make_test_self_test(pool.clone()),
             alert_manager: make_test_alert_manager(),
@@ -993,6 +1023,7 @@ mod tests {
             history,
             telemetry: make_test_telemetry(),
             benchmark_queue: Arc::new(BenchmarkQueue::new(ChronoDuration::minutes(5))),
+            benchmark_trigger: make_test_benchmark_trigger(pool.clone()),
             events: EventBus::new(16),
             self_test: make_test_self_test(pool.clone()),
             alert_manager: make_test_alert_manager(),

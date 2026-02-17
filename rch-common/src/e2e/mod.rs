@@ -55,6 +55,7 @@
 pub mod fixtures;
 pub mod harness;
 pub mod logging;
+pub mod process_triage;
 pub mod test_workers;
 pub mod verification;
 
@@ -77,6 +78,16 @@ pub use logging::{
     LogEntry, LogLevel, LogSource, LoggerConfig, RELIABILITY_EVENT_SCHEMA_VERSION,
     ReliabilityContext, ReliabilityEventInput, ReliabilityPhase, ReliabilityPhaseEvent,
     TestLogSummary, TestLogger, TestLoggerBuilder,
+};
+pub use process_triage::{
+    PROCESS_TRIAGE_CONTRACT_SCHEMA_VERSION, ProcessTriageActionClass, ProcessTriageActionOutcome,
+    ProcessTriageActionRequest, ProcessTriageActionResult, ProcessTriageAdapterCommand,
+    ProcessTriageAuditRecord, ProcessTriageCommandBudget, ProcessTriageContract,
+    ProcessTriageContractError, ProcessTriageEscalationLevel, ProcessTriageFailure,
+    ProcessTriageFailureKind, ProcessTriagePolicyDecision, ProcessTriageRequest,
+    ProcessTriageResponse, ProcessTriageResponseStatus, ProcessTriageRetryPolicy,
+    ProcessTriageSafeActionPolicy, ProcessTriageTimeoutPolicy, ProcessTriageTrigger,
+    evaluate_triage_action, process_triage_request_schema, process_triage_response_schema,
 };
 pub use test_workers::{
     ENV_SKIP_WORKER_CHECK, ENV_TIMEOUT_SECS, ENV_WORKERS_CONFIG, TestConfigError, TestConfigResult,

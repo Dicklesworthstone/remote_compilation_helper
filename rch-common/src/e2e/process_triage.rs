@@ -183,8 +183,16 @@ impl Default for ProcessTriageSafeActionPolicy {
                 ProcessTriageActionClass::ReclaimDisk,
             ],
             deny_action_classes: vec![ProcessTriageActionClass::HardTerminate],
-            managed_process_patterns: vec!["cargo".to_string(), "rustc".to_string(), "clang".to_string()],
-            protected_process_patterns: vec!["sshd".to_string(), "systemd".to_string(), "init".to_string()],
+            managed_process_patterns: vec![
+                "cargo".to_string(),
+                "rustc".to_string(),
+                "clang".to_string(),
+            ],
+            protected_process_patterns: vec![
+                "sshd".to_string(),
+                "systemd".to_string(),
+                "init".to_string(),
+            ],
             escalation: ProcessTriageEscalationThresholds::default(),
             require_audit_record: true,
         }
@@ -433,18 +441,33 @@ impl ProcessTriageContract {
                 value: self.retry_policy.max_backoff_ms,
             });
         }
-        if self.safe_action_policy.escalation.min_confidence_for_automatic > 100 {
+        if self
+            .safe_action_policy
+            .escalation
+            .min_confidence_for_automatic
+            > 100
+        {
             return Err(ProcessTriageContractError::InvalidEscalationConfidence(
-                self.safe_action_policy.escalation.min_confidence_for_automatic,
+                self.safe_action_policy
+                    .escalation
+                    .min_confidence_for_automatic,
             ));
         }
 
-        let allow: HashSet<ProcessTriageActionClass> =
-            self.safe_action_policy.allow_action_classes.iter().copied().collect();
-        let deny: HashSet<ProcessTriageActionClass> =
-            self.safe_action_policy.deny_action_classes.iter().copied().collect();
+        let allow: HashSet<ProcessTriageActionClass> = self
+            .safe_action_policy
+            .allow_action_classes
+            .iter()
+            .copied()
+            .collect();
+        let deny: HashSet<ProcessTriageActionClass> = self
+            .safe_action_policy
+            .deny_action_classes
+            .iter()
+            .copied()
+            .collect();
 
-        for action in allow.intersection(&deny) {
+        if let Some(action) = allow.intersection(&deny).next() {
             return Err(ProcessTriageContractError::AllowDenyConflict(*action));
         }
 
@@ -459,8 +482,10 @@ pub fn evaluate_triage_action(
     action: &ProcessTriageActionRequest,
 ) -> ProcessTriagePolicyDecision {
     let policy = &contract.safe_action_policy;
-    let allow: HashSet<ProcessTriageActionClass> = policy.allow_action_classes.iter().copied().collect();
-    let deny: HashSet<ProcessTriageActionClass> = policy.deny_action_classes.iter().copied().collect();
+    let allow: HashSet<ProcessTriageActionClass> =
+        policy.allow_action_classes.iter().copied().collect();
+    let deny: HashSet<ProcessTriageActionClass> =
+        policy.deny_action_classes.iter().copied().collect();
 
     if deny.contains(&action.action_class) {
         return ProcessTriagePolicyDecision {
@@ -499,7 +524,10 @@ pub fn evaluate_triage_action(
                 escalation_level: ProcessTriageEscalationLevel::Blocked,
                 effective_action: None,
                 decision_code: "PT_BLOCK_PROTECTED_PROCESS".to_string(),
-                reason: format!("target process '{}' matches protected patterns", proc_desc.command),
+                reason: format!(
+                    "target process '{}' matches protected patterns",
+                    proc_desc.command
+                ),
                 requires_operator_ack: true,
                 audit_required: policy.require_audit_record,
             };
@@ -575,7 +603,9 @@ pub fn evaluate_triage_action(
     }
 
     if request.requested_actions.len() as u32 > policy.escalation.max_actions_before_manual_review {
-        let downgraded_action = if action.action_class.risk_rank() > ProcessTriageActionClass::ObserveOnly.risk_rank() {
+        let downgraded_action = if action.action_class.risk_rank()
+            > ProcessTriageActionClass::ObserveOnly.risk_rank()
+        {
             ProcessTriageActionClass::ObserveOnly
         } else {
             action.action_class
@@ -674,8 +704,12 @@ mod tests {
         request.validate().expect("sample request should validate");
 
         let json = serde_json::to_string(&request).expect("serialize request");
-        let restored: ProcessTriageRequest = serde_json::from_str(&json).expect("deserialize request");
-        assert_eq!(restored.schema_version, PROCESS_TRIAGE_CONTRACT_SCHEMA_VERSION);
+        let restored: ProcessTriageRequest =
+            serde_json::from_str(&json).expect("deserialize request");
+        assert_eq!(
+            restored.schema_version,
+            PROCESS_TRIAGE_CONTRACT_SCHEMA_VERSION
+        );
         assert_eq!(restored.worker_id, "worker-a");
         assert_eq!(restored.requested_actions.len(), 1);
     }
@@ -712,7 +746,10 @@ mod tests {
 
         let decision = evaluate_triage_action(&request, &contract, &request.requested_actions[0]);
         assert!(!decision.permitted);
-        assert_eq!(decision.escalation_level, ProcessTriageEscalationLevel::Blocked);
+        assert_eq!(
+            decision.escalation_level,
+            ProcessTriageEscalationLevel::Blocked
+        );
         assert_eq!(decision.decision_code, "PT_BLOCK_PROTECTED_PROCESS");
     }
 
@@ -740,7 +777,8 @@ mod tests {
             ProcessTriageActionClass::ObserveOnly,
             ProcessTriageActionClass::HardTerminate,
         ];
-        contract.safe_action_policy.deny_action_classes = vec![ProcessTriageActionClass::HardTerminate];
+        contract.safe_action_policy.deny_action_classes =
+            vec![ProcessTriageActionClass::HardTerminate];
 
         let request = ProcessTriageRequest {
             requested_actions: vec![ProcessTriageActionRequest {
@@ -754,7 +792,10 @@ mod tests {
 
         let decision = evaluate_triage_action(&request, &contract, &request.requested_actions[0]);
         assert!(!decision.permitted);
-        assert_eq!(decision.escalation_level, ProcessTriageEscalationLevel::Blocked);
+        assert_eq!(
+            decision.escalation_level,
+            ProcessTriageEscalationLevel::Blocked
+        );
         assert_eq!(decision.decision_code, "PT_BLOCK_DENYLIST");
     }
 
@@ -762,11 +803,27 @@ mod tests {
     fn process_triage_contract_schema_contains_core_fields() {
         let schema = process_triage_request_schema();
         let schema_json = serde_json::to_value(&schema).expect("schema to json");
-        let properties = schema_json
-            .get("definitions")
-            .and_then(|defs| defs.get("ProcessTriageRequest"))
-            .and_then(|node| node.get("properties"))
+        let root_properties = schema_json
+            .get("properties")
             .and_then(|props| props.as_object())
+            .cloned();
+        let definition_properties = schema_json
+            .get("definitions")
+            .and_then(|defs| defs.as_object())
+            .and_then(|defs| {
+                defs.values().find_map(|node| {
+                    let properties = node.get("properties")?.as_object()?;
+                    if properties.contains_key("worker_id")
+                        && properties.contains_key("requested_actions")
+                    {
+                        Some(properties.clone())
+                    } else {
+                        None
+                    }
+                })
+            });
+        let properties = root_properties
+            .or(definition_properties)
             .expect("request properties in schema");
 
         assert!(properties.contains_key("schema_version"));
@@ -803,7 +860,10 @@ mod tests {
         }"#;
 
         let request: ProcessTriageRequest = serde_json::from_str(json).expect("compat parse");
-        assert_eq!(request.schema_version, PROCESS_TRIAGE_CONTRACT_SCHEMA_VERSION);
+        assert_eq!(
+            request.schema_version,
+            PROCESS_TRIAGE_CONTRACT_SCHEMA_VERSION
+        );
         assert_eq!(request.trigger, ProcessTriageTrigger::DiskPressure);
         assert_eq!(request.requested_actions.len(), 1);
     }

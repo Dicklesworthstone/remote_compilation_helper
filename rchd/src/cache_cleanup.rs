@@ -49,6 +49,99 @@ pub struct CleanupStats {
     pub total_dirs_removed: u64,
 }
 
+#[derive(Debug, Clone)]
+struct CleanupMetrics {
+    removed_dirs: u64,
+    freed_bytes: u64,
+    free_before_gb: f64,
+    free_after_gb: f64,
+    low_disk_mode: bool,
+}
+
+fn cleanup_threshold_kb(min_free_gb: u64) -> u64 {
+    min_free_gb.saturating_mul(1024).saturating_mul(1024)
+}
+
+fn build_cleanup_command(escaped_base: &str, max_cache_age_hours: u64, min_free_gb: u64) -> String {
+    let max_age_minutes = max_cache_age_hours.saturating_mul(60);
+    let threshold_kb = cleanup_threshold_kb(min_free_gb);
+    let active_grace_minutes = 5_u64;
+    format!(
+        "set -u; \
+         base={base}; \
+         max_age_minutes={max_age_minutes}; \
+         threshold_kb={threshold_kb}; \
+         active_grace_minutes={active_grace_minutes}; \
+         if [ ! -d \"$base\" ]; then mkdir -p \"$base\"; fi; \
+         before_kb=$(df -Pk \"$base\" 2>/dev/null | awk 'NR==2 {{print $4}}'); \
+         if [ -z \"$before_kb\" ]; then before_kb=0; fi; \
+         removed=0; freed_kb=0; low_disk=0; \
+         if [ \"$before_kb\" -lt \"$threshold_kb\" ]; then low_disk=1; fi; \
+         candidates=$(mktemp /tmp/rch-cleanup.XXXXXX); \
+         if [ \"$low_disk\" -eq 1 ]; then \
+           find \"$base\" -mindepth 2 -maxdepth 2 -type d -printf '%T@ %p\\n' 2>/dev/null \
+             | sort -n | sed 's/^[^ ]* //' > \"$candidates\"; \
+         else \
+           find \"$base\" -mindepth 2 -maxdepth 2 -type d -mmin +\"$max_age_minutes\" -print 2>/dev/null > \"$candidates\"; \
+         fi; \
+         while IFS= read -r dir; do \
+           [ -z \"$dir\" ] && continue; \
+           [ ! -d \"$dir\" ] && continue; \
+           case \"$dir\" in \"$base\"/*) ;; *) continue ;; esac; \
+           recent_active=$(find \"$dir\" -type f -mmin -\"$active_grace_minutes\" -print -quit 2>/dev/null || true); \
+           if [ -n \"$recent_active\" ]; then continue; fi; \
+           size_kb=$(du -sk \"$dir\" 2>/dev/null | awk '{{print $1}}'); \
+           rm -rf \"$dir\" 2>/dev/null || true; \
+           removed=$((removed + 1)); \
+           if [ -n \"$size_kb\" ]; then freed_kb=$((freed_kb + size_kb)); fi; \
+           if [ \"$low_disk\" -eq 1 ]; then \
+             current_kb=$(df -Pk \"$base\" 2>/dev/null | awk 'NR==2 {{print $4}}'); \
+             if [ -n \"$current_kb\" ] && [ \"$current_kb\" -ge \"$threshold_kb\" ]; then break; fi; \
+           fi; \
+         done < \"$candidates\"; \
+         rm -f \"$candidates\"; \
+         after_kb=$(df -Pk \"$base\" 2>/dev/null | awk 'NR==2 {{print $4}}'); \
+         if [ -z \"$after_kb\" ]; then after_kb=0; fi; \
+         printf 'RCH_CLEANUP_METRICS removed=%s freed_kb=%s before_kb=%s after_kb=%s low_disk=%s\\n' \"$removed\" \"$freed_kb\" \"$before_kb\" \"$after_kb\" \"$low_disk\"",
+        base = escaped_base,
+        max_age_minutes = max_age_minutes,
+        threshold_kb = threshold_kb,
+        active_grace_minutes = active_grace_minutes,
+    )
+}
+
+fn parse_cleanup_metrics(stdout: &str) -> Option<CleanupMetrics> {
+    let line = stdout
+        .lines()
+        .find(|line| line.contains("RCH_CLEANUP_METRICS"))?;
+
+    let mut removed_dirs = None;
+    let mut freed_kb = None;
+    let mut before_kb = None;
+    let mut after_kb = None;
+    let mut low_disk = None;
+
+    for token in line.split_whitespace().skip(1) {
+        let (key, value) = token.split_once('=')?;
+        match key {
+            "removed" => removed_dirs = value.parse::<u64>().ok(),
+            "freed_kb" => freed_kb = value.parse::<u64>().ok(),
+            "before_kb" => before_kb = value.parse::<u64>().ok(),
+            "after_kb" => after_kb = value.parse::<u64>().ok(),
+            "low_disk" => low_disk = Some(value == "1"),
+            _ => {}
+        }
+    }
+
+    Some(CleanupMetrics {
+        removed_dirs: removed_dirs.unwrap_or(0),
+        freed_bytes: freed_kb.unwrap_or(0).saturating_mul(1024),
+        free_before_gb: before_kb.unwrap_or(0) as f64 / (1024.0 * 1024.0),
+        free_after_gb: after_kb.unwrap_or(0) as f64 / (1024.0 * 1024.0),
+        low_disk_mode: low_disk.unwrap_or(false),
+    })
+}
+
 /// Cache cleanup scheduler service.
 pub struct CacheCleanupScheduler {
     /// Worker pool reference.
@@ -57,6 +150,8 @@ pub struct CacheCleanupScheduler {
     config: CacheCleanupConfig,
     /// Last cleanup time per worker.
     last_cleanup: Arc<RwLock<HashMap<WorkerId, Instant>>>,
+    /// First observed idle instant per worker (used for idle-threshold gating).
+    idle_since: Arc<RwLock<HashMap<WorkerId, Instant>>>,
     /// SSH options for cleanup commands.
     ssh_options: SshOptions,
 }
@@ -68,6 +163,7 @@ impl CacheCleanupScheduler {
             pool,
             config,
             last_cleanup: Arc::new(RwLock::new(HashMap::new())),
+            idle_since: Arc::new(RwLock::new(HashMap::new())),
             ssh_options: SshOptions::default(),
         }
     }
@@ -153,26 +249,49 @@ impl CacheCleanupScheduler {
 
     /// Check if a worker is eligible for cleanup.
     async fn is_worker_eligible(&self, worker_state: &WorkerState) -> bool {
+        let (worker_id, total_slots) = {
+            let config = worker_state.config.read().await;
+            (config.id.clone(), config.total_slots)
+        };
+
         // Check worker status
         let status = worker_state.status().await;
         if status != WorkerStatus::Healthy {
             debug!(
                 "Worker {:?} not healthy (status={:?}), skipping cleanup",
-                worker_state.config.read().await.id,
-                status
+                worker_id, status
             );
+            self.idle_since.write().await.remove(&worker_id);
             return false;
         }
 
         // Check if worker is busy (has active slots)
         let available = worker_state.available_slots().await;
-        let config = worker_state.config.read().await;
-        if available < config.total_slots {
+        if available < total_slots {
             debug!(
                 "Worker {} is busy ({}/{} slots available), skipping cleanup",
-                config.id, available, config.total_slots
+                worker_id, available, total_slots
             );
+            self.idle_since.write().await.remove(&worker_id);
             return false;
+        }
+
+        // Enforce idle threshold before cleanup.
+        let idle_threshold = Duration::from_secs(self.config.idle_threshold_secs);
+        if !idle_threshold.is_zero() {
+            let now = Instant::now();
+            let idle_for = {
+                let mut idle_since = self.idle_since.write().await;
+                let first_idle = idle_since.entry(worker_id.clone()).or_insert(now);
+                now.saturating_duration_since(*first_idle)
+            };
+            if idle_for < idle_threshold {
+                debug!(
+                    "Worker {} idle for {:?} (threshold {:?}), skipping cleanup",
+                    worker_id, idle_for, idle_threshold
+                );
+                return false;
+            }
         }
 
         // Check circuit breaker state
@@ -180,7 +299,7 @@ impl CacheCleanupScheduler {
         if circuit_state != Some(rch_common::CircuitState::Closed) {
             debug!(
                 "Worker {} circuit not closed ({:?}), skipping cleanup",
-                config.id, circuit_state
+                worker_id, circuit_state
             );
             return false;
         }
@@ -194,20 +313,20 @@ impl CacheCleanupScheduler {
         let config = worker_state.config.read().await.clone();
 
         info!(
-            "Starting cache cleanup on worker {} (max_age={}h)",
-            config.id, self.config.max_cache_age_hours
+            "Starting cache cleanup on worker {} (max_age={}h, min_free={}GB)",
+            config.id, self.config.max_cache_age_hours, self.config.min_free_gb
         );
 
-        // Build cleanup command
-        // Uses find to delete directories older than max_age_hours
+        // Build cleanup command:
+        // - baseline prune by age
+        // - when below disk threshold, escalate and prune oldest caches until threshold is met
         let remote_base = &self.config.remote_base;
         let escaped_base = rch_common::ssh_utils::shell_escape_path_with_home(remote_base)
             .ok_or_else(|| anyhow::anyhow!("Invalid remote_base: contains control characters"))?;
-        let max_age_minutes = self.config.max_cache_age_hours.saturating_mul(60);
-        let cleanup_cmd = format!(
-            "find {} -mindepth 2 -maxdepth 2 -type d -mmin +{} -exec rm -rf {{}} \\; 2>/dev/null; \
-             du -sh {} 2>/dev/null || echo '0 {}'",
-            escaped_base, max_age_minutes, escaped_base, escaped_base
+        let cleanup_cmd = build_cleanup_command(
+            escaped_base.as_ref(),
+            self.config.max_cache_age_hours,
+            self.config.min_free_gb,
         );
 
         // Execute cleanup via SSH
@@ -223,22 +342,48 @@ impl CacheCleanupScheduler {
         }
 
         let duration = start.elapsed();
+        let metrics = parse_cleanup_metrics(&result.stdout);
+        let metrics_summary = metrics
+            .as_ref()
+            .map(|m| {
+                format!(
+                    "removed={}, freed_mb={}, before_free_gb={:.2}, after_free_gb={:.2}, low_disk={}",
+                    m.removed_dirs,
+                    m.freed_bytes / (1024 * 1024),
+                    m.free_before_gb,
+                    m.free_after_gb,
+                    m.low_disk_mode
+                )
+            })
+            .unwrap_or_else(|| "metrics=unavailable".to_string());
 
         if result.exit_code == 0 {
             info!(
-                "Cache cleanup completed on worker {} in {:?}",
-                config.id, duration
+                "Cache cleanup completed on worker {} in {:?} ({})",
+                config.id, duration, metrics_summary
             );
+            if let Some(ref parsed) = metrics
+                && parsed.free_after_gb < self.config.min_free_gb as f64
+            {
+                warn!(
+                    "Worker {} still below free-space threshold after cleanup: {:.2}GB < {}GB",
+                    config.id, parsed.free_after_gb, self.config.min_free_gb
+                );
+            }
             Ok(CleanupResult {
                 worker_id: config.id,
                 success: true,
-                dirs_removed: None, // Could parse from output
-                bytes_freed: None,  // Could parse from output
+                dirs_removed: metrics.as_ref().map(|m| m.removed_dirs),
+                bytes_freed: metrics.as_ref().map(|m| m.freed_bytes),
                 duration,
                 error: None,
             })
         } else {
-            let error_msg = format!("Cleanup command failed with exit code {}", result.exit_code);
+            let error_msg = format!(
+                "Cleanup command failed with exit code {} (stderr: {})",
+                result.exit_code,
+                result.stderr.trim()
+            );
             warn!(
                 "Cache cleanup failed on worker {}: {}",
                 config.id, error_msg
@@ -618,7 +763,10 @@ mod tests {
         let config = create_test_worker_config("eligible-worker");
         pool.add_worker(config).await;
 
-        let cleanup_config = CacheCleanupConfig::default();
+        let cleanup_config = CacheCleanupConfig {
+            idle_threshold_secs: 0,
+            ..Default::default()
+        };
         let scheduler = CacheCleanupScheduler::new(pool.clone(), cleanup_config);
 
         let worker_state = pool.get(&WorkerId::new("eligible-worker")).await.unwrap();
@@ -626,6 +774,37 @@ mod tests {
         // Worker is healthy, all slots available, circuit closed
         let eligible = scheduler.is_worker_eligible(&worker_state).await;
         assert!(eligible);
+    }
+
+    #[tokio::test]
+    async fn test_is_worker_eligible_respects_idle_threshold() {
+        let pool = WorkerPool::new();
+        let config = create_test_worker_config("idle-threshold-worker");
+        pool.add_worker(config).await;
+
+        let cleanup_config = CacheCleanupConfig {
+            idle_threshold_secs: 60,
+            ..Default::default()
+        };
+        let scheduler = CacheCleanupScheduler::new(pool.clone(), cleanup_config);
+        let worker_state = pool
+            .get(&WorkerId::new("idle-threshold-worker"))
+            .await
+            .unwrap();
+
+        let eligible_first = scheduler.is_worker_eligible(&worker_state).await;
+        assert!(!eligible_first);
+
+        {
+            let mut idle_since = scheduler.idle_since.write().await;
+            idle_since.insert(
+                WorkerId::new("idle-threshold-worker"),
+                Instant::now() - Duration::from_secs(120),
+            );
+        }
+
+        let eligible_after_threshold = scheduler.is_worker_eligible(&worker_state).await;
+        assert!(eligible_after_threshold);
     }
 
     #[tokio::test]
@@ -815,5 +994,29 @@ mod tests {
         assert_eq!(stats.workers_checked, 100);
         assert_eq!(stats.total_bytes_freed, 536870912000);
         assert_eq!(stats.total_dirs_removed, 5000);
+    }
+
+    #[test]
+    fn test_parse_cleanup_metrics_parses_emitted_line() {
+        let _guard = test_guard!();
+        let stdout = "noise\nRCH_CLEANUP_METRICS removed=4 freed_kb=2048 before_kb=4096 after_kb=6144 low_disk=1\n";
+        let metrics = parse_cleanup_metrics(stdout).expect("expected parse result");
+        assert_eq!(metrics.removed_dirs, 4);
+        assert_eq!(metrics.freed_bytes, 2 * 1024 * 1024);
+        assert!((metrics.free_before_gb - (4096.0 / (1024.0 * 1024.0))).abs() < f64::EPSILON);
+        assert!((metrics.free_after_gb - (6144.0 / (1024.0 * 1024.0))).abs() < f64::EPSILON);
+        assert!(metrics.low_disk_mode);
+    }
+
+    #[test]
+    fn test_build_cleanup_command_contains_threshold_and_marker() {
+        let _guard = test_guard!();
+        let command = build_cleanup_command("'/tmp/rch'", 72, 10);
+        assert!(command.contains("threshold_kb=10485760"));
+        assert!(command.contains("active_grace_minutes=5"));
+        assert!(command.contains("-mmin -\"$active_grace_minutes\""));
+        assert!(command.contains("case \"$dir\" in \"$base\"/*)"));
+        assert!(command.contains("RCH_CLEANUP_METRICS"));
+        assert!(command.contains("low_disk"));
     }
 }

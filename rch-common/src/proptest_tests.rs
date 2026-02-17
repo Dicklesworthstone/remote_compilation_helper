@@ -595,29 +595,39 @@ mod tests {
         /// Strategy for generating arbitrary WorkerCapabilities.
         fn arb_worker_capabilities() -> impl Strategy<Value = WorkerCapabilities> {
             (
-                proptest::option::of("[0-9]+\\.[0-9]+\\.[0-9]+(-[a-zA-Z0-9]+)?"),
-                proptest::option::of("[0-9]+\\.[0-9]+\\.[0-9]+"),
-                proptest::option::of("v[0-9]+\\.[0-9]+\\.[0-9]+"),
-                proptest::option::of("[0-9]+\\.[0-9]+\\.[0-9]+"),
-                proptest::option::of(1u32..128u32),
-                proptest::option::of(0.0f64..100.0f64),
-                proptest::option::of(0.0f64..100.0f64),
-                proptest::option::of(0.0f64..100.0f64),
-                proptest::option::of(0.0f64..10000.0f64),
-                proptest::option::of(0.0f64..10000.0f64),
+                (
+                    proptest::option::of("[0-9]+\\.[0-9]+\\.[0-9]+(-[a-zA-Z0-9]+)?"),
+                    proptest::option::of("[0-9]+\\.[0-9]+\\.[0-9]+"),
+                    proptest::option::of("v[0-9]+\\.[0-9]+\\.[0-9]+"),
+                    proptest::option::of("[0-9]+\\.[0-9]+\\.[0-9]+"),
+                    proptest::option::of(1u32..128u32),
+                    proptest::option::of(0.0f64..100.0f64),
+                    proptest::option::of(0.0f64..100.0f64),
+                    proptest::option::of(0.0f64..100.0f64),
+                    proptest::option::of(0.0f64..10000.0f64),
+                    proptest::option::of(0.0f64..10000.0f64),
+                ),
+                (
+                    proptest::option::of(any::<bool>()),
+                    proptest::option::of("[a-z_]{3,64}"),
+                    proptest::option::of(1i64..4_102_444_800_000i64),
+                ),
             )
                 .prop_map(
                     |(
-                        rustc_version,
-                        bun_version,
-                        node_version,
-                        npm_version,
-                        num_cpus,
-                        load_avg_1,
-                        load_avg_5,
-                        load_avg_15,
-                        disk_free_gb,
-                        disk_total_gb,
+                        (
+                            rustc_version,
+                            bun_version,
+                            node_version,
+                            npm_version,
+                            num_cpus,
+                            load_avg_1,
+                            load_avg_5,
+                            load_avg_15,
+                            disk_free_gb,
+                            disk_total_gb,
+                        ),
+                        (projects_root_ok, projects_root_issue, projects_root_checked_at_unix_ms),
                     )| {
                         WorkerCapabilities {
                             rustc_version,
@@ -630,6 +640,9 @@ mod tests {
                             load_avg_15,
                             disk_free_gb,
                             disk_total_gb,
+                            projects_root_ok,
+                            projects_root_issue,
+                            projects_root_checked_at_unix_ms,
                         }
                     },
                 )

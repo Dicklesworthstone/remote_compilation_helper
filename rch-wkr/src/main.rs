@@ -11,7 +11,7 @@ mod toolchain;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use rch_common::WorkerCapabilities;
+use rch_common::{DEFAULT_ALIAS_PROJECT_ROOT, DEFAULT_CANONICAL_PROJECT_ROOT, WorkerCapabilities};
 use rch_common::{LogConfig, init_logging};
 use tracing::info;
 
@@ -309,6 +309,7 @@ fn print_system_info() {
 /// This function detects installed runtimes (Rust, Bun, Node.js, npm)
 /// and returns a WorkerCapabilities struct suitable for JSON serialization.
 fn probe_capabilities() -> WorkerCapabilities {
+    use std::path::Path;
     use std::process::Command;
 
     let mut capabilities = WorkerCapabilities::new();
@@ -377,7 +378,77 @@ fn probe_capabilities() -> WorkerCapabilities {
         capabilities.disk_total_gb = Some(total_gb);
     }
 
+    let (topology_ok, topology_issue) = probe_projects_topology(
+        Path::new(DEFAULT_CANONICAL_PROJECT_ROOT),
+        Path::new(DEFAULT_ALIAS_PROJECT_ROOT),
+    );
+    capabilities.projects_root_ok = Some(topology_ok);
+    capabilities.projects_root_issue = topology_issue;
+    capabilities.projects_root_checked_at_unix_ms = Some(current_unix_ms());
+
     capabilities
+}
+
+fn current_unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or_default()
+}
+
+fn probe_projects_topology(
+    canonical_root: &std::path::Path,
+    alias_root: &std::path::Path,
+) -> (bool, Option<String>) {
+    let canonical_meta = match std::fs::symlink_metadata(canonical_root) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return (false, Some("canonical_missing".to_string()));
+        }
+        Err(err) => {
+            return (false, Some(format!("canonical_probe_error:{err}")));
+        }
+    };
+    if !canonical_meta.file_type().is_dir() {
+        return (false, Some("canonical_not_directory".to_string()));
+    }
+
+    let alias_meta = match std::fs::symlink_metadata(alias_root) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return (false, Some("alias_missing".to_string()));
+        }
+        Err(err) => {
+            return (false, Some(format!("alias_probe_error:{err}")));
+        }
+    };
+    if !alias_meta.file_type().is_symlink() {
+        return (false, Some("alias_not_symlink".to_string()));
+    }
+
+    let alias_target = match std::fs::read_link(alias_root) {
+        Ok(target) => target,
+        Err(err) => return (false, Some(format!("alias_readlink_error:{err}"))),
+    };
+    let resolved_target = if alias_target.is_absolute() {
+        alias_target
+    } else if let Some(parent) = alias_root.parent() {
+        parent.join(alias_target)
+    } else {
+        alias_target
+    };
+
+    let canonical_real =
+        std::fs::canonicalize(canonical_root).unwrap_or_else(|_| canonical_root.to_path_buf());
+    let target_real = std::fs::canonicalize(&resolved_target).unwrap_or(resolved_target.clone());
+    if canonical_real != target_real {
+        return (
+            false,
+            Some(format!("alias_wrong_target:{}", target_real.display())),
+        );
+    }
+
+    (true, None)
 }
 
 /// Probe number of CPU cores.
@@ -715,6 +786,73 @@ mod tests {
         assert_eq!(total_kb, 1_048_576);
         assert_eq!(avail_kb, 524_288);
         println!("TEST PASS: test_parse_df_posix_kb_parses_total_and_available");
+    }
+
+    fn make_temp_topology_paths(
+        test_name: &str,
+    ) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        let unique = format!(
+            "rch-wkr-topology-{}-{}-{}",
+            test_name,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time should be after unix epoch")
+                .as_nanos()
+        );
+        let base = std::env::temp_dir().join(unique);
+        let canonical = base.join("data/projects");
+        let alias = base.join("dp");
+        std::fs::create_dir_all(&canonical).expect("create canonical root");
+        (base, canonical, alias)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_probe_projects_topology_healthy_symlink() {
+        let _guard = test_guard!();
+        let (base, canonical, alias) = make_temp_topology_paths("healthy");
+        std::os::unix::fs::symlink(&canonical, &alias).expect("create alias symlink");
+
+        let (ok, issue) = probe_projects_topology(&canonical, &alias);
+        assert!(ok);
+        assert!(issue.is_none());
+
+        std::fs::remove_dir_all(&base).expect("cleanup temp topology");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_probe_projects_topology_missing_alias() {
+        let _guard = test_guard!();
+        let (base, canonical, alias) = make_temp_topology_paths("missing-alias");
+
+        let (ok, issue) = probe_projects_topology(&canonical, &alias);
+        assert!(!ok);
+        assert_eq!(issue.as_deref(), Some("alias_missing"));
+
+        std::fs::remove_dir_all(&base).expect("cleanup temp topology");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_probe_projects_topology_wrong_alias_target() {
+        let _guard = test_guard!();
+        let (base, canonical, alias) = make_temp_topology_paths("wrong-target");
+        let wrong_target = base.join("some/other/path");
+        std::fs::create_dir_all(&wrong_target).expect("create wrong target");
+        std::os::unix::fs::symlink(&wrong_target, &alias).expect("create alias symlink");
+
+        let (ok, issue) = probe_projects_topology(&canonical, &alias);
+        assert!(!ok);
+        assert!(
+            issue
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with("alias_wrong_target:")
+        );
+
+        std::fs::remove_dir_all(&base).expect("cleanup temp topology");
     }
 }
 
