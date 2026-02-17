@@ -3,7 +3,10 @@
 //! Maintains a ring buffer of recent builds for status reporting and analytics.
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use rch_common::{BuildLocation, BuildRecord, BuildStats, CommandTimingBreakdown, SavedTimeStats};
+use rch_common::{
+    BuildHeartbeatPhase, BuildHeartbeatRequest, BuildLocation, BuildRecord, BuildStats,
+    CommandTimingBreakdown, SavedTimeStats,
+};
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
@@ -30,6 +33,33 @@ pub struct ActiveBuildState {
     pub hook_pid: u32,
     pub slots: u32,
     pub location: BuildLocation,
+    pub heartbeat_phase: BuildHeartbeatPhase,
+    pub heartbeat_detail: Option<String>,
+    pub heartbeat_counter: u64,
+    pub heartbeat_percent: Option<f64>,
+    pub heartbeat_count: u64,
+    pub last_heartbeat_at: String,
+    pub last_heartbeat_mono: Instant,
+    pub last_progress_at: String,
+    pub last_progress_mono: Instant,
+    pub detector_hook_alive: bool,
+    pub detector_heartbeat_stale: bool,
+    pub detector_progress_stale: bool,
+    pub detector_confidence: f64,
+    pub detector_build_age_secs: u64,
+    pub detector_slots_owned: u32,
+    pub detector_last_evaluated_at: Option<String>,
+}
+
+/// Snapshot of stuck-detector evidence for an active build.
+#[derive(Debug, Clone, Copy)]
+pub struct StuckDetectorSnapshot {
+    pub hook_alive: bool,
+    pub heartbeat_stale: bool,
+    pub progress_stale: bool,
+    pub confidence: f64,
+    pub build_age_secs: u64,
+    pub slots_owned: u32,
 }
 
 /// Queued build state for builds waiting for available workers.
@@ -169,21 +199,118 @@ impl BuildHistory {
     ) -> ActiveBuildState {
         let id = self.next_id();
         let started_at = Utc::now().to_rfc3339();
+        let started_at_mono = Instant::now();
         let state = ActiveBuildState {
             id,
             project_id,
             worker_id,
             command,
-            started_at,
-            started_at_mono: Instant::now(),
+            started_at: started_at.clone(),
+            started_at_mono,
             hook_pid,
             slots,
             location,
+            heartbeat_phase: BuildHeartbeatPhase::SyncUp,
+            heartbeat_detail: Some("build_started".to_string()),
+            heartbeat_counter: 0,
+            heartbeat_percent: None,
+            heartbeat_count: 0,
+            last_heartbeat_at: started_at.clone(),
+            last_heartbeat_mono: started_at_mono,
+            last_progress_at: started_at,
+            last_progress_mono: started_at_mono,
+            detector_hook_alive: true,
+            detector_heartbeat_stale: false,
+            detector_progress_stale: false,
+            detector_confidence: 0.0,
+            detector_build_age_secs: 0,
+            detector_slots_owned: slots,
+            detector_last_evaluated_at: None,
         };
 
         let mut active = self.active.write().unwrap_or_else(|e| e.into_inner());
         active.insert(id, state.clone());
         state
+    }
+
+    /// Record a heartbeat/progress update for an active build.
+    ///
+    /// Returns the updated active state if the build exists.
+    pub fn record_build_heartbeat(
+        &self,
+        heartbeat: BuildHeartbeatRequest,
+    ) -> Option<ActiveBuildState> {
+        let now = Instant::now();
+        let now_rfc3339 = Utc::now().to_rfc3339();
+
+        let mut active = self.active.write().unwrap_or_else(|e| e.into_inner());
+        let state = active.get_mut(&heartbeat.build_id)?;
+
+        // Ignore worker mismatch updates to avoid cross-build contamination.
+        if state.worker_id != heartbeat.worker_id.as_str() {
+            return None;
+        }
+
+        // Keep hook PID in sync if the heartbeat carries it.
+        if let Some(pid) = heartbeat.hook_pid.filter(|pid| *pid > 0) {
+            state.hook_pid = pid;
+        }
+
+        let previous_phase = state.heartbeat_phase.clone();
+        let previous_counter = state.heartbeat_counter;
+        let previous_percent = state.heartbeat_percent;
+        let previous_detail = state.heartbeat_detail.clone();
+
+        state.heartbeat_phase = heartbeat.phase;
+        state.heartbeat_detail = heartbeat.detail;
+        if let Some(counter) = heartbeat.progress_counter {
+            state.heartbeat_counter = state.heartbeat_counter.max(counter);
+        }
+        if let Some(percent) = heartbeat.progress_percent {
+            state.heartbeat_percent = Some(percent.clamp(0.0, 100.0));
+        }
+        state.heartbeat_count = state.heartbeat_count.saturating_add(1);
+        state.last_heartbeat_at = now_rfc3339.clone();
+        state.last_heartbeat_mono = now;
+
+        // Progress evidence can come from phase transitions, increasing counters,
+        // percent improvements, or detail updates.
+        let counter_progressed = state.heartbeat_counter > previous_counter;
+        let percent_progressed = match (previous_percent, state.heartbeat_percent) {
+            (Some(before), Some(after)) => after > before + f64::EPSILON,
+            (None, Some(_)) => true,
+            _ => false,
+        };
+        let detail_changed = state.heartbeat_detail != previous_detail;
+        let phase_changed = state.heartbeat_phase != previous_phase;
+
+        if counter_progressed || percent_progressed || detail_changed || phase_changed {
+            state.last_progress_at = now_rfc3339;
+            state.last_progress_mono = now;
+        }
+
+        Some(state.clone())
+    }
+
+    /// Record the latest stuck-detector evidence snapshot for an active build.
+    pub fn record_stuck_detector_snapshot(
+        &self,
+        build_id: u64,
+        snapshot: StuckDetectorSnapshot,
+    ) -> Option<ActiveBuildState> {
+        let now_rfc3339 = Utc::now().to_rfc3339();
+        let mut active = self.active.write().unwrap_or_else(|e| e.into_inner());
+        let state = active.get_mut(&build_id)?;
+
+        state.detector_hook_alive = snapshot.hook_alive;
+        state.detector_heartbeat_stale = snapshot.heartbeat_stale;
+        state.detector_progress_stale = snapshot.progress_stale;
+        state.detector_confidence = snapshot.confidence.clamp(0.0, 1.0);
+        state.detector_build_age_secs = snapshot.build_age_secs;
+        state.detector_slots_owned = snapshot.slots_owned;
+        state.detector_last_evaluated_at = Some(now_rfc3339);
+
+        Some(state.clone())
     }
 
     /// Complete an active build, moving it into history.
@@ -849,6 +976,103 @@ mod tests {
         assert_eq!(history.next_id(), 1);
         assert_eq!(history.next_id(), 2);
         assert_eq!(history.next_id(), 3);
+    }
+
+    #[test]
+    fn test_record_build_heartbeat_updates_progress_metadata() {
+        let _guard = test_guard!();
+        let history = BuildHistory::new(10);
+        let build = history.start_active_build(
+            "proj".to_string(),
+            "worker-a".to_string(),
+            "cargo build".to_string(),
+            1234,
+            4,
+            BuildLocation::Remote,
+        );
+        let initial_progress_at = build.last_progress_at.clone();
+
+        let updated = history
+            .record_build_heartbeat(BuildHeartbeatRequest {
+                build_id: build.id,
+                worker_id: rch_common::WorkerId::new("worker-a"),
+                hook_pid: Some(1234),
+                phase: BuildHeartbeatPhase::Execute,
+                detail: Some("Compiling".to_string()),
+                progress_counter: Some(3),
+                progress_percent: Some(25.0),
+            })
+            .expect("active build should be updated");
+
+        assert_eq!(updated.heartbeat_phase, BuildHeartbeatPhase::Execute);
+        assert_eq!(updated.heartbeat_counter, 3);
+        assert_eq!(updated.heartbeat_percent, Some(25.0));
+        assert_eq!(updated.heartbeat_count, 1);
+        assert_ne!(updated.last_progress_at, initial_progress_at);
+    }
+
+    #[test]
+    fn test_record_build_heartbeat_rejects_worker_mismatch() {
+        let _guard = test_guard!();
+        let history = BuildHistory::new(10);
+        let build = history.start_active_build(
+            "proj".to_string(),
+            "worker-a".to_string(),
+            "cargo check".to_string(),
+            9999,
+            2,
+            BuildLocation::Remote,
+        );
+
+        let updated = history.record_build_heartbeat(BuildHeartbeatRequest {
+            build_id: build.id,
+            worker_id: rch_common::WorkerId::new("worker-b"),
+            hook_pid: Some(9999),
+            phase: BuildHeartbeatPhase::Execute,
+            detail: Some("Unexpected".to_string()),
+            progress_counter: Some(1),
+            progress_percent: Some(10.0),
+        });
+        assert!(
+            updated.is_none(),
+            "mismatched worker heartbeat must be ignored"
+        );
+    }
+
+    #[test]
+    fn test_record_stuck_detector_snapshot_updates_active_build() {
+        let _guard = test_guard!();
+        let history = BuildHistory::new(10);
+        let build = history.start_active_build(
+            "proj".to_string(),
+            "worker-a".to_string(),
+            "cargo test".to_string(),
+            4321,
+            6,
+            BuildLocation::Remote,
+        );
+
+        let updated = history
+            .record_stuck_detector_snapshot(
+                build.id,
+                StuckDetectorSnapshot {
+                    hook_alive: false,
+                    heartbeat_stale: true,
+                    progress_stale: true,
+                    confidence: 0.91,
+                    build_age_secs: 140,
+                    slots_owned: 6,
+                },
+            )
+            .expect("active build should exist");
+
+        assert!(!updated.detector_hook_alive);
+        assert!(updated.detector_heartbeat_stale);
+        assert!(updated.detector_progress_stale);
+        assert_eq!(updated.detector_confidence, 0.91);
+        assert_eq!(updated.detector_build_age_secs, 140);
+        assert_eq!(updated.detector_slots_owned, 6);
+        assert!(updated.detector_last_evaluated_at.is_some());
     }
 
     #[tokio::test]

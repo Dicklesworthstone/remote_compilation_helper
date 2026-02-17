@@ -647,6 +647,72 @@ fn render_builds_section_to<W: Write>(
                 style.info(&build.worker_id),
                 style.muted(&cmd_display)
             )?;
+
+            let phase = build
+                .heartbeat_phase
+                .as_deref()
+                .map_or_else(|| "unknown".to_string(), str::to_string);
+            let heartbeat_age = build
+                .heartbeat_age_secs
+                .map_or_else(|| "n/a".to_string(), format_duration);
+            let progress_age = build
+                .progress_age_secs
+                .map_or_else(|| "n/a".to_string(), format_duration);
+            let progress_counter = build
+                .heartbeat_counter
+                .map_or_else(|| "n/a".to_string(), |v| v.to_string());
+            let percent = build
+                .heartbeat_percent
+                .map_or_else(|| "n/a".to_string(), |v| format!("{v:.0}%"));
+            let slots = build
+                .slots
+                .map_or_else(|| "n/a".to_string(), |v| v.to_string());
+            let detail = build
+                .heartbeat_detail
+                .as_deref()
+                .map_or_else(|| "none".to_string(), str::to_string);
+            let detector_confidence = build
+                .detector_confidence
+                .map_or_else(|| "n/a".to_string(), |v| format!("{v:.2}"));
+            let detector_hook_alive = build
+                .detector_hook_alive
+                .map_or_else(|| "n/a".to_string(), |v| v.to_string());
+            let detector_hb_stale = build
+                .detector_heartbeat_stale
+                .map_or_else(|| "n/a".to_string(), |v| v.to_string());
+            let detector_progress_stale = build
+                .detector_progress_stale
+                .map_or_else(|| "n/a".to_string(), |v| v.to_string());
+            let detector_build_age = build
+                .detector_build_age_secs
+                .map_or_else(|| "n/a".to_string(), format_duration);
+            let detector_slots = build
+                .detector_slots_owned
+                .map_or_else(|| "n/a".to_string(), |v| v.to_string());
+
+            writeln!(
+                out,
+                "    {} phase={} | hb_age={} | progress_age={} | counter={} | pct={} | slots={} | detail={}",
+                style.muted("heartbeat:"),
+                style.info(&phase),
+                style.info(&heartbeat_age),
+                style.info(&progress_age),
+                style.info(&progress_counter),
+                style.info(&percent),
+                style.info(&slots),
+                style.muted(&detail)
+            )?;
+            writeln!(
+                out,
+                "    {} confidence={} | hook_alive={} | hb_stale={} | progress_stale={} | build_age={} | slots={}",
+                style.muted("detector:"),
+                style.info(&detector_confidence),
+                style.info(&detector_hook_alive),
+                style.info(&detector_hb_stale),
+                style.info(&detector_progress_stale),
+                style.info(&detector_build_age),
+                style.info(&detector_slots)
+            )?;
         }
     }
 
@@ -908,6 +974,22 @@ mod tests {
                 worker_id: "worker-a".to_string(),
                 command: "cargo build".to_string(),
                 started_at: "2026-01-17T00:00:01Z".to_string(),
+                last_heartbeat_at: Some("2026-01-17T00:00:05Z".to_string()),
+                heartbeat_age_secs: Some(2),
+                last_progress_at: Some("2026-01-17T00:00:04Z".to_string()),
+                progress_age_secs: Some(3),
+                heartbeat_phase: Some("execute".to_string()),
+                heartbeat_detail: Some("Compiling".to_string()),
+                heartbeat_counter: Some(7),
+                heartbeat_percent: Some(35.0),
+                slots: Some(4),
+                detector_hook_alive: Some(false),
+                detector_heartbeat_stale: Some(true),
+                detector_progress_stale: Some(true),
+                detector_confidence: Some(0.91),
+                detector_build_age_secs: Some(120),
+                detector_slots_owned: Some(4),
+                detector_last_evaluated_at: Some("2026-01-17T00:00:05Z".to_string()),
             }],
             queued_builds: vec![],
             recent_builds: vec![
@@ -1070,6 +1152,9 @@ mod tests {
         assert!(output.contains("Recent Builds"));
         assert!(output.contains("cargo build"));
         assert!(output.contains("cargo test --release"));
+        assert!(output.contains("heartbeat:"));
+        assert!(output.contains("detector:"));
+        assert!(output.contains("phase="));
         assert!(output.contains("✓"));
         assert!(output.contains("✗"));
         info!("PASS: build sections rendered with status indicators");

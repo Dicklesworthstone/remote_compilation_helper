@@ -18,9 +18,9 @@ use crate::workers::{
 use anyhow::{Result, anyhow};
 use chrono::{Duration as ChronoDuration, Utc};
 use rch_common::{
-    ApiError, BuildRecord, BuildStats, CircuitBreakerConfig, CircuitState, CommandPriority,
-    ErrorCode, ReleaseRequest, RequiredRuntime, SavedTimeStats, SelectedWorker, SelectionReason,
-    SelectionRequest, SelectionResponse, WorkerId, WorkerStatus,
+    ApiError, BuildHeartbeatRequest, BuildRecord, BuildStats, CircuitBreakerConfig, CircuitState,
+    CommandPriority, ErrorCode, ReleaseRequest, RequiredRuntime, SavedTimeStats, SelectedWorker,
+    SelectionReason, SelectionRequest, SelectionResponse, WorkerId, WorkerStatus,
 };
 use rch_telemetry::protocol::{TelemetrySource, TestRunRecord, TestRunStats, WorkerTelemetry};
 use rch_telemetry::speedscore::SpeedScore;
@@ -109,6 +109,7 @@ enum ApiRequest {
         project: String,
         is_test: bool,
     },
+    BuildHeartbeat,
     IngestTelemetry(TelemetrySource),
     TestRun,
     TelemetryPoll {
@@ -287,6 +288,38 @@ pub struct ActiveBuild {
     pub command: String,
     /// When build started (ISO 8601).
     pub started_at: String,
+    /// Last heartbeat timestamp (ISO 8601).
+    pub last_heartbeat_at: String,
+    /// Age of the latest heartbeat sample in seconds.
+    pub heartbeat_age_secs: u64,
+    /// Last progress-evidence timestamp (ISO 8601).
+    pub last_progress_at: String,
+    /// Age of latest progress evidence in seconds.
+    pub progress_age_secs: u64,
+    /// Current heartbeat phase.
+    pub heartbeat_phase: String,
+    /// Progress detail captured from heartbeat samples.
+    pub heartbeat_detail: Option<String>,
+    /// Monotonic progress counter from the hook.
+    pub heartbeat_counter: u64,
+    /// Progress estimate in [0,100], when available.
+    pub heartbeat_percent: Option<f64>,
+    /// Slots currently owned by this build.
+    pub slots: u32,
+    /// Latest detector check: hook process alive.
+    pub detector_hook_alive: bool,
+    /// Latest detector check: heartbeat currently stale.
+    pub detector_heartbeat_stale: bool,
+    /// Latest detector check: progress evidence currently stale.
+    pub detector_progress_stale: bool,
+    /// Latest detector confidence in [0,1].
+    pub detector_confidence: f64,
+    /// Build age at last detector evaluation.
+    pub detector_build_age_secs: u64,
+    /// Slot count considered by detector at last evaluation.
+    pub detector_slots_owned: u32,
+    /// Last detector evaluation timestamp (ISO 8601), if available.
+    pub detector_last_evaluated_at: Option<String>,
 }
 
 /// Queued build information.
@@ -386,6 +419,15 @@ pub struct SelfTestHistoryResponse {
 pub struct SelfTestRunResponse {
     pub run: crate::self_test::SelfTestRunRecord,
     pub results: Vec<crate::self_test::SelfTestResultRecord>,
+}
+
+/// Build heartbeat ingestion response.
+#[derive(Debug, Serialize)]
+pub struct BuildHeartbeatResponse {
+    pub status: String,
+    pub build_id: u64,
+    pub worker_id: String,
+    pub phase: String,
 }
 
 // ============================================================================
@@ -559,6 +601,46 @@ pub async fn handle_connection(
             metrics::inc_requests("record-build");
             handle_record_build(&ctx, &worker_id, &project, is_test).await?;
             ("{}".to_string(), "application/json")
+        }
+        Ok(ApiRequest::BuildHeartbeat) => {
+            metrics::inc_requests("build-heartbeat");
+            let mut body = String::new();
+            match tokio::time::timeout(
+                Duration::from_secs(10),
+                reader.take(MAX_BODY_SIZE).read_to_string(&mut body),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => return Err(e.into()),
+                Err(_) => {
+                    warn!("Build heartbeat body read timed out");
+                    return Ok(());
+                }
+            }
+            let payload = body.trim();
+            if payload.is_empty() {
+                (
+                    "{\"status\":\"error\",\"error\":\"empty build heartbeat payload\"}"
+                        .to_string(),
+                    "application/json",
+                )
+            } else {
+                match serde_json::from_str::<BuildHeartbeatRequest>(payload) {
+                    Ok(request) => {
+                        let response = handle_build_heartbeat(&ctx, request).await;
+                        (serde_json::to_string(&response)?, "application/json")
+                    }
+                    Err(e) => {
+                        warn!("Failed to parse build heartbeat JSON: {}", e);
+                        (
+                            "{\"status\":\"error\",\"error\":\"invalid build heartbeat payload\"}"
+                                .to_string(),
+                            "application/json",
+                        )
+                    }
+                }
+            }
         }
         Ok(ApiRequest::IngestTelemetry(source)) => {
             metrics::inc_requests("telemetry");
@@ -1227,6 +1309,13 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
             project,
             is_test,
         });
+    }
+
+    if path.starts_with("/build-heartbeat") {
+        if method != "POST" {
+            return Err(anyhow!("Only POST method supported for build heartbeat"));
+        }
+        return Ok(ApiRequest::BuildHeartbeat);
     }
 
     if path.starts_with("/test-run") {
@@ -2142,6 +2231,75 @@ async fn handle_record_build(
     Ok(())
 }
 
+fn heartbeat_phase_to_str(phase: &rch_common::BuildHeartbeatPhase) -> &'static str {
+    match phase {
+        rch_common::BuildHeartbeatPhase::SyncUp => "sync_up",
+        rch_common::BuildHeartbeatPhase::Execute => "execute",
+        rch_common::BuildHeartbeatPhase::SyncDown => "sync_down",
+        rch_common::BuildHeartbeatPhase::Finalize => "finalize",
+    }
+}
+
+/// Handle a build-heartbeat request.
+async fn handle_build_heartbeat(
+    ctx: &DaemonContext,
+    request: BuildHeartbeatRequest,
+) -> BuildHeartbeatResponse {
+    let build_id = request.build_id;
+    let worker_id = request.worker_id.as_str().to_string();
+    let phase = heartbeat_phase_to_str(&request.phase).to_string();
+    let detail = request.detail.clone();
+    let progress_counter = request.progress_counter;
+    let progress_percent = request.progress_percent;
+
+    if let Some(state) = ctx.history.record_build_heartbeat(request) {
+        let event_phase = heartbeat_phase_to_str(&state.heartbeat_phase).to_string();
+        let event_detail = state.heartbeat_detail.clone();
+        let event_counter = state.heartbeat_counter;
+        let event_percent = state.heartbeat_percent;
+        ctx.events.emit(
+            "build_heartbeat",
+            &serde_json::json!({
+                "build_id": state.id,
+                "project_id": state.project_id,
+                "worker_id": state.worker_id,
+                "phase": event_phase,
+                "detail": event_detail,
+                "progress_counter": event_counter,
+                "progress_percent": event_percent,
+            }),
+        );
+        BuildHeartbeatResponse {
+            status: "ok".to_string(),
+            build_id,
+            worker_id,
+            phase,
+        }
+    } else {
+        warn!(
+            "Ignoring heartbeat for unknown build {} on worker {}",
+            build_id, worker_id
+        );
+        ctx.events.emit(
+            "build_heartbeat_ignored",
+            &serde_json::json!({
+                "build_id": build_id,
+                "worker_id": worker_id.clone(),
+                "phase": phase.clone(),
+                "detail": detail,
+                "progress_counter": progress_counter,
+                "progress_percent": progress_percent,
+            }),
+        );
+        BuildHeartbeatResponse {
+            status: "ignored".to_string(),
+            build_id,
+            worker_id,
+            phase,
+        }
+    }
+}
+
 /// Handle a metrics request - returns Prometheus text format.
 fn handle_metrics() -> Result<String> {
     metrics::encode_metrics()
@@ -2537,6 +2695,22 @@ async fn handle_status(ctx: &DaemonContext) -> Result<DaemonFullStatus> {
                 worker_id: b.worker_id,
                 command: b.command,
                 started_at: b.started_at,
+                last_heartbeat_at: b.last_heartbeat_at,
+                heartbeat_age_secs: b.last_heartbeat_mono.elapsed().as_secs(),
+                last_progress_at: b.last_progress_at,
+                progress_age_secs: b.last_progress_mono.elapsed().as_secs(),
+                heartbeat_phase: heartbeat_phase_to_str(&b.heartbeat_phase).to_string(),
+                heartbeat_detail: b.heartbeat_detail,
+                heartbeat_counter: b.heartbeat_counter,
+                heartbeat_percent: b.heartbeat_percent,
+                slots: b.slots,
+                detector_hook_alive: b.detector_hook_alive,
+                detector_heartbeat_stale: b.detector_heartbeat_stale,
+                detector_progress_stale: b.detector_progress_stale,
+                detector_confidence: b.detector_confidence,
+                detector_build_age_secs: b.detector_build_age_secs,
+                detector_slots_owned: b.detector_slots_owned,
+                detector_last_evaluated_at: b.detector_last_evaluated_at,
             })
             .collect(),
         queued_builds: ctx
@@ -2701,6 +2875,16 @@ mod tests {
         assert!(
             matches!(req, ApiRequest::TestRun),
             "expected test run request"
+        );
+    }
+
+    #[test]
+    fn test_parse_request_build_heartbeat() {
+        let _guard = test_guard!();
+        let req = parse_request("POST /build-heartbeat").unwrap();
+        assert!(
+            matches!(req, ApiRequest::BuildHeartbeat),
+            "expected build-heartbeat request"
         );
     }
 
@@ -3360,11 +3544,30 @@ mod tests {
             worker_id: "worker1".to_string(),
             command: "cargo build".to_string(),
             started_at: "2025-01-01T00:00:00Z".to_string(),
+            last_heartbeat_at: "2025-01-01T00:00:03Z".to_string(),
+            heartbeat_age_secs: 2,
+            last_progress_at: "2025-01-01T00:00:02Z".to_string(),
+            progress_age_secs: 3,
+            heartbeat_phase: "execute".to_string(),
+            heartbeat_detail: Some("Compiling crates".to_string()),
+            heartbeat_counter: 9,
+            heartbeat_percent: Some(42.0),
+            slots: 4,
+            detector_hook_alive: false,
+            detector_heartbeat_stale: true,
+            detector_progress_stale: true,
+            detector_confidence: 0.91,
+            detector_build_age_secs: 120,
+            detector_slots_owned: 4,
+            detector_last_evaluated_at: Some("2025-01-01T00:00:04Z".to_string()),
         };
         let json = serde_json::to_string(&build).unwrap();
         assert!(json.contains("\"id\":42"));
         assert!(json.contains("\"project_id\":\"my-project\""));
         assert!(json.contains("\"command\":\"cargo build\""));
+        assert!(json.contains("\"heartbeat_phase\":\"execute\""));
+        assert!(json.contains("\"heartbeat_counter\":9"));
+        assert!(json.contains("\"detector_confidence\":0.91"));
     }
 
     #[test]
@@ -4353,6 +4556,79 @@ mod tests {
         assert_eq!(completed.unwrap().exit_code, 0);
     }
 
+    #[tokio::test]
+    async fn test_handle_build_heartbeat_updates_active_build_state() {
+        let _guard = test_guard!();
+        let pool = WorkerPool::new();
+        pool.add_worker(make_test_worker("worker1", 8)).await;
+        let ctx = make_test_context(pool);
+
+        let build = ctx.history.start_active_build(
+            "test-project".to_string(),
+            "worker1".to_string(),
+            "cargo build".to_string(),
+            43210,
+            4,
+            rch_common::BuildLocation::Remote,
+        );
+
+        let response = handle_build_heartbeat(
+            &ctx,
+            BuildHeartbeatRequest {
+                build_id: build.id,
+                worker_id: WorkerId::new("worker1"),
+                hook_pid: Some(43210),
+                phase: rch_common::BuildHeartbeatPhase::Execute,
+                detail: Some("Compiling".to_string()),
+                progress_counter: Some(4),
+                progress_percent: Some(18.0),
+            },
+        )
+        .await;
+
+        assert_eq!(response.status, "ok");
+        let active = ctx.history.active_build(build.id).expect("active build");
+        assert_eq!(
+            active.heartbeat_phase,
+            rch_common::BuildHeartbeatPhase::Execute
+        );
+        assert_eq!(active.heartbeat_counter, 4);
+        assert_eq!(active.heartbeat_percent, Some(18.0));
+    }
+
+    #[tokio::test]
+    async fn test_handle_build_heartbeat_rejects_worker_mismatch() {
+        let _guard = test_guard!();
+        let pool = WorkerPool::new();
+        pool.add_worker(make_test_worker("worker1", 8)).await;
+        let ctx = make_test_context(pool);
+
+        let build = ctx.history.start_active_build(
+            "test-project".to_string(),
+            "worker1".to_string(),
+            "cargo build".to_string(),
+            5555,
+            2,
+            rch_common::BuildLocation::Remote,
+        );
+
+        let response = handle_build_heartbeat(
+            &ctx,
+            BuildHeartbeatRequest {
+                build_id: build.id,
+                worker_id: WorkerId::new("worker-x"),
+                hook_pid: Some(5555),
+                phase: rch_common::BuildHeartbeatPhase::Execute,
+                detail: Some("Mismatch".to_string()),
+                progress_counter: Some(2),
+                progress_percent: None,
+            },
+        )
+        .await;
+
+        assert_eq!(response.status, "ignored");
+    }
+
     // =========================================================================
     // Record build tests
     // =========================================================================
@@ -4531,6 +4807,10 @@ mod tests {
         assert_eq!(status.active_builds.len(), 1);
         assert_eq!(status.active_builds[0].project_id, "test-project");
         assert_eq!(status.active_builds[0].command, "cargo build");
+        assert_eq!(status.active_builds[0].heartbeat_phase, "sync_up");
+        assert_eq!(status.active_builds[0].heartbeat_counter, 0);
+        assert_eq!(status.active_builds[0].slots, 4);
+        assert_eq!(status.active_builds[0].detector_confidence, 0.0);
     }
 
     // =========================================================================

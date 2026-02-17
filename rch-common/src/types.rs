@@ -511,6 +511,46 @@ pub struct ReleaseRequest {
     pub timing: Option<CommandTimingBreakdown>,
 }
 
+/// Build execution phase for daemon heartbeat tracking.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BuildHeartbeatPhase {
+    /// Uploading sources/dependencies to the worker.
+    SyncUp,
+    /// Running the remote compilation/test command.
+    Execute,
+    /// Downloading build artifacts from the worker.
+    SyncDown,
+    /// Build is completing or finalizing.
+    Finalize,
+}
+
+/// Request to update liveness/progress for an active build.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct BuildHeartbeatRequest {
+    /// Active build identifier assigned by the daemon.
+    pub build_id: u64,
+    /// Worker executing the build.
+    pub worker_id: WorkerId,
+    /// Hook process ID sending the heartbeat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hook_pid: Option<u32>,
+    /// Current build execution phase.
+    pub phase: BuildHeartbeatPhase,
+    /// Optional human-readable progress detail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// Optional monotonic progress counter.
+    ///
+    /// The hook increments this when it observes meaningful progress
+    /// (phase transitions, new output, or richer progress signals).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress_counter: Option<u64>,
+    /// Optional progress estimate in [0,100].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress_percent: Option<f64>,
+}
+
 /// Configuration for a remote worker.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerConfig {
@@ -2978,6 +3018,37 @@ mod tests {
         assert_eq!(worker.host, "192.168.1.100");
         assert_eq!(worker.slots_available, 16);
         assert_eq!(parsed.reason, SelectionReason::Success);
+    }
+
+    #[test]
+    fn test_build_heartbeat_phase_roundtrip() {
+        let _guard = test_guard!();
+        let json = serde_json::to_string(&BuildHeartbeatPhase::SyncUp).unwrap();
+        assert_eq!(json, "\"sync_up\"");
+        let parsed: BuildHeartbeatPhase = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, BuildHeartbeatPhase::SyncUp);
+    }
+
+    #[test]
+    fn test_build_heartbeat_request_roundtrip() {
+        let _guard = test_guard!();
+        let request = BuildHeartbeatRequest {
+            build_id: 42,
+            worker_id: WorkerId::new("worker-a"),
+            hook_pid: Some(12345),
+            phase: BuildHeartbeatPhase::Execute,
+            detail: Some("Compiling crates".to_string()),
+            progress_counter: Some(7),
+            progress_percent: Some(42.5),
+        };
+
+        let json = serde_json::to_string(&request).unwrap();
+        let parsed: BuildHeartbeatRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.build_id, 42);
+        assert_eq!(parsed.worker_id.as_str(), "worker-a");
+        assert_eq!(parsed.phase, BuildHeartbeatPhase::Execute);
+        assert_eq!(parsed.progress_counter, Some(7));
+        assert_eq!(parsed.progress_percent, Some(42.5));
     }
 
     // CircuitStats tests

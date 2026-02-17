@@ -86,6 +86,38 @@ pub struct ActiveBuildFromApi {
     pub worker_id: String,
     pub command: String,
     pub started_at: String,
+    #[serde(default)]
+    pub last_heartbeat_at: Option<String>,
+    #[serde(default)]
+    pub heartbeat_age_secs: Option<u64>,
+    #[serde(default)]
+    pub last_progress_at: Option<String>,
+    #[serde(default)]
+    pub progress_age_secs: Option<u64>,
+    #[serde(default)]
+    pub heartbeat_phase: Option<String>,
+    #[serde(default)]
+    pub heartbeat_detail: Option<String>,
+    #[serde(default)]
+    pub heartbeat_counter: Option<u64>,
+    #[serde(default)]
+    pub heartbeat_percent: Option<f64>,
+    #[serde(default)]
+    pub slots: Option<u32>,
+    #[serde(default)]
+    pub detector_hook_alive: Option<bool>,
+    #[serde(default)]
+    pub detector_heartbeat_stale: Option<bool>,
+    #[serde(default)]
+    pub detector_progress_stale: Option<bool>,
+    #[serde(default)]
+    pub detector_confidence: Option<f64>,
+    #[serde(default)]
+    pub detector_build_age_secs: Option<u64>,
+    #[serde(default)]
+    pub detector_slots_owned: Option<u32>,
+    #[serde(default)]
+    pub detector_last_evaluated_at: Option<String>,
 }
 
 /// Queued build information from API.
@@ -656,13 +688,35 @@ mod tests {
             "project_id": "rch",
             "worker_id": "worker-1",
             "command": "cargo build --release",
-            "started_at": "2026-01-16T12:00:00Z"
+            "started_at": "2026-01-16T12:00:00Z",
+            "last_heartbeat_at": "2026-01-16T12:00:04Z",
+            "heartbeat_age_secs": 3,
+            "last_progress_at": "2026-01-16T12:00:03Z",
+            "progress_age_secs": 4,
+            "heartbeat_phase": "execute",
+            "heartbeat_detail": "Compiling",
+            "heartbeat_counter": 12,
+            "heartbeat_percent": 66.0,
+            "slots": 4,
+            "detector_hook_alive": false,
+            "detector_heartbeat_stale": true,
+            "detector_progress_stale": true,
+            "detector_confidence": 0.91,
+            "detector_build_age_secs": 120,
+            "detector_slots_owned": 4,
+            "detector_last_evaluated_at": "2026-01-16T12:00:05Z"
         });
 
         let build: ActiveBuildFromApi = serde_json::from_value(json).unwrap();
         assert_eq!(build.id, 12345);
         assert_eq!(build.project_id, "rch");
         assert_eq!(build.command, "cargo build --release");
+        assert_eq!(build.heartbeat_phase, Some("execute".to_string()));
+        assert_eq!(build.heartbeat_counter, Some(12));
+        assert_eq!(build.heartbeat_percent, Some(66.0));
+        assert_eq!(build.slots, Some(4));
+        assert_eq!(build.detector_confidence, Some(0.91));
+        assert_eq!(build.detector_hook_alive, Some(false));
     }
 
     #[test]

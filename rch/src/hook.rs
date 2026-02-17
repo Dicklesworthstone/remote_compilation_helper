@@ -27,11 +27,11 @@ use rch_common::repo_updater_contract::{
     RepoUpdaterOperatorOverride, RepoUpdaterTrustedHostIdentity, RepoUpdaterVerifiedHostIdentity,
 };
 use rch_common::{
-    ColorMode, CommandPriority, CommandTimingBreakdown, CompilationKind, HookInput, HookOutput,
-    OutputVisibility, REPO_UPDATER_CANONICAL_PROJECTS_ROOT, RepoUpdaterAdapterCommand,
-    RepoUpdaterAdapterContract, RepoUpdaterAdapterRequest, RepoUpdaterOutputFormat,
-    RequiredRuntime, SelectedWorker, SelectionReason, SelectionResponse, SelfHealingConfig,
-    ToolchainInfo, TransferConfig, WorkerConfig, WorkerId,
+    BuildHeartbeatPhase, BuildHeartbeatRequest, ColorMode, CommandPriority, CommandTimingBreakdown,
+    CompilationKind, HookInput, HookOutput, OutputVisibility, REPO_UPDATER_CANONICAL_PROJECTS_ROOT,
+    RepoUpdaterAdapterCommand, RepoUpdaterAdapterContract, RepoUpdaterAdapterRequest,
+    RepoUpdaterOutputFormat, RequiredRuntime, SelectedWorker, SelectionReason, SelectionResponse,
+    SelfHealingConfig, ToolchainInfo, TransferConfig, WorkerConfig, WorkerId,
     build_dependency_closure_plan_with_policy, build_invocation, classify_command, mock,
     normalize_project_path, normalize_project_path_with_policy,
     path_topology::{
@@ -51,10 +51,12 @@ use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::process::Command;
+use tokio::sync::oneshot;
 use tokio::time::{sleep, timeout};
 use tracing::{debug, info, warn};
 use which::which;
@@ -3066,6 +3068,20 @@ struct SyncClosurePlanEntry {
     is_primary: bool,
 }
 
+/// Outcome of syncing a single closure root during multi-root transfer.
+///
+/// Used to collect per-root results and enable partial failure diagnostics
+/// instead of aborting the entire sync on the first dependency root failure.
+#[derive(Debug)]
+enum SyncRootOutcome {
+    /// Root synced successfully.
+    Synced,
+    /// Dependency root sync was skipped (transfer estimation indicated skip).
+    Skipped { reason: String },
+    /// Dependency root sync failed (non-fatal for non-primary roots).
+    Failed { error: String },
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 struct SyncClosureManifest {
     schema_version: &'static str,
@@ -3090,14 +3106,31 @@ fn canonicalize_sync_root_for_plan(root: &Path) -> PathBuf {
         .unwrap_or_else(|| root.to_path_buf())
 }
 
+/// Returns `true` if `path` is within the allowed topology roots.
+fn is_within_sync_topology(path: &Path, policy: &PathTopologyPolicy) -> bool {
+    path.starts_with(policy.canonical_root()) || path.starts_with(policy.alias_root())
+}
+
 fn build_sync_closure_plan(
     sync_roots: &[PathBuf],
     normalized_project_root: &Path,
     project_hash: &str,
 ) -> Vec<SyncClosurePlanEntry> {
+    let policy = PathTopologyPolicy::default();
     let mut ordered_roots = std::collections::BTreeSet::<PathBuf>::new();
     for root in sync_roots {
-        ordered_roots.insert(canonicalize_sync_root_for_plan(root));
+        let canonicalized = canonicalize_sync_root_for_plan(root);
+        if !is_within_sync_topology(&canonicalized, &policy) {
+            warn!(
+                "Dependency root {} (canonicalized: {}) is outside allowed topology ({} / {}); skipping from sync closure",
+                root.display(),
+                canonicalized.display(),
+                policy.canonical_root().display(),
+                policy.alias_root().display(),
+            );
+            continue;
+        }
+        ordered_roots.insert(canonicalized);
     }
 
     let primary_root = canonicalize_sync_root_for_plan(normalized_project_root);
@@ -3335,6 +3368,157 @@ fn get_artifact_patterns(kind: Option<CompilationKind>) -> Vec<String> {
     }
 }
 
+const BUILD_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Clone)]
+struct BuildHeartbeatSnapshot {
+    phase: BuildHeartbeatPhase,
+    detail: Option<String>,
+    progress_counter: u64,
+    progress_percent: Option<f64>,
+}
+
+impl BuildHeartbeatSnapshot {
+    fn new() -> Self {
+        Self {
+            phase: BuildHeartbeatPhase::SyncUp,
+            detail: Some("build_started".to_string()),
+            progress_counter: 0,
+            progress_percent: None,
+        }
+    }
+
+    fn update_phase(&mut self, phase: BuildHeartbeatPhase, detail: Option<String>) {
+        self.phase = phase;
+        self.detail = detail;
+        self.progress_counter = self.progress_counter.saturating_add(1);
+    }
+
+    fn note_progress(&mut self) {
+        self.progress_counter = self.progress_counter.saturating_add(1);
+    }
+}
+
+struct BuildHeartbeatLoop {
+    socket_path: String,
+    build_id: u64,
+    worker_id: WorkerId,
+    hook_pid: u32,
+    state: Arc<Mutex<BuildHeartbeatSnapshot>>,
+    stop_tx: Option<oneshot::Sender<()>>,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl BuildHeartbeatLoop {
+    fn start(socket_path: &str, build_id: u64, worker_id: &WorkerId) -> Self {
+        let state = Arc::new(Mutex::new(BuildHeartbeatSnapshot::new()));
+        let (stop_tx, mut stop_rx) = oneshot::channel::<()>();
+
+        let socket_path_owned = socket_path.to_string();
+        let worker_id_owned = worker_id.clone();
+        let state_for_task = Arc::clone(&state);
+        let hook_pid = std::process::id();
+
+        let task = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(BUILD_HEARTBEAT_INTERVAL);
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        let snapshot = {
+                            state_for_task
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .clone()
+                        };
+                        let heartbeat = BuildHeartbeatRequest {
+                            build_id,
+                            worker_id: worker_id_owned.clone(),
+                            hook_pid: Some(hook_pid),
+                            phase: snapshot.phase,
+                            detail: snapshot.detail,
+                            progress_counter: Some(snapshot.progress_counter),
+                            progress_percent: snapshot.progress_percent,
+                        };
+                        if let Err(e) = send_build_heartbeat(&socket_path_owned, &heartbeat).await {
+                            debug!("build heartbeat send failed for build {}: {}", build_id, e);
+                        }
+                    }
+                    _ = &mut stop_rx => break,
+                }
+            }
+        });
+
+        Self {
+            socket_path: socket_path.to_string(),
+            build_id,
+            worker_id: worker_id.clone(),
+            hook_pid,
+            state,
+            stop_tx: Some(stop_tx),
+            task: Some(task),
+        }
+    }
+
+    fn shared_state(&self) -> Arc<Mutex<BuildHeartbeatSnapshot>> {
+        Arc::clone(&self.state)
+    }
+
+    fn update_phase(&self, phase: BuildHeartbeatPhase, detail: Option<String>) {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .update_phase(phase, detail);
+    }
+
+    async fn flush(&self) {
+        let snapshot = { self.state.lock().unwrap_or_else(|e| e.into_inner()).clone() };
+        let heartbeat = BuildHeartbeatRequest {
+            build_id: self.build_id,
+            worker_id: self.worker_id.clone(),
+            hook_pid: Some(self.hook_pid),
+            phase: snapshot.phase,
+            detail: snapshot.detail,
+            progress_counter: Some(snapshot.progress_counter),
+            progress_percent: snapshot.progress_percent,
+        };
+        if let Err(e) = send_build_heartbeat(&self.socket_path, &heartbeat).await {
+            debug!(
+                "build heartbeat flush failed for build {}: {}",
+                self.build_id, e
+            );
+        }
+    }
+
+    async fn finish(mut self, phase: BuildHeartbeatPhase, detail: Option<String>) {
+        self.update_phase(phase, detail);
+        self.flush().await;
+        if let Some(stop_tx) = self.stop_tx.take() {
+            let _ = stop_tx.send(());
+        }
+        if let Some(task) = self.task.take() {
+            let _ = task.await;
+        }
+    }
+}
+
+impl Drop for BuildHeartbeatLoop {
+    fn drop(&mut self) {
+        if let Some(stop_tx) = self.stop_tx.take() {
+            let _ = stop_tx.send(());
+        }
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
+fn mark_heartbeat_progress(state: &Arc<Mutex<BuildHeartbeatSnapshot>>) {
+    state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .note_progress();
+}
+
 /// Execute a compilation command on a remote worker.
 ///
 /// This function:
@@ -3393,6 +3577,12 @@ async fn execute_remote_compilation(
     let feedback_visible = reporter.visibility != OutputVisibility::None && !console.is_machine();
     let progress_enabled =
         output_ctx.supports_rich() && reporter.visibility != OutputVisibility::None;
+    let mut heartbeat_loop =
+        build_id.map(|id| BuildHeartbeatLoop::start(socket_path, id, &worker_config.id));
+    if let Some(loop_ref) = heartbeat_loop.as_ref() {
+        loop_ref.update_phase(BuildHeartbeatPhase::SyncUp, Some("sync_start".to_string()));
+        loop_ref.flush().await;
+    }
 
     if feedback_visible {
         emit_job_banner(&console, output_ctx, worker, build_id);
@@ -3454,6 +3644,7 @@ async fn execute_remote_compilation(
     } else {
         None
     };
+    let mut root_outcomes: Vec<(&SyncClosurePlanEntry, SyncRootOutcome)> = Vec::new();
     for entry in &sync_plan {
         let mut root_pipeline = TransferPipeline::new(
             entry.local_root.clone(),
@@ -3482,10 +3673,15 @@ async fn execute_remote_compilation(
                 entry.local_root.display(),
                 skip_reason
             ));
-            return Err(TransferError::TransferSkipped {
-                reason: skip_reason,
+            if entry.is_primary {
+                // Primary root skip is fatal — cannot build without the main project.
+                return Err(TransferError::TransferSkipped {
+                    reason: skip_reason,
+                }
+                .into());
             }
-            .into());
+            root_outcomes.push((entry, SyncRootOutcome::Skipped { reason: skip_reason }));
+            continue;
         }
 
         reporter.verbose(&format!(
@@ -3493,22 +3689,81 @@ async fn execute_remote_compilation(
             entry.local_root.display(),
             entry.remote_root.as_str()
         ));
-        let root_sync_result = if let Some(progress) = &mut upload_progress {
+        let sync_attempt = if let Some(progress) = &mut upload_progress {
             root_pipeline
                 .sync_to_remote_streaming(&worker_config, |line| {
                     progress.update_from_line(line);
                 })
-                .await?
+                .await
         } else {
-            root_pipeline.sync_to_remote(&worker_config).await?
+            root_pipeline.sync_to_remote(&worker_config).await
         };
-        aggregate_sync_result = Some(match &aggregate_sync_result {
-            Some(existing) => merge_sync_result(existing, &root_sync_result),
-            None => root_sync_result,
-        });
+        match sync_attempt {
+            Ok(root_sync_result) => {
+                aggregate_sync_result = Some(match &aggregate_sync_result {
+                    Some(existing) => merge_sync_result(existing, &root_sync_result),
+                    None => root_sync_result,
+                });
+                if entry.is_primary {
+                    primary_pipeline = Some(root_pipeline);
+                }
+                root_outcomes.push((entry, SyncRootOutcome::Synced));
+            }
+            Err(e) => {
+                if entry.is_primary {
+                    // Primary root failure is fatal — cannot build without the main project.
+                    return Err(e);
+                }
+                // Dependency root failure is non-fatal (fail-open for deps).
+                warn!(
+                    "Dependency root sync failed for {} (non-fatal): {}",
+                    entry.local_root.display(),
+                    e
+                );
+                reporter.verbose(&format!(
+                    "[RCH] dependency root sync failed (fail-open): {} — {}",
+                    entry.local_root.display(),
+                    e
+                ));
+                root_outcomes.push((
+                    entry,
+                    SyncRootOutcome::Failed {
+                        error: e.to_string(),
+                    },
+                ));
+            }
+        }
+    }
 
-        if entry.is_primary {
-            primary_pipeline = Some(root_pipeline);
+    // Emit structured partial-sync diagnostics when any dependency roots had issues.
+    let failed_count = root_outcomes
+        .iter()
+        .filter(|(_, o)| !matches!(o, SyncRootOutcome::Synced))
+        .count();
+    if failed_count > 0 {
+        warn!(
+            "Partial sync: {}/{} closure roots had issues (build continues with available roots)",
+            failed_count,
+            sync_plan.len()
+        );
+        for (entry, outcome) in &root_outcomes {
+            match outcome {
+                SyncRootOutcome::Synced => {}
+                SyncRootOutcome::Skipped { reason } => {
+                    info!(
+                        "  dependency root skipped: {} — {}",
+                        entry.local_root.display(),
+                        reason
+                    );
+                }
+                SyncRootOutcome::Failed { error } => {
+                    info!(
+                        "  dependency root failed: {} — {}",
+                        entry.local_root.display(),
+                        error
+                    );
+                }
+            }
         }
     }
     let sync_result = aggregate_sync_result
@@ -3530,6 +3785,13 @@ async fn execute_remote_compilation(
     if let Some(progress) = &mut upload_progress {
         progress.apply_summary(sync_result.bytes_transferred, sync_result.files_transferred);
         progress.finish();
+    }
+    if let Some(loop_ref) = heartbeat_loop.as_ref() {
+        loop_ref.update_phase(
+            BuildHeartbeatPhase::Execute,
+            Some("remote_exec_start".to_string()),
+        );
+        loop_ref.flush().await;
     }
 
     if command_uses_cargo_dependency_graph(kind) {
@@ -3591,6 +3853,12 @@ async fn execute_remote_compilation(
     let ui_state_stdout = Rc::clone(&ui_state);
     let ui_state_stderr = Rc::clone(&ui_state);
     let stderr_capture_stderr = Rc::clone(&stderr_capture_cell);
+    let heartbeat_state_stdout = heartbeat_loop
+        .as_ref()
+        .map(BuildHeartbeatLoop::shared_state);
+    let heartbeat_state_stderr = heartbeat_loop
+        .as_ref()
+        .map(BuildHeartbeatLoop::shared_state);
     let mut suppress_telemetry = false;
 
     let result = pipeline
@@ -3605,6 +3873,9 @@ async fn execute_remote_compilation(
                 if line.trim() == PIGGYBACK_MARKER {
                     suppress_telemetry = true;
                     return;
+                }
+                if let Some(state) = heartbeat_state_stdout.as_ref() {
+                    mark_heartbeat_progress(state);
                 }
 
                 let mut state = ui_state_stdout.borrow_mut();
@@ -3624,6 +3895,9 @@ async fn execute_remote_compilation(
                 }
             },
             move |line| {
+                if let Some(state) = heartbeat_state_stderr.as_ref() {
+                    mark_heartbeat_progress(state);
+                }
                 // Write stderr lines to stderr and capture for analysis
                 let mut state = ui_state_stderr.borrow_mut();
                 if let Some(progress) = state.progress.as_mut() {
@@ -3690,9 +3964,19 @@ async fn execute_remote_compilation(
     let mut artifacts_failed = false;
     // Step 3: Retrieve artifacts
     if result.success() {
+        if let Some(loop_ref) = heartbeat_loop.as_ref() {
+            loop_ref.update_phase(
+                BuildHeartbeatPhase::SyncDown,
+                Some("artifact_sync_start".to_string()),
+            );
+            loop_ref.flush().await;
+        }
         info!("Retrieving build artifacts...");
         reporter.verbose("[RCH] artifacts: retrieving...");
         let artifact_patterns = get_artifact_patterns(kind);
+        let heartbeat_state_download = heartbeat_loop
+            .as_ref()
+            .map(BuildHeartbeatLoop::shared_state);
         let mut download_progress = if progress_enabled {
             Some(TransferProgress::download(
                 output_ctx,
@@ -3707,6 +3991,9 @@ async fn execute_remote_compilation(
             pipeline
                 .retrieve_artifacts_streaming(&worker_config, &artifact_patterns, |line| {
                     progress.update_from_line(line);
+                    if let Some(state) = heartbeat_state_download.as_ref() {
+                        mark_heartbeat_progress(state);
+                    }
                 })
                 .await
         } else {
@@ -3811,9 +4098,15 @@ async fn execute_remote_compilation(
             };
 
             let target_retrieval = if let Some(progress) = &mut target_progress {
+                let heartbeat_state_target = heartbeat_loop
+                    .as_ref()
+                    .map(BuildHeartbeatLoop::shared_state);
                 target_pipeline
                     .retrieve_artifacts_streaming(&worker_config, &custom_patterns, |line| {
                         progress.update_from_line(line);
+                        if let Some(state) = heartbeat_state_target.as_ref() {
+                            mark_heartbeat_progress(state);
+                        }
                     })
                     .await
             } else {
@@ -3941,6 +4234,15 @@ async fn execute_remote_compilation(
         ..Default::default()
     };
 
+    if let Some(loop_ref) = heartbeat_loop.take() {
+        let detail = if result.success() {
+            Some("build_complete".to_string())
+        } else {
+            Some(format!("build_exit_{}", result.exit_code))
+        };
+        loop_ref.finish(BuildHeartbeatPhase::Finalize, detail).await;
+    }
+
     Ok(RemoteExecutionResult {
         exit_code: result.exit_code,
         stderr: stderr_capture,
@@ -4012,6 +4314,33 @@ async fn send_test_run(socket_path: &str, record: &TestRunRecord) -> anyhow::Res
     let body = record.to_json()?;
     let request = format!("POST /test-run\n{}\n", body);
 
+    writer.write_all(request.as_bytes()).await?;
+    writer.flush().await?;
+
+    let mut reader = BufReader::new(reader);
+    let mut line = String::new();
+    let _ = timeout(Duration::from_secs(5), reader.read_line(&mut line)).await;
+
+    Ok(())
+}
+
+async fn send_build_heartbeat(
+    socket_path: &str,
+    heartbeat: &BuildHeartbeatRequest,
+) -> anyhow::Result<()> {
+    if !Path::new(socket_path).exists() {
+        return Ok(());
+    }
+
+    let stream = match timeout(Duration::from_secs(2), UnixStream::connect(socket_path)).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => return Err(e.into()),
+        Err(_) => return Ok(()), // Timeout connecting — don't block hook
+    };
+    let (reader, mut writer) = stream.into_split();
+
+    let body = serde_json::to_string(heartbeat)?;
+    let request = format!("POST /build-heartbeat\n{}\n", body);
     writer.write_all(request.as_bytes()).await?;
     writer.flush().await?;
 
@@ -5786,7 +6115,7 @@ mod tests {
     #[test]
     fn test_build_sync_closure_plan_deterministic_under_permutation() {
         let _guard = test_guard!();
-        let temp_dir = tempfile::tempdir().expect("create tempdir");
+        let temp_dir = tempfile::tempdir_in("/data/projects").expect("create tempdir");
         let project_root = temp_dir.path().join("project");
         let dep_a = temp_dir.path().join("dep_a");
         let dep_b = temp_dir.path().join("dep_b");
@@ -5821,7 +6150,7 @@ mod tests {
         let _guard = test_guard!();
         use std::os::unix::fs::symlink;
 
-        let temp_dir = tempfile::tempdir().expect("create tempdir");
+        let temp_dir = tempfile::tempdir_in("/data/projects").expect("create tempdir");
         let project_root = temp_dir.path().join("project");
         let dep = temp_dir.path().join("dep");
         let dep_alias = temp_dir.path().join("dep_alias");
@@ -7607,5 +7936,337 @@ mod tests {
             "Load+save took {:?}, should be <50ms for CI compatibility",
             total
         );
+    }
+
+    // ── Multi-root sync manifest & partial failure tests (bd-vvmd.2.3 AC5) ──
+
+    #[test]
+    fn test_build_sync_closure_manifest_deterministic_entries() {
+        let _guard = test_guard!();
+        let temp_dir = tempfile::tempdir_in("/data/projects").expect("create tempdir");
+        let project_root = temp_dir.path().join("project");
+        let dep_a = temp_dir.path().join("dep_a");
+        let dep_b = temp_dir.path().join("dep_b");
+        std::fs::create_dir_all(&project_root).expect("create project root");
+        std::fs::create_dir_all(&dep_a).expect("create dep_a");
+        std::fs::create_dir_all(&dep_b).expect("create dep_b");
+
+        let plan = build_sync_closure_plan(
+            &[dep_b.clone(), dep_a.clone(), project_root.clone()],
+            &project_root,
+            "abc123",
+        );
+        let manifest_a = build_sync_closure_manifest(&plan, &project_root);
+        let manifest_b = build_sync_closure_manifest(&plan, &project_root);
+
+        // Entries must be identical (order, roots, hashes, primary flag).
+        assert_eq!(
+            manifest_a.entries, manifest_b.entries,
+            "manifest entries should be deterministic for the same plan"
+        );
+        assert_eq!(
+            manifest_a.schema_version, manifest_b.schema_version,
+            "schema version must be stable"
+        );
+        assert_eq!(
+            manifest_a.project_root, manifest_b.project_root,
+            "project root must be stable"
+        );
+    }
+
+    #[test]
+    fn test_build_sync_closure_manifest_schema_version_stable() {
+        let _guard = test_guard!();
+        let temp_dir = tempfile::tempdir_in("/data/projects").expect("create tempdir");
+        let project_root = temp_dir.path().join("project");
+        std::fs::create_dir_all(&project_root).expect("create project root");
+
+        let plan = build_sync_closure_plan(std::slice::from_ref(&project_root), &project_root, "deadbeef");
+        let manifest = build_sync_closure_manifest(&plan, &project_root);
+
+        assert_eq!(
+            manifest.schema_version, "rch.sync_closure_manifest.v1",
+            "schema version must match the documented v1 contract"
+        );
+    }
+
+    #[test]
+    fn test_build_sync_closure_manifest_entries_faithfully_represent_plan() {
+        let _guard = test_guard!();
+        let temp_dir = tempfile::tempdir_in("/data/projects").expect("create tempdir");
+        let project_root = temp_dir.path().join("project");
+        let dep = temp_dir.path().join("dep");
+        std::fs::create_dir_all(&project_root).expect("create project root");
+        std::fs::create_dir_all(&dep).expect("create dep");
+
+        let plan = build_sync_closure_plan(
+            &[dep.clone(), project_root.clone()],
+            &project_root,
+            "cafe0001",
+        );
+        let manifest = build_sync_closure_manifest(&plan, &project_root);
+
+        assert_eq!(
+            manifest.entries.len(),
+            plan.len(),
+            "manifest must have one entry per plan entry"
+        );
+        for (idx, (plan_entry, manifest_entry)) in
+            plan.iter().zip(manifest.entries.iter()).enumerate()
+        {
+            assert_eq!(manifest_entry.order, idx + 1, "order must be 1-indexed");
+            assert_eq!(
+                manifest_entry.local_root,
+                plan_entry.local_root.to_string_lossy().to_string()
+            );
+            assert_eq!(manifest_entry.remote_root, plan_entry.remote_root);
+            assert_eq!(manifest_entry.project_id, plan_entry.project_id);
+            assert_eq!(manifest_entry.root_hash, plan_entry.root_hash);
+            assert_eq!(manifest_entry.is_primary, plan_entry.is_primary);
+        }
+    }
+
+    #[test]
+    fn test_build_sync_closure_manifest_primary_root_present() {
+        let _guard = test_guard!();
+        let temp_dir = tempfile::tempdir_in("/data/projects").expect("create tempdir");
+        let project_root = temp_dir.path().join("project");
+        let dep = temp_dir.path().join("dep");
+        std::fs::create_dir_all(&project_root).expect("create project root");
+        std::fs::create_dir_all(&dep).expect("create dep");
+
+        let plan = build_sync_closure_plan(
+            &[dep.clone(), project_root.clone()],
+            &project_root,
+            "primary_hash",
+        );
+        let manifest = build_sync_closure_manifest(&plan, &project_root);
+
+        let primary_entries: Vec<_> = manifest
+            .entries
+            .iter()
+            .filter(|e| e.is_primary)
+            .collect();
+        assert_eq!(
+            primary_entries.len(),
+            1,
+            "exactly one manifest entry should be the primary root"
+        );
+        assert_eq!(
+            primary_entries[0].root_hash, "primary_hash",
+            "primary entry must carry the project-level hash"
+        );
+    }
+
+    #[test]
+    fn test_build_sync_closure_plan_adds_primary_even_when_absent_from_roots() {
+        let _guard = test_guard!();
+        let temp_dir = tempfile::tempdir_in("/data/projects").expect("create tempdir");
+        let project_root = temp_dir.path().join("project");
+        let dep = temp_dir.path().join("dep");
+        std::fs::create_dir_all(&project_root).expect("create project root");
+        std::fs::create_dir_all(&dep).expect("create dep");
+
+        // Deliberately omit project_root from sync_roots list.
+        let plan = build_sync_closure_plan(std::slice::from_ref(&dep), &project_root, "hash_auto_add");
+        let has_primary = plan.iter().any(|e| e.is_primary);
+        assert!(
+            has_primary,
+            "primary root must be auto-added to plan even when not in sync_roots"
+        );
+        let primary = plan.iter().find(|e| e.is_primary).unwrap();
+        assert_eq!(primary.root_hash, "hash_auto_add");
+    }
+
+    #[test]
+    fn test_sync_root_outcome_diagnostic_counting() {
+        let _guard = test_guard!();
+        let temp_dir = tempfile::tempdir_in("/data/projects").expect("create tempdir");
+        let project_root = temp_dir.path().join("project");
+        let dep_a = temp_dir.path().join("dep_a");
+        let dep_b = temp_dir.path().join("dep_b");
+        let dep_c = temp_dir.path().join("dep_c");
+        std::fs::create_dir_all(&project_root).expect("create project root");
+        std::fs::create_dir_all(&dep_a).expect("create dep_a");
+        std::fs::create_dir_all(&dep_b).expect("create dep_b");
+        std::fs::create_dir_all(&dep_c).expect("create dep_c");
+
+        let plan = build_sync_closure_plan(
+            &[
+                dep_a.clone(),
+                dep_b.clone(),
+                dep_c.clone(),
+                project_root.clone(),
+            ],
+            &project_root,
+            "diag_hash",
+        );
+
+        // Simulate outcomes: primary synced, one dep synced, one skipped, one failed.
+        let outcomes: Vec<(&SyncClosurePlanEntry, SyncRootOutcome)> = plan
+            .iter()
+            .map(|entry| {
+                let outcome = if entry.is_primary || entry.local_root.ends_with("dep_a") {
+                    SyncRootOutcome::Synced
+                } else if entry.local_root.ends_with("dep_b") {
+                    SyncRootOutcome::Skipped {
+                        reason: "size too small".to_string(),
+                    }
+                } else {
+                    SyncRootOutcome::Failed {
+                        error: "rsync timeout".to_string(),
+                    }
+                };
+                (entry, outcome)
+            })
+            .collect();
+
+        let failed_count = outcomes
+            .iter()
+            .filter(|(_, o)| !matches!(o, SyncRootOutcome::Synced))
+            .count();
+        assert_eq!(
+            failed_count, 2,
+            "skipped + failed should count as non-synced"
+        );
+
+        let synced_count = outcomes
+            .iter()
+            .filter(|(_, o)| matches!(o, SyncRootOutcome::Synced))
+            .count();
+        assert_eq!(synced_count, 2, "primary + dep_a should be synced");
+    }
+
+    #[test]
+    fn test_build_sync_closure_manifest_serializes_to_json() {
+        let _guard = test_guard!();
+        let temp_dir = tempfile::tempdir_in("/data/projects").expect("create tempdir");
+        let project_root = temp_dir.path().join("project");
+        let dep = temp_dir.path().join("dep");
+        std::fs::create_dir_all(&project_root).expect("create project root");
+        std::fs::create_dir_all(&dep).expect("create dep");
+
+        let plan = build_sync_closure_plan(
+            &[dep.clone(), project_root.clone()],
+            &project_root,
+            "serial_hash",
+        );
+        let manifest = build_sync_closure_manifest(&plan, &project_root);
+
+        let json = serde_json::to_string_pretty(&manifest)
+            .expect("manifest should serialize to JSON");
+        assert!(
+            json.contains("rch.sync_closure_manifest.v1"),
+            "JSON must contain schema_version"
+        );
+        assert!(
+            json.contains("serial_hash"),
+            "JSON must contain the primary root hash"
+        );
+        assert!(
+            json.contains("\"is_primary\": true"),
+            "JSON must contain primary flag"
+        );
+
+        // Roundtrip: deserialize should also work for consumers.
+        let parsed: serde_json::Value =
+            serde_json::from_str(&json).expect("manifest JSON should be valid");
+        let entries = parsed["entries"]
+            .as_array()
+            .expect("entries should be an array");
+        assert_eq!(entries.len(), plan.len());
+    }
+
+    // ── Closure topology validation tests (bd-vvmd.2.3 AC3) ──
+
+    #[test]
+    fn test_is_within_sync_topology_accepts_canonical_root() {
+        let _guard = test_guard!();
+        let policy = rch_common::path_topology::PathTopologyPolicy::default();
+        let path = PathBuf::from("/data/projects/my_project");
+        assert!(
+            is_within_sync_topology(&path, &policy),
+            "paths under /data/projects should be accepted"
+        );
+    }
+
+    #[test]
+    fn test_is_within_sync_topology_accepts_alias_root() {
+        let _guard = test_guard!();
+        let policy = rch_common::path_topology::PathTopologyPolicy::default();
+        let path = PathBuf::from("/dp/my_project");
+        assert!(
+            is_within_sync_topology(&path, &policy),
+            "paths under /dp alias should be accepted"
+        );
+    }
+
+    #[test]
+    fn test_is_within_sync_topology_rejects_outside_paths() {
+        let _guard = test_guard!();
+        let policy = rch_common::path_topology::PathTopologyPolicy::default();
+        assert!(
+            !is_within_sync_topology(Path::new("/tmp/evil"), &policy),
+            "/tmp paths should be rejected"
+        );
+        assert!(
+            !is_within_sync_topology(Path::new("/home/user/project"), &policy),
+            "/home paths should be rejected"
+        );
+        assert!(
+            !is_within_sync_topology(Path::new("/var/lib/data"), &policy),
+            "/var paths should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_build_sync_closure_plan_excludes_out_of_topology_roots() {
+        let _guard = test_guard!();
+        // Use paths under /data/projects (canonical root) for valid paths,
+        // and a /tmp path for the invalid one. Since these dirs may not exist
+        // on the test runner, the canonicalization will fall back to the raw
+        // path, which is exactly what we want to test.
+        let project_root = PathBuf::from("/data/projects/test_proj");
+        let valid_dep = PathBuf::from("/data/projects/valid_dep");
+        let invalid_dep = PathBuf::from("/tmp/not_allowed");
+
+        let plan = build_sync_closure_plan(
+            &[valid_dep.clone(), invalid_dep.clone(), project_root.clone()],
+            &project_root,
+            "topo_hash",
+        );
+
+        // The plan should contain the primary root and valid dep, but NOT the invalid dep.
+        let plan_paths: Vec<_> = plan.iter().map(|e| &e.local_root).collect();
+        assert!(
+            plan_paths.iter().any(|p| p.starts_with("/data/projects/test_proj")),
+            "primary root must be in plan"
+        );
+        assert!(
+            plan_paths.iter().any(|p| p.starts_with("/data/projects/valid_dep")),
+            "valid dependency root must be in plan"
+        );
+        assert!(
+            !plan_paths.iter().any(|p| p.starts_with("/tmp")),
+            "out-of-topology dependency must be excluded from plan"
+        );
+    }
+
+    #[test]
+    fn test_build_sync_closure_plan_topology_filter_preserves_primary() {
+        let _guard = test_guard!();
+        // Even with all deps invalid, the primary root must survive.
+        let project_root = PathBuf::from("/data/projects/primary_proj");
+        let bad_dep_a = PathBuf::from("/home/user/dep_a");
+        let bad_dep_b = PathBuf::from("/var/lib/dep_b");
+
+        let plan = build_sync_closure_plan(
+            &[bad_dep_a, bad_dep_b],
+            &project_root,
+            "lonely_hash",
+        );
+
+        assert_eq!(plan.len(), 1, "only the primary root should remain");
+        assert!(plan[0].is_primary, "surviving entry must be the primary root");
     }
 }
