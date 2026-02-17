@@ -14,6 +14,7 @@ mod cleanup;
 mod config;
 mod disk_pressure;
 mod events;
+mod headroom;
 mod health;
 mod history;
 mod http_api;
