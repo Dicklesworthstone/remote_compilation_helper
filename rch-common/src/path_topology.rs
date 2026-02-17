@@ -398,9 +398,10 @@ mod tests {
     use super::*;
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use tracing::info;
 
     #[cfg(unix)]
-    use std::os::unix::fs::symlink;
+    use std::os::unix::fs::{PermissionsExt, symlink};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -452,6 +453,16 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+
+    fn log_normalization_error(test_name: &str, err: &PathNormalizationError) {
+        info!(
+            test = test_name,
+            kind = ?err.kind(),
+            detail = %err.detail(),
+            decisions = ?err.decision_trace(),
+            "topology_normalization_error"
+        );
     }
 
     #[test]
@@ -510,6 +521,7 @@ mod tests {
 
         let err = normalize_project_path_with_policy(&outside, &fixture.policy())
             .expect_err("outside root must fail");
+        log_normalization_error("reject_path_outside_canonical_root", &err);
         assert_eq!(
             err.kind(),
             &PathNormalizationErrorKind::OutsideCanonicalRoot
@@ -528,6 +540,7 @@ mod tests {
         let input = fixture.alias_root.join("repo");
         let err = normalize_project_path_with_policy(&input, &fixture.policy())
             .expect_err("missing alias must fail");
+        log_normalization_error("reject_missing_alias_for_alias_prefixed_input", &err);
         assert_eq!(err.kind(), &PathNormalizationErrorKind::AliasMissing);
     }
 
@@ -543,7 +556,79 @@ mod tests {
 
         let err = normalize_project_path_with_policy(&alias_input, &fixture.policy())
             .expect_err("alias wrong target must fail");
+        log_normalization_error("reject_alias_pointing_to_wrong_target", &err);
         assert_eq!(err.kind(), &PathNormalizationErrorKind::AliasWrongTarget);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reject_alias_path_that_is_not_symlink() {
+        let fixture = TestFixture::new("alias-not-symlink", false, None);
+        fs::create_dir_all(&fixture.alias_root).expect("create alias directory");
+        let alias_input = fixture.alias_root.join("repo");
+        fs::create_dir_all(&alias_input).expect("create alias repo path");
+
+        let err = normalize_project_path_with_policy(&alias_input, &fixture.policy())
+            .expect_err("non-symlink alias must fail");
+        log_normalization_error("reject_alias_path_that_is_not_symlink", &err);
+        assert_eq!(err.kind(), &PathNormalizationErrorKind::AliasNotSymlink);
+        assert!(err.detail().contains("not a symlink"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reject_alias_symlink_loop() {
+        let fixture = TestFixture::new("alias-loop", false, None);
+        symlink("dp", &fixture.alias_root).expect("create alias symlink loop");
+        let alias_input = fixture.alias_root.join("repo");
+
+        let err = normalize_project_path_with_policy(&alias_input, &fixture.policy())
+            .expect_err("alias loop must fail");
+        log_normalization_error("reject_alias_symlink_loop", &err);
+        assert_eq!(
+            err.kind(),
+            &PathNormalizationErrorKind::AliasTargetResolveFailed
+        );
+        assert!(
+            err.decision_trace()
+                .iter()
+                .any(|decision| matches!(decision, NormalizationDecision::AliasPrefixDetected(_)))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reject_permission_denied_during_canonical_resolution() {
+        let fixture = TestFixture::new("permission-denied", false, None);
+        let project = fixture.canonical_root.join("repo");
+        fs::create_dir_all(&project).expect("create project path");
+
+        let original_permissions = fs::metadata(&fixture.canonical_root)
+            .expect("read canonical root metadata")
+            .permissions();
+        let mut denied_permissions = original_permissions.clone();
+        denied_permissions.set_mode(0o000);
+        fs::set_permissions(&fixture.canonical_root, denied_permissions)
+            .expect("lock canonical root permissions");
+
+        let result = normalize_project_path_with_policy(&project, &fixture.policy());
+
+        fs::set_permissions(&fixture.canonical_root, original_permissions)
+            .expect("restore canonical root permissions");
+
+        let err = match result {
+            Ok(_) => {
+                // Root users can bypass mode bits; treat as a non-actionable skip.
+                return;
+            }
+            Err(err) => err,
+        };
+        log_normalization_error("reject_permission_denied_during_canonical_resolution", &err);
+        assert!(matches!(
+            err.kind(),
+            PathNormalizationErrorKind::CanonicalRootResolveFailed
+                | PathNormalizationErrorKind::InputResolveFailed
+        ));
     }
 
     #[test]
@@ -556,6 +641,7 @@ mod tests {
 
         let err = normalize_project_path_with_policy(&outside, &policy)
             .expect_err("missing canonical root must fail");
+        log_normalization_error("reject_when_canonical_root_missing", &err);
         assert_eq!(
             err.kind(),
             &PathNormalizationErrorKind::CanonicalRootMissing

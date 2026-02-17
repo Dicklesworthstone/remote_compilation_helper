@@ -1725,6 +1725,35 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn topology_bootstrap_local_reports_integrity_mismatch_for_alias_symlink_loop() {
+        log_test_start(
+            "topology_bootstrap_local_reports_integrity_mismatch_for_alias_symlink_loop",
+        );
+        let tmp = TempDir::new().unwrap();
+        let canonical = tmp.path().join("data/projects");
+        let alias = tmp.path().join("dp");
+
+        fs::create_dir_all(&canonical).unwrap();
+        unix_fs::symlink("dp", &alias).unwrap();
+
+        let result = enforce_local_topology_for_tests(&canonical, &alias, false);
+        assert!(!result.success);
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|error| error.contains("alias path"))
+        );
+        assert!(result.audit.iter().any(|entry| {
+            entry.step == "alias_symlink"
+                && entry.failure_kind == Some(TopologyFailureKind::IntegrityMismatch)
+                && entry.status == TopologyAuditStatus::Failed
+        }));
+        log_test_pass("topology_bootstrap_local_reports_integrity_mismatch_for_alias_symlink_loop");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn topology_bootstrap_local_partial_failure_recovery_path() {
         log_test_start("topology_bootstrap_local_partial_failure_recovery_path");
         let tmp = TempDir::new().unwrap();

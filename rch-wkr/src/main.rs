@@ -836,6 +836,49 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn test_probe_projects_topology_missing_canonical_root() {
+        let _guard = test_guard!();
+        let (base, canonical, alias) = make_temp_topology_paths("missing-canonical");
+        std::fs::remove_dir_all(&canonical).expect("remove canonical root");
+
+        let (ok, issue) = probe_projects_topology(&canonical, &alias);
+        assert!(!ok);
+        assert_eq!(issue.as_deref(), Some("canonical_missing"));
+
+        std::fs::remove_dir_all(&base).expect("cleanup temp topology");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_probe_projects_topology_canonical_not_directory() {
+        let _guard = test_guard!();
+        let (base, canonical, alias) = make_temp_topology_paths("canonical-not-directory");
+        std::fs::remove_dir_all(&canonical).expect("remove canonical directory");
+        std::fs::write(&canonical, "not-a-directory").expect("create canonical file");
+
+        let (ok, issue) = probe_projects_topology(&canonical, &alias);
+        assert!(!ok);
+        assert_eq!(issue.as_deref(), Some("canonical_not_directory"));
+
+        std::fs::remove_dir_all(&base).expect("cleanup temp topology");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_probe_projects_topology_alias_not_symlink() {
+        let _guard = test_guard!();
+        let (base, canonical, alias) = make_temp_topology_paths("alias-not-symlink");
+        std::fs::create_dir_all(&alias).expect("create alias directory");
+
+        let (ok, issue) = probe_projects_topology(&canonical, &alias);
+        assert!(!ok);
+        assert_eq!(issue.as_deref(), Some("alias_not_symlink"));
+
+        std::fs::remove_dir_all(&base).expect("cleanup temp topology");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn test_probe_projects_topology_wrong_alias_target() {
         let _guard = test_guard!();
         let (base, canonical, alias) = make_temp_topology_paths("wrong-target");

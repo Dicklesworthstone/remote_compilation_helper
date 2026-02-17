@@ -133,30 +133,112 @@ ls -la target/release/
 ./target/release/your-app --version
 ```
 
-## Step 4: Phased Rollout
+## Step 4: Canonical Topology Rollout Plan (`/data/projects` + `/dp`)
 
-### Phase 1: Single Project
+This phase is specifically for migrating existing workers to the canonical
+filesystem topology required by reliability workstreams:
 
-Start with one project to gain confidence:
+- `/data/projects` must exist as a directory
+- `/dp` must be a symlink resolving to `/data/projects`
+- workers failing topology preflight must be excluded from remote scheduling
+
+### Phase 0: Fleet Inventory and Segmentation
+
+1. Capture a baseline before making any changes:
+```bash
+rch workers list
+rch workers probe --all
+rch status --workers
+```
+2. Segment workers into rollout cohorts (for example by region or host group):
+- `canary` (5-15% of fleet)
+- `batch-a` (next 30-40%)
+- `batch-b` (remainder)
+3. Record cohort membership in your operations notes before execution.
+
+### Phase 1: Canary Cohort
+
+Run migration only on canary workers first:
 
 ```bash
-# Enable only for specific project
-cd /path/to/project
-mkdir .rch
-echo 'enabled = true' > .rch/config.toml
+# Run bootstrap/enforcement for a single canary worker or a small set.
+rch workers setup --worker <canary-id>
+
+# Re-verify health and topology eligibility.
+rch workers probe <canary-id>
+rch status --workers
 ```
 
-### Phase 2: Gradual Expansion
+Go/no-go rule for Phase 1:
+- Proceed only if all canary workers are healthy or have explicit, understood,
+  non-topology issues unrelated to migration.
 
-After validation:
-- Remove project-specific configs
-- Let RCH handle all projects
+### Phase 2: Rolling Batch Migration
 
-### Phase 3: Full Production
+Migrate the remaining cohorts in bounded batches. After each batch:
 
-- Enable for all AI agent sessions
-- Monitor for issues
-- Tune as needed
+1. Run worker setup for that cohort.
+2. Re-check worker probe + status.
+3. Stop immediately on repeated topology integrity failures.
+
+### Phase 3: Full-Fleet Validation and Stabilization
+
+After all cohorts are migrated:
+
+- Run full worker health checks.
+- Run representative compile/test workloads.
+- Confirm no persistent preflight exclusion for topology reasons.
+
+## Mixed-State Worker Handling (Critical)
+
+During migration, mixed states are expected temporarily. Treat them explicitly:
+
+| State Detected | Meaning | Required Action |
+|---|---|---|
+| `projects_root_ok=true` | Topology healthy | Keep worker eligible |
+| `alias_missing` | `/dp` missing | Re-run setup, verify symlink creation |
+| `alias_wrong_target:*` | `/dp` points elsewhere | Repoint alias, re-run probe |
+| `alias_not_symlink` | `/dp` exists but wrong type | Manual repair (safe remove/recreate symlink) |
+| `canonical_not_directory` | `/data/projects` exists but invalid type | Manual integrity remediation before retry |
+| `canonical_missing` | canonical root absent | Re-run setup, confirm directory creation |
+
+Workers with topology failures must remain excluded from remote scheduling until
+explicit revalidation confirms recovery.
+
+## Validation Checklist (Per Phase Gate)
+
+Use this checklist before promoting to the next phase:
+
+- [ ] `rch workers probe` succeeds for target cohort
+- [ ] No unresolved topology-preflight failure reasons in `rch status --workers`
+- [ ] At least one representative `cargo build` and `cargo test` run succeeds
+- [ ] No unexpected fail-open spikes during the phase window
+- [ ] Operator notes include worker IDs, timestamps, and remediation actions
+
+## Dry-Run Procedure + Evidence Template
+
+Before each production phase, run and archive a dry-run evidence bundle:
+
+```bash
+# Example evidence capture commands
+date -Iseconds
+rch workers list
+rch workers probe --all
+rch status --workers
+```
+
+Evidence template (store in your rollout notes):
+
+```text
+Phase: <canary|batch-a|batch-b|final>
+Timestamp: <ISO8601>
+Cohort Workers: <comma-separated ids>
+Preflight Summary: <healthy/degraded counts>
+Topology Failures: <none | list of worker->reason>
+Actions Taken: <commands + remediation>
+Go/No-Go Decision: <go|no-go>
+Approved By: <operator>
+```
 
 ## Step 5: Performance Tuning
 
@@ -259,18 +341,45 @@ include_artifacts = [
 
 ## Rollback Plan
 
-If issues arise, disable RCH temporarily:
+If migration causes instability or inconsistent topology states, roll back in
+reverse cohort order.
 
+### Rollback Triggers
+
+Initiate rollback when any of the following are true:
+
+- sustained topology preflight failures after remediation attempts
+- repeated `alias_wrong_target` / `alias_not_symlink` reoccurrence in the same cohort
+- materially elevated fail-open rate attributable to topology drift
+- operator cannot prove canonical invariants for current rollout segment
+
+### Rollback Steps
+
+1. Freeze rollout immediately (no new cohorts).
+2. Remove affected workers from routing (drain/disable) until repaired:
 ```bash
-# Immediate disable (environment)
-export RCH_ENABLED=false
-
-# Or stop daemon
-rch daemon stop
-
-# Or uninstall hook
-rch hook uninstall
+rch workers drain <worker-id>
 ```
+3. Restore previously known-good worker topology configuration for the affected cohort.
+4. Re-run probe/status validation:
+```bash
+rch workers probe <worker-id>
+rch status --workers
+```
+5. Re-enable workers only after explicit verification:
+```bash
+rch workers enable <worker-id>
+```
+6. If fleet-wide instability persists, temporarily disable RCH for local fallback:
+```bash
+export RCH_ENABLED=false
+```
+
+### Rollback Completion Criteria
+
+- All affected workers are either healthy and revalidated, or intentionally drained.
+- No unknown topology-preflight failures remain.
+- Incident notes include root cause, corrective action, and follow-up owner.
 
 ## Post-Migration
 
