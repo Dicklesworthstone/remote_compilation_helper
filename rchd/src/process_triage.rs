@@ -706,6 +706,300 @@ fn send_signal(pid: u32, signal: &str) -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------
+// Periodic triage loop (bd-vvmd.5.4)
+// ---------------------------------------------------------------------------
+
+/// Configuration for the periodic triage loop.
+#[derive(Debug, Clone)]
+pub struct TriageLoopConfig {
+    /// Interval between triage sweeps.
+    pub interval: Duration,
+    /// Time budget per sweep (abort and emit partial results if exceeded).
+    pub sweep_budget: Duration,
+    /// Skip workers with active builds (busy slots > 0).
+    pub skip_busy_workers: bool,
+}
+
+impl Default for TriageLoopConfig {
+    fn default() -> Self {
+        Self {
+            interval: Duration::from_secs(30),
+            sweep_budget: Duration::from_secs(15),
+            skip_busy_workers: true,
+        }
+    }
+}
+
+/// Result of a single triage sweep (periodic or on-demand).
+#[derive(Debug, Clone, Serialize)]
+pub struct TriageSweepResult {
+    pub sweep_id: u64,
+    pub workers_evaluated: u32,
+    pub workers_skipped: u32,
+    pub total_candidates: u32,
+    pub actions_taken: u32,
+    pub escalations: u32,
+    pub budget_exhausted: bool,
+    pub duration_ms: u64,
+    pub worker_results: Vec<WorkerTriageResult>,
+    pub timestamp_unix_ms: i64,
+}
+
+/// Per-worker result within a triage sweep.
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkerTriageResult {
+    pub worker_id: String,
+    pub skipped: bool,
+    pub skip_reason: Option<String>,
+    pub candidates_found: u32,
+    pub response_status: Option<String>,
+    pub escalation_level: Option<String>,
+    pub actions_executed: u32,
+    pub actions_escalated: u32,
+}
+
+/// Periodic triage loop that sweeps workers for stuck processes.
+///
+/// Shares the RemediationPipeline for deterministic decision-making,
+/// ensuring loop and on-demand commands produce identical results.
+pub struct TriageLoop {
+    pipeline: Arc<RemediationPipeline>,
+    pool: crate::workers::WorkerPool,
+    events: EventBus,
+    config: TriageLoopConfig,
+    sweep_count: u64,
+}
+
+impl TriageLoop {
+    /// Create a new periodic triage loop.
+    pub fn new(
+        pipeline: Arc<RemediationPipeline>,
+        pool: crate::workers::WorkerPool,
+        events: EventBus,
+        config: TriageLoopConfig,
+    ) -> Self {
+        Self {
+            pipeline,
+            pool,
+            events,
+            config,
+            sweep_count: 0,
+        }
+    }
+
+    /// Start the periodic triage loop as a background task.
+    pub fn start(mut self) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(self.config.interval);
+            loop {
+                ticker.tick().await;
+                let _result = self.sweep(None).await;
+            }
+        })
+    }
+
+    /// Execute a single triage sweep. If `worker_filter` is provided,
+    /// only the specified worker is evaluated (on-demand mode).
+    pub async fn sweep(
+        &mut self,
+        worker_filter: Option<&str>,
+    ) -> TriageSweepResult {
+        self.sweep_count += 1;
+        let sweep_start = Instant::now();
+        let sweep_id = self.sweep_count;
+
+        let workers = self.pool.all_workers().await;
+        let mut worker_results = Vec::new();
+        let mut total_candidates = 0u32;
+        let mut total_actions = 0u32;
+        let mut total_escalations = 0u32;
+        let mut workers_evaluated = 0u32;
+        let mut workers_skipped = 0u32;
+        let mut budget_exhausted = false;
+
+        for worker in &workers {
+            // Budget check
+            if sweep_start.elapsed() > self.config.sweep_budget {
+                budget_exhausted = true;
+                warn!(
+                    sweep_id,
+                    elapsed_ms = sweep_start.elapsed().as_millis() as u64,
+                    budget_ms = self.config.sweep_budget.as_millis() as u64,
+                    "Triage sweep budget exhausted — partial results"
+                );
+                break;
+            }
+
+            let worker_config = worker.config.read().await;
+            let worker_id = worker_config.id.to_string();
+            drop(worker_config);
+
+            // Filter check (on-demand mode)
+            if let Some(filter) = worker_filter
+                && worker_id != filter
+            {
+                continue;
+            }
+
+            // Skip busy workers
+            if self.config.skip_busy_workers && worker.used_slots() > 0 {
+                workers_skipped += 1;
+                worker_results.push(WorkerTriageResult {
+                    worker_id: worker_id.clone(),
+                    skipped: true,
+                    skip_reason: Some("active builds".to_string()),
+                    candidates_found: 0,
+                    response_status: None,
+                    escalation_level: None,
+                    actions_executed: 0,
+                    actions_escalated: 0,
+                });
+                continue;
+            }
+
+            workers_evaluated += 1;
+
+            // Build a synthetic triage request for this worker.
+            // In a real deployment, this would come from the stuck-process detector.
+            // For now, emit an observe-only sweep to exercise the pipeline.
+            let request = build_sweep_request(&worker_id, sweep_id);
+            if request.requested_actions.is_empty() {
+                worker_results.push(WorkerTriageResult {
+                    worker_id: worker_id.clone(),
+                    skipped: false,
+                    skip_reason: None,
+                    candidates_found: 0,
+                    response_status: Some("no_candidates".to_string()),
+                    escalation_level: None,
+                    actions_executed: 0,
+                    actions_escalated: 0,
+                });
+                continue;
+            }
+
+            total_candidates += request.candidate_processes.len() as u32;
+            let response = self.pipeline.execute(&request).await;
+
+            let executed = response.executed_actions.iter()
+                .filter(|a| a.outcome == ProcessTriageActionOutcome::Executed).count() as u32;
+            let escalated = response.executed_actions.iter()
+                .filter(|a| a.outcome == ProcessTriageActionOutcome::Escalated).count() as u32;
+
+            total_actions += executed;
+            total_escalations += escalated;
+
+            worker_results.push(WorkerTriageResult {
+                worker_id: worker_id.clone(),
+                skipped: false,
+                skip_reason: None,
+                candidates_found: request.candidate_processes.len() as u32,
+                response_status: Some(format!("{:?}", response.status)),
+                escalation_level: Some(format!("{:?}", response.escalation_level)),
+                actions_executed: executed,
+                actions_escalated: escalated,
+            });
+        }
+
+        let result = TriageSweepResult {
+            sweep_id,
+            workers_evaluated,
+            workers_skipped,
+            total_candidates,
+            actions_taken: total_actions,
+            escalations: total_escalations,
+            budget_exhausted,
+            duration_ms: sweep_start.elapsed().as_millis() as u64,
+            worker_results,
+            timestamp_unix_ms: Utc::now().timestamp_millis(),
+        };
+
+        self.events.emit("process_triage.sweep_completed", &result);
+
+        if budget_exhausted {
+            info!(
+                sweep_id,
+                workers_evaluated,
+                workers_skipped,
+                total_actions,
+                "Triage sweep completed (budget exhausted, partial results)"
+            );
+        } else {
+            debug!(
+                sweep_id,
+                workers_evaluated,
+                workers_skipped,
+                total_actions,
+                "Triage sweep completed"
+            );
+        }
+
+        result
+    }
+}
+
+/// Build a synthetic sweep request for a worker. In production this would
+/// integrate with the stuck-process detector; for now it produces an
+/// observe-only probe.
+fn build_sweep_request(worker_id: &str, sweep_id: u64) -> ProcessTriageRequest {
+    use rch_common::e2e::process_triage::ProcessTriageTrigger;
+
+    ProcessTriageRequest {
+        schema_version: PROCESS_TRIAGE_CONTRACT_SCHEMA_VERSION.to_string(),
+        correlation_id: format!("sweep-{sweep_id}-{worker_id}"),
+        worker_id: worker_id.to_string(),
+        observed_at_unix_ms: Utc::now().timestamp_millis(),
+        trigger: ProcessTriageTrigger::WorkerHealth,
+        detector_confidence_percent: 0,
+        retry_attempt: 0,
+        candidate_processes: vec![],
+        requested_actions: vec![],
+    }
+}
+
+/// On-demand triage command that shares the same pipeline as the loop.
+///
+/// Returns structured results suitable for machine or human consumption.
+pub struct TriageCommand {
+    pipeline: Arc<RemediationPipeline>,
+    pool: crate::workers::WorkerPool,
+    events: EventBus,
+}
+
+impl TriageCommand {
+    /// Create a new on-demand triage command.
+    pub fn new(
+        pipeline: Arc<RemediationPipeline>,
+        pool: crate::workers::WorkerPool,
+        events: EventBus,
+    ) -> Self {
+        Self {
+            pipeline,
+            pool,
+            events,
+        }
+    }
+
+    /// Run an on-demand triage sweep against a specific worker (or all workers).
+    pub async fn run(
+        &self,
+        worker_filter: Option<&str>,
+        budget: Duration,
+    ) -> TriageSweepResult {
+        let mut loop_runner = TriageLoop::new(
+            self.pipeline.clone(),
+            self.pool.clone(),
+            self.events.clone(),
+            TriageLoopConfig {
+                interval: Duration::from_secs(0), // Unused for on-demand
+                sweep_budget: budget,
+                skip_busy_workers: false, // On-demand includes all workers
+            },
+        );
+        loop_runner.sweep(worker_filter).await
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1319,5 +1613,257 @@ mod tests {
         let step = EscalationStep::HardTerminate;
         assert_eq!(step.next(), None);
         assert_eq!(step.signal(), Some("KILL"));
+    }
+
+    // -----------------------------------------------------------------------
+    // TriageLoop tests (bd-vvmd.5.4)
+    // -----------------------------------------------------------------------
+
+    async fn make_test_pool() -> crate::workers::WorkerPool {
+        use rch_common::WorkerConfig;
+        let pool: crate::workers::WorkerPool = crate::workers::WorkerPool::new();
+        pool.add_worker(WorkerConfig {
+            id: rch_common::WorkerId::new("loop-w1"),
+            ..WorkerConfig::default()
+        }).await;
+        pool.add_worker(WorkerConfig {
+            id: rch_common::WorkerId::new("loop-w2"),
+            ..WorkerConfig::default()
+        }).await;
+        pool
+    }
+
+    #[tokio::test]
+    async fn test_triage_loop_sweep_empty_candidates() {
+        let _guard = test_guard!();
+        let pipeline = Arc::new(make_default_pipeline());
+        let pool = make_test_pool().await;
+        let events = EventBus::new(64);
+        let mut triage = TriageLoop::new(
+            pipeline,
+            pool,
+            events,
+            TriageLoopConfig::default(),
+        );
+
+        let result = triage.sweep(None).await;
+        assert_eq!(result.sweep_id, 1);
+        assert_eq!(result.workers_evaluated, 2);
+        assert_eq!(result.total_candidates, 0);
+        assert_eq!(result.actions_taken, 0);
+        assert!(!result.budget_exhausted);
+    }
+
+    #[tokio::test]
+    async fn test_triage_loop_sweep_increments_id() {
+        let _guard = test_guard!();
+        let pipeline = Arc::new(make_default_pipeline());
+        let pool = make_test_pool().await;
+        let events = EventBus::new(64);
+        let mut triage = TriageLoop::new(
+            pipeline,
+            pool,
+            events,
+            TriageLoopConfig::default(),
+        );
+
+        let r1 = triage.sweep(None).await;
+        let r2 = triage.sweep(None).await;
+        let r3 = triage.sweep(None).await;
+        assert_eq!(r1.sweep_id, 1);
+        assert_eq!(r2.sweep_id, 2);
+        assert_eq!(r3.sweep_id, 3);
+    }
+
+    #[tokio::test]
+    async fn test_triage_loop_skips_busy_workers() {
+        let _guard = test_guard!();
+        let pipeline = Arc::new(make_default_pipeline());
+        let pool = make_test_pool().await;
+
+        // Reserve slots on loop-w1
+        // Reserve slots on loop-w1 via WorkerState
+        {
+            let workers = pool.all_workers().await;
+            for w in &workers {
+                let cfg = w.config.read().await;
+                if cfg.id.as_str() == "loop-w1" {
+                    w.reserve_slots(1).await;
+                }
+            }
+        }
+
+        let events = EventBus::new(64);
+        let mut triage = TriageLoop::new(
+            pipeline,
+            pool.clone(),
+            events,
+            TriageLoopConfig {
+                skip_busy_workers: true,
+                ..TriageLoopConfig::default()
+            },
+        );
+
+        let result = triage.sweep(None).await;
+        assert_eq!(result.workers_skipped, 1);
+        assert_eq!(result.workers_evaluated, 1);
+
+        // Verify the skipped worker result
+        let skipped = result.worker_results.iter()
+            .find(|r| r.worker_id == "loop-w1").unwrap();
+        assert!(skipped.skipped);
+        assert_eq!(skipped.skip_reason.as_deref(), Some("active builds"));
+    }
+
+    #[tokio::test]
+    async fn test_triage_loop_worker_filter() {
+        let _guard = test_guard!();
+        let pipeline = Arc::new(make_default_pipeline());
+        let pool = make_test_pool().await;
+        let events = EventBus::new(64);
+        let mut triage = TriageLoop::new(
+            pipeline,
+            pool,
+            events,
+            TriageLoopConfig::default(),
+        );
+
+        let result = triage.sweep(Some("loop-w1")).await;
+        // Only loop-w1 should be evaluated (loop-w2 filtered out)
+        assert_eq!(result.worker_results.len(), 1);
+        assert_eq!(result.worker_results[0].worker_id, "loop-w1");
+    }
+
+    #[tokio::test]
+    async fn test_triage_loop_budget_exhaustion() {
+        let _guard = test_guard!();
+        let pipeline = Arc::new(make_default_pipeline());
+        let pool = make_test_pool().await;
+        let events = EventBus::new(64);
+        let mut triage = TriageLoop::new(
+            pipeline,
+            pool,
+            events,
+            TriageLoopConfig {
+                sweep_budget: Duration::from_nanos(1), // Immediate exhaustion
+                ..TriageLoopConfig::default()
+            },
+        );
+
+        let result = triage.sweep(None).await;
+        assert!(result.budget_exhausted);
+    }
+
+    #[tokio::test]
+    async fn test_triage_loop_emits_sweep_event() {
+        let _guard = test_guard!();
+        let pipeline = Arc::new(make_default_pipeline());
+        let pool = make_test_pool().await;
+        let events = EventBus::new(64);
+        let mut rx = events.subscribe();
+        let mut triage = TriageLoop::new(
+            pipeline,
+            pool,
+            events,
+            TriageLoopConfig::default(),
+        );
+
+        let _result = triage.sweep(None).await;
+
+        let mut found = false;
+        while let Ok(msg) = tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
+            if let Ok(msg) = msg {
+                let parsed: serde_json::Value = serde_json::from_str(&msg).unwrap();
+                if parsed["event"] == "process_triage.sweep_completed" {
+                    found = true;
+                    assert_eq!(parsed["data"]["sweep_id"], 1);
+                    assert!(parsed["data"]["duration_ms"].is_number());
+                }
+            }
+        }
+        assert!(found, "Sweep completed event not emitted");
+    }
+
+    #[tokio::test]
+    async fn test_on_demand_triage_command() {
+        let _guard = test_guard!();
+        let pipeline = Arc::new(make_default_pipeline());
+        let pool = make_test_pool().await;
+        let events = EventBus::new(64);
+        let cmd = TriageCommand::new(pipeline, pool, events);
+
+        // Run on-demand for a specific worker
+        let result = cmd.run(Some("loop-w1"), Duration::from_secs(5)).await;
+        assert_eq!(result.worker_results.len(), 1);
+        assert_eq!(result.worker_results[0].worker_id, "loop-w1");
+        assert!(!result.worker_results[0].skipped); // On-demand doesn't skip busy
+    }
+
+    #[tokio::test]
+    async fn test_on_demand_triage_all_workers() {
+        let _guard = test_guard!();
+        let pipeline = Arc::new(make_default_pipeline());
+        let pool = make_test_pool().await;
+        let events = EventBus::new(64);
+        let cmd = TriageCommand::new(pipeline, pool, events);
+
+        let result = cmd.run(None, Duration::from_secs(5)).await;
+        assert_eq!(result.workers_evaluated, 2);
+    }
+
+    #[tokio::test]
+    async fn test_loop_and_command_share_pipeline() {
+        let _guard = test_guard!();
+        let pipeline = Arc::new(make_default_pipeline());
+        let pool = make_test_pool().await;
+        let events = EventBus::new(64);
+
+        // Both loop and command use the same pipeline Arc
+        let mut loop_runner = TriageLoop::new(
+            pipeline.clone(),
+            pool.clone(),
+            events.clone(),
+            TriageLoopConfig::default(),
+        );
+        let cmd = TriageCommand::new(pipeline.clone(), pool.clone(), events.clone());
+
+        // Both produce consistent results for same workers
+        let loop_result = loop_runner.sweep(Some("loop-w1")).await;
+        let cmd_result = cmd.run(Some("loop-w1"), Duration::from_secs(5)).await;
+
+        assert_eq!(loop_result.worker_results.len(), cmd_result.worker_results.len());
+        assert_eq!(
+            loop_result.worker_results[0].worker_id,
+            cmd_result.worker_results[0].worker_id
+        );
+    }
+
+    #[tokio::test]
+    async fn test_triage_loop_config_defaults() {
+        let _guard = test_guard!();
+        let config = TriageLoopConfig::default();
+        assert_eq!(config.interval, Duration::from_secs(30));
+        assert_eq!(config.sweep_budget, Duration::from_secs(15));
+        assert!(config.skip_busy_workers);
+    }
+
+    #[tokio::test]
+    async fn test_sweep_result_serializable() {
+        let _guard = test_guard!();
+        let result = TriageSweepResult {
+            sweep_id: 1,
+            workers_evaluated: 2,
+            workers_skipped: 0,
+            total_candidates: 0,
+            actions_taken: 0,
+            escalations: 0,
+            budget_exhausted: false,
+            duration_ms: 10,
+            worker_results: vec![],
+            timestamp_unix_ms: 1234567890,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("\"sweep_id\":1"));
+        assert!(json.contains("\"budget_exhausted\":false"));
     }
 }
