@@ -4767,7 +4767,10 @@ mod tests {
             selector.set_repo_convergence(convergence.clone());
             let request = make_selection_request("test-project");
             let result = selector.select(&pool, &request).await;
-            assert!(result.worker.is_some(), "Drifting worker should still be eligible");
+            assert!(
+                result.worker.is_some(),
+                "Drifting worker should still be eligible"
+            );
 
             // Step 3: Worker enters Converging → excluded.
             convergence.mark_converging(&wid).await;
@@ -4805,14 +4808,8 @@ mod tests {
             let pool = WorkerPool::new();
             pool.add_worker(make_worker("w1", 8, 80.0).config.read().await.clone())
                 .await;
-            pool.add_worker(
-                make_worker("w2", 8, 85.0)
-                    .config
-                    .read()
-                    .await
-                    .clone(),
-            )
-            .await;
+            pool.add_worker(make_worker("w2", 8, 85.0).config.read().await.clone())
+                .await;
 
             let convergence = make_convergence_svc();
 
@@ -4860,22 +4857,10 @@ mod tests {
         #[tokio::test]
         async fn test_integration_stale_ready_prefers_ready() {
             let pool = WorkerPool::new();
-            pool.add_worker(
-                make_worker("w-stale", 8, 90.0)
-                    .config
-                    .read()
-                    .await
-                    .clone(),
-            )
-            .await;
-            pool.add_worker(
-                make_worker("w-ready", 8, 80.0)
-                    .config
-                    .read()
-                    .await
-                    .clone(),
-            )
-            .await;
+            pool.add_worker(make_worker("w-stale", 8, 90.0).config.read().await.clone())
+                .await;
+            pool.add_worker(make_worker("w-ready", 8, 80.0).config.read().await.clone())
+                .await;
 
             let convergence = make_convergence_svc();
 
@@ -4907,14 +4892,8 @@ mod tests {
                     .clone(),
             )
             .await;
-            pool.add_worker(
-                make_worker("w-fresh", 8, 80.0)
-                    .config
-                    .read()
-                    .await
-                    .clone(),
-            )
-            .await;
+            pool.add_worker(make_worker("w-fresh", 8, 80.0).config.read().await.clone())
+                .await;
 
             let convergence = make_convergence_svc();
 
@@ -4971,14 +4950,8 @@ mod tests {
             let pool = WorkerPool::new();
             pool.add_worker(make_worker("w1", 8, 80.0).config.read().await.clone())
                 .await;
-            pool.add_worker(
-                make_worker("w2", 8, 85.0)
-                    .config
-                    .read()
-                    .await
-                    .clone(),
-            )
-            .await;
+            pool.add_worker(make_worker("w2", 8, 85.0).config.read().await.clone())
+                .await;
 
             let convergence = make_convergence_svc();
             // Neither worker registered → both Stale (fail-open).

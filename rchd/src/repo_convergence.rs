@@ -2334,7 +2334,10 @@ mod tests {
         // Put worker into Drifting state.
         svc.update_required_repos(&wid, vec!["repo-a".into()], vec![])
             .await;
-        assert_eq!(svc.get_drift_state(&wid).await, ConvergenceDriftState::Drifting);
+        assert_eq!(
+            svc.get_drift_state(&wid).await,
+            ConvergenceDriftState::Drifting
+        );
 
         // Each attempt consumes a huge chunk of time budget (simulating slow timeouts).
         // Default budget = 120_000ms, we consume 50_000ms each attempt.
@@ -2379,13 +2382,15 @@ mod tests {
             vec![],
         )
         .await;
-        assert_eq!(svc.get_drift_state(&wid).await, ConvergenceDriftState::Drifting);
+        assert_eq!(
+            svc.get_drift_state(&wid).await,
+            ConvergenceDriftState::Drifting
+        );
 
         // Adapter returns: 2 synced, 1 auth denied.
         let outcome = svc
             .record_convergence_attempt(
-                &wid,
-                2,     // synced
+                &wid, 2,     // synced
                 1,     // failed
                 0,     // skipped
                 5_000, // 5s
@@ -2430,7 +2435,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(outcome.failure.as_deref(), Some("auth_credential_expired: token TTL exceeded"));
+        assert_eq!(
+            outcome.failure.as_deref(),
+            Some("auth_credential_expired: token TTL exceeded")
+        );
         assert_eq!(outcome.reason_code, "sync_failed_retryable");
         assert_eq!(
             svc.get_drift_state(&wid).await,
@@ -2463,8 +2471,14 @@ mod tests {
 
         assert!(outcome.failure.is_some());
         assert_eq!(outcome.reason_code, "sync_failed_retryable");
-        assert_eq!(svc.get_drift_state(&wid).await, ConvergenceDriftState::Drifting);
-        assert!(svc.has_budget(&wid).await, "Network failure is retryable, budget should remain");
+        assert_eq!(
+            svc.get_drift_state(&wid).await,
+            ConvergenceDriftState::Drifting
+        );
+        assert!(
+            svc.has_budget(&wid).await,
+            "Network failure is retryable, budget should remain"
+        );
     }
 
     /// AC1: Adapter unavailable (binary not found) — repeated failures exhaust
@@ -2515,42 +2529,21 @@ mod tests {
 
         // Attempt 1: auth failure.
         let o1 = svc
-            .record_convergence_attempt(
-                &wid,
-                0,
-                1,
-                0,
-                1_000,
-                Some("auth_failure".into()),
-            )
+            .record_convergence_attempt(&wid, 0, 1, 0, 1_000, Some("auth_failure".into()))
             .await
             .unwrap();
         assert_eq!(o1.reason_code, "sync_failed_retryable");
 
         // Attempt 2: timeout.
         let o2 = svc
-            .record_convergence_attempt(
-                &wid,
-                0,
-                1,
-                0,
-                30_000,
-                Some("timeout".into()),
-            )
+            .record_convergence_attempt(&wid, 0, 1, 0, 30_000, Some("timeout".into()))
             .await
             .unwrap();
         assert_eq!(o2.reason_code, "sync_failed_retryable");
 
         // Attempt 3: final failure (budget exhausted).
         let o3 = svc
-            .record_convergence_attempt(
-                &wid,
-                0,
-                1,
-                0,
-                1_000,
-                Some("connection_refused".into()),
-            )
+            .record_convergence_attempt(&wid, 0, 1, 0, 1_000, Some("connection_refused".into()))
             .await
             .unwrap();
         assert_eq!(o3.reason_code, "attempt_budget_exhausted");
@@ -2647,7 +2640,10 @@ mod tests {
                 .await;
         }
 
-        assert_eq!(svc.get_drift_state(&wid).await, ConvergenceDriftState::Failed);
+        assert_eq!(
+            svc.get_drift_state(&wid).await,
+            ConvergenceDriftState::Failed
+        );
 
         // State is still fully queryable.
         let ws = svc.get_worker_state(&wid).await;
@@ -2700,7 +2696,10 @@ mod tests {
                 .record_convergence_attempt(&wid, 0, 1, 0, 1_000, Some("fail".into()))
                 .await;
         }
-        assert_eq!(svc.get_drift_state(&wid).await, ConvergenceDriftState::Failed);
+        assert_eq!(
+            svc.get_drift_state(&wid).await,
+            ConvergenceDriftState::Failed
+        );
 
         // Expire hysteresis.
         let expired = Instant::now() - Duration::from_millis(STATE_HYSTERESIS_MS + 100);
@@ -2720,7 +2719,10 @@ mod tests {
         // Budgets should be reset.
         let ws = svc.get_worker_state(&wid).await.unwrap();
         assert_eq!(ws.attempt_budget_remaining, MAX_CONVERGENCE_ATTEMPTS);
-        assert_eq!(ws.time_budget_remaining_ms, CONVERGENCE_TIME_BUDGET_SECS * 1000);
+        assert_eq!(
+            ws.time_budget_remaining_ms,
+            CONVERGENCE_TIME_BUDGET_SECS * 1000
+        );
     }
 
     /// AC4: Stale detection + recovery — Ready worker goes Stale after
@@ -2734,7 +2736,10 @@ mod tests {
         // Set up Ready worker.
         svc.update_required_repos(&wid, vec!["repo-a".into()], vec!["repo-a".into()])
             .await;
-        assert_eq!(svc.get_drift_state(&wid).await, ConvergenceDriftState::Ready);
+        assert_eq!(
+            svc.get_drift_state(&wid).await,
+            ConvergenceDriftState::Ready
+        );
 
         // Backdate last status check to trigger staleness.
         let old_ms = SystemTime::now()
@@ -2794,12 +2799,9 @@ mod tests {
         // Verify required structured fields.
         assert_eq!(parsed["event"], "repo_convergence.state_changed");
         let data = &parsed["data"];
-        assert_eq!(data["from_state"], "stale", "Must include from_state");
-        assert_eq!(data["to_state"], "drifting", "Must include to_state");
-        assert!(
-            data["reason_code"].is_string(),
-            "Must include reason_code"
-        );
+        assert_eq!(data["from_state"], "Stale", "Must include from_state");
+        assert_eq!(data["to_state"], "Drifting", "Must include to_state");
+        assert!(data["reason_code"].is_string(), "Must include reason_code");
         assert!(
             data["transitioned_at_unix_ms"].is_number(),
             "Must include timestamp"
@@ -2922,6 +2924,6 @@ mod tests {
         }
         let evt = last_outcome_event.expect("Should have outcome event");
         assert_eq!(evt["data"]["reason_code"], "attempt_budget_exhausted");
-        assert_eq!(evt["data"]["drift_state_after"], "failed");
+        assert_eq!(evt["data"]["drift_state_after"], "Failed");
     }
 }
