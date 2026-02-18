@@ -466,6 +466,16 @@ async fn main() -> Result<()> {
     let _disk_pressure_handle = disk_pressure_monitor.start();
     info!("Disk pressure monitor started");
 
+    // Start background convergence loop (bd-vvmd.3.4)
+    let convergence_loop = repo_convergence::ConvergenceLoop::new(
+        context.repo_convergence.clone(),
+        worker_pool.clone(),
+        event_bus.clone(),
+        repo_convergence::ConvergenceLoopConfig::default(),
+    );
+    let _convergence_loop_handle = convergence_loop.start();
+    info!("Convergence loop started");
+
     let metrics_pool = worker_pool.clone();
     let metrics_history = context.history.clone();
     let metrics_selector = worker_selector.clone();

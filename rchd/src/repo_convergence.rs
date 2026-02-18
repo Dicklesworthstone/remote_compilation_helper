@@ -7,6 +7,7 @@
 use rch_common::WorkerId;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
@@ -642,11 +643,329 @@ impl RepoConvergenceService {
     }
 }
 
+// ── Background Convergence Loop (bd-vvmd.3.4) ────────────────────────────
+
+/// Default interval between convergence loop ticks.
+const CONVERGENCE_LOOP_INTERVAL_SECS: u64 = 30;
+
+/// Sustained drift alert threshold: alert if a worker stays Drifting for this
+/// many consecutive ticks without improvement.
+const SUSTAINED_DRIFT_ALERT_TICKS: u32 = 6;
+
+/// Sustained failure alert threshold: alert if a worker stays Failed for this
+/// many consecutive ticks.
+const SUSTAINED_FAILURE_ALERT_TICKS: u32 = 2;
+
+/// Alert debounce window: suppress repeat alerts for the same worker within
+/// this many ticks after an alert fires.
+const ALERT_DEBOUNCE_TICKS: u32 = 10;
+
+/// Per-worker tracking for the convergence loop.
+#[derive(Debug, Clone)]
+struct LoopWorkerState {
+    /// Consecutive ticks in Drifting state.
+    drift_ticks: u32,
+    /// Consecutive ticks in Failed state.
+    failure_ticks: u32,
+    /// Ticks remaining in alert suppression window.
+    alert_cooldown: u32,
+    /// Last drift state observed.
+    last_state: ConvergenceDriftState,
+}
+
+impl LoopWorkerState {
+    fn new() -> Self {
+        Self {
+            drift_ticks: 0,
+            failure_ticks: 0,
+            alert_cooldown: 0,
+            last_state: ConvergenceDriftState::Stale,
+        }
+    }
+}
+
+/// Configuration for the background convergence loop.
+#[derive(Debug, Clone)]
+pub struct ConvergenceLoopConfig {
+    /// Interval between convergence ticks.
+    pub interval: Duration,
+    /// After how many consecutive drift ticks to emit an alert.
+    pub sustained_drift_ticks: u32,
+    /// After how many consecutive failure ticks to emit an alert.
+    pub sustained_failure_ticks: u32,
+    /// Ticks to suppress repeat alerts after one fires.
+    pub alert_debounce_ticks: u32,
+}
+
+impl Default for ConvergenceLoopConfig {
+    fn default() -> Self {
+        Self {
+            interval: Duration::from_secs(CONVERGENCE_LOOP_INTERVAL_SECS),
+            sustained_drift_ticks: SUSTAINED_DRIFT_ALERT_TICKS,
+            sustained_failure_ticks: SUSTAINED_FAILURE_ALERT_TICKS,
+            alert_debounce_ticks: ALERT_DEBOUNCE_TICKS,
+        }
+    }
+}
+
+/// Alert emitted by the convergence loop for sustained drift or failure.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConvergenceAlert {
+    pub worker_id: String,
+    pub alert_type: String,
+    pub drift_state: String,
+    pub consecutive_ticks: u32,
+    pub missing_repos: Vec<String>,
+    pub remediation: Vec<String>,
+    pub emitted_at_unix_ms: i64,
+}
+
+/// Summary of a single convergence loop tick.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConvergenceLoopTickSummary {
+    pub tick_number: u64,
+    pub workers_checked: usize,
+    pub workers_skipped_busy: usize,
+    pub staleness_checks: usize,
+    pub alerts_emitted: usize,
+    pub duration_ms: u64,
+}
+
+/// Background convergence loop that periodically checks worker drift states,
+/// runs staleness checks, and emits alerts for sustained drift or failure.
+///
+/// Follows workload-aware throttling: workers with active builds (used_slots > 0)
+/// are skipped to avoid interfering with in-flight compilations.
+pub struct ConvergenceLoop {
+    convergence: Arc<RepoConvergenceService>,
+    pool: crate::workers::WorkerPool,
+    events: EventBus,
+    config: ConvergenceLoopConfig,
+    tick_number: u64,
+    tracker: HashMap<String, LoopWorkerState>,
+}
+
+impl ConvergenceLoop {
+    /// Create a new convergence loop.
+    pub fn new(
+        convergence: Arc<RepoConvergenceService>,
+        pool: crate::workers::WorkerPool,
+        events: EventBus,
+        config: ConvergenceLoopConfig,
+    ) -> Self {
+        Self {
+            convergence,
+            pool,
+            events,
+            config,
+            tick_number: 0,
+            tracker: HashMap::new(),
+        }
+    }
+
+    /// Start the background convergence loop. Returns a JoinHandle.
+    pub fn start(mut self) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            use tokio::time::interval;
+
+            let mut ticker = interval(self.config.interval);
+
+            info!(
+                interval_secs = self.config.interval.as_secs(),
+                "Convergence loop started"
+            );
+
+            loop {
+                ticker.tick().await;
+                self.tick().await;
+            }
+        })
+    }
+
+    /// Execute a single convergence tick. Public for testability.
+    pub async fn tick(&mut self) -> ConvergenceLoopTickSummary {
+        self.tick_number += 1;
+
+        let tick_start = Instant::now();
+        let mut workers_checked: usize = 0;
+        let mut workers_skipped_busy: usize = 0;
+        let mut alerts_emitted: usize = 0;
+
+        // 1. Run staleness checks for all tracked workers.
+        self.convergence.check_staleness().await;
+
+        // 2. Iterate over all pool workers and check convergence state.
+        let pool_workers = self.pool.all_workers().await;
+
+        for worker in &pool_workers {
+            let worker_id = {
+                let cfg = worker.config.read().await;
+                cfg.id.clone()
+            };
+
+            // Workload-aware throttling: skip workers with active builds.
+            if worker.used_slots() > 0 {
+                workers_skipped_busy += 1;
+                continue;
+            }
+
+            workers_checked += 1;
+            let drift_state = self.convergence.get_drift_state(&worker_id).await;
+
+            let entry = self
+                .tracker
+                .entry(worker_id.as_str().to_string())
+                .or_insert_with(LoopWorkerState::new);
+
+            // Decrement alert cooldown.
+            if entry.alert_cooldown > 0 {
+                entry.alert_cooldown -= 1;
+            }
+
+            // Track consecutive drift/failure ticks.
+            match drift_state {
+                ConvergenceDriftState::Drifting => {
+                    entry.drift_ticks += 1;
+                    entry.failure_ticks = 0;
+                }
+                ConvergenceDriftState::Failed => {
+                    entry.failure_ticks += 1;
+                    entry.drift_ticks = 0;
+                }
+                _ => {
+                    // Ready, Converging, or Stale: reset counters.
+                    entry.drift_ticks = 0;
+                    entry.failure_ticks = 0;
+                }
+            }
+            entry.last_state = drift_state;
+
+            // Determine if alert should fire. Capture needed data before borrowing self.
+            let alert_info = if entry.alert_cooldown == 0 {
+                if entry.drift_ticks >= self.config.sustained_drift_ticks {
+                    Some(("sustained_drift", entry.drift_ticks, entry.last_state))
+                } else if entry.failure_ticks >= self.config.sustained_failure_ticks {
+                    Some(("convergence_failure", entry.failure_ticks, entry.last_state))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            if let Some((alert_type, ticks, _state)) = alert_info {
+                let alert =
+                    Self::build_alert_static(&self.convergence, &worker_id, alert_type, ticks)
+                        .await;
+                warn!(
+                    worker_id = %alert.worker_id,
+                    alert_type = %alert.alert_type,
+                    consecutive_ticks = alert.consecutive_ticks,
+                    "Convergence alert: {}",
+                    alert.alert_type
+                );
+                self.events.emit("repo_convergence.alert", &alert);
+                // Re-borrow entry to set cooldown.
+                if let Some(entry) = self.tracker.get_mut(worker_id.as_str()) {
+                    entry.alert_cooldown = self.config.alert_debounce_ticks;
+                }
+                alerts_emitted += 1;
+            }
+        }
+
+        // Prune tracker entries for workers no longer in the pool.
+        let pool_ids: std::collections::HashSet<String> = {
+            let mut ids = std::collections::HashSet::new();
+            for w in &pool_workers {
+                let cfg = w.config.read().await;
+                ids.insert(cfg.id.as_str().to_string());
+            }
+            ids
+        };
+        self.tracker.retain(|k, _| pool_ids.contains(k));
+
+        let duration_ms = tick_start.elapsed().as_millis() as u64;
+
+        let summary = ConvergenceLoopTickSummary {
+            tick_number: self.tick_number,
+            workers_checked,
+            workers_skipped_busy,
+            staleness_checks: pool_workers.len(),
+            alerts_emitted,
+            duration_ms,
+        };
+
+        self.events.emit("repo_convergence.loop_tick", &summary);
+
+        if alerts_emitted > 0 || self.tick_number <= 1 {
+            info!(
+                tick = self.tick_number,
+                checked = workers_checked,
+                skipped_busy = workers_skipped_busy,
+                alerts = alerts_emitted,
+                duration_ms = duration_ms,
+                "Convergence loop tick"
+            );
+        }
+
+        summary
+    }
+
+    async fn build_alert_static(
+        convergence: &RepoConvergenceService,
+        worker_id: &WorkerId,
+        alert_type: &str,
+        ticks: u32,
+    ) -> ConvergenceAlert {
+        let (missing_repos, remediation) =
+            if let Some(ws) = convergence.get_worker_state(worker_id).await {
+                let missing = ws.missing_repos.clone();
+                let mut hints = Vec::new();
+                match ws.current_state {
+                    ConvergenceDriftState::Drifting => {
+                        if !missing.is_empty() {
+                            hints.push(format!(
+                                "Missing {} repo(s): {}",
+                                missing.len(),
+                                missing.join(", ")
+                            ));
+                        }
+                        hints.push("Run convergence repair to sync missing repos.".into());
+                    }
+                    ConvergenceDriftState::Failed => {
+                        hints.push("Convergence budgets exhausted.".into());
+                        hints.push("Run repair to reset budgets and retry convergence.".into());
+                    }
+                    _ => {}
+                }
+                (missing, hints)
+            } else {
+                (vec![], vec!["No convergence data available.".into()])
+            };
+
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+
+        ConvergenceAlert {
+            worker_id: worker_id.as_str().to_string(),
+            alert_type: alert_type.to_string(),
+            drift_state: convergence.get_drift_state(worker_id).await.to_string(),
+            consecutive_ticks: ticks,
+            missing_repos,
+            remediation,
+            emitted_at_unix_ms: now_ms,
+        }
+    }
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rch_common::WorkerConfig;
     use rch_common::test_guard;
 
     fn test_events() -> EventBus {
@@ -2968,5 +3287,413 @@ mod tests {
         let evt = last_outcome_event.expect("Should have outcome event");
         assert_eq!(evt["data"]["reason_code"], "attempt_budget_exhausted");
         assert_eq!(evt["data"]["drift_state_after"], "Failed");
+    }
+
+    // ============================================================================
+    // Convergence Loop Tests (bd-vvmd.3.4)
+    // ============================================================================
+
+    fn make_test_pool_and_loop(
+        config: ConvergenceLoopConfig,
+    ) -> (
+        Arc<RepoConvergenceService>,
+        crate::workers::WorkerPool,
+        EventBus,
+        ConvergenceLoop,
+    ) {
+        let events = EventBus::new(256);
+        let svc = Arc::new(RepoConvergenceService::new(events.clone()));
+        let pool = crate::workers::WorkerPool::new();
+
+        let convergence_loop =
+            ConvergenceLoop::new(svc.clone(), pool.clone(), events.clone(), config);
+
+        (svc, pool, events, convergence_loop)
+    }
+
+    async fn add_test_worker(pool: &crate::workers::WorkerPool, id: &str) {
+        pool.add_worker(WorkerConfig {
+            id: WorkerId::new(id),
+            ..Default::default()
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_loop_steady_state_no_alerts() {
+        // All workers Ready => no alerts emitted across many ticks.
+        let config = ConvergenceLoopConfig {
+            interval: Duration::from_millis(10),
+            sustained_drift_ticks: 3,
+            sustained_failure_ticks: 2,
+            alert_debounce_ticks: 5,
+        };
+        let (svc, pool, events, mut cloop) = make_test_pool_and_loop(config);
+        let mut rx = events.subscribe();
+
+        add_test_worker(&pool, "w1").await;
+        add_test_worker(&pool, "w2").await;
+
+        // Mark both workers Ready.
+        svc.update_required_repos(
+            &WorkerId::new("w1"),
+            vec!["repo-a".into()],
+            vec!["repo-a".into()],
+        )
+        .await;
+        svc.update_required_repos(
+            &WorkerId::new("w2"),
+            vec!["repo-b".into()],
+            vec!["repo-b".into()],
+        )
+        .await;
+
+        // Run 10 ticks.
+        for _ in 0..10 {
+            let summary = cloop.tick().await;
+            assert_eq!(summary.alerts_emitted, 0);
+            assert_eq!(summary.workers_checked, 2);
+        }
+
+        // Verify only loop_tick events, no alert events.
+        let mut alert_count = 0;
+        while let Ok(msg) = tokio::time::timeout(Duration::from_millis(5), rx.recv()).await {
+            if let Ok(msg) = msg {
+                let parsed: serde_json::Value = serde_json::from_str(&msg).unwrap();
+                if parsed["event"] == "repo_convergence.alert" {
+                    alert_count += 1;
+                }
+            }
+        }
+        assert_eq!(alert_count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_loop_sustained_drift_emits_alert() {
+        let config = ConvergenceLoopConfig {
+            interval: Duration::from_millis(10),
+            sustained_drift_ticks: 3,
+            sustained_failure_ticks: 2,
+            alert_debounce_ticks: 5,
+        };
+        let (svc, pool, events, mut cloop) = make_test_pool_and_loop(config);
+        let mut rx = events.subscribe();
+
+        add_test_worker(&pool, "drift-w").await;
+
+        // Set worker to Drifting (missing repos).
+        svc.update_required_repos(
+            &WorkerId::new("drift-w"),
+            vec!["repo-x".into(), "repo-y".into()],
+            vec![], // none synced
+        )
+        .await;
+
+        // Tick 1-2: no alert (below threshold).
+        for _ in 0..2 {
+            let s = cloop.tick().await;
+            assert_eq!(s.alerts_emitted, 0);
+        }
+
+        // Tick 3: alert should fire (sustained_drift_ticks = 3).
+        let s = cloop.tick().await;
+        assert_eq!(s.alerts_emitted, 1);
+
+        // Find the alert event.
+        let mut found_alert = false;
+        while let Ok(msg) = tokio::time::timeout(Duration::from_millis(5), rx.recv()).await {
+            if let Ok(msg) = msg {
+                let parsed: serde_json::Value = serde_json::from_str(&msg).unwrap();
+                if parsed["event"] == "repo_convergence.alert" {
+                    assert_eq!(parsed["data"]["alert_type"], "sustained_drift");
+                    assert_eq!(parsed["data"]["worker_id"], "drift-w");
+                    assert_eq!(parsed["data"]["consecutive_ticks"], 3);
+                    assert!(
+                        !parsed["data"]["missing_repos"]
+                            .as_array()
+                            .unwrap()
+                            .is_empty()
+                    );
+                    assert!(!parsed["data"]["remediation"].as_array().unwrap().is_empty());
+                    found_alert = true;
+                }
+            }
+        }
+        assert!(found_alert, "Expected sustained_drift alert event");
+    }
+
+    #[tokio::test]
+    async fn test_loop_failure_alert() {
+        let config = ConvergenceLoopConfig {
+            interval: Duration::from_millis(10),
+            sustained_drift_ticks: 6,
+            sustained_failure_ticks: 2,
+            alert_debounce_ticks: 5,
+        };
+        let (svc, pool, _events, mut cloop) = make_test_pool_and_loop(config);
+
+        add_test_worker(&pool, "fail-w").await;
+
+        // Put worker into Failed state by exhausting budgets.
+        let wid = WorkerId::new("fail-w");
+        svc.update_required_repos(&wid, vec!["r1".into()], vec![])
+            .await;
+        svc.mark_converging(&wid).await;
+        // Exhaust attempt budget (3 failures).
+        for _ in 0..3 {
+            let _ = svc
+                .record_convergence_attempt(&wid, 0, 1, 0, 1000, Some("test".into()))
+                .await;
+            // Re-mark converging for next attempt (except when Failed).
+            if svc.get_drift_state(&wid).await != ConvergenceDriftState::Failed {
+                svc.mark_converging(&wid).await;
+            }
+        }
+        assert_eq!(
+            svc.get_drift_state(&wid).await,
+            ConvergenceDriftState::Failed
+        );
+
+        // Tick 1: no alert.
+        let s = cloop.tick().await;
+        assert_eq!(s.alerts_emitted, 0);
+
+        // Tick 2: alert fires (sustained_failure_ticks = 2).
+        let s = cloop.tick().await;
+        assert_eq!(s.alerts_emitted, 1);
+    }
+
+    #[tokio::test]
+    async fn test_loop_alert_debounce_suppresses_repeats() {
+        // debounce_ticks=4 means after alert fires, cooldown is set to 4.
+        // Next ticks decrement: 4→3→2→1→0. Ticks with cooldown>0 are suppressed.
+        // So 3 ticks suppressed (cooldown 3,2,1), 4th tick cooldown reaches 0 and fires.
+        let config = ConvergenceLoopConfig {
+            interval: Duration::from_millis(10),
+            sustained_drift_ticks: 2,
+            sustained_failure_ticks: 2,
+            alert_debounce_ticks: 4,
+        };
+        let (svc, pool, _events, mut cloop) = make_test_pool_and_loop(config);
+
+        add_test_worker(&pool, "bounce-w").await;
+        svc.update_required_repos(&WorkerId::new("bounce-w"), vec!["r".into()], vec![])
+            .await;
+
+        // Tick 1: no alert (drift_ticks=1, below threshold=2).
+        let s = cloop.tick().await;
+        assert_eq!(s.alerts_emitted, 0);
+
+        // Tick 2: alert fires (drift_ticks=2, meets threshold).
+        let s = cloop.tick().await;
+        assert_eq!(s.alerts_emitted, 1);
+
+        // Ticks 3-5: debounce suppresses (cooldown 3,2,1).
+        for i in 0..3 {
+            let s = cloop.tick().await;
+            assert_eq!(s.alerts_emitted, 0, "Tick {} should be debounced", i + 3);
+        }
+
+        // Tick 6: cooldown expired (0), alert fires again.
+        let s = cloop.tick().await;
+        assert_eq!(
+            s.alerts_emitted, 1,
+            "Alert should fire after debounce window"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_loop_recovery_to_healthy_clears_counters() {
+        let config = ConvergenceLoopConfig {
+            interval: Duration::from_millis(10),
+            sustained_drift_ticks: 3,
+            sustained_failure_ticks: 2,
+            alert_debounce_ticks: 5,
+        };
+        let (svc, pool, _events, mut cloop) = make_test_pool_and_loop(config);
+
+        add_test_worker(&pool, "recover-w").await;
+        let wid = WorkerId::new("recover-w");
+
+        // Start Drifting.
+        svc.update_required_repos(&wid, vec!["r1".into()], vec![])
+            .await;
+
+        // 2 drift ticks (below threshold).
+        for _ in 0..2 {
+            cloop.tick().await;
+        }
+
+        // Recover: sync the repos.
+        // Need to wait for hysteresis before transitioning back.
+        tokio::time::sleep(Duration::from_millis(5100)).await;
+        svc.update_required_repos(&wid, vec!["r1".into()], vec!["r1".into()])
+            .await;
+        assert_eq!(
+            svc.get_drift_state(&wid).await,
+            ConvergenceDriftState::Ready
+        );
+
+        // Tick after recovery: no alert, counters reset.
+        let s = cloop.tick().await;
+        assert_eq!(s.alerts_emitted, 0);
+
+        // Continue ticking many times: never alert (counters were reset).
+        for _ in 0..10 {
+            let s = cloop.tick().await;
+            assert_eq!(s.alerts_emitted, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_loop_workload_aware_throttling_skips_busy_workers() {
+        let config = ConvergenceLoopConfig {
+            interval: Duration::from_millis(10),
+            sustained_drift_ticks: 2,
+            sustained_failure_ticks: 2,
+            alert_debounce_ticks: 5,
+        };
+        let (svc, pool, _events, mut cloop) = make_test_pool_and_loop(config);
+
+        add_test_worker(&pool, "busy-w").await;
+        add_test_worker(&pool, "idle-w").await;
+
+        // Put both into Drifting state.
+        svc.update_required_repos(&WorkerId::new("busy-w"), vec!["r".into()], vec![])
+            .await;
+        svc.update_required_repos(&WorkerId::new("idle-w"), vec!["r".into()], vec![])
+            .await;
+
+        // Make busy-w have active builds.
+        let workers = pool.all_workers().await;
+        for w in &workers {
+            let cfg = w.config.read().await;
+            if cfg.id.as_str() == "busy-w" {
+                w.reserve_slots(1).await;
+            }
+        }
+
+        // First tick: busy-w skipped, idle-w checked.
+        let s = cloop.tick().await;
+        assert_eq!(s.workers_checked, 1);
+        assert_eq!(s.workers_skipped_busy, 1);
+
+        // Second tick: idle-w hits threshold, alert fires for idle-w only.
+        let s = cloop.tick().await;
+        assert_eq!(s.alerts_emitted, 1);
+        assert_eq!(s.workers_skipped_busy, 1);
+    }
+
+    #[tokio::test]
+    async fn test_loop_tick_summary_event_emitted() {
+        let config = ConvergenceLoopConfig {
+            interval: Duration::from_millis(10),
+            sustained_drift_ticks: 100,
+            sustained_failure_ticks: 100,
+            alert_debounce_ticks: 100,
+        };
+        let (_svc, pool, events, mut cloop) = make_test_pool_and_loop(config);
+        let mut rx = events.subscribe();
+
+        add_test_worker(&pool, "w1").await;
+
+        let summary = cloop.tick().await;
+        assert_eq!(summary.tick_number, 1);
+        assert_eq!(summary.workers_checked, 1);
+        assert_eq!(summary.workers_skipped_busy, 0);
+        assert_eq!(summary.staleness_checks, 1);
+
+        // Find loop_tick event.
+        let mut found_tick_event = false;
+        while let Ok(msg) = tokio::time::timeout(Duration::from_millis(5), rx.recv()).await {
+            if let Ok(msg) = msg {
+                let parsed: serde_json::Value = serde_json::from_str(&msg).unwrap();
+                if parsed["event"] == "repo_convergence.loop_tick" {
+                    assert_eq!(parsed["data"]["tick_number"], 1);
+                    assert_eq!(parsed["data"]["workers_checked"], 1);
+                    found_tick_event = true;
+                }
+            }
+        }
+        assert!(found_tick_event, "Expected loop_tick event");
+    }
+
+    #[tokio::test]
+    async fn test_loop_empty_pool_no_panic() {
+        let config = ConvergenceLoopConfig {
+            interval: Duration::from_millis(10),
+            sustained_drift_ticks: 3,
+            sustained_failure_ticks: 2,
+            alert_debounce_ticks: 5,
+        };
+        let (_svc, _pool, _events, mut cloop) = make_test_pool_and_loop(config);
+
+        // Empty pool should not panic and report 0 workers.
+        let s = cloop.tick().await;
+        assert_eq!(s.workers_checked, 0);
+        assert_eq!(s.workers_skipped_busy, 0);
+        assert_eq!(s.staleness_checks, 0);
+        assert_eq!(s.alerts_emitted, 0);
+    }
+
+    #[tokio::test]
+    async fn test_loop_config_default_values() {
+        let config = ConvergenceLoopConfig::default();
+        assert_eq!(config.interval, Duration::from_secs(30));
+        assert_eq!(config.sustained_drift_ticks, SUSTAINED_DRIFT_ALERT_TICKS);
+        assert_eq!(
+            config.sustained_failure_ticks,
+            SUSTAINED_FAILURE_ALERT_TICKS
+        );
+        assert_eq!(config.alert_debounce_ticks, ALERT_DEBOUNCE_TICKS);
+    }
+
+    #[tokio::test]
+    async fn test_loop_drift_then_failure_switches_counter() {
+        // Verify that transitioning from Drifting to Failed resets drift counter
+        // and starts counting failure ticks.
+        let config = ConvergenceLoopConfig {
+            interval: Duration::from_millis(10),
+            sustained_drift_ticks: 10,
+            sustained_failure_ticks: 2,
+            alert_debounce_ticks: 100,
+        };
+        let (svc, pool, _events, mut cloop) = make_test_pool_and_loop(config);
+
+        add_test_worker(&pool, "df-w").await;
+        let wid = WorkerId::new("df-w");
+
+        // Start Drifting.
+        svc.update_required_repos(&wid, vec!["r1".into()], vec![])
+            .await;
+
+        // 3 drift ticks.
+        for _ in 0..3 {
+            let s = cloop.tick().await;
+            assert_eq!(s.alerts_emitted, 0);
+        }
+
+        // Transition to Failed by exhausting budgets.
+        svc.mark_converging(&wid).await;
+        for _ in 0..3 {
+            let _ = svc
+                .record_convergence_attempt(&wid, 0, 1, 0, 1000, Some("err".into()))
+                .await;
+            if svc.get_drift_state(&wid).await != ConvergenceDriftState::Failed {
+                svc.mark_converging(&wid).await;
+            }
+        }
+        assert_eq!(
+            svc.get_drift_state(&wid).await,
+            ConvergenceDriftState::Failed
+        );
+
+        // Tick 1 in Failed: no alert (need 2 failure ticks).
+        let s = cloop.tick().await;
+        assert_eq!(s.alerts_emitted, 0);
+
+        // Tick 2 in Failed: alert fires.
+        let s = cloop.tick().await;
+        assert_eq!(s.alerts_emitted, 1);
     }
 }
