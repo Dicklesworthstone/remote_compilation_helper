@@ -24,6 +24,7 @@ mod http_api;
 mod metrics;
 mod process_triage;
 mod reclaim;
+mod reliability;
 mod reload;
 mod repo_convergence;
 mod selection;

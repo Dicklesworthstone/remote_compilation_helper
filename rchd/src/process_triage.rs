@@ -48,13 +48,13 @@ const WORKER_PIPELINE_COOLDOWN: Duration = Duration::from_secs(60);
 #[derive(Debug, Clone, Default)]
 pub(crate) struct WorkerRemediationState {
     /// Total actions executed against this worker.
-    total_actions: u32,
+    pub(crate) total_actions: u32,
     /// Total hard terminations executed.
-    hard_terminations: u32,
+    pub(crate) hard_terminations: u32,
     /// Last pipeline completion time.
-    last_pipeline_at: Option<Instant>,
+    pub(crate) last_pipeline_at: Option<Instant>,
     /// Consecutive failed pipeline runs.
-    consecutive_failures: u32,
+    pub(crate) consecutive_failures: u32,
 }
 
 /// Escalation step in the pipeline.
@@ -639,7 +639,7 @@ impl RemediationPipeline {
     }
 
     /// Get current remediation state for a worker (for status surfaces).
-    pub async fn worker_state(&self, worker_id: &str) -> Option<WorkerRemediationState> {
+    pub(crate) async fn worker_state(&self, worker_id: &str) -> Option<WorkerRemediationState> {
         self.worker_states.read().await.get(worker_id).cloned()
     }
 

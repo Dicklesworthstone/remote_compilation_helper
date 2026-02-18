@@ -399,6 +399,8 @@ pub struct WorkerScoreBreakdown {
     pub circuit_state: String,
     /// Repo convergence drift state at selection time (if convergence service is wired).
     pub convergence_state: Option<String>,
+    /// Unified reliability health state (if aggregator is wired, bd-vvmd.5.5).
+    pub reliability_state: Option<String>,
     /// Whether this worker was selected.
     pub selected: bool,
     /// Reason if skipped (e.g., "no slots", "circuit open").
@@ -530,6 +532,8 @@ pub struct WorkerSelector {
     pub admission_gate: Option<Arc<AdmissionGate>>,
     /// Optional repo convergence service for pre-build freshness checks (bd-vvmd.3.3).
     pub repo_convergence: Option<Arc<crate::repo_convergence::RepoConvergenceService>>,
+    /// Optional unified reliability aggregator for multi-signal health (bd-vvmd.5.5).
+    pub reliability: Option<Arc<crate::reliability::ReliabilityAggregator>>,
 }
 
 /// Result of worker selection with reason.
@@ -568,6 +572,7 @@ impl WorkerSelector {
             audit_log: Arc::new(RwLock::new(SelectionAuditLog::default())),
             admission_gate: None,
             repo_convergence: None,
+            reliability: None,
         }
     }
 
@@ -581,6 +586,7 @@ impl WorkerSelector {
             audit_log: Arc::new(RwLock::new(SelectionAuditLog::default())),
             admission_gate: None,
             repo_convergence: None,
+            reliability: None,
         }
     }
 
@@ -595,6 +601,14 @@ impl WorkerSelector {
         svc: Arc<crate::repo_convergence::RepoConvergenceService>,
     ) {
         self.repo_convergence = Some(svc);
+    }
+
+    /// Set the unified reliability aggregator for multi-signal health (bd-vvmd.5.5).
+    pub fn set_reliability(
+        &mut self,
+        agg: Arc<crate::reliability::ReliabilityAggregator>,
+    ) {
+        self.reliability = Some(agg);
     }
 
     /// Get a read-only view of the audit log entries.
@@ -967,6 +981,15 @@ impl WorkerSelector {
                 None
             };
 
+            // Query reliability state for audit trail (bd-vvmd.5.5)
+            let reliability_state = if let Some(ref agg) = self.reliability {
+                agg.get_assessment(worker_id.as_str())
+                    .await
+                    .map(|a| a.health_state.to_string())
+            } else {
+                None
+            };
+
             breakdowns.push(WorkerScoreBreakdown {
                 worker_id,
                 total_score: speed_score * slot_availability, // Simplified total
@@ -976,6 +999,7 @@ impl WorkerSelector {
                 priority_score,
                 circuit_state: format!("{:?}", circuit_state),
                 convergence_state,
+                reliability_state,
                 selected,
                 skip_reason,
             });
@@ -1351,6 +1375,21 @@ impl WorkerSelector {
                 }
             }
 
+            // Unified reliability check (bd-vvmd.5.5).
+            // Quarantined workers receive a hard exclusion; degraded workers
+            // pass through with their penalty applied later in scoring.
+            if let Some(ref agg) = self.reliability {
+                let assessment = agg.evaluate(worker.as_ref(), worker_id.as_str()).await;
+                if assessment.hard_exclude {
+                    debug!(
+                        "Worker {} excluded: reliability quarantined (debt={:.2}, state={})",
+                        worker_id, assessment.aggregated_debt, assessment.health_state
+                    );
+                    passes_preflight = false;
+                    hard_preflight_block = true;
+                }
+            }
+
             // Critical pressure is a hard preflight exclusion. We do not
             // include these workers in fail-open remote fallback candidates.
             if hard_preflight_block {
@@ -1627,8 +1666,23 @@ impl WorkerSelector {
             0.0
         };
 
+        // Apply unified reliability penalty (bd-vvmd.5.5).
+        // Aggregates circuit, convergence, pressure, and process-triage
+        // signals into a single penalty (0.0-1.0).  When the aggregator is
+        // not wired, no penalty is applied (fail-open).
+        let reliability_penalty = if let Some(ref agg) = self.reliability {
+            let assessment = agg.evaluate(worker, config.id.as_str()).await;
+            let p = assessment.penalty;
+            if p > 0.0 {
+                final_score *= 1.0 - p;
+            }
+            p
+        } else {
+            0.0
+        };
+
         debug!(
-            "Worker {} balanced score: {:.3} (speed={:.2}, load={:.2}, slots={:.2}, health={:.2}, cache={:.2}, network={:.2}, priority={:.2}, half_open={:?}, admission_penalty={:.2}, cache_use={:?})",
+            "Worker {} balanced score: {:.3} (speed={:.2}, load={:.2}, slots={:.2}, health={:.2}, cache={:.2}, network={:.2}, priority={:.2}, half_open={:?}, admission_penalty={:.2}, reliability_penalty={:.2}, cache_use={:?})",
             config.id,
             final_score,
             speed_score,
@@ -1640,6 +1694,7 @@ impl WorkerSelector {
             priority_score,
             circuit_state == CircuitState::HalfOpen,
             admission_penalty,
+            reliability_penalty,
             cache_use
         );
 
@@ -3734,6 +3789,7 @@ mod tests {
             priority_score: 0.8,
             circuit_state: "Closed".to_string(),
             convergence_state: None,
+            reliability_state: None,
             selected: true,
             skip_reason: None,
         };
