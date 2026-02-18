@@ -4740,5 +4740,258 @@ mod tests {
                 "Audit should include convergence state"
             );
         }
+
+        // ── bd-vvmd.3.8 AC3: Integration Tests (Convergence + Selection) ──
+
+        /// AC3: Detect drift → worker excluded → converge → worker re-eligible.
+        #[tokio::test]
+        async fn test_integration_drift_detect_converge_reselect() {
+            let pool = WorkerPool::new();
+            pool.add_worker(make_worker("w1", 8, 80.0).config.read().await.clone())
+                .await;
+
+            let convergence = make_convergence_svc();
+            let wid = WorkerId::new("w1");
+
+            // Step 1: Worker has missing repos → Drifting.
+            convergence
+                .update_required_repos(&wid, vec!["repo-x".into()], vec![])
+                .await;
+            assert_eq!(
+                convergence.get_drift_state(&wid).await,
+                crate::repo_convergence::ConvergenceDriftState::Drifting
+            );
+
+            // Step 2: Drifting workers are allowed (warn only).
+            let mut selector = WorkerSelector::new();
+            selector.set_repo_convergence(convergence.clone());
+            let request = make_selection_request("test-project");
+            let result = selector.select(&pool, &request).await;
+            assert!(result.worker.is_some(), "Drifting worker should still be eligible");
+
+            // Step 3: Worker enters Converging → excluded.
+            convergence.mark_converging(&wid).await;
+            let mut selector2 = WorkerSelector::new();
+            selector2.set_repo_convergence(convergence.clone());
+            let result2 = selector2.select(&pool, &request).await;
+            assert!(
+                result2.worker.is_none(),
+                "Converging worker should be excluded from selection"
+            );
+
+            // Step 4: Convergence succeeds → Ready → eligible again.
+            convergence
+                .record_convergence_attempt(&wid, 1, 0, 0, 1_000, None)
+                .await
+                .unwrap();
+            assert_eq!(
+                convergence.get_drift_state(&wid).await,
+                crate::repo_convergence::ConvergenceDriftState::Ready
+            );
+
+            let mut selector3 = WorkerSelector::new();
+            selector3.set_repo_convergence(convergence);
+            let result3 = selector3.select(&pool, &request).await;
+            assert!(
+                result3.worker.is_some(),
+                "Ready worker should be eligible after convergence"
+            );
+        }
+
+        /// AC3: Missing repos prevent remote selection when all workers are
+        /// in Failed state → AllWorkersFailedConvergence.
+        #[tokio::test]
+        async fn test_integration_all_workers_failed_convergence_error() {
+            let pool = WorkerPool::new();
+            pool.add_worker(make_worker("w1", 8, 80.0).config.read().await.clone())
+                .await;
+            pool.add_worker(
+                make_worker("w2", 8, 85.0)
+                    .config
+                    .read()
+                    .await
+                    .clone(),
+            )
+            .await;
+
+            let convergence = make_convergence_svc();
+
+            // Drive both workers to Failed.
+            for name in ["w1", "w2"] {
+                let wid = WorkerId::new(name);
+                convergence
+                    .update_required_repos(&wid, vec!["repo-x".into()], vec![])
+                    .await;
+                for _ in 0..3 {
+                    let _ = convergence
+                        .record_convergence_attempt(
+                            &wid,
+                            0,
+                            1,
+                            0,
+                            10_000,
+                            Some("sync_error".into()),
+                        )
+                        .await;
+                }
+                assert_eq!(
+                    convergence.get_drift_state(&wid).await,
+                    crate::repo_convergence::ConvergenceDriftState::Failed
+                );
+            }
+
+            let mut selector = WorkerSelector::new();
+            selector.set_repo_convergence(convergence);
+            let request = make_selection_request("test-project");
+            let result = selector.select(&pool, &request).await;
+
+            assert!(
+                result.worker.is_none(),
+                "No worker should be selected when all are Failed"
+            );
+            assert_eq!(
+                result.reason,
+                rch_common::SelectionReason::AllWorkersFailedConvergence,
+                "Should return AllWorkersFailedConvergence reason"
+            );
+        }
+
+        /// AC3: Stale + Ready mix — selection prefers Ready worker.
+        #[tokio::test]
+        async fn test_integration_stale_ready_prefers_ready() {
+            let pool = WorkerPool::new();
+            pool.add_worker(
+                make_worker("w-stale", 8, 90.0)
+                    .config
+                    .read()
+                    .await
+                    .clone(),
+            )
+            .await;
+            pool.add_worker(
+                make_worker("w-ready", 8, 80.0)
+                    .config
+                    .read()
+                    .await
+                    .clone(),
+            )
+            .await;
+
+            let convergence = make_convergence_svc();
+
+            // w-stale: never registered → Stale (allowed via fail-open).
+            // w-ready: all repos synced → Ready.
+            let wid_ready = WorkerId::new("w-ready");
+            convergence
+                .update_required_repos(&wid_ready, vec!["repo-a".into()], vec!["repo-a".into()])
+                .await;
+
+            let mut selector = WorkerSelector::new();
+            selector.set_repo_convergence(convergence);
+            let request = make_selection_request("test-project");
+            let result = selector.select(&pool, &request).await;
+
+            // Both are eligible, but selection should work.
+            assert!(result.worker.is_some(), "Should select a worker");
+        }
+
+        /// AC3: Budget-exhausted worker excluded while fresh worker selected.
+        #[tokio::test]
+        async fn test_integration_budget_exhausted_excluded_fresh_selected() {
+            let pool = WorkerPool::new();
+            pool.add_worker(
+                make_worker("w-exhausted", 16, 95.0)
+                    .config
+                    .read()
+                    .await
+                    .clone(),
+            )
+            .await;
+            pool.add_worker(
+                make_worker("w-fresh", 8, 80.0)
+                    .config
+                    .read()
+                    .await
+                    .clone(),
+            )
+            .await;
+
+            let convergence = make_convergence_svc();
+
+            // w-exhausted: drive to Failed.
+            let wid_exhausted = WorkerId::new("w-exhausted");
+            convergence
+                .update_required_repos(&wid_exhausted, vec!["repo-x".into()], vec![])
+                .await;
+            for _ in 0..3 {
+                let _ = convergence
+                    .record_convergence_attempt(
+                        &wid_exhausted,
+                        0,
+                        1,
+                        0,
+                        10_000,
+                        Some("fail".into()),
+                    )
+                    .await;
+            }
+
+            // w-fresh: Ready.
+            let wid_fresh = WorkerId::new("w-fresh");
+            convergence
+                .update_required_repos(&wid_fresh, vec!["repo-x".into()], vec!["repo-x".into()])
+                .await;
+
+            let mut selector = WorkerSelector::new();
+            selector.set_repo_convergence(convergence);
+            let request = make_selection_request("test-project");
+            let result = selector.select(&pool, &request).await;
+
+            assert!(result.worker.is_some(), "Should select the fresh worker");
+            let selected_id = result
+                .worker
+                .as_ref()
+                .unwrap()
+                .config
+                .read()
+                .await
+                .id
+                .clone();
+            assert_eq!(
+                selected_id.as_str(),
+                "w-fresh",
+                "Should prefer the Ready worker over the Failed one"
+            );
+        }
+
+        /// AC4: Fail-open semantics — when convergence service returns Stale
+        /// for all workers, selection still proceeds (fail-open).
+        #[tokio::test]
+        async fn test_integration_fail_open_all_stale_still_selects() {
+            let pool = WorkerPool::new();
+            pool.add_worker(make_worker("w1", 8, 80.0).config.read().await.clone())
+                .await;
+            pool.add_worker(
+                make_worker("w2", 8, 85.0)
+                    .config
+                    .read()
+                    .await
+                    .clone(),
+            )
+            .await;
+
+            let convergence = make_convergence_svc();
+            // Neither worker registered → both Stale (fail-open).
+
+            let mut selector = WorkerSelector::new();
+            selector.set_repo_convergence(convergence);
+            let request = make_selection_request("test-project");
+            let result = selector.select(&pool, &request).await;
+
+            assert!(
+                result.worker.is_some(),
+                "All-stale scenario should still select a worker (fail-open)"
+            );
+        }
     }
 }

@@ -2320,4 +2320,608 @@ mod tests {
         let ws = svc.get_worker_state(&wid).await.unwrap();
         assert_eq!(ws.attempt_budget_remaining, MAX_CONVERGENCE_ATTEMPTS);
     }
+
+    // ── bd-vvmd.3.8 AC1: Adapter Failure Taxonomy Tests ───────────────
+
+    /// AC1: Timeout scenario — adapter exceeds time budget across multiple
+    /// attempts, driving the worker to Failed state.
+    #[tokio::test]
+    async fn test_adapter_timeout_exhausts_time_budget() {
+        let _guard = test_guard!();
+        let svc = RepoConvergenceService::new(test_events());
+        let wid = test_worker_id("w-timeout");
+
+        // Put worker into Drifting state.
+        svc.update_required_repos(&wid, vec!["repo-a".into()], vec![])
+            .await;
+        assert_eq!(svc.get_drift_state(&wid).await, ConvergenceDriftState::Drifting);
+
+        // Each attempt consumes a huge chunk of time budget (simulating slow timeouts).
+        // Default budget = 120_000ms, we consume 50_000ms each attempt.
+        for i in 0..3 {
+            let result = svc
+                .record_convergence_attempt(
+                    &wid,
+                    0,
+                    1,
+                    0,
+                    50_000, // 50s per timeout
+                    Some(format!("rsync_timeout_attempt_{}", i)),
+                )
+                .await;
+            assert!(result.is_ok(), "Attempt should return Ok even on failure");
+            let outcome = result.unwrap();
+            assert_eq!(outcome.failed_count, 1);
+            assert!(outcome.failure.is_some());
+        }
+
+        // After 3 attempts × 50s = 150s consumed (budget was 120s), should be Failed.
+        assert_eq!(
+            svc.get_drift_state(&wid).await,
+            ConvergenceDriftState::Failed,
+            "Worker should be Failed after time budget exhausted"
+        );
+        let ws = svc.get_worker_state(&wid).await.unwrap();
+        assert_eq!(ws.time_budget_remaining_ms, 0);
+    }
+
+    /// AC1: Partial sync results — some repos succeed, some fail.
+    /// Worker stays Drifting when budget remains.
+    #[tokio::test]
+    async fn test_adapter_partial_result_mixed_success_failure() {
+        let _guard = test_guard!();
+        let svc = RepoConvergenceService::new(test_events());
+        let wid = test_worker_id("w-partial");
+
+        svc.update_required_repos(
+            &wid,
+            vec!["repo-a".into(), "repo-b".into(), "repo-c".into()],
+            vec![],
+        )
+        .await;
+        assert_eq!(svc.get_drift_state(&wid).await, ConvergenceDriftState::Drifting);
+
+        // Adapter returns: 2 synced, 1 auth denied.
+        let outcome = svc
+            .record_convergence_attempt(
+                &wid,
+                2,     // synced
+                1,     // failed
+                0,     // skipped
+                5_000, // 5s
+                None,  // No error string → partial path based on failed_count > 0
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.synced_count, 2);
+        assert_eq!(outcome.failed_count, 1);
+        assert_eq!(outcome.reason_code, "partial_failure_1_repos");
+        assert_eq!(
+            svc.get_drift_state(&wid).await,
+            ConvergenceDriftState::Drifting,
+            "Partial failure with budget remaining should stay Drifting"
+        );
+
+        // Budget should still be available.
+        assert!(svc.has_budget(&wid).await);
+    }
+
+    /// AC1: Auth failure classification — failure string is preserved in outcome
+    /// and worker transitions correctly.
+    #[tokio::test]
+    async fn test_adapter_auth_failure_classification() {
+        let _guard = test_guard!();
+        let svc = RepoConvergenceService::new(test_events());
+        let wid = test_worker_id("w-auth");
+
+        svc.update_required_repos(&wid, vec!["repo-a".into()], vec![])
+            .await;
+
+        let outcome = svc
+            .record_convergence_attempt(
+                &wid,
+                0,
+                1,
+                0,
+                2_000,
+                Some("auth_credential_expired: token TTL exceeded".into()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.failure.as_deref(), Some("auth_credential_expired: token TTL exceeded"));
+        assert_eq!(outcome.reason_code, "sync_failed_retryable");
+        assert_eq!(
+            svc.get_drift_state(&wid).await,
+            ConvergenceDriftState::Drifting,
+            "Auth failure with remaining budget should stay Drifting"
+        );
+    }
+
+    /// AC1: Network failure (SSH unreachable) — retryable failure, stays Drifting.
+    #[tokio::test]
+    async fn test_adapter_network_failure_ssh_unreachable() {
+        let _guard = test_guard!();
+        let svc = RepoConvergenceService::new(test_events());
+        let wid = test_worker_id("w-net");
+
+        svc.update_required_repos(&wid, vec!["repo-a".into()], vec![])
+            .await;
+
+        let outcome = svc
+            .record_convergence_attempt(
+                &wid,
+                0,
+                1,
+                0,
+                1_000,
+                Some("connection_refused: ssh port 22 unreachable".into()),
+            )
+            .await
+            .unwrap();
+
+        assert!(outcome.failure.is_some());
+        assert_eq!(outcome.reason_code, "sync_failed_retryable");
+        assert_eq!(svc.get_drift_state(&wid).await, ConvergenceDriftState::Drifting);
+        assert!(svc.has_budget(&wid).await, "Network failure is retryable, budget should remain");
+    }
+
+    /// AC1: Adapter unavailable (binary not found) — repeated failures exhaust
+    /// attempt budget, driving to Failed.
+    #[tokio::test]
+    async fn test_adapter_unavailable_exhausts_attempt_budget() {
+        let _guard = test_guard!();
+        let svc = RepoConvergenceService::new(test_events());
+        let wid = test_worker_id("w-nobin");
+
+        svc.update_required_repos(&wid, vec!["repo-a".into()], vec![])
+            .await;
+
+        // Exhaust all 3 attempts with "command not found" failures.
+        for _ in 0..MAX_CONVERGENCE_ATTEMPTS {
+            let _ = svc
+                .record_convergence_attempt(
+                    &wid,
+                    0,
+                    1,
+                    0,
+                    100,
+                    Some("ru: command not found (exit 127)".into()),
+                )
+                .await;
+        }
+
+        assert_eq!(
+            svc.get_drift_state(&wid).await,
+            ConvergenceDriftState::Failed,
+            "Should be Failed after exhausting attempt budget"
+        );
+        let ws = svc.get_worker_state(&wid).await.unwrap();
+        assert_eq!(ws.attempt_budget_remaining, 0);
+        assert!(!svc.has_budget(&wid).await, "Budget should be exhausted");
+    }
+
+    /// AC1: Exit code mapping — verify outcomes track failure reasons correctly
+    /// when different failure strings indicate different root causes.
+    #[tokio::test]
+    async fn test_adapter_failure_reason_codes_differentiated() {
+        let _guard = test_guard!();
+        let svc = RepoConvergenceService::new(test_events());
+        let wid = test_worker_id("w-codes");
+
+        svc.update_required_repos(&wid, vec!["repo-a".into()], vec![])
+            .await;
+
+        // Attempt 1: auth failure.
+        let o1 = svc
+            .record_convergence_attempt(
+                &wid,
+                0,
+                1,
+                0,
+                1_000,
+                Some("auth_failure".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(o1.reason_code, "sync_failed_retryable");
+
+        // Attempt 2: timeout.
+        let o2 = svc
+            .record_convergence_attempt(
+                &wid,
+                0,
+                1,
+                0,
+                30_000,
+                Some("timeout".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(o2.reason_code, "sync_failed_retryable");
+
+        // Attempt 3: final failure (budget exhausted).
+        let o3 = svc
+            .record_convergence_attempt(
+                &wid,
+                0,
+                1,
+                0,
+                1_000,
+                Some("connection_refused".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(o3.reason_code, "attempt_budget_exhausted");
+
+        // All outcomes are stored.
+        let outcomes = svc.get_recent_outcomes(10).await;
+        assert_eq!(outcomes.len(), 3);
+        // Most recent first.
+        assert_eq!(outcomes[0].failure.as_deref(), Some("connection_refused"));
+        assert_eq!(outcomes[1].failure.as_deref(), Some("timeout"));
+        assert_eq!(outcomes[2].failure.as_deref(), Some("auth_failure"));
+    }
+
+    /// AC1: Zero-duration timeout attempt shouldn't consume time budget but
+    /// still consumes attempt budget.
+    #[tokio::test]
+    async fn test_adapter_zero_duration_failure_consumes_only_attempt_budget() {
+        let _guard = test_guard!();
+        let svc = RepoConvergenceService::new(test_events());
+        let wid = test_worker_id("w-zero");
+
+        svc.update_required_repos(&wid, vec!["repo-a".into()], vec![])
+            .await;
+
+        let ws_before = svc.get_worker_state(&wid).await.unwrap();
+        let time_before = ws_before.time_budget_remaining_ms;
+
+        let _ = svc
+            .record_convergence_attempt(
+                &wid,
+                0,
+                1,
+                0,
+                0, // zero duration
+                Some("instant_reject".into()),
+            )
+            .await;
+
+        let ws_after = svc.get_worker_state(&wid).await.unwrap();
+        assert_eq!(
+            ws_after.time_budget_remaining_ms, time_before,
+            "Zero-duration attempt should not consume time budget"
+        );
+        assert_eq!(
+            ws_after.attempt_budget_remaining,
+            MAX_CONVERGENCE_ATTEMPTS - 1,
+            "Should consume one attempt"
+        );
+    }
+
+    /// AC1: Skipped repos are tracked correctly in outcome.
+    #[tokio::test]
+    async fn test_adapter_skipped_repos_tracked_in_outcome() {
+        let _guard = test_guard!();
+        let svc = RepoConvergenceService::new(test_events());
+        let wid = test_worker_id("w-skip");
+
+        svc.update_required_repos(&wid, vec!["repo-a".into(), "repo-b".into()], vec![])
+            .await;
+
+        let outcome = svc
+            .record_convergence_attempt(&wid, 1, 0, 1, 3_000, None)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.synced_count, 1);
+        assert_eq!(outcome.skipped_count, 1);
+        assert_eq!(outcome.failed_count, 0);
+        assert_eq!(outcome.reason_code, "sync_complete");
+        assert_eq!(
+            svc.get_drift_state(&wid).await,
+            ConvergenceDriftState::Ready,
+            "No failures means Ready"
+        );
+    }
+
+    // ── bd-vvmd.3.8 AC4: Fail-Open Semantics Tests ────────────────────
+
+    /// AC4: Failed convergence does NOT prevent querying state — fail-open
+    /// means callers can still check and decide.
+    #[tokio::test]
+    async fn test_fail_open_failed_state_still_queryable() {
+        let _guard = test_guard!();
+        let svc = RepoConvergenceService::new(test_events());
+        let wid = test_worker_id("w-failq");
+
+        svc.update_required_repos(&wid, vec!["repo-a".into()], vec![])
+            .await;
+
+        // Exhaust budgets.
+        for _ in 0..MAX_CONVERGENCE_ATTEMPTS {
+            let _ = svc
+                .record_convergence_attempt(&wid, 0, 1, 0, 10_000, Some("fail".into()))
+                .await;
+        }
+
+        assert_eq!(svc.get_drift_state(&wid).await, ConvergenceDriftState::Failed);
+
+        // State is still fully queryable.
+        let ws = svc.get_worker_state(&wid).await;
+        assert!(ws.is_some(), "Failed worker state must still be queryable");
+        let ws = ws.unwrap();
+        assert_eq!(ws.current_state, ConvergenceDriftState::Failed);
+        assert_eq!(ws.attempt_budget_remaining, 0);
+        assert!(!ws.missing_repos.is_empty());
+    }
+
+    /// AC4: Stale worker (no convergence data) returns Stale, which callers
+    /// interpret as fail-open.
+    #[tokio::test]
+    async fn test_fail_open_unknown_worker_returns_stale() {
+        let _guard = test_guard!();
+        let svc = RepoConvergenceService::new(test_events());
+        let wid = test_worker_id("w-unknown");
+
+        // Never registered — should return Stale.
+        assert_eq!(
+            svc.get_drift_state(&wid).await,
+            ConvergenceDriftState::Stale,
+            "Unknown worker should return Stale (fail-open)"
+        );
+
+        // get_worker_state returns None for unknown workers.
+        assert!(svc.get_worker_state(&wid).await.is_none());
+
+        // has_budget returns true for unknown workers (budgets not consumed).
+        assert!(
+            svc.has_budget(&wid).await,
+            "Unknown worker should have budget (never consumed)"
+        );
+    }
+
+    /// AC4: Failed worker can recover when repo set changes — budgets reset
+    /// on transition to Ready.
+    #[tokio::test]
+    async fn test_fail_open_failed_worker_recovers_on_repo_change() {
+        let _guard = test_guard!();
+        let svc = RepoConvergenceService::new(test_events());
+        let wid = test_worker_id("w-recover");
+
+        svc.update_required_repos(&wid, vec!["repo-a".into()], vec![])
+            .await;
+
+        // Drive to Failed.
+        for _ in 0..MAX_CONVERGENCE_ATTEMPTS {
+            let _ = svc
+                .record_convergence_attempt(&wid, 0, 1, 0, 1_000, Some("fail".into()))
+                .await;
+        }
+        assert_eq!(svc.get_drift_state(&wid).await, ConvergenceDriftState::Failed);
+
+        // Expire hysteresis.
+        let expired = Instant::now() - Duration::from_millis(STATE_HYSTERESIS_MS + 100);
+        svc.set_last_transition_at(wid.as_str(), Some(expired))
+            .await;
+
+        // Update with all repos synced → Ready.
+        svc.update_required_repos(&wid, vec!["repo-b".into()], vec!["repo-b".into()])
+            .await;
+
+        assert_eq!(
+            svc.get_drift_state(&wid).await,
+            ConvergenceDriftState::Ready,
+            "Failed worker should recover to Ready when repos change"
+        );
+
+        // Budgets should be reset.
+        let ws = svc.get_worker_state(&wid).await.unwrap();
+        assert_eq!(ws.attempt_budget_remaining, MAX_CONVERGENCE_ATTEMPTS);
+        assert_eq!(ws.time_budget_remaining_ms, CONVERGENCE_TIME_BUDGET_SECS * 1000);
+    }
+
+    /// AC4: Stale detection + recovery — Ready worker goes Stale after
+    /// staleness threshold, then recovers on status update.
+    #[tokio::test]
+    async fn test_fail_open_stale_detection_and_recovery() {
+        let _guard = test_guard!();
+        let svc = RepoConvergenceService::new(test_events());
+        let wid = test_worker_id("w-stale-rec");
+
+        // Set up Ready worker.
+        svc.update_required_repos(&wid, vec!["repo-a".into()], vec!["repo-a".into()])
+            .await;
+        assert_eq!(svc.get_drift_state(&wid).await, ConvergenceDriftState::Ready);
+
+        // Backdate last status check to trigger staleness.
+        let old_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
+            - ((STALENESS_THRESHOLD_SECS as i64 + 60) * 1000);
+        svc.set_last_status_check_unix_ms(wid.as_str(), old_ms)
+            .await;
+
+        // Expire hysteresis so check_staleness can transition.
+        let expired = Instant::now() - Duration::from_millis(STATE_HYSTERESIS_MS + 100);
+        svc.set_last_transition_at(wid.as_str(), Some(expired))
+            .await;
+
+        svc.check_staleness().await;
+        assert_eq!(
+            svc.get_drift_state(&wid).await,
+            ConvergenceDriftState::Stale,
+            "Worker should be Stale after staleness threshold"
+        );
+
+        // Expire hysteresis again for recovery.
+        svc.set_last_transition_at(wid.as_str(), Some(expired))
+            .await;
+
+        // Refresh status → Ready.
+        svc.update_required_repos(&wid, vec!["repo-a".into()], vec!["repo-a".into()])
+            .await;
+        assert_eq!(
+            svc.get_drift_state(&wid).await,
+            ConvergenceDriftState::Ready,
+            "Stale worker should recover to Ready on fresh status update"
+        );
+    }
+
+    // ── bd-vvmd.3.8 AC5: Structured Log / Event Verification Tests ────
+
+    /// AC5: Verify transition events contain scenario-identifying fields.
+    #[tokio::test]
+    async fn test_structured_event_contains_scenario_fields() {
+        let _guard = test_guard!();
+        let events = test_events();
+        let mut rx = events.subscribe();
+        let svc = RepoConvergenceService::new(events);
+        let wid = test_worker_id("w-log");
+
+        // Trigger a state transition.
+        svc.update_required_repos(&wid, vec!["repo-a".into()], vec![])
+            .await;
+
+        // Read emitted event.
+        let msg = rx.try_recv().expect("Should receive state_changed event");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&msg).expect("Event should be valid JSON");
+
+        // Verify required structured fields.
+        assert_eq!(parsed["event"], "repo_convergence.state_changed");
+        let data = &parsed["data"];
+        assert_eq!(data["from_state"], "stale", "Must include from_state");
+        assert_eq!(data["to_state"], "drifting", "Must include to_state");
+        assert!(
+            data["reason_code"].is_string(),
+            "Must include reason_code"
+        );
+        assert!(
+            data["transitioned_at_unix_ms"].is_number(),
+            "Must include timestamp"
+        );
+    }
+
+    /// AC5: Convergence outcome events include decision-relevant fields.
+    #[tokio::test]
+    async fn test_structured_outcome_event_contains_decision_fields() {
+        let _guard = test_guard!();
+        let events = test_events();
+        let mut rx = events.subscribe();
+        let svc = RepoConvergenceService::new(events);
+        let wid = test_worker_id("w-outcome-log");
+
+        svc.update_required_repos(&wid, vec!["repo-a".into()], vec![])
+            .await;
+        // Drain the state_changed event.
+        let _ = rx.try_recv();
+
+        // Record a convergence attempt.
+        svc.record_convergence_attempt(&wid, 0, 1, 0, 5_000, Some("ssh_timeout".into()))
+            .await
+            .unwrap();
+
+        // There should be a state_changed event (Drifting→Drifting is no-op, so
+        // no transition event), but there IS an outcome event.
+        let msg = rx.try_recv().expect("Should receive outcome event");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&msg).expect("Event should be valid JSON");
+
+        assert_eq!(parsed["event"], "repo_convergence.outcome");
+        let data = &parsed["data"];
+        assert_eq!(data["worker_id"], "w-outcome-log");
+        assert_eq!(data["synced_count"], 0);
+        assert_eq!(data["failed_count"], 1);
+        assert_eq!(data["duration_ms"], 5_000);
+        assert_eq!(data["reason_code"], "sync_failed_retryable");
+        assert_eq!(data["failure"], "ssh_timeout");
+        assert!(data["emitted_at_unix_ms"].is_number());
+    }
+
+    /// AC5: Verify transition history captures scenario-level audit trail.
+    #[tokio::test]
+    async fn test_structured_transition_history_audit_trail() {
+        let _guard = test_guard!();
+        let svc = RepoConvergenceService::new(test_events());
+        let wid = test_worker_id("w-audit");
+
+        // Drive through: Stale→Drifting→Converging→Ready.
+        svc.update_required_repos(&wid, vec!["repo-a".into()], vec![])
+            .await;
+        svc.mark_converging(&wid).await;
+        svc.record_convergence_attempt(&wid, 1, 0, 0, 1_000, None)
+            .await
+            .unwrap();
+
+        let transitions = svc.get_worker_transitions(&wid).await;
+        assert_eq!(transitions.len(), 3, "Should have 3 transitions");
+
+        // Transition 1: Stale→Drifting.
+        assert_eq!(transitions[0].from_state, ConvergenceDriftState::Stale);
+        assert_eq!(transitions[0].to_state, ConvergenceDriftState::Drifting);
+        assert_eq!(transitions[0].reason_code, "missing_1_repos");
+
+        // Transition 2: Drifting→Converging.
+        assert_eq!(transitions[1].from_state, ConvergenceDriftState::Drifting);
+        assert_eq!(transitions[1].to_state, ConvergenceDriftState::Converging);
+        assert_eq!(transitions[1].reason_code, "sync_started");
+
+        // Transition 3: Converging→Ready.
+        assert_eq!(transitions[2].from_state, ConvergenceDriftState::Converging);
+        assert_eq!(transitions[2].to_state, ConvergenceDriftState::Ready);
+        assert_eq!(transitions[2].reason_code, "sync_complete");
+
+        // All transitions have valid timestamps.
+        for t in &transitions {
+            assert!(t.transitioned_at_unix_ms > 0, "Timestamp must be set");
+        }
+    }
+
+    /// AC5: Failed convergence outcome includes remediation-relevant
+    /// information (budget exhaustion reason).
+    #[tokio::test]
+    async fn test_structured_failed_outcome_includes_remediation_info() {
+        let _guard = test_guard!();
+        let events = test_events();
+        let mut rx = events.subscribe();
+        let svc = RepoConvergenceService::new(events);
+        let wid = test_worker_id("w-remed");
+
+        svc.update_required_repos(&wid, vec!["repo-a".into()], vec![])
+            .await;
+        // Drain state_changed event.
+        let _ = rx.try_recv();
+
+        // Exhaust attempt budget.
+        for _ in 0..MAX_CONVERGENCE_ATTEMPTS {
+            let _ = svc
+                .record_convergence_attempt(&wid, 0, 1, 0, 1_000, Some("sync_error".into()))
+                .await;
+        }
+
+        // The last outcome should indicate budget exhaustion.
+        let outcomes = svc.get_recent_outcomes(1).await;
+        assert_eq!(outcomes.len(), 1);
+        let last = &outcomes[0];
+        assert_eq!(last.reason_code, "attempt_budget_exhausted");
+        assert_eq!(last.drift_state_after, ConvergenceDriftState::Failed);
+        assert!(last.failure.is_some());
+
+        // Verify the final outcome event is emitted with correct fields.
+        // Drain all events to find the last outcome event.
+        let mut last_outcome_event = None;
+        while let Ok(msg) = rx.try_recv() {
+            let parsed: serde_json::Value = serde_json::from_str(&msg).unwrap();
+            if parsed["event"] == "repo_convergence.outcome" {
+                last_outcome_event = Some(parsed);
+            }
+        }
+        let evt = last_outcome_event.expect("Should have outcome event");
+        assert_eq!(evt["data"]["reason_code"], "attempt_budget_exhausted");
+        assert_eq!(evt["data"]["drift_state_after"], "failed");
+    }
 }
