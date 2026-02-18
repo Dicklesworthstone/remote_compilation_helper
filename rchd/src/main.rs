@@ -24,6 +24,8 @@ mod http_api;
 mod metrics;
 mod reclaim;
 mod reload;
+#[allow(dead_code)] // Not yet wired into daemon main loop.
+mod repo_convergence;
 mod selection;
 mod self_test;
 mod telemetry;

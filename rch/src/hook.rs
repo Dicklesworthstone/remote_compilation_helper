@@ -8269,4 +8269,686 @@ mod tests {
         assert_eq!(plan.len(), 1, "only the primary root should remain");
         assert!(plan[0].is_primary, "surviving entry must be the primary root");
     }
+
+    // ── bd-3jjc.6: canonicalize_sync_root_for_plan() edge cases ─────────
+
+    #[test]
+    fn test_canonicalize_existing_path() {
+        let _guard = test_guard!();
+        let temp_dir = tempfile::tempdir_in("/data/projects").expect("create tempdir");
+        let dir = temp_dir.path().join("real_dir");
+        std::fs::create_dir_all(&dir).expect("create dir");
+
+        let result = canonicalize_sync_root_for_plan(&dir);
+        // Should be a canonical absolute path containing the dir name.
+        assert!(result.is_absolute());
+        assert!(
+            result.to_string_lossy().contains("real_dir"),
+            "canonicalized path should contain dir name: {}",
+            result.display()
+        );
+    }
+
+    #[test]
+    fn test_canonicalize_nonexistent_path() {
+        let _guard = test_guard!();
+        let path = PathBuf::from("/data/projects/does_not_exist_xyz_12345");
+        let result = canonicalize_sync_root_for_plan(&path);
+        // Fallback: should return original path since normalize and canonicalize both fail.
+        assert_eq!(result, path);
+    }
+
+    #[test]
+    fn test_canonicalize_trailing_slash() {
+        let _guard = test_guard!();
+        let temp_dir = tempfile::tempdir_in("/data/projects").expect("create tempdir");
+        let dir = temp_dir.path().join("trail");
+        std::fs::create_dir_all(&dir).expect("create dir");
+
+        let with_trailing = PathBuf::from(format!("{}/", dir.display()));
+        let without_trailing = canonicalize_sync_root_for_plan(&dir);
+        let with_result = canonicalize_sync_root_for_plan(&with_trailing);
+        // Both should resolve to the same canonical path.
+        assert_eq!(with_result, without_trailing);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_canonicalize_symlink() {
+        let _guard = test_guard!();
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempfile::tempdir_in("/data/projects").expect("create tempdir");
+        let real_dir = temp_dir.path().join("real");
+        let link_dir = temp_dir.path().join("link");
+        std::fs::create_dir_all(&real_dir).expect("create real dir");
+        symlink(&real_dir, &link_dir).expect("create symlink");
+
+        let from_real = canonicalize_sync_root_for_plan(&real_dir);
+        let from_link = canonicalize_sync_root_for_plan(&link_dir);
+        assert_eq!(
+            from_real, from_link,
+            "symlink and real path should canonicalize to the same path"
+        );
+    }
+
+    #[test]
+    fn test_canonicalize_dp_alias() {
+        let _guard = test_guard!();
+        // /dp is an alias for /data/projects. If /dp symlink exists,
+        // canonicalization should resolve through it.
+        if Path::new("/dp").exists() {
+            let dp_path = PathBuf::from("/dp/remote_compilation_helper");
+            let canonical = PathBuf::from("/data/projects/remote_compilation_helper");
+            let result = canonicalize_sync_root_for_plan(&dp_path);
+            assert_eq!(
+                result, canonical,
+                "/dp alias should resolve to /data/projects"
+            );
+        }
+        // If /dp doesn't exist, test is effectively a no-op. That's OK —
+        // this is an environment-dependent test.
+    }
+
+    // ── bd-3jjc.7: is_within_sync_topology() edge cases ─────────────────
+
+    #[test]
+    fn test_topology_deeply_nested_accepted() {
+        let _guard = test_guard!();
+        let policy = rch_common::path_topology::PathTopologyPolicy::default();
+        let path = PathBuf::from("/data/projects/a/b/c/d/e/f/g");
+        assert!(
+            is_within_sync_topology(&path, &policy),
+            "deeply nested /data/projects subpaths should be accepted"
+        );
+    }
+
+    #[test]
+    fn test_topology_exact_root_match() {
+        let _guard = test_guard!();
+        let policy = rch_common::path_topology::PathTopologyPolicy::default();
+        // The exact root (/data/projects itself) should be accepted.
+        assert!(
+            is_within_sync_topology(Path::new("/data/projects"), &policy),
+            "/data/projects itself should be accepted"
+        );
+        assert!(
+            is_within_sync_topology(Path::new("/dp"), &policy),
+            "/dp itself should be accepted"
+        );
+    }
+
+    #[test]
+    fn test_topology_parent_of_root_rejected() {
+        let _guard = test_guard!();
+        let policy = rch_common::path_topology::PathTopologyPolicy::default();
+        assert!(
+            !is_within_sync_topology(Path::new("/data"), &policy),
+            "/data (parent of root) should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_topology_prefix_collision_rejected() {
+        let _guard = test_guard!();
+        let policy = rch_common::path_topology::PathTopologyPolicy::default();
+        // /data/projects_extra starts with /data/projects as a string prefix
+        // but is NOT a child path. Path::starts_with uses component-based matching.
+        assert!(
+            !is_within_sync_topology(Path::new("/data/projects_extra"), &policy),
+            "/data/projects_extra should be rejected (not a child path)"
+        );
+    }
+
+    #[test]
+    fn test_topology_empty_path_rejected() {
+        let _guard = test_guard!();
+        let policy = rch_common::path_topology::PathTopologyPolicy::default();
+        assert!(
+            !is_within_sync_topology(Path::new(""), &policy),
+            "empty path should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_topology_root_slash_rejected() {
+        let _guard = test_guard!();
+        let policy = rch_common::path_topology::PathTopologyPolicy::default();
+        assert!(
+            !is_within_sync_topology(Path::new("/"), &policy),
+            "root path (/) should be rejected"
+        );
+    }
+
+    // ── bd-3jjc.8: build_sync_closure_plan() edge cases ─────────────────
+
+    #[test]
+    fn test_plan_empty_sync_roots() {
+        let _guard = test_guard!();
+        let project_root = PathBuf::from("/data/projects/solo_project");
+        let plan = build_sync_closure_plan(&[], &project_root, "solo_hash");
+        assert_eq!(plan.len(), 1, "empty sync_roots should produce single primary entry");
+        assert!(plan[0].is_primary);
+        assert_eq!(plan[0].root_hash, "solo_hash");
+    }
+
+    #[test]
+    fn test_plan_primary_is_only_root() {
+        let _guard = test_guard!();
+        let temp_dir = tempfile::tempdir_in("/data/projects").expect("create tempdir");
+        let project_root = temp_dir.path().join("only");
+        std::fs::create_dir_all(&project_root).expect("create dir");
+
+        let plan = build_sync_closure_plan(
+            std::slice::from_ref(&project_root),
+            &project_root,
+            "only_hash",
+        );
+        assert_eq!(plan.len(), 1);
+        assert!(plan[0].is_primary);
+        assert_eq!(plan[0].root_hash, "only_hash");
+    }
+
+    #[test]
+    fn test_plan_large_root_set() {
+        let _guard = test_guard!();
+        let temp_dir = tempfile::tempdir_in("/data/projects").expect("create tempdir");
+        let project_root = temp_dir.path().join("main_proj");
+        std::fs::create_dir_all(&project_root).expect("create main");
+
+        let mut roots = Vec::new();
+        for i in 0..100u32 {
+            let dep = temp_dir.path().join(format!("dep_{i:04}"));
+            std::fs::create_dir_all(&dep).expect("create dep");
+            roots.push(dep);
+        }
+        roots.push(project_root.clone());
+
+        let start = std::time::Instant::now();
+        let plan = build_sync_closure_plan(&roots, &project_root, "large_hash");
+        let elapsed = start.elapsed();
+
+        // 100 deps + 1 primary (deduped) = 101 entries.
+        assert_eq!(plan.len(), 101);
+        assert!(elapsed.as_millis() < 500, "plan build took too long: {elapsed:?}");
+
+        // Verify lexicographic ordering.
+        for window in plan.windows(2) {
+            assert!(
+                window[0].local_root <= window[1].local_root,
+                "plan should be lexicographically ordered: {} > {}",
+                window[0].local_root.display(),
+                window[1].local_root.display(),
+            );
+        }
+    }
+
+    #[test]
+    fn test_plan_duplicate_roots_deduped() {
+        let _guard = test_guard!();
+        let temp_dir = tempfile::tempdir_in("/data/projects").expect("create tempdir");
+        let project_root = temp_dir.path().join("proj");
+        let dep = temp_dir.path().join("dep");
+        std::fs::create_dir_all(&project_root).expect("create proj");
+        std::fs::create_dir_all(&dep).expect("create dep");
+
+        let plan = build_sync_closure_plan(
+            &[dep.clone(), dep.clone(), dep.clone(), project_root.clone()],
+            &project_root,
+            "dup_hash",
+        );
+
+        // dep appears 3 times in input but should be deduped to 1 entry + primary = 2.
+        assert_eq!(plan.len(), 2, "duplicate roots should be deduped");
+    }
+
+    #[test]
+    fn test_plan_primary_via_dp_alias_canonical() {
+        let _guard = test_guard!();
+        // If /dp symlink exists, verify /dp/X resolves to /data/projects/X.
+        if Path::new("/dp").exists() {
+            let dp_path = PathBuf::from("/dp/remote_compilation_helper");
+            let canonical = PathBuf::from("/data/projects/remote_compilation_helper");
+            let plan = build_sync_closure_plan(&[], &dp_path, "dp_hash");
+            assert_eq!(plan.len(), 1);
+            assert!(plan[0].is_primary);
+            assert_eq!(
+                plan[0].local_root, canonical,
+                "primary via /dp alias should canonicalize"
+            );
+        }
+    }
+
+    #[test]
+    fn test_plan_entry_ordering_is_lexicographic() {
+        let _guard = test_guard!();
+        let temp_dir = tempfile::tempdir_in("/data/projects").expect("create tempdir");
+        let project_root = temp_dir.path().join("proj");
+        let dep_z = temp_dir.path().join("z_dep");
+        let dep_a = temp_dir.path().join("a_dep");
+        let dep_m = temp_dir.path().join("m_dep");
+        std::fs::create_dir_all(&project_root).expect("create proj");
+        std::fs::create_dir_all(&dep_z).expect("create dep_z");
+        std::fs::create_dir_all(&dep_a).expect("create dep_a");
+        std::fs::create_dir_all(&dep_m).expect("create dep_m");
+
+        let plan = build_sync_closure_plan(
+            &[dep_z, dep_a, dep_m, project_root.clone()],
+            &project_root,
+            "order_hash",
+        );
+
+        for window in plan.windows(2) {
+            assert!(
+                window[0].local_root <= window[1].local_root,
+                "entries must be lexicographically sorted"
+            );
+        }
+    }
+
+    // ── bd-3jjc.9: build_sync_closure_manifest() edge cases ─────────────
+
+    #[test]
+    fn test_manifest_empty_plan() {
+        let _guard = test_guard!();
+        let project_root = PathBuf::from("/data/projects/empty_proj");
+        let manifest = build_sync_closure_manifest(&[], &project_root);
+        assert_eq!(manifest.entries.len(), 0);
+        assert_eq!(manifest.project_root, "/data/projects/empty_proj");
+        assert_eq!(manifest.schema_version, "rch.sync_closure_manifest.v1");
+    }
+
+    #[test]
+    fn test_manifest_generated_at_is_recent() {
+        let _guard = test_guard!();
+        let temp_dir = tempfile::tempdir_in("/data/projects").expect("create tempdir");
+        let project_root = temp_dir.path().join("proj");
+        std::fs::create_dir_all(&project_root).expect("create proj");
+
+        let before_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let plan = build_sync_closure_plan(
+            std::slice::from_ref(&project_root),
+            &project_root,
+            "ts_hash",
+        );
+        let manifest = build_sync_closure_manifest(&plan, &project_root);
+        let after_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+
+        assert!(
+            manifest.generated_at_unix_ms >= before_ms,
+            "generated_at should be >= start time"
+        );
+        assert!(
+            manifest.generated_at_unix_ms <= after_ms,
+            "generated_at should be <= end time"
+        );
+    }
+
+    #[test]
+    fn test_manifest_order_field_sequential() {
+        let _guard = test_guard!();
+        let temp_dir = tempfile::tempdir_in("/data/projects").expect("create tempdir");
+        let project_root = temp_dir.path().join("proj");
+        std::fs::create_dir_all(&project_root).expect("create proj");
+
+        let mut roots = Vec::new();
+        for i in 0..10u32 {
+            let dep = temp_dir.path().join(format!("dep_{i:02}"));
+            std::fs::create_dir_all(&dep).expect("create dep");
+            roots.push(dep);
+        }
+        roots.push(project_root.clone());
+
+        let plan = build_sync_closure_plan(&roots, &project_root, "seq_hash");
+        let manifest = build_sync_closure_manifest(&plan, &project_root);
+
+        // Order field should be 1-indexed and sequential.
+        for (idx, entry) in manifest.entries.iter().enumerate() {
+            assert_eq!(
+                entry.order,
+                idx + 1,
+                "order should be 1-indexed sequential, got {} at position {}",
+                entry.order,
+                idx
+            );
+        }
+    }
+
+    #[test]
+    fn test_manifest_unicode_paths() {
+        let _guard = test_guard!();
+        // Use synthetic plan entries with unicode paths.
+        let entries = vec![
+            SyncClosurePlanEntry {
+                local_root: PathBuf::from("/data/projects/日本語プロジェクト"),
+                remote_root: "/data/projects/日本語プロジェクト".to_string(),
+                project_id: "日本語".to_string(),
+                root_hash: "unicode_hash".to_string(),
+                is_primary: true,
+            },
+        ];
+        let manifest = build_sync_closure_manifest(
+            &entries,
+            Path::new("/data/projects/日本語プロジェクト"),
+        );
+        assert_eq!(manifest.entries.len(), 1);
+        assert!(manifest.entries[0].local_root.contains("日本語"));
+
+        // Verify JSON serialization handles unicode.
+        let json = serde_json::to_string(&manifest).expect("should serialize unicode");
+        assert!(json.contains("日本語"));
+    }
+
+    #[test]
+    fn test_manifest_long_strings() {
+        let _guard = test_guard!();
+        let long_id = "x".repeat(10_000);
+        let long_hash = "h".repeat(10_000);
+        let entries = vec![
+            SyncClosurePlanEntry {
+                local_root: PathBuf::from("/data/projects/long_test"),
+                remote_root: "/data/projects/long_test".to_string(),
+                project_id: long_id.clone(),
+                root_hash: long_hash.clone(),
+                is_primary: true,
+            },
+        ];
+        let manifest = build_sync_closure_manifest(
+            &entries,
+            Path::new("/data/projects/long_test"),
+        );
+        assert_eq!(manifest.entries[0].project_id, long_id, "project_id should not be truncated");
+        assert_eq!(manifest.entries[0].root_hash, long_hash, "root_hash should not be truncated");
+    }
+
+    // ── bd-3jjc.10: SyncRootOutcome variant coverage ────────────────────
+
+    #[test]
+    fn test_sync_root_outcome_all_synced() {
+        let _guard = test_guard!();
+        let outcomes: Vec<SyncRootOutcome> = (0..5)
+            .map(|_| SyncRootOutcome::Synced)
+            .collect();
+        let non_synced = outcomes
+            .iter()
+            .filter(|o| !matches!(o, SyncRootOutcome::Synced))
+            .count();
+        assert_eq!(non_synced, 0);
+    }
+
+    #[test]
+    fn test_sync_root_outcome_all_failed() {
+        let _guard = test_guard!();
+        let outcomes: Vec<SyncRootOutcome> = (0..3)
+            .map(|i| SyncRootOutcome::Failed {
+                error: format!("error_{i}"),
+            })
+            .collect();
+        let failed_count = outcomes
+            .iter()
+            .filter(|o| matches!(o, SyncRootOutcome::Failed { .. }))
+            .count();
+        assert_eq!(failed_count, 3);
+
+        // Verify error messages are preserved.
+        let errors: Vec<&str> = outcomes
+            .iter()
+            .filter_map(|o| match o {
+                SyncRootOutcome::Failed { error } => Some(error.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(errors, vec!["error_0", "error_1", "error_2"]);
+    }
+
+    #[test]
+    fn test_sync_root_outcome_all_skipped() {
+        let _guard = test_guard!();
+        let outcomes: Vec<SyncRootOutcome> = (0..4)
+            .map(|i| SyncRootOutcome::Skipped {
+                reason: format!("reason_{i}"),
+            })
+            .collect();
+        let skipped_count = outcomes
+            .iter()
+            .filter(|o| matches!(o, SyncRootOutcome::Skipped { .. }))
+            .count();
+        assert_eq!(skipped_count, 4);
+    }
+
+    #[test]
+    fn test_sync_root_outcome_empty_collection() {
+        let _guard = test_guard!();
+        let outcomes: Vec<SyncRootOutcome> = vec![];
+        let synced = outcomes
+            .iter()
+            .filter(|o| matches!(o, SyncRootOutcome::Synced))
+            .count();
+        let failed = outcomes
+            .iter()
+            .filter(|o| matches!(o, SyncRootOutcome::Failed { .. }))
+            .count();
+        let skipped = outcomes
+            .iter()
+            .filter(|o| matches!(o, SyncRootOutcome::Skipped { .. }))
+            .count();
+        assert_eq!(synced, 0);
+        assert_eq!(failed, 0);
+        assert_eq!(skipped, 0);
+    }
+
+    #[test]
+    fn test_sync_root_outcome_mixed_with_reasons() {
+        let _guard = test_guard!();
+        let outcomes = vec![
+            SyncRootOutcome::Synced,
+            SyncRootOutcome::Synced,
+            SyncRootOutcome::Skipped {
+                reason: "stale".to_string(),
+            },
+            SyncRootOutcome::Failed {
+                error: "timeout".to_string(),
+            },
+            SyncRootOutcome::Skipped {
+                reason: "denied".to_string(),
+            },
+        ];
+
+        let synced = outcomes
+            .iter()
+            .filter(|o| matches!(o, SyncRootOutcome::Synced))
+            .count();
+        let failed = outcomes
+            .iter()
+            .filter(|o| matches!(o, SyncRootOutcome::Failed { .. }))
+            .count();
+        let skipped = outcomes
+            .iter()
+            .filter(|o| matches!(o, SyncRootOutcome::Skipped { .. }))
+            .count();
+
+        assert_eq!(synced, 2);
+        assert_eq!(failed, 1);
+        assert_eq!(skipped, 2);
+
+        // Verify reason extraction.
+        let skip_reasons: Vec<&str> = outcomes
+            .iter()
+            .filter_map(|o| match o {
+                SyncRootOutcome::Skipped { reason } => Some(reason.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(skip_reasons, vec!["stale", "denied"]);
+
+        let error_msgs: Vec<&str> = outcomes
+            .iter()
+            .filter_map(|o| match o {
+                SyncRootOutcome::Failed { error } => Some(error.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(error_msgs, vec!["timeout"]);
+    }
+
+    // ── bd-3jjc.13: E2E sync closure plan + manifest generation ─────────
+
+    #[test]
+    fn test_e2e_sync_closure_plan_and_manifest() {
+        let _guard = test_guard!();
+        let temp_dir = tempfile::tempdir_in("/data/projects").expect("create tempdir");
+        let primary = temp_dir.path().join("primary_project");
+        let dep_a = temp_dir.path().join("dep_a");
+        let dep_b = temp_dir.path().join("dep_b");
+        std::fs::create_dir_all(&primary).expect("create primary");
+        std::fs::create_dir_all(&dep_a).expect("create dep_a");
+        std::fs::create_dir_all(&dep_b).expect("create dep_b");
+
+        // Step 2: Build plan with valid deps + invalid /tmp dep.
+        let plan = build_sync_closure_plan(
+            &[
+                primary.clone(),
+                dep_a.clone(),
+                dep_b.clone(),
+                PathBuf::from("/tmp/invalid_dep"),
+            ],
+            &primary,
+            "e2e_hash",
+        );
+
+        // Step 3: 3 entries (primary, dep_a, dep_b), /tmp excluded.
+        assert_eq!(
+            plan.len(), 3,
+            "plan should have 3 entries (primary + 2 deps), got {}",
+            plan.len()
+        );
+        assert!(
+            !plan.iter().any(|e| e.local_root.to_string_lossy().contains("/tmp")),
+            "/tmp dep should be excluded by topology filter"
+        );
+
+        // Step 4: Verify lexicographic ordering.
+        for window in plan.windows(2) {
+            assert!(
+                window[0].local_root <= window[1].local_root,
+                "plan entries should be lexicographically sorted"
+            );
+        }
+
+        // Step 5: Primary entry has is_primary=true with correct hash.
+        let primary_entry = plan.iter().find(|e| e.is_primary).expect("primary must exist");
+        assert_eq!(primary_entry.root_hash, "e2e_hash");
+        let non_primary: Vec<_> = plan.iter().filter(|e| !e.is_primary).collect();
+        assert_eq!(non_primary.len(), 2, "should have 2 non-primary entries");
+
+        // Step 6-7: Generate manifest.
+        let before_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let manifest = build_sync_closure_manifest(&plan, &primary);
+        let after_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+
+        assert_eq!(manifest.schema_version, "rch.sync_closure_manifest.v1");
+        assert_eq!(manifest.entries.len(), 3);
+        assert!(manifest.generated_at_unix_ms >= before_ms);
+        assert!(manifest.generated_at_unix_ms <= after_ms);
+
+        // Step 8-9: JSON roundtrip.
+        let json = serde_json::to_string_pretty(&manifest).expect("serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse");
+        let entries = parsed["entries"].as_array().expect("entries array");
+        assert_eq!(entries.len(), 3);
+
+        // Step 10: Verify order fields are 1-indexed sequential.
+        for (idx, entry) in manifest.entries.iter().enumerate() {
+            assert_eq!(entry.order, idx + 1, "order should be 1-indexed sequential");
+            assert_eq!(entry.is_primary, plan[idx].is_primary);
+            assert_eq!(entry.root_hash, plan[idx].root_hash);
+        }
+    }
+
+    // ── bd-3jjc.15: E2E topology validation with symlinks ───────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn test_e2e_topology_validation_with_symlinks() {
+        let _guard = test_guard!();
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempfile::tempdir_in("/data/projects").expect("create tempdir");
+        let valid_root = temp_dir.path().join("valid_root");
+        let valid_sub = valid_root.join("sub");
+        std::fs::create_dir_all(&valid_sub).expect("create valid_root/sub");
+
+        let primary = temp_dir.path().join("primary");
+        std::fs::create_dir_all(&primary).expect("create primary");
+
+        // Create symlink alias within the same tempdir.
+        let alias_link = temp_dir.path().join("alias_for_valid");
+        symlink(&valid_root, &alias_link).expect("create symlink");
+
+        // Build plan with mixed valid/invalid/alias paths.
+        let plan = build_sync_closure_plan(
+            &[
+                valid_root.clone(),
+                alias_link.clone(),          // should dedup with valid_root
+                PathBuf::from("/tmp/should_reject"),
+                PathBuf::from("/home/fake/project"),
+                PathBuf::from("/var/lib/something"),
+                primary.clone(),
+            ],
+            &primary,
+            "topo_e2e_hash",
+        );
+
+        // Should contain primary + valid_root (deduped with alias) = 2 entries.
+        assert_eq!(
+            plan.len(), 2,
+            "plan should have 2 entries (primary + deduped valid_root), got {}",
+            plan.len()
+        );
+
+        // Verify /tmp, /home, /var paths were excluded.
+        for entry in &plan {
+            let path_str = entry.local_root.to_string_lossy();
+            assert!(
+                !path_str.starts_with("/tmp")
+                    && !path_str.starts_with("/home")
+                    && !path_str.starts_with("/var"),
+                "out-of-topology path should not appear in plan: {}",
+                path_str
+            );
+        }
+
+        // Verify alias was deduplicated (only one entry for valid_root).
+        let valid_canonical = std::fs::canonicalize(&valid_root).expect("canonicalize");
+        let matching_entries = plan
+            .iter()
+            .filter(|e| {
+                std::fs::canonicalize(&e.local_root)
+                    .map(|c| c == valid_canonical)
+                    .unwrap_or(false)
+            })
+            .count();
+        assert_eq!(
+            matching_entries, 1,
+            "symlink alias should be deduplicated with canonical path"
+        );
+
+        // Verify primary is present.
+        assert!(
+            plan.iter().any(|e| e.is_primary),
+            "primary root must always be in plan"
+        );
+    }
 }
