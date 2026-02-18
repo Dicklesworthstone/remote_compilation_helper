@@ -22,6 +22,7 @@ mod health;
 mod history;
 mod http_api;
 mod metrics;
+mod process_triage;
 mod reclaim;
 mod reload;
 mod repo_convergence;
