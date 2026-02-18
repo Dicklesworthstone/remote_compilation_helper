@@ -284,10 +284,7 @@ impl RepoConvergenceService {
     }
 
     /// Get state transitions for a specific worker.
-    pub async fn get_worker_transitions(
-        &self,
-        worker_id: &WorkerId,
-    ) -> Vec<DriftStateTransition> {
+    pub async fn get_worker_transitions(&self, worker_id: &WorkerId) -> Vec<DriftStateTransition> {
         let transitions = self.transitions.read().await;
         transitions
             .get(worker_id.as_str())
@@ -461,8 +458,7 @@ impl RepoConvergenceService {
         };
 
         // Emit event.
-        self.events
-            .emit("repo_convergence.outcome", &outcome);
+        self.events.emit("repo_convergence.outcome", &outcome);
 
         // Store outcome.
         let mut outcomes = self.outcomes.write().await;
@@ -595,9 +591,7 @@ impl RepoConvergenceService {
         self.events
             .emit("repo_convergence.state_changed", &transition);
 
-        let worker_transitions = transitions
-            .entry(worker_id.to_string())
-            .or_default();
+        let worker_transitions = transitions.entry(worker_id.to_string()).or_default();
         if worker_transitions.len() >= MAX_TRANSITION_HISTORY {
             worker_transitions.pop_front();
         }
@@ -642,11 +636,7 @@ mod tests {
         let ctx = RepoConvergenceService::compute_required_hull(&roots);
         assert_eq!(
             ctx.required_repos,
-            vec![
-                "/data/projects/a",
-                "/data/projects/b",
-                "/data/projects/c",
-            ]
+            vec!["/data/projects/a", "/data/projects/b", "/data/projects/c",]
         );
         assert_eq!(ctx.active_build_count, 4);
         assert!(ctx.hull_computed_at_unix_ms > 0);
@@ -770,14 +760,7 @@ mod tests {
             .await;
 
         let outcome = svc
-            .record_convergence_attempt(
-                &wid,
-                0,
-                1,
-                0,
-                100,
-                Some("rsync timeout".to_string()),
-            )
+            .record_convergence_attempt(&wid, 0, 1, 0, 100, Some("rsync timeout".to_string()))
             .await
             .unwrap();
         // Should stay Drifting (still has budget).
@@ -797,14 +780,7 @@ mod tests {
         // Exhaust attempt budget.
         for _ in 0..MAX_CONVERGENCE_ATTEMPTS {
             let _ = svc
-                .record_convergence_attempt(
-                    &wid,
-                    0,
-                    1,
-                    0,
-                    100,
-                    Some("auth failure".to_string()),
-                )
+                .record_convergence_attempt(&wid, 0, 1, 0, 100, Some("auth failure".to_string()))
                 .await;
         }
 
@@ -877,12 +853,8 @@ mod tests {
         let svc = RepoConvergenceService::new(test_events());
         let wid = test_worker_id("w9");
 
-        svc.update_required_repos(
-            &wid,
-            vec!["a".into(), "b".into()],
-            vec![],
-        )
-        .await;
+        svc.update_required_repos(&wid, vec!["a".into(), "b".into()], vec![])
+            .await;
 
         // Partial: 1 synced, 1 failed, no fatal error
         let outcome = svc
@@ -897,18 +869,10 @@ mod tests {
         let _guard = test_guard!();
         let svc = RepoConvergenceService::new(test_events());
 
-        svc.update_required_repos(
-            &test_worker_id("w10"),
-            vec!["r".into()],
-            vec!["r".into()],
-        )
-        .await;
-        svc.update_required_repos(
-            &test_worker_id("w11"),
-            vec!["r".into()],
-            vec![],
-        )
-        .await;
+        svc.update_required_repos(&test_worker_id("w10"), vec!["r".into()], vec!["r".into()])
+            .await;
+        svc.update_required_repos(&test_worker_id("w11"), vec!["r".into()], vec![])
+            .await;
 
         let all = svc.get_all_worker_states().await;
         assert_eq!(all.len(), 2);
@@ -961,16 +925,9 @@ mod tests {
             .await;
 
         // Consume one attempt.
-        svc.record_convergence_attempt(
-            &wid,
-            0,
-            1,
-            0,
-            100,
-            Some("fail".into()),
-        )
-        .await
-        .unwrap();
+        svc.record_convergence_attempt(&wid, 0, 1, 0, 100, Some("fail".into()))
+            .await
+            .unwrap();
 
         // Now succeed.
         svc.record_convergence_attempt(&wid, 1, 0, 0, 100, None)
@@ -1054,28 +1011,14 @@ mod tests {
 
         // Consume 2 of 3 attempts with large durations.
         for _ in 0..2 {
-            svc.record_convergence_attempt(
-                &wid,
-                0,
-                1,
-                0,
-                55_000,
-                Some("fail".into()),
-            )
-            .await
-            .unwrap();
+            svc.record_convergence_attempt(&wid, 0, 1, 0, 55_000, Some("fail".into()))
+                .await
+                .unwrap();
         }
 
         // Third attempt exhausts both attempt budget and time budget.
         let outcome = svc
-            .record_convergence_attempt(
-                &wid,
-                0,
-                1,
-                0,
-                55_000,
-                Some("fail".into()),
-            )
+            .record_convergence_attempt(&wid, 0, 1, 0, 55_000, Some("fail".into()))
             .await
             .unwrap();
         assert_eq!(outcome.drift_state_after, ConvergenceDriftState::Failed);
@@ -1211,15 +1154,20 @@ mod tests {
     #[test]
     fn test_hull_single_root() {
         let _guard = test_guard!();
-        let ctx = RepoConvergenceService::compute_required_hull(&[
-            "/data/projects/solo".to_string(),
-        ]);
+        let ctx =
+            RepoConvergenceService::compute_required_hull(&["/data/projects/solo".to_string()]);
         assert_eq!(ctx.required_repos, vec!["/data/projects/solo"]);
         assert_eq!(ctx.active_build_count, 1);
         // Context ID is timestamp-based, so just verify the format.
-        assert!(ctx.context_id.starts_with("hull-"), "context_id should start with 'hull-'");
+        assert!(
+            ctx.context_id.starts_with("hull-"),
+            "context_id should start with 'hull-'"
+        );
         let ts_part = &ctx.context_id["hull-".len()..];
-        assert!(ts_part.parse::<i64>().is_ok(), "context_id suffix should be a numeric timestamp");
+        assert!(
+            ts_part.parse::<i64>().is_ok(),
+            "context_id suffix should be a numeric timestamp"
+        );
     }
 
     #[test]
@@ -1244,7 +1192,10 @@ mod tests {
         let ctx = RepoConvergenceService::compute_required_hull(&roots);
         let elapsed = start.elapsed();
         assert_eq!(ctx.required_repos.len(), 500);
-        assert!(elapsed.as_millis() < 10, "hull computation took {elapsed:?}");
+        assert!(
+            elapsed.as_millis() < 10,
+            "hull computation took {elapsed:?}"
+        );
     }
 
     #[test]
@@ -1283,16 +1234,9 @@ mod tests {
             .await;
 
         // Consume 200000ms from 120000ms budget — should saturate at 0.
-        svc.record_convergence_attempt(
-            &wid,
-            0,
-            1,
-            0,
-            200_000,
-            Some("fail".into()),
-        )
-        .await
-        .unwrap();
+        svc.record_convergence_attempt(&wid, 0, 1, 0, 200_000, Some("fail".into()))
+            .await
+            .unwrap();
         let ws = svc.get_worker_state(&wid).await.unwrap();
         assert_eq!(ws.time_budget_remaining_ms, 0);
     }
@@ -1337,7 +1281,10 @@ mod tests {
             serde_json::from_str(&event_json).expect("event should be valid JSON");
         assert!(parsed.get("event").is_some(), "missing 'event' field");
         assert!(parsed.get("data").is_some(), "missing 'data' field");
-        assert!(parsed.get("timestamp").is_some(), "missing 'timestamp' field");
+        assert!(
+            parsed.get("timestamp").is_some(),
+            "missing 'timestamp' field"
+        );
     }
 
     #[tokio::test]
@@ -1357,11 +1304,16 @@ mod tests {
             .expect("should receive event")
             .expect("recv should succeed");
 
-        let parsed: serde_json::Value =
-            serde_json::from_str(&event_json).expect("valid JSON");
+        let parsed: serde_json::Value = serde_json::from_str(&event_json).expect("valid JSON");
         let data = parsed.get("data").expect("data field");
-        assert_eq!(data.get("from_state").and_then(|v| v.as_str()), Some("Stale"));
-        assert_eq!(data.get("to_state").and_then(|v| v.as_str()), Some("Drifting"));
+        assert_eq!(
+            data.get("from_state").and_then(|v| v.as_str()),
+            Some("Stale")
+        );
+        assert_eq!(
+            data.get("to_state").and_then(|v| v.as_str()),
+            Some("Drifting")
+        );
         assert!(data.get("reason_code").is_some());
     }
 
@@ -1374,21 +1326,13 @@ mod tests {
         let wid = test_worker_id("ev3");
 
         // First: Stale -> Ready (all synced) — emits event.
-        svc.update_required_repos(
-            &wid,
-            vec!["r".into()],
-            vec!["r".into()],
-        )
-        .await;
+        svc.update_required_repos(&wid, vec!["r".into()], vec!["r".into()])
+            .await;
         let _ = tokio::time::timeout(Duration::from_millis(50), rx.recv()).await;
 
         // Second: Ready -> Ready (same repos, no change) — should NOT emit.
-        svc.update_required_repos(
-            &wid,
-            vec!["r".into()],
-            vec!["r".into()],
-        )
-        .await;
+        svc.update_required_repos(&wid, vec!["r".into()], vec!["r".into()])
+            .await;
 
         let result = tokio::time::timeout(Duration::from_millis(50), rx.recv()).await;
         assert!(result.is_err(), "should NOT receive event on no-op");
@@ -1410,8 +1354,7 @@ mod tests {
             .expect("should receive event")
             .expect("recv should succeed");
 
-        let parsed: serde_json::Value =
-            serde_json::from_str(&event_json).expect("valid JSON");
+        let parsed: serde_json::Value = serde_json::from_str(&event_json).expect("valid JSON");
         assert_eq!(
             parsed.get("event").and_then(|v| v.as_str()),
             Some("repo_convergence.state_changed")
@@ -1436,12 +1379,8 @@ mod tests {
 
         // Immediately try Drifting → Ready (all synced). Should be BLOCKED
         // by hysteresis since <5s has elapsed since last transition.
-        svc.update_required_repos(
-            &wid,
-            vec!["r".into()],
-            vec!["r".into()],
-        )
-        .await;
+        svc.update_required_repos(&wid, vec!["r".into()], vec!["r".into()])
+            .await;
         // State should still be Drifting because hysteresis blocked it.
         assert_eq!(
             svc.get_drift_state(&wid).await,
@@ -1530,12 +1469,8 @@ mod tests {
             .await;
 
         // Now update_required_repos should allow Drifting → Ready.
-        svc.update_required_repos(
-            &wid,
-            vec!["r".into()],
-            vec!["r".into()],
-        )
-        .await;
+        svc.update_required_repos(&wid, vec!["r".into()], vec!["r".into()])
+            .await;
         assert_eq!(
             svc.get_drift_state(&wid).await,
             ConvergenceDriftState::Ready,
@@ -1554,7 +1489,10 @@ mod tests {
         // Initial state is Stale; update with missing repos → Drifting.
         svc.update_required_repos(&wid, vec!["r".into()], vec![])
             .await;
-        assert_eq!(svc.get_drift_state(&wid).await, ConvergenceDriftState::Drifting);
+        assert_eq!(
+            svc.get_drift_state(&wid).await,
+            ConvergenceDriftState::Drifting
+        );
 
         let transitions = svc.get_worker_transitions(&wid).await;
         assert_eq!(transitions.len(), 1);
@@ -1569,13 +1507,12 @@ mod tests {
         let wid = test_worker_id("sm2");
 
         // Initial state is Stale; all repos synced → Ready.
-        svc.update_required_repos(
-            &wid,
-            vec!["r".into()],
-            vec!["r".into()],
-        )
-        .await;
-        assert_eq!(svc.get_drift_state(&wid).await, ConvergenceDriftState::Ready);
+        svc.update_required_repos(&wid, vec!["r".into()], vec!["r".into()])
+            .await;
+        assert_eq!(
+            svc.get_drift_state(&wid).await,
+            ConvergenceDriftState::Ready
+        );
 
         let transitions = svc.get_worker_transitions(&wid).await;
         assert_eq!(transitions.len(), 1);
@@ -1594,7 +1531,10 @@ mod tests {
             .await;
         // Drifting → Converging via mark_converging.
         svc.mark_converging(&wid).await;
-        assert_eq!(svc.get_drift_state(&wid).await, ConvergenceDriftState::Converging);
+        assert_eq!(
+            svc.get_drift_state(&wid).await,
+            ConvergenceDriftState::Converging
+        );
 
         let transitions = svc.get_worker_transitions(&wid).await;
         assert_eq!(transitions.len(), 2);
@@ -1615,7 +1555,10 @@ mod tests {
         svc.record_convergence_attempt(&wid, 1, 0, 0, 10, None)
             .await
             .unwrap();
-        assert_eq!(svc.get_drift_state(&wid).await, ConvergenceDriftState::Ready);
+        assert_eq!(
+            svc.get_drift_state(&wid).await,
+            ConvergenceDriftState::Ready
+        );
     }
 
     #[tokio::test]
@@ -1629,13 +1572,14 @@ mod tests {
             .await;
         // Exhaust attempt budget → Failed.
         for _ in 0..MAX_CONVERGENCE_ATTEMPTS {
-            svc.record_convergence_attempt(
-                &wid, 0, 1, 0, 10, Some("fail".into()),
-            )
-            .await
-            .unwrap();
+            svc.record_convergence_attempt(&wid, 0, 1, 0, 10, Some("fail".into()))
+                .await
+                .unwrap();
         }
-        assert_eq!(svc.get_drift_state(&wid).await, ConvergenceDriftState::Failed);
+        assert_eq!(
+            svc.get_drift_state(&wid).await,
+            ConvergenceDriftState::Failed
+        );
     }
 
     #[tokio::test]
@@ -1648,13 +1592,19 @@ mod tests {
         svc.update_required_repos(&wid, vec!["r".into()], vec![])
             .await;
         svc.mark_converging(&wid).await;
-        assert_eq!(svc.get_drift_state(&wid).await, ConvergenceDriftState::Converging);
+        assert_eq!(
+            svc.get_drift_state(&wid).await,
+            ConvergenceDriftState::Converging
+        );
 
         // Converging → Ready via success.
         svc.record_convergence_attempt(&wid, 1, 0, 0, 10, None)
             .await
             .unwrap();
-        assert_eq!(svc.get_drift_state(&wid).await, ConvergenceDriftState::Ready);
+        assert_eq!(
+            svc.get_drift_state(&wid).await,
+            ConvergenceDriftState::Ready
+        );
     }
 
     #[tokio::test]
@@ -1670,12 +1620,13 @@ mod tests {
 
         // Converging → Drifting via failure with budget remaining.
         let outcome = svc
-            .record_convergence_attempt(
-                &wid, 0, 1, 0, 10, Some("fail".into()),
-            )
+            .record_convergence_attempt(&wid, 0, 1, 0, 10, Some("fail".into()))
             .await
             .unwrap();
-        assert_eq!(outcome.drift_state_before, ConvergenceDriftState::Converging);
+        assert_eq!(
+            outcome.drift_state_before,
+            ConvergenceDriftState::Converging
+        );
         assert_eq!(outcome.drift_state_after, ConvergenceDriftState::Drifting);
     }
 
@@ -1692,13 +1643,14 @@ mod tests {
 
         // Exhaust attempt budget from Converging → Failed.
         for _ in 0..MAX_CONVERGENCE_ATTEMPTS {
-            svc.record_convergence_attempt(
-                &wid, 0, 1, 0, 10, Some("fail".into()),
-            )
-            .await
-            .unwrap();
+            svc.record_convergence_attempt(&wid, 0, 1, 0, 10, Some("fail".into()))
+                .await
+                .unwrap();
         }
-        assert_eq!(svc.get_drift_state(&wid).await, ConvergenceDriftState::Failed);
+        assert_eq!(
+            svc.get_drift_state(&wid).await,
+            ConvergenceDriftState::Failed
+        );
     }
 
     #[tokio::test]
@@ -1708,13 +1660,12 @@ mod tests {
         let wid = test_worker_id("sm9");
 
         // Stale → Ready.
-        svc.update_required_repos(
-            &wid,
-            vec!["r".into()],
-            vec!["r".into()],
-        )
-        .await;
-        assert_eq!(svc.get_drift_state(&wid).await, ConvergenceDriftState::Ready);
+        svc.update_required_repos(&wid, vec!["r".into()], vec!["r".into()])
+            .await;
+        assert_eq!(
+            svc.get_drift_state(&wid).await,
+            ConvergenceDriftState::Ready
+        );
 
         // Expire hysteresis so update_required_repos can transition.
         let expired = Instant::now() - Duration::from_millis(STATE_HYSTERESIS_MS + 100);
@@ -1722,13 +1673,12 @@ mod tests {
             .await;
 
         // Ready → Drifting (new required repo missing).
-        svc.update_required_repos(
-            &wid,
-            vec!["r".into(), "new_repo".into()],
-            vec!["r".into()],
-        )
-        .await;
-        assert_eq!(svc.get_drift_state(&wid).await, ConvergenceDriftState::Drifting);
+        svc.update_required_repos(&wid, vec!["r".into(), "new_repo".into()], vec!["r".into()])
+            .await;
+        assert_eq!(
+            svc.get_drift_state(&wid).await,
+            ConvergenceDriftState::Drifting
+        );
     }
 
     #[tokio::test]
@@ -1740,12 +1690,8 @@ mod tests {
         let wid = test_worker_id("sm10");
 
         // Stale → Ready.
-        svc.update_required_repos(
-            &wid,
-            vec!["r".into()],
-            vec!["r".into()],
-        )
-        .await;
+        svc.update_required_repos(&wid, vec!["r".into()], vec!["r".into()])
+            .await;
         // Drain the transition event.
         let _ = tokio::time::timeout(Duration::from_millis(50), rx.recv()).await;
 
@@ -1755,17 +1701,19 @@ mod tests {
             .await;
 
         // Same repos, same state → no-op.
-        svc.update_required_repos(
-            &wid,
-            vec!["r".into()],
-            vec!["r".into()],
-        )
-        .await;
-        assert_eq!(svc.get_drift_state(&wid).await, ConvergenceDriftState::Ready);
+        svc.update_required_repos(&wid, vec!["r".into()], vec!["r".into()])
+            .await;
+        assert_eq!(
+            svc.get_drift_state(&wid).await,
+            ConvergenceDriftState::Ready
+        );
 
         // Verify no event emitted for no-op.
         let result = tokio::time::timeout(Duration::from_millis(50), rx.recv()).await;
-        assert!(result.is_err(), "no event should be emitted for Ready→Ready no-op");
+        assert!(
+            result.is_err(),
+            "no event should be emitted for Ready→Ready no-op"
+        );
     }
 
     #[tokio::test]
@@ -1778,13 +1726,14 @@ mod tests {
         svc.update_required_repos(&wid, vec!["r".into()], vec![])
             .await;
         for _ in 0..MAX_CONVERGENCE_ATTEMPTS {
-            svc.record_convergence_attempt(
-                &wid, 0, 1, 0, 10, Some("fail".into()),
-            )
-            .await
-            .unwrap();
+            svc.record_convergence_attempt(&wid, 0, 1, 0, 10, Some("fail".into()))
+                .await
+                .unwrap();
         }
-        assert_eq!(svc.get_drift_state(&wid).await, ConvergenceDriftState::Failed);
+        assert_eq!(
+            svc.get_drift_state(&wid).await,
+            ConvergenceDriftState::Failed
+        );
 
         // Expire hysteresis.
         let expired = Instant::now() - Duration::from_millis(STATE_HYSTERESIS_MS + 100);
@@ -1813,13 +1762,12 @@ mod tests {
         let wid = test_worker_id("sm12");
 
         // Start Ready.
-        svc.update_required_repos(
-            &wid,
-            vec!["r".into()],
-            vec!["r".into()],
-        )
-        .await;
-        assert_eq!(svc.get_drift_state(&wid).await, ConvergenceDriftState::Ready);
+        svc.update_required_repos(&wid, vec!["r".into()], vec!["r".into()])
+            .await;
+        assert_eq!(
+            svc.get_drift_state(&wid).await,
+            ConvergenceDriftState::Ready
+        );
 
         // Backdate status check to simulate staleness.
         let stale_time = SystemTime::now()
@@ -2058,12 +2006,18 @@ mod tests {
         let w3_outcome = svc
             .record_convergence_attempt(
                 &test_worker_id("w3"),
-                0, 1, 0, 50,
+                0,
+                1,
+                0,
+                50,
                 Some("ssh timeout".into()),
             )
             .await
             .unwrap();
-        assert_eq!(w3_outcome.drift_state_after, ConvergenceDriftState::Drifting);
+        assert_eq!(
+            w3_outcome.drift_state_after,
+            ConvergenceDriftState::Drifting
+        );
 
         // Step 7: w3 second attempt succeeds.
         let w3_outcome_2 = svc
@@ -2121,13 +2075,12 @@ mod tests {
         let wid = test_worker_id("stale_w1");
 
         // Step 1-2: Register Ready worker.
-        svc.update_required_repos(
-            &wid,
-            vec!["repo_a".into()],
-            vec!["repo_a".into()],
-        )
-        .await;
-        assert_eq!(svc.get_drift_state(&wid).await, ConvergenceDriftState::Ready);
+        svc.update_required_repos(&wid, vec!["repo_a".into()], vec!["repo_a".into()])
+            .await;
+        assert_eq!(
+            svc.get_drift_state(&wid).await,
+            ConvergenceDriftState::Ready
+        );
 
         // Step 3: Backdate last_status_check_unix_ms to >300s ago.
         let stale_ms = SystemTime::now()
@@ -2157,12 +2110,8 @@ mod tests {
             .await;
 
         // Refresh via update_required_repos → Ready (all synced).
-        svc.update_required_repos(
-            &wid,
-            vec!["repo_a".into()],
-            vec!["repo_a".into()],
-        )
-        .await;
+        svc.update_required_repos(&wid, vec!["repo_a".into()], vec!["repo_a".into()])
+            .await;
         assert_eq!(
             svc.get_drift_state(&wid).await,
             ConvergenceDriftState::Ready,
@@ -2177,10 +2126,19 @@ mod tests {
             .iter()
             .position(|t| t.to_state == ConvergenceDriftState::Stale)
             .expect("should have Stale transition");
-        assert_eq!(transitions[stale_idx].from_state, ConvergenceDriftState::Ready);
+        assert_eq!(
+            transitions[stale_idx].from_state,
+            ConvergenceDriftState::Ready
+        );
         assert!(stale_idx + 1 < transitions.len());
-        assert_eq!(transitions[stale_idx + 1].from_state, ConvergenceDriftState::Stale);
-        assert_eq!(transitions[stale_idx + 1].to_state, ConvergenceDriftState::Ready);
+        assert_eq!(
+            transitions[stale_idx + 1].from_state,
+            ConvergenceDriftState::Stale
+        );
+        assert_eq!(
+            transitions[stale_idx + 1].to_state,
+            ConvergenceDriftState::Ready
+        );
     }
 
     // ── bd-3jjc.14: E2E concurrent convergence stress test ──────────────
@@ -2215,11 +2173,9 @@ mod tests {
                         .await
                         .unwrap();
                 } else {
-                    svc.record_convergence_attempt(
-                        &wid, 0, 1, 0, 10, Some("fail".into()),
-                    )
-                    .await
-                    .unwrap();
+                    svc.record_convergence_attempt(&wid, 0, 1, 0, 10, Some("fail".into()))
+                        .await
+                        .unwrap();
                 }
             }));
         }
@@ -2235,7 +2191,8 @@ mod tests {
 
         // Step 4c: Even → Ready, Odd → Drifting.
         for ws in &all {
-            let idx: u32 = ws.worker_id
+            let idx: u32 = ws
+                .worker_id
                 .strip_prefix("stress_")
                 .unwrap()
                 .parse()
@@ -2286,14 +2243,21 @@ mod tests {
             vec![], // missing
         )
         .await;
-        assert_eq!(svc.get_drift_state(&wid).await, ConvergenceDriftState::Drifting);
+        assert_eq!(
+            svc.get_drift_state(&wid).await,
+            ConvergenceDriftState::Drifting
+        );
 
         // Steps 2-7: Exhaust attempt budget via mark_converging + fail cycle.
         for attempt in 1..=MAX_CONVERGENCE_ATTEMPTS {
             svc.mark_converging(&wid).await;
             let outcome = svc
                 .record_convergence_attempt(
-                    &wid, 0, 1, 0, 40_000,
+                    &wid,
+                    0,
+                    1,
+                    0,
+                    40_000,
                     Some(format!("attempt {attempt} failed")),
                 )
                 .await
@@ -2315,7 +2279,10 @@ mod tests {
         }
 
         // Verify Failed + budgets exhausted.
-        assert_eq!(svc.get_drift_state(&wid).await, ConvergenceDriftState::Failed);
+        assert_eq!(
+            svc.get_drift_state(&wid).await,
+            ConvergenceDriftState::Failed
+        );
         let ws = svc.get_worker_state(&wid).await.unwrap();
         assert_eq!(ws.attempt_budget_remaining, 0);
 
@@ -2346,7 +2313,10 @@ mod tests {
             .unwrap();
 
         // Step 11: Verify Ready + budgets reset.
-        assert_eq!(svc.get_drift_state(&wid).await, ConvergenceDriftState::Ready);
+        assert_eq!(
+            svc.get_drift_state(&wid).await,
+            ConvergenceDriftState::Ready
+        );
         let ws = svc.get_worker_state(&wid).await.unwrap();
         assert_eq!(ws.attempt_budget_remaining, MAX_CONVERGENCE_ATTEMPTS);
     }

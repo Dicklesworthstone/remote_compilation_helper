@@ -175,6 +175,8 @@ pub enum SelectionReason {
     AllWorkersBusy,
     /// All candidate workers failed hard preflight checks.
     AllWorkersFailedPreflight,
+    /// All candidate workers failed repo convergence checks (repos missing/stale/failed).
+    AllWorkersFailedConvergence,
     /// No workers match required tags or preferences.
     NoMatchingWorkers,
     /// No workers have the required runtime (e.g., Bun, Node).
@@ -196,6 +198,9 @@ impl std::fmt::Display for SelectionReason {
             Self::AllCircuitsOpen => write!(f, "all worker circuits open"),
             Self::AllWorkersBusy => write!(f, "all workers at capacity"),
             Self::AllWorkersFailedPreflight => write!(f, "all workers failed preflight checks"),
+            Self::AllWorkersFailedConvergence => {
+                write!(f, "all workers failed repo convergence checks")
+            }
             Self::NoMatchingWorkers => write!(f, "no matching workers found"),
             Self::NoWorkersWithRuntime(rt) => write!(f, "no workers with {} installed", rt),
             Self::SelectionError(e) => write!(f, "selection error: {}", e),
@@ -2898,6 +2903,10 @@ mod tests {
             "\"all_workers_failed_preflight\""
         );
         assert_eq!(
+            serde_json::to_string(&SelectionReason::AllWorkersFailedConvergence).unwrap(),
+            "\"all_workers_failed_convergence\""
+        );
+        assert_eq!(
             serde_json::to_string(&SelectionReason::NoMatchingWorkers).unwrap(),
             "\"no_matching_workers\""
         );
@@ -2927,6 +2936,10 @@ mod tests {
             serde_json::from_str::<SelectionReason>("\"all_workers_failed_preflight\"").unwrap(),
             SelectionReason::AllWorkersFailedPreflight
         );
+        assert_eq!(
+            serde_json::from_str::<SelectionReason>("\"all_workers_failed_convergence\"").unwrap(),
+            SelectionReason::AllWorkersFailedConvergence
+        );
     }
 
     #[test]
@@ -2951,6 +2964,10 @@ mod tests {
         assert_eq!(
             SelectionReason::AllWorkersFailedPreflight.to_string(),
             "all workers failed preflight checks"
+        );
+        assert_eq!(
+            SelectionReason::AllWorkersFailedConvergence.to_string(),
+            "all workers failed repo convergence checks"
         );
         assert_eq!(
             SelectionReason::SelectionError("oops".to_string()).to_string(),

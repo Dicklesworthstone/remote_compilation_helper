@@ -397,6 +397,8 @@ pub struct WorkerScoreBreakdown {
     pub priority_score: f64,
     /// Circuit state at selection time.
     pub circuit_state: String,
+    /// Repo convergence drift state at selection time (if convergence service is wired).
+    pub convergence_state: Option<String>,
     /// Whether this worker was selected.
     pub selected: bool,
     /// Reason if skipped (e.g., "no slots", "circuit open").
@@ -526,6 +528,8 @@ pub struct WorkerSelector {
     pub audit_log: Arc<RwLock<SelectionAuditLog>>,
     /// Optional admission gate for disk-pressure risk evaluation (bd-vvmd.4.4).
     pub admission_gate: Option<Arc<AdmissionGate>>,
+    /// Optional repo convergence service for pre-build freshness checks (bd-vvmd.3.3).
+    pub repo_convergence: Option<Arc<crate::repo_convergence::RepoConvergenceService>>,
 }
 
 /// Result of worker selection with reason.
@@ -563,6 +567,7 @@ impl WorkerSelector {
             selection_history: Arc::new(RwLock::new(SelectionHistory::new())),
             audit_log: Arc::new(RwLock::new(SelectionAuditLog::default())),
             admission_gate: None,
+            repo_convergence: None,
         }
     }
 
@@ -575,12 +580,21 @@ impl WorkerSelector {
             selection_history: Arc::new(RwLock::new(SelectionHistory::new())),
             audit_log: Arc::new(RwLock::new(SelectionAuditLog::default())),
             admission_gate: None,
+            repo_convergence: None,
         }
     }
 
     /// Set the admission gate for disk-pressure risk evaluation (bd-vvmd.4.4).
     pub fn set_admission_gate(&mut self, gate: Arc<AdmissionGate>) {
         self.admission_gate = Some(gate);
+    }
+
+    /// Set the repo convergence service for pre-build freshness checks (bd-vvmd.3.3).
+    pub fn set_repo_convergence(
+        &mut self,
+        svc: Arc<crate::repo_convergence::RepoConvergenceService>,
+    ) {
+        self.repo_convergence = Some(svc);
     }
 
     /// Get a read-only view of the audit log entries.
@@ -945,6 +959,14 @@ impl WorkerSelector {
 
             let selected = selected_id == Some(worker_id.as_str());
 
+            // Query convergence state for audit trail (bd-vvmd.3.3)
+            let convergence_state = if let Some(ref convergence_svc) = self.repo_convergence {
+                let wid = rch_common::WorkerId::new(worker_id.as_str());
+                Some(convergence_svc.get_drift_state(&wid).await.to_string())
+            } else {
+                None
+            };
+
             breakdowns.push(WorkerScoreBreakdown {
                 worker_id,
                 total_score: speed_score * slot_availability, // Simplified total
@@ -953,6 +975,7 @@ impl WorkerSelector {
                 cache_affinity,
                 priority_score,
                 circuit_state: format!("{:?}", circuit_state),
+                convergence_state,
                 selected,
                 skip_reason,
             });
@@ -1117,6 +1140,7 @@ impl WorkerSelector {
         let mut preferred_without_health: Vec<(Arc<WorkerState>, CircuitState)> = Vec::new();
         let mut filtered_by_health = 0usize;
         let mut filtered_by_hard_preflight = 0usize;
+        let mut filtered_by_convergence = 0usize;
         let mut any_has_runtime = false;
 
         for worker in workers {
@@ -1176,6 +1200,60 @@ impl WorkerSelector {
 
             let mut passes_preflight = true;
             let mut hard_preflight_block = false;
+
+            // Filter by repo convergence state (bd-vvmd.3.3)
+            //
+            // When a convergence service is wired, check whether the candidate
+            // worker has the required repos present and fresh.  Workers with
+            // Failed or Stale convergence are soft-excluded (still available for
+            // fail-open fallback).  Workers actively Converging are soft-excluded
+            // to avoid racing with an in-progress sync.  Drifting workers are
+            // allowed with a debug warning since partial freshness may suffice.
+            if let Some(ref convergence_svc) = self.repo_convergence {
+                let wid = rch_common::WorkerId::new(worker_id.as_str());
+                let drift_state = convergence_svc.get_drift_state(&wid).await;
+                match drift_state {
+                    crate::repo_convergence::ConvergenceDriftState::Ready => {
+                        // All repos present and fresh — passes check.
+                    }
+                    crate::repo_convergence::ConvergenceDriftState::Drifting => {
+                        // Some repos stale but may still work; allow with warning.
+                        debug!(
+                            "Worker {} convergence drifting: some repos may be stale",
+                            worker_id
+                        );
+                    }
+                    crate::repo_convergence::ConvergenceDriftState::Converging => {
+                        // Active sync in progress — hard exclude to avoid racing.
+                        debug!(
+                            "Worker {} excluded: repo convergence sync in progress",
+                            worker_id
+                        );
+                        passes_preflight = false;
+                        hard_preflight_block = true;
+                        filtered_by_convergence += 1;
+                    }
+                    crate::repo_convergence::ConvergenceDriftState::Failed => {
+                        // Convergence failed after exhausting budgets — hard exclude.
+                        debug!(
+                            "Worker {} excluded: repo convergence failed (budgets exhausted)",
+                            worker_id
+                        );
+                        passes_preflight = false;
+                        hard_preflight_block = true;
+                        filtered_by_convergence += 1;
+                    }
+                    crate::repo_convergence::ConvergenceDriftState::Stale => {
+                        // No recent convergence data — fail-open: allow with warning.
+                        // Stale state means we don't know, so we let it through
+                        // to honor the fail-open philosophy.
+                        debug!(
+                            "Worker {} convergence stale: no recent status check, fail-open allows",
+                            worker_id
+                        );
+                    }
+                }
+            }
             if let Some(max_load) = self.config.max_load_per_core
                 && let Some(true) = capabilities.is_high_load(max_load)
             {
@@ -1322,12 +1400,25 @@ impl WorkerSelector {
             return Ok(eligible);
         }
 
-        // Hard preflight failures (for example topology invariants) must not
-        // fall back to unhealthy worker assignment; force fail-open local execution.
+        // Hard preflight failures (for example topology invariants or
+        // convergence failures) must not fall back to unhealthy worker
+        // assignment; force fail-open local execution.
         if filtered_by_hard_preflight > 0
             && preferred_without_health.is_empty()
             && eligible_without_health.is_empty()
         {
+            // Emit a convergence-specific reason when convergence was the
+            // dominant failure mode, so the hook can produce actionable
+            // diagnostics (bd-vvmd.3.3).
+            if filtered_by_convergence > 0 && filtered_by_convergence >= filtered_by_hard_preflight
+            {
+                debug!(
+                    "All candidate workers failed repo convergence checks (count={})",
+                    filtered_by_convergence
+                );
+                return Err(SelectionReason::AllWorkersFailedConvergence);
+            }
+
             debug!(
                 "All candidate workers failed hard preflight checks (count={})",
                 filtered_by_hard_preflight
@@ -3642,6 +3733,7 @@ mod tests {
             cache_affinity: 0.5,
             priority_score: 0.8,
             circuit_state: "Closed".to_string(),
+            convergence_state: None,
             selected: true,
             skip_reason: None,
         };
@@ -4356,6 +4448,297 @@ mod tests {
             assert!(log.last().is_none());
             assert!(log.get(1).is_none());
             assert!(log.last_n(5).is_empty());
+        }
+
+        // ====================================================================
+        // Convergence-aware selection tests (bd-vvmd.3.3)
+        // ====================================================================
+
+        fn make_convergence_svc() -> Arc<crate::repo_convergence::RepoConvergenceService> {
+            Arc::new(crate::repo_convergence::RepoConvergenceService::new(
+                crate::events::EventBus::new(64),
+            ))
+        }
+
+        fn make_selection_request(project: &str) -> SelectionRequest {
+            SelectionRequest {
+                project: project.to_string(),
+                command: Some("cargo build".to_string()),
+                command_priority: CommandPriority::Normal,
+                estimated_cores: 1,
+                preferred_workers: vec![],
+                toolchain: None,
+                required_runtime: RequiredRuntime::default(),
+                classification_duration_us: None,
+                hook_pid: None,
+            }
+        }
+
+        #[tokio::test]
+        async fn test_convergence_ready_worker_selected() {
+            // Worker with Ready convergence state should be eligible.
+            let pool = WorkerPool::new();
+            pool.add_worker(make_worker("w1", 8, 80.0).config.read().await.clone())
+                .await;
+
+            let convergence = make_convergence_svc();
+            let wid = WorkerId::new("w1");
+            // Set worker to Ready state.
+            convergence
+                .update_required_repos(&wid, vec!["repo-a".into()], vec!["repo-a".into()])
+                .await;
+
+            let mut selector = WorkerSelector::new();
+            selector.set_repo_convergence(convergence);
+
+            let request = make_selection_request("test-project");
+            let result = selector.select(&pool, &request).await;
+            assert!(result.worker.is_some(), "Ready worker should be selected");
+            assert_eq!(result.reason, SelectionReason::Success);
+        }
+
+        #[tokio::test]
+        async fn test_convergence_drifting_worker_still_eligible() {
+            // Worker with Drifting convergence should still be eligible (warning only).
+            let pool = WorkerPool::new();
+            pool.add_worker(make_worker("w1", 8, 80.0).config.read().await.clone())
+                .await;
+
+            let convergence = make_convergence_svc();
+            let wid = WorkerId::new("w1");
+            // Set worker to Drifting state (some repos missing).
+            convergence
+                .update_required_repos(
+                    &wid,
+                    vec!["repo-a".into(), "repo-b".into()],
+                    vec!["repo-a".into()], // repo-b is missing
+                )
+                .await;
+
+            let mut selector = WorkerSelector::new();
+            selector.set_repo_convergence(convergence);
+
+            let request = make_selection_request("test-project");
+            let result = selector.select(&pool, &request).await;
+            assert!(
+                result.worker.is_some(),
+                "Drifting worker should still be eligible"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_convergence_failed_worker_excluded() {
+            // Worker with Failed convergence should be soft-excluded.
+            // With only one worker that fails convergence and no fallback pool,
+            // we should get AllWorkersFailedConvergence.
+            let pool = WorkerPool::new();
+            pool.add_worker(make_worker("w1", 8, 80.0).config.read().await.clone())
+                .await;
+
+            let convergence = make_convergence_svc();
+            let wid = WorkerId::new("w1");
+            // Set initial state and then record enough failures to enter Failed.
+            convergence
+                .update_required_repos(
+                    &wid,
+                    vec!["repo-a".into()],
+                    vec![], // missing
+                )
+                .await;
+
+            // Exhaust attempt budget to trigger Failed state.
+            for _ in 0..3 {
+                let _ = convergence
+                    .record_convergence_attempt(&wid, 0, 1, 0, 10_000, Some("ssh_timeout".into()))
+                    .await;
+            }
+
+            // Verify the worker is now in Failed state.
+            let drift = convergence.get_drift_state(&wid).await;
+            assert_eq!(
+                drift,
+                crate::repo_convergence::ConvergenceDriftState::Failed
+            );
+
+            let mut selector = WorkerSelector::new();
+            selector.set_repo_convergence(convergence);
+
+            let request = make_selection_request("test-project");
+            let result = selector.select(&pool, &request).await;
+            assert!(
+                result.worker.is_none(),
+                "Failed convergence worker should not be selected"
+            );
+            assert_eq!(result.reason, SelectionReason::AllWorkersFailedConvergence);
+        }
+
+        #[tokio::test]
+        async fn test_convergence_converging_worker_excluded() {
+            // Worker actively syncing should be soft-excluded.
+            let pool = WorkerPool::new();
+            pool.add_worker(make_worker("w1", 8, 80.0).config.read().await.clone())
+                .await;
+
+            let convergence = make_convergence_svc();
+            let wid = WorkerId::new("w1");
+            convergence.mark_converging(&wid).await;
+
+            let drift = convergence.get_drift_state(&wid).await;
+            assert_eq!(
+                drift,
+                crate::repo_convergence::ConvergenceDriftState::Converging
+            );
+
+            let mut selector = WorkerSelector::new();
+            selector.set_repo_convergence(convergence);
+
+            let request = make_selection_request("test-project");
+            let result = selector.select(&pool, &request).await;
+            assert!(
+                result.worker.is_none(),
+                "Converging worker should be excluded"
+            );
+            assert_eq!(result.reason, SelectionReason::AllWorkersFailedConvergence);
+        }
+
+        #[tokio::test]
+        async fn test_convergence_stale_worker_fail_open() {
+            // Worker with Stale convergence (no data) should be allowed (fail-open).
+            let pool = WorkerPool::new();
+            pool.add_worker(make_worker("w1", 8, 80.0).config.read().await.clone())
+                .await;
+
+            let convergence = make_convergence_svc();
+            // Don't set any state for w1 — it defaults to Stale.
+            let wid = WorkerId::new("w1");
+            let drift = convergence.get_drift_state(&wid).await;
+            assert_eq!(drift, crate::repo_convergence::ConvergenceDriftState::Stale);
+
+            let mut selector = WorkerSelector::new();
+            selector.set_repo_convergence(convergence);
+
+            let request = make_selection_request("test-project");
+            let result = selector.select(&pool, &request).await;
+            assert!(
+                result.worker.is_some(),
+                "Stale convergence should fail-open and allow selection"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_convergence_mixed_workers_prefers_ready() {
+            // With two workers, one Ready and one Failed, only the Ready one
+            // should be selected.
+            let pool = WorkerPool::new();
+            pool.add_worker(make_worker("w-ready", 8, 80.0).config.read().await.clone())
+                .await;
+            pool.add_worker(
+                make_worker("w-failed", 16, 95.0)
+                    .config
+                    .read()
+                    .await
+                    .clone(),
+            )
+            .await;
+
+            let convergence = make_convergence_svc();
+
+            // w-ready: all repos present
+            let wid_ready = WorkerId::new("w-ready");
+            convergence
+                .update_required_repos(&wid_ready, vec!["repo-x".into()], vec!["repo-x".into()])
+                .await;
+
+            // w-failed: convergence failed
+            let wid_failed = WorkerId::new("w-failed");
+            convergence
+                .update_required_repos(&wid_failed, vec!["repo-x".into()], vec![])
+                .await;
+            for _ in 0..3 {
+                let _ = convergence
+                    .record_convergence_attempt(
+                        &wid_failed,
+                        0,
+                        1,
+                        0,
+                        10_000,
+                        Some("timeout".into()),
+                    )
+                    .await;
+            }
+
+            let mut selector = WorkerSelector::new();
+            selector.set_repo_convergence(convergence);
+
+            let request = make_selection_request("test-project");
+            let result = selector.select(&pool, &request).await;
+            assert!(result.worker.is_some());
+            let selected_id = result
+                .worker
+                .unwrap()
+                .config
+                .read()
+                .await
+                .id
+                .as_str()
+                .to_string();
+            assert_eq!(
+                selected_id, "w-ready",
+                "Should select Ready worker, not the Failed one"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_convergence_no_service_wired_all_eligible() {
+            // When no convergence service is configured, all workers pass.
+            let pool = WorkerPool::new();
+            pool.add_worker(make_worker("w1", 8, 80.0).config.read().await.clone())
+                .await;
+            pool.add_worker(make_worker("w2", 8, 80.0).config.read().await.clone())
+                .await;
+
+            let selector = WorkerSelector::new();
+            // No convergence service set.
+
+            let request = make_selection_request("test-project");
+            let result = selector.select(&pool, &request).await;
+            assert!(
+                result.worker.is_some(),
+                "Without convergence service, workers should be eligible"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_convergence_audit_includes_state() {
+            // Verify that the audit log includes convergence_state when service
+            // is wired.
+            let pool = WorkerPool::new();
+            pool.add_worker(make_worker("w1", 8, 80.0).config.read().await.clone())
+                .await;
+
+            let convergence = make_convergence_svc();
+            let wid = WorkerId::new("w1");
+            convergence
+                .update_required_repos(&wid, vec!["repo-a".into()], vec!["repo-a".into()])
+                .await;
+
+            let mut selector = WorkerSelector::new();
+            selector.set_repo_convergence(convergence);
+
+            let request = make_selection_request("test-project");
+            let _ = selector.select(&pool, &request).await;
+
+            // Check audit log entry.
+            let entries = selector.get_audit_log(Some(1)).await;
+            assert!(!entries.is_empty(), "Should have audit log entry");
+            let entry = &entries[0];
+            assert!(!entry.workers_evaluated.is_empty());
+            let breakdown = &entry.workers_evaluated[0];
+            assert_eq!(
+                breakdown.convergence_state.as_deref(),
+                Some("ready"),
+                "Audit should include convergence state"
+            );
         }
     }
 }

@@ -3680,7 +3680,12 @@ async fn execute_remote_compilation(
                 }
                 .into());
             }
-            root_outcomes.push((entry, SyncRootOutcome::Skipped { reason: skip_reason }));
+            root_outcomes.push((
+                entry,
+                SyncRootOutcome::Skipped {
+                    reason: skip_reason,
+                },
+            ));
             continue;
         }
 
@@ -7981,7 +7986,11 @@ mod tests {
         let project_root = temp_dir.path().join("project");
         std::fs::create_dir_all(&project_root).expect("create project root");
 
-        let plan = build_sync_closure_plan(std::slice::from_ref(&project_root), &project_root, "deadbeef");
+        let plan = build_sync_closure_plan(
+            std::slice::from_ref(&project_root),
+            &project_root,
+            "deadbeef",
+        );
         let manifest = build_sync_closure_manifest(&plan, &project_root);
 
         assert_eq!(
@@ -8042,11 +8051,7 @@ mod tests {
         );
         let manifest = build_sync_closure_manifest(&plan, &project_root);
 
-        let primary_entries: Vec<_> = manifest
-            .entries
-            .iter()
-            .filter(|e| e.is_primary)
-            .collect();
+        let primary_entries: Vec<_> = manifest.entries.iter().filter(|e| e.is_primary).collect();
         assert_eq!(
             primary_entries.len(),
             1,
@@ -8068,7 +8073,8 @@ mod tests {
         std::fs::create_dir_all(&dep).expect("create dep");
 
         // Deliberately omit project_root from sync_roots list.
-        let plan = build_sync_closure_plan(std::slice::from_ref(&dep), &project_root, "hash_auto_add");
+        let plan =
+            build_sync_closure_plan(std::slice::from_ref(&dep), &project_root, "hash_auto_add");
         let has_primary = plan.iter().any(|e| e.is_primary);
         assert!(
             has_primary,
@@ -8153,8 +8159,8 @@ mod tests {
         );
         let manifest = build_sync_closure_manifest(&plan, &project_root);
 
-        let json = serde_json::to_string_pretty(&manifest)
-            .expect("manifest should serialize to JSON");
+        let json =
+            serde_json::to_string_pretty(&manifest).expect("manifest should serialize to JSON");
         assert!(
             json.contains("rch.sync_closure_manifest.v1"),
             "JSON must contain schema_version"
@@ -8239,11 +8245,15 @@ mod tests {
         // The plan should contain the primary root and valid dep, but NOT the invalid dep.
         let plan_paths: Vec<_> = plan.iter().map(|e| &e.local_root).collect();
         assert!(
-            plan_paths.iter().any(|p| p.starts_with("/data/projects/test_proj")),
+            plan_paths
+                .iter()
+                .any(|p| p.starts_with("/data/projects/test_proj")),
             "primary root must be in plan"
         );
         assert!(
-            plan_paths.iter().any(|p| p.starts_with("/data/projects/valid_dep")),
+            plan_paths
+                .iter()
+                .any(|p| p.starts_with("/data/projects/valid_dep")),
             "valid dependency root must be in plan"
         );
         assert!(
@@ -8260,14 +8270,13 @@ mod tests {
         let bad_dep_a = PathBuf::from("/home/user/dep_a");
         let bad_dep_b = PathBuf::from("/var/lib/dep_b");
 
-        let plan = build_sync_closure_plan(
-            &[bad_dep_a, bad_dep_b],
-            &project_root,
-            "lonely_hash",
-        );
+        let plan = build_sync_closure_plan(&[bad_dep_a, bad_dep_b], &project_root, "lonely_hash");
 
         assert_eq!(plan.len(), 1, "only the primary root should remain");
-        assert!(plan[0].is_primary, "surviving entry must be the primary root");
+        assert!(
+            plan[0].is_primary,
+            "surviving entry must be the primary root"
+        );
     }
 
     // ── bd-3jjc.6: canonicalize_sync_root_for_plan() edge cases ─────────
@@ -8427,7 +8436,11 @@ mod tests {
         let _guard = test_guard!();
         let project_root = PathBuf::from("/data/projects/solo_project");
         let plan = build_sync_closure_plan(&[], &project_root, "solo_hash");
-        assert_eq!(plan.len(), 1, "empty sync_roots should produce single primary entry");
+        assert_eq!(
+            plan.len(),
+            1,
+            "empty sync_roots should produce single primary entry"
+        );
         assert!(plan[0].is_primary);
         assert_eq!(plan[0].root_hash, "solo_hash");
     }
@@ -8470,7 +8483,10 @@ mod tests {
 
         // 100 deps + 1 primary (deduped) = 101 entries.
         assert_eq!(plan.len(), 101);
-        assert!(elapsed.as_millis() < 500, "plan build took too long: {elapsed:?}");
+        assert!(
+            elapsed.as_millis() < 500,
+            "plan build took too long: {elapsed:?}"
+        );
 
         // Verify lexicographic ordering.
         for window in plan.windows(2) {
@@ -8624,19 +8640,15 @@ mod tests {
     fn test_manifest_unicode_paths() {
         let _guard = test_guard!();
         // Use synthetic plan entries with unicode paths.
-        let entries = vec![
-            SyncClosurePlanEntry {
-                local_root: PathBuf::from("/data/projects/日本語プロジェクト"),
-                remote_root: "/data/projects/日本語プロジェクト".to_string(),
-                project_id: "日本語".to_string(),
-                root_hash: "unicode_hash".to_string(),
-                is_primary: true,
-            },
-        ];
-        let manifest = build_sync_closure_manifest(
-            &entries,
-            Path::new("/data/projects/日本語プロジェクト"),
-        );
+        let entries = vec![SyncClosurePlanEntry {
+            local_root: PathBuf::from("/data/projects/日本語プロジェクト"),
+            remote_root: "/data/projects/日本語プロジェクト".to_string(),
+            project_id: "日本語".to_string(),
+            root_hash: "unicode_hash".to_string(),
+            is_primary: true,
+        }];
+        let manifest =
+            build_sync_closure_manifest(&entries, Path::new("/data/projects/日本語プロジェクト"));
         assert_eq!(manifest.entries.len(), 1);
         assert!(manifest.entries[0].local_root.contains("日本語"));
 
@@ -8650,21 +8662,22 @@ mod tests {
         let _guard = test_guard!();
         let long_id = "x".repeat(10_000);
         let long_hash = "h".repeat(10_000);
-        let entries = vec![
-            SyncClosurePlanEntry {
-                local_root: PathBuf::from("/data/projects/long_test"),
-                remote_root: "/data/projects/long_test".to_string(),
-                project_id: long_id.clone(),
-                root_hash: long_hash.clone(),
-                is_primary: true,
-            },
-        ];
-        let manifest = build_sync_closure_manifest(
-            &entries,
-            Path::new("/data/projects/long_test"),
+        let entries = vec![SyncClosurePlanEntry {
+            local_root: PathBuf::from("/data/projects/long_test"),
+            remote_root: "/data/projects/long_test".to_string(),
+            project_id: long_id.clone(),
+            root_hash: long_hash.clone(),
+            is_primary: true,
+        }];
+        let manifest = build_sync_closure_manifest(&entries, Path::new("/data/projects/long_test"));
+        assert_eq!(
+            manifest.entries[0].project_id, long_id,
+            "project_id should not be truncated"
         );
-        assert_eq!(manifest.entries[0].project_id, long_id, "project_id should not be truncated");
-        assert_eq!(manifest.entries[0].root_hash, long_hash, "root_hash should not be truncated");
+        assert_eq!(
+            manifest.entries[0].root_hash, long_hash,
+            "root_hash should not be truncated"
+        );
     }
 
     // ── bd-3jjc.10: SyncRootOutcome variant coverage ────────────────────
@@ -8672,9 +8685,7 @@ mod tests {
     #[test]
     fn test_sync_root_outcome_all_synced() {
         let _guard = test_guard!();
-        let outcomes: Vec<SyncRootOutcome> = (0..5)
-            .map(|_| SyncRootOutcome::Synced)
-            .collect();
+        let outcomes: Vec<SyncRootOutcome> = (0..5).map(|_| SyncRootOutcome::Synced).collect();
         let non_synced = outcomes
             .iter()
             .filter(|o| !matches!(o, SyncRootOutcome::Synced))
@@ -8824,12 +8835,15 @@ mod tests {
 
         // Step 3: 3 entries (primary, dep_a, dep_b), /tmp excluded.
         assert_eq!(
-            plan.len(), 3,
+            plan.len(),
+            3,
             "plan should have 3 entries (primary + 2 deps), got {}",
             plan.len()
         );
         assert!(
-            !plan.iter().any(|e| e.local_root.to_string_lossy().contains("/tmp")),
+            !plan
+                .iter()
+                .any(|e| e.local_root.to_string_lossy().contains("/tmp")),
             "/tmp dep should be excluded by topology filter"
         );
 
@@ -8842,7 +8856,10 @@ mod tests {
         }
 
         // Step 5: Primary entry has is_primary=true with correct hash.
-        let primary_entry = plan.iter().find(|e| e.is_primary).expect("primary must exist");
+        let primary_entry = plan
+            .iter()
+            .find(|e| e.is_primary)
+            .expect("primary must exist");
         assert_eq!(primary_entry.root_hash, "e2e_hash");
         let non_primary: Vec<_> = plan.iter().filter(|e| !e.is_primary).collect();
         assert_eq!(non_primary.len(), 2, "should have 2 non-primary entries");
@@ -8901,7 +8918,7 @@ mod tests {
         let plan = build_sync_closure_plan(
             &[
                 valid_root.clone(),
-                alias_link.clone(),          // should dedup with valid_root
+                alias_link.clone(), // should dedup with valid_root
                 PathBuf::from("/tmp/should_reject"),
                 PathBuf::from("/home/fake/project"),
                 PathBuf::from("/var/lib/something"),
@@ -8913,7 +8930,8 @@ mod tests {
 
         // Should contain primary + valid_root (deduped with alias) = 2 entries.
         assert_eq!(
-            plan.len(), 2,
+            plan.len(),
+            2,
             "plan should have 2 entries (primary + deduped valid_root), got {}",
             plan.len()
         );
