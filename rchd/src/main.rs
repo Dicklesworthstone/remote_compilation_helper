@@ -11,6 +11,7 @@ mod api;
 mod benchmark_queue;
 mod benchmark_scheduler;
 mod cache_cleanup;
+mod cancellation;
 mod cleanup;
 mod config;
 #[cfg(test)]
@@ -127,6 +128,8 @@ pub struct DaemonContext {
     pub alert_manager: Arc<alerts::AlertManager>,
     /// Repo convergence service for worker fleet sync tracking.
     pub repo_convergence: Arc<repo_convergence::RepoConvergenceService>,
+    /// Cancellation orchestrator for deterministic build cancellation.
+    pub cancellation: Arc<cancellation::CancellationOrchestrator>,
     /// Daemon start time.
     pub started_at: Instant,
     /// Socket path (for status reporting).
@@ -412,6 +415,11 @@ async fn main() -> Result<()> {
         event_bus.clone(),
     ));
 
+    let cancellation_orchestrator = Arc::new(cancellation::CancellationOrchestrator::new(
+        cancellation::CancellationConfig::default(),
+        event_bus.clone(),
+    ));
+
     let context = DaemonContext {
         pool: worker_pool.clone(),
         worker_selector: worker_selector.clone(),
@@ -423,6 +431,7 @@ async fn main() -> Result<()> {
         self_test: self_test_service.clone(),
         alert_manager: alert_manager.clone(),
         repo_convergence,
+        cancellation: cancellation_orchestrator,
         started_at: Instant::now(),
         socket_path: cli.socket.to_string_lossy().to_string(),
         version: env!("CARGO_PKG_VERSION"),
@@ -744,6 +753,13 @@ mod tests {
         ))
     }
 
+    fn make_test_cancellation() -> Arc<cancellation::CancellationOrchestrator> {
+        Arc::new(cancellation::CancellationOrchestrator::new(
+            cancellation::CancellationConfig::default(),
+            EventBus::new(16),
+        ))
+    }
+
     fn make_test_benchmark_trigger(pool: workers::WorkerPool) -> BenchmarkTriggerHandle {
         let (scheduler, trigger) = BenchmarkScheduler::new(
             SchedulerConfig::default(),
@@ -844,6 +860,7 @@ mod tests {
             repo_convergence: Arc::new(repo_convergence::RepoConvergenceService::new(
                 EventBus::new(16),
             )),
+            cancellation: make_test_cancellation(),
             started_at,
             socket_path: "/tmp/test.sock".to_string(),
             version: "0.1.0-test",
@@ -893,6 +910,7 @@ mod tests {
             repo_convergence: Arc::new(repo_convergence::RepoConvergenceService::new(
                 EventBus::new(16),
             )),
+            cancellation: make_test_cancellation(),
             started_at,
             socket_path: rch_common::default_socket_path(),
             version: env!("CARGO_PKG_VERSION"),
@@ -943,6 +961,7 @@ mod tests {
             repo_convergence: Arc::new(repo_convergence::RepoConvergenceService::new(
                 EventBus::new(16),
             )),
+            cancellation: make_test_cancellation(),
             started_at: Instant::now(),
             socket_path: rch_common::default_socket_path(),
             version: "0.1.0",
@@ -977,6 +996,7 @@ mod tests {
             repo_convergence: Arc::new(repo_convergence::RepoConvergenceService::new(
                 EventBus::new(16),
             )),
+            cancellation: make_test_cancellation(),
             started_at: Instant::now(),
             socket_path: rch_common::default_socket_path(),
             version: "0.1.0",
@@ -1030,6 +1050,7 @@ mod tests {
             repo_convergence: Arc::new(repo_convergence::RepoConvergenceService::new(
                 EventBus::new(16),
             )),
+            cancellation: make_test_cancellation(),
             started_at,
             socket_path: rch_common::default_socket_path(),
             version: "0.1.0",
@@ -1081,6 +1102,7 @@ mod tests {
             repo_convergence: Arc::new(repo_convergence::RepoConvergenceService::new(
                 EventBus::new(16),
             )),
+            cancellation: make_test_cancellation(),
             started_at: Instant::now(),
             socket_path: rch_common::default_socket_path(),
             version: "0.1.0",

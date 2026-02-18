@@ -1,7 +1,6 @@
 //! Background cleanup for active builds with dead hooks.
 
 use crate::{DaemonContext, history::StuckDetectorSnapshot};
-use rch_common::WorkerId;
 use std::path::Path;
 use std::time::{Duration, Instant};
 use tokio::time::interval;
@@ -183,42 +182,17 @@ impl ActiveBuildCleanup {
                 evidence.confidence
             );
 
-            // Release slots
-            self.context
-                .pool
-                .release_slots(&WorkerId::new(&build.worker_id), build.slots)
-                .await;
-
-            // Cancel build in history
-            if self
+            // Delegate to CancellationOrchestrator for deterministic cleanup.
+            let _ = self
                 .context
-                .history
-                .cancel_active_build(build.id, None)
-                .is_some()
-                && !cfg!(test)
-            {
-                crate::metrics::dec_active_builds("remote");
-                crate::metrics::inc_build_total("cancelled", "remote");
-            }
-
-            // Emit event
-            self.context.events.emit(
-                "build_cancelled",
-                &serde_json::json!({
-                    "build_id": build.id,
-                    "project_id": build.project_id,
-                    "reason": "stuck_confidence_high",
-                    "confidence": evidence.confidence,
-                    "hook_alive": evidence.hook_alive,
-                    "heartbeat_stale": evidence.heartbeat_stale,
-                    "progress_stale": evidence.progress_stale,
-                    "heartbeat_age_secs": evidence.heartbeat_age_secs,
-                    "progress_age_secs": evidence.progress_age_secs,
-                    "build_age_secs": evidence.build_age_secs,
-                    "slots_owned": evidence.slots_owned,
-                    "worker_id": build.worker_id,
-                }),
-            );
+                .cancellation
+                .cancel_build(
+                    &self.context,
+                    build.id,
+                    crate::cancellation::CancelReason::StuckDetector,
+                    false,
+                )
+                .await;
         }
 
         let elapsed_ms = triage_started.elapsed().as_millis() as u64;

@@ -2502,30 +2502,6 @@ fn handle_budget() -> BudgetStatusResponse {
     budget::get_budget_status()
 }
 
-/// Send a signal to a process using the kill command.
-///
-/// Returns true if the signal was sent successfully, false otherwise.
-fn send_signal_to_process(pid: u32, force: bool) -> bool {
-    if pid == 0 {
-        return false;
-    }
-
-    let signal = if force { "KILL" } else { "TERM" };
-
-    // Use kill command which is available on all Unix systems
-    match std::process::Command::new("kill")
-        .arg(format!("-{}", signal))
-        .arg(pid.to_string())
-        .output()
-    {
-        Ok(output) => output.status.success(),
-        Err(e) => {
-            debug!("Failed to send {} signal to process {}: {}", signal, pid, e);
-            false
-        }
-    }
-}
-
 fn is_process_alive(pid: u32) -> bool {
     if pid == 0 {
         return false;
@@ -2543,129 +2519,23 @@ fn is_process_alive(pid: u32) -> bool {
 
 /// Handle a build cancellation request.
 ///
-/// Cancels an active build by:
-/// 1. Sending SIGTERM to the hook process (which propagates to remote)
-/// 2. Marking the build as cancelled in history
-/// 3. Releasing worker slots
+/// Delegates to the CancellationOrchestrator for deterministic state machine,
+/// bounded escalation (SIGTERM → remote kill → SIGKILL), and cleanup.
 async fn handle_cancel_build(
     ctx: &DaemonContext,
     build_id: u64,
     force: bool,
 ) -> CancelBuildResponse {
-    // Look up the active build
-    let active_build = match ctx.history.active_build(build_id) {
-        Some(build) => build,
-        None => {
-            return CancelBuildResponse {
-                status: "error".to_string(),
-                build_id,
-                worker_id: None,
-                project_id: None,
-                message: Some("Build not found or already completed".to_string()),
-                slots_released: 0,
-            };
-        }
-    };
-
-    let worker_id = active_build.worker_id.clone();
-    let project_id = active_build.project_id.clone();
-    let slots = active_build.slots;
-    let hook_pid = active_build.hook_pid;
-
-    // Send signal to the hook process
-    // SIGTERM for graceful, SIGKILL for force
-    if hook_pid > 0 && !send_signal_to_process(hook_pid, force) {
-        debug!("Failed to send signal to hook process {}", hook_pid);
-        // Process might have already exited, continue with cleanup
-    }
-
-    // Cancel the build in history (marks as cancelled with exit code 130)
-    if ctx.history.cancel_active_build(build_id, None).is_some() && !cfg!(test) {
-        metrics::dec_active_builds("remote");
-        metrics::inc_build_total("cancelled", "remote");
-    }
-
-    // Release worker slots
-    if let Some(worker) = ctx.pool.get(&WorkerId::new(&worker_id)).await {
-        worker.release_slots(slots).await;
-    }
-
-    CancelBuildResponse {
-        status: "cancelled".to_string(),
-        build_id,
-        worker_id: Some(worker_id),
-        project_id: Some(project_id),
-        message: Some(if force {
-            "Build forcefully terminated".to_string()
-        } else {
-            "Build cancellation signal sent".to_string()
-        }),
-        slots_released: slots,
-    }
+    ctx.cancellation
+        .cancel_build(ctx, build_id, crate::cancellation::CancelReason::User, force)
+        .await
 }
 
 /// Handle cancellation of all active builds.
+///
+/// Delegates to the CancellationOrchestrator for each active build.
 async fn handle_cancel_all_builds(ctx: &DaemonContext, force: bool) -> CancelAllBuildsResponse {
-    let active_builds = ctx.history.active_builds();
-
-    if active_builds.is_empty() {
-        return CancelAllBuildsResponse {
-            status: "ok".to_string(),
-            cancelled_count: 0,
-            cancelled: vec![],
-            message: Some("No active builds to cancel".to_string()),
-        };
-    }
-
-    let mut cancelled = Vec::with_capacity(active_builds.len());
-
-    for build in active_builds {
-        let build_id = build.id;
-        let worker_id = build.worker_id.clone();
-        let project_id = build.project_id.clone();
-        let slots = build.slots;
-        let hook_pid = build.hook_pid;
-
-        // Send signal to hook process
-        if hook_pid > 0 {
-            send_signal_to_process(hook_pid, force);
-        }
-
-        // Cancel in history
-        if ctx.history.cancel_active_build(build_id, None).is_some() && !cfg!(test) {
-            metrics::dec_active_builds("remote");
-            metrics::inc_build_total("cancelled", "remote");
-        }
-
-        // Release worker slots
-        if let Some(worker) = ctx.pool.get(&WorkerId::new(&worker_id)).await {
-            worker.release_slots(slots).await;
-        }
-
-        cancelled.push(CancelledBuildInfo {
-            build_id,
-            worker_id,
-            project_id,
-            slots_released: slots,
-        });
-    }
-
-    let cancelled_count = cancelled.len();
-
-    CancelAllBuildsResponse {
-        status: "ok".to_string(),
-        cancelled_count,
-        cancelled,
-        message: Some(format!(
-            "{} build(s) {}",
-            cancelled_count,
-            if force {
-                "forcefully terminated"
-            } else {
-                "cancelled"
-            }
-        )),
-    }
+    ctx.cancellation.cancel_all_builds(ctx, force).await
 }
 
 /// Handle a status request.
@@ -3164,6 +3034,10 @@ mod tests {
             benchmark_queue: Arc::new(BenchmarkQueue::new(ChronoDuration::minutes(5))),
             benchmark_trigger: make_test_benchmark_trigger(),
             repo_convergence: Arc::new(crate::repo_convergence::RepoConvergenceService::new(
+                events.clone(),
+            )),
+            cancellation: Arc::new(crate::cancellation::CancellationOrchestrator::new(
+                crate::cancellation::CancellationConfig::default(),
                 events.clone(),
             )),
             events,

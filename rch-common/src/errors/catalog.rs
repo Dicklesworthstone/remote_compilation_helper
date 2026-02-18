@@ -26,6 +26,7 @@
 //! | E019-E024  | Config/Closure     | Dependency-closure planner errors     |
 //! | E210-E219  | Worker/Storage     | Disk pressure and storage errors      |
 //! | E310-E319  | Build/Triage       | Process triage integration errors     |
+//! | E320-E325  | Build/Cancellation | Build cancellation lifecycle errors   |
 //!
 //! # Example
 //!
@@ -211,6 +212,20 @@ pub enum ErrorCode {
     /// Invalid process triage request (malformed input)
     ProcessTriageInvalidRequest,
 
+    // -- Cancellation (E320-E325) --
+    /// Graceful cancel signal dispatched
+    CancelGracefulSent,
+    /// Escalated to forced kill after timeout
+    CancelEscalatedKill,
+    /// Failed to kill remote process via SSH
+    CancelRemoteKillFailed,
+    /// Post-cancel cleanup encountered errors
+    CancelCleanupFailed,
+    /// Slots not properly released after cancel
+    CancelSlotLeak,
+    /// Cancellation exceeded policy time budget
+    CancelTimeoutExceeded,
+
     // =========================================================================
     // Transfer Errors (E400-E499)
     // =========================================================================
@@ -348,6 +363,14 @@ impl ErrorCode {
             Self::ProcessTriageTimeout => 315,
             Self::ProcessTriagePartialResult => 316,
             Self::ProcessTriageInvalidRequest => 317,
+
+            // Cancellation (320-325)
+            Self::CancelGracefulSent => 320,
+            Self::CancelEscalatedKill => 321,
+            Self::CancelRemoteKillFailed => 322,
+            Self::CancelCleanupFailed => 323,
+            Self::CancelSlotLeak => 324,
+            Self::CancelTimeoutExceeded => 325,
 
             // Transfer (400-499)
             Self::TransferRsyncFailed => 400,
@@ -518,6 +541,14 @@ impl ErrorCode {
                 "Process triage returned partial or incomplete results"
             }
             Self::ProcessTriageInvalidRequest => "Invalid process triage request",
+
+            // Cancellation
+            Self::CancelGracefulSent => "Graceful cancel signal dispatched",
+            Self::CancelEscalatedKill => "Escalated to forced kill after timeout",
+            Self::CancelRemoteKillFailed => "Failed to kill remote process via SSH",
+            Self::CancelCleanupFailed => "Post-cancel cleanup encountered errors",
+            Self::CancelSlotLeak => "Slots not properly released after cancel",
+            Self::CancelTimeoutExceeded => "Cancellation exceeded policy time budget",
 
             // Transfer
             Self::TransferRsyncFailed => "Rsync transfer failed",
@@ -907,6 +938,38 @@ impl ErrorCode {
                 "Check the contract schema version compatibility",
             ],
 
+            // Cancellation
+            Self::CancelGracefulSent => &[
+                "Graceful cancellation signal (SIGTERM) was sent to the build process",
+                "The build should terminate within the grace period",
+                "Use force cancel if the process does not respond",
+            ],
+            Self::CancelEscalatedKill => &[
+                "Build did not respond to graceful cancel within the grace period",
+                "SIGKILL was sent to forcefully terminate the process",
+                "Check worker for orphaned processes if this occurs frequently",
+            ],
+            Self::CancelRemoteKillFailed => &[
+                "SSH kill command to the remote worker failed",
+                "Verify SSH connectivity to the worker",
+                "Check that the remote process PID is still valid",
+            ],
+            Self::CancelCleanupFailed => &[
+                "Post-cancellation cleanup did not complete successfully",
+                "Check worker disk space and permissions",
+                "Verify remote working directory state manually",
+            ],
+            Self::CancelSlotLeak => &[
+                "Worker slots were not properly released after cancellation",
+                "Check worker slot accounting for inconsistencies",
+                "Restart the daemon if slot leak persists",
+            ],
+            Self::CancelTimeoutExceeded => &[
+                "Cancellation did not complete within the policy time budget",
+                "The build may still be running on the worker",
+                "Consider increasing cancellation timeouts or force-cancelling",
+            ],
+
             // Transfer
             Self::TransferRsyncFailed => &[
                 "Verify rsync is installed on both ends",
@@ -1050,6 +1113,13 @@ impl ErrorCode {
             | Self::ProcessTriagePartialResult
             | Self::ProcessTriageInvalidRequest => Some("https://rch.dev/docs/process-triage"),
 
+            Self::CancelGracefulSent
+            | Self::CancelEscalatedKill
+            | Self::CancelRemoteKillFailed
+            | Self::CancelCleanupFailed
+            | Self::CancelSlotLeak
+            | Self::CancelTimeoutExceeded => Some("https://rch.dev/docs/cancellation"),
+
             _ => match self.category() {
                 ErrorCategory::Config => Some("https://rch.dev/docs/config"),
                 ErrorCategory::Network => Some("https://rch.dev/docs/ssh"),
@@ -1141,6 +1211,13 @@ impl ErrorCode {
             Self::ProcessTriageTimeout,
             Self::ProcessTriagePartialResult,
             Self::ProcessTriageInvalidRequest,
+            // Cancellation
+            Self::CancelGracefulSent,
+            Self::CancelEscalatedKill,
+            Self::CancelRemoteKillFailed,
+            Self::CancelCleanupFailed,
+            Self::CancelSlotLeak,
+            Self::CancelTimeoutExceeded,
             // Transfer
             Self::TransferRsyncFailed,
             Self::TransferTimeout,
@@ -1495,6 +1572,17 @@ mod tests {
         assert_eq!(ErrorCode::ProcessTriageInvalidRequest.code_number(), 317);
     }
 
+    /// Contract test: cancellation error codes are stable.
+    #[test]
+    fn test_cancellation_error_codes_stable() {
+        assert_eq!(ErrorCode::CancelGracefulSent.code_number(), 320);
+        assert_eq!(ErrorCode::CancelEscalatedKill.code_number(), 321);
+        assert_eq!(ErrorCode::CancelRemoteKillFailed.code_number(), 322);
+        assert_eq!(ErrorCode::CancelCleanupFailed.code_number(), 323);
+        assert_eq!(ErrorCode::CancelSlotLeak.code_number(), 324);
+        assert_eq!(ErrorCode::CancelTimeoutExceeded.code_number(), 325);
+    }
+
     /// Contract test: new error codes belong to correct categories.
     #[test]
     fn test_new_error_codes_correct_categories() {
@@ -1524,6 +1612,16 @@ mod tests {
             ErrorCode::ProcessTriageInvalidRequest.category(),
             ErrorCategory::Build
         );
+
+        // Cancellation in Build range (E300-E399)
+        assert_eq!(
+            ErrorCode::CancelGracefulSent.category(),
+            ErrorCategory::Build
+        );
+        assert_eq!(
+            ErrorCode::CancelTimeoutExceeded.category(),
+            ErrorCategory::Build
+        );
     }
 
     /// Contract test: all new error codes have doc URLs pointing to correct sections.
@@ -1544,6 +1642,10 @@ mod tests {
         assert_eq!(
             ErrorCode::ProcessTriageTimeout.doc_url(),
             Some("https://rch.dev/docs/process-triage")
+        );
+        assert_eq!(
+            ErrorCode::CancelGracefulSent.doc_url(),
+            Some("https://rch.dev/docs/cancellation")
         );
     }
 
@@ -1576,10 +1678,10 @@ mod tests {
     fn test_total_error_code_count() {
         let total = ErrorCode::all().len();
         // 10 config + 12 path-dep/closure + 10 network + 10 worker + 8 storage
-        // + 10 build + 8 process-triage + 10 transfer + 10 internal = 88
+        // + 10 build + 8 process-triage + 6 cancellation + 10 transfer + 10 internal = 94
         assert!(
-            total >= 88,
-            "Expected at least 88 error codes (was {}); did a code get accidentally removed?",
+            total >= 94,
+            "Expected at least 94 error codes (was {}); did a code get accidentally removed?",
             total,
         );
     }

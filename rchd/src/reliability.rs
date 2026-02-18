@@ -25,6 +25,7 @@
 #![allow(dead_code)] // Integration wiring lands in follow-on beads.
 
 use crate::admission::AdmissionGate;
+use crate::cancellation::CancellationOrchestrator;
 use crate::disk_pressure::PressureState;
 use crate::process_triage::RemediationPipeline;
 use crate::repo_convergence::RepoConvergenceService;
@@ -77,15 +78,18 @@ pub struct SignalWeights {
     pub pressure: f64,
     /// Weight for process-triage remediation debt.
     pub process: f64,
+    /// Weight for cancellation frequency/escalation debt.
+    pub cancellation: f64,
 }
 
 impl Default for SignalWeights {
     fn default() -> Self {
         Self {
-            circuit: 0.35,
-            convergence: 0.25,
-            pressure: 0.25,
-            process: 0.15,
+            circuit: 0.30,
+            convergence: 0.22,
+            pressure: 0.22,
+            process: 0.13,
+            cancellation: 0.13,
         }
     }
 }
@@ -93,7 +97,7 @@ impl Default for SignalWeights {
 impl SignalWeights {
     /// Normalize weights so they sum to 1.0.
     fn normalized(&self) -> Self {
-        let sum = self.circuit + self.convergence + self.pressure + self.process;
+        let sum = self.circuit + self.convergence + self.pressure + self.process + self.cancellation;
         if sum <= 0.0 {
             return Self::default();
         }
@@ -102,6 +106,7 @@ impl SignalWeights {
             convergence: self.convergence / sum,
             pressure: self.pressure / sum,
             process: self.process / sum,
+            cancellation: self.cancellation / sum,
         }
     }
 }
@@ -181,6 +186,8 @@ pub struct SignalDebts {
     pub pressure_debt: f64,
     /// Process-triage remediation debt (0.0 = no actions, 1.0 = saturated).
     pub process_debt: f64,
+    /// Cancellation frequency/escalation debt (0.0 = none, 1.0 = saturated).
+    pub cancellation_debt: f64,
 }
 
 // ── Per-Worker Hysteresis ──────────────────────────────────────────────────
@@ -248,6 +255,8 @@ pub struct ReliabilityAggregator {
     admission: Option<Arc<AdmissionGate>>,
     /// Optional remediation pipeline.
     remediation: Option<Arc<RemediationPipeline>>,
+    /// Optional cancellation orchestrator.
+    cancellation: Option<Arc<CancellationOrchestrator>>,
 }
 
 impl ReliabilityAggregator {
@@ -259,6 +268,7 @@ impl ReliabilityAggregator {
             convergence: None,
             admission: None,
             remediation: None,
+            cancellation: None,
         }
     }
 
@@ -275,6 +285,11 @@ impl ReliabilityAggregator {
     /// Wire the remediation pipeline.
     pub fn set_remediation(&mut self, pipeline: Arc<RemediationPipeline>) {
         self.remediation = Some(pipeline);
+    }
+
+    /// Wire the cancellation orchestrator.
+    pub fn set_cancellation(&mut self, orch: Arc<CancellationOrchestrator>) {
+        self.cancellation = Some(orch);
     }
 
     /// Evaluate a single worker and return its reliability assessment.
@@ -303,18 +318,23 @@ impl ReliabilityAggregator {
         // 4. Process-triage remediation debt.
         let process_debt = self.compute_process_debt(worker_id).await;
 
+        // 5. Cancellation frequency/escalation debt.
+        let cancellation_debt = self.compute_cancellation_debt(worker_id).await;
+
         let signals = SignalDebts {
             circuit_debt,
             convergence_debt,
             pressure_debt,
             process_debt,
+            cancellation_debt,
         };
 
         // Weighted aggregation.
         let aggregated_debt = (weights.circuit * circuit_debt
             + weights.convergence * convergence_debt
             + weights.pressure * pressure_debt
-            + weights.process * process_debt)
+            + weights.process * process_debt
+            + weights.cancellation * cancellation_debt)
             .clamp(0.0, 1.0);
 
         // State machine transition with hysteresis.
@@ -324,7 +344,7 @@ impl ReliabilityAggregator {
 
         debug!(
             "Worker {} reliability: state={}, debt={:.3}, penalty={:.3}, exclude={}, \
-             circuit={:.2}, convergence={:.2}, pressure={:.2}, process={:.2}",
+             circuit={:.2}, convergence={:.2}, pressure={:.2}, process={:.2}, cancel={:.2}",
             worker_id,
             health_state,
             aggregated_debt,
@@ -334,6 +354,7 @@ impl ReliabilityAggregator {
             convergence_debt,
             pressure_debt,
             process_debt,
+            cancellation_debt,
         );
 
         ReliabilityAssessment {
@@ -445,6 +466,13 @@ impl ReliabilityAggregator {
         let action_churn = (state.total_actions as f64 * 0.02).min(0.2);
 
         (hard_term_debt + failure_debt + action_churn).clamp(0.0, 1.0)
+    }
+
+    async fn compute_cancellation_debt(&self, worker_id: &str) -> f64 {
+        let Some(ref orch) = self.cancellation else {
+            return 0.0; // Fail-open: no orchestrator → no debt.
+        };
+        orch.cancellation_debt(worker_id).await
     }
 
     // ── State Machine ─────────────────────────────────────────────────────
@@ -1034,14 +1062,16 @@ mod tests {
             convergence: 1.0,
             pressure: 1.0,
             process: 1.0,
+            cancellation: 1.0,
         };
         let normalized = weights.normalized();
         let sum = normalized.circuit
             + normalized.convergence
             + normalized.pressure
-            + normalized.process;
+            + normalized.process
+            + normalized.cancellation;
         assert!((sum - 1.0).abs() < f64::EPSILON);
-        assert!((normalized.circuit - 0.25).abs() < f64::EPSILON);
+        assert!((normalized.circuit - 0.2).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -1051,6 +1081,7 @@ mod tests {
             convergence: 0.0,
             pressure: 0.0,
             process: 0.0,
+            cancellation: 0.0,
         };
         let normalized = weights.normalized();
         // Should fall back to default.
@@ -1093,5 +1124,48 @@ mod tests {
         // Default pressure is Healthy.
         let debt = agg.compute_pressure_debt(&worker).await;
         assert!(debt < f64::EPSILON);
+    }
+
+    // ── Cancellation signal tests ────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_cancellation_no_orchestrator_zero_debt() {
+        let agg = ReliabilityAggregator::new(test_config());
+        let worker = make_worker("w1");
+
+        let assessment = agg.evaluate(&worker, "w1").await;
+        assert!(assessment.signals.cancellation_debt < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn test_cancellation_signal_included_in_aggregation() {
+        use crate::cancellation::{CancellationConfig, CancellationOrchestrator};
+
+        let orch = Arc::new(CancellationOrchestrator::new(
+            CancellationConfig::default(),
+            test_events(),
+        ));
+
+        let mut agg = ReliabilityAggregator::new(test_config());
+        agg.set_cancellation(orch.clone());
+
+        let worker = make_worker("w1");
+
+        // No cancellation history → debt should be 0.
+        let assessment = agg.evaluate(&worker, "w1").await;
+        assert!(assessment.signals.cancellation_debt < f64::EPSILON);
+        assert_eq!(assessment.health_state, WorkerHealthState::Healthy);
+    }
+
+    #[test]
+    fn test_signal_weights_five_signals_sum_to_one() {
+        let weights = SignalWeights::default();
+        let sum = weights.circuit + weights.convergence + weights.pressure
+            + weights.process + weights.cancellation;
+        assert!(
+            (sum - 1.0).abs() < f64::EPSILON,
+            "Default weights should sum to 1.0, got {}",
+            sum
+        );
     }
 }
