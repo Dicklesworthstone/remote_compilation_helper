@@ -24,7 +24,6 @@ mod http_api;
 mod metrics;
 mod reclaim;
 mod reload;
-#[allow(dead_code)] // Not yet wired into daemon main loop.
 mod repo_convergence;
 mod selection;
 mod self_test;
@@ -124,6 +123,8 @@ pub struct DaemonContext {
     pub self_test: Arc<SelfTestService>,
     /// Alert manager for worker health alerting.
     pub alert_manager: Arc<alerts::AlertManager>,
+    /// Repo convergence service for worker fleet sync tracking.
+    pub repo_convergence: Arc<repo_convergence::RepoConvergenceService>,
     /// Daemon start time.
     pub started_at: Instant,
     /// Socket path (for status reporting).
@@ -405,6 +406,10 @@ async fn main() -> Result<()> {
     };
     let alert_manager = Arc::new(alerts::AlertManager::new(alert_config));
 
+    let repo_convergence = Arc::new(repo_convergence::RepoConvergenceService::new(
+        event_bus.clone(),
+    ));
+
     let context = DaemonContext {
         pool: worker_pool.clone(),
         worker_selector: worker_selector.clone(),
@@ -415,6 +420,7 @@ async fn main() -> Result<()> {
         events: event_bus.clone(),
         self_test: self_test_service.clone(),
         alert_manager: alert_manager.clone(),
+        repo_convergence,
         started_at: Instant::now(),
         socket_path: cli.socket.to_string_lossy().to_string(),
         version: env!("CARGO_PKG_VERSION"),
@@ -823,6 +829,9 @@ mod tests {
             events: EventBus::new(16),
             self_test: make_test_self_test(pool.clone()),
             alert_manager: make_test_alert_manager(),
+            repo_convergence: Arc::new(repo_convergence::RepoConvergenceService::new(
+                EventBus::new(16),
+            )),
             started_at,
             socket_path: "/tmp/test.sock".to_string(),
             version: "0.1.0-test",
@@ -869,6 +878,9 @@ mod tests {
             events: EventBus::new(16),
             self_test: make_test_self_test(pool.clone()),
             alert_manager: make_test_alert_manager(),
+            repo_convergence: Arc::new(repo_convergence::RepoConvergenceService::new(
+                EventBus::new(16),
+            )),
             started_at,
             socket_path: rch_common::default_socket_path(),
             version: env!("CARGO_PKG_VERSION"),
@@ -916,6 +928,9 @@ mod tests {
             events: EventBus::new(16),
             self_test: make_test_self_test(pool.clone()),
             alert_manager: make_test_alert_manager(),
+            repo_convergence: Arc::new(repo_convergence::RepoConvergenceService::new(
+                EventBus::new(16),
+            )),
             started_at: Instant::now(),
             socket_path: rch_common::default_socket_path(),
             version: "0.1.0",
@@ -947,6 +962,9 @@ mod tests {
             events: EventBus::new(16),
             self_test: make_test_self_test(pool.clone()),
             alert_manager: make_test_alert_manager(),
+            repo_convergence: Arc::new(repo_convergence::RepoConvergenceService::new(
+                EventBus::new(16),
+            )),
             started_at: Instant::now(),
             socket_path: rch_common::default_socket_path(),
             version: "0.1.0",
@@ -997,6 +1015,9 @@ mod tests {
             events: EventBus::new(16),
             self_test: make_test_self_test(pool.clone()),
             alert_manager: make_test_alert_manager(),
+            repo_convergence: Arc::new(repo_convergence::RepoConvergenceService::new(
+                EventBus::new(16),
+            )),
             started_at,
             socket_path: rch_common::default_socket_path(),
             version: "0.1.0",
@@ -1045,6 +1066,9 @@ mod tests {
             events: EventBus::new(16),
             self_test: make_test_self_test(pool.clone()),
             alert_manager: make_test_alert_manager(),
+            repo_convergence: Arc::new(repo_convergence::RepoConvergenceService::new(
+                EventBus::new(16),
+            )),
             started_at: Instant::now(),
             socket_path: rch_common::default_socket_path(),
             version: "0.1.0",

@@ -122,7 +122,7 @@ impl WorkerConvergenceState {
     }
 
     /// Compute drift confidence score (0.0 = fully converged, 1.0 = fully drifted).
-    fn drift_confidence(&self) -> f64 {
+    pub(crate) fn drift_confidence(&self) -> f64 {
         if self.required_repos.is_empty() {
             return 0.0;
         }
@@ -534,6 +534,49 @@ impl RepoConvergenceService {
                 );
             }
         }
+    }
+
+    /// Operator repair: force-reset a worker's convergence state to Drifting
+    /// with fresh budgets. Bypasses hysteresis since this is a deliberate action.
+    ///
+    /// Returns the previous drift state, or `None` if the worker is not tracked.
+    pub async fn repair_worker(&self, worker_id: &WorkerId) -> Option<ConvergenceDriftState> {
+        let mut state = self.state.write().await;
+        let entry = state.get_mut(worker_id.as_str())?;
+
+        let old_state = entry.current_state;
+
+        // Reset synced repos to force Drifting, reset budgets.
+        entry.synced_repos.clear();
+        entry.missing_repos = entry.required_repos.clone();
+        entry.reset_budgets();
+
+        let new_state = if entry.required_repos.is_empty() {
+            ConvergenceDriftState::Ready
+        } else {
+            ConvergenceDriftState::Drifting
+        };
+
+        if new_state != old_state {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or_default();
+
+            let mut transitions = self.transitions.write().await;
+            self.record_transition_locked(
+                &mut transitions,
+                worker_id.as_str(),
+                old_state,
+                new_state,
+                "operator_repair",
+                now_ms,
+            );
+            entry.current_state = new_state;
+            entry.last_transition_at = Some(std::time::Instant::now());
+        }
+
+        Some(old_state)
     }
 
     /// Check if convergence budgets allow another attempt for a worker.
@@ -1802,7 +1845,7 @@ mod tests {
         for i in 0..10u32 {
             let svc = svc.clone();
             handles.push(tokio::spawn(async move {
-                let wid = WorkerId::new(&format!("conc_w{i}"));
+                let wid = WorkerId::new(format!("conc_w{i}"));
                 svc.update_required_repos(
                     &wid,
                     vec!["r".into()],
@@ -1894,7 +1937,7 @@ mod tests {
             handles.push(tokio::spawn(async move {
                 if i < 5 {
                     // Mutate.
-                    let wid = WorkerId::new(&format!("snap{i}"));
+                    let wid = WorkerId::new(format!("snap{i}"));
                     svc.record_convergence_attempt(&wid, 1, 0, 0, 1, None)
                         .await
                         .ok();
@@ -1927,7 +1970,7 @@ mod tests {
         for i in 0..50u32 {
             let svc = svc.clone();
             handles.push(tokio::spawn(async move {
-                let wid = WorkerId::new(&format!("hc{i}"));
+                let wid = WorkerId::new(format!("hc{i}"));
                 svc.record_convergence_attempt(&wid, 1, 0, 0, 1, None)
                     .await
                     .unwrap();
@@ -2155,7 +2198,7 @@ mod tests {
         for i in 0..20u32 {
             let svc = svc.clone();
             handles.push(tokio::spawn(async move {
-                let wid = WorkerId::new(&format!("stress_{i:02}"));
+                let wid = WorkerId::new(format!("stress_{i:02}"));
                 // Register with missing repos.
                 svc.update_required_repos(
                     &wid,
@@ -2197,7 +2240,7 @@ mod tests {
                 .unwrap()
                 .parse()
                 .unwrap();
-            let expected = if idx % 2 == 0 {
+            let expected = if idx.is_multiple_of(2) {
                 ConvergenceDriftState::Ready
             } else {
                 ConvergenceDriftState::Drifting

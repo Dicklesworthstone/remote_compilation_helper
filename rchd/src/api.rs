@@ -167,6 +167,18 @@ enum ApiRequest {
         /// If true, drain existing jobs before fully disabling.
         drain_first: bool,
     },
+    /// Get repo convergence status for all or a specific worker.
+    RepoConvergenceStatus {
+        worker_id: Option<WorkerId>,
+    },
+    /// Simulate convergence dry-run for a worker.
+    RepoConvergenceDryRun {
+        worker_id: WorkerId,
+    },
+    /// Trigger targeted convergence repair for a worker.
+    RepoConvergenceRepair {
+        worker_id: WorkerId,
+    },
 }
 
 // ============================================================================
@@ -529,6 +541,71 @@ pub struct BenchmarkTriggerResponse {
     pub status: String,
     pub worker_id: String,
     pub request_id: String,
+}
+
+// ============================================================================
+// Repo Convergence Response Types (per bead bd-vvmd.3.5)
+// ============================================================================
+
+/// Worker convergence state view for JSON output.
+#[derive(Debug, Serialize)]
+pub struct ConvergenceWorkerView {
+    pub worker_id: String,
+    pub drift_state: String,
+    pub drift_confidence: f64,
+    pub required_repos: Vec<String>,
+    pub synced_repos: Vec<String>,
+    pub missing_repos: Vec<String>,
+    pub attempt_budget_remaining: u32,
+    pub time_budget_remaining_ms: u64,
+    pub last_status_check_unix_ms: i64,
+    pub remediation: Vec<String>,
+}
+
+/// Full convergence status response.
+#[derive(Debug, Serialize)]
+pub struct RepoConvergenceStatusResponse {
+    pub status: String,
+    pub workers: Vec<ConvergenceWorkerView>,
+    pub recent_outcomes: Vec<crate::repo_convergence::ConvergenceOutcome>,
+    pub summary: ConvergenceSummary,
+}
+
+/// Summary statistics for convergence status.
+#[derive(Debug, Serialize)]
+pub struct ConvergenceSummary {
+    pub total_workers: usize,
+    pub ready: usize,
+    pub drifting: usize,
+    pub converging: usize,
+    pub failed: usize,
+    pub stale: usize,
+}
+
+/// Dry-run response: what convergence would do without actually doing it.
+#[derive(Debug, Serialize)]
+pub struct RepoConvergenceDryRunResponse {
+    pub status: String,
+    pub worker_id: String,
+    pub current_state: String,
+    pub missing_repos: Vec<String>,
+    pub has_budget: bool,
+    pub attempt_budget_remaining: u32,
+    pub time_budget_remaining_ms: u64,
+    pub would_attempt: bool,
+    pub reason: String,
+    pub remediation: Vec<String>,
+}
+
+/// Repair response: result of triggering convergence repair.
+#[derive(Debug, Serialize)]
+pub struct RepoConvergenceRepairResponse {
+    pub status: String,
+    pub worker_id: String,
+    pub action: String,
+    pub previous_state: String,
+    pub new_state: String,
+    pub message: String,
 }
 
 /// Local API response enum for daemon endpoints.
@@ -909,6 +986,21 @@ pub async fn handle_connection(
         }) => {
             metrics::inc_requests("worker-disable");
             let response = handle_worker_disable(&ctx, &worker_id, reason, drain_first).await;
+            (serde_json::to_string(&response)?, "application/json")
+        }
+        Ok(ApiRequest::RepoConvergenceStatus { worker_id }) => {
+            metrics::inc_requests("repo-convergence-status");
+            let response = handle_repo_convergence_status(&ctx, worker_id.as_ref()).await;
+            (serde_json::to_string(&response)?, "application/json")
+        }
+        Ok(ApiRequest::RepoConvergenceDryRun { worker_id }) => {
+            metrics::inc_requests("repo-convergence-dry-run");
+            let response = handle_repo_convergence_dry_run(&ctx, &worker_id).await;
+            (serde_json::to_string(&response)?, "application/json")
+        }
+        Ok(ApiRequest::RepoConvergenceRepair { worker_id }) => {
+            metrics::inc_requests("repo-convergence-repair");
+            let response = handle_repo_convergence_repair(&ctx, &worker_id).await;
             (serde_json::to_string(&response)?, "application/json")
         }
         Err(e) => return Err(e),
@@ -1430,6 +1522,69 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
                 }
                 _ => {}
             }
+        }
+    }
+
+    // Repo convergence operator endpoints (bd-vvmd.3.5).
+    if path.starts_with("/repo-convergence") {
+        let (path_only, query) = split_path_query(path);
+
+        match path_only {
+            "/repo-convergence/status" => {
+                let mut worker_id = None;
+                for param in query.split('&') {
+                    if param.is_empty() {
+                        continue;
+                    }
+                    let mut kv = param.splitn(2, '=');
+                    let key = kv.next().unwrap_or("");
+                    let value = kv.next().unwrap_or("");
+                    if key == "worker" {
+                        worker_id = Some(WorkerId::new(urlencoding_decode(value)));
+                    }
+                }
+                return Ok(ApiRequest::RepoConvergenceStatus { worker_id });
+            }
+            "/repo-convergence/dry-run" => {
+                let mut worker_id = None;
+                for param in query.split('&') {
+                    if param.is_empty() {
+                        continue;
+                    }
+                    let mut kv = param.splitn(2, '=');
+                    let key = kv.next().unwrap_or("");
+                    let value = kv.next().unwrap_or("");
+                    if key == "worker" {
+                        worker_id = Some(WorkerId::new(urlencoding_decode(value)));
+                    }
+                }
+                return match worker_id {
+                    Some(id) => Ok(ApiRequest::RepoConvergenceDryRun { worker_id: id }),
+                    None => Err(anyhow!("Missing required 'worker' parameter for dry-run")),
+                };
+            }
+            "/repo-convergence/repair" => {
+                if method != "POST" {
+                    return Err(anyhow!("Repair endpoint requires POST method"));
+                }
+                let mut worker_id = None;
+                for param in query.split('&') {
+                    if param.is_empty() {
+                        continue;
+                    }
+                    let mut kv = param.splitn(2, '=');
+                    let key = kv.next().unwrap_or("");
+                    let value = kv.next().unwrap_or("");
+                    if key == "worker" {
+                        worker_id = Some(WorkerId::new(urlencoding_decode(value)));
+                    }
+                }
+                return match worker_id {
+                    Some(id) => Ok(ApiRequest::RepoConvergenceRepair { worker_id: id }),
+                    None => Err(anyhow!("Missing required 'worker' parameter for repair")),
+                };
+            }
+            _ => return Err(anyhow!("Unknown convergence endpoint: {}", path_only)),
         }
     }
 
@@ -2741,6 +2896,232 @@ async fn handle_status(ctx: &DaemonContext) -> Result<DaemonFullStatus> {
     })
 }
 
+// ============================================================================
+// Repo Convergence Handlers (bd-vvmd.3.5)
+// ============================================================================
+
+/// Build remediation suggestions based on worker convergence state.
+fn convergence_remediation(state: &crate::repo_convergence::WorkerConvergenceState) -> Vec<String> {
+    use crate::repo_convergence::ConvergenceDriftState;
+
+    let mut hints = Vec::new();
+    match state.current_state {
+        ConvergenceDriftState::Ready => {}
+        ConvergenceDriftState::Drifting => {
+            if !state.missing_repos.is_empty() {
+                hints.push(format!(
+                    "Missing {} repo(s): {}",
+                    state.missing_repos.len(),
+                    state.missing_repos.join(", ")
+                ));
+            }
+            hints.push("Run convergence repair to sync missing repos.".into());
+        }
+        ConvergenceDriftState::Converging => {
+            hints.push("Sync in progress — wait for completion.".into());
+        }
+        ConvergenceDriftState::Failed => {
+            hints.push(format!(
+                "Budget exhausted (attempts: {}, time: {}ms remaining).",
+                state.attempt_budget_remaining, state.time_budget_remaining_ms
+            ));
+            hints.push("Reset worker state with a new repo set update or manual repair.".into());
+        }
+        ConvergenceDriftState::Stale => {
+            hints.push("No recent status check — run status refresh.".into());
+        }
+    }
+    hints
+}
+
+/// Convert a WorkerConvergenceState into a JSON-safe view with remediation.
+fn build_convergence_worker_view(
+    state: &crate::repo_convergence::WorkerConvergenceState,
+) -> ConvergenceWorkerView {
+    let drift_confidence = state.drift_confidence();
+
+    ConvergenceWorkerView {
+        worker_id: state.worker_id.clone(),
+        drift_state: state.current_state.to_string(),
+        drift_confidence,
+        required_repos: state.required_repos.clone(),
+        synced_repos: state.synced_repos.clone(),
+        missing_repos: state.missing_repos.clone(),
+        attempt_budget_remaining: state.attempt_budget_remaining,
+        time_budget_remaining_ms: state.time_budget_remaining_ms,
+        last_status_check_unix_ms: state.last_status_check_unix_ms,
+        remediation: convergence_remediation(state),
+    }
+}
+
+/// Handle GET /repo-convergence/status — full convergence dashboard.
+async fn handle_repo_convergence_status(
+    ctx: &DaemonContext,
+    worker_id: Option<&WorkerId>,
+) -> ApiResponse<RepoConvergenceStatusResponse> {
+    let svc = &ctx.repo_convergence;
+
+    let workers: Vec<ConvergenceWorkerView> = if let Some(wid) = worker_id {
+        match svc.get_worker_state(wid).await {
+            Some(ws) => vec![build_convergence_worker_view(&ws)],
+            None => {
+                // Worker not tracked — return Stale view.
+                vec![ConvergenceWorkerView {
+                    worker_id: wid.as_str().to_string(),
+                    drift_state: "stale".into(),
+                    drift_confidence: 0.0,
+                    required_repos: vec![],
+                    synced_repos: vec![],
+                    missing_repos: vec![],
+                    attempt_budget_remaining: 3,
+                    time_budget_remaining_ms: 120_000,
+                    last_status_check_unix_ms: 0,
+                    remediation: vec!["No convergence data — run status refresh.".into()],
+                }]
+            }
+        }
+    } else {
+        let all = svc.get_all_worker_states().await;
+        all.iter().map(build_convergence_worker_view).collect()
+    };
+
+    // Build summary counts.
+    let mut summary = ConvergenceSummary {
+        total_workers: workers.len(),
+        ready: 0,
+        drifting: 0,
+        converging: 0,
+        failed: 0,
+        stale: 0,
+    };
+    for w in &workers {
+        match w.drift_state.as_str() {
+            "ready" => summary.ready += 1,
+            "drifting" => summary.drifting += 1,
+            "converging" => summary.converging += 1,
+            "failed" => summary.failed += 1,
+            _ => summary.stale += 1,
+        }
+    }
+
+    let recent_outcomes = svc.get_recent_outcomes(20).await;
+
+    let status = if summary.failed > 0 {
+        "degraded"
+    } else if summary.drifting > 0 || summary.converging > 0 {
+        "converging"
+    } else if summary.total_workers == 0 || summary.stale == summary.total_workers {
+        "unknown"
+    } else {
+        "healthy"
+    };
+
+    ApiResponse::Ok(RepoConvergenceStatusResponse {
+        status: status.into(),
+        workers,
+        recent_outcomes,
+        summary,
+    })
+}
+
+/// Handle GET /repo-convergence/dry-run — simulate what convergence would do.
+async fn handle_repo_convergence_dry_run(
+    ctx: &DaemonContext,
+    worker_id: &WorkerId,
+) -> ApiResponse<RepoConvergenceDryRunResponse> {
+    use crate::repo_convergence::ConvergenceDriftState;
+
+    let svc = &ctx.repo_convergence;
+    let has_budget = svc.has_budget(worker_id).await;
+
+    match svc.get_worker_state(worker_id).await {
+        Some(ws) => {
+            let (would_attempt, reason) = match ws.current_state {
+                ConvergenceDriftState::Ready => (false, "Worker is already converged.".into()),
+                ConvergenceDriftState::Drifting => {
+                    if has_budget {
+                        (true, "Would attempt sync for missing repos.".into())
+                    } else {
+                        (false, "Budget exhausted — cannot attempt sync.".into())
+                    }
+                }
+                ConvergenceDriftState::Converging => (false, "Sync already in progress.".into()),
+                ConvergenceDriftState::Failed => {
+                    (false, "Budget exhausted — manual reset required.".into())
+                }
+                ConvergenceDriftState::Stale => {
+                    (true, "Would attempt fresh status check and sync.".into())
+                }
+            };
+
+            let remediation = convergence_remediation(&ws);
+
+            ApiResponse::Ok(RepoConvergenceDryRunResponse {
+                status: "ok".into(),
+                worker_id: worker_id.as_str().to_string(),
+                current_state: ws.current_state.to_string(),
+                missing_repos: ws.missing_repos.clone(),
+                has_budget,
+                attempt_budget_remaining: ws.attempt_budget_remaining,
+                time_budget_remaining_ms: ws.time_budget_remaining_ms,
+                would_attempt,
+                reason,
+                remediation,
+            })
+        }
+        None => ApiResponse::Ok(RepoConvergenceDryRunResponse {
+            status: "ok".into(),
+            worker_id: worker_id.as_str().to_string(),
+            current_state: "stale".into(),
+            missing_repos: vec![],
+            has_budget: true,
+            attempt_budget_remaining: 3,
+            time_budget_remaining_ms: 120_000,
+            would_attempt: true,
+            reason: "No convergence data — would attempt fresh sync.".into(),
+            remediation: vec!["No convergence data — run status refresh.".into()],
+        }),
+    }
+}
+
+/// Handle POST /repo-convergence/repair — trigger convergence repair for a worker.
+///
+/// Resets budget and marks the worker for re-convergence. Bypasses hysteresis
+/// since this is a deliberate operator action. Does NOT invoke the actual
+/// adapter (that happens in the background convergence loop); this just
+/// unblocks the state machine so the next convergence cycle picks it up.
+async fn handle_repo_convergence_repair(
+    ctx: &DaemonContext,
+    worker_id: &WorkerId,
+) -> ApiResponse<RepoConvergenceRepairResponse> {
+    let svc = &ctx.repo_convergence;
+
+    match svc.repair_worker(worker_id).await {
+        Some(previous_state) => {
+            let new_state = svc.get_drift_state(worker_id).await;
+            ApiResponse::Ok(RepoConvergenceRepairResponse {
+                status: "ok".into(),
+                worker_id: worker_id.as_str().to_string(),
+                action: "reset_convergence".into(),
+                previous_state: previous_state.to_string(),
+                new_state: new_state.to_string(),
+                message: format!(
+                    "Worker convergence reset from {} to {}. Next convergence cycle will attempt sync.",
+                    previous_state, new_state
+                ),
+            })
+        }
+        None => ApiResponse::Ok(RepoConvergenceRepairResponse {
+            status: "noop".into(),
+            worker_id: worker_id.as_str().to_string(),
+            action: "none".into(),
+            previous_state: "stale".into(),
+            new_state: "stale".into(),
+            message: "Worker not tracked — nothing to repair.".into(),
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2774,6 +3155,7 @@ mod tests {
         let alert_manager = Arc::new(crate::alerts::AlertManager::new(
             crate::alerts::AlertConfig::default(),
         ));
+        let events = EventBus::new(16);
         DaemonContext {
             pool,
             worker_selector: Arc::new(WorkerSelector::new()),
@@ -2781,7 +3163,10 @@ mod tests {
             telemetry: Arc::new(TelemetryStore::new(Duration::from_secs(300), None)),
             benchmark_queue: Arc::new(BenchmarkQueue::new(ChronoDuration::minutes(5))),
             benchmark_trigger: make_test_benchmark_trigger(),
-            events: EventBus::new(16),
+            repo_convergence: Arc::new(crate::repo_convergence::RepoConvergenceService::new(
+                events.clone(),
+            )),
+            events,
             self_test,
             alert_manager,
             started_at: Instant::now(),
@@ -4871,5 +5256,287 @@ mod tests {
         // Just verify it returns without panic and has expected structure
         // Response has status, budgets, and computed_at fields
         assert!(!response.computed_at.is_empty());
+    }
+
+    // =========================================================================
+    // Repo Convergence API Tests (bd-vvmd.3.5)
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_convergence_status_empty() {
+        let _guard = test_guard!();
+        let pool = WorkerPool::new();
+        let ctx = make_test_context(pool);
+
+        let response = handle_repo_convergence_status(&ctx, None).await;
+        match response {
+            ApiResponse::Ok(status) => {
+                assert_eq!(status.workers.len(), 0);
+                assert_eq!(status.summary.total_workers, 0);
+                assert_eq!(status.status, "unknown");
+            }
+            ApiResponse::Error(e) => panic!("Expected Ok, got error: {}", e.message),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_convergence_status_with_workers() {
+        let _guard = test_guard!();
+        let pool = WorkerPool::new();
+        let ctx = make_test_context(pool);
+
+        // Set up convergence state.
+        let wid = WorkerId::new("w1");
+        ctx.repo_convergence
+            .update_required_repos(&wid, vec!["repo-a".into()], vec!["repo-a".into()])
+            .await;
+
+        let response = handle_repo_convergence_status(&ctx, None).await;
+        match response {
+            ApiResponse::Ok(status) => {
+                assert_eq!(status.workers.len(), 1);
+                assert_eq!(status.workers[0].worker_id, "w1");
+                assert_eq!(status.workers[0].drift_state, "ready");
+                assert_eq!(status.summary.ready, 1);
+                assert_eq!(status.status, "healthy");
+            }
+            ApiResponse::Error(e) => panic!("Expected Ok, got error: {}", e.message),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_convergence_status_filtered_by_worker() {
+        let _guard = test_guard!();
+        let pool = WorkerPool::new();
+        let ctx = make_test_context(pool);
+
+        let wid1 = WorkerId::new("w1");
+        let wid2 = WorkerId::new("w2");
+        ctx.repo_convergence
+            .update_required_repos(&wid1, vec!["repo-a".into()], vec!["repo-a".into()])
+            .await;
+        ctx.repo_convergence
+            .update_required_repos(&wid2, vec!["repo-b".into()], vec![])
+            .await;
+
+        // Filter to w1 only.
+        let response = handle_repo_convergence_status(&ctx, Some(&wid1)).await;
+        match response {
+            ApiResponse::Ok(status) => {
+                assert_eq!(status.workers.len(), 1);
+                assert_eq!(status.workers[0].worker_id, "w1");
+            }
+            ApiResponse::Error(e) => panic!("Expected Ok, got error: {}", e.message),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_convergence_status_unknown_worker() {
+        let _guard = test_guard!();
+        let pool = WorkerPool::new();
+        let ctx = make_test_context(pool);
+
+        let wid = WorkerId::new("nonexistent");
+        let response = handle_repo_convergence_status(&ctx, Some(&wid)).await;
+        match response {
+            ApiResponse::Ok(status) => {
+                assert_eq!(status.workers.len(), 1);
+                assert_eq!(status.workers[0].drift_state, "stale");
+                assert!(!status.workers[0].remediation.is_empty());
+            }
+            ApiResponse::Error(e) => panic!("Expected Ok, got error: {}", e.message),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_convergence_dry_run_ready_worker() {
+        let _guard = test_guard!();
+        let pool = WorkerPool::new();
+        let ctx = make_test_context(pool);
+
+        let wid = WorkerId::new("w1");
+        ctx.repo_convergence
+            .update_required_repos(&wid, vec!["repo-a".into()], vec!["repo-a".into()])
+            .await;
+
+        let response = handle_repo_convergence_dry_run(&ctx, &wid).await;
+        match response {
+            ApiResponse::Ok(dr) => {
+                assert!(!dr.would_attempt, "Ready worker should not attempt sync");
+                assert_eq!(dr.current_state, "ready");
+            }
+            ApiResponse::Error(e) => panic!("Expected Ok, got error: {}", e.message),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_convergence_dry_run_drifting_worker() {
+        let _guard = test_guard!();
+        let pool = WorkerPool::new();
+        let ctx = make_test_context(pool);
+
+        let wid = WorkerId::new("w1");
+        ctx.repo_convergence
+            .update_required_repos(&wid, vec!["repo-a".into()], vec![])
+            .await;
+
+        let response = handle_repo_convergence_dry_run(&ctx, &wid).await;
+        match response {
+            ApiResponse::Ok(dr) => {
+                assert!(
+                    dr.would_attempt,
+                    "Drifting worker with budget should attempt"
+                );
+                assert_eq!(dr.current_state, "drifting");
+                assert!(!dr.missing_repos.is_empty());
+                assert!(dr.has_budget);
+            }
+            ApiResponse::Error(e) => panic!("Expected Ok, got error: {}", e.message),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_convergence_dry_run_unknown_worker() {
+        let _guard = test_guard!();
+        let pool = WorkerPool::new();
+        let ctx = make_test_context(pool);
+
+        let wid = WorkerId::new("nonexistent");
+        let response = handle_repo_convergence_dry_run(&ctx, &wid).await;
+        match response {
+            ApiResponse::Ok(dr) => {
+                assert!(dr.would_attempt);
+                assert_eq!(dr.current_state, "stale");
+            }
+            ApiResponse::Error(e) => panic!("Expected Ok, got error: {}", e.message),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_convergence_repair_resets_to_drifting() {
+        let _guard = test_guard!();
+        let pool = WorkerPool::new();
+        let ctx = make_test_context(pool);
+
+        let wid = WorkerId::new("w1");
+        // Set to Ready.
+        ctx.repo_convergence
+            .update_required_repos(&wid, vec!["repo-a".into()], vec!["repo-a".into()])
+            .await;
+
+        let response = handle_repo_convergence_repair(&ctx, &wid).await;
+        match response {
+            ApiResponse::Ok(repair) => {
+                assert_eq!(repair.status, "ok");
+                assert_eq!(repair.previous_state, "ready");
+                assert_eq!(repair.new_state, "drifting");
+                assert_eq!(repair.action, "reset_convergence");
+            }
+            ApiResponse::Error(e) => panic!("Expected Ok, got error: {}", e.message),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_convergence_repair_no_repos_noop() {
+        let _guard = test_guard!();
+        let pool = WorkerPool::new();
+        let ctx = make_test_context(pool);
+
+        let wid = WorkerId::new("unknown");
+        let response = handle_repo_convergence_repair(&ctx, &wid).await;
+        match response {
+            ApiResponse::Ok(repair) => {
+                assert_eq!(repair.status, "noop");
+                assert_eq!(repair.action, "none");
+            }
+            ApiResponse::Error(e) => panic!("Expected Ok, got error: {}", e.message),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_convergence_status_json_serializable() {
+        let _guard = test_guard!();
+        let pool = WorkerPool::new();
+        let ctx = make_test_context(pool);
+
+        let wid = WorkerId::new("w1");
+        ctx.repo_convergence
+            .update_required_repos(&wid, vec!["repo-a".into()], vec![])
+            .await;
+
+        let response = handle_repo_convergence_status(&ctx, None).await;
+        // Must serialize without error for the API to work.
+        let json = serde_json::to_string(&response).expect("Should serialize to JSON");
+        assert!(json.contains("drifting"));
+        assert!(json.contains("w1"));
+    }
+
+    #[test]
+    fn test_parse_convergence_status_route() {
+        let _guard = test_guard!();
+        let req = parse_request("GET /repo-convergence/status").unwrap();
+        assert!(
+            matches!(req, ApiRequest::RepoConvergenceStatus { worker_id: None }),
+            "Should parse status route without worker filter"
+        );
+    }
+
+    #[test]
+    fn test_parse_convergence_status_with_worker() {
+        let _guard = test_guard!();
+        let req = parse_request("GET /repo-convergence/status?worker=w1").unwrap();
+        match req {
+            ApiRequest::RepoConvergenceStatus {
+                worker_id: Some(wid),
+            } => {
+                assert_eq!(wid.as_str(), "w1");
+            }
+            _ => panic!("Expected RepoConvergenceStatus with worker_id"),
+        }
+    }
+
+    #[test]
+    fn test_parse_convergence_dry_run_route() {
+        let _guard = test_guard!();
+        let req = parse_request("GET /repo-convergence/dry-run?worker=w1").unwrap();
+        match req {
+            ApiRequest::RepoConvergenceDryRun { worker_id } => {
+                assert_eq!(worker_id.as_str(), "w1");
+            }
+            _ => panic!("Expected RepoConvergenceDryRun"),
+        }
+    }
+
+    #[test]
+    fn test_parse_convergence_dry_run_missing_worker() {
+        let _guard = test_guard!();
+        let result = parse_request("GET /repo-convergence/dry-run");
+        assert!(result.is_err(), "Should fail without worker parameter");
+    }
+
+    #[test]
+    fn test_parse_convergence_repair_route() {
+        let _guard = test_guard!();
+        let req = parse_request("POST /repo-convergence/repair?worker=w1").unwrap();
+        match req {
+            ApiRequest::RepoConvergenceRepair { worker_id } => {
+                assert_eq!(worker_id.as_str(), "w1");
+            }
+            _ => panic!("Expected RepoConvergenceRepair"),
+        }
+    }
+
+    #[test]
+    fn test_parse_convergence_repair_requires_post() {
+        let _guard = test_guard!();
+        let result = parse_request("GET /repo-convergence/repair?worker=w1");
+        assert!(result.is_err(), "Repair should require POST method");
+    }
+
+    #[test]
+    fn test_parse_convergence_unknown_subpath() {
+        let _guard = test_guard!();
+        let result = parse_request("GET /repo-convergence/unknown");
+        assert!(result.is_err(), "Unknown subpath should error");
     }
 }
