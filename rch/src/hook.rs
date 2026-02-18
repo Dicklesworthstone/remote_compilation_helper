@@ -8757,7 +8757,7 @@ mod tests {
     #[test]
     fn test_sync_root_outcome_mixed_with_reasons() {
         let _guard = test_guard!();
-        let outcomes = vec![
+        let outcomes = [
             SyncRootOutcome::Synced,
             SyncRootOutcome::Synced,
             SyncRootOutcome::Skipped {
