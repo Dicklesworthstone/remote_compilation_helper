@@ -2,7 +2,9 @@
 //!
 //! These types mirror the response structures from rchd's /status API endpoint.
 
-use rch_common::{CommandTimingBreakdown, SavedTimeStats, WorkerCapabilities};
+use rch_common::{
+    BuildCancellationMetadata, CommandTimingBreakdown, SavedTimeStats, WorkerCapabilities,
+};
 use serde::{Deserialize, Serialize};
 
 /// Full status response from daemon's GET /status.
@@ -148,6 +150,8 @@ pub struct BuildRecordFromApi {
     pub bytes_transferred: Option<u64>,
     #[serde(default)]
     pub timing: Option<CommandTimingBreakdown>,
+    #[serde(default)]
+    pub cancellation: Option<BuildCancellationMetadata>,
 }
 
 /// Issue from API.

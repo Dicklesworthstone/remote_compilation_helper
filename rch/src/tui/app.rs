@@ -816,6 +816,7 @@ mod tests {
             location: "remote".to_string(),
             bytes_transferred: Some(1234),
             timing: None,
+            cancellation: None,
         }
     }
 
@@ -1369,6 +1370,7 @@ mod tests {
             location: "remote".to_string(),
             bytes_transferred: None,
             timing: None,
+            cancellation: None,
         }];
 
         let response = make_response(vec![], active, history);

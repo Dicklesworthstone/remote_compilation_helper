@@ -8,6 +8,7 @@ use crate::commands::{
     load_workers_from_config,
 };
 use crate::state::primitives::IdempotentResult;
+use crate::status_display::query_daemon_full_status;
 use crate::ui::context::OutputContext;
 use crate::ui::theme::StatusIndicator;
 use anyhow::Result;
@@ -69,6 +70,7 @@ pub async fn run_doctor(ctx: &OutputContext, options: DoctorOptions) -> Result<(
     check_ssh_keys(&mut checks, ctx, &options, &mut fixes_applied);
     check_hooks(&mut checks, ctx, &options, &mut fixes_applied);
     check_daemon(&mut checks, ctx, &options, &mut fixes_applied);
+    check_cancellation_health(&mut checks, ctx).await;
     check_workers(&mut checks, ctx, &options).await;
     check_telemetry_database(&mut checks, ctx, &options);
 
@@ -1196,6 +1198,164 @@ fn check_daemon(
 }
 
 // =============================================================================
+// Cancellation Health Checks
+// =============================================================================
+
+fn evaluate_cancellation_health(
+    status: &crate::status_types::DaemonFullStatusResponse,
+) -> CheckResult {
+    let mut total = 0usize;
+    let mut cleanup_failures = 0usize;
+    let mut sigkill_escalations = 0usize;
+    let mut unreachable_workers = 0usize;
+    let mut operations = Vec::new();
+
+    for build in &status.recent_builds {
+        let Some(cancellation) = &build.cancellation else {
+            continue;
+        };
+        total += 1;
+        operations.push(cancellation.operation_id.clone());
+        if !cancellation.cleanup_ok {
+            cleanup_failures += 1;
+        }
+        if cancellation.escalation_stage == "sigkill" {
+            sigkill_escalations += 1;
+        }
+        if cancellation
+            .worker_health
+            .as_ref()
+            .is_some_and(|health| health.status == "unreachable")
+        {
+            unreachable_workers += 1;
+        }
+    }
+
+    if total == 0 {
+        return CheckResult {
+            category: "cancellation".to_string(),
+            name: "cancellation_health".to_string(),
+            status: CheckStatus::Pass,
+            message: "No recent cancellation events detected".to_string(),
+            details: None,
+            suggestion: None,
+            fixable: false,
+            fix_applied: false,
+            fix_message: None,
+        };
+    }
+
+    let details = Some(format!(
+        "recent={}, cleanup_failures={}, sigkill_escalations={}, unreachable_workers={}, operations={}",
+        total,
+        cleanup_failures,
+        sigkill_escalations,
+        unreachable_workers,
+        operations.join(",")
+    ));
+
+    if cleanup_failures > 0 {
+        return CheckResult {
+            category: "cancellation".to_string(),
+            name: "cancellation_health".to_string(),
+            status: CheckStatus::Fail,
+            message: format!(
+                "{} cancellation(s) ended with cleanup failures",
+                cleanup_failures
+            ),
+            details,
+            suggestion: Some(
+                "Run `rch workers probe --all` and inspect daemon `cancellation_failed` events before retrying affected builds.".to_string(),
+            ),
+            fixable: false,
+            fix_applied: false,
+            fix_message: None,
+        };
+    }
+
+    if sigkill_escalations > 0 || unreachable_workers > 0 {
+        return CheckResult {
+            category: "cancellation".to_string(),
+            name: "cancellation_health".to_string(),
+            status: CheckStatus::Warning,
+            message: format!(
+                "{} cancellation(s) required escalation and/or involved unreachable workers",
+                total
+            ),
+            details,
+            suggestion: Some(
+                "Review `rch status --jobs` for stuck phases and verify worker connectivity with `rch workers probe --all`.".to_string(),
+            ),
+            fixable: false,
+            fix_applied: false,
+            fix_message: None,
+        };
+    }
+
+    CheckResult {
+        category: "cancellation".to_string(),
+        name: "cancellation_health".to_string(),
+        status: CheckStatus::Pass,
+        message: format!(
+            "{} recent cancellation(s) completed with deterministic cleanup",
+            total
+        ),
+        details,
+        suggestion: None,
+        fixable: false,
+        fix_applied: false,
+        fix_message: None,
+    }
+}
+
+async fn check_cancellation_health(checks: &mut Vec<CheckResult>, ctx: &OutputContext) {
+    let style = ctx.theme();
+    if !ctx.is_json() {
+        println!("{}", style.highlight("Cancellation Health"));
+        println!();
+    }
+
+    let result = if !default_socket_path().exists() {
+        CheckResult {
+            category: "cancellation".to_string(),
+            name: "cancellation_health".to_string(),
+            status: CheckStatus::Skipped,
+            message: "Daemon socket not present; skipping cancellation diagnostics".to_string(),
+            details: Some(default_socket_path().display().to_string()),
+            suggestion: Some("Start daemon with: rch daemon start".to_string()),
+            fixable: false,
+            fix_applied: false,
+            fix_message: None,
+        }
+    } else {
+        match query_daemon_full_status().await {
+            Ok(status) => evaluate_cancellation_health(&status),
+            Err(e) => CheckResult {
+                category: "cancellation".to_string(),
+                name: "cancellation_health".to_string(),
+                status: CheckStatus::Warning,
+                message: "Unable to query daemon status for cancellation diagnostics".to_string(),
+                details: Some(e.to_string()),
+                suggestion: Some(
+                    "Ensure daemon is responsive (`rch status`) and retry `rch doctor`."
+                        .to_string(),
+                ),
+                fixable: false,
+                fix_applied: false,
+                fix_message: None,
+            },
+        }
+    };
+
+    print_check_result(&result, ctx);
+    checks.push(result);
+
+    if !ctx.is_json() {
+        println!();
+    }
+}
+
+// =============================================================================
 // Hook Checks
 // =============================================================================
 
@@ -1650,6 +1810,7 @@ fn print_check_result(result: &CheckResult, ctx: &OutputContext) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use tempfile::TempDir;
 
     #[test]
@@ -1689,6 +1850,146 @@ mod tests {
         let json = serde_json::to_string(&summary).unwrap();
         assert!(json.contains("\"total\":10"));
         assert!(json.contains("\"passed\":7"));
+    }
+
+    #[test]
+    fn test_evaluate_cancellation_health_fails_on_cleanup_failure() {
+        let status: crate::status_types::DaemonFullStatusResponse = serde_json::from_value(json!({
+            "daemon": {
+                "pid": 1,
+                "uptime_secs": 10,
+                "version": "0.1.0",
+                "socket_path": "/tmp/rch.sock",
+                "started_at": "2026-01-01T00:00:00Z",
+                "workers_total": 1,
+                "workers_healthy": 1,
+                "slots_total": 8,
+                "slots_available": 4
+            },
+            "workers": [],
+            "active_builds": [],
+            "queued_builds": [],
+            "recent_builds": [{
+                "id": 9,
+                "started_at": "2026-01-01T00:00:00Z",
+                "completed_at": "2026-01-01T00:00:05Z",
+                "project_id": "proj",
+                "worker_id": "worker-a",
+                "command": "cargo test",
+                "exit_code": 130,
+                "duration_ms": 5000,
+                "location": "remote",
+                "bytes_transferred": 1024,
+                "timing": null,
+                "cancellation": {
+                    "operation_id": "cancel-9",
+                    "origin": "timeout",
+                    "reason_code": "timeout",
+                    "decision_path": ["requested", "term_sent", "remote_kill_sent", "escalated", "completed"],
+                    "escalation_stage": "sigkill",
+                    "escalation_count": 2,
+                    "remote_kill_attempted": true,
+                    "cleanup_ok": false,
+                    "history_cancelled": true,
+                    "final_state": "completed",
+                    "worker_health": {
+                        "status": "unreachable",
+                        "speed_score": 0.0,
+                        "used_slots": 4,
+                        "available_slots": 0,
+                        "pressure_state": "critical",
+                        "pressure_reason_code": "disk_free_below_critical_gb"
+                    }
+                }
+            }],
+            "issues": [],
+            "alerts": [],
+            "stats": {
+                "total_builds": 1,
+                "success_count": 0,
+                "failure_count": 1,
+                "remote_count": 1,
+                "local_count": 0,
+                "avg_duration_ms": 5000
+            },
+            "test_stats": null,
+            "saved_time": null
+        }))
+        .expect("status json should parse");
+
+        let result = evaluate_cancellation_health(&status);
+        assert_eq!(result.status, CheckStatus::Fail);
+        assert!(result.message.contains("cleanup failures"));
+    }
+
+    #[test]
+    fn test_evaluate_cancellation_health_passes_on_clean_cancel() {
+        let status: crate::status_types::DaemonFullStatusResponse = serde_json::from_value(json!({
+            "daemon": {
+                "pid": 1,
+                "uptime_secs": 10,
+                "version": "0.1.0",
+                "socket_path": "/tmp/rch.sock",
+                "started_at": "2026-01-01T00:00:00Z",
+                "workers_total": 1,
+                "workers_healthy": 1,
+                "slots_total": 8,
+                "slots_available": 4
+            },
+            "workers": [],
+            "active_builds": [],
+            "queued_builds": [],
+            "recent_builds": [{
+                "id": 10,
+                "started_at": "2026-01-01T00:00:00Z",
+                "completed_at": "2026-01-01T00:00:03Z",
+                "project_id": "proj",
+                "worker_id": "worker-a",
+                "command": "cargo check",
+                "exit_code": 130,
+                "duration_ms": 3000,
+                "location": "remote",
+                "bytes_transferred": 1024,
+                "timing": null,
+                "cancellation": {
+                    "operation_id": "cancel-10",
+                    "origin": "user",
+                    "reason_code": "user",
+                    "decision_path": ["requested", "term_sent", "completed"],
+                    "escalation_stage": "term",
+                    "escalation_count": 0,
+                    "remote_kill_attempted": false,
+                    "cleanup_ok": true,
+                    "history_cancelled": true,
+                    "final_state": "completed",
+                    "worker_health": {
+                        "status": "healthy",
+                        "speed_score": 97.2,
+                        "used_slots": 0,
+                        "available_slots": 8,
+                        "pressure_state": "healthy",
+                        "pressure_reason_code": "healthy"
+                    }
+                }
+            }],
+            "issues": [],
+            "alerts": [],
+            "stats": {
+                "total_builds": 1,
+                "success_count": 0,
+                "failure_count": 1,
+                "remote_count": 1,
+                "local_count": 0,
+                "avg_duration_ms": 3000
+            },
+            "test_stats": null,
+            "saved_time": null
+        }))
+        .expect("status json should parse");
+
+        let result = evaluate_cancellation_health(&status);
+        assert_eq!(result.status, CheckStatus::Pass);
+        assert!(result.message.contains("deterministic cleanup"));
     }
 
     #[test]

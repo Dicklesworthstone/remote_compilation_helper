@@ -752,6 +752,67 @@ fn render_builds_section_to<W: Write>(
                     .unwrap_or_else(|| style.muted("-")),
                 style.muted(&cmd_display)
             )?;
+
+            if let Some(cancellation) = &build.cancellation {
+                let decision_path = if cancellation.decision_path.is_empty() {
+                    "n/a".to_string()
+                } else {
+                    cancellation.decision_path.join(" -> ")
+                };
+                let cleanup = if cancellation.cleanup_ok {
+                    style.success("ok")
+                } else {
+                    style.error("failed")
+                };
+                let health = cancellation
+                    .worker_health
+                    .as_ref()
+                    .map(|worker| {
+                        format!(
+                            "{} / pressure={} ({})",
+                            worker.status, worker.pressure_state, worker.pressure_reason_code
+                        )
+                    })
+                    .unwrap_or_else(|| "n/a".to_string());
+
+                writeln!(
+                    out,
+                    "    {} origin={} | stage={} | cleanup={} | operation={}",
+                    style.muted("cancellation:"),
+                    style.info(&cancellation.origin),
+                    style.info(&cancellation.escalation_stage),
+                    cleanup,
+                    style.info(&cancellation.operation_id)
+                )?;
+                writeln!(
+                    out,
+                    "    {} decision={} | worker={} | final_state={}",
+                    style.muted("details:"),
+                    style.muted(&decision_path),
+                    style.muted(&health),
+                    style.info(&cancellation.final_state)
+                )?;
+
+                if !cancellation.cleanup_ok {
+                    writeln!(
+                        out,
+                        "    {} {}",
+                        style.muted("action:"),
+                        style.warning(
+                            "run `rch workers probe --all` and inspect daemon cancellation logs"
+                        )
+                    )?;
+                } else if cancellation.escalation_stage == "sigkill" {
+                    writeln!(
+                        out,
+                        "    {} {}",
+                        style.muted("action:"),
+                        style.warning(
+                            "review stuck-process signals; cancellation required SIGKILL escalation"
+                        )
+                    )?;
+                }
+            }
         }
     }
 
@@ -1005,6 +1066,7 @@ mod tests {
                     location: "remote".to_string(),
                     bytes_transferred: Some(2048),
                     timing: None,
+                    cancellation: None,
                 },
                 BuildRecordFromApi {
                     id: 3,
@@ -1018,6 +1080,7 @@ mod tests {
                     location: "local".to_string(),
                     bytes_transferred: None,
                     timing: None,
+                    cancellation: None,
                 },
             ],
             issues: vec![IssueFromApi {
@@ -1158,6 +1221,48 @@ mod tests {
         assert!(output.contains("✓"));
         assert!(output.contains("✗"));
         info!("PASS: build sections rendered with status indicators");
+    }
+
+    #[test]
+    fn test_render_full_status_includes_cancellation_details() {
+        let _guard = test_guard!();
+        let mut status = sample_status();
+        status.recent_builds[1].cancellation = Some(rch_common::BuildCancellationMetadata {
+            operation_id: "cancel-3".to_string(),
+            origin: "timeout".to_string(),
+            reason_code: "timeout".to_string(),
+            decision_path: vec![
+                "requested".to_string(),
+                "term_sent".to_string(),
+                "remote_kill_sent".to_string(),
+                "escalated".to_string(),
+                "completed".to_string(),
+            ],
+            escalation_stage: "sigkill".to_string(),
+            escalation_count: 2,
+            remote_kill_attempted: true,
+            cleanup_ok: false,
+            history_cancelled: true,
+            final_state: "completed".to_string(),
+            worker_health: Some(rch_common::BuildCancellationWorkerHealth {
+                status: "unreachable".to_string(),
+                speed_score: 0.0,
+                used_slots: 8,
+                available_slots: 0,
+                pressure_state: "critical".to_string(),
+                pressure_reason_code: "disk_free_below_critical_gb".to_string(),
+            }),
+        });
+
+        let style = Theme::new(false, true, false);
+        let mut buf = Vec::new();
+        render_full_status_to(&mut buf, &status, false, true, &style).expect("render");
+        let output = String::from_utf8(buf).expect("utf8 output");
+
+        assert!(output.contains("cancellation:"));
+        assert!(output.contains("cancel-3"));
+        assert!(output.contains("sigkill"));
+        assert!(output.contains("failed"));
     }
 
     #[test]
