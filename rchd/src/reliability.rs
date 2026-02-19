@@ -666,7 +666,7 @@ mod tests {
 
         // Record failures to increase circuit error rate.
         // 5 failures + 1 success → error_rate=5/6≈0.83 → circuit_debt≈0.83
-        // Weighted: 0.35 * 0.83 ≈ 0.29 → well above degraded_penalty_floor(0.05).
+        // Weighted: 0.30 * 0.83 ≈ 0.25 → well above degraded_penalty_floor(0.05).
         for _ in 0..5 {
             worker.record_failure(Some("test error".to_string())).await;
         }
@@ -718,8 +718,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_quarantine_on_high_circuit_debt() {
-        // With circuit-only debt at 100%, weighted = 0.35.
-        // Set quarantine threshold just below that.
+        // With circuit-only debt at 100%, weighted = 0.30.
+        // Set quarantine threshold at exactly that.
         let config = ReliabilityConfig {
             quarantine_threshold: 0.3,
             min_quarantine_duration: Duration::from_millis(10),
@@ -728,7 +728,7 @@ mod tests {
         let agg = ReliabilityAggregator::new(config);
         let worker = make_worker("w1");
 
-        // Drive circuit error rate to 100% → circuit_debt=1.0, weighted=0.35 > 0.3.
+        // Drive circuit error rate to 100% → circuit_debt=1.0, weighted=0.30 >= 0.3.
         for _ in 0..10 {
             worker.record_failure(Some("test".to_string())).await;
         }
@@ -772,7 +772,7 @@ mod tests {
 
         let assessment = agg.evaluate(&worker, "w1").await;
 
-        // circuit_debt=1.0 * 0.35 + convergence_debt=1.0 * 0.25 = 0.60 → > 0.5
+        // circuit_debt=1.0 * 0.30 + convergence_debt=1.0 * 0.22 = 0.52 → > 0.5
         assert_eq!(assessment.health_state, WorkerHealthState::Quarantined);
         assert!(assessment.hard_exclude);
         assert_eq!(assessment.penalty, 1.0);
@@ -793,14 +793,14 @@ mod tests {
         let agg = ReliabilityAggregator::new(config);
         let worker = make_worker("w1");
 
-        // Drive into quarantine: 10 failures → error_rate=1.0 → debt=0.35 > 0.15.
+        // Drive into quarantine: 10 failures → error_rate=1.0 → debt=0.30 > 0.15.
         for _ in 0..10 {
             worker.record_failure(Some("test".to_string())).await;
         }
         let assessment = agg.evaluate(&worker, "w1").await;
         assert_eq!(assessment.health_state, WorkerHealthState::Quarantined);
 
-        // Fix: 500 successes → error_rate=10/510≈0.02 → debt≈0.007 < 0.05.
+        // Fix: 500 successes → error_rate=10/510≈0.02 → debt≈0.006 < 0.05.
         for _ in 0..500 {
             worker.record_success().await;
         }
@@ -834,13 +834,13 @@ mod tests {
         let agg = ReliabilityAggregator::new(config);
         let worker = make_worker("w1");
 
-        // Drive into quarantine: 10 failures → debt=0.35 > 0.15.
+        // Drive into quarantine: 10 failures → debt=0.30 > 0.15.
         for _ in 0..10 {
             worker.record_failure(Some("test".to_string())).await;
         }
         let _ = agg.evaluate(&worker, "w1").await;
 
-        // Fix worker: 500 successes → debt≈0.007 < 0.05.
+        // Fix worker: 500 successes → debt≈0.006 < 0.05.
         for _ in 0..500 {
             worker.record_success().await;
         }
@@ -862,13 +862,13 @@ mod tests {
         let agg = ReliabilityAggregator::new(config);
         let worker = make_worker("w1");
 
-        // Drive into quarantine: 10 failures, error_rate=1.0, debt=0.35 > 0.15.
+        // Drive into quarantine: 10 failures, error_rate=1.0, debt=0.30 > 0.15.
         for _ in 0..10 {
             worker.record_failure(Some("test".to_string())).await;
         }
         let _ = agg.evaluate(&worker, "w1").await;
 
-        // Fix: 200 successes → error_rate=10/210≈0.048 → debt=0.017 < 0.05.
+        // Fix: 200 successes → error_rate=10/210≈0.048 → debt=0.014 < 0.05.
         for _ in 0..200 {
             worker.record_success().await;
         }
@@ -913,7 +913,7 @@ mod tests {
         let worker = make_worker("w1");
 
         // Introduce circuit debt: 3 failures + 1 success → error_rate=0.75
-        // circuit_debt=0.75, weighted=0.35*0.75=0.2625 → Degraded.
+        // circuit_debt=0.75, weighted=0.30*0.75=0.225 → Degraded.
         for _ in 0..3 {
             worker.record_failure(Some("test".to_string())).await;
         }
@@ -1096,7 +1096,7 @@ mod tests {
         let worker = make_worker("w1");
 
         // Make degraded: need enough debt to cross degraded_penalty_floor (0.05).
-        // 5 failures → error_rate=1.0 → circuit_debt=1.0 → weighted=0.35 > 0.05.
+        // 5 failures → error_rate=1.0 → circuit_debt=1.0 → weighted=0.30 > 0.05.
         for _ in 0..5 {
             worker.record_failure(Some("test".to_string())).await;
         }
@@ -1104,8 +1104,8 @@ mod tests {
         assert_eq!(d.health_state, WorkerHealthState::Degraded);
 
         // Fix: overwhelm with successes to drive debt below floor.
-        // 500 successes → error_rate=5/505≈0.0099 → circuit_debt≈0.01 → weighted≈0.0035
-        // 0.0035 < degraded_penalty_floor(0.05) → Healthy.
+        // 500 successes → error_rate=5/505≈0.0099 → circuit_debt≈0.01 → weighted≈0.003
+        // 0.003 < degraded_penalty_floor(0.05) → Healthy.
         for _ in 0..500 {
             worker.record_success().await;
         }

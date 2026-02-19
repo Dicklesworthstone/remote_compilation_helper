@@ -128,14 +128,16 @@ impl Default for CancellationConfig {
 // ── Per-Worker Debt Tracker ──────────────────────────────────────────────
 
 /// Tracks cancellation frequency per worker for reliability integration.
+/// All counters use timestamped vectors pruned to the DEBT_WINDOW so stale
+/// events do not permanently inflate a worker's cancellation debt.
 #[derive(Debug, Clone, Default)]
 struct WorkerCancelStats {
     /// Recent cancellation timestamps (within window).
     recent_cancellations: Vec<Instant>,
-    /// Number of escalations beyond TermSent.
-    escalation_total: u32,
-    /// Number of failed cleanups.
-    cleanup_failures: u32,
+    /// Recent escalation timestamps (within window).
+    recent_escalations: Vec<Instant>,
+    /// Recent cleanup failure timestamps (within window).
+    recent_cleanup_failures: Vec<Instant>,
     /// Total builds observed (for rate computation).
     total_builds: u64,
 }
@@ -223,8 +225,25 @@ impl CancellationOrchestrator {
             hook_pid,
         };
 
-        // Store in active map.
-        self.active.write().await.insert(build_id, record.clone());
+        // Atomically check-and-insert: prevent concurrent double-cancellation
+        // which would cause double slot release.
+        {
+            let mut active = self.active.write().await;
+            if let Some(existing) = active.get(&build_id) {
+                return CancelBuildResponse {
+                    status: "cancelling".to_string(),
+                    build_id,
+                    worker_id: Some(existing.worker_id.clone()),
+                    project_id: Some(project_id),
+                    message: Some(format!(
+                        "Cancellation already in progress (state: {})",
+                        existing.state
+                    )),
+                    slots_released: existing.slots_released,
+                };
+            }
+            active.insert(build_id, record.clone());
+        }
 
         // Emit requested event.
         self.events.emit(
@@ -509,8 +528,11 @@ impl CancellationOrchestrator {
             crate::metrics::inc_build_total("cancelled", "remote");
         }
 
-        // 2. Release worker slots (using count captured at cancel time).
-        if record.slots > 0 {
+        // 2. Release worker slots — only if we successfully claimed the build from
+        // active history. If cancel_active_build returned None, the build already
+        // completed normally (via handle_release_worker) which already released slots.
+        // Releasing again would steal slots from a subsequent build.
+        if history_ok && record.slots > 0 {
             if let Some(worker) = ctx.pool.get(&WorkerId::new(worker_id)).await {
                 worker.release_slots(record.slots).await;
                 record.slots_released = record.slots;
@@ -564,13 +586,14 @@ impl CancellationOrchestrator {
             .entry(record.worker_id.clone())
             .or_default();
 
-        entry.recent_cancellations.push(Instant::now());
+        let now = Instant::now();
+        entry.recent_cancellations.push(now);
 
-        if record.escalation_count > 0 {
-            entry.escalation_total += record.escalation_count;
+        for _ in 0..record.escalation_count {
+            entry.recent_escalations.push(now);
         }
         if !record.cleanup_ok {
-            entry.cleanup_failures += 1;
+            entry.recent_cleanup_failures.push(now);
         }
     }
 
@@ -583,9 +606,11 @@ impl CancellationOrchestrator {
             return 0.0; // No cancellation history → no debt.
         };
 
-        // Prune old cancellations outside the window.
+        // Prune all counters outside the window.
         let cutoff = Instant::now() - DEBT_WINDOW;
         entry.recent_cancellations.retain(|t| *t > cutoff);
+        entry.recent_escalations.retain(|t| *t > cutoff);
+        entry.recent_cleanup_failures.retain(|t| *t > cutoff);
 
         let recent_count = entry.recent_cancellations.len() as f64;
 
@@ -593,11 +618,11 @@ impl CancellationOrchestrator {
         // 5+ cancellations in 5 minutes → full rate debt.
         let rate_debt = (recent_count / 5.0).min(1.0);
 
-        // Escalation component: 0.2 per escalation beyond TermSent.
-        let escalation_debt = (entry.escalation_total as f64 * 0.2).min(0.6);
+        // Escalation component: 0.2 per recent escalation.
+        let escalation_debt = (entry.recent_escalations.len() as f64 * 0.2).min(0.6);
 
-        // Cleanup failure component: 0.3 per failed cleanup.
-        let cleanup_debt = (entry.cleanup_failures as f64 * 0.3).min(0.6);
+        // Cleanup failure component: 0.3 per recent failed cleanup.
+        let cleanup_debt = (entry.recent_cleanup_failures.len() as f64 * 0.3).min(0.6);
 
         // Weighted combination, capped at 1.0.
         (rate_debt * 0.4 + escalation_debt * 0.3 + cleanup_debt * 0.3).clamp(0.0, 1.0)
@@ -670,7 +695,7 @@ mod tests {
     use crate::self_test::{SelfTestHistory, SelfTestService, DEFAULT_RESULT_CAPACITY, DEFAULT_RUN_CAPACITY};
     use crate::workers::WorkerPool;
     use chrono::Duration as ChronoDuration;
-    use rch_common::{SelfTestConfig, WorkerConfig};
+    use rch_common::SelfTestConfig;
     use std::sync::Arc;
     use std::time::Instant;
 
@@ -798,11 +823,14 @@ mod tests {
         {
             let mut stats = orch.worker_stats.write().await;
             let entry = stats.entry("w1".to_string()).or_default();
+            let now = Instant::now();
             for _ in 0..5 {
-                entry.recent_cancellations.push(Instant::now());
+                entry.recent_cancellations.push(now);
             }
-            entry.escalation_total = 3;
-            entry.cleanup_failures = 1;
+            for _ in 0..3 {
+                entry.recent_escalations.push(now);
+            }
+            entry.recent_cleanup_failures.push(now);
         }
 
         let debt = orch.cancellation_debt("w1").await;
@@ -818,11 +846,16 @@ mod tests {
         {
             let mut stats = orch.worker_stats.write().await;
             let entry = stats.entry("w1".to_string()).or_default();
+            let now = Instant::now();
             for _ in 0..100 {
-                entry.recent_cancellations.push(Instant::now());
+                entry.recent_cancellations.push(now);
             }
-            entry.escalation_total = 100;
-            entry.cleanup_failures = 100;
+            for _ in 0..100 {
+                entry.recent_escalations.push(now);
+            }
+            for _ in 0..100 {
+                entry.recent_cleanup_failures.push(now);
+            }
         }
 
         let debt = orch.cancellation_debt("w1").await;
