@@ -2527,7 +2527,12 @@ async fn handle_cancel_build(
     force: bool,
 ) -> CancelBuildResponse {
     ctx.cancellation
-        .cancel_build(ctx, build_id, crate::cancellation::CancelReason::User, force)
+        .cancel_build(
+            ctx,
+            build_id,
+            crate::cancellation::CancelReason::User,
+            force,
+        )
         .await
 }
 
@@ -2536,6 +2541,93 @@ async fn handle_cancel_build(
 /// Delegates to the CancellationOrchestrator for each active build.
 async fn handle_cancel_all_builds(ctx: &DaemonContext, force: bool) -> CancelAllBuildsResponse {
     ctx.cancellation.cancel_all_builds(ctx, force).await
+}
+
+fn cancellation_issues_from_recent_builds(recent_builds: &[BuildRecord]) -> Vec<Issue> {
+    let mut cancelled = 0usize;
+    let mut cleanup_failures = 0usize;
+    let mut sigkill_escalations = 0usize;
+    let mut unreachable_workers = 0usize;
+    let mut latest_operation: Option<String> = None;
+
+    for build in recent_builds {
+        let Some(cancellation) = &build.cancellation else {
+            continue;
+        };
+        cancelled += 1;
+        latest_operation = Some(cancellation.operation_id.clone());
+        if !cancellation.cleanup_ok {
+            cleanup_failures += 1;
+        }
+        if cancellation.escalation_stage == "sigkill" {
+            sigkill_escalations += 1;
+        }
+        if cancellation
+            .worker_health
+            .as_ref()
+            .is_some_and(|health| health.status == "unreachable")
+        {
+            unreachable_workers += 1;
+        }
+    }
+
+    let mut issues = Vec::new();
+    if cleanup_failures > 0 {
+        let operation_hint = latest_operation
+            .map(|op| format!(" Last operation: {op}."))
+            .unwrap_or_default();
+        issues.push(Issue {
+            severity: "error".to_string(),
+            summary: format!(
+                "{} recent cancellation(s) finished with cleanup failures.{operation_hint}",
+                cleanup_failures
+            ),
+            remediation: Some(
+                "Run `rch workers probe --all`, then inspect daemon logs for `cancellation_failed` events before retrying affected builds.".to_string(),
+            ),
+        });
+    }
+
+    if sigkill_escalations > 0 {
+        issues.push(Issue {
+            severity: "warning".to_string(),
+            summary: format!(
+                "{} recent cancellation(s) escalated to SIGKILL (stuck or unresponsive process trees).",
+                sigkill_escalations
+            ),
+            remediation: Some(
+                "Check for stuck toolchain phases with `rch status --jobs` and investigate long-running remote processes.".to_string(),
+            ),
+        });
+    }
+
+    if unreachable_workers > 0 {
+        issues.push(Issue {
+            severity: "warning".to_string(),
+            summary: format!(
+                "{} cancellation(s) ended while worker health reported unreachable.",
+                unreachable_workers
+            ),
+            remediation: Some(
+                "Validate worker reachability with `rch workers probe --all` and confirm SSH connectivity before resuming remote builds.".to_string(),
+            ),
+        });
+    }
+
+    if cancelled > 0 && issues.is_empty() {
+        issues.push(Issue {
+            severity: "info".to_string(),
+            summary: format!(
+                "{} recent cancellation(s) completed cleanly with deterministic cleanup.",
+                cancelled
+            ),
+            remediation: Some(
+                "No action required. Use `rch status --json` to inspect cancellation metadata if debugging build interruptions.".to_string(),
+            ),
+        });
+    }
+
+    issues
 }
 
 /// Handle a status request.
@@ -2685,6 +2777,7 @@ async fn handle_status(ctx: &DaemonContext) -> Result<DaemonFullStatus> {
 
     // Get recent builds from history
     let recent_builds = ctx.history.recent(20);
+    issues.extend(cancellation_issues_from_recent_builds(&recent_builds));
     let stats = ctx.history.stats();
     let test_stats = ctx.telemetry.test_run_stats().await;
 
@@ -3008,7 +3101,10 @@ mod tests {
     };
     use chrono::Duration as ChronoDuration;
     use rch_common::test_guard;
-    use rch_common::{SelfTestConfig, WorkerCapabilities};
+    use rch_common::{
+        BuildCancellationMetadata, BuildCancellationWorkerHealth, SelfTestConfig,
+        WorkerCapabilities,
+    };
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -5039,6 +5135,68 @@ mod tests {
                 .iter()
                 .any(|issue| issue.summary.contains("critical pressure state")),
             "status issues should include critical pressure signal"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_status_emits_cancellation_cleanup_issue() {
+        let _guard = test_guard!();
+        let pool = WorkerPool::new();
+        pool.add_worker(make_test_worker("worker1", 8)).await;
+        let ctx = make_test_context(pool);
+
+        let active = ctx.history.start_active_build(
+            "test-project".to_string(),
+            "worker1".to_string(),
+            "cargo test".to_string(),
+            0,
+            4,
+            rch_common::BuildLocation::Remote,
+        );
+        let cancellation = BuildCancellationMetadata {
+            operation_id: "cancel-1".to_string(),
+            origin: "timeout".to_string(),
+            reason_code: "timeout".to_string(),
+            decision_path: vec![
+                "requested".to_string(),
+                "term_sent".to_string(),
+                "remote_kill_sent".to_string(),
+                "escalated".to_string(),
+                "completed".to_string(),
+            ],
+            escalation_stage: "sigkill".to_string(),
+            escalation_count: 2,
+            remote_kill_attempted: true,
+            cleanup_ok: false,
+            history_cancelled: true,
+            final_state: "completed".to_string(),
+            worker_health: Some(BuildCancellationWorkerHealth {
+                status: "unreachable".to_string(),
+                speed_score: 0.0,
+                used_slots: 4,
+                available_slots: 0,
+                pressure_state: "critical".to_string(),
+                pressure_reason_code: "disk_free_below_critical_gb".to_string(),
+            }),
+        };
+        let _ = ctx
+            .history
+            .cancel_active_build(active.id, None, Some(cancellation));
+
+        let status = handle_status(&ctx).await.expect("status should succeed");
+        assert!(
+            status
+                .issues
+                .iter()
+                .any(|issue| issue.summary.contains("cleanup failures")),
+            "status issues should include cancellation cleanup failures"
+        );
+        assert!(
+            status
+                .issues
+                .iter()
+                .any(|issue| issue.summary.contains("SIGKILL")),
+            "status issues should include cancellation escalation warnings"
         );
     }
 
