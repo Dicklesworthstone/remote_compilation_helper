@@ -11,7 +11,10 @@
 
 use crate::admission::AdmissionGate;
 use crate::disk_pressure::PressureState;
-use crate::metrics::latency::{DecisionTimer, DecisionType};
+use crate::metrics::{
+    self,
+    latency::{DecisionTimer, DecisionType},
+};
 use crate::ui::workers::{debug_routing_enabled, log_routing_decision};
 use crate::workers::{WorkerPool, WorkerState};
 use rand::Rng;
@@ -627,6 +630,17 @@ impl WorkerSelector {
     pub async fn select(&self, pool: &WorkerPool, request: &SelectionRequest) -> SelectionResult {
         let _timer = DecisionTimer::new(DecisionType::WorkerSelection);
         let select_start = Instant::now();
+        let correlation_id = request
+            .hook_pid
+            .map(|pid| format!("hook-{pid}"))
+            .unwrap_or_else(|| "hook-unknown".to_string());
+        debug!(
+            correlation_id = %correlation_id,
+            project = %request.project,
+            strategy = ?self.config.strategy,
+            command_priority = ?request.command_priority,
+            "Starting worker selection"
+        );
         let cache_use = cache_use_for_request(request);
 
         // Get eligible workers
@@ -636,6 +650,7 @@ impl WorkerSelector {
                 // Record failed selection in audit log
                 self.record_audit_entry(request, Vec::new(), None, &reason, select_start.elapsed())
                     .await;
+                record_selection_metrics(&reason, select_start.elapsed());
                 return SelectionResult {
                     worker: None,
                     reason,
@@ -661,6 +676,10 @@ impl WorkerSelector {
                         "Using affinity fallback worker {} for project {}",
                         fallback_worker_id, request.project
                     );
+                    record_selection_metrics(
+                        &SelectionReason::AffinityFallback,
+                        select_start.elapsed(),
+                    );
                     return SelectionResult {
                         worker: Some(worker),
                         reason: SelectionReason::AffinityFallback,
@@ -677,6 +696,7 @@ impl WorkerSelector {
                 select_start.elapsed(),
             )
             .await;
+            record_selection_metrics(&SelectionReason::AllWorkersBusy, select_start.elapsed());
             return SelectionResult {
                 worker: None,
                 reason: SelectionReason::AllWorkersBusy,
@@ -708,6 +728,7 @@ impl WorkerSelector {
                 select_start.elapsed(),
             )
             .await;
+            record_selection_metrics(&SelectionReason::AffinityPinned, select_start.elapsed());
 
             // If selecting a half-open worker, start the probe
             if circuit_state == CircuitState::HalfOpen {
@@ -796,6 +817,7 @@ impl WorkerSelector {
             // Record the selection for fairness tracking
             let mut history = self.selection_history.write().await;
             history.record_selection(&worker_id);
+            record_selection_metrics(&SelectionReason::Success, select_start.elapsed());
 
             SelectionResult {
                 worker: Some(worker),
@@ -814,6 +836,7 @@ impl WorkerSelector {
                 select_start.elapsed(),
             )
             .await;
+            record_selection_metrics(&SelectionReason::AllWorkersBusy, select_start.elapsed());
 
             SelectionResult {
                 worker: None,
@@ -1231,8 +1254,21 @@ impl WorkerSelector {
             // to avoid racing with an in-progress sync.  Drifting workers are
             // allowed with a debug warning since partial freshness may suffice.
             if let Some(ref convergence_svc) = self.repo_convergence {
+                let convergence_start = Instant::now();
                 let wid = rch_common::WorkerId::new(worker_id.as_str());
                 let drift_state = convergence_svc.get_drift_state(&wid).await;
+                let convergence_outcome = match drift_state {
+                    crate::repo_convergence::ConvergenceDriftState::Ready => "ready",
+                    crate::repo_convergence::ConvergenceDriftState::Drifting => "drifting",
+                    crate::repo_convergence::ConvergenceDriftState::Converging => "converging",
+                    crate::repo_convergence::ConvergenceDriftState::Failed => "failed",
+                    crate::repo_convergence::ConvergenceDriftState::Stale => "stale",
+                };
+                metrics::observe_reliability_decision(
+                    "preflight_convergence",
+                    convergence_outcome,
+                    convergence_start.elapsed(),
+                );
                 match drift_state {
                     crate::repo_convergence::ConvergenceDriftState::Ready => {
                         // All repos present and fresh — passes check.
@@ -1259,6 +1295,10 @@ impl WorkerSelector {
                         debug!(
                             "Worker {} excluded: repo convergence failed (budgets exhausted)",
                             worker_id
+                        );
+                        metrics::inc_reliability_error(
+                            "preflight_convergence",
+                            "convergence_failed",
                         );
                         passes_preflight = false;
                         hard_preflight_block = true;
@@ -1306,6 +1346,7 @@ impl WorkerSelector {
             // fall back to the original pressure-state filter (bd-vvmd.4.2).
             if let Some(ref gate) = self.admission_gate {
                 use crate::admission::AdmissionVerdict;
+                let admission_start = Instant::now();
                 let verdict = gate
                     .evaluate(worker.as_ref(), worker_id.as_str(), &request.project)
                     .await;
@@ -1318,8 +1359,17 @@ impl WorkerSelector {
                             "Worker {} admission rejected: {} ({})",
                             worker_id, reason, reason_code
                         );
+                        metrics::observe_reliability_decision(
+                            "preflight_pressure",
+                            "reject",
+                            admission_start.elapsed(),
+                        );
                         if reason_code == "admission_critical_pressure" {
                             // Critical pressure: hard exclusion (not even in fallback)
+                            metrics::inc_reliability_error(
+                                "preflight_pressure",
+                                "critical_pressure",
+                            );
                             hard_preflight_block = true;
                         }
                         passes_preflight = false;
@@ -1332,11 +1382,28 @@ impl WorkerSelector {
                             "Worker {} admitted: penalty={:.2}, headroom={:.2}",
                             worker_id, pressure_penalty, headroom_score
                         );
+                        metrics::observe_reliability_decision(
+                            "preflight_pressure",
+                            "admit",
+                            admission_start.elapsed(),
+                        );
                     }
                 }
             } else {
                 // Legacy path: basic pressure-state filter (bd-vvmd.4.2)
+                let pressure_start = Instant::now();
                 let pressure = worker.pressure_assessment().await;
+                let pressure_outcome = match pressure.state {
+                    PressureState::Healthy => "healthy",
+                    PressureState::Warning => "warning",
+                    PressureState::Critical => "critical",
+                    PressureState::TelemetryGap => "telemetry_gap",
+                };
+                metrics::observe_reliability_decision(
+                    "preflight_pressure",
+                    pressure_outcome,
+                    pressure_start.elapsed(),
+                );
                 match pressure.state {
                     PressureState::Critical => {
                         debug!(
@@ -1347,6 +1414,7 @@ impl WorkerSelector {
                             pressure.reason_code,
                             pressure.policy_rule
                         );
+                        metrics::inc_reliability_error("preflight_pressure", "critical_pressure");
                         passes_preflight = false;
                         hard_preflight_block = true;
                     }
@@ -1376,12 +1444,26 @@ impl WorkerSelector {
             // Quarantined workers receive a hard exclusion; degraded workers
             // pass through with their penalty applied later in scoring.
             if let Some(ref agg) = self.reliability {
+                let reliability_start = Instant::now();
                 let assessment = agg.evaluate(worker.as_ref(), worker_id.as_str()).await;
+                let reliability_outcome = if assessment.hard_exclude {
+                    "quarantined"
+                } else if assessment.penalty > 0.0 {
+                    "degraded"
+                } else {
+                    "healthy"
+                };
+                metrics::observe_reliability_decision(
+                    "reliability_preflight",
+                    reliability_outcome,
+                    reliability_start.elapsed(),
+                );
                 if assessment.hard_exclude {
                     debug!(
                         "Worker {} excluded: reliability quarantined (debt={:.2}, state={})",
                         worker_id, assessment.aggregated_debt, assessment.health_state
                     );
+                    metrics::inc_reliability_error("reliability_preflight", "quarantined");
                     passes_preflight = false;
                     hard_preflight_block = true;
                 }
@@ -1390,6 +1472,7 @@ impl WorkerSelector {
             // Critical pressure is a hard preflight exclusion. We do not
             // include these workers in fail-open remote fallback candidates.
             if hard_preflight_block {
+                metrics::inc_reliability_error("selection", "preflight_blocked");
                 filtered_by_hard_preflight += 1;
                 continue;
             }
@@ -2169,15 +2252,65 @@ fn normalize_priority(priority: u32, min_priority: u32, max_priority: u32) -> f6
     }
 }
 
+fn selection_reason_label(reason: &SelectionReason) -> &'static str {
+    match reason {
+        SelectionReason::Success => "success",
+        SelectionReason::NoWorkersConfigured => "no_workers_configured",
+        SelectionReason::AllWorkersUnreachable => "all_workers_unreachable",
+        SelectionReason::AllCircuitsOpen => "all_circuits_open",
+        SelectionReason::AllWorkersBusy => "all_workers_busy",
+        SelectionReason::AllWorkersFailedPreflight => "all_workers_failed_preflight",
+        SelectionReason::AllWorkersFailedConvergence => "all_workers_failed_convergence",
+        SelectionReason::NoMatchingWorkers => "no_matching_workers",
+        SelectionReason::NoWorkersWithRuntime(_) => "no_workers_with_runtime",
+        SelectionReason::SelectionError(_) => "selection_error",
+        SelectionReason::AffinityPinned => "affinity_pinned",
+        SelectionReason::AffinityFallback => "affinity_fallback",
+    }
+}
+
+fn selection_outcome_label(reason: &SelectionReason) -> &'static str {
+    match reason {
+        SelectionReason::Success | SelectionReason::AffinityPinned => "success",
+        SelectionReason::AffinityFallback => "fallback",
+        _ => "failure",
+    }
+}
+
+fn record_selection_metrics(reason: &SelectionReason, duration: Duration) {
+    metrics::observe_reliability_decision("selection", selection_outcome_label(reason), duration);
+    if !matches!(
+        reason,
+        SelectionReason::Success
+            | SelectionReason::AffinityPinned
+            | SelectionReason::AffinityFallback
+    ) {
+        metrics::inc_local_fallback_reason(selection_reason_label(reason));
+        if matches!(reason, SelectionReason::SelectionError(_)) {
+            metrics::inc_reliability_error("selection", "selection_error");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::process_triage::{RemediationPipeline, RemediationPipelineConfig};
+    use crate::reliability::{
+        ReliabilityAggregator, ReliabilityConfig, SignalWeights, WorkerHealthState,
+    };
     use crate::workers::WorkerState;
     use rch_common::WorkerStatus;
+    use rch_common::e2e::process_triage::{
+        PROCESS_TRIAGE_CONTRACT_SCHEMA_VERSION, ProcessClassification, ProcessDescriptor,
+        ProcessTriageActionClass, ProcessTriageActionRequest, ProcessTriageContract,
+        ProcessTriageRequest, ProcessTriageResponseStatus, ProcessTriageTrigger,
+    };
     use rch_common::test_guard;
     use rch_common::{
         CommandPriority, RequiredRuntime, SelectionWeightConfig, WorkerConfig, WorkerId,
     };
+    use std::sync::Arc;
 
     fn make_worker(id: &str, total_slots: u32, speed: f64) -> WorkerState {
         let config = WorkerConfig {
@@ -2192,6 +2325,81 @@ mod tests {
         let state = WorkerState::new(config);
         state.set_speed_score(speed);
         state
+    }
+
+    fn process_only_weights() -> SignalWeights {
+        SignalWeights {
+            circuit: 0.0,
+            convergence: 0.0,
+            pressure: 0.0,
+            process: 1.0,
+            cancellation: 0.0,
+        }
+    }
+
+    fn make_hard_terminate_request(
+        worker_id: &str,
+        correlation_id: &str,
+        pid: u32,
+    ) -> ProcessTriageRequest {
+        ProcessTriageRequest {
+            schema_version: PROCESS_TRIAGE_CONTRACT_SCHEMA_VERSION.to_string(),
+            correlation_id: correlation_id.to_string(),
+            worker_id: worker_id.to_string(),
+            observed_at_unix_ms: chrono::Utc::now().timestamp_millis(),
+            trigger: ProcessTriageTrigger::BuildTimeout,
+            detector_confidence_percent: 99,
+            retry_attempt: 0,
+            candidate_processes: vec![ProcessDescriptor {
+                pid,
+                ppid: Some(1),
+                owner: "ubuntu".to_string(),
+                command: "cargo build --workspace".to_string(),
+                classification: ProcessClassification::BuildRelated,
+                cpu_percent_milli: 98_000,
+                rss_mb: 2048,
+                runtime_secs: 240,
+            }],
+            requested_actions: vec![ProcessTriageActionRequest {
+                action_class: ProcessTriageActionClass::HardTerminate,
+                pid,
+                reason_code: "stuck_hard".to_string(),
+                signal: Some("KILL".to_string()),
+            }],
+        }
+    }
+
+    async fn seeded_remediation_pipeline(
+        worker_id: &str,
+        pids: &[u32],
+    ) -> Arc<RemediationPipeline> {
+        let mut contract = ProcessTriageContract::default();
+        contract
+            .safe_action_policy
+            .allow_action_classes
+            .push(ProcessTriageActionClass::HardTerminate);
+        contract
+            .safe_action_policy
+            .deny_action_classes
+            .retain(|class| *class != ProcessTriageActionClass::HardTerminate);
+
+        let pipeline = Arc::new(RemediationPipeline::new(
+            contract,
+            crate::events::EventBus::new(64),
+            RemediationPipelineConfig {
+                dry_run: true,
+                worker_cooldown: Duration::from_millis(0),
+                ..RemediationPipelineConfig::default()
+            },
+        ));
+
+        for (idx, pid) in pids.iter().enumerate() {
+            let request = make_hard_terminate_request(worker_id, &format!("corr-hard-{idx}"), *pid);
+            let response = pipeline.execute(&request).await;
+            assert_eq!(response.status, ProcessTriageResponseStatus::Applied);
+        }
+
+        pipeline
     }
 
     #[test]
@@ -2245,6 +2453,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_select_worker_ignores_unhealthy() {
+        let _guard = test_guard!();
         let pool = WorkerPool::new();
         pool.add_worker(make_worker("healthy", 8, 50.0).config.read().await.clone())
             .await;
@@ -2277,6 +2486,44 @@ mod tests {
         let selected = select_worker(&pool, &request, &weights).await;
         let selected = selected.expect("Expected a healthy worker to be selected");
         assert_eq!(selected.config.read().await.id.as_str(), "healthy");
+    }
+
+    #[tokio::test]
+    async fn test_selection_metrics_capture_local_fallback_reason() {
+        let _guard = test_guard!();
+        let pool = WorkerPool::new();
+        let selector = WorkerSelector::new();
+        let request = SelectionRequest {
+            project: "metrics-fallback-project".to_string(),
+            command: Some("cargo test".to_string()),
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 1,
+            preferred_workers: vec![],
+            toolchain: None,
+            required_runtime: RequiredRuntime::default(),
+            classification_duration_us: Some(123),
+            hook_pid: Some(4321),
+        };
+
+        let decision_before = crate::metrics::RELIABILITY_DECISIONS_TOTAL
+            .with_label_values(&["selection", "failure"])
+            .get();
+        let fallback_before = crate::metrics::LOCAL_FALLBACK_REASON_TOTAL
+            .with_label_values(&["no_workers_configured"])
+            .get();
+
+        let result = selector.select(&pool, &request).await;
+        assert_eq!(result.reason, SelectionReason::NoWorkersConfigured);
+
+        let decision_after = crate::metrics::RELIABILITY_DECISIONS_TOTAL
+            .with_label_values(&["selection", "failure"])
+            .get();
+        let fallback_after = crate::metrics::LOCAL_FALLBACK_REASON_TOTAL
+            .with_label_values(&["no_workers_configured"])
+            .get();
+
+        assert!(decision_after > decision_before);
+        assert!(fallback_after > fallback_before);
     }
 
     #[tokio::test]
@@ -4501,6 +4748,140 @@ mod tests {
             assert!(log.last().is_none());
             assert!(log.get(1).is_none());
             assert!(log.last_n(5).is_empty());
+        }
+
+        // ====================================================================
+        // Reliability-aware selection tests (bd-vvmd.5.6)
+        // ====================================================================
+
+        #[tokio::test]
+        async fn test_reliability_degraded_penalty_reorders_balanced_selection() {
+            let _guard = test_guard!();
+            let pool = WorkerPool::new();
+            pool.add_worker_state(make_worker("risky", 8, 95.0)).await;
+            pool.add_worker_state(make_worker("steady", 8, 70.0)).await;
+
+            let remediation = seeded_remediation_pipeline("risky", &[1001, 1002]).await;
+
+            let reliability_cfg = ReliabilityConfig {
+                weights: process_only_weights(),
+                quarantine_threshold: 0.95,
+                degraded_penalty_floor: 0.05,
+                ..ReliabilityConfig::default()
+            };
+
+            let mut reliability = ReliabilityAggregator::new(reliability_cfg);
+            reliability.set_remediation(remediation);
+
+            let mut selector = WorkerSelector::with_config(
+                SelectionConfig {
+                    strategy: SelectionStrategy::Balanced,
+                    weights: SelectionWeightConfig {
+                        speedscore: 1.0,
+                        slots: 0.0,
+                        health: 0.0,
+                        cache: 0.0,
+                        network: 0.0,
+                        priority: 0.0,
+                        ..SelectionWeightConfig::default()
+                    },
+                    ..SelectionConfig::default()
+                },
+                CircuitBreakerConfig::default(),
+            );
+            selector.set_reliability(Arc::new(reliability));
+
+            let request = SelectionRequest {
+                project: "reliability-penalty".to_string(),
+                command: Some("cargo build --workspace".to_string()),
+                command_priority: CommandPriority::Normal,
+                estimated_cores: 1,
+                preferred_workers: vec![],
+                toolchain: None,
+                required_runtime: RequiredRuntime::default(),
+                classification_duration_us: None,
+                hook_pid: None,
+            };
+
+            let result = selector.select(&pool, &request).await;
+            assert_eq!(result.reason, SelectionReason::Success);
+            let selected = result.worker.expect("expected selected worker");
+            assert_eq!(selected.config.read().await.id.as_str(), "steady");
+
+            let assessment = selector
+                .reliability
+                .as_ref()
+                .expect("reliability wired")
+                .get_assessment("risky")
+                .await
+                .expect("expected cached reliability assessment");
+            assert_eq!(assessment.health_state, WorkerHealthState::Degraded);
+            assert!(!assessment.hard_exclude);
+
+            let audit = selector
+                .get_last_audit_entry()
+                .await
+                .expect("expected selection audit entry");
+            let risky_breakdown = audit
+                .workers_evaluated
+                .iter()
+                .find(|w| w.worker_id == "risky")
+                .expect("expected risky worker in audit");
+            assert_eq!(
+                risky_breakdown.reliability_state.as_deref(),
+                Some("degraded")
+            );
+        }
+
+        #[tokio::test]
+        async fn test_reliability_quarantine_worker_hard_excluded_preflight() {
+            let _guard = test_guard!();
+            let pool = WorkerPool::new();
+            pool.add_worker_state(make_worker("risky", 8, 95.0)).await;
+
+            let remediation = seeded_remediation_pipeline("risky", &[2001, 2002]).await;
+
+            let reliability_cfg = ReliabilityConfig {
+                weights: process_only_weights(),
+                quarantine_threshold: 0.05,
+                ..ReliabilityConfig::default()
+            };
+
+            let mut reliability = ReliabilityAggregator::new(reliability_cfg);
+            reliability.set_remediation(remediation);
+
+            let mut selector = WorkerSelector::new();
+            selector.set_reliability(Arc::new(reliability));
+
+            let request = SelectionRequest {
+                project: "reliability-quarantine".to_string(),
+                command: Some("cargo test".to_string()),
+                command_priority: CommandPriority::Normal,
+                estimated_cores: 1,
+                preferred_workers: vec![],
+                toolchain: None,
+                required_runtime: RequiredRuntime::default(),
+                classification_duration_us: None,
+                hook_pid: None,
+            };
+
+            let result = selector.select(&pool, &request).await;
+            assert!(
+                result.worker.is_none(),
+                "quarantined worker should be excluded"
+            );
+            assert_eq!(result.reason, SelectionReason::AllWorkersFailedPreflight);
+
+            let assessment = selector
+                .reliability
+                .as_ref()
+                .expect("reliability wired")
+                .get_assessment("risky")
+                .await
+                .expect("expected cached reliability assessment");
+            assert_eq!(assessment.health_state, WorkerHealthState::Quarantined);
+            assert!(assessment.hard_exclude);
+            assert_eq!(assessment.penalty, 1.0);
         }
 
         // ====================================================================

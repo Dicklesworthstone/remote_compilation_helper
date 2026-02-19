@@ -6,6 +6,7 @@
 #![allow(dead_code)] // Initial integration surface; consumers land in follow-on beads.
 
 use crate::events::EventBus;
+use crate::metrics;
 use chrono::Utc;
 use rch_common::e2e::process_triage::{
     PROCESS_TRIAGE_CONTRACT_SCHEMA_VERSION, ProcessTriageActionClass, ProcessTriageActionOutcome,
@@ -216,6 +217,14 @@ impl RemediationPipeline {
     /// 5. Emits audit events for every decision
     pub async fn execute(&self, request: &ProcessTriageRequest) -> ProcessTriageResponse {
         let pipeline_start = Instant::now();
+        info!(
+            correlation_id = %request.correlation_id,
+            worker_id = %request.worker_id,
+            trigger = ?request.trigger,
+            requested_actions = request.requested_actions.len(),
+            candidate_processes = request.candidate_processes.len(),
+            "Starting remediation pipeline execution"
+        );
         let now_ms = Utc::now().timestamp_millis();
 
         // Emit pipeline start event
@@ -240,6 +249,12 @@ impl RemediationPipeline {
                 &format!("Request validation failed: {e}"),
                 now_ms,
             );
+            metrics::inc_reliability_error("process_triage_pipeline", "invalid_request");
+            metrics::observe_reliability_decision(
+                "process_triage_pipeline",
+                "failure",
+                pipeline_start.elapsed(),
+            );
             self.emit_pipeline_summary(request, &response, pipeline_start, false, None);
             return response;
         }
@@ -261,6 +276,12 @@ impl RemediationPipeline {
                     self.config.max_concurrent_pipelines
                 ),
                 now_ms,
+            );
+            metrics::inc_reliability_error("process_triage_pipeline", "concurrent_limit");
+            metrics::observe_reliability_decision(
+                "process_triage_pipeline",
+                "failure",
+                pipeline_start.elapsed(),
             );
             self.emit_pipeline_summary(
                 request,
@@ -292,6 +313,12 @@ impl RemediationPipeline {
                     ),
                     now_ms,
                 );
+                metrics::inc_reliability_error("process_triage_pipeline", "worker_cooldown");
+                metrics::observe_reliability_decision(
+                    "process_triage_pipeline",
+                    "failure",
+                    pipeline_start.elapsed(),
+                );
                 self.emit_pipeline_summary(
                     request,
                     &response,
@@ -313,8 +340,9 @@ impl RemediationPipeline {
         let mut highest_escalation = ProcessTriageEscalationLevel::Automatic;
 
         for action_req in &request.requested_actions {
+            let action_start = Instant::now();
             // Timeout check
-            if pipeline_start.elapsed() > self.config.pipeline_timeout {
+            if pipeline_start.elapsed() >= self.config.pipeline_timeout {
                 aborted = true;
                 abort_reason = Some("pipeline timeout exceeded".to_string());
                 action_results.push(ProcessTriageActionResult {
@@ -323,6 +351,11 @@ impl RemediationPipeline {
                     outcome: ProcessTriageActionOutcome::Skipped,
                     note: Some("Pipeline timeout exceeded".to_string()),
                 });
+                metrics::observe_reliability_decision(
+                    "process_triage_action",
+                    "skipped",
+                    action_start.elapsed(),
+                );
                 break;
             }
 
@@ -385,6 +418,11 @@ impl RemediationPipeline {
                     outcome,
                     note: Some(decision.reason.clone()),
                 });
+                metrics::observe_reliability_decision(
+                    "process_triage_action",
+                    process_triage_action_outcome_label(&outcome),
+                    action_start.elapsed(),
+                );
 
                 // If blocked, check if we should abort the whole pipeline
                 if decision.escalation_level == ProcessTriageEscalationLevel::Blocked {
@@ -446,6 +484,14 @@ impl RemediationPipeline {
                 outcome,
                 note: signal_sent.map(|s| format!("Signal {} sent", s)),
             });
+            metrics::observe_reliability_decision(
+                "process_triage_action",
+                process_triage_action_outcome_label(&outcome),
+                action_start.elapsed(),
+            );
+            if outcome == ProcessTriageActionOutcome::Failed {
+                metrics::inc_reliability_error("process_triage_action", "action_failed");
+            }
         }
 
         // Decrement active pipeline count
@@ -524,6 +570,15 @@ impl RemediationPipeline {
                 audit_required: self.contract.safe_action_policy.require_audit_record,
             },
         };
+
+        metrics::observe_reliability_decision(
+            "process_triage_pipeline",
+            process_triage_status_label(&response.status),
+            pipeline_start.elapsed(),
+        );
+        if aborted {
+            metrics::inc_reliability_error("process_triage_pipeline", "pipeline_timeout");
+        }
 
         self.emit_pipeline_summary(request, &response, pipeline_start, aborted, abort_reason);
 
@@ -691,6 +746,25 @@ impl RemediationPipeline {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+fn process_triage_status_label(status: &ProcessTriageResponseStatus) -> &'static str {
+    match status {
+        ProcessTriageResponseStatus::Applied => "applied",
+        ProcessTriageResponseStatus::PartiallyApplied => "partially_applied",
+        ProcessTriageResponseStatus::EscalatedNoAction => "escalated_no_action",
+        ProcessTriageResponseStatus::RejectedByPolicy => "rejected_by_policy",
+        ProcessTriageResponseStatus::Failed => "failure",
+    }
+}
+
+fn process_triage_action_outcome_label(outcome: &ProcessTriageActionOutcome) -> &'static str {
+    match outcome {
+        ProcessTriageActionOutcome::Executed => "executed",
+        ProcessTriageActionOutcome::Skipped => "skipped",
+        ProcessTriageActionOutcome::Escalated => "escalated",
+        ProcessTriageActionOutcome::Failed => "failure",
+    }
+}
 
 fn escalation_rank(level: ProcessTriageEscalationLevel) -> u8 {
     match level {
@@ -1098,6 +1172,12 @@ mod tests {
         let _guard = test_guard!();
         let pipeline = make_default_pipeline();
         let proc = sample_process(1001, "cargo test", ProcessClassification::BuildRelated);
+        let pipeline_before = crate::metrics::RELIABILITY_DECISIONS_TOTAL
+            .with_label_values(&["process_triage_pipeline", "applied"])
+            .get();
+        let action_before = crate::metrics::RELIABILITY_DECISIONS_TOTAL
+            .with_label_values(&["process_triage_action", "executed"])
+            .get();
         let req = sample_request(
             vec![proc],
             vec![ProcessTriageActionRequest {
@@ -1119,6 +1199,14 @@ mod tests {
             resp.executed_actions[0].action_class,
             ProcessTriageActionClass::ObserveOnly
         );
+        let pipeline_after = crate::metrics::RELIABILITY_DECISIONS_TOTAL
+            .with_label_values(&["process_triage_pipeline", "applied"])
+            .get();
+        let action_after = crate::metrics::RELIABILITY_DECISIONS_TOTAL
+            .with_label_values(&["process_triage_action", "executed"])
+            .get();
+        assert!(pipeline_after > pipeline_before);
+        assert!(action_after > action_before);
     }
 
     #[tokio::test]
@@ -1173,6 +1261,82 @@ mod tests {
         assert_eq!(
             resp.executed_actions[0].outcome,
             ProcessTriageActionOutcome::Escalated
+        );
+    }
+
+    #[tokio::test]
+    async fn test_hard_terminate_allowed_by_policy_executes_with_kill_signal() {
+        let _guard = test_guard!();
+        let mut contract = ProcessTriageContract::default();
+        contract
+            .safe_action_policy
+            .allow_action_classes
+            .push(ProcessTriageActionClass::HardTerminate);
+        contract
+            .safe_action_policy
+            .deny_action_classes
+            .retain(|class| *class != ProcessTriageActionClass::HardTerminate);
+
+        let events = EventBus::new(64);
+        let mut rx = events.subscribe();
+        let pipeline = RemediationPipeline::new(
+            contract,
+            events,
+            RemediationPipelineConfig {
+                dry_run: true,
+                worker_cooldown: Duration::from_millis(0),
+                ..RemediationPipelineConfig::default()
+            },
+        );
+        let proc = sample_process(1001, "cargo build", ProcessClassification::BuildRelated);
+        let req = sample_request(
+            vec![proc],
+            vec![ProcessTriageActionRequest {
+                action_class: ProcessTriageActionClass::HardTerminate,
+                pid: 1001,
+                reason_code: "stuck_hard".to_string(),
+                signal: Some("KILL".to_string()),
+            }],
+        );
+
+        let resp = pipeline.execute(&req).await;
+        assert_eq!(resp.status, ProcessTriageResponseStatus::Applied);
+        assert_eq!(resp.executed_actions.len(), 1);
+        assert_eq!(
+            resp.executed_actions[0].action_class,
+            ProcessTriageActionClass::HardTerminate
+        );
+        assert_eq!(
+            resp.executed_actions[0].outcome,
+            ProcessTriageActionOutcome::Executed
+        );
+        assert_eq!(
+            resp.executed_actions[0].note.as_deref(),
+            Some("Signal KILL sent")
+        );
+
+        let mut saw_hard_kill_audit = false;
+        while let Ok(msg) = tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
+            if let Ok(msg) = msg {
+                let parsed: serde_json::Value = serde_json::from_str(&msg).unwrap();
+                if parsed["event"] == "process_triage.action_audit"
+                    && parsed["data"]["pid"] == 1001
+                    && parsed["data"]["action_class"] == "hard_terminate"
+                {
+                    saw_hard_kill_audit = true;
+                    assert_eq!(parsed["data"]["signal"], "KILL");
+                    assert_eq!(parsed["data"]["decision_code"], "PT_ALLOW_AUTOMATIC");
+                    assert_eq!(
+                        parsed["data"]["evidence"]["detector_confidence_percent"],
+                        96
+                    );
+                    break;
+                }
+            }
+        }
+        assert!(
+            saw_hard_kill_audit,
+            "expected hard-terminate audit event with KILL signal"
         );
     }
 
@@ -1448,6 +1612,57 @@ mod tests {
             resp.escalation_level,
             ProcessTriageEscalationLevel::ManualReview
         );
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_timeout_marks_actions_skipped_and_returns_timeout_failure() {
+        let _guard = test_guard!();
+        let pipeline = make_test_pipeline(RemediationPipelineConfig {
+            dry_run: true,
+            worker_cooldown: Duration::from_millis(0),
+            pipeline_timeout: Duration::from_secs(0),
+            ..RemediationPipelineConfig::default()
+        });
+        let decision_before = crate::metrics::RELIABILITY_DECISIONS_TOTAL
+            .with_label_values(&["process_triage_pipeline", "failure"])
+            .get();
+        let error_before = crate::metrics::RELIABILITY_ERRORS_TOTAL
+            .with_label_values(&["process_triage_pipeline", "pipeline_timeout"])
+            .get();
+        let proc = sample_process(1001, "cargo test", ProcessClassification::BuildRelated);
+        let req = sample_request(
+            vec![proc],
+            vec![ProcessTriageActionRequest {
+                action_class: ProcessTriageActionClass::SoftTerminate,
+                pid: 1001,
+                reason_code: "timeout_check".to_string(),
+                signal: Some("TERM".to_string()),
+            }],
+        );
+
+        let resp = pipeline.execute(&req).await;
+        assert_eq!(resp.status, ProcessTriageResponseStatus::Failed);
+        assert_eq!(resp.executed_actions.len(), 1);
+        assert_eq!(
+            resp.executed_actions[0].outcome,
+            ProcessTriageActionOutcome::Skipped
+        );
+        assert_eq!(
+            resp.executed_actions[0].note.as_deref(),
+            Some("Pipeline timeout exceeded")
+        );
+
+        let failure = resp.failure.expect("expected timeout failure payload");
+        assert_eq!(failure.kind, ProcessTriageFailureKind::Timeout);
+        assert_eq!(failure.code, "PT_PIPELINE_TIMEOUT");
+        let decision_after = crate::metrics::RELIABILITY_DECISIONS_TOTAL
+            .with_label_values(&["process_triage_pipeline", "failure"])
+            .get();
+        let error_after = crate::metrics::RELIABILITY_ERRORS_TOTAL
+            .with_label_values(&["process_triage_pipeline", "pipeline_timeout"])
+            .get();
+        assert!(decision_after > decision_before);
+        assert!(error_after > error_before);
     }
 
     // -----------------------------------------------------------------------

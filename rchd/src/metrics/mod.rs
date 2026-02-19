@@ -22,6 +22,7 @@ use lazy_static::lazy_static;
 use prometheus::{
     CounterVec, Encoder, GaugeVec, HistogramOpts, HistogramVec, Opts, Registry, TextEncoder,
 };
+use std::time::Duration;
 
 lazy_static! {
     /// Global Prometheus registry for all RCH metrics.
@@ -209,6 +210,58 @@ lazy_static! {
     ).expect("Failed to create DECISION_BUDGET_VIOLATIONS metric");
 
     // =========================================================================
+    // Reliability Metrics (bd-vvmd.6.2)
+    // =========================================================================
+
+    /// Reliability and preflight decisions by service and outcome.
+    pub static ref RELIABILITY_DECISIONS_TOTAL: CounterVec = CounterVec::new(
+        Opts::new(
+            "rch_reliability_decisions_total",
+            "Reliability, preflight, and remediation decisions by service and outcome"
+        ),
+        &["service", "outcome"]
+    ).expect("Failed to create RELIABILITY_DECISIONS_TOTAL metric");
+
+    /// Reliability decision latency by service and outcome.
+    pub static ref RELIABILITY_DECISION_LATENCY: HistogramVec = HistogramVec::new(
+        HistogramOpts::new(
+            "rch_reliability_decision_latency_seconds",
+            "Reliability decision latency in seconds"
+        )
+        .buckets(vec![
+            0.0001, // 100us
+            0.0005, // 500us
+            0.001,  // 1ms
+            0.005,  // 5ms
+            0.01,   // 10ms
+            0.05,   // 50ms
+            0.1,    // 100ms
+            0.5,    // 500ms
+            1.0,    // 1s
+            5.0,    // 5s
+        ]),
+        &["service", "outcome"]
+    ).expect("Failed to create RELIABILITY_DECISION_LATENCY metric");
+
+    /// Reliability and remediation errors by service and normalized kind.
+    pub static ref RELIABILITY_ERRORS_TOTAL: CounterVec = CounterVec::new(
+        Opts::new(
+            "rch_reliability_errors_total",
+            "Reliability and remediation errors by service and normalized kind"
+        ),
+        &["service", "error_kind"]
+    ).expect("Failed to create RELIABILITY_ERRORS_TOTAL metric");
+
+    /// Local fallback reasons observed from selection outcomes.
+    pub static ref LOCAL_FALLBACK_REASON_TOTAL: CounterVec = CounterVec::new(
+        Opts::new(
+            "rch_local_fallback_reason_total",
+            "Local fallback reasons grouped by normalized reason label"
+        ),
+        &["reason"]
+    ).expect("Failed to create LOCAL_FALLBACK_REASON_TOTAL metric");
+
+    // =========================================================================
     // Classification Tier Metrics
     // =========================================================================
 
@@ -273,6 +326,12 @@ pub fn register_metrics() -> Result<()> {
     // Decision latency metrics (CRITICAL)
     REGISTRY.register(Box::new(DECISION_LATENCY.clone()))?;
     REGISTRY.register(Box::new(DECISION_BUDGET_VIOLATIONS.clone()))?;
+
+    // Reliability metrics
+    REGISTRY.register(Box::new(RELIABILITY_DECISIONS_TOTAL.clone()))?;
+    REGISTRY.register(Box::new(RELIABILITY_DECISION_LATENCY.clone()))?;
+    REGISTRY.register(Box::new(RELIABILITY_ERRORS_TOTAL.clone()))?;
+    REGISTRY.register(Box::new(LOCAL_FALLBACK_REASON_TOTAL.clone()))?;
 
     // Classification tier metrics
     REGISTRY.register(Box::new(CLASSIFICATION_TIER_TOTAL.clone()))?;
@@ -452,6 +511,126 @@ pub fn dec_connections() {
 /// Record an API request.
 pub fn inc_requests(endpoint: &str) {
     DAEMON_REQUESTS_TOTAL.with_label_values(&[endpoint]).inc();
+}
+
+// ============================================================================
+// Reliability Metric Helpers
+// ============================================================================
+
+fn normalize_reliability_service_label(service: &str) -> &'static str {
+    match service {
+        "selection" => "selection",
+        "preflight_convergence" => "preflight_convergence",
+        "preflight_pressure" => "preflight_pressure",
+        "reliability_aggregate" => "reliability_aggregate",
+        "reliability_preflight" => "reliability_preflight",
+        "convergence_signal" => "convergence_signal",
+        "pressure_signal" => "pressure_signal",
+        "process_signal" => "process_signal",
+        "cancellation_signal" => "cancellation_signal",
+        "process_triage_pipeline" => "process_triage_pipeline",
+        "process_triage_action" => "process_triage_action",
+        _ => "other",
+    }
+}
+
+fn normalize_reliability_outcome_label(outcome: &str) -> &'static str {
+    match outcome {
+        "success" => "success",
+        "failure" => "failure",
+        "fallback" => "fallback",
+        "admit" => "admit",
+        "reject" => "reject",
+        "ready" => "ready",
+        "drifting" => "drifting",
+        "converging" => "converging",
+        "stale" => "stale",
+        "failed" => "failed",
+        "healthy" => "healthy",
+        "warning" => "warning",
+        "critical" => "critical",
+        "telemetry_gap" => "telemetry_gap",
+        "quarantined" => "quarantined",
+        "degraded" => "degraded",
+        "probing_recovery" => "probing_recovery",
+        "clean" => "clean",
+        "elevated" => "elevated",
+        "applied" => "applied",
+        "partially_applied" => "partially_applied",
+        "escalated_no_action" => "escalated_no_action",
+        "rejected_by_policy" => "rejected_by_policy",
+        "executed" => "executed",
+        "skipped" => "skipped",
+        "escalated" => "escalated",
+        "missing_service" => "missing_service",
+        _ => "other",
+    }
+}
+
+fn normalize_reliability_error_kind_label(error_kind: &str) -> &'static str {
+    match error_kind {
+        "invalid_request" => "invalid_request",
+        "concurrent_limit" => "concurrent_limit",
+        "worker_cooldown" => "worker_cooldown",
+        "pipeline_timeout" => "pipeline_timeout",
+        "action_failed" => "action_failed",
+        "selection_error" => "selection_error",
+        "convergence_failed" => "convergence_failed",
+        "preflight_blocked" => "preflight_blocked",
+        "critical_pressure" => "critical_pressure",
+        "quarantined" => "quarantined",
+        _ => "other",
+    }
+}
+
+fn normalize_fallback_reason_label(reason: &str) -> &'static str {
+    match reason {
+        "no_workers_configured" => "no_workers_configured",
+        "all_workers_unreachable" => "all_workers_unreachable",
+        "all_circuits_open" => "all_circuits_open",
+        "all_workers_busy" => "all_workers_busy",
+        "all_workers_failed_preflight" => "all_workers_failed_preflight",
+        "all_workers_failed_convergence" => "all_workers_failed_convergence",
+        "no_matching_workers" => "no_matching_workers",
+        "no_workers_with_runtime" => "no_workers_with_runtime",
+        "selection_error" => "selection_error",
+        "daemon_unavailable" => "daemon_unavailable",
+        "dependency_preflight" => "dependency_preflight",
+        "remote_pipeline_failed" => "remote_pipeline_failed",
+        "confidence_below_threshold" => "confidence_below_threshold",
+        "force_local" => "force_local",
+        "allowlist_blocked" => "allowlist_blocked",
+        _ => "other",
+    }
+}
+
+/// Record a reliability decision with latency and normalized labels.
+pub fn observe_reliability_decision(service: &str, outcome: &str, duration: Duration) {
+    let service = normalize_reliability_service_label(service);
+    let outcome = normalize_reliability_outcome_label(outcome);
+    RELIABILITY_DECISIONS_TOTAL
+        .with_label_values(&[service, outcome])
+        .inc();
+    RELIABILITY_DECISION_LATENCY
+        .with_label_values(&[service, outcome])
+        .observe(duration.as_secs_f64());
+}
+
+/// Increment a normalized reliability error counter.
+pub fn inc_reliability_error(service: &str, error_kind: &str) {
+    RELIABILITY_ERRORS_TOTAL
+        .with_label_values(&[
+            normalize_reliability_service_label(service),
+            normalize_reliability_error_kind_label(error_kind),
+        ])
+        .inc();
+}
+
+/// Increment a normalized local fallback reason counter.
+pub fn inc_local_fallback_reason(reason: &str) {
+    LOCAL_FALLBACK_REASON_TOTAL
+        .with_label_values(&[normalize_fallback_reason_label(reason)])
+        .inc();
 }
 
 #[cfg(test)]
@@ -760,5 +939,56 @@ mod tests {
 
         info!("VERIFY: Classification metrics recorded for tiers 0-4");
         info!("TEST PASS: test_classification_metric_helpers");
+    }
+
+    #[test]
+    fn test_reliability_decision_helpers_record_counter_and_latency() {
+        let _guard = test_guard!();
+        setup_tracing();
+
+        let counter_before = RELIABILITY_DECISIONS_TOTAL
+            .with_label_values(&["selection", "success"])
+            .get();
+        let latency_before = RELIABILITY_DECISION_LATENCY
+            .with_label_values(&["selection", "success"])
+            .get_sample_count();
+
+        observe_reliability_decision("selection", "success", Duration::from_millis(2));
+
+        let counter_after = RELIABILITY_DECISIONS_TOTAL
+            .with_label_values(&["selection", "success"])
+            .get();
+        let latency_after = RELIABILITY_DECISION_LATENCY
+            .with_label_values(&["selection", "success"])
+            .get_sample_count();
+
+        assert!(counter_after > counter_before);
+        assert!(latency_after > latency_before);
+    }
+
+    #[test]
+    fn test_reliability_label_normalization_routes_unknown_to_other() {
+        let _guard = test_guard!();
+        setup_tracing();
+
+        let errors_before = RELIABILITY_ERRORS_TOTAL
+            .with_label_values(&["other", "other"])
+            .get();
+        let fallback_before = LOCAL_FALLBACK_REASON_TOTAL
+            .with_label_values(&["other"])
+            .get();
+
+        inc_reliability_error("custom_service_name", "custom_error_kind");
+        inc_local_fallback_reason("custom_fallback_reason");
+
+        let errors_after = RELIABILITY_ERRORS_TOTAL
+            .with_label_values(&["other", "other"])
+            .get();
+        let fallback_after = LOCAL_FALLBACK_REASON_TOTAL
+            .with_label_values(&["other"])
+            .get();
+
+        assert!(errors_after > errors_before);
+        assert!(fallback_after > fallback_before);
     }
 }

@@ -27,6 +27,7 @@
 use crate::admission::AdmissionGate;
 use crate::cancellation::CancellationOrchestrator;
 use crate::disk_pressure::PressureState;
+use crate::metrics;
 use crate::process_triage::RemediationPipeline;
 use crate::repo_convergence::RepoConvergenceService;
 use crate::workers::WorkerState;
@@ -298,6 +299,8 @@ impl ReliabilityAggregator {
     /// This is the main entry point called by the selection pipeline.
     /// Each signal is queried independently; missing services produce 0.0 debt.
     pub async fn evaluate(&self, worker: &WorkerState, worker_id: &str) -> ReliabilityAssessment {
+        let evaluate_start = Instant::now();
+        debug!("Starting reliability evaluation for worker {}", worker_id);
         let weights = self.config.weights.normalized();
 
         // 1. Circuit-breaker debt: error rate from sliding window.
@@ -354,6 +357,15 @@ impl ReliabilityAggregator {
             cancellation_debt,
         );
 
+        metrics::observe_reliability_decision(
+            "reliability_aggregate",
+            health_state_label(health_state),
+            evaluate_start.elapsed(),
+        );
+        if hard_exclude {
+            metrics::inc_reliability_error("reliability_aggregate", "quarantined");
+        }
+
         ReliabilityAssessment {
             health_state,
             aggregated_debt,
@@ -395,17 +407,23 @@ impl ReliabilityAggregator {
     // ── Signal Computation ────────────────────────────────────────────────
 
     async fn compute_convergence_debt(&self, worker_id: &str) -> f64 {
+        let start = Instant::now();
         let Some(ref svc) = self.convergence else {
+            metrics::observe_reliability_decision(
+                "convergence_signal",
+                "missing_service",
+                start.elapsed(),
+            );
             return 0.0; // Fail-open: no service → no debt.
         };
         let wid = WorkerId::new(worker_id);
         let drift_state = svc.get_drift_state(&wid).await;
 
-        match drift_state {
-            crate::repo_convergence::ConvergenceDriftState::Ready => 0.0,
+        let (debt, outcome) = match drift_state {
+            crate::repo_convergence::ConvergenceDriftState::Ready => (0.0, "ready"),
             crate::repo_convergence::ConvergenceDriftState::Drifting => {
                 // Use drift confidence if available, otherwise moderate penalty.
-                if let Some(ws) = svc.get_worker_state(&wid).await {
+                let debt = if let Some(ws) = svc.get_worker_state(&wid).await {
                     // drift_confidence = missing/total (0.0-1.0)
                     // Scale to 0.3-0.7 range for Drifting.
                     if ws.required_repos.is_empty() {
@@ -417,38 +435,59 @@ impl ReliabilityAggregator {
                     }
                 } else {
                     0.4 // Moderate default for Drifting.
-                }
+                };
+                (debt, "drifting")
             }
-            crate::repo_convergence::ConvergenceDriftState::Converging => 0.5,
-            crate::repo_convergence::ConvergenceDriftState::Failed => 1.0,
-            crate::repo_convergence::ConvergenceDriftState::Stale => 0.2, // Fail-open: mild penalty.
+            crate::repo_convergence::ConvergenceDriftState::Converging => (0.5, "converging"),
+            crate::repo_convergence::ConvergenceDriftState::Failed => (1.0, "failed"),
+            crate::repo_convergence::ConvergenceDriftState::Stale => (0.2, "stale"), // Fail-open: mild penalty.
+        };
+
+        metrics::observe_reliability_decision("convergence_signal", outcome, start.elapsed());
+        if outcome == "failed" {
+            metrics::inc_reliability_error("convergence_signal", "convergence_failed");
         }
+        debt
     }
 
     async fn compute_pressure_debt(&self, worker: &WorkerState) -> f64 {
+        let start = Instant::now();
         let pressure = worker.pressure_assessment().await;
-        match pressure.state {
-            PressureState::Healthy => 0.0,
+        let (debt, outcome) = match pressure.state {
+            PressureState::Healthy => (0.0, "healthy"),
             PressureState::TelemetryGap => {
                 // Fail-open: un-evaluated workers (reason_code contains
                 // "not_evaluated") carry zero debt.  Stale telemetry from
                 // an already-evaluated worker carries a small penalty.
                 if pressure.reason_code.contains("not_evaluated") {
-                    0.0
+                    (0.0, "telemetry_gap")
                 } else {
-                    0.15
+                    (0.15, "telemetry_gap")
                 }
             }
-            PressureState::Warning => 0.6,
-            PressureState::Critical => 1.0,
+            PressureState::Warning => (0.6, "warning"),
+            PressureState::Critical => (1.0, "critical"),
+        };
+
+        metrics::observe_reliability_decision("pressure_signal", outcome, start.elapsed());
+        if outcome == "critical" {
+            metrics::inc_reliability_error("pressure_signal", "critical_pressure");
         }
+        debt
     }
 
     async fn compute_process_debt(&self, worker_id: &str) -> f64 {
+        let start = Instant::now();
         let Some(ref pipeline) = self.remediation else {
+            metrics::observe_reliability_decision(
+                "process_signal",
+                "missing_service",
+                start.elapsed(),
+            );
             return 0.0; // Fail-open: no pipeline → no debt.
         };
         let Some(state) = pipeline.worker_state(worker_id).await else {
+            metrics::observe_reliability_decision("process_signal", "clean", start.elapsed());
             return 0.0; // No remediation history → clean.
         };
 
@@ -461,15 +500,34 @@ impl ReliabilityAggregator {
         let hard_term_debt = (state.hard_terminations as f64 * 0.3).min(0.6);
         let failure_debt = (state.consecutive_failures as f64 * 0.15).min(0.3);
         let action_churn = (state.total_actions as f64 * 0.02).min(0.2);
-
-        (hard_term_debt + failure_debt + action_churn).clamp(0.0, 1.0)
+        let debt = (hard_term_debt + failure_debt + action_churn).clamp(0.0, 1.0);
+        let outcome = if debt < f64::EPSILON {
+            "clean"
+        } else {
+            "elevated"
+        };
+        metrics::observe_reliability_decision("process_signal", outcome, start.elapsed());
+        debt
     }
 
     async fn compute_cancellation_debt(&self, worker_id: &str) -> f64 {
+        let start = Instant::now();
         let Some(ref orch) = self.cancellation else {
+            metrics::observe_reliability_decision(
+                "cancellation_signal",
+                "missing_service",
+                start.elapsed(),
+            );
             return 0.0; // Fail-open: no orchestrator → no debt.
         };
-        orch.cancellation_debt(worker_id).await
+        let debt = orch.cancellation_debt(worker_id).await;
+        let outcome = if debt < f64::EPSILON {
+            "clean"
+        } else {
+            "elevated"
+        };
+        metrics::observe_reliability_decision("cancellation_signal", outcome, start.elapsed());
+        debt
     }
 
     // ── State Machine ─────────────────────────────────────────────────────
@@ -586,6 +644,15 @@ impl ReliabilityAggregator {
     }
 }
 
+fn health_state_label(state: WorkerHealthState) -> &'static str {
+    match state {
+        WorkerHealthState::Healthy => "healthy",
+        WorkerHealthState::Degraded => "degraded",
+        WorkerHealthState::Quarantined => "quarantined",
+        WorkerHealthState::ProbingRecovery => "probing_recovery",
+    }
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -595,7 +662,11 @@ mod tests {
     use crate::process_triage::RemediationPipelineConfig;
     use crate::workers::WorkerPool;
     use rch_common::WorkerConfig;
-    use rch_common::e2e::process_triage::ProcessTriageContract;
+    use rch_common::e2e::process_triage::{
+        PROCESS_TRIAGE_CONTRACT_SCHEMA_VERSION, ProcessClassification, ProcessDescriptor,
+        ProcessTriageActionClass, ProcessTriageActionRequest, ProcessTriageContract,
+        ProcessTriageRequest, ProcessTriageTrigger,
+    };
 
     fn test_config() -> ReliabilityConfig {
         ReliabilityConfig {
@@ -709,6 +780,128 @@ mod tests {
         // No remediation history → no debt.
         let clean = agg.evaluate(&worker, "w1").await;
         assert!(clean.signals.process_debt < f64::EPSILON);
+    }
+
+    fn hard_terminate_request(
+        worker_id: &str,
+        correlation_id: &str,
+        pid: u32,
+    ) -> ProcessTriageRequest {
+        ProcessTriageRequest {
+            schema_version: PROCESS_TRIAGE_CONTRACT_SCHEMA_VERSION.to_string(),
+            correlation_id: correlation_id.to_string(),
+            worker_id: worker_id.to_string(),
+            observed_at_unix_ms: chrono::Utc::now().timestamp_millis(),
+            trigger: ProcessTriageTrigger::BuildTimeout,
+            detector_confidence_percent: 99,
+            retry_attempt: 0,
+            candidate_processes: vec![ProcessDescriptor {
+                pid,
+                ppid: Some(1),
+                owner: "ubuntu".to_string(),
+                command: "cargo build --workspace".to_string(),
+                classification: ProcessClassification::BuildRelated,
+                cpu_percent_milli: 98_000,
+                rss_mb: 2048,
+                runtime_secs: 240,
+            }],
+            requested_actions: vec![ProcessTriageActionRequest {
+                action_class: ProcessTriageActionClass::HardTerminate,
+                pid,
+                reason_code: "stuck_hard".to_string(),
+                signal: Some("KILL".to_string()),
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn test_process_debt_from_remediation_hard_terminations_degrade_worker() {
+        let mut contract = ProcessTriageContract::default();
+        contract
+            .safe_action_policy
+            .allow_action_classes
+            .push(ProcessTriageActionClass::HardTerminate);
+        contract
+            .safe_action_policy
+            .deny_action_classes
+            .retain(|class| *class != ProcessTriageActionClass::HardTerminate);
+
+        let pipeline = Arc::new(RemediationPipeline::new(
+            contract,
+            test_events(),
+            RemediationPipelineConfig {
+                dry_run: true,
+                worker_cooldown: Duration::from_millis(0),
+                ..RemediationPipelineConfig::default()
+            },
+        ));
+
+        let first = hard_terminate_request("w1", "corr-hard-1", 1001);
+        let second = hard_terminate_request("w1", "corr-hard-2", 1002);
+        assert_eq!(
+            pipeline.execute(&first).await.status,
+            rch_common::e2e::process_triage::ProcessTriageResponseStatus::Applied
+        );
+        assert_eq!(
+            pipeline.execute(&second).await.status,
+            rch_common::e2e::process_triage::ProcessTriageResponseStatus::Applied
+        );
+
+        let mut agg = ReliabilityAggregator::new(test_config());
+        agg.set_remediation(pipeline);
+
+        let worker = make_worker("w1");
+        let assessment = agg.evaluate(&worker, "w1").await;
+        assert!(
+            assessment.signals.process_debt > 0.6,
+            "process debt should reflect repeated hard remediations"
+        );
+        assert!(
+            assessment.aggregated_debt >= test_config().degraded_penalty_floor,
+            "aggregated debt should cross degraded threshold"
+        );
+        assert_eq!(assessment.health_state, WorkerHealthState::Degraded);
+        assert!(assessment.penalty >= test_config().degraded_penalty_floor);
+    }
+
+    #[tokio::test]
+    async fn test_process_debt_can_quarantine_with_strict_threshold() {
+        let mut contract = ProcessTriageContract::default();
+        contract
+            .safe_action_policy
+            .allow_action_classes
+            .push(ProcessTriageActionClass::HardTerminate);
+        contract
+            .safe_action_policy
+            .deny_action_classes
+            .retain(|class| *class != ProcessTriageActionClass::HardTerminate);
+
+        let pipeline = Arc::new(RemediationPipeline::new(
+            contract,
+            test_events(),
+            RemediationPipelineConfig {
+                dry_run: true,
+                worker_cooldown: Duration::from_millis(0),
+                ..RemediationPipelineConfig::default()
+            },
+        ));
+
+        let first = hard_terminate_request("w1", "corr-hard-q1", 2001);
+        let second = hard_terminate_request("w1", "corr-hard-q2", 2002);
+        let _ = pipeline.execute(&first).await;
+        let _ = pipeline.execute(&second).await;
+
+        let mut config = test_config();
+        config.quarantine_threshold = 0.08;
+
+        let mut agg = ReliabilityAggregator::new(config);
+        agg.set_remediation(pipeline);
+
+        let worker = make_worker("w1");
+        let assessment = agg.evaluate(&worker, "w1").await;
+        assert_eq!(assessment.health_state, WorkerHealthState::Quarantined);
+        assert!(assessment.hard_exclude);
+        assert_eq!(assessment.penalty, 1.0);
     }
 
     #[tokio::test]
@@ -1157,5 +1350,52 @@ mod tests {
             "Default weights should sum to 1.0, got {}",
             sum
         );
+    }
+
+    #[tokio::test]
+    async fn test_metrics_emitted_for_healthy_reliability_evaluation() {
+        let worker_id = "metrics-healthy-w1";
+        let counter_before = crate::metrics::RELIABILITY_DECISIONS_TOTAL
+            .with_label_values(&["reliability_aggregate", "healthy"])
+            .get();
+
+        let agg = ReliabilityAggregator::new(test_config());
+        let worker = make_worker(worker_id);
+        let assessment = agg.evaluate(&worker, worker_id).await;
+        assert_eq!(assessment.health_state, WorkerHealthState::Healthy);
+
+        let counter_after = crate::metrics::RELIABILITY_DECISIONS_TOTAL
+            .with_label_values(&["reliability_aggregate", "healthy"])
+            .get();
+        assert!(counter_after > counter_before);
+    }
+
+    #[tokio::test]
+    async fn test_metrics_emitted_for_quarantined_reliability_evaluation() {
+        let worker_id = "metrics-quarantine-w1";
+        let error_before = crate::metrics::RELIABILITY_ERRORS_TOTAL
+            .with_label_values(&["reliability_aggregate", "quarantined"])
+            .get();
+
+        let config = ReliabilityConfig {
+            quarantine_threshold: 0.2,
+            ..test_config()
+        };
+        let agg = ReliabilityAggregator::new(config);
+        let worker = make_worker(worker_id);
+        for _ in 0..10 {
+            worker
+                .record_failure(Some("forced-metric-quarantine".to_string()))
+                .await;
+        }
+
+        let assessment = agg.evaluate(&worker, worker_id).await;
+        assert_eq!(assessment.health_state, WorkerHealthState::Quarantined);
+        assert!(assessment.hard_exclude);
+
+        let error_after = crate::metrics::RELIABILITY_ERRORS_TOTAL
+            .with_label_values(&["reliability_aggregate", "quarantined"])
+            .get();
+        assert!(error_after > error_before);
     }
 }

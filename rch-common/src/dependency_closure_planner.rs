@@ -403,3 +403,136 @@ fn issue_from_resolver_error(error: &CargoPathDependencyError) -> DependencyPlan
         diagnostics,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn package(root: &str, name: &str, workspace_member: bool) -> CargoPathDependencyPackage {
+        CargoPathDependencyPackage {
+            package_root: PathBuf::from(root),
+            manifest_path: PathBuf::from(root).join("Cargo.toml"),
+            package_name: name.to_string(),
+            workspace_member,
+        }
+    }
+
+    fn edge(from: &str, to: &str, dependency_name: &str) -> CargoPathDependencyEdge {
+        CargoPathDependencyEdge {
+            from: PathBuf::from(from),
+            to: PathBuf::from(to),
+            dependency_name: dependency_name.to_string(),
+        }
+    }
+
+    #[test]
+    fn planner_produces_dependency_first_deterministic_sync_order() {
+        let graph = CargoPathDependencyGraph {
+            entry_manifest_path: PathBuf::from("/data/projects/app/Cargo.toml"),
+            workspace_root: Some(PathBuf::from("/data/projects")),
+            root_packages: vec![PathBuf::from("/data/projects/app")],
+            packages: vec![
+                package("/data/projects/app", "app", true),
+                package("/data/projects/lib_a", "lib_a", false),
+                package("/data/projects/lib_b", "lib_b", false),
+            ],
+            edges: vec![
+                edge("/data/projects/app", "/data/projects/lib_a", "lib_a"),
+                edge("/data/projects/lib_a", "/data/projects/lib_b", "lib_b"),
+            ],
+        };
+
+        let plan = plan_dependency_closure_from_graph(&graph);
+        assert!(plan.is_ready(), "acyclic graph should be planner-ready");
+        assert_eq!(plan.sync_order.len(), 3);
+
+        let ordered_roots = plan
+            .sync_order
+            .iter()
+            .map(|action| action.package_root.as_path())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ordered_roots,
+            vec![
+                Path::new("/data/projects/lib_b"),
+                Path::new("/data/projects/lib_a"),
+                Path::new("/data/projects/app"),
+            ],
+            "planner must sync dependencies before dependents"
+        );
+        assert_eq!(
+            plan.sync_order[0].metadata.reason,
+            DependencySyncReason::TransitivePathDependency
+        );
+        assert_eq!(
+            plan.sync_order[2].metadata.reason,
+            DependencySyncReason::EntryPoint
+        );
+    }
+
+    #[test]
+    fn planner_cycle_fails_open_with_stable_issue_code() {
+        let graph = CargoPathDependencyGraph {
+            entry_manifest_path: PathBuf::from("/data/projects/cycle_a/Cargo.toml"),
+            workspace_root: None,
+            root_packages: vec![PathBuf::from("/data/projects/cycle_a")],
+            packages: vec![
+                package("/data/projects/cycle_a", "cycle_a", false),
+                package("/data/projects/cycle_b", "cycle_b", false),
+            ],
+            edges: vec![
+                edge("/data/projects/cycle_a", "/data/projects/cycle_b", "cycle_b"),
+                edge("/data/projects/cycle_b", "/data/projects/cycle_a", "cycle_a"),
+            ],
+        };
+
+        let plan = plan_dependency_closure_from_graph(&graph);
+        assert_eq!(plan.state, DependencyClosurePlanState::FailOpen);
+        assert!(plan.fail_open);
+        assert_eq!(plan.sync_order.len(), 0);
+        assert_eq!(plan.issues.len(), 1);
+        assert_eq!(plan.issues[0].code, "planner_non_deterministic_order");
+        assert_eq!(plan.issues[0].risk, DependencyRiskClass::Critical);
+    }
+
+    #[test]
+    fn resolver_error_mapping_reports_path_policy_violation_code() {
+        let error = CargoPathDependencyError::new(
+            CargoPathDependencyErrorKind::PathPolicyViolation,
+            "dependency escaped canonical root",
+        )
+        .with_manifest_path("/data/projects/app/Cargo.toml")
+        .with_dependency_name("bad_dep")
+        .with_dependency_path("/tmp/outside");
+
+        let issue = issue_from_resolver_error(&error);
+        assert_eq!(issue.code, "path-policy-violation");
+        assert_eq!(issue.risk, DependencyRiskClass::High);
+        assert!(
+            issue
+                .diagnostics
+                .iter()
+                .any(|line| line.contains("dependency_path=/tmp/outside"))
+        );
+    }
+
+    #[test]
+    fn resolver_error_mapping_reports_manifest_parse_failure_code() {
+        let error = CargoPathDependencyError::new(
+            CargoPathDependencyErrorKind::ManifestParseFailure,
+            "invalid Cargo.toml syntax",
+        )
+        .with_manifest_path("/data/projects/app/Cargo.toml");
+
+        let plan = fail_open_plan_from_resolver_error(Path::new("/data/projects/app"), &error);
+        assert_eq!(plan.state, DependencyClosurePlanState::FailOpen);
+        assert_eq!(plan.issues.len(), 1);
+        assert_eq!(plan.issues[0].code, "manifest-parse-failure");
+        assert_eq!(plan.issues[0].risk, DependencyRiskClass::Critical);
+        assert!(
+            plan.fail_open_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("manifest parse failure"))
+        );
+    }
+}

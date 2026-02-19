@@ -28,12 +28,12 @@ use rch_common::repo_updater_contract::{
 };
 use rch_common::{
     BuildHeartbeatPhase, BuildHeartbeatRequest, ColorMode, CommandPriority, CommandTimingBreakdown,
-    CompilationKind, HookInput, HookOutput, OutputVisibility, REPO_UPDATER_CANONICAL_PROJECTS_ROOT,
-    RepoUpdaterAdapterCommand, RepoUpdaterAdapterContract, RepoUpdaterAdapterRequest,
-    RepoUpdaterOutputFormat, RequiredRuntime, SelectedWorker, SelectionReason, SelectionResponse,
-    SelfHealingConfig, ToolchainInfo, TransferConfig, WorkerConfig, WorkerId,
-    build_dependency_closure_plan_with_policy, build_invocation, classify_command, mock,
-    normalize_project_path, normalize_project_path_with_policy,
+    CompilationKind, DependencyClosurePlan, HookInput, HookOutput, OutputVisibility,
+    REPO_UPDATER_CANONICAL_PROJECTS_ROOT, RepoUpdaterAdapterCommand, RepoUpdaterAdapterContract,
+    RepoUpdaterAdapterRequest, RepoUpdaterOutputFormat, RequiredRuntime, SelectedWorker,
+    SelectionReason, SelectionResponse, SelfHealingConfig, ToolchainInfo, TransferConfig,
+    WorkerConfig, WorkerId, build_dependency_closure_plan_with_policy, build_invocation,
+    classify_command, mock, normalize_project_path, normalize_project_path_with_policy,
     path_topology::{
         DEFAULT_ALIAS_PROJECT_ROOT, DEFAULT_CANONICAL_PROJECT_ROOT, PathTopologyPolicy,
     },
@@ -369,6 +369,26 @@ pub async fn run_exec(command_parts: Vec<String>) -> anyhow::Result<()> {
             }
         }
         Err(e) => {
+            if let Some(preflight_err) = e.downcast_ref::<DependencyPreflightFailure>() {
+                warn!(
+                    "Dependency preflight blocked remote execution [{}]: {}",
+                    preflight_err.reason_code, preflight_err.remediation
+                );
+                reporter.summary(&format!(
+                    "[RCH] local (dependency preflight {}: {})",
+                    preflight_err.reason_code, preflight_err.remediation
+                ));
+                reporter.verbose(&format!(
+                    "[RCH] dependency preflight report: {}",
+                    preflight_err.report_json()
+                ));
+                let status = std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(&command)
+                    .status()?;
+                std::process::exit(status.code().unwrap_or(1));
+            }
+
             // Check for transfer skip (not a failure)
             if let Some(skip_err) = e.downcast_ref::<TransferError>()
                 && let TransferError::TransferSkipped { reason } = skip_err
@@ -1833,6 +1853,22 @@ async fn handle_selection_response(
             }
         }
         Err(e) => {
+            if let Some(preflight_err) = e.downcast_ref::<DependencyPreflightFailure>() {
+                info!(
+                    "Dependency preflight blocked remote execution [{}], falling back to local",
+                    preflight_err.reason_code
+                );
+                reporter.summary(&format!(
+                    "[RCH] local (dependency preflight {}: {})",
+                    preflight_err.reason_code, preflight_err.remediation
+                ));
+                reporter.verbose(&format!(
+                    "[RCH] dependency preflight report: {}",
+                    preflight_err.report_json()
+                ));
+                return HookOutput::allow();
+            }
+
             // Check if this is a transfer skip (not a failure, just too large/slow)
             if let Some(skip_err) = e.downcast_ref::<TransferError>()
                 && let TransferError::TransferSkipped { reason } = skip_err
@@ -2192,6 +2228,109 @@ fn selected_worker_to_config(worker: &SelectedWorker) -> WorkerConfig {
 #[derive(Debug, Clone)]
 struct DependencyRuntimePlan {
     sync_roots: Vec<PathBuf>,
+    fail_open_decision: Option<DependencyRuntimeFailOpenDecision>,
+}
+
+#[derive(Debug, Clone)]
+struct DependencyRuntimeFailOpenDecision {
+    reason_code: &'static str,
+    remediation: &'static str,
+    detail: String,
+}
+
+fn text_indicates_timeout(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    lower.contains("timeout") || lower.contains("timed out")
+}
+
+fn classify_dependency_runtime_fail_open(
+    plan: &DependencyClosurePlan,
+) -> DependencyRuntimeFailOpenDecision {
+    let has_policy_violation = plan
+        .issues
+        .iter()
+        .any(|issue| issue.code == "path-policy-violation");
+    let has_timeout = plan
+        .fail_open_reason
+        .as_deref()
+        .is_some_and(text_indicates_timeout)
+        || plan.issues.iter().any(|issue| {
+            text_indicates_timeout(&issue.message)
+                || issue
+                    .diagnostics
+                    .iter()
+                    .any(|diag| text_indicates_timeout(diag))
+        });
+
+    let (reason_code, remediation) = if has_policy_violation {
+        (
+            DEPENDENCY_PREFLIGHT_CODE_POLICY,
+            DEPENDENCY_PREFLIGHT_REMEDIATION_POLICY,
+        )
+    } else if has_timeout {
+        (
+            DEPENDENCY_PREFLIGHT_CODE_TIMEOUT,
+            DEPENDENCY_PREFLIGHT_REMEDIATION_TIMEOUT,
+        )
+    } else {
+        (
+            DEPENDENCY_PREFLIGHT_CODE_UNKNOWN,
+            DEPENDENCY_PREFLIGHT_REMEDIATION_UNKNOWN,
+        )
+    };
+
+    let issue_codes = if plan.issues.is_empty() {
+        "none".to_string()
+    } else {
+        plan.issues
+            .iter()
+            .map(|issue| issue.code.clone())
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let fail_open_reason = plan
+        .fail_open_reason
+        .as_deref()
+        .unwrap_or("no planner fail-open reason supplied");
+    let detail = format!("planner fail-open reason={fail_open_reason}; issue_codes={issue_codes}");
+
+    DependencyRuntimeFailOpenDecision {
+        reason_code,
+        remediation,
+        detail,
+    }
+}
+
+fn build_dependency_runtime_fail_open_report(
+    worker: &WorkerConfig,
+    normalized_project_root: &Path,
+    decision: &DependencyRuntimeFailOpenDecision,
+) -> DependencyPreflightReport {
+    let status = if decision.reason_code == DEPENDENCY_PREFLIGHT_CODE_POLICY {
+        DependencyPreflightStatus::PolicyViolation
+    } else if decision.reason_code == DEPENDENCY_PREFLIGHT_CODE_TIMEOUT {
+        DependencyPreflightStatus::Timeout
+    } else {
+        DependencyPreflightStatus::Unknown
+    };
+
+    DependencyPreflightReport {
+        schema_version: DEPENDENCY_PREFLIGHT_SCHEMA_VERSION,
+        worker: worker.id.as_str().to_string(),
+        verified: false,
+        reason_code: Some(decision.reason_code),
+        remediation: Some(decision.remediation),
+        evidence: vec![DependencyPreflightEvidence {
+            root: normalized_project_root.to_string_lossy().to_string(),
+            manifest: normalized_project_root
+                .join("Cargo.toml")
+                .to_string_lossy()
+                .to_string(),
+            status,
+            reason_code: decision.reason_code,
+            detail: decision.detail.clone(),
+        }],
+    }
 }
 
 fn command_uses_cargo_dependency_graph(kind: Option<CompilationKind>) -> bool {
@@ -2223,6 +2362,7 @@ fn build_dependency_runtime_plan(
     if !command_uses_cargo_dependency_graph(kind) {
         return DependencyRuntimePlan {
             sync_roots: vec![normalized_project_root.to_path_buf()],
+            fail_open_decision: None,
         };
     }
 
@@ -2243,8 +2383,14 @@ fn build_dependency_runtime_plan(
                 issue.code, issue.risk, issue.message
             ));
         }
+        let decision = classify_dependency_runtime_fail_open(&plan);
+        reporter.verbose(&format!(
+            "[RCH] dependency planner fail-open decision [{}]: {}",
+            decision.reason_code, decision.remediation
+        ));
         return DependencyRuntimePlan {
             sync_roots: vec![normalized_project_root.to_path_buf()],
+            fail_open_decision: Some(decision),
         };
     }
 
@@ -2272,6 +2418,7 @@ fn build_dependency_runtime_plan(
 
     DependencyRuntimePlan {
         sync_roots: ordered,
+        fail_open_decision: None,
     }
 }
 
@@ -3072,7 +3219,7 @@ struct SyncClosurePlanEntry {
 ///
 /// Used to collect per-root results and enable partial failure diagnostics
 /// instead of aborting the entire sync on the first dependency root failure.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum SyncRootOutcome {
     /// Root synced successfully.
     Synced,
@@ -3098,6 +3245,215 @@ struct SyncClosureManifestEntry {
     project_id: String,
     root_hash: String,
     is_primary: bool,
+}
+
+const DEPENDENCY_PREFLIGHT_SCHEMA_VERSION: &str = "rch.dependency_preflight.v1";
+const DEPENDENCY_PREFLIGHT_CODE_PRESENT: &str = "RCH-I324";
+const DEPENDENCY_PREFLIGHT_CODE_MISSING: &str = "RCH-E324";
+const DEPENDENCY_PREFLIGHT_CODE_STALE: &str = "RCH-E325";
+const DEPENDENCY_PREFLIGHT_CODE_UNKNOWN: &str = "RCH-E326";
+const DEPENDENCY_PREFLIGHT_CODE_POLICY: &str = "RCH-E327";
+const DEPENDENCY_PREFLIGHT_CODE_TIMEOUT: &str = "RCH-E328";
+const DEPENDENCY_PREFLIGHT_REMEDIATION_MISSING: &str =
+    "Ensure every dependency root in the closure is synced and Cargo.toml exists remotely.";
+const DEPENDENCY_PREFLIGHT_REMEDIATION_STALE: &str = "One or more dependency roots were not refreshed; rerun after successful sync of skipped roots.";
+const DEPENDENCY_PREFLIGHT_REMEDIATION_UNKNOWN: &str =
+    "Dependency verification could not determine remote state; inspect sync/SSH logs and retry.";
+const DEPENDENCY_PREFLIGHT_REMEDIATION_POLICY: &str = "Path dependency topology policy failed; move dependencies under /data/projects (or /dp) and retry.";
+const DEPENDENCY_PREFLIGHT_REMEDIATION_TIMEOUT: &str = "Dependency planner timed out; rerun after system load decreases or investigate cargo metadata latency.";
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum DependencyPreflightStatus {
+    Present,
+    Missing,
+    Stale,
+    PolicyViolation,
+    Timeout,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct DependencyPreflightEvidence {
+    root: String,
+    manifest: String,
+    status: DependencyPreflightStatus,
+    reason_code: &'static str,
+    detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct DependencyPreflightReport {
+    schema_version: &'static str,
+    worker: String,
+    verified: bool,
+    reason_code: Option<&'static str>,
+    remediation: Option<&'static str>,
+    evidence: Vec<DependencyPreflightEvidence>,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("dependency preflight verification failed [{reason_code}]")]
+struct DependencyPreflightFailure {
+    reason_code: &'static str,
+    remediation: &'static str,
+    report: DependencyPreflightReport,
+}
+
+impl DependencyPreflightFailure {
+    fn from_report(report: DependencyPreflightReport) -> Self {
+        let reason_code = report
+            .reason_code
+            .unwrap_or(DEPENDENCY_PREFLIGHT_CODE_UNKNOWN);
+        let remediation = report
+            .remediation
+            .unwrap_or(DEPENDENCY_PREFLIGHT_REMEDIATION_UNKNOWN);
+        Self {
+            reason_code,
+            remediation,
+            report,
+        }
+    }
+
+    fn report_json(&self) -> String {
+        serde_json::to_string(&self.report).unwrap_or_else(|err| {
+            format!(
+                "{{\"schema_version\":\"{}\",\"verified\":false,\"reason_code\":\"{}\",\"serialization_error\":\"{}\"}}",
+                DEPENDENCY_PREFLIGHT_SCHEMA_VERSION, self.reason_code, err
+            )
+        })
+    }
+}
+
+fn parse_dependency_preflight_probe_output(
+    stdout: &str,
+) -> (
+    std::collections::BTreeSet<String>,
+    std::collections::BTreeSet<String>,
+) {
+    let mut present = std::collections::BTreeSet::new();
+    let mut missing = std::collections::BTreeSet::new();
+
+    for line in stdout.lines() {
+        if let Some(path) = line.strip_prefix("RCH_DEP_PRESENT:") {
+            present.insert(path.trim().to_string());
+        } else if let Some(path) = line.strip_prefix("RCH_DEP_MISSING:") {
+            missing.insert(path.trim().to_string());
+        }
+    }
+
+    (present, missing)
+}
+
+fn dependency_preflight_failure_reason(
+    evidence: &[DependencyPreflightEvidence],
+) -> Option<(&'static str, &'static str)> {
+    if evidence
+        .iter()
+        .any(|item| item.status == DependencyPreflightStatus::Missing)
+    {
+        return Some((
+            DEPENDENCY_PREFLIGHT_CODE_MISSING,
+            DEPENDENCY_PREFLIGHT_REMEDIATION_MISSING,
+        ));
+    }
+    if evidence
+        .iter()
+        .any(|item| item.status == DependencyPreflightStatus::Stale)
+    {
+        return Some((
+            DEPENDENCY_PREFLIGHT_CODE_STALE,
+            DEPENDENCY_PREFLIGHT_REMEDIATION_STALE,
+        ));
+    }
+    if evidence
+        .iter()
+        .any(|item| item.status == DependencyPreflightStatus::Unknown)
+    {
+        return Some((
+            DEPENDENCY_PREFLIGHT_CODE_UNKNOWN,
+            DEPENDENCY_PREFLIGHT_REMEDIATION_UNKNOWN,
+        ));
+    }
+    None
+}
+
+fn build_dependency_preflight_report(
+    worker: &WorkerConfig,
+    root_outcomes: &[(SyncClosurePlanEntry, SyncRootOutcome)],
+    present_manifests: &std::collections::BTreeSet<String>,
+    missing_manifests: &std::collections::BTreeSet<String>,
+    probe_failure: Option<&str>,
+) -> DependencyPreflightReport {
+    let mut evidence = Vec::with_capacity(root_outcomes.len());
+
+    for (entry, outcome) in root_outcomes {
+        let manifest_path = entry.local_root.join("Cargo.toml");
+        let manifest = manifest_path.to_string_lossy().to_string();
+        let root = entry.local_root.to_string_lossy().to_string();
+
+        let (status, reason_code, detail) = match outcome {
+            SyncRootOutcome::Synced => {
+                if missing_manifests.contains(&manifest) {
+                    (
+                        DependencyPreflightStatus::Missing,
+                        DEPENDENCY_PREFLIGHT_CODE_MISSING,
+                        "required Cargo.toml is missing on remote worker".to_string(),
+                    )
+                } else if present_manifests.contains(&manifest) {
+                    (
+                        DependencyPreflightStatus::Present,
+                        DEPENDENCY_PREFLIGHT_CODE_PRESENT,
+                        "manifest present and refreshed in current sync".to_string(),
+                    )
+                } else {
+                    let detail = probe_failure
+                        .map(|failure| format!("manifest probe unavailable: {}", failure))
+                        .unwrap_or_else(|| {
+                            "probe output omitted status for synced manifest".to_string()
+                        });
+                    (
+                        DependencyPreflightStatus::Unknown,
+                        DEPENDENCY_PREFLIGHT_CODE_UNKNOWN,
+                        detail,
+                    )
+                }
+            }
+            SyncRootOutcome::Skipped { reason } => (
+                DependencyPreflightStatus::Stale,
+                DEPENDENCY_PREFLIGHT_CODE_STALE,
+                format!("dependency root skipped before verification: {}", reason),
+            ),
+            SyncRootOutcome::Failed { error } => (
+                DependencyPreflightStatus::Unknown,
+                DEPENDENCY_PREFLIGHT_CODE_UNKNOWN,
+                format!("dependency root sync failed before verification: {}", error),
+            ),
+        };
+
+        evidence.push(DependencyPreflightEvidence {
+            root,
+            manifest,
+            status,
+            reason_code,
+            detail,
+        });
+    }
+
+    let (verified, reason_code, remediation) = match dependency_preflight_failure_reason(&evidence)
+    {
+        Some((reason_code, remediation)) => (false, Some(reason_code), Some(remediation)),
+        None => (true, None, None),
+    };
+
+    DependencyPreflightReport {
+        schema_version: DEPENDENCY_PREFLIGHT_SCHEMA_VERSION,
+        worker: worker.id.as_str().to_string(),
+        verified,
+        reason_code,
+        remediation,
+        evidence,
+    }
 }
 
 fn canonicalize_sync_root_for_plan(root: &Path) -> PathBuf {
@@ -3186,38 +3542,88 @@ fn build_sync_closure_manifest(
 
 async fn verify_remote_dependency_manifests(
     worker: &WorkerConfig,
-    sync_roots: &[PathBuf],
+    root_outcomes: &[(SyncClosurePlanEntry, SyncRootOutcome)],
     reporter: &HookReporter,
 ) -> anyhow::Result<()> {
     if should_skip_remote_preflight(worker) {
         reporter.verbose("[RCH] remote dependency preflight skipped in mock mode");
         return Ok(());
     }
-    if sync_roots.is_empty() {
+    if root_outcomes.is_empty() {
         return Ok(());
     }
 
-    let verify_cmd = build_remote_dependency_preflight_command(sync_roots)
-        .expect("sync_roots is non-empty due early return");
+    let synced_roots = root_outcomes
+        .iter()
+        .filter_map(|(entry, outcome)| match outcome {
+            SyncRootOutcome::Synced => Some(entry.local_root.clone()),
+            SyncRootOutcome::Skipped { .. } | SyncRootOutcome::Failed { .. } => None,
+        })
+        .collect::<Vec<_>>();
 
-    let output = run_worker_ssh_command(worker, &verify_cmd, Duration::from_secs(20)).await?;
-    if !output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        anyhow::bail!(
-            "remote dependency preflight failed on {}: stdout='{}' stderr='{}'",
-            worker.id,
-            stdout,
-            stderr
-        );
+    let mut present_manifests = std::collections::BTreeSet::new();
+    let mut missing_manifests = std::collections::BTreeSet::new();
+    let mut probe_failure: Option<String> = None;
+
+    if let Some(verify_cmd) = build_remote_dependency_preflight_command(&synced_roots) {
+        match run_worker_ssh_command(worker, &verify_cmd, Duration::from_secs(20)).await {
+            Ok(output) => {
+                let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                let (present, missing) = parse_dependency_preflight_probe_output(&stdout);
+                present_manifests = present;
+                missing_manifests = missing;
+                if !output.status.success() && missing_manifests.is_empty() {
+                    probe_failure = Some(format!(
+                        "probe exited with status {:?}; stdout='{}'; stderr='{}'",
+                        output.status.code(),
+                        stdout,
+                        stderr
+                    ));
+                }
+            }
+            Err(err) => {
+                probe_failure = Some(err.to_string());
+            }
+        }
     }
 
+    let report = build_dependency_preflight_report(
+        worker,
+        root_outcomes,
+        &present_manifests,
+        &missing_manifests,
+        probe_failure.as_deref(),
+    );
+    let report_json = serde_json::to_string(&report).unwrap_or_else(|err| {
+        format!(
+            "{{\"schema_version\":\"{}\",\"verified\":false,\"reason_code\":\"{}\",\"serialization_error\":\"{}\"}}",
+            DEPENDENCY_PREFLIGHT_SCHEMA_VERSION, DEPENDENCY_PREFLIGHT_CODE_UNKNOWN, err
+        )
+    });
     reporter.verbose(&format!(
-        "[RCH] remote dependency preflight verified {} manifests on {}",
-        sync_roots.len(),
-        worker.id
+        "[RCH] dependency preflight report: {}",
+        report_json
     ));
-    Ok(())
+    if report.verified {
+        reporter.verbose(&format!(
+            "[RCH] remote dependency preflight verified {} roots on {}",
+            report.evidence.len(),
+            worker.id
+        ));
+        return Ok(());
+    }
+
+    let failure = DependencyPreflightFailure::from_report(report);
+    warn!(
+        "Remote dependency preflight blocked remote execution on {} [{}] remediation='{}'",
+        worker.id, failure.reason_code, failure.remediation
+    );
+    reporter.verbose(&format!(
+        "[RCH] dependency preflight remediation [{}]: {}",
+        failure.reason_code, failure.remediation
+    ));
+    Err(failure.into())
 }
 
 fn build_remote_dependency_preflight_command(sync_roots: &[PathBuf]) -> Option<String> {
@@ -3231,7 +3637,7 @@ fn build_remote_dependency_preflight_command(sync_roots: &[PathBuf]) -> Option<S
         .map(|manifest| {
             let escaped = shell_escape::escape(manifest.to_string_lossy().to_string().into());
             format!(
-                "if [ ! -f {manifest} ]; then echo MISSING_DEP_MANIFEST:{manifest}; missing=1; fi",
+                "manifest={manifest}; if [ -f \"$manifest\" ]; then printf 'RCH_DEP_PRESENT:%s\\n' \"$manifest\"; else printf 'RCH_DEP_MISSING:%s\\n' \"$manifest\"; missing=1; fi",
                 manifest = escaped
             )
         })
@@ -3560,6 +3966,28 @@ async fn execute_remote_compilation(
     let normalized_project_root = normalized_project.canonical_path().to_path_buf();
 
     let dependency_plan = build_dependency_runtime_plan(&normalized_project_root, kind, reporter);
+    if let Some(decision) = dependency_plan.fail_open_decision.as_ref() {
+        let report = build_dependency_runtime_fail_open_report(
+            &worker_config,
+            &normalized_project_root,
+            decision,
+        );
+        if let Ok(report_json) = serde_json::to_string(&report) {
+            reporter.verbose(&format!(
+                "[RCH] dependency planner fail-open report: {}",
+                report_json
+            ));
+        }
+        warn!(
+            "Dependency planner blocked remote execution on {} [{}]: {}",
+            worker_config.id, decision.reason_code, decision.remediation
+        );
+        reporter.verbose(&format!(
+            "[RCH] dependency planner fail-open [{}]: {}",
+            decision.reason_code, decision.remediation
+        ));
+        return Err(DependencyPreflightFailure::from_report(report).into());
+    }
     let raw_sync_roots = dependency_plan.sync_roots;
     let project_id = project_id_from_path(&normalized_project_root);
     let project_hash =
@@ -3644,7 +4072,7 @@ async fn execute_remote_compilation(
     } else {
         None
     };
-    let mut root_outcomes: Vec<(&SyncClosurePlanEntry, SyncRootOutcome)> = Vec::new();
+    let mut root_outcomes: Vec<(SyncClosurePlanEntry, SyncRootOutcome)> = Vec::new();
     for entry in &sync_plan {
         let mut root_pipeline = TransferPipeline::new(
             entry.local_root.clone(),
@@ -3681,7 +4109,7 @@ async fn execute_remote_compilation(
                 .into());
             }
             root_outcomes.push((
-                entry,
+                entry.clone(),
                 SyncRootOutcome::Skipped {
                     reason: skip_reason,
                 },
@@ -3712,7 +4140,7 @@ async fn execute_remote_compilation(
                 if entry.is_primary {
                     primary_pipeline = Some(root_pipeline);
                 }
-                root_outcomes.push((entry, SyncRootOutcome::Synced));
+                root_outcomes.push((entry.clone(), SyncRootOutcome::Synced));
             }
             Err(e) => {
                 if entry.is_primary {
@@ -3731,7 +4159,7 @@ async fn execute_remote_compilation(
                     e
                 ));
                 root_outcomes.push((
-                    entry,
+                    entry.clone(),
                     SyncRootOutcome::Failed {
                         error: e.to_string(),
                     },
@@ -3800,7 +4228,7 @@ async fn execute_remote_compilation(
     }
 
     if command_uses_cargo_dependency_graph(kind) {
-        verify_remote_dependency_manifests(&worker_config, &sync_roots, reporter).await?;
+        verify_remote_dependency_manifests(&worker_config, &root_outcomes, reporter).await?;
     }
 
     // Step 2: Execute command remotely with streaming output
@@ -6086,12 +6514,339 @@ mod tests {
             .expect("command should be constructed");
 
         assert!(
-            command.contains("fi; if [ ! -f"),
+            command.contains("fi; manifest="),
             "generated command must separate consecutive if/fi checks with ';'"
         );
         assert!(
             !command.contains("fi if ["),
             "generated command must not concatenate checks without separator"
+        );
+        assert!(
+            command.contains("RCH_DEP_PRESENT:"),
+            "generated command must emit structured present marker"
+        );
+        assert!(
+            command.contains("RCH_DEP_MISSING:"),
+            "generated command must emit structured missing marker"
+        );
+    }
+
+    #[test]
+    fn test_parse_dependency_preflight_probe_output_extracts_markers() {
+        let _guard = test_guard!();
+        let stdout = "\
+RCH_DEP_PRESENT:/data/projects/a/Cargo.toml
+noise
+RCH_DEP_MISSING:/data/projects/b/Cargo.toml
+RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
+";
+
+        let (present, missing) = parse_dependency_preflight_probe_output(stdout);
+
+        assert_eq!(present.len(), 2);
+        assert_eq!(missing.len(), 1);
+        assert!(present.contains("/data/projects/a/Cargo.toml"));
+        assert!(present.contains("/data/projects/c/Cargo.toml"));
+        assert!(missing.contains("/data/projects/b/Cargo.toml"));
+    }
+
+    fn make_sync_entry(root: &str, is_primary: bool) -> SyncClosurePlanEntry {
+        SyncClosurePlanEntry {
+            local_root: PathBuf::from(root),
+            remote_root: root.to_string(),
+            project_id: format!("id-{}", root.replace('/', "_")),
+            root_hash: format!("hash-{}", root.replace('/', "_")),
+            is_primary,
+        }
+    }
+
+    fn make_test_worker_config(id: &str) -> WorkerConfig {
+        WorkerConfig {
+            id: WorkerId::new(id),
+            host: "worker.host".to_string(),
+            user: "ubuntu".to_string(),
+            identity_file: "~/.ssh/id_ed25519".to_string(),
+            total_slots: 8,
+            priority: 100,
+            tags: Vec::new(),
+        }
+    }
+
+    fn make_fail_open_plan(
+        fail_open_reason: Option<&str>,
+        issues: Vec<rch_common::DependencyPlanIssue>,
+    ) -> DependencyClosurePlan {
+        DependencyClosurePlan {
+            state: rch_common::DependencyClosurePlanState::FailOpen,
+            entry_manifest_path: PathBuf::from("/data/projects/example/Cargo.toml"),
+            workspace_root: Some(PathBuf::from("/data/projects/example")),
+            canonical_roots: Vec::new(),
+            sync_order: Vec::new(),
+            fail_open: true,
+            fail_open_reason: fail_open_reason.map(ToString::to_string),
+            issues,
+        }
+    }
+
+    #[test]
+    fn test_classify_dependency_runtime_fail_open_policy_violation() {
+        let _guard = test_guard!();
+        let plan = make_fail_open_plan(
+            Some("resolver produced path policy violation"),
+            vec![rch_common::DependencyPlanIssue {
+                code: "path-policy-violation".to_string(),
+                message: "dependency path escapes canonical root".to_string(),
+                risk: rch_common::DependencyRiskClass::High,
+                diagnostics: vec!["dependency_path=/tmp/off-policy".to_string()],
+            }],
+        );
+
+        let decision = classify_dependency_runtime_fail_open(&plan);
+        assert_eq!(decision.reason_code, DEPENDENCY_PREFLIGHT_CODE_POLICY);
+        assert_eq!(
+            decision.remediation,
+            DEPENDENCY_PREFLIGHT_REMEDIATION_POLICY
+        );
+    }
+
+    #[test]
+    fn test_classify_dependency_runtime_fail_open_timeout_signal() {
+        let _guard = test_guard!();
+        let plan = make_fail_open_plan(
+            Some("cargo metadata timed out after 10s"),
+            vec![rch_common::DependencyPlanIssue {
+                code: "metadata-invocation-failure".to_string(),
+                message: "metadata invocation timed out".to_string(),
+                risk: rch_common::DependencyRiskClass::Critical,
+                diagnostics: vec!["timeout=10s".to_string()],
+            }],
+        );
+
+        let decision = classify_dependency_runtime_fail_open(&plan);
+        assert_eq!(decision.reason_code, DEPENDENCY_PREFLIGHT_CODE_TIMEOUT);
+        assert_eq!(
+            decision.remediation,
+            DEPENDENCY_PREFLIGHT_REMEDIATION_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn test_classify_dependency_runtime_fail_open_defaults_unknown() {
+        let _guard = test_guard!();
+        let plan = make_fail_open_plan(
+            Some("resolver returned unverifiable graph ordering"),
+            vec![rch_common::DependencyPlanIssue {
+                code: "non-deterministic-order".to_string(),
+                message: "graph order could not be proven".to_string(),
+                risk: rch_common::DependencyRiskClass::Critical,
+                diagnostics: vec!["planner_state=fail_open".to_string()],
+            }],
+        );
+
+        let decision = classify_dependency_runtime_fail_open(&plan);
+        assert_eq!(decision.reason_code, DEPENDENCY_PREFLIGHT_CODE_UNKNOWN);
+        assert_eq!(
+            decision.remediation,
+            DEPENDENCY_PREFLIGHT_REMEDIATION_UNKNOWN
+        );
+    }
+
+    #[test]
+    fn test_build_dependency_runtime_fail_open_report_uses_status_mapping() {
+        let _guard = test_guard!();
+        let worker = make_test_worker_config("worker-runtime-report");
+        let project_root = PathBuf::from("/data/projects/runtime-policy");
+        let decision = DependencyRuntimeFailOpenDecision {
+            reason_code: DEPENDENCY_PREFLIGHT_CODE_POLICY,
+            remediation: DEPENDENCY_PREFLIGHT_REMEDIATION_POLICY,
+            detail: "policy violation detail".to_string(),
+        };
+
+        let report = build_dependency_runtime_fail_open_report(&worker, &project_root, &decision);
+        assert!(!report.verified);
+        assert_eq!(report.reason_code, Some(DEPENDENCY_PREFLIGHT_CODE_POLICY));
+        assert_eq!(
+            report.remediation,
+            Some(DEPENDENCY_PREFLIGHT_REMEDIATION_POLICY)
+        );
+        assert_eq!(report.evidence.len(), 1);
+        assert_eq!(
+            report.evidence[0].status,
+            DependencyPreflightStatus::PolicyViolation
+        );
+    }
+
+    #[test]
+    fn test_e2e_dependency_preflight_verified_success_path() {
+        let _guard = test_guard!();
+        let worker = make_test_worker_config("worker-success");
+        let entry = make_sync_entry("/data/projects/repo-success", true);
+        let manifest = entry
+            .local_root
+            .join("Cargo.toml")
+            .to_string_lossy()
+            .to_string();
+        let outcomes = vec![(entry, SyncRootOutcome::Synced)];
+        let present = std::collections::BTreeSet::from([manifest]);
+        let missing = std::collections::BTreeSet::new();
+
+        let report =
+            build_dependency_preflight_report(&worker, &outcomes, &present, &missing, None);
+
+        assert!(report.verified, "all-present manifests should verify");
+        assert!(report.reason_code.is_none());
+        assert!(report.remediation.is_none());
+        assert_eq!(report.evidence.len(), 1);
+        assert_eq!(
+            report.evidence[0].status,
+            DependencyPreflightStatus::Present,
+            "evidence must mark synced+present roots as present"
+        );
+    }
+
+    #[test]
+    fn test_build_dependency_preflight_report_missing_stale_and_unknown_paths() {
+        let _guard = test_guard!();
+        let worker = make_test_worker_config("worker-mixed");
+        let synced_missing = make_sync_entry("/data/projects/repo-missing", false);
+        let skipped_stale = make_sync_entry("/data/projects/repo-stale", false);
+        let failed_unknown = make_sync_entry("/data/projects/repo-unknown", false);
+        let missing_manifest = synced_missing
+            .local_root
+            .join("Cargo.toml")
+            .to_string_lossy()
+            .to_string();
+        let outcomes = vec![
+            (synced_missing, SyncRootOutcome::Synced),
+            (
+                skipped_stale,
+                SyncRootOutcome::Skipped {
+                    reason: "transfer skipped by estimator".to_string(),
+                },
+            ),
+            (
+                failed_unknown,
+                SyncRootOutcome::Failed {
+                    error: "rsync timeout".to_string(),
+                },
+            ),
+        ];
+        let present = std::collections::BTreeSet::new();
+        let missing = std::collections::BTreeSet::from([missing_manifest]);
+
+        let report = build_dependency_preflight_report(
+            &worker,
+            &outcomes,
+            &present,
+            &missing,
+            Some("probe returned missing markers"),
+        );
+
+        assert!(
+            !report.verified,
+            "missing/stale/unknown evidence must block remote execution"
+        );
+        assert_eq!(
+            report.reason_code,
+            Some(DEPENDENCY_PREFLIGHT_CODE_MISSING),
+            "missing should dominate failure reason"
+        );
+        assert_eq!(
+            report.remediation,
+            Some(DEPENDENCY_PREFLIGHT_REMEDIATION_MISSING)
+        );
+        assert!(
+            report
+                .evidence
+                .iter()
+                .any(|item| item.status == DependencyPreflightStatus::Missing)
+        );
+        assert!(
+            report
+                .evidence
+                .iter()
+                .any(|item| item.status == DependencyPreflightStatus::Stale)
+        );
+        assert!(
+            report
+                .evidence
+                .iter()
+                .any(|item| item.status == DependencyPreflightStatus::Unknown)
+        );
+    }
+
+    #[test]
+    fn test_e2e_dependency_preflight_stale_fallback_path_maps_reason_code() {
+        let _guard = test_guard!();
+        let worker = make_test_worker_config("worker-stale");
+        let stale_entry = make_sync_entry("/data/projects/repo-stale-only", false);
+        let outcomes = vec![(
+            stale_entry,
+            SyncRootOutcome::Skipped {
+                reason: "bandwidth guard skip".to_string(),
+            },
+        )];
+        let present = std::collections::BTreeSet::new();
+        let missing = std::collections::BTreeSet::new();
+
+        let report =
+            build_dependency_preflight_report(&worker, &outcomes, &present, &missing, None);
+
+        assert!(!report.verified);
+        assert_eq!(report.reason_code, Some(DEPENDENCY_PREFLIGHT_CODE_STALE));
+        assert_eq!(
+            report.remediation,
+            Some(DEPENDENCY_PREFLIGHT_REMEDIATION_STALE)
+        );
+    }
+
+    #[test]
+    fn test_e2e_dependency_preflight_missing_fallback_path_maps_reason_code() {
+        let _guard = test_guard!();
+        let worker = make_test_worker_config("worker-missing");
+        let entry = make_sync_entry("/data/projects/repo-missing-only", false);
+        let manifest = entry
+            .local_root
+            .join("Cargo.toml")
+            .to_string_lossy()
+            .to_string();
+        let outcomes = vec![(entry, SyncRootOutcome::Synced)];
+        let present = std::collections::BTreeSet::new();
+        let missing = std::collections::BTreeSet::from([manifest]);
+
+        let report =
+            build_dependency_preflight_report(&worker, &outcomes, &present, &missing, None);
+
+        assert!(!report.verified);
+        assert_eq!(report.reason_code, Some(DEPENDENCY_PREFLIGHT_CODE_MISSING));
+        assert_eq!(
+            report.remediation,
+            Some(DEPENDENCY_PREFLIGHT_REMEDIATION_MISSING)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_verify_remote_dependency_manifests_blocks_stale_outcomes_deterministically() {
+        let _guard = test_guard!();
+        let worker = make_test_worker_config("worker-stale-verify");
+        let outcomes = vec![(
+            make_sync_entry("/data/projects/repo-stale-verify", false),
+            SyncRootOutcome::Skipped {
+                reason: "transfer budget skip".to_string(),
+            },
+        )];
+        let reporter = HookReporter::new(OutputVisibility::Verbose);
+
+        let err = verify_remote_dependency_manifests(&worker, &outcomes, &reporter)
+            .await
+            .expect_err("stale dependency evidence should block remote execution");
+        let preflight = err
+            .downcast_ref::<DependencyPreflightFailure>()
+            .expect("error should preserve DependencyPreflightFailure type");
+        assert_eq!(preflight.reason_code, DEPENDENCY_PREFLIGHT_CODE_STALE);
+        assert_eq!(
+            preflight.remediation,
+            DEPENDENCY_PREFLIGHT_REMEDIATION_STALE
         );
     }
 
