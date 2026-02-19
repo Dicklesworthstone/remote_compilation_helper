@@ -26,12 +26,13 @@ run_contract_tests() {
   log "running reliability schema + artifact contract tests"
   (
     cd "$PROJECT_ROOT"
-    cargo test -p rch-common reliability -- --nocapture
+    rch exec -- cargo test -p rch-common reliability -- --nocapture
   )
 }
 
 main() {
   require_cmd cargo
+  require_cmd rch
   run_contract_tests
   log "PASS: reliability logging contract tests succeeded"
 }

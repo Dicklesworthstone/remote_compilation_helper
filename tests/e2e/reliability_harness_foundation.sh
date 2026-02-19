@@ -26,12 +26,13 @@ run_foundation_tests() {
   log "running reliability harness foundation contract tests"
   (
     cd "$PROJECT_ROOT"
-    cargo test -p rch-common reliability_harness_ -- --nocapture
+    rch exec -- cargo test -p rch-common reliability_harness_ -- --nocapture
   )
 }
 
 main() {
   require_cmd cargo
+  require_cmd rch
   run_foundation_tests
   log "PASS: reliability harness foundation tests succeeded"
 }
