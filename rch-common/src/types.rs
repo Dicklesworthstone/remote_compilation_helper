@@ -2188,6 +2188,52 @@ pub enum BuildLocation {
     Remote,
 }
 
+/// Worker health snapshot captured when a cancellation completes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BuildCancellationWorkerHealth {
+    /// Worker status at cancellation completion.
+    pub status: String,
+    /// Worker speed score at cancellation completion.
+    pub speed_score: f64,
+    /// Slots currently used on the worker.
+    pub used_slots: u32,
+    /// Slots currently available on the worker.
+    pub available_slots: u32,
+    /// Normalized pressure state.
+    pub pressure_state: String,
+    /// Stable pressure reason code.
+    pub pressure_reason_code: String,
+}
+
+/// Structured cancellation metadata attached to cancelled build records.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BuildCancellationMetadata {
+    /// Stable cancellation operation identifier.
+    pub operation_id: String,
+    /// Cancellation origin (for example `user`, `timeout`).
+    pub origin: String,
+    /// Stable reason code for cancellation.
+    pub reason_code: String,
+    /// Ordered cancellation state path.
+    #[serde(default)]
+    pub decision_path: Vec<String>,
+    /// Highest escalation stage reached (`term`, `remote_kill`, `sigkill`).
+    pub escalation_stage: String,
+    /// Number of escalation transitions taken.
+    pub escalation_count: u32,
+    /// Whether remote kill was attempted.
+    pub remote_kill_attempted: bool,
+    /// Whether cleanup completed successfully.
+    pub cleanup_ok: bool,
+    /// Whether active build history was successfully claimed/cancelled.
+    pub history_cancelled: bool,
+    /// Final cancellation state.
+    pub final_state: String,
+    /// Worker health snapshot at completion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_health: Option<BuildCancellationWorkerHealth>,
+}
+
 /// Record of a completed build.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BuildRecord {
@@ -2214,6 +2260,9 @@ pub struct BuildRecord {
     /// Optional timing breakdown for the pipeline.
     #[serde(default)]
     pub timing: Option<CommandTimingBreakdown>,
+    /// Structured cancellation metadata for cancelled builds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancellation: Option<BuildCancellationMetadata>,
 }
 
 /// Input payload for recording a completed build.
@@ -2240,6 +2289,9 @@ pub struct BuildRecordInput {
     /// Optional timing breakdown for the pipeline.
     #[serde(default)]
     pub timing: Option<CommandTimingBreakdown>,
+    /// Structured cancellation metadata for cancelled builds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancellation: Option<BuildCancellationMetadata>,
 }
 
 impl BuildRecordInput {
@@ -2257,6 +2309,7 @@ impl BuildRecordInput {
             location: self.location,
             bytes_transferred: self.bytes_transferred,
             timing: self.timing,
+            cancellation: self.cancellation,
         }
     }
 }
