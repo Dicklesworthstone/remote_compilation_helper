@@ -4,8 +4,8 @@
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use rch_common::{
-    BuildHeartbeatPhase, BuildHeartbeatRequest, BuildLocation, BuildRecord, BuildStats,
-    CommandTimingBreakdown, SavedTimeStats,
+    BuildCancellationMetadata, BuildHeartbeatPhase, BuildHeartbeatRequest, BuildLocation,
+    BuildRecord, BuildStats, CommandTimingBreakdown, SavedTimeStats,
 };
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
@@ -322,10 +322,7 @@ impl BuildHistory {
         bytes_transferred: Option<u64>,
         timing: Option<CommandTimingBreakdown>,
     ) -> Option<BuildRecord> {
-        let state = {
-            let mut active = self.active.write().unwrap_or_else(|e| e.into_inner());
-            active.remove(&build_id)
-        }?;
+        let state = self.take_active_build(build_id)?;
 
         let duration_ms =
             duration_ms.unwrap_or_else(|| state.started_at_mono.elapsed().as_millis() as u64);
@@ -341,23 +338,26 @@ impl BuildHistory {
             location: state.location,
             bytes_transferred,
             timing,
+            cancellation: None,
         };
 
         self.record(record.clone());
         Some(record)
     }
 
-    /// Cancel an active build, moving it into history with a cancel exit code.
-    pub fn cancel_active_build(
-        &self,
-        build_id: u64,
-        bytes_transferred: Option<u64>,
-    ) -> Option<BuildRecord> {
-        let state = {
-            let mut active = self.active.write().unwrap_or_else(|e| e.into_inner());
-            active.remove(&build_id)
-        }?;
+    /// Claim an active build for deterministic finalization.
+    pub fn take_active_build(&self, build_id: u64) -> Option<ActiveBuildState> {
+        let mut active = self.active.write().unwrap_or_else(|e| e.into_inner());
+        active.remove(&build_id)
+    }
 
+    /// Record a cancelled build from a claimed active state.
+    pub fn record_cancelled_build(
+        &self,
+        state: ActiveBuildState,
+        bytes_transferred: Option<u64>,
+        cancellation: Option<BuildCancellationMetadata>,
+    ) -> BuildRecord {
         let duration_ms = state.started_at_mono.elapsed().as_millis() as u64;
         let record = BuildRecord {
             id: state.id,
@@ -371,10 +371,22 @@ impl BuildHistory {
             location: state.location,
             bytes_transferred,
             timing: None,
+            cancellation,
         };
 
         self.record(record.clone());
-        Some(record)
+        record
+    }
+
+    /// Cancel an active build, moving it into history with a cancel exit code.
+    pub fn cancel_active_build(
+        &self,
+        build_id: u64,
+        bytes_transferred: Option<u64>,
+        cancellation: Option<BuildCancellationMetadata>,
+    ) -> Option<BuildRecord> {
+        let state = self.take_active_build(build_id)?;
+        Some(self.record_cancelled_build(state, bytes_transferred, cancellation))
     }
 
     /// Get a specific active build by ID.
@@ -842,6 +854,7 @@ mod tests {
             location: BuildLocation::Local,
             bytes_transferred: None,
             timing: None,
+            cancellation: None,
         }
     }
 
@@ -976,6 +989,71 @@ mod tests {
         assert_eq!(history.next_id(), 1);
         assert_eq!(history.next_id(), 2);
         assert_eq!(history.next_id(), 3);
+    }
+
+    #[test]
+    fn test_cancel_active_build_records_cancellation_metadata() {
+        let _guard = test_guard!();
+        let history = BuildHistory::new(10);
+        let active = history.start_active_build(
+            "proj".to_string(),
+            "worker-a".to_string(),
+            "cargo test".to_string(),
+            0,
+            4,
+            BuildLocation::Remote,
+        );
+
+        let metadata = BuildCancellationMetadata {
+            operation_id: "cancel-1".to_string(),
+            origin: "timeout".to_string(),
+            reason_code: "timeout".to_string(),
+            decision_path: vec![
+                "requested".to_string(),
+                "term_sent".to_string(),
+                "remote_kill_sent".to_string(),
+                "completed".to_string(),
+            ],
+            escalation_stage: "remote_kill".to_string(),
+            escalation_count: 1,
+            remote_kill_attempted: true,
+            cleanup_ok: true,
+            history_cancelled: true,
+            final_state: "completed".to_string(),
+            worker_health: Some(rch_common::BuildCancellationWorkerHealth {
+                status: "healthy".to_string(),
+                speed_score: 91.2,
+                used_slots: 0,
+                available_slots: 8,
+                pressure_state: "healthy".to_string(),
+                pressure_reason_code: "healthy".to_string(),
+            }),
+        };
+
+        let cancelled = history
+            .cancel_active_build(active.id, None, Some(metadata.clone()))
+            .expect("cancelled build record");
+        assert_eq!(cancelled.exit_code, 130);
+        assert_eq!(
+            cancelled
+                .cancellation
+                .as_ref()
+                .expect("cancellation metadata")
+                .operation_id,
+            metadata.operation_id
+        );
+        assert!(history.active_build(active.id).is_none());
+
+        let recent = history.recent(1);
+        assert_eq!(recent.len(), 1);
+        assert_eq!(
+            recent[0]
+                .cancellation
+                .as_ref()
+                .expect("persisted cancellation metadata")
+                .escalation_stage,
+            "remote_kill"
+        );
     }
 
     #[test]

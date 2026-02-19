@@ -4,10 +4,12 @@
 //! deterministic cleanup (slots, history, events), and per-worker
 //! cancellation debt for reliability integration.
 
-use crate::api::{CancelBuildResponse, CancelAllBuildsResponse, CancelledBuildInfo};
-use crate::events::EventBus;
 use crate::DaemonContext;
-use rch_common::WorkerId;
+use crate::api::{CancelAllBuildsResponse, CancelBuildResponse, CancelledBuildInfo};
+use crate::events::EventBus;
+use rch_common::{
+    BuildCancellationMetadata, BuildCancellationWorkerHealth, WorkerId, WorkerStatus,
+};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -94,6 +96,96 @@ pub struct CancellationRecord {
     pub slots: u32,
     pub slots_released: u32,
     pub hook_pid: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CancellationWorkerHealthSnapshot {
+    status: String,
+    speed_score: f64,
+    used_slots: u32,
+    available_slots: u32,
+    pressure_state: String,
+    pressure_reason_code: String,
+}
+
+fn cancellation_operation_id(build_id: u64) -> String {
+    format!("cancel-{build_id}")
+}
+
+fn worker_status_label(status: WorkerStatus) -> &'static str {
+    match status {
+        WorkerStatus::Healthy => "healthy",
+        WorkerStatus::Degraded => "degraded",
+        WorkerStatus::Unreachable => "unreachable",
+        WorkerStatus::Draining => "draining",
+        WorkerStatus::Drained => "drained",
+        WorkerStatus::Disabled => "disabled",
+    }
+}
+
+fn worker_health_for_history(
+    snapshot: &CancellationWorkerHealthSnapshot,
+) -> BuildCancellationWorkerHealth {
+    BuildCancellationWorkerHealth {
+        status: snapshot.status.clone(),
+        speed_score: snapshot.speed_score,
+        used_slots: snapshot.used_slots,
+        available_slots: snapshot.available_slots,
+        pressure_state: snapshot.pressure_state.clone(),
+        pressure_reason_code: snapshot.pressure_reason_code.clone(),
+    }
+}
+
+fn push_decision_stage(path: &mut Vec<&'static str>, stage: &'static str) {
+    if path.last().copied() != Some(stage) {
+        path.push(stage);
+    }
+}
+
+fn cancellation_decision_path(record: &CancellationRecord) -> Vec<&'static str> {
+    let mut path = vec!["requested"];
+
+    let force_path = record.remote_kill_attempted
+        && record.escalation_count == 0
+        && matches!(
+            record.state,
+            CancellationState::Completed | CancellationState::Failed | CancellationState::Escalated
+        );
+
+    if force_path {
+        push_decision_stage(&mut path, "escalated");
+        push_decision_stage(&mut path, "remote_kill_sent");
+    } else {
+        push_decision_stage(&mut path, "term_sent");
+        if record.remote_kill_attempted {
+            push_decision_stage(&mut path, "remote_kill_sent");
+        }
+        if record.escalation_count > 1 || matches!(record.state, CancellationState::Escalated) {
+            push_decision_stage(&mut path, "escalated");
+        }
+    }
+
+    let terminal = match record.state {
+        CancellationState::Completed => "completed",
+        CancellationState::Failed => "failed",
+        CancellationState::Requested => "requested",
+        CancellationState::TermSent => "term_sent",
+        CancellationState::RemoteKillSent => "remote_kill_sent",
+        CancellationState::Escalated => "escalated",
+    };
+    push_decision_stage(&mut path, terminal);
+
+    path
+}
+
+fn cancellation_escalation_stage(record: &CancellationRecord) -> &'static str {
+    if record.escalation_count > 1 || matches!(record.state, CancellationState::Escalated) {
+        "sigkill"
+    } else if record.remote_kill_attempted {
+        "remote_kill"
+    } else {
+        "term"
+    }
 }
 
 // ── Configuration ────────────────────────────────────────────────────────
@@ -189,7 +281,10 @@ impl CancellationOrchestrator {
                         build_id,
                         worker_id: Some(record.worker_id.clone()),
                         project_id: None,
-                        message: Some(format!("Cancellation already in progress (state: {})", record.state)),
+                        message: Some(format!(
+                            "Cancellation already in progress (state: {})",
+                            record.state
+                        )),
                         slots_released: record.slots_released,
                     };
                 }
@@ -330,7 +425,11 @@ impl CancellationOrchestrator {
             message: Some(format!(
                 "{} build(s) {}",
                 cancelled_count,
-                if force { "forcefully terminated" } else { "cancelled" },
+                if force {
+                    "forcefully terminated"
+                } else {
+                    "cancelled"
+                },
             )),
         }
     }
@@ -436,11 +535,7 @@ impl CancellationOrchestrator {
     }
 
     /// Attempt to kill the remote process on the worker via SSH.
-    async fn try_remote_kill(
-        &self,
-        ctx: &DaemonContext,
-        record: &mut CancellationRecord,
-    ) -> bool {
+    async fn try_remote_kill(&self, ctx: &DaemonContext, record: &mut CancellationRecord) -> bool {
         record.remote_kill_attempted = true;
 
         // Look up worker config for SSH connection details.
@@ -468,10 +563,14 @@ impl CancellationOrchestrator {
             self.config.remote_kill_timeout,
             tokio::process::Command::new("ssh")
                 .args([
-                    "-o", "StrictHostKeyChecking=no",
-                    "-o", "ConnectTimeout=5",
-                    "-o", "BatchMode=yes",
-                    "-i", &identity,
+                    "-o",
+                    "StrictHostKeyChecking=no",
+                    "-o",
+                    "ConnectTimeout=5",
+                    "-o",
+                    "BatchMode=yes",
+                    "-i",
+                    &identity,
                     &format!("{}@{}", user, host),
                     &format!(
                         "pkill -9 -f 'RCH_BUILD_ID={}' 2>/dev/null; true",
@@ -508,30 +607,39 @@ impl CancellationOrchestrator {
         }
     }
 
-    /// Deterministic cleanup: release slots, update history, emit event.
-    /// Always runs regardless of cancellation outcome.
-    async fn run_cleanup(
+    async fn capture_worker_health_snapshot(
         &self,
         ctx: &DaemonContext,
-        record: &mut CancellationRecord,
-    ) {
+        worker_id: &str,
+    ) -> Option<CancellationWorkerHealthSnapshot> {
+        let worker = ctx.pool.get(&WorkerId::new(worker_id)).await?;
+        let status = worker.status().await;
+        let pressure = worker.pressure_assessment().await;
+
+        Some(CancellationWorkerHealthSnapshot {
+            status: worker_status_label(status).to_string(),
+            speed_score: worker.get_speed_score(),
+            used_slots: worker.used_slots(),
+            available_slots: worker.available_slots().await,
+            pressure_state: pressure.state.to_string(),
+            pressure_reason_code: pressure.reason_code,
+        })
+    }
+
+    /// Deterministic cleanup: release slots, update history, emit event.
+    /// Always runs regardless of cancellation outcome.
+    async fn run_cleanup(&self, ctx: &DaemonContext, record: &mut CancellationRecord) {
         let worker_id = &record.worker_id;
 
-        // 1. Cancel build in history (marks as cancelled with exit code 130).
-        let history_ok = ctx
-            .history
-            .cancel_active_build(record.build_id, None)
-            .is_some();
-
-        if history_ok && !cfg!(test) {
-            crate::metrics::dec_active_builds("remote");
-            crate::metrics::inc_build_total("cancelled", "remote");
-        }
+        // 1. Claim active build in history. This is the idempotency/ownership gate:
+        // whoever claims it performs deterministic cleanup and final record write.
+        let claimed_active = ctx.history.take_active_build(record.build_id);
+        let history_ok = claimed_active.is_some();
 
         // 2. Release worker slots — only if we successfully claimed the build from
-        // active history. If cancel_active_build returned None, the build already
-        // completed normally (via handle_release_worker) which already released slots.
-        // Releasing again would steal slots from a subsequent build.
+        // active history. If claim failed, another codepath already finalized the
+        // build and released slots; releasing again would steal slots from a
+        // subsequent build.
         if history_ok && record.slots > 0 {
             if let Some(worker) = ctx.pool.get(&WorkerId::new(worker_id)).await {
                 worker.release_slots(record.slots).await;
@@ -545,10 +653,42 @@ impl CancellationOrchestrator {
             }
         }
 
-        // 3. Emit completion or failure event.
+        // 3. Build cancellation metadata and write finalized cancelled record.
         let elapsed = record.requested_at.elapsed();
         record.completed_at = Some(Instant::now());
 
+        let decision_path = cancellation_decision_path(record);
+        let escalation_stage = cancellation_escalation_stage(record);
+        let operation_id = cancellation_operation_id(record.build_id);
+        let cancel_origin = record.reason.to_string();
+        let worker_health = self.capture_worker_health_snapshot(ctx, worker_id).await;
+
+        if let Some(state) = claimed_active {
+            let cancellation = BuildCancellationMetadata {
+                operation_id: operation_id.clone(),
+                origin: cancel_origin.clone(),
+                reason_code: record.reason.to_string(),
+                decision_path: decision_path
+                    .iter()
+                    .map(|stage| (*stage).to_string())
+                    .collect(),
+                escalation_stage: escalation_stage.to_string(),
+                escalation_count: record.escalation_count,
+                remote_kill_attempted: record.remote_kill_attempted,
+                cleanup_ok: record.cleanup_ok,
+                history_cancelled: true,
+                final_state: record.state.to_string(),
+                worker_health: worker_health.as_ref().map(worker_health_for_history),
+            };
+            ctx.history
+                .record_cancelled_build(state, None, Some(cancellation));
+            if !cfg!(test) {
+                crate::metrics::dec_active_builds("remote");
+                crate::metrics::inc_build_total("cancelled", "remote");
+            }
+        }
+
+        // 4. Emit completion or failure event.
         let event_name = match record.state {
             CancellationState::Completed => "cancellation_completed",
             _ => "cancellation_failed",
@@ -557,15 +697,21 @@ impl CancellationOrchestrator {
         self.events.emit(
             event_name,
             &serde_json::json!({
+                "operation_id": operation_id,
                 "build_id": record.build_id,
                 "worker_id": record.worker_id,
                 "reason": record.reason,
+                "cancel_origin": cancel_origin,
                 "state": record.state,
+                "decision_path": decision_path,
+                "escalation_stage": escalation_stage,
                 "escalation_count": record.escalation_count,
                 "remote_kill_attempted": record.remote_kill_attempted,
                 "slots_released": record.slots_released,
                 "elapsed_ms": elapsed.as_millis() as u64,
                 "cleanup_ok": record.cleanup_ok,
+                "history_cancelled": history_ok,
+                "worker_health": worker_health,
             }),
         );
 
@@ -582,9 +728,7 @@ impl CancellationOrchestrator {
     /// Record cancellation stats for a worker (for debt computation).
     async fn record_cancellation_stats(&self, record: &CancellationRecord) {
         let mut stats = self.worker_stats.write().await;
-        let entry = stats
-            .entry(record.worker_id.clone())
-            .or_default();
+        let entry = stats.entry(record.worker_id.clone()).or_default();
 
         let now = Instant::now();
         entry.recent_cancellations.push(now);
@@ -692,7 +836,9 @@ mod tests {
     use crate::events::EventBus;
     use crate::history::BuildHistory;
     use crate::selection::WorkerSelector;
-    use crate::self_test::{SelfTestHistory, SelfTestService, DEFAULT_RESULT_CAPACITY, DEFAULT_RUN_CAPACITY};
+    use crate::self_test::{
+        DEFAULT_RESULT_CAPACITY, DEFAULT_RUN_CAPACITY, SelfTestHistory, SelfTestService,
+    };
     use crate::workers::WorkerPool;
     use chrono::Duration as ChronoDuration;
     use rch_common::SelfTestConfig;
@@ -731,17 +877,15 @@ mod tests {
         ))
     }
 
-    fn make_test_benchmark_trigger(pool: WorkerPool) -> crate::benchmark_scheduler::BenchmarkTriggerHandle {
+    fn make_test_benchmark_trigger(
+        pool: WorkerPool,
+    ) -> crate::benchmark_scheduler::BenchmarkTriggerHandle {
         let telemetry = Arc::new(crate::telemetry::TelemetryStore::new(
             Duration::from_secs(300),
             None,
         ));
-        let (scheduler, trigger) = BenchmarkScheduler::new(
-            SchedulerConfig::default(),
-            pool,
-            telemetry,
-            test_events(),
-        );
+        let (scheduler, trigger) =
+            BenchmarkScheduler::new(SchedulerConfig::default(), pool, telemetry, test_events());
         let scheduler = Arc::new(scheduler);
         tokio::spawn(scheduler.run());
         trigger
@@ -777,6 +921,27 @@ mod tests {
         }
     }
 
+    fn test_record(
+        state: CancellationState,
+        escalation_count: u32,
+        remote_kill_attempted: bool,
+    ) -> CancellationRecord {
+        CancellationRecord {
+            build_id: 42,
+            worker_id: "w1".to_string(),
+            state,
+            reason: CancelReason::User,
+            requested_at: Instant::now(),
+            completed_at: None,
+            escalation_count,
+            remote_kill_attempted,
+            cleanup_ok: true,
+            slots: 1,
+            slots_released: 1,
+            hook_pid: 12345,
+        }
+    }
+
     // 1. Cancel of non-existent build → error response
     #[tokio::test]
     async fn test_cancel_nonexistent_build_returns_error() {
@@ -785,9 +950,102 @@ mod tests {
         let ctx = make_test_context(pool, history);
         let orch = CancellationOrchestrator::new(test_config(), test_events());
 
-        let resp = orch.cancel_build(&ctx, 999, CancelReason::User, false).await;
+        let resp = orch
+            .cancel_build(&ctx, 999, CancelReason::User, false)
+            .await;
         assert_eq!(resp.status, "error");
         assert_eq!(resp.slots_released, 0);
+    }
+
+    #[tokio::test]
+    async fn test_cancel_inflight_build_records_metadata() {
+        let pool = WorkerPool::new();
+        let history = Arc::new(BuildHistory::new(100));
+        let active = history.start_active_build(
+            "proj".to_string(),
+            "worker-a".to_string(),
+            "cargo test".to_string(),
+            0,
+            0,
+            rch_common::BuildLocation::Remote,
+        );
+        let ctx = make_test_context(pool, history.clone());
+        let orch = CancellationOrchestrator::new(test_config(), test_events());
+
+        let resp = orch
+            .cancel_build(&ctx, active.id, CancelReason::Timeout, false)
+            .await;
+        assert_eq!(resp.status, "cancelled");
+        assert_eq!(resp.build_id, active.id);
+        assert!(history.active_build(active.id).is_none());
+
+        let recent = history.recent(5);
+        let cancelled = recent
+            .iter()
+            .find(|record| record.id == active.id)
+            .expect("cancelled build record should exist");
+        let metadata = cancelled
+            .cancellation
+            .as_ref()
+            .expect("cancellation metadata should be present");
+        assert_eq!(metadata.origin, "timeout");
+        assert_eq!(metadata.reason_code, "timeout");
+        assert_eq!(metadata.operation_id, format!("cancel-{}", active.id));
+        assert_eq!(metadata.final_state, "completed");
+        assert!(metadata.history_cancelled);
+    }
+
+    #[tokio::test]
+    async fn test_cancel_after_completion_returns_error_post_completion_race() {
+        let pool = WorkerPool::new();
+        let history = Arc::new(BuildHistory::new(100));
+        let active = history.start_active_build(
+            "proj".to_string(),
+            "worker-a".to_string(),
+            "cargo check".to_string(),
+            0,
+            0,
+            rch_common::BuildLocation::Remote,
+        );
+        let _ = history.finish_active_build(active.id, 0, None, None, None);
+
+        let ctx = make_test_context(pool, history);
+        let orch = CancellationOrchestrator::new(test_config(), test_events());
+        let resp = orch
+            .cancel_build(&ctx, active.id, CancelReason::User, false)
+            .await;
+        assert_eq!(resp.status, "error");
+        assert!(
+            resp.message
+                .as_deref()
+                .is_some_and(|message| message.contains("not found"))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_repeated_cancel_after_completion_is_deterministic() {
+        let pool = WorkerPool::new();
+        let history = Arc::new(BuildHistory::new(100));
+        let active = history.start_active_build(
+            "proj".to_string(),
+            "worker-a".to_string(),
+            "cargo clippy".to_string(),
+            0,
+            0,
+            rch_common::BuildLocation::Remote,
+        );
+        let ctx = make_test_context(pool, history);
+        let orch = CancellationOrchestrator::new(test_config(), test_events());
+
+        let first = orch
+            .cancel_build(&ctx, active.id, CancelReason::User, false)
+            .await;
+        assert_eq!(first.status, "cancelled");
+
+        let second = orch
+            .cancel_build(&ctx, active.id, CancelReason::User, false)
+            .await;
+        assert_eq!(second.status, "error");
     }
 
     // 2. Double cancel (idempotent) — simulate by trying to cancel the same
@@ -892,7 +1150,10 @@ mod tests {
     fn test_cancellation_state_display() {
         assert_eq!(CancellationState::Requested.to_string(), "requested");
         assert_eq!(CancellationState::TermSent.to_string(), "term_sent");
-        assert_eq!(CancellationState::RemoteKillSent.to_string(), "remote_kill_sent");
+        assert_eq!(
+            CancellationState::RemoteKillSent.to_string(),
+            "remote_kill_sent"
+        );
         assert_eq!(CancellationState::Escalated.to_string(), "escalated");
         assert_eq!(CancellationState::Completed.to_string(), "completed");
         assert_eq!(CancellationState::Failed.to_string(), "failed");
@@ -944,5 +1205,65 @@ mod tests {
         // One recent cancellation = rate_debt = 1/5 = 0.2, total ~ 0.2 * 0.4 = 0.08
         assert!(debt > 0.0);
         assert!(debt < 0.5); // Single cancel shouldn't be high.
+    }
+
+    #[test]
+    fn test_cancellation_decision_path_term_only() {
+        let record = test_record(CancellationState::Completed, 0, false);
+        let path = cancellation_decision_path(&record);
+        assert_eq!(path, vec!["requested", "term_sent", "completed"]);
+        assert_eq!(cancellation_escalation_stage(&record), "term");
+    }
+
+    #[test]
+    fn test_cancellation_decision_path_remote_kill() {
+        let record = test_record(CancellationState::Completed, 1, true);
+        let path = cancellation_decision_path(&record);
+        assert_eq!(
+            path,
+            vec!["requested", "term_sent", "remote_kill_sent", "completed"]
+        );
+        assert_eq!(cancellation_escalation_stage(&record), "remote_kill");
+    }
+
+    #[test]
+    fn test_cancellation_decision_path_sigkill_escalation() {
+        let record = test_record(CancellationState::Completed, 2, true);
+        let path = cancellation_decision_path(&record);
+        assert_eq!(
+            path,
+            vec![
+                "requested",
+                "term_sent",
+                "remote_kill_sent",
+                "escalated",
+                "completed"
+            ]
+        );
+        assert_eq!(cancellation_escalation_stage(&record), "sigkill");
+    }
+
+    #[test]
+    fn test_cancellation_decision_path_failed_before_remote_kill() {
+        let record = test_record(CancellationState::Failed, 0, false);
+        let path = cancellation_decision_path(&record);
+        assert_eq!(path, vec!["requested", "term_sent", "failed"]);
+        assert_eq!(cancellation_escalation_stage(&record), "term");
+    }
+
+    #[test]
+    fn test_cancellation_decision_path_force_cancel() {
+        let record = test_record(CancellationState::Completed, 0, true);
+        let path = cancellation_decision_path(&record);
+        assert_eq!(
+            path,
+            vec!["requested", "escalated", "remote_kill_sent", "completed"]
+        );
+        assert_eq!(cancellation_escalation_stage(&record), "remote_kill");
+    }
+
+    #[test]
+    fn test_cancellation_operation_id_format() {
+        assert_eq!(cancellation_operation_id(4242), "cancel-4242");
     }
 }
