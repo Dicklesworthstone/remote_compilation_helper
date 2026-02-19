@@ -604,10 +604,7 @@ impl WorkerSelector {
     }
 
     /// Set the unified reliability aggregator for multi-signal health (bd-vvmd.5.5).
-    pub fn set_reliability(
-        &mut self,
-        agg: Arc<crate::reliability::ReliabilityAggregator>,
-    ) {
+    pub fn set_reliability(&mut self, agg: Arc<crate::reliability::ReliabilityAggregator>) {
         self.reliability = Some(agg);
     }
 

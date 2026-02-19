@@ -400,6 +400,7 @@ mod tests {
             location: BuildLocation::Remote,
             bytes_transferred: Some(bytes_transferred),
             timing: None,
+            cancellation: None,
         }
     }
 
@@ -416,6 +417,7 @@ mod tests {
             location: BuildLocation::Local,
             bytes_transferred: None,
             timing: None,
+            cancellation: None,
         }
     }
 

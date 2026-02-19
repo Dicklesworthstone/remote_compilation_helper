@@ -97,7 +97,8 @@ impl Default for SignalWeights {
 impl SignalWeights {
     /// Normalize weights so they sum to 1.0.
     fn normalized(&self) -> Self {
-        let sum = self.circuit + self.convergence + self.pressure + self.process + self.cancellation;
+        let sum =
+            self.circuit + self.convergence + self.pressure + self.process + self.cancellation;
         if sum <= 0.0 {
             return Self::default();
         }
@@ -296,11 +297,7 @@ impl ReliabilityAggregator {
     ///
     /// This is the main entry point called by the selection pipeline.
     /// Each signal is queried independently; missing services produce 0.0 debt.
-    pub async fn evaluate(
-        &self,
-        worker: &WorkerState,
-        worker_id: &str,
-    ) -> ReliabilityAssessment {
+    pub async fn evaluate(&self, worker: &WorkerState, worker_id: &str) -> ReliabilityAssessment {
         let weights = self.config.weights.normalized();
 
         // 1. Circuit-breaker debt: error rate from sliding window.
@@ -499,9 +496,7 @@ impl ReliabilityAggregator {
         signals: &SignalDebts,
     ) -> (WorkerHealthState, f64, bool) {
         let mut trackers = self.trackers.write().await;
-        let tracker = trackers
-            .entry(worker_id.to_string())
-            .or_default();
+        let tracker = trackers.entry(worker_id.to_string()).or_default();
 
         let prev_state = tracker.state;
         let now = Instant::now();
@@ -940,11 +935,7 @@ mod tests {
 
         // Set up convergence: Drifting.
         convergence
-            .update_required_repos(
-                &wid,
-                vec!["a".into(), "b".into()],
-                vec!["a".into()],
-            )
+            .update_required_repos(&wid, vec!["a".into(), "b".into()], vec!["a".into()])
             .await;
 
         // Add some circuit failures.
@@ -973,11 +964,7 @@ mod tests {
 
         // All repos present and synced.
         convergence
-            .update_required_repos(
-                &wid,
-                vec!["repo_a".into()],
-                vec!["repo_a".into()],
-            )
+            .update_required_repos(&wid, vec!["repo_a".into()], vec!["repo_a".into()])
             .await;
 
         let assessment = agg.evaluate(&worker, "w1").await;
@@ -1160,8 +1147,11 @@ mod tests {
     #[test]
     fn test_signal_weights_five_signals_sum_to_one() {
         let weights = SignalWeights::default();
-        let sum = weights.circuit + weights.convergence + weights.pressure
-            + weights.process + weights.cancellation;
+        let sum = weights.circuit
+            + weights.convergence
+            + weights.pressure
+            + weights.process
+            + weights.cancellation;
         assert!(
             (sum - 1.0).abs() < f64::EPSILON,
             "Default weights should sum to 1.0, got {}",

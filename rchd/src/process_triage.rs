@@ -8,11 +8,11 @@
 use crate::events::EventBus;
 use chrono::Utc;
 use rch_common::e2e::process_triage::{
-    ProcessTriageActionClass, ProcessTriageActionOutcome, ProcessTriageActionResult,
-    ProcessTriageAuditRecord, ProcessTriageContract, ProcessTriageEscalationLevel,
-    ProcessTriageFailure, ProcessTriageFailureKind, ProcessTriageRequest,
-    ProcessTriageResponse, ProcessTriageResponseStatus,
-    evaluate_triage_action, PROCESS_TRIAGE_CONTRACT_SCHEMA_VERSION,
+    PROCESS_TRIAGE_CONTRACT_SCHEMA_VERSION, ProcessTriageActionClass, ProcessTriageActionOutcome,
+    ProcessTriageActionResult, ProcessTriageAuditRecord, ProcessTriageContract,
+    ProcessTriageEscalationLevel, ProcessTriageFailure, ProcessTriageFailureKind,
+    ProcessTriageRequest, ProcessTriageResponse, ProcessTriageResponseStatus,
+    evaluate_triage_action,
 };
 use serde::Serialize;
 use std::collections::HashMap;
@@ -214,10 +214,7 @@ impl RemediationPipeline {
     /// 3. Executes permitted actions with bounded escalation
     /// 4. Aborts if confidence drops or safety checks fail
     /// 5. Emits audit events for every decision
-    pub async fn execute(
-        &self,
-        request: &ProcessTriageRequest,
-    ) -> ProcessTriageResponse {
+    pub async fn execute(&self, request: &ProcessTriageRequest) -> ProcessTriageResponse {
         let pipeline_start = Instant::now();
         let now_ms = Utc::now().timestamp_millis();
 
@@ -248,9 +245,12 @@ impl RemediationPipeline {
         }
 
         // Gate: concurrent pipeline limit
-        let prev = self.active_pipelines.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let prev = self
+            .active_pipelines
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if prev >= self.config.max_concurrent_pipelines {
-            self.active_pipelines.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            self.active_pipelines
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
             let response = self.build_failure_response(
                 request,
                 ProcessTriageFailureKind::ExecutorRuntimeError,
@@ -262,8 +262,13 @@ impl RemediationPipeline {
                 ),
                 now_ms,
             );
-            self.emit_pipeline_summary(request, &response, pipeline_start, true,
-                Some("concurrent pipeline limit".to_string()));
+            self.emit_pipeline_summary(
+                request,
+                &response,
+                pipeline_start,
+                true,
+                Some("concurrent pipeline limit".to_string()),
+            );
             return response;
         }
 
@@ -274,7 +279,8 @@ impl RemediationPipeline {
                 && let Some(last) = state.last_pipeline_at
                 && last.elapsed() < self.config.worker_cooldown
             {
-                self.active_pipelines.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                self.active_pipelines
+                    .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                 let response = self.build_failure_response(
                     request,
                     ProcessTriageFailureKind::ExecutorRuntimeError,
@@ -286,8 +292,13 @@ impl RemediationPipeline {
                     ),
                     now_ms,
                 );
-                self.emit_pipeline_summary(request, &response, pipeline_start, true,
-                    Some("worker cooldown".to_string()));
+                self.emit_pipeline_summary(
+                    request,
+                    &response,
+                    pipeline_start,
+                    true,
+                    Some("worker cooldown".to_string()),
+                );
                 return response;
             }
         }
@@ -319,7 +330,9 @@ impl RemediationPipeline {
             let decision = evaluate_triage_action(request, &self.contract, action_req);
 
             // Find the process descriptor for evidence
-            let proc_desc = request.candidate_processes.iter()
+            let proc_desc = request
+                .candidate_processes
+                .iter()
                 .find(|p| p.pid == action_req.pid);
 
             let evidence = proc_desc.map(|p| RemediationEvidence {
@@ -334,7 +347,8 @@ impl RemediationPipeline {
 
             if !decision.permitted {
                 // Action blocked by policy
-                let outcome = if decision.escalation_level == ProcessTriageEscalationLevel::ManualReview
+                let outcome = if decision.escalation_level
+                    == ProcessTriageEscalationLevel::ManualReview
                     || decision.escalation_level == ProcessTriageEscalationLevel::Blocked
                 {
                     any_escalated = true;
@@ -344,7 +358,8 @@ impl RemediationPipeline {
                 };
 
                 // Update highest escalation
-                if escalation_rank(decision.escalation_level) > escalation_rank(highest_escalation) {
+                if escalation_rank(decision.escalation_level) > escalation_rank(highest_escalation)
+                {
                     highest_escalation = decision.escalation_level;
                 }
 
@@ -394,11 +409,9 @@ impl RemediationPipeline {
                 ProcessTriageActionClass::ReclaimDisk => EscalationStep::Observe,
             };
 
-            let (outcome, signal_sent) = self.execute_escalation_step(
-                step,
-                action_req.pid,
-                &request.worker_id,
-            ).await;
+            let (outcome, signal_sent) = self
+                .execute_escalation_step(step, action_req.pid, &request.worker_id)
+                .await;
 
             if outcome == ProcessTriageActionOutcome::Executed {
                 any_executed = true;
@@ -436,19 +449,24 @@ impl RemediationPipeline {
         }
 
         // Decrement active pipeline count
-        self.active_pipelines.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        self.active_pipelines
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
 
         // Update per-worker state
         {
             let mut states = self.worker_states.write().await;
             let state = states.entry(request.worker_id.clone()).or_default();
             state.last_pipeline_at = Some(Instant::now());
-            state.total_actions += action_results.iter()
+            state.total_actions += action_results
+                .iter()
                 .filter(|r| r.outcome == ProcessTriageActionOutcome::Executed)
                 .count() as u32;
-            state.hard_terminations += action_results.iter()
-                .filter(|r| r.outcome == ProcessTriageActionOutcome::Executed
-                    && r.action_class == ProcessTriageActionClass::HardTerminate)
+            state.hard_terminations += action_results
+                .iter()
+                .filter(|r| {
+                    r.outcome == ProcessTriageActionOutcome::Executed
+                        && r.action_class == ProcessTriageActionClass::HardTerminate
+                })
                 .count() as u32;
 
             if any_failed && !any_executed {
@@ -496,8 +514,12 @@ impl RemediationPipeline {
                 policy_version: self.contract.safe_action_policy.policy_version.clone(),
                 evaluated_by: "rchd_remediation_pipeline".to_string(),
                 evaluated_at_unix_ms: Utc::now().timestamp_millis(),
-                decision_code: format!("PT_PIPELINE_{}", format!("{:?}", status).to_ascii_uppercase()),
-                requires_operator_ack: highest_escalation == ProcessTriageEscalationLevel::ManualReview
+                decision_code: format!(
+                    "PT_PIPELINE_{}",
+                    format!("{:?}", status).to_ascii_uppercase()
+                ),
+                requires_operator_ack: highest_escalation
+                    == ProcessTriageEscalationLevel::ManualReview
                     || highest_escalation == ProcessTriageEscalationLevel::Blocked,
                 audit_required: self.contract.safe_action_policy.require_audit_record,
             },
@@ -590,9 +612,7 @@ impl RemediationPipeline {
                 kind,
                 code: code.to_string(),
                 message: message.to_string(),
-                remediation: vec![
-                    "Check pipeline configuration and retry".to_string(),
-                ],
+                remediation: vec!["Check pipeline configuration and retry".to_string()],
             }),
             audit: ProcessTriageAuditRecord {
                 policy_version: self.contract.safe_action_policy.policy_version.clone(),
@@ -622,20 +642,33 @@ impl RemediationPipeline {
             worker_id: request.worker_id.clone(),
             trigger: format!("{:?}", request.trigger),
             processes_evaluated: request.candidate_processes.len() as u32,
-            actions_executed: response.executed_actions.iter()
-                .filter(|a| a.outcome == ProcessTriageActionOutcome::Executed).count() as u32,
-            actions_skipped: response.executed_actions.iter()
-                .filter(|a| a.outcome == ProcessTriageActionOutcome::Skipped).count() as u32,
-            actions_escalated: response.executed_actions.iter()
-                .filter(|a| a.outcome == ProcessTriageActionOutcome::Escalated).count() as u32,
-            actions_failed: response.executed_actions.iter()
-                .filter(|a| a.outcome == ProcessTriageActionOutcome::Failed).count() as u32,
+            actions_executed: response
+                .executed_actions
+                .iter()
+                .filter(|a| a.outcome == ProcessTriageActionOutcome::Executed)
+                .count() as u32,
+            actions_skipped: response
+                .executed_actions
+                .iter()
+                .filter(|a| a.outcome == ProcessTriageActionOutcome::Skipped)
+                .count() as u32,
+            actions_escalated: response
+                .executed_actions
+                .iter()
+                .filter(|a| a.outcome == ProcessTriageActionOutcome::Escalated)
+                .count() as u32,
+            actions_failed: response
+                .executed_actions
+                .iter()
+                .filter(|a| a.outcome == ProcessTriageActionOutcome::Failed)
+                .count() as u32,
             total_duration_ms: start.elapsed().as_millis() as u64,
             aborted,
             abort_reason,
             timestamp_unix_ms: Utc::now().timestamp_millis(),
         };
-        self.events.emit("process_triage.pipeline_completed", &summary);
+        self.events
+            .emit("process_triage.pipeline_completed", &summary);
     }
 
     /// Get current remediation state for a worker (for status surfaces).
@@ -650,7 +683,8 @@ impl RemediationPipeline {
 
     /// Number of currently active pipeline executions.
     pub fn active_pipeline_count(&self) -> u32 {
-        self.active_pipelines.load(std::sync::atomic::Ordering::SeqCst)
+        self.active_pipelines
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -800,10 +834,7 @@ impl TriageLoop {
 
     /// Execute a single triage sweep. If `worker_filter` is provided,
     /// only the specified worker is evaluated (on-demand mode).
-    pub async fn sweep(
-        &mut self,
-        worker_filter: Option<&str>,
-    ) -> TriageSweepResult {
+    pub async fn sweep(&mut self, worker_filter: Option<&str>) -> TriageSweepResult {
         self.sweep_count += 1;
         let sweep_start = Instant::now();
         let sweep_id = self.sweep_count;
@@ -880,10 +911,16 @@ impl TriageLoop {
             total_candidates += request.candidate_processes.len() as u32;
             let response = self.pipeline.execute(&request).await;
 
-            let executed = response.executed_actions.iter()
-                .filter(|a| a.outcome == ProcessTriageActionOutcome::Executed).count() as u32;
-            let escalated = response.executed_actions.iter()
-                .filter(|a| a.outcome == ProcessTriageActionOutcome::Escalated).count() as u32;
+            let executed = response
+                .executed_actions
+                .iter()
+                .filter(|a| a.outcome == ProcessTriageActionOutcome::Executed)
+                .count() as u32;
+            let escalated = response
+                .executed_actions
+                .iter()
+                .filter(|a| a.outcome == ProcessTriageActionOutcome::Escalated)
+                .count() as u32;
 
             total_actions += executed;
             total_escalations += escalated;
@@ -926,10 +963,7 @@ impl TriageLoop {
         } else {
             debug!(
                 sweep_id,
-                workers_evaluated,
-                workers_skipped,
-                total_actions,
-                "Triage sweep completed"
+                workers_evaluated, workers_skipped, total_actions, "Triage sweep completed"
             );
         }
 
@@ -980,11 +1014,7 @@ impl TriageCommand {
     }
 
     /// Run an on-demand triage sweep against a specific worker (or all workers).
-    pub async fn run(
-        &self,
-        worker_filter: Option<&str>,
-        budget: Duration,
-    ) -> TriageSweepResult {
+    pub async fn run(&self, worker_filter: Option<&str>, budget: Duration) -> TriageSweepResult {
         let mut loop_runner = TriageLoop::new(
             self.pipeline.clone(),
             self.pool.clone(),
@@ -1007,8 +1037,7 @@ impl TriageCommand {
 mod tests {
     use super::*;
     use rch_common::e2e::process_triage::{
-        ProcessClassification, ProcessDescriptor, ProcessTriageActionRequest,
-        ProcessTriageTrigger,
+        ProcessClassification, ProcessDescriptor, ProcessTriageActionRequest, ProcessTriageTrigger,
     };
     use rch_common::test_guard;
 
@@ -1026,7 +1055,11 @@ mod tests {
         })
     }
 
-    fn sample_process(pid: u32, command: &str, classification: ProcessClassification) -> ProcessDescriptor {
+    fn sample_process(
+        pid: u32,
+        command: &str,
+        classification: ProcessClassification,
+    ) -> ProcessDescriptor {
         ProcessDescriptor {
             pid,
             ppid: Some(1),
@@ -1039,7 +1072,10 @@ mod tests {
         }
     }
 
-    fn sample_request(processes: Vec<ProcessDescriptor>, actions: Vec<ProcessTriageActionRequest>) -> ProcessTriageRequest {
+    fn sample_request(
+        processes: Vec<ProcessDescriptor>,
+        actions: Vec<ProcessTriageActionRequest>,
+    ) -> ProcessTriageRequest {
         ProcessTriageRequest {
             schema_version: PROCESS_TRIAGE_CONTRACT_SCHEMA_VERSION.to_string(),
             correlation_id: "test-corr-001".to_string(),
@@ -1075,15 +1111,25 @@ mod tests {
         let resp = pipeline.execute(&req).await;
         assert_eq!(resp.status, ProcessTriageResponseStatus::Applied);
         assert_eq!(resp.executed_actions.len(), 1);
-        assert_eq!(resp.executed_actions[0].outcome, ProcessTriageActionOutcome::Executed);
-        assert_eq!(resp.executed_actions[0].action_class, ProcessTriageActionClass::ObserveOnly);
+        assert_eq!(
+            resp.executed_actions[0].outcome,
+            ProcessTriageActionOutcome::Executed
+        );
+        assert_eq!(
+            resp.executed_actions[0].action_class,
+            ProcessTriageActionClass::ObserveOnly
+        );
     }
 
     #[tokio::test]
     async fn test_soft_terminate_permitted_for_managed_process() {
         let _guard = test_guard!();
         let pipeline = make_default_pipeline();
-        let proc = sample_process(1001, "cargo test --workspace", ProcessClassification::BuildRelated);
+        let proc = sample_process(
+            1001,
+            "cargo test --workspace",
+            ProcessClassification::BuildRelated,
+        );
         let req = sample_request(
             vec![proc],
             vec![ProcessTriageActionRequest {
@@ -1097,7 +1143,10 @@ mod tests {
         let resp = pipeline.execute(&req).await;
         // In dry-run mode, action is "executed" (logged but not actually sent)
         assert_eq!(resp.status, ProcessTriageResponseStatus::Applied);
-        assert_eq!(resp.executed_actions[0].outcome, ProcessTriageActionOutcome::Executed);
+        assert_eq!(
+            resp.executed_actions[0].outcome,
+            ProcessTriageActionOutcome::Executed
+        );
     }
 
     #[tokio::test]
@@ -1119,9 +1168,12 @@ mod tests {
         // Default policy denylists HardTerminate
         assert!(
             resp.status == ProcessTriageResponseStatus::EscalatedNoAction
-            || resp.status == ProcessTriageResponseStatus::RejectedByPolicy
+                || resp.status == ProcessTriageResponseStatus::RejectedByPolicy
         );
-        assert_eq!(resp.executed_actions[0].outcome, ProcessTriageActionOutcome::Escalated);
+        assert_eq!(
+            resp.executed_actions[0].outcome,
+            ProcessTriageActionOutcome::Escalated
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1132,7 +1184,11 @@ mod tests {
     async fn test_protected_process_is_never_terminated() {
         let _guard = test_guard!();
         let pipeline = make_default_pipeline();
-        let proc = sample_process(1, "sshd: ubuntu@pts/0", ProcessClassification::SystemCritical);
+        let proc = sample_process(
+            1,
+            "sshd: ubuntu@pts/0",
+            ProcessClassification::SystemCritical,
+        );
         let req = sample_request(
             vec![proc],
             vec![ProcessTriageActionRequest {
@@ -1145,7 +1201,10 @@ mod tests {
 
         let resp = pipeline.execute(&req).await;
         assert_ne!(resp.status, ProcessTriageResponseStatus::Applied);
-        assert_eq!(resp.executed_actions[0].outcome, ProcessTriageActionOutcome::Escalated);
+        assert_eq!(
+            resp.executed_actions[0].outcome,
+            ProcessTriageActionOutcome::Escalated
+        );
     }
 
     #[tokio::test]
@@ -1185,7 +1244,10 @@ mod tests {
         let resp = pipeline.execute(&req).await;
         assert_eq!(resp.status, ProcessTriageResponseStatus::Failed);
         assert!(resp.failure.is_some());
-        assert_eq!(resp.failure.unwrap().kind, ProcessTriageFailureKind::InvalidRequest);
+        assert_eq!(
+            resp.failure.unwrap().kind,
+            ProcessTriageFailureKind::InvalidRequest
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1299,7 +1361,10 @@ mod tests {
 
         let resp = pipeline.execute(&req).await;
         assert_eq!(resp.status, ProcessTriageResponseStatus::EscalatedNoAction);
-        assert_eq!(resp.escalation_level, ProcessTriageEscalationLevel::ManualReview);
+        assert_eq!(
+            resp.escalation_level,
+            ProcessTriageEscalationLevel::ManualReview
+        );
         assert!(resp.audit.requires_operator_ack);
     }
 
@@ -1379,7 +1444,10 @@ mod tests {
 
         let resp = pipeline.execute(&req).await;
         assert_eq!(resp.status, ProcessTriageResponseStatus::EscalatedNoAction);
-        assert_eq!(resp.escalation_level, ProcessTriageEscalationLevel::ManualReview);
+        assert_eq!(
+            resp.escalation_level,
+            ProcessTriageEscalationLevel::ManualReview
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1414,8 +1482,14 @@ mod tests {
         let resp = pipeline.execute(&req).await;
         // First action should execute, second should be blocked (protected process)
         assert_eq!(resp.executed_actions.len(), 2);
-        assert_eq!(resp.executed_actions[0].outcome, ProcessTriageActionOutcome::Executed);
-        assert_eq!(resp.executed_actions[1].outcome, ProcessTriageActionOutcome::Escalated);
+        assert_eq!(
+            resp.executed_actions[0].outcome,
+            ProcessTriageActionOutcome::Executed
+        );
+        assert_eq!(
+            resp.executed_actions[1].outcome,
+            ProcessTriageActionOutcome::Escalated
+        );
         // Partial = some executed, some escalated
         assert_eq!(resp.status, ProcessTriageResponseStatus::PartiallyApplied);
     }
@@ -1437,7 +1511,11 @@ mod tests {
         );
 
         let req = sample_request(
-            vec![sample_process(1001, "cargo test", ProcessClassification::BuildRelated)],
+            vec![sample_process(
+                1001,
+                "cargo test",
+                ProcessClassification::BuildRelated,
+            )],
             vec![ProcessTriageActionRequest {
                 action_class: ProcessTriageActionClass::ObserveOnly,
                 pid: 1001,
@@ -1487,7 +1565,10 @@ mod tests {
         let resp = pipeline.execute(&req).await;
         assert_eq!(resp.status, ProcessTriageResponseStatus::Failed);
         assert!(resp.failure.is_some());
-        assert_eq!(resp.failure.unwrap().kind, ProcessTriageFailureKind::InvalidRequest);
+        assert_eq!(
+            resp.failure.unwrap().kind,
+            ProcessTriageFailureKind::InvalidRequest
+        );
     }
 
     #[tokio::test]
@@ -1545,7 +1626,13 @@ mod tests {
 
         // Create 6 actions (exceeds max_actions_before_manual_review=5)
         let processes: Vec<ProcessDescriptor> = (0..6)
-            .map(|i| sample_process(1000 + i, &format!("cargo build -p crate{i}"), ProcessClassification::BuildRelated))
+            .map(|i| {
+                sample_process(
+                    1000 + i,
+                    &format!("cargo build -p crate{i}"),
+                    ProcessClassification::BuildRelated,
+                )
+            })
             .collect();
         let actions: Vec<ProcessTriageActionRequest> = (0..6)
             .map(|i| ProcessTriageActionRequest {
@@ -1563,7 +1650,10 @@ mod tests {
         for action in &resp.executed_actions {
             assert_eq!(action.action_class, ProcessTriageActionClass::ObserveOnly);
         }
-        assert_eq!(resp.escalation_level, ProcessTriageEscalationLevel::Supervised);
+        assert_eq!(
+            resp.escalation_level,
+            ProcessTriageEscalationLevel::Supervised
+        );
     }
 
     #[tokio::test]
@@ -1625,11 +1715,13 @@ mod tests {
         pool.add_worker(WorkerConfig {
             id: rch_common::WorkerId::new("loop-w1"),
             ..WorkerConfig::default()
-        }).await;
+        })
+        .await;
         pool.add_worker(WorkerConfig {
             id: rch_common::WorkerId::new("loop-w2"),
             ..WorkerConfig::default()
-        }).await;
+        })
+        .await;
         pool
     }
 
@@ -1639,12 +1731,7 @@ mod tests {
         let pipeline = Arc::new(make_default_pipeline());
         let pool = make_test_pool().await;
         let events = EventBus::new(64);
-        let mut triage = TriageLoop::new(
-            pipeline,
-            pool,
-            events,
-            TriageLoopConfig::default(),
-        );
+        let mut triage = TriageLoop::new(pipeline, pool, events, TriageLoopConfig::default());
 
         let result = triage.sweep(None).await;
         assert_eq!(result.sweep_id, 1);
@@ -1660,12 +1747,7 @@ mod tests {
         let pipeline = Arc::new(make_default_pipeline());
         let pool = make_test_pool().await;
         let events = EventBus::new(64);
-        let mut triage = TriageLoop::new(
-            pipeline,
-            pool,
-            events,
-            TriageLoopConfig::default(),
-        );
+        let mut triage = TriageLoop::new(pipeline, pool, events, TriageLoopConfig::default());
 
         let r1 = triage.sweep(None).await;
         let r2 = triage.sweep(None).await;
@@ -1709,8 +1791,11 @@ mod tests {
         assert_eq!(result.workers_evaluated, 1);
 
         // Verify the skipped worker result
-        let skipped = result.worker_results.iter()
-            .find(|r| r.worker_id == "loop-w1").unwrap();
+        let skipped = result
+            .worker_results
+            .iter()
+            .find(|r| r.worker_id == "loop-w1")
+            .unwrap();
         assert!(skipped.skipped);
         assert_eq!(skipped.skip_reason.as_deref(), Some("active builds"));
     }
@@ -1721,12 +1806,7 @@ mod tests {
         let pipeline = Arc::new(make_default_pipeline());
         let pool = make_test_pool().await;
         let events = EventBus::new(64);
-        let mut triage = TriageLoop::new(
-            pipeline,
-            pool,
-            events,
-            TriageLoopConfig::default(),
-        );
+        let mut triage = TriageLoop::new(pipeline, pool, events, TriageLoopConfig::default());
 
         let result = triage.sweep(Some("loop-w1")).await;
         // Only loop-w1 should be evaluated (loop-w2 filtered out)
@@ -1761,12 +1841,7 @@ mod tests {
         let pool = make_test_pool().await;
         let events = EventBus::new(64);
         let mut rx = events.subscribe();
-        let mut triage = TriageLoop::new(
-            pipeline,
-            pool,
-            events,
-            TriageLoopConfig::default(),
-        );
+        let mut triage = TriageLoop::new(pipeline, pool, events, TriageLoopConfig::default());
 
         let _result = triage.sweep(None).await;
 
@@ -1831,7 +1906,10 @@ mod tests {
         let loop_result = loop_runner.sweep(Some("loop-w1")).await;
         let cmd_result = cmd.run(Some("loop-w1"), Duration::from_secs(5)).await;
 
-        assert_eq!(loop_result.worker_results.len(), cmd_result.worker_results.len());
+        assert_eq!(
+            loop_result.worker_results.len(),
+            cmd_result.worker_results.len()
+        );
         assert_eq!(
             loop_result.worker_results[0].worker_id,
             cmd_result.worker_results[0].worker_id

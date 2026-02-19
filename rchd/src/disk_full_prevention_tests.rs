@@ -98,6 +98,7 @@ mod tests {
             location: BuildLocation::Remote,
             bytes_transferred: Some(bytes),
             timing: None,
+            cancellation: None,
         }
     }
 

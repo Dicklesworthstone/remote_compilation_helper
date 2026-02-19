@@ -945,6 +945,7 @@ mod tests {
             location: rch_common::BuildLocation::Remote,
             bytes_transferred: Some(1024),
             timing: None,
+            cancellation: None,
         };
         history.record(record);
 
@@ -1138,6 +1139,7 @@ mod tests {
                 location: rch_common::BuildLocation::Local,
                 bytes_transferred: None,
                 timing: None,
+                cancellation: None,
             };
             history.record(record);
         }
@@ -1177,6 +1179,7 @@ mod tests {
                 location,
                 bytes_transferred: None,
                 timing: None,
+                cancellation: None,
             };
             history.record(record);
         }
