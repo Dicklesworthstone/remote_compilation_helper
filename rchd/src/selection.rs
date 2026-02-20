@@ -17,7 +17,7 @@ use crate::metrics::{
 };
 use crate::ui::workers::{debug_routing_enabled, log_routing_decision};
 use crate::workers::{WorkerPool, WorkerState};
-use rand::Rng;
+use rand::RngExt;
 use rch_common::{
     CircuitBreakerConfig, CircuitState, CommandPriority, RequiredRuntime, SelectionConfig,
     SelectionReason, SelectionRequest, SelectionStrategy, SelectionWeightConfig, WorkerId,

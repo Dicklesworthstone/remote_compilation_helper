@@ -1,7 +1,7 @@
 //! Common types used across RCH components.
 
 use crate::{CompilationKind, toolchain::ToolchainInfo};
-use rand::Rng;
+use rand::RngExt;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;

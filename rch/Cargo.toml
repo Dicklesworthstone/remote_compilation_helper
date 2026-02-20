@@ -36,12 +36,12 @@ is-terminal = "0.4.17"
 terminal_size = "0.4.3"
 regex = "1"
 glob = "0.3"
-indicatif = { version = "0.18.3", features = ["tokio"] }
+indicatif = { version = "0.18.4", features = ["tokio"] }
 chrono = { workspace = true, features = ["serde"] }
 uuid = { workspace = true }
 
 # Update system dependencies
-reqwest = { version = "0.13.1", features = ["json"] }
+reqwest = { version = "0.13.2", features = ["json"] }
 sha2 = "0.10.9"
 shell-escape = "0.1.5"
 
@@ -74,9 +74,9 @@ rich-ui = ["rich_rust"]
 true-e2e = []
 
 [dev-dependencies]
-tempfile = "3.22.0"
-proptest = "1.7.0"
-insta = "1.42"
+tempfile = "3.25.0"
+proptest = "1.10.0"
+insta = "1.46"
 serial_test = "3.2"
 ctor = "0.2.9"
 

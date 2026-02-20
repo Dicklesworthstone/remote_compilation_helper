@@ -92,7 +92,7 @@ pub struct CargoPathDependencyError {
 }
 
 impl CargoPathDependencyError {
-    fn new(kind: CargoPathDependencyErrorKind, detail: impl Into<String>) -> Self {
+    pub(crate) fn new(kind: CargoPathDependencyErrorKind, detail: impl Into<String>) -> Self {
         Self {
             kind,
             detail: detail.into(),
@@ -104,17 +104,17 @@ impl CargoPathDependencyError {
         }
     }
 
-    fn with_manifest_path(mut self, manifest_path: impl Into<PathBuf>) -> Self {
+    pub(crate) fn with_manifest_path(mut self, manifest_path: impl Into<PathBuf>) -> Self {
         self.manifest_path = Some(Box::new(manifest_path.into()));
         self
     }
 
-    fn with_dependency_name(mut self, dependency_name: impl Into<String>) -> Self {
+    pub(crate) fn with_dependency_name(mut self, dependency_name: impl Into<String>) -> Self {
         self.dependency_name = Some(dependency_name.into().into_boxed_str());
         self
     }
 
-    fn with_dependency_path(mut self, dependency_path: impl Into<PathBuf>) -> Self {
+    pub(crate) fn with_dependency_path(mut self, dependency_path: impl Into<PathBuf>) -> Self {
         self.dependency_path = Some(Box::new(dependency_path.into()));
         self
     }

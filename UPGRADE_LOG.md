@@ -83,6 +83,131 @@ Applied best practices from the rust-cli-with-sqlite skill to rch-telemetry:
 
 ---
 
+**Date:** 2026-02-19  |  **Project:** remote_compilation_helper  |  **Language:** Rust
+
+## Summary
+- **Updated:** 20  |  **Skipped:** 1  |  **Failed:** 0  |  **Needs attention:** 0
+
+## Updates
+
+### Workspace-level (Cargo.toml)
+
+#### clap: 4.5.54 → 4.5.60
+- **Breaking:** None (patch release)
+- **Tests:** Passed
+
+#### clap_complete: 4.5.65 → 4.5.66
+- **Breaking:** None (patch release)
+- **Tests:** Passed
+
+#### memchr: 2.7.6 → 2.8.0
+- **Breaking:** None (minor release)
+- **Tests:** Passed
+
+#### regex: 1.12.2 → 1.12.3
+- **Breaking:** None (patch release)
+- **Tests:** Passed
+
+#### uuid: 1.19.0 → 1.21.0
+- **Breaking:** None (minor release)
+- **Tests:** Passed
+
+#### anyhow: 1.0.100 → 1.0.101
+- **Breaking:** None (patch release)
+- **Tests:** Passed
+
+#### ureq: 3.0 → 3.2
+- **Breaking:** None (minor release)
+- **Tests:** Passed
+
+#### notify: 8.0 → 8.2
+- **Breaking:** None (minor release)
+- **Tests:** Passed
+
+#### toml: 0.9.10 → 1.0 (MAJOR)
+- **Breaking:** Minimal — only `Time::second`/`Time::nanosecond` wrapped in `Option`; project doesn't use datetime types
+- **Migration:** Version bump only, no code changes needed
+- **Tests:** Passed
+
+#### tracing-opentelemetry: 0.28 → 0.32 (MAJOR)
+- **Breaking:** Semantic convention attribute renames (`code.filepath` → `code.file.path`, `code.lineno` → `code.line.number`), `PreSampledTracer` removed, `otel.status_message` → `otel.status_description`
+- **Migration:** No code changes needed — project's OpenTelemetry integration is a stub
+- **Bonus:** Removed duplicate `opentelemetry v0.27.1` and `opentelemetry_sdk v0.27.1` from dependency tree (old tracing-opentelemetry required OTel 0.27, now correctly uses 0.31)
+- **Tests:** Passed
+
+#### rand: 0.9.2 → 0.10.0 (MAJOR)
+- **Breaking:** `rand::Rng` trait renamed to `rand::RngExt`
+- **Migration:** Changed `use rand::Rng` to `use rand::RngExt` in 2 files:
+  - `rch-common/src/types.rs:4`
+  - `rchd/src/selection.rs:20`
+- **Tests:** Passed
+
+### Crate-specific
+
+#### indicatif: 0.18.3 → 0.18.4 (rch)
+- **Breaking:** None (patch release)
+- **Tests:** Passed
+
+#### reqwest: 0.13.1 → 0.13.2 (rch)
+- **Breaking:** None (patch release)
+- **Tests:** Passed
+
+#### tempfile: 3.22.0 → 3.25.0 (rch, rchd, rch-common, rch-telemetry)
+- **Breaking:** None (minor release)
+- **Tests:** Passed
+
+#### proptest: 1.7.0 → 1.10.0 (rch, rchd, rch-common, rch-telemetry dev-deps)
+- **Breaking:** None (minor release)
+- **Tests:** Passed
+
+#### criterion: 0.8.1 → 0.8.2 (rch-common dev-dep)
+- **Breaking:** None (patch release)
+- **Tests:** Passed
+
+#### insta: 1.42 → 1.46 (rch dev-dep)
+- **Breaking:** None (minor release)
+- **Tests:** Passed
+
+#### whoami: 2.0 → 2.1 (rch-common, rchd)
+- **Breaking:** None (minor release)
+- **Tests:** Passed
+
+### Pre-existing fix applied
+
+#### rch-common/src/cargo_path_deps.rs: visibility fix
+- **Issue:** `CargoPathDependencyError::new`, `with_manifest_path`, `with_dependency_name`, `with_dependency_path` were `fn` (private) but called from tests in `dependency_closure_planner.rs`
+- **Fix:** Changed to `pub(crate) fn`
+- **Note:** Pre-existing compilation error, not caused by dependency updates
+
+## Skipped
+
+### ctor: 0.2.9 → 0.6.3
+- **Reason:** ctor 0.6 macro expansion uses `#[allow(unsafe_code)]` which is incompatible with `#![forbid(unsafe_code)]` required by project policy (AGENTS.md)
+- **Action:** Stayed on 0.2.9
+
+## Failed
+
+None
+
+## Transitive dependency improvements
+- Removed duplicate `opentelemetry v0.27.1` / `opentelemetry_sdk v0.27.1` (were only needed by tracing-opentelemetry 0.28)
+- Removed `rand_chacha v0.3.1` (replaced by `chacha20 v0.10.0` in rand 0.10)
+
+### Toolchain update
+
+#### rust-toolchain.toml: nightly-2025-11-01 → nightly-2026-02-19
+- **Change:** rustc 1.93.0-nightly (82ae0ee64 2025-10-31) → rustc 1.95.0-nightly (c04308580 2026-02-18)
+- **Breaking:** None observed
+- **Tests:** All passing (4993+ tests, 0 failures)
+
+## Notes
+
+- All 4993+ tests passing with 0 failures after toolchain update
+- `cargo clippy --workspace --all-targets -- -D warnings` clean
+- `cargo fmt --check` clean (fixed pre-existing formatting in `dependency_closure_planner.rs`)
+
+---
+
 **Date:** 2026-01-26  |  **Project:** remote_compilation_helper  |  **Language:** Rust
 
 ## Summary

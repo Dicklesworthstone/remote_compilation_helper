@@ -65,10 +65,10 @@ rich-ui = ["rich_rust"]
 unix-sockets = []
 
 [dev-dependencies]
-tempfile = "3.22.0"
-whoami = "2"
+tempfile = "3.25.0"
+whoami = "2.1"
 rch-common = { workspace = true, features = ["rich-ui"] }
-proptest = "1.7.0"
+proptest = "1.10.0"
 ctor = { workspace = true }
 serial_test = "3.2"
 

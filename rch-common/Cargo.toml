@@ -40,7 +40,7 @@ unicode-width = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 openssh = { workspace = true }
-whoami = "2.0"
+whoami = "2.1"
 
 # Rich terminal output (optional)
 rich_rust = { workspace = true, optional = true }
@@ -50,10 +50,10 @@ default = ["rich-ui"]
 rich-ui = ["rich_rust"]
 
 [dev-dependencies]
-tempfile = "3.22.0"
-criterion = { version = "0.8.1", features = ["html_reports"] }
+tempfile = "3.25.0"
+criterion = { version = "0.8.2", features = ["html_reports"] }
 tracing-subscriber = { workspace = true }
-proptest = "1.7.0"
+proptest = "1.10.0"
 serde_yaml_ng = "0.10.0"
 ctor = { workspace = true }
 

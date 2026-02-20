@@ -481,8 +481,16 @@ mod tests {
                 package("/data/projects/cycle_b", "cycle_b", false),
             ],
             edges: vec![
-                edge("/data/projects/cycle_a", "/data/projects/cycle_b", "cycle_b"),
-                edge("/data/projects/cycle_b", "/data/projects/cycle_a", "cycle_a"),
+                edge(
+                    "/data/projects/cycle_a",
+                    "/data/projects/cycle_b",
+                    "cycle_b",
+                ),
+                edge(
+                    "/data/projects/cycle_b",
+                    "/data/projects/cycle_a",
+                    "cycle_a",
+                ),
             ],
         };
 
