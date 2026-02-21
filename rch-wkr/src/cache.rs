@@ -7,12 +7,22 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 use tracing::{debug, info, warn};
 
-/// Base directory for RCH project caches.
-const CACHE_BASE: &str = "/tmp/rch";
+/// Get the base directory for RCH project caches.
+/// Uses `dirs::cache_dir()` (e.g. `~/.cache/rch`) to isolate caches per-user
+/// and prevent symlink attacks on shared `/tmp` partitions. Falls back to `/tmp/rch-$USER`.
+pub fn get_cache_base() -> PathBuf {
+    if let Some(mut cache) = dirs::cache_dir() {
+        cache.push("rch");
+        cache
+    } else {
+        let user = std::env::var("USER").unwrap_or_else(|_| "unknown".to_string());
+        PathBuf::from(format!("/tmp/rch-{}", user))
+    }
+}
 
 /// Clean up old project caches.
 pub async fn cleanup(max_age_hours: u64) -> Result<()> {
-    cleanup_in(Path::new(CACHE_BASE), max_age_hours).await
+    cleanup_in(&get_cache_base(), max_age_hours).await
 }
 
 /// Clean up old project caches under a specific base directory.
@@ -163,7 +173,7 @@ pub async fn cleanup_in(cache_base: &Path, max_age_hours: u64) -> Result<()> {
 
 /// Get the cache path for a project.
 pub fn cache_path(project: &str, hash: &str) -> PathBuf {
-    cache_path_in(Path::new(CACHE_BASE), project, hash)
+    cache_path_in(&get_cache_base(), project, hash)
 }
 
 /// Get the cache path for a project under a specific cache base directory.
@@ -207,7 +217,8 @@ mod tests {
     fn test_cache_path() {
         println!("TEST START: test_cache_path");
         let path = cache_path("myproject", "abc123");
-        assert_eq!(path, PathBuf::from("/tmp/rch/myproject/abc123"));
+        assert!(path.to_string_lossy().contains("myproject/abc123"));
+        assert!(path.to_string_lossy().contains("rch"));
         println!("TEST PASS: test_cache_path");
     }
 
@@ -215,7 +226,7 @@ mod tests {
     fn test_cache_path_simple() {
         println!("TEST START: test_cache_path_simple");
         let path = cache_path("proj", "hash");
-        assert_eq!(path, PathBuf::from("/tmp/rch/proj/hash"));
+        assert!(path.to_string_lossy().contains("proj/hash"));
         println!("TEST PASS: test_cache_path_simple");
     }
 
@@ -223,7 +234,7 @@ mod tests {
     fn test_cache_path_with_dots() {
         println!("TEST START: test_cache_path_with_dots");
         let path = cache_path("my.project", "abc.123");
-        assert_eq!(path, PathBuf::from("/tmp/rch/my.project/abc.123"));
+        assert!(path.to_string_lossy().contains("my.project/abc.123"));
         println!("TEST PASS: test_cache_path_with_dots");
     }
 
@@ -231,7 +242,7 @@ mod tests {
     fn test_cache_path_with_dashes() {
         println!("TEST START: test_cache_path_with_dashes");
         let path = cache_path("my-project", "abc-123-def");
-        assert_eq!(path, PathBuf::from("/tmp/rch/my-project/abc-123-def"));
+        assert!(path.to_string_lossy().contains("my-project/abc-123-def"));
         println!("TEST PASS: test_cache_path_with_dashes");
     }
 
@@ -239,7 +250,7 @@ mod tests {
     fn test_cache_path_with_underscores() {
         println!("TEST START: test_cache_path_with_underscores");
         let path = cache_path("my_project", "abc_123");
-        assert_eq!(path, PathBuf::from("/tmp/rch/my_project/abc_123"));
+        assert!(path.to_string_lossy().contains("my_project/abc_123"));
         println!("TEST PASS: test_cache_path_with_underscores");
     }
 
@@ -247,7 +258,7 @@ mod tests {
     fn test_cache_path_hex_hash() {
         println!("TEST START: test_cache_path_hex_hash");
         let path = cache_path("project", "a1b2c3d4e5f6");
-        assert_eq!(path, PathBuf::from("/tmp/rch/project/a1b2c3d4e5f6"));
+        assert!(path.to_string_lossy().contains("project/a1b2c3d4e5f6"));
         println!("TEST PASS: test_cache_path_hex_hash");
     }
 
@@ -256,10 +267,7 @@ mod tests {
         println!("TEST START: test_cache_path_long_hash");
         let long_hash = "a".repeat(64);
         let path = cache_path("project", &long_hash);
-        assert_eq!(
-            path,
-            PathBuf::from(format!("/tmp/rch/project/{}", long_hash))
-        );
+        assert!(path.to_string_lossy().contains(&format!("project/{}", long_hash)));
         println!("TEST PASS: test_cache_path_long_hash");
     }
 
@@ -267,8 +275,7 @@ mod tests {
     fn test_cache_path_empty_project() {
         println!("TEST START: test_cache_path_empty_project");
         let path = cache_path("", "hash123");
-        // Empty project creates path with trailing slash component
-        assert_eq!(path, PathBuf::from("/tmp/rch//hash123"));
+        assert!(path.to_string_lossy().ends_with("/hash123"));
         println!("TEST PASS: test_cache_path_empty_project");
     }
 
@@ -276,15 +283,16 @@ mod tests {
     fn test_cache_path_empty_hash() {
         println!("TEST START: test_cache_path_empty_hash");
         let path = cache_path("project", "");
-        assert_eq!(path, PathBuf::from("/tmp/rch/project/"));
+        assert!(path.to_string_lossy().ends_with("project"));
         println!("TEST PASS: test_cache_path_empty_hash");
     }
 
     #[test]
     fn test_cache_base_constant() {
         println!("TEST START: test_cache_base_constant");
-        // Verify CACHE_BASE is used correctly
-        assert_eq!(CACHE_BASE, "/tmp/rch");
+        // Verify get_cache_base works
+        let base = get_cache_base();
+        assert!(base.to_string_lossy().contains("rch"));
         println!("TEST PASS: test_cache_base_constant");
     }
 

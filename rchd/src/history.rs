@@ -114,13 +114,21 @@ const DEFAULT_MAX_QUEUE_DEPTH: usize = 100;
 impl BuildHistory {
     /// Create a new build history with the given capacity.
     pub fn new(capacity: usize) -> Self {
+        // Use a timestamp-based epoch for build IDs to prevent collisions
+        // with orphaned remote processes if the daemon crashes and restarts.
+        let epoch_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let initial_id = (epoch_secs << 24) | 1;
+
         Self {
             records: RwLock::new(VecDeque::with_capacity(capacity)),
             active: RwLock::new(HashMap::new()),
             queued: RwLock::new(VecDeque::new()),
             capacity,
             max_queue_depth: DEFAULT_MAX_QUEUE_DEPTH,
-            next_id: AtomicU64::new(1),
+            next_id: AtomicU64::new(initial_id),
             next_queue_id: AtomicU64::new(1),
             persistence_path: None,
         }
@@ -769,13 +777,20 @@ impl BuildHistory {
 
         debug!("Loaded {} build records from {:?}", records.len(), path);
 
+        let epoch_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let epoch_id = (epoch_secs << 24) | 1;
+        let initial_id = std::cmp::max(max_id + 1, epoch_id);
+
         Ok(Self {
             records: RwLock::new(records),
             active: RwLock::new(HashMap::new()),
             queued: RwLock::new(VecDeque::new()),
             capacity,
             max_queue_depth: DEFAULT_MAX_QUEUE_DEPTH,
-            next_id: AtomicU64::new(max_id + 1),
+            next_id: AtomicU64::new(initial_id),
             next_queue_id: AtomicU64::new(1),
             persistence_path: Some(path.to_path_buf()),
         })

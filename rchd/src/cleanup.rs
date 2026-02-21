@@ -38,12 +38,14 @@ struct StuckEvidence {
 
 impl StuckEvidence {
     fn should_remediate(self) -> bool {
-        self.build_age_secs >= MIN_BUILD_AGE_SECS
+        let hard_timeout = self.build_age_secs > 86400; // 24 hours
+
+        hard_timeout || (self.build_age_secs >= MIN_BUILD_AGE_SECS
             && self.slots_owned > 0
             && self.has_worker_binding
             && !self.hook_alive
             && self.heartbeat_stale
-            && self.confidence >= REMEDIATION_CONFIDENCE_THRESHOLD
+            && self.confidence >= REMEDIATION_CONFIDENCE_THRESHOLD)
     }
 }
 
