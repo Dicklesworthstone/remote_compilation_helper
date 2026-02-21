@@ -368,8 +368,8 @@ fn try_classify_compound_command(cmd: &str) -> Option<Classification> {
 
     // Reject if command contains pipes, redirects, or subshells (anywhere)
     // These make command rewriting unsafe
-    if cmd.contains('|') && !cmd.contains("||") {
-        return None; // Pipe (but not ||)
+    if cmd.contains('|') {
+        return None; // Pipe or || chain
     }
     if has_file_redirect(cmd) {
         return None; // File redirects (but NOT fd-to-fd like 2>&1)
@@ -377,7 +377,7 @@ fn try_classify_compound_command(cmd: &str) -> Option<Classification> {
     if cmd.contains('(') || cmd.contains('`') || cmd.contains("$(") {
         return None; // Subshells
     }
-    if cmd.contains("||") || cmd.contains(';') {
+    if cmd.contains(';') {
         return None; // Only handle pure && chains for now
     }
 

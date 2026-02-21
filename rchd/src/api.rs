@@ -2258,12 +2258,6 @@ async fn handle_select_worker(
             });
         }
 
-        // Only the head-of-line build attempts selection (simple FIFO).
-        if ctx.history.queue_position(queued.id) != Some(1) {
-            tokio::time::sleep(QUEUE_POLL_INTERVAL).await;
-            continue;
-        }
-
         // If the hook process exited while waiting, drop the queued build to avoid leaking slots.
         if hook_pid > 0 && !is_process_alive(hook_pid) {
             let _ = ctx.history.remove_queued_build(queued.id);

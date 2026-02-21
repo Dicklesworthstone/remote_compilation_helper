@@ -580,6 +580,10 @@ async fn main() -> Result<()> {
     // Set up SIGHUP handler for manual reload (Unix only)
     #[cfg(unix)]
     let mut sighup = signal(SignalKind::hangup()).expect("Failed to register SIGHUP handler");
+    #[cfg(unix)]
+    let mut sigint = signal(SignalKind::interrupt()).expect("Failed to register SIGINT handler");
+    #[cfg(unix)]
+    let mut sigterm = signal(SignalKind::terminate()).expect("Failed to register SIGTERM handler");
 
     // Shutdown channel
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel(1);
@@ -607,6 +611,14 @@ async fn main() -> Result<()> {
                 }
                 _ = shutdown_rx.recv() => {
                     info!("Shutdown signal received");
+                    break;
+                }
+                _ = sigint.recv() => {
+                    info!("SIGINT received, shutting down");
+                    break;
+                }
+                _ = sigterm.recv() => {
+                    info!("SIGTERM received, shutting down");
                     break;
                 }
                 _ = sighup.recv() => {
@@ -680,6 +692,10 @@ async fn main() -> Result<()> {
                 }
                 _ = shutdown_rx.recv() => {
                     info!("Shutdown signal received");
+                    break;
+                }
+                _ = tokio::signal::ctrl_c() => {
+                    info!("Ctrl-C received, shutting down");
                     break;
                 }
                 // Monitor background tasks for unexpected termination (panics)

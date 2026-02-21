@@ -1261,17 +1261,28 @@ impl TransferPipeline {
         let mut stderr_acc = String::new();
 
         let command_timeout = self.ssh_options.command_timeout;
+        const MAX_OUTPUT_SIZE: usize = 10 * 1024 * 1024;
 
         let status = match tokio::time::timeout(command_timeout, async {
             while let Some(event) = rx.recv().await {
                 match event {
                     StreamEvent::Stdout(line) => {
                         on_stdout(&line);
-                        stdout_acc.push_str(&line);
+                        if stdout_acc.len() < MAX_OUTPUT_SIZE {
+                            stdout_acc.push_str(&line);
+                            if stdout_acc.len() >= MAX_OUTPUT_SIZE {
+                                stdout_acc.push_str("\n...[output truncated]...\n");
+                            }
+                        }
                     }
                     StreamEvent::Stderr(line) => {
                         on_stderr(&line);
-                        stderr_acc.push_str(&line);
+                        if stderr_acc.len() < MAX_OUTPUT_SIZE {
+                            stderr_acc.push_str(&line);
+                            if stderr_acc.len() >= MAX_OUTPUT_SIZE {
+                                stderr_acc.push_str("\n...[output truncated]...\n");
+                            }
+                        }
                     }
                 }
             }
@@ -1867,10 +1878,16 @@ where
     drop(tx);
 
     let mut combined = String::new();
+    const MAX_RSYNC_OUTPUT: usize = 10 * 1024 * 1024;
     while let Some(text) = rx.recv().await {
         on_line(&text);
-        combined.push_str(&text);
-        combined.push('\n');
+        if combined.len() < MAX_RSYNC_OUTPUT {
+            combined.push_str(&text);
+            combined.push('\n');
+            if combined.len() >= MAX_RSYNC_OUTPUT {
+                combined.push_str("...[output truncated]...\n");
+            }
+        }
     }
 
     let status = child.wait().await.context("Failed to wait on rsync")?;

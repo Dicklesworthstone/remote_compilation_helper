@@ -122,7 +122,9 @@ fn parse_cleanup_metrics(stdout: &str) -> Option<CleanupMetrics> {
     let mut low_disk = None;
 
     for token in line.split_whitespace().skip(1) {
-        let (key, value) = token.split_once('=')?;
+        let Some((key, value)) = token.split_once('=') else {
+            continue;
+        };
         match key {
             "removed" => removed_dirs = value.parse::<u64>().ok(),
             "freed_kb" => freed_kb = value.parse::<u64>().ok(),

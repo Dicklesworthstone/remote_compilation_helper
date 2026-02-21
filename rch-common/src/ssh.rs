@@ -294,11 +294,16 @@ impl SshClient {
             let stdout_fut = async {
                 if let Some(out) = stdout_handle {
                     let reader = BufReader::new(out);
+                    let mut take = reader.take(MAX_OUTPUT_SIZE);
                     let mut buf = String::new();
-                    reader
-                        .take(MAX_OUTPUT_SIZE)
-                        .read_to_string(&mut buf)
-                        .await?;
+                    take.read_to_string(&mut buf).await?;
+                    // Drain the rest to prevent SIGPIPE or blocking
+                    let mut reader = take.into_inner();
+                    let mut sink = tokio::io::sink();
+                    tokio::io::copy(&mut reader, &mut sink).await?;
+                    if buf.len() >= MAX_OUTPUT_SIZE as usize {
+                        buf.push_str("\n...[output truncated]...\n");
+                    }
                     Ok::<String, anyhow::Error>(buf)
                 } else {
                     Ok(String::new())
@@ -308,11 +313,16 @@ impl SshClient {
             let stderr_fut = async {
                 if let Some(err) = stderr_handle {
                     let reader = BufReader::new(err);
+                    let mut take = reader.take(MAX_OUTPUT_SIZE);
                     let mut buf = String::new();
-                    reader
-                        .take(MAX_OUTPUT_SIZE)
-                        .read_to_string(&mut buf)
-                        .await?;
+                    take.read_to_string(&mut buf).await?;
+                    // Drain the rest to prevent SIGPIPE or blocking
+                    let mut reader = take.into_inner();
+                    let mut sink = tokio::io::sink();
+                    tokio::io::copy(&mut reader, &mut sink).await?;
+                    if buf.len() >= MAX_OUTPUT_SIZE as usize {
+                        buf.push_str("\n...[output truncated]...\n");
+                    }
                     Ok::<String, anyhow::Error>(buf)
                 } else {
                     Ok(String::new())
@@ -461,11 +471,21 @@ impl SshClient {
                 match event {
                     StreamEvent::Stdout(line) => {
                         on_stdout(&line);
-                        stdout_acc.push_str(&line);
+                        if stdout_acc.len() < MAX_OUTPUT_SIZE as usize {
+                            stdout_acc.push_str(&line);
+                            if stdout_acc.len() >= MAX_OUTPUT_SIZE as usize {
+                                stdout_acc.push_str("\n...[output truncated]...\n");
+                            }
+                        }
                     }
                     StreamEvent::Stderr(line) => {
                         on_stderr(&line);
-                        stderr_acc.push_str(&line);
+                        if stderr_acc.len() < MAX_OUTPUT_SIZE as usize {
+                            stderr_acc.push_str(&line);
+                            if stderr_acc.len() >= MAX_OUTPUT_SIZE as usize {
+                                stderr_acc.push_str("\n...[output truncated]...\n");
+                            }
+                        }
                     }
                 }
             }
@@ -570,17 +590,24 @@ impl SshPool {
             // Connection exists but is disconnected - we'll replace it below
         }
 
-        // Create new connection while holding write lock to prevent races
-        // Note: holding lock during connect() is acceptable here because:
-        // 1. Connections are per-worker, so only requests to same worker contend
-        // 2. Alternative (release lock during connect) has worse race conditions
-        let mut client = SshClient::new(config.clone(), self.options.clone());
-        client.connect().await?;
+        // Create new connection but don't connect yet
+        let client = SshClient::new(config.clone(), self.options.clone());
+        let shared_client = Arc::new(RwLock::new(client));
+        connections.insert(worker_id.clone(), shared_client.clone());
+        
+        // Drop the write lock on the entire pool before performing network I/O
+        drop(connections);
 
-        let client = Arc::new(RwLock::new(client));
-        connections.insert(worker_id.clone(), client.clone());
+        // Perform the slow connection process while holding only the lock for this specific worker
+        let mut client_guard = shared_client.write().await;
+        // Double check it wasn't connected while we waited for the write lock
+        if !client_guard.is_connected() {
+            client_guard.connect().await?;
+        }
+        // Drop write lock before returning
+        drop(client_guard);
 
-        Ok(client)
+        Ok(shared_client)
     }
 
     /// Close a specific connection.
