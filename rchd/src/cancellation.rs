@@ -573,7 +573,7 @@ impl CancellationOrchestrator {
                     &identity,
                     &format!("{}@{}", user, host),
                     &format!(
-                        "pkill -9 -f 'RCH_BUILD_ID={}' 2>/dev/null; true",
+                        "pkill -9 -f 'RCH_BUILD_ID={};' 2>/dev/null; true",
                         record.build_id
                     ),
                 ])

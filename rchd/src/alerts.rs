@@ -399,7 +399,7 @@ impl AlertManager {
         let retry_count = webhook.retry_count;
         let secret = webhook.secret.clone();
 
-        std::thread::spawn(move || {
+        tokio::task::spawn_blocking(move || {
             if let Err(e) = send_webhook_with_retries(
                 &url,
                 &payload,

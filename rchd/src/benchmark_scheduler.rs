@@ -520,25 +520,35 @@ impl BenchmarkScheduler {
         let slots_available = self.config.max_concurrent - running_count;
 
         for _ in 0..slots_available {
-            // Get next request
-            let request = {
-                let mut queue = self.pending_queue.lock().await;
+            // Get candidate worker IDs to check without holding the lock during the check
+            let candidates = {
+                let queue = self.pending_queue.lock().await;
                 if queue.is_empty() {
                     break;
                 }
+                queue.iter().map(|req| req.worker_id.clone()).collect::<Vec<_>>()
+            };
 
-                // Find first eligible worker
-                let mut eligible_idx = None;
-                for (idx, req) in queue.iter().enumerate() {
-                    if self.is_worker_eligible(&req.worker_id).await {
-                        eligible_idx = Some(idx);
-                        break;
-                    }
+            let mut eligible_worker_id = None;
+            for worker_id in candidates {
+                if self.is_worker_eligible(&worker_id).await {
+                    eligible_worker_id = Some(worker_id);
+                    break;
                 }
+            }
 
-                match eligible_idx {
-                    Some(idx) => queue.remove(idx),
-                    None => break, // No eligible workers found
+            // Get next request
+            let request = {
+                let mut queue = self.pending_queue.lock().await;
+                if let Some(worker_id) = eligible_worker_id {
+                    // Find it again, in case it moved or was removed
+                    if let Some(idx) = queue.iter().position(|r| r.worker_id == worker_id) {
+                        Some(queue.remove(idx).unwrap())
+                    } else {
+                        None // Removed concurrently
+                    }
+                } else {
+                    break; // No eligible workers found
                 }
             };
 
@@ -933,10 +943,12 @@ async fn execute_benchmark_on_worker(
         Ok(Ok(_)) => {}
         Ok(Err(e)) => {
             let _ = child.kill().await;
+            let _ = child.wait().await; // Prevent zombie
             return Err(anyhow::anyhow!("Failed to read benchmark output: {}", e));
         }
         Err(_) => {
             let _ = child.kill().await;
+            let _ = child.wait().await; // Prevent zombie
             return Err(anyhow::anyhow!("Benchmark timed out after {:?}", timeout));
         }
     }

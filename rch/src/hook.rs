@@ -973,6 +973,46 @@ async fn try_auto_start_daemon(
     Ok(())
 }
 
+fn tokenize_command(command: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+
+    for c in command.chars() {
+        if escaped {
+            current.push(c);
+            escaped = false;
+            continue;
+        }
+        if c == '\\' {
+            escaped = true;
+            continue;
+        }
+        if c == '\'' && !in_double {
+            in_single = !in_single;
+            continue;
+        }
+        if c == '"' && !in_single {
+            in_double = !in_double;
+            continue;
+        }
+        if c.is_whitespace() && !in_single && !in_double {
+            if !current.is_empty() {
+                tokens.push(current.clone());
+                current.clear();
+            }
+            continue;
+        }
+        current.push(c);
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
 /// Detect if a cargo test command has a test name filter.
 ///
 /// Filtered tests (e.g., `cargo test my_test`) typically run fewer tests
@@ -980,10 +1020,10 @@ async fn try_auto_start_daemon(
 ///
 /// Returns true if the command appears to filter tests by name.
 fn is_filtered_test_command(command: &str) -> bool {
-    let tokens: Vec<&str> = command.split_whitespace().collect();
+    let tokens = tokenize_command(command);
 
-    // Find the position of "test" in the command
-    let test_pos = tokens.iter().position(|&t| t == "test");
+    // Find the position of "test" or "run" (for nextest) in the command
+    let test_pos = tokens.iter().position(|t| t == "test" || t == "t" || t == "run");
     let Some(test_idx) = test_pos else {
         return false;
     };
@@ -1004,38 +1044,29 @@ fn is_filtered_test_command(command: &str) -> bool {
         "--color",
         "--message-format",
         "--manifest-path",
-    ];
-
-    // Flags that don't take arguments (standalone)
-    let standalone_flags = [
-        "--lib",
-        "--release",
-        "--all",
-        "--workspace",
-        "--no-default-features",
-        "--all-features",
-        "-v",
-        "--verbose",
-        "-q",
-        "--quiet",
-        "--frozen",
-        "--locked",
-        "--offline",
-        "--no-fail-fast",
+        "--profile",
+        "--config",
+        "-Z",
     ];
 
     let mut i = test_idx + 1;
     while i < tokens.len() {
-        let token = tokens[i];
+        let token = &tokens[i];
 
         // Stop at the separator
         if token == "--" {
+            // Check if there is a positional argument after --
+            if i + 1 < tokens.len() {
+                let next = &tokens[i + 1];
+                if !next.starts_with('-') {
+                    return true;
+                }
+            }
             break;
         }
 
         // Check if this is a flag that takes an argument
-        if flags_with_args.contains(&token) {
-            // Skip this flag and its argument
+        if flags_with_args.contains(&token.as_str()) {
             i += 2;
             continue;
         }
@@ -1045,12 +1076,6 @@ fn is_filtered_test_command(command: &str) -> bool {
             .iter()
             .any(|&f| token.starts_with(&format!("{}=", f)))
         {
-            i += 1;
-            continue;
-        }
-
-        // Check if this is a standalone flag
-        if standalone_flags.contains(&token) {
             i += 1;
             continue;
         }
@@ -1073,13 +1098,11 @@ fn is_filtered_test_command(command: &str) -> bool {
 /// Tests marked with `#[ignore]` are typically a small subset, so they need
 /// fewer slots. However, --include-ignored runs all tests plus ignored ones.
 fn has_ignored_only_flag(command: &str) -> bool {
-    let tokens: Vec<&str> = command.split_whitespace().collect();
+    let tokens = tokenize_command(command);
 
-    // Look for "--ignored" but not "--include-ignored"
-    let has_ignored = tokens.contains(&"--ignored");
-    let has_include_ignored = tokens.contains(&"--include-ignored");
+    let has_ignored = tokens.iter().any(|t| t == "--ignored");
+    let has_include_ignored = tokens.iter().any(|t| t == "--include-ignored");
 
-    // Only return true for --ignored without --include-ignored
     has_ignored && !has_include_ignored
 }
 
@@ -1087,7 +1110,7 @@ fn has_ignored_only_flag(command: &str) -> bool {
 ///
 /// Exact matching typically results in running a single test.
 fn has_exact_flag(command: &str) -> bool {
-    command.split_whitespace().any(|t| t == "--exact")
+    tokenize_command(command).iter().any(|t| t == "--exact")
 }
 
 // ============================================================================
@@ -4083,7 +4106,8 @@ async fn execute_remote_compilation(
         .with_color_mode(color_mode)
         .with_command_timeout(command_timeout)
         .with_compilation_kind(kind)
-        .with_remote_path_override(entry.remote_root.clone());
+        .with_remote_path_override(entry.remote_root.clone())
+        .with_build_id(build_id);
         if entry.is_primary {
             root_pipeline = root_pipeline.with_env_allowlist(env_allowlist.clone());
         }

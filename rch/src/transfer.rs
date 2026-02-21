@@ -218,6 +218,8 @@ pub struct TransferPipeline {
     /// When set, transfer and execution use this path directly instead of
     /// deriving `<remote_base>/<project_id>/<project_hash>`.
     remote_path_override: Option<String>,
+    /// Build ID for tracking and cancellation.
+    build_id: Option<u64>,
 }
 
 /// Validate a project hash for safe use in file paths.
@@ -304,7 +306,14 @@ impl TransferPipeline {
             compilation_config: rch_common::CompilationConfig::default(),
             estimated_transfer_bytes: None,
             remote_path_override: None,
+            build_id: None,
         }
+    }
+
+    /// Set build id for remote execution.
+    pub fn with_build_id(mut self, build_id: Option<u64>) -> Self {
+        self.build_id = build_id;
+        self
     }
 
     /// Set custom SSH options.
@@ -612,9 +621,15 @@ impl TransferPipeline {
         // Touching the remote root refreshes directory mtime so age-based cleanup
         // treats actively used caches as hot.
         // Wrap command to run in project directory.
+        let build_id_export = if let Some(id) = self.build_id {
+            format!("export RCH_BUILD_ID={}; ", id)
+        } else {
+            String::new()
+        };
+
         format!(
-            "export LC_ALL=C; touch {} && cd {} && {}{}",
-            escaped_remote_path, escaped_remote_path, ensure_dirs_command, timeout_wrapped_command
+            "export LC_ALL=C; {}touch {} && cd {} && {}{}",
+            build_id_export, escaped_remote_path, escaped_remote_path, ensure_dirs_command, timeout_wrapped_command
         )
     }
 
