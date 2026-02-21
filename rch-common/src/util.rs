@@ -1,5 +1,49 @@
 //! Shared utilities for RCH.
 
+fn find_value_end(s: &str) -> usize {
+    let mut chars = s.chars();
+    let mut end = 0;
+    let mut in_quote = None;
+    let mut escaped = false;
+
+    while let Some(c) = chars.next() {
+        let char_len = c.len_utf8();
+
+        if escaped {
+            escaped = false;
+            end += char_len;
+            continue;
+        }
+
+        if c == '\\' {
+            escaped = true;
+            end += char_len;
+            continue;
+        }
+
+        if let Some(q) = in_quote {
+            if c == q {
+                in_quote = None;
+            }
+            end += char_len;
+            continue;
+        }
+
+        if c == '"' || c == '\'' {
+            in_quote = Some(c);
+            end += char_len;
+            continue;
+        }
+
+        if c.is_whitespace() {
+            break;
+        }
+
+        end += char_len;
+    }
+    end
+}
+
 /// Mask sensitive patterns in a command string before logging.
 ///
 /// This prevents accidental exposure of API keys, passwords, and tokens
@@ -51,14 +95,9 @@ pub fn mask_sensitive_command(cmd: &str) -> String {
             };
             let abs_start = search_start + start;
             let value_start = abs_start + pattern.len();
-            // Find end of value (next unquoted space or end of string)
-            // Note: simple whitespace search; does not handle quoted values correctly
-            // but suffices for basic logging safety.
+            
             let rest = &result[value_start..];
-            let value_end = rest
-                .find(|c: char| c.is_whitespace())
-                .map(|i| value_start + i)
-                .unwrap_or(result.len());
+            let value_end = value_start + find_value_end(rest);
 
             // Replace the value portion
             let prefix = &result[..abs_start];
@@ -100,5 +139,14 @@ mod tests {
         let cmd = "TOKEN=a TOKEN=b";
         let masked = mask_sensitive_command(cmd);
         assert_eq!(masked, "TOKEN=*** TOKEN=***");
+    }
+
+    #[test]
+    fn test_mask_sensitive_command_quoted() {
+        let cmd = "cargo run TOKEN=\"my super secret\" --other";
+        let masked = mask_sensitive_command(cmd);
+        assert_eq!(masked, "cargo run TOKEN=*** --other");
+        assert!(!masked.contains("super"));
+        assert!(!masked.contains("secret"));
     }
 }
