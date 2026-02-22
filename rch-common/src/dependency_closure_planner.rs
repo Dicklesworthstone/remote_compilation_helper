@@ -543,4 +543,711 @@ mod tests {
                 .is_some_and(|reason| reason.contains("manifest parse failure"))
         );
     }
+
+    // =======================================================================
+    // Empty and single-package closure tests
+    // =======================================================================
+
+    #[test]
+    fn empty_graph_produces_empty_ready_plan() {
+        let graph = CargoPathDependencyGraph {
+            entry_manifest_path: PathBuf::from("/data/projects/empty/Cargo.toml"),
+            workspace_root: None,
+            root_packages: Vec::new(),
+            packages: Vec::new(),
+            edges: Vec::new(),
+        };
+
+        let plan = plan_dependency_closure_from_graph(&graph);
+        assert!(plan.is_ready(), "empty graph should still be ready");
+        assert_eq!(plan.sync_order.len(), 0);
+        assert_eq!(plan.canonical_roots.len(), 0);
+        assert!(plan.issues.is_empty());
+        assert!(!plan.fail_open);
+    }
+
+    #[test]
+    fn single_package_no_deps_produces_single_entry_point_action() {
+        let graph = CargoPathDependencyGraph {
+            entry_manifest_path: PathBuf::from("/data/projects/solo/Cargo.toml"),
+            workspace_root: None,
+            root_packages: vec![PathBuf::from("/data/projects/solo")],
+            packages: vec![package("/data/projects/solo", "solo-crate", false)],
+            edges: Vec::new(),
+        };
+
+        let plan = plan_dependency_closure_from_graph(&graph);
+        assert!(plan.is_ready());
+        assert_eq!(plan.sync_order.len(), 1);
+        assert_eq!(plan.sync_order[0].order_index, 0);
+        assert_eq!(plan.sync_order[0].package_name, "solo-crate");
+        assert_eq!(
+            plan.sync_order[0].metadata.reason,
+            DependencySyncReason::EntryPoint
+        );
+        assert_eq!(plan.sync_order[0].risk, DependencyRiskClass::Low);
+        assert!(
+            plan.sync_order[0]
+                .metadata
+                .inbound_dependency_names
+                .is_empty()
+        );
+        assert!(plan.sync_order[0].metadata.dependent_roots.is_empty());
+    }
+
+    // =======================================================================
+    // Diamond dependency pattern (A→B, A→C, B→D, C→D)
+    // =======================================================================
+
+    #[test]
+    fn diamond_dependency_preserves_deterministic_order() {
+        let graph = CargoPathDependencyGraph {
+            entry_manifest_path: PathBuf::from("/data/projects/app/Cargo.toml"),
+            workspace_root: Some(PathBuf::from("/data/projects")),
+            root_packages: vec![PathBuf::from("/data/projects/app")],
+            packages: vec![
+                package("/data/projects/app", "app", true),
+                package("/data/projects/b", "lib_b", false),
+                package("/data/projects/c", "lib_c", false),
+                package("/data/projects/d", "lib_d", false),
+            ],
+            edges: vec![
+                edge("/data/projects/app", "/data/projects/b", "lib_b"),
+                edge("/data/projects/app", "/data/projects/c", "lib_c"),
+                edge("/data/projects/b", "/data/projects/d", "lib_d"),
+                edge("/data/projects/c", "/data/projects/d", "lib_d"),
+            ],
+        };
+
+        let plan = plan_dependency_closure_from_graph(&graph);
+        assert!(plan.is_ready(), "diamond graph should be planner-ready");
+        assert_eq!(plan.sync_order.len(), 4);
+
+        let ordered_roots: Vec<_> = plan
+            .sync_order
+            .iter()
+            .map(|a| a.package_root.as_path())
+            .collect();
+
+        // D must come before B and C; B and C must come before app.
+        let d_pos = ordered_roots
+            .iter()
+            .position(|r| *r == Path::new("/data/projects/d"))
+            .unwrap();
+        let b_pos = ordered_roots
+            .iter()
+            .position(|r| *r == Path::new("/data/projects/b"))
+            .unwrap();
+        let c_pos = ordered_roots
+            .iter()
+            .position(|r| *r == Path::new("/data/projects/c"))
+            .unwrap();
+        let app_pos = ordered_roots
+            .iter()
+            .position(|r| *r == Path::new("/data/projects/app"))
+            .unwrap();
+        assert!(d_pos < b_pos, "D must sync before B");
+        assert!(d_pos < c_pos, "D must sync before C");
+        assert!(b_pos < app_pos, "B must sync before app");
+        assert!(c_pos < app_pos, "C must sync before app");
+
+        // D has 2 dependent roots (B and C), so it should be High risk.
+        let d_action = &plan.sync_order[d_pos];
+        assert_eq!(d_action.risk, DependencyRiskClass::High);
+        assert_eq!(d_action.metadata.dependent_roots.len(), 2);
+
+        // B and C each have 1 dependent root (app), so Medium risk.
+        let b_action = &plan.sync_order[b_pos];
+        assert_eq!(b_action.risk, DependencyRiskClass::Medium);
+
+        // app is entry point, so Low risk.
+        let app_action = &plan.sync_order[app_pos];
+        assert_eq!(app_action.risk, DependencyRiskClass::Low);
+    }
+
+    // =======================================================================
+    // Risk classification boundary tests
+    // =======================================================================
+
+    #[test]
+    fn classify_sync_risk_entry_point_is_always_low() {
+        assert_eq!(
+            classify_sync_risk(DependencySyncReason::EntryPoint, 0),
+            DependencyRiskClass::Low
+        );
+        assert_eq!(
+            classify_sync_risk(DependencySyncReason::EntryPoint, 10),
+            DependencyRiskClass::Low
+        );
+    }
+
+    #[test]
+    fn classify_sync_risk_workspace_member_is_always_low() {
+        assert_eq!(
+            classify_sync_risk(DependencySyncReason::WorkspaceMember, 0),
+            DependencyRiskClass::Low
+        );
+        assert_eq!(
+            classify_sync_risk(DependencySyncReason::WorkspaceMember, 5),
+            DependencyRiskClass::Low
+        );
+    }
+
+    #[test]
+    fn classify_sync_risk_transitive_with_zero_dependents_is_medium() {
+        assert_eq!(
+            classify_sync_risk(DependencySyncReason::TransitivePathDependency, 0),
+            DependencyRiskClass::Medium
+        );
+    }
+
+    #[test]
+    fn classify_sync_risk_transitive_with_one_dependent_is_medium() {
+        assert_eq!(
+            classify_sync_risk(DependencySyncReason::TransitivePathDependency, 1),
+            DependencyRiskClass::Medium
+        );
+    }
+
+    #[test]
+    fn classify_sync_risk_transitive_with_two_dependents_is_high() {
+        assert_eq!(
+            classify_sync_risk(DependencySyncReason::TransitivePathDependency, 2),
+            DependencyRiskClass::High
+        );
+    }
+
+    #[test]
+    fn classify_sync_risk_transitive_with_many_dependents_is_high() {
+        assert_eq!(
+            classify_sync_risk(DependencySyncReason::TransitivePathDependency, 100),
+            DependencyRiskClass::High
+        );
+    }
+
+    // =======================================================================
+    // Wide fan-out graph test
+    // =======================================================================
+
+    #[test]
+    fn wide_fanout_graph_syncs_all_leaves_before_root() {
+        let leaf_count = 20;
+        let mut packages = vec![package("/data/projects/hub", "hub", true)];
+        let mut edges = Vec::new();
+        for i in 0..leaf_count {
+            let root = format!("/data/projects/leaf_{i}");
+            let name = format!("leaf_{i}");
+            packages.push(package(&root, &name, false));
+            edges.push(edge("/data/projects/hub", &root, &name));
+        }
+
+        let graph = CargoPathDependencyGraph {
+            entry_manifest_path: PathBuf::from("/data/projects/hub/Cargo.toml"),
+            workspace_root: Some(PathBuf::from("/data/projects")),
+            root_packages: vec![PathBuf::from("/data/projects/hub")],
+            packages,
+            edges,
+        };
+
+        let plan = plan_dependency_closure_from_graph(&graph);
+        assert!(plan.is_ready());
+        assert_eq!(plan.sync_order.len(), leaf_count + 1);
+
+        // Hub must be last.
+        let hub_action = plan.sync_order.last().unwrap();
+        assert_eq!(hub_action.package_root, PathBuf::from("/data/projects/hub"));
+        assert_eq!(hub_action.metadata.reason, DependencySyncReason::EntryPoint);
+
+        // All leaves must come before hub.
+        for action in &plan.sync_order[..leaf_count] {
+            assert_eq!(
+                action.metadata.reason,
+                DependencySyncReason::TransitivePathDependency
+            );
+            assert_eq!(action.metadata.dependent_roots.len(), 1);
+            assert_eq!(action.risk, DependencyRiskClass::Medium);
+        }
+    }
+
+    // =======================================================================
+    // Deep chain graph test
+    // =======================================================================
+
+    #[test]
+    fn deep_chain_graph_preserves_order() {
+        let depth = 10;
+        let mut packages = Vec::new();
+        let mut edges = Vec::new();
+        for i in 0..depth {
+            let root = format!("/data/projects/chain_{i}");
+            let name = format!("chain_{i}");
+            packages.push(package(&root, &name, i == depth - 1));
+            if i > 0 {
+                let parent = format!("/data/projects/chain_{}", i);
+                let child = format!("/data/projects/chain_{}", i - 1);
+                edges.push(edge(&parent, &child, &format!("chain_{}", i - 1)));
+            }
+        }
+
+        let graph = CargoPathDependencyGraph {
+            entry_manifest_path: PathBuf::from(format!(
+                "/data/projects/chain_{}/Cargo.toml",
+                depth - 1
+            )),
+            workspace_root: Some(PathBuf::from("/data/projects")),
+            root_packages: vec![PathBuf::from(format!("/data/projects/chain_{}", depth - 1))],
+            packages,
+            edges,
+        };
+
+        let plan = plan_dependency_closure_from_graph(&graph);
+        assert!(plan.is_ready());
+        assert_eq!(plan.sync_order.len(), depth);
+
+        // chain_0 should be first (leaf), chain_{depth-1} should be last (entry point).
+        assert_eq!(
+            plan.sync_order[0].package_root,
+            PathBuf::from("/data/projects/chain_0")
+        );
+        assert_eq!(
+            plan.sync_order.last().unwrap().package_root,
+            PathBuf::from(format!("/data/projects/chain_{}", depth - 1))
+        );
+    }
+
+    // =======================================================================
+    // All error kind mappings
+    // =======================================================================
+
+    #[test]
+    fn resolver_error_mapping_metadata_parse_failure() {
+        let error = CargoPathDependencyError::new(
+            CargoPathDependencyErrorKind::MetadataParseFailure,
+            "cannot parse metadata JSON",
+        );
+        let issue = issue_from_resolver_error(&error);
+        assert_eq!(issue.code, "metadata-parse-failure");
+        assert_eq!(issue.risk, DependencyRiskClass::Critical);
+    }
+
+    #[test]
+    fn resolver_error_mapping_metadata_invocation_failure() {
+        let error = CargoPathDependencyError::new(
+            CargoPathDependencyErrorKind::MetadataInvocationFailure,
+            "cargo metadata timed out after 30s",
+        );
+        let issue = issue_from_resolver_error(&error);
+        assert_eq!(issue.code, "metadata-invocation-failure");
+        assert_eq!(issue.risk, DependencyRiskClass::Critical);
+    }
+
+    #[test]
+    fn resolver_error_mapping_missing_path_dependency() {
+        let error = CargoPathDependencyError::new(
+            CargoPathDependencyErrorKind::MissingPathDependency,
+            "path dep does not exist on disk",
+        )
+        .with_dependency_name("phantom_dep")
+        .with_dependency_path("/data/projects/nonexistent");
+
+        let issue = issue_from_resolver_error(&error);
+        assert_eq!(issue.code, "missing-path-dependency");
+        assert_eq!(issue.risk, DependencyRiskClass::High);
+        assert!(
+            issue
+                .diagnostics
+                .iter()
+                .any(|d| d.contains("dependency_name=phantom_dep")),
+            "diagnostics should include dependency name"
+        );
+        assert!(
+            issue
+                .diagnostics
+                .iter()
+                .any(|d| d.contains("dependency_path=/data/projects/nonexistent")),
+            "diagnostics should include dependency path"
+        );
+    }
+
+    #[test]
+    fn resolver_error_mapping_cyclic_dependency() {
+        let error = CargoPathDependencyError::new(
+            CargoPathDependencyErrorKind::CyclicDependency,
+            "circular path dependency detected",
+        );
+
+        let issue = issue_from_resolver_error(&error);
+        assert_eq!(issue.code, "cyclic-path-dependency");
+        assert_eq!(issue.risk, DependencyRiskClass::Critical);
+        assert!(
+            issue.message.contains("cyclic path dependency"),
+            "message should contain error kind, got: {}",
+            issue.message
+        );
+    }
+
+    // =======================================================================
+    // fail_open_plan_from_resolver_error tests
+    // =======================================================================
+
+    #[test]
+    fn fail_open_plan_preserves_manifest_path_from_error() {
+        let error = CargoPathDependencyError::new(
+            CargoPathDependencyErrorKind::MetadataInvocationFailure,
+            "timeout",
+        )
+        .with_manifest_path("/data/projects/app/Cargo.toml");
+
+        let plan =
+            fail_open_plan_from_resolver_error(Path::new("/data/projects/app/Cargo.toml"), &error);
+        assert_eq!(
+            plan.entry_manifest_path,
+            PathBuf::from("/data/projects/app/Cargo.toml")
+        );
+        assert_eq!(plan.state, DependencyClosurePlanState::FailOpen);
+        assert!(plan.fail_open);
+        assert!(plan.sync_order.is_empty());
+        assert!(plan.canonical_roots.is_empty());
+        assert!(plan.workspace_root.is_none());
+    }
+
+    #[test]
+    fn fail_open_plan_uses_entrypoint_when_error_has_no_manifest_path() {
+        let error = CargoPathDependencyError::new(
+            CargoPathDependencyErrorKind::MissingPathDependency,
+            "dep not found",
+        );
+
+        let plan = fail_open_plan_from_resolver_error(Path::new("/data/projects/fallback"), &error);
+        assert_eq!(
+            plan.entry_manifest_path,
+            PathBuf::from("/data/projects/fallback")
+        );
+    }
+
+    // =======================================================================
+    // DependencyClosurePlan API tests
+    // =======================================================================
+
+    #[test]
+    fn is_ready_returns_false_for_fail_open() {
+        let plan = DependencyClosurePlan {
+            state: DependencyClosurePlanState::FailOpen,
+            entry_manifest_path: PathBuf::from("/tmp/Cargo.toml"),
+            workspace_root: None,
+            canonical_roots: Vec::new(),
+            sync_order: Vec::new(),
+            fail_open: true,
+            fail_open_reason: Some("test".to_string()),
+            issues: Vec::new(),
+        };
+        assert!(!plan.is_ready());
+    }
+
+    #[test]
+    fn sync_roots_returns_roots_in_sync_order() {
+        let plan = DependencyClosurePlan {
+            state: DependencyClosurePlanState::Ready,
+            entry_manifest_path: PathBuf::from("/data/projects/app/Cargo.toml"),
+            workspace_root: None,
+            canonical_roots: vec![
+                PathBuf::from("/data/projects/dep"),
+                PathBuf::from("/data/projects/app"),
+            ],
+            sync_order: vec![
+                DependencySyncAction {
+                    order_index: 0,
+                    package_root: PathBuf::from("/data/projects/dep"),
+                    manifest_path: PathBuf::from("/data/projects/dep/Cargo.toml"),
+                    package_name: "dep".to_string(),
+                    risk: DependencyRiskClass::Medium,
+                    metadata: DependencySyncMetadata {
+                        reason: DependencySyncReason::TransitivePathDependency,
+                        workspace_member: false,
+                        root_package: false,
+                        inbound_dependency_names: vec!["dep".to_string()],
+                        dependent_roots: vec![PathBuf::from("/data/projects/app")],
+                        notes: vec!["dependent_root_count=1".to_string()],
+                    },
+                },
+                DependencySyncAction {
+                    order_index: 1,
+                    package_root: PathBuf::from("/data/projects/app"),
+                    manifest_path: PathBuf::from("/data/projects/app/Cargo.toml"),
+                    package_name: "app".to_string(),
+                    risk: DependencyRiskClass::Low,
+                    metadata: DependencySyncMetadata {
+                        reason: DependencySyncReason::EntryPoint,
+                        workspace_member: false,
+                        root_package: true,
+                        inbound_dependency_names: Vec::new(),
+                        dependent_roots: Vec::new(),
+                        notes: vec!["dependent_root_count=0".to_string()],
+                    },
+                },
+            ],
+            fail_open: false,
+            fail_open_reason: None,
+            issues: Vec::new(),
+        };
+
+        let roots = plan.sync_roots();
+        assert_eq!(
+            roots,
+            vec![
+                PathBuf::from("/data/projects/dep"),
+                PathBuf::from("/data/projects/app"),
+            ]
+        );
+    }
+
+    // =======================================================================
+    // Workspace member classification tests
+    // =======================================================================
+
+    #[test]
+    fn workspace_member_gets_workspace_member_reason() {
+        let graph = CargoPathDependencyGraph {
+            entry_manifest_path: PathBuf::from("/data/projects/app/Cargo.toml"),
+            workspace_root: Some(PathBuf::from("/data/projects")),
+            root_packages: vec![PathBuf::from("/data/projects/app")],
+            packages: vec![
+                package("/data/projects/app", "app", true),
+                package("/data/projects/member", "member", true),
+            ],
+            edges: vec![edge(
+                "/data/projects/app",
+                "/data/projects/member",
+                "member",
+            )],
+        };
+
+        let plan = plan_dependency_closure_from_graph(&graph);
+        assert!(plan.is_ready());
+
+        let member_action = plan
+            .sync_order
+            .iter()
+            .find(|a| a.package_name == "member")
+            .unwrap();
+        assert_eq!(
+            member_action.metadata.reason,
+            DependencySyncReason::WorkspaceMember
+        );
+        assert!(member_action.metadata.workspace_member);
+        assert_eq!(member_action.risk, DependencyRiskClass::Low);
+    }
+
+    // =======================================================================
+    // Inbound dependency name deduplication
+    // =======================================================================
+
+    #[test]
+    fn inbound_dependency_names_are_deduplicated() {
+        let graph = CargoPathDependencyGraph {
+            entry_manifest_path: PathBuf::from("/data/projects/app/Cargo.toml"),
+            workspace_root: None,
+            root_packages: vec![PathBuf::from("/data/projects/app")],
+            packages: vec![
+                package("/data/projects/app", "app", false),
+                package("/data/projects/dep", "dep", false),
+                package("/data/projects/other", "other", false),
+            ],
+            edges: vec![
+                edge("/data/projects/app", "/data/projects/dep", "dep"),
+                edge("/data/projects/other", "/data/projects/dep", "dep"),
+            ],
+        };
+
+        let plan = plan_dependency_closure_from_graph(&graph);
+        let dep_action = plan
+            .sync_order
+            .iter()
+            .find(|a| a.package_name == "dep")
+            .unwrap();
+        // Same dependency name from two sources — should appear only once (BTreeSet dedup).
+        assert_eq!(dep_action.metadata.inbound_dependency_names, vec!["dep"]);
+    }
+
+    // =======================================================================
+    // Topological order determinism
+    // =======================================================================
+
+    #[test]
+    fn topological_sort_is_deterministic_across_calls() {
+        let graph = CargoPathDependencyGraph {
+            entry_manifest_path: PathBuf::from("/data/projects/app/Cargo.toml"),
+            workspace_root: None,
+            root_packages: vec![PathBuf::from("/data/projects/app")],
+            packages: vec![
+                package("/data/projects/app", "app", false),
+                package("/data/projects/a", "a", false),
+                package("/data/projects/b", "b", false),
+                package("/data/projects/c", "c", false),
+            ],
+            edges: vec![
+                edge("/data/projects/app", "/data/projects/a", "a"),
+                edge("/data/projects/app", "/data/projects/b", "b"),
+                edge("/data/projects/app", "/data/projects/c", "c"),
+            ],
+        };
+
+        let plan1 = plan_dependency_closure_from_graph(&graph);
+        let plan2 = plan_dependency_closure_from_graph(&graph);
+
+        let roots1: Vec<_> = plan1.sync_order.iter().map(|a| &a.package_root).collect();
+        let roots2: Vec<_> = plan2.sync_order.iter().map(|a| &a.package_root).collect();
+        assert_eq!(roots1, roots2, "topological order must be deterministic");
+    }
+
+    // =======================================================================
+    // Notes field validation
+    // =======================================================================
+
+    #[test]
+    fn notes_include_dependent_root_count() {
+        let graph = CargoPathDependencyGraph {
+            entry_manifest_path: PathBuf::from("/data/projects/app/Cargo.toml"),
+            workspace_root: None,
+            root_packages: vec![PathBuf::from("/data/projects/app")],
+            packages: vec![
+                package("/data/projects/app", "app", false),
+                package("/data/projects/dep", "dep", false),
+            ],
+            edges: vec![edge("/data/projects/app", "/data/projects/dep", "dep")],
+        };
+
+        let plan = plan_dependency_closure_from_graph(&graph);
+        let dep_action = plan
+            .sync_order
+            .iter()
+            .find(|a| a.package_name == "dep")
+            .unwrap();
+        assert!(
+            dep_action
+                .metadata
+                .notes
+                .iter()
+                .any(|n| n == "dependent_root_count=1"),
+            "notes should include dependent_root_count"
+        );
+
+        let app_action = plan
+            .sync_order
+            .iter()
+            .find(|a| a.package_name == "app")
+            .unwrap();
+        assert!(
+            app_action
+                .metadata
+                .notes
+                .iter()
+                .any(|n| n == "dependent_root_count=0"),
+            "entry point should have 0 dependent roots"
+        );
+    }
+
+    // =======================================================================
+    // Serialization round-trip
+    // =======================================================================
+
+    #[test]
+    fn plan_serialization_round_trip() {
+        let graph = CargoPathDependencyGraph {
+            entry_manifest_path: PathBuf::from("/data/projects/app/Cargo.toml"),
+            workspace_root: Some(PathBuf::from("/data/projects")),
+            root_packages: vec![PathBuf::from("/data/projects/app")],
+            packages: vec![
+                package("/data/projects/app", "app", true),
+                package("/data/projects/dep", "dep", false),
+            ],
+            edges: vec![edge("/data/projects/app", "/data/projects/dep", "dep")],
+        };
+
+        let plan = plan_dependency_closure_from_graph(&graph);
+        let json = serde_json::to_string(&plan).expect("plan should serialize");
+        let deserialized: DependencyClosurePlan =
+            serde_json::from_str(&json).expect("plan should deserialize");
+        assert_eq!(plan, deserialized);
+    }
+
+    #[test]
+    fn fail_open_plan_serialization_round_trip() {
+        let error = CargoPathDependencyError::new(
+            CargoPathDependencyErrorKind::CyclicDependency,
+            "cycle detected",
+        );
+
+        let plan = fail_open_plan_from_resolver_error(Path::new("/data/projects/app"), &error);
+        let json = serde_json::to_string(&plan).expect("fail-open plan should serialize");
+        let deserialized: DependencyClosurePlan =
+            serde_json::from_str(&json).expect("fail-open plan should deserialize");
+        assert_eq!(plan, deserialized);
+    }
+
+    // =======================================================================
+    // root_package flag validation
+    // =======================================================================
+
+    #[test]
+    fn root_package_flag_set_correctly() {
+        let graph = CargoPathDependencyGraph {
+            entry_manifest_path: PathBuf::from("/data/projects/app/Cargo.toml"),
+            workspace_root: None,
+            root_packages: vec![PathBuf::from("/data/projects/app")],
+            packages: vec![
+                package("/data/projects/app", "app", false),
+                package("/data/projects/dep", "dep", false),
+            ],
+            edges: vec![edge("/data/projects/app", "/data/projects/dep", "dep")],
+        };
+
+        let plan = plan_dependency_closure_from_graph(&graph);
+        let app_action = plan
+            .sync_order
+            .iter()
+            .find(|a| a.package_name == "app")
+            .unwrap();
+        assert!(
+            app_action.metadata.root_package,
+            "app should be marked as root_package"
+        );
+
+        let dep_action = plan
+            .sync_order
+            .iter()
+            .find(|a| a.package_name == "dep")
+            .unwrap();
+        assert!(
+            !dep_action.metadata.root_package,
+            "dep should not be marked as root_package"
+        );
+    }
+
+    // =======================================================================
+    // Order indices are sequential
+    // =======================================================================
+
+    #[test]
+    fn order_indices_are_sequential_from_zero() {
+        let graph = CargoPathDependencyGraph {
+            entry_manifest_path: PathBuf::from("/data/projects/app/Cargo.toml"),
+            workspace_root: None,
+            root_packages: vec![PathBuf::from("/data/projects/app")],
+            packages: vec![
+                package("/data/projects/app", "app", false),
+                package("/data/projects/a", "a", false),
+                package("/data/projects/b", "b", false),
+            ],
+            edges: vec![
+                edge("/data/projects/app", "/data/projects/a", "a"),
+                edge("/data/projects/a", "/data/projects/b", "b"),
+            ],
+        };
+
+        let plan = plan_dependency_closure_from_graph(&graph);
+        for (i, action) in plan.sync_order.iter().enumerate() {
+            assert_eq!(action.order_index, i, "order_index should be sequential");
+        }
+    }
 }
