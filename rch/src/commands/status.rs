@@ -1083,6 +1083,11 @@ async fn self_test_run(
 // =============================================================================
 
 pub async fn status_overview(workers: bool, jobs: bool, ctx: &OutputContext) -> Result<()> {
+    use crate::status_types::{
+        RepoConvergenceStatusFromApi, RemediationHint, SystemPosture, UnifiedStatusResponse,
+        STATUS_SCHEMA_VERSION, generate_convergence_remediations, generate_worker_remediations,
+    };
+
     // Query daemon for full status.
     let response = send_daemon_command("GET /status\n").await?;
     let json = extract_json_body(&response)
@@ -1090,8 +1095,69 @@ pub async fn status_overview(workers: bool, jobs: bool, ctx: &OutputContext) -> 
     let status: DaemonFullStatusResponse =
         serde_json::from_str(json).context("Failed to parse daemon status response")?;
 
+    // Query convergence status (best-effort; don't fail if endpoint unreachable).
+    let convergence = match send_daemon_command("GET /repo-convergence/status\n").await {
+        Ok(conv_response) => extract_json_body(&conv_response)
+            .and_then(|j| serde_json::from_str::<RepoConvergenceStatusFromApi>(j).ok()),
+        Err(_) => None,
+    };
+
+    // Compute system posture.
+    let posture = SystemPosture::from_status(&status);
+
+    // Generate remediation hints from all signals.
+    let mut remediation_hints: Vec<RemediationHint> = generate_worker_remediations(&status.workers);
+    if let Some(ref conv) = convergence {
+        remediation_hints.extend(generate_convergence_remediations(conv));
+    }
+
+    // Posture-level hints.
+    match &posture {
+        SystemPosture::LocalOnly => {
+            if status.daemon.workers_total == 0 {
+                remediation_hints.push(RemediationHint {
+                    reason_code: "no_workers_configured".into(),
+                    severity: "critical".into(),
+                    message: "No workers configured; all builds run locally".into(),
+                    suggested_action: "rch workers add <host> or edit ~/.config/rch/workers.toml"
+                        .into(),
+                    worker_id: None,
+                });
+            } else {
+                remediation_hints.push(RemediationHint {
+                    reason_code: "all_workers_down".into(),
+                    severity: "critical".into(),
+                    message: "All workers unreachable; builds falling back to local".into(),
+                    suggested_action: "rch doctor --fix".into(),
+                    worker_id: None,
+                });
+            }
+        }
+        SystemPosture::Degraded => {
+            remediation_hints.push(RemediationHint {
+                reason_code: "partial_capacity".into(),
+                severity: "warning".into(),
+                message: format!(
+                    "Operating at reduced capacity: {}/{} workers healthy",
+                    status.daemon.workers_healthy, status.daemon.workers_total
+                ),
+                suggested_action: "rch workers probe --all".into(),
+                worker_id: None,
+            });
+        }
+        SystemPosture::RemoteReady => {}
+    }
+
     if ctx.is_json() {
-        let _ = ctx.json(&ApiResponse::ok("status", &status));
+        let unified = UnifiedStatusResponse {
+            schema_version: STATUS_SCHEMA_VERSION.to_string(),
+            posture_description: posture.description().to_string(),
+            posture,
+            daemon: status,
+            convergence,
+            remediation_hints,
+        };
+        let _ = ctx.json(&ApiResponse::ok("status", &unified));
         return Ok(());
     }
 
@@ -1099,7 +1165,15 @@ pub async fn status_overview(workers: bool, jobs: bool, ctx: &OutputContext) -> 
     let show_workers = workers || ctx.is_verbose();
     let show_jobs = jobs || ctx.is_verbose();
 
-    crate::status_display::render_full_status(&status, show_workers, show_jobs, ctx.style());
+    crate::status_display::render_full_status(
+        &status,
+        show_workers,
+        show_jobs,
+        convergence.as_ref(),
+        &remediation_hints,
+        &posture,
+        ctx.style(),
+    );
 
     // Verbose mode: show additional details not in standard display
     if ctx.is_verbose() {

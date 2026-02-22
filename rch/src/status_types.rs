@@ -63,6 +63,39 @@ pub struct WorkerStatusFromApi {
     /// Recent health check results (true=success, false=failure).
     #[serde(default)]
     pub failure_history: Vec<bool>,
+    /// Normalized storage pressure state (healthy, warning, critical, telemetry_gap).
+    #[serde(default)]
+    pub pressure_state: Option<String>,
+    /// Confidence level for the pressure decision (high, medium, low).
+    #[serde(default)]
+    pub pressure_confidence: Option<String>,
+    /// Stable pressure reason code for diagnostics.
+    #[serde(default)]
+    pub pressure_reason_code: Option<String>,
+    /// Policy rule provenance for pressure classification.
+    #[serde(default)]
+    pub pressure_policy_rule: Option<String>,
+    /// Measured free disk (GB), if available.
+    #[serde(default)]
+    pub pressure_disk_free_gb: Option<f64>,
+    /// Measured total disk (GB), if available.
+    #[serde(default)]
+    pub pressure_disk_total_gb: Option<f64>,
+    /// Measured free-disk ratio, if available.
+    #[serde(default)]
+    pub pressure_disk_free_ratio: Option<f64>,
+    /// Last disk I/O utilization sample, if available.
+    #[serde(default)]
+    pub pressure_disk_io_util_pct: Option<f64>,
+    /// Last memory pressure sample, if available.
+    #[serde(default)]
+    pub pressure_memory_pressure: Option<f64>,
+    /// Age of latest telemetry sample in seconds, if available.
+    #[serde(default)]
+    pub pressure_telemetry_age_secs: Option<u64>,
+    /// Whether the latest telemetry sample is fresh enough for high-confidence decisions.
+    #[serde(default)]
+    pub pressure_telemetry_fresh: Option<bool>,
 }
 
 /// Worker capabilities information from API.
@@ -195,6 +228,327 @@ pub struct TestRunStatsFromApi {
     pub avg_duration_ms: u64,
     #[serde(default)]
     pub runs_by_kind: std::collections::HashMap<String, u64>,
+}
+
+// ============================================================================
+// Convergence API Types
+// ============================================================================
+
+/// Worker convergence view from the /repo-convergence/status endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConvergenceWorkerViewFromApi {
+    pub worker_id: String,
+    pub drift_state: String,
+    #[serde(default)]
+    pub drift_confidence: f64,
+    #[serde(default)]
+    pub required_repos: Vec<String>,
+    #[serde(default)]
+    pub synced_repos: Vec<String>,
+    #[serde(default)]
+    pub missing_repos: Vec<String>,
+    #[serde(default)]
+    pub attempt_budget_remaining: u32,
+    #[serde(default)]
+    pub time_budget_remaining_ms: u64,
+    #[serde(default)]
+    pub last_status_check_unix_ms: i64,
+    #[serde(default)]
+    pub remediation: Vec<String>,
+}
+
+/// Summary statistics for convergence status.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConvergenceSummaryFromApi {
+    pub total_workers: usize,
+    pub ready: usize,
+    pub drifting: usize,
+    pub converging: usize,
+    pub failed: usize,
+    pub stale: usize,
+}
+
+/// Full convergence status response from /repo-convergence/status.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepoConvergenceStatusFromApi {
+    pub status: String,
+    pub workers: Vec<ConvergenceWorkerViewFromApi>,
+    pub summary: ConvergenceSummaryFromApi,
+}
+
+// ============================================================================
+// Unified Status Surface Types (bd-vvmd.6.3)
+// ============================================================================
+
+/// Schema version for the unified status JSON envelope.
+pub const STATUS_SCHEMA_VERSION: &str = "1.0.0";
+
+/// System-level posture summarizing whether builds go remote or fall back local.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SystemPosture {
+    /// All workers healthy, remote compilation fully available.
+    RemoteReady,
+    /// Some workers degraded; partial remote capability.
+    Degraded,
+    /// No workers available; all builds run locally (fail-open).
+    LocalOnly,
+}
+
+impl SystemPosture {
+    /// Compute posture from daemon status response.
+    pub fn from_status(status: &DaemonFullStatusResponse) -> Self {
+        if status.daemon.workers_total == 0 || status.daemon.workers_healthy == 0 {
+            Self::LocalOnly
+        } else if status.daemon.workers_healthy < status.daemon.workers_total {
+            Self::Degraded
+        } else {
+            Self::RemoteReady
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::RemoteReady => "remote-ready",
+            Self::Degraded => "degraded",
+            Self::LocalOnly => "local-only",
+        }
+    }
+
+    pub fn description(&self) -> &'static str {
+        match self {
+            Self::RemoteReady => "All workers healthy, remote compilation available",
+            Self::Degraded => "Some workers unhealthy, partial remote capability",
+            Self::LocalOnly => "No workers available, builds run locally (fail-open)",
+        }
+    }
+}
+
+/// Structured remediation hint with reason code and actionable guidance.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemediationHint {
+    /// Stable reason code for programmatic matching (e.g., "circuit_open", "pressure_critical").
+    pub reason_code: String,
+    /// Severity: "critical", "warning", "info".
+    pub severity: String,
+    /// Human-readable explanation of the issue.
+    pub message: String,
+    /// Actionable command or step to resolve the issue.
+    pub suggested_action: String,
+    /// Optional worker ID this hint applies to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_id: Option<String>,
+}
+
+/// Generate remediation hints for workers with non-healthy states.
+pub fn generate_worker_remediations(workers: &[WorkerStatusFromApi]) -> Vec<RemediationHint> {
+    let mut hints = Vec::new();
+
+    for w in workers {
+        // Circuit breaker issues
+        match w.circuit_state.as_str() {
+            "open" => {
+                let msg = if w.consecutive_failures > 0 {
+                    format!(
+                        "Worker {} circuit open after {} consecutive failures",
+                        w.id, w.consecutive_failures
+                    )
+                } else {
+                    format!("Worker {} circuit open due to repeated failures", w.id)
+                };
+                hints.push(RemediationHint {
+                    reason_code: "circuit_open".into(),
+                    severity: "critical".into(),
+                    message: msg,
+                    suggested_action: format!("rch workers probe {} --force", w.id),
+                    worker_id: Some(w.id.clone()),
+                });
+            }
+            "half_open" => {
+                hints.push(RemediationHint {
+                    reason_code: "circuit_half_open".into(),
+                    severity: "warning".into(),
+                    message: format!("Worker {} circuit is testing recovery", w.id),
+                    suggested_action: format!("rch workers probe {}", w.id),
+                    worker_id: Some(w.id.clone()),
+                });
+            }
+            _ => {}
+        }
+
+        // Pressure issues
+        if let Some(ref pressure) = w.pressure_state {
+            match pressure.as_str() {
+                "critical" => {
+                    let disk_info = w
+                        .pressure_disk_free_gb
+                        .map(|gb| format!(" ({:.1} GB free)", gb))
+                        .unwrap_or_default();
+                    hints.push(RemediationHint {
+                        reason_code: "pressure_critical".into(),
+                        severity: "critical".into(),
+                        message: format!(
+                            "Worker {} under critical storage pressure{}",
+                            w.id, disk_info
+                        ),
+                        suggested_action: format!(
+                            "ssh {}@{} 'cargo clean' or free disk space",
+                            w.user, w.host
+                        ),
+                        worker_id: Some(w.id.clone()),
+                    });
+                }
+                "warning" => {
+                    let disk_info = w
+                        .pressure_disk_free_gb
+                        .map(|gb| format!(" ({:.1} GB free)", gb))
+                        .unwrap_or_default();
+                    hints.push(RemediationHint {
+                        reason_code: "pressure_warning".into(),
+                        severity: "warning".into(),
+                        message: format!(
+                            "Worker {} storage pressure elevated{}",
+                            w.id, disk_info
+                        ),
+                        suggested_action: format!(
+                            "ssh {}@{} 'du -sh /tmp/rch-*' to check cache sizes",
+                            w.user, w.host
+                        ),
+                        worker_id: Some(w.id.clone()),
+                    });
+                }
+                "telemetry_gap" => {
+                    hints.push(RemediationHint {
+                        reason_code: "pressure_telemetry_gap".into(),
+                        severity: "warning".into(),
+                        message: format!(
+                            "Worker {} storage telemetry stale or missing",
+                            w.id
+                        ),
+                        suggested_action: format!("rch workers probe {}", w.id),
+                        worker_id: Some(w.id.clone()),
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        // Unreachable workers
+        if w.status == "unreachable" || w.status == "unhealthy" {
+            if w.circuit_state != "open" {
+                // Only add if not already covered by circuit_open hint
+                hints.push(RemediationHint {
+                    reason_code: "worker_unreachable".into(),
+                    severity: "critical".into(),
+                    message: format!(
+                        "Worker {} is unreachable{}",
+                        w.id,
+                        w.last_error
+                            .as_ref()
+                            .map(|e| format!(": {}", e))
+                            .unwrap_or_default()
+                    ),
+                    suggested_action: format!(
+                        "ssh {}@{} 'echo ok' to verify connectivity",
+                        w.user, w.host
+                    ),
+                    worker_id: Some(w.id.clone()),
+                });
+            }
+        }
+    }
+
+    hints
+}
+
+/// Generate convergence remediation hints.
+pub fn generate_convergence_remediations(
+    convergence: &RepoConvergenceStatusFromApi,
+) -> Vec<RemediationHint> {
+    let mut hints = Vec::new();
+
+    for w in &convergence.workers {
+        match w.drift_state.as_str() {
+            "drifting" => {
+                let missing = if w.missing_repos.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (missing: {})", w.missing_repos.join(", "))
+                };
+                hints.push(RemediationHint {
+                    reason_code: "convergence_drifting".into(),
+                    severity: "warning".into(),
+                    message: format!("Worker {} repos drifting{}", w.worker_id, missing),
+                    suggested_action: format!(
+                        "rch repo-convergence repair --worker {}",
+                        w.worker_id
+                    ),
+                    worker_id: Some(w.worker_id.clone()),
+                });
+            }
+            "failed" => {
+                hints.push(RemediationHint {
+                    reason_code: "convergence_failed".into(),
+                    severity: "critical".into(),
+                    message: format!(
+                        "Worker {} convergence failed (budget: {} attempts, {}ms remaining)",
+                        w.worker_id, w.attempt_budget_remaining, w.time_budget_remaining_ms
+                    ),
+                    suggested_action: format!(
+                        "rch repo-convergence repair --worker {} --force",
+                        w.worker_id
+                    ),
+                    worker_id: Some(w.worker_id.clone()),
+                });
+            }
+            "stale" => {
+                hints.push(RemediationHint {
+                    reason_code: "convergence_stale".into(),
+                    severity: "info".into(),
+                    message: format!("Worker {} convergence data stale", w.worker_id),
+                    suggested_action: format!(
+                        "rch repo-convergence dry-run --worker {}",
+                        w.worker_id
+                    ),
+                    worker_id: Some(w.worker_id.clone()),
+                });
+            }
+            _ => {} // "ready" and "converging" are fine
+        }
+
+        // Include per-worker remediation from the convergence endpoint
+        for rem in &w.remediation {
+            if !rem.is_empty() {
+                hints.push(RemediationHint {
+                    reason_code: "convergence_hint".into(),
+                    severity: "info".into(),
+                    message: rem.clone(),
+                    suggested_action: String::new(),
+                    worker_id: Some(w.worker_id.clone()),
+                });
+            }
+        }
+    }
+
+    hints
+}
+
+/// Unified status surface response for JSON output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnifiedStatusResponse {
+    /// Schema version for forward compatibility.
+    pub schema_version: String,
+    /// System-level posture.
+    pub posture: SystemPosture,
+    /// Posture description.
+    pub posture_description: String,
+    /// Core daemon and worker status.
+    pub daemon: DaemonFullStatusResponse,
+    /// Convergence status (None if endpoint unreachable).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub convergence: Option<RepoConvergenceStatusFromApi>,
+    /// Aggregated remediation hints across all signals.
+    pub remediation_hints: Vec<RemediationHint>,
 }
 
 // ============================================================================

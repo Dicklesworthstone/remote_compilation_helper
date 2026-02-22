@@ -276,10 +276,22 @@ pub fn render_full_status(
     status: &DaemonFullStatusResponse,
     show_workers: bool,
     show_jobs: bool,
+    convergence: Option<&crate::status_types::RepoConvergenceStatusFromApi>,
+    remediation_hints: &[crate::status_types::RemediationHint],
+    posture: &crate::status_types::SystemPosture,
     style: &Theme,
 ) {
     let mut stdout = std::io::stdout();
-    let _ = render_full_status_to(&mut stdout, status, show_workers, show_jobs, style);
+    let _ = render_full_status_to(
+        &mut stdout,
+        status,
+        show_workers,
+        show_jobs,
+        convergence,
+        remediation_hints,
+        posture,
+        style,
+    );
 }
 
 fn render_full_status_to<W: Write>(
@@ -287,6 +299,9 @@ fn render_full_status_to<W: Write>(
     status: &DaemonFullStatusResponse,
     show_workers: bool,
     show_jobs: bool,
+    convergence: Option<&crate::status_types::RepoConvergenceStatusFromApi>,
+    remediation_hints: &[crate::status_types::RemediationHint],
+    posture: &crate::status_types::SystemPosture,
     style: &Theme,
 ) -> std::io::Result<()> {
     writeln!(out, "{}", style.format_header("RCH Status"))?;
@@ -314,6 +329,21 @@ fn render_full_status_to<W: Write>(
         style.key("Version"),
         style.muted(":"),
         style.info(&status.daemon.version)
+    )?;
+
+    // System posture
+    let posture_display = match posture {
+        crate::status_types::SystemPosture::RemoteReady => style.success("remote-ready"),
+        crate::status_types::SystemPosture::Degraded => style.warning("degraded"),
+        crate::status_types::SystemPosture::LocalOnly => style.error("local-only"),
+    };
+    writeln!(
+        out,
+        "  {} {} {} {}",
+        style.key("Posture"),
+        style.muted(":"),
+        posture_display,
+        style.muted(&format!("({})", posture.description()))
     )?;
 
     // Worker summary
@@ -466,6 +496,16 @@ fn render_full_status_to<W: Write>(
         }
     }
 
+    // Convergence summary if available
+    if let Some(conv) = convergence {
+        render_convergence_summary_to(out, conv, style)?;
+    }
+
+    // Remediation hints if any non-healthy states
+    if !remediation_hints.is_empty() {
+        render_remediation_hints_to(out, remediation_hints, style)?;
+    }
+
     // Workers section
     if show_workers {
         render_workers_table_to(out, status, style)?;
@@ -550,6 +590,163 @@ fn render_workers_table_to<W: Write>(
         // Show detailed circuit info for workers with issues
         if worker.circuit_state != "closed" {
             render_circuit_details_to(out, worker, style)?;
+        }
+
+        // Show pressure info for workers under pressure
+        if let Some(ref pressure) = worker.pressure_state {
+            if pressure != "healthy" {
+                render_pressure_details_to(out, worker, style)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Render pressure details for a worker under storage pressure.
+fn render_pressure_details_to<W: Write>(
+    out: &mut W,
+    worker: &crate::status_types::WorkerStatusFromApi,
+    style: &Theme,
+) -> std::io::Result<()> {
+    let pressure = worker.pressure_state.as_deref().unwrap_or("unknown");
+    let pressure_display = match pressure {
+        "critical" => style.error("CRITICAL"),
+        "warning" => style.warning("WARNING"),
+        "telemetry_gap" => style.warning("TELEMETRY GAP"),
+        _ => style.muted(pressure),
+    };
+
+    write!(out, "    {} {}", style.muted("Pressure:"), pressure_display)?;
+
+    // Show disk info if available
+    if let (Some(free), Some(total)) = (worker.pressure_disk_free_gb, worker.pressure_disk_total_gb)
+    {
+        let ratio = worker
+            .pressure_disk_free_ratio
+            .map(|r| format!(" ({:.0}%)", r * 100.0))
+            .unwrap_or_default();
+        write!(
+            out,
+            " — {:.1}/{:.1} GB free{}",
+            free, total, ratio
+        )?;
+    }
+    writeln!(out)?;
+
+    // Show reason code for diagnostics
+    if let Some(ref reason_code) = worker.pressure_reason_code {
+        if !reason_code.is_empty() {
+            writeln!(
+                out,
+                "      {} {}",
+                style.muted("reason:"),
+                style.muted(reason_code)
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Render convergence summary section.
+fn render_convergence_summary_to<W: Write>(
+    out: &mut W,
+    convergence: &crate::status_types::RepoConvergenceStatusFromApi,
+    style: &Theme,
+) -> std::io::Result<()> {
+    writeln!(out, "\n{}", style.format_header("Repo Convergence"))?;
+
+    let s = &convergence.summary;
+    let state_display = if s.failed > 0 {
+        style.error("failed")
+    } else if s.drifting > 0 || s.converging > 0 {
+        style.warning("drifting")
+    } else if s.stale > 0 && s.ready == 0 {
+        style.warning("stale")
+    } else {
+        style.success("ready")
+    };
+
+    writeln!(
+        out,
+        "  {} {} {} ({} ready, {} drifting, {} failed, {} stale)",
+        style.key("State"),
+        style.muted(":"),
+        state_display,
+        s.ready,
+        s.drifting + s.converging,
+        s.failed,
+        s.stale
+    )?;
+
+    // Show details for non-ready workers
+    for w in &convergence.workers {
+        if w.drift_state != "ready" {
+            let drift_display = match w.drift_state.as_str() {
+                "drifting" => style.warning(&w.drift_state),
+                "converging" => style.info(&w.drift_state),
+                "failed" => style.error(&w.drift_state),
+                "stale" => style.muted(&w.drift_state),
+                _ => style.muted(&w.drift_state),
+            };
+            write!(
+                out,
+                "  {} {} {}",
+                style.symbols.bullet_filled,
+                style.highlight(&w.worker_id),
+                drift_display
+            )?;
+            if !w.missing_repos.is_empty() {
+                write!(
+                    out,
+                    " (missing: {})",
+                    style.muted(&w.missing_repos.join(", "))
+                )?;
+            }
+            writeln!(out)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Render remediation hints section.
+fn render_remediation_hints_to<W: Write>(
+    out: &mut W,
+    hints: &[crate::status_types::RemediationHint],
+    style: &Theme,
+) -> std::io::Result<()> {
+    writeln!(out, "\n{}", style.format_header("Remediation"))?;
+
+    for hint in hints {
+        let severity_display = match hint.severity.as_str() {
+            "critical" => style.error("!!"),
+            "warning" => style.warning("!"),
+            _ => style.info("i"),
+        };
+
+        let worker_suffix = hint
+            .worker_id
+            .as_ref()
+            .map(|id| format!(" [{}]", id))
+            .unwrap_or_default();
+
+        writeln!(
+            out,
+            "  {} {}{}",
+            severity_display,
+            hint.message,
+            style.muted(&worker_suffix)
+        )?;
+
+        if !hint.suggested_action.is_empty() {
+            writeln!(
+                out,
+                "    {} {}",
+                style.muted("Fix:"),
+                style.info(&hint.suggested_action)
+            )?;
         }
     }
 
@@ -1189,7 +1386,7 @@ mod tests {
         let status = sample_status();
         let style = Theme::new(false, true, false);
         let mut buf = Vec::new();
-        render_full_status_to(&mut buf, &status, true, false, &style).expect("render");
+        render_full_status_to(&mut buf, &status, true, false, None, &[], &crate::status_types::SystemPosture::RemoteReady, &style).expect("render");
         let output = String::from_utf8(buf).expect("utf8 output");
 
         assert!(output.contains("worker-a"));
@@ -1208,7 +1405,7 @@ mod tests {
         let status = sample_status();
         let style = Theme::new(false, true, false);
         let mut buf = Vec::new();
-        render_full_status_to(&mut buf, &status, false, true, &style).expect("render");
+        render_full_status_to(&mut buf, &status, false, true, None, &[], &crate::status_types::SystemPosture::RemoteReady, &style).expect("render");
         let output = String::from_utf8(buf).expect("utf8 output");
 
         assert!(output.contains("Active Builds"));
@@ -1256,7 +1453,7 @@ mod tests {
 
         let style = Theme::new(false, true, false);
         let mut buf = Vec::new();
-        render_full_status_to(&mut buf, &status, false, true, &style).expect("render");
+        render_full_status_to(&mut buf, &status, false, true, None, &[], &crate::status_types::SystemPosture::RemoteReady, &style).expect("render");
         let output = String::from_utf8(buf).expect("utf8 output");
 
         assert!(output.contains("cancellation:"));
@@ -1272,7 +1469,7 @@ mod tests {
         let status = sample_status();
         let style = Theme::new(false, true, false);
         let mut buf = Vec::new();
-        render_full_status_to(&mut buf, &status, true, false, &style).expect("render");
+        render_full_status_to(&mut buf, &status, true, false, None, &[], &crate::status_types::SystemPosture::RemoteReady, &style).expect("render");
         let output = String::from_utf8(buf).expect("utf8 output");
 
         assert!(output.contains("Circuit:"));
