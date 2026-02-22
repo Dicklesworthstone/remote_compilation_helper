@@ -774,6 +774,17 @@ mod tests {
             consecutive_failures: 0,
             recovery_in_secs: None,
             failure_history: vec![],
+            pressure_state: None,
+            pressure_confidence: None,
+            pressure_reason_code: None,
+            pressure_policy_rule: None,
+            pressure_disk_free_gb: None,
+            pressure_disk_total_gb: None,
+            pressure_disk_free_ratio: None,
+            pressure_disk_io_util_pct: None,
+            pressure_memory_pressure: None,
+            pressure_telemetry_age_secs: None,
+            pressure_telemetry_fresh: None,
         }
     }
 

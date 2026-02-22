@@ -629,7 +629,11 @@ impl TransferPipeline {
 
         format!(
             "export LC_ALL=C; {}touch {} && cd {} && {}{}",
-            build_id_export, escaped_remote_path, escaped_remote_path, ensure_dirs_command, timeout_wrapped_command
+            build_id_export,
+            escaped_remote_path,
+            escaped_remote_path,
+            ensure_dirs_command,
+            timeout_wrapped_command
         )
     }
 

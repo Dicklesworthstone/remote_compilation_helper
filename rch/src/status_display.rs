@@ -294,6 +294,7 @@ pub fn render_full_status(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_full_status_to<W: Write>(
     out: &mut W,
     status: &DaemonFullStatusResponse,
@@ -593,10 +594,10 @@ fn render_workers_table_to<W: Write>(
         }
 
         // Show pressure info for workers under pressure
-        if let Some(ref pressure) = worker.pressure_state {
-            if pressure != "healthy" {
-                render_pressure_details_to(out, worker, style)?;
-            }
+        if let Some(ref pressure) = worker.pressure_state
+            && pressure != "healthy"
+        {
+            render_pressure_details_to(out, worker, style)?;
         }
     }
 
@@ -626,24 +627,20 @@ fn render_pressure_details_to<W: Write>(
             .pressure_disk_free_ratio
             .map(|r| format!(" ({:.0}%)", r * 100.0))
             .unwrap_or_default();
-        write!(
-            out,
-            " — {:.1}/{:.1} GB free{}",
-            free, total, ratio
-        )?;
+        write!(out, " — {:.1}/{:.1} GB free{}", free, total, ratio)?;
     }
     writeln!(out)?;
 
     // Show reason code for diagnostics
-    if let Some(ref reason_code) = worker.pressure_reason_code {
-        if !reason_code.is_empty() {
-            writeln!(
-                out,
-                "      {} {}",
-                style.muted("reason:"),
-                style.muted(reason_code)
-            )?;
-        }
+    if let Some(ref reason_code) = worker.pressure_reason_code
+        && !reason_code.is_empty()
+    {
+        writeln!(
+            out,
+            "      {} {}",
+            style.muted("reason:"),
+            style.muted(reason_code)
+        )?;
     }
 
     Ok(())
@@ -1210,6 +1207,17 @@ mod tests {
                     consecutive_failures: 0,
                     recovery_in_secs: None,
                     failure_history: vec![true, true],
+                    pressure_state: None,
+                    pressure_confidence: None,
+                    pressure_reason_code: None,
+                    pressure_policy_rule: None,
+                    pressure_disk_free_gb: None,
+                    pressure_disk_total_gb: None,
+                    pressure_disk_free_ratio: None,
+                    pressure_disk_io_util_pct: None,
+                    pressure_memory_pressure: None,
+                    pressure_telemetry_age_secs: None,
+                    pressure_telemetry_fresh: None,
                 },
                 WorkerStatusFromApi {
                     id: "worker-b".to_string(),
@@ -1224,6 +1232,17 @@ mod tests {
                     consecutive_failures: 3,
                     recovery_in_secs: Some(30),
                     failure_history: vec![false, false, true],
+                    pressure_state: None,
+                    pressure_confidence: None,
+                    pressure_reason_code: None,
+                    pressure_policy_rule: None,
+                    pressure_disk_free_gb: None,
+                    pressure_disk_total_gb: None,
+                    pressure_disk_free_ratio: None,
+                    pressure_disk_io_util_pct: None,
+                    pressure_memory_pressure: None,
+                    pressure_telemetry_age_secs: None,
+                    pressure_telemetry_fresh: None,
                 },
             ],
             active_builds: vec![ActiveBuildFromApi {
@@ -1386,7 +1405,17 @@ mod tests {
         let status = sample_status();
         let style = Theme::new(false, true, false);
         let mut buf = Vec::new();
-        render_full_status_to(&mut buf, &status, true, false, None, &[], &crate::status_types::SystemPosture::RemoteReady, &style).expect("render");
+        render_full_status_to(
+            &mut buf,
+            &status,
+            true,
+            false,
+            None,
+            &[],
+            &crate::status_types::SystemPosture::RemoteReady,
+            &style,
+        )
+        .expect("render");
         let output = String::from_utf8(buf).expect("utf8 output");
 
         assert!(output.contains("worker-a"));
@@ -1405,7 +1434,17 @@ mod tests {
         let status = sample_status();
         let style = Theme::new(false, true, false);
         let mut buf = Vec::new();
-        render_full_status_to(&mut buf, &status, false, true, None, &[], &crate::status_types::SystemPosture::RemoteReady, &style).expect("render");
+        render_full_status_to(
+            &mut buf,
+            &status,
+            false,
+            true,
+            None,
+            &[],
+            &crate::status_types::SystemPosture::RemoteReady,
+            &style,
+        )
+        .expect("render");
         let output = String::from_utf8(buf).expect("utf8 output");
 
         assert!(output.contains("Active Builds"));
@@ -1453,7 +1492,17 @@ mod tests {
 
         let style = Theme::new(false, true, false);
         let mut buf = Vec::new();
-        render_full_status_to(&mut buf, &status, false, true, None, &[], &crate::status_types::SystemPosture::RemoteReady, &style).expect("render");
+        render_full_status_to(
+            &mut buf,
+            &status,
+            false,
+            true,
+            None,
+            &[],
+            &crate::status_types::SystemPosture::RemoteReady,
+            &style,
+        )
+        .expect("render");
         let output = String::from_utf8(buf).expect("utf8 output");
 
         assert!(output.contains("cancellation:"));
@@ -1469,7 +1518,17 @@ mod tests {
         let status = sample_status();
         let style = Theme::new(false, true, false);
         let mut buf = Vec::new();
-        render_full_status_to(&mut buf, &status, true, false, None, &[], &crate::status_types::SystemPosture::RemoteReady, &style).expect("render");
+        render_full_status_to(
+            &mut buf,
+            &status,
+            true,
+            false,
+            None,
+            &[],
+            &crate::status_types::SystemPosture::RemoteReady,
+            &style,
+        )
+        .expect("render");
         let output = String::from_utf8(buf).expect("utf8 output");
 
         assert!(output.contains("Circuit:"));

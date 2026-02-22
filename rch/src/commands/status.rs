@@ -1084,8 +1084,8 @@ async fn self_test_run(
 
 pub async fn status_overview(workers: bool, jobs: bool, ctx: &OutputContext) -> Result<()> {
     use crate::status_types::{
-        RepoConvergenceStatusFromApi, RemediationHint, SystemPosture, UnifiedStatusResponse,
-        STATUS_SCHEMA_VERSION, generate_convergence_remediations, generate_worker_remediations,
+        RemediationHint, RepoConvergenceStatusFromApi, STATUS_SCHEMA_VERSION, SystemPosture,
+        UnifiedStatusResponse, generate_convergence_remediations, generate_worker_remediations,
     };
 
     // Query daemon for full status.

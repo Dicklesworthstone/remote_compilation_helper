@@ -307,6 +307,7 @@ impl SystemPosture {
         }
     }
 
+    #[allow(dead_code)]
     pub fn label(&self) -> &'static str {
         match self {
             Self::RemoteReady => "remote-ready",
@@ -406,10 +407,7 @@ pub fn generate_worker_remediations(workers: &[WorkerStatusFromApi]) -> Vec<Reme
                     hints.push(RemediationHint {
                         reason_code: "pressure_warning".into(),
                         severity: "warning".into(),
-                        message: format!(
-                            "Worker {} storage pressure elevated{}",
-                            w.id, disk_info
-                        ),
+                        message: format!("Worker {} storage pressure elevated{}", w.id, disk_info),
                         suggested_action: format!(
                             "ssh {}@{} 'du -sh /tmp/rch-*' to check cache sizes",
                             w.user, w.host
@@ -421,10 +419,7 @@ pub fn generate_worker_remediations(workers: &[WorkerStatusFromApi]) -> Vec<Reme
                     hints.push(RemediationHint {
                         reason_code: "pressure_telemetry_gap".into(),
                         severity: "warning".into(),
-                        message: format!(
-                            "Worker {} storage telemetry stale or missing",
-                            w.id
-                        ),
+                        message: format!("Worker {} storage telemetry stale or missing", w.id),
                         suggested_action: format!("rch workers probe {}", w.id),
                         worker_id: Some(w.id.clone()),
                     });
@@ -434,27 +429,25 @@ pub fn generate_worker_remediations(workers: &[WorkerStatusFromApi]) -> Vec<Reme
         }
 
         // Unreachable workers
-        if w.status == "unreachable" || w.status == "unhealthy" {
-            if w.circuit_state != "open" {
-                // Only add if not already covered by circuit_open hint
-                hints.push(RemediationHint {
-                    reason_code: "worker_unreachable".into(),
-                    severity: "critical".into(),
-                    message: format!(
-                        "Worker {} is unreachable{}",
-                        w.id,
-                        w.last_error
-                            .as_ref()
-                            .map(|e| format!(": {}", e))
-                            .unwrap_or_default()
-                    ),
-                    suggested_action: format!(
-                        "ssh {}@{} 'echo ok' to verify connectivity",
-                        w.user, w.host
-                    ),
-                    worker_id: Some(w.id.clone()),
-                });
-            }
+        if (w.status == "unreachable" || w.status == "unhealthy") && w.circuit_state != "open" {
+            // Only add if not already covered by circuit_open hint
+            hints.push(RemediationHint {
+                reason_code: "worker_unreachable".into(),
+                severity: "critical".into(),
+                message: format!(
+                    "Worker {} is unreachable{}",
+                    w.id,
+                    w.last_error
+                        .as_ref()
+                        .map(|e| format!(": {}", e))
+                        .unwrap_or_default()
+                ),
+                suggested_action: format!(
+                    "ssh {}@{} 'echo ok' to verify connectivity",
+                    w.user, w.host
+                ),
+                worker_id: Some(w.id.clone()),
+            });
         }
     }
 
@@ -1225,5 +1218,510 @@ mod tests {
         let pagination: PaginationInfoFromApi = serde_json::from_value(json).unwrap();
         assert_eq!(pagination.total, 100);
         assert!(pagination.has_more);
+    }
+
+    // ── SystemPosture tests ──
+
+    fn make_daemon_status(
+        workers_total: usize,
+        workers_healthy: usize,
+    ) -> DaemonFullStatusResponse {
+        DaemonFullStatusResponse {
+            daemon: DaemonInfoFromApi {
+                pid: 1,
+                uptime_secs: 100,
+                version: "test".to_string(),
+                socket_path: "/tmp/test.sock".to_string(),
+                started_at: "2026-01-01T00:00:00Z".to_string(),
+                workers_total,
+                workers_healthy,
+                slots_total: 16,
+                slots_available: 8,
+            },
+            workers: vec![],
+            active_builds: vec![],
+            queued_builds: vec![],
+            recent_builds: vec![],
+            issues: vec![],
+            alerts: vec![],
+            stats: BuildStatsFromApi {
+                total_builds: 0,
+                success_count: 0,
+                failure_count: 0,
+                remote_count: 0,
+                local_count: 0,
+                avg_duration_ms: 0,
+            },
+            test_stats: None,
+            saved_time: None,
+        }
+    }
+
+    #[test]
+    fn test_system_posture_remote_ready() {
+        let _guard = test_guard!();
+        let status = make_daemon_status(2, 2);
+        assert_eq!(
+            SystemPosture::from_status(&status),
+            SystemPosture::RemoteReady
+        );
+    }
+
+    #[test]
+    fn test_system_posture_degraded() {
+        let _guard = test_guard!();
+        let status = make_daemon_status(3, 1);
+        assert_eq!(SystemPosture::from_status(&status), SystemPosture::Degraded);
+    }
+
+    #[test]
+    fn test_system_posture_local_only_no_workers() {
+        let _guard = test_guard!();
+        let status = make_daemon_status(0, 0);
+        assert_eq!(
+            SystemPosture::from_status(&status),
+            SystemPosture::LocalOnly
+        );
+    }
+
+    #[test]
+    fn test_system_posture_local_only_no_healthy() {
+        let _guard = test_guard!();
+        let status = make_daemon_status(2, 0);
+        assert_eq!(
+            SystemPosture::from_status(&status),
+            SystemPosture::LocalOnly
+        );
+    }
+
+    #[test]
+    fn test_system_posture_label_and_description() {
+        let _guard = test_guard!();
+        assert_eq!(SystemPosture::RemoteReady.label(), "remote-ready");
+        assert_eq!(SystemPosture::Degraded.label(), "degraded");
+        assert_eq!(SystemPosture::LocalOnly.label(), "local-only");
+
+        assert!(!SystemPosture::RemoteReady.description().is_empty());
+        assert!(!SystemPosture::Degraded.description().is_empty());
+        assert!(!SystemPosture::LocalOnly.description().is_empty());
+    }
+
+    #[test]
+    fn test_system_posture_serialization_round_trip() {
+        let _guard = test_guard!();
+        for posture in [
+            SystemPosture::RemoteReady,
+            SystemPosture::Degraded,
+            SystemPosture::LocalOnly,
+        ] {
+            let json = serde_json::to_string(&posture).unwrap();
+            let deserialized: SystemPosture = serde_json::from_str(&json).unwrap();
+            assert_eq!(posture, deserialized);
+        }
+    }
+
+    // ── Worker remediation tests ──
+
+    fn make_worker(id: &str, status: &str, circuit: &str) -> WorkerStatusFromApi {
+        WorkerStatusFromApi {
+            id: id.to_string(),
+            host: "10.0.0.1".to_string(),
+            user: "ubuntu".to_string(),
+            status: status.to_string(),
+            circuit_state: circuit.to_string(),
+            used_slots: 0,
+            total_slots: 8,
+            speed_score: 50.0,
+            last_error: None,
+            consecutive_failures: 0,
+            recovery_in_secs: None,
+            failure_history: vec![],
+            pressure_state: None,
+            pressure_confidence: None,
+            pressure_reason_code: None,
+            pressure_policy_rule: None,
+            pressure_disk_free_gb: None,
+            pressure_disk_total_gb: None,
+            pressure_disk_free_ratio: None,
+            pressure_disk_io_util_pct: None,
+            pressure_memory_pressure: None,
+            pressure_telemetry_age_secs: None,
+            pressure_telemetry_fresh: None,
+        }
+    }
+
+    #[test]
+    fn test_remediation_circuit_open() {
+        let _guard = test_guard!();
+        let mut w = make_worker("w1", "unhealthy", "open");
+        w.consecutive_failures = 5;
+        let hints = generate_worker_remediations(&[w]);
+
+        let circuit_hints: Vec<_> = hints
+            .iter()
+            .filter(|h| h.reason_code == "circuit_open")
+            .collect();
+        assert_eq!(circuit_hints.len(), 1);
+        assert_eq!(circuit_hints[0].severity, "critical");
+        assert!(circuit_hints[0].message.contains("5 consecutive failures"));
+        assert!(circuit_hints[0].suggested_action.contains("probe"));
+        assert_eq!(circuit_hints[0].worker_id.as_deref(), Some("w1"));
+    }
+
+    #[test]
+    fn test_remediation_circuit_half_open() {
+        let _guard = test_guard!();
+        let w = make_worker("w2", "healthy", "half_open");
+        let hints = generate_worker_remediations(&[w]);
+
+        let half_open: Vec<_> = hints
+            .iter()
+            .filter(|h| h.reason_code == "circuit_half_open")
+            .collect();
+        assert_eq!(half_open.len(), 1);
+        assert_eq!(half_open[0].severity, "warning");
+    }
+
+    #[test]
+    fn test_remediation_pressure_critical() {
+        let _guard = test_guard!();
+        let mut w = make_worker("w3", "healthy", "closed");
+        w.pressure_state = Some("critical".to_string());
+        w.pressure_disk_free_gb = Some(1.2);
+        let hints = generate_worker_remediations(&[w]);
+
+        let pressure: Vec<_> = hints
+            .iter()
+            .filter(|h| h.reason_code == "pressure_critical")
+            .collect();
+        assert_eq!(pressure.len(), 1);
+        assert_eq!(pressure[0].severity, "critical");
+        assert!(pressure[0].message.contains("1.2 GB free"));
+        assert!(pressure[0].suggested_action.contains("cargo clean"));
+    }
+
+    #[test]
+    fn test_remediation_pressure_warning() {
+        let _guard = test_guard!();
+        let mut w = make_worker("w4", "healthy", "closed");
+        w.pressure_state = Some("warning".to_string());
+        let hints = generate_worker_remediations(&[w]);
+
+        let pressure: Vec<_> = hints
+            .iter()
+            .filter(|h| h.reason_code == "pressure_warning")
+            .collect();
+        assert_eq!(pressure.len(), 1);
+        assert_eq!(pressure[0].severity, "warning");
+    }
+
+    #[test]
+    fn test_remediation_pressure_telemetry_gap() {
+        let _guard = test_guard!();
+        let mut w = make_worker("w5", "healthy", "closed");
+        w.pressure_state = Some("telemetry_gap".to_string());
+        let hints = generate_worker_remediations(&[w]);
+
+        let gap: Vec<_> = hints
+            .iter()
+            .filter(|h| h.reason_code == "pressure_telemetry_gap")
+            .collect();
+        assert_eq!(gap.len(), 1);
+        assert_eq!(gap[0].severity, "warning");
+    }
+
+    #[test]
+    fn test_remediation_worker_unreachable() {
+        let _guard = test_guard!();
+        let mut w = make_worker("w6", "unreachable", "closed");
+        w.last_error = Some("Connection refused".to_string());
+        let hints = generate_worker_remediations(&[w]);
+
+        let unreach: Vec<_> = hints
+            .iter()
+            .filter(|h| h.reason_code == "worker_unreachable")
+            .collect();
+        assert_eq!(unreach.len(), 1);
+        assert_eq!(unreach[0].severity, "critical");
+        assert!(unreach[0].message.contains("Connection refused"));
+        assert!(unreach[0].suggested_action.contains("ssh"));
+    }
+
+    #[test]
+    fn test_remediation_healthy_workers_no_hints() {
+        let _guard = test_guard!();
+        let w = make_worker("w7", "healthy", "closed");
+        let hints = generate_worker_remediations(&[w]);
+        assert!(hints.is_empty(), "healthy worker should produce no hints");
+    }
+
+    #[test]
+    fn test_remediation_open_circuit_does_not_duplicate_unreachable() {
+        let _guard = test_guard!();
+        // Worker with open circuit + unreachable should NOT get worker_unreachable hint
+        // (the circuit_open hint covers it)
+        let w = make_worker("w8", "unreachable", "open");
+        let hints = generate_worker_remediations(&[w]);
+
+        let circuit: Vec<_> = hints
+            .iter()
+            .filter(|h| h.reason_code == "circuit_open")
+            .collect();
+        let unreach: Vec<_> = hints
+            .iter()
+            .filter(|h| h.reason_code == "worker_unreachable")
+            .collect();
+        assert_eq!(circuit.len(), 1);
+        assert_eq!(
+            unreach.len(),
+            0,
+            "open circuit should suppress worker_unreachable"
+        );
+    }
+
+    // ── Convergence remediation tests ──
+
+    #[test]
+    fn test_convergence_remediation_drifting() {
+        let _guard = test_guard!();
+        let conv = RepoConvergenceStatusFromApi {
+            status: "degraded".to_string(),
+            workers: vec![ConvergenceWorkerViewFromApi {
+                worker_id: "w1".to_string(),
+                drift_state: "drifting".to_string(),
+                drift_confidence: 0.8,
+                required_repos: vec!["repo-a".to_string()],
+                synced_repos: vec![],
+                missing_repos: vec!["repo-a".to_string()],
+                attempt_budget_remaining: 3,
+                time_budget_remaining_ms: 60000,
+                last_status_check_unix_ms: 0,
+                remediation: vec![],
+            }],
+            summary: ConvergenceSummaryFromApi {
+                total_workers: 1,
+                ready: 0,
+                drifting: 1,
+                converging: 0,
+                failed: 0,
+                stale: 0,
+            },
+        };
+        let hints = generate_convergence_remediations(&conv);
+
+        let drift: Vec<_> = hints
+            .iter()
+            .filter(|h| h.reason_code == "convergence_drifting")
+            .collect();
+        assert_eq!(drift.len(), 1);
+        assert_eq!(drift[0].severity, "warning");
+        assert!(drift[0].message.contains("repo-a"));
+        assert!(drift[0].suggested_action.contains("repair"));
+    }
+
+    #[test]
+    fn test_convergence_remediation_failed() {
+        let _guard = test_guard!();
+        let conv = RepoConvergenceStatusFromApi {
+            status: "failed".to_string(),
+            workers: vec![ConvergenceWorkerViewFromApi {
+                worker_id: "w2".to_string(),
+                drift_state: "failed".to_string(),
+                drift_confidence: 0.0,
+                required_repos: vec![],
+                synced_repos: vec![],
+                missing_repos: vec![],
+                attempt_budget_remaining: 0,
+                time_budget_remaining_ms: 0,
+                last_status_check_unix_ms: 0,
+                remediation: vec![],
+            }],
+            summary: ConvergenceSummaryFromApi {
+                total_workers: 1,
+                ready: 0,
+                drifting: 0,
+                converging: 0,
+                failed: 1,
+                stale: 0,
+            },
+        };
+        let hints = generate_convergence_remediations(&conv);
+
+        let failed: Vec<_> = hints
+            .iter()
+            .filter(|h| h.reason_code == "convergence_failed")
+            .collect();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].severity, "critical");
+        assert!(failed[0].suggested_action.contains("--force"));
+    }
+
+    #[test]
+    fn test_convergence_remediation_stale() {
+        let _guard = test_guard!();
+        let conv = RepoConvergenceStatusFromApi {
+            status: "stale".to_string(),
+            workers: vec![ConvergenceWorkerViewFromApi {
+                worker_id: "w3".to_string(),
+                drift_state: "stale".to_string(),
+                drift_confidence: 0.0,
+                required_repos: vec![],
+                synced_repos: vec![],
+                missing_repos: vec![],
+                attempt_budget_remaining: 5,
+                time_budget_remaining_ms: 30000,
+                last_status_check_unix_ms: 0,
+                remediation: vec![],
+            }],
+            summary: ConvergenceSummaryFromApi {
+                total_workers: 1,
+                ready: 0,
+                drifting: 0,
+                converging: 0,
+                failed: 0,
+                stale: 1,
+            },
+        };
+        let hints = generate_convergence_remediations(&conv);
+
+        let stale: Vec<_> = hints
+            .iter()
+            .filter(|h| h.reason_code == "convergence_stale")
+            .collect();
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].severity, "info");
+        assert!(stale[0].suggested_action.contains("dry-run"));
+    }
+
+    #[test]
+    fn test_convergence_remediation_ready_produces_no_hints() {
+        let _guard = test_guard!();
+        let conv = RepoConvergenceStatusFromApi {
+            status: "ready".to_string(),
+            workers: vec![ConvergenceWorkerViewFromApi {
+                worker_id: "w4".to_string(),
+                drift_state: "ready".to_string(),
+                drift_confidence: 1.0,
+                required_repos: vec![],
+                synced_repos: vec![],
+                missing_repos: vec![],
+                attempt_budget_remaining: 5,
+                time_budget_remaining_ms: 30000,
+                last_status_check_unix_ms: 0,
+                remediation: vec![],
+            }],
+            summary: ConvergenceSummaryFromApi {
+                total_workers: 1,
+                ready: 1,
+                drifting: 0,
+                converging: 0,
+                failed: 0,
+                stale: 0,
+            },
+        };
+        let hints = generate_convergence_remediations(&conv);
+        assert!(
+            hints.is_empty(),
+            "ready convergence should produce no hints"
+        );
+    }
+
+    #[test]
+    fn test_convergence_per_worker_remediation_forwarded() {
+        let _guard = test_guard!();
+        let conv = RepoConvergenceStatusFromApi {
+            status: "degraded".to_string(),
+            workers: vec![ConvergenceWorkerViewFromApi {
+                worker_id: "w5".to_string(),
+                drift_state: "drifting".to_string(),
+                drift_confidence: 0.5,
+                required_repos: vec![],
+                synced_repos: vec![],
+                missing_repos: vec![],
+                attempt_budget_remaining: 3,
+                time_budget_remaining_ms: 60000,
+                last_status_check_unix_ms: 0,
+                remediation: vec!["run git fetch on worker".to_string()],
+            }],
+            summary: ConvergenceSummaryFromApi {
+                total_workers: 1,
+                ready: 0,
+                drifting: 1,
+                converging: 0,
+                failed: 0,
+                stale: 0,
+            },
+        };
+        let hints = generate_convergence_remediations(&conv);
+
+        let forwarded: Vec<_> = hints
+            .iter()
+            .filter(|h| h.reason_code == "convergence_hint")
+            .collect();
+        assert_eq!(forwarded.len(), 1);
+        assert!(forwarded[0].message.contains("git fetch"));
+    }
+
+    // ── UnifiedStatusResponse tests ──
+
+    #[test]
+    fn test_unified_status_response_serialization() {
+        let _guard = test_guard!();
+        let status = make_daemon_status(2, 2);
+        let unified = UnifiedStatusResponse {
+            schema_version: STATUS_SCHEMA_VERSION.to_string(),
+            posture: SystemPosture::RemoteReady,
+            posture_description: SystemPosture::RemoteReady.description().to_string(),
+            daemon: status,
+            convergence: None,
+            remediation_hints: vec![RemediationHint {
+                reason_code: "test_hint".to_string(),
+                severity: "info".to_string(),
+                message: "test message".to_string(),
+                suggested_action: "do something".to_string(),
+                worker_id: None,
+            }],
+        };
+
+        let json = serde_json::to_string(&unified).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed["schema_version"], STATUS_SCHEMA_VERSION);
+        assert_eq!(parsed["posture"], "remote_ready");
+        assert_eq!(parsed["remediation_hints"].as_array().unwrap().len(), 1);
+        assert_eq!(parsed["remediation_hints"][0]["reason_code"], "test_hint");
+    }
+
+    #[test]
+    fn test_unified_status_schema_version_constant() {
+        let _guard = test_guard!();
+        assert_eq!(STATUS_SCHEMA_VERSION, "1.0.0");
+    }
+
+    #[test]
+    fn test_remediation_hint_serialization_skips_none_worker() {
+        let _guard = test_guard!();
+        let hint = RemediationHint {
+            reason_code: "test".to_string(),
+            severity: "info".to_string(),
+            message: "msg".to_string(),
+            suggested_action: "act".to_string(),
+            worker_id: None,
+        };
+        let json = serde_json::to_string(&hint).unwrap();
+        assert!(
+            !json.contains("worker_id"),
+            "None worker_id should be skipped"
+        );
+
+        let hint_with_worker = RemediationHint {
+            worker_id: Some("w1".to_string()),
+            ..hint
+        };
+        let json2 = serde_json::to_string(&hint_with_worker).unwrap();
+        assert!(
+            json2.contains("worker_id"),
+            "Some worker_id should be included"
+        );
     }
 }
