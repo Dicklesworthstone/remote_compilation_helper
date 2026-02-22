@@ -4816,7 +4816,7 @@ mod tests {
         set_mock_rsync_config_override, set_mock_ssh_config_override,
     };
     use rch_common::test_guard;
-    use rch_common::{SelectionReason, ToolInput};
+    use rch_common::{SelectionReason, TierDecision, ToolInput, classify_command_detailed};
     use serial_test::serial;
     use std::sync::OnceLock;
     use tokio::io::BufReader as TokioBufReader;
@@ -9747,5 +9747,213 @@ RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
             plan.iter().any(|e| e.is_primary),
             "primary root must always be in plan"
         );
+    }
+
+    // =========================================================================
+    // Regression suite: Classification timing budget & edge cases (bd-vvmd.2.9)
+    // =========================================================================
+
+    /// Verify classification completes well within the 5ms panic threshold for
+    /// compilation commands, and within 1ms for non-compilation commands.
+    /// This acts as a regression gate: if any code change blows the budget,
+    /// this test catches it.
+    #[test]
+    fn test_classification_timing_budget_non_compilation() {
+        let _guard = test_guard!();
+        let non_compilation_cmds = [
+            "ls -la",
+            "pwd",
+            "git status",
+            "echo hello world",
+            "cat Cargo.toml",
+            "npm install",
+            "python main.py",
+            "docker build -t myapp .",
+            "mkdir -p build",
+            "rm -rf target/",
+        ];
+
+        for cmd in non_compilation_cmds {
+            let start = std::time::Instant::now();
+            for _ in 0..100 {
+                let _ = classify_command(cmd);
+            }
+            let elapsed = start.elapsed();
+            let per_call_us = elapsed.as_micros() / 100;
+            // Non-compilation: budget <1ms, panic at 5ms
+            // We check the median is under 1ms (1000us)
+            assert!(
+                per_call_us < 1000,
+                "Non-compilation command {:?} exceeded 1ms budget: {}us per call",
+                cmd, per_call_us
+            );
+        }
+    }
+
+    #[test]
+    fn test_classification_timing_budget_compilation() {
+        let _guard = test_guard!();
+        let compilation_cmds = [
+            "cargo build --release",
+            "cargo test --workspace",
+            "cargo clippy --all-targets",
+            "gcc -c main.c -o main.o",
+            "make -j8",
+            "bun test",
+            "rustc main.rs",
+            "ninja -j4",
+        ];
+
+        for cmd in compilation_cmds {
+            let start = std::time::Instant::now();
+            for _ in 0..100 {
+                let _ = classify_command(cmd);
+            }
+            let elapsed = start.elapsed();
+            let per_call_us = elapsed.as_micros() / 100;
+            // Compilation: budget <5ms, panic at 10ms
+            assert!(
+                per_call_us < 5000,
+                "Compilation command {:?} exceeded 5ms budget: {}us per call",
+                cmd, per_call_us
+            );
+        }
+    }
+
+    /// Verify that process_hook handles compilation commands correctly when
+    /// daemon is absent — the classification MUST work, and the hook MUST
+    /// fail-open to allow local execution.
+    #[tokio::test]
+    async fn test_hook_classification_fail_open_all_compilation_kinds() {
+        let _lock = test_lock().lock().await;
+        mock::set_mock_enabled_override(Some(false));
+
+        let compilation_commands = [
+            ("cargo build --release", "CargoBuild"),
+            ("cargo test --workspace", "CargoTest"),
+            ("cargo check --all-targets", "CargoCheck"),
+            ("cargo clippy", "CargoClippy"),
+            ("cargo doc --no-deps", "CargoDoc"),
+            ("cargo run", "CargoRun"),
+            ("cargo bench", "CargoBench"),
+            ("cargo nextest run", "CargoNextest"),
+            ("bun test", "BunTest"),
+            ("bun typecheck", "BunTypecheck"),
+        ];
+
+        for (cmd, label) in compilation_commands {
+            let input = HookInput {
+                tool_name: "Bash".to_string(),
+                tool_input: ToolInput {
+                    command: cmd.to_string(),
+                    description: None,
+                },
+                session_id: None,
+            };
+
+            let output = process_hook(input).await;
+            assert!(
+                output.is_allow(),
+                "Hook should fail-open for {} ({}) when daemon absent",
+                label, cmd
+            );
+        }
+
+        mock::set_mock_enabled_override(None);
+    }
+
+    /// Verify that non-compilation commands pass through the hook immediately
+    /// (are allowed without daemon interaction).
+    #[tokio::test]
+    async fn test_hook_non_compilation_passthrough() {
+        let non_compilation = [
+            "ls -la",
+            "git status",
+            "cargo fmt --check",
+            "cargo install ripgrep",
+            "bun install",
+            "bun run dev",
+            "echo hello",
+            "cat Cargo.toml",
+        ];
+
+        for cmd in non_compilation {
+            let input = HookInput {
+                tool_name: "Bash".to_string(),
+                tool_input: ToolInput {
+                    command: cmd.to_string(),
+                    description: None,
+                },
+                session_id: None,
+            };
+
+            let output = process_hook(input).await;
+            assert!(
+                output.is_allow(),
+                "Non-compilation command {:?} should pass through the hook (Allow)",
+                cmd
+            );
+        }
+    }
+
+    /// Verify that non-Bash tool invocations are always allowed.
+    #[tokio::test]
+    async fn test_hook_non_bash_tools_always_allowed() {
+        let tools = ["Read", "Write", "Edit", "Glob", "Grep", "WebSearch"];
+
+        for tool in tools {
+            let input = HookInput {
+                tool_name: tool.to_string(),
+                tool_input: ToolInput {
+                    command: "cargo build".to_string(), // Even compilation keyword
+                    description: None,
+                },
+                session_id: None,
+            };
+
+            let output = process_hook(input).await;
+            assert!(
+                output.is_allow(),
+                "Non-Bash tool {:?} should always be allowed, even with compilation keyword",
+                tool
+            );
+        }
+    }
+
+    /// Verify that classify_command_detailed produces valid structured output
+    /// for every tier decision path, enabling structured logging.
+    #[test]
+    fn test_structured_log_output_per_tier() {
+        let _guard = test_guard!();
+
+        // Tier 0 reject: empty command
+        let d = classify_command_detailed("");
+        assert_eq!(d.tiers.len(), 1);
+        assert_eq!(d.tiers[0].tier, 0);
+        assert_eq!(d.tiers[0].decision, TierDecision::Reject);
+        assert!(!d.tiers[0].reason.is_empty());
+
+        // Tier 1 reject: piped command
+        let d = classify_command_detailed("cargo build | tee log");
+        assert!(d.tiers.iter().any(|t| t.tier == 1 && t.decision == TierDecision::Reject));
+
+        // Tier 2 reject: no keyword
+        let d = classify_command_detailed("ls -la");
+        assert!(d.tiers.iter().any(|t| t.tier == 2 && t.decision == TierDecision::Reject));
+
+        // Tier 3 reject: never-intercept
+        let d = classify_command_detailed("cargo install serde");
+        assert!(d.tiers.iter().any(|t| t.tier == 3 && t.decision == TierDecision::Reject));
+
+        // Tier 4 pass: full classification
+        let d = classify_command_detailed("cargo build --release");
+        assert!(d.tiers.iter().any(|t| t.tier == 4 && t.decision == TierDecision::Pass));
+        assert!(d.classification.is_compilation);
+        assert!(d.classification.confidence > 0.0);
+        assert!(d.classification.kind.is_some());
+
+        // Tier 4 reject: keyword present but no matching pattern
+        let d = classify_command_detailed("cargo tree");
+        assert!(d.tiers.iter().any(|t| t.tier == 4 && t.decision == TierDecision::Reject));
     }
 }

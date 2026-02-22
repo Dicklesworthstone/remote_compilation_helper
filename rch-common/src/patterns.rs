@@ -3784,3 +3784,723 @@ mod tests_normalize_whitespace {
         assert_eq!(normalize_command("env\tRUST_BACKTRACE=1\tcargo"), "cargo");
     }
 }
+
+// ============================================================================
+// REGRESSION SUITE: Command Classification (bd-vvmd.2.9)
+//
+// Table-driven regression tests protecting non-compilation UX. Every entry
+// documents expected behavior with rationale so accidental interception of
+// local-only commands is caught immediately.
+// ============================================================================
+
+#[cfg(test)]
+mod regression_classification {
+    use super::*;
+    use crate::test_guard;
+
+    /// A single regression test case.
+    struct Case {
+        cmd: &'static str,
+        expect_compilation: bool,
+        expected_kind: Option<CompilationKind>,
+        /// Substring that MUST appear in the classification reason.
+        reason_contains: &'static str,
+        /// Minimum confidence (only checked when expect_compilation is true).
+        min_confidence: f64,
+    }
+
+    fn run_cases(cases: &[Case]) {
+        for (i, c) in cases.iter().enumerate() {
+            let result = classify_command(c.cmd);
+            assert_eq!(
+                result.is_compilation, c.expect_compilation,
+                "Case {i} ({:?}): expected is_compilation={}, got={}. reason={:?}",
+                c.cmd, c.expect_compilation, result.is_compilation, result.reason
+            );
+            if c.expect_compilation {
+                assert_eq!(
+                    result.kind, c.expected_kind,
+                    "Case {i} ({:?}): expected kind={:?}, got={:?}",
+                    c.cmd, c.expected_kind, result.kind
+                );
+                assert!(
+                    result.confidence >= c.min_confidence,
+                    "Case {i} ({:?}): expected confidence >= {}, got={}",
+                    c.cmd, c.min_confidence, result.confidence
+                );
+            }
+            if !c.reason_contains.is_empty() {
+                assert!(
+                    result.reason.contains(c.reason_contains),
+                    "Case {i} ({:?}): expected reason containing {:?}, got {:?}",
+                    c.cmd, c.reason_contains, result.reason
+                );
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 1. Cargo: Positive compilation commands
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn regression_cargo_compilation_positive() {
+        let _guard = test_guard!();
+        let cases = [
+            Case { cmd: "cargo build", expect_compilation: true, expected_kind: Some(CompilationKind::CargoBuild), reason_contains: "cargo build", min_confidence: 0.90 },
+            Case { cmd: "cargo build --release", expect_compilation: true, expected_kind: Some(CompilationKind::CargoBuild), reason_contains: "cargo build", min_confidence: 0.90 },
+            Case { cmd: "cargo build --workspace", expect_compilation: true, expected_kind: Some(CompilationKind::CargoBuild), reason_contains: "cargo build", min_confidence: 0.90 },
+            Case { cmd: "cargo build -p my-crate", expect_compilation: true, expected_kind: Some(CompilationKind::CargoBuild), reason_contains: "cargo build", min_confidence: 0.90 },
+            Case { cmd: "cargo b", expect_compilation: true, expected_kind: Some(CompilationKind::CargoBuild), reason_contains: "cargo build", min_confidence: 0.90 },
+            Case { cmd: "cargo test", expect_compilation: true, expected_kind: Some(CompilationKind::CargoTest), reason_contains: "cargo test", min_confidence: 0.90 },
+            Case { cmd: "cargo test --release", expect_compilation: true, expected_kind: Some(CompilationKind::CargoTest), reason_contains: "cargo test", min_confidence: 0.90 },
+            Case { cmd: "cargo test my_test", expect_compilation: true, expected_kind: Some(CompilationKind::CargoTest), reason_contains: "cargo test", min_confidence: 0.90 },
+            Case { cmd: "cargo test -- --nocapture", expect_compilation: true, expected_kind: Some(CompilationKind::CargoTest), reason_contains: "cargo test", min_confidence: 0.90 },
+            Case { cmd: "cargo test --workspace", expect_compilation: true, expected_kind: Some(CompilationKind::CargoTest), reason_contains: "cargo test", min_confidence: 0.90 },
+            Case { cmd: "cargo test -p rch-common", expect_compilation: true, expected_kind: Some(CompilationKind::CargoTest), reason_contains: "cargo test", min_confidence: 0.90 },
+            Case { cmd: "cargo t", expect_compilation: true, expected_kind: Some(CompilationKind::CargoTest), reason_contains: "cargo test", min_confidence: 0.90 },
+            Case { cmd: "cargo test --lib", expect_compilation: true, expected_kind: Some(CompilationKind::CargoTest), reason_contains: "cargo test", min_confidence: 0.90 },
+            Case { cmd: "cargo test --bins", expect_compilation: true, expected_kind: Some(CompilationKind::CargoTest), reason_contains: "cargo test", min_confidence: 0.90 },
+            Case { cmd: "cargo test --doc", expect_compilation: true, expected_kind: Some(CompilationKind::CargoTest), reason_contains: "cargo test", min_confidence: 0.90 },
+            Case { cmd: "cargo test -- --test-threads=4", expect_compilation: true, expected_kind: Some(CompilationKind::CargoTest), reason_contains: "cargo test", min_confidence: 0.90 },
+            Case { cmd: "cargo check", expect_compilation: true, expected_kind: Some(CompilationKind::CargoCheck), reason_contains: "cargo check", min_confidence: 0.85 },
+            Case { cmd: "cargo check --workspace --all-targets", expect_compilation: true, expected_kind: Some(CompilationKind::CargoCheck), reason_contains: "cargo check", min_confidence: 0.85 },
+            Case { cmd: "cargo c", expect_compilation: true, expected_kind: Some(CompilationKind::CargoCheck), reason_contains: "cargo check", min_confidence: 0.85 },
+            Case { cmd: "cargo clippy", expect_compilation: true, expected_kind: Some(CompilationKind::CargoClippy), reason_contains: "cargo clippy", min_confidence: 0.85 },
+            Case { cmd: "cargo clippy --workspace --all-targets -- -D warnings", expect_compilation: true, expected_kind: Some(CompilationKind::CargoClippy), reason_contains: "cargo clippy", min_confidence: 0.85 },
+            Case { cmd: "cargo doc", expect_compilation: true, expected_kind: Some(CompilationKind::CargoDoc), reason_contains: "cargo doc", min_confidence: 0.80 },
+            Case { cmd: "cargo doc --no-deps", expect_compilation: true, expected_kind: Some(CompilationKind::CargoDoc), reason_contains: "cargo doc", min_confidence: 0.80 },
+            Case { cmd: "cargo run", expect_compilation: true, expected_kind: Some(CompilationKind::CargoBuild), reason_contains: "cargo run", min_confidence: 0.80 },
+            Case { cmd: "cargo run --release", expect_compilation: true, expected_kind: Some(CompilationKind::CargoBuild), reason_contains: "cargo run", min_confidence: 0.80 },
+            Case { cmd: "cargo r", expect_compilation: true, expected_kind: Some(CompilationKind::CargoBuild), reason_contains: "cargo run", min_confidence: 0.80 },
+            Case { cmd: "cargo bench", expect_compilation: true, expected_kind: Some(CompilationKind::CargoBench), reason_contains: "cargo bench", min_confidence: 0.85 },
+            Case { cmd: "cargo bench --bench my_bench", expect_compilation: true, expected_kind: Some(CompilationKind::CargoBench), reason_contains: "cargo bench", min_confidence: 0.85 },
+            Case { cmd: "cargo nextest run", expect_compilation: true, expected_kind: Some(CompilationKind::CargoNextest), reason_contains: "cargo nextest run", min_confidence: 0.90 },
+            Case { cmd: "cargo nextest run --workspace", expect_compilation: true, expected_kind: Some(CompilationKind::CargoNextest), reason_contains: "cargo nextest run", min_confidence: 0.90 },
+            Case { cmd: "cargo nextest r", expect_compilation: true, expected_kind: Some(CompilationKind::CargoNextest), reason_contains: "cargo nextest run", min_confidence: 0.90 },
+            // Toolchain override variants
+            Case { cmd: "cargo +nightly build", expect_compilation: true, expected_kind: Some(CompilationKind::CargoBuild), reason_contains: "cargo build", min_confidence: 0.90 },
+            Case { cmd: "cargo +1.80.0 test", expect_compilation: true, expected_kind: Some(CompilationKind::CargoTest), reason_contains: "cargo test", min_confidence: 0.90 },
+            Case { cmd: "cargo +nightly nextest run", expect_compilation: true, expected_kind: Some(CompilationKind::CargoNextest), reason_contains: "cargo nextest run", min_confidence: 0.90 },
+        ];
+        run_cases(&cases);
+    }
+
+    // ------------------------------------------------------------------
+    // 2. Cargo: Negative (NEVER intercept — must stay local)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn regression_cargo_never_intercept() {
+        let _guard = test_guard!();
+        let cases = [
+            Case { cmd: "cargo install ripgrep", expect_compilation: false, expected_kind: None, reason_contains: "never-intercept", min_confidence: 0.0 },
+            Case { cmd: "cargo publish", expect_compilation: false, expected_kind: None, reason_contains: "never-intercept", min_confidence: 0.0 },
+            Case { cmd: "cargo login", expect_compilation: false, expected_kind: None, reason_contains: "never-intercept", min_confidence: 0.0 },
+            Case { cmd: "cargo fmt", expect_compilation: false, expected_kind: None, reason_contains: "never-intercept", min_confidence: 0.0 },
+            Case { cmd: "cargo fmt --check", expect_compilation: false, expected_kind: None, reason_contains: "never-intercept", min_confidence: 0.0 },
+            Case { cmd: "cargo fix", expect_compilation: false, expected_kind: None, reason_contains: "never-intercept", min_confidence: 0.0 },
+            Case { cmd: "cargo clean", expect_compilation: false, expected_kind: None, reason_contains: "never-intercept", min_confidence: 0.0 },
+            Case { cmd: "cargo new my_project", expect_compilation: false, expected_kind: None, reason_contains: "never-intercept", min_confidence: 0.0 },
+            Case { cmd: "cargo init", expect_compilation: false, expected_kind: None, reason_contains: "never-intercept", min_confidence: 0.0 },
+            Case { cmd: "cargo add serde", expect_compilation: false, expected_kind: None, reason_contains: "never-intercept", min_confidence: 0.0 },
+            Case { cmd: "cargo remove serde", expect_compilation: false, expected_kind: None, reason_contains: "never-intercept", min_confidence: 0.0 },
+            Case { cmd: "cargo update", expect_compilation: false, expected_kind: None, reason_contains: "never-intercept", min_confidence: 0.0 },
+            Case { cmd: "cargo generate-lockfile", expect_compilation: false, expected_kind: None, reason_contains: "never-intercept", min_confidence: 0.0 },
+            Case { cmd: "cargo watch -x test", expect_compilation: false, expected_kind: None, reason_contains: "never-intercept", min_confidence: 0.0 },
+            Case { cmd: "cargo --version", expect_compilation: false, expected_kind: None, reason_contains: "never-intercept", min_confidence: 0.0 },
+            Case { cmd: "cargo -V", expect_compilation: false, expected_kind: None, reason_contains: "never-intercept", min_confidence: 0.0 },
+            // cargo nextest non-run subcommands
+            Case { cmd: "cargo nextest list", expect_compilation: false, expected_kind: None, reason_contains: "never-intercept", min_confidence: 0.0 },
+            Case { cmd: "cargo nextest archive", expect_compilation: false, expected_kind: None, reason_contains: "never-intercept", min_confidence: 0.0 },
+            Case { cmd: "cargo nextest show", expect_compilation: false, expected_kind: None, reason_contains: "never-intercept", min_confidence: 0.0 },
+            // Bare cargo / bare cargo nextest
+            Case { cmd: "cargo", expect_compilation: false, expected_kind: None, reason_contains: "bare cargo", min_confidence: 0.0 },
+            Case { cmd: "cargo nextest", expect_compilation: false, expected_kind: None, reason_contains: "bare cargo nextest", min_confidence: 0.0 },
+            // Non-interceptable subcommands
+            Case { cmd: "cargo tree", expect_compilation: false, expected_kind: None, reason_contains: "not interceptable", min_confidence: 0.0 },
+            Case { cmd: "cargo metadata", expect_compilation: false, expected_kind: None, reason_contains: "not interceptable", min_confidence: 0.0 },
+            Case { cmd: "cargo search serde", expect_compilation: false, expected_kind: None, reason_contains: "not interceptable", min_confidence: 0.0 },
+            Case { cmd: "cargo vendor", expect_compilation: false, expected_kind: None, reason_contains: "not interceptable", min_confidence: 0.0 },
+        ];
+        run_cases(&cases);
+    }
+
+    // ------------------------------------------------------------------
+    // 3. Bun: Positive compilation (test, typecheck)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn regression_bun_compilation_positive() {
+        let _guard = test_guard!();
+        let cases = [
+            Case { cmd: "bun test", expect_compilation: true, expected_kind: Some(CompilationKind::BunTest), reason_contains: "bun test", min_confidence: 0.90 },
+            Case { cmd: "bun test src/", expect_compilation: true, expected_kind: Some(CompilationKind::BunTest), reason_contains: "bun test", min_confidence: 0.90 },
+            Case { cmd: "bun test --bail", expect_compilation: true, expected_kind: Some(CompilationKind::BunTest), reason_contains: "bun test", min_confidence: 0.90 },
+            Case { cmd: "bun test --timeout 5000", expect_compilation: true, expected_kind: Some(CompilationKind::BunTest), reason_contains: "bun test", min_confidence: 0.90 },
+            Case { cmd: "bun typecheck", expect_compilation: true, expected_kind: Some(CompilationKind::BunTypecheck), reason_contains: "bun typecheck", min_confidence: 0.90 },
+            Case { cmd: "bun typecheck src/", expect_compilation: true, expected_kind: Some(CompilationKind::BunTypecheck), reason_contains: "bun typecheck", min_confidence: 0.90 },
+        ];
+        run_cases(&cases);
+    }
+
+    // ------------------------------------------------------------------
+    // 4. Bun: Negative (package management, execution, interactive)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn regression_bun_never_intercept() {
+        let _guard = test_guard!();
+        let cases = [
+            // Package management — modifies local node_modules
+            Case { cmd: "bun install", expect_compilation: false, expected_kind: None, reason_contains: "never-intercept", min_confidence: 0.0 },
+            Case { cmd: "bun add react", expect_compilation: false, expected_kind: None, reason_contains: "never-intercept", min_confidence: 0.0 },
+            Case { cmd: "bun remove react", expect_compilation: false, expected_kind: None, reason_contains: "never-intercept", min_confidence: 0.0 },
+            Case { cmd: "bun link", expect_compilation: false, expected_kind: None, reason_contains: "never-intercept", min_confidence: 0.0 },
+            Case { cmd: "bun unlink", expect_compilation: false, expected_kind: None, reason_contains: "never-intercept", min_confidence: 0.0 },
+            Case { cmd: "bun pm ls", expect_compilation: false, expected_kind: None, reason_contains: "never-intercept", min_confidence: 0.0 },
+            Case { cmd: "bun init", expect_compilation: false, expected_kind: None, reason_contains: "never-intercept", min_confidence: 0.0 },
+            Case { cmd: "bun create my-app", expect_compilation: false, expected_kind: None, reason_contains: "never-intercept", min_confidence: 0.0 },
+            Case { cmd: "bun upgrade", expect_compilation: false, expected_kind: None, reason_contains: "never-intercept", min_confidence: 0.0 },
+            // Execution — binds local ports or runs scripts
+            Case { cmd: "bun run dev", expect_compilation: false, expected_kind: None, reason_contains: "never-intercept", min_confidence: 0.0 },
+            Case { cmd: "bun build src/index.ts", expect_compilation: false, expected_kind: None, reason_contains: "never-intercept", min_confidence: 0.0 },
+            Case { cmd: "bun dev", expect_compilation: false, expected_kind: None, reason_contains: "never-intercept", min_confidence: 0.0 },
+            Case { cmd: "bun repl", expect_compilation: false, expected_kind: None, reason_contains: "never-intercept", min_confidence: 0.0 },
+            // Package runner — arbitrary execution like npx
+            Case { cmd: "bun x vitest", expect_compilation: false, expected_kind: None, reason_contains: "bun x", min_confidence: 0.0 },
+            Case { cmd: "bun x tsc --noEmit", expect_compilation: false, expected_kind: None, reason_contains: "bun x", min_confidence: 0.0 },
+            // Interactive watch modes — must run locally for interactivity
+            Case { cmd: "bun test --watch", expect_compilation: false, expected_kind: None, reason_contains: "interactive", min_confidence: 0.0 },
+            Case { cmd: "bun test -w", expect_compilation: false, expected_kind: None, reason_contains: "interactive", min_confidence: 0.0 },
+            Case { cmd: "bun typecheck --watch", expect_compilation: false, expected_kind: None, reason_contains: "interactive", min_confidence: 0.0 },
+            Case { cmd: "bun typecheck -w", expect_compilation: false, expected_kind: None, reason_contains: "interactive", min_confidence: 0.0 },
+            // Version/help
+            Case { cmd: "bun --version", expect_compilation: false, expected_kind: None, reason_contains: "never-intercept", min_confidence: 0.0 },
+            Case { cmd: "bun -v", expect_compilation: false, expected_kind: None, reason_contains: "never-intercept", min_confidence: 0.0 },
+            Case { cmd: "bun --help", expect_compilation: false, expected_kind: None, reason_contains: "never-intercept", min_confidence: 0.0 },
+            Case { cmd: "bun -h", expect_compilation: false, expected_kind: None, reason_contains: "never-intercept", min_confidence: 0.0 },
+            Case { cmd: "bun completions", expect_compilation: false, expected_kind: None, reason_contains: "never-intercept", min_confidence: 0.0 },
+        ];
+        run_cases(&cases);
+    }
+
+    // ------------------------------------------------------------------
+    // 5. C/C++ compilers: Positive compilation
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn regression_c_cpp_compilation_positive() {
+        let _guard = test_guard!();
+        let cases = [
+            Case { cmd: "gcc -c main.c -o main.o", expect_compilation: true, expected_kind: Some(CompilationKind::Gcc), reason_contains: "gcc", min_confidence: 0.85 },
+            Case { cmd: "gcc main.c -o main", expect_compilation: true, expected_kind: Some(CompilationKind::Gcc), reason_contains: "gcc", min_confidence: 0.85 },
+            Case { cmd: "g++ -c main.cpp -o main.o", expect_compilation: true, expected_kind: Some(CompilationKind::Gpp), reason_contains: "g++", min_confidence: 0.85 },
+            Case { cmd: "g++ main.cc -o main", expect_compilation: true, expected_kind: Some(CompilationKind::Gpp), reason_contains: "g++", min_confidence: 0.85 },
+            Case { cmd: "clang -c main.c -o main.o", expect_compilation: true, expected_kind: Some(CompilationKind::Clang), reason_contains: "clang", min_confidence: 0.85 },
+            Case { cmd: "clang++ -c main.cpp -o main.o", expect_compilation: true, expected_kind: Some(CompilationKind::Clangpp), reason_contains: "clang++", min_confidence: 0.85 },
+            Case { cmd: "clang++ main.cc -o main", expect_compilation: true, expected_kind: Some(CompilationKind::Clangpp), reason_contains: "clang++", min_confidence: 0.85 },
+            Case { cmd: "cc -c main.c -o main.o", expect_compilation: true, expected_kind: Some(CompilationKind::Gcc), reason_contains: "cc", min_confidence: 0.80 },
+            Case { cmd: "c++ -c main.cpp -o main.o", expect_compilation: true, expected_kind: Some(CompilationKind::Gpp), reason_contains: "c++", min_confidence: 0.80 },
+        ];
+        run_cases(&cases);
+    }
+
+    // ------------------------------------------------------------------
+    // 6. C/C++ compilers: Version checks (NEVER intercept)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn regression_c_cpp_version_checks_not_intercepted() {
+        let _guard = test_guard!();
+        let cases = [
+            Case { cmd: "rustc --version", expect_compilation: false, expected_kind: None, reason_contains: "never-intercept", min_confidence: 0.0 },
+            Case { cmd: "rustc -V", expect_compilation: false, expected_kind: None, reason_contains: "never-intercept", min_confidence: 0.0 },
+            Case { cmd: "gcc --version", expect_compilation: false, expected_kind: None, reason_contains: "never-intercept", min_confidence: 0.0 },
+            Case { cmd: "gcc -v", expect_compilation: false, expected_kind: None, reason_contains: "never-intercept", min_confidence: 0.0 },
+            Case { cmd: "clang --version", expect_compilation: false, expected_kind: None, reason_contains: "never-intercept", min_confidence: 0.0 },
+            Case { cmd: "clang -v", expect_compilation: false, expected_kind: None, reason_contains: "never-intercept", min_confidence: 0.0 },
+            Case { cmd: "make --version", expect_compilation: false, expected_kind: None, reason_contains: "never-intercept", min_confidence: 0.0 },
+            Case { cmd: "make -v", expect_compilation: false, expected_kind: None, reason_contains: "never-intercept", min_confidence: 0.0 },
+            Case { cmd: "cmake --version", expect_compilation: false, expected_kind: None, reason_contains: "never-intercept", min_confidence: 0.0 },
+        ];
+        run_cases(&cases);
+    }
+
+    // ------------------------------------------------------------------
+    // 7. Build systems: Positive compilation
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn regression_build_systems_positive() {
+        let _guard = test_guard!();
+        let cases = [
+            Case { cmd: "make", expect_compilation: true, expected_kind: Some(CompilationKind::Make), reason_contains: "make build", min_confidence: 0.80 },
+            Case { cmd: "make -j8", expect_compilation: true, expected_kind: Some(CompilationKind::Make), reason_contains: "make build", min_confidence: 0.80 },
+            Case { cmd: "make all", expect_compilation: true, expected_kind: Some(CompilationKind::Make), reason_contains: "make build", min_confidence: 0.80 },
+            Case { cmd: "cmake --build build", expect_compilation: true, expected_kind: Some(CompilationKind::CmakeBuild), reason_contains: "cmake --build", min_confidence: 0.85 },
+            Case { cmd: "cmake --build=build", expect_compilation: true, expected_kind: Some(CompilationKind::CmakeBuild), reason_contains: "cmake --build", min_confidence: 0.85 },
+            Case { cmd: "ninja", expect_compilation: true, expected_kind: Some(CompilationKind::Ninja), reason_contains: "ninja build", min_confidence: 0.85 },
+            Case { cmd: "ninja -j4", expect_compilation: true, expected_kind: Some(CompilationKind::Ninja), reason_contains: "ninja build", min_confidence: 0.85 },
+            Case { cmd: "meson compile", expect_compilation: true, expected_kind: Some(CompilationKind::Meson), reason_contains: "meson compile", min_confidence: 0.80 },
+        ];
+        run_cases(&cases);
+    }
+
+    // ------------------------------------------------------------------
+    // 8. Build systems: Negative (clean, install, version)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn regression_build_systems_not_intercepted() {
+        let _guard = test_guard!();
+        let cases = [
+            Case { cmd: "make clean", expect_compilation: false, expected_kind: None, reason_contains: "make maintenance", min_confidence: 0.0 },
+            Case { cmd: "make install", expect_compilation: false, expected_kind: None, reason_contains: "make maintenance", min_confidence: 0.0 },
+            Case { cmd: "make distclean", expect_compilation: false, expected_kind: None, reason_contains: "make maintenance", min_confidence: 0.0 },
+            Case { cmd: "ninja -t clean", expect_compilation: false, expected_kind: None, reason_contains: "ninja clean", min_confidence: 0.0 },
+            Case { cmd: "ninja clean", expect_compilation: false, expected_kind: None, reason_contains: "ninja clean", min_confidence: 0.0 },
+            // meson without compile subcommand
+            Case { cmd: "meson setup build", expect_compilation: false, expected_kind: None, reason_contains: "no matching pattern", min_confidence: 0.0 },
+            Case { cmd: "meson configure", expect_compilation: false, expected_kind: None, reason_contains: "no matching pattern", min_confidence: 0.0 },
+            // cmake without --build
+            Case { cmd: "cmake .", expect_compilation: false, expected_kind: None, reason_contains: "no matching pattern", min_confidence: 0.0 },
+            Case { cmd: "cmake -DCMAKE_BUILD_TYPE=Release ..", expect_compilation: false, expected_kind: None, reason_contains: "no matching pattern", min_confidence: 0.0 },
+        ];
+        run_cases(&cases);
+    }
+
+    // ------------------------------------------------------------------
+    // 9. Rustc: Direct invocation
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn regression_rustc_positive() {
+        let _guard = test_guard!();
+        let cases = [
+            Case { cmd: "rustc main.rs", expect_compilation: true, expected_kind: Some(CompilationKind::Rustc), reason_contains: "rustc", min_confidence: 0.90 },
+            Case { cmd: "rustc main.rs -o main", expect_compilation: true, expected_kind: Some(CompilationKind::Rustc), reason_contains: "rustc", min_confidence: 0.90 },
+            Case { cmd: "rustc --edition 2021 main.rs", expect_compilation: true, expected_kind: Some(CompilationKind::Rustc), reason_contains: "rustc", min_confidence: 0.90 },
+        ];
+        run_cases(&cases);
+    }
+
+    // ------------------------------------------------------------------
+    // 10. Shell structure exclusions (pipes, redirects, bg, chains)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn regression_shell_structure_exclusions() {
+        let _guard = test_guard!();
+        let cases = [
+            // Pipes
+            Case { cmd: "cargo build 2>&1 | grep error", expect_compilation: false, expected_kind: None, reason_contains: "piped", min_confidence: 0.0 },
+            Case { cmd: "cargo test | tee output.log", expect_compilation: false, expected_kind: None, reason_contains: "piped", min_confidence: 0.0 },
+            // Background
+            Case { cmd: "cargo build &", expect_compilation: false, expected_kind: None, reason_contains: "background", min_confidence: 0.0 },
+            // Output redirect
+            Case { cmd: "cargo build > log.txt", expect_compilation: false, expected_kind: None, reason_contains: "redirect", min_confidence: 0.0 },
+            Case { cmd: "cargo build >> log.txt", expect_compilation: false, expected_kind: None, reason_contains: "redirect", min_confidence: 0.0 },
+            // Input redirect
+            Case { cmd: "cargo build < input.txt", expect_compilation: false, expected_kind: None, reason_contains: "input redirect", min_confidence: 0.0 },
+            // Subshell
+            Case { cmd: "(cargo build)", expect_compilation: false, expected_kind: None, reason_contains: "subshell", min_confidence: 0.0 },
+            Case { cmd: "$(cargo build)", expect_compilation: false, expected_kind: None, reason_contains: "subshell", min_confidence: 0.0 },
+            Case { cmd: "`cargo build`", expect_compilation: false, expected_kind: None, reason_contains: "subshell capture", min_confidence: 0.0 },
+            // Process substitution
+            Case { cmd: "cargo build --config <(echo ...)", expect_compilation: false, expected_kind: None, reason_contains: "subshell", min_confidence: 0.0 },
+            // Semicolon chains
+            Case { cmd: "cargo build; cargo test", expect_compilation: false, expected_kind: None, reason_contains: "chained", min_confidence: 0.0 },
+            // || chains
+            Case { cmd: "cargo build || echo failed", expect_compilation: false, expected_kind: None, reason_contains: "chained", min_confidence: 0.0 },
+            // Newline injection (security)
+            Case { cmd: "cargo build\nrm -rf /", expect_compilation: false, expected_kind: None, reason_contains: "newline", min_confidence: 0.0 },
+            Case { cmd: "cargo build\r\nevil", expect_compilation: false, expected_kind: None, reason_contains: "newline", min_confidence: 0.0 },
+        ];
+        run_cases(&cases);
+    }
+
+    // ------------------------------------------------------------------
+    // 11. fd-to-fd redirects are SAFE and should NOT block interception
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn regression_fd_redirect_safe() {
+        let _guard = test_guard!();
+        // Compound: "cd /path && cargo build 2>&1" should detect cargo build
+        // via compound command handling (depth-0 splits on &&, depth-1 checks segment)
+        // Simple fd-to-fd redirect like "cargo build 2>&1" is handled by check_structure
+        // which explicitly skips fd-to-fd redirects. So "cargo build 2>&1" should be
+        // classified as compilation.
+        let result = classify_command("cargo build 2>&1");
+        assert!(
+            result.is_compilation,
+            "cargo build 2>&1 should be classified as compilation (fd redirect is safe), got: {:?}",
+            result.reason
+        );
+        assert_eq!(result.kind, Some(CompilationKind::CargoBuild));
+    }
+
+    // ------------------------------------------------------------------
+    // 12. Compound commands: && chains with compilation suffix
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn regression_compound_commands() {
+        let _guard = test_guard!();
+        // cd && cargo build should be detected as compilation
+        let result = classify_command("cd /path && cargo build");
+        assert!(result.is_compilation, "cd && cargo build should compile, got: {:?}", result.reason);
+        assert_eq!(result.kind, Some(CompilationKind::CargoBuild));
+        assert!(result.command_prefix.is_some(), "should have prefix");
+        assert!(result.extracted_command.is_some(), "should have extracted command");
+
+        let result = classify_command("cd /path && cargo test --workspace");
+        assert!(result.is_compilation, "cd && cargo test should compile, got: {:?}", result.reason);
+        assert_eq!(result.kind, Some(CompilationKind::CargoTest));
+
+        // Non-compilation suffix should not match
+        let result = classify_command("cd /path && cargo fmt");
+        assert!(!result.is_compilation, "cd && cargo fmt should NOT compile");
+
+        let result = classify_command("cd /path && ls -la");
+        assert!(!result.is_compilation, "cd && ls should NOT compile");
+    }
+
+    // ------------------------------------------------------------------
+    // 13. Wrapper normalization: env, sudo, time, etc.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn regression_wrapper_normalization() {
+        let _guard = test_guard!();
+        let cases = [
+            Case { cmd: "sudo cargo build", expect_compilation: true, expected_kind: Some(CompilationKind::CargoBuild), reason_contains: "cargo build", min_confidence: 0.90 },
+            Case { cmd: "time cargo test", expect_compilation: true, expected_kind: Some(CompilationKind::CargoTest), reason_contains: "cargo test", min_confidence: 0.90 },
+            Case { cmd: "env RUST_BACKTRACE=1 cargo test", expect_compilation: true, expected_kind: Some(CompilationKind::CargoTest), reason_contains: "cargo test", min_confidence: 0.90 },
+            Case { cmd: "RUST_BACKTRACE=1 cargo test", expect_compilation: true, expected_kind: Some(CompilationKind::CargoTest), reason_contains: "cargo test", min_confidence: 0.90 },
+            Case { cmd: "nice cargo build --release", expect_compilation: true, expected_kind: Some(CompilationKind::CargoBuild), reason_contains: "cargo build", min_confidence: 0.90 },
+            Case { cmd: "/usr/bin/cargo build", expect_compilation: true, expected_kind: Some(CompilationKind::CargoBuild), reason_contains: "cargo build", min_confidence: 0.90 },
+            Case { cmd: "sudo env RUSTFLAGS=-Dwarnings cargo clippy", expect_compilation: true, expected_kind: Some(CompilationKind::CargoClippy), reason_contains: "cargo clippy", min_confidence: 0.85 },
+        ];
+        run_cases(&cases);
+    }
+
+    // ------------------------------------------------------------------
+    // 14. Non-compilation commands (must never trigger)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn regression_non_compilation_passthrough() {
+        let _guard = test_guard!();
+        let cases = [
+            Case { cmd: "ls -la", expect_compilation: false, expected_kind: None, reason_contains: "no compilation keyword", min_confidence: 0.0 },
+            Case { cmd: "pwd", expect_compilation: false, expected_kind: None, reason_contains: "no compilation keyword", min_confidence: 0.0 },
+            Case { cmd: "echo hello", expect_compilation: false, expected_kind: None, reason_contains: "no compilation keyword", min_confidence: 0.0 },
+            Case { cmd: "cat Cargo.toml", expect_compilation: false, expected_kind: None, reason_contains: "no compilation keyword", min_confidence: 0.0 },
+            Case { cmd: "git status", expect_compilation: false, expected_kind: None, reason_contains: "no compilation keyword", min_confidence: 0.0 },
+            Case { cmd: "git commit -m 'fix'", expect_compilation: false, expected_kind: None, reason_contains: "no compilation keyword", min_confidence: 0.0 },
+            Case { cmd: "npm install", expect_compilation: false, expected_kind: None, reason_contains: "no compilation keyword", min_confidence: 0.0 },
+            Case { cmd: "yarn build", expect_compilation: false, expected_kind: None, reason_contains: "no compilation keyword", min_confidence: 0.0 },
+            Case { cmd: "python main.py", expect_compilation: false, expected_kind: None, reason_contains: "no compilation keyword", min_confidence: 0.0 },
+            Case { cmd: "go build .", expect_compilation: false, expected_kind: None, reason_contains: "no compilation keyword", min_confidence: 0.0 },
+            Case { cmd: "docker build -t myapp .", expect_compilation: false, expected_kind: None, reason_contains: "no compilation keyword", min_confidence: 0.0 },
+            Case { cmd: "pip install -r requirements.txt", expect_compilation: false, expected_kind: None, reason_contains: "no compilation keyword", min_confidence: 0.0 },
+            Case { cmd: "curl https://example.com", expect_compilation: false, expected_kind: None, reason_contains: "no compilation keyword", min_confidence: 0.0 },
+            Case { cmd: "mkdir -p build", expect_compilation: false, expected_kind: None, reason_contains: "no compilation keyword", min_confidence: 0.0 },
+            Case { cmd: "rm -rf target/", expect_compilation: false, expected_kind: None, reason_contains: "no compilation keyword", min_confidence: 0.0 },
+            Case { cmd: "cp -r src/ backup/", expect_compilation: false, expected_kind: None, reason_contains: "no compilation keyword", min_confidence: 0.0 },
+            Case { cmd: "", expect_compilation: false, expected_kind: None, reason_contains: "empty command", min_confidence: 0.0 },
+            Case { cmd: "   ", expect_compilation: false, expected_kind: None, reason_contains: "empty command", min_confidence: 0.0 },
+        ];
+        run_cases(&cases);
+    }
+
+    // ------------------------------------------------------------------
+    // 15. ClassificationDetails: structured log field verification
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn regression_classification_details_fields() {
+        let _guard = test_guard!();
+
+        // Compilation: verify all tiers pass and final has kind + confidence
+        let details = classify_command_detailed("cargo build --release");
+        assert_eq!(details.original, "cargo build --release");
+        assert!(details.classification.is_compilation);
+        assert_eq!(
+            details.classification.kind,
+            Some(CompilationKind::CargoBuild)
+        );
+        assert!(details.classification.confidence >= 0.90);
+        // Should have 5 tiers: 0-4
+        assert_eq!(details.tiers.len(), 5, "Should have 5 tier decisions");
+        for tier in &details.tiers[..4] {
+            assert_eq!(tier.decision, TierDecision::Pass);
+        }
+        // Tier 4 should also pass (compilation detected)
+        assert_eq!(details.tiers[4].decision, TierDecision::Pass);
+        assert_eq!(details.tiers[4].tier, 4);
+
+        // Non-compilation: should reject early at Tier 2 (keyword filter)
+        let details = classify_command_detailed("ls -la");
+        assert!(!details.classification.is_compilation);
+        assert!(details.tiers.len() >= 3, "Should have at least 3 tiers for keyword rejection");
+        assert_eq!(details.tiers.last().unwrap().decision, TierDecision::Reject);
+
+        // Never-intercept: should reject at Tier 3
+        let details = classify_command_detailed("cargo fmt --check");
+        assert!(!details.classification.is_compilation);
+        assert!(details.tiers.len() >= 4, "Should have at least 4 tiers for never-intercept rejection");
+        // Find tier 3
+        let tier3 = details.tiers.iter().find(|t| t.tier == 3).unwrap();
+        assert_eq!(tier3.decision, TierDecision::Reject);
+        assert!(
+            tier3.reason.contains("never-intercept"),
+            "Tier 3 reason should mention never-intercept, got: {:?}",
+            tier3.reason
+        );
+
+        // Piped command: should reject at Tier 1 (structure analysis)
+        let details = classify_command_detailed("cargo build | grep error");
+        assert!(!details.classification.is_compilation);
+        let tier1 = details.tiers.iter().find(|t| t.tier == 1).unwrap();
+        assert_eq!(tier1.decision, TierDecision::Reject);
+        assert!(tier1.reason.contains("piped"));
+
+        // Empty command: should reject at Tier 0
+        let details = classify_command_detailed("");
+        assert!(!details.classification.is_compilation);
+        assert_eq!(details.tiers[0].tier, 0);
+        assert_eq!(details.tiers[0].decision, TierDecision::Reject);
+    }
+
+    // ------------------------------------------------------------------
+    // 16. Decision path completeness: every positive case has reason code
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn regression_every_compilation_has_reason_and_confidence() {
+        let _guard = test_guard!();
+        let compilation_cmds = [
+            "cargo build",
+            "cargo test",
+            "cargo check",
+            "cargo clippy",
+            "cargo doc",
+            "cargo run",
+            "cargo bench",
+            "cargo nextest run",
+            "rustc main.rs",
+            "gcc -c main.c -o main.o",
+            "g++ -c main.cpp -o main.o",
+            "clang -c main.c -o main.o",
+            "clang++ -c main.cpp -o main.o",
+            "make",
+            "cmake --build build",
+            "ninja",
+            "meson compile",
+            "bun test",
+            "bun typecheck",
+        ];
+        for cmd in compilation_cmds {
+            let result = classify_command(cmd);
+            assert!(
+                result.is_compilation,
+                "{cmd:?} should be compilation"
+            );
+            assert!(
+                result.kind.is_some(),
+                "{cmd:?} should have a CompilationKind"
+            );
+            assert!(
+                result.confidence > 0.0,
+                "{cmd:?} should have non-zero confidence"
+            );
+            assert!(
+                !result.reason.is_empty(),
+                "{cmd:?} should have a non-empty reason"
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 17. Decision path completeness: every negative case has reason code
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn regression_every_rejection_has_reason() {
+        let _guard = test_guard!();
+        let non_compilation_cmds = [
+            "",
+            "ls",
+            "pwd",
+            "git status",
+            "cargo fmt",
+            "cargo install ripgrep",
+            "cargo clean",
+            "bun install",
+            "bun add react",
+            "bun run dev",
+            "bun dev",
+            "bun repl",
+            "bun x vitest",
+            "bun test --watch",
+            "bun typecheck -w",
+            "make clean",
+            "ninja clean",
+            "gcc --version",
+            "rustc --version",
+            "cargo build | grep error",
+            "cargo build &",
+            "cargo build > log.txt",
+            "(cargo build)",
+        ];
+        for cmd in non_compilation_cmds {
+            let result = classify_command(cmd);
+            assert!(
+                !result.is_compilation,
+                "{cmd:?} should NOT be compilation, got kind={:?}",
+                result.kind
+            );
+            assert!(
+                !result.reason.is_empty(),
+                "{cmd:?} should have a non-empty rejection reason"
+            );
+            assert_eq!(
+                result.kind, None,
+                "{cmd:?} should have no CompilationKind"
+            );
+            assert_eq!(
+                result.confidence, 0.0,
+                "{cmd:?} should have zero confidence"
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 18. Representative real-world agent workflow commands
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn regression_real_world_agent_workflows() {
+        let _guard = test_guard!();
+
+        // Typical Claude Code agent workflow: navigation + build
+        let cd_build = classify_command("cd /data/projects/remote_compilation_helper && cargo build --workspace --all-targets");
+        assert!(cd_build.is_compilation, "agent cd+build workflow should be intercepted");
+
+        // Agent running tests after code change
+        let test_ws = classify_command("cargo test --workspace -- --nocapture");
+        assert!(test_ws.is_compilation);
+        assert_eq!(test_ws.kind, Some(CompilationKind::CargoTest));
+
+        // Agent running clippy check
+        let clippy = classify_command("cargo clippy --workspace --all-targets -- -D warnings");
+        assert!(clippy.is_compilation);
+        assert_eq!(clippy.kind, Some(CompilationKind::CargoClippy));
+
+        // Agent checking format (should NOT intercept — modifies source)
+        let fmt = classify_command("cargo fmt --check");
+        assert!(!fmt.is_compilation);
+
+        // Agent reading Cargo.toml (should NOT intercept)
+        let cat = classify_command("cat Cargo.toml");
+        assert!(!cat.is_compilation);
+
+        // Agent checking git status (should NOT intercept)
+        let gs = classify_command("git status");
+        assert!(!gs.is_compilation);
+
+        // Agent installing a tool (should NOT intercept)
+        let install = classify_command("cargo install cargo-nextest");
+        assert!(!install.is_compilation);
+
+        // Agent running specific package tests
+        let pkg_test = classify_command("cargo test -p rch-common");
+        assert!(pkg_test.is_compilation);
+        assert_eq!(pkg_test.kind, Some(CompilationKind::CargoTest));
+
+        // Agent running with environment variable
+        let env_test = classify_command("RUST_BACKTRACE=1 cargo test --workspace");
+        assert!(env_test.is_compilation);
+        assert_eq!(env_test.kind, Some(CompilationKind::CargoTest));
+
+        // Agent running nextest
+        let nxt = classify_command("cargo nextest run --workspace --no-fail-fast");
+        assert!(nxt.is_compilation);
+        assert_eq!(nxt.kind, Some(CompilationKind::CargoNextest));
+    }
+
+    // ------------------------------------------------------------------
+    // 19. Boundary: commands that contain keywords but are NOT compilation
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn regression_keyword_in_non_compilation_context() {
+        let _guard = test_guard!();
+        // "cargo" appears as substring in path or argument, not as command
+        let result = classify_command("echo cargo build");
+        // "echo" has no compilation keyword... wait, "cargo" IS a keyword
+        // but the command starts with "echo", which isn't a compilation command.
+        // After normalization, it should still start with "echo".
+        assert!(!result.is_compilation, "echo cargo should not compile, got: {:?}", result.reason);
+
+        // grep for "make" in a log file - keyword present but not a build command
+        let result = classify_command("grep make Makefile");
+        // "make" is a keyword so passes Tier 2, but starts with "grep", not "make"
+        assert!(!result.is_compilation, "grep make should not compile, got: {:?}", result.reason);
+
+        // cat a file with "gcc" in its name
+        let result = classify_command("cat gcc_output.log");
+        // "gcc" keyword passes Tier 2, but the command is "cat"
+        assert!(!result.is_compilation, "cat gcc_output should not compile, got: {:?}", result.reason);
+    }
+
+    // ------------------------------------------------------------------
+    // 20. CompilationKind properties: is_test_command, command_base
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn regression_compilation_kind_properties() {
+        let _guard = test_guard!();
+
+        // Test commands
+        assert!(CompilationKind::CargoTest.is_test_command());
+        assert!(CompilationKind::CargoNextest.is_test_command());
+        assert!(CompilationKind::CargoBench.is_test_command());
+        assert!(CompilationKind::BunTest.is_test_command());
+
+        // Non-test commands
+        assert!(!CompilationKind::CargoBuild.is_test_command());
+        assert!(!CompilationKind::CargoCheck.is_test_command());
+        assert!(!CompilationKind::CargoClippy.is_test_command());
+        assert!(!CompilationKind::CargoDoc.is_test_command());
+        assert!(!CompilationKind::BunTypecheck.is_test_command());
+        assert!(!CompilationKind::Gcc.is_test_command());
+        assert!(!CompilationKind::Gpp.is_test_command());
+        assert!(!CompilationKind::Clang.is_test_command());
+        assert!(!CompilationKind::Clangpp.is_test_command());
+        assert!(!CompilationKind::Make.is_test_command());
+        assert!(!CompilationKind::CmakeBuild.is_test_command());
+        assert!(!CompilationKind::Ninja.is_test_command());
+        assert!(!CompilationKind::Meson.is_test_command());
+        assert!(!CompilationKind::Rustc.is_test_command());
+
+        // command_base
+        assert_eq!(CompilationKind::CargoBuild.command_base(), "cargo");
+        assert_eq!(CompilationKind::CargoTest.command_base(), "cargo");
+        assert_eq!(CompilationKind::CargoNextest.command_base(), "cargo");
+        assert_eq!(CompilationKind::Rustc.command_base(), "rustc");
+        assert_eq!(CompilationKind::Gcc.command_base(), "gcc");
+        assert_eq!(CompilationKind::Gpp.command_base(), "g++");
+        assert_eq!(CompilationKind::Clang.command_base(), "clang");
+        assert_eq!(CompilationKind::Clangpp.command_base(), "clang++");
+        assert_eq!(CompilationKind::Make.command_base(), "make");
+        assert_eq!(CompilationKind::CmakeBuild.command_base(), "cmake");
+        assert_eq!(CompilationKind::Ninja.command_base(), "ninja");
+        assert_eq!(CompilationKind::Meson.command_base(), "meson");
+        assert_eq!(CompilationKind::BunTest.command_base(), "bun");
+        assert_eq!(CompilationKind::BunTypecheck.command_base(), "bun");
+    }
+}

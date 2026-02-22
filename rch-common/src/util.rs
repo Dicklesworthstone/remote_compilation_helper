@@ -1,12 +1,12 @@
 //! Shared utilities for RCH.
 
 fn find_value_end(s: &str) -> usize {
-    let mut chars = s.chars();
+    let chars = s.chars();
     let mut end = 0;
     let mut in_quote = None;
     let mut escaped = false;
 
-    while let Some(c) = chars.next() {
+    for c in chars {
         let char_len = c.len_utf8();
 
         if escaped {
