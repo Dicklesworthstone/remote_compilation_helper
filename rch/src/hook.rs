@@ -1023,7 +1023,9 @@ fn is_filtered_test_command(command: &str) -> bool {
     let tokens = tokenize_command(command);
 
     // Find the position of "test" or "run" (for nextest) in the command
-    let test_pos = tokens.iter().position(|t| t == "test" || t == "t" || t == "run");
+    let test_pos = tokens
+        .iter()
+        .position(|t| t == "test" || t == "t" || t == "run");
     let Some(test_idx) = test_pos else {
         return false;
     };
@@ -2352,6 +2354,7 @@ fn build_dependency_runtime_fail_open_report(
             status,
             reason_code: decision.reason_code,
             detail: decision.detail.clone(),
+            is_primary: true,
         }],
     }
 }
@@ -2721,47 +2724,94 @@ async fn execute_repo_updater_command(
 
     let invocation = build_invocation(&request, contract);
     let remote_cmd = build_repo_updater_remote_command(&invocation);
-    match run_worker_ssh_command(worker, &remote_cmd, Duration::from_secs(timeout_secs)).await {
-        Ok(output) if output.status.success() => {
+    let retry_policy = &contract.retry_policy;
+    let max_attempts = retry_policy.max_attempts.max(1);
+    let mut backoff_ms = retry_policy.initial_backoff_ms;
+
+    for attempt in 0..max_attempts {
+        if attempt > 0 {
             reporter.verbose(&format!(
-                "[RCH] repo_updater {} succeeded for {} repositories on {}",
+                "[RCH] repo_updater {} retry {}/{} on {} (backoff {}ms)",
                 repo_updater_command_name(command),
-                request.repo_specs.len(),
-                worker.id
-            ));
-            true
-        }
-        Ok(output) => {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            warn!(
-                "repo_updater {} failed on {} (status {:?}): {}",
-                repo_updater_command_name(command),
+                attempt + 1,
+                max_attempts,
                 worker.id,
-                output.status.code(),
-                stderr
-            );
-            reporter.verbose(&format!(
-                "[RCH] repo_updater {} failed on {} (continuing with direct sync)",
-                repo_updater_command_name(command),
-                worker.id
+                backoff_ms
             ));
-            false
+            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+            backoff_ms = backoff_ms
+                .saturating_mul(u64::from(retry_policy.backoff_multiplier_percent))
+                .saturating_div(100)
+                .min(retry_policy.max_backoff_ms);
         }
-        Err(err) => {
-            warn!(
-                "repo_updater {} transport failure on {}: {}",
-                repo_updater_command_name(command),
-                worker.id,
-                err
-            );
-            reporter.verbose(&format!(
-                "[RCH] repo_updater {} unavailable on {} (continuing with direct sync)",
-                repo_updater_command_name(command),
-                worker.id
-            ));
-            false
+
+        match run_worker_ssh_command(worker, &remote_cmd, Duration::from_secs(timeout_secs)).await {
+            Ok(output) if output.status.success() => {
+                if attempt > 0 {
+                    reporter.verbose(&format!(
+                        "[RCH] repo_updater {} succeeded on attempt {}/{} for {} repositories on {}",
+                        repo_updater_command_name(command),
+                        attempt + 1,
+                        max_attempts,
+                        request.repo_specs.len(),
+                        worker.id
+                    ));
+                } else {
+                    reporter.verbose(&format!(
+                        "[RCH] repo_updater {} succeeded for {} repositories on {}",
+                        repo_updater_command_name(command),
+                        request.repo_specs.len(),
+                        worker.id
+                    ));
+                }
+                return true;
+            }
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                warn!(
+                    "repo_updater {} failed on {} attempt {}/{} (status {:?}): {}",
+                    repo_updater_command_name(command),
+                    worker.id,
+                    attempt + 1,
+                    max_attempts,
+                    output.status.code(),
+                    stderr
+                );
+                // Last attempt — give up
+                if attempt + 1 >= max_attempts {
+                    reporter.verbose(&format!(
+                        "[RCH] repo_updater {} exhausted {} attempts on {} (continuing with direct sync)",
+                        repo_updater_command_name(command),
+                        max_attempts,
+                        worker.id
+                    ));
+                    return false;
+                }
+            }
+            Err(err) => {
+                warn!(
+                    "repo_updater {} transport failure on {} attempt {}/{}: {}",
+                    repo_updater_command_name(command),
+                    worker.id,
+                    attempt + 1,
+                    max_attempts,
+                    err
+                );
+                // Last attempt — give up
+                if attempt + 1 >= max_attempts {
+                    reporter.verbose(&format!(
+                        "[RCH] repo_updater {} unavailable on {} after {} attempts (continuing with direct sync)",
+                        repo_updater_command_name(command),
+                        max_attempts,
+                        worker.id
+                    ));
+                    return false;
+                }
+            }
         }
     }
+
+    false
 }
 
 fn parse_csv_env_var(var_name: &str) -> Option<Vec<String>> {
@@ -3303,6 +3353,7 @@ struct DependencyPreflightEvidence {
     status: DependencyPreflightStatus,
     reason_code: &'static str,
     detail: String,
+    is_primary: bool,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -3371,9 +3422,14 @@ fn parse_dependency_preflight_probe_output(
 fn dependency_preflight_failure_reason(
     evidence: &[DependencyPreflightEvidence],
 ) -> Option<(&'static str, &'static str)> {
+    // Only block on primary root failures. Non-primary dependency roots with
+    // Missing/Stale/Unknown status are logged as warnings but do not abort the
+    // build — cargo will surface clear errors if a dep is truly unavailable,
+    // and this avoids false-positive blocking from intermittent verification
+    // issues on sibling repos that may already be cached on the worker.
     if evidence
         .iter()
-        .any(|item| item.status == DependencyPreflightStatus::Missing)
+        .any(|item| item.is_primary && item.status == DependencyPreflightStatus::Missing)
     {
         return Some((
             DEPENDENCY_PREFLIGHT_CODE_MISSING,
@@ -3382,7 +3438,7 @@ fn dependency_preflight_failure_reason(
     }
     if evidence
         .iter()
-        .any(|item| item.status == DependencyPreflightStatus::Stale)
+        .any(|item| item.is_primary && item.status == DependencyPreflightStatus::Stale)
     {
         return Some((
             DEPENDENCY_PREFLIGHT_CODE_STALE,
@@ -3391,12 +3447,21 @@ fn dependency_preflight_failure_reason(
     }
     if evidence
         .iter()
-        .any(|item| item.status == DependencyPreflightStatus::Unknown)
+        .any(|item| item.is_primary && item.status == DependencyPreflightStatus::Unknown)
     {
         return Some((
             DEPENDENCY_PREFLIGHT_CODE_UNKNOWN,
             DEPENDENCY_PREFLIGHT_REMEDIATION_UNKNOWN,
         ));
+    }
+    // Log warnings for non-primary roots with issues (informational, non-blocking).
+    for item in evidence {
+        if !item.is_primary && item.status != DependencyPreflightStatus::Present {
+            warn!(
+                "Non-primary dependency root {} has status {:?} (non-blocking): {}",
+                item.root, item.status, item.detail
+            );
+        }
     }
     None
 }
@@ -3460,6 +3525,7 @@ fn build_dependency_preflight_report(
             status,
             reason_code,
             detail,
+            is_primary: entry.is_primary,
         });
     }
 
@@ -4001,15 +4067,19 @@ async fn execute_remote_compilation(
                 report_json
             ));
         }
+        // Proceed with primary-root-only sync instead of aborting.
+        // The planner already set sync_roots = [primary_root] as a safe fallback.
+        // Running remotely with just the primary root is better than falling back
+        // to local execution (which defeats rch's purpose). Cargo will surface
+        // clear errors if any path dependency is truly missing on the worker.
         warn!(
-            "Dependency planner blocked remote execution on {} [{}]: {}",
+            "Dependency planner fail-open on {} [{}]: proceeding with primary-root-only sync ({})",
             worker_config.id, decision.reason_code, decision.remediation
         );
         reporter.verbose(&format!(
-            "[RCH] dependency planner fail-open [{}]: {}",
+            "[RCH] dependency planner fail-open [{}]: proceeding with primary root only — {}",
             decision.reason_code, decision.remediation
         ));
-        return Err(DependencyPreflightFailure::from_report(report).into());
     }
     let raw_sync_roots = dependency_plan.sync_roots;
     let project_id = project_id_from_path(&normalized_project_root);
@@ -6732,7 +6802,8 @@ RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
     fn test_build_dependency_preflight_report_missing_stale_and_unknown_paths() {
         let _guard = test_guard!();
         let worker = make_test_worker_config("worker-mixed");
-        let synced_missing = make_sync_entry("/data/projects/repo-missing", false);
+        // Use is_primary: true so the missing status triggers blocking.
+        let synced_missing = make_sync_entry("/data/projects/repo-missing", true);
         let skipped_stale = make_sync_entry("/data/projects/repo-stale", false);
         let failed_unknown = make_sync_entry("/data/projects/repo-unknown", false);
         let missing_manifest = synced_missing
@@ -6768,12 +6839,12 @@ RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
 
         assert!(
             !report.verified,
-            "missing/stale/unknown evidence must block remote execution"
+            "missing primary root evidence must block remote execution"
         );
         assert_eq!(
             report.reason_code,
             Some(DEPENDENCY_PREFLIGHT_CODE_MISSING),
-            "missing should dominate failure reason"
+            "missing primary should dominate failure reason"
         );
         assert_eq!(
             report.remediation,
@@ -6803,7 +6874,8 @@ RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
     fn test_e2e_dependency_preflight_stale_fallback_path_maps_reason_code() {
         let _guard = test_guard!();
         let worker = make_test_worker_config("worker-stale");
-        let stale_entry = make_sync_entry("/data/projects/repo-stale-only", false);
+        // Use is_primary: true so stale status triggers blocking.
+        let stale_entry = make_sync_entry("/data/projects/repo-stale-only", true);
         let outcomes = vec![(
             stale_entry,
             SyncRootOutcome::Skipped {
@@ -6828,7 +6900,8 @@ RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
     fn test_e2e_dependency_preflight_missing_fallback_path_maps_reason_code() {
         let _guard = test_guard!();
         let worker = make_test_worker_config("worker-missing");
-        let entry = make_sync_entry("/data/projects/repo-missing-only", false);
+        // Use is_primary: true so missing status triggers blocking.
+        let entry = make_sync_entry("/data/projects/repo-missing-only", true);
         let manifest = entry
             .local_root
             .join("Cargo.toml")
@@ -6852,9 +6925,13 @@ RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
     #[tokio::test]
     async fn test_verify_remote_dependency_manifests_blocks_stale_outcomes_deterministically() {
         let _guard = test_guard!();
+        // Disable mock mode so verify_remote_dependency_manifests reaches
+        // the preflight report logic instead of short-circuiting.
+        mock::set_thread_mock_override(Some(false));
         let worker = make_test_worker_config("worker-stale-verify");
+        // Use is_primary: true so stale status triggers blocking.
         let outcomes = vec![(
-            make_sync_entry("/data/projects/repo-stale-verify", false),
+            make_sync_entry("/data/projects/repo-stale-verify", true),
             SyncRootOutcome::Skipped {
                 reason: "transfer budget skip".to_string(),
             },
@@ -6871,6 +6948,80 @@ RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
         assert_eq!(
             preflight.remediation,
             DEPENDENCY_PREFLIGHT_REMEDIATION_STALE
+        );
+        mock::set_thread_mock_override(None);
+    }
+
+    #[test]
+    fn test_non_primary_missing_deps_do_not_block_preflight() {
+        let _guard = test_guard!();
+        let worker = make_test_worker_config("worker-non-primary");
+        let primary = make_sync_entry("/data/projects/main-project", true);
+        let dep = make_sync_entry("/data/projects/sibling-dep", false);
+        let primary_manifest = primary
+            .local_root
+            .join("Cargo.toml")
+            .to_string_lossy()
+            .to_string();
+        let dep_manifest = dep
+            .local_root
+            .join("Cargo.toml")
+            .to_string_lossy()
+            .to_string();
+
+        let outcomes = vec![
+            (primary, SyncRootOutcome::Synced),
+            (dep, SyncRootOutcome::Synced),
+        ];
+        let present = std::collections::BTreeSet::from([primary_manifest]);
+        let missing = std::collections::BTreeSet::from([dep_manifest]);
+
+        let report =
+            build_dependency_preflight_report(&worker, &outcomes, &present, &missing, None);
+
+        assert!(
+            report.verified,
+            "non-primary missing dep should not block preflight"
+        );
+        assert!(
+            report
+                .evidence
+                .iter()
+                .any(|e| !e.is_primary && e.status == DependencyPreflightStatus::Missing),
+            "evidence should still record the non-primary missing status"
+        );
+    }
+
+    #[test]
+    fn test_non_primary_stale_deps_do_not_block_preflight() {
+        let _guard = test_guard!();
+        let worker = make_test_worker_config("worker-non-primary-stale");
+        let primary = make_sync_entry("/data/projects/main-project", true);
+        let dep = make_sync_entry("/data/projects/sibling-dep-stale", false);
+        let primary_manifest = primary
+            .local_root
+            .join("Cargo.toml")
+            .to_string_lossy()
+            .to_string();
+
+        let outcomes = vec![
+            (primary, SyncRootOutcome::Synced),
+            (
+                dep,
+                SyncRootOutcome::Skipped {
+                    reason: "estimator skip".to_string(),
+                },
+            ),
+        ];
+        let present = std::collections::BTreeSet::from([primary_manifest]);
+        let missing = std::collections::BTreeSet::new();
+
+        let report =
+            build_dependency_preflight_report(&worker, &outcomes, &present, &missing, None);
+
+        assert!(
+            report.verified,
+            "non-primary stale dep should not block preflight"
         );
     }
 
@@ -9785,7 +9936,8 @@ RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
             assert!(
                 per_call_us < 1000,
                 "Non-compilation command {:?} exceeded 1ms budget: {}us per call",
-                cmd, per_call_us
+                cmd,
+                per_call_us
             );
         }
     }
@@ -9815,7 +9967,8 @@ RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
             assert!(
                 per_call_us < 5000,
                 "Compilation command {:?} exceeded 5ms budget: {}us per call",
-                cmd, per_call_us
+                cmd,
+                per_call_us
             );
         }
     }
@@ -9855,7 +10008,8 @@ RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
             assert!(
                 output.is_allow(),
                 "Hook should fail-open for {} ({}) when daemon absent",
-                label, cmd
+                label,
+                cmd
             );
         }
 
@@ -9935,25 +10089,45 @@ RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
 
         // Tier 1 reject: piped command
         let d = classify_command_detailed("cargo build | tee log");
-        assert!(d.tiers.iter().any(|t| t.tier == 1 && t.decision == TierDecision::Reject));
+        assert!(
+            d.tiers
+                .iter()
+                .any(|t| t.tier == 1 && t.decision == TierDecision::Reject)
+        );
 
         // Tier 2 reject: no keyword
         let d = classify_command_detailed("ls -la");
-        assert!(d.tiers.iter().any(|t| t.tier == 2 && t.decision == TierDecision::Reject));
+        assert!(
+            d.tiers
+                .iter()
+                .any(|t| t.tier == 2 && t.decision == TierDecision::Reject)
+        );
 
         // Tier 3 reject: never-intercept
         let d = classify_command_detailed("cargo install serde");
-        assert!(d.tiers.iter().any(|t| t.tier == 3 && t.decision == TierDecision::Reject));
+        assert!(
+            d.tiers
+                .iter()
+                .any(|t| t.tier == 3 && t.decision == TierDecision::Reject)
+        );
 
         // Tier 4 pass: full classification
         let d = classify_command_detailed("cargo build --release");
-        assert!(d.tiers.iter().any(|t| t.tier == 4 && t.decision == TierDecision::Pass));
+        assert!(
+            d.tiers
+                .iter()
+                .any(|t| t.tier == 4 && t.decision == TierDecision::Pass)
+        );
         assert!(d.classification.is_compilation);
         assert!(d.classification.confidence > 0.0);
         assert!(d.classification.kind.is_some());
 
         // Tier 4 reject: keyword present but no matching pattern
         let d = classify_command_detailed("cargo tree");
-        assert!(d.tiers.iter().any(|t| t.tier == 4 && t.decision == TierDecision::Reject));
+        assert!(
+            d.tiers
+                .iter()
+                .any(|t| t.tier == 4 && t.decision == TierDecision::Reject)
+        );
     }
 }
