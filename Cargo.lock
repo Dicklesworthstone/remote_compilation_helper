@@ -3231,6 +3231,7 @@ dependencies = [
  "blake3",
  "clap",
  "ctor",
+ "dirs",
  "rch-common",
  "rch-telemetry",
  "serde",
