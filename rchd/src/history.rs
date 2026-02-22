@@ -1001,9 +1001,14 @@ mod tests {
         let _guard = test_guard!();
         let history = BuildHistory::new(10);
 
-        assert_eq!(history.next_id(), 1);
-        assert_eq!(history.next_id(), 2);
-        assert_eq!(history.next_id(), 3);
+        // IDs use a timestamp-based epoch, so we verify monotonic sequence
+        // rather than exact values.
+        let id1 = history.next_id();
+        let id2 = history.next_id();
+        let id3 = history.next_id();
+        assert!(id1 > 0, "first ID should be positive");
+        assert_eq!(id2, id1 + 1, "IDs should be sequential");
+        assert_eq!(id3, id2 + 1, "IDs should be sequential");
     }
 
     #[test]

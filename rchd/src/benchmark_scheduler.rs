@@ -526,7 +526,10 @@ impl BenchmarkScheduler {
                 if queue.is_empty() {
                     break;
                 }
-                queue.iter().map(|req| req.worker_id.clone()).collect::<Vec<_>>()
+                queue
+                    .iter()
+                    .map(|req| req.worker_id.clone())
+                    .collect::<Vec<_>>()
             };
 
             let mut eligible_worker_id = None;
@@ -542,11 +545,10 @@ impl BenchmarkScheduler {
                 let mut queue = self.pending_queue.lock().await;
                 if let Some(worker_id) = eligible_worker_id {
                     // Find it again, in case it moved or was removed
-                    if let Some(idx) = queue.iter().position(|r| r.worker_id == worker_id) {
-                        Some(queue.remove(idx).unwrap())
-                    } else {
-                        None // Removed concurrently
-                    }
+                    queue
+                        .iter()
+                        .position(|r| r.worker_id == worker_id)
+                        .map(|idx| queue.remove(idx).unwrap())
                 } else {
                     break; // No eligible workers found
                 }
