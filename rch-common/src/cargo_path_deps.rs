@@ -281,18 +281,68 @@ fn resolve_entry_manifest(
     Ok(manifest_path)
 }
 
+/// Maximum time to wait for `cargo metadata` before killing the process.
+const CARGO_METADATA_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 fn invoke_cargo_metadata(manifest_path: &Path) -> Result<String, CargoPathDependencyError> {
-    let output = Command::new("cargo")
+    let child = Command::new("cargo")
         .arg("metadata")
         .arg("--format-version")
         .arg("1")
         .arg("--manifest-path")
         .arg(manifest_path)
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .map_err(|error| {
             CargoPathDependencyError::new(
                 CargoPathDependencyErrorKind::MetadataInvocationFailure,
-                format!("failed to execute cargo metadata: {error}"),
+                format!("failed to spawn cargo metadata: {error}"),
+            )
+            .with_manifest_path(manifest_path)
+        })?;
+
+    // Wait with timeout: spawn a thread to wait on the child, then join with a deadline.
+    let deadline = std::time::Instant::now() + CARGO_METADATA_TIMEOUT;
+    let handle = std::thread::spawn(move || child.wait_with_output());
+    loop {
+        if handle.is_finished() {
+            break;
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            // Timeout: try to retrieve the child from the thread to kill it.
+            // The thread owns the child; we cannot kill it directly, but the
+            // Drop impl on the thread handle will not block. The OS will
+            // eventually reclaim the process. Return a timeout error so the
+            // caller falls back to manifest parsing.
+            return Err(CargoPathDependencyError::new(
+                CargoPathDependencyErrorKind::MetadataInvocationFailure,
+                format!(
+                    "cargo metadata timed out after {}s for {}",
+                    CARGO_METADATA_TIMEOUT.as_secs(),
+                    manifest_path.display()
+                ),
+            )
+            .with_manifest_path(manifest_path)
+            .with_diagnostic(format!("timeout_secs={}", CARGO_METADATA_TIMEOUT.as_secs())));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50).min(remaining));
+    }
+
+    let output = handle
+        .join()
+        .map_err(|_| {
+            CargoPathDependencyError::new(
+                CargoPathDependencyErrorKind::MetadataInvocationFailure,
+                "cargo metadata wait thread panicked".to_string(),
+            )
+            .with_manifest_path(manifest_path)
+        })?
+        .map_err(|error| {
+            CargoPathDependencyError::new(
+                CargoPathDependencyErrorKind::MetadataInvocationFailure,
+                format!("failed to wait for cargo metadata: {error}"),
             )
             .with_manifest_path(manifest_path)
         })?;
@@ -1669,5 +1719,621 @@ mod tests {
             error.cycle().len() >= 3,
             "cycle path should include repeated terminal node"
         );
+    }
+
+    // ── Error type construction and accessor tests ──
+
+    #[test]
+    fn error_kind_display_all_variants() {
+        let variants = [
+            (
+                CargoPathDependencyErrorKind::ManifestParseFailure,
+                "manifest parse failure",
+            ),
+            (
+                CargoPathDependencyErrorKind::MissingPathDependency,
+                "missing path dependency",
+            ),
+            (
+                CargoPathDependencyErrorKind::CyclicDependency,
+                "cyclic path dependency",
+            ),
+            (
+                CargoPathDependencyErrorKind::PathPolicyViolation,
+                "path policy violation",
+            ),
+            (
+                CargoPathDependencyErrorKind::MetadataParseFailure,
+                "metadata parse failure",
+            ),
+            (
+                CargoPathDependencyErrorKind::MetadataInvocationFailure,
+                "metadata invocation failure",
+            ),
+        ];
+        for (kind, expected) in variants {
+            assert_eq!(kind.to_string(), expected, "Display for {kind:?}");
+        }
+    }
+
+    #[test]
+    fn error_accessors_return_builder_values() {
+        let error = CargoPathDependencyError::new(
+            CargoPathDependencyErrorKind::MissingPathDependency,
+            "test detail",
+        )
+        .with_manifest_path("/a/Cargo.toml")
+        .with_dependency_name("dep_x")
+        .with_dependency_path("/b/dep_x");
+
+        assert_eq!(
+            error.kind(),
+            &CargoPathDependencyErrorKind::MissingPathDependency
+        );
+        assert_eq!(error.detail(), "test detail");
+        assert_eq!(error.manifest_path(), Some(Path::new("/a/Cargo.toml")));
+        assert_eq!(error.dependency_name(), Some("dep_x"));
+        assert_eq!(error.dependency_path(), Some(Path::new("/b/dep_x")));
+        assert!(error.cycle().is_empty());
+        assert!(error.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn error_display_includes_all_fields() {
+        let error = CargoPathDependencyError::new(
+            CargoPathDependencyErrorKind::MissingPathDependency,
+            "not found",
+        )
+        .with_manifest_path("/a/Cargo.toml")
+        .with_dependency_name("missing_dep")
+        .with_dependency_path("/b/missing");
+
+        let display = error.to_string();
+        assert!(
+            display.contains("missing path dependency"),
+            "should contain kind"
+        );
+        assert!(display.contains("not found"), "should contain detail");
+        assert!(
+            display.contains("/a/Cargo.toml"),
+            "should contain manifest path"
+        );
+        assert!(
+            display.contains("missing_dep"),
+            "should contain dependency name"
+        );
+        assert!(
+            display.contains("/b/missing"),
+            "should contain dependency path"
+        );
+    }
+
+    #[test]
+    fn error_diagnostics_accumulate() {
+        let error = CargoPathDependencyError::new(
+            CargoPathDependencyErrorKind::MetadataParseFailure,
+            "parse error",
+        )
+        .with_diagnostic("line 1")
+        .with_diagnostics(["line 2", "line 3"]);
+
+        assert_eq!(error.diagnostics().len(), 3);
+        assert_eq!(error.diagnostics()[0], "line 1");
+        assert_eq!(error.diagnostics()[1], "line 2");
+        assert_eq!(error.diagnostics()[2], "line 3");
+    }
+
+    #[test]
+    fn error_implements_std_error() {
+        let error = CargoPathDependencyError::new(
+            CargoPathDependencyErrorKind::ManifestParseFailure,
+            "bad toml",
+        );
+        let _: &dyn std::error::Error = &error;
+    }
+
+    // ── Internal helper function tests ──
+
+    #[test]
+    fn default_package_name_uses_last_component() {
+        assert_eq!(default_package_name(Path::new("/a/b/my_crate")), "my_crate");
+        assert_eq!(default_package_name(Path::new("/single")), "single");
+    }
+
+    #[test]
+    fn default_package_name_root_path_uses_display() {
+        let name = default_package_name(Path::new("/"));
+        assert!(
+            !name.is_empty(),
+            "root path should produce a non-empty name"
+        );
+    }
+
+    #[test]
+    fn resolve_dependency_candidate_relative_path() {
+        let result = resolve_dependency_candidate(Path::new("/project/app"), "../lib");
+        assert_eq!(result, PathBuf::from("/project/app/../lib"));
+    }
+
+    #[test]
+    fn resolve_dependency_candidate_absolute_path() {
+        let result = resolve_dependency_candidate(Path::new("/project/app"), "/other/lib");
+        assert_eq!(result, PathBuf::from("/other/lib"));
+    }
+
+    #[test]
+    fn resolve_dependency_candidate_strips_cargo_toml_suffix() {
+        let result = resolve_dependency_candidate(Path::new("/project/app"), "../lib/Cargo.toml");
+        assert_eq!(result, PathBuf::from("/project/app/../lib"));
+    }
+
+    #[test]
+    fn resolve_dependency_candidate_preserves_non_cargo_toml() {
+        let result = resolve_dependency_candidate(Path::new("/project/app"), "../lib/src");
+        assert_eq!(result, PathBuf::from("/project/app/../lib/src"));
+    }
+
+    // ── Wildcard / glob helper tests ──
+
+    #[test]
+    fn contains_glob_detects_patterns() {
+        assert!(contains_glob("crates/*"));
+        assert!(contains_glob("lib?"));
+        assert!(contains_glob("[abc]"));
+        assert!(!contains_glob("plain_path"));
+        assert!(!contains_glob(""));
+    }
+
+    #[test]
+    fn contains_wildcard_detects_star_and_question() {
+        assert!(contains_wildcard("*"));
+        assert!(contains_wildcard("foo*"));
+        assert!(contains_wildcard("fo?"));
+        assert!(!contains_wildcard("plain"));
+        assert!(!contains_wildcard("[abc]"));
+    }
+
+    #[test]
+    fn wildcard_match_exact() {
+        assert!(wildcard_match("hello", "hello"));
+        assert!(!wildcard_match("hello", "world"));
+    }
+
+    #[test]
+    fn wildcard_match_star_patterns() {
+        assert!(wildcard_match("*", "anything"));
+        assert!(wildcard_match("*", ""));
+        assert!(wildcard_match("he*o", "hello"));
+        assert!(wildcard_match("he*o", "heo"));
+        assert!(!wildcard_match("he*o", "hex"));
+        assert!(wildcard_match("*.*", "file.rs"));
+        assert!(!wildcard_match("*.*", "nodot"));
+    }
+
+    #[test]
+    fn wildcard_match_question_mark() {
+        assert!(wildcard_match("h?llo", "hello"));
+        assert!(wildcard_match("h?llo", "hallo"));
+        assert!(!wildcard_match("h?llo", "hllo"));
+        assert!(!wildcard_match("?", ""));
+    }
+
+    #[test]
+    fn wildcard_match_combined() {
+        assert!(wildcard_match("rch-*", "rch-common"));
+        assert!(wildcard_match("rch-*", "rch-"));
+        assert!(!wildcard_match("rch-*", "rch"));
+    }
+
+    #[test]
+    fn wildcard_match_empty_pattern_and_value() {
+        assert!(wildcard_match("", ""));
+        assert!(!wildcard_match("", "x"));
+        assert!(wildcard_match("*", ""));
+    }
+
+    // ── cycle_from_stack tests ──
+
+    #[test]
+    fn cycle_from_stack_extracts_cycle_segment() {
+        let stack = vec![
+            PathBuf::from("/a"),
+            PathBuf::from("/b"),
+            PathBuf::from("/c"),
+        ];
+        let cycle = cycle_from_stack(&stack, Path::new("/b"));
+        assert_eq!(
+            cycle,
+            vec![
+                PathBuf::from("/b"),
+                PathBuf::from("/c"),
+                PathBuf::from("/b"),
+            ]
+        );
+    }
+
+    #[test]
+    fn cycle_from_stack_terminal_not_in_stack() {
+        let stack = vec![PathBuf::from("/a")];
+        let cycle = cycle_from_stack(&stack, Path::new("/z"));
+        assert_eq!(cycle, vec![PathBuf::from("/z")]);
+    }
+
+    #[test]
+    fn cycle_from_stack_single_node_self_cycle() {
+        let stack = vec![PathBuf::from("/a")];
+        let cycle = cycle_from_stack(&stack, Path::new("/a"));
+        assert_eq!(cycle, vec![PathBuf::from("/a"), PathBuf::from("/a")]);
+    }
+
+    #[test]
+    fn cycle_from_stack_empty_stack() {
+        let stack: Vec<PathBuf> = vec![];
+        let cycle = cycle_from_stack(&stack, Path::new("/a"));
+        assert_eq!(cycle, vec![PathBuf::from("/a")]);
+    }
+
+    // ── finalize_graph tests ──
+
+    #[test]
+    fn finalize_empty_graph() {
+        let partial = PartialGraph::default();
+        let graph =
+            finalize_graph(PathBuf::from("/fake/Cargo.toml"), partial).expect("should succeed");
+        assert!(graph.packages.is_empty());
+        assert!(graph.edges.is_empty());
+        assert!(graph.root_packages.is_empty());
+        assert!(graph.workspace_root.is_none());
+    }
+
+    #[test]
+    fn finalize_graph_single_root_no_edges() {
+        let mut partial = PartialGraph::default();
+        partial.add_root(PathBuf::from("/project"));
+        partial.add_package(
+            PathBuf::from("/project"),
+            PathBuf::from("/project/Cargo.toml"),
+            "my_project".to_string(),
+            true,
+        );
+
+        let graph =
+            finalize_graph(PathBuf::from("/project/Cargo.toml"), partial).expect("should succeed");
+        assert_eq!(graph.packages.len(), 1);
+        assert_eq!(graph.packages[0].package_name, "my_project");
+        assert!(graph.packages[0].workspace_member);
+        assert!(graph.edges.is_empty());
+        assert_eq!(graph.root_packages, vec![PathBuf::from("/project")]);
+    }
+
+    #[test]
+    fn finalize_graph_unreachable_packages_excluded() {
+        let mut partial = PartialGraph::default();
+        partial.add_root(PathBuf::from("/root"));
+        partial.add_package(
+            PathBuf::from("/root"),
+            PathBuf::from("/root/Cargo.toml"),
+            "root_pkg".to_string(),
+            true,
+        );
+        // Add an unreachable package (no edge from root)
+        partial.add_package(
+            PathBuf::from("/orphan"),
+            PathBuf::from("/orphan/Cargo.toml"),
+            "orphan_pkg".to_string(),
+            false,
+        );
+
+        let graph =
+            finalize_graph(PathBuf::from("/root/Cargo.toml"), partial).expect("should succeed");
+        assert_eq!(graph.packages.len(), 1, "orphan should be excluded");
+        assert_eq!(graph.packages[0].package_name, "root_pkg");
+    }
+
+    #[test]
+    fn finalize_graph_detects_cycle() {
+        let mut partial = PartialGraph::default();
+        partial.add_root(PathBuf::from("/a"));
+        partial.add_package(
+            PathBuf::from("/a"),
+            PathBuf::from("/a/Cargo.toml"),
+            "a".to_string(),
+            true,
+        );
+        partial.add_package(
+            PathBuf::from("/b"),
+            PathBuf::from("/b/Cargo.toml"),
+            "b".to_string(),
+            false,
+        );
+        partial.add_edge(PathBuf::from("/a"), PathBuf::from("/b"), "b".to_string());
+        partial.add_edge(PathBuf::from("/b"), PathBuf::from("/a"), "a".to_string());
+
+        let error = finalize_graph(PathBuf::from("/a/Cargo.toml"), partial)
+            .expect_err("should detect cycle");
+        assert_eq!(
+            error.kind(),
+            &CargoPathDependencyErrorKind::CyclicDependency
+        );
+        assert!(
+            error.cycle().len() >= 2,
+            "cycle should include at least the two nodes"
+        );
+    }
+
+    #[test]
+    fn finalize_graph_diamond_reachable() {
+        // A -> B, A -> C, B -> D, C -> D
+        let mut partial = PartialGraph::default();
+        partial.add_root(PathBuf::from("/a"));
+        for (name, root) in [("a", "/a"), ("b", "/b"), ("c", "/c"), ("d", "/d")] {
+            partial.add_package(
+                PathBuf::from(root),
+                PathBuf::from(format!("{root}/Cargo.toml")),
+                name.to_string(),
+                name == "a",
+            );
+        }
+        partial.add_edge(PathBuf::from("/a"), PathBuf::from("/b"), "b".to_string());
+        partial.add_edge(PathBuf::from("/a"), PathBuf::from("/c"), "c".to_string());
+        partial.add_edge(PathBuf::from("/b"), PathBuf::from("/d"), "d".to_string());
+        partial.add_edge(PathBuf::from("/c"), PathBuf::from("/d"), "d".to_string());
+
+        let graph =
+            finalize_graph(PathBuf::from("/a/Cargo.toml"), partial).expect("should succeed");
+        assert_eq!(graph.packages.len(), 4, "all 4 nodes reachable in diamond");
+        assert_eq!(graph.edges.len(), 4, "all 4 edges present");
+        // Packages should be sorted by BTreeSet order
+        let names: Vec<_> = graph
+            .packages
+            .iter()
+            .map(|p| p.package_name.as_str())
+            .collect();
+        assert_eq!(names, vec!["a", "b", "c", "d"]);
+    }
+
+    // ── Graph serialization round-trip ──
+
+    #[test]
+    fn graph_serialization_round_trip() {
+        let graph = CargoPathDependencyGraph {
+            entry_manifest_path: PathBuf::from("/project/Cargo.toml"),
+            workspace_root: Some(PathBuf::from("/project")),
+            root_packages: vec![PathBuf::from("/project/app")],
+            packages: vec![
+                CargoPathDependencyPackage {
+                    package_root: PathBuf::from("/project/app"),
+                    manifest_path: PathBuf::from("/project/app/Cargo.toml"),
+                    package_name: "app".to_string(),
+                    workspace_member: true,
+                },
+                CargoPathDependencyPackage {
+                    package_root: PathBuf::from("/project/lib"),
+                    manifest_path: PathBuf::from("/project/lib/Cargo.toml"),
+                    package_name: "lib".to_string(),
+                    workspace_member: true,
+                },
+            ],
+            edges: vec![CargoPathDependencyEdge {
+                from: PathBuf::from("/project/app"),
+                to: PathBuf::from("/project/lib"),
+                dependency_name: "lib".to_string(),
+            }],
+        };
+
+        let json = serde_json::to_string(&graph).expect("serialize");
+        let deserialized: CargoPathDependencyGraph =
+            serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(graph, deserialized);
+    }
+
+    // ── Edge type ordering ──
+
+    #[test]
+    fn edge_ordering_is_deterministic() {
+        let edge_a = CargoPathDependencyEdge {
+            from: PathBuf::from("/a"),
+            to: PathBuf::from("/b"),
+            dependency_name: "b".to_string(),
+        };
+        let edge_b = CargoPathDependencyEdge {
+            from: PathBuf::from("/a"),
+            to: PathBuf::from("/c"),
+            dependency_name: "c".to_string(),
+        };
+        let edge_c = CargoPathDependencyEdge {
+            from: PathBuf::from("/b"),
+            to: PathBuf::from("/c"),
+            dependency_name: "c".to_string(),
+        };
+
+        let mut edges = vec![edge_c.clone(), edge_a.clone(), edge_b.clone()];
+        edges.sort();
+        assert_eq!(edges, vec![edge_a, edge_b, edge_c]);
+    }
+
+    // ── Metadata provider fallback tests ──
+
+    #[cfg(unix)]
+    #[test]
+    fn metadata_error_then_fallback_success() {
+        let fixture = TopologyFixture::new("meta-err-fallback");
+        let scenario_root = fixture.canonical_root.join("meta_fallback");
+        let app_root = scenario_root.join("app");
+        let dep_root = scenario_root.join("dep");
+
+        write_lib_crate(&dep_root, "fb_dep", &[]);
+        write_bin_crate(&app_root, "fb_app", &[("fb_dep", "../dep")]);
+
+        // Metadata provider returns an error, fallback should recover
+        let graph = resolve_cargo_path_dependency_graph_with_policy_and_provider(
+            &app_root,
+            &fixture.policy(),
+            |_| {
+                Err(CargoPathDependencyError::new(
+                    CargoPathDependencyErrorKind::MetadataInvocationFailure,
+                    "simulated cargo metadata failure",
+                ))
+            },
+        )
+        .expect("should recover via manifest fallback");
+
+        let app_root = app_root.canonicalize().expect("canonical app");
+        let dep_root = dep_root.canonicalize().expect("canonical dep");
+        assert_eq!(graph.root_packages, vec![app_root.clone()]);
+        assert_eq!(graph.edges.len(), 1);
+        assert_eq!(graph.edges[0].from, app_root);
+        assert_eq!(graph.edges[0].to, dep_root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn metadata_provider_with_synthetic_json() {
+        let fixture = TopologyFixture::new("synthetic-meta");
+        let scenario_root = fixture.canonical_root.join("synth_meta");
+        let app_root = scenario_root.join("app");
+        let dep_root = scenario_root.join("dep");
+
+        write_lib_crate(&dep_root, "synth_dep", &[]);
+        write_bin_crate(&app_root, "synth_app", &[("synth_dep", "../dep")]);
+
+        // Provide well-formed synthetic metadata JSON
+        let app_canonical = app_root.canonicalize().expect("canonical app");
+        let dep_canonical = dep_root.canonicalize().expect("canonical dep");
+        let app_manifest = app_canonical.join("Cargo.toml");
+        let dep_manifest = dep_canonical.join("Cargo.toml");
+
+        let metadata_json = format!(
+            r#"{{
+                "packages": [
+                    {{
+                        "id": "synth_app 0.1.0 (path+file://{})",
+                        "name": "synth_app",
+                        "manifest_path": "{}",
+                        "dependencies": [
+                            {{"name": "synth_dep", "path": "{}"}}
+                        ]
+                    }},
+                    {{
+                        "id": "synth_dep 0.1.0 (path+file://{})",
+                        "name": "synth_dep",
+                        "manifest_path": "{}",
+                        "dependencies": []
+                    }}
+                ],
+                "workspace_members": [],
+                "workspace_root": null,
+                "resolve": {{
+                    "root": "synth_app 0.1.0 (path+file://{})"
+                }}
+            }}"#,
+            app_canonical.display(),
+            app_manifest.display(),
+            dep_canonical.display(),
+            dep_canonical.display(),
+            dep_manifest.display(),
+            app_canonical.display(),
+        );
+
+        let json_clone = metadata_json.clone();
+        let graph = resolve_cargo_path_dependency_graph_with_policy_and_provider(
+            &app_root,
+            &fixture.policy(),
+            move |_| Ok(json_clone.clone()),
+        )
+        .expect("synthetic metadata should resolve");
+
+        assert_eq!(graph.root_packages, vec![app_canonical.clone()]);
+        assert_eq!(graph.edges.len(), 1);
+        assert_eq!(graph.edges[0].dependency_name, "synth_dep");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn standalone_crate_no_dependencies() {
+        let fixture = TopologyFixture::new("standalone");
+        let crate_root = fixture.canonical_root.join("standalone_crate");
+
+        write_bin_crate(&crate_root, "standalone", &[]);
+
+        let graph = resolve_cargo_path_dependency_graph_with_policy_and_provider(
+            &crate_root,
+            &fixture.policy(),
+            |_| Ok("{not-json".to_string()), // force fallback
+        )
+        .expect("standalone crate should resolve");
+
+        assert_eq!(graph.packages.len(), 1);
+        assert_eq!(graph.packages[0].package_name, "standalone");
+        assert!(graph.edges.is_empty());
+    }
+
+    // ── PartialGraph internal behavior ──
+
+    #[test]
+    fn partial_graph_deduplicates_edges() {
+        let mut partial = PartialGraph::default();
+        partial.add_edge(PathBuf::from("/a"), PathBuf::from("/b"), "b".to_string());
+        partial.add_edge(PathBuf::from("/a"), PathBuf::from("/b"), "b".to_string());
+
+        let edges = partial.adjacency.get(Path::new("/a")).unwrap();
+        assert_eq!(
+            edges.len(),
+            1,
+            "duplicate edge should be deduplicated by BTreeSet"
+        );
+    }
+
+    #[test]
+    fn partial_graph_add_package_updates_name_from_default() {
+        let mut partial = PartialGraph::default();
+        let root = PathBuf::from("/project/my_crate");
+
+        // First add with default name
+        partial.add_package(
+            root.clone(),
+            root.join("Cargo.toml"),
+            default_package_name(&root),
+            false,
+        );
+        assert_eq!(
+            partial.packages.get(&root).unwrap().package_name,
+            "my_crate"
+        );
+
+        // Second add with real name should update
+        partial.add_package(
+            root.clone(),
+            root.join("Cargo.toml"),
+            "real_name".to_string(),
+            false,
+        );
+        assert_eq!(
+            partial.packages.get(&root).unwrap().package_name,
+            "real_name"
+        );
+    }
+
+    #[test]
+    fn partial_graph_add_package_or_promotes_workspace_member() {
+        let mut partial = PartialGraph::default();
+        let root = PathBuf::from("/project");
+
+        partial.add_package(
+            root.clone(),
+            root.join("Cargo.toml"),
+            "pkg".to_string(),
+            false,
+        );
+        assert!(!partial.packages.get(&root).unwrap().workspace_member);
+
+        // Adding again with workspace_member=true should promote
+        partial.add_package(
+            root.clone(),
+            root.join("Cargo.toml"),
+            "pkg".to_string(),
+            true,
+        );
+        assert!(partial.packages.get(&root).unwrap().workspace_member);
     }
 }

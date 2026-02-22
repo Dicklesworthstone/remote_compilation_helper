@@ -280,6 +280,11 @@ pub fn compute_binary_hash(path: &Path) -> Result<BinaryHashResult> {
 pub fn binary_contains_marker(path: &Path, marker: &str) -> Result<bool> {
     info!("Searching for marker '{}' in {:?}", marker, path);
 
+    // Empty marker is trivially contained in any file (consistent with str::contains(""))
+    if marker.is_empty() {
+        return Ok(true);
+    }
+
     let data = std::fs::read(path).with_context(|| format!("Failed to read binary: {:?}", path))?;
 
     // Search for the marker in the raw binary data
@@ -709,5 +714,302 @@ mod tests {
         assert!(result.is_err(), "Should fail for nonexistent file");
         info!("VERIFY: Nonexistent file returns error");
         info!("TEST PASS: test_binary_contains_marker_nonexistent_file");
+    }
+
+    // ===================================================================
+    // Empty / non-binary file edge cases
+    // ===================================================================
+
+    #[test]
+    fn test_compute_binary_hash_empty_file() {
+        init_test_logging();
+        info!("TEST START: test_compute_binary_hash_empty_file");
+
+        let dir = std::env::temp_dir().join("rch-binary-hash-test-empty");
+        let _ = std::fs::create_dir_all(&dir);
+        let empty_path = dir.join("empty_binary");
+        std::fs::write(&empty_path, b"").unwrap();
+
+        let result = compute_binary_hash(&empty_path);
+        assert!(
+            result.is_err(),
+            "empty file should fail binary hash (not a valid binary format)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        info!("TEST PASS: test_compute_binary_hash_empty_file");
+    }
+
+    #[test]
+    fn test_compute_binary_hash_text_file() {
+        init_test_logging();
+        info!("TEST START: test_compute_binary_hash_text_file");
+
+        let dir = std::env::temp_dir().join("rch-binary-hash-test-text");
+        let _ = std::fs::create_dir_all(&dir);
+        let text_path = dir.join("not_a_binary.txt");
+        std::fs::write(&text_path, b"Hello, this is not a binary file.").unwrap();
+
+        let result = compute_binary_hash(&text_path);
+        assert!(
+            result.is_err(),
+            "text file should fail binary hash computation"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        info!("TEST PASS: test_compute_binary_hash_text_file");
+    }
+
+    #[test]
+    fn test_compute_binary_hash_truncated_elf_header() {
+        init_test_logging();
+        info!("TEST START: test_compute_binary_hash_truncated_elf_header");
+
+        let dir = std::env::temp_dir().join("rch-binary-hash-test-truncated");
+        let _ = std::fs::create_dir_all(&dir);
+        let trunc_path = dir.join("truncated_elf");
+        // ELF magic followed by truncated header
+        std::fs::write(&trunc_path, b"\x7fELF\x02\x01\x01\x00").unwrap();
+
+        let result = compute_binary_hash(&trunc_path);
+        assert!(
+            result.is_err(),
+            "truncated ELF should fail binary hash computation"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        info!("TEST PASS: test_compute_binary_hash_truncated_elf_header");
+    }
+
+    // ===================================================================
+    // BinaryHashResult equivalence edge cases
+    // ===================================================================
+
+    #[test]
+    fn test_binaries_equivalent_ignores_full_hash() {
+        init_test_logging();
+
+        let result1 = BinaryHashResult {
+            full_hash: "aaaa".to_string(),
+            code_hash: "same_code".to_string(),
+            text_section_size: 1024,
+            is_debug: false,
+        };
+        let result2 = BinaryHashResult {
+            full_hash: "bbbb".to_string(), // different full hash
+            code_hash: "same_code".to_string(),
+            text_section_size: 1024,
+            is_debug: false,
+        };
+
+        assert!(
+            binaries_equivalent(&result1, &result2),
+            "equivalence should only consider code_hash, text_section_size, is_debug"
+        );
+    }
+
+    #[test]
+    fn test_binaries_not_equivalent_debug_vs_release() {
+        init_test_logging();
+
+        let debug = BinaryHashResult {
+            full_hash: "a".to_string(),
+            code_hash: "same".to_string(),
+            text_section_size: 1024,
+            is_debug: true,
+        };
+        let release = BinaryHashResult {
+            full_hash: "a".to_string(),
+            code_hash: "same".to_string(),
+            text_section_size: 1024,
+            is_debug: false,
+        };
+
+        assert!(
+            !binaries_equivalent(&debug, &release),
+            "debug vs release should not be equivalent"
+        );
+    }
+
+    #[test]
+    fn test_binaries_not_equivalent_different_text_size() {
+        init_test_logging();
+
+        let small = BinaryHashResult {
+            full_hash: "a".to_string(),
+            code_hash: "same".to_string(),
+            text_section_size: 1024,
+            is_debug: false,
+        };
+        let large = BinaryHashResult {
+            full_hash: "a".to_string(),
+            code_hash: "same".to_string(),
+            text_section_size: 2048,
+            is_debug: false,
+        };
+
+        assert!(
+            !binaries_equivalent(&small, &large),
+            "different text section sizes should not be equivalent"
+        );
+    }
+
+    // ===================================================================
+    // BinaryHashResult serialization
+    // ===================================================================
+
+    #[test]
+    fn test_binary_hash_result_serialization_round_trip() {
+        let result = BinaryHashResult {
+            full_hash: "abc123def456".to_string(),
+            code_hash: "789ghi012".to_string(),
+            text_section_size: 65536,
+            is_debug: true,
+        };
+
+        let json = serde_json::to_string(&result).expect("should serialize");
+        let deserialized: BinaryHashResult =
+            serde_json::from_str(&json).expect("should deserialize");
+        assert_eq!(result, deserialized);
+    }
+
+    // ===================================================================
+    // Marker search edge cases
+    // ===================================================================
+
+    #[test]
+    fn test_binary_contains_marker_empty_marker() {
+        init_test_logging();
+
+        let binary_path = match find_test_binary() {
+            Some(p) => p,
+            None => {
+                info!("SKIP: No test binary found");
+                return;
+            }
+        };
+
+        // Empty marker is trivially contained (consistent with str::contains(""))
+        let result = binary_contains_marker(&binary_path, "");
+        assert!(result.is_ok(), "empty marker should not panic");
+        assert!(result.unwrap(), "empty marker should be trivially found");
+    }
+
+    #[test]
+    fn test_binary_contains_marker_very_long_marker() {
+        init_test_logging();
+
+        let binary_path = match find_test_binary() {
+            Some(p) => p,
+            None => {
+                info!("SKIP: No test binary found");
+                return;
+            }
+        };
+
+        // Very long marker that surely doesn't exist
+        let marker = "X".repeat(1024);
+        let result = binary_contains_marker(&binary_path, &marker).unwrap();
+        assert!(
+            !result,
+            "very long marker should not be found in any binary"
+        );
+    }
+
+    // ===================================================================
+    // Hash determinism verification
+    // ===================================================================
+
+    #[test]
+    fn test_full_hash_determinism() {
+        init_test_logging();
+
+        let binary_path = match find_test_binary() {
+            Some(p) => p,
+            None => return,
+        };
+
+        let result1 = compute_binary_hash(&binary_path).unwrap();
+        let result2 = compute_binary_hash(&binary_path).unwrap();
+
+        assert_eq!(
+            result1.full_hash, result2.full_hash,
+            "full_hash must be deterministic"
+        );
+        assert_eq!(
+            result1.code_hash, result2.code_hash,
+            "code_hash must be deterministic"
+        );
+        assert_eq!(
+            result1.text_section_size, result2.text_section_size,
+            "text_section_size must be deterministic"
+        );
+        assert_eq!(
+            result1.is_debug, result2.is_debug,
+            "is_debug must be deterministic"
+        );
+    }
+
+    #[test]
+    fn test_code_hash_differs_from_full_hash() {
+        init_test_logging();
+
+        let binary_path = match find_test_binary() {
+            Some(p) => p,
+            None => return,
+        };
+
+        let result = compute_binary_hash(&binary_path).unwrap();
+        assert_ne!(
+            result.code_hash, result.full_hash,
+            "code_hash should differ from full_hash (unless binary has only code sections)"
+        );
+    }
+
+    #[test]
+    fn test_text_section_size_nonzero_for_real_binary() {
+        init_test_logging();
+
+        let binary_path = match find_test_binary() {
+            Some(p) => p,
+            None => return,
+        };
+
+        let result = compute_binary_hash(&binary_path).unwrap();
+        assert!(
+            result.text_section_size > 0,
+            "real binary should have non-zero text section"
+        );
+    }
+
+    #[test]
+    fn test_hash_format_is_hex_string() {
+        init_test_logging();
+
+        let binary_path = match find_test_binary() {
+            Some(p) => p,
+            None => return,
+        };
+
+        let result = compute_binary_hash(&binary_path).unwrap();
+        assert!(
+            result.full_hash.chars().all(|c| c.is_ascii_hexdigit()),
+            "full_hash should be hex string"
+        );
+        assert!(
+            result.code_hash.chars().all(|c| c.is_ascii_hexdigit()),
+            "code_hash should be hex string"
+        );
+        // BLAKE3 produces 64-char hex (256 bits)
+        assert_eq!(
+            result.full_hash.len(),
+            64,
+            "BLAKE3 hash should be 64 hex chars"
+        );
+        assert_eq!(
+            result.code_hash.len(),
+            64,
+            "BLAKE3 hash should be 64 hex chars"
+        );
     }
 }
