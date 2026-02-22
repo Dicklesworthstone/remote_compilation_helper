@@ -231,6 +231,18 @@ run_classification_regression() {
 }
 
 # ---------------------------------------------------------------------------
+# Family: schema contract (bd-vvmd.6.8)
+# ---------------------------------------------------------------------------
+
+run_schema_contract() {
+  log "running JSON/log schema contract tests"
+  (
+    cd "$PROJECT_ROOT"
+    CARGO_TARGET_DIR=/data/tmp/cargo-target cargo test -p rch-common --test schema_contract_e2e -- --nocapture
+  )
+}
+
+# ---------------------------------------------------------------------------
 # Nightly-only families
 # ---------------------------------------------------------------------------
 
@@ -314,6 +326,7 @@ main() {
   run_family "topology_fixtures"      run_topology_fixtures
   run_family "fault_injection"           run_fault_injection
   run_family "classification_regression" run_classification_regression
+  run_family "schema_contract"           run_schema_contract
 
   # --- Nightly families (only in nightly/full mode) ---
   case "$E2E_MODE" in
