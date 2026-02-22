@@ -594,7 +594,7 @@ impl SshPool {
         let client = SshClient::new(config.clone(), self.options.clone());
         let shared_client = Arc::new(RwLock::new(client));
         connections.insert(worker_id.clone(), shared_client.clone());
-        
+
         // Drop the write lock on the entire pool before performing network I/O
         drop(connections);
 

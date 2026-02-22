@@ -95,7 +95,7 @@ pub fn mask_sensitive_command(cmd: &str) -> String {
             };
             let abs_start = search_start + start;
             let value_start = abs_start + pattern.len();
-            
+
             let rest = &result[value_start..];
             let value_end = value_start + find_value_end(rest);
 
