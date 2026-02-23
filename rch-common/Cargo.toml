@@ -65,6 +65,10 @@ harness = false
 name = "ui_bench"
 harness = false
 
+[[bench]]
+name = "reliability_bench"
+harness = false
+
 [lints.rust]
 # Use "deny" instead of "forbid" to allow tests to manipulate environment variables
 # (set_var/remove_var are unsafe in Rust 2024 edition)
