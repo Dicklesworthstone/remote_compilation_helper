@@ -166,6 +166,9 @@ fn ftui_buffer_to_string(buffer: &Buffer, pool: &GraphemePool) -> String {
             if let Some(cell) = buffer.get(x, y) {
                 if cell.content.is_continuation() {
                     continue;
+                }
+                if cell.content.is_empty() {
+                    out.push(' ');
                 } else if let Some(c) = cell.content.as_char() {
                     out.push(c);
                 } else if let Some(gid) = cell.content.grapheme_id() {

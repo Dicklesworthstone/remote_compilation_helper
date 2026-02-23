@@ -146,7 +146,9 @@ where
     );
     let mut pool = GraphemePool::new();
     let mut frame = Frame::new(area.width, area.height, &mut pool);
-    draw(&mut frame, area);
+    // Normalize to origin since the frame buffer starts at (0, 0)
+    let normalized = Rect::new(0, 0, area.width, area.height);
+    draw(&mut frame, normalized);
     buffer_to_string(&frame.buffer, &pool)
 }
 
