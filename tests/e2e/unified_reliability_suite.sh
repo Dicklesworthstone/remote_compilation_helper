@@ -231,6 +231,30 @@ run_classification_regression() {
 }
 
 # ---------------------------------------------------------------------------
+# Family: cross-worker parity (bd-vvmd.7.10)
+# ---------------------------------------------------------------------------
+
+run_cross_worker_parity() {
+  log "running cross-worker determinism/parity E2E scenarios"
+  (
+    cd "$PROJECT_ROOT"
+    CARGO_TARGET_DIR=/data/tmp/cargo-target cargo test -p rch-common --test cross_worker_parity_e2e -- --nocapture
+  )
+}
+
+# ---------------------------------------------------------------------------
+# Family: soak concurrency (bd-vvmd.7.9)
+# ---------------------------------------------------------------------------
+
+run_soak_concurrency() {
+  log "running soak concurrency E2E scenarios"
+  (
+    cd "$PROJECT_ROOT"
+    CARGO_TARGET_DIR=/data/tmp/cargo-target cargo test -p rch-common --test soak_concurrency_e2e -- --nocapture
+  )
+}
+
+# ---------------------------------------------------------------------------
 # Family: schema contract (bd-vvmd.6.8)
 # ---------------------------------------------------------------------------
 
@@ -239,6 +263,162 @@ run_schema_contract() {
   (
     cd "$PROJECT_ROOT"
     CARGO_TARGET_DIR=/data/tmp/cargo-target cargo test -p rch-common --test schema_contract_e2e -- --nocapture
+  )
+}
+
+# ---------------------------------------------------------------------------
+# Family: deterministic replay (bd-vvmd.7.12)
+# ---------------------------------------------------------------------------
+
+run_deterministic_replay() {
+  log "running deterministic replay workflow E2E scenarios"
+  (
+    cd "$PROJECT_ROOT"
+    CARGO_TARGET_DIR=/data/tmp/cargo-target cargo test -p rch-common --test deterministic_replay_e2e -- --nocapture
+  )
+}
+
+# ---------------------------------------------------------------------------
+# Family: performance budget (bd-vvmd.6.6)
+# ---------------------------------------------------------------------------
+
+run_performance_budget() {
+  log "running performance budget assertion E2E scenarios"
+  (
+    cd "$PROJECT_ROOT"
+    CARGO_TARGET_DIR=/data/tmp/cargo-target cargo test -p rch-common --test performance_budget_e2e -- --nocapture
+  )
+}
+
+# ---------------------------------------------------------------------------
+# Family: local-vs-remote parity (bd-vvmd.7.11)
+# ---------------------------------------------------------------------------
+
+run_local_remote_parity() {
+  log "running local-vs-remote parity validation E2E scenarios"
+  (
+    cd "$PROJECT_ROOT"
+    CARGO_TARGET_DIR=/data/tmp/cargo-target cargo test -p rch-common --test local_remote_parity_e2e -- --nocapture
+  )
+}
+
+# ---------------------------------------------------------------------------
+# Family: feature flags + rollout (bd-vvmd.6.7)
+# ---------------------------------------------------------------------------
+
+run_feature_flags_rollout() {
+  log "running feature flags and staged rollout E2E scenarios"
+  (
+    cd "$PROJECT_ROOT"
+    CARGO_TARGET_DIR=/data/tmp/cargo-target cargo test -p rch-common --test feature_flags_rollout_e2e -- --nocapture
+  )
+}
+
+# ---------------------------------------------------------------------------
+# Family: contract-drift compatibility (bd-vvmd.6.11)
+# ---------------------------------------------------------------------------
+
+run_contract_drift() {
+  log "running cross-project helper contract-drift compatibility E2E scenarios"
+  (
+    cd "$PROJECT_ROOT"
+    CARGO_TARGET_DIR=/data/tmp/cargo-target cargo test -p rch-common --test contract_drift_e2e -- --nocapture
+  )
+}
+
+# ---------------------------------------------------------------------------
+# Family: redaction + retention governance (bd-vvmd.6.10)
+# ---------------------------------------------------------------------------
+
+run_redaction_retention() {
+  log "running redaction and retention governance E2E scenarios"
+  (
+    cd "$PROJECT_ROOT"
+    CARGO_TARGET_DIR=/data/tmp/cargo-target cargo test -p rch-common --test redaction_retention_e2e -- --nocapture
+  )
+}
+
+# ---------------------------------------------------------------------------
+# Family: reliability doctor (bd-vvmd.6.9)
+# ---------------------------------------------------------------------------
+
+run_reliability_doctor() {
+  log "running reliability doctor E2E scenarios"
+  (
+    cd "$PROJECT_ROOT"
+    CARGO_TARGET_DIR=/data/tmp/cargo-target cargo test -p rch-common --test reliability_doctor_e2e -- --nocapture
+  )
+}
+
+# ---------------------------------------------------------------------------
+# Family: UX regression (bd-1qhj)
+# ---------------------------------------------------------------------------
+
+run_ux_regression() {
+  log "running UX regression E2E scenarios"
+  (
+    cd "$PROJECT_ROOT"
+    CARGO_TARGET_DIR=/data/tmp/cargo-target cargo test -p rch-common --test ux_regression_e2e -- --nocapture
+  )
+}
+
+# ---------------------------------------------------------------------------
+# Family: coverage matrix (bd-vvmd.7.8)
+# ---------------------------------------------------------------------------
+
+run_coverage_matrix() {
+  log "running reliability coverage matrix staleness checks"
+  (
+    cd "$PROJECT_ROOT"
+    CARGO_TARGET_DIR=/data/tmp/cargo-target cargo test -p rch-common --test reliability_coverage_matrix_e2e -- --nocapture
+  )
+}
+
+# ---------------------------------------------------------------------------
+# Family: CI test tiers (bd-vvmd.7.4)
+# ---------------------------------------------------------------------------
+
+run_ci_test_tiers() {
+  log "running CI test tier definition validation"
+  (
+    cd "$PROJECT_ROOT"
+    CARGO_TARGET_DIR=/data/tmp/cargo-target cargo test -p rch-common --test ci_test_tiers_e2e -- --nocapture
+  )
+}
+
+# ---------------------------------------------------------------------------
+# Family: SLO guardrails (bd-vvmd.6.5)
+# ---------------------------------------------------------------------------
+
+run_slo_guardrails() {
+  log "running SLO guardrail regression checks"
+  (
+    cd "$PROJECT_ROOT"
+    CARGO_TARGET_DIR=/data/tmp/cargo-target cargo test -p rch-common --test slo_guardrails_e2e -- --nocapture
+  )
+}
+
+# ---------------------------------------------------------------------------
+# Family: docs validation (bd-vvmd.6.4)
+# ---------------------------------------------------------------------------
+
+run_docs_validation() {
+  log "running documentation validation checks"
+  (
+    cd "$PROJECT_ROOT"
+    CARGO_TARGET_DIR=/data/tmp/cargo-target cargo test -p rch-common --test docs_validation_e2e -- --nocapture
+  )
+}
+
+# ---------------------------------------------------------------------------
+# Family: release gate sign-off (bd-vvmd.7.5)
+# ---------------------------------------------------------------------------
+
+run_release_gate_signoff() {
+  log "running release gate sign-off checklist"
+  (
+    cd "$PROJECT_ROOT"
+    CARGO_TARGET_DIR=/data/tmp/cargo-target cargo test -p rch-common --test release_gate_signoff_e2e -- --nocapture
   )
 }
 
@@ -260,6 +440,14 @@ run_nightly_contract_schema_deep() {
     cd "$PROJECT_ROOT"
     CARGO_TARGET_DIR=/data/tmp/cargo-target cargo test -p rch-common -- repo_updater_contract::tests --nocapture
     CARGO_TARGET_DIR=/data/tmp/cargo-target cargo test -p rch-common -- process_triage::tests --nocapture
+  )
+}
+
+run_nightly_reliability_benchmarks() {
+  log "running nightly criterion benchmarks for reliability pipeline"
+  (
+    cd "$PROJECT_ROOT"
+    CARGO_TARGET_DIR=/data/tmp/cargo-target cargo bench -p rch-common --bench reliability_bench -- --quick
   )
 }
 
@@ -327,6 +515,21 @@ main() {
   run_family "fault_injection"           run_fault_injection
   run_family "classification_regression" run_classification_regression
   run_family "schema_contract"           run_schema_contract
+  run_family "soak_concurrency"          run_soak_concurrency
+  run_family "cross_worker_parity"       run_cross_worker_parity
+  run_family "deterministic_replay"      run_deterministic_replay
+  run_family "performance_budget"       run_performance_budget
+  run_family "local_remote_parity"     run_local_remote_parity
+  run_family "redaction_retention"     run_redaction_retention
+  run_family "contract_drift"          run_contract_drift
+  run_family "feature_flags_rollout"  run_feature_flags_rollout
+  run_family "reliability_doctor"    run_reliability_doctor
+  run_family "ux_regression"         run_ux_regression
+  run_family "coverage_matrix"       run_coverage_matrix
+  run_family "ci_test_tiers"        run_ci_test_tiers
+  run_family "slo_guardrails"       run_slo_guardrails
+  run_family "docs_validation"      run_docs_validation
+  run_family "release_gate_signoff" run_release_gate_signoff
 
   # --- Nightly families (only in nightly/full mode) ---
   case "$E2E_MODE" in
@@ -336,6 +539,7 @@ main() {
     nightly|full)
       run_family "nightly_topology_deep"      run_nightly_topology_deep
       run_family "nightly_contract_schema"    run_nightly_contract_schema_deep
+      run_family "nightly_benchmarks"         run_nightly_reliability_benchmarks
       ;;
     *)
       fail "unknown RCH_E2E_MODE=$E2E_MODE (expected smoke|nightly|full)"
