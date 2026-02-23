@@ -60,9 +60,16 @@ pulldown-cmark = { workspace = true }
 # Rich terminal output (optional)
 rich_rust = { workspace = true, optional = true }
 
-# TUI (Terminal User Interface)
-ratatui = { workspace = true }
-crossterm = { workspace = true }
+# TUI (Terminal User Interface) — FrankenTUI native stack
+ftui = { workspace = true }
+ftui-core = { workspace = true }
+ftui-render = { workspace = true }
+ftui-style = { workspace = true }
+ftui-text = { workspace = true }
+ftui-layout = { workspace = true }
+ftui-widgets = { workspace = true }
+ftui-tty = { workspace = true }
+ftui-backend = { workspace = true }
 
 # Interactive CLI prompts
 dialoguer = { workspace = true }

@@ -114,9 +114,16 @@ console = "0.16.2"
 # Markdown rendering
 pulldown-cmark = "0.13"
 
-# TUI (Terminal User Interface)
-ratatui = "0.30.0"
-crossterm = "0.29"
+# TUI (Terminal User Interface) — FrankenTUI native stack
+ftui = { path = "/dp/frankentui/crates/ftui", default-features = false, features = ["runtime"] }
+ftui-core = { path = "/dp/frankentui/crates/ftui-core" }
+ftui-render = { path = "/dp/frankentui/crates/ftui-render" }
+ftui-style = { path = "/dp/frankentui/crates/ftui-style" }
+ftui-text = { path = "/dp/frankentui/crates/ftui-text" }
+ftui-layout = { path = "/dp/frankentui/crates/ftui-layout" }
+ftui-widgets = { path = "/dp/frankentui/crates/ftui-widgets" }
+ftui-tty = { path = "/dp/frankentui/crates/ftui-tty" }
+ftui-backend = { path = "/dp/frankentui/crates/ftui-backend" }
 
 # Rich terminal output (optional, for enhanced UI)
 rich_rust = { version = "0.2.0", features = ["full"] }
