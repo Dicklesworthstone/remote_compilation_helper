@@ -1,6 +1,6 @@
 //! TUI test harness utilities.
 //!
-//! Provides test terminal creation, rendering utilities, and assertion helpers
+//! Provides test rendering utilities and assertion helpers
 //! for testing TUI components without a real terminal.
 //!
 //! # Example
@@ -14,57 +14,65 @@
 //! assert_rendered_contains(&content, "RCH Dashboard");
 //! ```
 
-use ratatui::Terminal;
-use ratatui::backend::TestBackend;
-use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
-use ratatui::prelude::*;
+use ftui::Frame;
+use ftui_core::geometry::Rect;
+use ftui_render::buffer::Buffer;
+use ftui_render::cell::Cell;
+use ftui_render::grapheme_pool::GraphemePool;
 use tracing::{debug, info};
 
-/// Create a test terminal with the given dimensions.
+/// Create a test buffer with the given dimensions and a fresh GraphemePool.
 ///
-/// Returns a terminal backed by a `TestBackend` that can be used
-/// for rendering TUI components in tests.
+/// Returns a (Buffer, GraphemePool) pair for use in tests that need
+/// direct buffer manipulation without rendering.
 ///
 /// # Arguments
 ///
-/// * `width` - Terminal width in columns
-/// * `height` - Terminal height in rows
-///
-/// # Example
-///
-/// ```ignore
-/// let mut terminal = create_test_terminal(80, 24);
-/// terminal.draw(|f| widgets::render(f, &state)).unwrap();
-/// ```
-pub fn create_test_terminal(width: u16, height: u16) -> Terminal<TestBackend> {
-    debug!("TEST HARNESS: creating test terminal {}x{}", width, height);
-    let backend = TestBackend::new(width, height);
-    Terminal::new(backend).expect("failed to create test terminal")
+/// * `width` - Buffer width in columns
+/// * `height` - Buffer height in rows
+pub fn create_test_buffer(width: u16, height: u16) -> (Buffer, GraphemePool) {
+    debug!("TEST HARNESS: creating test buffer {}x{}", width, height);
+    (Buffer::new(width, height), GraphemePool::new())
 }
 
-/// Convert a ratatui buffer to a string representation.
+/// Convert an ftui buffer to a string representation.
 ///
-/// Iterates through each cell of the buffer, extracting the symbol
-/// and concatenating with newlines between rows. This is useful for
-/// asserting on rendered content.
+/// Iterates through each cell of the buffer, extracting the character content
+/// and concatenating with newlines between rows. Handles both direct chars
+/// and grapheme pool references for multi-codepoint clusters.
 ///
 /// # Arguments
 ///
-/// * `buffer` - The ratatui buffer to convert
+/// * `buffer` - The ftui buffer to convert
+/// * `pool` - The grapheme pool for resolving grapheme IDs
 ///
 /// # Returns
 ///
 /// A string representation of the buffer contents, with newlines
 /// between each row.
-pub fn buffer_to_string(buffer: &Buffer) -> String {
+pub fn buffer_to_string(buffer: &Buffer, pool: &GraphemePool) -> String {
     let mut out = String::new();
-    let width = buffer.area.width;
-    let height = buffer.area.height;
+    let width = buffer.width();
+    let height = buffer.height();
     for y in 0..height {
         for x in 0..width {
-            if let Some(cell) = buffer.cell((x, y)) {
-                out.push_str(cell.symbol());
+            if let Some(cell) = buffer.get(x, y) {
+                if cell.content.is_continuation() {
+                    continue;
+                }
+                if cell.content.is_empty() {
+                    out.push(' ');
+                } else if let Some(ch) = cell.content.as_char() {
+                    out.push(ch);
+                } else if let Some(id) = cell.content.grapheme_id() {
+                    if let Some(s) = pool.get(id) {
+                        out.push_str(s);
+                    } else {
+                        out.push(' ');
+                    }
+                } else {
+                    out.push(' ');
+                }
             } else {
                 out.push(' ');
             }
@@ -74,9 +82,16 @@ pub fn buffer_to_string(buffer: &Buffer) -> String {
     out
 }
 
+/// Write a string into a buffer at the given position, one char per cell.
+fn set_string_in_buffer(buffer: &mut Buffer, x: u16, y: u16, s: &str) {
+    for (i, ch) in s.chars().enumerate() {
+        buffer.set(x + i as u16, y, Cell::from_char(ch));
+    }
+}
+
 /// Render a TUI component to a string for testing.
 ///
-/// Creates a test terminal, invokes the draw function, and returns
+/// Creates a test frame, invokes the draw function, and returns
 /// the rendered content as a string.
 ///
 /// # Arguments
@@ -98,10 +113,10 @@ where
     F: FnMut(&mut Frame),
 {
     debug!("TEST HARNESS: render_to_string {}x{}", width, height);
-    let backend = TestBackend::new(width, height);
-    let mut terminal = Terminal::new(backend).unwrap();
-    terminal.draw(|f| draw(f)).unwrap();
-    buffer_to_string(terminal.backend().buffer())
+    let mut pool = GraphemePool::new();
+    let mut frame = Frame::new(width, height, &mut pool);
+    draw(&mut frame);
+    buffer_to_string(&frame.buffer, &pool)
 }
 
 /// Render a TUI component at a specific rectangular region.
@@ -129,21 +144,16 @@ where
         "TEST HARNESS: render_to_area x={} y={} w={} h={}",
         area.x, area.y, area.width, area.height
     );
-    let backend = TestBackend::new(area.width, area.height);
-    let mut terminal = Terminal::new(backend).unwrap();
-    terminal.draw(|f| draw(f, area)).unwrap();
-    buffer_to_string(terminal.backend().buffer())
+    let mut pool = GraphemePool::new();
+    let mut frame = Frame::new(area.width, area.height, &mut pool);
+    draw(&mut frame, area);
+    buffer_to_string(&frame.buffer, &pool)
 }
 
 /// Assert that rendered content contains an expected substring.
 ///
 /// Provides detailed logging on assertion failure, showing what was
 /// expected and what the actual content was.
-///
-/// # Arguments
-///
-/// * `content` - The rendered content string
-/// * `expected` - The substring that should be present
 ///
 /// # Panics
 ///
@@ -164,13 +174,6 @@ pub fn assert_rendered_contains(content: &str, expected: &str) {
 }
 
 /// Assert that rendered content does NOT contain a substring.
-///
-/// Useful for verifying that certain elements are hidden or removed.
-///
-/// # Arguments
-///
-/// * `content` - The rendered content string
-/// * `unexpected` - The substring that should NOT be present
 ///
 /// # Panics
 ///
@@ -194,13 +197,6 @@ pub fn assert_rendered_not_contains(content: &str, unexpected: &str) {
 }
 
 /// Assert that rendered content matches multiple expectations.
-///
-/// Convenience function for checking multiple substrings at once.
-///
-/// # Arguments
-///
-/// * `content` - The rendered content string
-/// * `expected` - Slice of substrings that should all be present
 ///
 /// # Panics
 ///
@@ -244,9 +240,6 @@ pub fn init_test_logging() {
 
 /// Snapshot a TUI state rendering for comparison or visual inspection.
 ///
-/// Creates a snapshot of the rendered state at the specified dimensions.
-/// Useful for debugging test failures by examining the actual output.
-///
 /// # Arguments
 ///
 /// * `state` - The TuiState to render
@@ -263,48 +256,47 @@ pub fn snapshot_state(state: &super::TuiState, width: u16, height: u16) -> Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ftui_widgets::Widget;
+    use ftui_widgets::block::Block;
+    use ftui_widgets::borders::Borders;
     use tracing::info;
 
     #[test]
-    fn test_create_test_terminal_default_size() {
+    fn test_create_test_buffer_default_size() {
         init_test_logging();
-        info!("TEST START: test_create_test_terminal_default_size");
-        let terminal = create_test_terminal(80, 24);
-        let size = terminal.size().unwrap();
-        assert_eq!(size.width, 80);
-        assert_eq!(size.height, 24);
-        info!("TEST PASS: test_create_test_terminal_default_size");
+        info!("TEST START: test_create_test_buffer_default_size");
+        let (buffer, _pool) = create_test_buffer(80, 24);
+        assert_eq!(buffer.width(), 80);
+        assert_eq!(buffer.height(), 24);
+        info!("TEST PASS: test_create_test_buffer_default_size");
     }
 
     #[test]
-    fn test_create_test_terminal_custom_size() {
+    fn test_create_test_buffer_custom_size() {
         init_test_logging();
-        info!("TEST START: test_create_test_terminal_custom_size");
-        let terminal = create_test_terminal(120, 40);
-        let size = terminal.size().unwrap();
-        assert_eq!(size.width, 120);
-        assert_eq!(size.height, 40);
-        info!("TEST PASS: test_create_test_terminal_custom_size");
+        info!("TEST START: test_create_test_buffer_custom_size");
+        let (buffer, _pool) = create_test_buffer(120, 40);
+        assert_eq!(buffer.width(), 120);
+        assert_eq!(buffer.height(), 40);
+        info!("TEST PASS: test_create_test_buffer_custom_size");
     }
 
     #[test]
-    fn test_create_test_terminal_minimum_size() {
+    fn test_create_test_buffer_minimum_size() {
         init_test_logging();
-        info!("TEST START: test_create_test_terminal_minimum_size");
-        let terminal = create_test_terminal(1, 1);
-        let size = terminal.size().unwrap();
-        assert_eq!(size.width, 1);
-        assert_eq!(size.height, 1);
-        info!("TEST PASS: test_create_test_terminal_minimum_size");
+        info!("TEST START: test_create_test_buffer_minimum_size");
+        let (buffer, _pool) = create_test_buffer(1, 1);
+        assert_eq!(buffer.width(), 1);
+        assert_eq!(buffer.height(), 1);
+        info!("TEST PASS: test_create_test_buffer_minimum_size");
     }
 
     #[test]
     fn test_buffer_to_string_empty() {
         init_test_logging();
         info!("TEST START: test_buffer_to_string_empty");
-        let rect = Rect::new(0, 0, 5, 2);
-        let buffer = Buffer::empty(rect);
-        let result = buffer_to_string(&buffer);
+        let (buffer, pool) = create_test_buffer(5, 2);
+        let result = buffer_to_string(&buffer, &pool);
         info!("VERIFY: buffer lines count = {}", result.lines().count());
         assert_eq!(result.lines().count(), 2);
         assert!(result.lines().all(|l| l.len() == 5));
@@ -315,10 +307,9 @@ mod tests {
     fn test_buffer_to_string_with_content() {
         init_test_logging();
         info!("TEST START: test_buffer_to_string_with_content");
-        let rect = Rect::new(0, 0, 10, 1);
-        let mut buffer = Buffer::empty(rect);
-        buffer.set_string(0, 0, "Hello", Style::default());
-        let result = buffer_to_string(&buffer);
+        let (mut buffer, pool) = create_test_buffer(10, 1);
+        set_string_in_buffer(&mut buffer, 0, 0, "Hello");
+        let result = buffer_to_string(&buffer, &pool);
         info!("VERIFY: buffer contains Hello: {}", result.trim());
         assert!(result.contains("Hello"));
         info!("TEST PASS: test_buffer_to_string_with_content");
@@ -328,12 +319,11 @@ mod tests {
     fn test_buffer_to_string_multiline() {
         init_test_logging();
         info!("TEST START: test_buffer_to_string_multiline");
-        let rect = Rect::new(0, 0, 10, 3);
-        let mut buffer = Buffer::empty(rect);
-        buffer.set_string(0, 0, "Line 1", Style::default());
-        buffer.set_string(0, 1, "Line 2", Style::default());
-        buffer.set_string(0, 2, "Line 3", Style::default());
-        let result = buffer_to_string(&buffer);
+        let (mut buffer, pool) = create_test_buffer(10, 3);
+        set_string_in_buffer(&mut buffer, 0, 0, "Line 1");
+        set_string_in_buffer(&mut buffer, 0, 1, "Line 2");
+        set_string_in_buffer(&mut buffer, 0, 2, "Line 3");
+        let result = buffer_to_string(&buffer, &pool);
         info!("VERIFY: buffer has 3 lines");
         assert!(result.contains("Line 1"));
         assert!(result.contains("Line 2"));
@@ -347,10 +337,10 @@ mod tests {
         init_test_logging();
         info!("TEST START: test_render_to_string_basic");
         let content = render_to_string(20, 5, |f| {
-            let block = ratatui::widgets::Block::default()
+            let block = Block::new()
                 .title("Test")
-                .borders(ratatui::widgets::Borders::ALL);
-            f.render_widget(block, f.area());
+                .borders(Borders::ALL);
+            block.render(f.bounds(), f);
         });
         info!("VERIFY: rendered content contains title");
         assert!(content.contains("Test"));
@@ -363,10 +353,10 @@ mod tests {
         info!("TEST START: test_render_to_string_at_various_sizes");
         for (w, h) in [(40, 12), (80, 24), (120, 40)] {
             let content = render_to_string(w, h, |f| {
-                let block = ratatui::widgets::Block::default()
+                let block = Block::new()
                     .title("Size Test")
-                    .borders(ratatui::widgets::Borders::ALL);
-                f.render_widget(block, f.area());
+                    .borders(Borders::ALL);
+                block.render(f.bounds(), f);
             });
             info!(
                 "VERIFY: render {}x{} produces {} lines",
@@ -385,10 +375,10 @@ mod tests {
         info!("TEST START: test_render_to_area");
         let area = Rect::new(0, 0, 30, 5);
         let content = render_to_area(area, |f, rect| {
-            let block = ratatui::widgets::Block::default()
+            let block = Block::new()
                 .title("Area")
-                .borders(ratatui::widgets::Borders::ALL);
-            f.render_widget(block, rect);
+                .borders(Borders::ALL);
+            block.render(rect, f);
         });
         info!("VERIFY: rendered area contains title");
         assert!(content.contains("Area"));

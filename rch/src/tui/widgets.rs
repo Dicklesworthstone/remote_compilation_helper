@@ -6,19 +6,41 @@ use crate::tui::state::{
     BuildStatus, CircuitState, ColorBlindMode, ConfirmDialog, Panel, TuiState, WorkerStatus,
 };
 use crate::ui::theme::{StatusIndicator, Symbols};
-use ratatui::{
-    Frame,
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
-    text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
-};
+use ftui::Frame;
+use ftui_core::geometry::Rect;
+use ftui_layout::{Constraint, Flex};
+use ftui_render::cell::PackedRgba;
+use ftui_style::Style;
+use ftui_text::{Line, Span, WrapMode};
+use ftui_widgets::Widget;
+use ftui_widgets::block::{Alignment, Block};
+use ftui_widgets::borders::Borders;
+use ftui_widgets::list::{List, ListItem};
+use ftui_widgets::paragraph::Paragraph;
+
+// ANSI 16 color palette as PackedRgba constants
+const C_WHITE: PackedRgba = PackedRgba::rgb(255, 255, 255);
+const C_BLACK: PackedRgba = PackedRgba::rgb(0, 0, 0);
+const C_RED: PackedRgba = PackedRgba::rgb(205, 0, 0);
+const C_GREEN: PackedRgba = PackedRgba::rgb(0, 205, 0);
+const C_YELLOW: PackedRgba = PackedRgba::rgb(205, 205, 0);
+const C_BLUE: PackedRgba = PackedRgba::rgb(0, 0, 238);
+const C_CYAN: PackedRgba = PackedRgba::rgb(0, 205, 205);
+const C_DARK_GRAY: PackedRgba = PackedRgba::rgb(85, 85, 85);
+const C_GRAY: PackedRgba = PackedRgba::rgb(170, 170, 170);
+const C_LIGHT_GREEN: PackedRgba = PackedRgba::rgb(85, 255, 85);
+const C_LIGHT_YELLOW: PackedRgba = PackedRgba::rgb(255, 255, 85);
+const C_LIGHT_RED: PackedRgba = PackedRgba::rgb(255, 85, 85);
+const C_LIGHT_CYAN: PackedRgba = PackedRgba::rgb(85, 255, 255);
+const C_LIGHT_MAGENTA: PackedRgba = PackedRgba::rgb(255, 85, 255);
+const C_LIGHT_BLUE: PackedRgba = PackedRgba::rgb(85, 85, 255);
+const C_RESET: PackedRgba = PackedRgba::TRANSPARENT;
 
 /// Standard unicode symbols shared with the CLI for consistent display.
 const SYMBOLS: Symbols = Symbols::UNICODE;
 
-/// Get the ratatui color for a StatusIndicator from the TUI color scheme.
-fn indicator_color(indicator: StatusIndicator, colors: &ColorScheme) -> Color {
+/// Get the PackedRgba color for a StatusIndicator from the TUI color scheme.
+fn indicator_color(indicator: StatusIndicator, colors: &ColorScheme) -> PackedRgba {
     match indicator {
         StatusIndicator::Success => colors.success,
         StatusIndicator::Error => colors.error,
@@ -33,71 +55,71 @@ fn indicator_color(indicator: StatusIndicator, colors: &ColorScheme) -> Color {
 fn get_colors(high_contrast: bool, color_blind: ColorBlindMode) -> ColorScheme {
     if high_contrast {
         return ColorScheme {
-            fg: Color::White,
-            bg: Color::Black,
-            highlight: Color::Yellow,
-            success: Color::LightGreen,
-            warning: Color::LightYellow,
-            error: Color::LightRed,
-            info: Color::LightCyan,
-            muted: Color::Gray,
-            selected_bg: Color::White,
-            selected_fg: Color::Black,
+            fg: C_WHITE,
+            bg: C_BLACK,
+            highlight: C_YELLOW,
+            success: C_LIGHT_GREEN,
+            warning: C_LIGHT_YELLOW,
+            error: C_LIGHT_RED,
+            info: C_LIGHT_CYAN,
+            muted: C_GRAY,
+            selected_bg: C_WHITE,
+            selected_fg: C_BLACK,
         };
     }
 
     match color_blind {
         ColorBlindMode::None => ColorScheme {
-            fg: Color::White,
-            bg: Color::Reset,
-            highlight: Color::Cyan,
-            success: Color::Green,
-            warning: Color::Yellow,
-            error: Color::Red,
-            info: Color::Blue,
-            muted: Color::DarkGray,
-            selected_bg: Color::DarkGray,
-            selected_fg: Color::White,
+            fg: C_WHITE,
+            bg: C_RESET,
+            highlight: C_CYAN,
+            success: C_GREEN,
+            warning: C_YELLOW,
+            error: C_RED,
+            info: C_BLUE,
+            muted: C_DARK_GRAY,
+            selected_bg: C_DARK_GRAY,
+            selected_fg: C_WHITE,
         },
         ColorBlindMode::Deuteranopia | ColorBlindMode::Protanopia => ColorScheme {
-            fg: Color::White,
-            bg: Color::Reset,
-            highlight: Color::LightCyan,
-            success: Color::LightCyan,
-            warning: Color::Yellow,
-            error: Color::LightMagenta,
-            info: Color::LightBlue,
-            muted: Color::DarkGray,
-            selected_bg: Color::DarkGray,
-            selected_fg: Color::White,
+            fg: C_WHITE,
+            bg: C_RESET,
+            highlight: C_LIGHT_CYAN,
+            success: C_LIGHT_CYAN,
+            warning: C_YELLOW,
+            error: C_LIGHT_MAGENTA,
+            info: C_LIGHT_BLUE,
+            muted: C_DARK_GRAY,
+            selected_bg: C_DARK_GRAY,
+            selected_fg: C_WHITE,
         },
         ColorBlindMode::Tritanopia => ColorScheme {
-            fg: Color::White,
-            bg: Color::Reset,
-            highlight: Color::LightMagenta,
-            success: Color::LightGreen,
-            warning: Color::LightRed,
-            error: Color::Red,
-            info: Color::LightCyan,
-            muted: Color::DarkGray,
-            selected_bg: Color::DarkGray,
-            selected_fg: Color::White,
+            fg: C_WHITE,
+            bg: C_RESET,
+            highlight: C_LIGHT_MAGENTA,
+            success: C_LIGHT_GREEN,
+            warning: C_LIGHT_RED,
+            error: C_RED,
+            info: C_LIGHT_CYAN,
+            muted: C_DARK_GRAY,
+            selected_bg: C_DARK_GRAY,
+            selected_fg: C_WHITE,
         },
     }
 }
 
 struct ColorScheme {
-    fg: Color,
+    fg: PackedRgba,
     #[allow(dead_code)]
-    bg: Color,
-    highlight: Color,
-    success: Color,
-    warning: Color,
-    error: Color,
-    info: Color,
-    muted: Color,
-    selected_bg: Color,
-    selected_fg: Color,
+    bg: PackedRgba,
+    highlight: PackedRgba,
+    success: PackedRgba,
+    warning: PackedRgba,
+    error: PackedRgba,
+    info: PackedRgba,
+    muted: PackedRgba,
+    selected_bg: PackedRgba,
+    selected_fg: PackedRgba,
 }
 
 /// Render the main dashboard layout.
@@ -107,26 +129,24 @@ pub fn render(frame: &mut Frame, state: &TuiState) {
     let has_detail = state.show_detail && state.selected_detail().is_some();
 
     let chunks = if has_detail {
-        Layout::default()
-            .direction(Direction::Vertical)
-            .margin(1)
+        Flex::vertical()
+            .margin(ftui_core::geometry::Sides::all(1))
             .constraints([
-                Constraint::Length(3), // Header
+                Constraint::Fixed(3), // Header
                 Constraint::Min(10),   // Main content
-                Constraint::Length(3), // Detail bar
-                Constraint::Length(3), // Footer
+                Constraint::Fixed(3), // Detail bar
+                Constraint::Fixed(3), // Footer
             ])
-            .split(frame.area())
+            .split(frame.bounds())
     } else {
-        Layout::default()
-            .direction(Direction::Vertical)
-            .margin(1)
+        Flex::vertical()
+            .margin(ftui_core::geometry::Sides::all(1))
             .constraints([
-                Constraint::Length(3), // Header
+                Constraint::Fixed(3), // Header
                 Constraint::Min(10),   // Main content
-                Constraint::Length(3), // Footer
+                Constraint::Fixed(3), // Footer
             ])
-            .split(frame.area())
+            .split(frame.bounds())
     };
 
     render_header(frame, chunks[0], state, &colors);
@@ -167,7 +187,7 @@ pub fn render(frame: &mut Frame, state: &TuiState) {
 
 /// Render filter input overlay.
 fn render_filter_input(frame: &mut Frame, state: &TuiState, colors: &ColorScheme) {
-    let area = frame.area();
+    let area = frame.bounds();
     // Position at bottom of screen, above footer
     let width = 50.min(area.width.saturating_sub(4));
     let x = (area.width.saturating_sub(width)) / 2;
@@ -175,28 +195,28 @@ fn render_filter_input(frame: &mut Frame, state: &TuiState, colors: &ColorScheme
     let input_area = Rect::new(x, y, width, 3);
 
     // Clear the area behind the overlay
-    frame.render_widget(Clear, input_area);
+    frame.buffer.fill(input_area, ftui_render::cell::Cell::default());
 
     // Show search query with cursor indicator
     let cursor = "█";
     let input_text = format!("/{}{}", state.filter.query, cursor);
-    let input = Paragraph::new(Line::from(vec![
-        Span::styled("Search: ", Style::default().fg(colors.highlight)),
-        Span::styled(input_text, Style::default().fg(colors.fg)),
+    let input = Paragraph::new(Line::from_spans(vec![
+        Span::styled("Search: ", Style::new().fg(colors.highlight)),
+        Span::styled(input_text, Style::new().fg(colors.fg)),
     ]))
     .block(
-        Block::default()
+        Block::new()
             .borders(Borders::ALL)
             .title("Filter Build History (Enter to apply, Esc to cancel)")
-            .border_style(Style::default().fg(colors.highlight)),
+            .border_style(Style::new().fg(colors.highlight)),
     );
 
-    frame.render_widget(input, input_area);
+    input.render(input_area, frame);
 }
 
 /// Render a centered confirmation dialog for destructive actions.
 fn render_confirm_dialog(frame: &mut Frame, dialog: &ConfirmDialog, colors: &ColorScheme) {
-    let area = frame.area();
+    let area = frame.bounds();
     // Calculate dialog dimensions based on content
     let msg_lines: Vec<&str> = dialog.message.lines().collect();
     let content_width = dialog
@@ -212,49 +232,49 @@ fn render_confirm_dialog(frame: &mut Frame, dialog: &ConfirmDialog, colors: &Col
     let y = (area.height.saturating_sub(height)) / 2;
     let dialog_area = Rect::new(x, y, width, height);
 
-    frame.render_widget(Clear, dialog_area);
+    frame.buffer.fill(dialog_area, ftui_render::cell::Cell::default());
 
     let mut lines = vec![
         Line::from(Span::styled(
             &dialog.title,
-            Style::default()
+            Style::new()
                 .fg(colors.warning)
-                .add_modifier(Modifier::BOLD),
+                .bold(),
         )),
         Line::from(""),
     ];
     for msg_line in &msg_lines {
         lines.push(Line::from(Span::styled(
             *msg_line,
-            Style::default().fg(colors.fg),
+            Style::new().fg(colors.fg),
         )));
     }
     lines.push(Line::from(""));
-    lines.push(Line::from(vec![
-        Span::styled("      [", Style::default().fg(colors.muted)),
+    lines.push(Line::from_spans(vec![
+        Span::styled("      [", Style::new().fg(colors.muted)),
         Span::styled(
             "Y",
-            Style::default()
+            Style::new()
                 .fg(colors.success)
-                .add_modifier(Modifier::BOLD),
+                .bold(),
         ),
-        Span::styled("]es    [", Style::default().fg(colors.muted)),
+        Span::styled("]es    [", Style::new().fg(colors.muted)),
         Span::styled(
             "N",
-            Style::default()
+            Style::new()
                 .fg(colors.error)
-                .add_modifier(Modifier::BOLD),
+                .bold(),
         ),
-        Span::styled("]o", Style::default().fg(colors.muted)),
+        Span::styled("]o", Style::new().fg(colors.muted)),
     ]));
 
-    let confirm_widget = Paragraph::new(lines).block(
-        Block::default()
+    let confirm_widget = Paragraph::new(ftui_text::Text::from_lines(lines)).block(
+        Block::new()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(colors.warning)),
+            .border_style(Style::new().fg(colors.warning)),
     );
 
-    frame.render_widget(confirm_widget, dialog_area);
+    confirm_widget.render(dialog_area, frame);
 }
 
 /// Render the header with daemon status.
@@ -277,14 +297,14 @@ fn render_header(frame: &mut Frame, area: Rect, state: &TuiState, colors: &Color
         crate::tui::state::Status::Stopped => colors.warning,
         _ => indicator_color(status_indicator, colors),
     };
-    let status_style = Style::default().fg(status_color);
+    let status_style = Style::new().fg(status_color);
 
-    let header = Paragraph::new(Line::from(vec![
+    let header = Paragraph::new(Line::from_spans(vec![
         Span::styled(
             "RCH Dashboard",
-            Style::default()
+            Style::new()
                 .fg(colors.highlight)
-                .add_modifier(Modifier::BOLD),
+                .bold(),
         ),
         Span::raw(" | "),
         Span::styled(status_text, status_style),
@@ -295,12 +315,12 @@ fn render_header(frame: &mut Frame, area: Rect, state: &TuiState, colors: &Color
                 state.workers.len(),
                 state.active_builds.len()
             ),
-            Style::default().fg(colors.fg),
+            Style::new().fg(colors.fg),
         ),
     ]))
-    .block(Block::default().borders(Borders::ALL).title("Status"));
+    .block(Block::new().borders(Borders::ALL).title("Status"));
 
-    frame.render_widget(header, area);
+    header.render(area, frame);
 }
 
 /// Render the main content area with panels.
@@ -311,21 +331,19 @@ fn render_main_content(frame: &mut Frame, area: Rect, state: &TuiState, colors: 
         return;
     }
 
-    let chunks = Layout::default()
-        .direction(Direction::Horizontal)
+    let chunks = Flex::horizontal()
         .constraints([
-            Constraint::Percentage(40), // Workers
-            Constraint::Percentage(60), // Builds
+            Constraint::Percentage(40.0), // Workers
+            Constraint::Percentage(60.0), // Builds
         ])
         .split(area);
 
     render_workers_panel(frame, chunks[0], state, colors);
 
-    let build_chunks = Layout::default()
-        .direction(Direction::Vertical)
+    let build_chunks = Flex::vertical()
         .constraints([
-            Constraint::Percentage(50), // Active builds
-            Constraint::Percentage(50), // Build history
+            Constraint::Percentage(50.0), // Active builds
+            Constraint::Percentage(50.0), // Build history
         ])
         .split(chunks[1]);
 
@@ -337,9 +355,9 @@ fn render_main_content(frame: &mut Frame, area: Rect, state: &TuiState, colors: 
 fn render_workers_panel(frame: &mut Frame, area: Rect, state: &TuiState, colors: &ColorScheme) {
     let is_selected = state.selected_panel == Panel::Workers;
     let border_style = if is_selected {
-        Style::default().fg(colors.highlight)
+        Style::new().fg(colors.highlight)
     } else {
-        Style::default()
+        Style::new()
     };
 
     let items: Vec<ListItem> = state
@@ -381,20 +399,20 @@ fn render_workers_panel(frame: &mut Frame, area: Rect, state: &TuiState, colors:
             };
 
             let style = if is_selected && i == state.selected_index {
-                Style::default()
+                Style::new()
                     .bg(colors.selected_bg)
                     .fg(colors.selected_fg)
             } else {
-                Style::default()
+                Style::new()
             };
 
-            ListItem::new(Line::from(vec![
-                Span::styled(status_icon, Style::default().fg(status_color)),
+            ListItem::new(Line::from_spans(vec![
+                Span::styled(status_icon, Style::new().fg(status_color)),
                 Span::raw(" "),
                 Span::raw(&w.id),
                 Span::styled(
                     format!(" ({}/{})", w.used_slots, w.total_slots),
-                    Style::default().fg(colors.muted),
+                    Style::new().fg(colors.muted),
                 ),
                 Span::raw(circuit_icon),
             ]))
@@ -403,13 +421,13 @@ fn render_workers_panel(frame: &mut Frame, area: Rect, state: &TuiState, colors:
         .collect();
 
     let list = List::new(items).block(
-        Block::default()
+        Block::new()
             .borders(Borders::ALL)
             .title("Workers")
             .border_style(border_style),
     );
 
-    frame.render_widget(list, area);
+    list.render(area, frame);
 }
 
 /// Render active builds panel.
@@ -421,9 +439,9 @@ fn render_active_builds_panel(
 ) {
     let is_selected = state.selected_panel == Panel::ActiveBuilds;
     let border_style = if is_selected {
-        Style::default().fg(colors.highlight)
+        Style::new().fg(colors.highlight)
     } else {
-        Style::default()
+        Style::new()
     };
 
     let items: Vec<ListItem> = state
@@ -456,22 +474,22 @@ fn render_active_builds_panel(
                 .unwrap_or_default();
 
             let style = if is_selected && i == state.selected_index {
-                Style::default()
+                Style::new()
                     .bg(colors.selected_bg)
                     .fg(colors.selected_fg)
             } else {
-                Style::default()
+                Style::new()
             };
 
             // Truncate command for display (preserves important flags)
             let cmd = truncate_command(&b.command, 40);
 
-            ListItem::new(Line::from(vec![
+            ListItem::new(Line::from_spans(vec![
                 Span::raw(status_icon),
                 Span::raw(" "),
                 Span::raw(cmd),
-                Span::styled(worker, Style::default().fg(colors.info)),
-                Span::styled(progress, Style::default().fg(colors.muted)),
+                Span::styled(worker, Style::new().fg(colors.info)),
+                Span::styled(progress, Style::new().fg(colors.muted)),
             ]))
             .style(style)
         })
@@ -484,13 +502,13 @@ fn render_active_builds_panel(
     };
 
     let list = List::new(items).block(
-        Block::default()
+        Block::new()
             .borders(Borders::ALL)
             .title(title)
             .border_style(border_style),
     );
 
-    frame.render_widget(list, area);
+    list.render(area, frame);
 }
 
 /// Render build history panel.
@@ -502,9 +520,9 @@ fn render_build_history_panel(
 ) {
     let is_selected = state.selected_panel == Panel::BuildHistory;
     let border_style = if is_selected {
-        Style::default().fg(colors.highlight)
+        Style::new().fg(colors.highlight)
     } else {
-        Style::default()
+        Style::new()
     };
 
     // Use filtered history if filter is active
@@ -527,11 +545,11 @@ fn render_build_history_panel(
             let status_color = indicator_color(build_indicator, colors);
 
             let style = if is_selected && i == state.selected_index {
-                Style::default()
+                Style::new()
                     .bg(colors.selected_bg)
                     .fg(colors.selected_fg)
             } else {
-                Style::default()
+                Style::new()
             };
 
             let duration = format_duration_ms(b.duration_ms);
@@ -540,15 +558,15 @@ fn render_build_history_panel(
             // Truncate command (preserves important flags)
             let cmd = truncate_command(&b.command, 30);
 
-            ListItem::new(Line::from(vec![
-                Span::styled(status_icon, Style::default().fg(status_color)),
+            ListItem::new(Line::from_spans(vec![
+                Span::styled(status_icon, Style::new().fg(status_color)),
                 Span::raw(" "),
                 Span::raw(cmd),
                 Span::raw(" @ "),
-                Span::styled(worker, Style::default().fg(colors.highlight)),
+                Span::styled(worker, Style::new().fg(colors.highlight)),
                 Span::styled(
                     format!(" ({})", duration),
-                    Style::default().fg(colors.muted),
+                    Style::new().fg(colors.muted),
                 ),
             ]))
             .style(style)
@@ -573,13 +591,13 @@ fn render_build_history_panel(
     };
 
     let list = List::new(items).block(
-        Block::default()
+        Block::new()
             .borders(Borders::ALL)
-            .title(title)
+            .title(title.as_str())
             .border_style(border_style),
     );
 
-    frame.render_widget(list, area);
+    list.render(area, frame);
 }
 
 /// Format duration in human-readable form.
@@ -654,15 +672,15 @@ fn render_detail_bar(frame: &mut Frame, area: Rect, state: &TuiState, colors: &C
     let detail = state.selected_detail().unwrap_or_default();
     let paragraph = Paragraph::new(Line::from(Span::styled(
         detail,
-        Style::default().fg(colors.fg),
+        Style::new().fg(colors.fg),
     )))
     .block(
-        Block::default()
+        Block::new()
             .borders(Borders::ALL)
             .title("Selected")
-            .border_style(Style::default().fg(colors.muted)),
+            .border_style(Style::new().fg(colors.muted)),
     );
-    frame.render_widget(paragraph, area);
+    paragraph.render(area, frame);
 }
 
 /// Render the footer with help hints.
@@ -688,26 +706,26 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &TuiState, colors: &Color
             vec![
                 Span::styled(
                     *key,
-                    Style::default()
+                    Style::new()
                         .fg(colors.highlight)
-                        .add_modifier(Modifier::BOLD),
+                        .bold(),
                 ),
                 Span::raw(": "),
-                Span::styled(*desc, Style::default().fg(colors.fg)),
+                Span::styled(*desc, Style::new().fg(colors.fg)),
                 Span::raw(" | "),
             ]
         })
         .collect();
 
-    let footer = Paragraph::new(Line::from(spans))
-        .block(Block::default().borders(Borders::ALL).title("Controls"));
+    let footer = Paragraph::new(Line::from_spans(spans))
+        .block(Block::new().borders(Borders::ALL).title("Controls"));
 
-    frame.render_widget(footer, area);
+    footer.render(area, frame);
 }
 
 /// Render the help overlay.
 fn render_help_overlay(frame: &mut Frame, colors: &ColorScheme) {
-    let area = frame.area();
+    let area = frame.bounds();
     // Center the help box - increased height to accommodate more content
     // Content is ~46 lines, plus 2 for borders = 48 minimum for full content
     let width = 60.min(area.width.saturating_sub(4));
@@ -717,19 +735,19 @@ fn render_help_overlay(frame: &mut Frame, colors: &ColorScheme) {
     let help_area = Rect::new(x, y, width, height);
 
     // Clear the area behind the overlay
-    frame.render_widget(Clear, help_area);
+    frame.buffer.fill(help_area, ftui_render::cell::Cell::default());
 
     let help_text = vec![
         Line::from(Span::styled(
             "RCH Dashboard Help",
-            Style::default()
+            Style::new()
                 .fg(colors.highlight)
-                .add_modifier(Modifier::BOLD),
+                .bold(),
         )),
         Line::from(""),
-        Line::from(vec![Span::styled(
+        Line::from_spans(vec![Span::styled(
             "Navigation",
-            Style::default().add_modifier(Modifier::BOLD),
+            Style::new().bold(),
         )]),
         Line::from("  ↑/k, ↓/j    Move selection up/down"),
         Line::from("  →/l, Tab    Next panel"),
@@ -740,55 +758,55 @@ fn render_help_overlay(frame: &mut Frame, colors: &ColorScheme) {
         Line::from("  Enter       Select/expand item"),
         Line::from("  Backspace   Go back / Close log view"),
         Line::from(""),
-        Line::from(vec![Span::styled(
+        Line::from_spans(vec![Span::styled(
             "Scrolling (Log View)",
-            Style::default().add_modifier(Modifier::BOLD),
+            Style::new().bold(),
         )]),
         Line::from("  PgUp/PgDn   Scroll page up/down"),
         Line::from("  g           Jump to top"),
         Line::from("  G           Jump to bottom (resume auto-scroll)"),
         Line::from(""),
-        Line::from(vec![Span::styled(
+        Line::from_spans(vec![Span::styled(
             "Actions",
-            Style::default().add_modifier(Modifier::BOLD),
+            Style::new().bold(),
         )]),
         Line::from("  r           Refresh data from daemon"),
         Line::from("  y           Copy selected item"),
         Line::from(""),
-        Line::from(vec![Span::styled(
+        Line::from_spans(vec![Span::styled(
             "Worker Actions (Workers panel)",
-            Style::default().add_modifier(Modifier::BOLD),
+            Style::new().bold(),
         )]),
         Line::from("  d           Drain selected worker"),
         Line::from("  e           Enable selected worker"),
         Line::from("  D           Drain ALL workers"),
         Line::from("  E           Enable ALL workers"),
         Line::from(""),
-        Line::from(vec![Span::styled(
+        Line::from_spans(vec![Span::styled(
             "Build Actions (Active Builds panel)",
-            Style::default().add_modifier(Modifier::BOLD),
+            Style::new().bold(),
         )]),
         Line::from("  x           Cancel selected build (SIGTERM)"),
         Line::from("  X           Force kill selected build (SIGKILL)"),
         Line::from(""),
-        Line::from(vec![Span::styled(
+        Line::from_spans(vec![Span::styled(
             "Search & Filter",
-            Style::default().add_modifier(Modifier::BOLD),
+            Style::new().bold(),
         )]),
         Line::from("  /           Open filter (Build History panel)"),
         Line::from("  Enter       Apply filter"),
         Line::from("  Esc         Cancel filter"),
         Line::from(""),
-        Line::from(vec![Span::styled(
+        Line::from_spans(vec![Span::styled(
             "Sort (Build History panel)",
-            Style::default().add_modifier(Modifier::BOLD),
+            Style::new().bold(),
         )]),
         Line::from("  s           Cycle sort order"),
         Line::from("  S           Reverse sort direction"),
         Line::from(""),
-        Line::from(vec![Span::styled(
+        Line::from_spans(vec![Span::styled(
             "General",
-            Style::default().add_modifier(Modifier::BOLD),
+            Style::new().bold(),
         )]),
         Line::from("  q, Esc      Quit / Close overlay"),
         Line::from("  ?, F1       Toggle this help"),
@@ -796,26 +814,26 @@ fn render_help_overlay(frame: &mut Frame, colors: &ColorScheme) {
         Line::from(""),
         Line::from(Span::styled(
             "Press any key to close",
-            Style::default().fg(colors.muted),
+            Style::new().fg(colors.muted),
         )),
     ];
 
-    let help = Paragraph::new(help_text)
+    let help = Paragraph::new(ftui_text::Text::from_lines(help_text))
         .block(
-            Block::default()
+            Block::new()
                 .borders(Borders::ALL)
                 .title("Help")
-                .border_style(Style::default().fg(colors.highlight)),
+                .border_style(Style::new().fg(colors.highlight)),
         )
         .alignment(Alignment::Left)
-        .wrap(Wrap { trim: false });
+        .wrap(WrapMode::Word);
 
-    frame.render_widget(help, help_area);
+    help.render(help_area, frame);
 }
 
 /// Render error bar at bottom of screen.
 fn render_error_bar(frame: &mut Frame, error: &str, colors: &ColorScheme) {
-    let area = frame.area();
+    let area = frame.bounds();
     let error_area = Rect::new(
         1,
         area.height.saturating_sub(2),
@@ -823,22 +841,22 @@ fn render_error_bar(frame: &mut Frame, error: &str, colors: &ColorScheme) {
         1,
     );
 
-    let error_msg = Paragraph::new(Line::from(vec![
+    let error_msg = Paragraph::new(Line::from_spans(vec![
         Span::styled(
             "Error: ",
-            Style::default()
+            Style::new()
                 .fg(colors.error)
-                .add_modifier(Modifier::BOLD),
+                .bold(),
         ),
-        Span::styled(error, Style::default().fg(colors.error)),
+        Span::styled(error, Style::new().fg(colors.error)),
     ]));
 
-    frame.render_widget(error_msg, error_area);
+    error_msg.render(error_area, frame);
 }
 
 /// Render copy feedback.
 fn render_copy_feedback(frame: &mut Frame, colors: &ColorScheme) {
-    let area = frame.area();
+    let area = frame.bounds();
     let message = "Copied to clipboard!";
     let max_width = area.width.saturating_sub(2).max(1);
     let width = (message.len() as u16).min(max_width);
@@ -846,9 +864,9 @@ fn render_copy_feedback(frame: &mut Frame, colors: &ColorScheme) {
     let feedback_area = Rect::new(x, 1, width, 1);
     let visible = &message[..width as usize];
 
-    let feedback = Paragraph::new(Span::styled(visible, Style::default().fg(colors.success)));
+    let feedback = Paragraph::new(Line::from(Span::styled(visible, Style::new().fg(colors.success))));
 
-    frame.render_widget(feedback, feedback_area);
+    feedback.render(feedback_area, frame);
 }
 
 /// Render logs panel (full screen when viewing build logs).
@@ -860,9 +878,9 @@ fn render_logs_panel(frame: &mut Frame, area: Rect, state: &TuiState, colors: &C
 
     let is_selected = state.selected_panel == Panel::Logs;
     let border_style = if is_selected {
-        Style::default().fg(colors.highlight)
+        Style::new().fg(colors.highlight)
     } else {
-        Style::default()
+        Style::new()
     };
 
     // Calculate visible window
@@ -882,17 +900,17 @@ fn render_logs_panel(frame: &mut Frame, area: Rect, state: &TuiState, colors: &C
         .map(|line| {
             // Color code log lines based on content
             let style = if line.contains("error") || line.contains("Error") {
-                Style::default().fg(colors.error)
+                Style::new().fg(colors.error)
             } else if line.contains("warning") || line.contains("Warning") {
-                Style::default().fg(colors.warning)
+                Style::new().fg(colors.warning)
             } else if line.contains("Compiling") || line.contains("Building") {
-                Style::default().fg(colors.info)
+                Style::new().fg(colors.info)
             } else if line.contains("Finished") {
-                Style::default().fg(colors.success)
+                Style::new().fg(colors.success)
             } else {
-                Style::default().fg(colors.fg)
+                Style::new().fg(colors.fg)
             };
-            ListItem::new(Span::styled(line.as_str(), style))
+            ListItem::new(Line::from(Span::styled(line.as_str(), style)))
         })
         .collect();
 
@@ -911,13 +929,13 @@ fn render_logs_panel(frame: &mut Frame, area: Rect, state: &TuiState, colors: &C
     );
 
     let list = List::new(items).block(
-        Block::default()
+        Block::new()
             .borders(Borders::ALL)
-            .title(title)
+            .title(title.as_str())
             .border_style(border_style),
     );
 
-    frame.render_widget(list, area);
+    list.render(area, frame);
 
     // Render scroll bar on the right side if content exceeds visible area
     if total_lines > visible_height {
@@ -967,14 +985,11 @@ fn render_scrollbar(
             "│" // Track
         };
         let style = if i >= thumb_pos && i < thumb_pos + thumb_size {
-            Style::default().fg(colors.highlight)
+            Style::new().fg(colors.highlight)
         } else {
-            Style::default().fg(colors.muted)
+            Style::new().fg(colors.muted)
         };
-        frame.render_widget(
-            Paragraph::new(Span::styled(char, style)),
-            Rect::new(x, y, 1, 1),
-        );
+        Paragraph::new(Line::from(Span::styled(char, style))).render(Rect::new(x, y, 1, 1), frame);
     }
 }
 
@@ -987,9 +1002,9 @@ mod tests {
         TuiState, WorkerState, WorkerStatus,
     };
     use chrono::Utc;
-    use ratatui::Terminal;
-    use ratatui::backend::TestBackend;
-    use ratatui::buffer::Buffer;
+    use ftui_render::buffer::Buffer;
+    use ftui_render::cell::{Cell, CellContent};
+    use ftui_render::grapheme_pool::GraphemePool;
     use tracing::info;
 
     fn init_test_logging() {
@@ -999,14 +1014,26 @@ mod tests {
             .try_init();
     }
 
-    fn buffer_to_string(buffer: &Buffer) -> String {
+    fn buffer_to_string(buffer: &Buffer, pool: &GraphemePool) -> String {
         let mut out = String::new();
-        let width = buffer.area.width;
-        let height = buffer.area.height;
+        let width = buffer.width();
+        let height = buffer.height();
         for y in 0..height {
             for x in 0..width {
-                if let Some(cell) = buffer.cell((x, y)) {
-                    out.push_str(cell.symbol());
+                if let Some(cell) = buffer.get(x, y) {
+                    if cell.content.is_continuation() {
+                        continue;
+                    } else if let Some(c) = cell.content.as_char() {
+                        out.push(c);
+                    } else if let Some(gid) = cell.content.grapheme_id() {
+                        if let Some(s) = pool.get(gid) {
+                            out.push_str(s);
+                        } else {
+                            out.push(' ');
+                        }
+                    } else {
+                        out.push(' ');
+                    }
                 } else {
                     out.push(' ');
                 }
@@ -1020,10 +1047,10 @@ mod tests {
     where
         F: FnMut(&mut Frame),
     {
-        let backend = TestBackend::new(width, height);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| draw(f)).unwrap();
-        buffer_to_string(terminal.backend().buffer())
+        let mut pool = GraphemePool::new();
+        let mut frame = Frame::new(width, height, &mut pool);
+        draw(&mut frame);
+        buffer_to_string(&frame.buffer, &pool)
     }
 
     fn sample_worker(id: &str, status: WorkerStatus, circuit: CircuitState) -> WorkerState {
@@ -1087,8 +1114,8 @@ mod tests {
             "VERIFY: deuter_highlight={:?} tritan_highlight={:?}",
             deuter.highlight, tritan.highlight
         );
-        assert_eq!(deuter.highlight, Color::LightCyan);
-        assert_eq!(tritan.highlight, Color::LightMagenta);
+        assert_eq!(deuter.highlight, C_LIGHT_CYAN);
+        assert_eq!(tritan.highlight, C_LIGHT_MAGENTA);
         info!("TEST PASS: test_color_blind_palette_selection");
     }
 
@@ -1521,13 +1548,13 @@ mod tests {
         init_test_logging();
         info!("TEST START: test_high_contrast_mode_colors");
         let high_contrast = get_colors(true, ColorBlindMode::None);
-        assert_eq!(high_contrast.fg, Color::White);
-        assert_eq!(high_contrast.bg, Color::Black);
-        assert_eq!(high_contrast.highlight, Color::Yellow);
-        assert_eq!(high_contrast.success, Color::LightGreen);
-        assert_eq!(high_contrast.error, Color::LightRed);
-        assert_eq!(high_contrast.selected_bg, Color::White);
-        assert_eq!(high_contrast.selected_fg, Color::Black);
+        assert_eq!(high_contrast.fg, C_WHITE);
+        assert_eq!(high_contrast.bg, C_BLACK);
+        assert_eq!(high_contrast.highlight, C_YELLOW);
+        assert_eq!(high_contrast.success, C_LIGHT_GREEN);
+        assert_eq!(high_contrast.error, C_LIGHT_RED);
+        assert_eq!(high_contrast.selected_bg, C_WHITE);
+        assert_eq!(high_contrast.selected_fg, C_BLACK);
         info!("TEST PASS: test_high_contrast_mode_colors");
     }
 
@@ -1541,8 +1568,8 @@ mod tests {
         assert_eq!(proto.highlight, deuter.highlight);
         assert_eq!(proto.success, deuter.success);
         assert_eq!(proto.error, deuter.error);
-        assert_eq!(proto.highlight, Color::LightCyan);
-        assert_eq!(proto.error, Color::LightMagenta);
+        assert_eq!(proto.highlight, C_LIGHT_CYAN);
+        assert_eq!(proto.error, C_LIGHT_MAGENTA);
         info!("TEST PASS: test_color_blind_protanopia_same_as_deuteranopia");
     }
 
@@ -1553,9 +1580,9 @@ mod tests {
         let tritan = get_colors(false, ColorBlindMode::Tritanopia);
         let normal = get_colors(false, ColorBlindMode::None);
         // Tritanopia uses different highlight
-        assert_eq!(tritan.highlight, Color::LightMagenta);
+        assert_eq!(tritan.highlight, C_LIGHT_MAGENTA);
         assert_ne!(tritan.highlight, normal.highlight);
-        assert_eq!(tritan.warning, Color::LightRed);
+        assert_eq!(tritan.warning, C_LIGHT_RED);
         info!("TEST PASS: test_color_blind_tritanopia_distinct_palette");
     }
 
@@ -1564,13 +1591,13 @@ mod tests {
         init_test_logging();
         info!("TEST START: test_normal_mode_colors");
         let normal = get_colors(false, ColorBlindMode::None);
-        assert_eq!(normal.fg, Color::White);
-        assert_eq!(normal.bg, Color::Reset);
-        assert_eq!(normal.highlight, Color::Cyan);
-        assert_eq!(normal.success, Color::Green);
-        assert_eq!(normal.warning, Color::Yellow);
-        assert_eq!(normal.error, Color::Red);
-        assert_eq!(normal.info, Color::Blue);
+        assert_eq!(normal.fg, C_WHITE);
+        assert_eq!(normal.bg, C_RESET);
+        assert_eq!(normal.highlight, C_CYAN);
+        assert_eq!(normal.success, C_GREEN);
+        assert_eq!(normal.warning, C_YELLOW);
+        assert_eq!(normal.error, C_RED);
+        assert_eq!(normal.info, C_BLUE);
         info!("TEST PASS: test_normal_mode_colors");
     }
 

@@ -17,13 +17,12 @@ use crate::tui::{
 };
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use crossterm::{
-    event::{DisableMouseCapture, EnableMouseCapture},
-    execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
-};
-use ratatui::{Terminal, backend::CrosstermBackend};
-use std::io::{self, Stdout};
+use ftui::Frame;
+use ftui_backend::{Backend, BackendEventSource, BackendFeatures, BackendPresenter};
+use ftui_render::buffer::Buffer;
+use ftui_render::diff::BufferDiff;
+use ftui_render::grapheme_pool::GraphemePool;
+use ftui_tty::{TtyBackend, TtySessionOptions};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -77,16 +76,22 @@ pub async fn run_tui(config: TuiConfig) -> Result<()> {
         return Ok(());
     }
 
-    // Setup terminal
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    if config.mouse_support {
-        execute!(stdout, EnableMouseCapture)?;
-    }
+    // Query terminal size
+    let (width, height) = terminal_size::terminal_size()
+        .map(|(w, h)| (w.0, h.0))
+        .unwrap_or((80, 24));
 
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+    // Setup terminal via ftui-tty (RAII — cleanup on drop)
+    let features = BackendFeatures {
+        mouse_capture: config.mouse_support,
+        ..BackendFeatures::default()
+    };
+    let options = TtySessionOptions {
+        alternate_screen: true,
+        features,
+        intercept_signals: true,
+    };
+    let mut backend = TtyBackend::open(width, height, options)?;
 
     // Initialize state and fetch initial data
     let mut state = TuiState::new();
@@ -95,15 +100,10 @@ pub async fn run_tui(config: TuiConfig) -> Result<()> {
     refresh_state(&mut state, &config).await;
 
     // Run main loop
-    let result = run_app(&mut terminal, &mut state, &config).await;
+    let result = run_app(&mut backend, &mut state, &config).await;
 
-    // Restore terminal
-    disable_raw_mode()?;
-    if config.mouse_support {
-        execute!(terminal.backend_mut(), DisableMouseCapture)?;
-    }
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
+    // TtyBackend::drop handles all terminal cleanup automatically
+    drop(backend);
 
     result
 }
@@ -151,25 +151,32 @@ fn test_backend_size() -> (u16, u16) {
 }
 
 fn render_snapshot(state: &TuiState, width: u16, height: u16) -> String {
-    use ratatui::Terminal;
-    use ratatui::backend::TestBackend;
-
-    let backend = TestBackend::new(width, height);
-    let mut terminal = Terminal::new(backend).expect("create test terminal");
-    terminal
-        .draw(|f| widgets::render(f, state))
-        .expect("render snapshot");
-    buffer_to_string(terminal.backend().buffer())
+    let mut pool = GraphemePool::new();
+    let mut frame = Frame::new(width, height, &mut pool);
+    widgets::render(&mut frame, state);
+    ftui_buffer_to_string(&frame.buffer, &pool)
 }
 
-fn buffer_to_string(buffer: &ratatui::buffer::Buffer) -> String {
+fn ftui_buffer_to_string(buffer: &Buffer, pool: &GraphemePool) -> String {
     let mut out = String::new();
-    let width = buffer.area.width;
-    let height = buffer.area.height;
+    let width = buffer.width();
+    let height = buffer.height();
     for y in 0..height {
         for x in 0..width {
-            if let Some(cell) = buffer.cell((x, y)) {
-                out.push_str(cell.symbol());
+            if let Some(cell) = buffer.get(x, y) {
+                if cell.content.is_continuation() {
+                    continue;
+                } else if let Some(c) = cell.content.as_char() {
+                    out.push(c);
+                } else if let Some(gid) = cell.content.grapheme_id() {
+                    if let Some(s) = pool.get(gid) {
+                        out.push_str(s);
+                    } else {
+                        out.push(' ');
+                    }
+                } else {
+                    out.push(' ');
+                }
             } else {
                 out.push(' ');
             }
@@ -389,20 +396,31 @@ fn update_state_from_daemon(state: &mut TuiState, response: DaemonFullStatusResp
 
 /// Main application loop.
 async fn run_app(
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    backend: &mut TtyBackend,
     state: &mut TuiState,
     config: &TuiConfig,
 ) -> Result<()> {
     let tick_rate = Duration::from_millis(config.refresh_interval_ms);
     let refresh_interval = Duration::from_millis(config.refresh_interval_ms * 5); // Refresh every 5 ticks
+    let mut pool = GraphemePool::new();
+    let mut prev_buf: Option<Buffer> = None;
 
     loop {
-        // Draw UI
-        terminal.draw(|f| widgets::render(f, state))?;
+        // Draw UI via ftui frame
+        let (w, h) = backend.events().size()?;
+        {
+            let mut frame = Frame::new(w, h, &mut pool);
+            widgets::render(&mut frame, state);
+
+            // Present the frame
+            let diff = prev_buf.as_ref().map(|prev| BufferDiff::compute(prev, &frame.buffer));
+            backend.presenter().present_ui(&frame.buffer, diff.as_ref(), prev_buf.is_none())?;
+            prev_buf = Some(frame.buffer.clone());
+        }
 
         // Handle events - use confirm mode when dialog is showing, input mode for filters
         let confirm_mode = state.confirm_dialog.is_some();
-        if let Some(action) = poll_event_with_flags(tick_rate, state.filter_mode, confirm_mode)? {
+        if let Some(action) = poll_event_with_flags(backend.events(), tick_rate, state.filter_mode, confirm_mode)? {
             match action {
                 Action::Quit => {
                     // If help overlay is open, close it; otherwise quit
@@ -1024,11 +1042,9 @@ mod tests {
         let _guard = test_guard!();
         init_test_logging();
         info!("TEST START: test_buffer_to_string_basic");
-        use ratatui::buffer::Buffer;
-        use ratatui::layout::Rect;
-        let rect = Rect::new(0, 0, 5, 2);
-        let buffer = Buffer::empty(rect);
-        let result = buffer_to_string(&buffer);
+        let pool = GraphemePool::new();
+        let buffer = Buffer::new(5, 2);
+        let result = ftui_buffer_to_string(&buffer, &pool);
         info!("VERIFY: buffer_to_string output len={}", result.len());
         // Empty buffer produces spaces with newlines
         assert_eq!(result.lines().count(), 2);
@@ -1041,12 +1057,16 @@ mod tests {
         let _guard = test_guard!();
         init_test_logging();
         info!("TEST START: test_buffer_to_string_with_content");
-        use ratatui::buffer::Buffer;
-        use ratatui::layout::Rect;
-        let rect = Rect::new(0, 0, 10, 1);
-        let mut buffer = Buffer::empty(rect);
-        buffer.set_string(0, 0, "Hello", ratatui::style::Style::default());
-        let result = buffer_to_string(&buffer);
+        use ftui_render::cell::{Cell, CellContent};
+        let pool = GraphemePool::new();
+        let mut buffer = Buffer::new(10, 1);
+        // Write "Hello" directly as cells
+        for (i, c) in "Hello".chars().enumerate() {
+            let mut cell = Cell::default();
+            cell.content = CellContent::from_char(c);
+            buffer.set(i as u16, 0, cell);
+        }
+        let result = ftui_buffer_to_string(&buffer, &pool);
         info!("VERIFY: buffer contains Hello: {}", result.trim());
         assert!(result.contains("Hello"));
         info!("TEST PASS: test_buffer_to_string_with_content");

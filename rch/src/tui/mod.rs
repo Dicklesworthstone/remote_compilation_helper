@@ -1,7 +1,7 @@
 //! Interactive TUI dashboard for RCH monitoring.
 //!
 //! Provides real-time worker status, active build monitoring, and operator actions
-//! using ratatui for terminal UI rendering.
+//! using FrankenTUI for terminal UI rendering.
 //!
 //! # Test Infrastructure
 //!
