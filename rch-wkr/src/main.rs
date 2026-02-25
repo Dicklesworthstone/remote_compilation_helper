@@ -498,13 +498,30 @@ fn probe_load_average() -> Option<(f64, f64, f64)> {
     None
 }
 
-/// Probe disk space for /tmp (free and total in GB).
+/// Probe disk space for project workspace filesystem (free and total in GB).
+///
+/// We intentionally prefer the project roots because /tmp may be a small tmpfs
+/// on some workers and can produce false pressure signals.
 fn probe_disk_space() -> Option<(f64, f64)> {
+    use std::path::Path;
+    [
+        Path::new(DEFAULT_CANONICAL_PROJECT_ROOT),
+        Path::new(DEFAULT_ALIAS_PROJECT_ROOT),
+        Path::new("/tmp"),
+    ]
+    .iter()
+    .find_map(|path| probe_disk_space_for(path))
+}
+
+fn probe_disk_space_for(path: &std::path::Path) -> Option<(f64, f64)> {
     use std::process::Command;
 
-    // Use df to get disk space for /tmp
-    // Try POSIX format first (works on Linux and macOS)
-    if let Ok(output) = Command::new("df").args(["-P", "-k", "/tmp"]).output()
+    if !path.exists() {
+        return None;
+    }
+
+    let path_str = path.to_string_lossy();
+    if let Ok(output) = Command::new("df").args(["-P", "-k", &path_str]).output()
         && output.status.success()
     {
         let stdout = String::from_utf8_lossy(&output.stdout);
