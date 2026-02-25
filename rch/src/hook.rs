@@ -2672,6 +2672,34 @@ async fn collect_repo_updater_specs(sync_roots: &[PathBuf]) -> Vec<String> {
     specs.into_iter().collect()
 }
 
+async fn detect_dirty_sync_roots(sync_roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut dirty = Vec::new();
+
+    for root in sync_roots {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .arg("status")
+            .arg("--porcelain")
+            .output()
+            .await;
+
+        let Ok(output) = output else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
+
+        let status = String::from_utf8_lossy(&output.stdout);
+        if !status.trim().is_empty() {
+            dirty.push(root.clone());
+        }
+    }
+
+    dirty
+}
+
 fn repo_updater_timeout_for(
     contract: &RepoUpdaterAdapterContract,
     command: RepoUpdaterAdapterCommand,
@@ -3207,6 +3235,19 @@ async fn maybe_sync_repo_set_with_repo_updater(
     }
     if should_skip_remote_preflight(worker) {
         reporter.verbose("[RCH] repo_updater pre-sync skipped in mock mode");
+        return;
+    }
+
+    let dirty_roots = detect_dirty_sync_roots(sync_roots).await;
+    if !dirty_roots.is_empty() {
+        let joined = dirty_roots
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(", ");
+        reporter.verbose(&format!(
+            "[RCH] repo_updater pre-sync skipped (dirty local sync roots: {joined})"
+        ));
         return;
     }
 
