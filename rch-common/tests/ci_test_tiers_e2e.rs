@@ -116,8 +116,7 @@ const ALL_FAMILIES: &[&str] = &[
 fn build_smoke_tier() -> CiTestTier {
     CiTestTier {
         name: "smoke".into(),
-        description: "Fast contract + unit + integration tests. Runs on every PR and push."
-            .into(),
+        description: "Fast contract + unit + integration tests. Runs on every PR and push.".into(),
         runtime_budget_secs: 300, // 5 minutes
         seed_policy: SeedPolicy::RunIdBased,
         scenario_families: ALL_FAMILIES.iter().map(|s| s.to_string()).collect(),
@@ -157,9 +156,8 @@ fn build_nightly_tier() -> CiTestTier {
 
     CiTestTier {
         name: "nightly".into(),
-        description:
-            "Full suite including topology, soak, and regression. Scheduled nightly run."
-                .into(),
+        description: "Full suite including topology, soak, and regression. Scheduled nightly run."
+            .into(),
         runtime_budget_secs: 1800, // 30 minutes
         seed_policy: SeedPolicy::RandomRecorded,
         scenario_families: families,
@@ -370,7 +368,11 @@ fn e2e_tiers_each_tier_has_seed_policy() {
     for tier in &config.tiers {
         // Just verify it serializes (policy is always set)
         let json = serde_json::to_string(&tier.seed_policy).unwrap();
-        assert!(!json.is_empty(), "tier '{}' must have a seed policy", tier.name);
+        assert!(
+            !json.is_empty(),
+            "tier '{}' must have a seed policy",
+            tier.name
+        );
     }
 }
 

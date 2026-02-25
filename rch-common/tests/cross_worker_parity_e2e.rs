@@ -12,8 +12,8 @@ use rch_common::e2e::harness::{
     ReliabilityScenarioSpec,
 };
 use rch_common::e2e::logging::{
-    LogLevel, ReliabilityContext, ReliabilityEventInput, ReliabilityPhase, TestLoggerBuilder,
-    RELIABILITY_EVENT_SCHEMA_VERSION,
+    LogLevel, RELIABILITY_EVENT_SCHEMA_VERSION, ReliabilityContext, ReliabilityEventInput,
+    ReliabilityPhase, TestLoggerBuilder,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -53,7 +53,9 @@ impl DriftCategory {
             Self::ArtifactHashMismatch => "Verify incremental build state is clean on both workers",
             Self::TimingAnomaly => "Check worker load and disk I/O; consider rebalancing",
             Self::LogContentDivergence => "Compare build environment snapshots for discrepancies",
-            Self::ResourceContention => "Check disk pressure and slot utilization on affected worker",
+            Self::ResourceContention => {
+                "Check disk pressure and slot utilization on affected worker"
+            }
             Self::Unknown => "Investigate worker health dashboard for anomalies",
         }
     }
@@ -310,7 +312,11 @@ fn e2e_parity_exit_code_divergence_detected() {
 
     assert!(!result.is_parity);
     assert!(!result.exit_code_match);
-    assert!(result.drift_categories.contains(&DriftCategory::ExitCodeDivergence));
+    assert!(
+        result
+            .drift_categories
+            .contains(&DriftCategory::ExitCodeDivergence)
+    );
     assert!(!result.remediation_hints.is_empty());
 }
 
@@ -339,7 +345,11 @@ fn e2e_parity_artifact_hash_mismatch_detected() {
 
     assert!(!result.is_parity);
     assert!(!result.artifact_hash_match);
-    assert!(result.drift_categories.contains(&DriftCategory::ArtifactHashMismatch));
+    assert!(
+        result
+            .drift_categories
+            .contains(&DriftCategory::ArtifactHashMismatch)
+    );
 }
 
 #[test]
@@ -367,7 +377,11 @@ fn e2e_parity_timing_anomaly_detected() {
 
     assert!(!result.is_parity);
     assert!(!result.timing_within_envelope);
-    assert!(result.drift_categories.contains(&DriftCategory::TimingAnomaly));
+    assert!(
+        result
+            .drift_categories
+            .contains(&DriftCategory::TimingAnomaly)
+    );
 }
 
 #[test]
@@ -395,7 +409,11 @@ fn e2e_parity_toolchain_mismatch_detected() {
 
     // Parity still passes (exit code, hash, timing match) but drift is noted
     assert!(result.is_parity);
-    assert!(result.drift_categories.contains(&DriftCategory::ToolchainMismatch));
+    assert!(
+        result
+            .drift_categories
+            .contains(&DriftCategory::ToolchainMismatch)
+    );
 }
 
 #[test]
@@ -423,13 +441,32 @@ fn e2e_parity_multiple_drift_categories_detected() {
 
     assert!(!result.is_parity);
     assert!(result.drift_categories.len() >= 4);
-    assert!(result.drift_categories.contains(&DriftCategory::ExitCodeDivergence));
-    assert!(result.drift_categories.contains(&DriftCategory::ArtifactHashMismatch));
-    assert!(result.drift_categories.contains(&DriftCategory::TimingAnomaly));
-    assert!(result.drift_categories.contains(&DriftCategory::ToolchainMismatch));
+    assert!(
+        result
+            .drift_categories
+            .contains(&DriftCategory::ExitCodeDivergence)
+    );
+    assert!(
+        result
+            .drift_categories
+            .contains(&DriftCategory::ArtifactHashMismatch)
+    );
+    assert!(
+        result
+            .drift_categories
+            .contains(&DriftCategory::TimingAnomaly)
+    );
+    assert!(
+        result
+            .drift_categories
+            .contains(&DriftCategory::ToolchainMismatch)
+    );
 
     // Each drift category should produce a remediation hint
-    assert_eq!(result.remediation_hints.len(), result.drift_categories.len());
+    assert_eq!(
+        result.remediation_hints.len(),
+        result.drift_categories.len()
+    );
 }
 
 // ===========================================================================
@@ -507,10 +544,7 @@ fn e2e_parity_fleet_detects_single_drifted_worker() {
                 || (c.worker_a == "mms" && c.worker_b == "css")
         })
         .expect("should have css-mms comparison");
-    assert!(
-        css_mms.is_parity,
-        "css vs mms should have parity"
-    );
+    assert!(css_mms.is_parity, "css vs mms should have parity");
 
     // At least one comparison involving gpu-01 should detect drift
     let gpu_comparisons: Vec<&ParityComparisonResult> = comparisons
@@ -524,10 +558,7 @@ fn e2e_parity_fleet_detects_single_drifted_worker() {
     let gpu_has_drift = gpu_comparisons
         .iter()
         .any(|c| !c.drift_categories.is_empty());
-    assert!(
-        gpu_has_drift,
-        "gpu-01 comparisons should detect drift"
-    );
+    assert!(gpu_has_drift, "gpu-01 comparisons should detect drift");
 }
 
 // ===========================================================================
@@ -568,7 +599,10 @@ fn e2e_parity_comparison_result_serialization() {
     // Roundtrip
     let parsed: ParityComparisonResult = serde_json::from_str(&json).unwrap();
     assert_eq!(parsed.scenario_id, "build-test");
-    assert_eq!(parsed.drift_categories, vec![DriftCategory::ArtifactHashMismatch]);
+    assert_eq!(
+        parsed.drift_categories,
+        vec![DriftCategory::ArtifactHashMismatch]
+    );
 }
 
 #[test]
@@ -638,9 +672,15 @@ fn e2e_parity_drift_categories_serialize_snake_case() {
         (DriftCategory::ToolchainMismatch, "toolchain_mismatch"),
         (DriftCategory::EnvConfigDrift, "env_config_drift"),
         (DriftCategory::ExitCodeDivergence, "exit_code_divergence"),
-        (DriftCategory::ArtifactHashMismatch, "artifact_hash_mismatch"),
+        (
+            DriftCategory::ArtifactHashMismatch,
+            "artifact_hash_mismatch",
+        ),
         (DriftCategory::TimingAnomaly, "timing_anomaly"),
-        (DriftCategory::LogContentDivergence, "log_content_divergence"),
+        (
+            DriftCategory::LogContentDivergence,
+            "log_content_divergence",
+        ),
         (DriftCategory::ResourceContention, "resource_contention"),
         (DriftCategory::Unknown, "unknown"),
     ];
@@ -678,7 +718,8 @@ fn e2e_parity_multi_scenario_fleet_report() {
     let mut all_comparisons: Vec<ParityComparisonResult> = Vec::new();
     let mut drift_counts: HashMap<String, usize> = HashMap::new();
     let mut worst_timing_ratio = 1.0f64;
-    let mut workers_with_drift: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut workers_with_drift: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
 
     for scenario in &scenarios {
         let outputs: Vec<SimulatedWorkerOutput> = workers
@@ -695,7 +736,10 @@ fn e2e_parity_multi_scenario_fleet_report() {
                 let cmp = compare_worker_outputs(scenario, &outputs[i], &outputs[j], 2.0);
 
                 for cat in &cmp.drift_categories {
-                    let key = serde_json::to_string(cat).unwrap().trim_matches('"').to_string();
+                    let key = serde_json::to_string(cat)
+                        .unwrap()
+                        .trim_matches('"')
+                        .to_string();
                     *drift_counts.entry(key).or_insert(0) += 1;
                 }
 
@@ -809,20 +853,18 @@ fn e2e_parity_report_comparison_across_workers() {
                 ReliabilityPhase::Cleanup,
             ],
             activated_failure_hooks: vec![],
-            command_records: vec![
-                ReliabilityCommandRecord {
-                    phase: ReliabilityPhase::Execute,
-                    stage: "execute".to_string(),
-                    command_name: "build".to_string(),
-                    invoked_program: "cargo".to_string(),
-                    invoked_args: vec!["build".to_string()],
-                    exit_code: 0,
-                    duration_ms: 1500,
-                    required_success: true,
-                    succeeded: true,
-                    artifact_paths: vec![],
-                },
-            ],
+            command_records: vec![ReliabilityCommandRecord {
+                phase: ReliabilityPhase::Execute,
+                stage: "execute".to_string(),
+                command_name: "build".to_string(),
+                invoked_program: "cargo".to_string(),
+                invoked_args: vec!["build".to_string()],
+                exit_code: 0,
+                duration_ms: 1500,
+                required_success: true,
+                succeeded: true,
+                artifact_paths: vec![],
+            }],
             artifact_paths: vec![],
             manifest_path: None,
         })
@@ -928,7 +970,10 @@ fn e2e_parity_timing_envelope_boundary_conditions() {
         ..base.clone()
     };
     let result = compare_worker_outputs("timing-boundary", &base, &at_boundary, 2.0);
-    assert!(result.timing_within_envelope, "exactly 2x should be within 2.0 envelope");
+    assert!(
+        result.timing_within_envelope,
+        "exactly 2x should be within 2.0 envelope"
+    );
 
     // Just over 2x
     let over_boundary = SimulatedWorkerOutput {
@@ -937,7 +982,10 @@ fn e2e_parity_timing_envelope_boundary_conditions() {
         ..base.clone()
     };
     let result = compare_worker_outputs("timing-over", &base, &over_boundary, 2.0);
-    assert!(!result.timing_within_envelope, "2.001x should exceed 2.0 envelope");
+    assert!(
+        !result.timing_within_envelope,
+        "2.001x should exceed 2.0 envelope"
+    );
 
     // Zero duration (edge case)
     let zero_dur = SimulatedWorkerOutput {

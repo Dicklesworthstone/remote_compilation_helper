@@ -44,10 +44,7 @@ impl ReliabilitySubsystem {
     }
 
     fn is_security_relevant(&self) -> bool {
-        matches!(
-            self,
-            Self::ProcessTriage | Self::DiskPressureAdmission
-        )
+        matches!(self, Self::ProcessTriage | Self::DiskPressureAdmission)
     }
 }
 
@@ -232,7 +229,7 @@ struct AutoDisableTrigger {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum AutoDisableCondition {
-    ErrorRateExceeded { threshold: u32 },      // basis points (10000 = 100%)
+    ErrorRateExceeded { threshold: u32 }, // basis points (10000 = 100%)
     LatencyExceeded { p99_ms: u64 },
     ContractDriftDetected,
     WorkerQuarantineCount { max_workers: u32 },
@@ -328,9 +325,7 @@ fn check_auto_disable<'a>(
             AutoDisableCondition::ErrorRateExceeded { threshold } => {
                 (metrics.error_rate * 10000.0) as u32 > *threshold
             }
-            AutoDisableCondition::LatencyExceeded { p99_ms } => {
-                metrics.p99_latency_ms > *p99_ms
-            }
+            AutoDisableCondition::LatencyExceeded { p99_ms } => metrics.p99_latency_ms > *p99_ms,
             AutoDisableCondition::ContractDriftDetected => !metrics.contract_compat,
             AutoDisableCondition::WorkerQuarantineCount { max_workers } => {
                 quarantined_workers > *max_workers
@@ -480,7 +475,9 @@ fn e2e_feature_flag_state_transitions() {
         "entering dry run",
         "system",
     );
-    let flag = config.get_flag(&ReliabilitySubsystem::PathClosureSync).unwrap();
+    let flag = config
+        .get_flag(&ReliabilitySubsystem::PathClosureSync)
+        .unwrap();
     assert!(flag.state.is_active());
     assert!(!flag.state.is_enforcing());
 
@@ -491,7 +488,9 @@ fn e2e_feature_flag_state_transitions() {
         "canary on w1",
         "operator",
     );
-    let flag = config.get_flag(&ReliabilitySubsystem::PathClosureSync).unwrap();
+    let flag = config
+        .get_flag(&ReliabilitySubsystem::PathClosureSync)
+        .unwrap();
     assert!(flag.state.is_enforcing());
 
     // Canary → Enabled
@@ -501,7 +500,9 @@ fn e2e_feature_flag_state_transitions() {
         "full rollout",
         "operator",
     );
-    let flag = config.get_flag(&ReliabilitySubsystem::PathClosureSync).unwrap();
+    let flag = config
+        .get_flag(&ReliabilitySubsystem::PathClosureSync)
+        .unwrap();
     assert!(flag.state.is_enforcing());
 }
 
@@ -519,7 +520,9 @@ fn e2e_feature_flag_canary_worker_scoping() {
     let key = "process_triage".to_string();
     config.flags.get_mut(&key).unwrap().canary_workers = vec!["w1".to_string()];
 
-    let flag = config.get_flag(&ReliabilitySubsystem::ProcessTriage).unwrap();
+    let flag = config
+        .get_flag(&ReliabilitySubsystem::ProcessTriage)
+        .unwrap();
     assert!(flag.is_enabled_for_worker("w1"));
     assert!(!flag.is_enabled_for_worker("w2"));
     assert!(!flag.is_enabled_for_worker("w3"));
@@ -643,7 +646,10 @@ fn e2e_rollout_plan_serialization_roundtrip() {
     let json = serde_json::to_string_pretty(&plan).unwrap();
     let back: RolloutPlan = serde_json::from_str(&json).unwrap();
     assert_eq!(back.stages.len(), plan.stages.len());
-    assert_eq!(back.auto_disable_triggers.len(), plan.auto_disable_triggers.len());
+    assert_eq!(
+        back.auto_disable_triggers.len(),
+        plan.auto_disable_triggers.len()
+    );
 }
 
 #[test]
@@ -858,9 +864,15 @@ fn e2e_mixed_flags_partial_rollout_safe() {
     // StorageBallastPolicy stays Disabled
 
     // Worker w1 should see PathClosure + ConvergenceGate active
-    let path_flag = config.get_flag(&ReliabilitySubsystem::PathClosureSync).unwrap();
-    let conv_flag = config.get_flag(&ReliabilitySubsystem::RepoConvergenceGate).unwrap();
-    let proc_flag = config.get_flag(&ReliabilitySubsystem::ProcessTriage).unwrap();
+    let path_flag = config
+        .get_flag(&ReliabilitySubsystem::PathClosureSync)
+        .unwrap();
+    let conv_flag = config
+        .get_flag(&ReliabilitySubsystem::RepoConvergenceGate)
+        .unwrap();
+    let proc_flag = config
+        .get_flag(&ReliabilitySubsystem::ProcessTriage)
+        .unwrap();
 
     assert!(path_flag.is_enabled_for_worker("w1"));
     assert!(!conv_flag.is_enabled_for_worker("w1")); // no canary workers set yet
@@ -911,7 +923,9 @@ fn e2e_rollback_disables_without_disruption() {
         "auto-disable",
     );
 
-    let flag = config.get_flag(&ReliabilitySubsystem::ProcessTriage).unwrap();
+    let flag = config
+        .get_flag(&ReliabilitySubsystem::ProcessTriage)
+        .unwrap();
     assert_eq!(flag.state, FlagState::Disabled);
     assert!(flag.reason.contains("rollback"));
     assert_eq!(flag.changed_by, "auto-disable");

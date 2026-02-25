@@ -1842,6 +1842,7 @@ exclude_patterns = [
     "target/",
     ".git/objects/",
     "node_modules/",
+    ".beads/",
     "*.rlib",
     "*.rmeta",
 ]

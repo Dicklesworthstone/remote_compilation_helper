@@ -94,16 +94,12 @@ impl RepoUpdaterAdapterCommand {
     #[must_use]
     pub fn args(self) -> &'static [&'static str] {
         match self {
-            Self::ListPaths => &["list", "--paths", "--non-interactive", "--format", "json"],
-            Self::StatusNoFetch => &[
-                "status",
-                "--no-fetch",
-                "--non-interactive",
-                "--format",
-                "json",
-            ],
-            Self::SyncDryRun => &["sync", "--dry-run", "--non-interactive", "--format", "json"],
-            Self::SyncApply => &["sync", "--non-interactive", "--format", "json"],
+            // Use `--json` global flag for backward compatibility with older
+            // repo_updater versions that do not support `--format json`.
+            Self::ListPaths => &["list", "--paths", "--non-interactive", "--json"],
+            Self::StatusNoFetch => &["status", "--no-fetch", "--non-interactive", "--json"],
+            Self::SyncDryRun => &["sync", "--dry-run", "--non-interactive", "--json"],
+            Self::SyncApply => &["sync", "--non-interactive", "--json"],
             Self::RobotDocsSchemas => &["robot-docs", "schemas", "--format", "json"],
             Self::Version => &["--version"],
         }
@@ -1538,17 +1534,11 @@ mod tests {
     fn repo_updater_contract_command_surface_is_stable() {
         assert_eq!(
             RepoUpdaterAdapterCommand::SyncDryRun.args(),
-            ["sync", "--dry-run", "--non-interactive", "--format", "json"]
+            ["sync", "--dry-run", "--non-interactive", "--json"]
         );
         assert_eq!(
             RepoUpdaterAdapterCommand::StatusNoFetch.args(),
-            [
-                "status",
-                "--no-fetch",
-                "--non-interactive",
-                "--format",
-                "json"
-            ]
+            ["status", "--no-fetch", "--non-interactive", "--json"]
         );
         assert_eq!(
             RepoUpdaterAdapterCommand::RobotDocsSchemas.args(),

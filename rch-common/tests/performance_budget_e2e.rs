@@ -22,13 +22,13 @@ use rch_common::e2e::harness::{
     ReliabilityLifecycleCommand, ReliabilityScenarioReport, ReliabilityScenarioSpec,
 };
 use rch_common::e2e::logging::{
-    LogLevel, ReliabilityContext, ReliabilityEventInput, ReliabilityPhase, TestLoggerBuilder,
-    RELIABILITY_EVENT_SCHEMA_VERSION,
+    LogLevel, RELIABILITY_EVENT_SCHEMA_VERSION, ReliabilityContext, ReliabilityEventInput,
+    ReliabilityPhase, TestLoggerBuilder,
 };
 use rch_common::e2e::process_triage::{
-    ProcessClassification, ProcessDescriptor, ProcessTriageActionClass,
-    ProcessTriageActionRequest, ProcessTriageContract, ProcessTriageRequest,
-    ProcessTriageTrigger, PROCESS_TRIAGE_CONTRACT_SCHEMA_VERSION, evaluate_triage_action,
+    PROCESS_TRIAGE_CONTRACT_SCHEMA_VERSION, ProcessClassification, ProcessDescriptor,
+    ProcessTriageActionClass, ProcessTriageActionRequest, ProcessTriageContract,
+    ProcessTriageRequest, ProcessTriageTrigger, evaluate_triage_action,
 };
 use rch_common::errors::ErrorCode;
 use rch_common::protocol::HookOutput;
@@ -235,7 +235,15 @@ fn e2e_budget_hook_noncompilation_within_budget() {
 #[test]
 fn e2e_budget_hook_noncompilation_batch_throughput() {
     let commands = [
-        "ls", "cd /tmp", "git status", "echo hi", "cat f", "pwd", "whoami", "date", "env",
+        "ls",
+        "cd /tmp",
+        "git status",
+        "echo hi",
+        "cat f",
+        "pwd",
+        "whoami",
+        "date",
+        "env",
         "export X=1",
     ];
 

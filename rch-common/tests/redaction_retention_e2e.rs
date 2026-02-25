@@ -464,16 +464,25 @@ fn path_matches_pattern(path: &str, pattern: &str) -> bool {
 #[test]
 fn e2e_redaction_env_var_secrets_masked() {
     let secrets = [
-        ("CARGO_REGISTRY_TOKEN=crt_supersecret123", "crt_supersecret123"),
+        (
+            "CARGO_REGISTRY_TOKEN=crt_supersecret123",
+            "crt_supersecret123",
+        ),
         ("GITHUB_TOKEN=ghp_1234567890abcdef", "ghp_1234567890abcdef"),
         ("GH_TOKEN=gho_token_value", "gho_token_value"),
-        ("DATABASE_URL=postgres://user:pass@host/db", "postgres://user:pass@host/db"),
+        (
+            "DATABASE_URL=postgres://user:pass@host/db",
+            "postgres://user:pass@host/db",
+        ),
         ("DB_PASSWORD=hunter2", "hunter2"),
         ("API_KEY=sk-proj-1234567890", "sk-proj-1234567890"),
         ("API_SECRET=secret_value_here", "secret_value_here"),
         ("SECRET_KEY=django-insecure-key", "django-insecure-key"),
         ("AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI", "wJalrXUtnFEMI"),
-        ("AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE", "AKIAIOSFODNN7EXAMPLE"),
+        (
+            "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE",
+            "AKIAIOSFODNN7EXAMPLE",
+        ),
         ("OPENAI_API_KEY=sk-xxxxxxxx", "sk-xxxxxxxx"),
         ("ANTHROPIC_API_KEY=sk-ant-xxxxxxxx", "sk-ant-xxxxxxxx"),
         ("STRIPE_SECRET_KEY=sk_live_12345", "sk_live_12345"),
@@ -529,8 +538,7 @@ fn e2e_redaction_cli_arg_secrets_masked() {
 
 #[test]
 fn e2e_redaction_multiple_secrets_in_one_command() {
-    let cmd =
-        "GITHUB_TOKEN=ghp_abc123 cargo build --release TOKEN=secret1 --password=hunter2 API_KEY=sk-key";
+    let cmd = "GITHUB_TOKEN=ghp_abc123 cargo build --release TOKEN=secret1 --password=hunter2 API_KEY=sk-key";
     let policy = RedactionPolicy::default();
     let (redacted, _) = apply_redaction(cmd, &policy);
 
@@ -574,7 +582,10 @@ fn e2e_redaction_no_false_positives_on_safe_content() {
             &redacted, cmd,
             "safe command was incorrectly redacted: {cmd}"
         );
-        assert!(audit.is_empty(), "safe command generated audit entries: {cmd}");
+        assert!(
+            audit.is_empty(),
+            "safe command generated audit entries: {cmd}"
+        );
     }
 }
 
@@ -784,10 +795,7 @@ fn e2e_retention_artifact_json_matched() {
 #[test]
 fn e2e_retention_replay_bundles_cold_storage() {
     let policy = RetentionPolicy::default();
-    let decision = decide_retention(
-        "target/replay_bundles/incident-123/bundle.json",
-        &policy,
-    );
+    let decision = decide_retention("target/replay_bundles/incident-123/bundle.json", &policy);
 
     assert!(decision.matched_rule.is_some());
     assert_eq!(decision.tier, StorageTier::Cold);
@@ -883,10 +891,7 @@ fn e2e_incident_bundle_not_safe_without_redaction() {
     };
 
     assert!(!bundle.safe_for_sharing);
-    assert!(bundle
-        .artifact_manifest
-        .iter()
-        .any(|a| !a.redacted));
+    assert!(bundle.artifact_manifest.iter().any(|a| !a.redacted));
 }
 
 // ===========================================================================

@@ -188,7 +188,7 @@ fn build_slo_guardrails() -> Vec<SloGuardrail> {
             unit: "ratio".into(),
             threshold: 0.10,
             measurement_window_secs: 86400, // 24h
-            error_budget: 0.0, // any sustained violation is a problem
+            error_budget: 0.0,              // any sustained violation is a problem
             component: "routing".into(),
             ci_tier: "nightly".into(),
             alert: AlertCriteria {
@@ -287,10 +287,7 @@ fn build_slo_guardrails() -> Vec<SloGuardrail> {
 
 fn build_slo_config() -> SloConfig {
     let guardrails = build_slo_guardrails();
-    let release_blocking = guardrails
-        .iter()
-        .filter(|g| g.alert.blocks_release)
-        .count();
+    let release_blocking = guardrails.iter().filter(|g| g.alert.blocks_release).count();
 
     let mut components: Vec<String> = guardrails.iter().map(|g| g.component.clone()).collect();
     components.sort();
@@ -324,7 +321,10 @@ fn check_slo(guardrail: &SloGuardrail, samples: &[MetricSample]) -> SloCheckResu
         };
     }
 
-    let violations = samples.iter().filter(|s| s.value > guardrail.threshold).count() as u32;
+    let violations = samples
+        .iter()
+        .filter(|s| s.value > guardrail.threshold)
+        .count() as u32;
     let violation_rate = violations as f64 / samples.len() as f64;
     let budget_remaining = guardrail.error_budget - violation_rate;
     let avg_value = samples.iter().map(|s| s.value).sum::<f64>() / samples.len() as f64;
@@ -480,7 +480,10 @@ fn e2e_slo_no_duplicate_ids() {
     let mut seen = HashMap::new();
     for g in &config.guardrails {
         if let Some(prev) = seen.insert(&g.id, &g.description) {
-            panic!("duplicate SLO ID '{}': '{}' vs '{}'", g.id, prev, g.description);
+            panic!(
+                "duplicate SLO ID '{}': '{}' vs '{}'",
+                g.id, prev, g.description
+            );
         }
     }
 }
@@ -502,7 +505,10 @@ fn e2e_slo_covers_hook_latency() {
 fn e2e_slo_covers_convergence_latency() {
     let config = build_slo_config();
     assert!(
-        config.guardrails.iter().any(|g| g.component == "convergence"),
+        config
+            .guardrails
+            .iter()
+            .any(|g| g.component == "convergence"),
         "must have convergence latency guardrail"
     );
 }
@@ -548,12 +554,24 @@ fn e2e_slo_covers_cancellation() {
 fn e2e_slo_check_passes_when_under_threshold() {
     let guardrail = &build_slo_guardrails()[0]; // SLO-HOOK-P50, threshold=1.0ms
     let samples = vec![
-        MetricSample { value: 0.5, timestamp_ms: 1000 },
-        MetricSample { value: 0.8, timestamp_ms: 2000 },
-        MetricSample { value: 0.3, timestamp_ms: 3000 },
+        MetricSample {
+            value: 0.5,
+            timestamp_ms: 1000,
+        },
+        MetricSample {
+            value: 0.8,
+            timestamp_ms: 2000,
+        },
+        MetricSample {
+            value: 0.3,
+            timestamp_ms: 3000,
+        },
     ];
     let result = check_slo(guardrail, &samples);
-    assert!(result.passed, "should pass when all samples under threshold");
+    assert!(
+        result.passed,
+        "should pass when all samples under threshold"
+    );
     assert_eq!(result.violation_count, 0);
 }
 
@@ -562,8 +580,14 @@ fn e2e_slo_check_fails_when_budget_exhausted() {
     let guardrail = &build_slo_guardrails()[0]; // error_budget=0.01
     // 50% violations far exceeds 1% budget
     let samples = vec![
-        MetricSample { value: 2.0, timestamp_ms: 1000 }, // violation
-        MetricSample { value: 0.5, timestamp_ms: 2000 },
+        MetricSample {
+            value: 2.0,
+            timestamp_ms: 1000,
+        }, // violation
+        MetricSample {
+            value: 0.5,
+            timestamp_ms: 2000,
+        },
     ];
     let result = check_slo(guardrail, &samples);
     assert!(!result.passed, "should fail when error budget exhausted");
@@ -586,7 +610,10 @@ fn e2e_slo_check_passes_within_budget() {
         timestamp_ms: 99000,
     }); // 1 violation
     let result = check_slo(guardrail, &samples);
-    assert!(result.passed, "1% violation rate should be within 5% budget");
+    assert!(
+        result.passed,
+        "1% violation rate should be within 5% budget"
+    );
     assert_eq!(result.violation_count, 1);
 }
 
@@ -622,11 +649,26 @@ fn e2e_slo_alert_requires_consecutive_violations() {
     };
 
     // First two violations: no alert yet
-    assert!(!check_alert_hysteresis(guardrail, &mut state, &failing_result, 1000));
-    assert!(!check_alert_hysteresis(guardrail, &mut state, &failing_result, 2000));
+    assert!(!check_alert_hysteresis(
+        guardrail,
+        &mut state,
+        &failing_result,
+        1000
+    ));
+    assert!(!check_alert_hysteresis(
+        guardrail,
+        &mut state,
+        &failing_result,
+        2000
+    ));
 
     // Third violation: alert fires
-    assert!(check_alert_hysteresis(guardrail, &mut state, &failing_result, 3000));
+    assert!(check_alert_hysteresis(
+        guardrail,
+        &mut state,
+        &failing_result,
+        3000
+    ));
 }
 
 #[test]
@@ -649,10 +691,20 @@ fn e2e_slo_alert_debounced() {
     };
 
     // Too soon after last alert (300s = 300_000ms)
-    assert!(!check_alert_hysteresis(guardrail, &mut state, &failing_result, 100_000));
+    assert!(!check_alert_hysteresis(
+        guardrail,
+        &mut state,
+        &failing_result,
+        100_000
+    ));
 
     // After debounce interval
-    assert!(check_alert_hysteresis(guardrail, &mut state, &failing_result, 400_000));
+    assert!(check_alert_hysteresis(
+        guardrail,
+        &mut state,
+        &failing_result,
+        400_000
+    ));
 }
 
 #[test]
@@ -698,7 +750,10 @@ fn e2e_slo_regression_detected() {
 fn e2e_slo_no_regression_when_improved() {
     let guardrail = &build_slo_guardrails()[0];
     let report = build_regression_report(guardrail, 1.0, 0.5);
-    assert!(report.is_none(), "improvement should not generate regression report");
+    assert!(
+        report.is_none(),
+        "improvement should not generate regression report"
+    );
 }
 
 #[test]
@@ -726,7 +781,11 @@ fn e2e_slo_has_release_blocking_guardrails() {
 #[test]
 fn e2e_slo_hook_latency_blocks_release() {
     let config = build_slo_config();
-    let hook_p99 = config.guardrails.iter().find(|g| g.id == "SLO-HOOK-P99").unwrap();
+    let hook_p99 = config
+        .guardrails
+        .iter()
+        .find(|g| g.id == "SLO-HOOK-P99")
+        .unwrap();
     assert!(
         hook_p99.alert.blocks_release,
         "hook P99 latency violation must block release"

@@ -73,10 +73,7 @@ fn build_runbook_requirements() -> Vec<DocRequirement> {
         DocRequirement {
             id: "DOC-DIAG-001".into(),
             section: "Quick Diagnosis".into(),
-            required_content: vec![
-                "rch status".into(),
-                "rch doctor".into(),
-            ],
+            required_content: vec!["rch status".into(), "rch doctor".into()],
             description: "Runbook must include diagnostic commands".into(),
         },
         DocRequirement {
@@ -102,7 +99,8 @@ fn build_runbook_requirements() -> Vec<DocRequirement> {
                 "rch workers probe".into(),
                 "Risk:".into(),
             ],
-            description: "Worker unreachable failure mode documented with remediation and risk".into(),
+            description: "Worker unreachable failure mode documented with remediation and risk"
+                .into(),
         },
         DocRequirement {
             id: "DOC-FAIL-002".into(),
@@ -129,19 +127,13 @@ fn build_runbook_requirements() -> Vec<DocRequirement> {
         DocRequirement {
             id: "DOC-FAIL-004".into(),
             section: "All Workers Down".into(),
-            required_content: vec![
-                "local-only".into(),
-                "fail-open".into(),
-            ],
+            required_content: vec!["local-only".into(), "fail-open".into()],
             description: "Fail-open scenario documented".into(),
         },
         DocRequirement {
             id: "DOC-FAIL-005".into(),
             section: "Schema Mismatch".into(),
-            required_content: vec![
-                "schema_mismatch".into(),
-                "migration".into(),
-            ],
+            required_content: vec!["schema_mismatch".into(), "migration".into()],
             description: "Schema mismatch failure mode documented".into(),
         },
         DocRequirement {
@@ -168,20 +160,13 @@ fn build_runbook_requirements() -> Vec<DocRequirement> {
         DocRequirement {
             id: "DOC-TRIAGE-001".into(),
             section: "Incident Triage".into(),
-            required_content: vec![
-                "posture".into(),
-                "Escalation".into(),
-            ],
+            required_content: vec!["posture".into(), "Escalation".into()],
             description: "Incident triage flowchart documented".into(),
         },
         DocRequirement {
             id: "DOC-DRYRUN-001".into(),
             section: "Dry-Run".into(),
-            required_content: vec![
-                "safe to run".into(),
-                "--force".into(),
-                "destructive".into(),
-            ],
+            required_content: vec!["safe to run".into(), "--force".into(), "destructive".into()],
             description: "Dry-run safety guidance documented".into(),
         },
     ]
@@ -325,7 +310,11 @@ fn e2e_docs_existing_runbooks_present() {
         .parent()
         .unwrap()
         .join("docs/runbooks");
-    let expected = ["debugging-slow-builds.md", "worker-recovery.md", "reliability-operations.md"];
+    let expected = [
+        "debugging-slow-builds.md",
+        "worker-recovery.md",
+        "reliability-operations.md",
+    ];
     for file in &expected {
         assert!(
             docs_dir.join(file).exists(),
@@ -349,7 +338,9 @@ fn e2e_docs_error_taxonomy_matches_implementation() {
     let content = std::fs::read_to_string(&path).unwrap();
 
     // All documented ranges must be present
-    let ranges = ["RCH-E0xx", "RCH-E1xx", "RCH-E2xx", "RCH-E3xx", "RCH-E4xx", "RCH-E5xx"];
+    let ranges = [
+        "RCH-E0xx", "RCH-E1xx", "RCH-E2xx", "RCH-E3xx", "RCH-E4xx", "RCH-E5xx",
+    ];
     for range in &ranges {
         assert!(
             content.contains(range),

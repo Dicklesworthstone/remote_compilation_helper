@@ -133,7 +133,7 @@ pub fn render(frame: &mut Frame, state: &TuiState) {
             .margin(ftui_core::geometry::Sides::all(1))
             .constraints([
                 Constraint::Fixed(3), // Header
-                Constraint::Min(10),   // Main content
+                Constraint::Min(10),  // Main content
                 Constraint::Fixed(3), // Detail bar
                 Constraint::Fixed(3), // Footer
             ])
@@ -143,7 +143,7 @@ pub fn render(frame: &mut Frame, state: &TuiState) {
             .margin(ftui_core::geometry::Sides::all(1))
             .constraints([
                 Constraint::Fixed(3), // Header
-                Constraint::Min(10),   // Main content
+                Constraint::Min(10),  // Main content
                 Constraint::Fixed(3), // Footer
             ])
             .split(frame.bounds())
@@ -195,7 +195,9 @@ fn render_filter_input(frame: &mut Frame, state: &TuiState, colors: &ColorScheme
     let input_area = Rect::new(x, y, width, 3);
 
     // Clear the area behind the overlay
-    frame.buffer.fill(input_area, ftui_render::cell::Cell::default());
+    frame
+        .buffer
+        .fill(input_area, ftui_render::cell::Cell::default());
 
     // Show search query with cursor indicator
     let cursor = "█";
@@ -232,14 +234,14 @@ fn render_confirm_dialog(frame: &mut Frame, dialog: &ConfirmDialog, colors: &Col
     let y = (area.height.saturating_sub(height)) / 2;
     let dialog_area = Rect::new(x, y, width, height);
 
-    frame.buffer.fill(dialog_area, ftui_render::cell::Cell::default());
+    frame
+        .buffer
+        .fill(dialog_area, ftui_render::cell::Cell::default());
 
     let mut lines = vec![
         Line::from(Span::styled(
             &dialog.title,
-            Style::new()
-                .fg(colors.warning)
-                .bold(),
+            Style::new().fg(colors.warning).bold(),
         )),
         Line::from(""),
     ];
@@ -252,19 +254,9 @@ fn render_confirm_dialog(frame: &mut Frame, dialog: &ConfirmDialog, colors: &Col
     lines.push(Line::from(""));
     lines.push(Line::from_spans(vec![
         Span::styled("      [", Style::new().fg(colors.muted)),
-        Span::styled(
-            "Y",
-            Style::new()
-                .fg(colors.success)
-                .bold(),
-        ),
+        Span::styled("Y", Style::new().fg(colors.success).bold()),
         Span::styled("]es    [", Style::new().fg(colors.muted)),
-        Span::styled(
-            "N",
-            Style::new()
-                .fg(colors.error)
-                .bold(),
-        ),
+        Span::styled("N", Style::new().fg(colors.error).bold()),
         Span::styled("]o", Style::new().fg(colors.muted)),
     ]));
 
@@ -300,12 +292,7 @@ fn render_header(frame: &mut Frame, area: Rect, state: &TuiState, colors: &Color
     let status_style = Style::new().fg(status_color);
 
     let header = Paragraph::new(Line::from_spans(vec![
-        Span::styled(
-            "RCH Dashboard",
-            Style::new()
-                .fg(colors.highlight)
-                .bold(),
-        ),
+        Span::styled("RCH Dashboard", Style::new().fg(colors.highlight).bold()),
         Span::raw(" | "),
         Span::styled(status_text, status_style),
         Span::raw(" | "),
@@ -399,9 +386,7 @@ fn render_workers_panel(frame: &mut Frame, area: Rect, state: &TuiState, colors:
             };
 
             let style = if is_selected && i == state.selected_index {
-                Style::new()
-                    .bg(colors.selected_bg)
-                    .fg(colors.selected_fg)
+                Style::new().bg(colors.selected_bg).fg(colors.selected_fg)
             } else {
                 Style::new()
             };
@@ -474,9 +459,7 @@ fn render_active_builds_panel(
                 .unwrap_or_default();
 
             let style = if is_selected && i == state.selected_index {
-                Style::new()
-                    .bg(colors.selected_bg)
-                    .fg(colors.selected_fg)
+                Style::new().bg(colors.selected_bg).fg(colors.selected_fg)
             } else {
                 Style::new()
             };
@@ -545,9 +528,7 @@ fn render_build_history_panel(
             let status_color = indicator_color(build_indicator, colors);
 
             let style = if is_selected && i == state.selected_index {
-                Style::new()
-                    .bg(colors.selected_bg)
-                    .fg(colors.selected_fg)
+                Style::new().bg(colors.selected_bg).fg(colors.selected_fg)
             } else {
                 Style::new()
             };
@@ -564,10 +545,7 @@ fn render_build_history_panel(
                 Span::raw(cmd),
                 Span::raw(" @ "),
                 Span::styled(worker, Style::new().fg(colors.highlight)),
-                Span::styled(
-                    format!(" ({})", duration),
-                    Style::new().fg(colors.muted),
-                ),
+                Span::styled(format!(" ({})", duration), Style::new().fg(colors.muted)),
             ]))
             .style(style)
         })
@@ -670,16 +648,13 @@ fn truncate_command(cmd: &str, max_len: usize) -> String {
 /// Render the detail bar showing full content of the selected item.
 fn render_detail_bar(frame: &mut Frame, area: Rect, state: &TuiState, colors: &ColorScheme) {
     let detail = state.selected_detail().unwrap_or_default();
-    let paragraph = Paragraph::new(Line::from(Span::styled(
-        detail,
-        Style::new().fg(colors.fg),
-    )))
-    .block(
-        Block::new()
-            .borders(Borders::ALL)
-            .title("Selected")
-            .border_style(Style::new().fg(colors.muted)),
-    );
+    let paragraph = Paragraph::new(Line::from(Span::styled(detail, Style::new().fg(colors.fg))))
+        .block(
+            Block::new()
+                .borders(Borders::ALL)
+                .title("Selected")
+                .border_style(Style::new().fg(colors.muted)),
+        );
     paragraph.render(area, frame);
 }
 
@@ -704,12 +679,7 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &TuiState, colors: &Color
         .iter()
         .flat_map(|(key, desc)| {
             vec![
-                Span::styled(
-                    *key,
-                    Style::new()
-                        .fg(colors.highlight)
-                        .bold(),
-                ),
+                Span::styled(*key, Style::new().fg(colors.highlight).bold()),
                 Span::raw(": "),
                 Span::styled(*desc, Style::new().fg(colors.fg)),
                 Span::raw(" | "),
@@ -735,20 +705,17 @@ fn render_help_overlay(frame: &mut Frame, colors: &ColorScheme) {
     let help_area = Rect::new(x, y, width, height);
 
     // Clear the area behind the overlay
-    frame.buffer.fill(help_area, ftui_render::cell::Cell::default());
+    frame
+        .buffer
+        .fill(help_area, ftui_render::cell::Cell::default());
 
     let help_text = vec![
         Line::from(Span::styled(
             "RCH Dashboard Help",
-            Style::new()
-                .fg(colors.highlight)
-                .bold(),
+            Style::new().fg(colors.highlight).bold(),
         )),
         Line::from(""),
-        Line::from_spans(vec![Span::styled(
-            "Navigation",
-            Style::new().bold(),
-        )]),
+        Line::from_spans(vec![Span::styled("Navigation", Style::new().bold())]),
         Line::from("  ↑/k, ↓/j    Move selection up/down"),
         Line::from("  →/l, Tab    Next panel"),
         Line::from("  ←/h, S-Tab  Previous panel"),
@@ -766,10 +733,7 @@ fn render_help_overlay(frame: &mut Frame, colors: &ColorScheme) {
         Line::from("  g           Jump to top"),
         Line::from("  G           Jump to bottom (resume auto-scroll)"),
         Line::from(""),
-        Line::from_spans(vec![Span::styled(
-            "Actions",
-            Style::new().bold(),
-        )]),
+        Line::from_spans(vec![Span::styled("Actions", Style::new().bold())]),
         Line::from("  r           Refresh data from daemon"),
         Line::from("  y           Copy selected item"),
         Line::from(""),
@@ -789,10 +753,7 @@ fn render_help_overlay(frame: &mut Frame, colors: &ColorScheme) {
         Line::from("  x           Cancel selected build (SIGTERM)"),
         Line::from("  X           Force kill selected build (SIGKILL)"),
         Line::from(""),
-        Line::from_spans(vec![Span::styled(
-            "Search & Filter",
-            Style::new().bold(),
-        )]),
+        Line::from_spans(vec![Span::styled("Search & Filter", Style::new().bold())]),
         Line::from("  /           Open filter (Build History panel)"),
         Line::from("  Enter       Apply filter"),
         Line::from("  Esc         Cancel filter"),
@@ -804,10 +765,7 @@ fn render_help_overlay(frame: &mut Frame, colors: &ColorScheme) {
         Line::from("  s           Cycle sort order"),
         Line::from("  S           Reverse sort direction"),
         Line::from(""),
-        Line::from_spans(vec![Span::styled(
-            "General",
-            Style::new().bold(),
-        )]),
+        Line::from_spans(vec![Span::styled("General", Style::new().bold())]),
         Line::from("  q, Esc      Quit / Close overlay"),
         Line::from("  ?, F1       Toggle this help"),
         Line::from("  Ctrl+C      Force quit"),
@@ -842,12 +800,7 @@ fn render_error_bar(frame: &mut Frame, error: &str, colors: &ColorScheme) {
     );
 
     let error_msg = Paragraph::new(Line::from_spans(vec![
-        Span::styled(
-            "Error: ",
-            Style::new()
-                .fg(colors.error)
-                .bold(),
-        ),
+        Span::styled("Error: ", Style::new().fg(colors.error).bold()),
         Span::styled(error, Style::new().fg(colors.error)),
     ]));
 
@@ -864,7 +817,10 @@ fn render_copy_feedback(frame: &mut Frame, colors: &ColorScheme) {
     let feedback_area = Rect::new(x, 1, width, 1);
     let visible = &message[..width as usize];
 
-    let feedback = Paragraph::new(Line::from(Span::styled(visible, Style::new().fg(colors.success))));
+    let feedback = Paragraph::new(Line::from(Span::styled(
+        visible,
+        Style::new().fg(colors.success),
+    )));
 
     feedback.render(feedback_area, frame);
 }

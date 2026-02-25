@@ -13,8 +13,8 @@ use rch_common::e2e::harness::{
     ReliabilityLifecycleCommand, ReliabilityScenarioReport, ReliabilityScenarioSpec,
 };
 use rch_common::e2e::logging::{
-    LogLevel, ReliabilityContext, ReliabilityEventInput, ReliabilityPhase, TestLoggerBuilder,
-    RELIABILITY_EVENT_SCHEMA_VERSION,
+    LogLevel, RELIABILITY_EVENT_SCHEMA_VERSION, ReliabilityContext, ReliabilityEventInput,
+    ReliabilityPhase, TestLoggerBuilder,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -94,10 +94,7 @@ struct DivergencePoint {
 // ===========================================================================
 
 /// Check bundle schema/version compatibility before replay.
-fn check_bundle_compatibility(
-    bundle: &ReplayBundle,
-    current_schema: &str,
-) -> Vec<String> {
+fn check_bundle_compatibility(bundle: &ReplayBundle, current_schema: &str) -> Vec<String> {
     let mut issues = Vec::new();
 
     if bundle.schema_version != current_schema {
@@ -275,8 +272,7 @@ fn build_sample_spec(scenario_id: &str) -> ReliabilityScenarioSpec {
                 .with_timeout_secs(300),
         )
         .add_execute_command(
-            ReliabilityLifecycleCommand::new("test", "echo", ["cargo test"])
-                .with_timeout_secs(600),
+            ReliabilityLifecycleCommand::new("test", "echo", ["cargo test"]).with_timeout_secs(600),
         )
         .add_post_check(ReliabilityLifecycleCommand::new(
             "verify-artifacts",
@@ -344,19 +340,20 @@ fn build_sample_bundle(scenario_id: &str) -> ReplayBundle {
             worker_id: Some("css".to_string()),
             env_vars: {
                 let mut m = HashMap::new();
-                m.insert("CARGO_TARGET_DIR".to_string(), "/data/tmp/cargo-target".to_string());
+                m.insert(
+                    "CARGO_TARGET_DIR".to_string(),
+                    "/data/tmp/cargo-target".to_string(),
+                );
                 m.insert("HOME".to_string(), "/home/ubuntu".to_string());
                 m
             },
         },
-        artifact_manifest: vec![
-            ArtifactEntry {
-                name: "build-log".to_string(),
-                path: "/tmp/build.log".to_string(),
-                hash: "sha256:abc123".to_string(),
-                size_bytes: 4096,
-            },
-        ],
+        artifact_manifest: vec![ArtifactEntry {
+            name: "build-log".to_string(),
+            path: "/tmp/build.log".to_string(),
+            hash: "sha256:abc123".to_string(),
+            size_bytes: 4096,
+        }],
     }
 }
 
@@ -383,11 +380,7 @@ fn e2e_replay_bundle_capture_roundtrip() {
 fn e2e_replay_bundle_contains_all_phases() {
     let bundle = build_sample_bundle("replay-phases");
 
-    let phases: Vec<ReliabilityPhase> = bundle
-        .decision_trace
-        .iter()
-        .map(|t| t.phase)
-        .collect();
+    let phases: Vec<ReliabilityPhase> = bundle.decision_trace.iter().map(|t| t.phase).collect();
 
     assert!(phases.contains(&ReliabilityPhase::Setup));
     assert!(phases.contains(&ReliabilityPhase::Execute));
@@ -743,18 +736,24 @@ fn e2e_replay_bundle_with_failure_hooks_roundtrip() {
     let parsed: ReplayBundle = serde_json::from_str(&json).unwrap();
 
     assert_eq!(parsed.scenario_spec.requested_failure_hooks.len(), 2);
-    assert!(parsed
-        .scenario_spec
-        .failure_hook_flags
-        .allows(ReliabilityFailureHook::NetworkCut));
-    assert!(parsed
-        .scenario_spec
-        .failure_hook_flags
-        .allows(ReliabilityFailureHook::SyncTimeout));
-    assert!(!parsed
-        .scenario_spec
-        .failure_hook_flags
-        .allows(ReliabilityFailureHook::DaemonRestart));
+    assert!(
+        parsed
+            .scenario_spec
+            .failure_hook_flags
+            .allows(ReliabilityFailureHook::NetworkCut)
+    );
+    assert!(
+        parsed
+            .scenario_spec
+            .failure_hook_flags
+            .allows(ReliabilityFailureHook::SyncTimeout)
+    );
+    assert!(
+        !parsed
+            .scenario_spec
+            .failure_hook_flags
+            .allows(ReliabilityFailureHook::DaemonRestart)
+    );
 }
 
 // ===========================================================================
@@ -782,10 +781,7 @@ fn e2e_replay_events_logged_correctly() {
         },
         phase: ReliabilityPhase::Verify,
         scenario_id: "replay-logged".to_string(),
-        message: format!(
-            "replay complete: {} divergences",
-            divergences.len()
-        ),
+        message: format!("replay complete: {} divergences", divergences.len()),
         context: ReliabilityContext {
             worker_id: Some("css".to_string()),
             repo_set: vec!["/data/projects/rch".to_string()],
@@ -857,7 +853,10 @@ fn e2e_replay_env_snapshot_serialization() {
         worker_id: Some("css".to_string()),
         env_vars: {
             let mut m = HashMap::new();
-            m.insert("CARGO_TARGET_DIR".to_string(), "/data/tmp/cargo-target".to_string());
+            m.insert(
+                "CARGO_TARGET_DIR".to_string(),
+                "/data/tmp/cargo-target".to_string(),
+            );
             m.insert("RUSTFLAGS".to_string(), "-C target-cpu=native".to_string());
             m
         },

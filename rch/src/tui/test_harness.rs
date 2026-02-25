@@ -339,9 +339,7 @@ mod tests {
         init_test_logging();
         info!("TEST START: test_render_to_string_basic");
         let content = render_to_string(20, 5, |f| {
-            let block = Block::new()
-                .title("Test")
-                .borders(Borders::ALL);
+            let block = Block::new().title("Test").borders(Borders::ALL);
             block.render(f.bounds(), f);
         });
         info!("VERIFY: rendered content contains title");
@@ -355,9 +353,7 @@ mod tests {
         info!("TEST START: test_render_to_string_at_various_sizes");
         for (w, h) in [(40, 12), (80, 24), (120, 40)] {
             let content = render_to_string(w, h, |f| {
-                let block = Block::new()
-                    .title("Size Test")
-                    .borders(Borders::ALL);
+                let block = Block::new().title("Size Test").borders(Borders::ALL);
                 block.render(f.bounds(), f);
             });
             info!(
@@ -377,9 +373,7 @@ mod tests {
         info!("TEST START: test_render_to_area");
         let area = Rect::new(0, 0, 30, 5);
         let content = render_to_area(area, |f, rect| {
-            let block = Block::new()
-                .title("Area")
-                .borders(Borders::ALL);
+            let block = Block::new().title("Area").borders(Borders::ALL);
             block.render(rect, f);
         });
         info!("VERIFY: rendered area contains title");

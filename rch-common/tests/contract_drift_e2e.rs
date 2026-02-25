@@ -16,16 +16,16 @@ use rch_common::e2e::logging::{
     LogLevel, ReliabilityContext, ReliabilityEventInput, ReliabilityPhase, TestLoggerBuilder,
 };
 use rch_common::e2e::process_triage::{
-    ProcessClassification, ProcessDescriptor, ProcessTriageActionClass,
-    ProcessTriageActionRequest, ProcessTriageContract, ProcessTriageRequest,
-    ProcessTriageTrigger, PROCESS_TRIAGE_CONTRACT_SCHEMA_VERSION, evaluate_triage_action,
+    PROCESS_TRIAGE_CONTRACT_SCHEMA_VERSION, ProcessClassification, ProcessDescriptor,
+    ProcessTriageActionClass, ProcessTriageActionRequest, ProcessTriageContract,
+    ProcessTriageRequest, ProcessTriageTrigger, evaluate_triage_action,
     process_triage_request_schema, process_triage_response_schema,
 };
 use rch_common::errors::ErrorCode;
 use rch_common::repo_updater_contract::{
+    REPO_UPDATER_CONTRACT_SCHEMA_VERSION, REPO_UPDATER_MIN_SUPPORTED_VERSION,
     RepoUpdaterAdapterCommand, RepoUpdaterAdapterContract, RepoUpdaterFailureKind,
     RepoUpdaterFallbackMode, RepoUpdaterVersionCompatibility, RepoUpdaterVersionPolicy,
-    REPO_UPDATER_CONTRACT_SCHEMA_VERSION, REPO_UPDATER_MIN_SUPPORTED_VERSION,
     build_invocation, classify_exit_code, evaluate_version_compatibility,
     map_failure_kind_to_error_code, repo_updater_envelope_schema, repo_updater_request_schema,
     repo_updater_response_schema,
@@ -124,9 +124,7 @@ fn check_schema_version(
         expected: expected.to_string(),
         observed: observed.to_string(),
         severity,
-        remediation: format!(
-            "Update contract adapter to match schema version {expected}"
-        ),
+        remediation: format!("Update contract adapter to match schema version {expected}"),
         decision_code: "DRIFT_SCHEMA_VERSION_MISMATCH".to_string(),
     })
 }
@@ -194,9 +192,7 @@ fn check_timeout_drift(
         } else {
             DriftSeverity::Warning
         },
-        remediation: format!(
-            "Adjust {operation} timeout to [{min_secs}, {max_secs}] seconds"
-        ),
+        remediation: format!("Adjust {operation} timeout to [{min_secs}, {max_secs}] seconds"),
         decision_code: "DRIFT_TIMEOUT_OUT_OF_RANGE".to_string(),
     })
 }
@@ -249,7 +245,10 @@ fn e2e_ru_schema_version_matches_contract() {
     let parts: Vec<&str> = REPO_UPDATER_CONTRACT_SCHEMA_VERSION.split('.').collect();
     assert_eq!(parts.len(), 3, "schema version must be semver");
     for part in &parts {
-        assert!(part.parse::<u32>().is_ok(), "semver part must be numeric: {part}");
+        assert!(
+            part.parse::<u32>().is_ok(),
+            "semver part must be numeric: {part}"
+        );
     }
 }
 
@@ -356,13 +355,34 @@ fn e2e_ru_exit_code_classification_stable() {
     // Exit codes 0-5 must classify to known dispositions
     use rch_common::repo_updater_contract::RepoUpdaterExitDisposition;
 
-    assert!(matches!(classify_exit_code(0), RepoUpdaterExitDisposition::Success));
-    assert!(matches!(classify_exit_code(1), RepoUpdaterExitDisposition::PartialFailure));
-    assert!(matches!(classify_exit_code(2), RepoUpdaterExitDisposition::Conflicts));
-    assert!(matches!(classify_exit_code(3), RepoUpdaterExitDisposition::SystemError));
-    assert!(matches!(classify_exit_code(4), RepoUpdaterExitDisposition::InvalidArguments));
-    assert!(matches!(classify_exit_code(5), RepoUpdaterExitDisposition::Interrupted));
-    assert!(matches!(classify_exit_code(99), RepoUpdaterExitDisposition::Unknown));
+    assert!(matches!(
+        classify_exit_code(0),
+        RepoUpdaterExitDisposition::Success
+    ));
+    assert!(matches!(
+        classify_exit_code(1),
+        RepoUpdaterExitDisposition::PartialFailure
+    ));
+    assert!(matches!(
+        classify_exit_code(2),
+        RepoUpdaterExitDisposition::Conflicts
+    ));
+    assert!(matches!(
+        classify_exit_code(3),
+        RepoUpdaterExitDisposition::SystemError
+    ));
+    assert!(matches!(
+        classify_exit_code(4),
+        RepoUpdaterExitDisposition::InvalidArguments
+    ));
+    assert!(matches!(
+        classify_exit_code(5),
+        RepoUpdaterExitDisposition::Interrupted
+    ));
+    assert!(matches!(
+        classify_exit_code(99),
+        RepoUpdaterExitDisposition::Unknown
+    ));
 }
 
 #[test]
@@ -462,10 +482,7 @@ fn e2e_ru_timeout_policy_within_bounds() {
         findings.push(f);
     }
 
-    assert!(
-        findings.is_empty(),
-        "timeout drift detected: {findings:?}"
-    );
+    assert!(findings.is_empty(), "timeout drift detected: {findings:?}");
 }
 
 #[test]
@@ -526,7 +543,10 @@ fn e2e_pt_action_class_risk_ordering() {
         signal: Some("SIGKILL".to_string()),
     };
     let hard_result = evaluate_triage_action(&request, &contract, &hard_action);
-    assert!(!hard_result.permitted, "HardTerminate should be denied by default");
+    assert!(
+        !hard_result.permitted,
+        "HardTerminate should be denied by default"
+    );
 }
 
 #[test]
@@ -641,10 +661,7 @@ fn e2e_pt_timeout_policy_within_bounds() {
         findings.push(f);
     }
 
-    assert!(
-        findings.is_empty(),
-        "timeout drift detected: {findings:?}"
-    );
+    assert!(findings.is_empty(), "timeout drift detected: {findings:?}");
 }
 
 #[test]
@@ -664,10 +681,7 @@ fn e2e_pt_error_taxonomy_coverage() {
 
     for kind in &failure_kinds {
         let json = serde_json::to_string(kind).unwrap();
-        assert!(
-            !json.is_empty(),
-            "failure kind {kind:?} must serialize"
-        );
+        assert!(!json.is_empty(), "failure kind {kind:?} must serialize");
     }
 }
 
@@ -771,21 +785,13 @@ fn e2e_cross_retry_policies_consistent() {
 
 #[test]
 fn e2e_fallback_compilation_path_is_fail_open() {
-    let finding = evaluate_fallback_on_mismatch(
-        HelperComponent::RepoUpdater,
-        false,
-        "fail_open",
-    );
+    let finding = evaluate_fallback_on_mismatch(HelperComponent::RepoUpdater, false, "fail_open");
     assert_eq!(finding.severity, DriftSeverity::Info);
 }
 
 #[test]
 fn e2e_fallback_security_path_must_fail_closed() {
-    let finding = evaluate_fallback_on_mismatch(
-        HelperComponent::ProcessTriage,
-        true,
-        "fail_open",
-    );
+    let finding = evaluate_fallback_on_mismatch(HelperComponent::ProcessTriage, true, "fail_open");
     assert_eq!(
         finding.severity,
         DriftSeverity::Critical,
@@ -795,11 +801,8 @@ fn e2e_fallback_security_path_must_fail_closed() {
 
 #[test]
 fn e2e_fallback_security_path_fail_closed_is_ok() {
-    let finding = evaluate_fallback_on_mismatch(
-        HelperComponent::ProcessTriage,
-        true,
-        "fail_closed",
-    );
+    let finding =
+        evaluate_fallback_on_mismatch(HelperComponent::ProcessTriage, true, "fail_closed");
     assert_ne!(finding.severity, DriftSeverity::Critical);
 }
 
@@ -915,32 +918,20 @@ fn e2e_suite_summary_serialization() {
 
 #[test]
 fn e2e_schema_drift_same_version_no_finding() {
-    let finding = check_schema_version(
-        HelperComponent::RepoUpdater,
-        "1.0.0",
-        "1.0.0",
-    );
+    let finding = check_schema_version(HelperComponent::RepoUpdater, "1.0.0", "1.0.0");
     assert!(finding.is_none());
 }
 
 #[test]
 fn e2e_schema_drift_minor_bump_is_warning() {
-    let finding = check_schema_version(
-        HelperComponent::RepoUpdater,
-        "1.0.0",
-        "1.1.0",
-    );
+    let finding = check_schema_version(HelperComponent::RepoUpdater, "1.0.0", "1.1.0");
     assert!(finding.is_some());
     assert_eq!(finding.unwrap().severity, DriftSeverity::Warning);
 }
 
 #[test]
 fn e2e_schema_drift_major_bump_is_critical() {
-    let finding = check_schema_version(
-        HelperComponent::ProcessTriage,
-        "1.0.0",
-        "2.0.0",
-    );
+    let finding = check_schema_version(HelperComponent::ProcessTriage, "1.0.0", "2.0.0");
     assert!(finding.is_some());
     assert_eq!(finding.unwrap().severity, DriftSeverity::Critical);
 }
@@ -988,7 +979,10 @@ fn e2e_mixed_version_environment_deterministic_diagnostics() {
     ];
 
     // Build summary
-    let all_findings: Vec<_> = checks.iter().flat_map(|c| c.drift_findings.clone()).collect();
+    let all_findings: Vec<_> = checks
+        .iter()
+        .flat_map(|c| c.drift_findings.clone())
+        .collect();
     let summary = CompatibilitySuiteSummary {
         total_checks: checks.len(),
         pass: checks.iter().filter(|c| c.is_compatible).count(),
@@ -1097,10 +1091,7 @@ fn e2e_mock_adapter_records_calls() {
 
     let calls = mock.calls();
     assert_eq!(calls.len(), 1);
-    assert_eq!(
-        calls[0].command,
-        RepoUpdaterAdapterCommand::Version
-    );
+    assert_eq!(calls[0].command, RepoUpdaterAdapterCommand::Version);
 }
 
 // ===========================================================================
@@ -1148,20 +1139,14 @@ fn e2e_full_compatibility_sweep() {
     }
 
     // 4. Check fallback semantics
-    let ru_fallback = evaluate_fallback_on_mismatch(
-        HelperComponent::RepoUpdater,
-        false,
-        "fail_open",
-    );
+    let ru_fallback =
+        evaluate_fallback_on_mismatch(HelperComponent::RepoUpdater, false, "fail_open");
     if ru_fallback.severity == DriftSeverity::Critical {
         findings.push(ru_fallback);
     }
 
-    let pt_fallback = evaluate_fallback_on_mismatch(
-        HelperComponent::ProcessTriage,
-        true,
-        "fail_closed",
-    );
+    let pt_fallback =
+        evaluate_fallback_on_mismatch(HelperComponent::ProcessTriage, true, "fail_closed");
     if pt_fallback.severity == DriftSeverity::Critical {
         findings.push(pt_fallback);
     }
@@ -1210,7 +1195,9 @@ fn e2e_full_compatibility_sweep() {
 // Helpers
 // ===========================================================================
 
-fn make_ru_request(command: RepoUpdaterAdapterCommand) -> rch_common::repo_updater_contract::RepoUpdaterAdapterRequest {
+fn make_ru_request(
+    command: RepoUpdaterAdapterCommand,
+) -> rch_common::repo_updater_contract::RepoUpdaterAdapterRequest {
     use rch_common::repo_updater_contract::{RepoUpdaterAdapterRequest, RepoUpdaterOutputFormat};
     RepoUpdaterAdapterRequest {
         schema_version: REPO_UPDATER_CONTRACT_SCHEMA_VERSION.to_string(),

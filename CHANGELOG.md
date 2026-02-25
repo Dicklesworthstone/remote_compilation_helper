@@ -1,568 +1,295 @@
 # Changelog
 
-All notable changes to the Remote Compilation Helper (RCH) project.
+This is a synthesized, feature-oriented changelog for the last two months of development.
+
+Scope window: **2025-12-25 through 2026-02-25**.
+
+This document is intentionally organized by **finished capabilities** (not commit-by-commit diffs), and each section groups coherent functionality that is fully landed.
 
 ---
 
-## [1.0.5] - 2026-02-02
+## Feature Timeline (Last Two Months)
 
-### Bug Fixes
+## 1) Deterministic Multi-Repo Reliability Platform
 
-**Hook Installation Safety** - Fixed critical bug where `rch hook install` would wipe out existing hooks (like dcg) instead of merging with them.
+RCH now includes a complete deterministic reliability stack for multi-repo remote builds, including policy, control loops, remediation, and validation.
 
-- **Safe Merge**: Hook installation now properly merges with existing PreToolUse hooks instead of replacing them
-- **Idempotent**: Running `rch hook install` multiple times is now safe and returns early if already installed
-- **Backup Creation**: Both install and uninstall now create timestamped backups before modifying settings
-- **Safe Uninstall**: Hook uninstall now only removes rch from the Bash matcher, preserving other hooks (like dcg)
-- **Append Position**: rch hook is added at the END of the hooks array (after safety guards like dcg)
+### Delivered capability
 
-This matches the robust approach used by the dcg (Destructive Command Guard) installer.
+- Multi-repo topology enforcement for remote execution roots.
+- Path-dependency closure planning and preflight validation.
+- Repo convergence state tracking and repair workflows.
+- Disk-pressure risk scoring + admission/scheduling guards.
+- Process triage and bounded remediation escalation.
+- Deterministic cancellation orchestration and health signals.
+- Unified posture/remediation status surfaces.
 
----
+### Completed workstreams
 
-## [1.1.0] - 2026-02-01
+- `bd-vvmd` (epic)
+- `bd-vvmd.1` Canonical worker filesystem topology
+- `bd-vvmd.2` Path-dependency closure + preflight verification
+- `bd-vvmd.3` Fleet repo convergence + repair surface
+- `bd-vvmd.4` Disk pressure resilience
+- `bd-vvmd.5` Process triage and remediation
+- `bd-vvmd.6` Error taxonomy, telemetry, operator UX
+- `bd-vvmd.7` Comprehensive validation/logging
 
-### Cross-Platform Support
+### Representative commits
 
-**Windows & macOS Compatibility** - RCH now builds and runs on all major platforms:
-
-- **Windows Compilation**: Cross-platform build with proper feature-gating for Unix-only components (`openssh`, daemon socket)
-- **macOS Compatibility**: Platform-specific process detection, handling read-only root filesystem for rich_rust dependencies
-- **Platform-Agnostic Tests**: E2E fixtures use platform-agnostic usernames, binary hash computation works across platforms
-- **Feature-Gated Imports**: Conditional compilation for Unix-specific functionality
-
----
-
-### Fleet Module Overhaul (Stub Elimination)
-
-**Critical: All fleet operations now perform REAL work** - Previously, fleet commands were stubs that reported success without doing anything. This was a major reliability issue discovered during production testing.
-
-**`run_preflight()` - Real SSH Checks**:
-- Parallel SSH connectivity testing to all workers
-- Real disk space queries via `df -BM`
-- Tool availability verification (rsync, zstd, rustup)
-- rch-wkr version detection on workers
-- Timeout handling (30s per check)
-- Issue collection with actionable remediation
-
-**`get_fleet_status()` - Live Worker Queries**:
-- Concurrent worker status checks (semaphore-limited to 10)
-- Real SSH connectivity testing
-- Actual version detection via `rch-wkr --version`
-- Health check execution via `rch-wkr health`
-- Proper timeout handling for unresponsive workers
-
-**`rollback_workers()` - Binary Restoration**:
-- Backup creation during deployment (stored in `~/.config/rch/backups.json`)
-- Real binary restoration via SSH/SCP
-- Version verification after rollback
-- Parallel rollback with graceful worker lifecycle
-- Backup retention (last 3 per worker)
-- CommandRunner trait for testable backup operations
+- `c1bd5cb`, `7d87d3b`, `a876f0c`, `db0728d`, `c8fe9bf`
+- `660e7a4`, `fcfe4e8`, `320780d`, `6bae14b`, `ea3ba1a`
+- `b70e4e7`, `a770153`, `3c55240`, `38260cd`, `1b54521`
+- `ddd0bec`, `77074ba`, `95c8e80`, `7aefab2`, `1c0257d`
 
 ---
 
-### New Commands
+## 2) FrankenTUI Migration (Native ftui Stack)
 
-**`rch config doctor`** - Diagnose configuration issues:
-- Validates SSH identity file existence and permissions
-- Tests worker connectivity
-- Checks daemon socket accessibility
-- Provides remediation suggestions for issues
+The interactive dashboard/TUI stack has been migrated from `ratatui/crossterm` to the FrankenTUI-native `ftui-*` stack.
 
-**`rch config edit`** - Edit configuration in default editor:
-- Opens config.toml or workers.toml in `$EDITOR`
-- Validates syntax after save
-- Supports `--workers` flag for workers.toml
+### Delivered capability
 
-**`rch config get`** - Query individual config values:
-- Dot-notation access (e.g., `rch config get general.log_level`)
-- JSON output support
-- Lists available keys with `--list`
+- Native ftui event/render/layout/widget integration.
+- Updated test harness and snapshot rendering behavior.
+- TUI behavior parity with prior operations (status/builds/history interactions).
 
----
+### Completed epic
 
-### Code Architecture Improvements
+- `bd-q8g6` Epic: Port TUI from `ratatui+crossterm` to FrankenTUI.
 
-**Command Modularization** - The 3800+ line commands.rs was split into focused modules:
+### Representative commits
 
-| Module | Purpose |
-|--------|---------|
-| `commands/daemon.rs` | Daemon lifecycle (start, stop, restart, reload) |
-| `commands/config.rs` | Config show/set/init/get/edit/doctor |
-| `commands/agent.rs` | Agent detection and hook management |
-| `commands/queue.rs` | Build queue inspection |
-| `commands/speedscore.rs` | Worker benchmarking |
-| `commands/workers_deploy.rs` | Binary deployment to workers |
-| `commands/workers_init.rs` | Worker discovery and setup |
-
-**Structured Error Handling** - Converted all bare `bail!()` calls to structured `RchError` with:
-- Error codes (RCH-Exxx)
-- Contextual information
-- Remediation suggestions
-- Machine-parseable format
-
-**Deep Audit Fixes** - Comprehensive security, reliability, and performance review:
-- Removed dead code replaced by single-pass state machine
-- Minor improvements to config, completions, and CLI
-- Fixed formatting and type mismatches
+- `e68db7d`, `365f607`, `86cd921`
 
 ---
 
-### Security Hardening
+## 3) Fleet Operations Became Fully Real (No Stubs)
 
-**Sigstore Verification** - Strict certificate verification for self-update:
-- Enforces `certificate-identity` and `certificate-oidc-issuer` flags
-- Validates GitHub Actions OIDC tokens
-- Rejects unsigned or incorrectly signed releases
+Fleet deploy/status/rollback behavior is now fully operational rather than placeholder logic.
 
-**Dependency Updates**:
-- LRU cache updated to 0.16 (security fix)
+### Delivered capability
 
----
+- Real preflight checks over SSH.
+- Live worker status retrieval.
+- Real rollback with artifact/version handling.
+- Parallel fleet operations with bounded concurrency.
+- Canary and staged deployment controls.
 
-### Bug Fixes
+### Completed work
 
-**Bun Test Timeout Wrapper** - Prevents indefinite CPU hangs:
-- External `timeout --signal=KILL` wrapper for bun test/typecheck
-- Configurable via `bun_test_timeout_secs` (default: 600s / 10 minutes)
-- Addresses known Bun defects causing 100% CPU loops
+- `bd-rs7w` Epic: Fleet module stub elimination.
+- `bd-3029`, `bd-2ch3`, `bd-39j3` feature tracks.
 
-**Cache Affinity Uniqueness**:
-- Path hash added to project names for cache key uniqueness
-- Prevents collisions between projects with same directory name
+### Representative commits
 
-**Overflow Prevention**:
-- `saturating_mul` for age calculations in cache warmth decay
+- `8ce42a3`, `ab7a83c`, `7717457`, `75907e6`
+- `92cc5eb`, `1261243`
 
 ---
 
-### Testing Improvements
+## 4) Hook Execution Pipeline Hardening
 
-**CI/CD Stability**:
-- Exponential backoff in E2E daemon tests
-- CPU variance tolerance increased for CI environments
-- Daemon test timeouts extended for slower CI runners
-- Tests respect `CARGO_TARGET_DIR` consistently
+The hook path and remote execution pipeline were substantially hardened for correctness, safety, and concurrency stability.
 
-**Test Infrastructure**:
-- Thread-safe environment variable helpers
-- Proptest regression test cases
-- Feature-gating for true-e2e tests
-- Global test logging initialization
+### Delivered capability
 
-**Test Coverage**:
-- Preflight check unit tests for all worker status types
-- Rollback registry unit tests (CRUD, concurrent writes, shutdown order)
-- Mock SSH executor for isolated unit testing
+- `AllowWithModifiedCommand` transparent interception path.
+- Shell-aware command tokenization and robust command rewriting.
+- Queue timeout behavior and graceful local fallback on contention.
+- Output truncation/SIGPIPE handling and improved daemon communication limits.
+- Classification regression/timing-budget coverage.
+
+### Representative commits
+
+- `cfdb411`, `1b867f1`, `412a875`, `8141d20`, `78d2f9f`, `2ff8c3c`
 
 ---
 
-## [1.0.0] - 2026-01-30
+## 5) Runtime Coverage Expansion
 
-The 1.0.0 release marks RCH as feature-complete for production use. This release represents approximately 3 weeks of intensive development with 827 commits, building the entire system from initial scaffold to a fully functional transparent compilation offloading system.
+RCH now supports broader remote-compilation/test command coverage with explicit semantics.
 
----
+### Delivered capability
 
-### Core Hook System
+- Bun support: `bun test`, `bun typecheck` (with explicit non-intercept list for package/dev commands).
+- Cargo test semantics stabilized (including expected exit-code behavior).
+- Cargo nextest and cargo bench remote execution support.
+- C/C++ pipeline and build-system support expanded/validated.
 
-**Transparent Compilation Interception** - RCH integrates with Claude Code's PreToolUse hook system to intercept compilation commands transparently. The agent is unaware of remote execution; artifacts simply appear locally.
+### Representative commits
 
-- **5-Tier Classification System** - High-precision command classification with sub-millisecond performance:
-  - Tier 0: Instant reject (empty commands, non-Bash tools)
-  - Tier 1: Structure analysis (pipes, redirects, backgrounding)
-  - Tier 2: SIMD keyword filter (memchr-accelerated)
-  - Tier 3: Negative pattern check (never-intercept commands)
-  - Tier 4: Full classification with confidence scoring
-
-- **Supported Compilation Commands**:
-  - Rust: `cargo build`, `cargo test`, `cargo check`, `cargo clippy`, `cargo doc`, `cargo bench`, `cargo nextest run`
-  - Bun/TypeScript: `bun test`, `bun typecheck`
-  - C/C++: `gcc`, `g++`, `clang`, `clang++`
-  - Build systems: `make`, `cmake --build`, `ninja`, `meson compile`
-
-- **Smart Multi-Command Classification** - Commands chained with `&&`, `||`, or `;` are split and classified independently. If any sub-command is compilation, it triggers remote execution.
-
-- **Zero-Allocation Hot Paths** - Classification strings use `Cow<'static, str>` to avoid heap allocations on the critical path.
+- `4bd48c9`, `509ed50`, `343a552`
+- `4901ed0`, `75b261e`, `b5e7550`, `dbfa2df`
+- `bd-v9pq` closure via true E2E validation
 
 ---
 
-### Worker Fleet Management
+## 6) Onboarding and Worker Bootstrap Automation
 
-**Intelligent Worker Selection** - Multiple selection strategies optimize for different workloads:
+First-run experience and worker bootstrap are now automated and operator-friendly.
 
-- **Priority Strategy** - Respects configured worker priorities for preferred routing
-- **Fastest Strategy** - Routes to workers with highest SpeedScore
-- **Balanced Strategy** - Distributes load evenly across workers
-- **CacheAffinity Strategy** - Routes projects to workers with warm caches
-- **FairFastest Strategy** - Balances speed and fair distribution
+### Delivered capability
 
-**Health Monitoring & Circuit Breakers**:
-- Automatic health probing with configurable intervals
-- Circuit breaker pattern (Closed → Open → HalfOpen) for fault tolerance
-- Consecutive failure tracking with configurable thresholds
-- Automatic recovery with exponential backoff
+- `rch init` guided setup flow.
+- Worker discovery from SSH config/aliases.
+- Worker provisioning (`workers setup`, `deploy-binary`, `sync-toolchain`).
+- Installer easy-mode + service manager integration path.
 
-**Worker Lifecycle Management**:
-- `Healthy`, `Degraded`, `Unhealthy`, `Unknown`, `Draining`, `Drained`, `Disabled` statuses
-- Graceful drain: stop new jobs, let existing jobs complete
-- Manual enable/disable with optional reasons
+### Representative commits
 
-**Slot-Based Concurrency** - Each worker declares total slots (typically CPU cores). The daemon tracks slot usage and never overcommits.
+- `8dd3b46`, `f40d370`, `9b4c311`, `6903c26`, `99f9bc0`
+- `0494a08`, `ec9a7ca`, `0b4c772`, `de88252`
 
 ---
 
-### Transfer Pipeline
+## 7) Configuration and Operational Doctoring Suite
 
-**High-Performance File Synchronization**:
-- rsync with zstd compression for efficient transfers
-- Incremental sync (only changed files)
-- Configurable exclusion patterns
-- `.rchignore` support (similar to `.gitignore`)
+Configuration management now supports full lifecycle authoring, diagnostics, and machine-readable introspection.
 
-**Artifact Retrieval**:
-- Automatic retrieval of `target/` build artifacts
-- Checksum verification for integrity
-- Retry logic with exponential backoff for transient failures
+### Delivered capability
 
-**SSH Transport Hardening**:
-- Configurable ServerAliveInterval and ControlPersist
-- Connection pooling with ControlMaster
-- Timeout handling for hung connections
-- Identity file validation
+- `config get/set/reset/show/init/validate/lint/doctor/edit/diff/export`.
+- Rich precedence and source reporting.
+- Operator diagnostics through `rch doctor` and `rch check`.
+- Configurable self-healing behavior (hook daemon autostart/hook installation).
+
+### Representative commits
+
+- `a08d565`, `5fff22f`, `41c9719`, `bd36dbd`, `bc077f3`
 
 ---
 
-### Daemon (rchd)
+## 8) Queue, Cancellation, and Build Lifecycle Visibility
 
-**Unix Socket API** - HTTP-like protocol over Unix socket for hook-daemon communication:
+RCH now has coherent queue/cancel operations and richer lifecycle diagnostics.
 
-| Endpoint | Purpose |
-|----------|---------|
-| `GET /select-worker` | Request a worker for compilation |
-| `POST /release-worker` | Release a reserved worker |
-| `GET /status` | Full system status |
-| `GET /health` | Kubernetes-style health check |
-| `GET /ready` | Kubernetes-style readiness check |
-| `GET /metrics` | Prometheus-format metrics |
-| `GET /events` | Server-Sent Events stream |
-| `POST /reload` | Hot-reload configuration |
-| `POST /shutdown` | Graceful shutdown |
+### Delivered capability
 
-**Build Queue Management**:
-- Wait-for-worker queueing when all workers busy
-- FIFO queue with priority support
-- Queue position tracking and ETA estimation
+- Queue visibility with watch/follow modes.
+- Build cancellation controls and deterministic cancellation metadata.
+- Status integration of cancellation health and stuck-build protections.
 
-**Configuration Hot-Reload**:
-- `rch daemon reload` or `SIGHUP` signal
-- Add/remove/update workers without restart
-- Validation before applying changes
+### Representative commits
 
-**Event Bus**:
-- Real-time event streaming for monitoring
-- Events: `worker:selected`, `worker:released`, `build:started`, `build:completed`, `health:changed`
+- `da285f0`, `defebdf`, `38260cd`, `1b54521`, `4cc9f7e`
 
 ---
 
-### CLI Commands
+## 9) Observability Platform + SpeedScore System
 
-**Comprehensive Command Suite**:
+Observability matured from basic status into a full telemetry + scoring stack.
 
-```
-rch status              # System overview with worker health
-rch workers list        # List workers with slot usage
-rch workers probe       # Test worker connectivity
-rch workers deploy      # Deploy rch-wkr binary to workers
-rch workers enable/disable/drain  # Lifecycle management
-rch fleet deploy        # Parallel deployment to all workers
-rch daemon start/stop/restart/reload  # Daemon control
-rch config show/set/init  # Configuration management
-rch doctor              # Diagnose and fix issues
-rch check               # Quick health verification
-rch update check/install/rollback  # Self-update system
-```
+### Delivered capability
 
-**Rich Output Modes**:
-- Interactive mode with colors and panels (TTY)
-- JSON mode for programmatic access (`--json` or `RCH_JSON=1`)
-- Plain text for non-TTY environments
+- Prometheus metrics and OpenTelemetry tracing integration.
+- Worker telemetry ingestion and persistence.
+- SpeedScore model with history and CLI/API exposure.
+- Benchmark scheduling and trigger orchestration.
 
-**Short Flags** - Common options have short forms:
-- `-a` for `--all`
-- `-v` for `--verbose`
-- `-f` for `--force`
+### Representative commits
 
-**Confirmation Prompts** - Destructive actions require confirmation (can skip with `--yes`).
-
-**Shell Completions** - Tab completion for bash, zsh, and fish:
-- `rch completions bash > ~/.local/share/bash-completion/completions/rch`
-- `rch completions zsh > ~/.zfunc/_rch`
-- `rch completions fish > ~/.config/fish/completions/rch.fish`
+- `60362bb`, `9325707`, `63d1741`, `a0e0f5d`
+- `4e2a743`, `381e84f`, `762009c`, `acec405`, `1d4f8ea`
 
 ---
 
-### Runtime Detection & Toolchain Management
+## 10) Multi-Surface UX: Rich CLI, Dashboard, and Web
 
-**Automatic Toolchain Detection**:
-- Parses `rust-toolchain.toml` for Rust projects
-- Detects channel (stable/beta/nightly), version, components, targets
-- Forwards toolchain info to workers for environment setup
+Operator UX now spans structured machine output, rich terminal surfaces, and browser dashboard workflows.
 
-**Worker Capability Probing**:
-- Workers declare available runtimes (Rust, Bun, Node, GCC/Clang)
-- Runtime filtering prevents routing to incompatible workers
-- Version detection for all supported toolchains
+### Delivered capability
 
-**Toolchain Synchronization**:
-- Auto-installs missing Rust toolchains on workers via rustup
-- Verifies component availability before compilation
-- Graceful local fallback on toolchain failures
+- Context-aware output system with machine/hook/plain/rich behavior.
+- `dashboard`/`tui` interface with accessibility controls and test/dump modes.
+- Web dashboard surface for worker/build/metrics visibility.
+- Schema export/list for API consumers.
 
----
+### Representative commits
 
-### Terminal UI (TUI)
-
-**Interactive Dashboard** (`rch tui`):
-
-- **Workers Panel** - Real-time worker status with health indicators
-- **Build History Panel** - Recent builds with timing and outcomes
-- **Detail Bar** - Full content preview of selected items
-- **Help Overlay** - Keyboard shortcut reference (`?` to toggle)
-
-**Keyboard Controls**:
-- `Tab` / `Shift+Tab` - Navigate panels
-- `j/k` or arrows - Navigate items
-- `d` - Drain selected worker
-- `e` - Enable selected worker
-- `/` - Filter mode
-- `q` - Quit
-
-**Visual Indicators**:
-- Unicode symbols for cross-terminal compatibility (no emoji)
-- Color-coded status (green=healthy, yellow=degraded, red=unhealthy)
-- Slot usage bars with percentage
-
-**Sort Controls** - Build history sortable by time, duration, or worker.
+- `38a6f80`, `8620e62`, `a14f195`, `123149a`, `b95c8d0`
+- `e0ab713` and subsequent web/dashboard tracks
+- `365f607` + `86cd921` for current TUI runtime state
 
 ---
 
-### Rich Terminal Output
+## 11) Update and Release Integrity System
 
-**Styled Box Rendering**:
-- Configurable borders (rounded, sharp, double, ascii)
-- Padding and margin control
-- Nested box support
+The update path is now first-class and includes rollback + verification workflows.
 
-**Terminal Hyperlinks**:
-- Clickable links in terminal output (OSC 8 escape sequences)
-- Links to documentation, GitHub issues, worker hosts
-- Graceful fallback for unsupported terminals
+### Delivered capability
 
-**Markdown Rendering**:
-- Basic markdown support in terminal output
-- Code blocks with syntax hints
-- Headers, lists, and emphasis
+- Version check/update channels and specific-version installs.
+- Backup metadata and rollback support.
+- Changelog diffing across multi-version jumps.
+- Integrity verification via checksums and signing-oriented release flow.
 
-**Agent Detection**:
-- Automatic detection of Claude Code, Codex CLI, Cursor
-- Context-aware output formatting per agent
-- Machine-readable output for automated agents
+### Representative commits
 
-**Progress Indicators**:
-- Spinner for long-running operations
-- Progress bars for file transfers
-- Phase indicators for multi-step operations
+- `73ff4d3`, `4868d76`, `c67499a`, `27a7e78`, `6e014ee`, `2caa631`
 
 ---
 
-### Self-Test System
+## 12) Security and Safety Hardening
 
-**Remote Compilation Verification** - Proves the pipeline works end-to-end:
+Execution and transport safety posture significantly improved.
 
-1. Applies unique test marker to source code
-2. Builds locally for reference hash
-3. Syncs source to worker
-4. Builds on worker
-5. Retrieves artifacts
-6. Compares binary hashes
+### Delivered capability
 
-**Scheduled Self-Tests**:
-- Configurable cron schedule
-- History retention and reporting
-- Alert on repeated failures
+- Safer SSH defaults and socket handling.
+- Shell escaping and command-path safety checks.
+- Sensitive value masking improvements.
+- External timeout wrappers to prevent runaway/hung remote commands.
 
----
+### Representative commits
 
-### Update System
-
-**Self-Updating Capability**:
-- `rch update check` - Check for new releases
-- `rch update install` - Download and install update
-- `rch update rollback` - Revert to previous version
-
-**Security Features**:
-- SHA256 checksum verification
-- Sigstore signature verification (when bundle available)
-- Backup of current binary before update
-
-**Fleet Deployment** (`rch fleet deploy`):
-- Parallel deployment to all workers
-- Progress tracking per worker
-- Version verification after install
+- `a8ed079`, `cb4ba31`, `9df00fa`, `7b71b38`
+- `c08af0b`, `3fb98ce`, `fd67cb4`, `2638c6b` (`bd-1nmv` timeout hardening)
 
 ---
 
-### Telemetry & SpeedScore
+## 13) Comprehensive Validation and Reliability Test Matrix
 
-**Worker Telemetry Collection**:
-- CPU usage (overall, per-core, load average)
-- Memory usage (used, available, swap)
-- Disk I/O metrics
-- Network throughput
+Test infrastructure now includes broad true-E2E and reliability-contract coverage.
 
-**SpeedScore System** - Composite performance score (0-100) based on:
-- CPU benchmark results
-- Memory bandwidth
-- Disk I/O speed
-- Network latency
+### Delivered capability
 
-**Benchmark Scheduler**:
-- Automatic re-benchmark on score staleness
-- Drift detection triggers re-benchmark
-- Manual trigger via API
+- Expanded true E2E suites across Rust/Bun/C/C++/fleet/hook flows.
+- Reliability-focused suites (convergence, triage, fault injection, parity, SLO guardrails, contract drift).
+- Property-based and concurrency-focused coverage where relevant.
+- Unified reliability suite orchestration and operator runbook support.
+
+### Representative commits
+
+- `0062e96`, `bd0ef1a`, `7f7bf85`, `f6cdbf7`, `966d657`
+- `77074ba`, `95c8e80`, `7aefab2`, `1c0257d`, `261a4c7`, `2498cb9`
 
 ---
 
-### Configuration & Validation
+## 14) Platform and Dependency Modernization
 
-**Configuration Files**:
-- `~/.config/rch/config.toml` - User settings
-- `~/.config/rch/workers.toml` - Worker definitions
+Core platform/toolchain and dependency baselines were advanced to support current architecture and runtime behavior.
 
-**Setup Wizard** (`rch config init`):
-- Interactive worker configuration
-- SSH key validation
-- Connectivity testing
+### Delivered capability
 
-**Comprehensive Validation**:
-- SSH identity file existence and permissions
-- rsync exclude pattern syntax
-- Network address resolution
-- Remote directory accessibility
+- Workspace moved through stable release cadence into current 1.0.10 baseline.
+- Rust/tooling/dependency refreshes aligned with new reliability and TUI architecture.
+- Migration from `ratatui/crossterm` to `ftui-*` dependency tree.
+
+### Representative commits
+
+- `29c748a`, `77a779d`, `e68db7d`
 
 ---
 
-### Error Handling & Diagnostics
+## Summary
 
-**Structured Error Codes** - All errors have unique codes (RCH-Exxx):
+Over this two-month window, RCH evolved from a strong remote compilation core into a full operational platform with:
 
-| Range | Category |
-|-------|----------|
-| E001-E099 | Configuration errors |
-| E100-E199 | Network/SSH errors |
-| E200-E299 | Worker errors |
-| E300-E399 | Build errors |
-| E400-E499 | Daemon errors |
-| E500-E599 | Internal errors |
+- deterministic multi-repo reliability controls,
+- production-grade fleet and cancellation operations,
+- deep observability and telemetry-backed scoring,
+- multi-surface operator UX (CLI/TUI/Web), and
+- comprehensive validation infrastructure.
 
-**Rich Error Display**:
-- Color-coded severity
-- Contextual information (worker, host, command)
-- Remediation suggestions
-- Related documentation links
-
-**Fail-Open Philosophy** - If anything fails, allow local execution rather than blocking the agent.
-
----
-
-### Installation System
-
-**One-Line Install**:
-```bash
-curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/remote_compilation_helper/main/install.sh | bash
-```
-
-**Installation Features**:
-- Automatic binary download for platform
-- Fallback to source build if binaries unavailable
-- Claude Code hook integration
-- Systemd/launchd service setup (optional)
-- Shell completions (bash, zsh, fish)
-
-**Agent Integration**:
-- Automatic Claude Code `.claude.json` configuration
-- Hook registration in `~/.claude/settings.json`
-
----
-
-### Testing Infrastructure
-
-**Comprehensive Test Coverage**:
-- Unit tests with TestLogger (JSONL output)
-- Integration tests for subsystems
-- True end-to-end tests with real workers
-- Property-based tests (proptest) for edge cases
-
-**Test Categories**:
-- Command classification tests
-- Worker selection tests
-- Transfer pipeline tests
-- Fail-open behavior tests
-- Exit code propagation tests
-- Artifact integrity tests
-
-**CI/CD Integration**:
-- GitHub Actions workflows
-- Dependabot automerge for patches
-- Performance regression detection
-
----
-
-### Performance Characteristics
-
-| Operation | Target | Panic Threshold |
-|-----------|--------|-----------------|
-| Hook decision (non-compilation) | <1ms | 5ms |
-| Hook decision (compilation) | <5ms | 10ms |
-| Worker selection | <10ms | 50ms |
-| Full pipeline overhead | <15% | 50% |
-
-**Optimizations**:
-- SIMD-accelerated keyword search (memchr)
-- Zero-allocation classification paths
-- In-memory timing history cache
-- Connection pooling
-
----
-
-### Security
-
-- **No unsafe code** - `#![forbid(unsafe_code)]` enforced
-- **Shell escaping** - All user input properly escaped with shell-words
-- **SSH key validation** - Permissions checked (0600/0400) before use
-- **Checksum verification** - All downloads verified with SHA256
-- **No secrets in config** - Identity files referenced by path
-- **Command classification hardening** - Prevents shell injection via crafted commands
-- **Path sanitization** - All file paths validated before transfer
-
----
-
-### Known Limitations (1.0.0)
-
-- Benchmark execution stub (placeholder for rch-benchmark integration)
-- Changelog diff computation in update check
-
-**Note:** Rollback was a stub in 1.0.0 but is now fully implemented in 1.1.0.
-
----
-
-## Contributors
-
-Built with assistance from Claude Code AI agents using the Beads issue tracking system.
-
----
-
-## License
-
-MIT License - See LICENSE file for details.
+The project is now organized around coherent control-plane behavior rather than ad-hoc command plumbing, and the major reliability epics are fully closed.

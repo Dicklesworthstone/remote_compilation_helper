@@ -12,8 +12,8 @@ use rch_common::e2e::harness::{
     ReliabilityLifecycleCommand, ReliabilityScenarioReport, ReliabilityScenarioSpec,
 };
 use rch_common::e2e::logging::{
-    LogLevel, ReliabilityContext, ReliabilityEventInput, ReliabilityPhase,
-    ReliabilityPhaseEvent, TestLoggerBuilder, RELIABILITY_EVENT_SCHEMA_VERSION,
+    LogLevel, RELIABILITY_EVENT_SCHEMA_VERSION, ReliabilityContext, ReliabilityEventInput,
+    ReliabilityPhase, ReliabilityPhaseEvent, TestLoggerBuilder,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -299,7 +299,10 @@ fn e2e_soak_slot_reservation_no_unbounded_leak() {
         );
     }
 
-    assert_eq!(total_leak, 0, "aggregate slot leak across fleet: {total_leak}");
+    assert_eq!(
+        total_leak, 0,
+        "aggregate slot leak across fleet: {total_leak}"
+    );
 }
 
 // ===========================================================================
@@ -525,7 +528,11 @@ fn e2e_soak_structured_logging_under_sustained_load() {
 
     // Verify all events were logged
     let entries = logger.entries();
-    assert_eq!(entries.len(), iterations, "should have logged {iterations} events");
+    assert_eq!(
+        entries.len(),
+        iterations,
+        "should have logged {iterations} events"
+    );
 
     // Verify JSONL file was written and each line parses
     if let Some(rel_path) = logger.reliability_log_path() {
@@ -538,9 +545,8 @@ fn e2e_soak_structured_logging_under_sustained_load() {
         );
 
         for (i, line) in lines.iter().enumerate() {
-            let event: ReliabilityPhaseEvent = serde_json::from_str(line).unwrap_or_else(|e| {
-                panic!("line {i} is not a valid ReliabilityPhaseEvent: {e}")
-            });
+            let event: ReliabilityPhaseEvent = serde_json::from_str(line)
+                .unwrap_or_else(|e| panic!("line {i} is not a valid ReliabilityPhaseEvent: {e}"));
             assert_eq!(event.schema_version, "1.0.0");
         }
     }
@@ -782,8 +788,14 @@ fn e2e_soak_report_accumulation_no_unbounded_growth() {
     // Build summary
     let summary = SoakSummary {
         total_iterations: iterations,
-        passed_iterations: records.iter().filter(|r| r.decision_code == "SOAK_OK").count(),
-        failed_iterations: records.iter().filter(|r| r.decision_code != "SOAK_OK").count(),
+        passed_iterations: records
+            .iter()
+            .filter(|r| r.decision_code == "SOAK_OK")
+            .count(),
+        failed_iterations: records
+            .iter()
+            .filter(|r| r.decision_code != "SOAK_OK")
+            .count(),
         total_slot_leaks: records.iter().map(|r| r.slot_leak).sum(),
         max_convergence_drift: drift_tracker.max_drift(),
         total_fallback_count: fallback_count,
@@ -824,7 +836,11 @@ fn e2e_soak_report_accumulation_no_unbounded_growth() {
     // Records should not have unbounded growth per iteration
     assert_eq!(records.len(), iterations);
     for r in &records {
-        assert_eq!(r.slot_leak, 0, "iteration {} has nonzero slot leak", r.iteration);
+        assert_eq!(
+            r.slot_leak, 0,
+            "iteration {} has nonzero slot leak",
+            r.iteration
+        );
     }
 }
 
@@ -858,7 +874,11 @@ fn e2e_soak_worker_health_snapshots_logged() {
         let failure_hooks = select_failure_hooks(&mut rng, i);
         let has_fault = !failure_hooks.is_empty();
 
-        let circuit_debt = if has_fault { rng.next_f64() * 0.5 } else { rng.next_f64() * 0.1 };
+        let circuit_debt = if has_fault {
+            rng.next_f64() * 0.5
+        } else {
+            rng.next_f64() * 0.1
+        };
         let convergence_debt = rng.next_f64() * 0.3;
         let pressure_debt = if simulate_pressure_state(&mut rng, i).contains("critical") {
             0.8 + rng.next_f64() * 0.2
@@ -868,7 +888,13 @@ fn e2e_soak_worker_health_snapshots_logged() {
         let process_debt = rng.next_f64() * 0.15;
         let cancellation_debt = rng.next_f64() * 0.1;
 
-        let debts = [circuit_debt, convergence_debt, pressure_debt, process_debt, cancellation_debt];
+        let debts = [
+            circuit_debt,
+            convergence_debt,
+            pressure_debt,
+            process_debt,
+            cancellation_debt,
+        ];
         let aggregated: f64 = debts.iter().zip(weights.iter()).map(|(d, w)| d * w).sum();
 
         let health_state = if aggregated >= 0.7 {
@@ -1037,7 +1063,11 @@ fn e2e_soak_artifact_capture_under_load() {
             .capture_artifact_json(&scenario_id, "iteration_record", &summary)
             .unwrap_or_else(|e| panic!("iteration {i}: artifact capture failed: {e}"));
 
-        assert!(path.exists(), "artifact file should exist: {}", path.display());
+        assert!(
+            path.exists(),
+            "artifact file should exist: {}",
+            path.display()
+        );
         captured_paths.push(path);
     }
 
@@ -1079,7 +1109,10 @@ fn e2e_soak_seed_reproducibility() {
         decisions2.push(format!("{i}:{pressure}:{}", hooks.len()));
     }
 
-    assert_eq!(decisions1, decisions2, "same seed must produce identical decisions");
+    assert_eq!(
+        decisions1, decisions2,
+        "same seed must produce identical decisions"
+    );
 
     // Different seed should produce different results
     let mut rng3 = Rng::new(seed + 1);
@@ -1090,7 +1123,10 @@ fn e2e_soak_seed_reproducibility() {
         decisions3.push(format!("{i}:{pressure}:{}", hooks.len()));
     }
 
-    assert_ne!(decisions1, decisions3, "different seeds must produce different decisions");
+    assert_ne!(
+        decisions1, decisions3,
+        "different seeds must produce different decisions"
+    );
 }
 
 // ===========================================================================

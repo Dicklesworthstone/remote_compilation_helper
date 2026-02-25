@@ -43,7 +43,6 @@ enum DiagnosticCategory {
     SchemaCompatibility,
 }
 
-
 /// A single diagnostic finding from the reliability doctor.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ReliabilityDiagnostic {
@@ -265,10 +264,7 @@ fn check_disk_pressure(workers: &[SimulatedWorker]) -> Vec<ReliabilityDiagnostic
                         "ssh {} 'cargo clean --manifest-path /tmp/rch/*/Cargo.toml'",
                         w.host
                     )),
-                    validation_check: Some(format!(
-                        "ssh {} 'df -h / | tail -1'",
-                        w.host
-                    )),
+                    validation_check: Some(format!("ssh {} 'df -h / | tail -1'", w.host)),
                     dry_run_safe: true,
                 });
             }
@@ -283,14 +279,8 @@ fn check_disk_pressure(workers: &[SimulatedWorker]) -> Vec<ReliabilityDiagnostic
                     ),
                     reason_code: "DISK_CRITICAL".to_string(),
                     worker_id: Some(w.id.clone()),
-                    remediation_command: Some(format!(
-                        "ssh {} 'rm -rf /tmp/rch/*/target'",
-                        w.host
-                    )),
-                    validation_check: Some(format!(
-                        "ssh {} 'df -h / | tail -1'",
-                        w.host
-                    )),
+                    remediation_command: Some(format!("ssh {} 'rm -rf /tmp/rch/*/target'", w.host)),
+                    validation_check: Some(format!("ssh {} 'df -h / | tail -1'", w.host)),
                     dry_run_safe: false,
                 });
             }
@@ -311,7 +301,10 @@ fn check_rollout_posture(flags: &HashMap<String, String>) -> Vec<ReliabilityDiag
     ];
 
     for subsystem in &subsystems {
-        let state = flags.get(*subsystem).map(|s| s.as_str()).unwrap_or("disabled");
+        let state = flags
+            .get(*subsystem)
+            .map(|s| s.as_str())
+            .unwrap_or("disabled");
         let severity = match state {
             "enabled" => DiagnosticSeverity::Pass,
             "canary" | "dry_run" => DiagnosticSeverity::Info,
@@ -332,9 +325,7 @@ fn check_rollout_posture(flags: &HashMap<String, String>) -> Vec<ReliabilityDiag
             } else {
                 None
             },
-            validation_check: Some(format!(
-                "rch config get reliability.flags.{subsystem}"
-            )),
+            validation_check: Some(format!("rch config get reliability.flags.{subsystem}")),
             dry_run_safe: true,
         });
     }
@@ -362,28 +353,23 @@ fn check_schema_compatibility(
                 dry_run_safe: true,
             });
         } else {
-            let severity =
-                if expected.split('.').next() != actual.split('.').next() {
-                    DiagnosticSeverity::Critical
-                } else {
-                    DiagnosticSeverity::Warning
-                };
+            let severity = if expected.split('.').next() != actual.split('.').next() {
+                DiagnosticSeverity::Critical
+            } else {
+                DiagnosticSeverity::Warning
+            };
 
             diags.push(ReliabilityDiagnostic {
                 category: DiagnosticCategory::SchemaCompatibility,
                 check_name: format!("schema_drift:{name}"),
                 severity,
-                message: format!(
-                    "{name} schema v{actual} differs from expected v{expected}"
-                ),
+                message: format!("{name} schema v{actual} differs from expected v{expected}"),
                 reason_code: "SCHEMA_DRIFT".to_string(),
                 worker_id: None,
                 remediation_command: Some(format!(
                     "Update {name} adapter to match schema v{expected}"
                 )),
-                validation_check: Some(
-                    "rch doctor --reliability --check-schemas".to_string()
-                ),
+                validation_check: Some("rch doctor --reliability --check-schemas".to_string()),
                 dry_run_safe: true,
             });
         }
@@ -398,10 +384,22 @@ fn build_doctor_response(
     diagnostics: Vec<ReliabilityDiagnostic>,
 ) -> ReliabilityDoctorResponse {
     let total = diagnostics.len();
-    let pass = diagnostics.iter().filter(|d| d.severity == DiagnosticSeverity::Pass).count();
-    let info = diagnostics.iter().filter(|d| d.severity == DiagnosticSeverity::Info).count();
-    let warning = diagnostics.iter().filter(|d| d.severity == DiagnosticSeverity::Warning).count();
-    let critical = diagnostics.iter().filter(|d| d.severity == DiagnosticSeverity::Critical).count();
+    let pass = diagnostics
+        .iter()
+        .filter(|d| d.severity == DiagnosticSeverity::Pass)
+        .count();
+    let info = diagnostics
+        .iter()
+        .filter(|d| d.severity == DiagnosticSeverity::Info)
+        .count();
+    let warning = diagnostics
+        .iter()
+        .filter(|d| d.severity == DiagnosticSeverity::Warning)
+        .count();
+    let critical = diagnostics
+        .iter()
+        .filter(|d| d.severity == DiagnosticSeverity::Critical)
+        .count();
 
     let mut categories_checked: Vec<DiagnosticCategory> = diagnostics
         .iter()
@@ -417,7 +415,10 @@ fn build_doctor_response(
     let mut remediation_plan: Vec<RemediationStep> = Vec::new();
     let mut order = 1;
     // Critical first
-    for d in diagnostics.iter().filter(|d| d.severity == DiagnosticSeverity::Critical) {
+    for d in diagnostics
+        .iter()
+        .filter(|d| d.severity == DiagnosticSeverity::Critical)
+    {
         if let Some(cmd) = &d.remediation_command {
             remediation_plan.push(RemediationStep {
                 order,
@@ -432,7 +433,10 @@ fn build_doctor_response(
         }
     }
     // Then warnings
-    for d in diagnostics.iter().filter(|d| d.severity == DiagnosticSeverity::Warning) {
+    for d in diagnostics
+        .iter()
+        .filter(|d| d.severity == DiagnosticSeverity::Warning)
+    {
         if let Some(cmd) = &d.remediation_command {
             remediation_plan.push(RemediationStep {
                 order,
@@ -635,8 +639,16 @@ fn e2e_doctor_topology_unreachable_worker_is_critical() {
     }];
 
     let diags = check_topology(&workers);
-    assert!(diags.iter().any(|d| d.severity == DiagnosticSeverity::Critical));
-    assert!(diags.iter().any(|d| d.reason_code == "TOPOLOGY_WORKER_UNREACHABLE"));
+    assert!(
+        diags
+            .iter()
+            .any(|d| d.severity == DiagnosticSeverity::Critical)
+    );
+    assert!(
+        diags
+            .iter()
+            .any(|d| d.reason_code == "TOPOLOGY_WORKER_UNREACHABLE")
+    );
 }
 
 #[test]
@@ -657,7 +669,11 @@ fn e2e_doctor_repo_drifting_is_warning() {
     }];
 
     let diags = check_repo_presence(&workers);
-    assert!(diags.iter().any(|d| d.severity == DiagnosticSeverity::Warning));
+    assert!(
+        diags
+            .iter()
+            .any(|d| d.severity == DiagnosticSeverity::Warning)
+    );
     assert!(diags.iter().any(|d| d.reason_code == "REPO_DRIFTING"));
 }
 
@@ -673,7 +689,11 @@ fn e2e_doctor_repo_failed_is_critical() {
     }];
 
     let diags = check_repo_presence(&workers);
-    assert!(diags.iter().any(|d| d.severity == DiagnosticSeverity::Critical));
+    assert!(
+        diags
+            .iter()
+            .any(|d| d.severity == DiagnosticSeverity::Critical)
+    );
 }
 
 #[test]
@@ -688,7 +708,9 @@ fn e2e_doctor_disk_warning_has_remediation() {
     }];
 
     let diags = check_disk_pressure(&workers);
-    let warning = diags.iter().find(|d| d.severity == DiagnosticSeverity::Warning);
+    let warning = diags
+        .iter()
+        .find(|d| d.severity == DiagnosticSeverity::Warning);
     assert!(warning.is_some());
     assert!(warning.unwrap().remediation_command.is_some());
     assert!(warning.unwrap().validation_check.is_some());
@@ -706,7 +728,9 @@ fn e2e_doctor_disk_critical_not_dry_run_safe() {
     }];
 
     let diags = check_disk_pressure(&workers);
-    let critical = diags.iter().find(|d| d.severity == DiagnosticSeverity::Critical);
+    let critical = diags
+        .iter()
+        .find(|d| d.severity == DiagnosticSeverity::Critical);
     assert!(critical.is_some());
     assert!(!critical.unwrap().dry_run_safe);
 }
@@ -718,7 +742,11 @@ fn e2e_doctor_disk_critical_not_dry_run_safe() {
 #[test]
 fn e2e_doctor_rollout_all_disabled_warns() {
     let diags = check_rollout_posture(&HashMap::new());
-    assert!(diags.iter().all(|d| d.severity == DiagnosticSeverity::Warning));
+    assert!(
+        diags
+            .iter()
+            .all(|d| d.severity == DiagnosticSeverity::Warning)
+    );
     assert!(diags.iter().all(|d| d.remediation_command.is_some()));
 }
 
@@ -806,7 +834,10 @@ fn e2e_doctor_every_failure_has_remediation() {
     diags.extend(check_rollout_posture(&HashMap::new()));
 
     for d in &diags {
-        if matches!(d.severity, DiagnosticSeverity::Warning | DiagnosticSeverity::Critical) {
+        if matches!(
+            d.severity,
+            DiagnosticSeverity::Warning | DiagnosticSeverity::Critical
+        ) {
             assert!(
                 d.remediation_command.is_some(),
                 "diagnostic '{}' (severity={:?}) must have remediation command",

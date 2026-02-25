@@ -131,7 +131,7 @@ fn handle_key_input_mode(key: KeyEvent) -> Action {
     }
 
     match key.code {
-        KeyCode::Escape => Action::Back,     // Exit input mode
+        KeyCode::Escape => Action::Back,  // Exit input mode
         KeyCode::Enter => Action::Select, // Apply filter
         KeyCode::Backspace => Action::DeleteChar,
         KeyCode::Char(c) => Action::TextInput(c),
@@ -201,34 +201,16 @@ mod tests {
     fn test_handle_key_navigation() {
         init_test_logging();
         info!("TEST START: test_handle_key_navigation");
-        assert_eq!(
-            handle_key(KeyEvent::new(KeyCode::Up)),
-            Action::Up
-        );
-        assert_eq!(
-            handle_key(KeyEvent::new(KeyCode::Char('k'))),
-            Action::Up
-        );
-        assert_eq!(
-            handle_key(KeyEvent::new(KeyCode::Down)),
-            Action::Down
-        );
-        assert_eq!(
-            handle_key(KeyEvent::new(KeyCode::Char('j'))),
-            Action::Down
-        );
-        assert_eq!(
-            handle_key(KeyEvent::new(KeyCode::Tab)),
-            Action::NextPanel
-        );
+        assert_eq!(handle_key(KeyEvent::new(KeyCode::Up)), Action::Up);
+        assert_eq!(handle_key(KeyEvent::new(KeyCode::Char('k'))), Action::Up);
+        assert_eq!(handle_key(KeyEvent::new(KeyCode::Down)), Action::Down);
+        assert_eq!(handle_key(KeyEvent::new(KeyCode::Char('j'))), Action::Down);
+        assert_eq!(handle_key(KeyEvent::new(KeyCode::Tab)), Action::NextPanel);
         assert_eq!(
             handle_key(KeyEvent::new(KeyCode::BackTab)),
             Action::PrevPanel
         );
-        assert_eq!(
-            handle_key(KeyEvent::new(KeyCode::PageUp)),
-            Action::PageUp
-        );
+        assert_eq!(handle_key(KeyEvent::new(KeyCode::PageUp)), Action::PageUp);
         assert_eq!(
             handle_key(KeyEvent::new(KeyCode::PageDown)),
             Action::PageDown
@@ -252,30 +234,15 @@ mod tests {
             handle_key(KeyEvent::new(KeyCode::Char('r'))),
             Action::Refresh
         );
-        assert_eq!(
-            handle_key(KeyEvent::new(KeyCode::Char('?'))),
-            Action::Help
-        );
-        assert_eq!(
-            handle_key(KeyEvent::new(KeyCode::F(1))),
-            Action::Help
-        );
+        assert_eq!(handle_key(KeyEvent::new(KeyCode::Char('?'))), Action::Help);
+        assert_eq!(handle_key(KeyEvent::new(KeyCode::F(1))), Action::Help);
         assert_eq!(
             handle_key(KeyEvent::new(KeyCode::Char('/'))),
             Action::Filter
         );
-        assert_eq!(
-            handle_key(KeyEvent::new(KeyCode::Char('y'))),
-            Action::Copy
-        );
-        assert_eq!(
-            handle_key(KeyEvent::new(KeyCode::Enter)),
-            Action::Select
-        );
-        assert_eq!(
-            handle_key(KeyEvent::new(KeyCode::Backspace)),
-            Action::Back
-        );
+        assert_eq!(handle_key(KeyEvent::new(KeyCode::Char('y'))), Action::Copy);
+        assert_eq!(handle_key(KeyEvent::new(KeyCode::Enter)), Action::Select);
+        assert_eq!(handle_key(KeyEvent::new(KeyCode::Backspace)), Action::Back);
         assert_eq!(
             handle_key(KeyEvent::new(KeyCode::Char('x'))),
             Action::CancelBuild

@@ -398,11 +398,7 @@ fn update_state_from_daemon(state: &mut TuiState, response: DaemonFullStatusResp
 }
 
 /// Main application loop.
-async fn run_app(
-    backend: &mut TtyBackend,
-    state: &mut TuiState,
-    config: &TuiConfig,
-) -> Result<()> {
+async fn run_app(backend: &mut TtyBackend, state: &mut TuiState, config: &TuiConfig) -> Result<()> {
     let tick_rate = Duration::from_millis(config.refresh_interval_ms);
     let refresh_interval = Duration::from_millis(config.refresh_interval_ms * 5); // Refresh every 5 ticks
     let mut pool = GraphemePool::new();
@@ -416,14 +412,20 @@ async fn run_app(
             widgets::render(&mut frame, state);
 
             // Present the frame
-            let diff = prev_buf.as_ref().map(|prev| BufferDiff::compute(prev, &frame.buffer));
-            backend.presenter().present_ui(&frame.buffer, diff.as_ref(), prev_buf.is_none())?;
+            let diff = prev_buf
+                .as_ref()
+                .map(|prev| BufferDiff::compute(prev, &frame.buffer));
+            backend
+                .presenter()
+                .present_ui(&frame.buffer, diff.as_ref(), prev_buf.is_none())?;
             prev_buf = Some(frame.buffer.clone());
         }
 
         // Handle events - use confirm mode when dialog is showing, input mode for filters
         let confirm_mode = state.confirm_dialog.is_some();
-        if let Some(action) = poll_event_with_flags(backend.events(), tick_rate, state.filter_mode, confirm_mode)? {
+        if let Some(action) =
+            poll_event_with_flags(backend.events(), tick_rate, state.filter_mode, confirm_mode)?
+        {
             match action {
                 Action::Quit => {
                     // If help overlay is open, close it; otherwise quit

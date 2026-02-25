@@ -13,10 +13,10 @@
 use rch_common::api::schema::{
     generate_api_error_schema, generate_api_response_schema, generate_error_catalog,
 };
-use rch_common::api::{ApiError, ApiResponse, LegacyErrorCode, API_VERSION};
+use rch_common::api::{API_VERSION, ApiError, ApiResponse, LegacyErrorCode};
 use rch_common::e2e::logging::{
-    LogLevel, LogSource, ReliabilityContext, ReliabilityEventInput, ReliabilityPhase,
-    ReliabilityPhaseEvent, TestLoggerBuilder, RELIABILITY_EVENT_SCHEMA_VERSION,
+    LogLevel, LogSource, RELIABILITY_EVENT_SCHEMA_VERSION, ReliabilityContext,
+    ReliabilityEventInput, ReliabilityPhase, ReliabilityPhaseEvent, TestLoggerBuilder,
 };
 use rch_common::errors::catalog::{ErrorCategory, ErrorCode};
 use rch_common::protocol::{HookInput, HookOutput};
@@ -138,7 +138,10 @@ fn e2e_error_payload_config_category_structure() {
     assert_eq!(val["category"].as_str().unwrap(), "config");
     assert!(!val["message"].as_str().unwrap().is_empty());
     let remediation = val["remediation"].as_array().unwrap();
-    assert!(!remediation.is_empty(), "config errors must have remediation");
+    assert!(
+        !remediation.is_empty(),
+        "config errors must have remediation"
+    );
 }
 
 #[test]
@@ -174,10 +177,12 @@ fn e2e_error_payload_build_category_structure() {
 
     assert_eq!(val["code"].as_str().unwrap(), "RCH-E300");
     assert_eq!(val["category"].as_str().unwrap(), "build");
-    assert!(val["details"]
-        .as_str()
-        .unwrap()
-        .contains("exited with code 101"));
+    assert!(
+        val["details"]
+            .as_str()
+            .unwrap()
+            .contains("exited with code 101")
+    );
 }
 
 #[test]
@@ -190,7 +195,10 @@ fn e2e_error_payload_transfer_category_structure() {
 
     assert_eq!(val["code"].as_str().unwrap(), "RCH-E400");
     assert_eq!(val["category"].as_str().unwrap(), "transfer");
-    assert_eq!(val["context"]["src"].as_str().unwrap(), "/data/projects/myapp");
+    assert_eq!(
+        val["context"]["src"].as_str().unwrap(),
+        "/data/projects/myapp"
+    );
 }
 
 #[test]
@@ -228,7 +236,10 @@ fn e2e_error_payload_process_triage_subcategory() {
     assert_eq!(val["code"].as_str().unwrap(), "RCH-E312");
     assert_eq!(val["category"].as_str().unwrap(), "build");
     assert_eq!(val["context"]["action"].as_str().unwrap(), "HardTerminate");
-    assert_eq!(val["context"]["decision_code"].as_str().unwrap(), "PT_BLOCK_DENYLIST");
+    assert_eq!(
+        val["context"]["decision_code"].as_str().unwrap(),
+        "PT_BLOCK_DENYLIST"
+    );
 }
 
 #[test]
@@ -261,14 +272,8 @@ fn e2e_hook_protocol_deny_output_structure() {
     let val: Value = serde_json::from_str(&json).unwrap();
 
     let hook_output = &val["hookSpecificOutput"];
-    assert_eq!(
-        hook_output["hookEventName"].as_str().unwrap(),
-        "PreToolUse"
-    );
-    assert_eq!(
-        hook_output["permissionDecision"].as_str().unwrap(),
-        "deny"
-    );
+    assert_eq!(hook_output["hookEventName"].as_str().unwrap(), "PreToolUse");
+    assert_eq!(hook_output["permissionDecision"].as_str().unwrap(), "deny");
     assert_eq!(
         hook_output["permissionDecisionReason"].as_str().unwrap(),
         "remote build failed: exit code 101"
@@ -282,14 +287,8 @@ fn e2e_hook_protocol_allow_with_modified_command_structure() {
     let val: Value = serde_json::from_str(&json).unwrap();
 
     let hook_output = &val["hookSpecificOutput"];
-    assert_eq!(
-        hook_output["hookEventName"].as_str().unwrap(),
-        "PreToolUse"
-    );
-    assert_eq!(
-        hook_output["permissionDecision"].as_str().unwrap(),
-        "allow"
-    );
+    assert_eq!(hook_output["hookEventName"].as_str().unwrap(), "PreToolUse");
+    assert_eq!(hook_output["permissionDecision"].as_str().unwrap(), "allow");
     let updated = &hook_output["updatedInput"];
     assert_eq!(updated["command"].as_str().unwrap(), "true");
 }
@@ -397,10 +396,7 @@ fn e2e_reliability_event_backward_compat_with_all_optional_context() {
     assert_eq!(event.schema_version, "1.0.0");
     assert_eq!(event.phase, ReliabilityPhase::Execute);
     assert_eq!(event.level, LogLevel::Warn);
-    assert_eq!(
-        event.context.worker_id.as_deref(),
-        Some("worker-css")
-    );
+    assert_eq!(event.context.worker_id.as_deref(), Some("worker-css"));
     assert_eq!(event.context.repo_set.len(), 2);
     assert_eq!(
         event.context.pressure_state.as_deref(),
@@ -629,9 +625,15 @@ fn e2e_api_response_schema_has_required_properties() {
 
     // The root schema should define key properties
     let json_str = serde_json::to_string(&json).unwrap();
-    assert!(json_str.contains("api_version"), "schema must include api_version");
+    assert!(
+        json_str.contains("api_version"),
+        "schema must include api_version"
+    );
     assert!(json_str.contains("success"), "schema must include success");
-    assert!(json_str.contains("timestamp"), "schema must include timestamp");
+    assert!(
+        json_str.contains("timestamp"),
+        "schema must include timestamp"
+    );
 }
 
 #[test]
@@ -732,8 +734,7 @@ fn e2e_legacy_unknown_code_falls_back_to_internal() {
 #[test]
 fn e2e_machine_parser_can_extract_error_code_from_response() {
     // Simulate what an external parser (e.g., agent, CI script) would do
-    let error = ApiError::from_code(ErrorCode::TransferTimeout)
-        .with_context("timeout_secs", "120");
+    let error = ApiError::from_code(ErrorCode::TransferTimeout).with_context("timeout_secs", "120");
     let response: ApiResponse<()> = ApiResponse::err("exec", error);
     let json = serde_json::to_string(&response).unwrap();
 
@@ -748,13 +749,14 @@ fn e2e_machine_parser_can_extract_error_code_from_response() {
 
     let category = val["error"]["category"].as_str().unwrap();
     assert!(
-        ["config", "network", "worker", "build", "transfer", "internal"].contains(&category)
+        [
+            "config", "network", "worker", "build", "transfer", "internal"
+        ]
+        .contains(&category)
     );
 
     let empty_vec = vec![];
-    let remediation = val["error"]["remediation"]
-        .as_array()
-        .unwrap_or(&empty_vec);
+    let remediation = val["error"]["remediation"].as_array().unwrap_or(&empty_vec);
     for step in remediation {
         assert!(step.as_str().is_some(), "remediation steps must be strings");
     }
@@ -808,7 +810,10 @@ fn e2e_machine_parser_can_extract_reliability_event_fields() {
     assert!(val["timestamp"].as_str().is_some());
     assert_eq!(val["level"].as_str().unwrap(), "error");
     assert_eq!(val["phase"].as_str().unwrap(), "execute");
-    assert_eq!(val["scenario_id"].as_str().unwrap(), "scenario-disk-pressure");
+    assert_eq!(
+        val["scenario_id"].as_str().unwrap(),
+        "scenario-disk-pressure"
+    );
     assert_eq!(
         val["context"]["decision_code"].as_str().unwrap(),
         "PRESSURE_CRITICAL"
@@ -817,7 +822,10 @@ fn e2e_machine_parser_can_extract_reliability_event_fields() {
         val["context"]["pressure_state"].as_str().unwrap(),
         "critical"
     );
-    assert_eq!(val["context"]["triage_actions"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        val["context"]["triage_actions"].as_array().unwrap().len(),
+        1
+    );
     assert_eq!(val["artifact_paths"].as_array().unwrap().len(), 1);
 }
 
@@ -880,10 +888,7 @@ fn e2e_log_entry_jsonl_format_conformance() {
             "line {i}: missing message"
         );
         // source is an object (tagged enum)
-        assert!(
-            val.get("source").is_some(),
-            "line {i}: missing source"
-        );
+        assert!(val.get("source").is_some(), "line {i}: missing source");
     }
 
     // Verify the third line has context
@@ -920,21 +925,14 @@ fn e2e_api_error_from_code_roundtrips_through_json() {
         let json = serde_json::to_string(&error).unwrap();
         let parsed: ApiError = serde_json::from_str(&json).unwrap();
 
+        assert_eq!(parsed.code, error.code, "code mismatch for {:?}", code);
         assert_eq!(
-            parsed.code,
-            error.code,
-            "code mismatch for {:?}",
-            code
-        );
-        assert_eq!(
-            parsed.category,
-            error.category,
+            parsed.category, error.category,
             "category mismatch for {:?}",
             code
         );
         assert_eq!(
-            parsed.message,
-            error.message,
+            parsed.message, error.message,
             "message mismatch for {:?}",
             code
         );

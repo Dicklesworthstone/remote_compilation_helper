@@ -370,10 +370,7 @@ fn generate_worker_hints(workers: &[SimWorker]) -> Vec<UxRemediationHint> {
                     hints.push(UxRemediationHint {
                         reason_code: "pressure_telemetry_gap".into(),
                         severity: HintSeverity::Warning,
-                        message: format!(
-                            "Worker {} storage telemetry stale or missing",
-                            w.id
-                        ),
+                        message: format!("Worker {} storage telemetry stale or missing", w.id),
                         suggested_action: format!("rch workers probe {}", w.id),
                         worker_id: Some(w.id.clone()),
                         involves_destructive_action: false,
@@ -419,10 +416,7 @@ fn generate_convergence_hints(workers: &[SimWorker]) -> Vec<UxRemediationHint> {
                     reason_code: "convergence_drifting".into(),
                     severity: HintSeverity::Warning,
                     message: format!("Worker {} repos drifting{}", w.id, missing),
-                    suggested_action: format!(
-                        "rch repo-convergence repair --worker {}",
-                        w.id
-                    ),
+                    suggested_action: format!("rch repo-convergence repair --worker {}", w.id),
                     worker_id: Some(w.id.clone()),
                     involves_destructive_action: false,
                     risk_note: None,
@@ -450,10 +444,7 @@ fn generate_convergence_hints(workers: &[SimWorker]) -> Vec<UxRemediationHint> {
                     reason_code: "convergence_stale".into(),
                     severity: HintSeverity::Info,
                     message: format!("Worker {} convergence data stale", w.id),
-                    suggested_action: format!(
-                        "rch repo-convergence dry-run --worker {}",
-                        w.id
-                    ),
+                    suggested_action: format!("rch repo-convergence dry-run --worker {}", w.id),
                     worker_id: Some(w.id.clone()),
                     involves_destructive_action: false,
                     risk_note: None,
@@ -637,11 +628,7 @@ fn build_scenario(
     let worker_summary = if workers.is_empty() {
         "Workers: none configured".into()
     } else {
-        format!(
-            "Workers: {}/{} healthy",
-            healthy_count,
-            workers.len()
-        )
+        format!("Workers: {}/{} healthy", healthy_count, workers.len())
     };
 
     let conv_ready = workers
@@ -699,10 +686,7 @@ fn build_golden_snapshot(scenario: &UxScenario) -> UxGoldenSnapshot {
         .filter(|h| h.involves_destructive_action)
         .all(|h| h.risk_note.is_some());
 
-    let all_have_reason = scenario
-        .hints
-        .iter()
-        .all(|h| !h.reason_code.is_empty());
+    let all_have_reason = scenario.hints.iter().all(|h| !h.reason_code.is_empty());
     let all_have_action = scenario
         .hints
         .iter()
@@ -783,7 +767,10 @@ fn e2e_ux_healthy_posture_is_remote_ready() {
 #[test]
 fn e2e_ux_healthy_no_hints() {
     let scenario = build_scenario("healthy", &healthy_workers(), vec![]);
-    assert!(scenario.hints.is_empty(), "healthy scenario should have no remediation hints");
+    assert!(
+        scenario.hints.is_empty(),
+        "healthy scenario should have no remediation hints"
+    );
 }
 
 #[test]
@@ -792,7 +779,12 @@ fn e2e_ux_healthy_narrative_clean() {
     let snapshot = build_golden_snapshot(&scenario);
     assert!(snapshot.narrative_deterministic);
     assert!(snapshot.redaction_clean);
-    assert!(!scenario.narrative_lines.iter().any(|l| l.contains("Remediation")));
+    assert!(
+        !scenario
+            .narrative_lines
+            .iter()
+            .any(|l| l.contains("Remediation"))
+    );
 }
 
 #[test]
@@ -832,7 +824,10 @@ fn e2e_ux_degraded_all_hints_have_reason_and_action() {
 fn e2e_ux_degraded_narrative_contains_remediation_section() {
     let scenario = build_scenario("degraded", &degraded_workers(), vec![]);
     assert!(
-        scenario.narrative_lines.iter().any(|l| l.contains("Remediation")),
+        scenario
+            .narrative_lines
+            .iter()
+            .any(|l| l.contains("Remediation")),
         "degraded narrative must include remediation section"
     );
 }
@@ -851,7 +846,10 @@ fn e2e_ux_degraded_convergence_drifting_mentioned() {
         .hints
         .iter()
         .any(|h| h.reason_code == "convergence_drifting");
-    assert!(has_drift, "degraded scenario should report convergence drifting");
+    assert!(
+        has_drift,
+        "degraded scenario should report convergence drifting"
+    );
 }
 
 // ===========================================================================
@@ -971,7 +969,10 @@ fn e2e_ux_compat_mismatch_generates_hint() {
         .hints
         .iter()
         .any(|h| h.reason_code == "schema_mismatch");
-    assert!(has_mismatch, "compatibility mismatch must generate schema_mismatch hint");
+    assert!(
+        has_mismatch,
+        "compatibility mismatch must generate schema_mismatch hint"
+    );
 }
 
 #[test]
@@ -1017,7 +1018,9 @@ fn e2e_ux_rollout_all_disabled_warns() {
     ];
     let hints = generate_rollout_hints(&flags);
     assert!(
-        hints.iter().any(|h| h.reason_code == "rollout_all_disabled"),
+        hints
+            .iter()
+            .any(|h| h.reason_code == "rollout_all_disabled"),
         "all-disabled should warn"
     );
 }
@@ -1030,9 +1033,11 @@ fn e2e_ux_rollout_canary_is_info() {
         subsystem: "disk_pressure".into(),
     }];
     let hints = generate_rollout_hints(&flags);
-    assert!(hints.iter().any(|h| {
-        h.reason_code == "rollout_canary_active" && h.severity == HintSeverity::Info
-    }));
+    assert!(
+        hints.iter().any(|h| {
+            h.reason_code == "rollout_canary_active" && h.severity == HintSeverity::Info
+        })
+    );
 }
 
 #[test]
@@ -1076,14 +1081,16 @@ fn e2e_ux_rollout_canary_gate_in_narrative() {
         },
     ];
     let rollout_hints = generate_rollout_hints(&flags);
-    let scenario = build_scenario(
-        "rollback-canary-gate",
-        &healthy_workers(),
-        rollout_hints,
-    );
+    let scenario = build_scenario("rollback-canary-gate", &healthy_workers(), rollout_hints);
     let text = scenario.narrative_lines.join("\n");
-    assert!(text.contains("canary"), "canary flags should appear in narrative");
-    assert!(text.contains("dry_run"), "dry-run flags should appear in narrative");
+    assert!(
+        text.contains("canary"),
+        "canary flags should appear in narrative"
+    );
+    assert!(
+        text.contains("dry_run"),
+        "dry-run flags should appear in narrative"
+    );
 }
 
 // ===========================================================================
@@ -1425,7 +1432,10 @@ fn e2e_ux_golden_snapshot_quarantined_stable() {
     let snapshot = build_golden_snapshot(&scenario);
 
     assert_eq!(snapshot.posture, PostureLabel::LocalOnly);
-    assert!(snapshot.hint_count >= 4, "quarantined should have many hints");
+    assert!(
+        snapshot.hint_count >= 4,
+        "quarantined should have many hints"
+    );
     assert!(snapshot.critical_count >= 2);
     assert!(snapshot.has_destructive_hints);
     assert!(snapshot.all_destructive_have_risk_notes);
@@ -1493,7 +1503,11 @@ fn e2e_ux_logging_integration() {
 
     let entries = logger.entries();
     assert_eq!(entries.len(), 4, "should log one entry per scenario");
-    assert!(entries.iter().all(|e| e.source.to_string() == "ux_regression"));
+    assert!(
+        entries
+            .iter()
+            .all(|e| e.source.to_string() == "ux_regression")
+    );
 }
 
 // ===========================================================================
@@ -1510,14 +1524,8 @@ fn e2e_ux_failure_history_visual_pattern() {
             .collect()
     }
 
-    assert_eq!(
-        format_failure_history(&[true, true, true]),
-        "✓✓✓"
-    );
-    assert_eq!(
-        format_failure_history(&[false, false, true]),
-        "✗✗✓"
-    );
+    assert_eq!(format_failure_history(&[true, true, true]), "✓✓✓");
+    assert_eq!(format_failure_history(&[false, false, true]), "✗✗✓");
     assert_eq!(
         format_failure_history(&[false, false, false, false, false]),
         "✗✗✗✗✗"

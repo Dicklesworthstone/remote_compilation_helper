@@ -2158,6 +2158,8 @@ fn default_excludes() -> Vec<String> {
         ".nuxt/".to_string(),
         ".turbo/".to_string(),
         ".parcel-cache/".to_string(),
+        // Beads runtime state (local issue DB + lock/temp files); not needed remotely.
+        ".beads/".to_string(),
         // Coverage reports (generated during tests)
         "coverage/".to_string(),
         ".nyc_output/".to_string(),

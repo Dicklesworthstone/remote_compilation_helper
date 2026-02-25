@@ -13,11 +13,11 @@
 //!
 //! All tests use deterministic seeds and simulated execution — no live workers needed.
 
+use rch_common::classify_command;
 use rch_common::e2e::logging::{
     LogLevel, ReliabilityContext, ReliabilityEventInput, ReliabilityPhase, TestLoggerBuilder,
 };
 use rch_common::errors::ErrorCode;
-use rch_common::classify_command;
 use rch_common::patterns::Classification;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -266,7 +266,10 @@ fn check_parity(
         .unwrap_or("info")
         .to_string();
 
-    let remediation_hints: Vec<String> = divergences.iter().map(|d| d.remediation().to_string()).collect();
+    let remediation_hints: Vec<String> = divergences
+        .iter()
+        .map(|d| d.remediation().to_string())
+        .collect();
 
     ParityCheckResult {
         command: local.command.clone(),
@@ -279,11 +282,19 @@ fn check_parity(
     }
 }
 
-fn build_suite_summary(results: &[ParityCheckResult], seed: u64, threshold: f64) -> ParitySuiteSummary {
+fn build_suite_summary(
+    results: &[ParityCheckResult],
+    seed: u64,
+    threshold: f64,
+) -> ParitySuiteSummary {
     let total = results.len();
     let pass = results.iter().filter(|r| r.is_parity).count();
     let fail = total - pass;
-    let rate = if total > 0 { pass as f64 / total as f64 } else { 1.0 };
+    let rate = if total > 0 {
+        pass as f64 / total as f64
+    } else {
+        1.0
+    };
 
     let mut type_counts: HashMap<String, usize> = HashMap::new();
     let mut critical = Vec::new();
@@ -356,7 +367,11 @@ fn make_local_result(cmd: &str, exit_code: i32, rng: &mut Xorshift64) -> LocalEx
     }
 }
 
-fn make_matching_remote(local: &LocalExecutionResult, worker: &str, rng: &mut Xorshift64) -> RemoteExecutionResult {
+fn make_matching_remote(
+    local: &LocalExecutionResult,
+    worker: &str,
+    rng: &mut Xorshift64,
+) -> RemoteExecutionResult {
     RemoteExecutionResult {
         _command: local.command.clone(),
         worker_id: worker.to_string(),
@@ -489,7 +504,11 @@ fn e2e_parity_classification_drift() {
 
     let result = check_parity(&local, &remote, &allowlist);
     assert!(!result.is_parity);
-    assert!(result.divergences.contains(&DivergenceType::ClassificationDrift));
+    assert!(
+        result
+            .divergences
+            .contains(&DivergenceType::ClassificationDrift)
+    );
     assert_eq!(result.severity, "critical");
 }
 
@@ -507,8 +526,15 @@ fn e2e_parity_timing_only_does_not_fail_when_allowlisted() {
     remote.duration_ms = local.duration_ms * 3;
 
     let result = check_parity(&local, &remote, &allowlist);
-    assert!(result.is_parity, "timing-only difference should be allowlisted");
-    assert!(result.allowlisted_fields.contains(&"duration_ms".to_string()));
+    assert!(
+        result.is_parity,
+        "timing-only difference should be allowlisted"
+    );
+    assert!(
+        result
+            .allowlisted_fields
+            .contains(&"duration_ms".to_string())
+    );
 }
 
 #[test]
@@ -624,7 +650,12 @@ fn e2e_parity_result_includes_remediation_hints() {
 
     let result = check_parity(&local, &remote, &allowlist);
     assert!(!result.remediation_hints.is_empty());
-    assert!(result.remediation_hints.iter().any(|h| h.contains("toolchain")));
+    assert!(
+        result
+            .remediation_hints
+            .iter()
+            .any(|h| h.contains("toolchain"))
+    );
 }
 
 // ===========================================================================
@@ -650,10 +681,7 @@ fn e2e_parity_build_test_check_clippy_paths() {
         let local = make_local_result(cmd, 0, &mut rng);
         let remote = make_matching_remote(&local, "w1", &mut rng);
         let result = check_parity(&local, &remote, &allowlist);
-        assert!(
-            result.is_parity,
-            "parity should pass for matching '{cmd}'"
-        );
+        assert!(result.is_parity, "parity should pass for matching '{cmd}'");
     }
 }
 
@@ -669,7 +697,10 @@ fn e2e_parity_non_compilation_commands_local_only() {
         let remote = make_matching_remote(&local, "w1", &mut rng);
         let result = check_parity(&local, &remote, &allowlist);
         // Non-compilation commands should pass when local/remote agree
-        assert!(result.is_parity, "non-compilation '{cmd}' should pass parity");
+        assert!(
+            result.is_parity,
+            "non-compilation '{cmd}' should pass parity"
+        );
     }
 }
 
@@ -997,7 +1028,10 @@ fn e2e_parity_normalization_rules_in_allowlist() {
         })
         .collect();
 
-    assert!(rule_types.contains(&"ignore"), "allowlist should contain Ignore rule");
+    assert!(
+        rule_types.contains(&"ignore"),
+        "allowlist should contain Ignore rule"
+    );
     assert!(
         rule_types.contains(&"within_tolerance"),
         "allowlist should contain WithinTolerance rule"

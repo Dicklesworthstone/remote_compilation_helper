@@ -11,23 +11,23 @@
 //!   - Full pipeline simulation (classification → spec → triage → response)
 
 use criterion::{Criterion, criterion_group, criterion_main};
+use rch_common::HookInput;
 use rch_common::api::{ApiError, ApiResponse};
 use rch_common::e2e::harness::{
     ReliabilityCommandRecord, ReliabilityFailureHook, ReliabilityFailureHookFlags,
     ReliabilityLifecycleCommand, ReliabilityScenarioReport, ReliabilityScenarioSpec,
 };
 use rch_common::e2e::logging::{
-    ReliabilityContext, ReliabilityEventInput, ReliabilityPhase, TestLoggerBuilder,
-    RELIABILITY_EVENT_SCHEMA_VERSION,
+    RELIABILITY_EVENT_SCHEMA_VERSION, ReliabilityContext, ReliabilityEventInput, ReliabilityPhase,
+    TestLoggerBuilder,
 };
 use rch_common::e2e::process_triage::{
-    ProcessClassification, ProcessDescriptor, ProcessTriageActionClass,
-    ProcessTriageActionRequest, ProcessTriageContract, ProcessTriageRequest,
-    ProcessTriageTrigger, PROCESS_TRIAGE_CONTRACT_SCHEMA_VERSION, evaluate_triage_action,
+    PROCESS_TRIAGE_CONTRACT_SCHEMA_VERSION, ProcessClassification, ProcessDescriptor,
+    ProcessTriageActionClass, ProcessTriageActionRequest, ProcessTriageContract,
+    ProcessTriageRequest, ProcessTriageTrigger, evaluate_triage_action,
 };
 use rch_common::errors::ErrorCode;
 use rch_common::protocol::HookOutput;
-use rch_common::HookInput;
 use std::hint::black_box;
 
 // ---------------------------------------------------------------------------
@@ -173,9 +173,7 @@ fn bench_scenario_spec_serialization(c: &mut Criterion) {
 
     let json = serde_json::to_string(&spec).unwrap();
     group.bench_function("deserialize", |b| {
-        b.iter(|| {
-            black_box(serde_json::from_str::<ReliabilityScenarioSpec>(&json).unwrap())
-        })
+        b.iter(|| black_box(serde_json::from_str::<ReliabilityScenarioSpec>(&json).unwrap()))
     });
 
     group.finish();
@@ -371,9 +369,7 @@ fn bench_scenario_report(c: &mut Criterion) {
 
     let json = serde_json::to_string(&report).unwrap();
     group.bench_function("deserialize_10_commands", |b| {
-        b.iter(|| {
-            black_box(serde_json::from_str::<ReliabilityScenarioReport>(&json).unwrap())
-        })
+        b.iter(|| black_box(serde_json::from_str::<ReliabilityScenarioReport>(&json).unwrap()))
     });
 
     group.finish();
@@ -430,8 +426,7 @@ fn bench_full_pipeline_simulation(c: &mut Criterion) {
 
             // 3. Serialize spec (simulates daemon transmission)
             let spec_json = serde_json::to_string(&spec).unwrap();
-            let _spec_back: ReliabilityScenarioSpec =
-                serde_json::from_str(&spec_json).unwrap();
+            let _spec_back: ReliabilityScenarioSpec = serde_json::from_str(&spec_json).unwrap();
 
             // 4. Evaluate triage action
             let contract = ProcessTriageContract::default();

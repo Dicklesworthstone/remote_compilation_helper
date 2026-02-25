@@ -81,16 +81,15 @@ fn build_coverage_matrix() -> CoverageMatrix {
         // ---------------------------------------------------------------
         RequirementRow {
             id: "REQ-PATH-001".into(),
-            description: "Cross-repo Cargo path dependency resolution and transitive closure".into(),
+            description: "Cross-repo Cargo path dependency resolution and transitive closure"
+                .into(),
             domain: "path_deps".into(),
             bead_id: "bd-vvmd.2.8".into(),
-            test_refs: vec![
-                TestRef {
-                    file: "cross_repo_path_deps_e2e.rs".into(),
-                    name_prefix: "e2e_cross_repo_".into(),
-                    tier: "smoke".into(),
-                },
-            ],
+            test_refs: vec![TestRef {
+                file: "cross_repo_path_deps_e2e.rs".into(),
+                name_prefix: "e2e_cross_repo_".into(),
+                tier: "smoke".into(),
+            }],
             artifact_assertions: vec![
                 "Planner output includes all transitive path deps".into(),
                 "Alias symlinks produce equivalent closure".into(),
@@ -104,16 +103,12 @@ fn build_coverage_matrix() -> CoverageMatrix {
             description: "Dependency closure planner deterministic ordering".into(),
             domain: "path_deps".into(),
             bead_id: "bd-vvmd.2.7".into(),
-            test_refs: vec![
-                TestRef {
-                    file: "dependency_closure_planner.rs".into(),
-                    name_prefix: "test_".into(),
-                    tier: "smoke".into(),
-                },
-            ],
-            artifact_assertions: vec![
-                "Planner output is deterministically ordered".into(),
-            ],
+            test_refs: vec![TestRef {
+                file: "dependency_closure_planner.rs".into(),
+                name_prefix: "test_".into(),
+                tier: "smoke".into(),
+            }],
+            artifact_assertions: vec!["Planner output is deterministically ordered".into()],
             has_executable_test: true,
             has_log_assertion: true,
             gap: None,
@@ -123,13 +118,11 @@ fn build_coverage_matrix() -> CoverageMatrix {
             description: "Fail-open semantics when path deps cannot be resolved".into(),
             domain: "path_deps".into(),
             bead_id: "bd-vvmd.2.8".into(),
-            test_refs: vec![
-                TestRef {
-                    file: "cross_repo_path_deps_e2e.rs".into(),
-                    name_prefix: "e2e_cross_repo_fail_open".into(),
-                    tier: "smoke".into(),
-                },
-            ],
+            test_refs: vec![TestRef {
+                file: "cross_repo_path_deps_e2e.rs".into(),
+                name_prefix: "e2e_cross_repo_fail_open".into(),
+                tier: "smoke".into(),
+            }],
             artifact_assertions: vec![
                 "Graceful degradation with diagnostic output when deps are missing".into(),
             ],
@@ -145,13 +138,11 @@ fn build_coverage_matrix() -> CoverageMatrix {
             description: "Command classification regression for non-compilation UX".into(),
             domain: "classification".into(),
             bead_id: "bd-vvmd.2.9".into(),
-            test_refs: vec![
-                TestRef {
-                    file: "cross_repo_path_deps_e2e.rs".into(),
-                    name_prefix: "e2e_cross_repo_classify".into(),
-                    tier: "smoke".into(),
-                },
-            ],
+            test_refs: vec![TestRef {
+                file: "cross_repo_path_deps_e2e.rs".into(),
+                name_prefix: "e2e_cross_repo_classify".into(),
+                tier: "smoke".into(),
+            }],
             artifact_assertions: vec![
                 "Classification timing under budget".into(),
                 "Known commands correctly categorized".into(),
@@ -168,13 +159,11 @@ fn build_coverage_matrix() -> CoverageMatrix {
             description: "Repo convergence adapter contract and failure taxonomy".into(),
             domain: "convergence".into(),
             bead_id: "bd-vvmd.3.6".into(),
-            test_refs: vec![
-                TestRef {
-                    file: "repo_convergence_e2e.rs".into(),
-                    name_prefix: "e2e_convergence_".into(),
-                    tier: "smoke".into(),
-                },
-            ],
+            test_refs: vec![TestRef {
+                file: "repo_convergence_e2e.rs".into(),
+                name_prefix: "e2e_convergence_".into(),
+                tier: "smoke".into(),
+            }],
             artifact_assertions: vec![
                 "Adapter request/response schema roundtrip valid".into(),
                 "Failure taxonomy maps to error codes".into(),
@@ -189,16 +178,12 @@ fn build_coverage_matrix() -> CoverageMatrix {
             description: "Repo convergence internal unit tests".into(),
             domain: "convergence".into(),
             bead_id: "bd-vvmd.3.8".into(),
-            test_refs: vec![
-                TestRef {
-                    file: "repo_convergence_e2e.rs".into(),
-                    name_prefix: "e2e_convergence_mock_adapter".into(),
-                    tier: "smoke".into(),
-                },
-            ],
-            artifact_assertions: vec![
-                "Mock adapter exercises all contract branches".into(),
-            ],
+            test_refs: vec![TestRef {
+                file: "repo_convergence_e2e.rs".into(),
+                name_prefix: "e2e_convergence_mock_adapter".into(),
+                tier: "smoke".into(),
+            }],
+            artifact_assertions: vec!["Mock adapter exercises all contract branches".into()],
             has_executable_test: true,
             has_log_assertion: true,
             gap: None,
@@ -211,13 +196,11 @@ fn build_coverage_matrix() -> CoverageMatrix {
             description: "Disk pressure detection, prevention, and recovery".into(),
             domain: "disk_pressure".into(),
             bead_id: "bd-vvmd.4.6".into(),
-            test_refs: vec![
-                TestRef {
-                    file: "fault_injection_e2e.rs".into(),
-                    name_prefix: "e2e_fault_".into(),
-                    tier: "smoke".into(),
-                },
-            ],
+            test_refs: vec![TestRef {
+                file: "fault_injection_e2e.rs".into(),
+                name_prefix: "e2e_fault_".into(),
+                tier: "smoke".into(),
+            }],
             artifact_assertions: vec![
                 "Pressure state transitions logged".into(),
                 "Critical threshold triggers build deferral".into(),
@@ -234,13 +217,11 @@ fn build_coverage_matrix() -> CoverageMatrix {
             description: "Process triage contract, safe-action policy, escalation ladder".into(),
             domain: "process_triage".into(),
             bead_id: "bd-vvmd.5.6".into(),
-            test_refs: vec![
-                TestRef {
-                    file: "process_triage_e2e.rs".into(),
-                    name_prefix: "e2e_triage_".into(),
-                    tier: "smoke".into(),
-                },
-            ],
+            test_refs: vec![TestRef {
+                file: "process_triage_e2e.rs".into(),
+                name_prefix: "e2e_triage_".into(),
+                tier: "smoke".into(),
+            }],
             artifact_assertions: vec![
                 "Safe-action policy prevents harmful actions on protected processes".into(),
                 "Escalation ladder produces monotonically increasing severity".into(),
@@ -258,13 +239,11 @@ fn build_coverage_matrix() -> CoverageMatrix {
             description: "Deterministic fault injection for partial failure and recovery".into(),
             domain: "fault_injection".into(),
             bead_id: "bd-vvmd.7.6".into(),
-            test_refs: vec![
-                TestRef {
-                    file: "fault_injection_e2e.rs".into(),
-                    name_prefix: "e2e_fault_".into(),
-                    tier: "smoke".into(),
-                },
-            ],
+            test_refs: vec![TestRef {
+                file: "fault_injection_e2e.rs".into(),
+                name_prefix: "e2e_fault_".into(),
+                tier: "smoke".into(),
+            }],
             artifact_assertions: vec![
                 "Network cut, partial sync, timeout, and combined pressure faults exercised".into(),
                 "Recovery path validated after each fault".into(),
@@ -281,13 +260,11 @@ fn build_coverage_matrix() -> CoverageMatrix {
             description: "JSON/log schema contract golden tests for reliability outputs".into(),
             domain: "schema_contract".into(),
             bead_id: "bd-vvmd.6.8".into(),
-            test_refs: vec![
-                TestRef {
-                    file: "schema_contract_e2e.rs".into(),
-                    name_prefix: "e2e_schema_".into(),
-                    tier: "smoke".into(),
-                },
-            ],
+            test_refs: vec![TestRef {
+                file: "schema_contract_e2e.rs".into(),
+                name_prefix: "e2e_schema_".into(),
+                tier: "smoke".into(),
+            }],
             artifact_assertions: vec![
                 "API envelope schema valid".into(),
                 "Error payload schema valid".into(),
@@ -303,16 +280,15 @@ fn build_coverage_matrix() -> CoverageMatrix {
         // ---------------------------------------------------------------
         RequirementRow {
             id: "REQ-SOAK-001".into(),
-            description: "Long-duration concurrency soak with slot churn and pressure transitions".into(),
+            description: "Long-duration concurrency soak with slot churn and pressure transitions"
+                .into(),
             domain: "soak_concurrency".into(),
             bead_id: "bd-vvmd.7.9".into(),
-            test_refs: vec![
-                TestRef {
-                    file: "soak_concurrency_e2e.rs".into(),
-                    name_prefix: "e2e_soak_".into(),
-                    tier: "smoke".into(),
-                },
-            ],
+            test_refs: vec![TestRef {
+                file: "soak_concurrency_e2e.rs".into(),
+                name_prefix: "e2e_soak_".into(),
+                tier: "smoke".into(),
+            }],
             artifact_assertions: vec![
                 "No resource leaks after sustained concurrent operations".into(),
                 "Failure hooks execute within timing budget".into(),
@@ -329,13 +305,11 @@ fn build_coverage_matrix() -> CoverageMatrix {
             description: "Cross-worker determinism and parity validation".into(),
             domain: "cross_worker_parity".into(),
             bead_id: "bd-vvmd.7.10".into(),
-            test_refs: vec![
-                TestRef {
-                    file: "cross_worker_parity_e2e.rs".into(),
-                    name_prefix: "e2e_parity_".into(),
-                    tier: "smoke".into(),
-                },
-            ],
+            test_refs: vec![TestRef {
+                file: "cross_worker_parity_e2e.rs".into(),
+                name_prefix: "e2e_parity_".into(),
+                tier: "smoke".into(),
+            }],
             artifact_assertions: vec![
                 "Exit codes identical across workers for same input".into(),
                 "Artifact hashes match across workers".into(),
@@ -353,13 +327,11 @@ fn build_coverage_matrix() -> CoverageMatrix {
             description: "Local-vs-remote execution parity validation".into(),
             domain: "local_remote_parity".into(),
             bead_id: "bd-vvmd.7.11".into(),
-            test_refs: vec![
-                TestRef {
-                    file: "local_remote_parity_e2e.rs".into(),
-                    name_prefix: "e2e_lr_parity_".into(),
-                    tier: "smoke".into(),
-                },
-            ],
+            test_refs: vec![TestRef {
+                file: "local_remote_parity_e2e.rs".into(),
+                name_prefix: "e2e_lr_parity_".into(),
+                tier: "smoke".into(),
+            }],
             artifact_assertions: vec![
                 "Error codes consistent between local and remote".into(),
                 "Schema divergence detection works".into(),
@@ -377,13 +349,11 @@ fn build_coverage_matrix() -> CoverageMatrix {
             description: "Scenario bundle capture, replay, and divergence detection".into(),
             domain: "deterministic_replay".into(),
             bead_id: "bd-vvmd.7.12".into(),
-            test_refs: vec![
-                TestRef {
-                    file: "deterministic_replay_e2e.rs".into(),
-                    name_prefix: "e2e_replay_".into(),
-                    tier: "smoke".into(),
-                },
-            ],
+            test_refs: vec![TestRef {
+                file: "deterministic_replay_e2e.rs".into(),
+                name_prefix: "e2e_replay_".into(),
+                tier: "smoke".into(),
+            }],
             artifact_assertions: vec![
                 "Bundle round-trips through capture/replay".into(),
                 "Schema version compatibility checked".into(),
@@ -401,13 +371,11 @@ fn build_coverage_matrix() -> CoverageMatrix {
             description: "Hard-gated performance budgets for reliability pipeline".into(),
             domain: "performance_budget".into(),
             bead_id: "bd-vvmd.6.6".into(),
-            test_refs: vec![
-                TestRef {
-                    file: "performance_budget_e2e.rs".into(),
-                    name_prefix: "e2e_perf_".into(),
-                    tier: "smoke".into(),
-                },
-            ],
+            test_refs: vec![TestRef {
+                file: "performance_budget_e2e.rs".into(),
+                name_prefix: "e2e_perf_".into(),
+                tier: "smoke".into(),
+            }],
             artifact_assertions: vec![
                 "Hook decision latency under 5ms".into(),
                 "Catalog lookup under 1ms".into(),
@@ -454,13 +422,11 @@ fn build_coverage_matrix() -> CoverageMatrix {
             description: "Cross-project helper contract-drift compatibility validation".into(),
             domain: "contract_drift".into(),
             bead_id: "bd-vvmd.6.11".into(),
-            test_refs: vec![
-                TestRef {
-                    file: "contract_drift_e2e.rs".into(),
-                    name_prefix: "e2e_compat_".into(),
-                    tier: "smoke".into(),
-                },
-            ],
+            test_refs: vec![TestRef {
+                file: "contract_drift_e2e.rs".into(),
+                name_prefix: "e2e_compat_".into(),
+                tier: "smoke".into(),
+            }],
             artifact_assertions: vec![
                 "Version matrix compatibility checked".into(),
                 "Structured mismatch diffs generated".into(),
@@ -478,13 +444,11 @@ fn build_coverage_matrix() -> CoverageMatrix {
             description: "Feature flag states, staged rollout, health gates, auto-disable".into(),
             domain: "feature_flags".into(),
             bead_id: "bd-vvmd.6.7".into(),
-            test_refs: vec![
-                TestRef {
-                    file: "feature_flags_rollout_e2e.rs".into(),
-                    name_prefix: "e2e_flags_".into(),
-                    tier: "smoke".into(),
-                },
-            ],
+            test_refs: vec![TestRef {
+                file: "feature_flags_rollout_e2e.rs".into(),
+                name_prefix: "e2e_flags_".into(),
+                tier: "smoke".into(),
+            }],
             artifact_assertions: vec![
                 "Flag state transitions valid".into(),
                 "Canary scoping enforced".into(),
@@ -503,13 +467,11 @@ fn build_coverage_matrix() -> CoverageMatrix {
             description: "Reliability doctor diagnostics with actionable remediation".into(),
             domain: "reliability_doctor".into(),
             bead_id: "bd-vvmd.6.9".into(),
-            test_refs: vec![
-                TestRef {
-                    file: "reliability_doctor_e2e.rs".into(),
-                    name_prefix: "e2e_doctor_".into(),
-                    tier: "smoke".into(),
-                },
-            ],
+            test_refs: vec![TestRef {
+                file: "reliability_doctor_e2e.rs".into(),
+                name_prefix: "e2e_doctor_".into(),
+                tier: "smoke".into(),
+            }],
             artifact_assertions: vec![
                 "All diagnostic categories covered".into(),
                 "Every non-pass diagnostic has remediation command".into(),
@@ -528,13 +490,11 @@ fn build_coverage_matrix() -> CoverageMatrix {
             description: "Human-facing reliability output quality and golden snapshots".into(),
             domain: "ux_quality".into(),
             bead_id: "bd-1qhj".into(),
-            test_refs: vec![
-                TestRef {
-                    file: "ux_regression_e2e.rs".into(),
-                    name_prefix: "e2e_ux_".into(),
-                    tier: "smoke".into(),
-                },
-            ],
+            test_refs: vec![TestRef {
+                file: "ux_regression_e2e.rs".into(),
+                name_prefix: "e2e_ux_".into(),
+                tier: "smoke".into(),
+            }],
             artifact_assertions: vec![
                 "Golden snapshots for all scenario postures".into(),
                 "Reason codes present in all non-healthy outputs".into(),
@@ -554,13 +514,11 @@ fn build_coverage_matrix() -> CoverageMatrix {
             description: "Remote build cancellation and deterministic cleanup semantics".into(),
             domain: "cancellation".into(),
             bead_id: "bd-1yt6".into(),
-            test_refs: vec![
-                TestRef {
-                    file: "fault_injection_e2e.rs".into(),
-                    name_prefix: "e2e_fault_cancel".into(),
-                    tier: "smoke".into(),
-                },
-            ],
+            test_refs: vec![TestRef {
+                file: "fault_injection_e2e.rs".into(),
+                name_prefix: "e2e_fault_cancel".into(),
+                tier: "smoke".into(),
+            }],
             artifact_assertions: vec![
                 "Cancellation state machine transitions valid".into(),
                 "Cleanup invariants maintained after cancel".into(),
@@ -577,13 +535,11 @@ fn build_coverage_matrix() -> CoverageMatrix {
             description: "Structured reliability test logger and artifact capture".into(),
             domain: "logging".into(),
             bead_id: "bd-vvmd.7.3".into(),
-            test_refs: vec![
-                TestRef {
-                    file: "smoke.rs".into(),
-                    name_prefix: "smoke_test_logger".into(),
-                    tier: "smoke".into(),
-                },
-            ],
+            test_refs: vec![TestRef {
+                file: "smoke.rs".into(),
+                name_prefix: "smoke_test_logger".into(),
+                tier: "smoke".into(),
+            }],
             artifact_assertions: vec![
                 "JSONL log output conforms to schema".into(),
                 "Phase events have required fields".into(),
@@ -600,13 +556,11 @@ fn build_coverage_matrix() -> CoverageMatrix {
             description: "Reusable reliability E2E harness foundation".into(),
             domain: "harness".into(),
             bead_id: "bd-vvmd.7.7".into(),
-            test_refs: vec![
-                TestRef {
-                    file: "smoke.rs".into(),
-                    name_prefix: "smoke_".into(),
-                    tier: "smoke".into(),
-                },
-            ],
+            test_refs: vec![TestRef {
+                file: "smoke.rs".into(),
+                name_prefix: "smoke_".into(),
+                tier: "smoke".into(),
+            }],
             artifact_assertions: vec![
                 "TestHarnessBuilder creates isolated directories".into(),
                 "TestLoggerBuilder produces valid JSONL".into(),
@@ -623,13 +577,11 @@ fn build_coverage_matrix() -> CoverageMatrix {
             description: "Unified E2E scripts for all reliability families".into(),
             domain: "e2e_scripts".into(),
             bead_id: "bd-vvmd.7.2".into(),
-            test_refs: vec![
-                TestRef {
-                    file: "../tests/e2e/unified_reliability_suite.sh".into(),
-                    name_prefix: "run_family".into(),
-                    tier: "smoke".into(),
-                },
-            ],
+            test_refs: vec![TestRef {
+                file: "../tests/e2e/unified_reliability_suite.sh".into(),
+                name_prefix: "run_family".into(),
+                tier: "smoke".into(),
+            }],
             artifact_assertions: vec![
                 "Suite produces machine-readable JSONL phase logs".into(),
                 "Suite summary JSON has pass/fail/skip counts".into(),
@@ -641,7 +593,10 @@ fn build_coverage_matrix() -> CoverageMatrix {
     ];
 
     let total = requirements.len();
-    let covered = requirements.iter().filter(|r| r.has_executable_test).count();
+    let covered = requirements
+        .iter()
+        .filter(|r| r.has_executable_test)
+        .count();
     let gaps = requirements.iter().filter(|r| r.gap.is_some()).count();
     let total_refs: usize = requirements.iter().map(|r| r.test_refs.len()).sum();
     let total_artifacts: usize = requirements
@@ -708,7 +663,10 @@ fn e2e_matrix_serialization_roundtrip() {
     let json = serde_json::to_string_pretty(&matrix).unwrap();
     let parsed: CoverageMatrix = serde_json::from_str(&json).unwrap();
     assert_eq!(parsed.requirements.len(), matrix.requirements.len());
-    assert_eq!(parsed.summary.total_requirements, matrix.summary.total_requirements);
+    assert_eq!(
+        parsed.summary.total_requirements,
+        matrix.summary.total_requirements
+    );
 }
 
 // ===========================================================================
@@ -812,7 +770,11 @@ fn e2e_matrix_covers_all_required_domains() {
 
     for domain in &required_domains {
         let has = matrix.requirements.iter().any(|r| r.domain == *domain);
-        assert!(has, "required domain '{}' must be covered in the matrix", domain);
+        assert!(
+            has,
+            "required domain '{}' must be covered in the matrix",
+            domain
+        );
     }
 }
 
@@ -849,7 +811,9 @@ fn e2e_matrix_referenced_test_files_exist() {
             assert!(
                 path.exists(),
                 "test file '{}' referenced by requirement '{}' does not exist at {:?}",
-                test_ref.file, row.id, path
+                test_ref.file,
+                row.id,
+                path
             );
         }
     }
@@ -878,11 +842,19 @@ fn e2e_matrix_summary_counts_correct() {
     assert_eq!(matrix.summary.total_requirements, matrix.requirements.len());
     assert_eq!(
         matrix.summary.covered_requirements,
-        matrix.requirements.iter().filter(|r| r.has_executable_test).count()
+        matrix
+            .requirements
+            .iter()
+            .filter(|r| r.has_executable_test)
+            .count()
     );
     assert_eq!(
         matrix.summary.gap_count,
-        matrix.requirements.iter().filter(|r| r.gap.is_some()).count()
+        matrix
+            .requirements
+            .iter()
+            .filter(|r| r.gap.is_some())
+            .count()
     );
 }
 
@@ -915,7 +887,8 @@ fn e2e_matrix_all_bead_ids_well_formed() {
         assert!(
             row.bead_id.starts_with("bd-"),
             "bead_id '{}' in requirement '{}' must start with 'bd-'",
-            row.bead_id, row.id
+            row.bead_id,
+            row.id
         );
     }
 }
@@ -933,7 +906,9 @@ fn e2e_matrix_all_test_tiers_valid() {
             assert!(
                 valid_tiers.contains(&test_ref.tier.as_str()),
                 "test tier '{}' in requirement '{}' must be one of {:?}",
-                test_ref.tier, row.id, valid_tiers
+                test_ref.tier,
+                row.id,
+                valid_tiers
             );
         }
     }

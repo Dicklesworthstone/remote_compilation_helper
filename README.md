@@ -11,7 +11,7 @@
 curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/remote_compilation_helper/main/install.sh?$(date +%s)" | bash -s -- --easy-mode
 ```
 
-<p><em>Installs rch + rchd, configures the hook, and can optionally enable the background daemon. If rchd or workers are unavailable, RCH fails open to local builds.</em></p>
+<p><em>Installs `rch` + `rchd`, bootstraps config, and can install/start the background daemon. If remote execution cannot proceed, RCH fails open to local execution.</em></p>
 </div>
 
 <div align="center">
@@ -20,7 +20,7 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/remote_compilati
 
 <div align="center">
 
-**Transparent compilation offloading for AI coding agents**
+**Transparent remote compilation for multi-agent development**
 
 [![CI](https://github.com/Dicklesworthstone/remote_compilation_helper/actions/workflows/ci.yml/badge.svg)](https://github.com/Dicklesworthstone/remote_compilation_helper/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -33,1157 +33,410 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/remote_compilati
 
 ## TL;DR
 
-**The Problem**: Running 15+ AI coding agents (Claude Code, Codex CLI) simultaneously creates compilation storms—100% CPU, kernel contention, thermal throttling, and unresponsive shells. Your workstation becomes unusable while agents wait for builds.
+**Problem**: Many concurrent AI agents can saturate local CPU and make your workstation unusable.
 
-**The Solution**: RCH intercepts compilation commands via Claude Code's PreToolUse hook, transparently routes them to a fleet of remote worker machines, and returns artifacts as if compilation ran locally. Agents never know the difference.
+**Solution**: RCH runs as a Claude Code PreToolUse hook, classifies build-like commands in milliseconds, executes them on remote workers, and returns artifacts/output as if they ran locally.
 
-### Why Use RCH?
-
-| Feature | What It Does |
-|---------|--------------|
-| **Transparent Interception** | Hooks into Claude Code's PreToolUse—agents think compilation ran locally |
-| **Sub-Millisecond Decisions** | 5-tier classifier rejects 99% of commands in <0.1ms, compilation decisions in <1ms |
-| **Smart Worker Selection** | Load-balances across workers using speed scores, available slots, and project locality |
-| **Project Affinity** | Routes to workers with cached project copies—incremental builds stay fast |
-| **Multi-Agent Dedup** | Multiple agents compiling same project share results via broadcast channels |
-| **Fail-Open Design** | Any error falls back to local execution—never blocks an agent |
+**Design constraint**: RCH is fail-open. If remote execution is not safe/possible, commands run locally.
 
 ---
 
-## Quick Example
+## What RCH Intercepts
 
-```bash
-# 1. Start the daemon
-$ rchd &
-[rchd] Listening on /tmp/rch.sock
-[rchd] 3 workers online (72 total slots)
+RCH currently recognizes and can offload:
 
-# 2. Configure a worker (one-time)
-$ cat >> ~/.config/rch/workers.toml << 'EOF'
-[[workers]]
-id = "build-server"
-host = "203.0.113.10"
-user = "ubuntu"
-identity_file = "~/.ssh/id_rsa"
-total_slots = 32
-EOF
+| Ecosystem | Intercepted Commands |
+|---|---|
+| Rust | `cargo build`, `cargo check`, `cargo clippy`, `cargo doc`, `cargo test`, `cargo nextest run`, `cargo bench`, `rustc` |
+| Bun/TypeScript | `bun test`, `bun typecheck` |
+| C/C++ | `gcc`, `g++`, `clang`, `clang++` |
+| Build Systems | `make`, `cmake --build`, `ninja`, `meson compile` |
 
-# 3. Verify connectivity
-$ rch workers probe --all
-build-server: OK (latency: 12ms, 32 slots, rust 1.87-nightly, bun 1.2.0)
+RCH explicitly does **not** intercept local-mutating or interactive patterns (examples):
 
-# 4. Install the hook into Claude Code
-$ rch hook install
-Hook installed at ~/.claude/hooks/pre-tool-use.sh
-
-# 5. Use Claude Code normally—RCH intercepts automatically
-$ claude
-> cargo build --release     # → Runs on build-server, artifacts returned
-> cargo test               # → Tests run remotely, output streams back
-> bun test                 # → Bun tests offloaded to worker
-> cargo fmt                # → NOT intercepted (modifies source)
-> ls -la                   # → NOT intercepted (not compilation)
-
-# 6. Monitor what's happening
-$ rch status --jobs
-ACTIVE JOBS:
-  project-x/cargo build --release  →  build-server (14s elapsed)
-
-$ rch status --workers
-WORKERS:
-  build-server   ████████░░░░  (8/32 slots)  speed: 94.2
-```
+- Package management: `cargo install`, `cargo clean`, `bun install`, `bun add`, `bun remove`
+- Bun runners/dev: `bun run`, `bun build`, `bun dev`, `bun x` / `bunx`
+- Watch/background/piped/redirected commands where deterministic offload is unsafe
 
 ---
 
-## Beautiful Terminal Output (rich_rust)
+## Why It Works Well
 
-RCH ships with rich terminal output for human use (tables, panels, progress). It automatically falls back to plain ASCII when a terminal is not available or machine output is requested. Rich output goes to stderr so stdout remains clean for JSON/machine consumption.
-
-### UI Features Overview
-
-- Colored status output with consistent icons
-- Progress visualization for sync and execution phases
-- Rich error panels with remediation hints
-- Worker status tables (status, slots, speed, latency)
-
-### Controlling Output
-
-Use these flags and environment variables to force the desired output mode:
-
-- `--json` or `--format json|toon` -> machine output on stdout, no rich UI
-- `--color=never` or `NO_COLOR=1` -> plain ASCII output (no ANSI)
-- `--color=always` or `CLICOLOR_FORCE=1` / `FORCE_COLOR=1` -> force color output
-- `TERM=dumb` -> plain ASCII fallback
-- `-q/--quiet` -> errors only
-- `-v/--verbose` -> extra details (timings, diagnostics)
-
-See [docs/RICH_OUTPUT_MIGRATION.md](docs/RICH_OUTPUT_MIGRATION.md) for a detailed migration guide and compatibility info.
-
-### Before / After (Plain vs Rich)
-
-Plain fallback (no colors, no tables):
-
-```text
-$ rch status
-Daemon: running (pid 4123)
-Workers: 3 total, 3 healthy, 72 slots
-Active jobs: 1
-Recent builds: 5
-```
-
-Rich output (conceptual layout):
-
-```text
-$ rch status
-[Status]  Daemon: healthy  |  Workers: 3  |  Slots: 72 (12 used)
----------------------------------------------------------------
-WORKERS
-  id    status    slots    speed   latency
-  css   healthy   8/32     94.2    12ms
-  csd   healthy   2/16     88.1    18ms
-  cse   healthy   2/24     91.0    15ms
-```
-
-### Screenshots Gallery (Text Previews)
-
-Status overview:
-
-```text
-$ rch status --workers
-WORKERS
-  css  healthy  8/32  speed 94.2  latency 12ms
-  csd  healthy  2/16  speed 88.1  latency 18ms
-```
-
-Worker probe results:
-
-```text
-$ rch workers probe --all
-css: OK   (latency 12ms, rust 1.87-nightly, bun 1.2.0)
-csd: OK   (latency 18ms, rust 1.87-nightly, bun 1.2.0)
-```
-
-Compilation progress:
-
-```text
-Syncing project...  182 MB / 182 MB  (1.2s)
-Compiling...        cargo build --release
-Returning artifacts...  14 files  (0.6s)
-```
-
-Error display:
-
-```text
-ERROR: Worker 'css' unreachable
-Suggested fix: rch workers probe css
-```
-
-### Accessibility
-
-- Colors are optional; plain ASCII is always available.
-- Output avoids emoji-only signals and includes text labels.
-- Rich UI renders to stderr, keeping stdout available for tooling.
-- Use `--color=never` or `NO_COLOR=1` for screen reader friendliness.
+- Transparent hook behavior: agents see normal command semantics.
+- 5-tier classification pipeline optimized for very fast non-compilation rejection.
+- Daemon-owned worker state and slot accounting.
+- Cache-aware worker selection and project affinity.
+- Queue + cancellation primitives for overloaded scenarios.
+- Deterministic reliability subsystems for convergence, pressure handling, and remediation.
+- Unified status surface with posture and remediation hints.
 
 ---
 
-## Design Philosophy
+## Current Architecture
 
-### 1. Transparency Above All
+```text
+Agent Shell / Claude Code
+        |
+        v
+PreToolUse Hook -> rch (classifier + hook protocol)
+        |
+        v
+      rchd (daemon)
+      - worker selection
+      - queueing and cancellation metadata
+      - health, alerts, telemetry, history
+      - reliability subsystems (convergence, pressure, triage)
+        |
+        v
+Remote workers (rch-wkr)
+      - execute build/test commands
+      - manage worker cache
+      - report capabilities/health/telemetry
+```
 
-Agents must not know compilation ran remotely. The hook returns silently on success with artifacts in place. Only failures surface—and they look like normal compilation errors.
+Workspace crates:
 
-### 2. Fail-Open, Never Block
-
-On any error—worker unreachable, transfer timeout, daemon down—RCH allows local execution rather than blocking the agent. A slow local build beats a stuck agent.
-
-### 3. Precision Over Recall
-
-False positives are catastrophic (intercepting `cargo fmt` corrupts source files). False negatives are acceptable (missing an offload just means local compilation). The 5-tier classifier prioritizes precision.
-
-### 4. Sub-Millisecond Non-Compilation Decisions
-
-99% of commands are non-compilation. The hook must reject them in <0.1ms. Only actual compilation commands pay the full classification cost (<5ms).
-
-### 5. Stateless Hook, Stateful Daemon
-
-The `rch` hook is a pure function—all state lives in `rchd`. This makes the hook fast, debuggable, and crash-resistant.
+- `rch/`: Hook + primary CLI
+- `rchd/`: Local daemon + scheduling/reliability APIs
+- `rch-wkr/`: Worker execution/caching agent
+- `rch-common/`: Shared protocol/types/patterns/UI foundations
+- `rch-telemetry/`: Telemetry collection/storage integration
 
 ---
 
-## How RCH Compares
+## Reliability Model (Operational)
 
-| Capability | RCH | distcc | icecc | Local |
-|------------|-----|--------|-------|-------|
-| **Transparent to agents** | ✅ Full | ❌ Wrapper required | ❌ Wrapper required | ✅ |
-| **Full Rust support** | ✅ cargo, rustc | ❌ C/C++ only | ❌ C/C++ only | ✅ |
-| **Bun/TypeScript** | ✅ test, typecheck | ❌ | ❌ | ✅ |
-| **C/C++ support** | ✅ gcc, clang, make | ✅ | ✅ | ✅ |
-| **Automatic load balancing** | ✅ Slot-aware | ⚠️ Manual | ✅ | N/A |
-| **Project caching** | ✅ Affinity routing | ❌ | ❌ | ✅ |
-| **Multi-agent dedup** | ✅ Broadcast | ❌ | ❌ | ❌ |
-| **Setup complexity** | ⚠️ Moderate | ✅ Simple | ⚠️ Moderate | ✅ None |
+RCH now includes a deterministic reliability stack for multi-repo and multi-worker stability:
 
-**When to use RCH:**
-- Running multiple AI coding agents simultaneously
-- Your workstation CPU is the bottleneck
-- You have SSH access to remote machines with spare capacity
-- Projects are Rust-heavy (best support), TypeScript/Bun (good), or C/C++ (good)
-
-**When RCH might not be ideal:**
-- Single-agent workflows (local is usually fast enough)
-- Projects with unusual build systems (Bazel, Buck)
-- Air-gapped environments without SSH access to workers
+- **Path-dependency closure planning**: builds can include required repository closure rather than a single root.
+- **Canonical topology enforcement**: worker/project roots are normalized around `/data/projects` and `/dp` conventions.
+- **Repo convergence service**: tracks worker drift vs required repos and can repair drift.
+- **Disk pressure resilience**: pressure scoring, admission control, safe reclaim with active-build protection.
+- **Process triage/remediation**: bounded TERM/KILL escalation with audit trail.
+- **Cancellation orchestration**: deterministic cancellation metadata and worker health integration.
+- **Unified posture/reporting**: status output includes posture, convergence state, pressure, and actionable remediation hints.
 
 ---
 
 ## Installation
 
-### From Source (Recommended)
+### Recommended: Installer
+
+```bash
+curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/remote_compilation_helper/main/install.sh?$(date +%s)" | bash -s -- --easy-mode
+```
+
+### From Source
 
 ```bash
 git clone https://github.com/Dicklesworthstone/remote_compilation_helper.git
 cd remote_compilation_helper
 cargo build --release
-
-# Install binaries
 cp target/release/rch ~/.local/bin/
 cp target/release/rchd ~/.local/bin/
 ```
 
-### With Cargo
+### Source Build Note
+
+This workspace currently uses FrankenTUI path dependencies (`ftui-*`) from `/dp/frankentui/crates/...` in `Cargo.toml`. Ensure that dependency tree is available when building from source in this environment.
+
+---
+
+## First-Time Setup
+
+### Fastest Path
 
 ```bash
-cargo install --git https://github.com/Dicklesworthstone/remote_compilation_helper.git
+rch init
 ```
 
-### Setup Workers
+`rch init` can guide:
+
+1. Worker discovery from SSH config/aliases
+2. Worker probing and selection
+3. `rch-wkr` deployment
+4. Toolchain synchronization
+5. Daemon startup
+6. Hook installation
+7. Validation build
+
+### Manual Path
 
 ```bash
-# Create config directory
+# 1) configure workers
 mkdir -p ~/.config/rch
-
-# Configure your worker fleet
-cat > ~/.config/rch/workers.toml << 'EOF'
+cat > ~/.config/rch/workers.toml << 'TOML'
 [[workers]]
-id = "worker1"
-host = "203.0.113.10"
-user = "ubuntu"
-identity_file = "~/.ssh/id_rsa"
-total_slots = 16
-priority = 100
-
-[[workers]]
-id = "worker2"
-host = "203.0.113.11"
+id = "css"
+host = "203.0.113.20"
 user = "ubuntu"
 identity_file = "~/.ssh/id_rsa"
 total_slots = 32
 priority = 100
-EOF
+TOML
 
-# Install RCH on workers (copies rch-wkr binary)
-rch install --fleet
+# 2) start daemon
+rch daemon start
 
-# Register the Claude Code hook
+# 3) verify workers
+rch workers probe --all
+
+# 4) install hook
 rch hook install
+
+# 5) check posture
+rch check
+rch status --workers --jobs
 ```
 
 ---
 
-## Quick Start
+## Command Surface
 
-### 1. Start the Daemon
+Global flags:
 
 ```bash
-rchd                          # Foreground (see logs)
-rch daemon start              # Background (systemd/launchd)
+-v, --verbose
+-q, --quiet
+-j, --json
+-F, --format json|toon
+--color auto|always|never
 ```
 
-### 2. Verify Workers
+### Core Operations
 
 ```bash
-rch workers list              # Show configured workers
-rch workers probe --all       # Test SSH connectivity
-rch workers benchmark         # Measure worker speeds (optional)
+rch daemon start|stop|restart|status|logs|reload
+rch workers list|capabilities|probe|benchmark|drain|enable|disable
+rch status [--workers] [--jobs]
+rch check
+rch queue [--watch|--follow]
+rch cancel <id> | --all
 ```
 
-### 3. Use Claude Code Normally
+### Hook + Agent Integration
 
 ```bash
-claude                        # Start Claude Code session
-# All cargo build/test/check commands are now offloaded
+rch hook install|uninstall|status|test
+rch agents list|status|install-hook|uninstall-hook
+rch diagnose "cargo build --release"
+rch exec -- cargo build --release
 ```
 
-### 4. Monitor Activity
+### Config + Diagnostics
 
 ```bash
-rch status                    # Daemon status
-rch status --workers          # Worker health and slots
-rch status --jobs             # Active compilations
+rch config show|get|set|reset|init|validate|lint|doctor|edit|diff|export
+rch doctor [--fix] [--dry-run]
+rch self-test [--worker <id>|--all]
+rch self-test status
+rch self-test history --limit 10
 ```
 
----
-
-## Commands
-
-Global flags available on all commands:
+### Fleet + Release + UX
 
 ```bash
---verbose       # Increase logging
---quiet         # Suppress non-error output
---json          # Machine-readable JSON output (legacy)
---format json|toon   # Machine output format (json or toon)
-```
-
-### `rch daemon`
-
-Control the local daemon.
-
-```bash
-rch daemon start              # Start in background
-rch daemon stop               # Stop daemon
-rch daemon restart            # Restart daemon
-rch daemon status             # Check if running
-rch daemon logs               # Tail daemon logs
-```
-
-### `rch workers`
-
-Manage the worker fleet.
-
-```bash
-rch workers list              # List configured workers
-rch workers probe --all       # Test connectivity and detect capabilities
-rch workers probe worker1     # Test specific worker
-rch workers benchmark         # Run speed benchmarks
-rch workers drain worker1     # Stop routing to worker
-rch workers enable worker1    # Resume routing to worker
-```
-
-### `rch status`
-
-Show system status.
-
-```bash
-rch status                    # Overview
-rch status --workers          # Worker details (slots, health, latency)
-rch status --jobs             # Active and recent compilations
-rch status --stats            # Aggregate statistics
-```
-
-### `rch dashboard` (alias: `rch tui`)
-
-Interactive TUI dashboard for real-time monitoring in your terminal.
-
-```bash
-rch dashboard                          # Launch interactive dashboard
-rch dashboard --refresh 500            # Faster refresh (ms)
-rch dashboard --no-mouse               # Disable mouse support
-rch dashboard --high-contrast          # Accessibility: high contrast mode
-rch dashboard --color-blind tritanopia # Accessibility: color blind palette
-
-# Non-interactive modes (do not manipulate the terminal)
-rch dashboard --test-mode --mock-data  # Render once and exit (CI-friendly)
-rch dashboard --dump-state --mock-data # Print JSON state and exit (automation)
-```
-
-Controls: `q`/Esc quit, ↑/↓ navigate, Tab switch panels, `r` refresh, `?` help.
-
-### `rch config`
-
-Manage configuration.
-
-```bash
-rch config show               # Show effective config
-rch config init               # Create project .rch/config.toml
-rch config validate           # Validate TOML syntax
-rch config set key value      # Set config value
-```
-
-### `rch hook`
-
-Manage the Claude Code hook.
-
-```bash
-rch hook install              # Register PreToolUse hook
-rch hook uninstall            # Remove hook
-rch hook test                 # Simulate hook invocation
+rch update [--check|--rollback|--fleet]
+rch fleet deploy|rollback|status|verify|drain|history
+rch speedscore <worker>|--all [--history]
+rch dashboard   # alias: rch tui
+rch web
+rch schema export|list
+rch completions generate|install|uninstall|status
 ```
 
 ---
 
 ## Configuration
 
-### User Config (`~/.config/rch/config.toml`)
+Primary files:
+
+- User config: `~/.config/rch/config.toml`
+- Worker list: `~/.config/rch/workers.toml`
+- Project override: `.rch/config.toml`
+- Optional project excludes: `.rchignore`
+
+Precedence (highest first):
+
+1. CLI flags
+2. Environment variables
+3. Profile defaults
+4. `.env` / `.rch.env`
+5. Project config
+6. User config
+7. Built-in defaults
+
+### Minimal Example
 
 ```toml
-# Global settings
 [general]
 enabled = true
-log_level = "info"
+force_local = false
+force_remote = false
 socket_path = "~/.cache/rch/rch.sock"
+log_level = "info"
 
-# Compilation settings
 [compilation]
-confidence_threshold = 0.85      # Min confidence to intercept (0.0-1.0)
-min_local_time_ms = 2000         # Skip if local <2s
-remote_speedup_threshold = 1.2   # Require 20% speedup for remote
+confidence_threshold = 0.85
+min_local_time_ms = 2000
+remote_speedup_threshold = 1.2
+build_slots = 4
+test_slots = 8
+check_slots = 2
+build_timeout_sec = 300
+test_timeout_sec = 1800
+bun_timeout_sec = 600
+external_timeout_enabled = true
 
-# Transfer settings
 [transfer]
-compression_level = 3            # zstd level (1-19)
-exclude_patterns = [
-    "target/",
-    ".git/objects/",
-    "node_modules/",
-    "*.rlib",
-    "*.rmeta",
-]
-# Optional SSH stability knobs (useful on flaky networks)
-ssh_server_alive_interval_secs = 30  # ssh -o ServerAliveInterval
-ssh_control_persist_secs = 60        # ssh -o ControlPersist=60s (0 disables)
+compression_level = 3
+remote_base = "/tmp/rch"
+adaptive_compression = true
+verify_artifacts = false
+max_transfer_mb = 2048
 
-# Optional: project-local excludes
-#
-# If a project root contains a `.rchignore` file, its patterns are appended to
-# the effective exclude list (defaults + config). Format:
-# - one pattern per line
-# - `#` comments and blank lines ignored
-# - leading/trailing whitespace trimmed
-# - negation (`!pattern`) is NOT supported (treated as literal)
+[selection]
+strategy = "fair_fastest"
 
-# Output settings
-[output]
-stream_mode = "realtime"         # realtime, buffered, summary
-preserve_colors = true
-max_latency_ms = 50
-```
+[self_healing]
+hook_starts_daemon = true
+daemon_installs_hooks = true
 
-### Workers Config (`~/.config/rch/workers.toml`)
-
-```toml
-[[workers]]
-id = "css"                       # Unique identifier
-host = "203.0.113.20"           # SSH hostname or IP
-user = "ubuntu"                  # SSH user
-identity_file = "~/.ssh/key.pem" # SSH private key
-total_slots = 32                 # CPU cores available
-priority = 100                   # Higher = preferred
-tags = ["fast", "ssd"]          # Optional tags for filtering
-
-[[workers]]
-id = "fra"
-host = "worker2.example.com"
-user = "builder"
-identity_file = "~/.ssh/id_rsa"
-total_slots = 16
-priority = 50
-```
-
-### Project Config (`.rch/config.toml` in project root)
-
-```toml
-# Disable RCH for this project
-enabled = false
-
-# Or customize behavior
-[general]
+[alerts]
 enabled = true
-force_local = false           # Never offload for this project (mutually exclusive with force_remote)
-force_remote = false          # Always attempt offload for this project (still respects safety gates)
-preferred_workers = ["css"]     # Always try these first
-
-[transfer]
-include_patterns = [            # Force-include files
-    "src/generated/*.rs",
-]
-exclude_patterns = [            # Additional excludes
-    "benches/data/",
-]
-
-# Alternatively (or additionally), add a `.rchignore` file in the project root.
-# Its patterns are merged deterministically into the transfer excludes.
-
-[environment]
-allowlist = ["RUSTFLAGS", "CARGO_TARGET_DIR"]
-# Reliability note:
-# If forwarded, CARGO_TARGET_DIR/TMPDIR/TMP/TEMP are remapped by RCH
-# to worker-scoped directories under the remote project root.
+suppress_duplicates_secs = 300
 ```
 
-### Environment Variables
+### Worker Config Example
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `RCH_ENABLED` | Enable/disable RCH | `true` |
-| `RCH_WORKER` | Force specific worker | unset |
-| `RCH_WORKERS` | Limit worker pool (comma-separated) | all |
-| `RCH_COMPRESSION` | Override compression level | `3` |
-| `RCH_DRY_RUN` | Show what would happen | `false` |
-| `RCH_LOCAL_ONLY` | Force local execution | `false` |
-| `RCH_BYPASS` | Disable RCH entirely | `false` |
-| `RCH_ENV_ALLOWLIST` | Comma-separated env vars to forward | unset |
-| `RCH_SSH_SERVER_ALIVE_INTERVAL_SECS` | SSH keepalive interval (ServerAliveInterval) | unset |
-| `RCH_SSH_CONTROL_PERSIST_SECS` | SSH ControlPersist idle seconds (0 disables) | unset |
-| `RCH_VERBOSE` | Enable verbose logging | `false` |
-| `RCH_PRIORITY` | Per-command selection hint: `low|normal|high` | unset |
-| `RCH_OUTPUT_FORMAT` | Machine output format: `json` or `toon` | unset |
-| `TOON_DEFAULT_FORMAT` | Default machine format when `--json` is set | unset |
-
----
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                            AGENT WORKSTATION                                 │
-│                                                                             │
-│  ┌──────────────┐     ┌────────────────────────────────────────────────┐   │
-│  │ Claude Code  │────▶│ rch (PreToolUse Hook)                          │   │
-│  │ Agent 1..N   │     │ • Parse hook JSON                              │   │
-│  └──────────────┘     │ • 5-tier command classification (<1ms)         │   │
-│        │              │ • Query daemon for worker selection            │   │
-│        │              └──────────────────────────┬─────────────────────┘   │
-│        │                                         │                          │
-│        │              ┌──────────────────────────▼─────────────────────┐   │
-│        │              │ rchd (Local Daemon)                            │   │
-│        │              │ • Worker health monitoring (30s heartbeat)      │   │
-│        │              │ • Slot tracking (atomic, lock-free)            │   │
-│        │              │ • Speed scoring & load balancing               │   │
-│        │              │ • SSH connection pool (multiplexing)           │   │
-│        │              │ • Compilation deduplication (broadcast)        │   │
-│        │              └──────────────────────────┬─────────────────────┘   │
-│        │                                         │                          │
-└────────┼─────────────────────────────────────────┼──────────────────────────┘
-         │                                         │ SSH
-         │                                         ▼
-┌────────┼─────────────────────────────────────────────────────────────────────┐
-│        │              WORKER FLEET (4+ machines, 48-80 cores)               │
-│        │                                                                     │
-│        │         ┌─────────────┐   ┌─────────────┐   ┌─────────────┐        │
-│        │         │ Worker 1    │   │ Worker 2    │   │ Worker N    │        │
-│        │         │ 16 slots    │   │ 32 slots    │   │ 16 slots    │        │
-│        │         │             │   │             │   │             │        │
-│        │         │ rch-wkr     │   │ rch-wkr     │   │ rch-wkr     │        │
-│        │         │ • Execute   │   │ • Execute   │   │ • Execute   │        │
-│        │         │ • Cache     │   │ • Cache     │   │ • Cache     │        │
-│        │         │ • Cleanup   │   │ • Cleanup   │   │ • Cleanup   │        │
-│        │         └─────────────┘   └─────────────┘   └─────────────┘        │
-│        │                                                                     │
-└────────┼─────────────────────────────────────────────────────────────────────┘
-         │
-         ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                              DATA FLOW                                       │
-│                                                                             │
-│  1. Agent runs `cargo build`                                                │
-│  2. Hook classifies → compilation (0.92 confidence)                         │
-│  3. Daemon selects worker (slots available, project cached)                 │
-│  4. rsync project → worker (zstd, exclude target/)                          │
-│  5. Execute `cargo build` on worker                                         │
-│  6. Stream output back in real-time (colors preserved)                      │
-│  7. rsync artifacts ← worker (target/release/)                              │
-│  8. Hook returns silently → agent continues                                 │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
-
-### Command Classification (5-Tier System)
-
-```
-Command: "cargo build --release"
-
-Tier 0: Instant Reject (<0.01ms)
-├─ Is Bash tool? ✅
-├─ Has content? ✅
-└─ Pass → continue
-
-Tier 1: Structure Analysis (<0.1ms)
-├─ Piped? ❌
-├─ Backgrounded? ❌
-├─ Redirected? ❌
-└─ Pass → continue
-
-Tier 2: SIMD Keyword Filter (<0.2ms)
-├─ Contains "cargo"? ✅
-└─ Pass → continue
-
-Tier 3: Negative Pattern Check (<0.5ms)
-├─ "cargo install"? ❌
-├─ "cargo fmt"? ❌
-├─ "cargo clean"? ❌
-└─ Pass → continue
-
-Tier 4: Full Classification (<5ms)
-├─ Pattern match: cargo build
-├─ Confidence: 0.95
-├─ Threshold: 0.85
-└─ INTERCEPT ✅
-```
-
----
-
-## Troubleshooting
-
-### Display issues (colors, glyphs, or rich tables missing)
-
-- Rich UI renders to stderr; ensure stderr is a TTY when testing locally.
-- Force color output with `--color=always`, `CLICOLOR_FORCE=1`, or `FORCE_COLOR=1`.
-- Disable styling with `--color=never` or `NO_COLOR=1`.
-- For automation, prefer `--json` or `--format json|toon` to avoid ANSI output.
-- If your terminal is mis-detected, set `TERM=dumb` to force plain output.
-
-### "Connection refused to worker"
-
-```bash
-# Check SSH connectivity directly
-ssh -i ~/.ssh/key.pem ubuntu@worker-host echo "OK"
-
-# Verify worker is configured
-rch workers list
-
-# Test specific worker with verbose output
-rch workers probe worker1 --verbose
-```
-
-### "Compilation slower than local"
-
-```bash
-# Check if project caching is working
-rch status --jobs --verbose
-
-# Force benchmark update to recalculate speed scores
-rch workers benchmark
-
-# Verify network latency
-rch workers probe --all --latency
-```
-
-### "Output not showing during compilation"
-
-```bash
-# Check stream mode
-rch config show | grep stream_mode
-
-# Force realtime streaming
-export RCH_STREAM_MODE=realtime
-cargo build
-```
-
-### "Some commands not being intercepted"
-
-```bash
-# Test classification manually
-echo '{"tool":"Bash","input":{"command":"cargo build"}}' | rch hook test
-
-# Check confidence threshold (default 0.85)
-rch config show | grep confidence_threshold
-
-# Run with verbose to see classification decisions
-RCH_VERBOSE=1 cargo build
-```
-
-### "Daemon not running"
-
-```bash
-# Check daemon status
-rch daemon status
-
-# View logs for errors
-rch daemon logs --tail 50
-
-# Restart daemon
-rch daemon restart
-```
-
----
-
-## Test Execution
-
-RCH fully supports `cargo test` and streams test output back to your agent in real-time.
-
-### Supported Test Commands
-
-| Command | Offloaded | Notes |
-|---------|-----------|-------|
-| `cargo test` | ✅ Yes | Basic test execution |
-| `cargo test --release` | ✅ Yes | Release mode tests |
-| `cargo test specific_test` | ✅ Yes | Run specific test by name |
-| `cargo test -- --nocapture` | ✅ Yes | Shows test stdout |
-| `cargo test --workspace` | ✅ Yes | Tests all workspace packages |
-| `cargo test -p crate_name` | ✅ Yes | Test specific package |
-| `cargo t` | ✅ Yes | Short alias for cargo test |
-| `cargo test --lib` | ✅ Yes | Library tests only |
-| `cargo test --bins` | ✅ Yes | Binary tests only |
-| `cargo test --doc` | ✅ Yes | Documentation tests |
-| `RUST_BACKTRACE=1 cargo test` | ✅ Yes | Environment variables preserved |
-
-### Exit Code Handling
-
-RCH correctly handles cargo test's specific exit codes:
-
-| Exit Code | Meaning | RCH Behavior |
-|-----------|---------|--------------|
-| 0 | All tests passed | Deny local execution (success) |
-| 1 | Build/compilation error | Deny local execution (error) |
-| 101 | Tests ran but some failed | Deny local execution (test failure) |
-| 128+N | Killed by signal N | Deny local execution (resource issue) |
-
-**Why deny local after failure?** Re-running tests locally won't help—the agent already saw the failure output. This prevents redundant execution.
-
-### Output Streaming
-
-Test output streams back in real-time as tests execute:
-- Pass/fail results appear as they complete
-- `--nocapture` output is visible immediately
-- Compilation errors show before tests run
-
-### Example Usage
-
-```bash
-# Run all tests on remote worker
-$ cargo test
-   Compiling my-crate v0.1.0
-    Finished test [unoptimized + debuginfo]
-     Running unittests src/lib.rs
-running 42 tests
-test module::test_feature ... ok
-test module::test_edge_case ... ok
-...
-test result: ok. 42 passed; 0 failed; 0 ignored
-
-# Run specific tests with output capture disabled
-$ cargo test my_function -- --nocapture
-running 1 test
-test my_function ... [debug output here] ok
-```
-
----
-
-## Limitations
-
-### What RCH Doesn't Handle (Yet)
-
-- **Bazel/Buck builds**: Complex build systems with custom execution models
-- **Cross-compilation**: Target architecture must match worker architecture
-- **Build caching servers**: No integration with sccache servers (local sccache works)
-- **Windows workers**: Linux workers only (WSL2 might work, untested)
-
-### Known Constraints
-
-| Constraint | Impact | Workaround |
-|------------|--------|------------|
-| SSH required | No HTTP/gRPC transport | Use SSH tunnels if needed |
-| Rust nightly | Workers need matching toolchain | `rch install --fleet` syncs toolchains |
-| Large artifacts | Slow return for 500MB+ binaries | Use `--release` profile, strip symbols |
-| Workspace deps | All workspace members transferred | Use `.rch/config.toml` excludes |
-
----
-
-## FAQ
-
-### Why "RCH"?
-
-**R**emote **C**ompilation **H**elper. Short, typeable, memorable.
-
-### Is my code sent over the network?
-
-Yes—source files are transferred via rsync over SSH. If this is a concern:
-- Use workers you control (not shared infrastructure)
-- Workers should be on a trusted network
-- SSH provides encryption in transit
-- Consider VPN for additional security
-
-### Does RCH work with non-Rust projects?
-
-Yes, with varying levels of support:
-
-| Ecosystem | Offloaded Commands | Local Commands |
-|-----------|-------------------|----------------|
-| **Rust** | `cargo build`, `cargo test`, `cargo check`, `cargo run`, `rustc` | `cargo fmt`, `cargo clean`, `cargo install` |
-| **Bun/TypeScript** | `bun test`, `bun typecheck` | `bun install`, `bun dev`, `bun run` |
-| **C/C++** | `gcc`, `g++`, `clang`, `make`, `cmake`, `ninja` | — |
-| **Not supported** | — | Go, Python, npm, yarn, pnpm |
-
-### What if a worker goes down mid-compilation?
-
-RCH detects the failure and falls back to local compilation. The agent sees a brief delay, then compilation proceeds locally.
-
-### Can I use RCH without Claude Code?
-
-The hook is designed for Claude Code's PreToolUse mechanism. For standalone use, you'd need to wrap your shell to call `rch` for every command—possible but not officially supported.
-
-### How do I add more workers?
-
-```bash
-# Edit workers.toml
-vim ~/.config/rch/workers.toml
-
-# Add new worker block
+```toml
 [[workers]]
-id = "new-worker"
-host = "203.0.113.12"
+id = "css"
+host = "203.0.113.20"
 user = "ubuntu"
 identity_file = "~/.ssh/id_rsa"
-total_slots = 24
+total_slots = 32
 priority = 100
-
-# Install rch-wkr on the new worker
-rch install --worker new-worker
-
-# Verify connectivity
-rch workers probe new-worker
+tags = ["fast", "ssd"]
 ```
 
-### Why are some fast commands not intercepted?
+---
 
-RCH skips commands estimated to complete locally in <2 seconds. The overhead of transfer + remote execution isn't worth it for quick operations like `cargo check` on a small crate.
+## Output Modes
+
+RCH auto-selects output mode by context:
+
+- `hook`: strict JSON for hook protocol
+- `machine`: explicit machine output (`--json`, `--format`)
+- `interactive`: rich terminal rendering
+- `colored`: ANSI-only when forced without TTY
+- `plain`: text fallback
+
+Environment controls:
+
+- `RCH_JSON=1`, `RCH_HOOK_MODE=1`
+- `NO_COLOR=1`, `FORCE_COLOR=1`, `FORCE_COLOR=0`
+- `RCH_OUTPUT_FORMAT=json|toon`, `TOON_DEFAULT_FORMAT`
+
+JSON responses use a stable envelope (`api_version`, `timestamp`, `success`, `data`, `error`).
 
 ---
 
-## About Contributions
+## Monitoring and Observability
 
-Please don't take this the wrong way, but I do not accept outside contributions for any of my projects. I simply don't have the mental bandwidth to review anything, and it's my name on the thing, so I'm responsible for any problems it causes; thus, the risk-reward is highly asymmetric from my perspective. I'd also have to worry about other "stakeholders," which seems unwise for tools I mostly make for myself for free. Feel free to submit issues, and even PRs if you want to illustrate a proposed fix, but know I won't merge them directly. Instead, I'll have Claude or Codex review submissions via `gh` and independently decide whether and how to address them. Bug reports in particular are welcome. Sorry if this offends, but I want to avoid wasted time and hurt feelings. I understand this isn't in sync with the prevailing open-source ethos that seeks community contributions, but it's the only way I can move at this velocity and keep my sanity.
+RCH exposes observability through daemon APIs and metrics:
 
----
+- daemon health/readiness endpoints
+- Prometheus metrics collection
+- OpenTelemetry tracing integration
+- telemetry-backed worker SpeedScore history
+- queue/build history, active alerts, cancellation metadata in status APIs
 
-## License
-
-MIT License. See [LICENSE](LICENSE) for details.
-
----
-
----
-
-## Self-Update System
-
-RCH includes a built-in update mechanism that handles version checking, downloading, verification, and installation—all without requiring manual intervention.
-
-### Checking for Updates
+Quick checks:
 
 ```bash
-# Check if an update is available
-rch update --check
-
-# Show detailed version information
-rch update --check --verbose
-```
-
-The update checker uses intelligent caching:
-- Version checks are cached for 24 hours to avoid hammering GitHub's API
-- Background threads warm the cache on startup without blocking your workflow
-- Set `RCH_NO_UPDATE_CHECK=1` to disable automatic checks entirely
-
-### Performing Updates
-
-```bash
-# Update to latest stable release
-rch update
-
-# Update to a specific version
-rch update --version 0.2.0
-
-# Update from beta/nightly channel
-rch update --channel beta
-```
-
-### Backup and Rollback
-
-Every update creates a backup of the current installation:
-
-```bash
-# List available backups
-rch update --list-backups
-
-# Rollback to previous version
-rch update --rollback
-
-# Rollback to specific version
-rch update --rollback --version 0.1.0
-```
-
-Backups are stored in `~/.local/share/rch/backups/` with JSON metadata files. Only the 3 most recent backups are retained to conserve disk space.
-
-### Update Verification
-
-Downloaded releases are verified using multiple mechanisms:
-- **SHA256 checksums**: Every release artifact has a corresponding `.sha256` file
-- **Sigstore signatures**: Artifacts are signed using keyless Sigstore/cosign
-- **SLSA provenance**: Level 3 supply chain attestation via GitHub Actions
-
-```bash
-# Verify a downloaded artifact manually
-cosign verify-blob --bundle rch-v0.2.0-linux.tar.gz.sigstore.json \
-  --certificate-identity-regexp=".*" \
-  --certificate-oidc-issuer-regexp=".*" \
-  rch-v0.2.0-linux.tar.gz
+rch status --workers --jobs
+rch speedscore --all
+rch doctor --json
 ```
 
 ---
 
-## Algorithms and Design Principles
+## Testing and Validation
 
-### Worker Selection Algorithm
-
-When a compilation command is intercepted, RCH must quickly select the optimal worker. The selection algorithm considers multiple factors:
-
-```
-Score(worker) = SpeedScore × AvailabilityFactor × AffinityBonus × PriorityWeight
-
-Where:
-  SpeedScore        = Benchmark-derived CPU performance (0-100)
-  AvailabilityFactor = AvailableSlots / TotalSlots (0-1)
-  AffinityBonus     = 1.5 if worker has project cached, else 1.0
-  PriorityWeight    = ConfiguredPriority / 100 (0-1)
-```
-
-The daemon maintains real-time slot counts using atomic operations—no locks required. When a job starts, slots are decremented; when it completes, they're incremented back. This lock-free design allows concurrent worker selection without contention.
-
-### Transfer Optimization
-
-File transfers use rsync with carefully tuned parameters:
+Workspace checks:
 
 ```bash
-rsync -az --compress-level=3 \
-  --exclude='target/' \
-  --exclude='.git/objects/' \
-  --exclude='node_modules/' \
-  --partial --inplace \
-  --timeout=300 \
-  source/ worker:dest/
+cargo fmt --check
+cargo check --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
 ```
 
-Key optimizations:
-- **zstd compression (level 3)**: Balances speed vs ratio—level 3 is ~400MB/s encoding
-- **Exclusion patterns**: Skip derived artifacts that will be regenerated
-- **Partial transfers**: Resume interrupted transfers instead of restarting
-- **In-place updates**: Modify files directly to reduce I/O operations
+Reliability and E2E suites are provided under:
 
-For incremental builds (where worker already has an old project copy), rsync's delta algorithm transfers only changed blocks—typically <1% of total file size.
+- `tests/`
+- `tests/e2e/`
+- `rch-common/tests/` (contract/reliability/perf suites)
 
-### Connection Pooling
+If you are running CPU-intensive validation manually and want explicit offload:
 
-SSH connections are expensive to establish (~200-500ms for handshake). RCH maintains a connection pool per worker:
-
+```bash
+rch exec -- cargo check --workspace --all-targets
+rch exec -- cargo test --workspace
+rch exec -- cargo clippy --workspace --all-targets -- -D warnings
 ```
-ConnectionPool {
-  worker_id -> [Connection; max_connections]
-
-  get_connection():
-    if pool has idle connection:
-      return idle connection (reuse)
-    if pool.size < max_connections:
-      establish new connection
-      return new connection
-    else:
-      wait for connection to become available
-}
-```
-
-With SSH multiplexing enabled (`ControlMaster`), additional connections over an existing master are near-instant (~5ms).
-
-### Compilation Deduplication
-
-Multiple agents working in the same project may trigger identical builds simultaneously. RCH deduplicates these using broadcast channels:
-
-```
-InFlightCompilations {
-  key: (project_path, command_hash) -> broadcast::Sender<Result>
-}
-
-on_compilation_request(project, command):
-  key = (project, hash(command))
-
-  if key in in_flight:
-    # Another agent already running this exact build
-    return in_flight[key].subscribe().await
-
-  # First request—execute compilation
-  sender = broadcast::channel()
-  in_flight[key] = sender
-
-  result = execute_on_worker(project, command)
-  sender.send(result)
-
-  remove in_flight[key]
-  return result
-```
-
-When Agent A triggers `cargo build --release` and Agent B triggers the same command 2 seconds later, Agent B subscribes to A's result channel instead of starting a duplicate build. Both agents receive the same output and artifacts.
-
-### Output Streaming Architecture
-
-Compilation output streams back to agents in real-time via a buffered channel architecture:
-
-```
-Worker Process → SSH stdout → Daemon → Unix Socket → Hook → Agent
-
-Buffering strategy:
-  - 64KB buffer between SSH and daemon (high throughput)
-  - Line-buffered between daemon and hook (low latency)
-  - Hook outputs lines immediately to agent (no buffering)
-```
-
-The daemon performs ANSI color code translation on-the-fly to ensure terminal colors display correctly regardless of the SSH pseudo-terminal settings.
-
----
-
-## Performance Characteristics
-
-### Latency Budget
-
-RCH is designed around strict latency budgets to remain imperceptible during normal development:
-
-| Operation | Budget | Typical |
-|-----------|--------|---------|
-| Hook invocation (non-compilation) | <1ms | 0.1ms |
-| Command classification | <5ms | 0.8ms |
-| Worker selection | <10ms | 2ms |
-| Connection (pooled) | <50ms | 5ms |
-| File sync (incremental, <100 files changed) | <2s | 500ms |
-| File sync (full project, 10K files) | <30s | 8s |
-
-### When Remote Wins vs Local
-
-Remote compilation provides speedup when:
-
-```
-T_local > T_transfer + T_remote + T_return
-
-Where:
-  T_local    = Local compilation time
-  T_transfer = Time to sync files to worker
-  T_remote   = Remote compilation time (faster due to more cores)
-  T_return   = Time to sync artifacts back
-```
-
-**Sweet spot**: Projects with >30s local compile time, where workers have 2x+ core count advantage.
-
-**Break-even point**: ~5-10 second local builds. Below this, overhead dominates.
-
-RCH automatically estimates `T_local` based on project size and historical data, skipping remote execution when it's unlikely to help.
-
-### Memory Usage
-
-| Component | Idle | Active |
-|-----------|------|--------|
-| Hook (`rch`) | N/A (exits after check) | ~8MB peak |
-| Daemon (`rchd`) | ~15MB | ~50MB (scales with concurrent jobs) |
-| Worker (`rch-wkr`) | ~10MB | ~20MB + compilation process |
-
-The daemon uses memory-mapped I/O for large file transfers, keeping resident memory low regardless of artifact size.
 
 ---
 
 ## Security Model
 
-### Trust Boundaries
+- Transport uses SSH.
+- Worker commands are constrained to classified execution paths.
+- Sensitive field masking and structured error taxonomy are built in.
+- Sigstore/checksum verification is part of update/release flows.
+- Hook path remains fail-open to avoid deadlocks/stalls.
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    AGENT WORKSTATION (trusted)                   │
-│  ┌──────────┐     ┌─────────┐     ┌──────────┐                  │
-│  │  Agent   │────▶│   rch   │────▶│   rchd   │                  │
-│  │(Claude)  │     │ (hook)  │     │ (daemon) │                  │
-│  └──────────┘     └─────────┘     └──────────┘                  │
-│                                        │                         │
-└────────────────────────────────────────┼─────────────────────────┘
-                                         │ SSH (encrypted)
-                                         ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    WORKER MACHINES (semi-trusted)                │
-│  • Has read access to source code during compilation             │
-│  • Returns artifacts (binaries, test results)                    │
-│  • No persistent storage of source (cleaned after job)           │
-│  • Isolated per-job directories                                  │
-└─────────────────────────────────────────────────────────────────┘
-```
+Operational recommendations:
 
-### Recommendations
-
-1. **Use workers you control**: Don't use shared infrastructure for proprietary code
-2. **Network isolation**: Workers should be on a trusted network or VPN
-3. **SSH key management**: Use dedicated keys for RCH with limited permissions
-4. **Audit logging**: Enable `RCH_LOG_LEVEL=debug` for full command tracing
-
-### What RCH Does NOT Do
-
-- Store source code persistently on workers (cleaned after each job)
-- Transmit credentials or secrets (excluded from sync by default)
-- Execute arbitrary commands (only classified compilation commands)
-- Modify source files (write-protected during remote execution)
+1. Use workers you control.
+2. Use dedicated SSH keys for worker access.
+3. Keep workers patched and isolated.
+4. Enable telemetry/alerting for production-like use.
 
 ---
 
-## Integration with AI Coding Agents
+## Limitations
 
-RCH is specifically designed for multi-agent AI coding workflows. Here's how it integrates with popular tools:
-
-### Claude Code
-
-Claude Code's PreToolUse hook mechanism is RCH's primary integration point:
-
-```json
-{
-  "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "/home/user/.local/bin/rch"
-          }
-        ]
-      }
-    ]
-  }
-}
-```
-
-When Claude Code is about to execute a Bash command:
-1. It calls `rch` with the command as JSON on stdin
-2. `rch` classifies the command (<1ms for most commands)
-3. If compilation: `rch` executes remotely and returns output
-4. If not compilation: `rch` exits with code 0, letting Claude Code proceed normally
-
-The agent never knows compilation happened remotely—artifacts appear in the expected locations.
-
-### Multiple Simultaneous Agents
-
-RCH shines when running 5, 10, or 15+ agents simultaneously:
-
-| Agents | Without RCH | With RCH (4 workers, 64 total slots) |
-|--------|-------------|--------------------------------------|
-| 1 | Normal | ~Same (overhead not worth it) |
-| 3 | CPU contention begins | Distributed across workers |
-| 5 | Severe slowdown | Still responsive |
-| 10 | System unusable | Workers at 50% capacity |
-| 15+ | Crashes likely | Workers handling load |
-
-The key insight: your workstation's CPU becomes a bottleneck far before your workers' combined capacity is exhausted.
-
-### Agent-Aware Features
-
-- **Deduplication**: Agents compiling the same project share results
-- **Priority hints**: Mark urgent agent work with `RCH_PRIORITY=high`
-- **Isolation**: Each agent's jobs are tracked separately for debugging
-- **Fail-open**: If RCH has issues, agents continue with local builds
+- Designed around SSH-based Linux worker environments.
+- Tooling assumptions are strongest for Rust and selected build/test commands.
+- Remote performance gains depend on network + worker capacity + project shape.
+- Web dashboard workflows require the `/web` stack and its runtime dependencies.
 
 ---
 
-## Acknowledgments
+## FAQ
 
-Built with:
-- [Rust](https://www.rust-lang.org/) — Systems programming language
-- [tokio](https://tokio.rs/) — Async runtime
-- [ssh2](https://docs.rs/ssh2) — SSH connectivity
-- [memchr](https://docs.rs/memchr) — SIMD string search
-- [zstd](https://facebook.github.io/zstd/) — Fast compression
+### Does RCH block my command if the daemon/workers fail?
+No. It fails open and allows local execution.
 
-Inspired by:
-- [distcc](https://distcc.github.io/) — Distributed C/C++ compilation
-- [icecc](https://github.com/icecc/icecream) — Distributed compiler
-- [Claude Code](https://claude.ai/code) — AI coding assistant with hooks
+### Can I force local or force remote per project?
+Yes, via `.rch/config.toml` (`general.force_local` / `general.force_remote`).
+
+### Is queue/cancel supported?
+Yes. Use `rch queue` and `rch cancel`.
+
+### Can I inspect why a command is or is not intercepted?
+Yes. Use `rch diagnose "<command>"`.
+
+---
+
+## About Contributions
+
+Please don't take this the wrong way, but I do not accept outside contributions for my projects. You can still open issues and PRs for discussion/proof-of-fix, but I review and re-implement changes independently.
+
+---
+
+## License
+
+MIT License. See [LICENSE](LICENSE).
