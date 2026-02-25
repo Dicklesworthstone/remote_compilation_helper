@@ -102,6 +102,9 @@ enum ApiRequest {
         request: SelectionRequest,
         /// If true and all workers are busy, enqueue and wait for a worker.
         wait_for_worker: bool,
+        /// Optional client-provided max queue wait timeout (seconds).
+        /// Effective wait timeout is min(daemon queue timeout, client timeout).
+        wait_timeout_secs: Option<u64>,
     },
     ReleaseWorker(ReleaseRequest),
     RecordBuild {
@@ -643,9 +646,11 @@ pub async fn handle_connection(
         Ok(ApiRequest::SelectWorker {
             request,
             wait_for_worker,
+            wait_timeout_secs,
         }) => {
             metrics::inc_requests("select-worker");
-            let response = handle_select_worker(&ctx, request, wait_for_worker).await?;
+            let response =
+                handle_select_worker(&ctx, request, wait_for_worker, wait_timeout_secs).await?;
             (serde_json::to_string(&response)?, "application/json")
         }
         Ok(ApiRequest::ReleaseWorker(mut request)) => {
@@ -1600,6 +1605,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
     let mut command = None;
     let mut cores = None;
     let mut wait_for_worker = false;
+    let mut wait_timeout_secs = None;
     let mut toolchain = None;
     let mut required_runtime = RequiredRuntime::default();
     let mut command_priority = CommandPriority::Normal;
@@ -1620,6 +1626,9 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
             "cores" => cores = value.parse().ok(),
             "wait" | "queue" => {
                 wait_for_worker = value == "1" || value.eq_ignore_ascii_case("true");
+            }
+            "wait_timeout_secs" => {
+                wait_timeout_secs = value.parse::<u64>().ok().filter(|secs| *secs > 0);
             }
             "toolchain" => {
                 let json = urlencoding_decode(value);
@@ -1665,6 +1674,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
             hook_pid,
         },
         wait_for_worker,
+        wait_timeout_secs,
     })
 }
 
@@ -2031,6 +2041,7 @@ async fn handle_select_worker(
     ctx: &DaemonContext,
     request: SelectionRequest,
     wait_for_worker: bool,
+    wait_timeout_secs: Option<u64>,
 ) -> Result<SelectionResponse> {
     debug!(
         "Selecting worker for project '{}' with {} cores",
@@ -2227,7 +2238,12 @@ async fn handle_select_worker(
     );
 
     const QUEUE_POLL_INTERVAL: Duration = Duration::from_secs(1);
-    let queue_timeout = Duration::from_secs(ctx.queue_timeout_secs);
+    let daemon_queue_timeout_secs = ctx.queue_timeout_secs.max(1);
+    let effective_queue_timeout_secs = wait_timeout_secs
+        .filter(|secs| *secs > 0)
+        .map(|client_secs| client_secs.min(daemon_queue_timeout_secs))
+        .unwrap_or(daemon_queue_timeout_secs);
+    let queue_timeout = Duration::from_secs(effective_queue_timeout_secs);
 
     loop {
         // Check if the queue wait has timed out
@@ -3563,7 +3579,9 @@ mod tests {
             hook_pid: None,
         };
 
-        let response = handle_select_worker(&ctx, request, false).await.unwrap();
+        let response = handle_select_worker(&ctx, request, false, None)
+            .await
+            .unwrap();
         assert!(response.worker.is_none());
         assert_eq!(response.reason, SelectionReason::NoWorkersConfigured);
     }
@@ -3593,7 +3611,9 @@ mod tests {
             hook_pid: None,
         };
 
-        let response = handle_select_worker(&ctx, request, false).await.unwrap();
+        let response = handle_select_worker(&ctx, request, false, None)
+            .await
+            .unwrap();
         assert!(response.worker.is_none());
         assert_eq!(response.reason, SelectionReason::AllWorkersUnreachable);
     }
@@ -3620,7 +3640,9 @@ mod tests {
             hook_pid: None,
         };
 
-        let response = handle_select_worker(&ctx, request, false).await.unwrap();
+        let response = handle_select_worker(&ctx, request, false, None)
+            .await
+            .unwrap();
         assert!(response.worker.is_none());
         assert_eq!(response.reason, SelectionReason::AllWorkersBusy);
     }
@@ -3643,7 +3665,9 @@ mod tests {
             hook_pid: None,
         };
 
-        let response = handle_select_worker(&ctx, request, false).await.unwrap();
+        let response = handle_select_worker(&ctx, request, false, None)
+            .await
+            .unwrap();
         assert!(response.worker.is_some());
         assert_eq!(response.reason, SelectionReason::Success);
 
@@ -3671,7 +3695,9 @@ mod tests {
             hook_pid: Some(4242),
         };
 
-        let response = handle_select_worker(&ctx, request, false).await.unwrap();
+        let response = handle_select_worker(&ctx, request, false, None)
+            .await
+            .unwrap();
         assert_eq!(response.reason, SelectionReason::Success);
         let build_id = response.build_id.expect("build_id should be assigned");
 
@@ -3727,7 +3753,9 @@ mod tests {
             hook_pid: None,
         };
 
-        let response = handle_select_worker(&ctx, request, false).await.unwrap();
+        let response = handle_select_worker(&ctx, request, false, None)
+            .await
+            .unwrap();
         let worker = response.worker.unwrap();
         assert_eq!(worker.id.as_str(), "worker2");
     }
@@ -4277,12 +4305,16 @@ mod tests {
     #[test]
     fn test_parse_request_wait_for_worker() {
         let _guard = test_guard!();
-        let req = parse_request("GET /select-worker?project=test&wait=true").unwrap();
+        let req = parse_request("GET /select-worker?project=test&wait=true&wait_timeout_secs=45")
+            .unwrap();
         match req {
             ApiRequest::SelectWorker {
-                wait_for_worker, ..
+                wait_for_worker,
+                wait_timeout_secs,
+                ..
             } => {
                 assert!(wait_for_worker);
+                assert_eq!(wait_timeout_secs, Some(45));
             }
             _ => panic!("expected select worker request"),
         }
@@ -4290,9 +4322,22 @@ mod tests {
         let req = parse_request("GET /select-worker?project=test&wait=false").unwrap();
         match req {
             ApiRequest::SelectWorker {
-                wait_for_worker, ..
+                wait_for_worker,
+                wait_timeout_secs,
+                ..
             } => {
                 assert!(!wait_for_worker);
+                assert_eq!(wait_timeout_secs, None);
+            }
+            _ => panic!("expected select worker request"),
+        }
+
+        let req = parse_request("GET /select-worker?project=test&wait_timeout_secs=0").unwrap();
+        match req {
+            ApiRequest::SelectWorker {
+                wait_timeout_secs, ..
+            } => {
+                assert_eq!(wait_timeout_secs, None);
             }
             _ => panic!("expected select worker request"),
         }

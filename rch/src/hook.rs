@@ -213,6 +213,7 @@ pub async fn run_exec(command_parts: Vec<String>) -> anyhow::Result<()> {
     // Determine required runtime
     let required_runtime = required_runtime_for_kind(classification.kind);
     let command_priority = command_priority_from_env(&reporter);
+    let wait_for_worker = queue_when_busy_enabled();
 
     // Query daemon for worker selection
     let response = match query_daemon(
@@ -225,6 +226,7 @@ pub async fn run_exec(command_parts: Vec<String>) -> anyhow::Result<()> {
         command_priority,
         0, // classification duration not relevant here
         Some(std::process::id()),
+        wait_for_worker,
     )
     .await
     {
@@ -247,6 +249,7 @@ pub async fn run_exec(command_parts: Vec<String>) -> anyhow::Result<()> {
                     command_priority,
                     0,
                     Some(std::process::id()),
+                    wait_for_worker,
                 )
                 .await
                 {
@@ -1929,6 +1932,7 @@ pub(crate) async fn query_daemon(
     command_priority: CommandPriority,
     classification_duration_us: u64,
     hook_pid: Option<u32>,
+    wait_for_worker: bool,
 ) -> anyhow::Result<SelectionResponse> {
     // Mock support: RCH_MOCK_CIRCUIT_OPEN simulates all circuits open
     // This needs to be checked in the hook since the daemon may be started
@@ -1992,8 +1996,16 @@ pub(crate) async fn query_daemon(
 
     // When all workers are at capacity, queue the build on the daemon instead of
     // falling back to a local compilation storm. Disable with RCH_QUEUE_WHEN_BUSY=0.
-    if queue_when_busy_enabled() {
+    if wait_for_worker {
         query.push_str("&wait=1");
+        // Keep daemon queue timeout aligned with the client-side socket timeout
+        // so queued requests return a structured SelectionReason instead of
+        // triggering a client communication timeout.
+        let wait_timeout_secs = daemon_response_timeout(wait_for_worker)
+            .as_secs()
+            .saturating_sub(1)
+            .max(1);
+        query.push_str(&format!("&wait_timeout_secs={}", wait_timeout_secs));
     }
 
     // Send request
@@ -2002,10 +2014,9 @@ pub(crate) async fn query_daemon(
     writer.flush().await?;
 
     // Read response (skip HTTP headers) with timeout and body size limit.
-    // The daemon should respond within 30s even when queuing builds.
     // Body is capped at 64KB to prevent unbounded memory growth.
     const MAX_RESPONSE_BODY: usize = 64 * 1024;
-    const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+    let response_timeout = daemon_response_timeout(wait_for_worker);
 
     let read_response = async {
         let mut reader = BufReader::new(reader);
@@ -2036,9 +2047,14 @@ pub(crate) async fn query_daemon(
             .map_err(|e| anyhow::anyhow!("Failed to parse daemon response: {}", e))
     };
 
-    let response = timeout(RESPONSE_TIMEOUT, read_response)
+    let response = timeout(response_timeout, read_response)
         .await
-        .map_err(|_| anyhow::anyhow!("Daemon response timed out after 30s"))??;
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "Daemon response timed out after {}s",
+                response_timeout.as_secs()
+            )
+        })??;
 
     Ok(response)
 }
@@ -2172,12 +2188,53 @@ fn urlencoding_encode(s: &str) -> String {
     result
 }
 
-fn queue_when_busy_enabled() -> bool {
-    let Ok(value) = std::env::var("RCH_QUEUE_WHEN_BUSY") else {
+const DEFAULT_DAEMON_RESPONSE_TIMEOUT_SECS: u64 = 30;
+const DEFAULT_DAEMON_WAIT_RESPONSE_TIMEOUT_SECS: u64 = 330;
+
+fn queue_when_busy_enabled_from(value: Option<&str>) -> bool {
+    let Some(value) = value else {
         return true;
     };
     let value = value.trim().to_lowercase();
     !matches!(value.as_str(), "0" | "false" | "no" | "off")
+}
+
+fn queue_when_busy_enabled() -> bool {
+    let value = std::env::var("RCH_QUEUE_WHEN_BUSY").ok();
+    queue_when_busy_enabled_from(value.as_deref())
+}
+
+fn parse_timeout_secs(raw: &str) -> Option<u64> {
+    raw.trim().parse::<u64>().ok().filter(|secs| *secs > 0)
+}
+
+fn daemon_response_timeout_for(
+    wait_for_worker: bool,
+    global_override: Option<&str>,
+    wait_override: Option<&str>,
+) -> Duration {
+    if let Some(secs) = global_override.and_then(parse_timeout_secs) {
+        return Duration::from_secs(secs);
+    }
+
+    if wait_for_worker {
+        let secs = wait_override
+            .and_then(parse_timeout_secs)
+            .unwrap_or(DEFAULT_DAEMON_WAIT_RESPONSE_TIMEOUT_SECS);
+        return Duration::from_secs(secs);
+    }
+
+    Duration::from_secs(DEFAULT_DAEMON_RESPONSE_TIMEOUT_SECS)
+}
+
+fn daemon_response_timeout(wait_for_worker: bool) -> Duration {
+    let global_override = std::env::var("RCH_DAEMON_RESPONSE_TIMEOUT_SECS").ok();
+    let wait_override = std::env::var("RCH_DAEMON_WAIT_RESPONSE_TIMEOUT_SECS").ok();
+    daemon_response_timeout_for(
+        wait_for_worker,
+        global_override.as_deref(),
+        wait_override.as_deref(),
+    )
 }
 
 /// Extract project name from current working directory.
@@ -5368,6 +5425,7 @@ mod tests {
             CommandPriority::Normal,
             100, // 100µs classification time
             None,
+            false,
         )
         .await;
         assert!(result.is_err());
@@ -5449,6 +5507,7 @@ mod tests {
             CommandPriority::Normal,
             100,
             None,
+            false,
         )
         .await;
 
@@ -5518,6 +5577,7 @@ mod tests {
             CommandPriority::Normal,
             150, // 150µs classification time
             None,
+            false,
         )
         .await;
         daemon_handle.await.expect("Daemon task");
@@ -7969,6 +8029,7 @@ RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
             CommandPriority::Normal,
             100,
             None,
+            false,
         )
         .await;
 
@@ -8082,6 +8143,7 @@ RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
             CommandPriority::Normal,
             100,
             None,
+            false,
         )
         .await;
 
@@ -8092,20 +8154,40 @@ RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
     }
 
     #[test]
-    fn test_timeout_constants_are_reasonable() {
+    fn test_queue_when_busy_enabled_parser() {
         let _guard = test_guard!();
-        // Document and verify the timeout values used in the hook
-        // Connection timeout: 300ms (quick enough to not block agents, long enough for local socket)
-        // Read timeout: 300ms (same reasoning)
-        // These are defined in query_daemon but we verify the code uses timeouts
-        // by checking the function uses tokio::time::timeout
+        assert!(queue_when_busy_enabled_from(None));
+        assert!(queue_when_busy_enabled_from(Some("1")));
+        assert!(queue_when_busy_enabled_from(Some("true")));
+        assert!(queue_when_busy_enabled_from(Some("yes")));
+        assert!(!queue_when_busy_enabled_from(Some("0")));
+        assert!(!queue_when_busy_enabled_from(Some("false")));
+        assert!(!queue_when_busy_enabled_from(Some("off")));
+    }
 
-        // This is a documentation test - the actual values are embedded in query_daemon
-        // We verify the timeout behavior via the tests above (test_daemon_query_connect_timeout_fail_open,
-        // test_process_hook_timeout_fail_open, test_daemon_query_partial_response_timeout)
-        //
-        // The specific timeout values (300ms connect, 300ms read) are validated by the fact that
-        // these tests complete in reasonable time without hanging.
+    #[test]
+    fn test_daemon_response_timeout_defaults_and_overrides() {
+        let _guard = test_guard!();
+        assert_eq!(
+            daemon_response_timeout_for(false, None, None),
+            Duration::from_secs(DEFAULT_DAEMON_RESPONSE_TIMEOUT_SECS)
+        );
+        assert_eq!(
+            daemon_response_timeout_for(true, None, None),
+            Duration::from_secs(DEFAULT_DAEMON_WAIT_RESPONSE_TIMEOUT_SECS)
+        );
+        assert_eq!(
+            daemon_response_timeout_for(true, None, Some("900")),
+            Duration::from_secs(900)
+        );
+        assert_eq!(
+            daemon_response_timeout_for(true, Some("45"), Some("900")),
+            Duration::from_secs(45)
+        );
+        assert_eq!(
+            daemon_response_timeout_for(true, Some("invalid"), Some("invalid")),
+            Duration::from_secs(DEFAULT_DAEMON_WAIT_RESPONSE_TIMEOUT_SECS)
+        );
     }
 
     // ============================================================================
