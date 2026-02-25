@@ -5524,6 +5524,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_daemon_query_wait_parameters() {
+        let socket_path = format!("/tmp/rch_test_wait_{}.sock", std::process::id());
+        let _ = std::fs::remove_file(&socket_path);
+
+        let listener = UnixListener::bind(&socket_path).expect("Failed to create test socket");
+        let expected_wait_timeout_secs = daemon_response_timeout_for(true, None, None)
+            .as_secs()
+            .saturating_sub(1)
+            .max(1);
+
+        let socket_path_clone = socket_path.clone();
+        let daemon_handle = tokio::spawn(async move {
+            let (stream, _) = listener
+                .accept()
+                .await
+                .expect("Failed to accept connection");
+            let (reader, mut writer) = stream.into_split();
+            let mut buf_reader = TokioBufReader::new(reader);
+
+            let mut request_line = String::new();
+            buf_reader
+                .read_line(&mut request_line)
+                .await
+                .expect("Failed to read request");
+
+            assert!(request_line.starts_with("GET /select-worker"));
+            assert!(request_line.contains("wait=1"));
+            assert!(
+                request_line.contains(&format!("wait_timeout_secs={expected_wait_timeout_secs}"))
+            );
+
+            let response = SelectionResponse {
+                worker: Some(SelectedWorker {
+                    id: rch_common::WorkerId::new("mock-worker"),
+                    host: "mock.host.local".to_string(),
+                    user: "mockuser".to_string(),
+                    identity_file: "~/.ssh/mock_key".to_string(),
+                    slots_available: 16,
+                    speed_score: 95.0,
+                }),
+                reason: SelectionReason::Success,
+                build_id: None,
+            };
+            let body = serde_json::to_string(&response).unwrap();
+            let http_response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            writer
+                .write_all(http_response.as_bytes())
+                .await
+                .expect("Failed to write response");
+            writer.flush().await.expect("Failed to flush response");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        let result = query_daemon(
+            &socket_path,
+            "test-project",
+            4,
+            "cargo build",
+            None,
+            RequiredRuntime::None,
+            CommandPriority::Normal,
+            100,
+            None,
+            true,
+        )
+        .await;
+
+        daemon_handle.await.expect("Daemon task panicked");
+        let _ = std::fs::remove_file(&socket_path_clone);
+
+        let response = result.expect("Query should succeed");
+        let worker = response.worker.expect("Should have worker");
+        assert_eq!(worker.id.as_str(), "mock-worker");
+    }
+
+    #[tokio::test]
     async fn test_daemon_query_url_encoding() {
         // Verify special characters in project name are encoded
         let socket_path = format!("/tmp/rch_test_url_{}.sock", std::process::id());
