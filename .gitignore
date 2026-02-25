@@ -67,3 +67,12 @@ storage.sqlite3-*
 
 # Claude local settings
 .claude/settings.local.json
+
+# Claude plan files
+.claude/plan.md
+
+# Remote compilation helper deploy/build artifacts
+.rch-deploy-root/
+.rch-target/
+rch-bin/
+rch-install/
