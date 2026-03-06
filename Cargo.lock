@@ -1081,6 +1081,7 @@ dependencies = [
 [[package]]
 name = "ftui"
 version = "0.2.1"
+source = "git+https://github.com/Dicklesworthstone/frankentui#7f1dd71641428102d3a12f38419b6b07b6fce92a"
 dependencies = [
  "ftui-core",
  "ftui-layout",
@@ -1094,6 +1095,7 @@ dependencies = [
 [[package]]
 name = "ftui-backend"
 version = "0.2.1"
+source = "git+https://github.com/Dicklesworthstone/frankentui#7f1dd71641428102d3a12f38419b6b07b6fce92a"
 dependencies = [
  "ftui-core",
  "ftui-render",
@@ -1102,6 +1104,7 @@ dependencies = [
 [[package]]
 name = "ftui-core"
 version = "0.2.1"
+source = "git+https://github.com/Dicklesworthstone/frankentui#7f1dd71641428102d3a12f38419b6b07b6fce92a"
 dependencies = [
  "ahash",
  "arc-swap",
@@ -1116,10 +1119,12 @@ dependencies = [
 [[package]]
 name = "ftui-i18n"
 version = "0.2.1"
+source = "git+https://github.com/Dicklesworthstone/frankentui#7f1dd71641428102d3a12f38419b6b07b6fce92a"
 
 [[package]]
 name = "ftui-layout"
 version = "0.2.1"
+source = "git+https://github.com/Dicklesworthstone/frankentui#7f1dd71641428102d3a12f38419b6b07b6fce92a"
 dependencies = [
  "ftui-core",
  "rustc-hash",
@@ -1130,6 +1135,7 @@ dependencies = [
 [[package]]
 name = "ftui-render"
 version = "0.2.1"
+source = "git+https://github.com/Dicklesworthstone/frankentui#7f1dd71641428102d3a12f38419b6b07b6fce92a"
 dependencies = [
  "ahash",
  "bitflags 2.11.0",
@@ -1144,6 +1150,7 @@ dependencies = [
 [[package]]
 name = "ftui-runtime"
 version = "0.2.1"
+source = "git+https://github.com/Dicklesworthstone/frankentui#7f1dd71641428102d3a12f38419b6b07b6fce92a"
 dependencies = [
  "arc-swap",
  "ftui-backend",
@@ -1162,6 +1169,7 @@ dependencies = [
 [[package]]
 name = "ftui-style"
 version = "0.2.1"
+source = "git+https://github.com/Dicklesworthstone/frankentui#7f1dd71641428102d3a12f38419b6b07b6fce92a"
 dependencies = [
  "ahash",
  "arc-swap",
@@ -1172,6 +1180,7 @@ dependencies = [
 [[package]]
 name = "ftui-text"
 version = "0.2.1"
+source = "git+https://github.com/Dicklesworthstone/frankentui#7f1dd71641428102d3a12f38419b6b07b6fce92a"
 dependencies = [
  "ftui-core",
  "ftui-layout",
@@ -1189,6 +1198,7 @@ dependencies = [
 [[package]]
 name = "ftui-tty"
 version = "0.2.1"
+source = "git+https://github.com/Dicklesworthstone/frankentui#7f1dd71641428102d3a12f38419b6b07b6fce92a"
 dependencies = [
  "ftui-backend",
  "ftui-core",
@@ -1201,6 +1211,7 @@ dependencies = [
 [[package]]
 name = "ftui-widgets"
 version = "0.2.1"
+source = "git+https://github.com/Dicklesworthstone/frankentui#7f1dd71641428102d3a12f38419b6b07b6fce92a"
 dependencies = [
  "ahash",
  "bitflags 2.11.0",

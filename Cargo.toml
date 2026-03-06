@@ -115,15 +115,15 @@ console = "0.16.2"
 pulldown-cmark = "0.13"
 
 # TUI (Terminal User Interface) — FrankenTUI native stack
-ftui = { path = "/dp/frankentui/crates/ftui", default-features = false, features = ["runtime"] }
-ftui-core = { path = "/dp/frankentui/crates/ftui-core" }
-ftui-render = { path = "/dp/frankentui/crates/ftui-render" }
-ftui-style = { path = "/dp/frankentui/crates/ftui-style" }
-ftui-text = { path = "/dp/frankentui/crates/ftui-text" }
-ftui-layout = { path = "/dp/frankentui/crates/ftui-layout" }
-ftui-widgets = { path = "/dp/frankentui/crates/ftui-widgets" }
-ftui-tty = { path = "/dp/frankentui/crates/ftui-tty" }
-ftui-backend = { path = "/dp/frankentui/crates/ftui-backend" }
+ftui = { git = "https://github.com/Dicklesworthstone/frankentui", default-features = false, features = ["runtime"] }
+ftui-core = { git = "https://github.com/Dicklesworthstone/frankentui" }
+ftui-render = { git = "https://github.com/Dicklesworthstone/frankentui" }
+ftui-style = { git = "https://github.com/Dicklesworthstone/frankentui" }
+ftui-text = { git = "https://github.com/Dicklesworthstone/frankentui" }
+ftui-layout = { git = "https://github.com/Dicklesworthstone/frankentui" }
+ftui-widgets = { git = "https://github.com/Dicklesworthstone/frankentui" }
+ftui-tty = { git = "https://github.com/Dicklesworthstone/frankentui" }
+ftui-backend = { git = "https://github.com/Dicklesworthstone/frankentui" }
 
 # Rich terminal output (optional, for enhanced UI)
 rich_rust = { version = "0.2.0", features = ["full"] }
