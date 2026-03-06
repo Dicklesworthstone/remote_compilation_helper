@@ -13,6 +13,7 @@ use crate::transfer::{
     default_rust_test_artifact_patterns, project_id_from_path,
 };
 use crate::ui::console::RchConsole;
+use rch_common::errors::catalog::ErrorCode;
 use rch_common::repo_updater_contract::{
     REPO_UPDATER_ALLOW_OVERRIDE_ENV, REPO_UPDATER_ALLOWED_HOSTS_ENV, REPO_UPDATER_ALLOWLIST_ENV,
     REPO_UPDATER_AUTH_CREDENTIAL_ID_ENV, REPO_UPDATER_AUTH_EXPIRES_AT_MS_ENV,
@@ -362,6 +363,28 @@ pub async fn run_exec(command_parts: Vec<String>) -> anyhow::Result<()> {
                     .arg(&command)
                     .status()?;
                 std::process::exit(status.code().unwrap_or(1));
+            } else if let Some(env_failure) =
+                detect_worker_system_dependency_failure(&result.stderr, result.exit_code)
+            {
+                let error = ErrorCode::BuildEnvError;
+                warn!(
+                    "Remote worker build-environment failure on {} [{}]: {}",
+                    worker.id,
+                    error.code_string(),
+                    env_failure.log_detail()
+                );
+                reporter.summary(&format!(
+                    "[RCH] remote {} failed [{}] {}",
+                    worker.id,
+                    error.code_string(),
+                    env_failure.summary()
+                ));
+                reporter.verbose(&format!(
+                    "[RCH] remediation [{}]: {}",
+                    error.code_string(),
+                    env_failure.remediation()
+                ));
+                std::process::exit(result.exit_code);
             } else {
                 // Command failed remotely - exit with the same code
                 reporter.summary(&format!(
@@ -3574,9 +3597,9 @@ fn build_dependency_preflight_report(
     let mut evidence = Vec::with_capacity(root_outcomes.len());
 
     for (entry, outcome) in root_outcomes {
-        let manifest_path = entry.local_root.join("Cargo.toml");
+        let manifest_path = PathBuf::from(&entry.remote_root).join("Cargo.toml");
         let manifest = manifest_path.to_string_lossy().to_string();
-        let root = entry.local_root.to_string_lossy().to_string();
+        let root = entry.remote_root.clone();
 
         let (status, reason_code, detail) = match outcome {
             SyncRootOutcome::Synced => {
@@ -3649,9 +3672,39 @@ fn canonicalize_sync_root_for_plan(root: &Path) -> PathBuf {
         .unwrap_or_else(|| root.to_path_buf())
 }
 
+fn effective_sync_topology_roots(policy: &PathTopologyPolicy) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    roots.push(policy.canonical_root().to_path_buf());
+    roots.push(policy.alias_root().to_path_buf());
+
+    if !policy.canonical_root().exists()
+        && let Ok(alias_target) = std::fs::canonicalize(policy.alias_root())
+    {
+        roots.push(alias_target);
+    }
+
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
 /// Returns `true` if `path` is within the allowed topology roots.
 fn is_within_sync_topology(path: &Path, policy: &PathTopologyPolicy) -> bool {
-    path.starts_with(policy.canonical_root()) || path.starts_with(policy.alias_root())
+    effective_sync_topology_roots(policy)
+        .into_iter()
+        .any(|root| path.starts_with(&root))
+}
+
+fn map_sync_root_to_remote_root(path: &Path, policy: &PathTopologyPolicy) -> String {
+    let remote_root = Path::new(DEFAULT_CANONICAL_PROJECT_ROOT);
+
+    for root in effective_sync_topology_roots(policy) {
+        if let Ok(relative) = path.strip_prefix(&root) {
+            return remote_root.join(relative).to_string_lossy().to_string();
+        }
+    }
+
+    path.to_string_lossy().to_string()
 }
 
 fn build_sync_closure_plan(
@@ -3689,7 +3742,7 @@ fn build_sync_closure_plan(
                 compute_project_hash(&root)
             };
             SyncClosurePlanEntry {
-                remote_root: root.to_string_lossy().to_string(),
+                remote_root: map_sync_root_to_remote_root(&root, &policy),
                 project_id: project_id_from_path(&root),
                 root_hash,
                 is_primary,
@@ -3740,13 +3793,7 @@ async fn verify_remote_dependency_manifests(
         return Ok(());
     }
 
-    let synced_roots = root_outcomes
-        .iter()
-        .filter_map(|(entry, outcome)| match outcome {
-            SyncRootOutcome::Synced => Some(entry.local_root.clone()),
-            SyncRootOutcome::Skipped { .. } | SyncRootOutcome::Failed { .. } => None,
-        })
-        .collect::<Vec<_>>();
+    let synced_roots = synced_remote_roots(root_outcomes);
 
     let mut present_manifests = std::collections::BTreeSet::new();
     let mut missing_manifests = std::collections::BTreeSet::new();
@@ -3813,6 +3860,16 @@ async fn verify_remote_dependency_manifests(
     Err(failure.into())
 }
 
+fn synced_remote_roots(root_outcomes: &[(SyncClosurePlanEntry, SyncRootOutcome)]) -> Vec<PathBuf> {
+    root_outcomes
+        .iter()
+        .filter_map(|(entry, outcome)| match outcome {
+            SyncRootOutcome::Synced => Some(PathBuf::from(&entry.remote_root)),
+            SyncRootOutcome::Skipped { .. } | SyncRootOutcome::Failed { .. } => None,
+        })
+        .collect()
+}
+
 fn build_remote_dependency_preflight_command(sync_roots: &[PathBuf]) -> Option<String> {
     if sync_roots.is_empty() {
         return None;
@@ -3872,6 +3929,120 @@ fn is_toolchain_failure(stderr: &str, exit_code: i32) -> bool {
     toolchain_patterns
         .iter()
         .any(|pattern| stderr_lower.contains(&pattern.to_lowercase()))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkerSystemDependencyFailure {
+    system_library: Option<String>,
+    crate_name: Option<String>,
+    pkg_config_file: Option<String>,
+}
+
+impl WorkerSystemDependencyFailure {
+    fn summary(&self) -> String {
+        if let Some(pkg_config_file) = &self.pkg_config_file {
+            return format!("missing worker system package {}", pkg_config_file);
+        }
+        if let Some(system_library) = &self.system_library {
+            return format!("missing worker system library {}", system_library);
+        }
+        "worker build environment is missing a required system package".to_string()
+    }
+
+    fn remediation(&self) -> String {
+        match (&self.pkg_config_file, &self.system_library) {
+            (Some(pkg_config_file), Some(system_library)) => format!(
+                "Install the worker-side development package that provides {} (system library {}) and ensure pkg-config can resolve it on the worker.",
+                pkg_config_file, system_library
+            ),
+            (Some(pkg_config_file), None) => format!(
+                "Install the worker-side development package that provides {} and ensure PKG_CONFIG_PATH includes its parent directory on the worker.",
+                pkg_config_file
+            ),
+            (None, Some(system_library)) => format!(
+                "Install the worker-side development package for system library {} and ensure pkg-config is configured on the worker.",
+                system_library
+            ),
+            (None, None) => "Install the missing worker-side development package and ensure pkg-config can find it on the worker.".to_string(),
+        }
+    }
+
+    fn log_detail(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(crate_name) = &self.crate_name {
+            parts.push(format!("crate={}", crate_name));
+        }
+        if let Some(system_library) = &self.system_library {
+            parts.push(format!("system_library={}", system_library));
+        }
+        if let Some(pkg_config_file) = &self.pkg_config_file {
+            parts.push(format!("pkg_config_file={}", pkg_config_file));
+        }
+        if parts.is_empty() {
+            "pkg-config/system dependency detection matched".to_string()
+        } else {
+            parts.join(" ")
+        }
+    }
+}
+
+fn detect_worker_system_dependency_failure(
+    stderr: &str,
+    exit_code: i32,
+) -> Option<WorkerSystemDependencyFailure> {
+    if exit_code == 0 {
+        return None;
+    }
+
+    let mut system_library = None;
+    let mut crate_name = None;
+    let mut pkg_config_file = None;
+    let mut pkg_config_signal = false;
+
+    for raw_line in stderr.lines() {
+        let line = raw_line.trim();
+        let lower = line.to_ascii_lowercase();
+
+        if lower.contains("pkg-config exited with status code")
+            || lower.contains("pkg_config_path")
+            || lower.contains("the system library `")
+            || lower.contains(".pc` needs to be installed")
+        {
+            pkg_config_signal = true;
+        }
+
+        if let Some(value) = extract_tick_quoted_value(line, "The system library `") {
+            system_library = Some(value);
+        }
+        if let Some(value) = extract_tick_quoted_value(line, "required by crate `") {
+            crate_name = Some(value);
+        }
+        if let Some(value) = extract_tick_quoted_value(line, "The file `") {
+            if value.ends_with(".pc") {
+                pkg_config_file = Some(value);
+            }
+        }
+    }
+
+    if !pkg_config_signal || (system_library.is_none() && pkg_config_file.is_none()) {
+        return None;
+    }
+
+    Some(WorkerSystemDependencyFailure {
+        system_library,
+        crate_name,
+        pkg_config_file,
+    })
+}
+
+fn extract_tick_quoted_value(line: &str, prefix: &str) -> Option<String> {
+    let remainder = line.split_once(prefix)?.1;
+    let value = remainder.split('`').next()?.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
 }
 
 /// Check if the process was killed by a signal.
@@ -6583,6 +6754,44 @@ mod tests {
     }
 
     #[test]
+    fn test_detect_worker_system_dependency_failure_from_pkg_config_output() {
+        let _guard = test_guard!();
+        let stderr = r#"thread 'main' panicked at build.rs:42:14:
+called `Result::unwrap()` on an `Err` value:
+pkg-config exited with status code 1
+> PKG_CONFIG_ALLOW_SYSTEM_LIBS=1 pkg-config --libs --cflags x11 'x11 >= 1.4.99.1'
+
+The system library `x11` required by crate `x11` was not found.
+The file `x11.pc` needs to be installed and the PKG_CONFIG_PATH environment variable must contain its parent directory.
+"#;
+
+        let failure = detect_worker_system_dependency_failure(stderr, EXIT_BUILD_ERROR)
+            .expect("pkg-config/system dependency failure should be detected");
+
+        assert_eq!(failure.system_library.as_deref(), Some("x11"));
+        assert_eq!(failure.crate_name.as_deref(), Some("x11"));
+        assert_eq!(failure.pkg_config_file.as_deref(), Some("x11.pc"));
+        assert_eq!(failure.summary(), "missing worker system package x11.pc");
+        assert!(failure.remediation().contains("x11.pc"));
+    }
+
+    #[test]
+    fn test_detect_worker_system_dependency_failure_ignores_normal_compile_errors() {
+        let _guard = test_guard!();
+        let stderr = r#"error[E0425]: cannot find value `oops` in this scope
+ --> src/main.rs:4:5
+  |
+4 |     oops();
+  |     ^^^^ not found in this scope
+"#;
+
+        assert!(
+            detect_worker_system_dependency_failure(stderr, EXIT_BUILD_ERROR).is_none(),
+            "ordinary compile errors must not be misclassified as worker env failures"
+        );
+    }
+
+    #[test]
     fn test_exit_code_semantics_documented() {
         let _guard = test_guard!();
         // This test documents the expected behavior for different exit codes
@@ -6808,6 +7017,38 @@ mod tests {
     }
 
     #[test]
+    fn test_synced_remote_roots_use_remote_paths() {
+        let _guard = test_guard!();
+        let root_outcomes = vec![
+            (
+                SyncClosurePlanEntry {
+                    local_root: PathBuf::from("/Users/jemanuel/projects/frankenterm"),
+                    remote_root: "/data/projects/frankenterm".to_string(),
+                    project_id: "frankenterm".to_string(),
+                    root_hash: "hash-primary".to_string(),
+                    is_primary: true,
+                },
+                SyncRootOutcome::Synced,
+            ),
+            (
+                SyncClosurePlanEntry {
+                    local_root: PathBuf::from("/Users/jemanuel/projects/frankentui"),
+                    remote_root: "/data/projects/frankentui".to_string(),
+                    project_id: "frankentui".to_string(),
+                    root_hash: "hash-dep".to_string(),
+                    is_primary: false,
+                },
+                SyncRootOutcome::Failed {
+                    error: "no sync".to_string(),
+                },
+            ),
+        ];
+
+        let synced = synced_remote_roots(&root_outcomes);
+        assert_eq!(synced, vec![PathBuf::from("/data/projects/frankenterm")]);
+    }
+
+    #[test]
     fn test_parse_dependency_preflight_probe_output_extracts_markers() {
         let _guard = test_guard!();
         let stdout = "\
@@ -6977,6 +7218,42 @@ RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
             report.evidence[0].status,
             DependencyPreflightStatus::Present,
             "evidence must mark synced+present roots as present"
+        );
+    }
+
+    #[test]
+    fn test_build_dependency_preflight_report_uses_remote_manifest_paths() {
+        let _guard = test_guard!();
+        let worker = make_test_worker_config("worker-remote-paths");
+        let entry = SyncClosurePlanEntry {
+            local_root: PathBuf::from("/Users/jemanuel/projects/repo-success"),
+            remote_root: "/data/projects/repo-success".to_string(),
+            project_id: "id-remote-paths".to_string(),
+            root_hash: "hash-remote-paths".to_string(),
+            is_primary: true,
+        };
+        let outcomes = vec![(entry, SyncRootOutcome::Synced)];
+        let present = std::collections::BTreeSet::from([String::from(
+            "/data/projects/repo-success/Cargo.toml",
+        )]);
+        let missing = std::collections::BTreeSet::new();
+
+        let report =
+            build_dependency_preflight_report(&worker, &outcomes, &present, &missing, None);
+
+        assert!(report.verified, "remote manifest markers should verify");
+        assert_eq!(report.evidence.len(), 1);
+        assert_eq!(
+            report.evidence[0].root, "/data/projects/repo-success",
+            "evidence should report the remote synced root"
+        );
+        assert_eq!(
+            report.evidence[0].manifest, "/data/projects/repo-success/Cargo.toml",
+            "manifest matching must use remote paths from the probe"
+        );
+        assert_eq!(
+            report.evidence[0].status,
+            DependencyPreflightStatus::Present
         );
     }
 
@@ -9658,13 +9935,43 @@ RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
         // If /dp symlink exists, verify /dp/X resolves to /data/projects/X.
         if Path::new("/dp").exists() {
             let dp_path = PathBuf::from("/dp/remote_compilation_helper");
-            let canonical = PathBuf::from("/data/projects/remote_compilation_helper");
+            let canonical = std::fs::canonicalize(&dp_path).expect("canonicalize /dp path");
             let plan = build_sync_closure_plan(&[], &dp_path, "dp_hash");
             assert_eq!(plan.len(), 1);
             assert!(plan[0].is_primary);
             assert_eq!(
                 plan[0].local_root, canonical,
-                "primary via /dp alias should canonicalize"
+                "primary via /dp alias should canonicalize to the alias target"
+            );
+            assert_eq!(
+                plan[0].remote_root, "/data/projects/remote_compilation_helper",
+                "remote root should stay in worker canonical topology"
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_sync_closure_plan_maps_alias_target_roots_to_worker_canonical_topology() {
+        let _guard = test_guard!();
+        if let Ok(local_projects_root) = std::fs::canonicalize("/dp") {
+            let project_root = local_projects_root.join("frankenterm");
+            let dep_root = local_projects_root.join("frankentui");
+
+            let plan = build_sync_closure_plan(
+                &[dep_root.clone(), project_root.clone()],
+                &project_root,
+                "mapped_hash",
+            );
+
+            assert!(
+                plan.iter().any(|entry| entry.local_root == project_root
+                    && entry.remote_root == "/data/projects/frankenterm"),
+                "primary root should map back to worker canonical topology"
+            );
+            assert!(
+                plan.iter().any(|entry| entry.local_root == dep_root
+                    && entry.remote_root == "/data/projects/frankentui"),
+                "dependency root should map back to worker canonical topology"
             );
         }
     }

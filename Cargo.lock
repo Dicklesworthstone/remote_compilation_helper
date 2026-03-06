@@ -1124,6 +1124,7 @@ dependencies = [
  "ftui-core",
  "rustc-hash",
  "serde",
+ "smallvec",
 ]
 
 [[package]]
@@ -1144,6 +1145,7 @@ dependencies = [
 name = "ftui-runtime"
 version = "0.2.1"
 dependencies = [
+ "arc-swap",
  "ftui-backend",
  "ftui-core",
  "ftui-i18n",
@@ -1205,6 +1207,7 @@ dependencies = [
  "ftui-core",
  "ftui-layout",
  "ftui-render",
+ "ftui-runtime",
  "ftui-style",
  "ftui-text",
  "unicode-segmentation",

@@ -61,7 +61,10 @@ impl Default for SshOptions {
             command_timeout: DEFAULT_COMMAND_TIMEOUT,
             server_alive_interval: None,
             control_persist_idle: None,
-            control_master: true,
+            // Default to a plain SSH session. ControlMaster is an optimization
+            // and stale local control sockets can poison otherwise healthy
+            // connections. Callers that explicitly want mux reuse can opt in.
+            control_master: false,
             known_hosts: KnownHostsPolicy::Add,
         }
     }
@@ -154,41 +157,68 @@ impl SshClient {
         let destination = format!("{}@{}", self.config.user, self.config.host);
         debug!("Connecting to {} via SSH...", destination);
 
+        let session = match self
+            .connect_with_mode(&destination, self.options.control_master)
+            .await
+        {
+            Ok(session) => session,
+            Err(primary_error) if self.options.control_master => {
+                warn!(
+                    "SSH ControlMaster connection to {} failed ({}). Retrying without ControlMaster.",
+                    destination, primary_error
+                );
+                self.connect_with_mode(&destination, false)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "Failed to connect to {} after retrying without ControlMaster",
+                            destination
+                        )
+                    })?
+            }
+            Err(primary_error) => {
+                return Err(primary_error)
+                    .with_context(|| format!("Failed to connect to {}", destination));
+            }
+        };
+
+        info!("Connected to {} ({})", self.config.id, self.config.host);
+        self.session = Some(session);
+        Ok(())
+    }
+
+    async fn connect_with_mode(&self, destination: &str, control_master: bool) -> Result<Session> {
+        let mut builder = SessionBuilder::default();
+        self.configure_builder(&mut builder, control_master);
+
+        builder.connect(destination).await.with_context(|| {
+            if control_master {
+                format!(
+                    "Failed to connect to {} with ControlMaster enabled",
+                    destination
+                )
+            } else {
+                format!(
+                    "Failed to connect to {} with ControlMaster disabled",
+                    destination
+                )
+            }
+        })
+    }
+
+    fn configure_builder(&self, builder: &mut SessionBuilder, control_master: bool) {
         let known_hosts = match self.options.known_hosts {
             KnownHostsPolicy::Strict => KnownHosts::Strict,
             KnownHostsPolicy::Add => KnownHosts::Add,
             KnownHostsPolicy::AcceptAll => KnownHosts::Accept,
         };
 
-        let mut builder = SessionBuilder::default();
         builder
             .known_hosts_check(known_hosts)
             .connect_timeout(self.options.connect_timeout);
 
         if let Some(interval) = self.options.server_alive_interval {
             builder.server_alive_interval(interval);
-        }
-
-        if let Some(idle) = self.options.control_persist_idle {
-            if idle.is_zero() {
-                builder.control_persist(ControlPersist::ClosedAfterInitialConnection);
-            } else {
-                match usize::try_from(idle.as_secs()) {
-                    Ok(secs) => {
-                        if let Some(nonzero) = NonZeroUsize::new(secs) {
-                            builder.control_persist(ControlPersist::IdleFor(nonzero));
-                        } else {
-                            builder.control_persist(ControlPersist::ClosedAfterInitialConnection);
-                        }
-                    }
-                    Err(_) => {
-                        warn!(
-                            "control_persist_idle too large ({}s); ignoring override",
-                            idle.as_secs()
-                        );
-                    }
-                }
-            }
         }
 
         // Add identity file if specified
@@ -198,7 +228,30 @@ impl SshClient {
         }
 
         // Enable control master for connection reuse
-        if self.options.control_master {
+        if control_master {
+            if let Some(idle) = self.options.control_persist_idle {
+                if idle.is_zero() {
+                    builder.control_persist(ControlPersist::ClosedAfterInitialConnection);
+                } else {
+                    match usize::try_from(idle.as_secs()) {
+                        Ok(secs) => {
+                            if let Some(nonzero) = NonZeroUsize::new(secs) {
+                                builder.control_persist(ControlPersist::IdleFor(nonzero));
+                            } else {
+                                builder
+                                    .control_persist(ControlPersist::ClosedAfterInitialConnection);
+                            }
+                        }
+                        Err(_) => {
+                            warn!(
+                                "control_persist_idle too large ({}s); ignoring override",
+                                idle.as_secs()
+                            );
+                        }
+                    }
+                }
+            }
+
             // Use a short control directory path to stay within the Unix domain
             // socket path limit (104 bytes on macOS, 108 on Linux).  The openssh
             // crate appends a `%C` hash (~32 chars) to form the socket filename,
@@ -244,15 +297,6 @@ impl SshClient {
             }
             builder.control_directory(&control_dir);
         }
-
-        let session = builder
-            .connect(&destination)
-            .await
-            .with_context(|| format!("Failed to connect to {}", destination))?;
-
-        info!("Connected to {} ({})", self.config.id, self.config.host);
-        self.session = Some(session);
-        Ok(())
     }
 
     /// Disconnect from the worker.
@@ -687,7 +731,7 @@ mod tests {
         assert_eq!(options.command_timeout, Duration::from_secs(300));
         assert!(options.server_alive_interval.is_none());
         assert!(options.control_persist_idle.is_none());
-        assert!(options.control_master);
+        assert!(!options.control_master);
     }
 
     #[test]

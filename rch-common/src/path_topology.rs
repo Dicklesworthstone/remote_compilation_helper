@@ -302,6 +302,13 @@ fn resolve_canonical_root(
     decisions: &mut Vec<NormalizationDecision>,
 ) -> Result<PathBuf, PathNormalizationError> {
     if !policy.canonical_root().exists() {
+        if let Some(alias_target) = try_resolve_alias_target(policy.alias_root()) {
+            decisions.push(NormalizationDecision::CanonicalRootResolved(
+                alias_target.clone(),
+            ));
+            return Ok(alias_target);
+        }
+
         return Err(PathNormalizationError::new(
             PathNormalizationErrorKind::CanonicalRootMissing,
             input_path,
@@ -322,6 +329,25 @@ fn resolve_canonical_root(
         canonical_root.clone(),
     ));
     Ok(canonical_root)
+}
+
+fn try_resolve_alias_target(alias_root: &Path) -> Option<PathBuf> {
+    let metadata = std::fs::symlink_metadata(alias_root).ok()?;
+    if !metadata.file_type().is_symlink() {
+        return None;
+    }
+
+    let raw_target = std::fs::read_link(alias_root).ok()?;
+    let absolute_target = if raw_target.is_absolute() {
+        raw_target
+    } else {
+        alias_root
+            .parent()
+            .unwrap_or_else(|| Path::new("/"))
+            .join(raw_target)
+    };
+
+    std::fs::canonicalize(absolute_target).ok()
 }
 
 fn verify_alias(
@@ -650,5 +676,31 @@ mod tests {
             err.detail()
                 .contains(missing_root.to_string_lossy().as_ref())
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn normalize_direct_path_via_alias_target_when_canonical_root_missing() {
+        let fixture = TestFixture::new("alias-target-root", true, None);
+        let missing_root = fixture.root.join("does-not-exist");
+        let policy = PathTopologyPolicy::new(missing_root, fixture.alias_root.clone());
+        let project = fixture.canonical_root.join("repo");
+        fs::create_dir_all(&project).expect("create project");
+
+        let normalized = normalize_project_path_with_policy(&project, &policy)
+            .expect("normalize path using alias target fallback");
+
+        assert_eq!(
+            normalized.canonical_root(),
+            fixture
+                .canonical_root
+                .canonicalize()
+                .expect("canonicalize alias target root")
+        );
+        assert_eq!(
+            normalized.canonical_path(),
+            project.canonicalize().expect("canonicalize project")
+        );
+        assert!(!normalized.used_alias_prefix());
     }
 }

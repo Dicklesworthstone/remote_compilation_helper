@@ -289,6 +289,7 @@ impl TransferPipeline {
             control_persist_idle: transfer_config
                 .ssh_control_persist_secs
                 .map(std::time::Duration::from_secs),
+            control_master: transfer_config.ssh_control_persist_secs.is_some(),
             ..Default::default()
         };
 
@@ -1450,7 +1451,9 @@ impl TransferPipeline {
                 }
             }
 
-            if let Some(idle) = self.ssh_options.control_persist_idle {
+            if self.ssh_options.control_master
+                && let Some(idle) = self.ssh_options.control_persist_idle
+            {
                 let control_dir = self.rsync_control_dir();
                 if let Err(e) = std::fs::create_dir_all(&control_dir) {
                     warn!(
@@ -2558,6 +2561,40 @@ mod tests {
     }
 
     #[test]
+    fn test_transfer_pipeline_defaults_to_plain_ssh_sessions() {
+        let _guard = test_guard!();
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/tmp/test"),
+            "test-project".to_string(),
+            "abc123".to_string(),
+            TransferConfig::default(),
+        );
+
+        assert!(!pipeline.ssh_options.control_master);
+        assert!(pipeline.ssh_options.control_persist_idle.is_none());
+    }
+
+    #[test]
+    fn test_transfer_pipeline_enables_control_master_when_persist_configured() {
+        let _guard = test_guard!();
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/tmp/test"),
+            "test-project".to_string(),
+            "abc123".to_string(),
+            TransferConfig {
+                ssh_control_persist_secs: Some(60),
+                ..TransferConfig::default()
+            },
+        );
+
+        assert!(pipeline.ssh_options.control_master);
+        assert_eq!(
+            pipeline.ssh_options.control_persist_idle,
+            Some(std::time::Duration::from_secs(60))
+        );
+    }
+
+    #[test]
     fn test_bun_test_external_timeout_wrapper() {
         let _guard = test_guard!();
         // Test that BunTest commands get wrapped with timeout
@@ -2708,6 +2745,7 @@ mod tests {
         let custom_options = SshOptions {
             server_alive_interval: Some(std::time::Duration::from_secs(30)),
             control_persist_idle: Some(std::time::Duration::from_secs(60)),
+            control_master: true,
             ..Default::default()
         };
 
