@@ -688,8 +688,8 @@ pub async fn handle_connection(
             metrics::inc_requests("build-heartbeat");
             let mut body = String::new();
             match tokio::time::timeout(
-                Duration::from_secs(10),
-                reader.take(MAX_BODY_SIZE).read_to_string(&mut body),
+                Duration::from_secs(5),
+                read_line_with_limit(&mut reader, &mut body, MAX_LINE_SIZE),
             )
             .await
             {
@@ -728,8 +728,8 @@ pub async fn handle_connection(
             metrics::inc_requests("telemetry");
             let mut body = String::new();
             match tokio::time::timeout(
-                Duration::from_secs(10),
-                reader.take(MAX_BODY_SIZE).read_to_string(&mut body),
+                Duration::from_secs(5),
+                read_line_with_limit(&mut reader, &mut body, MAX_LINE_SIZE),
             )
             .await
             {
@@ -775,8 +775,8 @@ pub async fn handle_connection(
             metrics::inc_requests("test-run");
             let mut body = String::new();
             match tokio::time::timeout(
-                Duration::from_secs(10),
-                reader.take(MAX_BODY_SIZE).read_to_string(&mut body),
+                Duration::from_secs(5),
+                read_line_with_limit(&mut reader, &mut body, MAX_LINE_SIZE),
             )
             .await
             {

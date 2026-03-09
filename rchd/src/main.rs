@@ -44,7 +44,7 @@ use std::time::{Duration, Instant};
 use tokio::net::UnixListener;
 use tokio::sync::{Mutex, mpsc};
 use tokio::time::interval;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 #[cfg(unix)]
 use tokio::signal::unix::{SignalKind, signal};
@@ -600,7 +600,13 @@ async fn main() -> Result<()> {
                             let tx = shutdown_tx.clone();
                             tokio::spawn(async move {
                                 if let Err(e) = api::handle_connection(stream, ctx, tx).await {
-                                    warn!("Connection error: {}", e);
+                                    if e.downcast_ref::<std::io::Error>()
+                                        .is_some_and(|io_err| io_err.kind() == std::io::ErrorKind::BrokenPipe)
+                                    {
+                                        debug!("Client disconnected (broken pipe)");
+                                    } else {
+                                        warn!("Connection error: {}", e);
+                                    }
                                 }
                             });
                         }
@@ -681,7 +687,13 @@ async fn main() -> Result<()> {
                             let tx = shutdown_tx.clone();
                             tokio::spawn(async move {
                                 if let Err(e) = api::handle_connection(stream, ctx, tx).await {
-                                    warn!("Connection error: {}", e);
+                                    if e.downcast_ref::<std::io::Error>()
+                                        .is_some_and(|io_err| io_err.kind() == std::io::ErrorKind::BrokenPipe)
+                                    {
+                                        debug!("Client disconnected (broken pipe)");
+                                    } else {
+                                        warn!("Connection error: {}", e);
+                                    }
                                 }
                             });
                         }

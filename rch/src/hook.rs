@@ -5087,6 +5087,7 @@ async fn send_telemetry(
 
     writer.write_all(request.as_bytes()).await?;
     writer.flush().await?;
+    writer.shutdown().await?;
 
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
@@ -5112,6 +5113,7 @@ async fn send_test_run(socket_path: &str, record: &TestRunRecord) -> anyhow::Res
 
     writer.write_all(request.as_bytes()).await?;
     writer.flush().await?;
+    writer.shutdown().await?;
 
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
@@ -5139,6 +5141,7 @@ async fn send_build_heartbeat(
     let request = format!("POST /build-heartbeat\n{}\n", body);
     writer.write_all(request.as_bytes()).await?;
     writer.flush().await?;
+    writer.shutdown().await?;
 
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
