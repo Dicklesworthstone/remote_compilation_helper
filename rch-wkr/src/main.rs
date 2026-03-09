@@ -92,7 +92,15 @@ enum Commands {
     },
 
     /// Run a benchmark
-    Benchmark,
+    Benchmark {
+        /// Output format
+        #[arg(long, value_enum, default_value = "pretty")]
+        format: OutputFormat,
+
+        /// Output JSON (shorthand for --format json)
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(clap::ValueEnum, Clone, Copy)]
@@ -206,7 +214,10 @@ async fn main() -> Result<()> {
             println!("{}", output);
             Ok(())
         }
-        Commands::Benchmark => run_benchmark().await,
+        Commands::Benchmark { format, json } => {
+            let fmt = if json { OutputFormat::Json } else { format };
+            run_benchmark(fmt).await
+        }
     }
 }
 
@@ -617,7 +628,7 @@ fn parse_df_posix_kb(stdout: &str) -> Option<(u64, u64)> {
     None
 }
 
-async fn run_benchmark() -> Result<()> {
+async fn run_benchmark(format: OutputFormat) -> Result<()> {
     info!("Running benchmark...");
 
     // Create a simple benchmark project with a unique name
@@ -659,8 +670,19 @@ fn main() {
 
     if output.status.success() {
         let score = 100.0 / elapsed.as_secs_f64();
-        println!("Benchmark completed in {:.2}s", elapsed.as_secs_f64());
-        println!("Score: {:.1}", score.min(100.0));
+        match format {
+            OutputFormat::Json => {
+                println!(
+                    "{{\"score\":{:.1},\"elapsed_secs\":{:.2}}}",
+                    score.min(100.0),
+                    elapsed.as_secs_f64()
+                );
+            }
+            OutputFormat::Pretty => {
+                println!("Benchmark completed in {:.2}s", elapsed.as_secs_f64());
+                println!("Score: {:.1}", score.min(100.0));
+            }
+        }
     } else {
         println!(
             "Benchmark failed: {}",
