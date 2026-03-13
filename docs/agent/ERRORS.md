@@ -102,9 +102,9 @@ For full remediation details and the JSON error envelope, see `docs/api/error-co
 | `RCH-E400` | `transfer` | `TransferRsyncFailed` | Rsync transfer failed | Verify rsync is installed on both ends |
 | `RCH-E401` | `transfer` | `TransferTimeout` | File sync operation timed out | Increase transfer timeout in configuration |
 | `RCH-E402` | `transfer` | `TransferSourceMissing` | Source files not found | Verify source files exist locally |
-| `RCH-E403` | `transfer` | `TransferDestError` | Destination path error | Check remote directory permissions |
+| `RCH-E403` | `transfer` | `TransferDestError` | Destination path error | Check remote directory permissions and ownership |
 | `RCH-E404` | `transfer` | `TransferDiskFull` | Insufficient disk space on worker | Clean up old builds on worker |
-| `RCH-E405` | `transfer` | `TransferPermissionDenied` | Permission denied during file transfer | Check file ownership on worker |
+| `RCH-E405` | `transfer` | `TransferPermissionDenied` | Permission denied during file transfer | Check ownership of `/data/projects/<repo>` on worker |
 | `RCH-E406` | `transfer` | `TransferChecksumError` | Transfer checksum mismatch | Retry the transfer |
 | `RCH-E407` | `transfer` | `TransferBinaryFailed` | Binary download failed | Check network connectivity |
 | `RCH-E408` | `transfer` | `TransferIncomplete` | Transfer completed partially | Retry the transfer operation |

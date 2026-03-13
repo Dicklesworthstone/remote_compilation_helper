@@ -89,16 +89,20 @@ rch status --workers
 **Diagnosis:**
 ```bash
 rch status --json | jq '.daemon.workers[] | select(.pressure_state == "critical")'
-ssh <user>@<host> 'df -h /'
+ssh <user>@<host> 'df -h / /tmp'
 ```
 
 **Remediation:**
 ```bash
-# Check cache sizes
-ssh <user>@<host> 'du -sh /tmp/rch-*'
+# Check temp and target churn separately
+ssh <user>@<host> 'du -sh /tmp/rch-* /tmp/rch_target_* 2>/dev/null'
+ssh <user>@<host> 'find /data/projects -maxdepth 2 -type d \( -name "target_rch_*" -o -name "target_*" -o -name "target-*" -o -name target \) -exec du -sh {} + 2>/dev/null | sort -h | tail -n 20'
 
-# Clean build artifacts (destructive)
-ssh <user>@<host> 'cargo clean'
+# Verify candidate is inactive before cleanup
+ssh <user>@<host> 'sudo lsof +D /tmp/rch_target_<name>'
+
+# Clean only inactive build artifacts (destructive)
+ssh <user>@<host> 'rm -rf /tmp/rch_target_<name>'
 
 # Verify recovery
 rch workers probe <worker-id>

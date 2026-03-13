@@ -831,7 +831,7 @@ impl ErrorCode {
             Self::WorkerReclaimFailed => &[
                 "Disk space reclaim operation failed on the worker",
                 "Check worker filesystem health and permissions",
-                "Try manual cleanup: ssh <worker> du -sh /tmp/rch/",
+                "Inspect both root and temp usage: ssh <worker> 'df -h / /tmp'",
             ],
             Self::WorkerDiskHeadroomInsufficient => &[
                 "Estimated build disk requirement exceeds available free space",
@@ -987,7 +987,7 @@ impl ErrorCode {
                 "Review .rchignore exclusions",
             ],
             Self::TransferDestError => &[
-                "Check remote directory permissions",
+                "Check remote directory permissions and ownership",
                 "Verify remote_base_dir is valid",
                 "Ensure sufficient disk space on worker",
             ],
@@ -997,9 +997,9 @@ impl ErrorCode {
                 "Increase disk allocation for worker",
             ],
             Self::TransferPermissionDenied => &[
-                "Check file ownership on worker",
+                "Check ownership of /data/projects/<repo> on the worker",
                 "Verify SSH user has write permissions",
-                "Review umask settings",
+                "Repair drift if needed: sudo chown -R <ssh-user>:<ssh-user> /data/projects/<repo>",
             ],
             Self::TransferChecksumError => &[
                 "Retry the transfer",

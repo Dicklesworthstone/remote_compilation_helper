@@ -337,7 +337,7 @@ fn generate_worker_hints(workers: &[SimWorker]) -> Vec<UxRemediationHint> {
                             w.id, disk_info
                         ),
                         suggested_action: format!(
-                            "ssh {}@{} 'cargo clean' or free disk space",
+                            "ssh {}@{} 'df -h / /tmp && du -sh /tmp/rch-* /tmp/rch_target_* /data/projects/*/target* 2>/dev/null'",
                             w.user, w.host
                         ),
                         worker_id: Some(w.id.clone()),
@@ -358,7 +358,7 @@ fn generate_worker_hints(workers: &[SimWorker]) -> Vec<UxRemediationHint> {
                         severity: HintSeverity::Warning,
                         message: format!("Worker {} storage pressure elevated{}", w.id, disk_info),
                         suggested_action: format!(
-                            "ssh {}@{} 'du -sh /tmp/rch-*' to check cache sizes",
+                            "ssh {}@{} 'df -h / /tmp && du -sh /tmp/rch-* /tmp/rch_target_* 2>/dev/null'",
                             w.user, w.host
                         ),
                         worker_id: Some(w.id.clone()),

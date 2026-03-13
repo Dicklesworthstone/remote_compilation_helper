@@ -611,7 +611,7 @@ This document provides a comprehensive reference for all error codes used in the
 **Message:** Destination path error
 
 **Remediation:**
-1. Check remote directory permissions
+1. Check remote directory permissions and ownership
 2. Verify `remote_base_dir` is valid
 3. Ensure sufficient disk space on worker
 
@@ -627,9 +627,9 @@ This document provides a comprehensive reference for all error codes used in the
 **Message:** Permission denied during file transfer
 
 **Remediation:**
-1. Check file ownership on worker
+1. Check ownership of `/data/projects/<repo>` on the worker
 2. Verify SSH user has write permissions
-3. Review umask settings
+3. Repair drift if needed: `sudo chown -R <ssh-user>:<ssh-user> /data/projects/<repo>`
 
 ### RCH-E406: TransferChecksumError
 **Message:** Transfer checksum mismatch
