@@ -3039,31 +3039,33 @@ fn repo_updater_auth_context_env_supplied() -> bool {
     .any(|var_name| std::env::var(var_name).is_ok())
 }
 
-fn infer_repo_updater_auth_context(requested_at_unix_ms: i64) -> RepoUpdaterAuthContext {
-    let (source, credential_id, granted_scopes) = if env_var_present("GH_TOKEN") {
+fn infer_repo_updater_auth_context_with_env_lookup<F>(
+    requested_at_unix_ms: i64,
+    env_present: F,
+) -> Option<RepoUpdaterAuthContext>
+where
+    F: Fn(&str) -> bool,
+{
+    let (source, credential_id, granted_scopes) = if env_present("GH_TOKEN") {
         (
             RepoUpdaterCredentialSource::TokenEnv,
             "env:GH_TOKEN".to_string(),
             vec!["repo:read".to_string()],
         )
-    } else if env_var_present("GITHUB_TOKEN") {
+    } else if env_present("GITHUB_TOKEN") {
         (
             RepoUpdaterCredentialSource::TokenEnv,
             "env:GITHUB_TOKEN".to_string(),
             vec!["repo:read".to_string()],
         )
-    } else if env_var_present("SSH_AUTH_SOCK") {
+    } else if env_present("SSH_AUTH_SOCK") {
         (
             RepoUpdaterCredentialSource::SshAgent,
             "ssh-agent".to_string(),
             Vec::new(),
         )
     } else {
-        (
-            RepoUpdaterCredentialSource::SshAgent,
-            "implicit-no-auth".to_string(),
-            Vec::new(),
-        )
+        return None;
     };
 
     let issued_at_unix_ms = if requested_at_unix_ms > 1_000 {
@@ -3073,7 +3075,7 @@ fn infer_repo_updater_auth_context(requested_at_unix_ms: i64) -> RepoUpdaterAuth
     };
     let expires_at_unix_ms = requested_at_unix_ms.saturating_add(86_400_000);
 
-    RepoUpdaterAuthContext {
+    Some(RepoUpdaterAuthContext {
         source,
         credential_id,
         issued_at_unix_ms,
@@ -3081,7 +3083,11 @@ fn infer_repo_updater_auth_context(requested_at_unix_ms: i64) -> RepoUpdaterAuth
         granted_scopes,
         revoked: false,
         verified_hosts: Vec::new(),
-    }
+    })
+}
+
+fn infer_repo_updater_auth_context(requested_at_unix_ms: i64) -> Option<RepoUpdaterAuthContext> {
+    infer_repo_updater_auth_context_with_env_lookup(requested_at_unix_ms, env_var_present)
 }
 
 fn auto_tune_repo_updater_contract(
@@ -3298,8 +3304,14 @@ async fn maybe_sync_repo_set_with_repo_updater(
         None
     };
     if auth_context.is_none() {
-        auth_context = Some(infer_repo_updater_auth_context(now_ms));
-        reporter.verbose("[RCH] repo_updater auth context inferred from runtime environment");
+        auth_context = infer_repo_updater_auth_context(now_ms);
+        if auth_context.is_some() {
+            reporter.verbose("[RCH] repo_updater auth context inferred from runtime environment");
+        } else {
+            reporter.verbose(
+                "[RCH] repo_updater auth context unavailable in local environment; sync-apply may be skipped",
+            );
+        }
     }
 
     auto_tune_repo_updater_contract(
@@ -6934,6 +6946,27 @@ The file `x11.pc` needs to be installed and the PKG_CONFIG_PATH environment vari
             auth_context.verified_hosts.len(),
             contract.auth_policy.trusted_host_identities.len()
         );
+    }
+
+    #[test]
+    fn test_infer_repo_updater_auth_context_returns_none_without_local_auth() {
+        let _guard = test_guard!();
+        assert!(
+            infer_repo_updater_auth_context_with_env_lookup(1_700_000_000_000, |_| false).is_none()
+        );
+    }
+
+    #[test]
+    fn test_infer_repo_updater_auth_context_uses_token_env_when_present() {
+        let _guard = test_guard!();
+        let auth_context =
+            infer_repo_updater_auth_context_with_env_lookup(1_700_000_000_000, |key| {
+                key == "GH_TOKEN"
+            })
+            .expect("token env should infer auth context");
+        assert_eq!(auth_context.source, RepoUpdaterCredentialSource::TokenEnv);
+        assert_eq!(auth_context.credential_id, "env:GH_TOKEN");
+        assert_eq!(auth_context.granted_scopes, vec!["repo:read".to_string()]);
     }
 
     #[test]
