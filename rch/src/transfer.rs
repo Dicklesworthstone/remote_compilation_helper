@@ -44,7 +44,11 @@ const PROJECT_HASH_KEY_FILES: &[&str] = &[
     // Bun config
     "bunfig.toml",
 ];
-const REMOTE_RUNTIME_EXCLUDE_PATTERNS: &[&str] = &[".rch-target/", ".rch-tmp/"];
+const REMOTE_RUNTIME_EXCLUDE_PATTERNS: &[&str] = &[
+    ".rch-target/",
+    ".rch-tmp/",
+    ".franken_whisper/tools/ffmpeg/",
+];
 
 // =============================================================================
 // Retry Logic (bd-x1ek)
@@ -3149,6 +3153,7 @@ node_modules/
         }
         assert!(effective.contains(&".rch-target/".to_string()));
         assert!(effective.contains(&".rch-tmp/".to_string()));
+        assert!(effective.contains(&".franken_whisper/tools/ffmpeg/".to_string()));
     }
 
     #[test]
@@ -3175,6 +3180,7 @@ node_modules/
         }
         assert!(effective.contains(&".rch-target/".to_string()));
         assert!(effective.contains(&".rch-tmp/".to_string()));
+        assert!(effective.contains(&".franken_whisper/tools/ffmpeg/".to_string()));
         assert!(effective.contains(&"large_data/".to_string()));
         assert!(effective.contains(&"secrets/".to_string()));
     }
@@ -3204,6 +3210,7 @@ node_modules/
         }
         assert!(effective.contains(&".rch-target/".to_string()));
         assert!(effective.contains(&".rch-tmp/".to_string()));
+        assert!(effective.contains(&".franken_whisper/tools/ffmpeg/".to_string()));
         assert!(effective.contains(&"custom/".to_string()));
         // target/ should appear only once
         let target_count = effective.iter().filter(|p| *p == "target/").count();
@@ -3213,6 +3220,11 @@ node_modules/
         assert_eq!(runtime_target_count, 1);
         let runtime_tmp_count = effective.iter().filter(|p| *p == ".rch-tmp/").count();
         assert_eq!(runtime_tmp_count, 1);
+        let runtime_ffmpeg_count = effective
+            .iter()
+            .filter(|p| *p == ".franken_whisper/tools/ffmpeg/")
+            .count();
+        assert_eq!(runtime_ffmpeg_count, 1);
     }
 
     // ==========================================================================

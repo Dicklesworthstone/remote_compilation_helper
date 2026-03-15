@@ -658,6 +658,21 @@ struct MetadataDocument {
 #[derive(Debug, Deserialize)]
 struct MetadataResolve {
     root: Option<String>,
+    #[serde(default)]
+    nodes: Vec<MetadataResolveNode>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MetadataResolveNode {
+    id: String,
+    #[serde(default)]
+    deps: Vec<MetadataResolveDep>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MetadataResolveDep {
+    name: String,
+    pkg: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -673,6 +688,8 @@ struct MetadataPackage {
 struct MetadataDependency {
     name: String,
     path: Option<String>,
+    #[serde(default)]
+    optional: bool,
 }
 
 #[derive(Debug)]
@@ -745,8 +762,63 @@ where
         });
     }
 
+    let resolve_nodes = metadata
+        .resolve
+        .as_ref()
+        .map(|resolve| {
+            resolve
+                .nodes
+                .iter()
+                .map(|node| (node.id.clone(), node))
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
+
     for package in &package_records {
+        if let Some(node) = resolve_nodes.get(
+            &partial
+                .packages
+                .get(&package.package_root)
+                .map(|_| ())
+                .and(Some(
+                    id_to_root
+                        .iter()
+                        .find_map(|(id, root)| (root == &package.package_root).then(|| id.clone()))
+                        .unwrap_or_default(),
+                ))
+                .unwrap_or_default(),
+        ) {
+            for dependency in &node.deps {
+                let dependency_root = id_to_root.get(&dependency.pkg).ok_or_else(|| {
+                    CargoPathDependencyError::new(
+                        CargoPathDependencyErrorKind::MetadataParseFailure,
+                        format!(
+                            "resolve dependency pkg missing from package list: {}",
+                            dependency.pkg
+                        ),
+                    )
+                    .with_manifest_path(&package.manifest_path)
+                })?;
+                let dependency_manifest = dependency_root.join("Cargo.toml");
+                partial.add_package(
+                    dependency_root.clone(),
+                    dependency_manifest,
+                    dependency.name.clone(),
+                    false,
+                );
+                partial.add_edge(
+                    package.package_root.clone(),
+                    dependency_root.clone(),
+                    dependency.name.clone(),
+                );
+            }
+            continue;
+        }
+
         for dependency in &package.dependencies {
+            if dependency.optional {
+                continue;
+            }
             let Some(raw_path) = dependency.path.as_deref() else {
                 continue;
             };
@@ -1211,6 +1283,13 @@ fn collect_dependency_paths(
         let Some(path) = dependency_table.get("path").and_then(toml::Value::as_str) else {
             continue;
         };
+        if dependency_table
+            .get("optional")
+            .and_then(toml::Value::as_bool)
+            .unwrap_or(false)
+        {
+            continue;
+        }
         collector.push(ManifestDependency {
             dependency_name: dependency_name.clone(),
             dependency_path: path.to_string(),
@@ -1718,6 +1797,52 @@ mod tests {
         assert!(
             error.cycle().len() >= 3,
             "cycle path should include repeated terminal node"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn optional_path_dependency_cycle_is_ignored_for_active_closure() {
+        let fixture = TopologyFixture::new("optional-cycle");
+        let scenario_root = fixture.canonical_root.join("optional_cycle");
+        let app_root = scenario_root.join("app");
+        let real_dep_root = scenario_root.join("real_dep");
+        let optional_a_root = scenario_root.join("optional_a");
+        let optional_b_root = scenario_root.join("optional_b");
+
+        write_lib_crate(&real_dep_root, "real_dep", &[]);
+        write_lib_crate(&optional_a_root, "optional_a", &[("optional_b", "../optional_b")]);
+        write_lib_crate(&optional_b_root, "optional_b", &[("optional_a", "../optional_a")]);
+
+        fs::create_dir_all(app_root.join("src")).expect("create app src");
+        fs::write(
+            app_root.join("Cargo.toml"),
+            r#"[package]
+name = "optional_cycle_app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+real_dep = { path = "../real_dep" }
+optional_a = { path = "../optional_a", optional = true }
+"#,
+        )
+        .expect("write app manifest");
+        fs::write(app_root.join("src/main.rs"), "fn main() {}\n").expect("write app main");
+
+        let graph = resolve_cargo_path_dependency_graph_with_policy(&app_root, &fixture.policy())
+            .expect("optional cycle should not poison active dependency closure");
+
+        let app_root = app_root.canonicalize().expect("canonical app");
+        let real_dep_root = real_dep_root.canonicalize().expect("canonical real dep");
+        assert_eq!(graph.root_packages, vec![app_root.clone()]);
+        assert_eq!(
+            graph.edges,
+            vec![CargoPathDependencyEdge {
+                from: app_root,
+                to: real_dep_root,
+                dependency_name: "real_dep".to_string(),
+            }]
         );
     }
 
