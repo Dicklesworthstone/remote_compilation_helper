@@ -694,6 +694,7 @@ struct MetadataDependency {
 
 #[derive(Debug)]
 struct MetadataPackageRecord {
+    package_id: String,
     package_root: PathBuf,
     manifest_path: PathBuf,
     dependencies: Vec<MetadataDependency>,
@@ -756,6 +757,7 @@ where
 
         id_to_root.insert(package.id.clone(), package_root.clone());
         package_records.push(MetadataPackageRecord {
+            package_id: package.id,
             package_root,
             manifest_path: canonical_manifest_path,
             dependencies: package.dependencies,
@@ -775,19 +777,7 @@ where
         .unwrap_or_default();
 
     for package in &package_records {
-        if let Some(node) = resolve_nodes.get(
-            &partial
-                .packages
-                .get(&package.package_root)
-                .map(|_| ())
-                .and(Some(
-                    id_to_root
-                        .iter()
-                        .find_map(|(id, root)| (root == &package.package_root).then(|| id.clone()))
-                        .unwrap_or_default(),
-                ))
-                .unwrap_or_default(),
-        ) {
+        if let Some(node) = resolve_nodes.get(&package.package_id) {
             for dependency in &node.deps {
                 let dependency_root = id_to_root.get(&dependency.pkg).ok_or_else(|| {
                     CargoPathDependencyError::new(
