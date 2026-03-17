@@ -3923,24 +3923,26 @@ struct RemoteExecutionResult {
 /// Returns true if the error indicates a toolchain issue that should
 /// trigger a local fallback rather than denying execution.
 fn is_toolchain_failure(stderr: &str, exit_code: i32) -> bool {
-    if exit_code == 0 {
+    if exit_code == 0 || exit_code == EXIT_TEST_FAILURES || is_signal_killed(exit_code).is_some() {
         return false;
     }
 
-    // Check for common toolchain failure patterns
-    let toolchain_patterns = [
-        "toolchain",
-        "is not installed",
-        "rustup: command not found",
-        "rustup: not found",
-        "error: no such command",
-        "error: toolchain",
-    ];
-
-    let stderr_lower = stderr.to_lowercase();
-    toolchain_patterns
-        .iter()
-        .any(|pattern| stderr_lower.contains(&pattern.to_lowercase()))
+    stderr
+        .lines()
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .any(|line| {
+            line.starts_with("rustup: command not found")
+                || line.starts_with("rustup: not found")
+                || line.contains("error: no default toolchain configured")
+                || line.contains("error: no active toolchain")
+                || (line.contains("error: toolchain ")
+                    && (line.contains(" is not installed")
+                        || line.contains(" is unavailable")
+                        || line.contains(" does not have the binary ")))
+                || (line.contains("error: override toolchain ")
+                    && line.contains(" is not installed"))
+        })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6752,7 +6754,14 @@ mod tests {
             1
         ));
         assert!(is_toolchain_failure("rustup: command not found", 127));
-        assert!(is_toolchain_failure("error: no such command: `build`", 1));
+        assert!(is_toolchain_failure(
+            "error: no default toolchain configured",
+            1
+        ));
+        assert!(is_toolchain_failure(
+            "error: toolchain 'nightly-2025-01-01' does not have the binary `cargo`",
+            1
+        ));
 
         // Should not flag normal failures
         assert!(!is_toolchain_failure(
@@ -6766,6 +6775,29 @@ mod tests {
 
         // Success should never be a toolchain failure
         assert!(!is_toolchain_failure("anything", 0));
+    }
+
+    #[test]
+    fn test_is_toolchain_failure_ignores_rustup_toolchain_paths_in_normal_failures() {
+        let _guard = test_guard!();
+        let stderr = r#"error: could not compile `serde` (lib)
+Caused by:
+  process didn't exit successfully: `/home/ubuntu/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/bin/rustc --crate-name serde ...` (signal: 9, SIGKILL: kill)
+"#;
+
+        assert!(
+            !is_toolchain_failure(stderr, 137),
+            "SIGKILL/OOM stderr mentioning .rustup/toolchains paths must not trigger local fallback"
+        );
+
+        let compile_error = r#"error[E0425]: cannot find value `x` in this scope
+note: the compiler executable is /home/ubuntu/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/bin/rustc
+"#;
+
+        assert!(
+            !is_toolchain_failure(compile_error, EXIT_BUILD_ERROR),
+            "ordinary compile errors mentioning the rustc toolchain path must not trigger local fallback"
+        );
     }
 
     #[test]
@@ -7996,6 +8028,66 @@ RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
         assert!(
             matches!(output, HookOutput::AllowWithModifiedCommand(_)),
             "Signal-killed cargo test should return AllowWithModifiedCommand"
+        );
+    }
+
+    #[tokio::test]
+    #[serial(mock_global)]
+    async fn test_cargo_test_signal_killed_with_toolchain_path_does_not_fallback_local() {
+        let _lock = test_lock().lock().await;
+        let socket_path = format!(
+            "/tmp/rch_test_cargo_test_signal_toolchain_path_{}_{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+
+        let stderr = "error: could not compile `serde` (lib)\nCaused by:\n  process didn't exit successfully: `/home/ubuntu/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/bin/rustc --crate-name serde ...` (signal: 9, SIGKILL: kill)\n";
+
+        let _overrides = TestOverridesGuard::set(
+            &socket_path,
+            MockConfig {
+                default_exit_code: 137,
+                default_stderr: stderr.to_string(),
+                ..MockConfig::default()
+            },
+            MockRsyncConfig::success(),
+        );
+        mock::clear_global_invocations();
+
+        let response = SelectionResponse {
+            worker: Some(SelectedWorker {
+                id: rch_common::WorkerId::new("test-worker"),
+                host: "test.host.local".to_string(),
+                user: "testuser".to_string(),
+                identity_file: "~/.ssh/test_key".to_string(),
+                slots_available: 8,
+                speed_score: 85.0,
+            }),
+            reason: SelectionReason::Success,
+            build_id: None,
+        };
+        spawn_mock_daemon(&socket_path, response).await;
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
+
+        let input = HookInput {
+            tool_name: "Bash".to_string(),
+            tool_input: ToolInput {
+                command: "cargo test".to_string(),
+                description: None,
+            },
+            session_id: None,
+        };
+
+        let output = process_hook(input).await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        assert!(
+            matches!(output, HookOutput::AllowWithModifiedCommand(_)),
+            "signal-killed remote failures that mention .rustup/toolchains must preserve the remote exit code instead of falling back local"
         );
     }
 
