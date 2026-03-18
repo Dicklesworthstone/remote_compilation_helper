@@ -1,7 +1,7 @@
 //! Worker selection algorithm with multiple selection strategies.
 //!
 //! Supports five selection strategies:
-//! - **Priority**: Original behavior, sort by priority and select first available
+//! - **Priority**: Respect worker priority first, then break ties with cache/speed hints
 //! - **Fastest**: Select worker with highest SpeedScore
 //! - **Balanced**: Balance SpeedScore, load, health, cache affinity, and priority
 //! - **CacheAffinity**: Prefer workers with warm caches for the project
@@ -32,6 +32,9 @@ use tracing::{debug, warn};
 
 const DEFAULT_NETWORK_SCORE: f64 = 0.5;
 const NETWORK_LATENCY_HALF_LIFE_MS: f64 = 200.0;
+const PRIORITY_BUCKET_SCORE: f64 = 10_000.0;
+const PRIORITY_CACHE_TIEBREAK_SCORE: f64 = 1_000.0;
+const PRIORITY_SPEED_TIEBREAK_SCORE: f64 = 10.0;
 const TEST_CACHE_BOOST: f64 = 1.5;
 const TEST_BUILD_FALLBACK_FACTOR: f64 = 0.4;
 
@@ -257,11 +260,23 @@ impl CacheTracker {
     pub fn record_success(&mut self, worker_id: &str, project_id: &str) {
         let now = Instant::now();
 
-        // Update per-worker cache state
-        if let Some(cache) = self.workers.get_mut(worker_id)
-            && let Some(state) = cache.get_mut(project_id)
+        // Update per-worker cache state. A successful run always implies a
+        // usable build cache, even if record_build was skipped on this path.
         {
+            let cache = self.workers.entry(worker_id.to_string()).or_default();
+            let state = cache.entry(project_id.to_string()).or_default();
+            state.last_build = Some(now);
             state.last_success = Some(now);
+
+            while cache.len() > self.max_projects_per_worker {
+                let oldest = cache
+                    .iter()
+                    .min_by_key(|(_, state)| state.last_activity())
+                    .map(|(key, _)| key.clone());
+                if let Some(key) = oldest {
+                    cache.remove(&key);
+                }
+            }
         }
 
         // Update global last-success-by-project
@@ -1077,9 +1092,18 @@ impl WorkerSelector {
 
         match self.config.strategy {
             SelectionStrategy::Priority => {
+                let cache = self.cache_tracker.read().await;
                 for (worker, _) in workers {
                     let config = worker.config.read().await;
-                    scores.push((config.id.as_str().to_string(), config.priority as f64));
+                    let warmth =
+                        cache.estimate_warmth(config.id.as_str(), &request.project, cache_use);
+                    let score = Self::priority_selection_score(
+                        config.priority,
+                        warmth,
+                        worker.get_speed_score(),
+                        request.command_priority,
+                    );
+                    scores.push((config.id.as_str().to_string(), score));
                 }
             }
             SelectionStrategy::Fastest | SelectionStrategy::FairFastest => {
@@ -1559,51 +1583,62 @@ impl WorkerSelector {
         }
     }
 
-    /// Priority strategy: select worker with highest priority.
+    /// Priority strategy: respect worker priority first, then use cache/speed
+    /// tie-breaks so repeated builds land on warm workers when possible.
     async fn select_by_priority(
         &self,
         workers: &[(Arc<WorkerState>, CircuitState)],
         request: &SelectionRequest,
         cache_use: CacheUse,
     ) -> Option<(Arc<WorkerState>, CircuitState)> {
-        // Preserve existing behavior for the default case: pick the first worker with the
-        // highest worker.priority (in the pool's iteration order).
-        let mut best_priority: Option<u32> = None;
-        for (worker, _) in workers {
-            let priority = worker.config.read().await.priority;
-            best_priority = Some(best_priority.map_or(priority, |best: u32| best.max(priority)));
-        }
-
-        let best_priority = best_priority?;
-        let mut candidates: Vec<(Arc<WorkerState>, CircuitState)> = Vec::new();
+        let cache = self.cache_tracker.read().await;
+        let mut best: Option<(Arc<WorkerState>, CircuitState)> = None;
+        let mut best_score = f64::NEG_INFINITY;
 
         for (worker, circuit_state) in workers {
-            let priority = worker.config.read().await.priority;
-            if priority == best_priority {
-                candidates.push((worker.clone(), *circuit_state));
+            let config = worker.config.read().await;
+            let warmth = cache.estimate_warmth(config.id.as_str(), &request.project, cache_use);
+            let score = Self::priority_selection_score(
+                config.priority,
+                warmth,
+                worker.get_speed_score(),
+                request.command_priority,
+            );
+            drop(config);
+
+            if score > best_score {
+                best_score = score;
+                best = Some((worker.clone(), *circuit_state));
             }
         }
 
-        match request.command_priority {
-            CommandPriority::High => self.select_by_fastest(&candidates).await,
-            CommandPriority::Low => {
-                let cache = self.cache_tracker.read().await;
-                let mut best_idx: Option<usize> = None;
-                let mut best_warmth = f64::NEG_INFINITY;
+        best
+    }
 
-                for (idx, (worker, _)) in candidates.iter().enumerate() {
-                    let id = worker.config.read().await.id.as_str().to_string();
-                    let warmth = cache.estimate_warmth(id.as_str(), &request.project, cache_use);
-                    if warmth > best_warmth {
-                        best_warmth = warmth;
-                        best_idx = Some(idx);
-                    }
-                }
-
-                best_idx.map(|idx| (candidates[idx].0.clone(), candidates[idx].1))
+    fn priority_selection_score(
+        priority: u32,
+        warmth: f64,
+        speed_score: f64,
+        command_priority: CommandPriority,
+    ) -> f64 {
+        let warmth = if warmth.is_finite() {
+            warmth.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let speed_score = if speed_score.is_finite() {
+            speed_score.clamp(0.0, 100.0)
+        } else {
+            0.0
+        };
+        let tie_break = match command_priority {
+            CommandPriority::High => (speed_score * PRIORITY_SPEED_TIEBREAK_SCORE) + warmth,
+            CommandPriority::Normal | CommandPriority::Low => {
+                (warmth * PRIORITY_CACHE_TIEBREAK_SCORE) + speed_score
             }
-            CommandPriority::Normal => candidates.first().cloned(),
-        }
+        };
+
+        (priority as f64 * PRIORITY_BUCKET_SCORE) + tie_break
     }
 
     /// Fastest strategy: select worker with highest SpeedScore.
@@ -3067,6 +3102,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_worker_selector_priority_strategy_prefers_warm_worker_for_normal_commands() {
+        let pool = WorkerPool::new();
+
+        let warm = make_worker("warm-worker", 8, 50.0);
+        {
+            let mut config = warm.config.write().await;
+            config.priority = 100;
+        }
+        pool.add_worker_state(warm).await;
+
+        let cold = make_worker("cold-worker", 8, 95.0);
+        {
+            let mut config = cold.config.write().await;
+            config.priority = 100;
+        }
+        pool.add_worker_state(cold).await;
+
+        let selector = WorkerSelector::with_config(
+            SelectionConfig {
+                strategy: SelectionStrategy::Priority,
+                affinity: rch_common::AffinityConfig {
+                    enabled: false,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            CircuitBreakerConfig::default(),
+        );
+        selector.record_success("warm-worker", "test-project").await;
+
+        let request = SelectionRequest {
+            project: "test-project".to_string(),
+            command: Some("cargo check".to_string()),
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 2,
+            preferred_workers: vec![],
+            toolchain: None,
+            required_runtime: RequiredRuntime::default(),
+            classification_duration_us: None,
+            hook_pid: None,
+        };
+
+        let result = selector.select(&pool, &request).await;
+        let selected = result.worker.expect("Expected a worker");
+        assert_eq!(selected.config.read().await.id.as_str(), "warm-worker");
+    }
+
+    #[tokio::test]
     async fn test_worker_selector_fastest_strategy() {
         let pool = WorkerPool::new();
 
@@ -4084,7 +4167,7 @@ mod tests {
         let entry = &audit_entries[0];
         assert_eq!(entry.project, "audit-test-project");
         assert_eq!(entry.command, Some("cargo test".to_string()));
-        assert_eq!(entry.strategy, "Priority"); // Default strategy
+        assert_eq!(entry.strategy, "Balanced"); // Default strategy
         assert_eq!(entry.classification_duration_us, Some(250));
     }
 
@@ -4108,6 +4191,20 @@ mod tests {
         // Now should have pinned worker
         let pinned = tracker.get_pinned_worker("project-a", pin_window);
         assert_eq!(pinned, Some("worker1"));
+    }
+
+    #[test]
+    fn test_cache_tracker_record_success_creates_cache_entry() {
+        let _guard = test_guard!();
+        let mut tracker = CacheTracker::new();
+
+        tracker.record_success("worker1", "project-a");
+
+        let warmth = tracker.estimate_warmth("worker1", "project-a", CacheUse::Build);
+        assert!(
+            warmth > 0.0,
+            "successful runs should establish build warmth"
+        );
     }
 
     #[test]

@@ -959,7 +959,6 @@ mod tests {
     };
     use chrono::Utc;
     use ftui_render::buffer::Buffer;
-    use ftui_render::cell::{Cell, CellContent};
     use ftui_render::grapheme_pool::GraphemePool;
     use tracing::info;
 

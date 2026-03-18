@@ -4031,10 +4031,10 @@ fn detect_worker_system_dependency_failure(
         if let Some(value) = extract_tick_quoted_value(line, "required by crate `") {
             crate_name = Some(value);
         }
-        if let Some(value) = extract_tick_quoted_value(line, "The file `") {
-            if value.ends_with(".pc") {
-                pkg_config_file = Some(value);
-            }
+        if let Some(value) = extract_tick_quoted_value(line, "The file `")
+            && value.ends_with(".pc")
+        {
+            pkg_config_file = Some(value);
         }
     }
 

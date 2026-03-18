@@ -218,15 +218,15 @@ impl std::fmt::Display for SelectionReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SelectionStrategy {
-    /// Original behavior: sort by priority, select first available.
-    /// Use for backwards compatibility or manual control.
-    #[default]
+    /// Legacy/manual control: prioritize worker.priority first, then break ties
+    /// using command-aware cache/speed hints.
     Priority,
     /// Select worker with highest SpeedScore.
     /// Best for performance-critical builds with homogeneous workers.
     Fastest,
     /// Balance all factors: SpeedScore, load, health, cache affinity.
-    /// Default recommendation for diverse worker pools.
+    /// Default for general use across diverse worker pools.
+    #[default]
     Balanced,
     /// Prefer workers with warm caches for the project.
     /// Best for incremental builds on large codebases.

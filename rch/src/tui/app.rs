@@ -1067,8 +1067,10 @@ mod tests {
         let mut buffer = Buffer::new(10, 1);
         // Write "Hello" directly as cells
         for (i, c) in "Hello".chars().enumerate() {
-            let mut cell = Cell::default();
-            cell.content = CellContent::from_char(c);
+            let cell = Cell {
+                content: CellContent::from_char(c),
+                ..Default::default()
+            };
             buffer.set(i as u16, 0, cell);
         }
         let result = ftui_buffer_to_string(&buffer, &pool);

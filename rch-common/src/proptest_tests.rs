@@ -1985,7 +1985,7 @@ mod tests {
             let config = SelectionConfig::default();
 
             // Strategy default
-            assert_eq!(config.strategy, SelectionStrategy::Priority);
+            assert_eq!(config.strategy, SelectionStrategy::Balanced);
 
             // min_success_rate default (0.8)
             assert!((config.min_success_rate - 0.8).abs() < 0.001);

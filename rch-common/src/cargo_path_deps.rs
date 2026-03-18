@@ -1801,8 +1801,16 @@ mod tests {
         let optional_b_root = scenario_root.join("optional_b");
 
         write_lib_crate(&real_dep_root, "real_dep", &[]);
-        write_lib_crate(&optional_a_root, "optional_a", &[("optional_b", "../optional_b")]);
-        write_lib_crate(&optional_b_root, "optional_b", &[("optional_a", "../optional_a")]);
+        write_lib_crate(
+            &optional_a_root,
+            "optional_a",
+            &[("optional_b", "../optional_b")],
+        );
+        write_lib_crate(
+            &optional_b_root,
+            "optional_b",
+            &[("optional_a", "../optional_a")],
+        );
 
         fs::create_dir_all(app_root.join("src")).expect("create app src");
         fs::write(

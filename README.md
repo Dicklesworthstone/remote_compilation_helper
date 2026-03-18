@@ -296,7 +296,7 @@ verify_artifacts = false
 max_transfer_mb = 2048
 
 [selection]
-strategy = "fair_fastest"
+strategy = "balanced"
 
 [self_healing]
 hook_starts_daemon = true
@@ -306,6 +306,10 @@ daemon_installs_hooks = true
 enabled = true
 suppress_duplicates_secs = 300
 ```
+
+Built-in worker selection defaults to `balanced`, which blends speed, load,
+health, and cache affinity. Use `priority` only when you want explicit
+worker-priority control, and `fair_fastest` when you want extra load spreading.
 
 ### Worker Config Example
 

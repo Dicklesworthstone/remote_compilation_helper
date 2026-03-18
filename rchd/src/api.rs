@@ -693,7 +693,7 @@ pub async fn handle_connection(
             .await
             {
                 Ok(Ok(_)) => {}
-                Ok(Err(e)) => return Err(e.into()),
+                Ok(Err(e)) => return Err(e),
                 Err(_) => {
                     warn!("Build heartbeat body read timed out");
                     return Ok(());
@@ -733,7 +733,7 @@ pub async fn handle_connection(
             .await
             {
                 Ok(Ok(_)) => {}
-                Ok(Err(e)) => return Err(e.into()),
+                Ok(Err(e)) => return Err(e),
                 Err(_) => {
                     warn!("Telemetry body read timed out");
                     return Ok(());
@@ -780,7 +780,7 @@ pub async fn handle_connection(
             .await
             {
                 Ok(Ok(_)) => {}
-                Ok(Err(e)) => return Err(e.into()),
+                Ok(Err(e)) => return Err(e),
                 Err(_) => {
                     warn!("Test run body read timed out");
                     return Ok(());
