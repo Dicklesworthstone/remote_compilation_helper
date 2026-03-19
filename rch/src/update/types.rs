@@ -220,26 +220,57 @@ pub struct ReleaseAsset {
 impl ReleaseAsset {
     /// Check if this asset is for the current platform.
     pub fn is_for_current_platform(&self) -> bool {
-        let target = current_target();
-        self.name.contains(&target)
+        current_release_targets()
+            .into_iter()
+            .any(|target| self.name.contains(&target))
     }
 }
 
-/// Get the current target triple.
-pub fn current_target() -> String {
-    let arch = std::env::consts::ARCH;
-    let os = std::env::consts::OS;
+fn release_os_name(os: &str) -> &str {
+    match os {
+        "macos" => "darwin",
+        other => other,
+    }
+}
 
-    let arch_str = arch;
-
+fn target_for(os: &str, arch: &str) -> String {
     let os_str = match os {
         "linux" => "unknown-linux-gnu",
         "macos" => "apple-darwin",
         "windows" => "pc-windows-msvc",
-        _ => os,
+        other => other,
     };
 
-    format!("{}-{}", arch_str, os_str)
+    format!("{arch}-{os_str}")
+}
+
+/// Get the current target triple.
+pub fn current_target() -> String {
+    target_for(std::env::consts::OS, std::env::consts::ARCH)
+}
+
+fn release_targets_for(os: &str, arch: &str) -> Vec<String> {
+    let mut targets = vec![target_for(os, arch)];
+
+    if os == "linux" && arch == "x86_64" {
+        // Linux x86_64 releases are shipped as static musl builds.
+        targets.push("x86_64-unknown-linux-musl".to_string());
+    }
+
+    targets.push(format!("{}-{}", release_os_name(os), arch));
+    targets.dedup();
+    targets
+}
+
+pub fn current_release_targets() -> Vec<String> {
+    release_targets_for(std::env::consts::OS, std::env::consts::ARCH)
+}
+
+pub fn current_release_archive_extension() -> &'static str {
+    match std::env::consts::OS {
+        "windows" => ".zip",
+        _ => ".tar.gz",
+    }
 }
 
 /// Result of checking for updates.
@@ -353,6 +384,41 @@ mod tests {
         assert!(!target.is_empty());
         // Should contain architecture
         assert!(target.contains("x86_64") || target.contains("aarch64") || target.contains("arm"));
+    }
+
+    #[test]
+    fn test_release_targets_for_linux_x86_64_include_musl_and_alias() {
+        let targets = release_targets_for("linux", "x86_64");
+        assert_eq!(
+            targets,
+            vec![
+                "x86_64-unknown-linux-gnu".to_string(),
+                "x86_64-unknown-linux-musl".to_string(),
+                "linux-x86_64".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_release_targets_for_macos_aarch64_include_darwin_alias() {
+        let targets = release_targets_for("macos", "aarch64");
+        assert_eq!(
+            targets,
+            vec![
+                "aarch64-apple-darwin".to_string(),
+                "darwin-aarch64".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_current_release_archive_extension_is_platform_appropriate() {
+        let extension = current_release_archive_extension();
+        if std::env::consts::OS == "windows" {
+            assert_eq!(extension, ".zip");
+        } else {
+            assert_eq!(extension, ".tar.gz");
+        }
     }
 
     #[test]

@@ -1,6 +1,9 @@
 //! Download release artifacts with verification.
 
-use super::types::{UpdateCheck, UpdateError, current_target};
+use super::types::{
+    UpdateCheck, UpdateError, current_release_archive_extension, current_release_targets,
+    current_target,
+};
 use super::verify::{verify_checksum, verify_checksum_and_signature};
 use crate::ui::OutputContext;
 use std::path::PathBuf;
@@ -25,20 +28,11 @@ pub async fn download_release(
     ctx: &OutputContext,
     update: &UpdateCheck,
 ) -> Result<DownloadedRelease, UpdateError> {
-    // Find the asset for our platform
-    let target = current_target();
-    let archive_asset = update
-        .assets
-        .iter()
-        .find(|a| a.name.contains(&target) && a.name.ends_with(".tar.gz"))
-        .ok_or_else(|| UpdateError::UnsupportedPlatform(target.clone()))?;
+    // Find the asset for our platform.
+    let archive_asset = find_archive_asset(&update.assets, &update.latest_version.to_string())?;
 
-    // Find the checksum file
-    let checksum_asset = update
-        .assets
-        .iter()
-        .find(|a| a.name == format!("{}.sha256", archive_asset.name))
-        .or_else(|| update.assets.iter().find(|a| a.name == "checksums.txt"));
+    // Find the checksum manifest or per-asset checksum file.
+    let checksum_asset = find_checksum_asset(&update.assets, archive_asset);
 
     if !ctx.is_json() {
         println!(
@@ -187,6 +181,64 @@ fn is_transient_error(e: &UpdateError) -> bool {
     matches!(e, UpdateError::NetworkError(_))
 }
 
+fn archive_asset_candidates(version: &str) -> Vec<String> {
+    let version = version.trim_start_matches('v');
+    let version_tag = format!("v{version}");
+    let extension = current_release_archive_extension();
+    let mut candidates = Vec::new();
+
+    for target in current_release_targets() {
+        candidates.push(format!("rch-{version_tag}-{target}{extension}"));
+        candidates.push(format!("rch-{target}{extension}"));
+    }
+
+    candidates.dedup();
+    candidates
+}
+
+fn find_archive_asset<'a>(
+    assets: &'a [super::types::ReleaseAsset],
+    version: &str,
+) -> Result<&'a super::types::ReleaseAsset, UpdateError> {
+    for candidate in archive_asset_candidates(version) {
+        if let Some(asset) = assets.iter().find(|asset| asset.name == candidate) {
+            return Ok(asset);
+        }
+    }
+
+    let extension = current_release_archive_extension();
+    let release_targets = current_release_targets();
+    if let Some(asset) = assets.iter().find(|asset| {
+        asset.name.ends_with(extension)
+            && release_targets
+                .iter()
+                .any(|target| asset.name.contains(target))
+    }) {
+        return Ok(asset);
+    }
+
+    Err(UpdateError::UnsupportedPlatform(format!(
+        "{} (release assets: {})",
+        current_target(),
+        release_targets.join(", ")
+    )))
+}
+
+fn find_checksum_asset<'a>(
+    assets: &'a [super::types::ReleaseAsset],
+    archive_asset: &super::types::ReleaseAsset,
+) -> Option<&'a super::types::ReleaseAsset> {
+    let checksum_candidates = [
+        format!("{}.sha256", archive_asset.name),
+        "SHA256SUMS".to_string(),
+        "checksums.txt".to_string(),
+    ];
+
+    checksum_candidates
+        .iter()
+        .find_map(|name| assets.iter().find(|asset| asset.name == *name))
+}
+
 /// Extract checksum for a specific file from a checksum file.
 async fn extract_checksum(checksum_file: &PathBuf, filename: &str) -> Result<String, UpdateError> {
     let content = tokio::fs::read_to_string(checksum_file)
@@ -227,8 +279,18 @@ async fn extract_checksum(checksum_file: &PathBuf, filename: &str) -> Result<Str
 
 #[cfg(test)]
 mod tests {
+    use super::super::types::ReleaseAsset;
     use super::*;
     use tempfile::TempDir;
+
+    fn test_asset(name: &str) -> ReleaseAsset {
+        ReleaseAsset {
+            name: name.to_string(),
+            browser_download_url: format!("https://example.invalid/{name}"),
+            size: 1,
+            content_type: "application/octet-stream".to_string(),
+        }
+    }
 
     #[tokio::test]
     async fn test_extract_checksum_standard_format() {
@@ -387,5 +449,62 @@ mod tests {
 
         let result = extract_checksum(&checksum_file.to_path_buf(), "rch.tar.gz").await;
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_archive_asset_candidates_include_static_linux_release_names() {
+        let candidates = archive_asset_candidates("1.0.13");
+        if std::env::consts::OS == "linux" && std::env::consts::ARCH == "x86_64" {
+            assert!(
+                candidates.contains(&"rch-v1.0.13-x86_64-unknown-linux-musl.tar.gz".to_string())
+            );
+            assert!(candidates.contains(&"rch-linux-x86_64.tar.gz".to_string()));
+        }
+    }
+
+    #[test]
+    fn test_find_archive_asset_matches_musl_release_for_linux_gnu_host() {
+        if !(std::env::consts::OS == "linux" && std::env::consts::ARCH == "x86_64") {
+            return;
+        }
+
+        let assets = vec![
+            test_asset("rch-v1.0.13-x86_64-unknown-linux-musl.tar.gz"),
+            test_asset("rch-v1.0.13-aarch64-apple-darwin.tar.gz"),
+        ];
+
+        let archive = find_archive_asset(&assets, "1.0.13").unwrap();
+        assert_eq!(archive.name, "rch-v1.0.13-x86_64-unknown-linux-musl.tar.gz");
+    }
+
+    #[test]
+    fn test_find_archive_asset_falls_back_to_unversioned_alias() {
+        let assets = vec![test_asset(&format!(
+            "rch-{}{}",
+            current_release_targets().last().unwrap(),
+            current_release_archive_extension()
+        ))];
+
+        let archive = find_archive_asset(&assets, "1.0.13").unwrap();
+        assert_eq!(archive.name, assets[0].name);
+    }
+
+    #[test]
+    fn test_find_checksum_asset_prefers_per_asset_then_manifest() {
+        let archive = test_asset("rch-v1.0.13-x86_64-unknown-linux-musl.tar.gz");
+        let per_asset_checksum = test_asset("rch-v1.0.13-x86_64-unknown-linux-musl.tar.gz.sha256");
+        let manifest = test_asset("SHA256SUMS");
+        let assets = vec![
+            archive.clone(),
+            manifest.clone(),
+            per_asset_checksum.clone(),
+        ];
+
+        let selected = find_checksum_asset(&assets, &archive).unwrap();
+        assert_eq!(selected.name, per_asset_checksum.name);
+
+        let assets = vec![archive.clone(), manifest.clone()];
+        let selected = find_checksum_asset(&assets, &archive).unwrap();
+        assert_eq!(selected.name, manifest.name);
     }
 }

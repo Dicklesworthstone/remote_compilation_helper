@@ -36,7 +36,7 @@ set -euo pipefail
 # Configuration
 # ============================================================================
 
-INSTALLER_VERSION="1.0.12"
+INSTALLER_VERSION="1.0.13"
 VERSION="${VERSION:-}"  # Set dynamically based on install mode
 REPO_URL="https://github.com/Dicklesworthstone/remote_compilation_helper"
 GITHUB_REPO="Dicklesworthstone/remote_compilation_helper"
@@ -660,6 +660,7 @@ download_binaries() {
     local downloaded=false
     local release_info=""
     local tag_name=""
+    local checksum_tag=""
     local asset_ext="${RELEASE_ARCHIVE_EXT}"
 
     TEMP_DIR=$(mktemp -d)
@@ -683,6 +684,7 @@ download_binaries() {
             downloaded=true
             asset_name="$versioned_asset"
             checksum_url="https://github.com/${GITHUB_REPO}/releases/download/${tag_name}/${versioned_asset}.sha256"
+            checksum_tag="$tag_name"
         fi
     fi
 
@@ -693,6 +695,7 @@ download_binaries() {
         if curl -fsSL "${PROXY_ARGS[@]}" "$latest_url" -o "$TEMP_DIR/$unversioned_asset" 2>/dev/null; then
             downloaded=true
             asset_name="$unversioned_asset"
+            checksum_tag="$tag_name"
         fi
     fi
 
@@ -704,6 +707,7 @@ download_binaries() {
         if curl -fsSL "${PROXY_ARGS[@]}" "$version_url" -o "$TEMP_DIR/$unversioned_asset" 2>/dev/null; then
             downloaded=true
             asset_name="$unversioned_asset"
+            checksum_tag="$version_tag"
         fi
     fi
 
@@ -715,10 +719,20 @@ download_binaries() {
         return
     fi
 
-    if [[ -n "$checksum_url" ]]; then
+    if [[ -n "$checksum_url" || -n "$checksum_tag" ]]; then
         info "Verifying checksum..."
         local expected=""
-        expected=$(curl -fsSL "${PROXY_ARGS[@]}" "$checksum_url" 2>/dev/null | cut -d' ' -f1 || true)
+        if [[ -n "$checksum_url" ]]; then
+            expected=$(curl -fsSL "${PROXY_ARGS[@]}" "$checksum_url" 2>/dev/null | cut -d' ' -f1 || true)
+        fi
+        if [[ -z "$expected" && -n "$checksum_tag" ]]; then
+            local manifest_url="https://github.com/${GITHUB_REPO}/releases/download/${checksum_tag}/SHA256SUMS"
+            local manifest_content=""
+            manifest_content=$(curl -fsSL "${PROXY_ARGS[@]}" "$manifest_url" 2>/dev/null || true)
+            if [[ -n "$manifest_content" ]]; then
+                expected=$(extract_checksum_from_manifest "$manifest_content" "$asset_name")
+            fi
+        fi
         if [[ -n "$expected" ]]; then
             local actual=""
             if command -v sha256sum >/dev/null 2>&1; then
@@ -921,6 +935,22 @@ verify_checksum() {
     fi
 
     success "Checksum verified"
+}
+
+extract_checksum_from_manifest() {
+    local manifest_content="$1"
+    local filename="$2"
+
+    printf '%s\n' "$manifest_content" | awk -v file="$filename" '
+        NF >= 2 {
+            checksum = $1
+            path = $NF
+            if (path == file || path ~ ("/" file "$") || path ~ ("\\\\" file "$")) {
+                print checksum
+                exit
+            }
+        }
+    '
 }
 
 # ============================================================================

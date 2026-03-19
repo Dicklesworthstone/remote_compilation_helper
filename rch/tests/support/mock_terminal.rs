@@ -108,25 +108,33 @@ impl Default for MockTerminal {
 
 /// Strip ANSI escape codes from a string.
 pub fn strip_ansi_codes(s: &str) -> String {
-    // Matches ANSI escape sequences: ESC [ ... final byte
     let mut result = String::with_capacity(s.len());
-    let mut in_escape = false;
+    let bytes = s.as_bytes();
+    let mut plain_start = 0;
+    let mut i = 0;
 
-    for c in s.chars() {
-        if in_escape {
-            // Wait for final byte (letter A-Z or a-z)
-            if c.is_ascii_alphabetic() {
-                in_escape = false;
+    while i < bytes.len() {
+        if bytes[i] == b'\x1b' {
+            result.push_str(&s[plain_start..i]);
+            i += 1;
+
+            while i < bytes.len() {
+                if bytes[i].is_ascii_alphabetic() {
+                    i += 1;
+                    break;
+                }
+                i += 1;
             }
-        } else if c == '\x1b' {
-            in_escape = true;
-        } else {
-            result.push(c);
+
+            plain_start = i;
+            continue;
         }
+
+        i += 1;
     }
 
-    // Handle incomplete escape sequences
-    result.replace("\x1b[", "")
+    result.push_str(&s[plain_start..]);
+    result
 }
 
 #[cfg(test)]
