@@ -26,6 +26,7 @@ toml = { workspace = true }
 directories = { workspace = true }
 notify = { workspace = true }
 chrono = { workspace = true }
+shell-escape = "0.1.5"
 
 [target.'cfg(unix)'.dependencies]
 openssh = { workspace = true }

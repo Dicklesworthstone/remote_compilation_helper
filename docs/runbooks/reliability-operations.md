@@ -98,6 +98,9 @@ ssh <user>@<host> 'df -h / /tmp'
 ssh <user>@<host> 'du -sh /tmp/rch-* /tmp/rch_target_* 2>/dev/null'
 ssh <user>@<host> 'find /data/projects -maxdepth 2 -type d \( -name "target_rch_*" -o -name "target_*" -o -name "target-*" -o -name target \) -exec du -sh {} + 2>/dev/null | sort -h | tail -n 20'
 
+# Reclaim incremental build state before deleting whole target trees
+ssh <user>@<host> 'cargo clean --manifest-path /tmp/rch/<project>/Cargo.toml'
+
 # Verify candidate is inactive before cleanup
 ssh <user>@<host> 'sudo lsof +D /tmp/rch_target_<name>'
 

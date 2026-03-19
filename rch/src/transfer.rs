@@ -579,6 +579,7 @@ impl TransferPipeline {
         format!("{}/{}/{}", base, self.project_id, self.project_hash)
     }
 
+    #[cfg(test)]
     pub fn remote_pgid_file_path(&self) -> Option<String> {
         self.build_id
             .map(|build_id| Self::remote_pgid_file_path_for_root(&self.remote_path(), build_id))

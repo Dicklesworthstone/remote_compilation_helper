@@ -435,6 +435,13 @@ mod tests {
             compilation: ConfigCompilationSection {
                 confidence_threshold: 0.8,
                 min_local_time_ms: 1000,
+                build_slots: 4,
+                test_slots: 8,
+                check_slots: 2,
+                build_timeout_sec: 300,
+                test_timeout_sec: 1800,
+                bun_timeout_sec: 600,
+                external_timeout_enabled: true,
             },
             transfer: ConfigTransferSection {
                 compression_level: 6,
