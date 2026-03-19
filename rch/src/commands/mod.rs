@@ -579,6 +579,13 @@ mod tests {
             compilation: ConfigCompilationSection {
                 confidence_threshold: 0.85,
                 min_local_time_ms: 2000,
+                build_slots: 4,
+                test_slots: 8,
+                check_slots: 2,
+                build_timeout_sec: 300,
+                test_timeout_sec: 1800,
+                bun_timeout_sec: 600,
+                external_timeout_enabled: true,
             },
             transfer: ConfigTransferSection {
                 compression_level: 3,
@@ -621,6 +628,8 @@ mod tests {
         let json = serde_json::to_value(&response).unwrap();
         assert!(json["general"]["enabled"].as_bool().unwrap());
         assert_eq!(json["compilation"]["confidence_threshold"], 0.85);
+        assert_eq!(json["compilation"]["build_timeout_sec"], 300);
+        assert_eq!(json["compilation"]["external_timeout_enabled"], true);
         assert_eq!(json["transfer"]["compression_level"], 3);
         assert_eq!(json["circuit"]["failure_threshold"], 3);
     }

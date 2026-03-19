@@ -4480,6 +4480,7 @@ async fn execute_remote_compilation(
         )
         .with_color_mode(color_mode)
         .with_command_timeout(command_timeout)
+        .with_compilation_config(compilation_config.clone())
         .with_compilation_kind(kind)
         .with_remote_path_override(entry.remote_root.clone())
         .with_build_id(build_id);
@@ -4916,6 +4917,7 @@ async fn execute_remote_compilation(
             )
             .with_color_mode(color_mode)
             .with_command_timeout(command_timeout)
+            .with_compilation_config(compilation_config.clone())
             .with_compilation_kind(kind)
             .with_remote_path_override(remote_target_path.clone());
 

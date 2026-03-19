@@ -214,6 +214,13 @@ pub struct ConfigGeneralSection {
 pub struct ConfigCompilationSection {
     pub confidence_threshold: f64,
     pub min_local_time_ms: u64,
+    pub build_slots: u32,
+    pub test_slots: u32,
+    pub check_slots: u32,
+    pub build_timeout_sec: u64,
+    pub test_timeout_sec: u64,
+    pub bun_timeout_sec: u64,
+    pub external_timeout_enabled: bool,
 }
 
 /// Transfer configuration section.

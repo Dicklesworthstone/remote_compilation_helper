@@ -120,6 +120,13 @@ pub fn config_show(show_sources: bool, ctx: &OutputContext) -> Result<()> {
             compilation: ConfigCompilationSection {
                 confidence_threshold: config.compilation.confidence_threshold,
                 min_local_time_ms: config.compilation.min_local_time_ms,
+                build_slots: config.compilation.build_slots,
+                test_slots: config.compilation.test_slots,
+                check_slots: config.compilation.check_slots,
+                build_timeout_sec: config.compilation.build_timeout_sec,
+                test_timeout_sec: config.compilation.test_timeout_sec,
+                bun_timeout_sec: config.compilation.bun_timeout_sec,
+                external_timeout_enabled: config.compilation.external_timeout_enabled,
             },
             transfer: ConfigTransferSection {
                 compression_level: config.transfer.compression_level,
@@ -243,6 +250,69 @@ pub fn config_show(show_sources: bool, ctx: &OutputContext) -> Result<()> {
         format_with_source(
             "compilation.min_local_time_ms",
             &style.value(&config.compilation.min_local_time_ms.to_string()),
+            &value_sources
+        )
+    );
+    println!(
+        "  {} = {}",
+        style.key("build_slots"),
+        format_with_source(
+            "compilation.build_slots",
+            &style.value(&config.compilation.build_slots.to_string()),
+            &value_sources
+        )
+    );
+    println!(
+        "  {} = {}",
+        style.key("test_slots"),
+        format_with_source(
+            "compilation.test_slots",
+            &style.value(&config.compilation.test_slots.to_string()),
+            &value_sources
+        )
+    );
+    println!(
+        "  {} = {}",
+        style.key("check_slots"),
+        format_with_source(
+            "compilation.check_slots",
+            &style.value(&config.compilation.check_slots.to_string()),
+            &value_sources
+        )
+    );
+    println!(
+        "  {} = {}",
+        style.key("build_timeout_sec"),
+        format_with_source(
+            "compilation.build_timeout_sec",
+            &style.value(&config.compilation.build_timeout_sec.to_string()),
+            &value_sources
+        )
+    );
+    println!(
+        "  {} = {}",
+        style.key("test_timeout_sec"),
+        format_with_source(
+            "compilation.test_timeout_sec",
+            &style.value(&config.compilation.test_timeout_sec.to_string()),
+            &value_sources
+        )
+    );
+    println!(
+        "  {} = {}",
+        style.key("bun_timeout_sec"),
+        format_with_source(
+            "compilation.bun_timeout_sec",
+            &style.value(&config.compilation.bun_timeout_sec.to_string()),
+            &value_sources
+        )
+    );
+    println!(
+        "  {} = {}",
+        style.key("external_timeout_enabled"),
+        format_with_source(
+            "compilation.external_timeout_enabled",
+            &style.value(&config.compilation.external_timeout_enabled.to_string()),
             &value_sources
         )
     );
@@ -1082,6 +1152,13 @@ pub fn config_export(format: &str, ctx: &OutputContext) -> Result<()> {
                     "compilation": {
                         "confidence_threshold": config.compilation.confidence_threshold,
                         "min_local_time_ms": config.compilation.min_local_time_ms,
+                        "build_slots": config.compilation.build_slots,
+                        "test_slots": config.compilation.test_slots,
+                        "check_slots": config.compilation.check_slots,
+                        "build_timeout_sec": config.compilation.build_timeout_sec,
+                        "test_timeout_sec": config.compilation.test_timeout_sec,
+                        "bun_timeout_sec": config.compilation.bun_timeout_sec,
+                        "external_timeout_enabled": config.compilation.external_timeout_enabled,
                     },
                     "transfer": {
                         "compression_level": config.transfer.compression_level,

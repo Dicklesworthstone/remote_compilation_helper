@@ -373,7 +373,6 @@ impl TransferPipeline {
     ///
     /// This allows customizing external timeout durations for different command
     /// types and enables/disables timeout wrapping entirely.
-    #[cfg(test)]
     pub fn with_compilation_config(mut self, config: rch_common::CompilationConfig) -> Self {
         self.compilation_config = config;
         self
