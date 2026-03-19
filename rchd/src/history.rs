@@ -31,6 +31,7 @@ pub struct ActiveBuildState {
     pub started_at: String,
     pub started_at_mono: Instant,
     pub hook_pid: u32,
+    pub remote_pgid_file: Option<String>,
     pub slots: u32,
     pub location: BuildLocation,
     pub heartbeat_phase: BuildHeartbeatPhase,
@@ -216,6 +217,7 @@ impl BuildHistory {
             started_at: started_at.clone(),
             started_at_mono,
             hook_pid,
+            remote_pgid_file: None,
             slots,
             location,
             heartbeat_phase: BuildHeartbeatPhase::SyncUp,
@@ -262,6 +264,12 @@ impl BuildHistory {
         // Keep hook PID in sync if the heartbeat carries it.
         if let Some(pid) = heartbeat.hook_pid.filter(|pid| *pid > 0) {
             state.hook_pid = pid;
+        }
+        if let Some(remote_pgid_file) = heartbeat
+            .remote_pgid_file
+            .filter(|path| !path.trim().is_empty())
+        {
+            state.remote_pgid_file = Some(remote_pgid_file);
         }
 
         let previous_phase = state.heartbeat_phase.clone();
@@ -1095,6 +1103,7 @@ mod tests {
                 build_id: build.id,
                 worker_id: rch_common::WorkerId::new("worker-a"),
                 hook_pid: Some(1234),
+                remote_pgid_file: Some("/tmp/rch/proj/hash/.rch-run/1.pgid".to_string()),
                 phase: BuildHeartbeatPhase::Execute,
                 detail: Some("Compiling".to_string()),
                 progress_counter: Some(3),
@@ -1106,6 +1115,10 @@ mod tests {
         assert_eq!(updated.heartbeat_counter, 3);
         assert_eq!(updated.heartbeat_percent, Some(25.0));
         assert_eq!(updated.heartbeat_count, 1);
+        assert_eq!(
+            updated.remote_pgid_file.as_deref(),
+            Some("/tmp/rch/proj/hash/.rch-run/1.pgid")
+        );
         assert_ne!(updated.last_progress_at, initial_progress_at);
     }
 
@@ -1126,6 +1139,7 @@ mod tests {
             build_id: build.id,
             worker_id: rch_common::WorkerId::new("worker-b"),
             hook_pid: Some(9999),
+            remote_pgid_file: None,
             phase: BuildHeartbeatPhase::Execute,
             detail: Some("Unexpected".to_string()),
             progress_counter: Some(1),

@@ -96,6 +96,7 @@ pub struct CancellationRecord {
     pub slots: u32,
     pub slots_released: u32,
     pub hook_pid: u32,
+    pub remote_pgid_file: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -303,6 +304,7 @@ impl CancellationOrchestrator {
         let project_id = active_build.project_id.clone();
         let slots = active_build.slots;
         let hook_pid = active_build.hook_pid;
+        let remote_pgid_file = active_build.remote_pgid_file.clone();
 
         // Create the cancellation record.
         let mut record = CancellationRecord {
@@ -318,6 +320,7 @@ impl CancellationOrchestrator {
             slots,
             slots_released: 0,
             hook_pid,
+            remote_pgid_file,
         };
 
         // Atomically check-and-insert: prevent concurrent double-cancellation
@@ -556,9 +559,8 @@ impl CancellationOrchestrator {
         let identity = config.identity_file.clone();
         drop(config);
 
-        // SSH kill command: kill all processes in the build's process group
-        // on the remote worker. Use pkill to match by the build_id marker
-        // that the hook sets in the remote process environment.
+        let remote_kill_script =
+            build_remote_kill_script(record.remote_pgid_file.as_deref(), record.build_id);
         let ssh_result = tokio::time::timeout(
             self.config.remote_kill_timeout,
             tokio::process::Command::new("ssh")
@@ -572,10 +574,7 @@ impl CancellationOrchestrator {
                     "-i",
                     &identity,
                     &format!("{}@{}", user, host),
-                    &format!(
-                        "pkill -9 -f 'RCH_BUILD_ID={};' 2>/dev/null; true",
-                        record.build_id
-                    ),
+                    &remote_kill_script,
                 ])
                 .output(),
         )
@@ -787,6 +786,25 @@ impl CancellationOrchestrator {
 
 // ── Process signal helpers ───────────────────────────────────────────────
 
+fn build_remote_kill_script(remote_pgid_file: Option<&str>, build_id: u64) -> String {
+    if let Some(remote_pgid_file) = remote_pgid_file {
+        let escaped_file = shell_escape::escape(std::borrow::Cow::from(remote_pgid_file));
+        return format!(
+            "sh -lc 'pgid_file={file}; \
+if [ ! -r \"$pgid_file\" ]; then exit 1; fi; \
+pgid=$(cat \"$pgid_file\" 2>/dev/null); \
+if [ -z \"$pgid\" ]; then exit 1; fi; \
+kill -TERM -- -\"$pgid\" 2>/dev/null || kill -TERM \"$pgid\" 2>/dev/null || exit 1; \
+sleep 1; \
+kill -KILL -- -\"$pgid\" 2>/dev/null || kill -KILL \"$pgid\" 2>/dev/null || true; \
+exit 0'",
+            file = escaped_file,
+        );
+    }
+
+    format!("pkill -9 -f 'RCH_BUILD_ID={build_id};'")
+}
+
 fn send_signal_to_process(pid: u32, force: bool) -> bool {
     if pid == 0 {
         return false;
@@ -939,7 +957,17 @@ mod tests {
             slots: 1,
             slots_released: 1,
             hook_pid: 12345,
+            remote_pgid_file: None,
         }
+    }
+
+    #[test]
+    fn test_build_remote_kill_script_prefers_recorded_pgid_file() {
+        let script = build_remote_kill_script(Some("/tmp/rch/project/.rch-run/42.pgid"), 42);
+        assert!(script.contains("pgid_file="));
+        assert!(script.contains("kill -TERM -- -\"$pgid\""));
+        assert!(script.contains("/tmp/rch/project/.rch-run/42.pgid"));
+        assert!(!script.contains("RCH_BUILD_ID=42;"));
     }
 
     // 1. Cancel of non-existent build → error response

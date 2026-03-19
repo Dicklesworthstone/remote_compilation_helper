@@ -540,6 +540,9 @@ pub struct BuildHeartbeatRequest {
     /// Hook process ID sending the heartbeat.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hook_pid: Option<u32>,
+    /// Remote file containing the process-group leader PID for cancellation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_pgid_file: Option<String>,
     /// Current build execution phase.
     pub phase: BuildHeartbeatPhase,
     /// Optional human-readable progress detail.
@@ -3108,6 +3111,7 @@ mod tests {
             build_id: 42,
             worker_id: WorkerId::new("worker-a"),
             hook_pid: Some(12345),
+            remote_pgid_file: Some("/tmp/rch/project/hash/.rch-run/42.pgid".to_string()),
             phase: BuildHeartbeatPhase::Execute,
             detail: Some("Compiling crates".to_string()),
             progress_counter: Some(7),
@@ -3118,6 +3122,10 @@ mod tests {
         let parsed: BuildHeartbeatRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.build_id, 42);
         assert_eq!(parsed.worker_id.as_str(), "worker-a");
+        assert_eq!(
+            parsed.remote_pgid_file,
+            Some("/tmp/rch/project/hash/.rch-run/42.pgid".to_string())
+        );
         assert_eq!(parsed.phase, BuildHeartbeatPhase::Execute);
         assert_eq!(parsed.progress_counter, Some(7));
         assert_eq!(parsed.progress_percent, Some(42.5));

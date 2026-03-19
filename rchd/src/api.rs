@@ -4971,6 +4971,7 @@ mod tests {
                 build_id: build.id,
                 worker_id: WorkerId::new("worker1"),
                 hook_pid: Some(43210),
+                remote_pgid_file: Some("/tmp/rch/test-project/hash/.rch-run/99.pgid".to_string()),
                 phase: rch_common::BuildHeartbeatPhase::Execute,
                 detail: Some("Compiling".to_string()),
                 progress_counter: Some(4),
@@ -4984,6 +4985,10 @@ mod tests {
         assert_eq!(
             active.heartbeat_phase,
             rch_common::BuildHeartbeatPhase::Execute
+        );
+        assert_eq!(
+            active.remote_pgid_file.as_deref(),
+            Some("/tmp/rch/test-project/hash/.rch-run/99.pgid")
         );
         assert_eq!(active.heartbeat_counter, 4);
         assert_eq!(active.heartbeat_percent, Some(18.0));
@@ -5011,6 +5016,7 @@ mod tests {
                 build_id: build.id,
                 worker_id: WorkerId::new("worker-x"),
                 hook_pid: Some(5555),
+                remote_pgid_file: None,
                 phase: rch_common::BuildHeartbeatPhase::Execute,
                 detail: Some("Mismatch".to_string()),
                 progress_counter: Some(2),

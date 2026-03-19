@@ -580,6 +580,15 @@ impl TransferPipeline {
         format!("{}/{}/{}", base, self.project_id, self.project_hash)
     }
 
+    pub fn remote_pgid_file_path(&self) -> Option<String> {
+        self.build_id
+            .map(|build_id| Self::remote_pgid_file_path_for_root(&self.remote_path(), build_id))
+    }
+
+    pub fn remote_pgid_file_path_for_root(remote_root: &str, build_id: u64) -> String {
+        format!("{remote_root}/.rch-run/{build_id}.pgid")
+    }
+
     /// Build the full remote command string with all wrappers.
     fn build_remote_command(&self, command: &str, toolchain: Option<&ToolchainInfo>) -> String {
         let remote_path = self.remote_path();
@@ -626,19 +635,34 @@ impl TransferPipeline {
         // Touching the remote root refreshes directory mtime so age-based cleanup
         // treats actively used caches as hot.
         // Wrap command to run in project directory.
-        let build_id_export = if let Some(id) = self.build_id {
-            format!("export RCH_BUILD_ID={}; ", id)
+        let execution_command = if let Some(build_id) = self.build_id {
+            let remote_pgid_file = Self::remote_pgid_file_path_for_root(&remote_path, build_id);
+            let remote_run_dir = format!("{remote_path}/.rch-run");
+            let escaped_pgid_file = escape(Cow::from(remote_pgid_file));
+            let escaped_run_dir = escape(Cow::from(remote_run_dir));
+            let escaped_command = escape(Cow::from(timeout_wrapped_command.as_str()));
+
+            format!(
+                "mkdir -p {} && rm -f {} && \
+if command -v setsid >/dev/null 2>&1; then \
+setsid sh -c 'echo $$ > \"$1\"; shift; exec \"$@\"' rch-build {} sh -lc {}; \
+else \
+sh -c 'echo $$ > \"$1\"; shift; exec \"$@\"' rch-build {} sh -lc {}; \
+fi",
+                escaped_run_dir,
+                escaped_pgid_file,
+                escaped_pgid_file,
+                escaped_command,
+                escaped_pgid_file,
+                escaped_command,
+            )
         } else {
-            String::new()
+            timeout_wrapped_command
         };
 
         format!(
-            "export LC_ALL=C; {}touch {} && cd {} && {}{}",
-            build_id_export,
-            escaped_remote_path,
-            escaped_remote_path,
-            ensure_dirs_command,
-            timeout_wrapped_command
+            "export LC_ALL=C; touch {} && cd {} && {}{}",
+            escaped_remote_path, escaped_remote_path, ensure_dirs_command, execution_command
         )
     }
 
@@ -2987,6 +3011,28 @@ mod tests {
         let command = pipeline.build_remote_command("cargo build", None);
         assert!(command.contains("RUSTFLAGS='-C target-cpu=native'"));
         assert!(command.contains("cargo build"));
+    }
+
+    #[test]
+    fn test_build_remote_command_records_remote_pgid_for_cancellation() {
+        let _guard = test_guard!();
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/tmp/project"),
+            "project".to_string(),
+            "hash".to_string(),
+            TransferConfig::default(),
+        )
+        .with_build_id(Some(42));
+
+        let command = pipeline.build_remote_command("cargo test --no-run", None);
+        let remote_pgid_file = pipeline
+            .remote_pgid_file_path()
+            .expect("build_id should enable remote pgid tracking");
+
+        assert!(command.contains(".rch-run/42.pgid"));
+        assert!(command.contains("echo $$ > \"$1\""));
+        assert!(command.contains("setsid sh -c"));
+        assert!(command.contains(&remote_pgid_file));
     }
 
     #[test]

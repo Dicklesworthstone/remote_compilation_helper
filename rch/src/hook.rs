@@ -4154,6 +4154,7 @@ struct BuildHeartbeatSnapshot {
     detail: Option<String>,
     progress_counter: u64,
     progress_percent: Option<f64>,
+    remote_pgid_file: Option<String>,
 }
 
 impl BuildHeartbeatSnapshot {
@@ -4163,6 +4164,7 @@ impl BuildHeartbeatSnapshot {
             detail: Some("build_started".to_string()),
             progress_counter: 0,
             progress_percent: None,
+            remote_pgid_file: None,
         }
     }
 
@@ -4174,6 +4176,10 @@ impl BuildHeartbeatSnapshot {
 
     fn note_progress(&mut self) {
         self.progress_counter = self.progress_counter.saturating_add(1);
+    }
+
+    fn set_remote_pgid_file(&mut self, remote_pgid_file: Option<String>) {
+        self.remote_pgid_file = remote_pgid_file;
     }
 }
 
@@ -4212,6 +4218,7 @@ impl BuildHeartbeatLoop {
                             build_id,
                             worker_id: worker_id_owned.clone(),
                             hook_pid: Some(hook_pid),
+                            remote_pgid_file: snapshot.remote_pgid_file.clone(),
                             phase: snapshot.phase,
                             detail: snapshot.detail,
                             progress_counter: Some(snapshot.progress_counter),
@@ -4248,12 +4255,20 @@ impl BuildHeartbeatLoop {
             .update_phase(phase, detail);
     }
 
+    fn set_remote_pgid_file(&self, remote_pgid_file: Option<String>) {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_remote_pgid_file(remote_pgid_file);
+    }
+
     async fn flush(&self) {
         let snapshot = { self.state.lock().unwrap_or_else(|e| e.into_inner()).clone() };
         let heartbeat = BuildHeartbeatRequest {
             build_id: self.build_id,
             worker_id: self.worker_id.clone(),
             hook_pid: Some(self.hook_pid),
+            remote_pgid_file: snapshot.remote_pgid_file.clone(),
             phase: snapshot.phase,
             detail: snapshot.detail,
             progress_counter: Some(snapshot.progress_counter),
@@ -4381,9 +4396,16 @@ async fn execute_remote_compilation(
     let feedback_visible = reporter.visibility != OutputVisibility::None && !console.is_machine();
     let progress_enabled =
         output_ctx.supports_rich() && reporter.visibility != OutputVisibility::None;
+    let remote_pgid_file = build_id.and_then(|id| {
+        sync_plan
+            .iter()
+            .find(|entry| entry.is_primary)
+            .map(|entry| TransferPipeline::remote_pgid_file_path_for_root(&entry.remote_root, id))
+    });
     let mut heartbeat_loop =
         build_id.map(|id| BuildHeartbeatLoop::start(socket_path, id, &worker_config.id));
     if let Some(loop_ref) = heartbeat_loop.as_ref() {
+        loop_ref.set_remote_pgid_file(remote_pgid_file);
         loop_ref.update_phase(BuildHeartbeatPhase::SyncUp, Some("sync_start".to_string()));
         loop_ref.flush().await;
     }
