@@ -101,6 +101,25 @@ open_cooldown_secs = 30
 half_open_max_probes = 1
 ```
 
+### `[path_topology]`
+- `canonical_root` (string, optional, default `"/data/projects"`) — Canonical
+  project root directory. Override this on systems where `/data/projects` is
+  unavailable (e.g., macOS with SIP).
+- `alias_root` (string, optional, default `"/dp"`) — Symlink alias root that
+  points at the canonical root.
+
+Environment variable overrides:
+- `RCH_CANONICAL_PROJECT_ROOT`
+- `RCH_ALIAS_PROJECT_ROOT`
+
+Example (macOS):
+
+```toml
+[path_topology]
+canonical_root = "/Users/me/Projects"
+alias_root = "/Users/me/p"
+```
+
 ## Workers Config (`workers.toml`)
 
 Location: `~/.config/rch/workers.toml`
@@ -156,6 +175,8 @@ These are read by the hook configuration loader:
 - `RCH_SOCKET_PATH`
 - `RCH_CONFIDENCE_THRESHOLD`
 - `RCH_COMPRESSION`
+- `RCH_CANONICAL_PROJECT_ROOT`
+- `RCH_ALIAS_PROJECT_ROOT`
 
 Note: `rch config export` currently outputs `RCH_DAEMON_SOCKET` and
 `RCH_TRANSFER_ZSTD_LEVEL`; the hook loader reads `RCH_SOCKET_PATH` and
