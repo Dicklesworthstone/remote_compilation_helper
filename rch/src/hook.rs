@@ -7634,11 +7634,13 @@ RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
             &[dep_b.clone(), project_root.clone(), dep_a.clone()],
             &project_root,
             project_hash,
+            &PathTopologyPolicy::default(),
         );
         let plan_b = build_sync_closure_plan(
             &[dep_a.clone(), dep_b.clone(), project_root.clone()],
             &project_root,
             project_hash,
+            &PathTopologyPolicy::default(),
         );
 
         assert_eq!(plan_a, plan_b, "sync closure plan should be deterministic");
@@ -7669,6 +7671,7 @@ RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
             &[dep_alias.clone(), dep.clone(), project_root.clone()],
             &project_root,
             "beefcafe",
+            &PathTopologyPolicy::default(),
         );
 
         let dep_entries = plan
@@ -9544,6 +9547,7 @@ RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
             &[dep_b.clone(), dep_a.clone(), project_root.clone()],
             &project_root,
             "abc123",
+            &PathTopologyPolicy::default(),
         );
         let manifest_a = build_sync_closure_manifest(&plan, &project_root);
         let manifest_b = build_sync_closure_manifest(&plan, &project_root);
@@ -9574,6 +9578,7 @@ RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
             std::slice::from_ref(&project_root),
             &project_root,
             "deadbeef",
+            &PathTopologyPolicy::default(),
         );
         let manifest = build_sync_closure_manifest(&plan, &project_root);
 
@@ -9596,6 +9601,7 @@ RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
             &[dep.clone(), project_root.clone()],
             &project_root,
             "cafe0001",
+            &PathTopologyPolicy::default(),
         );
         let manifest = build_sync_closure_manifest(&plan, &project_root);
 
@@ -9632,6 +9638,7 @@ RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
             &[dep.clone(), project_root.clone()],
             &project_root,
             "primary_hash",
+            &PathTopologyPolicy::default(),
         );
         let manifest = build_sync_closure_manifest(&plan, &project_root);
 
@@ -9658,7 +9665,7 @@ RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
 
         // Deliberately omit project_root from sync_roots list.
         let plan =
-            build_sync_closure_plan(std::slice::from_ref(&dep), &project_root, "hash_auto_add");
+            build_sync_closure_plan(std::slice::from_ref(&dep), &project_root, "hash_auto_add", &PathTopologyPolicy::default());
         let has_primary = plan.iter().any(|e| e.is_primary);
         assert!(
             has_primary,
@@ -9690,6 +9697,7 @@ RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
             ],
             &project_root,
             "diag_hash",
+            &PathTopologyPolicy::default(),
         );
 
         // Simulate outcomes: primary synced, one dep synced, one skipped, one failed.
@@ -9740,6 +9748,7 @@ RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
             &[dep.clone(), project_root.clone()],
             &project_root,
             "serial_hash",
+            &PathTopologyPolicy::default(),
         );
         let manifest = build_sync_closure_manifest(&plan, &project_root);
 
@@ -9824,6 +9833,7 @@ RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
             &[valid_dep.clone(), invalid_dep.clone(), project_root.clone()],
             &project_root,
             "topo_hash",
+            &PathTopologyPolicy::default(),
         );
 
         // The plan should contain the primary root and valid dep, but NOT the invalid dep.
@@ -9854,7 +9864,7 @@ RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
         let bad_dep_a = PathBuf::from("/home/user/dep_a");
         let bad_dep_b = PathBuf::from("/var/lib/dep_b");
 
-        let plan = build_sync_closure_plan(&[bad_dep_a, bad_dep_b], &project_root, "lonely_hash");
+        let plan = build_sync_closure_plan(&[bad_dep_a, bad_dep_b], &project_root, "lonely_hash", &PathTopologyPolicy::default());
 
         assert_eq!(plan.len(), 1, "only the primary root should remain");
         assert!(
@@ -10024,7 +10034,7 @@ RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
     fn test_plan_empty_sync_roots() {
         let _guard = test_guard!();
         let project_root = PathBuf::from("/data/projects/solo_project");
-        let plan = build_sync_closure_plan(&[], &project_root, "solo_hash");
+        let plan = build_sync_closure_plan(&[], &project_root, "solo_hash", &PathTopologyPolicy::default());
         assert_eq!(
             plan.len(),
             1,
@@ -10045,6 +10055,7 @@ RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
             std::slice::from_ref(&project_root),
             &project_root,
             "only_hash",
+            &PathTopologyPolicy::default(),
         );
         assert_eq!(plan.len(), 1);
         assert!(plan[0].is_primary);
@@ -10067,7 +10078,7 @@ RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
         roots.push(project_root.clone());
 
         let start = std::time::Instant::now();
-        let plan = build_sync_closure_plan(&roots, &project_root, "large_hash");
+        let plan = build_sync_closure_plan(&roots, &project_root, "large_hash", &PathTopologyPolicy::default());
         let elapsed = start.elapsed();
 
         // 100 deps + 1 primary (deduped) = 101 entries.
@@ -10101,6 +10112,7 @@ RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
             &[dep.clone(), dep.clone(), dep.clone(), project_root.clone()],
             &project_root,
             "dup_hash",
+            &PathTopologyPolicy::default(),
         );
 
         // dep appears 3 times in input but should be deduped to 1 entry + primary = 2.
@@ -10114,7 +10126,7 @@ RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
         if Path::new("/dp").exists() {
             let dp_path = PathBuf::from("/dp/remote_compilation_helper");
             let canonical = std::fs::canonicalize(&dp_path).expect("canonicalize /dp path");
-            let plan = build_sync_closure_plan(&[], &dp_path, "dp_hash");
+            let plan = build_sync_closure_plan(&[], &dp_path, "dp_hash", &PathTopologyPolicy::default());
             assert_eq!(plan.len(), 1);
             assert!(plan[0].is_primary);
             assert_eq!(
@@ -10139,6 +10151,7 @@ RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
                 &[dep_root.clone(), project_root.clone()],
                 &project_root,
                 "mapped_hash",
+                &PathTopologyPolicy::default(),
             );
 
             assert!(
@@ -10171,6 +10184,7 @@ RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
             &[dep_z, dep_a, dep_m, project_root.clone()],
             &project_root,
             "order_hash",
+            &PathTopologyPolicy::default(),
         );
 
         for window in plan.windows(2) {
@@ -10208,6 +10222,7 @@ RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
             std::slice::from_ref(&project_root),
             &project_root,
             "ts_hash",
+            &PathTopologyPolicy::default(),
         );
         let manifest = build_sync_closure_manifest(&plan, &project_root);
         let after_ms = SystemTime::now()
@@ -10240,7 +10255,7 @@ RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
         }
         roots.push(project_root.clone());
 
-        let plan = build_sync_closure_plan(&roots, &project_root, "seq_hash");
+        let plan = build_sync_closure_plan(&roots, &project_root, "seq_hash", &PathTopologyPolicy::default());
         let manifest = build_sync_closure_manifest(&plan, &project_root);
 
         // Order field should be 1-indexed and sequential.
@@ -10450,6 +10465,7 @@ RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
             ],
             &primary,
             "e2e_hash",
+            &PathTopologyPolicy::default(),
         );
 
         // Step 3: 3 entries (primary, dep_a, dep_b), /tmp excluded.
@@ -10545,6 +10561,7 @@ RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
             ],
             &primary,
             "topo_e2e_hash",
+            &PathTopologyPolicy::default(),
         );
 
         // Should contain primary + valid_root (deduped with alias) = 2 entries.
