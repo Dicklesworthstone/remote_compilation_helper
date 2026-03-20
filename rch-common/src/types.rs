@@ -740,15 +740,24 @@ pub struct PathTopologyConfig {
 impl PathTopologyConfig {
     /// Build a [`crate::path_topology::PathTopologyPolicy`] from this config,
     /// falling back to the compiled-in defaults for any field left unset.
+    ///
+    /// Empty strings are treated as unset (fall back to defaults).
+    /// Tilde prefixes (`~/...`) are expanded to the user's home directory.
     pub fn to_policy(&self) -> crate::path_topology::PathTopologyPolicy {
         let canonical = self
             .canonical_root
             .as_deref()
-            .unwrap_or(crate::path_topology::DEFAULT_CANONICAL_PROJECT_ROOT);
+            .filter(|s| !s.is_empty())
+            .map(|s| shellexpand::tilde(s).into_owned())
+            .unwrap_or_else(|| {
+                crate::path_topology::DEFAULT_CANONICAL_PROJECT_ROOT.to_string()
+            });
         let alias = self
             .alias_root
             .as_deref()
-            .unwrap_or(crate::path_topology::DEFAULT_ALIAS_PROJECT_ROOT);
+            .filter(|s| !s.is_empty())
+            .map(|s| shellexpand::tilde(s).into_owned())
+            .unwrap_or_else(|| crate::path_topology::DEFAULT_ALIAS_PROJECT_ROOT.to_string());
         crate::path_topology::PathTopologyPolicy::new(
             PathBuf::from(canonical),
             PathBuf::from(alias),

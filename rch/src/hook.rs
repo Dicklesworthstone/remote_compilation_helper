@@ -8,8 +8,8 @@ use crate::error::{ArtifactRetrievalWarning, DaemonError, TransferError};
 use crate::status_types::format_bytes;
 use crate::toolchain::detect_toolchain;
 use crate::transfer::{
-    SyncResult, TransferPipeline, compute_project_hash,
-    compute_project_hash_with_dependency_roots_and_policy, default_bun_artifact_patterns,
+    SyncResult, TransferPipeline, compute_project_hash_with_dependency_roots_and_policy,
+    default_bun_artifact_patterns,
     default_c_cpp_artifact_patterns, default_rust_artifact_patterns,
     default_rust_test_artifact_patterns, project_id_from_path,
 };
@@ -3761,7 +3761,11 @@ fn build_sync_closure_plan(
             let root_hash = if is_primary {
                 project_hash.to_string()
             } else {
-                compute_project_hash(&root)
+                compute_project_hash_with_dependency_roots_and_policy(
+                    &root,
+                    &[],
+                    topology_policy,
+                )
             };
             SyncClosurePlanEntry {
                 remote_root: map_sync_root_to_remote_root(&root, topology_policy),
@@ -4932,7 +4936,11 @@ async fn execute_remote_compilation(
             let target_pipeline = TransferPipeline::new(
                 local_target_dir.clone(),
                 project_id_from_path(local_target_dir),
-                compute_project_hash(local_target_dir),
+                compute_project_hash_with_dependency_roots_and_policy(
+                    local_target_dir,
+                    &[],
+                    topology_policy,
+                ),
                 transfer_config.clone(),
             )
             .with_color_mode(color_mode)

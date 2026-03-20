@@ -585,8 +585,17 @@ impl TransferPipeline {
             .map(|build_id| Self::remote_pgid_file_path_for_root(&self.remote_path(), build_id))
     }
 
+    pub fn remote_run_dir_for_root(remote_root: &str) -> String {
+        let project_id = project_id_from_path(Path::new(remote_root));
+        let hash = blake3::hash(remote_root.as_bytes()).to_hex();
+        format!("/tmp/rch-run/{}-{}", project_id, &hash[..16])
+    }
+
     pub fn remote_pgid_file_path_for_root(remote_root: &str, build_id: u64) -> String {
-        format!("{remote_root}/.rch-run/{build_id}.pgid")
+        format!(
+            "{}/{build_id}.pgid",
+            Self::remote_run_dir_for_root(remote_root)
+        )
     }
 
     /// Build the full remote command string with all wrappers.
@@ -637,7 +646,7 @@ impl TransferPipeline {
         // Wrap command to run in project directory.
         let execution_command = if let Some(build_id) = self.build_id {
             let remote_pgid_file = Self::remote_pgid_file_path_for_root(&remote_path, build_id);
-            let remote_run_dir = format!("{remote_path}/.rch-run");
+            let remote_run_dir = Self::remote_run_dir_for_root(&remote_path);
             let escaped_pgid_file = escape(Cow::from(remote_pgid_file));
             let escaped_run_dir = escape(Cow::from(remote_run_dir));
             let escaped_command = escape(Cow::from(timeout_wrapped_command.as_str()));
@@ -1998,6 +2007,10 @@ fn collect_hash_roots(
 ///
 /// The resulting value is deterministic across `/dp` vs `/data/projects` alias
 /// forms and changes when any tracked key file for any closure member changes.
+///
+/// Convenience wrapper using the default topology policy; production code
+/// should prefer [`compute_project_hash_with_dependency_roots_and_policy`].
+#[cfg(test)]
 pub fn compute_project_hash_with_dependency_roots(
     project_path: &Path,
     dependency_roots: &[PathBuf],
@@ -2030,6 +2043,10 @@ pub fn compute_project_hash_with_dependency_roots_and_policy(
 }
 
 /// Compute a hash of the project for cache invalidation.
+///
+/// Convenience wrapper using the default topology policy; production code
+/// should prefer [`compute_project_hash_with_dependency_roots_and_policy`].
+#[cfg(test)]
 pub fn compute_project_hash(project_path: &Path) -> String {
     compute_project_hash_with_dependency_roots(project_path, &[])
 }
@@ -3046,7 +3063,8 @@ mod tests {
             .remote_pgid_file_path()
             .expect("build_id should enable remote pgid tracking");
 
-        assert!(command.contains(".rch-run/42.pgid"));
+        assert!(command.contains("/tmp/rch-run/"));
+        assert!(!command.contains("/.rch-run/"));
         assert!(command.contains("echo $$ > \"$1\""));
         assert!(command.contains("setsid sh -c"));
         assert!(command.contains(&remote_pgid_file));
