@@ -1953,8 +1953,8 @@ where
     Ok((combined, start.elapsed().as_millis() as u64))
 }
 
-fn normalize_hash_root(path: &Path) -> PathBuf {
-    normalize_project_path_with_policy(path, &PathTopologyPolicy::default())
+fn normalize_hash_root(path: &Path, policy: &PathTopologyPolicy) -> PathBuf {
+    normalize_project_path_with_policy(path, policy)
         .map(|normalized| normalized.canonical_path().to_path_buf())
         .or_else(|_| std::fs::canonicalize(path))
         .unwrap_or_else(|_| path.to_path_buf())
@@ -1981,11 +1981,15 @@ fn update_hasher_with_file_fingerprint(hasher: &mut blake3::Hasher, file_path: &
     }
 }
 
-fn collect_hash_roots(project_path: &Path, dependency_roots: &[PathBuf]) -> Vec<PathBuf> {
+fn collect_hash_roots(
+    project_path: &Path,
+    dependency_roots: &[PathBuf],
+    policy: &PathTopologyPolicy,
+) -> Vec<PathBuf> {
     let mut roots = BTreeSet::new();
-    roots.insert(normalize_hash_root(project_path));
+    roots.insert(normalize_hash_root(project_path, policy));
     for root in dependency_roots {
-        roots.insert(normalize_hash_root(root));
+        roots.insert(normalize_hash_root(root, policy));
     }
     roots.into_iter().collect()
 }
@@ -1998,10 +2002,23 @@ pub fn compute_project_hash_with_dependency_roots(
     project_path: &Path,
     dependency_roots: &[PathBuf],
 ) -> String {
+    compute_project_hash_with_dependency_roots_and_policy(
+        project_path,
+        dependency_roots,
+        &PathTopologyPolicy::default(),
+    )
+}
+
+/// Compute a project hash using an explicit topology policy.
+pub fn compute_project_hash_with_dependency_roots_and_policy(
+    project_path: &Path,
+    dependency_roots: &[PathBuf],
+    policy: &PathTopologyPolicy,
+) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"rch-project-hash-v2");
 
-    for root in collect_hash_roots(project_path, dependency_roots) {
+    for root in collect_hash_roots(project_path, dependency_roots, policy) {
         hasher.update(b"\0root\0");
         hasher.update(root.to_string_lossy().as_bytes());
         for filename in PROJECT_HASH_KEY_FILES {

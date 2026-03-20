@@ -8,8 +8,9 @@ use crate::error::{ArtifactRetrievalWarning, DaemonError, TransferError};
 use crate::status_types::format_bytes;
 use crate::toolchain::detect_toolchain;
 use crate::transfer::{
-    SyncResult, TransferPipeline, compute_project_hash, compute_project_hash_with_dependency_roots,
-    default_bun_artifact_patterns, default_c_cpp_artifact_patterns, default_rust_artifact_patterns,
+    SyncResult, TransferPipeline, compute_project_hash,
+    compute_project_hash_with_dependency_roots_and_policy, default_bun_artifact_patterns,
+    default_c_cpp_artifact_patterns, default_rust_artifact_patterns,
     default_rust_test_artifact_patterns, project_id_from_path,
 };
 use crate::ui::console::RchConsole;
@@ -291,6 +292,7 @@ pub async fn run_exec(command_parts: Vec<String>) -> anyhow::Result<()> {
     );
 
     // Execute remote compilation pipeline
+    let topology_policy = config.path_topology.to_policy();
     let remote_start = Instant::now();
     let result = execute_remote_compilation(
         &worker,
@@ -305,6 +307,7 @@ pub async fn run_exec(command_parts: Vec<String>) -> anyhow::Result<()> {
         &config.general.socket_path,
         config.output.color_mode,
         response.build_id,
+        &topology_policy,
     )
     .await;
     let remote_elapsed = remote_start.elapsed();
@@ -1748,6 +1751,7 @@ async fn handle_selection_response(
     );
 
     // Execute remote compilation pipeline
+    let topology_policy = config.path_topology.to_policy();
     let remote_start = Instant::now();
     let result = execute_remote_compilation(
         &worker,
@@ -1762,6 +1766,7 @@ async fn handle_selection_response(
         &config.general.socket_path,
         config.output.color_mode,
         response.build_id,
+        &topology_policy,
     )
     .await;
     let remote_elapsed = remote_start.elapsed();
@@ -2454,8 +2459,11 @@ fn command_uses_cargo_dependency_graph(kind: Option<CompilationKind>) -> bool {
     )
 }
 
-fn normalize_dependency_root_for_runtime(root: &Path) -> Option<PathBuf> {
-    normalize_project_path_with_policy(root, &PathTopologyPolicy::default())
+fn normalize_dependency_root_for_runtime(
+    root: &Path,
+    policy: &PathTopologyPolicy,
+) -> Option<PathBuf> {
+    normalize_project_path_with_policy(root, policy)
         .ok()
         .map(|normalized| normalized.canonical_path().to_path_buf())
 }
@@ -2464,6 +2472,7 @@ fn build_dependency_runtime_plan(
     normalized_project_root: &Path,
     kind: Option<CompilationKind>,
     reporter: &HookReporter,
+    topology_policy: &PathTopologyPolicy,
 ) -> DependencyRuntimePlan {
     if !command_uses_cargo_dependency_graph(kind) {
         return DependencyRuntimePlan {
@@ -2474,7 +2483,7 @@ fn build_dependency_runtime_plan(
 
     let plan = build_dependency_closure_plan_with_policy(
         normalized_project_root,
-        &PathTopologyPolicy::default(),
+        topology_policy,
     );
     if !plan.is_ready() {
         if let Some(reason) = &plan.fail_open_reason {
@@ -2503,7 +2512,8 @@ fn build_dependency_runtime_plan(
     let mut seen = std::collections::BTreeSet::<PathBuf>::new();
     let mut ordered = Vec::<PathBuf>::new();
     for action in &plan.sync_order {
-        if let Some(root) = normalize_dependency_root_for_runtime(&action.package_root)
+        if let Some(root) =
+            normalize_dependency_root_for_runtime(&action.package_root, topology_policy)
             && seen.insert(root.clone())
         {
             reporter.verbose(&format!(
@@ -3678,8 +3688,8 @@ fn build_dependency_preflight_report(
     }
 }
 
-fn canonicalize_sync_root_for_plan(root: &Path) -> PathBuf {
-    normalize_dependency_root_for_runtime(root)
+fn canonicalize_sync_root_for_plan(root: &Path, policy: &PathTopologyPolicy) -> PathBuf {
+    normalize_dependency_root_for_runtime(root, policy)
         .or_else(|| std::fs::canonicalize(root).ok())
         .unwrap_or_else(|| root.to_path_buf())
 }
@@ -3723,25 +3733,25 @@ fn build_sync_closure_plan(
     sync_roots: &[PathBuf],
     normalized_project_root: &Path,
     project_hash: &str,
+    topology_policy: &PathTopologyPolicy,
 ) -> Vec<SyncClosurePlanEntry> {
-    let policy = PathTopologyPolicy::default();
     let mut ordered_roots = std::collections::BTreeSet::<PathBuf>::new();
     for root in sync_roots {
-        let canonicalized = canonicalize_sync_root_for_plan(root);
-        if !is_within_sync_topology(&canonicalized, &policy) {
+        let canonicalized = canonicalize_sync_root_for_plan(root, topology_policy);
+        if !is_within_sync_topology(&canonicalized, topology_policy) {
             warn!(
                 "Dependency root {} (canonicalized: {}) is outside allowed topology ({} / {}); skipping from sync closure",
                 root.display(),
                 canonicalized.display(),
-                policy.canonical_root().display(),
-                policy.alias_root().display(),
+                topology_policy.canonical_root().display(),
+                topology_policy.alias_root().display(),
             );
             continue;
         }
         ordered_roots.insert(canonicalized);
     }
 
-    let primary_root = canonicalize_sync_root_for_plan(normalized_project_root);
+    let primary_root = canonicalize_sync_root_for_plan(normalized_project_root, topology_policy);
     ordered_roots.insert(primary_root.clone());
 
     ordered_roots
@@ -3754,7 +3764,7 @@ fn build_sync_closure_plan(
                 compute_project_hash(&root)
             };
             SyncClosurePlanEntry {
-                remote_root: map_sync_root_to_remote_root(&root, &policy),
+                remote_root: map_sync_root_to_remote_root(&root, topology_policy),
                 project_id: project_id_from_path(&root),
                 root_hash,
                 is_primary,
@@ -4334,25 +4344,28 @@ async fn execute_remote_compilation(
     socket_path: &str,
     color_mode: ColorMode,
     build_id: Option<u64>,
+    topology_policy: &PathTopologyPolicy,
 ) -> anyhow::Result<RemoteExecutionResult> {
     let worker_config = selected_worker_to_config(worker);
 
     // Get current working directory and normalize it to the canonical project root.
     let project_root =
         std::env::current_dir().map_err(|e| TransferError::NoProjectRoot { source: e })?;
-    let normalized_project = normalize_project_path(&project_root).map_err(|e| {
-        anyhow::anyhow!(
-            "Project path normalization failed for {}: {}",
-            project_root.display(),
-            e
-        )
-    })?;
+    let normalized_project =
+        normalize_project_path_with_policy(&project_root, topology_policy).map_err(|e| {
+            anyhow::anyhow!(
+                "Project path normalization failed for {}: {}",
+                project_root.display(),
+                e
+            )
+        })?;
     for decision in normalized_project.decision_trace() {
         reporter.verbose(&format!("[RCH] project path normalized: {}", decision));
     }
     let normalized_project_root = normalized_project.canonical_path().to_path_buf();
 
-    let dependency_plan = build_dependency_runtime_plan(&normalized_project_root, kind, reporter);
+    let dependency_plan =
+        build_dependency_runtime_plan(&normalized_project_root, kind, reporter, topology_policy);
     if let Some(decision) = dependency_plan.fail_open_decision.as_ref() {
         let report = build_dependency_runtime_fail_open_report(
             &worker_config,
@@ -4381,10 +4394,17 @@ async fn execute_remote_compilation(
     }
     let raw_sync_roots = dependency_plan.sync_roots;
     let project_id = project_id_from_path(&normalized_project_root);
-    let project_hash =
-        compute_project_hash_with_dependency_roots(&normalized_project_root, &raw_sync_roots);
-    let sync_plan =
-        build_sync_closure_plan(&raw_sync_roots, &normalized_project_root, &project_hash);
+    let project_hash = compute_project_hash_with_dependency_roots_and_policy(
+        &normalized_project_root,
+        &raw_sync_roots,
+        topology_policy,
+    );
+    let sync_plan = build_sync_closure_plan(
+        &raw_sync_roots,
+        &normalized_project_root,
+        &project_hash,
+        topology_policy,
+    );
     let sync_roots = sync_plan
         .iter()
         .map(|entry| entry.local_root.clone())
@@ -7709,6 +7729,7 @@ RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
             &socket_path,
             ColorMode::Auto,
             None,
+            &PathTopologyPolicy::default(),
         )
         .await;
 
@@ -9851,7 +9872,8 @@ RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
         let dir = temp_dir.path().join("real_dir");
         std::fs::create_dir_all(&dir).expect("create dir");
 
-        let result = canonicalize_sync_root_for_plan(&dir);
+        let policy = rch_common::path_topology::PathTopologyPolicy::default();
+        let result = canonicalize_sync_root_for_plan(&dir, &policy);
         // Should be a canonical absolute path containing the dir name.
         assert!(result.is_absolute());
         assert!(
@@ -9865,7 +9887,8 @@ RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
     fn test_canonicalize_nonexistent_path() {
         let _guard = test_guard!();
         let path = PathBuf::from("/data/projects/does_not_exist_xyz_12345");
-        let result = canonicalize_sync_root_for_plan(&path);
+        let policy = rch_common::path_topology::PathTopologyPolicy::default();
+        let result = canonicalize_sync_root_for_plan(&path, &policy);
         // Fallback: should return original path since normalize and canonicalize both fail.
         assert_eq!(result, path);
     }
@@ -9877,9 +9900,10 @@ RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
         let dir = temp_dir.path().join("trail");
         std::fs::create_dir_all(&dir).expect("create dir");
 
+        let policy = rch_common::path_topology::PathTopologyPolicy::default();
         let with_trailing = PathBuf::from(format!("{}/", dir.display()));
-        let without_trailing = canonicalize_sync_root_for_plan(&dir);
-        let with_result = canonicalize_sync_root_for_plan(&with_trailing);
+        let without_trailing = canonicalize_sync_root_for_plan(&dir, &policy);
+        let with_result = canonicalize_sync_root_for_plan(&with_trailing, &policy);
         // Both should resolve to the same canonical path.
         assert_eq!(with_result, without_trailing);
     }
@@ -9896,8 +9920,9 @@ RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
         std::fs::create_dir_all(&real_dir).expect("create real dir");
         symlink(&real_dir, &link_dir).expect("create symlink");
 
-        let from_real = canonicalize_sync_root_for_plan(&real_dir);
-        let from_link = canonicalize_sync_root_for_plan(&link_dir);
+        let policy = rch_common::path_topology::PathTopologyPolicy::default();
+        let from_real = canonicalize_sync_root_for_plan(&real_dir, &policy);
+        let from_link = canonicalize_sync_root_for_plan(&link_dir, &policy);
         assert_eq!(
             from_real, from_link,
             "symlink and real path should canonicalize to the same path"
@@ -9912,7 +9937,8 @@ RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
         if Path::new("/dp").exists() {
             let dp_path = PathBuf::from("/dp/remote_compilation_helper");
             let canonical = PathBuf::from("/data/projects/remote_compilation_helper");
-            let result = canonicalize_sync_root_for_plan(&dp_path);
+            let policy = rch_common::path_topology::PathTopologyPolicy::default();
+            let result = canonicalize_sync_root_for_plan(&dp_path, &policy);
             assert_eq!(
                 result, canonical,
                 "/dp alias should resolve to /data/projects"

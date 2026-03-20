@@ -1127,6 +1127,18 @@ fn merge_config(mut base: RchConfig, overlay: RchConfig) -> RchConfig {
     // Merge self-test section
     merge_self_test(&mut base.self_test, &overlay.self_test, &default.self_test);
 
+    // Merge path_topology section (overlay wins when set)
+    if overlay.path_topology.canonical_root.is_some() {
+        base.path_topology
+            .canonical_root
+            .clone_from(&overlay.path_topology.canonical_root);
+    }
+    if overlay.path_topology.alias_root.is_some() {
+        base.path_topology
+            .alias_root
+            .clone_from(&overlay.path_topology.alias_root);
+    }
+
     base
 }
 
@@ -1683,6 +1695,28 @@ fn apply_env_overrides_inner(
                 sources,
                 "self_healing.auto_start_timeout_secs",
                 ConfigValueSource::EnvVar("RCH_AUTO_START_TIMEOUT_SECS".to_string()),
+            );
+        }
+    }
+
+    // Path topology overrides
+    if let Some(val) = get_env("RCH_CANONICAL_PROJECT_ROOT") {
+        config.path_topology.canonical_root = Some(val);
+        if let Some(ref mut sources) = sources {
+            set_source(
+                sources,
+                "path_topology.canonical_root",
+                ConfigValueSource::EnvVar("RCH_CANONICAL_PROJECT_ROOT".to_string()),
+            );
+        }
+    }
+    if let Some(val) = get_env("RCH_ALIAS_PROJECT_ROOT") {
+        config.path_topology.alias_root = Some(val);
+        if let Some(ref mut sources) = sources {
+            set_source(
+                sources,
+                "path_topology.alias_root",
+                ConfigValueSource::EnvVar("RCH_ALIAS_PROJECT_ROOT".to_string()),
             );
         }
     }

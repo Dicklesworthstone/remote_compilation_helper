@@ -712,6 +712,50 @@ impl WorkerCapabilities {
     }
 }
 
+/// Path topology configuration.
+///
+/// Overrides the default canonical and alias project roots used by
+/// [`crate::path_topology::PathTopologyPolicy`].  This is useful on platforms
+/// such as macOS where SIP prevents using `/data/projects` and the user must
+/// choose a different root (e.g. `~/Projects`).
+///
+/// ```toml
+/// [path_topology]
+/// canonical_root = "/Users/me/Projects"
+/// alias_root = "/Users/me/p"
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PathTopologyConfig {
+    /// Canonical project root directory.
+    /// Defaults to `/data/projects` when absent.
+    #[serde(default)]
+    pub canonical_root: Option<String>,
+
+    /// Alias (symlink) root that points at the canonical root.
+    /// Defaults to `/dp` when absent.
+    #[serde(default)]
+    pub alias_root: Option<String>,
+}
+
+impl PathTopologyConfig {
+    /// Build a [`crate::path_topology::PathTopologyPolicy`] from this config,
+    /// falling back to the compiled-in defaults for any field left unset.
+    pub fn to_policy(&self) -> crate::path_topology::PathTopologyPolicy {
+        let canonical = self
+            .canonical_root
+            .as_deref()
+            .unwrap_or(crate::path_topology::DEFAULT_CANONICAL_PROJECT_ROOT);
+        let alias = self
+            .alias_root
+            .as_deref()
+            .unwrap_or(crate::path_topology::DEFAULT_ALIAS_PROJECT_ROOT);
+        crate::path_topology::PathTopologyPolicy::new(
+            PathBuf::from(canonical),
+            PathBuf::from(alias),
+        )
+    }
+}
+
 /// RCH configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RchConfig {
@@ -743,6 +787,9 @@ pub struct RchConfig {
     /// Fleet operation configuration (bd-rs7w.2).
     #[serde(default)]
     pub fleet: FleetConfig,
+    /// Path topology overrides for project root directories.
+    #[serde(default)]
+    pub path_topology: PathTopologyConfig,
 }
 
 /// Worker health alerting configuration.
