@@ -2673,8 +2673,15 @@ async fn ensure_worker_projects_topology(
     Ok(())
 }
 
-async fn collect_repo_updater_specs(sync_roots: &[PathBuf]) -> Vec<String> {
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RepoUpdaterSyncRoots {
+    roots: Vec<PathBuf>,
+    specs: Vec<String>,
+}
+
+async fn collect_repo_updater_roots_and_specs(sync_roots: &[PathBuf]) -> RepoUpdaterSyncRoots {
     let mut specs = std::collections::BTreeSet::new();
+    let mut roots = Vec::new();
 
     for root in sync_roots {
         let output = Command::new("git")
@@ -2694,11 +2701,15 @@ async fn collect_repo_updater_specs(sync_roots: &[PathBuf]) -> Vec<String> {
         }
         let remote = String::from_utf8_lossy(&output.stdout).trim().to_string();
         if !remote.is_empty() {
+            roots.push(root.clone());
             specs.insert(remote);
         }
     }
 
-    specs.into_iter().collect()
+    RepoUpdaterSyncRoots {
+        roots,
+        specs: specs.into_iter().collect(),
+    }
 }
 
 async fn detect_dirty_sync_roots(sync_roots: &[PathBuf]) -> Vec<PathBuf> {
@@ -3306,7 +3317,13 @@ async fn maybe_sync_repo_set_with_repo_updater(
         return;
     }
 
-    let dirty_roots = detect_dirty_sync_roots(sync_roots).await;
+    let repo_updater_roots = collect_repo_updater_roots_and_specs(sync_roots).await;
+    if repo_updater_roots.specs.is_empty() {
+        reporter.verbose("[RCH] repo_updater pre-sync skipped (no git origin remotes found)");
+        return;
+    }
+
+    let dirty_roots = detect_dirty_sync_roots(&repo_updater_roots.roots).await;
     if !dirty_roots.is_empty() {
         let joined = dirty_roots
             .iter()
@@ -3319,7 +3336,8 @@ async fn maybe_sync_repo_set_with_repo_updater(
         return;
     }
 
-    let remote_unsuitable_roots = detect_remote_unsuitable_sync_roots(worker, sync_roots).await;
+    let remote_unsuitable_roots =
+        detect_remote_unsuitable_sync_roots(worker, &repo_updater_roots.roots).await;
     if !remote_unsuitable_roots.is_empty() {
         let joined = remote_unsuitable_roots
             .iter()
@@ -3330,12 +3348,6 @@ async fn maybe_sync_repo_set_with_repo_updater(
             "[RCH] repo_updater pre-sync skipped (dirty/broken remote sync roots on {}: {joined})",
             worker.id
         ));
-        return;
-    }
-
-    let repo_specs = collect_repo_updater_specs(sync_roots).await;
-    if repo_specs.is_empty() {
-        reporter.verbose("[RCH] repo_updater pre-sync skipped (no git origin remotes found)");
         return;
     }
 
@@ -3369,7 +3381,7 @@ async fn maybe_sync_repo_set_with_repo_updater(
 
     auto_tune_repo_updater_contract(
         &mut contract,
-        &repo_specs,
+        &repo_updater_roots.specs,
         auth_context.as_ref(),
         has_explicit_allowlist,
         has_explicit_auth_mode,
@@ -3386,8 +3398,8 @@ async fn maybe_sync_repo_set_with_repo_updater(
         command,
         requested_at_unix_ms: now_ms,
         projects_root: PathBuf::from(REPO_UPDATER_CANONICAL_PROJECTS_ROOT),
-        repo_specs,
-        idempotency_key: build_repo_sync_idempotency_key(&worker.id, sync_roots),
+        repo_specs: repo_updater_roots.specs.clone(),
+        idempotency_key: build_repo_sync_idempotency_key(&worker.id, &repo_updater_roots.roots),
         retry_attempt: 0,
         timeout_secs,
         expected_output_format: RepoUpdaterOutputFormat::Json,
@@ -3419,7 +3431,7 @@ async fn maybe_sync_repo_set_with_repo_updater(
         worker,
         &contract,
         &request,
-        sync_roots,
+        &repo_updater_roots.roots,
         RepoUpdaterAdapterCommand::SyncDryRun,
         reporter,
     )
@@ -3434,7 +3446,7 @@ async fn maybe_sync_repo_set_with_repo_updater(
         worker,
         &contract,
         &request,
-        sync_roots,
+        &repo_updater_roots.roots,
         RepoUpdaterAdapterCommand::SyncApply,
         reporter,
     )
@@ -3445,7 +3457,7 @@ async fn maybe_sync_repo_set_with_repo_updater(
             worker,
             &contract,
             &request,
-            sync_roots,
+            &repo_updater_roots.roots,
             RepoUpdaterAdapterCommand::StatusNoFetch,
             reporter,
         )
@@ -7006,6 +7018,68 @@ The file `x11.pc` needs to be installed and the PKG_CONFIG_PATH environment vari
                 "/data/projects/remote_compilation_helper/tmp/custom-target"
             ))
         );
+    }
+
+    #[tokio::test]
+    async fn test_collect_repo_updater_roots_and_specs_filters_to_git_roots_with_origin() {
+        let _guard = test_guard!();
+        let temp_dir = tempfile::tempdir().expect("temp dir should be creatable");
+        let with_origin = temp_dir.path().join("with_origin");
+        let duplicate_origin = temp_dir.path().join("duplicate_origin");
+        let without_origin = temp_dir.path().join("without_origin");
+        let not_git = temp_dir.path().join("not_git");
+
+        std::fs::create_dir_all(&with_origin).expect("create with_origin");
+        std::fs::create_dir_all(&duplicate_origin).expect("create duplicate_origin");
+        std::fs::create_dir_all(&without_origin).expect("create without_origin");
+        std::fs::create_dir_all(&not_git).expect("create not_git");
+
+        for repo in [&with_origin, &duplicate_origin, &without_origin] {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .arg("init")
+                .arg("-q")
+                .status()
+                .expect("git init should run");
+            assert!(
+                status.success(),
+                "git init should succeed for {}",
+                repo.display()
+            );
+        }
+
+        let origin_url = "git@github.com:example/repo-with-origin.git";
+        for repo in [&with_origin, &duplicate_origin] {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .arg("remote")
+                .arg("add")
+                .arg("origin")
+                .arg(origin_url)
+                .status()
+                .expect("git remote add should run");
+            assert!(
+                status.success(),
+                "git remote add should succeed for {}",
+                repo.display()
+            );
+        }
+
+        let collected = collect_repo_updater_roots_and_specs(&[
+            with_origin.clone(),
+            without_origin.clone(),
+            not_git.clone(),
+            duplicate_origin.clone(),
+        ])
+        .await;
+
+        assert_eq!(
+            collected.roots,
+            vec![with_origin.clone(), duplicate_origin.clone()]
+        );
+        assert_eq!(collected.specs, vec![origin_url.to_string()]);
     }
 
     #[test]
