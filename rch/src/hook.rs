@@ -9,8 +9,7 @@ use crate::status_types::format_bytes;
 use crate::toolchain::detect_toolchain;
 use crate::transfer::{
     SyncResult, TransferPipeline, compute_project_hash_with_dependency_roots_and_policy,
-    default_bun_artifact_patterns,
-    default_c_cpp_artifact_patterns, default_rust_artifact_patterns,
+    default_bun_artifact_patterns, default_c_cpp_artifact_patterns, default_rust_artifact_patterns,
     default_rust_test_artifact_patterns, project_id_from_path,
 };
 use crate::ui::console::RchConsole;
@@ -2481,10 +2480,7 @@ fn build_dependency_runtime_plan(
         };
     }
 
-    let plan = build_dependency_closure_plan_with_policy(
-        normalized_project_root,
-        topology_policy,
-    );
+    let plan = build_dependency_closure_plan_with_policy(normalized_project_root, topology_policy);
     if !plan.is_ready() {
         if let Some(reason) = &plan.fail_open_reason {
             reporter.verbose(&format!(
@@ -2731,6 +2727,39 @@ async fn detect_dirty_sync_roots(sync_roots: &[PathBuf]) -> Vec<PathBuf> {
     }
 
     dirty
+}
+
+async fn detect_remote_unsuitable_sync_roots(
+    worker: &WorkerConfig,
+    sync_roots: &[PathBuf],
+) -> Vec<(PathBuf, String)> {
+    let mut unsuitable = Vec::new();
+
+    for root in sync_roots {
+        let escaped_root = shell_escape::escape(root.to_string_lossy().into()).to_string();
+        let command = format!("git -C {escaped_root} status --porcelain");
+
+        match run_worker_ssh_command(worker, &command, Duration::from_secs(10)).await {
+            Ok(output) if output.status.success() => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                if !stdout.trim().is_empty() {
+                    unsuitable.push((root.clone(), "dirty".to_string()));
+                }
+            }
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                let reason = if stderr.is_empty() {
+                    format!("git status failed with exit {:?}", output.status.code())
+                } else {
+                    format!("git status failed: {stderr}")
+                };
+                unsuitable.push((root.clone(), reason));
+            }
+            Err(err) => unsuitable.push((root.clone(), format!("status probe error: {err}"))),
+        }
+    }
+
+    unsuitable
 }
 
 fn repo_updater_timeout_for(
@@ -3290,6 +3319,20 @@ async fn maybe_sync_repo_set_with_repo_updater(
         return;
     }
 
+    let remote_unsuitable_roots = detect_remote_unsuitable_sync_roots(worker, sync_roots).await;
+    if !remote_unsuitable_roots.is_empty() {
+        let joined = remote_unsuitable_roots
+            .iter()
+            .map(|(path, reason)| format!("{} ({reason})", path.display()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        reporter.verbose(&format!(
+            "[RCH] repo_updater pre-sync skipped (dirty/broken remote sync roots on {}: {joined})",
+            worker.id
+        ));
+        return;
+    }
+
     let repo_specs = collect_repo_updater_specs(sync_roots).await;
     if repo_specs.is_empty() {
         reporter.verbose("[RCH] repo_updater pre-sync skipped (no git origin remotes found)");
@@ -3761,11 +3804,7 @@ fn build_sync_closure_plan(
             let root_hash = if is_primary {
                 project_hash.to_string()
             } else {
-                compute_project_hash_with_dependency_roots_and_policy(
-                    &root,
-                    &[],
-                    topology_policy,
-                )
+                compute_project_hash_with_dependency_roots_and_policy(&root, &[], topology_policy)
             };
             SyncClosurePlanEntry {
                 remote_root: map_sync_root_to_remote_root(&root, topology_policy),
@@ -4355,8 +4394,8 @@ async fn execute_remote_compilation(
     // Get current working directory and normalize it to the canonical project root.
     let project_root =
         std::env::current_dir().map_err(|e| TransferError::NoProjectRoot { source: e })?;
-    let normalized_project =
-        normalize_project_path_with_policy(&project_root, topology_policy).map_err(|e| {
+    let normalized_project = normalize_project_path_with_policy(&project_root, topology_policy)
+        .map_err(|e| {
             anyhow::anyhow!(
                 "Project path normalization failed for {}: {}",
                 project_root.display(),
@@ -9672,8 +9711,12 @@ RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
         std::fs::create_dir_all(&dep).expect("create dep");
 
         // Deliberately omit project_root from sync_roots list.
-        let plan =
-            build_sync_closure_plan(std::slice::from_ref(&dep), &project_root, "hash_auto_add", &PathTopologyPolicy::default());
+        let plan = build_sync_closure_plan(
+            std::slice::from_ref(&dep),
+            &project_root,
+            "hash_auto_add",
+            &PathTopologyPolicy::default(),
+        );
         let has_primary = plan.iter().any(|e| e.is_primary);
         assert!(
             has_primary,
@@ -9872,7 +9915,12 @@ RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
         let bad_dep_a = PathBuf::from("/home/user/dep_a");
         let bad_dep_b = PathBuf::from("/var/lib/dep_b");
 
-        let plan = build_sync_closure_plan(&[bad_dep_a, bad_dep_b], &project_root, "lonely_hash", &PathTopologyPolicy::default());
+        let plan = build_sync_closure_plan(
+            &[bad_dep_a, bad_dep_b],
+            &project_root,
+            "lonely_hash",
+            &PathTopologyPolicy::default(),
+        );
 
         assert_eq!(plan.len(), 1, "only the primary root should remain");
         assert!(
@@ -10042,7 +10090,12 @@ RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
     fn test_plan_empty_sync_roots() {
         let _guard = test_guard!();
         let project_root = PathBuf::from("/data/projects/solo_project");
-        let plan = build_sync_closure_plan(&[], &project_root, "solo_hash", &PathTopologyPolicy::default());
+        let plan = build_sync_closure_plan(
+            &[],
+            &project_root,
+            "solo_hash",
+            &PathTopologyPolicy::default(),
+        );
         assert_eq!(
             plan.len(),
             1,
@@ -10086,7 +10139,12 @@ RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
         roots.push(project_root.clone());
 
         let start = std::time::Instant::now();
-        let plan = build_sync_closure_plan(&roots, &project_root, "large_hash", &PathTopologyPolicy::default());
+        let plan = build_sync_closure_plan(
+            &roots,
+            &project_root,
+            "large_hash",
+            &PathTopologyPolicy::default(),
+        );
         let elapsed = start.elapsed();
 
         // 100 deps + 1 primary (deduped) = 101 entries.
@@ -10134,7 +10192,8 @@ RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
         if Path::new("/dp").exists() {
             let dp_path = PathBuf::from("/dp/remote_compilation_helper");
             let canonical = std::fs::canonicalize(&dp_path).expect("canonicalize /dp path");
-            let plan = build_sync_closure_plan(&[], &dp_path, "dp_hash", &PathTopologyPolicy::default());
+            let plan =
+                build_sync_closure_plan(&[], &dp_path, "dp_hash", &PathTopologyPolicy::default());
             assert_eq!(plan.len(), 1);
             assert!(plan[0].is_primary);
             assert_eq!(
@@ -10263,7 +10322,12 @@ RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
         }
         roots.push(project_root.clone());
 
-        let plan = build_sync_closure_plan(&roots, &project_root, "seq_hash", &PathTopologyPolicy::default());
+        let plan = build_sync_closure_plan(
+            &roots,
+            &project_root,
+            "seq_hash",
+            &PathTopologyPolicy::default(),
+        );
         let manifest = build_sync_closure_manifest(&plan, &project_root);
 
         // Order field should be 1-indexed and sequential.
