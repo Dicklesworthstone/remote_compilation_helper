@@ -2747,7 +2747,7 @@ async fn detect_remote_unsuitable_sync_roots(
     let mut unsuitable = Vec::new();
 
     for root in sync_roots {
-        let escaped_root = shell_escape::escape(root.to_string_lossy().into()).to_string();
+        let escaped_root = shell_escape::escape(root.to_string_lossy()).to_string();
         let command = format!("git -C {escaped_root} status --porcelain");
 
         match run_worker_ssh_command(worker, &command, Duration::from_secs(10)).await {
