@@ -22,7 +22,6 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/remote_compilati
 
 **Transparent remote compilation for multi-agent development**
 
-[![CI](https://github.com/Dicklesworthstone/remote_compilation_helper/actions/workflows/ci.yml/badge.svg)](https://github.com/Dicklesworthstone/remote_compilation_helper/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Rust](https://img.shields.io/badge/rust-nightly%202024-orange.svg)](https://www.rust-lang.org/)
 [![codecov](https://codecov.io/gh/Dicklesworthstone/remote_compilation_helper/graph/badge.svg)](https://codecov.io/gh/Dicklesworthstone/remote_compilation_helper)
