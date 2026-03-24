@@ -25,7 +25,6 @@ use rch_common::{
 use rch_telemetry::protocol::{TelemetrySource, TestRunRecord, TestRunStats, WorkerTelemetry};
 use rch_telemetry::speedscore::SpeedScore;
 use serde::Serialize;
-use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -2086,7 +2085,7 @@ async fn handle_select_worker(
         // Retry loop to handle race conditions where slots are taken between selection and reservation.
         let mut reservation_attempts = 0;
         const MAX_ATTEMPTS: u32 = 3;
-        let mut excluded_worker_ids = HashSet::new();
+        let mut excluded_worker_ids = ctx.history.active_workers_for_project(&request.project);
 
         loop {
             // Use the configured worker selector.
@@ -2105,17 +2104,6 @@ async fn handle_select_worker(
             };
 
             let selected_worker_id = worker.config.read().await.id.clone();
-            if ctx.history.has_active_build_for_project_on_worker(
-                &request.project,
-                selected_worker_id.as_str(),
-            ) {
-                debug!(
-                    "Worker {} excluded for project {}: active build already running on same worker",
-                    selected_worker_id, request.project
-                );
-                excluded_worker_ids.insert(selected_worker_id.as_str().to_string());
-                continue;
-            }
 
             // Reserve the slots.
             reservation_attempts += 1;
@@ -2136,14 +2124,22 @@ async fn handle_select_worker(
                     .unwrap_or_else(|| "<unknown>".to_string());
 
                 let build_id = if let Some(hook_pid) = request.hook_pid.filter(|pid| *pid > 0) {
-                    let state = ctx.history.start_active_build(
+                    let Some(state) = ctx.history.try_start_active_build(
                         request.project.clone(),
                         id.as_str().to_string(),
                         command.clone(),
                         hook_pid,
                         request.estimated_cores,
                         rch_common::BuildLocation::Remote,
-                    );
+                    ) else {
+                        debug!(
+                            "Worker {} lost same-project active-build race for {} after slot reservation",
+                            id, request.project
+                        );
+                        worker.release_slots(request.estimated_cores).await;
+                        excluded_worker_ids.insert(id.as_str().to_string());
+                        continue;
+                    };
                     if !cfg!(test) {
                         metrics::inc_active_builds("remote");
                     }

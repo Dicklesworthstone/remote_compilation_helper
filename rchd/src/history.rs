@@ -7,7 +7,7 @@ use rch_common::{
     BuildCancellationMetadata, BuildHeartbeatPhase, BuildHeartbeatRequest, BuildLocation,
     BuildRecord, BuildStats, CommandTimingBreakdown, SavedTimeStats,
 };
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -243,6 +243,59 @@ impl BuildHistory {
         state
     }
 
+    /// Try to register a new active build, failing if the same worker already
+    /// has a live build for the same project.
+    pub fn try_start_active_build(
+        &self,
+        project_id: String,
+        worker_id: String,
+        command: String,
+        hook_pid: u32,
+        slots: u32,
+        location: BuildLocation,
+    ) -> Option<ActiveBuildState> {
+        let id = self.next_id();
+        let started_at = Utc::now().to_rfc3339();
+        let started_at_mono = Instant::now();
+        let state = ActiveBuildState {
+            id,
+            project_id,
+            worker_id,
+            command,
+            started_at: started_at.clone(),
+            started_at_mono,
+            hook_pid,
+            remote_pgid_file: None,
+            slots,
+            location,
+            heartbeat_phase: BuildHeartbeatPhase::SyncUp,
+            heartbeat_detail: Some("build_started".to_string()),
+            heartbeat_counter: 0,
+            heartbeat_percent: None,
+            heartbeat_count: 0,
+            last_heartbeat_at: started_at.clone(),
+            last_heartbeat_mono: started_at_mono,
+            last_progress_at: started_at,
+            last_progress_mono: started_at_mono,
+            detector_hook_alive: true,
+            detector_heartbeat_stale: false,
+            detector_progress_stale: false,
+            detector_confidence: 0.0,
+            detector_build_age_secs: 0,
+            detector_slots_owned: slots,
+            detector_last_evaluated_at: None,
+        };
+
+        let mut active = self.active.write().unwrap_or_else(|e| e.into_inner());
+        if active.values().any(|existing| {
+            existing.project_id == state.project_id && existing.worker_id == state.worker_id
+        }) {
+            return None;
+        }
+        active.insert(id, state.clone());
+        Some(state)
+    }
+
     /// Record a heartbeat/progress update for an active build.
     ///
     /// Returns the updated active state if the build exists.
@@ -435,6 +488,17 @@ impl BuildHistory {
             .unwrap_or_else(|e| e.into_inner())
             .values()
             .any(|state| state.project_id == project_id && state.worker_id == worker_id)
+    }
+
+    /// Return worker IDs currently running an active build for the given project.
+    pub fn active_workers_for_project(&self, project_id: &str) -> HashSet<String> {
+        self.active
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .filter(|state| state.project_id == project_id)
+            .map(|state| state.worker_id.clone())
+            .collect()
     }
 
     // =========================================================================
@@ -1030,6 +1094,98 @@ mod tests {
         assert!(id1 > 0, "first ID should be positive");
         assert_eq!(id2, id1 + 1, "IDs should be sequential");
         assert_eq!(id3, id2 + 1, "IDs should be sequential");
+    }
+
+    #[test]
+    fn test_try_start_active_build_blocks_same_project_on_same_worker() {
+        let _guard = test_guard!();
+        let history = BuildHistory::new(10);
+
+        let first = history.try_start_active_build(
+            "proj-a".to_string(),
+            "worker-1".to_string(),
+            "cargo test".to_string(),
+            1111,
+            2,
+            BuildLocation::Remote,
+        );
+        assert!(first.is_some(), "first active build should be registered");
+
+        let second = history.try_start_active_build(
+            "proj-a".to_string(),
+            "worker-1".to_string(),
+            "cargo test".to_string(),
+            2222,
+            2,
+            BuildLocation::Remote,
+        );
+        assert!(
+            second.is_none(),
+            "same project on same worker must be rejected"
+        );
+
+        let different_worker = history.try_start_active_build(
+            "proj-a".to_string(),
+            "worker-2".to_string(),
+            "cargo test".to_string(),
+            3333,
+            2,
+            BuildLocation::Remote,
+        );
+        assert!(
+            different_worker.is_some(),
+            "same project on a different worker should still be allowed"
+        );
+
+        let different_project = history.try_start_active_build(
+            "proj-b".to_string(),
+            "worker-1".to_string(),
+            "cargo test".to_string(),
+            4444,
+            2,
+            BuildLocation::Remote,
+        );
+        assert!(
+            different_project.is_some(),
+            "different project on the same worker should still be allowed"
+        );
+    }
+
+    #[test]
+    fn test_active_workers_for_project_tracks_current_workers() {
+        let _guard = test_guard!();
+        let history = BuildHistory::new(10);
+
+        history.start_active_build(
+            "proj-a".to_string(),
+            "worker-1".to_string(),
+            "cargo build".to_string(),
+            1111,
+            2,
+            BuildLocation::Remote,
+        );
+        history.start_active_build(
+            "proj-a".to_string(),
+            "worker-2".to_string(),
+            "cargo build".to_string(),
+            2222,
+            2,
+            BuildLocation::Remote,
+        );
+        history.start_active_build(
+            "proj-b".to_string(),
+            "worker-3".to_string(),
+            "cargo build".to_string(),
+            3333,
+            2,
+            BuildLocation::Remote,
+        );
+
+        let active_workers = history.active_workers_for_project("proj-a");
+        assert_eq!(active_workers.len(), 2);
+        assert!(active_workers.contains("worker-1"));
+        assert!(active_workers.contains("worker-2"));
+        assert!(!active_workers.contains("worker-3"));
     }
 
     #[test]
