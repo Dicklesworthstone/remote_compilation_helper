@@ -643,7 +643,8 @@ impl WorkerSelector {
 
     /// Select a worker using the configured strategy.
     pub async fn select(&self, pool: &WorkerPool, request: &SelectionRequest) -> SelectionResult {
-        self.select_with_exclusions(pool, request, &HashSet::new()).await
+        self.select_with_exclusions(pool, request, &HashSet::new())
+            .await
     }
 
     /// Select a worker while excluding specific worker IDs from consideration.
@@ -688,9 +689,8 @@ impl WorkerSelector {
 
         if eligible.is_empty() {
             // Try last-success fallback if enabled
-            if let Some(fallback_worker_id) = self
-                .try_fallback(pool, request, excluded_worker_ids)
-                .await
+            if let Some(fallback_worker_id) =
+                self.try_fallback(pool, request, excluded_worker_ids).await
             {
                 // Record fallback selection in audit log
                 self.record_audit_entry(

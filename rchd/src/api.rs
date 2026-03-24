@@ -2194,10 +2194,7 @@ async fn handle_select_worker(
 
             warn!(
                 "Failed to reserve {} slots on {} (race condition), attempt {}/{}",
-                request.estimated_cores,
-                selected_worker_id,
-                reservation_attempts,
-                MAX_ATTEMPTS
+                request.estimated_cores, selected_worker_id, reservation_attempts, MAX_ATTEMPTS
             );
 
             if reservation_attempts >= MAX_ATTEMPTS {

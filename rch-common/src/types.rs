@@ -749,9 +749,7 @@ impl PathTopologyConfig {
             .as_deref()
             .filter(|s| !s.is_empty())
             .map(|s| shellexpand::tilde(s).into_owned())
-            .unwrap_or_else(|| {
-                crate::path_topology::DEFAULT_CANONICAL_PROJECT_ROOT.to_string()
-            });
+            .unwrap_or_else(|| crate::path_topology::DEFAULT_CANONICAL_PROJECT_ROOT.to_string());
         let alias = self
             .alias_root
             .as_deref()

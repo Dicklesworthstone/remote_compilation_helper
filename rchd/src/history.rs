@@ -425,7 +425,11 @@ impl BuildHistory {
     }
 
     /// Check whether a worker already has an active build for the same project.
-    pub fn has_active_build_for_project_on_worker(&self, project_id: &str, worker_id: &str) -> bool {
+    pub fn has_active_build_for_project_on_worker(
+        &self,
+        project_id: &str,
+        worker_id: &str,
+    ) -> bool {
         self.active
             .read()
             .unwrap_or_else(|e| e.into_inner())
