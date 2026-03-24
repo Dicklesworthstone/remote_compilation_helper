@@ -8,9 +8,21 @@ Repository: <https://github.com/Dicklesworthstone/remote_compilation_helper>
 
 ---
 
-## [Unreleased] (since v1.0.13)
+## [Unreleased] (since v1.0.14)
 
-8 commits on `main` since v1.0.13, as of 2026-03-21.
+No unreleased changes yet.
+
+---
+
+## [v1.0.14] -- 2026-03-23 **(release)**
+
+### Worker scheduling safety
+
+- Prevent concurrent builds for the same project from landing on the same worker checkout. The daemon now excludes workers already active for that project and uses an atomic active-build claim after slot reservation to close the last same-project race in worker selection. ([fbea95f](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/fbea95f7b65903859a3e81f7f01d9ced28ac7ee2))
+
+### Dependency maintenance
+
+- Update dependencies to resolve security advisories. ([1548842](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/154884291146b73177c122e1856c0d287767ef50))
 
 ### Configurable path topology
 
@@ -438,7 +450,8 @@ First tagged version. Marks the project's initial functional milestone after 9 d
 
 ---
 
-[Unreleased]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.13...HEAD
+[Unreleased]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.14...HEAD
+[v1.0.14]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.13...v1.0.14
 [v1.0.13]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.12...v1.0.13
 [v1.0.12]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.11...v1.0.12
 [v1.0.11]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.10...v1.0.11
