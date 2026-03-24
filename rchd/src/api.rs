@@ -25,6 +25,7 @@ use rch_common::{
 use rch_telemetry::protocol::{TelemetrySource, TestRunRecord, TestRunStats, WorkerTelemetry};
 use rch_telemetry::speedscore::SpeedScore;
 use serde::Serialize;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -2083,14 +2084,16 @@ async fn handle_select_worker(
         request: &SelectionRequest,
     ) -> Result<SelectionResponse> {
         // Retry loop to handle race conditions where slots are taken between selection and reservation.
-        let mut attempts = 0;
+        let mut reservation_attempts = 0;
         const MAX_ATTEMPTS: u32 = 3;
+        let mut excluded_worker_ids = HashSet::new();
 
         loop {
-            attempts += 1;
-
             // Use the configured worker selector.
-            let result = ctx.worker_selector.select(&ctx.pool, request).await;
+            let result = ctx
+                .worker_selector
+                .select_with_exclusions(&ctx.pool, request, &excluded_worker_ids)
+                .await;
 
             let Some(worker) = result.worker else {
                 debug!("No worker selected: {}", result.reason);
@@ -2101,7 +2104,21 @@ async fn handle_select_worker(
                 });
             };
 
+            let selected_worker_id = worker.config.read().await.id.clone();
+            if ctx.history.has_active_build_for_project_on_worker(
+                &request.project,
+                selected_worker_id.as_str(),
+            ) {
+                debug!(
+                    "Worker {} excluded for project {}: active build already running on same worker",
+                    selected_worker_id, request.project
+                );
+                excluded_worker_ids.insert(selected_worker_id.as_str().to_string());
+                continue;
+            }
+
             // Reserve the slots.
+            reservation_attempts += 1;
             if worker.reserve_slots(request.estimated_cores).await {
                 let (id, host, user, identity_file) = {
                     let config = worker.config.read().await;
@@ -2178,12 +2195,12 @@ async fn handle_select_worker(
             warn!(
                 "Failed to reserve {} slots on {} (race condition), attempt {}/{}",
                 request.estimated_cores,
-                worker.config.read().await.id,
-                attempts,
+                selected_worker_id,
+                reservation_attempts,
                 MAX_ATTEMPTS
             );
 
-            if attempts >= MAX_ATTEMPTS {
+            if reservation_attempts >= MAX_ATTEMPTS {
                 // Give up after max attempts.
                 return Ok(SelectionResponse {
                     worker: None,
@@ -3731,6 +3748,147 @@ mod tests {
         assert_eq!(recent[0].worker_id.as_deref(), Some("worker1"));
         assert_eq!(recent[0].exit_code, 0);
         assert_eq!(recent[0].location, rch_common::BuildLocation::Remote);
+    }
+
+    #[tokio::test]
+    async fn test_handle_select_worker_blocks_same_project_on_same_worker() {
+        let pool = WorkerPool::new();
+        pool.add_worker(make_test_worker("worker1", 8)).await;
+
+        let ctx = make_test_context(pool);
+        let first_request = SelectionRequest {
+            project: "shared-project".to_string(),
+            command: Some("cargo test".to_string()),
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 2,
+            preferred_workers: vec![],
+            toolchain: None,
+            required_runtime: RequiredRuntime::default(),
+            classification_duration_us: None,
+            hook_pid: Some(1001),
+        };
+
+        let first_response = handle_select_worker(&ctx, first_request, false, None)
+            .await
+            .unwrap();
+        assert_eq!(first_response.reason, SelectionReason::Success);
+        assert_eq!(
+            first_response.worker.as_ref().map(|w| w.id.as_str()),
+            Some("worker1")
+        );
+
+        let second_request = SelectionRequest {
+            project: "shared-project".to_string(),
+            command: Some("cargo test".to_string()),
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 2,
+            preferred_workers: vec![],
+            toolchain: None,
+            required_runtime: RequiredRuntime::default(),
+            classification_duration_us: None,
+            hook_pid: Some(1002),
+        };
+
+        let second_response = handle_select_worker(&ctx, second_request, false, None)
+            .await
+            .unwrap();
+        assert!(second_response.worker.is_none());
+        assert_eq!(second_response.reason, SelectionReason::AllWorkersBusy);
+    }
+
+    #[tokio::test]
+    async fn test_handle_select_worker_routes_same_project_to_different_worker() {
+        let pool = WorkerPool::new();
+        pool.add_worker(make_test_worker("worker1", 8)).await;
+        pool.add_worker(make_test_worker("worker2", 8)).await;
+
+        let ctx = make_test_context(pool);
+        let first_request = SelectionRequest {
+            project: "shared-project".to_string(),
+            command: Some("cargo build".to_string()),
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 2,
+            preferred_workers: vec![WorkerId::new("worker1")],
+            toolchain: None,
+            required_runtime: RequiredRuntime::default(),
+            classification_duration_us: None,
+            hook_pid: Some(2001),
+        };
+
+        let first_response = handle_select_worker(&ctx, first_request, false, None)
+            .await
+            .unwrap();
+        assert_eq!(first_response.reason, SelectionReason::Success);
+        assert_eq!(
+            first_response.worker.as_ref().map(|w| w.id.as_str()),
+            Some("worker1")
+        );
+
+        let second_request = SelectionRequest {
+            project: "shared-project".to_string(),
+            command: Some("cargo build".to_string()),
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 2,
+            preferred_workers: vec![],
+            toolchain: None,
+            required_runtime: RequiredRuntime::default(),
+            classification_duration_us: None,
+            hook_pid: Some(2002),
+        };
+
+        let second_response = handle_select_worker(&ctx, second_request, false, None)
+            .await
+            .unwrap();
+        assert_eq!(second_response.reason, SelectionReason::Success);
+        assert_eq!(
+            second_response.worker.as_ref().map(|w| w.id.as_str()),
+            Some("worker2")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_select_worker_allows_different_projects_on_same_worker() {
+        let pool = WorkerPool::new();
+        pool.add_worker(make_test_worker("worker1", 8)).await;
+
+        let ctx = make_test_context(pool);
+        let first_request = SelectionRequest {
+            project: "project-a".to_string(),
+            command: Some("cargo check".to_string()),
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 2,
+            preferred_workers: vec![],
+            toolchain: None,
+            required_runtime: RequiredRuntime::default(),
+            classification_duration_us: None,
+            hook_pid: Some(3001),
+        };
+
+        let first_response = handle_select_worker(&ctx, first_request, false, None)
+            .await
+            .unwrap();
+        assert_eq!(first_response.reason, SelectionReason::Success);
+
+        let second_request = SelectionRequest {
+            project: "project-b".to_string(),
+            command: Some("cargo check".to_string()),
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 2,
+            preferred_workers: vec![],
+            toolchain: None,
+            required_runtime: RequiredRuntime::default(),
+            classification_duration_us: None,
+            hook_pid: Some(3002),
+        };
+
+        let second_response = handle_select_worker(&ctx, second_request, false, None)
+            .await
+            .unwrap();
+        assert_eq!(second_response.reason, SelectionReason::Success);
+        assert_eq!(
+            second_response.worker.as_ref().map(|w| w.id.as_str()),
+            Some("worker1")
+        );
     }
 
     #[tokio::test]

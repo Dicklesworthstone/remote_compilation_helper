@@ -643,6 +643,16 @@ impl WorkerSelector {
 
     /// Select a worker using the configured strategy.
     pub async fn select(&self, pool: &WorkerPool, request: &SelectionRequest) -> SelectionResult {
+        self.select_with_exclusions(pool, request, &HashSet::new()).await
+    }
+
+    /// Select a worker while excluding specific worker IDs from consideration.
+    pub async fn select_with_exclusions(
+        &self,
+        pool: &WorkerPool,
+        request: &SelectionRequest,
+        excluded_worker_ids: &HashSet<String>,
+    ) -> SelectionResult {
         let _timer = DecisionTimer::new(DecisionType::WorkerSelection);
         let select_start = Instant::now();
         let correlation_id = request
@@ -659,7 +669,10 @@ impl WorkerSelector {
         let cache_use = cache_use_for_request(request);
 
         // Get eligible workers
-        let eligible = match self.get_eligible_workers(pool, request).await {
+        let eligible = match self
+            .get_eligible_workers(pool, request, excluded_worker_ids)
+            .await
+        {
             Ok(workers) => workers,
             Err(reason) => {
                 // Record failed selection in audit log
@@ -675,7 +688,10 @@ impl WorkerSelector {
 
         if eligible.is_empty() {
             // Try last-success fallback if enabled
-            if let Some(fallback_worker_id) = self.try_fallback(pool, request).await {
+            if let Some(fallback_worker_id) = self
+                .try_fallback(pool, request, excluded_worker_ids)
+                .await
+            {
                 // Record fallback selection in audit log
                 self.record_audit_entry(
                     request,
@@ -719,7 +735,9 @@ impl WorkerSelector {
         }
 
         // Check for affinity-pinned worker (if enabled)
-        let pinned_selection = self.try_pinned_worker(&eligible, request).await;
+        let pinned_selection = self
+            .try_pinned_worker(&eligible, request, excluded_worker_ids)
+            .await;
         if let Some((worker, circuit_state)) = pinned_selection {
             let worker_id = worker.config.read().await.id.as_str().to_string();
             debug!(
@@ -920,12 +938,16 @@ impl WorkerSelector {
         &self,
         eligible: &[(Arc<WorkerState>, CircuitState)],
         request: &SelectionRequest,
+        excluded_worker_ids: &HashSet<String>,
     ) -> Option<(Arc<WorkerState>, CircuitState)> {
         if !self.config.affinity.enabled {
             return None;
         }
 
         let pinned_worker_id = self.get_pinned_worker(&request.project).await?;
+        if excluded_worker_ids.contains(&pinned_worker_id) {
+            return None;
+        }
 
         // Find the pinned worker in the eligible list
         for (worker, circuit_state) in eligible {
@@ -945,12 +967,20 @@ impl WorkerSelector {
     /// - The worker still exists in the pool
     /// - The worker has available slots
     /// - The worker's circuit is not open
-    async fn try_fallback(&self, pool: &WorkerPool, request: &SelectionRequest) -> Option<String> {
+    async fn try_fallback(
+        &self,
+        pool: &WorkerPool,
+        request: &SelectionRequest,
+        excluded_worker_ids: &HashSet<String>,
+    ) -> Option<String> {
         if !self.config.affinity.enable_last_success_fallback {
             return None;
         }
 
         let fallback_id = self.get_fallback_worker(&request.project).await?;
+        if excluded_worker_ids.contains(&fallback_id) {
+            return None;
+        }
 
         // Check if the fallback worker is viable
         let worker_id = WorkerId::new(&fallback_id);
@@ -1152,6 +1182,7 @@ impl WorkerSelector {
         &self,
         pool: &WorkerPool,
         request: &SelectionRequest,
+        excluded_worker_ids: &HashSet<String>,
     ) -> Result<Vec<(Arc<WorkerState>, CircuitState)>, SelectionReason> {
         // Clear per-round admission verdict cache (bd-vvmd.4.4).
         if let Some(ref gate) = self.admission_gate {
@@ -1214,6 +1245,10 @@ impl WorkerSelector {
         for worker in workers {
             let circuit_state = worker.circuit_state().await.unwrap_or(CircuitState::Closed);
             let worker_id = worker.config.read().await.id.clone();
+            if excluded_worker_ids.contains(worker_id.as_str()) {
+                debug!("Worker {} excluded: caller-side exclusion set", worker_id);
+                continue;
+            }
 
             // Filter by circuit state
             match circuit_state {
