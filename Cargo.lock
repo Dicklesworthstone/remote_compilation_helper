@@ -86,7 +86,7 @@ dependencies = [
 
 [[package]]
 name = "anstyle"
-version = "1.0.14"
+version = "1.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "940b3a0ca603d1eade50a4846a2afffd5ef57a9feac2c0e2ec2e14f9ead76000"
 
@@ -2872,7 +2872,7 @@ dependencies = [
 
 [[package]]
 name = "rch"
-version = "1.0.13"
+version = "1.0.15"
 dependencies = [
  "anyhow",
  "blake3",
@@ -2931,7 +2931,7 @@ dependencies = [
 
 [[package]]
 name = "rch-common"
-version = "1.0.13"
+version = "1.0.15"
 dependencies = [
  "anyhow",
  "blake3",
@@ -2966,7 +2966,7 @@ dependencies = [
 
 [[package]]
 name = "rch-telemetry"
-version = "1.0.13"
+version = "1.0.15"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2987,7 +2987,7 @@ dependencies = [
 
 [[package]]
 name = "rch-wkr"
-version = "1.0.13"
+version = "1.0.15"
 dependencies = [
  "anyhow",
  "blake3",
@@ -3006,7 +3006,7 @@ dependencies = [
 
 [[package]]
 name = "rchd"
-version = "1.0.13"
+version = "1.0.15"
 dependencies = [
  "anyhow",
  "axum",
