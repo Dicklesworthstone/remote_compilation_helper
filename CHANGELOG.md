@@ -8,13 +8,13 @@ Repository: <https://github.com/Dicklesworthstone/remote_compilation_helper>
 
 ---
 
-## [Unreleased] (since v1.0.15)
+## [Unreleased] (since v1.0.16)
 
 No unreleased changes yet.
 
 ---
 
-## [v1.0.15] -- 2026-03-23 **(release)**
+## [v1.0.16] -- 2026-03-23 **(release)**
 
 ### Worker scheduling safety
 
@@ -31,6 +31,12 @@ No unreleased changes yet.
 ### Hook system expansion
 
 - Major expansion of the hook lifecycle: additional compilation event handling, improved orchestration, and expanded compilation config types in the transfer pipeline. ([698422c](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/698422cbe71ab0a2fcaf9720e6abe6b0ab3a532e), [a92c452](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/a92c4528d730d24765d009db3e6f59f0c0987b02), [eb516a4](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/eb516a4a299ce772c3f0c19b6e02a13f52c1d203), [aed2477](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/aed247792bda9e83c33d8f75a5ccba8181b5635c), [e713602](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/e7136026e69cfe85905dc189d87dc2bb97f3ff86))
+
+---
+
+## [v1.0.15] -- 2026-03-23
+
+Superseded tag-only version bump. `v1.0.16` carries the same release content with the corrected lockfile version metadata.
 
 ---
 
@@ -456,7 +462,8 @@ First tagged version. Marks the project's initial functional milestone after 9 d
 
 ---
 
-[Unreleased]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.15...HEAD
+[Unreleased]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.16...HEAD
+[v1.0.16]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.15...v1.0.16
 [v1.0.15]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.14...v1.0.15
 [v1.0.14]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.13...v1.0.14
 [v1.0.13]: https://github.com/Dicklesworthstone/remote_compilation_helper/compare/v1.0.12...v1.0.13
