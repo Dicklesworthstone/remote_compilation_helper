@@ -1454,6 +1454,13 @@ fi",
         // empty parents of excluded files (side effect of --include="*/")
         cmd.arg("--prune-empty-dirs");
 
+        // Apply the same effective excludes used during upload before the
+        // directory include so rsync never descends into known junk trees like
+        // `.beads/recovery_*` on the worker.
+        for pattern in self.get_effective_excludes() {
+            cmd.arg("--exclude").arg(pattern);
+        }
+
         // Essential: Include all directories so rsync can traverse to match patterns.
         // Without this, the final --exclude "*" prevents rsync from entering directories
         // like "target/" to check for matches.
@@ -1696,6 +1703,12 @@ fi",
 
         // Prune empty directories to prevent cluttering local project
         cmd.arg("--prune-empty-dirs");
+
+        // Reuse the upload-side effective excludes so retrieval does not walk
+        // stale worker-local trees that should have been filtered from sync.
+        for pattern in self.get_effective_excludes() {
+            cmd.arg("--exclude").arg(pattern);
+        }
 
         // Essential: Include all directories so rsync can traverse to match patterns.
         cmd.arg("--include").arg("*/");
@@ -2896,6 +2909,73 @@ mod tests {
 
         assert!(args.iter().any(|arg| arg == "--compress-choice=zstd"));
         assert!(args.iter().any(|arg| arg == "--compress-level=7"));
+    }
+
+    #[test]
+    fn test_build_retrieve_command_applies_effective_excludes_before_directory_include() {
+        let _guard = test_guard!();
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        std::fs::write(
+            temp_dir.path().join(".rchignore"),
+            ".beads/\n.beads/recovery_*/\ncustom-cache/\n",
+        )
+        .expect("write .rchignore");
+
+        let pipeline = TransferPipeline::new(
+            temp_dir.path().to_path_buf(),
+            "test-project".to_string(),
+            "abc123".to_string(),
+            TransferConfig::default(),
+        );
+
+        let worker = WorkerConfig {
+            id: WorkerId::new("mock-worker"),
+            host: "mock://worker".to_string(),
+            user: "mockuser".to_string(),
+            identity_file: "~/.ssh/mock".to_string(),
+            total_slots: 4,
+            priority: 100,
+            tags: vec![],
+        };
+
+        let cmd = pipeline.build_retrieve_command(
+            &worker,
+            "/tmp/rch/test-project/abc123",
+            &["target/debug/**".to_string()],
+        );
+
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect();
+
+        let beads_exclude = args
+            .windows(2)
+            .position(|window| window == ["--exclude", ".beads/"])
+            .expect("missing .beads exclude");
+        let recovery_exclude = args
+            .windows(2)
+            .position(|window| window == ["--exclude", ".beads/recovery_*/"])
+            .expect("missing .beads recovery exclude");
+        let custom_exclude = args
+            .windows(2)
+            .position(|window| window == ["--exclude", "custom-cache/"])
+            .expect("missing custom cache exclude");
+        let include_dirs = args
+            .windows(2)
+            .position(|window| window == ["--include", "*/"])
+            .expect("missing directory include");
+        let target_include = args
+            .windows(2)
+            .position(|window| window == ["--include", "target/debug/**"])
+            .expect("missing artifact include");
+
+        assert!(beads_exclude < include_dirs);
+        assert!(recovery_exclude < include_dirs);
+        assert!(custom_exclude < include_dirs);
+        assert!(include_dirs < target_include);
+        assert!(args.windows(2).any(|window| window == ["--exclude", "*"]));
     }
 
     #[test]
