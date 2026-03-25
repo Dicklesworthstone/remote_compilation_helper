@@ -6,6 +6,7 @@ use directories::ProjectDirs;
 use rch_common::types::validate_remote_base;
 use rch_common::{
     ConfigValueSource, OutputVisibility, RchConfig, SelfTestFailureAction, SelfTestWorkers,
+    TransferConfig,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -1850,7 +1851,13 @@ pub fn load_workers_config(path: Option<&Path>) -> Result<WorkersConfig> {
 /// Generate an example project config.
 #[allow(dead_code)] // Used by future CLI scaffolding
 pub fn example_project_config() -> String {
-    r#"# RCH Project Configuration
+    let exclude_lines: String = TransferConfig::default()
+        .exclude_patterns
+        .iter()
+        .map(|p| format!("    \"{p}\",\n"))
+        .collect();
+    format!(
+        r#"# RCH Project Configuration
 # Place this file at .rch/config.toml in your project root
 
 [general]
@@ -1873,13 +1880,7 @@ check_slots = 2
 compression_level = 3
 # Additional patterns to exclude from transfer
 exclude_patterns = [
-    "target/",
-    ".git/objects/",
-    "node_modules/",
-    ".beads/",
-    "*.rlib",
-    "*.rmeta",
-]
+{exclude_lines}]
 
 [environment]
 # Env vars to forward to workers.
@@ -1891,7 +1892,7 @@ allowlist = ["RUSTFLAGS", "CARGO_TARGET_DIR"]
 # Hook output visibility: none, summary, verbose
 visibility = "none"
 "#
-    .to_string()
+    )
 }
 
 /// Generate an example workers config.

@@ -2228,7 +2228,16 @@ fn default_excludes() -> Vec<String> {
         "*.pem".to_string(),
         "*.key".to_string(),
         "credentials.json".to_string(),
-        "secrets.*".to_string(),
+        "secrets.json".to_string(),
+        "secrets.yaml".to_string(),
+        "secrets.yml".to_string(),
+        "secrets.toml".to_string(),
+        "secrets.env".to_string(),
+        "secrets.txt".to_string(),
+        "secrets.conf".to_string(),
+        "secrets.cfg".to_string(),
+        "secrets.properties".to_string(),
+        "secrets.xml".to_string(),
     ]
 }
 
