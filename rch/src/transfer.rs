@@ -565,6 +565,44 @@ impl TransferPipeline {
         excludes
     }
 
+    /// Retrieval-side excludes used when pulling artifacts back from the worker.
+    ///
+    /// This is intentionally narrower than upload filtering. Upload wants broad
+    /// project hygiene exclusions (`target/`, `dist/`, coverage caches, etc.),
+    /// but retrieval still needs to descend into artifact roots like `target/`
+    /// and `build/`. The retrieval pass only applies runtime scratch guards plus
+    /// project-local `.rchignore` patterns, which is enough to avoid pathological
+    /// junk trees such as `.beads/recovery_*` without hiding requested outputs.
+    fn get_retrieval_excludes(&self) -> Vec<String> {
+        let mut excludes = Vec::new();
+
+        for pattern in REMOTE_RUNTIME_EXCLUDE_PATTERNS {
+            if !excludes.iter().any(|existing| existing == pattern) {
+                excludes.push((*pattern).to_string());
+            }
+        }
+
+        let rchignore_path = self.project_root.join(".rchignore");
+        if let Ok(patterns) = parse_rchignore(&rchignore_path) {
+            let original_count = excludes.len();
+            for pattern in patterns {
+                if !excludes.contains(&pattern) {
+                    excludes.push(pattern);
+                }
+            }
+            let added = excludes.len() - original_count;
+            if added > 0 {
+                info!(
+                    "Loaded {} retrieval exclude pattern(s) from .rchignore (total: {})",
+                    added,
+                    excludes.len()
+                );
+            }
+        }
+
+        excludes
+    }
+
     fn compression_level_for_transfer(&self) -> u32 {
         self.transfer_config
             .select_compression_level(self.estimated_transfer_bytes)
@@ -1454,10 +1492,10 @@ fi",
         // empty parents of excluded files (side effect of --include="*/")
         cmd.arg("--prune-empty-dirs");
 
-        // Apply the same effective excludes used during upload before the
-        // directory include so rsync never descends into known junk trees like
-        // `.beads/recovery_*` on the worker.
-        for pattern in self.get_effective_excludes() {
+        // Apply retrieval-safe excludes before the directory include so rsync
+        // never descends into known junk trees like `.beads/recovery_*` on the
+        // worker, while still allowing traversal into declared artifact roots.
+        for pattern in self.get_retrieval_excludes() {
             cmd.arg("--exclude").arg(pattern);
         }
 
@@ -1704,9 +1742,9 @@ fi",
         // Prune empty directories to prevent cluttering local project
         cmd.arg("--prune-empty-dirs");
 
-        // Reuse the upload-side effective excludes so retrieval does not walk
-        // stale worker-local trees that should have been filtered from sync.
-        for pattern in self.get_effective_excludes() {
+        // Reuse the retrieval-safe excludes so streaming downloads skip stale
+        // worker-local junk trees without excluding legitimate artifact roots.
+        for pattern in self.get_retrieval_excludes() {
             cmd.arg("--exclude").arg(pattern);
         }
 
@@ -2912,7 +2950,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_retrieve_command_applies_effective_excludes_before_directory_include() {
+    fn test_build_retrieve_command_applies_rchignore_excludes_before_directory_include() {
         let _guard = test_guard!();
         let temp_dir = tempfile::tempdir().expect("create temp dir");
         std::fs::write(
@@ -2975,6 +3013,12 @@ mod tests {
         assert!(recovery_exclude < include_dirs);
         assert!(custom_exclude < include_dirs);
         assert!(include_dirs < target_include);
+        assert!(
+            !args
+                .windows(2)
+                .any(|window| window == ["--exclude", "target/"]),
+            "retrieve filters must not inherit upload-only target/ exclusion"
+        );
         assert!(args.windows(2).any(|window| window == ["--exclude", "*"]));
     }
 
