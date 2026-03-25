@@ -756,6 +756,13 @@ download_binaries() {
     # Extract and install
     info "Extracting binaries..."
     if [[ "$asset_ext" == "zip" ]]; then
+        if ! command_exists unzip; then
+             warn "unzip command not found"
+             info "Falling back to building from source..."
+             rm -rf "$TEMP_DIR"
+             clone_and_build_from_source
+             return
+        fi
         if ! unzip -q "$TEMP_DIR/$asset_name" -d "$TEMP_DIR"; then
             warn "Failed to extract zip"
             info "Falling back to building from source..."

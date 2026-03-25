@@ -3620,14 +3620,13 @@ fn parse_dependency_preflight_probe_output(
 fn dependency_preflight_failure_reason(
     evidence: &[DependencyPreflightEvidence],
 ) -> Option<(&'static str, &'static str)> {
-    // Only block on primary root failures. Non-primary dependency roots with
-    // Missing/Stale/Unknown status are logged as warnings but do not abort the
-    // build — cargo will surface clear errors if a dep is truly unavailable,
-    // and this avoids false-positive blocking from intermittent verification
-    // issues on sibling repos that may already be cached on the worker.
+    // For Cargo dependency-closure builds, every synchronized root must reflect
+    // the current local state. Proceeding when any non-primary dependency root
+    // is stale or missing can silently compile against an older sibling checkout
+    // on the worker, which is worse than falling back to a local build.
     if evidence
         .iter()
-        .any(|item| item.is_primary && item.status == DependencyPreflightStatus::Missing)
+        .any(|item| item.status == DependencyPreflightStatus::Missing)
     {
         return Some((
             DEPENDENCY_PREFLIGHT_CODE_MISSING,
@@ -3636,7 +3635,7 @@ fn dependency_preflight_failure_reason(
     }
     if evidence
         .iter()
-        .any(|item| item.is_primary && item.status == DependencyPreflightStatus::Stale)
+        .any(|item| item.status == DependencyPreflightStatus::Stale)
     {
         return Some((
             DEPENDENCY_PREFLIGHT_CODE_STALE,
@@ -3645,21 +3644,12 @@ fn dependency_preflight_failure_reason(
     }
     if evidence
         .iter()
-        .any(|item| item.is_primary && item.status == DependencyPreflightStatus::Unknown)
+        .any(|item| item.status == DependencyPreflightStatus::Unknown)
     {
         return Some((
             DEPENDENCY_PREFLIGHT_CODE_UNKNOWN,
             DEPENDENCY_PREFLIGHT_REMEDIATION_UNKNOWN,
         ));
-    }
-    // Log warnings for non-primary roots with issues (informational, non-blocking).
-    for item in evidence {
-        if !item.is_primary && item.status != DependencyPreflightStatus::Present {
-            warn!(
-                "Non-primary dependency root {} has status {:?} (non-blocking): {}",
-                item.root, item.status, item.detail
-            );
-        }
     }
     None
 }
@@ -4421,6 +4411,7 @@ async fn execute_remote_compilation(
 
     let dependency_plan =
         build_dependency_runtime_plan(&normalized_project_root, kind, reporter, topology_policy);
+    let exact_dependency_closure_sync = command_uses_cargo_dependency_graph(kind);
     if let Some(decision) = dependency_plan.fail_open_decision.as_ref() {
         let report = build_dependency_runtime_fail_open_report(
             &worker_config,
@@ -4433,11 +4424,17 @@ async fn execute_remote_compilation(
                 report_json
             ));
         }
-        // Proceed with primary-root-only sync instead of aborting.
-        // The planner already set sync_roots = [primary_root] as a safe fallback.
-        // Running remotely with just the primary root is better than falling back
-        // to local execution (which defeats rch's purpose). Cargo will surface
-        // clear errors if any path dependency is truly missing on the worker.
+        if exact_dependency_closure_sync {
+            warn!(
+                "Dependency planner fail-open on {} [{}]: refusing remote Cargo execution and falling back local ({})",
+                worker_config.id, decision.reason_code, decision.remediation
+            );
+            reporter.verbose(&format!(
+                "[RCH] dependency planner fail-open [{}]: exact dependency closure required, forcing local fallback — {}",
+                decision.reason_code, decision.remediation
+            ));
+            return Err(DependencyPreflightFailure::from_report(report).into());
+        }
         warn!(
             "Dependency planner fail-open on {} [{}]: proceeding with primary-root-only sync ({})",
             worker_config.id, decision.reason_code, decision.remediation
@@ -4563,8 +4560,12 @@ async fn execute_remote_compilation(
             root_pipeline = root_pipeline.with_env_allowlist(env_allowlist.clone());
         }
 
-        // Check if transfer should be skipped based on size/time estimation.
-        if let Some(skip_reason) = root_pipeline.should_skip_transfer(&worker_config).await {
+        if exact_dependency_closure_sync {
+            reporter.verbose(&format!(
+                "[RCH] exact dependency closure sync required; bypassing transfer estimator for {}",
+                entry.local_root.display()
+            ));
+        } else if let Some(skip_reason) = root_pipeline.should_skip_transfer(&worker_config).await {
             info!(
                 "Transfer estimation indicates skip for {}: {} (worker {})",
                 entry.local_root.display(),
@@ -4618,8 +4619,9 @@ async fn execute_remote_compilation(
                 root_outcomes.push((entry.clone(), SyncRootOutcome::Synced));
             }
             Err(e) => {
-                if entry.is_primary {
-                    // Primary root failure is fatal — cannot build without the main project.
+                if entry.is_primary || exact_dependency_closure_sync {
+                    // Cargo dependency-closure builds must not continue against
+                    // stale sibling repositories on the worker.
                     return Err(e);
                 }
                 // Dependency root failure is non-fatal (fail-open for deps).
@@ -7645,7 +7647,7 @@ RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
     }
 
     #[test]
-    fn test_non_primary_missing_deps_do_not_block_preflight() {
+    fn test_non_primary_missing_deps_block_preflight() {
         let _guard = test_guard!();
         let worker = make_test_worker_config("worker-non-primary");
         let primary = make_sync_entry("/data/projects/main-project", true);
@@ -7672,20 +7674,14 @@ RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
             build_dependency_preflight_report(&worker, &outcomes, &present, &missing, None);
 
         assert!(
-            report.verified,
-            "non-primary missing dep should not block preflight"
+            !report.verified,
+            "non-primary missing dep must block preflight to avoid stale sibling builds"
         );
-        assert!(
-            report
-                .evidence
-                .iter()
-                .any(|e| !e.is_primary && e.status == DependencyPreflightStatus::Missing),
-            "evidence should still record the non-primary missing status"
-        );
+        assert_eq!(report.reason_code, Some(DEPENDENCY_PREFLIGHT_CODE_MISSING));
     }
 
     #[test]
-    fn test_non_primary_stale_deps_do_not_block_preflight() {
+    fn test_non_primary_stale_deps_block_preflight() {
         let _guard = test_guard!();
         let worker = make_test_worker_config("worker-non-primary-stale");
         let primary = make_sync_entry("/data/projects/main-project", true);
@@ -7712,9 +7708,10 @@ RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
             build_dependency_preflight_report(&worker, &outcomes, &present, &missing, None);
 
         assert!(
-            report.verified,
-            "non-primary stale dep should not block preflight"
+            !report.verified,
+            "non-primary stale dep must block preflight to avoid stale sibling builds"
         );
+        assert_eq!(report.reason_code, Some(DEPENDENCY_PREFLIGHT_CODE_STALE));
     }
 
     #[test]
