@@ -1878,7 +1878,7 @@ check_slots = 2
 [transfer]
 # zstd compression level (1-19)
 compression_level = 3
-# Additional patterns to exclude from transfer
+# Patterns to exclude from transfer (replaces defaults if modified)
 exclude_patterns = [
 {exclude_lines}]
 
