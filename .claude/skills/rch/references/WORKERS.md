@@ -1,123 +1,135 @@
-# Worker Configuration
+# Worker Management
 
-## Schema
+## Worker Lifecycle
+
+### 1) Discover and add workers
+
+```bash
+rch workers discover
+rch workers discover --probe
+rch workers discover --add --yes
+```
+
+### 2) Complete setup
+
+```bash
+rch workers setup --all
+```
+
+This performs the standard bootstrap path (binary/toolchain setup, validation) for configured workers.
+
+### 3) Validate runtime health
+
+```bash
+rch workers list --speedscore
+rch workers probe --all
+rch workers capabilities --refresh
+rch check
+```
+
+---
+
+## Add a Worker Manually
+
+Edit `~/.config/rch/workers.toml`:
 
 ```toml
 [[workers]]
-id = "unique-name"           # Required
-host = "192.168.1.100"       # Required: IP or hostname
-user = "ubuntu"              # Required: SSH user
-identity_file = "~/.ssh/key" # Required: SSH key path
-total_slots = 16             # Required: max concurrent jobs (≈ CPU cores - 2)
-priority = 100               # Optional: selection weight (default: 50, higher = preferred)
-tags = ["rust", "fast"]      # Optional: capability tags
-enabled = true               # Optional: set false to disable (default: true)
-```
-
-## Selection Algorithm
-
-```
-score = available_slots × priority × locality_bonus
-```
-
-1. **Available slots**: `total_slots - active_jobs`
-2. **Priority**: tiebreaker when slots equal
-3. **Locality**: bonus for workers with cached project data
-4. **Tags**: project can require specific tags via `.rch.toml`
-
-## Multi-Worker Example
-
-```toml
-# Primary (fast, high priority)
-[[workers]]
-id = "fast-builder"
-host = "build-server.local"
-user = "build"
-identity_file = "~/.ssh/build_key"
-total_slots = 48
-priority = 100
-tags = ["fast", "rust", "bun"]
-
-# Secondary (fallback when primary busy)
-[[workers]]
-id = "backup"
-host = "192.168.1.50"
+id = "new-worker"
+host = "203.0.113.20"
 user = "ubuntu"
-identity_file = "~/.ssh/id_ed25519"
-total_slots = 8
-priority = 50
-tags = ["rust"]
-
-# Specialized TypeScript worker
-[[workers]]
-id = "ts-builder"
-host = "ts.internal"
-user = "node"
-identity_file = "~/.ssh/ts_key"
+identity_file = "~/.ssh/new_worker_ed25519"
 total_slots = 16
-priority = 75
-tags = ["bun", "typescript"]
+priority = 90
+tags = ["rust", "bun"]
 ```
 
-## SSH Config Discovery
+Then validate and setup:
 
 ```bash
-rch workers discover --from-ssh-config --dry-run   # Preview
-rch workers discover --from-ssh-config             # Add to config
-rch workers discover --from-ssh-config --filter "build*"  # Filter by pattern
+rch config validate
+rch workers probe new-worker
+rch workers setup new-worker
 ```
 
-**Required SSH config fields**: `Host`, `HostName`, `User`, `IdentityFile`
+---
 
-**Optional RCH hints** (in SSH config comments):
-```
-Host build-server
-    HostName 192.168.1.100
-    User ubuntu
-    IdentityFile ~/.ssh/build_key
-    # rch-slots: 16
-    # rch-priority: 90
-    # rch-tags: rust,bun
-```
+## Drain / Disable / Enable
 
-## Probing & Monitoring
+Use these for maintenance windows and incident isolation.
 
 ```bash
-rch workers probe worker1 --verbose  # Test connectivity + detect toolchains
-rch workers probe --all              # Probe all workers
-rch workers status                   # Current state
-rch workers status --json            # For monitoring tools
-watch -n 5 'rch workers status'      # Continuous monitoring
+rch workers drain <worker> -y
+rch workers disable <worker> --reason "maintenance" --drain -y
+rch workers enable <worker>
 ```
 
-Probe output shows: SSH connectivity, detected toolchains (rustc, cargo, bun, gcc), disk space, load.
+State model:
 
-## Tags
+- `HEALTHY`: accepting jobs
+- `DRAINING`: finishing active jobs, no new jobs
+- `DRAINED`: idle and not accepting jobs
+- `DISABLED`: explicitly offline from scheduler
 
-Workers declare capabilities:
-```toml
-[[workers]]
-id = "polyglot"
-tags = ["rust", "bun", "cpp"]
-```
+---
 
-Projects require tags:
-```toml
-# .rch.toml in project root
-required_tags = ["rust", "fast"]
-```
-
-## Slot Sizing
+## Toolchain and Binary Management
 
 ```bash
-ssh worker1 "nproc"  # Check cores
-# Rule: total_slots = cores - 2 (leave headroom for system)
+rch workers sync-toolchain --all
+rch workers deploy-binary --all
 ```
 
-## Disable/Enable
+Use `--dry-run` before broad changes:
 
-```toml
-[[workers]]
-id = "under-maintenance"
-enabled = false  # Won't be selected
+```bash
+rch workers sync-toolchain --all --dry-run
+rch workers deploy-binary --all --dry-run
 ```
+
+---
+
+## Fleet-Level Rollout Commands
+
+```bash
+rch fleet status
+rch fleet deploy --verify
+rch fleet deploy --canary 25 --canary-wait 60 --verify
+rch fleet rollback --verify
+rch fleet history --limit 20
+```
+
+---
+
+## Worker Selection Notes
+
+Selection favors availability and execution quality signals (slot capacity, health, and policy strategy).
+
+Operational guidance:
+
+- Keep `total_slots` realistic for CPU and memory limits.
+- Prefer explicit `priority` shaping for known fast/reliable workers.
+- Drain before disruptive operations.
+- Keep worker toolchains synchronized to avoid fallback churn.
+
+---
+
+## SSH Verification Shortcuts
+
+Single worker:
+
+```bash
+rch workers probe <worker>
+```
+
+All workers with machine-readable output:
+
+```bash
+rch --json workers probe --all
+```
+
+If probes fail:
+
+1. Verify `identity_file` exists and permissions are restrictive.
+2. Verify worker host reachability and SSH service.
+3. Re-run `rch workers setup <worker>` after connectivity is restored.

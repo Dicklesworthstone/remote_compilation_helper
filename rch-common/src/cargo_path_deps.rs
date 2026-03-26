@@ -690,6 +690,25 @@ struct MetadataResolveNode {
 struct MetadataResolveDep {
     name: String,
     pkg: String,
+    #[serde(default)]
+    dep_kinds: Vec<MetadataResolveDepKind>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MetadataResolveDepKind {
+    kind: Option<String>,
+}
+
+impl MetadataResolveDep {
+    fn is_runtime_relevant(&self) -> bool {
+        if self.dep_kinds.is_empty() {
+            return true;
+        }
+
+        self.dep_kinds
+            .iter()
+            .any(|dep_kind| dep_kind.kind.as_deref() != Some("dev"))
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -796,6 +815,9 @@ where
     for package in &package_records {
         if let Some(node) = resolve_nodes.get(&package.package_id) {
             for dependency in &node.deps {
+                if !dependency.is_runtime_relevant() {
+                    continue;
+                }
                 let dependency_root = id_to_root.get(&dependency.pkg).ok_or_else(|| {
                     CargoPathDependencyError::new(
                         CargoPathDependencyErrorKind::MetadataParseFailure,
@@ -1249,17 +1271,12 @@ fn read_manifest_document(
 
     let mut path_dependencies = Vec::new();
     collect_dependency_paths(table.get("dependencies"), &mut path_dependencies);
-    collect_dependency_paths(table.get("dev-dependencies"), &mut path_dependencies);
     collect_dependency_paths(table.get("build-dependencies"), &mut path_dependencies);
 
     if let Some(targets) = table.get("target").and_then(toml::Value::as_table) {
         for target_config in targets.values() {
             if let Some(target_table) = target_config.as_table() {
                 collect_dependency_paths(target_table.get("dependencies"), &mut path_dependencies);
-                collect_dependency_paths(
-                    target_table.get("dev-dependencies"),
-                    &mut path_dependencies,
-                );
                 collect_dependency_paths(
                     target_table.get("build-dependencies"),
                     &mut path_dependencies,
@@ -2406,6 +2423,176 @@ optional_a = { path = "../optional_a", optional = true }
         assert_eq!(graph.root_packages, vec![app_canonical.clone()]);
         assert_eq!(graph.edges.len(), 1);
         assert_eq!(graph.edges[0].dependency_name, "synth_dep");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn metadata_resolve_ignores_pure_dev_path_edges() {
+        let fixture = TopologyFixture::new("synthetic-meta-dev-filter");
+        let scenario_root = fixture.canonical_root.join("synth_meta_dev_filter");
+        let app_root = scenario_root.join("app");
+        let dep_root = scenario_root.join("dep");
+        let dev_dep_root = scenario_root.join("dev_dep");
+
+        write_lib_crate(&dep_root, "runtime_dep", &[]);
+        write_lib_crate(&dev_dep_root, "dev_only_dep", &[]);
+        write_bin_crate(&app_root, "dev_filter_app", &[]);
+
+        let app_canonical = app_root.canonicalize().expect("canonical app");
+        let dep_canonical = dep_root.canonicalize().expect("canonical dep");
+        let dev_dep_canonical = dev_dep_root.canonicalize().expect("canonical dev dep");
+        let app_manifest = app_canonical.join("Cargo.toml");
+        let dep_manifest = dep_canonical.join("Cargo.toml");
+        let dev_dep_manifest = dev_dep_canonical.join("Cargo.toml");
+
+        let metadata_json = format!(
+            r#"{{
+                "packages": [
+                    {{
+                        "id": "dev_filter_app 0.1.0 (path+file://{app_root})",
+                        "name": "dev_filter_app",
+                        "manifest_path": "{app_manifest}",
+                        "dependencies": [
+                            {{"name": "runtime_dep", "path": "{dep_root}"}},
+                            {{"name": "dev_only_dep", "path": "{dev_dep_root}"}}
+                        ]
+                    }},
+                    {{
+                        "id": "runtime_dep 0.1.0 (path+file://{dep_root})",
+                        "name": "runtime_dep",
+                        "manifest_path": "{dep_manifest}",
+                        "dependencies": []
+                    }},
+                    {{
+                        "id": "dev_only_dep 0.1.0 (path+file://{dev_dep_root})",
+                        "name": "dev_only_dep",
+                        "manifest_path": "{dev_dep_manifest}",
+                        "dependencies": []
+                    }}
+                ],
+                "workspace_members": [],
+                "workspace_root": null,
+                "resolve": {{
+                    "root": "dev_filter_app 0.1.0 (path+file://{app_root})",
+                    "nodes": [
+                        {{
+                            "id": "dev_filter_app 0.1.0 (path+file://{app_root})",
+                            "deps": [
+                                {{
+                                    "name": "runtime_dep",
+                                    "pkg": "runtime_dep 0.1.0 (path+file://{dep_root})",
+                                    "dep_kinds": [{{"kind": null, "target": null}}]
+                                }},
+                                {{
+                                    "name": "dev_only_dep",
+                                    "pkg": "dev_only_dep 0.1.0 (path+file://{dev_dep_root})",
+                                    "dep_kinds": [{{"kind": "dev", "target": null}}]
+                                }}
+                            ]
+                        }},
+                        {{
+                            "id": "runtime_dep 0.1.0 (path+file://{dep_root})",
+                            "deps": []
+                        }},
+                        {{
+                            "id": "dev_only_dep 0.1.0 (path+file://{dev_dep_root})",
+                            "deps": []
+                        }}
+                    ]
+                }}
+            }}"#,
+            app_root = app_canonical.display(),
+            app_manifest = app_manifest.display(),
+            dep_root = dep_canonical.display(),
+            dep_manifest = dep_manifest.display(),
+            dev_dep_root = dev_dep_canonical.display(),
+            dev_dep_manifest = dev_dep_manifest.display(),
+        );
+
+        let json_clone = metadata_json.clone();
+        let graph = resolve_cargo_path_dependency_graph_with_policy_and_provider(
+            &app_root,
+            &fixture.policy(),
+            move |_| Ok(json_clone.clone()),
+        )
+        .expect("synthetic metadata with dev-only edge should resolve");
+
+        assert_eq!(graph.root_packages, vec![app_canonical.clone()]);
+        assert_eq!(
+            graph.edges.len(),
+            1,
+            "pure dev-only path edges must be ignored"
+        );
+        assert_eq!(graph.edges[0].dependency_name, "runtime_dep");
+        assert_eq!(graph.edges[0].from, app_canonical);
+        assert_eq!(graph.edges[0].to, dep_canonical);
+        assert!(
+            graph
+                .packages
+                .iter()
+                .all(|pkg| pkg.package_root != dev_dep_canonical),
+            "dev-only dependency package should not be pulled into runtime closure"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manifest_fallback_ignores_pure_dev_path_edges() {
+        let fixture = TopologyFixture::new("manifest-fallback-dev-filter");
+        let scenario_root = fixture.canonical_root.join("manifest_fallback_dev_filter");
+        let app_root = scenario_root.join("app");
+        let dep_root = scenario_root.join("dep");
+        let dev_dep_root = scenario_root.join("dev_dep");
+
+        write_lib_crate(&dep_root, "runtime_dep", &[]);
+        write_lib_crate(&dev_dep_root, "dev_only_dep", &[]);
+
+        std::fs::create_dir_all(app_root.join("src")).expect("create app src");
+        std::fs::write(
+            app_root.join("Cargo.toml"),
+            r#"[package]
+name = "manifest_dev_filter_app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+runtime_dep = { path = "../dep" }
+
+[dev-dependencies]
+dev_only_dep = { path = "../dev_dep" }
+"#,
+        )
+        .expect("write app manifest");
+        std::fs::write(app_root.join("src/main.rs"), "fn main() {}\n").expect("write app main");
+
+        let graph = resolve_cargo_path_dependency_graph_with_policy_and_provider(
+            &app_root,
+            &fixture.policy(),
+            |_| {
+                Err(CargoPathDependencyError::new(
+                    CargoPathDependencyErrorKind::MetadataInvocationFailure,
+                    "force manifest fallback",
+                ))
+            },
+        )
+        .expect("manifest fallback should ignore pure dev-only path edges");
+
+        let app_canonical = app_root.canonicalize().expect("canonical app");
+        let dep_canonical = dep_root.canonicalize().expect("canonical dep");
+        let dev_dep_canonical = dev_dep_root.canonicalize().expect("canonical dev dep");
+
+        assert_eq!(graph.root_packages, vec![app_canonical.clone()]);
+        assert_eq!(graph.edges.len(), 1);
+        assert_eq!(graph.edges[0].dependency_name, "runtime_dep");
+        assert_eq!(graph.edges[0].from, app_canonical);
+        assert_eq!(graph.edges[0].to, dep_canonical);
+        assert!(
+            graph
+                .packages
+                .iter()
+                .all(|pkg| pkg.package_root != dev_dep_canonical),
+            "manifest fallback must not pull pure dev-only path deps into runtime closure"
+        );
     }
 
     #[cfg(unix)]

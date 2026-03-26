@@ -1,127 +1,151 @@
 # Hook Integration
 
-## Flow
+## Execution Flow
 
-```
-Claude Code → PreToolUse Hook → rch
-                                 │
-                    ┌────────────┴────────────┐
-                    │ Bash tool?              │
-                    │   └─ Compilation cmd?   │
-                    │       └─ Yes → Remote   │
-                    │       └─ No → Local     │
-                    │   └─ No → Pass through  │
-                    └─────────────────────────┘
+```text
+Claude Code PreToolUse -> rch (no subcommand = hook mode)
+                               |
+                               +-- Non-Bash tool -> allow unchanged
+                               +-- Bash non-compilation -> allow unchanged
+                               +-- Bash compilation -> allow with modified command:
+                                   "rch exec -- <original command>"
 ```
 
-## Installation
+Important behavior:
+
+- Hook returns quickly (classification path), then remote execution happens via `rch exec -- ...`.
+- On unsafe/unavailable remote conditions, hook fails open and allows local execution.
+- For successful or failed remote runs, RCH preserves command semantics by rewriting to `true` or `exit <code>` as needed.
+
+---
+
+## Installation and Status
 
 ```bash
-rch hook install      # Modifies ~/.claude/settings.json
-rch hook status       # Verify
-rch hook uninstall    # Remove
+rch hook install
+rch hook status
+rch hook test
+rch hook uninstall
 ```
 
-Adds to settings:
+For multi-agent installs:
+
+```bash
+rch agents list
+rch agents status
+rch agents install-hook claude-code
+rch agents uninstall-hook claude-code
+```
+
+Installed Claude settings entry:
+
 ```json
-{"hooks":{"PreToolUse":[{"matcher":"Bash","command":"/path/to/rch hook"}]}}
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          { "type": "command", "command": "/absolute/path/to/rch" }
+        ]
+      }
+    ]
+  }
+}
 ```
 
-## Protocol
+---
 
-**Input** (stdin):
+## Hook Protocol (Current)
+
+### Input on `stdin`
+
 ```json
-{"tool":"Bash","input":{"command":"cargo build --release"}}
+{
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "cargo build --release",
+    "description": "Build project"
+  },
+  "session_id": "optional"
+}
 ```
 
-**Output** (stdout):
+### Output on `stdout`
 
-| Response | JSON | Meaning |
-|----------|------|---------|
-| Pass through | `{"allow":true}` | Run locally |
-| Intercept | `{"allow":true,"output":"..."}` | Return captured output |
-| Block | `{"allow":false,"reason":"..."}` | Prevent execution |
+1. Allow unchanged command: **empty stdout**
+2. Allow with command rewrite (transparent interception):
 
-## Classification (5-tier, <5ms total)
-
-| Tier | Time | Check |
-|------|------|-------|
-| 1 | <100μs | Keyword bloom filter |
-| 2 | <200μs | Quick regex scan |
-| 3 | <500μs | Full command parse |
-| 4 | <1ms | Context extraction |
-| 5 | <5ms | Worker selection |
-
-### Intercepted
-
-```
-cargo build/test/check/run, rustc
-bun test, bun typecheck
-gcc, g++, clang, clang++, cc
-make, cmake --build, ninja, meson compile
+```json
+{
+  "hookSpecificOutput": {
+    "hookEventName": "PreToolUse",
+    "permissionDecision": "allow",
+    "updatedInput": {
+      "command": "rch exec -- cargo build --release"
+    }
+  }
+}
 ```
 
-### Never Intercepted
+3. Deny command (rare, policy-level):
 
-```
-bun install/add/remove     # Modifies node_modules
-bun run/dev/build          # Needs local ports
-cargo build | tee log      # Piped
-cargo build > output.txt   # Redirected
-cargo build &              # Background
+```json
+{
+  "hookSpecificOutput": {
+    "hookEventName": "PreToolUse",
+    "permissionDecision": "deny",
+    "permissionDecisionReason": "reason text"
+  }
+}
 ```
 
-## Testing
+---
+
+## What Gets Intercepted
+
+Common intercepted command families:
+
+- Rust: `cargo build`, `cargo check`, `cargo clippy`, `cargo doc`, `cargo test`, `cargo nextest run`, `cargo bench`, `rustc`
+- Bun/TypeScript: `bun test`, `bun typecheck`
+- C/C++: `gcc`, `g++`, `clang`, `clang++`
+- Build systems: `make`, `cmake --build`, `ninja`, `meson compile`
+
+Commonly not intercepted:
+
+- Local-mutating package commands (`cargo install`, `cargo clean`, `bun install`, `bun add`, etc.)
+- Interactive/dev commands (`bun run`, `bun dev`, `bun build`, `bunx`)
+- Piped/redirected/backgrounded shell forms where deterministic offload is unsafe
+
+---
+
+## Quick Hook Tests
 
 ```bash
-# Test classification
-echo '{"tool":"Bash","input":{"command":"cargo build"}}' | rch hook
-# → {"allow":true,"output":"..."}
+# Direct protocol test (compilation command)
+printf '%s\n' \
+  '{"tool_name":"Bash","tool_input":{"command":"cargo build --release"}}' | rch
 
-echo '{"tool":"Bash","input":{"command":"ls -la"}}' | rch hook
-# → {"allow":true}
+# Direct protocol test (non-compilation command should usually return empty stdout)
+printf '%s\n' \
+  '{"tool_name":"Bash","tool_input":{"command":"ls -la"}}' | rch
 
-# Dry run with file input
-RCH_DRY_RUN=1 rch hook < test-input.json
-
-# Dry run (logs but no remote execution)
-RCH_DRY_RUN=1 cargo check
-
-# Debug logging
-RCH_LOG=debug cargo build
-RCH_LOG=trace cargo build  # Maximum detail
-
-# Verify hook is running
-ps aux | grep rch
+# Built-in integration test
+rch hook test
 ```
 
-## Configuration
-
-`~/.config/rch/config.toml`:
-```toml
-[hook]
-classify_timeout_ms = 5      # Classification budget
-pipeline_timeout_s = 300     # Full pipeline timeout
-fail_open = true             # On error → allow local execution
-
-local_patterns = [           # Force local execution
-    "cargo fmt",
-    "cargo doc"
-]
-```
-
-## Uninstalling
+Debugging:
 
 ```bash
-rch hook uninstall  # Removes hook from ~/.claude/settings.json
-
-# Manual removal: edit ~/.claude/settings.json and remove the PreToolUse entry
+RCH_LOG_LEVEL=debug rch hook test
+RCH_LOG_LEVEL=debug rch diagnose "cargo test --workspace"
 ```
 
-## Security
+---
 
-- Runs with user permissions
-- SSH keys via ssh-agent (recommended)
-- Workers should be trusted machines
-- Never modifies source code
-- Artifacts transferred via secure rsync
+## Performance and Safety Notes
+
+- Non-compilation decisions target sub-millisecond latency.
+- Compilation decisions target low-millisecond latency.
+- Hook mode always keeps stdout protocol-clean; diagnostics go to stderr.
+- If parsing/config/daemon selection fails, RCH allows local execution instead of blocking.

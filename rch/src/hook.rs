@@ -2443,6 +2443,10 @@ fn build_dependency_runtime_fail_open_report(
     }
 }
 
+fn should_force_local_fallback_for_runtime_fail_open(reason_code: &str) -> bool {
+    reason_code == DEPENDENCY_PREFLIGHT_CODE_POLICY
+}
+
 fn command_uses_cargo_dependency_graph(kind: Option<CompilationKind>) -> bool {
     matches!(
         kind,
@@ -4424,7 +4428,9 @@ async fn execute_remote_compilation(
                 report_json
             ));
         }
-        if exact_dependency_closure_sync {
+        if exact_dependency_closure_sync
+            && should_force_local_fallback_for_runtime_fail_open(decision.reason_code)
+        {
             warn!(
                 "Dependency planner fail-open on {} [{}]: refusing remote Cargo execution and falling back local ({})",
                 worker_config.id, decision.reason_code, decision.remediation
@@ -7426,6 +7432,20 @@ RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
             report.evidence[0].status,
             DependencyPreflightStatus::PolicyViolation
         );
+    }
+
+    #[test]
+    fn test_should_force_local_fallback_for_runtime_fail_open_policy_only() {
+        let _guard = test_guard!();
+        assert!(should_force_local_fallback_for_runtime_fail_open(
+            DEPENDENCY_PREFLIGHT_CODE_POLICY
+        ));
+        assert!(!should_force_local_fallback_for_runtime_fail_open(
+            DEPENDENCY_PREFLIGHT_CODE_UNKNOWN
+        ));
+        assert!(!should_force_local_fallback_for_runtime_fail_open(
+            DEPENDENCY_PREFLIGHT_CODE_TIMEOUT
+        ));
     }
 
     #[test]

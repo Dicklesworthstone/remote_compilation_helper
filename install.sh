@@ -1109,6 +1109,26 @@ install_skill() {
     local codex_dest="$HOME/.codex/skills/rch"
     local installed_claude=false
     local installed_codex=false
+    local repo_skill_path=""
+    local skill_raw_base="https://raw.githubusercontent.com/${GITHUB_REPO}/main/.claude/skills/rch"
+    local skill_stage="${TEMP_DIR:-/tmp}/rch-skill-stage.$$"
+    local raw_skill_ok=true
+    local rel_path=""
+    local script_dir
+    local skill_url="https://github.com/${GITHUB_REPO}/releases/latest/download/skill.tar.gz"
+    local skill_temp="${TEMP_DIR:-/tmp}/skill.tar.gz"
+    local skill_files=(
+        "SKILL.md"
+        "assets/workers-template.toml"
+        "references/CONFIGURATION.md"
+        "references/HOOKS.md"
+        "references/OPERATIONS.md"
+        "references/TROUBLESHOOTING.md"
+        "references/WORKERS.md"
+        "scripts/diagnose-rch.sh"
+    )
+
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
     info "Installing RCH skill for AI coding agents..."
 
@@ -1116,16 +1136,36 @@ install_skill() {
     mkdir -p "$claude_dest/references"
     mkdir -p "$codex_dest/references"
 
-    # Try to download skill from release assets
-    local skill_url="https://github.com/${GITHUB_REPO}/releases/latest/download/skill.tar.gz"
-    local skill_temp="${TEMP_DIR:-/tmp}/skill.tar.gz"
+    if [[ -d "${script_dir}/.claude/skills/rch" ]] && [[ -f "${script_dir}/.claude/skills/rch/SKILL.md" ]]; then
+        repo_skill_path="${script_dir}/.claude/skills/rch"
+    fi
 
+    if [[ -n "$repo_skill_path" ]] && cp -R "${repo_skill_path}/." "$claude_dest/" && cp -R "${repo_skill_path}/." "$codex_dest/"; then
+        success "Installed RCH skill from repository source at $repo_skill_path"
+        show_skill_info true true
+        return 0
+    fi
+
+    mkdir -p "$skill_stage/assets" "$skill_stage/references" "$skill_stage/scripts"
+    for rel_path in "${skill_files[@]}"; do
+        mkdir -p "${skill_stage}/$(dirname "$rel_path")"
+        if ! curl -fsSL "${PROXY_ARGS[@]}" "${skill_raw_base}/${rel_path}" -o "${skill_stage}/${rel_path}" 2>/dev/null; then
+            raw_skill_ok=false
+            break
+        fi
+    done
+
+    if $raw_skill_ok && cp -R "${skill_stage}/." "$claude_dest/" && cp -R "${skill_stage}/." "$codex_dest/"; then
+        success "Installed RCH skill from repository raw skill tree"
+        show_skill_info true true
+        return 0
+    fi
+
+    # Try release-packaged skill only after repo-local and raw repo sources.
     if curl -fsSL "${PROXY_ARGS[@]}" "$skill_url" -o "$skill_temp" 2>/dev/null; then
-        # Install to Claude skills folder
         if tar -xzf "$skill_temp" -C "$HOME/.claude/skills" 2>/dev/null; then
             installed_claude=true
         fi
-        # Install to Codex skills folder
         if tar -xzf "$skill_temp" -C "$HOME/.codex/skills" 2>/dev/null; then
             installed_codex=true
         fi
@@ -1147,117 +1187,110 @@ install_skill() {
 ---
 name: rch
 description: >-
-  Remote compilation helper. Use when: rch doctor, workers.toml, "no workers",
-  "compilation slow", fleet deploy, self-test, or offload cargo/gcc/bun.
+  Offload cargo/gcc/bun builds to remote workers. Use when compilation is slow,
+  workers are unhealthy, hook routing is unclear, or remote sync/execution is
+  failing.
 ---
 
 # RCH — Remote Compilation Helper
 
-Transparently offloads `cargo build`, `bun test`, `gcc` to remote workers. Same commands, faster builds.
+Use this skill for remote compilation offload, worker fleet health checks, and hook incident recovery.
 
-<!-- TOC: Diagnosis | Quick Fixes | Worker Config | Install | Commands | Debug | References -->
-
-## Diagnosis Loop
+## Quick Start
 
 ```bash
-rch doctor              # What's broken?
-rch doctor --fix        # Auto-fix common issues
-rch doctor --verbose    # All checks passed? Ready to use
+rch check
+rch status --workers --jobs
+rch workers probe --all
+rch hook status
+rch diagnose --dry-run "cargo check --workspace --all-targets"
+rch exec -- env CARGO_TARGET_DIR=/tmp/rch_target_<name> cargo check --workspace --all-targets
 ```
 
-**If `--fix` can't solve it → see Quick Fixes or references.**
+If `rch exec -- ...` succeeds, remote offload is healthy and remaining failures are likely project/toolchain specific.
+
+If `rch status` shows storage pressure, always check both `/` and `/tmp` on the worker before deciding what to fix:
+
+```bash
+ssh ubuntu@<host> 'df -h / /tmp && free -h && cat /proc/pressure/memory && cat /proc/pressure/io'
+```
 
 ---
 
-## Quick Fixes (Copy-Paste)
+## Fast Triage Order
+
+Run in this order and stop at the first failing stage:
+
+1. **Availability**
+```bash
+rch check
+rch status --workers --jobs
+rch workers probe --all
+rch queue
+```
+
+2. **Config + socket consistency**
+```bash
+rch config show --sources
+rch --json config get general.socket_path
+rch --json daemon status
+```
+
+3. **Hook integration**
+```bash
+rch hook status
+rch agents status
+rch hook install
+```
+
+4. **Command classification + path closure**
+```bash
+rch diagnose "cargo build --release"
+rch diagnose --dry-run "cargo test --workspace"
+```
+
+5. **Remote compile proof**
+```bash
+rch exec -- env CARGO_TARGET_DIR=/tmp/rch_target_<name> cargo check --workspace --all-targets
+```
+
+6. **If sync fails or storage looks bad, inspect the worker directly**
+```bash
+ssh ubuntu@<host> 'df -h / /tmp'
+ssh ubuntu@<host> 'du -sh /tmp/rch-* /tmp/rch_target_* 2>/dev/null | sort -h'
+ssh ubuntu@<host> 'find /data/projects -maxdepth 2 -type d \\( -name "target_rch_*" -o -name "target_*" -o -name "target-*" -o -name target \\) -exec du -sh {} + 2>/dev/null | sort -h | tail'
+```
+
+---
+
+## Quick Fixes
 
 | Symptom | Command |
 |---------|---------|
-| SSH auth fails | `eval $(ssh-agent) && ssh-add ~/.ssh/your_key` |
-| Daemon not running | `rm -f /tmp/rch.sock && rchd &` |
-| Hook not installed | `rch hook install --force` |
-| No workers available | `vim ~/.config/rch/workers.toml` (add workers) |
-| Socket permission | `rm /tmp/rch.sock && rchd` |
-| Stale socket | `lsof /tmp/rch.sock` → kill stale process |
+| Hook not installed | `rch hook install && rch hook status` |
+| Daemon not running | `rch daemon start` |
+| Socket mismatch / stale daemon state | `rch daemon restart -y` then `rch --json daemon status` |
+| No workers configured | `rch workers discover --add --yes && rch workers setup --all` |
+| Workers unreachable | `rch workers probe --all` then fix SSH key/host reachability |
+| Transfer churn under target dirs | Add excludes in `~/.config/rch/config.toml`, then `rch daemon reload` |
+| Path dependency missing remotely | Ensure required sibling repos exist on workers under canonical project roots, then retry `rch exec -- ...` |
+| Sync fails with `Permission denied` in `/data/projects/<repo>` | Fix remote mirror ownership: `ssh ubuntu@<host> 'sudo chown -R ubuntu:ubuntu /data/projects/<repo> && sudo chmod 775 /data/projects/<repo>'` |
+| Worker shows pressure warning | Check `/` and `/tmp` separately, then inspect stale `rch_target_*`, `rch-*`, and `target_rch_*` dirs before broader cleanup |
+| Need full environment diagnosis | `rch doctor` and `rch config doctor` |
 
 ---
 
-## Worker Config (`~/.config/rch/workers.toml`)
+## Reference Index
 
-```toml
-[[workers]]
-id = "builder"
-host = "192.168.1.100"        # IP or hostname
-user = "ubuntu"
-identity_file = "~/.ssh/id_ed25519"
-total_slots = 8               # ≈ CPU cores - 2
-priority = 100                # Higher = preferred
-tags = ["rust", "bun"]        # Optional capabilities
-```
+Use these files for full depth:
 
-### Auto-Discover from SSH Config
-
-```bash
-rch workers discover --from-ssh-config --dry-run  # Preview
-rch workers discover --from-ssh-config            # Add to config
-```
-
-### Verify Workers
-
-```bash
-rch workers probe --all         # Test all workers
-rch workers probe worker1 -v    # Test single, verbose
-rch workers list                # Show status
-```
-
----
-
-## Commands
-
-- `rch doctor` - Diagnose issues
-- `rch status` - Show daemon status
-- `rch workers probe --all` - Test all workers
-- `rch workers discover --from-ssh-config` - Auto-discover workers
-- `rch fleet status` - Show all workers
-- `rch self-test` - Full end-to-end verification
-
----
-
-## Fleet Operations
-
-```bash
-rch fleet status             # Show all workers
-rch fleet preflight --all    # Verify workers ready
-rch fleet deploy --all       # Deploy rch-wkr to workers
-rch self-test                # Full end-to-end verification
-```
-
----
-
-## Anti-Patterns
-
-| Don't | Why | Do Instead |
-|-------|-----|------------|
-| Run daemon as root | Security risk | `systemctl --user start rchd` |
-| Skip `rch doctor` | Miss config issues | Always verify first |
-| Use `--force` blindly | May break hook | Check `rch hook status` first |
-| Ignore transfer errors | Indicates network/disk issues | Check worker disk space, network |
-
----
-
-## Debug
-
-```bash
-RCH_LOG=debug cargo build    # Show hook decisions
-RCH_DRY_RUN=1 cargo check    # Test without remote execution
-rch doctor --json > diag.json  # Export diagnostics
-```
-
----
-
-## Docs
-
-Full documentation: https://github.com/Dicklesworthstone/remote_compilation_helper
+- **Runbooks + operational playbooks**: `references/OPERATIONS.md`
+- **Troubleshooting flow + failure signatures**: `references/TROUBLESHOOTING.md`
+- **Worker lifecycle operations**: `references/WORKERS.md`
+- **Config hierarchy + environment controls**: `references/CONFIGURATION.md`
+- **PreToolUse hook protocol and behavior**: `references/HOOKS.md`
+- **Workers config template**: `assets/workers-template.toml`
+- **Project docs**: https://github.com/Dicklesworthstone/remote_compilation_helper
 SKILL_EOF
 )
 
