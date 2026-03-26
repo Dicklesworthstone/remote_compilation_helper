@@ -579,6 +579,23 @@ fn default_package_name(root: &Path) -> String {
         .unwrap_or_else(|| root.display().to_string())
 }
 
+fn allowed_dependency_roots(policy: &PathTopologyPolicy) -> Vec<PathBuf> {
+    let mut roots = vec![
+        policy.canonical_root().to_path_buf(),
+        policy.alias_root().to_path_buf(),
+    ];
+
+    for candidate in [policy.canonical_root(), policy.alias_root()] {
+        if let Ok(resolved) = std::fs::canonicalize(candidate) {
+            if !roots.iter().any(|root| root == &resolved) {
+                roots.push(resolved);
+            }
+        }
+    }
+
+    roots
+}
+
 fn validate_absolute_dependency_scope(
     dependency_candidate: &Path,
     policy: &PathTopologyPolicy,
@@ -589,27 +606,27 @@ fn validate_absolute_dependency_scope(
     if !dependency_candidate.is_absolute() {
         return Ok(());
     }
-    if dependency_candidate.starts_with(policy.canonical_root())
-        || dependency_candidate.starts_with(policy.alias_root())
+    let allowed_roots = allowed_dependency_roots(policy);
+    if allowed_roots
+        .iter()
+        .any(|root| dependency_candidate.starts_with(root))
     {
         return Ok(());
     }
 
-    Err(CargoPathDependencyError::new(
+    let mut error = CargoPathDependencyError::new(
         CargoPathDependencyErrorKind::PathPolicyViolation,
         format!("{context}: {}", dependency_candidate.display()),
     )
     .with_manifest_path(manifest_path)
     .with_dependency_name(dependency_name.to_string())
-    .with_dependency_path(dependency_candidate.to_path_buf())
-    .with_diagnostic(format!(
-        "allowed canonical root: {}",
-        policy.canonical_root().display()
-    ))
-    .with_diagnostic(format!(
-        "allowed alias root: {}",
-        policy.alias_root().display()
-    )))
+    .with_dependency_path(dependency_candidate.to_path_buf());
+
+    for root in &allowed_roots {
+        error = error.with_diagnostic(format!("allowed root: {}", root.display()));
+    }
+
+    Err(error)
 }
 
 fn normalize_path_for_policy(
@@ -1765,6 +1782,26 @@ mod tests {
             error.kind(),
             &CargoPathDependencyErrorKind::PathPolicyViolation
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolved_alias_target_is_allowed_for_absolute_dependency_scope() {
+        let fixture = TopologyFixture::new("resolved-alias-target");
+        let alias_target_root = fixture
+            .alias_root
+            .canonicalize()
+            .expect("resolve alias target root");
+        let dependency_candidate = alias_target_root.join("repo/crate_dep");
+
+        validate_absolute_dependency_scope(
+            &dependency_candidate,
+            &fixture.policy(),
+            Path::new("/tmp/Cargo.toml"),
+            "crate_dep",
+            "metadata dependency path policy violation",
+        )
+        .expect("resolved alias target should be accepted");
     }
 
     #[cfg(unix)]
