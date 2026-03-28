@@ -2509,19 +2509,49 @@ fn build_dependency_runtime_plan(
         };
     }
 
+    // When the dependency graph has an enclosing workspace root, promote
+    // individual package roots that live inside it to the workspace root.
+    // Without this, nested path dependencies only sync their own crate
+    // directory, missing the workspace-level Cargo.toml/Cargo.lock that
+    // the remote build requires.
+    let workspace_root_normalized = plan
+        .workspace_root
+        .as_deref()
+        .and_then(|ws| normalize_dependency_root_for_runtime(ws, topology_policy));
+
     let mut seen = std::collections::BTreeSet::<PathBuf>::new();
     let mut ordered = Vec::<PathBuf>::new();
     for action in &plan.sync_order {
         if let Some(root) =
             normalize_dependency_root_for_runtime(&action.package_root, topology_policy)
-            && seen.insert(root.clone())
         {
-            reporter.verbose(&format!(
-                "[RCH] dependency root {} ({:?})",
-                root.display(),
-                action.metadata.reason
-            ));
-            ordered.push(root);
+            // If this package lives inside a known workspace, promote the
+            // sync root to the workspace root so the entire workspace
+            // (including shared Cargo.lock) is transferred.
+            let effective_root =
+                if let Some(ws_root) = &workspace_root_normalized
+                    && root.starts_with(ws_root)
+                    && root != *ws_root
+                {
+                    reporter.verbose(&format!(
+                        "[RCH] promoting dependency root {} -> workspace root {} ({:?})",
+                        root.display(),
+                        ws_root.display(),
+                        action.metadata.reason
+                    ));
+                    ws_root.clone()
+                } else {
+                    root
+                };
+
+            if seen.insert(effective_root.clone()) {
+                reporter.verbose(&format!(
+                    "[RCH] dependency root {} ({:?})",
+                    effective_root.display(),
+                    action.metadata.reason
+                ));
+                ordered.push(effective_root);
+            }
         }
     }
 
