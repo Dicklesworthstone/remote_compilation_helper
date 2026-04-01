@@ -111,6 +111,21 @@ impl WorkerState {
         *self.status.write().await = status;
     }
 
+    /// Apply a health-derived status without overriding administrative lifecycle states.
+    ///
+    /// Health probes may mark a worker healthy/unreachable, but they must not revive
+    /// workers that are intentionally `Draining`, `Drained`, or `Disabled`.
+    pub async fn apply_health_status(&self, health_status: WorkerStatus) -> WorkerStatus {
+        let mut status = self.status.write().await;
+        match *status {
+            WorkerStatus::Draining | WorkerStatus::Drained | WorkerStatus::Disabled => *status,
+            _ => {
+                *status = health_status;
+                health_status
+            }
+        }
+    }
+
     /// Get the number of available slots.
     pub async fn available_slots(&self) -> u32 {
         let used = self.used_slots.load(Ordering::Relaxed);
@@ -1137,6 +1152,56 @@ mod tests {
 
         state.set_status(WorkerStatus::Healthy).await;
         assert_eq!(state.status().await, WorkerStatus::Healthy);
+    }
+
+    #[tokio::test]
+    async fn test_apply_health_status_updates_non_administrative_states() {
+        let state = WorkerState::new(test_config("test"));
+
+        assert_eq!(
+            state.apply_health_status(WorkerStatus::Degraded).await,
+            WorkerStatus::Degraded
+        );
+        assert_eq!(state.status().await, WorkerStatus::Degraded);
+
+        assert_eq!(
+            state.apply_health_status(WorkerStatus::Unreachable).await,
+            WorkerStatus::Unreachable
+        );
+        assert_eq!(state.status().await, WorkerStatus::Unreachable);
+
+        assert_eq!(
+            state.apply_health_status(WorkerStatus::Healthy).await,
+            WorkerStatus::Healthy
+        );
+        assert_eq!(state.status().await, WorkerStatus::Healthy);
+    }
+
+    #[tokio::test]
+    async fn test_apply_health_status_preserves_administrative_states() {
+        let state = WorkerState::new(test_config("test"));
+
+        state.drain().await;
+        assert_eq!(
+            state.apply_health_status(WorkerStatus::Healthy).await,
+            WorkerStatus::Draining
+        );
+        assert_eq!(state.status().await, WorkerStatus::Draining);
+
+        state.check_drain_complete().await;
+        assert_eq!(state.status().await, WorkerStatus::Drained);
+        assert_eq!(
+            state.apply_health_status(WorkerStatus::Healthy).await,
+            WorkerStatus::Drained
+        );
+        assert_eq!(state.status().await, WorkerStatus::Drained);
+
+        state.disable(Some("maintenance".to_string())).await;
+        assert_eq!(
+            state.apply_health_status(WorkerStatus::Healthy).await,
+            WorkerStatus::Disabled
+        );
+        assert_eq!(state.status().await, WorkerStatus::Disabled);
     }
 
     #[tokio::test]

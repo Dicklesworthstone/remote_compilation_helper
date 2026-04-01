@@ -209,6 +209,7 @@ pub async fn run_exec(command_parts: Vec<String>) -> anyhow::Result<()> {
         &config.environment.allowlist,
         project_root.as_deref().unwrap_or_else(|| Path::new(".")),
         &reporter,
+        Some(&command_parts),
     );
 
     // Determine required runtime
@@ -1743,10 +1744,12 @@ async fn handle_selection_response(
         worker.user, worker.host, worker.slots_available, worker.speed_score
     ));
     let invocation_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let command_tokens = parse_command_tokens(command, reporter);
     let forwarded_cargo_target_dir = resolve_forwarded_cargo_target_dir(
         &config.environment.allowlist,
         &invocation_cwd,
         reporter,
+        command_tokens.as_deref(),
     );
 
     // Execute remote compilation pipeline
@@ -2509,48 +2512,19 @@ fn build_dependency_runtime_plan(
         };
     }
 
-    // When the dependency graph has an enclosing workspace root, promote
-    // individual package roots that live inside it to the workspace root.
-    // Without this, nested path dependencies only sync their own crate
-    // directory, missing the workspace-level Cargo.toml/Cargo.lock that
-    // the remote build requires.
-    let workspace_root_normalized = plan
-        .workspace_root
-        .as_deref()
-        .and_then(|ws| normalize_dependency_root_for_runtime(ws, topology_policy));
-
     let mut seen = std::collections::BTreeSet::<PathBuf>::new();
     let mut ordered = Vec::<PathBuf>::new();
     for action in &plan.sync_order {
         if let Some(root) =
             normalize_dependency_root_for_runtime(&action.package_root, topology_policy)
         {
-            // If this package lives inside a known workspace, promote the
-            // sync root to the workspace root so the entire workspace
-            // (including shared Cargo.lock) is transferred.
-            let effective_root =
-                if let Some(ws_root) = &workspace_root_normalized
-                    && root.starts_with(ws_root)
-                    && root != *ws_root
-                {
-                    reporter.verbose(&format!(
-                        "[RCH] promoting dependency root {} -> workspace root {} ({:?})",
-                        root.display(),
-                        ws_root.display(),
-                        action.metadata.reason
-                    ));
-                    ws_root.clone()
-                } else {
-                    root
-                };
-
-            if seen.insert(effective_root.clone()) {
+            if seen.insert(root.clone()) {
                 reporter.verbose(&format!(
                     "[RCH] dependency root {} ({:?})",
-                    effective_root.display(),
+                    root.display(),
                     action.metadata.reason
                 ));
-                ordered.push(effective_root);
+                ordered.push(root);
             }
         }
     }
@@ -2580,6 +2554,7 @@ fn resolve_forwarded_cargo_target_dir_with_lookup<F>(
     invocation_cwd: &Path,
     reporter: &HookReporter,
     mut lookup_env: F,
+    command_tokens: Option<&[String]>,
 ) -> Option<PathBuf>
 where
     F: FnMut(&str) -> Option<String>,
@@ -2588,10 +2563,23 @@ where
         return None;
     }
 
-    let raw = match lookup_env("CARGO_TARGET_DIR") {
+    let raw = lookup_env("CARGO_TARGET_DIR").or_else(|| {
+        command_tokens.and_then(|tokens| {
+            extract_cargo_target_dir_from_command_tokens(tokens).map(|value| {
+                reporter.verbose(
+                    "[RCH] CARGO_TARGET_DIR forwarding detected from delegated command tokens",
+                );
+                value
+            })
+        })
+    });
+
+    let raw = match raw {
         Some(value) => value,
         None => {
-            reporter.verbose("[RCH] CARGO_TARGET_DIR is allowlisted but unset locally");
+            reporter.verbose(
+                "[RCH] CARGO_TARGET_DIR is allowlisted but unset locally and absent from command",
+            );
             return None;
         }
     };
@@ -2620,10 +2608,79 @@ fn resolve_forwarded_cargo_target_dir(
     env_allowlist: &[String],
     invocation_cwd: &Path,
     reporter: &HookReporter,
+    command_tokens: Option<&[String]>,
 ) -> Option<PathBuf> {
-    resolve_forwarded_cargo_target_dir_with_lookup(env_allowlist, invocation_cwd, reporter, |key| {
-        std::env::var(key).ok()
-    })
+    resolve_forwarded_cargo_target_dir_with_lookup(
+        env_allowlist,
+        invocation_cwd,
+        reporter,
+        |key| std::env::var(key).ok(),
+        command_tokens,
+    )
+}
+
+fn extract_cargo_target_dir_from_command_tokens(tokens: &[String]) -> Option<String> {
+    fn scan_assignment_prefix(tokens: &[String], start: usize) -> Option<String> {
+        let mut index = start;
+        while let Some(token) = tokens.get(index) {
+            if let Some((key, value)) = token.split_once('=') {
+                if key == "CARGO_TARGET_DIR" {
+                    return Some(value.to_string());
+                }
+                index += 1;
+                continue;
+            }
+            break;
+        }
+        None
+    }
+
+    let mut index = 0usize;
+    while let Some(token) = tokens.get(index) {
+        match token.as_str() {
+            "sudo" | "time" => {
+                index += 1;
+                while let Some(flag) = tokens.get(index) {
+                    if flag.starts_with('-') {
+                        index += 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            "env" => {
+                index += 1;
+                while let Some(flag) = tokens.get(index) {
+                    if flag == "--" {
+                        index += 1;
+                        break;
+                    }
+                    if flag.starts_with('-') && !flag.contains('=') {
+                        index += 1;
+                    } else {
+                        break;
+                    }
+                }
+                return scan_assignment_prefix(tokens, index);
+            }
+            _ => return scan_assignment_prefix(tokens, index),
+        }
+    }
+
+    None
+}
+
+fn parse_command_tokens(command: &str, reporter: &HookReporter) -> Option<Vec<String>> {
+    match shell_words::split(command) {
+        Ok(tokens) => Some(tokens),
+        Err(error) => {
+            reporter.verbose(&format!(
+                "[RCH] failed to parse delegated command for CARGO_TARGET_DIR forwarding: {}",
+                error
+            ));
+            None
+        }
+    }
 }
 
 fn should_skip_remote_preflight(worker: &WorkerConfig) -> bool {
@@ -3518,6 +3575,14 @@ struct SyncClosurePlanEntry {
     project_id: String,
     root_hash: String,
     is_primary: bool,
+    mode: SyncClosureMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum SyncClosureMode {
+    Full,
+    WorkspaceMetadata,
 }
 
 /// Outcome of syncing a single closure root during multi-root transfer.
@@ -3550,6 +3615,7 @@ struct SyncClosureManifestEntry {
     project_id: String,
     root_hash: String,
     is_primary: bool,
+    mode: SyncClosureMode,
 }
 
 const DEPENDENCY_PREFLIGHT_SCHEMA_VERSION: &str = "rch.dependency_preflight.v1";
@@ -3566,6 +3632,14 @@ const DEPENDENCY_PREFLIGHT_REMEDIATION_UNKNOWN: &str =
     "Dependency verification could not determine remote state; inspect sync/SSH logs and retry.";
 const DEPENDENCY_PREFLIGHT_REMEDIATION_POLICY: &str = "Path dependency topology policy failed; move dependencies under /data/projects (or /dp) and retry.";
 const DEPENDENCY_PREFLIGHT_REMEDIATION_TIMEOUT: &str = "Dependency planner timed out; rerun after system load decreases or investigate cargo metadata latency.";
+const WORKSPACE_METADATA_SYNC_PATTERNS: &[&str] = &[
+    "Cargo.toml",
+    "Cargo.lock",
+    "rust-toolchain",
+    "rust-toolchain.toml",
+    ".cargo/",
+    ".cargo/**",
+];
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -3773,6 +3847,37 @@ fn canonicalize_sync_root_for_plan(root: &Path, policy: &PathTopologyPolicy) -> 
         .unwrap_or_else(|| root.to_path_buf())
 }
 
+fn manifest_declares_workspace(manifest_path: &Path) -> bool {
+    let Ok(contents) = std::fs::read_to_string(manifest_path) else {
+        return false;
+    };
+    let Ok(table) = toml::from_str::<toml::Table>(&contents) else {
+        return false;
+    };
+    table.contains_key("workspace")
+}
+
+fn enclosing_workspace_root_for_sync_root(root: &Path, policy: &PathTopologyPolicy) -> Option<PathBuf> {
+    for candidate in root.ancestors() {
+        if !is_within_sync_topology(candidate, policy) {
+            break;
+        }
+        let manifest_path = candidate.join("Cargo.toml");
+        if manifest_path.is_file() && manifest_declares_workspace(&manifest_path) {
+            return (candidate != root).then(|| candidate.to_path_buf());
+        }
+    }
+
+    None
+}
+
+fn workspace_metadata_sync_patterns() -> Vec<String> {
+    WORKSPACE_METADATA_SYNC_PATTERNS
+        .iter()
+        .map(|pattern| (*pattern).to_string())
+        .collect()
+}
+
 fn effective_sync_topology_roots(policy: &PathTopologyPolicy) -> Vec<PathBuf> {
     let mut roots = Vec::new();
     roots.push(policy.canonical_root().to_path_buf());
@@ -3814,7 +3919,8 @@ fn build_sync_closure_plan(
     project_hash: &str,
     topology_policy: &PathTopologyPolicy,
 ) -> Vec<SyncClosurePlanEntry> {
-    let mut ordered_roots = std::collections::BTreeSet::<PathBuf>::new();
+    let mut ordered_entries =
+        std::collections::BTreeSet::<(PathBuf, SyncClosureMode)>::new();
     for root in sync_roots {
         let canonicalized = canonicalize_sync_root_for_plan(root, topology_policy);
         if !is_within_sync_topology(&canonicalized, topology_policy) {
@@ -3827,16 +3933,28 @@ fn build_sync_closure_plan(
             );
             continue;
         }
-        ordered_roots.insert(canonicalized);
+        ordered_entries.insert((canonicalized.clone(), SyncClosureMode::Full));
+        if let Some(workspace_root) =
+            enclosing_workspace_root_for_sync_root(&canonicalized, topology_policy)
+        {
+            ordered_entries.insert((workspace_root, SyncClosureMode::WorkspaceMetadata));
+        }
     }
 
     let primary_root = canonicalize_sync_root_for_plan(normalized_project_root, topology_policy);
-    ordered_roots.insert(primary_root.clone());
+    ordered_entries.insert((primary_root.clone(), SyncClosureMode::Full));
+    let full_roots: Vec<PathBuf> = ordered_entries
+        .iter()
+        .filter_map(|(root, mode)| (*mode == SyncClosureMode::Full).then(|| root.clone()))
+        .collect();
+    for root in full_roots {
+        ordered_entries.remove(&(root, SyncClosureMode::WorkspaceMetadata));
+    }
 
-    ordered_roots
+    ordered_entries
         .into_iter()
-        .map(|root| {
-            let is_primary = root == primary_root;
+        .map(|(root, mode)| {
+            let is_primary = root == primary_root && mode == SyncClosureMode::Full;
             let root_hash = if is_primary {
                 project_hash.to_string()
             } else {
@@ -3847,6 +3965,7 @@ fn build_sync_closure_plan(
                 project_id: project_id_from_path(&root),
                 root_hash,
                 is_primary,
+                mode,
                 local_root: root,
             }
         })
@@ -3871,10 +3990,11 @@ fn build_sync_closure_manifest(
             project_id: entry.project_id.clone(),
             root_hash: entry.root_hash.clone(),
             is_primary: entry.is_primary,
+            mode: entry.mode,
         })
         .collect();
     SyncClosureManifest {
-        schema_version: "rch.sync_closure_manifest.v1",
+        schema_version: "rch.sync_closure_manifest.v2",
         generated_at_unix_ms,
         project_root: normalized_project_root.to_string_lossy().to_string(),
         entries,
@@ -4592,6 +4712,11 @@ async fn execute_remote_compilation(
         .with_compilation_kind(kind)
         .with_remote_path_override(entry.remote_root.clone())
         .with_build_id(build_id);
+        if entry.mode == SyncClosureMode::WorkspaceMetadata {
+            root_pipeline = root_pipeline
+                .with_sync_include_patterns(workspace_metadata_sync_patterns())
+                .with_sync_delete(false);
+        }
         if entry.is_primary {
             root_pipeline = root_pipeline.with_env_allowlist(env_allowlist.clone());
         }
@@ -7034,6 +7159,7 @@ The file `x11.pc` needs to be installed and the PKG_CONFIG_PATH environment vari
             Path::new("/tmp/rch"),
             &reporter,
             |_| Some("/tmp/rch-target-no-allowlist".to_string()),
+            None,
         );
 
         assert!(resolved.is_none());
@@ -7048,12 +7174,63 @@ The file `x11.pc` needs to be installed and the PKG_CONFIG_PATH environment vari
             Path::new("/data/projects/remote_compilation_helper"),
             &reporter,
             |_| Some("tmp/custom-target".to_string()),
+            None,
         );
 
         assert_eq!(
             resolved,
             Some(PathBuf::from(
                 "/data/projects/remote_compilation_helper/tmp/custom-target"
+            ))
+        );
+    }
+
+    #[test]
+    fn test_resolve_forwarded_cargo_target_dir_extracts_env_wrapper_assignment() {
+        let _guard = test_guard!();
+        let reporter = HookReporter::new(OutputVisibility::Verbose);
+        let command_tokens = vec![
+            "env".to_string(),
+            "RUST_BACKTRACE=1".to_string(),
+            "CARGO_TARGET_DIR=/data/projects/custom-target".to_string(),
+            "cargo".to_string(),
+            "check".to_string(),
+        ];
+        let resolved = resolve_forwarded_cargo_target_dir_with_lookup(
+            &[String::from("CARGO_TARGET_DIR")],
+            Path::new("/data/projects/remote_compilation_helper"),
+            &reporter,
+            |_| None,
+            Some(&command_tokens),
+        );
+
+        assert_eq!(
+            resolved,
+            Some(PathBuf::from("/data/projects/custom-target"))
+        );
+    }
+
+    #[test]
+    fn test_resolve_forwarded_cargo_target_dir_extracts_inline_assignment() {
+        let _guard = test_guard!();
+        let reporter = HookReporter::new(OutputVisibility::Verbose);
+        let command_tokens = vec![
+            "CARGO_TARGET_DIR=.rch-target-inline".to_string(),
+            "cargo".to_string(),
+            "build".to_string(),
+        ];
+        let resolved = resolve_forwarded_cargo_target_dir_with_lookup(
+            &[String::from("CARGO_TARGET_DIR")],
+            Path::new("/data/projects/remote_compilation_helper"),
+            &reporter,
+            |_| None,
+            Some(&command_tokens),
+        );
+
+        assert_eq!(
+            resolved,
+            Some(PathBuf::from(
+                "/data/projects/remote_compilation_helper/.rch-target-inline"
             ))
         );
     }
@@ -7298,6 +7475,7 @@ The file `x11.pc` needs to be installed and the PKG_CONFIG_PATH environment vari
                     project_id: "frankenterm".to_string(),
                     root_hash: "hash-primary".to_string(),
                     is_primary: true,
+                    mode: SyncClosureMode::Full,
                 },
                 SyncRootOutcome::Synced,
             ),
@@ -7308,6 +7486,7 @@ The file `x11.pc` needs to be installed and the PKG_CONFIG_PATH environment vari
                     project_id: "frankentui".to_string(),
                     root_hash: "hash-dep".to_string(),
                     is_primary: false,
+                    mode: SyncClosureMode::Full,
                 },
                 SyncRootOutcome::Failed {
                     error: "no sync".to_string(),
@@ -7345,6 +7524,7 @@ RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
             project_id: format!("id-{}", root.replace('/', "_")),
             root_hash: format!("hash-{}", root.replace('/', "_")),
             is_primary,
+            mode: SyncClosureMode::Full,
         }
     }
 
@@ -7516,6 +7696,7 @@ RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
             project_id: "id-remote-paths".to_string(),
             root_hash: "hash-remote-paths".to_string(),
             is_primary: true,
+            mode: SyncClosureMode::Full,
         };
         let outcomes = vec![(entry, SyncRootOutcome::Synced)];
         let present = std::collections::BTreeSet::from([String::from(
@@ -7851,6 +8032,136 @@ RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
             })
             .count();
         assert_eq!(dep_entries, 1, "alias/canonical roots should deduplicate");
+    }
+
+    #[test]
+    fn test_build_sync_closure_plan_adds_workspace_metadata_for_member_roots() {
+        let _guard = test_guard!();
+        let temp_dir = tempfile::tempdir_in("/data/projects").expect("create tempdir");
+        let project_root = temp_dir.path().join("project");
+        let dep_workspace_root = temp_dir.path().join("dep_workspace");
+        let dep_member_root = dep_workspace_root.join("crates/member");
+
+        std::fs::create_dir_all(&project_root).expect("create project root");
+        std::fs::create_dir_all(&dep_member_root).expect("create member root");
+        std::fs::write(
+            dep_workspace_root.join("Cargo.toml"),
+            r#"[workspace]
+members = ["crates/member"]
+"#,
+        )
+        .expect("write workspace manifest");
+        std::fs::write(
+            dep_member_root.join("Cargo.toml"),
+            r#"[package]
+name = "member"
+version = "0.1.0"
+edition = "2024"
+"#,
+        )
+        .expect("write member manifest");
+
+        let plan = build_sync_closure_plan(
+            &[dep_member_root.clone(), project_root.clone()],
+            &project_root,
+            "workspace_hash",
+            &PathTopologyPolicy::default(),
+        );
+
+        assert!(
+            plan.iter()
+                .any(|entry| entry.local_root == dep_member_root
+                    && entry.mode == SyncClosureMode::Full
+                    && !entry.is_primary),
+            "workspace member root should remain a full sync root"
+        );
+        assert!(
+            plan.iter()
+                .any(|entry| entry.local_root == dep_workspace_root
+                    && entry.mode == SyncClosureMode::WorkspaceMetadata
+                    && !entry.is_primary),
+            "workspace member roots should add a thin workspace metadata sync"
+        );
+        assert!(
+            !plan.iter().any(|entry| entry.local_root == dep_workspace_root
+                && entry.mode == SyncClosureMode::Full),
+            "workspace root should not become a full sync root unless it was explicitly requested"
+        );
+    }
+
+    #[test]
+    fn test_build_dependency_runtime_plan_keeps_workspace_member_roots() {
+        let _guard = test_guard!();
+        let temp_dir = tempfile::tempdir_in("/data/projects").expect("create tempdir");
+        let project_root = temp_dir.path().join("project");
+        let dep_workspace_root = temp_dir.path().join("dep_workspace");
+        let dep_member_root = dep_workspace_root.join("crates/member");
+
+        std::fs::create_dir_all(project_root.join("src")).expect("create project src");
+        std::fs::create_dir_all(dep_member_root.join("src")).expect("create member src");
+        std::fs::write(
+            project_root.join("Cargo.toml"),
+            r#"[package]
+name = "project"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+member = { path = "../dep_workspace/crates/member" }
+"#,
+        )
+        .expect("write project manifest");
+        std::fs::write(project_root.join("src/lib.rs"), "pub fn project() {}\n")
+            .expect("write project lib");
+        std::fs::write(
+            dep_workspace_root.join("Cargo.toml"),
+            r#"[workspace]
+members = ["crates/member"]
+"#,
+        )
+        .expect("write workspace manifest");
+        std::fs::write(
+            dep_member_root.join("Cargo.toml"),
+            r#"[package]
+name = "member"
+version = "0.1.0"
+edition = "2024"
+"#,
+        )
+        .expect("write member manifest");
+        std::fs::write(dep_member_root.join("src/lib.rs"), "pub fn member() {}\n")
+            .expect("write member lib");
+
+        let project_root = std::fs::canonicalize(&project_root).expect("canonicalize project");
+        let dep_workspace_root =
+            std::fs::canonicalize(&dep_workspace_root).expect("canonicalize workspace");
+        let dep_member_root =
+            std::fs::canonicalize(&dep_member_root).expect("canonicalize member");
+        let reporter = HookReporter::new(OutputVisibility::None);
+
+        let plan = build_dependency_runtime_plan(
+            &project_root,
+            Some(CompilationKind::CargoCheck),
+            &reporter,
+            &PathTopologyPolicy::default(),
+        );
+
+        assert!(
+            plan.fail_open_decision.is_none(),
+            "dependency runtime planning should stay on the ready path"
+        );
+        assert!(
+            plan.sync_roots.contains(&dep_member_root),
+            "workspace member root must stay in the runtime sync roots"
+        );
+        assert!(
+            !plan.sync_roots.contains(&dep_workspace_root),
+            "workspace root should be added later as metadata-only sync, not full runtime root"
+        );
+        assert!(
+            plan.sync_roots.contains(&project_root),
+            "primary project root must remain in the sync roots"
+        );
     }
 
     #[tokio::test]
@@ -9751,8 +10062,8 @@ RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
         let manifest = build_sync_closure_manifest(&plan, &project_root);
 
         assert_eq!(
-            manifest.schema_version, "rch.sync_closure_manifest.v1",
-            "schema version must match the documented v1 contract"
+            manifest.schema_version, "rch.sync_closure_manifest.v2",
+            "schema version must match the documented v2 contract"
         );
     }
 
@@ -9927,7 +10238,7 @@ RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
         let json =
             serde_json::to_string_pretty(&manifest).expect("manifest should serialize to JSON");
         assert!(
-            json.contains("rch.sync_closure_manifest.v1"),
+            json.contains("rch.sync_closure_manifest.v2"),
             "JSON must contain schema_version"
         );
         assert!(
@@ -10392,7 +10703,7 @@ RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
         let manifest = build_sync_closure_manifest(&[], &project_root);
         assert_eq!(manifest.entries.len(), 0);
         assert_eq!(manifest.project_root, "/data/projects/empty_proj");
-        assert_eq!(manifest.schema_version, "rch.sync_closure_manifest.v1");
+        assert_eq!(manifest.schema_version, "rch.sync_closure_manifest.v2");
     }
 
     #[test]
@@ -10473,6 +10784,7 @@ RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
             project_id: "日本語".to_string(),
             root_hash: "unicode_hash".to_string(),
             is_primary: true,
+            mode: SyncClosureMode::Full,
         }];
         let manifest =
             build_sync_closure_manifest(&entries, Path::new("/data/projects/日本語プロジェクト"));
@@ -10495,6 +10807,7 @@ RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
             project_id: long_id.clone(),
             root_hash: long_hash.clone(),
             is_primary: true,
+            mode: SyncClosureMode::Full,
         }];
         let manifest = build_sync_closure_manifest(&entries, Path::new("/data/projects/long_test"));
         assert_eq!(
@@ -10703,7 +11016,7 @@ RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
             .unwrap()
             .as_millis() as i64;
 
-        assert_eq!(manifest.schema_version, "rch.sync_closure_manifest.v1");
+        assert_eq!(manifest.schema_version, "rch.sync_closure_manifest.v2");
         assert_eq!(manifest.entries.len(), 3);
         assert!(manifest.generated_at_unix_ms >= before_ms);
         assert!(manifest.generated_at_unix_ms <= after_ms);

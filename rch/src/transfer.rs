@@ -222,6 +222,10 @@ pub struct TransferPipeline {
     /// When set, transfer and execution use this path directly instead of
     /// deriving `<remote_base>/<project_id>/<project_hash>`.
     remote_path_override: Option<String>,
+    /// Optional include-only patterns for sync-to-remote uploads.
+    sync_include_patterns: Option<Vec<String>>,
+    /// Whether sync-to-remote should delete extraneous files remotely.
+    sync_delete: bool,
     /// Build ID for tracking and cancellation.
     build_id: Option<u64>,
 }
@@ -311,6 +315,8 @@ impl TransferPipeline {
             compilation_config: rch_common::CompilationConfig::default(),
             estimated_transfer_bytes: None,
             remote_path_override: None,
+            sync_include_patterns: None,
+            sync_delete: true,
             build_id: None,
         }
     }
@@ -339,6 +345,18 @@ impl TransferPipeline {
     /// Set environment allowlist for remote execution.
     pub fn with_env_allowlist(mut self, allowlist: Vec<String>) -> Self {
         self.env_allowlist = allowlist;
+        self
+    }
+
+    /// Restrict sync-to-remote uploads to a small include-only set.
+    pub fn with_sync_include_patterns(mut self, patterns: Vec<String>) -> Self {
+        self.sync_include_patterns = Some(patterns);
+        self
+    }
+
+    /// Control whether sync-to-remote deletes extraneous remote files.
+    pub fn with_sync_delete(mut self, delete: bool) -> Self {
+        self.sync_delete = delete;
         self
     }
 
@@ -932,18 +950,29 @@ fi",
 
         cmd.arg("-az") // Archive mode + compression
             .arg("--stats") // Structured output for parse_rsync_bytes/files
-            .arg("--delete") // Remove extraneous files from destination
             .arg("-e")
             .arg(ssh_command);
+
+        if self.sync_delete {
+            cmd.arg("--delete"); // Remove extraneous files from destination
+        }
 
         // Create remote directory implicitly using rsync-path wrapper
         // This saves a separate SSH handshake for 'mkdir -p'
         cmd.arg("--rsync-path")
             .arg(format!("mkdir -p {} && rsync", escaped_remote_path));
 
-        // Add exclude patterns (config defaults + .rchignore)
-        for pattern in effective_excludes {
-            cmd.arg("--exclude").arg(pattern);
+        if let Some(include_patterns) = &self.sync_include_patterns {
+            cmd.arg("--prune-empty-dirs");
+            for pattern in include_patterns {
+                cmd.arg("--include").arg(pattern);
+            }
+            cmd.arg("--exclude").arg("*");
+        } else {
+            // Add exclude patterns (config defaults + .rchignore)
+            for pattern in effective_excludes {
+                cmd.arg("--exclude").arg(pattern);
+            }
         }
 
         // Add zstd compression if available (rsync 3.2.3+)
@@ -3657,5 +3686,65 @@ Total file size: 123 bytes";
 
         // bwlimit=0 should be treated as disabled (no flag)
         assert!(!args.iter().any(|arg| arg.starts_with("--bwlimit")));
+    }
+
+    #[test]
+    fn test_build_sync_command_metadata_only_sync_omits_delete_and_uses_includes() {
+        let _guard = test_guard!();
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/tmp/workspace-root"),
+            "workspace-root".to_string(),
+            "abc123".to_string(),
+            TransferConfig::default(),
+        )
+        .with_sync_include_patterns(vec![
+            "Cargo.toml".to_string(),
+            "Cargo.lock".to_string(),
+            ".cargo/".to_string(),
+            ".cargo/**".to_string(),
+        ])
+        .with_sync_delete(false);
+
+        let worker = WorkerConfig {
+            id: WorkerId::new("mock-worker"),
+            host: "mock://worker".to_string(),
+            user: "mockuser".to_string(),
+            identity_file: "~/.ssh/mock".to_string(),
+            total_slots: 4,
+            priority: 100,
+            tags: vec![],
+        };
+
+        let cmd = pipeline.build_sync_command(
+            &worker,
+            "mockuser@mock://worker:/tmp/rch/test-project/abc123",
+            "/tmp/rch/test-project/abc123",
+            &[],
+        );
+
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect();
+
+        assert!(
+            !args.iter().any(|arg| arg == "--delete"),
+            "metadata-only syncs must not delete unrelated remote files"
+        );
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["--include", "Cargo.toml"]),
+            "metadata-only syncs should include Cargo.toml"
+        );
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["--include", ".cargo/**"]),
+            "metadata-only syncs should include workspace .cargo metadata"
+        );
+        assert!(
+            args.windows(2).any(|window| window == ["--exclude", "*"]),
+            "metadata-only syncs should exclude everything else"
+        );
     }
 }

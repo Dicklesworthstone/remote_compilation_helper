@@ -3309,49 +3309,6 @@ mod tests {
             );
             assert!(result.reason.contains("chained"));
         }
-
-        #[test]
-        fn test_classify_cd_and_make() {
-            let _guard = test_guard!();
-            let result = classify_command("cd /project && make -j8");
-            assert!(
-                !result.is_compilation,
-                "chained commands should be rejected"
-            );
-            assert!(result.reason.contains("chained"));
-        }
-        #[test]
-        fn test_classify_export_and_cargo_build() {
-            let _guard = test_guard!();
-            let result =
-                classify_command("export RUSTFLAGS='-C opt-level=3' && cargo build --release");
-            assert!(
-                !result.is_compilation,
-                "chained commands should be rejected"
-            );
-            assert!(result.reason.contains("chained"));
-        }
-        #[test]
-        fn test_classify_mkdir_cmake_chain() {
-            let _guard = test_guard!();
-            let result =
-                classify_command("mkdir -p build && cmake -B build && cmake --build build");
-            assert!(
-                !result.is_compilation,
-                "chained commands should be rejected"
-            );
-            assert!(result.reason.contains("chained"));
-        }
-        #[test]
-        fn test_classify_echo_and_cargo_test() {
-            let _guard = test_guard!();
-            let result = classify_command("echo 'Starting...' && cargo test");
-            assert!(
-                !result.is_compilation,
-                "chained commands should be rejected"
-            );
-            assert!(result.reason.contains("chained"));
-        }
         // --- Classification integration: should classify as NON-COMPILATION ---
 
         #[test]

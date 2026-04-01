@@ -774,15 +774,24 @@ where
             )
             .with_manifest_path(entry_manifest_path)
         })?;
-        let package_root = normalize_path_for_policy(
+        let workspace_member = workspace_member_ids.contains(&package.id);
+        let package_root = match normalize_path_for_policy(
             manifest_dir,
             policy,
             Some(entry_manifest_path),
             None,
             "normalize metadata package root",
-        )?;
+        ) {
+            Ok(root) => root,
+            Err(error)
+                if !workspace_member
+                    && error.kind() == &CargoPathDependencyErrorKind::PathPolicyViolation =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         let canonical_manifest_path = package_root.join("Cargo.toml");
-        let workspace_member = workspace_member_ids.contains(&package.id);
 
         partial.add_package(
             package_root.clone(),
@@ -818,16 +827,9 @@ where
                 if !dependency.is_runtime_relevant() {
                     continue;
                 }
-                let dependency_root = id_to_root.get(&dependency.pkg).ok_or_else(|| {
-                    CargoPathDependencyError::new(
-                        CargoPathDependencyErrorKind::MetadataParseFailure,
-                        format!(
-                            "resolve dependency pkg missing from package list: {}",
-                            dependency.pkg
-                        ),
-                    )
-                    .with_manifest_path(&package.manifest_path)
-                })?;
+                let Some(dependency_root) = id_to_root.get(&dependency.pkg) else {
+                    continue;
+                };
                 let dependency_manifest = dependency_root.join("Cargo.toml");
                 partial.add_package(
                     dependency_root.clone(),
@@ -976,13 +978,16 @@ struct ManifestDocument {
     package_name: Option<String>,
     has_workspace: bool,
     workspace_members: Vec<String>,
+    workspace_path_dependencies: BTreeMap<String, String>,
+    patch_path_dependencies: BTreeMap<String, String>,
     path_dependencies: Vec<ManifestDependency>,
 }
 
 #[derive(Debug, Clone)]
 struct ManifestDependency {
     dependency_name: String,
-    dependency_path: String,
+    dependency_path: Option<String>,
+    uses_workspace_inheritance: bool,
 }
 
 fn resolve_from_manifest_fallback(
@@ -1012,6 +1017,8 @@ fn resolve_from_manifest_fallback(
     if entry_manifest.has_workspace {
         partial.workspace_root = Some(entry_root.clone());
     }
+    let workspace_path_dependencies = entry_manifest.workspace_path_dependencies.clone();
+    let patch_path_dependencies = entry_manifest.patch_path_dependencies.clone();
 
     let workspace_member_manifests = expand_workspace_members(
         &entry_root,
@@ -1033,7 +1040,10 @@ fn resolve_from_manifest_fallback(
         visit_manifest_recursive(
             manifest_path,
             policy,
+            &entry_root,
             &workspace_member_set,
+            &workspace_path_dependencies,
+            &patch_path_dependencies,
             true,
             &mut partial,
             &mut manifest_cache,
@@ -1045,7 +1055,10 @@ fn resolve_from_manifest_fallback(
         visit_manifest_recursive(
             entry_manifest_path,
             policy,
+            &entry_root,
             &workspace_member_set,
+            &workspace_path_dependencies,
+            &patch_path_dependencies,
             true,
             &mut partial,
             &mut manifest_cache,
@@ -1061,7 +1074,10 @@ fn resolve_from_manifest_fallback(
 fn visit_manifest_recursive(
     manifest_path: &Path,
     policy: &PathTopologyPolicy,
+    workspace_root: &Path,
     workspace_member_manifests: &BTreeSet<PathBuf>,
+    workspace_path_dependencies: &BTreeMap<String, String>,
+    patch_path_dependencies: &BTreeMap<String, String>,
     mark_workspace_member: bool,
     partial: &mut PartialGraph,
     manifest_cache: &mut BTreeMap<PathBuf, ManifestDocument>,
@@ -1139,8 +1155,15 @@ fn visit_manifest_recursive(
     }
 
     for dependency in &manifest.path_dependencies {
-        let dependency_candidate =
-            resolve_dependency_candidate(&package_root, &dependency.dependency_path);
+        let Some(dependency_candidate) = resolve_manifest_dependency_candidate(
+            &package_root,
+            workspace_root,
+            dependency,
+            workspace_path_dependencies,
+            patch_path_dependencies,
+        ) else {
+            continue;
+        };
         validate_absolute_dependency_scope(
             &dependency_candidate,
             policy,
@@ -1190,7 +1213,10 @@ fn visit_manifest_recursive(
         visit_manifest_recursive(
             &dependency_manifest,
             policy,
+            workspace_root,
             workspace_member_manifests,
+            workspace_path_dependencies,
+            patch_path_dependencies,
             false,
             partial,
             manifest_cache,
@@ -1222,6 +1248,38 @@ fn resolve_dependency_candidate(base_root: &Path, raw_dependency_path: &str) -> 
     } else {
         resolved
     }
+}
+
+fn resolve_manifest_dependency_candidate(
+    package_root: &Path,
+    workspace_root: &Path,
+    dependency: &ManifestDependency,
+    workspace_path_dependencies: &BTreeMap<String, String>,
+    patch_path_dependencies: &BTreeMap<String, String>,
+) -> Option<PathBuf> {
+    if let Some(raw_dependency_path) = dependency.dependency_path.as_deref() {
+        return Some(resolve_dependency_candidate(
+            package_root,
+            raw_dependency_path,
+        ));
+    }
+
+    if dependency.uses_workspace_inheritance {
+        if let Some(raw_dependency_path) =
+            workspace_path_dependencies.get(&dependency.dependency_name)
+        {
+            return Some(resolve_dependency_candidate(
+                workspace_root,
+                raw_dependency_path,
+            ));
+        }
+    }
+
+    patch_path_dependencies
+        .get(&dependency.dependency_name)
+        .map(|raw_dependency_path| {
+            resolve_dependency_candidate(workspace_root, raw_dependency_path)
+        })
 }
 
 fn read_manifest_document(
@@ -1268,16 +1326,27 @@ fn read_manifest_document(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    let workspace_path_dependencies = table
+        .get("workspace")
+        .and_then(toml::Value::as_table)
+        .and_then(|workspace| workspace.get("dependencies"))
+        .map(collect_named_path_dependencies)
+        .unwrap_or_default();
+    let patch_path_dependencies = table
+        .get("patch")
+        .and_then(toml::Value::as_table)
+        .map(collect_patch_path_dependencies)
+        .unwrap_or_default();
 
     let mut path_dependencies = Vec::new();
-    collect_dependency_paths(table.get("dependencies"), &mut path_dependencies);
-    collect_dependency_paths(table.get("build-dependencies"), &mut path_dependencies);
+    collect_dependency_specs(table.get("dependencies"), &mut path_dependencies);
+    collect_dependency_specs(table.get("build-dependencies"), &mut path_dependencies);
 
     if let Some(targets) = table.get("target").and_then(toml::Value::as_table) {
         for target_config in targets.values() {
             if let Some(target_table) = target_config.as_table() {
-                collect_dependency_paths(target_table.get("dependencies"), &mut path_dependencies);
-                collect_dependency_paths(
+                collect_dependency_specs(target_table.get("dependencies"), &mut path_dependencies);
+                collect_dependency_specs(
                     target_table.get("build-dependencies"),
                     &mut path_dependencies,
                 );
@@ -1289,11 +1358,13 @@ fn read_manifest_document(
         package_name,
         has_workspace,
         workspace_members,
+        workspace_path_dependencies,
+        patch_path_dependencies,
         path_dependencies,
     })
 }
 
-fn collect_dependency_paths(
+fn collect_dependency_specs(
     maybe_table_value: Option<&toml::Value>,
     collector: &mut Vec<ManifestDependency>,
 ) {
@@ -1301,24 +1372,63 @@ fn collect_dependency_paths(
         return;
     };
     for (dependency_name, dependency_value) in table {
+        match dependency_value {
+            toml::Value::String(_) => {
+                collector.push(ManifestDependency {
+                    dependency_name: dependency_name.clone(),
+                    dependency_path: None,
+                    uses_workspace_inheritance: false,
+                });
+            }
+            toml::Value::Table(dependency_table) => {
+                if dependency_table
+                    .get("optional")
+                    .and_then(toml::Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                collector.push(ManifestDependency {
+                    dependency_name: dependency_name.clone(),
+                    dependency_path: dependency_table
+                        .get("path")
+                        .and_then(toml::Value::as_str)
+                        .map(ToOwned::to_owned),
+                    uses_workspace_inheritance: dependency_table
+                        .get("workspace")
+                        .and_then(toml::Value::as_bool)
+                        .unwrap_or(false),
+                });
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_named_path_dependencies(maybe_table_value: &toml::Value) -> BTreeMap<String, String> {
+    let Some(table) = maybe_table_value.as_table() else {
+        return BTreeMap::new();
+    };
+
+    let mut dependencies = BTreeMap::new();
+    for (dependency_name, dependency_value) in table {
         let Some(dependency_table) = dependency_value.as_table() else {
             continue;
         };
         let Some(path) = dependency_table.get("path").and_then(toml::Value::as_str) else {
             continue;
         };
-        if dependency_table
-            .get("optional")
-            .and_then(toml::Value::as_bool)
-            .unwrap_or(false)
-        {
-            continue;
-        }
-        collector.push(ManifestDependency {
-            dependency_name: dependency_name.clone(),
-            dependency_path: path.to_string(),
-        });
+        dependencies.insert(dependency_name.clone(), path.to_string());
     }
+    dependencies
+}
+
+fn collect_patch_path_dependencies(patch_table: &toml::value::Table) -> BTreeMap<String, String> {
+    let mut dependencies = BTreeMap::new();
+    for patch_source in patch_table.values() {
+        dependencies.extend(collect_named_path_dependencies(patch_source));
+    }
+    dependencies
 }
 
 fn expand_workspace_members(
@@ -2537,6 +2647,119 @@ optional_a = { path = "../optional_a", optional = true }
 
     #[cfg(unix)]
     #[test]
+    fn metadata_resolve_skips_non_local_packages_and_keeps_local_edges() {
+        let fixture = TopologyFixture::new("synthetic-meta-nonlocal");
+        let scenario_root = fixture.canonical_root.join("synth_meta_nonlocal");
+        let app_root = scenario_root.join("app");
+        let dep_root = scenario_root.join("dep");
+        let external_root = fixture.root.join("external_registry/serde");
+
+        write_lib_crate(&dep_root, "local_dep", &[]);
+        write_bin_crate(&app_root, "meta_nonlocal_app", &[]);
+        write_lib_crate(&external_root, "serde", &[]);
+
+        let app_canonical = app_root.canonicalize().expect("canonical app");
+        let dep_canonical = dep_root.canonicalize().expect("canonical dep");
+        let external_canonical = external_root
+            .canonicalize()
+            .expect("canonical external dep");
+        let app_manifest = app_canonical.join("Cargo.toml");
+        let dep_manifest = dep_canonical.join("Cargo.toml");
+        let external_manifest = external_canonical.join("Cargo.toml");
+
+        let metadata_json = format!(
+            r#"{{
+                "packages": [
+                    {{
+                        "id": "meta_nonlocal_app 0.1.0 (path+file://{app_root})",
+                        "name": "meta_nonlocal_app",
+                        "manifest_path": "{app_manifest}",
+                        "dependencies": [
+                            {{"name": "local_dep", "path": "{dep_root}"}},
+                            {{"name": "serde", "path": null}}
+                        ]
+                    }},
+                    {{
+                        "id": "local_dep 0.1.0 (path+file://{dep_root})",
+                        "name": "local_dep",
+                        "manifest_path": "{dep_manifest}",
+                        "dependencies": []
+                    }},
+                    {{
+                        "id": "serde 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)",
+                        "name": "serde",
+                        "manifest_path": "{external_manifest}",
+                        "dependencies": []
+                    }}
+                ],
+                "workspace_members": [
+                    "meta_nonlocal_app 0.1.0 (path+file://{app_root})"
+                ],
+                "workspace_root": null,
+                "resolve": {{
+                    "root": "meta_nonlocal_app 0.1.0 (path+file://{app_root})",
+                    "nodes": [
+                        {{
+                            "id": "meta_nonlocal_app 0.1.0 (path+file://{app_root})",
+                            "deps": [
+                                {{
+                                    "name": "local_dep",
+                                    "pkg": "local_dep 0.1.0 (path+file://{dep_root})",
+                                    "dep_kinds": [{{"kind": null, "target": null}}]
+                                }},
+                                {{
+                                    "name": "serde",
+                                    "pkg": "serde 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)",
+                                    "dep_kinds": [{{"kind": null, "target": null}}]
+                                }}
+                            ]
+                        }},
+                        {{
+                            "id": "local_dep 0.1.0 (path+file://{dep_root})",
+                            "deps": []
+                        }},
+                        {{
+                            "id": "serde 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)",
+                            "deps": []
+                        }}
+                    ]
+                }}
+            }}"#,
+            app_root = app_canonical.display(),
+            app_manifest = app_manifest.display(),
+            dep_root = dep_canonical.display(),
+            dep_manifest = dep_manifest.display(),
+            external_manifest = external_manifest.display(),
+        );
+
+        let json_clone = metadata_json.clone();
+        let graph = resolve_cargo_path_dependency_graph_with_policy_and_provider(
+            &app_root,
+            &fixture.policy(),
+            move |_| Ok(json_clone.clone()),
+        )
+        .expect("synthetic metadata with non-local packages should still resolve");
+
+        assert_eq!(graph.root_packages, vec![app_canonical.clone()]);
+        assert_eq!(
+            graph.edges,
+            vec![CargoPathDependencyEdge {
+                from: app_canonical.clone(),
+                to: dep_canonical.clone(),
+                dependency_name: "local_dep".to_string(),
+            }]
+        );
+        assert!(
+            graph
+                .packages
+                .iter()
+                .all(|package| package.package_root != external_canonical),
+            "non-local registry packages must not be pulled into the sync closure"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn manifest_fallback_ignores_pure_dev_path_edges() {
         let fixture = TopologyFixture::new("manifest-fallback-dev-filter");
         let scenario_root = fixture.canonical_root.join("manifest_fallback_dev_filter");
@@ -2592,6 +2815,130 @@ dev_only_dep = { path = "../dev_dep" }
                 .iter()
                 .all(|pkg| pkg.package_root != dev_dep_canonical),
             "manifest fallback must not pull pure dev-only path deps into runtime closure"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manifest_fallback_resolves_workspace_shared_path_dependencies() {
+        let fixture = TopologyFixture::new("manifest-workspace-shared");
+        let scenario_root = fixture.canonical_root.join("manifest_workspace_shared");
+        let workspace_root = scenario_root.join("workspace");
+        let app_root = workspace_root.join("crates/app");
+        let shared_root = scenario_root.join("shared/shared_dep");
+
+        write_lib_crate(&shared_root, "shared_dep", &[]);
+        std::fs::create_dir_all(app_root.join("src")).expect("create app src");
+        std::fs::write(
+            app_root.join("Cargo.toml"),
+            r#"[package]
+name = "workspace_shared_app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+shared_dep = { workspace = true }
+"#,
+        )
+        .expect("write app manifest");
+        std::fs::write(app_root.join("src/main.rs"), "fn main() {}\n").expect("write app main");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace root");
+        std::fs::write(
+            workspace_root.join("Cargo.toml"),
+            r#"[workspace]
+members = ["crates/app"]
+resolver = "3"
+
+[workspace.dependencies]
+shared_dep = { path = "../shared/shared_dep" }
+"#,
+        )
+        .expect("write workspace manifest");
+
+        let graph = resolve_cargo_path_dependency_graph_with_policy_and_provider(
+            &workspace_root,
+            &fixture.policy(),
+            |_| {
+                Err(CargoPathDependencyError::new(
+                    CargoPathDependencyErrorKind::MetadataInvocationFailure,
+                    "force manifest fallback",
+                ))
+            },
+        )
+        .expect("manifest fallback should resolve workspace-shared path dependencies");
+
+        let app_canonical = app_root.canonicalize().expect("canonical app");
+        let shared_canonical = shared_root.canonicalize().expect("canonical shared dep");
+        assert_eq!(graph.root_packages, vec![app_canonical.clone()]);
+        assert_eq!(
+            graph.edges,
+            vec![CargoPathDependencyEdge {
+                from: app_canonical,
+                to: shared_canonical,
+                dependency_name: "shared_dep".to_string(),
+            }]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manifest_fallback_resolves_patch_path_dependencies() {
+        let fixture = TopologyFixture::new("manifest-patch-shared");
+        let scenario_root = fixture.canonical_root.join("manifest_patch_shared");
+        let workspace_root = scenario_root.join("workspace");
+        let app_root = workspace_root.join("app");
+        let patched_root = scenario_root.join("patched/patched_dep");
+
+        write_lib_crate(&patched_root, "patched_dep", &[]);
+        std::fs::create_dir_all(app_root.join("src")).expect("create app src");
+        std::fs::write(
+            app_root.join("Cargo.toml"),
+            r#"[package]
+name = "patched_app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+patched_dep = "0.1"
+"#,
+        )
+        .expect("write app manifest");
+        std::fs::write(app_root.join("src/main.rs"), "fn main() {}\n").expect("write app main");
+        std::fs::create_dir_all(&workspace_root).expect("create workspace root");
+        std::fs::write(
+            workspace_root.join("Cargo.toml"),
+            r#"[workspace]
+members = ["app"]
+resolver = "3"
+
+[patch.crates-io]
+patched_dep = { path = "../patched/patched_dep" }
+"#,
+        )
+        .expect("write workspace manifest");
+
+        let graph = resolve_cargo_path_dependency_graph_with_policy_and_provider(
+            &workspace_root,
+            &fixture.policy(),
+            |_| {
+                Err(CargoPathDependencyError::new(
+                    CargoPathDependencyErrorKind::MetadataInvocationFailure,
+                    "force manifest fallback",
+                ))
+            },
+        )
+        .expect("manifest fallback should resolve patch path dependencies");
+
+        let app_canonical = app_root.canonicalize().expect("canonical app");
+        let patched_canonical = patched_root.canonicalize().expect("canonical patched dep");
+        assert_eq!(graph.root_packages, vec![app_canonical.clone()]);
+        assert_eq!(
+            graph.edges,
+            vec![CargoPathDependencyEdge {
+                from: app_canonical,
+                to: patched_canonical,
+                dependency_name: "patched_dep".to_string(),
+            }]
         );
     }
 

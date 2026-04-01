@@ -345,6 +345,7 @@ impl HealthMonitor {
                     // Drop lock before check_worker_health to avoid holding it during IO
                     drop(worker_config_guard);
 
+                    let previous_effective_status = worker.status().await;
                     let result = check_worker_health(&worker, &config).await;
 
                     // Record health check latency metric
@@ -361,7 +362,6 @@ impl HealthMonitor {
                     // Update health state, tracking previous status for alerting
                     let mut states = health_states.write().await;
                     let health = states.entry(worker_id.clone()).or_default();
-                    let previous_status = health.status();
                     let previous_circuit_state = health.circuit_state();
                     health.update(result.clone(), &config, &worker_id);
 
@@ -373,21 +373,22 @@ impl HealthMonitor {
 
                     // Log status changes
                     let new_status = health.status();
+                    let effective_status = worker.apply_health_status(new_status).await;
                     let new_circuit_state = health.circuit_state();
 
                     // Track unreachable workers for all-workers-offline alert
-                    if new_status == WorkerStatus::Unreachable {
+                    if effective_status == WorkerStatus::Unreachable {
                         unreachable_count += 1;
                     }
 
                     // Notify alert manager of status changes and circuit state changes
                     if let Some(ref alert_mgr) = alert_manager {
                         // Status change notification
-                        if previous_status != new_status {
+                        if previous_effective_status != effective_status {
                             alert_mgr.handle_worker_status_change(
                                 &worker_id,
-                                previous_status,
-                                new_status,
+                                previous_effective_status,
+                                effective_status,
                                 health.last_error(),
                             );
                         }
@@ -401,7 +402,7 @@ impl HealthMonitor {
                     }
 
                     // Record worker status metric
-                    let status_value = match new_status {
+                    let status_value = match effective_status {
                         WorkerStatus::Healthy => 1.0,
                         WorkerStatus::Degraded => 2.0,
                         WorkerStatus::Draining => 2.0,
@@ -448,9 +449,6 @@ impl HealthMonitor {
                         );
                     }
 
-                    // Update worker pool status
-                    let worker_config = worker.config.read().await;
-                    pool.set_status(&worker_config.id, new_status).await;
                 }
 
                 // Check for all-workers-offline condition
@@ -1605,6 +1603,51 @@ mod tests {
         assert!(worker_ids.contains(&"worker-1"));
         assert!(worker_ids.contains(&"worker-2"));
         assert!(worker_ids.contains(&"worker-3"));
+    }
+
+    #[tokio::test]
+    async fn test_health_monitor_does_not_revive_draining_worker() {
+        let _lock = test_lock().lock().await;
+        set_mock_enabled_override(Some(true));
+        set_mock_ssh_config_override(Some(MockConfig::success().with_stdout("health_check")));
+
+        let pool = WorkerPool::new();
+        let worker_id = WorkerId::new("draining-worker");
+        pool.add_worker(WorkerConfig {
+            id: worker_id.clone(),
+            host: "draining.host".to_string(),
+            user: "user".to_string(),
+            identity_file: "~/.ssh/key".to_string(),
+            total_slots: 4,
+            priority: 100,
+            tags: vec![],
+        })
+        .await;
+
+        let worker = pool.get(&worker_id).await.unwrap();
+        worker.drain().await;
+
+        let monitor = HealthMonitor::new(
+            pool,
+            HealthConfig {
+                check_interval: Duration::from_millis(10),
+                check_timeout: Duration::from_secs(1),
+                ..Default::default()
+            },
+        );
+
+        let handle = monitor.start();
+        tokio::time::sleep(Duration::from_millis(35)).await;
+        monitor.stop().await;
+        handle.await.unwrap();
+
+        assert_eq!(worker.status().await, WorkerStatus::Draining);
+        assert_eq!(
+            monitor.get_health(worker_id.as_str()).await,
+            Some(WorkerStatus::Healthy)
+        );
+
+        clear_mock_overrides();
     }
 
     // ============================================================================
