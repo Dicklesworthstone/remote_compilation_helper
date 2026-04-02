@@ -74,5 +74,6 @@ storage.sqlite3-*
 # Remote compilation helper deploy/build artifacts
 .rch-deploy-root/
 .rch-target/
+.rch-target-*/
 rch-bin/
 rch-install/
