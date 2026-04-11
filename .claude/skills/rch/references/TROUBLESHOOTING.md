@@ -181,7 +181,7 @@ Interpretation:
 
 ```bash
 rch diagnose --dry-run "cargo test --workspace"
-rch exec -- env CARGO_TARGET_DIR=/tmp/rch_target_<name> cargo check --workspace --all-targets
+rch exec -- env CARGO_TARGET_DIR=${TMPDIR:-/tmp}/rch_target_<name> cargo check --workspace --all-targets
 ```
 
 Then ensure sibling repos exist on workers under canonical roots and retry.

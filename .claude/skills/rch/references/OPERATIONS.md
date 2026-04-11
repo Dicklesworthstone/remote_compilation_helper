@@ -34,7 +34,7 @@ rch hook test
 
 ```bash
 rch diagnose "cargo check --workspace --all-targets"
-rch exec -- env CARGO_TARGET_DIR=/tmp/rch_target_<name> cargo check --workspace --all-targets
+rch exec -- env CARGO_TARGET_DIR=${TMPDIR:-/tmp}/rch_target_<name> cargo check --workspace --all-targets
 ```
 
 If step 4 succeeds, RCH infrastructure is healthy and remaining failures are project/toolchain specific.
@@ -146,7 +146,7 @@ Recommended checks:
 
 ```bash
 rch diagnose --dry-run "cargo test --workspace"
-rch exec -- env CARGO_TARGET_DIR=/tmp/rch_target_<name> cargo test --workspace --no-fail-fast
+rch exec -- env CARGO_TARGET_DIR=${TMPDIR:-/tmp}/rch_target_<name> cargo test --workspace --no-fail-fast
 ```
 
 If remote path dependencies are missing:

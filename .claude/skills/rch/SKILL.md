@@ -18,8 +18,10 @@ rch status --workers --jobs
 rch workers probe --all
 rch hook status
 rch diagnose --dry-run "cargo check --workspace --all-targets"
-rch exec -- env CARGO_TARGET_DIR=/tmp/rch_target_<name> cargo check --workspace --all-targets
+rch exec -- env CARGO_TARGET_DIR=${TMPDIR:-/tmp}/rch_target_<name> cargo check --workspace --all-targets
 ```
+
+**IMPORTANT**: Always use `${TMPDIR:-/tmp}` for target dirs, never hardcode `/tmp` or `/var/tmp`. On fleet machines `TMPDIR=/data/tmp` (disk-backed). Hardcoding `/tmp` wastes tmpfs RAM; `/var/tmp` survives reboots and accumulates silently.
 
 If `rch exec -- ...` succeeds, remote offload is healthy and remaining failures are likely project/toolchain specific.
 
@@ -65,7 +67,7 @@ rch diagnose --dry-run "cargo test --workspace"
 
 5. **Remote compile proof**
 ```bash
-rch exec -- env CARGO_TARGET_DIR=/tmp/rch_target_<name> cargo check --workspace --all-targets
+rch exec -- env CARGO_TARGET_DIR=${TMPDIR:-/tmp}/rch_target_<name> cargo check --workspace --all-targets
 ```
 
 6. **If sync fails or storage looks bad, inspect the worker directly**
