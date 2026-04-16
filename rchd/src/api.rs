@@ -1290,20 +1290,14 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
                 "worker" => worker_ids.push(urlencoding_decode(value)),
                 "project" => project = Some(urlencoding_decode(value)),
                 "timeout" => timeout_secs = value.parse().ok(),
-                "debug" => {
-                    if value == "1" || value.eq_ignore_ascii_case("true") {
-                        release_mode = false;
-                    }
+                "debug" if value == "1" || value.eq_ignore_ascii_case("true") => {
+                    release_mode = false;
                 }
-                "scheduled" => {
-                    if value == "1" || value.eq_ignore_ascii_case("true") {
-                        scheduled = true;
-                    }
+                "scheduled" if value == "1" || value.eq_ignore_ascii_case("true") => {
+                    scheduled = true;
                 }
-                "all" => {
-                    if value == "1" || value.eq_ignore_ascii_case("true") {
-                        worker_ids.clear();
-                    }
+                "all" if value == "1" || value.eq_ignore_ascii_case("true") => {
+                    worker_ids.clear();
                 }
                 _ => {}
             }

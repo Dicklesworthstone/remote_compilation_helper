@@ -97,10 +97,8 @@ impl TerminalRenderer {
                 self.ensure_newlines(2);
                 self.write_heading_prefix(level);
             }
-            Tag::Paragraph => {
-                if !self.in_list {
-                    self.ensure_newlines(2);
-                }
+            Tag::Paragraph if !self.in_list => {
+                self.ensure_newlines(2);
             }
             Tag::BlockQuote(_) => {
                 self.ensure_newlines(1);
@@ -359,10 +357,10 @@ pub fn strip_markdown(input: &str) -> String {
                 in_code_block = false;
                 output.push('\n');
             }
-            Event::Start(Tag::Paragraph) if !in_code_block => {
-                if !output.is_empty() && !output.ends_with('\n') {
-                    output.push_str("\n\n");
-                }
+            Event::Start(Tag::Paragraph)
+                if !in_code_block && !output.is_empty() && !output.ends_with('\n') =>
+            {
+                output.push_str("\n\n");
             }
             Event::End(TagEnd::Paragraph) if !in_code_block => {
                 output.push('\n');
