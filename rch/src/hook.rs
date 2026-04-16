@@ -2276,7 +2276,10 @@ fn daemon_response_timeout(wait_for_worker: bool) -> Duration {
 ///
 /// Prefer [`extract_project_name_with_policy`] when a configured
 /// [`PathTopologyPolicy`] is available, so error messages reference the
-/// configured roots rather than the compiled-in defaults.
+/// configured roots rather than the compiled-in defaults. This shim is
+/// retained for test coverage and for callers that provably operate under
+/// the default topology.
+#[allow(dead_code)]
 pub(crate) fn extract_project_name() -> String {
     extract_project_name_with_policy(&PathTopologyPolicy::default())
 }
