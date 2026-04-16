@@ -3,7 +3,9 @@
 //! This module contains commands for diagnosing RCH behavior, running self-tests,
 //! and checking overall system status.
 
-use crate::hook::{extract_project_name, query_daemon, release_worker, required_runtime_for_kind};
+use crate::hook::{
+    extract_project_name_with_policy, query_daemon, release_worker, required_runtime_for_kind,
+};
 use crate::status_types::{
     DaemonFullStatusResponse, SelfTestHistoryResponse, SelfTestRunResponse, SelfTestStatusResponse,
     extract_json_body,
@@ -13,7 +15,9 @@ use crate::ui::context::OutputContext;
 use crate::ui::progress::Spinner;
 use crate::ui::theme::StatusIndicator;
 use anyhow::{Context, Result};
-use rch_common::{ApiResponse, CommandPriority, RequiredRuntime, normalize_project_path};
+use rch_common::{
+    ApiResponse, CommandPriority, RequiredRuntime, normalize_project_path_with_policy,
+};
 use std::path::Path;
 use tracing::debug;
 
@@ -215,6 +219,10 @@ pub async fn diagnose(command: &str, dry_run: bool, ctx: &OutputContext) -> Resu
     let style = ctx.theme();
     let loaded = crate::config::load_config_with_sources()?;
     let config = loaded.config;
+    // Build the path topology policy from the loaded config so that any
+    // normalization diagnostics reference the configured roots rather than
+    // the compiled-in `/data/projects` + `/dp` defaults. See GitHub #9.
+    let topology_policy = config.path_topology.to_policy();
 
     let details = classify_command_detailed(command);
     let threshold = config.compilation.confidence_threshold;
@@ -302,11 +310,11 @@ pub async fn diagnose(command: &str, dry_run: bool, ctx: &OutputContext) -> Resu
         let estimated_cores = 4;
         let project_root = std::env::current_dir().ok();
         let normalized_project_root = project_root.as_ref().and_then(|path| {
-            normalize_project_path(path)
+            normalize_project_path_with_policy(path, &topology_policy)
                 .map(|normalized| normalized.canonical_path().to_path_buf())
                 .ok()
         });
-        let project = extract_project_name();
+        let project = extract_project_name_with_policy(&topology_policy);
         let toolchain = normalized_project_root
             .as_ref()
             .or(project_root.as_ref())

@@ -34,7 +34,7 @@ use rch_common::{
     RepoUpdaterAdapterRequest, RepoUpdaterOutputFormat, RequiredRuntime, SelectedWorker,
     SelectionReason, SelectionResponse, SelfHealingConfig, ToolchainInfo, TransferConfig,
     WorkerConfig, WorkerId, build_dependency_closure_plan_with_policy, build_invocation,
-    classify_command, mock, normalize_project_path, normalize_project_path_with_policy,
+    classify_command, mock, normalize_project_path_with_policy,
     path_topology::{
         DEFAULT_ALIAS_PROJECT_ROOT, DEFAULT_CANONICAL_PROJECT_ROOT, PathTopologyPolicy,
     },
@@ -191,8 +191,12 @@ pub async fn run_exec(command_parts: Vec<String>) -> anyhow::Result<()> {
 
     let reporter = HookReporter::new(config.output.visibility);
 
-    // Extract project name
-    let project = extract_project_name();
+    // Build path topology policy from loaded config so that any normalization
+    // warnings reference the configured roots rather than compiled-in defaults.
+    let topology_policy = config.path_topology.to_policy();
+
+    // Extract project name honoring configured path topology.
+    let project = extract_project_name_with_policy(&topology_policy);
 
     // Estimate cores needed
     let estimated_cores =
@@ -291,8 +295,8 @@ pub async fn run_exec(command_parts: Vec<String>) -> anyhow::Result<()> {
         worker.id, worker.user, worker.host, worker.slots_available, worker.speed_score
     );
 
-    // Execute remote compilation pipeline
-    let topology_policy = config.path_topology.to_policy();
+    // Execute remote compilation pipeline (topology_policy was built earlier
+    // from the loaded config so diagnostics reference configured roots).
     let remote_start = Instant::now();
     let result = execute_remote_compilation(
         &worker,
@@ -2267,10 +2271,21 @@ fn daemon_response_timeout(wait_for_worker: bool) -> Duration {
     )
 }
 
-/// Extract project name from current working directory.
+/// Extract project name from current working directory using the default
+/// path topology policy.
+///
+/// Prefer [`extract_project_name_with_policy`] when a configured
+/// [`PathTopologyPolicy`] is available, so error messages reference the
+/// configured roots rather than the compiled-in defaults.
 pub(crate) fn extract_project_name() -> String {
+    extract_project_name_with_policy(&PathTopologyPolicy::default())
+}
+
+/// Extract project name from current working directory, honoring the
+/// supplied [`PathTopologyPolicy`].
+pub(crate) fn extract_project_name_with_policy(policy: &PathTopologyPolicy) -> String {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("unknown"));
-    let normalized_cwd = match normalize_project_path(&cwd) {
+    let normalized_cwd = match normalize_project_path_with_policy(&cwd, policy) {
         Ok(normalized) => {
             for decision in normalized.decision_trace() {
                 debug!("[RCH] project identity normalization: {}", decision);
@@ -5861,6 +5876,58 @@ mod tests {
         let project = extract_project_name();
         // Should return something (either actual dir name or "unknown")
         assert!(!project.is_empty());
+    }
+
+    /// Regression test for GitHub #9: when a custom [`PathTopologyPolicy`]
+    /// is supplied and the cwd lives under the configured canonical root,
+    /// normalization must succeed and must not fall back to the
+    /// default `/data/projects` root.
+    #[test]
+    fn test_extract_project_name_honors_custom_policy() {
+        let _guard = test_guard!();
+        use std::fs;
+
+        // Create an isolated canonical root inside the OS temp dir.
+        let tmp = std::env::temp_dir().join(format!(
+            "rch_extract_custom_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&tmp).expect("create canonical root");
+        let project_dir = tmp.join("sample_project");
+        fs::create_dir_all(&project_dir).expect("create project dir");
+
+        // Resolve to the real path so symlinked temp dirs (e.g. /tmp -> /private/tmp
+        // on macOS) don't trip the `OutsideCanonicalRoot` check.
+        let canonical_tmp = fs::canonicalize(&tmp).expect("canonicalize tmp");
+        let canonical_project = fs::canonicalize(&project_dir).expect("canonicalize project");
+
+        let policy = PathTopologyPolicy::new(canonical_tmp.clone(), canonical_tmp.clone());
+
+        let prev_cwd = std::env::current_dir().ok();
+        std::env::set_current_dir(&canonical_project).expect("cd into project dir");
+
+        let project = extract_project_name_with_policy(&policy);
+
+        // Restore cwd before any assertion so failure doesn't poison other tests.
+        if let Some(prev) = prev_cwd {
+            let _ = std::env::set_current_dir(prev);
+        }
+        let _ = fs::remove_dir_all(&tmp);
+
+        // The project name must be based on the configured root's subdir,
+        // and crucially must not equal "unknown" (the fallback when
+        // normalization against the default `/data/projects` policy fails).
+        assert!(
+            project.starts_with("sample_project-"),
+            "expected project name to start with sample_project-, got {:?} \
+             (cwd was {:?})",
+            project,
+            canonical_project
+        );
     }
 
     // =========================================================================

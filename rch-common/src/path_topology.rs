@@ -678,6 +678,43 @@ mod tests {
         );
     }
 
+    /// Regression test for GitHub #9: when a custom canonical root is
+    /// configured and does not exist (and there is no alias symlink to
+    /// fall back through), the error must reference the *configured*
+    /// root — not the compiled-in `/data/projects` default.
+    #[test]
+    fn canonical_root_missing_error_cites_configured_root_not_default() {
+        let fixture = TestFixture::new("missing-custom-root", false, None);
+        let missing_root = fixture.root.join("custom-missing-root");
+        let missing_alias = fixture.root.join("custom-missing-alias");
+        let policy = PathTopologyPolicy::new(missing_root.clone(), missing_alias);
+
+        // Any absolute path we attempt to normalize under this policy must
+        // fail with a message that names the configured canonical root.
+        let probe = fixture.root.join("some-project");
+        let err = normalize_project_path_with_policy(&probe, &policy)
+            .expect_err("normalization must fail when canonical root is missing");
+
+        assert!(
+            matches!(err.kind(), PathNormalizationErrorKind::CanonicalRootMissing),
+            "expected CanonicalRootMissing, got {:?}",
+            err.kind()
+        );
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains(&missing_root.display().to_string()),
+            "error should mention configured canonical root {}: {}",
+            missing_root.display(),
+            rendered
+        );
+        assert!(
+            !rendered.contains("/data/projects"),
+            "error must not leak default /data/projects when a custom \
+             canonical_root is configured. got: {}",
+            rendered
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn normalize_direct_path_via_alias_target_when_canonical_root_missing() {
