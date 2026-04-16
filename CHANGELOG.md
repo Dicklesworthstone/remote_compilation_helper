@@ -8,9 +8,34 @@ Repository: <https://github.com/Dicklesworthstone/remote_compilation_helper>
 
 ---
 
-## [Unreleased] (since v1.0.16)
+## [Unreleased] (since v1.0.18)
 
 No unreleased changes yet.
+
+---
+
+## [v1.0.18] -- 2026-04-16 **(release)**
+
+### Diagnose + path topology bug fixes
+
+- `rch diagnose` and the `rch exec` post-hook entry point now honor the
+  configured `[path_topology]` section when normalizing the project path.
+  Previously both call sites used the compiled-in `/data/projects` + `/dp`
+  defaults even when operators had set `canonical_root` / `alias_root` in
+  `config.toml`, producing a spurious warning:
+  `Project path normalization failed for ...: canonical root is missing
+  (input: ..., detail: missing root /data/projects)`. Closes
+  [#9](https://github.com/Dicklesworthstone/remote_compilation_helper/issues/9).
+  ([24580cd](https://github.com/Dicklesworthstone/remote_compilation_helper/commit/24580cdf))
+
+---
+
+## [v1.0.17] -- 2026-04-11
+
+Nightly toolchain verification release. Unpins the nightly toolchain to the
+rolling latest, forwards `CARGO_TARGET_DIR` through delegated commands,
+expands path-dependency resolution to enclosing workspace roots, and switches
+documentation examples to `${TMPDIR:-/tmp}` instead of hardcoded `/tmp`.
 
 ---
 
