@@ -5507,6 +5507,26 @@ mod tests {
         }
     }
 
+    /// RAII wrapper around `tempfile::TempDir` that always reports the
+    /// canonical form of the scratch path via `.path()`, so subdirectories
+    /// derived from it pass `starts_with` against a canonicalized
+    /// topology root even when the OS routes `/tmp` through a symlink
+    /// (macOS resolves `/tmp` to `/private/tmp`).
+    ///
+    /// Deliberately mimics the `tempfile::TempDir` shape (`.path()` only)
+    /// so call sites can continue to write
+    /// `temp_dir.path().join("subdir")` without change.
+    struct CanonicalTempDir {
+        _dir: tempfile::TempDir,
+        path: PathBuf,
+    }
+
+    impl CanonicalTempDir {
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
     /// Create a platform-portable tempdir and a matching `PathTopologyPolicy`
     /// whose canonical root points at the tempdir's canonical path.
     ///
@@ -5520,7 +5540,7 @@ mod tests {
     ///
     /// The tempdir path is canonicalized so macOS `/tmp -> /private/tmp`
     /// and similar symlinks don't cause `starts_with` mismatches when
-    /// callers canonicalize their own roots.
+    /// paths are compared against the policy.
     ///
     /// The `alias_root` is set to a sibling path that is deliberately *not*
     /// a prefix of the tempdir. This keeps
@@ -5528,9 +5548,9 @@ mod tests {
     /// as a symlink (which fails when the alias is a plain directory or
     /// missing) while still giving `is_within_sync_topology` a well-formed
     /// second entry.
-    fn topology_tempdir() -> (tempfile::TempDir, PathTopologyPolicy) {
-        let temp_dir = tempfile::tempdir().expect("create tempdir");
-        let canonical = std::fs::canonicalize(temp_dir.path()).expect("canonicalize tempdir");
+    fn topology_tempdir() -> (CanonicalTempDir, PathTopologyPolicy) {
+        let raw = tempfile::tempdir().expect("create tempdir");
+        let canonical = std::fs::canonicalize(raw.path()).expect("canonicalize tempdir");
         let alias_root = canonical
             .parent()
             .map(|parent| {
@@ -5541,8 +5561,14 @@ mod tests {
                 parent.join(format!("{leaf}__rch_alias_sentinel"))
             })
             .unwrap_or_else(|| canonical.clone());
-        let policy = PathTopologyPolicy::new(canonical, alias_root);
-        (temp_dir, policy)
+        let policy = PathTopologyPolicy::new(canonical.clone(), alias_root);
+        (
+            CanonicalTempDir {
+                _dir: raw,
+                path: canonical,
+            },
+            policy,
+        )
     }
 
     async fn spawn_mock_daemon(socket_path: &str, response: SelectionResponse) {
