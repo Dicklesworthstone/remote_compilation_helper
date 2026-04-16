@@ -1063,10 +1063,8 @@ fn check_structure(cmd: &str) -> Option<&'static str> {
             b'`' => found_subshell_capture = true,
 
             // Dollar sign: check for $( subshell capture
-            b'$' => {
-                if i + 1 < len && bytes[i + 1] == b'(' {
-                    found_subshell_capture = true;
-                }
+            b'$' if i + 1 < len && bytes[i + 1] == b'(' => {
+                found_subshell_capture = true;
             }
 
             _ => {}

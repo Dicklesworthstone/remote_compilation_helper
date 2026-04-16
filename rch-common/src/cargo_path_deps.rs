@@ -586,10 +586,10 @@ fn allowed_dependency_roots(policy: &PathTopologyPolicy) -> Vec<PathBuf> {
     ];
 
     for candidate in [policy.canonical_root(), policy.alias_root()] {
-        if let Ok(resolved) = std::fs::canonicalize(candidate) {
-            if !roots.iter().any(|root| root == &resolved) {
-                roots.push(resolved);
-            }
+        if let Ok(resolved) = std::fs::canonicalize(candidate)
+            && !roots.iter().any(|root| root == &resolved)
+        {
+            roots.push(resolved);
         }
     }
 
@@ -1264,15 +1264,14 @@ fn resolve_manifest_dependency_candidate(
         ));
     }
 
-    if dependency.uses_workspace_inheritance {
-        if let Some(raw_dependency_path) =
+    if dependency.uses_workspace_inheritance
+        && let Some(raw_dependency_path) =
             workspace_path_dependencies.get(&dependency.dependency_name)
-        {
-            return Some(resolve_dependency_candidate(
-                workspace_root,
-                raw_dependency_path,
-            ));
-        }
+    {
+        return Some(resolve_dependency_candidate(
+            workspace_root,
+            raw_dependency_path,
+        ));
     }
 
     patch_path_dependencies

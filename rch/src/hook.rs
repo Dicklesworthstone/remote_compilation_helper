@@ -2535,15 +2535,14 @@ fn build_dependency_runtime_plan(
     for action in &plan.sync_order {
         if let Some(root) =
             normalize_dependency_root_for_runtime(&action.package_root, topology_policy)
+            && seen.insert(root.clone())
         {
-            if seen.insert(root.clone()) {
-                reporter.verbose(&format!(
-                    "[RCH] dependency root {} ({:?})",
-                    root.display(),
-                    action.metadata.reason
-                ));
-                ordered.push(root);
-            }
+            reporter.verbose(&format!(
+                "[RCH] dependency root {} ({:?})",
+                root.display(),
+                action.metadata.reason
+            ));
+            ordered.push(root);
         }
     }
 
@@ -2583,11 +2582,10 @@ where
 
     let raw = lookup_env("CARGO_TARGET_DIR").or_else(|| {
         command_tokens.and_then(|tokens| {
-            extract_cargo_target_dir_from_command_tokens(tokens).map(|value| {
+            extract_cargo_target_dir_from_command_tokens(tokens).inspect(|_| {
                 reporter.verbose(
                     "[RCH] CARGO_TARGET_DIR forwarding detected from delegated command tokens",
                 );
-                value
             })
         })
     });
@@ -3875,7 +3873,10 @@ fn manifest_declares_workspace(manifest_path: &Path) -> bool {
     table.contains_key("workspace")
 }
 
-fn enclosing_workspace_root_for_sync_root(root: &Path, policy: &PathTopologyPolicy) -> Option<PathBuf> {
+fn enclosing_workspace_root_for_sync_root(
+    root: &Path,
+    policy: &PathTopologyPolicy,
+) -> Option<PathBuf> {
     for candidate in root.ancestors() {
         if !is_within_sync_topology(candidate, policy) {
             break;
@@ -3937,8 +3938,7 @@ fn build_sync_closure_plan(
     project_hash: &str,
     topology_policy: &PathTopologyPolicy,
 ) -> Vec<SyncClosurePlanEntry> {
-    let mut ordered_entries =
-        std::collections::BTreeSet::<(PathBuf, SyncClosureMode)>::new();
+    let mut ordered_entries = std::collections::BTreeSet::<(PathBuf, SyncClosureMode)>::new();
     for root in sync_roots {
         let canonicalized = canonicalize_sync_root_for_plan(root, topology_policy);
         if !is_within_sync_topology(&canonicalized, topology_policy) {
@@ -3963,7 +3963,8 @@ fn build_sync_closure_plan(
     ordered_entries.insert((primary_root.clone(), SyncClosureMode::Full));
     let full_roots: Vec<PathBuf> = ordered_entries
         .iter()
-        .filter_map(|(root, mode)| (*mode == SyncClosureMode::Full).then(|| root.clone()))
+        .filter(|(_, mode)| *mode == SyncClosureMode::Full)
+        .map(|(root, _)| root.clone())
         .collect();
     for root in full_roots {
         ordered_entries.remove(&(root, SyncClosureMode::WorkspaceMetadata));
@@ -5504,6 +5505,44 @@ mod tests {
         fn drop(&mut self) {
             crate::config::set_test_config_override(None);
         }
+    }
+
+    /// Create a platform-portable tempdir and a matching `PathTopologyPolicy`
+    /// whose canonical root points at the tempdir's canonical path.
+    ///
+    /// Tests previously used `tempfile::tempdir_in("/data/projects")` +
+    /// `PathTopologyPolicy::default()` so the default `/data/projects`
+    /// topology would accept the tempdir paths. That pins tests to the
+    /// maintainer's dev machine and fails on every CI runner that doesn't
+    /// have `/data/projects`. This helper keeps the intent (tempdir paths
+    /// are "within topology") without the path pin — we simply build a
+    /// policy that recognises the tempdir itself as the topology root.
+    ///
+    /// The tempdir path is canonicalized so macOS `/tmp -> /private/tmp`
+    /// and similar symlinks don't cause `starts_with` mismatches when
+    /// callers canonicalize their own roots.
+    ///
+    /// The `alias_root` is set to a sibling path that is deliberately *not*
+    /// a prefix of the tempdir. This keeps
+    /// `normalize_project_path_with_policy` from trying to verify the alias
+    /// as a symlink (which fails when the alias is a plain directory or
+    /// missing) while still giving `is_within_sync_topology` a well-formed
+    /// second entry.
+    fn topology_tempdir() -> (tempfile::TempDir, PathTopologyPolicy) {
+        let temp_dir = tempfile::tempdir().expect("create tempdir");
+        let canonical = std::fs::canonicalize(temp_dir.path()).expect("canonicalize tempdir");
+        let alias_root = canonical
+            .parent()
+            .map(|parent| {
+                let leaf = canonical
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("tmp");
+                parent.join(format!("{leaf}__rch_alias_sentinel"))
+            })
+            .unwrap_or_else(|| canonical.clone());
+        let policy = PathTopologyPolicy::new(canonical, alias_root);
+        (temp_dir, policy)
     }
 
     async fn spawn_mock_daemon(socket_path: &str, response: SelectionResponse) {
@@ -8040,7 +8079,7 @@ RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
     #[test]
     fn test_build_sync_closure_plan_deterministic_under_permutation() {
         let _guard = test_guard!();
-        let temp_dir = tempfile::tempdir_in("/data/projects").expect("create tempdir");
+        let (temp_dir, policy) = topology_tempdir();
         let project_root = temp_dir.path().join("project");
         let dep_a = temp_dir.path().join("dep_a");
         let dep_b = temp_dir.path().join("dep_b");
@@ -8053,13 +8092,13 @@ RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
             &[dep_b.clone(), project_root.clone(), dep_a.clone()],
             &project_root,
             project_hash,
-            &PathTopologyPolicy::default(),
+            &policy,
         );
         let plan_b = build_sync_closure_plan(
             &[dep_a.clone(), dep_b.clone(), project_root.clone()],
             &project_root,
             project_hash,
-            &PathTopologyPolicy::default(),
+            &policy,
         );
 
         assert_eq!(plan_a, plan_b, "sync closure plan should be deterministic");
@@ -8077,7 +8116,7 @@ RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
         let _guard = test_guard!();
         use std::os::unix::fs::symlink;
 
-        let temp_dir = tempfile::tempdir_in("/data/projects").expect("create tempdir");
+        let (temp_dir, policy) = topology_tempdir();
         let project_root = temp_dir.path().join("project");
         let dep = temp_dir.path().join("dep");
         let dep_alias = temp_dir.path().join("dep_alias");
@@ -8090,7 +8129,7 @@ RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
             &[dep_alias.clone(), dep.clone(), project_root.clone()],
             &project_root,
             "beefcafe",
-            &PathTopologyPolicy::default(),
+            &policy,
         );
 
         let dep_entries = plan
@@ -8107,7 +8146,7 @@ RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
     #[test]
     fn test_build_sync_closure_plan_adds_workspace_metadata_for_member_roots() {
         let _guard = test_guard!();
-        let temp_dir = tempfile::tempdir_in("/data/projects").expect("create tempdir");
+        let (temp_dir, policy) = topology_tempdir();
         let project_root = temp_dir.path().join("project");
         let dep_workspace_root = temp_dir.path().join("dep_workspace");
         let dep_member_root = dep_workspace_root.join("crates/member");
@@ -8135,14 +8174,13 @@ edition = "2024"
             &[dep_member_root.clone(), project_root.clone()],
             &project_root,
             "workspace_hash",
-            &PathTopologyPolicy::default(),
+            &policy,
         );
 
         assert!(
-            plan.iter()
-                .any(|entry| entry.local_root == dep_member_root
-                    && entry.mode == SyncClosureMode::Full
-                    && !entry.is_primary),
+            plan.iter().any(|entry| entry.local_root == dep_member_root
+                && entry.mode == SyncClosureMode::Full
+                && !entry.is_primary),
             "workspace member root should remain a full sync root"
         );
         assert!(
@@ -8153,8 +8191,10 @@ edition = "2024"
             "workspace member roots should add a thin workspace metadata sync"
         );
         assert!(
-            !plan.iter().any(|entry| entry.local_root == dep_workspace_root
-                && entry.mode == SyncClosureMode::Full),
+            !plan
+                .iter()
+                .any(|entry| entry.local_root == dep_workspace_root
+                    && entry.mode == SyncClosureMode::Full),
             "workspace root should not become a full sync root unless it was explicitly requested"
         );
     }
@@ -8162,7 +8202,7 @@ edition = "2024"
     #[test]
     fn test_build_dependency_runtime_plan_keeps_workspace_member_roots() {
         let _guard = test_guard!();
-        let temp_dir = tempfile::tempdir_in("/data/projects").expect("create tempdir");
+        let (temp_dir, policy) = topology_tempdir();
         let project_root = temp_dir.path().join("project");
         let dep_workspace_root = temp_dir.path().join("dep_workspace");
         let dep_member_root = dep_workspace_root.join("crates/member");
@@ -8205,15 +8245,14 @@ edition = "2024"
         let project_root = std::fs::canonicalize(&project_root).expect("canonicalize project");
         let dep_workspace_root =
             std::fs::canonicalize(&dep_workspace_root).expect("canonicalize workspace");
-        let dep_member_root =
-            std::fs::canonicalize(&dep_member_root).expect("canonicalize member");
+        let dep_member_root = std::fs::canonicalize(&dep_member_root).expect("canonicalize member");
         let reporter = HookReporter::new(OutputVisibility::None);
 
         let plan = build_dependency_runtime_plan(
             &project_root,
             Some(CompilationKind::CargoCheck),
             &reporter,
-            &PathTopologyPolicy::default(),
+            &policy,
         );
 
         assert!(
@@ -8256,7 +8295,19 @@ edition = "2024"
         );
         mock::clear_global_invocations();
 
-        let custom_target_dir = "/data/projects/remote_compilation_helper/.rch-test-target-cache";
+        // `execute_remote_compilation` reads the current project root from
+        // `std::env::current_dir()` and normalizes it through the supplied
+        // topology policy. Pin the cwd to a tempdir and build a policy that
+        // recognises it so the test runs anywhere (including CI runners with
+        // no `/data/projects`).
+        let (temp_dir, policy) = topology_tempdir();
+        let project_dir = temp_dir.path().join("remote_compilation_helper");
+        std::fs::create_dir_all(&project_dir).expect("create project dir");
+        let custom_target_dir_path = project_dir.join(".rch-test-target-cache");
+        let custom_target_dir = custom_target_dir_path.to_string_lossy().to_string();
+
+        let prev_cwd = std::env::current_dir().ok();
+        std::env::set_current_dir(&project_dir).expect("cd into project dir");
 
         let worker = SelectedWorker {
             id: rch_common::WorkerId::new("mock-worker"),
@@ -8273,7 +8324,7 @@ edition = "2024"
             "cargo build",
             TransferConfig::default(),
             Vec::new(),
-            Some(PathBuf::from(custom_target_dir)),
+            Some(PathBuf::from(&custom_target_dir)),
             &rch_common::CompilationConfig::default(),
             None,
             Some(CompilationKind::CargoBuild),
@@ -8281,9 +8332,14 @@ edition = "2024"
             &socket_path,
             ColorMode::Auto,
             None,
-            &PathTopologyPolicy::default(),
+            &policy,
         )
         .await;
+
+        // Restore cwd before any assertion so a failure doesn't poison other tests.
+        if let Some(prev) = prev_cwd {
+            let _ = std::env::set_current_dir(prev);
+        }
 
         let execution = result.expect("remote execution should succeed in mock mode");
         assert_eq!(execution.exit_code, 0);
@@ -10084,7 +10140,7 @@ edition = "2024"
     #[test]
     fn test_build_sync_closure_manifest_deterministic_entries() {
         let _guard = test_guard!();
-        let temp_dir = tempfile::tempdir_in("/data/projects").expect("create tempdir");
+        let (temp_dir, policy) = topology_tempdir();
         let project_root = temp_dir.path().join("project");
         let dep_a = temp_dir.path().join("dep_a");
         let dep_b = temp_dir.path().join("dep_b");
@@ -10096,7 +10152,7 @@ edition = "2024"
             &[dep_b.clone(), dep_a.clone(), project_root.clone()],
             &project_root,
             "abc123",
-            &PathTopologyPolicy::default(),
+            &policy,
         );
         let manifest_a = build_sync_closure_manifest(&plan, &project_root);
         let manifest_b = build_sync_closure_manifest(&plan, &project_root);
@@ -10119,7 +10175,7 @@ edition = "2024"
     #[test]
     fn test_build_sync_closure_manifest_schema_version_stable() {
         let _guard = test_guard!();
-        let temp_dir = tempfile::tempdir_in("/data/projects").expect("create tempdir");
+        let (temp_dir, policy) = topology_tempdir();
         let project_root = temp_dir.path().join("project");
         std::fs::create_dir_all(&project_root).expect("create project root");
 
@@ -10127,7 +10183,7 @@ edition = "2024"
             std::slice::from_ref(&project_root),
             &project_root,
             "deadbeef",
-            &PathTopologyPolicy::default(),
+            &policy,
         );
         let manifest = build_sync_closure_manifest(&plan, &project_root);
 
@@ -10140,7 +10196,7 @@ edition = "2024"
     #[test]
     fn test_build_sync_closure_manifest_entries_faithfully_represent_plan() {
         let _guard = test_guard!();
-        let temp_dir = tempfile::tempdir_in("/data/projects").expect("create tempdir");
+        let (temp_dir, policy) = topology_tempdir();
         let project_root = temp_dir.path().join("project");
         let dep = temp_dir.path().join("dep");
         std::fs::create_dir_all(&project_root).expect("create project root");
@@ -10150,7 +10206,7 @@ edition = "2024"
             &[dep.clone(), project_root.clone()],
             &project_root,
             "cafe0001",
-            &PathTopologyPolicy::default(),
+            &policy,
         );
         let manifest = build_sync_closure_manifest(&plan, &project_root);
 
@@ -10177,7 +10233,7 @@ edition = "2024"
     #[test]
     fn test_build_sync_closure_manifest_primary_root_present() {
         let _guard = test_guard!();
-        let temp_dir = tempfile::tempdir_in("/data/projects").expect("create tempdir");
+        let (temp_dir, policy) = topology_tempdir();
         let project_root = temp_dir.path().join("project");
         let dep = temp_dir.path().join("dep");
         std::fs::create_dir_all(&project_root).expect("create project root");
@@ -10187,7 +10243,7 @@ edition = "2024"
             &[dep.clone(), project_root.clone()],
             &project_root,
             "primary_hash",
-            &PathTopologyPolicy::default(),
+            &policy,
         );
         let manifest = build_sync_closure_manifest(&plan, &project_root);
 
@@ -10206,7 +10262,7 @@ edition = "2024"
     #[test]
     fn test_build_sync_closure_plan_adds_primary_even_when_absent_from_roots() {
         let _guard = test_guard!();
-        let temp_dir = tempfile::tempdir_in("/data/projects").expect("create tempdir");
+        let (temp_dir, policy) = topology_tempdir();
         let project_root = temp_dir.path().join("project");
         let dep = temp_dir.path().join("dep");
         std::fs::create_dir_all(&project_root).expect("create project root");
@@ -10217,7 +10273,7 @@ edition = "2024"
             std::slice::from_ref(&dep),
             &project_root,
             "hash_auto_add",
-            &PathTopologyPolicy::default(),
+            &policy,
         );
         let has_primary = plan.iter().any(|e| e.is_primary);
         assert!(
@@ -10231,7 +10287,7 @@ edition = "2024"
     #[test]
     fn test_sync_root_outcome_diagnostic_counting() {
         let _guard = test_guard!();
-        let temp_dir = tempfile::tempdir_in("/data/projects").expect("create tempdir");
+        let (temp_dir, policy) = topology_tempdir();
         let project_root = temp_dir.path().join("project");
         let dep_a = temp_dir.path().join("dep_a");
         let dep_b = temp_dir.path().join("dep_b");
@@ -10250,7 +10306,7 @@ edition = "2024"
             ],
             &project_root,
             "diag_hash",
-            &PathTopologyPolicy::default(),
+            &policy,
         );
 
         // Simulate outcomes: primary synced, one dep synced, one skipped, one failed.
@@ -10291,7 +10347,7 @@ edition = "2024"
     #[test]
     fn test_build_sync_closure_manifest_serializes_to_json() {
         let _guard = test_guard!();
-        let temp_dir = tempfile::tempdir_in("/data/projects").expect("create tempdir");
+        let (temp_dir, policy) = topology_tempdir();
         let project_root = temp_dir.path().join("project");
         let dep = temp_dir.path().join("dep");
         std::fs::create_dir_all(&project_root).expect("create project root");
@@ -10301,7 +10357,7 @@ edition = "2024"
             &[dep.clone(), project_root.clone()],
             &project_root,
             "serial_hash",
-            &PathTopologyPolicy::default(),
+            &policy,
         );
         let manifest = build_sync_closure_manifest(&plan, &project_root);
 
@@ -10436,11 +10492,10 @@ edition = "2024"
     #[test]
     fn test_canonicalize_existing_path() {
         let _guard = test_guard!();
-        let temp_dir = tempfile::tempdir_in("/data/projects").expect("create tempdir");
+        let (temp_dir, policy) = topology_tempdir();
         let dir = temp_dir.path().join("real_dir");
         std::fs::create_dir_all(&dir).expect("create dir");
 
-        let policy = rch_common::path_topology::PathTopologyPolicy::default();
         let result = canonicalize_sync_root_for_plan(&dir, &policy);
         // Should be a canonical absolute path containing the dir name.
         assert!(result.is_absolute());
@@ -10464,11 +10519,10 @@ edition = "2024"
     #[test]
     fn test_canonicalize_trailing_slash() {
         let _guard = test_guard!();
-        let temp_dir = tempfile::tempdir_in("/data/projects").expect("create tempdir");
+        let (temp_dir, policy) = topology_tempdir();
         let dir = temp_dir.path().join("trail");
         std::fs::create_dir_all(&dir).expect("create dir");
 
-        let policy = rch_common::path_topology::PathTopologyPolicy::default();
         let with_trailing = PathBuf::from(format!("{}/", dir.display()));
         let without_trailing = canonicalize_sync_root_for_plan(&dir, &policy);
         let with_result = canonicalize_sync_root_for_plan(&with_trailing, &policy);
@@ -10482,13 +10536,12 @@ edition = "2024"
         let _guard = test_guard!();
         use std::os::unix::fs::symlink;
 
-        let temp_dir = tempfile::tempdir_in("/data/projects").expect("create tempdir");
+        let (temp_dir, policy) = topology_tempdir();
         let real_dir = temp_dir.path().join("real");
         let link_dir = temp_dir.path().join("link");
         std::fs::create_dir_all(&real_dir).expect("create real dir");
         symlink(&real_dir, &link_dir).expect("create symlink");
 
-        let policy = rch_common::path_topology::PathTopologyPolicy::default();
         let from_real = canonicalize_sync_root_for_plan(&real_dir, &policy);
         let from_link = canonicalize_sync_root_for_plan(&link_dir, &policy);
         assert_eq!(
@@ -10500,20 +10553,34 @@ edition = "2024"
     #[test]
     fn test_canonicalize_dp_alias() {
         let _guard = test_guard!();
-        // /dp is an alias for /data/projects. If /dp symlink exists,
-        // canonicalization should resolve through it.
-        if Path::new("/dp").exists() {
-            let dp_path = PathBuf::from("/dp/remote_compilation_helper");
-            let canonical = PathBuf::from("/data/projects/remote_compilation_helper");
-            let policy = rch_common::path_topology::PathTopologyPolicy::default();
-            let result = canonicalize_sync_root_for_plan(&dp_path, &policy);
-            assert_eq!(
-                result, canonical,
-                "/dp alias should resolve to /data/projects"
-            );
+        // /dp is an alias for /data/projects on the maintainer's dev host.
+        // This test is environment-dependent: only meaningful when BOTH the
+        // alias and the canonical target exist and the concrete subdir
+        // (`remote_compilation_helper`) is present under each.
+        //
+        // Using `Path::exists()` alone isn't robust — CI runners occasionally
+        // have a `/dp` inode that doesn't resolve through `canonicalize`
+        // (broken or partially-populated mount). Guard on canonicalization
+        // success of the actual input path instead, and skip otherwise.
+        let dp_path = PathBuf::from("/dp/remote_compilation_helper");
+        let canonical_expected = PathBuf::from("/data/projects/remote_compilation_helper");
+        let (Ok(dp_canonical), true) =
+            (std::fs::canonicalize(&dp_path), canonical_expected.exists())
+        else {
+            return;
+        };
+        if dp_canonical != canonical_expected {
+            // Alias target exists but points somewhere else on this host —
+            // nothing to assert here.
+            return;
         }
-        // If /dp doesn't exist, test is effectively a no-op. That's OK —
-        // this is an environment-dependent test.
+
+        let policy = rch_common::path_topology::PathTopologyPolicy::default();
+        let result = canonicalize_sync_root_for_plan(&dp_path, &policy);
+        assert_eq!(
+            result, canonical_expected,
+            "/dp alias should resolve to /data/projects"
+        );
     }
 
     // ── bd-3jjc.7: is_within_sync_topology() edge cases ─────────────────
@@ -10610,7 +10677,7 @@ edition = "2024"
     #[test]
     fn test_plan_primary_is_only_root() {
         let _guard = test_guard!();
-        let temp_dir = tempfile::tempdir_in("/data/projects").expect("create tempdir");
+        let (temp_dir, policy) = topology_tempdir();
         let project_root = temp_dir.path().join("only");
         std::fs::create_dir_all(&project_root).expect("create dir");
 
@@ -10618,7 +10685,7 @@ edition = "2024"
             std::slice::from_ref(&project_root),
             &project_root,
             "only_hash",
-            &PathTopologyPolicy::default(),
+            &policy,
         );
         assert_eq!(plan.len(), 1);
         assert!(plan[0].is_primary);
@@ -10628,7 +10695,7 @@ edition = "2024"
     #[test]
     fn test_plan_large_root_set() {
         let _guard = test_guard!();
-        let temp_dir = tempfile::tempdir_in("/data/projects").expect("create tempdir");
+        let (temp_dir, policy) = topology_tempdir();
         let project_root = temp_dir.path().join("main_proj");
         std::fs::create_dir_all(&project_root).expect("create main");
 
@@ -10641,12 +10708,7 @@ edition = "2024"
         roots.push(project_root.clone());
 
         let start = std::time::Instant::now();
-        let plan = build_sync_closure_plan(
-            &roots,
-            &project_root,
-            "large_hash",
-            &PathTopologyPolicy::default(),
-        );
+        let plan = build_sync_closure_plan(&roots, &project_root, "large_hash", &policy);
         let elapsed = start.elapsed();
 
         // 100 deps + 1 primary (deduped) = 101 entries.
@@ -10670,7 +10732,7 @@ edition = "2024"
     #[test]
     fn test_plan_duplicate_roots_deduped() {
         let _guard = test_guard!();
-        let temp_dir = tempfile::tempdir_in("/data/projects").expect("create tempdir");
+        let (temp_dir, policy) = topology_tempdir();
         let project_root = temp_dir.path().join("proj");
         let dep = temp_dir.path().join("dep");
         std::fs::create_dir_all(&project_root).expect("create proj");
@@ -10680,7 +10742,7 @@ edition = "2024"
             &[dep.clone(), dep.clone(), dep.clone(), project_root.clone()],
             &project_root,
             "dup_hash",
-            &PathTopologyPolicy::default(),
+            &policy,
         );
 
         // dep appears 3 times in input but should be deduped to 1 entry + primary = 2.
@@ -10690,23 +10752,26 @@ edition = "2024"
     #[test]
     fn test_plan_primary_via_dp_alias_canonical() {
         let _guard = test_guard!();
-        // If /dp symlink exists, verify /dp/X resolves to /data/projects/X.
-        if Path::new("/dp").exists() {
-            let dp_path = PathBuf::from("/dp/remote_compilation_helper");
-            let canonical = std::fs::canonicalize(&dp_path).expect("canonicalize /dp path");
-            let plan =
-                build_sync_closure_plan(&[], &dp_path, "dp_hash", &PathTopologyPolicy::default());
-            assert_eq!(plan.len(), 1);
-            assert!(plan[0].is_primary);
-            assert_eq!(
-                plan[0].local_root, canonical,
-                "primary via /dp alias should canonicalize to the alias target"
-            );
-            assert_eq!(
-                plan[0].remote_root, "/data/projects/remote_compilation_helper",
-                "remote root should stay in worker canonical topology"
-            );
-        }
+        // Verify /dp/X resolves to /data/projects/X — but only when the
+        // maintainer's alias layout is actually present. `Path::exists`
+        // alone is too permissive (some CI images have a broken `/dp`
+        // node that `canonicalize` refuses).
+        let dp_path = PathBuf::from("/dp/remote_compilation_helper");
+        let Ok(canonical) = std::fs::canonicalize(&dp_path) else {
+            return;
+        };
+        let plan =
+            build_sync_closure_plan(&[], &dp_path, "dp_hash", &PathTopologyPolicy::default());
+        assert_eq!(plan.len(), 1);
+        assert!(plan[0].is_primary);
+        assert_eq!(
+            plan[0].local_root, canonical,
+            "primary via /dp alias should canonicalize to the alias target"
+        );
+        assert_eq!(
+            plan[0].remote_root, "/data/projects/remote_compilation_helper",
+            "remote root should stay in worker canonical topology"
+        );
     }
 
     #[test]
@@ -10739,7 +10804,7 @@ edition = "2024"
     #[test]
     fn test_plan_entry_ordering_is_lexicographic() {
         let _guard = test_guard!();
-        let temp_dir = tempfile::tempdir_in("/data/projects").expect("create tempdir");
+        let (temp_dir, policy) = topology_tempdir();
         let project_root = temp_dir.path().join("proj");
         let dep_z = temp_dir.path().join("z_dep");
         let dep_a = temp_dir.path().join("a_dep");
@@ -10753,7 +10818,7 @@ edition = "2024"
             &[dep_z, dep_a, dep_m, project_root.clone()],
             &project_root,
             "order_hash",
-            &PathTopologyPolicy::default(),
+            &policy,
         );
 
         for window in plan.windows(2) {
@@ -10779,7 +10844,7 @@ edition = "2024"
     #[test]
     fn test_manifest_generated_at_is_recent() {
         let _guard = test_guard!();
-        let temp_dir = tempfile::tempdir_in("/data/projects").expect("create tempdir");
+        let (temp_dir, policy) = topology_tempdir();
         let project_root = temp_dir.path().join("proj");
         std::fs::create_dir_all(&project_root).expect("create proj");
 
@@ -10791,7 +10856,7 @@ edition = "2024"
             std::slice::from_ref(&project_root),
             &project_root,
             "ts_hash",
-            &PathTopologyPolicy::default(),
+            &policy,
         );
         let manifest = build_sync_closure_manifest(&plan, &project_root);
         let after_ms = SystemTime::now()
@@ -10812,7 +10877,7 @@ edition = "2024"
     #[test]
     fn test_manifest_order_field_sequential() {
         let _guard = test_guard!();
-        let temp_dir = tempfile::tempdir_in("/data/projects").expect("create tempdir");
+        let (temp_dir, policy) = topology_tempdir();
         let project_root = temp_dir.path().join("proj");
         std::fs::create_dir_all(&project_root).expect("create proj");
 
@@ -10824,12 +10889,7 @@ edition = "2024"
         }
         roots.push(project_root.clone());
 
-        let plan = build_sync_closure_plan(
-            &roots,
-            &project_root,
-            "seq_hash",
-            &PathTopologyPolicy::default(),
-        );
+        let plan = build_sync_closure_plan(&roots, &project_root, "seq_hash", &policy);
         let manifest = build_sync_closure_manifest(&plan, &project_root);
 
         // Order field should be 1-indexed and sequential.
@@ -11023,7 +11083,7 @@ edition = "2024"
     #[test]
     fn test_e2e_sync_closure_plan_and_manifest() {
         let _guard = test_guard!();
-        let temp_dir = tempfile::tempdir_in("/data/projects").expect("create tempdir");
+        let (temp_dir, policy) = topology_tempdir();
         let primary = temp_dir.path().join("primary_project");
         let dep_a = temp_dir.path().join("dep_a");
         let dep_b = temp_dir.path().join("dep_b");
@@ -11031,31 +11091,36 @@ edition = "2024"
         std::fs::create_dir_all(&dep_a).expect("create dep_a");
         std::fs::create_dir_all(&dep_b).expect("create dep_b");
 
-        // Step 2: Build plan with valid deps + invalid /tmp dep.
+        // Step 2: Build plan with valid deps + an out-of-topology sentinel
+        // that must be filtered. Pick any path that lies outside the
+        // `topology_tempdir` root — `/var/empty` exists on Linux & macOS
+        // and is not under our scratch area.
+        let out_of_topology = PathBuf::from("/var/empty/invalid_dep");
         let plan = build_sync_closure_plan(
             &[
                 primary.clone(),
                 dep_a.clone(),
                 dep_b.clone(),
-                PathBuf::from("/tmp/invalid_dep"),
+                out_of_topology.clone(),
             ],
             &primary,
             "e2e_hash",
-            &PathTopologyPolicy::default(),
+            &policy,
         );
 
-        // Step 3: 3 entries (primary, dep_a, dep_b), /tmp excluded.
+        // Step 3: 3 entries (primary, dep_a, dep_b), out-of-topology excluded.
         assert_eq!(
             plan.len(),
             3,
             "plan should have 3 entries (primary + 2 deps), got {}",
             plan.len()
         );
+        let out_of_topology_str = out_of_topology.to_string_lossy().to_string();
         assert!(
             !plan
                 .iter()
-                .any(|e| e.local_root.to_string_lossy().contains("/tmp")),
-            "/tmp dep should be excluded by topology filter"
+                .any(|e| e.local_root.to_string_lossy() == out_of_topology_str),
+            "out-of-topology dep should be excluded by topology filter"
         );
 
         // Step 4: Verify lexicographic ordering.
@@ -11113,7 +11178,7 @@ edition = "2024"
         let _guard = test_guard!();
         use std::os::unix::fs::symlink;
 
-        let temp_dir = tempfile::tempdir_in("/data/projects").expect("create tempdir");
+        let (temp_dir, policy) = topology_tempdir();
         let valid_root = temp_dir.path().join("valid_root");
         let valid_sub = valid_root.join("sub");
         std::fs::create_dir_all(&valid_sub).expect("create valid_root/sub");
@@ -11125,19 +11190,25 @@ edition = "2024"
         let alias_link = temp_dir.path().join("alias_for_valid");
         symlink(&valid_root, &alias_link).expect("create symlink");
 
-        // Build plan with mixed valid/invalid/alias paths.
+        // Build plan with mixed valid/invalid/alias paths. Rejection paths
+        // are deliberately under system roots that won't overlap with the
+        // `topology_tempdir` scratch area (which itself lives under
+        // `/tmp/.tmpXXXX` on Linux or `/var/folders/...` on macOS).
+        let reject_a = PathBuf::from("/etc/rch_should_reject");
+        let reject_b = PathBuf::from("/usr/local/fake_project");
+        let reject_c = PathBuf::from("/opt/fake_thing");
         let plan = build_sync_closure_plan(
             &[
                 valid_root.clone(),
                 alias_link.clone(), // should dedup with valid_root
-                PathBuf::from("/tmp/should_reject"),
-                PathBuf::from("/home/fake/project"),
-                PathBuf::from("/var/lib/something"),
+                reject_a.clone(),
+                reject_b.clone(),
+                reject_c.clone(),
                 primary.clone(),
             ],
             &primary,
             "topo_e2e_hash",
-            &PathTopologyPolicy::default(),
+            &policy,
         );
 
         // Should contain primary + valid_root (deduped with alias) = 2 entries.
@@ -11148,13 +11219,15 @@ edition = "2024"
             plan.len()
         );
 
-        // Verify /tmp, /home, /var paths were excluded.
+        // Verify the three explicit rejection paths were excluded.
+        let reject_strs: Vec<String> = [reject_a, reject_b, reject_c]
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
         for entry in &plan {
-            let path_str = entry.local_root.to_string_lossy();
+            let path_str = entry.local_root.to_string_lossy().to_string();
             assert!(
-                !path_str.starts_with("/tmp")
-                    && !path_str.starts_with("/home")
-                    && !path_str.starts_with("/var"),
+                !reject_strs.contains(&path_str),
                 "out-of-topology path should not appear in plan: {}",
                 path_str
             );

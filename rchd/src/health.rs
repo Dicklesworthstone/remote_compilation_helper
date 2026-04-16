@@ -448,7 +448,6 @@ impl HealthMonitor {
                             health.circuit_stats().consecutive_failures()
                         );
                     }
-
                 }
 
                 // Check for all-workers-offline condition
