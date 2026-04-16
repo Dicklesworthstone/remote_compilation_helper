@@ -38,12 +38,17 @@ struct TopologyFixture {
 impl TopologyFixture {
     fn new(prefix: &str) -> Self {
         let id = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let root = std::env::temp_dir().join(format!(
+        let raw_root = std::env::temp_dir().join(format!(
             "rch-e2e-cross-repo-{}-{}-{}",
             prefix,
             std::process::id(),
             id,
         ));
+        fs::create_dir_all(&raw_root).expect("create fixture root");
+        // Canonicalize the root so macOS (`/tmp -> /private/tmp`) doesn't
+        // produce `starts_with` mismatches when callers compare against
+        // package_root paths returned by cargo (which are canonical).
+        let root = fs::canonicalize(&raw_root).expect("canonicalize fixture root");
         let canonical_root = root.join("data/projects");
         let alias_root = root.join("dp");
         fs::create_dir_all(&canonical_root).expect("create canonical root");
