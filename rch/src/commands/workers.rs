@@ -25,12 +25,12 @@ use crate::ui::theme::StatusIndicator;
 use super::helpers::{
     classify_ssh_error, default_socket_path, format_ssh_report, indent_lines,
     major_version_mismatch, runtime_label, rust_version_mismatch, send_daemon_command,
-    urlencoding_encode,
+    ssh_error_code, urlencoding_encode,
 };
 use super::helpers::{config_dir, load_workers_from_config};
 use super::types::{
     WorkerActionResponse, WorkerBenchmarkResult, WorkerInfo, WorkerProbeResult,
-    WorkersCapabilitiesReport, WorkersListResponse,
+    WorkerProbeSummary, WorkersCapabilitiesReport, WorkersListResponse, WorkersProbeResponse,
 };
 
 use crate::hook::required_runtime_for_kind;
@@ -692,9 +692,12 @@ pub async fn workers_probe(
 
     if workers.is_empty() {
         if ctx.is_json() {
-            let _ = ctx.json(&ApiResponse::<Vec<WorkerProbeResult>>::ok(
+            let _ = ctx.json(&ApiResponse::<WorkersProbeResponse>::ok(
                 "workers probe",
-                vec![],
+                WorkersProbeResponse {
+                    results: vec![],
+                    summary: WorkerProbeSummary::default(),
+                },
             ));
         }
         return Ok(());
@@ -772,15 +775,15 @@ pub async fn workers_probe(
                 match client.health_check().await {
                     Ok(true) => {
                         let latency = start.elapsed().as_millis() as u64;
-                        if ctx.is_json() {
-                            results.push(WorkerProbeResult {
-                                id: worker.id.as_str().to_string(),
-                                host: worker.host.clone(),
-                                status: "ok".to_string(),
-                                latency_ms: Some(latency),
-                                error: None,
-                            });
-                        } else {
+                        results.push(WorkerProbeResult {
+                            id: worker.id.as_str().to_string(),
+                            host: worker.host.clone(),
+                            status: "ok".to_string(),
+                            latency_ms: Some(latency),
+                            error: None,
+                            error_code: None,
+                        });
+                        if !ctx.is_json() {
                             println!(
                                 "{} ({}ms)",
                                 StatusIndicator::Success.with_label(style, "OK"),
@@ -789,15 +792,19 @@ pub async fn workers_probe(
                         }
                     }
                     Ok(false) => {
-                        if ctx.is_json() {
-                            results.push(WorkerProbeResult {
-                                id: worker.id.as_str().to_string(),
-                                host: worker.host.clone(),
-                                status: "unhealthy".to_string(),
-                                latency_ms: None,
-                                error: Some("Health check failed".to_string()),
-                            });
-                        } else {
+                        // Reachable over SSH but the worker didn't confirm
+                        // readiness. Distinguish this from connect-layer
+                        // failures with WorkerHealthCheckFailed (E202).
+                        let code = rch_common::ErrorCode::WorkerHealthCheckFailed.code_string();
+                        results.push(WorkerProbeResult {
+                            id: worker.id.as_str().to_string(),
+                            host: worker.host.clone(),
+                            status: "unhealthy".to_string(),
+                            latency_ms: None,
+                            error: Some("Health check failed".to_string()),
+                            error_code: Some(code),
+                        });
+                        if !ctx.is_json() {
                             println!(
                                 "{}",
                                 StatusIndicator::Error.with_label(style, "Health check failed")
@@ -806,19 +813,21 @@ pub async fn workers_probe(
                     }
                     Err(e) => {
                         let ssh_error = classify_ssh_error(worker, &e, ssh_options.connect_timeout);
+                        let code = ssh_error_code(&ssh_error).code_string();
                         let report = format_ssh_report(ssh_error);
-                        if ctx.is_json() {
-                            results.push(WorkerProbeResult {
-                                id: worker.id.as_str().to_string(),
-                                host: worker.host.clone(),
-                                status: "error".to_string(),
-                                latency_ms: None,
-                                error: Some(report),
-                            });
-                        } else {
+                        results.push(WorkerProbeResult {
+                            id: worker.id.as_str().to_string(),
+                            host: worker.host.clone(),
+                            status: "error".to_string(),
+                            latency_ms: None,
+                            error: Some(report.clone()),
+                            error_code: Some(code.clone()),
+                        });
+                        if !ctx.is_json() {
                             println!(
-                                "{} Health check failed:\n{}",
+                                "{} Health check failed [{}]:\n{}",
                                 StatusIndicator::Error.display(style),
+                                style.highlight(&code),
                                 indent_lines(&report, "    ")
                             );
                         }
@@ -828,19 +837,21 @@ pub async fn workers_probe(
             }
             Err(e) => {
                 let ssh_error = classify_ssh_error(worker, &e, ssh_options.connect_timeout);
+                let code = ssh_error_code(&ssh_error).code_string();
                 let report = format_ssh_report(ssh_error);
-                if ctx.is_json() {
-                    results.push(WorkerProbeResult {
-                        id: worker.id.as_str().to_string(),
-                        host: worker.host.clone(),
-                        status: "connection_failed".to_string(),
-                        latency_ms: None,
-                        error: Some(report),
-                    });
-                } else {
+                results.push(WorkerProbeResult {
+                    id: worker.id.as_str().to_string(),
+                    host: worker.host.clone(),
+                    status: "connection_failed".to_string(),
+                    latency_ms: None,
+                    error: Some(report.clone()),
+                    error_code: Some(code.clone()),
+                });
+                if !ctx.is_json() {
                     println!(
-                        "{} Connection failed:\n{}",
+                        "{} Connection failed [{}]:\n{}",
                         StatusIndicator::Error.display(style),
+                        style.highlight(&code),
                         indent_lines(&report, "    ")
                     );
                 }
@@ -848,11 +859,64 @@ pub async fn workers_probe(
         }
     }
 
+    let summary = summarize_probe_results(&results);
+
     if ctx.is_json() {
-        let _ = ctx.json(&ApiResponse::ok("workers probe", results));
+        let _ = ctx.json(&ApiResponse::ok(
+            "workers probe",
+            WorkersProbeResponse { results, summary },
+        ));
+    } else {
+        println!("\n{}", format_probe_summary_line(&summary, style));
     }
 
     Ok(())
+}
+
+/// Tally a batch of probe results into a `WorkerProbeSummary`.
+pub(crate) fn summarize_probe_results(results: &[WorkerProbeResult]) -> WorkerProbeSummary {
+    let mut summary = WorkerProbeSummary {
+        total: results.len(),
+        ..WorkerProbeSummary::default()
+    };
+    for result in results {
+        match result.status.as_str() {
+            "ok" | "healthy" => summary.healthy += 1,
+            "unhealthy" => summary.unhealthy += 1,
+            _ => summary.failed += 1,
+        }
+        if let Some(code) = &result.error_code {
+            *summary.by_error_code.entry(code.clone()).or_insert(0) += 1;
+        } else if result.error.is_some() {
+            *summary
+                .by_error_code
+                .entry("other".to_string())
+                .or_insert(0) += 1;
+        }
+    }
+    summary
+}
+
+/// Render a one-line human summary such as
+/// `"9 worker(s) probed: 0 healthy, 6 RCH-E100, 3 RCH-E108."`
+fn format_probe_summary_line(
+    summary: &WorkerProbeSummary,
+    style: &rch_common::ui::RchTheme,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    parts.push(format!("{} healthy", summary.healthy));
+    if summary.unhealthy > 0 {
+        parts.push(format!("{} unhealthy", summary.unhealthy));
+    }
+    // BTreeMap iteration is sorted by key, so output order is deterministic.
+    for (code, count) in &summary.by_error_code {
+        parts.push(format!("{} {}", count, code));
+    }
+    format!(
+        "{} worker(s) probed: {}.",
+        style.highlight(&summary.total.to_string()),
+        parts.join(", ")
+    )
 }
 
 /// Run worker benchmarks (not available on non-Unix platforms).

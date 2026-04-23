@@ -200,6 +200,33 @@ pub fn format_ssh_report(error: SshError) -> String {
     format!("{:?}", miette::Report::new(error))
 }
 
+/// Map an SSH error to a stable `ErrorCode` from the shared catalog so callers
+/// can surface `"RCH-Exxx"` in structured output.
+///
+/// The `SshError` enum carries its own diagnostic annotation codes for the
+/// miette report, but those are display-only. The `ErrorCode` catalog is the
+/// authoritative identifier that downstream automation branches on.
+pub fn ssh_error_code(error: &SshError) -> rch_common::ErrorCode {
+    use rch_common::ErrorCode;
+    match error {
+        SshError::AuthFailed { .. }
+        | SshError::PermissionDenied { .. }
+        | SshError::AgentUnavailable { .. } => ErrorCode::SshAuthFailed,
+        SshError::KeyNotFound { .. } | SshError::KeyInsecurePermissions { .. } => {
+            ErrorCode::SshKeyError
+        }
+        SshError::HostKeyVerificationFailed { .. } => ErrorCode::SshHostKeyError,
+        SshError::ConnectionTimeout { .. } => ErrorCode::NetworkTimeout,
+        SshError::ConnectionRefused { .. } => ErrorCode::NetworkConnectionRefused,
+        SshError::ChannelError { .. } => ErrorCode::SshSessionDropped,
+        SshError::ConnectionFailed { .. }
+        | SshError::CommandFailed { .. }
+        | SshError::BinaryNotFound { .. }
+        | SshError::ToolchainInstallFailed { .. }
+        | SshError::RemotePermissionDenied { .. } => ErrorCode::SshConnectionFailed,
+    }
+}
+
 // ============================================================================
 // Text formatting helpers
 // ============================================================================
