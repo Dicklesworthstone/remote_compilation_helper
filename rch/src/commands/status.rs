@@ -1025,12 +1025,23 @@ async fn self_test_run(
         style.error(&run.run.workers_failed.to_string())
     );
 
+    let mut timed_out = 0usize;
     for result in &run.results {
         let status = if result.passed {
             StatusIndicator::Success.display(style)
         } else {
             StatusIndicator::Error.display(style)
         };
+        // A timeout is a distinct failure class; count it separately so the
+        // end-of-run summary can tell the agent whether it was a wedged
+        // worker versus a real regression (bd-nuuqt).
+        let is_timeout = result
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("[RCH-E203]") || e.to_lowercase().contains("timed out"));
+        if is_timeout {
+            timed_out += 1;
+        }
         let detail = if result.passed {
             format!(
                 "remote={}ms local={}ms",
@@ -1083,6 +1094,27 @@ async fn self_test_run(
             }
         }
     }
+
+    // Final one-line summary so agents watching --all runs can tell at a
+    // glance whether a failure is a timeout (likely transient/wedged worker)
+    // or a real self-test failure (bd-nuuqt).
+    let ok = run.run.workers_passed;
+    let failed_other = run.run.workers_failed.saturating_sub(timed_out);
+    println!(
+        "\n{} {} ok, {} timed out, {} failed.",
+        style.muted("Summary:"),
+        style.success(&ok.to_string()),
+        if timed_out > 0 {
+            style.warning(&timed_out.to_string())
+        } else {
+            style.muted("0")
+        },
+        if failed_other > 0 {
+            style.error(&failed_other.to_string())
+        } else {
+            style.muted("0")
+        }
+    );
 
     Ok(())
 }

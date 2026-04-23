@@ -539,8 +539,21 @@ fn parse_duration(value: &str) -> Option<Duration> {
     humantime::parse_duration(value).ok()
 }
 
-/// Run a single worker self-test with retries and timeout enforcement.
-/// This is a standalone function to allow parallel execution via tokio::spawn.
+/// Run a single worker self-test with retries, each bounded by the per-worker
+/// `options.timeout`, and with a fleet-safe total budget so a wedged worker
+/// can never starve `--all` mode of attention (bd-nuuqt).
+///
+/// The `options.timeout` value is enforced in two places:
+///
+/// 1. **Per attempt**: each call to the remote compilation test is wrapped in
+///    `tokio::time::timeout(options.timeout, ...)`.
+/// 2. **Per worker total**: the retry loop itself is wrapped in
+///    `tokio::time::timeout(options.timeout, ...)`. This guarantees the total
+///    wall clock time a single worker can consume is strictly bounded,
+///    regardless of retry count.
+///
+/// On timeout, `RCH-E203` (`WorkerSelfTestFailed`) is prefixed to the error
+/// message so downstream automation can branch on a stable code.
 async fn run_single_worker_test(
     run_id: u64,
     worker: &WorkerConfig,
@@ -549,62 +562,85 @@ async fn run_single_worker_test(
     config: &SelfTestConfig,
     _pool: &WorkerPool, // Reserved for future use (e.g., status updates)
 ) -> SelfTestResultRecord {
-    let retry_delay =
-        parse_duration(&config.retry_delay).unwrap_or_else(|| Duration::from_secs(300));
+    let worker_id = worker.id.to_string();
+    let timeout_total = options.timeout;
 
-    let mut attempt = 0;
-    loop {
-        attempt += 1;
-        let test = RemoteCompilationTest::new(worker.clone(), project_path.to_path_buf())
-            .with_timeout(options.timeout)
-            .with_release_mode(options.release_mode);
+    let retry_loop = async {
+        let retry_delay =
+            parse_duration(&config.retry_delay).unwrap_or_else(|| Duration::from_secs(300));
 
-        // CRITICAL: Actually enforce the timeout using tokio::time::timeout
-        // The RemoteCompilationTest.timeout field wasn't being applied!
-        let result = tokio::time::timeout(options.timeout, test.run()).await;
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            let test = RemoteCompilationTest::new(worker.clone(), project_path.to_path_buf())
+                .with_timeout(options.timeout)
+                .with_release_mode(options.release_mode);
 
-        let record = match result {
-            Ok(Ok(outcome)) => SelfTestResultRecord {
-                run_id,
-                worker_id: worker.id.to_string(),
-                passed: outcome.success,
-                local_hash: Some(outcome.local_hash.code_hash),
-                remote_hash: Some(outcome.remote_hash.code_hash),
-                local_time_ms: Some(outcome.local_build_ms),
-                remote_time_ms: Some(outcome.compilation_ms),
-                error: outcome.error,
-            },
-            Ok(Err(err)) => SelfTestResultRecord {
-                run_id,
-                worker_id: worker.id.to_string(),
-                passed: false,
-                local_hash: None,
-                remote_hash: None,
-                local_time_ms: None,
-                remote_time_ms: None,
-                error: Some(err.to_string()),
-            },
-            Err(_elapsed) => SelfTestResultRecord {
-                run_id,
-                worker_id: worker.id.to_string(),
-                passed: false,
-                local_hash: None,
-                remote_hash: None,
-                local_time_ms: None,
-                remote_time_ms: None,
-                error: Some(format!("Self-test timed out after {:?}", options.timeout)),
-            },
-        };
+            let result = tokio::time::timeout(options.timeout, test.run()).await;
 
-        if record.passed || attempt > config.retry_count {
-            return record;
+            let record = match result {
+                Ok(Ok(outcome)) => SelfTestResultRecord {
+                    run_id,
+                    worker_id: worker_id.clone(),
+                    passed: outcome.success,
+                    local_hash: Some(outcome.local_hash.code_hash),
+                    remote_hash: Some(outcome.remote_hash.code_hash),
+                    local_time_ms: Some(outcome.local_build_ms),
+                    remote_time_ms: Some(outcome.compilation_ms),
+                    error: outcome.error,
+                },
+                Ok(Err(err)) => SelfTestResultRecord {
+                    run_id,
+                    worker_id: worker_id.clone(),
+                    passed: false,
+                    local_hash: None,
+                    remote_hash: None,
+                    local_time_ms: None,
+                    remote_time_ms: None,
+                    error: Some(err.to_string()),
+                },
+                Err(_elapsed) => SelfTestResultRecord {
+                    run_id,
+                    worker_id: worker_id.clone(),
+                    passed: false,
+                    local_hash: None,
+                    remote_hash: None,
+                    local_time_ms: None,
+                    remote_time_ms: None,
+                    error: Some(format!(
+                        "[RCH-E203] Self-test attempt timed out after {:?}",
+                        options.timeout
+                    )),
+                },
+            };
+
+            if record.passed || attempt > config.retry_count {
+                return record;
+            }
+
+            warn!(
+                "Self-test failed for worker {} (attempt {}/{}), retrying in {:?}",
+                worker_id, attempt, config.retry_count, retry_delay
+            );
+            sleep(retry_delay).await;
         }
+    };
 
-        warn!(
-            "Self-test failed for worker {} (attempt {}/{}), retrying in {:?}",
-            worker.id, attempt, config.retry_count, retry_delay
-        );
-        sleep(retry_delay).await;
+    match tokio::time::timeout(timeout_total, retry_loop).await {
+        Ok(record) => record,
+        Err(_elapsed) => SelfTestResultRecord {
+            run_id,
+            worker_id,
+            passed: false,
+            local_hash: None,
+            remote_hash: None,
+            local_time_ms: None,
+            remote_time_ms: None,
+            error: Some(format!(
+                "[RCH-E203] Self-test hit per-worker deadline {:?} (including retries)",
+                timeout_total
+            )),
+        },
     }
 }
 
