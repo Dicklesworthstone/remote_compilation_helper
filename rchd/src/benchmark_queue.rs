@@ -46,8 +46,13 @@ impl BenchmarkQueue {
         request_id: String,
     ) -> Result<BenchmarkRequest, RateLimitInfo> {
         let now = Utc::now();
+
+        // Check-and-set under a single write lock: two concurrent callers
+        // must not both pass the rate-limit check before either has
+        // written its timestamp, or both requests would pass through and
+        // the per-worker interval would be violated.
         {
-            let last = self.last_triggered.lock().expect("benchmark rate lock");
+            let mut last = self.last_triggered.lock().expect("benchmark rate lock");
             if let Some(last_at) = last.get(&worker_id) {
                 let since = now - *last_at;
                 if since < self.min_interval {
@@ -57,10 +62,6 @@ impl BenchmarkQueue {
                     });
                 }
             }
-        }
-
-        {
-            let mut last = self.last_triggered.lock().expect("benchmark rate lock");
             last.insert(worker_id.clone(), now);
         }
 
@@ -586,5 +587,39 @@ mod tests {
 
         let popped = queue.pop().unwrap();
         assert_eq!(popped.request_id, unique_id);
+    }
+
+    #[test]
+    fn test_concurrent_enqueue_respects_rate_limit() {
+        // Regression test for a check-then-set race: the rate-limit check
+        // and the timestamp insert were performed under separate Mutex
+        // acquisitions, which allowed two concurrent callers to both pass
+        // the "not too recent" check before either had written.
+        let _guard = test_guard!();
+        let queue = std::sync::Arc::new(BenchmarkQueue::new(ChronoDuration::seconds(60)));
+        let worker_id = WorkerId::new("hot-worker");
+
+        let mut handles = Vec::new();
+        for i in 0..16 {
+            let q = queue.clone();
+            let w = worker_id.clone();
+            handles.push(std::thread::spawn(move || {
+                q.enqueue(w, format!("req-{}", i))
+            }));
+        }
+
+        let mut successes = 0;
+        for h in handles {
+            if h.join().expect("thread join").is_ok() {
+                successes += 1;
+            }
+        }
+
+        // Exactly one caller must succeed when the rate-limit window is
+        // 60s and all callers arrive within microseconds of each other.
+        assert_eq!(
+            successes, 1,
+            "rate-limit check must be atomic with insert; got {successes} successes"
+        );
     }
 }
