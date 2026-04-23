@@ -1438,9 +1438,7 @@ async fn main() -> Result<()> {
             let forced_hook = env::var_os("RCH_HOOK_MODE").is_some_and(|v| v != "0")
                 || env::var_os("RCH_JSON").is_some_and(|v| v != "0");
             if !forced_hook && std::io::stdin().is_terminal() {
-                eprintln!(
-                    "rch runs in PreToolUse hook mode when invoked without a subcommand."
-                );
+                eprintln!("rch runs in PreToolUse hook mode when invoked without a subcommand.");
                 eprintln!("It is now waiting for a JSON hook request on stdin.");
                 eprintln!();
                 eprintln!("If you are a human at a terminal, try one of:");
