@@ -249,20 +249,56 @@ pub struct PiggybackExtraction {
 ///
 /// Looks for the telemetry marker and parses the JSON following it.
 /// Returns the clean build output and the extracted telemetry.
+///
+/// Two disambiguations are applied so we don't mistakenly truncate a
+/// user's build output just because it happened to contain the literal
+/// marker string:
+///
+/// 1. The marker must sit on its own line (either at the start of the
+///    output or immediately after a newline). A match mid-line is
+///    almost certainly part of a log message, not our trailer.
+/// 2. The content after the marker must *look like* JSON (start with
+///    `{` after trimming). If it doesn't, we treat the match as a
+///    coincidence and leave the build output untouched.
+///
+/// If those two checks pass but `serde_json` rejects the body, we
+/// preserve the pre-marker text as the build output and report an
+/// `extraction_error` — the worker clearly intended to send telemetry
+/// but emitted something malformed.
 pub fn extract_piggybacked_telemetry(output: &str) -> PiggybackExtraction {
     if let Some(marker_pos) = output.rfind(PIGGYBACK_MARKER) {
-        let build_output = output[..marker_pos].trim_end().to_string();
+        let at_line_start = marker_pos == 0
+            || output.as_bytes()[..marker_pos]
+                .last()
+                .is_some_and(|b| *b == b'\n');
+        if !at_line_start {
+            return PiggybackExtraction {
+                build_output: output.to_string(),
+                telemetry: None,
+                extraction_error: None,
+            };
+        }
+
         let telemetry_start = marker_pos + PIGGYBACK_MARKER.len();
         let telemetry_json = output[telemetry_start..].trim();
 
+        if !telemetry_json.starts_with('{') {
+            // Probably a marker literal in build output, not our trailer.
+            return PiggybackExtraction {
+                build_output: output.to_string(),
+                telemetry: None,
+                extraction_error: None,
+            };
+        }
+
         match WorkerTelemetry::from_json(telemetry_json) {
             Ok(telemetry) => PiggybackExtraction {
-                build_output,
+                build_output: output[..marker_pos].trim_end().to_string(),
                 telemetry: Some(telemetry),
                 extraction_error: None,
             },
             Err(e) => PiggybackExtraction {
-                build_output,
+                build_output: output[..marker_pos].trim_end().to_string(),
                 telemetry: None,
                 extraction_error: Some(format!("Failed to parse telemetry: {}", e)),
             },
@@ -463,6 +499,33 @@ mod tests {
         assert!(extraction.telemetry.is_none());
         assert!(extraction.extraction_error.is_some());
         assert_eq!(extraction.build_output, "Build output");
+    }
+
+    #[test]
+    fn test_extract_piggybacked_marker_mid_line_is_not_stripped() {
+        // A build line that happens to contain the marker literal mid-line
+        // must NOT cause truncation — the marker isn't at line start and
+        // what follows isn't JSON.
+        let output = "error: unexpected token ---RCH-TELEMETRY--- in file.rs";
+        let extraction = extract_piggybacked_telemetry(output);
+        assert_eq!(extraction.build_output, output);
+        assert!(extraction.telemetry.is_none());
+        assert!(extraction.extraction_error.is_none());
+    }
+
+    #[test]
+    fn test_extract_piggybacked_marker_on_own_line_but_nojson_is_not_stripped() {
+        // Marker sits on its own line but the bytes after are prose, not
+        // JSON. That's still a build-output collision — preserve the
+        // entire output.
+        let output = format!(
+            "Line before\n{}\nmore build output after the marker",
+            PIGGYBACK_MARKER
+        );
+        let extraction = extract_piggybacked_telemetry(&output);
+        assert_eq!(extraction.build_output, output);
+        assert!(extraction.telemetry.is_none());
+        assert!(extraction.extraction_error.is_none());
     }
 
     #[test]
