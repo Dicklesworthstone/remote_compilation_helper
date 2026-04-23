@@ -672,6 +672,7 @@ mod tests {
                 status: "ok".to_string(),
                 latency_ms: Some(25),
                 error: None,
+                error_code: None,
             },
             ssh_ok: true,
             rsync_available: None,
@@ -851,6 +852,7 @@ mod tests {
             status: "ok".to_string(),
             latency_ms: Some(50),
             error: None,
+            error_code: None,
         };
         let detailed = DetailedProbeResult::from_basic(basic, true);
         assert!(detailed.ssh_ok);

@@ -414,6 +414,69 @@ mod tests {
         assert!(matches!(err, SshError::ConnectionFailed { .. }));
     }
 
+    #[test]
+    fn test_ssh_error_code_mapping() {
+        use rch_common::ErrorCode;
+        let host = "h".to_string();
+        let user = "u".to_string();
+        let key = PathBuf::from("/k");
+
+        assert_eq!(
+            ssh_error_code(&SshError::PermissionDenied {
+                host: host.clone(),
+                user: user.clone(),
+                key_path: key.clone(),
+            }),
+            ErrorCode::SshAuthFailed
+        );
+        assert_eq!(
+            ssh_error_code(&SshError::ConnectionRefused {
+                host: host.clone(),
+                user: user.clone(),
+                key_path: key.clone(),
+            }),
+            ErrorCode::NetworkConnectionRefused
+        );
+        assert_eq!(
+            ssh_error_code(&SshError::ConnectionTimeout {
+                host: host.clone(),
+                user: user.clone(),
+                key_path: key.clone(),
+                timeout_secs: 30,
+            }),
+            ErrorCode::NetworkTimeout
+        );
+        assert_eq!(
+            ssh_error_code(&SshError::HostKeyVerificationFailed {
+                host: host.clone(),
+                user: user.clone(),
+                key_path: key.clone(),
+            }),
+            ErrorCode::SshHostKeyError
+        );
+        assert_eq!(
+            ssh_error_code(&SshError::KeyNotFound {
+                key_path: key.clone(),
+            }),
+            ErrorCode::SshKeyError
+        );
+        assert_eq!(
+            ssh_error_code(&SshError::KeyInsecurePermissions {
+                key_path: key.clone(),
+            }),
+            ErrorCode::SshKeyError
+        );
+        assert_eq!(
+            ssh_error_code(&SshError::ConnectionFailed {
+                host,
+                user,
+                key_path: key,
+                message: "generic".into(),
+            }),
+            ErrorCode::SshConnectionFailed
+        );
+    }
+
     // ========================================================================
     // Text formatting tests
     // ========================================================================

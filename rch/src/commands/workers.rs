@@ -29,8 +29,8 @@ use super::helpers::{
 };
 use super::helpers::{config_dir, load_workers_from_config};
 use super::types::{
-    WorkerActionResponse, WorkerBenchmarkResult, WorkerInfo, WorkerProbeResult,
-    WorkerProbeSummary, WorkersCapabilitiesReport, WorkersListResponse, WorkersProbeResponse,
+    WorkerActionResponse, WorkerBenchmarkResult, WorkerInfo, WorkerProbeResult, WorkerProbeSummary,
+    WorkersCapabilitiesReport, WorkersListResponse, WorkersProbeResponse,
 };
 
 use crate::hook::required_runtime_for_kind;
@@ -899,15 +899,16 @@ pub(crate) fn summarize_probe_results(results: &[WorkerProbeResult]) -> WorkerPr
 
 /// Render a one-line human summary such as
 /// `"9 worker(s) probed: 0 healthy, 6 RCH-E100, 3 RCH-E108."`
+///
+/// Unhealthy workers are reported via their `RCH-E202` bucket in
+/// `by_error_code` rather than as a separate "unhealthy" entry to avoid
+/// double-counting the same worker.
 fn format_probe_summary_line(
     summary: &WorkerProbeSummary,
-    style: &rch_common::ui::RchTheme,
+    style: &crate::ui::theme::Theme,
 ) -> String {
     let mut parts: Vec<String> = Vec::new();
     parts.push(format!("{} healthy", summary.healthy));
-    if summary.unhealthy > 0 {
-        parts.push(format!("{} unhealthy", summary.unhealthy));
-    }
     // BTreeMap iteration is sorted by key, so output order is deterministic.
     for (code, count) in &summary.by_error_code {
         parts.push(format!("{} {}", count, code));
@@ -1424,4 +1425,55 @@ pub async fn workers_disable(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod probe_summary_tests {
+    use super::*;
+
+    fn mk(status: &str, error_code: Option<&str>, error: Option<&str>) -> WorkerProbeResult {
+        WorkerProbeResult {
+            id: "w".to_string(),
+            host: "h".to_string(),
+            status: status.to_string(),
+            latency_ms: None,
+            error: error.map(String::from),
+            error_code: error_code.map(String::from),
+        }
+    }
+
+    #[test]
+    fn summarize_counts_healthy_and_error_codes() {
+        let results = vec![
+            mk("ok", None, None),
+            mk("ok", None, None),
+            mk("connection_failed", Some("RCH-E100"), Some("...")),
+            mk("connection_failed", Some("RCH-E108"), Some("...")),
+            mk("connection_failed", Some("RCH-E108"), Some("...")),
+            mk("unhealthy", Some("RCH-E202"), Some("Health check failed")),
+        ];
+        let s = summarize_probe_results(&results);
+        assert_eq!(s.total, 6);
+        assert_eq!(s.healthy, 2);
+        assert_eq!(s.unhealthy, 1);
+        assert_eq!(s.failed, 3);
+        assert_eq!(s.by_error_code.get("RCH-E100"), Some(&1));
+        assert_eq!(s.by_error_code.get("RCH-E108"), Some(&2));
+        assert_eq!(s.by_error_code.get("RCH-E202"), Some(&1));
+    }
+
+    #[test]
+    fn summarize_buckets_uncategorized_errors_as_other() {
+        let results = vec![mk("error", None, Some("something weird"))];
+        let s = summarize_probe_results(&results);
+        assert_eq!(s.by_error_code.get("other"), Some(&1));
+    }
+
+    #[test]
+    fn summarize_empty_input() {
+        let s = summarize_probe_results(&[]);
+        assert_eq!(s.total, 0);
+        assert_eq!(s.healthy, 0);
+        assert!(s.by_error_code.is_empty());
+    }
 }
