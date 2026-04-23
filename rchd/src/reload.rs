@@ -151,6 +151,25 @@ fn worker_config_changed(old: &WorkerConfig, new: &WorkerConfig) -> bool {
 pub fn validate_workers_config(config: &WorkersConfig) -> Result<Vec<String>> {
     let mut warnings = Vec::new();
 
+    // Reject IDs that would unsafely splice into shell commands, paths, or
+    // HTTP request lines. The daemon embeds worker IDs into remote shell
+    // invocations (telemetry collection, hook installation), into local
+    // filesystem paths (caches, control sockets), and into HTTP URLs
+    // (`POST /workers/{id}/drain`). A worker ID like `; rm -rf /` would
+    // turn an operator-supplied config into arbitrary code execution on
+    // the worker the next time the daemon polled telemetry. We require a
+    // conservative, predictable character set up-front so every downstream
+    // consumer can rely on it without re-validating.
+    for worker in &config.workers {
+        if !is_safe_worker_id(&worker.id) {
+            return Err(anyhow::anyhow!(
+                "Invalid worker ID '{}': must be 1-64 chars and contain only \
+                 letters, digits, '_', '-', or '.'",
+                worker.id
+            ));
+        }
+    }
+
     // Check for duplicate IDs
     let mut seen_ids = HashSet::new();
     for worker in &config.workers {
@@ -173,6 +192,24 @@ pub fn validate_workers_config(config: &WorkersConfig) -> Result<Vec<String>> {
     }
 
     Ok(warnings)
+}
+
+/// Worker IDs must be safe for shell, filesystem, and URL contexts.
+///
+/// Allowed: ASCII letters, digits, `_`, `-`, `.`. Empty, leading-dot
+/// (hidden-file confusion), and over-length IDs are rejected. We
+/// deliberately disallow `/` and `:` even though they would survive most
+/// shells, because they would silently re-interpret cache paths and HTTP
+/// route segments respectively.
+fn is_safe_worker_id(id: &str) -> bool {
+    if id.is_empty() || id.len() > 64 {
+        return false;
+    }
+    if id.starts_with('.') {
+        return false;
+    }
+    id.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
 }
 
 /// Apply a configuration diff to the worker pool.
@@ -202,6 +239,11 @@ pub async fn apply_worker_diff(pool: &WorkerPool, diff: &ConfigDiff) -> Result<R
     // Note: We don't remove workers immediately to avoid disrupting active jobs.
     // Instead, we mark them for draining. A separate process should handle removal
     // once jobs complete.
+    //
+    // `result.removed` counts workers that were *actually removed* from the pool.
+    // Drained workers stay in the pool until their jobs finish, so they belong in
+    // the warnings list, not the removed count — otherwise the reload summary
+    // claims workers were removed when they're still scheduling builds.
     for id in &diff.to_remove {
         if let Some(worker) = pool.get(id).await {
             let used_slots = worker.used_slots();
@@ -218,8 +260,8 @@ pub async fn apply_worker_diff(pool: &WorkerPool, diff: &ConfigDiff) -> Result<R
             } else {
                 info!("Worker {} removed (no active jobs)", id);
                 pool.remove_worker(id).await;
+                result.removed += 1;
             }
-            result.removed += 1;
         }
     }
 
@@ -892,6 +934,72 @@ enabled = true
         assert!(warnings.is_empty());
     }
 
+    #[test]
+    fn test_is_safe_worker_id_accepts_normal_names() {
+        assert!(is_safe_worker_id("worker1"));
+        assert!(is_safe_worker_id("css"));
+        assert!(is_safe_worker_id("worker-1"));
+        assert!(is_safe_worker_id("worker_1"));
+        assert!(is_safe_worker_id("rch.prod.01"));
+        assert!(is_safe_worker_id("a"));
+        assert!(is_safe_worker_id(&"a".repeat(64)));
+    }
+
+    #[test]
+    fn test_is_safe_worker_id_rejects_shell_metacharacters() {
+        // Defense-in-depth: even with telemetry.rs shell-escaping the ID, we
+        // refuse to load configs that would smuggle metacharacters into the
+        // many other places the ID is interpolated (cache paths, HTTP routes,
+        // remote shell commands).
+        for bad in [
+            "",                  // empty
+            ".hidden",           // leading dot
+            "worker;rm -rf /",   // command separator
+            "worker$(id)",       // command substitution
+            "worker`id`",        // backticks
+            "worker|cat",        // pipe
+            "worker&background", // background
+            "worker with space", // whitespace
+            "worker\nrm",        // newline
+            "worker/etc/passwd", // path separator
+            "worker:443",        // url separator
+            "worker'",           // single quote
+            "worker\"",          // double quote
+            "worker\\esc",       // backslash
+            &"a".repeat(65),     // too long
+        ] {
+            assert!(
+                !is_safe_worker_id(bad),
+                "expected {bad:?} to be rejected as unsafe worker ID"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_workers_config_rejects_unsafe_id() {
+        let _guard = test_guard!();
+        init_test_logging();
+
+        let config = WorkersConfig {
+            workers: vec![crate::config::WorkerEntry {
+                id: "worker;rm -rf /".to_string(),
+                enabled: true,
+                host: "1.2.3.4".to_string(),
+                user: "ubuntu".to_string(),
+                identity_file: "~/.ssh/id_rsa".to_string(),
+                total_slots: 4,
+                priority: 100,
+                tags: vec![],
+            }],
+        };
+
+        let err = validate_workers_config(&config).unwrap_err();
+        assert!(
+            err.to_string().contains("Invalid worker ID"),
+            "expected validation error, got: {err}"
+        );
+    }
+
     #[tokio::test]
     async fn test_compute_worker_diff_host_change() {
         init_test_logging();
@@ -1128,6 +1236,49 @@ enabled = true
         assert_eq!(result.removed, 1);
         assert!(result.warnings.is_empty()); // No active jobs, so no warning
         assert_eq!(pool.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_apply_worker_diff_drained_worker_not_counted_as_removed() {
+        // Regression: previously `result.removed` incremented for every
+        // `to_remove` entry, including workers that had active builds and
+        // were only drained. The reload summary then claimed workers were
+        // removed while they were still in the pool draining — confusing
+        // both operators and any automation reading the count.
+        init_test_logging();
+
+        let pool = WorkerPool::new();
+        let config = WorkerConfig {
+            id: WorkerId::new("busy-worker"),
+            host: "192.168.1.100".to_string(),
+            user: "ubuntu".to_string(),
+            identity_file: "~/.ssh/id_rsa".to_string(),
+            total_slots: 8,
+            priority: 100,
+            ..WorkerConfig::default()
+        };
+        pool.add_worker(config).await;
+        // Reserve a slot so used_slots > 0 — this forces the drain path.
+        let worker = pool.get(&WorkerId::new("busy-worker")).await.unwrap();
+        assert!(worker.reserve_slots(1).await);
+
+        let diff = ConfigDiff {
+            to_add: vec![],
+            to_update: vec![],
+            to_remove: vec![WorkerId::new("busy-worker")],
+        };
+
+        let result = apply_worker_diff(&pool, &diff).await.unwrap();
+        assert_eq!(
+            result.removed, 0,
+            "drained (not removed) workers must not count as removed"
+        );
+        assert_eq!(result.warnings.len(), 1, "drain path must emit a warning");
+        assert_eq!(
+            pool.len(),
+            1,
+            "worker must still be in the pool after drain"
+        );
     }
 
     #[tokio::test]

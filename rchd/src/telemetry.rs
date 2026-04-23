@@ -335,11 +335,17 @@ pub async fn collect_telemetry_from_worker(
 ) -> anyhow::Result<WorkerTelemetry> {
     let config = worker.config.read().await;
     let worker_id = config.id.as_str();
+    // Worker IDs come from operator-supplied config (workers.toml), not from
+    // a trusted source — a stray quote, semicolon, or `$()` would otherwise
+    // be evaluated by the remote shell. Always shell-escape before splicing
+    // into the remote command. The companion path in rch/src/hook.rs already
+    // uses `shell_escape::escape` for exactly this reason.
+    let escaped_worker = shell_escape::escape(worker_id.into());
     // Use rch-wkr from PATH if available, otherwise fallback to ~/.local/bin/rch-wkr
     // This handles non-interactive SSH sessions where ~/.local/bin might not be in PATH
     let command = format!(
-        "if command -v rch-wkr >/dev/null 2>&1; then rch-wkr telemetry --format json --worker-id {}; else ~/.local/bin/rch-wkr telemetry --format json --worker-id {}; fi",
-        worker_id, worker_id
+        "if command -v rch-wkr >/dev/null 2>&1; then rch-wkr telemetry --format json --worker-id {worker}; else ~/.local/bin/rch-wkr telemetry --format json --worker-id {worker}; fi",
+        worker = escaped_worker,
     );
 
     let options = SshOptions {
