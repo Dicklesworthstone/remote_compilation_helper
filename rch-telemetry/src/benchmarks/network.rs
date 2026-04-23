@@ -596,14 +596,27 @@ pub fn calculate_latency_stats(samples: &[f64]) -> (f64, f64) {
         return (0.0, 0.0);
     }
 
-    // Sort for median
+    // Sort for median. `partial_cmp` fallback keeps NaN samples from
+    // panicking on comparison; they sort to an indeterminate position
+    // but don't corrupt the other ordering.
     let mut sorted = samples.to_vec();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let median = sorted[sorted.len() / 2];
 
-    // Calculate jitter (standard deviation)
-    let mean = samples.iter().sum::<f64>() / samples.len() as f64;
-    let variance = samples.iter().map(|l| (l - mean).powi(2)).sum::<f64>() / samples.len() as f64;
+    // True median: average the two middle elements when `sorted.len()`
+    // is even. The previous implementation always returned
+    // `sorted[len / 2]` — the *upper* middle — which biased the median
+    // of every even-length sample set.
+    let n = sorted.len();
+    let median = if n % 2 == 0 {
+        (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
+    } else {
+        sorted[n / 2]
+    };
+
+    // Calculate jitter (standard deviation, biased estimator — the
+    // conventional network-engineering definition).
+    let mean = samples.iter().sum::<f64>() / n as f64;
+    let variance = samples.iter().map(|l| (l - mean).powi(2)).sum::<f64>() / n as f64;
     let jitter = variance.sqrt();
 
     (median, jitter)
@@ -795,6 +808,33 @@ mod tests {
         info!("RESULT: Single sample returns (42, 0)");
 
         info!("TEST PASS: test_latency_statistics_single");
+    }
+
+    #[test]
+    fn test_latency_statistics_even_length_median() {
+        // Regression: the previous implementation returned `sorted[n/2]`,
+        // the UPPER middle, for every even-length input. True median of
+        // [1, 2, 3, 4] is 2.5, not 3.
+        let (median, _jitter) = calculate_latency_stats(&[4.0, 1.0, 2.0, 3.0]);
+        assert!(
+            (median - 2.5).abs() < 1e-9,
+            "median of [1,2,3,4] must be 2.5, got {median}"
+        );
+
+        // Another case where middles straddle an integer:
+        let (median, _jitter) = calculate_latency_stats(&[10.0, 20.0, 30.0, 40.0, 50.0, 60.0]);
+        assert!(
+            (median - 35.0).abs() < 1e-9,
+            "median of [10..=60] must be 35.0, got {median}"
+        );
+    }
+
+    #[test]
+    fn test_latency_statistics_odd_length_median_unchanged() {
+        // Odd-length median was already correct; this test locks it in
+        // so a future refactor can't regress it.
+        let (median, _jitter) = calculate_latency_stats(&[1.0, 2.0, 3.0, 4.0, 5.0]);
+        assert!((median - 3.0).abs() < 1e-9, "odd median off: {median}");
     }
 
     #[test]
