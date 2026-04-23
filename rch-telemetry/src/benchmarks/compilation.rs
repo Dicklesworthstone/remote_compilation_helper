@@ -488,9 +488,14 @@ fn calculate_compilation_score(debug_ms: u64, release_ms: u64, incremental_ms: u
         weight_sum += 0.15;
     }
 
-    // Normalize by actual weight used
+    // Normalize by the sum of weights for components that actually ran.
+    // The previous `score / weight_sum * weight_sum` cancelled to just
+    // `score`, so partial runs (e.g. release only, weight_sum = 0.60)
+    // silently returned a score scaled *down* by the component weight
+    // — a reference-hardware release build alone would register ~600
+    // instead of the intended ~1000.
     if weight_sum > 0.0 {
-        score / weight_sum * weight_sum
+        score / weight_sum
     } else {
         0.0
     }
@@ -1556,12 +1561,19 @@ mod tests {
         init_test_logging();
         info!("TEST START: test_score_calculation_debug_only");
 
+        // Debug-only at reference time (5s) should normalize to ~1000.
+        // The previous expected range (200–300) encoded a bug where
+        // `score / weight_sum * weight_sum` collapsed to no-op, leaving
+        // the score scaled *down* by the component weight.
         let score = calculate_compilation_score(5000, 0, 0);
         info!("INPUT: debug=5000ms only");
         info!("RESULT: score = {}", score);
 
-        assert!(score > 200.0 && score < 300.0);
-        info!("VERIFY: Debug-only score is in expected range");
+        assert!(
+            (900.0..=1100.0).contains(&score),
+            "debug-only score should normalize to ~1000 at reference hardware, got {score}"
+        );
+        info!("VERIFY: Debug-only score is at reference level");
 
         info!("TEST PASS: test_score_calculation_debug_only");
     }
@@ -1575,8 +1587,13 @@ mod tests {
         info!("INPUT: incremental=1000ms only");
         info!("RESULT: score = {}", score);
 
-        assert!(score > 120.0 && score < 180.0);
-        info!("VERIFY: Incremental-only score is in expected range");
+        // Incremental-only at reference time (1s) → ~1000 after proper
+        // weight normalization.
+        assert!(
+            (900.0..=1100.0).contains(&score),
+            "incremental-only score should normalize to ~1000 at reference hardware, got {score}"
+        );
+        info!("VERIFY: Incremental-only score is at reference level");
 
         info!("TEST PASS: test_score_calculation_incremental_only");
     }
@@ -1586,14 +1603,17 @@ mod tests {
         init_test_logging();
         info!("TEST START: test_score_calculation_partial");
 
-        // Only release build enabled (others = 0)
+        // Only release build enabled (others = 0). At reference time
+        // (10s), the normalized score should be ~1000, not 600.
         let score = calculate_compilation_score(0, 10000, 0);
         info!("INPUT: release only = 10000ms");
         info!("RESULT: score = {}", score);
 
-        // Should still produce a valid score
-        assert!(score > 0.0);
-        info!("VERIFY: Partial benchmark produces valid score");
+        assert!(
+            (900.0..=1100.0).contains(&score),
+            "release-only score should normalize to ~1000 at reference hardware, got {score}"
+        );
+        info!("VERIFY: Partial benchmark produces correctly-normalized score");
 
         info!("TEST PASS: test_score_calculation_partial");
     }
