@@ -273,11 +273,24 @@ pub fn create_backup(path: &Path) -> Result<std::path::PathBuf> {
 }
 
 /// Remove old backups, keeping only the N most recent.
+///
+/// Matches entries of the form `{prefix}_{timestamp}.bak` — the separator
+/// is enforced so that, e.g., retention for `settings.json` doesn't
+/// accidentally sweep up backups of a sibling `settings.jsona` or
+/// `settings.json.old` because naive `starts_with(prefix)` would match
+/// both.
 fn cleanup_old_backups(backup_dir: &Path, prefix: &str, keep: usize) -> Result<()> {
+    // Anchor the separator produced by `create_backup` so unrelated files
+    // that merely share a prefix don't get mixed into the retention set.
+    let anchor = format!("{}_", prefix);
     let mut backups: Vec<_> = fs::read_dir(backup_dir)
         .with_context(|| format!("Failed to read backup directory: {:?}", backup_dir))?
         .filter_map(|e| e.ok())
-        .filter(|e| e.file_name().to_string_lossy().starts_with(prefix))
+        .filter(|e| {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with(&anchor) && name.ends_with(".bak")
+        })
         .collect();
 
     // Sort by modification time (newest first)
