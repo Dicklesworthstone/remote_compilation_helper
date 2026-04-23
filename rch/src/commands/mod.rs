@@ -498,12 +498,14 @@ mod tests {
             status: "healthy".to_string(),
             latency_ms: Some(42),
             error: None,
+            error_code: None,
         };
         let json = serde_json::to_value(&result).unwrap();
         assert_eq!(json["id"], "worker1");
         assert_eq!(json["status"], "healthy");
         assert_eq!(json["latency_ms"], 42);
         assert!(json.get("error").is_none()); // skipped when None
+        assert!(json.get("error_code").is_none()); // skipped when None
     }
 
     #[test]
@@ -515,11 +517,13 @@ mod tests {
             status: "unreachable".to_string(),
             latency_ms: None,
             error: Some("Connection refused".to_string()),
+            error_code: Some("RCH-E108".to_string()),
         };
         let json = serde_json::to_value(&result).unwrap();
         assert_eq!(json["status"], "unreachable");
         assert!(json.get("latency_ms").is_none()); // skipped when None
         assert_eq!(json["error"], "Connection refused");
+        assert_eq!(json["error_code"], "RCH-E108");
     }
 
     #[test]
