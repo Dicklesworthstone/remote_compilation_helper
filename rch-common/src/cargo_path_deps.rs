@@ -285,6 +285,8 @@ fn resolve_entry_manifest(
 const CARGO_METADATA_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 fn invoke_cargo_metadata(manifest_path: &Path) -> Result<String, CargoPathDependencyError> {
+    use std::io::Read;
+
     let mut child = Command::new("cargo")
         .arg("metadata")
         .arg("--format-version")
@@ -302,24 +304,45 @@ fn invoke_cargo_metadata(manifest_path: &Path) -> Result<String, CargoPathDepend
             .with_manifest_path(manifest_path)
         })?;
 
+    // Drain stdout and stderr concurrently in background threads.
+    //
+    // The previous implementation polled `try_wait` without ever reading from
+    // the pipes, which deadlocked for any project whose `cargo metadata` JSON
+    // exceeded the OS pipe capacity (~64KB on Linux). The child blocked on
+    // `write()` to a full pipe, never exited, and we always hit the 30s
+    // timeout. The RCH workspace itself emits ~2.5MB of metadata, so this
+    // function timed out for *its own callers*. Concurrent draining keeps
+    // the pipe flowing so the child can complete normally; on timeout we
+    // still kill+reap below, after which the drain threads see EOF and exit.
+    let mut stdout_pipe = child
+        .stdout
+        .take()
+        .expect("child spawned with piped stdout");
+    let mut stderr_pipe = child
+        .stderr
+        .take()
+        .expect("child spawned with piped stderr");
+
+    let stdout_thread = std::thread::spawn(move || -> std::io::Result<Vec<u8>> {
+        let mut buf = Vec::new();
+        stdout_pipe.read_to_end(&mut buf)?;
+        Ok(buf)
+    });
+    let stderr_thread = std::thread::spawn(move || -> std::io::Result<Vec<u8>> {
+        let mut buf = Vec::new();
+        stderr_pipe.read_to_end(&mut buf)?;
+        Ok(buf)
+    });
+
     // Poll `try_wait` with a small sleep. On timeout we kill the child and
-    // reap it so the process + OS resources don't leak. A previous
-    // implementation spawned a waiter thread with no way to kill the child,
-    // which would leave `cargo metadata` running past the timeout (and leak
-    // the thread reading the stdout pipe).
+    // reap it so the process + OS resources don't leak.
     let deadline = std::time::Instant::now() + CARGO_METADATA_TIMEOUT;
     loop {
         match child.try_wait() {
             Ok(Some(_)) => break,
             Ok(None) => {
                 if std::time::Instant::now() >= deadline {
-                    // Best-effort: kill + reap. Failures are logged via
-                    // diagnostics but not propagated — the caller already
-                    // has a timeout error to report.
                     let kill_err = child.kill().err();
-                    // Wait briefly for the kill to take effect so the
-                    // process isn't left as a zombie. Bound this so a
-                    // process ignoring SIGKILL can't hang us indefinitely.
                     let reap_deadline =
                         std::time::Instant::now() + std::time::Duration::from_secs(2);
                     let reaped = loop {
@@ -334,6 +357,12 @@ fn invoke_cargo_metadata(manifest_path: &Path) -> Result<String, CargoPathDepend
                             Err(_) => break false,
                         }
                     };
+                    // Reap the drain threads now that the pipes are closed
+                    // (kill closed them, or EOF arrived). Discard their output
+                    // — we have a timeout error to return either way.
+                    let _ = stdout_thread.join();
+                    let _ = stderr_thread.join();
+
                     let mut err = CargoPathDependencyError::new(
                         CargoPathDependencyErrorKind::MetadataInvocationFailure,
                         format!(
@@ -355,10 +384,10 @@ fn invoke_cargo_metadata(manifest_path: &Path) -> Result<String, CargoPathDepend
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
             Err(error) => {
-                // try_wait() errored (rare: EINTR, EINVAL, etc.). Best-effort
-                // kill so the child doesn't outlive us, then propagate.
                 let _ = child.kill();
                 let _ = child.wait();
+                let _ = stdout_thread.join();
+                let _ = stderr_thread.join();
                 return Err(CargoPathDependencyError::new(
                     CargoPathDependencyErrorKind::MetadataInvocationFailure,
                     format!("failed to poll cargo metadata: {error}"),
@@ -368,18 +397,51 @@ fn invoke_cargo_metadata(manifest_path: &Path) -> Result<String, CargoPathDepend
         }
     }
 
-    let output = child.wait_with_output().map_err(|error| {
+    let status = child.wait().map_err(|error| {
         CargoPathDependencyError::new(
             CargoPathDependencyErrorKind::MetadataInvocationFailure,
-            format!("failed to collect cargo metadata output: {error}"),
+            format!("failed to wait on cargo metadata: {error}"),
         )
         .with_manifest_path(manifest_path)
     })?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let stdout_bytes = stdout_thread
+        .join()
+        .map_err(|_| {
+            CargoPathDependencyError::new(
+                CargoPathDependencyErrorKind::MetadataInvocationFailure,
+                "stdout drain thread panicked".to_string(),
+            )
+            .with_manifest_path(manifest_path)
+        })?
+        .map_err(|error| {
+            CargoPathDependencyError::new(
+                CargoPathDependencyErrorKind::MetadataInvocationFailure,
+                format!("failed to read cargo metadata stdout: {error}"),
+            )
+            .with_manifest_path(manifest_path)
+        })?;
+    let stderr_bytes = stderr_thread
+        .join()
+        .map_err(|_| {
+            CargoPathDependencyError::new(
+                CargoPathDependencyErrorKind::MetadataInvocationFailure,
+                "stderr drain thread panicked".to_string(),
+            )
+            .with_manifest_path(manifest_path)
+        })?
+        .map_err(|error| {
+            CargoPathDependencyError::new(
+                CargoPathDependencyErrorKind::MetadataInvocationFailure,
+                format!("failed to read cargo metadata stderr: {error}"),
+            )
+            .with_manifest_path(manifest_path)
+        })?;
+
+    if !status.success() {
+        let stderr = String::from_utf8_lossy(&stderr_bytes).to_string();
         let detail = if stderr.trim().is_empty() {
-            format!("cargo metadata exited with status {}", output.status)
+            format!("cargo metadata exited with status {status}")
         } else {
             stderr.trim().to_string()
         };
@@ -390,7 +452,7 @@ fn invoke_cargo_metadata(manifest_path: &Path) -> Result<String, CargoPathDepend
         .with_manifest_path(manifest_path));
     }
 
-    String::from_utf8(output.stdout).map_err(|error| {
+    String::from_utf8(stdout_bytes).map_err(|error| {
         CargoPathDependencyError::new(
             CargoPathDependencyErrorKind::MetadataParseFailure,
             format!("metadata stdout is not valid UTF-8: {error}"),
@@ -3057,5 +3119,132 @@ patched_dep = { path = "../patched/patched_dep" }
             true,
         );
         assert!(partial.packages.get(&root).unwrap().workspace_member);
+    }
+
+    /// Regression: `invoke_cargo_metadata` previously deadlocked when the JSON
+    /// output exceeded the OS pipe capacity (~64 KB on Linux). The poll loop
+    /// never read stdout, so the child blocked on `write()` and we always hit
+    /// the 30s timeout. We now drain stdout/stderr concurrently in background
+    /// threads. This test forces a large output by pulling in dozens of
+    /// crates.io dependencies and asserting the call returns successfully
+    /// well under the timeout.
+    #[cfg(unix)]
+    #[test]
+    fn invoke_cargo_metadata_handles_output_larger_than_pipe_buffer() {
+        let fixture = TopologyFixture::new("metadata-large");
+        let project_root = fixture.canonical_root.join("metadata_pipe");
+        fs::create_dir_all(project_root.join("src")).expect("create src");
+
+        // 60+ small dependencies inflate the cargo metadata JSON well past
+        // the 64KB pipe buffer once each is resolved with version, source,
+        // checksum, and feature lists.
+        let mut deps = String::new();
+        for name in [
+            "serde",
+            "serde_json",
+            "anyhow",
+            "thiserror",
+            "tokio",
+            "futures",
+            "log",
+            "tracing",
+            "regex",
+            "chrono",
+            "uuid",
+            "rand",
+            "base64",
+            "hex",
+            "url",
+            "bytes",
+            "clap",
+            "rusqlite",
+            "blake3",
+            "sha2",
+            "reqwest",
+            "tempfile",
+            "directories",
+            "dirs",
+            "shellexpand",
+            "shell-escape",
+            "which",
+            "openssh",
+            "schemars",
+            "indexmap",
+            "lazy_static",
+            "once_cell",
+            "parking_lot",
+            "toml",
+            "shell-words",
+            "globset",
+            "walkdir",
+            "ignore",
+            "crossbeam-channel",
+            "rayon",
+            "memchr",
+            "smallvec",
+            "ahash",
+            "fnv",
+            "itertools",
+            "num_cpus",
+            "humantime",
+            "humansize",
+            "ratatui",
+            "crossterm",
+        ] {
+            deps.push_str(&format!("{name} = \"*\"\n"));
+        }
+
+        fs::write(
+            project_root.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"metadata_pipe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n{deps}",
+            ),
+        )
+        .expect("write manifest");
+        fs::write(project_root.join("src/lib.rs"), "").expect("write lib.rs");
+
+        let manifest_path = project_root.join("Cargo.toml");
+        let start = std::time::Instant::now();
+        match invoke_cargo_metadata(&manifest_path) {
+            Ok(json) => {
+                let elapsed = start.elapsed();
+                // Without the fix the function would either time out at 30s
+                // or (depending on dependency cache) produce a truncated
+                // result; both paths fail this assertion.
+                assert!(
+                    elapsed < CARGO_METADATA_TIMEOUT,
+                    "metadata took {elapsed:?}, near the {CARGO_METADATA_TIMEOUT:?} timeout"
+                );
+                assert!(
+                    json.len() > 64 * 1024,
+                    "test fixture too small to exercise the pipe-buffer path: {} bytes",
+                    json.len()
+                );
+                assert!(
+                    json.starts_with('{'),
+                    "metadata stdout should be JSON; got: {:.120}",
+                    json
+                );
+            }
+            Err(e) => {
+                // Skip on machines without network access to crates.io or
+                // without registry caches — we only care about the
+                // *deadlock* regression, not about resolver outcomes.
+                let detail = e.detail().to_lowercase();
+                let offline = detail.contains("network")
+                    || detail.contains("dns")
+                    || detail.contains("registry")
+                    || detail.contains("connection")
+                    || detail.contains("not found")
+                    || detail.contains("offline")
+                    || detail.contains("could not")
+                    || detail.contains("failed to fetch")
+                    || detail.contains("no such file");
+                assert!(
+                    offline,
+                    "invoke_cargo_metadata failed for non-network reason: {e}"
+                );
+            }
+        }
     }
 }
