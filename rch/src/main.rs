@@ -1431,6 +1431,27 @@ async fn main() -> Result<()> {
     // If no subcommand, we're being invoked as a hook
     match cli.command {
         None => {
+            // If stdin is a TTY and hook mode is not forced, the user likely typed `rch`
+            // interactively. Print a short hint instead of silently blocking on stdin.
+            // RCH_HOOK_MODE=1 or RCH_JSON=1 force hook behavior (used by test harnesses).
+            use std::io::IsTerminal;
+            let forced_hook = env::var_os("RCH_HOOK_MODE").is_some_and(|v| v != "0")
+                || env::var_os("RCH_JSON").is_some_and(|v| v != "0");
+            if !forced_hook && std::io::stdin().is_terminal() {
+                eprintln!(
+                    "rch runs in PreToolUse hook mode when invoked without a subcommand."
+                );
+                eprintln!("It is now waiting for a JSON hook request on stdin.");
+                eprintln!();
+                eprintln!("If you are a human at a terminal, try one of:");
+                eprintln!("    rch --help          Full CLI help");
+                eprintln!("    rch status          Show daemon and worker status");
+                eprintln!("    rch hook test       Exercise the hook with a sample payload");
+                eprintln!("    rch dashboard       Launch the TUI");
+                eprintln!();
+                eprintln!("To force hook mode anyway, set RCH_HOOK_MODE=1 or pipe JSON in.");
+                eprintln!("Press Ctrl-D to send EOF (allows unchanged) or Ctrl-C to exit.");
+            }
             // Running as PreToolUse hook - read from stdin, process, write to stdout
             hook::run_hook().await
         }

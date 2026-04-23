@@ -61,6 +61,35 @@ pub struct WorkerProbeResult {
     pub latency_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Structured error code (e.g. `"RCH-E100"`). Present when `error` is set
+    /// and the underlying failure maps to a catalog entry. Lets auto-recovery
+    /// agents branch on a stable identifier instead of substring-matching the
+    /// human-readable `error` field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+}
+
+/// Per-error-code tally for a batch probe.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct WorkerProbeSummary {
+    /// Total workers probed.
+    pub total: usize,
+    /// Workers that answered the health check successfully.
+    pub healthy: usize,
+    /// Workers that reachable but failed the health check.
+    pub unhealthy: usize,
+    /// Workers that failed to connect / errored.
+    pub failed: usize,
+    /// Error-code tally, keyed by `"RCH-Exxx"`. Errors without a mapped code
+    /// are counted under `"other"`.
+    pub by_error_code: std::collections::BTreeMap<String, usize>,
+}
+
+/// Workers probe response envelope.
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkersProbeResponse {
+    pub results: Vec<WorkerProbeResult>,
+    pub summary: WorkerProbeSummary,
 }
 
 /// Worker capabilities report for JSON output.
