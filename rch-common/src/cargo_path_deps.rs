@@ -343,10 +343,7 @@ fn invoke_cargo_metadata(manifest_path: &Path) -> Result<String, CargoPathDepend
                         ),
                     )
                     .with_manifest_path(manifest_path)
-                    .with_diagnostic(format!(
-                        "timeout_secs={}",
-                        CARGO_METADATA_TIMEOUT.as_secs()
-                    ));
+                    .with_diagnostic(format!("timeout_secs={}", CARGO_METADATA_TIMEOUT.as_secs()));
                     if let Some(ke) = kill_err {
                         err = err.with_diagnostic(format!("kill_failed={ke}"));
                     }
@@ -358,6 +355,10 @@ fn invoke_cargo_metadata(manifest_path: &Path) -> Result<String, CargoPathDepend
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
             Err(error) => {
+                // try_wait() errored (rare: EINTR, EINVAL, etc.). Best-effort
+                // kill so the child doesn't outlive us, then propagate.
+                let _ = child.kill();
+                let _ = child.wait();
                 return Err(CargoPathDependencyError::new(
                     CargoPathDependencyErrorKind::MetadataInvocationFailure,
                     format!("failed to poll cargo metadata: {error}"),

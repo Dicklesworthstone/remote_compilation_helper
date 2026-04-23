@@ -306,7 +306,12 @@ fn parse_reclaim_metrics(stdout: &str) -> Option<ReclaimMetrics> {
     let mut protected = None;
 
     for token in line.split_whitespace().skip(1) {
-        let (key, value) = token.split_once('=')?;
+        // Skip malformed tokens rather than aborting the whole line.
+        // A single stray token (e.g. a trailing suffix from a shell
+        // variation) shouldn't cause us to drop perfectly good metrics.
+        let Some((key, value)) = token.split_once('=') else {
+            continue;
+        };
         match key {
             "removed" => removed = value.parse::<u32>().ok(),
             "dry_removed" => dry_removed = value.parse::<u32>().ok(),

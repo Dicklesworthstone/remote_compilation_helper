@@ -598,9 +598,12 @@ impl BuildHistory {
 
     /// Get a specific queued build by ID.
     pub fn queued_build(&self, queue_id: u64) -> Option<QueuedBuildState> {
+        // Use the same poisoned-lock recovery pattern as the rest of this
+        // file: a prior panic under this lock shouldn't propagate a panic
+        // into a simple read-only query.
         self.queued
             .read()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
             .find(|b| b.id == queue_id)
             .cloned()
