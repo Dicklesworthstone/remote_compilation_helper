@@ -158,8 +158,23 @@ pub async fn run_hook() -> anyhow::Result<()> {
 /// rewrites the original compilation command. This separation allows the hook
 /// to return immediately (<50ms) while the actual compilation runs as a
 /// normal command invocation.
+/// Re-assemble an argv vector into a shell command string that preserves
+/// word boundaries under `sh -c` re-parsing.
+///
+/// Using a plain `parts.join(" ")` is wrong whenever an argv entry contains
+/// shell-meaningful characters (spaces, quotes, `$`, etc.): the outer shell
+/// that dispatched us already stripped the original quoting, leaving such
+/// bytes as literal content in a single argv entry. `sh -c` would then
+/// re-split on those literals and silently corrupt the command.
+///
+/// `shell_words::join` re-quotes each entry so round-tripping through
+/// `sh -c` is a no-op.
+fn join_exec_command(command_parts: &[String]) -> String {
+    shell_words::join(command_parts)
+}
+
 pub async fn run_exec(command_parts: Vec<String>) -> anyhow::Result<()> {
-    let command = command_parts.join(" ");
+    let command = join_exec_command(&command_parts);
     if command.is_empty() {
         anyhow::bail!("No command provided to exec");
     }
@@ -5463,6 +5478,68 @@ mod tests {
     use tokio::io::BufReader as TokioBufReader;
     use tokio::net::UnixListener;
     use tokio::sync::Mutex;
+
+    // ------------------------------------------------------------------
+    // join_exec_command tests — guard against the `.join(" ")` round-trip
+    // corruption that was present when `rch exec --` rebuilt a command
+    // string for `sh -c` (bug audit 2026-04-23).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn join_exec_command_plain_args_unchanged() {
+        let _guard = test_guard!();
+        let parts = vec![
+            "cargo".to_string(),
+            "build".to_string(),
+            "--release".to_string(),
+        ];
+        let joined = join_exec_command(&parts);
+        // shell_words::split of the result should reproduce the original argv.
+        let round_trip = shell_words::split(&joined).expect("valid shell words");
+        assert_eq!(round_trip, parts);
+    }
+
+    #[test]
+    fn join_exec_command_preserves_space_bearing_arg() {
+        let _guard = test_guard!();
+        // The outer shell merges `--features='foo bar'` into one argv
+        // entry with a literal space. We must re-quote so `sh -c` does
+        // not re-split it into two tokens.
+        let parts = vec![
+            "cargo".to_string(),
+            "build".to_string(),
+            "--features=foo bar".to_string(),
+        ];
+        let joined = join_exec_command(&parts);
+        let round_trip = shell_words::split(&joined).expect("valid shell words");
+        assert_eq!(
+            round_trip, parts,
+            "space must survive round-trip through sh"
+        );
+    }
+
+    #[test]
+    fn join_exec_command_preserves_quote_metachars() {
+        let _guard = test_guard!();
+        let parts = vec![
+            "cargo".to_string(),
+            "run".to_string(),
+            "--".to_string(),
+            "he said \"hi\"".to_string(),
+            "$PATH".to_string(),
+            "a;b".to_string(),
+        ];
+        let joined = join_exec_command(&parts);
+        let round_trip = shell_words::split(&joined).expect("valid shell words");
+        assert_eq!(round_trip, parts);
+    }
+
+    #[test]
+    fn join_exec_command_empty_input() {
+        let _guard = test_guard!();
+        let parts: Vec<String> = Vec::new();
+        assert_eq!(join_exec_command(&parts), "");
+    }
 
     fn test_lock() -> &'static Mutex<()> {
         static ENV_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
