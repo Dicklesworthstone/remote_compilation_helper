@@ -285,7 +285,7 @@ fn resolve_entry_manifest(
 const CARGO_METADATA_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 fn invoke_cargo_metadata(manifest_path: &Path) -> Result<String, CargoPathDependencyError> {
-    let child = Command::new("cargo")
+    let mut child = Command::new("cargo")
         .arg("metadata")
         .arg("--format-version")
         .arg("1")
@@ -302,50 +302,78 @@ fn invoke_cargo_metadata(manifest_path: &Path) -> Result<String, CargoPathDepend
             .with_manifest_path(manifest_path)
         })?;
 
-    // Wait with timeout: spawn a thread to wait on the child, then join with a deadline.
+    // Poll `try_wait` with a small sleep. On timeout we kill the child and
+    // reap it so the process + OS resources don't leak. A previous
+    // implementation spawned a waiter thread with no way to kill the child,
+    // which would leave `cargo metadata` running past the timeout (and leak
+    // the thread reading the stdout pipe).
     let deadline = std::time::Instant::now() + CARGO_METADATA_TIMEOUT;
-    let handle = std::thread::spawn(move || child.wait_with_output());
     loop {
-        if handle.is_finished() {
-            break;
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    // Best-effort: kill + reap. Failures are logged via
+                    // diagnostics but not propagated — the caller already
+                    // has a timeout error to report.
+                    let kill_err = child.kill().err();
+                    // Wait briefly for the kill to take effect so the
+                    // process isn't left as a zombie. Bound this so a
+                    // process ignoring SIGKILL can't hang us indefinitely.
+                    let reap_deadline =
+                        std::time::Instant::now() + std::time::Duration::from_secs(2);
+                    let reaped = loop {
+                        match child.try_wait() {
+                            Ok(Some(_)) => break true,
+                            Ok(None) => {
+                                if std::time::Instant::now() >= reap_deadline {
+                                    break false;
+                                }
+                                std::thread::sleep(std::time::Duration::from_millis(20));
+                            }
+                            Err(_) => break false,
+                        }
+                    };
+                    let mut err = CargoPathDependencyError::new(
+                        CargoPathDependencyErrorKind::MetadataInvocationFailure,
+                        format!(
+                            "cargo metadata timed out after {}s for {}",
+                            CARGO_METADATA_TIMEOUT.as_secs(),
+                            manifest_path.display()
+                        ),
+                    )
+                    .with_manifest_path(manifest_path)
+                    .with_diagnostic(format!(
+                        "timeout_secs={}",
+                        CARGO_METADATA_TIMEOUT.as_secs()
+                    ));
+                    if let Some(ke) = kill_err {
+                        err = err.with_diagnostic(format!("kill_failed={ke}"));
+                    }
+                    if !reaped {
+                        err = err.with_diagnostic("reap_failed=true".to_string());
+                    }
+                    return Err(err);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(error) => {
+                return Err(CargoPathDependencyError::new(
+                    CargoPathDependencyErrorKind::MetadataInvocationFailure,
+                    format!("failed to poll cargo metadata: {error}"),
+                )
+                .with_manifest_path(manifest_path));
+            }
         }
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        if remaining.is_zero() {
-            // Timeout: try to retrieve the child from the thread to kill it.
-            // The thread owns the child; we cannot kill it directly, but the
-            // Drop impl on the thread handle will not block. The OS will
-            // eventually reclaim the process. Return a timeout error so the
-            // caller falls back to manifest parsing.
-            return Err(CargoPathDependencyError::new(
-                CargoPathDependencyErrorKind::MetadataInvocationFailure,
-                format!(
-                    "cargo metadata timed out after {}s for {}",
-                    CARGO_METADATA_TIMEOUT.as_secs(),
-                    manifest_path.display()
-                ),
-            )
-            .with_manifest_path(manifest_path)
-            .with_diagnostic(format!("timeout_secs={}", CARGO_METADATA_TIMEOUT.as_secs())));
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50).min(remaining));
     }
 
-    let output = handle
-        .join()
-        .map_err(|_| {
-            CargoPathDependencyError::new(
-                CargoPathDependencyErrorKind::MetadataInvocationFailure,
-                "cargo metadata wait thread panicked".to_string(),
-            )
-            .with_manifest_path(manifest_path)
-        })?
-        .map_err(|error| {
-            CargoPathDependencyError::new(
-                CargoPathDependencyErrorKind::MetadataInvocationFailure,
-                format!("failed to wait for cargo metadata: {error}"),
-            )
-            .with_manifest_path(manifest_path)
-        })?;
+    let output = child.wait_with_output().map_err(|error| {
+        CargoPathDependencyError::new(
+            CargoPathDependencyErrorKind::MetadataInvocationFailure,
+            format!("failed to collect cargo metadata output: {error}"),
+        )
+        .with_manifest_path(manifest_path)
+    })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
