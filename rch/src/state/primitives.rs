@@ -104,23 +104,40 @@ pub fn atomic_write(path: &Path, content: &[u8]) -> Result<()> {
     );
     let temp_path = parent.join(temp_name);
 
-    // Write to temp file
-    let mut file = File::create(&temp_path)
-        .with_context(|| format!("Failed to create temp file: {:?}", temp_path))?;
+    // RAII guard: if any `?` between here and the successful rename bails
+    // out, unlink the half-written temp file. The previous implementation
+    // only cleaned up on rename failure (via the `.with_context` closure),
+    // leaving partial-write and fsync failures to accumulate
+    // `.<orig>.<pid>.<ns>.tmp` orphans next to the real file on every
+    // backup or atomic write.
+    struct TempGuard<'a>(Option<&'a std::path::Path>);
+    impl Drop for TempGuard<'_> {
+        fn drop(&mut self) {
+            if let Some(p) = self.0 {
+                let _ = fs::remove_file(p);
+            }
+        }
+    }
+    let mut guard = TempGuard(Some(temp_path.as_path()));
 
-    file.write_all(content)
-        .with_context(|| format!("Failed to write to temp file: {:?}", temp_path))?;
+    {
+        // Write to temp file
+        let mut file = File::create(&temp_path)
+            .with_context(|| format!("Failed to create temp file: {:?}", temp_path))?;
 
-    // Sync data to disk
-    file.sync_all()
-        .with_context(|| format!("Failed to sync temp file: {:?}", temp_path))?;
+        file.write_all(content)
+            .with_context(|| format!("Failed to write to temp file: {:?}", temp_path))?;
+
+        // Sync data to disk
+        file.sync_all()
+            .with_context(|| format!("Failed to sync temp file: {:?}", temp_path))?;
+    }
 
     // Atomic rename
-    fs::rename(&temp_path, path).with_context(|| {
-        // Clean up temp file on rename failure
-        let _ = fs::remove_file(&temp_path);
-        format!("Failed to rename {:?} to {:?}", temp_path, path)
-    })?;
+    fs::rename(&temp_path, path)
+        .with_context(|| format!("Failed to rename {:?} to {:?}", temp_path, path))?;
+    // Rename succeeded — temp_path no longer exists, so skip cleanup.
+    guard.0 = None;
 
     // Sync parent directory for extra safety (important on some filesystems)
     if let Ok(dir) = File::open(parent) {

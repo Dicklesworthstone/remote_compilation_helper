@@ -41,6 +41,23 @@ fn claude_code_settings_path() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".claude").join("settings.json"))
 }
 
+/// Return true when the given command-line invokes the `rch` binary.
+///
+/// Matches against the basename of the first whitespace-separated token,
+/// not a naive `contains("rch")`. The substring test was prone to false
+/// positives on any path or arg containing "rch" in its name — `search`,
+/// `archive`, `rearchive`, `rch-wkr`, `rchd`, `myrchwrapper` — which
+/// would have made the daemon's self-healing check falsely report that
+/// the user's Claude Code settings already contained the RCH hook.
+fn is_rch_hook_command(cmd: &str) -> bool {
+    let first_token = cmd.split_whitespace().next().unwrap_or(cmd);
+    let basename = std::path::Path::new(first_token)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(first_token);
+    basename == "rch"
+}
+
 /// Gets the path to the .claude directory.
 fn claude_code_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".claude"))
@@ -80,7 +97,7 @@ fn check_claude_code_hook_installed() -> Result<bool> {
             if let Some(inner_hooks) = hook.get("hooks").and_then(|h| h.as_array()) {
                 for inner in inner_hooks {
                     if let Some(cmd) = inner.get("command").and_then(|c| c.as_str())
-                        && cmd.contains("rch")
+                        && is_rch_hook_command(cmd)
                     {
                         return Ok(true);
                     }
@@ -88,13 +105,13 @@ fn check_claude_code_hook_installed() -> Result<bool> {
             }
             // Check old format: {"command": "rch"} (for backwards compatibility)
             if let Some(cmd) = hook.get("command").and_then(|c| c.as_str())
-                && cmd.contains("rch")
+                && is_rch_hook_command(cmd)
             {
                 return Ok(true);
             }
             // Also check for string hooks
             if let Some(cmd) = hook.as_str()
-                && cmd.contains("rch")
+                && is_rch_hook_command(cmd)
             {
                 return Ok(true);
             }
@@ -105,18 +122,41 @@ fn check_claude_code_hook_installed() -> Result<bool> {
 }
 
 /// Writes content to a file atomically using a temporary file.
+///
+/// Cleans up the temp file on any failure path — otherwise a write/sync/
+/// rename error (e.g. disk-full, EPERM, cross-device) would leave a
+/// `.UUID.tmp` orphan next to the real settings file that grows on every
+/// retry. We rely on `fs::rename` replacing the target atomically on
+/// success, so the temp file only exists transiently in the happy path.
 fn atomic_write(path: &PathBuf, content: &[u8]) -> Result<()> {
     let parent = path.parent().context("Path has no parent directory")?;
     let temp_path = parent.join(format!(".{}.tmp", Uuid::new_v4()));
 
-    let mut file = fs::File::create(&temp_path)
-        .with_context(|| format!("Failed to create temp file {:?}", temp_path))?;
-    file.write_all(content)
-        .with_context(|| format!("Failed to write to temp file {:?}", temp_path))?;
-    file.sync_all().context("Failed to sync temp file")?;
+    // Guard removes the temp file if any `?` below bails out. Defused
+    // after a successful `fs::rename`, where the file has already been
+    // moved into place.
+    struct TempGuard<'a>(Option<&'a std::path::Path>);
+    impl Drop for TempGuard<'_> {
+        fn drop(&mut self) {
+            if let Some(p) = self.0 {
+                let _ = fs::remove_file(p);
+            }
+        }
+    }
+    let mut guard = TempGuard(Some(temp_path.as_path()));
+
+    {
+        let mut file = fs::File::create(&temp_path)
+            .with_context(|| format!("Failed to create temp file {:?}", temp_path))?;
+        file.write_all(content)
+            .with_context(|| format!("Failed to write to temp file {:?}", temp_path))?;
+        file.sync_all().context("Failed to sync temp file")?;
+    }
 
     fs::rename(&temp_path, path)
         .with_context(|| format!("Failed to rename {:?} to {:?}", temp_path, path))?;
+    // Rename succeeded — temp_path no longer exists, so skip cleanup.
+    guard.0 = None;
 
     Ok(())
 }
@@ -278,7 +318,7 @@ fn settings_has_rch_hook(settings: &Value) -> bool {
             if let Some(inner_hooks) = hook.get("hooks").and_then(|h| h.as_array()) {
                 for inner in inner_hooks {
                     if let Some(cmd) = inner.get("command").and_then(|c| c.as_str())
-                        && cmd.contains("rch")
+                        && is_rch_hook_command(cmd)
                     {
                         return true;
                     }
@@ -286,12 +326,12 @@ fn settings_has_rch_hook(settings: &Value) -> bool {
             }
             // Check old format: {"command": "rch"} (for backwards compatibility)
             if let Some(cmd) = hook.get("command").and_then(|c| c.as_str())
-                && cmd.contains("rch")
+                && is_rch_hook_command(cmd)
             {
                 return true;
             }
             if let Some(cmd) = hook.as_str()
-                && cmd.contains("rch")
+                && is_rch_hook_command(cmd)
             {
                 return true;
             }
@@ -344,6 +384,33 @@ mod tests {
     use super::*;
     use serde_json::json;
     use tempfile::TempDir;
+
+    // =========================================================================
+    // is_rch_hook_command — guard against the `contains("rch")` bug
+    // =========================================================================
+
+    #[test]
+    fn is_rch_hook_command_matches_rch() {
+        assert!(is_rch_hook_command("rch"));
+        assert!(is_rch_hook_command("/usr/local/bin/rch"));
+        assert!(is_rch_hook_command("rch --some-flag"));
+        assert!(is_rch_hook_command("/home/user/.local/bin/rch arg1 arg2"));
+    }
+
+    #[test]
+    fn is_rch_hook_command_rejects_substring_false_positives() {
+        // Regression: the previous `contains("rch")` misidentified all
+        // of these as the RCH hook, so `verify_and_install_claude_code_hook`
+        // would skip installation even when the user's hook was some
+        // unrelated tool whose name happened to contain "rch".
+        assert!(!is_rch_hook_command("search"));
+        assert!(!is_rch_hook_command("/usr/bin/search"));
+        assert!(!is_rch_hook_command("archive"));
+        assert!(!is_rch_hook_command("rearchive"));
+        assert!(!is_rch_hook_command("rch-wkr"));
+        assert!(!is_rch_hook_command("rchd"));
+        assert!(!is_rch_hook_command("myrchwrapper"));
+    }
 
     // =========================================================================
     // HookResult Display Tests
