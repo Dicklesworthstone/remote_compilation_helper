@@ -10,6 +10,23 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::PathBuf;
 
+/// Return true when the given command-line invokes the `rch` binary.
+///
+/// We match against the basename of the first whitespace-separated
+/// token, not a naive `contains("rch")`. The substring test was prone
+/// to false positives across any path or arg containing "rch" in its
+/// name — for example `search`, `archive`, `rearchive`, `rch-wkr`, or
+/// `my-rchwrapper` — which in `uninstall_hook` would silently *delete*
+/// legitimate unrelated hooks from the user's settings.
+fn is_rch_hook_command(cmd: &str) -> bool {
+    let first_token = cmd.split_whitespace().next().unwrap_or(cmd);
+    let basename = std::path::Path::new(first_token)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(first_token);
+    basename == "rch"
+}
+
 /// Status of RCH hook for an agent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -139,7 +156,7 @@ fn check_claude_code_hook_at_path(settings_path: &std::path::Path) -> Result<Hoo
             if let Some(inner_hooks) = hook.get("hooks").and_then(|h| h.as_array()) {
                 for inner in inner_hooks {
                     if let Some(cmd) = inner.get("command").and_then(|c| c.as_str())
-                        && cmd.contains("rch")
+                        && is_rch_hook_command(cmd)
                     {
                         return Ok(HookStatus::Installed);
                     }
@@ -148,7 +165,7 @@ fn check_claude_code_hook_at_path(settings_path: &std::path::Path) -> Result<Hoo
             // Also check obsolete format for backwards compatibility detection:
             // { "command": "rch", "description": "..." }
             if let Some(cmd) = hook.get("command").and_then(|c| c.as_str())
-                && cmd.contains("rch")
+                && is_rch_hook_command(cmd)
                 && hook.get("matcher").is_none()
             {
                 // Obsolete format detected - needs update
@@ -221,7 +238,7 @@ fn install_claude_code_hook_at_path(
                 let is_obsolete_rch = hook
                     .get("command")
                     .and_then(|c| c.as_str())
-                    .map(|c| c.contains("rch"))
+                    .map(is_rch_hook_command)
                     .unwrap_or(false)
                     && hook.get("matcher").is_none();
                 !is_obsolete_rch
@@ -310,7 +327,7 @@ fn uninstall_claude_code_hook(dry_run: bool) -> Result<IdempotentResult> {
             if let Some(inner_hooks) = hook.get("hooks").and_then(|h| h.as_array()) {
                 for inner in inner_hooks {
                     if let Some(cmd) = inner.get("command").and_then(|c| c.as_str())
-                        && cmd.contains("rch")
+                        && is_rch_hook_command(cmd)
                     {
                         return false; // Remove this entry
                     }
@@ -318,7 +335,7 @@ fn uninstall_claude_code_hook(dry_run: bool) -> Result<IdempotentResult> {
             }
             // Check obsolete format: { "command": "rch", ... }
             if let Some(cmd) = hook.get("command").and_then(|c| c.as_str())
-                && cmd.contains("rch")
+                && is_rch_hook_command(cmd)
                 && hook.get("matcher").is_none()
             {
                 return false; // Remove this entry
@@ -360,7 +377,7 @@ fn check_gemini_cli_hook() -> Result<HookStatus> {
     {
         for hook in arr {
             if let Some(cmd) = hook.get("command").and_then(|c| c.as_str())
-                && cmd.contains("rch")
+                && is_rch_hook_command(cmd)
             {
                 return Ok(HookStatus::Installed);
             }
@@ -462,7 +479,7 @@ fn uninstall_gemini_cli_hook(dry_run: bool) -> Result<IdempotentResult> {
             !hook
                 .get("command")
                 .and_then(|c| c.as_str())
-                .map(|c| c.contains("rch"))
+                .map(is_rch_hook_command)
                 .unwrap_or(false)
         });
     }
@@ -717,7 +734,7 @@ fn check_continue_dev_hook() -> Result<HookStatus> {
     // Check for rch in experimental features or custom commands
     if let Some(experimental) = config.get("experimental")
         && let Some(pre_cmd) = experimental.get("preCompileCommand")
-        && pre_cmd.as_str().map(|s| s.contains("rch")).unwrap_or(false)
+        && pre_cmd.as_str().map(is_rch_hook_command).unwrap_or(false)
     {
         return Ok(HookStatus::Installed);
     }
@@ -810,6 +827,47 @@ fn uninstall_continue_dev_hook(dry_run: bool) -> Result<IdempotentResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ===== TEST: is_rch_hook_command =====
+
+    #[test]
+    fn is_rch_hook_command_matches_bare_name() {
+        assert!(is_rch_hook_command("rch"));
+    }
+
+    #[test]
+    fn is_rch_hook_command_matches_absolute_path() {
+        assert!(is_rch_hook_command("/usr/local/bin/rch"));
+        assert!(is_rch_hook_command("/home/user/.local/bin/rch"));
+    }
+
+    #[test]
+    fn is_rch_hook_command_matches_with_args() {
+        assert!(is_rch_hook_command("rch --some-flag"));
+        assert!(is_rch_hook_command("/opt/rch/bin/rch --verbose arg"));
+    }
+
+    #[test]
+    fn is_rch_hook_command_rejects_substring_false_positives() {
+        // Regression: the previous `contains("rch")` implementation
+        // matched any of these, which caused `rch hook uninstall` to
+        // silently remove unrelated hooks from the user's settings.
+        assert!(!is_rch_hook_command("search"));
+        assert!(!is_rch_hook_command("/usr/bin/search"));
+        assert!(!is_rch_hook_command("archive"));
+        assert!(!is_rch_hook_command("rearchive"));
+        assert!(!is_rch_hook_command("arch"));
+        assert!(!is_rch_hook_command("rch-wkr"));
+        assert!(!is_rch_hook_command("/usr/bin/rchd"));
+        assert!(!is_rch_hook_command("myrchwrapper"));
+        assert!(!is_rch_hook_command("rchextra"));
+    }
+
+    #[test]
+    fn is_rch_hook_command_rejects_empty() {
+        assert!(!is_rch_hook_command(""));
+        assert!(!is_rch_hook_command("   "));
+    }
 
     // ===== TEST: HookStatus =====
 
@@ -1374,7 +1432,7 @@ mod tests {
                         entry
                             .get("command")
                             .and_then(|c| c.as_str())
-                            .map(|s| s.contains("rch"))
+                            .map(is_rch_hook_command)
                             .unwrap_or(false)
                     })
                 })
@@ -1490,7 +1548,7 @@ mod tests {
                     arr.iter().any(|e| {
                         e.get("command")
                             .and_then(|c| c.as_str())
-                            .map(|s| s.contains("rch"))
+                            .map(is_rch_hook_command)
                             .unwrap_or(false)
                     })
                 })

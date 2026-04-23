@@ -113,7 +113,19 @@ const GITHUB_ACTIONS_OIDC_ISSUER: &str = "https://token.actions.githubuserconten
 
 /// Expected certificate identity pattern for official RCH releases.
 /// This must match the GitHub Actions workflow that signs the releases.
-const RCH_RELEASE_IDENTITY_PATTERN: &str = "https://github.com/Dicklesworthstone/remote_compilation_helper/.github/workflows/release.yml@refs/.*";
+///
+/// # Anchoring
+///
+/// Cosign's `--certificate-identity-regexp` uses Go's `regexp.MatchString`
+/// which performs *substring* matching. Without explicit `^` and `$`
+/// anchors, a malicious certificate whose SAN merely contains our
+/// workflow URL as a substring (for example, nested inside another URL)
+/// would also satisfy the check. We anchor both ends and escape the `.`
+/// metacharacters in `github.com` / `.github` / `.yml` so the pattern
+/// matches the real identity shape only:
+///
+///     ^https://github\.com/Dicklesworthstone/remote_compilation_helper/\.github/workflows/release\.yml@refs/.*$
+const RCH_RELEASE_IDENTITY_PATTERN: &str = r"^https://github\.com/Dicklesworthstone/remote_compilation_helper/\.github/workflows/release\.yml@refs/.*$";
 
 /// Verify Sigstore/cosign signature bundle for a file.
 ///

@@ -255,17 +255,27 @@ async fn extract_checksum(checksum_file: &PathBuf, filename: &str) -> Result<Str
         }
     }
 
-    // Checksum files typically have format: "checksum  filename" or "checksum filename"
+    // Checksum files typically have format: "checksum  filename" or "checksum filename".
+    //
+    // We compare on the path *basename*, not a naive `ends_with`. An
+    // `ends_with("/filename")` match is vulnerable to prefix injection:
+    // a line like `EVIL_HASH  ../evil/rch-v1.0.0-linux.tar.gz` would
+    // silently match when the caller asked for `rch-v1.0.0-linux.tar.gz`,
+    // letting an attacker with write access to the checksum file (or a
+    // release asset replacement) seed a different hash.
     for line in lines {
         let parts: Vec<&str> = line.split_whitespace().collect();
         if parts.len() >= 2 {
             let checksum = parts[0];
             let file = parts.last().unwrap();
-            // Exact match, or path prefix match (e.g., "./release/filename" matches "filename")
-            if *file == filename
-                || file.ends_with(&format!("/{}", filename))
-                || file.ends_with(&format!("\\{}", filename))
-            {
+            let file_basename = std::path::Path::new(file)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or(file);
+            // Also handle `\` separators on Windows-generated manifests,
+            // where `Path::file_name` doesn't split on backslash on Unix.
+            let win_basename = file.rsplit_once('\\').map(|(_, tail)| tail).unwrap_or(file);
+            if *file == filename || file_basename == filename || win_basename == filename {
                 return Ok(checksum.to_string());
             }
         }
@@ -359,6 +369,58 @@ mod tests {
         let result =
             extract_checksum(&checksum_file.to_path_buf(), "rch-v0.1.0-linux.tar.gz").await;
         assert_eq!(result.unwrap(), "abc123");
+    }
+
+    #[tokio::test]
+    async fn test_extract_checksum_rejects_nondelimited_suffix() {
+        // Regression: `ends_with("/foo")` on "baz-foo" would have
+        // rejected, but `ends_with("foo")` would have matched. More
+        // critically, raw suffix matching on the path column (without
+        // basename normalisation) permits lines whose filename column is
+        // a concatenation like `pfxrch-v0.1.0-linux.tar.gz` to spoof a
+        // match. The basename comparison enforces the separator
+        // requirement correctly.
+        let temp = TempDir::new().unwrap();
+        let checksum_file = temp.path().join("checksums.txt");
+
+        std::fs::write(
+            &checksum_file,
+            // First line's filename column does NOT have a separator
+            // before the target name — it's a concatenation. It must not
+            // match on basename lookup.
+            "ATTACKER_HASH  pfxrch-v0.1.0-linux.tar.gz\n\
+             LEGIT_HASH  rch-v0.1.0-linux.tar.gz\n",
+        )
+        .unwrap();
+
+        let result =
+            extract_checksum(&checksum_file.to_path_buf(), "rch-v0.1.0-linux.tar.gz").await;
+        assert_eq!(
+            result.unwrap(),
+            "LEGIT_HASH",
+            "non-delimited suffix must not satisfy basename match"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_extract_checksum_windows_backslash_basename() {
+        // Windows-style manifests may use backslash separators. We match
+        // the final path component regardless of separator style.
+        let temp = TempDir::new().unwrap();
+        let checksum_file = temp.path().join("checksums.txt");
+
+        std::fs::write(
+            &checksum_file,
+            "winhash  release\\rch-v0.1.0-x86_64-pc-windows-msvc.zip\n",
+        )
+        .unwrap();
+
+        let result = extract_checksum(
+            &checksum_file.to_path_buf(),
+            "rch-v0.1.0-x86_64-pc-windows-msvc.zip",
+        )
+        .await;
+        assert_eq!(result.unwrap(), "winhash");
     }
 
     #[test]
