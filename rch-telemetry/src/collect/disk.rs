@@ -83,22 +83,23 @@ impl DiskStats {
 
             let device = parts[2].to_string();
 
-            // Skip partitions (e.g., sda1) if we have the whole disk (sda)
-            // We want whole disks or nvme namespaces, not partitions
-            if device
-                .chars()
-                .last()
-                .map(|c| c.is_ascii_digit())
-                .unwrap_or(false)
-                && !device.starts_with("nvme")
-                && !device.starts_with("loop")
-            {
-                // This is likely a partition (sda1, sdb2, etc.) - skip
+            // Skip loop devices (they're virtual).
+            if device.starts_with("loop") {
                 continue;
             }
 
-            // Skip loop devices
-            if device.starts_with("loop") {
+            // Skip partitions. Whole-disk vs partition naming conventions:
+            //   traditional: `sda` (whole) vs `sda1` (partition)
+            //   nvme:        `nvme0n1` (whole ns) vs `nvme0n1p1` (partition)
+            //   mmc/sd:      `mmcblk0` (whole) vs `mmcblk0p1` (partition)
+            //   md raid:     `md0` (whole); no partition suffix scheme
+            //   ram/sr/fd:   `ram0`, `sr0`, `fd0` — all whole "disks"
+            //
+            // The previous heuristic ("ends in a digit" minus nvme/loop)
+            // mis-filtered `mmcblk0` (dropped it) and mis-included
+            // `nvme0n1p1` (kept a partition alongside its parent disk,
+            // causing double-counted I/O metrics).
+            if is_partition_name(&device) {
                 continue;
             }
 
@@ -133,6 +134,60 @@ impl DiskStats {
     pub fn bytes_written(&self) -> u64 {
         self.sectors_written * 512
     }
+}
+
+/// Return true if `device` (as it appears in /proc/diskstats) is a
+/// partition, not a whole disk or namespace.
+///
+/// Covers the three Linux naming families:
+///
+/// - **traditional** (sda, sdb, hda, vda, xvd…): whole disk is an
+///   alpha-only name; partitions append digits directly (`sda1`).
+/// - **nvme**: whole namespace is `nvme<ctrl>n<ns>`; partitions add
+///   `p<n>` (`nvme0n1p2`).
+/// - **mmc/SD**: whole disk is `mmcblk<n>`; partitions append
+///   `p<n>` (`mmcblk0p1`).
+///
+/// Whole-disk names that *end in a digit* but aren't partitions —
+/// `mmcblk0`, `nvme0n1`, `md0`, `ram7`, `sr0`, `fd0`, `dm-3` — must
+/// not be filtered. The previous heuristic ("ends in a digit and
+/// doesn't start with `nvme`/`loop`") dropped `mmcblk0` and *kept*
+/// `nvme0n1p1` (causing double-counted IO).
+fn is_partition_name(device: &str) -> bool {
+    // Whole-disk families whose whole-disk name ends in digits.
+    // Anything whose stripped-of-trailing-digits prefix matches one
+    // of these exactly is a whole disk, not a partition.
+    const WHOLE_DISK_PREFIX_EXACT: &[&str] = &["md", "ram", "sr", "fd", "dm-"];
+
+    // NVMe and MMC use explicit `p<digits>` for partitions. Absence of
+    // that suffix means whole namespace / whole card.
+    if device.starts_with("nvme") || device.starts_with("mmcblk") {
+        // Partition iff final segment after the last 'p' is all-digits
+        // AND the 'p' is preceded by a digit (to distinguish
+        // `nvme0n1p1` from a hypothetical `nvmeXp` controller name).
+        if let Some((head, tail)) = device.rsplit_once('p') {
+            let tail_is_num = !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit());
+            let head_ends_digit = head.chars().last().is_some_and(|c| c.is_ascii_digit());
+            return tail_is_num && head_ends_digit;
+        }
+        return false;
+    }
+
+    // Generic: strip trailing digits; what's left is the "family".
+    let stripped = device.trim_end_matches(|c: char| c.is_ascii_digit());
+    if stripped == device {
+        // No trailing digits → can't be a partition.
+        return false;
+    }
+    if stripped.is_empty() {
+        // Device is all digits — treat as whole disk to be safe.
+        return false;
+    }
+    if WHOLE_DISK_PREFIX_EXACT.contains(&stripped) {
+        return false;
+    }
+    // Traditional partition pattern: alpha prefix + trailing digits.
+    true
 }
 
 /// Derived disk metrics calculated from delta between two snapshots.
@@ -424,6 +479,46 @@ mod tests {
             )
             .with(filter)
             .try_init();
+    }
+
+    #[test]
+    fn partition_name_classifies_traditional_sd() {
+        // sda / hda / vda = whole disks; sda1, sdb2 = partitions.
+        assert!(!is_partition_name("sda"));
+        assert!(!is_partition_name("hda"));
+        assert!(!is_partition_name("vda"));
+        assert!(is_partition_name("sda1"));
+        assert!(is_partition_name("sdb15"));
+        assert!(is_partition_name("hda3"));
+    }
+
+    #[test]
+    fn partition_name_classifies_nvme() {
+        // nvme0n1 = whole namespace; nvme0n1p1 = partition.
+        assert!(!is_partition_name("nvme0n1"));
+        assert!(!is_partition_name("nvme1n1"));
+        assert!(is_partition_name("nvme0n1p1"));
+        assert!(is_partition_name("nvme0n1p12"));
+    }
+
+    #[test]
+    fn partition_name_classifies_mmc() {
+        // Regression: previous heuristic dropped `mmcblk0` because it
+        // ends in a digit, even though it's the whole disk.
+        assert!(!is_partition_name("mmcblk0"));
+        assert!(!is_partition_name("mmcblk1"));
+        assert!(is_partition_name("mmcblk0p1"));
+        assert!(is_partition_name("mmcblk1p3"));
+    }
+
+    #[test]
+    fn partition_name_keeps_whole_disk_families_ending_in_digit() {
+        assert!(!is_partition_name("md0"));
+        assert!(!is_partition_name("md127"));
+        assert!(!is_partition_name("ram7"));
+        assert!(!is_partition_name("sr0"));
+        assert!(!is_partition_name("fd0"));
+        assert!(!is_partition_name("dm-3"));
     }
 
     #[test]
