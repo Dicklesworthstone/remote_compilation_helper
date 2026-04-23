@@ -749,11 +749,20 @@ impl CancellationOrchestrator {
             return 0.0; // No cancellation history → no debt.
         };
 
-        // Prune all counters outside the window.
-        let cutoff = Instant::now() - DEBT_WINDOW;
-        entry.recent_cancellations.retain(|t| *t > cutoff);
-        entry.recent_escalations.retain(|t| *t > cutoff);
-        entry.recent_cleanup_failures.retain(|t| *t > cutoff);
+        // Prune all counters outside the window. Compare ages rather than
+        // constructing a cutoff Instant, because `Instant::now() - Duration`
+        // panics if the result would precede the monotonic clock's origin
+        // (fresh-boot scenario on Linux where `Instant::now()` < DEBT_WINDOW).
+        let now = Instant::now();
+        entry
+            .recent_cancellations
+            .retain(|t| now.saturating_duration_since(*t) < DEBT_WINDOW);
+        entry
+            .recent_escalations
+            .retain(|t| now.saturating_duration_since(*t) < DEBT_WINDOW);
+        entry
+            .recent_cleanup_failures
+            .retain(|t| now.saturating_duration_since(*t) < DEBT_WINDOW);
 
         let recent_count = entry.recent_cancellations.len() as f64;
 

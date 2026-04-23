@@ -373,18 +373,33 @@ impl SelectionHistory {
 
     /// Count recent selections for a worker within a time window.
     pub fn recent_selections(&self, worker_id: &str, window: Duration) -> usize {
-        let cutoff = Instant::now() - window;
+        // Compare ages rather than constructing a cutoff Instant: on a
+        // freshly-booted host `Instant::now() - window` would underflow
+        // and panic because Linux's monotonic clock starts near zero at
+        // boot.
+        let now = Instant::now();
         self.selections
             .get(worker_id)
-            .map(|history| history.iter().filter(|&&t| t > cutoff).count())
+            .map(|history| {
+                history
+                    .iter()
+                    .filter(|&&t| now.saturating_duration_since(t) < window)
+                    .count()
+            })
             .unwrap_or(0)
     }
 
     /// Prune old entries from all workers.
     pub fn prune(&mut self, max_age: Duration) {
-        let cutoff = Instant::now() - max_age;
+        // See `recent_selections` for why age comparison is used instead
+        // of `Instant::now() - max_age`.
+        let now = Instant::now();
         for history in self.selections.values_mut() {
-            while history.front().map(|&t| t < cutoff).unwrap_or(false) {
+            while history
+                .front()
+                .map(|&t| now.saturating_duration_since(t) >= max_age)
+                .unwrap_or(false)
+            {
                 history.pop_front();
             }
         }
