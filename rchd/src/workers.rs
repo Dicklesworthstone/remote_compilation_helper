@@ -137,13 +137,29 @@ impl WorkerState {
     ///
     /// Re-reads total_slots on each CAS iteration to handle concurrent config changes.
     /// This prevents overallocation if total_slots is reduced while reserving.
+    ///
+    /// Also re-checks status on each iteration and refuses reservations on
+    /// workers that are `Draining`, `Drained`, or `Disabled`. The selector
+    /// filters by `healthy_workers()` up-front, but between that filter and
+    /// this CAS an operator may run `rch workers drain`, which would
+    /// otherwise let a new build land on a worker that was just asked to
+    /// stop accepting work — defeating the entire drain contract.
     pub async fn reserve_slots(&self, count: u32) -> bool {
         let mut current = self.used_slots.load(Ordering::Relaxed);
         loop {
+            // Re-read status on each iteration so a concurrent `drain()` /
+            // `disable()` becomes authoritative as soon as it's written,
+            // not only on the next selection round.
+            match *self.status.read().await {
+                WorkerStatus::Draining | WorkerStatus::Drained | WorkerStatus::Disabled => {
+                    return false;
+                }
+                _ => {}
+            }
             // Re-read total_slots on each iteration to handle concurrent config changes.
             // This is safe because CAS loops typically succeed in 1-2 iterations.
             let total_slots = self.config.read().await.total_slots;
-            if current + count > total_slots {
+            if current.saturating_add(count) > total_slots {
                 return false;
             }
             match self.used_slots.compare_exchange(
@@ -1155,6 +1171,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_reserve_slots_refuses_draining_worker() {
+        // Regression: the selector's `healthy_workers()` filter runs *before*
+        // `reserve_slots`, so an operator invoking `drain()` between the two
+        // must still prevent the reservation. Previously reserve_slots only
+        // compared used + count against total_slots and silently accepted on
+        // drained workers — a build could land on a worker we had just asked
+        // to stop accepting work, breaking the drain contract.
+        let state = WorkerState::new(test_config("drain-race"));
+        assert!(state.reserve_slots(1).await, "fresh worker should accept");
+        state.release_slots(1).await;
+
+        state.drain().await;
+        assert!(
+            !state.reserve_slots(1).await,
+            "draining worker must refuse new reservations"
+        );
+        assert_eq!(state.used_slots(), 0);
+
+        state.check_drain_complete().await;
+        assert_eq!(state.status().await, WorkerStatus::Drained);
+        assert!(
+            !state.reserve_slots(1).await,
+            "drained worker must refuse new reservations"
+        );
+
+        state.disable(Some("maintenance".to_string())).await;
+        assert!(
+            !state.reserve_slots(1).await,
+            "disabled worker must refuse new reservations"
+        );
+    }
+
+    #[tokio::test]
     async fn test_apply_health_status_updates_non_administrative_states() {
         let state = WorkerState::new(test_config("test"));
 
@@ -1646,7 +1695,13 @@ mod tests {
         drained_empty.drain().await;
         pool.add_worker_state(drained_empty).await;
 
-        // Drained worker with slots in use (should NOT be pruned)
+        // Drained worker with slots in use (should NOT be pruned).
+        //
+        // In production, slot reservation happens while the worker is
+        // still healthy (selection path) and a subsequent drain() just
+        // stops new reservations without releasing the in-flight ones.
+        // `reserve_slots` (correctly) refuses after drain, so the test
+        // must mirror that ordering.
         let drained_busy = WorkerState::new(WorkerConfig {
             id: WorkerId::new("drained_busy"),
             host: "localhost".to_string(),
@@ -1656,8 +1711,8 @@ mod tests {
             priority: 100,
             tags: vec![],
         });
+        assert!(drained_busy.reserve_slots(1).await);
         drained_busy.drain().await;
-        drained_busy.reserve_slots(1).await;
         pool.add_worker_state(drained_busy).await;
 
         assert_eq!(pool.len(), 3);
