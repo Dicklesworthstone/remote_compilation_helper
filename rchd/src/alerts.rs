@@ -33,6 +33,11 @@ pub struct AlertConfig {
     pub enabled: bool,
     /// Suppress duplicate alerts for this duration.
     pub suppress_duplicates: ChronoDuration,
+    /// How long to retain an alert after it is cleared before dropping it
+    /// entirely. During this window the alert is reported with status
+    /// `cleared_pending_clean` so UIs can visually grey it out instead of
+    /// making humans chase a warning that has already healed (bd-3ogaz).
+    pub cleared_retention: ChronoDuration,
     /// Webhook configuration for external notifications.
     pub webhook: Option<WebhookConfig>,
 }
@@ -42,6 +47,7 @@ impl Default for AlertConfig {
         Self {
             enabled: true,
             suppress_duplicates: ChronoDuration::seconds(300),
+            cleared_retention: ChronoDuration::seconds(300),
             webhook: None,
         }
     }
@@ -107,6 +113,26 @@ enum AlertKey {
     AllWorkersOffline,
 }
 
+/// Lifecycle state for an alert (bd-3ogaz).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AlertState {
+    /// The condition that raised the alert is still present.
+    Active,
+    /// The condition has healed but the alert is kept around briefly so
+    /// operators can see that it just self-cleared. Dropped from the
+    /// active-alerts list once `cleared_retention` elapses.
+    ClearedPendingClean,
+}
+
+impl AlertState {
+    fn as_str(&self) -> &'static str {
+        match self {
+            AlertState::Active => "active",
+            AlertState::ClearedPendingClean => "cleared_pending_clean",
+        }
+    }
+}
+
 /// Alert record stored in memory.
 #[derive(Debug, Clone)]
 pub struct Alert {
@@ -115,6 +141,17 @@ pub struct Alert {
     severity: AlertSeverity,
     message: String,
     worker_id: Option<String>,
+    /// First time this alert instance was observed. Stable across duplicate
+    /// re-raises within the same lifecycle.
+    first_seen: DateTime<Utc>,
+    /// Last time the underlying condition was re-observed. Updated on every
+    /// `upsert_alert` call.
+    last_seen: DateTime<Utc>,
+    /// Timestamp at which the alert was cleared. `None` while the alert is
+    /// still active.
+    cleared_at: Option<DateTime<Utc>>,
+    /// Retained for backwards compatibility with existing callers — equal to
+    /// `first_seen`.
     created_at: DateTime<Utc>,
 }
 
@@ -125,13 +162,25 @@ impl Alert {
         message: String,
         worker_id: Option<String>,
     ) -> Self {
+        let now = Utc::now();
         Self {
             id: Uuid::new_v4().to_string(),
             kind,
             severity,
             message,
             worker_id,
-            created_at: Utc::now(),
+            first_seen: now,
+            last_seen: now,
+            cleared_at: None,
+            created_at: now,
+        }
+    }
+
+    fn state(&self) -> AlertState {
+        if self.cleared_at.is_some() {
+            AlertState::ClearedPendingClean
+        } else {
+            AlertState::Active
         }
     }
 
@@ -143,6 +192,10 @@ impl Alert {
             message: self.message.clone(),
             worker_id: self.worker_id.clone(),
             created_at: self.created_at.to_rfc3339(),
+            first_seen: self.first_seen.to_rfc3339(),
+            last_seen: self.last_seen.to_rfc3339(),
+            cleared_at: self.cleared_at.map(|t| t.to_rfc3339()),
+            state: self.state().as_str().to_string(),
         }
     }
 }
@@ -157,9 +210,21 @@ pub struct AlertInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worker_id: Option<String>,
     pub created_at: String,
+    /// First time the alert instance was raised. Stable across duplicate
+    /// re-raises within a single lifecycle.
+    pub first_seen: String,
+    /// Last time the underlying condition was re-observed.
+    pub last_seen: String,
+    /// Timestamp at which the alert was cleared. Present only when the alert
+    /// is in the `cleared_pending_clean` state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cleared_at: Option<String>,
+    /// Lifecycle state: `active` while the condition persists,
+    /// `cleared_pending_clean` while a recently-healed alert is still shown.
+    pub state: String,
 }
 
-struct AlertState {
+struct AlertStore {
     active: HashMap<AlertKey, Alert>,
     last_sent: HashMap<AlertKey, DateTime<Utc>>,
 }
@@ -167,7 +232,7 @@ struct AlertState {
 /// Manages active alerts and suppression logic.
 pub struct AlertManager {
     config: AlertConfig,
-    state: RwLock<AlertState>,
+    state: RwLock<AlertStore>,
 }
 
 impl AlertManager {
@@ -175,7 +240,7 @@ impl AlertManager {
     pub fn new(config: AlertConfig) -> Self {
         Self {
             config,
-            state: RwLock::new(AlertState {
+            state: RwLock::new(AlertStore {
                 active: HashMap::new(),
                 last_sent: HashMap::new(),
             }),
@@ -183,20 +248,43 @@ impl AlertManager {
     }
 
     /// Return the currently active alerts.
+    ///
+    /// Side effect: any alert whose `cleared_at` is older than the configured
+    /// `cleared_retention` window is evicted from the store on this call.
+    /// Still-healing alerts (within the retention window) are returned with
+    /// `state = "cleared_pending_clean"` so UIs can grey them out.
     pub fn active_alerts(&self) -> Vec<AlertInfo> {
+        self.sweep_stale_cleared();
+
         let mut alerts: Vec<Alert> = {
             let state = self.state.read().unwrap();
             state.active.values().cloned().collect()
         };
 
         alerts.sort_by(|a, b| {
-            a.severity
-                .rank()
-                .cmp(&b.severity.rank())
-                .then_with(|| b.created_at.cmp(&a.created_at))
+            // Active alerts first; within each group sort by severity then recency.
+            let a_state = a.state();
+            let b_state = b.state();
+            a_state
+                .cmp(&b_state)
+                .then_with(|| a.severity.rank().cmp(&b.severity.rank()))
+                .then_with(|| b.last_seen.cmp(&a.last_seen))
         });
 
         alerts.into_iter().map(|alert| alert.to_info()).collect()
+    }
+
+    /// Remove alerts that have been in the `cleared_pending_clean` state for
+    /// longer than the retention window. Best-effort; caller does not need
+    /// to observe the result.
+    fn sweep_stale_cleared(&self) {
+        let now = Utc::now();
+        let retention = self.config.cleared_retention;
+        let mut state = self.state.write().unwrap();
+        state.active.retain(|_, alert| match alert.cleared_at {
+            Some(cleared) => now - cleared < retention,
+            None => true,
+        });
     }
 
     /// Handle worker status transitions.
@@ -263,6 +351,23 @@ impl AlertManager {
         self.upsert_alert(key, alert);
     }
 
+    /// Handle circuit breaker returning to closed (or half-open) state.
+    ///
+    /// Transitions the corresponding `CircuitOpen` alert to
+    /// `cleared_pending_clean` so UIs can grey it out. `active_alerts()`
+    /// evicts it after `cleared_retention` elapses.
+    ///
+    /// This is the counterpart to [`handle_circuit_open`] and is the key
+    /// fix for bd-3ogaz: without it, a transient circuit-open alert would
+    /// persist forever in `rch status` even after the worker recovers.
+    pub fn handle_circuit_closed(&self, worker_id: &str) {
+        if !self.config.enabled {
+            return;
+        }
+        let key = AlertKey::CircuitOpen(worker_id.to_string());
+        self.clear_alert(&key);
+    }
+
     /// Handle all-workers-offline aggregation.
     pub fn handle_all_workers_offline(&self, total: usize, unreachable: usize) {
         if !self.config.enabled || total == 0 {
@@ -285,9 +390,22 @@ impl AlertManager {
         }
     }
 
-    fn upsert_alert(&self, key: AlertKey, alert: Alert) {
+    fn upsert_alert(&self, key: AlertKey, mut alert: Alert) {
         let now = alert.created_at;
         let mut state = self.state.write().unwrap();
+
+        // If the same alert condition is being re-raised (either active or
+        // recently-cleared), preserve the original `id`, `first_seen`, and
+        // `created_at` so downstream correlates this as the same incident
+        // rather than a new one. `last_seen` is stamped to now so UIs can
+        // show "still ongoing" age, and `cleared_at` is reset.
+        if let Some(existing) = state.active.get(&key) {
+            alert.id = existing.id.clone();
+            alert.first_seen = existing.first_seen;
+            alert.created_at = existing.created_at;
+        }
+        alert.last_seen = now;
+        alert.cleared_at = None;
 
         if let Some(last) = state.last_sent.get(&key)
             && now - *last < self.config.suppress_duplicates
@@ -297,7 +415,17 @@ impl AlertManager {
                 alert_id = %alert.id,
                 "Alert suppressed (duplicate within window)"
             );
-            state.active.entry(key).or_insert(alert);
+            // Merge into existing entry to keep first_seen/last_seen fresh;
+            // if no existing entry, seed one so re-raises after suppression
+            // still surface.
+            state
+                .active
+                .entry(key)
+                .and_modify(|a| {
+                    a.last_seen = now;
+                    a.cleared_at = None;
+                })
+                .or_insert(alert);
             return;
         }
 
@@ -353,12 +481,20 @@ impl AlertManager {
     }
 
     fn clear_alert(&self, key: &AlertKey) {
+        let now = Utc::now();
         let mut state = self.state.write().unwrap();
-        if let Some(alert) = state.active.remove(key) {
+        // Mark-cleared rather than remove: the alert lingers as
+        // `cleared_pending_clean` so operators can see a transient condition
+        // just resolved. `active_alerts()` evicts it after the retention
+        // window (bd-3ogaz).
+        if let Some(alert) = state.active.get_mut(key)
+            && alert.cleared_at.is_none()
+        {
+            alert.cleared_at = Some(now);
             debug!(
                 alert_kind = alert.kind.as_str(),
                 alert_id = %alert.id,
-                "Alert cleared"
+                "Alert transitioned to cleared_pending_clean"
             );
         }
     }
@@ -657,6 +793,7 @@ mod tests {
         let config = AlertConfig {
             enabled: true,
             suppress_duplicates: ChronoDuration::seconds(60),
+            cleared_retention: ChronoDuration::seconds(300),
             webhook: Some(webhook),
         };
 
@@ -670,6 +807,7 @@ mod tests {
         let config = AlertConfig {
             enabled: false,
             suppress_duplicates: ChronoDuration::seconds(60),
+            cleared_retention: ChronoDuration::seconds(300),
             webhook: None,
         };
         assert!(!config.enabled);
@@ -774,6 +912,7 @@ mod tests {
         let config = AlertConfig {
             enabled: true,
             suppress_duplicates: ChronoDuration::seconds(300),
+            cleared_retention: ChronoDuration::seconds(300),
             webhook: None,
         };
         let manager = AlertManager::new(config);
@@ -801,7 +940,14 @@ mod tests {
     #[test]
     fn test_clear_alert_on_recovery() {
         let _guard = test_guard!();
-        let manager = AlertManager::new(AlertConfig::default());
+        // With zero cleared_retention, a cleared alert is evicted on the
+        // next query. Use this to keep the original "cleared = disappears"
+        // contract while still exercising the new lifecycle.
+        let config = AlertConfig {
+            cleared_retention: ChronoDuration::zero(),
+            ..AlertConfig::default()
+        };
+        let manager = AlertManager::new(config);
         manager.handle_worker_status_change(
             "w1",
             WorkerStatus::Healthy,
@@ -820,11 +966,133 @@ mod tests {
     }
 
     #[test]
+    fn test_cleared_alert_retained_and_marked() {
+        let _guard = test_guard!();
+        // Default retention is 5 minutes, so a just-cleared alert should
+        // still appear but with state "cleared_pending_clean" (bd-3ogaz).
+        let manager = AlertManager::new(AlertConfig::default());
+        manager.handle_worker_status_change(
+            "w1",
+            WorkerStatus::Healthy,
+            WorkerStatus::Degraded,
+            None,
+        );
+        assert_eq!(manager.active_alerts().len(), 1);
+        assert_eq!(manager.active_alerts()[0].state, "active");
+        assert!(manager.active_alerts()[0].cleared_at.is_none());
+
+        manager.handle_worker_status_change(
+            "w1",
+            WorkerStatus::Degraded,
+            WorkerStatus::Healthy,
+            None,
+        );
+        let after = manager.active_alerts();
+        assert_eq!(after.len(), 1, "cleared alert should be retained");
+        assert_eq!(after[0].state, "cleared_pending_clean");
+        assert!(after[0].cleared_at.is_some());
+    }
+
+    #[test]
+    fn test_circuit_open_reraise_preserves_identity() {
+        let _guard = test_guard!();
+        // Re-raising the same circuit_open condition should correlate to a
+        // single incident: same id, same first_seen, last_seen bumped.
+        let manager = AlertManager::new(AlertConfig::default());
+        manager.handle_circuit_open("w1");
+        assert_eq!(manager.active_alerts()[0].state, "active");
+
+        let first_alert = manager.active_alerts()[0].clone();
+        manager.handle_circuit_open("w1");
+        let second = manager.active_alerts();
+        assert_eq!(second[0].id, first_alert.id, "re-raise should keep id");
+        assert_eq!(second[0].first_seen, first_alert.first_seen);
+    }
+
+    #[test]
+    fn test_circuit_closed_transitions_alert_to_cleared() {
+        let _guard = test_guard!();
+        // Core bd-3ogaz behaviour: circuit opens, then closes → alert must
+        // flip to cleared_pending_clean so `rch status` doesn't keep
+        // warning about a condition that has already healed.
+        let manager = AlertManager::new(AlertConfig::default());
+        manager.handle_circuit_open("w1");
+        assert_eq!(manager.active_alerts()[0].state, "active");
+
+        manager.handle_circuit_closed("w1");
+        let after = manager.active_alerts();
+        assert_eq!(after.len(), 1, "alert retained during retention window");
+        assert_eq!(after[0].state, "cleared_pending_clean");
+        assert!(after[0].cleared_at.is_some());
+    }
+
+    #[test]
+    fn test_circuit_closed_then_expires() {
+        let _guard = test_guard!();
+        let config = AlertConfig {
+            cleared_retention: ChronoDuration::zero(),
+            ..AlertConfig::default()
+        };
+        let manager = AlertManager::new(config);
+        manager.handle_circuit_open("w1");
+        manager.handle_circuit_closed("w1");
+        assert!(
+            manager.active_alerts().is_empty(),
+            "zero retention should evict on next read"
+        );
+    }
+
+    #[test]
+    fn test_circuit_reopen_after_clear_reactivates() {
+        let _guard = test_guard!();
+        // If a circuit clears and then re-opens before eviction, the alert
+        // should reactivate (state=active, cleared_at=None) with the same
+        // id so operators see one continuing incident.
+        let manager = AlertManager::new(AlertConfig::default());
+        manager.handle_circuit_open("w1");
+        let original_id = manager.active_alerts()[0].id.clone();
+
+        manager.handle_circuit_closed("w1");
+        assert_eq!(manager.active_alerts()[0].state, "cleared_pending_clean");
+
+        manager.handle_circuit_open("w1");
+        let reactivated = manager.active_alerts();
+        assert_eq!(reactivated[0].state, "active");
+        assert!(reactivated[0].cleared_at.is_none());
+        assert_eq!(reactivated[0].id, original_id);
+    }
+
+    #[test]
+    fn test_cleared_pending_clean_evicted_after_retention() {
+        let _guard = test_guard!();
+        let config = AlertConfig {
+            cleared_retention: ChronoDuration::zero(),
+            ..AlertConfig::default()
+        };
+        let manager = AlertManager::new(config);
+        manager.handle_worker_status_change(
+            "w1",
+            WorkerStatus::Healthy,
+            WorkerStatus::Degraded,
+            None,
+        );
+        manager.handle_worker_status_change(
+            "w1",
+            WorkerStatus::Degraded,
+            WorkerStatus::Healthy,
+            None,
+        );
+        // With zero retention, the alert evicts immediately on next read.
+        assert_eq!(manager.active_alerts().len(), 0);
+    }
+
+    #[test]
     fn test_disabled_config_no_alerts() {
         let _guard = test_guard!();
         let config = AlertConfig {
             enabled: false,
             suppress_duplicates: ChronoDuration::seconds(300),
+            cleared_retention: ChronoDuration::seconds(300),
             webhook: None,
         };
         let manager = AlertManager::new(config);
@@ -895,7 +1163,13 @@ mod tests {
     #[test]
     fn test_unreachable_to_degraded() {
         let _guard = test_guard!();
-        let manager = AlertManager::new(AlertConfig::default());
+        // Use zero retention so this test keeps its "the other alert
+        // disappears" contract after the bd-3ogaz lifecycle changes.
+        let config = AlertConfig {
+            cleared_retention: ChronoDuration::zero(),
+            ..AlertConfig::default()
+        };
+        let manager = AlertManager::new(config);
 
         // First become unreachable
         manager.handle_worker_status_change(
@@ -922,7 +1196,11 @@ mod tests {
     #[test]
     fn test_degraded_to_unreachable() {
         let _guard = test_guard!();
-        let manager = AlertManager::new(AlertConfig::default());
+        let config = AlertConfig {
+            cleared_retention: ChronoDuration::zero(),
+            ..AlertConfig::default()
+        };
+        let manager = AlertManager::new(config);
 
         // First become degraded
         manager.handle_worker_status_change(
@@ -995,6 +1273,7 @@ mod tests {
         let config = AlertConfig {
             enabled: false,
             suppress_duplicates: ChronoDuration::seconds(300),
+            cleared_retention: ChronoDuration::seconds(300),
             webhook: None,
         };
         let manager = AlertManager::new(config);
@@ -1020,7 +1299,11 @@ mod tests {
     #[test]
     fn test_all_workers_offline_clears_on_recovery() {
         let _guard = test_guard!();
-        let manager = AlertManager::new(AlertConfig::default());
+        let config = AlertConfig {
+            cleared_retention: ChronoDuration::zero(),
+            ..AlertConfig::default()
+        };
+        let manager = AlertManager::new(config);
 
         manager.handle_all_workers_offline(3, 3); // All offline
         assert_eq!(manager.active_alerts().len(), 1);
@@ -1045,6 +1328,7 @@ mod tests {
         let config = AlertConfig {
             enabled: false,
             suppress_duplicates: ChronoDuration::seconds(300),
+            cleared_retention: ChronoDuration::seconds(300),
             webhook: None,
         };
         let manager = AlertManager::new(config);

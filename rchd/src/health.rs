@@ -399,6 +399,17 @@ impl HealthMonitor {
                         {
                             alert_mgr.handle_circuit_open(&worker_id);
                         }
+
+                        // Circuit breaker closing notification (bd-3ogaz):
+                        // mark the open-alert as cleared so UIs can grey it
+                        // out and auto-evict it after the retention window.
+                        // Without this, a transient circuit-open warning
+                        // persists on `rch status` long after recovery.
+                        if previous_circuit_state == CircuitState::Open
+                            && new_circuit_state != CircuitState::Open
+                        {
+                            alert_mgr.handle_circuit_closed(&worker_id);
+                        }
                     }
 
                     // Record worker status metric

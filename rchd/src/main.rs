@@ -404,9 +404,15 @@ async fn main() -> Result<()> {
             events: w.events.clone(),
         });
 
+    let cleared_retention_secs = rch_config
+        .alerts
+        .cleared_retention_secs
+        .min(i64::MAX as u64) as i64;
+
     let alert_config = alerts::AlertConfig {
         enabled: rch_config.alerts.enabled,
         suppress_duplicates: ChronoDuration::seconds(suppress_secs),
+        cleared_retention: ChronoDuration::seconds(cleared_retention_secs),
         webhook: webhook_config,
     };
     let alert_manager = Arc::new(alerts::AlertManager::new(alert_config));

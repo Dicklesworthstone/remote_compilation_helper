@@ -447,10 +447,23 @@ fn render_full_status_to<W: Write>(
     if !status.alerts.is_empty() {
         writeln!(out, "\n{}", style.format_header("Alerts"))?;
         for alert in &status.alerts {
-            let severity_style = match alert.severity.as_str() {
-                "critical" | "error" => style.error(&alert.severity),
-                "warning" => style.warning(&alert.severity),
-                _ => style.info(&alert.severity),
+            // Cleared-but-still-retained alerts are greyed out so humans don't
+            // overreact to a condition that has already healed (bd-3ogaz).
+            let is_cleared = alert.state == "cleared_pending_clean";
+            let severity_style = if is_cleared {
+                style.muted(&format!("{} (cleared)", alert.severity))
+            } else {
+                match alert.severity.as_str() {
+                    "critical" | "error" => style.error(&alert.severity),
+                    "warning" => style.warning(&alert.severity),
+                    _ => style.info(&alert.severity),
+                }
+            };
+
+            let message = if is_cleared {
+                style.muted(&alert.message).to_string()
+            } else {
+                alert.message.clone()
             };
 
             if let Some(worker_id) = &alert.worker_id {
@@ -459,14 +472,14 @@ fn render_full_status_to<W: Write>(
                     "  {} [{}] {} {}",
                     style.symbols.bullet_filled,
                     severity_style,
-                    alert.message,
+                    message,
                     style.muted(&format!("({worker_id})")),
                 )?;
             } else {
                 writeln!(
                     out,
                     "  {} [{}] {}",
-                    style.symbols.bullet_filled, severity_style, alert.message
+                    style.symbols.bullet_filled, severity_style, message
                 )?;
             }
         }

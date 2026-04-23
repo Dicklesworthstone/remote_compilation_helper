@@ -205,6 +205,24 @@ pub struct AlertInfoFromApi {
     #[serde(default)]
     pub worker_id: Option<String>,
     pub created_at: String,
+    /// First time the alert was raised. `serde(default)` so older daemons
+    /// that don't emit this field still parse.
+    #[serde(default)]
+    pub first_seen: String,
+    /// Last time the underlying condition was observed.
+    #[serde(default)]
+    pub last_seen: String,
+    /// Populated only when the alert is in the `cleared_pending_clean` state.
+    #[serde(default)]
+    pub cleared_at: Option<String>,
+    /// Lifecycle state: `active` or `cleared_pending_clean`. Defaults to
+    /// `active` for compatibility with daemons that don't emit this field.
+    #[serde(default = "default_alert_state_active")]
+    pub state: String,
+}
+
+fn default_alert_state_active() -> String {
+    "active".to_string()
 }
 
 /// Build statistics from API.

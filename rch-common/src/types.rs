@@ -808,6 +808,12 @@ pub struct AlertsConfig {
     /// Suppress duplicate alerts for this many seconds.
     #[serde(default = "default_alert_suppress_duplicates_secs")]
     pub suppress_duplicates_secs: u64,
+    /// How long to keep a cleared alert visible (with state
+    /// `cleared_pending_clean`) before removing it entirely. Prevents
+    /// transient, self-healing circuit-breaker warnings from lingering on
+    /// `rch status` long after the fleet returned to healthy (bd-3ogaz).
+    #[serde(default = "default_alert_cleared_retention_secs")]
+    pub cleared_retention_secs: u64,
     /// Webhook configuration for external notifications.
     #[serde(default)]
     pub webhook: Option<WebhookConfig>,
@@ -845,11 +851,16 @@ fn default_alert_suppress_duplicates_secs() -> u64 {
     300
 }
 
+fn default_alert_cleared_retention_secs() -> u64 {
+    300
+}
+
 impl Default for AlertsConfig {
     fn default() -> Self {
         Self {
             enabled: true,
             suppress_duplicates_secs: default_alert_suppress_duplicates_secs(),
+            cleared_retention_secs: default_alert_cleared_retention_secs(),
             webhook: None,
         }
     }
