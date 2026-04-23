@@ -3,9 +3,9 @@
 //! Uses a PID-based lock file approach that's safe and portable.
 
 use super::types::UpdateError;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Lock to prevent concurrent updates.
 pub struct UpdateLock {
@@ -17,6 +17,12 @@ impl UpdateLock {
     ///
     /// Uses a PID-based lock file. If a lock file exists, checks if the
     /// process is still running before failing.
+    ///
+    /// The create step uses `O_CREAT|O_EXCL` (via `OpenOptions::create_new`)
+    /// so two concurrent acquirers can't both succeed. A previous revision
+    /// used `File::create`, which truncates an existing file — two
+    /// processes racing past a stale-lock sweep could each overwrite the
+    /// other's PID and both believe they held the lock.
     pub fn acquire() -> Result<Self, UpdateError> {
         let path = get_lock_path()?;
 
@@ -27,30 +33,53 @@ impl UpdateLock {
             })?;
         }
 
-        // Check if lock file exists and if the process is still running
-        if path.exists() {
-            if let Ok(mut file) = File::open(&path) {
-                let mut contents = String::new();
-                if file.read_to_string(&mut contents).is_ok()
-                    && let Ok(pid) = contents.trim().parse::<u32>()
-                    && is_process_running(pid)
-                {
-                    return Err(UpdateError::LockHeld);
+        // One-shot stale sweep: if an existing lock points at a dead PID,
+        // reclaim it by comparing the contents we just read and removing
+        // only if they still match.
+        let mut attempted_sweep = false;
+        loop {
+            match exclusive_create(&path) {
+                Ok(mut file) => {
+                    write!(file, "{}", std::process::id()).map_err(|e| {
+                        // Clean up our half-written file so a later sweep
+                        // doesn't see a malformed PID and choke.
+                        let _ = fs::remove_file(&path);
+                        UpdateError::InstallFailed(format!("Failed to write lock file: {}", e))
+                    })?;
+                    file.sync_all().map_err(|e| {
+                        let _ = fs::remove_file(&path);
+                        UpdateError::InstallFailed(format!("Failed to sync lock file: {}", e))
+                    })?;
+                    return Ok(Self { path });
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let existing_pid = read_pid(&path);
+                    let holder_alive = existing_pid.is_some_and(is_process_running);
+                    if holder_alive {
+                        return Err(UpdateError::LockHeld);
+                    }
+                    if attempted_sweep {
+                        // We already tried to sweep once; if the lock is
+                        // still blocking us, another process just grabbed
+                        // it — treat as held.
+                        return Err(UpdateError::LockHeld);
+                    }
+                    attempted_sweep = true;
+                    if !try_sweep_stale(&path, existing_pid) {
+                        // Someone else reclaimed or removed it; loop and
+                        // let the exclusive create race decide.
+                        continue;
+                    }
+                    // Sweep succeeded; loop to retry create.
+                }
+                Err(e) => {
+                    return Err(UpdateError::InstallFailed(format!(
+                        "Failed to create lock file: {}",
+                        e
+                    )));
                 }
             }
-            // Stale lock file, remove it
-            let _ = fs::remove_file(&path);
         }
-
-        // Write our PID to the lock file
-        let mut file = File::create(&path).map_err(|e| {
-            UpdateError::InstallFailed(format!("Failed to create lock file: {}", e))
-        })?;
-
-        write!(file, "{}", std::process::id())
-            .map_err(|e| UpdateError::InstallFailed(format!("Failed to write lock file: {}", e)))?;
-
-        Ok(Self { path })
     }
 
     /// Check if an update is currently in progress.
@@ -85,6 +114,36 @@ fn get_lock_path() -> Result<PathBuf, UpdateError> {
     })?;
 
     Ok(data_dir.join("rch/update.lock"))
+}
+
+/// Open a file with `O_CREAT|O_EXCL` semantics — succeeds only if the file
+/// does not already exist. This is the primitive that makes the acquire
+/// loop race-safe.
+fn exclusive_create(path: &Path) -> std::io::Result<File> {
+    OpenOptions::new().write(true).create_new(true).open(path)
+}
+
+/// Read the PID recorded in the lock file, if any.
+fn read_pid(path: &Path) -> Option<u32> {
+    let mut file = File::open(path).ok()?;
+    let mut contents = String::new();
+    file.read_to_string(&mut contents).ok()?;
+    contents.trim().parse().ok()
+}
+
+/// Remove the lock file ONLY if the PID it contains still matches what we
+/// previously observed. This avoids swiping a lock that a fresh process
+/// just grabbed between our read and our remove.
+fn try_sweep_stale(path: &Path, observed_pid: Option<u32>) -> bool {
+    let current = read_pid(path);
+    if current != observed_pid {
+        return false;
+    }
+    match fs::remove_file(path) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+        Err(_) => false,
+    }
 }
 
 /// Check if a process is still running.
@@ -268,5 +327,76 @@ mod tests {
         {
             assert!(is_process_running(1));
         }
+    }
+
+    #[test]
+    fn test_second_acquire_without_drop_is_rejected() {
+        // Regression: the previous implementation used `File::create`,
+        // which truncates-and-opens rather than create-exclusively. A
+        // subsequent `acquire()` while a lock was still held (identified
+        // by matching PID and `is_process_running(pid) = true`) would
+        // still fail at the read step, but any code path that reached
+        // the `File::create` call would silently overwrite the existing
+        // lock. The current implementation uses `O_CREAT|O_EXCL` so the
+        // second acquire is rejected unambiguously.
+        let _guard = test_lock().lock().unwrap();
+        let path = get_lock_path().unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        let first = UpdateLock::acquire().expect("first acquire");
+        // Our own PID is running, so a second attempt must see
+        // `LockHeld` rather than sweeping and overwriting.
+        match UpdateLock::acquire() {
+            Err(UpdateError::LockHeld) => {}
+            Err(other) => panic!("expected LockHeld, got {:?}", other),
+            Ok(_) => panic!("expected LockHeld, second acquire unexpectedly succeeded"),
+        }
+        drop(first);
+
+        // After drop, a fresh acquire should succeed again.
+        let third = UpdateLock::acquire().expect("re-acquire after drop");
+        drop(third);
+    }
+
+    #[test]
+    fn test_acquire_is_atomic_across_threads() {
+        // Regression: only one of N concurrent acquirers may succeed.
+        // With `File::create`, two threads could both race past a stale
+        // sweep and both overwrite the lock file with their own PID.
+        use std::sync::{Arc, Barrier};
+        let _guard = test_lock().lock().unwrap();
+        let path = get_lock_path().unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        let thread_count = 8usize;
+        let barrier = Arc::new(Barrier::new(thread_count));
+        let mut handles = Vec::with_capacity(thread_count);
+        for _ in 0..thread_count {
+            let b = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                b.wait();
+                UpdateLock::acquire()
+            }));
+        }
+
+        let mut successes = Vec::new();
+        let mut lock_held = 0usize;
+        for h in handles {
+            match h.join().expect("join") {
+                Ok(lock) => successes.push(lock),
+                Err(UpdateError::LockHeld) => lock_held += 1,
+                Err(other) => panic!("unexpected error: {:?}", other),
+            }
+        }
+        assert_eq!(
+            successes.len(),
+            1,
+            "exactly one thread must acquire the lock"
+        );
+        assert_eq!(
+            successes.len() + lock_held,
+            thread_count,
+            "all acquires must resolve to either success or LockHeld"
+        );
     }
 }
