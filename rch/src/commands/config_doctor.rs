@@ -7,7 +7,7 @@ use anyhow::Result;
 use rch_common::RchConfig;
 use schemars::JsonSchema;
 use serde::Serialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::config;
 use crate::ui::context::OutputContext;
@@ -154,50 +154,98 @@ fn check_identity_files(diagnostics: &mut Vec<DoctorDiagnostic>) {
         Err(_) => return, // Skip if workers can't be loaded
     };
 
-    for worker in workers {
-        let identity_path = expand_tilde(&worker.identity_file);
+    // Group workers by (expanded) identity_file so a shared missing key only
+    // produces one diagnostic that names every referencing worker.
+    let mut by_identity: std::collections::BTreeMap<PathBuf, Vec<String>> =
+        std::collections::BTreeMap::new();
 
+    for worker in &workers {
+        let identity_path = match shellexpand::full(&worker.identity_file) {
+            Ok(expanded) => PathBuf::from(expanded.into_owned()),
+            Err(err) => {
+                diagnostics.push(DoctorDiagnostic {
+                    severity: DoctorSeverity::Error,
+                    code: "RCH-E009".to_string(),
+                    message: format!(
+                        "identity_file {:?} for worker '{}' is unresolvable: {}",
+                        worker.identity_file, worker.id, err
+                    ),
+                    detail: None,
+                    remediation: Some(
+                        "Set the referenced environment variable, or replace the reference \
+                        with an absolute path / ~-relative path in workers.toml"
+                            .to_string(),
+                    ),
+                });
+                continue;
+            }
+        };
+        by_identity
+            .entry(identity_path)
+            .or_default()
+            .push(worker.id.as_str().to_string());
+    }
+
+    for (identity_path, worker_ids) in &by_identity {
         if !identity_path.exists() {
+            let referencing = worker_ids.join(", ");
             diagnostics.push(DoctorDiagnostic {
                 severity: DoctorSeverity::Error,
-                code: "DOC-E020".to_string(),
+                code: "RCH-E009".to_string(),
                 message: format!(
-                    "SSH identity file not found for worker '{}': {}",
-                    worker.id, worker.identity_file
+                    "SSH identity file not found: {} (referenced by workers: {})",
+                    identity_path.display(),
+                    referencing
                 ),
                 detail: None,
                 remediation: Some(format!(
                     "Generate key: ssh-keygen -t ed25519 -f {}",
-                    worker.identity_file
+                    identity_path.display()
                 )),
             });
-        } else {
-            // Check permissions (should be 600 or 400)
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                if let Ok(metadata) = identity_path.metadata() {
-                    let mode = metadata.permissions().mode() & 0o777;
-                    if mode != 0o600 && mode != 0o400 {
-                        diagnostics.push(DoctorDiagnostic {
-                            severity: DoctorSeverity::Warning,
-                            code: "DOC-W020".to_string(),
-                            message: format!(
-                                "Identity file has insecure permissions for worker '{}': {:o}",
-                                worker.id, mode
-                            ),
-                            detail: Some(
-                                "SSH may refuse to use keys with permissions too open".to_string(),
-                            ),
-                            remediation: Some(format!(
-                                "Fix permissions: chmod 600 {}",
-                                worker.identity_file
-                            )),
-                        });
-                    }
-                }
-            }
+            continue;
         }
+        check_shared_identity_file_permissions(identity_path, worker_ids, diagnostics);
+    }
+}
+
+/// Emit at most one permissions warning per unique identity_file, listing
+/// every worker that references it. Keeps `rch config doctor` output short
+/// when many workers share a single key.
+fn check_shared_identity_file_permissions(
+    identity_path: &Path,
+    worker_ids: &[String],
+    diagnostics: &mut Vec<DoctorDiagnostic>,
+) {
+    #[cfg(not(unix))]
+    {
+        let _ = (identity_path, worker_ids, diagnostics);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let Ok(metadata) = identity_path.metadata() else {
+            return;
+        };
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode == 0o600 || mode == 0o400 {
+            return;
+        }
+        diagnostics.push(DoctorDiagnostic {
+            severity: DoctorSeverity::Warning,
+            code: "DOC-W020".to_string(),
+            message: format!(
+                "Identity file {} has insecure permissions {:o} (referenced by workers: {})",
+                identity_path.display(),
+                mode,
+                worker_ids.join(", ")
+            ),
+            detail: Some("SSH may refuse to use keys with permissions too open".to_string()),
+            remediation: Some(format!(
+                "Fix permissions: chmod 600 {}",
+                identity_path.display()
+            )),
+        });
     }
 }
 
@@ -437,18 +485,4 @@ fn output_doctor_results(ctx: &OutputContext, diagnostics: Vec<DoctorDiagnostic>
     }
 
     Ok(())
-}
-
-/// Expand ~ to home directory.
-fn expand_tilde(path: &str) -> PathBuf {
-    if let Some(stripped) = path.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(stripped);
-        }
-    } else if path == "~"
-        && let Some(home) = dirs::home_dir()
-    {
-        return home;
-    }
-    PathBuf::from(path)
 }

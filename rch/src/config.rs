@@ -600,6 +600,11 @@ pub fn validate_workers_config_file(path: &Path) -> FileValidation {
 
     let mut seen_ids = HashSet::new();
 
+    // Track workers per missing identity_file so we can emit one aggregated
+    // error at the end listing every affected worker (bd-hke4t).
+    let mut missing_identity_files: std::collections::BTreeMap<PathBuf, Vec<String>> =
+        std::collections::BTreeMap::new();
+
     for (index, worker) in workers.iter().enumerate() {
         let Some(table) = worker.as_table() else {
             validation.error(format!("workers[{}] must be a table", index));
@@ -687,15 +692,36 @@ pub fn validate_workers_config_file(path: &Path) -> FileValidation {
             ));
         }
 
-        let expanded_identity = shellexpand::tilde(identity_value);
-        let identity_path = Path::new(expanded_identity.as_ref());
+        // Expand `~` and `$VAR` / `${VAR}` references so that paths like
+        // `$HOME/.ssh/id_ed25519` are handled. `shellexpand::full` fails if a
+        // referenced env var is not set, which we surface as a config error.
+        let identity_path = match shellexpand::full(identity_value) {
+            Ok(expanded) => PathBuf::from(expanded.into_owned()),
+            Err(err) => {
+                validation.error(format!(
+                    "[RCH-E009] workers[{}] {} identity_file is unresolvable ({:?}): {}",
+                    index,
+                    if id.is_empty() { "(unknown id)" } else { &id },
+                    identity_value,
+                    err
+                ));
+                continue;
+            }
+        };
+
         if !identity_path.exists() {
-            validation.warn(format!(
-                "workers[{}] {} identity_file not found: {}",
-                index,
-                if id.is_empty() { "(unknown id)" } else { &id },
-                identity_path.display()
-            ));
+            // Defer the error to the post-loop aggregation pass so that
+            // multiple workers referencing the same missing key produce one
+            // combined message rather than N copies.
+            let worker_label = if id.is_empty() {
+                format!("workers[{}]", index)
+            } else {
+                id.clone()
+            };
+            missing_identity_files
+                .entry(identity_path.clone())
+                .or_default()
+                .push(worker_label);
         } else {
             // SSH key exists - validate permissions (bd-1g3l)
             validation.validate_ssh_key_permissions(
@@ -704,7 +730,7 @@ pub fn validate_workers_config_file(path: &Path) -> FileValidation {
                     index,
                     if id.is_empty() { "(unknown id)" } else { &id }
                 ),
-                identity_path,
+                &identity_path,
             );
         }
 
@@ -731,6 +757,20 @@ pub fn validate_workers_config_file(path: &Path) -> FileValidation {
                 if id.is_empty() { "(unknown id)" } else { &id }
             ));
         }
+    }
+
+    // Emit one missing-identity_file error per unique path, listing every
+    // worker that references it. Aggregation is cleaner for the common case
+    // where several workers share one typo'd path, and still produces a
+    // specific message for the single-worker case.
+    for (path, worker_labels) in &missing_identity_files {
+        validation.error(format!(
+            "[RCH-E009] identity_file {} is missing; referenced by workers: {}. \
+             Generate a key with `ssh-keygen -t ed25519 -f {}` or update workers.toml.",
+            path.display(),
+            worker_labels.join(", "),
+            path.display()
+        ));
     }
 
     validation
@@ -2099,9 +2139,85 @@ total_slots = 4
         std::io::Write::write_all(file.as_file_mut(), workers_toml.as_bytes())
             .expect("write workers config");
         let result = validate_workers_config_file(file.path());
-        info!("RESULT: warnings={:?}", result.warnings);
-        assert!(result.warnings.iter().any(|e| e.contains("identity_file")));
+        info!("RESULT: errors={:?}", result.errors);
+        // A missing identity_file is now a hard error (RCH-E009) so that
+        // `rch config validate` fails before the first probe is attempted.
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.contains("identity_file") && e.contains("RCH-E009"))
+        );
         info!("TEST PASS: test_validate_file_path_exists");
+    }
+
+    #[test]
+    fn test_validate_shared_missing_identity_aggregated() {
+        let _guard = test_guard!();
+        let mut file = NamedTempFile::new().expect("create temp file");
+        // Two workers referencing the same missing key should produce an
+        // aggregated "referenced by workers: a, b" summary line.
+        let workers_toml = r#"
+[[workers]]
+id = "a"
+host = "10.0.0.1"
+user = "ubuntu"
+identity_file = "/definitely/missing/key"
+total_slots = 1
+
+[[workers]]
+id = "b"
+host = "10.0.0.2"
+user = "ubuntu"
+identity_file = "/definitely/missing/key"
+total_slots = 1
+"#;
+        std::io::Write::write_all(file.as_file_mut(), workers_toml.as_bytes())
+            .expect("write workers config");
+        let result = validate_workers_config_file(file.path());
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.contains("referenced by workers") && e.contains("a, b")),
+            "expected aggregated error, got errors={:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn test_validate_identity_file_env_var_unresolvable() {
+        let _guard = test_guard!();
+        // An unset env var in identity_file should be reported as RCH-E009
+        // rather than silently expanding. Use a nonce name that is
+        // overwhelmingly unlikely to already be set in the environment.
+        let nonce_var = "RCH_UNRESOLVED_KEY_VAR_81a3c972f4";
+        if std::env::var_os(nonce_var).is_some() {
+            // Skip if the nonce collision actually happens.
+            return;
+        }
+        let mut file = NamedTempFile::new().expect("create temp file");
+        let workers_toml = format!(
+            r#"
+[[workers]]
+id = "unresolved"
+host = "10.0.0.1"
+user = "ubuntu"
+identity_file = "${nonce_var}/id_ed25519"
+total_slots = 1
+"#
+        );
+        std::io::Write::write_all(file.as_file_mut(), workers_toml.as_bytes())
+            .expect("write workers config");
+        let result = validate_workers_config_file(file.path());
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.contains("unresolvable") && e.contains("RCH-E009")),
+            "expected unresolvable error, got errors={:?}",
+            result.errors
+        );
     }
 
     #[test]

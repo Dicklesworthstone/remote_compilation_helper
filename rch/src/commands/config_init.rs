@@ -267,7 +267,9 @@ exclude_patterns = [
         }
     }
 
-    // Write example workers.toml
+    // Write example workers.toml. Note: `identity_file` defaults to
+    // `~/.ssh/id_rsa`; if that file doesn't exist, `rch config validate`
+    // will flag RCH-E009. Run `rch workers init` once you have real workers.
     if !workers_path.exists() {
         let workers_content = r###"# RCH Workers Configuration
 # Define your remote compilation workers here
