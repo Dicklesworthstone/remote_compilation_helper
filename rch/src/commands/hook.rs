@@ -426,11 +426,19 @@ pub async fn hook_test(ctx: &OutputContext) -> Result<()> {
     // Find the rch binary
     let rch_path = std::env::current_exe()?;
 
-    // Spawn rch in hook mode (no arguments = hook mode)
+    // Spawn rch in hook mode (no arguments = hook mode).
+    //
+    // `kill_on_drop` is essential here because the call below wraps
+    // `child.wait_with_output()` in `tokio::time::timeout(30s, ...)`. On
+    // timeout, the future is dropped — without this flag the child rch
+    // process keeps running detached, which for a hook test means leaking
+    // a process that may also have taken its own slot reservation on the
+    // daemon. Force a SIGKILL when the future drops.
     let mut child = Command::new(&rch_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .kill_on_drop(true)
         .spawn()
         .context("Failed to spawn rch in hook mode")?;
 

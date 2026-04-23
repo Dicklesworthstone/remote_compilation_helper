@@ -561,6 +561,11 @@ impl CancellationOrchestrator {
 
         let remote_kill_script =
             build_remote_kill_script(record.remote_pgid_file.as_deref(), record.build_id);
+        // `tokio::time::timeout(..., cmd.output())` drops the spawned ssh
+        // future when it fires. Without `kill_on_drop`, the local ssh
+        // process stays alive holding a socket until its own keepalive
+        // gives up — at exactly the moment we're trying to clean up after
+        // a stuck build. Force a SIGKILL on cancellation.
         let ssh_result = tokio::time::timeout(
             self.config.remote_kill_timeout,
             tokio::process::Command::new("ssh")
@@ -576,6 +581,7 @@ impl CancellationOrchestrator {
                     &format!("{}@{}", user, host),
                     &remote_kill_script,
                 ])
+                .kill_on_drop(true)
                 .output(),
         )
         .await;

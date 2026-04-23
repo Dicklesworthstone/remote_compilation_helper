@@ -906,6 +906,12 @@ async fn execute_benchmark_on_worker(
     cmd.arg("~/.local/bin/rch-wkr benchmark --json");
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
+    // Defense in depth: if the surrounding task is dropped mid-flight (e.g.
+    // a panic, scheduler shutdown, or a parent select! losing the race),
+    // the spawned ssh process should not outlive us. The explicit
+    // `child.kill().await` calls below cover the timeout/IO error paths;
+    // `kill_on_drop` covers the panic-unwind/cancellation paths.
+    cmd.kill_on_drop(true);
 
     debug!(
         worker_id = %worker.id,

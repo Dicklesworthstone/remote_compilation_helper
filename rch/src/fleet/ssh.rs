@@ -260,6 +260,12 @@ impl<'a> SshExecutor<'a> {
             .arg(format!("ConnectTimeout={}", self.connect_timeout.as_secs()));
         cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
         cmd.arg("-i").arg(&self.worker.identity_file);
+        // All callers wrap `cmd.output()` in `tokio::time::timeout`. On
+        // timeout the future is dropped; without this flag the spawned
+        // ssh process keeps running and holding the network socket open
+        // until SSH's own keepalive eventually gives up. Set kill_on_drop
+        // so the local ssh process is SIGKILLed promptly on cancellation.
+        cmd.kill_on_drop(true);
     }
 
     /// Build common SCP command arguments.
@@ -269,6 +275,9 @@ impl<'a> SshExecutor<'a> {
             .arg(format!("ConnectTimeout={}", self.scp_timeout.as_secs()));
         cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
         cmd.arg("-i").arg(&self.worker.identity_file);
+        // Same rationale as `build_ssh_args`: avoid leaking scp processes
+        // when a timeout fires.
+        cmd.kill_on_drop(true);
     }
 
     // =========================================================================

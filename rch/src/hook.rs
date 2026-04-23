@@ -2734,14 +2734,63 @@ async fn run_worker_ssh_command(
         timeout_duration.as_secs().max(1)
     ));
     cmd.arg("-i").arg(identity_file.as_ref());
-    cmd.arg(destination);
+    cmd.arg(&destination);
     cmd.arg(build_remote_shell_command(remote_cmd));
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
-    let output = timeout(timeout_duration, cmd.output())
-        .await
-        .map_err(|_| anyhow::anyhow!("SSH command timed out after {:?}", timeout_duration))??;
-    Ok(output)
+    // Spawn manually instead of `cmd.output()` so the local SSH process is
+    // killed if our outer timeout fires. `tokio::time::timeout` only drops
+    // the future; without `kill_on_drop`, the spawned ssh process keeps
+    // running, holding the network socket open until SSH's own keepalive
+    // gives up. For a busy hook this leaks fds and ssh processes — exactly
+    // the kind of slow accumulation that turns into a daemon-restart bug
+    // weeks later.
+    cmd.kill_on_drop(true);
+
+    use anyhow::Context as _;
+    use tokio::io::AsyncReadExt as _;
+
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("Failed to spawn ssh to {}", destination))?;
+
+    // Drain stdout/stderr concurrently with the wait so that even verbose
+    // remote output never deadlocks the child on a full pipe buffer.
+    let mut stdout_pipe = child.stdout.take();
+    let mut stderr_pipe = child.stderr.take();
+    let collect = async {
+        let stdout_fut = async {
+            let mut buf = Vec::new();
+            if let Some(p) = stdout_pipe.as_mut() {
+                p.read_to_end(&mut buf).await?;
+            }
+            Ok::<_, std::io::Error>(buf)
+        };
+        let stderr_fut = async {
+            let mut buf = Vec::new();
+            if let Some(p) = stderr_pipe.as_mut() {
+                p.read_to_end(&mut buf).await?;
+            }
+            Ok::<_, std::io::Error>(buf)
+        };
+        let (stdout_bytes, stderr_bytes) = tokio::try_join!(stdout_fut, stderr_fut)?;
+        let status = child.wait().await?;
+        Ok::<_, std::io::Error>(Output {
+            status,
+            stdout: stdout_bytes,
+            stderr: stderr_bytes,
+        })
+    };
+
+    match timeout(timeout_duration, collect).await {
+        Ok(result) => result.context("Failed to collect ssh output"),
+        Err(_) => {
+            // collect future is dropped here; with kill_on_drop=true the
+            // local ssh process is SIGKILLed when `child` (still owned by
+            // the dropped future) is dropped.
+            anyhow::bail!("SSH command timed out after {:?}", timeout_duration);
+        }
+    }
 }
 
 fn build_remote_shell_command(remote_cmd: &str) -> String {
