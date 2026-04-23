@@ -7,11 +7,14 @@ mod audit;
 mod dry_run;
 mod executor;
 mod history;
+mod lock;
 mod plan;
 mod preflight;
 mod progress;
 mod rollback;
 pub mod ssh;
+
+pub use lock::{FleetLockGuard, RCH_FLEET_WAIT_SECS_ENV};
 
 use crate::commands::load_workers_from_config;
 use crate::config::load_config;
@@ -167,10 +170,30 @@ pub async fn deploy(
 
     // Handle dry run
     if dry_run {
+        // Dry-run is read-only; skip the cooperative lock so it can be
+        // exercised while another agent holds a deploy.
         let dry_run_result = dry_run::compute_dry_run(&plan, ctx).await?;
         dry_run::display_dry_run(&dry_run_result, ctx, "fleet deploy")?;
         return Ok(());
     }
+
+    // Per-fleet cooperative lock — prevents two concurrent deploys from
+    // racing on worker state (bd-5z2wa). Held for the rest of this function
+    // via RAII; drop removes the file.
+    let _fleet_lock = match lock::acquire("fleet-deploy") {
+        Ok(guard) => guard,
+        Err(err) => {
+            if ctx.is_json() {
+                let _ = ctx.json(&ApiResponse::<()>::err(
+                    "fleet deploy",
+                    ApiError::new(ErrorCode::InternalStateError, err.to_string()),
+                ));
+            } else {
+                println!("{} {}", StatusIndicator::Error.display(style), err);
+            }
+            return Ok(());
+        }
+    };
 
     // Prompt for confirmation unless skipped or in JSON mode
     if !skip_confirm && !ctx.is_json() {
@@ -357,6 +380,23 @@ pub async fn rollback(
         }
         return Ok(());
     }
+
+    // Per-fleet cooperative lock — shared across deploy/rollback/drain so a
+    // rollback cannot race with an in-progress deploy (bd-5z2wa).
+    let _fleet_lock = match lock::acquire("fleet-rollback") {
+        Ok(guard) => guard,
+        Err(err) => {
+            if ctx.is_json() {
+                let _ = ctx.json(&ApiResponse::<()>::err(
+                    "fleet rollback",
+                    ApiError::new(ErrorCode::InternalStateError, err.to_string()),
+                ));
+            } else {
+                println!("{} {}", StatusIndicator::Error.display(style), err);
+            }
+            return Ok(());
+        }
+    };
 
     // Prompt for confirmation unless skipped or in JSON mode
     if !skip_confirm && !ctx.is_json() {
@@ -670,6 +710,23 @@ pub async fn drain(
         );
         println!();
     }
+
+    // Per-fleet cooperative lock — drain mutates routing state so concurrent
+    // drains would race (bd-5z2wa).
+    let _fleet_lock = match lock::acquire("fleet-drain") {
+        Ok(guard) => guard,
+        Err(err) => {
+            if ctx.is_json() {
+                let _ = ctx.json(&ApiResponse::<()>::err(
+                    "fleet drain",
+                    ApiError::new(ErrorCode::InternalStateError, err.to_string()),
+                ));
+            } else {
+                println!("{} {}", StatusIndicator::Error.display(style), err);
+            }
+            return Ok(());
+        }
+    };
 
     // Prompt for confirmation unless skipped or in JSON mode
     if !skip_confirm && !ctx.is_json() {
