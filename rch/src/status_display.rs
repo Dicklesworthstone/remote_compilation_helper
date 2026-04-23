@@ -804,7 +804,10 @@ fn render_circuit_details_to<W: Write>(
     // Show last error if available
     if let Some(ref error) = worker.last_error {
         let error_truncated = if error.len() > 60 {
-            format!("{}...", &error[..57])
+            format!(
+                "{}...",
+                rch_common::util::truncate_at_char_boundary(error, 57)
+            )
         } else {
             error.clone()
         };
@@ -842,7 +845,10 @@ fn render_builds_section_to<W: Write>(
     } else {
         for build in &status.active_builds {
             let cmd_display = if build.command.len() > 50 {
-                format!("{}...", &build.command[..47])
+                format!(
+                    "{}...",
+                    rch_common::util::truncate_at_char_boundary(&build.command, 47)
+                )
             } else {
                 build.command.clone()
             };
@@ -941,7 +947,10 @@ fn render_builds_section_to<W: Write>(
                 style.muted(&build.location)
             };
             let cmd_display = if build.command.len() > 40 {
-                format!("{}...", &build.command[..37])
+                format!(
+                    "{}...",
+                    rch_common::util::truncate_at_char_boundary(&build.command, 37)
+                )
             } else {
                 build.command.clone()
             };

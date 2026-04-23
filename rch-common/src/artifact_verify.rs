@@ -87,12 +87,12 @@ impl VerificationResult {
             msg.push_str(&format!("  {} - HASH MISMATCH\n", failure.path));
             msg.push_str(&format!(
                 "    Expected: {} ({} bytes)\n",
-                &failure.expected_hash[..16],
+                short_hash(&failure.expected_hash),
                 failure.expected_size
             ));
             msg.push_str(&format!(
                 "    Actual:   {} ({} bytes)\n",
-                &failure.actual_hash[..16],
+                short_hash(&failure.actual_hash),
                 failure.actual_size
             ));
         }
@@ -156,6 +156,17 @@ pub fn compute_file_hash(path: &Path) -> std::io::Result<FileHash> {
     let hash = hasher.finalize().to_hex().to_string();
 
     Ok(FileHash { hash, size })
+}
+
+/// Safely truncate a hash for display, tolerating short or non-ASCII strings
+/// that could arrive from an attacker-controlled manifest.
+///
+/// Byte-indexed slicing (`&s[..16]`) panics when the string is shorter than
+/// 16 bytes or when byte 16 falls mid-codepoint. Display paths must never
+/// panic on manifest input — a malicious worker could otherwise crash the
+/// hook just by sending `{ "hash": "ab" }`.
+fn short_hash(hash: &str) -> String {
+    hash.chars().take(16).collect()
 }
 
 /// Check if a path is safe for artifact verification (relative, no parent traversal).
@@ -239,9 +250,9 @@ pub fn verify_artifacts(
                     warn!(
                         "Verification failed for {}: expected {} ({} bytes), got {} ({} bytes)",
                         rel_path,
-                        &expected.hash[..16],
+                        short_hash(&expected.hash),
                         expected.size,
-                        &actual.hash[..16],
+                        short_hash(&actual.hash),
                         actual.size
                     );
                     result.failed.push(VerificationFailure::new(
@@ -315,6 +326,38 @@ mod tests {
             .with_test_writer()
             .with_max_level(tracing::Level::DEBUG)
             .try_init();
+    }
+
+    #[test]
+    fn test_short_hash_tolerates_short_and_non_ascii() {
+        // Regression: `&hash[..16]` used to panic when the manifest-supplied
+        // hash was shorter than 16 bytes or crossed a UTF-8 boundary. A
+        // hostile worker must not be able to crash the hook via a crafted
+        // manifest, so display formatting truncates by chars instead.
+        assert_eq!(short_hash(""), "");
+        assert_eq!(short_hash("ab"), "ab");
+        assert_eq!(
+            short_hash("0123456789abcdef0123456789abcdef"),
+            "0123456789abcdef"
+        );
+        // Multi-byte codepoints: "é" is 2 bytes; mixing with shorter count
+        // must not panic and must yield exactly 16 chars.
+        let multi = "é".repeat(20);
+        assert_eq!(short_hash(&multi).chars().count(), 16);
+    }
+
+    #[test]
+    fn test_format_failures_tolerates_short_hashes() {
+        let result = VerificationResult {
+            passed: vec![],
+            failed: vec![VerificationFailure::new("foo", "ab", "cd", 1, 1)],
+            skipped: vec![],
+        };
+        // Must not panic.
+        let msg = result.format_failures();
+        assert!(msg.contains("foo"));
+        assert!(msg.contains("ab"));
+        assert!(msg.contains("cd"));
     }
 
     #[test]

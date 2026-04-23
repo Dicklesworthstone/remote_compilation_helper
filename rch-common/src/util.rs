@@ -1,5 +1,23 @@
 //! Shared utilities for RCH.
 
+/// Truncate a string to at most `max_bytes` bytes, snapping back to the nearest
+/// UTF-8 character boundary.
+///
+/// `&s[..n]` panics if byte `n` falls mid-codepoint. Every display path that
+/// truncates user- or worker-supplied strings must snap to a char boundary
+/// first — otherwise a rogue command like `café build` at exactly the wrong
+/// length will crash the whole hook.
+pub fn truncate_at_char_boundary(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
+
 fn find_value_end(s: &str) -> usize {
     let chars = s.chars();
     let mut end = 0;
@@ -148,5 +166,38 @@ mod tests {
         assert_eq!(masked, "cargo run TOKEN=*** --other");
         assert!(!masked.contains("super"));
         assert!(!masked.contains("secret"));
+    }
+
+    #[test]
+    fn test_truncate_at_char_boundary_short_string_unchanged() {
+        assert_eq!(truncate_at_char_boundary("abc", 10), "abc");
+        assert_eq!(truncate_at_char_boundary("", 10), "");
+        assert_eq!(truncate_at_char_boundary("exactly10!", 10), "exactly10!");
+    }
+
+    #[test]
+    fn test_truncate_at_char_boundary_ascii() {
+        assert_eq!(truncate_at_char_boundary("hello world", 5), "hello");
+        assert_eq!(truncate_at_char_boundary("abcdef", 3), "abc");
+    }
+
+    #[test]
+    fn test_truncate_at_char_boundary_snaps_back_from_mid_codepoint() {
+        // "é" is 2 bytes in UTF-8 (0xC3 0xA9). Requesting len=1 would land
+        // mid-codepoint; the helper must snap back to 0 rather than panic.
+        assert_eq!(truncate_at_char_boundary("é", 1), "");
+        // Requesting a boundary past the last codepoint returns the string.
+        assert_eq!(truncate_at_char_boundary("é", 2), "é");
+        // Mixed ASCII/multi-byte: "café" is 5 bytes. At len=4 we're between
+        // "caf" and "é" — safe. At len=3 we're at "caf". At len=2 we're "ca".
+        assert_eq!(truncate_at_char_boundary("café", 4), "caf");
+        assert_eq!(truncate_at_char_boundary("café", 3), "caf");
+        assert_eq!(truncate_at_char_boundary("café", 5), "café");
+    }
+
+    #[test]
+    fn test_truncate_at_char_boundary_never_panics_on_len_zero() {
+        assert_eq!(truncate_at_char_boundary("hello", 0), "");
+        assert_eq!(truncate_at_char_boundary("é", 0), "");
     }
 }

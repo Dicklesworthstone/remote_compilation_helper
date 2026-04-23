@@ -1762,12 +1762,18 @@ pub fn config_diff(ctx: &OutputContext) -> Result<()> {
         for entry in &entries {
             // Truncate long values
             let current = if entry.current.len() > 18 {
-                format!("{}...", &entry.current[..15])
+                format!(
+                    "{}...",
+                    rch_common::util::truncate_at_char_boundary(&entry.current, 15)
+                )
             } else {
                 entry.current.clone()
             };
             let default = if entry.default.len() > 18 {
-                format!("{}...", &entry.default[..15])
+                format!(
+                    "{}...",
+                    rch_common::util::truncate_at_char_boundary(&entry.default, 15)
+                )
             } else {
                 entry.default.clone()
             };

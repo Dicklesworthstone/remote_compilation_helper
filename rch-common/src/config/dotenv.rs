@@ -66,9 +66,11 @@ fn parse_env_file(path: &Path) -> Result<Vec<(String, String)>> {
             let key = key.trim().to_string();
             let value = value.trim();
 
-            // Handle quoted values
-            let value = if (value.starts_with('"') && value.ends_with('"'))
-                || (value.starts_with('\'') && value.ends_with('\''))
+            // Handle quoted values. Require at least two chars so that a stray
+            // lone quote like `KEY="` or `KEY='` does not panic when slicing.
+            let value = if value.len() >= 2
+                && ((value.starts_with('"') && value.ends_with('"'))
+                    || (value.starts_with('\'') && value.ends_with('\'')))
             {
                 value[1..value.len() - 1].to_string()
             } else {
@@ -152,6 +154,24 @@ mod tests {
         assert_eq!(vars.len(), 2);
         assert_eq!(vars[0], ("DOUBLE".to_string(), "hello world".to_string()));
         assert_eq!(vars[1], ("SINGLE".to_string(), "single quoted".to_string()));
+    }
+
+    #[test]
+    fn test_parse_env_file_lone_quote_does_not_panic() {
+        // Regression: `KEY="` previously panicked with a reversed slice range
+        // (value[1..0]) because both starts_with and ends_with were true on
+        // a single-char value. A malformed .env file must not crash the app.
+        let tmp = TempDir::new().unwrap();
+        let env_file = tmp.path().join(".env");
+        fs::write(&env_file, "LONE_DOUBLE=\"\nLONE_SINGLE='\nEMPTY=").unwrap();
+
+        let vars = parse_env_file(&env_file).unwrap();
+        assert_eq!(vars.len(), 3);
+        // A lone quote is treated as a literal value (it is not a well-formed
+        // quoted pair), so it is passed through the inline-comment stripper.
+        assert_eq!(vars[0], ("LONE_DOUBLE".to_string(), "\"".to_string()));
+        assert_eq!(vars[1], ("LONE_SINGLE".to_string(), "'".to_string()));
+        assert_eq!(vars[2], ("EMPTY".to_string(), String::new()));
     }
 
     #[test]

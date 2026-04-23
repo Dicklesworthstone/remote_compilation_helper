@@ -111,7 +111,10 @@ pub async fn queue_status(watch: bool, follow: bool, ctx: &OutputContext) -> Res
 
                 // Truncate command for display
                 let cmd_display = if build.command.len() > 50 {
-                    format!("{}...", &build.command[..47])
+                    format!(
+                        "{}...",
+                        rch_common::util::truncate_at_char_boundary(&build.command, 47)
+                    )
                 } else {
                     build.command.clone()
                 };
@@ -167,7 +170,10 @@ pub async fn queue_status(watch: bool, follow: bool, ctx: &OutputContext) -> Res
             for build in &status.queued_builds {
                 // Truncate command for display
                 let cmd_display = if build.command.len() > 50 {
-                    format!("{}...", &build.command[..47])
+                    format!(
+                        "{}...",
+                        rch_common::util::truncate_at_char_boundary(&build.command, 47)
+                    )
                 } else {
                     build.command.clone()
                 };
