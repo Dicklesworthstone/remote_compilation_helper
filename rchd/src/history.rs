@@ -336,7 +336,15 @@ impl BuildHistory {
             state.heartbeat_counter = state.heartbeat_counter.max(counter);
         }
         if let Some(percent) = heartbeat.progress_percent {
-            state.heartbeat_percent = Some(percent.clamp(0.0, 100.0));
+            // `f64::clamp` returns NaN when given NaN — so a worker sending
+            // `NaN` would poison the heartbeat state, making every
+            // subsequent percent comparison `false` (NaN never compares >)
+            // and leaving status displays to render "NaN%". Drop invalid
+            // values silently; a progress report with no number is better
+            // than a stuck progress bar for the rest of the build.
+            if percent.is_finite() {
+                state.heartbeat_percent = Some(percent.clamp(0.0, 100.0));
+            }
         }
         state.heartbeat_count = state.heartbeat_count.saturating_add(1);
         state.last_heartbeat_at = now_rfc3339.clone();
@@ -885,6 +893,18 @@ impl BuildHistory {
     }
 
     /// Persist a single record to the JSONL file (append mode).
+    ///
+    /// Each completed build spawns its own task that calls this function,
+    /// so multiple concurrent writers are normal. We rely on POSIX
+    /// `O_APPEND` to serialize writes at the end of the file — but that
+    /// guarantee only holds for a single `write()` syscall. The previous
+    /// implementation split the record into two writes (JSON bytes, then
+    /// `\n`) and two racing writers could produce
+    /// `{record_a}{record_b}\n\n` instead of `{record_a}\n{record_b}\n`,
+    /// corrupting the JSONL stream and breaking history recovery on
+    /// daemon restart. Assemble the whole line in one buffer so a single
+    /// `write_all` (which for <PIPE_BUF-sized payloads is a single
+    /// syscall on Linux) keeps each line intact under concurrent append.
     async fn persist_record_async(path: &Path, record: &BuildRecord) -> std::io::Result<()> {
         let mut file = AsyncOpenOptions::new()
             .create(true)
@@ -892,9 +912,9 @@ impl BuildHistory {
             .open(path)
             .await?;
 
-        let json = serde_json::to_string(record)?;
-        file.write_all(json.as_bytes()).await?;
-        file.write_all(b"\n").await?;
+        let mut line = serde_json::to_vec(record)?;
+        line.push(b'\n');
+        file.write_all(&line).await?;
         file.flush().await?;
         Ok(())
     }

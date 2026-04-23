@@ -233,9 +233,14 @@ async fn persist_entry_async(path: &Path, entry: &SelfTestHistoryEntry) -> std::
         .append(true)
         .open(path)
         .await?;
-    let json = serde_json::to_string(entry)?;
-    file.write_all(json.as_bytes()).await?;
-    file.write_all(b"\n").await?;
+    // Concatenate JSON + newline into a single buffer so one `write_all`
+    // can land atomically on the tail of an O_APPEND file. Two writes
+    // (json, then `\n`) from concurrent callers can interleave and
+    // produce `{a}{b}\n\n` — a corrupt JSONL stream that breaks the
+    // history replay on the next daemon start.
+    let mut line = serde_json::to_vec(entry)?;
+    line.push(b'\n');
+    file.write_all(&line).await?;
     file.flush().await?;
     Ok(())
 }

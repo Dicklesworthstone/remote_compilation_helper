@@ -85,8 +85,19 @@ impl HistoryManager {
             .append(true)
             .open(&history_file)?;
 
+        // Fleet deployments run workers in parallel via tokio::spawn, so
+        // multiple threads hit this function simultaneously. `writeln!` on
+        // `std::fs::File` compiles to *two* `write_all` calls (JSON bytes,
+        // then `\n`). Even with O_APPEND — which only makes a single
+        // `write()` syscall atomic at EOF — those two writes can
+        // interleave between threads and produce `{a}{b}\n\n`, which
+        // invalidates the JSONL stream that `get_history` reads back.
+        // Build one buffer and hand it to a single `write_all` so each
+        // line lands intact (typical entry is well under PIPE_BUF).
         use std::io::Write;
-        writeln!(file, "{}", serde_json::to_string(entry)?)?;
+        let mut line = serde_json::to_vec(entry)?;
+        line.push(b'\n');
+        file.write_all(&line)?;
 
         Ok(())
     }
