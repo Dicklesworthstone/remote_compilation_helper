@@ -607,7 +607,7 @@ pub fn calculate_latency_stats(samples: &[f64]) -> (f64, f64) {
     // `sorted[len / 2]` — the *upper* middle — which biased the median
     // of every even-length sample set.
     let n = sorted.len();
-    let median = if n % 2 == 0 {
+    let median = if n.is_multiple_of(2) {
         (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
     } else {
         sorted[n / 2]

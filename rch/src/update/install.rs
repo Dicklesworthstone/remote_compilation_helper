@@ -202,28 +202,20 @@ fn get_backup_dir(version: &str) -> Result<PathBuf, UpdateError> {
 }
 
 /// Find the latest backup.
+///
+/// Previously sorted directory entries by filename, which made `v1.0.10-...`
+/// appear *older* than `v1.0.9-...` (lexicographic `0` < `9`). Worse, any
+/// version with ten or more digits in any segment would land in the wrong
+/// bucket entirely. We now delegate to `list_backups`, which reads each
+/// backup's `backup.json` metadata and sorts by the recorded creation time,
+/// so "latest" really means "most recently created" regardless of version
+/// formatting.
 fn find_latest_backup() -> Result<PathBuf, UpdateError> {
-    let data_dir = dirs::data_dir().ok_or_else(|| {
-        UpdateError::InstallFailed("Could not determine data directory".to_string())
-    })?;
-
-    let backup_base = data_dir.join("rch/backups");
-
-    if !backup_base.exists() {
-        return Err(UpdateError::NoBackupAvailable);
-    }
-
-    let mut backups: Vec<_> = std::fs::read_dir(&backup_base)
-        .map_err(|e| UpdateError::InstallFailed(format!("Failed to read backup dir: {}", e)))?
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().map(|ft| ft.is_dir()).unwrap_or(false))
-        .collect();
-
-    backups.sort_by_key(|e| e.file_name());
-
+    let backups = list_backups()?;
     backups
-        .last()
-        .map(|e| e.path())
+        .into_iter()
+        .next()
+        .map(|b| b.backup_path)
         .ok_or(UpdateError::NoBackupAvailable)
 }
 

@@ -639,6 +639,18 @@ async fn run_benchmark(format: OutputFormat) -> Result<()> {
     let temp_dir = std::env::temp_dir().join(format!("rch-benchmark-{}", timestamp));
     std::fs::create_dir_all(&temp_dir)?;
 
+    // RAII guard: any early return via `?` below (write failures, spawn
+    // failures) would previously skip the trailing `remove_dir_all` and
+    // leak the temp build tree. Benchmarks run on every worker selection
+    // round, so that leak compounds over a long-running daemon.
+    struct DirGuard(std::path::PathBuf);
+    impl Drop for DirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _cleanup = DirGuard(temp_dir.clone());
+
     // Write a simple Rust project
     let cargo_toml = r#"
 [package]
@@ -689,9 +701,6 @@ fn main() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
-
-    // Cleanup
-    let _ = std::fs::remove_dir_all(&temp_dir);
 
     Ok(())
 }

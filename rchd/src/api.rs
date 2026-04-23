@@ -2782,7 +2782,11 @@ async fn handle_status(ctx: &DaemonContext) -> Result<DaemonFullStatus> {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let start = now - uptime_secs;
+        // `saturating_sub` guards against a wall-clock jump backward (NTP
+        // step) that would make `uptime_secs > now`. Plain subtraction
+        // panics in debug and wraps in release, turning a harmless
+        // displayed start time into a crash or a nonsensical date.
+        let start = now.saturating_sub(uptime_secs);
         // Format as ISO 8601
         let dt = chrono::DateTime::from_timestamp(start as i64, 0).unwrap_or_else(chrono::Utc::now);
         dt.to_rfc3339()
