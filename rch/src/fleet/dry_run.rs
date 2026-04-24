@@ -135,14 +135,23 @@ fn estimate_total_duration(predictions: &[WorkerPrediction], strategy: &Deployme
         .unwrap_or(0);
     match strategy {
         DeploymentStrategy::AllAtOnce { parallelism } => {
-            active.len().div_ceil(*parallelism) as u64 * max_time
+            // `div_ceil` panics on a 0 divisor. The executor always clamps
+            // parallelism to at least 1 at runtime (`parallelism.max(1)` in
+            // `deploy_batch`), but dry-run reads the strategy straight from
+            // user config/JSON and would crash if someone set
+            // `parallelism: 0`. Mirror the executor's clamp so estimation
+            // agrees with the real deployment path.
+            let par = (*parallelism).max(1);
+            active.len().div_ceil(par) as u64 * max_time
         }
         DeploymentStrategy::Canary { wait_secs, .. } => max_time + wait_secs + max_time,
         DeploymentStrategy::Rolling {
             batch_size,
             wait_between,
         } => {
-            let batches = active.len().div_ceil(*batch_size);
+            // Same 0-divisor guard as AllAtOnce above.
+            let bs = (*batch_size).max(1);
+            let batches = active.len().div_ceil(bs);
             batches as u64 * max_time + (batches.saturating_sub(1) as u64) * wait_between
         }
     }

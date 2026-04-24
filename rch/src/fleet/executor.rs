@@ -241,6 +241,13 @@ impl FleetExecutor {
                 batch_size,
                 wait_between,
             } => {
+                // Clamp batch_size to at least 1. A 0 here would make
+                // `end = start + 0 = start`, so `start = end` wouldn't
+                // advance and the loop would spin forever. The strategy
+                // value comes from user config/JSON, so we must not trust
+                // it — mirror the `parallelism.max(1)` clamp used inside
+                // `deploy_batch` and by dry-run's estimator.
+                let batch_size = batch_size.max(1);
                 let mut start = 0;
                 let mut batch_num = 0;
 
