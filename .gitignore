@@ -1,6 +1,8 @@
 # bv (beads viewer) local config and caches
 .bv/
 .beads/.bv.lock
+.beads/*.lock
+.beads/last-touched
 
 # Build artifacts
 /target/
