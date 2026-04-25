@@ -276,6 +276,20 @@ struct PartialRchConfig {
     self_healing: PartialSelfHealingConfig,
     #[serde(default)]
     self_test: PartialSelfTestConfig,
+    // Issue #10: was missing here, so `[path_topology]` blocks in
+    // user / project TOML files silently deserialized to nothing and
+    // `apply_layer` had no field to merge from. Without this, the
+    // file-config path was dead — only the env var path worked, and
+    // `config get path_topology.canonical_root` fell through to the
+    // "unknown key" branch in collect_value_sources below.
+    #[serde(default)]
+    path_topology: PartialPathTopologyConfig,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PartialPathTopologyConfig {
+    canonical_root: Option<String>,
+    alias_root: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1116,6 +1130,23 @@ fn apply_layer(
     {
         config.self_test.retry_delay = retry_delay.clone();
         set_source(sources, "self_test.retry_delay", source.clone());
+    }
+
+    // Path topology overrides from user/project TOML (issue #10). Empty
+    // strings are treated as unset to match `PathTopologyConfig::to_policy`
+    // semantics — otherwise an accidentally-empty TOML value would
+    // shadow the env var or default.
+    if let Some(canonical_root) = layer.path_topology.canonical_root.as_ref()
+        && !canonical_root.is_empty()
+    {
+        config.path_topology.canonical_root = Some(canonical_root.clone());
+        set_source(sources, "path_topology.canonical_root", source.clone());
+    }
+    if let Some(alias_root) = layer.path_topology.alias_root.as_ref()
+        && !alias_root.is_empty()
+    {
+        config.path_topology.alias_root = Some(alias_root.clone());
+        set_source(sources, "path_topology.alias_root", source.clone());
     }
 }
 
@@ -2846,6 +2877,93 @@ identity_file = "/tmp/id_ed25519"
         );
 
         info!("PASS: Real-world project config scenario works correctly");
+    }
+
+    /// Regression test for issue #10: a `[path_topology]` section in
+    /// the user/project TOML must round-trip into the loaded config.
+    /// Pre-fix `PartialRchConfig` didn't have a `path_topology` field,
+    /// so the section silently deserialized to nothing and `apply_layer`
+    /// had nothing to merge.
+    #[test]
+    fn test_path_topology_section_loaded_from_toml() {
+        let _guard = test_guard!();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let user_path = dir.path().join("user.toml");
+        std::fs::write(
+            &user_path,
+            r#"
+[path_topology]
+canonical_root = "/home/alex/projects"
+alias_root = "/home/alex/dp"
+"#,
+        )
+        .expect("write user config");
+
+        let loaded = load_config_with_sources_from_paths(Some(&user_path), None, None)
+            .expect("load_config_with_sources_from_paths");
+        assert_eq!(
+            loaded.config.path_topology.canonical_root.as_deref(),
+            Some("/home/alex/projects"),
+            "TOML canonical_root should land in config.path_topology"
+        );
+        assert_eq!(
+            loaded.config.path_topology.alias_root.as_deref(),
+            Some("/home/alex/dp"),
+            "TOML alias_root should land in config.path_topology"
+        );
+        let canonical_source = loaded
+            .sources
+            .get("path_topology.canonical_root")
+            .expect("source tracked");
+        assert!(
+            matches!(canonical_source, ConfigValueSource::UserConfig(_)),
+            "expected UserConfig, got {:?}",
+            canonical_source
+        );
+    }
+
+    /// Regression test for issue #10: env vars must override TOML values.
+    /// This was already true at runtime, but the missing PartialRchConfig
+    /// field meant the underlying merge order was untested.
+    #[test]
+    fn test_path_topology_env_overrides_toml() {
+        let _guard = test_guard!();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let user_path = dir.path().join("user.toml");
+        std::fs::write(
+            &user_path,
+            r#"
+[path_topology]
+canonical_root = "/from/toml"
+"#,
+        )
+        .expect("write user config");
+
+        let mut env_overrides: HashMap<String, String> = HashMap::new();
+        env_overrides.insert(
+            "RCH_CANONICAL_PROJECT_ROOT".to_string(),
+            "/from/env".to_string(),
+        );
+
+        let loaded = load_config_with_sources_from_paths(
+            Some(&user_path),
+            None,
+            Some(&env_overrides),
+        )
+        .expect("load_config_with_sources_from_paths");
+        assert_eq!(
+            loaded.config.path_topology.canonical_root.as_deref(),
+            Some("/from/env"),
+            "env var should win over TOML"
+        );
+        let source = loaded
+            .sources
+            .get("path_topology.canonical_root")
+            .expect("source tracked");
+        assert_eq!(
+            source,
+            &ConfigValueSource::EnvVar("RCH_CANONICAL_PROJECT_ROOT".to_string())
+        );
     }
 
     #[test]

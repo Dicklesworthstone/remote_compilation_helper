@@ -481,6 +481,38 @@ pub fn config_show(show_sources: bool, ctx: &OutputContext) -> Result<()> {
         )
     );
 
+    // Path topology (issue #10): always show the effective root paths
+    // so users can verify that env-var or TOML overrides were picked up.
+    let canonical_root = config
+        .path_topology
+        .canonical_root
+        .clone()
+        .unwrap_or_else(|| {
+            rch_common::path_topology::DEFAULT_CANONICAL_PROJECT_ROOT.to_string()
+        });
+    let alias_root = config.path_topology.alias_root.clone().unwrap_or_else(|| {
+        rch_common::path_topology::DEFAULT_ALIAS_PROJECT_ROOT.to_string()
+    });
+    println!("\n{}", style.highlight("[path_topology]"));
+    println!(
+        "  {} = {}",
+        style.key("canonical_root"),
+        format_with_source(
+            "path_topology.canonical_root",
+            &style.value(&format!("\"{canonical_root}\"")),
+            &value_sources
+        )
+    );
+    println!(
+        "  {} = {}",
+        style.key("alias_root"),
+        format_with_source(
+            "path_topology.alias_root",
+            &style.value(&format!("\"{alias_root}\"")),
+            &value_sources
+        )
+    );
+
     // Show config file locations
     println!(
         "\n{}",
@@ -693,6 +725,37 @@ pub(super) fn collect_value_sources(
         &mut values,
         "self_healing.auto_start_timeout_secs",
         config.self_healing.auto_start_timeout_secs.to_string(),
+        sources,
+    );
+
+    // Path topology overrides (issue #10). The runtime path-normalization
+    // layer already supported these via env var, but the config CLI surface
+    // didn't list them, so `rch config get path_topology.canonical_root`
+    // failed with "unknown configuration key" and `rch config show`
+    // hid them entirely. Surface the effective value (configured or
+    // compiled-in default) so users can verify their overrides took.
+    let canonical_root_effective = config
+        .path_topology
+        .canonical_root
+        .clone()
+        .unwrap_or_else(|| {
+            rch_common::path_topology::DEFAULT_CANONICAL_PROJECT_ROOT.to_string()
+        });
+    push_value_source(
+        &mut values,
+        "path_topology.canonical_root",
+        canonical_root_effective,
+        sources,
+    );
+    let alias_root_effective = config
+        .path_topology
+        .alias_root
+        .clone()
+        .unwrap_or_else(|| rch_common::path_topology::DEFAULT_ALIAS_PROJECT_ROOT.to_string());
+    push_value_source(
+        &mut values,
+        "path_topology.alias_root",
+        alias_root_effective,
         sources,
     );
 
