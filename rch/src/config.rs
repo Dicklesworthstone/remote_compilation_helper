@@ -1199,13 +1199,29 @@ fn merge_config(mut base: RchConfig, overlay: RchConfig) -> RchConfig {
     // Merge self-test section
     merge_self_test(&mut base.self_test, &overlay.self_test, &default.self_test);
 
-    // Merge path_topology section (overlay wins when set)
-    if overlay.path_topology.canonical_root.is_some() {
+    // Merge path_topology section (overlay wins when *meaningfully*
+    // set). Empty strings are treated as unset to match the
+    // PathTopologyConfig::to_policy() semantics and keep this path
+    // aligned with apply_layer in load_config_with_sources_from_paths
+    // — otherwise an accidentally-blank `canonical_root` in a project
+    // TOML would clobber a valid value from the user TOML and force
+    // an unwanted fallback to the compiled-in default.
+    if overlay
+        .path_topology
+        .canonical_root
+        .as_deref()
+        .is_some_and(|s| !s.is_empty())
+    {
         base.path_topology
             .canonical_root
             .clone_from(&overlay.path_topology.canonical_root);
     }
-    if overlay.path_topology.alias_root.is_some() {
+    if overlay
+        .path_topology
+        .alias_root
+        .as_deref()
+        .is_some_and(|s| !s.is_empty())
+    {
         base.path_topology
             .alias_root
             .clone_from(&overlay.path_topology.alias_root);
