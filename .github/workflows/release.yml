@@ -19,9 +19,10 @@ on:
         required: true
         type: string
 
-# Only allow one release at a time to prevent conflicts
+# Only serialize runs that target the same release tag. A single global release
+# group lets one stale queued tag block every later release.
 concurrency:
-  group: release
+  group: ${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 permissions:
@@ -587,26 +588,37 @@ jobs:
         run: cargo publish -p rch-common --dry-run --no-default-features
 
       - name: Publish rch-common to crates.io
-        if: ${{ env.CARGO_REGISTRY_TOKEN != '' }}
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
+          set -euo pipefail
+          version="${{ needs.plan.outputs.version }}"
+          if [[ -z "${CARGO_REGISTRY_TOKEN:-}" ]]; then
+            echo "Skipping publish: CARGO_REGISTRY_TOKEN not configured"
+            exit 0
+          fi
+
           echo "Publishing rch-common to crates.io..."
-          cargo publish -p rch-common --no-default-features || {
-            # If already published, that's OK
-            if [[ $? -eq 0 ]] || cargo search rch-common | grep -q "^rch-common"; then
-              echo "rch-common already published or publish succeeded"
-            else
-              exit 1
-            fi
-          }
+          if cargo publish -p rch-common --no-default-features 2>publish.err; then
+            exit 0
+          fi
+
+          cat publish.err >&2
+          if curl -fsSL "https://crates.io/api/v1/crates/rch-common/$version" >/dev/null; then
+            echo "rch-common v$version is already published"
+            exit 0
+          fi
+
+          exit 1
 
       - name: Summary
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           echo "## Crates.io Publish" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          if [[ -n "${{ secrets.CARGO_REGISTRY_TOKEN }}" ]]; then
-            echo "✅ Published rch-common v${{ needs.plan.outputs.version }} to crates.io" >> $GITHUB_STEP_SUMMARY
+          if [[ -n "${CARGO_REGISTRY_TOKEN:-}" ]]; then
+            echo "✅ Published or confirmed rch-common v${{ needs.plan.outputs.version }} on crates.io" >> $GITHUB_STEP_SUMMARY
           else
             echo "⚠️ Skipped - CARGO_REGISTRY_TOKEN not configured" >> $GITHUB_STEP_SUMMARY
           fi
