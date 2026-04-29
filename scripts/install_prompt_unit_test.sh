@@ -195,6 +195,22 @@ SERVICE_MANAGER=""
 INSTALL_SERVICE="true"
 run_case "no_service_manager_opt_in" "false" "false" "Background service requested but no supported service manager detected"
 
+# Case 11: default runtime directory collision
+start_test "runtime_dir_collision_uses_private_directory"
+runtime_collision_root="$TEST_DIR/runtime-collision"
+mkdir -p "$runtime_collision_root"
+printf 'occupied\n' > "$runtime_collision_root/rch"
+INSTALL_DIR="$TEST_DIR/install-bin"
+CONFIG_DIR="$TEST_DIR/config"
+RUNTIME_DIR=""
+unset RCH_RUNTIME_DIR
+runtime_output=$(TMPDIR="$runtime_collision_root" create_directories 2>&1 || true)
+if [[ -d "$RUNTIME_DIR" && "$RUNTIME_DIR" == "$runtime_collision_root"/rch-runtime.* ]]; then
+    pass "runtime_dir_collision_uses_private_directory"
+else
+    fail "runtime_dir_collision_uses_private_directory (RUNTIME_DIR='$RUNTIME_DIR', output='$runtime_output')"
+fi
+
 log "=== Summary ==="
 log "Tests run: $TESTS_RUN"
 log "Passed:    $TESTS_PASSED"

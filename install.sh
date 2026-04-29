@@ -46,6 +46,7 @@ INSTALL_DIR="${RCH_INSTALL_DIR:-$HOME/.local/bin}"
 CONFIG_DIR="${RCH_CONFIG_DIR:-$HOME/.config/rch}"
 SOCKET_PATH="/tmp/rch.sock"
 LOCK_FILE="/tmp/rch-install.lock"
+RUNTIME_DIR="${RCH_RUNTIME_DIR:-}"
 
 # Binaries
 HOOK_BIN="rch"
@@ -585,7 +586,18 @@ create_directories() {
 
     mkdir -p "$INSTALL_DIR"
     mkdir -p "$CONFIG_DIR"
-    mkdir -p /tmp/rch
+
+    local runtime_dir="${RUNTIME_DIR:-${RCH_RUNTIME_DIR:-${TMPDIR:-/tmp}/rch}}"
+    if [[ -e "$runtime_dir" && ! -d "$runtime_dir" ]]; then
+        if [[ -n "${RCH_RUNTIME_DIR:-}" || -n "${RUNTIME_DIR:-}" ]]; then
+            die "RCH runtime path exists but is not a directory: $runtime_dir"
+        fi
+        warn "Default runtime path $runtime_dir is occupied; using a private runtime directory"
+        runtime_dir="$(mktemp -d "${TMPDIR:-/tmp}/rch-runtime.XXXXXX")"
+    else
+        mkdir -p "$runtime_dir"
+    fi
+    RUNTIME_DIR="$runtime_dir"
 
     success "Directories created"
 }
