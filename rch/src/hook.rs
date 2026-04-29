@@ -7691,7 +7691,7 @@ The file `x11.pc` needs to be installed and the PKG_CONFIG_PATH environment vari
             &reporter,
         );
 
-        assert_eq!(rewritten, "env RUST_BACKTRACE=1 cargo build --release");
+        assert_eq!(rewritten, "env 'RUST_BACKTRACE=1' cargo build --release");
         assert!(!rewritten.contains("CARGO_TARGET_DIR=/data/projects/custom-target"));
     }
 
