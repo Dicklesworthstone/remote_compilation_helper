@@ -2714,9 +2714,21 @@ fn rewrite_cargo_target_dir_command_for_remote(
         tokens
     };
 
-    if let Some(stripped) = strip_cargo_target_dir_assignments_from_command_tokens(tokens) {
+    let mut stripped = tokens.to_vec();
+    let mut removed_target_dir = false;
+    if let Some(without_assignments) =
+        strip_cargo_target_dir_assignments_from_command_tokens(&stripped)
+    {
+        stripped = without_assignments;
+        removed_target_dir = true;
+    }
+    if let Some(without_flags) = strip_cargo_target_dir_flags_from_command_tokens(&stripped) {
+        stripped = without_flags;
+        removed_target_dir = true;
+    }
+    if removed_target_dir {
         reporter.verbose(
-            "[RCH] removed inline CARGO_TARGET_DIR assignment before remote execution; worker-scoped target dir will be injected",
+            "[RCH] removed local Cargo target-dir setting before remote execution; worker-scoped target dir will be injected",
         );
         return join_exec_command(&stripped);
     }
@@ -2781,6 +2793,41 @@ fn strip_cargo_target_dir_assignments_from_command_tokens(
     None
 }
 
+fn strip_cargo_target_dir_flags_from_command_tokens(tokens: &[String]) -> Option<Vec<String>> {
+    let mut stripped = Vec::with_capacity(tokens.len());
+    let mut changed = false;
+    let mut index = 0usize;
+
+    while let Some(token) = tokens.get(index) {
+        if token == "--" {
+            stripped.extend_from_slice(&tokens[index..]);
+            break;
+        }
+        if token == "--target-dir" {
+            changed = true;
+            index += 1;
+            if tokens.get(index).is_some() {
+                index += 1;
+            }
+            continue;
+        }
+
+        if token
+            .strip_prefix("--target-dir=")
+            .is_some_and(|value| !value.is_empty())
+        {
+            changed = true;
+            index += 1;
+            continue;
+        }
+
+        stripped.push(token.clone());
+        index += 1;
+    }
+
+    changed.then_some(stripped)
+}
+
 fn extract_cargo_target_dir_from_command_tokens(tokens: &[String]) -> Option<String> {
     fn scan_assignment_prefix(tokens: &[String], start: usize) -> Option<String> {
         let mut index = start;
@@ -2793,6 +2840,25 @@ fn extract_cargo_target_dir_from_command_tokens(tokens: &[String]) -> Option<Str
                 continue;
             }
             break;
+        }
+        None
+    }
+
+    fn scan_target_dir_flag(tokens: &[String]) -> Option<String> {
+        let mut index = 0usize;
+        while let Some(token) = tokens.get(index) {
+            if token == "--" {
+                break;
+            }
+            if token == "--target-dir" {
+                return tokens.get(index + 1).cloned();
+            }
+            if let Some(value) = token.strip_prefix("--target-dir=")
+                && !value.is_empty()
+            {
+                return Some(value.to_string());
+            }
+            index += 1;
         }
         None
     }
@@ -2823,13 +2889,21 @@ fn extract_cargo_target_dir_from_command_tokens(tokens: &[String]) -> Option<Str
                         break;
                     }
                 }
-                return scan_assignment_prefix(tokens, index);
+                if let Some(value) = scan_assignment_prefix(tokens, index) {
+                    return Some(value);
+                }
+                return scan_target_dir_flag(tokens);
             }
-            _ => return scan_assignment_prefix(tokens, index),
+            _ => {
+                if let Some(value) = scan_assignment_prefix(tokens, index) {
+                    return Some(value);
+                }
+                return scan_target_dir_flag(tokens);
+            }
         }
     }
 
-    None
+    scan_target_dir_flag(tokens)
 }
 
 fn parse_command_tokens(command: &str, reporter: &HookReporter) -> Option<Vec<String>> {
@@ -7672,6 +7746,48 @@ The file `x11.pc` needs to be installed and the PKG_CONFIG_PATH environment vari
     }
 
     #[test]
+    fn test_resolve_forwarded_cargo_target_dir_extracts_target_dir_flag() {
+        let _guard = test_guard!();
+        let reporter = HookReporter::new(OutputVisibility::Verbose);
+        let command_tokens = vec![
+            "cargo".to_string(),
+            "build".to_string(),
+            "--target-dir".to_string(),
+            "/data/tmp/rch-target-flag".to_string(),
+            "--release".to_string(),
+        ];
+        let resolved = resolve_forwarded_cargo_target_dir_with_lookup(
+            Some(CompilationKind::CargoBuild),
+            Path::new("/data/projects/remote_compilation_helper"),
+            &reporter,
+            |_| None,
+            Some(&command_tokens),
+        );
+
+        assert_eq!(resolved, Some(PathBuf::from("/data/tmp/rch-target-flag")));
+    }
+
+    #[test]
+    fn test_resolve_forwarded_cargo_target_dir_extracts_target_dir_equals_flag() {
+        let _guard = test_guard!();
+        let reporter = HookReporter::new(OutputVisibility::Verbose);
+        let command_tokens = vec![
+            "cargo".to_string(),
+            "check".to_string(),
+            "--target-dir=/data/tmp/rch-target-equals".to_string(),
+        ];
+        let resolved = resolve_forwarded_cargo_target_dir_with_lookup(
+            Some(CompilationKind::CargoCheck),
+            Path::new("/data/projects/remote_compilation_helper"),
+            &reporter,
+            |_| None,
+            Some(&command_tokens),
+        );
+
+        assert_eq!(resolved, Some(PathBuf::from("/data/tmp/rch-target-equals")));
+    }
+
+    #[test]
     fn test_rewrite_cargo_target_dir_command_for_remote_strips_inline_assignment() {
         let _guard = test_guard!();
         let reporter = HookReporter::new(OutputVisibility::Verbose);
@@ -7693,6 +7809,112 @@ The file `x11.pc` needs to be installed and the PKG_CONFIG_PATH environment vari
 
         assert_eq!(rewritten, "env 'RUST_BACKTRACE=1' cargo build --release");
         assert!(!rewritten.contains("CARGO_TARGET_DIR=/data/projects/custom-target"));
+    }
+
+    #[test]
+    fn test_rewrite_cargo_target_dir_command_for_remote_strips_target_dir_flag() {
+        let _guard = test_guard!();
+        let reporter = HookReporter::new(OutputVisibility::Verbose);
+        let command_tokens = vec![
+            "cargo".to_string(),
+            "build".to_string(),
+            "--target-dir".to_string(),
+            "/data/tmp/rch-target-flag".to_string(),
+            "--release".to_string(),
+        ];
+
+        let rewritten = rewrite_cargo_target_dir_command_for_remote(
+            "cargo build --target-dir /data/tmp/rch-target-flag --release",
+            Some(&command_tokens),
+            Some(&PathBuf::from("/data/tmp/rch-target-flag")),
+            &reporter,
+        );
+
+        assert_eq!(rewritten, "cargo build --release");
+        assert!(!rewritten.contains("--target-dir"));
+        assert!(!rewritten.contains("/data/tmp/rch-target-flag"));
+    }
+
+    #[test]
+    fn test_rewrite_cargo_target_dir_command_for_remote_strips_target_dir_equals_flag() {
+        let _guard = test_guard!();
+        let reporter = HookReporter::new(OutputVisibility::Verbose);
+        let command_tokens = vec![
+            "cargo".to_string(),
+            "check".to_string(),
+            "--target-dir=/data/tmp/rch-target-equals".to_string(),
+            "--workspace".to_string(),
+        ];
+
+        let rewritten = rewrite_cargo_target_dir_command_for_remote(
+            "cargo check --target-dir=/data/tmp/rch-target-equals --workspace",
+            Some(&command_tokens),
+            Some(&PathBuf::from("/data/tmp/rch-target-equals")),
+            &reporter,
+        );
+
+        assert_eq!(rewritten, "cargo check --workspace");
+        assert!(!rewritten.contains("--target-dir"));
+        assert!(!rewritten.contains("/data/tmp/rch-target-equals"));
+    }
+
+    #[test]
+    fn test_cargo_target_dir_scanner_ignores_args_after_delimiter() {
+        let _guard = test_guard!();
+        let reporter = HookReporter::new(OutputVisibility::Verbose);
+        let command_tokens = vec![
+            "cargo".to_string(),
+            "test".to_string(),
+            "--".to_string(),
+            "--target-dir".to_string(),
+            "test-filter".to_string(),
+        ];
+        let resolved = resolve_forwarded_cargo_target_dir_with_lookup(
+            Some(CompilationKind::CargoTest),
+            Path::new("/data/projects/remote_compilation_helper"),
+            &reporter,
+            |_| None,
+            Some(&command_tokens),
+        );
+        let rewritten = rewrite_cargo_target_dir_command_for_remote(
+            "cargo test -- --target-dir test-filter",
+            Some(&command_tokens),
+            Some(&PathBuf::from(
+                "/data/projects/remote_compilation_helper/target",
+            )),
+            &reporter,
+        );
+
+        assert_eq!(
+            resolved,
+            Some(PathBuf::from(
+                "/data/projects/remote_compilation_helper/target"
+            ))
+        );
+        assert_eq!(rewritten, "cargo test -- --target-dir test-filter");
+    }
+
+    #[test]
+    fn test_rewrite_cargo_target_dir_command_preserves_args_after_delimiter() {
+        let _guard = test_guard!();
+        let reporter = HookReporter::new(OutputVisibility::Verbose);
+        let command_tokens = vec![
+            "cargo".to_string(),
+            "test".to_string(),
+            "--target-dir".to_string(),
+            "/data/tmp/rch-target-flag".to_string(),
+            "--".to_string(),
+            "--nocapture".to_string(),
+        ];
+
+        let rewritten = rewrite_cargo_target_dir_command_for_remote(
+            "cargo test --target-dir /data/tmp/rch-target-flag -- --nocapture",
+            Some(&command_tokens),
+            Some(&PathBuf::from("/data/tmp/rch-target-flag")),
+            &reporter,
+        );
+
+        assert_eq!(rewritten, "cargo test -- --nocapture");
     }
 
     #[tokio::test]

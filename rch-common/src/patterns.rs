@@ -798,6 +798,8 @@ pub fn normalize_command(cmd: &str) -> Cow<'_, str> {
             if let Some(q) = in_quote {
                 if c == q {
                     in_quote = None;
+                } else if c == '=' {
+                    has_equals = true;
                 }
                 token_len += c.len_utf8();
             } else if c == '"' || c == '\'' {
@@ -1954,6 +1956,13 @@ mod tests {
             result.is_compilation,
             "Should classify env-wrapped cargo test as compilation"
         );
+
+        let result = classify_command("env 'CARGO_TARGET_DIR=/data/tmp/rch-target' cargo build");
+        assert!(
+            result.is_compilation,
+            "Should classify shell-quoted env assignment before cargo build as compilation"
+        );
+        assert_eq!(result.kind, Some(CompilationKind::CargoBuild));
     }
 
     // =========================================================================
