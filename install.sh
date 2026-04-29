@@ -908,6 +908,7 @@ install_rust_toolchain() {
     if curl --proto '=https' --tlsv1.2 -sSf "${PROXY_ARGS[@]}" https://sh.rustup.rs | sh -s -- -y --default-toolchain nightly; then
         # Source cargo env for current session
         if [[ -f "$HOME/.cargo/env" ]]; then
+            # shellcheck source=/dev/null
             source "$HOME/.cargo/env"
         fi
         success "Rust installed successfully"
@@ -1934,9 +1935,11 @@ setup_path() {
     fi
 
     if [[ "${EASY_MODE:-}" == "true" ]] || confirm "Add $INSTALL_DIR to PATH in $shell_rc?"; then
-        echo "" >> "$shell_rc"
-        echo "# RCH - Remote Compilation Helper" >> "$shell_rc"
-        echo "$path_line" >> "$shell_rc"
+        {
+            echo ""
+            echo "# RCH - Remote Compilation Helper"
+            echo "$path_line"
+        } >> "$shell_rc"
         success "PATH configured in $shell_rc"
         warn "Run 'source $shell_rc' or restart your shell"
     fi
@@ -2698,6 +2701,7 @@ main() {
 }
 
 if [[ "${RCH_INSTALLER_LIB:-}" == "1" ]]; then
+    # shellcheck disable=SC2317
     return 0 2>/dev/null || exit 0
 fi
 
