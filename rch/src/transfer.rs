@@ -1546,6 +1546,68 @@ fi",
         cmd
     }
 
+    /// Build rsync command for streaming artifact retrieval.
+    fn build_retrieve_streaming_command(
+        &self,
+        worker: &WorkerConfig,
+        escaped_remote_path: &str,
+        artifact_patterns: &[String],
+    ) -> Command {
+        let mut cmd = Command::new("rsync");
+        // Force C locale for consistent output parsing
+        cmd.env("LC_ALL", "C");
+
+        let identity_file = shellexpand::tilde(&worker.identity_file);
+        let escaped_identity = escape(Cow::from(identity_file.as_ref()));
+
+        let ssh_command = self.build_rsync_ssh_command(escaped_identity.as_ref());
+
+        cmd.arg("-az")
+            .arg("--info=progress2")
+            .arg("--info=stats2")
+            .arg("--safe-links")
+            .arg("-e")
+            .arg(ssh_command);
+
+        // Add zstd compression
+        let compression_level = self.compression_level_for_transfer();
+        if compression_level > 0 {
+            cmd.arg("--compress-choice=zstd");
+            cmd.arg(format!("--compress-level={}", compression_level));
+        }
+
+        // Add bandwidth limit if configured (bd-3hho)
+        if let Some(bwlimit) = self.transfer_config.bwlimit_kbps
+            && bwlimit > 0
+        {
+            cmd.arg(format!("--bwlimit={}", bwlimit));
+        }
+
+        // Prune empty directories to prevent cluttering local project
+        cmd.arg("--prune-empty-dirs");
+
+        // Reuse the retrieval-safe excludes so streaming downloads skip stale
+        // worker-local junk trees without excluding legitimate artifact roots.
+        for pattern in self.get_retrieval_excludes() {
+            cmd.arg("--exclude").arg(pattern);
+        }
+
+        // Essential: Include all directories so rsync can traverse to match patterns.
+        cmd.arg("--include").arg("*/");
+
+        for pattern in artifact_patterns {
+            cmd.arg("--include").arg(pattern);
+        }
+        cmd.arg("--exclude").arg("*");
+
+        let source = format!("{}@{}:{}/", worker.user, worker.host, escaped_remote_path);
+        cmd.arg(&source)
+            .arg(format!("{}/", self.project_root.display()));
+
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        cmd
+    }
+
     fn build_rsync_ssh_command(&self, escaped_identity: &str) -> String {
         let mut command = format!(
             "ssh -i {} -o StrictHostKeyChecking=accept-new -o BatchMode=yes",
@@ -1738,57 +1800,8 @@ fi",
             remote_path, worker.id
         );
 
-        let mut cmd = Command::new("rsync");
-        // Force C locale for consistent output parsing
-        cmd.env("LC_ALL", "C");
-
-        let identity_file = shellexpand::tilde(&worker.identity_file);
-        let escaped_identity = escape(Cow::from(identity_file.as_ref()));
-
-        let ssh_command = self.build_rsync_ssh_command(escaped_identity.as_ref());
-
-        cmd.arg("-az")
-            .arg("--info=progress2")
-            .arg("--info=stats2")
-            .arg("-e")
-            .arg(ssh_command);
-
-        // Add zstd compression
-        let compression_level = self.compression_level_for_transfer();
-        if compression_level > 0 {
-            cmd.arg("--compress-choice=zstd");
-            cmd.arg(format!("--compress-level={}", compression_level));
-        }
-
-        // Add bandwidth limit if configured (bd-3hho)
-        if let Some(bwlimit) = self.transfer_config.bwlimit_kbps
-            && bwlimit > 0
-        {
-            cmd.arg(format!("--bwlimit={}", bwlimit));
-        }
-
-        // Prune empty directories to prevent cluttering local project
-        cmd.arg("--prune-empty-dirs");
-
-        // Reuse the retrieval-safe excludes so streaming downloads skip stale
-        // worker-local junk trees without excluding legitimate artifact roots.
-        for pattern in self.get_retrieval_excludes() {
-            cmd.arg("--exclude").arg(pattern);
-        }
-
-        // Essential: Include all directories so rsync can traverse to match patterns.
-        cmd.arg("--include").arg("*/");
-
-        for pattern in artifact_patterns {
-            cmd.arg("--include").arg(pattern);
-        }
-        cmd.arg("--exclude").arg("*");
-
-        let source = format!("{}@{}:{}/", worker.user, worker.host, escaped_remote_path);
-        cmd.arg(&source)
-            .arg(format!("{}/", self.project_root.display()));
-
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let cmd =
+            self.build_retrieve_streaming_command(worker, &escaped_remote_path, artifact_patterns);
 
         debug!(
             "Running artifact retrieval (streaming): rsync {:?}",
@@ -3046,6 +3059,51 @@ mod tests {
                 .windows(2)
                 .any(|window| window == ["--exclude", "target/"]),
             "retrieve filters must not inherit upload-only target/ exclusion"
+        );
+        assert!(args.windows(2).any(|window| window == ["--exclude", "*"]));
+    }
+
+    #[test]
+    fn test_build_retrieve_streaming_command_uses_safe_links() {
+        let _guard = test_guard!();
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let pipeline = TransferPipeline::new(
+            temp_dir.path().to_path_buf(),
+            "test-project".to_string(),
+            "abc123".to_string(),
+            TransferConfig::default(),
+        );
+
+        let worker = WorkerConfig {
+            id: WorkerId::new("mock-worker"),
+            host: "mock://worker".to_string(),
+            user: "mockuser".to_string(),
+            identity_file: "~/.ssh/mock".to_string(),
+            total_slots: 4,
+            priority: 100,
+            tags: vec![],
+        };
+
+        let cmd = pipeline.build_retrieve_streaming_command(
+            &worker,
+            "/tmp/rch/test-project/abc123",
+            &["target/release/**".to_string()],
+        );
+
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect();
+
+        assert!(
+            args.iter().any(|arg| arg == "--safe-links"),
+            "streaming artifact retrieval must keep symlink traversal protection"
+        );
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["--include", "target/release/**"]),
+            "streaming retrieval should still include requested artifact patterns"
         );
         assert!(args.windows(2).any(|window| window == ["--exclude", "*"]));
     }
