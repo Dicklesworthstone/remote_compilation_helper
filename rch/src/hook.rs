@@ -225,10 +225,16 @@ pub async fn run_exec(command_parts: Vec<String>) -> anyhow::Result<()> {
         None
     };
     let forwarded_cargo_target_dir = resolve_forwarded_cargo_target_dir(
-        &config.environment.allowlist,
+        classification.kind,
         project_root.as_deref().unwrap_or_else(|| Path::new(".")),
         &reporter,
         Some(&command_parts),
+    );
+    let remote_command = rewrite_cargo_target_dir_command_for_remote(
+        &command,
+        Some(&command_parts),
+        forwarded_cargo_target_dir.as_ref(),
+        &reporter,
     );
 
     // Determine required runtime
@@ -241,7 +247,7 @@ pub async fn run_exec(command_parts: Vec<String>) -> anyhow::Result<()> {
         &config.general.socket_path,
         &project,
         estimated_cores,
-        &command,
+        &remote_command,
         toolchain.as_ref(),
         required_runtime,
         command_priority,
@@ -264,7 +270,7 @@ pub async fn run_exec(command_parts: Vec<String>) -> anyhow::Result<()> {
                     &config.general.socket_path,
                     &project,
                     estimated_cores,
-                    &command,
+                    &remote_command,
                     toolchain.as_ref(),
                     required_runtime,
                     command_priority,
@@ -315,7 +321,7 @@ pub async fn run_exec(command_parts: Vec<String>) -> anyhow::Result<()> {
     let remote_start = Instant::now();
     let result = execute_remote_compilation(
         &worker,
-        &command,
+        &remote_command,
         config.transfer.clone(),
         config.environment.allowlist.clone(),
         forwarded_cargo_target_dir,
@@ -1765,10 +1771,16 @@ async fn handle_selection_response(
     let invocation_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let command_tokens = parse_command_tokens(command, reporter);
     let forwarded_cargo_target_dir = resolve_forwarded_cargo_target_dir(
-        &config.environment.allowlist,
+        classification_kind,
         &invocation_cwd,
         reporter,
         command_tokens.as_deref(),
+    );
+    let remote_command = rewrite_cargo_target_dir_command_for_remote(
+        command,
+        command_tokens.as_deref(),
+        forwarded_cargo_target_dir.as_ref(),
+        reporter,
     );
 
     // Execute remote compilation pipeline
@@ -1776,7 +1788,7 @@ async fn handle_selection_response(
     let remote_start = Instant::now();
     let result = execute_remote_compilation(
         &worker,
-        command,
+        &remote_command,
         config.transfer.clone(),
         config.environment.allowlist.clone(),
         forwarded_cargo_target_dir,
@@ -2581,8 +2593,23 @@ fn env_allowlist_contains(env_allowlist: &[String], key: &str) -> bool {
         .any(|item| item == key)
 }
 
+fn cargo_kind_uses_target_dir(kind: Option<CompilationKind>) -> bool {
+    matches!(
+        kind,
+        Some(
+            CompilationKind::CargoBuild
+                | CompilationKind::CargoCheck
+                | CompilationKind::CargoClippy
+                | CompilationKind::CargoDoc
+                | CompilationKind::CargoTest
+                | CompilationKind::CargoNextest
+                | CompilationKind::CargoBench,
+        )
+    )
+}
+
 fn resolve_forwarded_cargo_target_dir_with_lookup<F>(
-    env_allowlist: &[String],
+    kind: Option<CompilationKind>,
     invocation_cwd: &Path,
     reporter: &HookReporter,
     mut lookup_env: F,
@@ -2591,63 +2618,167 @@ fn resolve_forwarded_cargo_target_dir_with_lookup<F>(
 where
     F: FnMut(&str) -> Option<String>,
 {
-    if !env_allowlist_contains(env_allowlist, "CARGO_TARGET_DIR") {
+    if !cargo_kind_uses_target_dir(kind) {
         return None;
     }
 
-    let raw = lookup_env("CARGO_TARGET_DIR").or_else(|| {
-        command_tokens.and_then(|tokens| {
+    let raw = command_tokens
+        .and_then(|tokens| {
             extract_cargo_target_dir_from_command_tokens(tokens).inspect(|_| {
                 reporter.verbose(
                     "[RCH] CARGO_TARGET_DIR forwarding detected from delegated command tokens",
                 );
             })
         })
-    });
+        .or_else(|| {
+            lookup_env("CARGO_TARGET_DIR").inspect(|_| {
+                reporter.verbose("[RCH] CARGO_TARGET_DIR forwarding detected from environment");
+            })
+        });
 
-    let raw = match raw {
-        Some(value) => value,
-        None => {
-            reporter.verbose(
-                "[RCH] CARGO_TARGET_DIR is allowlisted but unset locally and absent from command",
-            );
+    let resolved = raw.and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            reporter.verbose("[RCH] CARGO_TARGET_DIR is empty; using default Cargo target dir");
             return None;
         }
-    };
 
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        reporter.verbose("[RCH] CARGO_TARGET_DIR is allowlisted but empty");
-        return None;
-    }
+        let requested = PathBuf::from(trimmed);
+        Some(if requested.is_absolute() {
+            requested
+        } else {
+            invocation_cwd.join(requested)
+        })
+    });
 
-    let requested = PathBuf::from(trimmed);
-    let resolved = if requested.is_absolute() {
-        requested
-    } else {
-        invocation_cwd.join(requested)
-    };
+    let resolved = resolved.unwrap_or_else(|| invocation_cwd.join("target"));
 
     reporter.verbose(&format!(
-        "[RCH] CARGO_TARGET_DIR forwarding detected; syncing worker .rch-target to {}",
+        "[RCH] Cargo target sync active; forcing worker CARGO_TARGET_DIR=.rch-target and syncing back to {}",
         resolved.display()
     ));
     Some(resolved)
 }
 
 fn resolve_forwarded_cargo_target_dir(
-    env_allowlist: &[String],
+    kind: Option<CompilationKind>,
     invocation_cwd: &Path,
     reporter: &HookReporter,
     command_tokens: Option<&[String]>,
 ) -> Option<PathBuf> {
     resolve_forwarded_cargo_target_dir_with_lookup(
-        env_allowlist,
+        kind,
         invocation_cwd,
         reporter,
         |key| std::env::var(key).ok(),
         command_tokens,
     )
+}
+
+fn cargo_target_env_allowlist(env_allowlist: &[String], cargo_target_sync: bool) -> Vec<String> {
+    let mut effective = env_allowlist.to_vec();
+    if cargo_target_sync && !env_allowlist_contains(&effective, "CARGO_TARGET_DIR") {
+        effective.push("CARGO_TARGET_DIR".to_string());
+    }
+    effective
+}
+
+fn cargo_target_env_overrides(local_target_dir: Option<&Path>) -> Option<HashMap<String, String>> {
+    let local_target_dir = local_target_dir?;
+    let mut overrides = HashMap::new();
+    overrides.insert(
+        "CARGO_TARGET_DIR".to_string(),
+        local_target_dir.to_string_lossy().to_string(),
+    );
+    Some(overrides)
+}
+
+fn rewrite_cargo_target_dir_command_for_remote(
+    command: &str,
+    command_tokens: Option<&[String]>,
+    forwarded_cargo_target_dir: Option<&PathBuf>,
+    reporter: &HookReporter,
+) -> String {
+    if forwarded_cargo_target_dir.is_none() {
+        return command.to_string();
+    }
+
+    let parsed_tokens;
+    let tokens = if let Some(tokens) = command_tokens {
+        tokens
+    } else {
+        parsed_tokens = parse_command_tokens(command, reporter);
+        let Some(tokens) = parsed_tokens.as_deref() else {
+            return command.to_string();
+        };
+        tokens
+    };
+
+    if let Some(stripped) = strip_cargo_target_dir_assignments_from_command_tokens(tokens) {
+        reporter.verbose(
+            "[RCH] removed inline CARGO_TARGET_DIR assignment before remote execution; worker-scoped target dir will be injected",
+        );
+        return join_exec_command(&stripped);
+    }
+
+    command.to_string()
+}
+
+fn strip_cargo_target_dir_assignments_from_command_tokens(
+    tokens: &[String],
+) -> Option<Vec<String>> {
+    fn strip_assignment_prefix(tokens: &mut Vec<String>, mut index: usize) -> bool {
+        let mut changed = false;
+        while let Some(token) = tokens.get(index) {
+            let Some((key, _)) = token.split_once('=') else {
+                break;
+            };
+            if key == "CARGO_TARGET_DIR" {
+                tokens.remove(index);
+                changed = true;
+            } else {
+                index += 1;
+            }
+        }
+        changed
+    }
+
+    let mut stripped = tokens.to_vec();
+    let mut index = 0usize;
+    while let Some(token) = stripped.get(index) {
+        match token.as_str() {
+            "sudo" | "time" => {
+                index += 1;
+                while let Some(flag) = stripped.get(index) {
+                    if flag.starts_with('-') {
+                        index += 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            "env" => {
+                index += 1;
+                while let Some(flag) = stripped.get(index) {
+                    if flag == "--" {
+                        index += 1;
+                        break;
+                    }
+                    if flag.starts_with('-') && !flag.contains('=') {
+                        index += 1;
+                    } else {
+                        break;
+                    }
+                }
+                return strip_assignment_prefix(&mut stripped, index).then_some(stripped);
+            }
+            _ => {
+                return strip_assignment_prefix(&mut stripped, index).then_some(stripped);
+            }
+        }
+    }
+
+    None
 }
 
 fn extract_cargo_target_dir_from_command_tokens(tokens: &[String]) -> Option<String> {
@@ -4767,6 +4898,9 @@ async fn execute_remote_compilation(
 
     // Build transfer pipelines with color mode, command timeout, and compilation kind.
     let command_timeout = compilation_config.timeout_for_kind(kind);
+    let effective_env_allowlist =
+        cargo_target_env_allowlist(&env_allowlist, forwarded_cargo_target_dir.is_some());
+    let cargo_env_overrides = cargo_target_env_overrides(forwarded_cargo_target_dir.as_deref());
     let mut primary_pipeline: Option<TransferPipeline> = None;
     let mut aggregate_sync_result: Option<SyncResult> = None;
 
@@ -4801,7 +4935,10 @@ async fn execute_remote_compilation(
                 .with_sync_delete(false);
         }
         if entry.is_primary {
-            root_pipeline = root_pipeline.with_env_allowlist(env_allowlist.clone());
+            root_pipeline = root_pipeline.with_env_allowlist(effective_env_allowlist.clone());
+            if let Some(overrides) = cargo_env_overrides.as_ref() {
+                root_pipeline = root_pipeline.with_env_overrides(overrides.clone());
+            }
         }
 
         if exact_dependency_closure_sync {
@@ -7412,14 +7549,52 @@ The file `x11.pc` needs to be installed and the PKG_CONFIG_PATH environment vari
     }
 
     #[test]
-    fn test_resolve_forwarded_cargo_target_dir_requires_allowlist() {
+    fn test_resolve_forwarded_cargo_target_dir_reads_env_without_allowlist() {
         let _guard = test_guard!();
         let reporter = HookReporter::new(OutputVisibility::Verbose);
         let resolved = resolve_forwarded_cargo_target_dir_with_lookup(
-            &[],
+            Some(CompilationKind::CargoBuild),
             Path::new("/tmp/rch"),
             &reporter,
             |_| Some("/tmp/rch-target-no-allowlist".to_string()),
+            None,
+        );
+
+        assert_eq!(
+            resolved,
+            Some(PathBuf::from("/tmp/rch-target-no-allowlist"))
+        );
+    }
+
+    #[test]
+    fn test_resolve_forwarded_cargo_target_dir_defaults_for_cargo() {
+        let _guard = test_guard!();
+        let reporter = HookReporter::new(OutputVisibility::Verbose);
+        let resolved = resolve_forwarded_cargo_target_dir_with_lookup(
+            Some(CompilationKind::CargoBuild),
+            Path::new("/data/projects/remote_compilation_helper"),
+            &reporter,
+            |_| None,
+            None,
+        );
+
+        assert_eq!(
+            resolved,
+            Some(PathBuf::from(
+                "/data/projects/remote_compilation_helper/target"
+            ))
+        );
+    }
+
+    #[test]
+    fn test_resolve_forwarded_cargo_target_dir_ignores_non_cargo() {
+        let _guard = test_guard!();
+        let reporter = HookReporter::new(OutputVisibility::Verbose);
+        let resolved = resolve_forwarded_cargo_target_dir_with_lookup(
+            Some(CompilationKind::BunTest),
+            Path::new("/data/projects/remote_compilation_helper"),
+            &reporter,
+            |_| Some("/tmp/should-not-forward".to_string()),
             None,
         );
 
@@ -7431,7 +7606,7 @@ The file `x11.pc` needs to be installed and the PKG_CONFIG_PATH environment vari
         let _guard = test_guard!();
         let reporter = HookReporter::new(OutputVisibility::Verbose);
         let resolved = resolve_forwarded_cargo_target_dir_with_lookup(
-            &[String::from(" CARGO_TARGET_DIR ")],
+            Some(CompilationKind::CargoBuild),
             Path::new("/data/projects/remote_compilation_helper"),
             &reporter,
             |_| Some("tmp/custom-target".to_string()),
@@ -7458,10 +7633,10 @@ The file `x11.pc` needs to be installed and the PKG_CONFIG_PATH environment vari
             "check".to_string(),
         ];
         let resolved = resolve_forwarded_cargo_target_dir_with_lookup(
-            &[String::from("CARGO_TARGET_DIR")],
+            Some(CompilationKind::CargoBuild),
             Path::new("/data/projects/remote_compilation_helper"),
             &reporter,
-            |_| None,
+            |_| Some("/tmp/env-should-lose-to-command".to_string()),
             Some(&command_tokens),
         );
 
@@ -7481,7 +7656,7 @@ The file `x11.pc` needs to be installed and the PKG_CONFIG_PATH environment vari
             "build".to_string(),
         ];
         let resolved = resolve_forwarded_cargo_target_dir_with_lookup(
-            &[String::from("CARGO_TARGET_DIR")],
+            Some(CompilationKind::CargoBuild),
             Path::new("/data/projects/remote_compilation_helper"),
             &reporter,
             |_| None,
@@ -7494,6 +7669,30 @@ The file `x11.pc` needs to be installed and the PKG_CONFIG_PATH environment vari
                 "/data/projects/remote_compilation_helper/.rch-target-inline"
             ))
         );
+    }
+
+    #[test]
+    fn test_rewrite_cargo_target_dir_command_for_remote_strips_inline_assignment() {
+        let _guard = test_guard!();
+        let reporter = HookReporter::new(OutputVisibility::Verbose);
+        let command_tokens = vec![
+            "env".to_string(),
+            "RUST_BACKTRACE=1".to_string(),
+            "CARGO_TARGET_DIR=/data/projects/custom-target".to_string(),
+            "cargo".to_string(),
+            "build".to_string(),
+            "--release".to_string(),
+        ];
+
+        let rewritten = rewrite_cargo_target_dir_command_for_remote(
+            "env RUST_BACKTRACE=1 CARGO_TARGET_DIR=/data/projects/custom-target cargo build --release",
+            Some(&command_tokens),
+            Some(&PathBuf::from("/data/projects/custom-target")),
+            &reporter,
+        );
+
+        assert_eq!(rewritten, "env RUST_BACKTRACE=1 cargo build --release");
+        assert!(!rewritten.contains("CARGO_TARGET_DIR=/data/projects/custom-target"));
     }
 
     #[tokio::test]
@@ -8505,6 +8704,18 @@ edition = "2024"
         assert!(
             has_custom_target_artifact_sync,
             "expected artifact retrieval into custom CARGO_TARGET_DIR from worker .rch-target path"
+        );
+
+        let ssh_logs = mock::global_ssh_invocations_snapshot();
+        let execute_command = ssh_logs
+            .iter()
+            .find(|entry| entry.phase == mock::Phase::Execute)
+            .and_then(|entry| entry.command.as_deref())
+            .expect("execute command should be recorded");
+        assert!(
+            execute_command.contains("CARGO_TARGET_DIR=")
+                && execute_command.contains(".rch-target"),
+            "expected remote Cargo execution to force worker-scoped CARGO_TARGET_DIR, got {execute_command}"
         );
     }
 

@@ -360,7 +360,6 @@ impl TransferPipeline {
         self
     }
 
-    #[cfg(test)]
     pub fn with_env_overrides(mut self, overrides: HashMap<String, String>) -> Self {
         self.env_overrides = Some(overrides);
         self
