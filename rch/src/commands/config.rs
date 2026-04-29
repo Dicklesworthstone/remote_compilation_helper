@@ -491,9 +491,7 @@ pub fn config_show(show_sources: bool, ctx: &OutputContext) -> Result<()> {
         .as_deref()
         .filter(|s| !s.is_empty())
         .map(String::from)
-        .unwrap_or_else(|| {
-            rch_common::path_topology::DEFAULT_CANONICAL_PROJECT_ROOT.to_string()
-        });
+        .unwrap_or_else(|| rch_common::path_topology::DEFAULT_CANONICAL_PROJECT_ROOT.to_string());
     let alias_root = config
         .path_topology
         .alias_root
@@ -753,9 +751,7 @@ pub(super) fn collect_value_sources(
         .as_deref()
         .filter(|s| !s.is_empty())
         .map(String::from)
-        .unwrap_or_else(|| {
-            rch_common::path_topology::DEFAULT_CANONICAL_PROJECT_ROOT.to_string()
-        });
+        .unwrap_or_else(|| rch_common::path_topology::DEFAULT_CANONICAL_PROJECT_ROOT.to_string());
     push_value_source(
         &mut values,
         "path_topology.canonical_root",

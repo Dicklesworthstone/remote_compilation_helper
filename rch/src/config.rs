@@ -2961,12 +2961,9 @@ canonical_root = "/from/toml"
             "/from/env".to_string(),
         );
 
-        let loaded = load_config_with_sources_from_paths(
-            Some(&user_path),
-            None,
-            Some(&env_overrides),
-        )
-        .expect("load_config_with_sources_from_paths");
+        let loaded =
+            load_config_with_sources_from_paths(Some(&user_path), None, Some(&env_overrides))
+                .expect("load_config_with_sources_from_paths");
         assert_eq!(
             loaded.config.path_topology.canonical_root.as_deref(),
             Some("/from/env"),
