@@ -602,6 +602,15 @@ create_directories() {
     success "Directories created"
 }
 
+install_binary_file() {
+    local source_path="$1"
+    local dest_path="$2"
+    local temp_path="${dest_path}.tmp.$$"
+
+    install -m 755 "$source_path" "$temp_path"
+    mv -f "$temp_path" "$dest_path"
+}
+
 build_from_source() {
     info "Building from source..."
 
@@ -635,8 +644,7 @@ build_from_source() {
 
     if [[ "$MODE" == "worker" ]]; then
         if [[ -f "$target_dir/$WORKER_BIN" ]]; then
-            cp "$target_dir/$WORKER_BIN" "$INSTALL_DIR/"
-            chmod +x "$INSTALL_DIR/$WORKER_BIN"
+            install_binary_file "$target_dir/$WORKER_BIN" "$INSTALL_DIR/$WORKER_BIN"
             success "Installed $WORKER_BIN"
         else
             die "Worker binary not found: $target_dir/$WORKER_BIN"
@@ -645,8 +653,7 @@ build_from_source() {
         # Local mode: install hook, daemon, and worker binary (needed for fleet deploy)
         for binary in "$HOOK_BIN" "$DAEMON_BIN" "$WORKER_BIN"; do
             if [[ -f "$target_dir/$binary" ]]; then
-                cp "$target_dir/$binary" "$INSTALL_DIR/"
-                chmod +x "$INSTALL_DIR/$binary"
+                install_binary_file "$target_dir/$binary" "$INSTALL_DIR/$binary"
                 success "Installed $binary"
             else
                 if [[ "$binary" == "$WORKER_BIN" ]]; then
@@ -794,7 +801,7 @@ download_binaries() {
 
     if [[ "$MODE" == "worker" ]]; then
         if [[ -f "$TEMP_DIR/$WORKER_BIN" ]]; then
-            install -m 755 "$TEMP_DIR/$WORKER_BIN" "$INSTALL_DIR/$WORKER_BIN"
+            install_binary_file "$TEMP_DIR/$WORKER_BIN" "$INSTALL_DIR/$WORKER_BIN"
             success "Installed $WORKER_BIN"
         else
             warn "Worker binary not in release"
@@ -806,7 +813,7 @@ download_binaries() {
     else
         for binary in "$HOOK_BIN" "$DAEMON_BIN" "$WORKER_BIN"; do
             if [[ -f "$TEMP_DIR/$binary" ]]; then
-                install -m 755 "$TEMP_DIR/$binary" "$INSTALL_DIR/$binary"
+                install_binary_file "$TEMP_DIR/$binary" "$INSTALL_DIR/$binary"
                 success "Installed $binary"
             else
                 warn "$binary not in release"
@@ -873,7 +880,7 @@ clone_and_build_from_source() {
 
     if [[ "$MODE" == "worker" ]]; then
         if [[ -f "$target_dir/$WORKER_BIN" ]]; then
-            install -m 755 "$target_dir/$WORKER_BIN" "$INSTALL_DIR/$WORKER_BIN"
+            install_binary_file "$target_dir/$WORKER_BIN" "$INSTALL_DIR/$WORKER_BIN"
             success "Installed $WORKER_BIN"
         else
             die "Worker binary not found after build"
@@ -881,7 +888,7 @@ clone_and_build_from_source() {
     else
         for binary in "$HOOK_BIN" "$DAEMON_BIN" "$WORKER_BIN"; do
             if [[ -f "$target_dir/$binary" ]]; then
-                install -m 755 "$target_dir/$binary" "$INSTALL_DIR/$binary"
+                install_binary_file "$target_dir/$binary" "$INSTALL_DIR/$binary"
                 success "Installed $binary"
             else
                 if [[ "$binary" == "$WORKER_BIN" ]]; then
@@ -1435,7 +1442,7 @@ install_from_tarball() {
     # Install binaries from tarball
     if [[ "$MODE" == "worker" ]]; then
         if [[ -f "$TEMP_DIR/$WORKER_BIN" ]]; then
-            install -m 755 "$TEMP_DIR/$WORKER_BIN" "$INSTALL_DIR/$WORKER_BIN"
+            install_binary_file "$TEMP_DIR/$WORKER_BIN" "$INSTALL_DIR/$WORKER_BIN"
             success "Installed $WORKER_BIN"
         else
             die "Worker binary not found in tarball"
@@ -1443,7 +1450,7 @@ install_from_tarball() {
     else
         for binary in "$HOOK_BIN" "$DAEMON_BIN"; do
             if [[ -f "$TEMP_DIR/$binary" ]]; then
-                install -m 755 "$TEMP_DIR/$binary" "$INSTALL_DIR/$binary"
+                install_binary_file "$TEMP_DIR/$binary" "$INSTALL_DIR/$binary"
                 success "Installed $binary"
             else
                 warn "$binary not found in tarball"
@@ -1451,7 +1458,7 @@ install_from_tarball() {
         done
 
         if [[ -f "$TEMP_DIR/$WORKER_BIN" ]]; then
-            install -m 755 "$TEMP_DIR/$WORKER_BIN" "$INSTALL_DIR/$WORKER_BIN"
+            install_binary_file "$TEMP_DIR/$WORKER_BIN" "$INSTALL_DIR/$WORKER_BIN"
             success "Installed $WORKER_BIN"
         else
             if [[ "${RCH_SKIP_FLEET_SYNC:-}" == "1" ]]; then
