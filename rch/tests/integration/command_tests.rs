@@ -166,6 +166,39 @@ fn test_doctor_subcommand_help() {
 }
 
 #[test]
+fn test_doctor_handles_closed_stdout_pipe() {
+    init_test_logging();
+    crate::test_log!("TEST START: test_doctor_handles_closed_stdout_pipe");
+
+    let output = Command::new("bash")
+        .args([
+            "-o",
+            "pipefail",
+            "-c",
+            "\"$RCH_BIN\" doctor 2>&1 | head -20",
+        ])
+        .env("RCH_BIN", env!("CARGO_BIN_EXE_rch"))
+        .output()
+        .expect("Failed to run rch doctor pipe regression");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "rch doctor should exit cleanly when stdout closes early; status={:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        stdout,
+        stderr
+    );
+    assert_contains(&stdout, "RCH Diagnostic Report");
+    assert!(
+        !stderr.contains("panicked") && !stderr.contains("core dumped"),
+        "rch doctor should not report a panic or abort when piped to head; stderr:\n{stderr}"
+    );
+    crate::test_log!("TEST PASS: test_doctor_handles_closed_stdout_pipe");
+}
+
+#[test]
 fn test_speedscore_subcommand_help() {
     init_test_logging();
     crate::test_log!("TEST START: test_speedscore_subcommand_help");
@@ -276,15 +309,14 @@ fn test_global_json_flag_accepted() {
 }
 
 #[test]
-fn test_global_color_flag_accepted() {
+fn test_global_color_flag_accepted() -> Result<(), Box<dyn std::error::Error>> {
     init_test_logging();
     crate::test_log!("TEST START: test_global_color_flag_accepted");
 
     for mode in ["auto", "always", "never"] {
         let output = Command::new(env!("CARGO_BIN_EXE_rch"))
             .args(["--color", mode, "--help"])
-            .output()
-            .unwrap_or_else(|_| panic!("Failed to run rch --color {} --help", mode));
+            .output()?;
 
         assert!(
             output.status.success(),
@@ -293,18 +325,18 @@ fn test_global_color_flag_accepted() {
         );
     }
     crate::test_log!("TEST PASS: test_global_color_flag_accepted");
+    Ok(())
 }
 
 #[test]
-fn test_global_format_flag_accepted() {
+fn test_global_format_flag_accepted() -> Result<(), Box<dyn std::error::Error>> {
     init_test_logging();
     crate::test_log!("TEST START: test_global_format_flag_accepted");
 
     for format in ["json", "toon"] {
         let output = Command::new(env!("CARGO_BIN_EXE_rch"))
             .args(["--format", format, "--help"])
-            .output()
-            .unwrap_or_else(|_| panic!("Failed to run rch --format {} --help", format));
+            .output()?;
 
         assert!(
             output.status.success(),
@@ -313,6 +345,7 @@ fn test_global_format_flag_accepted() {
         );
     }
     crate::test_log!("TEST PASS: test_global_format_flag_accepted");
+    Ok(())
 }
 
 // =============================================================================

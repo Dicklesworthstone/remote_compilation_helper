@@ -15,6 +15,7 @@ use anyhow::Result;
 use directories::ProjectDirs;
 use rch_common::ApiResponse;
 use rch_telemetry::TelemetryStorage;
+use std::io::{self, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -31,6 +32,47 @@ fn default_socket_path() -> PathBuf {
 type CheckResult = DoctorCheck;
 type CheckStatus = DoctorCheckStatus;
 type FixApplied = DoctorFixApplied;
+
+// `rch doctor` emits a long human report. A downstream consumer such as
+// `head` may close stdout early; treat that as normal Unix pipe behavior
+// instead of letting Rust's standard print macros panic.
+macro_rules! print {
+    ($($arg:tt)*) => {{
+        write_stdout(format_args!($($arg)*), false);
+    }};
+}
+
+macro_rules! println {
+    () => {{
+        write_stdout(format_args!(""), true);
+    }};
+    ($($arg:tt)*) => {{
+        write_stdout(format_args!($($arg)*), true);
+    }};
+}
+
+fn write_stdout(args: std::fmt::Arguments<'_>, newline: bool) {
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    let result = out.write_fmt(args).and_then(|()| {
+        if newline {
+            out.write_all(b"\n")
+        } else {
+            Ok(())
+        }
+    });
+
+    if let Err(err) = result {
+        if err.kind() == io::ErrorKind::BrokenPipe {
+            std::process::exit(0);
+        }
+        let _ = writeln!(
+            io::stderr().lock(),
+            "rch doctor: failed to write output: {err}"
+        );
+        std::process::exit(1);
+    }
+}
 
 // =============================================================================
 // Doctor Command Options
@@ -401,22 +443,8 @@ fn check_prerequisites(
 }
 
 fn check_command_exists(cmd: &str, description: &str) -> CheckResult {
-    let exists = Command::new("which")
-        .arg(cmd)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-
-    let version = if exists {
-        Command::new(cmd)
-            .arg("--version")
-            .output()
-            .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .map(|v| v.lines().next().unwrap_or("").to_string())
-    } else {
-        None
-    };
+    let exists = which(cmd).is_ok();
+    let version = exists.then(|| command_version(cmd)).flatten();
 
     CheckResult {
         category: "prerequisites".to_string(),
@@ -441,6 +469,29 @@ fn check_command_exists(cmd: &str, description: &str) -> CheckResult {
         fix_applied: false,
         fix_message: None,
     }
+}
+
+fn command_version(cmd: &str) -> Option<String> {
+    let output = match cmd {
+        "rsync" => Command::new("rsync").arg("--version").output().ok(),
+        "zstd" => Command::new("zstd").arg("--version").output().ok(),
+        "ssh" => Command::new("ssh").arg("-V").output().ok(),
+        "rustup" => Command::new("rustup").arg("--version").output().ok(),
+        "cargo" => Command::new("cargo").arg("--version").output().ok(),
+        _ => None,
+    }?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let text = if stdout.trim().is_empty() {
+        stderr.as_ref()
+    } else {
+        stdout.as_ref()
+    };
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_string)
 }
 
 // =============================================================================
