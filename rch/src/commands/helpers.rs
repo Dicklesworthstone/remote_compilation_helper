@@ -12,6 +12,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 #[cfg(unix)]
 use tokio::net::UnixStream;
 
+#[cfg(unix)]
+const DAEMON_COMMAND_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+#[cfg(unix)]
+const DAEMON_COMMAND_IO_TIMEOUT: Duration = Duration::from_secs(10);
+
 // ============================================================================
 // Path helpers
 // ============================================================================
@@ -649,15 +654,82 @@ pub async fn send_daemon_command(command: &str) -> Result<String> {
         .into());
     }
 
-    let stream = UnixStream::connect(socket_path).await?;
+    send_daemon_command_to_socket(socket_path, command).await
+}
+
+#[cfg(unix)]
+async fn send_daemon_command_to_socket(socket_path: &Path, command: &str) -> Result<String> {
+    let stream = tokio::time::timeout(
+        DAEMON_COMMAND_CONNECT_TIMEOUT,
+        UnixStream::connect(socket_path),
+    )
+    .await
+    .context("Timed out connecting to daemon socket")??;
     let (reader, mut writer) = stream.into_split();
 
-    writer.write_all(command.as_bytes()).await?;
-    writer.flush().await?;
+    tokio::time::timeout(DAEMON_COMMAND_IO_TIMEOUT, async {
+        writer.write_all(command.as_bytes()).await?;
+        writer.flush().await?;
+        writer.shutdown().await
+    })
+    .await
+    .context("Timed out sending daemon command")??;
 
     let mut reader = BufReader::new(reader);
     let mut response = String::new();
-    reader.read_to_string(&mut response).await?;
+    tokio::time::timeout(
+        DAEMON_COMMAND_IO_TIMEOUT,
+        reader.read_to_string(&mut response),
+    )
+    .await
+    .context("Timed out waiting for daemon response")??;
 
     Ok(response)
+}
+
+#[cfg(all(test, unix))]
+mod daemon_command_tests {
+    use super::*;
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+    use tokio::net::UnixListener;
+
+    #[tokio::test]
+    async fn send_daemon_command_half_closes_request_before_waiting_for_response() -> Result<()> {
+        let temp_dir = tempfile::tempdir().context("create temp dir")?;
+        let socket_path = temp_dir.path().join("rch-test.sock");
+        let listener = UnixListener::bind(&socket_path).context("bind test socket")?;
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.context("accept client")?;
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(reader);
+
+            let mut line = String::new();
+            reader.read_line(&mut line).await.context("read request")?;
+            assert_eq!(line, "GET /status\n");
+
+            let mut eof_probe = String::new();
+            let bytes = tokio::time::timeout(
+                Duration::from_secs(1),
+                reader.read_to_string(&mut eof_probe),
+            )
+            .await
+            .context("client should half-close request")?
+            .context("read client eof")?;
+            assert_eq!(bytes, 0);
+
+            writer
+                .write_all(b"HTTP/1.1 200 OK\r\n\r\n{\"ok\":true}\n")
+                .await
+                .context("write response")?;
+            Result::<()>::Ok(())
+        });
+
+        let response = send_daemon_command_to_socket(&socket_path, "GET /status\n")
+            .await
+            .context("daemon response")?;
+        assert!(response.contains("\"ok\":true"));
+        server.await.context("server task")??;
+        Ok(())
+    }
 }
