@@ -24,7 +24,7 @@ use anyhow::Result;
 
 use crate::error::BinaryError;
 use rch_common::{ApiError, ApiResponse, ErrorCode};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub use audit::{AuditEventType, AuditLogger, DeploymentAuditEntry};
 pub use dry_run::{DryRunResult, PotentialIssue, PredictedAction, WorkerPrediction};
@@ -827,32 +827,22 @@ pub async fn history(ctx: &OutputContext, limit: usize, worker: Option<String>) 
 
 /// Find a local binary in common locations.
 fn find_local_binary(name: &str) -> Result<PathBuf> {
-    let mut locations: Vec<Option<PathBuf>> = Vec::new();
+    let current_exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf));
+    let home_dir = dirs::home_dir();
+    let path_binary = which::which(name).ok();
+    let cargo_target_dir = std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from);
+    let cwd = std::env::current_dir().ok();
 
-    // Check CARGO_TARGET_DIR first if set (development with custom target dir)
-    if let Ok(target_dir) = std::env::var("CARGO_TARGET_DIR") {
-        let target_path = PathBuf::from(target_dir);
-        locations.push(Some(target_path.join("release").join(name)));
-        locations.push(Some(target_path.join("debug").join(name)));
-    }
-
-    // Target directory (development)
-    if let Ok(cwd) = std::env::current_dir() {
-        locations.push(Some(cwd.join("target/release").join(name)));
-        locations.push(Some(cwd.join("target/debug").join(name)));
-    }
-
-    // Cargo install location
-    locations.push(dirs::home_dir().map(|h| h.join(".cargo/bin").join(name)));
-
-    // User local bin
-    locations.push(dirs::home_dir().map(|h| h.join(".local/bin").join(name)));
-
-    // System paths
-    locations.push(Some(PathBuf::from("/usr/local/bin").join(name)));
-    locations.push(Some(PathBuf::from("/usr/bin").join(name)));
-
-    for loc in locations.into_iter().flatten() {
+    for loc in local_binary_candidate_locations(
+        name,
+        current_exe_dir.as_deref(),
+        home_dir.as_deref(),
+        path_binary.as_deref(),
+        cargo_target_dir.as_deref(),
+        cwd.as_deref(),
+    ) {
         if loc.exists() && loc.is_file() {
             return Ok(loc);
         }
@@ -862,6 +852,45 @@ fn find_local_binary(name: &str) -> Result<PathBuf> {
         name: name.to_string(),
     }
     .into())
+}
+
+fn local_binary_candidate_locations(
+    name: &str,
+    current_exe_dir: Option<&Path>,
+    home_dir: Option<&Path>,
+    path_binary: Option<&Path>,
+    cargo_target_dir: Option<&Path>,
+    cwd: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut locations = Vec::new();
+
+    if let Some(dir) = current_exe_dir {
+        locations.push(dir.join(name));
+    }
+
+    if let Some(home) = home_dir {
+        locations.push(home.join(".local/bin").join(name));
+        locations.push(home.join(".cargo/bin").join(name));
+    }
+
+    locations.push(PathBuf::from("/usr/local/bin").join(name));
+    locations.push(PathBuf::from("/usr/bin").join(name));
+
+    if let Some(path) = path_binary {
+        locations.push(path.to_path_buf());
+    }
+
+    if let Some(target_dir) = cargo_target_dir {
+        locations.push(target_dir.join("release").join(name));
+        locations.push(target_dir.join("debug").join(name));
+    }
+
+    if let Some(cwd) = cwd {
+        locations.push(cwd.join("target/release").join(name));
+        locations.push(cwd.join("target/debug").join(name));
+    }
+
+    locations
 }
 
 #[cfg(test)]
@@ -918,6 +947,37 @@ mod tests {
         assert!(
             value.get("command").is_some(),
             "expected ApiResponse-like JSON with 'command' field"
+        );
+    }
+
+    #[test]
+    fn binary_candidates_prefer_installed_sibling_over_stale_cargo_target() {
+        let candidates = local_binary_candidate_locations(
+            "rch-wkr",
+            Some(Path::new("/home/ubuntu/.local/bin")),
+            Some(Path::new("/home/ubuntu")),
+            Some(Path::new("/data/tmp/cargo-target/release/rch-wkr")),
+            Some(Path::new("/data/tmp/cargo-target")),
+            Some(Path::new("/data/projects/remote_compilation_helper")),
+        );
+
+        let installed_sibling = PathBuf::from("/home/ubuntu/.local/bin/rch-wkr");
+        let stale_target = PathBuf::from("/data/tmp/cargo-target/release/rch-wkr");
+
+        assert_eq!(candidates.first(), Some(&installed_sibling));
+
+        let installed_position = candidates
+            .iter()
+            .position(|path| path == &installed_sibling)
+            .expect("installed sibling should be considered");
+        let stale_target_position = candidates
+            .iter()
+            .position(|path| path == &stale_target)
+            .expect("cargo target fallback should still be considered");
+
+        assert!(
+            installed_position < stale_target_position,
+            "installed binary must win over stale CARGO_TARGET_DIR fallback"
         );
     }
 
