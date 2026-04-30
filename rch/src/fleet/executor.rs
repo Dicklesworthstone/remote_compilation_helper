@@ -22,13 +22,19 @@ use anyhow::Result;
 
 use crate::error::{FleetError, SshError};
 use futures::future::BoxFuture;
+use rch_common::ssh_utils::shell_escape_path_with_home;
 use rch_common::{WorkerConfig, WorkerId};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
+
+const REMOTE_WORKER_BINARY: &str = "~/.local/bin/rch-wkr";
+static STAGED_BINARY_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Result of a fleet deployment operation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -489,22 +495,46 @@ async fn create_remote_directory(worker: &WorkerConfig) -> Result<()> {
 
 /// Copy the binary to the worker via SCP.
 ///
-/// Uses `SshExecutor::copy_file()` for consistent behavior and logging.
+/// Uploads to a temporary file in the target directory, then atomically renames
+/// it into place. Directly scp'ing onto `rch-wkr` can fail when the worker
+/// binary is currently executing.
 async fn copy_binary_via_scp(worker: &WorkerConfig, local_binary: &Path) -> Result<()> {
     let ssh = SshExecutor::new(worker);
-    let remote_path = "~/.local/bin/rch-wkr";
+    let remote_path = REMOTE_WORKER_BINARY;
+    let staging_path = remote_worker_binary_staging_path();
 
     debug!(
         "SCP: {} -> {}@{}:{}",
         local_binary.display(),
         worker.user,
         worker.host,
-        remote_path
+        staging_path
     );
 
-    ssh.copy_file(local_binary, remote_path)
+    ssh.copy_file(local_binary, &staging_path)
         .await
-        .map_err(|e| anyhow::anyhow!("scp failed: {}", e))
+        .map_err(|e| anyhow::anyhow!("scp failed: {}", e))?;
+
+    let finalize_cmd = finalize_staged_binary_command(&staging_path, remote_path)?;
+    let output = ssh
+        .run_command(&finalize_cmd)
+        .await
+        .map_err(|e| anyhow::anyhow!("finalize staged binary failed: {}", e))?;
+
+    if output.success() {
+        return Ok(());
+    }
+
+    if let Ok(staging_path) = remote_shell_path(&staging_path) {
+        let cleanup_cmd = format!("rm -f {staging_path}");
+        let _ = ssh.run_command(&cleanup_cmd).await;
+    }
+
+    Err(anyhow::anyhow!(
+        "finalize staged binary failed with exit {}: {}",
+        output.exit_code,
+        output.stderr.trim()
+    ))
 }
 
 /// Set executable permissions on the remote binary.
@@ -512,7 +542,7 @@ async fn copy_binary_via_scp(worker: &WorkerConfig, local_binary: &Path) -> Resu
 /// Uses `SshExecutor::set_executable()` for consistent behavior and logging.
 async fn set_executable_permissions(worker: &WorkerConfig) -> Result<()> {
     let ssh = SshExecutor::new(worker);
-    ssh.set_executable("~/.local/bin/rch-wkr")
+    ssh.set_executable(REMOTE_WORKER_BINARY)
         .await
         .map_err(|e| anyhow::anyhow!("chmod failed: {}", e))
 }
@@ -535,6 +565,33 @@ async fn verify_installation(worker: &WorkerConfig) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn remote_worker_binary_staging_path() -> String {
+    let counter = STAGED_BINARY_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    format!(
+        "~/.local/bin/.rch-wkr.tmp.{}.{}.{}",
+        std::process::id(),
+        nonce,
+        counter
+    )
+}
+
+fn remote_shell_path(remote_path: &str) -> Result<String> {
+    shell_escape_path_with_home(remote_path)
+        .ok_or_else(|| anyhow::anyhow!("invalid remote path contains control characters"))
+}
+
+fn finalize_staged_binary_command(staging_path: &str, final_path: &str) -> Result<String> {
+    Ok(format!(
+        "set -e; chmod +x {staged}; mv -f {staged} {final_path}",
+        staged = remote_shell_path(staging_path)?,
+        final_path = remote_shell_path(final_path)?
+    ))
 }
 
 // =============================================================================
@@ -904,61 +961,62 @@ mod tests {
     }
 
     #[test]
-    fn fleet_result_aborted_special_chars_in_reason() {
+    fn fleet_result_aborted_special_chars_in_reason() -> Result<()> {
         let result = FleetResult::Aborted {
             reason: "User cancelled: \"interrupted\" <signal>".to_string(),
         };
-        let json = serde_json::to_string(&result).unwrap();
-        let deserialized: FleetResult = serde_json::from_str(&json).unwrap();
-        match deserialized {
-            FleetResult::Aborted { reason } => {
-                assert!(reason.contains("interrupted"));
-                assert!(reason.contains("<signal>"));
-            }
-            _ => panic!("Expected Aborted variant"),
-        }
+        let json = serde_json::to_string(&result)?;
+        let deserialized: FleetResult = serde_json::from_str(&json)?;
+        let FleetResult::Aborted { reason } = deserialized else {
+            return Err(anyhow::anyhow!("expected Aborted variant"));
+        };
+
+        assert!(reason.contains("interrupted"));
+        assert!(reason.contains("<signal>"));
+        Ok(())
     }
 
     #[test]
-    fn fleet_result_deserialize_success() {
+    fn fleet_result_deserialize_success() -> Result<()> {
         let json = r#"{"status":"Success","deployed":3,"skipped":1,"failed":0}"#;
-        let result: FleetResult = serde_json::from_str(json).unwrap();
-        match result {
-            FleetResult::Success {
-                deployed,
-                skipped,
-                failed,
-            } => {
-                assert_eq!(deployed, 3);
-                assert_eq!(skipped, 1);
-                assert_eq!(failed, 0);
-            }
-            _ => panic!("Expected Success variant"),
-        }
+        let result: FleetResult = serde_json::from_str(json)?;
+        let FleetResult::Success {
+            deployed,
+            skipped,
+            failed,
+        } = result
+        else {
+            return Err(anyhow::anyhow!("expected Success variant"));
+        };
+
+        assert_eq!(deployed, 3);
+        assert_eq!(skipped, 1);
+        assert_eq!(failed, 0);
+        Ok(())
     }
 
     #[test]
-    fn fleet_result_deserialize_canary_failed() {
+    fn fleet_result_deserialize_canary_failed() -> Result<()> {
         let json = r#"{"status":"CanaryFailed","reason":"worker timeout"}"#;
-        let result: FleetResult = serde_json::from_str(json).unwrap();
-        match result {
-            FleetResult::CanaryFailed { reason } => {
-                assert_eq!(reason, "worker timeout");
-            }
-            _ => panic!("Expected CanaryFailed variant"),
-        }
+        let result: FleetResult = serde_json::from_str(json)?;
+        let FleetResult::CanaryFailed { reason } = result else {
+            return Err(anyhow::anyhow!("expected CanaryFailed variant"));
+        };
+
+        assert_eq!(reason, "worker timeout");
+        Ok(())
     }
 
     #[test]
-    fn fleet_result_deserialize_aborted() {
+    fn fleet_result_deserialize_aborted() -> Result<()> {
         let json = r#"{"status":"Aborted","reason":"ctrl+c"}"#;
-        let result: FleetResult = serde_json::from_str(json).unwrap();
-        match result {
-            FleetResult::Aborted { reason } => {
-                assert_eq!(reason, "ctrl+c");
-            }
-            _ => panic!("Expected Aborted variant"),
-        }
+        let result: FleetResult = serde_json::from_str(json)?;
+        let FleetResult::Aborted { reason } = result else {
+            return Err(anyhow::anyhow!("expected Aborted variant"));
+        };
+
+        assert_eq!(reason, "ctrl+c");
+        Ok(())
     }
 
     #[test]
@@ -1024,6 +1082,28 @@ mod tests {
         assert_eq!(executor.worker_configs.len(), 2);
         assert!(executor.worker_configs.contains_key("worker-1"));
         assert!(executor.worker_configs.contains_key("worker-2"));
+    }
+
+    #[test]
+    fn finalize_staged_binary_command_renames_temp_binary_into_place() -> Result<()> {
+        let command = finalize_staged_binary_command(
+            "~/.local/bin/.rch-wkr.tmp.123.456",
+            REMOTE_WORKER_BINARY,
+        )?;
+
+        assert!(command.contains("chmod +x \"$HOME/.local/bin/.rch-wkr.tmp.123.456\""));
+        assert!(command.contains(
+            "mv -f \"$HOME/.local/bin/.rch-wkr.tmp.123.456\" \"$HOME/.local/bin/rch-wkr\""
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn remote_worker_binary_staging_path_never_targets_live_binary() {
+        let staging_path = remote_worker_binary_staging_path();
+
+        assert!(staging_path.starts_with("~/.local/bin/.rch-wkr.tmp."));
+        assert_ne!(staging_path, REMOTE_WORKER_BINARY);
     }
 
     // ========================
