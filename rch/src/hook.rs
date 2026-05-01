@@ -100,6 +100,9 @@ const EXIT_TEST_FAILURES: i32 = 101;
 #[allow(dead_code)] // Used in run_exec
 const EXIT_SIGNAL_BASE: i32 = 128;
 
+const RCH_CARGO_WRAPPER_BYPASS_ENV: &str = "RCH_CARGO_WRAPPER_BYPASS";
+const RCH_REQUIRE_REMOTE_ENV: &str = "RCH_REQUIRE_REMOTE";
+
 use rch_common::util::mask_sensitive_command;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -217,6 +220,43 @@ fn normalize_exec_command_parts(command_parts: &[String]) -> Vec<String> {
     command_parts.to_vec()
 }
 
+fn env_flag_enabled(value: &str) -> bool {
+    matches!(
+        value.to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+fn exec_requires_remote() -> bool {
+    std::env::var(RCH_REQUIRE_REMOTE_ENV).is_ok_and(|value| env_flag_enabled(&value))
+}
+
+fn local_fallback_command(command: &str) -> std::process::Command {
+    let mut child = std::process::Command::new("sh");
+    child
+        .env(RCH_CARGO_WRAPPER_BYPASS_ENV, "1")
+        .arg("-c")
+        .arg(command);
+    child
+}
+
+fn exit_with_local_fallback(command: &str, reporter: &HookReporter, reason: &str) -> ! {
+    if exec_requires_remote() {
+        reporter.summary(&format!(
+            "[RCH] remote required; refusing local fallback ({reason})"
+        ));
+        std::process::exit(EXIT_BUILD_ERROR);
+    }
+
+    match local_fallback_command(command).status() {
+        Ok(status) => std::process::exit(status.code().unwrap_or(1)),
+        Err(error) => {
+            reporter.summary(&format!("[RCH] local fallback failed: {error}"));
+            std::process::exit(EXIT_BUILD_ERROR);
+        }
+    }
+}
+
 pub async fn run_exec(command_parts: Vec<String>) -> anyhow::Result<()> {
     let command = join_exec_command(&command_parts);
     if command.is_empty() {
@@ -229,10 +269,7 @@ pub async fn run_exec(command_parts: Vec<String>) -> anyhow::Result<()> {
         // Not a compilation command - just run locally
         // This shouldn't normally happen since the hook only rewrites compilations
         warn!("exec called with non-compilation command: {}", command);
-        let status = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(&command)
-            .status()?;
+        let status = local_fallback_command(&command).status()?;
         std::process::exit(status.code().unwrap_or(1));
     }
 
@@ -240,11 +277,8 @@ pub async fn run_exec(command_parts: Vec<String>) -> anyhow::Result<()> {
         Ok(cfg) => cfg,
         Err(e) => {
             warn!("Failed to load config: {}, running locally", e);
-            let status = std::process::Command::new("sh")
-                .arg("-c")
-                .arg(&command)
-                .status()?;
-            std::process::exit(status.code().unwrap_or(1));
+            let reporter = HookReporter::new(OutputVisibility::Summary);
+            exit_with_local_fallback(&command, &reporter, "config unavailable");
         }
     };
 
@@ -327,20 +361,12 @@ pub async fn run_exec(command_parts: Vec<String>) -> anyhow::Result<()> {
                     Ok(resp) => resp,
                     Err(_) => {
                         reporter.summary("[RCH] local (daemon unavailable)");
-                        let status = std::process::Command::new("sh")
-                            .arg("-c")
-                            .arg(&command)
-                            .status()?;
-                        std::process::exit(status.code().unwrap_or(1));
+                        exit_with_local_fallback(&command, &reporter, "daemon unavailable");
                     }
                 }
             } else {
                 reporter.summary("[RCH] local (daemon unavailable)");
-                let status = std::process::Command::new("sh")
-                    .arg("-c")
-                    .arg(&command)
-                    .status()?;
-                std::process::exit(status.code().unwrap_or(1));
+                exit_with_local_fallback(&command, &reporter, "daemon unavailable");
             }
         }
     };
@@ -348,11 +374,7 @@ pub async fn run_exec(command_parts: Vec<String>) -> anyhow::Result<()> {
     // Check if a worker was assigned
     let Some(worker) = response.worker else {
         reporter.summary(&format!("[RCH] local ({})", response.reason));
-        let status = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(&command)
-            .status()?;
-        std::process::exit(status.code().unwrap_or(1));
+        exit_with_local_fallback(&command, &reporter, "no worker assigned");
     };
 
     info!(
@@ -430,11 +452,7 @@ pub async fn run_exec(command_parts: Vec<String>) -> anyhow::Result<()> {
                 // Toolchain failure - fall back to local
                 warn!("Remote toolchain failure, falling back to local");
                 reporter.summary(&format!("[RCH] local (toolchain missing on {})", worker.id));
-                let status = std::process::Command::new("sh")
-                    .arg("-c")
-                    .arg(&command)
-                    .status()?;
-                std::process::exit(status.code().unwrap_or(1));
+                exit_with_local_fallback(&command, &reporter, "remote toolchain missing");
             } else if let Some(env_failure) =
                 detect_worker_system_dependency_failure(&result.stderr, result.exit_code)
             {
@@ -480,11 +498,7 @@ pub async fn run_exec(command_parts: Vec<String>) -> anyhow::Result<()> {
                     "[RCH] dependency preflight report: {}",
                     preflight_err.report_json()
                 ));
-                let status = std::process::Command::new("sh")
-                    .arg("-c")
-                    .arg(&command)
-                    .status()?;
-                std::process::exit(status.code().unwrap_or(1));
+                exit_with_local_fallback(&command, &reporter, "dependency preflight failed");
             }
 
             // Check for transfer skip (not a failure)
@@ -492,11 +506,7 @@ pub async fn run_exec(command_parts: Vec<String>) -> anyhow::Result<()> {
                 && let TransferError::TransferSkipped { reason } = skip_err
             {
                 reporter.summary(&format!("[RCH] local ({})", reason));
-                let status = std::process::Command::new("sh")
-                    .arg("-c")
-                    .arg(&command)
-                    .status()?;
-                std::process::exit(status.code().unwrap_or(1));
+                exit_with_local_fallback(&command, &reporter, "transfer skipped");
             }
 
             if classify_remote_pipeline_failure(&e)
@@ -513,11 +523,7 @@ pub async fn run_exec(command_parts: Vec<String>) -> anyhow::Result<()> {
             // Other errors - run locally
             warn!("Remote execution failed: {}, running locally", e);
             reporter.summary("[RCH] local (remote execution failed)");
-            let status = std::process::Command::new("sh")
-                .arg("-c")
-                .arg(&command)
-                .status()?;
-            std::process::exit(status.code().unwrap_or(1));
+            exit_with_local_fallback(&command, &reporter, "remote execution failed");
         }
     }
 }
@@ -5972,6 +5978,43 @@ mod tests {
         let _guard = test_guard!();
         let parts: Vec<String> = Vec::new();
         assert_eq!(join_exec_command(&parts), "");
+    }
+
+    #[test]
+    fn local_fallback_command_bypasses_cargo_wrapper() {
+        let _guard = test_guard!();
+        let command = local_fallback_command("cargo test -p rch");
+
+        let has_bypass = command.get_envs().any(|(key, value)| {
+            key == std::ffi::OsStr::new(RCH_CARGO_WRAPPER_BYPASS_ENV)
+                && value == Some(std::ffi::OsStr::new("1"))
+        });
+        assert!(
+            has_bypass,
+            "local fallback must bypass the PATH cargo wrapper to avoid recursive rch exec"
+        );
+
+        let args = command.get_args().collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            vec![
+                std::ffi::OsStr::new("-c"),
+                std::ffi::OsStr::new("cargo test -p rch")
+            ]
+        );
+    }
+
+    #[test]
+    fn env_flag_enabled_accepts_common_truthy_values() {
+        let _guard = test_guard!();
+
+        for value in ["1", "true", "TRUE", "yes", "on"] {
+            assert!(env_flag_enabled(value), "{value} should be truthy");
+        }
+
+        for value in ["", "0", "false", "no", "off", "remote"] {
+            assert!(!env_flag_enabled(value), "{value} should not be truthy");
+        }
     }
 
     fn test_lock() -> &'static Mutex<()> {
