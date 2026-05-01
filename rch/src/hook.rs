@@ -102,6 +102,36 @@ const EXIT_SIGNAL_BASE: i32 = 128;
 
 use rch_common::util::mask_sensitive_command;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemotePipelineFailurePolicy {
+    AllowLocalFallback,
+    FailClosedNoLocalFallback,
+}
+
+fn classify_remote_pipeline_failure(error: &anyhow::Error) -> RemotePipelineFailurePolicy {
+    if is_ssh_command_timeout_error(error) {
+        RemotePipelineFailurePolicy::FailClosedNoLocalFallback
+    } else {
+        RemotePipelineFailurePolicy::AllowLocalFallback
+    }
+}
+
+fn is_ssh_command_timeout_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let message = cause.to_string();
+        message.contains("SSH command timed out after")
+            || message.contains("Command timed out after")
+    })
+}
+
+fn remote_pipeline_failure_summary(worker_id: &WorkerId) -> String {
+    format!(
+        "[RCH] remote {} failed [{}] SSH command timed out (no local fallback)",
+        worker_id,
+        ErrorCode::SshTimeout.code_string()
+    )
+}
+
 /// Run the hook, reading from stdin and writing to stdout.
 pub async fn run_hook() -> anyhow::Result<()> {
     let mut stdout = io::stdout();
@@ -467,6 +497,17 @@ pub async fn run_exec(command_parts: Vec<String>) -> anyhow::Result<()> {
                     .arg(&command)
                     .status()?;
                 std::process::exit(status.code().unwrap_or(1));
+            }
+
+            if classify_remote_pipeline_failure(&e)
+                == RemotePipelineFailurePolicy::FailClosedNoLocalFallback
+            {
+                warn!(
+                    "Remote execution failed on {} with SSH timeout; refusing local fallback: {}",
+                    worker.id, e
+                );
+                reporter.summary(&remote_pipeline_failure_summary(&worker.id));
+                std::process::exit(EXIT_BUILD_ERROR);
             }
 
             // Other errors - run locally
@@ -1982,6 +2023,20 @@ async fn handle_selection_response(
                 );
                 reporter.summary(&format!("[RCH] local ({})", reason));
                 return HookOutput::allow();
+            }
+
+            if classify_remote_pipeline_failure(&e)
+                == RemotePipelineFailurePolicy::FailClosedNoLocalFallback
+            {
+                warn!(
+                    "Remote execution pipeline failed on {} with SSH timeout; refusing local fallback: {}",
+                    worker.id, e
+                );
+                reporter.summary(&remote_pipeline_failure_summary(&worker.id));
+                return HookOutput::allow_with_modified_command(format!(
+                    "exit {}",
+                    EXIT_BUILD_ERROR
+                ));
             }
 
             // Pipeline failed - fall back to local execution
@@ -7597,6 +7652,40 @@ mod tests {
         assert_eq!(EXIT_BUILD_ERROR, 1);
         assert_eq!(EXIT_TEST_FAILURES, 101);
         assert_eq!(EXIT_SIGNAL_BASE, 128);
+    }
+
+    #[test]
+    fn test_remote_pipeline_failure_policy_ssh_timeout_fails_closed() {
+        let _guard = test_guard!();
+        let error = anyhow::anyhow!("SSH command timed out after 1800s");
+
+        assert_eq!(
+            classify_remote_pipeline_failure(&error),
+            RemotePipelineFailurePolicy::FailClosedNoLocalFallback
+        );
+    }
+
+    #[test]
+    fn test_remote_pipeline_failure_policy_wrapped_ssh_timeout_fails_closed() {
+        let _guard = test_guard!();
+        let error =
+            anyhow::anyhow!("SSH command timed out after 1800s").context("remote execution failed");
+
+        assert_eq!(
+            classify_remote_pipeline_failure(&error),
+            RemotePipelineFailurePolicy::FailClosedNoLocalFallback
+        );
+    }
+
+    #[test]
+    fn test_remote_pipeline_failure_policy_non_timeout_allows_existing_fallback() {
+        let _guard = test_guard!();
+        let error = anyhow::anyhow!("rsync failed before remote execution");
+
+        assert_eq!(
+            classify_remote_pipeline_failure(&error),
+            RemotePipelineFailurePolicy::AllowLocalFallback
+        );
     }
 
     #[test]
