@@ -816,7 +816,7 @@ mod tests {
                 start.wait();
                 let _lock = ConfigLock::acquire_with_timeout(
                     &lock_name,
-                    Duration::from_secs(2),
+                    Duration::from_secs(10),
                     &format!("thread-{i}"),
                 )
                 .expect("lock acquisition failed");

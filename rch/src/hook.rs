@@ -4712,6 +4712,24 @@ fn get_artifact_patterns(kind: Option<CompilationKind>) -> Vec<String> {
     }
 }
 
+fn get_custom_target_artifact_patterns(kind: Option<CompilationKind>) -> Vec<String> {
+    match kind {
+        Some(CompilationKind::CargoTest) => Vec::new(),
+        Some(CompilationKind::CargoNextest) | Some(CompilationKind::CargoBench) => {
+            get_artifact_patterns(kind)
+                .into_iter()
+                .map(|pattern| {
+                    pattern
+                        .strip_prefix("target/")
+                        .unwrap_or(pattern.as_str())
+                        .to_string()
+                })
+                .collect()
+        }
+        _ => vec!["**".to_string()],
+    }
+}
+
 const BUILD_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
@@ -5509,89 +5527,96 @@ async fn execute_remote_compilation(
 
         if let Some(local_target_dir) = forwarded_cargo_target_dir.as_ref() {
             let remote_target_path = format!("{}/.rch-target", pipeline.remote_path());
-            let custom_patterns = vec!["**".to_string()];
-            let target_pipeline = TransferPipeline::new(
-                local_target_dir.clone(),
-                project_id_from_path(local_target_dir),
-                compute_project_hash_with_dependency_roots_and_policy(
-                    local_target_dir,
-                    &[],
-                    topology_policy,
-                ),
-                transfer_config.clone(),
-            )
-            .with_color_mode(color_mode)
-            .with_command_timeout(command_timeout)
-            .with_compilation_config(compilation_config.clone())
-            .with_compilation_kind(kind)
-            .with_remote_path_override(remote_target_path.clone());
-
-            let mut target_progress = if progress_enabled {
-                Some(TransferProgress::download(
-                    output_ctx,
-                    "Syncing custom CARGO_TARGET_DIR artifacts",
-                    reporter.visibility == OutputVisibility::None,
-                ))
+            let custom_patterns = get_custom_target_artifact_patterns(kind);
+            if custom_patterns.is_empty() {
+                reporter.verbose(&format!(
+                    "[RCH] custom target dir sync skipped for {} after test command",
+                    local_target_dir.display()
+                ));
             } else {
-                None
-            };
+                let target_pipeline = TransferPipeline::new(
+                    local_target_dir.clone(),
+                    project_id_from_path(local_target_dir),
+                    compute_project_hash_with_dependency_roots_and_policy(
+                        local_target_dir,
+                        &[],
+                        topology_policy,
+                    ),
+                    transfer_config.clone(),
+                )
+                .with_color_mode(color_mode)
+                .with_command_timeout(command_timeout)
+                .with_compilation_config(compilation_config.clone())
+                .with_compilation_kind(kind)
+                .with_remote_path_override(remote_target_path.clone());
 
-            let target_retrieval = if let Some(progress) = &mut target_progress {
-                let heartbeat_state_target = heartbeat_loop
-                    .as_ref()
-                    .map(BuildHeartbeatLoop::shared_state);
-                target_pipeline
-                    .retrieve_artifacts_streaming(&worker_config, &custom_patterns, |line| {
-                        progress.update_from_line(line);
-                        if let Some(state) = heartbeat_state_target.as_ref() {
-                            mark_heartbeat_progress(state);
-                        }
-                    })
-                    .await
-            } else {
-                target_pipeline
-                    .retrieve_artifacts(&worker_config, &custom_patterns)
-                    .await
-            };
+                let mut target_progress = if progress_enabled {
+                    Some(TransferProgress::download(
+                        output_ctx,
+                        "Syncing custom CARGO_TARGET_DIR artifacts",
+                        reporter.visibility == OutputVisibility::None,
+                    ))
+                } else {
+                    None
+                };
 
-            match target_retrieval {
-                Ok(target_result) => {
-                    info!(
-                        "Custom CARGO_TARGET_DIR artifacts retrieved: {} files, {} bytes in {}ms",
-                        target_result.files_transferred,
-                        target_result.bytes_transferred,
-                        target_result.duration_ms
-                    );
-                    reporter.verbose(&format!(
-                        "[RCH] custom target dir sync done: {} -> {} ({} files, {} bytes in {}ms)",
-                        remote_target_path,
-                        local_target_dir.display(),
-                        target_result.files_transferred,
-                        target_result.bytes_transferred,
-                        target_result.duration_ms
-                    ));
-                    if let Some(progress) = &mut target_progress {
-                        progress.apply_summary(
-                            target_result.bytes_transferred,
+                let target_retrieval = if let Some(progress) = &mut target_progress {
+                    let heartbeat_state_target = heartbeat_loop
+                        .as_ref()
+                        .map(BuildHeartbeatLoop::shared_state);
+                    target_pipeline
+                        .retrieve_artifacts_streaming(&worker_config, &custom_patterns, |line| {
+                            progress.update_from_line(line);
+                            if let Some(state) = heartbeat_state_target.as_ref() {
+                                mark_heartbeat_progress(state);
+                            }
+                        })
+                        .await
+                } else {
+                    target_pipeline
+                        .retrieve_artifacts(&worker_config, &custom_patterns)
+                        .await
+                };
+
+                match target_retrieval {
+                    Ok(target_result) => {
+                        info!(
+                            "Custom CARGO_TARGET_DIR artifacts retrieved: {} files, {} bytes in {}ms",
                             target_result.files_transferred,
+                            target_result.bytes_transferred,
+                            target_result.duration_ms
                         );
-                        progress.finish();
+                        reporter.verbose(&format!(
+                            "[RCH] custom target dir sync done: {} -> {} ({} files, {} bytes in {}ms)",
+                            remote_target_path,
+                            local_target_dir.display(),
+                            target_result.files_transferred,
+                            target_result.bytes_transferred,
+                            target_result.duration_ms
+                        ));
+                        if let Some(progress) = &mut target_progress {
+                            progress.apply_summary(
+                                target_result.bytes_transferred,
+                                target_result.files_transferred,
+                            );
+                            progress.finish();
+                        }
+                        artifacts_result = Some(match artifacts_result.take() {
+                            Some(existing) => merge_sync_result(&existing, &target_result),
+                            None => target_result,
+                        });
                     }
-                    artifacts_result = Some(match artifacts_result.take() {
-                        Some(existing) => merge_sync_result(&existing, &target_result),
-                        None => target_result,
-                    });
-                }
-                Err(e) => {
-                    artifacts_failed = true;
-                    warn!("Failed to sync custom CARGO_TARGET_DIR artifacts: {}", e);
-                    reporter.verbose(&format!(
-                        "[RCH] custom target dir sync failed for {}: {}",
-                        local_target_dir.display(),
-                        e
-                    ));
-                    if let Some(progress) = &mut target_progress {
-                        progress.finish_error(&e.to_string());
+                    Err(e) => {
+                        artifacts_failed = true;
+                        warn!("Failed to sync custom CARGO_TARGET_DIR artifacts: {}", e);
+                        reporter.verbose(&format!(
+                            "[RCH] custom target dir sync failed for {}: {}",
+                            local_target_dir.display(),
+                            e
+                        ));
+                        if let Some(progress) = &mut target_progress {
+                            progress.finish_error(&e.to_string());
+                        }
                     }
                 }
             }
@@ -9673,6 +9698,44 @@ edition = "2024"
             !test_patterns.iter().any(|p| p == "target/release/**"),
             "Test artifacts should not include target/release/**"
         );
+    }
+
+    #[test]
+    fn test_custom_target_artifact_patterns_for_cargo_test_are_skipped() {
+        let _guard = test_guard!();
+        let patterns = get_custom_target_artifact_patterns(Some(CompilationKind::CargoTest));
+
+        assert!(
+            patterns.is_empty(),
+            "cargo test output is streamed; do not sync a custom target dir after tests"
+        );
+    }
+
+    #[test]
+    fn test_custom_target_artifact_patterns_for_nextest_are_target_relative() {
+        let _guard = test_guard!();
+        let patterns = get_custom_target_artifact_patterns(Some(CompilationKind::CargoNextest));
+
+        assert!(
+            !patterns.iter().any(|p| p == "**"),
+            "nextest custom target retrieval must not sync the full target dir"
+        );
+        assert!(
+            !patterns.iter().any(|p| p.starts_with("target/")),
+            "custom target retrieval is already rooted at the target dir"
+        );
+        assert!(
+            patterns.iter().any(|p| p == "nextest/**"),
+            "nextest custom target retrieval should keep targeted test artifacts"
+        );
+    }
+
+    #[test]
+    fn test_custom_target_artifact_patterns_for_build_commands_keep_full_target() {
+        let _guard = test_guard!();
+        let patterns = get_custom_target_artifact_patterns(Some(CompilationKind::CargoBuild));
+
+        assert_eq!(patterns, vec!["**".to_string()]);
     }
 
     // =========================================================================

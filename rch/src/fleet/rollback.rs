@@ -55,7 +55,7 @@ const REGISTRY_FILE: &str = "registry.json";
 const ROLLBACK_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Timeout for acquiring the backup registry lock.
-const REGISTRY_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+const REGISTRY_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Maximum concurrent rollback operations (cap to prevent resource exhaustion).
 const MAX_CONCURRENT_ROLLBACKS: usize = 10;
