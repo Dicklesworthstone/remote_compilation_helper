@@ -168,9 +168,23 @@ pub async fn run_hook() -> anyhow::Result<()> {
 /// re-split on those literals and silently corrupt the command.
 ///
 /// `shell_words::join` re-quotes each entry so round-tripping through
-/// `sh -c` is a no-op.
+/// `sh -c` is a no-op. Some callers pass `rch exec -- "<whole shell command>"`
+/// as a single argv entry; split that shell command once before re-quoting so
+/// `sh -c` sees `env VAR=... cargo ...` instead of one quoted command name.
 fn join_exec_command(command_parts: &[String]) -> String {
-    shell_words::join(command_parts)
+    let normalized_parts = normalize_exec_command_parts(command_parts);
+    shell_words::join(normalized_parts)
+}
+
+fn normalize_exec_command_parts(command_parts: &[String]) -> Vec<String> {
+    if command_parts.len() == 1 {
+        match shell_words::split(&command_parts[0]) {
+            Ok(parts) if parts.len() > 1 => return parts,
+            _ => {}
+        }
+    }
+
+    command_parts.to_vec()
 }
 
 pub async fn run_exec(command_parts: Vec<String>) -> anyhow::Result<()> {
@@ -5795,6 +5809,45 @@ mod tests {
     }
 
     #[test]
+    fn join_exec_command_splits_single_shell_command_arg() {
+        let _guard = test_guard!();
+        let parts = vec![
+            "env RUSTFLAGS=\"-C linker=cc\" cargo build --bin generate_react_goldens".to_string(),
+        ];
+        let joined = join_exec_command(&parts);
+        let round_trip = shell_words::split(&joined).expect("valid shell words");
+        assert_eq!(
+            round_trip,
+            vec![
+                "env".to_string(),
+                "RUSTFLAGS=-C linker=cc".to_string(),
+                "cargo".to_string(),
+                "build".to_string(),
+                "--bin".to_string(),
+                "generate_react_goldens".to_string(),
+            ]
+        );
+        assert!(
+            !joined.starts_with("'env "),
+            "env wrapper must remain the executable, not part of one quoted command: {joined}"
+        );
+    }
+
+    #[test]
+    fn join_exec_command_preserves_already_split_env_prefix() {
+        let _guard = test_guard!();
+        let parts = vec![
+            "env".to_string(),
+            "RUSTFLAGS=-C linker=cc".to_string(),
+            "cargo".to_string(),
+            "build".to_string(),
+        ];
+        let joined = join_exec_command(&parts);
+        let round_trip = shell_words::split(&joined).expect("valid shell words");
+        assert_eq!(round_trip, parts);
+    }
+
+    #[test]
     fn join_exec_command_empty_input() {
         let _guard = test_guard!();
         let parts: Vec<String> = Vec::new();
@@ -6975,6 +7028,69 @@ mod tests {
             "Hook should not invoke rsync directly"
         );
         assert!(ssh_logs.is_empty(), "Hook should not invoke SSH directly");
+    }
+
+    #[tokio::test]
+    #[serial(mock_global)]
+    async fn test_process_hook_delegates_env_prefixed_cargo_command() {
+        let _lock = test_lock().lock().await;
+        let socket_path = format!(
+            "/tmp/rch_test_hook_delegate_env_{}_{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+
+        let _overrides = TestOverridesGuard::set(
+            &socket_path,
+            MockConfig::default(),
+            MockRsyncConfig::sync_failure(),
+        );
+        mock::clear_global_invocations();
+
+        let input = HookInput {
+            tool_name: "Bash".to_string(),
+            tool_input: ToolInput {
+                command: "env RUSTFLAGS=\"-C linker=cc\" cargo build --bin frankenctl".to_string(),
+                description: None,
+            },
+            session_id: None,
+        };
+
+        let output = process_hook(input).await;
+        let _ = std::fs::remove_file(&socket_path);
+
+        match &output {
+            HookOutput::AllowWithModifiedCommand(modified) => {
+                let cmd = &modified.hook_specific_output.updated_input.command;
+                assert!(
+                    cmd.starts_with("rch exec -- env "),
+                    "env wrapper must remain an argv prefix in delegated command: {cmd}"
+                );
+                let tokens = shell_words::split(
+                    cmd.strip_prefix("rch exec -- ")
+                        .expect("delegated command prefix"),
+                )
+                .expect("delegated command should parse as shell words");
+                assert_eq!(
+                    tokens,
+                    vec![
+                        "env".to_string(),
+                        "RUSTFLAGS=-C linker=cc".to_string(),
+                        "cargo".to_string(),
+                        "build".to_string(),
+                        "--bin".to_string(),
+                        "frankenctl".to_string(),
+                    ]
+                );
+            }
+            _ => panic!("Expected AllowWithModifiedCommand"),
+        }
+
+        assert!(mock::global_rsync_invocations_snapshot().is_empty());
+        assert!(mock::global_ssh_invocations_snapshot().is_empty());
     }
 
     #[tokio::test]
