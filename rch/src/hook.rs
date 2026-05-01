@@ -5903,6 +5903,7 @@ async fn send_build_heartbeat(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use rch_common::mock::{
         self, MockConfig, MockRsyncConfig, clear_mock_overrides, set_mock_enabled_override,
         set_mock_rsync_config_override, set_mock_ssh_config_override,
@@ -8348,6 +8349,114 @@ The file `x11.pc` needs to be installed and the PKG_CONFIG_PATH environment vari
         );
 
         assert_eq!(rewritten, "cargo test -- --nocapture");
+    }
+
+    fn env_key_strategy() -> impl Strategy<Value = String> {
+        prop::string::string_regex("[A-Z_][A-Z0-9_]{0,16}")
+            .expect("valid env key regex")
+            .prop_filter("not the target dir key under test", |key| {
+                key != "CARGO_TARGET_DIR"
+            })
+    }
+
+    fn shell_safe_value_strategy() -> impl Strategy<Value = String> {
+        prop::string::string_regex("[A-Za-z0-9_./:+-]{0,40}").expect("valid env value regex")
+    }
+
+    fn relative_target_dir_strategy() -> impl Strategy<Value = String> {
+        prop::string::string_regex("[A-Za-z0-9_.-]{1,16}(/[A-Za-z0-9_.-]{1,16}){0,2}")
+            .expect("valid relative path regex")
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        #[test]
+        fn env_prefix_target_dir_parser_round_trips_and_rewrites(
+            target_dir in relative_target_dir_strategy(),
+            extra_envs in prop::collection::vec((env_key_strategy(), shell_safe_value_strategy()), 0..4),
+            cargo_subcommand in prop_oneof![
+                Just("build".to_string()),
+                Just("check".to_string()),
+                Just("test".to_string()),
+                Just("clippy".to_string()),
+            ],
+        ) {
+            let _guard = test_guard!();
+            let reporter = HookReporter::new(OutputVisibility::Verbose);
+            let mut tokens = vec!["env".to_string()];
+            for (key, value) in &extra_envs {
+                tokens.push(format!("{key}={value}"));
+            }
+            tokens.push(format!("CARGO_TARGET_DIR={target_dir}"));
+            tokens.push("cargo".to_string());
+            tokens.push(cargo_subcommand);
+            tokens.push("--release".to_string());
+
+            let command = join_exec_command(&tokens);
+            let parsed = parse_command_tokens(&command, &reporter).expect("joined command should parse");
+            prop_assert_eq!(&parsed, &tokens);
+            prop_assert_eq!(
+                extract_cargo_target_dir_from_command_tokens(&parsed),
+                Some(target_dir.clone())
+            );
+
+            let invocation_cwd = Path::new("/tmp/rch-proptest-project");
+            let resolved = resolve_forwarded_cargo_target_dir_with_lookup(
+                Some(CompilationKind::CargoBuild),
+                invocation_cwd,
+                &reporter,
+                |_| Some("/tmp/ambient-target".to_string()),
+                Some(&parsed),
+            );
+            let expected_resolved = Some(invocation_cwd.join(&target_dir));
+            prop_assert_eq!(resolved.as_ref(), expected_resolved.as_ref());
+
+            let rewritten = rewrite_cargo_target_dir_command_for_remote(
+                &command,
+                Some(&parsed),
+                resolved.as_ref(),
+                &reporter,
+            );
+            prop_assert!(!rewritten.contains("CARGO_TARGET_DIR="));
+            let rewritten_tokens = parse_command_tokens(&rewritten, &reporter)
+                .expect("rewritten command should remain parseable");
+            prop_assert_eq!(rewritten_tokens.first().map(String::as_str), Some("env"));
+            for (key, value) in &extra_envs {
+                let expected_assignment = format!("{key}={value}");
+                prop_assert!(
+                    rewritten_tokens.contains(&expected_assignment),
+                    "rewritten command dropped env assignment {expected_assignment:?}"
+                );
+            }
+            prop_assert!(rewritten_tokens.iter().any(|token| token == "cargo"));
+        }
+
+        #[test]
+        fn env_prefix_helpers_do_not_panic_on_arbitrary_command_bytes(
+            bytes in prop::collection::vec(any::<u8>(), 0..192),
+        ) {
+            let _guard = test_guard!();
+            let reporter = HookReporter::new(OutputVisibility::Verbose);
+            let command = String::from_utf8_lossy(&bytes).into_owned();
+
+            if let Some(tokens) = parse_command_tokens(&command, &reporter) {
+                let _ = extract_cargo_target_dir_from_command_tokens(&tokens);
+                let _ = strip_cargo_target_dir_assignments_from_command_tokens(&tokens);
+                let _ = strip_cargo_target_dir_flags_from_command_tokens(&tokens);
+
+                let rewritten = rewrite_cargo_target_dir_command_for_remote(
+                    &command,
+                    Some(&tokens),
+                    Some(&PathBuf::from("/tmp/rch-proptest-target")),
+                    &reporter,
+                );
+                prop_assert!(
+                    parse_command_tokens(&rewritten, &reporter).is_some(),
+                    "parsed command rewrote to an unparsable command: {rewritten:?}"
+                );
+            }
+        }
     }
 
     #[tokio::test]

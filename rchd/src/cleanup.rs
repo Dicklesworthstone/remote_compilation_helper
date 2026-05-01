@@ -278,7 +278,18 @@ fn is_process_alive(pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+    use rch_common::BuildHeartbeatPhase;
     use rch_common::test_guard;
+
+    fn heartbeat_phase_strategy() -> impl Strategy<Value = BuildHeartbeatPhase> {
+        prop_oneof![
+            Just(BuildHeartbeatPhase::SyncUp),
+            Just(BuildHeartbeatPhase::Execute),
+            Just(BuildHeartbeatPhase::SyncDown),
+            Just(BuildHeartbeatPhase::Finalize),
+        ]
+    }
 
     #[test]
     fn test_score_stuck_evidence_high_confidence_for_dead_hook_and_stale_heartbeat() {
@@ -462,5 +473,62 @@ mod tests {
         });
 
         assert!(!evidence.should_remediate());
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
+
+        #[test]
+        fn stuck_detector_phase_classification_accepts_known_heartbeat_phases(
+            phase in heartbeat_phase_strategy(),
+        ) {
+            let _guard = test_guard!();
+            prop_assert!(is_progress_stall_remediable_phase(&phase));
+        }
+
+        #[test]
+        fn stuck_detector_scoring_is_bounded_and_fail_closed_before_hard_timeout(
+            phase in heartbeat_phase_strategy(),
+            hook_alive in any::<bool>(),
+            heartbeat_age_secs in 0u64..=600,
+            progress_age_secs in 0u64..=600,
+            build_age_secs in 0u64..=86_400,
+            slots_owned in 0u32..=64,
+            has_worker_binding in any::<bool>(),
+        ) {
+            let _guard = test_guard!();
+            let phase_remediable = is_progress_stall_remediable_phase(&phase);
+            let evidence = score_stuck_evidence(StuckEvidenceInput {
+                hook_alive,
+                progress_stall_remediable_phase: phase_remediable,
+                heartbeat_age_secs,
+                progress_age_secs,
+                build_age_secs,
+                slots_owned,
+                has_worker_binding,
+            });
+
+            prop_assert_eq!(evidence.heartbeat_stale, heartbeat_age_secs >= HEARTBEAT_STALE_SECS);
+            prop_assert_eq!(evidence.progress_stale, progress_age_secs >= PROGRESS_STALE_SECS);
+            prop_assert_eq!(
+                evidence.remediable_progress_stale,
+                phase_remediable
+                    && progress_age_secs >= PROGRESS_STALE_SECS
+                    && progress_age_secs > RECENT_PROGRESS_GRACE_SECS
+                    && (!hook_alive || evidence.heartbeat_stale)
+            );
+            prop_assert!(evidence.confidence.is_finite());
+            prop_assert!((0.0..=1.0).contains(&evidence.confidence));
+
+            if evidence.should_remediate() {
+                prop_assert!(build_age_secs >= MIN_BUILD_AGE_SECS);
+                prop_assert!(slots_owned > 0);
+                prop_assert!(has_worker_binding);
+                prop_assert!(evidence.confidence >= REMEDIATION_CONFIDENCE_THRESHOLD);
+                prop_assert!(
+                    (!hook_alive && evidence.heartbeat_stale) || evidence.remediable_progress_stale
+                );
+            }
+        }
     }
 }

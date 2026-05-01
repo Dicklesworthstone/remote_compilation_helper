@@ -4635,6 +4635,89 @@ mod tests {
         use proptest::prelude::*;
         use std::time::Duration;
 
+        fn worker_status_strategy() -> impl Strategy<Value = WorkerStatus> {
+            prop_oneof![
+                Just(WorkerStatus::Healthy),
+                Just(WorkerStatus::Degraded),
+                Just(WorkerStatus::Unreachable),
+                Just(WorkerStatus::Draining),
+                Just(WorkerStatus::Drained),
+                Just(WorkerStatus::Disabled),
+            ]
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(128))]
+
+            #[test]
+            fn worker_selection_only_selects_admissible_worker_statuses(
+                statuses in prop::collection::vec(worker_status_strategy(), 0..10),
+                estimated_cores in 1u32..=4,
+            ) {
+                let _guard = test_guard!();
+                let expected_selectable = statuses
+                    .iter()
+                    .filter(|status| matches!(status, WorkerStatus::Healthy | WorkerStatus::Degraded))
+                    .count();
+                let statuses_for_runtime = statuses.clone();
+
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("test runtime should build");
+                let (healthy_statuses, selected_status) = runtime.block_on(async move {
+                    let pool = WorkerPool::new();
+                    for (index, status) in statuses_for_runtime.iter().copied().enumerate() {
+                        let id = format!("status-{index}");
+                        pool.add_worker_state(make_worker(&id, 8, 50.0 + index as f64))
+                            .await;
+                        pool.set_status(&WorkerId::new(&id), status).await;
+                    }
+
+                    let mut healthy_statuses = Vec::new();
+                    for worker in pool.healthy_workers().await {
+                        healthy_statuses.push(worker.status().await);
+                    }
+
+                    let request = SelectionRequest {
+                        project: "worker-status-proptest".to_string(),
+                        command: None,
+                        command_priority: CommandPriority::Normal,
+                        estimated_cores,
+                        preferred_workers: vec![],
+                        toolchain: None,
+                        required_runtime: RequiredRuntime::default(),
+                        classification_duration_us: None,
+                        hook_pid: None,
+                    };
+                    let result = select_worker_with_config(
+                        &pool,
+                        &request,
+                        &SelectionWeights::default(),
+                        &CircuitBreakerConfig::default(),
+                    )
+                    .await;
+                    let selected_status = if let Some(worker) = result.worker {
+                        Some(worker.status().await)
+                    } else {
+                        None
+                    };
+
+                    (healthy_statuses, selected_status)
+                });
+
+                prop_assert_eq!(healthy_statuses.len(), expected_selectable);
+                prop_assert!(healthy_statuses
+                    .iter()
+                    .all(|status| matches!(status, WorkerStatus::Healthy | WorkerStatus::Degraded)));
+                if let Some(status) = selected_status {
+                    prop_assert!(matches!(status, WorkerStatus::Healthy | WorkerStatus::Degraded));
+                } else {
+                    prop_assert_eq!(expected_selectable, 0);
+                }
+            }
+        }
+
         // ====================================================================
         // normalize_latency_ms property tests
         // ====================================================================
