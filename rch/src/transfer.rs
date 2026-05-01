@@ -46,9 +46,11 @@ const PROJECT_HASH_KEY_FILES: &[&str] = &[
 ];
 const REMOTE_RUNTIME_EXCLUDE_PATTERNS: &[&str] = &[
     ".rch-target/",
+    ".rch-target-*/",
     ".rch-tmp/",
     ".franken_whisper/tools/ffmpeg/",
 ];
+const DEFAULT_REMOTE_CARGO_TARGET_DIR_NAME: &str = ".rch-target";
 
 // =============================================================================
 // Retry Logic (bd-x1ek)
@@ -222,6 +224,13 @@ pub struct TransferPipeline {
     /// When set, transfer and execution use this path directly instead of
     /// deriving `<remote_base>/<project_id>/<project_hash>`.
     remote_path_override: Option<String>,
+    /// Remote Cargo target directory basename.
+    ///
+    /// Defaults to `.rch-target` for direct `TransferPipeline` users. The rch
+    /// hook sets a unique value per remote job to prevent parallel Cargo runs
+    /// in the same synchronized project from contending on Cargo's artifact
+    /// directory lock.
+    remote_cargo_target_dir_name: String,
     /// Optional include-only patterns for sync-to-remote uploads.
     sync_include_patterns: Option<Vec<String>>,
     /// Whether sync-to-remote should delete extraneous files remotely.
@@ -315,6 +324,7 @@ impl TransferPipeline {
             compilation_config: rch_common::CompilationConfig::default(),
             estimated_transfer_bytes: None,
             remote_path_override: None,
+            remote_cargo_target_dir_name: DEFAULT_REMOTE_CARGO_TARGET_DIR_NAME.to_string(),
             sync_include_patterns: None,
             sync_delete: true,
             build_id: None,
@@ -433,6 +443,43 @@ impl TransferPipeline {
         self
     }
 
+    /// Set the remote Cargo target directory basename.
+    ///
+    /// The value must be a single relative path segment because it is appended
+    /// to the worker-side project root. Invalid names are ignored so callers
+    /// fail closed to the default path rather than creating surprising remote
+    /// paths.
+    pub fn with_remote_cargo_target_dir_name(mut self, name: impl Into<String>) -> Self {
+        let name = name.into();
+        let trimmed = name.trim();
+        if trimmed.is_empty()
+            || trimmed == "."
+            || trimmed == ".."
+            || trimmed.contains('/')
+            || trimmed.contains('\\')
+            || trimmed.contains('\n')
+            || trimmed.contains('\r')
+            || trimmed.contains('\0')
+        {
+            warn!(
+                "Ignoring invalid remote Cargo target directory name: {:?}",
+                name
+            );
+            return self;
+        }
+
+        self.remote_cargo_target_dir_name = trimmed.to_string();
+        self
+    }
+
+    fn remote_cargo_target_dir_for_remote_path(&self, remote_path: &str) -> String {
+        format!(
+            "{}/{}",
+            remote_path.trim_end_matches('/'),
+            self.remote_cargo_target_dir_name
+        )
+    }
+
     fn env_value(&self, key: &str) -> Option<String> {
         if let Some(ref overrides) = self.env_overrides
             && let Some(value) = overrides.get(key)
@@ -452,7 +499,7 @@ impl TransferPipeline {
             // Absolute or host-specific target directories are brittle on workers.
             // Force a remote-scoped target dir rooted in the synchronized project.
             "CARGO_TARGET_DIR" => {
-                let target_dir = format!("{remote_path}/.rch-target");
+                let target_dir = self.remote_cargo_target_dir_for_remote_path(remote_path);
                 (
                     target_dir.clone(),
                     Some(target_dir.clone()),
@@ -632,6 +679,11 @@ impl TransferPipeline {
         }
         let base = self.transfer_config.remote_base.trim_end_matches('/');
         format!("{}/{}/{}", base, self.project_id, self.project_hash)
+    }
+
+    /// Get the remote Cargo target directory path on the worker.
+    pub fn remote_cargo_target_dir(&self) -> String {
+        self.remote_cargo_target_dir_for_remote_path(&self.remote_path())
     }
 
     #[cfg(test)]
@@ -3235,6 +3287,65 @@ mod tests {
             "host-local tmpfs path should not be forwarded to worker"
         );
         assert!(command.contains(&worker_scoped_root));
+    }
+
+    #[test]
+    fn test_build_remote_command_uses_custom_remote_cargo_target_dir_name() {
+        let _guard = test_guard!();
+        let mut overrides = HashMap::new();
+        overrides.insert(
+            "CARGO_TARGET_DIR".to_string(),
+            "/data/tmp/pi_agent_rust/pearleagle".to_string(),
+        );
+
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/tmp/project"),
+            "project".to_string(),
+            "hash".to_string(),
+            TransferConfig::default(),
+        )
+        .with_env_allowlist(vec!["CARGO_TARGET_DIR".to_string()])
+        .with_env_overrides(overrides)
+        .with_remote_cargo_target_dir_name(".rch-target-worker-job-42");
+
+        let worker_scoped_root = pipeline.remote_path();
+        let command = pipeline.build_remote_command("cargo test --no-run", None);
+        assert!(command.contains(&format!(
+            "CARGO_TARGET_DIR='{}/.rch-target-worker-job-42'",
+            worker_scoped_root
+        )));
+        assert!(command.contains(&format!("{}/.rch-target-worker-job-42", worker_scoped_root)));
+        assert!(!command.contains(&format!("{}/.rch-target'", worker_scoped_root)));
+    }
+
+    #[test]
+    fn test_invalid_remote_cargo_target_dir_name_falls_back_to_default() {
+        let _guard = test_guard!();
+        let mut overrides = HashMap::new();
+        overrides.insert(
+            "CARGO_TARGET_DIR".to_string(),
+            "/data/tmp/pi_agent_rust/pearleagle".to_string(),
+        );
+
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/tmp/project"),
+            "project".to_string(),
+            "hash".to_string(),
+            TransferConfig::default(),
+        )
+        .with_env_allowlist(vec!["CARGO_TARGET_DIR".to_string()])
+        .with_env_overrides(overrides)
+        .with_remote_cargo_target_dir_name("../bad");
+
+        assert!(
+            pipeline
+                .build_remote_command("cargo test --no-run", None)
+                .contains(".rch-target")
+        );
+        assert_eq!(
+            pipeline.remote_cargo_target_dir(),
+            format!("{}/.rch-target", pipeline.remote_path())
+        );
     }
 
     #[test]

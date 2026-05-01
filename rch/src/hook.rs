@@ -2723,7 +2723,7 @@ where
     let resolved = resolved.unwrap_or_else(|| invocation_cwd.join("target"));
 
     reporter.verbose(&format!(
-        "[RCH] Cargo target sync active; forcing worker CARGO_TARGET_DIR=.rch-target and syncing back to {}",
+        "[RCH] Cargo target sync active; forcing worker CARGO_TARGET_DIR to an isolated remote target and syncing back to {}",
         resolved.display()
     ));
     Some(resolved)
@@ -2760,6 +2760,40 @@ fn cargo_target_env_overrides(local_target_dir: Option<&Path>) -> Option<HashMap
         local_target_dir.to_string_lossy().to_string(),
     );
     Some(overrides)
+}
+
+fn remote_cargo_target_dir_name(build_id: Option<u64>, worker_id: &WorkerId) -> String {
+    static REMOTE_CARGO_TARGET_DIR_SEQUENCE: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+
+    let safe_worker_id = worker_id
+        .as_str()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    let safe_worker_id = safe_worker_id.trim_matches('-');
+    let safe_worker_id = if safe_worker_id.is_empty() {
+        "worker"
+    } else {
+        safe_worker_id
+    };
+    let job_id = build_id
+        .map(|id| format!("job-{id}"))
+        .unwrap_or_else(|| format!("pid-{}", std::process::id()));
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let sequence =
+        REMOTE_CARGO_TARGET_DIR_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    format!(".rch-target-{safe_worker_id}-{job_id}-{timestamp}-{sequence}")
 }
 
 fn rewrite_cargo_target_dir_command_for_remote(
@@ -5062,6 +5096,9 @@ async fn execute_remote_compilation(
     let effective_env_allowlist =
         cargo_target_env_allowlist(&env_allowlist, forwarded_cargo_target_dir.is_some());
     let cargo_env_overrides = cargo_target_env_overrides(forwarded_cargo_target_dir.as_deref());
+    let remote_cargo_target_dir_name_override = forwarded_cargo_target_dir
+        .as_ref()
+        .map(|_| remote_cargo_target_dir_name(build_id, &worker_config.id));
     let mut primary_pipeline: Option<TransferPipeline> = None;
     let mut aggregate_sync_result: Option<SyncResult> = None;
 
@@ -5099,6 +5136,9 @@ async fn execute_remote_compilation(
             root_pipeline = root_pipeline.with_env_allowlist(effective_env_allowlist.clone());
             if let Some(overrides) = cargo_env_overrides.as_ref() {
                 root_pipeline = root_pipeline.with_env_overrides(overrides.clone());
+            }
+            if let Some(name) = remote_cargo_target_dir_name_override.as_ref() {
+                root_pipeline = root_pipeline.with_remote_cargo_target_dir_name(name.clone());
             }
         }
 
@@ -5526,7 +5566,7 @@ async fn execute_remote_compilation(
         }
 
         if let Some(local_target_dir) = forwarded_cargo_target_dir.as_ref() {
-            let remote_target_path = format!("{}/.rch-target", pipeline.remote_path());
+            let remote_target_path = pipeline.remote_cargo_target_dir();
             let custom_patterns = get_custom_target_artifact_patterns(kind);
             if custom_patterns.is_empty() {
                 reporter.verbose(&format!(
@@ -9148,14 +9188,27 @@ edition = "2024"
         assert_eq!(execution.exit_code, 0);
 
         let rsync_logs = mock::global_rsync_invocations_snapshot();
-        let has_custom_target_artifact_sync = rsync_logs.iter().any(|entry| {
-            entry.phase == mock::Phase::Artifacts
-                && entry.destination == custom_target_dir
-                && entry.source.contains(".rch-target")
-        });
-        assert!(
-            has_custom_target_artifact_sync,
+        let custom_target_artifact_sync = rsync_logs
+            .iter()
+            .find(|entry| {
+                entry.phase == mock::Phase::Artifacts
+                    && entry.destination == custom_target_dir
+                    && entry.source.contains(".rch-target")
+            })
+            .expect(
             "expected artifact retrieval into custom CARGO_TARGET_DIR from worker .rch-target path"
+        );
+        assert!(
+            custom_target_artifact_sync
+                .source
+                .contains(".rch-target-mock-worker-"),
+            "expected per-job remote target dir, got {}",
+            custom_target_artifact_sync.source
+        );
+        assert!(
+            !custom_target_artifact_sync.source.contains("/.rch-target/"),
+            "custom target sync must not use the shared .rch-target dir: {}",
+            custom_target_artifact_sync.source
         );
 
         let ssh_logs = mock::global_ssh_invocations_snapshot();
@@ -9166,8 +9219,8 @@ edition = "2024"
             .expect("execute command should be recorded");
         assert!(
             execute_command.contains("CARGO_TARGET_DIR=")
-                && execute_command.contains(".rch-target"),
-            "expected remote Cargo execution to force worker-scoped CARGO_TARGET_DIR, got {execute_command}"
+                && execute_command.contains(".rch-target-mock-worker-"),
+            "expected remote Cargo execution to force per-job worker CARGO_TARGET_DIR, got {execute_command}"
         );
     }
 
