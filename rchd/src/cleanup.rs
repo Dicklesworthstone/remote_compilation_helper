@@ -57,8 +57,11 @@ fn score_stuck_evidence(input: StuckEvidenceInput) -> StuckEvidence {
     let heartbeat_stale = input.heartbeat_age_secs >= HEARTBEAT_STALE_SECS;
     let progress_stale = input.progress_age_secs >= PROGRESS_STALE_SECS;
     let progress_recent = input.progress_age_secs <= RECENT_PROGRESS_GRACE_SECS;
-    let remediable_progress_stale =
-        input.progress_stall_remediable_phase && progress_stale && !progress_recent;
+    let progress_stall_corroborated = !input.hook_alive || heartbeat_stale;
+    let remediable_progress_stale = input.progress_stall_remediable_phase
+        && progress_stale
+        && !progress_recent
+        && progress_stall_corroborated;
 
     // Missing heartbeats are only one signal; remediation needs multiple corroborating signals.
     let mut confidence: f64 = 0.0;
@@ -182,29 +185,42 @@ impl ActiveBuildCleanup {
             if !evidence.should_remediate() {
                 if !evidence.hook_alive || evidence.heartbeat_stale || evidence.progress_stale {
                     debug!(
-                        "Build {} retained (hook_alive={}, hb_age={}s, progress_age={}s, build_age={}s, slots={}, confidence={:.2})",
-                        build.id,
-                        evidence.hook_alive,
-                        evidence.heartbeat_age_secs,
-                        evidence.progress_age_secs,
-                        evidence.build_age_secs,
-                        evidence.slots_owned,
-                        evidence.confidence
+                        build_id = build.id,
+                        project_id = %build.project_id,
+                        worker_id = %build.worker_id,
+                        phase = ?build.heartbeat_phase,
+                        hook_alive = evidence.hook_alive,
+                        heartbeat_stale = evidence.heartbeat_stale,
+                        progress_stale = evidence.progress_stale,
+                        remediable_progress_stale = evidence.remediable_progress_stale,
+                        hb_age = evidence.heartbeat_age_secs,
+                        progress_age = evidence.progress_age_secs,
+                        build_age = evidence.build_age_secs,
+                        slots = evidence.slots_owned,
+                        confidence = evidence.confidence,
+                        "Build retained by stuck detector"
                     );
                 }
                 continue;
             }
 
             warn!(
-                "Cleaning up build {} (project: {}) due to high-confidence stuck evidence (hook_alive={}, hb_age={}s, progress_age={}s, build_age={}s, slots={}, confidence={:.2})",
-                build.id,
-                build.project_id,
-                evidence.hook_alive,
-                evidence.heartbeat_age_secs,
-                evidence.progress_age_secs,
-                evidence.build_age_secs,
-                evidence.slots_owned,
-                evidence.confidence
+                build_id = build.id,
+                project_id = %build.project_id,
+                worker_id = %build.worker_id,
+                phase = ?build.heartbeat_phase,
+                hook_alive = evidence.hook_alive,
+                heartbeat_stale = evidence.heartbeat_stale,
+                progress_stale = evidence.progress_stale,
+                remediable_progress_stale = evidence.remediable_progress_stale,
+                hb_age = evidence.heartbeat_age_secs,
+                progress_age = evidence.progress_age_secs,
+                build_age = evidence.build_age_secs,
+                slots = evidence.slots_owned,
+                confidence = evidence.confidence,
+                decision = "cancel",
+                reason = "stuck_detector",
+                "Cleaning up build due to high-confidence stuck evidence"
             );
 
             // Delegate to CancellationOrchestrator for deterministic cleanup.
@@ -319,7 +335,7 @@ mod tests {
     }
 
     #[test]
-    fn test_score_stuck_evidence_execute_progress_stall_remediates_live_hook() {
+    fn test_score_stuck_evidence_execute_progress_stall_retains_fresh_live_hook() {
         let _guard = test_guard!();
         let evidence = score_stuck_evidence(StuckEvidenceInput {
             hook_alive: true,
@@ -333,12 +349,32 @@ mod tests {
 
         assert!(!evidence.heartbeat_stale);
         assert!(evidence.progress_stale);
+        assert!(!evidence.remediable_progress_stale);
+        assert!(!evidence.should_remediate());
+        assert!(evidence.confidence < REMEDIATION_CONFIDENCE_THRESHOLD);
+    }
+
+    #[test]
+    fn test_score_stuck_evidence_execute_progress_stall_remediates_stale_heartbeat() {
+        let _guard = test_guard!();
+        let evidence = score_stuck_evidence(StuckEvidenceInput {
+            hook_alive: true,
+            progress_stall_remediable_phase: true,
+            heartbeat_age_secs: HEARTBEAT_STALE_SECS + 1,
+            progress_age_secs: PROGRESS_STALE_SECS + 60,
+            build_age_secs: MIN_BUILD_AGE_SECS + 90,
+            slots_owned: 2,
+            has_worker_binding: true,
+        });
+
+        assert!(evidence.heartbeat_stale);
+        assert!(evidence.progress_stale);
         assert!(evidence.remediable_progress_stale);
         assert!(evidence.should_remediate());
     }
 
     #[test]
-    fn test_score_stuck_evidence_sync_down_progress_stall_remediates_live_hook() {
+    fn test_score_stuck_evidence_sync_down_progress_stall_retains_fresh_live_hook() {
         let _guard = test_guard!();
         assert!(is_progress_stall_remediable_phase(
             &rch_common::BuildHeartbeatPhase::SyncDown
@@ -356,8 +392,8 @@ mod tests {
 
         assert!(!evidence.heartbeat_stale);
         assert!(evidence.progress_stale);
-        assert!(evidence.remediable_progress_stale);
-        assert!(evidence.should_remediate());
+        assert!(!evidence.remediable_progress_stale);
+        assert!(!evidence.should_remediate());
     }
 
     #[test]
