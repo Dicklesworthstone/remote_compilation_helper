@@ -3,7 +3,9 @@
 #![allow(dead_code)] // Scaffold code - methods will be used in future beads
 
 use crate::DaemonContext;
-use crate::disk_pressure::PressureAssessment;
+use crate::disk_pressure::{
+    DiskPressurePolicyConfig, PressureAssessment, evaluate_pressure_policy,
+};
 use crate::health::{HealthConfig, probe_worker_capabilities};
 use rch_common::{
     CircuitBreakerConfig, CircuitState, CircuitStats, WorkerCapabilities, WorkerConfig, WorkerId,
@@ -13,6 +15,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::debug;
 
@@ -58,6 +61,8 @@ pub struct WorkerState {
     last_error_msg: RwLock<Option<String>>,
     /// Runtime capabilities (Bun, Node, Rust versions).
     capabilities: RwLock<WorkerCapabilities>,
+    /// Cached per-toolchain preflight verdicts.
+    toolchain_preflight: RwLock<HashMap<String, ToolchainPreflightStatus>>,
     /// Latest daemon-side pressure policy assessment for this worker.
     pressure_assessment: RwLock<PressureAssessment>,
     /// Reason for disabling this worker (if disabled).
@@ -89,6 +94,7 @@ impl WorkerState {
             circuit: RwLock::new(CircuitStats::new()),
             last_error_msg: RwLock::new(None),
             capabilities: RwLock::new(WorkerCapabilities::new()),
+            toolchain_preflight: RwLock::new(HashMap::new()),
             pressure_assessment: RwLock::new(PressureAssessment::default()),
             disabled_reason: RwLock::new(None),
             disabled_at: AtomicI64::new(0),
@@ -331,12 +337,44 @@ impl WorkerState {
 
     /// Update worker capabilities.
     pub async fn set_capabilities(&self, capabilities: WorkerCapabilities) {
+        let pressure =
+            evaluate_pressure_policy(&capabilities, None, &DiskPressurePolicyConfig::default());
         *self.capabilities.write().await = capabilities;
+        *self.pressure_assessment.write().await = pressure;
     }
 
     /// Get worker capabilities.
     pub async fn capabilities(&self) -> WorkerCapabilities {
         self.capabilities.read().await.clone()
+    }
+
+    /// Cache a toolchain preflight verdict for selection-time routing.
+    pub async fn record_toolchain_preflight(
+        &self,
+        toolchain: String,
+        usable: bool,
+        reason: Option<String>,
+    ) {
+        self.toolchain_preflight.write().await.insert(
+            toolchain,
+            ToolchainPreflightStatus {
+                usable,
+                reason,
+                checked_at_unix_ms: current_unix_ms(),
+            },
+        );
+    }
+
+    /// Retrieve a cached toolchain preflight verdict.
+    pub async fn toolchain_preflight_status(
+        &self,
+        toolchain: &str,
+    ) -> Option<ToolchainPreflightStatus> {
+        self.toolchain_preflight
+            .read()
+            .await
+            .get(toolchain)
+            .cloned()
     }
 
     /// Update the latest disk-pressure policy assessment.
@@ -436,6 +474,25 @@ impl WorkerState {
     /// Get the number of slots currently in use.
     pub fn used_slots(&self) -> u32 {
         self.used_slots.load(Ordering::Relaxed)
+    }
+}
+
+/// Cached result of checking a concrete Rust toolchain on a worker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolchainPreflightStatus {
+    /// Whether both `rustc` and `cargo` work through `rustup run <toolchain>`.
+    pub usable: bool,
+    /// Stable diagnostic reason when unusable.
+    pub reason: Option<String>,
+    /// Epoch milliseconds when the verdict was recorded.
+    pub checked_at_unix_ms: i64,
+}
+
+impl ToolchainPreflightStatus {
+    /// Whether this verdict is fresh enough to reuse for dispatch decisions.
+    pub fn is_fresh(&self, ttl: Duration) -> bool {
+        let age_ms = current_unix_ms().saturating_sub(self.checked_at_unix_ms);
+        age_ms <= ttl.as_millis() as i64
     }
 }
 
@@ -599,6 +656,13 @@ impl Default for WorkerPool {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn current_unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or_default()
 }
 
 // ============================================================================
@@ -1462,11 +1526,22 @@ mod tests {
         // Set capabilities with Rust
         let mut caps = WorkerCapabilities::new();
         caps.rustc_version = Some("1.87.0-nightly".to_string());
+        caps.disk_free_gb = Some(4.0);
+        caps.disk_total_gb = Some(120.0);
         state.set_capabilities(caps).await;
 
         assert!(state.has_rust().await);
         assert!(!state.has_bun().await);
         assert!(!state.has_node().await);
+        let pressure = state.pressure_assessment().await;
+        assert_eq!(
+            pressure.state,
+            crate::disk_pressure::PressureState::Critical
+        );
+        assert_eq!(
+            pressure.reason_code,
+            "disk_critical_without_fresh_telemetry"
+        );
 
         // Set capabilities with all runtimes
         let mut caps = WorkerCapabilities::new();
@@ -1483,6 +1558,31 @@ mod tests {
         let retrieved = state.capabilities().await;
         assert_eq!(retrieved.rustc_version, Some("1.87.0".to_string()));
         assert_eq!(retrieved.bun_version, Some("1.2.0".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_toolchain_preflight_cache_records_fail_closed_reason() {
+        let state = WorkerState::new(test_config("test"));
+
+        state
+            .record_toolchain_preflight(
+                "nightly-2026-04-30".to_string(),
+                false,
+                Some("cargo binary not applicable".to_string()),
+            )
+            .await;
+
+        let cached = state
+            .toolchain_preflight_status("nightly-2026-04-30")
+            .await
+            .expect("toolchain preflight verdict should be cached");
+
+        assert!(!cached.usable);
+        assert_eq!(
+            cached.reason.as_deref(),
+            Some("cargo binary not applicable")
+        );
+        assert!(cached.is_fresh(Duration::from_secs(60)));
     }
 
     #[tokio::test]

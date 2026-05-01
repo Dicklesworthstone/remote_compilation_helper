@@ -20,8 +20,8 @@ use crate::workers::{WorkerPool, WorkerState};
 use rand::RngExt;
 use rch_common::{
     CircuitBreakerConfig, CircuitState, CommandPriority, RequiredRuntime, SelectionConfig,
-    SelectionReason, SelectionRequest, SelectionStrategy, SelectionWeightConfig, WorkerId,
-    classify_command,
+    SelectionReason, SelectionRequest, SelectionStrategy, SelectionWeightConfig, SshClient,
+    SshOptions, WorkerId, classify_command,
 };
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -37,6 +37,9 @@ const PRIORITY_CACHE_TIEBREAK_SCORE: f64 = 1_000.0;
 const PRIORITY_SPEED_TIEBREAK_SCORE: f64 = 10.0;
 const TEST_CACHE_BOOST: f64 = 1.5;
 const TEST_BUILD_FALLBACK_FACTOR: f64 = 0.4;
+const TOOLCHAIN_PREFLIGHT_TTL: Duration = Duration::from_secs(600);
+const TOOLCHAIN_PREFLIGHT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const TOOLCHAIN_PREFLIGHT_COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Weights for the selection scoring algorithm (legacy compatibility).
 #[derive(Debug, Clone)]
@@ -1299,6 +1302,19 @@ impl WorkerSelector {
 
             any_has_runtime = true;
 
+            if let Some(reason) = self
+                .toolchain_preflight_failure(worker.as_ref(), worker_id.as_str(), request)
+                .await
+            {
+                debug!(
+                    "Worker {} excluded: toolchain preflight failed ({})",
+                    worker_id, reason
+                );
+                metrics::inc_reliability_error("selection", "toolchain_preflight_failed");
+                filtered_by_hard_preflight += 1;
+                continue;
+            }
+
             // Filter by slot availability
             if worker.available_slots().await < request.estimated_cores {
                 debug!(
@@ -1643,6 +1659,48 @@ impl WorkerSelector {
             Ok(preferred_without_health)
         } else {
             Ok(eligible_without_health)
+        }
+    }
+
+    async fn toolchain_preflight_failure(
+        &self,
+        worker: &WorkerState,
+        worker_id: &str,
+        request: &SelectionRequest,
+    ) -> Option<String> {
+        let toolchain = request.toolchain.as_ref()?;
+        let toolchain_name = toolchain.rustup_toolchain();
+
+        if let Some(cached) = worker.toolchain_preflight_status(&toolchain_name).await
+            && cached.is_fresh(TOOLCHAIN_PREFLIGHT_TTL)
+        {
+            return (!cached.usable).then(|| {
+                cached
+                    .reason
+                    .unwrap_or_else(|| "cached_toolchain_unusable".to_string())
+            });
+        }
+
+        let result = probe_worker_toolchain(worker, &toolchain_name).await;
+        match result {
+            Ok(()) => {
+                worker
+                    .record_toolchain_preflight(toolchain_name, true, None)
+                    .await;
+                None
+            }
+            Err(reason) => {
+                warn!(
+                    worker = %worker_id,
+                    toolchain = %toolchain_name,
+                    reason = %reason,
+                    "Worker toolchain preflight failed"
+                );
+                worker
+                    .record_toolchain_preflight(toolchain_name, false, Some(reason.clone()))
+                    .await;
+                Some(reason)
+            }
         }
     }
 
@@ -2390,6 +2448,54 @@ fn record_selection_metrics(reason: &SelectionReason, duration: Duration) {
     }
 }
 
+async fn probe_worker_toolchain(worker: &WorkerState, toolchain_name: &str) -> Result<(), String> {
+    let worker_config = worker.config.read().await.clone();
+    let ssh_options = SshOptions {
+        connect_timeout: TOOLCHAIN_PREFLIGHT_CONNECT_TIMEOUT,
+        command_timeout: TOOLCHAIN_PREFLIGHT_COMMAND_TIMEOUT,
+        control_master: false,
+        ..Default::default()
+    };
+
+    let mut client = SshClient::new(worker_config, ssh_options);
+    client
+        .connect()
+        .await
+        .map_err(|err| format!("toolchain_preflight_connect_failed:{err}"))?;
+
+    let escaped_toolchain = shell_escape::escape(std::borrow::Cow::from(toolchain_name));
+    let command = format!(
+        "rustup run {escaped_toolchain} rustc --version >/dev/null && rustup run {escaped_toolchain} cargo --version >/dev/null"
+    );
+
+    let result = client.execute(&command).await;
+    let _ = client.disconnect().await;
+
+    match result {
+        Ok(output) if output.success() => Ok(()),
+        Ok(output) => Err(format!(
+            "toolchain_preflight_command_failed:{}:{}",
+            output.exit_code,
+            short_preflight_error(&output.stderr)
+        )),
+        Err(err) => Err(format!("toolchain_preflight_command_error:{err}")),
+    }
+}
+
+fn short_preflight_error(stderr: &str) -> String {
+    let compact = stderr.trim().replace(['\n', '\r'], " ");
+    if compact.is_empty() {
+        return "stderr_empty".to_string();
+    }
+    const LIMIT: usize = 240;
+    if compact.len() > LIMIT {
+        let truncated: String = compact.chars().take(LIMIT).collect();
+        format!("{truncated}...")
+    } else {
+        compact
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2406,7 +2512,8 @@ mod tests {
     };
     use rch_common::test_guard;
     use rch_common::{
-        CommandPriority, RequiredRuntime, SelectionWeightConfig, WorkerConfig, WorkerId,
+        CommandPriority, RequiredRuntime, SelectionWeightConfig, ToolchainInfo, WorkerConfig,
+        WorkerId,
     };
     use std::sync::Arc;
 
@@ -3594,6 +3701,113 @@ mod tests {
             .expect("expected worker to recover after explicit revalidation");
         assert_eq!(selected.config.read().await.id.as_str(), "flapping");
         assert_eq!(second.reason, SelectionReason::Success);
+    }
+
+    #[tokio::test]
+    async fn test_toolchain_preflight_rejects_cached_broken_toolchain_only_pool() {
+        let pool = WorkerPool::new();
+        let broken = make_worker("broken-toolchain", 8, 95.0);
+        broken
+            .set_capabilities(rch_common::WorkerCapabilities {
+                rustc_version: Some("1.87.0".to_string()),
+                projects_root_ok: Some(true),
+                disk_free_gb: Some(60.0),
+                disk_total_gb: Some(120.0),
+                ..Default::default()
+            })
+            .await;
+        broken
+            .record_toolchain_preflight(
+                "nightly-2026-04-30".to_string(),
+                false,
+                Some("cargo binary not applicable".to_string()),
+            )
+            .await;
+        pool.add_worker_state(broken).await;
+
+        let selector = WorkerSelector::default();
+        let request = SelectionRequest {
+            project: "toolchain-project".to_string(),
+            command: Some("cargo check".to_string()),
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 2,
+            preferred_workers: vec![],
+            toolchain: Some(ToolchainInfo {
+                channel: "nightly".to_string(),
+                date: Some("2026-04-30".to_string()),
+                full_version: "nightly-2026-04-30".to_string(),
+            }),
+            required_runtime: RequiredRuntime::Rust,
+            classification_duration_us: None,
+            hook_pid: None,
+        };
+
+        let result = selector.select(&pool, &request).await;
+        assert!(result.worker.is_none());
+        assert_eq!(result.reason, SelectionReason::AllWorkersFailedPreflight);
+    }
+
+    #[tokio::test]
+    async fn test_toolchain_preflight_prefers_cached_healthy_worker() {
+        let pool = WorkerPool::new();
+
+        let broken_fast = make_worker("broken-fast", 8, 99.0);
+        broken_fast
+            .set_capabilities(rch_common::WorkerCapabilities {
+                rustc_version: Some("1.87.0".to_string()),
+                projects_root_ok: Some(true),
+                disk_free_gb: Some(60.0),
+                disk_total_gb: Some(120.0),
+                ..Default::default()
+            })
+            .await;
+        broken_fast
+            .record_toolchain_preflight(
+                "nightly-2026-04-30".to_string(),
+                false,
+                Some("rustup run failed".to_string()),
+            )
+            .await;
+        pool.add_worker_state(broken_fast).await;
+
+        let usable_slow = make_worker("usable-slow", 8, 40.0);
+        usable_slow
+            .set_capabilities(rch_common::WorkerCapabilities {
+                rustc_version: Some("1.87.0".to_string()),
+                projects_root_ok: Some(true),
+                disk_free_gb: Some(60.0),
+                disk_total_gb: Some(120.0),
+                ..Default::default()
+            })
+            .await;
+        usable_slow
+            .record_toolchain_preflight("nightly-2026-04-30".to_string(), true, None)
+            .await;
+        pool.add_worker_state(usable_slow).await;
+
+        let selector = WorkerSelector::default();
+        let request = SelectionRequest {
+            project: "toolchain-project".to_string(),
+            command: Some("cargo test".to_string()),
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 2,
+            preferred_workers: vec![],
+            toolchain: Some(ToolchainInfo {
+                channel: "nightly".to_string(),
+                date: Some("2026-04-30".to_string()),
+                full_version: "nightly-2026-04-30".to_string(),
+            }),
+            required_runtime: RequiredRuntime::Rust,
+            classification_duration_us: None,
+            hook_pid: None,
+        };
+
+        let result = selector.select(&pool, &request).await;
+        let selected = result
+            .worker
+            .expect("expected selector to skip broken toolchain worker");
+        assert_eq!(selected.config.read().await.id.as_str(), "usable-slow");
+        assert_eq!(result.reason, SelectionReason::Success);
     }
 
     #[tokio::test]
