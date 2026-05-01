@@ -384,19 +384,42 @@ impl RemoteCompilationTest {
         let remote_path = self.remote_project_path();
         let escaped_remote_path = escape(Cow::from(&remote_path));
 
-        let build_cmd = if self.release_mode {
-            format!(
-                "cd {} && CARGO_INCREMENTAL=0 cargo build --release",
-                escaped_remote_path
-            )
-        } else {
-            format!(
-                "cd {} && CARGO_INCREMENTAL=0 cargo build",
-                escaped_remote_path
-            )
-        };
+        // Generate unique cargo home and target dir per worker session to prevent cache lock contention
+        let session_id = std::process::id();
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let worker_id = &self.worker.id;
+        let cargo_home = format!(
+            "/tmp/rch-cargo-home-{}-{}-{}",
+            worker_id, session_id, timestamp
+        );
+        let cargo_target_dir = format!("{}/target", remote_path);
+        let escaped_cargo_home = escape(Cow::from(&cargo_home));
+        let escaped_cargo_target_dir = escape(Cow::from(&cargo_target_dir));
 
-        debug!("Running remote build: {}", build_cmd);
+        let cargo_args = if self.release_mode {
+            "cargo build --release"
+        } else {
+            "cargo build"
+        };
+        // Preserve the cargo status after removing the isolated cache.
+        let build_cmd = format!(
+            "mkdir -p {} {} && cd {} && CARGO_HOME={} CARGO_TARGET_DIR={} CARGO_INCREMENTAL=0 {}; status=$?; rm -rf {}; exit $status",
+            escaped_cargo_home,
+            escaped_cargo_target_dir,
+            escaped_remote_path,
+            escaped_cargo_home,
+            escaped_cargo_target_dir,
+            cargo_args,
+            escaped_cargo_home
+        );
+
+        debug!(
+            "Running remote build with isolated cargo cache: {}",
+            build_cmd
+        );
 
         if use_mock_transport(&self.worker) {
             let mut client = MockSshClient::new(self.worker.clone(), MockConfig::from_env());

@@ -5346,8 +5346,11 @@ async fn execute_remote_compilation(
         warnings: None,
     }));
 
+    // Add per-worker CARGO_HOME isolation to prevent cache lock contention
+    let isolated_command = add_cargo_isolation(command, &worker_config.id);
+
     // Stream stdout/stderr to our stderr so the agent sees the output
-    let command_with_telemetry = wrap_command_with_telemetry(command, &worker_config.id);
+    let command_with_telemetry = wrap_command_with_telemetry(&isolated_command, &worker_config.id);
     let ui_state_stdout = Rc::clone(&ui_state);
     let ui_state_stderr = Rc::clone(&ui_state);
     let stderr_capture_stderr = Rc::clone(&stderr_capture_cell);
@@ -5759,6 +5762,39 @@ async fn execute_remote_compilation(
         duration_ms: result.duration_ms,
         timing,
     })
+}
+
+/// Add per-worker CARGO_HOME isolation to prevent cache lock contention.
+fn add_cargo_isolation(command: &str, worker_id: &WorkerId) -> String {
+    // Check if this is a cargo command that could benefit from isolation
+    if !command.contains("cargo") {
+        return command.to_string();
+    }
+
+    // Generate unique cargo home per worker session to prevent cache lock contention
+    let session_id = std::process::id();
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let cargo_home = format!(
+        "/tmp/rch-cargo-home-{}-{}-{}",
+        worker_id, session_id, timestamp
+    );
+
+    let escaped_cargo_home = shell_escape::escape(cargo_home.as_str().into());
+    let escaped_command = shell_escape::escape(command.into());
+    let script = format!(
+        "mkdir -p {cargo_home} || exit $?; export CARGO_HOME={cargo_home}; sh -c {command}; status=$?; rm -rf {cargo_home}; exit $status",
+        cargo_home = escaped_cargo_home,
+        command = escaped_command
+    );
+
+    // The transfer layer may prepend `timeout ...` directly before this string.
+    // Running the env assignment inside an explicit shell prevents `timeout`
+    // from trying to exec `CARGO_HOME=...` as argv[0], while preserving the
+    // original cargo exit status after cleanup.
+    format!("sh -c {}", shell_escape::escape(script.into()))
 }
 
 fn wrap_command_with_telemetry(command: &str, worker_id: &WorkerId) -> String {
@@ -7933,6 +7969,90 @@ The file `x11.pc` needs to be installed and the PKG_CONFIG_PATH environment vari
         // Basic sanity check on structure
         assert!(wrapped.contains("rch-telemetry collect"));
         assert!(wrapped.contains("exit $status"));
+    }
+
+    #[test]
+    fn test_add_cargo_isolation_adds_unique_cargo_home() {
+        let _guard = test_guard!();
+        let worker_id = rch_common::WorkerId::new("test-worker");
+
+        // Test cargo build command gets isolation
+        let cargo_command = "cargo build --release";
+        let isolated = add_cargo_isolation(cargo_command, &worker_id);
+
+        assert!(isolated.starts_with("sh -c "));
+        assert!(!isolated.starts_with("CARGO_HOME="));
+        assert!(isolated.contains("mkdir -p /tmp/rch-cargo-home-test-worker-"));
+        assert!(isolated.contains("CARGO_HOME=/tmp/rch-cargo-home-test-worker-"));
+        assert!(isolated.contains("cargo build --release"));
+        assert!(isolated.contains("status=$?"));
+        assert!(isolated.contains("exit $status"));
+        assert!(isolated.contains("rm -rf /tmp/rch-cargo-home-test-worker-"));
+    }
+
+    #[test]
+    fn test_add_cargo_isolation_skips_non_cargo_commands() {
+        let _guard = test_guard!();
+        let worker_id = rch_common::WorkerId::new("test-worker");
+
+        // Test non-cargo command is unchanged
+        let non_cargo_command = "echo hello world";
+        let isolated = add_cargo_isolation(non_cargo_command, &worker_id);
+
+        assert_eq!(isolated, non_cargo_command);
+        assert!(!isolated.contains("CARGO_HOME"));
+    }
+
+    #[test]
+    fn test_add_cargo_isolation_handles_complex_cargo_commands() {
+        let _guard = test_guard!();
+        let worker_id = rch_common::WorkerId::new("worker-123");
+
+        // Test complex cargo command with environment variables and arguments
+        let complex_command = "cd /some/path && RUSTFLAGS=\"-C target-cpu=native\" cargo test --release --features=foo";
+        let isolated = add_cargo_isolation(complex_command, &worker_id);
+
+        assert!(isolated.starts_with("sh -c "));
+        assert!(isolated.contains("mkdir -p /tmp/rch-cargo-home-worker-123-"));
+        assert!(isolated.contains("CARGO_HOME=/tmp/rch-cargo-home-worker-123-"));
+        assert!(isolated.contains("cd /some/path && RUSTFLAGS=\"-C target-cpu=native\" cargo test --release --features=foo"));
+        assert!(isolated.contains("status=$?"));
+        assert!(isolated.contains("exit $status"));
+        assert!(isolated.contains("rm -rf /tmp/rch-cargo-home-worker-123-"));
+    }
+
+    #[test]
+    fn test_add_cargo_isolation_survives_timeout_prefix_and_preserves_status() {
+        let _guard = test_guard!();
+        let worker_id = rch_common::WorkerId::new("timeout-worker");
+        let isolated = add_cargo_isolation("printf cargo >/dev/null; exit 42", &worker_id);
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "timeout --foreground --preserve-status 5 {}",
+                isolated
+            ))
+            .status()
+            .expect("timeout-wrapped isolated command should execute");
+
+        assert_eq!(
+            status.code(),
+            Some(42),
+            "timeout must execute the shell wrapper and preserve the command status"
+        );
+    }
+
+    #[test]
+    fn test_remote_cargo_target_dir_name_is_unique_and_path_safe() {
+        let _guard = test_guard!();
+        let worker_id = rch_common::WorkerId::new("worker/with spaces");
+        let first = remote_cargo_target_dir_name(Some(42), &worker_id);
+        let second = remote_cargo_target_dir_name(Some(42), &worker_id);
+
+        assert!(first.starts_with(".rch-target-worker-with-spaces-job-42-"));
+        assert!(!first.contains('/'));
+        assert!(!first.contains(' '));
+        assert_ne!(first, second);
     }
 
     #[test]
