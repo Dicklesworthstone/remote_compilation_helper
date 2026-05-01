@@ -16,7 +16,7 @@ const REMEDIATION_CONFIDENCE_THRESHOLD: f64 = 0.85;
 #[derive(Debug, Clone, Copy)]
 struct StuckEvidenceInput {
     hook_alive: bool,
-    execute_phase: bool,
+    progress_stall_remediable_phase: bool,
     heartbeat_age_secs: u64,
     progress_age_secs: u64,
     build_age_secs: u64,
@@ -29,7 +29,7 @@ struct StuckEvidence {
     hook_alive: bool,
     heartbeat_stale: bool,
     progress_stale: bool,
-    execute_progress_stale: bool,
+    remediable_progress_stale: bool,
     heartbeat_age_secs: u64,
     progress_age_secs: u64,
     build_age_secs: u64,
@@ -42,13 +42,13 @@ impl StuckEvidence {
     fn should_remediate(self) -> bool {
         let hard_timeout = self.build_age_secs > 86400; // 24 hours
         let dead_hook_evidence = !self.hook_alive && self.heartbeat_stale;
-        let execute_stall_evidence = self.execute_progress_stale;
+        let phase_stall_evidence = self.remediable_progress_stale;
 
         hard_timeout
             || (self.build_age_secs >= MIN_BUILD_AGE_SECS
                 && self.slots_owned > 0
                 && self.has_worker_binding
-                && (dead_hook_evidence || execute_stall_evidence)
+                && (dead_hook_evidence || phase_stall_evidence)
                 && self.confidence >= REMEDIATION_CONFIDENCE_THRESHOLD)
     }
 }
@@ -57,7 +57,8 @@ fn score_stuck_evidence(input: StuckEvidenceInput) -> StuckEvidence {
     let heartbeat_stale = input.heartbeat_age_secs >= HEARTBEAT_STALE_SECS;
     let progress_stale = input.progress_age_secs >= PROGRESS_STALE_SECS;
     let progress_recent = input.progress_age_secs <= RECENT_PROGRESS_GRACE_SECS;
-    let execute_progress_stale = input.execute_phase && progress_stale && !progress_recent;
+    let remediable_progress_stale =
+        input.progress_stall_remediable_phase && progress_stale && !progress_recent;
 
     // Missing heartbeats are only one signal; remediation needs multiple corroborating signals.
     let mut confidence: f64 = 0.0;
@@ -70,7 +71,7 @@ fn score_stuck_evidence(input: StuckEvidenceInput) -> StuckEvidence {
     if progress_stale {
         confidence += 0.15;
     }
-    if execute_progress_stale {
+    if remediable_progress_stale {
         confidence += 0.65;
     }
     if progress_recent {
@@ -91,7 +92,7 @@ fn score_stuck_evidence(input: StuckEvidenceInput) -> StuckEvidence {
         hook_alive: input.hook_alive,
         heartbeat_stale,
         progress_stale,
-        execute_progress_stale,
+        remediable_progress_stale,
         heartbeat_age_secs: input.heartbeat_age_secs,
         progress_age_secs: input.progress_age_secs,
         build_age_secs: input.build_age_secs,
@@ -99,6 +100,16 @@ fn score_stuck_evidence(input: StuckEvidenceInput) -> StuckEvidence {
         has_worker_binding: input.has_worker_binding,
         confidence,
     }
+}
+
+fn is_progress_stall_remediable_phase(phase: &rch_common::BuildHeartbeatPhase) -> bool {
+    matches!(
+        phase,
+        rch_common::BuildHeartbeatPhase::SyncUp
+            | rch_common::BuildHeartbeatPhase::Execute
+            | rch_common::BuildHeartbeatPhase::SyncDown
+            | rch_common::BuildHeartbeatPhase::Finalize
+    )
 }
 
 pub struct ActiveBuildCleanup {
@@ -147,9 +158,8 @@ impl ActiveBuildCleanup {
             let has_worker_binding = !build.worker_id.is_empty();
             let evidence = score_stuck_evidence(StuckEvidenceInput {
                 hook_alive,
-                execute_phase: matches!(
-                    build.heartbeat_phase,
-                    rch_common::BuildHeartbeatPhase::Execute
+                progress_stall_remediable_phase: is_progress_stall_remediable_phase(
+                    &build.heartbeat_phase,
                 ),
                 heartbeat_age_secs,
                 progress_age_secs,
@@ -259,7 +269,7 @@ mod tests {
         let _guard = test_guard!();
         let evidence = score_stuck_evidence(StuckEvidenceInput {
             hook_alive: false,
-            execute_phase: true,
+            progress_stall_remediable_phase: true,
             heartbeat_age_secs: HEARTBEAT_STALE_SECS + 5,
             progress_age_secs: PROGRESS_STALE_SECS + 10,
             build_age_secs: MIN_BUILD_AGE_SECS + 45,
@@ -277,7 +287,7 @@ mod tests {
         let _guard = test_guard!();
         let evidence = score_stuck_evidence(StuckEvidenceInput {
             hook_alive: true,
-            execute_phase: false,
+            progress_stall_remediable_phase: false,
             heartbeat_age_secs: HEARTBEAT_STALE_SECS + 2,
             progress_age_secs: 4,
             build_age_secs: MIN_BUILD_AGE_SECS + 10,
@@ -295,7 +305,7 @@ mod tests {
         let _guard = test_guard!();
         let evidence = score_stuck_evidence(StuckEvidenceInput {
             hook_alive: true,
-            execute_phase: false,
+            progress_stall_remediable_phase: false,
             heartbeat_age_secs: HEARTBEAT_STALE_SECS + 60,
             progress_age_secs: PROGRESS_STALE_SECS + 60,
             build_age_secs: MIN_BUILD_AGE_SECS + 90,
@@ -313,7 +323,7 @@ mod tests {
         let _guard = test_guard!();
         let evidence = score_stuck_evidence(StuckEvidenceInput {
             hook_alive: true,
-            execute_phase: true,
+            progress_stall_remediable_phase: true,
             heartbeat_age_secs: 1,
             progress_age_secs: PROGRESS_STALE_SECS + 60,
             build_age_secs: MIN_BUILD_AGE_SECS + 90,
@@ -323,16 +333,20 @@ mod tests {
 
         assert!(!evidence.heartbeat_stale);
         assert!(evidence.progress_stale);
-        assert!(evidence.execute_progress_stale);
+        assert!(evidence.remediable_progress_stale);
         assert!(evidence.should_remediate());
     }
 
     #[test]
-    fn test_score_stuck_evidence_non_execute_progress_stall_retains_live_hook() {
+    fn test_score_stuck_evidence_sync_down_progress_stall_remediates_live_hook() {
         let _guard = test_guard!();
+        assert!(is_progress_stall_remediable_phase(
+            &rch_common::BuildHeartbeatPhase::SyncDown
+        ));
+
         let evidence = score_stuck_evidence(StuckEvidenceInput {
             hook_alive: true,
-            execute_phase: false,
+            progress_stall_remediable_phase: true,
             heartbeat_age_secs: 1,
             progress_age_secs: PROGRESS_STALE_SECS + 60,
             build_age_secs: MIN_BUILD_AGE_SECS + 90,
@@ -342,7 +356,26 @@ mod tests {
 
         assert!(!evidence.heartbeat_stale);
         assert!(evidence.progress_stale);
-        assert!(!evidence.execute_progress_stale);
+        assert!(evidence.remediable_progress_stale);
+        assert!(evidence.should_remediate());
+    }
+
+    #[test]
+    fn test_score_stuck_evidence_unremediable_progress_stall_retains_live_hook() {
+        let _guard = test_guard!();
+        let evidence = score_stuck_evidence(StuckEvidenceInput {
+            hook_alive: true,
+            progress_stall_remediable_phase: false,
+            heartbeat_age_secs: 1,
+            progress_age_secs: PROGRESS_STALE_SECS + 60,
+            build_age_secs: MIN_BUILD_AGE_SECS + 90,
+            slots_owned: 2,
+            has_worker_binding: true,
+        });
+
+        assert!(!evidence.heartbeat_stale);
+        assert!(evidence.progress_stale);
+        assert!(!evidence.remediable_progress_stale);
         assert!(!evidence.should_remediate());
     }
 
@@ -351,7 +384,7 @@ mod tests {
         let _guard = test_guard!();
         let evidence = score_stuck_evidence(StuckEvidenceInput {
             hook_alive: false,
-            execute_phase: true,
+            progress_stall_remediable_phase: true,
             heartbeat_age_secs: HEARTBEAT_STALE_SECS + 1,
             progress_age_secs: RECENT_PROGRESS_GRACE_SECS,
             build_age_secs: MIN_BUILD_AGE_SECS + 30,
@@ -368,7 +401,7 @@ mod tests {
         let _guard = test_guard!();
         let evidence = score_stuck_evidence(StuckEvidenceInput {
             hook_alive: false,
-            execute_phase: true,
+            progress_stall_remediable_phase: true,
             heartbeat_age_secs: HEARTBEAT_STALE_SECS + 30,
             progress_age_secs: PROGRESS_STALE_SECS + 30,
             build_age_secs: MIN_BUILD_AGE_SECS - 1,
@@ -384,7 +417,7 @@ mod tests {
         let _guard = test_guard!();
         let evidence = score_stuck_evidence(StuckEvidenceInput {
             hook_alive: false,
-            execute_phase: true,
+            progress_stall_remediable_phase: true,
             heartbeat_age_secs: HEARTBEAT_STALE_SECS + 30,
             progress_age_secs: PROGRESS_STALE_SECS + 30,
             build_age_secs: MIN_BUILD_AGE_SECS + 30,
