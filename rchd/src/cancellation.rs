@@ -687,6 +687,15 @@ impl CancellationOrchestrator {
             };
             ctx.history
                 .record_cancelled_build(state, None, Some(cancellation));
+            if matches!(
+                record.reason,
+                CancelReason::Timeout | CancelReason::StuckDetector
+            ) && let Some(worker) = ctx.pool.get(&WorkerId::new(worker_id)).await
+            {
+                worker
+                    .record_failure(Some(format!("build cancelled by {}", record.reason)))
+                    .await;
+            }
             if !cfg!(test) {
                 crate::metrics::dec_active_builds("remote");
                 crate::metrics::inc_build_total("cancelled", "remote");

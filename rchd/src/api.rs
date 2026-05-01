@@ -2370,12 +2370,22 @@ async fn handle_release_worker(ctx: &DaemonContext, request: ReleaseRequest) -> 
             );
 
             // Record successful builds for affinity pinning
-            if exit_code == 0
-                && let Some(ref worker_id) = rec.worker_id
-            {
-                ctx.worker_selector
-                    .record_success(worker_id, &rec.project_id)
-                    .await;
+            if let Some(ref worker_id) = rec.worker_id {
+                if let Some(worker) = ctx.pool.get(&rch_common::WorkerId::new(worker_id)).await {
+                    if exit_code == 0 {
+                        worker.record_success().await;
+                    } else {
+                        worker
+                            .record_failure(Some(format!("build exited with {exit_code}")))
+                            .await;
+                    }
+                }
+
+                if exit_code == 0 {
+                    ctx.worker_selector
+                        .record_success(worker_id, &rec.project_id)
+                        .await;
+                }
             }
         }
     }
@@ -5096,6 +5106,43 @@ mod tests {
         let completed = recent.iter().find(|b| b.id == build_id);
         assert!(completed.is_some());
         assert_eq!(completed.unwrap().exit_code, 0);
+    }
+
+    #[tokio::test]
+    async fn test_handle_release_worker_records_nonzero_exit_as_worker_failure() {
+        let _guard = test_guard!();
+        let pool = WorkerPool::new();
+        pool.add_worker(make_test_worker("worker1", 8)).await;
+
+        let ctx = make_test_context(pool.clone());
+        let build = ctx.history.start_active_build(
+            "test-project".to_string(),
+            "worker1".to_string(),
+            "cargo test".to_string(),
+            12345,
+            4,
+            rch_common::BuildLocation::Remote,
+        );
+        let build_id = build.id;
+
+        let worker = pool.get(&WorkerId::new("worker1")).await.unwrap();
+        worker.reserve_slots(4).await;
+
+        let request = ReleaseRequest {
+            worker_id: WorkerId::new("worker1"),
+            slots: 4,
+            build_id: Some(build_id),
+            exit_code: Some(101),
+            duration_ms: Some(5000),
+            bytes_transferred: Some(1024 * 1024),
+            timing: None,
+        };
+
+        let result = handle_release_worker(&ctx, request).await;
+        assert!(result.is_ok());
+
+        let stats = worker.circuit_stats().await;
+        assert!(stats.error_rate() > 0.0);
     }
 
     #[tokio::test]

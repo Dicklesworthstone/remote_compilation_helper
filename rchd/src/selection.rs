@@ -1012,6 +1012,15 @@ impl WorkerSelector {
             return None;
         }
 
+        let success_rate = self.health_score(&worker).await;
+        if success_rate < self.config.affinity.fallback_min_success_rate {
+            debug!(
+                "Affinity fallback worker {} skipped: success_rate {:.2} < fallback_min {:.2}",
+                fallback_id, success_rate, self.config.affinity.fallback_min_success_rate
+            );
+            return None;
+        }
+
         Some(fallback_id)
     }
 
@@ -1551,14 +1560,12 @@ impl WorkerSelector {
                 continue;
             }
 
-            // Track workers for fail-open fallback even if they fail preflight
-            if has_preferred && preferred_set.contains(worker_id.as_str()) {
-                preferred_without_health.push((worker.clone(), circuit_state));
-            }
-            eligible_without_health.push((worker.clone(), circuit_state));
-
             // Skip workers failing preflight checks (but keep for fail-open)
             if !passes_preflight {
+                if has_preferred && preferred_set.contains(worker_id.as_str()) {
+                    preferred_without_health.push((worker.clone(), circuit_state));
+                }
+                eligible_without_health.push((worker.clone(), circuit_state));
                 continue;
             }
 
@@ -1569,6 +1576,12 @@ impl WorkerSelector {
                     "Worker {} excluded: success_rate {:.2} < min {:.2}",
                     worker_id, success_rate, self.config.min_success_rate
                 );
+                if success_rate >= self.config.affinity.fallback_min_success_rate {
+                    if has_preferred && preferred_set.contains(worker_id.as_str()) {
+                        preferred_without_health.push((worker.clone(), circuit_state));
+                    }
+                    eligible_without_health.push((worker.clone(), circuit_state));
+                }
                 continue;
             }
 
@@ -4353,6 +4366,50 @@ mod tests {
         // Fallback disabled, should return None
         let fallback = selector.get_fallback_worker("project-a").await;
         assert!(fallback.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_selector_skips_low_success_last_success_fallback() {
+        use rch_common::AffinityConfig;
+
+        let pool = WorkerPool::new();
+        let worker = make_worker("worker1", 8, 50.0);
+        worker
+            .record_failure(Some("toolchain probe failed".to_string()))
+            .await;
+        worker
+            .record_failure(Some("toolchain probe failed".to_string()))
+            .await;
+        pool.add_worker_state(worker).await;
+
+        let selector = WorkerSelector::with_config(
+            SelectionConfig {
+                min_success_rate: 0.8,
+                affinity: AffinityConfig {
+                    fallback_min_success_rate: 0.5,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            CircuitBreakerConfig::default(),
+        );
+        selector.record_success("worker1", "project-a").await;
+
+        let request = SelectionRequest {
+            project: "project-a".to_string(),
+            command: None,
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 2,
+            preferred_workers: vec![],
+            toolchain: None,
+            required_runtime: RequiredRuntime::default(),
+            classification_duration_us: None,
+            hook_pid: None,
+        };
+
+        let result = selector.select(&pool, &request).await;
+        assert!(result.worker.is_none());
+        assert_eq!(result.reason, SelectionReason::AllWorkersBusy);
     }
 
     // ========================================================================
