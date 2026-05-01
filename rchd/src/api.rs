@@ -2653,6 +2653,42 @@ fn cancellation_issues_from_recent_builds(recent_builds: &[BuildRecord]) -> Vec<
     issues
 }
 
+fn active_build_issues_from_active_builds(
+    active_builds: &[crate::history::ActiveBuildState],
+) -> Vec<Issue> {
+    let stalled_live_hook_builds: Vec<_> = active_builds
+        .iter()
+        .filter(|build| {
+            build.detector_progress_stale
+                && build.detector_hook_alive
+                && !build.detector_heartbeat_stale
+        })
+        .collect();
+
+    if stalled_live_hook_builds.is_empty() {
+        return Vec::new();
+    }
+
+    let representative = stalled_live_hook_builds
+        .iter()
+        .max_by_key(|build| build.detector_build_age_secs)
+        .expect("non-empty stalled live-hook build list");
+
+    vec![Issue {
+        severity: "warning".to_string(),
+        summary: format!(
+            "{} active build(s) have stale progress while hook heartbeats remain fresh; queued validations may stall behind build {} on worker {}.",
+            stalled_live_hook_builds.len(),
+            representative.id,
+            representative.worker_id
+        ),
+        remediation: Some(format!(
+            "Inspect with `rch queue --json`; if progress remains stale, run `rch cancel {}`. If this repeats on {}, drain it with `rch workers drain {}` before retrying validation.",
+            representative.id, representative.worker_id, representative.worker_id
+        )),
+    }]
+}
+
 /// Handle a status request.
 async fn handle_status(ctx: &DaemonContext) -> Result<DaemonFullStatus> {
     let workers = ctx.pool.all_workers().await;
@@ -2802,9 +2838,11 @@ async fn handle_status(ctx: &DaemonContext) -> Result<DaemonFullStatus> {
         dt.to_rfc3339()
     };
 
-    // Get recent builds from history
+    // Get recent and active builds from history.
     let recent_builds = ctx.history.recent(20);
     issues.extend(cancellation_issues_from_recent_builds(&recent_builds));
+    let active_builds = ctx.history.active_builds();
+    issues.extend(active_build_issues_from_active_builds(&active_builds));
     let stats = ctx.history.stats();
     let test_stats = ctx.telemetry.test_run_stats().await;
 
@@ -2830,9 +2868,7 @@ async fn handle_status(ctx: &DaemonContext) -> Result<DaemonFullStatus> {
             slots_available,
         },
         workers: worker_infos,
-        active_builds: ctx
-            .history
-            .active_builds()
+        active_builds: active_builds
             .into_iter()
             .map(|b| ActiveBuild {
                 id: b.id,
@@ -5438,6 +5474,52 @@ mod tests {
                 .any(|issue| issue.summary.contains("SIGKILL")),
             "status issues should include cancellation escalation warnings"
         );
+    }
+
+    #[tokio::test]
+    async fn test_handle_status_emits_live_hook_progress_stall_issue() {
+        let _guard = test_guard!();
+        let pool = WorkerPool::new();
+        pool.add_worker(make_test_worker("worker1", 8)).await;
+        let ctx = make_test_context(pool);
+
+        let active = ctx.history.start_active_build(
+            "test-project".to_string(),
+            "worker1".to_string(),
+            "cargo test".to_string(),
+            0,
+            4,
+            rch_common::BuildLocation::Remote,
+        );
+        let updated = ctx.history.record_stuck_detector_snapshot(
+            active.id,
+            crate::history::StuckDetectorSnapshot {
+                hook_alive: true,
+                heartbeat_stale: false,
+                progress_stale: true,
+                confidence: 0.25,
+                build_age_secs: 240,
+                slots_owned: 4,
+            },
+        );
+        assert!(updated.is_some());
+
+        let status = handle_status(&ctx).await.expect("status should succeed");
+        let issue = status
+            .issues
+            .iter()
+            .find(|issue| issue.summary.contains("stale progress"))
+            .expect("status issues should include live-hook progress stall");
+
+        assert_eq!(issue.severity, "warning");
+        assert!(issue.summary.contains(&active.id.to_string()));
+        assert!(issue.summary.contains("worker1"));
+        let remediation = issue
+            .remediation
+            .as_ref()
+            .expect("stall issue should include remediation");
+        assert!(remediation.contains(&format!("rch cancel {}", active.id)));
+        assert!(remediation.contains("rch workers drain worker1"));
     }
 
     #[tokio::test]
