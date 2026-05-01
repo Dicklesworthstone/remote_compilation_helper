@@ -121,7 +121,7 @@ pub fn wrap_command_with_color(command: &str, color_mode: ColorMode) -> String {
         }
         ColorMode::Never => {
             // Explicitly disable colors
-            format!("NO_COLOR=1 CARGO_TERM_COLOR=never {}", command)
+            format!("env NO_COLOR=1 CARGO_TERM_COLOR=never {}", command)
         }
     }
 }
@@ -413,9 +413,29 @@ mod tests {
     #[test]
     fn test_wrap_command_with_color_never() {
         let wrapped = wrap_command_with_color("cargo test", ColorMode::Never);
+        assert!(wrapped.starts_with("env "));
         assert!(wrapped.contains("NO_COLOR=1"));
         assert!(wrapped.contains("CARGO_TERM_COLOR=never"));
         assert!(wrapped.contains("cargo test"));
+    }
+
+    #[test]
+    fn test_wrap_command_with_color_never_is_timeout_safe() {
+        let wrapped = wrap_command_with_color("sh -c 'exit 43'", ColorMode::Never);
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "timeout --foreground --preserve-status 5 {}",
+                wrapped
+            ))
+            .status()
+            .expect("timeout-wrapped color-disabled command should execute");
+
+        assert_eq!(
+            status.code(),
+            Some(43),
+            "timeout must execute env, not an environment assignment argv"
+        );
     }
 
     #[test]
