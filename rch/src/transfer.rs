@@ -1113,6 +1113,71 @@ fi",
         cmd
     }
 
+    /// Build rsync command for sync_to_remote_streaming.
+    fn build_sync_streaming_command(
+        &self,
+        worker: &WorkerConfig,
+        destination: &str,
+        escaped_remote_path: &str,
+        effective_excludes: &[String],
+    ) -> Command {
+        let mut cmd = Command::new("rsync");
+        // Force C locale for consistent output parsing
+        cmd.env("LC_ALL", "C");
+
+        let identity_file = shellexpand::tilde(&worker.identity_file);
+        let escaped_identity = escape(Cow::from(identity_file.as_ref()));
+        let ssh_command = self.build_rsync_ssh_command(escaped_identity.as_ref());
+
+        cmd.arg("-az") // Archive mode + compression
+            .arg("--info=progress2")
+            .arg("--info=stats2")
+            .arg("-e")
+            .arg(ssh_command);
+
+        if self.sync_delete {
+            cmd.arg("--delete"); // Remove extraneous files from destination
+        }
+
+        // Create remote directory implicitly using rsync-path wrapper
+        cmd.arg("--rsync-path")
+            .arg(format!("mkdir -p {} && rsync", escaped_remote_path));
+
+        if let Some(include_patterns) = &self.sync_include_patterns {
+            cmd.arg("--prune-empty-dirs");
+            for pattern in include_patterns {
+                cmd.arg("--include").arg(pattern);
+            }
+            cmd.arg("--exclude").arg("*");
+        } else {
+            // Add exclude patterns (config defaults + .rchignore)
+            for pattern in effective_excludes {
+                cmd.arg("--exclude").arg(pattern);
+            }
+        }
+
+        // Add zstd compression if available (rsync 3.2.3+)
+        let compression_level = self.compression_level_for_transfer();
+        if compression_level > 0 {
+            cmd.arg("--compress-choice=zstd");
+            cmd.arg(format!("--compress-level={}", compression_level));
+        }
+
+        // Add bandwidth limit if configured (bd-3hho)
+        if let Some(bwlimit) = self.transfer_config.bwlimit_kbps
+            && bwlimit > 0
+        {
+            cmd.arg(format!("--bwlimit={}", bwlimit));
+        }
+
+        // Source and destination
+        cmd.arg(format!("{}/", self.project_root.display())) // Trailing slash = contents only
+            .arg(destination);
+
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        cmd
+    }
+
     /// Synchronize local project to remote worker.
     ///
     /// Uses retry logic with exponential backoff for transient network errors.
@@ -1266,50 +1331,12 @@ fi",
 
         debug!("Effective exclude patterns: {:?}", effective_excludes);
 
-        let mut cmd = Command::new("rsync");
-        // Force C locale for consistent output parsing
-        cmd.env("LC_ALL", "C");
-
-        let identity_file = shellexpand::tilde(&worker.identity_file);
-        let escaped_identity = escape(Cow::from(identity_file.as_ref()));
-
-        let ssh_command = self.build_rsync_ssh_command(escaped_identity.as_ref());
-
-        cmd.arg("-az") // Archive mode + compression
-            .arg("--delete") // Remove extraneous files from destination
-            .arg("--info=progress2")
-            .arg("--info=stats2")
-            .arg("-e")
-            .arg(ssh_command);
-
-        // Create remote directory implicitly using rsync-path wrapper
-        cmd.arg("--rsync-path")
-            .arg(format!("mkdir -p {} && rsync", escaped_remote_path));
-
-        // Add exclude patterns (config defaults + .rchignore)
-        for pattern in &effective_excludes {
-            cmd.arg("--exclude").arg(pattern);
-        }
-
-        // Add zstd compression if available (rsync 3.2.3+)
-        let compression_level = self.compression_level_for_transfer();
-        if compression_level > 0 {
-            cmd.arg("--compress-choice=zstd");
-            cmd.arg(format!("--compress-level={}", compression_level));
-        }
-
-        // Add bandwidth limit if configured (bd-3hho)
-        if let Some(bwlimit) = self.transfer_config.bwlimit_kbps
-            && bwlimit > 0
-        {
-            cmd.arg(format!("--bwlimit={}", bwlimit));
-        }
-
-        // Source and destination
-        cmd.arg(format!("{}/", self.project_root.display())) // Trailing slash = contents only
-            .arg(&destination);
-
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let cmd = self.build_sync_streaming_command(
+            worker,
+            &destination,
+            &escaped_remote_path,
+            &effective_excludes,
+        );
 
         debug!(
             "Running (streaming): rsync {:?}",
@@ -4069,6 +4096,105 @@ Total file size: 123 bytes";
         assert!(
             args.windows(2).any(|window| window == ["--exclude", "*"]),
             "metadata-only syncs should exclude everything else"
+        );
+    }
+
+    #[test]
+    fn test_build_sync_streaming_command_metadata_only_sync_omits_delete_and_uses_includes() {
+        let _guard = test_guard!();
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/tmp/workspace-root"),
+            "workspace-root".to_string(),
+            "abc123".to_string(),
+            TransferConfig::default(),
+        )
+        .with_sync_include_patterns(vec![
+            "Cargo.toml".to_string(),
+            "Cargo.lock".to_string(),
+            ".cargo/".to_string(),
+            ".cargo/**".to_string(),
+        ])
+        .with_sync_delete(false);
+
+        let worker = WorkerConfig {
+            id: WorkerId::new("mock-worker"),
+            host: "mock://worker".to_string(),
+            user: "mockuser".to_string(),
+            identity_file: "~/.ssh/mock".to_string(),
+            total_slots: 4,
+            priority: 100,
+            tags: vec![],
+        };
+
+        let cmd = pipeline.build_sync_streaming_command(
+            &worker,
+            "mockuser@mock://worker:/tmp/rch/test-project/abc123",
+            "/tmp/rch/test-project/abc123",
+            &[],
+        );
+
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect();
+
+        assert!(
+            !args.iter().any(|arg| arg == "--delete"),
+            "streaming metadata-only syncs must not delete unrelated remote files"
+        );
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["--include", "Cargo.toml"]),
+            "streaming metadata-only syncs should include Cargo.toml"
+        );
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["--include", ".cargo/**"]),
+            "streaming metadata-only syncs should include workspace .cargo metadata"
+        );
+        assert!(
+            args.windows(2).any(|window| window == ["--exclude", "*"]),
+            "streaming metadata-only syncs should exclude everything else"
+        );
+    }
+
+    #[test]
+    fn test_build_sync_streaming_command_default_sync_includes_delete() {
+        let _guard = test_guard!();
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/tmp/workspace-root"),
+            "workspace-root".to_string(),
+            "abc123".to_string(),
+            TransferConfig::default(),
+        );
+
+        let worker = WorkerConfig {
+            id: WorkerId::new("mock-worker"),
+            host: "mock://worker".to_string(),
+            user: "mockuser".to_string(),
+            identity_file: "~/.ssh/mock".to_string(),
+            total_slots: 4,
+            priority: 100,
+            tags: vec![],
+        };
+
+        let cmd = pipeline.build_sync_streaming_command(
+            &worker,
+            "mockuser@mock://worker:/tmp/rch/test-project/abc123",
+            "/tmp/rch/test-project/abc123",
+            &[],
+        );
+
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect();
+
+        assert!(
+            args.iter().any(|arg| arg == "--delete"),
+            "normal streaming syncs should retain delete semantics"
         );
     }
 }
