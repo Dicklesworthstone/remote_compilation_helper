@@ -243,6 +243,8 @@ async fn test_cargo_nextest_run() -> Result<(), String> {
     if let Err(e) =
         sync_fixture_to_remote(&mut client, &worker_config, &fixture_dir, &remote_path).await
     {
+        let _ = cleanup_remote(&mut client, &remote_path).await;
+        client.disconnect().await.ok();
         let message = format!("Failed to sync fixture: {e}");
         logger.fail(message.as_str());
         return Err(message);
