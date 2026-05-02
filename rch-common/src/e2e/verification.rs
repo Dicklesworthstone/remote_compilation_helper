@@ -27,12 +27,15 @@
 //! }
 //! ```
 
-use std::path::PathBuf;
+use std::borrow::Cow;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
+use shell_escape::escape;
 use tracing::{debug, error, info, warn};
+use uuid::Uuid;
 
 use crate::binary_hash::{BinaryHashResult, binaries_equivalent, compute_binary_hash};
 use crate::test_change::{TestChangeGuard, TestCodeChange};
@@ -55,7 +58,7 @@ pub struct VerificationConfig {
     pub exclude_patterns: Vec<String>,
     /// Whether to clean target directory before remote build.
     pub clean_before_build: bool,
-    /// Remote base path for project caching.
+    /// Remote base path for isolated verification workspaces.
     pub remote_base_path: PathBuf,
 }
 
@@ -141,6 +144,39 @@ pub struct RemoteCompilationTest {
     project_path: PathBuf,
     /// Verification configuration.
     config: VerificationConfig,
+    /// Unique suffix appended to the remote project directory for this test run.
+    remote_path_suffix: String,
+}
+
+fn sanitize_remote_path_component(component: &str, fallback: &str) -> String {
+    let sanitized = component
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    let trimmed = sanitized.trim_matches('-');
+    if trimmed.is_empty() {
+        fallback.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn sanitize_remote_path_suffix(suffix: &str) -> String {
+    sanitize_remote_path_component(suffix, "run")
+}
+
+fn shell_escape_path(path: &Path) -> String {
+    escape(path.to_string_lossy()).into_owned()
+}
+
+fn shell_escape_str(value: &str) -> String {
+    escape(Cow::from(value)).into_owned()
 }
 
 impl RemoteCompilationTest {
@@ -159,7 +195,14 @@ impl RemoteCompilationTest {
             worker,
             project_path: project_path.into(),
             config,
+            remote_path_suffix: format!("run-{}", Uuid::new_v4()),
         }
+    }
+
+    /// Set the remote project path suffix.
+    pub fn with_remote_path_suffix(mut self, suffix: impl AsRef<str>) -> Self {
+        self.remote_path_suffix = sanitize_remote_path_suffix(suffix.as_ref());
+        self
     }
 
     /// Run the verification test.
@@ -352,14 +395,13 @@ impl RemoteCompilationTest {
 
     /// Build the project on the remote worker.
     fn build_remote(&self) -> Result<()> {
-        let remote_path = self.remote_project_path();
         let build_cmd = if self.config.release_mode {
             "cargo build --release"
         } else {
             "cargo build"
         };
 
-        let ssh_cmd = format!("cd {} && {}", remote_path.display(), build_cmd);
+        let ssh_cmd = self.remote_build_command(build_cmd);
 
         let identity_file = shellexpand::tilde(&self.worker.identity_file).to_string();
         let mut cmd = Command::new("ssh");
@@ -391,7 +433,8 @@ impl RemoteCompilationTest {
         let identity_file = shellexpand::tilde(&self.worker.identity_file).to_string();
 
         // Ensure remote directory exists
-        let mkdir_cmd = format!("mkdir -p {}", remote_path.display());
+        let escaped_remote_path = shell_escape_path(&remote_path);
+        let mkdir_cmd = format!("mkdir -p -- {}", escaped_remote_path);
         let mut mkdir = Command::new("ssh");
         mkdir.args([
             "-i",
@@ -403,9 +446,13 @@ impl RemoteCompilationTest {
             &format!("{}@{}", self.worker.user, self.worker.host),
             &mkdir_cmd,
         ]);
-        mkdir
+        let mkdir_output = mkdir
             .output()
             .context("Failed to create remote directory")?;
+        if !mkdir_output.status.success() {
+            let stderr = String::from_utf8_lossy(&mkdir_output.stderr);
+            return Err(anyhow!("remote directory creation failed: {}", stderr));
+        }
 
         // Build rsync command
         let mut cmd = Command::new("rsync");
@@ -415,10 +462,7 @@ impl RemoteCompilationTest {
             &self.config.rsync_compression.to_string(),
             "--delete",
             "-e",
-            &format!(
-                "ssh -i {} -o StrictHostKeyChecking=accept-new -o BatchMode=yes",
-                identity_file
-            ),
+            &self.rsync_ssh_command(&identity_file),
         ]);
 
         // Add exclude patterns
@@ -430,9 +474,7 @@ impl RemoteCompilationTest {
         let src = format!("{}/", self.project_path.display());
         let dest = format!(
             "{}@{}:{}",
-            self.worker.user,
-            self.worker.host,
-            remote_path.display()
+            self.worker.user, self.worker.host, escaped_remote_path
         );
         cmd.args([&src, &dest]);
 
@@ -472,19 +514,17 @@ impl RemoteCompilationTest {
             "--compress-level",
             &self.config.rsync_compression.to_string(),
             "-e",
-            &format!(
-                "ssh -i {} -o StrictHostKeyChecking=accept-new -o BatchMode=yes",
-                identity_file
-            ),
+            &self.rsync_ssh_command(&identity_file),
         ]);
 
         // Source (remote target/debug or target/release) and destination
+        let remote_target_dir = remote_path.join("target").join(profile);
+        let remote_target_dir_with_slash = format!("{}/", remote_target_dir.display());
         let remote_target = format!(
-            "{}@{}:{}/target/{}/",
+            "{}@{}:{}",
             self.worker.user,
             self.worker.host,
-            remote_path.display(),
-            profile
+            shell_escape_str(&remote_target_dir_with_slash)
         );
         let local_target = format!("{}/", local_artifact_dir.display());
         cmd.args([&remote_target, &local_target]);
@@ -527,14 +567,52 @@ impl RemoteCompilationTest {
 
     /// Get the remote project path on the worker.
     fn remote_project_path(&self) -> PathBuf {
-        // Create a unique path based on project name
         let project_name = self
             .project_path
             .file_name()
             .and_then(|n| n.to_str())
-            .unwrap_or("project");
+            .map(|name| sanitize_remote_path_component(name, "project"))
+            .unwrap_or_else(|| "project".to_string());
+        let remote_path_suffix = sanitize_remote_path_suffix(&self.remote_path_suffix);
 
-        self.config.remote_base_path.join(project_name)
+        self.config
+            .remote_base_path
+            .join(format!("{project_name}-{remote_path_suffix}"))
+    }
+
+    /// Build the remote cargo command.
+    fn remote_cargo_command(&self, build_cmd: &str) -> String {
+        let mut parts = vec![build_cmd.to_string()];
+        parts.extend(
+            self.config
+                .cargo_flags
+                .iter()
+                .map(|flag| shell_escape_str(flag)),
+        );
+        parts.join(" ")
+    }
+
+    /// Build the remote shell command for compilation.
+    fn remote_build_command(&self, build_cmd: &str) -> String {
+        let remote_path = self.remote_project_path();
+        let cargo_cmd = self.remote_cargo_command(build_cmd);
+        if self.config.clean_before_build {
+            format!(
+                "cd {} && cargo clean && {}",
+                shell_escape_path(&remote_path),
+                cargo_cmd
+            )
+        } else {
+            format!("cd {} && {}", shell_escape_path(&remote_path), cargo_cmd)
+        }
+    }
+
+    /// Build the rsync SSH transport command.
+    fn rsync_ssh_command(&self, identity_file: &str) -> String {
+        format!(
+            "ssh -i {} -o StrictHostKeyChecking=accept-new -o BatchMode=yes",
+            shell_escape_str(identity_file)
+        )
     }
 
     /// Get the binary name from Cargo.toml.
@@ -661,7 +739,136 @@ mod tests {
         init_test_logging();
         info!("TEST START: test_remote_compilation_test_paths");
 
-        let worker = WorkerConfig {
+        let config = VerificationConfig::default();
+        let test = RemoteCompilationTest::new(test_worker(), "/tmp/test-project", config)
+            .with_remote_path_suffix("run-1");
+
+        let remote_path = test.remote_project_path();
+        info!("RESULT: remote_path={:?}", remote_path);
+        assert_eq!(
+            remote_path,
+            PathBuf::from("/tmp/rch_verify/test-project-run-1")
+        );
+
+        info!("TEST PASS: test_remote_compilation_test_paths");
+    }
+
+    #[test]
+    fn test_remote_compilation_paths_are_isolated_by_default() {
+        init_test_logging();
+        info!("TEST START: test_remote_compilation_paths_are_isolated_by_default");
+
+        let config = VerificationConfig::default();
+        let first = RemoteCompilationTest::new(test_worker(), "/tmp/test-project", config.clone());
+        let second = RemoteCompilationTest::new(test_worker(), "/tmp/test-project", config);
+
+        let first_remote_path = first.remote_project_path();
+        let second_remote_path = second.remote_project_path();
+
+        info!("RESULT: first_remote_path={:?}", first_remote_path);
+        info!("RESULT: second_remote_path={:?}", second_remote_path);
+
+        assert_ne!(first_remote_path, second_remote_path);
+        assert!(
+            first_remote_path
+                .to_string_lossy()
+                .starts_with("/tmp/rch_verify/test-project-run-")
+        );
+        assert!(
+            second_remote_path
+                .to_string_lossy()
+                .starts_with("/tmp/rch_verify/test-project-run-")
+        );
+
+        info!("TEST PASS: test_remote_compilation_paths_are_isolated_by_default");
+    }
+
+    #[test]
+    fn test_remote_project_path_sanitizes_project_and_suffix() {
+        init_test_logging();
+        info!("TEST START: test_remote_project_path_sanitizes_project_and_suffix");
+
+        let config = VerificationConfig::default();
+        let test = RemoteCompilationTest::new(test_worker(), "/tmp/project with spaces", config)
+            .with_remote_path_suffix("../attempt 1");
+
+        let remote_path = test.remote_project_path();
+        info!("RESULT: remote_path={:?}", remote_path);
+        assert_eq!(
+            remote_path,
+            PathBuf::from("/tmp/rch_verify/project-with-spaces-..-attempt-1")
+        );
+
+        info!("TEST PASS: test_remote_project_path_sanitizes_project_and_suffix");
+    }
+
+    #[test]
+    fn test_remote_build_command_includes_cargo_flags_and_clean() {
+        init_test_logging();
+        info!("TEST START: test_remote_build_command_includes_cargo_flags_and_clean");
+
+        let config = VerificationConfig {
+            release_mode: true,
+            cargo_flags: vec!["--features".to_string(), "foo bar".to_string()],
+            clean_before_build: true,
+            ..VerificationConfig::default()
+        };
+        let test = RemoteCompilationTest::new(test_worker(), "/tmp/test-project", config)
+            .with_remote_path_suffix("run-1");
+
+        let command = test.remote_build_command("cargo build --release");
+        info!("RESULT: command={}", command);
+        assert_eq!(
+            command,
+            "cd /tmp/rch_verify/test-project-run-1 && cargo clean && cargo build --release --features 'foo bar'"
+        );
+
+        info!("TEST PASS: test_remote_build_command_includes_cargo_flags_and_clean");
+    }
+
+    #[test]
+    fn test_remote_build_command_quotes_remote_path() {
+        init_test_logging();
+        info!("TEST START: test_remote_build_command_quotes_remote_path");
+
+        let config = VerificationConfig {
+            remote_base_path: PathBuf::from("/tmp/rch verify"),
+            ..VerificationConfig::default()
+        };
+        let test = RemoteCompilationTest::new(test_worker(), "/tmp/test-project", config)
+            .with_remote_path_suffix("run-1");
+
+        let command = test.remote_build_command("cargo build");
+        info!("RESULT: command={}", command);
+        assert_eq!(
+            command,
+            "cd '/tmp/rch verify/test-project-run-1' && cargo build"
+        );
+
+        info!("TEST PASS: test_remote_build_command_quotes_remote_path");
+    }
+
+    #[test]
+    fn test_rsync_ssh_command_quotes_identity_path() {
+        init_test_logging();
+        info!("TEST START: test_rsync_ssh_command_quotes_identity_path");
+
+        let config = VerificationConfig::default();
+        let test = RemoteCompilationTest::new(test_worker(), "/tmp/test-project", config)
+            .with_remote_path_suffix("run-1");
+
+        let command = test.rsync_ssh_command("/tmp/key files/id_ed25519");
+        info!("RESULT: command={}", command);
+        assert_eq!(
+            command,
+            "ssh -i '/tmp/key files/id_ed25519' -o StrictHostKeyChecking=accept-new -o BatchMode=yes"
+        );
+
+        info!("TEST PASS: test_rsync_ssh_command_quotes_identity_path");
+    }
+
+    fn test_worker() -> WorkerConfig {
+        WorkerConfig {
             id: crate::types::WorkerId::new("test-worker"),
             host: "localhost".to_string(),
             user: "testuser".to_string(),
@@ -669,15 +876,6 @@ mod tests {
             total_slots: 4,
             priority: 100,
             tags: vec![],
-        };
-
-        let config = VerificationConfig::default();
-        let test = RemoteCompilationTest::new(worker, "/tmp/test-project", config);
-
-        let remote_path = test.remote_project_path();
-        info!("RESULT: remote_path={:?}", remote_path);
-        assert!(remote_path.to_string_lossy().contains("test-project"));
-
-        info!("TEST PASS: test_remote_compilation_test_paths");
+        }
     }
 }
