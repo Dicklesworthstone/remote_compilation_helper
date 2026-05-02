@@ -51,6 +51,15 @@ const REMOTE_RUNTIME_EXCLUDE_PATTERNS: &[&str] = &[
     ".franken_whisper/tools/ffmpeg/",
 ];
 const DEFAULT_REMOTE_CARGO_TARGET_DIR_NAME: &str = ".rch-target";
+const LEGACY_CORE_DUMP_EXCLUDE_REWRITES: &[(&str, &str)] =
+    &[("core.*", "core.[0-9]*"), (".core.*", ".core.[0-9]*")];
+
+fn normalize_config_exclude_pattern(pattern: &str) -> &str {
+    LEGACY_CORE_DUMP_EXCLUDE_REWRITES
+        .iter()
+        .find_map(|(legacy, replacement)| (*legacy == pattern).then_some(*replacement))
+        .unwrap_or(pattern)
+}
 
 // =============================================================================
 // Retry Logic (bd-x1ek)
@@ -596,7 +605,19 @@ impl TransferPipeline {
     /// 2. User config exclude patterns (already in transfer_config)
     /// 3. Project-local .rchignore patterns (if present)
     fn get_effective_excludes(&self) -> Vec<String> {
-        let mut excludes = self.transfer_config.exclude_patterns.clone();
+        let mut excludes = Vec::new();
+        for pattern in &self.transfer_config.exclude_patterns {
+            let normalized = normalize_config_exclude_pattern(pattern);
+            if normalized != pattern {
+                debug!(
+                    "Rewriting legacy broad exclude pattern '{}' to '{}'",
+                    pattern, normalized
+                );
+            }
+            if !excludes.iter().any(|existing| existing == normalized) {
+                excludes.push(normalized.to_string());
+            }
+        }
 
         // Always protect remote-only runtime scratch/output directories from rsync --delete.
         // Without this, concurrent builds targeting the same remote root can remove each
@@ -3627,6 +3648,35 @@ node_modules/
             .filter(|p| *p == ".franken_whisper/tools/ffmpeg/")
             .count();
         assert_eq!(runtime_ffmpeg_count, 1);
+    }
+
+    #[test]
+    fn test_get_effective_excludes_rewrites_legacy_core_dump_globs() {
+        let _guard = test_guard!();
+        let config = TransferConfig {
+            exclude_patterns: vec![
+                "target/".to_string(),
+                "core.*".to_string(),
+                ".core.*".to_string(),
+                "core.[0-9]*".to_string(),
+            ],
+            ..TransferConfig::default()
+        };
+
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/nonexistent/project"),
+            "project".to_string(),
+            "hash".to_string(),
+            config,
+        );
+
+        let effective = pipeline.get_effective_excludes();
+
+        assert!(!effective.contains(&"core.*".to_string()));
+        assert!(!effective.contains(&".core.*".to_string()));
+        assert!(effective.contains(&"core.[0-9]*".to_string()));
+        assert!(effective.contains(&".core.[0-9]*".to_string()));
+        assert_eq!(effective.iter().filter(|p| *p == "core.[0-9]*").count(), 1);
     }
 
     // ==========================================================================
