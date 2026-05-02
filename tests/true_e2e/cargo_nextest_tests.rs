@@ -17,11 +17,38 @@ use rch_common::e2e::{TestConfigError, TestWorkersConfig, should_skip_worker_che
 use rch_common::ssh::{KnownHostsPolicy, SshClient, SshOptions};
 use rch_common::testing::{TestLogger, TestPhase};
 use rch_common::types::WorkerConfig;
+use shell_escape::escape;
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+use uuid::Uuid;
 
 /// Project root for fixtures
 const FIXTURES_DIR: &str = "tests/true_e2e/fixtures";
+
+fn shell_escape_str(value: &str) -> String {
+    escape(Cow::from(value)).into_owned()
+}
+
+fn remote_test_path(base: &str, test_name: &str) -> String {
+    format!(
+        "{}/{test_name}-{}",
+        base.trim_end_matches('/'),
+        Uuid::new_v4()
+    )
+}
+
+fn remote_rsync_path(remote_path: &str) -> String {
+    shell_escape_str(&format!("{}/", remote_path.trim_end_matches('/')))
+}
+
+fn rsync_ssh_command(identity_file: &str) -> String {
+    let expanded_identity_file = shellexpand::tilde(identity_file);
+    format!(
+        "ssh -o StrictHostKeyChecking=accept-new -i {}",
+        shell_escape_str(expanded_identity_file.as_ref())
+    )
+}
 
 /// Get the hello_world fixture directory (has passing tests)
 fn hello_world_fixture_dir() -> PathBuf {
@@ -85,7 +112,8 @@ async fn sync_fixture_to_remote(
     local_path: &Path,
     remote_path: &str,
 ) -> Result<(), String> {
-    let mkdir_cmd = format!("mkdir -p {}", remote_path);
+    let escaped_remote_path = shell_escape_str(remote_path);
+    let mkdir_cmd = format!("mkdir -p -- {escaped_remote_path}");
     client
         .execute(&mkdir_cmd)
         .await
@@ -97,14 +125,13 @@ async fn sync_fixture_to_remote(
             "--delete",
             "--exclude=target",
             "-e",
-            &format!(
-                "ssh -o StrictHostKeyChecking=accept-new -i {}",
-                worker_config.identity_file
-            ),
+            &rsync_ssh_command(&worker_config.identity_file),
             &format!("{}/", local_path.display()),
             &format!(
-                "{}@{}:{}/",
-                worker_config.user, worker_config.host, remote_path
+                "{}@{}:{}",
+                worker_config.user,
+                worker_config.host,
+                remote_rsync_path(remote_path)
             ),
         ])
         .output()
@@ -122,7 +149,7 @@ async fn sync_fixture_to_remote(
 
 /// Clean up remote directory after test.
 async fn cleanup_remote(client: &mut SshClient, remote_path: &str) -> Result<(), String> {
-    let cmd = format!("rm -rf {}", remote_path);
+    let cmd = format!("rm -rf -- {}", shell_escape_str(remote_path));
     client
         .execute(&cmd)
         .await
@@ -151,7 +178,7 @@ async fn nextest_available_remote(client: &mut SshClient) -> bool {
 
 /// Test: cargo nextest run on hello_world fixture
 #[tokio::test]
-async fn test_cargo_nextest_run() {
+async fn test_cargo_nextest_run() -> Result<(), String> {
     let logger = TestLogger::for_test("test_cargo_nextest_run");
 
     logger.log_with_data(
@@ -165,17 +192,17 @@ async fn test_cargo_nextest_run() {
             TestPhase::Setup,
             "Test skipped: cargo nextest not installed locally",
         );
-        return;
+        return Ok(());
     }
 
     let Some(config) = require_workers() else {
         logger.log(TestPhase::Setup, "Test skipped: no workers available");
-        return;
+        return Ok(());
     };
 
     let Some(worker_entry) = get_test_worker(&config) else {
         logger.log(TestPhase::Setup, "Test skipped: no enabled worker found");
-        return;
+        return Ok(());
     };
 
     let fixture_dir = hello_world_fixture_dir();
@@ -187,13 +214,13 @@ async fn test_cargo_nextest_run() {
                 fixture_dir.display()
             ),
         );
-        return;
+        return Ok(());
     }
 
     let worker_config = worker_entry.to_worker_config();
     let Some(mut client) = get_connected_client(&config, worker_entry).await else {
         logger.fail("Failed to connect to worker");
-        return;
+        return Err("Failed to connect to worker".to_string());
     };
 
     if !nextest_available_remote(&mut client).await {
@@ -202,10 +229,10 @@ async fn test_cargo_nextest_run() {
             "Test skipped: cargo nextest not installed on worker",
         );
         client.disconnect().await.ok();
-        return;
+        return Ok(());
     }
 
-    let remote_path = format!("{}/cargo_nextest_run", config.settings.remote_work_dir);
+    let remote_path = remote_test_path(&config.settings.remote_work_dir, "cargo_nextest_run");
 
     logger.log_with_data(
         TestPhase::Setup,
@@ -216,8 +243,9 @@ async fn test_cargo_nextest_run() {
     if let Err(e) =
         sync_fixture_to_remote(&mut client, &worker_config, &fixture_dir, &remote_path).await
     {
-        logger.fail(format!("Failed to sync fixture: {e}"));
-        return;
+        let message = format!("Failed to sync fixture: {e}");
+        logger.fail(message.as_str());
+        return Err(message);
     }
 
     // Local baseline
@@ -245,7 +273,10 @@ async fn test_cargo_nextest_run() {
     );
 
     // Remote nextest
-    let nextest_cmd = format!("cd {} && cargo nextest run 2>&1", remote_path);
+    let nextest_cmd = format!(
+        "cd {} && cargo nextest run 2>&1",
+        shell_escape_str(&remote_path)
+    );
 
     logger.log_with_data(
         TestPhase::Execute,
@@ -277,8 +308,9 @@ async fn test_cargo_nextest_run() {
         Err(e) => {
             let _ = cleanup_remote(&mut client, &remote_path).await;
             client.disconnect().await.ok();
-            logger.fail(format!("Remote cargo nextest command failed: {e}"));
-            panic!("Remote cargo nextest command failed: {e}");
+            let message = format!("Remote cargo nextest command failed: {e}");
+            logger.fail(message.as_str());
+            return Err(message);
         }
     }
 
@@ -291,4 +323,48 @@ async fn test_cargo_nextest_run() {
     client.disconnect().await.ok();
     logger.log(TestPhase::Verify, "Exit code verification passed");
     logger.pass();
+    Ok(())
+}
+
+#[test]
+fn remote_nextest_path_is_unique_and_under_base() {
+    let first = remote_test_path("/tmp/rch-e2e", "cargo_nextest_run");
+    let second = remote_test_path("/tmp/rch-e2e/", "cargo_nextest_run");
+
+    assert_ne!(first, second);
+    assert!(first.starts_with("/tmp/rch-e2e/cargo_nextest_run-"));
+    assert!(second.starts_with("/tmp/rch-e2e/cargo_nextest_run-"));
+}
+
+#[test]
+fn remote_nextest_rsync_path_quotes_shell_sensitive_values() {
+    assert_eq!(
+        remote_rsync_path("/tmp/rch e2e/cargo_nextest_run"),
+        "'/tmp/rch e2e/cargo_nextest_run/'"
+    );
+}
+
+#[test]
+fn remote_nextest_command_path_is_shell_escaped() {
+    let remote_path = "/tmp/rch e2e/cargo_nextest_run";
+
+    assert_eq!(
+        format!(
+            "cd {} && cargo nextest run 2>&1",
+            shell_escape_str(remote_path)
+        ),
+        "cd '/tmp/rch e2e/cargo_nextest_run' && cargo nextest run 2>&1"
+    );
+}
+
+#[test]
+fn remote_nextest_rsync_ssh_command_expands_and_quotes_identity_path() {
+    assert_eq!(
+        rsync_ssh_command("/tmp/key files/id_ed25519"),
+        "ssh -o StrictHostKeyChecking=accept-new -i '/tmp/key files/id_ed25519'"
+    );
+
+    if std::env::var_os("HOME").is_some() {
+        assert!(!rsync_ssh_command("~/.ssh/id_ed25519").contains(" -i ~/"));
+    }
 }
