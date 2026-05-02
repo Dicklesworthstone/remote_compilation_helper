@@ -28,11 +28,42 @@ use rch_common::e2e::{
 };
 use rch_common::ssh::{KnownHostsPolicy, SshClient, SshOptions};
 use rch_common::types::WorkerConfig;
+use shell_escape::escape;
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+use uuid::Uuid;
 
 /// Project root for fixtures
 const FIXTURES_DIR: &str = "tests/true_e2e/fixtures";
+
+fn shell_escape_str(value: &str) -> String {
+    escape(Cow::from(value)).into_owned()
+}
+
+fn remote_test_path(base: &str, test_name: &str) -> String {
+    format!(
+        "{}/{test_name}-{}",
+        base.trim_end_matches('/'),
+        Uuid::new_v4()
+    )
+}
+
+fn remote_rsync_path(remote_path: &str) -> String {
+    shell_escape_str(&format!("{}/", remote_path.trim_end_matches('/')))
+}
+
+fn remote_cargo_command(remote_path: &str, command: &str) -> String {
+    format!("cd {} && {command} 2>&1", shell_escape_str(remote_path))
+}
+
+fn rsync_ssh_command(identity_file: &str) -> String {
+    let expanded_identity_file = shellexpand::tilde(identity_file);
+    format!(
+        "ssh -o StrictHostKeyChecking=accept-new -i {}",
+        shell_escape_str(expanded_identity_file.as_ref())
+    )
+}
 
 /// Get the hello_world fixture directory (has passing tests)
 fn hello_world_fixture_dir() -> PathBuf {
@@ -113,35 +144,42 @@ async fn sync_fixture_to_remote(
     remote_path: &str,
 ) -> Result<(), String> {
     // First, create the remote directory
-    let mkdir_cmd = format!("mkdir -p {}", remote_path);
+    let escaped_remote_path = shell_escape_str(remote_path);
+    let mkdir_cmd = format!("mkdir -p -- {escaped_remote_path}");
     client
         .execute(&mkdir_cmd)
         .await
         .map_err(|e| format!("Failed to create remote directory: {e}"))?;
 
     // Use rsync to copy the fixture
-    let output = std::process::Command::new("rsync")
+    let output = match std::process::Command::new("rsync")
         .args([
             "-avz",
             "--delete",
             "--exclude=target",
             "-e",
-            &format!(
-                "ssh -o StrictHostKeyChecking=accept-new -i {}",
-                worker_config.identity_file
-            ),
+            &rsync_ssh_command(&worker_config.identity_file),
             &format!("{}/", local_path.display()),
             &format!(
-                "{}@{}:{}/",
-                worker_config.user, worker_config.host, remote_path
+                "{}@{}:{}",
+                worker_config.user,
+                worker_config.host,
+                remote_rsync_path(remote_path)
             ),
         ])
         .output()
-        .map_err(|e| format!("Failed to run rsync: {e}"))?;
+    {
+        Ok(output) => output,
+        Err(e) => {
+            let _ = cleanup_remote(client, remote_path).await;
+            return Err(format!("Failed to run rsync: {e}"));
+        }
+    };
 
     if output.status.success() {
         Ok(())
     } else {
+        let _ = cleanup_remote(client, remote_path).await;
         Err(format!(
             "rsync failed: {}",
             String::from_utf8_lossy(&output.stderr)
@@ -151,7 +189,7 @@ async fn sync_fixture_to_remote(
 
 /// Clean up remote directory after test.
 async fn cleanup_remote(client: &mut SshClient, remote_path: &str) -> Result<(), String> {
-    let cmd = format!("rm -rf {}", remote_path);
+    let cmd = format!("rm -rf -- {}", shell_escape_str(remote_path));
     client
         .execute(&cmd)
         .await
@@ -169,7 +207,7 @@ async fn cleanup_remote(client: &mut SshClient, remote_path: &str) -> Result<(),
 /// Expected: exit code 0
 /// Verify: test output shows passes
 #[tokio::test]
-async fn test_cargo_test_pass() {
+async fn test_cargo_test_pass() -> Result<(), String> {
     let logger = TestLoggerBuilder::new("test_cargo_test_pass")
         .print_realtime(true)
         .build();
@@ -187,22 +225,22 @@ async fn test_cargo_test_pass() {
 
     let Some(config) = require_workers() else {
         logger.warn("Test skipped: no workers available");
-        return;
+        return Ok(());
     };
 
     let Some(worker_entry) = get_test_worker(&config) else {
         logger.warn("Test skipped: no enabled worker found");
-        return;
+        return Ok(());
     };
 
     let worker_config = worker_entry.to_worker_config();
     let Some(mut client) = get_connected_client(&config, worker_entry).await else {
         logger.error("Failed to connect to worker");
-        return;
+        return Err("Failed to connect to worker".to_string());
     };
 
     let fixture_dir = hello_world_fixture_dir();
-    let remote_path = format!("{}/cargo_test_pass", config.settings.remote_work_dir);
+    let remote_path = remote_test_path(&config.settings.remote_work_dir, "cargo_test_pass");
 
     // Phase: Setup - sync fixture to remote
     logger.log_with_context(
@@ -219,11 +257,12 @@ async fn test_cargo_test_pass() {
         sync_fixture_to_remote(&mut client, &worker_config, &fixture_dir, &remote_path).await
     {
         logger.error(format!("Failed to sync fixture: {e}"));
-        return;
+        client.disconnect().await.ok();
+        return Err(format!("Failed to sync fixture: {e}"));
     }
 
     // Phase: Execute remote cargo test
-    let test_cmd = format!("cd {} && cargo test --lib 2>&1", remote_path);
+    let test_cmd = remote_cargo_command(&remote_path, "cargo test --lib");
 
     logger.log_with_context(
         LogLevel::Info,
@@ -272,7 +311,7 @@ async fn test_cargo_test_pass() {
             logger.error(format!("Remote cargo test failed: {e}"));
             let _ = cleanup_remote(&mut client, &remote_path).await;
             client.disconnect().await.ok();
-            panic!("Remote cargo test command failed: {e}");
+            return Err(format!("Remote cargo test command failed: {e}"));
         }
     }
 
@@ -284,6 +323,7 @@ async fn test_cargo_test_pass() {
     client.disconnect().await.ok();
     logger.info("Cargo test pass test completed");
     logger.print_summary();
+    Ok(())
 }
 
 // =============================================================================
@@ -296,7 +336,7 @@ async fn test_cargo_test_pass() {
 /// Expected: exit code 101
 /// Verify: failure output preserved
 #[tokio::test]
-async fn test_cargo_test_fail() {
+async fn test_cargo_test_fail() -> Result<(), String> {
     let logger = TestLoggerBuilder::new("test_cargo_test_fail")
         .print_realtime(true)
         .build();
@@ -314,18 +354,18 @@ async fn test_cargo_test_fail() {
 
     let Some(config) = require_workers() else {
         logger.warn("Test skipped: no workers available");
-        return;
+        return Ok(());
     };
 
     let Some(worker_entry) = get_test_worker(&config) else {
         logger.warn("Test skipped: no enabled worker found");
-        return;
+        return Ok(());
     };
 
     let worker_config = worker_entry.to_worker_config();
     let Some(mut client) = get_connected_client(&config, worker_entry).await else {
         logger.error("Failed to connect to worker");
-        return;
+        return Err("Failed to connect to worker".to_string());
     };
 
     let fixture_dir = failing_tests_fixture_dir();
@@ -337,21 +377,22 @@ async fn test_cargo_test_fail() {
             fixture_dir.display()
         ));
         client.disconnect().await.ok();
-        return;
+        return Ok(());
     }
 
-    let remote_path = format!("{}/cargo_test_fail", config.settings.remote_work_dir);
+    let remote_path = remote_test_path(&config.settings.remote_work_dir, "cargo_test_fail");
 
     // Phase: Setup
     if let Err(e) =
         sync_fixture_to_remote(&mut client, &worker_config, &fixture_dir, &remote_path).await
     {
         logger.error(format!("Failed to sync fixture: {e}"));
-        return;
+        client.disconnect().await.ok();
+        return Err(format!("Failed to sync fixture: {e}"));
     }
 
     // Phase: Execute remote cargo test (expect failure)
-    let test_cmd = format!("cd {} && cargo test 2>&1", remote_path);
+    let test_cmd = remote_cargo_command(&remote_path, "cargo test");
 
     logger.log_with_context(
         LogLevel::Info,
@@ -395,7 +436,9 @@ async fn test_cargo_test_fail() {
             logger.error(format!("Remote cargo test command error: {e}"));
             let _ = cleanup_remote(&mut client, &remote_path).await;
             client.disconnect().await.ok();
-            panic!("Remote cargo test command failed unexpectedly: {e}");
+            return Err(format!(
+                "Remote cargo test command failed unexpectedly: {e}"
+            ));
         }
     }
 
@@ -407,6 +450,7 @@ async fn test_cargo_test_fail() {
     client.disconnect().await.ok();
     logger.info("Cargo test fail test completed");
     logger.print_summary();
+    Ok(())
 }
 
 // =============================================================================
@@ -419,7 +463,7 @@ async fn test_cargo_test_fail() {
 /// Expected: exit code 1 or 101 (cargo reports compilation failure)
 /// Verify: compiler error in output
 #[tokio::test]
-async fn test_cargo_test_build_error() {
+async fn test_cargo_test_build_error() -> Result<(), String> {
     let logger = TestLoggerBuilder::new("test_cargo_test_build_error")
         .print_realtime(true)
         .build();
@@ -437,18 +481,18 @@ async fn test_cargo_test_build_error() {
 
     let Some(config) = require_workers() else {
         logger.warn("Test skipped: no workers available");
-        return;
+        return Ok(());
     };
 
     let Some(worker_entry) = get_test_worker(&config) else {
         logger.warn("Test skipped: no enabled worker found");
-        return;
+        return Ok(());
     };
 
     let worker_config = worker_entry.to_worker_config();
     let Some(mut client) = get_connected_client(&config, worker_entry).await else {
         logger.error("Failed to connect to worker");
-        return;
+        return Err("Failed to connect to worker".to_string());
     };
 
     let fixture_dir = broken_project_fixture_dir();
@@ -460,21 +504,22 @@ async fn test_cargo_test_build_error() {
             fixture_dir.display()
         ));
         client.disconnect().await.ok();
-        return;
+        return Ok(());
     }
 
-    let remote_path = format!("{}/cargo_test_build_error", config.settings.remote_work_dir);
+    let remote_path = remote_test_path(&config.settings.remote_work_dir, "cargo_test_build_error");
 
     // Phase: Setup
     if let Err(e) =
         sync_fixture_to_remote(&mut client, &worker_config, &fixture_dir, &remote_path).await
     {
         logger.error(format!("Failed to sync fixture: {e}"));
-        return;
+        client.disconnect().await.ok();
+        return Err(format!("Failed to sync fixture: {e}"));
     }
 
     // Phase: Execute remote cargo test (expect build failure)
-    let test_cmd = format!("cd {} && cargo test 2>&1", remote_path);
+    let test_cmd = remote_cargo_command(&remote_path, "cargo test");
 
     logger.log_with_context(
         LogLevel::Info,
@@ -528,7 +573,9 @@ async fn test_cargo_test_build_error() {
             logger.error(format!("Remote cargo test command error: {e}"));
             let _ = cleanup_remote(&mut client, &remote_path).await;
             client.disconnect().await.ok();
-            panic!("Remote cargo test command failed unexpectedly: {e}");
+            return Err(format!(
+                "Remote cargo test command failed unexpectedly: {e}"
+            ));
         }
     }
 
@@ -540,6 +587,7 @@ async fn test_cargo_test_build_error() {
     client.disconnect().await.ok();
     logger.info("Cargo test build error test completed");
     logger.print_summary();
+    Ok(())
 }
 
 // =============================================================================
@@ -551,7 +599,7 @@ async fn test_cargo_test_build_error() {
 /// Command: `cargo test test_add`
 /// Expected: only tests matching "test_add" run
 #[tokio::test]
-async fn test_cargo_test_filter_by_name() {
+async fn test_cargo_test_filter_by_name() -> Result<(), String> {
     let logger = TestLoggerBuilder::new("test_cargo_test_filter_by_name")
         .print_realtime(true)
         .build();
@@ -568,33 +616,34 @@ async fn test_cargo_test_filter_by_name() {
 
     let Some(config) = require_workers() else {
         logger.warn("Test skipped: no workers available");
-        return;
+        return Ok(());
     };
 
     let Some(worker_entry) = get_test_worker(&config) else {
         logger.warn("Test skipped: no enabled worker found");
-        return;
+        return Ok(());
     };
 
     let worker_config = worker_entry.to_worker_config();
     let Some(mut client) = get_connected_client(&config, worker_entry).await else {
         logger.error("Failed to connect to worker");
-        return;
+        return Err("Failed to connect to worker".to_string());
     };
 
     let fixture_dir = hello_world_fixture_dir();
-    let remote_path = format!("{}/cargo_test_filter", config.settings.remote_work_dir);
+    let remote_path = remote_test_path(&config.settings.remote_work_dir, "cargo_test_filter");
 
     // Setup
     if let Err(e) =
         sync_fixture_to_remote(&mut client, &worker_config, &fixture_dir, &remote_path).await
     {
         logger.error(format!("Failed to sync fixture: {e}"));
-        return;
+        client.disconnect().await.ok();
+        return Err(format!("Failed to sync fixture: {e}"));
     }
 
     // Execute with filter
-    let test_cmd = format!("cd {} && cargo test test_add 2>&1", remote_path);
+    let test_cmd = remote_cargo_command(&remote_path, "cargo test test_add");
 
     logger.log_with_context(
         LogLevel::Info,
@@ -635,7 +684,7 @@ async fn test_cargo_test_filter_by_name() {
             logger.error(format!("Command failed: {e}"));
             let _ = cleanup_remote(&mut client, &remote_path).await;
             client.disconnect().await.ok();
-            panic!("Command failed: {e}");
+            return Err(format!("Command failed: {e}"));
         }
     }
 
@@ -647,6 +696,7 @@ async fn test_cargo_test_filter_by_name() {
     client.disconnect().await.ok();
     logger.info("Filter by name test completed");
     logger.print_summary();
+    Ok(())
 }
 
 // =============================================================================
@@ -658,7 +708,7 @@ async fn test_cargo_test_filter_by_name() {
 /// Command: `cargo test -- --ignored`
 /// Expected: ignored tests execute (and fail in our fixture)
 #[tokio::test]
-async fn test_cargo_test_run_ignored() {
+async fn test_cargo_test_run_ignored() -> Result<(), String> {
     let logger = TestLoggerBuilder::new("test_cargo_test_run_ignored")
         .print_realtime(true)
         .build();
@@ -675,33 +725,34 @@ async fn test_cargo_test_run_ignored() {
 
     let Some(config) = require_workers() else {
         logger.warn("Test skipped: no workers available");
-        return;
+        return Ok(());
     };
 
     let Some(worker_entry) = get_test_worker(&config) else {
         logger.warn("Test skipped: no enabled worker found");
-        return;
+        return Ok(());
     };
 
     let worker_config = worker_entry.to_worker_config();
     let Some(mut client) = get_connected_client(&config, worker_entry).await else {
         logger.error("Failed to connect to worker");
-        return;
+        return Err("Failed to connect to worker".to_string());
     };
 
     let fixture_dir = hello_world_fixture_dir();
-    let remote_path = format!("{}/cargo_test_ignored", config.settings.remote_work_dir);
+    let remote_path = remote_test_path(&config.settings.remote_work_dir, "cargo_test_ignored");
 
     // Setup
     if let Err(e) =
         sync_fixture_to_remote(&mut client, &worker_config, &fixture_dir, &remote_path).await
     {
         logger.error(format!("Failed to sync fixture: {e}"));
-        return;
+        client.disconnect().await.ok();
+        return Err(format!("Failed to sync fixture: {e}"));
     }
 
     // Execute with --ignored flag
-    let test_cmd = format!("cd {} && cargo test --lib -- --ignored 2>&1", remote_path);
+    let test_cmd = remote_cargo_command(&remote_path, "cargo test --lib -- --ignored");
 
     logger.log_with_context(
         LogLevel::Info,
@@ -743,7 +794,7 @@ async fn test_cargo_test_run_ignored() {
             logger.error(format!("Command failed: {e}"));
             let _ = cleanup_remote(&mut client, &remote_path).await;
             client.disconnect().await.ok();
-            panic!("Command failed: {e}");
+            return Err(format!("Command failed: {e}"));
         }
     }
 
@@ -755,6 +806,7 @@ async fn test_cargo_test_run_ignored() {
     client.disconnect().await.ok();
     logger.info("Run ignored tests completed");
     logger.print_summary();
+    Ok(())
 }
 
 // =============================================================================
@@ -766,7 +818,7 @@ async fn test_cargo_test_run_ignored() {
 /// Command: `cargo test -- --nocapture`
 /// Expected: stdout visible in output
 #[tokio::test]
-async fn test_cargo_test_nocapture() {
+async fn test_cargo_test_nocapture() -> Result<(), String> {
     let logger = TestLoggerBuilder::new("test_cargo_test_nocapture")
         .print_realtime(true)
         .build();
@@ -783,33 +835,34 @@ async fn test_cargo_test_nocapture() {
 
     let Some(config) = require_workers() else {
         logger.warn("Test skipped: no workers available");
-        return;
+        return Ok(());
     };
 
     let Some(worker_entry) = get_test_worker(&config) else {
         logger.warn("Test skipped: no enabled worker found");
-        return;
+        return Ok(());
     };
 
     let worker_config = worker_entry.to_worker_config();
     let Some(mut client) = get_connected_client(&config, worker_entry).await else {
         logger.error("Failed to connect to worker");
-        return;
+        return Err("Failed to connect to worker".to_string());
     };
 
     let fixture_dir = hello_world_fixture_dir();
-    let remote_path = format!("{}/cargo_test_nocapture", config.settings.remote_work_dir);
+    let remote_path = remote_test_path(&config.settings.remote_work_dir, "cargo_test_nocapture");
 
     // Setup
     if let Err(e) =
         sync_fixture_to_remote(&mut client, &worker_config, &fixture_dir, &remote_path).await
     {
         logger.error(format!("Failed to sync fixture: {e}"));
-        return;
+        client.disconnect().await.ok();
+        return Err(format!("Failed to sync fixture: {e}"));
     }
 
     // Execute with --nocapture
-    let test_cmd = format!("cd {} && cargo test --lib -- --nocapture 2>&1", remote_path);
+    let test_cmd = remote_cargo_command(&remote_path, "cargo test --lib -- --nocapture");
 
     logger.log_with_context(
         LogLevel::Info,
@@ -842,7 +895,7 @@ async fn test_cargo_test_nocapture() {
             logger.error(format!("Command failed: {e}"));
             let _ = cleanup_remote(&mut client, &remote_path).await;
             client.disconnect().await.ok();
-            panic!("Command failed: {e}");
+            return Err(format!("Command failed: {e}"));
         }
     }
 
@@ -854,6 +907,7 @@ async fn test_cargo_test_nocapture() {
     client.disconnect().await.ok();
     logger.info("Nocapture test completed");
     logger.print_summary();
+    Ok(())
 }
 
 // =============================================================================
@@ -865,7 +919,7 @@ async fn test_cargo_test_nocapture() {
 /// Command: `cargo test --lib`
 /// Expected: only library tests run
 #[tokio::test]
-async fn test_cargo_test_lib_only() {
+async fn test_cargo_test_lib_only() -> Result<(), String> {
     let logger = TestLoggerBuilder::new("test_cargo_test_lib_only")
         .print_realtime(true)
         .build();
@@ -882,33 +936,34 @@ async fn test_cargo_test_lib_only() {
 
     let Some(config) = require_workers() else {
         logger.warn("Test skipped: no workers available");
-        return;
+        return Ok(());
     };
 
     let Some(worker_entry) = get_test_worker(&config) else {
         logger.warn("Test skipped: no enabled worker found");
-        return;
+        return Ok(());
     };
 
     let worker_config = worker_entry.to_worker_config();
     let Some(mut client) = get_connected_client(&config, worker_entry).await else {
         logger.error("Failed to connect to worker");
-        return;
+        return Err("Failed to connect to worker".to_string());
     };
 
     let fixture_dir = hello_world_fixture_dir();
-    let remote_path = format!("{}/cargo_test_lib", config.settings.remote_work_dir);
+    let remote_path = remote_test_path(&config.settings.remote_work_dir, "cargo_test_lib");
 
     // Setup
     if let Err(e) =
         sync_fixture_to_remote(&mut client, &worker_config, &fixture_dir, &remote_path).await
     {
         logger.error(format!("Failed to sync fixture: {e}"));
-        return;
+        client.disconnect().await.ok();
+        return Err(format!("Failed to sync fixture: {e}"));
     }
 
     // Execute with --lib
-    let test_cmd = format!("cd {} && cargo test --lib 2>&1", remote_path);
+    let test_cmd = remote_cargo_command(&remote_path, "cargo test --lib");
 
     logger.log_with_context(
         LogLevel::Info,
@@ -944,7 +999,7 @@ async fn test_cargo_test_lib_only() {
             logger.error(format!("Command failed: {e}"));
             let _ = cleanup_remote(&mut client, &remote_path).await;
             client.disconnect().await.ok();
-            panic!("Command failed: {e}");
+            return Err(format!("Command failed: {e}"));
         }
     }
 
@@ -956,6 +1011,7 @@ async fn test_cargo_test_lib_only() {
     client.disconnect().await.ok();
     logger.info("Lib-only test completed");
     logger.print_summary();
+    Ok(())
 }
 
 // =============================================================================
@@ -967,7 +1023,7 @@ async fn test_cargo_test_lib_only() {
 /// Command: `cargo test --doc`
 /// Expected: documentation tests run
 #[tokio::test]
-async fn test_cargo_test_doc() {
+async fn test_cargo_test_doc() -> Result<(), String> {
     let logger = TestLoggerBuilder::new("test_cargo_test_doc")
         .print_realtime(true)
         .build();
@@ -984,33 +1040,34 @@ async fn test_cargo_test_doc() {
 
     let Some(config) = require_workers() else {
         logger.warn("Test skipped: no workers available");
-        return;
+        return Ok(());
     };
 
     let Some(worker_entry) = get_test_worker(&config) else {
         logger.warn("Test skipped: no enabled worker found");
-        return;
+        return Ok(());
     };
 
     let worker_config = worker_entry.to_worker_config();
     let Some(mut client) = get_connected_client(&config, worker_entry).await else {
         logger.error("Failed to connect to worker");
-        return;
+        return Err("Failed to connect to worker".to_string());
     };
 
     let fixture_dir = hello_world_fixture_dir();
-    let remote_path = format!("{}/cargo_test_doc", config.settings.remote_work_dir);
+    let remote_path = remote_test_path(&config.settings.remote_work_dir, "cargo_test_doc");
 
     // Setup
     if let Err(e) =
         sync_fixture_to_remote(&mut client, &worker_config, &fixture_dir, &remote_path).await
     {
         logger.error(format!("Failed to sync fixture: {e}"));
-        return;
+        client.disconnect().await.ok();
+        return Err(format!("Failed to sync fixture: {e}"));
     }
 
     // Execute with --doc
-    let test_cmd = format!("cd {} && cargo test --doc 2>&1", remote_path);
+    let test_cmd = remote_cargo_command(&remote_path, "cargo test --doc");
 
     logger.log_with_context(
         LogLevel::Info,
@@ -1047,7 +1104,7 @@ async fn test_cargo_test_doc() {
             logger.error(format!("Command failed: {e}"));
             let _ = cleanup_remote(&mut client, &remote_path).await;
             client.disconnect().await.ok();
-            panic!("Command failed: {e}");
+            return Err(format!("Command failed: {e}"));
         }
     }
 
@@ -1059,6 +1116,7 @@ async fn test_cargo_test_doc() {
     client.disconnect().await.ok();
     logger.info("Doc test completed");
     logger.print_summary();
+    Ok(())
 }
 
 // =============================================================================
@@ -1070,7 +1128,7 @@ async fn test_cargo_test_doc() {
 /// Command: `RUST_TEST_THREADS=4 cargo test`
 /// Expected: respects thread limit (tests run)
 #[tokio::test]
-async fn test_cargo_test_thread_control() {
+async fn test_cargo_test_thread_control() -> Result<(), String> {
     let logger = TestLoggerBuilder::new("test_cargo_test_thread_control")
         .print_realtime(true)
         .build();
@@ -1090,36 +1148,34 @@ async fn test_cargo_test_thread_control() {
 
     let Some(config) = require_workers() else {
         logger.warn("Test skipped: no workers available");
-        return;
+        return Ok(());
     };
 
     let Some(worker_entry) = get_test_worker(&config) else {
         logger.warn("Test skipped: no enabled worker found");
-        return;
+        return Ok(());
     };
 
     let worker_config = worker_entry.to_worker_config();
     let Some(mut client) = get_connected_client(&config, worker_entry).await else {
         logger.error("Failed to connect to worker");
-        return;
+        return Err("Failed to connect to worker".to_string());
     };
 
     let fixture_dir = hello_world_fixture_dir();
-    let remote_path = format!("{}/cargo_test_threads", config.settings.remote_work_dir);
+    let remote_path = remote_test_path(&config.settings.remote_work_dir, "cargo_test_threads");
 
     // Setup
     if let Err(e) =
         sync_fixture_to_remote(&mut client, &worker_config, &fixture_dir, &remote_path).await
     {
         logger.error(format!("Failed to sync fixture: {e}"));
-        return;
+        client.disconnect().await.ok();
+        return Err(format!("Failed to sync fixture: {e}"));
     }
 
     // Execute with RUST_TEST_THREADS environment variable
-    let test_cmd = format!(
-        "cd {} && RUST_TEST_THREADS=4 cargo test --lib 2>&1",
-        remote_path
-    );
+    let test_cmd = remote_cargo_command(&remote_path, "RUST_TEST_THREADS=4 cargo test --lib");
 
     logger.log_with_context(
         LogLevel::Info,
@@ -1152,7 +1208,7 @@ async fn test_cargo_test_thread_control() {
             logger.error(format!("Command failed: {e}"));
             let _ = cleanup_remote(&mut client, &remote_path).await;
             client.disconnect().await.ok();
-            panic!("Command failed: {e}");
+            return Err(format!("Command failed: {e}"));
         }
     }
 
@@ -1164,6 +1220,7 @@ async fn test_cargo_test_thread_control() {
     client.disconnect().await.ok();
     logger.info("Thread control test completed");
     logger.print_summary();
+    Ok(())
 }
 
 // =============================================================================
@@ -1175,7 +1232,7 @@ async fn test_cargo_test_thread_control() {
 /// Command: `cargo test --workspace`
 /// Expected: all packages tested
 #[tokio::test]
-async fn test_cargo_test_workspace() {
+async fn test_cargo_test_workspace() -> Result<(), String> {
     let logger = TestLoggerBuilder::new("test_cargo_test_workspace")
         .print_realtime(true)
         .build();
@@ -1192,18 +1249,18 @@ async fn test_cargo_test_workspace() {
 
     let Some(config) = require_workers() else {
         logger.warn("Test skipped: no workers available");
-        return;
+        return Ok(());
     };
 
     let Some(worker_entry) = get_test_worker(&config) else {
         logger.warn("Test skipped: no enabled worker found");
-        return;
+        return Ok(());
     };
 
     let worker_config = worker_entry.to_worker_config();
     let Some(mut client) = get_connected_client(&config, worker_entry).await else {
         logger.error("Failed to connect to worker");
-        return;
+        return Err("Failed to connect to worker".to_string());
     };
 
     let fixture_dir = rust_workspace_fixture_dir();
@@ -1215,21 +1272,22 @@ async fn test_cargo_test_workspace() {
             fixture_dir.display()
         ));
         client.disconnect().await.ok();
-        return;
+        return Ok(());
     }
 
-    let remote_path = format!("{}/cargo_test_workspace", config.settings.remote_work_dir);
+    let remote_path = remote_test_path(&config.settings.remote_work_dir, "cargo_test_workspace");
 
     // Setup
     if let Err(e) =
         sync_fixture_to_remote(&mut client, &worker_config, &fixture_dir, &remote_path).await
     {
         logger.error(format!("Failed to sync fixture: {e}"));
-        return;
+        client.disconnect().await.ok();
+        return Err(format!("Failed to sync fixture: {e}"));
     }
 
     // Execute with --workspace
-    let test_cmd = format!("cd {} && cargo test --workspace 2>&1", remote_path);
+    let test_cmd = remote_cargo_command(&remote_path, "cargo test --workspace");
 
     logger.log_with_context(
         LogLevel::Info,
@@ -1273,7 +1331,7 @@ async fn test_cargo_test_workspace() {
             logger.error(format!("Command failed: {e}"));
             let _ = cleanup_remote(&mut client, &remote_path).await;
             client.disconnect().await.ok();
-            panic!("Command failed: {e}");
+            return Err(format!("Command failed: {e}"));
         }
     }
 
@@ -1285,4 +1343,43 @@ async fn test_cargo_test_workspace() {
     client.disconnect().await.ok();
     logger.info("Workspace test completed");
     logger.print_summary();
+    Ok(())
+}
+
+#[test]
+fn remote_cargo_test_path_is_unique_and_under_base() {
+    let first = remote_test_path("/tmp/rch-e2e", "cargo_test_pass");
+    let second = remote_test_path("/tmp/rch-e2e/", "cargo_test_pass");
+
+    assert_ne!(first, second);
+    assert!(first.starts_with("/tmp/rch-e2e/cargo_test_pass-"));
+    assert!(second.starts_with("/tmp/rch-e2e/cargo_test_pass-"));
+}
+
+#[test]
+fn remote_cargo_test_rsync_path_quotes_shell_sensitive_values() {
+    assert_eq!(
+        remote_rsync_path("/tmp/rch e2e/cargo_test_pass"),
+        "'/tmp/rch e2e/cargo_test_pass/'"
+    );
+}
+
+#[test]
+fn remote_cargo_test_command_path_is_shell_escaped() {
+    assert_eq!(
+        remote_cargo_command("/tmp/rch e2e/cargo_test_pass", "cargo test --lib"),
+        "cd '/tmp/rch e2e/cargo_test_pass' && cargo test --lib 2>&1"
+    );
+}
+
+#[test]
+fn remote_cargo_test_rsync_ssh_command_expands_and_quotes_identity_path() {
+    assert_eq!(
+        rsync_ssh_command("/tmp/key files/id_ed25519"),
+        "ssh -o StrictHostKeyChecking=accept-new -i '/tmp/key files/id_ed25519'"
+    );
+
+    if std::env::var_os("HOME").is_some() {
+        assert!(!rsync_ssh_command("~/.ssh/id_ed25519").contains(" -i ~/"));
+    }
 }
