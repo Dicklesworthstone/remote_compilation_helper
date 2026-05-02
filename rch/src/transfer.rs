@@ -61,6 +61,42 @@ fn normalize_config_exclude_pattern(pattern: &str) -> &str {
         .unwrap_or(pattern)
 }
 
+fn has_rsync_glob_meta(pattern: &str) -> bool {
+    pattern
+        .chars()
+        .any(|ch| matches!(ch, '*' | '?' | '[' | ']'))
+}
+
+fn first_path_component(pattern: &str) -> Option<&str> {
+    let trimmed = pattern.trim_start_matches('/');
+    let trimmed = trimmed.trim_end_matches('/');
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.split('/').next().unwrap_or(trimmed))
+    }
+}
+
+fn retrieval_exclude_can_block_artifacts(pattern: &str, artifact_patterns: &[String]) -> bool {
+    let trimmed = pattern.trim();
+    if !trimmed.ends_with('/') {
+        return true;
+    }
+
+    let Some(exclude_root) = first_path_component(trimmed) else {
+        return true;
+    };
+    if has_rsync_glob_meta(exclude_root) {
+        return true;
+    }
+
+    artifact_patterns.iter().any(|artifact| {
+        first_path_component(artifact)
+            .map(|artifact_root| artifact_root == exclude_root)
+            .unwrap_or(false)
+    })
+}
+
 // =============================================================================
 // Retry Logic (bd-x1ek)
 // =============================================================================
@@ -655,10 +691,11 @@ impl TransferPipeline {
     /// This is intentionally narrower than upload filtering. Upload wants broad
     /// project hygiene exclusions (`target/`, `dist/`, coverage caches, etc.),
     /// but retrieval still needs to descend into artifact roots like `target/`
-    /// and `build/`. The retrieval pass only applies runtime scratch guards plus
-    /// project-local `.rchignore` patterns, which is enough to avoid pathological
-    /// junk trees such as `.beads/recovery_*` without hiding requested outputs.
-    fn get_retrieval_excludes(&self) -> Vec<String> {
+    /// and `build/`. The retrieval pass applies runtime scratch guards plus
+    /// project-local `.rchignore` directory patterns that cannot hide the
+    /// requested artifacts. File globs and artifact-root directories are skipped
+    /// because rsync evaluates these excludes before the artifact includes.
+    fn get_retrieval_excludes(&self, artifact_patterns: &[String]) -> Vec<String> {
         let mut excludes = Vec::new();
 
         for pattern in REMOTE_RUNTIME_EXCLUDE_PATTERNS {
@@ -671,6 +708,13 @@ impl TransferPipeline {
         if let Ok(patterns) = parse_rchignore(&rchignore_path) {
             let original_count = excludes.len();
             for pattern in patterns {
+                if retrieval_exclude_can_block_artifacts(&pattern, artifact_patterns) {
+                    debug!(
+                        "Skipping retrieval exclude pattern '{}' because it may hide requested artifacts",
+                        pattern
+                    );
+                    continue;
+                }
                 if !excludes.contains(&pattern) {
                     excludes.push(pattern);
                 }
@@ -1596,7 +1640,7 @@ fi",
         // Apply retrieval-safe excludes before the directory include so rsync
         // never descends into known junk trees like `.beads/recovery_*` on the
         // worker, while still allowing traversal into declared artifact roots.
-        for pattern in self.get_retrieval_excludes() {
+        for pattern in self.get_retrieval_excludes(artifact_patterns) {
             cmd.arg("--exclude").arg(pattern);
         }
 
@@ -1661,7 +1705,7 @@ fi",
 
         // Reuse the retrieval-safe excludes so streaming downloads skip stale
         // worker-local junk trees without excluding legitimate artifact roots.
-        for pattern in self.get_retrieval_excludes() {
+        for pattern in self.get_retrieval_excludes(artifact_patterns) {
             cmd.arg("--exclude").arg(pattern);
         }
 
@@ -3069,7 +3113,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("create temp dir");
         std::fs::write(
             temp_dir.path().join(".rchignore"),
-            ".beads/\n.beads/recovery_*/\ncustom-cache/\n",
+            ".beads/\n.beads/recovery_*/\ncustom-cache/\ntarget/\n*.rlib\n",
         )
         .expect("write .rchignore");
 
@@ -3114,6 +3158,12 @@ mod tests {
             .windows(2)
             .position(|window| window == ["--exclude", "custom-cache/"])
             .expect("missing custom cache exclude");
+        let target_exclude = args
+            .windows(2)
+            .position(|window| window == ["--exclude", "target/"]);
+        let rlib_exclude = args
+            .windows(2)
+            .position(|window| window == ["--exclude", "*.rlib"]);
         let include_dirs = args
             .windows(2)
             .position(|window| window == ["--include", "*/"])
@@ -3126,6 +3176,8 @@ mod tests {
         assert!(beads_exclude < include_dirs);
         assert!(recovery_exclude < include_dirs);
         assert!(custom_exclude < include_dirs);
+        assert_eq!(target_exclude, None);
+        assert_eq!(rlib_exclude, None);
         assert!(include_dirs < target_include);
         assert!(
             !args
@@ -3134,6 +3186,60 @@ mod tests {
             "retrieve filters must not inherit upload-only target/ exclusion"
         );
         assert!(args.windows(2).any(|window| window == ["--exclude", "*"]));
+    }
+
+    #[test]
+    fn test_build_retrieve_streaming_command_does_not_exclude_artifact_root_from_rchignore() {
+        let _guard = test_guard!();
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        std::fs::write(temp_dir.path().join(".rchignore"), "build/\n.cache/\n")
+            .expect("write .rchignore");
+
+        let pipeline = TransferPipeline::new(
+            temp_dir.path().to_path_buf(),
+            "test-project".to_string(),
+            "abc123".to_string(),
+            TransferConfig::default(),
+        );
+
+        let worker = WorkerConfig {
+            id: WorkerId::new("mock-worker"),
+            host: "mock://worker".to_string(),
+            user: "mockuser".to_string(),
+            identity_file: "~/.ssh/mock".to_string(),
+            total_slots: 4,
+            priority: 100,
+            tags: vec![],
+        };
+
+        let cmd = pipeline.build_retrieve_streaming_command(
+            &worker,
+            "/tmp/rch/test-project/abc123",
+            &["build/**".to_string()],
+        );
+
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect();
+
+        assert!(
+            !args
+                .windows(2)
+                .any(|window| window == ["--exclude", "build/"]),
+            "streaming retrieval must not exclude the requested artifact root"
+        );
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["--exclude", ".cache/"]),
+            "unrelated directory-only .rchignore entries should still prune traversal"
+        );
+        assert!(
+            args.windows(2)
+                .any(|window| window == ["--include", "build/**"]),
+            "streaming retrieval should include requested artifact patterns"
+        );
     }
 
     #[test]
