@@ -23,6 +23,7 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 use tokio::process::Command;
 use tracing::{debug, info, warn};
+use uuid::Uuid;
 
 /// Result of a remote compilation verification test.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,10 +67,44 @@ pub struct RemoteCompilationTest {
     pub binary_name: Option<String>,
     /// Remote base directory for builds.
     pub remote_base: String,
+    /// Unique suffix appended to the remote project directory for this test run.
+    pub remote_path_suffix: String,
 }
 
 fn use_mock_transport(worker: &WorkerConfig) -> bool {
     mock::is_mock_enabled() || mock::is_mock_worker(worker)
+}
+
+fn sanitize_remote_path_component(component: &str, fallback: &str) -> String {
+    let sanitized = component
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    let trimmed = sanitized.trim_matches('-');
+    if trimmed.is_empty() {
+        fallback.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn sanitize_remote_path_suffix(suffix: &str) -> String {
+    sanitize_remote_path_component(suffix, "run")
+}
+
+fn join_remote_path(base: &str, child: &str) -> String {
+    let base = base.trim_end_matches('/');
+    if base.is_empty() {
+        format!("/{child}")
+    } else {
+        format!("{base}/{child}")
+    }
 }
 
 impl Default for RemoteCompilationTest {
@@ -82,6 +117,7 @@ impl Default for RemoteCompilationTest {
             release_mode: true,
             binary_name: None,
             remote_base: "/tmp/rch_self_test".to_string(),
+            remote_path_suffix: format!("run-{}", Uuid::new_v4()),
         }
     }
 }
@@ -117,6 +153,12 @@ impl RemoteCompilationTest {
     /// Set the binary name to verify.
     pub fn with_binary_name(mut self, name: impl Into<String>) -> Self {
         self.binary_name = Some(name.into());
+        self
+    }
+
+    /// Set the remote project path suffix.
+    pub fn with_remote_path_suffix(mut self, suffix: impl AsRef<str>) -> Self {
+        self.remote_path_suffix = sanitize_remote_path_suffix(suffix.as_ref());
         self
     }
 
@@ -265,8 +307,11 @@ impl RemoteCompilationTest {
             .test_project
             .file_name()
             .and_then(|n| n.to_str())
-            .unwrap_or("self_test");
-        format!("{}/{}", self.remote_base, project_name)
+            .map(|n| sanitize_remote_path_component(n, "self_test"))
+            .unwrap_or_else(|| "self_test".to_string());
+        let remote_path_suffix = sanitize_remote_path_suffix(&self.remote_path_suffix);
+        let project_dir = format!("{project_name}-{remote_path_suffix}");
+        join_remote_path(&self.remote_base, &project_dir)
     }
 
     /// Build the project locally.
@@ -695,6 +740,7 @@ mod tests {
         assert!(test.release_mode);
         assert!(test.binary_name.is_none());
         assert_eq!(test.remote_base, "/tmp/rch_self_test");
+        assert!(test.remote_path_suffix.starts_with("run-"));
 
         logger.log_with_data(
             TestPhase::Verify,
@@ -702,7 +748,8 @@ mod tests {
             serde_json::json!({
                 "timeout_secs": 300,
                 "release_mode": true,
-                "remote_base": "/tmp/rch_self_test"
+                "remote_base": "/tmp/rch_self_test",
+                "remote_path_suffix": &test.remote_path_suffix
             }),
         );
         logger.pass();
@@ -949,7 +996,110 @@ mod tests {
             serde_json::json!({ "remote_path": &remote_path }),
         );
 
-        assert_eq!(remote_path, "/tmp/rch_self_test/test-project");
+        assert!(
+            remote_path.starts_with("/tmp/rch_self_test/test-project-run-"),
+            "remote path should include a unique run suffix: {remote_path}"
+        );
+
+        logger.pass();
+    }
+
+    #[test]
+    fn remote_compilation_test_custom_remote_path_suffix() {
+        let _guard = test_guard!();
+        let logger = TestLogger::for_test("remote_compilation_test_custom_remote_path_suffix");
+
+        let worker = WorkerConfig {
+            id: WorkerId::new("w1"),
+            host: "host".to_string(),
+            user: "user".to_string(),
+            identity_file: "~/.ssh/id_rsa".to_string(),
+            total_slots: 1,
+            ..Default::default()
+        };
+
+        let test = RemoteCompilationTest::new(worker, PathBuf::from("/home/user/test-project"))
+            .with_remote_path_suffix("run/42 attempt 1");
+
+        let remote_path = test.remote_project_path();
+        logger.log_with_data(
+            TestPhase::Execute,
+            "Computed remote path with custom suffix",
+            serde_json::json!({ "remote_path": &remote_path }),
+        );
+
+        assert_eq!(
+            remote_path,
+            "/tmp/rch_self_test/test-project-run-42-attempt-1"
+        );
+
+        logger.pass();
+    }
+
+    #[test]
+    fn remote_compilation_test_remote_path_sanitizes_public_suffix_field() {
+        let _guard = test_guard!();
+        let logger = TestLogger::for_test(
+            "remote_compilation_test_remote_path_sanitizes_public_suffix_field",
+        );
+
+        let worker = WorkerConfig {
+            id: WorkerId::new("w1"),
+            host: "host".to_string(),
+            user: "user".to_string(),
+            identity_file: "~/.ssh/id_rsa".to_string(),
+            total_slots: 1,
+            ..Default::default()
+        };
+
+        let mut test = RemoteCompilationTest::new(worker, PathBuf::from("/home/user/test-project"));
+        test.remote_path_suffix = "../unsafe path".to_string();
+
+        let remote_path = test.remote_project_path();
+        logger.log_with_data(
+            TestPhase::Execute,
+            "Computed remote path with directly-mutated suffix",
+            serde_json::json!({ "remote_path": &remote_path }),
+        );
+
+        assert_eq!(
+            remote_path,
+            "/tmp/rch_self_test/test-project-..-unsafe-path"
+        );
+
+        logger.pass();
+    }
+
+    #[test]
+    fn remote_compilation_test_instances_do_not_share_remote_paths() {
+        let _guard = test_guard!();
+        let logger =
+            TestLogger::for_test("remote_compilation_test_instances_do_not_share_remote_paths");
+
+        let worker = WorkerConfig {
+            id: WorkerId::new("w1"),
+            host: "host".to_string(),
+            user: "user".to_string(),
+            identity_file: "~/.ssh/id_rsa".to_string(),
+            total_slots: 1,
+            ..Default::default()
+        };
+
+        let first = RemoteCompilationTest::new(worker.clone(), PathBuf::from("/home/user/project"));
+        let second = RemoteCompilationTest::new(worker, PathBuf::from("/home/user/project"));
+
+        let first_path = first.remote_project_path();
+        let second_path = second.remote_project_path();
+        logger.log_with_data(
+            TestPhase::Verify,
+            "Computed independent remote paths",
+            serde_json::json!({
+                "first_path": &first_path,
+                "second_path": &second_path
+            }),
+        );
+
+        assert_ne!(first_path, second_path);
 
         logger.pass();
     }
@@ -968,20 +1118,21 @@ mod tests {
             ..Default::default()
         };
 
-        let mut test = RemoteCompilationTest::new(worker, PathBuf::from("/home/user/project"));
-        test.remote_base = "/custom/build/dir".to_string();
+        let mut test = RemoteCompilationTest::new(worker, PathBuf::from("/home/user/project"))
+            .with_remote_path_suffix("custom-suffix");
+        test.remote_base = "/custom/build/dir/".to_string();
 
         let remote_path = test.remote_project_path();
         logger.log_with_data(
             TestPhase::Execute,
             "Computed remote path with custom base",
             serde_json::json!({
-                "remote_base": "/custom/build/dir",
+                "remote_base": "/custom/build/dir/",
                 "remote_path": &remote_path
             }),
         );
 
-        assert_eq!(remote_path, "/custom/build/dir/project");
+        assert_eq!(remote_path, "/custom/build/dir/project-custom-suffix");
 
         logger.pass();
     }
