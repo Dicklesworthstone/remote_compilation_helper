@@ -314,6 +314,24 @@ impl RemoteCompilationTest {
         join_remote_path(&self.remote_base, &project_dir)
     }
 
+    /// Get the remote artifact source for rsync retrieval.
+    fn remote_artifact_source(&self, profile: &str) -> String {
+        let remote_path = self.remote_project_path();
+        let remote_target = format!("{}/target/{profile}/", remote_path.trim_end_matches('/'));
+        format!(
+            "{}@{}:{}",
+            self.worker.user,
+            self.worker.host,
+            escape(Cow::from(remote_target))
+        )
+    }
+
+    /// Build the isolated remote CARGO_HOME path for a single build attempt.
+    fn remote_cargo_home_path(&self, session_id: u32, timestamp: u128) -> String {
+        let worker_id = sanitize_remote_path_component(self.worker.id.as_str(), "worker");
+        format!("/tmp/rch-cargo-home-{worker_id}-{session_id}-{timestamp}")
+    }
+
     /// Build the project locally.
     async fn build_local(&self) -> Result<()> {
         let mut cmd = Command::new("cargo");
@@ -354,7 +372,7 @@ impl RemoteCompilationTest {
         if use_mock_transport(&self.worker) {
             let mut client = MockSshClient::new(self.worker.clone(), MockConfig::from_env());
             client.connect().await?;
-            let mkdir_cmd = format!("mkdir -p {}", escaped_remote_path);
+            let mkdir_cmd = format!("mkdir -p -- {}", escaped_remote_path);
             let mkdir_result = client.execute(&mkdir_cmd).await?;
             client.disconnect().await?;
 
@@ -376,7 +394,7 @@ impl RemoteCompilationTest {
         // First ensure remote directory exists
         let mut client = SshClient::new(self.worker.clone(), self.ssh_options.clone());
         client.connect().await?;
-        let mkdir_cmd = format!("mkdir -p {}", escaped_remote_path);
+        let mkdir_cmd = format!("mkdir -p -- {}", escaped_remote_path);
         let mkdir_result = client.execute(&mkdir_cmd).await?;
         client.disconnect().await?;
 
@@ -435,11 +453,7 @@ impl RemoteCompilationTest {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let worker_id = &self.worker.id;
-        let cargo_home = format!(
-            "/tmp/rch-cargo-home-{}-{}-{}",
-            worker_id, session_id, timestamp
-        );
+        let cargo_home = self.remote_cargo_home_path(session_id, timestamp);
         let cargo_target_dir = format!("{}/target", remote_path);
         let escaped_cargo_home = escape(Cow::from(&cargo_home));
         let escaped_cargo_target_dir = escape(Cow::from(&cargo_target_dir));
@@ -451,7 +465,7 @@ impl RemoteCompilationTest {
         };
         // Preserve the cargo status after removing the isolated cache.
         let build_cmd = format!(
-            "mkdir -p {} {} && cd {} && CARGO_HOME={} CARGO_TARGET_DIR={} CARGO_INCREMENTAL=0 {}; status=$?; rm -rf {}; exit $status",
+            "mkdir -p -- {} {} && cd {} && CARGO_HOME={} CARGO_TARGET_DIR={} CARGO_INCREMENTAL=0 {}; status=$?; rm -rf -- {}; exit $status",
             escaped_cargo_home,
             escaped_cargo_target_dir,
             escaped_remote_path,
@@ -501,7 +515,6 @@ impl RemoteCompilationTest {
 
     /// Sync build artifacts from the worker via rsync.
     async fn rsync_from_worker(&self) -> Result<()> {
-        let remote_path = self.remote_project_path();
         let profile = if self.release_mode {
             "release"
         } else {
@@ -518,20 +531,14 @@ impl RemoteCompilationTest {
 
         if use_mock_transport(&self.worker) {
             let rsync = MockRsync::new(MockRsyncConfig::from_env());
-            let remote_target = format!(
-                "{}@{}:{}/target/{}/",
-                self.worker.user, self.worker.host, remote_path, profile
-            );
+            let remote_target = self.remote_artifact_source(profile);
             rsync
                 .retrieve_artifacts(&remote_target, &local_dest.display().to_string(), &[])
                 .await?;
             return Ok(());
         }
 
-        let remote_target = format!(
-            "{}@{}:{}/target/{}/",
-            self.worker.user, self.worker.host, remote_path, profile
-        );
+        let remote_target = self.remote_artifact_source(profile);
 
         let identity_file = shellexpand::tilde(&self.worker.identity_file);
         let escaped_identity = escape(Cow::from(identity_file.as_ref()));
@@ -1133,6 +1140,70 @@ mod tests {
         );
 
         assert_eq!(remote_path, "/custom/build/dir/project-custom-suffix");
+
+        logger.pass();
+    }
+
+    #[test]
+    fn remote_compilation_test_artifact_source_quotes_remote_base() {
+        let _guard = test_guard!();
+        let logger =
+            TestLogger::for_test("remote_compilation_test_artifact_source_quotes_remote_base");
+
+        let worker = WorkerConfig {
+            id: WorkerId::new("w1"),
+            host: "host".to_string(),
+            user: "user".to_string(),
+            identity_file: "~/.ssh/id_rsa".to_string(),
+            total_slots: 1,
+            ..Default::default()
+        };
+
+        let mut test = RemoteCompilationTest::new(worker, PathBuf::from("/home/user/project"))
+            .with_remote_path_suffix("run-1");
+        test.remote_base = "/tmp/rch self test".to_string();
+
+        let source = test.remote_artifact_source("release");
+        logger.log_with_data(
+            TestPhase::Verify,
+            "Computed quoted artifact source",
+            serde_json::json!({ "source": &source }),
+        );
+
+        assert_eq!(
+            source,
+            "user@host:'/tmp/rch self test/project-run-1/target/release/'"
+        );
+
+        logger.pass();
+    }
+
+    #[test]
+    fn remote_compilation_test_cargo_home_sanitizes_worker_id() {
+        let _guard = test_guard!();
+        let logger = TestLogger::for_test("remote_compilation_test_cargo_home_sanitizes_worker_id");
+
+        let worker = WorkerConfig {
+            id: WorkerId::new("worker/one with spaces"),
+            host: "host".to_string(),
+            user: "user".to_string(),
+            identity_file: "~/.ssh/id_rsa".to_string(),
+            total_slots: 1,
+            ..Default::default()
+        };
+
+        let test = RemoteCompilationTest::new(worker, PathBuf::from("/home/user/project"));
+        let cargo_home = test.remote_cargo_home_path(7, 42);
+        logger.log_with_data(
+            TestPhase::Verify,
+            "Computed sanitized cargo home",
+            serde_json::json!({ "cargo_home": &cargo_home }),
+        );
+
+        assert_eq!(
+            cargo_home,
+            "/tmp/rch-cargo-home-worker-one-with-spaces-7-42"
+        );
 
         logger.pass();
     }
