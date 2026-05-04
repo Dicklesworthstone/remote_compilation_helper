@@ -904,9 +904,11 @@ fi",
         // Use --signal=KILL to ensure the process dies even if stuck in a CPU loop.
         // The --foreground flag ensures timeout works properly in non-interactive shells.
         // --preserve-status ensures the exit code reflects whether timeout killed it.
+        // Run through env so leading VAR=value assignments remain environment
+        // assignments after the timeout wrapper is prepended.
         // Exit code 137 (128 + 9) indicates SIGKILL was sent.
         format!(
-            "timeout --signal=KILL --foreground --preserve-status {} {}",
+            "timeout --signal=KILL --foreground --preserve-status {} env {}",
             timeout_secs, command
         )
     }
@@ -2982,6 +2984,27 @@ mod tests {
         assert!(wrapped.contains("timeout"));
         assert!(wrapped.contains("1800")); // Default test_timeout_sec
         assert!(wrapped.contains("cargo test"));
+    }
+
+    #[test]
+    fn test_external_timeout_preserves_leading_env_assignments() {
+        let _guard = test_guard!();
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/tmp/test"),
+            "test-project".to_string(),
+            "abc123".to_string(),
+            TransferConfig::default(),
+        )
+        .with_compilation_kind(Some(CompilationKind::CargoTest));
+
+        let wrapped = pipeline.wrap_with_external_timeout(
+            "CARGO_TARGET_DIR='/tmp/rch target' RUSTFLAGS='-C target-cpu=native' cargo test",
+        );
+
+        assert!(wrapped.contains("timeout"));
+        assert!(wrapped.contains(" env CARGO_TARGET_DIR="));
+        assert!(!wrapped.contains("1800 CARGO_TARGET_DIR="));
+        assert!(wrapped.contains("RUSTFLAGS='-C target-cpu=native' cargo test"));
     }
 
     #[test]
