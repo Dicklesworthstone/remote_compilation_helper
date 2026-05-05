@@ -18,6 +18,8 @@ use super::types::{
     ConfigValueSourceInfo, LintIssue, LintSeverity,
 };
 
+const SUPPORTED_CONFIG_KEYS: &str = "general.enabled, general.force_local, general.force_remote, general.log_level, general.socket_path, compilation.confidence_threshold, compilation.min_local_time_ms, compilation.build_slots, compilation.test_slots, compilation.check_slots, compilation.build_timeout_sec, compilation.test_timeout_sec, compilation.bun_timeout_sec, compilation.external_timeout_enabled, transfer.compression_level, transfer.exclude_patterns, environment.allowlist, output.visibility, output.first_run_complete";
+
 fn print_file_validation(
     label: &str,
     validations: &[config::FileValidation],
@@ -645,6 +647,48 @@ pub(super) fn collect_value_sources(
     );
     push_value_source(
         &mut values,
+        "compilation.build_slots",
+        config.compilation.build_slots.to_string(),
+        sources,
+    );
+    push_value_source(
+        &mut values,
+        "compilation.test_slots",
+        config.compilation.test_slots.to_string(),
+        sources,
+    );
+    push_value_source(
+        &mut values,
+        "compilation.check_slots",
+        config.compilation.check_slots.to_string(),
+        sources,
+    );
+    push_value_source(
+        &mut values,
+        "compilation.build_timeout_sec",
+        config.compilation.build_timeout_sec.to_string(),
+        sources,
+    );
+    push_value_source(
+        &mut values,
+        "compilation.test_timeout_sec",
+        config.compilation.test_timeout_sec.to_string(),
+        sources,
+    );
+    push_value_source(
+        &mut values,
+        "compilation.bun_timeout_sec",
+        config.compilation.bun_timeout_sec.to_string(),
+        sources,
+    );
+    push_value_source(
+        &mut values,
+        "compilation.external_timeout_enabled",
+        config.compilation.external_timeout_enabled.to_string(),
+        sources,
+    );
+    push_value_source(
+        &mut values,
         "transfer.compression_level",
         config.transfer.compression_level.to_string(),
         sources,
@@ -976,6 +1020,27 @@ fn config_set_at(config_path: &Path, key: &str, value: &str, ctx: &OutputContext
         "compilation.min_local_time_ms" => {
             config.compilation.min_local_time_ms = parse_u64(value, key)?;
         }
+        "compilation.build_slots" => {
+            config.compilation.build_slots = parse_u32(value, key)?;
+        }
+        "compilation.test_slots" => {
+            config.compilation.test_slots = parse_u32(value, key)?;
+        }
+        "compilation.check_slots" => {
+            config.compilation.check_slots = parse_u32(value, key)?;
+        }
+        "compilation.build_timeout_sec" => {
+            config.compilation.build_timeout_sec = parse_u64(value, key)?;
+        }
+        "compilation.test_timeout_sec" => {
+            config.compilation.test_timeout_sec = parse_u64(value, key)?;
+        }
+        "compilation.bun_timeout_sec" => {
+            config.compilation.bun_timeout_sec = parse_u64(value, key)?;
+        }
+        "compilation.external_timeout_enabled" => {
+            config.compilation.external_timeout_enabled = parse_bool(value, key)?;
+        }
         "transfer.compression_level" => {
             let level = parse_u32(value, key)?;
             if level > 19 {
@@ -1010,7 +1075,7 @@ fn config_set_at(config_path: &Path, key: &str, value: &str, ctx: &OutputContext
             return Err(ConfigError::InvalidValue {
                 field: key.to_string(),
                 reason: "unknown configuration key".to_string(),
-                suggestion: "Supported keys: general.enabled, general.force_local, general.force_remote, general.log_level, general.socket_path, compilation.confidence_threshold, compilation.min_local_time_ms, transfer.compression_level, transfer.exclude_patterns, environment.allowlist, output.visibility, output.first_run_complete".to_string(),
+                suggestion: format!("Supported keys: {}", SUPPORTED_CONFIG_KEYS),
             }
             .into());
         }
@@ -1093,6 +1158,35 @@ fn config_reset_at(config_path: &Path, key: &str, ctx: &OutputContext) -> Result
             config.compilation.min_local_time_ms = defaults.compilation.min_local_time_ms;
             config.compilation.min_local_time_ms.to_string()
         }
+        "compilation.build_slots" => {
+            config.compilation.build_slots = defaults.compilation.build_slots;
+            config.compilation.build_slots.to_string()
+        }
+        "compilation.test_slots" => {
+            config.compilation.test_slots = defaults.compilation.test_slots;
+            config.compilation.test_slots.to_string()
+        }
+        "compilation.check_slots" => {
+            config.compilation.check_slots = defaults.compilation.check_slots;
+            config.compilation.check_slots.to_string()
+        }
+        "compilation.build_timeout_sec" => {
+            config.compilation.build_timeout_sec = defaults.compilation.build_timeout_sec;
+            config.compilation.build_timeout_sec.to_string()
+        }
+        "compilation.test_timeout_sec" => {
+            config.compilation.test_timeout_sec = defaults.compilation.test_timeout_sec;
+            config.compilation.test_timeout_sec.to_string()
+        }
+        "compilation.bun_timeout_sec" => {
+            config.compilation.bun_timeout_sec = defaults.compilation.bun_timeout_sec;
+            config.compilation.bun_timeout_sec.to_string()
+        }
+        "compilation.external_timeout_enabled" => {
+            config.compilation.external_timeout_enabled =
+                defaults.compilation.external_timeout_enabled;
+            config.compilation.external_timeout_enabled.to_string()
+        }
         "transfer.compression_level" => {
             config.transfer.compression_level = defaults.transfer.compression_level;
             config.transfer.compression_level.to_string()
@@ -1117,7 +1211,7 @@ fn config_reset_at(config_path: &Path, key: &str, ctx: &OutputContext) -> Result
             return Err(ConfigError::InvalidValue {
                 field: key.to_string(),
                 reason: "unknown configuration key".to_string(),
-                suggestion: "Supported keys: general.enabled, general.force_local, general.force_remote, general.log_level, general.socket_path, compilation.confidence_threshold, compilation.min_local_time_ms, transfer.compression_level, transfer.exclude_patterns, environment.allowlist, output.visibility, output.first_run_complete".to_string(),
+                suggestion: format!("Supported keys: {}", SUPPORTED_CONFIG_KEYS),
             }
             .into());
         }
@@ -1178,6 +1272,22 @@ pub fn config_export(format: &str, ctx: &OutputContext) -> Result<()> {
                 config.compilation.min_local_time_ms
             );
             println!(
+                "export RCH_BUILD_TIMEOUT_SEC={}",
+                config.compilation.build_timeout_sec
+            );
+            println!(
+                "export RCH_TEST_TIMEOUT_SEC={}",
+                config.compilation.test_timeout_sec
+            );
+            println!(
+                "export RCH_BUN_TIMEOUT_SEC={}",
+                config.compilation.bun_timeout_sec
+            );
+            println!(
+                "export RCH_EXTERNAL_TIMEOUT_ENABLED={}",
+                config.compilation.external_timeout_enabled
+            );
+            println!(
                 "export RCH_TRANSFER_ZSTD_LEVEL={}",
                 config.transfer.compression_level
             );
@@ -1202,6 +1312,19 @@ pub fn config_export(format: &str, ctx: &OutputContext) -> Result<()> {
             println!(
                 "RCH_MIN_LOCAL_TIME_MS={}",
                 config.compilation.min_local_time_ms
+            );
+            println!(
+                "RCH_BUILD_TIMEOUT_SEC={}",
+                config.compilation.build_timeout_sec
+            );
+            println!(
+                "RCH_TEST_TIMEOUT_SEC={}",
+                config.compilation.test_timeout_sec
+            );
+            println!("RCH_BUN_TIMEOUT_SEC={}", config.compilation.bun_timeout_sec);
+            println!(
+                "RCH_EXTERNAL_TIMEOUT_ENABLED={}",
+                config.compilation.external_timeout_enabled
             );
             println!(
                 "RCH_TRANSFER_ZSTD_LEVEL={}",
@@ -1684,6 +1807,18 @@ pub fn config_diff(ctx: &OutputContext) -> Result<()> {
         config.compilation.test_timeout_sec,
         defaults.compilation.test_timeout_sec,
         "compilation.test_timeout_sec"
+    );
+    diff_field!(
+        "compilation.bun_timeout_sec",
+        config.compilation.bun_timeout_sec,
+        defaults.compilation.bun_timeout_sec,
+        "compilation.bun_timeout_sec"
+    );
+    diff_field!(
+        "compilation.external_timeout_enabled",
+        config.compilation.external_timeout_enabled,
+        defaults.compilation.external_timeout_enabled,
+        "compilation.external_timeout_enabled"
     );
 
     // Transfer section

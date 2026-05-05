@@ -310,6 +310,8 @@ struct PartialCompilationConfig {
     check_slots: Option<u32>,
     build_timeout_sec: Option<u64>,
     test_timeout_sec: Option<u64>,
+    bun_timeout_sec: Option<u64>,
+    external_timeout_enabled: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -805,6 +807,8 @@ fn default_sources_map() -> ConfigSourceMap {
         "compilation.check_slots",
         "compilation.build_timeout_sec",
         "compilation.test_timeout_sec",
+        "compilation.bun_timeout_sec",
+        "compilation.external_timeout_enabled",
         "transfer.compression_level",
         "transfer.exclude_patterns",
         "environment.allowlist",
@@ -914,6 +918,22 @@ fn apply_layer(
     {
         config.compilation.test_timeout_sec = test_timeout_sec;
         set_source(sources, "compilation.test_timeout_sec", source.clone());
+    }
+    if let Some(bun_timeout_sec) = layer.compilation.bun_timeout_sec
+        && bun_timeout_sec != defaults.compilation.bun_timeout_sec
+    {
+        config.compilation.bun_timeout_sec = bun_timeout_sec;
+        set_source(sources, "compilation.bun_timeout_sec", source.clone());
+    }
+    if let Some(external_timeout_enabled) = layer.compilation.external_timeout_enabled
+        && external_timeout_enabled != defaults.compilation.external_timeout_enabled
+    {
+        config.compilation.external_timeout_enabled = external_timeout_enabled;
+        set_source(
+            sources,
+            "compilation.external_timeout_enabled",
+            source.clone(),
+        );
     }
 
     if let Some(compression) = layer.transfer.compression_level
@@ -1283,6 +1303,12 @@ fn merge_compilation(
     if overlay.test_timeout_sec != default.test_timeout_sec {
         base.test_timeout_sec = overlay.test_timeout_sec;
     }
+    if overlay.bun_timeout_sec != default.bun_timeout_sec {
+        base.bun_timeout_sec = overlay.bun_timeout_sec;
+    }
+    if overlay.external_timeout_enabled != default.external_timeout_enabled {
+        base.external_timeout_enabled = overlay.external_timeout_enabled;
+    }
 }
 
 /// Merge TransferConfig fields.
@@ -1611,6 +1637,30 @@ fn apply_env_overrides_inner(
                 sources,
                 "compilation.test_timeout_sec",
                 ConfigValueSource::EnvVar("RCH_TEST_TIMEOUT_SEC".to_string()),
+            );
+        }
+    }
+    if let Some(val) = get_env("RCH_BUN_TIMEOUT_SEC")
+        && let Ok(timeout) = val.parse()
+    {
+        config.compilation.bun_timeout_sec = timeout;
+        if let Some(ref mut sources) = sources {
+            set_source(
+                sources,
+                "compilation.bun_timeout_sec",
+                ConfigValueSource::EnvVar("RCH_BUN_TIMEOUT_SEC".to_string()),
+            );
+        }
+    }
+    if let Some(val) = get_env("RCH_EXTERNAL_TIMEOUT_ENABLED")
+        && let Some(enabled) = parse_bool(&val)
+    {
+        config.compilation.external_timeout_enabled = enabled;
+        if let Some(ref mut sources) = sources {
+            set_source(
+                sources,
+                "compilation.external_timeout_enabled",
+                ConfigValueSource::EnvVar("RCH_EXTERNAL_TIMEOUT_ENABLED".to_string()),
             );
         }
     }
@@ -2326,25 +2376,32 @@ identity_file = "/tmp/id_ed25519"
         base.compilation.check_slots = 3;
         base.compilation.build_timeout_sec = 420;
         base.compilation.test_timeout_sec = 2400;
+        base.compilation.bun_timeout_sec = 700;
+        base.compilation.external_timeout_enabled = false;
 
         let mut overlay = RchConfig::default();
         overlay.compilation.build_slots = 12;
         overlay.compilation.build_timeout_sec = 600;
+        overlay.compilation.bun_timeout_sec = 120;
 
         let merged = merge_config(base.clone(), overlay);
         info!(
-            "RESULT: build_slots={}, test_slots={}, check_slots={}, build_timeout_sec={}, test_timeout_sec={}",
+            "RESULT: build_slots={}, test_slots={}, check_slots={}, build_timeout_sec={}, test_timeout_sec={}, bun_timeout_sec={}, external_timeout_enabled={}",
             merged.compilation.build_slots,
             merged.compilation.test_slots,
             merged.compilation.check_slots,
             merged.compilation.build_timeout_sec,
-            merged.compilation.test_timeout_sec
+            merged.compilation.test_timeout_sec,
+            merged.compilation.bun_timeout_sec,
+            merged.compilation.external_timeout_enabled
         );
         assert_eq!(merged.compilation.build_slots, 12);
         assert_eq!(merged.compilation.test_slots, 10);
         assert_eq!(merged.compilation.check_slots, 3);
         assert_eq!(merged.compilation.build_timeout_sec, 600);
         assert_eq!(merged.compilation.test_timeout_sec, 2400);
+        assert_eq!(merged.compilation.bun_timeout_sec, 120);
+        assert!(!merged.compilation.external_timeout_enabled);
         info!("TEST PASS: test_merge_compilation_slots_override");
     }
 
@@ -3057,6 +3114,38 @@ canonical_root = "/from/toml"
     }
 
     #[test]
+    fn test_apply_env_overrides_external_timeout_controls() {
+        let _guard = test_guard!();
+        info!("TEST: test_apply_env_overrides_external_timeout_controls");
+        let mut config = RchConfig::default();
+        let mut sources = default_sources_map();
+        let mut env_overrides: HashMap<String, String> = HashMap::new();
+        env_overrides.insert("RCH_BUN_TIMEOUT_SEC".to_string(), "123".to_string());
+        env_overrides.insert(
+            "RCH_EXTERNAL_TIMEOUT_ENABLED".to_string(),
+            "false".to_string(),
+        );
+
+        apply_env_overrides_inner(&mut config, Some(&mut sources), Some(&env_overrides));
+
+        assert_eq!(config.compilation.bun_timeout_sec, 123);
+        assert!(!config.compilation.external_timeout_enabled);
+        assert_eq!(
+            sources
+                .get("compilation.bun_timeout_sec")
+                .expect("bun timeout source present"),
+            &ConfigValueSource::EnvVar("RCH_BUN_TIMEOUT_SEC".to_string())
+        );
+        assert_eq!(
+            sources
+                .get("compilation.external_timeout_enabled")
+                .expect("external timeout source present"),
+            &ConfigValueSource::EnvVar("RCH_EXTERNAL_TIMEOUT_ENABLED".to_string())
+        );
+        info!("PASS: external timeout env controls applied with source tracking");
+    }
+
+    #[test]
     fn test_apply_env_overrides_self_healing() {
         let _guard = test_guard!();
         info!("TEST: test_apply_env_overrides_self_healing");
@@ -3540,6 +3629,55 @@ build_timeout_sec = 900
         // Cleanup
         let _ = std::fs::remove_dir_all(&temp_dir);
         info!("PASS: User -> Project cascade works correctly");
+    }
+
+    #[test]
+    fn test_full_config_cascade_tracks_external_timeout_project_values() {
+        let _guard = test_guard!();
+        info!("TEST: test_full_config_cascade_tracks_external_timeout_project_values");
+
+        let temp_dir = std::env::temp_dir().join(format!(
+            "rch_test_timeout_cascade_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&temp_dir).expect("create temp dir");
+
+        let project_path = temp_dir.join("project_config.toml");
+        let project_toml = r#"
+[compilation]
+bun_timeout_sec = 123
+external_timeout_enabled = false
+"#;
+        std::fs::write(&project_path, project_toml).expect("write project config");
+
+        let env_overrides: HashMap<String, String> = HashMap::new();
+        let loaded =
+            load_config_with_sources_from_paths(None, Some(&project_path), Some(&env_overrides))
+                .expect("load config cascade");
+
+        assert_eq!(loaded.config.compilation.bun_timeout_sec, 123);
+        assert!(!loaded.config.compilation.external_timeout_enabled);
+        assert_eq!(
+            loaded
+                .sources
+                .get("compilation.bun_timeout_sec")
+                .expect("bun timeout source tracked"),
+            &ConfigValueSource::ProjectConfig(project_path.clone())
+        );
+        assert_eq!(
+            loaded
+                .sources
+                .get("compilation.external_timeout_enabled")
+                .expect("external timeout source tracked"),
+            &ConfigValueSource::ProjectConfig(project_path.clone())
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        info!("PASS: Project timeout controls are tracked");
     }
 
     #[test]
