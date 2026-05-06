@@ -102,6 +102,8 @@ const EXIT_SIGNAL_BASE: i32 = 128;
 
 const RCH_CARGO_WRAPPER_BYPASS_ENV: &str = "RCH_CARGO_WRAPPER_BYPASS";
 const RCH_REQUIRE_REMOTE_ENV: &str = "RCH_REQUIRE_REMOTE";
+const RCH_WORKER_ENV: &str = "RCH_WORKER";
+const RCH_WORKERS_ENV: &str = "RCH_WORKERS";
 
 use rch_common::util::mask_sensitive_command;
 
@@ -231,6 +233,36 @@ fn exec_requires_remote() -> bool {
     std::env::var(RCH_REQUIRE_REMOTE_ENV).is_ok_and(|value| env_flag_enabled(&value))
 }
 
+pub(crate) fn preferred_workers_from_env() -> Vec<WorkerId> {
+    let mut preferred = Vec::new();
+    if let Ok(value) = std::env::var(RCH_WORKER_ENV) {
+        preferred.extend(parse_preferred_workers(&value));
+    }
+    if let Ok(value) = std::env::var(RCH_WORKERS_ENV) {
+        preferred.extend(parse_preferred_workers(&value));
+    }
+    dedupe_worker_ids(preferred)
+}
+
+fn parse_preferred_workers(value: &str) -> Vec<WorkerId> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(WorkerId::new)
+        .collect()
+}
+
+fn dedupe_worker_ids(workers: Vec<WorkerId>) -> Vec<WorkerId> {
+    let mut deduped = Vec::new();
+    for worker in workers {
+        if !deduped.contains(&worker) {
+            deduped.push(worker);
+        }
+    }
+    deduped
+}
+
 fn local_fallback_command(command: &str) -> std::process::Command {
     let mut child = std::process::Command::new("sh");
     child
@@ -319,6 +351,7 @@ pub async fn run_exec(command_parts: Vec<String>) -> anyhow::Result<()> {
     let required_runtime = required_runtime_for_kind(classification.kind);
     let command_priority = command_priority_from_env(&reporter);
     let wait_for_worker = queue_when_busy_enabled();
+    let preferred_workers = preferred_workers_from_env();
 
     // Query daemon for worker selection
     let response = match query_daemon(
@@ -332,6 +365,7 @@ pub async fn run_exec(command_parts: Vec<String>) -> anyhow::Result<()> {
         0, // classification duration not relevant here
         Some(std::process::id()),
         wait_for_worker,
+        &preferred_workers,
     )
     .await
     {
@@ -355,6 +389,7 @@ pub async fn run_exec(command_parts: Vec<String>) -> anyhow::Result<()> {
                     0,
                     Some(std::process::id()),
                     wait_for_worker,
+                    &preferred_workers,
                 )
                 .await
                 {
@@ -2069,6 +2104,7 @@ pub(crate) async fn query_daemon(
     classification_duration_us: u64,
     hook_pid: Option<u32>,
     wait_for_worker: bool,
+    preferred_workers: &[WorkerId],
 ) -> anyhow::Result<SelectionResponse> {
     // Mock support: RCH_MOCK_CIRCUIT_OPEN simulates all circuits open
     // This needs to be checked in the hook since the daemon may be started
@@ -2128,6 +2164,10 @@ pub(crate) async fn query_daemon(
 
     if let Some(pid) = hook_pid {
         query.push_str(&format!("&hook_pid={}", pid));
+    }
+
+    for worker in preferred_workers {
+        query.push_str(&format!("&worker={}", urlencoding_encode(worker.as_str())));
     }
 
     // When all workers are at capacity, queue the build on the daemon instead of
@@ -6628,6 +6668,14 @@ mod tests {
         assert_eq!(config.total_slots, 8);
     }
 
+    #[test]
+    fn test_parse_preferred_workers_dedupes_ordered_values() {
+        let _guard = test_guard!();
+        let workers = dedupe_worker_ids(parse_preferred_workers(" ts2, vmi1,,ts2 , vmi2 "));
+        let ids: Vec<&str> = workers.iter().map(|worker| worker.as_str()).collect();
+        assert_eq!(ids, vec!["ts2", "vmi1", "vmi2"]);
+    }
+
     // =========================================================================
     // Mock daemon socket tests
     // =========================================================================
@@ -6646,6 +6694,7 @@ mod tests {
             100, // 100µs classification time
             None,
             false,
+            &[],
         )
         .await;
         assert!(result.is_err());
@@ -6728,6 +6777,7 @@ mod tests {
             100,
             None,
             false,
+            &[],
         )
         .await;
 
@@ -6741,6 +6791,85 @@ mod tests {
         assert_eq!(worker.id.as_str(), "mock-worker");
         assert_eq!(worker.host, "mock.host.local");
         assert_eq!(worker.slots_available, 16);
+    }
+
+    #[tokio::test]
+    async fn test_daemon_query_sends_preferred_workers() {
+        let socket_path = format!("/tmp/rch_test_daemon_preferred_{}.sock", std::process::id());
+        let _ = std::fs::remove_file(&socket_path);
+
+        let listener = UnixListener::bind(&socket_path).expect("Failed to create test socket");
+
+        let socket_path_clone = socket_path.clone();
+        let daemon_handle = tokio::spawn(async move {
+            let (stream, _) = listener
+                .accept()
+                .await
+                .expect("Failed to accept connection");
+            let (reader, mut writer) = stream.into_split();
+            let mut buf_reader = TokioBufReader::new(reader);
+
+            let mut request_line = String::new();
+            buf_reader
+                .read_line(&mut request_line)
+                .await
+                .expect("Failed to read request");
+
+            assert!(request_line.contains("worker=ts2"));
+            assert!(request_line.contains("worker=vmi1264463"));
+
+            let response = SelectionResponse {
+                worker: Some(SelectedWorker {
+                    id: rch_common::WorkerId::new("ts2"),
+                    host: "mock.host.local".to_string(),
+                    user: "mockuser".to_string(),
+                    identity_file: "~/.ssh/mock_key".to_string(),
+                    slots_available: 16,
+                    speed_score: 95.0,
+                }),
+                reason: SelectionReason::Success,
+                build_id: None,
+            };
+            let body = serde_json::to_string(&response).unwrap();
+            let http_response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            writer
+                .write_all(http_response.as_bytes())
+                .await
+                .expect("Failed to write response");
+            writer.flush().await.expect("Failed to flush response");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        let preferred = vec![
+            rch_common::WorkerId::new("ts2"),
+            rch_common::WorkerId::new("vmi1264463"),
+        ];
+        let result = query_daemon(
+            &socket_path,
+            "test-project",
+            4,
+            "cargo build",
+            None,
+            RequiredRuntime::None,
+            CommandPriority::Normal,
+            100,
+            None,
+            false,
+            &preferred,
+        )
+        .await;
+
+        daemon_handle.await.expect("Daemon task panicked");
+        let _ = std::fs::remove_file(&socket_path_clone);
+
+        let response = result.expect("Query should succeed");
+        let worker = response.worker.expect("Should have worker");
+        assert_eq!(worker.id.as_str(), "ts2");
     }
 
     #[tokio::test]
@@ -6813,6 +6942,7 @@ mod tests {
             100,
             None,
             true,
+            &[],
         )
         .await;
 
@@ -6879,6 +7009,7 @@ mod tests {
             150, // 150µs classification time
             None,
             false,
+            &[],
         )
         .await;
         daemon_handle.await.expect("Daemon task");
@@ -10388,6 +10519,7 @@ edition = "2024"
             100,
             None,
             false,
+            &[],
         )
         .await;
 
@@ -10502,6 +10634,7 @@ edition = "2024"
             100,
             None,
             false,
+            &[],
         )
         .await;
 

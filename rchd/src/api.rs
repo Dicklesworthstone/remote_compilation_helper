@@ -1604,6 +1604,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
     let mut command_priority = CommandPriority::Normal;
     let mut classification_duration_us = None;
     let mut hook_pid = None;
+    let mut preferred_workers = Vec::new();
 
     for param in query.split('&') {
         if param.is_empty() {
@@ -1647,6 +1648,12 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
             "hook_pid" => {
                 hook_pid = value.parse().ok();
             }
+            "worker" | "preferred_worker" | "preferred" => {
+                preferred_workers.extend(parse_worker_id_list(value));
+            }
+            "workers" | "preferred_workers" => {
+                preferred_workers.extend(parse_worker_id_list(value));
+            }
             _ => {} // Ignore unknown parameters
         }
     }
@@ -1660,7 +1667,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
             command,
             command_priority,
             estimated_cores,
-            preferred_workers: vec![],
+            preferred_workers,
             toolchain,
             required_runtime,
             classification_duration_us,
@@ -1669,6 +1676,15 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
         wait_for_worker,
         wait_timeout_secs,
     })
+}
+
+fn parse_worker_id_list(encoded_value: &str) -> Vec<WorkerId> {
+    urlencoding_decode(encoded_value)
+        .split(',')
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(WorkerId::new)
+        .collect()
 }
 
 fn parse_telemetry_source(value: &str) -> Option<TelemetrySource> {
@@ -3230,8 +3246,9 @@ mod tests {
     fn test_parse_request_basic() {
         let _guard = test_guard!();
         let req = parse_request("GET /select-worker?project=myproject&cores=4").unwrap();
+        assert!(matches!(req, ApiRequest::SelectWorker { .. }));
         let ApiRequest::SelectWorker { request: req, .. } = req else {
-            panic!("expected select-worker request");
+            return;
         };
         assert_eq!(req.project, "myproject");
         assert_eq!(req.estimated_cores, 4);
@@ -3267,6 +3284,25 @@ mod tests {
             panic!("expected select-worker request");
         };
         assert_eq!(req.command_priority, rch_common::CommandPriority::High);
+    }
+
+    #[test]
+    fn test_parse_request_with_preferred_workers() {
+        let _guard = test_guard!();
+        let req = parse_request(
+            "GET /select-worker?project=test&worker=ts2&workers=vmi1%2Cvmi2&preferred=fast",
+        )
+        .unwrap();
+        assert!(matches!(req, ApiRequest::SelectWorker { .. }));
+        let ApiRequest::SelectWorker { request: req, .. } = req else {
+            return;
+        };
+        let ids: Vec<&str> = req
+            .preferred_workers
+            .iter()
+            .map(|worker| worker.as_str())
+            .collect();
+        assert_eq!(ids, vec!["ts2", "vmi1", "vmi2", "fast"]);
     }
 
     #[test]

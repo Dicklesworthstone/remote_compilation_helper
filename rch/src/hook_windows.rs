@@ -56,6 +56,8 @@ pub(crate) async fn query_daemon(
     _command_priority: CommandPriority,
     _classification_duration_us: u64,
     _hook_pid: Option<u32>,
+    _wait_for_worker: bool,
+    _preferred_workers: &[WorkerId],
 ) -> anyhow::Result<SelectionResponse> {
     Err(PlatformError::UnixSocketUnsupported)?
 }

@@ -173,6 +173,8 @@ pub enum SelectionReason {
     AllCircuitsOpen,
     /// All workers are at capacity (no available slots).
     AllWorkersBusy,
+    /// Workers were present but none passed selection health thresholds.
+    NoWorkersPassedHealth,
     /// All candidate workers failed hard preflight checks.
     AllWorkersFailedPreflight,
     /// All candidate workers failed repo convergence checks (repos missing/stale/failed).
@@ -197,6 +199,7 @@ impl std::fmt::Display for SelectionReason {
             Self::AllWorkersUnreachable => write!(f, "all workers unreachable"),
             Self::AllCircuitsOpen => write!(f, "all worker circuits open"),
             Self::AllWorkersBusy => write!(f, "all workers at capacity"),
+            Self::NoWorkersPassedHealth => write!(f, "no workers passed health thresholds"),
             Self::AllWorkersFailedPreflight => write!(f, "all workers failed preflight checks"),
             Self::AllWorkersFailedConvergence => {
                 write!(f, "all workers failed repo convergence checks")
@@ -3031,6 +3034,10 @@ mod tests {
             "\"all_workers_busy\""
         );
         assert_eq!(
+            serde_json::to_string(&SelectionReason::NoWorkersPassedHealth).unwrap(),
+            "\"no_workers_passed_health\""
+        );
+        assert_eq!(
             serde_json::to_string(&SelectionReason::AllWorkersFailedPreflight).unwrap(),
             "\"all_workers_failed_preflight\""
         );
@@ -3065,6 +3072,10 @@ mod tests {
             SelectionReason::AllWorkersBusy
         );
         assert_eq!(
+            serde_json::from_str::<SelectionReason>("\"no_workers_passed_health\"").unwrap(),
+            SelectionReason::NoWorkersPassedHealth
+        );
+        assert_eq!(
             serde_json::from_str::<SelectionReason>("\"all_workers_failed_preflight\"").unwrap(),
             SelectionReason::AllWorkersFailedPreflight
         );
@@ -3092,6 +3103,10 @@ mod tests {
         assert_eq!(
             SelectionReason::AllWorkersBusy.to_string(),
             "all workers at capacity"
+        );
+        assert_eq!(
+            SelectionReason::NoWorkersPassedHealth.to_string(),
+            "no workers passed health thresholds"
         );
         assert_eq!(
             SelectionReason::AllWorkersFailedPreflight.to_string(),

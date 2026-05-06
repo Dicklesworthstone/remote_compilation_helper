@@ -193,6 +193,8 @@ Note: `rch config export` currently outputs `RCH_DAEMON_SOCKET` and
 - `RCH_ENABLE_METRICS`
 - `RCH_TEST_MODE`
 - `RCH_MIN_LOCAL_TIME_MS`
+- `RCH_WORKER` (preferred worker override)
+- `RCH_WORKERS` (comma-separated preferred worker override list)
 
 ### Hook integration variables
 Used by hook integration scripts (see `docs/extending/integration-hooks.md`):
@@ -275,8 +277,6 @@ These appear in docs/README but are not currently used by the config loader:
 - `RCH_DRY_RUN`
 - `RCH_LOCAL_ONLY`
 - `RCH_STREAM_MODE`
-- `RCH_WORKER` (override form; distinct from hook-provided variable)
-- `RCH_WORKERS` (override form)
 - `RCH_NO_CACHE`
 
 ## Per-Project Configuration

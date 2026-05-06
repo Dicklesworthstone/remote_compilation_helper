@@ -21,7 +21,7 @@ use rand::RngExt;
 use rch_common::{
     CircuitBreakerConfig, CircuitState, CommandPriority, RequiredRuntime, SelectionConfig,
     SelectionReason, SelectionRequest, SelectionStrategy, SelectionWeightConfig, SshClient,
-    SshOptions, WorkerId, classify_command,
+    SshOptions, ToolchainInfo, WorkerCapabilities, WorkerId, classify_command,
 };
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -1302,6 +1302,16 @@ impl WorkerSelector {
 
             any_has_runtime = true;
 
+            let capabilities = worker.capabilities().await;
+            if let Some(reason) =
+                toolchain_capability_mismatch(request.toolchain.as_ref(), &capabilities)
+            {
+                debug!("Worker {} excluded: {}", worker_id, reason);
+                metrics::inc_reliability_error("selection", "toolchain_version_mismatch");
+                filtered_by_hard_preflight += 1;
+                continue;
+            }
+
             if let Some(reason) = self
                 .toolchain_preflight_failure(worker.as_ref(), worker_id.as_str(), request)
                 .await
@@ -1327,7 +1337,6 @@ impl WorkerSelector {
             }
 
             // Filter by load-per-core threshold (bd-3eaa)
-            let capabilities = worker.capabilities().await;
             if let Some(false) = capabilities.is_topology_healthy() {
                 let reason = capabilities
                     .projects_root_issue
@@ -1592,10 +1601,11 @@ impl WorkerSelector {
                     "Worker {} excluded: success_rate {:.2} < min {:.2}",
                     worker_id, success_rate, self.config.min_success_rate
                 );
+                if has_preferred && preferred_set.contains(worker_id.as_str()) {
+                    preferred_without_health.push((worker.clone(), circuit_state));
+                    continue;
+                }
                 if success_rate >= self.config.affinity.fallback_min_success_rate {
-                    if has_preferred && preferred_set.contains(worker_id.as_str()) {
-                        preferred_without_health.push((worker.clone(), circuit_state));
-                    }
                     eligible_without_health.push((worker.clone(), circuit_state));
                 }
                 continue;
@@ -1617,6 +1627,9 @@ impl WorkerSelector {
         // Return preferred workers if available, otherwise all eligible
         if has_preferred && !preferred.is_empty() {
             return Ok(preferred);
+        }
+        if has_preferred && !preferred_without_health.is_empty() {
+            return Ok(preferred_without_health);
         }
         if !eligible.is_empty() {
             return Ok(eligible);
@@ -1648,6 +1661,17 @@ impl WorkerSelector {
             return Err(SelectionReason::AllWorkersFailedPreflight);
         }
 
+        if filtered_by_health > 0
+            && preferred_without_health.is_empty()
+            && eligible_without_health.is_empty()
+        {
+            debug!(
+                "No workers passed selection health thresholds (min_success_rate {:.2}, fallback_min_success_rate {:.2})",
+                self.config.min_success_rate, self.config.affinity.fallback_min_success_rate
+            );
+            return Err(SelectionReason::NoWorkersPassedHealth);
+        }
+
         if filtered_by_health > 0 {
             debug!(
                 "No workers meet min_success_rate {:.2}; falling back to workers below threshold",
@@ -1655,11 +1679,7 @@ impl WorkerSelector {
             );
         }
 
-        if has_preferred && !preferred_without_health.is_empty() {
-            Ok(preferred_without_health)
-        } else {
-            Ok(eligible_without_health)
-        }
+        Ok(eligible_without_health)
     }
 
     async fn toolchain_preflight_failure(
@@ -2415,6 +2435,7 @@ fn selection_reason_label(reason: &SelectionReason) -> &'static str {
         SelectionReason::AllWorkersUnreachable => "all_workers_unreachable",
         SelectionReason::AllCircuitsOpen => "all_circuits_open",
         SelectionReason::AllWorkersBusy => "all_workers_busy",
+        SelectionReason::NoWorkersPassedHealth => "no_workers_passed_health",
         SelectionReason::AllWorkersFailedPreflight => "all_workers_failed_preflight",
         SelectionReason::AllWorkersFailedConvergence => "all_workers_failed_convergence",
         SelectionReason::NoMatchingWorkers => "no_matching_workers",
@@ -2446,6 +2467,35 @@ fn record_selection_metrics(reason: &SelectionReason, duration: Duration) {
             metrics::inc_reliability_error("selection", "selection_error");
         }
     }
+}
+
+fn toolchain_capability_mismatch(
+    toolchain: Option<&ToolchainInfo>,
+    capabilities: &WorkerCapabilities,
+) -> Option<String> {
+    let toolchain = toolchain?;
+    if toolchain.date.is_some() || toolchain.full_version.trim().is_empty() {
+        return None;
+    }
+
+    let local = rustc_version_key(&toolchain.full_version)?;
+    let worker = capabilities
+        .rustc_version
+        .as_deref()
+        .and_then(rustc_version_key)?;
+    (local != worker).then(|| format!("rustc_version_mismatch:local={local}:worker={worker}"))
+}
+
+fn rustc_version_key(value: &str) -> Option<String> {
+    let mut parts = value.split_whitespace();
+    let first = parts.next()?;
+    let version = if first == "rustc" {
+        parts.next()?
+    } else {
+        first
+    };
+    let version = version.trim();
+    (!version.is_empty()).then(|| version.to_string())
 }
 
 async fn probe_worker_toolchain(worker: &WorkerState, toolchain_name: &str) -> Result<(), String> {
@@ -2512,8 +2562,8 @@ mod tests {
     };
     use rch_common::test_guard;
     use rch_common::{
-        CommandPriority, RequiredRuntime, SelectionWeightConfig, ToolchainInfo, WorkerConfig,
-        WorkerId,
+        CommandPriority, RequiredRuntime, SelectionWeightConfig, ToolchainInfo, WorkerCapabilities,
+        WorkerConfig, WorkerId,
     };
     use std::sync::Arc;
 
@@ -3403,6 +3453,98 @@ mod tests {
         let result = selector.select(&pool, &request).await;
         let selected = result.worker.expect("Expected a worker");
         assert_eq!(selected.config.read().await.id.as_str(), "slow-healthy");
+    }
+
+    #[tokio::test]
+    async fn test_worker_selector_reports_no_workers_passed_health_thresholds() {
+        let pool = WorkerPool::new();
+
+        let unhealthy = make_worker("unhealthy", 8, 95.0);
+        unhealthy.record_failure(None).await;
+        pool.add_worker_state(unhealthy).await;
+
+        let selector = WorkerSelector::with_config(
+            SelectionConfig {
+                strategy: SelectionStrategy::Fastest,
+                min_success_rate: 0.8,
+                ..Default::default()
+            },
+            CircuitBreakerConfig::default(),
+        );
+
+        let request = SelectionRequest {
+            project: "test-project".to_string(),
+            command: None,
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 2,
+            preferred_workers: vec![],
+            toolchain: None,
+            required_runtime: RequiredRuntime::default(),
+            classification_duration_us: None,
+            hook_pid: None,
+        };
+
+        let result = selector.select(&pool, &request).await;
+        assert!(result.worker.is_none());
+        assert_eq!(result.reason, SelectionReason::NoWorkersPassedHealth);
+    }
+
+    #[tokio::test]
+    async fn test_preferred_worker_overrides_health_fallback_threshold() {
+        let pool = WorkerPool::new();
+
+        let preferred = make_worker("preferred", 8, 95.0);
+        preferred.record_failure(None).await;
+        pool.add_worker_state(preferred).await;
+
+        let fallback = make_worker("fallback", 8, 40.0);
+        fallback.record_success().await;
+        pool.add_worker_state(fallback).await;
+
+        let selector = WorkerSelector::with_config(
+            SelectionConfig {
+                strategy: SelectionStrategy::Fastest,
+                min_success_rate: 0.8,
+                ..Default::default()
+            },
+            CircuitBreakerConfig::default(),
+        );
+
+        let request = SelectionRequest {
+            project: "test-project".to_string(),
+            command: None,
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 2,
+            preferred_workers: vec![WorkerId::new("preferred")],
+            toolchain: None,
+            required_runtime: RequiredRuntime::default(),
+            classification_duration_us: None,
+            hook_pid: None,
+        };
+
+        let result = selector.select(&pool, &request).await;
+        let selected = result.worker.expect("Expected preferred worker");
+        assert_eq!(selected.config.read().await.id.as_str(), "preferred");
+    }
+
+    #[test]
+    fn test_toolchain_capability_mismatch_for_floating_channels() {
+        let local = ToolchainInfo {
+            channel: "nightly".to_string(),
+            date: None,
+            full_version: "rustc 1.97.0-nightly (abcdef 2026-05-01)".to_string(),
+        };
+        let caps = WorkerCapabilities {
+            rustc_version: Some("rustc 1.95.0-nightly (abcdef 2026-03-01)".to_string()),
+            ..Default::default()
+        };
+        assert!(toolchain_capability_mismatch(Some(&local), &caps).is_some());
+
+        let dated = ToolchainInfo {
+            date: Some("2026-05-01".to_string()),
+            ..local
+        };
+        assert!(toolchain_capability_mismatch(Some(&dated), &caps).is_none());
     }
 
     #[tokio::test]
