@@ -685,23 +685,23 @@ fn is_pre_tool_use_rch(line: &str) -> bool {
 
     let value = value.trim();
 
-    // Handle string format: pre_tool_use = "rch"
+    // Handle string format: pre_tool_use = "rch" or "/abs/path/to/rch"
     if value.starts_with('"') || value.starts_with('\'') {
         let unquoted = value.trim_matches('"').trim_matches('\'');
-        return unquoted == "rch";
+        return is_rch_hook_command(unquoted);
     }
 
-    // Handle array format: pre_tool_use = ["rch", "other"]
+    // Handle array format: pre_tool_use = ["rch", "other"] or ["/abs/path/to/rch", ...]
     if value.starts_with('[') && value.ends_with(']') {
         let inner = &value[1..value.len() - 1];
         return inner.split(',').any(|item| {
             let item = item.trim().trim_matches('"').trim_matches('\'');
-            item == "rch"
+            is_rch_hook_command(item)
         });
     }
 
     // Bare word (unlikely but handle it)
-    value == "rch"
+    is_rch_hook_command(value)
 }
 
 fn ensure_trailing_newline(content: String) -> String {
@@ -867,6 +867,83 @@ mod tests {
     fn is_rch_hook_command_rejects_empty() {
         assert!(!is_rch_hook_command(""));
         assert!(!is_rch_hook_command("   "));
+    }
+
+    // ===== TEST: is_pre_tool_use_rch (codex CLI hook detector) =====
+
+    #[test]
+    fn is_pre_tool_use_rch_string_bare() {
+        assert!(is_pre_tool_use_rch(r#"pre_tool_use = "rch""#));
+        assert!(is_pre_tool_use_rch(r#"pre_tool_use = 'rch'"#));
+    }
+
+    #[test]
+    fn is_pre_tool_use_rch_string_absolute_path() {
+        // Regression for #11: absolute paths must match. Sanitized environments
+        // (systemd units, sandboxes) often have a bare PATH that doesn't include
+        // ~/.local/bin, so users legitimately configure pre_tool_use as an absolute
+        // path. The previous exact-string equality rejected these, causing
+        // status/install/uninstall to silently misbehave.
+        assert!(is_pre_tool_use_rch(
+            r#"pre_tool_use = "/home/user/.local/bin/rch""#
+        ));
+        assert!(is_pre_tool_use_rch(
+            r#"pre_tool_use = "/usr/local/bin/rch""#
+        ));
+        assert!(is_pre_tool_use_rch(r#"pre_tool_use = "/opt/rch/bin/rch""#));
+    }
+
+    #[test]
+    fn is_pre_tool_use_rch_array_bare() {
+        assert!(is_pre_tool_use_rch(r#"pre_tool_use = ["rch"]"#));
+        assert!(is_pre_tool_use_rch(r#"pre_tool_use = ["rch", "other"]"#));
+    }
+
+    #[test]
+    fn is_pre_tool_use_rch_array_absolute_path() {
+        // Regression for #11: absolute paths inside array form must also match.
+        assert!(is_pre_tool_use_rch(
+            r#"pre_tool_use = ["/home/user/.local/bin/rch"]"#
+        ));
+        assert!(is_pre_tool_use_rch(
+            r#"pre_tool_use = ["/usr/local/bin/rch", "other"]"#
+        ));
+        assert!(is_pre_tool_use_rch(
+            r#"pre_tool_use = ["other", "/opt/rch/bin/rch"]"#
+        ));
+    }
+
+    #[test]
+    fn is_pre_tool_use_rch_rejects_substring_false_positives() {
+        // The false-positive cases that motivated is_rch_hook_command's basename
+        // matching also apply here — pre_tool_use="search" or "rch-wrapper" must
+        // NOT match, otherwise install/uninstall would clobber unrelated hooks.
+        assert!(!is_pre_tool_use_rch(r#"pre_tool_use = "search""#));
+        assert!(!is_pre_tool_use_rch(r#"pre_tool_use = "/usr/bin/search""#));
+        assert!(!is_pre_tool_use_rch(r#"pre_tool_use = "rch-wrapper""#));
+        assert!(!is_pre_tool_use_rch(r#"pre_tool_use = "/usr/bin/rchd""#));
+        assert!(!is_pre_tool_use_rch(r#"pre_tool_use = ["search"]"#));
+        assert!(!is_pre_tool_use_rch(r#"pre_tool_use = ["rch-wrapper"]"#));
+    }
+
+    #[test]
+    fn is_pre_tool_use_rch_bare_word_absolute_path() {
+        // Bare-word value (no quotes) — uncommon but historically supported.
+        assert!(is_pre_tool_use_rch("pre_tool_use = rch"));
+        assert!(is_pre_tool_use_rch(
+            "pre_tool_use = /home/user/.local/bin/rch"
+        ));
+        assert!(!is_pre_tool_use_rch("pre_tool_use = search"));
+    }
+
+    #[test]
+    fn is_pre_tool_use_rch_ignores_comment_lines() {
+        // Lines fully commented out, or with the value before a `#`.
+        assert!(!is_pre_tool_use_rch(r#"# pre_tool_use = "rch""#));
+        assert!(is_pre_tool_use_rch(r#"pre_tool_use = "rch"  # codex hook"#));
+        assert!(is_pre_tool_use_rch(
+            r#"pre_tool_use = "/home/user/.local/bin/rch"  # absolute path for sandbox"#
+        ));
     }
 
     // ===== TEST: HookStatus =====
