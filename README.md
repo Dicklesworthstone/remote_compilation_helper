@@ -234,6 +234,7 @@ rch robot-docs guide
 ```bash
 rch config show|get|set|reset|init|validate|lint|doctor|edit|diff|export
 rch doctor [--fix] [--dry-run]
+rch doctor --reliability [--check-schemas] [--json]
 rch self-test [--worker <id>|--all]
 rch self-test status
 rch self-test history --limit 10

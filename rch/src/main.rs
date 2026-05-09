@@ -455,6 +455,8 @@ INSTALL LOCATIONS:
     rch doctor              # Run all diagnostic checks
     rch doctor --fix        # Attempt to fix safe issues
     rch doctor --fix --dry-run  # Show what would be fixed
+    rch doctor --reliability  # Inspect fleet reliability and remediation posture
+    rch doctor --reliability --check-schemas --json
     rch doctor -v           # Show detailed output
     rch doctor --json       # Output as JSON for scripting
 
@@ -464,7 +466,8 @@ CHECKS PERFORMED:
     SSH Keys        - Identity files exist with correct permissions
     Daemon          - Socket exists and responds
     Hooks           - Claude Code hook installed
-    Workers         - Connectivity (with --verbose)"#)]
+    Workers         - Connectivity (with --verbose)
+    Reliability     - topology, repo convergence, disk pressure, process debt"#)]
     Doctor {
         /// Attempt to fix safe issues (e.g., key permissions)
         #[arg(long)]
@@ -477,6 +480,14 @@ CHECKS PERFORMED:
         /// Allow installing missing prerequisites (requires confirmation)
         #[arg(long)]
         install_deps: bool,
+
+        /// Run reliability-focused diagnostics instead of the general doctor suite
+        #[arg(long)]
+        reliability: bool,
+
+        /// Include schema compatibility checks in reliability mode
+        #[arg(long)]
+        check_schemas: bool,
     },
 
     /// Verify remote compilation by running a self-test
@@ -1529,7 +1540,9 @@ async fn main() -> Result<()> {
                 fix,
                 dry_run,
                 install_deps,
-            } => handle_doctor(fix, dry_run, install_deps, &ctx).await,
+                reliability,
+                check_schemas,
+            } => handle_doctor(fix, dry_run, install_deps, reliability, check_schemas, &ctx).await,
             Commands::SelfTest {
                 action,
                 worker,
@@ -2657,6 +2670,8 @@ async fn handle_doctor(
     fix: bool,
     dry_run: bool,
     install_deps: bool,
+    reliability: bool,
+    check_schemas: bool,
     ctx: &OutputContext,
 ) -> Result<()> {
     use crate::doctor::DoctorOptions;
@@ -2664,6 +2679,8 @@ async fn handle_doctor(
         fix,
         dry_run,
         install_deps,
+        reliability,
+        check_schemas,
         verbose: ctx.is_verbose(),
     };
     crate::doctor::run_doctor(ctx, options).await
@@ -3719,10 +3736,14 @@ mod tests {
                 fix,
                 dry_run,
                 install_deps,
+                reliability,
+                check_schemas,
             }) => {
                 assert!(!fix);
                 assert!(!dry_run);
                 assert!(!install_deps);
+                assert!(!reliability);
+                assert!(!check_schemas);
             }
             _ => panic!("Expected doctor command"),
         }
@@ -3737,10 +3758,14 @@ mod tests {
                 fix,
                 dry_run,
                 install_deps,
+                reliability,
+                check_schemas,
             }) => {
                 assert!(fix);
                 assert!(!dry_run);
                 assert!(!install_deps);
+                assert!(!reliability);
+                assert!(!check_schemas);
             }
             _ => panic!("Expected doctor command"),
         }
@@ -3755,10 +3780,14 @@ mod tests {
                 fix,
                 dry_run,
                 install_deps,
+                reliability,
+                check_schemas,
             }) => {
                 assert!(!fix);
                 assert!(dry_run);
                 assert!(!install_deps);
+                assert!(!reliability);
+                assert!(!check_schemas);
             }
             _ => panic!("Expected doctor command"),
         }
@@ -3773,10 +3802,59 @@ mod tests {
                 fix,
                 dry_run,
                 install_deps,
+                reliability,
+                check_schemas,
             }) => {
                 assert!(!fix);
                 assert!(!dry_run);
                 assert!(install_deps);
+                assert!(!reliability);
+                assert!(!check_schemas);
+            }
+            _ => panic!("Expected doctor command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_doctor_reliability() {
+        let _guard = test_guard!();
+        let cli = Cli::try_parse_from(["rch", "doctor", "--reliability"]).unwrap();
+        match cli.command {
+            Some(Commands::Doctor {
+                fix,
+                dry_run,
+                install_deps,
+                reliability,
+                check_schemas,
+            }) => {
+                assert!(!fix);
+                assert!(!dry_run);
+                assert!(!install_deps);
+                assert!(reliability);
+                assert!(!check_schemas);
+            }
+            _ => panic!("Expected doctor command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_doctor_reliability_schema_check() {
+        let _guard = test_guard!();
+        let cli =
+            Cli::try_parse_from(["rch", "doctor", "--reliability", "--check-schemas"]).unwrap();
+        match cli.command {
+            Some(Commands::Doctor {
+                fix,
+                dry_run,
+                install_deps,
+                reliability,
+                check_schemas,
+            }) => {
+                assert!(!fix);
+                assert!(!dry_run);
+                assert!(!install_deps);
+                assert!(reliability);
+                assert!(check_schemas);
             }
             _ => panic!("Expected doctor command"),
         }

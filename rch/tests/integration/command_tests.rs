@@ -162,7 +162,82 @@ fn test_doctor_subcommand_help() {
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     assert_contains(&stdout, "doctor");
+    assert_contains(&stdout, "--reliability");
+    assert_contains(&stdout, "--check-schemas");
     crate::test_log!("TEST PASS: test_doctor_subcommand_help");
+}
+
+#[test]
+fn test_doctor_reliability_json_outputs_real_binary_response() {
+    init_test_logging();
+    crate::test_log!("TEST START: test_doctor_reliability_json_outputs_real_binary_response");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_rch"))
+        .args(["doctor", "--reliability", "--check-schemas", "--json"])
+        .output()
+        .expect("Failed to run rch doctor --reliability --check-schemas --json");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "rch doctor --reliability should exit successfully; status={:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        stdout,
+        stderr
+    );
+
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("reliability doctor should output JSON");
+    assert_eq!(
+        parsed
+            .pointer("/data/schema_version")
+            .and_then(|value| value.as_str()),
+        Some("1.0.0")
+    );
+    assert_eq!(
+        parsed
+            .pointer("/data/mode")
+            .and_then(|value| value.as_str()),
+        Some("check")
+    );
+
+    let diagnostics = parsed
+        .pointer("/data/diagnostics")
+        .and_then(|value| value.as_array())
+        .expect("reliability doctor data should include diagnostics");
+    assert!(
+        !diagnostics.is_empty(),
+        "reliability doctor should report at least one diagnostic"
+    );
+    assert!(
+        parsed
+            .pointer("/data/remediation_plan")
+            .and_then(|value| value.as_array())
+            .is_some(),
+        "reliability doctor data should include remediation_plan"
+    );
+
+    let categories = diagnostics
+        .iter()
+        .filter_map(|diagnostic| diagnostic.get("category").and_then(|value| value.as_str()))
+        .collect::<Vec<_>>();
+    for expected in [
+        "topology",
+        "repo_presence",
+        "disk_pressure",
+        "process_debt",
+        "helper_compatibility",
+        "rollout_posture",
+        "schema_compatibility",
+    ] {
+        assert!(
+            categories.contains(&expected),
+            "missing reliability category {expected}; categories={categories:?}"
+        );
+    }
+
+    crate::test_log!("TEST PASS: test_doctor_reliability_json_outputs_real_binary_response");
 }
 
 #[test]
