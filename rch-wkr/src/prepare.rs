@@ -145,10 +145,7 @@ async fn read_cached_fingerprint(project_root: &Path) -> Option<DependencyFinger
     serde_json::from_slice(&bytes).ok()
 }
 
-async fn write_cached_fingerprint(
-    project_root: &Path,
-    fp: &DependencyFingerprint,
-) -> Result<()> {
+async fn write_cached_fingerprint(project_root: &Path, fp: &DependencyFingerprint) -> Result<()> {
     let path = project_root.join(FINGERPRINT_FILE);
     let bytes = serde_json::to_vec(fp).context("serialize fingerprint")?;
     tokio::fs::write(&path, bytes)
@@ -258,15 +255,16 @@ async fn prepare_node_like(
     // When runtime=Bun and we picked Bun via the runtime hint above, the
     // project likely has no lockfile yet — so `--frozen-lockfile` would
     // fail. Use a permissive install in that case.
-    let cmd = if pm == PackageManager::Bun
-        && !project_root.join("bun.lockb").exists()
-    {
+    let cmd = if pm == PackageManager::Bun && !project_root.join("bun.lockb").exists() {
         vec!["bun".into(), "install".into()]
     } else {
         pm.install_command()
     };
     tokio::fs::create_dir_all(log_dir).await.ok();
-    let log_path = log_dir.join(format!("prepare_{}.log", &fingerprint.hash[..16.min(fingerprint.hash.len())]));
+    let log_path = log_dir.join(format!(
+        "prepare_{}.log",
+        &fingerprint.hash[..16.min(fingerprint.hash.len())]
+    ));
     let log_file = std::fs::File::create(&log_path)
         .with_context(|| format!("create install log at {}", log_path.display()))?;
 
@@ -354,7 +352,11 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         make_node_project(tmp.path(), r#"{"name":"x","version":"0.0.1"}"#, None);
         let fp1 = compute_fingerprint(tmp.path()).await.unwrap();
-        std::fs::write(tmp.path().join("package.json"), r#"{"name":"x","version":"0.0.2"}"#).unwrap();
+        std::fs::write(
+            tmp.path().join("package.json"),
+            r#"{"name":"x","version":"0.0.2"}"#,
+        )
+        .unwrap();
         let fp2 = compute_fingerprint(tmp.path()).await.unwrap();
         assert_ne!(fp1.hash, fp2.hash);
         // TEST PASS
@@ -521,7 +523,11 @@ mod tests {
         // TEST START: cache miss fires install (will Fail since no `bun` is
         // available in CI; we assert the action is one of Installed | Failed).
         let tmp = TempDir::new().unwrap();
-        make_node_project(tmp.path(), r#"{"name":"x"}"#, Some(("bun.lockb", "fake-lockfile-bytes-for-test")));
+        make_node_project(
+            tmp.path(),
+            r#"{"name":"x"}"#,
+            Some(("bun.lockb", "fake-lockfile-bytes-for-test")),
+        );
         let log_dir = tmp.path().join("logs");
         let report = prepare(tmp.path(), RequiredRuntime::Bun, &log_dir).await;
         // We don't require bun to be installed in the test environment; the
@@ -542,7 +548,9 @@ mod tests {
                 // bun may not be in PATH; spawn() returns NotFound. Acceptable.
                 let msg = e.to_string();
                 assert!(
-                    msg.contains("spawn") || msg.contains("No such file") || msg.contains("not found"),
+                    msg.contains("spawn")
+                        || msg.contains("No such file")
+                        || msg.contains("not found"),
                     "unexpected error: {}",
                     msg
                 );

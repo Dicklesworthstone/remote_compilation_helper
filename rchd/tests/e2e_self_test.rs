@@ -222,7 +222,13 @@ async fn test_verify_compilation_on_worker_e2e() {
     let ssh_target = format!("{}@{}", worker.user, worker.host);
     // Use `find /tmp/rch -name '*.o' -path "*worker_verify_test*" 2>/dev/null | head -5`
     let ssh_probe = Command::new("ssh")
-        .args(["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no", "-i"])
+        .args([
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-i",
+        ])
         .arg(&identity)
         .arg(&ssh_target)
         .arg("find /tmp/rch -name '*.o' 2>/dev/null | head -5")
@@ -284,7 +290,11 @@ async fn test_complete_self_test_workflow_e2e() {
     info!("[e2e::self_test] step=3 description=advance_mtime");
     sleep(Duration::from_millis(1100)).await;
     let main_rs = temp_dir.path().join("src/main.rs");
-    let _ = Command::new("touch").arg(&main_rs).status().await.expect("touch");
+    let _ = Command::new("touch")
+        .arg(&main_rs)
+        .status()
+        .await
+        .expect("touch");
 
     // ---- Step 4: rebuild after change ----
     info!("[e2e::self_test] step=4 description=rebuild_after_change");
