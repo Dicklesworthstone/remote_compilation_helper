@@ -1474,6 +1474,9 @@ async fn main() -> Result<()> {
         ..Default::default()
     };
     let ctx = Arc::new(OutputContext::new(output_config));
+    if ctx.is_verbose() {
+        tracing::debug!(target: "rch::verbose", mode = ?ctx.mode(), format = %ctx.format(), "verbose output enabled");
+    }
 
     // Agent-oriented mega-command. Handle before hook mode so `rch --robot-triage`
     // never waits for stdin when an agent is asking what to do next.

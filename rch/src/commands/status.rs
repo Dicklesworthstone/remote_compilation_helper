@@ -8,13 +8,13 @@ use crate::hook::{
     required_runtime_for_kind,
 };
 use crate::status_types::{
-    DaemonFullStatusResponse, SelfTestHistoryResponseFromApi, SelfTestRunResponseFromApi,
-    SelfTestStatusResponseFromApi, extract_json_body,
+    DaemonFullStatusResponse, SelfTestHistoryResponseFromApi, SelfTestResultRecordFromApi,
+    SelfTestRunResponseFromApi, SelfTestStatusResponseFromApi, extract_json_body,
 };
 use crate::toolchain::detect_toolchain;
 use crate::ui::context::OutputContext;
 use crate::ui::progress::Spinner;
-use crate::ui::theme::StatusIndicator;
+use crate::ui::theme::{StatusIndicator, Theme};
 use anyhow::{Context, Result};
 use rch_common::{
     ApiResponse, CommandPriority, RequiredRuntime, normalize_project_path_with_policy,
@@ -1064,36 +1064,10 @@ async fn self_test_run(
             detail
         );
 
-        // Verbose mode: show timing breakdown and additional info
         if ctx.is_verbose() {
-            if result.passed {
-                // Calculate speedup
-                if let (Some(remote), Some(local)) = (result.remote_time_ms, result.local_time_ms) {
-                    let speedup = if remote > 0 {
-                        local as f64 / remote as f64
-                    } else {
-                        1.0
-                    };
-                    println!("      {} {:.1}x speedup", style.muted("→"), speedup);
-                    // Show hash comparison in verbose mode
-                    if let (Some(local_hash), Some(remote_hash)) =
-                        (&result.local_hash, &result.remote_hash)
-                    {
-                        let hash_match = if local_hash == remote_hash {
-                            style.success("match")
-                        } else {
-                            style.error("MISMATCH")
-                        };
-                        println!("      {} hash {}", style.muted("→"), hash_match);
-                    }
-                }
-            } else {
-                // For failed tests, show more error context
-                if let Some(ref err) = result.error
-                    && err.len() > 50
-                {
-                    println!("      {} {}", style.muted("error:"), style.error(err));
-                }
+            debug!(target: "rch::verbose", worker_id = %result.worker_id, "rendering verbose self-test result details");
+            for line in render_self_test_result_verbose_lines(result, style) {
+                println!("{line}");
             }
         }
     }
@@ -1120,6 +1094,48 @@ async fn self_test_run(
     );
 
     Ok(())
+}
+
+fn render_self_test_result_verbose_lines(
+    result: &SelfTestResultRecordFromApi,
+    style: &Theme,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+
+    if result.passed {
+        if let (Some(remote), Some(local)) = (result.remote_time_ms, result.local_time_ms) {
+            let speedup = if remote > 0 {
+                local as f64 / remote as f64
+            } else {
+                1.0
+            };
+            lines.push(format!(
+                "      {} {:.1}x speedup",
+                style.muted("→"),
+                speedup
+            ));
+
+            if let (Some(local_hash), Some(remote_hash)) = (&result.local_hash, &result.remote_hash)
+            {
+                let hash_match = if local_hash == remote_hash {
+                    style.success("match")
+                } else {
+                    style.error("MISMATCH")
+                };
+                lines.push(format!("      {} hash {}", style.muted("→"), hash_match));
+            }
+        }
+    } else if let Some(ref err) = result.error
+        && err.len() > 50
+    {
+        lines.push(format!(
+            "      {} {}",
+            style.muted("error:"),
+            style.error(err)
+        ));
+    }
+
+    lines
 }
 
 // =============================================================================
@@ -1205,9 +1221,7 @@ pub async fn status_overview(workers: bool, jobs: bool, ctx: &OutputContext) -> 
         return Ok(());
     }
 
-    // In verbose mode, always show all sections (workers and jobs)
-    let show_workers = workers || ctx.is_verbose();
-    let show_jobs = jobs || ctx.is_verbose();
+    let (show_workers, show_jobs) = status_overview_section_flags(workers, jobs, ctx);
 
     crate::status_display::render_full_status(
         &status,
@@ -1219,62 +1233,74 @@ pub async fn status_overview(workers: bool, jobs: bool, ctx: &OutputContext) -> 
         ctx.style(),
     );
 
-    // Verbose mode: show additional details not in standard display
     if ctx.is_verbose() {
-        let style = ctx.theme();
-        println!();
-        println!("{}", style.format_header("Verbose Details"));
-        println!();
-
-        // Config source info
-        println!(
-            "  {} {} {}",
-            style.key("Socket"),
-            style.muted(":"),
-            style.value(&status.daemon.socket_path)
-        );
-        println!(
-            "  {} {} {}",
-            style.key("Started"),
-            style.muted(":"),
-            style.value(&status.daemon.started_at)
-        );
-
-        // Show alerts if any
-        if !status.alerts.is_empty() {
-            println!();
-            println!("  {}", style.key("Active Alerts:"));
-            for alert in &status.alerts {
-                let severity_style = match alert.severity.as_str() {
-                    "critical" | "error" => style.error(&alert.severity),
-                    "warning" => style.warning(&alert.severity),
-                    _ => style.info(&alert.severity),
-                };
-                println!(
-                    "    {} [{}] {}",
-                    severity_style,
-                    style.muted(&alert.created_at),
-                    style.value(&alert.message)
-                );
-            }
-        }
-
-        // Show issues if any
-        if !status.issues.is_empty() {
-            println!();
-            println!("  {}", style.key("Known Issues:"));
-            for issue in &status.issues {
-                println!(
-                    "    {} {} - {}",
-                    style.warning("⚠"),
-                    style.key(&issue.summary),
-                    style.muted(issue.remediation.as_deref().unwrap_or(""))
-                );
-            }
+        debug!(target: "rch::verbose", "rendering verbose status details");
+        for line in render_status_verbose_detail_lines(&status, ctx.theme()) {
+            println!("{line}");
         }
     }
 
     Ok(())
+}
+
+fn status_overview_section_flags(workers: bool, jobs: bool, ctx: &OutputContext) -> (bool, bool) {
+    (workers || ctx.is_verbose(), jobs || ctx.is_verbose())
+}
+
+fn render_status_verbose_detail_lines(
+    status: &DaemonFullStatusResponse,
+    style: &Theme,
+) -> Vec<String> {
+    let mut lines = vec![
+        String::new(),
+        style.format_header("Verbose Details"),
+        String::new(),
+        format!(
+            "  {} {} {}",
+            style.key("Socket"),
+            style.muted(":"),
+            style.value(&status.daemon.socket_path)
+        ),
+        format!(
+            "  {} {} {}",
+            style.key("Started"),
+            style.muted(":"),
+            style.value(&status.daemon.started_at)
+        ),
+    ];
+
+    if !status.alerts.is_empty() {
+        lines.push(String::new());
+        lines.push(format!("  {}", style.key("Active Alerts:")));
+        for alert in &status.alerts {
+            let severity_style = match alert.severity.as_str() {
+                "critical" | "error" => style.error(&alert.severity),
+                "warning" => style.warning(&alert.severity),
+                _ => style.info(&alert.severity),
+            };
+            lines.push(format!(
+                "    {} [{}] {}",
+                severity_style,
+                style.muted(&alert.created_at),
+                style.value(&alert.message)
+            ));
+        }
+    }
+
+    if !status.issues.is_empty() {
+        lines.push(String::new());
+        lines.push(format!("  {}", style.key("Known Issues:")));
+        for issue in &status.issues {
+            lines.push(format!(
+                "    {} {} - {}",
+                style.warning("⚠"),
+                style.key(&issue.summary),
+                style.muted(issue.remediation.as_deref().unwrap_or(""))
+            ));
+        }
+    }
+
+    lines
 }
 
 // =============================================================================
@@ -1615,4 +1641,120 @@ pub async fn check(ctx: &OutputContext) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::context::OutputConfig;
+    use crate::ui::writer::SharedOutputBuffer;
+
+    fn make_context(config: OutputConfig) -> OutputContext {
+        let stdout = SharedOutputBuffer::new().as_writer(true);
+        let stderr = SharedOutputBuffer::new().as_writer(true);
+        OutputContext::with_writers(config, stdout, stderr)
+    }
+
+    fn make_daemon_status() -> DaemonFullStatusResponse {
+        serde_json::from_value(serde_json::json!({
+            "daemon": {
+                "pid": 123,
+                "uptime_secs": 45,
+                "version": "test",
+                "socket_path": "/tmp/rch.sock",
+                "started_at": "2026-01-01T00:00:00Z",
+                "workers_total": 1,
+                "workers_healthy": 1,
+                "slots_total": 8,
+                "slots_available": 6
+            },
+            "workers": [],
+            "active_builds": [],
+            "recent_builds": [],
+            "issues": [{
+                "severity": "warning",
+                "summary": "worker pressure",
+                "remediation": "run rch workers probe --all"
+            }],
+            "alerts": [{
+                "id": "alert-1",
+                "kind": "worker",
+                "severity": "warning",
+                "message": "worker degraded",
+                "worker_id": "builder-1",
+                "created_at": "2026-01-01T00:00:30Z"
+            }],
+            "stats": {
+                "total_builds": 0,
+                "success_count": 0,
+                "failure_count": 0,
+                "remote_count": 0,
+                "local_count": 0,
+                "avg_duration_ms": 0
+            }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn test_status_verbose_includes_worker_details() {
+        let normal_ctx = make_context(OutputConfig::default());
+        assert_eq!(
+            status_overview_section_flags(false, false, &normal_ctx),
+            (false, false)
+        );
+
+        let verbose_ctx = make_context(OutputConfig {
+            verbose: true,
+            ..Default::default()
+        });
+        assert_eq!(
+            status_overview_section_flags(false, false, &verbose_ctx),
+            (true, true)
+        );
+
+        let style = crate::ui::theme::Style::new(false, true, false);
+        let output = render_status_verbose_detail_lines(&make_daemon_status(), &style).join("\n");
+        assert!(output.contains("Verbose Details"));
+        assert!(output.contains("Socket"));
+        assert!(output.contains("/tmp/rch.sock"));
+        assert!(output.contains("Started"));
+        assert!(output.contains("Active Alerts"));
+        assert!(output.contains("Known Issues"));
+    }
+
+    #[test]
+    fn test_self_test_verbose_shows_each_step() {
+        let style = crate::ui::theme::Style::new(false, true, false);
+        let passed: SelfTestResultRecordFromApi = serde_json::from_value(serde_json::json!({
+            "run_id": 1,
+            "worker_id": "builder-1",
+            "passed": true,
+            "local_hash": "abc",
+            "remote_hash": "abc",
+            "local_time_ms": 4000,
+            "remote_time_ms": 1000,
+            "error": null
+        }))
+        .unwrap();
+        let failed: SelfTestResultRecordFromApi = serde_json::from_value(serde_json::json!({
+            "run_id": 1,
+            "worker_id": "builder-2",
+            "passed": false,
+            "local_hash": null,
+            "remote_hash": null,
+            "local_time_ms": null,
+            "remote_time_ms": null,
+            "error": "this is a deliberately long worker self-test error message for verbose context"
+        }))
+        .unwrap();
+
+        let passed_output = render_self_test_result_verbose_lines(&passed, &style).join("\n");
+        assert!(passed_output.contains("4.0x speedup"));
+        assert!(passed_output.contains("hash match"));
+
+        let failed_output = render_self_test_result_verbose_lines(&failed, &style).join("\n");
+        assert!(failed_output.contains("error:"));
+        assert!(failed_output.contains("deliberately long"));
+    }
 }

@@ -791,6 +791,63 @@ mod tests {
     }
 
     #[test]
+    fn test_verbose_and_json_both_work() {
+        log_test_start("test_verbose_and_json_both_work");
+        let config = OutputConfig {
+            json: true,
+            verbose: true,
+            ..Default::default()
+        };
+        let (ctx, stdout_buf, stderr_buf) = make_test_context(config);
+
+        assert!(ctx.is_json());
+        assert!(ctx.is_verbose());
+
+        #[derive(Serialize)]
+        struct TestData {
+            mode: &'static str,
+        }
+
+        ctx.debug("hidden debug detail");
+        let json_result = ctx.json(&TestData {
+            mode: "verbose-json",
+        });
+        assert!(json_result.is_ok());
+
+        let output = stdout_buf.to_string_lossy();
+        let parsed_result = serde_json::from_str::<serde_json::Value>(&output);
+        assert!(
+            parsed_result.is_ok(),
+            "verbose JSON output should be valid JSON: {output}"
+        );
+        let parsed = parsed_result.unwrap_or(serde_json::Value::Null);
+        assert_eq!(parsed["mode"], "verbose-json");
+        assert!(stderr_buf.to_string_lossy().is_empty());
+    }
+
+    #[test]
+    fn test_verbose_and_quiet_conflict_handling() {
+        log_test_start("test_verbose_and_quiet_conflict_handling");
+        let config = OutputConfig {
+            verbose: true,
+            quiet: true,
+            ..Default::default()
+        };
+        let (ctx, _, stderr_buf) = make_test_context(config);
+
+        assert!(ctx.is_quiet());
+        assert!(!ctx.is_verbose());
+
+        ctx.debug("hidden debug detail");
+        ctx.info("hidden info detail");
+        assert!(stderr_buf.to_string_lossy().is_empty());
+
+        ctx.error("visible error detail");
+        let output = stderr_buf.to_string_lossy();
+        assert!(output.contains("visible error detail"));
+    }
+
+    #[test]
     fn test_quiet_mode_suppresses_info() {
         log_test_start("test_quiet_mode_suppresses_info");
         let config = OutputConfig {

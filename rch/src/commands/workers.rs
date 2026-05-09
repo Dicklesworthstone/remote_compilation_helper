@@ -20,7 +20,8 @@ use crate::status_types::{
 };
 use crate::ui::context::OutputContext;
 use crate::ui::progress::MultiProgressManager;
-use crate::ui::theme::StatusIndicator;
+use crate::ui::theme::{StatusIndicator, Theme};
+use tracing::debug;
 
 use super::helpers::{
     classify_ssh_error, default_socket_path, format_ssh_report, indent_lines,
@@ -229,6 +230,108 @@ pub(super) fn collect_local_capability_warnings(
     warnings
 }
 
+fn workers_list_verbose_enabled(ctx: &OutputContext) -> bool {
+    ctx.is_verbose() && !ctx.is_json()
+}
+
+fn render_worker_verbose_lines(
+    worker: &WorkerConfig,
+    daemon_status: Option<&DaemonFullStatusResponse>,
+    style: &Theme,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+
+    if let Some(status) = daemon_status {
+        if let Some(worker_status) = status.workers.iter().find(|w| w.id == worker.id.as_str()) {
+            let circuit_display = match worker_status.circuit_state.as_str() {
+                "closed" => style.success("Closed"),
+                "half_open" => style.warning("HalfOpen"),
+                "open" => style.error("Open"),
+                other => style.muted(other),
+            };
+            lines.push(format!(
+                "    {} {} {}",
+                style.key("Circuit"),
+                style.muted(":"),
+                circuit_display
+            ));
+
+            let slots_display = if worker_status.used_slots > 0 {
+                style.warning(&format!(
+                    "{}/{}",
+                    worker_status.used_slots, worker_status.total_slots
+                ))
+            } else {
+                style.success(&format!(
+                    "{}/{}",
+                    worker_status.used_slots, worker_status.total_slots
+                ))
+            };
+            lines.push(format!(
+                "    {} {} {}",
+                style.key("In Use"),
+                style.muted(":"),
+                slots_display
+            ));
+
+            let status_display = match worker_status.status.as_str() {
+                "healthy" => style.success("Healthy"),
+                "degraded" => style.warning("Degraded"),
+                "unreachable" => style.error("Unreachable"),
+                "draining" => style.warning("Draining"),
+                "drained" => style.info("Drained"),
+                "disabled" => style.muted("Disabled"),
+                other => style.muted(other),
+            };
+            lines.push(format!(
+                "    {} {} {}",
+                style.key("Status"),
+                style.muted(":"),
+                status_display
+            ));
+
+            if let Some(ref last_error) = worker_status.last_error {
+                lines.push(format!(
+                    "    {} {} {}",
+                    style.key("LastErr"),
+                    style.muted(":"),
+                    style.error(last_error)
+                ));
+            }
+
+            if let Some(recovery_secs) = worker_status.recovery_in_secs {
+                lines.push(format!(
+                    "    {} {} {}s",
+                    style.key("Recover"),
+                    style.muted(":"),
+                    style.info(&recovery_secs.to_string())
+                ));
+            }
+        } else {
+            lines.push(format!(
+                "    {} {}",
+                style.muted("Live status:"),
+                style.muted("(not in daemon)")
+            ));
+        }
+    } else {
+        lines.push(format!(
+            "    {} {}",
+            style.muted("Live status:"),
+            style.muted("(daemon not running)")
+        ));
+    }
+
+    lines.push(format!(
+        "    {} {} {}",
+        style.key("SSH Key"),
+        style.muted(":"),
+        style.muted(&worker.identity_file)
+    ));
+
+    lines
+}
+
 #[cfg(test)]
 pub(super) fn summarize_capabilities(capabilities: &WorkerCapabilities) -> String {
     let mut parts = Vec::new();
@@ -296,7 +399,8 @@ pub async fn workers_list(show_speedscore: bool, ctx: &OutputContext) -> Result<
     };
 
     // In verbose mode, fetch live daemon status for circuit breaker state, slot usage, etc.
-    let daemon_status = if ctx.is_verbose() {
+    let daemon_status = if workers_list_verbose_enabled(ctx) {
+        debug!(target: "rch::verbose", "fetching daemon status for verbose workers list");
         match send_daemon_command("GET /status\n").await {
             Ok(response) => extract_json_body(&response)
                 .and_then(|json| serde_json::from_str::<DaemonFullStatusResponse>(json).ok()),
@@ -400,103 +504,11 @@ pub async fn workers_list(show_speedscore: bool, ctx: &OutputContext) -> Result<
             );
         }
 
-        // Verbose mode: show live daemon status (circuit breaker, slot usage, etc.)
-        if ctx.is_verbose() {
-            if let Some(ref status) = daemon_status {
-                if let Some(worker_status) =
-                    status.workers.iter().find(|w| w.id == worker.id.as_str())
-                {
-                    // Circuit breaker state
-                    let circuit_display = match worker_status.circuit_state.as_str() {
-                        "closed" => style.success("Closed"),
-                        "half_open" => style.warning("HalfOpen"),
-                        "open" => style.error("Open"),
-                        other => style.muted(other),
-                    };
-                    println!(
-                        "    {} {} {}",
-                        style.key("Circuit"),
-                        style.muted(":"),
-                        circuit_display
-                    );
-
-                    // Slot usage
-                    let slots_display = if worker_status.used_slots > 0 {
-                        style.warning(&format!(
-                            "{}/{}",
-                            worker_status.used_slots, worker_status.total_slots
-                        ))
-                    } else {
-                        style.success(&format!(
-                            "{}/{}",
-                            worker_status.used_slots, worker_status.total_slots
-                        ))
-                    };
-                    println!(
-                        "    {} {} {}",
-                        style.key("In Use"),
-                        style.muted(":"),
-                        slots_display
-                    );
-
-                    // Status
-                    let status_display = match worker_status.status.as_str() {
-                        "healthy" => style.success("Healthy"),
-                        "degraded" => style.warning("Degraded"),
-                        "unreachable" => style.error("Unreachable"),
-                        "draining" => style.warning("Draining"),
-                        "drained" => style.info("Drained"),
-                        "disabled" => style.muted("Disabled"),
-                        other => style.muted(other),
-                    };
-                    println!(
-                        "    {} {} {}",
-                        style.key("Status"),
-                        style.muted(":"),
-                        status_display
-                    );
-
-                    // Show last error if any
-                    if let Some(ref last_error) = worker_status.last_error {
-                        println!(
-                            "    {} {} {}",
-                            style.key("LastErr"),
-                            style.muted(":"),
-                            style.error(last_error)
-                        );
-                    }
-
-                    // Show recovery time if circuit is open
-                    if let Some(recovery_secs) = worker_status.recovery_in_secs {
-                        println!(
-                            "    {} {} {}s",
-                            style.key("Recover"),
-                            style.muted(":"),
-                            style.info(&recovery_secs.to_string())
-                        );
-                    }
-                } else {
-                    println!(
-                        "    {} {}",
-                        style.muted("Live status:"),
-                        style.muted("(not in daemon)")
-                    );
-                }
-            } else {
-                println!(
-                    "    {} {}",
-                    style.muted("Live status:"),
-                    style.muted("(daemon not running)")
-                );
+        if workers_list_verbose_enabled(ctx) {
+            debug!(target: "rch::verbose", worker = %worker.id, "rendering verbose worker details");
+            for line in render_worker_verbose_lines(worker, daemon_status.as_ref(), style) {
+                println!("{line}");
             }
-
-            // Also show SSH key path in verbose mode
-            println!(
-                "    {} {} {}",
-                style.key("SSH Key"),
-                style.muted(":"),
-                style.muted(&worker.identity_file)
-            );
         }
 
         println!();
@@ -1430,6 +1442,9 @@ pub async fn workers_disable(
 #[cfg(test)]
 mod probe_summary_tests {
     use super::*;
+    use crate::ui::context::OutputConfig;
+    use crate::ui::writer::SharedOutputBuffer;
+    use rch_common::WorkerId;
 
     fn mk(status: &str, error_code: Option<&str>, error: Option<&str>) -> WorkerProbeResult {
         WorkerProbeResult {
@@ -1475,5 +1490,100 @@ mod probe_summary_tests {
         assert_eq!(s.total, 0);
         assert_eq!(s.healthy, 0);
         assert!(s.by_error_code.is_empty());
+    }
+
+    fn make_worker() -> WorkerConfig {
+        WorkerConfig {
+            id: WorkerId::new("builder-1"),
+            host: "127.0.0.1".to_string(),
+            user: "ubuntu".to_string(),
+            identity_file: "~/.ssh/rch_test".to_string(),
+            total_slots: 8,
+            priority: 100,
+            tags: vec!["rust".to_string()],
+        }
+    }
+
+    fn make_daemon_status() -> DaemonFullStatusResponse {
+        serde_json::from_value(serde_json::json!({
+            "daemon": {
+                "pid": 123,
+                "uptime_secs": 45,
+                "version": "test",
+                "socket_path": "/tmp/rch.sock",
+                "started_at": "2026-01-01T00:00:00Z",
+                "workers_total": 1,
+                "workers_healthy": 1,
+                "slots_total": 8,
+                "slots_available": 6
+            },
+            "workers": [{
+                "id": "builder-1",
+                "host": "127.0.0.1",
+                "user": "ubuntu",
+                "status": "degraded",
+                "circuit_state": "open",
+                "used_slots": 2,
+                "total_slots": 8,
+                "speed_score": 90.0,
+                "last_error": "ssh timeout",
+                "recovery_in_secs": 30
+            }],
+            "active_builds": [],
+            "recent_builds": [],
+            "issues": [],
+            "alerts": [],
+            "stats": {
+                "total_builds": 0,
+                "success_count": 0,
+                "failure_count": 0,
+                "remote_count": 0,
+                "local_count": 0,
+                "avg_duration_ms": 0
+            }
+        }))
+        .unwrap()
+    }
+
+    fn make_context(config: OutputConfig) -> OutputContext {
+        let stdout = SharedOutputBuffer::new().as_writer(true);
+        let stderr = SharedOutputBuffer::new().as_writer(true);
+        OutputContext::with_writers(config, stdout, stderr)
+    }
+
+    #[test]
+    fn test_workers_list_verbose_shows_extra_columns() {
+        let worker = make_worker();
+        let status = make_daemon_status();
+        let style = crate::ui::theme::Style::new(false, true, false);
+        let output = render_worker_verbose_lines(&worker, Some(&status), &style).join("\n");
+
+        assert!(output.contains("Circuit"));
+        assert!(output.contains("In Use"));
+        assert!(output.contains("Status"));
+        assert!(output.contains("LastErr"));
+        assert!(output.contains("Recover"));
+        assert!(output.contains("SSH Key"));
+        assert!(output.contains("ssh timeout"));
+        assert!(output.contains("~/.ssh/rch_test"));
+    }
+
+    #[test]
+    fn test_workers_list_normal_hides_extra_columns() {
+        let normal_ctx = make_context(OutputConfig::default());
+        assert!(!workers_list_verbose_enabled(&normal_ctx));
+
+        let verbose_ctx = make_context(OutputConfig {
+            verbose: true,
+            ..Default::default()
+        });
+        assert!(workers_list_verbose_enabled(&verbose_ctx));
+
+        let verbose_json_ctx = make_context(OutputConfig {
+            json: true,
+            verbose: true,
+            ..Default::default()
+        });
+        assert!(!workers_list_verbose_enabled(&verbose_json_ctx));
     }
 }

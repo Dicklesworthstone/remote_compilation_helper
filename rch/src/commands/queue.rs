@@ -10,8 +10,12 @@ use crate::config::load_config;
 use crate::error::DaemonError;
 #[cfg(not(unix))]
 use crate::error::PlatformError;
-use crate::status_types::{ActiveBuildFromApi, DaemonFullStatusResponse, extract_json_body};
+use crate::status_types::{
+    ActiveBuildFromApi, DaemonFullStatusResponse, QueuedBuildFromApi, WorkerStatusFromApi,
+    extract_json_body,
+};
 use crate::ui::context::OutputContext;
+use crate::ui::theme::Theme;
 
 use super::send_daemon_command;
 
@@ -141,18 +145,11 @@ pub async fn queue_status(watch: bool, follow: bool, ctx: &OutputContext) -> Res
                     style.value(&project_display)
                 );
 
-                // Verbose mode: show full command and started_at timestamp
                 if ctx.is_verbose() {
-                    println!(
-                        "      {} {}",
-                        style.muted("command:"),
-                        style.value(&build.command)
-                    );
-                    println!(
-                        "      {} {}",
-                        style.muted("started:"),
-                        style.value(&build.started_at)
-                    );
+                    debug!(target: "rch::verbose", build_id = build.id, "rendering verbose active build details");
+                    for line in render_active_build_verbose_lines(build, style) {
+                        println!("{line}");
+                    }
                 }
             }
         }
@@ -208,20 +205,11 @@ pub async fn queue_status(watch: bool, follow: bool, ctx: &OutputContext) -> Res
                     style.value(&build.position.to_string())
                 );
 
-                // Verbose mode: show full command, slots needed, queued timestamp
                 if ctx.is_verbose() {
-                    println!(
-                        "      {} {}",
-                        style.muted("command:"),
-                        style.value(&build.command)
-                    );
-                    println!(
-                        "      {} {}  {} {}",
-                        style.muted("slots:"),
-                        style.value(&build.slots_needed.to_string()),
-                        style.muted("queued:"),
-                        style.value(&build.queued_at)
-                    );
+                    debug!(target: "rch::verbose", build_id = build.id, "rendering verbose queued build details");
+                    for line in render_queued_build_verbose_lines(build, style) {
+                        println!("{line}");
+                    }
                 }
             }
             println!();
@@ -260,33 +248,10 @@ pub async fn queue_status(watch: bool, follow: bool, ctx: &OutputContext) -> Res
         );
         println!();
 
-        // Verbose mode: show each worker's status individually
         if ctx.is_verbose() {
+            debug!(target: "rch::verbose", workers = status.workers.len(), "rendering verbose queue worker availability");
             for worker in &status.workers {
-                let status_indicator = match worker.status.as_str() {
-                    "healthy" => style.success("●"),
-                    "degraded" => style.warning("●"),
-                    "draining" => style.warning("◐"),
-                    "drained" => style.info("○"),
-                    "unreachable" => style.error("○"),
-                    "disabled" => style.muted("⊘"),
-                    _ => style.muted("?"),
-                };
-                let slots_display = format!("{}/{}", worker.used_slots, worker.total_slots);
-                let circuit_display = match worker.circuit_state.as_str() {
-                    "closed" => style.success("ok"),
-                    "half_open" => style.warning("half"),
-                    "open" => style.error("open"),
-                    _ => style.muted(&worker.circuit_state),
-                };
-                println!(
-                    "    {} {} {} {} {}",
-                    status_indicator,
-                    style.key(&worker.id),
-                    style.muted(&format!("[{}]", slots_display)),
-                    style.muted("circuit:"),
-                    circuit_display
-                );
+                println!("{}", render_worker_availability_verbose_line(worker, style));
             }
             println!();
         }
@@ -308,6 +273,66 @@ pub async fn queue_status(watch: bool, follow: bool, ctx: &OutputContext) -> Res
     }
 
     Ok(())
+}
+
+fn render_active_build_verbose_lines(build: &ActiveBuildFromApi, style: &Theme) -> Vec<String> {
+    vec![
+        format!(
+            "      {} {}",
+            style.muted("command:"),
+            style.value(&build.command)
+        ),
+        format!(
+            "      {} {}",
+            style.muted("started:"),
+            style.value(&build.started_at)
+        ),
+    ]
+}
+
+fn render_queued_build_verbose_lines(build: &QueuedBuildFromApi, style: &Theme) -> Vec<String> {
+    vec![
+        format!(
+            "      {} {}",
+            style.muted("command:"),
+            style.value(&build.command)
+        ),
+        format!(
+            "      {} {}  {} {}",
+            style.muted("slots:"),
+            style.value(&build.slots_needed.to_string()),
+            style.muted("queued:"),
+            style.value(&build.queued_at)
+        ),
+    ]
+}
+
+fn render_worker_availability_verbose_line(worker: &WorkerStatusFromApi, style: &Theme) -> String {
+    let status_indicator = match worker.status.as_str() {
+        "healthy" => style.success("●"),
+        "degraded" => style.warning("●"),
+        "draining" => style.warning("◐"),
+        "drained" => style.info("○"),
+        "unreachable" => style.error("○"),
+        "disabled" => style.muted("⊘"),
+        _ => style.muted("?"),
+    };
+    let slots_display = format!("{}/{}", worker.used_slots, worker.total_slots);
+    let circuit_display = match worker.circuit_state.as_str() {
+        "closed" => style.success("ok"),
+        "half_open" => style.warning("half"),
+        "open" => style.error("open"),
+        _ => style.muted(&worker.circuit_state),
+    };
+
+    format!(
+        "    {} {} {} {} {}",
+        status_indicator,
+        style.key(&worker.id),
+        style.muted(&format!("[{}]", slots_display)),
+        style.muted("circuit:"),
+        circuit_display
+    )
 }
 
 /// Stream daemon build events (like `tail -f`).
@@ -752,6 +777,58 @@ mod tests {
     fn format_build_duration_multiple_hours() {
         let _guard = test_guard!();
         assert_eq!(format_build_duration(7380), "2h 3m"); // 2h 3m
+    }
+
+    #[test]
+    fn test_queue_verbose_shows_worker_assignment() {
+        let _guard = test_guard!();
+        let style = crate::ui::theme::Style::new(false, true, false);
+        let active: ActiveBuildFromApi = serde_json::from_value(serde_json::json!({
+            "id": 42,
+            "project_id": "rch",
+            "worker_id": "builder-1",
+            "command": "cargo test --workspace --all-targets",
+            "started_at": "2026-01-01T00:00:00Z"
+        }))
+        .unwrap();
+        let queued: QueuedBuildFromApi = serde_json::from_value(serde_json::json!({
+            "id": 43,
+            "project_id": "rch",
+            "command": "cargo clippy --workspace --all-targets -- -D warnings",
+            "queued_at": "2026-01-01T00:00:10Z",
+            "position": 1,
+            "slots_needed": 4,
+            "estimated_start": null,
+            "wait_time": "10s"
+        }))
+        .unwrap();
+        let worker: WorkerStatusFromApi = serde_json::from_value(serde_json::json!({
+            "id": "builder-1",
+            "host": "127.0.0.1",
+            "user": "ubuntu",
+            "status": "healthy",
+            "circuit_state": "closed",
+            "used_slots": 2,
+            "total_slots": 8,
+            "speed_score": 92.0,
+            "last_error": null
+        }))
+        .unwrap();
+
+        let active_output = render_active_build_verbose_lines(&active, &style).join("\n");
+        assert!(active_output.contains("cargo test --workspace --all-targets"));
+        assert!(active_output.contains("started:"));
+
+        let queued_output = render_queued_build_verbose_lines(&queued, &style).join("\n");
+        assert!(queued_output.contains("cargo clippy --workspace"));
+        assert!(queued_output.contains("slots: 4"));
+        assert!(queued_output.contains("queued:"));
+
+        let worker_output = render_worker_availability_verbose_line(&worker, &style);
+        assert!(worker_output.contains("builder-1"));
+        assert!(worker_output.contains("[2/8]"));
+        assert!(worker_output.contains("circuit:"));
+        assert!(worker_output.contains("ok"));
     }
 
     // -------------------------------------------------------------------------
