@@ -1481,6 +1481,19 @@ async fn main() -> Result<()> {
     }
     let _logging_guards = init_logging(&log_config)?;
 
+    // br-4zf3p: emit one INFO event so agents (and `rch ... --verbose`)
+    // can verify the CLI override actually took effect. Silent flags are
+    // a footgun for agents debugging "why didn't --no-self-healing
+    // disable my daemon auto-start?".
+    let active_overrides = crate::self_healing_overrides::active_cli_overrides();
+    if !active_overrides.is_empty() {
+        tracing::info!(
+            target: "rch::self_healing",
+            overrides = ?active_overrides,
+            "CLI self-healing overrides active"
+        );
+    }
+
     // Spawn background update check to warm cache (non-blocking)
     update::spawn_update_check_if_needed();
 

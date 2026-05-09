@@ -313,10 +313,15 @@ pub async fn execute(workdir: &str, command: &str) -> Result<()> {
                     bytes_added = report.bytes_added_to_node_modules,
                     "prepare completed"
                 );
-                if matches!(report.action, crate::prepare::PrepareAction::Failed) {
+                if matches!(
+                    report.action,
+                    crate::prepare::PrepareAction::Failed | crate::prepare::PrepareAction::Timeout
+                ) {
                     if let Some(p) = &report.install_log_path {
                         error!(
-                            "Pre-execution prepare FAILED — install log at {}",
+                            target: "rch::wkr::executor",
+                            action = ?report.action,
+                            "pre-execution prepare did not finish cleanly — install log at {}",
                             p.display()
                         );
                     }

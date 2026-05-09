@@ -1,11 +1,49 @@
 #!/usr/bin/env bash
-# E2E: verify bun install pre-execution hook caches correctly across runs.
+# e2e_bun_prepare.sh — E2E for the bun/node pre-execution hook (br-4998x).
 #
-# Each scenario is recorded as a JSONL line in $RCH_E2E_LOG with fields
-# {ts, run_id, test, phase, event, status, detail}.
-#
-# Skips gracefully if `bun` is not installed.
+# Verifies that `rch-wkr prepare` correctly caches `node_modules` across
+# runs and reports the right action (Skipped / Installed / Failed /
+# Timeout) under each scenario.
 set -euo pipefail
+
+case "${1:-}" in
+  -h|--help)
+    # Single-quoted heredoc — no command/variable substitution, so back-
+    # ticks and dollar-signs in the help text are safe to use literally.
+    cat <<'HELP'
+e2e_bun_prepare.sh — E2E test for rch-wkr prepare (br-4998x).
+
+Usage:
+  scripts/e2e_bun_prepare.sh [--help]
+
+Scenarios (each emits a PASS/FAIL line):
+  s0  rust_no_op             Rust runtime -> action=Skipped, no install attempted.
+  s5  bad_manifest_handled   Corrupt package.json -> Failed (no panic).
+  s1  first_install          Fresh project -> action=Installed, node_modules created.
+  s2  cache_hit              Second prepare -> action=Skipped, took_ms < 200.
+  s3  reinstall_on_change    Modify manifest -> action=Installed, prev_hash != new.
+  s4  fingerprint_persisted  .rch_dep_fingerprint.json exists after install.
+
+Skipped automatically when bun is not in PATH (only s0 + s5 run, others SKIP).
+
+Environment:
+  RCH_E2E_LOG    Override the JSONL log path (default: /tmp/rch_e2e_bun_prepare_<UTC>.jsonl).
+  RCHWKR_BIN     Path to the rch-wkr binary (default: <repo>/target/release/rch-wkr).
+                 If not present, the script builds the release crate.
+
+Output:
+  - Stdout: one human line per assertion + "==== TOTAL: PASS=N FAIL=M ===="
+  - JSONL log: one structured event per assertion, fields {ts, run_id, test,
+    phase, event, status, detail}.
+  - Build log: cargo output goes to <log>.build.log so the JSONL stays valid JSON.
+
+Exit codes:
+  0  all assertions passed
+  1  one or more assertions failed
+  2  setup error (rch-wkr binary missing and build failed)
+HELP
+    exit 0 ;;
+esac
 
 LOG_FILE=${RCH_E2E_LOG:-/tmp/rch_e2e_bun_prepare_$(date -u +%Y%m%dT%H%M%SZ).jsonl}
 BUILD_LOG=${LOG_FILE%.jsonl}.build.log
@@ -91,7 +129,7 @@ fi
 # Skip the bun-specific tests if bun is not installed.
 if ! command -v bun >/dev/null 2>&1; then
     emit setup bun_missing SKIP "bun not in PATH; skipping bun-install scenarios"
-    emit summary done "INFO" "pass=$PASS fail=$FAIL (bun-specific scenarios skipped)"
+    emit summary "done" "INFO" "pass=$PASS fail=$FAIL (bun-specific scenarios skipped)"
     echo "==== TOTAL: PASS=$PASS FAIL=$FAIL (bun-specific scenarios skipped) ===="
     [ "$FAIL" -eq 0 ] || exit 1
     exit 0
@@ -178,6 +216,6 @@ else
     emit s4 fingerprint_file FAIL
 fi
 
-emit summary done "INFO" "pass=$PASS fail=$FAIL"
+emit summary "done" "INFO" "pass=$PASS fail=$FAIL"
 echo "==== TOTAL: PASS=$PASS FAIL=$FAIL ===="
 [ "$FAIL" -eq 0 ] || exit 1

@@ -270,11 +270,18 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|| project_path.join(".rch_prepare_logs"));
             let report = prepare::prepare(&project_path, runtime.into(), &log_dir_path).await?;
             println!("{}", serde_json::to_string(&report)?);
-            // Exit 1 if install failed so the caller (daemon / e2e) can detect.
-            if matches!(report.action, prepare::PrepareAction::Failed) {
-                std::process::exit(1);
+            // Exit code mapping (callers and e2e tests rely on these):
+            //   0 — Skipped (cache hit / no-op for non-Node) or Installed (success)
+            //   1 — Failed (install ran but exited non-zero)
+            //   2 — Timeout (install exceeded RCH_PREPARE_INSTALL_TIMEOUT_SECS, was killed)
+            // The two non-zero codes are distinct so an agent / shell
+            // wrapper can branch on a network-stall remediation (timeout)
+            // vs. a real install error (failed).
+            match report.action {
+                prepare::PrepareAction::Skipped | prepare::PrepareAction::Installed => Ok(()),
+                prepare::PrepareAction::Failed => std::process::exit(1),
+                prepare::PrepareAction::Timeout => std::process::exit(2),
             }
-            Ok(())
         }
     }
 }

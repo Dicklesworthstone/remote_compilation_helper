@@ -1,7 +1,38 @@
 #!/usr/bin/env bash
-# E2E: run the 5 self-test E2E scenarios and emit JSONL per-scenario results.
-# Skips remote-worker scenarios when RCH_E2E_WORKER_HOST is unset (CI-friendly).
+# e2e_self_test_full.sh — Wrap the 5 self-test E2E scenarios + emit JSONL.
 set -euo pipefail
+
+case "${1:-}" in
+  -h|--help)
+    cat <<'HELP'
+e2e_self_test_full.sh — Run the 5 self-test E2E scenarios with JSONL logging.
+
+Usage:
+  scripts/e2e_self_test_full.sh [--help]
+
+Scenarios (each is a #[tokio::test] in rchd/tests/e2e_self_test.rs):
+  test_binary_hash_computation_e2e         Local-only; runs anywhere.
+  test_code_change_produces_different_hash Local-only; runs anywhere.
+  test_remote_compilation_verification_e2e Skipped without RCH_E2E_WORKER_HOST.
+  test_verify_compilation_on_worker_e2e    Skipped without RCH_E2E_WORKER_HOST. (br-0r1pg)
+  test_complete_self_test_workflow_e2e     8-step orchestration. (br-0r1pg)
+
+Environment:
+  RCH_E2E_LOG          Override the JSONL log path.
+  RCH_E2E_WORKER_HOST  Real worker hostname; remote scenarios run when set.
+  RCH_E2E_WORKER_USER  SSH user for the worker (default: \$USER).
+  RCH_E2E_WORKER_KEY   SSH private key path (default: ~/.ssh/id_rsa).
+
+Output:
+  - Stdout: one human line per scenario + "==== TOTAL: PASS=N FAIL=M ===="
+  - JSONL log: per-scenario {ts, run_id, test, phase, event, status, detail}.
+
+Exit codes:
+  0  all run scenarios passed (skipped scenarios don't fail the run)
+  1  one or more run scenarios failed
+HELP
+    exit 0 ;;
+esac
 
 LOG_FILE=${RCH_E2E_LOG:-/tmp/rch_e2e_self_test_full_$(date -u +%Y%m%dT%H%M%SZ).jsonl}
 RUN_ID=$(date -u +%Y%m%dT%H%M%SZ)-$$
@@ -59,6 +90,6 @@ for scenario in "${SCENARIOS[@]}"; do
     emit "$scenario" duration INFO "ms=$DUR_MS"
 done
 
-emit summary done "INFO" "pass=$PASS fail=$FAIL skipped_subset=$SKIPPED"
+emit summary "done" "INFO" "pass=$PASS fail=$FAIL skipped_subset=$SKIPPED"
 echo "==== TOTAL: PASS=$PASS FAIL=$FAIL (subset SKIPPED for missing real worker: $SKIPPED) ===="
 [ "$FAIL" -eq 0 ] || exit 1

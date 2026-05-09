@@ -11,9 +11,17 @@
 //!
 //! All fields are `AtomicBool`, set once at startup, read freely.
 //!
+//! ## Wiring (do not break this chain — agents debugging silent flag
+//! drops are very unhappy):
+//!   1. main.rs parses `cli.no_self_healing` / `cli.no_hook_auto_start`
+//!      and calls [`set_no_self_healing`] / [`set_no_hook_auto_start`].
+//!   2. main.rs reads [`active_cli_overrides`] and emits one INFO
+//!      tracing event so the agent can verify the flag took effect.
+//!   3. config.rs::load_config() and load_config_with_sources() both
+//!      call [`apply_to`] after env-var overrides, so the loaded
+//!      config reflects the CLI flag for every command handler.
+//!
 //! Added by br-4zf3p (completion debt for bd-18e8).
-
-#![allow(dead_code)] // br-4zf3p: scaffolded; consumers wire in through 4zf3p.3.
 
 use rch_common::SelfHealingConfig;
 use std::sync::atomic::{AtomicBool, Ordering};

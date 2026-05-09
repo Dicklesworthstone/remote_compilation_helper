@@ -25,6 +25,15 @@ use tracing::{info, warn};
 const DEFAULT_INSTALL_TIMEOUT_SECS: u64 = 300; // 5 minutes
 
 /// Action taken during prepare.
+///
+/// Agents reading prepare's JSON output branch on this single field:
+/// `Skipped` and `Installed` mean the dependency state is good — the
+/// user's `bun test` (etc.) will run with `node_modules/` in place.
+/// `Failed` and `Timeout` mean the install couldn't make
+/// `node_modules/` consistent — the user's command will likely emit a
+/// clearer runtime error (e.g. "Cannot find module"). Agents can offer
+/// different remediation for `Timeout` (network / registry stall) than
+/// for `Failed` (genuine install error — see `install_log_path`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "PascalCase")]
 pub enum PrepareAction {
@@ -32,8 +41,13 @@ pub enum PrepareAction {
     Skipped,
     /// Install command was run successfully.
     Installed,
-    /// Install command was attempted but failed.
+    /// Install command was attempted but exited non-zero. See
+    /// `install_log_path` for the captured stdout/stderr.
     Failed,
+    /// Install command exceeded the timeout
+    /// (`RCH_PREPARE_INSTALL_TIMEOUT_SECS`, default 300s) and was killed.
+    /// `install_log_path` may contain partial output.
+    Timeout,
 }
 
 /// Identifying fingerprint for a Node-flavored project's dependency manifest.
@@ -189,6 +203,44 @@ async fn write_cached_fingerprint(project_root: &Path, fp: &DependencyFingerprin
 async fn invalidate_cached_fingerprint(project_root: &Path) {
     let path = project_root.join(FINGERPRINT_FILE);
     let _ = tokio::fs::remove_file(&path).await;
+}
+
+/// Persist the post-install fingerprint when possible. If recomputing or
+/// writing the cache fails after a successful install, keep the install result
+/// fail-open for the user command, invalidate stale cache state, and return the
+/// best fingerprint available for diagnostics.
+async fn persist_post_install_fingerprint(
+    project_root: &Path,
+    pre_install_fingerprint: &DependencyFingerprint,
+    recomputed: Result<DependencyFingerprint>,
+) -> DependencyFingerprint {
+    match recomputed {
+        Ok(fp) => {
+            if let Err(e) = write_cached_fingerprint(project_root, &fp).await {
+                warn!(
+                    target: "rch::wkr::prepare",
+                    error = %e,
+                    "fingerprint write failed after successful install; cache will be \
+                     re-created on next call"
+                );
+                invalidate_cached_fingerprint(project_root).await;
+            }
+            fp
+        }
+        Err(e) => {
+            warn!(
+                target: "rch::wkr::prepare",
+                error = %e,
+                "post-install fingerprint recompute failed; invalidating cache so next \
+                 call recomputes fresh"
+            );
+            invalidate_cached_fingerprint(project_root).await;
+            // Return the pre-install fingerprint as a *report* value (best info
+            // we have) but DON'T persist it — that would be the silent-fallback
+            // bug.
+            pre_install_fingerprint.clone()
+        }
+    }
 }
 
 /// Build a canonical lock-key for a project path that survives all the
@@ -428,8 +480,11 @@ async fn prepare_node_like(
             return Err(anyhow!("install command wait failed: {e}"));
         }
         Err(_elapsed) => {
-            // Timeout: kill the child and report Failed. kill_on_drop
-            // ensures the process is reaped even if kill() races.
+            // Timeout: kill the child and report PrepareAction::Timeout
+            // so agents can distinguish a wedged install (network /
+            // registry stall) from a genuine install error.
+            // kill_on_drop ensures the process is reaped even if
+            // kill().await races.
             let _ = child.kill().await;
             warn!(
                 target: "rch::wkr::prepare",
@@ -442,7 +497,7 @@ async fn prepare_node_like(
             invalidate_cached_fingerprint(project_root).await;
             return Ok(PrepareReport {
                 runtime,
-                action: PrepareAction::Failed,
+                action: PrepareAction::Timeout,
                 fingerprint: Some(fingerprint),
                 fingerprint_changed_from: cached.map(|c| c.hash),
                 install_log_path: Some(log_path),
@@ -491,37 +546,12 @@ async fn prepare_node_like(
     //     the original silent-fallback bug — it permanently loses the
     //     newly-created lockfile from the cached state and forces
     //     re-install every call).
-    let (post_install_fingerprint, persisted) =
-        match compute_fingerprint(project_root).await {
-            Ok(fp) => {
-                if let Err(e) = write_cached_fingerprint(project_root, &fp).await {
-                    warn!(
-                        target: "rch::wkr::prepare",
-                        error = %e,
-                        "fingerprint write failed after successful install; cache will be \
-                         re-created on next call"
-                    );
-                    invalidate_cached_fingerprint(project_root).await;
-                    (fp, false)
-                } else {
-                    (fp.clone(), true)
-                }
-            }
-            Err(e) => {
-                warn!(
-                    target: "rch::wkr::prepare",
-                    error = %e,
-                    "post-install fingerprint recompute failed; invalidating cache so next \
-                     call recomputes fresh"
-                );
-                invalidate_cached_fingerprint(project_root).await;
-                // Return the pre-install fingerprint as a *report* value
-                // (best info we have) but DON'T persist it — that would
-                // be the silent-fallback bug.
-                (fingerprint.clone(), false)
-            }
-        };
-    let _ = persisted; // currently advisory; may surface in PrepareReport later.
+    let post_install_fingerprint = persist_post_install_fingerprint(
+        project_root,
+        &fingerprint,
+        compute_fingerprint(project_root).await,
+    )
+    .await;
 
     Ok(PrepareReport {
         runtime,
@@ -747,11 +777,14 @@ mod tests {
         let report = prepare(tmp.path(), RequiredRuntime::Bun, &log_dir).await;
         match report {
             Ok(r) => {
-                // Property A: cache-miss must yield Installed or Failed,
+                // Property A: cache-miss must yield Installed/Failed/Timeout,
                 // never Skipped (no fingerprint was cached).
                 assert!(
-                    matches!(r.action, PrepareAction::Installed | PrepareAction::Failed),
-                    "cache miss must yield Installed or Failed, not {:?}",
+                    matches!(
+                        r.action,
+                        PrepareAction::Installed | PrepareAction::Failed | PrepareAction::Timeout
+                    ),
+                    "cache miss must yield Installed/Failed/Timeout, not {:?}",
                     r.action
                 );
                 // Property B: fingerprint always populated for Bun/Node.
@@ -768,16 +801,18 @@ mod tests {
                     assert_eq!(cached.unwrap().hash, r.fingerprint.unwrap().hash);
                     assert!(tmp.path().join("node_modules").exists());
                 }
-                if r.action == PrepareAction::Failed {
-                    // Property E: failure invalidates fingerprint cache and
-                    // records install_log_path for diagnostics.
+                if matches!(r.action, PrepareAction::Failed | PrepareAction::Timeout) {
+                    // Property E: failure / timeout invalidates fingerprint
+                    // cache and records install_log_path for diagnostics.
                     assert!(
                         r.install_log_path.is_some(),
-                        "Failed must include install_log_path"
+                        "{:?} must include install_log_path",
+                        r.action
                     );
                     assert!(
                         read_cached_fingerprint(tmp.path()).await.is_none(),
-                        "Failed must invalidate cached fingerprint"
+                        "{:?} must invalidate cached fingerprint",
+                        r.action
                     );
                 }
             }
@@ -843,9 +878,8 @@ mod tests {
         // Fire prepare() in a task; it MUST block on the same lock.
         let p = tmp.path().to_path_buf();
         let log_dir = tmp.path().join("logs");
-        let join_handle = tokio::spawn(async move {
-            prepare(&p, RequiredRuntime::Bun, &log_dir).await
-        });
+        let join_handle =
+            tokio::spawn(async move { prepare(&p, RequiredRuntime::Bun, &log_dir).await });
 
         // Give the spawned task a moment to reach the lock acquisition.
         // It must NOT have completed yet — the lock is held.
@@ -857,14 +891,11 @@ mod tests {
 
         // Release the lock; the spawned task must now complete promptly.
         drop(held);
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            join_handle,
-        )
-        .await
-        .expect("prepare() must complete after lock release")
-        .expect("join handle")
-        .expect("prepare() Result");
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), join_handle)
+            .await
+            .expect("prepare() must complete after lock release")
+            .expect("join handle")
+            .expect("prepare() Result");
         assert_eq!(result.action, PrepareAction::Skipped);
         // TEST PASS
     }
@@ -889,27 +920,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_post_install_recompute_failure_invalidates_cache() {
+    async fn test_post_install_recompute_failure_invalidates_cache_but_returns_preinstall_report() {
         // TEST START: if compute_fingerprint fails after a successful
-        // install (e.g. install somehow removed package.json), the
-        // fingerprint cache must be invalidated and the report must
-        // be Failed. The previous behavior — silently caching the old
-        // fingerprint — would force re-install on every subsequent call.
-        //
-        // We can't easily simulate a real install that deletes the
-        // manifest from a unit test, so we check the structural
-        // contract via the unit-tier `invalidate_cached_fingerprint`
-        // primitive (already covered) AND verify the documented
-        // behavior in the doc-comment. This test exercises the
-        // fingerprint-recompute path's success case as a baseline.
+        // install, prepare should still report Installed to the caller,
+        // but the stale cache must be invalidated and the pre-install
+        // fingerprint may only be returned as diagnostic report data.
+        // Persisting it would recreate the original silent-fallback bug.
         let tmp = TempDir::new().unwrap();
-        make_node_project(tmp.path(), r#"{"name":"x"}"#, None);
-        let fp = compute_fingerprint(tmp.path()).await.unwrap();
-        // Sanity: fingerprint is non-empty and deterministic.
-        assert_eq!(fp.hash.len(), 64);
-        let fp2 = compute_fingerprint(tmp.path()).await.unwrap();
-        assert_eq!(fp.hash, fp2.hash);
+        let stale = DependencyFingerprint {
+            hash: "stale".into(),
+            sources: vec!["package.json".into()],
+        };
+        write_cached_fingerprint(tmp.path(), &stale).await.unwrap();
+
+        let pre_install = DependencyFingerprint {
+            hash: "pre-install".into(),
+            sources: vec!["package.json".into()],
+        };
+        let returned = persist_post_install_fingerprint(
+            tmp.path(),
+            &pre_install,
+            Err(anyhow!("simulated recompute failure")),
+        )
+        .await;
+
+        assert_eq!(returned, pre_install);
+        assert!(
+            read_cached_fingerprint(tmp.path()).await.is_none(),
+            "stale cache must be invalidated instead of preserving pre-install fingerprint"
+        );
         // TEST PASS
+    }
+
+    #[tokio::test]
+    async fn test_post_install_recompute_success_persists_recomputed_fingerprint() {
+        let tmp = TempDir::new().unwrap();
+        let pre_install = DependencyFingerprint {
+            hash: "pre-install".into(),
+            sources: vec!["package.json".into()],
+        };
+        let recomputed = DependencyFingerprint {
+            hash: "post-install".into(),
+            sources: vec!["package.json".into(), "bun.lock".into()],
+        };
+
+        let returned =
+            persist_post_install_fingerprint(tmp.path(), &pre_install, Ok(recomputed.clone()))
+                .await;
+        assert_eq!(returned, recomputed);
+        assert_eq!(read_cached_fingerprint(tmp.path()).await, Some(recomputed));
     }
 
     #[tokio::test]
@@ -982,8 +1041,8 @@ mod tests {
         std::fs::write(tmp.path().join("package.json"), "{}").unwrap();
         std::fs::write(tmp.path().join("bun.lock"), "# text lockfile\n").unwrap();
         // Either lockfile means a lockfile exists — frozen is correct.
-        let bun_has_lockfile = tmp.path().join("bun.lockb").exists()
-            || tmp.path().join("bun.lock").exists();
+        let bun_has_lockfile =
+            tmp.path().join("bun.lockb").exists() || tmp.path().join("bun.lock").exists();
         assert!(bun_has_lockfile, "test fixture must have a lockfile");
         // The selection rule: pm == Bun + has_lockfile → install_command()
         // (which is bun install --frozen-lockfile).

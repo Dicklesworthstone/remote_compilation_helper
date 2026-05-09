@@ -1,10 +1,40 @@
 #!/usr/bin/env bash
-# E2E: verify signature-verification test coverage matches bd-2bwc original AC.
-# Runs the gap-fill tests added by completion-debt bead remote_compilation_helper-6uuy2.
-#
-# JSONL log format (per assertion):
-#   {ts, run_id, test, phase, event, status, detail}
+# test_update_signature_verification.sh — verify signature-verification
+# test coverage matches bd-2bwc's 4 sub-criteria.
 set -euo pipefail
+
+case "${1:-}" in
+  -h|--help)
+    cat <<'HELP'
+test_update_signature_verification.sh — verify update-system signature-test coverage.
+
+Usage:
+  scripts/test_update_signature_verification.sh [--help]
+
+What it checks (each assertion → one PASS/FAIL line):
+  run/cargo_test                          All update::verify::tests pass.
+  coverage/valid                          ≥1 test covers valid-signature acceptance.
+  coverage/invalid                        ≥1 test covers invalid-signature rejection.
+  coverage/missing                        ≥1 test covers missing-signature handling.
+  coverage/key_rotation                   ≥1 test covers key-rotation (regex anchor).
+  anchor_check/pattern_starts_with_caret  RCH_RELEASE_IDENTITY_PATTERN starts with ^.
+  anchor_check/pattern_ends_with_dollar   …and ends with .*\$ (substring-attack defense).
+
+Environment:
+  RCH_E2E_LOG  Override the JSONL log path.
+
+Output:
+  - Stdout: one human line per assertion + "==== TOTAL: PASS=N FAIL=M ===="
+  - JSONL log: per-assertion {ts, run_id, test, phase, event, status, detail}.
+
+Exit codes:
+  0  all assertions passed
+  1  one or more assertions failed
+
+Filed under completion-debt bead remote_compilation_helper-6uuy2 (post-hoc verification of bd-2bwc).
+HELP
+    exit 0 ;;
+esac
 
 LOG_FILE=${RCH_E2E_LOG:-/tmp/rch_e2e_update_sig_$(date -u +%Y%m%dT%H%M%SZ).jsonl}
 RUN_ID=$(date -u +%Y%m%dT%H%M%SZ)-$$
@@ -75,6 +105,6 @@ else
     emit anchor_check pattern_ends_with_dollar FAIL
 fi
 
-emit summary done "INFO" "pass=$PASS fail=$FAIL log=$LOG_FILE"
+emit summary "done" "INFO" "pass=$PASS fail=$FAIL log=$LOG_FILE"
 echo "==== TOTAL: PASS=$PASS FAIL=$FAIL ===="
 [ "$FAIL" -eq 0 ] || exit 1
