@@ -1070,7 +1070,7 @@ fn reliability_schema_compatibility_diagnostics() -> Vec<ReliabilityDiagnostic> 
         (
             "status",
             crate::status_types::STATUS_SCHEMA_VERSION,
-            "unified status response",
+            "CLI status response",
         ),
         (
             "repo_updater_contract",

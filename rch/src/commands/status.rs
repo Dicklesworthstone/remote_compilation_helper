@@ -8,8 +8,8 @@ use crate::hook::{
     required_runtime_for_kind,
 };
 use crate::status_types::{
-    DaemonFullStatusResponse, SelfTestHistoryResponse, SelfTestRunResponse, SelfTestStatusResponse,
-    extract_json_body,
+    DaemonFullStatusResponse, SelfTestHistoryResponseFromApi, SelfTestRunResponseFromApi,
+    SelfTestStatusResponseFromApi, extract_json_body,
 };
 use crate::toolchain::detect_toolchain;
 use crate::ui::context::OutputContext;
@@ -789,7 +789,7 @@ pub async fn self_test(
 async fn self_test_status(ctx: &OutputContext) -> Result<()> {
     let response = send_daemon_command("GET /self-test/status\n").await?;
     let json = extract_json_body(&response).ok_or_else(|| anyhow::anyhow!("Invalid response"))?;
-    let status: SelfTestStatusResponse = serde_json::from_str(json)?;
+    let status: SelfTestStatusResponseFromApi = serde_json::from_str(json)?;
 
     let _ = ctx.json(&status);
     if ctx.is_json() {
@@ -851,7 +851,7 @@ async fn self_test_history(limit: usize, ctx: &OutputContext) -> Result<()> {
     let command = format!("GET /self-test/history?limit={}\n", limit);
     let response = send_daemon_command(&command).await?;
     let json = extract_json_body(&response).ok_or_else(|| anyhow::anyhow!("Invalid response"))?;
-    let history: SelfTestHistoryResponse = serde_json::from_str(json)?;
+    let history: SelfTestHistoryResponseFromApi = serde_json::from_str(json)?;
 
     let _ = ctx.json(&history);
     if ctx.is_json() {
@@ -1005,7 +1005,7 @@ async fn self_test_run(
     };
 
     let json = extract_json_body(&response).ok_or_else(|| anyhow::anyhow!("Invalid response"))?;
-    let run: SelfTestRunResponse = serde_json::from_str(json)?;
+    let run: SelfTestRunResponseFromApi = serde_json::from_str(json)?;
 
     let _ = ctx.json(&run);
     if ctx.is_json() {

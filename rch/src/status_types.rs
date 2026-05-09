@@ -591,7 +591,7 @@ pub struct SelfTestResultRecordFromApi {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SelfTestStatusResponse {
+pub struct SelfTestStatusResponseFromApi {
     pub enabled: bool,
     pub schedule: Option<String>,
     pub interval: Option<String>,
@@ -600,13 +600,13 @@ pub struct SelfTestStatusResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SelfTestHistoryResponse {
+pub struct SelfTestHistoryResponseFromApi {
     pub runs: Vec<SelfTestRunRecordFromApi>,
     pub results: Vec<SelfTestResultRecordFromApi>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SelfTestRunResponse {
+pub struct SelfTestRunResponseFromApi {
     pub run: SelfTestRunRecordFromApi,
     pub results: Vec<SelfTestResultRecordFromApi>,
 }
@@ -1207,7 +1207,7 @@ mod tests {
     }
 
     #[test]
-    fn test_deserialize_self_test_status() {
+    fn test_deserialize_self_test_status_from_api() {
         let _guard = test_guard!();
         let json = serde_json::json!({
             "enabled": true,
@@ -1217,10 +1217,18 @@ mod tests {
             "next_run": "2026-01-16T18:00:00Z"
         });
 
-        let status: SelfTestStatusResponse = serde_json::from_value(json).unwrap();
+        let status: SelfTestStatusResponseFromApi = serde_json::from_value(json).unwrap();
         assert!(status.enabled);
         assert_eq!(status.schedule, Some("0 */6 * * *".to_string()));
         assert!(status.last_run.is_none());
+    }
+
+    #[test]
+    fn test_self_test_api_response_type_names_are_explicit() {
+        let _guard = test_guard!();
+        assert!(std::any::type_name::<SelfTestStatusResponseFromApi>().contains("FromApi"));
+        assert!(std::any::type_name::<SelfTestHistoryResponseFromApi>().contains("FromApi"));
+        assert!(std::any::type_name::<SelfTestRunResponseFromApi>().contains("FromApi"));
     }
 
     #[test]
@@ -1715,6 +1723,12 @@ mod tests {
     fn test_cli_status_schema_version_constant() {
         let _guard = test_guard!();
         assert_eq!(STATUS_SCHEMA_VERSION, "1.0.0");
+    }
+
+    #[test]
+    fn test_cli_status_response_type_name_is_explicit() {
+        let _guard = test_guard!();
+        assert!(std::any::type_name::<CliStatusResponse>().ends_with("CliStatusResponse"));
     }
 
     #[test]
