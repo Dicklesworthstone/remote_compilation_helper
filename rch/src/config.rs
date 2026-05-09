@@ -66,6 +66,10 @@ pub fn load_config() -> Result<RchConfig> {
     // Apply environment variable overrides
     config = apply_env_overrides(config);
 
+    // br-4zf3p: CLI overrides for self-healing have highest priority
+    // (CLI > env > config > defaults). Recorded by main.rs at startup.
+    crate::self_healing_overrides::apply_to(&mut config.self_healing);
+
     Ok(config)
 }
 

@@ -12,6 +12,7 @@ mod commands;
 mod completions;
 mod config;
 mod doctor;
+mod self_healing_overrides;
 pub mod error;
 pub mod fleet;
 #[cfg_attr(not(unix), path = "hook_windows.rs")]
@@ -134,6 +135,21 @@ struct Cli {
     /// Disable ANSI color output
     #[arg(long, global = true)]
     no_color: bool,
+
+    /// Disable all self-healing behaviors for this invocation.
+    ///
+    /// Equivalent to setting `RCH_NO_SELF_HEALING=1` for this single
+    /// invocation. Highest priority in the override chain
+    /// (CLI > env > config > defaults). br-4zf3p.
+    #[arg(long, global = true)]
+    no_self_healing: bool,
+
+    /// Disable hook-side daemon auto-start for this invocation.
+    ///
+    /// Sets self_healing.hook_starts_daemon=false just for this run.
+    /// Useful when manually controlling daemon lifecycle. br-4zf3p.
+    #[arg(long, global = true)]
+    no_hook_auto_start: bool,
 
     /// Agent mega-command with quick_ref, recommended commands, and health probes
     #[arg(long, global = true)]
@@ -1444,6 +1460,16 @@ async fn main() -> Result<()> {
     }
 
     let cli = Cli::parse();
+
+    // br-4zf3p: track CLI self-healing overrides in a process-global atomic
+    // registry so config-loading sites can observe them without threading a
+    // parameter through every command handler. Priority: CLI > env > config.
+    if cli.no_self_healing {
+        crate::self_healing_overrides::set_no_self_healing(true);
+    }
+    if cli.no_hook_auto_start {
+        crate::self_healing_overrides::set_no_hook_auto_start(true);
+    }
 
     // Initialize logging - ALWAYS use stderr to keep stdout clean for hook JSON
     let base_level = base_log_level_for_cli(&cli);
