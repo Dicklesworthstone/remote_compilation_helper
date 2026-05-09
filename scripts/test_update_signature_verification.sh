@@ -26,6 +26,7 @@ Environment:
 Output:
   - Stdout: one human line per assertion + "==== TOTAL: PASS=N FAIL=M ===="
   - JSONL log: per-assertion {ts, run_id, test, phase, event, status, detail}.
+  - Test log: cargo output goes to <log>.cargo.log so the JSONL stays valid JSON.
 
 Exit codes:
   0  all assertions passed
@@ -37,6 +38,7 @@ HELP
 esac
 
 LOG_FILE=${RCH_E2E_LOG:-/tmp/rch_e2e_update_sig_$(date -u +%Y%m%dT%H%M%SZ).jsonl}
+TEST_LOG=${LOG_FILE%.jsonl}.cargo.log
 RUN_ID=$(date -u +%Y%m%dT%H%M%SZ)-$$
 PROJECT_ROOT=$(git rev-parse --show-toplevel)
 PASS=0
@@ -44,23 +46,28 @@ FAIL=0
 
 emit() {
     local phase="$1" event="$2" status="$3" detail="${4:-}"
-    python3 -c "
-import json, time
+    EMIT_RUN_ID="$RUN_ID" EMIT_PHASE="$phase" EMIT_EVENT="$event" \
+    EMIT_STATUS="$status" EMIT_DETAIL="$detail" \
+    python3 -c '
+import json, os, time
 print(json.dumps({
-  'ts': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
-  'run_id': '$RUN_ID',
-  'test': 'e2e_update_signature_verification',
-  'phase': '$phase', 'event': '$event', 'status': '$status', 'detail': '$detail',
-}))" >>"$LOG_FILE"
+  "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+  "run_id": os.environ.get("EMIT_RUN_ID", ""),
+  "test": "e2e_update_signature_verification",
+  "phase": os.environ.get("EMIT_PHASE", ""),
+  "event": os.environ.get("EMIT_EVENT", ""),
+  "status": os.environ.get("EMIT_STATUS", ""),
+  "detail": os.environ.get("EMIT_DETAIL", ""),
+}))' >>"$LOG_FILE"
     echo "[$(date +%H:%M:%S)] [$status] $phase: $event ${detail:+- $detail}"
 }
 
-emit setup begin INFO "log=$LOG_FILE root=$PROJECT_ROOT"
+emit setup begin INFO "log=$LOG_FILE test_log=$TEST_LOG root=$PROJECT_ROOT"
 
 # 1. Run the targeted unit tests for signature verification
 emit run begin INFO "filter=update::verify::tests"
 cd "$PROJECT_ROOT"
-if cargo test -p rch --bin rch update::verify::tests -- --nocapture >>"$LOG_FILE" 2>&1; then
+if cargo test -p rch --bin rch update::verify::tests -- --nocapture >>"$TEST_LOG" 2>&1; then
     PASS=$((PASS + 1))
     emit run cargo_test PASS
 else
