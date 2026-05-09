@@ -563,19 +563,31 @@ mod tests {
             attack3
         );
 
-        // Trailing-content attack (would only matter without `$` anchor)
-        let attack4 = "https://github.com/Dicklesworthstone/remote_compilation_helper/.github/workflows/release.yml@refs/tags/v1.0.0?evil=true";
-        // Note: query strings ARE allowed by regex .*$ — verify expectation.
-        // The pattern's tail is `@refs/.*$` so anything after refs/ is fine.
-        // The point is: trailing content does not bypass anchoring.
-        let _ = re.is_match(attack4); // Either result is fine; we just verify the regex doesn't panic.
+        // Wrong protocol — must NOT match (the `^https://` anchor prefix
+        // rejects http://).
+        let attack4 = "http://github.com/Dicklesworthstone/remote_compilation_helper/.github/workflows/release.yml@refs/tags/v1.0.0";
+        assert!(
+            !re.is_match(attack4),
+            "http (not https) must not match: {}",
+            attack4
+        );
 
-        // Wrong protocol
-        let attack5 = "http://github.com/Dicklesworthstone/remote_compilation_helper/.github/workflows/release.yml@refs/tags/v1.0.0";
+        // Lookalike-URL prefix attack — the `^` anchor prevents a longer
+        // hostname from being treated as a match by substring rule.
+        let attack5 = "evilhttps://github.com/Dicklesworthstone/remote_compilation_helper/.github/workflows/release.yml@refs/tags/v1.0.0";
         assert!(
             !re.is_match(attack5),
-            "http (not https) must not match: {}",
+            "lookalike-host prefix must not match: {}",
             attack5
+        );
+
+        // Path-traversal attempt — `.` is escaped in the pattern, so a
+        // literal `.github` is required (no wildcard substitution).
+        let attack6 = "https://github.com/Dicklesworthstone/remote_compilation_helper/Xgithub/workflows/release.yml@refs/tags/v1.0.0";
+        assert!(
+            !re.is_match(attack6),
+            "missing .github literal must not match: {}",
+            attack6
         );
         // TEST PASS: substring attacks rejected
     }
