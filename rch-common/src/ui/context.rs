@@ -194,6 +194,8 @@ impl OutputContext {
                 | "dashboard"
                 | "web"
                 | "schema"
+                | "capabilities"
+                | "robot-docs"
                 // Clap-provided
                 | "version"
                 | "help"
@@ -357,6 +359,8 @@ mod tests {
         assert!(OutputContext::is_known_subcommand("status"));
         assert!(OutputContext::is_known_subcommand("workers"));
         assert!(OutputContext::is_known_subcommand("daemon"));
+        assert!(OutputContext::is_known_subcommand("capabilities"));
+        assert!(OutputContext::is_known_subcommand("robot-docs"));
         assert!(OutputContext::is_known_subcommand("help"));
         assert!(!OutputContext::is_known_subcommand("unknown"));
         assert!(!OutputContext::is_known_subcommand(""));
