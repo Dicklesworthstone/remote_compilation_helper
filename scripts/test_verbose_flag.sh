@@ -2,7 +2,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-RCH_BIN="${RCH_BIN:-$ROOT/target/debug/rch}"
+DEFAULT_RCH_BIN="$ROOT/target/debug/rch"
+RCH_BIN="${RCH_BIN:-$DEFAULT_RCH_BIN}"
 
 usage() {
   cat <<'USAGE'
@@ -26,9 +27,14 @@ if [[ $# -gt 0 ]]; then
   exit 2
 fi
 
-if [[ ! -x "$RCH_BIN" ]]; then
+if [[ ! -x "$RCH_BIN" && "$RCH_BIN" == "$DEFAULT_RCH_BIN" ]]; then
   echo "Building rch debug binary..."
   (cd "$ROOT" && cargo build -p rch)
+fi
+
+if [[ ! -x "$RCH_BIN" ]]; then
+  echo "rch binary is not executable: $RCH_BIN" >&2
+  exit 2
 fi
 
 CONFIG_HOME="${TMPDIR:-/tmp}/rch-verbose-flag-$$"
@@ -50,6 +56,9 @@ JSON_OUT="$CONFIG_HOME/workers-verbose.json"
 NORMAL_ERR="$CONFIG_HOME/workers-normal.err"
 VERBOSE_ERR="$CONFIG_HOME/workers-verbose.err"
 JSON_ERR="$CONFIG_HOME/workers-verbose-json.err"
+# This checks the literal workers.toml value, not the user's expanded home path.
+# shellcheck disable=SC2088
+EXPECTED_IDENTITY='~/.ssh/rch_verbose_test'
 
 run_capture() {
   local stdout_file="$1"
@@ -75,7 +84,12 @@ fi
 
 grep -q "SSH Key" "$VERBOSE_OUT"
 grep -q "Live status" "$VERBOSE_OUT"
-grep -q "~/.ssh/rch_verbose_test" "$VERBOSE_OUT"
+grep -Fq "$EXPECTED_IDENTITY" "$VERBOSE_OUT"
+
+if grep -Eq "SSH Key|Live status" "$JSON_OUT"; then
+  echo "verbose JSON output unexpectedly included human-only labels" >&2
+  exit 1
+fi
 
 python3 - "$JSON_OUT" <<'PY'
 import json

@@ -74,14 +74,23 @@ fn starts_with_word(command: &str, prefix: &str) -> bool {
 /// Rust command never accidentally triggers `bun install`.
 fn detect_runtime_from_command(command: &str) -> RequiredRuntime {
     let after_env = strip_leading_env_assignments(command);
-    // Bun: `bun test`, `bun typecheck`. Match only at word boundary so
-    // `bun test` doesn't also match a hypothetical `bun testx`.
+    // Bun: `bun test`, `bun typecheck`, `bun run test` (script runner form).
     if let Some(rest) = after_env
         .strip_prefix("bun ")
         .or_else(|| after_env.strip_prefix("bun\t"))
     {
-        let first = rest.split_whitespace().next().unwrap_or("");
+        let mut tokens = rest.split_whitespace();
+        let first = tokens.next().unwrap_or("");
         if matches!(first, "test" | "typecheck") {
+            return RequiredRuntime::Bun;
+        }
+        // `bun run test` / `bun run typecheck` — the script-runner form.
+        // Note: `bun run` arbitrary-script can mean anything (build, dev,
+        // ...), so we only auto-prepare for the well-known test scripts.
+        if first == "run"
+            && let Some(second) = tokens.next()
+            && matches!(second, "test" | "typecheck")
+        {
             return RequiredRuntime::Bun;
         }
     }
@@ -116,6 +125,28 @@ mod runtime_detection_tests {
         assert_eq!(
             detect_runtime_from_command("bun typecheck"),
             RequiredRuntime::Bun
+        );
+    }
+
+    #[test]
+    fn test_detect_runtime_bun_run_script_form() {
+        // `bun run test` is the script-runner form — same intent as `bun test`.
+        assert_eq!(
+            detect_runtime_from_command("bun run test"),
+            RequiredRuntime::Bun
+        );
+        assert_eq!(
+            detect_runtime_from_command("bun run typecheck"),
+            RequiredRuntime::Bun
+        );
+        // `bun run` of anything else is NOT a test runner — don't auto-prepare.
+        assert_eq!(
+            detect_runtime_from_command("bun run build"),
+            RequiredRuntime::None
+        );
+        assert_eq!(
+            detect_runtime_from_command("bun run dev"),
+            RequiredRuntime::None
         );
     }
 

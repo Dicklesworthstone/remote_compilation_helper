@@ -1713,7 +1713,10 @@ mod tests {
         );
 
         let style = crate::ui::theme::Style::new(false, true, false);
-        let output = render_status_verbose_detail_lines(&make_daemon_status(), &style).join("\n");
+        let verbose_lines = render_status_verbose_detail_lines(&make_daemon_status(), &style);
+        assert_ne!(verbose_lines.first().map(String::as_str), Some(""));
+
+        let output = verbose_lines.join("\n");
         assert!(output.contains("Verbose Details"));
         assert!(output.contains("Socket"));
         assert!(output.contains("/tmp/rch.sock"));
