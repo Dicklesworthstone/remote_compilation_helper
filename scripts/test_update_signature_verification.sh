@@ -1,24 +1,24 @@
 #!/usr/bin/env bash
-# test_update_signature_verification.sh — verify signature-verification
+# test_update_signature_verification.sh - verify signature-verification
 # test coverage matches bd-2bwc's 4 sub-criteria.
 set -euo pipefail
 
 case "${1:-}" in
   -h|--help)
     cat <<'HELP'
-test_update_signature_verification.sh — verify update-system signature-test coverage.
+test_update_signature_verification.sh - verify update-system signature-test coverage.
 
 Usage:
   scripts/test_update_signature_verification.sh [--help]
 
-What it checks (each assertion → one PASS/FAIL line):
+What it checks (each assertion -> one PASS/FAIL line):
   run/cargo_test                          All update::verify::tests pass.
-  coverage/valid                          ≥1 test covers valid-signature acceptance.
-  coverage/invalid                        ≥1 test covers invalid-signature rejection.
-  coverage/missing                        ≥1 test covers missing-signature handling.
-  coverage/key_rotation                   ≥1 test covers key-rotation (regex anchor).
+  coverage/valid                          >=1 test covers valid-signature acceptance.
+  coverage/invalid                        >=1 test covers invalid-signature rejection.
+  coverage/missing                        >=1 test covers missing-signature handling.
+  coverage/key_rotation                   >=1 test covers key-rotation (regex anchor).
   anchor_check/pattern_starts_with_caret  RCH_RELEASE_IDENTITY_PATTERN starts with ^.
-  anchor_check/pattern_ends_with_dollar   …and ends with .*\$ (substring-attack defense).
+  anchor_check/pattern_ends_with_dollar   ...and ends with .*$ (substring-attack defense).
 
 Environment:
   RCH_E2E_LOG  Override the JSONL log path.
@@ -52,7 +52,7 @@ print(json.dumps({
   'test': 'e2e_update_signature_verification',
   'phase': '$phase', 'event': '$event', 'status': '$status', 'detail': '$detail',
 }))" >>"$LOG_FILE"
-    echo "[$(date +%H:%M:%S)] [$status] $phase: $event ${detail:+— $detail}"
+    echo "[$(date +%H:%M:%S)] [$status] $phase: $event ${detail:+- $detail}"
 }
 
 emit setup begin INFO "log=$LOG_FILE root=$PROJECT_ROOT"

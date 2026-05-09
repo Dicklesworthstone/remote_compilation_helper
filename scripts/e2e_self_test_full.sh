@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# e2e_self_test_full.sh — Wrap the 5 self-test E2E scenarios + emit JSONL.
+# e2e_self_test_full.sh - Wrap the 5 self-test E2E scenarios + emit JSONL.
 set -euo pipefail
 
 case "${1:-}" in
   -h|--help)
     cat <<'HELP'
-e2e_self_test_full.sh — Run the 5 self-test E2E scenarios with JSONL logging.
+e2e_self_test_full.sh - Run the 5 self-test E2E scenarios with JSONL logging.
 
 Usage:
   scripts/e2e_self_test_full.sh [--help]
@@ -20,7 +20,7 @@ Scenarios (each is a #[tokio::test] in rchd/tests/e2e_self_test.rs):
 Environment:
   RCH_E2E_LOG          Override the JSONL log path.
   RCH_E2E_WORKER_HOST  Real worker hostname; remote scenarios run when set.
-  RCH_E2E_WORKER_USER  SSH user for the worker (default: \$USER).
+  RCH_E2E_WORKER_USER  SSH user for the worker (default: $USER).
   RCH_E2E_WORKER_KEY   SSH private key path (default: ~/.ssh/id_rsa).
 
 Output:
@@ -51,7 +51,7 @@ print(json.dumps({
   'test': 'e2e_self_test_full',
   'phase': '$phase', 'event': '$event', 'status': '$status', 'detail': '$detail',
 }))" >>"$LOG_FILE"
-    echo "[$(date +%H:%M:%S)] [$status] $phase: $event ${detail:+— $detail}"
+    echo "[$(date +%H:%M:%S)] [$status] $phase: $event ${detail:+- $detail}"
 }
 
 emit setup begin INFO "log=$LOG_FILE"

@@ -271,9 +271,9 @@ async fn main() -> Result<()> {
             let report = prepare::prepare(&project_path, runtime.into(), &log_dir_path).await?;
             println!("{}", serde_json::to_string(&report)?);
             // Exit code mapping (callers and e2e tests rely on these):
-            //   0 — Skipped (cache hit / no-op for non-Node) or Installed (success)
-            //   1 — Failed (install ran but exited non-zero)
-            //   2 — Timeout (install exceeded RCH_PREPARE_INSTALL_TIMEOUT_SECS, was killed)
+            //   0 - Skipped (cache hit / no-op for non-Node) or Installed (success)
+            //   1 - Failed (install ran but exited non-zero)
+            //   2 - Timeout (install exceeded RCH_PREPARE_INSTALL_TIMEOUT_SECS, was killed)
             // The two non-zero codes are distinct so an agent / shell
             // wrapper can branch on a network-stall remediation (timeout)
             // vs. a real install error (failed).

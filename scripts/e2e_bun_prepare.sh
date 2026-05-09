@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# e2e_bun_prepare.sh — E2E for the bun/node pre-execution hook (br-4998x).
+# e2e_bun_prepare.sh - E2E for the bun/node pre-execution hook (br-4998x).
 #
 # Verifies that `rch-wkr prepare` correctly caches `node_modules` across
 # runs and reports the right action (Skipped / Installed / Failed /
@@ -8,10 +8,10 @@ set -euo pipefail
 
 case "${1:-}" in
   -h|--help)
-    # Single-quoted heredoc — no command/variable substitution, so back-
+    # Single-quoted heredoc - no command/variable substitution, so back-
     # ticks and dollar-signs in the help text are safe to use literally.
     cat <<'HELP'
-e2e_bun_prepare.sh — E2E test for rch-wkr prepare (br-4998x).
+e2e_bun_prepare.sh - E2E test for rch-wkr prepare (br-4998x).
 
 Usage:
   scripts/e2e_bun_prepare.sh [--help]
@@ -52,7 +52,7 @@ PROJECT_ROOT=$(git rev-parse --show-toplevel)
 RCHWKR=${RCHWKR_BIN:-${PROJECT_ROOT}/target/release/rch-wkr}
 TMP=$(mktemp -d /tmp/rch_e2e_bun_XXXXXX)
 # Quote $TMP at trap-set time only (single-quoted body ensures it's not
-# re-expanded — it's already pinned to the safe mktemp path).
+# re-expanded - it's already pinned to the safe mktemp path).
 trap 'rm -rf "$TMP"' EXIT
 PASS=0
 FAIL=0
@@ -74,13 +74,13 @@ print(json.dumps({
   "status": os.environ.get("EMIT_STATUS", ""),
   "detail": os.environ.get("EMIT_DETAIL", ""),
 }))' >>"$LOG_FILE"
-    echo "[$(date +%H:%M:%S)] [$status] $phase: $event ${detail:+— $detail}"
+    echo "[$(date +%H:%M:%S)] [$status] $phase: $event ${detail:+- $detail}"
 }
 
 emit setup begin INFO "log=$LOG_FILE build_log=$BUILD_LOG tmp=$TMP rch_wkr=$RCHWKR"
 
 # Build rch-wkr release if missing. Build output goes to a SEPARATE log
-# file — we MUST NOT pollute the JSONL with cargo's free-form output, or
+# file - we MUST NOT pollute the JSONL with cargo's free-form output, or
 # any `jq -c` consumer would crash.
 if [ ! -x "$RCHWKR" ]; then
     emit setup build_rch_wkr INFO
@@ -107,10 +107,10 @@ else
 fi
 
 # ---------- Scenario 5: bad manifest reports Failed (no bun needed) ----------
-# This scenario validates the failure path even when bun isn't installed —
+# This scenario validates the failure path even when bun isn't installed -
 # we use an empty/corrupt package.json. compute_fingerprint succeeds (it just
 # hashes the bytes) but the actual install attempt fails (or bun is absent
-# and the spawn fails). Either is acceptable — we just need a failure mode
+# and the spawn fails). Either is acceptable - we just need a failure mode
 # that doesn't panic.
 emit s5 begin INFO "bad_manifest_handled"
 mkdir -p "$TMP/bad_proj"
@@ -164,7 +164,7 @@ fi
 # ---------- Scenario 2: Second prepare with no changes hits cache ----------
 # We assert ACTION2==Skipped and that the cache-hit path didn't actually
 # reinstall (took_ms is below an absolute install-cost threshold). We do
-# NOT compare TOOK2 < TOOK1 — both can legitimately be 0ms when bun has a
+# NOT compare TOOK2 < TOOK1 - both can legitimately be 0ms when bun has a
 # warm system cache, leading to false failures on `0 -lt 0`.
 emit s2 begin INFO "cache_hit"
 "$RCHWKR" prepare --project "$PROJ" --runtime bun >"$TMP/prep2.json" 2>>"$BUILD_LOG"

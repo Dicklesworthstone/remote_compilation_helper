@@ -321,7 +321,7 @@ pub async fn execute(workdir: &str, command: &str) -> Result<()> {
                         error!(
                             target: "rch::wkr::executor",
                             action = ?report.action,
-                            "pre-execution prepare did not finish cleanly — install log at {}",
+                            "pre-execution prepare did not finish cleanly - install log at {}",
                             p.display()
                         );
                     }

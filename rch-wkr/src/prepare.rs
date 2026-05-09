@@ -27,13 +27,13 @@ const DEFAULT_INSTALL_TIMEOUT_SECS: u64 = 300; // 5 minutes
 /// Action taken during prepare.
 ///
 /// Agents reading prepare's JSON output branch on this single field:
-/// `Skipped` and `Installed` mean the dependency state is good — the
+/// `Skipped` and `Installed` mean the dependency state is good - the
 /// user's `bun test` (etc.) will run with `node_modules/` in place.
 /// `Failed` and `Timeout` mean the install couldn't make
-/// `node_modules/` consistent — the user's command will likely emit a
+/// `node_modules/` consistent - the user's command will likely emit a
 /// clearer runtime error (e.g. "Cannot find module"). Agents can offer
 /// different remediation for `Timeout` (network / registry stall) than
-/// for `Failed` (genuine install error — see `install_log_path`).
+/// for `Failed` (genuine install error - see `install_log_path`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "PascalCase")]
 pub enum PrepareAction {
@@ -236,7 +236,7 @@ async fn persist_post_install_fingerprint(
             );
             invalidate_cached_fingerprint(project_root).await;
             // Return the pre-install fingerprint as a *report* value (best info
-            // we have) but DON'T persist it — that would be the silent-fallback
+            // we have) but DON'T persist it - that would be the silent-fallback
             // bug.
             pre_install_fingerprint.clone()
         }

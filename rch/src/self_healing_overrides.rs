@@ -11,7 +11,7 @@
 //!
 //! All fields are `AtomicBool`, set once at startup, read freely.
 //!
-//! ## Wiring (do not break this chain — agents debugging silent flag
+//! ## Wiring (do not break this chain - agents debugging silent flag
 //! drops are very unhappy):
 //!   1. main.rs parses `cli.no_self_healing` / `cli.no_hook_auto_start`
 //!      and calls [`set_no_self_healing`] / [`set_no_hook_auto_start`].
