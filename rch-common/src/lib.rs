@@ -105,8 +105,7 @@ pub use types::{
     ReleaseRequest, RequiredRuntime, RetryConfig, SavedTimeStats, SelectedWorker, SelectionConfig,
     SelectionReason, SelectionRequest, SelectionResponse, SelectionStrategy, SelectionWeightConfig,
     SelfHealingConfig, SelfHealingLogLevel, SelfTestConfig, SelfTestFailureAction, SelfTestWorkers,
-    TransferConfig,
-    WorkerCapabilities, WorkerConfig, WorkerId, WorkerStatus, default_socket_path,
+    TransferConfig, WorkerCapabilities, WorkerConfig, WorkerId, WorkerStatus, default_socket_path,
     validate_remote_base,
 };
 

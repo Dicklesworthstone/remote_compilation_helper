@@ -1252,7 +1252,6 @@ fn render_status_verbose_detail_lines(
     style: &Theme,
 ) -> Vec<String> {
     let mut lines = vec![
-        String::new(),
         style.format_header("Verbose Details"),
         String::new(),
         format!(

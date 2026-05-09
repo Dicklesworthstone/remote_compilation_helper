@@ -12,11 +12,11 @@ mod commands;
 mod completions;
 mod config;
 mod doctor;
-mod self_healing_overrides;
 pub mod error;
 pub mod fleet;
 #[cfg_attr(not(unix), path = "hook_windows.rs")]
 mod hook;
+mod self_healing_overrides;
 pub mod state;
 mod status_display;
 mod status_types;

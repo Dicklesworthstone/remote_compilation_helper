@@ -4,6 +4,28 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RCH_BIN="${RCH_BIN:-$ROOT/target/debug/rch}"
 
+usage() {
+  cat <<'USAGE'
+Usage: scripts/test_verbose_flag.sh
+
+Checks that --verbose adds human diagnostics without contaminating JSON output.
+
+Environment:
+  RCH_BIN    Path to the rch binary to test. Defaults to target/debug/rch.
+  TMPDIR     Base directory for test artifacts. Defaults to /tmp.
+USAGE
+}
+
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+  usage
+  exit 0
+fi
+
+if [[ $# -gt 0 ]]; then
+  usage >&2
+  exit 2
+fi
+
 if [[ ! -x "$RCH_BIN" ]]; then
   echo "Building rch debug binary..."
   (cd "$ROOT" && cargo build -p rch)
@@ -25,10 +47,26 @@ TOML
 NORMAL_OUT="$CONFIG_HOME/workers-normal.out"
 VERBOSE_OUT="$CONFIG_HOME/workers-verbose.out"
 JSON_OUT="$CONFIG_HOME/workers-verbose.json"
+NORMAL_ERR="$CONFIG_HOME/workers-normal.err"
+VERBOSE_ERR="$CONFIG_HOME/workers-verbose.err"
+JSON_ERR="$CONFIG_HOME/workers-verbose-json.err"
 
-XDG_CONFIG_HOME="$CONFIG_HOME" "$RCH_BIN" workers list > "$NORMAL_OUT"
-XDG_CONFIG_HOME="$CONFIG_HOME" "$RCH_BIN" --verbose workers list > "$VERBOSE_OUT"
-XDG_CONFIG_HOME="$CONFIG_HOME" "$RCH_BIN" --verbose --json workers list > "$JSON_OUT"
+run_capture() {
+  local stdout_file="$1"
+  local stderr_file="$2"
+  shift 2
+
+  if ! XDG_CONFIG_HOME="$CONFIG_HOME" "$RCH_BIN" "$@" > "$stdout_file" 2> "$stderr_file"; then
+    echo "command failed: $RCH_BIN $*" >&2
+    echo "stdout: $stdout_file" >&2
+    echo "stderr: $stderr_file" >&2
+    return 1
+  fi
+}
+
+run_capture "$NORMAL_OUT" "$NORMAL_ERR" workers list
+run_capture "$VERBOSE_OUT" "$VERBOSE_ERR" --verbose workers list
+run_capture "$JSON_OUT" "$JSON_ERR" --verbose --json workers list
 
 if grep -q "SSH Key" "$NORMAL_OUT"; then
   echo "normal workers list unexpectedly showed verbose SSH key detail" >&2
