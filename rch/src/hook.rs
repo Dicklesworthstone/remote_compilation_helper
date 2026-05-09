@@ -52,7 +52,10 @@ use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -104,6 +107,8 @@ const RCH_CARGO_WRAPPER_BYPASS_ENV: &str = "RCH_CARGO_WRAPPER_BYPASS";
 const RCH_REQUIRE_REMOTE_ENV: &str = "RCH_REQUIRE_REMOTE";
 const RCH_WORKER_ENV: &str = "RCH_WORKER";
 const RCH_WORKERS_ENV: &str = "RCH_WORKERS";
+
+static HOOK_MODE_PANIC_FAIL_OPEN: AtomicBool = AtomicBool::new(false);
 
 use rch_common::util::mask_sensitive_command;
 
@@ -237,6 +242,8 @@ pub async fn run_hook() -> anyhow::Result<()> {
 ///
 /// Call this BEFORE any code that could panic.
 pub fn install_hook_mode_panic_handler() {
+    enable_hook_mode_panic_fail_open();
+
     // Idempotent guard: only install once.
     use std::sync::Once;
     static ONCE: Once = Once::new();
@@ -245,11 +252,7 @@ pub fn install_hook_mode_panic_handler() {
         // (e.g. `rch exec`) keep their normal panic output.
         let original = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
-            if std::env::var("RCH_HOOK_MODE")
-                .ok()
-                .as_deref()
-                .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            {
+            if hook_mode_panic_fail_open_enabled() {
                 // Hook mode: log to stderr quietly, then exit 0 so the
                 // agent's Bash command runs locally. Don't print the
                 // backtrace to stderr (Claude Code may surface it).
@@ -268,6 +271,18 @@ pub fn install_hook_mode_panic_handler() {
             }
         }));
     });
+}
+
+fn enable_hook_mode_panic_fail_open() {
+    HOOK_MODE_PANIC_FAIL_OPEN.store(true, Ordering::Release);
+}
+
+fn hook_mode_panic_fail_open_enabled() -> bool {
+    HOOK_MODE_PANIC_FAIL_OPEN.load(Ordering::Acquire)
+        || std::env::var("RCH_HOOK_MODE")
+            .ok()
+            .as_deref()
+            .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
 }
 
 /// Execute a compilation command on a remote worker.
@@ -6191,6 +6206,19 @@ mod tests {
         for value in ["", "0", "false", "no", "off", "remote"] {
             assert!(!env_flag_enabled(value), "{value} should not be truthy");
         }
+    }
+
+    #[test]
+    fn hook_panic_fail_open_can_be_enabled_without_env_var() {
+        let _guard = test_guard!();
+
+        let previous = HOOK_MODE_PANIC_FAIL_OPEN.swap(false, Ordering::AcqRel);
+        enable_hook_mode_panic_fail_open();
+        assert!(
+            hook_mode_panic_fail_open_enabled(),
+            "installing the hook panic handler must mark no-subcommand hook mode as fail-open even when RCH_HOOK_MODE is unset"
+        );
+        HOOK_MODE_PANIC_FAIL_OPEN.store(previous, Ordering::Release);
     }
 
     fn test_lock() -> &'static Mutex<()> {
