@@ -79,3 +79,6 @@ storage.sqlite3-*
 .rch-target-*/
 rch-bin/
 rch-install/
+
+# Beads compliance audit dir (managed by /beads-compliance-and-completion-verification skill)
+/beads_compliance_audit/

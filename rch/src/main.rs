@@ -113,7 +113,7 @@ struct Cli {
     quiet: bool,
 
     /// Output as JSON for machine parsing
-    #[arg(short = 'j', long, global = true)]
+    #[arg(short = 'j', long, global = true, alias = "jason", alias = "jsno")]
     json: bool,
 
     /// Machine output format: json or toon
@@ -130,6 +130,14 @@ struct Cli {
     /// Color output mode: auto, always, never
     #[arg(long, global = true, default_value = "auto")]
     color: String,
+
+    /// Disable ANSI color output
+    #[arg(long, global = true)]
+    no_color: bool,
+
+    /// Agent mega-command with quick_ref, recommended commands, and health probes
+    #[arg(long, global = true)]
+    robot_triage: bool,
 
     /// Emit JSON Schema for command output format
     ///
@@ -706,6 +714,30 @@ The web dashboard provides a modern browser-based interface for:
         prod: bool,
     },
 
+    /// List RCH capabilities for machine discovery
+    #[command(after_help = r#"EXAMPLES:
+    rch capabilities --json       # Stable agent-readable capability envelope
+    rch capabilities --format toon  # Same data in TOON format
+    rch --capabilities            # Legacy raw JSON capability flag
+
+The capabilities report includes command names, aliases, output formats,
+environment variables, exit codes, and recommended agent entry points."#)]
+    Capabilities,
+
+    /// In-tool documentation for AI coding agents
+    #[command(
+        name = "robot-docs",
+        after_help = r#"EXAMPLES:
+    rch robot-docs guide          # Paste-ready agent handbook
+    rch robot-docs guide --json   # Same guide in the API response envelope
+
+Use this when an agent needs the operating contract without opening README.md."#
+    )]
+    RobotDocs {
+        #[command(subcommand)]
+        action: RobotDocsAction,
+    },
+
     /// Export API schemas and error code documentation
     #[command(after_help = r#"EXAMPLES:
     rch schema export                     # Export to docs/api/schemas/
@@ -736,6 +768,12 @@ enum SchemaAction {
     },
     /// List available schemas
     List,
+}
+
+#[derive(Subcommand)]
+enum RobotDocsAction {
+    /// Print the agent-oriented operating guide
+    Guide,
 }
 
 #[derive(Subcommand)]
@@ -1379,12 +1417,14 @@ async fn main() -> Result<()> {
     // (which would fail on subcommands that require further arguments)
     let args: Vec<String> = env::args().collect();
     if args.iter().any(|a| a == "--help-json") {
-        let subcommand = args
+        let subcommand_path: Vec<String> = args
             .iter()
+            .skip_while(|a| a.as_str() != "--help-json")
             .skip(1)
-            .find(|a| !a.starts_with('-'))
-            .map(|s| s.as_str());
-        return handle_help_json_early(subcommand);
+            .filter(|a| !a.starts_with('-'))
+            .cloned()
+            .collect();
+        return handle_help_json_early(&subcommand_path);
     }
 
     // Early check for --capabilities (standalone flag, no subcommand context needed)
@@ -1415,10 +1455,20 @@ async fn main() -> Result<()> {
         format,
         verbose: cli.verbose,
         quiet: cli.quiet,
-        color: ColorChoice::parse(&cli.color),
+        color: if cli.no_color {
+            ColorChoice::Never
+        } else {
+            ColorChoice::parse(&cli.color)
+        },
         ..Default::default()
     };
     let ctx = Arc::new(OutputContext::new(output_config));
+
+    // Agent-oriented mega-command. Handle before hook mode so `rch --robot-triage`
+    // never waits for stdin when an agent is asking what to do next.
+    if cli.robot_triage {
+        return handle_robot_triage(&ctx);
+    }
 
     // Handle --schema flag: output JSON Schema for command's JSON output format
     if cli.schema {
@@ -1558,6 +1608,8 @@ async fn main() -> Result<()> {
                 no_open,
                 prod,
             } => handle_web(port, no_open, prod, &ctx).await,
+            Commands::Capabilities => handle_capabilities_command(&ctx),
+            Commands::RobotDocs { action } => handle_robot_docs(action, &ctx),
             Commands::Schema { action } => handle_schema_command(action, &ctx),
         },
     }
@@ -1768,6 +1820,8 @@ struct HelpJsonOutput {
     about: Option<String>,
     subcommands: Vec<SubcommandHelp>,
     global_flags: Vec<ArgHelp>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    arguments: Vec<ArgHelp>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
@@ -1796,34 +1850,35 @@ struct ArgHelp {
 }
 
 /// Handle --help-json flag early (before full clap parsing).
-/// Takes an optional subcommand name as a string.
-fn handle_help_json_early(subcommand: Option<&str>) -> Result<()> {
+/// Accepts a subcommand path either as space-separated parts (`workers list`)
+/// or slash-separated parts (`workers/list`).
+fn handle_help_json_early(subcommand_path: &[String]) -> Result<()> {
     let cmd = Cli::command();
 
-    let output = match subcommand {
-        None => {
-            // Full CLI structure
-            build_help_json(&cmd)
-        }
-        Some(subcmd_name) => {
-            // Find the specific subcommand (supporting nested lookups like "workers/list")
-            let parts: Vec<&str> = subcmd_name.split('/').collect();
-            let mut current_cmd = &cmd;
+    let output = if subcommand_path.is_empty() {
+        // Full CLI structure
+        build_help_json(&cmd)
+    } else {
+        // Find the specific subcommand (supporting nested lookups like "workers/list")
+        let mut current_cmd = &cmd;
+        let mut traversed = Vec::new();
 
-            for part in &parts {
-                match current_cmd
-                    .get_subcommands()
-                    .find(|s| s.get_name() == *part)
-                {
+        for raw_part in subcommand_path {
+            for part in raw_part.split('/').filter(|part| !part.is_empty()) {
+                traversed.push(part.to_string());
+                match current_cmd.get_subcommands().find(|s| s.get_name() == part) {
                     Some(sub) => current_cmd = sub,
                     None => {
-                        eprintln!("Unknown subcommand: {subcmd_name}");
+                        eprintln!("Unknown subcommand path: {}", traversed.join("/"));
+                        eprintln!(
+                            "Try a valid path from `rch --help-json`, for example: rch --help-json workers/list"
+                        );
                         std::process::exit(1);
                     }
                 }
             }
-            build_help_json(current_cmd)
         }
+        build_help_json(current_cmd)
     };
 
     let json = serde_json::to_string_pretty(&output)?;
@@ -1844,6 +1899,11 @@ fn build_help_json(cmd: &clap::Command) -> HelpJsonOutput {
         global_flags: cmd
             .get_arguments()
             .filter(|a| a.is_global_set() && a.get_id() != "help" && a.get_id() != "version")
+            .map(build_arg_help)
+            .collect(),
+        arguments: cmd
+            .get_arguments()
+            .filter(|a| !a.is_global_set() && a.get_id() != "help" && a.get_id() != "version")
             .map(build_arg_help)
             .collect(),
     }
@@ -1889,6 +1949,10 @@ fn build_arg_help(arg: &clap::Arg) -> ArgHelp {
 /// JSON structure for --capabilities output.
 #[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
 struct CapabilitiesOutput {
+    /// Agent-facing contract version for this capability payload.
+    contract_version: String,
+    /// Schema identifier for this payload shape.
+    schema_version: String,
     /// RCH version
     version: String,
     /// Build timestamp if available
@@ -1904,6 +1968,12 @@ struct CapabilitiesOutput {
     hook_formats: Vec<String>,
     /// Machine-readable output formats
     output_formats: Vec<String>,
+    /// Semantic process exit codes used by CLI commands.
+    exit_codes: Vec<ExitCodeCapability>,
+    /// Environment variables that affect RCH behavior.
+    env_vars: Vec<EnvVarCapability>,
+    /// Copy-paste-ready commands agents should try first.
+    recommended_commands: Vec<RecommendedCommand>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
@@ -1922,6 +1992,9 @@ struct CommandCapability {
     description: String,
     /// Brief category: "setup", "monitoring", "management", "configuration"
     category: String,
+    /// Alternate command names accepted by clap.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    aliases: Vec<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
@@ -1931,9 +2004,29 @@ struct FeatureCapability {
     enabled: bool,
 }
 
-/// Handle --capabilities flag: output RCH capabilities for machine discovery.
-fn handle_capabilities() -> Result<()> {
-    let output = CapabilitiesOutput {
+#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
+struct ExitCodeCapability {
+    code: i32,
+    meaning: String,
+    agent_action: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
+struct EnvVarCapability {
+    name: String,
+    effect: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
+struct RecommendedCommand {
+    command: String,
+    purpose: String,
+}
+
+fn build_capabilities_output() -> CapabilitiesOutput {
+    CapabilitiesOutput {
+        contract_version: "rch.capabilities.v1".to_string(),
+        schema_version: "1.0".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         build_timestamp: option_env!("RCH_BUILD_TIMESTAMP").map(|s| s.to_string()),
         runtimes: vec![
@@ -1957,115 +2050,36 @@ fn handle_capabilities() -> Result<()> {
                     "jsx".to_string(),
                     "tsx".to_string(),
                 ],
-                example_commands: vec![
-                    "bun build".to_string(),
-                    "bun test".to_string(),
-                    "bun run".to_string(),
-                ],
+                example_commands: vec!["bun test".to_string(), "bun typecheck".to_string()],
             },
             RuntimeCapability {
                 name: "node".to_string(),
-                description: "Node.js JavaScript runtime".to_string(),
+                description: "Node.js/npm capability detection for worker parity".to_string(),
                 extensions: vec!["js".to_string(), "ts".to_string(), "mjs".to_string()],
+                example_commands: vec!["node --version".to_string(), "npm --version".to_string()],
+            },
+            RuntimeCapability {
+                name: "c-cpp".to_string(),
+                description: "C and C++ compiler commands".to_string(),
+                extensions: vec!["c".to_string(), "cc".to_string(), "cpp".to_string()],
                 example_commands: vec![
-                    "npm run build".to_string(),
-                    "npm test".to_string(),
-                    "npx".to_string(),
+                    "gcc -o main main.c".to_string(),
+                    "clang++ -O2 -o app main.cpp".to_string(),
+                ],
+            },
+            RuntimeCapability {
+                name: "build-systems".to_string(),
+                description: "Make, CMake, Ninja, and Meson build commands".to_string(),
+                extensions: vec![],
+                example_commands: vec![
+                    "make".to_string(),
+                    "cmake --build build".to_string(),
+                    "ninja".to_string(),
+                    "meson compile -C build".to_string(),
                 ],
             },
         ],
-        commands: vec![
-            CommandCapability {
-                name: "init".to_string(),
-                description: "Interactive first-time setup wizard".to_string(),
-                category: "setup".to_string(),
-            },
-            CommandCapability {
-                name: "daemon".to_string(),
-                description: "Control the RCH daemon (start/stop/status)".to_string(),
-                category: "management".to_string(),
-            },
-            CommandCapability {
-                name: "workers".to_string(),
-                description: "Manage remote workers (list/probe/setup)".to_string(),
-                category: "management".to_string(),
-            },
-            CommandCapability {
-                name: "status".to_string(),
-                description: "Show system status overview".to_string(),
-                category: "monitoring".to_string(),
-            },
-            CommandCapability {
-                name: "queue".to_string(),
-                description: "View build queue status".to_string(),
-                category: "monitoring".to_string(),
-            },
-            CommandCapability {
-                name: "cancel".to_string(),
-                description: "Cancel running builds".to_string(),
-                category: "management".to_string(),
-            },
-            CommandCapability {
-                name: "config".to_string(),
-                description: "View and modify configuration".to_string(),
-                category: "configuration".to_string(),
-            },
-            CommandCapability {
-                name: "diagnose".to_string(),
-                description: "Diagnose command routing decisions".to_string(),
-                category: "debugging".to_string(),
-            },
-            CommandCapability {
-                name: "hook".to_string(),
-                description: "Manage Claude Code hook integration".to_string(),
-                category: "setup".to_string(),
-            },
-            CommandCapability {
-                name: "agents".to_string(),
-                description: "Manage AI coding agent integrations".to_string(),
-                category: "setup".to_string(),
-            },
-            CommandCapability {
-                name: "completions".to_string(),
-                description: "Generate shell completions".to_string(),
-                category: "setup".to_string(),
-            },
-            CommandCapability {
-                name: "doctor".to_string(),
-                description: "Diagnose and fix system issues".to_string(),
-                category: "debugging".to_string(),
-            },
-            CommandCapability {
-                name: "self-test".to_string(),
-                description: "Run end-to-end self-tests".to_string(),
-                category: "debugging".to_string(),
-            },
-            CommandCapability {
-                name: "update".to_string(),
-                description: "Update RCH binaries".to_string(),
-                category: "management".to_string(),
-            },
-            CommandCapability {
-                name: "fleet".to_string(),
-                description: "Deploy and manage worker fleet".to_string(),
-                category: "management".to_string(),
-            },
-            CommandCapability {
-                name: "speedscore".to_string(),
-                description: "View worker performance scores".to_string(),
-                category: "monitoring".to_string(),
-            },
-            CommandCapability {
-                name: "dashboard".to_string(),
-                description: "Interactive TUI dashboard".to_string(),
-                category: "monitoring".to_string(),
-            },
-            CommandCapability {
-                name: "web".to_string(),
-                description: "Web-based dashboard".to_string(),
-                category: "monitoring".to_string(),
-            },
-        ],
+        commands: command_capabilities(),
         features: vec![
             FeatureCapability {
                 name: "rich-ui".to_string(),
@@ -2088,6 +2102,22 @@ fn handle_capabilities() -> Result<()> {
                 enabled: true,
             },
             FeatureCapability {
+                name: "capabilities-command".to_string(),
+                description: "Agent-readable capability report via `rch capabilities --json`"
+                    .to_string(),
+                enabled: true,
+            },
+            FeatureCapability {
+                name: "robot-docs".to_string(),
+                description: "In-tool agent handbook via `rch robot-docs guide`".to_string(),
+                enabled: true,
+            },
+            FeatureCapability {
+                name: "robot-triage".to_string(),
+                description: "Agent mega-command via `rch --robot-triage --json`".to_string(),
+                enabled: true,
+            },
+            FeatureCapability {
                 name: "shell-completions".to_string(),
                 description: "Tab completion for bash, zsh, fish, etc.".to_string(),
                 enabled: true,
@@ -2103,10 +2133,340 @@ fn handle_capabilities() -> Result<()> {
             "gemini-cli".to_string(),
         ],
         output_formats: vec!["json".to_string(), "toon".to_string(), "human".to_string()],
-    };
+        exit_codes: exit_code_capabilities(),
+        env_vars: env_var_capabilities(),
+        recommended_commands: recommended_commands(),
+    }
+}
+
+/// Handle --capabilities flag: output raw RCH capabilities for machine discovery.
+fn handle_capabilities() -> Result<()> {
+    let output = build_capabilities_output();
 
     let json = serde_json::to_string_pretty(&output)?;
     println!("{json}");
+    Ok(())
+}
+
+fn handle_capabilities_command(ctx: &OutputContext) -> Result<()> {
+    let output = build_capabilities_output();
+    if ctx.is_json() {
+        ctx.json(&ApiResponse::ok("capabilities", output))?;
+    } else {
+        ctx.header("RCH Capabilities");
+        ctx.key_value("Contract", &output.contract_version);
+        ctx.key_value("Version", &output.version);
+        ctx.key_value("Commands", &output.commands.len().to_string());
+        ctx.key_value("Output formats", &output.output_formats.join(", "));
+        ctx.print("");
+        ctx.print("Recommended agent entry points:");
+        for command in &output.recommended_commands {
+            ctx.print(&format!("  {}  # {}", command.command, command.purpose));
+        }
+    }
+    Ok(())
+}
+
+fn command_capabilities() -> Vec<CommandCapability> {
+    Cli::command()
+        .get_subcommands()
+        .filter(|cmd| !cmd.is_hide_set() && cmd.get_name() != "help")
+        .map(|cmd| {
+            let name = cmd.get_name().to_string();
+            CommandCapability {
+                description: cmd.get_about().map(|s| s.to_string()).unwrap_or_default(),
+                category: command_category(&name).to_string(),
+                aliases: cmd
+                    .get_all_aliases()
+                    .map(|alias| alias.to_string())
+                    .collect(),
+                name,
+            }
+        })
+        .collect()
+}
+
+fn command_category(name: &str) -> &'static str {
+    match name {
+        "init" | "hook" | "agents" | "completions" => "setup",
+        "status" | "check" | "queue" | "speedscore" | "dashboard" | "web" => "monitoring",
+        "daemon" | "workers" | "cancel" | "exec" | "update" | "fleet" => "management",
+        "config" => "configuration",
+        "diagnose" | "doctor" | "self-test" | "schema" => "debugging",
+        "capabilities" | "robot-docs" => "agent-docs",
+        _ => "general",
+    }
+}
+
+fn exit_code_capabilities() -> Vec<ExitCodeCapability> {
+    vec![
+        ExitCodeCapability {
+            code: 0,
+            meaning: "success".to_string(),
+            agent_action: "Continue; stdout contains the requested data in machine mode."
+                .to_string(),
+        },
+        ExitCodeCapability {
+            code: 1,
+            meaning: "general error or degraded health".to_string(),
+            agent_action: "Read stderr or the JSON error/remediation fields; do not retry blindly."
+                .to_string(),
+        },
+        ExitCodeCapability {
+            code: 2,
+            meaning: "usage error or not ready health check".to_string(),
+            agent_action:
+                "Correct the command shape, or run `rch doctor --json` when this came from `rch check`."
+                    .to_string(),
+        },
+        ExitCodeCapability {
+            code: 100,
+            meaning: "network or SSH failure".to_string(),
+            agent_action: "Run `rch workers probe --all --json` and inspect RCH-E1xx errors."
+                .to_string(),
+        },
+        ExitCodeCapability {
+            code: 101,
+            meaning: "worker error".to_string(),
+            agent_action: "Inspect `rch workers list --json` and worker capability mismatches."
+                .to_string(),
+        },
+        ExitCodeCapability {
+            code: 102,
+            meaning: "remote build failed".to_string(),
+            agent_action: "Treat as the build/test command result; local re-run is usually redundant."
+                .to_string(),
+        },
+    ]
+}
+
+fn env_var_capabilities() -> Vec<EnvVarCapability> {
+    vec![
+        EnvVarCapability {
+            name: "RCH_OUTPUT_FORMAT".to_string(),
+            effect: "Set machine output format: json or toon; implies machine output.".to_string(),
+        },
+        EnvVarCapability {
+            name: "TOON_DEFAULT_FORMAT".to_string(),
+            effect: "Default format when --json is set: json or toon.".to_string(),
+        },
+        EnvVarCapability {
+            name: "RCH_HOOK_MODE".to_string(),
+            effect: "Force no-subcommand invocation to read Claude Code hook JSON from stdin."
+                .to_string(),
+        },
+        EnvVarCapability {
+            name: "RCH_JSON".to_string(),
+            effect: "Force hook/machine JSON behavior for automation.".to_string(),
+        },
+        EnvVarCapability {
+            name: "NO_COLOR".to_string(),
+            effect: "Disable ANSI color output.".to_string(),
+        },
+        EnvVarCapability {
+            name: "RCH_DAEMON_SOCKET".to_string(),
+            effect: "Override daemon Unix socket path.".to_string(),
+        },
+        EnvVarCapability {
+            name: "RCH_DAEMON_TIMEOUT_MS".to_string(),
+            effect: "Override daemon communication timeout in milliseconds.".to_string(),
+        },
+        EnvVarCapability {
+            name: "RCH_MOCK_SSH".to_string(),
+            effect: "Enable mock SSH for tests and offline verification.".to_string(),
+        },
+        EnvVarCapability {
+            name: "RCH_VISIBILITY".to_string(),
+            effect: "Control hook output visibility: none, summary, or verbose.".to_string(),
+        },
+    ]
+}
+
+fn recommended_commands() -> Vec<RecommendedCommand> {
+    vec![
+        RecommendedCommand {
+            command: "rch --robot-triage --json".to_string(),
+            purpose: "Single-call agent quick reference with next commands.".to_string(),
+        },
+        RecommendedCommand {
+            command: "rch capabilities --json".to_string(),
+            purpose: "Discover commands, output formats, env vars, and exit codes.".to_string(),
+        },
+        RecommendedCommand {
+            command: "rch robot-docs guide".to_string(),
+            purpose: "Read the in-tool agent handbook without external docs.".to_string(),
+        },
+        RecommendedCommand {
+            command: "rch check --json".to_string(),
+            purpose: "Fast readiness probe with stable exit codes.".to_string(),
+        },
+        RecommendedCommand {
+            command: "rch diagnose \"cargo test\" --json".to_string(),
+            purpose: "Explain whether a command will be offloaded.".to_string(),
+        },
+        RecommendedCommand {
+            command: "rch doctor --dry-run --json".to_string(),
+            purpose: "Get remediation steps without making changes.".to_string(),
+        },
+    ]
+}
+
+#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
+struct RobotDocsGuideOutput {
+    contract_version: String,
+    guide: String,
+    canonical_commands: Vec<RecommendedCommand>,
+    output_contracts: Vec<String>,
+    safety_notes: Vec<String>,
+}
+
+fn handle_robot_docs(action: RobotDocsAction, ctx: &OutputContext) -> Result<()> {
+    match action {
+        RobotDocsAction::Guide => {
+            let output = RobotDocsGuideOutput {
+                contract_version: "rch.robot_docs.v1".to_string(),
+                guide: robot_docs_guide_text().to_string(),
+                canonical_commands: recommended_commands(),
+                output_contracts: vec![
+                    "Use --json or --format toon for parseable stdout.".to_string(),
+                    "Diagnostics, progress, and remediation text belong on stderr.".to_string(),
+                    "JSON commands use the ApiResponse envelope unless documented as legacy raw JSON."
+                        .to_string(),
+                ],
+                safety_notes: vec![
+                    "Prefer --dry-run before commands that change hooks, workers, or fleet state."
+                        .to_string(),
+                    "Use --yes only when the intended mutation is explicit.".to_string(),
+                    "If remote execution is unavailable, RCH fails open to local execution.".to_string(),
+                ],
+            };
+
+            if ctx.is_json() {
+                ctx.json(&ApiResponse::ok("robot-docs guide", output))?;
+            } else {
+                ctx.print(robot_docs_guide_text());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn robot_docs_guide_text() -> &'static str {
+    r#"RCH Agent Guide
+
+Primary contract:
+  RCH transparently offloads build/test commands to remote workers. If remote
+  execution is unavailable or unsafe, it fails open and lets the command run
+  locally.
+
+First commands to try:
+  rch --robot-triage --json       One-call quick_ref and recommended commands
+  rch capabilities --json         Machine-readable command/env/exit-code map
+  rch check --json                Fast readiness status
+  rch status --workers --jobs --json
+  rch diagnose "cargo test" --json
+  rch doctor --dry-run --json
+
+Output rules:
+  stdout is data. stderr is diagnostics. Use --json for JSON and
+  --format toon for TOON. Use --no-color, NO_COLOR=1, CI=true, or TERM=dumb
+  when output must be plain.
+
+Safe mutation rules:
+  Use --dry-run before hook, worker, update, and fleet changes when available.
+  Use --yes only when the target operation is explicit. For active builds,
+  prefer graceful cancellation before --force.
+
+Common workflows:
+  Install and validate hook:
+    rch hook install
+    rch hook test
+    rch check --json
+
+  Explain routing:
+    rch diagnose "cargo build --release" --json
+    rch diagnose "bun test" --json
+
+  Inspect fleet health:
+    rch workers list --json
+    rch workers probe --all --json
+    rch workers capabilities --refresh --json
+
+  Repair safely:
+    rch doctor --dry-run --json
+    rch config validate --json
+"#
+}
+
+#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
+struct RobotTriageOutput {
+    contract_version: String,
+    quick_ref: RobotTriageQuickRef,
+    recommended_commands: Vec<RecommendedCommand>,
+    health_checks: Vec<RecommendedCommand>,
+    safety_notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
+struct RobotTriageQuickRef {
+    purpose: String,
+    default_probe: String,
+    machine_output: Vec<String>,
+    no_external_docs_needed: bool,
+}
+
+fn handle_robot_triage(ctx: &OutputContext) -> Result<()> {
+    let output = RobotTriageOutput {
+        contract_version: "rch.robot_triage.v1".to_string(),
+        quick_ref: RobotTriageQuickRef {
+            purpose: "Transparent remote compilation offload for AI coding agents.".to_string(),
+            default_probe: "rch check --json".to_string(),
+            machine_output: vec![
+                "--json".to_string(),
+                "--format toon".to_string(),
+                "RCH_OUTPUT_FORMAT=json|toon".to_string(),
+            ],
+            no_external_docs_needed: true,
+        },
+        recommended_commands: recommended_commands(),
+        health_checks: vec![
+            RecommendedCommand {
+                command: "rch check --json".to_string(),
+                purpose: "Fast readiness gate; exit 0 ready, 1 degraded, 2 not ready.".to_string(),
+            },
+            RecommendedCommand {
+                command: "rch status --workers --jobs --json".to_string(),
+                purpose: "Detailed daemon, worker, and active-job view.".to_string(),
+            },
+            RecommendedCommand {
+                command: "rch workers probe --all --json".to_string(),
+                purpose: "Connectivity probe for every configured worker.".to_string(),
+            },
+        ],
+        safety_notes: vec![
+            "Run mutating commands with --dry-run first when the flag exists.".to_string(),
+            "Use `rch diagnose <command> --json` before forcing local/remote behavior.".to_string(),
+            "If RCH cannot safely offload, it fails open instead of blocking builds.".to_string(),
+        ],
+    };
+
+    if ctx.is_json() {
+        ctx.json(&ApiResponse::ok("robot-triage", output))?;
+    } else {
+        ctx.header("RCH Robot Triage");
+        ctx.key_value("Purpose", &output.quick_ref.purpose);
+        ctx.key_value("Default probe", &output.quick_ref.default_probe);
+        ctx.print("");
+        ctx.print("Recommended commands:");
+        for command in &output.recommended_commands {
+            ctx.print(&format!("  {}  # {}", command.command, command.purpose));
+        }
+        ctx.print("");
+        ctx.print("Health checks:");
+        for command in &output.health_checks {
+            ctx.print(&format!("  {}  # {}", command.command, command.purpose));
+        }
+    }
     Ok(())
 }
 
@@ -2677,6 +3037,48 @@ mod tests {
         let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "--color", "auto"]).unwrap();
         assert_eq!(cli.color, "auto");
+    }
+
+    #[test]
+    fn cli_parses_no_color_flag() {
+        let _guard = test_guard!();
+        let cli = Cli::try_parse_from(["rch", "--no-color"]).unwrap();
+        assert!(cli.no_color);
+    }
+
+    #[test]
+    fn cli_parses_json_typo_aliases() {
+        let _guard = test_guard!();
+        let jsno = Cli::try_parse_from(["rch", "--jsno"]).unwrap();
+        let jason = Cli::try_parse_from(["rch", "--jason"]).unwrap();
+        assert!(jsno.json);
+        assert!(jason.json);
+    }
+
+    #[test]
+    fn cli_parses_robot_triage_flag() {
+        let _guard = test_guard!();
+        let cli = Cli::try_parse_from(["rch", "--robot-triage"]).unwrap();
+        assert!(cli.robot_triage);
+    }
+
+    #[test]
+    fn cli_parses_capabilities_command() {
+        let _guard = test_guard!();
+        let cli = Cli::try_parse_from(["rch", "capabilities"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::Capabilities)));
+    }
+
+    #[test]
+    fn cli_parses_robot_docs_guide() {
+        let _guard = test_guard!();
+        let cli = Cli::try_parse_from(["rch", "robot-docs", "guide"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::RobotDocs {
+                action: RobotDocsAction::Guide
+            })
+        ));
     }
 
     // -------------------------------------------------------------------------

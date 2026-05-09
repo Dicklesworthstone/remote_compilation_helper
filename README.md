@@ -200,6 +200,10 @@ Global flags:
 -j, --json
 -F, --format json|toon
 --color auto|always|never
+--no-color
+--schema
+--help-json
+--robot-triage
 ```
 
 ### Core Operations
@@ -220,6 +224,9 @@ rch hook install|uninstall|status|test
 rch agents list|status|install-hook|uninstall-hook
 rch diagnose "cargo build --release"
 rch exec -- cargo build --release
+rch --robot-triage --json
+rch capabilities --json
+rch robot-docs guide
 ```
 
 ### Config + Diagnostics
@@ -243,6 +250,21 @@ rch web
 rch schema export|list
 rch completions generate|install|uninstall|status
 ```
+
+### Agent Discovery Surface
+
+For AI agents and automation, start with:
+
+```bash
+rch --robot-triage --json       # quick_ref + recommended commands + health probes
+rch capabilities --json         # commands, aliases, env vars, exit codes, output formats
+rch robot-docs guide            # in-tool operating guide, no README lookup needed
+rch --help-json workers/list    # machine-readable help for nested command paths
+```
+
+`--json` uses the standard API envelope for command output; `--format toon`
+emits the same data as TOON. The legacy `rch --capabilities` flag remains a
+raw JSON shortcut for lightweight discovery.
 
 ---
 

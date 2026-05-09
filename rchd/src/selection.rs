@@ -4765,7 +4765,7 @@ mod tests {
 
         let result = selector.select(&pool, &request).await;
         assert!(result.worker.is_none());
-        assert_eq!(result.reason, SelectionReason::AllWorkersBusy);
+        assert_eq!(result.reason, SelectionReason::NoWorkersPassedHealth);
     }
 
     // ========================================================================

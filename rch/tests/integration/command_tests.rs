@@ -727,6 +727,70 @@ fn test_help_json_with_subcommand() {
 }
 
 #[test]
+fn test_help_json_nested_subcommand_includes_arguments() {
+    init_test_logging();
+    crate::test_log!("TEST START: test_help_json_nested_subcommand_includes_arguments");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_rch"))
+        .args(["--help-json", "workers/list"])
+        .output()
+        .expect("Failed to run rch --help-json workers/list");
+
+    assert!(
+        output.status.success(),
+        "rch --help-json workers/list failed"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("--help-json workers/list should output valid JSON");
+
+    assert_eq!(
+        parsed.get("name").and_then(|v| v.as_str()),
+        Some("list"),
+        "Should be the workers list subcommand"
+    );
+
+    let arg_names: Vec<&str> = parsed
+        .get("arguments")
+        .and_then(|v| v.as_array())
+        .expect("nested help should include an arguments array")
+        .iter()
+        .filter_map(|arg| arg.get("name").and_then(|v| v.as_str()))
+        .collect();
+
+    assert!(
+        arg_names.contains(&"speedscore"),
+        "workers/list help-json should expose the --speedscore flag"
+    );
+
+    crate::test_log!("TEST PASS: test_help_json_nested_subcommand_includes_arguments");
+}
+
+#[test]
+fn test_help_json_space_separated_nested_subcommand_path() {
+    init_test_logging();
+    crate::test_log!("TEST START: test_help_json_space_separated_nested_subcommand_path");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_rch"))
+        .args(["--help-json", "workers", "list"])
+        .output()
+        .expect("Failed to run rch --help-json workers list");
+
+    assert!(
+        output.status.success(),
+        "rch --help-json workers list failed"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("--help-json workers list should output valid JSON");
+
+    assert_eq!(parsed.get("name").and_then(|v| v.as_str()), Some("list"));
+
+    crate::test_log!("TEST PASS: test_help_json_space_separated_nested_subcommand_path");
+}
+
+#[test]
 fn test_capabilities_outputs_valid_json() {
     init_test_logging();
     crate::test_log!("TEST START: test_capabilities_outputs_valid_json");
@@ -827,4 +891,137 @@ fn test_capabilities_lists_all_commands() {
     );
 
     crate::test_log!("TEST PASS: test_capabilities_lists_all_commands");
+}
+
+#[test]
+fn test_capabilities_command_outputs_api_envelope() {
+    init_test_logging();
+    crate::test_log!("TEST START: test_capabilities_command_outputs_api_envelope");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_rch"))
+        .args(["capabilities", "--json"])
+        .output()
+        .expect("Failed to run rch capabilities --json");
+
+    assert!(output.status.success(), "rch capabilities --json failed");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("capabilities --json should output valid JSON");
+
+    assert_eq!(parsed.get("success").and_then(|v| v.as_bool()), Some(true));
+    assert_eq!(
+        parsed
+            .pointer("/data/contract_version")
+            .and_then(|v| v.as_str()),
+        Some("rch.capabilities.v1")
+    );
+    assert!(
+        parsed
+            .pointer("/data/env_vars")
+            .and_then(|v| v.as_array())
+            .is_some_and(|vars| !vars.is_empty()),
+        "capabilities should include env var dictionary"
+    );
+    assert!(
+        parsed
+            .pointer("/data/exit_codes")
+            .and_then(|v| v.as_array())
+            .is_some_and(|codes| !codes.is_empty()),
+        "capabilities should include exit code dictionary"
+    );
+
+    crate::test_log!("TEST PASS: test_capabilities_command_outputs_api_envelope");
+}
+
+#[test]
+fn test_robot_docs_guide_outputs_agent_handbook() {
+    init_test_logging();
+    crate::test_log!("TEST START: test_robot_docs_guide_outputs_agent_handbook");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_rch"))
+        .args(["robot-docs", "guide"])
+        .output()
+        .expect("Failed to run rch robot-docs guide");
+
+    assert!(output.status.success(), "rch robot-docs guide failed");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(stdout.contains("RCH Agent Guide"));
+    assert!(stdout.contains("rch capabilities --json"));
+    assert!(stdout.contains("rch --robot-triage --json"));
+
+    crate::test_log!("TEST PASS: test_robot_docs_guide_outputs_agent_handbook");
+}
+
+#[test]
+fn test_robot_docs_guide_json_outputs_api_envelope() {
+    init_test_logging();
+    crate::test_log!("TEST START: test_robot_docs_guide_json_outputs_api_envelope");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_rch"))
+        .args(["robot-docs", "guide", "--json"])
+        .output()
+        .expect("Failed to run rch robot-docs guide --json");
+
+    assert!(
+        output.status.success(),
+        "rch robot-docs guide --json failed"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("robot-docs guide --json should be valid JSON");
+
+    assert_eq!(parsed.get("success").and_then(|v| v.as_bool()), Some(true));
+    assert_eq!(
+        parsed
+            .pointer("/data/contract_version")
+            .and_then(|v| v.as_str()),
+        Some("rch.robot_docs.v1")
+    );
+    assert!(
+        parsed
+            .pointer("/data/guide")
+            .and_then(|v| v.as_str())
+            .is_some_and(|guide| guide.contains("RCH Agent Guide"))
+    );
+
+    crate::test_log!("TEST PASS: test_robot_docs_guide_json_outputs_api_envelope");
+}
+
+#[test]
+fn test_robot_triage_json_outputs_quick_ref() {
+    init_test_logging();
+    crate::test_log!("TEST START: test_robot_triage_json_outputs_quick_ref");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_rch"))
+        .args(["--robot-triage", "--json"])
+        .output()
+        .expect("Failed to run rch --robot-triage --json");
+
+    assert!(output.status.success(), "rch --robot-triage --json failed");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("--robot-triage --json should be valid JSON");
+
+    assert_eq!(parsed.get("success").and_then(|v| v.as_bool()), Some(true));
+    assert_eq!(
+        parsed
+            .pointer("/data/contract_version")
+            .and_then(|v| v.as_str()),
+        Some("rch.robot_triage.v1")
+    );
+    assert_eq!(
+        parsed
+            .pointer("/data/quick_ref/default_probe")
+            .and_then(|v| v.as_str()),
+        Some("rch check --json")
+    );
+    assert!(
+        parsed
+            .pointer("/data/recommended_commands")
+            .and_then(|v| v.as_array())
+            .is_some_and(|commands| !commands.is_empty())
+    );
+
+    crate::test_log!("TEST PASS: test_robot_triage_json_outputs_quick_ref");
 }
