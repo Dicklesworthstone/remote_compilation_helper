@@ -439,6 +439,10 @@ fn load_config_with_sources_from_paths(
 
     apply_env_overrides_inner(&mut config, Some(&mut sources), env_overrides);
 
+    // br-4zf3p: CLI flags are highest priority and apply to every code path
+    // that loads a config. Mirror the apply_to call from `load_config()`.
+    crate::self_healing_overrides::apply_to(&mut config.self_healing);
+
     Ok(LoadedConfig { config, sources })
 }
 

@@ -16,6 +16,56 @@ pub struct CommandFailed {
     pub exit_code: i32,
 }
 
+/// Strip leading `VAR=value` shell env assignments from a command.
+/// Returns the remainder. Tokens that look like flags (`-foo`) or that
+/// contain no `=` are not stripped. Path-valued env vars are handled
+/// correctly — `LD_LIBRARY_PATH=/usr/lib bun test` correctly leaves
+/// `bun test` after stripping.
+fn strip_leading_env_assignments(command: &str) -> &str {
+    let mut rest = command.trim_start();
+    loop {
+        // Take the next whitespace-delimited token without copying.
+        let token_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        if token_end == 0 {
+            return rest;
+        }
+        let token = &rest[..token_end];
+        // Heuristic: a `VAR=value` assignment has the shape NAME=ANYTHING
+        // where NAME is a valid shell identifier (alphanumeric + underscore,
+        // starting with a letter or underscore). The VALUE may contain
+        // anything (including `/`). A flag like `-x=1` is NOT stripped.
+        let Some(eq_idx) = token.find('=') else {
+            return rest;
+        };
+        let name = &token[..eq_idx];
+        if name.is_empty()
+            || !name
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            return rest;
+        }
+        // It's a VAR=value assignment; advance past it.
+        rest = rest[token_end..].trim_start();
+    }
+}
+
+/// Return true if `command` starts with `prefix` followed by a word
+/// boundary (whitespace or end-of-string). Avoids the substring-prefix
+/// false-positive that would match `npm test` against `npm test:foo`.
+fn starts_with_word(command: &str, prefix: &str) -> bool {
+    if !command.starts_with(prefix) {
+        return false;
+    }
+    match command.as_bytes().get(prefix.len()) {
+        None => true,
+        Some(c) if c.is_ascii_whitespace() => true,
+        _ => false,
+    }
+}
+
 /// Detect whether a worker-side command requires Bun/Node prepare (i.e.
 /// `bun test`, `bun typecheck`, or any Node-flavored test runner). Returns
 /// `RequiredRuntime::None` for Rust / shell / unrelated commands. The
@@ -23,44 +73,181 @@ pub struct CommandFailed {
 /// need `node_modules/` to be installed map to Bun/Node, so a misclassified
 /// Rust command never accidentally triggers `bun install`.
 fn detect_runtime_from_command(command: &str) -> RequiredRuntime {
-    let trimmed = command.trim_start();
-    // Strip leading `VAR=value ` env assignments (worker-side commands often
-    // include them).
-    let mut after_env = trimmed;
-    while let Some(rest) = after_env.split_whitespace().next() {
-        if rest.contains('=') && !rest.starts_with('-') && !rest.contains('/') {
-            // Likely VAR=value; advance past it.
-            if let Some(idx) = after_env.find(rest) {
-                after_env = after_env[idx + rest.len()..].trim_start();
-            } else {
-                break;
-            }
-        } else {
-            break;
-        }
-    }
-    // Bun: `bun test`, `bun typecheck`, `bunx ...`
-    if let Some(rest) = after_env.strip_prefix("bun ") {
+    let after_env = strip_leading_env_assignments(command);
+    // Bun: `bun test`, `bun typecheck`. Match only at word boundary so
+    // `bun test` doesn't also match a hypothetical `bun testx`.
+    if let Some(rest) = after_env
+        .strip_prefix("bun ")
+        .or_else(|| after_env.strip_prefix("bun\t"))
+    {
         let first = rest.split_whitespace().next().unwrap_or("");
         if matches!(first, "test" | "typecheck") {
             return RequiredRuntime::Bun;
         }
     }
-    // Plain Node test runners (npm test / npx jest / pnpm test / yarn test).
-    for (prefix, marker) in [
-        ("npm test", true),
-        ("npm run test", true),
-        ("npm run-script test", true),
-        ("yarn test", true),
-        ("pnpm test", true),
-        ("npx jest", true),
-        ("npx vitest", true),
+    // Plain Node test runners. Word-boundary match avoids `npm test:foo`
+    // accidentally matching `npm test`.
+    for prefix in [
+        "npm test",
+        "npm run test",
+        "npm run-script test",
+        "yarn test",
+        "pnpm test",
+        "npx jest",
+        "npx vitest",
     ] {
-        if marker && after_env.starts_with(prefix) {
+        if starts_with_word(after_env, prefix) {
             return RequiredRuntime::Node;
         }
     }
     RequiredRuntime::None
+}
+
+#[cfg(test)]
+mod runtime_detection_tests {
+    use super::*;
+
+    #[test]
+    fn test_detect_runtime_bun_test() {
+        assert_eq!(
+            detect_runtime_from_command("bun test"),
+            RequiredRuntime::Bun
+        );
+        assert_eq!(
+            detect_runtime_from_command("bun typecheck"),
+            RequiredRuntime::Bun
+        );
+    }
+
+    #[test]
+    fn test_detect_runtime_bun_with_env_assignment() {
+        // The previous regex-style heuristic incorrectly rejected env
+        // values containing slashes (LD_LIBRARY_PATH=/...). Now correct.
+        assert_eq!(
+            detect_runtime_from_command("LD_LIBRARY_PATH=/usr/local/lib bun test"),
+            RequiredRuntime::Bun
+        );
+        assert_eq!(
+            detect_runtime_from_command("RUST_LOG=debug bun test"),
+            RequiredRuntime::Bun
+        );
+        assert_eq!(
+            detect_runtime_from_command("FOO=bar BAZ=qux bun test"),
+            RequiredRuntime::Bun
+        );
+    }
+
+    #[test]
+    fn test_detect_runtime_word_boundary_strict() {
+        // `bun testfoo` is NOT bun test.
+        assert_eq!(
+            detect_runtime_from_command("bun testfoo"),
+            RequiredRuntime::None
+        );
+        // `npm test:integration` is NOT plain npm test (it's a script).
+        // Both should be classified as Node since they need node_modules,
+        // but the detection logic specifically only matches `npm test` at
+        // word boundary — `npm test:integration` has `:` after `test` so it
+        // matches as `npm test` if no boundary check. starts_with_word
+        // requires whitespace, so this returns None.
+        assert_eq!(
+            detect_runtime_from_command("npm test:integration"),
+            RequiredRuntime::None
+        );
+        assert_eq!(
+            detect_runtime_from_command("npm run testfoo"),
+            RequiredRuntime::None
+        );
+    }
+
+    #[test]
+    fn test_detect_runtime_npm_test_variants() {
+        assert_eq!(
+            detect_runtime_from_command("npm test"),
+            RequiredRuntime::Node
+        );
+        assert_eq!(
+            detect_runtime_from_command("npm run test"),
+            RequiredRuntime::Node
+        );
+        assert_eq!(
+            detect_runtime_from_command("yarn test"),
+            RequiredRuntime::Node
+        );
+        assert_eq!(
+            detect_runtime_from_command("pnpm test"),
+            RequiredRuntime::Node
+        );
+        assert_eq!(
+            detect_runtime_from_command("npx jest"),
+            RequiredRuntime::Node
+        );
+        assert_eq!(
+            detect_runtime_from_command("npx vitest"),
+            RequiredRuntime::Node
+        );
+    }
+
+    #[test]
+    fn test_detect_runtime_unrelated_commands_are_none() {
+        assert_eq!(
+            detect_runtime_from_command("cargo test"),
+            RequiredRuntime::None
+        );
+        assert_eq!(
+            detect_runtime_from_command("cargo build --release"),
+            RequiredRuntime::None
+        );
+        assert_eq!(
+            detect_runtime_from_command("gcc -O2 main.c"),
+            RequiredRuntime::None
+        );
+        assert_eq!(detect_runtime_from_command(""), RequiredRuntime::None);
+        assert_eq!(detect_runtime_from_command("   "), RequiredRuntime::None);
+    }
+
+    #[test]
+    fn test_strip_leading_env_assignments_basic() {
+        assert_eq!(
+            strip_leading_env_assignments("RUST_LOG=debug cargo test"),
+            "cargo test"
+        );
+        assert_eq!(strip_leading_env_assignments("cargo test"), "cargo test");
+    }
+
+    #[test]
+    fn test_strip_leading_env_assignments_with_paths() {
+        assert_eq!(
+            strip_leading_env_assignments("LD_LIBRARY_PATH=/usr/lib bun test"),
+            "bun test"
+        );
+        assert_eq!(
+            strip_leading_env_assignments("PATH=/usr/bin:/bin bun test"),
+            "bun test"
+        );
+    }
+
+    #[test]
+    fn test_strip_leading_env_assignments_does_not_strip_flags() {
+        // -x=1 is a flag, not an assignment, so it's NOT stripped.
+        assert_eq!(strip_leading_env_assignments("-x=1 cmd"), "-x=1 cmd");
+    }
+
+    #[test]
+    fn test_strip_leading_env_assignments_multiple() {
+        assert_eq!(
+            strip_leading_env_assignments("FOO=1 BAR=2 BAZ=3 cmd arg"),
+            "cmd arg"
+        );
+    }
+
+    #[test]
+    fn test_starts_with_word_basic() {
+        assert!(starts_with_word("npm test", "npm test"));
+        assert!(starts_with_word("npm test foo", "npm test"));
+        assert!(!starts_with_word("npm test:foo", "npm test"));
+        assert!(!starts_with_word("npm testfoo", "npm test"));
+    }
 }
 
 /// Execute a command in the specified working directory.
