@@ -1866,7 +1866,9 @@ fn handle_help_json_early(subcommand_path: &[String]) -> Result<()> {
         for raw_part in subcommand_path {
             for part in raw_part.split('/').filter(|part| !part.is_empty()) {
                 traversed.push(part.to_string());
-                match current_cmd.get_subcommands().find(|s| s.get_name() == part) {
+                match current_cmd.get_subcommands().find(|s| {
+                    s.get_name() == part || s.get_all_aliases().any(|alias| alias == part)
+                }) {
                     Some(sub) => current_cmd = sub,
                     None => {
                         eprintln!("Unknown subcommand path: {}", traversed.join("/"));

@@ -791,6 +791,29 @@ fn test_help_json_space_separated_nested_subcommand_path() {
 }
 
 #[test]
+fn test_help_json_resolves_subcommand_alias() {
+    init_test_logging();
+    crate::test_log!("TEST START: test_help_json_resolves_subcommand_alias");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_rch"))
+        .args(["--help-json", "tui"])
+        .output()
+        .expect("Failed to run rch --help-json tui");
+
+    assert!(output.status.success(), "rch --help-json tui failed");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("--help-json tui should output valid JSON");
+
+    assert_eq!(
+        parsed.get("name").and_then(|v| v.as_str()),
+        Some("dashboard")
+    );
+
+    crate::test_log!("TEST PASS: test_help_json_resolves_subcommand_alias");
+}
+
+#[test]
 fn test_capabilities_outputs_valid_json() {
     init_test_logging();
     crate::test_log!("TEST START: test_capabilities_outputs_valid_json");
