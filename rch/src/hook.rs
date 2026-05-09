@@ -138,17 +138,33 @@ fn remote_pipeline_failure_summary(worker_id: &WorkerId) -> String {
 }
 
 /// Run the hook, reading from stdin and writing to stdout.
+///
+/// **Fail-open contract**: this function MUST return `Ok(())` for every
+/// non-fatal failure mode. The hook runs synchronously in the agent's
+/// Bash invocation path; any error we propagate becomes a non-zero exit
+/// from `rch`, which Claude Code interprets as "hook said deny". We
+/// would rather silently allow the command than block on stdin EOF, a
+/// flushing hiccup, or a serialization edge case.
+///
+/// The single legitimate Err return is one we cannot fix locally
+/// (e.g., `init_logging` error before this is called). All I/O within
+/// run_hook is degraded to a silent allow.
 pub async fn run_hook() -> anyhow::Result<()> {
     let mut stdout = io::stdout();
 
-    // Read input from stdin with a 10MB limit to prevent OOM
+    // Read input from stdin with a 10MB limit to prevent OOM.
+    // A truncated/closed pipe is treated as "no input" (fail-open).
     let mut input = String::new();
     {
         use tokio::io::{AsyncReadExt, stdin};
-        stdin()
+        if let Err(e) = stdin()
             .take(10 * 1024 * 1024)
             .read_to_string(&mut input)
-            .await?;
+            .await
+        {
+            warn!(target: "rch::hook", error = %e, "stdin read failed; allowing command (fail-open)");
+            return Ok(());
+        }
     }
 
     let input = input.trim();
@@ -170,14 +186,35 @@ pub async fn run_hook() -> anyhow::Result<()> {
     // Process the hook request
     let output = process_hook(hook_input).await;
 
-    // Write output
-    // - Deny: write JSON to block the command
-    // - AllowWithModifiedCommand: write JSON to replace the command (transparent interception)
-    // - Allow: output nothing (empty stdout = allow unchanged)
+    // Write output:
+    //   - Deny: write JSON to block the command
+    //   - AllowWithModifiedCommand: write JSON to replace the command (transparent interception)
+    //   - Allow: output nothing (empty stdout = allow unchanged)
+    //
+    // serde / writeln errors here would be near-impossible (we just
+    // built the value from typed Rust), but if they occur we log and
+    // fall open rather than non-zero-exit and block the agent's Bash.
     match &output {
         HookOutput::Deny(_) | HookOutput::AllowWithModifiedCommand(_) => {
-            let json = serde_json::to_string(&output)?;
-            writeln!(stdout, "{}", json)?;
+            match serde_json::to_string(&output) {
+                Ok(json) => {
+                    if let Err(e) = writeln!(stdout, "{}", json) {
+                        warn!(target: "rch::hook", error = %e, "stdout write failed; falling open");
+                        return Ok(());
+                    }
+                    if let Err(e) = stdout.flush() {
+                        // Explicit flush: io::stdout() is fully buffered when
+                        // attached to a pipe (Claude Code reads via pipe).
+                        // Without this flush, abnormal exit could lose the JSON.
+                        warn!(target: "rch::hook", error = %e, "stdout flush failed; falling open");
+                        return Ok(());
+                    }
+                }
+                Err(e) => {
+                    warn!(target: "rch::hook", error = %e, "JSON serialization failed; falling open");
+                    return Ok(());
+                }
+            }
         }
         HookOutput::Allow(_) => {
             // Empty stdout = allow command unchanged
@@ -185,6 +222,52 @@ pub async fn run_hook() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Install a panic hook that suppresses panic output and exits 0 when
+/// the process is invoked as a Claude Code hook. Without this, any
+/// panic in classify / serde / cache propagates as a non-zero exit,
+/// which Claude Code interprets as "deny" and BLOCKS the agent's Bash.
+///
+/// The trade-off: a real bug in the hook becomes silent. That's the
+/// correct call here — a hook that crashes silently and lets the
+/// command run is strictly better for the agent than a hook that
+/// blocks every Bash command on a regression. Real-world bug reports
+/// surface via the daemon-side error logs, not the hook stderr.
+///
+/// Call this BEFORE any code that could panic.
+pub fn install_hook_mode_panic_handler() {
+    // Idempotent guard: only install once.
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        // Capture the original hook so non-hook-mode invocations
+        // (e.g. `rch exec`) keep their normal panic output.
+        let original = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if std::env::var("RCH_HOOK_MODE")
+                .ok()
+                .as_deref()
+                .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            {
+                // Hook mode: log to stderr quietly, then exit 0 so the
+                // agent's Bash command runs locally. Don't print the
+                // backtrace to stderr (Claude Code may surface it).
+                eprintln!("[rch] hook panicked; falling open. (set RUST_BACKTRACE=1 to see)");
+                if std::env::var("RUST_BACKTRACE")
+                    .ok()
+                    .as_deref()
+                    .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("full"))
+                {
+                    original(info);
+                }
+                std::process::exit(0);
+            } else {
+                // Non-hook invocation: original panic behavior.
+                original(info);
+            }
+        }));
+    });
 }
 
 /// Execute a compilation command on a remote worker.
@@ -1063,18 +1146,33 @@ async fn try_auto_start_daemon(
         "Daemon unavailable, attempting auto-start"
     );
 
-    if socket_path.exists() {
-        if probe_daemon_health(socket_path).await {
-            debug!(
-                target: "rch::hook::autostart",
-                "Socket exists and daemon is responsive"
-            );
-            return Ok(());
-        }
+    // Acquire the autostart lock BEFORE doing anything destructive
+    // (stale-socket removal). Two concurrent hooks racing on the same
+    // socket could otherwise both observe a transiently-unresponsive
+    // daemon and the second hook deletes the socket the first hook
+    // just verified — corrupting an in-flight connection.
+    //
+    // Order is now:
+    //   1. Acquire autostart lock (only one hook auto-starts at a time).
+    //   2. Re-probe socket: while waiting for the lock, the prior
+    //      lock-holder may have already started the daemon.
+    //   3. Only delete the socket if it's confirmed stale UNDER the lock.
+    let _lock = acquire_autostart_lock(&autostart_lock_path())?;
 
+    // Re-probe under the lock — another hook may have spawned rchd
+    // while we were waiting.
+    if socket_path.exists() && probe_daemon_health(socket_path).await {
+        debug!(
+            target: "rch::hook::autostart",
+            "Socket became responsive while waiting for autostart lock"
+        );
+        return Ok(());
+    }
+
+    if socket_path.exists() {
         warn!(
             target: "rch::hook::autostart",
-            "Socket exists but daemon not responding"
+            "Socket exists but daemon not responding (after lock-protected re-probe)"
         );
         if let Err(err) = std::fs::remove_file(socket_path) {
             warn!(
@@ -1100,7 +1198,8 @@ async fn try_auto_start_daemon(
         }
     }
 
-    let _lock = acquire_autostart_lock(&autostart_lock_path())?;
+    // Note: the autostart lock acquired earlier is still held here.
+    // It's released when this function returns (Drop).
     write_cooldown_timestamp(&cooldown_path)?;
 
     let rchd_path = which_rchd_path().ok_or(AutoStartError::BinaryNotFound)?;

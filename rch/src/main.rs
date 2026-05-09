@@ -1553,6 +1553,12 @@ async fn main() -> Result<()> {
                 eprintln!("To force hook mode anyway, set RCH_HOOK_MODE=1 or pipe JSON in.");
                 eprintln!("Press Ctrl-D to send EOF (allows unchanged) or Ctrl-C to exit.");
             }
+            // Install a panic hook that suppresses panic output and exits
+            // 0 when invoked as a Claude Code hook. Without this, any
+            // panic in classify/serde/cache propagates as a non-zero
+            // exit, which Claude Code interprets as "deny" and BLOCKS
+            // the agent's Bash command. True fail-open requires this.
+            hook::install_hook_mode_panic_handler();
             // Running as PreToolUse hook - read from stdin, process, write to stdout
             hook::run_hook().await
         }
