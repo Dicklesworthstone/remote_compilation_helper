@@ -1,6 +1,8 @@
 //! Command execution on worker.
 
 use anyhow::Result;
+use rch_common::types::RequiredRuntime;
+use std::path::Path;
 use std::process::Stdio;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -14,9 +16,59 @@ pub struct CommandFailed {
     pub exit_code: i32,
 }
 
+/// Detect whether a worker-side command requires Bun/Node prepare (i.e.
+/// `bun test`, `bun typecheck`, or any Node-flavored test runner). Returns
+/// `RequiredRuntime::None` for Rust / shell / unrelated commands. The
+/// detection is intentionally conservative — only commands that genuinely
+/// need `node_modules/` to be installed map to Bun/Node, so a misclassified
+/// Rust command never accidentally triggers `bun install`.
+fn detect_runtime_from_command(command: &str) -> RequiredRuntime {
+    let trimmed = command.trim_start();
+    // Strip leading `VAR=value ` env assignments (worker-side commands often
+    // include them).
+    let mut after_env = trimmed;
+    while let Some(rest) = after_env.split_whitespace().next() {
+        if rest.contains('=') && !rest.starts_with('-') && !rest.contains('/') {
+            // Likely VAR=value; advance past it.
+            if let Some(idx) = after_env.find(rest) {
+                after_env = after_env[idx + rest.len()..].trim_start();
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    // Bun: `bun test`, `bun typecheck`, `bunx ...`
+    if let Some(rest) = after_env.strip_prefix("bun ") {
+        let first = rest.split_whitespace().next().unwrap_or("");
+        if matches!(first, "test" | "typecheck") {
+            return RequiredRuntime::Bun;
+        }
+    }
+    // Plain Node test runners (npm test / npx jest / pnpm test / yarn test).
+    for (prefix, marker) in [
+        ("npm test", true),
+        ("npm run test", true),
+        ("npm run-script test", true),
+        ("yarn test", true),
+        ("pnpm test", true),
+        ("npx jest", true),
+        ("npx vitest", true),
+    ] {
+        if marker && after_env.starts_with(prefix) {
+            return RequiredRuntime::Node;
+        }
+    }
+    RequiredRuntime::None
+}
+
 /// Execute a command in the specified working directory.
 ///
-/// Streams stdout/stderr in real-time and returns Ok on success.
+/// Streams stdout/stderr in real-time and returns Ok on success. For
+/// Bun/Node test runners, runs `prepare::prepare()` first to ensure
+/// `node_modules/` is in place (cache-aware via the dependency
+/// fingerprint stored in `<workdir>/.rch_dep_fingerprint.json`).
 pub async fn execute(workdir: &str, command: &str) -> Result<()> {
     info!(
         "Executing in {}: {}",
@@ -26,6 +78,44 @@ pub async fn execute(workdir: &str, command: &str) -> Result<()> {
 
     if command.trim().is_empty() {
         anyhow::bail!("Empty command");
+    }
+
+    // br-4998x: pre-execution hook for Bun/Node projects.
+    let runtime = detect_runtime_from_command(command);
+    if matches!(runtime, RequiredRuntime::Bun | RequiredRuntime::Node) {
+        let project_root = Path::new(workdir);
+        let log_dir = project_root.join(".rch_prepare_logs");
+        match crate::prepare::prepare(project_root, runtime, &log_dir).await {
+            Ok(report) => {
+                info!(
+                    target: "rch::wkr::executor",
+                    runtime = ?report.runtime,
+                    action = ?report.action,
+                    took_ms = report.took_ms,
+                    bytes_added = report.bytes_added_to_node_modules,
+                    "prepare completed"
+                );
+                if matches!(report.action, crate::prepare::PrepareAction::Failed) {
+                    if let Some(p) = &report.install_log_path {
+                        error!(
+                            "Pre-execution prepare FAILED — install log at {}",
+                            p.display()
+                        );
+                    }
+                    return Err(CommandFailed { exit_code: 1 }.into());
+                }
+            }
+            Err(e) => {
+                // Fail-open: if prepare itself errored (no manifest, IO error)
+                // we log and continue. The user's command will run and likely
+                // fail with a clearer error from the test runner itself.
+                tracing::warn!(
+                    target: "rch::wkr::executor",
+                    error = %e,
+                    "prepare hook errored; continuing without install"
+                );
+            }
+        }
     }
 
     // Use shell execution to properly handle quoted arguments and shell features

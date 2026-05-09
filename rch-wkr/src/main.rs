@@ -7,6 +7,7 @@
 
 mod cache;
 mod executor;
+mod prepare;
 mod toolchain;
 
 use anyhow::Result;
@@ -101,6 +102,45 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+
+    /// Pre-execution preparation (e.g. `bun install` for Node projects).
+    ///
+    /// For Bun/Node projects, fingerprints package.json + lockfiles, runs
+    /// `bun install` / `pnpm install` / etc. on cache miss, and persists the
+    /// fingerprint so subsequent prepare calls hit the cache. For Rust /
+    /// non-Node runtimes this is a no-op (returns Skipped). Output is JSON.
+    Prepare {
+        /// Project root directory on the worker.
+        #[arg(long)]
+        project: String,
+
+        /// Required runtime: rust | bun | node | none.
+        #[arg(long, default_value = "none")]
+        runtime: PrepareRuntime,
+
+        /// Directory for install logs (default: <project>/.rch_prepare_logs/).
+        #[arg(long)]
+        log_dir: Option<String>,
+    },
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+enum PrepareRuntime {
+    Rust,
+    Bun,
+    Node,
+    None,
+}
+
+impl From<PrepareRuntime> for rch_common::types::RequiredRuntime {
+    fn from(value: PrepareRuntime) -> Self {
+        match value {
+            PrepareRuntime::Rust => Self::Rust,
+            PrepareRuntime::Bun => Self::Bun,
+            PrepareRuntime::Node => Self::Node,
+            PrepareRuntime::None => Self::None,
+        }
+    }
 }
 
 #[derive(clap::ValueEnum, Clone, Copy)]
@@ -217,6 +257,24 @@ async fn main() -> Result<()> {
         Commands::Benchmark { format, json } => {
             let fmt = if json { OutputFormat::Json } else { format };
             run_benchmark(fmt).await
+        }
+        Commands::Prepare {
+            project,
+            runtime,
+            log_dir,
+        } => {
+            use std::path::PathBuf;
+            let project_path = PathBuf::from(&project);
+            let log_dir_path = log_dir
+                .map(PathBuf::from)
+                .unwrap_or_else(|| project_path.join(".rch_prepare_logs"));
+            let report = prepare::prepare(&project_path, runtime.into(), &log_dir_path).await?;
+            println!("{}", serde_json::to_string(&report)?);
+            // Exit 1 if install failed so the caller (daemon / e2e) can detect.
+            if matches!(report.action, prepare::PrepareAction::Failed) {
+                std::process::exit(1);
+            }
+            Ok(())
         }
     }
 }
