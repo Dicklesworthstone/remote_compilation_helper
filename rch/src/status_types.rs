@@ -295,10 +295,10 @@ pub struct RepoConvergenceStatusFromApi {
 }
 
 // ============================================================================
-// Unified Status Surface Types (bd-vvmd.6.3)
+// CLI Status Surface Types (bd-vvmd.6.3)
 // ============================================================================
 
-/// Schema version for the unified status JSON envelope.
+/// Schema version for the CLI status JSON envelope.
 pub const STATUS_SCHEMA_VERSION: &str = "1.0.0";
 
 /// System-level posture summarizing whether builds go remote or fall back local.
@@ -544,9 +544,9 @@ pub fn generate_convergence_remediations(
     hints
 }
 
-/// Unified status surface response for JSON output.
+/// CLI status surface response for JSON output.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UnifiedStatusResponse {
+pub struct CliStatusResponse {
     /// Schema version for forward compatibility.
     pub schema_version: String,
     /// System-level posture.
@@ -1681,13 +1681,13 @@ mod tests {
         assert!(forwarded[0].message.contains("git fetch"));
     }
 
-    // ── UnifiedStatusResponse tests ──
+    // ── CliStatusResponse tests ──
 
     #[test]
-    fn test_unified_status_response_serialization() {
+    fn test_cli_status_response_serialization() {
         let _guard = test_guard!();
         let status = make_daemon_status(2, 2);
-        let unified = UnifiedStatusResponse {
+        let cli_status = CliStatusResponse {
             schema_version: STATUS_SCHEMA_VERSION.to_string(),
             posture: SystemPosture::RemoteReady,
             posture_description: SystemPosture::RemoteReady.description().to_string(),
@@ -1702,7 +1702,7 @@ mod tests {
             }],
         };
 
-        let json = serde_json::to_string(&unified).unwrap();
+        let json = serde_json::to_string(&cli_status).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
 
         assert_eq!(parsed["schema_version"], STATUS_SCHEMA_VERSION);
@@ -1712,7 +1712,7 @@ mod tests {
     }
 
     #[test]
-    fn test_unified_status_schema_version_constant() {
+    fn test_cli_status_schema_version_constant() {
         let _guard = test_guard!();
         assert_eq!(STATUS_SCHEMA_VERSION, "1.0.0");
     }

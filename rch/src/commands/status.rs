@@ -1128,8 +1128,8 @@ async fn self_test_run(
 
 pub async fn status_overview(workers: bool, jobs: bool, ctx: &OutputContext) -> Result<()> {
     use crate::status_types::{
-        RemediationHint, RepoConvergenceStatusFromApi, STATUS_SCHEMA_VERSION, SystemPosture,
-        UnifiedStatusResponse, generate_convergence_remediations, generate_worker_remediations,
+        CliStatusResponse, RemediationHint, RepoConvergenceStatusFromApi, STATUS_SCHEMA_VERSION,
+        SystemPosture, generate_convergence_remediations, generate_worker_remediations,
     };
 
     // Query daemon for full status.
@@ -1193,7 +1193,7 @@ pub async fn status_overview(workers: bool, jobs: bool, ctx: &OutputContext) -> 
     }
 
     if ctx.is_json() {
-        let unified = UnifiedStatusResponse {
+        let cli_status = CliStatusResponse {
             schema_version: STATUS_SCHEMA_VERSION.to_string(),
             posture_description: posture.description().to_string(),
             posture,
@@ -1201,7 +1201,7 @@ pub async fn status_overview(workers: bool, jobs: bool, ctx: &OutputContext) -> 
             convergence,
             remediation_hints,
         };
-        let _ = ctx.json(&ApiResponse::ok("status", &unified));
+        let _ = ctx.json(&ApiResponse::ok("status", &cli_status));
         return Ok(());
     }
 
