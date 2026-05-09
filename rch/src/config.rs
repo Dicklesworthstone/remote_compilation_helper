@@ -5,8 +5,8 @@ use anyhow::{Context, Result};
 use directories::ProjectDirs;
 use rch_common::types::validate_remote_base;
 use rch_common::{
-    ConfigValueSource, OutputVisibility, RchConfig, SelfTestFailureAction, SelfTestWorkers,
-    TransferConfig,
+    ConfigValueSource, OutputVisibility, RchConfig, SelfHealingLogLevel, SelfTestFailureAction,
+    SelfTestWorkers, TransferConfig,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -362,6 +362,7 @@ struct PartialSelfHealingConfig {
     daemon_installs_hooks: Option<bool>,
     auto_start_cooldown_secs: Option<u64>,
     auto_start_timeout_secs: Option<u64>,
+    self_healing_log_level: Option<SelfHealingLogLevel>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -824,6 +825,7 @@ fn default_sources_map() -> ConfigSourceMap {
         "self_healing.daemon_installs_hooks",
         "self_healing.auto_start_cooldown_secs",
         "self_healing.auto_start_timeout_secs",
+        "self_healing.self_healing_log_level",
         "self_test.enabled",
         "self_test.schedule",
         "self_test.interval",
@@ -1105,6 +1107,16 @@ fn apply_layer(
         set_source(
             sources,
             "self_healing.auto_start_timeout_secs",
+            source.clone(),
+        );
+    }
+    if let Some(log_level) = layer.self_healing.self_healing_log_level
+        && log_level != defaults.self_healing.self_healing_log_level
+    {
+        config.self_healing.self_healing_log_level = log_level;
+        set_source(
+            sources,
+            "self_healing.self_healing_log_level",
             source.clone(),
         );
     }

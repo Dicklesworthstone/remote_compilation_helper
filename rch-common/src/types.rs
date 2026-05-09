@@ -1117,6 +1117,34 @@ fn default_autostart_timeout_secs() -> u64 {
     3
 }
 
+/// Log level for self-healing diagnostic output.
+///
+/// Used to filter `tracing` events emitted by the self-healing subsystem
+/// (hook auto-start, daemon hook-install). Read from
+/// `RCH_SELF_HEALING_LOG_LEVEL=debug|info|warn|error` (case-insensitive).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SelfHealingLogLevel {
+    Debug,
+    #[default]
+    Info,
+    Warn,
+    Error,
+}
+
+impl SelfHealingLogLevel {
+    /// Parse a human-friendly level name. Returns `None` for unknown input.
+    pub fn from_env_str(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "debug" => Some(Self::Debug),
+            "info" => Some(Self::Info),
+            "warn" | "warning" => Some(Self::Warn),
+            "error" => Some(Self::Error),
+            _ => None,
+        }
+    }
+}
+
 /// Self-healing behaviors for the hook and daemon.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SelfHealingConfig {
@@ -1136,6 +1164,10 @@ pub struct SelfHealingConfig {
         alias = "daemon_start_timeout"
     )]
     pub auto_start_timeout_secs: u64,
+    /// Log level for self-healing diagnostic events. Default: info.
+    /// Override via `RCH_SELF_HEALING_LOG_LEVEL=debug|info|warn|error`.
+    #[serde(default)]
+    pub self_healing_log_level: SelfHealingLogLevel,
 }
 
 impl Default for SelfHealingConfig {
@@ -1145,6 +1177,7 @@ impl Default for SelfHealingConfig {
             daemon_installs_hooks: default_true(),
             auto_start_cooldown_secs: default_autostart_cooldown_secs(),
             auto_start_timeout_secs: default_autostart_timeout_secs(),
+            self_healing_log_level: SelfHealingLogLevel::default(),
         }
     }
 }
@@ -1186,6 +1219,18 @@ impl SelfHealingConfig {
             && let Ok(secs) = val.parse()
         {
             self.auto_start_cooldown_secs = secs;
+        }
+        // br-4zf3p: log-level override.
+        if let Ok(val) = std::env::var("RCH_SELF_HEALING_LOG_LEVEL") {
+            if let Some(level) = SelfHealingLogLevel::from_env_str(&val) {
+                self.self_healing_log_level = level;
+            } else {
+                tracing::warn!(
+                    target: "rch::self_healing",
+                    invalid = %val,
+                    "RCH_SELF_HEALING_LOG_LEVEL has invalid value; using default=info"
+                );
+            }
         }
 
         self
@@ -4372,6 +4417,7 @@ mod tests {
             daemon_installs_hooks: false,
             auto_start_cooldown_secs: 60,
             auto_start_timeout_secs: 10,
+            self_healing_log_level: SelfHealingLogLevel::Debug,
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -4379,13 +4425,87 @@ mod tests {
         assert!(json.contains("\"daemon_installs_hooks\":false"));
         assert!(json.contains("\"auto_start_cooldown_secs\":60"));
         assert!(json.contains("\"auto_start_timeout_secs\":10"));
+        assert!(json.contains("\"self_healing_log_level\":\"debug\""));
 
         let parsed: SelfHealingConfig = serde_json::from_str(&json).unwrap();
         assert!(!parsed.hook_starts_daemon);
         assert!(!parsed.daemon_installs_hooks);
         assert_eq!(parsed.auto_start_cooldown_secs, 60);
         assert_eq!(parsed.auto_start_timeout_secs, 10);
+        assert_eq!(parsed.self_healing_log_level, SelfHealingLogLevel::Debug);
         // TEST PASS: Full SelfHealingConfig serde
+    }
+
+    // br-4zf3p: Tests for the self_healing_log_level field.
+
+    #[test]
+    fn test_self_healing_log_level_default_is_info() {
+        // TEST START: SelfHealingLogLevel::default() == Info
+        let level = SelfHealingLogLevel::default();
+        assert_eq!(level, SelfHealingLogLevel::Info);
+        // Also verify the SelfHealingConfig default surfaces it.
+        let config = SelfHealingConfig::default();
+        assert_eq!(
+            config.self_healing_log_level,
+            SelfHealingLogLevel::Info,
+            "config default should be Info"
+        );
+        // TEST PASS
+    }
+
+    #[test]
+    fn test_self_healing_log_level_serializes_lowercase() {
+        // TEST START: serde uses lowercase variants
+        let json = serde_json::to_string(&SelfHealingLogLevel::Warn).unwrap();
+        assert_eq!(json, "\"warn\"");
+        let parsed: SelfHealingLogLevel = serde_json::from_str("\"error\"").unwrap();
+        assert_eq!(parsed, SelfHealingLogLevel::Error);
+        // TEST PASS
+    }
+
+    #[test]
+    fn test_self_healing_log_level_from_env_str_accepts_known() {
+        // TEST START: from_env_str parses each level (case-insensitive) and aliases
+        assert_eq!(
+            SelfHealingLogLevel::from_env_str("debug"),
+            Some(SelfHealingLogLevel::Debug)
+        );
+        assert_eq!(
+            SelfHealingLogLevel::from_env_str("DEBUG"),
+            Some(SelfHealingLogLevel::Debug)
+        );
+        assert_eq!(
+            SelfHealingLogLevel::from_env_str("info"),
+            Some(SelfHealingLogLevel::Info)
+        );
+        assert_eq!(
+            SelfHealingLogLevel::from_env_str("warn"),
+            Some(SelfHealingLogLevel::Warn)
+        );
+        assert_eq!(
+            SelfHealingLogLevel::from_env_str("warning"),
+            Some(SelfHealingLogLevel::Warn),
+            "warning should map to Warn"
+        );
+        assert_eq!(
+            SelfHealingLogLevel::from_env_str("error"),
+            Some(SelfHealingLogLevel::Error)
+        );
+        // Whitespace tolerance
+        assert_eq!(
+            SelfHealingLogLevel::from_env_str("  debug  "),
+            Some(SelfHealingLogLevel::Debug)
+        );
+        // TEST PASS
+    }
+
+    #[test]
+    fn test_self_healing_log_level_from_env_str_rejects_unknown() {
+        // TEST START: unknown values return None (caller falls back to default)
+        assert!(SelfHealingLogLevel::from_env_str("banana").is_none());
+        assert!(SelfHealingLogLevel::from_env_str("").is_none());
+        assert!(SelfHealingLogLevel::from_env_str("trace").is_none());
+        // TEST PASS
     }
 
     #[test]
