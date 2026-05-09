@@ -477,38 +477,51 @@ async fn prepare_node_like(
     let post_size = dir_size(&project_root.join("node_modules")).await;
     // Recompute the fingerprint AFTER install so newly-created lockfiles
     // (e.g. `bun.lock` written by `bun install`, `package-lock.json`
-    // written by `npm install`) are included. Otherwise the next prepare
-    // call would see those files in compute_fingerprint() and miss the
-    // cache despite the dependency state being unchanged.
+    // written by `npm install`) are included in the cached state.
+    // Otherwise the next prepare call would see those files in
+    // compute_fingerprint() and miss the cache despite dependency state
+    // being unchanged.
     //
-    // If the recompute itself fails (e.g. the install somehow deleted
-    // package.json — implausible but possible), invalidate the cache and
-    // surface the failure rather than silently caching a stale hash.
-    // The fallback-to-old-fingerprint pattern was incorrect: it would
-    // miss the freshly-created lockfile and force a re-install on every
-    // subsequent prepare call.
-    let post_install_fingerprint = match compute_fingerprint(project_root).await {
-        Ok(fp) => fp,
-        Err(e) => {
-            warn!(
-                target: "rch::wkr::prepare",
-                error = %e,
-                "post-install fingerprint recompute failed; invalidating cache"
-            );
-            invalidate_cached_fingerprint(project_root).await;
-            return Ok(PrepareReport {
-                runtime,
-                action: PrepareAction::Failed,
-                fingerprint: Some(fingerprint),
-                fingerprint_changed_from: cached.map(|c| c.hash),
-                install_log_path: Some(log_path),
-                took_ms: started.elapsed().as_millis() as u64,
-                bytes_added_to_node_modules: post_size.saturating_sub(pre_size),
-                completed_at: Utc::now(),
-            });
-        }
-    };
-    write_cached_fingerprint(project_root, &post_install_fingerprint).await?;
+    // Recompute failure is pathological — would require the install to
+    // have deleted package.json. The install itself SUCCEEDED, so:
+    //   - Report PrepareAction::Installed (the user's bun test should run).
+    //   - Invalidate any stale cached fingerprint so the next call
+    //     recomputes fresh.
+    //   - Do NOT silently cache the pre-install fingerprint (that was
+    //     the original silent-fallback bug — it permanently loses the
+    //     newly-created lockfile from the cached state and forces
+    //     re-install every call).
+    let (post_install_fingerprint, persisted) =
+        match compute_fingerprint(project_root).await {
+            Ok(fp) => {
+                if let Err(e) = write_cached_fingerprint(project_root, &fp).await {
+                    warn!(
+                        target: "rch::wkr::prepare",
+                        error = %e,
+                        "fingerprint write failed after successful install; cache will be \
+                         re-created on next call"
+                    );
+                    invalidate_cached_fingerprint(project_root).await;
+                    (fp, false)
+                } else {
+                    (fp.clone(), true)
+                }
+            }
+            Err(e) => {
+                warn!(
+                    target: "rch::wkr::prepare",
+                    error = %e,
+                    "post-install fingerprint recompute failed; invalidating cache so next \
+                     call recomputes fresh"
+                );
+                invalidate_cached_fingerprint(project_root).await;
+                // Return the pre-install fingerprint as a *report* value
+                // (best info we have) but DON'T persist it — that would
+                // be the silent-fallback bug.
+                (fingerprint.clone(), false)
+            }
+        };
+    let _ = persisted; // currently advisory; may surface in PrepareReport later.
 
     Ok(PrepareReport {
         runtime,
