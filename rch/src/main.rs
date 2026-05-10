@@ -295,9 +295,9 @@ Use 'disable' to mark a worker as unavailable (optionally with --reason)."#)]
     rch check --json        # Machine-readable output
 
 EXIT CODES:
-    0   Ready - daemon running, all workers healthy
+    0   Ready - daemon running, hook installed, all workers healthy
     1   Degraded - daemon running, some workers unreachable
-    2   Not ready - daemon not running or fatal issues
+    2   Not ready - daemon/hook missing or fatal issues
 
 USAGE:
     # CI/CD health gate

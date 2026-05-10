@@ -1306,12 +1306,55 @@ fn render_status_verbose_detail_lines(
 // Check Command
 // =============================================================================
 
+const CHECK_HOOK_NOT_INSTALLED_ISSUE: &str = "Claude Code hook not installed";
+
+fn derive_check_outcome(
+    total_count: usize,
+    healthy_count: usize,
+    unhealthy: &[String],
+    daemon_issues: &[String],
+    hook_installed: bool,
+) -> (String, i32, Vec<String>) {
+    let mut issues_list: Vec<String> = unhealthy
+        .iter()
+        .map(|w| format!("Worker {} is unreachable", w))
+        .collect();
+    issues_list.extend(daemon_issues.iter().cloned());
+
+    let (mut status, mut exit_code, mut issues) = if total_count == 0 {
+        (
+            "not_ready".to_string(),
+            2,
+            vec!["No workers configured".to_string()],
+        )
+    } else if healthy_count == total_count {
+        ("ready".to_string(), 0, issues_list)
+    } else if healthy_count > 0 {
+        ("degraded".to_string(), 1, issues_list)
+    } else {
+        issues_list.insert(0, "All workers are unreachable".to_string());
+        ("not_ready".to_string(), 2, issues_list)
+    };
+
+    if !hook_installed {
+        if status == "ready" || status == "degraded" {
+            issues.insert(0, CHECK_HOOK_NOT_INSTALLED_ISSUE.to_string());
+        } else {
+            issues.push(CHECK_HOOK_NOT_INSTALLED_ISSUE.to_string());
+        }
+        status = "not_ready".to_string();
+        exit_code = 2;
+    }
+
+    (status, exit_code, issues)
+}
+
 /// Quick health check: "Is RCH working right now?"
 ///
 /// Returns exit codes:
-/// - 0: Ready (daemon running, all workers healthy)
+/// - 0: Ready (daemon running, hook installed, all workers healthy)
 /// - 1: Degraded (daemon running, some workers unreachable)
-/// - 2: Not ready (daemon not running or fatal issues)
+/// - 2: Not ready (daemon/hook missing or fatal issues)
 pub async fn check(ctx: &OutputContext) -> Result<()> {
     #[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
     struct CheckResponse {
@@ -1345,16 +1388,26 @@ pub async fn check(ctx: &OutputContext) -> Result<()> {
     // Try to query daemon status
     let daemon_result = send_daemon_command("GET /status\n").await;
 
+    // Check if hook is installed. RCH is not "ready" for transparent
+    // Claude Code offload unless the hook is actually present.
+    let hook_installed = {
+        use crate::agent::{AgentKind, HookStatus, check_hook_status};
+        matches!(
+            check_hook_status(AgentKind::ClaudeCode),
+            Ok(HookStatus::Installed)
+        )
+    };
+
     let (status, exit_code, daemon_info, workers_info, issues) = match daemon_result {
         Ok(response) => {
             match extract_json_body(&response) {
                 Some(json) => {
                     match serde_json::from_str::<DaemonFullStatusResponse>(json) {
-                        Ok(status) => {
+                        Ok(daemon_status) => {
                             // Daemon is running - determine health
-                            let healthy_count = status.daemon.workers_healthy;
-                            let total_count = status.daemon.workers_total;
-                            let unhealthy: Vec<String> = status
+                            let healthy_count = daemon_status.daemon.workers_healthy;
+                            let total_count = daemon_status.daemon.workers_total;
+                            let unhealthy: Vec<String> = daemon_status
                                 .workers
                                 .iter()
                                 .filter(|w| {
@@ -1367,8 +1420,8 @@ pub async fn check(ctx: &OutputContext) -> Result<()> {
 
                             let daemon_info = DaemonCheckInfo {
                                 running: true,
-                                pid: Some(status.daemon.pid),
-                                uptime_secs: Some(status.daemon.uptime_secs),
+                                pid: Some(daemon_status.daemon.pid),
+                                uptime_secs: Some(daemon_status.daemon.uptime_secs),
                             };
 
                             let workers_info = WorkersCheckInfo {
@@ -1377,50 +1430,19 @@ pub async fn check(ctx: &OutputContext) -> Result<()> {
                                 unhealthy: unhealthy.clone(),
                             };
 
-                            let mut issues_list: Vec<String> = unhealthy
+                            let daemon_issues: Vec<String> = daemon_status
+                                .issues
                                 .iter()
-                                .map(|w| format!("Worker {} is unreachable", w))
+                                .map(|issue| issue.summary.clone())
                                 .collect();
-
-                            // Add daemon-reported issues
-                            for issue in &status.issues {
-                                issues_list.push(issue.summary.clone());
-                            }
-
-                            if total_count == 0 {
-                                (
-                                    "not_ready".to_string(),
-                                    2,
-                                    daemon_info,
-                                    workers_info,
-                                    vec!["No workers configured".to_string()],
-                                )
-                            } else if healthy_count == total_count {
-                                (
-                                    "ready".to_string(),
-                                    0,
-                                    daemon_info,
-                                    workers_info,
-                                    issues_list,
-                                )
-                            } else if healthy_count > 0 {
-                                (
-                                    "degraded".to_string(),
-                                    1,
-                                    daemon_info,
-                                    workers_info,
-                                    issues_list,
-                                )
-                            } else {
-                                issues_list.insert(0, "All workers are unreachable".to_string());
-                                (
-                                    "not_ready".to_string(),
-                                    2,
-                                    daemon_info,
-                                    workers_info,
-                                    issues_list,
-                                )
-                            }
+                            let (status, exit_code, issues) = derive_check_outcome(
+                                total_count,
+                                healthy_count,
+                                &unhealthy,
+                                &daemon_issues,
+                                hook_installed,
+                            );
+                            (status, exit_code, daemon_info, workers_info, issues)
                         }
                         Err(_) => {
                             let daemon_info = DaemonCheckInfo {
@@ -1484,15 +1506,6 @@ pub async fn check(ctx: &OutputContext) -> Result<()> {
                 vec!["Daemon not running".to_string()],
             )
         }
-    };
-
-    // Check if hook is installed
-    let hook_installed = {
-        use crate::agent::{AgentKind, HookStatus, check_hook_status};
-        matches!(
-            check_hook_status(AgentKind::ClaudeCode),
-            Ok(HookStatus::Installed)
-        )
     };
 
     let hook_info = HookCheckInfo {
@@ -1723,6 +1736,54 @@ mod tests {
         assert!(output.contains("Started"));
         assert!(output.contains("Active Alerts"));
         assert!(output.contains("Known Issues"));
+    }
+
+    #[test]
+    fn test_check_outcome_ready_requires_hook() {
+        let unhealthy = Vec::new();
+        let daemon_issues = Vec::new();
+        let (status, exit_code, issues) =
+            derive_check_outcome(2, 2, &unhealthy, &daemon_issues, false);
+
+        assert_eq!(status, "not_ready");
+        assert_eq!(exit_code, 2);
+        assert_eq!(
+            issues.first().map(String::as_str),
+            Some(CHECK_HOOK_NOT_INSTALLED_ISSUE)
+        );
+    }
+
+    #[test]
+    fn test_check_outcome_ready_when_hook_installed() {
+        let unhealthy = Vec::new();
+        let daemon_issues = Vec::new();
+        let (status, exit_code, issues) =
+            derive_check_outcome(2, 2, &unhealthy, &daemon_issues, true);
+
+        assert_eq!(status, "ready");
+        assert_eq!(exit_code, 0);
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn test_check_outcome_degraded_missing_hook_promotes_not_ready() {
+        let unhealthy = vec!["builder-2".to_string()];
+        let daemon_issues = vec!["worker pressure".to_string()];
+        let (status, exit_code, issues) =
+            derive_check_outcome(2, 1, &unhealthy, &daemon_issues, false);
+
+        assert_eq!(status, "not_ready");
+        assert_eq!(exit_code, 2);
+        assert_eq!(
+            issues.first().map(String::as_str),
+            Some(CHECK_HOOK_NOT_INSTALLED_ISSUE)
+        );
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue == "Worker builder-2 is unreachable")
+        );
+        assert!(issues.iter().any(|issue| issue == "worker pressure"));
     }
 
     #[test]
