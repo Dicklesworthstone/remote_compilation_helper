@@ -1267,15 +1267,14 @@ impl WorkerSelector {
         let mut filtered_by_health = 0usize;
         let mut filtered_by_hard_preflight = 0usize;
         let mut filtered_by_convergence = 0usize;
+        let mut filtered_by_pressure = 0usize;
+        let mut filtered_by_slots = 0usize;
+        let mut filtered_by_active_project = 0usize;
         let mut any_has_runtime = false;
 
         for worker in workers {
             let circuit_state = worker.circuit_state().await.unwrap_or(CircuitState::Closed);
             let worker_id = worker.config.read().await.id.clone();
-            if excluded_worker_ids.contains(worker_id.as_str()) {
-                debug!("Worker {} excluded: caller-side exclusion set", worker_id);
-                continue;
-            }
 
             // Filter by circuit state
             match circuit_state {
@@ -1295,6 +1294,18 @@ impl WorkerSelector {
                 RequiredRuntime::Bun => worker.has_bun().await,
                 RequiredRuntime::Node => worker.has_node().await,
             };
+
+            if excluded_worker_ids.contains(worker_id.as_str()) {
+                debug!(
+                    "Worker {} excluded: already active for project {}",
+                    worker_id, request.project
+                );
+                if has_required_runtime {
+                    any_has_runtime = true;
+                    filtered_by_active_project += 1;
+                }
+                continue;
+            }
 
             if !has_required_runtime {
                 continue;
@@ -1327,6 +1338,7 @@ impl WorkerSelector {
 
             // Filter by slot availability
             if worker.available_slots().await < request.estimated_cores {
+                filtered_by_slots += 1;
                 debug!(
                     "Worker {} excluded: insufficient slots ({} < {})",
                     worker_id,
@@ -1478,6 +1490,7 @@ impl WorkerSelector {
                                 "preflight_pressure",
                                 "critical_pressure",
                             );
+                            filtered_by_pressure += 1;
                             hard_preflight_block = true;
                         }
                         passes_preflight = false;
@@ -1524,6 +1537,7 @@ impl WorkerSelector {
                         );
                         metrics::inc_reliability_error("preflight_pressure", "critical_pressure");
                         passes_preflight = false;
+                        filtered_by_pressure += 1;
                         hard_preflight_block = true;
                     }
                     PressureState::Warning => {
@@ -1635,6 +1649,20 @@ impl WorkerSelector {
             return Ok(eligible);
         }
 
+        if filtered_by_active_project > 0
+            && preferred_without_health.is_empty()
+            && eligible_without_health.is_empty()
+        {
+            return Err(SelectionReason::NoAdmissibleWorkers(
+                no_admissible_workers_summary_with_active_project(
+                    filtered_by_pressure,
+                    filtered_by_slots,
+                    filtered_by_hard_preflight,
+                    filtered_by_active_project,
+                ),
+            ));
+        }
+
         // Hard preflight failures (for example topology invariants or
         // convergence failures) must not fall back to unhealthy worker
         // assignment; force fail-open local execution.
@@ -1642,6 +1670,20 @@ impl WorkerSelector {
             && preferred_without_health.is_empty()
             && eligible_without_health.is_empty()
         {
+            debug!(
+                "All candidate workers failed hard preflight checks (count={})",
+                filtered_by_hard_preflight
+            );
+            if filtered_by_pressure > 0 || filtered_by_slots > 0 {
+                return Err(SelectionReason::NoAdmissibleWorkers(
+                    no_admissible_workers_summary(
+                        filtered_by_pressure,
+                        filtered_by_slots,
+                        filtered_by_hard_preflight,
+                    ),
+                ));
+            }
+
             // Emit a convergence-specific reason when convergence was the
             // dominant failure mode, so the hook can produce actionable
             // diagnostics (bd-vvmd.3.3).
@@ -1653,11 +1695,6 @@ impl WorkerSelector {
                 );
                 return Err(SelectionReason::AllWorkersFailedConvergence);
             }
-
-            debug!(
-                "All candidate workers failed hard preflight checks (count={})",
-                filtered_by_hard_preflight
-            );
             return Err(SelectionReason::AllWorkersFailedPreflight);
         }
 
@@ -2438,12 +2475,52 @@ fn selection_reason_label(reason: &SelectionReason) -> &'static str {
         SelectionReason::NoWorkersPassedHealth => "no_workers_passed_health",
         SelectionReason::AllWorkersFailedPreflight => "all_workers_failed_preflight",
         SelectionReason::AllWorkersFailedConvergence => "all_workers_failed_convergence",
+        SelectionReason::NoAdmissibleWorkers(_) => "no_admissible_workers",
         SelectionReason::NoMatchingWorkers => "no_matching_workers",
         SelectionReason::NoWorkersWithRuntime(_) => "no_workers_with_runtime",
         SelectionReason::SelectionError(_) => "selection_error",
         SelectionReason::AffinityPinned => "affinity_pinned",
         SelectionReason::AffinityFallback => "affinity_fallback",
     }
+}
+
+fn no_admissible_workers_summary(
+    critical_pressure: usize,
+    insufficient_slots: usize,
+    hard_preflight: usize,
+) -> String {
+    let mut parts = Vec::new();
+    if critical_pressure > 0 {
+        parts.push(format!("critical_pressure={critical_pressure}"));
+    }
+    if insufficient_slots > 0 {
+        parts.push(format!("insufficient_slots={insufficient_slots}"));
+    }
+    let generic_hard_preflight = hard_preflight.saturating_sub(critical_pressure);
+    if generic_hard_preflight > 0 {
+        parts.push(format!("hard_preflight={generic_hard_preflight}"));
+    }
+    parts.join(",")
+}
+
+fn no_admissible_workers_summary_with_active_project(
+    critical_pressure: usize,
+    insufficient_slots: usize,
+    hard_preflight: usize,
+    active_project_exclusion: usize,
+) -> String {
+    let mut summary =
+        no_admissible_workers_summary(critical_pressure, insufficient_slots, hard_preflight);
+    if active_project_exclusion == 0 {
+        return summary;
+    }
+    if !summary.is_empty() {
+        summary.push(',');
+    }
+    summary.push_str(&format!(
+        "active_project_exclusion={active_project_exclusion}"
+    ));
+    summary
 }
 
 fn selection_outcome_label(reason: &SelectionReason) -> &'static str {
@@ -3715,6 +3792,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_active_project_exclusion_preserves_runtime_reason() {
+        let pool = WorkerPool::new();
+
+        let active = make_worker("active-rust", 4, 80.0);
+        active
+            .set_capabilities(rch_common::WorkerCapabilities {
+                rustc_version: Some("1.97.0-nightly".to_string()),
+                ..Default::default()
+            })
+            .await;
+        pool.add_worker_state(active).await;
+
+        let non_rust = make_worker("non-rust", 4, 70.0);
+        pool.add_worker_state(non_rust).await;
+
+        let selector = WorkerSelector::default();
+        let request = SelectionRequest {
+            project: "frankenterm".to_string(),
+            command: Some("cargo build".to_string()),
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 1,
+            preferred_workers: vec![],
+            toolchain: None,
+            required_runtime: RequiredRuntime::Rust,
+            classification_duration_us: None,
+            hook_pid: None,
+        };
+        let mut excluded_worker_ids = HashSet::new();
+        excluded_worker_ids.insert("active-rust".to_string());
+
+        let result = selector
+            .select_with_exclusions(&pool, &request, &excluded_worker_ids)
+            .await;
+        assert!(result.worker.is_none());
+        assert_eq!(
+            result.reason,
+            SelectionReason::NoAdmissibleWorkers("active_project_exclusion=1".to_string())
+        );
+    }
+
+    #[tokio::test]
     async fn test_topology_preflight_prefers_healthy_worker() {
         let pool = WorkerPool::new();
 
@@ -3792,6 +3910,73 @@ mod tests {
         let result = selector.select(&pool, &request).await;
         assert!(result.worker.is_none());
         assert_eq!(result.reason, SelectionReason::AllWorkersFailedPreflight);
+    }
+
+    #[tokio::test]
+    async fn test_pressure_and_busy_pool_reports_concrete_admission_blockers() {
+        let pool = WorkerPool::new();
+
+        let critical = make_worker("critical-pressure", 8, 80.0);
+        critical
+            .set_capabilities(rch_common::WorkerCapabilities {
+                rustc_version: Some("1.87.0".to_string()),
+                projects_root_ok: Some(true),
+                projects_root_checked_at_unix_ms: Some(1_700_000_000_000),
+                ..Default::default()
+            })
+            .await;
+        critical
+            .set_pressure_assessment(crate::disk_pressure::PressureAssessment {
+                state: crate::disk_pressure::PressureState::Critical,
+                confidence: crate::disk_pressure::PressureConfidence::High,
+                reason_code: "disk_ratio_below_critical".to_string(),
+                policy_rule: "disk_free_ratio<=critical_free_ratio".to_string(),
+                disk_free_gb: Some(38.0),
+                disk_total_gb: Some(774.0),
+                disk_free_ratio: Some(0.049),
+                disk_io_util_pct: Some(0.0),
+                memory_pressure: Some(15.0),
+                telemetry_age_secs: Some(8),
+                telemetry_fresh: true,
+                evaluated_at_unix_ms: 1_700_000_000_000,
+            })
+            .await;
+        pool.add_worker_state(critical).await;
+
+        let busy = make_worker("busy-rust", 8, 70.0);
+        busy.set_capabilities(rch_common::WorkerCapabilities {
+            rustc_version: Some("1.87.0".to_string()),
+            projects_root_ok: Some(true),
+            projects_root_checked_at_unix_ms: Some(1_700_000_000_000),
+            disk_free_gb: Some(90.0),
+            disk_total_gb: Some(774.0),
+            ..Default::default()
+        })
+        .await;
+        assert!(busy.reserve_slots(8).await);
+        pool.add_worker_state(busy).await;
+
+        let selector = WorkerSelector::default();
+        let request = SelectionRequest {
+            project: "pressure-plus-busy".to_string(),
+            command: Some("cargo test".to_string()),
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 4,
+            preferred_workers: vec![],
+            toolchain: None,
+            required_runtime: RequiredRuntime::Rust,
+            classification_duration_us: None,
+            hook_pid: None,
+        };
+
+        let result = selector.select(&pool, &request).await;
+        assert!(result.worker.is_none());
+        assert_eq!(
+            result.reason,
+            SelectionReason::NoAdmissibleWorkers(
+                "critical_pressure=1,insufficient_slots=1".to_string()
+            )
+        );
     }
 
     #[tokio::test]
@@ -3997,7 +4182,10 @@ mod tests {
 
         let result = selector.select(&pool, &request).await;
         assert!(result.worker.is_none());
-        assert_eq!(result.reason, SelectionReason::AllWorkersFailedPreflight);
+        assert_eq!(
+            result.reason,
+            SelectionReason::NoAdmissibleWorkers("critical_pressure=1".to_string())
+        );
     }
 
     #[tokio::test]
@@ -5676,6 +5864,40 @@ mod tests {
                 "Converging worker should be excluded"
             );
             assert_eq!(result.reason, SelectionReason::AllWorkersFailedConvergence);
+        }
+
+        #[tokio::test]
+        async fn test_preflight_rejects_mixed_convergence_and_busy_pool() {
+            let pool = WorkerPool::new();
+            pool.add_worker(
+                make_worker("converging", 8, 80.0)
+                    .config
+                    .read()
+                    .await
+                    .clone(),
+            )
+            .await;
+
+            let busy = make_worker("busy", 8, 80.0);
+            assert!(busy.reserve_slots(8).await);
+            pool.add_worker_state(busy).await;
+
+            let convergence = make_convergence_svc();
+            let wid = WorkerId::new("converging");
+            convergence.mark_converging(&wid).await;
+
+            let mut selector = WorkerSelector::new();
+            selector.set_repo_convergence(convergence);
+
+            let request = make_selection_request("test-project");
+            let result = selector.select(&pool, &request).await;
+            assert!(result.worker.is_none());
+            assert_eq!(
+                result.reason,
+                SelectionReason::NoAdmissibleWorkers(
+                    "insufficient_slots=1,hard_preflight=1".to_string()
+                )
+            );
         }
 
         #[tokio::test]

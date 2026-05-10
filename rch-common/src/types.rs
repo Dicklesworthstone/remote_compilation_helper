@@ -179,6 +179,8 @@ pub enum SelectionReason {
     AllWorkersFailedPreflight,
     /// All candidate workers failed repo convergence checks (repos missing/stale/failed).
     AllWorkersFailedConvergence,
+    /// Workers exist but admission was blocked by concrete capacity/preflight reasons.
+    NoAdmissibleWorkers(String),
     /// No workers match required tags or preferences.
     NoMatchingWorkers,
     /// No workers have the required runtime (e.g., Bun, Node).
@@ -203,6 +205,9 @@ impl std::fmt::Display for SelectionReason {
             Self::AllWorkersFailedPreflight => write!(f, "all workers failed preflight checks"),
             Self::AllWorkersFailedConvergence => {
                 write!(f, "all workers failed repo convergence checks")
+            }
+            Self::NoAdmissibleWorkers(summary) => {
+                write!(f, "no admissible workers: {}", summary)
             }
             Self::NoMatchingWorkers => write!(f, "no matching workers found"),
             Self::NoWorkersWithRuntime(rt) => write!(f, "no workers with {} installed", rt),
@@ -3091,6 +3096,13 @@ mod tests {
             "\"all_workers_failed_convergence\""
         );
         assert_eq!(
+            serde_json::to_string(&SelectionReason::NoAdmissibleWorkers(
+                "critical_pressure=1,insufficient_slots=1".to_string()
+            ))
+            .unwrap(),
+            "{\"no_admissible_workers\":\"critical_pressure=1,insufficient_slots=1\"}"
+        );
+        assert_eq!(
             serde_json::to_string(&SelectionReason::NoMatchingWorkers).unwrap(),
             "\"no_matching_workers\""
         );
@@ -3128,6 +3140,13 @@ mod tests {
             serde_json::from_str::<SelectionReason>("\"all_workers_failed_convergence\"").unwrap(),
             SelectionReason::AllWorkersFailedConvergence
         );
+        assert_eq!(
+            serde_json::from_str::<SelectionReason>(
+                "{\"no_admissible_workers\":\"critical_pressure=1\"}"
+            )
+            .unwrap(),
+            SelectionReason::NoAdmissibleWorkers("critical_pressure=1".to_string())
+        );
     }
 
     #[test]
@@ -3160,6 +3179,13 @@ mod tests {
         assert_eq!(
             SelectionReason::AllWorkersFailedConvergence.to_string(),
             "all workers failed repo convergence checks"
+        );
+        assert_eq!(
+            SelectionReason::NoAdmissibleWorkers(
+                "critical_pressure=1,insufficient_slots=1".to_string()
+            )
+            .to_string(),
+            "no admissible workers: critical_pressure=1,insufficient_slots=1"
         );
         assert_eq!(
             SelectionReason::SelectionError("oops".to_string()).to_string(),
