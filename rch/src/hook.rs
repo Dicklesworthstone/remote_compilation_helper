@@ -1385,13 +1385,17 @@ fn has_exact_flag(command: &str) -> bool {
 
 use std::collections::HashMap;
 
-// Timing infrastructure - currently used only for metrics collection and future
-// timing-based build gating. Allow dead_code until timing estimates are wired
-// into run_exec for smarter offload decisions.
-#[allow(dead_code)]
+// Timing infrastructure: feeds the global `TIMING_CACHE` (live; populated
+// by `record_build_timing` after every offloaded build). The estimator
+// surface that consumes the cache (`estimate_timing_for_build`,
+// `TimingEstimate`) is currently exercised only by unit tests — those
+// items keep `#[allow(dead_code)]` until production callers materialize.
+//
+// `MAX_TIMING_SAMPLES` bounds the per-project sample list (used at line
+// 1441). `MAX_TIMING_PROJECTS` bounds the project-keyed map for
+// LRU-eviction (used at line 1618).
 const MAX_TIMING_SAMPLES: usize = 20;
 
-#[allow(dead_code)]
 const MAX_TIMING_PROJECTS: usize = 500;
 
 /// A single timing record for a completed build.
@@ -1502,24 +1506,32 @@ struct TimingHistory {
     pub entries: HashMap<String, ProjectTimingData>,
 }
 
-/// Process-global in-memory cache for TimingHistory.
+/// Process-global in-memory cache for `TimingHistory`.
 ///
-/// After first load from disk, all reads come from memory (zero disk I/O).
-/// Writes update the cache first, then persist to disk asynchronously.
-/// This eliminates disk I/O from the estimate_timing_for_build hot path.
-#[allow(dead_code)]
+/// **Lifetime:** the hook is a fresh process per invocation, so the cache
+/// is rebuilt at the start of every hook call. Within a single hook call
+/// (or within `rchd` / a long-running `rch exec` session), `record_build_timing`
+/// can fire multiple times across `tokio::task::spawn_blocking` blocks; the
+/// `OnceLock` coalesces disk I/O for that batch — first call pays the
+/// `load_from_disk` cost; subsequent calls in the same process operate on
+/// the in-memory copy and write through to disk on update.
+///
+/// Consumers (live as of t19 close): two `record_build_timing` call sites
+/// in `run_classification_remote_path`. The estimator surface
+/// (`estimate_timing_for_build`, `TimingEstimate`) is currently exercised
+/// only by unit tests; those keep their `#[allow(dead_code)]` annotation
+/// until a production consumer wires them up.
 static TIMING_CACHE: std::sync::OnceLock<std::sync::RwLock<TimingHistory>> =
     std::sync::OnceLock::new();
 
-/// Get or initialize the global TimingHistory cache.
+/// Get or initialize the global `TimingHistory` cache.
 ///
-/// First call loads from disk (blocking); subsequent calls return the cached copy.
-#[allow(dead_code)]
+/// First call loads from disk (blocking); subsequent calls in the same
+/// process return the cached copy.
 fn timing_cache() -> &'static std::sync::RwLock<TimingHistory> {
     TIMING_CACHE.get_or_init(|| std::sync::RwLock::new(TimingHistory::load_from_disk()))
 }
 
-#[allow(dead_code)]
 impl TimingHistory {
     /// Load timing history from disk. Returns empty history on error.
     fn load_from_disk() -> Self {
@@ -1631,7 +1643,6 @@ fn timing_history_path() -> Option<PathBuf> {
 /// Updates the in-memory cache immediately, then persists to disk.
 /// Called after a build completes to update the timing history.
 /// This is used by `estimate_timing_for_build` for future predictions.
-#[allow(dead_code)]
 pub fn record_build_timing(
     project: &str,
     kind: Option<CompilationKind>,

@@ -299,7 +299,11 @@ pub struct RepoConvergenceStatusFromApi {
 // ============================================================================
 
 /// Schema version for the CLI status JSON envelope.
-pub const STATUS_SCHEMA_VERSION: &str = "1.0.0";
+///
+/// Sourced from the central [`rch_common::schema_versions`] registry so
+/// cross-component drift is caught by the registry's pinned-snapshot test.
+pub const STATUS_SCHEMA_VERSION: &str =
+    rch_common::schema_version(rch_common::SchemaComponent::Status);
 
 /// System-level posture summarizing whether builds go remote or fall back local.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

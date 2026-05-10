@@ -16,7 +16,7 @@ use crate::ui::context::OutputContext;
 use crate::ui::theme::StatusIndicator;
 use anyhow::Result;
 use directories::ProjectDirs;
-use rch_common::ApiResponse;
+use rch_common::{ApiResponse, ReliabilityReasonCode};
 use rch_telemetry::TelemetryStorage;
 use serde::Serialize;
 use std::collections::BTreeSet;
@@ -150,11 +150,25 @@ pub struct DoctorOptions {
     pub verbose: bool,
 }
 
-const RELIABILITY_DOCTOR_SCHEMA_VERSION: &str = "1.0.0";
-const EXPECTED_RELIABILITY_DOCTOR_SCHEMA_VERSION: &str = "1.0.0";
-const EXPECTED_STATUS_SCHEMA_VERSION: &str = "1.0.0";
-const EXPECTED_REPO_UPDATER_CONTRACT_SCHEMA_VERSION: &str = "1.0.0";
-const EXPECTED_PROCESS_TRIAGE_CONTRACT_SCHEMA_VERSION: &str = "1.0.0";
+// Schema-version constants are sourced from the central
+// `rch_common::schema_versions` registry so cross-component drift is
+// caught by the registry's pinned-snapshot test.
+//
+// The `EXPECTED_*` constants currently mirror the live versions because
+// every component shares the same value. They exist as a separate set
+// so future "expected vs live" mismatches (e.g., during a partial
+// rollout where the doctor binary was upgraded ahead of the daemon) can
+// be encoded by adjusting the EXPECTED_* values independently.
+const RELIABILITY_DOCTOR_SCHEMA_VERSION: &str =
+    rch_common::schema_version(rch_common::SchemaComponent::DoctorReliability);
+const EXPECTED_RELIABILITY_DOCTOR_SCHEMA_VERSION: &str =
+    rch_common::schema_version(rch_common::SchemaComponent::DoctorReliability);
+const EXPECTED_STATUS_SCHEMA_VERSION: &str =
+    rch_common::schema_version(rch_common::SchemaComponent::Status);
+const EXPECTED_REPO_UPDATER_CONTRACT_SCHEMA_VERSION: &str =
+    rch_common::schema_version(rch_common::SchemaComponent::RepoUpdaterContract);
+const EXPECTED_PROCESS_TRIAGE_CONTRACT_SCHEMA_VERSION: &str =
+    rch_common::schema_version(rch_common::SchemaComponent::ProcessTriageContract);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -205,7 +219,9 @@ struct ReliabilityDiagnostic {
     check_name: String,
     severity: ReliabilitySeverity,
     message: String,
-    reason_code: String,
+    /// Canonical `RCH-Rnnn` reason code (per `ReliabilityReasonCode`).
+    /// Serializes as the string form (e.g., `"RCH-R001"`).
+    code: ReliabilityReasonCode,
     #[serde(skip_serializing_if = "Option::is_none")]
     details: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -254,14 +270,14 @@ impl ReliabilityDiagnostic {
         check_name: impl Into<String>,
         severity: ReliabilitySeverity,
         message: impl Into<String>,
-        reason_code: impl Into<String>,
+        code: ReliabilityReasonCode,
     ) -> Self {
         Self {
             category,
             check_name: check_name.into(),
             severity,
             message: message.into(),
-            reason_code: reason_code.into(),
+            code,
             details: None,
             worker_id: None,
             remediation_command: None,
@@ -507,7 +523,7 @@ fn reliability_topology_diagnostics(
                 "workers_config",
                 ReliabilitySeverity::Critical,
                 "Worker configuration could not be loaded",
-                "workers_config_unreadable",
+                ReliabilityReasonCode::WorkersConfigUnreadable,
             )
             .with_details(error)
             .with_remediation(
@@ -523,7 +539,7 @@ fn reliability_topology_diagnostics(
                     "workers_config",
                     ReliabilitySeverity::Critical,
                     "No workers are configured, so all builds will run locally",
-                    "no_workers_configured",
+                    ReliabilityReasonCode::NoWorkersConfigured,
                 )
                 .with_remediation("rch workers add <host>", "rch workers list --json"),
             );
@@ -539,7 +555,7 @@ fn reliability_topology_diagnostics(
                     "workers_config",
                     ReliabilitySeverity::Pass,
                     format!("{} worker(s) configured", workers.len()),
-                    "workers_configured",
+                    ReliabilityReasonCode::WorkersConfigured,
                 )
                 .with_details(worker_ids),
             );
@@ -553,7 +569,7 @@ fn reliability_topology_diagnostics(
                 "daemon_status",
                 ReliabilitySeverity::Warning,
                 "Daemon status is unavailable; reliability health is partial",
-                "daemon_status_unavailable",
+                ReliabilityReasonCode::DaemonStatusUnavailable,
             )
             .with_remediation("rch daemon start", "rch status --json"),
         );
@@ -561,22 +577,22 @@ fn reliability_topology_diagnostics(
     };
 
     let daemon = &status.daemon;
-    let (severity, reason_code, message) = if daemon.workers_total == 0 {
+    let (severity, code, message) = if daemon.workers_total == 0 {
         (
             ReliabilitySeverity::Critical,
-            "daemon_has_no_workers",
+            ReliabilityReasonCode::DaemonHasNoWorkers,
             "Daemon has no registered workers".to_string(),
         )
     } else if daemon.workers_healthy == 0 {
         (
             ReliabilitySeverity::Critical,
-            "all_workers_unhealthy",
+            ReliabilityReasonCode::AllWorkersUnhealthy,
             format!("0/{} workers are healthy", daemon.workers_total),
         )
     } else if daemon.workers_healthy < daemon.workers_total {
         (
             ReliabilitySeverity::Warning,
-            "partial_worker_capacity",
+            ReliabilityReasonCode::PartialWorkerCapacity,
             format!(
                 "{}/{} workers are healthy",
                 daemon.workers_healthy, daemon.workers_total
@@ -585,7 +601,7 @@ fn reliability_topology_diagnostics(
     } else {
         (
             ReliabilitySeverity::Pass,
-            "workers_healthy",
+            ReliabilityReasonCode::WorkersHealthy,
             format!("All {} workers are healthy", daemon.workers_total),
         )
     };
@@ -594,7 +610,7 @@ fn reliability_topology_diagnostics(
         "daemon_worker_capacity",
         severity,
         message,
-        reason_code,
+        code,
     )
     .with_details(format!(
         "slots_available={}, slots_total={}, uptime_secs={}",
@@ -618,10 +634,10 @@ fn worker_topology_diagnostic(worker: &WorkerStatusFromApi) -> ReliabilityDiagno
         "healthy" | "available" | "ready" | "idle" | "running"
     );
 
-    let (severity, reason_code, message) = if circuit == "open" {
+    let (severity, code, message) = if circuit == "open" {
         (
             ReliabilitySeverity::Critical,
-            "worker_circuit_open",
+            ReliabilityReasonCode::WorkerCircuitOpen,
             format!("Worker {} circuit is open", worker.id),
         )
     } else if matches!(
@@ -630,13 +646,13 @@ fn worker_topology_diagnostic(worker: &WorkerStatusFromApi) -> ReliabilityDiagno
     ) {
         (
             ReliabilitySeverity::Critical,
-            "worker_unreachable",
+            ReliabilityReasonCode::WorkerUnreachable,
             format!("Worker {} is {}", worker.id, worker.status),
         )
     } else if circuit == "half_open" || !ready_status {
         (
             ReliabilitySeverity::Warning,
-            "worker_degraded",
+            ReliabilityReasonCode::WorkerDegraded,
             format!(
                 "Worker {} is degraded (status={}, circuit={})",
                 worker.id, worker.status, worker.circuit_state
@@ -645,7 +661,7 @@ fn worker_topology_diagnostic(worker: &WorkerStatusFromApi) -> ReliabilityDiagno
     } else {
         (
             ReliabilitySeverity::Pass,
-            "worker_ready",
+            ReliabilityReasonCode::WorkerReady,
             format!("Worker {} is ready", worker.id),
         )
     };
@@ -655,7 +671,7 @@ fn worker_topology_diagnostic(worker: &WorkerStatusFromApi) -> ReliabilityDiagno
         "worker_topology",
         severity,
         message,
-        reason_code,
+        code,
     )
     .with_worker(worker.id.clone())
     .with_details(format!(
@@ -687,7 +703,7 @@ fn reliability_repo_diagnostics(
                 "repo_convergence",
                 ReliabilitySeverity::Warning,
                 "Repo-convergence status is unavailable",
-                "repo_convergence_unavailable",
+                ReliabilityReasonCode::RepoConvergenceUnavailable,
             )
             .with_remediation("rch daemon start", "rch status --json"),
         ];
@@ -695,16 +711,16 @@ fn reliability_repo_diagnostics(
 
     let summary = &convergence.summary;
     let mut diagnostics = Vec::new();
-    let (severity, reason_code, message) = if summary.failed > 0 {
+    let (severity, code, message) = if summary.failed > 0 {
         (
             ReliabilitySeverity::Critical,
-            "repo_convergence_failed",
+            ReliabilityReasonCode::RepoConvergenceFailed,
             format!("{} worker(s) failed repo convergence", summary.failed),
         )
     } else if summary.drifting > 0 || summary.stale > 0 {
         (
             ReliabilitySeverity::Warning,
-            "repo_convergence_drift",
+            ReliabilityReasonCode::RepoConvergenceDrift,
             format!(
                 "{} drifting and {} stale worker(s)",
                 summary.drifting, summary.stale
@@ -713,13 +729,13 @@ fn reliability_repo_diagnostics(
     } else if summary.total_workers == 0 {
         (
             ReliabilitySeverity::Info,
-            "repo_convergence_no_workers",
+            ReliabilityReasonCode::RepoConvergenceNoWorkers,
             "No worker repo-convergence records were reported".to_string(),
         )
     } else {
         (
             ReliabilitySeverity::Pass,
-            "repo_convergence_ready",
+            ReliabilityReasonCode::RepoConvergenceReady,
             format!("{} worker(s) are repo-converged", summary.ready),
         )
     };
@@ -729,7 +745,7 @@ fn reliability_repo_diagnostics(
         "repo_convergence",
         severity,
         message,
-        reason_code,
+        code,
     )
     .with_details(format!(
         "status={}, total={}, ready={}, converging={}, drifting={}, failed={}, stale={}",
@@ -773,7 +789,7 @@ fn reliability_repo_diagnostics(
                 "Worker {} repo state is {}",
                 worker.worker_id, worker.drift_state
             ),
-            "worker_repo_not_ready",
+            ReliabilityReasonCode::WorkerRepoNotReady,
         )
         .with_worker(worker.worker_id.clone())
         .with_details(format!(
@@ -808,7 +824,7 @@ fn reliability_disk_pressure_diagnostics(
                 "disk_pressure",
                 ReliabilitySeverity::Warning,
                 "Disk-pressure telemetry is unavailable because daemon status could not be read",
-                "disk_pressure_unavailable",
+                ReliabilityReasonCode::DiskPressureUnavailable,
             )
             .with_remediation("rch daemon start", "rch status --workers --json"),
         ];
@@ -820,7 +836,7 @@ fn reliability_disk_pressure_diagnostics(
             "disk_pressure",
             ReliabilitySeverity::Info,
             "No workers reported disk-pressure telemetry",
-            "disk_pressure_no_workers",
+            ReliabilityReasonCode::DiskPressureNoWorkers,
         )];
     }
 
@@ -832,10 +848,10 @@ fn reliability_disk_pressure_diagnostics(
                 .pressure_state
                 .as_deref()
                 .unwrap_or("telemetry_gap");
-            let (severity, reason_code, message) = match state {
+            let (severity, code, message) = match state {
                 "critical" => (
                     ReliabilitySeverity::Critical,
-                    "worker_disk_pressure_critical",
+                    ReliabilityReasonCode::WorkerDiskPressureCritical,
                     format!(
                         "Worker {} has critical disk pressure ({})",
                         worker.id,
@@ -844,7 +860,7 @@ fn reliability_disk_pressure_diagnostics(
                 ),
                 "warning" => (
                     ReliabilitySeverity::Warning,
-                    "worker_disk_pressure_warning",
+                    ReliabilityReasonCode::WorkerDiskPressureWarning,
                     format!(
                         "Worker {} has elevated disk pressure ({})",
                         worker.id,
@@ -853,7 +869,7 @@ fn reliability_disk_pressure_diagnostics(
                 ),
                 "healthy" => (
                     ReliabilitySeverity::Pass,
-                    "worker_disk_pressure_healthy",
+                    ReliabilityReasonCode::WorkerDiskPressureHealthy,
                     format!(
                         "Worker {} disk pressure is healthy ({})",
                         worker.id,
@@ -862,7 +878,7 @@ fn reliability_disk_pressure_diagnostics(
                 ),
                 _ => (
                     ReliabilitySeverity::Warning,
-                    "worker_disk_pressure_telemetry_gap",
+                    ReliabilityReasonCode::WorkerDiskPressureTelemetryGap,
                     format!("Worker {} is missing fresh disk telemetry", worker.id),
                 ),
             };
@@ -872,7 +888,7 @@ fn reliability_disk_pressure_diagnostics(
                 "worker_disk_pressure",
                 severity,
                 message,
-                reason_code,
+                code,
             )
             .with_worker(worker.id.clone())
             .with_details(format!(
@@ -949,7 +965,7 @@ fn reliability_process_debt_diagnostics(
                 "process_debt",
                 ReliabilitySeverity::Warning,
                 "Process-debt health is unavailable because daemon status could not be read",
-                "process_debt_unavailable",
+                ReliabilityReasonCode::ProcessDebtUnavailable,
             )
             .with_remediation("rch daemon start", "rch status --jobs --json"),
         ];
@@ -968,10 +984,10 @@ fn reliability_process_debt_diagnostics(
         severity,
         cancellation.message,
         match severity {
-            ReliabilitySeverity::Pass => "cancellation_cleanup_healthy",
-            ReliabilitySeverity::Info => "cancellation_cleanup_skipped",
-            ReliabilitySeverity::Warning => "cancellation_cleanup_degraded",
-            ReliabilitySeverity::Critical => "cancellation_cleanup_failed",
+            ReliabilitySeverity::Pass => ReliabilityReasonCode::CancellationCleanupHealthy,
+            ReliabilitySeverity::Info => ReliabilityReasonCode::CancellationCleanupSkipped,
+            ReliabilitySeverity::Warning => ReliabilityReasonCode::CancellationCleanupDegraded,
+            ReliabilitySeverity::Critical => ReliabilityReasonCode::CancellationCleanupFailed,
         },
     );
     if let Some(details) = cancellation.details {
@@ -1002,7 +1018,7 @@ fn reliability_helper_compatibility_diagnostics() -> Vec<ReliabilityDiagnostic> 
                 cmd,
                 ReliabilitySeverity::Pass,
                 format!("{cmd} is available for {description}"),
-                "helper_available",
+                ReliabilityReasonCode::HelperAvailable,
             );
             if let Some(version) = command_version(cmd) {
                 diagnostic = diagnostic.with_details(version);
@@ -1014,7 +1030,7 @@ fn reliability_helper_compatibility_diagnostics() -> Vec<ReliabilityDiagnostic> 
                 cmd,
                 missing_severity,
                 format!("{cmd} is missing; {description} may fail or fall back"),
-                "helper_missing",
+                ReliabilityReasonCode::HelperMissing,
             )
             .with_remediation(
                 format!("Install {cmd} with the system package manager"),
@@ -1036,7 +1052,7 @@ fn reliability_rollout_posture_diagnostics() -> Vec<ReliabilityDiagnostic> {
                     "hook_starts_daemon",
                     ReliabilitySeverity::Pass,
                     "Hook auto-start is enabled",
-                    "hook_auto_start_enabled",
+                    ReliabilityReasonCode::HookAutoStartEnabled,
                 )
             } else {
                 ReliabilityDiagnostic::new(
@@ -1044,7 +1060,7 @@ fn reliability_rollout_posture_diagnostics() -> Vec<ReliabilityDiagnostic> {
                     "hook_starts_daemon",
                     ReliabilitySeverity::Warning,
                     "Hook auto-start is disabled; daemon outages may silently force local builds",
-                    "hook_auto_start_disabled",
+                    ReliabilityReasonCode::HookAutoStartDisabled,
                 )
                 .with_remediation(
                     "rch config set self_healing.hook_starts_daemon true",
@@ -1064,7 +1080,7 @@ fn reliability_rollout_posture_diagnostics() -> Vec<ReliabilityDiagnostic> {
                     "daemon_installs_hooks",
                     ReliabilitySeverity::Pass,
                     "Daemon hook repair is enabled",
-                    "daemon_hook_repair_enabled",
+                    ReliabilityReasonCode::DaemonHookRepairEnabled,
                 ));
             } else {
                 diagnostics.push(
@@ -1073,7 +1089,7 @@ fn reliability_rollout_posture_diagnostics() -> Vec<ReliabilityDiagnostic> {
                         "daemon_installs_hooks",
                         ReliabilitySeverity::Warning,
                         "Daemon hook repair is disabled; hook drift may persist",
-                        "daemon_hook_repair_disabled",
+                        ReliabilityReasonCode::DaemonHookRepairDisabled,
                     )
                     .with_remediation(
                         "rch config set self_healing.daemon_installs_hooks true",
@@ -1088,7 +1104,7 @@ fn reliability_rollout_posture_diagnostics() -> Vec<ReliabilityDiagnostic> {
                 "config_load",
                 ReliabilitySeverity::Warning,
                 "Configuration could not be loaded; rollout posture is partial",
-                "config_load_failed",
+                ReliabilityReasonCode::ConfigLoadFailed,
             )
             .with_details(err.to_string())
             .with_remediation(
@@ -1103,21 +1119,21 @@ fn reliability_rollout_posture_diagnostics() -> Vec<ReliabilityDiagnostic> {
         "status_surface",
         ReliabilitySeverity::Pass,
         "Unified status surface is compiled in",
-        "status_surface_available",
+        ReliabilityReasonCode::StatusSurfaceAvailable,
     ));
     diagnostics.push(ReliabilityDiagnostic::new(
         ReliabilityCategory::RolloutPosture,
         "repo_convergence_gate",
         ReliabilitySeverity::Pass,
         "Repo-convergence status endpoint is wired into the CLI",
-        "repo_convergence_surface_available",
+        ReliabilityReasonCode::RepoConvergenceSurfaceAvailable,
     ));
     diagnostics.push(ReliabilityDiagnostic::new(
         ReliabilityCategory::RolloutPosture,
         "disk_pressure_gate",
         ReliabilitySeverity::Pass,
         "Disk-pressure fields are wired into worker status",
-        "disk_pressure_surface_available",
+        ReliabilityReasonCode::DiskPressureSurfaceAvailable,
     ));
 
     diagnostics
@@ -1174,7 +1190,7 @@ fn schema_compatibility_diagnostic(
             name,
             ReliabilitySeverity::Pass,
             format!("{description} schema version is compatible"),
-            "schema_compatible",
+            ReliabilityReasonCode::SchemaCompatible,
         )
         .with_details(format!("schema_version={actual} expected={expected}"))
     } else {
@@ -1183,7 +1199,7 @@ fn schema_compatibility_diagnostic(
             name,
             ReliabilitySeverity::Critical,
             format!("{description} schema version is incompatible"),
-            "schema_incompatible",
+            ReliabilityReasonCode::SchemaIncompatible,
         )
         .with_details(format!("expected={expected}, actual={actual}"))
         .with_remediation(
@@ -1264,12 +1280,7 @@ fn build_reliability_remediation_plan(
                 .validation_check
                 .clone()
                 .unwrap_or_else(|| "rch doctor --reliability --json".to_string()),
-            requires_restart: matches!(
-                diagnostic.reason_code.as_str(),
-                "hook_auto_start_disabled"
-                    | "daemon_hook_repair_disabled"
-                    | "daemon_status_unavailable"
-            ),
+            requires_restart: diagnostic.code.requires_restart(),
             dry_run_safe: diagnostic.dry_run_safe,
         })
         .collect()
@@ -3088,7 +3099,7 @@ mod tests {
             ReliabilityCategory::SchemaCompatibility
         );
         assert_eq!(diagnostic.severity, ReliabilitySeverity::Critical);
-        assert_eq!(diagnostic.reason_code, "schema_incompatible");
+        assert_eq!(diagnostic.code, ReliabilityReasonCode::SchemaIncompatible);
         assert_eq!(
             diagnostic.details.as_deref(),
             Some("expected=1.0.0, actual=2.0.0")
@@ -3105,7 +3116,7 @@ mod tests {
             schema_compatibility_diagnostic("status", "1.0.0", "1.0.0", "CLI status response");
 
         assert_eq!(diagnostic.severity, ReliabilitySeverity::Pass);
-        assert_eq!(diagnostic.reason_code, "schema_compatible");
+        assert_eq!(diagnostic.code, ReliabilityReasonCode::SchemaCompatible);
         assert_eq!(
             diagnostic.details.as_deref(),
             Some("schema_version=1.0.0 expected=1.0.0")

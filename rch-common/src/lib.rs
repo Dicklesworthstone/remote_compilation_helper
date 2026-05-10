@@ -31,6 +31,7 @@ pub mod remote_compilation;
 #[cfg(unix)]
 pub mod remote_verification;
 pub mod repo_updater_contract;
+pub mod schema_versions;
 #[cfg(unix)]
 pub mod ssh;
 #[cfg(all(test, unix))]
@@ -132,7 +133,13 @@ pub use ui::{
 };
 
 // Errors module re-exports
-pub use errors::{ErrorCategory, ErrorCode, ErrorEntry};
+pub use errors::{
+    ErrorCategory, ErrorCode, ErrorEntry, ReliabilityCategoryKind, ReliabilityReasonCode,
+};
+
+// Schema-version registry re-exports
+pub use schema_versions::current_version as schema_version;
+pub use schema_versions::{ALL_COMPONENTS as SCHEMA_VERSION_COMPONENTS, SchemaComponent};
 
 // API module re-exports (unified API types for CLI and daemon)
 pub use api::{API_VERSION, ApiError, ApiResponse, ErrorContext, LegacyErrorCode};
