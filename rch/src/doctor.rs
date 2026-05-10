@@ -150,25 +150,17 @@ pub struct DoctorOptions {
     pub verbose: bool,
 }
 
-// Schema-version constants are sourced from the central
-// `rch_common::schema_versions` registry so cross-component drift is
-// caught by the registry's pinned-snapshot test.
-//
-// The `EXPECTED_*` constants currently mirror the live versions because
-// every component shares the same value. They exist as a separate set
-// so future "expected vs live" mismatches (e.g., during a partial
-// rollout where the doctor binary was upgraded ahead of the daemon) can
-// be encoded by adjusting the EXPECTED_* values independently.
+// Live schema-version constants are sourced from the central
+// `rch_common::schema_versions` registry. The `EXPECTED_*` constants
+// below are intentionally pinned literals: the reliability doctor must
+// compare live component versions against the versions this doctor knows
+// how to consume, not against aliases of those same live constants.
 const RELIABILITY_DOCTOR_SCHEMA_VERSION: &str =
     rch_common::schema_version(rch_common::SchemaComponent::DoctorReliability);
-const EXPECTED_RELIABILITY_DOCTOR_SCHEMA_VERSION: &str =
-    rch_common::schema_version(rch_common::SchemaComponent::DoctorReliability);
-const EXPECTED_STATUS_SCHEMA_VERSION: &str =
-    rch_common::schema_version(rch_common::SchemaComponent::Status);
-const EXPECTED_REPO_UPDATER_CONTRACT_SCHEMA_VERSION: &str =
-    rch_common::schema_version(rch_common::SchemaComponent::RepoUpdaterContract);
-const EXPECTED_PROCESS_TRIAGE_CONTRACT_SCHEMA_VERSION: &str =
-    rch_common::schema_version(rch_common::SchemaComponent::ProcessTriageContract);
+const EXPECTED_RELIABILITY_DOCTOR_SCHEMA_VERSION: &str = "1.0.0";
+const EXPECTED_STATUS_SCHEMA_VERSION: &str = "1.0.0";
+const EXPECTED_REPO_UPDATER_CONTRACT_SCHEMA_VERSION: &str = "1.0.0";
+const EXPECTED_PROCESS_TRIAGE_CONTRACT_SCHEMA_VERSION: &str = "1.0.0";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -3149,6 +3141,40 @@ mod tests {
             Some("schema_version=1.0.0 expected=1.0.0")
         );
         assert!(diagnostic.remediation_command.is_none());
+    }
+
+    #[test]
+    fn test_schema_compatibility_diagnostics_use_pinned_expected_versions() {
+        let diagnostics = reliability_schema_compatibility_diagnostics();
+
+        assert_eq!(diagnostics.len(), 4);
+        for check_name in [
+            "doctor_reliability",
+            "status",
+            "repo_updater_contract",
+            "process_triage_contract",
+        ] {
+            let diagnostic = diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.check_name == check_name);
+            assert!(
+                diagnostic.is_some(),
+                "missing schema diagnostic for {check_name}"
+            );
+            let Some(diagnostic) = diagnostic else {
+                return;
+            };
+
+            assert_eq!(diagnostic.severity, ReliabilitySeverity::Pass);
+            assert_eq!(diagnostic.code, ReliabilityReasonCode::SchemaCompatible);
+            assert!(
+                diagnostic
+                    .details
+                    .as_deref()
+                    .is_some_and(|details| details.ends_with(" expected=1.0.0")),
+                "{check_name} should compare against this doctor's pinned expected schema version"
+            );
+        }
     }
 
     #[test]
