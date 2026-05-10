@@ -8,8 +8,9 @@ use crate::hook::{
     required_runtime_for_kind,
 };
 use crate::status_types::{
-    DaemonFullStatusResponse, SelfTestHistoryResponseFromApi, SelfTestResultRecordFromApi,
-    SelfTestRunResponseFromApi, SelfTestStatusResponseFromApi, extract_json_body,
+    DaemonFullStatusResponse, IssueFromApi, SelfTestHistoryResponseFromApi,
+    SelfTestResultRecordFromApi, SelfTestRunResponseFromApi, SelfTestStatusResponseFromApi,
+    extract_json_body,
 };
 use crate::toolchain::detect_toolchain;
 use crate::ui::context::OutputContext;
@@ -1308,33 +1309,76 @@ fn render_status_verbose_detail_lines(
 
 const CHECK_HOOK_NOT_INSTALLED_ISSUE: &str = "Claude Code hook not installed";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum CheckIssueSeverity {
+    Info,
+    Warning,
+    Error,
+}
+
+fn check_issue_severity(severity: &str) -> CheckIssueSeverity {
+    if severity.eq_ignore_ascii_case("error") || severity.eq_ignore_ascii_case("critical") {
+        CheckIssueSeverity::Error
+    } else if severity.eq_ignore_ascii_case("info") {
+        CheckIssueSeverity::Info
+    } else {
+        CheckIssueSeverity::Warning
+    }
+}
+
 fn derive_check_outcome(
     total_count: usize,
     healthy_count: usize,
     unhealthy: &[String],
-    daemon_issues: &[String],
+    daemon_issues: &[IssueFromApi],
     hook_installed: bool,
 ) -> (String, i32, Vec<String>) {
     let mut issues_list: Vec<String> = unhealthy
         .iter()
         .map(|w| format!("Worker {} is unreachable", w))
         .collect();
-    issues_list.extend(daemon_issues.iter().cloned());
+    issues_list.extend(daemon_issues.iter().map(|issue| issue.summary.clone()));
+
+    let daemon_issue_severity = daemon_issues
+        .iter()
+        .map(|issue| check_issue_severity(&issue.severity))
+        .max();
 
     let (mut status, mut exit_code, mut issues) = if total_count == 0 {
-        (
-            "not_ready".to_string(),
-            2,
-            vec!["No workers configured".to_string()],
-        )
+        issues_list.insert(0, "No workers configured".to_string());
+        ("not_ready".to_string(), 2, issues_list)
     } else if healthy_count == total_count {
         ("ready".to_string(), 0, issues_list)
     } else if healthy_count > 0 {
+        if issues_list.is_empty() {
+            let not_healthy = total_count.saturating_sub(healthy_count);
+            let worker_word = if not_healthy == 1 {
+                "worker"
+            } else {
+                "workers"
+            };
+            let verb = if not_healthy == 1 { "is" } else { "are" };
+            issues_list.push(format!(
+                "{not_healthy} configured {worker_word} {verb} not healthy ({healthy_count}/{total_count} healthy)"
+            ));
+        }
         ("degraded".to_string(), 1, issues_list)
     } else {
         issues_list.insert(0, "All workers are unreachable".to_string());
         ("not_ready".to_string(), 2, issues_list)
     };
+
+    match daemon_issue_severity {
+        Some(CheckIssueSeverity::Error) => {
+            status = "not_ready".to_string();
+            exit_code = 2;
+        }
+        Some(CheckIssueSeverity::Warning) if status == "ready" => {
+            status = "degraded".to_string();
+            exit_code = 1;
+        }
+        _ => {}
+    }
 
     if !hook_installed {
         if status == "ready" || status == "degraded" {
@@ -1430,16 +1474,11 @@ pub async fn check(ctx: &OutputContext) -> Result<()> {
                                 unhealthy: unhealthy.clone(),
                             };
 
-                            let daemon_issues: Vec<String> = daemon_status
-                                .issues
-                                .iter()
-                                .map(|issue| issue.summary.clone())
-                                .collect();
                             let (status, exit_code, issues) = derive_check_outcome(
                                 total_count,
                                 healthy_count,
                                 &unhealthy,
-                                &daemon_issues,
+                                &daemon_status.issues,
                                 hook_installed,
                             );
                             (status, exit_code, daemon_info, workers_info, issues)
@@ -1543,13 +1582,21 @@ pub async fn check(ctx: &OutputContext) -> Result<()> {
             );
         }
         "degraded" => {
-            println!(
-                "{} RCH degraded: {}/{} workers unreachable ({})",
-                style.warning("\u{26A0}"),
-                workers_info.unhealthy.len(),
-                workers_info.total,
-                workers_info.unhealthy.join(", ")
-            );
+            if workers_info.unhealthy.is_empty() {
+                let issue = issues
+                    .first()
+                    .map(String::as_str)
+                    .unwrap_or("some workers are not fully healthy");
+                println!("{} RCH degraded: {}", style.warning("\u{26A0}"), issue);
+            } else {
+                println!(
+                    "{} RCH degraded: {}/{} workers unreachable ({})",
+                    style.warning("\u{26A0}"),
+                    workers_info.unhealthy.len(),
+                    workers_info.total,
+                    workers_info.unhealthy.join(", ")
+                );
+            }
         }
         "not_ready" => {
             let issue = issues
@@ -1708,6 +1755,14 @@ mod tests {
         .unwrap()
     }
 
+    fn check_issue(severity: &str, summary: &str) -> IssueFromApi {
+        IssueFromApi {
+            severity: severity.to_string(),
+            summary: summary.to_string(),
+            remediation: None,
+        }
+    }
+
     #[test]
     fn test_status_verbose_includes_worker_details() {
         let normal_ctx = make_context(OutputConfig::default());
@@ -1768,7 +1823,7 @@ mod tests {
     #[test]
     fn test_check_outcome_degraded_missing_hook_promotes_not_ready() {
         let unhealthy = vec!["builder-2".to_string()];
-        let daemon_issues = vec!["worker pressure".to_string()];
+        let daemon_issues = vec![check_issue("warning", "worker pressure")];
         let (status, exit_code, issues) =
             derive_check_outcome(2, 1, &unhealthy, &daemon_issues, false);
 
@@ -1784,6 +1839,65 @@ mod tests {
                 .any(|issue| issue == "Worker builder-2 is unreachable")
         );
         assert!(issues.iter().any(|issue| issue == "worker pressure"));
+    }
+
+    #[test]
+    fn test_check_outcome_ready_with_daemon_warning_is_degraded() {
+        let unhealthy = Vec::new();
+        let daemon_issues = vec![check_issue("warning", "worker pressure")];
+        let (status, exit_code, issues) =
+            derive_check_outcome(2, 2, &unhealthy, &daemon_issues, true);
+
+        assert_eq!(status, "degraded");
+        assert_eq!(exit_code, 1);
+        assert_eq!(issues, vec!["worker pressure"]);
+    }
+
+    #[test]
+    fn test_check_outcome_daemon_error_is_not_ready() {
+        let unhealthy = Vec::new();
+        let daemon_issues = vec![check_issue("error", "daemon failed to clean up a build")];
+        let (status, exit_code, issues) =
+            derive_check_outcome(2, 2, &unhealthy, &daemon_issues, true);
+
+        assert_eq!(status, "not_ready");
+        assert_eq!(exit_code, 2);
+        assert_eq!(issues, vec!["daemon failed to clean up a build"]);
+    }
+
+    #[test]
+    fn test_check_outcome_zero_workers_preserves_daemon_issues() {
+        let unhealthy = Vec::new();
+        let daemon_issues = vec![check_issue("warning", "stale pressure telemetry")];
+        let (status, exit_code, issues) =
+            derive_check_outcome(0, 0, &unhealthy, &daemon_issues, true);
+
+        assert_eq!(status, "not_ready");
+        assert_eq!(exit_code, 2);
+        assert_eq!(
+            issues.first().map(String::as_str),
+            Some("No workers configured")
+        );
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue == "stale pressure telemetry")
+        );
+    }
+
+    #[test]
+    fn test_check_outcome_partial_health_without_named_unhealthy_worker_explains_degraded() {
+        let unhealthy = Vec::new();
+        let daemon_issues = Vec::new();
+        let (status, exit_code, issues) =
+            derive_check_outcome(3, 2, &unhealthy, &daemon_issues, true);
+
+        assert_eq!(status, "degraded");
+        assert_eq!(exit_code, 1);
+        assert_eq!(
+            issues,
+            vec!["1 configured worker is not healthy (2/3 healthy)".to_string()]
+        );
     }
 
     #[test]
