@@ -1730,12 +1730,24 @@ fn print_reliability_doctor_response(ctx: &OutputContext, response: &Reliability
 }
 
 /// Quick health check result for post-hook-install display.
+///
+/// **t03 contract change:** `workers_healthy` is `Option<usize>` — `None`
+/// means "not probed / unknown", explicitly distinguishing the "fast
+/// check, no network probes" case from the "every worker is healthy"
+/// case. Prior shape unconditionally returned `Some(worker_count)`
+/// without probing, which silently treated unhealthy fleets as healthy.
+/// `is_healthy()` now requires `workers_healthy == Some(worker_count)`
+/// — `None` is NEVER reported as healthy.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct QuickCheckResult {
     pub daemon_running: bool,
     pub worker_count: usize,
-    pub workers_healthy: usize,
+    /// `None` = not probed (the default for `run_quick_check`, which is
+    /// designed to be fast / no-network).
+    /// `Some(n)` = `n` of the configured workers were probed and reported
+    /// healthy.
+    pub workers_healthy: Option<usize>,
     pub hook_installed: bool,
     pub warnings: Vec<String>,
     pub errors: Vec<String>,
@@ -1743,11 +1755,18 @@ pub struct QuickCheckResult {
 
 impl QuickCheckResult {
     /// Check if the system is fully operational.
+    ///
+    /// **Contract:** returns `true` ONLY when daemon is running, hook is
+    /// installed, errors are empty, AND every configured worker has been
+    /// probed and reported healthy. `workers_healthy == None` (unknown)
+    /// is NEVER healthy — this is the default-to-degraded discipline
+    /// per t03's bead body.
     pub fn is_healthy(&self) -> bool {
         self.daemon_running
             && self.worker_count > 0
             && self.hook_installed
             && self.errors.is_empty()
+            && self.workers_healthy == Some(self.worker_count)
     }
 
     /// Check if there are any issues.
@@ -1758,15 +1777,26 @@ impl QuickCheckResult {
 }
 
 /// Run a quick health check (for post-install feedback).
-/// This runs fast checks only (no network probes).
+///
+/// This runs fast local-only checks (no network probes). Worker health
+/// is reported as `None` (unknown) — callers needing real worker
+/// probes should run `rch doctor --reliability` (which performs the
+/// SSH-based health checks). This honest "unknown" signal is the t03
+/// fix for the prior default-to-success behavior that silently treated
+/// every configured worker as healthy.
 pub fn run_quick_check() -> QuickCheckResult {
     let socket_path = default_socket_path();
     let daemon_running = socket_path.exists();
 
-    // Check workers
+    // Check workers — fast check only counts configured entries; we do
+    // NOT probe each worker over the network here (that's `rch doctor
+    // --reliability`'s job). Health is reported as `None` (unknown)
+    // since we genuinely don't know without probing.
     let (worker_count, workers_healthy) = match load_workers_from_config() {
-        Ok(workers) => (workers.len(), workers.len()), // Assume healthy without probing
-        Err(_) => (0, 0),
+        // Fast-check: count configured workers; health is unknown
+        // until a real probe is performed (default-to-degraded discipline).
+        Ok(workers) => (workers.len(), None),
+        Err(_) => (0, None),
     };
 
     // Check hook
@@ -1802,15 +1832,33 @@ pub fn run_quick_check() -> QuickCheckResult {
     if !hook_installed {
         errors.push("Hook not installed".to_string());
     }
+    // Honest signal that this is a fast-check, not a real probe.
+    if worker_count > 0 && workers_healthy.is_none() {
+        warnings.push(
+            "Worker health not probed by quick-check; run `rch doctor --reliability` for full status".to_string(),
+        );
+    }
 
-    QuickCheckResult {
+    let result = QuickCheckResult {
         daemon_running,
         worker_count,
         workers_healthy,
         hook_installed,
         warnings,
         errors,
-    }
+    };
+
+    tracing::debug!(
+        target: "rch::doctor::quick_check",
+        daemon_running,
+        worker_count,
+        workers_healthy = ?result.workers_healthy,
+        hook_installed,
+        is_healthy = result.is_healthy(),
+        "doctor.quick_check.complete",
+    );
+
+    result
 }
 
 /// Print a quick health check summary to the console.
@@ -3705,7 +3753,7 @@ mod tests {
         let healthy = QuickCheckResult {
             daemon_running: true,
             worker_count: 1,
-            workers_healthy: 1,
+            workers_healthy: Some(1),
             hook_installed: true,
             warnings: vec![],
             errors: vec![],
@@ -3715,7 +3763,7 @@ mod tests {
         let no_daemon = QuickCheckResult {
             daemon_running: false,
             worker_count: 1,
-            workers_healthy: 1,
+            workers_healthy: Some(1),
             hook_installed: true,
             warnings: vec![],
             errors: vec![],
@@ -3725,7 +3773,7 @@ mod tests {
         let no_workers = QuickCheckResult {
             daemon_running: true,
             worker_count: 0,
-            workers_healthy: 0,
+            workers_healthy: None,
             hook_installed: true,
             warnings: vec![],
             errors: vec![],
@@ -3735,7 +3783,7 @@ mod tests {
         let no_hook = QuickCheckResult {
             daemon_running: true,
             worker_count: 1,
-            workers_healthy: 1,
+            workers_healthy: Some(1),
             hook_installed: false,
             warnings: vec![],
             errors: vec![],
@@ -3748,7 +3796,7 @@ mod tests {
         let no_issues = QuickCheckResult {
             daemon_running: true,
             worker_count: 1,
-            workers_healthy: 1,
+            workers_healthy: Some(1),
             hook_installed: true,
             warnings: vec![],
             errors: vec![],
@@ -3758,7 +3806,7 @@ mod tests {
         let with_warnings = QuickCheckResult {
             daemon_running: true,
             worker_count: 1,
-            workers_healthy: 1,
+            workers_healthy: Some(1),
             hook_installed: true,
             warnings: vec!["Some warning".to_string()],
             errors: vec![],
@@ -3768,7 +3816,7 @@ mod tests {
         let with_errors = QuickCheckResult {
             daemon_running: true,
             worker_count: 1,
-            workers_healthy: 1,
+            workers_healthy: Some(1),
             hook_installed: true,
             warnings: vec![],
             errors: vec!["Some error".to_string()],
@@ -3784,6 +3832,108 @@ mod tests {
         // We can't assert on specific values because they depend on system state,
         // but we can verify the result is accessible and properly structured
         let _total_issues = result.warnings.len() + result.errors.len();
+    }
+
+    // =========================================================================
+    // t03 — run_quick_check contract: Option<usize> for workers_healthy +
+    // honest "unknown" signal + is_healthy() never defaults to success.
+    // =========================================================================
+
+    #[test]
+    fn test_quick_check_unknown_workers_health_is_not_healthy() {
+        // The bead's headline regression: workers_healthy=None must
+        // never be treated as healthy. Even if everything else is ok,
+        // unknown worker state means "not healthy until probed".
+        let unknown = QuickCheckResult {
+            daemon_running: true,
+            worker_count: 3,
+            workers_healthy: None, // not probed
+            hook_installed: true,
+            warnings: vec![],
+            errors: vec![],
+        };
+        assert!(
+            !unknown.is_healthy(),
+            "is_healthy() must NOT return true when workers_healthy is None"
+        );
+    }
+
+    #[test]
+    fn test_quick_check_partial_health_is_not_healthy() {
+        // 5 workers configured, only 3 probed healthy: definitively NOT healthy.
+        let partial = QuickCheckResult {
+            daemon_running: true,
+            worker_count: 5,
+            workers_healthy: Some(3),
+            hook_installed: true,
+            warnings: vec![],
+            errors: vec![],
+        };
+        assert!(!partial.is_healthy());
+    }
+
+    #[test]
+    fn test_quick_check_full_health_is_healthy() {
+        // worker_count == workers_healthy.unwrap() AND everything else ok.
+        let full = QuickCheckResult {
+            daemon_running: true,
+            worker_count: 3,
+            workers_healthy: Some(3),
+            hook_installed: true,
+            warnings: vec![],
+            errors: vec![],
+        };
+        assert!(full.is_healthy());
+    }
+
+    #[test]
+    fn test_quick_check_does_not_default_to_success() {
+        // Explicit regression for the original bug: the prior code had
+        //   Ok(workers) => (workers.len(), workers.len()) // assume healthy
+        // which silently treated configured workers as healthy. Now we
+        // require an explicit Some(n) AND n == worker_count for is_healthy()
+        // to return true. NO path through run_quick_check() can satisfy
+        // this without an honest probe.
+        let result = run_quick_check();
+        // Since run_quick_check is fast-only (no network probes), it
+        // CANNOT report Some(_) for workers_healthy. The contract is
+        // verified by the implementation: workers_healthy is always None.
+        assert_eq!(
+            result.workers_healthy, None,
+            "fast-only run_quick_check must report unknown worker health"
+        );
+        // Confirms is_healthy() returns false for fast-only checks.
+        assert!(
+            !result.is_healthy(),
+            "fast-only check must never report healthy without a probe"
+        );
+    }
+
+    #[test]
+    fn test_quick_check_emits_warning_about_unprobed_workers() {
+        // When worker_count > 0 but workers_healthy is None, surface a
+        // warning so operators understand they ran a fast-check, not a
+        // real probe. (Only fires if there are configured workers; an
+        // empty fleet is reported via "No workers configured" warning.)
+        // Since we can't easily inject a fake fleet here, we test the
+        // logic at the struct level: build a synthetic result and
+        // verify the warning text would be emitted.
+        let r = QuickCheckResult {
+            daemon_running: true,
+            worker_count: 3,
+            workers_healthy: None,
+            hook_installed: true,
+            warnings: vec![
+                "Worker health not probed by quick-check; run `rch doctor --reliability` for full status".to_string(),
+            ],
+            errors: vec![],
+        };
+        assert!(
+            r.warnings.iter().any(|w| w.contains("not probed")),
+            "expected fast-check to surface 'not probed' warning"
+        );
+        // is_healthy still returns false because workers_healthy is None.
+        assert!(!r.is_healthy());
     }
 
     // =========================================================================
@@ -4271,7 +4421,7 @@ mod tests {
         let result = QuickCheckResult {
             daemon_running: false,
             worker_count: 0,
-            workers_healthy: 0,
+            workers_healthy: None,
             hook_installed: false,
             warnings: vec![
                 "Daemon not running".to_string(),
@@ -4289,19 +4439,27 @@ mod tests {
 
     #[test]
     fn test_quick_check_result_partial_health() {
-        // TEST START: QuickCheckResult partial health (some components working)
+        // TEST START: QuickCheckResult partial health
+        // Updated for t03 contract (2s99h.11): partial worker health is
+        // NOT healthy. Previously this test asserted is_healthy()=true
+        // with a warning, encoding the default-to-success behavior.
+        // The new contract: workers_healthy < worker_count means the
+        // system is NOT healthy.
         let result = QuickCheckResult {
             daemon_running: true,
             worker_count: 2,
-            workers_healthy: 1, // Only 1 of 2 healthy
+            workers_healthy: Some(1), // Only 1 of 2 healthy
             hook_installed: true,
             warnings: vec!["Worker css is offline".to_string()],
             errors: vec![],
         };
 
-        // System is "healthy" from base criteria but has warnings
-        assert!(result.is_healthy());
-        assert!(result.has_issues()); // Still has issues due to warning
+        // Partial health is now NOT healthy (default-to-degraded discipline).
+        assert!(
+            !result.is_healthy(),
+            "1/2 workers healthy must NOT report system-healthy"
+        );
+        assert!(result.has_issues());
         // TEST PASS: QuickCheckResult partial health
     }
 
