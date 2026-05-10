@@ -504,6 +504,18 @@ CHECKS PERFORMED:
         /// Include schema compatibility checks in reliability mode
         #[arg(long, requires = "reliability")]
         check_schemas: bool,
+
+        /// Strict mode: promote `Degraded` verdict to exit code 2 (warnings
+        /// treated as failures). For tight CI gates. Mutually exclusive with
+        /// `--lenient`. Only meaningful with `--reliability`.
+        #[arg(long, requires = "reliability", conflicts_with = "lenient")]
+        strict: bool,
+
+        /// Lenient mode: demote `Failing` verdict to exit code 1 (logs only,
+        /// never blocks). For non-blocking tripwires. Mutually exclusive with
+        /// `--strict`. Only meaningful with `--reliability`.
+        #[arg(long, requires = "reliability", conflicts_with = "strict")]
+        lenient: bool,
     },
 
     /// Verify remote compilation by running a self-test
@@ -1590,7 +1602,21 @@ async fn main() -> Result<()> {
                 install_deps,
                 reliability,
                 check_schemas,
-            } => handle_doctor(fix, dry_run, install_deps, reliability, check_schemas, &ctx).await,
+                strict,
+                lenient,
+            } => {
+                handle_doctor(
+                    fix,
+                    dry_run,
+                    install_deps,
+                    reliability,
+                    check_schemas,
+                    strict,
+                    lenient,
+                    &ctx,
+                )
+                .await
+            }
             Commands::SelfTest {
                 action,
                 worker,
@@ -2714,12 +2740,15 @@ async fn handle_agents(action: AgentsAction, ctx: &OutputContext) -> Result<()> 
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_doctor(
     fix: bool,
     dry_run: bool,
     install_deps: bool,
     reliability: bool,
     check_schemas: bool,
+    strict: bool,
+    lenient: bool,
     ctx: &OutputContext,
 ) -> Result<()> {
     use crate::doctor::DoctorOptions;
@@ -2730,6 +2759,8 @@ async fn handle_doctor(
         reliability,
         check_schemas,
         verbose: ctx.is_verbose(),
+        strict,
+        lenient,
     };
     crate::doctor::run_doctor(ctx, options).await
 }
@@ -3784,12 +3815,16 @@ mod tests {
                 install_deps,
                 reliability,
                 check_schemas,
+                strict,
+                lenient,
             }) => {
                 assert!(!fix);
                 assert!(!dry_run);
                 assert!(!install_deps);
                 assert!(!reliability);
                 assert!(!check_schemas);
+                assert!(!strict);
+                assert!(!lenient);
             }
             _ => panic!("Expected doctor command"),
         }
@@ -3806,12 +3841,16 @@ mod tests {
                 install_deps,
                 reliability,
                 check_schemas,
+                strict,
+                lenient,
             }) => {
                 assert!(fix);
                 assert!(!dry_run);
                 assert!(!install_deps);
                 assert!(!reliability);
                 assert!(!check_schemas);
+                assert!(!strict);
+                assert!(!lenient);
             }
             _ => panic!("Expected doctor command"),
         }
@@ -3828,12 +3867,16 @@ mod tests {
                 install_deps,
                 reliability,
                 check_schemas,
+                strict,
+                lenient,
             }) => {
                 assert!(!fix);
                 assert!(dry_run);
                 assert!(!install_deps);
                 assert!(!reliability);
                 assert!(!check_schemas);
+                assert!(!strict);
+                assert!(!lenient);
             }
             _ => panic!("Expected doctor command"),
         }
@@ -3850,12 +3893,16 @@ mod tests {
                 install_deps,
                 reliability,
                 check_schemas,
+                strict,
+                lenient,
             }) => {
                 assert!(!fix);
                 assert!(!dry_run);
                 assert!(install_deps);
                 assert!(!reliability);
                 assert!(!check_schemas);
+                assert!(!strict);
+                assert!(!lenient);
             }
             _ => panic!("Expected doctor command"),
         }
@@ -3872,12 +3919,16 @@ mod tests {
                 install_deps,
                 reliability,
                 check_schemas,
+                strict,
+                lenient,
             }) => {
                 assert!(!fix);
                 assert!(!dry_run);
                 assert!(!install_deps);
                 assert!(reliability);
                 assert!(!check_schemas);
+                assert!(!strict);
+                assert!(!lenient);
             }
             _ => panic!("Expected doctor command"),
         }
@@ -3895,15 +3946,65 @@ mod tests {
                 install_deps,
                 reliability,
                 check_schemas,
+                strict,
+                lenient,
             }) => {
                 assert!(!fix);
                 assert!(!dry_run);
                 assert!(!install_deps);
                 assert!(reliability);
                 assert!(check_schemas);
+                assert!(!strict);
+                assert!(!lenient);
             }
             _ => panic!("Expected doctor command"),
         }
+    }
+
+    #[test]
+    fn cli_parses_doctor_reliability_strict_and_lenient_modes() {
+        let _guard = test_guard!();
+        let strict_cli = Cli::try_parse_from(["rch", "doctor", "--reliability", "--strict"])
+            .expect("strict mode should parse with reliability mode");
+        assert!(
+            matches!(
+                strict_cli.command,
+                Some(Commands::Doctor {
+                    reliability: true,
+                    strict: true,
+                    lenient: false,
+                    ..
+                })
+            ),
+            "Expected doctor command with reliability strict mode"
+        );
+
+        let lenient_cli = Cli::try_parse_from(["rch", "doctor", "--reliability", "--lenient"])
+            .expect("lenient mode should parse with reliability mode");
+        assert!(
+            matches!(
+                lenient_cli.command,
+                Some(Commands::Doctor {
+                    reliability: true,
+                    strict: false,
+                    lenient: true,
+                    ..
+                })
+            ),
+            "Expected doctor command with reliability lenient mode"
+        );
+    }
+
+    #[test]
+    fn cli_rejects_doctor_reliability_strict_and_lenient_together() {
+        let _guard = test_guard!();
+        let result =
+            Cli::try_parse_from(["rch", "doctor", "--reliability", "--strict", "--lenient"]);
+
+        assert!(
+            result.is_err(),
+            "--strict and --lenient are mutually exclusive"
+        );
     }
 
     #[test]

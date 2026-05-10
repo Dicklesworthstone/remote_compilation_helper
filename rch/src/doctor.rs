@@ -18,7 +18,7 @@ use anyhow::Result;
 use directories::ProjectDirs;
 use rch_common::{ApiResponse, ReliabilityReasonCode};
 use rch_telemetry::TelemetryStorage;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::io::{self, Read, Write};
 #[cfg(unix)]
@@ -148,6 +148,12 @@ pub struct DoctorOptions {
     pub check_schemas: bool,
     /// Detailed output.
     pub verbose: bool,
+    /// `--strict`: promote `Degraded` to exit code 2 (treat warnings as failures
+    /// for tight CI gates). JSON `data.summary.overall` is unaffected.
+    pub strict: bool,
+    /// `--lenient`: demote `Failing` to exit code 1 (log only, never block).
+    /// JSON `data.summary.overall` is unaffected.
+    pub lenient: bool,
 }
 
 // Live schema-version constants are sourced from the central
@@ -169,6 +175,92 @@ enum ReliabilitySeverity {
     Info,
     Warning,
     Critical,
+}
+
+/// Tri-state aggregate verdict for the reliability doctor.
+///
+/// - `Healthy`  — every diagnostic passed (or only Info diagnostics).
+/// - `Degraded` — at least one Warning, no Criticals.
+/// - `Failing`  — at least one Critical.
+///
+/// Maps to process exit codes via `ReliabilityVerdict::exit_code`. Operators key
+/// alerting policy off this tri-state (sibling t25 watch / t28 webhooks).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReliabilityVerdict {
+    Healthy,
+    Degraded,
+    Failing,
+}
+
+impl ReliabilityVerdict {
+    /// Default exit-code mapping (without `--strict` / `--lenient`):
+    /// Healthy → 0, Degraded → 1, Failing → 2.
+    #[must_use]
+    pub const fn default_exit_code(self) -> i32 {
+        match self {
+            Self::Healthy => 0,
+            Self::Degraded => 1,
+            Self::Failing => 2,
+        }
+    }
+
+    /// Apply `--strict` / `--lenient` exit-code policy. Returns the mapped
+    /// exit code. JSON `data.summary.overall` is unaffected — flags only shift
+    /// the process exit.
+    #[must_use]
+    pub const fn exit_code(self, strict: bool, lenient: bool) -> i32 {
+        // Caller must guarantee strict and lenient are not both set.
+        if strict {
+            // Promote: Degraded becomes Failing-equivalent (exit 2).
+            match self {
+                Self::Healthy => 0,
+                Self::Degraded | Self::Failing => 2,
+            }
+        } else if lenient {
+            // Demote: Failing becomes Degraded-equivalent (exit 1).
+            match self {
+                Self::Healthy => 0,
+                Self::Degraded | Self::Failing => 1,
+            }
+        } else {
+            self.default_exit_code()
+        }
+    }
+
+    /// Human-readable label, used in banner rendering.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Healthy => "Healthy",
+            Self::Degraded => "Degraded",
+            Self::Failing => "Failing",
+        }
+    }
+}
+
+/// Pure aggregator: max-severity-wins.
+///
+/// - Any `Critical` → `Failing`.
+/// - Else any `Warning` → `Degraded`.
+/// - Else (Pass / Info / empty) → `Healthy`.
+///
+/// Empty input is honestly `Healthy` — caller is responsible for adding a
+/// "no probes ran" diagnostic if that's the wrong default for their context.
+fn aggregate_verdict(diagnostics: &[ReliabilityDiagnostic]) -> ReliabilityVerdict {
+    let mut has_warning = false;
+    for diag in diagnostics {
+        match diag.severity {
+            ReliabilitySeverity::Critical => return ReliabilityVerdict::Failing,
+            ReliabilitySeverity::Warning => has_warning = true,
+            ReliabilitySeverity::Pass | ReliabilitySeverity::Info => {}
+        }
+    }
+    if has_warning {
+        ReliabilityVerdict::Degraded
+    } else {
+        ReliabilityVerdict::Healthy
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -233,7 +325,11 @@ struct ReliabilityDoctorSummary {
     warning: usize,
     critical: usize,
     categories_checked: Vec<ReliabilityCategory>,
-    overall_healthy: bool,
+    /// Tri-state aggregate verdict (t02). Replaces the prior boolean
+    /// `overall_healthy`. Per AGENTS.md "no backwards compatibility":
+    /// JSON consumers update to read `summary.overall` (string) instead
+    /// of `summary.overall_healthy` (bool).
+    overall: ReliabilityVerdict,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -510,7 +606,34 @@ async fn run_reliability_doctor(ctx: &OutputContext, options: &DoctorOptions) ->
         print_reliability_doctor_response(ctx, &response);
     }
 
-    Ok(())
+    // Verdict → exit-code mapping (t02). Honors --strict / --lenient. Logged
+    // for forensics so log consumers can correlate exit codes with verdicts.
+    let exit_code = response
+        .summary
+        .overall
+        .exit_code(options.strict, options.lenient);
+    tracing::info!(
+        target: "rch::doctor::verdict",
+        verdict = response.summary.overall.label(),
+        exit_code,
+        strict = options.strict,
+        lenient = options.lenient,
+        pass = response.summary.pass,
+        info = response.summary.info,
+        warning = response.summary.warning,
+        critical = response.summary.critical,
+        "doctor.verdict",
+    );
+    if exit_code == 0 {
+        Ok(())
+    } else {
+        // Non-zero exit must reach the caller. Use process::exit AFTER all
+        // output has been flushed (println! above is line-buffered to stdout
+        // which auto-flushes on newline).
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+        std::process::exit(exit_code);
+    }
 }
 
 async fn query_repo_convergence_status() -> Result<RepoConvergenceStatusFromApi> {
@@ -1255,7 +1378,7 @@ fn build_reliability_doctor_response(
         warning,
         critical,
         categories_checked: categories.into_iter().collect(),
-        overall_healthy: warning == 0 && critical == 0,
+        overall: aggregate_verdict(&diagnostics),
     };
 
     ReliabilityDoctorResponse {
@@ -1315,13 +1438,15 @@ fn print_reliability_doctor_response(ctx: &OutputContext, response: &Reliability
         StatusIndicator::Info.display(style),
         style.value(&response.schema_version)
     );
+    let verdict_indicator = match response.summary.overall {
+        ReliabilityVerdict::Healthy => StatusIndicator::Success,
+        ReliabilityVerdict::Degraded => StatusIndicator::Warning,
+        ReliabilityVerdict::Failing => StatusIndicator::Error,
+    };
     println!(
-        "  {} {} check(s): {} pass, {} info, {} warning, {} critical",
-        if response.summary.overall_healthy {
-            StatusIndicator::Success.display(style)
-        } else {
-            StatusIndicator::Warning.display(style)
-        },
+        "  {} verdict: {} ({} check(s): {} pass, {} info, {} warning, {} critical)",
+        verdict_indicator.display(style),
+        style.highlight(response.summary.overall.label()),
         response.summary.total_checks,
         response.summary.pass,
         response.summary.info,
@@ -3791,6 +3916,8 @@ mod tests {
             reliability: false,
             check_schemas: false,
             verbose: false,
+            strict: false,
+            lenient: false,
         };
         assert!(!opts_minimal.fix);
         assert!(!opts_minimal.dry_run);
@@ -3802,6 +3929,8 @@ mod tests {
             reliability: false,
             check_schemas: false,
             verbose: false,
+            strict: false,
+            lenient: false,
         };
         assert!(opts_fix.fix);
 
@@ -3812,6 +3941,8 @@ mod tests {
             reliability: false,
             check_schemas: false,
             verbose: false,
+            strict: false,
+            lenient: false,
         };
         assert!(opts_dry_run.fix);
         assert!(opts_dry_run.dry_run);
@@ -3823,6 +3954,8 @@ mod tests {
             reliability: false,
             check_schemas: false,
             verbose: true,
+            strict: false,
+            lenient: false,
         };
         assert!(opts_verbose.verbose);
         // TEST PASS: DoctorOptions construction
@@ -4097,6 +4230,8 @@ mod tests {
             reliability: false,
             check_schemas: false,
             verbose: false,
+            strict: false,
+            lenient: false,
         };
 
         let mut checks = Vec::new();
@@ -4132,6 +4267,8 @@ mod tests {
             reliability: false,
             check_schemas: false,
             verbose: false,
+            strict: false,
+            lenient: false,
         };
 
         let mut checks = Vec::new();
@@ -4163,6 +4300,8 @@ mod tests {
             reliability: false,
             check_schemas: false,
             verbose: false,
+            strict: false,
+            lenient: false,
         };
         let mut fixes_applied = Vec::new();
 
@@ -4382,5 +4521,145 @@ exit 0\n"
             .expect("hook diag in b");
         assert_eq!(a_hook.code, ReliabilityReasonCode::HookAutoStartEnabled);
         assert_eq!(b_hook.code, ReliabilityReasonCode::HookAutoStartDisabled);
+    }
+
+    // ========================================================================
+    // Verdict tri-state (t02) — aggregator + exit-code mapping + serde shape.
+    // ========================================================================
+
+    fn make_diag(severity: ReliabilitySeverity) -> ReliabilityDiagnostic {
+        ReliabilityDiagnostic::new(
+            ReliabilityCategory::Topology,
+            "synthetic",
+            severity,
+            "test",
+            ReliabilityReasonCode::WorkersConfigured,
+        )
+    }
+
+    #[test]
+    fn test_aggregate_verdict_empty_is_healthy() {
+        // Empty input is honest — caller decorates with "no probes ran" if needed.
+        assert_eq!(aggregate_verdict(&[]), ReliabilityVerdict::Healthy);
+    }
+
+    #[test]
+    fn test_aggregate_verdict_all_pass_is_healthy() {
+        let diags = vec![make_diag(ReliabilitySeverity::Pass); 5];
+        assert_eq!(aggregate_verdict(&diags), ReliabilityVerdict::Healthy);
+    }
+
+    #[test]
+    fn test_aggregate_verdict_pass_plus_info_is_healthy() {
+        let diags = vec![
+            make_diag(ReliabilitySeverity::Pass),
+            make_diag(ReliabilitySeverity::Info),
+            make_diag(ReliabilitySeverity::Pass),
+        ];
+        assert_eq!(aggregate_verdict(&diags), ReliabilityVerdict::Healthy);
+    }
+
+    #[test]
+    fn test_aggregate_verdict_one_warning_is_degraded() {
+        let diags = vec![
+            make_diag(ReliabilitySeverity::Pass),
+            make_diag(ReliabilitySeverity::Warning),
+            make_diag(ReliabilitySeverity::Info),
+        ];
+        assert_eq!(aggregate_verdict(&diags), ReliabilityVerdict::Degraded);
+    }
+
+    #[test]
+    fn test_aggregate_verdict_one_critical_is_failing() {
+        let diags = vec![
+            make_diag(ReliabilitySeverity::Pass),
+            make_diag(ReliabilitySeverity::Warning),
+            make_diag(ReliabilitySeverity::Critical),
+        ];
+        assert_eq!(aggregate_verdict(&diags), ReliabilityVerdict::Failing);
+    }
+
+    #[test]
+    fn test_aggregate_verdict_critical_dominates_warning() {
+        let diags = vec![
+            make_diag(ReliabilitySeverity::Critical),
+            make_diag(ReliabilitySeverity::Warning),
+        ];
+        assert_eq!(aggregate_verdict(&diags), ReliabilityVerdict::Failing);
+    }
+
+    #[test]
+    fn test_verdict_serde_lowercase_strings() {
+        // JSON wire form: "healthy" / "degraded" / "failing".
+        let h = serde_json::to_string(&ReliabilityVerdict::Healthy).unwrap();
+        let d = serde_json::to_string(&ReliabilityVerdict::Degraded).unwrap();
+        let f = serde_json::to_string(&ReliabilityVerdict::Failing).unwrap();
+        assert_eq!(h, "\"healthy\"");
+        assert_eq!(d, "\"degraded\"");
+        assert_eq!(f, "\"failing\"");
+        // Roundtrip
+        let back: ReliabilityVerdict = serde_json::from_str(&d).unwrap();
+        assert_eq!(back, ReliabilityVerdict::Degraded);
+    }
+
+    #[test]
+    fn test_default_exit_code_mapping() {
+        assert_eq!(ReliabilityVerdict::Healthy.default_exit_code(), 0);
+        assert_eq!(ReliabilityVerdict::Degraded.default_exit_code(), 1);
+        assert_eq!(ReliabilityVerdict::Failing.default_exit_code(), 2);
+    }
+
+    #[test]
+    fn test_strict_promotes_degraded_to_two() {
+        assert_eq!(ReliabilityVerdict::Healthy.exit_code(true, false), 0);
+        assert_eq!(ReliabilityVerdict::Degraded.exit_code(true, false), 2);
+        assert_eq!(ReliabilityVerdict::Failing.exit_code(true, false), 2);
+    }
+
+    #[test]
+    fn test_lenient_demotes_failing_to_one() {
+        assert_eq!(ReliabilityVerdict::Healthy.exit_code(false, true), 0);
+        assert_eq!(ReliabilityVerdict::Degraded.exit_code(false, true), 1);
+        assert_eq!(ReliabilityVerdict::Failing.exit_code(false, true), 1);
+    }
+
+    #[test]
+    fn test_default_no_strict_no_lenient_uses_default_mapping() {
+        for v in [
+            ReliabilityVerdict::Healthy,
+            ReliabilityVerdict::Degraded,
+            ReliabilityVerdict::Failing,
+        ] {
+            assert_eq!(v.exit_code(false, false), v.default_exit_code());
+        }
+    }
+
+    #[test]
+    fn test_verdict_label_matches_variant_name() {
+        assert_eq!(ReliabilityVerdict::Healthy.label(), "Healthy");
+        assert_eq!(ReliabilityVerdict::Degraded.label(), "Degraded");
+        assert_eq!(ReliabilityVerdict::Failing.label(), "Failing");
+    }
+
+    #[test]
+    fn test_summary_overall_uses_aggregate_verdict() {
+        // Build a response with mixed severities and assert the summary's
+        // verdict matches the aggregator.
+        let diags = vec![
+            make_diag(ReliabilitySeverity::Pass),
+            make_diag(ReliabilitySeverity::Warning),
+        ];
+        let response = build_reliability_doctor_response(ReliabilityDoctorMode::Check, diags);
+        assert_eq!(response.summary.overall, ReliabilityVerdict::Degraded);
+    }
+
+    #[test]
+    fn test_summary_overall_failing_when_critical_present() {
+        let diags = vec![
+            make_diag(ReliabilitySeverity::Pass),
+            make_diag(ReliabilitySeverity::Critical),
+        ];
+        let response = build_reliability_doctor_response(ReliabilityDoctorMode::Check, diags);
+        assert_eq!(response.summary.overall, ReliabilityVerdict::Failing);
     }
 }
