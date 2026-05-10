@@ -1269,15 +1269,12 @@ impl WorkerSelector {
         let mut filtered_by_convergence = 0usize;
         let mut filtered_by_pressure = 0usize;
         let mut filtered_by_slots = 0usize;
+        let mut filtered_by_active_project = 0usize;
         let mut any_has_runtime = false;
 
         for worker in workers {
             let circuit_state = worker.circuit_state().await.unwrap_or(CircuitState::Closed);
             let worker_id = worker.config.read().await.id.clone();
-            if excluded_worker_ids.contains(worker_id.as_str()) {
-                debug!("Worker {} excluded: caller-side exclusion set", worker_id);
-                continue;
-            }
 
             // Filter by circuit state
             match circuit_state {
@@ -1297,6 +1294,18 @@ impl WorkerSelector {
                 RequiredRuntime::Bun => worker.has_bun().await,
                 RequiredRuntime::Node => worker.has_node().await,
             };
+
+            if excluded_worker_ids.contains(worker_id.as_str()) {
+                debug!(
+                    "Worker {} excluded: already active for project {}",
+                    worker_id, request.project
+                );
+                if has_required_runtime {
+                    any_has_runtime = true;
+                    filtered_by_active_project += 1;
+                }
+                continue;
+            }
 
             if !has_required_runtime {
                 continue;
@@ -1638,6 +1647,20 @@ impl WorkerSelector {
         }
         if !eligible.is_empty() {
             return Ok(eligible);
+        }
+
+        if filtered_by_active_project > 0
+            && preferred_without_health.is_empty()
+            && eligible_without_health.is_empty()
+        {
+            return Err(SelectionReason::NoAdmissibleWorkers(
+                no_admissible_workers_summary_with_active_project(
+                    filtered_by_pressure,
+                    filtered_by_slots,
+                    filtered_by_hard_preflight,
+                    filtered_by_active_project,
+                ),
+            ));
         }
 
         // Hard preflight failures (for example topology invariants or
@@ -2478,6 +2501,26 @@ fn no_admissible_workers_summary(
         parts.push(format!("hard_preflight={generic_hard_preflight}"));
     }
     parts.join(",")
+}
+
+fn no_admissible_workers_summary_with_active_project(
+    critical_pressure: usize,
+    insufficient_slots: usize,
+    hard_preflight: usize,
+    active_project_exclusion: usize,
+) -> String {
+    let mut summary =
+        no_admissible_workers_summary(critical_pressure, insufficient_slots, hard_preflight);
+    if active_project_exclusion == 0 {
+        return summary;
+    }
+    if !summary.is_empty() {
+        summary.push(',');
+    }
+    summary.push_str(&format!(
+        "active_project_exclusion={active_project_exclusion}"
+    ));
+    summary
 }
 
 fn selection_outcome_label(reason: &SelectionReason) -> &'static str {
@@ -3745,6 +3788,47 @@ mod tests {
             SelectionReason::AllWorkersBusy,
             "Expected AllWorkersBusy, got {:?}",
             result.reason
+        );
+    }
+
+    #[tokio::test]
+    async fn test_active_project_exclusion_preserves_runtime_reason() {
+        let pool = WorkerPool::new();
+
+        let active = make_worker("active-rust", 4, 80.0);
+        active
+            .set_capabilities(rch_common::WorkerCapabilities {
+                rustc_version: Some("1.97.0-nightly".to_string()),
+                ..Default::default()
+            })
+            .await;
+        pool.add_worker_state(active).await;
+
+        let non_rust = make_worker("non-rust", 4, 70.0);
+        pool.add_worker_state(non_rust).await;
+
+        let selector = WorkerSelector::default();
+        let request = SelectionRequest {
+            project: "frankenterm".to_string(),
+            command: Some("cargo build".to_string()),
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 1,
+            preferred_workers: vec![],
+            toolchain: None,
+            required_runtime: RequiredRuntime::Rust,
+            classification_duration_us: None,
+            hook_pid: None,
+        };
+        let mut excluded_worker_ids = HashSet::new();
+        excluded_worker_ids.insert("active-rust".to_string());
+
+        let result = selector
+            .select_with_exclusions(&pool, &request, &excluded_worker_ids)
+            .await;
+        assert!(result.worker.is_none());
+        assert_eq!(
+            result.reason,
+            SelectionReason::NoAdmissibleWorkers("active_project_exclusion=1".to_string())
         );
     }
 
