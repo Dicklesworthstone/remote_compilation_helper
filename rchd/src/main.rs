@@ -62,7 +62,11 @@ use ui::{DaemonBanner, MetricsDashboard, WorkerStatusPanel};
 
 #[derive(Parser)]
 #[command(name = "rchd")]
-#[command(author, version, about = "RCH daemon - worker fleet orchestration")]
+#[command(
+    author,
+    version = rch_common::build_version_value_static(),
+    about = "RCH daemon - worker fleet orchestration"
+)]
 struct Cli {
     /// Path to Unix socket
     #[arg(short, long, default_value_os_t = crate::config::default_socket_path())]
@@ -541,11 +545,7 @@ async fn main() -> Result<()> {
         None
     };
 
-    let commit_hash = option_env!("RCH_GIT_COMMIT")
-        .or(option_env!("VERGEN_GIT_SHA"))
-        .or(option_env!("GIT_COMMIT"))
-        .or(option_env!("GITHUB_SHA"))
-        .map(|value| value.to_string());
+    let commit_hash = rch_common::build_commit().map(|value| value.to_string());
 
     let banner = DaemonBanner::new(
         env!("CARGO_PKG_VERSION"),

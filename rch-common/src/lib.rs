@@ -6,6 +6,8 @@
 // in tests and profile defaults (env::set_var/remove_var are unsafe in Rust 2024)
 #![deny(unsafe_code)]
 
+use std::sync::OnceLock;
+
 pub mod api;
 pub mod artifact_verify;
 pub mod binary_hash;
@@ -43,6 +45,55 @@ pub mod toolchain;
 pub mod types;
 pub mod ui;
 pub mod util;
+
+pub const BUILD_COMMIT_ENV_VARS: &[&str] = &[
+    "RCH_GIT_COMMIT",
+    "VERGEN_GIT_SHA",
+    "GIT_COMMIT",
+    "GITHUB_SHA",
+];
+
+pub fn build_commit() -> Option<&'static str> {
+    [
+        option_env!("RCH_GIT_COMMIT"),
+        option_env!("VERGEN_GIT_SHA"),
+        option_env!("GIT_COMMIT"),
+        option_env!("GITHUB_SHA"),
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::trim)
+    .find(|value| !value.is_empty())
+}
+
+pub fn build_version_value() -> String {
+    build_version_value_with_commit(env!("CARGO_PKG_VERSION"), build_commit())
+}
+
+pub fn build_version_value_static() -> &'static str {
+    static VERSION_VALUE: OnceLock<String> = OnceLock::new();
+
+    VERSION_VALUE.get_or_init(build_version_value).as_str()
+}
+
+pub fn build_version_value_with_commit(package_version: &str, commit: Option<&str>) -> String {
+    let mut value = package_version.to_string();
+
+    if let Some(commit) = commit.map(str::trim).filter(|value| !value.is_empty()) {
+        value.push_str(" (commit ");
+        value.push_str(short_commit(commit));
+        value.push(')');
+    }
+
+    value
+}
+
+fn short_commit(commit: &str) -> &str {
+    commit
+        .char_indices()
+        .nth(12)
+        .map_or(commit, |(index, _)| &commit[..index])
+}
 
 pub use artifact_verify::{
     ArtifactManifest, FileHash, VerificationFailure, VerificationResult, compute_file_hash,
@@ -118,6 +169,48 @@ pub use config::{
     ConfigSource, ConfigValueSource, ConfigWarning, EnvError, EnvParser, Profile, Severity,
     Sourced, validate_config,
 };
+
+#[cfg(test)]
+mod build_version_tests {
+    use super::{BUILD_COMMIT_ENV_VARS, build_version_value_with_commit};
+
+    #[test]
+    fn build_version_value_omits_missing_commit() {
+        assert_eq!(build_version_value_with_commit("1.0.24", None), "1.0.24");
+    }
+
+    #[test]
+    fn build_version_value_trims_and_shortens_commit() {
+        assert_eq!(
+            build_version_value_with_commit(
+                "1.0.24",
+                Some(" 2fa1249a18dfd05ae5e319e8d10bfd3c9ea1af55 "),
+            ),
+            "1.0.24 (commit 2fa1249a18df)"
+        );
+    }
+
+    #[test]
+    fn build_version_value_ignores_empty_commit() {
+        assert_eq!(
+            build_version_value_with_commit("1.0.24", Some("  ")),
+            "1.0.24"
+        );
+    }
+
+    #[test]
+    fn build_commit_env_var_order_is_documented() {
+        assert_eq!(
+            BUILD_COMMIT_ENV_VARS,
+            &[
+                "RCH_GIT_COMMIT",
+                "VERGEN_GIT_SHA",
+                "GIT_COMMIT",
+                "GITHUB_SHA"
+            ]
+        );
+    }
+}
 
 // Discovery module re-exports
 pub use discovery::{

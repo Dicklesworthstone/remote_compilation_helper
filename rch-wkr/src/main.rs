@@ -18,7 +18,11 @@ use tracing::info;
 
 #[derive(Parser)]
 #[command(name = "rch-wkr")]
-#[command(author, version, about = "RCH worker agent - remote execution")]
+#[command(
+    author,
+    version = rch_common::build_version_value_static(),
+    about = "RCH worker agent - remote execution"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,

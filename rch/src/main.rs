@@ -41,7 +41,7 @@ use ui::{ColorChoice, OutputConfig, OutputContext, OutputFormat};
 #[command(name = "rch")]
 #[command(
     author,
-    version,
+    version = rch_common::build_version_value_static(),
     about = "Remote Compilation Helper - transparent compilation offloading",
     long_about = "Remote Compilation Helper (RCH) transparently offloads compilation commands \
                   to remote workers. When invoked without a subcommand, RCH runs as a Claude Code \
