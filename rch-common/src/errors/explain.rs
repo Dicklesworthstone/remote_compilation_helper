@@ -173,6 +173,23 @@ pub fn list_by_category(category: &str) -> Vec<CodeExplanation> {
         .collect()
 }
 
+/// Known category names across both code namespaces, sorted for stable CLI
+/// help and JSON error payloads.
+#[must_use]
+pub fn known_categories() -> Vec<String> {
+    let mut categories: Vec<String> = list_all().into_iter().map(|e| e.category).collect();
+    categories.sort();
+    categories.dedup();
+    categories
+}
+
+/// Whether a category name matches at least one known code category.
+#[must_use]
+pub fn is_known_category(category: &str) -> bool {
+    let cat = category.trim().to_ascii_lowercase();
+    !cat.is_empty() && known_categories().iter().any(|known| known == &cat)
+}
+
 /// All known [`ErrorCode`] variants. Hand-maintained because `ErrorCode`
 /// doesn't expose an iteration API; this list is the authoritative
 /// snapshot. A unit test asserts every variant has a unique `RCH-Ennn`
@@ -417,6 +434,27 @@ mod tests {
     #[test]
     fn test_list_by_category_unknown_returns_empty() {
         assert!(list_by_category("nonexistent_category").is_empty());
+    }
+
+    #[test]
+    fn test_known_categories_are_sorted_unique_and_complete() {
+        let categories = known_categories();
+        assert!(!categories.is_empty());
+        for w in categories.windows(2) {
+            assert!(w[0] < w[1], "known_categories must be sorted and unique");
+        }
+        assert!(categories.iter().any(|c| c == "disk_pressure"));
+        assert!(categories.iter().any(|c| c == "worker"));
+        assert!(categories.iter().any(|c| c == "topology"));
+    }
+
+    #[test]
+    fn test_is_known_category_trims_and_normalizes_case() {
+        assert!(is_known_category(" disk_pressure "));
+        assert!(is_known_category("WORKER"));
+        assert!(is_known_category("Topology"));
+        assert!(!is_known_category(""));
+        assert!(!is_known_category("nonexistent_category"));
     }
 
     #[test]

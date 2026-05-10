@@ -2862,7 +2862,9 @@ async fn handle_update(
 /// RCH-Rnnn reliability) into one uniform interface.
 fn handle_error_explain(sub: ErrorSubcommand, ctx: &OutputContext) -> Result<()> {
     use rch_common::api::ApiError;
-    use rch_common::errors::{list_all, list_by_category, lookup, render_human};
+    use rch_common::errors::{
+        is_known_category, known_categories, list_all, list_by_category, lookup, render_human,
+    };
     use rch_common::{ApiResponse, ErrorCode};
 
     match sub {
@@ -2906,8 +2908,35 @@ fn handle_error_explain(sub: ErrorSubcommand, ctx: &OutputContext) -> Result<()>
             }
         }
         ErrorSubcommand::List { category, json } => {
-            let entries = match category.as_deref() {
-                Some(c) if !c.is_empty() => list_by_category(c),
+            let requested_category = category.as_deref().map(str::trim).filter(|c| !c.is_empty());
+            let entries = match requested_category {
+                Some(c) => {
+                    let entries = list_by_category(c);
+                    if entries.is_empty() && !is_known_category(c) {
+                        let known = known_categories();
+                        let known_display = known.join(", ");
+                        if json || ctx.is_json() {
+                            let response: ApiResponse<()> = ApiResponse::err(
+                                "error.list",
+                                ApiError::new(
+                                    ErrorCode::ConfigValidationError,
+                                    format!("Unknown error category {c:?}"),
+                                )
+                                .with_context("category", c)
+                                .with_context("known_categories", known_display.as_str())
+                                .with_remediation([format!("Use one of: {known_display}")]),
+                            );
+                            if json {
+                                ctx.json_force(&response)?;
+                            } else {
+                                ctx.json(&response)?;
+                            }
+                        }
+                        eprintln!("Unknown error category {c:?}. Use one of: {known_display}.");
+                        std::process::exit(2);
+                    }
+                    entries
+                }
                 _ => list_all(),
             };
             if json || ctx.is_json() {

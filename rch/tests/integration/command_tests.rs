@@ -631,6 +631,59 @@ fn test_config_validate_help() {
 }
 
 // =============================================================================
+// Error Catalog Command Tests
+// =============================================================================
+
+#[test]
+fn test_error_list_unknown_category_fails() {
+    init_test_logging();
+    crate::test_log!("TEST START: test_error_list_unknown_category_fails");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_rch"))
+        .args(["error", "list", "--category", "nonexistent_category"])
+        .output()
+        .expect("Failed to run rch error list");
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "unknown category should be a usage error"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_contains(&stderr, "Unknown error category");
+    assert_contains(&stderr, "disk_pressure");
+    crate::test_log!("TEST PASS: test_error_list_unknown_category_fails");
+}
+
+#[test]
+fn test_error_list_unknown_category_json_fails_with_remediation() {
+    init_test_logging();
+    crate::test_log!("TEST START: test_error_list_unknown_category_json_fails_with_remediation");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_rch"))
+        .args([
+            "error",
+            "list",
+            "--category",
+            "nonexistent_category",
+            "--json",
+        ])
+        .output()
+        .expect("Failed to run rch error list --json");
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "unknown category should be a usage error"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_contains(&stdout, "\"success\": false");
+    assert_contains(&stdout, "\"known_categories\"");
+    assert_contains(&stdout, "nonexistent_category");
+    crate::test_log!("TEST PASS: test_error_list_unknown_category_json_fails_with_remediation");
+}
+
+// =============================================================================
 // Hook Subcommand Tests
 // =============================================================================
 
