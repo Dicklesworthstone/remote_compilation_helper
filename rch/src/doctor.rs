@@ -151,6 +151,10 @@ pub struct DoctorOptions {
 }
 
 const RELIABILITY_DOCTOR_SCHEMA_VERSION: &str = "1.0.0";
+const EXPECTED_RELIABILITY_DOCTOR_SCHEMA_VERSION: &str = "1.0.0";
+const EXPECTED_STATUS_SCHEMA_VERSION: &str = "1.0.0";
+const EXPECTED_REPO_UPDATER_CONTRACT_SCHEMA_VERSION: &str = "1.0.0";
+const EXPECTED_PROCESS_TRIAGE_CONTRACT_SCHEMA_VERSION: &str = "1.0.0";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -1120,78 +1124,73 @@ fn reliability_rollout_posture_diagnostics() -> Vec<ReliabilityDiagnostic> {
 }
 
 fn reliability_schema_compatibility_diagnostics() -> Vec<ReliabilityDiagnostic> {
-    // Each entry pairs the component's CURRENT version with the version
-    // THIS doctor expects from that component. Comparing every component
-    // against the doctor's own version (the prior bug) silently masked
-    // every real incompatibility: as long as all 4 constants happened to
-    // be "1.0.0" the check appeared to work, but the moment one
-    // component bumped, the others would all suddenly flip to
-    // "incompatible" — a false alarm — while the only legitimately
-    // updated one would also flip — silently passing as broken.
-    //
-    // The right comparison is `actual == expected_for_this_component`,
-    // where `expected_for_this_component` is what this version of
-    // doctor was built with. We capture that by recording the constant
-    // at the doctor's compile time as the per-entry expected.
-    //
-    // (When a future doctor bumps RELIABILITY_DOCTOR_SCHEMA_VERSION
-    // independently of the contract versions, the per-entry expected
-    // values stay aligned with what each contract publishes — only
-    // the doctor_reliability entry is gated by RELIABILITY_DOCTOR_SCHEMA_VERSION.)
+    // Each entry pairs the component's live schema constant with the
+    // version this doctor knows how to consume. These expected versions
+    // are deliberately separate constants; comparing a schema constant
+    // to itself would make this diagnostic permanently green.
     let entries: [(&str, &str, &str, &str); 4] = [
         (
             "doctor_reliability",
             RELIABILITY_DOCTOR_SCHEMA_VERSION,
-            RELIABILITY_DOCTOR_SCHEMA_VERSION,
+            EXPECTED_RELIABILITY_DOCTOR_SCHEMA_VERSION,
             "reliability doctor response",
         ),
         (
             "status",
             crate::status_types::STATUS_SCHEMA_VERSION,
-            crate::status_types::STATUS_SCHEMA_VERSION,
+            EXPECTED_STATUS_SCHEMA_VERSION,
             "CLI status response",
         ),
         (
             "repo_updater_contract",
             rch_common::REPO_UPDATER_CONTRACT_SCHEMA_VERSION,
-            rch_common::REPO_UPDATER_CONTRACT_SCHEMA_VERSION,
+            EXPECTED_REPO_UPDATER_CONTRACT_SCHEMA_VERSION,
             "repo updater contract",
         ),
         (
             "process_triage_contract",
             rch_common::e2e::PROCESS_TRIAGE_CONTRACT_SCHEMA_VERSION,
-            rch_common::e2e::PROCESS_TRIAGE_CONTRACT_SCHEMA_VERSION,
+            EXPECTED_PROCESS_TRIAGE_CONTRACT_SCHEMA_VERSION,
             "process triage contract",
         ),
     ];
     entries
         .into_iter()
         .map(|(name, actual, expected, description)| {
-            if actual == expected {
-                ReliabilityDiagnostic::new(
-                    ReliabilityCategory::SchemaCompatibility,
-                    name,
-                    ReliabilitySeverity::Pass,
-                    format!("{description} schema version is compatible"),
-                    "schema_compatible",
-                )
-                .with_details(format!("schema_version={actual} expected={expected}"))
-            } else {
-                ReliabilityDiagnostic::new(
-                    ReliabilityCategory::SchemaCompatibility,
-                    name,
-                    ReliabilitySeverity::Critical,
-                    format!("{description} schema version is incompatible"),
-                    "schema_incompatible",
-                )
-                .with_details(format!("expected={expected}, actual={actual}"))
-                .with_remediation(
-                    "Upgrade rch/rchd/rch-wkr binaries to the same release",
-                    "rch doctor --reliability --check-schemas --json",
-                )
-            }
+            schema_compatibility_diagnostic(name, actual, expected, description)
         })
         .collect()
+}
+
+fn schema_compatibility_diagnostic(
+    name: &str,
+    actual: &str,
+    expected: &str,
+    description: &str,
+) -> ReliabilityDiagnostic {
+    if actual == expected {
+        ReliabilityDiagnostic::new(
+            ReliabilityCategory::SchemaCompatibility,
+            name,
+            ReliabilitySeverity::Pass,
+            format!("{description} schema version is compatible"),
+            "schema_compatible",
+        )
+        .with_details(format!("schema_version={actual} expected={expected}"))
+    } else {
+        ReliabilityDiagnostic::new(
+            ReliabilityCategory::SchemaCompatibility,
+            name,
+            ReliabilitySeverity::Critical,
+            format!("{description} schema version is incompatible"),
+            "schema_incompatible",
+        )
+        .with_details(format!("expected={expected}, actual={actual}"))
+        .with_remediation(
+            "Upgrade rch/rchd/rch-wkr binaries to the same release",
+            "rch doctor --reliability --check-schemas --json",
+        )
+    }
 }
 
 fn build_reliability_doctor_response(
@@ -3077,6 +3076,41 @@ mod tests {
                 .expect("reader at the cap should be accepted");
 
         assert_eq!(content, "abc");
+    }
+
+    #[test]
+    fn test_schema_compatibility_diagnostic_flags_mismatch() {
+        let diagnostic =
+            schema_compatibility_diagnostic("status", "2.0.0", "1.0.0", "CLI status response");
+
+        assert_eq!(
+            diagnostic.category,
+            ReliabilityCategory::SchemaCompatibility
+        );
+        assert_eq!(diagnostic.severity, ReliabilitySeverity::Critical);
+        assert_eq!(diagnostic.reason_code, "schema_incompatible");
+        assert_eq!(
+            diagnostic.details.as_deref(),
+            Some("expected=1.0.0, actual=2.0.0")
+        );
+        assert!(
+            diagnostic.remediation_command.is_some(),
+            "schema mismatch should include remediation"
+        );
+    }
+
+    #[test]
+    fn test_schema_compatibility_diagnostic_passes_match() {
+        let diagnostic =
+            schema_compatibility_diagnostic("status", "1.0.0", "1.0.0", "CLI status response");
+
+        assert_eq!(diagnostic.severity, ReliabilitySeverity::Pass);
+        assert_eq!(diagnostic.reason_code, "schema_compatible");
+        assert_eq!(
+            diagnostic.details.as_deref(),
+            Some("schema_version=1.0.0 expected=1.0.0")
+        );
+        assert!(diagnostic.remediation_command.is_none());
     }
 
     #[test]
