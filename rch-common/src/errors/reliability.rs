@@ -159,6 +159,58 @@ pub enum ReliabilityReasonCode {
 }
 
 impl ReliabilityReasonCode {
+    /// The CamelCase variant identifier as a static string. Used by
+    /// `rch error explain` to render a human-readable name alongside
+    /// the `RCH-Rnnn` code.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::WorkersConfigUnreadable => "WorkersConfigUnreadable",
+            Self::NoWorkersConfigured => "NoWorkersConfigured",
+            Self::WorkersConfigured => "WorkersConfigured",
+            Self::DaemonStatusUnavailable => "DaemonStatusUnavailable",
+            Self::DaemonHasNoWorkers => "DaemonHasNoWorkers",
+            Self::AllWorkersUnhealthy => "AllWorkersUnhealthy",
+            Self::PartialWorkerCapacity => "PartialWorkerCapacity",
+            Self::WorkersHealthy => "WorkersHealthy",
+            Self::WorkerCircuitOpen => "WorkerCircuitOpen",
+            Self::WorkerUnreachable => "WorkerUnreachable",
+            Self::WorkerDegraded => "WorkerDegraded",
+            Self::WorkerReady => "WorkerReady",
+            Self::WorkerStatusUnrecognized => "WorkerStatusUnrecognized",
+            Self::WorkerCircuitStateUnrecognized => "WorkerCircuitStateUnrecognized",
+            Self::DiskPressureUnavailable => "DiskPressureUnavailable",
+            Self::WorkerDiskPressureCritical => "WorkerDiskPressureCritical",
+            Self::WorkerDiskPressureWarning => "WorkerDiskPressureWarning",
+            Self::WorkerDiskPressureHealthy => "WorkerDiskPressureHealthy",
+            Self::WorkerDiskPressureTelemetryGap => "WorkerDiskPressureTelemetryGap",
+            Self::DiskPressureNoWorkers => "DiskPressureNoWorkers",
+            Self::ProcessDebtUnavailable => "ProcessDebtUnavailable",
+            Self::CancellationCleanupHealthy => "CancellationCleanupHealthy",
+            Self::CancellationCleanupSkipped => "CancellationCleanupSkipped",
+            Self::CancellationCleanupDegraded => "CancellationCleanupDegraded",
+            Self::CancellationCleanupFailed => "CancellationCleanupFailed",
+            Self::RepoConvergenceUnavailable => "RepoConvergenceUnavailable",
+            Self::RepoConvergenceFailed => "RepoConvergenceFailed",
+            Self::RepoConvergenceDrift => "RepoConvergenceDrift",
+            Self::RepoConvergenceNoWorkers => "RepoConvergenceNoWorkers",
+            Self::RepoConvergenceReady => "RepoConvergenceReady",
+            Self::WorkerRepoNotReady => "WorkerRepoNotReady",
+            Self::HelperAvailable => "HelperAvailable",
+            Self::HelperMissing => "HelperMissing",
+            Self::HookAutoStartEnabled => "HookAutoStartEnabled",
+            Self::HookAutoStartDisabled => "HookAutoStartDisabled",
+            Self::DaemonHookRepairEnabled => "DaemonHookRepairEnabled",
+            Self::DaemonHookRepairDisabled => "DaemonHookRepairDisabled",
+            Self::ConfigLoadFailed => "ConfigLoadFailed",
+            Self::StatusSurfaceAvailable => "StatusSurfaceAvailable",
+            Self::RepoConvergenceSurfaceAvailable => "RepoConvergenceSurfaceAvailable",
+            Self::DiskPressureSurfaceAvailable => "DiskPressureSurfaceAvailable",
+            Self::SchemaCompatible => "SchemaCompatible",
+            Self::SchemaIncompatible => "SchemaIncompatible",
+        }
+    }
+
     /// The canonical `RCH-Rnnn` code string for this variant.
     #[must_use]
     pub const fn code(self) -> &'static str {

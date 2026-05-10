@@ -1815,11 +1815,12 @@ async fn process_hook(input: HookInput) -> HookOutput {
     // Mask sensitive data in debug logs (API keys, tokens, passwords)
     debug!("Processing command: {}", mask_sensitive_command(command));
 
-    // Classify the command using 5-tier system with LRU cache (bd-17cn)
+    // Classify the command using the 5-tier system.
     // Per AGENTS.md: non-compilation decisions must complete in <1ms, compilation in <5ms
-    // The cache reduces CPU overhead for repeated build/test commands
+    // The real hook path bypasses the classification cache because hook
+    // invocations are one-shot even when RCH_HOOK_MODE is not set.
     let classify_start = Instant::now();
-    let classification = crate::cache::classify_cached(command, classify_command);
+    let classification = crate::cache::classify_hook_command(command, classify_command);
     let classification_duration = classify_start.elapsed();
     let classification_duration_us = classification_duration.as_micros() as u64;
 
@@ -6392,6 +6393,27 @@ mod tests {
 
         let output = process_hook(input).await;
         assert!(output.is_allow());
+    }
+
+    #[tokio::test]
+    async fn test_process_hook_bypasses_classification_cache_without_env_flag() {
+        let unique_cmd = "echo rch-hook-cache-bypass-without-env-marker";
+        let input = HookInput {
+            tool_name: "Bash".to_string(),
+            tool_input: ToolInput {
+                command: unique_cmd.to_string(),
+                description: None,
+            },
+            session_id: None,
+        };
+
+        let output = process_hook(input).await;
+        assert!(output.is_allow());
+
+        assert!(
+            crate::cache::global_cache().get(unique_cmd).is_none(),
+            "process_hook must bypass the cache even when RCH_HOOK_MODE is unset"
+        );
     }
 
     #[tokio::test]

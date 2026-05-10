@@ -484,6 +484,12 @@ CHECKS PERFORMED:
     Hooks           - Claude Code hook installed
     Workers         - Connectivity (with --verbose)
     Reliability     - topology, repo convergence, disk pressure, process debt"#)]
+    /// Look up RCH-Ennn / RCH-Rnnn error and reason codes (operator ergonomics)
+    Error {
+        #[command(subcommand)]
+        sub: ErrorSubcommand,
+    },
+
     Doctor {
         /// Attempt to fix safe issues (e.g., key permissions)
         #[arg(long)]
@@ -819,6 +825,30 @@ enum SchemaAction {
     },
     /// List available schemas
     List,
+}
+
+#[derive(Subcommand)]
+enum ErrorSubcommand {
+    /// Print details for a specific code (e.g. RCH-R104, RCH-E001).
+    /// Operators paste a code from a log line and get description + remediation.
+    Explain {
+        /// The code to look up (whitespace and case tolerated; one of:
+        /// RCH-Rnnn for reliability codes, RCH-Ennn for error codes).
+        code: String,
+        /// Emit JSON envelope instead of the human-readable form.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List every known code in both namespaces (RCH-Ennn + RCH-Rnnn).
+    List {
+        /// Filter to a single category (snake_case; e.g. `disk_pressure`,
+        /// `worker`, `topology`). Empty = all categories.
+        #[arg(long)]
+        category: Option<String>,
+        /// Emit JSON envelope instead of the human-readable form.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1711,6 +1741,7 @@ async fn main() -> Result<()> {
             } => handle_web(port, no_open, prod, &ctx).await,
             Commands::Capabilities => handle_capabilities_command(&ctx),
             Commands::RobotDocs { action } => handle_robot_docs(action, &ctx),
+            Commands::Error { sub } => handle_error_explain(sub, &ctx),
             Commands::Schema { action } => handle_schema_command(action, &ctx),
         },
     }
@@ -2823,6 +2854,90 @@ async fn handle_update(
     )
     .await
     .map_err(|e| anyhow::anyhow!("{}", e))
+}
+
+/// Handle `rch error <sub>` subcommands. Operator-facing code lookup
+/// surface — pastes a code from a log line, get description +
+/// remediation. Bridges the two namespaces (RCH-Ennn errors,
+/// RCH-Rnnn reliability) into one uniform interface.
+fn handle_error_explain(sub: ErrorSubcommand, ctx: &OutputContext) -> Result<()> {
+    use rch_common::api::ApiError;
+    use rch_common::errors::{list_all, list_by_category, lookup, render_human};
+    use rch_common::{ApiResponse, ErrorCode};
+
+    match sub {
+        ErrorSubcommand::Explain { code, json } => {
+            let trimmed = code.trim();
+            match lookup(trimmed) {
+                Some(explanation) => {
+                    if json || ctx.is_json() {
+                        let response = ApiResponse::ok("error.explain", &explanation);
+                        if json {
+                            ctx.json_force(&response)?;
+                        } else {
+                            ctx.json(&response)?;
+                        }
+                    } else {
+                        print!("{}", render_human(&explanation));
+                    }
+                    Ok(())
+                }
+                None => {
+                    if json || ctx.is_json() {
+                        let response: ApiResponse<()> = ApiResponse::err(
+                            "error.explain",
+                            ApiError::new(
+                                ErrorCode::ConfigValidationError,
+                                format!("Unknown code {trimmed:?}"),
+                            )
+                            .with_remediation(["Run `rch error list` to see all known codes."]),
+                        );
+                        if json {
+                            ctx.json_force(&response)?;
+                        } else {
+                            ctx.json(&response)?;
+                        }
+                    }
+                    eprintln!(
+                        "Unknown code {trimmed:?}. Try `rch error list` to see all known codes."
+                    );
+                    std::process::exit(2);
+                }
+            }
+        }
+        ErrorSubcommand::List { category, json } => {
+            let entries = match category.as_deref() {
+                Some(c) if !c.is_empty() => list_by_category(c),
+                _ => list_all(),
+            };
+            if json || ctx.is_json() {
+                #[derive(serde::Serialize)]
+                struct ListPayload {
+                    count: usize,
+                    codes: Vec<rch_common::CodeExplanation>,
+                }
+                let payload = ListPayload {
+                    count: entries.len(),
+                    codes: entries,
+                };
+                let response = ApiResponse::ok("error.list", &payload);
+                if json {
+                    ctx.json_force(&response)?;
+                } else {
+                    ctx.json(&response)?;
+                }
+            } else {
+                println!("{} known code(s):", entries.len());
+                for e in &entries {
+                    println!(
+                        "  {} [{}] {} — {}",
+                        e.code, e.category, e.name, e.description
+                    );
+                }
+            }
+            Ok(())
+        }
+    }
 }
 
 /// Handle completions subcommands
@@ -4389,6 +4504,37 @@ mod tests {
                 assert_eq!(port, 3001);
             }
             _ => panic!("Expected web command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_error_explain_json() {
+        let _guard = test_guard!();
+        let cli = Cli::try_parse_from(["rch", "error", "explain", "RCH-R104", "--json"]).unwrap();
+        match cli.command {
+            Some(Commands::Error {
+                sub: ErrorSubcommand::Explain { code, json },
+            }) => {
+                assert_eq!(code, "RCH-R104");
+                assert!(json);
+            }
+            _ => panic!("Expected error explain command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_error_list_category() {
+        let _guard = test_guard!();
+        let cli =
+            Cli::try_parse_from(["rch", "error", "list", "--category", "disk_pressure"]).unwrap();
+        match cli.command {
+            Some(Commands::Error {
+                sub: ErrorSubcommand::List { category, json },
+            }) => {
+                assert_eq!(category.as_deref(), Some("disk_pressure"));
+                assert!(!json);
+            }
+            _ => panic!("Expected error list command"),
         }
     }
 

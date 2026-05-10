@@ -23,7 +23,11 @@
 //! [`reliability`] for the full table.
 
 pub mod catalog;
+pub mod explain;
 pub mod reliability;
 
 pub use catalog::{ErrorCategory, ErrorCode, ErrorEntry};
+pub use explain::{
+    CodeExplanation, CodeNamespace, is_known, list_all, list_by_category, lookup, render_human,
+};
 pub use reliability::{ReliabilityCategoryKind, ReliabilityReasonCode};

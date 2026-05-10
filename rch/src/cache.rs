@@ -238,11 +238,24 @@ pub fn global_cache() -> &'static ClassificationCache {
 /// 3. Long-lived consumers (`rchd`, `rch exec`) keep the cached path —
 ///    detected by the absence of `RCH_HOOK_MODE`.
 /// 4. On cache miss: call `classify_fn`, store, return.
+#[allow(dead_code)] // Reserved for long-lived classification callers outside one-shot hook mode.
 pub fn classify_cached<F>(command: &str, classify_fn: F) -> Classification
 where
     F: FnOnce(&str) -> Classification,
 {
     classify_cached_inner(command, classify_fn, is_hook_mode())
+}
+
+/// Classify a command on the real hook path.
+///
+/// The no-subcommand hook entry point is already known to be hook mode even
+/// when `RCH_HOOK_MODE` is not set, so callers on that path should bypass the
+/// cache directly instead of depending on environment detection.
+pub(crate) fn classify_hook_command<F>(command: &str, classify_fn: F) -> Classification
+where
+    F: FnOnce(&str) -> Classification,
+{
+    classify_cached_inner(command, classify_fn, true)
 }
 
 fn classify_cached_inner<F>(command: &str, classify_fn: F, hook_mode: bool) -> Classification
@@ -275,6 +288,7 @@ where
 /// Detect hook mode via the `RCH_HOOK_MODE` env var. Accepts truthy
 /// strings `"1"` / `"true"` (case-insensitive), matching the existing
 /// project convention from `rch/src/hook.rs`.
+#[allow(dead_code)] // Used by classify_cached when long-lived callers opt into the cache.
 fn is_hook_mode() -> bool {
     std::env::var_os("RCH_HOOK_MODE").is_some_and(|v| {
         let s = v.to_string_lossy().to_lowercase();
@@ -449,6 +463,19 @@ mod tests {
         }
 
         // Unique entry must not be present (bypass means no put).
+        assert!(global_cache().get(unique_cmd).is_none());
+    }
+
+    #[test]
+    fn test_classify_hook_command_bypasses_cache_without_env() {
+        let unique_cmd = "cargo build --hook-entry-bypass-without-env-marker";
+
+        for _ in 0..50 {
+            let _ = classify_hook_command(unique_cmd, classify_command);
+        }
+
+        // The explicit hook-path helper must not populate the cache; real hook
+        // invocations do not necessarily set RCH_HOOK_MODE.
         assert!(global_cache().get(unique_cmd).is_none());
     }
 
