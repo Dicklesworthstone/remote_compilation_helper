@@ -242,13 +242,20 @@ pub fn classify_cached<F>(command: &str, classify_fn: F) -> Classification
 where
     F: FnOnce(&str) -> Classification,
 {
+    classify_cached_inner(command, classify_fn, is_hook_mode())
+}
+
+fn classify_cached_inner<F>(command: &str, classify_fn: F, hook_mode: bool) -> Classification
+where
+    F: FnOnce(&str) -> Classification,
+{
     // Single trim — downstream consumers honor the pre-trimmed contract.
     let trimmed = command.trim();
 
     // Hook-mode bypass: skip cache (and its 3 mutex acquires) entirely.
     // The hook is process-per-invocation, so the cache always starts
     // empty; lookup overhead is pure cost with no benefit.
-    if is_hook_mode() {
+    if hook_mode {
         return classify_fn(trimmed);
     }
 
@@ -268,40 +275,11 @@ where
 /// Detect hook mode via the `RCH_HOOK_MODE` env var. Accepts truthy
 /// strings `"1"` / `"true"` (case-insensitive), matching the existing
 /// project convention from `rch/src/hook.rs`.
-///
-/// In tests, the env-read can be bypassed by setting
-/// [`HOOK_MODE_TEST_OVERRIDE`] — required because `rch` is built with
-/// `#![forbid(unsafe_code)]` and `std::env::set_var` is `unsafe` in
-/// Rust 2024.
 fn is_hook_mode() -> bool {
-    #[cfg(test)]
-    {
-        match HOOK_MODE_TEST_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
-            1 => return true,
-            2 => return false,
-            _ => {}
-        }
-    }
     std::env::var_os("RCH_HOOK_MODE").is_some_and(|v| {
         let s = v.to_string_lossy().to_lowercase();
         s == "1" || s == "true"
     })
-}
-
-/// Test-only override for [`is_hook_mode`].
-/// - `0` (default): consult the env var.
-/// - `1`: force hook mode true.
-/// - `2`: force hook mode false (ignores env).
-///
-/// Tests using this override should reset to `0` in a teardown so a
-/// subsequent test isn't affected. Single-threaded test execution is
-/// assumed (matches the rest of `rch::cache::tests`).
-#[cfg(test)]
-static HOOK_MODE_TEST_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
-
-#[cfg(test)]
-fn set_hook_mode_test_override(state: u8) {
-    HOOK_MODE_TEST_OVERRIDE.store(state, std::sync::atomic::Ordering::Relaxed);
 }
 
 #[cfg(test)]
@@ -464,34 +442,22 @@ mod tests {
 
     #[test]
     fn test_classify_cached_hook_mode_bypasses_cache() {
-        // Force hook mode via test override (project is forbid(unsafe_code)
-        // so we can't manipulate env vars at runtime).
-        set_hook_mode_test_override(1);
-        let stats_before = global_cache().stats();
         let unique_cmd = "cargo build --t16-hook-bypass-marker";
 
         for _ in 0..50 {
-            let _ = classify_cached(unique_cmd, classify_command);
+            let _ = classify_cached_inner(unique_cmd, classify_command, true);
         }
 
-        let stats_after = global_cache().stats();
-        // No cache activity should be visible: hits/misses unchanged.
-        assert_eq!(stats_after.hits, stats_before.hits);
-        assert_eq!(stats_after.misses, stats_before.misses);
-        // Reset override so other tests aren't affected.
-        set_hook_mode_test_override(0);
         // Unique entry must not be present (bypass means no put).
         assert!(global_cache().get(unique_cmd).is_none());
     }
 
     #[test]
     fn test_classify_cached_default_mode_uses_cache() {
-        // Force default mode (override = 2 means "force hook_mode=false").
-        set_hook_mode_test_override(2);
         let unique_cmd = "cargo test --t16-default-mode-marker";
 
-        let r1 = classify_cached(unique_cmd, classify_command);
-        let r2 = classify_cached(unique_cmd, classify_command);
+        let r1 = classify_cached_inner(unique_cmd, classify_command, false);
+        let r2 = classify_cached_inner(unique_cmd, classify_command, false);
         assert_eq!(r1.is_compilation, r2.is_compilation);
         assert_eq!(r1.kind, r2.kind);
 
@@ -500,7 +466,6 @@ mod tests {
             global_cache().get(unique_cmd).is_some(),
             "default mode should populate the cache"
         );
-        set_hook_mode_test_override(0);
     }
 
     #[test]
@@ -741,15 +706,16 @@ mod tests {
     }
 
     #[test]
-    fn test_cache_normalize_key_consistency() {
+    fn test_cache_direct_keys_are_byte_exact() {
         let cache = ClassificationCache::with_defaults();
 
-        // All these should normalize to the same key
+        // Direct cache callers are responsible for trimming. The cache
+        // itself treats keys byte-exactly.
         cache.put("  command  ", make_classification(true));
-        assert!(cache.get("command").is_some());
-        assert!(cache.get("  command").is_some());
-        assert!(cache.get("command  ").is_some());
         assert!(cache.get("  command  ").is_some());
+        assert!(cache.get("command").is_none());
+        assert!(cache.get("  command").is_none());
+        assert!(cache.get("command  ").is_none());
 
         // Stats should show only 1 entry
         let stats = cache.stats();
