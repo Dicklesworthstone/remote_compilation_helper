@@ -2059,6 +2059,8 @@ fn parse_rsync_bytes(output: &str) -> u64 {
 
 /// Parse files transferred from rsync output.
 fn parse_rsync_files(output: &str) -> u32 {
+    let mut total_files = None;
+
     for line in output.lines() {
         if let Some(rest) = line.strip_prefix("Number of files transferred:")
             && let Some(count) = rest.split_whitespace().next()
@@ -2070,14 +2072,14 @@ fn parse_rsync_files(output: &str) -> u32 {
             && let Some(count) = rest.split_whitespace().next()
             && let Ok(parsed) = count.replace(',', "").parse::<u32>()
         {
-            return parsed;
+            total_files = Some(parsed);
         }
     }
 
     // If we couldn't parse structured stats, return 0 rather than guessing.
     // The previous heuristic of counting non-empty lines was unreliable as it
     // would count progress lines, stats, and error messages as files.
-    0
+    total_files.unwrap_or(0)
 }
 
 // =============================================================================
@@ -2535,6 +2537,13 @@ mod tests {
         // Test "Number of files:" format (alternate rsync output)
         let output = "Number of files: 100\nsome other line";
         assert_eq!(parse_rsync_files(output), 100);
+    }
+
+    #[test]
+    fn test_parse_rsync_files_prefers_transferred_count_over_total_tree_count() {
+        let _guard = test_guard!();
+        let output = "Number of files: 28,779 (reg: 20,000, dir: 8,779)\nNumber of files transferred: 42\nTotal bytes sent: 1,271,299";
+        assert_eq!(parse_rsync_files(output), 42);
     }
 
     #[test]

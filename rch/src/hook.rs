@@ -50,6 +50,7 @@ use rch_telemetry::protocol::{
 use serde::{Deserialize, Serialize};
 use std::fs::OpenOptions;
 use std::io::{self, Write};
+use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
 use std::sync::{
@@ -2724,6 +2725,11 @@ fn build_dependency_runtime_fail_open_report(
                 .join("Cargo.toml")
                 .to_string_lossy()
                 .to_string(),
+            required_path: normalized_project_root
+                .join("Cargo.toml")
+                .to_string_lossy()
+                .to_string(),
+            required_kind: "manifest",
             status,
             reason_code: decision.reason_code,
             detail: decision.detail.clone(),
@@ -4185,8 +4191,7 @@ const DEPENDENCY_PREFLIGHT_CODE_STALE: &str = "RCH-E325";
 const DEPENDENCY_PREFLIGHT_CODE_UNKNOWN: &str = "RCH-E326";
 const DEPENDENCY_PREFLIGHT_CODE_POLICY: &str = "RCH-E327";
 const DEPENDENCY_PREFLIGHT_CODE_TIMEOUT: &str = "RCH-E328";
-const DEPENDENCY_PREFLIGHT_REMEDIATION_MISSING: &str =
-    "Ensure every dependency root in the closure is synced and Cargo.toml exists remotely.";
+const DEPENDENCY_PREFLIGHT_REMEDIATION_MISSING: &str = "Ensure every dependency root in the closure is synced and Cargo.toml plus required source entrypoints exist remotely.";
 const DEPENDENCY_PREFLIGHT_REMEDIATION_STALE: &str = "One or more dependency roots were not refreshed; rerun after successful sync of skipped roots.";
 const DEPENDENCY_PREFLIGHT_REMEDIATION_UNKNOWN: &str =
     "Dependency verification could not determine remote state; inspect sync/SSH logs and retry.";
@@ -4216,6 +4221,8 @@ enum DependencyPreflightStatus {
 struct DependencyPreflightEvidence {
     root: String,
     manifest: String,
+    required_path: String,
+    required_kind: &'static str,
     status: DependencyPreflightStatus,
     reason_code: &'static str,
     detail: String,
@@ -4322,67 +4329,308 @@ fn dependency_preflight_failure_reason(
     None
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DependencyPreflightCheck {
+    root: String,
+    manifest: String,
+    required_path: String,
+    required_kind: &'static str,
+    is_primary: bool,
+}
+
+fn clean_relative_cargo_path(raw: &str) -> Option<PathBuf> {
+    let path = Path::new(raw);
+    if path.is_absolute() {
+        return None;
+    }
+    if path.components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    }) {
+        return None;
+    }
+    Some(path.to_path_buf())
+}
+
+fn table_path_value(table: &toml::Table, key: &str) -> Option<PathBuf> {
+    table
+        .get(key)
+        .and_then(toml::Value::as_str)
+        .and_then(clean_relative_cargo_path)
+}
+
+fn target_array_paths(table: &toml::Table, key: &str) -> Vec<PathBuf> {
+    table
+        .get(key)
+        .and_then(toml::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(toml::Value::as_table)
+        .filter_map(|target| table_path_value(target, "path"))
+        .collect()
+}
+
+fn package_auto_discovery_enabled(table: &toml::Table, key: &str) -> bool {
+    table
+        .get("package")
+        .and_then(toml::Value::as_table)
+        .and_then(|package| package.get(key))
+        .and_then(toml::Value::as_bool)
+        .unwrap_or(true)
+}
+
+fn insert_existing_relative_entrypoint(
+    paths: &mut std::collections::BTreeSet<PathBuf>,
+    package_root: &Path,
+    relative_path: impl Into<PathBuf>,
+) {
+    let relative_path = relative_path.into();
+    if package_root.join(&relative_path).is_file() {
+        paths.insert(relative_path);
+    }
+}
+
+fn insert_auto_discovered_target_entrypoints(
+    paths: &mut std::collections::BTreeSet<PathBuf>,
+    package_root: &Path,
+    relative_dir: &str,
+) {
+    let Ok(entries) = std::fs::read_dir(package_root.join(relative_dir)) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let file_name = entry.file_name();
+        if file_type.is_file() {
+            if entry.path().extension().is_some_and(|ext| ext == "rs") {
+                paths.insert(PathBuf::from(relative_dir).join(file_name));
+            }
+        } else if file_type.is_dir() {
+            insert_existing_relative_entrypoint(
+                paths,
+                package_root,
+                PathBuf::from(relative_dir).join(file_name).join("main.rs"),
+            );
+        }
+    }
+}
+
+fn cargo_package_source_entrypoints(package_root: &Path) -> Vec<PathBuf> {
+    let manifest_path = package_root.join("Cargo.toml");
+    let Ok(contents) = std::fs::read_to_string(&manifest_path) else {
+        return Vec::new();
+    };
+    let Ok(table) = toml::from_str::<toml::Table>(&contents) else {
+        return Vec::new();
+    };
+    if !table.contains_key("package") {
+        return Vec::new();
+    }
+
+    let mut paths = std::collections::BTreeSet::<PathBuf>::new();
+
+    if let Some(lib_path) = table
+        .get("lib")
+        .and_then(toml::Value::as_table)
+        .and_then(|lib| table_path_value(lib, "path"))
+    {
+        paths.insert(lib_path);
+    } else if package_auto_discovery_enabled(&table, "autolib") || table.contains_key("lib") {
+        insert_existing_relative_entrypoint(&mut paths, package_root, "src/lib.rs");
+    }
+
+    if package_auto_discovery_enabled(&table, "autobins") {
+        insert_existing_relative_entrypoint(&mut paths, package_root, "src/main.rs");
+        insert_auto_discovered_target_entrypoints(&mut paths, package_root, "src/bin");
+    }
+    if package_auto_discovery_enabled(&table, "autoexamples") {
+        insert_auto_discovered_target_entrypoints(&mut paths, package_root, "examples");
+    }
+    if package_auto_discovery_enabled(&table, "autotests") {
+        insert_auto_discovered_target_entrypoints(&mut paths, package_root, "tests");
+    }
+    if package_auto_discovery_enabled(&table, "autobenches") {
+        insert_auto_discovered_target_entrypoints(&mut paths, package_root, "benches");
+    }
+
+    for key in ["bin", "example", "test", "bench"] {
+        paths.extend(target_array_paths(&table, key));
+    }
+
+    paths.into_iter().collect()
+}
+
+fn dependency_preflight_checks_for_entry(
+    entry: &SyncClosurePlanEntry,
+) -> Vec<DependencyPreflightCheck> {
+    let remote_root = PathBuf::from(&entry.remote_root);
+    let manifest = remote_root.join("Cargo.toml").to_string_lossy().to_string();
+    let mut checks = Vec::new();
+    checks.push(DependencyPreflightCheck {
+        root: entry.remote_root.clone(),
+        manifest: manifest.clone(),
+        required_path: manifest.clone(),
+        required_kind: "manifest",
+        is_primary: entry.is_primary,
+    });
+
+    if entry.mode == SyncClosureMode::Full {
+        checks.extend(
+            cargo_package_source_entrypoints(&entry.local_root)
+                .into_iter()
+                .map(|relative_path| DependencyPreflightCheck {
+                    root: entry.remote_root.clone(),
+                    manifest: manifest.clone(),
+                    required_path: remote_root
+                        .join(relative_path)
+                        .to_string_lossy()
+                        .to_string(),
+                    required_kind: "source_entrypoint",
+                    is_primary: entry.is_primary,
+                }),
+        );
+    }
+
+    checks.sort_by(|left, right| {
+        (&left.required_path, left.required_kind).cmp(&(&right.required_path, right.required_kind))
+    });
+    checks.dedup_by(|left, right| {
+        left.required_path == right.required_path && left.required_kind == right.required_kind
+    });
+    checks
+}
+
+fn synced_dependency_preflight_checks(
+    root_outcomes: &[(SyncClosurePlanEntry, SyncRootOutcome)],
+) -> Vec<DependencyPreflightCheck> {
+    root_outcomes
+        .iter()
+        .filter(|(_, outcome)| matches!(outcome, SyncRootOutcome::Synced))
+        .flat_map(|(entry, _)| dependency_preflight_checks_for_entry(entry))
+        .collect()
+}
+
 fn build_dependency_preflight_report(
     worker: &WorkerConfig,
     root_outcomes: &[(SyncClosurePlanEntry, SyncRootOutcome)],
-    present_manifests: &std::collections::BTreeSet<String>,
-    missing_manifests: &std::collections::BTreeSet<String>,
+    present_paths: &std::collections::BTreeSet<String>,
+    missing_paths: &std::collections::BTreeSet<String>,
     probe_failure: Option<&str>,
 ) -> DependencyPreflightReport {
-    let mut evidence = Vec::with_capacity(root_outcomes.len());
+    let mut evidence = Vec::new();
 
     for (entry, outcome) in root_outcomes {
-        let manifest_path = PathBuf::from(&entry.remote_root).join("Cargo.toml");
-        let manifest = manifest_path.to_string_lossy().to_string();
-        let root = entry.remote_root.clone();
-
-        let (status, reason_code, detail) = match outcome {
-            SyncRootOutcome::Synced => {
-                if missing_manifests.contains(&manifest) {
-                    (
-                        DependencyPreflightStatus::Missing,
-                        DEPENDENCY_PREFLIGHT_CODE_MISSING,
-                        "required Cargo.toml is missing on remote worker".to_string(),
-                    )
-                } else if present_manifests.contains(&manifest) {
-                    (
-                        DependencyPreflightStatus::Present,
-                        DEPENDENCY_PREFLIGHT_CODE_PRESENT,
-                        "manifest present and refreshed in current sync".to_string(),
-                    )
-                } else {
-                    let detail = probe_failure
-                        .map(|failure| format!("manifest probe unavailable: {}", failure))
-                        .unwrap_or_else(|| {
-                            "probe output omitted status for synced manifest".to_string()
-                        });
-                    (
-                        DependencyPreflightStatus::Unknown,
-                        DEPENDENCY_PREFLIGHT_CODE_UNKNOWN,
-                        detail,
-                    )
+        for check in dependency_preflight_checks_for_entry(entry) {
+            let (status, reason_code, detail) = match outcome {
+                SyncRootOutcome::Synced => {
+                    if missing_paths.contains(&check.required_path) {
+                        let detail = match check.required_kind {
+                            "manifest" => "required Cargo.toml is missing on remote worker",
+                            "source_entrypoint" => {
+                                "required package source entrypoint is missing on remote worker"
+                            }
+                            _ => "required dependency path is missing on remote worker",
+                        };
+                        (
+                            DependencyPreflightStatus::Missing,
+                            DEPENDENCY_PREFLIGHT_CODE_MISSING,
+                            format!("{detail}: {}", check.required_path),
+                        )
+                    } else if present_paths.contains(&check.required_path) {
+                        (
+                            DependencyPreflightStatus::Present,
+                            DEPENDENCY_PREFLIGHT_CODE_PRESENT,
+                            format!(
+                                "required {} present after current sync: {}",
+                                check.required_kind, check.required_path
+                            ),
+                        )
+                    } else {
+                        let detail = probe_failure
+                            .map(|failure| format!("dependency probe unavailable: {}", failure))
+                            .unwrap_or_else(|| {
+                                format!(
+                                    "probe output omitted status for synced required path: {}",
+                                    check.required_path
+                                )
+                            });
+                        (
+                            DependencyPreflightStatus::Unknown,
+                            DEPENDENCY_PREFLIGHT_CODE_UNKNOWN,
+                            detail,
+                        )
+                    }
                 }
-            }
-            SyncRootOutcome::Skipped { reason } => (
-                DependencyPreflightStatus::Stale,
-                DEPENDENCY_PREFLIGHT_CODE_STALE,
-                format!("dependency root skipped before verification: {}", reason),
-            ),
-            SyncRootOutcome::Failed { error } => (
-                DependencyPreflightStatus::Unknown,
-                DEPENDENCY_PREFLIGHT_CODE_UNKNOWN,
-                format!("dependency root sync failed before verification: {}", error),
-            ),
-        };
+                SyncRootOutcome::Skipped { reason } => (
+                    DependencyPreflightStatus::Stale,
+                    DEPENDENCY_PREFLIGHT_CODE_STALE,
+                    format!(
+                        "dependency root skipped before verification for {}: {}",
+                        check.required_path, reason
+                    ),
+                ),
+                SyncRootOutcome::Failed { error } => (
+                    DependencyPreflightStatus::Unknown,
+                    DEPENDENCY_PREFLIGHT_CODE_UNKNOWN,
+                    format!(
+                        "dependency root sync failed before verification for {}: {}",
+                        check.required_path, error
+                    ),
+                ),
+            };
 
-        evidence.push(DependencyPreflightEvidence {
-            root,
-            manifest,
-            status,
-            reason_code,
-            detail,
-            is_primary: entry.is_primary,
-        });
+            evidence.push(DependencyPreflightEvidence {
+                root: check.root,
+                manifest: check.manifest,
+                required_path: check.required_path,
+                required_kind: check.required_kind,
+                status,
+                reason_code,
+                detail,
+                is_primary: check.is_primary,
+            });
+        }
+    }
+
+    if evidence.is_empty() {
+        for (entry, outcome) in root_outcomes {
+            let manifest = PathBuf::from(&entry.remote_root)
+                .join("Cargo.toml")
+                .to_string_lossy()
+                .to_string();
+            let (status, reason_code, detail) = match outcome {
+                SyncRootOutcome::Synced => (
+                    DependencyPreflightStatus::Unknown,
+                    DEPENDENCY_PREFLIGHT_CODE_UNKNOWN,
+                    "dependency preflight had no required paths to verify".to_string(),
+                ),
+                SyncRootOutcome::Skipped { reason } => (
+                    DependencyPreflightStatus::Stale,
+                    DEPENDENCY_PREFLIGHT_CODE_STALE,
+                    format!("dependency root skipped before verification: {}", reason),
+                ),
+                SyncRootOutcome::Failed { error } => (
+                    DependencyPreflightStatus::Unknown,
+                    DEPENDENCY_PREFLIGHT_CODE_UNKNOWN,
+                    format!("dependency root sync failed before verification: {}", error),
+                ),
+            };
+            evidence.push(DependencyPreflightEvidence {
+                root: entry.remote_root.clone(),
+                manifest: manifest.clone(),
+                required_path: manifest,
+                required_kind: "manifest",
+                status,
+                reason_code,
+                detail,
+                is_primary: entry.is_primary,
+            });
+        }
     }
 
     let (verified, reason_code, remediation) = match dependency_preflight_failure_reason(&evidence)
@@ -4577,21 +4825,21 @@ async fn verify_remote_dependency_manifests(
         return Ok(());
     }
 
-    let synced_roots = synced_remote_roots(root_outcomes);
+    let synced_checks = synced_dependency_preflight_checks(root_outcomes);
 
-    let mut present_manifests = std::collections::BTreeSet::new();
-    let mut missing_manifests = std::collections::BTreeSet::new();
+    let mut present_paths = std::collections::BTreeSet::new();
+    let mut missing_paths = std::collections::BTreeSet::new();
     let mut probe_failure: Option<String> = None;
 
-    if let Some(verify_cmd) = build_remote_dependency_preflight_command(&synced_roots) {
+    if let Some(verify_cmd) = build_remote_dependency_preflight_command(&synced_checks) {
         match run_worker_ssh_command(worker, &verify_cmd, Duration::from_secs(20)).await {
             Ok(output) => {
                 let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
                 let (present, missing) = parse_dependency_preflight_probe_output(&stdout);
-                present_manifests = present;
-                missing_manifests = missing;
-                if !output.status.success() && missing_manifests.is_empty() {
+                present_paths = present;
+                missing_paths = missing;
+                if !output.status.success() && missing_paths.is_empty() {
                     probe_failure = Some(format!(
                         "probe exited with status {:?}; stdout='{}'; stderr='{}'",
                         output.status.code(),
@@ -4609,8 +4857,8 @@ async fn verify_remote_dependency_manifests(
     let report = build_dependency_preflight_report(
         worker,
         root_outcomes,
-        &present_manifests,
-        &missing_manifests,
+        &present_paths,
+        &missing_paths,
         probe_failure.as_deref(),
     );
     let report_json = serde_json::to_string(&report).unwrap_or_else(|err| {
@@ -4644,36 +4892,27 @@ async fn verify_remote_dependency_manifests(
     Err(failure.into())
 }
 
-fn synced_remote_roots(root_outcomes: &[(SyncClosurePlanEntry, SyncRootOutcome)]) -> Vec<PathBuf> {
-    root_outcomes
-        .iter()
-        .filter_map(|(entry, outcome)| match outcome {
-            SyncRootOutcome::Synced => Some(PathBuf::from(&entry.remote_root)),
-            SyncRootOutcome::Skipped { .. } | SyncRootOutcome::Failed { .. } => None,
-        })
-        .collect()
-}
-
-fn build_remote_dependency_preflight_command(sync_roots: &[PathBuf]) -> Option<String> {
-    if sync_roots.is_empty() {
+fn build_remote_dependency_preflight_command(
+    checks: &[DependencyPreflightCheck],
+) -> Option<String> {
+    if checks.is_empty() {
         return None;
     }
 
-    let checks = sync_roots
+    let commands = checks
         .iter()
-        .map(|root| root.join("Cargo.toml"))
-        .map(|manifest| {
-            let escaped = shell_escape::escape(manifest.to_string_lossy().to_string().into());
+        .map(|check| {
+            let escaped = shell_escape::escape(check.required_path.clone().into());
             format!(
-                "manifest={manifest}; if [ -f \"$manifest\" ]; then printf 'RCH_DEP_PRESENT:%s\\n' \"$manifest\"; else printf 'RCH_DEP_MISSING:%s\\n' \"$manifest\"; missing=1; fi",
-                manifest = escaped
+                "required={path}; if [ -f \"$required\" ]; then printf 'RCH_DEP_PRESENT:%s\\n' \"$required\"; else printf 'RCH_DEP_MISSING:%s\\n' \"$required\"; missing=1; fi",
+                path = escaped
             )
         })
         .collect::<Vec<_>>()
         .join("; ");
 
     Some(format!(
-        "missing=0; {checks}; if [ \"$missing\" -ne 0 ]; then exit 43; fi; echo RCH_REMOTE_DEPENDENCIES_OK"
+        "missing=0; {commands}; if [ \"$missing\" -ne 0 ]; then exit 43; fi; echo RCH_REMOTE_DEPENDENCIES_OK"
     ))
 }
 
@@ -8953,16 +9192,28 @@ The file `x11.pc` needs to be installed and the PKG_CONFIG_PATH environment vari
     #[test]
     fn test_build_remote_dependency_preflight_command_separates_checks() {
         let _guard = test_guard!();
-        let sync_roots = vec![
-            PathBuf::from("/data/projects/repo-a"),
-            PathBuf::from("/data/projects/repo-b"),
+        let checks = vec![
+            DependencyPreflightCheck {
+                root: "/data/projects/repo-a".to_string(),
+                manifest: "/data/projects/repo-a/Cargo.toml".to_string(),
+                required_path: "/data/projects/repo-a/Cargo.toml".to_string(),
+                required_kind: "manifest",
+                is_primary: true,
+            },
+            DependencyPreflightCheck {
+                root: "/data/projects/repo-b".to_string(),
+                manifest: "/data/projects/repo-b/Cargo.toml".to_string(),
+                required_path: "/data/projects/repo-b/src/lib.rs".to_string(),
+                required_kind: "source_entrypoint",
+                is_primary: false,
+            },
         ];
 
-        let command = build_remote_dependency_preflight_command(&sync_roots)
+        let command = build_remote_dependency_preflight_command(&checks)
             .expect("command should be constructed");
 
         assert!(
-            command.contains("fi; manifest="),
+            command.contains("fi; required="),
             "generated command must separate consecutive if/fi checks with ';'"
         );
         assert!(
@@ -8980,12 +9231,27 @@ The file `x11.pc` needs to be installed and the PKG_CONFIG_PATH environment vari
     }
 
     #[test]
-    fn test_synced_remote_roots_use_remote_paths() {
+    fn test_synced_dependency_preflight_checks_use_remote_paths() {
         let _guard = test_guard!();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let package_root = temp_dir.path().join("package");
+        std::fs::create_dir_all(package_root.join("src")).expect("create package src");
+        std::fs::write(
+            package_root.join("Cargo.toml"),
+            r#"[package]
+name = "package"
+version = "0.1.0"
+edition = "2024"
+"#,
+        )
+        .expect("write manifest");
+        std::fs::write(package_root.join("src/lib.rs"), "pub fn package() {}\n")
+            .expect("write lib");
+
         let root_outcomes = vec![
             (
                 SyncClosurePlanEntry {
-                    local_root: PathBuf::from("/Users/jemanuel/projects/frankenterm"),
+                    local_root: package_root,
                     remote_root: "/data/projects/frankenterm".to_string(),
                     project_id: "frankenterm".to_string(),
                     root_hash: "hash-primary".to_string(),
@@ -9009,8 +9275,19 @@ The file `x11.pc` needs to be installed and the PKG_CONFIG_PATH environment vari
             ),
         ];
 
-        let synced = synced_remote_roots(&root_outcomes);
-        assert_eq!(synced, vec![PathBuf::from("/data/projects/frankenterm")]);
+        let synced = synced_dependency_preflight_checks(&root_outcomes);
+        let required_paths = synced
+            .iter()
+            .map(|check| check.required_path.as_str())
+            .collect::<Vec<_>>();
+        assert!(required_paths.contains(&"/data/projects/frankenterm/Cargo.toml"));
+        assert!(required_paths.contains(&"/data/projects/frankenterm/src/lib.rs"));
+        assert!(
+            !required_paths
+                .iter()
+                .any(|path| path.starts_with("/data/projects/frankentui")),
+            "failed roots must not be probed as freshly synced"
+        );
     }
 
     #[test]
@@ -9360,6 +9637,165 @@ RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
             report.remediation,
             Some(DEPENDENCY_PREFLIGHT_REMEDIATION_MISSING)
         );
+    }
+
+    #[test]
+    fn test_cargo_package_source_entrypoints_include_auto_discovered_targets() {
+        let _guard = test_guard!();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let package_root = temp_dir.path().join("auto-targets");
+        for dir in [
+            "src",
+            "src/bin/nested",
+            "examples/demo",
+            "tests/integration",
+            "benches/speed",
+        ] {
+            std::fs::create_dir_all(package_root.join(dir)).expect("create target dir");
+        }
+        std::fs::write(
+            package_root.join("Cargo.toml"),
+            r#"[package]
+name = "auto-targets"
+version = "0.1.0"
+edition = "2024"
+"#,
+        )
+        .expect("write manifest");
+        for path in [
+            "src/lib.rs",
+            "src/main.rs",
+            "src/bin/tool.rs",
+            "src/bin/nested/main.rs",
+            "examples/example.rs",
+            "examples/demo/main.rs",
+            "tests/integration.rs",
+            "tests/integration/main.rs",
+            "benches/speed.rs",
+            "benches/speed/main.rs",
+        ] {
+            std::fs::write(package_root.join(path), "fn main() {}\n").expect("write entrypoint");
+        }
+
+        let entrypoints = cargo_package_source_entrypoints(&package_root);
+
+        for path in [
+            "src/lib.rs",
+            "src/main.rs",
+            "src/bin/tool.rs",
+            "src/bin/nested/main.rs",
+            "examples/example.rs",
+            "examples/demo/main.rs",
+            "tests/integration.rs",
+            "tests/integration/main.rs",
+            "benches/speed.rs",
+            "benches/speed/main.rs",
+        ] {
+            assert!(
+                entrypoints.contains(&PathBuf::from(path)),
+                "missing auto-discovered entrypoint {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_cargo_package_source_entrypoints_respect_auto_discovery_flags() {
+        let _guard = test_guard!();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let package_root = temp_dir.path().join("manual-targets");
+        for dir in ["src/bin", "examples", "tests", "benches", "custom"] {
+            std::fs::create_dir_all(package_root.join(dir)).expect("create target dir");
+        }
+        std::fs::write(
+            package_root.join("Cargo.toml"),
+            r#"[package]
+name = "manual-targets"
+version = "0.1.0"
+edition = "2024"
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+
+[lib]
+path = "custom/lib.rs"
+
+[[bin]]
+path = "custom/bin.rs"
+"#,
+        )
+        .expect("write manifest");
+        for path in [
+            "src/lib.rs",
+            "src/main.rs",
+            "src/bin/tool.rs",
+            "examples/example.rs",
+            "tests/integration.rs",
+            "benches/speed.rs",
+            "custom/lib.rs",
+            "custom/bin.rs",
+        ] {
+            std::fs::write(package_root.join(path), "fn main() {}\n").expect("write entrypoint");
+        }
+
+        let entrypoints = cargo_package_source_entrypoints(&package_root);
+
+        assert_eq!(
+            entrypoints,
+            vec![
+                PathBuf::from("custom/bin.rs"),
+                PathBuf::from("custom/lib.rs")
+            ]
+        );
+    }
+
+    #[test]
+    fn test_dependency_preflight_blocks_missing_source_entrypoint() {
+        let _guard = test_guard!();
+        let worker = make_test_worker_config("worker-missing-source");
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let package_root = temp_dir.path().join("member");
+        std::fs::create_dir_all(package_root.join("src")).expect("create src");
+        std::fs::write(
+            package_root.join("Cargo.toml"),
+            r#"[package]
+name = "member"
+version = "0.1.0"
+edition = "2024"
+"#,
+        )
+        .expect("write manifest");
+        std::fs::write(package_root.join("src/lib.rs"), "pub fn member() {}\n").expect("write lib");
+        let entry = SyncClosurePlanEntry {
+            local_root: package_root,
+            remote_root: "/data/projects/app/crates/member".to_string(),
+            project_id: "member".to_string(),
+            root_hash: "member-hash".to_string(),
+            is_primary: false,
+            mode: SyncClosureMode::Full,
+        };
+        let outcomes = vec![(entry, SyncRootOutcome::Synced)];
+        let present = std::collections::BTreeSet::from([String::from(
+            "/data/projects/app/crates/member/Cargo.toml",
+        )]);
+        let missing = std::collections::BTreeSet::from([String::from(
+            "/data/projects/app/crates/member/src/lib.rs",
+        )]);
+
+        let report =
+            build_dependency_preflight_report(&worker, &outcomes, &present, &missing, None);
+
+        assert!(
+            !report.verified,
+            "a synced root with a missing package source entrypoint must not reach Cargo"
+        );
+        assert_eq!(report.reason_code, Some(DEPENDENCY_PREFLIGHT_CODE_MISSING));
+        assert!(report.evidence.iter().any(|item| {
+            item.required_kind == "source_entrypoint"
+                && item.required_path == "/data/projects/app/crates/member/src/lib.rs"
+                && item.status == DependencyPreflightStatus::Missing
+        }));
     }
 
     #[tokio::test]
