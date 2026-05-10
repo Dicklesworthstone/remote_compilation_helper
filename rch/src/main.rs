@@ -502,7 +502,7 @@ CHECKS PERFORMED:
         reliability: bool,
 
         /// Include schema compatibility checks in reliability mode
-        #[arg(long)]
+        #[arg(long, requires = "reliability")]
         check_schemas: bool,
     },
 
@@ -2880,20 +2880,19 @@ async fn handle_web(port: u16, no_open: bool, prod: bool, ctx: &OutputContext) -
         .status();
 
     let port_str = port.to_string();
-    let (cmd_name, cmd_args): (&str, Vec<&str>) = if bun_check.is_ok() {
-        if prod {
-            ("bun", vec!["run", "start", "--", "-p", &port_str])
-        } else {
-            ("bun", vec!["run", "dev", "--", "-p", &port_str])
-        }
+    let use_bun = bun_check.is_ok();
+    let mut server_command = if use_bun {
+        Command::new("bun")
     } else {
         // Fall back to npm
-        if prod {
-            ("npm", vec!["run", "start", "--", "-p", &port_str])
-        } else {
-            ("npm", vec!["run", "dev", "--", "-p", &port_str])
-        }
+        Command::new("npm")
     };
+    let cmd_name = if use_bun { "bun" } else { "npm" };
+    if prod {
+        server_command.args(["run", "start", "--", "-p", &port_str]);
+    } else {
+        server_command.args(["run", "dev", "--", "-p", &port_str]);
+    }
 
     let url = format!("http://localhost:{}", port);
     ctx.info(&format!("Dashboard available at: {}", url));
@@ -2912,8 +2911,7 @@ async fn handle_web(port: u16, no_open: bool, prod: bool, ctx: &OutputContext) -
     ctx.info("Press Ctrl+C to stop the server");
 
     // Run the web server
-    let status = Command::new(cmd_name)
-        .args(&cmd_args)
+    let status = server_command
         .current_dir(&web_dir)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -3905,6 +3903,20 @@ mod tests {
                 assert!(check_schemas);
             }
             _ => panic!("Expected doctor command"),
+        }
+    }
+
+    #[test]
+    fn cli_rejects_doctor_schema_check_without_reliability() {
+        let _guard = test_guard!();
+        let result = Cli::try_parse_from(["rch", "doctor", "--check-schemas"]);
+
+        assert!(
+            result.is_err(),
+            "--check-schemas only has an effect in reliability mode"
+        );
+        if let Err(err) = result {
+            assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
         }
     }
 
