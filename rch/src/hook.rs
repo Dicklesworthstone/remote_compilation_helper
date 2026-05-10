@@ -4197,6 +4197,7 @@ const DEPENDENCY_PREFLIGHT_REMEDIATION_UNKNOWN: &str =
     "Dependency verification could not determine remote state; inspect sync/SSH logs and retry.";
 const DEPENDENCY_PREFLIGHT_REMEDIATION_POLICY: &str = "Path dependency topology policy failed; move dependencies under /data/projects (or /dp) and retry.";
 const DEPENDENCY_PREFLIGHT_REMEDIATION_TIMEOUT: &str = "Dependency planner timed out; rerun after system load decreases or investigate cargo metadata latency.";
+const DEPENDENCY_PREFLIGHT_PROBE_BATCH_SIZE: usize = 128;
 const WORKSPACE_METADATA_SYNC_PATTERNS: &[&str] = &[
     "Cargo.toml",
     "Cargo.lock",
@@ -4523,6 +4524,7 @@ fn build_dependency_preflight_report(
     probe_failure: Option<&str>,
 ) -> DependencyPreflightReport {
     let mut evidence = Vec::new();
+    let mut unknown_probe_samples = std::collections::BTreeSet::<(String, &'static str)>::new();
 
     for (entry, outcome) in root_outcomes {
         for check in dependency_preflight_checks_for_entry(entry) {
@@ -4552,7 +4554,15 @@ fn build_dependency_preflight_report(
                         )
                     } else {
                         let detail = probe_failure
-                            .map(|failure| format!("dependency probe unavailable: {}", failure))
+                            .map(|failure| {
+                                format!(
+                                    "dependency probe unavailable for {} under {}; sample required_path={}; additional unreported paths for this root/kind share this failure; {}",
+                                    check.required_kind,
+                                    check.root,
+                                    check.required_path,
+                                    failure
+                                )
+                            })
                             .unwrap_or_else(|| {
                                 format!(
                                     "probe output omitted status for synced required path: {}",
@@ -4583,6 +4593,14 @@ fn build_dependency_preflight_report(
                     ),
                 ),
             };
+
+            if probe_failure.is_some()
+                && status == DependencyPreflightStatus::Unknown
+                && matches!(outcome, SyncRootOutcome::Synced)
+                && !unknown_probe_samples.insert((check.root.clone(), check.required_kind))
+            {
+                continue;
+            }
 
             evidence.push(DependencyPreflightEvidence {
                 root: check.root,
@@ -4831,15 +4849,16 @@ async fn verify_remote_dependency_manifests(
     let mut missing_paths = std::collections::BTreeSet::new();
     let mut probe_failure: Option<String> = None;
 
-    if let Some(verify_cmd) = build_remote_dependency_preflight_command(&synced_checks) {
+    for verify_cmd in build_remote_dependency_preflight_commands(&synced_checks) {
         match run_worker_ssh_command(worker, &verify_cmd, Duration::from_secs(20)).await {
             Ok(output) => {
                 let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
                 let (present, missing) = parse_dependency_preflight_probe_output(&stdout);
-                present_paths = present;
-                missing_paths = missing;
-                if !output.status.success() && missing_paths.is_empty() {
+                let batch_had_missing = !missing.is_empty();
+                present_paths.extend(present);
+                missing_paths.extend(missing);
+                if !output.status.success() && !batch_had_missing {
                     probe_failure = Some(format!(
                         "probe exited with status {:?}; stdout='{}'; stderr='{}'",
                         output.status.code(),
@@ -4851,6 +4870,9 @@ async fn verify_remote_dependency_manifests(
             Err(err) => {
                 probe_failure = Some(err.to_string());
             }
+        }
+        if probe_failure.is_some() {
+            break;
         }
     }
 
@@ -4903,17 +4925,21 @@ fn build_remote_dependency_preflight_command(
         .iter()
         .map(|check| {
             let escaped = shell_escape::escape(check.required_path.clone().into());
-            format!(
-                "required={path}; if [ -f \"$required\" ]; then printf 'RCH_DEP_PRESENT:%s\\n' \"$required\"; else printf 'RCH_DEP_MISSING:%s\\n' \"$required\"; missing=1; fi",
-                path = escaped
-            )
+            escaped.to_string()
         })
         .collect::<Vec<_>>()
-        .join("; ");
+        .join(" ");
 
     Some(format!(
-        "missing=0; {commands}; if [ \"$missing\" -ne 0 ]; then exit 43; fi; echo RCH_REMOTE_DEPENDENCIES_OK"
+        "missing=0; for required in {commands}; do if [ -f \"$required\" ]; then printf 'RCH_DEP_PRESENT:%s\\n' \"$required\"; else printf 'RCH_DEP_MISSING:%s\\n' \"$required\"; missing=1; fi; done; if [ \"$missing\" -ne 0 ]; then exit 43; fi; echo RCH_REMOTE_DEPENDENCIES_OK"
     ))
+}
+
+fn build_remote_dependency_preflight_commands(checks: &[DependencyPreflightCheck]) -> Vec<String> {
+    checks
+        .chunks(DEPENDENCY_PREFLIGHT_PROBE_BATCH_SIZE)
+        .filter_map(build_remote_dependency_preflight_command)
+        .collect()
 }
 
 /// Result of remote compilation execution.
@@ -9213,8 +9239,8 @@ The file `x11.pc` needs to be installed and the PKG_CONFIG_PATH environment vari
             .expect("command should be constructed");
 
         assert!(
-            command.contains("fi; required="),
-            "generated command must separate consecutive if/fi checks with ';'"
+            command.contains("for required in "),
+            "generated command must batch paths through one bounded shell loop"
         );
         assert!(
             !command.contains("fi if ["),
@@ -9228,6 +9254,31 @@ The file `x11.pc` needs to be installed and the PKG_CONFIG_PATH environment vari
             command.contains("RCH_DEP_MISSING:"),
             "generated command must emit structured missing marker"
         );
+    }
+
+    #[test]
+    fn test_build_remote_dependency_preflight_commands_batches_large_workspaces() {
+        let _guard = test_guard!();
+        let checks = (0..=DEPENDENCY_PREFLIGHT_PROBE_BATCH_SIZE)
+            .map(|idx| DependencyPreflightCheck {
+                root: "/data/projects/big".to_string(),
+                manifest: "/data/projects/big/Cargo.toml".to_string(),
+                required_path: format!("/data/projects/big/tests/case_{idx}.rs"),
+                required_kind: "source_entrypoint",
+                is_primary: true,
+            })
+            .collect::<Vec<_>>();
+
+        let commands = build_remote_dependency_preflight_commands(&checks);
+
+        assert_eq!(
+            commands.len(),
+            2,
+            "one more than the batch size must be split into two SSH commands"
+        );
+        assert!(commands[0].contains("/data/projects/big/tests/case_127.rs"));
+        assert!(!commands[0].contains("/data/projects/big/tests/case_128.rs"));
+        assert!(commands[1].contains("/data/projects/big/tests/case_128.rs"));
     }
 
     #[test]
@@ -9796,6 +9847,79 @@ edition = "2024"
                 && item.required_path == "/data/projects/app/crates/member/src/lib.rs"
                 && item.status == DependencyPreflightStatus::Missing
         }));
+    }
+
+    #[test]
+    fn test_dependency_preflight_probe_failure_compacts_unknown_source_entrypoints() {
+        let _guard = test_guard!();
+        let worker = make_test_worker_config("worker-probe-reset");
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let package_root = temp_dir.path().join("large-member");
+        std::fs::create_dir_all(package_root.join("src")).expect("create src");
+        std::fs::create_dir_all(package_root.join("tests")).expect("create tests");
+        std::fs::write(
+            package_root.join("Cargo.toml"),
+            r#"[package]
+name = "large-member"
+version = "0.1.0"
+edition = "2024"
+"#,
+        )
+        .expect("write manifest");
+        std::fs::write(package_root.join("src/lib.rs"), "pub fn member() {}\n").expect("write lib");
+        for idx in 0..150 {
+            std::fs::write(
+                package_root.join("tests").join(format!("case_{idx}.rs")),
+                "#[test]\nfn case() {}\n",
+            )
+            .expect("write test entrypoint");
+        }
+        let entry = SyncClosurePlanEntry {
+            local_root: package_root,
+            remote_root: "/data/projects/app/crates/large-member".to_string(),
+            project_id: "large-member".to_string(),
+            root_hash: "large-member-hash".to_string(),
+            is_primary: false,
+            mode: SyncClosureMode::Full,
+        };
+        let outcomes = vec![(entry, SyncRootOutcome::Synced)];
+        let present = std::collections::BTreeSet::new();
+        let missing = std::collections::BTreeSet::new();
+
+        let report = build_dependency_preflight_report(
+            &worker,
+            &outcomes,
+            &present,
+            &missing,
+            Some("probe exited with status Some(255); connection reset"),
+        );
+
+        assert!(!report.verified);
+        assert_eq!(report.reason_code, Some(DEPENDENCY_PREFLIGHT_CODE_UNKNOWN));
+        let unknown_source_entrypoints = report
+            .evidence
+            .iter()
+            .filter(|item| {
+                item.status == DependencyPreflightStatus::Unknown
+                    && item.required_kind == "source_entrypoint"
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            unknown_source_entrypoints.len(),
+            1,
+            "transport failures should keep one sample per root/kind instead of duplicating every source entrypoint"
+        );
+        assert!(
+            unknown_source_entrypoints[0]
+                .detail
+                .contains("additional unreported paths"),
+            "unknown sample should explain why the report is compacted"
+        );
+        assert!(
+            report.evidence.len() < 10,
+            "large all-unknown reports should be compact, got {} evidence rows",
+            report.evidence.len()
+        );
     }
 
     #[tokio::test]
