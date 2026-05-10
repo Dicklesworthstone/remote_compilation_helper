@@ -383,6 +383,53 @@ impl ReliabilityScopeSet {
     pub fn as_strings(&self) -> Vec<String> {
         self.0.iter().map(|s| s.as_str().to_string()).collect()
     }
+
+    fn needs_worker_config(&self) -> bool {
+        self.matches(ReliabilityScope::Topology)
+    }
+
+    fn needs_daemon_status(&self) -> bool {
+        [
+            ReliabilityScope::Topology,
+            ReliabilityScope::Pressure,
+            ReliabilityScope::Triage,
+        ]
+        .into_iter()
+        .any(|scope| self.matches(scope))
+    }
+
+    fn needs_repo_convergence_status(&self) -> bool {
+        self.matches(ReliabilityScope::Convergence)
+    }
+
+    fn needs_rollout_config(&self) -> bool {
+        self.matches(ReliabilityScope::Rollout)
+    }
+
+    fn runs_schema_probe(&self, check_schemas: bool) -> bool {
+        self.0.contains(&ReliabilityScope::Schema)
+            || (check_schemas && self.matches(ReliabilityScope::Schema))
+    }
+
+    fn probe_names_to_run(&self, check_schemas: bool) -> Vec<&'static str> {
+        let mut names = Vec::new();
+        for (scope, name) in [
+            (ReliabilityScope::Topology, "topology"),
+            (ReliabilityScope::Convergence, "convergence"),
+            (ReliabilityScope::Pressure, "pressure"),
+            (ReliabilityScope::Triage, "triage"),
+            (ReliabilityScope::Helpers, "helpers"),
+            (ReliabilityScope::Rollout, "rollout"),
+        ] {
+            if self.matches(scope) {
+                names.push(name);
+            }
+        }
+        if self.runs_schema_probe(check_schemas) {
+            names.push("schema");
+        }
+        names
+    }
 }
 
 impl std::str::FromStr for ReliabilityScopeSet {
@@ -679,48 +726,44 @@ pub async fn run_doctor(ctx: &OutputContext, options: DoctorOptions) -> Result<(
 }
 
 async fn run_reliability_doctor(ctx: &OutputContext, options: &DoctorOptions) -> Result<()> {
-    // Load the RchConfig exactly once per doctor invocation. Every probe
-    // borrows the same snapshot, so:
-    //   1. We pay the TOML parse cost ONCE (was N times — see t10).
-    //   2. Every probe sees a consistent view even if the config file is
-    //      rewritten mid-doctor (was: probe N+1 could see new bytes that
-    //      contradict probe N).
-    let config_result = crate::config::load_config();
-    let config_load: Result<&rch_common::RchConfig, String> = match &config_result {
-        Ok(c) => Ok(c),
-        Err(e) => Err(e.to_string()),
-    };
-    tracing::debug!(
-        target: "rch::doctor::config_loads",
-        loaded = config_load.is_ok(),
-        "doctor.config.load",
-    );
-
-    let worker_config = load_workers_from_config();
-    let (workers, worker_config_error) = match worker_config {
-        Ok(workers) => (Some(workers), None),
-        Err(err) => (None, Some(err.to_string())),
-    };
-
-    let daemon_status = query_daemon_full_status().await.ok();
-    let convergence_status = query_repo_convergence_status().await.ok();
-
     // Probe gating per --scope (t01). Each branch runs only when the
     // operator-supplied scope set matches. Default `[All]` runs everything.
     let scope = &options.scope;
-    let probes_to_run: Vec<&str> = [
-        (ReliabilityScope::Topology, "topology"),
-        (ReliabilityScope::Convergence, "convergence"),
-        (ReliabilityScope::Pressure, "pressure"),
-        (ReliabilityScope::Triage, "triage"),
-        (ReliabilityScope::Helpers, "helpers"),
-        (ReliabilityScope::Rollout, "rollout"),
-        (ReliabilityScope::Schema, "schema"),
-    ]
-    .iter()
-    .filter(|(s, _)| scope.matches(*s))
-    .map(|(_, name)| *name)
-    .collect();
+
+    // Keep scoped runs honest: do not pay for daemon/repo/config prefetches
+    // that no selected probe can consume.
+    let config_result = if scope.needs_rollout_config() {
+        Some(crate::config::load_config())
+    } else {
+        None
+    };
+    tracing::debug!(
+        target: "rch::doctor::config_loads",
+        loaded = matches!(config_result.as_ref(), Some(Ok(_))),
+        skipped = !scope.needs_rollout_config(),
+        "doctor.config.load",
+    );
+
+    let (workers, worker_config_error) = if scope.needs_worker_config() {
+        match load_workers_from_config() {
+            Ok(workers) => (Some(workers), None),
+            Err(err) => (None, Some(err.to_string())),
+        }
+    } else {
+        (None, None)
+    };
+
+    let daemon_status = if scope.needs_daemon_status() {
+        query_daemon_full_status().await.ok()
+    } else {
+        None
+    };
+    let convergence_status = if scope.needs_repo_convergence_status() {
+        query_repo_convergence_status().await.ok()
+    } else {
+        None
+    };
+    let probes_to_run = scope.probe_names_to_run(options.check_schemas);
     tracing::info!(
         target: "rch::doctor::scope",
         scope = ?scope.as_strings(),
@@ -752,11 +795,16 @@ async fn run_reliability_doctor(ctx: &OutputContext, options: &DoctorOptions) ->
         diagnostics.extend(reliability_helper_compatibility_diagnostics());
     }
     if scope.matches(ReliabilityScope::Rollout) {
+        let config_load: Result<&rch_common::RchConfig, String> = match config_result.as_ref() {
+            Some(Ok(config)) => Ok(config),
+            Some(Err(error)) => Err(error.to_string()),
+            None => Err("config load skipped unexpectedly".to_string()),
+        };
         diagnostics.extend(reliability_rollout_posture_diagnostics(
             config_load.as_ref().map(|c| *c).map_err(|e| e.as_str()),
         ));
     }
-    if scope.matches(ReliabilityScope::Schema) && options.check_schemas {
+    if scope.runs_schema_probe(options.check_schemas) {
         diagnostics.extend(reliability_schema_compatibility_diagnostics());
     }
 
@@ -4968,5 +5016,82 @@ exit 0\n"
         );
         // data.scope is always an array (even single-element).
         assert_eq!(response.scope, vec!["all"]);
+    }
+
+    #[test]
+    fn test_scope_prefetch_dependencies_are_precise() {
+        let all = ReliabilityScopeSet::default();
+        assert!(all.needs_worker_config());
+        assert!(all.needs_daemon_status());
+        assert!(all.needs_repo_convergence_status());
+        assert!(all.needs_rollout_config());
+
+        let topology: ReliabilityScopeSet = "topology".parse().unwrap();
+        assert!(topology.needs_worker_config());
+        assert!(topology.needs_daemon_status());
+        assert!(!topology.needs_repo_convergence_status());
+        assert!(!topology.needs_rollout_config());
+
+        let pressure: ReliabilityScopeSet = "pressure".parse().unwrap();
+        assert!(!pressure.needs_worker_config());
+        assert!(pressure.needs_daemon_status());
+        assert!(!pressure.needs_repo_convergence_status());
+        assert!(!pressure.needs_rollout_config());
+
+        let convergence: ReliabilityScopeSet = "convergence".parse().unwrap();
+        assert!(!convergence.needs_worker_config());
+        assert!(!convergence.needs_daemon_status());
+        assert!(convergence.needs_repo_convergence_status());
+        assert!(!convergence.needs_rollout_config());
+
+        let rollout: ReliabilityScopeSet = "rollout".parse().unwrap();
+        assert!(!rollout.needs_worker_config());
+        assert!(!rollout.needs_daemon_status());
+        assert!(!rollout.needs_repo_convergence_status());
+        assert!(rollout.needs_rollout_config());
+
+        let local_only: ReliabilityScopeSet = "helpers,schema".parse().unwrap();
+        assert!(!local_only.needs_worker_config());
+        assert!(!local_only.needs_daemon_status());
+        assert!(!local_only.needs_repo_convergence_status());
+        assert!(!local_only.needs_rollout_config());
+    }
+
+    #[test]
+    fn test_scope_probe_names_honor_schema_gate() {
+        let all = ReliabilityScopeSet::default();
+        assert_eq!(
+            all.probe_names_to_run(false),
+            vec![
+                "topology",
+                "convergence",
+                "pressure",
+                "triage",
+                "helpers",
+                "rollout"
+            ]
+        );
+        assert_eq!(
+            all.probe_names_to_run(true),
+            vec![
+                "topology",
+                "convergence",
+                "pressure",
+                "triage",
+                "helpers",
+                "rollout",
+                "schema"
+            ]
+        );
+
+        let schema_only: ReliabilityScopeSet = "schema".parse().unwrap();
+        assert_eq!(schema_only.probe_names_to_run(false), vec!["schema"]);
+        assert_eq!(schema_only.probe_names_to_run(true), vec!["schema"]);
+
+        let helpers_schema: ReliabilityScopeSet = "helpers,schema".parse().unwrap();
+        assert_eq!(
+            helpers_schema.probe_names_to_run(false),
+            vec!["helpers", "schema"]
+        );
     }
 }

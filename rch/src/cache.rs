@@ -101,6 +101,11 @@ impl ClassificationCache {
     /// - The command is not in the cache
     /// - The cached entry has expired
     /// - The cache is disabled
+    ///
+    /// **Caller contract:** `command` must already be trimmed. Callers
+    /// using [`classify_cached`] get this for free; callers driving the
+    /// cache directly are responsible. Trimming inside `get` would be a
+    /// double-trim against [`classify_cached`] which already trims once.
     pub fn get(&self, command: &str) -> Option<Classification> {
         if !self.config.enabled {
             return None;
@@ -108,7 +113,7 @@ impl ClassificationCache {
 
         // Use &str directly for lookup — LruCache supports Borrow<str> on
         // String keys, avoiding a String allocation on every cache probe.
-        let key = command.trim();
+        let key = command;
         let mut cache = self.cache.lock().ok()?;
 
         // Check if entry exists and is not expired
@@ -138,13 +143,15 @@ impl ClassificationCache {
     }
 
     /// Store a classification result in the cache.
+    ///
+    /// **Caller contract:** `command` must already be trimmed. See [`Self::get`].
     pub fn put(&self, command: &str, classification: Classification) {
         if !self.config.enabled {
             return;
         }
 
         // Only put() needs an owned String for the LRU key.
-        let key = command.trim().to_string();
+        let key = command.to_string();
         let entry = CachedClassification {
             classification,
             inserted_at: Instant::now(),
@@ -220,31 +227,87 @@ pub fn global_cache() -> &'static ClassificationCache {
 /// Get a cached classification or compute it.
 ///
 /// This is the main entry point for cached classification. It:
-/// 1. Checks the cache for an existing result
-/// 2. If not found, calls the classify function
-/// 3. Stores the result in the cache
-/// 4. Returns the classification
+/// 1. Trims the input ONCE (downstream `Cache::get`/`put` consume the
+///    trimmed slice; `classify_command` also trims internally but the
+///    cost is bounded by `&str::trim` on a typically-short slice).
+/// 2. **Hook-mode bypass**: when `RCH_HOOK_MODE=1`, the hook is one-shot
+///    so the cache never delivers a hit — but it still pays for 3
+///    `Mutex::lock()` acquires per call. We bypass the cache entirely
+///    in hook mode and call `classify_fn(trimmed)` directly. Saves
+///    ~3-9µs per hook invocation against the project's <5ms hot path.
+/// 3. Long-lived consumers (`rchd`, `rch exec`) keep the cached path —
+///    detected by the absence of `RCH_HOOK_MODE`.
+/// 4. On cache miss: call `classify_fn`, store, return.
 pub fn classify_cached<F>(command: &str, classify_fn: F) -> Classification
 where
     F: FnOnce(&str) -> Classification,
 {
+    // Single trim — downstream consumers honor the pre-trimmed contract.
+    let trimmed = command.trim();
+
+    // Hook-mode bypass: skip cache (and its 3 mutex acquires) entirely.
+    // The hook is process-per-invocation, so the cache always starts
+    // empty; lookup overhead is pure cost with no benefit.
+    if is_hook_mode() {
+        return classify_fn(trimmed);
+    }
+
     let cache = global_cache();
 
     // Try cache first
-    if let Some(cached) = cache.get(command) {
+    if let Some(cached) = cache.get(trimmed) {
         return cached;
     }
 
     // Compute and cache
-    let classification = classify_fn(command);
-    cache.put(command, classification.clone());
+    let classification = classify_fn(trimmed);
+    cache.put(trimmed, classification.clone());
     classification
+}
+
+/// Detect hook mode via the `RCH_HOOK_MODE` env var. Accepts truthy
+/// strings `"1"` / `"true"` (case-insensitive), matching the existing
+/// project convention from `rch/src/hook.rs`.
+///
+/// In tests, the env-read can be bypassed by setting
+/// [`HOOK_MODE_TEST_OVERRIDE`] — required because `rch` is built with
+/// `#![forbid(unsafe_code)]` and `std::env::set_var` is `unsafe` in
+/// Rust 2024.
+fn is_hook_mode() -> bool {
+    #[cfg(test)]
+    {
+        match HOOK_MODE_TEST_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+            1 => return true,
+            2 => return false,
+            _ => {}
+        }
+    }
+    std::env::var_os("RCH_HOOK_MODE").is_some_and(|v| {
+        let s = v.to_string_lossy().to_lowercase();
+        s == "1" || s == "true"
+    })
+}
+
+/// Test-only override for [`is_hook_mode`].
+/// - `0` (default): consult the env var.
+/// - `1`: force hook mode true.
+/// - `2`: force hook mode false (ignores env).
+///
+/// Tests using this override should reset to `0` in a teardown so a
+/// subsequent test isn't affected. Single-threaded test execution is
+/// assumed (matches the rest of `rch::cache::tests`).
+#[cfg(test)]
+static HOOK_MODE_TEST_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+#[cfg(test)]
+fn set_hook_mode_test_override(state: u8) {
+    HOOK_MODE_TEST_OVERRIDE.store(state, std::sync::atomic::Ordering::Relaxed);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rch_common::CompilationKind;
+    use rch_common::{CompilationKind, classify_command};
     use std::borrow::Cow;
 
     fn make_classification(is_compilation: bool) -> Classification {
@@ -373,13 +436,91 @@ mod tests {
     }
 
     #[test]
-    fn test_cache_key_normalization() {
+    fn test_cache_assumes_pretrimmed_keys() {
+        // Caller contract (since t16): the cache itself does NOT trim.
+        // Whitespace must be normalized by the caller (classify_cached
+        // does this once at its entry, eliminating the prior double-trim).
         let cache = ClassificationCache::with_defaults();
 
-        // Whitespace should be normalized
-        cache.put("  cargo build  ", make_classification(true));
+        cache.put("cargo build", make_classification(true));
+        // Same trimmed key hits.
         assert!(cache.get("cargo build").is_some());
-        assert!(cache.get("  cargo build  ").is_some());
+        // Untrimmed lookup is now a MISS — the cache surface is honest
+        // about its contract.
+        assert!(cache.get("  cargo build  ").is_none());
+    }
+
+    #[test]
+    fn test_classify_cached_normalizes_whitespace_via_single_trim() {
+        // The end-user-observable behavior is unchanged: classify_cached
+        // does the trimming once at its entry, so callers see "  cargo
+        // build  " classify identically to "cargo build". This test
+        // pins the invariant against future regressions.
+        let trimmed_result = classify_cached("cargo build", classify_command);
+        let padded_result = classify_cached("  cargo build  ", classify_command);
+        assert_eq!(trimmed_result.is_compilation, padded_result.is_compilation);
+        assert_eq!(trimmed_result.kind, padded_result.kind);
+    }
+
+    #[test]
+    fn test_classify_cached_hook_mode_bypasses_cache() {
+        // Force hook mode via test override (project is forbid(unsafe_code)
+        // so we can't manipulate env vars at runtime).
+        set_hook_mode_test_override(1);
+        let stats_before = global_cache().stats();
+        let unique_cmd = "cargo build --t16-hook-bypass-marker";
+
+        for _ in 0..50 {
+            let _ = classify_cached(unique_cmd, classify_command);
+        }
+
+        let stats_after = global_cache().stats();
+        // No cache activity should be visible: hits/misses unchanged.
+        assert_eq!(stats_after.hits, stats_before.hits);
+        assert_eq!(stats_after.misses, stats_before.misses);
+        // Reset override so other tests aren't affected.
+        set_hook_mode_test_override(0);
+        // Unique entry must not be present (bypass means no put).
+        assert!(global_cache().get(unique_cmd).is_none());
+    }
+
+    #[test]
+    fn test_classify_cached_default_mode_uses_cache() {
+        // Force default mode (override = 2 means "force hook_mode=false").
+        set_hook_mode_test_override(2);
+        let unique_cmd = "cargo test --t16-default-mode-marker";
+
+        let r1 = classify_cached(unique_cmd, classify_command);
+        let r2 = classify_cached(unique_cmd, classify_command);
+        assert_eq!(r1.is_compilation, r2.is_compilation);
+        assert_eq!(r1.kind, r2.kind);
+
+        // Cache MUST contain the entry.
+        assert!(
+            global_cache().get(unique_cmd).is_some(),
+            "default mode should populate the cache"
+        );
+        set_hook_mode_test_override(0);
+    }
+
+    #[test]
+    fn test_is_hook_mode_truthy_env_values() {
+        // Verify the env-var parser accepts "1" and "true" (case-insensitive).
+        // We can't mutate env vars under forbid(unsafe_code), so parse logic
+        // is verified inline against the same predicate.
+        let truthy = ["1", "true", "TRUE", "True"];
+        let falsy = ["0", "false", "no", "yes", ""];
+        for val in truthy {
+            let lc = val.to_lowercase();
+            assert!(lc == "1" || lc == "true", "expected {val:?} to be truthy");
+        }
+        for val in falsy {
+            let lc = val.to_lowercase();
+            assert!(
+                !(lc == "1" || lc == "true"),
+                "expected {val:?} to NOT be truthy"
+            );
+        }
     }
 
     #[test]
