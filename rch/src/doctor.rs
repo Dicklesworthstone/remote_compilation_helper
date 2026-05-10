@@ -1757,14 +1757,15 @@ impl QuickCheckResult {
     /// Check if the system is fully operational.
     ///
     /// **Contract:** returns `true` ONLY when daemon is running, hook is
-    /// installed, errors are empty, AND every configured worker has been
-    /// probed and reported healthy. `workers_healthy == None` (unknown)
-    /// is NEVER healthy — this is the default-to-degraded discipline
-    /// per t03's bead body.
+    /// installed, warnings/errors are empty, AND every configured worker
+    /// has been probed and reported healthy. `workers_healthy == None`
+    /// (unknown) is NEVER healthy — this is the default-to-degraded
+    /// discipline per t03's bead body.
     pub fn is_healthy(&self) -> bool {
         self.daemon_running
             && self.worker_count > 0
             && self.hook_installed
+            && self.warnings.is_empty()
             && self.errors.is_empty()
             && self.workers_healthy == Some(self.worker_count)
     }
@@ -3789,6 +3790,19 @@ mod tests {
             errors: vec![],
         };
         assert!(!no_hook.is_healthy());
+
+        let with_warning = QuickCheckResult {
+            daemon_running: true,
+            worker_count: 1,
+            workers_healthy: Some(1),
+            hook_installed: true,
+            warnings: vec!["Worker health stale".to_string()],
+            errors: vec![],
+        };
+        assert!(
+            !with_warning.is_healthy(),
+            "warnings are issues and must not report full quick-check health"
+        );
     }
 
     #[test]
