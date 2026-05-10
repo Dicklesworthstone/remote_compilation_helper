@@ -154,6 +154,8 @@ pub struct DoctorOptions {
     /// `--lenient`: demote `Failing` to exit code 1 (log only, never block).
     /// JSON `data.summary.overall` is unaffected.
     pub lenient: bool,
+    /// `--scope=<list>`: subset of probes to run. Default = `[All]`.
+    pub scope: ReliabilityScopeSet,
 }
 
 // Live schema-version constants are sourced from the central
@@ -289,6 +291,133 @@ impl ReliabilityCategory {
     }
 }
 
+/// One scope bucket per reliability probe, plus an `All` sentinel that
+/// runs every probe (default behavior).
+///
+/// Each named variant maps to one of the `reliability_*_diagnostics`
+/// probes in `run_reliability_doctor`. Operators triaging a known
+/// symptom can pass `--scope=pressure` (or any subset, comma-separated)
+/// to skip the irrelevant probes — typical 7-probe sweep takes ~1.5s
+/// against an 8-worker fleet, scope=topology is ~50ms.
+///
+/// Naming uses the operator-facing labels per the bead: `convergence`
+/// (not `repo_presence`), `triage` (not `process_debt`), `helpers`
+/// (not `helper_compatibility`), `rollout` (not `rollout_posture`),
+/// `schema` (not `schema_compatibility`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReliabilityScope {
+    All,
+    Topology,
+    Convergence,
+    Pressure,
+    Triage,
+    Helpers,
+    Rollout,
+    Schema,
+}
+
+impl ReliabilityScope {
+    /// Operator-facing label (matches clap value names).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Topology => "topology",
+            Self::Convergence => "convergence",
+            Self::Pressure => "pressure",
+            Self::Triage => "triage",
+            Self::Helpers => "helpers",
+            Self::Rollout => "rollout",
+            Self::Schema => "schema",
+        }
+    }
+}
+
+impl std::str::FromStr for ReliabilityScope {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let trimmed = s.trim().to_ascii_lowercase();
+        match trimmed.as_str() {
+            "all" => Ok(Self::All),
+            "topology" => Ok(Self::Topology),
+            "convergence" => Ok(Self::Convergence),
+            "pressure" => Ok(Self::Pressure),
+            "triage" => Ok(Self::Triage),
+            "helpers" => Ok(Self::Helpers),
+            "rollout" => Ok(Self::Rollout),
+            "schema" => Ok(Self::Schema),
+            other => Err(format!(
+                "unknown scope value '{other}' (valid: all, topology, convergence, pressure, triage, helpers, rollout, schema)"
+            )),
+        }
+    }
+}
+
+/// Comma-separated set of scopes. Wraps `Vec<ReliabilityScope>` because
+/// clap's `value_parser` requires a single type for the field; the parser
+/// splits on `,`, deduplicates while preserving first-appearance order,
+/// and treats `all` as dominant (collapses any other entries to a
+/// 1-element `[All]` set with an INFO trace event noting redundancy).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReliabilityScopeSet(pub Vec<ReliabilityScope>);
+
+impl Default for ReliabilityScopeSet {
+    fn default() -> Self {
+        Self(vec![ReliabilityScope::All])
+    }
+}
+
+impl ReliabilityScopeSet {
+    /// Returns true if this set contains the `All` sentinel OR the
+    /// given scope explicitly. Used to gate each probe.
+    #[must_use]
+    pub fn matches(&self, scope: ReliabilityScope) -> bool {
+        self.0
+            .iter()
+            .any(|s| matches!(s, ReliabilityScope::All) || *s == scope)
+    }
+
+    /// Lowercase string form for `data.scope` JSON.
+    #[must_use]
+    pub fn as_strings(&self) -> Vec<String> {
+        self.0.iter().map(|s| s.as_str().to_string()).collect()
+    }
+}
+
+impl std::str::FromStr for ReliabilityScopeSet {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            return Err("scope list is empty (pass --scope=all or one of: topology, convergence, pressure, triage, helpers, rollout, schema)".to_string());
+        }
+        let mut out: Vec<ReliabilityScope> = Vec::new();
+        for segment in trimmed.split(',') {
+            let scope: ReliabilityScope = segment.parse()?;
+            if !out.contains(&scope) {
+                out.push(scope);
+            }
+        }
+        // `all` dominates: if mixed with other names, collapse to [All]
+        // and log the redundancy at INFO level.
+        if out.contains(&ReliabilityScope::All) && out.len() > 1 {
+            let redundant: Vec<String> = out
+                .iter()
+                .filter(|s| **s != ReliabilityScope::All)
+                .map(|s| s.as_str().to_string())
+                .collect();
+            tracing::info!(
+                target: "rch::doctor::scope",
+                redundant = ?redundant,
+                "doctor.scope.all_dominates_redundant",
+            );
+            out = vec![ReliabilityScope::All];
+        }
+        Ok(Self(out))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum ReliabilityDoctorMode {
@@ -347,6 +476,10 @@ struct ReliabilityRemediationStep {
 struct ReliabilityDoctorResponse {
     schema_version: String,
     mode: ReliabilityDoctorMode,
+    /// Scope set the operator requested (always present, single-element
+    /// `["all"]` by default). Agents inspect this field to confirm their
+    /// `--scope` arg was honored.
+    scope: Vec<String>,
     diagnostics: Vec<ReliabilityDiagnostic>,
     summary: ReliabilityDoctorSummary,
     remediation_plan: Vec<ReliabilityRemediationStep>,
@@ -572,22 +705,58 @@ async fn run_reliability_doctor(ctx: &OutputContext, options: &DoctorOptions) ->
     let daemon_status = query_daemon_full_status().await.ok();
     let convergence_status = query_repo_convergence_status().await.ok();
 
+    // Probe gating per --scope (t01). Each branch runs only when the
+    // operator-supplied scope set matches. Default `[All]` runs everything.
+    let scope = &options.scope;
+    let probes_to_run: Vec<&str> = [
+        (ReliabilityScope::Topology, "topology"),
+        (ReliabilityScope::Convergence, "convergence"),
+        (ReliabilityScope::Pressure, "pressure"),
+        (ReliabilityScope::Triage, "triage"),
+        (ReliabilityScope::Helpers, "helpers"),
+        (ReliabilityScope::Rollout, "rollout"),
+        (ReliabilityScope::Schema, "schema"),
+    ]
+    .iter()
+    .filter(|(s, _)| scope.matches(*s))
+    .map(|(_, name)| *name)
+    .collect();
+    tracing::info!(
+        target: "rch::doctor::scope",
+        scope = ?scope.as_strings(),
+        probes_to_run = ?probes_to_run,
+        probes_count = probes_to_run.len(),
+        "doctor.scope.applied",
+    );
+
     let mut diagnostics = Vec::new();
-    diagnostics.extend(reliability_topology_diagnostics(
-        workers.as_deref(),
-        daemon_status.as_ref(),
-        worker_config_error,
-    ));
-    diagnostics.extend(reliability_repo_diagnostics(convergence_status.as_ref()));
-    diagnostics.extend(reliability_disk_pressure_diagnostics(
-        daemon_status.as_ref(),
-    ));
-    diagnostics.extend(reliability_process_debt_diagnostics(daemon_status.as_ref()));
-    diagnostics.extend(reliability_helper_compatibility_diagnostics());
-    diagnostics.extend(reliability_rollout_posture_diagnostics(
-        config_load.as_ref().map(|c| *c).map_err(|e| e.as_str()),
-    ));
-    if options.check_schemas {
+    if scope.matches(ReliabilityScope::Topology) {
+        diagnostics.extend(reliability_topology_diagnostics(
+            workers.as_deref(),
+            daemon_status.as_ref(),
+            worker_config_error,
+        ));
+    }
+    if scope.matches(ReliabilityScope::Convergence) {
+        diagnostics.extend(reliability_repo_diagnostics(convergence_status.as_ref()));
+    }
+    if scope.matches(ReliabilityScope::Pressure) {
+        diagnostics.extend(reliability_disk_pressure_diagnostics(
+            daemon_status.as_ref(),
+        ));
+    }
+    if scope.matches(ReliabilityScope::Triage) {
+        diagnostics.extend(reliability_process_debt_diagnostics(daemon_status.as_ref()));
+    }
+    if scope.matches(ReliabilityScope::Helpers) {
+        diagnostics.extend(reliability_helper_compatibility_diagnostics());
+    }
+    if scope.matches(ReliabilityScope::Rollout) {
+        diagnostics.extend(reliability_rollout_posture_diagnostics(
+            config_load.as_ref().map(|c| *c).map_err(|e| e.as_str()),
+        ));
+    }
+    if scope.matches(ReliabilityScope::Schema) && options.check_schemas {
         diagnostics.extend(reliability_schema_compatibility_diagnostics());
     }
 
@@ -598,7 +767,7 @@ async fn run_reliability_doctor(ctx: &OutputContext, options: &DoctorOptions) ->
     } else {
         ReliabilityDoctorMode::Check
     };
-    let response = build_reliability_doctor_response(mode, diagnostics);
+    let response = build_reliability_doctor_response(mode, scope, diagnostics);
 
     if ctx.is_json() {
         let _ = ctx.json(&ApiResponse::ok("doctor reliability", &response));
@@ -1353,6 +1522,7 @@ fn schema_compatibility_diagnostic(
 
 fn build_reliability_doctor_response(
     mode: ReliabilityDoctorMode,
+    scope: &ReliabilityScopeSet,
     diagnostics: Vec<ReliabilityDiagnostic>,
 ) -> ReliabilityDoctorResponse {
     let mut categories = BTreeSet::new();
@@ -1384,6 +1554,7 @@ fn build_reliability_doctor_response(
     ReliabilityDoctorResponse {
         schema_version: RELIABILITY_DOCTOR_SCHEMA_VERSION.to_string(),
         mode,
+        scope: scope.as_strings(),
         diagnostics,
         summary,
         remediation_plan,
@@ -3918,6 +4089,7 @@ mod tests {
             verbose: false,
             strict: false,
             lenient: false,
+            scope: ReliabilityScopeSet::default(),
         };
         assert!(!opts_minimal.fix);
         assert!(!opts_minimal.dry_run);
@@ -3931,6 +4103,7 @@ mod tests {
             verbose: false,
             strict: false,
             lenient: false,
+            scope: ReliabilityScopeSet::default(),
         };
         assert!(opts_fix.fix);
 
@@ -3943,6 +4116,7 @@ mod tests {
             verbose: false,
             strict: false,
             lenient: false,
+            scope: ReliabilityScopeSet::default(),
         };
         assert!(opts_dry_run.fix);
         assert!(opts_dry_run.dry_run);
@@ -3956,6 +4130,7 @@ mod tests {
             verbose: true,
             strict: false,
             lenient: false,
+            scope: ReliabilityScopeSet::default(),
         };
         assert!(opts_verbose.verbose);
         // TEST PASS: DoctorOptions construction
@@ -4232,6 +4407,7 @@ mod tests {
             verbose: false,
             strict: false,
             lenient: false,
+            scope: ReliabilityScopeSet::default(),
         };
 
         let mut checks = Vec::new();
@@ -4269,6 +4445,7 @@ mod tests {
             verbose: false,
             strict: false,
             lenient: false,
+            scope: ReliabilityScopeSet::default(),
         };
 
         let mut checks = Vec::new();
@@ -4302,6 +4479,7 @@ mod tests {
             verbose: false,
             strict: false,
             lenient: false,
+            scope: ReliabilityScopeSet::default(),
         };
         let mut fixes_applied = Vec::new();
 
@@ -4649,7 +4827,11 @@ exit 0\n"
             make_diag(ReliabilitySeverity::Pass),
             make_diag(ReliabilitySeverity::Warning),
         ];
-        let response = build_reliability_doctor_response(ReliabilityDoctorMode::Check, diags);
+        let response = build_reliability_doctor_response(
+            ReliabilityDoctorMode::Check,
+            &ReliabilityScopeSet::default(),
+            diags,
+        );
         assert_eq!(response.summary.overall, ReliabilityVerdict::Degraded);
     }
 
@@ -4659,7 +4841,132 @@ exit 0\n"
             make_diag(ReliabilitySeverity::Pass),
             make_diag(ReliabilitySeverity::Critical),
         ];
-        let response = build_reliability_doctor_response(ReliabilityDoctorMode::Check, diags);
+        let response = build_reliability_doctor_response(
+            ReliabilityDoctorMode::Check,
+            &ReliabilityScopeSet::default(),
+            diags,
+        );
         assert_eq!(response.summary.overall, ReliabilityVerdict::Failing);
+    }
+
+    // ========================================================================
+    // Scope filter (t01) — parser, set semantics, gating, response wiring.
+    // ========================================================================
+
+    #[test]
+    fn test_scope_default_is_all() {
+        let s = ReliabilityScopeSet::default();
+        assert_eq!(s.0, vec![ReliabilityScope::All]);
+        assert!(s.matches(ReliabilityScope::Topology));
+        assert!(s.matches(ReliabilityScope::Pressure));
+        // matches() returns true for every named scope when All is present.
+        for v in [
+            ReliabilityScope::All,
+            ReliabilityScope::Topology,
+            ReliabilityScope::Convergence,
+            ReliabilityScope::Pressure,
+            ReliabilityScope::Triage,
+            ReliabilityScope::Helpers,
+            ReliabilityScope::Rollout,
+            ReliabilityScope::Schema,
+        ] {
+            assert!(s.matches(v));
+        }
+    }
+
+    #[test]
+    fn test_scope_parses_single_value() {
+        let s: ReliabilityScopeSet = "topology".parse().unwrap();
+        assert_eq!(s.0, vec![ReliabilityScope::Topology]);
+        assert!(s.matches(ReliabilityScope::Topology));
+        assert!(!s.matches(ReliabilityScope::Pressure));
+    }
+
+    #[test]
+    fn test_scope_parses_multi_value_csv() {
+        let s: ReliabilityScopeSet = "topology,pressure".parse().unwrap();
+        assert_eq!(
+            s.0,
+            vec![ReliabilityScope::Topology, ReliabilityScope::Pressure]
+        );
+        assert!(s.matches(ReliabilityScope::Topology));
+        assert!(s.matches(ReliabilityScope::Pressure));
+        assert!(!s.matches(ReliabilityScope::Helpers));
+    }
+
+    #[test]
+    fn test_scope_dedups_keeping_first_occurrence() {
+        let s: ReliabilityScopeSet = "topology,pressure,topology,pressure".parse().unwrap();
+        assert_eq!(
+            s.0,
+            vec![ReliabilityScope::Topology, ReliabilityScope::Pressure]
+        );
+    }
+
+    #[test]
+    fn test_scope_all_dominates_when_mixed() {
+        // `all,topology` collapses to `[All]` — operator gets the full sweep.
+        let s: ReliabilityScopeSet = "all,topology".parse().unwrap();
+        assert_eq!(s.0, vec![ReliabilityScope::All]);
+    }
+
+    #[test]
+    fn test_scope_empty_string_errors() {
+        let err = ""
+            .parse::<ReliabilityScopeSet>()
+            .expect_err("empty must err");
+        assert!(err.contains("scope list is empty"));
+    }
+
+    #[test]
+    fn test_scope_unknown_segment_errors_with_offender() {
+        let err = "topology,bogus"
+            .parse::<ReliabilityScopeSet>()
+            .expect_err("unknown segment must err");
+        assert!(
+            err.contains("bogus"),
+            "error should name the offender, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_scope_case_insensitive_segment_parse() {
+        let s: ReliabilityScopeSet = "Topology,PRESSURE".parse().unwrap();
+        assert_eq!(
+            s.0,
+            vec![ReliabilityScope::Topology, ReliabilityScope::Pressure]
+        );
+    }
+
+    #[test]
+    fn test_scope_whitespace_trimmed() {
+        let s: ReliabilityScopeSet = "  topology  ".parse().unwrap();
+        assert_eq!(s.0, vec![ReliabilityScope::Topology]);
+    }
+
+    #[test]
+    fn test_scope_as_strings_stable_order() {
+        let s = ReliabilityScopeSet(vec![ReliabilityScope::Pressure, ReliabilityScope::Topology]);
+        assert_eq!(s.as_strings(), vec!["pressure", "topology"]);
+    }
+
+    #[test]
+    fn test_scope_response_field_records_what_was_asked() {
+        let scope =
+            ReliabilityScopeSet(vec![ReliabilityScope::Topology, ReliabilityScope::Pressure]);
+        let response =
+            build_reliability_doctor_response(ReliabilityDoctorMode::Check, &scope, vec![]);
+        assert_eq!(response.scope, vec!["topology", "pressure"]);
+    }
+
+    #[test]
+    fn test_scope_response_default_is_all_array() {
+        let response = build_reliability_doctor_response(
+            ReliabilityDoctorMode::Check,
+            &ReliabilityScopeSet::default(),
+            vec![],
+        );
+        // data.scope is always an array (even single-element).
+        assert_eq!(response.scope, vec!["all"]);
     }
 }

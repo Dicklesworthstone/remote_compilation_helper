@@ -516,6 +516,18 @@ CHECKS PERFORMED:
         /// `--strict`. Only meaningful with `--reliability`.
         #[arg(long, requires = "reliability", conflicts_with = "strict")]
         lenient: bool,
+
+        /// Subset of probes to run, comma-separated. Default = `all`.
+        /// Valid values: `all`, `topology`, `convergence`, `pressure`,
+        /// `triage`, `helpers`, `rollout`, `schema`. Multi-scope:
+        /// `--scope topology,pressure`. Only meaningful with `--reliability`.
+        #[arg(
+            long,
+            requires = "reliability",
+            default_value = "all",
+            value_name = "SCOPES"
+        )]
+        scope: String,
     },
 
     /// Verify remote compilation by running a self-test
@@ -1604,6 +1616,7 @@ async fn main() -> Result<()> {
                 check_schemas,
                 strict,
                 lenient,
+                scope,
             } => {
                 handle_doctor(
                     fix,
@@ -1613,6 +1626,7 @@ async fn main() -> Result<()> {
                     check_schemas,
                     strict,
                     lenient,
+                    scope,
                     &ctx,
                 )
                 .await
@@ -2749,9 +2763,15 @@ async fn handle_doctor(
     check_schemas: bool,
     strict: bool,
     lenient: bool,
+    scope: String,
     ctx: &OutputContext,
 ) -> Result<()> {
-    use crate::doctor::DoctorOptions;
+    use crate::doctor::{DoctorOptions, ReliabilityScopeSet};
+    // Parse the scope arg (clap default = "all"). Invalid values produce
+    // a clear error via FromStr that's surfaced to the user.
+    let scope: ReliabilityScopeSet = scope
+        .parse()
+        .map_err(|e: String| anyhow::anyhow!("invalid --scope value: {e}"))?;
     let options = DoctorOptions {
         fix,
         dry_run,
@@ -2761,6 +2781,7 @@ async fn handle_doctor(
         verbose: ctx.is_verbose(),
         strict,
         lenient,
+        scope,
     };
     crate::doctor::run_doctor(ctx, options).await
 }
@@ -3817,6 +3838,7 @@ mod tests {
                 check_schemas,
                 strict,
                 lenient,
+                scope: _,
             }) => {
                 assert!(!fix);
                 assert!(!dry_run);
@@ -3843,6 +3865,7 @@ mod tests {
                 check_schemas,
                 strict,
                 lenient,
+                scope: _,
             }) => {
                 assert!(fix);
                 assert!(!dry_run);
@@ -3869,6 +3892,7 @@ mod tests {
                 check_schemas,
                 strict,
                 lenient,
+                scope: _,
             }) => {
                 assert!(!fix);
                 assert!(dry_run);
@@ -3895,6 +3919,7 @@ mod tests {
                 check_schemas,
                 strict,
                 lenient,
+                scope: _,
             }) => {
                 assert!(!fix);
                 assert!(!dry_run);
@@ -3921,6 +3946,7 @@ mod tests {
                 check_schemas,
                 strict,
                 lenient,
+                scope: _,
             }) => {
                 assert!(!fix);
                 assert!(!dry_run);
@@ -3948,6 +3974,7 @@ mod tests {
                 check_schemas,
                 strict,
                 lenient,
+                scope: _,
             }) => {
                 assert!(!fix);
                 assert!(!dry_run);
