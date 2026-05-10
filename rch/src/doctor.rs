@@ -20,7 +20,7 @@ use rch_common::ApiResponse;
 use rch_telemetry::TelemetryStorage;
 use serde::Serialize;
 use std::collections::BTreeSet;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -44,7 +44,8 @@ const MAX_CONFIG_FILE_BYTES: u64 = 16 * 1024 * 1024;
 /// but converts an oversize file into `io::Error::new(InvalidData, ...)`
 /// rather than blindly OOM-ing on `std::fs::read_to_string`.
 fn read_config_capped(path: &Path) -> std::io::Result<String> {
-    let metadata = std::fs::metadata(path)?;
+    let file = std::fs::File::open(path)?;
+    let metadata = file.metadata()?;
     if metadata.len() > MAX_CONFIG_FILE_BYTES {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -56,7 +57,30 @@ fn read_config_capped(path: &Path) -> std::io::Result<String> {
             ),
         ));
     }
-    std::fs::read_to_string(path)
+    read_config_capped_from_reader(
+        file,
+        MAX_CONFIG_FILE_BYTES,
+        &format!("config file {}", path.display()),
+    )
+}
+
+fn read_config_capped_from_reader<R: Read>(
+    reader: R,
+    max_bytes: u64,
+    source: &str,
+) -> std::io::Result<String> {
+    let mut limited = reader.take(max_bytes.saturating_add(1));
+    let mut bytes = Vec::new();
+    limited.read_to_end(&mut bytes)?;
+    let max_bytes_usize = usize::try_from(max_bytes).unwrap_or(usize::MAX);
+    if bytes.len() > max_bytes_usize {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{source} exceeds {max_bytes}-byte cap"),
+        ));
+    }
+    String::from_utf8(bytes)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))
 }
 
 // Type aliases for backward compatibility within this module
@@ -1575,18 +1599,37 @@ fn command_version(cmd: &str) -> Option<String> {
     use std::process::Stdio;
     use std::time::{Duration, Instant};
 
-    let (program, args): (&str, &[&str]) = match cmd {
-        "rsync" => ("rsync", &["--version"]),
-        "zstd" => ("zstd", &["--version"]),
-        "ssh" => ("ssh", &["-V"]),
-        "rustup" => ("rustup", &["--version"]),
-        "cargo" => ("cargo", &["--version"]),
+    let (program, mut command) = match cmd {
+        "rsync" => {
+            let mut command = Command::new("rsync");
+            command.arg("--version");
+            ("rsync", command)
+        }
+        "zstd" => {
+            let mut command = Command::new("zstd");
+            command.arg("--version");
+            ("zstd", command)
+        }
+        "ssh" => {
+            let mut command = Command::new("ssh");
+            command.arg("-V");
+            ("ssh", command)
+        }
+        "rustup" => {
+            let mut command = Command::new("rustup");
+            command.arg("--version");
+            ("rustup", command)
+        }
+        "cargo" => {
+            let mut command = Command::new("cargo");
+            command.arg("--version");
+            ("cargo", command)
+        }
         _ => return None,
     };
 
     let timeout = Duration::from_secs(5);
-    let mut child = Command::new(program)
-        .args(args)
+    let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -3010,6 +3053,31 @@ mod tests {
     use super::*;
     use serde_json::json;
     use tempfile::TempDir;
+
+    #[test]
+    fn test_read_config_capped_reader_rejects_bytes_past_cap() {
+        let err = read_config_capped_from_reader(
+            std::io::Cursor::new(b"abcd".to_vec()),
+            3,
+            "test config",
+        )
+        .expect_err("reader that yields more than the cap must be rejected");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("exceeds 3-byte cap"),
+            "unexpected error message: {err}"
+        );
+    }
+
+    #[test]
+    fn test_read_config_capped_reader_accepts_exact_cap() {
+        let content =
+            read_config_capped_from_reader(std::io::Cursor::new(b"abc".to_vec()), 3, "test config")
+                .expect("reader at the cap should be accepted");
+
+        assert_eq!(content, "abc");
+    }
 
     #[test]
     fn test_check_command_exists_which() {
