@@ -458,6 +458,23 @@ pub async fn run_doctor(ctx: &OutputContext, options: DoctorOptions) -> Result<(
 }
 
 async fn run_reliability_doctor(ctx: &OutputContext, options: &DoctorOptions) -> Result<()> {
+    // Load the RchConfig exactly once per doctor invocation. Every probe
+    // borrows the same snapshot, so:
+    //   1. We pay the TOML parse cost ONCE (was N times — see t10).
+    //   2. Every probe sees a consistent view even if the config file is
+    //      rewritten mid-doctor (was: probe N+1 could see new bytes that
+    //      contradict probe N).
+    let config_result = crate::config::load_config();
+    let config_load: Result<&rch_common::RchConfig, String> = match &config_result {
+        Ok(c) => Ok(c),
+        Err(e) => Err(e.to_string()),
+    };
+    tracing::debug!(
+        target: "rch::doctor::config_loads",
+        loaded = config_load.is_ok(),
+        "doctor.config.load",
+    );
+
     let worker_config = load_workers_from_config();
     let (workers, worker_config_error) = match worker_config {
         Ok(workers) => (Some(workers), None),
@@ -479,7 +496,9 @@ async fn run_reliability_doctor(ctx: &OutputContext, options: &DoctorOptions) ->
     ));
     diagnostics.extend(reliability_process_debt_diagnostics(daemon_status.as_ref()));
     diagnostics.extend(reliability_helper_compatibility_diagnostics());
-    diagnostics.extend(reliability_rollout_posture_diagnostics());
+    diagnostics.extend(reliability_rollout_posture_diagnostics(
+        config_load.as_ref().map(|c| *c).map_err(|e| e.as_str()),
+    ));
     if options.check_schemas {
         diagnostics.extend(reliability_schema_compatibility_diagnostics());
     }
@@ -1041,10 +1060,18 @@ fn reliability_helper_compatibility_diagnostics() -> Vec<ReliabilityDiagnostic> 
     .collect()
 }
 
-fn reliability_rollout_posture_diagnostics() -> Vec<ReliabilityDiagnostic> {
+/// Build rollout-posture diagnostics from a pre-loaded config snapshot.
+///
+/// Takes the result of a single `crate::config::load_config()` call shared
+/// across every probe in `run_reliability_doctor`, so the doctor pays the
+/// TOML-parse cost exactly once per invocation and every probe sees a
+/// consistent snapshot even if the config file is rewritten mid-run.
+fn reliability_rollout_posture_diagnostics(
+    config_load: Result<&rch_common::RchConfig, &str>,
+) -> Vec<ReliabilityDiagnostic> {
     let mut diagnostics = Vec::new();
 
-    match crate::config::load_config() {
+    match config_load {
         Ok(config) => {
             let mut hook_diag = if config.self_healing.hook_starts_daemon {
                 ReliabilityDiagnostic::new(
@@ -1106,7 +1133,7 @@ fn reliability_rollout_posture_diagnostics() -> Vec<ReliabilityDiagnostic> {
                 "Configuration could not be loaded; rollout posture is partial",
                 ReliabilityReasonCode::ConfigLoadFailed,
             )
-            .with_details(err.to_string())
+            .with_details(err)
             .with_remediation(
                 "rch config doctor --json",
                 "rch doctor --reliability --json",
@@ -4244,5 +4271,90 @@ exit 0\n"
         };
         assert!(!not_fixed.fix_applied);
         // TEST PASS: fix_applied and fix_message consistency
+    }
+
+    // ========================================================================
+    // Config-cache hoisting (t10) — verify the rollout-posture probe accepts
+    // a borrowed config and produces the same diagnostics regardless of how
+    // many times the caller invokes it.
+    // ========================================================================
+
+    #[test]
+    fn test_rollout_posture_takes_borrowed_config() {
+        // Borrowed-Ok path: probe consumes a shared snapshot.
+        let config = rch_common::RchConfig::default();
+        let diags = reliability_rollout_posture_diagnostics(Ok(&config));
+        // 5 always-on diagnostics: hook_starts_daemon, daemon_installs_hooks,
+        // status_surface, repo_convergence_gate, disk_pressure_gate.
+        assert!(
+            diags.len() >= 4,
+            "expected at least 4 diagnostics (got {}): {:?}",
+            diags.len(),
+            diags.iter().map(|d| &d.check_name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_rollout_posture_handles_borrowed_err() {
+        // Borrowed-Err path: probe surfaces a single ConfigLoadFailed
+        // diagnostic and continues with the rollout-surface checks.
+        let diags = reliability_rollout_posture_diagnostics(Err("synthetic toml parse failure"));
+        let warning_count = diags
+            .iter()
+            .filter(|d| {
+                matches!(d.severity, ReliabilitySeverity::Warning)
+                    && d.code == ReliabilityReasonCode::ConfigLoadFailed
+            })
+            .count();
+        assert_eq!(
+            warning_count,
+            1,
+            "expected exactly one ConfigLoadFailed diagnostic, got: {:?}",
+            diags
+                .iter()
+                .map(|d| (&d.check_name, &d.code))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_rollout_posture_idempotent_for_same_config() {
+        // Calling the probe twice with the same borrowed config must
+        // produce byte-identical diagnostics — confirms the function is
+        // pure with respect to its config input.
+        let config = rch_common::RchConfig::default();
+        let a = reliability_rollout_posture_diagnostics(Ok(&config));
+        let b = reliability_rollout_posture_diagnostics(Ok(&config));
+        assert_eq!(a.len(), b.len());
+        for (da, db) in a.iter().zip(b.iter()) {
+            assert_eq!(da.check_name, db.check_name);
+            assert_eq!(da.severity, db.severity);
+            assert_eq!(da.message, db.message);
+            assert_eq!(da.code, db.code);
+        }
+    }
+
+    #[test]
+    fn test_rollout_posture_two_configs_isolated() {
+        // Different config snapshots produce different diagnostics —
+        // confirms no shared mutable state between invocations.
+        let mut config_a = rch_common::RchConfig::default();
+        config_a.self_healing.hook_starts_daemon = true;
+        let mut config_b = rch_common::RchConfig::default();
+        config_b.self_healing.hook_starts_daemon = false;
+
+        let a = reliability_rollout_posture_diagnostics(Ok(&config_a));
+        let b = reliability_rollout_posture_diagnostics(Ok(&config_b));
+
+        let a_hook = a
+            .iter()
+            .find(|d| d.check_name == "hook_starts_daemon")
+            .expect("hook diag in a");
+        let b_hook = b
+            .iter()
+            .find(|d| d.check_name == "hook_starts_daemon")
+            .expect("hook diag in b");
+        assert_eq!(a_hook.code, ReliabilityReasonCode::HookAutoStartEnabled);
+        assert_eq!(b_hook.code, ReliabilityReasonCode::HookAutoStartDisabled);
     }
 }
