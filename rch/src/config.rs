@@ -39,8 +39,9 @@ pub fn config_dir() -> Option<PathBuf> {
 // Why this exists: the hook runs per-invocation and parses TOML every time.
 // On a slow disk under IO pressure the parse can blow the <5ms compilation-
 // decision budget (panic threshold 10ms). The cache stores a JSON serialization
-// of the merged `RchConfig` keyed by the source-file mtimes + an internal
-// schema version. Cache hit deserialize is ~10x faster than the TOML parse.
+// of the merged on-disk `RchConfig` keyed by the source-file mtimes + an
+// internal schema version. Cache hit deserialize is ~10x faster than the TOML
+// parse.
 //
 // We use `serde_json` (already a direct workspace dep) rather than `bincode`
 // to avoid pulling in a new dep — the perf delta vs bincode for ~4KB of config
@@ -51,6 +52,9 @@ pub fn config_dir() -> Option<PathBuf> {
 //   - CACHE_SCHEMA_VERSION bump (any change to RchConfig shape).
 //   - `RCH_DISABLE_CONFIG_CACHE=1` env var (testing / debugging).
 //   - Cache file unparseable / corrupt (fall through to TOML, rewrite cache).
+//
+// Runtime env and CLI overrides are intentionally applied after cache read.
+// They are not represented in the cache key and must never be memoized.
 
 /// Bumped manually whenever RchConfig (or any nested type) changes shape.
 /// Bumping invalidates every operator's cache on next run — they pay one
@@ -217,6 +221,10 @@ fn try_write_cache(config: &RchConfig) {
 
 /// Load configuration directly from TOML sources, bypassing the cache.
 /// Extracted so the cache layer can call back into it on miss.
+///
+/// This returns only the default + user/project TOML merge. Environment
+/// variables and CLI overrides are runtime inputs and are applied by
+/// `load_config` after cache lookup.
 fn load_config_uncached() -> Result<RchConfig> {
     // Start with defaults
     let mut config = RchConfig::default();
@@ -242,9 +250,6 @@ fn load_config_uncached() -> Result<RchConfig> {
         config = merge_config(config, project_config);
     }
 
-    // Apply environment variable overrides
-    config = apply_env_overrides(config);
-
     Ok(config)
 }
 
@@ -265,8 +270,9 @@ pub fn load_config() -> Result<RchConfig> {
         return Ok(config);
     }
 
-    // Cache fast-path. Skip when explicitly disabled via env var.
-    let mut config = if cache_is_disabled() {
+    // Cache fast-path for the on-disk merge. Skip when explicitly disabled
+    // via env var, but still apply all runtime env overrides below.
+    let config = if cache_is_disabled() {
         load_config_uncached()?
     } else if let Some(cached) = try_read_cache() {
         cached
@@ -275,6 +281,8 @@ pub fn load_config() -> Result<RchConfig> {
         try_write_cache(&parsed);
         parsed
     };
+
+    let mut config = apply_env_overrides(config);
 
     // br-4zf3p: CLI overrides for self-healing have highest priority
     // (CLI > env > config > defaults). Recorded by main.rs at startup.
@@ -4603,6 +4611,35 @@ confidence_threshold = 0.80
             bytes.len() < 256 * 1024,
             "default RchConfig should serialize to <256KB; got {} bytes",
             bytes.len()
+        );
+    }
+
+    #[test]
+    fn test_cached_config_payload_excludes_runtime_env_overrides() {
+        // The cache key tracks only source-file mtimes and schema version, so
+        // cached data must remain the on-disk/default merge. Runtime env vars
+        // are applied after cache lookup on every load.
+        let cached_base = RchConfig::default();
+        let payload = CachedConfig {
+            schema_version: CACHE_SCHEMA_VERSION,
+            source_mtimes: vec![],
+            config: cached_base.clone(),
+        };
+        let bytes = serde_json::to_vec(&payload).unwrap();
+        let back: CachedConfig = serde_json::from_slice(&bytes).unwrap();
+
+        let mut env_overrides = HashMap::new();
+        env_overrides.insert("RCH_LOG_LEVEL".to_string(), "error".to_string());
+        let mut runtime_config = back.config.clone();
+        super::apply_env_overrides_inner(&mut runtime_config, None, Some(&env_overrides));
+
+        assert_eq!(
+            back.config.general.log_level, cached_base.general.log_level,
+            "cache payload must not bake runtime env overrides into the on-disk merge"
+        );
+        assert_eq!(
+            runtime_config.general.log_level, "error",
+            "runtime env override should still apply after cache lookup"
         );
     }
 }
