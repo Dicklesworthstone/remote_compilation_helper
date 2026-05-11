@@ -134,6 +134,13 @@ fn current_source_fingerprints() -> Vec<SourceFingerprint> {
         .collect()
 }
 
+fn stable_source_fingerprints(
+    before: Vec<SourceFingerprint>,
+    after: Vec<SourceFingerprint>,
+) -> Option<Vec<SourceFingerprint>> {
+    if before == after { Some(after) } else { None }
+}
+
 fn try_read_cache() -> Option<RchConfig> {
     let path = cache_file_path()?;
     let bytes = std::fs::read(&path).ok()?;
@@ -178,7 +185,7 @@ fn try_read_cache() -> Option<RchConfig> {
 /// Atomically write the cache via temp+rename so concurrent hooks
 /// never read a torn file. Best-effort: failures are logged and
 /// ignored (the cache is an optimization, never load-bearing).
-fn try_write_cache(config: &RchConfig) {
+fn try_write_cache(config: &RchConfig, source_fingerprints: Vec<SourceFingerprint>) {
     let Some(path) = cache_file_path() else {
         return;
     };
@@ -195,7 +202,7 @@ fn try_write_cache(config: &RchConfig) {
     }
     let payload = CachedConfig {
         schema_version: CACHE_SCHEMA_VERSION,
-        source_fingerprints: current_source_fingerprints(),
+        source_fingerprints,
         config: config.clone(),
     };
     let bytes = match serde_json::to_vec(&payload) {
@@ -296,8 +303,17 @@ pub fn load_config() -> Result<RchConfig> {
     } else if let Some(cached) = try_read_cache() {
         cached
     } else {
+        let before = current_source_fingerprints();
         let parsed = load_config_uncached()?;
-        try_write_cache(&parsed);
+        let after = current_source_fingerprints();
+        if let Some(source_fingerprints) = stable_source_fingerprints(before, after) {
+            try_write_cache(&parsed, source_fingerprints);
+        } else {
+            tracing::debug!(
+                target: "rch::hook::config_cache",
+                "config.cache.write_skipped_source_changed_during_parse",
+            );
+        }
         parsed
     };
 
@@ -4648,6 +4664,42 @@ confidence_threshold = 0.80
         assert_ne!(
             before, after,
             "cache source fingerprints must include subsecond mtime precision"
+        );
+    }
+
+    #[test]
+    fn test_stable_source_fingerprints_accepts_unchanged_sources() {
+        let before = vec![SourceFingerprint {
+            path: PathBuf::from("/x/config.toml"),
+            mtime_unix_nanos: 1_700_000_000_000_000_001,
+            len: 42,
+        }];
+        let after = before.clone();
+
+        assert_eq!(
+            super::stable_source_fingerprints(before, after.clone()),
+            Some(after),
+            "stable source metadata should be cacheable"
+        );
+    }
+
+    #[test]
+    fn test_stable_source_fingerprints_rejects_parse_window_changes() {
+        let path = PathBuf::from("/x/config.toml");
+        let before = vec![SourceFingerprint {
+            path: path.clone(),
+            mtime_unix_nanos: 1_700_000_000_000_000_001,
+            len: 42,
+        }];
+        let after = vec![SourceFingerprint {
+            path,
+            mtime_unix_nanos: 1_700_000_000_000_000_999,
+            len: 43,
+        }];
+
+        assert!(
+            super::stable_source_fingerprints(before, after).is_none(),
+            "source changes during parsing must skip cache writes"
         );
     }
 
