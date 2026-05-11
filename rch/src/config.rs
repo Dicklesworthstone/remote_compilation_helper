@@ -33,22 +33,21 @@ pub fn config_dir() -> Option<PathBuf> {
 }
 
 // ============================================================================
-// Cache (t15) — mtime-keyed binary cache of parsed RchConfig.
+// Cache (t15) — source-fingerprint-keyed binary cache of parsed RchConfig.
 // ============================================================================
 //
 // Why this exists: the hook runs per-invocation and parses TOML every time.
 // On a slow disk under IO pressure the parse can blow the <5ms compilation-
 // decision budget (panic threshold 10ms). The cache stores a JSON serialization
-// of the merged on-disk `RchConfig` keyed by the source-file mtimes + an
-// internal schema version. Cache hit deserialize is ~10x faster than the TOML
-// parse.
+// of the merged on-disk `RchConfig` keyed by source-file metadata + an internal
+// schema version. Cache hit deserialize is ~10x faster than the TOML parse.
 //
 // We use `serde_json` (already a direct workspace dep) rather than `bincode`
 // to avoid pulling in a new dep — the perf delta vs bincode for ~4KB of config
 // is negligible against the original TOML-parse cost.
 //
 // Invalidation:
-//   - Source-file mtime mismatch (config.toml / .rch/config.toml).
+//   - Source-file metadata mismatch (config.toml / .rch/config.toml).
 //   - CACHE_SCHEMA_VERSION bump (any change to RchConfig shape).
 //   - `RCH_DISABLE_CONFIG_CACHE=1` env var (testing / debugging).
 //   - Cache file unparseable / corrupt (fall through to TOML, rewrite cache).
@@ -60,15 +59,24 @@ pub fn config_dir() -> Option<PathBuf> {
 /// Bumping invalidates every operator's cache on next run — they pay one
 /// TOML parse, then the cache repopulates. Cheap insurance against silent
 /// deserialization drift.
-const CACHE_SCHEMA_VERSION: u32 = 1;
+const CACHE_SCHEMA_VERSION: u32 = 2;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SourceFingerprint {
+    path: PathBuf,
+    /// Nanoseconds since Unix epoch. Seconds-level mtimes are too coarse for
+    /// agents that rewrite config during tight fix/verify loops.
+    mtime_unix_nanos: u64,
+    len: u64,
+}
 
 #[derive(Serialize, Deserialize)]
 struct CachedConfig {
     schema_version: u32,
-    /// (path, mtime_unix_secs). Order is stable (user, then project).
-    /// Absent source files record `(path, 0)` so a later-appearing file
+    /// Source metadata in stable order (user, then project).
+    /// Absent source files record zero metadata so a later-appearing file
     /// invalidates the cache.
-    source_mtimes: Vec<(PathBuf, u64)>,
+    source_fingerprints: Vec<SourceFingerprint>,
     config: RchConfig,
 }
 
@@ -80,13 +88,27 @@ fn cache_file_path() -> Option<PathBuf> {
     cache_dir().map(|d| d.join("config.cache.json"))
 }
 
-fn file_mtime_secs(path: &Path) -> u64 {
-    std::fs::metadata(path)
-        .and_then(|m| m.modified())
+fn source_fingerprint(path: PathBuf) -> SourceFingerprint {
+    let Ok(metadata) = std::fs::metadata(&path) else {
+        return SourceFingerprint {
+            path,
+            mtime_unix_nanos: 0,
+            len: 0,
+        };
+    };
+
+    let mtime_unix_nanos = metadata
+        .modified()
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .and_then(|d| u64::try_from(d.as_nanos()).ok())
+        .unwrap_or(0);
+
+    SourceFingerprint {
+        path,
+        mtime_unix_nanos,
+        len: metadata.len(),
+    }
 }
 
 fn cache_is_disabled() -> bool {
@@ -94,8 +116,8 @@ fn cache_is_disabled() -> bool {
 }
 
 /// Resolve the user + project config paths in canonical order. Used both
-/// by the cache and by `load_config_uncached` so the mtime keys match the
-/// actual files read.
+/// by the cache and by `load_config_uncached` so the source fingerprints
+/// match the actual files read.
 fn resolved_source_paths() -> Vec<PathBuf> {
     let mut out = Vec::with_capacity(2);
     if let Some(dir) = config_dir() {
@@ -105,13 +127,10 @@ fn resolved_source_paths() -> Vec<PathBuf> {
     out
 }
 
-fn current_source_mtimes() -> Vec<(PathBuf, u64)> {
+fn current_source_fingerprints() -> Vec<SourceFingerprint> {
     resolved_source_paths()
         .into_iter()
-        .map(|p| {
-            let mtime = if p.exists() { file_mtime_secs(&p) } else { 0 };
-            (p, mtime)
-        })
+        .map(source_fingerprint)
         .collect()
 }
 
@@ -139,11 +158,11 @@ fn try_read_cache() -> Option<RchConfig> {
         );
         return None;
     }
-    let current = current_source_mtimes();
-    if cached.source_mtimes != current {
+    let current = current_source_fingerprints();
+    if cached.source_fingerprints != current {
         tracing::debug!(
             target: "rch::hook::config_cache",
-            "config.cache.miss_mtime_changed",
+            "config.cache.miss_source_changed",
         );
         return None;
     }
@@ -176,7 +195,7 @@ fn try_write_cache(config: &RchConfig) {
     }
     let payload = CachedConfig {
         schema_version: CACHE_SCHEMA_VERSION,
-        source_mtimes: current_source_mtimes(),
+        source_fingerprints: current_source_fingerprints(),
         config: config.clone(),
     };
     let bytes = match serde_json::to_vec(&payload) {
@@ -255,7 +274,7 @@ fn load_config_uncached() -> Result<RchConfig> {
 
 /// Load configuration from all sources.
 ///
-/// Performance (t15): a mtime+schema-keyed binary cache lives at
+/// Performance (t15): a source-fingerprint+schema-keyed binary cache lives at
 /// `~/.cache/rch/config.cache.json`. Cache hit on a typical config takes
 /// roughly 10x less than re-parsing TOML — important for the hook's
 /// <5ms hot-path budget.
@@ -4442,10 +4461,10 @@ confidence_threshold = 0.80
     }
 
     // ========================================================================
-    // t15 — Config cache (mtime + schema_version keyed binary cache).
+    // t15 — Config cache (source fingerprint + schema_version keyed binary cache).
     //
     // Tests exercise the cache primitives directly (try_read_cache,
-    // try_write_cache, current_source_mtimes) using a synthetic
+    // try_write_cache, current_source_fingerprints) using a synthetic
     // CachedConfig payload. They DON'T drive load_config() end-to-end
     // because that function consults config_dir() / ProjectDirs which
     // ignores isolation env vars in some test runners — making real
@@ -4454,7 +4473,7 @@ confidence_threshold = 0.80
     // path that calls into them.
     // ========================================================================
 
-    use super::{CACHE_SCHEMA_VERSION, CachedConfig};
+    use super::{CACHE_SCHEMA_VERSION, CachedConfig, SourceFingerprint};
 
     fn write_synthetic_cache(path: &Path, payload: &CachedConfig) {
         let bytes = serde_json::to_vec(payload).unwrap();
@@ -4471,16 +4490,24 @@ confidence_threshold = 0.80
         // serde will fail this test.
         let payload = CachedConfig {
             schema_version: CACHE_SCHEMA_VERSION,
-            source_mtimes: vec![
-                (PathBuf::from("/x/a.toml"), 1234),
-                (PathBuf::from("/x/b.toml"), 5678),
+            source_fingerprints: vec![
+                SourceFingerprint {
+                    path: PathBuf::from("/x/a.toml"),
+                    mtime_unix_nanos: 1_234,
+                    len: 10,
+                },
+                SourceFingerprint {
+                    path: PathBuf::from("/x/b.toml"),
+                    mtime_unix_nanos: 5_678,
+                    len: 20,
+                },
             ],
             config: RchConfig::default(),
         };
         let bytes = serde_json::to_vec(&payload).expect("serialize");
         let back: CachedConfig = serde_json::from_slice(&bytes).expect("deserialize");
         assert_eq!(back.schema_version, CACHE_SCHEMA_VERSION);
-        assert_eq!(back.source_mtimes, payload.source_mtimes);
+        assert_eq!(back.source_fingerprints, payload.source_fingerprints);
     }
 
     #[test]
@@ -4491,10 +4518,10 @@ confidence_threshold = 0.80
         let cache_path = dir.path().join("config.cache.json");
         let mut payload = CachedConfig {
             schema_version: CACHE_SCHEMA_VERSION.wrapping_add(1),
-            source_mtimes: vec![],
+            source_fingerprints: vec![],
             config: RchConfig::default(),
         };
-        payload.source_mtimes = super::current_source_mtimes();
+        payload.source_fingerprints = super::current_source_fingerprints();
         write_synthetic_cache(&cache_path, &payload);
 
         // Read it back via serde directly to confirm the cached value;
@@ -4567,30 +4594,61 @@ confidence_threshold = 0.80
     }
 
     #[test]
-    fn test_current_source_mtimes_returns_zero_for_missing() {
-        // Files that don't exist are reported as (path, 0). This is the
-        // invariant that makes "file appears later" invalidate the cache.
-        let entries = super::current_source_mtimes();
-        for (path, mtime) in &entries {
-            if !path.exists() {
+    fn test_current_source_fingerprints_return_zero_metadata_for_missing() {
+        // Files that don't exist report zero metadata. This is the invariant
+        // that makes "file appears later" invalidate the cache.
+        let entries = super::current_source_fingerprints();
+        for fingerprint in &entries {
+            if !fingerprint.path.exists() {
                 assert_eq!(
-                    *mtime,
+                    fingerprint.mtime_unix_nanos,
                     0,
                     "missing file {} must have mtime=0",
-                    path.display()
+                    fingerprint.path.display()
+                );
+                assert_eq!(
+                    fingerprint.len,
+                    0,
+                    "missing file {} must have len=0",
+                    fingerprint.path.display()
                 );
             }
         }
     }
 
     #[test]
-    fn test_file_mtime_secs_for_real_file_is_positive() {
+    fn test_source_fingerprint_for_real_file_records_metadata() {
         // Sanity: the helper actually reads a real mtime.
         let dir = tempfile::tempdir().unwrap();
         let f = dir.path().join("touch.txt");
         std::fs::write(&f, b"hello").unwrap();
-        let mtime = super::file_mtime_secs(&f);
-        assert!(mtime > 0, "real file should have a positive mtime");
+        let fingerprint = super::source_fingerprint(f);
+        assert!(
+            fingerprint.mtime_unix_nanos > 0,
+            "real file should have a positive mtime"
+        );
+        assert_eq!(fingerprint.len, 5, "real file length should be tracked");
+    }
+
+    #[test]
+    fn test_source_fingerprint_distinguishes_subsecond_mtime_changes() {
+        // Seconds-level mtimes can miss rapid config edits. The cache key uses
+        // nanoseconds so same-second metadata changes invalidate correctly.
+        let path = PathBuf::from("/x/config.toml");
+        let before = SourceFingerprint {
+            path: path.clone(),
+            mtime_unix_nanos: 1_700_000_000_000_000_001,
+            len: 42,
+        };
+        let after = SourceFingerprint {
+            path,
+            mtime_unix_nanos: 1_700_000_000_000_000_999,
+            len: 42,
+        };
+        assert_ne!(
+            before, after,
+            "cache source fingerprints must include subsecond mtime precision"
+        );
     }
 
     #[test]
@@ -4600,7 +4658,7 @@ confidence_threshold = 0.80
         // being removed and pulling massive defaults into the cache file.
         let payload = CachedConfig {
             schema_version: CACHE_SCHEMA_VERSION,
-            source_mtimes: vec![],
+            source_fingerprints: vec![],
             config: RchConfig::default(),
         };
         let bytes = serde_json::to_vec(&payload).unwrap();
@@ -4616,13 +4674,13 @@ confidence_threshold = 0.80
 
     #[test]
     fn test_cached_config_payload_excludes_runtime_env_overrides() {
-        // The cache key tracks only source-file mtimes and schema version, so
-        // cached data must remain the on-disk/default merge. Runtime env vars
-        // are applied after cache lookup on every load.
+        // The cache key tracks only source-file metadata and schema version,
+        // so cached data must remain the on-disk/default merge. Runtime env
+        // vars are applied after cache lookup on every load.
         let cached_base = RchConfig::default();
         let payload = CachedConfig {
             schema_version: CACHE_SCHEMA_VERSION,
-            source_mtimes: vec![],
+            source_fingerprints: vec![],
             config: cached_base.clone(),
         };
         let bytes = serde_json::to_vec(&payload).unwrap();
