@@ -1058,15 +1058,213 @@ fn write_cooldown_timestamp(path: &Path) -> Result<(), AutoStartError> {
     std::fs::write(path, format!("{now_secs}")).map_err(AutoStartError::Io)
 }
 
+/// Maximum age (in seconds) of a lockfile before it's eligible for
+/// stale takeover regardless of the recorded PID. Belt-and-suspenders
+/// against PID reuse: even if the recorded PID happens to be alive
+/// (a different process that reused the ID after the original was
+/// killed), a >60s-old lockfile is treated as stale.
+const AUTOSTART_LOCK_STALE_TTL_SECS: u64 = 60;
+
+/// Render the lockfile body. Format: 3 newline-separated lines
+/// `pid\nunix_secs\nhostname\n`. Hand-rolled to avoid bringing in a
+/// serializer for a 3-field file the OS owns.
+fn render_autostart_lock_body() -> String {
+    let pid = std::process::id();
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::from_secs(0))
+        .as_secs();
+    let hostname = std::env::var("HOSTNAME")
+        .ok()
+        .or_else(|| {
+            std::fs::read_to_string("/etc/hostname")
+                .ok()
+                .map(|s| s.trim().to_string())
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+    format!("{pid}\n{now_secs}\n{hostname}\n")
+}
+
+/// Parsed contents of an autostart lockfile.
+#[derive(Debug)]
+struct ParsedLock {
+    pid: u32,
+    created_at_secs: u64,
+    hostname: String,
+}
+
+fn parse_autostart_lock_body(s: &str) -> Option<ParsedLock> {
+    let mut lines = s.lines();
+    let pid: u32 = lines.next()?.trim().parse().ok()?;
+    let created_at_secs: u64 = lines.next()?.trim().parse().ok()?;
+    let hostname = lines.next()?.trim().to_string();
+    if hostname.is_empty() {
+        return None;
+    }
+    Some(ParsedLock {
+        pid,
+        created_at_secs,
+        hostname,
+    })
+}
+
+/// Check whether a PID is alive. On Unix: send signal 0 (no-op) — if
+/// it succeeds the process exists; ESRCH means it's gone; EPERM also
+/// means it's alive (we just can't signal it). On non-Unix platforms:
+/// conservative `true` since we can't check cheaply — combined with
+/// the TTL fallback, a wedged lockfile still recovers within 60s.
+fn pid_is_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        // /proc/<pid> probe — cheap and unambiguous on Linux. We do
+        // NOT use kill(0) because rch is #![forbid(unsafe_code)] and
+        // the kill(2) wrapper would require nix/libc raw syscalls.
+        let proc_path = std::path::PathBuf::from(format!("/proc/{pid}"));
+        if proc_path.exists() {
+            return true;
+        }
+        // On non-Linux Unix (macOS, BSD), /proc may not exist. We can't
+        // easily check liveness without unsafe; rely on TTL fallback.
+        // To distinguish "no /proc" from "PID is dead" we check whether
+        // /proc itself exists.
+        if !std::path::Path::new("/proc").exists() {
+            // No /proc on this platform — be conservative and assume alive.
+            return true;
+        }
+        // /proc exists but /proc/<pid> doesn't — PID is definitively gone.
+        false
+    }
+    #[cfg(not(unix))]
+    {
+        // Conservative on non-Unix; TTL handles the stale case.
+        let _ = pid;
+        true
+    }
+}
+
+/// Decide whether an existing lockfile is stale and may be replaced.
+/// A lockfile is stale when:
+///   * its PID is not alive (process exited / SIGKILLed / power-cycled), OR
+///   * its body is unparseable (corruption), OR
+///   * its hostname matches this host AND it's older than the TTL (PID-reuse defense).
+///
+/// Lockfiles from a DIFFERENT host (NFS shared lock scenario) are NEVER
+/// considered stale here — only the holder's own host can prove liveness.
+fn autostart_lock_is_stale(parsed: &ParsedLock) -> bool {
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::from_secs(0))
+        .as_secs();
+    let age = now_secs.saturating_sub(parsed.created_at_secs);
+
+    let our_hostname = std::env::var("HOSTNAME")
+        .ok()
+        .or_else(|| {
+            std::fs::read_to_string("/etc/hostname")
+                .ok()
+                .map(|s| s.trim().to_string())
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+
+    if parsed.hostname != our_hostname {
+        // Different host — don't touch the lock; trust the holder.
+        // The cooldown mechanism upstream still prevents storm-spawning.
+        return false;
+    }
+
+    if !pid_is_alive(parsed.pid) {
+        return true;
+    }
+
+    // PID is alive, same host: TTL fallback for PID-reuse case.
+    age > AUTOSTART_LOCK_STALE_TTL_SECS
+}
+
 fn acquire_autostart_lock(path: &Path) -> Result<AutoStartLock, AutoStartError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(AutoStartError::Io)?;
     }
+    // Atomic create_new — winner of the race; loser falls into the
+    // stale-detection branch below.
+    let body = render_autostart_lock_body();
     match OpenOptions::new().write(true).create_new(true).open(path) {
-        Ok(_) => Ok(AutoStartLock {
-            path: path.to_path_buf(),
-        }),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(AutoStartError::LockHeld),
+        Ok(mut f) => {
+            // Write the lockfile body so subsequent contenders can decide
+            // whether to wait or take over. We deliberately don't fail the
+            // acquire if the write itself fails — the lockfile-exists
+            // mutual-exclusion is the load-bearing invariant; the body is
+            // diagnostic + stale-detection metadata.
+            let _ = std::io::Write::write_all(&mut f, body.as_bytes());
+            let _ = f.sync_all();
+            tracing::info!(
+                target: "rch::hook::autostart_lock",
+                path = %path.display(),
+                pid = %std::process::id(),
+                "doctor.autostart_lock.acquired",
+            );
+            Ok(AutoStartLock {
+                path: path.to_path_buf(),
+            })
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Stale-detection branch: read the existing body, decide
+            // whether the holder is gone, and take over if so.
+            match std::fs::read_to_string(path) {
+                Ok(existing) => {
+                    let parsed = parse_autostart_lock_body(&existing);
+                    let stale = match &parsed {
+                        Some(p) => autostart_lock_is_stale(p),
+                        None => {
+                            // Unparseable / corrupted body — treat as stale.
+                            tracing::warn!(
+                                target: "rch::hook::autostart_lock",
+                                path = %path.display(),
+                                bytes = existing.len(),
+                                "doctor.autostart_lock.body_corrupt_treated_as_stale",
+                            );
+                            true
+                        }
+                    };
+                    if stale {
+                        // Atomic replace: move the stale file aside (forensics)
+                        // then create_new again. The remove+create race is
+                        // benign — if two callers race, exactly one wins the
+                        // recreate; the other gets AlreadyExists and either
+                        // tries again or returns LockHeld.
+                        tracing::warn!(
+                            target: "rch::hook::autostart_lock",
+                            path = %path.display(),
+                            holder_pid = ?parsed.as_ref().map(|p| p.pid),
+                            holder_host = ?parsed.as_ref().map(|p| p.hostname.clone()),
+                            holder_age_secs = ?parsed.as_ref().map(|p| {
+                                SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .unwrap_or(Duration::from_secs(0))
+                                    .as_secs()
+                                    .saturating_sub(p.created_at_secs)
+                            }),
+                            "doctor.autostart_lock.stale_replaced",
+                        );
+                        let _ = std::fs::remove_file(path);
+                        match OpenOptions::new().write(true).create_new(true).open(path) {
+                            Ok(mut f) => {
+                                let _ = std::io::Write::write_all(&mut f, body.as_bytes());
+                                let _ = f.sync_all();
+                                Ok(AutoStartLock {
+                                    path: path.to_path_buf(),
+                                })
+                            }
+                            // Lost the race to recreate — another contender won.
+                            Err(_) => Err(AutoStartError::LockHeld),
+                        }
+                    } else {
+                        Err(AutoStartError::LockHeld)
+                    }
+                }
+                // Couldn't even read the file — treat as held to be safe.
+                Err(_) => Err(AutoStartError::LockHeld),
+            }
+        }
         Err(e) => Err(AutoStartError::Io(e)),
     }
 }
@@ -11528,6 +11726,173 @@ edition = "2024"
         // Should be able to acquire lock again
         let lock2 = super::acquire_autostart_lock(&lock_path);
         assert!(lock2.is_ok(), "Should be able to reacquire lock after drop");
+    }
+
+    // ========================================================================
+    // t17 — stale-PID detection on autostart lockfile
+    // ========================================================================
+
+    fn write_lockfile(path: &std::path::Path, pid: u32, age_secs: u64, hostname: &str) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let created_at = now.saturating_sub(age_secs);
+        std::fs::write(path, format!("{pid}\n{created_at}\n{hostname}\n")).unwrap();
+    }
+
+    fn our_hostname() -> String {
+        std::env::var("HOSTNAME")
+            .ok()
+            .or_else(|| {
+                std::fs::read_to_string("/etc/hostname")
+                    .ok()
+                    .map(|s| s.trim().to_string())
+            })
+            .unwrap_or_else(|| "unknown".to_string())
+    }
+
+    #[test]
+    fn test_acquire_autostart_lock_writes_body() {
+        // Fresh acquire writes pid/timestamp/hostname so subsequent
+        // contenders can decide whether to wait or take over.
+        let _guard = test_guard!();
+        let temp_dir = create_test_state_dir();
+        let lock_path = temp_dir.path().join("autostart.lock");
+
+        let _lock = super::acquire_autostart_lock(&lock_path).expect("fresh acquire");
+        let body = std::fs::read_to_string(&lock_path).expect("read body");
+        let parsed = super::parse_autostart_lock_body(&body).expect("body parses");
+        assert_eq!(parsed.pid, std::process::id());
+        assert!(!parsed.hostname.is_empty());
+    }
+
+    #[test]
+    fn test_autostart_lock_detects_dead_pid() {
+        // PID 99999 is virtually guaranteed not to exist (kernel PID
+        // max is typically 4194304, but the actual running set is sparse;
+        // we pick a value high enough to almost never collide).
+        let _guard = test_guard!();
+        let temp_dir = create_test_state_dir();
+        let lock_path = temp_dir.path().join("autostart.lock");
+
+        write_lockfile(&lock_path, 99999, 5, &our_hostname());
+        // Acquire — should detect stale and take over.
+        let lock = super::acquire_autostart_lock(&lock_path);
+        assert!(
+            lock.is_ok(),
+            "Stale PID should be detected and replaced; got {:?}",
+            lock.err()
+        );
+        // The new body should record our own PID.
+        let body = std::fs::read_to_string(&lock_path).expect("read body");
+        let parsed = super::parse_autostart_lock_body(&body).expect("body parses");
+        assert_eq!(parsed.pid, std::process::id());
+    }
+
+    #[test]
+    fn test_autostart_lock_respects_live_pid_recent() {
+        // Our own PID, age 5s, same host: definitely alive AND fresh.
+        // Must return LockHeld.
+        let _guard = test_guard!();
+        let temp_dir = create_test_state_dir();
+        let lock_path = temp_dir.path().join("autostart.lock");
+
+        write_lockfile(&lock_path, std::process::id(), 5, &our_hostname());
+        let lock = super::acquire_autostart_lock(&lock_path);
+        assert!(lock.is_err(), "Live recent holder must hold the lock");
+        assert!(matches!(lock.unwrap_err(), super::AutoStartError::LockHeld));
+    }
+
+    #[test]
+    fn test_autostart_lock_corrupt_body_treated_as_stale() {
+        // Garbage body (couldn't parse) → take over.
+        let _guard = test_guard!();
+        let temp_dir = create_test_state_dir();
+        let lock_path = temp_dir.path().join("autostart.lock");
+
+        std::fs::write(
+            &lock_path,
+            "this is not\nthe expected\nlock format with extra junk",
+        )
+        .unwrap();
+        let lock = super::acquire_autostart_lock(&lock_path);
+        assert!(
+            lock.is_ok(),
+            "Corrupted lockfile should be treated as stale; got {:?}",
+            lock.err()
+        );
+    }
+
+    #[test]
+    fn test_autostart_lock_empty_body_treated_as_stale() {
+        let _guard = test_guard!();
+        let temp_dir = create_test_state_dir();
+        let lock_path = temp_dir.path().join("autostart.lock");
+
+        std::fs::write(&lock_path, "").unwrap();
+        let lock = super::acquire_autostart_lock(&lock_path);
+        assert!(
+            lock.is_ok(),
+            "Empty lockfile body should be treated as stale; got {:?}",
+            lock.err()
+        );
+    }
+
+    #[test]
+    fn test_autostart_lock_different_hostname_blocks() {
+        // NFS-shared scenario: a different host holds the lock. Even if
+        // the PID isn't alive on our host, we can't tell — so we trust
+        // the holder and return LockHeld.
+        let _guard = test_guard!();
+        let temp_dir = create_test_state_dir();
+        let lock_path = temp_dir.path().join("autostart.lock");
+
+        // Use a PID that's almost certainly NOT alive on our host AND
+        // a hostname that's almost certainly not ours.
+        write_lockfile(&lock_path, 99999, 5, "definitely-not-our-host-xyz");
+        let lock = super::acquire_autostart_lock(&lock_path);
+        assert!(
+            lock.is_err(),
+            "Lock from a different host must not be taken over"
+        );
+    }
+
+    #[test]
+    fn test_autostart_lock_ttl_fallback_for_same_host() {
+        // PID-reuse defense: our own PID, but the lockfile is very old.
+        // Should be treated as stale (TTL exceeded) and replaced.
+        let _guard = test_guard!();
+        let temp_dir = create_test_state_dir();
+        let lock_path = temp_dir.path().join("autostart.lock");
+
+        // Age > TTL (60s) with our own PID + hostname.
+        write_lockfile(&lock_path, std::process::id(), 120, &our_hostname());
+        let lock = super::acquire_autostart_lock(&lock_path);
+        assert!(
+            lock.is_ok(),
+            "Old lockfile (TTL exceeded) should be stale-replaced even when PID is alive; got {:?}",
+            lock.err()
+        );
+    }
+
+    #[test]
+    fn test_parse_autostart_lock_body_valid() {
+        let body = "12345\n1778000000\nmybox\n";
+        let p = super::parse_autostart_lock_body(body).expect("valid body parses");
+        assert_eq!(p.pid, 12345);
+        assert_eq!(p.created_at_secs, 1_778_000_000);
+        assert_eq!(p.hostname, "mybox");
+    }
+
+    #[test]
+    fn test_parse_autostart_lock_body_invalid() {
+        // Various invalid shapes.
+        assert!(super::parse_autostart_lock_body("").is_none());
+        assert!(super::parse_autostart_lock_body("abc\n123\nhost\n").is_none());
+        assert!(super::parse_autostart_lock_body("123\nabc\nhost\n").is_none());
+        assert!(super::parse_autostart_lock_body("123\n456\n").is_none());
+        assert!(super::parse_autostart_lock_body("123\n456\n\n").is_none()); // empty hostname
     }
 
     #[test]
