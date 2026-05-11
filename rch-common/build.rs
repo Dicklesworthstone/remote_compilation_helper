@@ -89,10 +89,10 @@ fn register_git_head_paths(git_dir: &Path) {
     let Some(ref_path) = head_contents.trim().strip_prefix("ref: ") else {
         return;
     };
-    let Some(ref_path) = clean_git_ref_path(ref_path) else {
+    let Some(git_ref) = clean_git_ref_path(ref_path) else {
         return;
     };
-    emit_rerun_if_exists(&git_dir.join(ref_path));
+    emit_rerun_if_exists(&git_dir.join(git_ref));
 }
 
 fn emit_rerun_if_exists(path: &Path) {
