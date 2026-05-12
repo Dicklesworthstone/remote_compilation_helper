@@ -3866,7 +3866,10 @@ mod tests {
             .await
             .unwrap();
         assert!(second_response.worker.is_none());
-        assert_eq!(second_response.reason, SelectionReason::AllWorkersBusy);
+        assert_eq!(
+            second_response.reason,
+            SelectionReason::NoAdmissibleWorkers("active_project_exclusion=1".to_string())
+        );
     }
 
     #[tokio::test]

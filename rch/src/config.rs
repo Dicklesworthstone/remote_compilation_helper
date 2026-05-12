@@ -252,28 +252,36 @@ fn try_write_cache(config: &RchConfig, source_fingerprints: Vec<SourceFingerprin
 /// variables and CLI overrides are runtime inputs and are applied by
 /// `load_config` after cache lookup.
 fn load_config_uncached() -> Result<RchConfig> {
+    let user_path = config_dir().map(|dir| dir.join("config.toml"));
+    let user_path = user_path.as_deref().filter(|path| path.exists());
+
+    let project_path = PathBuf::from(".rch/config.toml");
+    let project_path = if project_path.exists() {
+        Some(project_path.as_path())
+    } else {
+        None
+    };
+
+    load_config_uncached_from_paths(user_path, project_path)
+}
+
+fn load_config_uncached_from_paths(
+    user_path: Option<&Path>,
+    project_path: Option<&Path>,
+) -> Result<RchConfig> {
     // Start with defaults
     let mut config = RchConfig::default();
 
     // Try to load user config
-    if let Some(config_dir) = config_dir() {
-        let config_path = config_dir.join("config.toml");
-        if config_path.exists() {
-            debug!("Loading user config from {:?}", config_path);
-            let content = std::fs::read_to_string(&config_path)?;
-            let user_config: RchConfig = toml::from_str(&content)?;
-            config = user_config;
-        }
+    if let Some(config_path) = user_path {
+        debug!("Loading user config from {:?}", config_path);
+        config = load_config_overlay(config, config_path)?;
     }
 
     // Try to load project config
-    let project_config_path = PathBuf::from(".rch/config.toml");
-    if project_config_path.exists() {
-        debug!("Loading project config from {:?}", project_config_path);
-        let content = std::fs::read_to_string(&project_config_path)?;
-        let project_config: RchConfig = toml::from_str(&content)?;
-        // Merge project config (project overrides user)
-        config = merge_config(config, project_config);
+    if let Some(config_path) = project_path {
+        debug!("Loading project config from {:?}", config_path);
+        config = load_config_overlay(config, config_path)?;
     }
 
     Ok(config)
@@ -707,6 +715,37 @@ fn load_partial_config(path: &Path) -> Result<PartialRchConfig> {
     Ok(parsed)
 }
 
+fn load_config_overlay(base: RchConfig, path: &Path) -> Result<RchConfig> {
+    let content =
+        std::fs::read_to_string(path).with_context(|| format!("Failed to read {:?}", path))?;
+    let overlay: toml::Value =
+        toml::from_str(&content).with_context(|| format!("Failed to parse {:?}", path))?;
+    let mut merged =
+        toml::Value::try_from(base).context("Failed to encode base RCH config as TOML")?;
+    merge_toml_overlay(&mut merged, overlay);
+    merged
+        .try_into()
+        .with_context(|| format!("Failed to decode merged config for {:?}", path))
+}
+
+fn merge_toml_overlay(base: &mut toml::Value, overlay: toml::Value) {
+    match (base, overlay) {
+        (toml::Value::Table(base_table), toml::Value::Table(overlay_table)) => {
+            for (key, overlay_value) in overlay_table {
+                match base_table.get_mut(&key) {
+                    Some(base_value) => merge_toml_overlay(base_value, overlay_value),
+                    None => {
+                        base_table.insert(key, overlay_value);
+                    }
+                }
+            }
+        }
+        (base_value, overlay_value) => {
+            *base_value = overlay_value;
+        }
+    }
+}
+
 /// Validate a standard RCH config file (config.toml or .rch/config.toml).
 pub fn validate_rch_config_file(path: &Path) -> FileValidation {
     let mut validation = FileValidation::new(path);
@@ -1105,92 +1144,62 @@ fn apply_layer(
     sources: &mut ConfigSourceMap,
     layer: &PartialRchConfig,
     source: &ConfigValueSource,
-    defaults: &RchConfig,
+    _defaults: &RchConfig,
 ) {
-    const EPSILON: f64 = 0.0001;
-
-    if let Some(enabled) = layer.general.enabled
-        && enabled != defaults.general.enabled
-    {
+    if let Some(enabled) = layer.general.enabled {
         config.general.enabled = enabled;
         set_source(sources, "general.enabled", source.clone());
     }
-    if let Some(force_local) = layer.general.force_local
-        && force_local != defaults.general.force_local
-    {
+    if let Some(force_local) = layer.general.force_local {
         config.general.force_local = force_local;
         set_source(sources, "general.force_local", source.clone());
     }
-    if let Some(force_remote) = layer.general.force_remote
-        && force_remote != defaults.general.force_remote
-    {
+    if let Some(force_remote) = layer.general.force_remote {
         config.general.force_remote = force_remote;
         set_source(sources, "general.force_remote", source.clone());
     }
-    if let Some(log_level) = layer.general.log_level.as_ref()
-        && log_level != &defaults.general.log_level
-    {
+    if let Some(log_level) = layer.general.log_level.as_ref() {
         config.general.log_level = log_level.clone();
         set_source(sources, "general.log_level", source.clone());
     }
-    if let Some(socket_path) = layer.general.socket_path.as_ref()
-        && socket_path != &defaults.general.socket_path
-    {
+    if let Some(socket_path) = layer.general.socket_path.as_ref() {
         config.general.socket_path = socket_path.clone();
         set_source(sources, "general.socket_path", source.clone());
     }
 
-    if let Some(threshold) = layer.compilation.confidence_threshold
-        && (threshold - defaults.compilation.confidence_threshold).abs() > EPSILON
-    {
+    if let Some(threshold) = layer.compilation.confidence_threshold {
         config.compilation.confidence_threshold = threshold;
         set_source(sources, "compilation.confidence_threshold", source.clone());
     }
-    if let Some(min_local) = layer.compilation.min_local_time_ms
-        && min_local != defaults.compilation.min_local_time_ms
-    {
+    if let Some(min_local) = layer.compilation.min_local_time_ms {
         config.compilation.min_local_time_ms = min_local;
         set_source(sources, "compilation.min_local_time_ms", source.clone());
     }
-    if let Some(build_slots) = layer.compilation.build_slots
-        && build_slots != defaults.compilation.build_slots
-    {
+    if let Some(build_slots) = layer.compilation.build_slots {
         config.compilation.build_slots = build_slots;
         set_source(sources, "compilation.build_slots", source.clone());
     }
-    if let Some(test_slots) = layer.compilation.test_slots
-        && test_slots != defaults.compilation.test_slots
-    {
+    if let Some(test_slots) = layer.compilation.test_slots {
         config.compilation.test_slots = test_slots;
         set_source(sources, "compilation.test_slots", source.clone());
     }
-    if let Some(check_slots) = layer.compilation.check_slots
-        && check_slots != defaults.compilation.check_slots
-    {
+    if let Some(check_slots) = layer.compilation.check_slots {
         config.compilation.check_slots = check_slots;
         set_source(sources, "compilation.check_slots", source.clone());
     }
-    if let Some(build_timeout_sec) = layer.compilation.build_timeout_sec
-        && build_timeout_sec != defaults.compilation.build_timeout_sec
-    {
+    if let Some(build_timeout_sec) = layer.compilation.build_timeout_sec {
         config.compilation.build_timeout_sec = build_timeout_sec;
         set_source(sources, "compilation.build_timeout_sec", source.clone());
     }
-    if let Some(test_timeout_sec) = layer.compilation.test_timeout_sec
-        && test_timeout_sec != defaults.compilation.test_timeout_sec
-    {
+    if let Some(test_timeout_sec) = layer.compilation.test_timeout_sec {
         config.compilation.test_timeout_sec = test_timeout_sec;
         set_source(sources, "compilation.test_timeout_sec", source.clone());
     }
-    if let Some(bun_timeout_sec) = layer.compilation.bun_timeout_sec
-        && bun_timeout_sec != defaults.compilation.bun_timeout_sec
-    {
+    if let Some(bun_timeout_sec) = layer.compilation.bun_timeout_sec {
         config.compilation.bun_timeout_sec = bun_timeout_sec;
         set_source(sources, "compilation.bun_timeout_sec", source.clone());
     }
-    if let Some(external_timeout_enabled) = layer.compilation.external_timeout_enabled
-        && external_timeout_enabled != defaults.compilation.external_timeout_enabled
-    {
+    if let Some(external_timeout_enabled) = layer.compilation.external_timeout_enabled {
         config.compilation.external_timeout_enabled = external_timeout_enabled;
         set_source(
             sources,
@@ -1199,21 +1208,15 @@ fn apply_layer(
         );
     }
 
-    if let Some(compression) = layer.transfer.compression_level
-        && compression != defaults.transfer.compression_level
-    {
+    if let Some(compression) = layer.transfer.compression_level {
         config.transfer.compression_level = compression;
         set_source(sources, "transfer.compression_level", source.clone());
     }
-    if let Some(patterns) = layer.transfer.exclude_patterns.as_ref()
-        && patterns != &defaults.transfer.exclude_patterns
-    {
+    if let Some(patterns) = layer.transfer.exclude_patterns.as_ref() {
         config.transfer.exclude_patterns = patterns.clone();
         set_source(sources, "transfer.exclude_patterns", source.clone());
     }
-    if let Some(remote_base) = layer.transfer.remote_base.as_ref()
-        && remote_base != &defaults.transfer.remote_base
-    {
+    if let Some(remote_base) = layer.transfer.remote_base.as_ref() {
         // Validate and normalize the remote_base path
         match validate_remote_base(remote_base) {
             Ok(validated) => {
@@ -1278,72 +1281,50 @@ fn apply_layer(
         set_source(sources, "transfer.verify_max_size_bytes", source.clone());
     }
 
-    if let Some(allowlist) = layer.environment.allowlist.as_ref()
-        && allowlist != &defaults.environment.allowlist
-    {
+    if let Some(allowlist) = layer.environment.allowlist.as_ref() {
         config.environment.allowlist = allowlist.clone();
         set_source(sources, "environment.allowlist", source.clone());
     }
 
-    if let Some(failure_threshold) = layer.circuit.failure_threshold
-        && failure_threshold != defaults.circuit.failure_threshold
-    {
+    if let Some(failure_threshold) = layer.circuit.failure_threshold {
         config.circuit.failure_threshold = failure_threshold;
         set_source(sources, "circuit.failure_threshold", source.clone());
     }
-    if let Some(success_threshold) = layer.circuit.success_threshold
-        && success_threshold != defaults.circuit.success_threshold
-    {
+    if let Some(success_threshold) = layer.circuit.success_threshold {
         config.circuit.success_threshold = success_threshold;
         set_source(sources, "circuit.success_threshold", source.clone());
     }
-    if let Some(error_rate_threshold) = layer.circuit.error_rate_threshold
-        && (error_rate_threshold - defaults.circuit.error_rate_threshold).abs() > EPSILON
-    {
+    if let Some(error_rate_threshold) = layer.circuit.error_rate_threshold {
         config.circuit.error_rate_threshold = error_rate_threshold;
         set_source(sources, "circuit.error_rate_threshold", source.clone());
     }
-    if let Some(window_secs) = layer.circuit.window_secs
-        && window_secs != defaults.circuit.window_secs
-    {
+    if let Some(window_secs) = layer.circuit.window_secs {
         config.circuit.window_secs = window_secs;
         set_source(sources, "circuit.window_secs", source.clone());
     }
-    if let Some(open_cooldown_secs) = layer.circuit.open_cooldown_secs
-        && open_cooldown_secs != defaults.circuit.open_cooldown_secs
-    {
+    if let Some(open_cooldown_secs) = layer.circuit.open_cooldown_secs {
         config.circuit.open_cooldown_secs = open_cooldown_secs;
         set_source(sources, "circuit.open_cooldown_secs", source.clone());
     }
-    if let Some(half_open_max_probes) = layer.circuit.half_open_max_probes
-        && half_open_max_probes != defaults.circuit.half_open_max_probes
-    {
+    if let Some(half_open_max_probes) = layer.circuit.half_open_max_probes {
         config.circuit.half_open_max_probes = half_open_max_probes;
         set_source(sources, "circuit.half_open_max_probes", source.clone());
     }
 
-    if let Some(visibility) = layer.output.visibility
-        && visibility != defaults.output.visibility
-    {
+    if let Some(visibility) = layer.output.visibility {
         config.output.visibility = visibility;
         set_source(sources, "output.visibility", source.clone());
     }
-    if let Some(first_run_complete) = layer.output.first_run_complete
-        && first_run_complete != defaults.output.first_run_complete
-    {
+    if let Some(first_run_complete) = layer.output.first_run_complete {
         config.output.first_run_complete = first_run_complete;
         set_source(sources, "output.first_run_complete", source.clone());
     }
 
-    if let Some(hook_starts_daemon) = layer.self_healing.hook_starts_daemon
-        && hook_starts_daemon != defaults.self_healing.hook_starts_daemon
-    {
+    if let Some(hook_starts_daemon) = layer.self_healing.hook_starts_daemon {
         config.self_healing.hook_starts_daemon = hook_starts_daemon;
         set_source(sources, "self_healing.hook_starts_daemon", source.clone());
     }
-    if let Some(daemon_installs_hooks) = layer.self_healing.daemon_installs_hooks
-        && daemon_installs_hooks != defaults.self_healing.daemon_installs_hooks
-    {
+    if let Some(daemon_installs_hooks) = layer.self_healing.daemon_installs_hooks {
         config.self_healing.daemon_installs_hooks = daemon_installs_hooks;
         set_source(
             sources,
@@ -1351,9 +1332,7 @@ fn apply_layer(
             source.clone(),
         );
     }
-    if let Some(cooldown) = layer.self_healing.auto_start_cooldown_secs
-        && cooldown != defaults.self_healing.auto_start_cooldown_secs
-    {
+    if let Some(cooldown) = layer.self_healing.auto_start_cooldown_secs {
         config.self_healing.auto_start_cooldown_secs = cooldown;
         set_source(
             sources,
@@ -1361,9 +1340,7 @@ fn apply_layer(
             source.clone(),
         );
     }
-    if let Some(timeout) = layer.self_healing.auto_start_timeout_secs
-        && timeout != defaults.self_healing.auto_start_timeout_secs
-    {
+    if let Some(timeout) = layer.self_healing.auto_start_timeout_secs {
         config.self_healing.auto_start_timeout_secs = timeout;
         set_source(
             sources,
@@ -1371,9 +1348,7 @@ fn apply_layer(
             source.clone(),
         );
     }
-    if let Some(log_level) = layer.self_healing.self_healing_log_level
-        && log_level != defaults.self_healing.self_healing_log_level
-    {
+    if let Some(log_level) = layer.self_healing.self_healing_log_level {
         config.self_healing.self_healing_log_level = log_level;
         set_source(
             sources,
@@ -1382,45 +1357,31 @@ fn apply_layer(
         );
     }
 
-    if let Some(enabled) = layer.self_test.enabled
-        && enabled != defaults.self_test.enabled
-    {
+    if let Some(enabled) = layer.self_test.enabled {
         config.self_test.enabled = enabled;
         set_source(sources, "self_test.enabled", source.clone());
     }
-    if let Some(schedule) = layer.self_test.schedule.as_ref()
-        && defaults.self_test.schedule.as_ref() != Some(schedule)
-    {
+    if let Some(schedule) = layer.self_test.schedule.as_ref() {
         config.self_test.schedule = Some(schedule.clone());
         set_source(sources, "self_test.schedule", source.clone());
     }
-    if let Some(interval) = layer.self_test.interval.as_ref()
-        && defaults.self_test.interval.as_ref() != Some(interval)
-    {
+    if let Some(interval) = layer.self_test.interval.as_ref() {
         config.self_test.interval = Some(interval.clone());
         set_source(sources, "self_test.interval", source.clone());
     }
-    if let Some(workers) = layer.self_test.workers.as_ref()
-        && workers != &defaults.self_test.workers
-    {
+    if let Some(workers) = layer.self_test.workers.as_ref() {
         config.self_test.workers = workers.clone();
         set_source(sources, "self_test.workers", source.clone());
     }
-    if let Some(on_failure) = layer.self_test.on_failure
-        && on_failure != defaults.self_test.on_failure
-    {
+    if let Some(on_failure) = layer.self_test.on_failure {
         config.self_test.on_failure = on_failure;
         set_source(sources, "self_test.on_failure", source.clone());
     }
-    if let Some(retry_count) = layer.self_test.retry_count
-        && retry_count != defaults.self_test.retry_count
-    {
+    if let Some(retry_count) = layer.self_test.retry_count {
         config.self_test.retry_count = retry_count;
         set_source(sources, "self_test.retry_count", source.clone());
     }
-    if let Some(retry_delay) = layer.self_test.retry_delay.as_ref()
-        && defaults.self_test.retry_delay != *retry_delay
-    {
+    if let Some(retry_delay) = layer.self_test.retry_delay.as_ref() {
         config.self_test.retry_delay = retry_delay.clone();
         set_source(sources, "self_test.retry_delay", source.clone());
     }
@@ -1453,6 +1414,7 @@ fn set_source(sources: &mut ConfigSourceMap, key: &str, source: ConfigValueSourc
 /// will override the base config. This allows partial config files
 /// (e.g., project configs that only set one field) to work correctly
 /// without clobbering the entire section from the user config.
+#[cfg(test)]
 fn merge_config(mut base: RchConfig, overlay: RchConfig) -> RchConfig {
     let default = RchConfig::default();
 
@@ -1524,6 +1486,7 @@ fn merge_config(mut base: RchConfig, overlay: RchConfig) -> RchConfig {
 }
 
 /// Merge GeneralConfig fields.
+#[cfg(test)]
 fn merge_general(
     base: &mut rch_common::GeneralConfig,
     overlay: &rch_common::GeneralConfig,
@@ -1548,6 +1511,7 @@ fn merge_general(
 }
 
 /// Merge CompilationConfig fields.
+#[cfg(test)]
 fn merge_compilation(
     base: &mut rch_common::CompilationConfig,
     overlay: &rch_common::CompilationConfig,
@@ -1585,6 +1549,7 @@ fn merge_compilation(
 }
 
 /// Merge TransferConfig fields.
+#[cfg(test)]
 fn merge_transfer(
     base: &mut rch_common::TransferConfig,
     overlay: &rch_common::TransferConfig,
@@ -1651,6 +1616,7 @@ fn merge_transfer(
 }
 
 /// Merge EnvironmentConfig fields.
+#[cfg(test)]
 fn merge_environment(
     base: &mut rch_common::EnvironmentConfig,
     overlay: &rch_common::EnvironmentConfig,
@@ -1662,6 +1628,7 @@ fn merge_environment(
 }
 
 /// Merge CircuitBreakerConfig fields.
+#[cfg(test)]
 fn merge_circuit(
     base: &mut rch_common::CircuitBreakerConfig,
     overlay: &rch_common::CircuitBreakerConfig,
@@ -1689,6 +1656,7 @@ fn merge_circuit(
 }
 
 /// Merge OutputConfig fields.
+#[cfg(test)]
 fn merge_output(
     base: &mut rch_common::OutputConfig,
     overlay: &rch_common::OutputConfig,
@@ -1703,6 +1671,7 @@ fn merge_output(
 }
 
 /// Merge SelfHealingConfig fields.
+#[cfg(test)]
 fn merge_self_healing(
     base: &mut rch_common::SelfHealingConfig,
     overlay: &rch_common::SelfHealingConfig,
@@ -1723,6 +1692,7 @@ fn merge_self_healing(
 }
 
 /// Merge SelfTestConfig fields.
+#[cfg(test)]
 fn merge_self_test(
     base: &mut rch_common::SelfTestConfig,
     overlay: &rch_common::SelfTestConfig,
@@ -2903,6 +2873,97 @@ identity_file = "/tmp/id_ed25519"
             .expect("general.log_level source present");
         assert_eq!(source, &ConfigValueSource::UserConfig(user_path));
         info!("PASS: User config source detected for general.log_level");
+    }
+
+    #[test]
+    fn test_project_config_can_reset_user_values_to_defaults_with_sources() {
+        let _guard = test_guard!();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let user_path = dir.path().join("user.toml");
+        let project_path = dir.path().join("project.toml");
+        std::fs::write(
+            &user_path,
+            r#"
+[general]
+force_local = true
+log_level = "debug"
+
+[compilation]
+min_local_time_ms = 5000
+"#,
+        )
+        .expect("write user config");
+        std::fs::write(
+            &project_path,
+            r#"
+[general]
+force_local = false
+log_level = "info"
+
+[compilation]
+min_local_time_ms = 2000
+"#,
+        )
+        .expect("write project config");
+
+        let loaded =
+            load_config_with_sources_from_paths(Some(&user_path), Some(&project_path), None)
+                .expect("load with sources");
+
+        assert!(!loaded.config.general.force_local);
+        assert_eq!(loaded.config.general.log_level, "info");
+        assert_eq!(loaded.config.compilation.min_local_time_ms, 2000);
+        assert_eq!(
+            loaded.sources.get("general.force_local"),
+            Some(&ConfigValueSource::ProjectConfig(project_path.clone()))
+        );
+        assert_eq!(
+            loaded.sources.get("general.log_level"),
+            Some(&ConfigValueSource::ProjectConfig(project_path.clone()))
+        );
+        assert_eq!(
+            loaded.sources.get("compilation.min_local_time_ms"),
+            Some(&ConfigValueSource::ProjectConfig(project_path))
+        );
+    }
+
+    #[test]
+    fn test_uncached_config_loader_can_reset_user_values_to_defaults() {
+        let _guard = test_guard!();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let user_path = dir.path().join("user.toml");
+        let project_path = dir.path().join("project.toml");
+        std::fs::write(
+            &user_path,
+            r#"
+[general]
+force_local = true
+log_level = "debug"
+
+[compilation]
+min_local_time_ms = 5000
+"#,
+        )
+        .expect("write user config");
+        std::fs::write(
+            &project_path,
+            r#"
+[general]
+force_local = false
+log_level = "info"
+
+[compilation]
+min_local_time_ms = 2000
+"#,
+        )
+        .expect("write project config");
+
+        let config = super::load_config_uncached_from_paths(Some(&user_path), Some(&project_path))
+            .expect("load uncached config");
+
+        assert!(!config.general.force_local);
+        assert_eq!(config.general.log_level, "info");
+        assert_eq!(config.compilation.min_local_time_ms, 2000);
     }
 
     #[test]

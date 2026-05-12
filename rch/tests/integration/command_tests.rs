@@ -177,18 +177,35 @@ fn test_doctor_reliability_json_outputs_real_binary_response() {
         .output()
         .expect("Failed to run rch doctor --reliability --check-schemas --json");
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success(),
-        "rch doctor --reliability should exit successfully; status={:?}\nstdout:\n{}\nstderr:\n{}",
-        output.status.code(),
-        stdout,
-        stderr
-    );
-
     let parsed: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("reliability doctor should output JSON");
+    assert_eq!(
+        parsed.pointer("/success").and_then(|value| value.as_bool()),
+        Some(true)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let overall = parsed
+        .pointer("/data/summary/overall")
+        .and_then(|value| value.as_str())
+        .expect("reliability doctor should report an overall verdict");
+    let expected_exit = match overall {
+        "healthy" => Some(0),
+        "degraded" => Some(1),
+        "failing" => Some(2),
+        _ => None,
+    };
+    assert!(
+        expected_exit.is_some(),
+        "unexpected reliability verdict: {overall}"
+    );
+    assert_eq!(
+        output.status.code(),
+        expected_exit,
+        "rch doctor --reliability should use the documented exit code for verdict {overall}; stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
     assert_eq!(
         parsed
             .pointer("/data/schema_version")
