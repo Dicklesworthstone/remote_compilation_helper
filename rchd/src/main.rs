@@ -34,16 +34,16 @@ mod telemetry;
 mod ui;
 mod workers;
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use chrono::{Duration as ChronoDuration, Local};
 use clap::Parser;
 use rch_common::{LogConfig, SelfTestConfig, init_logging};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::net::UnixListener;
+use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, mpsc};
-use tokio::time::interval;
+use tokio::time::{interval, timeout};
 use tracing::{debug, error, info, warn};
 
 #[cfg(unix)]
@@ -146,6 +146,63 @@ pub struct DaemonContext {
     pub queue_timeout_secs: u64,
 }
 
+async fn bind_daemon_socket(socket: &Path) -> Result<UnixListener> {
+    if socket.exists() {
+        if socket_has_live_listener(socket).await? {
+            bail!(
+                "daemon socket already accepts connections at {}; refusing to start a second rchd",
+                socket.display()
+            );
+        }
+
+        std::fs::remove_file(socket).with_context(|| {
+            format!("failed to remove stale daemon socket {}", socket.display())
+        })?;
+    }
+
+    let listener = UnixListener::bind(socket)
+        .with_context(|| format!("failed to bind daemon socket {}", socket.display()))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600)).with_context(
+            || {
+                format!(
+                    "failed to set daemon socket permissions {}",
+                    socket.display()
+                )
+            },
+        )?;
+    }
+
+    Ok(listener)
+}
+
+async fn socket_has_live_listener(socket: &Path) -> Result<bool> {
+    match timeout(Duration::from_millis(300), UnixStream::connect(socket)).await {
+        Ok(Ok(_stream)) => Ok(true),
+        Ok(Err(error)) if is_stale_socket_connect_error(&error) => Ok(false),
+        Ok(Err(error)) => Err(error).with_context(|| {
+            format!(
+                "daemon socket {} exists but could not be probed safely",
+                socket.display()
+            )
+        }),
+        Err(_) => bail!(
+            "daemon socket {} exists but the connection probe timed out; refusing to start a second rchd",
+            socket.display()
+        ),
+    }
+}
+
+fn is_stale_socket_connect_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+    )
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -164,6 +221,9 @@ async fn main() -> Result<()> {
     let _logging_guards = init_logging(&log_config)?;
 
     info!("Starting RCH daemon...");
+
+    let listener = bind_daemon_socket(&cli.socket).await?;
+    info!("Listening on {:?}", cli.socket);
 
     // Register Prometheus metrics
     if let Err(e) = metrics::register_metrics() {
@@ -331,23 +391,6 @@ async fn main() -> Result<()> {
         daemon_config.cache_cleanup,
     ));
     let _cache_cleanup_handle = cache_cleanup_scheduler.start();
-
-    // Remove existing socket if present
-    if cli.socket.exists() {
-        std::fs::remove_file(&cli.socket)?;
-    }
-
-    // Create Unix socket listener
-    let listener = UnixListener::bind(&cli.socket)?;
-
-    // Set socket permissions to 600 (owner read/write only) to prevent unauthorized access
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&cli.socket, std::fs::Permissions::from_mode(0o600))?;
-    }
-
-    info!("Listening on {:?}", cli.socket);
 
     // Create daemon context
     let telemetry_storage = match telemetry::default_telemetry_db_path() {
@@ -866,6 +909,49 @@ mod tests {
         assert!(cli.no_hot_reload);
         assert!(cli.verbose);
         assert!(cli.foreground);
+    }
+
+    #[tokio::test]
+    async fn test_bind_daemon_socket_creates_listener() {
+        let _guard = test_guard!();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let socket_path = temp_dir.path().join("rch.sock");
+
+        let listener = bind_daemon_socket(&socket_path).await.unwrap();
+
+        assert!(socket_path.exists());
+        drop(listener);
+    }
+
+    #[tokio::test]
+    async fn test_bind_daemon_socket_refuses_live_listener() {
+        let _guard = test_guard!();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let socket_path = temp_dir.path().join("rch.sock");
+        let _existing = UnixListener::bind(&socket_path).unwrap();
+
+        let error = bind_daemon_socket(&socket_path).await.unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("refusing to start a second rchd"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bind_daemon_socket_replaces_stale_socket() {
+        let _guard = test_guard!();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let socket_path = temp_dir.path().join("rch.sock");
+        let stale_listener = UnixListener::bind(&socket_path).unwrap();
+        drop(stale_listener);
+
+        let listener = bind_daemon_socket(&socket_path).await.unwrap();
+
+        assert!(socket_path.exists());
+        drop(listener);
     }
 
     // =========================================================================

@@ -1005,6 +1005,8 @@ enum AutoStartError {
     BinaryNotFound,
     #[error("Socket exists but daemon not responding (stale socket)")]
     StaleSocket,
+    #[error("Socket accepts connections but daemon health check failed")]
+    UnhealthySocket,
     #[error("Configuration disabled auto-start")]
     Disabled,
     #[error("Auto-start I/O error: {0}")]
@@ -1366,6 +1368,17 @@ async fn probe_daemon_health(socket_path: &Path) -> bool {
     response.status == "healthy"
 }
 
+async fn socket_is_confirmed_stale(socket_path: &Path) -> bool {
+    match timeout(Duration::from_millis(300), UnixStream::connect(socket_path)).await {
+        Ok(Ok(_stream)) => false,
+        Ok(Err(error)) => matches!(
+            error.kind(),
+            io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
+        ),
+        Err(_) => false,
+    }
+}
+
 async fn wait_for_socket(socket_path: &Path, timeout_secs: u64) -> bool {
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     loop {
@@ -1420,6 +1433,13 @@ async fn try_auto_start_daemon(
             target: "rch::hook::autostart",
             "Socket exists but daemon not responding (after lock-protected re-probe)"
         );
+        if !socket_is_confirmed_stale(socket_path).await {
+            warn!(
+                target: "rch::hook::autostart",
+                "Socket still accepts connections or could not be proven stale; refusing to replace a possible live daemon"
+            );
+            return Err(AutoStartError::UnhealthySocket);
+        }
         if let Err(err) = std::fs::remove_file(socket_path) {
             warn!(
                 target: "rch::hook::autostart",
@@ -12073,6 +12093,33 @@ edition = "2024"
         assert!(
             matches!(result.unwrap_err(), super::AutoStartError::Disabled),
             "Error should be Disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_socket_is_confirmed_stale_false_for_live_listener() {
+        let _guard = test_guard!();
+        let temp_dir = create_test_state_dir();
+        let socket_path = temp_dir.path().join("test.sock");
+        let _listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+
+        assert!(
+            !super::socket_is_confirmed_stale(&socket_path).await,
+            "live listener must not be treated as stale"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_socket_is_confirmed_stale_true_for_dropped_listener() {
+        let _guard = test_guard!();
+        let temp_dir = create_test_state_dir();
+        let socket_path = temp_dir.path().join("test.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        drop(listener);
+
+        assert!(
+            super::socket_is_confirmed_stale(&socket_path).await,
+            "dropped listener should leave a stale socket path"
         );
     }
 
