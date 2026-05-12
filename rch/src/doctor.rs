@@ -1361,6 +1361,32 @@ fn reliability_disk_pressure_diagnostics(
                 ),
             };
 
+            // t11: build the details string with a single preallocated
+            // buffer + write! macro instead of 7 intermediate
+            // `.map(|v| format!(...)).unwrap_or_else(|| "unknown".to_string())`
+            // chains. Saves ~7 allocations per worker; for a 50-worker
+            // fleet that's ~350 transient Strings eliminated per run.
+            let mut details = String::with_capacity(256);
+            use std::fmt::Write as _;
+            let _ = write!(
+                details,
+                "state={state}, confidence={}, free_gb=",
+                worker.pressure_confidence.as_deref().unwrap_or("unknown")
+            );
+            push_opt_f64(&mut details, worker.pressure_disk_free_gb, 2);
+            details.push_str(", total_gb=");
+            push_opt_f64(&mut details, worker.pressure_disk_total_gb, 2);
+            details.push_str(", free_ratio=");
+            push_opt_f64(&mut details, worker.pressure_disk_free_ratio, 3);
+            details.push_str(", io_util_pct=");
+            push_opt_f64(&mut details, worker.pressure_disk_io_util_pct, 1);
+            details.push_str(", memory_pressure=");
+            push_opt_f64(&mut details, worker.pressure_memory_pressure, 2);
+            details.push_str(", telemetry_age_secs=");
+            push_opt_display(&mut details, worker.pressure_telemetry_age_secs);
+            details.push_str(", telemetry_fresh=");
+            push_opt_display(&mut details, worker.pressure_telemetry_fresh);
+
             let mut diagnostic = ReliabilityDiagnostic::new(
                 ReliabilityCategory::DiskPressure,
                 "worker_disk_pressure",
@@ -1369,39 +1395,7 @@ fn reliability_disk_pressure_diagnostics(
                 code,
             )
             .with_worker(worker.id.clone())
-            .with_details(format!(
-                "state={}, confidence={}, free_gb={}, total_gb={}, free_ratio={}, io_util_pct={}, memory_pressure={}, telemetry_age_secs={}, telemetry_fresh={}",
-                state,
-                worker.pressure_confidence.as_deref().unwrap_or("unknown"),
-                worker
-                    .pressure_disk_free_gb
-                    .map(|value| format!("{value:.2}"))
-                    .unwrap_or_else(|| "unknown".to_string()),
-                worker
-                    .pressure_disk_total_gb
-                    .map(|value| format!("{value:.2}"))
-                    .unwrap_or_else(|| "unknown".to_string()),
-                worker
-                    .pressure_disk_free_ratio
-                    .map(|value| format!("{value:.3}"))
-                    .unwrap_or_else(|| "unknown".to_string()),
-                worker
-                    .pressure_disk_io_util_pct
-                    .map(|value| format!("{value:.1}"))
-                    .unwrap_or_else(|| "unknown".to_string()),
-                worker
-                    .pressure_memory_pressure
-                    .map(|value| format!("{value:.2}"))
-                    .unwrap_or_else(|| "unknown".to_string()),
-                worker
-                    .pressure_telemetry_age_secs
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "unknown".to_string()),
-                worker
-                    .pressure_telemetry_fresh
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "unknown".to_string())
-            ));
+            .with_details(details);
 
             if severity != ReliabilitySeverity::Pass {
                 // Shell-escape worker.user and worker.host: the remediation
@@ -1431,6 +1425,32 @@ fn format_disk_free(value: Option<f64>) -> String {
     value
         .map(|gb| format!("{gb:.1} GB free"))
         .unwrap_or_else(|| "free space unknown".to_string())
+}
+
+/// t11: Append an `Option<f64>` to `buf` with the given precision, or
+/// "unknown" if None. Replaces the prior `.map(|v| format!("{:.N}",
+/// v)).unwrap_or_else(|| "unknown".to_string())` pattern which
+/// allocated an intermediate String per worker × field.
+fn push_opt_f64(buf: &mut String, value: Option<f64>, precision: usize) {
+    use std::fmt::Write as _;
+    match value {
+        Some(v) => {
+            let _ = write!(buf, "{v:.precision$}");
+        }
+        None => buf.push_str("unknown"),
+    }
+}
+
+/// t11: Append any `Option<T: Display>` to `buf`, or "unknown" if None.
+/// Avoids the intermediate `Option::map(|v| v.to_string())` allocation.
+fn push_opt_display<T: std::fmt::Display>(buf: &mut String, value: Option<T>) {
+    use std::fmt::Write as _;
+    match value {
+        Some(v) => {
+            let _ = write!(buf, "{v}");
+        }
+        None => buf.push_str("unknown"),
+    }
 }
 
 fn reliability_process_debt_diagnostics(
@@ -5866,5 +5886,121 @@ exit 0\n"
         // And shouldn't have duplicates.
         let unique: std::collections::HashSet<_> = DAEMON_UNREACHABLE_REASON_CODES.iter().collect();
         assert_eq!(unique.len(), DAEMON_UNREACHABLE_REASON_CODES.len());
+    }
+
+    // ========================================================================
+    // t11 — alloc-discipline helpers. Verify that push_opt_f64 / push_opt_display
+    // produce byte-identical output to the old `.map().unwrap_or_else()` chains.
+    // ========================================================================
+
+    #[test]
+    fn test_push_opt_f64_some_at_precision_1() {
+        let mut buf = String::new();
+        push_opt_f64(&mut buf, Some(7.654), 1);
+        assert_eq!(buf, "7.7");
+    }
+
+    #[test]
+    fn test_push_opt_f64_some_at_precision_2() {
+        let mut buf = String::new();
+        push_opt_f64(&mut buf, Some(0.123456), 2);
+        assert_eq!(buf, "0.12");
+    }
+
+    #[test]
+    fn test_push_opt_f64_some_at_precision_3() {
+        let mut buf = String::new();
+        push_opt_f64(&mut buf, Some(0.123456), 3);
+        assert_eq!(buf, "0.123");
+    }
+
+    #[test]
+    fn test_push_opt_f64_none_writes_unknown() {
+        let mut buf = String::new();
+        push_opt_f64(&mut buf, None, 2);
+        assert_eq!(buf, "unknown");
+    }
+
+    #[test]
+    fn test_push_opt_f64_appends_to_existing_content() {
+        // The buffer is not cleared — the helper appends. (Value chosen
+        // to avoid clippy::approx_constant lint that flags PI-like literals.)
+        let mut buf = String::from("prefix=");
+        push_opt_f64(&mut buf, Some(2.5), 1);
+        assert_eq!(buf, "prefix=2.5");
+    }
+
+    #[test]
+    fn test_push_opt_display_some_u64() {
+        let mut buf = String::new();
+        push_opt_display(&mut buf, Some(42u64));
+        assert_eq!(buf, "42");
+    }
+
+    #[test]
+    fn test_push_opt_display_some_bool() {
+        let mut buf = String::new();
+        push_opt_display(&mut buf, Some(true));
+        assert_eq!(buf, "true");
+    }
+
+    #[test]
+    fn test_push_opt_display_none_writes_unknown() {
+        let mut buf = String::new();
+        push_opt_display::<i64>(&mut buf, None);
+        assert_eq!(buf, "unknown");
+    }
+
+    #[test]
+    fn test_t11_helpers_match_old_format_behavior() {
+        // Byte-identical equivalence: the new push_opt_* helpers produce
+        // the same text the old `.map(|v| format!(...)).unwrap_or_else(||
+        // "unknown".to_string())` chains produced.
+        //
+        // pressure_disk_free_gb (precision 2):
+        let v = Some(123.456);
+        let old: String = v
+            .map(|value| format!("{value:.2}"))
+            .unwrap_or_else(|| "unknown".to_string());
+        let mut new_buf = String::new();
+        push_opt_f64(&mut new_buf, v, 2);
+        assert_eq!(old, new_buf, "precision-2 helper must match old format");
+
+        // pressure_disk_free_ratio (precision 3):
+        let old: String = v
+            .map(|value| format!("{value:.3}"))
+            .unwrap_or_else(|| "unknown".to_string());
+        let mut new_buf = String::new();
+        push_opt_f64(&mut new_buf, v, 3);
+        assert_eq!(old, new_buf, "precision-3 helper must match old format");
+
+        // pressure_telemetry_age_secs (Option<u64>):
+        let v: Option<u64> = Some(3600);
+        let old: String = v
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let mut new_buf = String::new();
+        push_opt_display(&mut new_buf, v);
+        assert_eq!(old, new_buf, "Display helper for u64 must match old format");
+
+        // None path for all three:
+        let none_f64: Option<f64> = None;
+        let old: String = none_f64
+            .map(|value| format!("{value:.2}"))
+            .unwrap_or_else(|| "unknown".to_string());
+        let mut new_buf = String::new();
+        push_opt_f64(&mut new_buf, none_f64, 2);
+        assert_eq!(
+            old, new_buf,
+            "None precision-2 helper must match old format"
+        );
+
+        let none_u64: Option<u64> = None;
+        let old: String = none_u64
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let mut new_buf = String::new();
+        push_opt_display(&mut new_buf, none_u64);
+        assert_eq!(old, new_buf, "None Display helper must match old format");
     }
 }
