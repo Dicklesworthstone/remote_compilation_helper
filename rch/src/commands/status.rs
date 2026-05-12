@@ -317,9 +317,9 @@ pub async fn diagnose(command: &str, dry_run: bool, ctx: &OutputContext) -> Resu
                 .ok()
         });
         let project = extract_project_name_with_policy(&topology_policy);
-        let toolchain = normalized_project_root
+        let toolchain = project_root
             .as_ref()
-            .or(project_root.as_ref())
+            .or(normalized_project_root.as_ref())
             .and_then(|root| detect_toolchain(root).ok());
         let preferred_workers = preferred_workers_from_env();
 
