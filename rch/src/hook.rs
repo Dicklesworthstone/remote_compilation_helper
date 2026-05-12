@@ -4651,6 +4651,17 @@ fn target_array_paths(table: &toml::Table, key: &str) -> Vec<PathBuf> {
         .collect()
 }
 
+fn table_string_array(table: &toml::Table, key: &str) -> Vec<String> {
+    table
+        .get(key)
+        .and_then(toml::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(toml::Value::as_str)
+        .map(str::to_string)
+        .collect()
+}
+
 fn package_auto_discovery_enabled(table: &toml::Table, key: &str) -> bool {
     table
         .get("package")
@@ -4744,6 +4755,118 @@ fn cargo_package_source_entrypoints(package_root: &Path) -> Vec<PathBuf> {
     paths.into_iter().collect()
 }
 
+fn cargo_manifest_table(package_root: &Path) -> Option<toml::Table> {
+    let manifest_path = package_root.join("Cargo.toml");
+    let contents = std::fs::read_to_string(&manifest_path).ok()?;
+    toml::from_str::<toml::Table>(&contents).ok()
+}
+
+fn has_glob_meta(pattern: &str) -> bool {
+    pattern
+        .bytes()
+        .any(|byte| matches!(byte, b'*' | b'?' | b'['))
+}
+
+fn path_slash_string(path: &Path) -> Option<String> {
+    Some(
+        path.to_str()?
+            .trim_start_matches("./")
+            .replace(std::path::MAIN_SEPARATOR, "/"),
+    )
+}
+
+fn workspace_exclude_matches(relative_member: &Path, exclude_patterns: &[String]) -> bool {
+    let Some(relative_member) = path_slash_string(relative_member) else {
+        return false;
+    };
+
+    exclude_patterns.iter().any(|pattern| {
+        let Some(pattern_path) = clean_relative_cargo_path(pattern) else {
+            return false;
+        };
+        let Some(pattern_slash) = path_slash_string(&pattern_path) else {
+            return false;
+        };
+        if has_glob_meta(&pattern_slash) {
+            glob::Pattern::new(&pattern_slash)
+                .map(|compiled| compiled.matches(&relative_member))
+                .unwrap_or(false)
+        } else {
+            relative_member == pattern_slash
+                || relative_member
+                    .strip_prefix(&pattern_slash)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+        }
+    })
+}
+
+fn workspace_member_manifest_paths(workspace_root: &Path) -> Vec<PathBuf> {
+    let Some(table) = cargo_manifest_table(workspace_root) else {
+        return Vec::new();
+    };
+    let Some(workspace) = table.get("workspace").and_then(toml::Value::as_table) else {
+        return Vec::new();
+    };
+
+    let members = table_string_array(workspace, "members");
+    let exclude_patterns = table_string_array(workspace, "exclude");
+    let mut manifests = std::collections::BTreeSet::<PathBuf>::new();
+
+    for member in members {
+        let Some(member_path) = clean_relative_cargo_path(&member) else {
+            continue;
+        };
+        if has_glob_meta(&member) {
+            let glob_path = workspace_root.join(&member_path).join("Cargo.toml");
+            let Some(glob_pattern) = glob_path.to_str() else {
+                continue;
+            };
+            let Ok(entries) = glob::glob(glob_pattern) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                if !entry.is_file() {
+                    continue;
+                }
+                let Ok(relative_manifest) = entry.strip_prefix(workspace_root) else {
+                    continue;
+                };
+                let Some(relative_member) = relative_manifest.parent() else {
+                    continue;
+                };
+                if !workspace_exclude_matches(relative_member, &exclude_patterns) {
+                    manifests.insert(relative_manifest.to_path_buf());
+                }
+            }
+        } else {
+            let relative_manifest = member_path.join("Cargo.toml");
+            if workspace_root.join(&relative_manifest).is_file()
+                && !workspace_exclude_matches(&member_path, &exclude_patterns)
+            {
+                manifests.insert(relative_manifest);
+            }
+        }
+    }
+
+    manifests.into_iter().collect()
+}
+
+fn cargo_workspace_member_source_entrypoints(workspace_root: &Path) -> Vec<PathBuf> {
+    let mut paths = std::collections::BTreeSet::<PathBuf>::new();
+    for manifest_path in workspace_member_manifest_paths(workspace_root) {
+        paths.insert(manifest_path.clone());
+        if let Some(member_root) = manifest_path.parent() {
+            paths.extend(
+                cargo_package_source_entrypoints(&workspace_root.join(member_root))
+                    .into_iter()
+                    .map(|entrypoint| member_root.join(entrypoint)),
+            );
+        }
+    }
+
+    paths.into_iter().collect()
+}
+
 fn dependency_preflight_checks_for_entry(
     entry: &SyncClosurePlanEntry,
 ) -> Vec<DependencyPreflightCheck> {
@@ -4761,6 +4884,20 @@ fn dependency_preflight_checks_for_entry(
     if entry.mode == SyncClosureMode::Full {
         checks.extend(
             cargo_package_source_entrypoints(&entry.local_root)
+                .into_iter()
+                .map(|relative_path| DependencyPreflightCheck {
+                    root: entry.remote_root.clone(),
+                    manifest: manifest.clone(),
+                    required_path: remote_root
+                        .join(relative_path)
+                        .to_string_lossy()
+                        .to_string(),
+                    required_kind: "source_entrypoint",
+                    is_primary: entry.is_primary,
+                }),
+        );
+        checks.extend(
+            cargo_workspace_member_source_entrypoints(&entry.local_root)
                 .into_iter()
                 .map(|relative_path| DependencyPreflightCheck {
                     root: entry.remote_root.clone(),
@@ -10068,6 +10205,181 @@ path = "custom/bin.rs"
                 PathBuf::from("custom/bin.rs"),
                 PathBuf::from("custom/lib.rs")
             ]
+        );
+    }
+
+    #[test]
+    fn test_workspace_member_source_entrypoints_include_all_targets_and_exclusions() {
+        let _guard = test_guard!();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let workspace_root = temp_dir.path().join("workspace");
+
+        for dir in [
+            "crates/core/src",
+            "crates/core/benches",
+            "crates/core/examples",
+            "crates/atlas-types/src",
+            "crates/skipped/src",
+            "tools/cli/src",
+        ] {
+            std::fs::create_dir_all(workspace_root.join(dir)).expect("create workspace dir");
+        }
+        std::fs::write(
+            workspace_root.join("Cargo.toml"),
+            r#"[workspace]
+members = ["crates/*", "tools/cli"]
+exclude = ["crates/skipped"]
+"#,
+        )
+        .expect("write workspace manifest");
+        for (manifest, name) in [
+            ("crates/core/Cargo.toml", "core"),
+            ("crates/atlas-types/Cargo.toml", "atlas-types"),
+            ("crates/skipped/Cargo.toml", "skipped"),
+            ("tools/cli/Cargo.toml", "cli"),
+        ] {
+            std::fs::write(
+                workspace_root.join(manifest),
+                format!(
+                    r#"[package]
+name = "{name}"
+version = "0.1.0"
+edition = "2024"
+"#
+                ),
+            )
+            .expect("write member manifest");
+        }
+        for path in [
+            "crates/core/src/lib.rs",
+            "crates/core/benches/interval_tree_bench.rs",
+            "crates/core/examples/atlas_packing_attestation.rs",
+            "crates/atlas-types/src/lib.rs",
+            "crates/skipped/src/lib.rs",
+            "tools/cli/src/lib.rs",
+        ] {
+            std::fs::write(workspace_root.join(path), "pub fn marker() {}\n")
+                .expect("write member entrypoint");
+        }
+
+        let entrypoints = cargo_workspace_member_source_entrypoints(&workspace_root);
+
+        for path in [
+            "crates/core/Cargo.toml",
+            "crates/core/src/lib.rs",
+            "crates/core/benches/interval_tree_bench.rs",
+            "crates/core/examples/atlas_packing_attestation.rs",
+            "crates/atlas-types/Cargo.toml",
+            "crates/atlas-types/src/lib.rs",
+            "tools/cli/Cargo.toml",
+            "tools/cli/src/lib.rs",
+        ] {
+            assert!(
+                entrypoints.contains(&PathBuf::from(path)),
+                "missing workspace member entrypoint {path}"
+            );
+        }
+        assert!(
+            !entrypoints
+                .iter()
+                .any(|path| path.starts_with("crates/skipped")),
+            "workspace exclude entries must not be preflighted"
+        );
+    }
+
+    #[test]
+    fn test_dependency_preflight_checks_expand_virtual_workspace_all_targets() {
+        let _guard = test_guard!();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let workspace_root = temp_dir.path().join("frankenterm");
+
+        for dir in [
+            "crates/frankenterm-core/src",
+            "crates/frankenterm-core/benches",
+            "crates/frankenterm-core/examples",
+            "crates/frankenterm-core-atlas-pack-types/src",
+            "crates/frankenterm-core-connectors/src",
+            "crates/skipped/src",
+        ] {
+            std::fs::create_dir_all(workspace_root.join(dir)).expect("create workspace dir");
+        }
+        std::fs::write(
+            workspace_root.join("Cargo.toml"),
+            r#"[workspace]
+members = ["crates/frankenterm-core", "crates/frankenterm-core-*", "crates/skipped"]
+exclude = ["crates/skipped"]
+"#,
+        )
+        .expect("write workspace manifest");
+        for (manifest, name) in [
+            ("crates/frankenterm-core/Cargo.toml", "frankenterm-core"),
+            (
+                "crates/frankenterm-core-atlas-pack-types/Cargo.toml",
+                "frankenterm-core-atlas-pack-types",
+            ),
+            (
+                "crates/frankenterm-core-connectors/Cargo.toml",
+                "frankenterm-core-connectors",
+            ),
+            ("crates/skipped/Cargo.toml", "skipped"),
+        ] {
+            std::fs::write(
+                workspace_root.join(manifest),
+                format!(
+                    r#"[package]
+name = "{name}"
+version = "0.1.0"
+edition = "2024"
+"#
+                ),
+            )
+            .expect("write member manifest");
+        }
+        for path in [
+            "crates/frankenterm-core/src/lib.rs",
+            "crates/frankenterm-core/benches/interval_tree_bench.rs",
+            "crates/frankenterm-core/examples/atlas_packing_attestation.rs",
+            "crates/frankenterm-core-atlas-pack-types/src/lib.rs",
+            "crates/frankenterm-core-connectors/src/lib.rs",
+            "crates/skipped/src/lib.rs",
+        ] {
+            std::fs::write(workspace_root.join(path), "pub fn marker() {}\n")
+                .expect("write member entrypoint");
+        }
+        let entry = SyncClosurePlanEntry {
+            local_root: workspace_root,
+            remote_root: "/data/projects/frankenterm".to_string(),
+            project_id: "frankenterm".to_string(),
+            root_hash: "frankenterm-hash".to_string(),
+            is_primary: true,
+            mode: SyncClosureMode::Full,
+        };
+
+        let checks = dependency_preflight_checks_for_entry(&entry);
+        let required_paths = checks
+            .iter()
+            .map(|check| check.required_path.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        for path in [
+            "/data/projects/frankenterm/Cargo.toml",
+            "/data/projects/frankenterm/crates/frankenterm-core/Cargo.toml",
+            "/data/projects/frankenterm/crates/frankenterm-core/src/lib.rs",
+            "/data/projects/frankenterm/crates/frankenterm-core/benches/interval_tree_bench.rs",
+            "/data/projects/frankenterm/crates/frankenterm-core/examples/atlas_packing_attestation.rs",
+            "/data/projects/frankenterm/crates/frankenterm-core-atlas-pack-types/src/lib.rs",
+            "/data/projects/frankenterm/crates/frankenterm-core-connectors/src/lib.rs",
+        ] {
+            assert!(
+                required_paths.contains(path),
+                "missing dependency preflight check for {path}"
+            );
+        }
+        assert!(
+            !required_paths
+                .iter()
+                .any(|path| path.contains("/crates/skipped/")),
+            "workspace excluded members must not be preflighted"
         );
     }
 
