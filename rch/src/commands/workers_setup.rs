@@ -734,8 +734,17 @@ fn shell_escape_str(s: &str) -> String {
     if s.is_empty() {
         return "''".to_string();
     }
-    if s.chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '_' | '.'))
+    // Force quoting when the first char is `-`: even if every other
+    // character is "safe", `mkdir -p -weird-name` would parse the
+    // path as a flag. Quoting (`'-weird-name'`) makes shell treat it
+    // as a positional argument. The realistic case for path_topology
+    // is an absolute path starting with `/`, so this guard only
+    // matters for pathological configs — but it's a one-line
+    // hardening that closes a config-as-shell-injection adjacency.
+    let starts_with_dash = s.starts_with('-');
+    if !starts_with_dash
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '_' | '.'))
     {
         // Safe ASCII-identifier-ish — no quoting needed.
         return s.to_string();
@@ -1920,6 +1929,26 @@ mod tests {
             "canonical path must escape single quotes: {command}"
         );
         log_test_pass("topology_bootstrap_alias_check_command_shell_escapes_configured_paths");
+    }
+
+    // Regression: a path starting with `-` (rare but possible in a
+    // pathological path_topology config) must be force-quoted so it
+    // can't be parsed by mkdir/ln as a flag. Without quoting, the
+    // safe-char check would happily emit `mkdir -p -weird-name` and
+    // mkdir would error with "invalid option -- 'w'".
+    #[test]
+    fn shell_escape_str_force_quotes_paths_starting_with_dash() {
+        let escaped = shell_escape_str("-weird-name");
+        assert!(
+            escaped.starts_with('\'') && escaped.ends_with('\''),
+            "leading-dash path must be quoted; got: {escaped}"
+        );
+        // Sanity: real absolute paths starting with `/` stay unquoted.
+        let absolute = shell_escape_str("/data/projects");
+        assert_eq!(
+            absolute, "/data/projects",
+            "absolute path with only safe chars must NOT be quoted"
+        );
     }
 
     #[cfg(unix)]
