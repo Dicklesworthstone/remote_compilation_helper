@@ -24,7 +24,7 @@ use crate::ui::theme::{StatusIndicator, Theme};
 use tracing::debug;
 
 use super::helpers::{
-    classify_ssh_error, default_socket_path, format_ssh_report, indent_lines,
+    classify_ssh_error, configured_socket_path, format_ssh_report, indent_lines,
     major_version_mismatch, runtime_label, rust_version_mismatch, send_daemon_command,
     ssh_error_code, urlencoding_encode,
 };
@@ -51,12 +51,32 @@ pub(super) fn has_any_capabilities(capabilities: &WorkerCapabilities) -> bool {
 /// Uses tokio async to spawn all 4 version checks concurrently, reducing total
 /// latency from ~200ms (sequential) to ~50ms (parallel).
 pub(super) async fn probe_local_capabilities() -> WorkerCapabilities {
-    async fn run_version(cmd: &str, args: &[&str]) -> Option<String> {
-        let output = tokio::process::Command::new(cmd)
-            .args(args)
-            .output()
-            .await
-            .ok()?;
+    fn rustc_version_command() -> tokio::process::Command {
+        let mut command = tokio::process::Command::new("rustc");
+        command.arg("--version");
+        command
+    }
+
+    fn bun_version_command() -> tokio::process::Command {
+        let mut command = tokio::process::Command::new("bun");
+        command.arg("--version");
+        command
+    }
+
+    fn node_version_command() -> tokio::process::Command {
+        let mut command = tokio::process::Command::new("node");
+        command.arg("--version");
+        command
+    }
+
+    fn npm_version_command() -> tokio::process::Command {
+        let mut command = tokio::process::Command::new("npm");
+        command.arg("--version");
+        command
+    }
+
+    async fn run_version(mut command: tokio::process::Command) -> Option<String> {
+        let output = command.output().await.ok()?;
         if !output.status.success() {
             return None;
         }
@@ -71,10 +91,10 @@ pub(super) async fn probe_local_capabilities() -> WorkerCapabilities {
 
     // Run all version checks in parallel
     let (rustc, bun, node, npm) = tokio::join!(
-        run_version("rustc", &["--version"]),
-        run_version("bun", &["--version"]),
-        run_version("node", &["--version"]),
-        run_version("npm", &["--version"]),
+        run_version(rustc_version_command()),
+        run_version(bun_version_command()),
+        run_version(node_version_command()),
+        run_version(npm_version_command()),
     );
 
     let mut caps = WorkerCapabilities::new();
@@ -1093,7 +1113,7 @@ pub async fn workers_drain(worker_id: &str, skip_confirm: bool, ctx: &OutputCont
     let style = ctx.theme();
 
     // Check if daemon is running
-    let socket_path_str = default_socket_path();
+    let socket_path_str = configured_socket_path()?;
     if !Path::new(&socket_path_str).exists() {
         if ctx.is_json() {
             let _ = ctx.json(&ApiResponse::<()>::err(
@@ -1136,7 +1156,12 @@ pub async fn workers_drain(worker_id: &str, skip_confirm: bool, ctx: &OutputCont
     }
 
     // Send drain command to daemon
-    match send_daemon_command(&format!("POST /workers/{}/drain\n", worker_id)).await {
+    match send_daemon_command(&format!(
+        "POST /workers/{}/drain\n",
+        urlencoding_encode(worker_id)
+    ))
+    .await
+    {
         Ok(response) => {
             if response.contains("error") || response.contains("Error") {
                 if ctx.is_json() {
@@ -1205,7 +1230,8 @@ pub async fn workers_drain(worker_id: &str, skip_confirm: bool, ctx: &OutputCont
 pub async fn workers_enable(worker_id: &str, ctx: &OutputContext) -> Result<()> {
     let style = ctx.theme();
 
-    if !Path::new(&default_socket_path()).exists() {
+    let socket_path_str = configured_socket_path()?;
+    if !Path::new(&socket_path_str).exists() {
         if ctx.is_json() {
             let _ = ctx.json(&ApiResponse::<()>::err(
                 "workers enable",
@@ -1221,7 +1247,12 @@ pub async fn workers_enable(worker_id: &str, ctx: &OutputContext) -> Result<()> 
         return Ok(());
     }
 
-    match send_daemon_command(&format!("POST /workers/{}/enable\n", worker_id)).await {
+    match send_daemon_command(&format!(
+        "POST /workers/{}/enable\n",
+        urlencoding_encode(worker_id)
+    ))
+    .await
+    {
         Ok(response) => {
             if response.contains("error") || response.contains("Error") {
                 if ctx.is_json() {
@@ -1292,7 +1323,8 @@ pub async fn workers_disable(
 
     let style = ctx.theme();
 
-    if !Path::new(&default_socket_path()).exists() {
+    let socket_path_str = configured_socket_path()?;
+    if !Path::new(&socket_path_str).exists() {
         if ctx.is_json() {
             let _ = ctx.json(&ApiResponse::<()>::err(
                 "workers disable",
@@ -1337,7 +1369,7 @@ pub async fn workers_disable(
     }
 
     // Build the request URL with optional reason and drain flag
-    let mut url = format!("POST /workers/{}/disable", worker_id);
+    let mut url = format!("POST /workers/{}/disable", urlencoding_encode(worker_id));
     let mut query_parts = Vec::new();
     if let Some(ref r) = reason {
         query_parts.push(format!("reason={}", urlencoding_encode(r)));

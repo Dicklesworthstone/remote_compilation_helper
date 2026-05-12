@@ -23,8 +23,19 @@ const DAEMON_COMMAND_IO_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Get the default socket path.
 /// Uses XDG_RUNTIME_DIR if available, falls back to ~/.cache/rch/rch.sock, then /tmp/rch.sock.
+#[cfg(test)]
 pub fn default_socket_path() -> String {
     rch_common::default_socket_path()
+}
+
+/// Resolve the daemon socket path from the active RCH configuration.
+///
+/// Commands that talk to `rchd` must use this instead of the compiled-in
+/// default; otherwise a custom `general.socket_path` can start the daemon on
+/// one socket while hooks and status commands query another.
+pub(crate) fn configured_socket_path() -> Result<String> {
+    let config = crate::config::load_config()?;
+    Ok(shellexpand::tilde(&config.general.socket_path).into_owned())
 }
 
 // ============================================================================
@@ -508,6 +519,26 @@ mod tests {
         assert_eq!(urlencoding_encode("hello world"), "hello%20world");
         assert_eq!(urlencoding_encode("a/b?c=d"), "a%2Fb%3Fc%3Dd");
     }
+
+    #[test]
+    fn configured_socket_path_uses_active_config() {
+        let _guard = rch_common::test_guard!();
+        struct ResetConfigOverride;
+        impl Drop for ResetConfigOverride {
+            fn drop(&mut self) {
+                crate::config::set_test_config_override(None);
+            }
+        }
+
+        let mut config = rch_common::RchConfig::default();
+        config.general.socket_path = "/tmp/rch-custom-test.sock".to_string();
+        crate::config::set_test_config_override(Some(config));
+        let _reset = ResetConfigOverride;
+
+        let socket_path = configured_socket_path().expect("configured socket path");
+
+        assert_eq!(socket_path, "/tmp/rch-custom-test.sock");
+    }
 }
 
 // ============================================================================
@@ -644,9 +675,8 @@ pub async fn send_daemon_command(_command: &str) -> Result<String> {
 /// Helper to send command to daemon socket.
 #[cfg(unix)]
 pub async fn send_daemon_command(command: &str) -> Result<String> {
-    let config = crate::config::load_config()?;
-    let expanded = shellexpand::tilde(&config.general.socket_path);
-    let socket_path = Path::new(expanded.as_ref());
+    let socket_path_str = configured_socket_path()?;
+    let socket_path = Path::new(&socket_path_str);
     if !socket_path.exists() {
         return Err(DaemonError::SocketNotFound {
             socket_path: socket_path.display().to_string(),

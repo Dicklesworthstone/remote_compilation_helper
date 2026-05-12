@@ -6,14 +6,14 @@
 use crate::status_types::extract_json_body;
 use crate::ui::context::OutputContext;
 use crate::ui::theme::StatusIndicator;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rch_common::{ApiError, ApiResponse, ErrorCode};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::process::Command;
 
-use super::helpers::default_socket_path;
+use super::helpers::configured_socket_path;
 use super::types::{
     DaemonActionResponse, DaemonLogsResponse, DaemonReloadResponse, DaemonStatusResponse,
 };
@@ -59,13 +59,46 @@ fn which_rchd() -> PathBuf {
     which::which("rchd").unwrap_or_else(|_| PathBuf::from("rchd"))
 }
 
+fn daemon_start_args(socket_path: &Path) -> [&std::ffi::OsStr; 2] {
+    [std::ffi::OsStr::new("--socket"), socket_path.as_os_str()]
+}
+
+fn ensure_socket_parent(socket_path: &Path) -> Result<()> {
+    if let Some(parent) = socket_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create daemon socket parent directory {}",
+                parent.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+async fn daemon_responds_on_configured_socket() -> bool {
+    send_daemon_command("GET /health\n").await.is_ok()
+}
+
+async fn wait_for_daemon_ready() -> bool {
+    for _ in 0..20 {
+        if daemon_responds_on_configured_socket().await {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    false
+}
+
 // =============================================================================
 // Daemon Commands
 // =============================================================================
 
 /// Check daemon status.
 pub fn daemon_status(ctx: &OutputContext) -> Result<()> {
-    let socket_path_str = default_socket_path();
+    let socket_path_str = configured_socket_path()?;
     let socket_path = Path::new(&socket_path_str);
     let style = ctx.theme();
 
@@ -148,10 +181,10 @@ pub fn daemon_status(ctx: &OutputContext) -> Result<()> {
 /// Start the daemon.
 pub async fn daemon_start(ctx: &OutputContext) -> Result<()> {
     let style = ctx.theme();
-    let socket_path_str = default_socket_path();
+    let socket_path_str = configured_socket_path()?;
     let socket_path = Path::new(&socket_path_str);
 
-    if socket_path.exists() {
+    if socket_path.exists() && daemon_responds_on_configured_socket().await {
         if ctx.is_json() {
             let _ = ctx.json(&ApiResponse::ok(
                 "daemon start",
@@ -181,6 +214,13 @@ pub async fn daemon_start(ctx: &OutputContext) -> Result<()> {
         }
         return Ok(());
     }
+    if socket_path.exists() && !ctx.is_json() {
+        println!(
+            "{} Found stale daemon socket at {}; starting rchd will replace it.",
+            StatusIndicator::Warning.display(style),
+            style.value(&socket_path_str)
+        );
+    }
 
     // Check if rchd binary exists
     let rchd_path = which_rchd();
@@ -189,11 +229,14 @@ pub async fn daemon_start(ctx: &OutputContext) -> Result<()> {
         println!("Starting RCH daemon...");
     }
     tracing::debug!("Using rchd binary: {:?}", rchd_path);
+    ensure_socket_parent(socket_path)?;
 
     // Spawn rchd in background using nohup to detach from terminal
     // This avoids needing unsafe code for setsid()
     let mut cmd = Command::new("nohup");
+    let daemon_args = daemon_start_args(socket_path);
     cmd.arg(&rchd_path)
+        .args(daemon_args)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .stdin(Stdio::null())
@@ -201,10 +244,7 @@ pub async fn daemon_start(ctx: &OutputContext) -> Result<()> {
 
     match cmd.spawn() {
         Ok(_child) => {
-            // Wait a moment for the socket to appear
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-            if socket_path.exists() {
+            if wait_for_daemon_ready().await {
                 if ctx.is_json() {
                     let _ = ctx.json(&ApiResponse::ok(
                         "daemon start",
@@ -234,12 +274,12 @@ pub async fn daemon_start(ctx: &OutputContext) -> Result<()> {
                         action: "start".to_string(),
                         success: false,
                         socket_path: socket_path_str.clone(),
-                        message: Some("Process started but socket not found".to_string()),
+                        message: Some("Process started but daemon did not respond".to_string()),
                     },
                 ));
             } else {
                 println!(
-                    "{} Daemon process started but socket not found.",
+                    "{} Daemon process started but did not respond on its configured socket.",
                     StatusIndicator::Warning.display(style)
                 );
                 println!(
@@ -280,7 +320,7 @@ pub async fn daemon_stop(skip_confirm: bool, ctx: &OutputContext) -> Result<()> 
     use dialoguer::Confirm;
 
     let style = ctx.theme();
-    let socket_path_str = default_socket_path();
+    let socket_path_str = configured_socket_path()?;
     let socket_path = Path::new(&socket_path_str);
 
     if !socket_path.exists() {
@@ -449,7 +489,7 @@ pub async fn daemon_restart(skip_confirm: bool, ctx: &OutputContext) -> Result<(
     let style = ctx.theme();
 
     // Check for active builds and prompt for confirmation before restarting
-    let socket_path_str = default_socket_path();
+    let socket_path_str = configured_socket_path()?;
     let socket_path = Path::new(&socket_path_str);
     if !skip_confirm
         && !ctx.is_json()
@@ -493,9 +533,10 @@ pub async fn daemon_restart(skip_confirm: bool, ctx: &OutputContext) -> Result<(
 /// Reload daemon configuration without restart.
 pub async fn daemon_reload(ctx: &OutputContext) -> Result<()> {
     let style = ctx.theme();
+    let socket_path_str = configured_socket_path()?;
 
     // Check if daemon is running
-    if !Path::new(&default_socket_path()).exists() {
+    if !Path::new(&socket_path_str).exists() {
         if ctx.is_json() {
             let _ = ctx.json(&ApiResponse::<()>::err(
                 "daemon reload",
@@ -758,6 +799,16 @@ pub fn daemon_logs(lines: usize, ctx: &OutputContext) -> Result<()> {
 mod tests {
     use super::*;
     use rch_common::test_guard;
+
+    #[test]
+    fn daemon_start_args_pin_configured_socket_path() {
+        let _guard = test_guard!();
+        let socket_path = Path::new("/tmp/rch-custom.sock");
+        let args = daemon_start_args(socket_path);
+
+        assert_eq!(args[0], std::ffi::OsStr::new("--socket"));
+        assert_eq!(args[1], socket_path.as_os_str());
+    }
 
     #[test]
     fn reload_api_response_parses_http_10_with_headers() {
