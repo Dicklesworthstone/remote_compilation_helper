@@ -1013,11 +1013,12 @@ enum AutoStartError {
 #[derive(Debug)]
 struct AutoStartLock {
     path: PathBuf,
+    body: String,
 }
 
 impl Drop for AutoStartLock {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        let _ = remove_autostart_lock_if_unchanged(&self.path, &self.body);
     }
 }
 
@@ -1108,6 +1109,17 @@ fn parse_autostart_lock_body(s: &str) -> Option<ParsedLock> {
         created_at_secs,
         hostname,
     })
+}
+
+fn remove_autostart_lock_if_unchanged(path: &Path, expected_body: &str) -> bool {
+    match std::fs::read_to_string(path) {
+        Ok(current_body) if current_body == expected_body => match std::fs::remove_file(path) {
+            Ok(()) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+            Err(_) => false,
+        },
+        _ => false,
+    }
 }
 
 /// Check whether a PID is alive. On Unix: send signal 0 (no-op) — if
@@ -1206,6 +1218,7 @@ fn acquire_autostart_lock(path: &Path) -> Result<AutoStartLock, AutoStartError> 
             );
             Ok(AutoStartLock {
                 path: path.to_path_buf(),
+                body,
             })
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -1228,32 +1241,30 @@ fn acquire_autostart_lock(path: &Path) -> Result<AutoStartLock, AutoStartError> 
                         }
                     };
                     if stale {
-                        // Atomic replace: move the stale file aside (forensics)
-                        // then create_new again. The remove+create race is
-                        // benign — if two callers race, exactly one wins the
-                        // recreate; the other gets AlreadyExists and either
-                        // tries again or returns LockHeld.
-                        tracing::warn!(
-                            target: "rch::hook::autostart_lock",
-                            path = %path.display(),
-                            holder_pid = ?parsed.as_ref().map(|p| p.pid),
-                            holder_host = ?parsed.as_ref().map(|p| p.hostname.clone()),
-                            holder_age_secs = ?parsed.as_ref().map(|p| {
-                                SystemTime::now()
-                                    .duration_since(UNIX_EPOCH)
-                                    .unwrap_or(Duration::from_secs(0))
-                                    .as_secs()
-                                    .saturating_sub(p.created_at_secs)
-                            }),
-                            "doctor.autostart_lock.stale_replaced",
-                        );
-                        let _ = std::fs::remove_file(path);
+                        if !remove_autostart_lock_if_unchanged(path, &existing) {
+                            return Err(AutoStartError::LockHeld);
+                        }
                         match OpenOptions::new().write(true).create_new(true).open(path) {
                             Ok(mut f) => {
                                 let _ = std::io::Write::write_all(&mut f, body.as_bytes());
                                 let _ = f.sync_all();
+                                tracing::warn!(
+                                    target: "rch::hook::autostart_lock",
+                                    path = %path.display(),
+                                    holder_pid = ?parsed.as_ref().map(|p| p.pid),
+                                    holder_host = ?parsed.as_ref().map(|p| p.hostname.clone()),
+                                    holder_age_secs = ?parsed.as_ref().map(|p| {
+                                        SystemTime::now()
+                                            .duration_since(UNIX_EPOCH)
+                                            .unwrap_or(Duration::from_secs(0))
+                                            .as_secs()
+                                            .saturating_sub(p.created_at_secs)
+                                    }),
+                                    "doctor.autostart_lock.stale_replaced",
+                                );
                                 Ok(AutoStartLock {
                                     path: path.to_path_buf(),
+                                    body,
                                 })
                             }
                             // Lost the race to recreate — another contender won.
@@ -11756,6 +11767,30 @@ edition = "2024"
         assert!(lock2.is_ok(), "Should be able to reacquire lock after drop");
     }
 
+    #[test]
+    fn test_autostart_lock_drop_preserves_replaced_lock_body() {
+        let _guard = test_guard!();
+        let temp_dir = create_test_state_dir();
+        let lock_path = temp_dir.path().join("autostart.lock");
+
+        let lock = super::acquire_autostart_lock(&lock_path).expect("fresh acquire");
+        let replacement_body = format!(
+            "{}\n{}\n{}-replacement\n",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            our_hostname()
+        );
+        std::fs::write(&lock_path, &replacement_body).expect("replace lock body");
+
+        drop(lock);
+
+        let body = std::fs::read_to_string(&lock_path).expect("replacement should remain");
+        assert_eq!(body, replacement_body);
+    }
+
     // ========================================================================
     // t17 — stale-PID detection on autostart lockfile
     // ========================================================================
@@ -11902,6 +11937,25 @@ edition = "2024"
             "Old lockfile (TTL exceeded) should be stale-replaced even when PID is alive; got {:?}",
             lock.err()
         );
+    }
+
+    #[test]
+    fn test_autostart_stale_sweep_preserves_changed_lock_body() {
+        let _guard = test_guard!();
+        let temp_dir = create_test_state_dir();
+        let lock_path = temp_dir.path().join("autostart.lock");
+
+        write_lockfile(&lock_path, std::process::id(), 120, &our_hostname());
+        let observed_stale_body = std::fs::read_to_string(&lock_path).expect("read stale body");
+        let replacement_body = super::render_autostart_lock_body();
+        std::fs::write(&lock_path, &replacement_body).expect("replace lock body");
+
+        assert!(
+            !super::remove_autostart_lock_if_unchanged(&lock_path, &observed_stale_body),
+            "changed lock body must not be removed"
+        );
+        let body = std::fs::read_to_string(&lock_path).expect("replacement should remain");
+        assert_eq!(body, replacement_body);
     }
 
     #[test]
