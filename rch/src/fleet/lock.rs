@@ -8,8 +8,9 @@
 //! - Lock file: `$XDG_RUNTIME_DIR/rch/fleet_op.lock`, falling back to
 //!   `${TMPDIR:-/tmp}/rch-<uid>/fleet_op.lock`.
 //! - Acquisition is an atomic `O_CREAT|O_EXCL` create. The file contents are
-//!   a single line: `<pid> <operation> <start-unix-seconds>`.
-//! - Release removes the file (RAII via [`FleetLockGuard::drop`]).
+//!   a single line: `<pid> <operation> <start-unix-seconds> <token>`.
+//! - Release removes the file only if it still contains the body this process
+//!   wrote (RAII via [`FleetLockGuard::drop`]).
 //! - Staleness: if the file exists but its recorded PID is no longer running
 //!   (checked via `/proc/<pid>` on Linux), the file is removed and the
 //!   acquisition retried once.
@@ -25,6 +26,7 @@ use anyhow::{Context, Result, anyhow};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Environment variable controlling how long to wait for a conflicting
@@ -36,6 +38,8 @@ pub const RCH_FLEET_WAIT_SECS_ENV: &str = "RCH_FLEET_WAIT_SECS";
 /// other RCH runtime state.
 const LOCK_FILENAME: &str = "fleet_op.lock";
 
+static LOCK_TOKEN_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
 /// RAII guard that removes the lock file when dropped.
 ///
 /// Drop is best-effort: if removal fails (e.g. the file was already deleted
@@ -43,20 +47,17 @@ const LOCK_FILENAME: &str = "fleet_op.lock";
 #[derive(Debug)]
 pub struct FleetLockGuard {
     path: PathBuf,
+    body: String,
 }
 
 impl Drop for FleetLockGuard {
     fn drop(&mut self) {
-        if let Err(err) = std::fs::remove_file(&self.path) {
-            // Missing file is fine — someone else cleaned it up. Anything
-            // else we want to hear about but not panic over.
-            if err.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(
-                    path = %self.path.display(),
-                    error = %err,
-                    "failed to remove fleet lock on drop"
-                );
-            }
+        if let Err(err) = remove_lock_if_unchanged(&self.path, &self.body) {
+            tracing::warn!(
+                path = %self.path.display(),
+                error = %err,
+                "failed to remove fleet lock on drop"
+            );
         }
     }
 }
@@ -67,6 +68,7 @@ pub struct LockHolder {
     pub pid: u32,
     pub operation: String,
     pub started_at_unix: u64,
+    body: String,
 }
 
 impl LockHolder {
@@ -97,7 +99,7 @@ pub fn acquire(operation: &str) -> Result<FleetLockGuard> {
 
     loop {
         match try_create_lock(&path, operation) {
-            Ok(()) => return Ok(FleetLockGuard { path }),
+            Ok(body) => return Ok(FleetLockGuard { path, body }),
             Err(LockError::AlreadyHeld(holder)) => {
                 // One-shot sweep: if the recorded holder is no longer running,
                 // reclaim the file and retry. We only do this once per call so
@@ -141,17 +143,12 @@ enum LockError {
     Io(std::io::Error),
 }
 
-fn try_create_lock(path: &Path, operation: &str) -> Result<(), LockError> {
+fn try_create_lock(path: &Path, operation: &str) -> Result<String, LockError> {
     match OpenOptions::new().write(true).create_new(true).open(path) {
         Ok(mut file) => {
-            let payload = format!(
-                "{} {} {}\n",
-                std::process::id(),
-                sanitize_operation(operation),
-                unix_now()
-            );
+            let payload = render_lock_body(operation);
             file.write_all(payload.as_bytes()).map_err(LockError::Io)?;
-            Ok(())
+            Ok(payload)
         }
         Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
             match read_holder(path) {
@@ -164,6 +161,7 @@ fn try_create_lock(path: &Path, operation: &str) -> Result<(), LockError> {
                         pid: 0,
                         operation: "unknown".to_string(),
                         started_at_unix: 0,
+                        body: String::new(),
                     }))
                 }
             }
@@ -178,26 +176,55 @@ fn try_sweep_stale(path: &Path, holder: &LockHolder) -> Result<bool> {
     // acquired the lock in between.
     match std::fs::read_to_string(path) {
         Ok(contents) => {
-            let current = parse_holder(&contents);
-            match current {
-                Some(now)
-                    if now.pid == holder.pid && now.started_at_unix == holder.started_at_unix =>
-                {
-                    std::fs::remove_file(path)
-                        .with_context(|| format!("failed to remove stale fleet lock {:?}", path))?;
-                    tracing::warn!(
-                        stale_pid = holder.pid,
-                        lock = %path.display(),
-                        "removed stale fleet lock owned by non-running pid"
-                    );
-                    Ok(true)
+            if contents == holder.body {
+                match parse_holder(&contents) {
+                    Some(now) if now.pid == holder.pid => {
+                        std::fs::remove_file(path).with_context(|| {
+                            format!("failed to remove stale fleet lock {:?}", path)
+                        })?;
+                        tracing::warn!(
+                            stale_pid = holder.pid,
+                            lock = %path.display(),
+                            "removed stale fleet lock owned by non-running pid"
+                        );
+                        Ok(true)
+                    }
+                    _ => Ok(false),
                 }
-                _ => Ok(false),
+            } else {
+                Ok(false)
             }
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(true),
         Err(err) => Err(err).with_context(|| format!("failed to read fleet lock {:?}", path)),
     }
+}
+
+fn remove_lock_if_unchanged(path: &Path, expected_body: &str) -> std::io::Result<()> {
+    match std::fs::read_to_string(path) {
+        Ok(current) if current == expected_body => {
+            std::fs::remove_file(path)?;
+            Ok(())
+        }
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+fn render_lock_body(operation: &str) -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO);
+    let sequence = LOCK_TOKEN_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "{} {} {} {:x}-{:x}\n",
+        std::process::id(),
+        sanitize_operation(operation),
+        now.as_secs(),
+        now.as_nanos(),
+        sequence
+    )
 }
 
 fn read_holder(path: &Path) -> Result<LockHolder> {
@@ -217,6 +244,7 @@ fn parse_holder(contents: &str) -> Option<LockHolder> {
         pid,
         operation,
         started_at_unix: started,
+        body: contents.to_string(),
     })
 }
 
@@ -294,8 +322,9 @@ mod tests {
     #[test]
     fn try_create_lock_succeeds_when_unheld() {
         with_temp_runtime(|path| {
-            try_create_lock(path, "fleet-deploy").expect("acquire");
+            let body = try_create_lock(path, "fleet-deploy").expect("acquire");
             assert!(path.exists());
+            assert_eq!(std::fs::read_to_string(path).unwrap(), body);
             let holder = read_holder(path).expect("holder");
             assert_eq!(holder.pid, std::process::id());
             assert_eq!(holder.operation, "fleet-deploy");
@@ -306,12 +335,11 @@ mod tests {
     fn try_create_lock_fails_when_held() {
         with_temp_runtime(|path| {
             try_create_lock(path, "fleet-deploy").expect("first");
-            match try_create_lock(path, "fleet-deploy") {
-                Err(LockError::AlreadyHeld(h)) => {
-                    assert_eq!(h.pid, std::process::id());
-                    assert_eq!(h.operation, "fleet-deploy");
-                }
-                other => panic!("expected AlreadyHeld, got {:?}", other),
+            let result = try_create_lock(path, "fleet-deploy");
+            assert!(matches!(result, Err(LockError::AlreadyHeld(_))));
+            if let Err(LockError::AlreadyHeld(h)) = result {
+                assert_eq!(h.pid, std::process::id());
+                assert_eq!(h.operation, "fleet-deploy");
             }
         });
     }
@@ -330,7 +358,59 @@ mod tests {
     }
 
     #[test]
+    fn guard_drop_preserves_replaced_lock_body() {
+        with_temp_runtime(|path| {
+            let body = try_create_lock(path, "fleet-deploy").expect("acquire");
+            let guard = FleetLockGuard {
+                path: path.to_path_buf(),
+                body,
+            };
+            let replacement = "0 fleet-drain 1700000000 replacement\n";
+            std::fs::write(path, replacement).unwrap();
+
+            drop(guard);
+
+            assert_eq!(std::fs::read_to_string(path).unwrap(), replacement);
+        });
+    }
+
+    #[test]
+    fn stale_sweep_preserves_changed_lock_body() {
+        with_temp_runtime(|path| {
+            std::fs::write(path, "0 fleet-deploy 1700000000 original\n").unwrap();
+            let holder = read_holder(path).unwrap();
+            std::fs::write(path, "0 fleet-drain 1700000000 replacement\n").unwrap();
+
+            let swept = try_sweep_stale(path, &holder).unwrap();
+
+            assert!(!swept);
+            assert_eq!(
+                std::fs::read_to_string(path).unwrap(),
+                "0 fleet-drain 1700000000 replacement\n"
+            );
+        });
+    }
+
+    #[test]
+    fn render_lock_body_uses_unique_tokens() {
+        let body1 = render_lock_body("fleet-deploy");
+        let body2 = render_lock_body("fleet-deploy");
+
+        assert_ne!(body1, body2);
+        assert!(parse_holder(&body1).is_some());
+        assert!(parse_holder(&body2).is_some());
+    }
+
+    #[test]
     fn parse_holder_roundtrips() {
+        let h = parse_holder("12345 fleet-deploy 1700000000 token\n").unwrap();
+        assert_eq!(h.pid, 12345);
+        assert_eq!(h.operation, "fleet-deploy");
+        assert_eq!(h.started_at_unix, 1700000000);
+    }
+
+    #[test]
+    fn parse_holder_accepts_legacy_three_field_locks() {
         let h = parse_holder("12345 fleet-deploy 1700000000\n").unwrap();
         assert_eq!(h.pid, 12345);
         assert_eq!(h.operation, "fleet-deploy");
