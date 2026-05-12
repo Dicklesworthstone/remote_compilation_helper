@@ -3705,22 +3705,22 @@ mod tests {
     fn test_parse_ready_status_unknown_preserves_normalized_input() {
         // The Unrecognized variant carries the trim+lowered value so the
         // resulting diagnostic can surface it to operators.
-        match parse_worker_ready_status("  PARKED  ") {
-            ParsedStatus::Unrecognized(raw) => assert_eq!(raw, "parked"),
-            other => panic!("expected Unrecognized, got {other:?}"),
-        }
+        assert_eq!(
+            parse_worker_ready_status("  PARKED  "),
+            ParsedStatus::Unrecognized("parked".to_string())
+        );
     }
 
     #[test]
     fn test_parse_ready_status_empty_string_unrecognized() {
-        match parse_worker_ready_status("") {
-            ParsedStatus::Unrecognized(raw) => assert_eq!(raw, ""),
-            other => panic!("expected Unrecognized for empty, got {other:?}"),
-        }
-        match parse_worker_ready_status("   \t  ") {
-            ParsedStatus::Unrecognized(raw) => assert_eq!(raw, ""),
-            other => panic!("expected Unrecognized for whitespace-only, got {other:?}"),
-        }
+        assert_eq!(
+            parse_worker_ready_status(""),
+            ParsedStatus::Unrecognized(String::new())
+        );
+        assert_eq!(
+            parse_worker_ready_status("   \t  "),
+            ParsedStatus::Unrecognized(String::new())
+        );
     }
 
     #[test]
@@ -3758,18 +3758,18 @@ mod tests {
     #[test]
     fn test_parse_circuit_state_unknown_preserves_normalized() {
         // Forensics: Unrecognized carries the offending value.
-        match parse_worker_circuit_state("OPEN_FORCED") {
-            ParsedCircuit::Unrecognized(raw) => assert_eq!(raw, "open_forced"),
-            other => panic!("expected Unrecognized, got {other:?}"),
-        }
-        match parse_worker_circuit_state("closed_for_maintenance") {
-            ParsedCircuit::Unrecognized(raw) => assert_eq!(raw, "closed_for_maintenance"),
-            other => panic!("expected Unrecognized, got {other:?}"),
-        }
-        match parse_worker_circuit_state("") {
-            ParsedCircuit::Unrecognized(raw) => assert_eq!(raw, ""),
-            other => panic!("expected Unrecognized for empty, got {other:?}"),
-        }
+        assert_eq!(
+            parse_worker_circuit_state("OPEN_FORCED"),
+            ParsedCircuit::Unrecognized("open_forced".to_string())
+        );
+        assert_eq!(
+            parse_worker_circuit_state("closed_for_maintenance"),
+            ParsedCircuit::Unrecognized("closed_for_maintenance".to_string())
+        );
+        assert_eq!(
+            parse_worker_circuit_state(""),
+            ParsedCircuit::Unrecognized(String::new())
+        );
     }
 
     #[test]

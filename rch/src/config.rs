@@ -662,40 +662,38 @@ fn load_config_with_sources_from_paths(
     project_path: Option<&Path>,
     env_overrides: Option<&HashMap<String, String>>,
 ) -> Result<LoadedConfig> {
+    let user_path = user_path.filter(|path| path.exists());
+    let project_path = project_path.filter(|path| path.exists());
+    let mut config = load_config_uncached_from_paths(user_path, project_path)?;
     let defaults = RchConfig::default();
-    let mut config = defaults.clone();
     let mut sources = default_sources_map();
+    let mut source_probe = defaults.clone();
 
+    // The source-tracking command path must report the same effective config
+    // as `load_config()`, including full sections not represented by
+    // `PartialRchConfig`. Partial parsing below is only for attribution.
     if let Some(path) = user_path {
-        if path.exists() {
-            debug!("Loading user config with sources from {:?}", path);
-            let layer = load_partial_config(path)?;
-            apply_layer(
-                &mut config,
-                &mut sources,
-                &layer,
-                &ConfigValueSource::UserConfig(path.to_path_buf()),
-                &defaults,
-            );
-        } else {
-            debug!("User config not found at {:?}; skipping", path);
-        }
+        debug!("Loading user config with sources from {:?}", path);
+        let layer = load_partial_config(path)?;
+        apply_layer(
+            &mut source_probe,
+            &mut sources,
+            &layer,
+            &ConfigValueSource::UserConfig(path.to_path_buf()),
+            &defaults,
+        );
     }
 
     if let Some(path) = project_path {
-        if path.exists() {
-            debug!("Loading project config with sources from {:?}", path);
-            let layer = load_partial_config(path)?;
-            apply_layer(
-                &mut config,
-                &mut sources,
-                &layer,
-                &ConfigValueSource::ProjectConfig(path.to_path_buf()),
-                &defaults,
-            );
-        } else {
-            debug!("Project config not found at {:?}; skipping", path);
-        }
+        debug!("Loading project config with sources from {:?}", path);
+        let layer = load_partial_config(path)?;
+        apply_layer(
+            &mut source_probe,
+            &mut sources,
+            &layer,
+            &ConfigValueSource::ProjectConfig(path.to_path_buf()),
+            &defaults,
+        );
     }
 
     apply_env_overrides_inner(&mut config, Some(&mut sources), env_overrides);
@@ -2964,6 +2962,40 @@ min_local_time_ms = 2000
         assert!(!config.general.force_local);
         assert_eq!(config.general.log_level, "info");
         assert_eq!(config.compilation.min_local_time_ms, 2000);
+    }
+
+    #[test]
+    fn test_source_tracking_loader_preserves_full_config_sections() {
+        let _guard = test_guard!();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let user_path = dir.path().join("user.toml");
+        std::fs::write(
+            &user_path,
+            r#"
+[selection]
+min_success_rate = 0.42
+min_free_gb = 25.0
+
+[execution]
+allowlist = ["cargo"]
+
+[alerts]
+enabled = false
+
+[fleet]
+max_concurrent_workers = 3
+"#,
+        )
+        .expect("write user config");
+
+        let loaded = load_config_with_sources_from_paths(Some(&user_path), None, None)
+            .expect("load with sources");
+
+        assert_eq!(loaded.config.selection.min_success_rate, 0.42);
+        assert_eq!(loaded.config.selection.min_free_gb, Some(25.0));
+        assert_eq!(loaded.config.execution.allowlist, vec!["cargo"]);
+        assert!(!loaded.config.alerts.enabled);
+        assert_eq!(loaded.config.fleet.max_concurrent_workers, 3);
     }
 
     #[test]
