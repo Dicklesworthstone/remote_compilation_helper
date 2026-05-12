@@ -977,44 +977,132 @@ fn reliability_topology_diagnostics(
     diagnostics
 }
 
-fn worker_topology_diagnostic(worker: &WorkerStatusFromApi) -> ReliabilityDiagnostic {
-    let status = worker.status.to_ascii_lowercase();
-    let circuit = worker.circuit_state.to_ascii_lowercase();
-    let ready_status = matches!(
-        status.as_str(),
-        "healthy" | "available" | "ready" | "idle" | "running"
-    );
+/// Outcome of a defensive parse: a known categorical value OR the raw
+/// (trim+lowercased) input that we couldn't recognize. The raw form is
+/// preserved so the resulting diagnostic carries forensics for operators.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ParsedStatus {
+    Known(KnownStatus),
+    Unrecognized(String),
+}
 
-    let (severity, code, message) = if circuit == "open" {
-        (
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KnownStatus {
+    /// Healthy/available/ready/idle/running — counts as "ready".
+    Ready,
+    /// Known non-ready statuses reported by daemon/status UIs.
+    Degraded,
+    /// Unreachable/offline/error/failed — critical.
+    Unreachable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ParsedCircuit {
+    Known(KnownCircuit),
+    Unrecognized(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KnownCircuit {
+    Closed,
+    Open,
+    HalfOpen,
+}
+
+/// Trim + lowercase + match against the known status set. Known
+/// non-ready states remain `WorkerDegraded`; unknown values become
+/// `Unrecognized(raw)` so the caller can surface protocol drift rather
+/// than silently mapping to `Pass` (the prior default-to-success bug).
+fn parse_worker_ready_status(raw: &str) -> ParsedStatus {
+    let normalized = raw.trim().to_ascii_lowercase();
+    if matches!(
+        normalized.as_str(),
+        "healthy" | "available" | "ready" | "idle" | "running"
+    ) {
+        ParsedStatus::Known(KnownStatus::Ready)
+    } else if matches!(
+        normalized.as_str(),
+        "unreachable" | "offline" | "error" | "failed"
+    ) {
+        ParsedStatus::Known(KnownStatus::Unreachable)
+    } else if matches!(
+        normalized.as_str(),
+        "busy" | "degraded" | "draining" | "drained" | "disabled" | "unhealthy"
+    ) {
+        ParsedStatus::Known(KnownStatus::Degraded)
+    } else {
+        ParsedStatus::Unrecognized(normalized)
+    }
+}
+
+/// Same discipline as [`parse_worker_ready_status`] but for the
+/// circuit-breaker state field. `closed` is the healthy default;
+/// `open` is critical; `half_open` is degraded; anything else
+/// (including empty string, whitespace, unexpected casings of unknown
+/// variants like `OPEN_FORCED`) surfaces as `Unrecognized`.
+fn parse_worker_circuit_state(raw: &str) -> ParsedCircuit {
+    let normalized = raw.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "closed" => ParsedCircuit::Known(KnownCircuit::Closed),
+        "open" => ParsedCircuit::Known(KnownCircuit::Open),
+        "half_open" | "half-open" => ParsedCircuit::Known(KnownCircuit::HalfOpen),
+        _ => ParsedCircuit::Unrecognized(normalized),
+    }
+}
+
+fn worker_topology_diagnostic(worker: &WorkerStatusFromApi) -> ReliabilityDiagnostic {
+    let parsed_status = parse_worker_ready_status(&worker.status);
+    let parsed_circuit = parse_worker_circuit_state(&worker.circuit_state);
+
+    let (severity, code, message) = match (&parsed_circuit, &parsed_status) {
+        // Unrecognized values surface as Warnings with the raw value
+        // in the diagnostic context. Default-to-degraded — never Pass.
+        (ParsedCircuit::Unrecognized(raw), _) => (
+            ReliabilitySeverity::Warning,
+            ReliabilityReasonCode::WorkerCircuitStateUnrecognized,
+            format!(
+                "Worker {} circuit_state is unrecognized ({raw:?})",
+                worker.id
+            ),
+        ),
+        (_, ParsedStatus::Unrecognized(raw)) => (
+            ReliabilitySeverity::Warning,
+            ReliabilityReasonCode::WorkerStatusUnrecognized,
+            format!("Worker {} status is unrecognized ({raw:?})", worker.id),
+        ),
+        // Known values: same routing as before.
+        (ParsedCircuit::Known(KnownCircuit::Open), _) => (
             ReliabilitySeverity::Critical,
             ReliabilityReasonCode::WorkerCircuitOpen,
             format!("Worker {} circuit is open", worker.id),
-        )
-    } else if matches!(
-        status.as_str(),
-        "unreachable" | "offline" | "error" | "failed"
-    ) {
-        (
+        ),
+        (_, ParsedStatus::Known(KnownStatus::Unreachable)) => (
             ReliabilitySeverity::Critical,
             ReliabilityReasonCode::WorkerUnreachable,
             format!("Worker {} is {}", worker.id, worker.status),
-        )
-    } else if circuit == "half_open" || !ready_status {
-        (
+        ),
+        (ParsedCircuit::Known(KnownCircuit::HalfOpen), _) => (
             ReliabilitySeverity::Warning,
             ReliabilityReasonCode::WorkerDegraded,
             format!(
                 "Worker {} is degraded (status={}, circuit={})",
                 worker.id, worker.status, worker.circuit_state
             ),
-        )
-    } else {
-        (
+        ),
+        (_, ParsedStatus::Known(KnownStatus::Degraded)) => (
+            ReliabilitySeverity::Warning,
+            ReliabilityReasonCode::WorkerDegraded,
+            format!(
+                "Worker {} is degraded (status={}, circuit={})",
+                worker.id, worker.status, worker.circuit_state
+            ),
+        ),
+        // Closed circuit + Ready status = healthy.
+        (ParsedCircuit::Known(KnownCircuit::Closed), ParsedStatus::Known(KnownStatus::Ready)) => (
             ReliabilitySeverity::Pass,
             ReliabilityReasonCode::WorkerReady,
             format!("Worker {} is ready", worker.id),
-        )
+        ),
     };
 
     let mut diagnostic = ReliabilityDiagnostic::new(
@@ -1038,6 +1126,27 @@ fn worker_topology_diagnostic(worker: &WorkerStatusFromApi) -> ReliabilityDiagno
         diagnostic = diagnostic.with_remediation(
             format!("rch workers probe {} --force", worker.id),
             "rch status --workers --json",
+        );
+    }
+
+    // Emit a tracing event whenever we see an unrecognized value so log
+    // consumers can spot protocol drift between daemon versions.
+    if let ParsedStatus::Unrecognized(raw) = &parsed_status {
+        tracing::warn!(
+            target: "rch::doctor::parse",
+            worker = %worker.id,
+            field = "status",
+            raw = %raw,
+            "doctor.parse.unrecognized",
+        );
+    }
+    if let ParsedCircuit::Unrecognized(raw) = &parsed_circuit {
+        tracing::warn!(
+            target: "rch::doctor::parse",
+            worker = %worker.id,
+            field = "circuit_state",
+            raw = %raw,
+            "doctor.parse.unrecognized",
         );
     }
 
@@ -3475,6 +3584,225 @@ mod tests {
     use super::*;
     use serde_json::json;
     use tempfile::TempDir;
+
+    fn worker_status(
+        id: &str,
+        status: &str,
+        circuit_state: &str,
+    ) -> crate::status_types::WorkerStatusFromApi {
+        serde_json::from_value(json!({
+            "id": id,
+            "host": "worker.example",
+            "user": "ubuntu",
+            "status": status,
+            "circuit_state": circuit_state,
+            "used_slots": 0,
+            "total_slots": 8,
+            "speed_score": 99.0,
+            "last_error": null
+        }))
+        .expect("worker status fixture should parse")
+    }
+
+    #[test]
+    fn test_worker_topology_known_non_ready_status_is_degraded() {
+        for status in ["degraded", "draining", "drained", "disabled", "busy"] {
+            let worker = worker_status("worker-a", status, "closed");
+            let diagnostic = worker_topology_diagnostic(&worker);
+
+            assert_eq!(diagnostic.severity, ReliabilitySeverity::Warning);
+            assert_eq!(diagnostic.code, ReliabilityReasonCode::WorkerDegraded);
+            assert!(
+                diagnostic.message.contains(status),
+                "message should preserve the known non-ready status, got: {}",
+                diagnostic.message
+            );
+        }
+    }
+
+    #[test]
+    fn test_worker_topology_unknown_status_reports_protocol_drift() {
+        let worker = worker_status("worker-a", "parked", "closed");
+        let diagnostic = worker_topology_diagnostic(&worker);
+
+        assert_eq!(diagnostic.severity, ReliabilitySeverity::Warning);
+        assert_eq!(
+            diagnostic.code,
+            ReliabilityReasonCode::WorkerStatusUnrecognized
+        );
+        assert!(
+            diagnostic.message.contains("status is unrecognized"),
+            "unexpected message: {}",
+            diagnostic.message
+        );
+    }
+
+    // ========================================================================
+    // t07 — defensive parsers for worker.ready_status + circuit_state.
+    // Pure-function tests (no doctor/daemon harness) for the parser
+    // contracts that drive worker_topology_diagnostic.
+    // ========================================================================
+
+    #[test]
+    fn test_parse_ready_status_known_ready_variants() {
+        for v in ["healthy", "available", "ready", "idle", "running"] {
+            assert_eq!(
+                parse_worker_ready_status(v),
+                ParsedStatus::Known(KnownStatus::Ready),
+                "{v} should parse as Ready"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_ready_status_known_degraded_variants() {
+        for v in [
+            "busy",
+            "degraded",
+            "draining",
+            "drained",
+            "disabled",
+            "unhealthy",
+        ] {
+            assert_eq!(
+                parse_worker_ready_status(v),
+                ParsedStatus::Known(KnownStatus::Degraded),
+                "{v} should parse as Degraded"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_ready_status_known_unreachable_variants() {
+        for v in ["unreachable", "offline", "error", "failed"] {
+            assert_eq!(
+                parse_worker_ready_status(v),
+                ParsedStatus::Known(KnownStatus::Unreachable),
+                "{v} should parse as Unreachable"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_ready_status_trims_and_lowers() {
+        // Whitespace + casing variations all hit the same bucket.
+        for v in [
+            "  healthy  ",
+            "\tHealthy\n",
+            "READY",
+            "  Ready ",
+            "\u{00A0}healthy\u{00A0}", // non-breaking space (Rust trim handles)
+        ] {
+            assert_eq!(
+                parse_worker_ready_status(v),
+                ParsedStatus::Known(KnownStatus::Ready),
+                "{v:?} should normalize to Ready"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_ready_status_unknown_preserves_normalized_input() {
+        // The Unrecognized variant carries the trim+lowered value so the
+        // resulting diagnostic can surface it to operators.
+        match parse_worker_ready_status("  PARKED  ") {
+            ParsedStatus::Unrecognized(raw) => assert_eq!(raw, "parked"),
+            other => panic!("expected Unrecognized, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_ready_status_empty_string_unrecognized() {
+        match parse_worker_ready_status("") {
+            ParsedStatus::Unrecognized(raw) => assert_eq!(raw, ""),
+            other => panic!("expected Unrecognized for empty, got {other:?}"),
+        }
+        match parse_worker_ready_status("   \t  ") {
+            ParsedStatus::Unrecognized(raw) => assert_eq!(raw, ""),
+            other => panic!("expected Unrecognized for whitespace-only, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_circuit_state_known_variants() {
+        assert_eq!(
+            parse_worker_circuit_state("closed"),
+            ParsedCircuit::Known(KnownCircuit::Closed)
+        );
+        assert_eq!(
+            parse_worker_circuit_state("open"),
+            ParsedCircuit::Known(KnownCircuit::Open)
+        );
+        assert_eq!(
+            parse_worker_circuit_state("half_open"),
+            ParsedCircuit::Known(KnownCircuit::HalfOpen)
+        );
+        // dash form also accepted (some serializers use it).
+        assert_eq!(
+            parse_worker_circuit_state("half-open"),
+            ParsedCircuit::Known(KnownCircuit::HalfOpen)
+        );
+    }
+
+    #[test]
+    fn test_parse_circuit_state_trims_and_lowers() {
+        for v in ["  Open  ", "\tOPEN\n", "OPEN"] {
+            assert_eq!(
+                parse_worker_circuit_state(v),
+                ParsedCircuit::Known(KnownCircuit::Open),
+                "{v:?} should normalize to Open"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_circuit_state_unknown_preserves_normalized() {
+        // Forensics: Unrecognized carries the offending value.
+        match parse_worker_circuit_state("OPEN_FORCED") {
+            ParsedCircuit::Unrecognized(raw) => assert_eq!(raw, "open_forced"),
+            other => panic!("expected Unrecognized, got {other:?}"),
+        }
+        match parse_worker_circuit_state("closed_for_maintenance") {
+            ParsedCircuit::Unrecognized(raw) => assert_eq!(raw, "closed_for_maintenance"),
+            other => panic!("expected Unrecognized, got {other:?}"),
+        }
+        match parse_worker_circuit_state("") {
+            ParsedCircuit::Unrecognized(raw) => assert_eq!(raw, ""),
+            other => panic!("expected Unrecognized for empty, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_worker_topology_unknown_circuit_state_reports_protocol_drift() {
+        // The conjugate of the existing ready_status test: unknown
+        // circuit_state values must surface as Warning with the
+        // dedicated reason code, never silently mapped to Pass.
+        let worker = worker_status("worker-a", "healthy", "OPEN_FORCED");
+        let diagnostic = worker_topology_diagnostic(&worker);
+
+        assert_eq!(diagnostic.severity, ReliabilitySeverity::Warning);
+        assert_eq!(
+            diagnostic.code,
+            ReliabilityReasonCode::WorkerCircuitStateUnrecognized
+        );
+        assert!(
+            diagnostic.message.contains("circuit_state is unrecognized"),
+            "unexpected message: {}",
+            diagnostic.message
+        );
+    }
+
+    #[test]
+    fn test_worker_topology_circuit_unrecognized_dominates_status() {
+        // When BOTH fields are unrecognized, circuit drift is reported
+        // first (the match-arm ordering encodes operator priority).
+        let worker = worker_status("worker-a", "parked", "UNKNOWN");
+        let diagnostic = worker_topology_diagnostic(&worker);
+        assert_eq!(
+            diagnostic.code,
+            ReliabilityReasonCode::WorkerCircuitStateUnrecognized
+        );
+    }
 
     #[test]
     fn test_read_config_capped_reader_rejects_bytes_past_cap() {
