@@ -3559,33 +3559,12 @@ fn build_remote_shell_command(remote_cmd: &str) -> String {
     format!("sh -lc {}", shell_escape::escape(remote_cmd.into()))
 }
 
-async fn ensure_worker_projects_topology(
-    worker: &WorkerConfig,
-    reporter: &HookReporter,
-) -> anyhow::Result<()> {
-    if should_skip_remote_preflight(worker) {
-        reporter.verbose("[RCH] topology preflight skipped in mock mode");
-        return Ok(());
-    }
+fn build_worker_projects_topology_cmd(topology_policy: &PathTopologyPolicy) -> String {
+    let canonical_display = topology_policy.canonical_root().display().to_string();
+    let alias_display = topology_policy.alias_root().display().to_string();
+    let canonical_slash_display = format!("{}/", canonical_display.trim_end_matches('/'));
 
-    // rch#12: honour `[path_topology]` from `rch.toml` instead of
-    // hardcoding `/data/projects` and `/dp`. Load the config once;
-    // fall back to compiled-in defaults if the load fails so a
-    // misconfigured rch.toml doesn't break preflight for users who
-    // never customized topology.
-    let policy = match crate::config::load_config() {
-        Ok(cfg) => cfg.path_topology.to_policy(),
-        Err(e) => {
-            reporter.verbose(&format!(
-                "[RCH] topology preflight: could not load rch config for path_topology ({e}); using compiled-in defaults"
-            ));
-            rch_common::path_topology::PathTopologyPolicy::default()
-        }
-    };
-    let canonical_display = policy.canonical_root().display().to_string();
-    let alias_display = policy.alias_root().display().to_string();
-
-    let topology_cmd = format!(
+    format!(
         "set -e; \
          if [ ! -e {canonical} ] && [ ! -L {canonical} ]; then mkdir -p {canonical}; fi; \
          if [ -e {canonical} ] && [ ! -d {canonical} ]; then echo 'RCH_TOPOLOGY_ERR_CANONICAL_NOT_DIRECTORY' >&2; exit 41; fi; \
@@ -3598,10 +3577,25 @@ async fn ensure_worker_projects_topology(
            ln -s {canonical} {alias}; \
          fi; \
          echo RCH_TOPOLOGY_OK",
-        canonical = shell_escape::escape(canonical_display.clone().into()),
-        canonical_slash = shell_escape::escape(format!("{}/", canonical_display).into()),
-        alias = shell_escape::escape(alias_display.clone().into())
-    );
+        canonical = shell_escape::escape(canonical_display.into()),
+        canonical_slash = shell_escape::escape(canonical_slash_display.into()),
+        alias = shell_escape::escape(alias_display.into())
+    )
+}
+
+async fn ensure_worker_projects_topology(
+    worker: &WorkerConfig,
+    reporter: &HookReporter,
+    topology_policy: &PathTopologyPolicy,
+) -> anyhow::Result<()> {
+    if should_skip_remote_preflight(worker) {
+        reporter.verbose("[RCH] topology preflight skipped in mock mode");
+        return Ok(());
+    }
+
+    let canonical_display = topology_policy.canonical_root().display().to_string();
+    let alias_display = topology_policy.alias_root().display().to_string();
+    let topology_cmd = build_worker_projects_topology_cmd(topology_policy);
 
     let output = run_worker_ssh_command(worker, &topology_cmd, Duration::from_secs(20)).await?;
     if !output.status.success() {
@@ -5952,7 +5946,7 @@ async fn execute_remote_compilation(
     ));
 
     // Ensure deterministic remote topology before any repo synchronization.
-    ensure_worker_projects_topology(&worker_config, reporter).await?;
+    ensure_worker_projects_topology(&worker_config, reporter, topology_policy).await?;
 
     // Best-effort repo convergence for multi-repo dependency graphs.
     maybe_sync_repo_set_with_repo_updater(&worker_config, &sync_roots, reporter).await;
@@ -10635,6 +10629,50 @@ edition = "2024"
         assert!(
             wrapped.contains("if ["),
             "wrapped command should preserve the full script"
+        );
+    }
+
+    #[test]
+    fn test_build_worker_projects_topology_cmd_uses_supplied_policy() {
+        let _guard = test_guard!();
+        let policy = PathTopologyPolicy::new(
+            PathBuf::from("/custom/projects"),
+            PathBuf::from("/custom/dp"),
+        );
+
+        let command = build_worker_projects_topology_cmd(&policy);
+
+        assert!(
+            command.contains("/custom/projects"),
+            "preflight command must use the supplied canonical root: {command}"
+        );
+        assert!(
+            command.contains("/custom/dp"),
+            "preflight command must use the supplied alias root: {command}"
+        );
+        assert!(
+            !command.contains("/data/projects"),
+            "preflight command must not silently fall back to default canonical root: {command}"
+        );
+    }
+
+    #[test]
+    fn test_build_worker_projects_topology_cmd_shell_escapes_policy_paths() {
+        let _guard = test_guard!();
+        let policy = PathTopologyPolicy::new(
+            PathBuf::from("/tmp/rch weird'root"),
+            PathBuf::from("/tmp/rch alias;bad"),
+        );
+
+        let command = build_worker_projects_topology_cmd(&policy);
+
+        assert!(
+            command.contains("'/tmp/rch weird'\\''root'"),
+            "single quotes in canonical root must be shell escaped: {command}"
+        );
+        assert!(
+            command.contains("'/tmp/rch alias;bad'"),
+            "shell metacharacters in alias root must be quoted: {command}"
         );
     }
 

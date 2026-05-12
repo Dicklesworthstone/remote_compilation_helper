@@ -8,10 +8,7 @@ use crate::ui::context::OutputContext;
 use crate::ui::progress::Spinner;
 use crate::ui::theme::StatusIndicator;
 use anyhow::{Context, Result};
-use rch_common::{
-    ApiError, ApiResponse, DEFAULT_ALIAS_PROJECT_ROOT, DEFAULT_CANONICAL_PROJECT_ROOT, ErrorCode,
-    WorkerConfig,
-};
+use rch_common::{ApiError, ApiResponse, ErrorCode, WorkerConfig};
 use serde::Serialize;
 use std::path::Path;
 use tokio::process::Command;
@@ -631,6 +628,13 @@ struct TopologyEnforcementResult {
     errors: Vec<String>,
 }
 
+struct TopologyFixContext<'a> {
+    outcome: &'a mut TopologyEnforcementResult,
+    worker_id: &'a str,
+    canonical_root: &'a Path,
+    alias_root: &'a Path,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CanonicalTopologyState {
     Missing,
@@ -740,11 +744,12 @@ fn shell_escape_str(s: &str) -> String {
     format!("'{escaped}'")
 }
 
+#[cfg(test)]
 fn remediation_for_failure(kind: TopologyFailureKind) -> String {
     remediation_for_failure_with_paths(
         kind,
-        Path::new(DEFAULT_CANONICAL_PROJECT_ROOT),
-        Path::new(DEFAULT_ALIAS_PROJECT_ROOT),
+        Path::new(rch_common::DEFAULT_CANONICAL_PROJECT_ROOT),
+        Path::new(rch_common::DEFAULT_ALIAS_PROJECT_ROOT),
     )
 }
 
@@ -756,7 +761,8 @@ fn remediation_for_failure_with_paths(
     match kind {
         TopologyFailureKind::Permission => format!(
             "Ensure the SSH user can write {} and create {} symlinks (sudo/chown may be required).",
-            canonical_root.display(), alias_root.display()
+            canonical_root.display(),
+            alias_root.display()
         ),
         TopologyFailureKind::Filesystem => format!(
             "Verify remote filesystem health and that {} is writable before rerunning setup.",
@@ -927,17 +933,14 @@ async fn execute_topology_fix(
     step: &str,
     success_status: TopologyAuditStatus,
     action_message: &str,
-    outcome: &mut TopologyEnforcementResult,
-    worker_id: &str,
-    canonical_root: &Path,
-    alias_root: &Path,
+    ctx: &mut TopologyFixContext<'_>,
 ) -> bool {
     match run_worker_ssh_command(worker, command).await {
         Ok(output) if output.status.success() => {
-            outcome.changed = true;
+            ctx.outcome.changed = true;
             push_topology_audit(
-                worker_id,
-                &mut outcome.audit,
+                ctx.worker_id,
+                &mut ctx.outcome.audit,
                 step,
                 success_status,
                 action_message,
@@ -949,8 +952,11 @@ async fn execute_topology_fix(
         Ok(output) => {
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
             let failure_kind = classify_topology_failure(&stderr);
-            let remediation =
-                remediation_for_failure_with_paths(failure_kind, canonical_root, alias_root);
+            let remediation = remediation_for_failure_with_paths(
+                failure_kind,
+                ctx.canonical_root,
+                ctx.alias_root,
+            );
             let message = format!(
                 "{} failed (exit {}): {}",
                 step,
@@ -958,16 +964,16 @@ async fn execute_topology_fix(
                 stderr.trim()
             );
             push_topology_audit(
-                worker_id,
-                &mut outcome.audit,
+                ctx.worker_id,
+                &mut ctx.outcome.audit,
                 step,
                 TopologyAuditStatus::Failed,
                 message.clone(),
                 Some(remediation.clone()),
                 Some(failure_kind),
             );
-            outcome.success = false;
-            outcome.errors.push(format!(
+            ctx.outcome.success = false;
+            ctx.outcome.errors.push(format!(
                 "{} [{}] remediation: {}",
                 message,
                 failure_kind.as_str(),
@@ -977,20 +983,23 @@ async fn execute_topology_fix(
         }
         Err(e) => {
             let failure_kind = classify_topology_failure(&e.to_string());
-            let remediation =
-                remediation_for_failure_with_paths(failure_kind, canonical_root, alias_root);
+            let remediation = remediation_for_failure_with_paths(
+                failure_kind,
+                ctx.canonical_root,
+                ctx.alias_root,
+            );
             let message = format!("{} failed: {}", step, e);
             push_topology_audit(
-                worker_id,
-                &mut outcome.audit,
+                ctx.worker_id,
+                &mut ctx.outcome.audit,
                 step,
                 TopologyAuditStatus::Failed,
                 message.clone(),
                 Some(remediation.clone()),
                 Some(failure_kind),
             );
-            outcome.success = false;
-            outcome.errors.push(format!(
+            ctx.outcome.success = false;
+            ctx.outcome.errors.push(format!(
                 "{} [{}] remediation: {}",
                 message,
                 failure_kind.as_str(),
@@ -1067,16 +1076,19 @@ async fn enforce_worker_bootstrap_topology(
             } else {
                 let command = create_canonical_root_cmd(canonical_root);
                 let action_message = format!("Created {} directory", canonical_root.display());
+                let mut fix_ctx = TopologyFixContext {
+                    outcome: &mut outcome,
+                    worker_id,
+                    canonical_root,
+                    alias_root,
+                };
                 if !execute_topology_fix(
                     worker,
                     &command,
                     "canonical_root",
                     TopologyAuditStatus::Created,
                     &action_message,
-                    &mut outcome,
-                    worker_id,
-                    canonical_root,
-                    alias_root,
+                    &mut fix_ctx,
                 )
                 .await
                 {
@@ -1197,16 +1209,19 @@ async fn enforce_worker_bootstrap_topology(
                     alias_root.display(),
                     canonical_root.display()
                 );
+                let mut fix_ctx = TopologyFixContext {
+                    outcome: &mut outcome,
+                    worker_id,
+                    canonical_root,
+                    alias_root,
+                };
                 if !execute_topology_fix(
                     worker,
                     &command,
                     "alias_symlink",
                     TopologyAuditStatus::Created,
                     &action_message,
-                    &mut outcome,
-                    worker_id,
-                    canonical_root,
-                    alias_root,
+                    &mut fix_ctx,
                 )
                 .await
                 {
@@ -1237,16 +1252,19 @@ async fn enforce_worker_bootstrap_topology(
                     alias_root.display(),
                     canonical_root.display()
                 );
+                let mut fix_ctx = TopologyFixContext {
+                    outcome: &mut outcome,
+                    worker_id,
+                    canonical_root,
+                    alias_root,
+                };
                 if !execute_topology_fix(
                     worker,
                     &command,
                     "alias_symlink",
                     TopologyAuditStatus::Updated,
                     &action_message,
-                    &mut outcome,
-                    worker_id,
-                    canonical_root,
-                    alias_root,
+                    &mut fix_ctx,
                 )
                 .await
                 {
@@ -1855,7 +1873,7 @@ mod tests {
         assert!(integrity.contains("/custom/projects"));
         assert!(integrity.contains("/custom/dp"));
         assert!(
-            !permission.contains(DEFAULT_CANONICAL_PROJECT_ROOT),
+            !permission.contains(rch_common::DEFAULT_CANONICAL_PROJECT_ROOT),
             "custom remediation must not mention default canonical root: {permission}"
         );
         log_test_pass("topology_bootstrap_remediation_uses_configured_paths");
