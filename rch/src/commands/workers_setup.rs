@@ -13,6 +13,7 @@ use rch_common::{
     WorkerConfig,
 };
 use serde::Serialize;
+use std::path::Path;
 use tokio::process::Command;
 use tracing::{info, warn};
 
@@ -283,6 +284,23 @@ pub async fn workers_setup(
     // Track overall results
     let mut all_results: Vec<SetupResult> = Vec::new();
 
+    // Resolve the configured path topology policy once and pass it to
+    // every worker setup so the topology probes / mutations honour
+    // operator overrides instead of the hardcoded `/data/projects`,
+    // `/dp` constants. Falls back to the documented defaults when
+    // config loading fails — keeps the existing behaviour for users
+    // who haven't customized topology. See rch#12.
+    let policy = match crate::config::load_config() {
+        Ok(cfg) => cfg.path_topology.to_policy(),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "could not load rch config for path_topology — using compiled-in defaults (rch#12)"
+            );
+            rch_common::path_topology::PathTopologyPolicy::default()
+        }
+    };
+
     // Setup each worker
     for worker in &target_workers {
         let result = setup_single_worker(
@@ -291,6 +309,7 @@ pub async fn workers_setup(
             dry_run,
             skip_binary,
             skip_toolchain,
+            &policy,
             ctx,
         )
         .await;
@@ -353,6 +372,7 @@ async fn setup_single_worker(
     dry_run: bool,
     skip_binary: bool,
     skip_toolchain: bool,
+    policy: &rch_common::path_topology::PathTopologyPolicy,
     ctx: &OutputContext,
 ) -> SetupResult {
     let style = ctx.theme();
@@ -384,7 +404,7 @@ async fn setup_single_worker(
         let _ = std::io::stdout().flush();
     }
 
-    let topology = enforce_worker_bootstrap_topology(worker, dry_run).await;
+    let topology = enforce_worker_bootstrap_topology(worker, dry_run, policy).await;
     result.topology_enforced = topology.success;
     result.topology_changed = topology.changed;
     result.topology_audit = topology.audit;
@@ -628,17 +648,80 @@ enum AliasTopologyState {
     Unknown(String),
 }
 
-const CANONICAL_TOPOLOGY_CHECK_CMD: &str = "if [ ! -e /data/projects ] && [ ! -L /data/projects ]; then printf 'MISSING'; \
-elif [ -d /data/projects ]; then printf 'DIRECTORY'; \
-else printf 'NOT_DIRECTORY'; fi";
-const ALIAS_TOPOLOGY_CHECK_CMD: &str = "if [ ! -e /dp ] && [ ! -L /dp ]; then printf 'MISSING'; \
-elif [ -L /dp ]; then target=$(readlink /dp 2>/dev/null || true); \
-if [ \"$target\" = \"/data/projects\" ] || [ \"$target\" = \"/data/projects/\" ]; then printf 'CORRECT'; \
+/// Per-worker topology command builders (rch#12). The original
+/// implementation hardcoded `/data/projects` and `/dp` in
+/// `const &str` literals, so `[path_topology]` in `rch.toml` was
+/// silently ignored on the worker-setup path. The four mutation
+/// commands and two probe commands are now built at runtime from the
+/// caller-supplied `PathTopologyPolicy` so they honour whatever the
+/// operator configured.
+///
+/// **Security**: `shell_escape` quotes the path before splicing into
+/// the shell command. Without it, a path containing a metacharacter
+/// (`$`, backtick, `;`, etc.) would let the SSH-target shell
+/// re-parse it as arbitrary command — a privilege escalation in
+/// reverse (local-to-remote). We do not want any path from a config
+/// file to land unescaped in a shell `printf`/`readlink` argument.
+fn canonical_topology_check_cmd(canonical: &Path) -> String {
+    let p = shell_escape(canonical);
+    format!(
+        "if [ ! -e {p} ] && [ ! -L {p} ]; then printf 'MISSING'; \
+elif [ -d {p} ]; then printf 'DIRECTORY'; \
+else printf 'NOT_DIRECTORY'; fi"
+    )
+}
+
+fn alias_topology_check_cmd(alias: &Path, canonical: &Path) -> String {
+    let a = shell_escape(alias);
+    let c = shell_escape(canonical);
+    // Use POSIX `readlink` semantics: target may be `<canonical>` or
+    // `<canonical>/`. The pre-fix command hardcoded that comparison
+    // for the two literal forms; the runtime form preserves it but
+    // builds the suffixed variant from the actual canonical path.
+    let c_slash = shell_escape(&canonical.join(""));
+    format!(
+        "if [ ! -e {a} ] && [ ! -L {a} ]; then printf 'MISSING'; \
+elif [ -L {a} ]; then target=$(readlink {a} 2>/dev/null || true); \
+if [ \"$target\" = {c} ] || [ \"$target\" = {c_slash} ]; then printf 'CORRECT'; \
 else printf 'WRONG_TARGET:%s' \"$target\"; fi; \
-else printf 'NOT_SYMLINK'; fi";
-const CREATE_CANONICAL_ROOT_CMD: &str = "mkdir -p /data/projects";
-const CREATE_ALIAS_SYMLINK_CMD: &str = "ln -s /data/projects /dp";
-const UPDATE_ALIAS_SYMLINK_CMD: &str = "ln -sfn /data/projects /dp";
+else printf 'NOT_SYMLINK'; fi"
+    )
+}
+
+fn create_canonical_root_cmd(canonical: &Path) -> String {
+    format!("mkdir -p {}", shell_escape(canonical))
+}
+
+fn create_alias_symlink_cmd(alias: &Path, canonical: &Path) -> String {
+    format!("ln -s {} {}", shell_escape(canonical), shell_escape(alias))
+}
+
+fn update_alias_symlink_cmd(alias: &Path, canonical: &Path) -> String {
+    format!(
+        "ln -sfn {} {}",
+        shell_escape(canonical),
+        shell_escape(alias)
+    )
+}
+
+/// Single-quote a path for safe POSIX shell splicing. Anything in the
+/// path containing `'` is rewritten to `'\''` (the canonical
+/// end-quote-escape-quote-start trick) so the resulting argument is
+/// always a single bash word.
+fn shell_escape(path: &Path) -> String {
+    let s = path.display().to_string();
+    if s.is_empty() {
+        return "''".to_string();
+    }
+    if s.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '_' | '.'))
+    {
+        // Safe ASCII-identifier-ish — no quoting needed.
+        return s;
+    }
+    let escaped = s.replace('\'', "'\\''");
+    format!("'{escaped}'")
+}
 
 fn remediation_for_failure(kind: TopologyFailureKind) -> String {
     match kind {
@@ -769,8 +852,12 @@ async fn run_worker_ssh_command(
     })
 }
 
-async fn query_canonical_topology_state(worker: &WorkerConfig) -> Result<CanonicalTopologyState> {
-    let output = run_worker_ssh_command(worker, CANONICAL_TOPOLOGY_CHECK_CMD).await?;
+async fn query_canonical_topology_state(
+    worker: &WorkerConfig,
+    policy: &rch_common::path_topology::PathTopologyPolicy,
+) -> Result<CanonicalTopologyState> {
+    let cmd = canonical_topology_check_cmd(policy.canonical_root());
+    let output = run_worker_ssh_command(worker, &cmd).await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!(
@@ -785,8 +872,12 @@ async fn query_canonical_topology_state(worker: &WorkerConfig) -> Result<Canonic
     ))
 }
 
-async fn query_alias_topology_state(worker: &WorkerConfig) -> Result<AliasTopologyState> {
-    let output = run_worker_ssh_command(worker, ALIAS_TOPOLOGY_CHECK_CMD).await?;
+async fn query_alias_topology_state(
+    worker: &WorkerConfig,
+    policy: &rch_common::path_topology::PathTopologyPolicy,
+) -> Result<AliasTopologyState> {
+    let cmd = alias_topology_check_cmd(policy.alias_root(), policy.canonical_root());
+    let output = run_worker_ssh_command(worker, &cmd).await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!(
@@ -880,14 +971,17 @@ async fn execute_topology_fix(
 async fn enforce_worker_bootstrap_topology(
     worker: &WorkerConfig,
     dry_run: bool,
+    policy: &rch_common::path_topology::PathTopologyPolicy,
 ) -> TopologyEnforcementResult {
     let worker_id = worker.id.0.as_str();
+    let canonical_root = policy.canonical_root();
+    let alias_root = policy.alias_root();
     let mut outcome = TopologyEnforcementResult {
         success: true,
         ..TopologyEnforcementResult::default()
     };
 
-    let canonical_state = match query_canonical_topology_state(worker).await {
+    let canonical_state = match query_canonical_topology_state(worker, policy).await {
         Ok(state) => state,
         Err(e) => {
             let failure_kind = classify_topology_failure(&e.to_string());
@@ -920,7 +1014,7 @@ async fn enforce_worker_bootstrap_topology(
                 &mut outcome.audit,
                 "canonical_root",
                 TopologyAuditStatus::AlreadyCompliant,
-                format!("{} exists as a directory", DEFAULT_CANONICAL_PROJECT_ROOT),
+                format!("{} exists as a directory", canonical_root.display()),
                 None,
                 None,
             );
@@ -932,31 +1026,32 @@ async fn enforce_worker_bootstrap_topology(
                     &mut outcome.audit,
                     "canonical_root",
                     TopologyAuditStatus::DryRunWouldCreate,
-                    format!("Would create {}", DEFAULT_CANONICAL_PROJECT_ROOT),
+                    format!("Would create {}", canonical_root.display()),
                     None,
                     None,
                 );
-            } else if !execute_topology_fix(
-                worker,
-                CREATE_CANONICAL_ROOT_CMD,
-                "canonical_root",
-                TopologyAuditStatus::Created,
-                "Created /data/projects directory",
-                &mut outcome,
-                worker_id,
-            )
-            .await
-            {
-                return outcome;
+            } else {
+                let command = create_canonical_root_cmd(canonical_root);
+                let action_message = format!("Created {} directory", canonical_root.display());
+                if !execute_topology_fix(
+                    worker,
+                    &command,
+                    "canonical_root",
+                    TopologyAuditStatus::Created,
+                    &action_message,
+                    &mut outcome,
+                    worker_id,
+                )
+                .await
+                {
+                    return outcome;
+                }
             }
         }
         CanonicalTopologyState::NotDirectory => {
             let failure_kind = TopologyFailureKind::IntegrityMismatch;
             let remediation = remediation_for_failure(failure_kind);
-            let message = format!(
-                "{} exists but is not a directory",
-                DEFAULT_CANONICAL_PROJECT_ROOT
-            );
+            let message = format!("{} exists but is not a directory", canonical_root.display());
             push_topology_audit(
                 worker_id,
                 &mut outcome.audit,
@@ -999,7 +1094,7 @@ async fn enforce_worker_bootstrap_topology(
         }
     }
 
-    let alias_state = match query_alias_topology_state(worker).await {
+    let alias_state = match query_alias_topology_state(worker, policy).await {
         Ok(state) => state,
         Err(e) => {
             let failure_kind = classify_topology_failure(&e.to_string());
@@ -1034,7 +1129,8 @@ async fn enforce_worker_bootstrap_topology(
                 TopologyAuditStatus::AlreadyCompliant,
                 format!(
                     "{} already points to {}",
-                    DEFAULT_ALIAS_PROJECT_ROOT, DEFAULT_CANONICAL_PROJECT_ROOT
+                    alias_root.display(),
+                    canonical_root.display()
                 ),
                 None,
                 None,
@@ -1049,23 +1145,32 @@ async fn enforce_worker_bootstrap_topology(
                     TopologyAuditStatus::DryRunWouldCreate,
                     format!(
                         "Would create {} -> {}",
-                        DEFAULT_ALIAS_PROJECT_ROOT, DEFAULT_CANONICAL_PROJECT_ROOT
+                        alias_root.display(),
+                        canonical_root.display()
                     ),
                     None,
                     None,
                 );
-            } else if !execute_topology_fix(
-                worker,
-                CREATE_ALIAS_SYMLINK_CMD,
-                "alias_symlink",
-                TopologyAuditStatus::Created,
-                "Created /dp symlink",
-                &mut outcome,
-                worker_id,
-            )
-            .await
-            {
-                return outcome;
+            } else {
+                let command = create_alias_symlink_cmd(alias_root, canonical_root);
+                let action_message = format!(
+                    "Created {} symlink to {}",
+                    alias_root.display(),
+                    canonical_root.display()
+                );
+                if !execute_topology_fix(
+                    worker,
+                    &command,
+                    "alias_symlink",
+                    TopologyAuditStatus::Created,
+                    &action_message,
+                    &mut outcome,
+                    worker_id,
+                )
+                .await
+                {
+                    return outcome;
+                }
             }
         }
         AliasTopologyState::WrongTarget(target) => {
@@ -1077,29 +1182,39 @@ async fn enforce_worker_bootstrap_topology(
                     TopologyAuditStatus::DryRunWouldUpdate,
                     format!(
                         "Would repoint {} from '{}' to {}",
-                        DEFAULT_ALIAS_PROJECT_ROOT, target, DEFAULT_CANONICAL_PROJECT_ROOT
+                        alias_root.display(),
+                        target,
+                        canonical_root.display()
                     ),
                     None,
                     None,
                 );
-            } else if !execute_topology_fix(
-                worker,
-                UPDATE_ALIAS_SYMLINK_CMD,
-                "alias_symlink",
-                TopologyAuditStatus::Updated,
-                "Updated /dp symlink target to /data/projects",
-                &mut outcome,
-                worker_id,
-            )
-            .await
-            {
-                return outcome;
+            } else {
+                let command = update_alias_symlink_cmd(alias_root, canonical_root);
+                let action_message = format!(
+                    "Updated {} symlink target to {}",
+                    alias_root.display(),
+                    canonical_root.display()
+                );
+                if !execute_topology_fix(
+                    worker,
+                    &command,
+                    "alias_symlink",
+                    TopologyAuditStatus::Updated,
+                    &action_message,
+                    &mut outcome,
+                    worker_id,
+                )
+                .await
+                {
+                    return outcome;
+                }
             }
         }
         AliasTopologyState::NotSymlink => {
             let failure_kind = TopologyFailureKind::IntegrityMismatch;
             let remediation = remediation_for_failure(failure_kind);
-            let message = format!("{} exists but is not a symlink", DEFAULT_ALIAS_PROJECT_ROOT);
+            let message = format!("{} exists but is not a symlink", alias_root.display());
             push_topology_audit(
                 worker_id,
                 &mut outcome.audit,
@@ -1143,8 +1258,8 @@ async fn enforce_worker_bootstrap_topology(
     }
 
     if !dry_run {
-        let post_canonical = query_canonical_topology_state(worker).await;
-        let post_alias = query_alias_topology_state(worker).await;
+        let post_canonical = query_canonical_topology_state(worker, policy).await;
+        let post_alias = query_alias_topology_state(worker, policy).await;
         let verified = matches!(post_canonical, Ok(CanonicalTopologyState::Directory))
             && matches!(post_alias, Ok(AliasTopologyState::Correct));
 

@@ -35,9 +35,7 @@ use rch_common::{
     SelectionReason, SelectionResponse, SelfHealingConfig, ToolchainInfo, TransferConfig,
     WorkerConfig, WorkerId, build_dependency_closure_plan_with_policy, build_invocation,
     classify_command, mock, normalize_project_path_with_policy,
-    path_topology::{
-        DEFAULT_ALIAS_PROJECT_ROOT, DEFAULT_CANONICAL_PROJECT_ROOT, PathTopologyPolicy,
-    },
+    path_topology::{DEFAULT_CANONICAL_PROJECT_ROOT, PathTopologyPolicy},
     ui::{
         ArtifactSummary, CelebrationSummary, CompilationProgress, CompletionCelebration, Icons,
         OutputContext, RchTheme, TransferProgress,
@@ -3570,6 +3568,23 @@ async fn ensure_worker_projects_topology(
         return Ok(());
     }
 
+    // rch#12: honour `[path_topology]` from `rch.toml` instead of
+    // hardcoding `/data/projects` and `/dp`. Load the config once;
+    // fall back to compiled-in defaults if the load fails so a
+    // misconfigured rch.toml doesn't break preflight for users who
+    // never customized topology.
+    let policy = match crate::config::load_config() {
+        Ok(cfg) => cfg.path_topology.to_policy(),
+        Err(e) => {
+            reporter.verbose(&format!(
+                "[RCH] topology preflight: could not load rch config for path_topology ({e}); using compiled-in defaults"
+            ));
+            rch_common::path_topology::PathTopologyPolicy::default()
+        }
+    };
+    let canonical_display = policy.canonical_root().display().to_string();
+    let alias_display = policy.alias_root().display().to_string();
+
     let topology_cmd = format!(
         "set -e; \
          if [ ! -e {canonical} ] && [ ! -L {canonical} ]; then mkdir -p {canonical}; fi; \
@@ -3583,10 +3598,9 @@ async fn ensure_worker_projects_topology(
            ln -s {canonical} {alias}; \
          fi; \
          echo RCH_TOPOLOGY_OK",
-        canonical = shell_escape::escape(DEFAULT_CANONICAL_PROJECT_ROOT.into()),
-        canonical_slash =
-            shell_escape::escape(format!("{}/", DEFAULT_CANONICAL_PROJECT_ROOT).into()),
-        alias = shell_escape::escape(DEFAULT_ALIAS_PROJECT_ROOT.into())
+        canonical = shell_escape::escape(canonical_display.clone().into()),
+        canonical_slash = shell_escape::escape(format!("{}/", canonical_display).into()),
+        alias = shell_escape::escape(alias_display.clone().into())
     );
 
     let output = run_worker_ssh_command(worker, &topology_cmd, Duration::from_secs(20)).await?;
@@ -3602,8 +3616,8 @@ async fn ensure_worker_projects_topology(
         );
     }
     reporter.verbose(&format!(
-        "[RCH] topology preflight ok on {} (/dp -> /data/projects enforced)",
-        worker.id
+        "[RCH] topology preflight ok on {} ({} -> {} enforced)",
+        worker.id, alias_display, canonical_display
     ));
     Ok(())
 }
