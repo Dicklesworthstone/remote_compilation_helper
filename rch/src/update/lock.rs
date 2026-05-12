@@ -53,9 +53,13 @@ impl UpdateLock {
                     return Ok(Self { path });
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let existing_pid = read_pid(&path);
-                    let holder_alive = existing_pid.is_some_and(is_process_running);
-                    if holder_alive {
+                    let Some(existing_pid) = read_pid(&path) else {
+                        // A missing or malformed PID is ambiguous: it can be a
+                        // lock owner that created the file and has not written
+                        // the PID yet. Do not sweep it as stale.
+                        return Err(UpdateError::LockHeld);
+                    };
+                    if is_process_running(existing_pid) {
                         return Err(UpdateError::LockHeld);
                     }
                     if attempted_sweep {
@@ -131,12 +135,12 @@ fn read_pid(path: &Path) -> Option<u32> {
     contents.trim().parse().ok()
 }
 
-/// Remove the lock file ONLY if the PID it contains still matches what we
-/// previously observed. This avoids swiping a lock that a fresh process
-/// just grabbed between our read and our remove.
-fn try_sweep_stale(path: &Path, observed_pid: Option<u32>) -> bool {
+/// Remove the lock file ONLY if the dead PID it contains still matches what we
+/// previously observed. This avoids swiping a lock that a fresh process just
+/// grabbed between our read and our remove.
+fn try_sweep_stale(path: &Path, observed_pid: u32) -> bool {
     let current = read_pid(path);
-    if current != observed_pid {
+    if current != Some(observed_pid) {
         return false;
     }
     match fs::remove_file(path) {
@@ -295,6 +299,28 @@ mod tests {
     }
 
     #[test]
+    fn test_malformed_lock_is_not_swept() {
+        let _guard = test_lock().lock().unwrap();
+        let path = get_lock_path().unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+
+        std::fs::write(&path, "").unwrap();
+
+        let result = UpdateLock::acquire();
+        assert!(
+            matches!(result, Err(UpdateError::LockHeld)),
+            "expected LockHeld for malformed lock"
+        );
+        assert!(path.exists(), "malformed lock must not be swept");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn test_is_locked_with_active_lock() {
         let _guard = test_lock().lock().unwrap();
         // Clear any existing lock first
@@ -346,11 +372,11 @@ mod tests {
         let first = UpdateLock::acquire().expect("first acquire");
         // Our own PID is running, so a second attempt must see
         // `LockHeld` rather than sweeping and overwriting.
-        match UpdateLock::acquire() {
-            Err(UpdateError::LockHeld) => {}
-            Err(other) => panic!("expected LockHeld, got {:?}", other),
-            Ok(_) => panic!("expected LockHeld, second acquire unexpectedly succeeded"),
-        }
+        let result = UpdateLock::acquire();
+        assert!(
+            matches!(result, Err(UpdateError::LockHeld)),
+            "expected LockHeld for second acquire"
+        );
         drop(first);
 
         // After drop, a fresh acquire should succeed again.
@@ -359,7 +385,7 @@ mod tests {
     }
 
     #[test]
-    fn test_acquire_is_atomic_across_threads() {
+    fn test_acquire_is_atomic_across_threads() -> Result<(), String> {
         // Regression: only one of N concurrent acquirers may succeed.
         // With `File::create`, two threads could both race past a stale
         // sweep and both overwrite the lock file with their own PID.
@@ -385,7 +411,7 @@ mod tests {
             match h.join().expect("join") {
                 Ok(lock) => successes.push(lock),
                 Err(UpdateError::LockHeld) => lock_held += 1,
-                Err(other) => panic!("unexpected error: {:?}", other),
+                Err(other) => return Err(format!("unexpected error: {other:?}")),
             }
         }
         assert_eq!(
@@ -398,5 +424,6 @@ mod tests {
             thread_count,
             "all acquires must resolve to either success or LockHeld"
         );
+        Ok(())
     }
 }

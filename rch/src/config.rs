@@ -123,7 +123,10 @@ fn resolved_source_paths() -> Vec<PathBuf> {
     if let Some(dir) = config_dir() {
         out.push(dir.join("config.toml"));
     }
-    out.push(PathBuf::from(".rch/config.toml"));
+    let project_config = std::env::current_dir()
+        .map(|dir| dir.join(".rch/config.toml"))
+        .unwrap_or_else(|_| PathBuf::from(".rch/config.toml"));
+    out.push(project_config);
     out
 }
 
@@ -255,7 +258,9 @@ fn load_config_uncached() -> Result<RchConfig> {
     let user_path = config_dir().map(|dir| dir.join("config.toml"));
     let user_path = user_path.as_deref().filter(|path| path.exists());
 
-    let project_path = PathBuf::from(".rch/config.toml");
+    let project_path = std::env::current_dir()
+        .map(|dir| dir.join(".rch/config.toml"))
+        .unwrap_or_else(|_| PathBuf::from(".rch/config.toml"));
     let project_path = if project_path.exists() {
         Some(project_path.as_path())
     } else {
@@ -4691,14 +4696,26 @@ confidence_threshold = 0.80
     #[test]
     fn test_source_paths_canonical_order() {
         // resolved_source_paths returns [user, project] in that order.
-        // The project file is always the bare ".rch/config.toml" relative path.
+        // The project file is qualified by cwd because the cache file is
+        // global and relative project paths would collide across repos.
         let paths = super::resolved_source_paths();
         assert!(!paths.is_empty(), "must include at least the project path");
         let last = paths.last().unwrap();
+        let expected_project_path = std::env::current_dir()
+            .expect("current dir")
+            .join(".rch/config.toml");
+        assert_eq!(
+            last, &expected_project_path,
+            "project path should be cwd-qualified for cache isolation"
+        );
         assert!(
             last.ends_with(".rch/config.toml"),
             "project path must be last and end with .rch/config.toml; got {}",
             last.display()
+        );
+        assert!(
+            last.is_absolute(),
+            "project cache key path must be absolute"
         );
     }
 

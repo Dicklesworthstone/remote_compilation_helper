@@ -2807,31 +2807,27 @@ fn spawn_rchd(rchd_path: &Path, socket_path: &Path) -> Result<(), String> {
         .stdin(Stdio::null());
 
     let mut child = cmd.spawn().map_err(|e| match e.kind() {
-        std::io::ErrorKind::NotFound => "rchd not found in PATH".to_string(),
+        std::io::ErrorKind::NotFound => "nohup not found while launching rchd".to_string(),
         _ => e.to_string(),
     })?;
 
-    // t13: reap the nohup wrapper to avoid leaving a zombie process in
-    // rch's tree. `nohup` forks (daemonizing rchd) then exits — we want
-    // to collect that exit immediately so it doesn't sit zombified
-    // until our own process exits (which, for the doctor, may be many
-    // seconds since the doctor continues running other checks).
-    // try_wait is non-blocking; we poll for up to 100ms which is more
-    // than enough to catch nohup's near-instant exit. We do NOT wait
-    // for rchd itself — only the wrapper.
-    let started = Instant::now();
-    let budget = Duration::from_millis(100);
-    loop {
-        match child.try_wait() {
-            Ok(Some(_status)) => break,
-            Ok(None) => {}
-            Err(_) => break,
-        }
-        if started.elapsed() >= budget {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(5));
+    std::thread::sleep(Duration::from_millis(100));
+    if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+        return if status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "rchd launch wrapper exited unsuccessfully: {status}"
+            ))
+        };
     }
+
+    // `nohup` does not daemonize by itself; it execs/wraps rchd as our
+    // direct child. Keep a detached waiter while doctor continues so a
+    // later daemon exit is reaped instead of becoming a zombie.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
     Ok(())
 }
 
@@ -5103,6 +5099,27 @@ exit 0\n"
         start_daemon_with_binary(&socket_path, &fake_rchd, Duration::from_secs(1)).unwrap();
         assert!(socket_path.exists());
         // TEST PASS: start_daemon_with_binary creates socket file
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_start_daemon_with_failing_fake_rchd_reports_exit() {
+        let tmp = TempDir::new().unwrap();
+        let socket_path = tmp.path().join("daemon.sock");
+        let fake_rchd = tmp.path().join("rchd");
+
+        std::fs::write(&fake_rchd, "#!/usr/bin/env sh\nexit 42\n").unwrap();
+        let mut perms = std::fs::metadata(&fake_rchd).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_rchd, perms).unwrap();
+
+        let err =
+            start_daemon_with_binary(&socket_path, &fake_rchd, Duration::from_secs(1)).unwrap_err();
+        assert!(
+            err.contains("exited unsuccessfully") && err.contains("42"),
+            "unexpected error: {err}"
+        );
+        assert!(!socket_path.exists());
     }
 
     #[test]

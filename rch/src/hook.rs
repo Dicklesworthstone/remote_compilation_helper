@@ -996,6 +996,8 @@ enum AutoStartError {
     CooldownActive(u64, u64),
     #[error("Failed to spawn rchd: {0}")]
     SpawnFailed(#[source] std::io::Error),
+    #[error("rchd launch wrapper exited unsuccessfully: {0}")]
+    WrapperFailed(std::process::ExitStatus),
     #[error("Daemon started but socket not found after {0}s")]
     Timeout(u64),
     #[error("rchd binary not found in PATH")]
@@ -1288,40 +1290,24 @@ fn spawn_rchd(path: &Path) -> Result<(), AutoStartError> {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .stdin(Stdio::null());
+
     let mut child = cmd.spawn().map_err(AutoStartError::SpawnFailed)?;
-
-    // t13: reap the nohup wrapper to avoid leaving a zombie process in
-    // rch's tree. `nohup` forks (daemonizing rchd) then exits — we want
-    // to collect that exit immediately so it isn't waiting for init.
-    // try_wait() is non-blocking and (under Rust's stdlib) calls
-    // waitpid(WNOHANG) which DOES reap the zombie if it already exited.
-    // The wrapper typically exits within sub-millisecond of the spawn,
-    // so this small poll loop is enough in practice. We don't block on
-    // the daemon itself — only on the wrapper.
-    poll_reap_child(&mut child, std::time::Duration::from_millis(100));
-    Ok(())
-}
-
-/// Best-effort wait-and-reap of the nohup wrapper child. Polls
-/// `child.try_wait()` with brief sleeps up to `budget`. If the wrapper
-/// hasn't exited by then (rare in practice — typical wallclock is
-/// sub-millisecond), we silently move on; the OS will reap it when our
-/// own process exits (rch is short-lived) or it's reparented to init.
-///
-/// Returns true if reaped during the poll loop.
-fn poll_reap_child(child: &mut std::process::Child, budget: std::time::Duration) -> bool {
-    let started = std::time::Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(_status)) => return true,
-            Ok(None) => {}
-            Err(_) => return false,
-        }
-        if started.elapsed() >= budget {
-            return false;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(5));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    if let Some(status) = child.try_wait().map_err(AutoStartError::SpawnFailed)? {
+        return if status.success() {
+            Ok(())
+        } else {
+            Err(AutoStartError::WrapperFailed(status))
+        };
     }
+
+    // `nohup` does not daemonize by itself; it execs/wraps rchd as our
+    // direct child. Keep a detached waiter while rch remains alive so a
+    // later daemon exit is reaped instead of becoming a zombie.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
 }
 
 async fn probe_daemon_health(socket_path: &Path) -> bool {
@@ -6605,6 +6591,18 @@ mod tests {
     use tokio::net::UnixListener;
     use tokio::sync::Mutex;
 
+    fn delegated_command(output: &HookOutput) -> &str {
+        if let HookOutput::AllowWithModifiedCommand(modified) = output {
+            &modified.hook_specific_output.updated_input.command
+        } else {
+            assert!(
+                matches!(output, HookOutput::AllowWithModifiedCommand(_)),
+                "expected AllowWithModifiedCommand"
+            );
+            ""
+        }
+    }
+
     // ------------------------------------------------------------------
     // join_exec_command tests — guard against the `.join(" ")` round-trip
     // corruption that was present when `rch exec --` rebuilt a command
@@ -7812,22 +7810,17 @@ mod tests {
         // Hook should return AllowWithModifiedCommand delegating to `rch exec`
         // The actual remote compilation happens when `rch exec` runs, not in the hook
         assert!(output.is_allow());
-        match &output {
-            HookOutput::AllowWithModifiedCommand(modified) => {
-                let cmd = &modified.hook_specific_output.updated_input.command;
-                assert!(
-                    cmd.starts_with("rch exec -- "),
-                    "Modified command should delegate to rch exec: {}",
-                    cmd
-                );
-                assert!(
-                    cmd.contains("cargo build"),
-                    "Modified command should contain original command: {}",
-                    cmd
-                );
-            }
-            _ => panic!("Expected AllowWithModifiedCommand"),
-        }
+        let cmd = delegated_command(&output);
+        assert!(
+            cmd.starts_with("rch exec -- "),
+            "Modified command should delegate to rch exec: {}",
+            cmd
+        );
+        assert!(
+            cmd.contains("cargo build"),
+            "Modified command should contain original command: {}",
+            cmd
+        );
 
         // No rsync/SSH should be invoked during the hook - that happens in run_exec
         let rsync_logs = mock::global_rsync_invocations_snapshot();
@@ -7961,17 +7954,12 @@ mod tests {
         // force_remote should result in transparent interception (AllowWithModifiedCommand)
         // with delegation to `rch exec`
         assert!(output.is_allow());
-        match &output {
-            HookOutput::AllowWithModifiedCommand(modified) => {
-                let cmd = &modified.hook_specific_output.updated_input.command;
-                assert!(
-                    cmd.starts_with("rch exec -- "),
-                    "Should delegate to rch exec: {}",
-                    cmd
-                );
-            }
-            _ => panic!("force_remote should use transparent interception"),
-        }
+        let cmd = delegated_command(&output);
+        assert!(
+            cmd.starts_with("rch exec -- "),
+            "Should delegate to rch exec: {}",
+            cmd
+        );
 
         // No rsync/SSH should be invoked during the hook - that happens in run_exec
         let rsync_logs = mock::global_rsync_invocations_snapshot();
@@ -8022,17 +8010,12 @@ mod tests {
 
         // Hook should return AllowWithModifiedCommand delegating to rch exec
         assert!(output.is_allow());
-        match &output {
-            HookOutput::AllowWithModifiedCommand(modified) => {
-                let cmd = &modified.hook_specific_output.updated_input.command;
-                assert!(
-                    cmd.starts_with("rch exec -- "),
-                    "Should delegate to rch exec: {}",
-                    cmd
-                );
-            }
-            _ => panic!("Expected AllowWithModifiedCommand"),
-        }
+        let cmd = delegated_command(&output);
+        assert!(
+            cmd.starts_with("rch exec -- "),
+            "Should delegate to rch exec: {}",
+            cmd
+        );
 
         // No rsync/SSH should be invoked during the hook
         let rsync_logs = mock::global_rsync_invocations_snapshot();
@@ -8076,32 +8059,27 @@ mod tests {
         let output = process_hook(input).await;
         let _ = std::fs::remove_file(&socket_path);
 
-        match &output {
-            HookOutput::AllowWithModifiedCommand(modified) => {
-                let cmd = &modified.hook_specific_output.updated_input.command;
-                assert!(
-                    cmd.starts_with("rch exec -- env "),
-                    "env wrapper must remain an argv prefix in delegated command: {cmd}"
-                );
-                let tokens = shell_words::split(
-                    cmd.strip_prefix("rch exec -- ")
-                        .expect("delegated command prefix"),
-                )
-                .expect("delegated command should parse as shell words");
-                assert_eq!(
-                    tokens,
-                    vec![
-                        "env".to_string(),
-                        "RUSTFLAGS=-C linker=cc".to_string(),
-                        "cargo".to_string(),
-                        "build".to_string(),
-                        "--bin".to_string(),
-                        "frankenctl".to_string(),
-                    ]
-                );
-            }
-            _ => panic!("Expected AllowWithModifiedCommand"),
-        }
+        let cmd = delegated_command(&output);
+        assert!(
+            cmd.starts_with("rch exec -- env "),
+            "env wrapper must remain an argv prefix in delegated command: {cmd}"
+        );
+        let tokens = shell_words::split(
+            cmd.strip_prefix("rch exec -- ")
+                .expect("delegated command prefix"),
+        )
+        .expect("delegated command should parse as shell words");
+        assert_eq!(
+            tokens,
+            vec![
+                "env".to_string(),
+                "RUSTFLAGS=-C linker=cc".to_string(),
+                "cargo".to_string(),
+                "build".to_string(),
+                "--bin".to_string(),
+                "frankenctl".to_string(),
+            ]
+        );
 
         assert!(mock::global_rsync_invocations_snapshot().is_empty());
         assert!(mock::global_ssh_invocations_snapshot().is_empty());
@@ -10631,13 +10609,8 @@ edition = "2024"
             output.is_allow(),
             "cargo test should be allowed via delegation"
         );
-        match &output {
-            HookOutput::AllowWithModifiedCommand(modified) => {
-                let cmd = &modified.hook_specific_output.updated_input.command;
-                assert_eq!(cmd, "rch exec -- cargo test");
-            }
-            _ => panic!("Expected AllowWithModifiedCommand"),
-        }
+        let cmd = delegated_command(&output);
+        assert_eq!(cmd, "rch exec -- cargo test");
 
         // No rsync/SSH during hook - that happens in run_exec
         let rsync_logs = mock::global_rsync_invocations_snapshot();
@@ -10669,13 +10642,8 @@ edition = "2024"
 
         // Hook should delegate with all arguments preserved
         assert!(output.is_allow());
-        match &output {
-            HookOutput::AllowWithModifiedCommand(modified) => {
-                let cmd = &modified.hook_specific_output.updated_input.command;
-                assert_eq!(cmd, "rch exec -- cargo test --release -- --nocapture");
-            }
-            _ => panic!("Expected AllowWithModifiedCommand"),
-        }
+        let cmd = delegated_command(&output);
+        assert_eq!(cmd, "rch exec -- cargo test --release -- --nocapture");
 
         // No rsync/SSH during hook
         let rsync_logs = mock::global_rsync_invocations_snapshot();
@@ -11967,56 +11935,54 @@ edition = "2024"
     }
 
     // ========================================================================
-    // t13 — poll_reap_child contract. Verifies the helper reaps an
-    // already-exited child quickly, and returns false (without blocking)
-    // when the child hasn't exited yet.
+    // t13 follow-up — rchd launch should return quickly for a live daemon,
+    // but immediate launch failures should still surface.
     // ========================================================================
 
+    #[cfg(unix)]
     #[test]
-    fn test_poll_reap_child_reaps_quick_exit() {
+    fn test_spawn_rchd_returns_quickly_for_live_child() {
         let _guard = test_guard!();
-        // Spawn a process that exits ~immediately.
-        let mut child = std::process::Command::new("true")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .stdin(std::process::Stdio::null())
-            .spawn()
-            .expect("spawn true");
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = create_test_state_dir();
+        let fake_rchd = temp_dir.path().join("rchd");
+        std::fs::write(&fake_rchd, "#!/usr/bin/env sh\nsleep 0.3\n").expect("write fake rchd");
+        let mut perms = std::fs::metadata(&fake_rchd)
+            .expect("fake rchd metadata")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_rchd, perms).expect("chmod fake rchd");
+
         let started = std::time::Instant::now();
-        let reaped = super::poll_reap_child(&mut child, std::time::Duration::from_millis(200));
+        super::spawn_rchd(&fake_rchd).expect("spawn fake rchd");
         let elapsed = started.elapsed();
-        assert!(reaped, "should reap a /usr/bin/true that exits immediately");
-        // try_wait + at most a few 5ms sleeps; well under the 200ms budget.
         assert!(
-            elapsed < std::time::Duration::from_millis(200),
-            "reap of immediate-exit child took {elapsed:?} (expected <200ms)"
+            elapsed < std::time::Duration::from_millis(250),
+            "spawn_rchd should not wait for the daemon body to finish; elapsed={elapsed:?}"
         );
     }
 
+    #[cfg(unix)]
     #[test]
-    fn test_poll_reap_child_returns_false_within_budget_for_long_running() {
+    fn test_spawn_rchd_reports_immediate_child_failure() {
         let _guard = test_guard!();
-        // Spawn a long-running sleep. poll_reap_child must return false
-        // within the budget without blocking on the child's exit.
-        let mut child = std::process::Command::new("sleep")
-            .arg("5")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .stdin(std::process::Stdio::null())
-            .spawn()
-            .expect("spawn sleep");
-        let started = std::time::Instant::now();
-        let reaped = super::poll_reap_child(&mut child, std::time::Duration::from_millis(50));
-        let elapsed = started.elapsed();
-        assert!(!reaped, "must NOT reap a still-running child");
-        // Must NOT block on the sleep — budget + some scheduling slack.
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = create_test_state_dir();
+        let fake_rchd = temp_dir.path().join("rchd");
+        std::fs::write(&fake_rchd, "#!/usr/bin/env sh\nexit 42\n").expect("write fake rchd");
+        let mut perms = std::fs::metadata(&fake_rchd)
+            .expect("fake rchd metadata")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_rchd, perms).expect("chmod fake rchd");
+
+        let err = super::spawn_rchd(&fake_rchd).expect_err("child failure should surface");
         assert!(
-            elapsed < std::time::Duration::from_millis(150),
-            "poll_reap_child blocked: {elapsed:?} (expected <150ms; sleep is 5s)"
+            matches!(err, super::AutoStartError::WrapperFailed(status) if status.code() == Some(42)),
+            "unexpected error: {err:?}"
         );
-        // Cleanup: kill + wait so we don't leave the sleep around.
-        let _ = child.kill();
-        let _ = child.wait();
     }
 
     #[tokio::test]
