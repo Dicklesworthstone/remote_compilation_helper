@@ -3566,15 +3566,15 @@ fn build_worker_projects_topology_cmd(topology_policy: &PathTopologyPolicy) -> S
 
     format!(
         "set -e; \
-         if [ ! -e {canonical} ] && [ ! -L {canonical} ]; then mkdir -p {canonical}; fi; \
+         if [ ! -e {canonical} ] && [ ! -L {canonical} ]; then mkdir -p -- {canonical}; fi; \
          if [ -e {canonical} ] && [ ! -d {canonical} ]; then echo 'RCH_TOPOLOGY_ERR_CANONICAL_NOT_DIRECTORY' >&2; exit 41; fi; \
          if [ -L {alias} ]; then \
-           target=$(readlink {alias} 2>/dev/null || true); \
-           if [ \"$target\" != {canonical} ] && [ \"$target\" != {canonical_slash} ]; then ln -sfn {canonical} {alias}; fi; \
+           target=$(readlink -- {alias} 2>/dev/null || true); \
+           if [ \"$target\" != {canonical} ] && [ \"$target\" != {canonical_slash} ]; then ln -sfn -- {canonical} {alias}; fi; \
          elif [ -e {alias} ]; then \
            echo 'RCH_TOPOLOGY_ERR_ALIAS_NOT_SYMLINK' >&2; exit 42; \
          else \
-           ln -s {canonical} {alias}; \
+           ln -s -- {canonical} {alias}; \
          fi; \
          echo RCH_TOPOLOGY_OK",
         canonical = shell_escape::escape(canonical_display.into()),
@@ -10673,6 +10673,37 @@ edition = "2024"
         assert!(
             command.contains("'/tmp/rch alias;bad'"),
             "shell metacharacters in alias root must be quoted: {command}"
+        );
+    }
+
+    #[test]
+    fn test_build_worker_projects_topology_cmd_terminates_path_options() {
+        let _guard = test_guard!();
+        let policy = PathTopologyPolicy::new(
+            PathBuf::from("-custom/projects"),
+            PathBuf::from("-custom/dp"),
+        );
+        let canonical =
+            shell_escape::escape(std::borrow::Cow::from("-custom/projects")).to_string();
+        let alias = shell_escape::escape(std::borrow::Cow::from("-custom/dp")).to_string();
+
+        let command = build_worker_projects_topology_cmd(&policy);
+
+        assert!(
+            command.contains(&format!("mkdir -p -- {canonical}")),
+            "mkdir must terminate options before configured paths: {command}"
+        );
+        assert!(
+            command.contains(&format!("readlink -- {alias}")),
+            "readlink must terminate options before configured paths: {command}"
+        );
+        assert!(
+            command.contains(&format!("ln -sfn -- {canonical} {alias}")),
+            "ln update must terminate options before configured paths: {command}"
+        );
+        assert!(
+            command.contains(&format!("ln -s -- {canonical} {alias}")),
+            "ln create must terminate options before configured paths: {command}"
         );
     }
 

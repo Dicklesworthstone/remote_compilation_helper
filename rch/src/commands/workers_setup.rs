@@ -9,7 +9,7 @@ use crate::ui::progress::Spinner;
 use crate::ui::theme::StatusIndicator;
 use anyhow::{Context, Result};
 use rch_common::{ApiError, ApiResponse, ErrorCode, WorkerConfig};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 use tokio::process::Command;
 use tracing::{info, warn};
@@ -690,7 +690,7 @@ fn alias_topology_check_cmd(alias: &Path, canonical: &Path) -> String {
     let c_slash = shell_escape_str(&path_display_with_trailing_slash(&canonical_display));
     format!(
         "if [ ! -e {a} ] && [ ! -L {a} ]; then printf 'MISSING'; \
-elif [ -L {a} ]; then target=$(readlink {a} 2>/dev/null || true); \
+elif [ -L {a} ]; then target=$(readlink -- {a} 2>/dev/null || true); \
 if [ \"$target\" = {c} ] || [ \"$target\" = {c_slash} ]; then printf 'CORRECT'; \
 else printf 'WRONG_TARGET:%s' \"$target\"; fi; \
 else printf 'NOT_SYMLINK'; fi"
@@ -698,16 +698,20 @@ else printf 'NOT_SYMLINK'; fi"
 }
 
 fn create_canonical_root_cmd(canonical: &Path) -> String {
-    format!("mkdir -p {}", shell_escape(canonical))
+    format!("mkdir -p -- {}", shell_escape(canonical))
 }
 
 fn create_alias_symlink_cmd(alias: &Path, canonical: &Path) -> String {
-    format!("ln -s {} {}", shell_escape(canonical), shell_escape(alias))
+    format!(
+        "ln -s -- {} {}",
+        shell_escape(canonical),
+        shell_escape(alias)
+    )
 }
 
 fn update_alias_symlink_cmd(alias: &Path, canonical: &Path) -> String {
     format!(
-        "ln -sfn {} {}",
+        "ln -sfn -- {} {}",
         shell_escape(canonical),
         shell_escape(alias)
     )
@@ -734,13 +738,10 @@ fn shell_escape_str(s: &str) -> String {
     if s.is_empty() {
         return "''".to_string();
     }
-    // Force quoting when the first char is `-`: even if every other
-    // character is "safe", `mkdir -p -weird-name` would parse the
-    // path as a flag. Quoting (`'-weird-name'`) makes shell treat it
-    // as a positional argument. The realistic case for path_topology
-    // is an absolute path starting with `/`, so this guard only
-    // matters for pathological configs — but it's a one-line
-    // hardening that closes a config-as-shell-injection adjacency.
+    // Force quoting when the first char is `-` so the path remains
+    // visually distinct in generated shell. Program-level option
+    // parsing is handled by passing `--` before path operands in the
+    // command builders below.
     let starts_with_dash = s.starts_with('-');
     if !starts_with_dash
         && s.chars()
@@ -1391,6 +1392,51 @@ async fn verify_worker_health(worker: &WorkerConfig) -> Result<bool> {
     Ok(stdout == "OK")
 }
 
+#[derive(Debug, Deserialize)]
+struct RustToolchainToml {
+    toolchain: Option<RustToolchainSection>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RustToolchainSection {
+    channel: Option<String>,
+}
+
+fn normalize_toolchain_channel(channel: &str) -> Result<String> {
+    let trimmed = channel.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("Rust toolchain channel is empty");
+    }
+    if trimmed.chars().any(|ch| matches!(ch, '\0' | '\n' | '\r')) {
+        anyhow::bail!("Rust toolchain channel contains control characters");
+    }
+    Ok(trimmed.to_string())
+}
+
+fn parse_rust_toolchain_toml_channel(content: &str, path: &Path) -> Result<Option<String>> {
+    let parsed: RustToolchainToml =
+        toml::from_str(content).with_context(|| format!("Failed to parse {}", path.display()))?;
+    parsed
+        .toolchain
+        .and_then(|toolchain| toolchain.channel)
+        .map(|channel| normalize_toolchain_channel(&channel))
+        .transpose()
+}
+
+fn check_toolchain_command(toolchain: &str) -> String {
+    let toolchain = shell_escape_str(toolchain);
+    format!(
+        "rustup run -- {toolchain} rustc --version >/dev/null 2>&1 && echo FOUND || echo NOTFOUND"
+    )
+}
+
+fn install_toolchain_command(toolchain: &str) -> String {
+    let toolchain = shell_escape_str(toolchain);
+    format!(
+        "rustup install -- {toolchain} && rustup component add rust-src --toolchain={toolchain}"
+    )
+}
+
 /// Detect the project's required toolchain from rust-toolchain.toml or rust-toolchain.
 pub(super) fn detect_project_toolchain() -> Result<String> {
     use std::fs;
@@ -1398,25 +1444,19 @@ pub(super) fn detect_project_toolchain() -> Result<String> {
     // Check for rust-toolchain.toml first
     let toml_path = std::env::current_dir()?.join("rust-toolchain.toml");
     if toml_path.exists() {
-        let content = fs::read_to_string(&toml_path)?;
-        // Parse TOML to find channel
-        // Format: [toolchain]\nchannel = "nightly-2025-01-01"
-        for line in content.lines() {
-            let line = line.trim();
-            if line.starts_with("channel")
-                && let Some(value) = line.split('=').nth(1)
-            {
-                let channel = value.trim().trim_matches('"').trim_matches('\'');
-                return Ok(channel.to_string());
-            }
+        let content = fs::read_to_string(&toml_path)
+            .with_context(|| format!("Failed to read {}", toml_path.display()))?;
+        if let Some(channel) = parse_rust_toolchain_toml_channel(&content, &toml_path)? {
+            return Ok(channel);
         }
     }
 
     // Check for rust-toolchain (plain text)
     let plain_path = std::env::current_dir()?.join("rust-toolchain");
     if plain_path.exists() {
-        let content = fs::read_to_string(&plain_path)?;
-        return Ok(content.trim().to_string());
+        let content = fs::read_to_string(&plain_path)
+            .with_context(|| format!("Failed to read {}", plain_path.display()))?;
+        return normalize_toolchain_channel(&content);
     }
 
     // Default to stable if no toolchain file
@@ -1524,10 +1564,7 @@ async fn check_remote_toolchain(worker: &WorkerConfig, toolchain: &str) -> Resul
     cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
     cmd.arg("-i").arg(&worker.identity_file);
     cmd.arg(format!("{}@{}", worker.user, worker.host));
-    cmd.arg(format!(
-        "rustup show | grep -q '{}' && echo FOUND || echo NOTFOUND",
-        toolchain
-    ));
+    cmd.arg(check_toolchain_command(toolchain));
 
     let output = cmd.output().await.context("Failed to SSH to worker")?;
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1542,10 +1579,7 @@ async fn install_remote_toolchain(worker: &WorkerConfig, toolchain: &str) -> Res
     cmd.arg("-o").arg("ConnectTimeout=60"); // Toolchain install can take a while
     cmd.arg("-i").arg(&worker.identity_file);
     cmd.arg(format!("{}@{}", worker.user, worker.host));
-    cmd.arg(format!(
-        "rustup install {} && rustup component add rust-src --toolchain {}",
-        toolchain, toolchain
-    ));
+    cmd.arg(install_toolchain_command(toolchain));
 
     let output = cmd.output().await.context("Failed to install toolchain")?;
 
@@ -1932,10 +1966,8 @@ mod tests {
     }
 
     // Regression: a path starting with `-` (rare but possible in a
-    // pathological path_topology config) must be force-quoted so it
-    // can't be parsed by mkdir/ln as a flag. Without quoting, the
-    // safe-char check would happily emit `mkdir -p -weird-name` and
-    // mkdir would error with "invalid option -- 'w'".
+    // pathological path_topology config) is still shell-escaped even
+    // though command builders also pass `--` before path operands.
     #[test]
     fn shell_escape_str_force_quotes_paths_starting_with_dash() {
         let escaped = shell_escape_str("-weird-name");
@@ -1948,6 +1980,71 @@ mod tests {
         assert_eq!(
             absolute, "/data/projects",
             "absolute path with only safe chars must NOT be quoted"
+        );
+    }
+
+    #[test]
+    fn topology_bootstrap_mutation_commands_terminate_path_options() {
+        let canonical = Path::new("-canonical-root");
+        let alias = Path::new("-alias-root");
+
+        assert_eq!(
+            create_canonical_root_cmd(canonical),
+            "mkdir -p -- '-canonical-root'"
+        );
+        assert_eq!(
+            create_alias_symlink_cmd(alias, canonical),
+            "ln -s -- '-canonical-root' '-alias-root'"
+        );
+        assert_eq!(
+            update_alias_symlink_cmd(alias, canonical),
+            "ln -sfn -- '-canonical-root' '-alias-root'"
+        );
+
+        let check_cmd = alias_topology_check_cmd(alias, canonical);
+        assert!(
+            check_cmd.contains("readlink -- '-alias-root'"),
+            "alias probe must terminate readlink options before the path: {check_cmd}"
+        );
+    }
+
+    #[test]
+    fn rust_toolchain_toml_parsing_handles_comments_and_rejects_controls() {
+        let parsed = parse_rust_toolchain_toml_channel(
+            "[toolchain]\nchannel = \"nightly-2026-04-22\" # pinned\n",
+            Path::new("rust-toolchain.toml"),
+        );
+
+        assert!(
+            matches!(&parsed, Ok(Some(channel)) if channel == "nightly-2026-04-22"),
+            "TOML parser should extract channel with comments, got {parsed:?}"
+        );
+
+        let err = normalize_toolchain_channel("stable\nwhoops")
+            .err()
+            .map(|err| err.to_string());
+        assert!(
+            err.as_deref()
+                .is_some_and(|message| message.contains("control characters")),
+            "unexpected error for invalid toolchain channel: {err:?}"
+        );
+    }
+
+    #[test]
+    fn remote_toolchain_commands_escape_channel_values() {
+        assert_eq!(
+            check_toolchain_command("-nightly"),
+            "rustup run -- '-nightly' rustc --version >/dev/null 2>&1 && echo FOUND || echo NOTFOUND"
+        );
+        assert_eq!(
+            install_toolchain_command("-nightly"),
+            "rustup install -- '-nightly' && rustup component add rust-src --toolchain='-nightly'"
+        );
+
+        let single_quote = install_toolchain_command("nightly'bad");
+        assert!(
+            single_quote.contains("'nightly'\\''bad'"),
+            "single quotes in toolchain values must be shell escaped: {single_quote}"
         );
     }
 
