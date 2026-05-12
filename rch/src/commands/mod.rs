@@ -145,8 +145,8 @@ async fn query_daemon_health(socket_path: &str) -> Result<DaemonHealthResponse> 
 
 // NOTE: build_dry_run_summary and diagnose moved to status.rs
 
-// Re-export send_daemon_command from helpers (single source of truth)
-pub(crate) use helpers::send_daemon_command;
+// Re-export daemon IPC helpers from helpers (single source of truth)
+pub(crate) use helpers::{configured_socket_path, send_daemon_command};
 
 // =============================================================================
 // Unit Tests

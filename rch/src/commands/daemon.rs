@@ -97,12 +97,13 @@ async fn wait_for_daemon_ready() -> bool {
 // =============================================================================
 
 /// Check daemon status.
-pub fn daemon_status(ctx: &OutputContext) -> Result<()> {
+pub async fn daemon_status(ctx: &OutputContext) -> Result<()> {
     let socket_path_str = configured_socket_path()?;
     let socket_path = Path::new(&socket_path_str);
     let style = ctx.theme();
 
-    let running = socket_path.exists();
+    let socket_exists = socket_path.exists();
+    let running = socket_exists && daemon_responds_on_configured_socket().await;
     let uptime_seconds = if running {
         std::fs::metadata(socket_path)
             .ok()
@@ -154,6 +155,11 @@ pub fn daemon_status(ctx: &OutputContext) -> Result<()> {
             );
         }
     } else {
+        let socket_note = if socket_exists {
+            "(stale or unreachable)"
+        } else {
+            "(not found)"
+        };
         println!(
             "  {} {} {}",
             style.key("Status"),
@@ -165,7 +171,7 @@ pub fn daemon_status(ctx: &OutputContext) -> Result<()> {
             style.key("Socket"),
             style.muted(":"),
             style.muted(&socket_path_str),
-            style.muted("(not found)")
+            style.muted(socket_note)
         );
         println!();
         println!(
@@ -437,7 +443,7 @@ pub async fn daemon_stop(skip_confirm: bool, ctx: &OutputContext) -> Result<()> 
             match output {
                 Ok(o) if o.status.success() => {
                     // Remove stale socket
-                    let _ = std::fs::remove_file(socket_path);
+                    let _ = tokio::fs::remove_file(socket_path).await;
                     if ctx.is_json() {
                         let _ = ctx.json(&ApiResponse::ok(
                             "daemon stop",

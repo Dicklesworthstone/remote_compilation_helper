@@ -2616,7 +2616,7 @@ async fn handle_daemon(action: DaemonAction, ctx: &OutputContext) -> Result<()> 
             commands::daemon_restart(yes, ctx).await?;
         }
         DaemonAction::Status => {
-            commands::daemon_status(ctx)?;
+            commands::daemon_status(ctx).await?;
         }
         DaemonAction::Logs { lines } => {
             commands::daemon_logs(lines, ctx)?;

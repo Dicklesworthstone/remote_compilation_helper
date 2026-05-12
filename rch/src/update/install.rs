@@ -3,9 +3,10 @@
 use super::download::DownloadedRelease;
 use super::lock::UpdateLock;
 use super::types::{BackupEntry, MAX_BACKUPS, UpdateError};
+use crate::commands::{configured_socket_path, send_daemon_command};
 use crate::ui::OutputContext;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Result of installation.
@@ -500,25 +501,17 @@ async fn stop_daemon_gracefully(_timeout_secs: u64) -> Result<bool, UpdateError>
 
 /// Stop daemon gracefully, waiting for builds to complete.
 #[cfg(unix)]
-async fn stop_daemon_gracefully(_timeout_secs: u64) -> Result<bool, UpdateError> {
-    use std::path::Path;
-    use tokio::io::AsyncWriteExt;
-    use tokio::net::UnixStream;
-
-    // Check if daemon is running
-    let socket_path_buf = PathBuf::from(rch_common::default_socket_path());
-    let socket_path = Path::new(&socket_path_buf);
+async fn stop_daemon_gracefully(timeout_secs: u64) -> Result<bool, UpdateError> {
+    let socket_path = configured_update_socket_path()?;
     if !socket_path.exists() {
         return Ok(false);
     }
 
     // Try graceful shutdown via socket
-    if let Ok(mut stream) = UnixStream::connect(socket_path).await {
-        let _ = stream.write_all(b"POST /shutdown\n").await;
-    }
+    let _ = send_daemon_command("POST /shutdown\n").await;
 
     // Wait for socket to disappear
-    for _ in 0..20 {
+    for _ in 0..shutdown_poll_attempts(timeout_secs) {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         if !socket_path.exists() {
             return Ok(true);
@@ -532,16 +525,18 @@ async fn stop_daemon_gracefully(_timeout_secs: u64) -> Result<bool, UpdateError>
         .await;
 
     // Remove stale socket if present
-    let _ = std::fs::remove_file(socket_path);
+    let _ = tokio::fs::remove_file(&socket_path).await;
 
     Ok(true)
 }
 
 /// Start the daemon.
 async fn start_daemon() -> Result<(), UpdateError> {
-    // Use the commands module to start daemon
-    // This is a simplified version - the full implementation would use the proper startup flow
+    let socket_path = configured_update_socket_path()?;
+
+    // Preserve custom socket configuration across update and rollback restarts.
     let _child = Command::new("rchd")
+        .args(daemon_start_args(&socket_path))
         .spawn()
         .map_err(|e| UpdateError::InstallFailed(format!("Failed to start daemon: {}", e)))?;
 
@@ -549,6 +544,20 @@ async fn start_daemon() -> Result<(), UpdateError> {
     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
     Ok(())
+}
+
+fn configured_update_socket_path() -> Result<PathBuf, UpdateError> {
+    configured_socket_path()
+        .map(PathBuf::from)
+        .map_err(|e| UpdateError::InstallFailed(format!("Failed to resolve daemon socket: {e}")))
+}
+
+fn daemon_start_args(socket_path: &Path) -> [&std::ffi::OsStr; 2] {
+    [std::ffi::OsStr::new("--socket"), socket_path.as_os_str()]
+}
+
+fn shutdown_poll_attempts(timeout_secs: u64) -> u64 {
+    timeout_secs.saturating_mul(10)
 }
 
 #[cfg(test)]
@@ -699,5 +708,21 @@ mod tests {
             std::fs::read_to_string(install_dir.join("rchd")).unwrap(),
             "backup daemon"
         );
+    }
+
+    #[test]
+    fn daemon_start_args_pin_configured_socket_path() {
+        let socket_path = Path::new("/tmp/rch-update-custom.sock");
+        let args = daemon_start_args(socket_path);
+
+        assert_eq!(args[0], std::ffi::OsStr::new("--socket"));
+        assert_eq!(args[1], socket_path.as_os_str());
+    }
+
+    #[test]
+    fn shutdown_poll_attempts_respects_requested_timeout() {
+        assert_eq!(shutdown_poll_attempts(0), 0);
+        assert_eq!(shutdown_poll_attempts(1), 10);
+        assert_eq!(shutdown_poll_attempts(30), 300);
     }
 }
