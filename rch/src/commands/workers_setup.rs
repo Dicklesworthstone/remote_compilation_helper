@@ -675,10 +675,15 @@ fn alias_topology_check_cmd(alias: &Path, canonical: &Path) -> String {
     let a = shell_escape(alias);
     let c = shell_escape(canonical);
     // Use POSIX `readlink` semantics: target may be `<canonical>` or
-    // `<canonical>/`. The pre-fix command hardcoded that comparison
-    // for the two literal forms; the runtime form preserves it but
-    // builds the suffixed variant from the actual canonical path.
-    let c_slash = shell_escape(&canonical.join(""));
+    // `<canonical>/`. The pre-fix command hardcoded both forms; the
+    // runtime form preserves the same dual-comparison. Build the
+    // trailing-slash variant from the rendered display string
+    // directly; `Path::join("")` returns a `PathBuf` whose
+    // serialization differs across platforms (Linux drops the
+    // empty component, Windows preserves it), so an explicit
+    // `format!("{}/", display)` is the only reliable form.
+    let canonical_display = canonical.display().to_string();
+    let c_slash = shell_escape_str(&path_display_with_trailing_slash(&canonical_display));
     format!(
         "if [ ! -e {a} ] && [ ! -L {a} ]; then printf 'MISSING'; \
 elif [ -L {a} ]; then target=$(readlink {a} 2>/dev/null || true); \
@@ -709,7 +714,19 @@ fn update_alias_symlink_cmd(alias: &Path, canonical: &Path) -> String {
 /// end-quote-escape-quote-start trick) so the resulting argument is
 /// always a single bash word.
 fn shell_escape(path: &Path) -> String {
-    let s = path.display().to_string();
+    shell_escape_str(&path.display().to_string())
+}
+
+fn path_display_with_trailing_slash(display: &str) -> String {
+    format!("{}/", display.trim_end_matches('/'))
+}
+
+/// Same logic as `shell_escape` but operates on an already-rendered
+/// string. Used for the trailing-slash canonical variant in the
+/// alias-topology check, which can't be cleanly expressed as a
+/// `Path` because `Path::join("")` has platform-specific
+/// serialization semantics.
+fn shell_escape_str(s: &str) -> String {
     if s.is_empty() {
         return "''".to_string();
     }
@@ -717,27 +734,39 @@ fn shell_escape(path: &Path) -> String {
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '_' | '.'))
     {
         // Safe ASCII-identifier-ish — no quoting needed.
-        return s;
+        return s.to_string();
     }
     let escaped = s.replace('\'', "'\\''");
     format!("'{escaped}'")
 }
 
 fn remediation_for_failure(kind: TopologyFailureKind) -> String {
+    remediation_for_failure_with_paths(
+        kind,
+        Path::new(DEFAULT_CANONICAL_PROJECT_ROOT),
+        Path::new(DEFAULT_ALIAS_PROJECT_ROOT),
+    )
+}
+
+fn remediation_for_failure_with_paths(
+    kind: TopologyFailureKind,
+    canonical_root: &Path,
+    alias_root: &Path,
+) -> String {
     match kind {
         TopologyFailureKind::Permission => format!(
             "Ensure the SSH user can write {} and create {} symlinks (sudo/chown may be required).",
-            DEFAULT_CANONICAL_PROJECT_ROOT, DEFAULT_ALIAS_PROJECT_ROOT
+            canonical_root.display(), alias_root.display()
         ),
         TopologyFailureKind::Filesystem => format!(
             "Verify remote filesystem health and that {} is writable before rerunning setup.",
-            DEFAULT_CANONICAL_PROJECT_ROOT
+            canonical_root.display()
         ),
         TopologyFailureKind::IntegrityMismatch => format!(
             "Resolve conflicting paths manually so {} is a directory and {} is a symlink to {}.",
-            DEFAULT_CANONICAL_PROJECT_ROOT,
-            DEFAULT_ALIAS_PROJECT_ROOT,
-            DEFAULT_CANONICAL_PROJECT_ROOT
+            canonical_root.display(),
+            alias_root.display(),
+            canonical_root.display()
         ),
         TopologyFailureKind::Unknown => {
             "Inspect worker logs and rerun with --verbose for detailed diagnostics.".to_string()
@@ -900,6 +929,8 @@ async fn execute_topology_fix(
     action_message: &str,
     outcome: &mut TopologyEnforcementResult,
     worker_id: &str,
+    canonical_root: &Path,
+    alias_root: &Path,
 ) -> bool {
     match run_worker_ssh_command(worker, command).await {
         Ok(output) if output.status.success() => {
@@ -918,7 +949,8 @@ async fn execute_topology_fix(
         Ok(output) => {
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
             let failure_kind = classify_topology_failure(&stderr);
-            let remediation = remediation_for_failure(failure_kind);
+            let remediation =
+                remediation_for_failure_with_paths(failure_kind, canonical_root, alias_root);
             let message = format!(
                 "{} failed (exit {}): {}",
                 step,
@@ -945,7 +977,8 @@ async fn execute_topology_fix(
         }
         Err(e) => {
             let failure_kind = classify_topology_failure(&e.to_string());
-            let remediation = remediation_for_failure(failure_kind);
+            let remediation =
+                remediation_for_failure_with_paths(failure_kind, canonical_root, alias_root);
             let message = format!("{} failed: {}", step, e);
             push_topology_audit(
                 worker_id,
@@ -985,7 +1018,8 @@ async fn enforce_worker_bootstrap_topology(
         Ok(state) => state,
         Err(e) => {
             let failure_kind = classify_topology_failure(&e.to_string());
-            let remediation = remediation_for_failure(failure_kind);
+            let remediation =
+                remediation_for_failure_with_paths(failure_kind, canonical_root, alias_root);
             let message = format!("canonical topology probe failed: {}", e);
             push_topology_audit(
                 worker_id,
@@ -1041,6 +1075,8 @@ async fn enforce_worker_bootstrap_topology(
                     &action_message,
                     &mut outcome,
                     worker_id,
+                    canonical_root,
+                    alias_root,
                 )
                 .await
                 {
@@ -1050,7 +1086,8 @@ async fn enforce_worker_bootstrap_topology(
         }
         CanonicalTopologyState::NotDirectory => {
             let failure_kind = TopologyFailureKind::IntegrityMismatch;
-            let remediation = remediation_for_failure(failure_kind);
+            let remediation =
+                remediation_for_failure_with_paths(failure_kind, canonical_root, alias_root);
             let message = format!("{} exists but is not a directory", canonical_root.display());
             push_topology_audit(
                 worker_id,
@@ -1072,7 +1109,8 @@ async fn enforce_worker_bootstrap_topology(
         }
         CanonicalTopologyState::Unknown(raw) => {
             let failure_kind = TopologyFailureKind::Filesystem;
-            let remediation = remediation_for_failure(failure_kind);
+            let remediation =
+                remediation_for_failure_with_paths(failure_kind, canonical_root, alias_root);
             let message = format!("Unexpected canonical topology probe output: {}", raw);
             push_topology_audit(
                 worker_id,
@@ -1098,7 +1136,8 @@ async fn enforce_worker_bootstrap_topology(
         Ok(state) => state,
         Err(e) => {
             let failure_kind = classify_topology_failure(&e.to_string());
-            let remediation = remediation_for_failure(failure_kind);
+            let remediation =
+                remediation_for_failure_with_paths(failure_kind, canonical_root, alias_root);
             let message = format!("alias topology probe failed: {}", e);
             push_topology_audit(
                 worker_id,
@@ -1166,6 +1205,8 @@ async fn enforce_worker_bootstrap_topology(
                     &action_message,
                     &mut outcome,
                     worker_id,
+                    canonical_root,
+                    alias_root,
                 )
                 .await
                 {
@@ -1204,6 +1245,8 @@ async fn enforce_worker_bootstrap_topology(
                     &action_message,
                     &mut outcome,
                     worker_id,
+                    canonical_root,
+                    alias_root,
                 )
                 .await
                 {
@@ -1213,7 +1256,8 @@ async fn enforce_worker_bootstrap_topology(
         }
         AliasTopologyState::NotSymlink => {
             let failure_kind = TopologyFailureKind::IntegrityMismatch;
-            let remediation = remediation_for_failure(failure_kind);
+            let remediation =
+                remediation_for_failure_with_paths(failure_kind, canonical_root, alias_root);
             let message = format!("{} exists but is not a symlink", alias_root.display());
             push_topology_audit(
                 worker_id,
@@ -1235,7 +1279,8 @@ async fn enforce_worker_bootstrap_topology(
         }
         AliasTopologyState::Unknown(raw) => {
             let failure_kind = TopologyFailureKind::Filesystem;
-            let remediation = remediation_for_failure(failure_kind);
+            let remediation =
+                remediation_for_failure_with_paths(failure_kind, canonical_root, alias_root);
             let message = format!("Unexpected alias topology probe output: {}", raw);
             push_topology_audit(
                 worker_id,
@@ -1275,7 +1320,8 @@ async fn enforce_worker_bootstrap_topology(
             );
         } else {
             let failure_kind = TopologyFailureKind::IntegrityMismatch;
-            let remediation = remediation_for_failure(failure_kind);
+            let remediation =
+                remediation_for_failure_with_paths(failure_kind, canonical_root, alias_root);
             let message = format!(
                 "Post-fix verification failed: canonical={:?}, alias={:?}",
                 post_canonical, post_alias
@@ -1788,6 +1834,74 @@ mod tests {
         log_test_pass(
             "topology_bootstrap_failure_classification_covers_permission_filesystem_and_unknown",
         );
+    }
+
+    #[test]
+    fn topology_bootstrap_remediation_uses_configured_paths() {
+        log_test_start("topology_bootstrap_remediation_uses_configured_paths");
+        let canonical = Path::new("/custom/projects");
+        let alias = Path::new("/custom/dp");
+
+        let permission =
+            remediation_for_failure_with_paths(TopologyFailureKind::Permission, canonical, alias);
+        let integrity = remediation_for_failure_with_paths(
+            TopologyFailureKind::IntegrityMismatch,
+            canonical,
+            alias,
+        );
+
+        assert!(permission.contains("/custom/projects"));
+        assert!(permission.contains("/custom/dp"));
+        assert!(integrity.contains("/custom/projects"));
+        assert!(integrity.contains("/custom/dp"));
+        assert!(
+            !permission.contains(DEFAULT_CANONICAL_PROJECT_ROOT),
+            "custom remediation must not mention default canonical root: {permission}"
+        );
+        log_test_pass("topology_bootstrap_remediation_uses_configured_paths");
+    }
+
+    #[test]
+    fn topology_bootstrap_alias_check_command_adds_one_trailing_slash_variant() {
+        log_test_start("topology_bootstrap_alias_check_command_adds_one_trailing_slash_variant");
+
+        let without_slash =
+            alias_topology_check_cmd(Path::new("/custom/dp"), Path::new("/custom/projects"));
+        let with_slash =
+            alias_topology_check_cmd(Path::new("/custom/dp"), Path::new("/custom/projects/"));
+
+        assert!(
+            without_slash.contains("/custom/projects/"),
+            "alias probe should accept readlink targets with one trailing slash: {without_slash}"
+        );
+        assert!(
+            !without_slash.contains("/custom/projects//"),
+            "alias probe should not generate double trailing slashes: {without_slash}"
+        );
+        assert!(
+            !with_slash.contains("/custom/projects//"),
+            "already-slashed canonical roots should stay single-slashed: {with_slash}"
+        );
+        log_test_pass("topology_bootstrap_alias_check_command_adds_one_trailing_slash_variant");
+    }
+
+    #[test]
+    fn topology_bootstrap_alias_check_command_shell_escapes_configured_paths() {
+        log_test_start("topology_bootstrap_alias_check_command_shell_escapes_configured_paths");
+        let command = alias_topology_check_cmd(
+            Path::new("/tmp/rch alias;bad"),
+            Path::new("/tmp/rch weird'root"),
+        );
+
+        assert!(
+            command.contains("'/tmp/rch alias;bad'"),
+            "alias path must be shell escaped: {command}"
+        );
+        assert!(
+            command.contains("'/tmp/rch weird'\\''root'"),
+            "canonical path must escape single quotes: {command}"
+        );
+        log_test_pass("topology_bootstrap_alias_check_command_shell_escapes_configured_paths");
     }
 
     #[cfg(unix)]
