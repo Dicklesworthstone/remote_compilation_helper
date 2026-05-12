@@ -12443,6 +12443,13 @@ edition = "2024"
         let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
         drop(listener);
 
+        for _ in 0..20 {
+            if super::socket_is_confirmed_stale(&socket_path).await {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
         assert!(
             super::socket_is_confirmed_stale(&socket_path).await,
             "dropped listener should leave a stale socket path"
