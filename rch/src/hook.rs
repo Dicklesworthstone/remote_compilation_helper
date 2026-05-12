@@ -55,7 +55,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -110,6 +110,7 @@ const RCH_WORKER_ENV: &str = "RCH_WORKER";
 const RCH_WORKERS_ENV: &str = "RCH_WORKERS";
 
 static HOOK_MODE_PANIC_FAIL_OPEN: AtomicBool = AtomicBool::new(false);
+static AUTOSTART_LOCK_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 use rch_common::util::mask_sensitive_command;
 
@@ -1068,15 +1069,15 @@ fn write_cooldown_timestamp(path: &Path) -> Result<(), AutoStartError> {
 /// killed), a >60s-old lockfile is treated as stale.
 const AUTOSTART_LOCK_STALE_TTL_SECS: u64 = 60;
 
-/// Render the lockfile body. Format: 3 newline-separated lines
-/// `pid\nunix_secs\nhostname\n`. Hand-rolled to avoid bringing in a
-/// serializer for a 3-field file the OS owns.
+/// Render the lockfile body. Format: newline-separated
+/// `pid\nunix_secs\nhostname\nnonce\n`. Hand-rolled to avoid bringing in a
+/// serializer for a small file the OS owns.
 fn render_autostart_lock_body() -> String {
     let pid = std::process::id();
-    let now_secs = SystemTime::now()
+    let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap_or(Duration::from_secs(0))
-        .as_secs();
+        .unwrap_or(Duration::from_secs(0));
+    let now_secs = now.as_secs();
     let hostname = std::env::var("HOSTNAME")
         .ok()
         .or_else(|| {
@@ -1085,7 +1086,9 @@ fn render_autostart_lock_body() -> String {
                 .map(|s| s.trim().to_string())
         })
         .unwrap_or_else(|| "unknown".to_string());
-    format!("{pid}\n{now_secs}\n{hostname}\n")
+    let sequence = AUTOSTART_LOCK_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let nonce = now.as_nanos();
+    format!("{pid}\n{now_secs}\n{hostname}\n{nonce:x}-{sequence:x}\n")
 }
 
 /// Parsed contents of an autostart lockfile.
@@ -11828,6 +11831,21 @@ edition = "2024"
         let parsed = super::parse_autostart_lock_body(&body).expect("body parses");
         assert_eq!(parsed.pid, std::process::id());
         assert!(!parsed.hostname.is_empty());
+    }
+
+    #[test]
+    fn test_render_autostart_lock_body_is_unique_owner_token() {
+        let _guard = test_guard!();
+
+        let body1 = super::render_autostart_lock_body();
+        let body2 = super::render_autostart_lock_body();
+
+        assert_ne!(
+            body1, body2,
+            "lock cleanup token must be acquisition-unique"
+        );
+        assert!(super::parse_autostart_lock_body(&body1).is_some());
+        assert!(super::parse_autostart_lock_body(&body2).is_some());
     }
 
     #[test]
