@@ -2806,10 +2806,32 @@ fn spawn_rchd(rchd_path: &Path, socket_path: &Path) -> Result<(), String> {
         .stderr(Stdio::null())
         .stdin(Stdio::null());
 
-    cmd.spawn().map_err(|e| match e.kind() {
+    let mut child = cmd.spawn().map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => "rchd not found in PATH".to_string(),
         _ => e.to_string(),
     })?;
+
+    // t13: reap the nohup wrapper to avoid leaving a zombie process in
+    // rch's tree. `nohup` forks (daemonizing rchd) then exits — we want
+    // to collect that exit immediately so it doesn't sit zombified
+    // until our own process exits (which, for the doctor, may be many
+    // seconds since the doctor continues running other checks).
+    // try_wait is non-blocking; we poll for up to 100ms which is more
+    // than enough to catch nohup's near-instant exit. We do NOT wait
+    // for rchd itself — only the wrapper.
+    let started = Instant::now();
+    let budget = Duration::from_millis(100);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_status)) => break,
+            Ok(None) => {}
+            Err(_) => break,
+        }
+        if started.elapsed() >= budget {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
     Ok(())
 }
 

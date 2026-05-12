@@ -1288,8 +1288,40 @@ fn spawn_rchd(path: &Path) -> Result<(), AutoStartError> {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .stdin(Stdio::null());
-    cmd.spawn().map_err(AutoStartError::SpawnFailed)?;
+    let mut child = cmd.spawn().map_err(AutoStartError::SpawnFailed)?;
+
+    // t13: reap the nohup wrapper to avoid leaving a zombie process in
+    // rch's tree. `nohup` forks (daemonizing rchd) then exits — we want
+    // to collect that exit immediately so it isn't waiting for init.
+    // try_wait() is non-blocking and (under Rust's stdlib) calls
+    // waitpid(WNOHANG) which DOES reap the zombie if it already exited.
+    // The wrapper typically exits within sub-millisecond of the spawn,
+    // so this small poll loop is enough in practice. We don't block on
+    // the daemon itself — only on the wrapper.
+    poll_reap_child(&mut child, std::time::Duration::from_millis(100));
     Ok(())
+}
+
+/// Best-effort wait-and-reap of the nohup wrapper child. Polls
+/// `child.try_wait()` with brief sleeps up to `budget`. If the wrapper
+/// hasn't exited by then (rare in practice — typical wallclock is
+/// sub-millisecond), we silently move on; the OS will reap it when our
+/// own process exits (rch is short-lived) or it's reparented to init.
+///
+/// Returns true if reaped during the poll loop.
+fn poll_reap_child(child: &mut std::process::Child, budget: std::time::Duration) -> bool {
+    let started = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_status)) => return true,
+            Ok(None) => {}
+            Err(_) => return false,
+        }
+        if started.elapsed() >= budget {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
 }
 
 async fn probe_daemon_health(socket_path: &Path) -> bool {
@@ -11932,6 +11964,59 @@ edition = "2024"
         let lock = super::acquire_autostart_lock(&lock_path);
         assert!(lock.is_ok(), "Should create parent directories");
         assert!(lock_path.exists(), "Lock file should exist");
+    }
+
+    // ========================================================================
+    // t13 — poll_reap_child contract. Verifies the helper reaps an
+    // already-exited child quickly, and returns false (without blocking)
+    // when the child hasn't exited yet.
+    // ========================================================================
+
+    #[test]
+    fn test_poll_reap_child_reaps_quick_exit() {
+        let _guard = test_guard!();
+        // Spawn a process that exits ~immediately.
+        let mut child = std::process::Command::new("true")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn true");
+        let started = std::time::Instant::now();
+        let reaped = super::poll_reap_child(&mut child, std::time::Duration::from_millis(200));
+        let elapsed = started.elapsed();
+        assert!(reaped, "should reap a /usr/bin/true that exits immediately");
+        // try_wait + at most a few 5ms sleeps; well under the 200ms budget.
+        assert!(
+            elapsed < std::time::Duration::from_millis(200),
+            "reap of immediate-exit child took {elapsed:?} (expected <200ms)"
+        );
+    }
+
+    #[test]
+    fn test_poll_reap_child_returns_false_within_budget_for_long_running() {
+        let _guard = test_guard!();
+        // Spawn a long-running sleep. poll_reap_child must return false
+        // within the budget without blocking on the child's exit.
+        let mut child = std::process::Command::new("sleep")
+            .arg("5")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        let started = std::time::Instant::now();
+        let reaped = super::poll_reap_child(&mut child, std::time::Duration::from_millis(50));
+        let elapsed = started.elapsed();
+        assert!(!reaped, "must NOT reap a still-running child");
+        // Must NOT block on the sleep — budget + some scheduling slack.
+        assert!(
+            elapsed < std::time::Duration::from_millis(150),
+            "poll_reap_child blocked: {elapsed:?} (expected <150ms; sleep is 5s)"
+        );
+        // Cleanup: kill + wait so we don't leave the sleep around.
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     #[tokio::test]
