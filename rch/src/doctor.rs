@@ -527,6 +527,15 @@ struct ReliabilityDoctorResponse {
     /// `["all"]` by default). Agents inspect this field to confirm their
     /// `--scope` arg was honored.
     scope: Vec<String>,
+    /// True when ANY probe could not reach the daemon. Operators see this
+    /// top-level marker instead of grepping diagnostic messages for the
+    /// daemon-down case. (t05)
+    daemon_unreachable: bool,
+    /// Per-probe failures that contributed to `daemon_unreachable=true`.
+    /// Empty when `daemon_unreachable=false`. Forensic detail so log
+    /// consumers can attribute the unreachability to a specific probe
+    /// (e.g., "process_debt: daemon status unavailable"). (t05)
+    daemon_unreachable_reasons: Vec<String>,
     diagnostics: Vec<ReliabilityDiagnostic>,
     summary: ReliabilityDoctorSummary,
     remediation_plan: Vec<ReliabilityRemediationStep>,
@@ -637,6 +646,12 @@ pub async fn run_doctor(ctx: &OutputContext, options: DoctorOptions) -> Result<(
         let _ = ctx.json(&ApiResponse::ok(
             "doctor",
             DoctorResponse {
+                // t05: same schema-version on legacy doctor as on
+                // reliability mode; sourced from the central registry.
+                schema_version: rch_common::schema_version(
+                    rch_common::SchemaComponent::DoctorReliability,
+                )
+                .to_string(),
                 checks,
                 summary,
                 fixes_applied,
@@ -818,7 +833,10 @@ async fn run_reliability_doctor(ctx: &OutputContext, options: &DoctorOptions) ->
     let response = build_reliability_doctor_response(mode, scope, diagnostics);
 
     if ctx.is_json() {
-        let _ = ctx.json(&ApiResponse::ok("doctor reliability", &response));
+        // t05: command tag is a single dotted token ("doctor.reliability")
+        // for agent-friendly jq-matching. Per AGENTS.md no-back-compat:
+        // consumers update to the dotted form directly.
+        let _ = ctx.json(&ApiResponse::ok("doctor.reliability", &response));
     } else {
         print_reliability_doctor_response(ctx, &response);
     }
@@ -1677,6 +1695,17 @@ fn schema_compatibility_diagnostic(
     }
 }
 
+/// Reason codes whose presence in the diagnostic list indicates the
+/// daemon could not be reached. Each of these is emitted by a probe
+/// whose query specifically depends on a live daemon socket — so any
+/// one of them implies `daemon_unreachable=true`. (t05)
+const DAEMON_UNREACHABLE_REASON_CODES: &[ReliabilityReasonCode] = &[
+    ReliabilityReasonCode::DaemonStatusUnavailable,
+    ReliabilityReasonCode::DiskPressureUnavailable,
+    ReliabilityReasonCode::ProcessDebtUnavailable,
+    ReliabilityReasonCode::RepoConvergenceUnavailable,
+];
+
 fn build_reliability_doctor_response(
     mode: ReliabilityDoctorMode,
     scope: &ReliabilityScopeSet,
@@ -1697,6 +1726,17 @@ fn build_reliability_doctor_response(
         }
     }
 
+    // Compute daemon_unreachable + per-probe attribution (t05). Walk
+    // the diagnostics list looking for the "this probe needed the
+    // daemon but couldn't reach it" reason codes. The reasons list
+    // gives operators which specific probe failed.
+    let daemon_unreachable_reasons: Vec<String> = diagnostics
+        .iter()
+        .filter(|d| DAEMON_UNREACHABLE_REASON_CODES.contains(&d.code))
+        .map(|d| format!("{}: {}", d.check_name, d.message))
+        .collect();
+    let daemon_unreachable = !daemon_unreachable_reasons.is_empty();
+
     let remediation_plan = build_reliability_remediation_plan(&diagnostics);
     let summary = ReliabilityDoctorSummary {
         total_checks: diagnostics.len(),
@@ -1712,6 +1752,8 @@ fn build_reliability_doctor_response(
         schema_version: RELIABILITY_DOCTOR_SCHEMA_VERSION.to_string(),
         mode,
         scope: scope.as_strings(),
+        daemon_unreachable,
+        daemon_unreachable_reasons,
         diagnostics,
         summary,
         remediation_plan,
@@ -1761,6 +1803,18 @@ fn print_reliability_doctor_response(ctx: &OutputContext, response: &Reliability
 
     println!("{}", style.format_header("RCH Reliability Doctor"));
     println!();
+
+    // t05: daemon-unreachable prefix so the operator immediately sees
+    // the limited scope of this report. Suppressed in JSON mode where
+    // the envelope's data.daemon_unreachable flag carries the same
+    // signal for machine consumers.
+    if response.daemon_unreachable && !ctx.is_json() {
+        println!(
+            "  {} [daemon down — local-only checks]",
+            StatusIndicator::Warning.display(style)
+        );
+    }
+
     println!(
         "  {} schema {}",
         StatusIndicator::Info.display(style),
@@ -1835,6 +1889,22 @@ fn print_reliability_doctor_response(ctx: &OutputContext, response: &Reliability
         );
     } else {
         println!("{}", style.format_success("Reliability checks passed."));
+    }
+
+    // t05: meta footer for first-time operators — only in human mode
+    // (verbose or default). Hook/JSON modes get the same info via the
+    // envelope and the --schema endpoint.
+    if !ctx.is_json() {
+        println!();
+        println!(
+            "  {} Run with {} for machine-readable output",
+            StatusIndicator::Info.display(style),
+            style.value("--json")
+        );
+        println!(
+            "  {} Exit codes: 0 = healthy, 1 = degraded, 2 = failing (with --strict: degraded → 2; with --lenient: failing → 1)",
+            StatusIndicator::Info.display(style),
+        );
     }
 }
 
@@ -4525,6 +4595,7 @@ mod tests {
     fn test_doctor_response_serialization() {
         // TEST START: DoctorResponse full serialization
         let response = DoctorResponse {
+            schema_version: "1.0.0".to_string(),
             checks: vec![
                 CheckResult {
                     category: "prerequisites".to_string(),
@@ -4571,6 +4642,7 @@ mod tests {
     fn test_doctor_response_with_fixes() {
         // TEST START: DoctorResponse with applied fixes
         let response = DoctorResponse {
+            schema_version: "1.0.0".to_string(),
             checks: vec![],
             summary: DoctorSummary {
                 total: 1,
@@ -5632,5 +5704,167 @@ exit 0\n"
             helpers_schema.probe_names_to_run(false),
             vec!["helpers", "schema"]
         );
+    }
+
+    // ========================================================================
+    // t05 — envelope harmonization. Verify command tag is the dotted
+    // form, daemon_unreachable + reasons populate correctly, and the
+    // legacy DoctorResponse carries a schema_version.
+    // ========================================================================
+
+    fn synthetic_diagnostic(
+        code: ReliabilityReasonCode,
+        check_name: &str,
+        message: &str,
+        severity: ReliabilitySeverity,
+    ) -> ReliabilityDiagnostic {
+        ReliabilityDiagnostic::new(
+            ReliabilityCategory::Topology,
+            check_name,
+            severity,
+            message,
+            code,
+        )
+    }
+
+    #[test]
+    fn test_daemon_unreachable_false_when_all_reachable() {
+        // No daemon-unreachable codes in the diagnostics → false + empty list.
+        let diags = vec![
+            synthetic_diagnostic(
+                ReliabilityReasonCode::WorkersHealthy,
+                "daemon_worker_capacity",
+                "All 7 workers healthy",
+                ReliabilitySeverity::Pass,
+            ),
+            synthetic_diagnostic(
+                ReliabilityReasonCode::WorkerReady,
+                "worker_topology",
+                "Worker css ready",
+                ReliabilitySeverity::Pass,
+            ),
+        ];
+        let response = build_reliability_doctor_response(
+            ReliabilityDoctorMode::Check,
+            &ReliabilityScopeSet::default(),
+            diags,
+        );
+        assert!(!response.daemon_unreachable);
+        assert!(response.daemon_unreachable_reasons.is_empty());
+    }
+
+    #[test]
+    fn test_daemon_unreachable_true_when_status_unavailable() {
+        // Single probe reports DaemonStatusUnavailable → flag flips.
+        let diags = vec![synthetic_diagnostic(
+            ReliabilityReasonCode::DaemonStatusUnavailable,
+            "daemon_status",
+            "Daemon status is unavailable",
+            ReliabilitySeverity::Warning,
+        )];
+        let response = build_reliability_doctor_response(
+            ReliabilityDoctorMode::Check,
+            &ReliabilityScopeSet::default(),
+            diags,
+        );
+        assert!(response.daemon_unreachable);
+        assert_eq!(response.daemon_unreachable_reasons.len(), 1);
+        // The reason text should attribute it to the probe name + message.
+        assert!(
+            response.daemon_unreachable_reasons[0].contains("daemon_status"),
+            "reason text should name the probe: {:?}",
+            response.daemon_unreachable_reasons
+        );
+        assert!(
+            response.daemon_unreachable_reasons[0].contains("unavailable"),
+            "reason text should include the diagnostic message"
+        );
+    }
+
+    #[test]
+    fn test_daemon_unreachable_aggregates_multiple_probes() {
+        // Multiple unreachable codes → all attributed.
+        let diags = vec![
+            synthetic_diagnostic(
+                ReliabilityReasonCode::DaemonStatusUnavailable,
+                "daemon_status",
+                "daemon down",
+                ReliabilitySeverity::Warning,
+            ),
+            synthetic_diagnostic(
+                ReliabilityReasonCode::DiskPressureUnavailable,
+                "disk_pressure",
+                "disk surface gone",
+                ReliabilitySeverity::Warning,
+            ),
+            synthetic_diagnostic(
+                ReliabilityReasonCode::ProcessDebtUnavailable,
+                "process_debt",
+                "triage unavailable",
+                ReliabilitySeverity::Warning,
+            ),
+            // Non-unreachable diagnostic should NOT appear in the reasons.
+            synthetic_diagnostic(
+                ReliabilityReasonCode::WorkersHealthy,
+                "daemon_worker_capacity",
+                "ignored",
+                ReliabilitySeverity::Pass,
+            ),
+        ];
+        let response = build_reliability_doctor_response(
+            ReliabilityDoctorMode::Check,
+            &ReliabilityScopeSet::default(),
+            diags,
+        );
+        assert!(response.daemon_unreachable);
+        assert_eq!(
+            response.daemon_unreachable_reasons.len(),
+            3,
+            "expected 3 reasons (the 3 unreachable codes), got {:?}",
+            response.daemon_unreachable_reasons
+        );
+        // None of the reasons should mention the "ignored" Pass diagnostic.
+        for r in &response.daemon_unreachable_reasons {
+            assert!(
+                !r.contains("ignored"),
+                "Pass diagnostics should NOT contribute to reasons: {r}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_reliability_response_carries_schema_version() {
+        // schema_version is non-empty and sourced from the registry.
+        let response = build_reliability_doctor_response(
+            ReliabilityDoctorMode::Check,
+            &ReliabilityScopeSet::default(),
+            vec![],
+        );
+        assert!(!response.schema_version.is_empty());
+        // Format check: should look like a semver string (digits + dots).
+        assert!(
+            response
+                .schema_version
+                .chars()
+                .all(|c| c.is_ascii_digit() || c == '.'),
+            "schema_version must be numeric+dots: {:?}",
+            response.schema_version
+        );
+    }
+
+    #[test]
+    fn test_doctor_unreachable_codes_table_is_subset_of_known_codes() {
+        // The hand-maintained DAEMON_UNREACHABLE_REASON_CODES list must
+        // only contain codes that exist in ReliabilityReasonCode::ALL.
+        // Catches typos or removed-but-still-referenced variants.
+        for c in DAEMON_UNREACHABLE_REASON_CODES {
+            assert!(
+                ReliabilityReasonCode::ALL.contains(c),
+                "DAEMON_UNREACHABLE_REASON_CODES contains {c:?} which is not in ALL"
+            );
+        }
+        // And shouldn't have duplicates.
+        let unique: std::collections::HashSet<_> = DAEMON_UNREACHABLE_REASON_CODES.iter().collect();
+        assert_eq!(unique.len(), DAEMON_UNREACHABLE_REASON_CODES.len());
     }
 }
