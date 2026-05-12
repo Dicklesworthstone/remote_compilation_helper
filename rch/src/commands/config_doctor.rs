@@ -92,13 +92,17 @@ pub fn config_doctor(ctx: &OutputContext) -> Result<()> {
     check_file_permissions(&mut diagnostics);
 
     // Check 6: Daemon status
-    check_daemon_status(&mut diagnostics);
+    check_daemon_status(&config, &mut diagnostics);
 
     output_doctor_results(ctx, diagnostics)
 }
 
+fn configured_socket_path(config: &RchConfig) -> PathBuf {
+    PathBuf::from(shellexpand::tilde(&config.general.socket_path).into_owned())
+}
+
 fn check_socket_path(config: &RchConfig, diagnostics: &mut Vec<DoctorDiagnostic>) {
-    let socket_path = PathBuf::from(&config.general.socket_path);
+    let socket_path = configured_socket_path(config);
 
     // Check if parent directory exists and is writable
     if let Some(parent) = socket_path.parent() {
@@ -334,14 +338,8 @@ fn check_file_permissions(diagnostics: &mut Vec<DoctorDiagnostic>) {
     }
 }
 
-fn check_daemon_status(diagnostics: &mut Vec<DoctorDiagnostic>) {
-    // Try to connect to daemon socket
-    let config = match config::load_config() {
-        Ok(c) => c,
-        Err(_) => return,
-    };
-
-    let socket_path = PathBuf::from(&config.general.socket_path);
+fn check_daemon_status(config: &RchConfig, diagnostics: &mut Vec<DoctorDiagnostic>) {
+    let socket_path = configured_socket_path(config);
 
     #[cfg(unix)]
     {
@@ -485,4 +483,20 @@ fn output_doctor_results(ctx: &OutputContext, diagnostics: Vec<DoctorDiagnostic>
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn configured_socket_path_expands_tilde() {
+        let mut config = RchConfig::default();
+        config.general.socket_path = "~/rch-config-doctor.sock".to_string();
+
+        let socket_path = configured_socket_path(&config);
+
+        assert_ne!(socket_path, PathBuf::from("~/rch-config-doctor.sock"));
+        assert!(socket_path.ends_with("rch-config-doctor.sock"));
+    }
 }

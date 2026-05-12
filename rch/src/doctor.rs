@@ -33,6 +33,12 @@ fn default_socket_path() -> PathBuf {
     PathBuf::from(rch_common::default_socket_path())
 }
 
+fn configured_or_default_socket_path() -> PathBuf {
+    crate::commands::configured_socket_path()
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| default_socket_path())
+}
+
 /// Maximum size of a config / settings file we'll read into memory.
 /// Bounds OOM risk if a hostile or corrupted file is gigabytes in size.
 /// Real RCH/Claude config files are well under 1 MB; 16 MB gives an
@@ -1985,8 +1991,8 @@ impl QuickCheckResult {
 /// fix for the prior default-to-success behavior that silently treated
 /// every configured worker as healthy.
 pub fn run_quick_check() -> QuickCheckResult {
-    let socket_path = default_socket_path();
-    let daemon_running = socket_path.exists();
+    let socket_path = configured_or_default_socket_path();
+    let daemon_running = socket_path.exists() && daemon_socket_accepts_connections(&socket_path);
 
     // Check workers — fast check only counts configured entries; we do
     // NOT probe each worker over the network here (that's `rch doctor
@@ -2970,16 +2976,30 @@ fn check_daemon(
         println!();
     }
 
-    let socket_path = default_socket_path();
-    let mut result = if socket_path.exists() {
+    let socket_path = configured_or_default_socket_path();
+    let socket_exists = socket_path.exists();
+    let socket_live = socket_exists && daemon_socket_accepts_connections(&socket_path);
+    let mut result = if socket_live {
         CheckResult {
             category: "daemon".to_string(),
             name: "daemon_socket".to_string(),
             status: CheckStatus::Pass,
-            message: "Daemon socket exists".to_string(),
+            message: "Daemon is accepting connections".to_string(),
             details: Some(socket_path.to_string_lossy().to_string()),
             suggestion: None,
             fixable: false,
+            fix_applied: false,
+            fix_message: None,
+        }
+    } else if socket_exists {
+        CheckResult {
+            category: "daemon".to_string(),
+            name: "daemon_socket".to_string(),
+            status: CheckStatus::Warning,
+            message: "Daemon socket is stale or unreachable".to_string(),
+            details: Some(socket_path.to_string_lossy().to_string()),
+            suggestion: Some("Restart daemon with: rch daemon restart".to_string()),
+            fixable: true,
             fix_applied: false,
             fix_message: None,
         }
@@ -3052,7 +3072,7 @@ fn check_daemon(
     print_check_result(&result, ctx);
     checks.push(result);
 
-    // Warn if a legacy /tmp socket exists but the default has moved.
+    // Warn if a legacy /tmp socket exists but the configured path has moved.
     let legacy_socket = Path::new("/tmp/rch.sock");
     if socket_path != legacy_socket && legacy_socket.exists() {
         let legacy_result = CheckResult {
@@ -3062,7 +3082,7 @@ fn check_daemon(
             message: "Legacy /tmp socket detected".to_string(),
             details: Some(legacy_socket.display().to_string()),
             suggestion: Some(
-                "Restart the daemon so it binds to the new default socket path".to_string(),
+                "Restart the daemon so it binds to the configured socket path".to_string(),
             ),
             fixable: false,
             fix_applied: false,
@@ -3074,6 +3094,18 @@ fn check_daemon(
 
     if !ctx.is_json() {
         println!();
+    }
+}
+
+fn daemon_socket_accepts_connections(socket_path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        std::os::unix::net::UnixStream::connect(socket_path).is_ok()
+    }
+
+    #[cfg(not(unix))]
+    {
+        socket_path.exists()
     }
 }
 
@@ -3195,13 +3227,14 @@ async fn check_cancellation_health(checks: &mut Vec<CheckResult>, ctx: &OutputCo
         println!();
     }
 
-    let result = if !default_socket_path().exists() {
+    let socket_path = configured_or_default_socket_path();
+    let result = if !socket_path.exists() {
         CheckResult {
             category: "cancellation".to_string(),
             name: "cancellation_health".to_string(),
             status: CheckStatus::Skipped,
             message: "Daemon socket not present; skipping cancellation diagnostics".to_string(),
-            details: Some(default_socket_path().display().to_string()),
+            details: Some(socket_path.display().to_string()),
             suggestion: Some("Start daemon with: rch daemon start".to_string()),
             fixable: false,
             fix_applied: false,
@@ -5044,6 +5077,81 @@ mod tests {
             "Socket path should have a filename component"
         );
         // TEST PASS: default_socket_path
+    }
+
+    #[test]
+    fn test_configured_or_default_socket_path_uses_config_override() {
+        // TEST START: doctor socket path follows active config
+        let _guard = rch_common::test_guard!();
+        struct ResetConfigOverride;
+        impl Drop for ResetConfigOverride {
+            fn drop(&mut self) {
+                crate::config::set_test_config_override(None);
+            }
+        }
+
+        let mut config = rch_common::RchConfig::default();
+        config.general.socket_path = "/tmp/rch-doctor-custom.sock".to_string();
+        crate::config::set_test_config_override(Some(config));
+        let _reset = ResetConfigOverride;
+
+        assert_eq!(
+            configured_or_default_socket_path(),
+            PathBuf::from("/tmp/rch-doctor-custom.sock")
+        );
+        // TEST PASS: active config socket path used
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_daemon_check_warns_on_stale_socket_file() {
+        // TEST START: daemon check does not treat a stale socket file as running
+        use crate::ui::context::{OutputConfig, OutputContext};
+
+        let _guard = rch_common::test_guard!();
+        struct ResetConfigOverride;
+        impl Drop for ResetConfigOverride {
+            fn drop(&mut self) {
+                crate::config::set_test_config_override(None);
+            }
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let socket_path = tmp.path().join("stale.sock");
+        std::fs::write(&socket_path, "not a unix socket").unwrap();
+
+        let mut config = rch_common::RchConfig::default();
+        config.general.socket_path = socket_path.display().to_string();
+        crate::config::set_test_config_override(Some(config));
+        let _reset = ResetConfigOverride;
+
+        let ctx = OutputContext::new(OutputConfig::default());
+        let options = DoctorOptions {
+            fix: false,
+            dry_run: false,
+            install_deps: false,
+            reliability: false,
+            check_schemas: false,
+            verbose: false,
+            strict: false,
+            lenient: false,
+            scope: ReliabilityScopeSet::default(),
+        };
+        let mut checks = Vec::new();
+        let mut fixes_applied = Vec::new();
+
+        check_daemon(&mut checks, &ctx, &options, &mut fixes_applied);
+
+        let daemon_socket = checks
+            .iter()
+            .find(|check| check.name == "daemon_socket")
+            .expect("daemon socket check");
+        assert_eq!(daemon_socket.status, CheckStatus::Warning);
+        assert_eq!(
+            daemon_socket.message,
+            "Daemon socket is stale or unreachable"
+        );
+        // TEST PASS: stale socket is not a daemon pass
     }
 
     // =========================================================================
