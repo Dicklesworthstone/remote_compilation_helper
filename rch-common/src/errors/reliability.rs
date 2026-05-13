@@ -132,6 +132,8 @@ pub enum ReliabilityReasonCode {
     HelperAvailable,
     /// A required helper binary is missing.
     HelperMissing,
+    /// The helper compatibility probe itself did not complete.
+    HelperProbeUnavailable,
 
     // ---- RolloutPosture (R500-R599) ----
     /// `self_healing.hook_starts_daemon` is enabled (Pass).
@@ -198,6 +200,7 @@ impl ReliabilityReasonCode {
             Self::WorkerRepoNotReady => "WorkerRepoNotReady",
             Self::HelperAvailable => "HelperAvailable",
             Self::HelperMissing => "HelperMissing",
+            Self::HelperProbeUnavailable => "HelperProbeUnavailable",
             Self::HookAutoStartEnabled => "HookAutoStartEnabled",
             Self::HookAutoStartDisabled => "HookAutoStartDisabled",
             Self::DaemonHookRepairEnabled => "DaemonHookRepairEnabled",
@@ -257,6 +260,7 @@ impl ReliabilityReasonCode {
             // R400-R499 — HelperCompatibility
             Self::HelperAvailable => "RCH-R400",
             Self::HelperMissing => "RCH-R401",
+            Self::HelperProbeUnavailable => "RCH-R402",
 
             // R500-R599 — RolloutPosture
             Self::HookAutoStartEnabled => "RCH-R500",
@@ -314,7 +318,9 @@ impl ReliabilityReasonCode {
             | Self::RepoConvergenceReady
             | Self::WorkerRepoNotReady => C::RepoConvergence,
 
-            Self::HelperAvailable | Self::HelperMissing => C::HelperCompatibility,
+            Self::HelperAvailable | Self::HelperMissing | Self::HelperProbeUnavailable => {
+                C::HelperCompatibility
+            }
 
             Self::HookAutoStartEnabled
             | Self::HookAutoStartDisabled
@@ -382,7 +388,7 @@ impl ReliabilityReasonCode {
 
             // Helper install (cargo install / package manager) doesn't require
             // daemon restart.
-            Self::HelperAvailable | Self::HelperMissing => false,
+            Self::HelperAvailable | Self::HelperMissing | Self::HelperProbeUnavailable => false,
 
             // Rollout posture flags are cached at startup.
             Self::HookAutoStartEnabled => false,
@@ -465,6 +471,9 @@ impl ReliabilityReasonCode {
             Self::WorkerRepoNotReady => "Run `rch repo sync --worker <name>` to converge.",
             Self::HelperAvailable => "No action needed.",
             Self::HelperMissing => "Install the missing helper via the system package manager.",
+            Self::HelperProbeUnavailable => {
+                "Rerun the helper probe after checking for stuck local helper subprocesses."
+            }
             Self::HookAutoStartEnabled => "No action needed.",
             Self::HookAutoStartDisabled => {
                 "Run `rch config set self_healing.hook_starts_daemon true`."
@@ -519,6 +528,7 @@ impl ReliabilityReasonCode {
         Self::WorkerRepoNotReady,
         Self::HelperAvailable,
         Self::HelperMissing,
+        Self::HelperProbeUnavailable,
         Self::HookAutoStartEnabled,
         Self::HookAutoStartDisabled,
         Self::DaemonHookRepairEnabled,
@@ -714,6 +724,7 @@ mod tests {
         // HelperCompatibility
         (ReliabilityReasonCode::HelperAvailable, false),
         (ReliabilityReasonCode::HelperMissing, false),
+        (ReliabilityReasonCode::HelperProbeUnavailable, false),
         // RolloutPosture
         (ReliabilityReasonCode::HookAutoStartEnabled, false),
         (ReliabilityReasonCode::HookAutoStartDisabled, true),

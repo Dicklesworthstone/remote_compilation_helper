@@ -949,14 +949,10 @@ async fn collect_reliability_response_once(options: &DoctorOptions) -> Reliabili
         diagnostics.extend(reliability_process_debt_diagnostics(daemon_status.as_ref()));
     }
     if scope.matches(ReliabilityScope::Helpers) {
-        // The helper-compat probe was prefetched in parallel during Phase 1
-        // (bd-62u24.8). If it failed (timeout / panic / cancelled), fall
-        // back to a fresh synchronous run here so the operator still sees
-        // the helper-availability information. The fallback is rare;
-        // tracing already logged the joined outcome above.
-        let helper_diags =
-            helper_diags_override.unwrap_or_else(reliability_helper_compatibility_diagnostics);
-        diagnostics.extend(helper_diags);
+        diagnostics.extend(helper_diagnostics_from_probe_result(
+            helper_diags_override,
+            helpers_outcome,
+        ));
     }
     if scope.matches(ReliabilityScope::Rollout) {
         let config_load: Result<&rch_common::RchConfig, String> = match config_result.as_ref() {
@@ -1104,10 +1100,21 @@ async fn join_isolated_blocking_probe<T>(
 where
     T: Send + 'static,
 {
+    join_isolated_blocking_probe_with_timeout(probe_name, handle, PROBE_TIMEOUT).await
+}
+
+async fn join_isolated_blocking_probe_with_timeout<T>(
+    probe_name: &'static str,
+    handle: Option<tokio::task::JoinHandle<T>>,
+    timeout: Duration,
+) -> (Option<T>, ProbeOutcome)
+where
+    T: Send + 'static,
+{
     let Some(handle) = handle else {
         return (None, ProbeOutcome::Skipped);
     };
-    match tokio::time::timeout(PROBE_TIMEOUT, handle).await {
+    match tokio::time::timeout(timeout, handle).await {
         Ok(Ok(value)) => (Some(value), ProbeOutcome::Ok),
         Ok(Err(join_err)) if join_err.is_panic() => {
             let payload = join_err.into_panic();
@@ -1137,7 +1144,7 @@ where
             tracing::warn!(
                 target: "rch::doctor::probes",
                 probe = probe_name,
-                timeout_secs = PROBE_TIMEOUT.as_secs(),
+                timeout_secs = timeout.as_secs(),
                 "doctor.probe.timeout",
             );
             (None, ProbeOutcome::Timeout)
@@ -2356,6 +2363,34 @@ fn reliability_helper_compatibility_diagnostics() -> Vec<ReliabilityDiagnostic> 
         }
     })
     .collect()
+}
+
+fn helper_diagnostics_from_probe_result(
+    prefetched: Option<Vec<ReliabilityDiagnostic>>,
+    outcome: ProbeOutcome,
+) -> Vec<ReliabilityDiagnostic> {
+    if let Some(diagnostics) = prefetched {
+        return diagnostics;
+    }
+
+    vec![
+        ReliabilityDiagnostic::new(
+            ReliabilityCategory::HelperCompatibility,
+            "helper_probe",
+            ReliabilitySeverity::Warning,
+            "Helper compatibility could not be checked within the probe budget",
+            ReliabilityReasonCode::HelperProbeUnavailable,
+        )
+        .with_details(format!(
+            "probe_outcome={} timeout_secs={}",
+            outcome.label(),
+            PROBE_TIMEOUT.as_secs()
+        ))
+        .with_remediation(
+            "rch doctor --reliability --scope helpers --json",
+            "rch doctor --reliability --scope helpers --json",
+        ),
+    ]
 }
 
 /// Build rollout-posture diagnostics from a pre-loaded config snapshot.
@@ -7086,8 +7121,8 @@ exit 0\n"
         // and reported as (None, Panicked). The caller does NOT panic.
         let handle = tokio::spawn(async {
             tokio::time::timeout(PROBE_TIMEOUT, async {
-                panic!("probe explosion (intentional, for test)");
-                #[allow(unreachable_code)]
+                std::panic::panic_any("probe explosion (intentional, for test)".to_string());
+                #[expect(unreachable_code)]
                 Ok::<_, std::io::Error>("never".to_string())
             })
             .await
@@ -7117,7 +7152,7 @@ exit 0\n"
         // critical because the helper-compat probe is exactly this shape
         // and a panic there must not sink the doctor.
         let handle = tokio::task::spawn_blocking(|| -> Vec<String> {
-            panic!("blocking probe explosion (intentional, for test)");
+            std::panic::panic_any("blocking probe explosion (intentional, for test)".to_string());
         });
         let (result, outcome) = join_isolated_blocking_probe("blocking_panic", Some(handle)).await;
         assert!(result.is_none());
@@ -7133,6 +7168,59 @@ exit 0\n"
         assert!(result.is_none());
         assert_eq!(outcome, ProbeOutcome::Skipped);
         // TEST PASS: skip path for blocking variant
+    }
+
+    #[tokio::test]
+    async fn join_isolated_blocking_probe_surfaces_timeout_promptly() {
+        // TEST START: timeout around a spawn_blocking JoinHandle returns
+        // promptly. The blocking task may finish later; the doctor must not
+        // wait for it before emitting partial diagnostics.
+        let start = std::time::Instant::now();
+        let handle = tokio::task::spawn_blocking(|| {
+            std::thread::sleep(std::time::Duration::from_millis(80));
+            vec!["too_late".to_string()]
+        });
+        let (result, outcome) = join_isolated_blocking_probe_with_timeout(
+            "blocking_timeout",
+            Some(handle),
+            std::time::Duration::from_millis(10),
+        )
+        .await;
+        assert!(result.is_none());
+        assert_eq!(outcome, ProbeOutcome::Timeout);
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(60),
+            "blocking timeout should return promptly"
+        );
+        // TEST PASS: timeout classification for blocking probe
+    }
+
+    #[test]
+    fn helper_probe_failure_emits_unavailable_diagnostic_without_rerun() {
+        // TEST START: a failed helper prefetch must not synchronously run
+        // the same subprocess-heavy probe again. It emits one bounded
+        // warning instead.
+        let diagnostics = helper_diagnostics_from_probe_result(None, ProbeOutcome::Timeout);
+        assert_eq!(diagnostics.len(), 1);
+        let diagnostic = &diagnostics[0];
+        assert_eq!(
+            diagnostic.category,
+            ReliabilityCategory::HelperCompatibility
+        );
+        assert_eq!(diagnostic.check_name, "helper_probe");
+        assert_eq!(diagnostic.severity, ReliabilitySeverity::Warning);
+        assert_eq!(
+            diagnostic.code,
+            ReliabilityReasonCode::HelperProbeUnavailable
+        );
+        assert!(
+            diagnostic
+                .details
+                .as_deref()
+                .is_some_and(|details| details.contains("probe_outcome=timeout")),
+            "details should retain the probe outcome"
+        );
+        // TEST PASS: failed helper probe stays bounded and visible
     }
 
     #[tokio::test]
