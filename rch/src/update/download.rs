@@ -21,6 +21,29 @@ pub struct DownloadedRelease {
     pub checksum_verified: bool,
     pub signature_verified: Option<bool>,
     pub version: String,
+    _download_dir: UpdateDownloadDir,
+}
+
+struct UpdateDownloadDir {
+    path: PathBuf,
+}
+
+impl UpdateDownloadDir {
+    fn new() -> Self {
+        Self {
+            path: std::env::temp_dir().join(format!("rch-update-{}", uuid::Uuid::new_v4())),
+        }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for UpdateDownloadDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
 }
 
 /// Download and verify a release.
@@ -41,13 +64,15 @@ pub async fn download_release(
         );
     }
 
-    // Download to temp directory
-    let temp_dir = std::env::temp_dir().join("rch-update");
-    tokio::fs::create_dir_all(&temp_dir)
+    // Download to a per-update temp directory. The install lock is acquired
+    // later, so a shared path lets concurrent `rch update` invocations corrupt
+    // each other's archive, checksum, or signature files before verification.
+    let temp_dir = UpdateDownloadDir::new();
+    tokio::fs::create_dir(temp_dir.path())
         .await
         .map_err(|e| UpdateError::DownloadFailed(format!("Failed to create temp dir: {}", e)))?;
 
-    let archive_path = asset_temp_path(&temp_dir, &archive_asset.name)?;
+    let archive_path = asset_temp_path(temp_dir.path(), &archive_asset.name)?;
 
     // Download with retries
     download_with_retry(&archive_asset.browser_download_url, &archive_path, 3).await?;
@@ -58,7 +83,7 @@ pub async fn download_release(
             println!("Verifying checksum...");
         }
 
-        let checksum_path = asset_temp_path(&temp_dir, &checksum_asset.name)?;
+        let checksum_path = asset_temp_path(temp_dir.path(), &checksum_asset.name)?;
         download_with_retry(&checksum_asset.browser_download_url, &checksum_path, 3).await?;
 
         let expected_checksum = extract_checksum(&checksum_path, &archive_asset.name).await?;
@@ -71,7 +96,7 @@ pub async fn download_release(
             if !ctx.is_json() {
                 println!("Verifying signature (sigstore bundle)...");
             }
-            let sig_path = asset_temp_path(&temp_dir, &sig_asset.name)?;
+            let sig_path = asset_temp_path(temp_dir.path(), &sig_asset.name)?;
             download_with_retry(&sig_asset.browser_download_url, &sig_path, 3).await?;
             Some(sig_path)
         } else {
@@ -100,6 +125,7 @@ pub async fn download_release(
         checksum_verified,
         signature_verified,
         version: update.latest_version.to_string(),
+        _download_dir: temp_dir,
     })
 }
 
@@ -401,6 +427,39 @@ mod tests {
                 "expected {name:?} to be rejected"
             );
         }
+    }
+
+    #[test]
+    fn test_update_download_dir_is_unique_and_scoped_to_temp() {
+        let first = UpdateDownloadDir::new();
+        let second = UpdateDownloadDir::new();
+
+        assert_ne!(first.path(), second.path());
+        assert!(first.path().starts_with(std::env::temp_dir()));
+        assert!(second.path().starts_with(std::env::temp_dir()));
+        assert!(
+            first
+                .path()
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("rch-update-")
+        );
+    }
+
+    #[test]
+    fn test_update_download_dir_cleans_on_drop() {
+        let path = {
+            let dir = UpdateDownloadDir::new();
+            std::fs::create_dir(dir.path()).unwrap();
+            std::fs::write(dir.path().join("archive.tar.gz"), "partial download").unwrap();
+            dir.path().to_path_buf()
+        };
+
+        assert!(
+            !path.exists(),
+            "download temp directory should be removed when release handle is dropped"
+        );
     }
 
     #[tokio::test]
