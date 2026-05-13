@@ -2897,12 +2897,15 @@ async fn handle_cache_warm(
         )
     })?;
     let project_id = transfer::project_id_from_path(&project_root);
-    // Use the production hash entry point that takes a dependency-roots
-    // slice (`compute_project_hash` is #[cfg(test)]-gated). Empty slice
-    // matches the cache-warm contract: warm only the named project, no
-    // path-dep crawling.
-    let project_hash =
-        transfer::compute_project_hash_with_dependency_roots(&project_root, &[]);
+    // Use the production hash entry point (`_with_dependency_roots_and_policy`)
+    // — the other two variants are #[cfg(test)]-gated convenience wrappers.
+    // Empty deps + default policy matches the cache-warm contract: warm
+    // only the named project, no path-dep closure crawling.
+    let project_hash = transfer::compute_project_hash_with_dependency_roots_and_policy(
+        &project_root,
+        &[],
+        &rch_common::PathTopologyPolicy::default(),
+    );
 
     let all_workers = commands::load_workers_from_config()
         .map_err(|e| anyhow::anyhow!("load workers config: {e}"))?;
@@ -4355,6 +4358,75 @@ mod tests {
             }) => {}
             _ => panic!("Expected hook test command"),
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Cache Subcommand Tests (br-4zm6u)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn cli_parses_cache_warm_default() {
+        let _guard = test_guard!();
+        let cli = Cli::try_parse_from(["rch", "cache", "warm"]).unwrap();
+        match cli.command {
+            Some(Commands::Cache {
+                action: CacheAction::Warm { workers, project },
+            }) => {
+                assert!(workers.is_empty(), "default --workers must be empty");
+                assert!(project.is_none(), "default --project must be None");
+            }
+            _ => panic!("Expected cache warm command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_cache_warm_single_worker() {
+        let _guard = test_guard!();
+        let cli =
+            Cli::try_parse_from(["rch", "cache", "warm", "--workers", "css"]).unwrap();
+        match cli.command {
+            Some(Commands::Cache {
+                action: CacheAction::Warm { workers, project: _ },
+            }) => assert_eq!(workers, vec!["css".to_string()]),
+            _ => panic!("Expected cache warm command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_cache_warm_multiple_workers() {
+        let _guard = test_guard!();
+        let cli = Cli::try_parse_from([
+            "rch", "cache", "warm", "--workers", "css", "--workers", "vmi1",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Cache {
+                action: CacheAction::Warm { workers, project: _ },
+            }) => assert_eq!(workers, vec!["css".to_string(), "vmi1".to_string()]),
+            _ => panic!("Expected cache warm command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_cache_warm_with_project_path() {
+        let _guard = test_guard!();
+        let cli = Cli::try_parse_from([
+            "rch", "cache", "warm", "--project", "/tmp/some/project",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Cache {
+                action: CacheAction::Warm { workers: _, project },
+            }) => assert_eq!(project, Some(PathBuf::from("/tmp/some/project"))),
+            _ => panic!("Expected cache warm command"),
+        }
+    }
+
+    #[test]
+    fn cli_rejects_cache_warm_unknown_flag() {
+        let _guard = test_guard!();
+        let result = Cli::try_parse_from(["rch", "cache", "warm", "--bogus"]);
+        assert!(result.is_err(), "unknown flag must error");
     }
 
     // -------------------------------------------------------------------------
