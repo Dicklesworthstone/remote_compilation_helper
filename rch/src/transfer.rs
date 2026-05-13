@@ -5,6 +5,7 @@
 
 use crate::error::TransferError;
 use anyhow::{Context, Result};
+use glob::Pattern;
 use rch_common::mock::{self, MockConfig, MockRsync, MockRsyncConfig, MockSshClient};
 use rch_common::ssh_utils::{
     EnvPrefix, is_retryable_transport_error, is_valid_env_key, shell_escape_value,
@@ -123,6 +124,32 @@ fn has_rsync_glob_meta(pattern: &str) -> bool {
     pattern
         .chars()
         .any(|ch| matches!(ch, '*' | '?' | '[' | ']'))
+}
+
+fn top_level_artifact_pattern_matches_entry(pattern: &str, entry_name: &str) -> bool {
+    let anchored = anchor_retrieval_pattern(pattern);
+    if anchored.starts_with("**/") {
+        return false;
+    }
+
+    let after_slash = anchored.trim_start_matches('/');
+    let first = after_slash.split('/').next().unwrap_or("");
+    if first.is_empty() {
+        return false;
+    }
+    if first == entry_name {
+        return true;
+    }
+    has_rsync_glob_meta(first)
+        && Pattern::new(first)
+            .map(|pattern| pattern.matches(entry_name))
+            .unwrap_or(false)
+}
+
+fn artifact_patterns_allow_top_level_entry(artifact_patterns: &[String], entry_name: &str) -> bool {
+    artifact_patterns
+        .iter()
+        .any(|pattern| top_level_artifact_pattern_matches_entry(pattern, entry_name))
 }
 
 fn first_path_component(pattern: &str) -> Option<&str> {
@@ -760,7 +787,11 @@ impl TransferPipeline {
     /// is "stale or hostile remote tree dirties local source"; if our
     /// LOCAL layout is being tampered with, the operator has bigger
     /// problems than this retrieve.
-    fn local_source_roots_to_exclude(&self, allowed_roots: &BTreeSet<String>) -> Vec<String> {
+    fn local_source_roots_to_exclude(
+        &self,
+        allowed_roots: &BTreeSet<String>,
+        artifact_patterns: &[String],
+    ) -> Vec<String> {
         let Ok(entries) = std::fs::read_dir(&self.project_root) else {
             // Project root unreadable → nothing to exclude here. Other
             // retrieval excludes (REMOTE_RUNTIME_EXCLUDE_PATTERNS, the
@@ -779,6 +810,13 @@ impl TransferPipeline {
             }
             if allowed_roots.contains(name) {
                 // Permit descent into this artifact root.
+                continue;
+            }
+            if artifact_patterns_allow_top_level_entry(artifact_patterns, name) {
+                // Permit exact top-level artifact files and top-level artifact
+                // globs such as `*.tsbuildinfo`. Otherwise an existing local
+                // artifact file would be excluded before the later include rule
+                // can refresh it from the worker.
                 continue;
             }
             // Anchor with leading `/` so the exclude matches ONLY at the
@@ -1790,7 +1828,7 @@ fi",
         // checkout. The excludes are emitted BEFORE the directory include so
         // rsync evaluates them first and refuses to descend into source dirs.
         let allowed_roots = allowed_artifact_roots(artifact_patterns);
-        for exclude in self.local_source_roots_to_exclude(&allowed_roots) {
+        for exclude in self.local_source_roots_to_exclude(&allowed_roots, artifact_patterns) {
             cmd.arg("--exclude").arg(exclude);
         }
 
@@ -1865,7 +1903,7 @@ fi",
         // Source-integrity guard (RCH bug d7xc3): see build_retrieve_command.
         // Same belt-and-suspenders defense applied to the streaming variant.
         let allowed_roots = allowed_artifact_roots(artifact_patterns);
-        for exclude in self.local_source_roots_to_exclude(&allowed_roots) {
+        for exclude in self.local_source_roots_to_exclude(&allowed_roots, artifact_patterns) {
             cmd.arg("--exclude").arg(exclude);
         }
 
@@ -2590,6 +2628,13 @@ mod tests {
     use rch_common::mock::Phase;
     use rch_common::test_guard;
     use serial_test::serial;
+
+    fn arg_pair_position(args: &[String], flag: &str, value: &str) -> Option<usize> {
+        args.windows(2).position(|window| {
+            matches!(window, [observed_flag, observed_value]
+                if observed_flag.as_str() == flag && observed_value.as_str() == value)
+        })
+    }
 
     #[test]
     fn test_remote_path() {
@@ -3338,21 +3383,13 @@ mod tests {
             .map(|arg| arg.to_string_lossy().to_string())
             .collect();
 
-        let beads_exclude = args
-            .windows(2)
-            .position(|window| window == ["--exclude", ".beads/"])
-            .expect("missing .beads exclude");
-        let recovery_exclude = args
-            .windows(2)
-            .position(|window| window == ["--exclude", ".beads/recovery_*/"])
+        let beads_exclude =
+            arg_pair_position(&args, "--exclude", ".beads/").expect("missing .beads exclude");
+        let recovery_exclude = arg_pair_position(&args, "--exclude", ".beads/recovery_*/")
             .expect("missing .beads recovery exclude");
-        let custom_exclude = args
-            .windows(2)
-            .position(|window| window == ["--exclude", "custom-cache/"])
+        let custom_exclude = arg_pair_position(&args, "--exclude", "custom-cache/")
             .expect("missing custom cache exclude");
-        let target_exclude = args
-            .windows(2)
-            .position(|window| window == ["--exclude", "target/"]);
+        let target_exclude = arg_pair_position(&args, "--exclude", "target/");
         let rlib_exclude = args
             .windows(2)
             .position(|window| window == ["--exclude", "*.rlib"]);
@@ -4486,8 +4523,9 @@ Total file size: 123 bytes";
             "abc123".to_string(),
             TransferConfig::default(),
         );
-        let allowed = allowed_artifact_roots(&["target/debug/**".to_string()]);
-        let excludes = pipeline.local_source_roots_to_exclude(&allowed);
+        let artifact_patterns = ["target/debug/**".to_string()];
+        let allowed = allowed_artifact_roots(&artifact_patterns);
+        let excludes = pipeline.local_source_roots_to_exclude(&allowed, &artifact_patterns);
 
         // target/ MUST NOT be excluded — it's the artifact root.
         assert!(
@@ -4520,6 +4558,43 @@ Total file size: 123 bytes";
     }
 
     #[test]
+    fn local_source_roots_to_exclude_does_not_hide_top_level_glob_artifacts() {
+        // TEST START: Bun/typecheck retrieval includes top-level globs such
+        // as `*.tsbuildinfo`. If the local file already exists, the
+        // source-integrity guard must not emit a prior exclude that prevents
+        // rsync from refreshing it.
+        let _guard = test_guard!();
+        let temp = tempfile::tempdir().expect("create temp dir");
+        std::fs::create_dir(temp.path().join("src")).expect("mkdir src");
+        std::fs::write(temp.path().join("Cargo.toml"), b"[workspace]\n").expect("write toml");
+        std::fs::write(temp.path().join("tsconfig.tsbuildinfo"), b"old").expect("write artifact");
+        let pipeline = TransferPipeline::new(
+            temp.path().to_path_buf(),
+            "test-project".to_string(),
+            "abc123".to_string(),
+            TransferConfig::default(),
+        );
+        let artifact_patterns = ["*.tsbuildinfo".to_string()];
+        let allowed = allowed_artifact_roots(&artifact_patterns);
+        let excludes = pipeline.local_source_roots_to_exclude(&allowed, &artifact_patterns);
+
+        assert!(
+            !excludes.iter().any(|e| e == "/tsconfig.tsbuildinfo"),
+            "declared top-level glob artifact must not be source-excluded; got {excludes:?}"
+        );
+        assert!(
+            excludes.iter().any(|e| e == "/Cargo.toml"),
+            "unrelated top-level files must still be source-excluded; got {excludes:?}"
+        );
+        assert!(
+            excludes.iter().any(|e| e == "/src/"),
+            "source directories must still be source-excluded; got {excludes:?}"
+        );
+        // TEST PASS: top-level artifact glob stays retrievable without
+        // opening unrelated source entries.
+    }
+
+    #[test]
     fn local_source_roots_to_exclude_handles_unreadable_project_root() {
         // TEST START: defensive — if project_root is unreadable, we get an
         // empty exclude list (not a panic). Other retrieval guards still
@@ -4532,7 +4607,7 @@ Total file size: 123 bytes";
             TransferConfig::default(),
         );
         let allowed = std::collections::BTreeSet::new();
-        let excludes = pipeline.local_source_roots_to_exclude(&allowed);
+        let excludes = pipeline.local_source_roots_to_exclude(&allowed, &[]);
         assert!(
             excludes.is_empty(),
             "unreadable project_root must yield empty excludes (got {excludes:?})"
@@ -4623,6 +4698,58 @@ Total file size: 123 bytes";
             "source-integrity excludes must be applied BEFORE --include */"
         );
         // TEST PASS: source-integrity guard wired through both helpers
+    }
+
+    #[test]
+    fn build_retrieve_command_keeps_existing_top_level_glob_artifact_retrievable() {
+        // TEST START: command-level proof for the Bun/default artifact case.
+        // A local tsbuildinfo file must not be excluded before the artifact
+        // include can match it.
+        let _guard = test_guard!();
+        let temp = tempfile::tempdir().expect("create temp dir");
+        std::fs::create_dir(temp.path().join("src")).expect("mkdir src");
+        std::fs::write(temp.path().join("tsconfig.tsbuildinfo"), b"old").expect("write artifact");
+        let pipeline = TransferPipeline::new(
+            temp.path().to_path_buf(),
+            "test-project".to_string(),
+            "abc123".to_string(),
+            TransferConfig::default(),
+        );
+        let worker = WorkerConfig {
+            id: WorkerId::new("mock-worker"),
+            host: "mock://worker".to_string(),
+            user: "mockuser".to_string(),
+            identity_file: "~/.ssh/mock".to_string(),
+            total_slots: 4,
+            priority: 100,
+            tags: vec![],
+        };
+        let cmd = pipeline.build_retrieve_command(
+            &worker,
+            "/tmp/rch/test-project/abc123",
+            &["*.tsbuildinfo".to_string()],
+        );
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect();
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["--include", "/*.tsbuildinfo"]),
+            "top-level glob artifact must be emitted in anchored form; got args = {args:?}"
+        );
+        assert!(
+            !args
+                .windows(2)
+                .any(|w| w == ["--exclude", "/tsconfig.tsbuildinfo"]),
+            "existing top-level artifact must not be excluded before its include; got args = {args:?}"
+        );
+        assert!(
+            args.windows(2).any(|w| w == ["--exclude", "/src/"]),
+            "source directories must remain protected; got args = {args:?}"
+        );
+        // TEST PASS: command preserves both source guard and top-level glob retrieval.
     }
 
     #[test]
