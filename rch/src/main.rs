@@ -2885,10 +2885,7 @@ async fn handle_cache_warm(
             .map_err(|e| anyhow::anyhow!("cannot determine project root from cwd: {e}"))?,
     };
     if !project_root.exists() {
-        anyhow::bail!(
-            "project root does not exist: {}",
-            project_root.display()
-        );
+        anyhow::bail!("project root does not exist: {}", project_root.display());
     }
     let project_root = project_root.canonicalize().map_err(|e| {
         anyhow::anyhow!(
@@ -2920,25 +2917,26 @@ async fn handle_cache_warm(
     } else {
         let filter_set: std::collections::BTreeSet<&str> =
             worker_filter.iter().map(String::as_str).collect();
-        let filtered: Vec<_> = all_workers
-            .into_iter()
-            .filter(|w| filter_set.contains(w.id.as_str()))
-            .collect();
-        let found_ids: std::collections::BTreeSet<&str> =
-            filtered.iter().map(|w| w.id.as_str()).collect();
+        let known_ids: std::collections::BTreeSet<String> =
+            all_workers.iter().map(|w| w.id.to_string()).collect();
         let missing: Vec<&str> = filter_set
             .iter()
             .copied()
-            .filter(|id| !found_ids.contains(id))
+            .filter(|id| !known_ids.contains(*id))
             .collect();
         if !missing.is_empty() {
+            // Show the actual configured worker list (not the post-filter
+            // empty set) so the operator can spot a typo or stale id.
             anyhow::bail!(
                 "unknown worker id(s) in --workers filter: {}; configured workers: {}",
                 missing.join(", "),
-                ctx_worker_ids(&filtered)
+                ctx_worker_ids(&all_workers)
             );
         }
-        filtered
+        all_workers
+            .into_iter()
+            .filter(|w| filter_set.contains(w.id.as_str()))
+            .collect()
     };
 
     tracing::info!(
@@ -4382,11 +4380,14 @@ mod tests {
     #[test]
     fn cli_parses_cache_warm_single_worker() {
         let _guard = test_guard!();
-        let cli =
-            Cli::try_parse_from(["rch", "cache", "warm", "--workers", "css"]).unwrap();
+        let cli = Cli::try_parse_from(["rch", "cache", "warm", "--workers", "css"]).unwrap();
         match cli.command {
             Some(Commands::Cache {
-                action: CacheAction::Warm { workers, project: _ },
+                action:
+                    CacheAction::Warm {
+                        workers,
+                        project: _,
+                    },
             }) => assert_eq!(workers, vec!["css".to_string()]),
             _ => panic!("Expected cache warm command"),
         }
@@ -4396,12 +4397,22 @@ mod tests {
     fn cli_parses_cache_warm_multiple_workers() {
         let _guard = test_guard!();
         let cli = Cli::try_parse_from([
-            "rch", "cache", "warm", "--workers", "css", "--workers", "vmi1",
+            "rch",
+            "cache",
+            "warm",
+            "--workers",
+            "css",
+            "--workers",
+            "vmi1",
         ])
         .unwrap();
         match cli.command {
             Some(Commands::Cache {
-                action: CacheAction::Warm { workers, project: _ },
+                action:
+                    CacheAction::Warm {
+                        workers,
+                        project: _,
+                    },
             }) => assert_eq!(workers, vec!["css".to_string(), "vmi1".to_string()]),
             _ => panic!("Expected cache warm command"),
         }
@@ -4410,13 +4421,15 @@ mod tests {
     #[test]
     fn cli_parses_cache_warm_with_project_path() {
         let _guard = test_guard!();
-        let cli = Cli::try_parse_from([
-            "rch", "cache", "warm", "--project", "/tmp/some/project",
-        ])
-        .unwrap();
+        let cli = Cli::try_parse_from(["rch", "cache", "warm", "--project", "/tmp/some/project"])
+            .unwrap();
         match cli.command {
             Some(Commands::Cache {
-                action: CacheAction::Warm { workers: _, project },
+                action:
+                    CacheAction::Warm {
+                        workers: _,
+                        project,
+                    },
             }) => assert_eq!(project, Some(PathBuf::from("/tmp/some/project"))),
             _ => panic!("Expected cache warm command"),
         }
