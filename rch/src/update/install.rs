@@ -9,6 +9,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+const UPDATE_BINARIES: &[&str] = &["rch", "rchd", "rch-wkr"];
+
 /// Result of installation.
 #[allow(dead_code)]
 pub struct InstallResult {
@@ -52,14 +54,14 @@ pub async fn install_update(
     let backup_dir = backup_entry.backup_path;
 
     // Extract new binaries to temp location
-    let temp_extract = std::env::temp_dir().join("rch-extract");
+    let temp_extract = new_update_extract_dir();
     extract_archive(&download.archive_path, &temp_extract)?;
 
     // Atomic replace: move new binaries to install dir
     if !ctx.is_json() {
         println!("Installing new binaries...");
     }
-    replace_binaries(&temp_extract, &install_dir)?;
+    let _installed_binaries = replace_binaries(&temp_extract, &install_dir)?;
 
     // Verify new binaries work
     verify_installation(&install_dir)?;
@@ -228,7 +230,7 @@ fn backup_current_installation(
     std::fs::create_dir_all(backup_dir)
         .map_err(|e| UpdateError::InstallFailed(format!("Failed to create backup dir: {}", e)))?;
 
-    for binary in &["rch", "rchd", "rch-wkr"] {
+    for binary in UPDATE_BINARIES {
         let src = install_dir.join(binary);
         if src.exists() {
             let dst = backup_dir.join(binary);
@@ -359,18 +361,20 @@ pub fn prune_old_backups() -> Result<(), UpdateError> {
     Ok(())
 }
 
+fn new_update_extract_dir() -> PathBuf {
+    std::env::temp_dir().join(format!("rch-extract-{}", uuid::Uuid::new_v4()))
+}
+
 /// Extract archive to destination.
 fn extract_archive(archive: &std::path::Path, dest: &std::path::Path) -> Result<(), UpdateError> {
     std::fs::create_dir_all(dest)
         .map_err(|e| UpdateError::InstallFailed(format!("Failed to create extract dir: {}", e)))?;
 
     let output = Command::new("tar")
-        .args([
-            "-xzf",
-            archive.to_str().unwrap(),
-            "-C",
-            dest.to_str().unwrap(),
-        ])
+        .arg("-xzf")
+        .arg(archive)
+        .arg("-C")
+        .arg(dest)
         .output()
         .map_err(|e| UpdateError::InstallFailed(format!("Failed to run tar: {}", e)))?;
 
@@ -384,56 +388,90 @@ fn extract_archive(archive: &std::path::Path, dest: &std::path::Path) -> Result<
     Ok(())
 }
 
-/// Replace binaries in install directory.
-fn replace_binaries(
+fn discover_extracted_update_binaries(
     src_dir: &std::path::Path,
-    install_dir: &std::path::Path,
-) -> Result<(), UpdateError> {
-    std::fs::create_dir_all(install_dir)
-        .map_err(|e| UpdateError::InstallFailed(format!("Failed to create install dir: {}", e)))?;
-
-    for binary in &["rch", "rchd", "rch-wkr"] {
+) -> Result<Vec<&'static str>, UpdateError> {
+    let mut found = Vec::new();
+    for binary in UPDATE_BINARIES {
         let src = src_dir.join(binary);
-        if src.exists() {
-            let dst = install_dir.join(binary);
-
-            // Remove existing binary first
-            if dst.exists() {
-                std::fs::remove_file(&dst).map_err(|e| {
-                    UpdateError::InstallFailed(format!("Failed to remove old {}: {}", binary, e))
-                })?;
+        match std::fs::symlink_metadata(&src) {
+            Ok(metadata) if metadata.file_type().is_file() => found.push(*binary),
+            Ok(_) => {
+                return Err(UpdateError::InstallFailed(format!(
+                    "Extracted update entry '{}' is not a regular file",
+                    src.display()
+                )));
             }
-
-            // Move new binary
-            std::fs::rename(&src, &dst)
-                .or_else(|_| {
-                    // If rename fails (cross-device), copy instead
-                    std::fs::copy(&src, &dst)?;
-                    std::fs::remove_file(&src)?;
-                    Ok::<_, std::io::Error>(())
-                })
-                .map_err(|e| {
-                    UpdateError::InstallFailed(format!("Failed to install {}: {}", binary, e))
-                })?;
-
-            // Make executable
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mut perms = std::fs::metadata(&dst)
-                    .map_err(|e| {
-                        UpdateError::InstallFailed(format!("Failed to get permissions: {}", e))
-                    })?
-                    .permissions();
-                perms.set_mode(0o755);
-                std::fs::set_permissions(&dst, perms).map_err(|e| {
-                    UpdateError::InstallFailed(format!("Failed to set permissions: {}", e))
-                })?;
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(UpdateError::InstallFailed(format!(
+                    "Failed to inspect extracted {}: {}",
+                    binary, e
+                )));
             }
         }
     }
 
-    Ok(())
+    if !found.contains(&"rch") {
+        return Err(UpdateError::InstallFailed(format!(
+            "Extracted update archive did not contain required 'rch' binary in {}",
+            src_dir.display()
+        )));
+    }
+
+    Ok(found)
+}
+
+/// Replace binaries in install directory.
+fn replace_binaries(
+    src_dir: &std::path::Path,
+    install_dir: &std::path::Path,
+) -> Result<Vec<&'static str>, UpdateError> {
+    let binaries = discover_extracted_update_binaries(src_dir)?;
+
+    std::fs::create_dir_all(install_dir)
+        .map_err(|e| UpdateError::InstallFailed(format!("Failed to create install dir: {}", e)))?;
+
+    for binary in &binaries {
+        let src = src_dir.join(binary);
+        let dst = install_dir.join(binary);
+
+        // Remove existing binary first
+        if dst.exists() {
+            std::fs::remove_file(&dst).map_err(|e| {
+                UpdateError::InstallFailed(format!("Failed to remove old {}: {}", binary, e))
+            })?;
+        }
+
+        // Move new binary
+        std::fs::rename(&src, &dst)
+            .or_else(|_| {
+                // If rename fails (cross-device), copy instead
+                std::fs::copy(&src, &dst)?;
+                std::fs::remove_file(&src)?;
+                Ok::<_, std::io::Error>(())
+            })
+            .map_err(|e| {
+                UpdateError::InstallFailed(format!("Failed to install {}: {}", binary, e))
+            })?;
+
+        // Make executable
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&dst)
+                .map_err(|e| {
+                    UpdateError::InstallFailed(format!("Failed to get permissions: {}", e))
+                })?
+                .permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&dst, perms).map_err(|e| {
+                UpdateError::InstallFailed(format!("Failed to set permissions: {}", e))
+            })?;
+        }
+    }
+
+    Ok(binaries)
 }
 
 /// Verify the installation by checking binary versions.
@@ -459,7 +497,7 @@ fn restore_from_backup(
     backup_dir: &std::path::Path,
     install_dir: &std::path::Path,
 ) -> Result<(), UpdateError> {
-    for binary in &["rch", "rchd", "rch-wkr"] {
+    for binary in UPDATE_BINARIES {
         let src = backup_dir.join(binary);
         if src.exists() {
             let dst = install_dir.join(binary);
@@ -675,10 +713,65 @@ mod tests {
         // Install directory doesn't exist
         assert!(!install_dir.exists());
 
-        replace_binaries(&src_dir, &install_dir).unwrap();
+        let installed = replace_binaries(&src_dir, &install_dir).unwrap();
 
         // Should have created it
+        assert_eq!(installed, vec!["rch"]);
         assert!(install_dir.join("rch").exists());
+    }
+
+    #[test]
+    fn test_replace_binaries_requires_rch_payload() {
+        let temp = TempDir::new().unwrap();
+        let src_dir = temp.path().join("src");
+        let install_dir = temp.path().join("install");
+
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::create_dir_all(&install_dir).unwrap();
+        std::fs::write(src_dir.join("rchd"), "new daemon").unwrap();
+        std::fs::write(install_dir.join("rch"), "old rch").unwrap();
+
+        let result = replace_binaries(&src_dir, &install_dir);
+        assert!(matches!(result, Err(UpdateError::InstallFailed(_))));
+        assert_eq!(
+            std::fs::read_to_string(install_dir.join("rch")).unwrap(),
+            "old rch",
+            "missing rch payload must fail before touching installed binaries"
+        );
+        assert!(
+            !install_dir.join("rchd").exists(),
+            "preflight failure must not partially install optional binaries"
+        );
+    }
+
+    #[test]
+    fn test_replace_binaries_rejects_non_file_payload() {
+        let temp = TempDir::new().unwrap();
+        let src_dir = temp.path().join("src");
+        let install_dir = temp.path().join("install");
+
+        std::fs::create_dir_all(src_dir.join("rch")).unwrap();
+
+        let result = replace_binaries(&src_dir, &install_dir);
+        assert!(matches!(result, Err(UpdateError::InstallFailed(_))));
+        assert!(
+            !install_dir.exists(),
+            "invalid payload must fail before creating the install dir"
+        );
+    }
+
+    #[test]
+    fn test_new_update_extract_dir_is_unique() {
+        let first = new_update_extract_dir();
+        let second = new_update_extract_dir();
+        assert_ne!(first, second);
+        assert!(
+            first
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("rch-extract-")
+        );
     }
 
     #[test]
