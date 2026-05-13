@@ -11,7 +11,15 @@ use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
+#[cfg(not(windows))]
 const UPDATE_BINARIES: &[&str] = &["rch", "rchd", "rch-wkr"];
+#[cfg(windows)]
+const UPDATE_BINARIES: &[&str] = &["rch.exe", "rchd.exe", "rch-wkr.exe"];
+
+#[cfg(not(windows))]
+const REQUIRED_UPDATE_BINARY: &str = "rch";
+#[cfg(windows)]
+const REQUIRED_UPDATE_BINARY: &str = "rch.exe";
 
 /// Result of installation.
 #[allow(dead_code)]
@@ -364,6 +372,12 @@ fn new_update_extract_dir() -> PathBuf {
     std::env::temp_dir().join(format!("rch-extract-{}", uuid::Uuid::new_v4()))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UpdateArchiveFormat {
+    TarGz,
+    Zip,
+}
+
 struct UpdateExtractDir {
     path: PathBuf,
 }
@@ -388,6 +402,8 @@ impl Drop for UpdateExtractDir {
 
 /// Extract archive to destination.
 fn extract_archive(archive: &std::path::Path, dest: &std::path::Path) -> Result<(), UpdateError> {
+    let format = update_archive_format(archive)?;
+
     std::fs::create_dir(dest)
         .map_err(|e| UpdateError::InstallFailed(format!("Failed to create extract dir: {}", e)))?;
 
@@ -398,6 +414,34 @@ fn extract_archive(archive: &std::path::Path, dest: &std::path::Path) -> Result<
             e
         ))
     })?;
+
+    match format {
+        UpdateArchiveFormat::TarGz => extract_tar_gz_archive(archive_file, dest),
+        UpdateArchiveFormat::Zip => extract_zip_archive(archive_file, dest),
+    }
+}
+
+fn update_archive_format(archive: &Path) -> Result<UpdateArchiveFormat, UpdateError> {
+    let Some(file_name) = archive.file_name().and_then(|name| name.to_str()) else {
+        return Err(UpdateError::InstallFailed(format!(
+            "Unsupported update archive path: {}",
+            archive.display()
+        )));
+    };
+
+    if file_name.ends_with(".tar.gz") || file_name.ends_with(".tgz") {
+        Ok(UpdateArchiveFormat::TarGz)
+    } else if file_name.ends_with(".zip") {
+        Ok(UpdateArchiveFormat::Zip)
+    } else {
+        Err(UpdateError::InstallFailed(format!(
+            "Unsupported update archive format: {}",
+            archive.display()
+        )))
+    }
+}
+
+fn extract_tar_gz_archive(archive_file: fs::File, dest: &Path) -> Result<(), UpdateError> {
     let decoder = GzDecoder::new(archive_file);
     let mut tar = tar::Archive::new(decoder);
     let entries = tar
@@ -427,6 +471,39 @@ fn extract_archive(archive: &std::path::Path, dest: &std::path::Path) -> Result<
         } else {
             return Err(UpdateError::InstallFailed(format!(
                 "Unsupported update archive entry type for {}",
+                relative_path.display()
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn extract_zip_archive(archive_file: fs::File, dest: &Path) -> Result<(), UpdateError> {
+    let mut zip = zip::ZipArchive::new(archive_file)
+        .map_err(|e| UpdateError::InstallFailed(format!("Failed to read zip archive: {}", e)))?;
+
+    for index in 0..zip.len() {
+        let mut entry = zip
+            .by_index(index)
+            .map_err(|e| UpdateError::InstallFailed(format!("Invalid zip archive entry: {}", e)))?;
+        let entry_name = entry.name().to_string();
+        let relative_path = safe_archive_entry_path(Path::new(&entry_name))?;
+        let destination = dest.join(&relative_path);
+
+        if entry.is_dir() {
+            fs::create_dir_all(&destination).map_err(|e| {
+                UpdateError::InstallFailed(format!(
+                    "Failed to create extracted directory {}: {}",
+                    relative_path.display(),
+                    e
+                ))
+            })?;
+        } else if entry.is_file() {
+            unpack_regular_file(&mut entry, &relative_path, &destination)?;
+        } else {
+            return Err(UpdateError::InstallFailed(format!(
+                "Unsupported update zip entry type for {}",
                 relative_path.display()
             )));
         }
@@ -475,7 +552,7 @@ fn safe_archive_entry_path(path: &Path) -> Result<PathBuf, UpdateError> {
 }
 
 fn unpack_regular_file<R: Read>(
-    entry: &mut tar::Entry<'_, R>,
+    entry: &mut R,
     relative_path: &Path,
     destination: &Path,
 ) -> Result<(), UpdateError> {
@@ -535,9 +612,10 @@ fn discover_extracted_update_binaries(
         }
     }
 
-    if !found.contains(&"rch") {
+    if !found.contains(&REQUIRED_UPDATE_BINARY) {
         return Err(UpdateError::InstallFailed(format!(
-            "Extracted update archive did not contain required 'rch' binary in {}",
+            "Extracted update archive did not contain required '{}' binary in {}",
+            REQUIRED_UPDATE_BINARY,
             src_dir.display()
         )));
     }
@@ -599,7 +677,7 @@ fn replace_binaries(
 
 /// Verify the installation by checking binary versions.
 fn verify_installation(install_dir: &std::path::Path) -> Result<(), UpdateError> {
-    let rch = install_dir.join("rch");
+    let rch = install_dir.join(REQUIRED_UPDATE_BINARY);
 
     let output = Command::new(&rch)
         .arg("--version")
@@ -694,9 +772,10 @@ async fn stop_daemon_gracefully(timeout_secs: u64) -> Result<bool, UpdateError> 
 /// Start the daemon.
 async fn start_daemon() -> Result<(), UpdateError> {
     let socket_path = configured_update_socket_path()?;
+    let mut command = daemon_start_command();
 
     // Preserve custom socket configuration across update and rollback restarts.
-    let _child = Command::new("rchd")
+    let _child = command
         .args(daemon_start_args(&socket_path))
         .spawn()
         .map_err(|e| UpdateError::InstallFailed(format!("Failed to start daemon: {}", e)))?;
@@ -705,6 +784,16 @@ async fn start_daemon() -> Result<(), UpdateError> {
     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
     Ok(())
+}
+
+#[cfg(not(windows))]
+fn daemon_start_command() -> Command {
+    Command::new("rchd")
+}
+
+#[cfg(windows)]
+fn daemon_start_command() -> Command {
+    Command::new("rchd.exe")
 }
 
 fn configured_update_socket_path() -> Result<PathBuf, UpdateError> {
@@ -727,6 +816,7 @@ mod tests {
     use flate2::Compression;
     use flate2::write::GzEncoder;
     use std::io::Cursor;
+    use std::io::Write;
     use tempfile::TempDir;
 
     fn create_tar_gz_with_entries(
@@ -749,6 +839,32 @@ mod tests {
         let encoder = builder.into_inner()?;
         encoder.finish()?;
         Ok(())
+    }
+
+    fn create_zip_with_entries(
+        archive_path: &Path,
+        entries: &[(&str, &[u8])],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let file = fs::File::create(archive_path)?;
+        let mut writer = zip::ZipWriter::new(file);
+
+        for (path, content) in entries {
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            writer.start_file(*path, options)?;
+            writer.write_all(content)?;
+        }
+
+        writer.finish()?;
+        Ok(())
+    }
+
+    fn optional_update_binary() -> &'static str {
+        UPDATE_BINARIES
+            .iter()
+            .copied()
+            .find(|binary| *binary != REQUIRED_UPDATE_BINARY)
+            .expect("update binary list should include at least one optional binary")
     }
 
     fn create_tar_gz_with_raw_path(
@@ -818,18 +934,18 @@ mod tests {
         let backup_dir = temp.path().join("backup");
 
         std::fs::create_dir_all(&install_dir).unwrap();
-        std::fs::write(install_dir.join("rch"), "test binary").unwrap();
+        std::fs::write(install_dir.join(REQUIRED_UPDATE_BINARY), "test binary").unwrap();
 
         backup_current_installation(&install_dir, &backup_dir).unwrap();
-        assert!(backup_dir.join("rch").exists());
+        assert!(backup_dir.join(REQUIRED_UPDATE_BINARY).exists());
 
         // Modify the original
-        std::fs::write(install_dir.join("rch"), "modified").unwrap();
+        std::fs::write(install_dir.join(REQUIRED_UPDATE_BINARY), "modified").unwrap();
 
         // Restore
         restore_from_backup(&backup_dir, &install_dir).unwrap();
 
-        let content = std::fs::read_to_string(install_dir.join("rch")).unwrap();
+        let content = std::fs::read_to_string(install_dir.join(REQUIRED_UPDATE_BINARY)).unwrap();
         assert_eq!(content, "test binary");
     }
 
@@ -840,7 +956,7 @@ mod tests {
         let backup_dir = temp.path().join("backup/nested/deep");
 
         std::fs::create_dir_all(&install_dir).unwrap();
-        std::fs::write(install_dir.join("rch"), "test").unwrap();
+        std::fs::write(install_dir.join(REQUIRED_UPDATE_BINARY), "test").unwrap();
 
         // Backup directory doesn't exist yet
         assert!(!backup_dir.exists());
@@ -849,7 +965,7 @@ mod tests {
 
         // Should have created the directory
         assert!(backup_dir.exists());
-        assert!(backup_dir.join("rch").exists());
+        assert!(backup_dir.join(REQUIRED_UPDATE_BINARY).exists());
     }
 
     #[test]
@@ -859,15 +975,20 @@ mod tests {
         let backup_dir = temp.path().join("backup");
 
         std::fs::create_dir_all(&install_dir).unwrap();
-        // Only create rch, not rchd or rch-wkr
-        std::fs::write(install_dir.join("rch"), "test").unwrap();
+        // Only create the required binary, not the optional companions.
+        std::fs::write(install_dir.join(REQUIRED_UPDATE_BINARY), "test").unwrap();
 
         backup_current_installation(&install_dir, &backup_dir).unwrap();
 
         // Only rch should be backed up
-        assert!(backup_dir.join("rch").exists());
-        assert!(!backup_dir.join("rchd").exists());
-        assert!(!backup_dir.join("rch-wkr").exists());
+        assert!(backup_dir.join(REQUIRED_UPDATE_BINARY).exists());
+        for binary in UPDATE_BINARIES
+            .iter()
+            .copied()
+            .filter(|binary| *binary != REQUIRED_UPDATE_BINARY)
+        {
+            assert!(!backup_dir.join(binary).exists());
+        }
     }
 
     #[test]
@@ -877,21 +998,21 @@ mod tests {
         let backup_dir = temp.path().join("backup");
 
         std::fs::create_dir_all(&install_dir).unwrap();
-        std::fs::write(install_dir.join("rch"), "rch content").unwrap();
-        std::fs::write(install_dir.join("rchd"), "rchd content").unwrap();
-        std::fs::write(install_dir.join("rch-wkr"), "rch-wkr content").unwrap();
+        for binary in UPDATE_BINARIES {
+            std::fs::write(install_dir.join(binary), format!("content for {binary}")).unwrap();
+        }
 
         backup_current_installation(&install_dir, &backup_dir).unwrap();
 
         // All three should be backed up
-        assert!(backup_dir.join("rch").exists());
-        assert!(backup_dir.join("rchd").exists());
-        assert!(backup_dir.join("rch-wkr").exists());
+        for binary in UPDATE_BINARIES {
+            assert!(backup_dir.join(binary).exists());
+        }
 
         // Verify content
         assert_eq!(
-            std::fs::read_to_string(backup_dir.join("rchd")).unwrap(),
-            "rchd content"
+            std::fs::read_to_string(backup_dir.join(REQUIRED_UPDATE_BINARY)).unwrap(),
+            format!("content for {REQUIRED_UPDATE_BINARY}")
         );
     }
 
@@ -902,7 +1023,7 @@ mod tests {
         let install_dir = temp.path().join("install/nested");
 
         std::fs::create_dir_all(&src_dir).unwrap();
-        std::fs::write(src_dir.join("rch"), "new binary").unwrap();
+        std::fs::write(src_dir.join(REQUIRED_UPDATE_BINARY), "new binary").unwrap();
 
         // Install directory doesn't exist
         assert!(!install_dir.exists());
@@ -910,8 +1031,8 @@ mod tests {
         let installed = replace_binaries(&src_dir, &install_dir).unwrap();
 
         // Should have created it
-        assert_eq!(installed, vec!["rch"]);
-        assert!(install_dir.join("rch").exists());
+        assert_eq!(installed, vec![REQUIRED_UPDATE_BINARY]);
+        assert!(install_dir.join(REQUIRED_UPDATE_BINARY).exists());
     }
 
     #[test]
@@ -922,18 +1043,23 @@ mod tests {
 
         std::fs::create_dir_all(&src_dir).unwrap();
         std::fs::create_dir_all(&install_dir).unwrap();
-        std::fs::write(src_dir.join("rchd"), "new daemon").unwrap();
-        std::fs::write(install_dir.join("rch"), "old rch").unwrap();
+        let optional_binary = optional_update_binary();
+        std::fs::write(src_dir.join(optional_binary), "new optional binary").unwrap();
+        std::fs::write(
+            install_dir.join(REQUIRED_UPDATE_BINARY),
+            "old required binary",
+        )
+        .unwrap();
 
         let result = replace_binaries(&src_dir, &install_dir);
         assert!(matches!(result, Err(UpdateError::InstallFailed(_))));
         assert_eq!(
-            std::fs::read_to_string(install_dir.join("rch")).unwrap(),
-            "old rch",
-            "missing rch payload must fail before touching installed binaries"
+            std::fs::read_to_string(install_dir.join(REQUIRED_UPDATE_BINARY)).unwrap(),
+            "old required binary",
+            "missing required payload must fail before touching installed binaries"
         );
         assert!(
-            !install_dir.join("rchd").exists(),
+            !install_dir.join(optional_binary).exists(),
             "preflight failure must not partially install optional binaries"
         );
     }
@@ -944,7 +1070,7 @@ mod tests {
         let src_dir = temp.path().join("src");
         let install_dir = temp.path().join("install");
 
-        std::fs::create_dir_all(src_dir.join("rch")).unwrap();
+        std::fs::create_dir_all(src_dir.join(REQUIRED_UPDATE_BINARY)).unwrap();
 
         let result = replace_binaries(&src_dir, &install_dir);
         assert!(matches!(result, Err(UpdateError::InstallFailed(_))));
@@ -984,7 +1110,24 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_archive_extracts_regular_files() {
+    fn test_update_archive_format_accepts_release_formats() {
+        assert_eq!(
+            update_archive_format(Path::new("rch-v1.0.0-x86_64-unknown-linux-musl.tar.gz"))
+                .unwrap(),
+            UpdateArchiveFormat::TarGz
+        );
+        assert_eq!(
+            update_archive_format(Path::new("rch-v1.0.0-x86_64-pc-windows-msvc.zip")).unwrap(),
+            UpdateArchiveFormat::Zip
+        );
+        assert!(matches!(
+            update_archive_format(Path::new("rch-v1.0.0.txt")),
+            Err(UpdateError::InstallFailed(_))
+        ));
+    }
+
+    #[test]
+    fn test_extract_archive_extracts_tar_gz_regular_files() {
         let temp = TempDir::new().unwrap();
         let archive_path = temp.path().join("rch.tar.gz");
         let dest = temp.path().join("extract");
@@ -1003,6 +1146,32 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dest.join("nested/rchd")).unwrap(),
             "daemon binary"
+        );
+    }
+
+    #[test]
+    fn test_extract_archive_extracts_zip_regular_files() {
+        let temp = TempDir::new().unwrap();
+        let archive_path = temp.path().join("rch.zip");
+        let dest = temp.path().join("extract");
+        create_zip_with_entries(
+            &archive_path,
+            &[
+                (REQUIRED_UPDATE_BINARY, b"hook binary"),
+                (optional_update_binary(), b"optional binary"),
+            ],
+        )
+        .unwrap();
+
+        extract_archive(&archive_path, &dest).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(dest.join(REQUIRED_UPDATE_BINARY)).unwrap(),
+            "hook binary"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dest.join(optional_update_binary())).unwrap(),
+            "optional binary"
         );
     }
 
@@ -1085,24 +1254,25 @@ mod tests {
 
         std::fs::create_dir_all(&backup_dir).unwrap();
         std::fs::create_dir_all(&install_dir).unwrap();
+        let optional_binary = optional_update_binary();
 
         // Create backup with specific content
-        std::fs::write(backup_dir.join("rch"), "backup v1.0").unwrap();
-        std::fs::write(backup_dir.join("rchd"), "backup daemon").unwrap();
+        std::fs::write(backup_dir.join(REQUIRED_UPDATE_BINARY), "backup v1.0").unwrap();
+        std::fs::write(backup_dir.join(optional_binary), "backup optional").unwrap();
 
         // Create current with different content
-        std::fs::write(install_dir.join("rch"), "current v2.0").unwrap();
-        std::fs::write(install_dir.join("rchd"), "current daemon").unwrap();
+        std::fs::write(install_dir.join(REQUIRED_UPDATE_BINARY), "current v2.0").unwrap();
+        std::fs::write(install_dir.join(optional_binary), "current optional").unwrap();
 
         restore_from_backup(&backup_dir, &install_dir).unwrap();
 
         assert_eq!(
-            std::fs::read_to_string(install_dir.join("rch")).unwrap(),
+            std::fs::read_to_string(install_dir.join(REQUIRED_UPDATE_BINARY)).unwrap(),
             "backup v1.0"
         );
         assert_eq!(
-            std::fs::read_to_string(install_dir.join("rchd")).unwrap(),
-            "backup daemon"
+            std::fs::read_to_string(install_dir.join(optional_binary)).unwrap(),
+            "backup optional"
         );
     }
 
