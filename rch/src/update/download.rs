@@ -6,7 +6,7 @@ use super::types::{
 };
 use super::verify::{verify_checksum, verify_checksum_and_signature};
 use crate::ui::OutputContext;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 
@@ -47,7 +47,7 @@ pub async fn download_release(
         .await
         .map_err(|e| UpdateError::DownloadFailed(format!("Failed to create temp dir: {}", e)))?;
 
-    let archive_path = temp_dir.join(&archive_asset.name);
+    let archive_path = asset_temp_path(&temp_dir, &archive_asset.name)?;
 
     // Download with retries
     download_with_retry(&archive_asset.browser_download_url, &archive_path, 3).await?;
@@ -58,7 +58,7 @@ pub async fn download_release(
             println!("Verifying checksum...");
         }
 
-        let checksum_path = temp_dir.join(&checksum_asset.name);
+        let checksum_path = asset_temp_path(&temp_dir, &checksum_asset.name)?;
         download_with_retry(&checksum_asset.browser_download_url, &checksum_path, 3).await?;
 
         let expected_checksum = extract_checksum(&checksum_path, &archive_asset.name).await?;
@@ -71,7 +71,7 @@ pub async fn download_release(
             if !ctx.is_json() {
                 println!("Verifying signature (sigstore bundle)...");
             }
-            let sig_path = temp_dir.join(&sig_asset.name);
+            let sig_path = asset_temp_path(&temp_dir, &sig_asset.name)?;
             download_with_retry(&sig_asset.browser_download_url, &sig_path, 3).await?;
             Some(sig_path)
         } else {
@@ -181,6 +181,27 @@ fn is_transient_error(e: &UpdateError) -> bool {
     matches!(e, UpdateError::NetworkError(_))
 }
 
+fn asset_temp_path(temp_dir: &Path, asset_name: &str) -> Result<PathBuf, UpdateError> {
+    if !is_safe_asset_name(asset_name) {
+        return Err(UpdateError::DownloadFailed(format!(
+            "Unsafe release asset name: {}",
+            asset_name.escape_debug()
+        )));
+    }
+
+    Ok(temp_dir.join(asset_name))
+}
+
+fn is_safe_asset_name(asset_name: &str) -> bool {
+    !asset_name.is_empty()
+        && !asset_name.contains('/')
+        && !asset_name.contains('\\')
+        && !asset_name.contains('\0')
+        && Path::new(asset_name)
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+}
+
 fn archive_asset_candidates(version: &str) -> Vec<String> {
     let version = version.trim_start_matches('v');
     let version_tag = format!("v{version}");
@@ -240,18 +261,20 @@ fn find_checksum_asset<'a>(
 }
 
 /// Extract checksum for a specific file from a checksum file.
-async fn extract_checksum(checksum_file: &PathBuf, filename: &str) -> Result<String, UpdateError> {
+async fn extract_checksum(checksum_file: &Path, filename: &str) -> Result<String, UpdateError> {
     let content = tokio::fs::read_to_string(checksum_file)
         .await
         .map_err(|e| UpdateError::DownloadFailed(format!("Failed to read checksum file: {}", e)))?;
 
-    let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
-
     // Some checksum files contain just the hash (single non-empty line).
-    if lines.len() == 1 {
-        let parts: Vec<&str> = lines[0].split_whitespace().collect();
-        if parts.len() == 1 {
-            return Ok(parts[0].to_string());
+    let mut non_empty_lines = content
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    if let (Some(line), None) = (non_empty_lines.next(), non_empty_lines.next()) {
+        let mut parts = line.split_whitespace();
+        if let (Some(checksum), None) = (parts.next(), parts.next()) {
+            return Ok(checksum.to_string());
         }
     }
 
@@ -263,21 +286,28 @@ async fn extract_checksum(checksum_file: &PathBuf, filename: &str) -> Result<Str
     // silently match when the caller asked for `rch-v1.0.0-linux.tar.gz`,
     // letting an attacker with write access to the checksum file (or a
     // release asset replacement) seed a different hash.
-    for line in lines {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() >= 2 {
-            let checksum = parts[0];
-            let file = parts.last().unwrap();
-            let file_basename = std::path::Path::new(file)
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or(file);
-            // Also handle `\` separators on Windows-generated manifests,
-            // where `Path::file_name` doesn't split on backslash on Unix.
-            let win_basename = file.rsplit_once('\\').map(|(_, tail)| tail).unwrap_or(file);
-            if *file == filename || file_basename == filename || win_basename == filename {
-                return Ok(checksum.to_string());
-            }
+    for line in content
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        let mut parts = line.split_whitespace();
+        let Some(checksum) = parts.next() else {
+            continue;
+        };
+        let Some(file) = parts.next_back() else {
+            continue;
+        };
+
+        let file_basename = Path::new(file)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(file);
+        // Also handle `\` separators on Windows-generated manifests,
+        // where `Path::file_name` doesn't split on backslash on Unix.
+        let win_basename = file.rsplit_once('\\').map(|(_, tail)| tail).unwrap_or(file);
+        if file == filename || file_basename == filename || win_basename == filename {
+            return Ok(checksum.to_string());
         }
     }
 
@@ -339,6 +369,38 @@ mod tests {
             expected: "a".to_string(),
             actual: "b".to_string()
         }));
+    }
+
+    #[test]
+    fn test_asset_temp_path_accepts_plain_filename() {
+        let temp = TempDir::new().unwrap();
+        let name = "rch-v1.0.0-x86_64-unknown-linux-musl.tar.gz";
+
+        let path = asset_temp_path(temp.path(), name).unwrap();
+
+        assert_eq!(path, temp.path().join(name));
+    }
+
+    #[test]
+    fn test_asset_temp_path_rejects_path_like_names() {
+        let temp = TempDir::new().unwrap();
+
+        for name in [
+            "",
+            ".",
+            "..",
+            "../rch.tar.gz",
+            "release/rch.tar.gz",
+            "release\\rch.tar.gz",
+            "/tmp/rch.tar.gz",
+            "rch.tar.gz\0.sha256",
+        ] {
+            let result = asset_temp_path(temp.path(), name);
+            assert!(
+                matches!(result, Err(UpdateError::DownloadFailed(_))),
+                "expected {name:?} to be rejected"
+            );
+        }
     }
 
     #[tokio::test]
