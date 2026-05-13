@@ -373,6 +373,22 @@ to clean up. Use --force to immediately terminate with SIGKILL."#)]
         action: ConfigAction,
     },
 
+    /// Manage project caches on remote workers (br-4zm6u)
+    ///
+    /// Cache management without running a build. Useful for pre-warming
+    /// workers ahead of an interactive session so the first compilation
+    /// in that session uses an already-synced remote tree.
+    #[command(after_help = r#"EXAMPLES:
+    rch cache warm                                # Warm cache on all healthy workers
+    rch cache warm --workers css                  # Warm cache on specific worker
+    rch cache warm --workers css --workers vmi1   # Warm cache on multiple workers
+    rch cache warm --project /path/to/project     # Warm cache for a non-cwd project
+    rch cache warm --json                         # Emit per-worker results as JSON"#)]
+    Cache {
+        #[command(subcommand)]
+        action: CacheAction,
+    },
+
     /// Explain why a command would or wouldn't be offloaded
     #[command(after_help = r#"EXAMPLES:
     rch diagnose "cargo build --release"
@@ -1124,6 +1140,30 @@ impl WorkersAction {
 }
 
 #[derive(Subcommand)]
+enum CacheAction {
+    /// Pre-sync project sources to one or more workers without running a build.
+    ///
+    /// Useful to warm caches ahead of an interactive session so the first
+    /// compilation in the session uses an already-uploaded remote tree.
+    /// Reuses the standard `TransferPipeline::sync_to_remote` path so the
+    /// upload semantics match a real build (incremental rsync + .rchignore
+    /// honored + zstd compression).
+    Warm {
+        /// Worker IDs to warm (repeatable). Default: every configured worker.
+        ///
+        /// Currently the warm path issues one `sync_to_remote` per worker
+        /// sequentially; if a worker is unreachable, the remaining workers
+        /// still warm successfully (per-worker results reported separately).
+        #[arg(long, value_name = "WORKER_ID")]
+        workers: Vec<String>,
+
+        /// Project root to warm. Default: current working directory.
+        #[arg(long, value_name = "PATH")]
+        project: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
 enum ConfigAction {
     /// Show effective configuration
     Show {
@@ -1654,6 +1694,7 @@ async fn main() -> Result<()> {
                 dry_run,
             } => commands::cancel_build(build_id, all, force, yes, dry_run, &ctx).await,
             Commands::Config { action } => handle_config(action, &ctx).await,
+            Commands::Cache { action } => handle_cache(action, &ctx).await,
             Commands::Diagnose { command, dry_run } => {
                 handle_diagnose(command, dry_run, &ctx).await
             }
@@ -2778,6 +2819,289 @@ async fn handle_diagnose(command: Vec<String>, dry_run: bool, ctx: &OutputContex
     let joined = command.join(" ");
     commands::diagnose(&joined, dry_run, ctx).await?;
     Ok(())
+}
+
+/// `rch cache warm` per-worker result (br-4zm6u). Emitted in the JSON
+/// envelope under `data.workers[]` so consumers can summarize per-worker
+/// success/failure programmatically without parsing the human output.
+#[derive(Debug, serde::Serialize)]
+struct CacheWarmWorkerResult {
+    worker_id: String,
+    success: bool,
+    bytes_transferred: u64,
+    files_transferred: u64,
+    duration_ms: u64,
+    /// Only populated on failure. Operators read this to triage.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+/// `rch cache warm` aggregate response. Carries every per-worker entry
+/// plus a top-level summary so consumers can grep for "all-ok" without
+/// iterating the array.
+#[derive(Debug, serde::Serialize)]
+struct CacheWarmResponse {
+    project_root: String,
+    project_id: String,
+    project_hash: String,
+    workers_total: usize,
+    workers_succeeded: usize,
+    workers_failed: usize,
+    bytes_transferred: u64,
+    files_transferred: u64,
+    duration_ms: u64,
+    workers: Vec<CacheWarmWorkerResult>,
+}
+
+async fn handle_cache(action: CacheAction, ctx: &OutputContext) -> Result<()> {
+    match action {
+        CacheAction::Warm { workers, project } => handle_cache_warm(workers, project, ctx).await,
+    }
+}
+
+/// `rch cache warm` implementation (br-4zm6u): pre-syncs project sources
+/// to one or more workers via `TransferPipeline::sync_to_remote` WITHOUT
+/// running a compilation step. Surfaces per-worker outcomes so an
+/// operator triaging a worker outage can see exactly which workers
+/// failed to warm and why.
+///
+/// Failure policy: a single worker failure does NOT abort the warm
+/// across remaining workers — the loop continues and the final summary
+/// reports `workers_succeeded` / `workers_failed`. The process exits 0
+/// if at least one worker warmed; non-zero (exit 1) if all workers
+/// failed. This mirrors the fail-open philosophy from AGENTS.md (other
+/// workers should still be usable even if one is down).
+async fn handle_cache_warm(
+    worker_filter: Vec<String>,
+    project: Option<PathBuf>,
+    ctx: &OutputContext,
+) -> Result<()> {
+    use rch_common::TransferConfig;
+
+    let style = ctx.theme();
+    let project_root = match project {
+        Some(p) => p,
+        None => std::env::current_dir()
+            .map_err(|e| anyhow::anyhow!("cannot determine project root from cwd: {e}"))?,
+    };
+    if !project_root.exists() {
+        anyhow::bail!(
+            "project root does not exist: {}",
+            project_root.display()
+        );
+    }
+    let project_root = project_root.canonicalize().map_err(|e| {
+        anyhow::anyhow!(
+            "cannot canonicalize project root {}: {e}",
+            project_root.display()
+        )
+    })?;
+    let project_id = transfer::project_id_from_path(&project_root);
+    // Use the production hash entry point that takes a dependency-roots
+    // slice (`compute_project_hash` is #[cfg(test)]-gated). Empty slice
+    // matches the cache-warm contract: warm only the named project, no
+    // path-dep crawling.
+    let project_hash =
+        transfer::compute_project_hash_with_dependency_roots(&project_root, &[]);
+
+    let all_workers = commands::load_workers_from_config()
+        .map_err(|e| anyhow::anyhow!("load workers config: {e}"))?;
+    if all_workers.is_empty() {
+        anyhow::bail!("no workers configured; run `rch workers add <host>` first");
+    }
+    // Filter by --workers flag if supplied. A filter that names no
+    // existing worker is a configuration error — fail fast so the
+    // operator notices the typo instead of getting a silent no-op.
+    let selected: Vec<_> = if worker_filter.is_empty() {
+        all_workers
+    } else {
+        let filter_set: std::collections::BTreeSet<&str> =
+            worker_filter.iter().map(String::as_str).collect();
+        let filtered: Vec<_> = all_workers
+            .into_iter()
+            .filter(|w| filter_set.contains(w.id.as_str()))
+            .collect();
+        let found_ids: std::collections::BTreeSet<&str> =
+            filtered.iter().map(|w| w.id.as_str()).collect();
+        let missing: Vec<&str> = filter_set
+            .iter()
+            .copied()
+            .filter(|id| !found_ids.contains(id))
+            .collect();
+        if !missing.is_empty() {
+            anyhow::bail!(
+                "unknown worker id(s) in --workers filter: {}; configured workers: {}",
+                missing.join(", "),
+                ctx_worker_ids(&filtered)
+            );
+        }
+        filtered
+    };
+
+    tracing::info!(
+        target: "rch::cache::warm",
+        project_root = %project_root.display(),
+        project_id = %project_id,
+        project_hash = %project_hash,
+        worker_count = selected.len(),
+        "cache.warm.start",
+    );
+
+    if !ctx.is_json() {
+        eprintln!(
+            "{} {}",
+            style.format_header("Cache warm"),
+            style.muted(&format!(
+                "project={} ({}/{}) workers={}",
+                project_root.display(),
+                project_id,
+                &project_hash[..project_hash.len().min(12)],
+                selected.len(),
+            )),
+        );
+    }
+
+    let session_start = std::time::Instant::now();
+    let transfer_config = TransferConfig::default();
+    let mut results: Vec<CacheWarmWorkerResult> = Vec::with_capacity(selected.len());
+    let mut total_bytes: u64 = 0;
+    let mut total_files: u64 = 0;
+    let mut succeeded: usize = 0;
+    let mut failed: usize = 0;
+
+    for worker in &selected {
+        // Each worker gets its own TransferPipeline so state (env
+        // overrides, color mode, estimated bytes) cannot leak across
+        // warm targets.
+        let pipeline = transfer::TransferPipeline::new(
+            project_root.clone(),
+            project_id.clone(),
+            project_hash.clone(),
+            transfer_config.clone(),
+        );
+        let started = std::time::Instant::now();
+        match pipeline.sync_to_remote(worker).await {
+            Ok(sync_result) => {
+                succeeded += 1;
+                total_bytes += sync_result.bytes_transferred;
+                total_files += u64::from(sync_result.files_transferred);
+                tracing::info!(
+                    target: "rch::cache::warm",
+                    worker = %worker.id,
+                    bytes = sync_result.bytes_transferred,
+                    files = sync_result.files_transferred,
+                    duration_ms = sync_result.duration_ms,
+                    "cache.warm.worker.ok",
+                );
+                if !ctx.is_json() {
+                    eprintln!(
+                        "  {} {}: {} bytes, {} files, {}ms",
+                        style.format_success("✓"),
+                        style.highlight(worker.id.as_str()),
+                        sync_result.bytes_transferred,
+                        sync_result.files_transferred,
+                        sync_result.duration_ms,
+                    );
+                }
+                results.push(CacheWarmWorkerResult {
+                    worker_id: worker.id.to_string(),
+                    success: true,
+                    bytes_transferred: sync_result.bytes_transferred,
+                    files_transferred: u64::from(sync_result.files_transferred),
+                    duration_ms: sync_result.duration_ms,
+                    error: None,
+                });
+            }
+            Err(err) => {
+                failed += 1;
+                let duration_ms = started.elapsed().as_millis() as u64;
+                let error_msg = err.to_string();
+                tracing::warn!(
+                    target: "rch::cache::warm",
+                    worker = %worker.id,
+                    error = %error_msg,
+                    duration_ms,
+                    "cache.warm.worker.failed",
+                );
+                if !ctx.is_json() {
+                    eprintln!(
+                        "  {} {}: {}",
+                        style.format_error("✗"),
+                        style.highlight(worker.id.as_str()),
+                        style.error(&error_msg),
+                    );
+                }
+                results.push(CacheWarmWorkerResult {
+                    worker_id: worker.id.to_string(),
+                    success: false,
+                    bytes_transferred: 0,
+                    files_transferred: 0,
+                    duration_ms,
+                    error: Some(error_msg),
+                });
+            }
+        }
+    }
+
+    let total_duration_ms = session_start.elapsed().as_millis() as u64;
+    let response = CacheWarmResponse {
+        project_root: project_root.display().to_string(),
+        project_id: project_id.clone(),
+        project_hash: project_hash.clone(),
+        workers_total: selected.len(),
+        workers_succeeded: succeeded,
+        workers_failed: failed,
+        bytes_transferred: total_bytes,
+        files_transferred: total_files,
+        duration_ms: total_duration_ms,
+        workers: results,
+    };
+
+    if ctx.is_json() {
+        let _ = ctx.json(&ApiResponse::ok("cache.warm", &response));
+    } else {
+        eprintln!();
+        eprintln!(
+            "{} {}/{} workers warmed, {} bytes, {} files, {}ms total",
+            style.format_header("Summary"),
+            style.highlight(&succeeded.to_string()),
+            style.highlight(&selected.len().to_string()),
+            style.highlight(&total_bytes.to_string()),
+            style.highlight(&total_files.to_string()),
+            style.highlight(&total_duration_ms.to_string()),
+        );
+    }
+
+    tracing::info!(
+        target: "rch::cache::warm",
+        workers_succeeded = succeeded,
+        workers_failed = failed,
+        bytes = total_bytes,
+        files = total_files,
+        duration_ms = total_duration_ms,
+        "cache.warm.complete",
+    );
+
+    // Exit policy: at least one worker warmed → 0; all failed → 1.
+    // This is friendlier than "any failure = non-zero" because in a
+    // multi-worker fleet, a single offline worker shouldn't break a
+    // pre-session warm step.
+    if succeeded == 0 && failed > 0 {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// Format a `WorkerConfig` slice's IDs for error messages.
+fn ctx_worker_ids(workers: &[rch_common::WorkerConfig]) -> String {
+    if workers.is_empty() {
+        return "(none)".to_string();
+    }
+    workers
+        .iter()
+        .map(|w| w.id.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 async fn handle_hook(action: HookAction, ctx: &OutputContext) -> Result<()> {
