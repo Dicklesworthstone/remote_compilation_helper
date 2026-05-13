@@ -70,7 +70,7 @@ impl TelemetryStore {
         // Get summary for event emission before moving into storage
         let summary = received.telemetry.summary();
 
-        let mut recent = self.recent.write().unwrap();
+        let mut recent = self.recent.write().unwrap_or_else(|e| e.into_inner());
         let entries = recent.entry(worker_id).or_default();
         entries.push_back(received);
 
@@ -100,7 +100,7 @@ impl TelemetryStore {
 
     /// Get the most recent telemetry for a worker.
     pub fn latest(&self, worker_id: &str) -> Option<ReceivedTelemetry> {
-        let recent = self.recent.read().unwrap();
+        let recent = self.recent.read().unwrap_or_else(|e| e.into_inner());
         recent
             .get(worker_id)
             .and_then(|entries| entries.back().cloned())
@@ -108,7 +108,7 @@ impl TelemetryStore {
 
     /// Get the most recent telemetry for all workers.
     pub fn latest_all(&self) -> Vec<ReceivedTelemetry> {
-        let recent = self.recent.read().unwrap();
+        let recent = self.recent.read().unwrap_or_else(|e| e.into_inner());
         recent
             .values()
             .filter_map(|entries| entries.back().cloned())
@@ -122,7 +122,7 @@ impl TelemetryStore {
 
     /// Record a test run for telemetry and optional persistence.
     pub fn record_test_run(&self, record: TestRunRecord) {
-        let mut test_runs = self.test_runs.write().unwrap();
+        let mut test_runs = self.test_runs.write().unwrap_or_else(|e| e.into_inner());
         if test_runs.len() >= 200 {
             test_runs.pop_front();
         }
@@ -150,7 +150,7 @@ impl TelemetryStore {
             }
         }
 
-        let test_runs = self.test_runs.read().unwrap();
+        let test_runs = self.test_runs.read().unwrap_or_else(|e| e.into_inner());
         let mut stats = TestRunStats::default();
         for record in test_runs.iter() {
             stats.record(record);
@@ -213,7 +213,7 @@ pub fn default_telemetry_db_path() -> anyhow::Result<PathBuf> {
 /// Start background maintenance for the telemetry database.
 pub fn start_storage_maintenance(storage: Arc<TelemetryStorage>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut ticker = interval(Duration::from_secs(3600));
+        let mut ticker = interval(Duration::from_secs(300));
         loop {
             ticker.tick().await;
             let storage = Arc::clone(&storage);

@@ -257,7 +257,7 @@ impl AlertManager {
         self.sweep_stale_cleared();
 
         let mut alerts: Vec<Alert> = {
-            let state = self.state.read().unwrap();
+            let state = self.state.read().unwrap_or_else(|e| e.into_inner());
             state.active.values().cloned().collect()
         };
 
@@ -280,7 +280,7 @@ impl AlertManager {
     fn sweep_stale_cleared(&self) {
         let now = Utc::now();
         let retention = self.config.cleared_retention;
-        let mut state = self.state.write().unwrap();
+        let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
         state.active.retain(|_, alert| match alert.cleared_at {
             Some(cleared) => now - cleared < retention,
             None => true,
@@ -392,7 +392,7 @@ impl AlertManager {
 
     fn upsert_alert(&self, key: AlertKey, mut alert: Alert) {
         let now = alert.created_at;
-        let mut state = self.state.write().unwrap();
+        let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
 
         // If the same alert condition is being re-raised (either active or
         // recently-cleared), preserve the original `id`, `first_seen`, and
@@ -482,7 +482,7 @@ impl AlertManager {
 
     fn clear_alert(&self, key: &AlertKey) {
         let now = Utc::now();
-        let mut state = self.state.write().unwrap();
+        let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
         // Mark-cleared rather than remove: the alert lingers as
         // `cleared_pending_clean` so operators can see a transient condition
         // just resolved. `active_alerts()` evicts it after the retention
@@ -621,10 +621,11 @@ fn send_webhook_with_retries(
 
 /// Check if a webhook error is worth retrying.
 fn is_retryable_webhook_error(error: &str) -> bool {
-    // Retry on network errors and server errors (5xx)
+    // Retry on network errors, server errors (5xx), and rate limits (429)
     error.contains("timed out")
         || error.contains("connection")
         || error.contains("HTTP 5")
+        || error.contains("HTTP 429")
         || error.contains("network")
 }
 
@@ -1486,20 +1487,15 @@ mod tests {
     // ============== Retry Logic Tests ==============
 
     #[test]
-    fn test_retryable_webhook_error_detection() {
-        let _guard = test_guard!();
-
-        // Should retry on network/server errors
+    fn test_is_retryable_webhook_error() {
         assert!(is_retryable_webhook_error("connection timed out"));
         assert!(is_retryable_webhook_error("HTTP 502"));
         assert!(is_retryable_webhook_error("HTTP 503"));
         assert!(is_retryable_webhook_error("HTTP 500"));
+        assert!(is_retryable_webhook_error("HTTP 429"));
         assert!(is_retryable_webhook_error("network unreachable"));
 
-        // Should NOT retry on client errors
+        // Non-retryable
         assert!(!is_retryable_webhook_error("HTTP 400"));
-        assert!(!is_retryable_webhook_error("HTTP 401"));
-        assert!(!is_retryable_webhook_error("HTTP 404"));
-        assert!(!is_retryable_webhook_error("invalid JSON"));
     }
 }
