@@ -722,30 +722,7 @@ fn restore_from_backup(
         let src = backup_dir.join(binary);
         if src.exists() {
             let dst = install_dir.join(binary);
-
-            if dst.exists() {
-                std::fs::remove_file(&dst).map_err(|e| {
-                    UpdateError::InstallFailed(format!("Failed to remove {}: {}", binary, e))
-                })?;
-            }
-
-            std::fs::copy(&src, &dst).map_err(|e| {
-                UpdateError::InstallFailed(format!("Failed to restore {}: {}", binary, e))
-            })?;
-
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mut perms = std::fs::metadata(&dst)
-                    .map_err(|e| {
-                        UpdateError::InstallFailed(format!("Failed to get permissions: {}", e))
-                    })?
-                    .permissions();
-                perms.set_mode(0o755);
-                std::fs::set_permissions(&dst, perms).map_err(|e| {
-                    UpdateError::InstallFailed(format!("Failed to set permissions: {}", e))
-                })?;
-            }
+            install_binary_from_payload(&src, &dst, binary)?;
         }
     }
 
@@ -1320,6 +1297,26 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(install_dir.join(optional_binary)).unwrap(),
             "backup optional"
+        );
+    }
+
+    #[test]
+    fn test_restore_failure_preserves_existing_binary() {
+        let temp = TempDir::new().unwrap();
+        let backup_dir = temp.path().join("backup");
+        let install_dir = temp.path().join("install");
+
+        std::fs::create_dir_all(backup_dir.join(REQUIRED_UPDATE_BINARY)).unwrap();
+        std::fs::create_dir_all(&install_dir).unwrap();
+        std::fs::write(install_dir.join(REQUIRED_UPDATE_BINARY), "current binary").unwrap();
+
+        let result = restore_from_backup(&backup_dir, &install_dir);
+
+        assert!(matches!(result, Err(UpdateError::InstallFailed(_))));
+        assert_eq!(
+            std::fs::read_to_string(install_dir.join(REQUIRED_UPDATE_BINARY)).unwrap(),
+            "current binary",
+            "rollback must stage backup payload before replacing the installed binary"
         );
     }
 
