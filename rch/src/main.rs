@@ -2859,6 +2859,40 @@ async fn handle_cache(action: CacheAction, ctx: &OutputContext) -> Result<()> {
     }
 }
 
+fn resolve_cache_warm_project_root(
+    project_root: PathBuf,
+    policy: &rch_common::path_topology::PathTopologyPolicy,
+) -> Result<PathBuf> {
+    let project_root = if project_root.is_absolute() {
+        project_root
+    } else {
+        std::env::current_dir()
+            .map_err(|e| anyhow::anyhow!("cannot determine cwd for project path: {e}"))?
+            .join(project_root)
+    };
+
+    if !project_root.exists() {
+        anyhow::bail!("project root does not exist: {}", project_root.display());
+    }
+    if !project_root.is_dir() {
+        anyhow::bail!(
+            "project root is not a directory: {}",
+            project_root.display()
+        );
+    }
+
+    let normalized =
+        rch_common::path_topology::normalize_project_path_with_policy(&project_root, policy)
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "project path normalization failed for {}: {e}",
+                    project_root.display()
+                )
+            })?;
+
+    Ok(normalized.canonical_path().to_path_buf())
+}
+
 /// `rch cache warm` implementation (br-4zm6u): pre-syncs project sources
 /// to one or more workers via `TransferPipeline::sync_to_remote` WITHOUT
 /// running a compilation step. Surfaces per-worker outcomes so an
@@ -2876,32 +2910,26 @@ async fn handle_cache_warm(
     project: Option<PathBuf>,
     ctx: &OutputContext,
 ) -> Result<()> {
-    use rch_common::TransferConfig;
-
     let style = ctx.theme();
+    let rch_config = config::load_config().map_err(|e| anyhow::anyhow!("load config: {e}"))?;
+    let topology_policy = rch_config.path_topology.to_policy();
     let project_root = match project {
         Some(p) => p,
         None => std::env::current_dir()
             .map_err(|e| anyhow::anyhow!("cannot determine project root from cwd: {e}"))?,
     };
-    if !project_root.exists() {
-        anyhow::bail!("project root does not exist: {}", project_root.display());
-    }
-    let project_root = project_root.canonicalize().map_err(|e| {
-        anyhow::anyhow!(
-            "cannot canonicalize project root {}: {e}",
-            project_root.display()
-        )
-    })?;
+    let project_root = resolve_cache_warm_project_root(project_root, &topology_policy)?;
     let project_id = transfer::project_id_from_path(&project_root);
     // Use the production hash entry point (`_with_dependency_roots_and_policy`)
     // — the other two variants are #[cfg(test)]-gated convenience wrappers.
-    // Empty deps + default policy matches the cache-warm contract: warm
-    // only the named project, no path-dep closure crawling.
+    // Empty deps matches the cache-warm contract: warm only the named
+    // project, no path-dep closure crawling. The configured topology
+    // policy must still match the hook path or the warmed hash/path is
+    // different from the first real build.
     let project_hash = transfer::compute_project_hash_with_dependency_roots_and_policy(
         &project_root,
         &[],
-        &rch_common::PathTopologyPolicy::default(),
+        &topology_policy,
     );
 
     let all_workers = commands::load_workers_from_config()
@@ -2963,7 +2991,7 @@ async fn handle_cache_warm(
     }
 
     let session_start = std::time::Instant::now();
-    let transfer_config = TransferConfig::default();
+    let transfer_config = rch_config.transfer;
     let mut results: Vec<CacheWarmWorkerResult> = Vec::with_capacity(selected.len());
     let mut total_bytes: u64 = 0;
     let mut total_files: u64 = 0;
@@ -4440,6 +4468,48 @@ mod tests {
         let _guard = test_guard!();
         let result = Cli::try_parse_from(["rch", "cache", "warm", "--bogus"]);
         assert!(result.is_err(), "unknown flag must error");
+    }
+
+    #[test]
+    fn cache_warm_project_root_uses_configured_topology() {
+        let _guard = test_guard!();
+        let temp = tempfile::TempDir::new().unwrap();
+        let canonical_root = temp.path().join("projects");
+        let alias_root = temp.path().join("alias");
+        let project = canonical_root.join("demo");
+        std::fs::create_dir_all(&project).unwrap();
+        let policy = rch_common::path_topology::PathTopologyPolicy::new(canonical_root, alias_root);
+
+        let resolved = resolve_cache_warm_project_root(project.clone(), &policy).unwrap();
+
+        assert_eq!(resolved, std::fs::canonicalize(&project).unwrap());
+        assert!(
+            resolve_cache_warm_project_root(
+                project,
+                &rch_common::path_topology::PathTopologyPolicy::default(),
+            )
+            .is_err(),
+            "cache warm must honor configured topology instead of the compiled-in default"
+        );
+    }
+
+    #[test]
+    fn cache_warm_project_root_rejects_file_path() {
+        let _guard = test_guard!();
+        let temp = tempfile::TempDir::new().unwrap();
+        let project_file = temp.path().join("Cargo.toml");
+        std::fs::write(&project_file, "[package]\n").unwrap();
+        let policy = rch_common::path_topology::PathTopologyPolicy::new(
+            temp.path().to_path_buf(),
+            temp.path().join("alias"),
+        );
+
+        let err = resolve_cache_warm_project_root(project_file, &policy).unwrap_err();
+
+        assert!(
+            err.to_string().contains("project root is not a directory"),
+            "unexpected error: {err}"
+        );
     }
 
     // -------------------------------------------------------------------------
