@@ -162,6 +162,22 @@ pub struct DoctorOptions {
     pub lenient: bool,
     /// `--scope=<list>`: subset of probes to run. Default = `[All]`.
     pub scope: ReliabilityScopeSet,
+    /// `--watch`: continuous monitoring mode. The doctor re-runs every
+    /// `watch_interval_secs` and emits diff-aware output (transitions
+    /// since the prior sweep). Exits cleanly on SIGINT with a final
+    /// summary on stderr.
+    pub watch: bool,
+    /// `--watch-interval=<seconds>`: time between sweeps in `--watch`
+    /// mode. Clamped by the CLI handler to 1..=3600. Default: 5.
+    pub watch_interval_secs: u64,
+    /// `--transitions-only`: in `--watch` mode, suppress unchanged
+    /// iterations and emit only when the diagnostic set OR verdict
+    /// differs from the prior sweep.
+    pub transitions_only: bool,
+    /// `--watch-snapshot=PATH`: on `--watch` exit, write a final
+    /// summary JSON to PATH (sweep count, verdict transitions count,
+    /// final verdict). Useful for tmux/split-window setups.
+    pub watch_snapshot: Option<std::path::PathBuf>,
 }
 
 // Live schema-version constants are sourced from the central
@@ -747,6 +763,59 @@ pub async fn run_doctor(ctx: &OutputContext, options: DoctorOptions) -> Result<(
 }
 
 async fn run_reliability_doctor(ctx: &OutputContext, options: &DoctorOptions) -> Result<()> {
+    // Watch mode short-circuits the single-shot path: it loops, diffs,
+    // and returns only after SIGINT or a signal-handler error.
+    if options.watch {
+        return run_reliability_watch_loop(ctx, options).await;
+    }
+    let response = collect_reliability_response_once(options).await;
+
+    if ctx.is_json() {
+        // t05: command tag is a single dotted token ("doctor.reliability")
+        // for agent-friendly jq-matching. Per AGENTS.md no-back-compat:
+        // consumers update to the dotted form directly.
+        let _ = ctx.json(&ApiResponse::ok("doctor.reliability", &response));
+    } else {
+        print_reliability_doctor_response(ctx, &response);
+    }
+
+    // Verdict → exit-code mapping (t02). Honors --strict / --lenient. Logged
+    // for forensics so log consumers can correlate exit codes with verdicts.
+    let exit_code = response
+        .summary
+        .overall
+        .exit_code(options.strict, options.lenient);
+    tracing::info!(
+        target: "rch::doctor::verdict",
+        verdict = response.summary.overall.label(),
+        exit_code,
+        strict = options.strict,
+        lenient = options.lenient,
+        pass = response.summary.pass,
+        info = response.summary.info,
+        warning = response.summary.warning,
+        critical = response.summary.critical,
+        "doctor.verdict",
+    );
+    if exit_code == 0 {
+        Ok(())
+    } else {
+        // Non-zero exit must reach the caller. Use process::exit AFTER all
+        // output has been flushed (println! above is line-buffered to stdout
+        // which auto-flushes on newline).
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+        std::process::exit(exit_code);
+    }
+}
+
+/// Single-shot collection of a reliability doctor response. Extracted
+/// from `run_reliability_doctor` so both the single-shot path and the
+/// `--watch` loop (t25) can re-use the exact same probe gating, scope
+/// honoring, and verdict aggregation. Pure async data collection — no
+/// stdout/stderr writes, no `process::exit` — callers decide how to
+/// surface the result.
+async fn collect_reliability_response_once(options: &DoctorOptions) -> ReliabilityDoctorResponse {
     // Probe gating per --scope (t01). Each branch runs only when the
     // operator-supplied scope set matches. Default `[All]` runs everything.
     let scope = &options.scope;
@@ -836,45 +905,7 @@ async fn run_reliability_doctor(ctx: &OutputContext, options: &DoctorOptions) ->
     } else {
         ReliabilityDoctorMode::Check
     };
-    let response = build_reliability_doctor_response(mode, scope, diagnostics);
-
-    if ctx.is_json() {
-        // t05: command tag is a single dotted token ("doctor.reliability")
-        // for agent-friendly jq-matching. Per AGENTS.md no-back-compat:
-        // consumers update to the dotted form directly.
-        let _ = ctx.json(&ApiResponse::ok("doctor.reliability", &response));
-    } else {
-        print_reliability_doctor_response(ctx, &response);
-    }
-
-    // Verdict → exit-code mapping (t02). Honors --strict / --lenient. Logged
-    // for forensics so log consumers can correlate exit codes with verdicts.
-    let exit_code = response
-        .summary
-        .overall
-        .exit_code(options.strict, options.lenient);
-    tracing::info!(
-        target: "rch::doctor::verdict",
-        verdict = response.summary.overall.label(),
-        exit_code,
-        strict = options.strict,
-        lenient = options.lenient,
-        pass = response.summary.pass,
-        info = response.summary.info,
-        warning = response.summary.warning,
-        critical = response.summary.critical,
-        "doctor.verdict",
-    );
-    if exit_code == 0 {
-        Ok(())
-    } else {
-        // Non-zero exit must reach the caller. Use process::exit AFTER all
-        // output has been flushed (println! above is line-buffered to stdout
-        // which auto-flushes on newline).
-        let _ = std::io::Write::flush(&mut std::io::stdout());
-        let _ = std::io::Write::flush(&mut std::io::stderr());
-        std::process::exit(exit_code);
-    }
+    build_reliability_doctor_response(mode, scope, diagnostics)
 }
 
 async fn query_repo_convergence_status() -> Result<RepoConvergenceStatusFromApi> {
@@ -882,6 +913,551 @@ async fn query_repo_convergence_status() -> Result<RepoConvergenceStatusFromApi>
     let json = extract_json_body(&response)
         .ok_or_else(|| anyhow::anyhow!("Invalid response format from daemon"))?;
     serde_json::from_str(json).map_err(Into::into)
+}
+
+// =============================================================================
+// `--watch` Continuous Monitoring (t25)
+// =============================================================================
+
+/// Stable identity for a single diagnostic across sweeps. Two diagnostics
+/// from different sweeps refer to the "same issue" iff their keys match.
+/// `worker_id` distinguishes per-worker diagnostics (the same `check_name`
+/// is emitted once per worker for topology rows).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct DiagnosticKey {
+    category: ReliabilityCategory,
+    check_name: String,
+    worker_id: Option<String>,
+}
+
+impl DiagnosticKey {
+    fn from_diagnostic(d: &ReliabilityDiagnostic) -> Self {
+        Self {
+            category: d.category,
+            check_name: d.check_name.clone(),
+            worker_id: d.worker_id.clone(),
+        }
+    }
+
+    /// Human-rendered form used in diff output banners.
+    fn render(&self) -> String {
+        match &self.worker_id {
+            Some(w) => format!(
+                "{}/{}[worker={}]",
+                self.category.as_str(),
+                self.check_name,
+                w
+            ),
+            None => format!("{}/{}", self.category.as_str(), self.check_name),
+        }
+    }
+}
+
+/// The subset of a diagnostic that determines whether a state has
+/// changed across sweeps. We deliberately exclude `details` from the
+/// fingerprint because some details rotate every sweep (e.g.,
+/// `uptime_secs=12345`) and would generate noise for `--transitions-only`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DiagnosticFingerprint {
+    severity: ReliabilitySeverity,
+    code: ReliabilityReasonCode,
+    message: String,
+}
+
+impl DiagnosticFingerprint {
+    fn from_diagnostic(d: &ReliabilityDiagnostic) -> Self {
+        Self {
+            severity: d.severity,
+            code: d.code,
+            message: d.message.clone(),
+        }
+    }
+}
+
+/// Cross-sweep diff result. `added` are diagnostics present this sweep
+/// but absent last sweep; `cleared` are the inverse; `changed` are
+/// diagnostics whose fingerprint shifted (severity/code/message).
+#[derive(Debug, Default)]
+struct DiagnosticDiff {
+    added: Vec<(DiagnosticKey, DiagnosticFingerprint)>,
+    cleared: Vec<(DiagnosticKey, DiagnosticFingerprint)>,
+    changed: Vec<(DiagnosticKey, DiagnosticFingerprint, DiagnosticFingerprint)>,
+}
+
+impl DiagnosticDiff {
+    fn has_changes(&self) -> bool {
+        !self.added.is_empty() || !self.cleared.is_empty() || !self.changed.is_empty()
+    }
+
+    fn total_transitions(&self) -> usize {
+        self.added.len() + self.cleared.len() + self.changed.len()
+    }
+}
+
+/// Compute the diff between two sorted fingerprint maps. Pure function —
+/// trivially unit-testable without spinning up the daemon or running probes.
+fn diff_fingerprint_maps(
+    previous: &std::collections::BTreeMap<DiagnosticKey, DiagnosticFingerprint>,
+    current: &std::collections::BTreeMap<DiagnosticKey, DiagnosticFingerprint>,
+) -> DiagnosticDiff {
+    let mut diff = DiagnosticDiff::default();
+    for (key, fp) in current {
+        match previous.get(key) {
+            None => diff.added.push((key.clone(), fp.clone())),
+            Some(prev_fp) if prev_fp != fp => {
+                diff.changed
+                    .push((key.clone(), prev_fp.clone(), fp.clone()));
+            }
+            Some(_) => {}
+        }
+    }
+    for (key, fp) in previous {
+        if !current.contains_key(key) {
+            diff.cleared.push((key.clone(), fp.clone()));
+        }
+    }
+    diff
+}
+
+/// Build the fingerprint map for a response. Deterministic ordering by
+/// `DiagnosticKey` so machine output is stable across runs.
+fn fingerprint_map_of(
+    response: &ReliabilityDoctorResponse,
+) -> std::collections::BTreeMap<DiagnosticKey, DiagnosticFingerprint> {
+    let mut map = std::collections::BTreeMap::new();
+    for d in &response.diagnostics {
+        map.insert(
+            DiagnosticKey::from_diagnostic(d),
+            DiagnosticFingerprint::from_diagnostic(d),
+        );
+    }
+    map
+}
+
+/// State threaded through the watch loop. `last_*` fields are `None`
+/// before the first sweep (so the initial sweep is always a transition).
+struct WatchState {
+    started_at: Instant,
+    sweep_count: u64,
+    /// Number of sweeps where the diff had ANY changes (i.e., something
+    /// transitioned). Logged in the final summary.
+    transitions_count: u64,
+    last_verdict: Option<ReliabilityVerdict>,
+    last_fingerprints: std::collections::BTreeMap<DiagnosticKey, DiagnosticFingerprint>,
+    /// Highest-severity verdict observed across all sweeps. Useful for
+    /// CI tripwires that want a single answer at the end.
+    worst_verdict: Option<ReliabilityVerdict>,
+}
+
+fn worst_reliability_verdict(
+    observed: Option<ReliabilityVerdict>,
+    candidate: ReliabilityVerdict,
+) -> ReliabilityVerdict {
+    match (observed, candidate) {
+        (Some(ReliabilityVerdict::Failing), _) | (_, ReliabilityVerdict::Failing) => {
+            ReliabilityVerdict::Failing
+        }
+        (Some(ReliabilityVerdict::Degraded), _) | (_, ReliabilityVerdict::Degraded) => {
+            ReliabilityVerdict::Degraded
+        }
+        (Some(ReliabilityVerdict::Healthy), ReliabilityVerdict::Healthy)
+        | (None, ReliabilityVerdict::Healthy) => ReliabilityVerdict::Healthy,
+    }
+}
+
+impl WatchState {
+    fn new() -> Self {
+        Self {
+            started_at: Instant::now(),
+            sweep_count: 0,
+            transitions_count: 0,
+            last_verdict: None,
+            last_fingerprints: std::collections::BTreeMap::new(),
+            worst_verdict: None,
+        }
+    }
+
+    /// Update the worst-observed verdict using max-severity-wins.
+    fn observe_verdict(&mut self, verdict: ReliabilityVerdict) {
+        self.worst_verdict = Some(worst_reliability_verdict(self.worst_verdict, verdict));
+    }
+}
+
+/// Machine sweep payload (one of these per emitted iteration in
+/// machine-readable mode). Schema matches the agent contract: agents
+/// inspect `verdict` / `diff_summary` for tripwire behavior.
+#[derive(Debug, Clone, Serialize)]
+struct WatchSweepMachineLine<'a> {
+    /// Logical command tag — matches the dotted-token convention used
+    /// elsewhere ("doctor.reliability.watch") so log consumers can split
+    /// single-shot vs continuous traffic by tag alone.
+    command: &'static str,
+    schema_version: &'a str,
+    sweep_index: u64,
+    elapsed_secs: u64,
+    verdict: &'static str,
+    verdict_changed: bool,
+    diff_summary: WatchDiffSummary,
+    /// Full response (so a single machine output record is self-contained).
+    response: &'a ReliabilityDoctorResponse,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct WatchDiffSummary {
+    added: usize,
+    cleared: usize,
+    changed: usize,
+    has_changes: bool,
+}
+
+/// `--watch-snapshot` final summary. Written once at exit.
+#[derive(Debug, Clone, Serialize)]
+struct WatchSnapshot<'a> {
+    command: &'static str,
+    schema_version: &'a str,
+    sweeps_total: u64,
+    transitions_total: u64,
+    elapsed_secs: u64,
+    final_verdict: &'static str,
+    /// Worst verdict observed at any point during the watch session.
+    /// Distinct from `final_verdict` because the system may have
+    /// recovered before exit; CI gates often want the worst-case.
+    worst_verdict: &'static str,
+    /// Final per-diagnostic state (so the snapshot can be diffed against
+    /// the next session's first sweep).
+    final_diagnostics: &'a Vec<ReliabilityDiagnostic>,
+}
+
+/// Run the continuous-monitoring watch loop until SIGINT. Each sweep
+/// re-runs the full reliability probe suite, computes a diff against
+/// the prior sweep, and emits output (suppressed under
+/// `--transitions-only` when nothing changed).
+async fn run_reliability_watch_loop(ctx: &OutputContext, options: &DoctorOptions) -> Result<()> {
+    let interval_secs = options.watch_interval_secs.max(1);
+    let interval = Duration::from_secs(interval_secs);
+    let snapshot_path = options.watch_snapshot.clone();
+    let style = ctx.theme();
+    let schema_version =
+        rch_common::schema_version(rch_common::SchemaComponent::DoctorReliability).to_string();
+
+    tracing::info!(
+        target: "rch::doctor::watch",
+        interval_secs,
+        transitions_only = options.transitions_only,
+        snapshot_path = ?snapshot_path,
+        scope = ?options.scope.as_strings(),
+        "doctor.watch.start",
+    );
+
+    if !ctx.is_json() {
+        eprintln!(
+            "{} (interval={interval_secs}s, scope={:?}, press Ctrl-C to exit)",
+            style.format_header("RCH Doctor — continuous watch mode"),
+            options.scope.as_strings(),
+        );
+        if options.transitions_only {
+            eprintln!(
+                "{}",
+                style.muted("    --transitions-only: emitting only when state changes")
+            );
+        }
+        eprintln!();
+    }
+
+    let mut state = WatchState::new();
+    // `tokio::time::interval` ticks immediately on the first call to
+    // `tick()`. That's exactly what we want — sweep at t=0, then every
+    // `interval_secs` thereafter. `Skip` behavior ensures we don't build
+    // up a backlog if a sweep happens to overrun the interval.
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    // Single-shot SIGINT future. We `pin!` it so the borrow can survive
+    // across loop iterations; we break the moment it fires (never poll
+    // again).
+    let sigint = tokio::signal::ctrl_c();
+    tokio::pin!(sigint);
+
+    loop {
+        tokio::select! {
+            // Bias toward the SIGINT branch so a Ctrl-C delivered at the
+            // exact same instant as a tick exits cleanly rather than
+            // running one more (potentially slow) sweep.
+            biased;
+            sig = &mut sigint => {
+                if let Err(e) = sig {
+                    tracing::warn!(
+                        target: "rch::doctor::watch",
+                        error = %e,
+                        "ctrl_c handler installation failed; exiting watch loop"
+                    );
+                }
+                break;
+            }
+            _ = ticker.tick() => {
+                state.sweep_count += 1;
+                let sweep_started = Instant::now();
+                let response = collect_reliability_response_once(options).await;
+                let current_fp = fingerprint_map_of(&response);
+                let diff = diff_fingerprint_maps(&state.last_fingerprints, &current_fp);
+                let verdict = response.summary.overall;
+                let verdict_changed = state.last_verdict != Some(verdict);
+                let any_change = diff.has_changes() || verdict_changed;
+                if any_change {
+                    state.transitions_count += 1;
+                }
+                state.observe_verdict(verdict);
+                let sweep_elapsed_ms = sweep_started.elapsed().as_millis();
+
+                let should_emit = !options.transitions_only || any_change || state.sweep_count == 1;
+                tracing::debug!(
+                    target: "rch::doctor::watch",
+                    sweep = state.sweep_count,
+                    verdict = verdict.label(),
+                    verdict_changed,
+                    added = diff.added.len(),
+                    cleared = diff.cleared.len(),
+                    changed = diff.changed.len(),
+                    transition_items = diff.total_transitions(),
+                    sweep_elapsed_ms,
+                    suppressed = !should_emit,
+                    "doctor.watch.sweep",
+                );
+
+                if should_emit {
+                    if ctx.is_json() {
+                        emit_watch_sweep_machine_line(
+                            ctx,
+                            &response,
+                            &diff,
+                            verdict_changed,
+                            &schema_version,
+                            state.sweep_count,
+                            state.started_at,
+                        );
+                    } else {
+                        emit_watch_sweep_human(
+                            ctx,
+                            &response,
+                            &diff,
+                            verdict_changed,
+                            state.sweep_count,
+                            state.started_at,
+                            sweep_elapsed_ms,
+                        );
+                    }
+                }
+
+                state.last_verdict = Some(verdict);
+                state.last_fingerprints = current_fp;
+            }
+        }
+    }
+
+    // SIGINT or signal-handler error fell through. Emit a final summary on
+    // stderr (so JSON consumers piping stdout to a file still see it)
+    // and write the snapshot file if requested.
+    //
+    // When a snapshot is requested, collect the exit-time response before
+    // rendering the summary so stderr, tracing, and the snapshot file all
+    // describe the same final state.
+    let final_response_for_snapshot = if snapshot_path.is_some() {
+        Some(collect_reliability_response_once(options).await)
+    } else {
+        None
+    };
+    let final_verdict = final_response_for_snapshot.as_ref().map_or_else(
+        || state.last_verdict.unwrap_or(ReliabilityVerdict::Healthy),
+        |r| r.summary.overall,
+    );
+    let worst_verdict = worst_reliability_verdict(state.worst_verdict, final_verdict);
+    let elapsed_secs = state.started_at.elapsed().as_secs();
+    if !ctx.is_json() {
+        eprintln!();
+        eprintln!(
+            "{} {} sweeps, {} transitions, {}s elapsed — final={}, worst={}",
+            style.format_header("Watch session ended"),
+            style.highlight(&state.sweep_count.to_string()),
+            style.highlight(&state.transitions_count.to_string()),
+            style.highlight(&elapsed_secs.to_string()),
+            style.highlight(final_verdict.label()),
+            style.highlight(worst_verdict.label()),
+        );
+    } else {
+        // In JSON mode, still write a final summary line so log consumers
+        // can detect clean exit vs hard kill. Emitted on stderr to keep
+        // the machine stream on stdout uninterrupted.
+        eprintln!(
+            r#"{{"command":"doctor.reliability.watch.end","sweeps_total":{},"transitions_total":{},"elapsed_secs":{},"final_verdict":"{}","worst_verdict":"{}"}}"#,
+            state.sweep_count,
+            state.transitions_count,
+            elapsed_secs,
+            final_verdict.label(),
+            worst_verdict.label(),
+        );
+    }
+    tracing::info!(
+        target: "rch::doctor::watch",
+        sweeps_total = state.sweep_count,
+        transitions_total = state.transitions_count,
+        elapsed_secs,
+        final_verdict = final_verdict.label(),
+        worst_verdict = worst_verdict.label(),
+        "doctor.watch.end",
+    );
+
+    if let (Some(path), Some(final_response)) = (snapshot_path, final_response_for_snapshot) {
+        // The in-flight state only holds fingerprints; the full diagnostics
+        // list requires this final probe pass. This is intentional: the
+        // snapshot reflects state at exit, not state at the last emitted
+        // sweep.
+        let snapshot = WatchSnapshot {
+            command: "doctor.reliability.watch.snapshot",
+            schema_version: &schema_version,
+            sweeps_total: state.sweep_count,
+            transitions_total: state.transitions_count,
+            elapsed_secs,
+            final_verdict: final_response.summary.overall.label(),
+            worst_verdict: worst_verdict.label(),
+            final_diagnostics: &final_response.diagnostics,
+        };
+        let body = serde_json::to_string_pretty(&snapshot)
+            .map_err(|e| anyhow::anyhow!("serialize watch snapshot: {e}"))?;
+        // Atomic temp+rename so partial writes can't leave a corrupt
+        // snapshot on disk if the process is killed mid-write.
+        let tmp = path.with_extension("json.partial");
+        tokio::fs::write(&tmp, body.as_bytes())
+            .await
+            .map_err(|e| anyhow::anyhow!("write watch snapshot tmp file: {e}"))?;
+        tokio::fs::rename(&tmp, &path)
+            .await
+            .map_err(|e| anyhow::anyhow!("rename watch snapshot to final path: {e}"))?;
+        tracing::info!(
+            target: "rch::doctor::watch",
+            path = %path.display(),
+            "doctor.watch.snapshot.written",
+        );
+        if !ctx.is_json() {
+            eprintln!(
+                "{} {}",
+                style.muted("    snapshot:"),
+                style.highlight(&path.display().to_string())
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Human-form sweep emitter: prints a compact one-line header per
+/// sweep on stderr, followed by indented bullets for each transition.
+/// Severity gets verdict-aware coloring through the theme. Output is
+/// designed to be readable in a long-running terminal session — no
+/// full panel redraws, no clear-screen. Bullets are sortable.
+fn emit_watch_sweep_human(
+    ctx: &OutputContext,
+    response: &ReliabilityDoctorResponse,
+    diff: &DiagnosticDiff,
+    verdict_changed: bool,
+    sweep: u64,
+    started_at: Instant,
+    sweep_elapsed_ms: u128,
+) {
+    let style = ctx.theme();
+    let verdict = response.summary.overall;
+    let verdict_label = verdict.label();
+    let colored_verdict = match verdict {
+        ReliabilityVerdict::Healthy => style.format_success(verdict_label),
+        ReliabilityVerdict::Degraded => style.format_warning(verdict_label),
+        ReliabilityVerdict::Failing => style.format_error(verdict_label),
+    };
+    let elapsed = started_at.elapsed().as_secs();
+    let arrow = if verdict_changed { " (CHANGED)" } else { "" };
+    eprintln!(
+        "[sweep {sweep:>4} t+{elapsed:>4}s] verdict={colored_verdict}{arrow} \
+         pass={p} info={i} warn={w} crit={c} probe_ms={ms} \
+         diff: +{added} -{cleared} ~{changed}",
+        p = response.summary.pass,
+        i = response.summary.info,
+        w = response.summary.warning,
+        c = response.summary.critical,
+        ms = sweep_elapsed_ms,
+        added = diff.added.len(),
+        cleared = diff.cleared.len(),
+        changed = diff.changed.len(),
+    );
+    // Bullets — keyed by stable DiagnosticKey so output is sortable.
+    for (key, fp) in &diff.added {
+        eprintln!(
+            "    {} {} [{}] {}",
+            style.format_warning("+ new"),
+            key.render(),
+            severity_short(fp.severity),
+            fp.message,
+        );
+    }
+    for (key, fp) in &diff.cleared {
+        eprintln!(
+            "    {} {} [{}] {}",
+            style.format_success("- cleared"),
+            key.render(),
+            severity_short(fp.severity),
+            fp.message,
+        );
+    }
+    for (key, prev, cur) in &diff.changed {
+        eprintln!(
+            "    {} {} [{}→{}] {} → {}",
+            style.muted("~ changed"),
+            key.render(),
+            severity_short(prev.severity),
+            severity_short(cur.severity),
+            prev.message,
+            cur.message,
+        );
+    }
+}
+
+/// Machine-mode sweep emitter: one self-contained JSON or TOON object
+/// per line on stdout. Designed for structured-log consumers.
+fn emit_watch_sweep_machine_line(
+    ctx: &OutputContext,
+    response: &ReliabilityDoctorResponse,
+    diff: &DiagnosticDiff,
+    verdict_changed: bool,
+    schema_version: &str,
+    sweep: u64,
+    started_at: Instant,
+) {
+    let payload = WatchSweepMachineLine {
+        command: "doctor.reliability.watch",
+        schema_version,
+        sweep_index: sweep,
+        elapsed_secs: started_at.elapsed().as_secs(),
+        verdict: response.summary.overall.label(),
+        verdict_changed,
+        diff_summary: WatchDiffSummary {
+            added: diff.added.len(),
+            cleared: diff.cleared.len(),
+            changed: diff.changed.len(),
+            has_changes: diff.has_changes(),
+        },
+        response,
+    };
+    // `json_compact` honors the configured machine format and writes one
+    // record per line, preserving parseable stdout for watch consumers.
+    let _ = ctx.json_compact(&payload);
+}
+
+/// Short single-letter severity glyph used in the human watch output.
+/// Keeps diff lines compact when many transitions fire at once.
+fn severity_short(severity: ReliabilitySeverity) -> &'static str {
+    match severity {
+        ReliabilitySeverity::Pass => "PASS",
+        ReliabilitySeverity::Info => "INFO",
+        ReliabilitySeverity::Warning => "WARN",
+        ReliabilitySeverity::Critical => "CRIT",
+    }
 }
 
 fn reliability_topology_diagnostics(
@@ -4773,6 +5349,10 @@ mod tests {
             strict: false,
             lenient: false,
             scope: ReliabilityScopeSet::default(),
+            watch: false,
+            watch_interval_secs: 5,
+            transitions_only: false,
+            watch_snapshot: None,
         };
         assert!(!opts_minimal.fix);
         assert!(!opts_minimal.dry_run);
@@ -4787,6 +5367,10 @@ mod tests {
             strict: false,
             lenient: false,
             scope: ReliabilityScopeSet::default(),
+            watch: false,
+            watch_interval_secs: 5,
+            transitions_only: false,
+            watch_snapshot: None,
         };
         assert!(opts_fix.fix);
 
@@ -4800,6 +5384,10 @@ mod tests {
             strict: false,
             lenient: false,
             scope: ReliabilityScopeSet::default(),
+            watch: false,
+            watch_interval_secs: 5,
+            transitions_only: false,
+            watch_snapshot: None,
         };
         assert!(opts_dry_run.fix);
         assert!(opts_dry_run.dry_run);
@@ -4814,6 +5402,10 @@ mod tests {
             strict: false,
             lenient: false,
             scope: ReliabilityScopeSet::default(),
+            watch: false,
+            watch_interval_secs: 5,
+            transitions_only: false,
+            watch_snapshot: None,
         };
         assert!(opts_verbose.verbose);
         // TEST PASS: DoctorOptions construction
@@ -5136,6 +5728,10 @@ mod tests {
             strict: false,
             lenient: false,
             scope: ReliabilityScopeSet::default(),
+            watch: false,
+            watch_interval_secs: 5,
+            transitions_only: false,
+            watch_snapshot: None,
         };
         let mut checks = Vec::new();
         let mut fixes_applied = Vec::new();
@@ -5174,6 +5770,10 @@ mod tests {
             strict: false,
             lenient: false,
             scope: ReliabilityScopeSet::default(),
+            watch: false,
+            watch_interval_secs: 5,
+            transitions_only: false,
+            watch_snapshot: None,
         };
 
         let mut checks = Vec::new();
@@ -5212,6 +5812,10 @@ mod tests {
             strict: false,
             lenient: false,
             scope: ReliabilityScopeSet::default(),
+            watch: false,
+            watch_interval_secs: 5,
+            transitions_only: false,
+            watch_snapshot: None,
         };
 
         let mut checks = Vec::new();
@@ -5246,6 +5850,10 @@ mod tests {
             strict: false,
             lenient: false,
             scope: ReliabilityScopeSet::default(),
+            watch: false,
+            watch_interval_secs: 5,
+            transitions_only: false,
+            watch_snapshot: None,
         };
         let mut fixes_applied = Vec::new();
 
@@ -6110,5 +6718,337 @@ exit 0\n"
         let mut new_buf = String::new();
         push_opt_display(&mut new_buf, none_u64);
         assert_eq!(old, new_buf, "None Display helper must match old format");
+    }
+
+    // =========================================================================
+    // `--watch` Diff Function Tests (t25)
+    // =========================================================================
+    //
+    // These tests pin the contract of `diff_fingerprint_maps`. The watch
+    // loop relies on this purely-functional diff to compute added /
+    // cleared / changed sets. Regressions here would produce wrong
+    // `--transitions-only` suppression behavior and would silently
+    // miss-emit machine sweep deltas — so we cover empty-vs-empty,
+    // first-sweep (empty-vs-populated), severity flip, message rotation
+    // (not a fingerprint change), and the worker_id-keyed case where
+    // the same `check_name` appears once per worker.
+
+    fn make_watch_diag(
+        category: ReliabilityCategory,
+        check_name: &str,
+        severity: ReliabilitySeverity,
+        code: ReliabilityReasonCode,
+        message: &str,
+        worker_id: Option<&str>,
+    ) -> ReliabilityDiagnostic {
+        let mut d = ReliabilityDiagnostic::new(category, check_name, severity, message, code);
+        if let Some(w) = worker_id {
+            d = d.with_worker(w);
+        }
+        d
+    }
+
+    fn fp_map_of(
+        diags: &[ReliabilityDiagnostic],
+    ) -> std::collections::BTreeMap<DiagnosticKey, DiagnosticFingerprint> {
+        let mut map = std::collections::BTreeMap::new();
+        for d in diags {
+            map.insert(
+                DiagnosticKey::from_diagnostic(d),
+                DiagnosticFingerprint::from_diagnostic(d),
+            );
+        }
+        map
+    }
+
+    #[test]
+    fn diff_empty_vs_empty_is_quiet() {
+        // TEST START: empty → empty diff must be no-op
+        let prev = std::collections::BTreeMap::new();
+        let curr = std::collections::BTreeMap::new();
+        let diff = diff_fingerprint_maps(&prev, &curr);
+        assert!(!diff.has_changes(), "empty→empty must be quiet");
+        assert_eq!(diff.added.len(), 0);
+        assert_eq!(diff.cleared.len(), 0);
+        assert_eq!(diff.changed.len(), 0);
+        assert_eq!(diff.total_transitions(), 0);
+        // TEST PASS: empty→empty diff
+    }
+
+    #[test]
+    fn diff_first_sweep_classifies_everything_as_added() {
+        // TEST START: empty→populated first sweep — every diagnostic is "added"
+        let prev = std::collections::BTreeMap::new();
+        let curr_diags = vec![
+            make_watch_diag(
+                ReliabilityCategory::Topology,
+                "workers_config",
+                ReliabilitySeverity::Pass,
+                ReliabilityReasonCode::WorkersConfigured,
+                "3 workers configured",
+                None,
+            ),
+            make_watch_diag(
+                ReliabilityCategory::DiskPressure,
+                "disk_pressure",
+                ReliabilitySeverity::Warning,
+                ReliabilityReasonCode::PartialWorkerCapacity,
+                "disk pressure observed",
+                Some("css"),
+            ),
+        ];
+        let curr = fp_map_of(&curr_diags);
+        let diff = diff_fingerprint_maps(&prev, &curr);
+        assert!(diff.has_changes());
+        assert_eq!(diff.added.len(), 2, "first sweep must mark all as added");
+        assert_eq!(diff.cleared.len(), 0);
+        assert_eq!(diff.changed.len(), 0);
+        assert_eq!(diff.total_transitions(), 2);
+        // TEST PASS: first sweep added classification
+    }
+
+    #[test]
+    fn diff_cleared_when_diagnostic_disappears() {
+        // TEST START: a diagnostic gone from prev→curr is "cleared"
+        let prev_diags = vec![make_watch_diag(
+            ReliabilityCategory::Topology,
+            "workers_config",
+            ReliabilitySeverity::Critical,
+            ReliabilityReasonCode::NoWorkersConfigured,
+            "no workers configured",
+            None,
+        )];
+        let prev = fp_map_of(&prev_diags);
+        let curr = std::collections::BTreeMap::new();
+        let diff = diff_fingerprint_maps(&prev, &curr);
+        assert_eq!(diff.added.len(), 0);
+        assert_eq!(diff.cleared.len(), 1);
+        assert_eq!(diff.changed.len(), 0);
+        // TEST PASS: cleared diagnostic
+    }
+
+    #[test]
+    fn diff_severity_flip_is_changed_not_cleared_plus_added() {
+        // TEST START: same key, different severity → "changed" (not cleared+added)
+        let prev_diags = vec![make_watch_diag(
+            ReliabilityCategory::Topology,
+            "workers_config",
+            ReliabilitySeverity::Warning,
+            ReliabilityReasonCode::PartialWorkerCapacity,
+            "2/3 workers healthy",
+            None,
+        )];
+        let curr_diags = vec![make_watch_diag(
+            ReliabilityCategory::Topology,
+            "workers_config",
+            ReliabilitySeverity::Critical, // <-- flipped from Warning
+            ReliabilityReasonCode::AllWorkersUnhealthy,
+            "0/3 workers healthy",
+            None,
+        )];
+        let prev = fp_map_of(&prev_diags);
+        let curr = fp_map_of(&curr_diags);
+        let diff = diff_fingerprint_maps(&prev, &curr);
+        assert_eq!(diff.added.len(), 0, "must not double-count flip as added");
+        assert_eq!(
+            diff.cleared.len(),
+            0,
+            "must not double-count flip as cleared"
+        );
+        assert_eq!(
+            diff.changed.len(),
+            1,
+            "severity flip is a single 'changed' event"
+        );
+        let (key, prev_fp, cur_fp) = &diff.changed[0];
+        assert_eq!(key.check_name, "workers_config");
+        assert_eq!(prev_fp.severity, ReliabilitySeverity::Warning);
+        assert_eq!(cur_fp.severity, ReliabilitySeverity::Critical);
+        // TEST PASS: severity flip classification
+    }
+
+    #[test]
+    fn diff_identical_fingerprint_is_quiet() {
+        // TEST START: same fingerprint twice → diff is empty (drives --transitions-only)
+        let diags = vec![make_watch_diag(
+            ReliabilityCategory::Topology,
+            "workers_config",
+            ReliabilitySeverity::Pass,
+            ReliabilityReasonCode::WorkersConfigured,
+            "3 workers configured",
+            None,
+        )];
+        let prev = fp_map_of(&diags);
+        let curr = fp_map_of(&diags);
+        let diff = diff_fingerprint_maps(&prev, &curr);
+        assert!(
+            !diff.has_changes(),
+            "identical fingerprints must not flag changes"
+        );
+        // TEST PASS: identical fingerprint quiet
+    }
+
+    #[test]
+    fn diff_per_worker_keys_are_independent() {
+        // TEST START: same check_name on different workers are independent rows
+        // (so a flip on one worker doesn't get attributed to the other).
+        let prev_diags = vec![
+            make_watch_diag(
+                ReliabilityCategory::Topology,
+                "worker_health",
+                ReliabilitySeverity::Pass,
+                ReliabilityReasonCode::WorkersHealthy,
+                "ok",
+                Some("css"),
+            ),
+            make_watch_diag(
+                ReliabilityCategory::Topology,
+                "worker_health",
+                ReliabilitySeverity::Pass,
+                ReliabilityReasonCode::WorkersHealthy,
+                "ok",
+                Some("dlx"),
+            ),
+        ];
+        let curr_diags = vec![
+            make_watch_diag(
+                ReliabilityCategory::Topology,
+                "worker_health",
+                ReliabilitySeverity::Pass,
+                ReliabilityReasonCode::WorkersHealthy,
+                "ok",
+                Some("css"),
+            ),
+            // dlx flipped
+            make_watch_diag(
+                ReliabilityCategory::Topology,
+                "worker_health",
+                ReliabilitySeverity::Critical,
+                ReliabilityReasonCode::AllWorkersUnhealthy,
+                "down",
+                Some("dlx"),
+            ),
+        ];
+        let prev = fp_map_of(&prev_diags);
+        let curr = fp_map_of(&curr_diags);
+        let diff = diff_fingerprint_maps(&prev, &curr);
+        assert_eq!(diff.added.len(), 0);
+        assert_eq!(diff.cleared.len(), 0);
+        assert_eq!(
+            diff.changed.len(),
+            1,
+            "only the dlx row should be marked changed"
+        );
+        let (key, _, _) = &diff.changed[0];
+        assert_eq!(key.worker_id.as_deref(), Some("dlx"));
+        // TEST PASS: per-worker key independence
+    }
+
+    #[test]
+    fn watch_state_observe_verdict_tracks_worst_case() {
+        // TEST START: WatchState.observe_verdict is monotone non-decreasing
+        // (Healthy → Degraded → Failing). Once worst is Failing it stays
+        // Failing even if subsequent sweeps recover. CI tripwires read
+        // worst_verdict at exit.
+        let mut state = WatchState::new();
+        assert!(state.worst_verdict.is_none());
+        state.observe_verdict(ReliabilityVerdict::Healthy);
+        assert_eq!(state.worst_verdict, Some(ReliabilityVerdict::Healthy));
+        state.observe_verdict(ReliabilityVerdict::Degraded);
+        assert_eq!(state.worst_verdict, Some(ReliabilityVerdict::Degraded));
+        state.observe_verdict(ReliabilityVerdict::Healthy); // recovery
+        assert_eq!(
+            state.worst_verdict,
+            Some(ReliabilityVerdict::Degraded),
+            "recovery must not lower the worst-observed verdict"
+        );
+        state.observe_verdict(ReliabilityVerdict::Failing);
+        assert_eq!(state.worst_verdict, Some(ReliabilityVerdict::Failing));
+        state.observe_verdict(ReliabilityVerdict::Healthy); // recovery from Failing
+        assert_eq!(
+            state.worst_verdict,
+            Some(ReliabilityVerdict::Failing),
+            "worst_verdict is sticky once Failing"
+        );
+        // TEST PASS: worst_verdict monotonicity
+    }
+
+    #[test]
+    fn watch_worst_verdict_includes_exit_snapshot_probe() {
+        // TEST START: the exit-time snapshot probe is folded into
+        // worst_verdict, not just the completed watch sweeps.
+        assert_eq!(
+            worst_reliability_verdict(
+                Some(ReliabilityVerdict::Healthy),
+                ReliabilityVerdict::Failing
+            ),
+            ReliabilityVerdict::Failing,
+            "a failing exit snapshot must promote worst_verdict"
+        );
+        assert_eq!(
+            worst_reliability_verdict(
+                Some(ReliabilityVerdict::Degraded),
+                ReliabilityVerdict::Healthy
+            ),
+            ReliabilityVerdict::Degraded,
+            "a recovered exit snapshot must not lower the observed worst verdict"
+        );
+        assert_eq!(
+            worst_reliability_verdict(None, ReliabilityVerdict::Degraded),
+            ReliabilityVerdict::Degraded,
+            "snapshot-only sessions must use the exit probe verdict"
+        );
+        // TEST PASS: exit snapshot verdict folded into worst_verdict
+    }
+
+    #[test]
+    fn diagnostic_key_render_includes_worker_when_present() {
+        // TEST START: DiagnosticKey.render() produces stable human-readable form
+        let key_no_worker = DiagnosticKey {
+            category: ReliabilityCategory::Topology,
+            check_name: "workers_config".to_string(),
+            worker_id: None,
+        };
+        assert_eq!(key_no_worker.render(), "topology/workers_config");
+        let key_with_worker = DiagnosticKey {
+            category: ReliabilityCategory::DiskPressure,
+            check_name: "disk_pressure".to_string(),
+            worker_id: Some("css".to_string()),
+        };
+        assert_eq!(
+            key_with_worker.render(),
+            "disk_pressure/disk_pressure[worker=css]"
+        );
+        // TEST PASS: render format stable
+    }
+
+    #[test]
+    fn fingerprint_excludes_details_so_rotating_uptime_does_not_churn() {
+        // TEST START: fingerprint must NOT include `details` field — some
+        // details rotate every sweep (e.g., `uptime_secs=12345`) and would
+        // generate constant noise under --transitions-only.
+        let d_a = ReliabilityDiagnostic::new(
+            ReliabilityCategory::Topology,
+            "daemon_worker_capacity",
+            ReliabilitySeverity::Pass,
+            "All 3 workers healthy",
+            ReliabilityReasonCode::WorkersHealthy,
+        )
+        .with_details("uptime_secs=100");
+        let d_b = ReliabilityDiagnostic::new(
+            ReliabilityCategory::Topology,
+            "daemon_worker_capacity",
+            ReliabilitySeverity::Pass,
+            "All 3 workers healthy",
+            ReliabilityReasonCode::WorkersHealthy,
+        )
+        .with_details("uptime_secs=200");
+        let fp_a = DiagnosticFingerprint::from_diagnostic(&d_a);
+        let fp_b = DiagnosticFingerprint::from_diagnostic(&d_b);
+        assert_eq!(
+            fp_a, fp_b,
+            "rotating details must NOT change the fingerprint"
+        );
+        // TEST PASS: fingerprint stability across rotating details
     }
 }

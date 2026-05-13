@@ -534,6 +534,29 @@ CHECKS PERFORMED:
             value_name = "SCOPES"
         )]
         scope: String,
+
+        /// Continuous monitoring mode: re-runs the reliability doctor every
+        /// `--watch-interval` seconds and emits diff-aware output until SIGINT.
+        /// Only meaningful with `--reliability`. Mutually exclusive with `--fix`.
+        #[arg(long, requires = "reliability", conflicts_with = "fix")]
+        watch: bool,
+
+        /// Seconds between sweeps in `--watch` mode. Clamped by the CLI
+        /// handler to 1..=3600. Default: 5.
+        #[arg(long, requires = "watch", default_value = "5", value_name = "SECONDS")]
+        watch_interval: u64,
+
+        /// In `--watch` mode, emit output only when the verdict OR the
+        /// diagnostic set changes versus the prior sweep (suppresses
+        /// unchanged iterations).
+        #[arg(long, requires = "watch")]
+        transitions_only: bool,
+
+        /// On `--watch` exit, write a final summary JSON to PATH (sweep
+        /// count, transition count, final verdict). Useful for tmux/split-
+        /// window setups and CI tripwires.
+        #[arg(long, requires = "watch", value_name = "PATH")]
+        watch_snapshot: Option<PathBuf>,
     },
 
     /// Verify remote compilation by running a self-test
@@ -1647,6 +1670,10 @@ async fn main() -> Result<()> {
                 strict,
                 lenient,
                 scope,
+                watch,
+                watch_interval,
+                transitions_only,
+                watch_snapshot,
             } => {
                 handle_doctor(
                     fix,
@@ -1657,6 +1684,10 @@ async fn main() -> Result<()> {
                     strict,
                     lenient,
                     scope,
+                    watch,
+                    watch_interval,
+                    transitions_only,
+                    watch_snapshot,
                     &ctx,
                 )
                 .await
@@ -2795,6 +2826,10 @@ async fn handle_doctor(
     strict: bool,
     lenient: bool,
     scope: String,
+    watch: bool,
+    watch_interval: u64,
+    transitions_only: bool,
+    watch_snapshot: Option<PathBuf>,
     ctx: &OutputContext,
 ) -> Result<()> {
     use crate::doctor::{DoctorOptions, ReliabilityScopeSet};
@@ -2803,6 +2838,35 @@ async fn handle_doctor(
     let scope: ReliabilityScopeSet = scope
         .parse()
         .map_err(|e: String| anyhow::anyhow!("invalid --scope value: {e}"))?;
+    // Clamp watch interval at the CLI boundary. clap can't express an
+    // inclusive range constraint cleanly for u64, so we do it here so a
+    // pathological `--watch-interval=0` (busy loop) or `--watch-interval=
+    // 86400` (essentially-disabled) is gently corrected with a warning
+    // instead of failing or hanging.
+    let watch_interval_secs = if watch {
+        if watch_interval == 0 {
+            tracing::warn!(
+                target: "rch::doctor::watch",
+                requested = watch_interval,
+                clamped_to = 1u64,
+                "watch interval 0 would busy-loop; clamping to 1 second"
+            );
+            1
+        } else if watch_interval > 3600 {
+            tracing::warn!(
+                target: "rch::doctor::watch",
+                requested = watch_interval,
+                clamped_to = 3600u64,
+                "watch interval > 3600 is pathological; clamping to 1 hour"
+            );
+            3600
+        } else {
+            watch_interval
+        }
+    } else {
+        // Not in watch mode: the field is ignored at runtime.
+        watch_interval
+    };
     let options = DoctorOptions {
         fix,
         dry_run,
@@ -2813,6 +2877,10 @@ async fn handle_doctor(
         strict,
         lenient,
         scope,
+        watch,
+        watch_interval_secs,
+        transitions_only,
+        watch_snapshot,
     };
     crate::doctor::run_doctor(ctx, options).await
 }
@@ -3983,6 +4051,10 @@ mod tests {
                 strict,
                 lenient,
                 scope: _,
+                watch: _,
+                watch_interval: _,
+                transitions_only: _,
+                watch_snapshot: _,
             }) => {
                 assert!(!fix);
                 assert!(!dry_run);
@@ -4010,6 +4082,10 @@ mod tests {
                 strict,
                 lenient,
                 scope: _,
+                watch: _,
+                watch_interval: _,
+                transitions_only: _,
+                watch_snapshot: _,
             }) => {
                 assert!(fix);
                 assert!(!dry_run);
@@ -4037,6 +4113,10 @@ mod tests {
                 strict,
                 lenient,
                 scope: _,
+                watch: _,
+                watch_interval: _,
+                transitions_only: _,
+                watch_snapshot: _,
             }) => {
                 assert!(!fix);
                 assert!(dry_run);
@@ -4064,6 +4144,10 @@ mod tests {
                 strict,
                 lenient,
                 scope: _,
+                watch: _,
+                watch_interval: _,
+                transitions_only: _,
+                watch_snapshot: _,
             }) => {
                 assert!(!fix);
                 assert!(!dry_run);
@@ -4091,6 +4175,10 @@ mod tests {
                 strict,
                 lenient,
                 scope: _,
+                watch: _,
+                watch_interval: _,
+                transitions_only: _,
+                watch_snapshot: _,
             }) => {
                 assert!(!fix);
                 assert!(!dry_run);
@@ -4119,6 +4207,10 @@ mod tests {
                 strict,
                 lenient,
                 scope: _,
+                watch: _,
+                watch_interval: _,
+                transitions_only: _,
+                watch_snapshot: _,
             }) => {
                 assert!(!fix);
                 assert!(!dry_run);
@@ -4189,6 +4281,85 @@ mod tests {
         );
         if let Err(err) = result {
             assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+        }
+    }
+
+    #[test]
+    fn cli_parses_doctor_reliability_watch_flags() {
+        let _guard = test_guard!();
+        let cli = Cli::try_parse_from([
+            "rch",
+            "doctor",
+            "--reliability",
+            "--watch",
+            "--watch-interval",
+            "30",
+            "--transitions-only",
+            "--watch-snapshot",
+            "/tmp/rch-watch.json",
+        ])
+        .expect("watch mode flags should parse with reliability mode");
+
+        match cli.command {
+            Some(Commands::Doctor {
+                reliability,
+                watch,
+                watch_interval,
+                transitions_only,
+                watch_snapshot,
+                ..
+            }) => {
+                assert!(reliability);
+                assert!(watch);
+                assert_eq!(watch_interval, 30);
+                assert!(transitions_only);
+                assert_eq!(watch_snapshot, Some(PathBuf::from("/tmp/rch-watch.json")));
+            }
+            _ => panic!("Expected doctor command with reliability watch mode"),
+        }
+    }
+
+    #[test]
+    fn cli_rejects_doctor_watch_without_reliability() {
+        let _guard = test_guard!();
+        let result = Cli::try_parse_from(["rch", "doctor", "--watch"]);
+        assert!(
+            result.is_err(),
+            "--watch is only valid with reliability mode"
+        );
+        if let Err(err) = result {
+            assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+        }
+    }
+
+    #[test]
+    fn cli_rejects_doctor_watch_with_fix() {
+        let _guard = test_guard!();
+        let result = Cli::try_parse_from(["rch", "doctor", "--reliability", "--fix", "--watch"]);
+        assert!(result.is_err(), "--watch and --fix are mutually exclusive");
+        if let Err(err) = result {
+            assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+        }
+    }
+
+    #[test]
+    fn cli_rejects_doctor_watch_dependents_without_watch() {
+        let _guard = test_guard!();
+        for args in [
+            vec!["rch", "doctor", "--reliability", "--transitions-only"],
+            vec![
+                "rch",
+                "doctor",
+                "--reliability",
+                "--watch-snapshot",
+                "/tmp/rch-watch.json",
+            ],
+        ] {
+            let result = Cli::try_parse_from(args);
+            assert!(result.is_err(), "watch-only flags should require --watch");
+            if let Err(err) = result {
+                assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+            }
         }
     }
 
