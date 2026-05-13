@@ -4750,6 +4750,7 @@ mod tests {
             user: "test".to_string(),
             capabilities: WorkerCapabilities::default(),
             pressure_assessment: crate::disk_pressure::PressureAssessment::default(),
+            refresh: None,
         };
         let json = serde_json::to_string(&info).unwrap();
         assert!(json.contains("\"id\":\"worker1\""));

@@ -250,6 +250,26 @@ pub(super) fn collect_local_capability_warnings(
     warnings
 }
 
+pub(super) fn collect_refresh_warnings(workers: &[WorkerCapabilitiesFromApi]) -> Vec<String> {
+    workers
+        .iter()
+        .filter_map(|worker| {
+            let refresh = worker.refresh.as_ref()?;
+            if !refresh.attempted || refresh.live {
+                return None;
+            }
+            let detail = refresh
+                .message
+                .as_deref()
+                .unwrap_or("daemon returned cached capability snapshot");
+            Some(format!(
+                "Worker {} capabilities are cached after refresh attempt: {}",
+                worker.id, detail
+            ))
+        })
+        .collect()
+}
+
 fn workers_list_verbose_enabled(ctx: &OutputContext) -> bool {
     ctx.is_verbose() && !ctx.is_json()
 }
@@ -601,6 +621,7 @@ pub async fn workers_capabilities(
             &local_capabilities,
         ));
     }
+    warnings.extend(collect_refresh_warnings(&workers));
 
     if ctx.is_json() {
         let report = WorkersCapabilitiesReport {
@@ -683,6 +704,23 @@ pub async fn workers_capabilities(
         render("Bun", caps.bun_version.as_ref());
         render("Node", caps.node_version.as_ref());
         render("npm", caps.npm_version.as_ref());
+        if let Some(refresh) = worker.refresh.as_ref() {
+            let (indicator, label) = if refresh.live {
+                (StatusIndicator::Success, style.value("live refresh"))
+            } else {
+                (
+                    StatusIndicator::Warning,
+                    style.warning("cached after failed refresh"),
+                )
+            };
+            println!(
+                "    {} {} {} {}",
+                indicator.display(style),
+                style.key("Refresh"),
+                style.muted(":"),
+                label
+            );
+        }
         println!();
     }
 

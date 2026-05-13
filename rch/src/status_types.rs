@@ -105,6 +105,21 @@ pub struct WorkerCapabilitiesFromApi {
     pub host: String,
     pub user: String,
     pub capabilities: WorkerCapabilities,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh: Option<WorkerCapabilitiesRefreshFromApi>,
+}
+
+/// Freshness metadata for worker capabilities returned by the daemon.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerCapabilitiesRefreshFromApi {
+    #[serde(default)]
+    pub attempted: bool,
+    #[serde(default)]
+    pub live: bool,
+    #[serde(default)]
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 /// Worker capabilities response from API.

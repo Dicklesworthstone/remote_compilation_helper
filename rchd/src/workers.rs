@@ -6,7 +6,7 @@ use crate::DaemonContext;
 use crate::disk_pressure::{
     DiskPressurePolicyConfig, PressureAssessment, evaluate_pressure_policy,
 };
-use crate::health::{HealthConfig, probe_worker_capabilities};
+use crate::health::probe_worker_capabilities;
 use rch_common::{
     CircuitBreakerConfig, CircuitState, CircuitStats, WorkerCapabilities, WorkerConfig, WorkerId,
     WorkerStatus,
@@ -18,6 +18,9 @@ use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::debug;
+
+const CAPABILITIES_REFRESH_PROBE_TIMEOUT: Duration = Duration::from_secs(4);
+const CAPABILITIES_REFRESH_WORKER_BUDGET: Duration = Duration::from_secs(8);
 
 /// State of a single worker.
 #[derive(Debug)]
@@ -677,6 +680,38 @@ pub struct WorkerCapabilitiesInfo {
     pub user: String,
     pub capabilities: WorkerCapabilities,
     pub pressure_assessment: PressureAssessment,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refresh: Option<WorkerCapabilitiesRefreshInfo>,
+}
+
+/// Freshness information for a capabilities refresh request.
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkerCapabilitiesRefreshInfo {
+    pub attempted: bool,
+    pub live: bool,
+    pub source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+impl WorkerCapabilitiesRefreshInfo {
+    fn live_probe() -> Self {
+        Self {
+            attempted: true,
+            live: true,
+            source: "live_probe".to_string(),
+            message: None,
+        }
+    }
+
+    fn cached_after_probe_failure(message: impl Into<String>) -> Self {
+        Self {
+            attempted: true,
+            live: false,
+            source: "cached_after_probe_failure".to_string(),
+            message: Some(message.into()),
+        }
+    }
 }
 
 /// Worker capabilities response.
@@ -712,13 +747,13 @@ pub async fn get_workers_capabilities(
 ) -> WorkerCapabilitiesResponse {
     let workers = ctx.pool.all_workers().await;
     let mut entries = Vec::with_capacity(workers.len());
-    let timeout = HealthConfig::default().check_timeout;
+    let mut refresh_results = if refresh {
+        refresh_worker_capabilities_concurrently(&workers).await
+    } else {
+        HashMap::new()
+    };
 
     for worker in workers {
-        if refresh && let Some(capabilities) = probe_worker_capabilities(&worker, timeout).await {
-            worker.set_capabilities(capabilities).await;
-        }
-
         let (id, host, user) = {
             let config = worker.config.read().await;
             (
@@ -729,6 +764,7 @@ pub async fn get_workers_capabilities(
         };
         let capabilities = worker.capabilities().await;
         let pressure_assessment = worker.pressure_assessment().await;
+        let refresh = refresh_results.remove(&id);
 
         entries.push(WorkerCapabilitiesInfo {
             id,
@@ -736,10 +772,66 @@ pub async fn get_workers_capabilities(
             user,
             capabilities,
             pressure_assessment,
+            refresh,
         });
     }
 
     WorkerCapabilitiesResponse { workers: entries }
+}
+
+async fn refresh_worker_capabilities_concurrently(
+    workers: &[Arc<WorkerState>],
+) -> HashMap<String, WorkerCapabilitiesRefreshInfo> {
+    let mut handles = Vec::with_capacity(workers.len());
+
+    for worker in workers {
+        let id = {
+            let config = worker.config.read().await;
+            config.id.to_string()
+        };
+        let worker = Arc::clone(worker);
+        handles.push((
+            id,
+            tokio::spawn(async move { refresh_worker_capabilities_for_worker(worker).await }),
+        ));
+    }
+
+    let mut results = HashMap::with_capacity(handles.len());
+    for (id, handle) in handles {
+        let refresh = match handle.await {
+            Ok(refresh) => refresh,
+            Err(err) => WorkerCapabilitiesRefreshInfo::cached_after_probe_failure(format!(
+                "capabilities refresh task failed: {err}; returning cached capability snapshot"
+            )),
+        };
+        results.insert(id, refresh);
+    }
+
+    results
+}
+
+async fn refresh_worker_capabilities_for_worker(
+    worker: Arc<WorkerState>,
+) -> WorkerCapabilitiesRefreshInfo {
+    let probe = tokio::time::timeout(
+        CAPABILITIES_REFRESH_WORKER_BUDGET,
+        probe_worker_capabilities(&worker, CAPABILITIES_REFRESH_PROBE_TIMEOUT),
+    )
+    .await;
+
+    match probe {
+        Ok(Some(capabilities)) => {
+            worker.set_capabilities(capabilities).await;
+            WorkerCapabilitiesRefreshInfo::live_probe()
+        }
+        Ok(None) => WorkerCapabilitiesRefreshInfo::cached_after_probe_failure(
+            "capabilities probe failed; returning cached capability snapshot",
+        ),
+        Err(_) => WorkerCapabilitiesRefreshInfo::cached_after_probe_failure(format!(
+            "capabilities probe exceeded {}s response budget; returning cached capability snapshot",
+            CAPABILITIES_REFRESH_WORKER_BUDGET.as_secs()
+        )),
+    }
 }
 
 /// Handle a worker drain request.
@@ -875,6 +967,29 @@ mod tests {
             priority: 100,
             tags: vec![],
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_refresh_worker_capabilities_marks_live_probe() {
+        let _guard = rch_common::test_guard!();
+        struct MockOverrideGuard;
+        impl Drop for MockOverrideGuard {
+            fn drop(&mut self) {
+                rch_common::mock::clear_mock_overrides();
+            }
+        }
+
+        rch_common::mock::set_mock_enabled_override(Some(true));
+        let _mock_guard = MockOverrideGuard;
+        let state = std::sync::Arc::new(WorkerState::new(test_config("test-worker")));
+
+        let refresh = refresh_worker_capabilities_for_worker(std::sync::Arc::clone(&state)).await;
+
+        assert!(refresh.attempted);
+        assert!(refresh.live);
+        assert_eq!(refresh.source, "live_probe");
+        assert!(state.has_rust().await);
     }
 
     // ============== WorkerState Tests ==============
