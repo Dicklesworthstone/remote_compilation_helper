@@ -636,43 +636,63 @@ fn replace_binaries(
     for binary in &binaries {
         let src = src_dir.join(binary);
         let dst = install_dir.join(binary);
-
-        // Remove existing binary first
-        if dst.exists() {
-            std::fs::remove_file(&dst).map_err(|e| {
-                UpdateError::InstallFailed(format!("Failed to remove old {}: {}", binary, e))
-            })?;
-        }
-
-        // Move new binary
-        std::fs::rename(&src, &dst)
-            .or_else(|_| {
-                // If rename fails (cross-device), copy instead
-                std::fs::copy(&src, &dst)?;
-                std::fs::remove_file(&src)?;
-                Ok::<_, std::io::Error>(())
-            })
-            .map_err(|e| {
-                UpdateError::InstallFailed(format!("Failed to install {}: {}", binary, e))
-            })?;
-
-        // Make executable
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&dst)
-                .map_err(|e| {
-                    UpdateError::InstallFailed(format!("Failed to get permissions: {}", e))
-                })?
-                .permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&dst, perms).map_err(|e| {
-                UpdateError::InstallFailed(format!("Failed to set permissions: {}", e))
-            })?;
-        }
+        install_binary_from_payload(&src, &dst, binary)?;
     }
 
     Ok(binaries)
+}
+
+fn install_binary_from_payload(src: &Path, dst: &Path, binary: &str) -> Result<(), UpdateError> {
+    let staged = dst.with_file_name(format!(".{binary}.rch-update-{}", uuid::Uuid::new_v4()));
+
+    std::fs::copy(src, &staged).map_err(|e| {
+        UpdateError::InstallFailed(format!("Failed to stage {} for install: {}", binary, e))
+    })?;
+
+    if let Err(error) = set_update_binary_permissions(&staged) {
+        let _ = std::fs::remove_file(&staged);
+        return Err(error);
+    }
+    replace_staged_binary(&staged, dst, binary)
+}
+
+#[cfg(unix)]
+fn replace_staged_binary(staged: &Path, dst: &Path, binary: &str) -> Result<(), UpdateError> {
+    std::fs::rename(staged, dst).map_err(|e| {
+        let _ = std::fs::remove_file(staged);
+        UpdateError::InstallFailed(format!("Failed to install {}: {}", binary, e))
+    })
+}
+
+#[cfg(windows)]
+fn replace_staged_binary(staged: &Path, dst: &Path, binary: &str) -> Result<(), UpdateError> {
+    if dst.exists() {
+        std::fs::remove_file(dst).map_err(|e| {
+            let _ = std::fs::remove_file(staged);
+            UpdateError::InstallFailed(format!("Failed to remove old {}: {}", binary, e))
+        })?;
+    }
+
+    std::fs::rename(staged, dst).map_err(|e| {
+        let _ = std::fs::remove_file(staged);
+        UpdateError::InstallFailed(format!("Failed to install {}: {}", binary, e))
+    })
+}
+
+#[cfg(unix)]
+fn set_update_binary_permissions(path: &Path) -> Result<(), UpdateError> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(path)
+        .map_err(|e| UpdateError::InstallFailed(format!("Failed to get permissions: {}", e)))?
+        .permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(path, perms)
+        .map_err(|e| UpdateError::InstallFailed(format!("Failed to set permissions: {}", e)))
+}
+
+#[cfg(windows)]
+fn set_update_binary_permissions(_path: &Path) -> Result<(), UpdateError> {
+    Ok(())
 }
 
 /// Verify the installation by checking binary versions.
@@ -1061,6 +1081,33 @@ mod tests {
         assert!(
             !install_dir.join(optional_binary).exists(),
             "preflight failure must not partially install optional binaries"
+        );
+    }
+
+    #[test]
+    fn test_replace_binaries_replaces_existing_binary_after_staging() {
+        let temp = TempDir::new().unwrap();
+        let src_dir = temp.path().join("src");
+        let install_dir = temp.path().join("install");
+
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::create_dir_all(&install_dir).unwrap();
+        std::fs::write(src_dir.join(REQUIRED_UPDATE_BINARY), "new binary").unwrap();
+        std::fs::write(install_dir.join(REQUIRED_UPDATE_BINARY), "old binary").unwrap();
+
+        let installed = replace_binaries(&src_dir, &install_dir).unwrap();
+
+        assert_eq!(installed, vec![REQUIRED_UPDATE_BINARY]);
+        assert_eq!(
+            std::fs::read_to_string(install_dir.join(REQUIRED_UPDATE_BINARY)).unwrap(),
+            "new binary"
+        );
+        assert!(
+            std::fs::read_dir(&install_dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .all(|entry| !entry.file_name().to_string_lossy().contains(".rch-update-")),
+            "successful replacement should not leave staged update files"
         );
     }
 
