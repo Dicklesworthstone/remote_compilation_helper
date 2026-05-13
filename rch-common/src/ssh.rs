@@ -1111,13 +1111,13 @@ mod tests {
 
             // Multiple single quotes
             let result = shell_escape_value("'''");
-            assert!(result.is_some());
-            let escaped = match result {
-                Some(escaped) => escaped,
-                None => panic!("single quotes should be shell-escaped"),
-            };
             // shell_escape uses '\'' style for each single quote
-            assert_eq!(escaped.matches("'\\''").count(), 3);
+            assert_eq!(
+                result
+                    .as_deref()
+                    .map(|escaped| escaped.matches("'\\''").count()),
+                Some(3)
+            );
 
             // Unicode
             let result = shell_escape_value("日本語");
