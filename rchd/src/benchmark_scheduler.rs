@@ -961,7 +961,23 @@ async fn execute_benchmark_on_worker(
         }
     }
 
-    let status = child.wait().await?;
+    let status = match tokio::time::timeout(Duration::from_secs(5), child.wait()).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            return Err(anyhow::anyhow!(
+                "Failed to wait for benchmark process: {}",
+                e
+            ));
+        }
+        Err(_) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await; // Prevent zombie
+            return Err(anyhow::anyhow!(
+                "Benchmark process hung after closing output"
+            ));
+        }
+    };
+
     let exec_duration = start.elapsed();
 
     if !status.success() {
