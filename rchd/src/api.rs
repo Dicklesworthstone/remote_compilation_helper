@@ -4661,7 +4661,7 @@ mod tests {
         assert_eq!(response.status, "ok");
         assert_eq!(response.worker_id, "worker1");
         assert_eq!(response.action, "drain");
-        assert_eq!(response.new_status, Some("draining".to_string()));
+        assert_eq!(response.new_status, Some("drained".to_string()));
     }
 
     #[tokio::test]

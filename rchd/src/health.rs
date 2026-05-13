@@ -1635,6 +1635,7 @@ mod tests {
         .await;
 
         let worker = pool.get(&worker_id).await.unwrap();
+        assert!(worker.reserve_slots(1).await);
         worker.drain().await;
 
         let monitor = HealthMonitor::new(
