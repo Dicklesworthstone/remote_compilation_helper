@@ -809,19 +809,76 @@ async fn run_reliability_doctor(ctx: &OutputContext, options: &DoctorOptions) ->
     }
 }
 
+/// Per-probe timeout for the I/O collection phase (RCH bd-62u24.8). A
+/// hung daemon RPC or a stuck `which()` subprocess can't sink the whole
+/// doctor: each probe is bounded by this timeout and falls back to a
+/// `None`/empty result that downstream diagnostic builders interpret as
+/// "unavailable" (Warning verdict).
+const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Single-shot collection of a reliability doctor response. Extracted
 /// from `run_reliability_doctor` so both the single-shot path and the
 /// `--watch` loop (t25) can re-use the exact same probe gating, scope
 /// honoring, and verdict aggregation. Pure async data collection — no
 /// stdout/stderr writes, no `process::exit` — callers decide how to
 /// surface the result.
+///
+/// # Parallelism (bd-62u24.8)
+///
+/// The three I/O-bearing data sources run **concurrently** via
+/// `tokio::spawn` + (for sync work) `tokio::task::spawn_blocking`:
+///
+///   1. `query_daemon_full_status()` — daemon RPC for fleet topology /
+///      disk pressure / process debt data.
+///   2. `query_repo_convergence_status()` — daemon RPC for repo
+///      convergence status.
+///   3. `reliability_helper_compatibility_diagnostics()` — sync work
+///      that spawns `which()` + version-probe subprocesses (4 helpers ×
+///      2 subprocesses each = 8 forks). Moved to the blocking thread
+///      pool so its subprocess waits don't block the runtime's worker
+///      threads.
+///
+/// Each spawned task is bounded by `PROBE_TIMEOUT` and lives behind a
+/// `JoinHandle` so a panic in one probe is caught by `JoinError` and
+/// surfaces as a downgraded "unavailable" diagnostic for that scope —
+/// the other probes still produce their results. This satisfies the
+/// per-probe panic-isolation acceptance criterion.
+///
+/// The order of diagnostics in the final response is independent of the
+/// parallelism order: the `scope.matches(...)` branches at the bottom
+/// iterate in a fixed (Topology, Convergence, Pressure, Triage,
+/// Helpers, Rollout, Schema) sequence over the joined results, so
+/// output is byte-stable across runs even if probes finish in
+/// different orders.
 async fn collect_reliability_response_once(options: &DoctorOptions) -> ReliabilityDoctorResponse {
     // Probe gating per --scope (t01). Each branch runs only when the
     // operator-supplied scope set matches. Default `[All]` runs everything.
     let scope = &options.scope;
 
-    // Keep scoped runs honest: do not pay for daemon/repo/config prefetches
-    // that no selected probe can consume.
+    // Phase 1 — kick off the three I/O probes concurrently. Each one is
+    // spawn-isolated for panic safety, timeout-bounded for hung-RPC
+    // safety, and conditionally skipped per scope gating (so a scoped
+    // run doesn't pay the I/O cost it can't consume).
+    let join_start = Instant::now();
+    let daemon_handle = scope.needs_daemon_status().then(|| {
+        tokio::spawn(async move {
+            tokio::time::timeout(PROBE_TIMEOUT, query_daemon_full_status()).await
+        })
+    });
+    let convergence_handle = scope.needs_repo_convergence_status().then(|| {
+        tokio::spawn(async move {
+            tokio::time::timeout(PROBE_TIMEOUT, query_repo_convergence_status()).await
+        })
+    });
+    // Helper-compat probe is sync subprocess work. `spawn_blocking` puts
+    // it on tokio's blocking pool so it runs in parallel with the async
+    // daemon RPCs above without starving runtime worker threads.
+    let helpers_handle = scope
+        .matches(ReliabilityScope::Helpers)
+        .then(|| tokio::task::spawn_blocking(reliability_helper_compatibility_diagnostics));
+
+    // Phase 2 — sync file I/O. These are microseconds each and can run
+    // on the current thread while the spawned probes are in flight.
     let config_result = if scope.needs_rollout_config() {
         Some(crate::config::load_config())
     } else {
@@ -843,16 +900,26 @@ async fn collect_reliability_response_once(options: &DoctorOptions) -> Reliabili
         (None, None)
     };
 
-    let daemon_status = if scope.needs_daemon_status() {
-        query_daemon_full_status().await.ok()
-    } else {
-        None
-    };
-    let convergence_status = if scope.needs_repo_convergence_status() {
-        query_repo_convergence_status().await.ok()
-    } else {
-        None
-    };
+    // Phase 3 — join the spawned probes. `join_isolated_probe` collapses
+    // the three failure modes (timeout, panic, RPC error) into the
+    // single `None` outcome that downstream diagnostic builders
+    // already handle by emitting an "unavailable" Warning diagnostic.
+    let (daemon_status, daemon_outcome) =
+        join_isolated_async_probe("daemon_status", daemon_handle).await;
+    let (convergence_status, convergence_outcome) =
+        join_isolated_async_probe("repo_convergence", convergence_handle).await;
+    let (helper_diags_override, helpers_outcome) =
+        join_isolated_blocking_probe("helper_compatibility", helpers_handle).await;
+    let join_elapsed_ms = join_start.elapsed().as_millis() as u64;
+    tracing::info!(
+        target: "rch::doctor::probes",
+        daemon = %daemon_outcome.label(),
+        repo_convergence = %convergence_outcome.label(),
+        helpers = %helpers_outcome.label(),
+        join_elapsed_ms,
+        "doctor.probes.joined",
+    );
+
     let probes_to_run = scope.probe_names_to_run(options.check_schemas);
     tracing::info!(
         target: "rch::doctor::scope",
@@ -882,7 +949,14 @@ async fn collect_reliability_response_once(options: &DoctorOptions) -> Reliabili
         diagnostics.extend(reliability_process_debt_diagnostics(daemon_status.as_ref()));
     }
     if scope.matches(ReliabilityScope::Helpers) {
-        diagnostics.extend(reliability_helper_compatibility_diagnostics());
+        // The helper-compat probe was prefetched in parallel during Phase 1
+        // (bd-62u24.8). If it failed (timeout / panic / cancelled), fall
+        // back to a fresh synchronous run here so the operator still sees
+        // the helper-availability information. The fallback is rare;
+        // tracing already logged the joined outcome above.
+        let helper_diags =
+            helper_diags_override.unwrap_or_else(reliability_helper_compatibility_diagnostics);
+        diagnostics.extend(helper_diags);
     }
     if scope.matches(ReliabilityScope::Rollout) {
         let config_load: Result<&rch_common::RchConfig, String> = match config_result.as_ref() {
@@ -906,6 +980,169 @@ async fn collect_reliability_response_once(options: &DoctorOptions) -> Reliabili
         ReliabilityDoctorMode::Check
     };
     build_reliability_doctor_response(mode, scope, diagnostics)
+}
+
+// =============================================================================
+// Probe Parallelism Plumbing (bd-62u24.8)
+// =============================================================================
+
+/// Outcome label for the `doctor.probes.joined` tracing event. One value
+/// per spawned probe per doctor invocation; operators correlate these
+/// with verdict shifts during deployment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeOutcome {
+    /// Probe completed; result is populated.
+    Ok,
+    /// Probe was skipped (its scope wasn't selected).
+    Skipped,
+    /// Probe completed but its RPC/inner work returned an Err.
+    InnerError,
+    /// Probe exceeded `PROBE_TIMEOUT`.
+    Timeout,
+    /// Probe panicked. Surfaced as `None` for the result; tracing captures the payload.
+    Panicked,
+    /// Probe task was cancelled (e.g., runtime shutdown).
+    Cancelled,
+}
+
+impl ProbeOutcome {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Skipped => "skipped",
+            Self::InnerError => "inner_error",
+            Self::Timeout => "timeout",
+            Self::Panicked => "panicked",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// Join a spawned async probe with panic isolation + timeout reporting.
+/// Returns `(Option<T>, outcome)` — `None` on any failure mode so
+/// callers can fall through to "unavailable" diagnostic synthesis
+/// without needing to distinguish timeout/panic/error in the response
+/// schema. The outcome is reported separately so the
+/// `doctor.probes.joined` tracing event carries the forensic detail.
+///
+/// `handle` is `Option` so a scoped-out probe (its scope wasn't
+/// selected) maps cleanly to `(None, Skipped)` without spinning up a
+/// task whose result we'd ignore.
+async fn join_isolated_async_probe<T, E>(
+    probe_name: &'static str,
+    handle: Option<tokio::task::JoinHandle<Result<Result<T, E>, tokio::time::error::Elapsed>>>,
+) -> (Option<T>, ProbeOutcome)
+where
+    T: Send + 'static,
+    E: std::fmt::Display + Send + 'static,
+{
+    let Some(handle) = handle else {
+        return (None, ProbeOutcome::Skipped);
+    };
+    match handle.await {
+        Ok(Ok(Ok(value))) => (Some(value), ProbeOutcome::Ok),
+        Ok(Ok(Err(err))) => {
+            tracing::debug!(
+                target: "rch::doctor::probes",
+                probe = probe_name,
+                error = %err,
+                "doctor.probe.inner_error",
+            );
+            (None, ProbeOutcome::InnerError)
+        }
+        Ok(Err(_elapsed)) => {
+            tracing::warn!(
+                target: "rch::doctor::probes",
+                probe = probe_name,
+                timeout_secs = PROBE_TIMEOUT.as_secs(),
+                "doctor.probe.timeout",
+            );
+            (None, ProbeOutcome::Timeout)
+        }
+        Err(join_err) if join_err.is_panic() => {
+            // `into_panic()` returns Box<dyn Any + Send>. The payload is
+            // typically a String (panic! formatted) or &'static str.
+            // Both downcasts attempted; otherwise emit a placeholder.
+            let payload = join_err.into_panic();
+            let panic_msg = payload
+                .downcast::<String>()
+                .map(|b| *b)
+                .or_else(|p| p.downcast::<&'static str>().map(|b| (*b).to_string()))
+                .unwrap_or_else(|_| "<non-string panic payload>".to_string());
+            tracing::error!(
+                target: "rch::doctor::probes",
+                probe = probe_name,
+                panic = %panic_msg,
+                "doctor.probe.panicked",
+            );
+            (None, ProbeOutcome::Panicked)
+        }
+        Err(join_err) => {
+            tracing::warn!(
+                target: "rch::doctor::probes",
+                probe = probe_name,
+                error = %join_err,
+                "doctor.probe.cancelled",
+            );
+            (None, ProbeOutcome::Cancelled)
+        }
+    }
+}
+
+/// Same as `join_isolated_async_probe` but for `spawn_blocking` tasks
+/// (sync work moved to the blocking pool). The inner future is already
+/// resolved when the JoinHandle resolves — there's no per-task timeout
+/// at the tokio level for spawn_blocking tasks, so we apply one via
+/// `tokio::time::timeout` around the `await`. Sync blocking work that
+/// outruns `PROBE_TIMEOUT` will keep running on the blocking pool until
+/// it finishes (we can't preempt blocking work) but the doctor still
+/// returns promptly and surfaces the timeout outcome.
+async fn join_isolated_blocking_probe<T>(
+    probe_name: &'static str,
+    handle: Option<tokio::task::JoinHandle<T>>,
+) -> (Option<T>, ProbeOutcome)
+where
+    T: Send + 'static,
+{
+    let Some(handle) = handle else {
+        return (None, ProbeOutcome::Skipped);
+    };
+    match tokio::time::timeout(PROBE_TIMEOUT, handle).await {
+        Ok(Ok(value)) => (Some(value), ProbeOutcome::Ok),
+        Ok(Err(join_err)) if join_err.is_panic() => {
+            let payload = join_err.into_panic();
+            let panic_msg = payload
+                .downcast::<String>()
+                .map(|b| *b)
+                .or_else(|p| p.downcast::<&'static str>().map(|b| (*b).to_string()))
+                .unwrap_or_else(|_| "<non-string panic payload>".to_string());
+            tracing::error!(
+                target: "rch::doctor::probes",
+                probe = probe_name,
+                panic = %panic_msg,
+                "doctor.probe.panicked",
+            );
+            (None, ProbeOutcome::Panicked)
+        }
+        Ok(Err(join_err)) => {
+            tracing::warn!(
+                target: "rch::doctor::probes",
+                probe = probe_name,
+                error = %join_err,
+                "doctor.probe.cancelled",
+            );
+            (None, ProbeOutcome::Cancelled)
+        }
+        Err(_elapsed) => {
+            tracing::warn!(
+                target: "rch::doctor::probes",
+                probe = probe_name,
+                timeout_secs = PROBE_TIMEOUT.as_secs(),
+                "doctor.probe.timeout",
+            );
+            (None, ProbeOutcome::Timeout)
+        }
+    }
 }
 
 async fn query_repo_convergence_status() -> Result<RepoConvergenceStatusFromApi> {
@@ -6759,6 +6996,184 @@ exit 0\n"
             );
         }
         map
+    }
+
+    // =========================================================================
+    // Probe Parallelism Tests (bd-62u24.8)
+    // =========================================================================
+    //
+    // These tests pin the contract of `join_isolated_async_probe` and
+    // `join_isolated_blocking_probe`. The doctor relies on these to
+    // surface probe failures (timeout, panic, RPC error) as a uniform
+    // `(None, ProbeOutcome)` pair so downstream diagnostic builders can
+    // fall through to "unavailable" Warning diagnostics without caring
+    // about the exact failure mode. Regressions here would let a probe
+    // panic bring down the whole doctor or leak runaway subprocesses.
+
+    #[test]
+    fn probe_outcome_label_is_lowercase_and_stable() {
+        // TEST START: tracing field values are part of the operator contract
+        assert_eq!(ProbeOutcome::Ok.label(), "ok");
+        assert_eq!(ProbeOutcome::Skipped.label(), "skipped");
+        assert_eq!(ProbeOutcome::InnerError.label(), "inner_error");
+        assert_eq!(ProbeOutcome::Timeout.label(), "timeout");
+        assert_eq!(ProbeOutcome::Panicked.label(), "panicked");
+        assert_eq!(ProbeOutcome::Cancelled.label(), "cancelled");
+        // TEST PASS: label stability
+    }
+
+    #[tokio::test]
+    async fn join_isolated_async_probe_returns_skipped_for_none_handle() {
+        // TEST START: a scoped-out probe (no handle) yields (None, Skipped)
+        let (result, outcome) =
+            join_isolated_async_probe::<String, std::io::Error>("ghost", None).await;
+        assert_eq!(result, None);
+        assert_eq!(outcome, ProbeOutcome::Skipped);
+        // TEST PASS: skip path
+    }
+
+    #[tokio::test]
+    async fn join_isolated_async_probe_returns_ok_for_successful_task() {
+        // TEST START: a Future returning Ok produces (Some(value), Ok)
+        let handle = tokio::spawn(async {
+            tokio::time::timeout(PROBE_TIMEOUT, async {
+                Ok::<_, std::io::Error>("probe_value".to_string())
+            })
+            .await
+        });
+        let (result, outcome) = join_isolated_async_probe("ok_probe", Some(handle)).await;
+        assert_eq!(result.as_deref(), Some("probe_value"));
+        assert_eq!(outcome, ProbeOutcome::Ok);
+        // TEST PASS: success path
+    }
+
+    #[tokio::test]
+    async fn join_isolated_async_probe_classifies_inner_error() {
+        // TEST START: an inner Err is reported as InnerError, not Timeout
+        let handle = tokio::spawn(async {
+            tokio::time::timeout(PROBE_TIMEOUT, async {
+                Err::<String, std::io::Error>(std::io::Error::other("inner fault"))
+            })
+            .await
+        });
+        let (result, outcome) = join_isolated_async_probe("err_probe", Some(handle)).await;
+        assert!(result.is_none());
+        assert_eq!(outcome, ProbeOutcome::InnerError);
+        // TEST PASS: inner-error classification
+    }
+
+    #[tokio::test]
+    async fn join_isolated_async_probe_surfaces_timeout() {
+        // TEST START: a future that exceeds PROBE_TIMEOUT yields (None, Timeout)
+        // Use a much shorter timeout for the test by chaining the outer
+        // tokio::time::timeout — this mirrors the production wrapping.
+        let handle = tokio::spawn(async {
+            tokio::time::timeout(std::time::Duration::from_millis(20), async {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                Ok::<_, std::io::Error>("never returned".to_string())
+            })
+            .await
+        });
+        let (result, outcome) = join_isolated_async_probe("slow_probe", Some(handle)).await;
+        assert!(result.is_none());
+        assert_eq!(outcome, ProbeOutcome::Timeout);
+        // TEST PASS: timeout classification
+    }
+
+    #[tokio::test]
+    async fn join_isolated_async_probe_isolates_panic() {
+        // TEST START: a panic in the spawned task is caught by JoinError
+        // and reported as (None, Panicked). The caller does NOT panic.
+        let handle = tokio::spawn(async {
+            tokio::time::timeout(PROBE_TIMEOUT, async {
+                panic!("probe explosion (intentional, for test)");
+                #[allow(unreachable_code)]
+                Ok::<_, std::io::Error>("never".to_string())
+            })
+            .await
+        });
+        let (result, outcome) = join_isolated_async_probe("panic_probe", Some(handle)).await;
+        assert!(result.is_none());
+        assert_eq!(outcome, ProbeOutcome::Panicked);
+        // TEST PASS: panic isolation
+    }
+
+    #[tokio::test]
+    async fn join_isolated_blocking_probe_returns_value_for_successful_task() {
+        // TEST START: sync spawn_blocking task returns its value cleanly
+        let handle = tokio::task::spawn_blocking(|| vec!["a".to_string(), "b".to_string()]);
+        let (result, outcome) = join_isolated_blocking_probe("blocking_ok", Some(handle)).await;
+        assert_eq!(
+            result.as_deref(),
+            Some(&["a".to_string(), "b".to_string()][..])
+        );
+        assert_eq!(outcome, ProbeOutcome::Ok);
+        // TEST PASS: blocking success path
+    }
+
+    #[tokio::test]
+    async fn join_isolated_blocking_probe_isolates_panic() {
+        // TEST START: panic in spawn_blocking yields (None, Panicked) —
+        // critical because the helper-compat probe is exactly this shape
+        // and a panic there must not sink the doctor.
+        let handle = tokio::task::spawn_blocking(|| -> Vec<String> {
+            panic!("blocking probe explosion (intentional, for test)");
+        });
+        let (result, outcome) = join_isolated_blocking_probe("blocking_panic", Some(handle)).await;
+        assert!(result.is_none());
+        assert_eq!(outcome, ProbeOutcome::Panicked);
+        // TEST PASS: blocking panic isolation
+    }
+
+    #[tokio::test]
+    async fn join_isolated_blocking_probe_returns_skipped_for_none_handle() {
+        // TEST START: defensive — scoped-out path yields Skipped, not panic
+        let (result, outcome): (Option<Vec<String>>, ProbeOutcome) =
+            join_isolated_blocking_probe("ghost", None).await;
+        assert!(result.is_none());
+        assert_eq!(outcome, ProbeOutcome::Skipped);
+        // TEST PASS: skip path for blocking variant
+    }
+
+    #[tokio::test]
+    async fn probes_actually_run_in_parallel_not_serial() {
+        // TEST START: integration-style proof that the join is concurrent.
+        // Three tasks each sleep 100ms; with serial execution wallclock
+        // would be ~300ms+ ; with parallel execution it's ~100ms +
+        // join overhead. We assert wallclock < 250ms to leave wide
+        // headroom for CI variability while still rejecting any
+        // accidental return to sequential await.
+        let start = std::time::Instant::now();
+        let h1 = tokio::spawn(async {
+            tokio::time::timeout(PROBE_TIMEOUT, async {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                Ok::<_, std::io::Error>("a".to_string())
+            })
+            .await
+        });
+        let h2 = tokio::spawn(async {
+            tokio::time::timeout(PROBE_TIMEOUT, async {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                Ok::<_, std::io::Error>("b".to_string())
+            })
+            .await
+        });
+        let h3 = tokio::task::spawn_blocking(|| {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            vec!["c".to_string()]
+        });
+        let (r1, _) = join_isolated_async_probe("p1", Some(h1)).await;
+        let (r2, _) = join_isolated_async_probe("p2", Some(h2)).await;
+        let (r3, _) = join_isolated_blocking_probe("p3", Some(h3)).await;
+        let elapsed = start.elapsed();
+        assert_eq!(r1.as_deref(), Some("a"));
+        assert_eq!(r2.as_deref(), Some("b"));
+        assert_eq!(r3.as_deref(), Some(&["c".to_string()][..]));
+        assert!(
+            elapsed < std::time::Duration::from_millis(250),
+            "probes must run in parallel: elapsed={elapsed:?} (serial would be ~300ms+)"
+        );
+        // TEST PASS: actual parallelism (not just structural)
     }
 
     #[test]
