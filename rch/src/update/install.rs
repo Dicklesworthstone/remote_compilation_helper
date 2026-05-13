@@ -5,8 +5,10 @@ use super::lock::UpdateLock;
 use super::types::{BackupEntry, MAX_BACKUPS, UpdateError};
 use crate::commands::{configured_socket_path, send_daemon_command};
 use crate::ui::OutputContext;
+use flate2::read::GzDecoder;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::io::{self, Read};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 const UPDATE_BINARIES: &[&str] = &["rch", "rchd", "rch-wkr"];
@@ -370,20 +372,122 @@ fn extract_archive(archive: &std::path::Path, dest: &std::path::Path) -> Result<
     std::fs::create_dir_all(dest)
         .map_err(|e| UpdateError::InstallFailed(format!("Failed to create extract dir: {}", e)))?;
 
-    let output = Command::new("tar")
-        .arg("-xzf")
-        .arg(archive)
-        .arg("-C")
-        .arg(dest)
-        .output()
-        .map_err(|e| UpdateError::InstallFailed(format!("Failed to run tar: {}", e)))?;
+    let archive_file = fs::File::open(archive).map_err(|e| {
+        UpdateError::InstallFailed(format!(
+            "Failed to open update archive {}: {}",
+            archive.display(),
+            e
+        ))
+    })?;
+    let decoder = GzDecoder::new(archive_file);
+    let mut tar = tar::Archive::new(decoder);
+    let entries = tar
+        .entries()
+        .map_err(|e| UpdateError::InstallFailed(format!("Failed to read archive: {}", e)))?;
 
-    if !output.status.success() {
-        return Err(UpdateError::InstallFailed(format!(
-            "tar extraction failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )));
+    for entry in entries {
+        let mut entry = entry
+            .map_err(|e| UpdateError::InstallFailed(format!("Invalid archive entry: {}", e)))?;
+        let entry_type = entry.header().entry_type();
+        let entry_path = entry
+            .path()
+            .map_err(|e| UpdateError::InstallFailed(format!("Invalid archive path: {}", e)))?;
+        let relative_path = safe_archive_entry_path(&entry_path)?;
+        let destination = dest.join(&relative_path);
+
+        if entry_type.is_dir() {
+            fs::create_dir_all(&destination).map_err(|e| {
+                UpdateError::InstallFailed(format!(
+                    "Failed to create extracted directory {}: {}",
+                    relative_path.display(),
+                    e
+                ))
+            })?;
+        } else if entry_type.is_file() {
+            unpack_regular_file(&mut entry, &relative_path, &destination)?;
+        } else {
+            return Err(UpdateError::InstallFailed(format!(
+                "Unsupported update archive entry type for {}",
+                relative_path.display()
+            )));
+        }
     }
+
+    Ok(())
+}
+
+fn safe_archive_entry_path(path: &Path) -> Result<PathBuf, UpdateError> {
+    let mut safe_path = PathBuf::new();
+
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => {
+                let Some(part) = part.to_str() else {
+                    return Err(UpdateError::InstallFailed(format!(
+                        "Archive entry path is not UTF-8: {}",
+                        path.display()
+                    )));
+                };
+                if part.contains('\\') || part.contains('\0') {
+                    return Err(UpdateError::InstallFailed(format!(
+                        "Unsafe archive entry path: {}",
+                        path.display()
+                    )));
+                }
+                safe_path.push(part);
+            }
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(UpdateError::InstallFailed(format!(
+                    "Unsafe archive entry path: {}",
+                    path.display()
+                )));
+            }
+        }
+    }
+
+    if safe_path.as_os_str().is_empty() {
+        return Err(UpdateError::InstallFailed(
+            "Archive entry path is empty".to_string(),
+        ));
+    }
+
+    Ok(safe_path)
+}
+
+fn unpack_regular_file<R: Read>(
+    entry: &mut tar::Entry<'_, R>,
+    relative_path: &Path,
+    destination: &Path,
+) -> Result<(), UpdateError> {
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent).map_err(|e| {
+            UpdateError::InstallFailed(format!(
+                "Failed to create extracted parent for {}: {}",
+                relative_path.display(),
+                e
+            ))
+        })?;
+    }
+
+    let mut output = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)
+        .map_err(|e| {
+            UpdateError::InstallFailed(format!(
+                "Failed to create extracted file {}: {}",
+                relative_path.display(),
+                e
+            ))
+        })?;
+    io::copy(entry, &mut output).map_err(|e| {
+        UpdateError::InstallFailed(format!(
+            "Failed to extract file {}: {}",
+            relative_path.display(),
+            e
+        ))
+    })?;
 
     Ok(())
 }
@@ -601,7 +705,78 @@ fn shutdown_poll_attempts(timeout_secs: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use std::io::Cursor;
     use tempfile::TempDir;
+
+    fn create_tar_gz_with_entries(
+        archive_path: &Path,
+        entries: &[(&str, &[u8])],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let file = fs::File::create(archive_path)?;
+        let encoder = GzEncoder::new(file, Compression::default());
+        let mut builder = tar::Builder::new(encoder);
+
+        for (path, content) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_path(path)?;
+            header.set_size(u64::try_from(content.len())?);
+            header.set_cksum();
+            builder.append(&header, Cursor::new(*content))?;
+        }
+
+        builder.finish()?;
+        let encoder = builder.into_inner()?;
+        encoder.finish()?;
+        Ok(())
+    }
+
+    fn create_tar_gz_with_raw_path(
+        archive_path: &Path,
+        raw_path: &[u8],
+        content: &[u8],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let file = fs::File::create(archive_path)?;
+        let encoder = GzEncoder::new(file, Compression::default());
+        let mut builder = tar::Builder::new(encoder);
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_size(u64::try_from(content.len())?);
+        header.set_mode(0o755);
+        let path_field = header
+            .as_mut_bytes()
+            .get_mut(0..raw_path.len())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "raw tar path too long"))?;
+        path_field.copy_from_slice(raw_path);
+        header.set_cksum();
+        builder.append(&header, Cursor::new(content))?;
+        builder.finish()?;
+        let encoder = builder.into_inner()?;
+        encoder.finish()?;
+        Ok(())
+    }
+
+    fn create_tar_gz_with_symlink(
+        archive_path: &Path,
+        link_path: &str,
+        target_path: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let file = fs::File::create(archive_path)?;
+        let encoder = GzEncoder::new(file, Compression::default());
+        let mut builder = tar::Builder::new(encoder);
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Symlink);
+        header.set_path(link_path)?;
+        header.set_link_name(target_path)?;
+        header.set_size(0);
+        header.set_cksum();
+        builder.append(&header, io::empty())?;
+        builder.finish()?;
+        let encoder = builder.into_inner()?;
+        encoder.finish()?;
+        Ok(())
+    }
 
     #[test]
     fn test_get_install_dir() {
@@ -772,6 +947,83 @@ mod tests {
                 .to_string_lossy()
                 .starts_with("rch-extract-")
         );
+    }
+
+    #[test]
+    fn test_extract_archive_extracts_regular_files() {
+        let temp = TempDir::new().unwrap();
+        let archive_path = temp.path().join("rch.tar.gz");
+        let dest = temp.path().join("extract");
+        create_tar_gz_with_entries(
+            &archive_path,
+            &[("rch", b"hook binary"), ("nested/rchd", b"daemon binary")],
+        )
+        .unwrap();
+
+        extract_archive(&archive_path, &dest).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(dest.join("rch")).unwrap(),
+            "hook binary"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dest.join("nested/rchd")).unwrap(),
+            "daemon binary"
+        );
+    }
+
+    #[test]
+    fn test_extract_archive_rejects_parent_traversal() {
+        let temp = TempDir::new().unwrap();
+        let archive_path = temp.path().join("rch.tar.gz");
+        let dest = temp.path().join("extract");
+        let outside = temp.path().join("outside-rch");
+        create_tar_gz_with_raw_path(&archive_path, b"../outside-rch", b"escape").unwrap();
+
+        let result = extract_archive(&archive_path, &dest);
+
+        assert!(matches!(result, Err(UpdateError::InstallFailed(_))));
+        assert!(
+            !outside.exists(),
+            "traversal entry must not write outside extract root"
+        );
+    }
+
+    #[test]
+    fn test_extract_archive_rejects_absolute_paths() {
+        let temp = TempDir::new().unwrap();
+        let archive_path = temp.path().join("rch.tar.gz");
+        let dest = temp.path().join("extract");
+        create_tar_gz_with_raw_path(&archive_path, b"/tmp/rch-escape", b"escape").unwrap();
+
+        let result = extract_archive(&archive_path, &dest);
+
+        assert!(matches!(result, Err(UpdateError::InstallFailed(_))));
+    }
+
+    #[test]
+    fn test_extract_archive_rejects_backslash_paths() {
+        let temp = TempDir::new().unwrap();
+        let archive_path = temp.path().join("rch.tar.gz");
+        let dest = temp.path().join("extract");
+        create_tar_gz_with_entries(&archive_path, &[("nested\\rch", b"binary")]).unwrap();
+
+        let result = extract_archive(&archive_path, &dest);
+
+        assert!(matches!(result, Err(UpdateError::InstallFailed(_))));
+    }
+
+    #[test]
+    fn test_extract_archive_rejects_symlink_entries() {
+        let temp = TempDir::new().unwrap();
+        let archive_path = temp.path().join("rch.tar.gz");
+        let dest = temp.path().join("extract");
+        create_tar_gz_with_symlink(&archive_path, "rch", "/tmp/rch-target").unwrap();
+
+        let result = extract_archive(&archive_path, &dest);
+
+        assert!(matches!(result, Err(UpdateError::InstallFailed(_))));
+        assert!(!dest.join("rch").exists());
     }
 
     #[test]
