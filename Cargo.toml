@@ -63,7 +63,7 @@ rand = "0.10.0"
 # Compression
 zstd = "0.13.3"
 flate2 = "1.1.9"
-tar = "0.4.45"
+tar = { version = "0.4.45", default-features = false }
 
 # Time formatting for mock transport logging
 chrono = { version = "0.4.43", features = ["serde"] }

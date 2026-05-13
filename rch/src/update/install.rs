@@ -56,14 +56,14 @@ pub async fn install_update(
     let backup_dir = backup_entry.backup_path;
 
     // Extract new binaries to temp location
-    let temp_extract = new_update_extract_dir();
-    extract_archive(&download.archive_path, &temp_extract)?;
+    let temp_extract = UpdateExtractDir::new();
+    extract_archive(&download.archive_path, temp_extract.path())?;
 
     // Atomic replace: move new binaries to install dir
     if !ctx.is_json() {
         println!("Installing new binaries...");
     }
-    let _installed_binaries = replace_binaries(&temp_extract, &install_dir)?;
+    let _installed_binaries = replace_binaries(temp_extract.path(), &install_dir)?;
 
     // Verify new binaries work
     verify_installation(&install_dir)?;
@@ -78,9 +78,6 @@ pub async fn install_update(
     } else {
         false
     };
-
-    // Clean up temp files
-    let _ = std::fs::remove_dir_all(&temp_extract);
 
     Ok(InstallResult {
         backup_path: backup_dir,
@@ -367,9 +364,31 @@ fn new_update_extract_dir() -> PathBuf {
     std::env::temp_dir().join(format!("rch-extract-{}", uuid::Uuid::new_v4()))
 }
 
+struct UpdateExtractDir {
+    path: PathBuf,
+}
+
+impl UpdateExtractDir {
+    fn new() -> Self {
+        Self {
+            path: new_update_extract_dir(),
+        }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for UpdateExtractDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
 /// Extract archive to destination.
 fn extract_archive(archive: &std::path::Path, dest: &std::path::Path) -> Result<(), UpdateError> {
-    std::fs::create_dir_all(dest)
+    std::fs::create_dir(dest)
         .map_err(|e| UpdateError::InstallFailed(format!("Failed to create extract dir: {}", e)))?;
 
     let archive_file = fs::File::open(archive).map_err(|e| {
@@ -950,6 +969,21 @@ mod tests {
     }
 
     #[test]
+    fn test_update_extract_dir_cleans_on_drop() {
+        let path = {
+            let dir = UpdateExtractDir::new();
+            fs::create_dir(dir.path()).unwrap();
+            fs::write(dir.path().join("partial"), "partial extraction").unwrap();
+            dir.path().to_path_buf()
+        };
+
+        assert!(
+            !path.exists(),
+            "temporary extraction directory should be removed on drop"
+        );
+    }
+
+    #[test]
     fn test_extract_archive_extracts_regular_files() {
         let temp = TempDir::new().unwrap();
         let archive_path = temp.path().join("rch.tar.gz");
@@ -1024,6 +1058,23 @@ mod tests {
 
         assert!(matches!(result, Err(UpdateError::InstallFailed(_))));
         assert!(!dest.join("rch").exists());
+    }
+
+    #[test]
+    fn test_extract_archive_rejects_preexisting_destination() {
+        let temp = TempDir::new().unwrap();
+        let archive_path = temp.path().join("rch.tar.gz");
+        let dest = temp.path().join("extract");
+        create_tar_gz_with_entries(&archive_path, &[("rch", b"binary")]).unwrap();
+        fs::create_dir(&dest).unwrap();
+
+        let result = extract_archive(&archive_path, &dest);
+
+        assert!(matches!(result, Err(UpdateError::InstallFailed(_))));
+        assert!(
+            !dest.join("rch").exists(),
+            "existing extraction root must not be reused"
+        );
     }
 
     #[test]
