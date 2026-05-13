@@ -189,9 +189,48 @@ impl Ord for Version {
             (None, None) => Ordering::Equal,
             (Some(_), None) => Ordering::Less,
             (None, Some(_)) => Ordering::Greater,
-            (Some(a), Some(b)) => a.cmp(b),
+            (Some(a), Some(b)) => cmp_prerelease(a, b),
         }
     }
+}
+
+fn cmp_prerelease(left: &str, right: &str) -> Ordering {
+    let mut left_parts = left.split('.');
+    let mut right_parts = right.split('.');
+
+    loop {
+        match (left_parts.next(), right_parts.next()) {
+            (Some(left_part), Some(right_part)) => {
+                let ordering = cmp_prerelease_identifier(left_part, right_part);
+                if ordering != Ordering::Equal {
+                    return ordering;
+                }
+            }
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+        }
+    }
+}
+
+fn cmp_prerelease_identifier(left: &str, right: &str) -> Ordering {
+    match (numeric_identifier(left), numeric_identifier(right)) {
+        (Some(left_num), Some(right_num)) => cmp_numeric_identifier(left_num, right_num),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => left.cmp(right),
+    }
+}
+
+fn numeric_identifier(identifier: &str) -> Option<&str> {
+    if identifier.is_empty() || !identifier.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    Some(identifier)
+}
+
+fn cmp_numeric_identifier(left: &str, right: &str) -> Ordering {
+    left.len().cmp(&right.len()).then_with(|| left.cmp(right))
 }
 
 /// Information about a GitHub release.
@@ -473,6 +512,52 @@ mod tests {
         assert!(alpha < beta); // alpha < beta lexicographically
         assert!(beta < release); // prerelease < release
         assert!(alpha < release);
+    }
+
+    #[test]
+    fn test_version_prerelease_numeric_identifiers_order_semver() {
+        let beta_2 = Version::parse("1.0.0-beta.2").unwrap();
+        let beta_10 = Version::parse("1.0.0-beta.10").unwrap();
+        let rc_1 = Version::parse("1.0.0-rc.1").unwrap();
+        let rc_2 = Version::parse("1.0.0-rc.2").unwrap();
+
+        assert!(beta_2 < beta_10);
+        assert!(rc_1 < rc_2);
+    }
+
+    #[test]
+    fn test_version_prerelease_numeric_identifiers_do_not_overflow() {
+        let lower = Version::parse("1.0.0-beta.99999999999999999999999999999999999999").unwrap();
+        let higher = Version::parse("1.0.0-beta.100000000000000000000000000000000000000").unwrap();
+
+        assert!(lower < higher);
+    }
+
+    #[test]
+    fn test_version_prerelease_numeric_identifiers_keep_noncanonical_forms_distinct() {
+        let beta_1 = Version::parse("1.0.0-beta.1").unwrap();
+        let beta_01 = Version::parse("1.0.0-beta.01").unwrap();
+
+        assert_ne!(beta_1, beta_01);
+        assert!(beta_1 < beta_01);
+    }
+
+    #[test]
+    fn test_version_prerelease_numeric_identifiers_sort_before_text() {
+        let alpha_1 = Version::parse("1.0.0-alpha.1").unwrap();
+        let alpha_beta = Version::parse("1.0.0-alpha.beta").unwrap();
+
+        assert!(alpha_1 < alpha_beta);
+    }
+
+    #[test]
+    fn test_version_prerelease_longer_identifier_list_has_higher_precedence() {
+        let beta = Version::parse("1.0.0-beta").unwrap();
+        let beta_2 = Version::parse("1.0.0-beta.2").unwrap();
+        let beta_2_1 = Version::parse("1.0.0-beta.2.1").unwrap();
+
+        assert!(beta < beta_2);
+        assert!(beta_2 < beta_2_1);
     }
 
     #[test]
