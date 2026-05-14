@@ -631,7 +631,7 @@ fn is_retryable_webhook_error(error: &str) -> bool {
 
 /// Compute HMAC-SHA256 signature for webhook payload.
 fn compute_hmac_signature(body: &str, secret: &str) -> String {
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha256;
 
     type HmacSha256 = Hmac<Sha256>;

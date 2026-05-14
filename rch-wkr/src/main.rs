@@ -1015,10 +1015,3 @@ mod tests {
         std::fs::remove_dir_all(&base).expect("cleanup temp topology");
     }
 }
-
-// Global test logging initialization - enables JSONL output for all unit tests
-#[cfg(test)]
-#[ctor::ctor]
-fn init_test_logging() {
-    rch_common::testing::init_global_test_logging();
-}

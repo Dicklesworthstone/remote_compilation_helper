@@ -1316,7 +1316,6 @@ mod tests {
 
 // Global test logging initialization - enables JSONL output for all unit tests
 #[cfg(test)]
-#[ctor::ctor]
 fn init_test_logging() {
     rch_common::testing::init_global_test_logging();
 }

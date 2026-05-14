@@ -619,9 +619,7 @@ impl OutputContext {
             }
             OutputFormat::Toon => {
                 let json_value = serde_json::to_value(value)?;
-                // toon_rust::encode works with serde_json::Value directly
-                toon_rust::encode(&json_value, None)
-                    .map_err(|e| serde_json::Error::io(std::io::Error::other(e.to_string())))
+                Ok(toon_rust::encode(json_value, None))
             }
         }
     }
@@ -764,8 +762,7 @@ mod tests {
         ctx.json(&value).unwrap();
 
         let output = stdout_buf.to_string_lossy();
-        // toon_rust::decode returns Result<serde_json::Value, Error>
-        let decoded_json = toon_rust::decode(&output, None).unwrap();
+        let decoded_json = serde_json::Value::from(toon_rust::decode(&output, None));
         let expected = serde_json::to_value(&value).unwrap();
         assert!(
             json_values_loose_eq(&decoded_json, &expected),
