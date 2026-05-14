@@ -12,7 +12,7 @@ import {
   Tooltip,
 } from 'recharts';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-import { Activity, Server } from 'lucide-react';
+import { Activity } from 'lucide-react';
 import type { WorkerStatusInfo, SpeedScoreView } from '@/lib/types';
 
 interface ComparisonRadarProps {

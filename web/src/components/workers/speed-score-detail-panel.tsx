@@ -281,7 +281,7 @@ export function SpeedScoreDetailPanel({
       className="speedscore-detail-panel"
       role="region"
       aria-labelledby={`panel-title-${workerId}`}
-      aria-expanded={isExpanded}
+      data-expanded={isExpanded}
       data-testid="speedscore-detail-panel"
     >
       <CardHeader

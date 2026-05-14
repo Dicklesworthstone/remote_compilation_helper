@@ -1,11 +1,10 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+import { render, screen, fireEvent } from '@testing-library/react';
 import {
   SpeedScoreDetailPanel,
   SpeedScoreDetailPanelSkeleton,
   SpeedScoreDetailPanelError,
   SpeedScoreDetailPanelEmpty,
-  SpeedScoreDetailPanelPartial,
   TotalScoreBadge,
 } from './speed-score-detail-panel';
 import { ComponentRow } from './component-row';
@@ -431,7 +430,7 @@ describe('SpeedScoreDetailPanel', () => {
       );
 
       const panel = screen.getByRole('region');
-      expect(panel).toHaveAttribute('aria-expanded', 'true');
+      expect(panel).toHaveAttribute('data-expanded', 'true');
       expect(panel).toHaveAttribute('aria-labelledby', 'panel-title-css');
     });
 

@@ -21,15 +21,6 @@ const statusOrder: Record<WorkerStatusInfo['status'], number> = {
 };
 
 export function WorkersGrid({ workers, speedScores }: WorkersGridProps) {
-  if (workers.length === 0) {
-    return (
-      <div className="text-center py-12 text-muted-foreground">
-        <p>No workers configured</p>
-        <p className="text-sm mt-1">Add workers with: rch add user@host</p>
-      </div>
-    );
-  }
-
   const [sortBy, setSortBy] = useState<WorkerSort>('status');
 
   const sortedWorkers = useMemo(() => {
@@ -60,6 +51,15 @@ export function WorkersGrid({ workers, speedScores }: WorkersGridProps) {
     });
     return list;
   }, [workers, sortBy]);
+
+  if (workers.length === 0) {
+    return (
+      <div className="text-center py-12 text-muted-foreground">
+        <p>No workers configured</p>
+        <p className="text-sm mt-1">Add workers with: rch add user@host</p>
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-3">
