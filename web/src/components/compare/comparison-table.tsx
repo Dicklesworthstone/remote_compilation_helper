@@ -12,24 +12,6 @@ interface ComparisonTableProps {
   onViewDetails?: (workerId: string) => void;
 }
 
-interface ScoreRow {
-  label: string;
-  key: keyof WorkerStatusInfo | 'total_score';
-  format?: (value: number) => string;
-}
-
-const scoreRows: ScoreRow[] = [
-  { label: 'Total Score', key: 'speed_score', format: (v) => v.toFixed(1) },
-];
-
-const componentRows: ScoreRow[] = [
-  { label: 'CPU', key: 'speed_score' }, // These would be from SpeedScoreView
-  { label: 'Memory', key: 'speed_score' },
-  { label: 'Disk', key: 'speed_score' },
-  { label: 'Network', key: 'speed_score' },
-  { label: 'Compilation', key: 'speed_score' },
-];
-
 const metadataRows: { label: string; getValue: (w: WorkerStatusInfo) => string }[] = [
   { label: 'Slots', getValue: (w) => `${w.used_slots}/${w.total_slots}` },
   { label: 'Status', getValue: (w) => w.status },

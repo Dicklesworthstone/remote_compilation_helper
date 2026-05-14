@@ -10,6 +10,11 @@ const navItems = [
 ];
 
 test.describe('Navigation', () => {
+  test.skip(
+    ({ isMobile }) => isMobile,
+    'Desktop sidebar navigation is covered by Mobile Navigation on mobile projects.',
+  );
+
   test('sidebar navigation links are visible and functional', async ({ page }) => {
     console.log('[e2e:nav] TEST START: sidebar navigation links are visible and functional');
     await mockApiResponses(page);
@@ -32,11 +37,13 @@ test.describe('Navigation', () => {
 
     for (const item of navItems) {
       console.log(`[e2e:nav] NAVIGATE: Clicking ${item.label}`);
-      await page.goto('/');
+      await page.goto(item.href === '/' ? '/workers' : '/');
+      await page.waitForLoadState('networkidle');
       await page.getByRole('link', { name: item.label }).click();
 
       console.log(`[e2e:nav] VERIFY: URL is ${item.href}`);
       await expect(page).toHaveURL(item.href);
+      await page.waitForLoadState('networkidle');
 
       console.log(`[e2e:nav] VERIFY: ${item.label} link is active`);
       const link = page.getByRole('link', { name: item.label });
@@ -243,6 +250,8 @@ test.describe('Mobile Navigation', () => {
 });
 
 test.describe('Theme Toggle', () => {
+  test.skip(({ isMobile }) => isMobile, 'Mobile theme controls live inside the hidden drawer.');
+
   test('theme toggle switches between light and dark', async ({ page }) => {
     console.log('[e2e:nav:theme] TEST START: theme toggle switches between light and dark');
     await mockApiResponses(page);

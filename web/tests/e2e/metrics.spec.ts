@@ -18,12 +18,12 @@ test.describe('Metrics Page', () => {
     await expect(page.getByText('System Snapshot')).toBeVisible();
 
     console.log('[e2e:metrics] VERIFY: Metric card labels present');
-    await expect(page.getByText('Total Builds')).toBeVisible();
-    await expect(page.getByText('Success Rate')).toBeVisible();
-    await expect(page.getByText('Average Build Time')).toBeVisible();
-    await expect(page.getByText('Active Builds')).toBeVisible();
-    await expect(page.getByText('Workers Online')).toBeVisible();
-    await expect(page.getByText('Data Moved')).toBeVisible();
+    await expect(page.getByText('Total Builds', { exact: true })).toBeVisible();
+    await expect(page.getByText('Success Rate', { exact: true })).toBeVisible();
+    await expect(page.getByText('Average Build Time', { exact: true })).toBeVisible();
+    await expect(page.getByText('Active Builds', { exact: true })).toBeVisible();
+    await expect(page.getByText('Workers Online', { exact: true })).toBeVisible();
+    await expect(page.getByText('Data Moved', { exact: true })).toBeVisible();
 
     console.log('[e2e:metrics] TEST PASS: metrics page loads and displays metric cards');
   });
@@ -48,10 +48,11 @@ test.describe('Metrics Page', () => {
     }
 
     console.log('[e2e:metrics] VERIFY: Budget metrics visible');
-    await expect(page.getByText('Budget')).toBeVisible();
-    await expect(page.getByText('Typical (p50)')).toBeVisible();
-    await expect(page.getByText('Slow (p95)')).toBeVisible();
-    await expect(page.getByText('Worst (p99)')).toBeVisible();
+    const firstBudgetCard = page.getByTestId('budget-card').first();
+    await expect(firstBudgetCard.getByText('Budget', { exact: true })).toBeVisible();
+    await expect(firstBudgetCard.getByText('Typical (p50)', { exact: true })).toBeVisible();
+    await expect(firstBudgetCard.getByText('Slow (p95)', { exact: true })).toBeVisible();
+    await expect(firstBudgetCard.getByText('Worst (p99)', { exact: true })).toBeVisible();
 
     console.log('[e2e:metrics] TEST PASS: performance budgets section displays correctly');
   });
@@ -114,6 +115,10 @@ test.describe('Metrics Page', () => {
     });
 
     await page.route('**/metrics', async (route) => {
+      if (route.request().resourceType() === 'document') {
+        await route.fallback();
+        return;
+      }
       await route.fulfill({ body: mockMetricsText, contentType: 'text/plain' });
     });
 
@@ -143,6 +148,10 @@ test.describe('Metrics Page', () => {
     });
 
     await page.route('**/metrics', async (route) => {
+      if (route.request().resourceType() === 'document') {
+        await route.fallback();
+        return;
+      }
       console.log('[e2e:metrics] MOCK: delaying /metrics response');
       await new Promise((resolve) => setTimeout(resolve, 1200));
       await route.fulfill({ body: mockMetricsText, contentType: 'text/plain' });
@@ -189,14 +198,14 @@ test.describe('Metrics Page', () => {
     await page.goto('/metrics');
 
     console.log('[e2e:metrics] VERIFY: Initial status badge');
-    await expect(page.getByText('passing')).toBeVisible();
+    await expect(page.getByTestId('metrics-status-badge')).toHaveText('passing');
 
     console.log('[e2e:metrics] ACTION: Click refresh button');
     const refreshButton = page.getByRole('button', { name: 'Refresh metrics' });
     await refreshButton.click();
 
     console.log('[e2e:metrics] VERIFY: Updated status badge');
-    await expect(page.getByText('warning')).toBeVisible({ timeout: 5000 });
+    await expect(page.getByTestId('metrics-status-badge')).toHaveText('warning', { timeout: 5000 });
 
     console.log('[e2e:metrics] TEST PASS: metrics refresh button triggers data reload');
   });
@@ -209,8 +218,9 @@ test.describe('Metrics Page', () => {
     await page.goto('/metrics');
 
     console.log('[e2e:metrics] VERIFY: Status badge visible');
-    const statusBadge = page.locator('.capitalize').filter({ hasText: /passing|warning|failing/ });
+    const statusBadge = page.getByTestId('metrics-status-badge');
     await expect(statusBadge).toBeVisible();
+    await expect(statusBadge).toHaveText(/passing|warning|failing/);
 
     console.log('[e2e:metrics] VERIFY: Auto-refresh indicator visible');
     await expect(page.getByText('Auto-refreshing every 5s')).toBeVisible();

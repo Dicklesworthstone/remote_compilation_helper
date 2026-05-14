@@ -52,7 +52,7 @@ export default function WorkersPage() {
       refreshInterval: 15000,
     }
   );
-  const workers = data?.workers ?? [];
+  const workers = useMemo(() => data?.workers ?? [], [data?.workers]);
   const [selectedWorkerId, setSelectedWorkerId] = useState<string | null>(null);
   const selectedWorker = useMemo(
     () => workers.find((worker) => worker.id === selectedWorkerId) ?? null,

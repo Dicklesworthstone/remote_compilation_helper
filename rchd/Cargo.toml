@@ -54,8 +54,8 @@ hyper = { workspace = true }
 ureq = { workspace = true }
 
 # HMAC signing for webhooks
-hmac = "0.12"
-sha2 = "0.10"
+hmac = "0.13"
+sha2 = "0.11"
 
 # Rich terminal output (optional)
 rich_rust = { workspace = true, optional = true }
@@ -67,9 +67,9 @@ unix-sockets = []
 
 [dev-dependencies]
 tempfile = "3.25.0"
-whoami = "2.1"
+whoami = "2.1.2"
 rch-common = { workspace = true, features = ["rich-ui"] }
-proptest = "1.10.0"
+proptest = "1.11.0"
 ctor = { workspace = true }
 serial_test = "3.2"
 

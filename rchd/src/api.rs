@@ -1081,7 +1081,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
                 let key = kv.next().unwrap_or("");
                 let value = kv.next().unwrap_or("");
                 match key {
-                    "worker" => worker_id = Some(urlencoding_decode(value)),
+                    "worker" => worker_id = Some(percent_unescape_query_value(value)),
                     "days" => days = value.parse().unwrap_or(days),
                     "limit" => limit = value.parse().unwrap_or(limit).min(10_000),
                     "offset" => offset = value.parse().unwrap_or(offset).min(1_000_000),
@@ -1127,7 +1127,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
                 }
 
                 return Ok(ApiRequest::SpeedScoreHistory {
-                    worker_id: WorkerId::new(urlencoding_decode(worker_part)),
+                    worker_id: WorkerId::new(percent_unescape_query_value(worker_part)),
                     days,
                     limit,
                     offset,
@@ -1135,7 +1135,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
             }
 
             return Ok(ApiRequest::SpeedScore {
-                worker_id: WorkerId::new(urlencoding_decode(rest)),
+                worker_id: WorkerId::new(percent_unescape_query_value(rest)),
             });
         }
     }
@@ -1147,7 +1147,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
         let (path_only, query) = split_path_query(path);
         let mut worker_id = path_only
             .strip_prefix("/benchmark/trigger/")
-            .map(urlencoding_decode);
+            .map(percent_unescape_query_value);
 
         for param in query.split('&') {
             if param.is_empty() {
@@ -1157,7 +1157,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
             let key = kv.next().unwrap_or("");
             let value = kv.next().unwrap_or("");
             if key == "worker" {
-                worker_id = Some(urlencoding_decode(value));
+                worker_id = Some(percent_unescape_query_value(value));
             }
         }
 
@@ -1287,8 +1287,8 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
             let key = kv.next().unwrap_or("");
             let value = kv.next().unwrap_or("");
             match key {
-                "worker" => worker_ids.push(urlencoding_decode(value)),
-                "project" => project = Some(urlencoding_decode(value)),
+                "worker" => worker_ids.push(percent_unescape_query_value(value)),
+                "project" => project = Some(percent_unescape_query_value(value)),
                 "timeout" => timeout_secs = value.parse().ok(),
                 "debug" if value == "1" || value.eq_ignore_ascii_case("true") => {
                     release_mode = false;
@@ -1336,7 +1336,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
             let value = kv.next().unwrap_or("");
 
             match key {
-                "worker" => worker_id = Some(urlencoding_decode(value)),
+                "worker" => worker_id = Some(percent_unescape_query_value(value)),
                 "slots" => slots = value.parse().ok(),
                 "build_id" => build_id = value.parse().ok(),
                 "exit_code" => exit_code = value.parse().ok(),
@@ -1381,11 +1381,11 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
             let value = kv.next().unwrap_or("");
 
             match key {
-                "worker" => worker_id = Some(urlencoding_decode(value)),
-                "project" => project = Some(urlencoding_decode(value)),
+                "worker" => worker_id = Some(percent_unescape_query_value(value)),
+                "project" => project = Some(percent_unescape_query_value(value)),
                 "is_test" => {
-                    let decoded = urlencoding_decode(value);
-                    is_test = matches!(decoded.as_str(), "1" | "true" | "yes" | "y" | "on");
+                    let query_value = percent_unescape_query_value(value);
+                    is_test = matches!(query_value.as_str(), "1" | "true" | "yes" | "y" | "on");
                 }
                 _ => {}
             }
@@ -1433,7 +1433,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
                     let key = kv.next().unwrap_or("");
                     let value = kv.next().unwrap_or("");
                     if key == "worker" {
-                        worker_id = Some(urlencoding_decode(value));
+                        worker_id = Some(percent_unescape_query_value(value));
                     }
                 }
 
@@ -1458,7 +1458,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
                     let key = kv.next().unwrap_or("");
                     let value = kv.next().unwrap_or("");
                     if key == "source" {
-                        source = parse_telemetry_source(&urlencoding_decode(value));
+                        source = parse_telemetry_source(&percent_unescape_query_value(value));
                     }
                 }
 
@@ -1477,7 +1477,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
         let parts: Vec<&str> = path_part.split('/').collect();
 
         if parts.len() == 2 {
-            let worker_id = urlencoding_decode(parts[0]);
+            let worker_id = percent_unescape_query_value(parts[0]);
             let action = parts[1];
 
             match action {
@@ -1504,7 +1504,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
                         let value = kv.next().unwrap_or("");
 
                         match key {
-                            "reason" => reason = Some(urlencoding_decode(value)),
+                            "reason" => reason = Some(percent_unescape_query_value(value)),
                             "drain" => {
                                 drain_first = value == "1" || value.eq_ignore_ascii_case("true")
                             }
@@ -1538,7 +1538,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
                     let key = kv.next().unwrap_or("");
                     let value = kv.next().unwrap_or("");
                     if key == "worker" {
-                        worker_id = Some(WorkerId::new(urlencoding_decode(value)));
+                        worker_id = Some(WorkerId::new(percent_unescape_query_value(value)));
                     }
                 }
                 return Ok(ApiRequest::RepoConvergenceStatus { worker_id });
@@ -1553,7 +1553,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
                     let key = kv.next().unwrap_or("");
                     let value = kv.next().unwrap_or("");
                     if key == "worker" {
-                        worker_id = Some(WorkerId::new(urlencoding_decode(value)));
+                        worker_id = Some(WorkerId::new(percent_unescape_query_value(value)));
                     }
                 }
                 return match worker_id {
@@ -1574,7 +1574,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
                     let key = kv.next().unwrap_or("");
                     let value = kv.next().unwrap_or("");
                     if key == "worker" {
-                        worker_id = Some(WorkerId::new(urlencoding_decode(value)));
+                        worker_id = Some(WorkerId::new(percent_unescape_query_value(value)));
                     }
                 }
                 return match worker_id {
@@ -1615,8 +1615,8 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
         let value = kv.next().unwrap_or("");
 
         match key {
-            "project" => project = Some(urlencoding_decode(value)),
-            "command" => command = Some(urlencoding_decode(value)),
+            "project" => project = Some(percent_unescape_query_value(value)),
+            "command" => command = Some(percent_unescape_query_value(value)),
             "cores" => cores = value.parse().ok(),
             "wait" | "queue" => {
                 wait_for_worker = value == "1" || value.eq_ignore_ascii_case("true");
@@ -1625,12 +1625,12 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
                 wait_timeout_secs = value.parse::<u64>().ok().filter(|secs| *secs > 0);
             }
             "toolchain" => {
-                let json = urlencoding_decode(value);
+                let json = percent_unescape_query_value(value);
                 toolchain = serde_json::from_str(&json).ok();
             }
             "runtime" => {
                 // Parse required runtime (rust, bun, node)
-                let rt_str = urlencoding_decode(value);
+                let rt_str = percent_unescape_query_value(value);
                 // Use serde_json to parse the enum variant string (e.g. "bun")
                 // We wrap in quotes to make it valid JSON string for the enum
                 required_runtime = serde_json::from_str(&format!("\"{}\"", rt_str))
@@ -1638,7 +1638,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
                     .unwrap_or_default();
             }
             "priority" => {
-                let pr_str = urlencoding_decode(value);
+                let pr_str = percent_unescape_query_value(value);
                 command_priority = pr_str.parse().unwrap_or(CommandPriority::Normal);
             }
             "classification_us" => {
@@ -1679,7 +1679,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
 }
 
 fn parse_worker_id_list(encoded_value: &str) -> Vec<WorkerId> {
-    urlencoding_decode(encoded_value)
+    percent_unescape_query_value(encoded_value)
         .split(',')
         .map(str::trim)
         .filter(|id| !id.is_empty())
@@ -1703,11 +1703,11 @@ fn split_path_query(path: &str) -> (&str, &str) {
     }
 }
 
-/// URL percent-decoding.
+/// URL percent-unescaping for query/path segments.
 ///
-/// Decodes %XX hex sequences to their original characters.
-/// Handles UTF-8 multi-byte sequences correctly (e.g. %C3%A9 -> é).
-fn urlencoding_decode(s: &str) -> String {
+/// Converts %XX hex sequences to their original characters and treats '+'
+/// as a query-space marker.
+fn percent_unescape_query_value(s: &str) -> String {
     let mut bytes: Vec<u8> = Vec::with_capacity(s.len());
     let mut chars = s.chars().peekable();
 
@@ -3165,6 +3165,7 @@ async fn handle_repo_convergence_repair(
 }
 
 #[cfg(test)]
+#[allow(clippy::assertions_on_constants)]
 mod tests {
     use super::*;
     use crate::disk_pressure::{PressureAssessment, PressureConfidence, PressureState};
@@ -3259,7 +3260,8 @@ mod tests {
         let _guard = test_guard!();
         let req = parse_request("GET /select-worker?project=test").unwrap();
         let ApiRequest::SelectWorker { request: req, .. } = req else {
-            panic!("expected select-worker request");
+            assert!(false, "expected select-worker request");
+            return;
         };
         assert_eq!(req.project, "test");
         assert_eq!(req.estimated_cores, 1); // Default
@@ -3270,7 +3272,8 @@ mod tests {
         let _guard = test_guard!();
         let req = parse_request("GET /select-worker?project=my%20project&cores=2").unwrap();
         let ApiRequest::SelectWorker { request: req, .. } = req else {
-            panic!("expected select-worker request");
+            assert!(false, "expected select-worker request");
+            return;
         };
         assert_eq!(req.project, "my project");
         assert_eq!(req.estimated_cores, 2);
@@ -3281,7 +3284,8 @@ mod tests {
         let _guard = test_guard!();
         let req = parse_request("GET /select-worker?project=test&cores=2&priority=high").unwrap();
         let ApiRequest::SelectWorker { request: req, .. } = req else {
-            panic!("expected select-worker request");
+            assert!(false, "expected select-worker request");
+            return;
         };
         assert_eq!(req.command_priority, rch_common::CommandPriority::High);
     }
@@ -3310,7 +3314,8 @@ mod tests {
         let _guard = test_guard!();
         let req = parse_request("GET /select-worker?project=test&cores=2&priority=urgent").unwrap();
         let ApiRequest::SelectWorker { request: req, .. } = req else {
-            panic!("expected select-worker request");
+            assert!(false, "expected select-worker request");
+            return;
         };
         assert_eq!(req.command_priority, rch_common::CommandPriority::Normal);
     }
@@ -3350,7 +3355,7 @@ mod tests {
             ApiRequest::SpeedScore { worker_id } => {
                 assert_eq!(worker_id.as_str(), "css");
             }
-            _ => panic!("expected speedscore request"),
+            _ => assert!(false, "expected speedscore request"),
         }
     }
 
@@ -3370,7 +3375,7 @@ mod tests {
                 assert_eq!(limit, 25);
                 assert_eq!(offset, 5);
             }
-            _ => panic!("expected speedscore history request"),
+            _ => assert!(false, "expected speedscore history request"),
         }
     }
 
@@ -3392,7 +3397,7 @@ mod tests {
             ApiRequest::WorkersCapabilities { refresh } => {
                 assert!(!refresh);
             }
-            _ => panic!("expected workers capabilities request"),
+            _ => assert!(false, "expected workers capabilities request"),
         }
 
         let req = parse_request("GET /workers/capabilities?refresh=true").unwrap();
@@ -3400,7 +3405,7 @@ mod tests {
             ApiRequest::WorkersCapabilities { refresh } => {
                 assert!(refresh);
             }
-            _ => panic!("expected workers capabilities request"),
+            _ => assert!(false, "expected workers capabilities request"),
         }
     }
 
@@ -3412,7 +3417,7 @@ mod tests {
             ApiRequest::BenchmarkTrigger { worker_id } => {
                 assert_eq!(worker_id.as_str(), "css");
             }
-            _ => panic!("expected benchmark trigger request"),
+            _ => assert!(false, "expected benchmark trigger request"),
         }
     }
 
@@ -3446,7 +3451,7 @@ mod tests {
             ApiRequest::TelemetryPoll { worker_id } => {
                 assert_eq!(worker_id.as_str(), "css");
             }
-            _ => panic!("expected telemetry poll request"),
+            _ => assert!(false, "expected telemetry poll request"),
         }
     }
 
@@ -3466,7 +3471,7 @@ mod tests {
         let req = parse_request("GET /self-test/history?limit=5").unwrap();
         match req {
             ApiRequest::SelfTestHistory { limit } => assert_eq!(limit, 5),
-            _ => panic!("expected self-test history request"),
+            _ => assert!(false, "expected self-test history request"),
         }
     }
 
@@ -3477,7 +3482,8 @@ mod tests {
             parse_request("POST /self-test/run?worker=css&timeout=120&debug=1&scheduled=false")
                 .unwrap();
         let ApiRequest::SelfTestRun(req) = req else {
-            panic!("expected self-test run request");
+            assert!(false, "expected self-test run request");
+            return;
         };
         assert_eq!(req.worker_ids, vec!["css".to_string()]);
         assert_eq!(req.timeout_secs, Some(120));
@@ -3498,7 +3504,8 @@ mod tests {
 
         let req = parse_request(&query).unwrap();
         let ApiRequest::SelectWorker { request: req, .. } = req else {
-            panic!("expected select-worker request");
+            assert!(false, "expected select-worker request");
+            return;
         };
 
         assert_eq!(req.project, "test");
@@ -3516,14 +3523,16 @@ mod tests {
         let query = "GET /select-worker?project=test&runtime=bun";
         let req = parse_request(query).unwrap();
         let ApiRequest::SelectWorker { request: req, .. } = req else {
-            panic!("expected select-worker request");
+            assert!(false, "expected select-worker request");
+            return;
         };
         assert_eq!(req.required_runtime, RequiredRuntime::Bun);
 
         let query = "GET /select-worker?project=test&runtime=rust";
         let req = parse_request(query).unwrap();
         let ApiRequest::SelectWorker { request: req, .. } = req else {
-            panic!("expected select-worker request");
+            assert!(false, "expected select-worker request");
+            return;
         };
         assert_eq!(req.required_runtime, RequiredRuntime::Rust);
 
@@ -3531,7 +3540,8 @@ mod tests {
         let query = "GET /select-worker?project=test&runtime=invalid";
         let req = parse_request(query).unwrap();
         let ApiRequest::SelectWorker { request: req, .. } = req else {
-            panic!("expected select-worker request");
+            assert!(false, "expected select-worker request");
+            return;
         };
         assert_eq!(req.required_runtime, RequiredRuntime::None);
     }
@@ -3558,51 +3568,54 @@ mod tests {
     }
 
     #[test]
-    fn test_urlencoding_decode_basic() {
+    fn test_percent_unescape_query_value_basic() {
         let _guard = test_guard!();
-        assert_eq!(urlencoding_decode("hello%20world"), "hello world");
-        assert_eq!(urlencoding_decode("path%2Fto%2Ffile"), "path/to/file");
-        assert_eq!(urlencoding_decode("foo%3Abar"), "foo:bar");
-    }
-
-    #[test]
-    fn test_urlencoding_decode_special_chars() {
-        let _guard = test_guard!();
-        assert_eq!(urlencoding_decode("a%26b%3Dc"), "a&b=c");
-        assert_eq!(urlencoding_decode("100%25"), "100%");
-        assert_eq!(urlencoding_decode("hello%2Bworld"), "hello+world");
-    }
-
-    #[test]
-    fn test_urlencoding_decode_plus_as_space() {
-        let _guard = test_guard!();
-        assert_eq!(urlencoding_decode("hello+world"), "hello world");
-    }
-
-    #[test]
-    fn test_urlencoding_decode_no_encoding() {
-        let _guard = test_guard!();
-        assert_eq!(urlencoding_decode("simple"), "simple");
+        assert_eq!(percent_unescape_query_value("hello%20world"), "hello world");
         assert_eq!(
-            urlencoding_decode("with-dash_underscore"),
+            percent_unescape_query_value("path%2Fto%2Ffile"),
+            "path/to/file"
+        );
+        assert_eq!(percent_unescape_query_value("foo%3Abar"), "foo:bar");
+    }
+
+    #[test]
+    fn test_percent_unescape_query_value_special_chars() {
+        let _guard = test_guard!();
+        assert_eq!(percent_unescape_query_value("a%26b%3Dc"), "a&b=c");
+        assert_eq!(percent_unescape_query_value("100%25"), "100%");
+        assert_eq!(percent_unescape_query_value("hello%2Bworld"), "hello+world");
+    }
+
+    #[test]
+    fn test_percent_unescape_query_value_plus_as_space() {
+        let _guard = test_guard!();
+        assert_eq!(percent_unescape_query_value("hello+world"), "hello world");
+    }
+
+    #[test]
+    fn test_percent_unescape_query_value_no_escapes() {
+        let _guard = test_guard!();
+        assert_eq!(percent_unescape_query_value("simple"), "simple");
+        assert_eq!(
+            percent_unescape_query_value("with-dash_underscore"),
             "with-dash_underscore"
         );
     }
 
     #[test]
-    fn test_urlencoding_decode_invalid() {
+    fn test_percent_unescape_query_value_invalid() {
         let _guard = test_guard!();
         // Invalid hex should be preserved
-        assert_eq!(urlencoding_decode("foo%GGbar"), "foo%GGbar");
+        assert_eq!(percent_unescape_query_value("foo%GGbar"), "foo%GGbar");
         // Incomplete sequence at end
-        assert_eq!(urlencoding_decode("foo%"), "foo%");
+        assert_eq!(percent_unescape_query_value("foo%"), "foo%");
     }
 
     #[test]
-    fn test_urlencoding_decode_utf8() {
+    fn test_percent_unescape_query_value_utf8() {
         let _guard = test_guard!();
         // "é" is %C3%A9 in UTF-8
-        assert_eq!(urlencoding_decode("%C3%A9"), "é");
+        assert_eq!(percent_unescape_query_value("%C3%A9"), "é");
         // "こんにちは" (Konnichiwa)
         // こ: %E3%81%93
         // ん: %E3%82%93
@@ -3610,11 +3623,14 @@ mod tests {
         // ち: %E3%81%A1
         // は: %E3%81%AF
         assert_eq!(
-            urlencoding_decode("%E3%81%93%E3%82%93%E3%81%AB%E3%81%A1%E3%81%AF"),
+            percent_unescape_query_value("%E3%81%93%E3%82%93%E3%81%AB%E3%81%A1%E3%81%AF"),
             "こんにちは"
         );
         // Mixed
-        assert_eq!(urlencoding_decode("hello%20%F0%9F%8C%8D"), "hello 🌍");
+        assert_eq!(
+            percent_unescape_query_value("hello%20%F0%9F%8C%8D"),
+            "hello 🌍"
+        );
     }
 
     // Helper for test_parse_request_with_toolchain
@@ -3866,7 +3882,10 @@ mod tests {
             .await
             .unwrap();
         assert!(second_response.worker.is_none());
-        assert_eq!(second_response.reason, SelectionReason::AllWorkersBusy);
+        assert_eq!(
+            second_response.reason,
+            SelectionReason::NoAdmissibleWorkers("active_project_exclusion=1".to_string())
+        );
     }
 
     #[tokio::test]
@@ -4365,7 +4384,7 @@ mod tests {
                 assert_eq!(build_id, 123);
                 assert!(!force);
             }
-            _ => panic!("expected cancel build request"),
+            _ => assert!(false, "expected cancel build request"),
         }
 
         let req = parse_request("POST /builds/456/cancel?force=true").unwrap();
@@ -4374,7 +4393,7 @@ mod tests {
                 assert_eq!(build_id, 456);
                 assert!(force);
             }
-            _ => panic!("expected cancel build request with force"),
+            _ => assert!(false, "expected cancel build request with force"),
         }
     }
 
@@ -4386,7 +4405,7 @@ mod tests {
             ApiRequest::CancelAllBuilds { force } => {
                 assert!(!force);
             }
-            _ => panic!("expected cancel all builds request"),
+            _ => assert!(false, "expected cancel all builds request"),
         }
 
         let req = parse_request("POST /builds/cancel-all?force=true").unwrap();
@@ -4394,7 +4413,7 @@ mod tests {
             ApiRequest::CancelAllBuilds { force } => {
                 assert!(force);
             }
-            _ => panic!("expected cancel all builds with force"),
+            _ => assert!(false, "expected cancel all builds with force"),
         }
     }
 
@@ -4406,7 +4425,7 @@ mod tests {
             ApiRequest::WorkerDrain { worker_id } => {
                 assert_eq!(worker_id.as_str(), "css");
             }
-            _ => panic!("expected worker drain request"),
+            _ => assert!(false, "expected worker drain request"),
         }
     }
 
@@ -4418,7 +4437,7 @@ mod tests {
             ApiRequest::WorkerEnable { worker_id } => {
                 assert_eq!(worker_id.as_str(), "css");
             }
-            _ => panic!("expected worker enable request"),
+            _ => assert!(false, "expected worker enable request"),
         }
     }
 
@@ -4436,7 +4455,7 @@ mod tests {
                 assert!(reason.is_none());
                 assert!(!drain_first);
             }
-            _ => panic!("expected worker disable request"),
+            _ => assert!(false, "expected worker disable request"),
         }
 
         let req = parse_request("POST /workers/css/disable?reason=maintenance&drain=true").unwrap();
@@ -4450,7 +4469,7 @@ mod tests {
                 assert_eq!(reason, Some("maintenance".to_string()));
                 assert!(drain_first);
             }
-            _ => panic!("expected worker disable request with options"),
+            _ => assert!(false, "expected worker disable request with options"),
         }
     }
 
@@ -4463,7 +4482,7 @@ mod tests {
                 assert_eq!(req.worker_id.as_str(), "css");
                 assert_eq!(req.slots, 4);
             }
-            _ => panic!("expected release worker request"),
+            _ => assert!(false, "expected release worker request"),
         }
     }
 
@@ -4477,7 +4496,7 @@ mod tests {
                 assert_eq!(req.slots, 4);
                 assert_eq!(req.build_id, Some(123));
             }
-            _ => panic!("expected release worker request with build_id"),
+            _ => assert!(false, "expected release worker request with build_id"),
         }
     }
 
@@ -4489,7 +4508,7 @@ mod tests {
             ApiRequest::ReleaseWorker(req) => {
                 assert_eq!(req.exit_code, Some(0));
             }
-            _ => panic!("expected release worker request with exit_code"),
+            _ => assert!(false, "expected release worker request with exit_code"),
         }
     }
 
@@ -4508,7 +4527,7 @@ mod tests {
                 assert_eq!(project, "myproject");
                 assert!(is_test);
             }
-            _ => panic!("expected record build request"),
+            _ => assert!(false, "expected record build request"),
         }
     }
 
@@ -4520,7 +4539,7 @@ mod tests {
             ApiRequest::IngestTelemetry(source) => {
                 assert_eq!(source, TelemetrySource::Piggyback);
             }
-            _ => panic!("expected ingest telemetry request"),
+            _ => assert!(false, "expected ingest telemetry request"),
         }
 
         let req = parse_request("POST /telemetry/ingest?source=ssh_poll").unwrap();
@@ -4528,7 +4547,7 @@ mod tests {
             ApiRequest::IngestTelemetry(source) => {
                 assert_eq!(source, TelemetrySource::SshPoll);
             }
-            _ => panic!("expected ingest telemetry request"),
+            _ => assert!(false, "expected ingest telemetry request"),
         }
     }
 
@@ -4546,7 +4565,7 @@ mod tests {
                 assert!(wait_for_worker);
                 assert_eq!(wait_timeout_secs, Some(45));
             }
-            _ => panic!("expected select worker request"),
+            _ => assert!(false, "expected select worker request"),
         }
 
         let req = parse_request("GET /select-worker?project=test&wait=false").unwrap();
@@ -4559,7 +4578,7 @@ mod tests {
                 assert!(!wait_for_worker);
                 assert_eq!(wait_timeout_secs, None);
             }
-            _ => panic!("expected select worker request"),
+            _ => assert!(false, "expected select worker request"),
         }
 
         let req = parse_request("GET /select-worker?project=test&wait_timeout_secs=0").unwrap();
@@ -4569,7 +4588,7 @@ mod tests {
             } => {
                 assert_eq!(wait_timeout_secs, None);
             }
-            _ => panic!("expected select worker request"),
+            _ => assert!(false, "expected select worker request"),
         }
     }
 
@@ -4869,7 +4888,7 @@ mod tests {
                         .contains("not found")
                 );
             }
-            _ => panic!("expected error response"),
+            _ => assert!(false, "expected error response"),
         }
     }
 
@@ -4886,7 +4905,7 @@ mod tests {
                 // No speedscore initially
                 assert!(r.speedscore.is_none());
             }
-            _ => panic!("expected ok response"),
+            _ => assert!(false, "expected ok response"),
         }
     }
 
@@ -4902,7 +4921,7 @@ mod tests {
             ApiResponse::Ok(r) => {
                 assert_eq!(r.workers.len(), 2);
             }
-            _ => panic!("expected ok response"),
+            _ => assert!(false, "expected ok response"),
         }
     }
 
@@ -4921,7 +4940,7 @@ mod tests {
                         .contains("not found")
                 );
             }
-            _ => panic!("expected error response"),
+            _ => assert!(false, "expected error response"),
         }
     }
 
@@ -4938,7 +4957,7 @@ mod tests {
                 assert_eq!(r.worker_id, "worker1");
                 assert!(!r.request_id.is_empty());
             }
-            _ => panic!("expected ok response"),
+            _ => assert!(false, "expected ok response"),
         }
     }
 
@@ -4962,7 +4981,7 @@ mod tests {
                 );
                 assert!(err.retry_after_secs.is_some());
             }
-            _ => panic!("expected rate-limited error response"),
+            _ => assert!(false, "expected rate-limited error response"),
         }
     }
 
@@ -4987,7 +5006,7 @@ mod tests {
                         .contains("not found")
                 );
             }
-            _ => panic!("expected error response"),
+            _ => assert!(false, "expected error response"),
         }
     }
 
@@ -5005,7 +5024,7 @@ mod tests {
                 assert!(r.history.is_empty()); // No history entries yet
                 assert!(!r.pagination.has_more);
             }
-            _ => panic!("expected ok response"),
+            _ => assert!(false, "expected ok response"),
         }
     }
 
@@ -5022,7 +5041,7 @@ mod tests {
             ApiResponse::Ok(r) => {
                 assert_eq!(r.worker_id, "worker1");
             }
-            _ => panic!("expected ok response"),
+            _ => assert!(false, "expected ok response"),
         }
 
         // Request 1000 days - should be clamped to 365
@@ -5032,7 +5051,7 @@ mod tests {
             ApiResponse::Ok(r) => {
                 assert_eq!(r.worker_id, "worker1");
             }
-            _ => panic!("expected ok response"),
+            _ => assert!(false, "expected ok response"),
         }
     }
 
@@ -5049,7 +5068,7 @@ mod tests {
             ApiResponse::Ok(r) => {
                 assert_eq!(r.pagination.limit, 1);
             }
-            _ => panic!("expected ok response"),
+            _ => assert!(false, "expected ok response"),
         }
 
         // Request limit of 5000 - should be clamped to 1000
@@ -5058,7 +5077,7 @@ mod tests {
             ApiResponse::Ok(r) => {
                 assert_eq!(r.pagination.limit, 1000);
             }
-            _ => panic!("expected ok response"),
+            _ => assert!(false, "expected ok response"),
         }
     }
 
@@ -5077,7 +5096,7 @@ mod tests {
             ApiResponse::Ok(r) => {
                 assert!(r.workers.is_empty());
             }
-            _ => panic!("expected ok response"),
+            _ => assert!(false, "expected ok response"),
         }
     }
 
@@ -5098,7 +5117,7 @@ mod tests {
                 assert_eq!(w1.host, "localhost");
                 assert_eq!(w1.user, "user");
             }
-            _ => panic!("expected ok response"),
+            _ => assert!(false, "expected ok response"),
         }
     }
 
@@ -5665,7 +5684,7 @@ mod tests {
                 assert_eq!(status.summary.total_workers, 0);
                 assert_eq!(status.status, "unknown");
             }
-            ApiResponse::Error(e) => panic!("Expected Ok, got error: {}", e.message),
+            ApiResponse::Error(e) => assert!(false, "Expected Ok, got error: {}", e.message),
         }
     }
 
@@ -5690,7 +5709,7 @@ mod tests {
                 assert_eq!(status.summary.ready, 1);
                 assert_eq!(status.status, "healthy");
             }
-            ApiResponse::Error(e) => panic!("Expected Ok, got error: {}", e.message),
+            ApiResponse::Error(e) => assert!(false, "Expected Ok, got error: {}", e.message),
         }
     }
 
@@ -5716,7 +5735,7 @@ mod tests {
                 assert_eq!(status.workers.len(), 1);
                 assert_eq!(status.workers[0].worker_id, "w1");
             }
-            ApiResponse::Error(e) => panic!("Expected Ok, got error: {}", e.message),
+            ApiResponse::Error(e) => assert!(false, "Expected Ok, got error: {}", e.message),
         }
     }
 
@@ -5734,7 +5753,7 @@ mod tests {
                 assert_eq!(status.workers[0].drift_state, "stale");
                 assert!(!status.workers[0].remediation.is_empty());
             }
-            ApiResponse::Error(e) => panic!("Expected Ok, got error: {}", e.message),
+            ApiResponse::Error(e) => assert!(false, "Expected Ok, got error: {}", e.message),
         }
     }
 
@@ -5755,7 +5774,7 @@ mod tests {
                 assert!(!dr.would_attempt, "Ready worker should not attempt sync");
                 assert_eq!(dr.current_state, "ready");
             }
-            ApiResponse::Error(e) => panic!("Expected Ok, got error: {}", e.message),
+            ApiResponse::Error(e) => assert!(false, "Expected Ok, got error: {}", e.message),
         }
     }
 
@@ -5781,7 +5800,7 @@ mod tests {
                 assert!(!dr.missing_repos.is_empty());
                 assert!(dr.has_budget);
             }
-            ApiResponse::Error(e) => panic!("Expected Ok, got error: {}", e.message),
+            ApiResponse::Error(e) => assert!(false, "Expected Ok, got error: {}", e.message),
         }
     }
 
@@ -5798,7 +5817,7 @@ mod tests {
                 assert!(dr.would_attempt);
                 assert_eq!(dr.current_state, "stale");
             }
-            ApiResponse::Error(e) => panic!("Expected Ok, got error: {}", e.message),
+            ApiResponse::Error(e) => assert!(false, "Expected Ok, got error: {}", e.message),
         }
     }
 
@@ -5822,7 +5841,7 @@ mod tests {
                 assert_eq!(repair.new_state, "drifting");
                 assert_eq!(repair.action, "reset_convergence");
             }
-            ApiResponse::Error(e) => panic!("Expected Ok, got error: {}", e.message),
+            ApiResponse::Error(e) => assert!(false, "Expected Ok, got error: {}", e.message),
         }
     }
 
@@ -5839,7 +5858,7 @@ mod tests {
                 assert_eq!(repair.status, "noop");
                 assert_eq!(repair.action, "none");
             }
-            ApiResponse::Error(e) => panic!("Expected Ok, got error: {}", e.message),
+            ApiResponse::Error(e) => assert!(false, "Expected Ok, got error: {}", e.message),
         }
     }
 
@@ -5881,7 +5900,7 @@ mod tests {
             } => {
                 assert_eq!(wid.as_str(), "w1");
             }
-            _ => panic!("Expected RepoConvergenceStatus with worker_id"),
+            _ => assert!(false, "Expected RepoConvergenceStatus with worker_id"),
         }
     }
 
@@ -5893,7 +5912,7 @@ mod tests {
             ApiRequest::RepoConvergenceDryRun { worker_id } => {
                 assert_eq!(worker_id.as_str(), "w1");
             }
-            _ => panic!("Expected RepoConvergenceDryRun"),
+            _ => assert!(false, "Expected RepoConvergenceDryRun"),
         }
     }
 
@@ -5912,7 +5931,7 @@ mod tests {
             ApiRequest::RepoConvergenceRepair { worker_id } => {
                 assert_eq!(worker_id.as_str(), "w1");
             }
-            _ => panic!("Expected RepoConvergenceRepair"),
+            _ => assert!(false, "Expected RepoConvergenceRepair"),
         }
     }
 

@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
+import { useMemo, useState } from 'react';
 import { CheckCircle, XCircle, Clock, Search, ChevronLeft, ChevronRight } from 'lucide-react';
 import { motion } from 'motion/react';
 import { Button } from '@/components/ui/button';
@@ -195,19 +195,10 @@ export function BuildHistoryTable({ activeBuilds, recentBuilds }: BuildHistoryTa
 
   const totalPages = Math.ceil(sortedRows.length / PAGE_SIZE);
   const showPagination = sortedRows.length > 50;
+  const currentPage = showPagination ? Math.min(page, totalPages || 1) : 1;
   const pagedRows = showPagination
-    ? sortedRows.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE)
+    ? sortedRows.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE)
     : sortedRows;
-
-  useEffect(() => {
-    setPage(1);
-  }, [statusFilter, workerFilter, searchQuery, startDate, endDate]);
-
-  useEffect(() => {
-    if (page > totalPages) {
-      setPage(totalPages || 1);
-    }
-  }, [page, totalPages]);
 
   const hasBuilds = rows.length > 0;
 
@@ -230,7 +221,7 @@ export function BuildHistoryTable({ activeBuilds, recentBuilds }: BuildHistoryTa
   };
 
   const rangeLabel = showPagination
-    ? `${(page - 1) * PAGE_SIZE + 1}-${Math.min(page * PAGE_SIZE, sortedRows.length)} of ${sortedRows.length}`
+    ? `${(currentPage - 1) * PAGE_SIZE + 1}-${Math.min(currentPage * PAGE_SIZE, sortedRows.length)} of ${sortedRows.length}`
     : `${sortedRows.length} build${sortedRows.length === 1 ? '' : 's'}`;
 
   return (
@@ -242,7 +233,10 @@ export function BuildHistoryTable({ activeBuilds, recentBuilds }: BuildHistoryTa
             <select
               id="build-status-filter"
               value={statusFilter}
-              onChange={(event) => setStatusFilter(event.target.value as BuildStatusFilter)}
+              onChange={(event) => {
+                setStatusFilter(event.target.value as BuildStatusFilter);
+                setPage(1);
+              }}
               className="h-9 rounded-md border border-border bg-background px-3 text-sm text-foreground shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
             >
               <option value="all">All</option>
@@ -257,7 +251,10 @@ export function BuildHistoryTable({ activeBuilds, recentBuilds }: BuildHistoryTa
             <select
               id="build-worker-filter"
               value={workerFilter}
-              onChange={(event) => setWorkerFilter(event.target.value)}
+              onChange={(event) => {
+                setWorkerFilter(event.target.value);
+                setPage(1);
+              }}
               className="h-9 rounded-md border border-border bg-background px-3 text-sm text-foreground shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
             >
               <option value="all">All workers</option>
@@ -275,7 +272,10 @@ export function BuildHistoryTable({ activeBuilds, recentBuilds }: BuildHistoryTa
               <input
                 type="date"
                 value={startDate}
-                onChange={(event) => setStartDate(event.target.value)}
+                onChange={(event) => {
+                  setStartDate(event.target.value);
+                  setPage(1);
+                }}
                 className="h-9 rounded-md border border-border bg-background px-2 text-xs text-foreground shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
                 aria-label="Start date"
               />
@@ -283,7 +283,10 @@ export function BuildHistoryTable({ activeBuilds, recentBuilds }: BuildHistoryTa
               <input
                 type="date"
                 value={endDate}
-                onChange={(event) => setEndDate(event.target.value)}
+                onChange={(event) => {
+                  setEndDate(event.target.value);
+                  setPage(1);
+                }}
                 className="h-9 rounded-md border border-border bg-background px-2 text-xs text-foreground shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
                 aria-label="End date"
               />
@@ -297,7 +300,10 @@ export function BuildHistoryTable({ activeBuilds, recentBuilds }: BuildHistoryTa
             <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
             <input
               value={searchQuery}
-              onChange={(event) => setSearchQuery(event.target.value)}
+              onChange={(event) => {
+                setSearchQuery(event.target.value);
+                setPage(1);
+              }}
               placeholder="Filter commands..."
               className="h-9 w-full rounded-md border border-border bg-background pl-9 pr-3 text-sm text-foreground shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
               aria-label="Search build commands"
@@ -416,20 +422,20 @@ export function BuildHistoryTable({ activeBuilds, recentBuilds }: BuildHistoryTa
             <Button
               variant="outline"
               size="icon-sm"
-              onClick={() => setPage(Math.max(1, page - 1))}
-              disabled={page <= 1}
+              onClick={() => setPage(Math.max(1, currentPage - 1))}
+              disabled={currentPage <= 1}
               aria-label="Previous page"
             >
               <ChevronLeft className="h-4 w-4" />
             </Button>
             <span className="text-xs">
-              Page {page} of {totalPages || 1}
+              Page {currentPage} of {totalPages || 1}
             </span>
             <Button
               variant="outline"
               size="icon-sm"
-              onClick={() => setPage(Math.min(totalPages, page + 1))}
-              disabled={page >= totalPages}
+              onClick={() => setPage(Math.min(totalPages, currentPage + 1))}
+              disabled={currentPage >= totalPages}
               aria-label="Next page"
             >
               <ChevronRight className="h-4 w-4" />

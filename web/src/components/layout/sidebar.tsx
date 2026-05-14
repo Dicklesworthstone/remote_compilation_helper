@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState, useRef } from 'react';
+import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { Server, History, Settings, Activity, Home, Menu, X, Sun, Moon } from 'lucide-react';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
@@ -18,6 +18,9 @@ const navItems = [
 ];
 
 const STORAGE_KEY = 'rch.sidebar.open';
+const subscribeMounted = () => () => {};
+const getClientSnapshot = () => true;
+const getServerSnapshot = () => false;
 
 interface SidebarContentProps {
   pathname: string;
@@ -83,11 +86,11 @@ function SidebarContent({ pathname, onNavigate, variant }: SidebarContentProps) 
 
 function ThemeToggle() {
   const { resolvedTheme, setTheme } = useTheme();
-  const [mounted, setMounted] = useState(false);
-
-  useEffect(() => {
-    setMounted(true);
-  }, []);
+  const mounted = useSyncExternalStore(
+    subscribeMounted,
+    getClientSnapshot,
+    getServerSnapshot
+  );
 
   const isDark = resolvedTheme === 'dark';
   const label = isDark ? 'Switch to light theme' : 'Switch to dark theme';

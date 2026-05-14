@@ -1,11 +1,10 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+import { render, screen, fireEvent } from '@testing-library/react';
 import {
   SpeedScoreDetailPanel,
   SpeedScoreDetailPanelSkeleton,
   SpeedScoreDetailPanelError,
   SpeedScoreDetailPanelEmpty,
-  SpeedScoreDetailPanelPartial,
   TotalScoreBadge,
 } from './speed-score-detail-panel';
 import { ComponentRow } from './component-row';
@@ -427,12 +426,14 @@ describe('SpeedScoreDetailPanel', () => {
           speedscore={mockSpeedScore}
           rawResults={mockRawResults}
           isExpanded={true}
+          onToggle={vi.fn()}
         />
       );
 
       const panel = screen.getByRole('region');
-      expect(panel).toHaveAttribute('aria-expanded', 'true');
       expect(panel).toHaveAttribute('aria-labelledby', 'panel-title-css');
+      expect(screen.getByRole('button', { name: /toggle speedscore details/i }))
+        .toHaveAttribute('aria-expanded', 'true');
     });
 
     it('header is keyboard navigable when onToggle provided', () => {

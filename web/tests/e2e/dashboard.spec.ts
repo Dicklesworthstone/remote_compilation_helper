@@ -30,7 +30,7 @@ test.describe('Dashboard', () => {
     await page.goto('/');
 
     console.log('[e2e:dashboard] WAIT: Workers section visible');
-    await expect(page.getByText('Workers')).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'Workers' })).toBeVisible();
 
     console.log('[e2e:dashboard] VERIFY: Worker cards rendered');
     await expect(page.getByTestId('worker-card')).toHaveCount(3);
@@ -51,7 +51,7 @@ test.describe('Dashboard', () => {
     await page.goto('/');
 
     console.log('[e2e:dashboard] WAIT: Build History table visible');
-    await expect(page.getByText('Build History')).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'Build History' })).toBeVisible();
     await expect(page.getByRole('table')).toBeVisible();
 
     console.log('[e2e:dashboard] VERIFY: Build rows and statuses');

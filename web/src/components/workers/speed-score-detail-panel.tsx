@@ -281,7 +281,6 @@ export function SpeedScoreDetailPanel({
       className="speedscore-detail-panel"
       role="region"
       aria-labelledby={`panel-title-${workerId}`}
-      aria-expanded={isExpanded}
       data-testid="speedscore-detail-panel"
     >
       <CardHeader
@@ -293,6 +292,7 @@ export function SpeedScoreDetailPanel({
         onKeyDown={handleKeyDown}
         tabIndex={onToggle ? 0 : undefined}
         role={onToggle ? 'button' : undefined}
+        aria-expanded={onToggle ? isExpanded : undefined}
         aria-controls={`panel-content-${workerId}`}
         aria-label={onToggle ? `Toggle SpeedScore details for ${workerId}` : undefined}
       >

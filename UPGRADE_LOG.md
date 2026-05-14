@@ -1,5 +1,49 @@
 # Dependency Upgrade Log
 
+**Date:** 2026-05-14  |  **Project:** remote_compilation_helper  |  **Language:** Rust + Node
+
+## Summary
+- **Updated:** Rust direct dependencies, Rust lockfile transitive dependencies, `/dp` local-owner dependencies, release workflow dependency bootstrapping, and web dashboard dependencies
+- **Skipped:** `ctor` 1.0.5, ESLint 10.3.0, TypeScript 6.0.3
+- **Failed:** 0
+- **Needs attention:** 0
+
+## Updates
+
+### Local-owner libraries from `/dp`
+- **FrankenTUI:** GitHub dependency at `0.2.x` → `/dp/frankentui` crates at `0.4.0`
+- **TOON:** `toon-rust` 0.1.3 → `/dp/toon_rust` package `tru` 0.2.3
+- **rich_rust:** crates.io 0.2.0 with `full` feature → `/dp/rich_rust` 0.2.1 without `full`
+- **Reason:** User requested latest local versions for libraries developed in `/dp`; removing `rich_rust/full` also drops unused `syntect`, `bincode`, and `yaml-rust` audit warnings.
+- **Release workflow:** GitHub release, Windows, and crates.io publish jobs now clone `/dp/rich_rust`, `/dp/toon_rust`, and `/dp/frankentui` so fresh runners reproduce the local path dependency layout.
+- **Tests:** `cargo fmt --check`, `cargo check --workspace --all-targets`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, and `actionlint - < .github/workflows/release.yml` passed after migration fixes.
+
+### Rust dependency refresh
+- **Updated:** `rand` 0.10.0 → 0.10.1, `reqwest` 0.13.2 → 0.13.3, `sha2` 0.10.9 → 0.11.0, `hmac` 0.12 → 0.13, `terminal_size` 0.4.3 → 0.4.4, `lru` 0.16 → 0.18, `proptest` 1.10.0 → 1.11.0, `insta` 1.46 → 1.47.2, `whoami` 2.1 → 2.1.2, `fastrand` 2.3 → 2.4.1, and `rusqlite` 0.38 → 0.39.
+- **Security:** `cargo update` also moved `rustls-webpki` to 0.103.13 and removed the vulnerable/unused rich rendering transitive stack.
+- **Migrations:** Adapted `sha2` 0.11 hex conversion, imported `hmac::KeyInit`, and adjusted TOON encode/decode call sites for the newer local API.
+
+### Web dashboard dependency refresh
+- **Updated:** Next 16.1.3 → 16.2.6, React/React DOM 19.2.3 → 19.2.6, Playwright 1.43 → 1.60.0, Vitest 4.0.17 → 4.1.6, Vite React plugin 5.1.2 → 6.0.1 with direct Vite 8.0.12, jsdom 27.4.0 → 29.1.1, and other dashboard/runtime packages to current compatible releases.
+- **Security:** Added a `postcss` override at 8.5.10+ because the latest Next release still carries a vulnerable nested range; `npm audit --json` reports 0 vulnerabilities after the override.
+- **Tests:** `npm run lint`, `npm test` (133 tests), `npm run build`, and full Playwright `npm run test:e2e -- --workers=1` (316 passed, 44 skipped) passed after updating responsive navigation assertions for the current mobile sidebar behavior.
+
+## Skipped
+
+### ctor: 0.2.9 → 1.0.5
+- **Reason:** ctor 1.x requires `#[ctor(unsafe)]` annotations, conflicting with the repo's unsafe-code policy.
+- **Action:** Kept `ctor` at 0.2.9.
+
+### ESLint: 9.39.4 → 10.3.0
+- **Reason:** Next's current lint dependency stack still includes plugins that peer-declare support through ESLint 9 only.
+- **Action:** Kept ESLint at the newest peer-compatible 9.x release to avoid install/lint warnings.
+
+### TypeScript: 5.9.3 → 6.0.3
+- **Reason:** `typescript-eslint` in the current Next lint stack peer-declares `typescript <6.0.0`.
+- **Action:** Kept TypeScript at the newest peer-compatible 5.9.x release to avoid install/lint warnings.
+
+---
+
 **Date:** 2026-01-25  |  **Project:** remote_compilation_helper  |  **Language:** Rust
 
 ## Summary

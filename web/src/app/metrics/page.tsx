@@ -449,7 +449,11 @@ export default function MetricsPage() {
           </p>
         </div>
         <div className="flex items-center gap-3">
-          <Badge variant={statusBadgeVariant} className="capitalize">
+          <Badge
+            variant={statusBadgeVariant}
+            className="capitalize"
+            data-testid="metrics-status-badge"
+          >
             {statusBadgeLabel}
           </Badge>
           <Button
@@ -542,7 +546,11 @@ export default function MetricsPage() {
                 Budgets keep RCH snappy. If a budget fails, it means the hook or daemon is getting slow.
               </p>
             </div>
-            <Badge variant={statusBadgeVariant} className="capitalize">
+            <Badge
+              variant={statusBadgeVariant}
+              className="capitalize"
+              data-testid="budget-status-badge"
+            >
               {statusBadgeLabel}
             </Badge>
           </div>
@@ -551,6 +559,7 @@ export default function MetricsPage() {
             {budgetData.budgets.map((budget) => (
               <div
                 key={budget.name}
+                data-testid="budget-card"
                 className={`bg-surface border rounded-lg p-4 ${
                   budget.is_passing ? 'border-border' : 'border-error/50'
                 }`}

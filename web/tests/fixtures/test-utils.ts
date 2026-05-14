@@ -61,6 +61,10 @@ export async function mockApiResponses(
   });
 
   await page.route('**/metrics', async (route) => {
+    if (route.request().resourceType() === 'document') {
+      await route.fallback();
+      return;
+    }
     console.log('[mock] Intercepting /metrics');
     await route.fulfill({ body: metrics, contentType: 'text/plain' });
   });

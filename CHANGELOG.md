@@ -14,6 +14,28 @@ No unreleased changes yet.
 
 ---
 
+## [v1.0.25] -- 2026-05-14
+
+### Dependency and release maintenance
+
+- Switched local-owner libraries to the current `/dp` checkouts: FrankenTUI
+  crates now resolve from `/dp/frankentui`, TOON resolves from
+  `/dp/toon_rust`, and `rich_rust` resolves from `/dp/rich_rust`.
+- Refreshed Rust direct dependencies and lockfile, including `reqwest`,
+  `sha2`, `hmac`, `rusqlite`, `proptest`, `insta`, `terminal_size`,
+  `whoami`, `fastrand`, and security-sensitive transitive TLS crates.
+- Removed the `rich_rust/full` feature from RCH's default rich UI path,
+  dropping unmaintained `syntect` transitive dependencies that were not
+  needed by the codebase.
+- Updated the web dashboard dependency stack to current compatible releases
+  and added a `postcss` override so `npm audit` remains clean while Next.js
+  ships its pinned nested dependency.
+- Hardened the release workflow so all release and publish jobs recreate the
+  `/dp` local dependency layout, including Windows builds and crates.io dry
+  runs.
+
+---
+
 ## [v1.0.18] -- 2026-04-16 **(release)**
 
 ### Diagnose + path topology bug fixes

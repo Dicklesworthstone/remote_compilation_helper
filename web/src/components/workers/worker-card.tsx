@@ -99,6 +99,7 @@ export function WorkerCard({
         <div
           className="h-2 bg-surface-elevated rounded-full overflow-hidden"
           role="progressbar"
+          data-testid="worker-slots-bar"
           aria-label="Slots used"
           aria-valuemin={0}
           aria-valuemax={worker.total_slots}
@@ -110,7 +111,7 @@ export function WorkerCard({
             initial={{ width: 0 }}
             animate={{ width: `${slotsUsedPercent}%` }}
             transition={{ duration: 0.5, ease: 'easeOut' }}
-            data-testid="worker-slots-bar"
+            data-testid="worker-slots-fill"
           />
         </div>
       </div>

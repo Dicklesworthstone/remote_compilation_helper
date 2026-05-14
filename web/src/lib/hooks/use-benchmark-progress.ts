@@ -59,83 +59,9 @@ export function useBenchmarkProgress({
   const [state, setState] = useState<BenchmarkState>(initialState);
   const eventSourceRef = useRef<EventSource | null>(null);
   const isActiveRef = useRef(false);
-
-  // Connect to SSE for the worker
-  const connect = useCallback(() => {
-    if (eventSourceRef.current) {
-      eventSourceRef.current.close();
-    }
-
-    const url = `/api/ws?subscribe=${encodeURIComponent(workerId)}`;
-    const eventSource = new EventSource(url);
-    eventSourceRef.current = eventSource;
-    isActiveRef.current = true;
-
-    eventSource.addEventListener('message', (event) => {
-      if (!isActiveRef.current) return;
-
-      try {
-        const data = JSON.parse(event.data);
-        handleEvent(data);
-      } catch {
-        // Ignore parse errors
-      }
-    });
-
-    // Also listen for specific event types
-    eventSource.addEventListener('benchmark_queued', (event) => {
-      if (!isActiveRef.current) return;
-      try {
-        const data = JSON.parse((event as MessageEvent).data);
-        handleBenchmarkQueued(data);
-      } catch {
-        // Ignore
-      }
-    });
-
-    eventSource.onerror = () => {
-      // Reconnect after a delay if still active
-      if (isActiveRef.current && state.status === 'running') {
-        setTimeout(() => {
-          if (isActiveRef.current) connect();
-        }, 3000);
-      }
-    };
-  }, [workerId, state.status]);
-
-  // Cleanup on unmount
-  useEffect(() => {
-    return () => {
-      isActiveRef.current = false;
-      if (eventSourceRef.current) {
-        eventSourceRef.current.close();
-        eventSourceRef.current = null;
-      }
-    };
-  }, []);
-
-  const handleEvent = useCallback((data: unknown) => {
-    const event = data as { event?: string; data?: Record<string, unknown> };
-    if (!event.event) return;
-
-    switch (event.event) {
-      case 'benchmark_queued':
-        handleBenchmarkQueued(event.data as BenchmarkQueuedEvent['data']);
-        break;
-      case 'benchmark_started':
-        handleBenchmarkStarted(event.data as BenchmarkStartedEvent['data']);
-        break;
-      case 'benchmark_progress':
-        handleBenchmarkProgress(event.data as BenchmarkProgressEvent['data']);
-        break;
-      case 'benchmark_completed':
-        handleBenchmarkCompleted(event.data as BenchmarkCompletedEvent['data']);
-        break;
-      case 'benchmark_failed':
-        handleBenchmarkFailed(event.data as BenchmarkFailedEvent['data']);
-        break;
-    }
-  }, []);
+  const statusRef = useRef(state.status);
+  const reconnectRef = useRef<() => void>(() => {});
+  statusRef.current = state.status;
 
   const handleBenchmarkQueued = useCallback((data: BenchmarkQueuedEvent['data']) => {
     if (data.worker_id !== workerId) return;
@@ -202,6 +128,92 @@ export function useBenchmarkProgress({
       eventSourceRef.current = null;
     }
   }, [workerId, onFailed]);
+
+  const handleEvent = useCallback((data: unknown) => {
+    const event = data as { event?: string; data?: Record<string, unknown> };
+    if (!event.event) return;
+
+    switch (event.event) {
+      case 'benchmark_queued':
+        handleBenchmarkQueued(event.data as BenchmarkQueuedEvent['data']);
+        break;
+      case 'benchmark_started':
+        handleBenchmarkStarted(event.data as BenchmarkStartedEvent['data']);
+        break;
+      case 'benchmark_progress':
+        handleBenchmarkProgress(event.data as BenchmarkProgressEvent['data']);
+        break;
+      case 'benchmark_completed':
+        handleBenchmarkCompleted(event.data as BenchmarkCompletedEvent['data']);
+        break;
+      case 'benchmark_failed':
+        handleBenchmarkFailed(event.data as BenchmarkFailedEvent['data']);
+        break;
+    }
+  }, [
+    handleBenchmarkCompleted,
+    handleBenchmarkFailed,
+    handleBenchmarkProgress,
+    handleBenchmarkQueued,
+    handleBenchmarkStarted,
+  ]);
+
+  // Connect to SSE for the worker
+  const connect = useCallback(() => {
+    if (eventSourceRef.current) {
+      eventSourceRef.current.close();
+    }
+
+    const url = `/api/ws?subscribe=${encodeURIComponent(workerId)}`;
+    const eventSource = new EventSource(url);
+    eventSourceRef.current = eventSource;
+    isActiveRef.current = true;
+
+    eventSource.addEventListener('message', (event) => {
+      if (!isActiveRef.current) return;
+
+      try {
+        const data = JSON.parse(event.data);
+        handleEvent(data);
+      } catch {
+        // Ignore parse errors
+      }
+    });
+
+    // Also listen for specific event types
+    eventSource.addEventListener('benchmark_queued', (event) => {
+      if (!isActiveRef.current) return;
+      try {
+        const data = JSON.parse((event as MessageEvent).data);
+        handleBenchmarkQueued(data);
+      } catch {
+        // Ignore
+      }
+    });
+
+    eventSource.onerror = () => {
+      // Reconnect after a delay if still active
+      if (isActiveRef.current && statusRef.current === 'running') {
+        setTimeout(() => {
+          if (isActiveRef.current) {
+            reconnectRef.current();
+          }
+        }, 3000);
+      }
+    };
+  }, [handleBenchmarkQueued, handleEvent, workerId]);
+  reconnectRef.current = connect;
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      isActiveRef.current = false;
+      if (eventSourceRef.current) {
+        eventSourceRef.current.close();
+        eventSourceRef.current = null;
+      }
+    };
+  }, []);
 
   /**
    * Trigger a benchmark for the worker.

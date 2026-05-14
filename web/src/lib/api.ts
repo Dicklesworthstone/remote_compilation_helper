@@ -95,6 +95,14 @@ export const api = {
         'Accept': 'text/plain',
       },
     });
+    if (!response.ok) {
+      const text = await response.text();
+      throw new ApiError(
+        `API request failed: ${response.statusText}`,
+        response.status,
+        text
+      );
+    }
     return response.text();
   },
 

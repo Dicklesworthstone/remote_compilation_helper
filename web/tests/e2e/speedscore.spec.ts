@@ -4,26 +4,9 @@ import {
   mockWorkers,
   mockSpeedScores,
   mockSpeedScoreListResponse,
-  mockSpeedScoreHistoryResponse,
   mockDaemonStatus,
   mockStats,
 } from '../fixtures/api-mocks';
-
-const scoreLevelLabel: Record<string, string> = {
-  excellent: 'Excellent',
-  good: 'Good',
-  average: 'Average',
-  below_average: 'Below Average',
-  poor: 'Poor',
-};
-
-function getScoreLevel(score: number): string {
-  if (score >= 90) return 'excellent';
-  if (score >= 70) return 'good';
-  if (score >= 50) return 'average';
-  if (score >= 30) return 'below_average';
-  return 'poor';
-}
 
 test.describe('SpeedScore Badge Display', () => {
   test('worker cards display SpeedScore badges', async ({ page }) => {

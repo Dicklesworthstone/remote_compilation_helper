@@ -26,6 +26,7 @@ test('workers grid displays all workers', async ({ page }) => {
   console.log('[e2e:workers] NAVIGATE: Loaded /workers');
 
   const workerCards = page.locator('[data-testid="worker-card"]');
+  await expect(workerCards).toHaveCount(mockWorkers.length);
   const count = await workerCards.count();
   console.log(`[e2e:workers] FOUND: ${count} worker cards`);
 
@@ -121,4 +122,3 @@ test('workers page shows empty state when no workers configured', async ({ page 
   await expect(page.getByText('Add workers to your config to get started.')).toBeVisible();
   console.log('[e2e:workers] TEST PASS: empty state visible');
 });
-
