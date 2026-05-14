@@ -584,7 +584,7 @@ impl ErrorCode {
             Self::ConfigNotFound => &[
                 "Run 'rch init' to create a default configuration",
                 "Check if ~/.config/rch/config.toml exists",
-                "Set RCH_CONFIG environment variable to specify custom path",
+                "Set RCH_CONFIG_DIR environment variable to specify custom config directory",
             ],
             Self::ConfigReadError => &[
                 "Check file permissions on the configuration file",

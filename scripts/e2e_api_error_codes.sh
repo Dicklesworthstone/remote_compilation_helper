@@ -266,12 +266,14 @@ run_tests() {
     # Test 3: Invalid config file error
     # =========================================================================
     log "INFO" "Test 3: Invalid config file error"
-    local invalid_config
-    invalid_config=$(mktemp --suffix=.toml)
+    local invalid_config_dir invalid_config
+    invalid_config_dir=$(mktemp -d)
+    invalid_config="$invalid_config_dir/config.toml"
     echo 'invalid toml [' > "$invalid_config"
 
-    output=$(RCH_CONFIG="$invalid_config" "$rch" status --json 2>&1 || true)
+    output=$(RCH_CONFIG_DIR="$invalid_config_dir" "$rch" status --json 2>&1 || true)
     rm -f "$invalid_config"
+    rmdir "$invalid_config_dir"
     [[ "$VERBOSE" == "1" ]] && log "DEBUG" "Output: $output"
 
     # Config errors should have RCH-E format if triggered

@@ -4,7 +4,6 @@
 use crate::error::PlatformError;
 use crate::error::{DaemonError, SshError};
 use anyhow::{Context, Result};
-use directories::ProjectDirs;
 use rch_common::{RequiredRuntime, WorkerConfig, WorkerId};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -576,7 +575,7 @@ pub fn config_dir() -> Option<PathBuf> {
     if let Some(dir) = test_config_dir_override() {
         return Some(dir);
     }
-    ProjectDirs::from("com", "rch", "rch").map(|dirs| dirs.config_dir().to_path_buf())
+    crate::config::config_dir()
 }
 
 #[cfg(test)]

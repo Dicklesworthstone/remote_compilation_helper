@@ -5,8 +5,11 @@
 use anyhow::{Context, Result};
 use rch_common::{RchConfig, SelfTestConfig, WorkerConfig, validate_remote_base};
 use serde::{Deserialize, Serialize};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
+
+const RCH_CONFIG_DIR_ENV: &str = "RCH_CONFIG_DIR";
 
 /// Default config directory name.
 const CONFIG_DIR_NAME: &str = "rch";
@@ -273,8 +276,22 @@ fn default_priority() -> u32 {
 
 /// Get the configuration directory path.
 pub fn config_dir() -> Option<PathBuf> {
+    if let Some(path) = config_dir_from_env_value(std::env::var_os(RCH_CONFIG_DIR_ENV).as_deref()) {
+        return Some(path);
+    }
+
     directories::ProjectDirs::from("com", "rch", CONFIG_DIR_NAME)
         .map(|dirs| dirs.config_dir().to_path_buf())
+}
+
+fn config_dir_from_env_value(value: Option<&OsStr>) -> Option<PathBuf> {
+    let raw = value?;
+    if raw.is_empty() {
+        return None;
+    }
+
+    let expanded = shellexpand::tilde(&raw.to_string_lossy()).into_owned();
+    Some(PathBuf::from(expanded))
 }
 
 /// Load daemon configuration from file.
@@ -466,6 +483,22 @@ mod tests {
         assert_eq!(config.socket_path, expected_socket);
         assert_eq!(config.health_check_interval_secs, 30);
         assert!(config.connection_pooling);
+    }
+
+    #[test]
+    fn test_config_dir_env_value_override() {
+        let _guard = test_guard!();
+        let path = config_dir_from_env_value(Some(OsStr::new("~/rch-daemon-config")));
+        assert_eq!(
+            path,
+            Some(PathBuf::from(format!(
+                "{}/rch-daemon-config",
+                std::env::var("HOME").expect("HOME should be set for tests")
+            )))
+        );
+
+        assert_eq!(config_dir_from_env_value(Some(OsStr::new(""))), None);
+        assert_eq!(config_dir_from_env_value(None), None);
     }
 
     #[test]

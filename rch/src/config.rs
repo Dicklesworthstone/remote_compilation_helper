@@ -10,8 +10,11 @@ use rch_common::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use tracing::{debug, warn};
+
+const RCH_CONFIG_DIR_ENV: &str = "RCH_CONFIG_DIR";
 
 #[cfg(test)]
 use std::sync::{Mutex, OnceLock};
@@ -29,7 +32,21 @@ pub fn set_test_config_override(config: Option<RchConfig>) {
 
 /// Get the user config directory.
 pub fn config_dir() -> Option<PathBuf> {
+    if let Some(path) = config_dir_from_env_value(std::env::var_os(RCH_CONFIG_DIR_ENV).as_deref()) {
+        return Some(path);
+    }
+
     ProjectDirs::from("com", "rch", "rch").map(|dirs| dirs.config_dir().to_path_buf())
+}
+
+fn config_dir_from_env_value(value: Option<&OsStr>) -> Option<PathBuf> {
+    let raw = value?;
+    if raw.is_empty() {
+        return None;
+    }
+
+    let expanded = shellexpand::tilde(&raw.to_string_lossy()).into_owned();
+    Some(PathBuf::from(expanded))
 }
 
 // ============================================================================
@@ -630,7 +647,9 @@ struct PartialOutputConfig {
 struct PartialSelfHealingConfig {
     hook_starts_daemon: Option<bool>,
     daemon_installs_hooks: Option<bool>,
+    #[serde(alias = "auto_start_cooldown")]
     auto_start_cooldown_secs: Option<u64>,
+    #[serde(alias = "daemon_start_timeout", alias = "auto_start_timeout")]
     auto_start_timeout_secs: Option<u64>,
     self_healing_log_level: Option<SelfHealingLogLevel>,
 }
@@ -713,22 +732,63 @@ fn load_config_with_sources_from_paths(
 fn load_partial_config(path: &Path) -> Result<PartialRchConfig> {
     let content =
         std::fs::read_to_string(path).with_context(|| format!("Failed to read {:?}", path))?;
-    let parsed: PartialRchConfig =
+    let mut value: toml::Value =
         toml::from_str(&content).with_context(|| format!("Failed to parse {:?}", path))?;
+    canonicalize_config_aliases(&mut value);
+    let parsed: PartialRchConfig = value
+        .try_into()
+        .with_context(|| format!("Failed to decode partial config for {:?}", path))?;
     Ok(parsed)
 }
 
 fn load_config_overlay(base: RchConfig, path: &Path) -> Result<RchConfig> {
     let content =
         std::fs::read_to_string(path).with_context(|| format!("Failed to read {:?}", path))?;
-    let overlay: toml::Value =
+    let mut overlay: toml::Value =
         toml::from_str(&content).with_context(|| format!("Failed to parse {:?}", path))?;
+    canonicalize_config_aliases(&mut overlay);
     let mut merged =
         toml::Value::try_from(base).context("Failed to encode base RCH config as TOML")?;
     merge_toml_overlay(&mut merged, overlay);
     merged
         .try_into()
         .with_context(|| format!("Failed to decode merged config for {:?}", path))
+}
+
+fn canonicalize_config_aliases(value: &mut toml::Value) {
+    let toml::Value::Table(root) = value else {
+        return;
+    };
+    let Some(toml::Value::Table(self_healing)) = root.get_mut("self_healing") else {
+        return;
+    };
+
+    canonicalize_table_key(
+        self_healing,
+        "auto_start_cooldown",
+        "auto_start_cooldown_secs",
+    );
+    canonicalize_table_key(
+        self_healing,
+        "daemon_start_timeout",
+        "auto_start_timeout_secs",
+    );
+    canonicalize_table_key(
+        self_healing,
+        "auto_start_timeout",
+        "auto_start_timeout_secs",
+    );
+}
+
+fn canonicalize_table_key(table: &mut toml::Table, alias: &str, canonical: &str) {
+    if table.contains_key(canonical) {
+        table.remove(alias);
+        return;
+    }
+
+    if let Some(value) = table.remove(alias) {
+        table.insert(canonical.to_string(), value);
+    }
 }
 
 fn merge_toml_overlay(base: &mut toml::Value, overlay: toml::Value) {
@@ -2339,6 +2399,21 @@ mod tests {
     use tracing::info;
 
     #[test]
+    fn test_config_dir_env_value_override() {
+        let _guard = test_guard!();
+        let override_path = std::ffi::OsStr::new("/tmp/rch-custom-config");
+
+        let resolved = super::config_dir_from_env_value(Some(override_path));
+
+        assert_eq!(resolved, Some(PathBuf::from("/tmp/rch-custom-config")));
+        assert_eq!(
+            super::config_dir_from_env_value(Some(std::ffi::OsStr::new(""))),
+            None
+        );
+        assert_eq!(super::config_dir_from_env_value(None), None);
+    }
+
+    #[test]
     fn test_default_config() {
         let _guard = test_guard!();
         info!("TEST: test_default_config");
@@ -3558,6 +3633,44 @@ canonical_root = "/from/toml"
         );
 
         info!("PASS: self_healing env overrides applied with source tracking");
+    }
+
+    #[test]
+    fn test_self_healing_file_aliases_apply_through_partial_loader() {
+        let _guard = test_guard!();
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let user_path = temp_dir.path().join("config.toml");
+        std::fs::write(
+            &user_path,
+            r#"
+[self_healing]
+auto_start_cooldown = 45
+daemon_start_timeout = 7
+"#,
+        )
+        .expect("write config");
+
+        let env_overrides: HashMap<String, String> = HashMap::new();
+        let loaded =
+            load_config_with_sources_from_paths(Some(&user_path), None, Some(&env_overrides))
+                .expect("load config");
+
+        assert_eq!(loaded.config.self_healing.auto_start_cooldown_secs, 45);
+        assert_eq!(loaded.config.self_healing.auto_start_timeout_secs, 7);
+        assert_eq!(
+            loaded
+                .sources
+                .get("self_healing.auto_start_cooldown_secs")
+                .expect("cooldown source"),
+            &ConfigValueSource::UserConfig(user_path.clone())
+        );
+        assert_eq!(
+            loaded
+                .sources
+                .get("self_healing.auto_start_timeout_secs")
+                .expect("timeout source"),
+            &ConfigValueSource::UserConfig(user_path)
+        );
     }
 
     #[test]
