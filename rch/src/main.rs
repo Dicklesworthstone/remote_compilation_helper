@@ -30,9 +30,10 @@ mod update;
 use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::CompleteEnv;
-use rch_common::{ApiResponse, LogConfig, init_logging};
+use rch_common::{ApiError, ApiResponse, ErrorCode, LogConfig, init_logging};
 use schemars::schema_for;
 use std::env;
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::Arc;
 use ui::{ColorChoice, OutputConfig, OutputContext, OutputFormat};
@@ -1553,13 +1554,38 @@ fn base_log_level_for_cli(cli: &Cli) -> String {
 /// Multi-threaded runtime spawns one thread per CPU core (64 cores = 128MB stack allocations).
 /// Current-thread runtime uses a single thread, drastically reducing startup time.
 #[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<()> {
+async fn main() {
+    let args: Vec<OsString> = env::args_os().collect();
+    let wants_machine_output = top_level_machine_output_requested(&args);
+
+    if let Err(error) = run(args).await {
+        if wants_machine_output {
+            let response: ApiResponse<()> =
+                ApiResponse::err(top_level_command_label(), top_level_api_error(&error));
+            match serde_json::to_string_pretty(&response) {
+                Ok(json) => println!("{json}"),
+                Err(serialize_error) => {
+                    eprintln!("Error: {error:#}");
+                    eprintln!("Failed to serialize JSON error response: {serialize_error}");
+                }
+            }
+        } else {
+            eprintln!("Error: {error:#}");
+        }
+        std::process::exit(1);
+    }
+}
+
+async fn run(args: Vec<OsString>) -> Result<()> {
     // Handle dynamic shell completions (exits if handling a completion request)
     CompleteEnv::with_factory(Cli::command).complete();
 
     // Early check for --help-json to handle it before full clap parsing
     // (which would fail on subcommands that require further arguments)
-    let args: Vec<String> = env::args().collect();
+    let args: Vec<String> = args
+        .iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
     if args.iter().any(|a| a == "--help-json") {
         let subcommand_path: Vec<String> = args
             .iter()
@@ -1817,6 +1843,54 @@ async fn main() -> Result<()> {
             Commands::Schema { action } => handle_schema_command(action, &ctx),
         },
     }
+}
+
+fn top_level_machine_output_requested(args: &[OsString]) -> bool {
+    if env::var_os("RCH_JSON").is_some_and(|value| value != "0" && !value.is_empty())
+        || env::var_os("RCH_OUTPUT_FORMAT").is_some_and(|value| !value.is_empty())
+        || env::var_os("TOON_DEFAULT_FORMAT").is_some_and(|value| !value.is_empty())
+    {
+        return true;
+    }
+
+    for arg in args.iter().skip(1) {
+        let Some(arg) = arg.to_str() else {
+            continue;
+        };
+
+        match arg {
+            "--json" | "-j" | "--help-json" | "--capabilities" | "--schema" | "--robot-triage" => {
+                return true;
+            }
+            "--format" | "-F" => {
+                return true;
+            }
+            _ if arg.starts_with("--format=") => return true,
+            _ => {}
+        }
+    }
+
+    false
+}
+
+fn top_level_api_error(error: &anyhow::Error) -> ApiError {
+    let details = format!("{error:#}");
+    let code = if details.contains("TOML parse error")
+        || details.contains("Failed to parse")
+        || details.contains("Failed to decode")
+    {
+        ErrorCode::ConfigParseError
+    } else if details.contains("Failed to read") {
+        ErrorCode::ConfigReadError
+    } else {
+        ErrorCode::InternalStateError
+    };
+
+    ApiError::from_code(code).with_details(details)
+}
+
+fn top_level_command_label() -> &'static str {
+    "rch"
 }
 
 /// Handle 'rch schema' subcommands.
