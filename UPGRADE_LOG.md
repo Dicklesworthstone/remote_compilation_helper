@@ -6,7 +6,7 @@
 - **Updated:** Rust workspace dependencies, local authored `/dp` crates, and web dashboard dependencies
 - **Skipped latest:** 2 web majors due current peer constraints
 - **Failed:** 0
-- **Release target:** 1.0.25
+- **Release target:** 1.0.26
 
 ## Rust Updates
 
@@ -53,7 +53,14 @@
 - `cargo audit`: no vulnerabilities or warnings after lockfile and feature cleanup.
 - `npm outdated`: only the intentional `eslint` 10 and TypeScript 6 peer-incompatible majors remain.
 - `npm audit`: 0 vulnerabilities.
-- Full release-gate commands are run separately before publishing 1.0.25.
+- Full release-gate commands are run separately before publishing 1.0.26.
+
+### 2026-05-14 follow-up: DSR release verifier compatibility
+
+DSR's post-release verifier invokes `rch upgrade --check`, while RCH exposed
+the self-update workflow as `rch update --check`. Added `upgrade` as a visible
+alias for `update` and superseded `v1.0.25` with `v1.0.26` so release
+verification and user-facing self-update vocabulary both work.
 
 ---
 

@@ -611,8 +611,11 @@ CHECKS PERFORMED:
     },
 
     /// Update RCH binaries on local machine and/or workers
-    #[command(after_help = r#"EXAMPLES:
+    #[command(
+        visible_alias = "upgrade",
+        after_help = r#"EXAMPLES:
     rch update --check          # Check for available updates
+    rch upgrade --check         # Same as 'rch update --check'
     rch update                  # Update to latest stable
     rch update --channel=beta   # Update to beta channel
     rch update --version=v0.3.0 # Install specific version
@@ -620,7 +623,8 @@ CHECKS PERFORMED:
     rch update --dry-run        # Preview what would happen
     rch update --rollback       # Restore previous version
     rch update --verify         # Check installation integrity
-    rch update --skip-verify    # Skip checksum verification (dangerous)"#)]
+    rch update --skip-verify    # Skip checksum verification (dangerous)"#
+    )]
     Update {
         /// Check for updates without installing
         #[arg(long)]
@@ -3064,7 +3068,7 @@ async fn handle_cache_warm(
         );
     }
 
-    let session_start = std::time::Instant::now();
+    let cache_warm_started_at = std::time::Instant::now();
     let transfer_config = rch_config.transfer;
     let mut results: Vec<CacheWarmWorkerResult> = Vec::with_capacity(selected.len());
     let mut total_bytes: u64 = 0;
@@ -3146,7 +3150,7 @@ async fn handle_cache_warm(
         }
     }
 
-    let total_duration_ms = session_start.elapsed().as_millis() as u64;
+    let total_duration_ms = cache_warm_started_at.elapsed().as_millis() as u64;
     let response = CacheWarmResponse {
         project_root: project_root.display().to_string(),
         project_id: project_id.clone(),
@@ -3708,6 +3712,11 @@ mod tests {
     use super::*;
     use rch_common::test_guard;
 
+    #[track_caller]
+    fn fail_expected(message: &str) {
+        assert!(std::hint::black_box(false), "{message}");
+    }
+
     // -------------------------------------------------------------------------
     // CLI Parsing Tests
     // -------------------------------------------------------------------------
@@ -3842,7 +3851,7 @@ mod tests {
             Some(Commands::Daemon {
                 action: DaemonAction::Start,
             }) => {}
-            _ => panic!("Expected daemon start command"),
+            _ => fail_expected("Expected daemon start command"),
         }
     }
 
@@ -3856,7 +3865,7 @@ mod tests {
             }) => {
                 assert!(!yes, "yes should default to false");
             }
-            _ => panic!("Expected daemon stop command"),
+            _ => fail_expected("Expected daemon stop command"),
         }
     }
 
@@ -3870,7 +3879,7 @@ mod tests {
             }) => {
                 assert!(yes, "yes should be true");
             }
-            _ => panic!("Expected daemon stop --yes command"),
+            _ => fail_expected("Expected daemon stop --yes command"),
         }
     }
 
@@ -3884,7 +3893,7 @@ mod tests {
             }) => {
                 assert!(!yes, "yes should default to false");
             }
-            _ => panic!("Expected daemon restart command"),
+            _ => fail_expected("Expected daemon restart command"),
         }
     }
 
@@ -3898,7 +3907,7 @@ mod tests {
             }) => {
                 assert!(yes, "yes should be true with -y flag");
             }
-            _ => panic!("Expected daemon restart -y command"),
+            _ => fail_expected("Expected daemon restart -y command"),
         }
     }
 
@@ -3910,7 +3919,7 @@ mod tests {
             Some(Commands::Daemon {
                 action: DaemonAction::Status,
             }) => {}
-            _ => panic!("Expected daemon status command"),
+            _ => fail_expected("Expected daemon status command"),
         }
     }
 
@@ -3924,7 +3933,7 @@ mod tests {
             }) => {
                 assert_eq!(lines, 50);
             }
-            _ => panic!("Expected daemon logs command"),
+            _ => fail_expected("Expected daemon logs command"),
         }
     }
 
@@ -3938,7 +3947,7 @@ mod tests {
             }) => {
                 assert_eq!(lines, 100);
             }
-            _ => panic!("Expected daemon logs command"),
+            _ => fail_expected("Expected daemon logs command"),
         }
     }
 
@@ -3956,7 +3965,7 @@ mod tests {
             }) => {
                 assert!(!speedscore);
             }
-            _ => panic!("Expected workers list command"),
+            _ => fail_expected("Expected workers list command"),
         }
     }
 
@@ -3971,7 +3980,7 @@ mod tests {
                 assert!(!refresh);
                 assert!(command.is_none());
             }
-            _ => panic!("Expected workers capabilities command"),
+            _ => fail_expected("Expected workers capabilities command"),
         }
     }
 
@@ -3994,7 +4003,7 @@ mod tests {
                 assert!(refresh);
                 assert_eq!(command.as_deref(), Some("bun test"));
             }
-            _ => panic!("Expected workers capabilities command"),
+            _ => fail_expected("Expected workers capabilities command"),
         }
     }
 
@@ -4009,7 +4018,7 @@ mod tests {
                 assert_eq!(worker, Some("css".to_string()));
                 assert!(!all);
             }
-            _ => panic!("Expected workers probe command"),
+            _ => fail_expected("Expected workers probe command"),
         }
     }
 
@@ -4024,7 +4033,7 @@ mod tests {
                 assert!(worker.is_none());
                 assert!(all);
             }
-            _ => panic!("Expected workers probe command"),
+            _ => fail_expected("Expected workers probe command"),
         }
     }
 
@@ -4036,7 +4045,7 @@ mod tests {
             Some(Commands::Workers {
                 action: WorkersAction::Benchmark,
             }) => {}
-            _ => panic!("Expected workers benchmark command"),
+            _ => fail_expected("Expected workers benchmark command"),
         }
     }
 
@@ -4050,7 +4059,7 @@ mod tests {
             }) => {
                 assert_eq!(worker, "css");
             }
-            _ => panic!("Expected workers drain command"),
+            _ => fail_expected("Expected workers drain command"),
         }
     }
 
@@ -4064,7 +4073,7 @@ mod tests {
             }) => {
                 assert_eq!(worker, "css");
             }
-            _ => panic!("Expected workers enable command"),
+            _ => fail_expected("Expected workers enable command"),
         }
     }
 
@@ -4080,7 +4089,7 @@ mod tests {
                 assert!(add);
                 assert!(!yes);
             }
-            _ => panic!("Expected workers discover command"),
+            _ => fail_expected("Expected workers discover command"),
         }
     }
 
@@ -4094,7 +4103,7 @@ mod tests {
             }) => {
                 assert!(!yes);
             }
-            _ => panic!("Expected workers init command"),
+            _ => fail_expected("Expected workers init command"),
         }
     }
 
@@ -4108,7 +4117,7 @@ mod tests {
             }) => {
                 assert!(yes);
             }
-            _ => panic!("Expected workers init command with --yes"),
+            _ => fail_expected("Expected workers init command with --yes"),
         }
     }
 
@@ -4122,7 +4131,7 @@ mod tests {
             }) => {
                 assert!(yes);
             }
-            _ => panic!("Expected workers init command with -y"),
+            _ => fail_expected("Expected workers init command with -y"),
         }
     }
 
@@ -4139,7 +4148,7 @@ mod tests {
                 assert!(!workers);
                 assert!(!jobs);
             }
-            _ => panic!("Expected status command"),
+            _ => fail_expected("Expected status command"),
         }
     }
 
@@ -4152,7 +4161,7 @@ mod tests {
                 assert!(workers);
                 assert!(!jobs);
             }
-            _ => panic!("Expected status command"),
+            _ => fail_expected("Expected status command"),
         }
     }
 
@@ -4165,7 +4174,7 @@ mod tests {
                 assert!(!workers);
                 assert!(jobs);
             }
-            _ => panic!("Expected status command"),
+            _ => fail_expected("Expected status command"),
         }
     }
 
@@ -4178,7 +4187,7 @@ mod tests {
                 assert!(workers);
                 assert!(jobs);
             }
-            _ => panic!("Expected status command"),
+            _ => fail_expected("Expected status command"),
         }
     }
 
@@ -4196,7 +4205,7 @@ mod tests {
             }) => {
                 assert!(!sources);
             }
-            _ => panic!("Expected config show command"),
+            _ => fail_expected("Expected config show command"),
         }
     }
 
@@ -4210,7 +4219,7 @@ mod tests {
             }) => {
                 assert!(sources);
             }
-            _ => panic!("Expected config show command"),
+            _ => fail_expected("Expected config show command"),
         }
     }
 
@@ -4225,7 +4234,7 @@ mod tests {
                 assert_eq!(key, "general.enabled");
                 assert!(!sources);
             }
-            _ => panic!("Expected config get command"),
+            _ => fail_expected("Expected config get command"),
         }
     }
 
@@ -4241,7 +4250,7 @@ mod tests {
                 assert_eq!(key, "general.enabled");
                 assert!(sources);
             }
-            _ => panic!("Expected config get command"),
+            _ => fail_expected("Expected config get command"),
         }
     }
 
@@ -4258,7 +4267,7 @@ mod tests {
                 assert_eq!(command, vec!["cargo build --release"]);
                 assert!(!dry_run);
             }
-            _ => panic!("Expected diagnose command"),
+            _ => fail_expected("Expected diagnose command"),
         }
     }
 
@@ -4271,7 +4280,7 @@ mod tests {
                 assert_eq!(command, vec!["cargo", "build", "--release"]);
                 assert!(!dry_run);
             }
-            _ => panic!("Expected diagnose command"),
+            _ => fail_expected("Expected diagnose command"),
         }
     }
 
@@ -4284,7 +4293,7 @@ mod tests {
                 assert_eq!(command, vec!["cargo", "build"]);
                 assert!(dry_run);
             }
-            _ => panic!("Expected diagnose command"),
+            _ => fail_expected("Expected diagnose command"),
         }
     }
 
@@ -4297,7 +4306,7 @@ mod tests {
                 assert_eq!(command, vec!["cargo", "build"]);
                 assert!(dry_run);
             }
-            _ => panic!("Expected diagnose command"),
+            _ => fail_expected("Expected diagnose command"),
         }
     }
 
@@ -4316,7 +4325,7 @@ mod tests {
                 assert!(!wizard);
                 assert!(!non_interactive);
             }
-            _ => panic!("Expected config init command"),
+            _ => fail_expected("Expected config init command"),
         }
     }
 
@@ -4330,7 +4339,7 @@ mod tests {
             }) => {
                 assert!(wizard);
             }
-            _ => panic!("Expected config init command"),
+            _ => fail_expected("Expected config init command"),
         }
     }
 
@@ -4342,7 +4351,7 @@ mod tests {
             Some(Commands::Config {
                 action: ConfigAction::Validate,
             }) => {}
-            _ => panic!("Expected config validate command"),
+            _ => fail_expected("Expected config validate command"),
         }
     }
 
@@ -4357,7 +4366,7 @@ mod tests {
                 assert_eq!(key, "log_level");
                 assert_eq!(value, "debug");
             }
-            _ => panic!("Expected config set command"),
+            _ => fail_expected("Expected config set command"),
         }
     }
 
@@ -4371,7 +4380,7 @@ mod tests {
             }) => {
                 assert_eq!(key, "general.enabled");
             }
-            _ => panic!("Expected config reset command"),
+            _ => fail_expected("Expected config reset command"),
         }
     }
 
@@ -4385,7 +4394,7 @@ mod tests {
             }) => {
                 assert_eq!(format, "shell");
             }
-            _ => panic!("Expected config export command"),
+            _ => fail_expected("Expected config export command"),
         }
     }
 
@@ -4397,7 +4406,7 @@ mod tests {
             Some(Commands::Config {
                 action: ConfigAction::Lint,
             }) => {}
-            _ => panic!("Expected config lint command"),
+            _ => fail_expected("Expected config lint command"),
         }
     }
 
@@ -4409,7 +4418,7 @@ mod tests {
             Some(Commands::Config {
                 action: ConfigAction::Diff,
             }) => {}
-            _ => panic!("Expected config diff command"),
+            _ => fail_expected("Expected config diff command"),
         }
     }
 
@@ -4425,7 +4434,7 @@ mod tests {
             Some(Commands::Hook {
                 action: HookAction::Install,
             }) => {}
-            _ => panic!("Expected hook install command"),
+            _ => fail_expected("Expected hook install command"),
         }
     }
 
@@ -4437,7 +4446,7 @@ mod tests {
             Some(Commands::Hook {
                 action: HookAction::Uninstall { .. },
             }) => {}
-            _ => panic!("Expected hook uninstall command"),
+            _ => fail_expected("Expected hook uninstall command"),
         }
     }
 
@@ -4449,7 +4458,7 @@ mod tests {
             Some(Commands::Hook {
                 action: HookAction::Test,
             }) => {}
-            _ => panic!("Expected hook test command"),
+            _ => fail_expected("Expected hook test command"),
         }
     }
 
@@ -4468,7 +4477,7 @@ mod tests {
                 assert!(workers.is_empty(), "default --workers must be empty");
                 assert!(project.is_none(), "default --project must be None");
             }
-            _ => panic!("Expected cache warm command"),
+            _ => fail_expected("Expected cache warm command"),
         }
     }
 
@@ -4484,7 +4493,7 @@ mod tests {
                         project: _,
                     },
             }) => assert_eq!(workers, vec!["css".to_string()]),
-            _ => panic!("Expected cache warm command"),
+            _ => fail_expected("Expected cache warm command"),
         }
     }
 
@@ -4509,7 +4518,7 @@ mod tests {
                         project: _,
                     },
             }) => assert_eq!(workers, vec!["css".to_string(), "vmi1".to_string()]),
-            _ => panic!("Expected cache warm command"),
+            _ => fail_expected("Expected cache warm command"),
         }
     }
 
@@ -4526,7 +4535,7 @@ mod tests {
                         project,
                     },
             }) => assert_eq!(project, Some(PathBuf::from("/tmp/some/project"))),
-            _ => panic!("Expected cache warm command"),
+            _ => fail_expected("Expected cache warm command"),
         }
     }
 
@@ -4610,7 +4619,7 @@ mod tests {
                 assert!(!strict);
                 assert!(!lenient);
             }
-            _ => panic!("Expected doctor command"),
+            _ => fail_expected("Expected doctor command"),
         }
     }
 
@@ -4641,7 +4650,7 @@ mod tests {
                 assert!(!strict);
                 assert!(!lenient);
             }
-            _ => panic!("Expected doctor command"),
+            _ => fail_expected("Expected doctor command"),
         }
     }
 
@@ -4672,7 +4681,7 @@ mod tests {
                 assert!(!strict);
                 assert!(!lenient);
             }
-            _ => panic!("Expected doctor command"),
+            _ => fail_expected("Expected doctor command"),
         }
     }
 
@@ -4703,7 +4712,7 @@ mod tests {
                 assert!(!strict);
                 assert!(!lenient);
             }
-            _ => panic!("Expected doctor command"),
+            _ => fail_expected("Expected doctor command"),
         }
     }
 
@@ -4734,7 +4743,7 @@ mod tests {
                 assert!(!strict);
                 assert!(!lenient);
             }
-            _ => panic!("Expected doctor command"),
+            _ => fail_expected("Expected doctor command"),
         }
     }
 
@@ -4766,7 +4775,7 @@ mod tests {
                 assert!(!strict);
                 assert!(!lenient);
             }
-            _ => panic!("Expected doctor command"),
+            _ => fail_expected("Expected doctor command"),
         }
     }
 
@@ -4861,7 +4870,7 @@ mod tests {
                 assert!(transitions_only);
                 assert_eq!(watch_snapshot, Some(PathBuf::from("/tmp/rch-watch.json")));
             }
-            _ => panic!("Expected doctor command with reliability watch mode"),
+            _ => fail_expected("Expected doctor command with reliability watch mode"),
         }
     }
 
@@ -4922,7 +4931,7 @@ mod tests {
                 assert!(!yes);
                 assert!(!skip_test);
             }
-            _ => panic!("Expected init command"),
+            _ => fail_expected("Expected init command"),
         }
     }
 
@@ -4935,7 +4944,7 @@ mod tests {
                 assert!(yes);
                 assert!(!skip_test);
             }
-            _ => panic!("Expected init command"),
+            _ => fail_expected("Expected init command"),
         }
     }
 
@@ -4948,7 +4957,7 @@ mod tests {
                 assert!(!yes);
                 assert!(skip_test);
             }
-            _ => panic!("Expected init command"),
+            _ => fail_expected("Expected init command"),
         }
     }
 
@@ -4961,7 +4970,7 @@ mod tests {
                 assert!(!yes);
                 assert!(!skip_test);
             }
-            _ => panic!("Expected init command from setup alias"),
+            _ => fail_expected("Expected init command from setup alias"),
         }
     }
 
@@ -4974,7 +4983,7 @@ mod tests {
                 assert!(yes);
                 assert!(skip_test);
             }
-            _ => panic!("Expected init command from setup alias with flags"),
+            _ => fail_expected("Expected init command from setup alias with flags"),
         }
     }
 
@@ -4999,7 +5008,7 @@ mod tests {
                 assert_eq!(channel, "stable");
                 assert!(!fleet);
             }
-            _ => panic!("Expected update command"),
+            _ => fail_expected("Expected update command"),
         }
     }
 
@@ -5011,7 +5020,19 @@ mod tests {
             Some(Commands::Update { check, .. }) => {
                 assert!(check);
             }
-            _ => panic!("Expected update command"),
+            _ => fail_expected("Expected update command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_upgrade_alias_check() {
+        let _guard = test_guard!();
+        let cli = Cli::try_parse_from(["rch", "upgrade", "--check"]).unwrap();
+        match cli.command {
+            Some(Commands::Update { check, .. }) => {
+                assert!(check);
+            }
+            _ => fail_expected("Expected update command from upgrade alias"),
         }
     }
 
@@ -5023,7 +5044,7 @@ mod tests {
             Some(Commands::Update { version, .. }) => {
                 assert_eq!(version, Some("v0.2.0".to_string()));
             }
-            _ => panic!("Expected update command"),
+            _ => fail_expected("Expected update command"),
         }
     }
 
@@ -5035,7 +5056,7 @@ mod tests {
             Some(Commands::Update { channel, .. }) => {
                 assert_eq!(channel, "beta");
             }
-            _ => panic!("Expected update command"),
+            _ => fail_expected("Expected update command"),
         }
     }
 
@@ -5047,7 +5068,7 @@ mod tests {
             Some(Commands::Update { fleet, .. }) => {
                 assert!(fleet);
             }
-            _ => panic!("Expected update command"),
+            _ => fail_expected("Expected update command"),
         }
     }
 
@@ -5059,7 +5080,7 @@ mod tests {
             Some(Commands::Update { skip_verify, .. }) => {
                 assert!(skip_verify);
             }
-            _ => panic!("Expected update command"),
+            _ => fail_expected("Expected update command"),
         }
     }
 
@@ -5087,7 +5108,7 @@ mod tests {
                 assert!(canary.is_none());
                 assert!(!dry_run);
             }
-            _ => panic!("Expected fleet deploy command"),
+            _ => fail_expected("Expected fleet deploy command"),
         }
     }
 
@@ -5101,7 +5122,7 @@ mod tests {
             }) => {
                 assert_eq!(worker, Some("css".to_string()));
             }
-            _ => panic!("Expected fleet deploy command"),
+            _ => fail_expected("Expected fleet deploy command"),
         }
     }
 
@@ -5115,7 +5136,7 @@ mod tests {
             }) => {
                 assert_eq!(canary, Some(25));
             }
-            _ => panic!("Expected fleet deploy command"),
+            _ => fail_expected("Expected fleet deploy command"),
         }
     }
 
@@ -5133,7 +5154,7 @@ mod tests {
                 assert!(worker.is_none());
                 assert!(to_version.is_none());
             }
-            _ => panic!("Expected fleet rollback command"),
+            _ => fail_expected("Expected fleet rollback command"),
         }
     }
 
@@ -5148,7 +5169,7 @@ mod tests {
                 assert!(worker.is_none());
                 assert!(!watch);
             }
-            _ => panic!("Expected fleet status command"),
+            _ => fail_expected("Expected fleet status command"),
         }
     }
 
@@ -5162,7 +5183,7 @@ mod tests {
             }) => {
                 assert!(worker.is_none());
             }
-            _ => panic!("Expected fleet verify command"),
+            _ => fail_expected("Expected fleet verify command"),
         }
     }
 
@@ -5177,7 +5198,7 @@ mod tests {
                 assert_eq!(limit, 20);
                 assert!(worker.is_none());
             }
-            _ => panic!("Expected fleet history command"),
+            _ => fail_expected("Expected fleet history command"),
         }
     }
 
@@ -5207,7 +5228,7 @@ mod tests {
                 assert!(!high_contrast);
                 assert_eq!(color_blind, tui::ColorBlindMode::None);
             }
-            _ => panic!("Expected dashboard command"),
+            _ => fail_expected("Expected dashboard command"),
         }
     }
 
@@ -5219,7 +5240,7 @@ mod tests {
             Some(Commands::Dashboard { refresh, .. }) => {
                 assert_eq!(refresh, 500);
             }
-            _ => panic!("Expected dashboard command"),
+            _ => fail_expected("Expected dashboard command"),
         }
     }
 
@@ -5237,7 +5258,7 @@ mod tests {
                 assert!(!no_open);
                 assert!(!prod);
             }
-            _ => panic!("Expected web command"),
+            _ => fail_expected("Expected web command"),
         }
     }
 
@@ -5249,7 +5270,7 @@ mod tests {
             Some(Commands::Web { port, .. }) => {
                 assert_eq!(port, 3001);
             }
-            _ => panic!("Expected web command"),
+            _ => fail_expected("Expected web command"),
         }
     }
 
@@ -5264,7 +5285,7 @@ mod tests {
                 assert_eq!(code, "RCH-R104");
                 assert!(json);
             }
-            _ => panic!("Expected error explain command"),
+            _ => fail_expected("Expected error explain command"),
         }
     }
 
@@ -5280,7 +5301,7 @@ mod tests {
                 assert_eq!(category.as_deref(), Some("disk_pressure"));
                 assert!(!json);
             }
-            _ => panic!("Expected error list command"),
+            _ => fail_expected("Expected error list command"),
         }
     }
 
@@ -5308,7 +5329,7 @@ mod tests {
                 assert_eq!(days, 30);
                 assert_eq!(limit, 20);
             }
-            _ => panic!("Expected speedscore command"),
+            _ => fail_expected("Expected speedscore command"),
         }
     }
 
@@ -5321,7 +5342,7 @@ mod tests {
                 assert!(all);
                 assert!(worker.is_none());
             }
-            _ => panic!("Expected speedscore --all command"),
+            _ => fail_expected("Expected speedscore --all command"),
         }
     }
 
@@ -5335,7 +5356,7 @@ mod tests {
             Some(Commands::SpeedScore { worker, .. }) => {
                 assert_eq!(worker, Some("css".to_string()));
             }
-            _ => panic!("Expected speedscore --verbose command"),
+            _ => fail_expected("Expected speedscore --verbose command"),
         }
     }
 
@@ -5355,7 +5376,7 @@ mod tests {
                 assert!(history);
                 assert_eq!(days, 7);
             }
-            _ => panic!("Expected speedscore --history command"),
+            _ => fail_expected("Expected speedscore --history command"),
         }
     }
 
@@ -5367,7 +5388,7 @@ mod tests {
         assert!(cli.verbose, "Global verbose flag should be set with -v");
         match cli.command {
             Some(Commands::SpeedScore { .. }) => {}
-            _ => panic!("Expected speedscore -v command"),
+            _ => fail_expected("Expected speedscore -v command"),
         }
     }
 
@@ -5385,7 +5406,7 @@ mod tests {
             }) => {
                 assert_eq!(shell, clap_complete::Shell::Bash);
             }
-            _ => panic!("Expected completions generate command"),
+            _ => fail_expected("Expected completions generate command"),
         }
     }
 
@@ -5400,7 +5421,7 @@ mod tests {
                 assert_eq!(shell, Some(clap_complete::Shell::Zsh));
                 assert!(!dry_run);
             }
-            _ => panic!("Expected completions install command"),
+            _ => fail_expected("Expected completions install command"),
         }
     }
 
@@ -5412,7 +5433,7 @@ mod tests {
             Some(Commands::Completions {
                 action: CompletionsAction::Status,
             }) => {}
-            _ => panic!("Expected completions status command"),
+            _ => fail_expected("Expected completions status command"),
         }
     }
 
@@ -5430,7 +5451,7 @@ mod tests {
             }) => {
                 assert!(!all);
             }
-            _ => panic!("Expected agents list command"),
+            _ => fail_expected("Expected agents list command"),
         }
     }
 
@@ -5444,7 +5465,7 @@ mod tests {
             }) => {
                 assert!(all);
             }
-            _ => panic!("Expected agents list command"),
+            _ => fail_expected("Expected agents list command"),
         }
     }
 
@@ -5458,7 +5479,7 @@ mod tests {
             }) => {
                 assert!(agent.is_none());
             }
-            _ => panic!("Expected agents status command"),
+            _ => fail_expected("Expected agents status command"),
         }
     }
 
@@ -5473,7 +5494,7 @@ mod tests {
                 assert_eq!(agent, "claude-code");
                 assert!(!dry_run);
             }
-            _ => panic!("Expected agents install-hook command"),
+            _ => fail_expected("Expected agents install-hook command"),
         }
     }
 
@@ -5491,7 +5512,7 @@ mod tests {
             Some(Commands::Daemon {
                 action: DaemonAction::Status,
             }) => {}
-            _ => panic!("Expected daemon status command"),
+            _ => fail_expected("Expected daemon status command"),
         }
     }
 
@@ -5794,7 +5815,7 @@ mod tests {
                 assert!(!watch);
                 assert!(!follow);
             }
-            _ => panic!("Expected queue command"),
+            _ => fail_expected("Expected queue command"),
         }
     }
 
@@ -5806,7 +5827,7 @@ mod tests {
             Some(Commands::Queue { watch, .. }) => {
                 assert!(watch);
             }
-            _ => panic!("Expected queue command with watch"),
+            _ => fail_expected("Expected queue command with watch"),
         }
     }
 
@@ -5818,7 +5839,7 @@ mod tests {
             Some(Commands::Queue { watch, .. }) => {
                 assert!(watch);
             }
-            _ => panic!("Expected queue command with -w"),
+            _ => fail_expected("Expected queue command with -w"),
         }
     }
 
@@ -5830,7 +5851,7 @@ mod tests {
             Some(Commands::Queue { follow, .. }) => {
                 assert!(follow);
             }
-            _ => panic!("Expected queue command with follow"),
+            _ => fail_expected("Expected queue command with follow"),
         }
     }
 
@@ -5842,7 +5863,7 @@ mod tests {
             Some(Commands::Queue { follow, .. }) => {
                 assert!(follow);
             }
-            _ => panic!("Expected queue command with -f"),
+            _ => fail_expected("Expected queue command with -f"),
         }
     }
 
@@ -5855,7 +5876,7 @@ mod tests {
                 assert!(watch);
                 assert!(follow);
             }
-            _ => panic!("Expected queue command with watch and follow"),
+            _ => fail_expected("Expected queue command with watch and follow"),
         }
     }
 
@@ -5881,7 +5902,7 @@ mod tests {
                 assert!(!yes);
                 assert!(!dry_run);
             }
-            _ => panic!("Expected cancel command"),
+            _ => fail_expected("Expected cancel command"),
         }
     }
 
@@ -5893,7 +5914,7 @@ mod tests {
             Some(Commands::Cancel { all, .. }) => {
                 assert!(all);
             }
-            _ => panic!("Expected cancel --all command"),
+            _ => fail_expected("Expected cancel --all command"),
         }
     }
 
@@ -5906,7 +5927,7 @@ mod tests {
                 assert!(all);
                 assert!(yes);
             }
-            _ => panic!("Expected cancel --all --yes command"),
+            _ => fail_expected("Expected cancel --all --yes command"),
         }
     }
 
@@ -5921,7 +5942,7 @@ mod tests {
                 assert_eq!(build_id, Some(42));
                 assert!(force);
             }
-            _ => panic!("Expected cancel with --force"),
+            _ => fail_expected("Expected cancel with --force"),
         }
     }
 
@@ -5936,7 +5957,7 @@ mod tests {
                 assert_eq!(build_id, Some(42));
                 assert!(force);
             }
-            _ => panic!("Expected cancel with -f"),
+            _ => fail_expected("Expected cancel with -f"),
         }
     }
 
@@ -5948,7 +5969,7 @@ mod tests {
             Some(Commands::Cancel { yes, .. }) => {
                 assert!(yes);
             }
-            _ => panic!("Expected cancel with -y"),
+            _ => fail_expected("Expected cancel with -y"),
         }
     }
 
@@ -5960,7 +5981,7 @@ mod tests {
             Some(Commands::Cancel { dry_run, .. }) => {
                 assert!(dry_run);
             }
-            _ => panic!("Expected cancel with --dry-run"),
+            _ => fail_expected("Expected cancel with --dry-run"),
         }
     }
 
@@ -5972,7 +5993,7 @@ mod tests {
             Some(Commands::Cancel { dry_run, .. }) => {
                 assert!(dry_run);
             }
-            _ => panic!("Expected cancel with -n"),
+            _ => fail_expected("Expected cancel with -n"),
         }
     }
 
@@ -5987,7 +6008,7 @@ mod tests {
                 assert_eq!(build_id, Some(42));
                 assert!(dry_run);
             }
-            _ => panic!("Expected cancel 42 --dry-run"),
+            _ => fail_expected("Expected cancel 42 --dry-run"),
         }
     }
 
@@ -6000,7 +6021,7 @@ mod tests {
                 assert!(all);
                 assert!(dry_run);
             }
-            _ => panic!("Expected cancel -an"),
+            _ => fail_expected("Expected cancel -an"),
         }
     }
 
@@ -6030,7 +6051,7 @@ mod tests {
                 assert!(!debug);
                 assert!(!scheduled);
             }
-            _ => panic!("Expected self-test command"),
+            _ => fail_expected("Expected self-test command"),
         }
     }
 
@@ -6043,7 +6064,7 @@ mod tests {
                 assert_eq!(worker.as_deref(), Some("css"));
                 assert!(!all);
             }
-            _ => panic!("Expected self-test --worker command"),
+            _ => fail_expected("Expected self-test --worker command"),
         }
     }
 
@@ -6055,7 +6076,7 @@ mod tests {
             Some(Commands::SelfTest { all, .. }) => {
                 assert!(all);
             }
-            _ => panic!("Expected self-test --all command"),
+            _ => fail_expected("Expected self-test --all command"),
         }
     }
 
@@ -6067,7 +6088,7 @@ mod tests {
             Some(Commands::SelfTest { timeout, .. }) => {
                 assert_eq!(timeout, 600);
             }
-            _ => panic!("Expected self-test --timeout command"),
+            _ => fail_expected("Expected self-test --timeout command"),
         }
     }
 
@@ -6079,7 +6100,7 @@ mod tests {
             Some(Commands::SelfTest { debug, .. }) => {
                 assert!(debug);
             }
-            _ => panic!("Expected self-test --debug command"),
+            _ => fail_expected("Expected self-test --debug command"),
         }
     }
 
@@ -6091,7 +6112,7 @@ mod tests {
             Some(Commands::SelfTest { scheduled, .. }) => {
                 assert!(scheduled);
             }
-            _ => panic!("Expected self-test --scheduled command"),
+            _ => fail_expected("Expected self-test --scheduled command"),
         }
     }
 
@@ -6103,7 +6124,7 @@ mod tests {
             Some(Commands::SelfTest { action, .. }) => {
                 assert!(matches!(action, Some(SelfTestAction::Status)));
             }
-            _ => panic!("Expected self-test status command"),
+            _ => fail_expected("Expected self-test status command"),
         }
     }
 
@@ -6118,7 +6139,7 @@ mod tests {
                     Some(SelfTestAction::History { limit: 10 })
                 ));
             }
-            _ => panic!("Expected self-test history command"),
+            _ => fail_expected("Expected self-test history command"),
         }
     }
 
@@ -6133,7 +6154,7 @@ mod tests {
                     Some(SelfTestAction::History { limit: 20 })
                 ));
             }
-            _ => panic!("Expected self-test history --limit command"),
+            _ => fail_expected("Expected self-test history --limit command"),
         }
     }
 
@@ -6148,7 +6169,7 @@ mod tests {
                     Some("/tmp/test".to_string())
                 );
             }
-            _ => panic!("Expected self-test --project command"),
+            _ => fail_expected("Expected self-test --project command"),
         }
     }
 
