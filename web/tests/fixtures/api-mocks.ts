@@ -84,6 +84,7 @@ export const mockRecentBuilds: BuildRecord[] = [
     duration_ms: 4821,
     started_at: '2026-01-01T11:50:00.000Z',
     completed_at: '2026-01-01T11:50:04.821Z',
+    location: 'remote',
   },
   {
     id: 98,
@@ -94,6 +95,7 @@ export const mockRecentBuilds: BuildRecord[] = [
     duration_ms: 3120,
     started_at: '2026-01-01T11:40:00.000Z',
     completed_at: '2026-01-01T11:40:03.120Z',
+    location: 'remote',
   },
 ];
 
@@ -107,9 +109,10 @@ export const mockIssues: Issue[] = [
 
 export const mockStats: BuildStats = {
   total_builds: 128,
-  successful_builds: 120,
-  failed_builds: 8,
-  total_duration_ms: 502_000,
+  success_count: 120,
+  failure_count: 8,
+  remote_count: 96,
+  local_count: 32,
   avg_duration_ms: 3922,
 };
 
@@ -117,6 +120,7 @@ export const mockStatusResponse: StatusResponse = {
   daemon: mockDaemonStatus,
   workers: mockWorkers,
   active_builds: mockActiveBuilds,
+  queued_builds: [],
   recent_builds: mockRecentBuilds,
   issues: mockIssues,
   stats: mockStats,
@@ -265,7 +269,6 @@ export function mockSpeedScoreResponse(workerId: string): SpeedScoreResponse {
 
 export function mockSpeedScoreHistoryResponse(
   workerId: string,
-  days = 7,
   limit = 10
 ): SpeedScoreHistoryResponse {
   const history = mockSpeedScoreHistory[workerId] ?? [];
@@ -276,6 +279,7 @@ export function mockSpeedScoreHistoryResponse(
       total: history.length,
       offset: 0,
       limit,
+      has_more: history.length > limit,
     },
   };
 }
