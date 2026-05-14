@@ -2076,6 +2076,16 @@ async fn handle_select_worker(
                 duration_ms
             );
         }
+
+        if duration_ms > 10.0 {
+            metrics::DECISION_PANIC_THRESHOLD_VIOLATIONS
+                .with_label_values(&["compilation"])
+                .inc();
+            tracing::error!(
+                "Classification latency exceeded panic threshold: {:.3}ms (threshold: 10ms)",
+                duration_ms
+            );
+        }
     }
 
     // Mock support: RCH_MOCK_CIRCUIT_OPEN simulates all circuits open

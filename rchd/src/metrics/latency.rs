@@ -14,7 +14,7 @@ use tracing::warn;
 
 use super::{
     CLASSIFICATION_TIER_LATENCY, CLASSIFICATION_TIER_TOTAL, DECISION_BUDGET_VIOLATIONS,
-    DECISION_LATENCY,
+    DECISION_LATENCY, DECISION_PANIC_THRESHOLD_VIOLATIONS,
 };
 
 /// Performance budget for non-compilation decisions (milliseconds).
@@ -117,6 +117,10 @@ pub fn record_decision_latency(decision_type: DecisionType, start: Instant) -> D
     // Log panic threshold violations at error level
     let panic_ms = decision_type.panic_threshold_ms();
     if duration_ms > panic_ms {
+        DECISION_PANIC_THRESHOLD_VIOLATIONS
+            .with_label_values(&[decision_type.label()])
+            .inc();
+
         tracing::error!(
             decision_type = decision_type.label(),
             duration_ms = format!("{:.3}", duration_ms),
@@ -152,7 +156,7 @@ pub fn record_classification_tier(tier: u8, duration: Duration) {
 /// Automatically records latency when dropped.
 pub struct DecisionTimer {
     decision_type: DecisionType,
-    start: Instant,
+    start: Option<Instant>,
 }
 
 impl DecisionTimer {
@@ -160,28 +164,31 @@ impl DecisionTimer {
     pub fn new(decision_type: DecisionType) -> Self {
         Self {
             decision_type,
-            start: Instant::now(),
+            start: Some(Instant::now()),
         }
     }
 
     /// Get the elapsed time without stopping the timer.
     pub fn elapsed(&self) -> Duration {
-        self.start.elapsed()
+        self.start.map(|start| start.elapsed()).unwrap_or_default()
     }
 
     /// Stop the timer and record the latency.
     ///
     /// This consumes the timer, so it will not record again on drop.
-    pub fn stop(self) -> Duration {
-        record_decision_latency(self.decision_type, self.start)
+    pub fn stop(mut self) -> Duration {
+        self.start
+            .take()
+            .map(|start| record_decision_latency(self.decision_type, start))
+            .unwrap_or_default()
     }
 }
 
 impl Drop for DecisionTimer {
     fn drop(&mut self) {
-        // Only record if not already stopped via stop()
-        // Note: This is a fallback - prefer calling stop() explicitly
-        let _ = record_decision_latency(self.decision_type, self.start);
+        if let Some(start) = self.start.take() {
+            let _ = record_decision_latency(self.decision_type, start);
+        }
     }
 }
 
@@ -252,6 +259,18 @@ mod tests {
 
         // Note: stop() would be called, but timer moved
         // In practice, either call stop() or let drop handle it
+    }
+
+    #[test]
+    fn test_decision_timer_stop_records_once() {
+        let _guard = test_guard!();
+        let histogram = DECISION_LATENCY.with_label_values(&["worker_selection"]);
+        let before = histogram.get_sample_count();
+
+        let timer = DecisionTimer::new(DecisionType::WorkerSelection);
+        let _elapsed = timer.stop();
+
+        assert_eq!(histogram.get_sample_count(), before + 1);
     }
 
     #[test]

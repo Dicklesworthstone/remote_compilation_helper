@@ -8,11 +8,11 @@
 
 use serde::Serialize;
 
-use super::DECISION_BUDGET_VIOLATIONS;
 use super::latency::{
     COMPILATION_BUDGET_MS, COMPILATION_PANIC_MS, NON_COMPILATION_BUDGET_MS,
     NON_COMPILATION_PANIC_MS, WORKER_SELECTION_BUDGET_MS, WORKER_SELECTION_PANIC_MS,
 };
+use super::{DECISION_BUDGET_VIOLATIONS, DECISION_PANIC_THRESHOLD_VIOLATIONS};
 
 /// Overall budget compliance status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -45,6 +45,8 @@ pub struct BudgetInfo {
     pub panic_threshold_ms: f64,
     /// Total number of budget violations.
     pub violations: u64,
+    /// Total number of violations exceeding the panic threshold.
+    pub critical_violations: u64,
     /// Violation rate (violations / total observations).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub violation_rate: Option<f64>,
@@ -77,15 +79,21 @@ pub fn get_budget_status() -> BudgetStatusResponse {
     let non_compilation_violations = get_violations("non_compilation");
     let compilation_violations = get_violations("compilation");
     let worker_selection_violations = get_violations("worker_selection");
+    let non_compilation_critical_violations = get_critical_violations("non_compilation");
+    let compilation_critical_violations = get_critical_violations("compilation");
+    let worker_selection_critical_violations = get_critical_violations("worker_selection");
 
     // Determine overall status
     let total_violations =
         non_compilation_violations + compilation_violations + worker_selection_violations;
-    let status = if total_violations == 0 {
+    let total_critical_violations = non_compilation_critical_violations
+        + compilation_critical_violations
+        + worker_selection_critical_violations;
+    let status = if total_critical_violations > 0 {
+        BudgetStatus::Failing
+    } else if total_violations == 0 {
         BudgetStatus::Passing
     } else {
-        // In a real implementation, we'd check if violations exceed a threshold
-        // For now, any violation is a warning
         BudgetStatus::Warning
     };
 
@@ -99,18 +107,21 @@ pub fn get_budget_status() -> BudgetStatusResponse {
                 budget_ms: NON_COMPILATION_BUDGET_MS,
                 panic_threshold_ms: NON_COMPILATION_PANIC_MS,
                 violations: non_compilation_violations,
+                critical_violations: non_compilation_critical_violations,
                 violation_rate: None, // Would need total observations to compute
             },
             compilation: BudgetInfo {
                 budget_ms: COMPILATION_BUDGET_MS,
                 panic_threshold_ms: COMPILATION_PANIC_MS,
                 violations: compilation_violations,
+                critical_violations: compilation_critical_violations,
                 violation_rate: None,
             },
             worker_selection: BudgetInfo {
                 budget_ms: WORKER_SELECTION_BUDGET_MS,
                 panic_threshold_ms: WORKER_SELECTION_PANIC_MS,
                 violations: worker_selection_violations,
+                critical_violations: worker_selection_critical_violations,
                 violation_rate: None,
             },
         },
@@ -121,6 +132,13 @@ pub fn get_budget_status() -> BudgetStatusResponse {
 /// Get the number of violations for a decision type.
 fn get_violations(decision_type: &str) -> u64 {
     DECISION_BUDGET_VIOLATIONS
+        .with_label_values(&[decision_type])
+        .get() as u64
+}
+
+/// Get the number of panic-threshold violations for a decision type.
+fn get_critical_violations(decision_type: &str) -> u64 {
+    DECISION_PANIC_THRESHOLD_VIOLATIONS
         .with_label_values(&[decision_type])
         .get() as u64
 }
@@ -179,12 +197,14 @@ mod tests {
             budget_ms: 1.0,
             panic_threshold_ms: 5.0,
             violations: 0,
+            critical_violations: 0,
             violation_rate: None,
         };
 
         let json = serde_json::to_string(&info).unwrap();
         assert!(json.contains("budget_ms"));
         assert!(json.contains("violations"));
+        assert!(json.contains("critical_violations"));
         // violation_rate should be skipped when None
         assert!(!json.contains("violation_rate"));
     }
@@ -197,18 +217,21 @@ mod tests {
                 budget_ms: NON_COMPILATION_BUDGET_MS,
                 panic_threshold_ms: NON_COMPILATION_PANIC_MS,
                 violations: 0,
+                critical_violations: 0,
                 violation_rate: None,
             },
             compilation: BudgetInfo {
                 budget_ms: COMPILATION_BUDGET_MS,
                 panic_threshold_ms: COMPILATION_PANIC_MS,
                 violations: 2,
+                critical_violations: 0,
                 violation_rate: Some(0.01),
             },
             worker_selection: BudgetInfo {
                 budget_ms: WORKER_SELECTION_BUDGET_MS,
                 panic_threshold_ms: WORKER_SELECTION_PANIC_MS,
                 violations: 0,
+                critical_violations: 0,
                 violation_rate: None,
             },
         };
@@ -217,5 +240,20 @@ mod tests {
         assert!(json.contains("non_compilation"));
         assert!(json.contains("compilation"));
         assert!(json.contains("worker_selection"));
+    }
+
+    #[test]
+    fn test_get_budget_status_fails_with_critical_violations() {
+        let _guard = test_guard!();
+        let before = get_critical_violations("worker_selection");
+
+        DECISION_PANIC_THRESHOLD_VIOLATIONS
+            .with_label_values(&["worker_selection"])
+            .inc();
+
+        let status = get_budget_status();
+        assert_eq!(status.status, BudgetStatus::Failing);
+        assert!(status.budgets.worker_selection.critical_violations > before);
+        assert!(has_critical_violations());
     }
 }
