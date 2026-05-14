@@ -1,5 +1,56 @@
 # Dependency Upgrade Log
 
+**Date:** 2026-05-14  |  **Project:** remote_compilation_helper  |  **Language:** Rust + TypeScript
+
+## Summary
+- **Updated:** Rust workspace dependencies, local authored `/dp` crates, and web dashboard dependencies
+- **Skipped latest:** 2 web majors due current peer constraints
+- **Failed:** 0
+- **Release target:** 1.0.25
+
+## Rust Updates
+
+### Local authored libraries
+- `toon-rust` now resolves to local `/dp/toon_rust` (`package = "tru"`, version `0.2.3`).
+- FrankenTUI crates now resolve to local `/dp/frankentui/crates/*` paths at version `0.4.0`.
+- `rich_rust` now resolves to local `/dp/rich_rust` at version `0.2.1`.
+
+### Registry dependencies
+- Updated direct Rust dependencies reported by `cargo outdated`, including `hmac`, `sha2`, `lru`, `reqwest`, `terminal_size`, `rusqlite`, `fastrand`, `whoami`, `proptest`, `insta`, and `rand`.
+- Removed the `ctor` test initializer dependency instead of upgrading it. The 1.x macro API requires unsafe attributes that conflict with this workspace's `#![forbid(unsafe_code)]` policy.
+- Narrowed `rich_rust` features to the UI primitives RCH actually uses, removing unused syntax/markdown/backtrace dependencies and their transitive audit warnings.
+- Updated transitive `rustls-webpki` and `rand` lockfile entries to fixed patch releases after `cargo audit` reported advisories.
+
+### Code migrations
+- Adapted `toon_rust::encode` / `decode` call sites to the local `/dp/toon_rust` API.
+- Updated SHA-256 formatting for `sha2` 0.11 by converting finalized digest bytes to lowercase hex explicitly.
+- Imported `hmac::KeyInit` where required by `hmac` 0.13.
+
+## Web Updates
+
+### Updated dependencies
+- Updated the dashboard stack across Next.js, React, TanStack Query, Motion, Recharts, SWR, Tailwind packages, Playwright, Vitest, Vite, jsdom, and related type packages.
+- Added a direct Vite 8 dev dependency to satisfy `@vitejs/plugin-react` 6.x.
+- Added a package override for `postcss` 8.5.14 to keep `npm audit` clean through the Next.js dependency tree.
+
+### Intentionally held
+- Held `eslint` at 9.39.4 because the current Next/TypeScript ESLint stack rejects ESLint 10.
+- Held `typescript` at 5.9.3 because the current TypeScript ESLint peer range rejects TypeScript 6.
+
+### Code migrations
+- Fixed new React hook dependency and purity lints after the web dependency refresh.
+- Updated dashboard test fixtures for the current API shapes used by the build and E2E suites.
+- Replaced an invalid `aria-expanded` attribute on a `role="region"` element with a testable data attribute.
+
+## Verification
+- `cargo outdated --workspace --depth 1`: all Rust dependencies up to date; local `toon-rust` has no registry update to compare.
+- `cargo audit`: no vulnerabilities or warnings after lockfile and feature cleanup.
+- `npm outdated`: only the intentional `eslint` 10 and TypeScript 6 peer-incompatible majors remain.
+- `npm audit`: 0 vulnerabilities.
+- Full release-gate commands are run separately before publishing 1.0.25.
+
+---
+
 **Date:** 2026-01-25  |  **Project:** remote_compilation_helper  |  **Language:** Rust
 
 ## Summary

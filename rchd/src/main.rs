@@ -803,6 +803,12 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+// Global test logging initialization - enables JSONL output for all unit tests
+#[cfg(test)]
+fn init_test_logging() {
+    rch_common::testing::init_global_test_logging();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1312,10 +1318,4 @@ mod tests {
         assert_eq!(stats.local_count, 2);
         assert_eq!(stats.avg_duration_ms, 1250); // (1000+2000+500+1500)/4
     }
-}
-
-// Global test logging initialization - enables JSONL output for all unit tests
-#[cfg(test)]
-fn init_test_logging() {
-    rch_common::testing::init_global_test_logging();
 }

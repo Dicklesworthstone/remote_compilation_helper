@@ -170,6 +170,35 @@ pub use config::{
     Sourced, validate_config,
 };
 
+// Discovery module re-exports
+pub use discovery::{
+    DiscoveredHost, DiscoverySource, discover_all, parse_shell_aliases,
+    parse_shell_aliases_content, parse_ssh_config, parse_ssh_config_content,
+};
+
+// UI module re-exports
+pub use ui::{
+    ErrorPanel, ErrorSeverity, Icons, IntoErrorPanel, OutputContext, RchTheme, ResultExt,
+    anyhow_to_json, anyhow_to_panel, display_anyhow_error, display_error, display_error_with_code,
+    error_to_json, error_to_panel,
+};
+
+// Errors module re-exports
+pub use errors::{
+    CodeExplanation, CodeNamespace, ErrorCategory, ErrorCode, ErrorEntry, ReliabilityCategoryKind,
+    ReliabilityReasonCode,
+};
+
+// Schema-version registry re-exports
+pub use schema_versions::current_version as schema_version;
+pub use schema_versions::{ALL_COMPONENTS as SCHEMA_VERSION_COMPONENTS, SchemaComponent};
+
+// API module re-exports (unified API types for CLI and daemon)
+pub use api::{API_VERSION, ApiError, ApiResponse, ErrorContext, LegacyErrorCode};
+
+// Hooks module re-exports (daemon self-healing)
+pub use hooks::{HookResult, is_claude_code_installed, verify_and_install_claude_code_hook};
+
 #[cfg(test)]
 mod build_version_tests {
     use super::{BUILD_COMMIT_ENV_VARS, build_version_value_with_commit};
@@ -211,32 +240,3 @@ mod build_version_tests {
         );
     }
 }
-
-// Discovery module re-exports
-pub use discovery::{
-    DiscoveredHost, DiscoverySource, discover_all, parse_shell_aliases,
-    parse_shell_aliases_content, parse_ssh_config, parse_ssh_config_content,
-};
-
-// UI module re-exports
-pub use ui::{
-    ErrorPanel, ErrorSeverity, Icons, IntoErrorPanel, OutputContext, RchTheme, ResultExt,
-    anyhow_to_json, anyhow_to_panel, display_anyhow_error, display_error, display_error_with_code,
-    error_to_json, error_to_panel,
-};
-
-// Errors module re-exports
-pub use errors::{
-    CodeExplanation, CodeNamespace, ErrorCategory, ErrorCode, ErrorEntry, ReliabilityCategoryKind,
-    ReliabilityReasonCode,
-};
-
-// Schema-version registry re-exports
-pub use schema_versions::current_version as schema_version;
-pub use schema_versions::{ALL_COMPONENTS as SCHEMA_VERSION_COMPONENTS, SchemaComponent};
-
-// API module re-exports (unified API types for CLI and daemon)
-pub use api::{API_VERSION, ApiError, ApiResponse, ErrorContext, LegacyErrorCode};
-
-// Hooks module re-exports (daemon self-healing)
-pub use hooks::{HookResult, is_claude_code_installed, verify_and_install_claude_code_hook};
