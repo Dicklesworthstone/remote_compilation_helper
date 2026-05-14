@@ -56,6 +56,7 @@ struct CleanupMetrics {
     free_before_gb: f64,
     free_after_gb: f64,
     low_disk_mode: bool,
+    remove_errors: u64,
 }
 
 fn cleanup_threshold_kb(min_free_gb: u64) -> u64 {
@@ -75,7 +76,7 @@ fn build_cleanup_command(escaped_base: &str, max_cache_age_hours: u64, min_free_
          if [ ! -d \"$base\" ]; then mkdir -p \"$base\"; fi; \
          before_kb=$(df -Pk \"$base\" 2>/dev/null | awk 'NR==2 {{print $4}}'); \
          if [ -z \"$before_kb\" ]; then before_kb=0; fi; \
-         removed=0; freed_kb=0; low_disk=0; \
+         removed=0; freed_kb=0; low_disk=0; remove_errors=0; \
          if [ \"$before_kb\" -lt \"$threshold_kb\" ]; then low_disk=1; fi; \
          candidates=$(mktemp /tmp/rch-cleanup.XXXXXX); \
          if [ \"$low_disk\" -eq 1 ]; then \
@@ -91,9 +92,13 @@ fn build_cleanup_command(escaped_base: &str, max_cache_age_hours: u64, min_free_
            recent_active=$(find \"$dir\" -type f -mmin -\"$active_grace_minutes\" -print -quit 2>/dev/null || true); \
            if [ -n \"$recent_active\" ]; then continue; fi; \
            size_kb=$(du -sk \"$dir\" 2>/dev/null | awk '{{print $1}}'); \
-           rm -rf \"$dir\" 2>/dev/null || true; \
-           removed=$((removed + 1)); \
-           if [ -n \"$size_kb\" ]; then freed_kb=$((freed_kb + size_kb)); fi; \
+           if [ -z \"$size_kb\" ]; then size_kb=0; fi; \
+           if rm -rf \"$dir\" 2>/dev/null; then \
+             removed=$((removed + 1)); \
+             freed_kb=$((freed_kb + size_kb)); \
+           else \
+             remove_errors=$((remove_errors + 1)); \
+           fi; \
            if [ \"$low_disk\" -eq 1 ]; then \
              current_kb=$(df -Pk \"$base\" 2>/dev/null | awk 'NR==2 {{print $4}}'); \
              if [ -n \"$current_kb\" ] && [ \"$current_kb\" -ge \"$threshold_kb\" ]; then break; fi; \
@@ -102,7 +107,8 @@ fn build_cleanup_command(escaped_base: &str, max_cache_age_hours: u64, min_free_
          rm -f \"$candidates\"; \
          after_kb=$(df -Pk \"$base\" 2>/dev/null | awk 'NR==2 {{print $4}}'); \
          if [ -z \"$after_kb\" ]; then after_kb=0; fi; \
-         printf 'RCH_CLEANUP_METRICS removed=%s freed_kb=%s before_kb=%s after_kb=%s low_disk=%s\\n' \"$removed\" \"$freed_kb\" \"$before_kb\" \"$after_kb\" \"$low_disk\"",
+         printf 'RCH_CLEANUP_METRICS removed=%s freed_kb=%s before_kb=%s after_kb=%s low_disk=%s remove_errors=%s\\n' \"$removed\" \"$freed_kb\" \"$before_kb\" \"$after_kb\" \"$low_disk\" \"$remove_errors\"; \
+         if [ \"$remove_errors\" -gt 0 ]; then exit 1; fi",
         base = escaped_base,
         max_age_minutes = max_age_minutes,
         threshold_kb = threshold_kb,
@@ -120,6 +126,7 @@ fn parse_cleanup_metrics(stdout: &str) -> Option<CleanupMetrics> {
     let mut before_kb = None;
     let mut after_kb = None;
     let mut low_disk = None;
+    let mut remove_errors = None;
 
     for token in line.split_whitespace().skip(1) {
         let Some((key, value)) = token.split_once('=') else {
@@ -131,6 +138,7 @@ fn parse_cleanup_metrics(stdout: &str) -> Option<CleanupMetrics> {
             "before_kb" => before_kb = value.parse::<u64>().ok(),
             "after_kb" => after_kb = value.parse::<u64>().ok(),
             "low_disk" => low_disk = Some(value == "1"),
+            "remove_errors" => remove_errors = value.parse::<u64>().ok(),
             _ => {}
         }
     }
@@ -141,6 +149,7 @@ fn parse_cleanup_metrics(stdout: &str) -> Option<CleanupMetrics> {
         free_before_gb: before_kb.unwrap_or(0) as f64 / (1024.0 * 1024.0),
         free_after_gb: after_kb.unwrap_or(0) as f64 / (1024.0 * 1024.0),
         low_disk_mode: low_disk.unwrap_or(false),
+        remove_errors: remove_errors.unwrap_or(0),
     })
 }
 
@@ -349,12 +358,13 @@ impl CacheCleanupScheduler {
             .as_ref()
             .map(|m| {
                 format!(
-                    "removed={}, freed_mb={}, before_free_gb={:.2}, after_free_gb={:.2}, low_disk={}",
+                    "removed={}, freed_mb={}, before_free_gb={:.2}, after_free_gb={:.2}, low_disk={}, remove_errors={}",
                     m.removed_dirs,
                     m.freed_bytes / (1024 * 1024),
                     m.free_before_gb,
                     m.free_after_gb,
-                    m.low_disk_mode
+                    m.low_disk_mode,
+                    m.remove_errors
                 )
             })
             .unwrap_or_else(|| "metrics=unavailable".to_string());
@@ -382,8 +392,9 @@ impl CacheCleanupScheduler {
             })
         } else {
             let error_msg = format!(
-                "Cleanup command failed with exit code {} (stderr: {})",
+                "Cleanup command failed with exit code {} ({}, stderr: {})",
                 result.exit_code,
+                metrics_summary,
                 result.stderr.trim()
             );
             warn!(
@@ -1001,13 +1012,14 @@ mod tests {
     #[test]
     fn test_parse_cleanup_metrics_parses_emitted_line() {
         let _guard = test_guard!();
-        let stdout = "noise\nRCH_CLEANUP_METRICS removed=4 freed_kb=2048 before_kb=4096 after_kb=6144 low_disk=1\n";
+        let stdout = "noise\nRCH_CLEANUP_METRICS removed=4 freed_kb=2048 before_kb=4096 after_kb=6144 low_disk=1 remove_errors=2\n";
         let metrics = parse_cleanup_metrics(stdout).expect("expected parse result");
         assert_eq!(metrics.removed_dirs, 4);
         assert_eq!(metrics.freed_bytes, 2 * 1024 * 1024);
         assert!((metrics.free_before_gb - (4096.0 / (1024.0 * 1024.0))).abs() < f64::EPSILON);
         assert!((metrics.free_after_gb - (6144.0 / (1024.0 * 1024.0))).abs() < f64::EPSILON);
         assert!(metrics.low_disk_mode);
+        assert_eq!(metrics.remove_errors, 2);
     }
 
     #[test]
@@ -1018,7 +1030,11 @@ mod tests {
         assert!(command.contains("active_grace_minutes=5"));
         assert!(command.contains("-mmin -\"$active_grace_minutes\""));
         assert!(command.contains("case \"$dir\" in \"$base\"/*)"));
+        assert!(command.contains("if rm -rf \"$dir\""));
+        assert!(command.contains("remove_errors=$((remove_errors + 1))"));
+        assert!(command.contains("if [ \"$remove_errors\" -gt 0 ]; then exit 1; fi"));
         assert!(command.contains("RCH_CLEANUP_METRICS"));
         assert!(command.contains("low_disk"));
+        assert!(command.contains("remove_errors"));
     }
 }
