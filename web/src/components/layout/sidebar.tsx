@@ -67,7 +67,7 @@ function SidebarContent({ pathname, onNavigate, variant }: SidebarContentProps) 
                   {isActive && (
                     <motion.div
                       layoutId={`active-nav-${variant}`}
-                      className="absolute inset-0 bg-surface-elevated rounded-lg"
+                      className="pointer-events-none absolute inset-0 bg-surface-elevated rounded-lg"
                       initial={false}
                       transition={{ type: 'spring', stiffness: 500, damping: 30 }}
                     />

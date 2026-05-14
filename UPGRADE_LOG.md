@@ -40,8 +40,13 @@
 
 ### Code migrations
 - Fixed new React hook dependency and purity lints after the web dependency refresh.
+- Moved benchmark SSE status ref synchronization out of render to satisfy the newer React hooks lint rules.
 - Updated dashboard test fixtures for the current API shapes used by the build and E2E suites.
 - Replaced an invalid `aria-expanded` attribute on a `role="region"` element with a testable data attribute.
+- Set `turbopack.root` explicitly in the Next.js config after the Playwright release gate exposed a Next 16 root-inference panic from `src/app`.
+- Made the animated sidebar active-item highlight ignore pointer input so fast route-transition clicks cannot land on the moving highlight instead of a navigation link.
+- Added a timeout-backed abort signal to benchmark trigger requests so stalled HTTP calls cannot leave the dashboard in a pending trigger state indefinitely.
+- Prevented duplicate benchmark SSE reconnect timers and made the performance-budget percentile helper total for empty or out-of-range inputs.
 
 ## Verification
 - `cargo outdated --workspace --depth 1`: all Rust dependencies up to date; local `toon-rust` has no registry update to compare.

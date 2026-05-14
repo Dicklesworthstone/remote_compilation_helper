@@ -39,6 +39,8 @@ const initialState: BenchmarkState = {
   durationSecs: null,
 };
 
+const BENCHMARK_TRIGGER_TIMEOUT_MS = 30_000;
+
 interface UseBenchmarkProgressOptions {
   workerId: string;
   onCompleted?: (result: SpeedScoreView) => void;
@@ -62,7 +64,10 @@ export function useBenchmarkProgress({
   const statusRef = useRef(state.status);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const connectRef = useRef<(() => void) | null>(null);
-  statusRef.current = state.status;
+
+  useEffect(() => {
+    statusRef.current = state.status;
+  }, [state.status]);
 
   // Cleanup on unmount
   useEffect(() => {
@@ -213,7 +218,7 @@ export function useBenchmarkProgress({
 
     eventSource.onerror = () => {
       // Reconnect after a delay if still active
-      if (isActiveRef.current && statusRef.current === 'running') {
+      if (isActiveRef.current && statusRef.current === 'running' && !reconnectTimerRef.current) {
         reconnectTimerRef.current = setTimeout(() => {
           reconnectTimerRef.current = null;
           if (isActiveRef.current) connectRef.current?.();
@@ -235,9 +240,13 @@ export function useBenchmarkProgress({
     // Connect to SSE before triggering
     connect();
 
+    const abortController = new AbortController();
+    const timeoutId = setTimeout(() => abortController.abort(), BENCHMARK_TRIGGER_TIMEOUT_MS);
+
     try {
       const response = await fetch(`/api/workers/${encodeURIComponent(workerId)}/benchmark/trigger`, {
         method: 'POST',
+        signal: abortController.signal,
       });
 
       if (!response.ok) {
@@ -263,7 +272,12 @@ export function useBenchmarkProgress({
         requestId: data.request_id,
       }));
     } catch (err) {
-      const errorMsg = err instanceof Error ? err.message : 'Failed to trigger benchmark';
+      const errorMsg =
+        err instanceof DOMException && err.name === 'AbortError'
+          ? 'Benchmark trigger timed out.'
+          : err instanceof Error
+            ? err.message
+            : 'Failed to trigger benchmark';
       setState((prev) => ({
         ...prev,
         status: 'failed',
@@ -275,6 +289,8 @@ export function useBenchmarkProgress({
         eventSourceRef.current.close();
         eventSourceRef.current = null;
       }
+    } finally {
+      clearTimeout(timeoutId);
     }
   }, [workerId, connect]);
 

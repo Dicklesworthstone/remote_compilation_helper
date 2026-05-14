@@ -111,12 +111,27 @@ fn measure_us<F: FnMut()>(mut f: F, warmup: usize, iterations: usize) -> Vec<u12
 
 fn summarize(operation: &str, durations: &[u128], budget_us: u128) -> TimingSummary {
     let n = durations.len();
-    let min_us = durations[0];
-    let max_us = durations[n - 1];
+    if n == 0 {
+        return TimingSummary {
+            operation: operation.to_string(),
+            iterations: 0,
+            min_us: 0,
+            max_us: 0,
+            mean_us: 0,
+            p50_us: 0,
+            p95_us: 0,
+            p99_us: 0,
+            budget_us,
+            within_budget: false,
+        };
+    }
+
+    let min_us = durations.first().copied().unwrap_or(0);
+    let max_us = durations.last().copied().unwrap_or(min_us);
     let mean_us = durations.iter().sum::<u128>() / n as u128;
-    let p50_us = durations[n / 2];
-    let p95_us = durations[(n as f64 * 0.95) as usize];
-    let p99_us = durations[(n as f64 * 0.99) as usize];
+    let p50_us = durations.get(n / 2).copied().unwrap_or(max_us);
+    let p95_us = percentile_sample(durations, 95);
+    let p99_us = percentile_sample(durations, 99);
 
     TimingSummary {
         operation: operation.to_string(),
@@ -130,6 +145,20 @@ fn summarize(operation: &str, durations: &[u128], budget_us: u128) -> TimingSumm
         budget_us,
         within_budget: p95_us <= budget_us,
     }
+}
+
+fn percentile_sample(durations: &[u128], percentile: usize) -> u128 {
+    durations
+        .get(percentile_index(durations.len(), percentile))
+        .copied()
+        .unwrap_or(0)
+}
+
+fn percentile_index(len: usize, percentile: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    ((len * percentile.clamp(1, 100)).div_ceil(100)).saturating_sub(1)
 }
 
 // ===========================================================================
