@@ -605,8 +605,14 @@ pub struct DoctorFixApplied {
 }
 
 /// Overall doctor command response for JSON output.
+///
+/// **t05 — envelope harmonization:** carries `schema_version` matching
+/// the reliability-mode response. Sourced from the central schema-
+/// versions registry so cross-component drift is caught by the
+/// registry's pinned-snapshot test.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct DoctorResponse {
+    pub schema_version: String,
     pub checks: Vec<DoctorCheck>,
     pub summary: DoctorSummary,
     pub fixes_applied: Vec<DoctorFixApplied>,

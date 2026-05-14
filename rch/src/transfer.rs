@@ -5,6 +5,7 @@
 
 use crate::error::TransferError;
 use anyhow::{Context, Result};
+use glob::Pattern;
 use rch_common::mock::{self, MockConfig, MockRsync, MockRsyncConfig, MockSshClient};
 use rch_common::ssh_utils::{
     EnvPrefix, is_retryable_transport_error, is_valid_env_key, shell_escape_value,
@@ -61,10 +62,94 @@ fn normalize_config_exclude_pattern(pattern: &str) -> &str {
         .unwrap_or(pattern)
 }
 
+/// Anchor an artifact retrieval pattern so rsync only matches it at the
+/// transfer source root, NOT at any arbitrary depth in the source tree.
+/// Closes RCH bug `d7xc3` ("Artifact retrieval must not dirty local source
+/// checkout"). Unanchored patterns like `target/debug/**` would match
+/// `<root>/target/debug/foo` AND `<root>/anything/target/debug/foo` — the
+/// second branch lets a hostile or stale remote layout (e.g., another
+/// agent's build tree at `<root>/some-crate/target/...`) drift into the
+/// retrieval set and overwrite a local file.
+///
+/// Rules (rsync filter semantics):
+///   * pattern already starts with `/`  → leave as-is (already anchored)
+///   * pattern starts with `**/`        → leave as-is (explicit recursion)
+///   * otherwise                        → prepend `/` to anchor
+///
+/// Empty / whitespace-only patterns are returned unchanged so the caller
+/// can decide whether to drop them; we do not silently mutate junk input.
+fn anchor_retrieval_pattern(pattern: &str) -> String {
+    let trimmed = pattern.trim_start();
+    if trimmed.is_empty() {
+        return pattern.to_string();
+    }
+    if trimmed.starts_with('/') || trimmed.starts_with("**/") {
+        return pattern.to_string();
+    }
+    format!("/{}", pattern)
+}
+
+/// Compute the set of "allowed top-level roots" implied by anchored
+/// artifact patterns. Used to build the `--exclude` belt-and-suspenders
+/// for retrieval: anything at the rsync transfer root that ISN'T in this
+/// set gets explicitly excluded, regardless of pattern matching quirks.
+///
+/// For each anchored pattern, the first path component after the leading
+/// `/` is the implied root. Glob metacharacters in that component (e.g.,
+/// `*.tsbuildinfo`) disable the implication for that pattern — we can't
+/// safely derive a single root from a glob, so we conservatively allow
+/// the rsync source root to be scanned for that pattern.
+fn allowed_artifact_roots(artifact_patterns: &[String]) -> std::collections::BTreeSet<String> {
+    let mut roots = std::collections::BTreeSet::new();
+    for pattern in artifact_patterns {
+        let anchored = anchor_retrieval_pattern(pattern);
+        let after_slash = anchored.trim_start_matches('/');
+        let first = after_slash.split('/').next().unwrap_or("");
+        if first.is_empty() {
+            continue;
+        }
+        if has_rsync_glob_meta(first) {
+            // Top-level glob (e.g., `*.tsbuildinfo`) — can't derive a
+            // single allowed root. The caller's `--include` rule will
+            // accept matching files at the source root; we don't add a
+            // root exclusion that would block them.
+            continue;
+        }
+        roots.insert(first.to_string());
+    }
+    roots
+}
+
 fn has_rsync_glob_meta(pattern: &str) -> bool {
     pattern
         .chars()
         .any(|ch| matches!(ch, '*' | '?' | '[' | ']'))
+}
+
+fn top_level_artifact_pattern_matches_entry(pattern: &str, entry_name: &str) -> bool {
+    let anchored = anchor_retrieval_pattern(pattern);
+    if anchored.starts_with("**/") {
+        return false;
+    }
+
+    let after_slash = anchored.trim_start_matches('/');
+    let first = after_slash.split('/').next().unwrap_or("");
+    if first.is_empty() {
+        return false;
+    }
+    if first == entry_name {
+        return true;
+    }
+    has_rsync_glob_meta(first)
+        && Pattern::new(first)
+            .map(|pattern| pattern.matches(entry_name))
+            .unwrap_or(false)
+}
+
+fn artifact_patterns_allow_top_level_entry(artifact_patterns: &[String], entry_name: &str) -> bool {
+    artifact_patterns
+        .iter()
+        .any(|pattern| top_level_artifact_pattern_matches_entry(pattern, entry_name))
 }
 
 fn first_path_component(pattern: &str) -> Option<&str> {
@@ -683,6 +768,69 @@ impl TransferPipeline {
             }
         }
 
+        excludes
+    }
+
+    /// Belt-and-suspenders source-integrity guard for retrieval (RCH bug
+    /// `d7xc3`). Scans the LOCAL project root's top-level entries and
+    /// returns a list of explicit `--exclude /<entry>` rules for every
+    /// entry that ISN'T in the allowed-artifact-roots set. Rsync's filter
+    /// semantics: anchored excludes match only at the rsync transfer
+    /// root, so this rules out an entire class of source-overwrite bugs
+    /// (unanchored artifact patterns, malformed includes, hostile remote
+    /// layouts) by stopping rsync from even descending into known-source
+    /// top-level directories like `rch/`, `rch-common/`, etc.
+    ///
+    /// Why scan LOCAL not remote: the local project root mirrors the
+    /// remote source tree (we uploaded it). Listing local is fast (one
+    /// `read_dir`) and avoids an extra SSH round-trip. The threat model
+    /// is "stale or hostile remote tree dirties local source"; if our
+    /// LOCAL layout is being tampered with, the operator has bigger
+    /// problems than this retrieve.
+    fn local_source_roots_to_exclude(
+        &self,
+        allowed_roots: &BTreeSet<String>,
+        artifact_patterns: &[String],
+    ) -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir(&self.project_root) else {
+            // Project root unreadable → nothing to exclude here. Other
+            // retrieval excludes (REMOTE_RUNTIME_EXCLUDE_PATTERNS, the
+            // final `--exclude "*"`) still apply, so retrieval remains
+            // safe; we just lose the explicit belt-and-suspenders layer.
+            return Vec::new();
+        };
+        let mut excludes: Vec<String> = Vec::new();
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            let Some(name) = file_name.to_str() else {
+                continue;
+            };
+            if name.is_empty() || name == "." || name == ".." {
+                continue;
+            }
+            if allowed_roots.contains(name) {
+                // Permit descent into this artifact root.
+                continue;
+            }
+            if artifact_patterns_allow_top_level_entry(artifact_patterns, name) {
+                // Permit exact top-level artifact files and top-level artifact
+                // globs such as `*.tsbuildinfo`. Otherwise an existing local
+                // artifact file would be excluded before the later include rule
+                // can refresh it from the worker.
+                continue;
+            }
+            // Anchor with leading `/` so the exclude matches ONLY at the
+            // rsync transfer root, not at any nested depth.
+            let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            let exclude = if is_dir {
+                format!("/{name}/")
+            } else {
+                format!("/{name}")
+            };
+            excludes.push(exclude);
+        }
+        // Deterministic order so test assertions and tracing logs are stable.
+        excludes.sort();
         excludes
     }
 
@@ -1673,14 +1821,28 @@ fi",
             cmd.arg("--exclude").arg(pattern);
         }
 
+        // Source-integrity guard (RCH bug d7xc3): explicitly exclude every
+        // top-level entry in the local project root that ISN'T an allowed
+        // artifact root. Defends against unanchored pattern matching, malformed
+        // includes, or a stale remote tree pulling source files into the local
+        // checkout. The excludes are emitted BEFORE the directory include so
+        // rsync evaluates them first and refuses to descend into source dirs.
+        let allowed_roots = allowed_artifact_roots(artifact_patterns);
+        for exclude in self.local_source_roots_to_exclude(&allowed_roots, artifact_patterns) {
+            cmd.arg("--exclude").arg(exclude);
+        }
+
         // Essential: Include all directories so rsync can traverse to match patterns.
         // Without this, the final --exclude "*" prevents rsync from entering directories
         // like "target/" to check for matches.
         cmd.arg("--include").arg("*/");
 
-        // Include only specified artifact patterns
+        // Include only specified artifact patterns, anchored at the rsync
+        // transfer root via `anchor_retrieval_pattern` (RCH bug d7xc3) so
+        // a pattern like `target/debug/**` cannot match `<root>/anything/
+        // target/debug/...` at arbitrary depth.
         for pattern in artifact_patterns {
-            cmd.arg("--include").arg(pattern);
+            cmd.arg("--include").arg(anchor_retrieval_pattern(pattern));
         }
         cmd.arg("--exclude").arg("*"); // Exclude everything else
 
@@ -1738,11 +1900,20 @@ fi",
             cmd.arg("--exclude").arg(pattern);
         }
 
+        // Source-integrity guard (RCH bug d7xc3): see build_retrieve_command.
+        // Same belt-and-suspenders defense applied to the streaming variant.
+        let allowed_roots = allowed_artifact_roots(artifact_patterns);
+        for exclude in self.local_source_roots_to_exclude(&allowed_roots, artifact_patterns) {
+            cmd.arg("--exclude").arg(exclude);
+        }
+
         // Essential: Include all directories so rsync can traverse to match patterns.
         cmd.arg("--include").arg("*/");
 
+        // Artifact include patterns are anchored (RCH bug d7xc3) so they can
+        // only match at the rsync transfer root.
         for pattern in artifact_patterns {
-            cmd.arg("--include").arg(pattern);
+            cmd.arg("--include").arg(anchor_retrieval_pattern(pattern));
         }
         cmd.arg("--exclude").arg("*");
 
@@ -2059,6 +2230,8 @@ fn parse_rsync_bytes(output: &str) -> u64 {
 
 /// Parse files transferred from rsync output.
 fn parse_rsync_files(output: &str) -> u32 {
+    let mut total_files = None;
+
     for line in output.lines() {
         if let Some(rest) = line.strip_prefix("Number of files transferred:")
             && let Some(count) = rest.split_whitespace().next()
@@ -2070,14 +2243,14 @@ fn parse_rsync_files(output: &str) -> u32 {
             && let Some(count) = rest.split_whitespace().next()
             && let Ok(parsed) = count.replace(',', "").parse::<u32>()
         {
-            return parsed;
+            total_files = Some(parsed);
         }
     }
 
     // If we couldn't parse structured stats, return 0 rather than guessing.
     // The previous heuristic of counting non-empty lines was unreliable as it
     // would count progress lines, stats, and error messages as files.
-    0
+    total_files.unwrap_or(0)
 }
 
 // =============================================================================
@@ -2456,6 +2629,13 @@ mod tests {
     use rch_common::test_guard;
     use serial_test::serial;
 
+    fn arg_pair_position(args: &[String], flag: &str, value: &str) -> Option<usize> {
+        args.windows(2).position(|window| {
+            matches!(window, [observed_flag, observed_value]
+                if observed_flag.as_str() == flag && observed_value.as_str() == value)
+        })
+    }
+
     #[test]
     fn test_remote_path() {
         let _guard = test_guard!();
@@ -2535,6 +2715,13 @@ mod tests {
         // Test "Number of files:" format (alternate rsync output)
         let output = "Number of files: 100\nsome other line";
         assert_eq!(parse_rsync_files(output), 100);
+    }
+
+    #[test]
+    fn test_parse_rsync_files_prefers_transferred_count_over_total_tree_count() {
+        let _guard = test_guard!();
+        let output = "Number of files: 28,779 (reg: 20,000, dir: 8,779)\nNumber of files transferred: 42\nTotal bytes sent: 1,271,299";
+        assert_eq!(parse_rsync_files(output), 42);
     }
 
     #[test]
@@ -3196,21 +3383,13 @@ mod tests {
             .map(|arg| arg.to_string_lossy().to_string())
             .collect();
 
-        let beads_exclude = args
-            .windows(2)
-            .position(|window| window == ["--exclude", ".beads/"])
-            .expect("missing .beads exclude");
-        let recovery_exclude = args
-            .windows(2)
-            .position(|window| window == ["--exclude", ".beads/recovery_*/"])
+        let beads_exclude =
+            arg_pair_position(&args, "--exclude", ".beads/").expect("missing .beads exclude");
+        let recovery_exclude = arg_pair_position(&args, "--exclude", ".beads/recovery_*/")
             .expect("missing .beads recovery exclude");
-        let custom_exclude = args
-            .windows(2)
-            .position(|window| window == ["--exclude", "custom-cache/"])
+        let custom_exclude = arg_pair_position(&args, "--exclude", "custom-cache/")
             .expect("missing custom cache exclude");
-        let target_exclude = args
-            .windows(2)
-            .position(|window| window == ["--exclude", "target/"]);
+        let target_exclude = arg_pair_position(&args, "--exclude", "target/");
         let rlib_exclude = args
             .windows(2)
             .position(|window| window == ["--exclude", "*.rlib"]);
@@ -3218,9 +3397,13 @@ mod tests {
             .windows(2)
             .position(|window| window == ["--include", "*/"])
             .expect("missing directory include");
+        // RCH bug d7xc3: artifact patterns are now anchored at the rsync
+        // source root via `anchor_retrieval_pattern`, so `target/debug/**`
+        // is emitted as `/target/debug/**` to prevent it from floating
+        // and matching e.g. `<root>/anything/target/debug/...`.
         let target_include = args
             .windows(2)
-            .position(|window| window == ["--include", "target/debug/**"])
+            .position(|window| window == ["--include", "/target/debug/**"])
             .expect("missing artifact include");
 
         assert!(beads_exclude < include_dirs);
@@ -3287,8 +3470,8 @@ mod tests {
         );
         assert!(
             args.windows(2)
-                .any(|window| window == ["--include", "build/**"]),
-            "streaming retrieval should include requested artifact patterns"
+                .any(|window| window == ["--include", "/build/**"]),
+            "streaming retrieval should include the anchored form of requested artifact patterns (RCH bug d7xc3)"
         );
     }
 
@@ -3331,8 +3514,8 @@ mod tests {
         );
         assert!(
             args.windows(2)
-                .any(|window| window == ["--include", "target/release/**"]),
-            "streaming retrieval should still include requested artifact patterns"
+                .any(|window| window == ["--include", "/target/release/**"]),
+            "streaming retrieval should still include requested artifact patterns (anchored per RCH bug d7xc3)"
         );
         assert!(args.windows(2).any(|window| window == ["--exclude", "*"]));
     }
@@ -4219,5 +4402,447 @@ Total file size: 123 bytes";
             args.iter().any(|arg| arg == "--delete"),
             "normal streaming syncs should retain delete semantics"
         );
+    }
+
+    // =========================================================================
+    // Source-Integrity Hardening Tests (RCH bug d7xc3)
+    // =========================================================================
+    //
+    // These tests pin the contract that artifact retrieval cannot dirty the
+    // local source checkout, regardless of the pattern shape or what other
+    // agents may have left on the remote worker. The fix has three layers:
+    //
+    //   1. anchor_retrieval_pattern: every artifact pattern is anchored at
+    //      the rsync source root with leading `/`.
+    //   2. allowed_artifact_roots: derive the implied top-level allowed roots
+    //      from anchored patterns; non-glob top-level components only.
+    //   3. local_source_roots_to_exclude: emit explicit `--exclude /<entry>`
+    //      rules for every top-level entry in the local project root that
+    //      isn't an allowed artifact root.
+    //
+    // Together these mean: even if rsync's filter semantics had a subtle
+    // bug, AND a malicious/stale remote tree contained source files at
+    // unexpected paths, AND the artifact patterns were too permissive,
+    // rsync STILL refuses to descend into local source roots.
+
+    #[test]
+    fn anchor_retrieval_pattern_prepends_slash_when_unanchored() {
+        // TEST START: bare patterns get anchored
+        assert_eq!(
+            anchor_retrieval_pattern("target/debug/**"),
+            "/target/debug/**"
+        );
+        assert_eq!(
+            anchor_retrieval_pattern("target/release/**"),
+            "/target/release/**"
+        );
+        assert_eq!(anchor_retrieval_pattern("coverage/**"), "/coverage/**");
+        assert_eq!(
+            anchor_retrieval_pattern("*.tsbuildinfo"),
+            "/*.tsbuildinfo",
+            "top-level glob files must still be anchored"
+        );
+        // TEST PASS: unanchored patterns get a leading `/`
+    }
+
+    #[test]
+    fn anchor_retrieval_pattern_preserves_already_anchored() {
+        // TEST START: patterns starting with `/` are passthrough
+        assert_eq!(
+            anchor_retrieval_pattern("/target/debug/**"),
+            "/target/debug/**"
+        );
+        assert_eq!(anchor_retrieval_pattern("/coverage/**"), "/coverage/**");
+        // TEST PASS: already-anchored patterns are returned unchanged
+    }
+
+    #[test]
+    fn anchor_retrieval_pattern_preserves_recursive_globstar() {
+        // TEST START: explicit recursion via `**/` is intentional, leave alone
+        assert_eq!(
+            anchor_retrieval_pattern("**/junit.xml"),
+            "**/junit.xml",
+            "explicit recursive globstar must be preserved"
+        );
+        // TEST PASS: explicit `**/` patterns pass through
+    }
+
+    #[test]
+    fn anchor_retrieval_pattern_handles_edge_cases() {
+        // TEST START: empty and whitespace patterns are returned unchanged
+        assert_eq!(anchor_retrieval_pattern(""), "");
+        assert_eq!(anchor_retrieval_pattern("   "), "   ");
+        // TEST PASS: caller decides what to do with junk input
+    }
+
+    #[test]
+    fn allowed_artifact_roots_derives_first_component() {
+        // TEST START: implied allowed roots = first path component of each
+        // anchored pattern, glob components excluded.
+        let patterns = vec![
+            "target/debug/**".to_string(),
+            "target/release/**".to_string(),
+            "coverage/**".to_string(),
+            "*.tsbuildinfo".to_string(),
+            "/build/output/**".to_string(),
+        ];
+        let roots = allowed_artifact_roots(&patterns);
+        assert!(roots.contains("target"));
+        assert!(roots.contains("coverage"));
+        assert!(roots.contains("build"));
+        // Top-level glob patterns cannot contribute a single allowed root.
+        assert!(!roots.iter().any(|r| r.contains('*')));
+        // TEST PASS: derived allowed roots
+    }
+
+    #[test]
+    fn allowed_artifact_roots_handles_empty_input() {
+        // TEST START: defensive — empty patterns yields empty set
+        let roots = allowed_artifact_roots(&[]);
+        assert!(roots.is_empty());
+        // TEST PASS: empty input is safe
+    }
+
+    #[test]
+    fn local_source_roots_to_exclude_emits_explicit_rules_for_each_top_level_source_entry() {
+        // TEST START: scan local project root, emit `--exclude /<entry>/`
+        // for every top-level dir that ISN'T an allowed artifact root.
+        // This is the belt-and-suspenders defense — even if rsync filters
+        // are subtly wrong, these explicit anchored excludes pin source
+        // roots out of the retrieval set.
+        let _guard = test_guard!();
+        let temp = tempfile::tempdir().expect("create temp dir");
+        std::fs::create_dir(temp.path().join("rch")).expect("mkdir rch");
+        std::fs::create_dir(temp.path().join("rch-common")).expect("mkdir rch-common");
+        std::fs::create_dir(temp.path().join("rchd")).expect("mkdir rchd");
+        std::fs::create_dir(temp.path().join("target")).expect("mkdir target");
+        std::fs::write(temp.path().join("Cargo.toml"), b"[workspace]\n").expect("write toml");
+        let pipeline = TransferPipeline::new(
+            temp.path().to_path_buf(),
+            "test-project".to_string(),
+            "abc123".to_string(),
+            TransferConfig::default(),
+        );
+        let artifact_patterns = ["target/debug/**".to_string()];
+        let allowed = allowed_artifact_roots(&artifact_patterns);
+        let excludes = pipeline.local_source_roots_to_exclude(&allowed, &artifact_patterns);
+
+        // target/ MUST NOT be excluded — it's the artifact root.
+        assert!(
+            !excludes.iter().any(|e| e == "/target/"),
+            "target/ is an allowed artifact root and must NOT be in the exclude set"
+        );
+        // Every other source dir MUST be excluded (anchored with leading `/`).
+        assert!(
+            excludes.iter().any(|e| e == "/rch/"),
+            "rch/ source dir must be excluded; got {excludes:?}"
+        );
+        assert!(
+            excludes.iter().any(|e| e == "/rch-common/"),
+            "rch-common/ source dir must be excluded; got {excludes:?}"
+        );
+        assert!(
+            excludes.iter().any(|e| e == "/rchd/"),
+            "rchd/ source dir must be excluded; got {excludes:?}"
+        );
+        // Top-level files also excluded, with no trailing slash.
+        assert!(
+            excludes.iter().any(|e| e == "/Cargo.toml"),
+            "top-level files must be excluded (no trailing slash); got {excludes:?}"
+        );
+        // Excludes are sorted for stability.
+        let mut sorted = excludes.clone();
+        sorted.sort();
+        assert_eq!(excludes, sorted, "excludes must be sorted for determinism");
+        // TEST PASS: source-root exclusion contract
+    }
+
+    #[test]
+    fn local_source_roots_to_exclude_does_not_hide_top_level_glob_artifacts() {
+        // TEST START: Bun/typecheck retrieval includes top-level globs such
+        // as `*.tsbuildinfo`. If the local file already exists, the
+        // source-integrity guard must not emit a prior exclude that prevents
+        // rsync from refreshing it.
+        let _guard = test_guard!();
+        let temp = tempfile::tempdir().expect("create temp dir");
+        std::fs::create_dir(temp.path().join("src")).expect("mkdir src");
+        std::fs::write(temp.path().join("Cargo.toml"), b"[workspace]\n").expect("write toml");
+        std::fs::write(temp.path().join("tsconfig.tsbuildinfo"), b"old").expect("write artifact");
+        let pipeline = TransferPipeline::new(
+            temp.path().to_path_buf(),
+            "test-project".to_string(),
+            "abc123".to_string(),
+            TransferConfig::default(),
+        );
+        let artifact_patterns = ["*.tsbuildinfo".to_string()];
+        let allowed = allowed_artifact_roots(&artifact_patterns);
+        let excludes = pipeline.local_source_roots_to_exclude(&allowed, &artifact_patterns);
+
+        assert!(
+            !excludes.iter().any(|e| e == "/tsconfig.tsbuildinfo"),
+            "declared top-level glob artifact must not be source-excluded; got {excludes:?}"
+        );
+        assert!(
+            excludes.iter().any(|e| e == "/Cargo.toml"),
+            "unrelated top-level files must still be source-excluded; got {excludes:?}"
+        );
+        assert!(
+            excludes.iter().any(|e| e == "/src/"),
+            "source directories must still be source-excluded; got {excludes:?}"
+        );
+        // TEST PASS: top-level artifact glob stays retrievable without
+        // opening unrelated source entries.
+    }
+
+    #[test]
+    fn local_source_roots_to_exclude_handles_unreadable_project_root() {
+        // TEST START: defensive — if project_root is unreadable, we get an
+        // empty exclude list (not a panic). Other retrieval guards still
+        // apply, so retrieval remains safe.
+        let _guard = test_guard!();
+        let pipeline = TransferPipeline::new(
+            std::path::PathBuf::from("/this/path/does/not/exist/anywhere/d7xc3-test"),
+            "test-project".to_string(),
+            "abc123".to_string(),
+            TransferConfig::default(),
+        );
+        let allowed = std::collections::BTreeSet::new();
+        let excludes = pipeline.local_source_roots_to_exclude(&allowed, &[]);
+        assert!(
+            excludes.is_empty(),
+            "unreadable project_root must yield empty excludes (got {excludes:?})"
+        );
+        // TEST PASS: unreadable root is non-fatal
+    }
+
+    #[test]
+    fn build_retrieve_command_excludes_local_source_dirs_at_anchored_paths() {
+        // TEST START: integration test — build the retrieve command for a
+        // workspace-shaped local project and verify both layers fire:
+        //
+        //   (a) The artifact pattern is anchored.
+        //   (b) Every top-level source dir gets an explicit anchored exclude
+        //       BEFORE the directory `--include "*/"`.
+        let _guard = test_guard!();
+        let temp = tempfile::tempdir().expect("create temp dir");
+        std::fs::create_dir(temp.path().join("rch")).expect("mkdir rch");
+        std::fs::create_dir(temp.path().join("rch-common")).expect("mkdir rch-common");
+        std::fs::create_dir(temp.path().join("rchd")).expect("mkdir rchd");
+        std::fs::create_dir(temp.path().join("rch-wkr")).expect("mkdir rch-wkr");
+        std::fs::create_dir(temp.path().join("target")).expect("mkdir target");
+        let pipeline = TransferPipeline::new(
+            temp.path().to_path_buf(),
+            "test-project".to_string(),
+            "abc123".to_string(),
+            TransferConfig::default(),
+        );
+        let worker = WorkerConfig {
+            id: WorkerId::new("mock-worker"),
+            host: "mock://worker".to_string(),
+            user: "mockuser".to_string(),
+            identity_file: "~/.ssh/mock".to_string(),
+            total_slots: 4,
+            priority: 100,
+            tags: vec![],
+        };
+        let cmd = pipeline.build_retrieve_command(
+            &worker,
+            "/tmp/rch/test-project/abc123",
+            &["target/debug/**".to_string()],
+        );
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect();
+
+        // (a) Artifact pattern anchored.
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["--include", "/target/debug/**"]),
+            "artifact pattern must be emitted in anchored form (RCH bug d7xc3); got args = {args:?}"
+        );
+        assert!(
+            !args
+                .windows(2)
+                .any(|w| w == ["--include", "target/debug/**"]),
+            "unanchored pattern form must NOT be emitted (RCH bug d7xc3)"
+        );
+
+        // (b) All four workspace source dirs explicitly excluded with anchored form.
+        for src in ["/rch/", "/rch-common/", "/rchd/", "/rch-wkr/"] {
+            assert!(
+                args.windows(2).any(|w| w == ["--exclude", src]),
+                "{src} must be in the exclude set (source-integrity guard); got args = {args:?}"
+            );
+        }
+
+        // The artifact root MUST NOT be in the source-exclude set.
+        assert!(
+            !args.windows(2).any(|w| w == ["--exclude", "/target/"]),
+            "target/ is the allowed artifact root and must NOT be source-excluded"
+        );
+
+        // Ordering: source-excludes are emitted BEFORE the `--include "*/"`
+        // directive so rsync evaluates them first and refuses to descend.
+        let include_dirs_pos = args
+            .windows(2)
+            .position(|w| w == ["--include", "*/"])
+            .expect("missing directory include");
+        let first_source_exclude_pos = args
+            .windows(2)
+            .position(|w| w == ["--exclude", "/rch/"])
+            .expect("missing /rch/ exclude");
+        assert!(
+            first_source_exclude_pos < include_dirs_pos,
+            "source-integrity excludes must be applied BEFORE --include */"
+        );
+        // TEST PASS: source-integrity guard wired through both helpers
+    }
+
+    #[test]
+    fn build_retrieve_command_keeps_existing_top_level_glob_artifact_retrievable() {
+        // TEST START: command-level proof for the Bun/default artifact case.
+        // A local tsbuildinfo file must not be excluded before the artifact
+        // include can match it.
+        let _guard = test_guard!();
+        let temp = tempfile::tempdir().expect("create temp dir");
+        std::fs::create_dir(temp.path().join("src")).expect("mkdir src");
+        std::fs::write(temp.path().join("tsconfig.tsbuildinfo"), b"old").expect("write artifact");
+        let pipeline = TransferPipeline::new(
+            temp.path().to_path_buf(),
+            "test-project".to_string(),
+            "abc123".to_string(),
+            TransferConfig::default(),
+        );
+        let worker = WorkerConfig {
+            id: WorkerId::new("mock-worker"),
+            host: "mock://worker".to_string(),
+            user: "mockuser".to_string(),
+            identity_file: "~/.ssh/mock".to_string(),
+            total_slots: 4,
+            priority: 100,
+            tags: vec![],
+        };
+        let cmd = pipeline.build_retrieve_command(
+            &worker,
+            "/tmp/rch/test-project/abc123",
+            &["*.tsbuildinfo".to_string()],
+        );
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect();
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["--include", "/*.tsbuildinfo"]),
+            "top-level glob artifact must be emitted in anchored form; got args = {args:?}"
+        );
+        assert!(
+            !args
+                .windows(2)
+                .any(|w| w == ["--exclude", "/tsconfig.tsbuildinfo"]),
+            "existing top-level artifact must not be excluded before its include; got args = {args:?}"
+        );
+        assert!(
+            args.windows(2).any(|w| w == ["--exclude", "/src/"]),
+            "source directories must remain protected; got args = {args:?}"
+        );
+        // TEST PASS: command preserves both source guard and top-level glob retrieval.
+    }
+
+    #[test]
+    fn build_retrieve_streaming_command_also_applies_source_integrity_guard() {
+        // TEST START: parity check — the streaming variant must apply the
+        // same guard. If they drift, the bug returns under one code path.
+        let _guard = test_guard!();
+        let temp = tempfile::tempdir().expect("create temp dir");
+        std::fs::create_dir(temp.path().join("src")).expect("mkdir src");
+        std::fs::create_dir(temp.path().join("target")).expect("mkdir target");
+        let pipeline = TransferPipeline::new(
+            temp.path().to_path_buf(),
+            "test-project".to_string(),
+            "abc123".to_string(),
+            TransferConfig::default(),
+        );
+        let worker = WorkerConfig {
+            id: WorkerId::new("mock-worker"),
+            host: "mock://worker".to_string(),
+            user: "mockuser".to_string(),
+            identity_file: "~/.ssh/mock".to_string(),
+            total_slots: 4,
+            priority: 100,
+            tags: vec![],
+        };
+        let cmd = pipeline.build_retrieve_streaming_command(
+            &worker,
+            "/tmp/rch/test-project/abc123",
+            &["target/release/**".to_string()],
+        );
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect();
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["--include", "/target/release/**"]),
+            "streaming variant must anchor patterns (RCH bug d7xc3)"
+        );
+        assert!(
+            args.windows(2).any(|w| w == ["--exclude", "/src/"]),
+            "streaming variant must apply source-integrity excludes (RCH bug d7xc3)"
+        );
+        // TEST PASS: streaming + non-streaming have identical safety contract
+    }
+
+    #[test]
+    fn build_retrieve_command_with_absolute_cargo_target_dir_still_safe() {
+        // TEST START: simulate the original d7xc3 scenario — operator set
+        // CARGO_TARGET_DIR to an ABSOLUTE path outside the project (e.g.,
+        // /tmp/rch-target-foo). The artifact pattern is still `target/...`
+        // (relative to project), but no target/ exists locally. Our guard
+        // must STILL prevent any local source dir from being a retrieval
+        // candidate.
+        let _guard = test_guard!();
+        let temp = tempfile::tempdir().expect("create temp dir");
+        std::fs::create_dir(temp.path().join("rch")).expect("mkdir rch");
+        std::fs::create_dir(temp.path().join("rch-common")).expect("mkdir rch-common");
+        // NO target/ dir locally — simulates absolute CARGO_TARGET_DIR.
+        let pipeline = TransferPipeline::new(
+            temp.path().to_path_buf(),
+            "test-project".to_string(),
+            "abc123".to_string(),
+            TransferConfig::default(),
+        );
+        let worker = WorkerConfig {
+            id: WorkerId::new("mock-worker"),
+            host: "mock://worker".to_string(),
+            user: "mockuser".to_string(),
+            identity_file: "~/.ssh/mock".to_string(),
+            total_slots: 4,
+            priority: 100,
+            tags: vec![],
+        };
+        let cmd = pipeline.build_retrieve_command(
+            &worker,
+            "/tmp/rch/test-project/abc123",
+            &["target/debug/**".to_string()],
+        );
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect();
+        assert!(
+            args.windows(2).any(|w| w == ["--exclude", "/rch/"]),
+            "source-integrity excludes must fire even when local target/ is absent"
+        );
+        assert!(
+            args.windows(2).any(|w| w == ["--exclude", "/rch-common/"]),
+            "all local top-level source dirs must be excluded"
+        );
+        // TEST PASS: absolute CARGO_TARGET_DIR case
     }
 }

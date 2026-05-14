@@ -5,14 +5,6 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use which::which;
 
-fn hex_bytes(bytes: impl AsRef<[u8]>) -> String {
-    bytes
-        .as_ref()
-        .iter()
-        .map(|byte| format!("{:02x}", byte))
-        .collect()
-}
-
 /// Result of verification.
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -110,10 +102,21 @@ async fn compute_sha256(file_path: &std::path::Path) -> Result<String, UpdateErr
         }
 
         use sha2::Digest;
-        Ok(hex_bytes(hasher.finalize()))
+        Ok(bytes_to_lower_hex(hasher.finalize()))
     })
     .await
     .map_err(|e| UpdateError::InstallFailed(format!("Task failed: {}", e)))?
+}
+
+fn bytes_to_lower_hex(bytes: impl AsRef<[u8]>) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let bytes = bytes.as_ref();
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
 }
 
 /// Expected GitHub Actions OIDC issuer for sigstore verification.
@@ -193,7 +196,7 @@ pub fn verify_sha256_bytes(content: &[u8], expected: &str) -> Result<(), UpdateE
 
     let mut hasher = sha2::Sha256::new();
     hasher.update(content);
-    let actual = hex_bytes(hasher.finalize());
+    let actual = bytes_to_lower_hex(hasher.finalize());
 
     if actual.eq_ignore_ascii_case(expected) {
         Ok(())
@@ -442,7 +445,7 @@ mod tests {
         let mut hasher = sha2::Sha256::new();
         use sha2::Digest;
         hasher.update(b"hello world");
-        let expected = hex_bytes(hasher.finalize());
+        let expected = bytes_to_lower_hex(hasher.finalize());
 
         let result = verify_checksum_and_signature(&file_path, &expected, None)
             .await

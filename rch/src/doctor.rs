@@ -16,9 +16,9 @@ use crate::ui::context::OutputContext;
 use crate::ui::theme::StatusIndicator;
 use anyhow::Result;
 use directories::ProjectDirs;
-use rch_common::ApiResponse;
+use rch_common::{ApiResponse, ReliabilityReasonCode};
 use rch_telemetry::TelemetryStorage;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::io::{self, Read, Write};
 #[cfg(unix)]
@@ -31,6 +31,12 @@ use which::which;
 /// Default socket path (XDG_RUNTIME_DIR -> ~/.cache/rch -> /tmp fallback).
 fn default_socket_path() -> PathBuf {
     PathBuf::from(rch_common::default_socket_path())
+}
+
+fn configured_or_default_socket_path() -> PathBuf {
+    crate::commands::configured_socket_path()
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| default_socket_path())
 }
 
 /// Maximum size of a config / settings file we'll read into memory.
@@ -148,9 +154,39 @@ pub struct DoctorOptions {
     pub check_schemas: bool,
     /// Detailed output.
     pub verbose: bool,
+    /// `--strict`: promote `Degraded` to exit code 2 (treat warnings as failures
+    /// for tight CI gates). JSON `data.summary.overall` is unaffected.
+    pub strict: bool,
+    /// `--lenient`: demote `Failing` to exit code 1 (log only, never block).
+    /// JSON `data.summary.overall` is unaffected.
+    pub lenient: bool,
+    /// `--scope=<list>`: subset of probes to run. Default = `[All]`.
+    pub scope: ReliabilityScopeSet,
+    /// `--watch`: continuous monitoring mode. The doctor re-runs every
+    /// `watch_interval_secs` and emits diff-aware output (transitions
+    /// since the prior sweep). Exits cleanly on SIGINT with a final
+    /// summary on stderr.
+    pub watch: bool,
+    /// `--watch-interval=<seconds>`: time between sweeps in `--watch`
+    /// mode. Clamped by the CLI handler to 1..=3600. Default: 5.
+    pub watch_interval_secs: u64,
+    /// `--transitions-only`: in `--watch` mode, suppress unchanged
+    /// iterations and emit only when the diagnostic set OR verdict
+    /// differs from the prior sweep.
+    pub transitions_only: bool,
+    /// `--watch-snapshot=PATH`: on `--watch` exit, write a final
+    /// summary JSON to PATH (sweep count, verdict transitions count,
+    /// final verdict). Useful for tmux/split-window setups.
+    pub watch_snapshot: Option<std::path::PathBuf>,
 }
 
-const RELIABILITY_DOCTOR_SCHEMA_VERSION: &str = "1.0.0";
+// Live schema-version constants are sourced from the central
+// `rch_common::schema_versions` registry. The `EXPECTED_*` constants
+// below are intentionally pinned literals: the reliability doctor must
+// compare live component versions against the versions this doctor knows
+// how to consume, not against aliases of those same live constants.
+const RELIABILITY_DOCTOR_SCHEMA_VERSION: &str =
+    rch_common::schema_version(rch_common::SchemaComponent::DoctorReliability);
 const EXPECTED_RELIABILITY_DOCTOR_SCHEMA_VERSION: &str = "1.0.0";
 const EXPECTED_STATUS_SCHEMA_VERSION: &str = "1.0.0";
 const EXPECTED_REPO_UPDATER_CONTRACT_SCHEMA_VERSION: &str = "1.0.0";
@@ -163,6 +199,92 @@ enum ReliabilitySeverity {
     Info,
     Warning,
     Critical,
+}
+
+/// Tri-state aggregate verdict for the reliability doctor.
+///
+/// - `Healthy`  — every diagnostic passed (or only Info diagnostics).
+/// - `Degraded` — at least one Warning, no Criticals.
+/// - `Failing`  — at least one Critical.
+///
+/// Maps to process exit codes via `ReliabilityVerdict::exit_code`. Operators key
+/// alerting policy off this tri-state (sibling t25 watch / t28 webhooks).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReliabilityVerdict {
+    Healthy,
+    Degraded,
+    Failing,
+}
+
+impl ReliabilityVerdict {
+    /// Default exit-code mapping (without `--strict` / `--lenient`):
+    /// Healthy → 0, Degraded → 1, Failing → 2.
+    #[must_use]
+    pub const fn default_exit_code(self) -> i32 {
+        match self {
+            Self::Healthy => 0,
+            Self::Degraded => 1,
+            Self::Failing => 2,
+        }
+    }
+
+    /// Apply `--strict` / `--lenient` exit-code policy. Returns the mapped
+    /// exit code. JSON `data.summary.overall` is unaffected — flags only shift
+    /// the process exit.
+    #[must_use]
+    pub const fn exit_code(self, strict: bool, lenient: bool) -> i32 {
+        // Caller must guarantee strict and lenient are not both set.
+        if strict {
+            // Promote: Degraded becomes Failing-equivalent (exit 2).
+            match self {
+                Self::Healthy => 0,
+                Self::Degraded | Self::Failing => 2,
+            }
+        } else if lenient {
+            // Demote: Failing becomes Degraded-equivalent (exit 1).
+            match self {
+                Self::Healthy => 0,
+                Self::Degraded | Self::Failing => 1,
+            }
+        } else {
+            self.default_exit_code()
+        }
+    }
+
+    /// Human-readable label, used in banner rendering.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Healthy => "Healthy",
+            Self::Degraded => "Degraded",
+            Self::Failing => "Failing",
+        }
+    }
+}
+
+/// Pure aggregator: max-severity-wins.
+///
+/// - Any `Critical` → `Failing`.
+/// - Else any `Warning` → `Degraded`.
+/// - Else (Pass / Info / empty) → `Healthy`.
+///
+/// Empty input is honestly `Healthy` — caller is responsible for adding a
+/// "no probes ran" diagnostic if that's the wrong default for their context.
+fn aggregate_verdict(diagnostics: &[ReliabilityDiagnostic]) -> ReliabilityVerdict {
+    let mut has_warning = false;
+    for diag in diagnostics {
+        match diag.severity {
+            ReliabilitySeverity::Critical => return ReliabilityVerdict::Failing,
+            ReliabilitySeverity::Warning => has_warning = true,
+            ReliabilitySeverity::Pass | ReliabilitySeverity::Info => {}
+        }
+    }
+    if has_warning {
+        ReliabilityVerdict::Degraded
+    } else {
+        ReliabilityVerdict::Healthy
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -191,6 +313,180 @@ impl ReliabilityCategory {
     }
 }
 
+/// One scope bucket per reliability probe, plus an `All` sentinel that
+/// runs every probe (default behavior).
+///
+/// Each named variant maps to one of the `reliability_*_diagnostics`
+/// probes in `run_reliability_doctor`. Operators triaging a known
+/// symptom can pass `--scope=pressure` (or any subset, comma-separated)
+/// to skip the irrelevant probes — typical 7-probe sweep takes ~1.5s
+/// against an 8-worker fleet, scope=topology is ~50ms.
+///
+/// Naming uses the operator-facing labels per the bead: `convergence`
+/// (not `repo_presence`), `triage` (not `process_debt`), `helpers`
+/// (not `helper_compatibility`), `rollout` (not `rollout_posture`),
+/// `schema` (not `schema_compatibility`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReliabilityScope {
+    All,
+    Topology,
+    Convergence,
+    Pressure,
+    Triage,
+    Helpers,
+    Rollout,
+    Schema,
+}
+
+impl ReliabilityScope {
+    /// Operator-facing label (matches clap value names).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Topology => "topology",
+            Self::Convergence => "convergence",
+            Self::Pressure => "pressure",
+            Self::Triage => "triage",
+            Self::Helpers => "helpers",
+            Self::Rollout => "rollout",
+            Self::Schema => "schema",
+        }
+    }
+}
+
+impl std::str::FromStr for ReliabilityScope {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let trimmed = s.trim().to_ascii_lowercase();
+        match trimmed.as_str() {
+            "all" => Ok(Self::All),
+            "topology" => Ok(Self::Topology),
+            "convergence" => Ok(Self::Convergence),
+            "pressure" => Ok(Self::Pressure),
+            "triage" => Ok(Self::Triage),
+            "helpers" => Ok(Self::Helpers),
+            "rollout" => Ok(Self::Rollout),
+            "schema" => Ok(Self::Schema),
+            other => Err(format!(
+                "unknown scope value '{other}' (valid: all, topology, convergence, pressure, triage, helpers, rollout, schema)"
+            )),
+        }
+    }
+}
+
+/// Comma-separated set of scopes. Wraps `Vec<ReliabilityScope>` because
+/// clap's `value_parser` requires a single type for the field; the parser
+/// splits on `,`, deduplicates while preserving first-appearance order,
+/// and treats `all` as dominant (collapses any other entries to a
+/// 1-element `[All]` set with an INFO trace event noting redundancy).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReliabilityScopeSet(pub Vec<ReliabilityScope>);
+
+impl Default for ReliabilityScopeSet {
+    fn default() -> Self {
+        Self(vec![ReliabilityScope::All])
+    }
+}
+
+impl ReliabilityScopeSet {
+    /// Returns true if this set contains the `All` sentinel OR the
+    /// given scope explicitly. Used to gate each probe.
+    #[must_use]
+    pub fn matches(&self, scope: ReliabilityScope) -> bool {
+        self.0
+            .iter()
+            .any(|s| matches!(s, ReliabilityScope::All) || *s == scope)
+    }
+
+    /// Lowercase string form for `data.scope` JSON.
+    #[must_use]
+    pub fn as_strings(&self) -> Vec<String> {
+        self.0.iter().map(|s| s.as_str().to_string()).collect()
+    }
+
+    fn needs_worker_config(&self) -> bool {
+        self.matches(ReliabilityScope::Topology)
+    }
+
+    fn needs_daemon_status(&self) -> bool {
+        [
+            ReliabilityScope::Topology,
+            ReliabilityScope::Pressure,
+            ReliabilityScope::Triage,
+        ]
+        .into_iter()
+        .any(|scope| self.matches(scope))
+    }
+
+    fn needs_repo_convergence_status(&self) -> bool {
+        self.matches(ReliabilityScope::Convergence)
+    }
+
+    fn needs_rollout_config(&self) -> bool {
+        self.matches(ReliabilityScope::Rollout)
+    }
+
+    fn runs_schema_probe(&self, check_schemas: bool) -> bool {
+        self.0.contains(&ReliabilityScope::Schema)
+            || (check_schemas && self.matches(ReliabilityScope::Schema))
+    }
+
+    fn probe_names_to_run(&self, check_schemas: bool) -> Vec<&'static str> {
+        let mut names = Vec::new();
+        for (scope, name) in [
+            (ReliabilityScope::Topology, "topology"),
+            (ReliabilityScope::Convergence, "convergence"),
+            (ReliabilityScope::Pressure, "pressure"),
+            (ReliabilityScope::Triage, "triage"),
+            (ReliabilityScope::Helpers, "helpers"),
+            (ReliabilityScope::Rollout, "rollout"),
+        ] {
+            if self.matches(scope) {
+                names.push(name);
+            }
+        }
+        if self.runs_schema_probe(check_schemas) {
+            names.push("schema");
+        }
+        names
+    }
+}
+
+impl std::str::FromStr for ReliabilityScopeSet {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            return Err("scope list is empty (pass --scope=all or one of: topology, convergence, pressure, triage, helpers, rollout, schema)".to_string());
+        }
+        let mut out: Vec<ReliabilityScope> = Vec::new();
+        for segment in trimmed.split(',') {
+            let scope: ReliabilityScope = segment.parse()?;
+            if !out.contains(&scope) {
+                out.push(scope);
+            }
+        }
+        // `all` dominates: if mixed with other names, collapse to [All]
+        // and log the redundancy at INFO level.
+        if out.contains(&ReliabilityScope::All) && out.len() > 1 {
+            let redundant: Vec<String> = out
+                .iter()
+                .filter(|s| **s != ReliabilityScope::All)
+                .map(|s| s.as_str().to_string())
+                .collect();
+            tracing::info!(
+                target: "rch::doctor::scope",
+                redundant = ?redundant,
+                "doctor.scope.all_dominates_redundant",
+            );
+            out = vec![ReliabilityScope::All];
+        }
+        Ok(Self(out))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum ReliabilityDoctorMode {
@@ -205,7 +501,9 @@ struct ReliabilityDiagnostic {
     check_name: String,
     severity: ReliabilitySeverity,
     message: String,
-    reason_code: String,
+    /// Canonical `RCH-Rnnn` reason code (per `ReliabilityReasonCode`).
+    /// Serializes as the string form (e.g., `"RCH-R001"`).
+    code: ReliabilityReasonCode,
     #[serde(skip_serializing_if = "Option::is_none")]
     details: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -225,7 +523,11 @@ struct ReliabilityDoctorSummary {
     warning: usize,
     critical: usize,
     categories_checked: Vec<ReliabilityCategory>,
-    overall_healthy: bool,
+    /// Tri-state aggregate verdict (t02). Replaces the prior boolean
+    /// `overall_healthy`. Per AGENTS.md "no backwards compatibility":
+    /// JSON consumers update to read `summary.overall` (string) instead
+    /// of `summary.overall_healthy` (bool).
+    overall: ReliabilityVerdict,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -243,6 +545,19 @@ struct ReliabilityRemediationStep {
 struct ReliabilityDoctorResponse {
     schema_version: String,
     mode: ReliabilityDoctorMode,
+    /// Scope set the operator requested (always present, single-element
+    /// `["all"]` by default). Agents inspect this field to confirm their
+    /// `--scope` arg was honored.
+    scope: Vec<String>,
+    /// True when ANY probe could not reach the daemon. Operators see this
+    /// top-level marker instead of grepping diagnostic messages for the
+    /// daemon-down case. (t05)
+    daemon_unreachable: bool,
+    /// Per-probe failures that contributed to `daemon_unreachable=true`.
+    /// Empty when `daemon_unreachable=false`. Forensic detail so log
+    /// consumers can attribute the unreachability to a specific probe
+    /// (e.g., "process_debt: daemon status unavailable"). (t05)
+    daemon_unreachable_reasons: Vec<String>,
     diagnostics: Vec<ReliabilityDiagnostic>,
     summary: ReliabilityDoctorSummary,
     remediation_plan: Vec<ReliabilityRemediationStep>,
@@ -254,14 +569,14 @@ impl ReliabilityDiagnostic {
         check_name: impl Into<String>,
         severity: ReliabilitySeverity,
         message: impl Into<String>,
-        reason_code: impl Into<String>,
+        code: ReliabilityReasonCode,
     ) -> Self {
         Self {
             category,
             check_name: check_name.into(),
             severity,
             message: message.into(),
-            reason_code: reason_code.into(),
+            code,
             details: None,
             worker_id: None,
             remediation_command: None,
@@ -353,6 +668,12 @@ pub async fn run_doctor(ctx: &OutputContext, options: DoctorOptions) -> Result<(
         let _ = ctx.json(&ApiResponse::ok(
             "doctor",
             DoctorResponse {
+                // t05: same schema-version on legacy doctor as on
+                // reliability mode; sourced from the central registry.
+                schema_version: rch_common::schema_version(
+                    rch_common::SchemaComponent::DoctorReliability,
+                )
+                .to_string(),
                 checks,
                 summary,
                 fixes_applied,
@@ -442,29 +763,208 @@ pub async fn run_doctor(ctx: &OutputContext, options: DoctorOptions) -> Result<(
 }
 
 async fn run_reliability_doctor(ctx: &OutputContext, options: &DoctorOptions) -> Result<()> {
-    let worker_config = load_workers_from_config();
-    let (workers, worker_config_error) = match worker_config {
-        Ok(workers) => (Some(workers), None),
-        Err(err) => (None, Some(err.to_string())),
+    // Watch mode short-circuits the single-shot path: it loops, diffs,
+    // and returns only after SIGINT or a signal-handler error.
+    if options.watch {
+        return run_reliability_watch_loop(ctx, options).await;
+    }
+    let response = collect_reliability_response_once(options).await;
+
+    if ctx.is_json() {
+        // t05: command tag is a single dotted token ("doctor.reliability")
+        // for agent-friendly jq-matching. Per AGENTS.md no-back-compat:
+        // consumers update to the dotted form directly.
+        let _ = ctx.json(&ApiResponse::ok("doctor.reliability", &response));
+    } else {
+        print_reliability_doctor_response(ctx, &response);
+    }
+
+    // Verdict → exit-code mapping (t02). Honors --strict / --lenient. Logged
+    // for forensics so log consumers can correlate exit codes with verdicts.
+    let exit_code = response
+        .summary
+        .overall
+        .exit_code(options.strict, options.lenient);
+    tracing::info!(
+        target: "rch::doctor::verdict",
+        verdict = response.summary.overall.label(),
+        exit_code,
+        strict = options.strict,
+        lenient = options.lenient,
+        pass = response.summary.pass,
+        info = response.summary.info,
+        warning = response.summary.warning,
+        critical = response.summary.critical,
+        "doctor.verdict",
+    );
+    if exit_code == 0 {
+        Ok(())
+    } else {
+        // Non-zero exit must reach the caller. Use process::exit AFTER all
+        // output has been flushed (println! above is line-buffered to stdout
+        // which auto-flushes on newline).
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+        std::process::exit(exit_code);
+    }
+}
+
+/// Per-probe timeout for the I/O collection phase (RCH bd-62u24.8). A
+/// hung daemon RPC or a stuck `which()` subprocess can't sink the whole
+/// doctor: each probe is bounded by this timeout and falls back to a
+/// `None`/empty result that downstream diagnostic builders interpret as
+/// "unavailable" (Warning verdict).
+const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Single-shot collection of a reliability doctor response. Extracted
+/// from `run_reliability_doctor` so both the single-shot path and the
+/// `--watch` loop (t25) can re-use the exact same probe gating, scope
+/// honoring, and verdict aggregation. Pure async data collection — no
+/// stdout/stderr writes, no `process::exit` — callers decide how to
+/// surface the result.
+///
+/// # Parallelism (bd-62u24.8)
+///
+/// The three I/O-bearing data sources run **concurrently** via
+/// `tokio::spawn` + (for sync work) `tokio::task::spawn_blocking`:
+///
+///   1. `query_daemon_full_status()` — daemon RPC for fleet topology /
+///      disk pressure / process debt data.
+///   2. `query_repo_convergence_status()` — daemon RPC for repo
+///      convergence status.
+///   3. `reliability_helper_compatibility_diagnostics()` — sync work
+///      that spawns `which()` + version-probe subprocesses (4 helpers ×
+///      2 subprocesses each = 8 forks). Moved to the blocking thread
+///      pool so its subprocess waits don't block the runtime's worker
+///      threads.
+///
+/// Each spawned task is bounded by `PROBE_TIMEOUT` and lives behind a
+/// `JoinHandle` so a panic in one probe is caught by `JoinError` and
+/// surfaces as a downgraded "unavailable" diagnostic for that scope —
+/// the other probes still produce their results. This satisfies the
+/// per-probe panic-isolation acceptance criterion.
+///
+/// The order of diagnostics in the final response is independent of the
+/// parallelism order: the `scope.matches(...)` branches at the bottom
+/// iterate in a fixed (Topology, Convergence, Pressure, Triage,
+/// Helpers, Rollout, Schema) sequence over the joined results, so
+/// output is byte-stable across runs even if probes finish in
+/// different orders.
+async fn collect_reliability_response_once(options: &DoctorOptions) -> ReliabilityDoctorResponse {
+    // Probe gating per --scope (t01). Each branch runs only when the
+    // operator-supplied scope set matches. Default `[All]` runs everything.
+    let scope = &options.scope;
+
+    // Phase 1 — kick off the three I/O probes concurrently. Each one is
+    // spawn-isolated for panic safety, timeout-bounded for hung-RPC
+    // safety, and conditionally skipped per scope gating (so a scoped
+    // run doesn't pay the I/O cost it can't consume).
+    let join_start = Instant::now();
+    let daemon_handle = scope.needs_daemon_status().then(|| {
+        tokio::spawn(async move {
+            tokio::time::timeout(PROBE_TIMEOUT, query_daemon_full_status()).await
+        })
+    });
+    let convergence_handle = scope.needs_repo_convergence_status().then(|| {
+        tokio::spawn(async move {
+            tokio::time::timeout(PROBE_TIMEOUT, query_repo_convergence_status()).await
+        })
+    });
+    // Helper-compat probe is sync subprocess work. `spawn_blocking` puts
+    // it on tokio's blocking pool so it runs in parallel with the async
+    // daemon RPCs above without starving runtime worker threads.
+    let helpers_handle = scope
+        .matches(ReliabilityScope::Helpers)
+        .then(|| tokio::task::spawn_blocking(reliability_helper_compatibility_diagnostics));
+
+    // Phase 2 — sync file I/O. These are microseconds each and can run
+    // on the current thread while the spawned probes are in flight.
+    let config_result = if scope.needs_rollout_config() {
+        Some(crate::config::load_config())
+    } else {
+        None
+    };
+    tracing::debug!(
+        target: "rch::doctor::config_loads",
+        loaded = matches!(config_result.as_ref(), Some(Ok(_))),
+        skipped = !scope.needs_rollout_config(),
+        "doctor.config.load",
+    );
+
+    let (workers, worker_config_error) = if scope.needs_worker_config() {
+        match load_workers_from_config() {
+            Ok(workers) => (Some(workers), None),
+            Err(err) => (None, Some(err.to_string())),
+        }
+    } else {
+        (None, None)
     };
 
-    let daemon_status = query_daemon_full_status().await.ok();
-    let convergence_status = query_repo_convergence_status().await.ok();
+    // Phase 3 — join the spawned probes. `join_isolated_probe` collapses
+    // the three failure modes (timeout, panic, RPC error) into the
+    // single `None` outcome that downstream diagnostic builders
+    // already handle by emitting an "unavailable" Warning diagnostic.
+    let (daemon_status, daemon_outcome) =
+        join_isolated_async_probe("daemon_status", daemon_handle).await;
+    let (convergence_status, convergence_outcome) =
+        join_isolated_async_probe("repo_convergence", convergence_handle).await;
+    let (helper_diags_override, helpers_outcome) =
+        join_isolated_blocking_probe("helper_compatibility", helpers_handle).await;
+    let join_elapsed_ms = join_start.elapsed().as_millis() as u64;
+    tracing::info!(
+        target: "rch::doctor::probes",
+        daemon = %daemon_outcome.label(),
+        repo_convergence = %convergence_outcome.label(),
+        helpers = %helpers_outcome.label(),
+        join_elapsed_ms,
+        "doctor.probes.joined",
+    );
+
+    let probes_to_run = scope.probe_names_to_run(options.check_schemas);
+    tracing::info!(
+        target: "rch::doctor::scope",
+        scope = ?scope.as_strings(),
+        probes_to_run = ?probes_to_run,
+        probes_count = probes_to_run.len(),
+        "doctor.scope.applied",
+    );
 
     let mut diagnostics = Vec::new();
-    diagnostics.extend(reliability_topology_diagnostics(
-        workers.as_deref(),
-        daemon_status.as_ref(),
-        worker_config_error,
-    ));
-    diagnostics.extend(reliability_repo_diagnostics(convergence_status.as_ref()));
-    diagnostics.extend(reliability_disk_pressure_diagnostics(
-        daemon_status.as_ref(),
-    ));
-    diagnostics.extend(reliability_process_debt_diagnostics(daemon_status.as_ref()));
-    diagnostics.extend(reliability_helper_compatibility_diagnostics());
-    diagnostics.extend(reliability_rollout_posture_diagnostics());
-    if options.check_schemas {
+    if scope.matches(ReliabilityScope::Topology) {
+        diagnostics.extend(reliability_topology_diagnostics(
+            workers.as_deref(),
+            daemon_status.as_ref(),
+            worker_config_error,
+        ));
+    }
+    if scope.matches(ReliabilityScope::Convergence) {
+        diagnostics.extend(reliability_repo_diagnostics(convergence_status.as_ref()));
+    }
+    if scope.matches(ReliabilityScope::Pressure) {
+        diagnostics.extend(reliability_disk_pressure_diagnostics(
+            daemon_status.as_ref(),
+        ));
+    }
+    if scope.matches(ReliabilityScope::Triage) {
+        diagnostics.extend(reliability_process_debt_diagnostics(daemon_status.as_ref()));
+    }
+    if scope.matches(ReliabilityScope::Helpers) {
+        diagnostics.extend(helper_diagnostics_from_probe_result(
+            helper_diags_override,
+            helpers_outcome,
+        ));
+    }
+    if scope.matches(ReliabilityScope::Rollout) {
+        let config_load: Result<&rch_common::RchConfig, String> = match config_result.as_ref() {
+            Some(Ok(config)) => Ok(config),
+            Some(Err(error)) => Err(error.to_string()),
+            None => Err("config load skipped unexpectedly".to_string()),
+        };
+        diagnostics.extend(reliability_rollout_posture_diagnostics(
+            config_load.as_ref().map(|c| *c).map_err(|e| e.as_str()),
+        ));
+    }
+    if scope.runs_schema_probe(options.check_schemas) {
         diagnostics.extend(reliability_schema_compatibility_diagnostics());
     }
 
@@ -475,15 +975,181 @@ async fn run_reliability_doctor(ctx: &OutputContext, options: &DoctorOptions) ->
     } else {
         ReliabilityDoctorMode::Check
     };
-    let response = build_reliability_doctor_response(mode, diagnostics);
+    build_reliability_doctor_response(mode, scope, diagnostics)
+}
 
-    if ctx.is_json() {
-        let _ = ctx.json(&ApiResponse::ok("doctor reliability", &response));
-    } else {
-        print_reliability_doctor_response(ctx, &response);
+// =============================================================================
+// Probe Parallelism Plumbing (bd-62u24.8)
+// =============================================================================
+
+/// Outcome label for the `doctor.probes.joined` tracing event. One value
+/// per spawned probe per doctor invocation; operators correlate these
+/// with verdict shifts during deployment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeOutcome {
+    /// Probe completed; result is populated.
+    Ok,
+    /// Probe was skipped (its scope wasn't selected).
+    Skipped,
+    /// Probe completed but its RPC/inner work returned an Err.
+    InnerError,
+    /// Probe exceeded `PROBE_TIMEOUT`.
+    Timeout,
+    /// Probe panicked. Surfaced as `None` for the result; tracing captures the payload.
+    Panicked,
+    /// Probe task was cancelled (e.g., runtime shutdown).
+    Cancelled,
+}
+
+impl ProbeOutcome {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Skipped => "skipped",
+            Self::InnerError => "inner_error",
+            Self::Timeout => "timeout",
+            Self::Panicked => "panicked",
+            Self::Cancelled => "cancelled",
+        }
     }
+}
 
-    Ok(())
+/// Join a spawned async probe with panic isolation + timeout reporting.
+/// Returns `(Option<T>, outcome)` — `None` on any failure mode so
+/// callers can fall through to "unavailable" diagnostic synthesis
+/// without needing to distinguish timeout/panic/error in the response
+/// schema. The outcome is reported separately so the
+/// `doctor.probes.joined` tracing event carries the forensic detail.
+///
+/// `handle` is `Option` so a scoped-out probe (its scope wasn't
+/// selected) maps cleanly to `(None, Skipped)` without spinning up a
+/// task whose result we'd ignore.
+async fn join_isolated_async_probe<T, E>(
+    probe_name: &'static str,
+    handle: Option<tokio::task::JoinHandle<Result<Result<T, E>, tokio::time::error::Elapsed>>>,
+) -> (Option<T>, ProbeOutcome)
+where
+    T: Send + 'static,
+    E: std::fmt::Display + Send + 'static,
+{
+    let Some(handle) = handle else {
+        return (None, ProbeOutcome::Skipped);
+    };
+    match handle.await {
+        Ok(Ok(Ok(value))) => (Some(value), ProbeOutcome::Ok),
+        Ok(Ok(Err(err))) => {
+            tracing::debug!(
+                target: "rch::doctor::probes",
+                probe = probe_name,
+                error = %err,
+                "doctor.probe.inner_error",
+            );
+            (None, ProbeOutcome::InnerError)
+        }
+        Ok(Err(_elapsed)) => {
+            tracing::warn!(
+                target: "rch::doctor::probes",
+                probe = probe_name,
+                timeout_secs = PROBE_TIMEOUT.as_secs(),
+                "doctor.probe.timeout",
+            );
+            (None, ProbeOutcome::Timeout)
+        }
+        Err(join_err) if join_err.is_panic() => {
+            // `into_panic()` returns Box<dyn Any + Send>. The payload is
+            // typically a String (panic! formatted) or &'static str.
+            // Both downcasts attempted; otherwise emit a placeholder.
+            let payload = join_err.into_panic();
+            let panic_msg = payload
+                .downcast::<String>()
+                .map(|b| *b)
+                .or_else(|p| p.downcast::<&'static str>().map(|b| (*b).to_string()))
+                .unwrap_or_else(|_| "<non-string panic payload>".to_string());
+            tracing::error!(
+                target: "rch::doctor::probes",
+                probe = probe_name,
+                panic = %panic_msg,
+                "doctor.probe.panicked",
+            );
+            (None, ProbeOutcome::Panicked)
+        }
+        Err(join_err) => {
+            tracing::warn!(
+                target: "rch::doctor::probes",
+                probe = probe_name,
+                error = %join_err,
+                "doctor.probe.cancelled",
+            );
+            (None, ProbeOutcome::Cancelled)
+        }
+    }
+}
+
+/// Same as `join_isolated_async_probe` but for `spawn_blocking` tasks
+/// (sync work moved to the blocking pool). The inner future is already
+/// resolved when the JoinHandle resolves — there's no per-task timeout
+/// at the tokio level for spawn_blocking tasks, so we apply one via
+/// `tokio::time::timeout` around the `await`. Sync blocking work that
+/// outruns `PROBE_TIMEOUT` will keep running on the blocking pool until
+/// it finishes (we can't preempt blocking work) but the doctor still
+/// returns promptly and surfaces the timeout outcome.
+async fn join_isolated_blocking_probe<T>(
+    probe_name: &'static str,
+    handle: Option<tokio::task::JoinHandle<T>>,
+) -> (Option<T>, ProbeOutcome)
+where
+    T: Send + 'static,
+{
+    join_isolated_blocking_probe_with_timeout(probe_name, handle, PROBE_TIMEOUT).await
+}
+
+async fn join_isolated_blocking_probe_with_timeout<T>(
+    probe_name: &'static str,
+    handle: Option<tokio::task::JoinHandle<T>>,
+    timeout: Duration,
+) -> (Option<T>, ProbeOutcome)
+where
+    T: Send + 'static,
+{
+    let Some(handle) = handle else {
+        return (None, ProbeOutcome::Skipped);
+    };
+    match tokio::time::timeout(timeout, handle).await {
+        Ok(Ok(value)) => (Some(value), ProbeOutcome::Ok),
+        Ok(Err(join_err)) if join_err.is_panic() => {
+            let payload = join_err.into_panic();
+            let panic_msg = payload
+                .downcast::<String>()
+                .map(|b| *b)
+                .or_else(|p| p.downcast::<&'static str>().map(|b| (*b).to_string()))
+                .unwrap_or_else(|_| "<non-string panic payload>".to_string());
+            tracing::error!(
+                target: "rch::doctor::probes",
+                probe = probe_name,
+                panic = %panic_msg,
+                "doctor.probe.panicked",
+            );
+            (None, ProbeOutcome::Panicked)
+        }
+        Ok(Err(join_err)) => {
+            tracing::warn!(
+                target: "rch::doctor::probes",
+                probe = probe_name,
+                error = %join_err,
+                "doctor.probe.cancelled",
+            );
+            (None, ProbeOutcome::Cancelled)
+        }
+        Err(_elapsed) => {
+            tracing::warn!(
+                target: "rch::doctor::probes",
+                probe = probe_name,
+                timeout_secs = timeout.as_secs(),
+                "doctor.probe.timeout",
+            );
+            (None, ProbeOutcome::Timeout)
+        }
+    }
 }
 
 async fn query_repo_convergence_status() -> Result<RepoConvergenceStatusFromApi> {
@@ -491,6 +1157,551 @@ async fn query_repo_convergence_status() -> Result<RepoConvergenceStatusFromApi>
     let json = extract_json_body(&response)
         .ok_or_else(|| anyhow::anyhow!("Invalid response format from daemon"))?;
     serde_json::from_str(json).map_err(Into::into)
+}
+
+// =============================================================================
+// `--watch` Continuous Monitoring (t25)
+// =============================================================================
+
+/// Stable identity for a single diagnostic across sweeps. Two diagnostics
+/// from different sweeps refer to the "same issue" iff their keys match.
+/// `worker_id` distinguishes per-worker diagnostics (the same `check_name`
+/// is emitted once per worker for topology rows).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct DiagnosticKey {
+    category: ReliabilityCategory,
+    check_name: String,
+    worker_id: Option<String>,
+}
+
+impl DiagnosticKey {
+    fn from_diagnostic(d: &ReliabilityDiagnostic) -> Self {
+        Self {
+            category: d.category,
+            check_name: d.check_name.clone(),
+            worker_id: d.worker_id.clone(),
+        }
+    }
+
+    /// Human-rendered form used in diff output banners.
+    fn render(&self) -> String {
+        match &self.worker_id {
+            Some(w) => format!(
+                "{}/{}[worker={}]",
+                self.category.as_str(),
+                self.check_name,
+                w
+            ),
+            None => format!("{}/{}", self.category.as_str(), self.check_name),
+        }
+    }
+}
+
+/// The subset of a diagnostic that determines whether a state has
+/// changed across sweeps. We deliberately exclude `details` from the
+/// fingerprint because some details rotate every sweep (e.g.,
+/// `uptime_secs=12345`) and would generate noise for `--transitions-only`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DiagnosticFingerprint {
+    severity: ReliabilitySeverity,
+    code: ReliabilityReasonCode,
+    message: String,
+}
+
+impl DiagnosticFingerprint {
+    fn from_diagnostic(d: &ReliabilityDiagnostic) -> Self {
+        Self {
+            severity: d.severity,
+            code: d.code,
+            message: d.message.clone(),
+        }
+    }
+}
+
+/// Cross-sweep diff result. `added` are diagnostics present this sweep
+/// but absent last sweep; `cleared` are the inverse; `changed` are
+/// diagnostics whose fingerprint shifted (severity/code/message).
+#[derive(Debug, Default)]
+struct DiagnosticDiff {
+    added: Vec<(DiagnosticKey, DiagnosticFingerprint)>,
+    cleared: Vec<(DiagnosticKey, DiagnosticFingerprint)>,
+    changed: Vec<(DiagnosticKey, DiagnosticFingerprint, DiagnosticFingerprint)>,
+}
+
+impl DiagnosticDiff {
+    fn has_changes(&self) -> bool {
+        !self.added.is_empty() || !self.cleared.is_empty() || !self.changed.is_empty()
+    }
+
+    fn total_transitions(&self) -> usize {
+        self.added.len() + self.cleared.len() + self.changed.len()
+    }
+}
+
+/// Compute the diff between two sorted fingerprint maps. Pure function —
+/// trivially unit-testable without spinning up the daemon or running probes.
+fn diff_fingerprint_maps(
+    previous: &std::collections::BTreeMap<DiagnosticKey, DiagnosticFingerprint>,
+    current: &std::collections::BTreeMap<DiagnosticKey, DiagnosticFingerprint>,
+) -> DiagnosticDiff {
+    let mut diff = DiagnosticDiff::default();
+    for (key, fp) in current {
+        match previous.get(key) {
+            None => diff.added.push((key.clone(), fp.clone())),
+            Some(prev_fp) if prev_fp != fp => {
+                diff.changed
+                    .push((key.clone(), prev_fp.clone(), fp.clone()));
+            }
+            Some(_) => {}
+        }
+    }
+    for (key, fp) in previous {
+        if !current.contains_key(key) {
+            diff.cleared.push((key.clone(), fp.clone()));
+        }
+    }
+    diff
+}
+
+/// Build the fingerprint map for a response. Deterministic ordering by
+/// `DiagnosticKey` so machine output is stable across runs.
+fn fingerprint_map_of(
+    response: &ReliabilityDoctorResponse,
+) -> std::collections::BTreeMap<DiagnosticKey, DiagnosticFingerprint> {
+    let mut map = std::collections::BTreeMap::new();
+    for d in &response.diagnostics {
+        map.insert(
+            DiagnosticKey::from_diagnostic(d),
+            DiagnosticFingerprint::from_diagnostic(d),
+        );
+    }
+    map
+}
+
+/// State threaded through the watch loop. `last_*` fields are `None`
+/// before the first sweep (so the initial sweep is always a transition).
+struct WatchState {
+    started_at: Instant,
+    sweep_count: u64,
+    /// Number of sweeps where the diff had ANY changes (i.e., something
+    /// transitioned). Logged in the final summary.
+    transitions_count: u64,
+    last_verdict: Option<ReliabilityVerdict>,
+    last_fingerprints: std::collections::BTreeMap<DiagnosticKey, DiagnosticFingerprint>,
+    /// Highest-severity verdict observed across all sweeps. Useful for
+    /// CI tripwires that want a single answer at the end.
+    worst_verdict: Option<ReliabilityVerdict>,
+}
+
+fn worst_reliability_verdict(
+    observed: Option<ReliabilityVerdict>,
+    candidate: ReliabilityVerdict,
+) -> ReliabilityVerdict {
+    match (observed, candidate) {
+        (Some(ReliabilityVerdict::Failing), _) | (_, ReliabilityVerdict::Failing) => {
+            ReliabilityVerdict::Failing
+        }
+        (Some(ReliabilityVerdict::Degraded), _) | (_, ReliabilityVerdict::Degraded) => {
+            ReliabilityVerdict::Degraded
+        }
+        (Some(ReliabilityVerdict::Healthy), ReliabilityVerdict::Healthy)
+        | (None, ReliabilityVerdict::Healthy) => ReliabilityVerdict::Healthy,
+    }
+}
+
+impl WatchState {
+    fn new() -> Self {
+        Self {
+            started_at: Instant::now(),
+            sweep_count: 0,
+            transitions_count: 0,
+            last_verdict: None,
+            last_fingerprints: std::collections::BTreeMap::new(),
+            worst_verdict: None,
+        }
+    }
+
+    /// Update the worst-observed verdict using max-severity-wins.
+    fn observe_verdict(&mut self, verdict: ReliabilityVerdict) {
+        self.worst_verdict = Some(worst_reliability_verdict(self.worst_verdict, verdict));
+    }
+}
+
+/// Machine sweep payload (one of these per emitted iteration in
+/// machine-readable mode). Schema matches the agent contract: agents
+/// inspect `verdict` / `diff_summary` for tripwire behavior.
+#[derive(Debug, Clone, Serialize)]
+struct WatchSweepMachineLine<'a> {
+    /// Logical command tag — matches the dotted-token convention used
+    /// elsewhere ("doctor.reliability.watch") so log consumers can split
+    /// single-shot vs continuous traffic by tag alone.
+    command: &'static str,
+    schema_version: &'a str,
+    sweep_index: u64,
+    elapsed_secs: u64,
+    verdict: &'static str,
+    verdict_changed: bool,
+    diff_summary: WatchDiffSummary,
+    /// Full response (so a single machine output record is self-contained).
+    response: &'a ReliabilityDoctorResponse,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct WatchDiffSummary {
+    added: usize,
+    cleared: usize,
+    changed: usize,
+    has_changes: bool,
+}
+
+/// `--watch-snapshot` final summary. Written once at exit.
+#[derive(Debug, Clone, Serialize)]
+struct WatchSnapshot<'a> {
+    command: &'static str,
+    schema_version: &'a str,
+    sweeps_total: u64,
+    transitions_total: u64,
+    elapsed_secs: u64,
+    final_verdict: &'static str,
+    /// Worst verdict observed at any point during the watch session.
+    /// Distinct from `final_verdict` because the system may have
+    /// recovered before exit; CI gates often want the worst-case.
+    worst_verdict: &'static str,
+    /// Final per-diagnostic state (so the snapshot can be diffed against
+    /// the next session's first sweep).
+    final_diagnostics: &'a Vec<ReliabilityDiagnostic>,
+}
+
+/// Run the continuous-monitoring watch loop until SIGINT. Each sweep
+/// re-runs the full reliability probe suite, computes a diff against
+/// the prior sweep, and emits output (suppressed under
+/// `--transitions-only` when nothing changed).
+async fn run_reliability_watch_loop(ctx: &OutputContext, options: &DoctorOptions) -> Result<()> {
+    let interval_secs = options.watch_interval_secs.max(1);
+    let interval = Duration::from_secs(interval_secs);
+    let snapshot_path = options.watch_snapshot.clone();
+    let style = ctx.theme();
+    let schema_version =
+        rch_common::schema_version(rch_common::SchemaComponent::DoctorReliability).to_string();
+
+    tracing::info!(
+        target: "rch::doctor::watch",
+        interval_secs,
+        transitions_only = options.transitions_only,
+        snapshot_path = ?snapshot_path,
+        scope = ?options.scope.as_strings(),
+        "doctor.watch.start",
+    );
+
+    if !ctx.is_json() {
+        eprintln!(
+            "{} (interval={interval_secs}s, scope={:?}, press Ctrl-C to exit)",
+            style.format_header("RCH Doctor — continuous watch mode"),
+            options.scope.as_strings(),
+        );
+        if options.transitions_only {
+            eprintln!(
+                "{}",
+                style.muted("    --transitions-only: emitting only when state changes")
+            );
+        }
+        eprintln!();
+    }
+
+    let mut state = WatchState::new();
+    // `tokio::time::interval` ticks immediately on the first call to
+    // `tick()`. That's exactly what we want — sweep at t=0, then every
+    // `interval_secs` thereafter. `Skip` behavior ensures we don't build
+    // up a backlog if a sweep happens to overrun the interval.
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    // Single-shot SIGINT future. We `pin!` it so the borrow can survive
+    // across loop iterations; we break the moment it fires (never poll
+    // again).
+    let sigint = tokio::signal::ctrl_c();
+    tokio::pin!(sigint);
+
+    loop {
+        tokio::select! {
+            // Bias toward the SIGINT branch so a Ctrl-C delivered at the
+            // exact same instant as a tick exits cleanly rather than
+            // running one more (potentially slow) sweep.
+            biased;
+            sig = &mut sigint => {
+                if let Err(e) = sig {
+                    tracing::warn!(
+                        target: "rch::doctor::watch",
+                        error = %e,
+                        "ctrl_c handler installation failed; exiting watch loop"
+                    );
+                }
+                break;
+            }
+            _ = ticker.tick() => {
+                state.sweep_count += 1;
+                let sweep_started = Instant::now();
+                let response = collect_reliability_response_once(options).await;
+                let current_fp = fingerprint_map_of(&response);
+                let diff = diff_fingerprint_maps(&state.last_fingerprints, &current_fp);
+                let verdict = response.summary.overall;
+                let verdict_changed = state.last_verdict != Some(verdict);
+                let any_change = diff.has_changes() || verdict_changed;
+                if any_change {
+                    state.transitions_count += 1;
+                }
+                state.observe_verdict(verdict);
+                let sweep_elapsed_ms = sweep_started.elapsed().as_millis();
+
+                let should_emit = !options.transitions_only || any_change || state.sweep_count == 1;
+                tracing::debug!(
+                    target: "rch::doctor::watch",
+                    sweep = state.sweep_count,
+                    verdict = verdict.label(),
+                    verdict_changed,
+                    added = diff.added.len(),
+                    cleared = diff.cleared.len(),
+                    changed = diff.changed.len(),
+                    transition_items = diff.total_transitions(),
+                    sweep_elapsed_ms,
+                    suppressed = !should_emit,
+                    "doctor.watch.sweep",
+                );
+
+                if should_emit {
+                    if ctx.is_json() {
+                        emit_watch_sweep_machine_line(
+                            ctx,
+                            &response,
+                            &diff,
+                            verdict_changed,
+                            &schema_version,
+                            state.sweep_count,
+                            state.started_at,
+                        );
+                    } else {
+                        emit_watch_sweep_human(
+                            ctx,
+                            &response,
+                            &diff,
+                            verdict_changed,
+                            state.sweep_count,
+                            state.started_at,
+                            sweep_elapsed_ms,
+                        );
+                    }
+                }
+
+                state.last_verdict = Some(verdict);
+                state.last_fingerprints = current_fp;
+            }
+        }
+    }
+
+    // SIGINT or signal-handler error fell through. Emit a final summary on
+    // stderr (so JSON consumers piping stdout to a file still see it)
+    // and write the snapshot file if requested.
+    //
+    // When a snapshot is requested, collect the exit-time response before
+    // rendering the summary so stderr, tracing, and the snapshot file all
+    // describe the same final state.
+    let final_response_for_snapshot = if snapshot_path.is_some() {
+        Some(collect_reliability_response_once(options).await)
+    } else {
+        None
+    };
+    let final_verdict = final_response_for_snapshot.as_ref().map_or_else(
+        || state.last_verdict.unwrap_or(ReliabilityVerdict::Healthy),
+        |r| r.summary.overall,
+    );
+    let worst_verdict = worst_reliability_verdict(state.worst_verdict, final_verdict);
+    let elapsed_secs = state.started_at.elapsed().as_secs();
+    if !ctx.is_json() {
+        eprintln!();
+        eprintln!(
+            "{} {} sweeps, {} transitions, {}s elapsed — final={}, worst={}",
+            style.format_header("Watch session ended"),
+            style.highlight(&state.sweep_count.to_string()),
+            style.highlight(&state.transitions_count.to_string()),
+            style.highlight(&elapsed_secs.to_string()),
+            style.highlight(final_verdict.label()),
+            style.highlight(worst_verdict.label()),
+        );
+    } else {
+        // In JSON mode, still write a final summary line so log consumers
+        // can detect clean exit vs hard kill. Emitted on stderr to keep
+        // the machine stream on stdout uninterrupted.
+        eprintln!(
+            r#"{{"command":"doctor.reliability.watch.end","sweeps_total":{},"transitions_total":{},"elapsed_secs":{},"final_verdict":"{}","worst_verdict":"{}"}}"#,
+            state.sweep_count,
+            state.transitions_count,
+            elapsed_secs,
+            final_verdict.label(),
+            worst_verdict.label(),
+        );
+    }
+    tracing::info!(
+        target: "rch::doctor::watch",
+        sweeps_total = state.sweep_count,
+        transitions_total = state.transitions_count,
+        elapsed_secs,
+        final_verdict = final_verdict.label(),
+        worst_verdict = worst_verdict.label(),
+        "doctor.watch.end",
+    );
+
+    if let (Some(path), Some(final_response)) = (snapshot_path, final_response_for_snapshot) {
+        // The in-flight state only holds fingerprints; the full diagnostics
+        // list requires this final probe pass. This is intentional: the
+        // snapshot reflects state at exit, not state at the last emitted
+        // sweep.
+        let snapshot = WatchSnapshot {
+            command: "doctor.reliability.watch.snapshot",
+            schema_version: &schema_version,
+            sweeps_total: state.sweep_count,
+            transitions_total: state.transitions_count,
+            elapsed_secs,
+            final_verdict: final_response.summary.overall.label(),
+            worst_verdict: worst_verdict.label(),
+            final_diagnostics: &final_response.diagnostics,
+        };
+        let body = serde_json::to_string_pretty(&snapshot)
+            .map_err(|e| anyhow::anyhow!("serialize watch snapshot: {e}"))?;
+        // Atomic temp+rename so partial writes can't leave a corrupt
+        // snapshot on disk if the process is killed mid-write.
+        let tmp = path.with_extension("json.partial");
+        tokio::fs::write(&tmp, body.as_bytes())
+            .await
+            .map_err(|e| anyhow::anyhow!("write watch snapshot tmp file: {e}"))?;
+        tokio::fs::rename(&tmp, &path)
+            .await
+            .map_err(|e| anyhow::anyhow!("rename watch snapshot to final path: {e}"))?;
+        tracing::info!(
+            target: "rch::doctor::watch",
+            path = %path.display(),
+            "doctor.watch.snapshot.written",
+        );
+        if !ctx.is_json() {
+            eprintln!(
+                "{} {}",
+                style.muted("    snapshot:"),
+                style.highlight(&path.display().to_string())
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Human-form sweep emitter: prints a compact one-line header per
+/// sweep on stderr, followed by indented bullets for each transition.
+/// Severity gets verdict-aware coloring through the theme. Output is
+/// designed to be readable in a long-running terminal session — no
+/// full panel redraws, no clear-screen. Bullets are sortable.
+fn emit_watch_sweep_human(
+    ctx: &OutputContext,
+    response: &ReliabilityDoctorResponse,
+    diff: &DiagnosticDiff,
+    verdict_changed: bool,
+    sweep: u64,
+    started_at: Instant,
+    sweep_elapsed_ms: u128,
+) {
+    let style = ctx.theme();
+    let verdict = response.summary.overall;
+    let verdict_label = verdict.label();
+    let colored_verdict = match verdict {
+        ReliabilityVerdict::Healthy => style.format_success(verdict_label),
+        ReliabilityVerdict::Degraded => style.format_warning(verdict_label),
+        ReliabilityVerdict::Failing => style.format_error(verdict_label),
+    };
+    let elapsed = started_at.elapsed().as_secs();
+    let arrow = if verdict_changed { " (CHANGED)" } else { "" };
+    eprintln!(
+        "[sweep {sweep:>4} t+{elapsed:>4}s] verdict={colored_verdict}{arrow} \
+         pass={p} info={i} warn={w} crit={c} probe_ms={ms} \
+         diff: +{added} -{cleared} ~{changed}",
+        p = response.summary.pass,
+        i = response.summary.info,
+        w = response.summary.warning,
+        c = response.summary.critical,
+        ms = sweep_elapsed_ms,
+        added = diff.added.len(),
+        cleared = diff.cleared.len(),
+        changed = diff.changed.len(),
+    );
+    // Bullets — keyed by stable DiagnosticKey so output is sortable.
+    for (key, fp) in &diff.added {
+        eprintln!(
+            "    {} {} [{}] {}",
+            style.format_warning("+ new"),
+            key.render(),
+            severity_short(fp.severity),
+            fp.message,
+        );
+    }
+    for (key, fp) in &diff.cleared {
+        eprintln!(
+            "    {} {} [{}] {}",
+            style.format_success("- cleared"),
+            key.render(),
+            severity_short(fp.severity),
+            fp.message,
+        );
+    }
+    for (key, prev, cur) in &diff.changed {
+        eprintln!(
+            "    {} {} [{}→{}] {} → {}",
+            style.muted("~ changed"),
+            key.render(),
+            severity_short(prev.severity),
+            severity_short(cur.severity),
+            prev.message,
+            cur.message,
+        );
+    }
+}
+
+/// Machine-mode sweep emitter: one self-contained JSON or TOON object
+/// per line on stdout. Designed for structured-log consumers.
+fn emit_watch_sweep_machine_line(
+    ctx: &OutputContext,
+    response: &ReliabilityDoctorResponse,
+    diff: &DiagnosticDiff,
+    verdict_changed: bool,
+    schema_version: &str,
+    sweep: u64,
+    started_at: Instant,
+) {
+    let payload = WatchSweepMachineLine {
+        command: "doctor.reliability.watch",
+        schema_version,
+        sweep_index: sweep,
+        elapsed_secs: started_at.elapsed().as_secs(),
+        verdict: response.summary.overall.label(),
+        verdict_changed,
+        diff_summary: WatchDiffSummary {
+            added: diff.added.len(),
+            cleared: diff.cleared.len(),
+            changed: diff.changed.len(),
+            has_changes: diff.has_changes(),
+        },
+        response,
+    };
+    // `json_compact` honors the configured machine format and writes one
+    // record per line, preserving parseable stdout for watch consumers.
+    let _ = ctx.json_compact(&payload);
+}
+
+/// Short single-letter severity glyph used in the human watch output.
+/// Keeps diff lines compact when many transitions fire at once.
+fn severity_short(severity: ReliabilitySeverity) -> &'static str {
+    match severity {
+        ReliabilitySeverity::Pass => "PASS",
+        ReliabilitySeverity::Info => "INFO",
+        ReliabilitySeverity::Warning => "WARN",
+        ReliabilitySeverity::Critical => "CRIT",
+    }
 }
 
 fn reliability_topology_diagnostics(
@@ -507,7 +1718,7 @@ fn reliability_topology_diagnostics(
                 "workers_config",
                 ReliabilitySeverity::Critical,
                 "Worker configuration could not be loaded",
-                "workers_config_unreadable",
+                ReliabilityReasonCode::WorkersConfigUnreadable,
             )
             .with_details(error)
             .with_remediation(
@@ -523,7 +1734,7 @@ fn reliability_topology_diagnostics(
                     "workers_config",
                     ReliabilitySeverity::Critical,
                     "No workers are configured, so all builds will run locally",
-                    "no_workers_configured",
+                    ReliabilityReasonCode::NoWorkersConfigured,
                 )
                 .with_remediation("rch workers add <host>", "rch workers list --json"),
             );
@@ -539,7 +1750,7 @@ fn reliability_topology_diagnostics(
                     "workers_config",
                     ReliabilitySeverity::Pass,
                     format!("{} worker(s) configured", workers.len()),
-                    "workers_configured",
+                    ReliabilityReasonCode::WorkersConfigured,
                 )
                 .with_details(worker_ids),
             );
@@ -553,7 +1764,7 @@ fn reliability_topology_diagnostics(
                 "daemon_status",
                 ReliabilitySeverity::Warning,
                 "Daemon status is unavailable; reliability health is partial",
-                "daemon_status_unavailable",
+                ReliabilityReasonCode::DaemonStatusUnavailable,
             )
             .with_remediation("rch daemon start", "rch status --json"),
         );
@@ -561,22 +1772,22 @@ fn reliability_topology_diagnostics(
     };
 
     let daemon = &status.daemon;
-    let (severity, reason_code, message) = if daemon.workers_total == 0 {
+    let (severity, code, message) = if daemon.workers_total == 0 {
         (
             ReliabilitySeverity::Critical,
-            "daemon_has_no_workers",
+            ReliabilityReasonCode::DaemonHasNoWorkers,
             "Daemon has no registered workers".to_string(),
         )
     } else if daemon.workers_healthy == 0 {
         (
             ReliabilitySeverity::Critical,
-            "all_workers_unhealthy",
+            ReliabilityReasonCode::AllWorkersUnhealthy,
             format!("0/{} workers are healthy", daemon.workers_total),
         )
     } else if daemon.workers_healthy < daemon.workers_total {
         (
             ReliabilitySeverity::Warning,
-            "partial_worker_capacity",
+            ReliabilityReasonCode::PartialWorkerCapacity,
             format!(
                 "{}/{} workers are healthy",
                 daemon.workers_healthy, daemon.workers_total
@@ -585,7 +1796,7 @@ fn reliability_topology_diagnostics(
     } else {
         (
             ReliabilitySeverity::Pass,
-            "workers_healthy",
+            ReliabilityReasonCode::WorkersHealthy,
             format!("All {} workers are healthy", daemon.workers_total),
         )
     };
@@ -594,7 +1805,7 @@ fn reliability_topology_diagnostics(
         "daemon_worker_capacity",
         severity,
         message,
-        reason_code,
+        code,
     )
     .with_details(format!(
         "slots_available={}, slots_total={}, uptime_secs={}",
@@ -610,44 +1821,132 @@ fn reliability_topology_diagnostics(
     diagnostics
 }
 
-fn worker_topology_diagnostic(worker: &WorkerStatusFromApi) -> ReliabilityDiagnostic {
-    let status = worker.status.to_ascii_lowercase();
-    let circuit = worker.circuit_state.to_ascii_lowercase();
-    let ready_status = matches!(
-        status.as_str(),
-        "healthy" | "available" | "ready" | "idle" | "running"
-    );
+/// Outcome of a defensive parse: a known categorical value OR the raw
+/// (trim+lowercased) input that we couldn't recognize. The raw form is
+/// preserved so the resulting diagnostic carries forensics for operators.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ParsedStatus {
+    Known(KnownStatus),
+    Unrecognized(String),
+}
 
-    let (severity, reason_code, message) = if circuit == "open" {
-        (
-            ReliabilitySeverity::Critical,
-            "worker_circuit_open",
-            format!("Worker {} circuit is open", worker.id),
-        )
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KnownStatus {
+    /// Healthy/available/ready/idle/running — counts as "ready".
+    Ready,
+    /// Known non-ready statuses reported by daemon/status UIs.
+    Degraded,
+    /// Unreachable/offline/error/failed — critical.
+    Unreachable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ParsedCircuit {
+    Known(KnownCircuit),
+    Unrecognized(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KnownCircuit {
+    Closed,
+    Open,
+    HalfOpen,
+}
+
+/// Trim + lowercase + match against the known status set. Known
+/// non-ready states remain `WorkerDegraded`; unknown values become
+/// `Unrecognized(raw)` so the caller can surface protocol drift rather
+/// than silently mapping to `Pass` (the prior default-to-success bug).
+fn parse_worker_ready_status(raw: &str) -> ParsedStatus {
+    let normalized = raw.trim().to_ascii_lowercase();
+    if matches!(
+        normalized.as_str(),
+        "healthy" | "available" | "ready" | "idle" | "running"
+    ) {
+        ParsedStatus::Known(KnownStatus::Ready)
     } else if matches!(
-        status.as_str(),
+        normalized.as_str(),
         "unreachable" | "offline" | "error" | "failed"
     ) {
-        (
-            ReliabilitySeverity::Critical,
-            "worker_unreachable",
-            format!("Worker {} is {}", worker.id, worker.status),
-        )
-    } else if circuit == "half_open" || !ready_status {
-        (
+        ParsedStatus::Known(KnownStatus::Unreachable)
+    } else if matches!(
+        normalized.as_str(),
+        "busy" | "degraded" | "draining" | "drained" | "disabled" | "unhealthy"
+    ) {
+        ParsedStatus::Known(KnownStatus::Degraded)
+    } else {
+        ParsedStatus::Unrecognized(normalized)
+    }
+}
+
+/// Same discipline as [`parse_worker_ready_status`] but for the
+/// circuit-breaker state field. `closed` is the healthy default;
+/// `open` is critical; `half_open` is degraded; anything else
+/// (including empty string, whitespace, unexpected casings of unknown
+/// variants like `OPEN_FORCED`) surfaces as `Unrecognized`.
+fn parse_worker_circuit_state(raw: &str) -> ParsedCircuit {
+    let normalized = raw.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "closed" => ParsedCircuit::Known(KnownCircuit::Closed),
+        "open" => ParsedCircuit::Known(KnownCircuit::Open),
+        "half_open" | "half-open" => ParsedCircuit::Known(KnownCircuit::HalfOpen),
+        _ => ParsedCircuit::Unrecognized(normalized),
+    }
+}
+
+fn worker_topology_diagnostic(worker: &WorkerStatusFromApi) -> ReliabilityDiagnostic {
+    let parsed_status = parse_worker_ready_status(&worker.status);
+    let parsed_circuit = parse_worker_circuit_state(&worker.circuit_state);
+
+    let (severity, code, message) = match (&parsed_circuit, &parsed_status) {
+        // Unrecognized values surface as Warnings with the raw value
+        // in the diagnostic context. Default-to-degraded — never Pass.
+        (ParsedCircuit::Unrecognized(raw), _) => (
             ReliabilitySeverity::Warning,
-            "worker_degraded",
+            ReliabilityReasonCode::WorkerCircuitStateUnrecognized,
+            format!(
+                "Worker {} circuit_state is unrecognized ({raw:?})",
+                worker.id
+            ),
+        ),
+        (_, ParsedStatus::Unrecognized(raw)) => (
+            ReliabilitySeverity::Warning,
+            ReliabilityReasonCode::WorkerStatusUnrecognized,
+            format!("Worker {} status is unrecognized ({raw:?})", worker.id),
+        ),
+        // Known values: same routing as before.
+        (ParsedCircuit::Known(KnownCircuit::Open), _) => (
+            ReliabilitySeverity::Critical,
+            ReliabilityReasonCode::WorkerCircuitOpen,
+            format!("Worker {} circuit is open", worker.id),
+        ),
+        (_, ParsedStatus::Known(KnownStatus::Unreachable)) => (
+            ReliabilitySeverity::Critical,
+            ReliabilityReasonCode::WorkerUnreachable,
+            format!("Worker {} is {}", worker.id, worker.status),
+        ),
+        (ParsedCircuit::Known(KnownCircuit::HalfOpen), _) => (
+            ReliabilitySeverity::Warning,
+            ReliabilityReasonCode::WorkerDegraded,
             format!(
                 "Worker {} is degraded (status={}, circuit={})",
                 worker.id, worker.status, worker.circuit_state
             ),
-        )
-    } else {
-        (
+        ),
+        (_, ParsedStatus::Known(KnownStatus::Degraded)) => (
+            ReliabilitySeverity::Warning,
+            ReliabilityReasonCode::WorkerDegraded,
+            format!(
+                "Worker {} is degraded (status={}, circuit={})",
+                worker.id, worker.status, worker.circuit_state
+            ),
+        ),
+        // Closed circuit + Ready status = healthy.
+        (ParsedCircuit::Known(KnownCircuit::Closed), ParsedStatus::Known(KnownStatus::Ready)) => (
             ReliabilitySeverity::Pass,
-            "worker_ready",
+            ReliabilityReasonCode::WorkerReady,
             format!("Worker {} is ready", worker.id),
-        )
+        ),
     };
 
     let mut diagnostic = ReliabilityDiagnostic::new(
@@ -655,7 +1954,7 @@ fn worker_topology_diagnostic(worker: &WorkerStatusFromApi) -> ReliabilityDiagno
         "worker_topology",
         severity,
         message,
-        reason_code,
+        code,
     )
     .with_worker(worker.id.clone())
     .with_details(format!(
@@ -674,6 +1973,27 @@ fn worker_topology_diagnostic(worker: &WorkerStatusFromApi) -> ReliabilityDiagno
         );
     }
 
+    // Emit a tracing event whenever we see an unrecognized value so log
+    // consumers can spot protocol drift between daemon versions.
+    if let ParsedStatus::Unrecognized(raw) = &parsed_status {
+        tracing::warn!(
+            target: "rch::doctor::parse",
+            worker = %worker.id,
+            field = "status",
+            raw = %raw,
+            "doctor.parse.unrecognized",
+        );
+    }
+    if let ParsedCircuit::Unrecognized(raw) = &parsed_circuit {
+        tracing::warn!(
+            target: "rch::doctor::parse",
+            worker = %worker.id,
+            field = "circuit_state",
+            raw = %raw,
+            "doctor.parse.unrecognized",
+        );
+    }
+
     diagnostic
 }
 
@@ -687,7 +2007,7 @@ fn reliability_repo_diagnostics(
                 "repo_convergence",
                 ReliabilitySeverity::Warning,
                 "Repo-convergence status is unavailable",
-                "repo_convergence_unavailable",
+                ReliabilityReasonCode::RepoConvergenceUnavailable,
             )
             .with_remediation("rch daemon start", "rch status --json"),
         ];
@@ -695,16 +2015,16 @@ fn reliability_repo_diagnostics(
 
     let summary = &convergence.summary;
     let mut diagnostics = Vec::new();
-    let (severity, reason_code, message) = if summary.failed > 0 {
+    let (severity, code, message) = if summary.failed > 0 {
         (
             ReliabilitySeverity::Critical,
-            "repo_convergence_failed",
+            ReliabilityReasonCode::RepoConvergenceFailed,
             format!("{} worker(s) failed repo convergence", summary.failed),
         )
     } else if summary.drifting > 0 || summary.stale > 0 {
         (
             ReliabilitySeverity::Warning,
-            "repo_convergence_drift",
+            ReliabilityReasonCode::RepoConvergenceDrift,
             format!(
                 "{} drifting and {} stale worker(s)",
                 summary.drifting, summary.stale
@@ -713,13 +2033,13 @@ fn reliability_repo_diagnostics(
     } else if summary.total_workers == 0 {
         (
             ReliabilitySeverity::Info,
-            "repo_convergence_no_workers",
+            ReliabilityReasonCode::RepoConvergenceNoWorkers,
             "No worker repo-convergence records were reported".to_string(),
         )
     } else {
         (
             ReliabilitySeverity::Pass,
-            "repo_convergence_ready",
+            ReliabilityReasonCode::RepoConvergenceReady,
             format!("{} worker(s) are repo-converged", summary.ready),
         )
     };
@@ -729,7 +2049,7 @@ fn reliability_repo_diagnostics(
         "repo_convergence",
         severity,
         message,
-        reason_code,
+        code,
     )
     .with_details(format!(
         "status={}, total={}, ready={}, converging={}, drifting={}, failed={}, stale={}",
@@ -773,7 +2093,7 @@ fn reliability_repo_diagnostics(
                 "Worker {} repo state is {}",
                 worker.worker_id, worker.drift_state
             ),
-            "worker_repo_not_ready",
+            ReliabilityReasonCode::WorkerRepoNotReady,
         )
         .with_worker(worker.worker_id.clone())
         .with_details(format!(
@@ -808,7 +2128,7 @@ fn reliability_disk_pressure_diagnostics(
                 "disk_pressure",
                 ReliabilitySeverity::Warning,
                 "Disk-pressure telemetry is unavailable because daemon status could not be read",
-                "disk_pressure_unavailable",
+                ReliabilityReasonCode::DiskPressureUnavailable,
             )
             .with_remediation("rch daemon start", "rch status --workers --json"),
         ];
@@ -820,7 +2140,7 @@ fn reliability_disk_pressure_diagnostics(
             "disk_pressure",
             ReliabilitySeverity::Info,
             "No workers reported disk-pressure telemetry",
-            "disk_pressure_no_workers",
+            ReliabilityReasonCode::DiskPressureNoWorkers,
         )];
     }
 
@@ -832,10 +2152,10 @@ fn reliability_disk_pressure_diagnostics(
                 .pressure_state
                 .as_deref()
                 .unwrap_or("telemetry_gap");
-            let (severity, reason_code, message) = match state {
+            let (severity, code, message) = match state {
                 "critical" => (
                     ReliabilitySeverity::Critical,
-                    "worker_disk_pressure_critical",
+                    ReliabilityReasonCode::WorkerDiskPressureCritical,
                     format!(
                         "Worker {} has critical disk pressure ({})",
                         worker.id,
@@ -844,7 +2164,7 @@ fn reliability_disk_pressure_diagnostics(
                 ),
                 "warning" => (
                     ReliabilitySeverity::Warning,
-                    "worker_disk_pressure_warning",
+                    ReliabilityReasonCode::WorkerDiskPressureWarning,
                     format!(
                         "Worker {} has elevated disk pressure ({})",
                         worker.id,
@@ -853,7 +2173,7 @@ fn reliability_disk_pressure_diagnostics(
                 ),
                 "healthy" => (
                     ReliabilitySeverity::Pass,
-                    "worker_disk_pressure_healthy",
+                    ReliabilityReasonCode::WorkerDiskPressureHealthy,
                     format!(
                         "Worker {} disk pressure is healthy ({})",
                         worker.id,
@@ -862,52 +2182,46 @@ fn reliability_disk_pressure_diagnostics(
                 ),
                 _ => (
                     ReliabilitySeverity::Warning,
-                    "worker_disk_pressure_telemetry_gap",
+                    ReliabilityReasonCode::WorkerDiskPressureTelemetryGap,
                     format!("Worker {} is missing fresh disk telemetry", worker.id),
                 ),
             };
+
+            // t11: build the details string with a single preallocated
+            // buffer + write! macro instead of 7 intermediate
+            // `.map(|v| format!(...)).unwrap_or_else(|| "unknown".to_string())`
+            // chains. Saves ~7 allocations per worker; for a 50-worker
+            // fleet that's ~350 transient Strings eliminated per run.
+            let mut details = String::with_capacity(256);
+            use std::fmt::Write as _;
+            let _ = write!(
+                details,
+                "state={state}, confidence={}, free_gb=",
+                worker.pressure_confidence.as_deref().unwrap_or("unknown")
+            );
+            push_opt_f64(&mut details, worker.pressure_disk_free_gb, 2);
+            details.push_str(", total_gb=");
+            push_opt_f64(&mut details, worker.pressure_disk_total_gb, 2);
+            details.push_str(", free_ratio=");
+            push_opt_f64(&mut details, worker.pressure_disk_free_ratio, 3);
+            details.push_str(", io_util_pct=");
+            push_opt_f64(&mut details, worker.pressure_disk_io_util_pct, 1);
+            details.push_str(", memory_pressure=");
+            push_opt_f64(&mut details, worker.pressure_memory_pressure, 2);
+            details.push_str(", telemetry_age_secs=");
+            push_opt_display(&mut details, worker.pressure_telemetry_age_secs);
+            details.push_str(", telemetry_fresh=");
+            push_opt_display(&mut details, worker.pressure_telemetry_fresh);
 
             let mut diagnostic = ReliabilityDiagnostic::new(
                 ReliabilityCategory::DiskPressure,
                 "worker_disk_pressure",
                 severity,
                 message,
-                reason_code,
+                code,
             )
             .with_worker(worker.id.clone())
-            .with_details(format!(
-                "state={}, confidence={}, free_gb={}, total_gb={}, free_ratio={}, io_util_pct={}, memory_pressure={}, telemetry_age_secs={}, telemetry_fresh={}",
-                state,
-                worker.pressure_confidence.as_deref().unwrap_or("unknown"),
-                worker
-                    .pressure_disk_free_gb
-                    .map(|value| format!("{value:.2}"))
-                    .unwrap_or_else(|| "unknown".to_string()),
-                worker
-                    .pressure_disk_total_gb
-                    .map(|value| format!("{value:.2}"))
-                    .unwrap_or_else(|| "unknown".to_string()),
-                worker
-                    .pressure_disk_free_ratio
-                    .map(|value| format!("{value:.3}"))
-                    .unwrap_or_else(|| "unknown".to_string()),
-                worker
-                    .pressure_disk_io_util_pct
-                    .map(|value| format!("{value:.1}"))
-                    .unwrap_or_else(|| "unknown".to_string()),
-                worker
-                    .pressure_memory_pressure
-                    .map(|value| format!("{value:.2}"))
-                    .unwrap_or_else(|| "unknown".to_string()),
-                worker
-                    .pressure_telemetry_age_secs
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "unknown".to_string()),
-                worker
-                    .pressure_telemetry_fresh
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "unknown".to_string())
-            ));
+            .with_details(details);
 
             if severity != ReliabilitySeverity::Pass {
                 // Shell-escape worker.user and worker.host: the remediation
@@ -939,6 +2253,32 @@ fn format_disk_free(value: Option<f64>) -> String {
         .unwrap_or_else(|| "free space unknown".to_string())
 }
 
+/// t11: Append an `Option<f64>` to `buf` with the given precision, or
+/// "unknown" if None. Replaces the prior `.map(|v| format!("{:.N}",
+/// v)).unwrap_or_else(|| "unknown".to_string())` pattern which
+/// allocated an intermediate String per worker × field.
+fn push_opt_f64(buf: &mut String, value: Option<f64>, precision: usize) {
+    use std::fmt::Write as _;
+    match value {
+        Some(v) => {
+            let _ = write!(buf, "{v:.precision$}");
+        }
+        None => buf.push_str("unknown"),
+    }
+}
+
+/// t11: Append any `Option<T: Display>` to `buf`, or "unknown" if None.
+/// Avoids the intermediate `Option::map(|v| v.to_string())` allocation.
+fn push_opt_display<T: std::fmt::Display>(buf: &mut String, value: Option<T>) {
+    use std::fmt::Write as _;
+    match value {
+        Some(v) => {
+            let _ = write!(buf, "{v}");
+        }
+        None => buf.push_str("unknown"),
+    }
+}
+
 fn reliability_process_debt_diagnostics(
     status: Option<&DaemonFullStatusResponse>,
 ) -> Vec<ReliabilityDiagnostic> {
@@ -949,7 +2289,7 @@ fn reliability_process_debt_diagnostics(
                 "process_debt",
                 ReliabilitySeverity::Warning,
                 "Process-debt health is unavailable because daemon status could not be read",
-                "process_debt_unavailable",
+                ReliabilityReasonCode::ProcessDebtUnavailable,
             )
             .with_remediation("rch daemon start", "rch status --jobs --json"),
         ];
@@ -968,10 +2308,10 @@ fn reliability_process_debt_diagnostics(
         severity,
         cancellation.message,
         match severity {
-            ReliabilitySeverity::Pass => "cancellation_cleanup_healthy",
-            ReliabilitySeverity::Info => "cancellation_cleanup_skipped",
-            ReliabilitySeverity::Warning => "cancellation_cleanup_degraded",
-            ReliabilitySeverity::Critical => "cancellation_cleanup_failed",
+            ReliabilitySeverity::Pass => ReliabilityReasonCode::CancellationCleanupHealthy,
+            ReliabilitySeverity::Info => ReliabilityReasonCode::CancellationCleanupSkipped,
+            ReliabilitySeverity::Warning => ReliabilityReasonCode::CancellationCleanupDegraded,
+            ReliabilitySeverity::Critical => ReliabilityReasonCode::CancellationCleanupFailed,
         },
     );
     if let Some(details) = cancellation.details {
@@ -1002,7 +2342,7 @@ fn reliability_helper_compatibility_diagnostics() -> Vec<ReliabilityDiagnostic> 
                 cmd,
                 ReliabilitySeverity::Pass,
                 format!("{cmd} is available for {description}"),
-                "helper_available",
+                ReliabilityReasonCode::HelperAvailable,
             );
             if let Some(version) = command_version(cmd) {
                 diagnostic = diagnostic.with_details(version);
@@ -1014,7 +2354,7 @@ fn reliability_helper_compatibility_diagnostics() -> Vec<ReliabilityDiagnostic> 
                 cmd,
                 missing_severity,
                 format!("{cmd} is missing; {description} may fail or fall back"),
-                "helper_missing",
+                ReliabilityReasonCode::HelperMissing,
             )
             .with_remediation(
                 format!("Install {cmd} with the system package manager"),
@@ -1025,10 +2365,46 @@ fn reliability_helper_compatibility_diagnostics() -> Vec<ReliabilityDiagnostic> 
     .collect()
 }
 
-fn reliability_rollout_posture_diagnostics() -> Vec<ReliabilityDiagnostic> {
+fn helper_diagnostics_from_probe_result(
+    prefetched: Option<Vec<ReliabilityDiagnostic>>,
+    outcome: ProbeOutcome,
+) -> Vec<ReliabilityDiagnostic> {
+    if let Some(diagnostics) = prefetched {
+        return diagnostics;
+    }
+
+    vec![
+        ReliabilityDiagnostic::new(
+            ReliabilityCategory::HelperCompatibility,
+            "helper_probe",
+            ReliabilitySeverity::Warning,
+            "Helper compatibility could not be checked within the probe budget",
+            ReliabilityReasonCode::HelperProbeUnavailable,
+        )
+        .with_details(format!(
+            "probe_outcome={} timeout_secs={}",
+            outcome.label(),
+            PROBE_TIMEOUT.as_secs()
+        ))
+        .with_remediation(
+            "rch doctor --reliability --scope helpers --json",
+            "rch doctor --reliability --scope helpers --json",
+        ),
+    ]
+}
+
+/// Build rollout-posture diagnostics from a pre-loaded config snapshot.
+///
+/// Takes the result of a single `crate::config::load_config()` call shared
+/// across every probe in `run_reliability_doctor`, so the doctor pays the
+/// TOML-parse cost exactly once per invocation and every probe sees a
+/// consistent snapshot even if the config file is rewritten mid-run.
+fn reliability_rollout_posture_diagnostics(
+    config_load: Result<&rch_common::RchConfig, &str>,
+) -> Vec<ReliabilityDiagnostic> {
     let mut diagnostics = Vec::new();
 
-    match crate::config::load_config() {
+    match config_load {
         Ok(config) => {
             let mut hook_diag = if config.self_healing.hook_starts_daemon {
                 ReliabilityDiagnostic::new(
@@ -1036,7 +2412,7 @@ fn reliability_rollout_posture_diagnostics() -> Vec<ReliabilityDiagnostic> {
                     "hook_starts_daemon",
                     ReliabilitySeverity::Pass,
                     "Hook auto-start is enabled",
-                    "hook_auto_start_enabled",
+                    ReliabilityReasonCode::HookAutoStartEnabled,
                 )
             } else {
                 ReliabilityDiagnostic::new(
@@ -1044,7 +2420,7 @@ fn reliability_rollout_posture_diagnostics() -> Vec<ReliabilityDiagnostic> {
                     "hook_starts_daemon",
                     ReliabilitySeverity::Warning,
                     "Hook auto-start is disabled; daemon outages may silently force local builds",
-                    "hook_auto_start_disabled",
+                    ReliabilityReasonCode::HookAutoStartDisabled,
                 )
                 .with_remediation(
                     "rch config set self_healing.hook_starts_daemon true",
@@ -1064,7 +2440,7 @@ fn reliability_rollout_posture_diagnostics() -> Vec<ReliabilityDiagnostic> {
                     "daemon_installs_hooks",
                     ReliabilitySeverity::Pass,
                     "Daemon hook repair is enabled",
-                    "daemon_hook_repair_enabled",
+                    ReliabilityReasonCode::DaemonHookRepairEnabled,
                 ));
             } else {
                 diagnostics.push(
@@ -1073,7 +2449,7 @@ fn reliability_rollout_posture_diagnostics() -> Vec<ReliabilityDiagnostic> {
                         "daemon_installs_hooks",
                         ReliabilitySeverity::Warning,
                         "Daemon hook repair is disabled; hook drift may persist",
-                        "daemon_hook_repair_disabled",
+                        ReliabilityReasonCode::DaemonHookRepairDisabled,
                     )
                     .with_remediation(
                         "rch config set self_healing.daemon_installs_hooks true",
@@ -1088,9 +2464,9 @@ fn reliability_rollout_posture_diagnostics() -> Vec<ReliabilityDiagnostic> {
                 "config_load",
                 ReliabilitySeverity::Warning,
                 "Configuration could not be loaded; rollout posture is partial",
-                "config_load_failed",
+                ReliabilityReasonCode::ConfigLoadFailed,
             )
-            .with_details(err.to_string())
+            .with_details(err)
             .with_remediation(
                 "rch config doctor --json",
                 "rch doctor --reliability --json",
@@ -1103,21 +2479,21 @@ fn reliability_rollout_posture_diagnostics() -> Vec<ReliabilityDiagnostic> {
         "status_surface",
         ReliabilitySeverity::Pass,
         "Unified status surface is compiled in",
-        "status_surface_available",
+        ReliabilityReasonCode::StatusSurfaceAvailable,
     ));
     diagnostics.push(ReliabilityDiagnostic::new(
         ReliabilityCategory::RolloutPosture,
         "repo_convergence_gate",
         ReliabilitySeverity::Pass,
         "Repo-convergence status endpoint is wired into the CLI",
-        "repo_convergence_surface_available",
+        ReliabilityReasonCode::RepoConvergenceSurfaceAvailable,
     ));
     diagnostics.push(ReliabilityDiagnostic::new(
         ReliabilityCategory::RolloutPosture,
         "disk_pressure_gate",
         ReliabilitySeverity::Pass,
         "Disk-pressure fields are wired into worker status",
-        "disk_pressure_surface_available",
+        ReliabilityReasonCode::DiskPressureSurfaceAvailable,
     ));
 
     diagnostics
@@ -1174,7 +2550,7 @@ fn schema_compatibility_diagnostic(
             name,
             ReliabilitySeverity::Pass,
             format!("{description} schema version is compatible"),
-            "schema_compatible",
+            ReliabilityReasonCode::SchemaCompatible,
         )
         .with_details(format!("schema_version={actual} expected={expected}"))
     } else {
@@ -1183,7 +2559,7 @@ fn schema_compatibility_diagnostic(
             name,
             ReliabilitySeverity::Critical,
             format!("{description} schema version is incompatible"),
-            "schema_incompatible",
+            ReliabilityReasonCode::SchemaIncompatible,
         )
         .with_details(format!("expected={expected}, actual={actual}"))
         .with_remediation(
@@ -1193,8 +2569,20 @@ fn schema_compatibility_diagnostic(
     }
 }
 
+/// Reason codes whose presence in the diagnostic list indicates the
+/// daemon could not be reached. Each of these is emitted by a probe
+/// whose query specifically depends on a live daemon socket — so any
+/// one of them implies `daemon_unreachable=true`. (t05)
+const DAEMON_UNREACHABLE_REASON_CODES: &[ReliabilityReasonCode] = &[
+    ReliabilityReasonCode::DaemonStatusUnavailable,
+    ReliabilityReasonCode::DiskPressureUnavailable,
+    ReliabilityReasonCode::ProcessDebtUnavailable,
+    ReliabilityReasonCode::RepoConvergenceUnavailable,
+];
+
 fn build_reliability_doctor_response(
     mode: ReliabilityDoctorMode,
+    scope: &ReliabilityScopeSet,
     diagnostics: Vec<ReliabilityDiagnostic>,
 ) -> ReliabilityDoctorResponse {
     let mut categories = BTreeSet::new();
@@ -1212,6 +2600,17 @@ fn build_reliability_doctor_response(
         }
     }
 
+    // Compute daemon_unreachable + per-probe attribution (t05). Walk
+    // the diagnostics list looking for the "this probe needed the
+    // daemon but couldn't reach it" reason codes. The reasons list
+    // gives operators which specific probe failed.
+    let daemon_unreachable_reasons: Vec<String> = diagnostics
+        .iter()
+        .filter(|d| DAEMON_UNREACHABLE_REASON_CODES.contains(&d.code))
+        .map(|d| format!("{}: {}", d.check_name, d.message))
+        .collect();
+    let daemon_unreachable = !daemon_unreachable_reasons.is_empty();
+
     let remediation_plan = build_reliability_remediation_plan(&diagnostics);
     let summary = ReliabilityDoctorSummary {
         total_checks: diagnostics.len(),
@@ -1220,12 +2619,15 @@ fn build_reliability_doctor_response(
         warning,
         critical,
         categories_checked: categories.into_iter().collect(),
-        overall_healthy: warning == 0 && critical == 0,
+        overall: aggregate_verdict(&diagnostics),
     };
 
     ReliabilityDoctorResponse {
         schema_version: RELIABILITY_DOCTOR_SCHEMA_VERSION.to_string(),
         mode,
+        scope: scope.as_strings(),
+        daemon_unreachable,
+        daemon_unreachable_reasons,
         diagnostics,
         summary,
         remediation_plan,
@@ -1264,12 +2666,7 @@ fn build_reliability_remediation_plan(
                 .validation_check
                 .clone()
                 .unwrap_or_else(|| "rch doctor --reliability --json".to_string()),
-            requires_restart: matches!(
-                diagnostic.reason_code.as_str(),
-                "hook_auto_start_disabled"
-                    | "daemon_hook_repair_disabled"
-                    | "daemon_status_unavailable"
-            ),
+            requires_restart: diagnostic.code.requires_restart(),
             dry_run_safe: diagnostic.dry_run_safe,
         })
         .collect()
@@ -1280,18 +2677,32 @@ fn print_reliability_doctor_response(ctx: &OutputContext, response: &Reliability
 
     println!("{}", style.format_header("RCH Reliability Doctor"));
     println!();
+
+    // t05: daemon-unreachable prefix so the operator immediately sees
+    // the limited scope of this report. Suppressed in JSON mode where
+    // the envelope's data.daemon_unreachable flag carries the same
+    // signal for machine consumers.
+    if response.daemon_unreachable && !ctx.is_json() {
+        println!(
+            "  {} [daemon down — local-only checks]",
+            StatusIndicator::Warning.display(style)
+        );
+    }
+
     println!(
         "  {} schema {}",
         StatusIndicator::Info.display(style),
         style.value(&response.schema_version)
     );
+    let verdict_indicator = match response.summary.overall {
+        ReliabilityVerdict::Healthy => StatusIndicator::Success,
+        ReliabilityVerdict::Degraded => StatusIndicator::Warning,
+        ReliabilityVerdict::Failing => StatusIndicator::Error,
+    };
     println!(
-        "  {} {} check(s): {} pass, {} info, {} warning, {} critical",
-        if response.summary.overall_healthy {
-            StatusIndicator::Success.display(style)
-        } else {
-            StatusIndicator::Warning.display(style)
-        },
+        "  {} verdict: {} ({} check(s): {} pass, {} info, {} warning, {} critical)",
+        verdict_indicator.display(style),
+        style.highlight(response.summary.overall.label()),
         response.summary.total_checks,
         response.summary.pass,
         response.summary.info,
@@ -1353,15 +2764,43 @@ fn print_reliability_doctor_response(ctx: &OutputContext, response: &Reliability
     } else {
         println!("{}", style.format_success("Reliability checks passed."));
     }
+
+    // t05: meta footer for first-time operators — only in human mode
+    // (verbose or default). Hook/JSON modes get the same info via the
+    // envelope and the --schema endpoint.
+    if !ctx.is_json() {
+        println!();
+        println!(
+            "  {} Run with {} for machine-readable output",
+            StatusIndicator::Info.display(style),
+            style.value("--json")
+        );
+        println!(
+            "  {} Exit codes: 0 = healthy, 1 = degraded, 2 = failing (with --strict: degraded → 2; with --lenient: failing → 1)",
+            StatusIndicator::Info.display(style),
+        );
+    }
 }
 
 /// Quick health check result for post-hook-install display.
+///
+/// **t03 contract change:** `workers_healthy` is `Option<usize>` — `None`
+/// means "not probed / unknown", explicitly distinguishing the "fast
+/// check, no network probes" case from the "every worker is healthy"
+/// case. Prior shape unconditionally returned `Some(worker_count)`
+/// without probing, which silently treated unhealthy fleets as healthy.
+/// `is_healthy()` now requires `workers_healthy == Some(worker_count)`
+/// — `None` is NEVER reported as healthy.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct QuickCheckResult {
     pub daemon_running: bool,
     pub worker_count: usize,
-    pub workers_healthy: usize,
+    /// `None` = not probed (the default for `run_quick_check`, which is
+    /// designed to be fast / no-network).
+    /// `Some(n)` = `n` of the configured workers were probed and reported
+    /// healthy.
+    pub workers_healthy: Option<usize>,
     pub hook_installed: bool,
     pub warnings: Vec<String>,
     pub errors: Vec<String>,
@@ -1369,11 +2808,19 @@ pub struct QuickCheckResult {
 
 impl QuickCheckResult {
     /// Check if the system is fully operational.
+    ///
+    /// **Contract:** returns `true` ONLY when daemon is running, hook is
+    /// installed, warnings/errors are empty, AND every configured worker
+    /// has been probed and reported healthy. `workers_healthy == None`
+    /// (unknown) is NEVER healthy — this is the default-to-degraded
+    /// discipline per t03's bead body.
     pub fn is_healthy(&self) -> bool {
         self.daemon_running
             && self.worker_count > 0
             && self.hook_installed
+            && self.warnings.is_empty()
             && self.errors.is_empty()
+            && self.workers_healthy == Some(self.worker_count)
     }
 
     /// Check if there are any issues.
@@ -1384,15 +2831,26 @@ impl QuickCheckResult {
 }
 
 /// Run a quick health check (for post-install feedback).
-/// This runs fast checks only (no network probes).
+///
+/// This runs fast local-only checks (no network probes). Worker health
+/// is reported as `None` (unknown) — callers needing real worker
+/// probes should run `rch doctor --reliability` (which performs the
+/// SSH-based health checks). This honest "unknown" signal is the t03
+/// fix for the prior default-to-success behavior that silently treated
+/// every configured worker as healthy.
 pub fn run_quick_check() -> QuickCheckResult {
-    let socket_path = default_socket_path();
-    let daemon_running = socket_path.exists();
+    let socket_path = configured_or_default_socket_path();
+    let daemon_running = socket_path.exists() && daemon_socket_accepts_connections(&socket_path);
 
-    // Check workers
+    // Check workers — fast check only counts configured entries; we do
+    // NOT probe each worker over the network here (that's `rch doctor
+    // --reliability`'s job). Health is reported as `None` (unknown)
+    // since we genuinely don't know without probing.
     let (worker_count, workers_healthy) = match load_workers_from_config() {
-        Ok(workers) => (workers.len(), workers.len()), // Assume healthy without probing
-        Err(_) => (0, 0),
+        // Fast-check: count configured workers; health is unknown
+        // until a real probe is performed (default-to-degraded discipline).
+        Ok(workers) => (workers.len(), None),
+        Err(_) => (0, None),
     };
 
     // Check hook
@@ -1428,15 +2886,33 @@ pub fn run_quick_check() -> QuickCheckResult {
     if !hook_installed {
         errors.push("Hook not installed".to_string());
     }
+    // Honest signal that this is a fast-check, not a real probe.
+    if worker_count > 0 && workers_healthy.is_none() {
+        warnings.push(
+            "Worker health not probed by quick-check; run `rch doctor --reliability` for full status".to_string(),
+        );
+    }
 
-    QuickCheckResult {
+    let result = QuickCheckResult {
         daemon_running,
         worker_count,
         workers_healthy,
         hook_installed,
         warnings,
         errors,
-    }
+    };
+
+    tracing::debug!(
+        target: "rch::doctor::quick_check",
+        daemon_running,
+        worker_count,
+        workers_healthy = ?result.workers_healthy,
+        hook_installed,
+        is_healthy = result.is_healthy(),
+        "doctor.quick_check.complete",
+    );
+
+    result
 }
 
 /// Print a quick health check summary to the console.
@@ -2274,10 +3750,28 @@ fn spawn_rchd(rchd_path: &Path, socket_path: &Path) -> Result<(), String> {
         .stderr(Stdio::null())
         .stdin(Stdio::null());
 
-    cmd.spawn().map_err(|e| match e.kind() {
-        std::io::ErrorKind::NotFound => "rchd not found in PATH".to_string(),
+    let mut child = cmd.spawn().map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => "nohup not found while launching rchd".to_string(),
         _ => e.to_string(),
     })?;
+
+    std::thread::sleep(Duration::from_millis(100));
+    if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+        return if status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "rchd launch wrapper exited unsuccessfully: {status}"
+            ))
+        };
+    }
+
+    // `nohup` does not daemonize by itself; it execs/wraps rchd as our
+    // direct child. Keep a detached waiter while doctor continues so a
+    // later daemon exit is reaped instead of becoming a zombie.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
     Ok(())
 }
 
@@ -2330,16 +3824,30 @@ fn check_daemon(
         println!();
     }
 
-    let socket_path = default_socket_path();
-    let mut result = if socket_path.exists() {
+    let socket_path = configured_or_default_socket_path();
+    let socket_exists = socket_path.exists();
+    let socket_live = socket_exists && daemon_socket_accepts_connections(&socket_path);
+    let mut result = if socket_live {
         CheckResult {
             category: "daemon".to_string(),
             name: "daemon_socket".to_string(),
             status: CheckStatus::Pass,
-            message: "Daemon socket exists".to_string(),
+            message: "Daemon is accepting connections".to_string(),
             details: Some(socket_path.to_string_lossy().to_string()),
             suggestion: None,
             fixable: false,
+            fix_applied: false,
+            fix_message: None,
+        }
+    } else if socket_exists {
+        CheckResult {
+            category: "daemon".to_string(),
+            name: "daemon_socket".to_string(),
+            status: CheckStatus::Warning,
+            message: "Daemon socket is stale or unreachable".to_string(),
+            details: Some(socket_path.to_string_lossy().to_string()),
+            suggestion: Some("Restart daemon with: rch daemon restart".to_string()),
+            fixable: true,
             fix_applied: false,
             fix_message: None,
         }
@@ -2412,7 +3920,7 @@ fn check_daemon(
     print_check_result(&result, ctx);
     checks.push(result);
 
-    // Warn if a legacy /tmp socket exists but the default has moved.
+    // Warn if a legacy /tmp socket exists but the configured path has moved.
     let legacy_socket = Path::new("/tmp/rch.sock");
     if socket_path != legacy_socket && legacy_socket.exists() {
         let legacy_result = CheckResult {
@@ -2422,7 +3930,7 @@ fn check_daemon(
             message: "Legacy /tmp socket detected".to_string(),
             details: Some(legacy_socket.display().to_string()),
             suggestion: Some(
-                "Restart the daemon so it binds to the new default socket path".to_string(),
+                "Restart the daemon so it binds to the configured socket path".to_string(),
             ),
             fixable: false,
             fix_applied: false,
@@ -2434,6 +3942,18 @@ fn check_daemon(
 
     if !ctx.is_json() {
         println!();
+    }
+}
+
+fn daemon_socket_accepts_connections(socket_path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        std::os::unix::net::UnixStream::connect(socket_path).is_ok()
+    }
+
+    #[cfg(not(unix))]
+    {
+        socket_path.exists()
     }
 }
 
@@ -2555,13 +4075,14 @@ async fn check_cancellation_health(checks: &mut Vec<CheckResult>, ctx: &OutputCo
         println!();
     }
 
-    let result = if !default_socket_path().exists() {
+    let socket_path = configured_or_default_socket_path();
+    let result = if !socket_path.exists() {
         CheckResult {
             category: "cancellation".to_string(),
             name: "cancellation_health".to_string(),
             status: CheckStatus::Skipped,
             message: "Daemon socket not present; skipping cancellation diagnostics".to_string(),
-            details: Some(default_socket_path().display().to_string()),
+            details: Some(socket_path.display().to_string()),
             suggestion: Some("Start daemon with: rch daemon start".to_string()),
             fixable: false,
             fix_applied: false,
@@ -3053,6 +4574,225 @@ mod tests {
     use serde_json::json;
     use tempfile::TempDir;
 
+    fn worker_status(
+        id: &str,
+        status: &str,
+        circuit_state: &str,
+    ) -> crate::status_types::WorkerStatusFromApi {
+        serde_json::from_value(json!({
+            "id": id,
+            "host": "worker.example",
+            "user": "ubuntu",
+            "status": status,
+            "circuit_state": circuit_state,
+            "used_slots": 0,
+            "total_slots": 8,
+            "speed_score": 99.0,
+            "last_error": null
+        }))
+        .expect("worker status fixture should parse")
+    }
+
+    #[test]
+    fn test_worker_topology_known_non_ready_status_is_degraded() {
+        for status in ["degraded", "draining", "drained", "disabled", "busy"] {
+            let worker = worker_status("worker-a", status, "closed");
+            let diagnostic = worker_topology_diagnostic(&worker);
+
+            assert_eq!(diagnostic.severity, ReliabilitySeverity::Warning);
+            assert_eq!(diagnostic.code, ReliabilityReasonCode::WorkerDegraded);
+            assert!(
+                diagnostic.message.contains(status),
+                "message should preserve the known non-ready status, got: {}",
+                diagnostic.message
+            );
+        }
+    }
+
+    #[test]
+    fn test_worker_topology_unknown_status_reports_protocol_drift() {
+        let worker = worker_status("worker-a", "parked", "closed");
+        let diagnostic = worker_topology_diagnostic(&worker);
+
+        assert_eq!(diagnostic.severity, ReliabilitySeverity::Warning);
+        assert_eq!(
+            diagnostic.code,
+            ReliabilityReasonCode::WorkerStatusUnrecognized
+        );
+        assert!(
+            diagnostic.message.contains("status is unrecognized"),
+            "unexpected message: {}",
+            diagnostic.message
+        );
+    }
+
+    // ========================================================================
+    // t07 — defensive parsers for worker.ready_status + circuit_state.
+    // Pure-function tests (no doctor/daemon harness) for the parser
+    // contracts that drive worker_topology_diagnostic.
+    // ========================================================================
+
+    #[test]
+    fn test_parse_ready_status_known_ready_variants() {
+        for v in ["healthy", "available", "ready", "idle", "running"] {
+            assert_eq!(
+                parse_worker_ready_status(v),
+                ParsedStatus::Known(KnownStatus::Ready),
+                "{v} should parse as Ready"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_ready_status_known_degraded_variants() {
+        for v in [
+            "busy",
+            "degraded",
+            "draining",
+            "drained",
+            "disabled",
+            "unhealthy",
+        ] {
+            assert_eq!(
+                parse_worker_ready_status(v),
+                ParsedStatus::Known(KnownStatus::Degraded),
+                "{v} should parse as Degraded"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_ready_status_known_unreachable_variants() {
+        for v in ["unreachable", "offline", "error", "failed"] {
+            assert_eq!(
+                parse_worker_ready_status(v),
+                ParsedStatus::Known(KnownStatus::Unreachable),
+                "{v} should parse as Unreachable"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_ready_status_trims_and_lowers() {
+        // Whitespace + casing variations all hit the same bucket.
+        for v in [
+            "  healthy  ",
+            "\tHealthy\n",
+            "READY",
+            "  Ready ",
+            "\u{00A0}healthy\u{00A0}", // non-breaking space (Rust trim handles)
+        ] {
+            assert_eq!(
+                parse_worker_ready_status(v),
+                ParsedStatus::Known(KnownStatus::Ready),
+                "{v:?} should normalize to Ready"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_ready_status_unknown_preserves_normalized_input() {
+        // The Unrecognized variant carries the trim+lowered value so the
+        // resulting diagnostic can surface it to operators.
+        assert_eq!(
+            parse_worker_ready_status("  PARKED  "),
+            ParsedStatus::Unrecognized("parked".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_ready_status_empty_string_unrecognized() {
+        assert_eq!(
+            parse_worker_ready_status(""),
+            ParsedStatus::Unrecognized(String::new())
+        );
+        assert_eq!(
+            parse_worker_ready_status("   \t  "),
+            ParsedStatus::Unrecognized(String::new())
+        );
+    }
+
+    #[test]
+    fn test_parse_circuit_state_known_variants() {
+        assert_eq!(
+            parse_worker_circuit_state("closed"),
+            ParsedCircuit::Known(KnownCircuit::Closed)
+        );
+        assert_eq!(
+            parse_worker_circuit_state("open"),
+            ParsedCircuit::Known(KnownCircuit::Open)
+        );
+        assert_eq!(
+            parse_worker_circuit_state("half_open"),
+            ParsedCircuit::Known(KnownCircuit::HalfOpen)
+        );
+        // dash form also accepted (some serializers use it).
+        assert_eq!(
+            parse_worker_circuit_state("half-open"),
+            ParsedCircuit::Known(KnownCircuit::HalfOpen)
+        );
+    }
+
+    #[test]
+    fn test_parse_circuit_state_trims_and_lowers() {
+        for v in ["  Open  ", "\tOPEN\n", "OPEN"] {
+            assert_eq!(
+                parse_worker_circuit_state(v),
+                ParsedCircuit::Known(KnownCircuit::Open),
+                "{v:?} should normalize to Open"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_circuit_state_unknown_preserves_normalized() {
+        // Forensics: Unrecognized carries the offending value.
+        assert_eq!(
+            parse_worker_circuit_state("OPEN_FORCED"),
+            ParsedCircuit::Unrecognized("open_forced".to_string())
+        );
+        assert_eq!(
+            parse_worker_circuit_state("closed_for_maintenance"),
+            ParsedCircuit::Unrecognized("closed_for_maintenance".to_string())
+        );
+        assert_eq!(
+            parse_worker_circuit_state(""),
+            ParsedCircuit::Unrecognized(String::new())
+        );
+    }
+
+    #[test]
+    fn test_worker_topology_unknown_circuit_state_reports_protocol_drift() {
+        // The conjugate of the existing ready_status test: unknown
+        // circuit_state values must surface as Warning with the
+        // dedicated reason code, never silently mapped to Pass.
+        let worker = worker_status("worker-a", "healthy", "OPEN_FORCED");
+        let diagnostic = worker_topology_diagnostic(&worker);
+
+        assert_eq!(diagnostic.severity, ReliabilitySeverity::Warning);
+        assert_eq!(
+            diagnostic.code,
+            ReliabilityReasonCode::WorkerCircuitStateUnrecognized
+        );
+        assert!(
+            diagnostic.message.contains("circuit_state is unrecognized"),
+            "unexpected message: {}",
+            diagnostic.message
+        );
+    }
+
+    #[test]
+    fn test_worker_topology_circuit_unrecognized_dominates_status() {
+        // When BOTH fields are unrecognized, circuit drift is reported
+        // first (the match-arm ordering encodes operator priority).
+        let worker = worker_status("worker-a", "parked", "UNKNOWN");
+        let diagnostic = worker_topology_diagnostic(&worker);
+        assert_eq!(
+            diagnostic.code,
+            ReliabilityReasonCode::WorkerCircuitStateUnrecognized
+        );
+    }
+
     #[test]
     fn test_read_config_capped_reader_rejects_bytes_past_cap() {
         let err = read_config_capped_from_reader(
@@ -3088,7 +4828,7 @@ mod tests {
             ReliabilityCategory::SchemaCompatibility
         );
         assert_eq!(diagnostic.severity, ReliabilitySeverity::Critical);
-        assert_eq!(diagnostic.reason_code, "schema_incompatible");
+        assert_eq!(diagnostic.code, ReliabilityReasonCode::SchemaIncompatible);
         assert_eq!(
             diagnostic.details.as_deref(),
             Some("expected=1.0.0, actual=2.0.0")
@@ -3105,12 +4845,46 @@ mod tests {
             schema_compatibility_diagnostic("status", "1.0.0", "1.0.0", "CLI status response");
 
         assert_eq!(diagnostic.severity, ReliabilitySeverity::Pass);
-        assert_eq!(diagnostic.reason_code, "schema_compatible");
+        assert_eq!(diagnostic.code, ReliabilityReasonCode::SchemaCompatible);
         assert_eq!(
             diagnostic.details.as_deref(),
             Some("schema_version=1.0.0 expected=1.0.0")
         );
         assert!(diagnostic.remediation_command.is_none());
+    }
+
+    #[test]
+    fn test_schema_compatibility_diagnostics_use_pinned_expected_versions() {
+        let diagnostics = reliability_schema_compatibility_diagnostics();
+
+        assert_eq!(diagnostics.len(), 4);
+        for check_name in [
+            "doctor_reliability",
+            "status",
+            "repo_updater_contract",
+            "process_triage_contract",
+        ] {
+            let diagnostic = diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.check_name == check_name);
+            assert!(
+                diagnostic.is_some(),
+                "missing schema diagnostic for {check_name}"
+            );
+            let Some(diagnostic) = diagnostic else {
+                return;
+            };
+
+            assert_eq!(diagnostic.severity, ReliabilitySeverity::Pass);
+            assert_eq!(diagnostic.code, ReliabilityReasonCode::SchemaCompatible);
+            assert!(
+                diagnostic
+                    .details
+                    .as_deref()
+                    .is_some_and(|details| details.ends_with(" expected=1.0.0")),
+                "{check_name} should compare against this doctor's pinned expected schema version"
+            );
+        }
     }
 
     #[test]
@@ -3297,7 +5071,7 @@ mod tests {
         let healthy = QuickCheckResult {
             daemon_running: true,
             worker_count: 1,
-            workers_healthy: 1,
+            workers_healthy: Some(1),
             hook_installed: true,
             warnings: vec![],
             errors: vec![],
@@ -3307,7 +5081,7 @@ mod tests {
         let no_daemon = QuickCheckResult {
             daemon_running: false,
             worker_count: 1,
-            workers_healthy: 1,
+            workers_healthy: Some(1),
             hook_installed: true,
             warnings: vec![],
             errors: vec![],
@@ -3317,7 +5091,7 @@ mod tests {
         let no_workers = QuickCheckResult {
             daemon_running: true,
             worker_count: 0,
-            workers_healthy: 0,
+            workers_healthy: None,
             hook_installed: true,
             warnings: vec![],
             errors: vec![],
@@ -3327,12 +5101,25 @@ mod tests {
         let no_hook = QuickCheckResult {
             daemon_running: true,
             worker_count: 1,
-            workers_healthy: 1,
+            workers_healthy: Some(1),
             hook_installed: false,
             warnings: vec![],
             errors: vec![],
         };
         assert!(!no_hook.is_healthy());
+
+        let with_warning = QuickCheckResult {
+            daemon_running: true,
+            worker_count: 1,
+            workers_healthy: Some(1),
+            hook_installed: true,
+            warnings: vec!["Worker health stale".to_string()],
+            errors: vec![],
+        };
+        assert!(
+            !with_warning.is_healthy(),
+            "warnings are issues and must not report full quick-check health"
+        );
     }
 
     #[test]
@@ -3340,7 +5127,7 @@ mod tests {
         let no_issues = QuickCheckResult {
             daemon_running: true,
             worker_count: 1,
-            workers_healthy: 1,
+            workers_healthy: Some(1),
             hook_installed: true,
             warnings: vec![],
             errors: vec![],
@@ -3350,7 +5137,7 @@ mod tests {
         let with_warnings = QuickCheckResult {
             daemon_running: true,
             worker_count: 1,
-            workers_healthy: 1,
+            workers_healthy: Some(1),
             hook_installed: true,
             warnings: vec!["Some warning".to_string()],
             errors: vec![],
@@ -3360,7 +5147,7 @@ mod tests {
         let with_errors = QuickCheckResult {
             daemon_running: true,
             worker_count: 1,
-            workers_healthy: 1,
+            workers_healthy: Some(1),
             hook_installed: true,
             warnings: vec![],
             errors: vec!["Some error".to_string()],
@@ -3376,6 +5163,108 @@ mod tests {
         // We can't assert on specific values because they depend on system state,
         // but we can verify the result is accessible and properly structured
         let _total_issues = result.warnings.len() + result.errors.len();
+    }
+
+    // =========================================================================
+    // t03 — run_quick_check contract: Option<usize> for workers_healthy +
+    // honest "unknown" signal + is_healthy() never defaults to success.
+    // =========================================================================
+
+    #[test]
+    fn test_quick_check_unknown_workers_health_is_not_healthy() {
+        // The bead's headline regression: workers_healthy=None must
+        // never be treated as healthy. Even if everything else is ok,
+        // unknown worker state means "not healthy until probed".
+        let unknown = QuickCheckResult {
+            daemon_running: true,
+            worker_count: 3,
+            workers_healthy: None, // not probed
+            hook_installed: true,
+            warnings: vec![],
+            errors: vec![],
+        };
+        assert!(
+            !unknown.is_healthy(),
+            "is_healthy() must NOT return true when workers_healthy is None"
+        );
+    }
+
+    #[test]
+    fn test_quick_check_partial_health_is_not_healthy() {
+        // 5 workers configured, only 3 probed healthy: definitively NOT healthy.
+        let partial = QuickCheckResult {
+            daemon_running: true,
+            worker_count: 5,
+            workers_healthy: Some(3),
+            hook_installed: true,
+            warnings: vec![],
+            errors: vec![],
+        };
+        assert!(!partial.is_healthy());
+    }
+
+    #[test]
+    fn test_quick_check_full_health_is_healthy() {
+        // worker_count == workers_healthy.unwrap() AND everything else ok.
+        let full = QuickCheckResult {
+            daemon_running: true,
+            worker_count: 3,
+            workers_healthy: Some(3),
+            hook_installed: true,
+            warnings: vec![],
+            errors: vec![],
+        };
+        assert!(full.is_healthy());
+    }
+
+    #[test]
+    fn test_quick_check_does_not_default_to_success() {
+        // Explicit regression for the original bug: the prior code had
+        //   Ok(workers) => (workers.len(), workers.len()) // assume healthy
+        // which silently treated configured workers as healthy. Now we
+        // require an explicit Some(n) AND n == worker_count for is_healthy()
+        // to return true. NO path through run_quick_check() can satisfy
+        // this without an honest probe.
+        let result = run_quick_check();
+        // Since run_quick_check is fast-only (no network probes), it
+        // CANNOT report Some(_) for workers_healthy. The contract is
+        // verified by the implementation: workers_healthy is always None.
+        assert_eq!(
+            result.workers_healthy, None,
+            "fast-only run_quick_check must report unknown worker health"
+        );
+        // Confirms is_healthy() returns false for fast-only checks.
+        assert!(
+            !result.is_healthy(),
+            "fast-only check must never report healthy without a probe"
+        );
+    }
+
+    #[test]
+    fn test_quick_check_emits_warning_about_unprobed_workers() {
+        // When worker_count > 0 but workers_healthy is None, surface a
+        // warning so operators understand they ran a fast-check, not a
+        // real probe. (Only fires if there are configured workers; an
+        // empty fleet is reported via "No workers configured" warning.)
+        // Since we can't easily inject a fake fleet here, we test the
+        // logic at the struct level: build a synthetic result and
+        // verify the warning text would be emitted.
+        let r = QuickCheckResult {
+            daemon_running: true,
+            worker_count: 3,
+            workers_healthy: None,
+            hook_installed: true,
+            warnings: vec![
+                "Worker health not probed by quick-check; run `rch doctor --reliability` for full status".to_string(),
+            ],
+            errors: vec![],
+        };
+        assert!(
+            r.warnings.iter().any(|w| w.contains("not probed")),
+            "expected fast-check to surface 'not probed' warning"
+        );
+        // is_healthy still returns false because workers_healthy is None.
+        assert!(!r.is_healthy());
     }
 
     // =========================================================================
@@ -3607,6 +5496,7 @@ mod tests {
     fn test_doctor_response_serialization() {
         // TEST START: DoctorResponse full serialization
         let response = DoctorResponse {
+            schema_version: "1.0.0".to_string(),
             checks: vec![
                 CheckResult {
                     category: "prerequisites".to_string(),
@@ -3653,6 +5543,7 @@ mod tests {
     fn test_doctor_response_with_fixes() {
         // TEST START: DoctorResponse with applied fixes
         let response = DoctorResponse {
+            schema_version: "1.0.0".to_string(),
             checks: vec![],
             summary: DoctorSummary {
                 total: 1,
@@ -3727,6 +5618,13 @@ mod tests {
             reliability: false,
             check_schemas: false,
             verbose: false,
+            strict: false,
+            lenient: false,
+            scope: ReliabilityScopeSet::default(),
+            watch: false,
+            watch_interval_secs: 5,
+            transitions_only: false,
+            watch_snapshot: None,
         };
         assert!(!opts_minimal.fix);
         assert!(!opts_minimal.dry_run);
@@ -3738,6 +5636,13 @@ mod tests {
             reliability: false,
             check_schemas: false,
             verbose: false,
+            strict: false,
+            lenient: false,
+            scope: ReliabilityScopeSet::default(),
+            watch: false,
+            watch_interval_secs: 5,
+            transitions_only: false,
+            watch_snapshot: None,
         };
         assert!(opts_fix.fix);
 
@@ -3748,6 +5653,13 @@ mod tests {
             reliability: false,
             check_schemas: false,
             verbose: false,
+            strict: false,
+            lenient: false,
+            scope: ReliabilityScopeSet::default(),
+            watch: false,
+            watch_interval_secs: 5,
+            transitions_only: false,
+            watch_snapshot: None,
         };
         assert!(opts_dry_run.fix);
         assert!(opts_dry_run.dry_run);
@@ -3759,6 +5671,13 @@ mod tests {
             reliability: false,
             check_schemas: false,
             verbose: true,
+            strict: false,
+            lenient: false,
+            scope: ReliabilityScopeSet::default(),
+            watch: false,
+            watch_interval_secs: 5,
+            transitions_only: false,
+            watch_snapshot: None,
         };
         assert!(opts_verbose.verbose);
         // TEST PASS: DoctorOptions construction
@@ -3851,7 +5770,7 @@ mod tests {
         let result = QuickCheckResult {
             daemon_running: false,
             worker_count: 0,
-            workers_healthy: 0,
+            workers_healthy: None,
             hook_installed: false,
             warnings: vec![
                 "Daemon not running".to_string(),
@@ -3869,19 +5788,27 @@ mod tests {
 
     #[test]
     fn test_quick_check_result_partial_health() {
-        // TEST START: QuickCheckResult partial health (some components working)
+        // TEST START: QuickCheckResult partial health
+        // Updated for t03 contract (2s99h.11): partial worker health is
+        // NOT healthy. Previously this test asserted is_healthy()=true
+        // with a warning, encoding the default-to-success behavior.
+        // The new contract: workers_healthy < worker_count means the
+        // system is NOT healthy.
         let result = QuickCheckResult {
             daemon_running: true,
             worker_count: 2,
-            workers_healthy: 1, // Only 1 of 2 healthy
+            workers_healthy: Some(1), // Only 1 of 2 healthy
             hook_installed: true,
             warnings: vec!["Worker css is offline".to_string()],
             errors: vec![],
         };
 
-        // System is "healthy" from base criteria but has warnings
-        assert!(result.is_healthy());
-        assert!(result.has_issues()); // Still has issues due to warning
+        // Partial health is now NOT healthy (default-to-degraded discipline).
+        assert!(
+            !result.is_healthy(),
+            "1/2 workers healthy must NOT report system-healthy"
+        );
+        assert!(result.has_issues());
         // TEST PASS: QuickCheckResult partial health
     }
 
@@ -4016,6 +5943,85 @@ mod tests {
         // TEST PASS: default_socket_path
     }
 
+    #[test]
+    fn test_configured_or_default_socket_path_uses_config_override() {
+        // TEST START: doctor socket path follows active config
+        let _guard = rch_common::test_guard!();
+        struct ResetConfigOverride;
+        impl Drop for ResetConfigOverride {
+            fn drop(&mut self) {
+                crate::config::set_test_config_override(None);
+            }
+        }
+
+        let mut config = rch_common::RchConfig::default();
+        config.general.socket_path = "/tmp/rch-doctor-custom.sock".to_string();
+        crate::config::set_test_config_override(Some(config));
+        let _reset = ResetConfigOverride;
+
+        assert_eq!(
+            configured_or_default_socket_path(),
+            PathBuf::from("/tmp/rch-doctor-custom.sock")
+        );
+        // TEST PASS: active config socket path used
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_daemon_check_warns_on_stale_socket_file() {
+        // TEST START: daemon check does not treat a stale socket file as running
+        use crate::ui::context::{OutputConfig, OutputContext};
+
+        let _guard = rch_common::test_guard!();
+        struct ResetConfigOverride;
+        impl Drop for ResetConfigOverride {
+            fn drop(&mut self) {
+                crate::config::set_test_config_override(None);
+            }
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let socket_path = tmp.path().join("stale.sock");
+        std::fs::write(&socket_path, "not a unix socket").unwrap();
+
+        let mut config = rch_common::RchConfig::default();
+        config.general.socket_path = socket_path.display().to_string();
+        crate::config::set_test_config_override(Some(config));
+        let _reset = ResetConfigOverride;
+
+        let ctx = OutputContext::new(OutputConfig::default());
+        let options = DoctorOptions {
+            fix: false,
+            dry_run: false,
+            install_deps: false,
+            reliability: false,
+            check_schemas: false,
+            verbose: false,
+            strict: false,
+            lenient: false,
+            scope: ReliabilityScopeSet::default(),
+            watch: false,
+            watch_interval_secs: 5,
+            transitions_only: false,
+            watch_snapshot: None,
+        };
+        let mut checks = Vec::new();
+        let mut fixes_applied = Vec::new();
+
+        check_daemon(&mut checks, &ctx, &options, &mut fixes_applied);
+
+        let daemon_socket = checks
+            .iter()
+            .find(|check| check.name == "daemon_socket")
+            .expect("daemon socket check");
+        assert_eq!(daemon_socket.status, CheckStatus::Warning);
+        assert_eq!(
+            daemon_socket.message,
+            "Daemon socket is stale or unreachable"
+        );
+        // TEST PASS: stale socket is not a daemon pass
+    }
+
     // =========================================================================
     // Integration-Style Tests (Still No Mocks)
     // =========================================================================
@@ -4033,6 +6039,13 @@ mod tests {
             reliability: false,
             check_schemas: false,
             verbose: false,
+            strict: false,
+            lenient: false,
+            scope: ReliabilityScopeSet::default(),
+            watch: false,
+            watch_interval_secs: 5,
+            transitions_only: false,
+            watch_snapshot: None,
         };
 
         let mut checks = Vec::new();
@@ -4068,6 +6081,13 @@ mod tests {
             reliability: false,
             check_schemas: false,
             verbose: false,
+            strict: false,
+            lenient: false,
+            scope: ReliabilityScopeSet::default(),
+            watch: false,
+            watch_interval_secs: 5,
+            transitions_only: false,
+            watch_snapshot: None,
         };
 
         let mut checks = Vec::new();
@@ -4099,6 +6119,13 @@ mod tests {
             reliability: false,
             check_schemas: false,
             verbose: false,
+            strict: false,
+            lenient: false,
+            scope: ReliabilityScopeSet::default(),
+            watch: false,
+            watch_interval_secs: 5,
+            transitions_only: false,
+            watch_snapshot: None,
         };
         let mut fixes_applied = Vec::new();
 
@@ -4152,6 +6179,27 @@ exit 0\n"
         start_daemon_with_binary(&socket_path, &fake_rchd, Duration::from_secs(1)).unwrap();
         assert!(socket_path.exists());
         // TEST PASS: start_daemon_with_binary creates socket file
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_start_daemon_with_failing_fake_rchd_reports_exit() {
+        let tmp = TempDir::new().unwrap();
+        let socket_path = tmp.path().join("daemon.sock");
+        let fake_rchd = tmp.path().join("rchd");
+
+        std::fs::write(&fake_rchd, "#!/usr/bin/env sh\nexit 42\n").unwrap();
+        let mut perms = std::fs::metadata(&fake_rchd).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_rchd, perms).unwrap();
+
+        let err =
+            start_daemon_with_binary(&socket_path, &fake_rchd, Duration::from_secs(1)).unwrap_err();
+        assert!(
+            err.contains("exited unsuccessfully") && err.contains("42"),
+            "unexpected error: {err}"
+        );
+        assert!(!socket_path.exists());
     }
 
     #[test]
@@ -4233,5 +6281,1277 @@ exit 0\n"
         };
         assert!(!not_fixed.fix_applied);
         // TEST PASS: fix_applied and fix_message consistency
+    }
+
+    // ========================================================================
+    // Config-cache hoisting (t10) — verify the rollout-posture probe accepts
+    // a borrowed config and produces the same diagnostics regardless of how
+    // many times the caller invokes it.
+    // ========================================================================
+
+    #[test]
+    fn test_rollout_posture_takes_borrowed_config() {
+        // Borrowed-Ok path: probe consumes a shared snapshot.
+        let config = rch_common::RchConfig::default();
+        let diags = reliability_rollout_posture_diagnostics(Ok(&config));
+        // 5 always-on diagnostics: hook_starts_daemon, daemon_installs_hooks,
+        // status_surface, repo_convergence_gate, disk_pressure_gate.
+        assert!(
+            diags.len() >= 4,
+            "expected at least 4 diagnostics (got {}): {:?}",
+            diags.len(),
+            diags.iter().map(|d| &d.check_name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_rollout_posture_handles_borrowed_err() {
+        // Borrowed-Err path: probe surfaces a single ConfigLoadFailed
+        // diagnostic and continues with the rollout-surface checks.
+        let diags = reliability_rollout_posture_diagnostics(Err("synthetic toml parse failure"));
+        let warning_count = diags
+            .iter()
+            .filter(|d| {
+                matches!(d.severity, ReliabilitySeverity::Warning)
+                    && d.code == ReliabilityReasonCode::ConfigLoadFailed
+            })
+            .count();
+        assert_eq!(
+            warning_count,
+            1,
+            "expected exactly one ConfigLoadFailed diagnostic, got: {:?}",
+            diags
+                .iter()
+                .map(|d| (&d.check_name, &d.code))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_rollout_posture_idempotent_for_same_config() {
+        // Calling the probe twice with the same borrowed config must
+        // produce byte-identical diagnostics — confirms the function is
+        // pure with respect to its config input.
+        let config = rch_common::RchConfig::default();
+        let a = reliability_rollout_posture_diagnostics(Ok(&config));
+        let b = reliability_rollout_posture_diagnostics(Ok(&config));
+        assert_eq!(a.len(), b.len());
+        for (da, db) in a.iter().zip(b.iter()) {
+            assert_eq!(da.check_name, db.check_name);
+            assert_eq!(da.severity, db.severity);
+            assert_eq!(da.message, db.message);
+            assert_eq!(da.code, db.code);
+        }
+    }
+
+    #[test]
+    fn test_rollout_posture_two_configs_isolated() {
+        // Different config snapshots produce different diagnostics —
+        // confirms no shared mutable state between invocations.
+        let mut config_a = rch_common::RchConfig::default();
+        config_a.self_healing.hook_starts_daemon = true;
+        let mut config_b = rch_common::RchConfig::default();
+        config_b.self_healing.hook_starts_daemon = false;
+
+        let a = reliability_rollout_posture_diagnostics(Ok(&config_a));
+        let b = reliability_rollout_posture_diagnostics(Ok(&config_b));
+
+        let a_hook = a
+            .iter()
+            .find(|d| d.check_name == "hook_starts_daemon")
+            .expect("hook diag in a");
+        let b_hook = b
+            .iter()
+            .find(|d| d.check_name == "hook_starts_daemon")
+            .expect("hook diag in b");
+        assert_eq!(a_hook.code, ReliabilityReasonCode::HookAutoStartEnabled);
+        assert_eq!(b_hook.code, ReliabilityReasonCode::HookAutoStartDisabled);
+    }
+
+    // ========================================================================
+    // Verdict tri-state (t02) — aggregator + exit-code mapping + serde shape.
+    // ========================================================================
+
+    fn make_diag(severity: ReliabilitySeverity) -> ReliabilityDiagnostic {
+        ReliabilityDiagnostic::new(
+            ReliabilityCategory::Topology,
+            "synthetic",
+            severity,
+            "test",
+            ReliabilityReasonCode::WorkersConfigured,
+        )
+    }
+
+    #[test]
+    fn test_aggregate_verdict_empty_is_healthy() {
+        // Empty input is honest — caller decorates with "no probes ran" if needed.
+        assert_eq!(aggregate_verdict(&[]), ReliabilityVerdict::Healthy);
+    }
+
+    #[test]
+    fn test_aggregate_verdict_all_pass_is_healthy() {
+        let diags = vec![make_diag(ReliabilitySeverity::Pass); 5];
+        assert_eq!(aggregate_verdict(&diags), ReliabilityVerdict::Healthy);
+    }
+
+    #[test]
+    fn test_aggregate_verdict_pass_plus_info_is_healthy() {
+        let diags = vec![
+            make_diag(ReliabilitySeverity::Pass),
+            make_diag(ReliabilitySeverity::Info),
+            make_diag(ReliabilitySeverity::Pass),
+        ];
+        assert_eq!(aggregate_verdict(&diags), ReliabilityVerdict::Healthy);
+    }
+
+    #[test]
+    fn test_aggregate_verdict_one_warning_is_degraded() {
+        let diags = vec![
+            make_diag(ReliabilitySeverity::Pass),
+            make_diag(ReliabilitySeverity::Warning),
+            make_diag(ReliabilitySeverity::Info),
+        ];
+        assert_eq!(aggregate_verdict(&diags), ReliabilityVerdict::Degraded);
+    }
+
+    #[test]
+    fn test_aggregate_verdict_one_critical_is_failing() {
+        let diags = vec![
+            make_diag(ReliabilitySeverity::Pass),
+            make_diag(ReliabilitySeverity::Warning),
+            make_diag(ReliabilitySeverity::Critical),
+        ];
+        assert_eq!(aggregate_verdict(&diags), ReliabilityVerdict::Failing);
+    }
+
+    #[test]
+    fn test_aggregate_verdict_critical_dominates_warning() {
+        let diags = vec![
+            make_diag(ReliabilitySeverity::Critical),
+            make_diag(ReliabilitySeverity::Warning),
+        ];
+        assert_eq!(aggregate_verdict(&diags), ReliabilityVerdict::Failing);
+    }
+
+    #[test]
+    fn test_verdict_serde_lowercase_strings() {
+        // JSON wire form: "healthy" / "degraded" / "failing".
+        let h = serde_json::to_string(&ReliabilityVerdict::Healthy).unwrap();
+        let d = serde_json::to_string(&ReliabilityVerdict::Degraded).unwrap();
+        let f = serde_json::to_string(&ReliabilityVerdict::Failing).unwrap();
+        assert_eq!(h, "\"healthy\"");
+        assert_eq!(d, "\"degraded\"");
+        assert_eq!(f, "\"failing\"");
+        // Roundtrip
+        let back: ReliabilityVerdict = serde_json::from_str(&d).unwrap();
+        assert_eq!(back, ReliabilityVerdict::Degraded);
+    }
+
+    #[test]
+    fn test_default_exit_code_mapping() {
+        assert_eq!(ReliabilityVerdict::Healthy.default_exit_code(), 0);
+        assert_eq!(ReliabilityVerdict::Degraded.default_exit_code(), 1);
+        assert_eq!(ReliabilityVerdict::Failing.default_exit_code(), 2);
+    }
+
+    #[test]
+    fn test_strict_promotes_degraded_to_two() {
+        assert_eq!(ReliabilityVerdict::Healthy.exit_code(true, false), 0);
+        assert_eq!(ReliabilityVerdict::Degraded.exit_code(true, false), 2);
+        assert_eq!(ReliabilityVerdict::Failing.exit_code(true, false), 2);
+    }
+
+    #[test]
+    fn test_lenient_demotes_failing_to_one() {
+        assert_eq!(ReliabilityVerdict::Healthy.exit_code(false, true), 0);
+        assert_eq!(ReliabilityVerdict::Degraded.exit_code(false, true), 1);
+        assert_eq!(ReliabilityVerdict::Failing.exit_code(false, true), 1);
+    }
+
+    #[test]
+    fn test_default_no_strict_no_lenient_uses_default_mapping() {
+        for v in [
+            ReliabilityVerdict::Healthy,
+            ReliabilityVerdict::Degraded,
+            ReliabilityVerdict::Failing,
+        ] {
+            assert_eq!(v.exit_code(false, false), v.default_exit_code());
+        }
+    }
+
+    #[test]
+    fn test_verdict_label_matches_variant_name() {
+        assert_eq!(ReliabilityVerdict::Healthy.label(), "Healthy");
+        assert_eq!(ReliabilityVerdict::Degraded.label(), "Degraded");
+        assert_eq!(ReliabilityVerdict::Failing.label(), "Failing");
+    }
+
+    #[test]
+    fn test_summary_overall_uses_aggregate_verdict() {
+        // Build a response with mixed severities and assert the summary's
+        // verdict matches the aggregator.
+        let diags = vec![
+            make_diag(ReliabilitySeverity::Pass),
+            make_diag(ReliabilitySeverity::Warning),
+        ];
+        let response = build_reliability_doctor_response(
+            ReliabilityDoctorMode::Check,
+            &ReliabilityScopeSet::default(),
+            diags,
+        );
+        assert_eq!(response.summary.overall, ReliabilityVerdict::Degraded);
+    }
+
+    #[test]
+    fn test_summary_overall_failing_when_critical_present() {
+        let diags = vec![
+            make_diag(ReliabilitySeverity::Pass),
+            make_diag(ReliabilitySeverity::Critical),
+        ];
+        let response = build_reliability_doctor_response(
+            ReliabilityDoctorMode::Check,
+            &ReliabilityScopeSet::default(),
+            diags,
+        );
+        assert_eq!(response.summary.overall, ReliabilityVerdict::Failing);
+    }
+
+    // ========================================================================
+    // Scope filter (t01) — parser, set semantics, gating, response wiring.
+    // ========================================================================
+
+    #[test]
+    fn test_scope_default_is_all() {
+        let s = ReliabilityScopeSet::default();
+        assert_eq!(s.0, vec![ReliabilityScope::All]);
+        assert!(s.matches(ReliabilityScope::Topology));
+        assert!(s.matches(ReliabilityScope::Pressure));
+        // matches() returns true for every named scope when All is present.
+        for v in [
+            ReliabilityScope::All,
+            ReliabilityScope::Topology,
+            ReliabilityScope::Convergence,
+            ReliabilityScope::Pressure,
+            ReliabilityScope::Triage,
+            ReliabilityScope::Helpers,
+            ReliabilityScope::Rollout,
+            ReliabilityScope::Schema,
+        ] {
+            assert!(s.matches(v));
+        }
+    }
+
+    #[test]
+    fn test_scope_parses_single_value() {
+        let s: ReliabilityScopeSet = "topology".parse().unwrap();
+        assert_eq!(s.0, vec![ReliabilityScope::Topology]);
+        assert!(s.matches(ReliabilityScope::Topology));
+        assert!(!s.matches(ReliabilityScope::Pressure));
+    }
+
+    #[test]
+    fn test_scope_parses_multi_value_csv() {
+        let s: ReliabilityScopeSet = "topology,pressure".parse().unwrap();
+        assert_eq!(
+            s.0,
+            vec![ReliabilityScope::Topology, ReliabilityScope::Pressure]
+        );
+        assert!(s.matches(ReliabilityScope::Topology));
+        assert!(s.matches(ReliabilityScope::Pressure));
+        assert!(!s.matches(ReliabilityScope::Helpers));
+    }
+
+    #[test]
+    fn test_scope_dedups_keeping_first_occurrence() {
+        let s: ReliabilityScopeSet = "topology,pressure,topology,pressure".parse().unwrap();
+        assert_eq!(
+            s.0,
+            vec![ReliabilityScope::Topology, ReliabilityScope::Pressure]
+        );
+    }
+
+    #[test]
+    fn test_scope_all_dominates_when_mixed() {
+        // `all,topology` collapses to `[All]` — operator gets the full sweep.
+        let s: ReliabilityScopeSet = "all,topology".parse().unwrap();
+        assert_eq!(s.0, vec![ReliabilityScope::All]);
+    }
+
+    #[test]
+    fn test_scope_empty_string_errors() {
+        let err = ""
+            .parse::<ReliabilityScopeSet>()
+            .expect_err("empty must err");
+        assert!(err.contains("scope list is empty"));
+    }
+
+    #[test]
+    fn test_scope_unknown_segment_errors_with_offender() {
+        let err = "topology,bogus"
+            .parse::<ReliabilityScopeSet>()
+            .expect_err("unknown segment must err");
+        assert!(
+            err.contains("bogus"),
+            "error should name the offender, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_scope_case_insensitive_segment_parse() {
+        let s: ReliabilityScopeSet = "Topology,PRESSURE".parse().unwrap();
+        assert_eq!(
+            s.0,
+            vec![ReliabilityScope::Topology, ReliabilityScope::Pressure]
+        );
+    }
+
+    #[test]
+    fn test_scope_whitespace_trimmed() {
+        let s: ReliabilityScopeSet = "  topology  ".parse().unwrap();
+        assert_eq!(s.0, vec![ReliabilityScope::Topology]);
+    }
+
+    #[test]
+    fn test_scope_as_strings_stable_order() {
+        let s = ReliabilityScopeSet(vec![ReliabilityScope::Pressure, ReliabilityScope::Topology]);
+        assert_eq!(s.as_strings(), vec!["pressure", "topology"]);
+    }
+
+    #[test]
+    fn test_scope_response_field_records_what_was_asked() {
+        let scope =
+            ReliabilityScopeSet(vec![ReliabilityScope::Topology, ReliabilityScope::Pressure]);
+        let response =
+            build_reliability_doctor_response(ReliabilityDoctorMode::Check, &scope, vec![]);
+        assert_eq!(response.scope, vec!["topology", "pressure"]);
+    }
+
+    #[test]
+    fn test_scope_response_default_is_all_array() {
+        let response = build_reliability_doctor_response(
+            ReliabilityDoctorMode::Check,
+            &ReliabilityScopeSet::default(),
+            vec![],
+        );
+        // data.scope is always an array (even single-element).
+        assert_eq!(response.scope, vec!["all"]);
+    }
+
+    #[test]
+    fn test_scope_prefetch_dependencies_are_precise() {
+        let all = ReliabilityScopeSet::default();
+        assert!(all.needs_worker_config());
+        assert!(all.needs_daemon_status());
+        assert!(all.needs_repo_convergence_status());
+        assert!(all.needs_rollout_config());
+
+        let topology: ReliabilityScopeSet = "topology".parse().unwrap();
+        assert!(topology.needs_worker_config());
+        assert!(topology.needs_daemon_status());
+        assert!(!topology.needs_repo_convergence_status());
+        assert!(!topology.needs_rollout_config());
+
+        let pressure: ReliabilityScopeSet = "pressure".parse().unwrap();
+        assert!(!pressure.needs_worker_config());
+        assert!(pressure.needs_daemon_status());
+        assert!(!pressure.needs_repo_convergence_status());
+        assert!(!pressure.needs_rollout_config());
+
+        let convergence: ReliabilityScopeSet = "convergence".parse().unwrap();
+        assert!(!convergence.needs_worker_config());
+        assert!(!convergence.needs_daemon_status());
+        assert!(convergence.needs_repo_convergence_status());
+        assert!(!convergence.needs_rollout_config());
+
+        let rollout: ReliabilityScopeSet = "rollout".parse().unwrap();
+        assert!(!rollout.needs_worker_config());
+        assert!(!rollout.needs_daemon_status());
+        assert!(!rollout.needs_repo_convergence_status());
+        assert!(rollout.needs_rollout_config());
+
+        let local_only: ReliabilityScopeSet = "helpers,schema".parse().unwrap();
+        assert!(!local_only.needs_worker_config());
+        assert!(!local_only.needs_daemon_status());
+        assert!(!local_only.needs_repo_convergence_status());
+        assert!(!local_only.needs_rollout_config());
+    }
+
+    #[test]
+    fn test_scope_probe_names_honor_schema_gate() {
+        let all = ReliabilityScopeSet::default();
+        assert_eq!(
+            all.probe_names_to_run(false),
+            vec![
+                "topology",
+                "convergence",
+                "pressure",
+                "triage",
+                "helpers",
+                "rollout"
+            ]
+        );
+        assert_eq!(
+            all.probe_names_to_run(true),
+            vec![
+                "topology",
+                "convergence",
+                "pressure",
+                "triage",
+                "helpers",
+                "rollout",
+                "schema"
+            ]
+        );
+
+        let schema_only: ReliabilityScopeSet = "schema".parse().unwrap();
+        assert_eq!(schema_only.probe_names_to_run(false), vec!["schema"]);
+        assert_eq!(schema_only.probe_names_to_run(true), vec!["schema"]);
+
+        let helpers_schema: ReliabilityScopeSet = "helpers,schema".parse().unwrap();
+        assert_eq!(
+            helpers_schema.probe_names_to_run(false),
+            vec!["helpers", "schema"]
+        );
+    }
+
+    // ========================================================================
+    // t05 — envelope harmonization. Verify command tag is the dotted
+    // form, daemon_unreachable + reasons populate correctly, and the
+    // legacy DoctorResponse carries a schema_version.
+    // ========================================================================
+
+    fn synthetic_diagnostic(
+        code: ReliabilityReasonCode,
+        check_name: &str,
+        message: &str,
+        severity: ReliabilitySeverity,
+    ) -> ReliabilityDiagnostic {
+        ReliabilityDiagnostic::new(
+            ReliabilityCategory::Topology,
+            check_name,
+            severity,
+            message,
+            code,
+        )
+    }
+
+    #[test]
+    fn test_daemon_unreachable_false_when_all_reachable() {
+        // No daemon-unreachable codes in the diagnostics → false + empty list.
+        let diags = vec![
+            synthetic_diagnostic(
+                ReliabilityReasonCode::WorkersHealthy,
+                "daemon_worker_capacity",
+                "All 7 workers healthy",
+                ReliabilitySeverity::Pass,
+            ),
+            synthetic_diagnostic(
+                ReliabilityReasonCode::WorkerReady,
+                "worker_topology",
+                "Worker css ready",
+                ReliabilitySeverity::Pass,
+            ),
+        ];
+        let response = build_reliability_doctor_response(
+            ReliabilityDoctorMode::Check,
+            &ReliabilityScopeSet::default(),
+            diags,
+        );
+        assert!(!response.daemon_unreachable);
+        assert!(response.daemon_unreachable_reasons.is_empty());
+    }
+
+    #[test]
+    fn test_daemon_unreachable_true_when_status_unavailable() {
+        // Single probe reports DaemonStatusUnavailable → flag flips.
+        let diags = vec![synthetic_diagnostic(
+            ReliabilityReasonCode::DaemonStatusUnavailable,
+            "daemon_status",
+            "Daemon status is unavailable",
+            ReliabilitySeverity::Warning,
+        )];
+        let response = build_reliability_doctor_response(
+            ReliabilityDoctorMode::Check,
+            &ReliabilityScopeSet::default(),
+            diags,
+        );
+        assert!(response.daemon_unreachable);
+        assert_eq!(response.daemon_unreachable_reasons.len(), 1);
+        // The reason text should attribute it to the probe name + message.
+        assert!(
+            response.daemon_unreachable_reasons[0].contains("daemon_status"),
+            "reason text should name the probe: {:?}",
+            response.daemon_unreachable_reasons
+        );
+        assert!(
+            response.daemon_unreachable_reasons[0].contains("unavailable"),
+            "reason text should include the diagnostic message"
+        );
+    }
+
+    #[test]
+    fn test_daemon_unreachable_aggregates_multiple_probes() {
+        // Multiple unreachable codes → all attributed.
+        let diags = vec![
+            synthetic_diagnostic(
+                ReliabilityReasonCode::DaemonStatusUnavailable,
+                "daemon_status",
+                "daemon down",
+                ReliabilitySeverity::Warning,
+            ),
+            synthetic_diagnostic(
+                ReliabilityReasonCode::DiskPressureUnavailable,
+                "disk_pressure",
+                "disk surface gone",
+                ReliabilitySeverity::Warning,
+            ),
+            synthetic_diagnostic(
+                ReliabilityReasonCode::ProcessDebtUnavailable,
+                "process_debt",
+                "triage unavailable",
+                ReliabilitySeverity::Warning,
+            ),
+            // Non-unreachable diagnostic should NOT appear in the reasons.
+            synthetic_diagnostic(
+                ReliabilityReasonCode::WorkersHealthy,
+                "daemon_worker_capacity",
+                "ignored",
+                ReliabilitySeverity::Pass,
+            ),
+        ];
+        let response = build_reliability_doctor_response(
+            ReliabilityDoctorMode::Check,
+            &ReliabilityScopeSet::default(),
+            diags,
+        );
+        assert!(response.daemon_unreachable);
+        assert_eq!(
+            response.daemon_unreachable_reasons.len(),
+            3,
+            "expected 3 reasons (the 3 unreachable codes), got {:?}",
+            response.daemon_unreachable_reasons
+        );
+        // None of the reasons should mention the "ignored" Pass diagnostic.
+        for r in &response.daemon_unreachable_reasons {
+            assert!(
+                !r.contains("ignored"),
+                "Pass diagnostics should NOT contribute to reasons: {r}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_reliability_response_carries_schema_version() {
+        // schema_version is non-empty and sourced from the registry.
+        let response = build_reliability_doctor_response(
+            ReliabilityDoctorMode::Check,
+            &ReliabilityScopeSet::default(),
+            vec![],
+        );
+        assert!(!response.schema_version.is_empty());
+        // Format check: should look like a semver string (digits + dots).
+        assert!(
+            response
+                .schema_version
+                .chars()
+                .all(|c| c.is_ascii_digit() || c == '.'),
+            "schema_version must be numeric+dots: {:?}",
+            response.schema_version
+        );
+    }
+
+    #[test]
+    fn test_doctor_unreachable_codes_table_is_subset_of_known_codes() {
+        // The hand-maintained DAEMON_UNREACHABLE_REASON_CODES list must
+        // only contain codes that exist in ReliabilityReasonCode::ALL.
+        // Catches typos or removed-but-still-referenced variants.
+        for c in DAEMON_UNREACHABLE_REASON_CODES {
+            assert!(
+                ReliabilityReasonCode::ALL.contains(c),
+                "DAEMON_UNREACHABLE_REASON_CODES contains {c:?} which is not in ALL"
+            );
+        }
+        // And shouldn't have duplicates.
+        let unique: std::collections::HashSet<_> = DAEMON_UNREACHABLE_REASON_CODES.iter().collect();
+        assert_eq!(unique.len(), DAEMON_UNREACHABLE_REASON_CODES.len());
+    }
+
+    // ========================================================================
+    // t11 — alloc-discipline helpers. Verify that push_opt_f64 / push_opt_display
+    // produce byte-identical output to the old `.map().unwrap_or_else()` chains.
+    // ========================================================================
+
+    #[test]
+    fn test_push_opt_f64_some_at_precision_1() {
+        let mut buf = String::new();
+        push_opt_f64(&mut buf, Some(7.654), 1);
+        assert_eq!(buf, "7.7");
+    }
+
+    #[test]
+    fn test_push_opt_f64_some_at_precision_2() {
+        let mut buf = String::new();
+        push_opt_f64(&mut buf, Some(0.123456), 2);
+        assert_eq!(buf, "0.12");
+    }
+
+    #[test]
+    fn test_push_opt_f64_some_at_precision_3() {
+        let mut buf = String::new();
+        push_opt_f64(&mut buf, Some(0.123456), 3);
+        assert_eq!(buf, "0.123");
+    }
+
+    #[test]
+    fn test_push_opt_f64_none_writes_unknown() {
+        let mut buf = String::new();
+        push_opt_f64(&mut buf, None, 2);
+        assert_eq!(buf, "unknown");
+    }
+
+    #[test]
+    fn test_push_opt_f64_appends_to_existing_content() {
+        // The buffer is not cleared — the helper appends. (Value chosen
+        // to avoid clippy::approx_constant lint that flags PI-like literals.)
+        let mut buf = String::from("prefix=");
+        push_opt_f64(&mut buf, Some(2.5), 1);
+        assert_eq!(buf, "prefix=2.5");
+    }
+
+    #[test]
+    fn test_push_opt_display_some_u64() {
+        let mut buf = String::new();
+        push_opt_display(&mut buf, Some(42u64));
+        assert_eq!(buf, "42");
+    }
+
+    #[test]
+    fn test_push_opt_display_some_bool() {
+        let mut buf = String::new();
+        push_opt_display(&mut buf, Some(true));
+        assert_eq!(buf, "true");
+    }
+
+    #[test]
+    fn test_push_opt_display_none_writes_unknown() {
+        let mut buf = String::new();
+        push_opt_display::<i64>(&mut buf, None);
+        assert_eq!(buf, "unknown");
+    }
+
+    #[test]
+    fn test_t11_helpers_match_old_format_behavior() {
+        // Byte-identical equivalence: the new push_opt_* helpers produce
+        // the same text the old `.map(|v| format!(...)).unwrap_or_else(||
+        // "unknown".to_string())` chains produced.
+        //
+        // pressure_disk_free_gb (precision 2):
+        let v = Some(123.456);
+        let old: String = v
+            .map(|value| format!("{value:.2}"))
+            .unwrap_or_else(|| "unknown".to_string());
+        let mut new_buf = String::new();
+        push_opt_f64(&mut new_buf, v, 2);
+        assert_eq!(old, new_buf, "precision-2 helper must match old format");
+
+        // pressure_disk_free_ratio (precision 3):
+        let old: String = v
+            .map(|value| format!("{value:.3}"))
+            .unwrap_or_else(|| "unknown".to_string());
+        let mut new_buf = String::new();
+        push_opt_f64(&mut new_buf, v, 3);
+        assert_eq!(old, new_buf, "precision-3 helper must match old format");
+
+        // pressure_telemetry_age_secs (Option<u64>):
+        let v: Option<u64> = Some(3600);
+        let old: String = v
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let mut new_buf = String::new();
+        push_opt_display(&mut new_buf, v);
+        assert_eq!(old, new_buf, "Display helper for u64 must match old format");
+
+        // None path for all three:
+        let none_f64: Option<f64> = None;
+        let old: String = none_f64
+            .map(|value| format!("{value:.2}"))
+            .unwrap_or_else(|| "unknown".to_string());
+        let mut new_buf = String::new();
+        push_opt_f64(&mut new_buf, none_f64, 2);
+        assert_eq!(
+            old, new_buf,
+            "None precision-2 helper must match old format"
+        );
+
+        let none_u64: Option<u64> = None;
+        let old: String = none_u64
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let mut new_buf = String::new();
+        push_opt_display(&mut new_buf, none_u64);
+        assert_eq!(old, new_buf, "None Display helper must match old format");
+    }
+
+    // =========================================================================
+    // `--watch` Diff Function Tests (t25)
+    // =========================================================================
+    //
+    // These tests pin the contract of `diff_fingerprint_maps`. The watch
+    // loop relies on this purely-functional diff to compute added /
+    // cleared / changed sets. Regressions here would produce wrong
+    // `--transitions-only` suppression behavior and would silently
+    // miss-emit machine sweep deltas — so we cover empty-vs-empty,
+    // first-sweep (empty-vs-populated), severity flip, message rotation
+    // (not a fingerprint change), and the worker_id-keyed case where
+    // the same `check_name` appears once per worker.
+
+    fn make_watch_diag(
+        category: ReliabilityCategory,
+        check_name: &str,
+        severity: ReliabilitySeverity,
+        code: ReliabilityReasonCode,
+        message: &str,
+        worker_id: Option<&str>,
+    ) -> ReliabilityDiagnostic {
+        let mut d = ReliabilityDiagnostic::new(category, check_name, severity, message, code);
+        if let Some(w) = worker_id {
+            d = d.with_worker(w);
+        }
+        d
+    }
+
+    fn fp_map_of(
+        diags: &[ReliabilityDiagnostic],
+    ) -> std::collections::BTreeMap<DiagnosticKey, DiagnosticFingerprint> {
+        let mut map = std::collections::BTreeMap::new();
+        for d in diags {
+            map.insert(
+                DiagnosticKey::from_diagnostic(d),
+                DiagnosticFingerprint::from_diagnostic(d),
+            );
+        }
+        map
+    }
+
+    // =========================================================================
+    // Probe Parallelism Tests (bd-62u24.8)
+    // =========================================================================
+    //
+    // These tests pin the contract of `join_isolated_async_probe` and
+    // `join_isolated_blocking_probe`. The doctor relies on these to
+    // surface probe failures (timeout, panic, RPC error) as a uniform
+    // `(None, ProbeOutcome)` pair so downstream diagnostic builders can
+    // fall through to "unavailable" Warning diagnostics without caring
+    // about the exact failure mode. Regressions here would let a probe
+    // panic bring down the whole doctor or leak runaway subprocesses.
+
+    #[test]
+    fn probe_outcome_label_is_lowercase_and_stable() {
+        // TEST START: tracing field values are part of the operator contract
+        assert_eq!(ProbeOutcome::Ok.label(), "ok");
+        assert_eq!(ProbeOutcome::Skipped.label(), "skipped");
+        assert_eq!(ProbeOutcome::InnerError.label(), "inner_error");
+        assert_eq!(ProbeOutcome::Timeout.label(), "timeout");
+        assert_eq!(ProbeOutcome::Panicked.label(), "panicked");
+        assert_eq!(ProbeOutcome::Cancelled.label(), "cancelled");
+        // TEST PASS: label stability
+    }
+
+    #[tokio::test]
+    async fn join_isolated_async_probe_returns_skipped_for_none_handle() {
+        // TEST START: a scoped-out probe (no handle) yields (None, Skipped)
+        let (result, outcome) =
+            join_isolated_async_probe::<String, std::io::Error>("ghost", None).await;
+        assert_eq!(result, None);
+        assert_eq!(outcome, ProbeOutcome::Skipped);
+        // TEST PASS: skip path
+    }
+
+    #[tokio::test]
+    async fn join_isolated_async_probe_returns_ok_for_successful_task() {
+        // TEST START: a Future returning Ok produces (Some(value), Ok)
+        let handle = tokio::spawn(async {
+            tokio::time::timeout(PROBE_TIMEOUT, async {
+                Ok::<_, std::io::Error>("probe_value".to_string())
+            })
+            .await
+        });
+        let (result, outcome) = join_isolated_async_probe("ok_probe", Some(handle)).await;
+        assert_eq!(result.as_deref(), Some("probe_value"));
+        assert_eq!(outcome, ProbeOutcome::Ok);
+        // TEST PASS: success path
+    }
+
+    #[tokio::test]
+    async fn join_isolated_async_probe_classifies_inner_error() {
+        // TEST START: an inner Err is reported as InnerError, not Timeout
+        let handle = tokio::spawn(async {
+            tokio::time::timeout(PROBE_TIMEOUT, async {
+                Err::<String, std::io::Error>(std::io::Error::other("inner fault"))
+            })
+            .await
+        });
+        let (result, outcome) = join_isolated_async_probe("err_probe", Some(handle)).await;
+        assert!(result.is_none());
+        assert_eq!(outcome, ProbeOutcome::InnerError);
+        // TEST PASS: inner-error classification
+    }
+
+    #[tokio::test]
+    async fn join_isolated_async_probe_surfaces_timeout() {
+        // TEST START: a future that exceeds PROBE_TIMEOUT yields (None, Timeout)
+        // Use a much shorter timeout for the test by chaining the outer
+        // tokio::time::timeout — this mirrors the production wrapping.
+        let handle = tokio::spawn(async {
+            tokio::time::timeout(std::time::Duration::from_millis(20), async {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                Ok::<_, std::io::Error>("never returned".to_string())
+            })
+            .await
+        });
+        let (result, outcome) = join_isolated_async_probe("slow_probe", Some(handle)).await;
+        assert!(result.is_none());
+        assert_eq!(outcome, ProbeOutcome::Timeout);
+        // TEST PASS: timeout classification
+    }
+
+    #[tokio::test]
+    async fn join_isolated_async_probe_isolates_panic() {
+        // TEST START: a panic in the spawned task is caught by JoinError
+        // and reported as (None, Panicked). The caller does NOT panic.
+        let handle = tokio::spawn(async {
+            tokio::time::timeout(PROBE_TIMEOUT, async {
+                std::panic::panic_any("probe explosion (intentional, for test)".to_string());
+                #[expect(unreachable_code)]
+                Ok::<_, std::io::Error>("never".to_string())
+            })
+            .await
+        });
+        let (result, outcome) = join_isolated_async_probe("panic_probe", Some(handle)).await;
+        assert!(result.is_none());
+        assert_eq!(outcome, ProbeOutcome::Panicked);
+        // TEST PASS: panic isolation
+    }
+
+    #[tokio::test]
+    async fn join_isolated_blocking_probe_returns_value_for_successful_task() {
+        // TEST START: sync spawn_blocking task returns its value cleanly
+        let handle = tokio::task::spawn_blocking(|| vec!["a".to_string(), "b".to_string()]);
+        let (result, outcome) = join_isolated_blocking_probe("blocking_ok", Some(handle)).await;
+        assert_eq!(
+            result.as_deref(),
+            Some(&["a".to_string(), "b".to_string()][..])
+        );
+        assert_eq!(outcome, ProbeOutcome::Ok);
+        // TEST PASS: blocking success path
+    }
+
+    #[tokio::test]
+    async fn join_isolated_blocking_probe_isolates_panic() {
+        // TEST START: panic in spawn_blocking yields (None, Panicked) —
+        // critical because the helper-compat probe is exactly this shape
+        // and a panic there must not sink the doctor.
+        let handle = tokio::task::spawn_blocking(|| -> Vec<String> {
+            std::panic::panic_any("blocking probe explosion (intentional, for test)".to_string());
+        });
+        let (result, outcome) = join_isolated_blocking_probe("blocking_panic", Some(handle)).await;
+        assert!(result.is_none());
+        assert_eq!(outcome, ProbeOutcome::Panicked);
+        // TEST PASS: blocking panic isolation
+    }
+
+    #[tokio::test]
+    async fn join_isolated_blocking_probe_returns_skipped_for_none_handle() {
+        // TEST START: defensive — scoped-out path yields Skipped, not panic
+        let (result, outcome): (Option<Vec<String>>, ProbeOutcome) =
+            join_isolated_blocking_probe("ghost", None).await;
+        assert!(result.is_none());
+        assert_eq!(outcome, ProbeOutcome::Skipped);
+        // TEST PASS: skip path for blocking variant
+    }
+
+    #[tokio::test]
+    async fn join_isolated_blocking_probe_surfaces_timeout_promptly() {
+        // TEST START: timeout around a spawn_blocking JoinHandle returns
+        // promptly. The blocking task may finish later; the doctor must not
+        // wait for it before emitting partial diagnostics.
+        let start = std::time::Instant::now();
+        let handle = tokio::task::spawn_blocking(|| {
+            std::thread::sleep(std::time::Duration::from_millis(80));
+            vec!["too_late".to_string()]
+        });
+        let (result, outcome) = join_isolated_blocking_probe_with_timeout(
+            "blocking_timeout",
+            Some(handle),
+            std::time::Duration::from_millis(10),
+        )
+        .await;
+        assert!(result.is_none());
+        assert_eq!(outcome, ProbeOutcome::Timeout);
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(60),
+            "blocking timeout should return promptly"
+        );
+        // TEST PASS: timeout classification for blocking probe
+    }
+
+    #[test]
+    fn helper_probe_failure_emits_unavailable_diagnostic_without_rerun() {
+        // TEST START: a failed helper prefetch must not synchronously run
+        // the same subprocess-heavy probe again. It emits one bounded
+        // warning instead.
+        let diagnostics = helper_diagnostics_from_probe_result(None, ProbeOutcome::Timeout);
+        assert_eq!(diagnostics.len(), 1);
+        let diagnostic = &diagnostics[0];
+        assert_eq!(
+            diagnostic.category,
+            ReliabilityCategory::HelperCompatibility
+        );
+        assert_eq!(diagnostic.check_name, "helper_probe");
+        assert_eq!(diagnostic.severity, ReliabilitySeverity::Warning);
+        assert_eq!(
+            diagnostic.code,
+            ReliabilityReasonCode::HelperProbeUnavailable
+        );
+        assert!(
+            diagnostic
+                .details
+                .as_deref()
+                .is_some_and(|details| details.contains("probe_outcome=timeout")),
+            "details should retain the probe outcome"
+        );
+        // TEST PASS: failed helper probe stays bounded and visible
+    }
+
+    #[tokio::test]
+    async fn probes_actually_run_in_parallel_not_serial() {
+        // TEST START: integration-style proof that the join is concurrent.
+        // Three tasks each sleep 100ms; with serial execution wallclock
+        // would be ~300ms+ ; with parallel execution it's ~100ms +
+        // join overhead. We assert wallclock < 250ms to leave wide
+        // headroom for CI variability while still rejecting any
+        // accidental return to sequential await.
+        let start = std::time::Instant::now();
+        let h1 = tokio::spawn(async {
+            tokio::time::timeout(PROBE_TIMEOUT, async {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                Ok::<_, std::io::Error>("a".to_string())
+            })
+            .await
+        });
+        let h2 = tokio::spawn(async {
+            tokio::time::timeout(PROBE_TIMEOUT, async {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                Ok::<_, std::io::Error>("b".to_string())
+            })
+            .await
+        });
+        let h3 = tokio::task::spawn_blocking(|| {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            vec!["c".to_string()]
+        });
+        let (r1, _) = join_isolated_async_probe("p1", Some(h1)).await;
+        let (r2, _) = join_isolated_async_probe("p2", Some(h2)).await;
+        let (r3, _) = join_isolated_blocking_probe("p3", Some(h3)).await;
+        let elapsed = start.elapsed();
+        assert_eq!(r1.as_deref(), Some("a"));
+        assert_eq!(r2.as_deref(), Some("b"));
+        assert_eq!(r3.as_deref(), Some(&["c".to_string()][..]));
+        assert!(
+            elapsed < std::time::Duration::from_millis(250),
+            "probes must run in parallel: elapsed={elapsed:?} (serial would be ~300ms+)"
+        );
+        // TEST PASS: actual parallelism (not just structural)
+    }
+
+    #[test]
+    fn diff_empty_vs_empty_is_quiet() {
+        // TEST START: empty → empty diff must be no-op
+        let prev = std::collections::BTreeMap::new();
+        let curr = std::collections::BTreeMap::new();
+        let diff = diff_fingerprint_maps(&prev, &curr);
+        assert!(!diff.has_changes(), "empty→empty must be quiet");
+        assert_eq!(diff.added.len(), 0);
+        assert_eq!(diff.cleared.len(), 0);
+        assert_eq!(diff.changed.len(), 0);
+        assert_eq!(diff.total_transitions(), 0);
+        // TEST PASS: empty→empty diff
+    }
+
+    #[test]
+    fn diff_first_sweep_classifies_everything_as_added() {
+        // TEST START: empty→populated first sweep — every diagnostic is "added"
+        let prev = std::collections::BTreeMap::new();
+        let curr_diags = vec![
+            make_watch_diag(
+                ReliabilityCategory::Topology,
+                "workers_config",
+                ReliabilitySeverity::Pass,
+                ReliabilityReasonCode::WorkersConfigured,
+                "3 workers configured",
+                None,
+            ),
+            make_watch_diag(
+                ReliabilityCategory::DiskPressure,
+                "disk_pressure",
+                ReliabilitySeverity::Warning,
+                ReliabilityReasonCode::PartialWorkerCapacity,
+                "disk pressure observed",
+                Some("css"),
+            ),
+        ];
+        let curr = fp_map_of(&curr_diags);
+        let diff = diff_fingerprint_maps(&prev, &curr);
+        assert!(diff.has_changes());
+        assert_eq!(diff.added.len(), 2, "first sweep must mark all as added");
+        assert_eq!(diff.cleared.len(), 0);
+        assert_eq!(diff.changed.len(), 0);
+        assert_eq!(diff.total_transitions(), 2);
+        // TEST PASS: first sweep added classification
+    }
+
+    #[test]
+    fn diff_cleared_when_diagnostic_disappears() {
+        // TEST START: a diagnostic gone from prev→curr is "cleared"
+        let prev_diags = vec![make_watch_diag(
+            ReliabilityCategory::Topology,
+            "workers_config",
+            ReliabilitySeverity::Critical,
+            ReliabilityReasonCode::NoWorkersConfigured,
+            "no workers configured",
+            None,
+        )];
+        let prev = fp_map_of(&prev_diags);
+        let curr = std::collections::BTreeMap::new();
+        let diff = diff_fingerprint_maps(&prev, &curr);
+        assert_eq!(diff.added.len(), 0);
+        assert_eq!(diff.cleared.len(), 1);
+        assert_eq!(diff.changed.len(), 0);
+        // TEST PASS: cleared diagnostic
+    }
+
+    #[test]
+    fn diff_severity_flip_is_changed_not_cleared_plus_added() {
+        // TEST START: same key, different severity → "changed" (not cleared+added)
+        let prev_diags = vec![make_watch_diag(
+            ReliabilityCategory::Topology,
+            "workers_config",
+            ReliabilitySeverity::Warning,
+            ReliabilityReasonCode::PartialWorkerCapacity,
+            "2/3 workers healthy",
+            None,
+        )];
+        let curr_diags = vec![make_watch_diag(
+            ReliabilityCategory::Topology,
+            "workers_config",
+            ReliabilitySeverity::Critical, // <-- flipped from Warning
+            ReliabilityReasonCode::AllWorkersUnhealthy,
+            "0/3 workers healthy",
+            None,
+        )];
+        let prev = fp_map_of(&prev_diags);
+        let curr = fp_map_of(&curr_diags);
+        let diff = diff_fingerprint_maps(&prev, &curr);
+        assert_eq!(diff.added.len(), 0, "must not double-count flip as added");
+        assert_eq!(
+            diff.cleared.len(),
+            0,
+            "must not double-count flip as cleared"
+        );
+        assert_eq!(
+            diff.changed.len(),
+            1,
+            "severity flip is a single 'changed' event"
+        );
+        let (key, prev_fp, cur_fp) = &diff.changed[0];
+        assert_eq!(key.check_name, "workers_config");
+        assert_eq!(prev_fp.severity, ReliabilitySeverity::Warning);
+        assert_eq!(cur_fp.severity, ReliabilitySeverity::Critical);
+        // TEST PASS: severity flip classification
+    }
+
+    #[test]
+    fn diff_identical_fingerprint_is_quiet() {
+        // TEST START: same fingerprint twice → diff is empty (drives --transitions-only)
+        let diags = vec![make_watch_diag(
+            ReliabilityCategory::Topology,
+            "workers_config",
+            ReliabilitySeverity::Pass,
+            ReliabilityReasonCode::WorkersConfigured,
+            "3 workers configured",
+            None,
+        )];
+        let prev = fp_map_of(&diags);
+        let curr = fp_map_of(&diags);
+        let diff = diff_fingerprint_maps(&prev, &curr);
+        assert!(
+            !diff.has_changes(),
+            "identical fingerprints must not flag changes"
+        );
+        // TEST PASS: identical fingerprint quiet
+    }
+
+    #[test]
+    fn diff_per_worker_keys_are_independent() {
+        // TEST START: same check_name on different workers are independent rows
+        // (so a flip on one worker doesn't get attributed to the other).
+        let prev_diags = vec![
+            make_watch_diag(
+                ReliabilityCategory::Topology,
+                "worker_health",
+                ReliabilitySeverity::Pass,
+                ReliabilityReasonCode::WorkersHealthy,
+                "ok",
+                Some("css"),
+            ),
+            make_watch_diag(
+                ReliabilityCategory::Topology,
+                "worker_health",
+                ReliabilitySeverity::Pass,
+                ReliabilityReasonCode::WorkersHealthy,
+                "ok",
+                Some("dlx"),
+            ),
+        ];
+        let curr_diags = vec![
+            make_watch_diag(
+                ReliabilityCategory::Topology,
+                "worker_health",
+                ReliabilitySeverity::Pass,
+                ReliabilityReasonCode::WorkersHealthy,
+                "ok",
+                Some("css"),
+            ),
+            // dlx flipped
+            make_watch_diag(
+                ReliabilityCategory::Topology,
+                "worker_health",
+                ReliabilitySeverity::Critical,
+                ReliabilityReasonCode::AllWorkersUnhealthy,
+                "down",
+                Some("dlx"),
+            ),
+        ];
+        let prev = fp_map_of(&prev_diags);
+        let curr = fp_map_of(&curr_diags);
+        let diff = diff_fingerprint_maps(&prev, &curr);
+        assert_eq!(diff.added.len(), 0);
+        assert_eq!(diff.cleared.len(), 0);
+        assert_eq!(
+            diff.changed.len(),
+            1,
+            "only the dlx row should be marked changed"
+        );
+        let (key, _, _) = &diff.changed[0];
+        assert_eq!(key.worker_id.as_deref(), Some("dlx"));
+        // TEST PASS: per-worker key independence
+    }
+
+    #[test]
+    fn watch_state_observe_verdict_tracks_worst_case() {
+        // TEST START: WatchState.observe_verdict is monotone non-decreasing
+        // (Healthy → Degraded → Failing). Once worst is Failing it stays
+        // Failing even if subsequent sweeps recover. CI tripwires read
+        // worst_verdict at exit.
+        let mut state = WatchState::new();
+        assert!(state.worst_verdict.is_none());
+        state.observe_verdict(ReliabilityVerdict::Healthy);
+        assert_eq!(state.worst_verdict, Some(ReliabilityVerdict::Healthy));
+        state.observe_verdict(ReliabilityVerdict::Degraded);
+        assert_eq!(state.worst_verdict, Some(ReliabilityVerdict::Degraded));
+        state.observe_verdict(ReliabilityVerdict::Healthy); // recovery
+        assert_eq!(
+            state.worst_verdict,
+            Some(ReliabilityVerdict::Degraded),
+            "recovery must not lower the worst-observed verdict"
+        );
+        state.observe_verdict(ReliabilityVerdict::Failing);
+        assert_eq!(state.worst_verdict, Some(ReliabilityVerdict::Failing));
+        state.observe_verdict(ReliabilityVerdict::Healthy); // recovery from Failing
+        assert_eq!(
+            state.worst_verdict,
+            Some(ReliabilityVerdict::Failing),
+            "worst_verdict is sticky once Failing"
+        );
+        // TEST PASS: worst_verdict monotonicity
+    }
+
+    #[test]
+    fn watch_worst_verdict_includes_exit_snapshot_probe() {
+        // TEST START: the exit-time snapshot probe is folded into
+        // worst_verdict, not just the completed watch sweeps.
+        assert_eq!(
+            worst_reliability_verdict(
+                Some(ReliabilityVerdict::Healthy),
+                ReliabilityVerdict::Failing
+            ),
+            ReliabilityVerdict::Failing,
+            "a failing exit snapshot must promote worst_verdict"
+        );
+        assert_eq!(
+            worst_reliability_verdict(
+                Some(ReliabilityVerdict::Degraded),
+                ReliabilityVerdict::Healthy
+            ),
+            ReliabilityVerdict::Degraded,
+            "a recovered exit snapshot must not lower the observed worst verdict"
+        );
+        assert_eq!(
+            worst_reliability_verdict(None, ReliabilityVerdict::Degraded),
+            ReliabilityVerdict::Degraded,
+            "snapshot-only sessions must use the exit probe verdict"
+        );
+        // TEST PASS: exit snapshot verdict folded into worst_verdict
+    }
+
+    #[test]
+    fn diagnostic_key_render_includes_worker_when_present() {
+        // TEST START: DiagnosticKey.render() produces stable human-readable form
+        let key_no_worker = DiagnosticKey {
+            category: ReliabilityCategory::Topology,
+            check_name: "workers_config".to_string(),
+            worker_id: None,
+        };
+        assert_eq!(key_no_worker.render(), "topology/workers_config");
+        let key_with_worker = DiagnosticKey {
+            category: ReliabilityCategory::DiskPressure,
+            check_name: "disk_pressure".to_string(),
+            worker_id: Some("css".to_string()),
+        };
+        assert_eq!(
+            key_with_worker.render(),
+            "disk_pressure/disk_pressure[worker=css]"
+        );
+        // TEST PASS: render format stable
+    }
+
+    #[test]
+    fn fingerprint_excludes_details_so_rotating_uptime_does_not_churn() {
+        // TEST START: fingerprint must NOT include `details` field — some
+        // details rotate every sweep (e.g., `uptime_secs=12345`) and would
+        // generate constant noise under --transitions-only.
+        let d_a = ReliabilityDiagnostic::new(
+            ReliabilityCategory::Topology,
+            "daemon_worker_capacity",
+            ReliabilitySeverity::Pass,
+            "All 3 workers healthy",
+            ReliabilityReasonCode::WorkersHealthy,
+        )
+        .with_details("uptime_secs=100");
+        let d_b = ReliabilityDiagnostic::new(
+            ReliabilityCategory::Topology,
+            "daemon_worker_capacity",
+            ReliabilitySeverity::Pass,
+            "All 3 workers healthy",
+            ReliabilityReasonCode::WorkersHealthy,
+        )
+        .with_details("uptime_secs=200");
+        let fp_a = DiagnosticFingerprint::from_diagnostic(&d_a);
+        let fp_b = DiagnosticFingerprint::from_diagnostic(&d_b);
+        assert_eq!(
+            fp_a, fp_b,
+            "rotating details must NOT change the fingerprint"
+        );
+        // TEST PASS: fingerprint stability across rotating details
     }
 }

@@ -26,7 +26,6 @@ schemars = { workspace = true }
 rch-telemetry = { path = "../rch-telemetry", default-features = false }
 
 [dev-dependencies]
-ctor = { workspace = true }
 tempfile = "3.25.0"
 
 [lints.rust]

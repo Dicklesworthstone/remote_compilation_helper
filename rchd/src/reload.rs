@@ -252,7 +252,7 @@ pub async fn apply_worker_diff(pool: &WorkerPool, diff: &ConfigDiff) -> Result<R
                     "Worker {} has {} active slots, marking for drain instead of removal",
                     id, used_slots
                 );
-                worker.drain().await;
+                worker.drain_for_removal().await;
                 result.warnings.push(format!(
                     "Worker {} has active jobs, draining instead of removing",
                     id

@@ -4,7 +4,6 @@
 use crate::error::PlatformError;
 use crate::error::{DaemonError, SshError};
 use anyhow::{Context, Result};
-use directories::ProjectDirs;
 use rch_common::{RequiredRuntime, WorkerConfig, WorkerId};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -16,6 +15,8 @@ use tokio::net::UnixStream;
 const DAEMON_COMMAND_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 #[cfg(unix)]
 const DAEMON_COMMAND_IO_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(unix)]
+const DAEMON_CAPABILITIES_REFRESH_RESPONSE_TIMEOUT: Duration = Duration::from_secs(90);
 
 // ============================================================================
 // Path helpers
@@ -23,8 +24,19 @@ const DAEMON_COMMAND_IO_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Get the default socket path.
 /// Uses XDG_RUNTIME_DIR if available, falls back to ~/.cache/rch/rch.sock, then /tmp/rch.sock.
+#[cfg(test)]
 pub fn default_socket_path() -> String {
     rch_common::default_socket_path()
+}
+
+/// Resolve the daemon socket path from the active RCH configuration.
+///
+/// Commands that talk to `rchd` must use this instead of the compiled-in
+/// default; otherwise a custom `general.socket_path` can start the daemon on
+/// one socket while hooks and status commands query another.
+pub(crate) fn configured_socket_path() -> Result<String> {
+    let config = crate::config::load_config()?;
+    Ok(shellexpand::tilde(&config.general.socket_path).into_owned())
 }
 
 // ============================================================================
@@ -508,6 +520,47 @@ mod tests {
         assert_eq!(urlencoding_encode("hello world"), "hello%20world");
         assert_eq!(urlencoding_encode("a/b?c=d"), "a%2Fb%3Fc%3Dd");
     }
+
+    #[test]
+    fn configured_socket_path_uses_active_config() -> Result<()> {
+        let _guard = rch_common::test_guard!();
+        struct ResetConfigOverride;
+        impl Drop for ResetConfigOverride {
+            fn drop(&mut self) {
+                crate::config::set_test_config_override(None);
+            }
+        }
+
+        let mut config = rch_common::RchConfig::default();
+        config.general.socket_path = "/tmp/rch-custom-test.sock".to_string();
+        crate::config::set_test_config_override(Some(config));
+        let _reset = ResetConfigOverride;
+
+        let socket_path = configured_socket_path().context("configured socket path")?;
+
+        assert_eq!(socket_path, "/tmp/rch-custom-test.sock");
+        Ok(())
+    }
+
+    #[test]
+    fn toml_u32_field_accepts_valid_unsigned_range() -> Result<()> {
+        let entry: toml::Value =
+            toml::from_str("total_slots = 12\npriority = 42\n").context("parse worker toml")?;
+
+        assert_eq!(toml_u32_field_or(&entry, "total_slots", 8), 12);
+        assert_eq!(toml_u32_field_or(&entry, "priority", 100), 42);
+        Ok(())
+    }
+
+    #[test]
+    fn toml_u32_field_rejects_negative_and_overflow_values() -> Result<()> {
+        let entry: toml::Value = toml::from_str("total_slots = -1\npriority = 4294967296\n")
+            .context("parse worker toml")?;
+
+        assert_eq!(toml_u32_field_or(&entry, "total_slots", 8), 8);
+        assert_eq!(toml_u32_field_or(&entry, "priority", 100), 100);
+        Ok(())
+    }
 }
 
 // ============================================================================
@@ -522,7 +575,7 @@ pub fn config_dir() -> Option<PathBuf> {
     if let Some(dir) = test_config_dir_override() {
         return Some(dir);
     }
-    ProjectDirs::from("com", "rch", "rch").map(|dirs| dirs.config_dir().to_path_buf())
+    crate::config::config_dir()
 }
 
 #[cfg(test)]
@@ -597,14 +650,8 @@ pub fn load_workers_from_config() -> Result<Vec<WorkerConfig>> {
             .get("identity_file")
             .and_then(|v| v.as_str())
             .unwrap_or("~/.ssh/id_rsa");
-        let total_slots = entry
-            .get("total_slots")
-            .and_then(|v| v.as_integer())
-            .unwrap_or(8) as u32;
-        let priority = entry
-            .get("priority")
-            .and_then(|v| v.as_integer())
-            .unwrap_or(100) as u32;
+        let total_slots = toml_u32_field_or(entry, "total_slots", 8);
+        let priority = toml_u32_field_or(entry, "priority", 100);
         let tags: Vec<String> = entry
             .get("tags")
             .and_then(|v| v.as_array())
@@ -629,6 +676,14 @@ pub fn load_workers_from_config() -> Result<Vec<WorkerConfig>> {
     Ok(workers)
 }
 
+fn toml_u32_field_or(entry: &toml::Value, key: &str, default: u32) -> u32 {
+    entry
+        .get(key)
+        .and_then(|value| value.as_integer())
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or(default)
+}
+
 // ============================================================================
 // Daemon communication helpers
 // ============================================================================
@@ -644,9 +699,8 @@ pub async fn send_daemon_command(_command: &str) -> Result<String> {
 /// Helper to send command to daemon socket.
 #[cfg(unix)]
 pub async fn send_daemon_command(command: &str) -> Result<String> {
-    let config = crate::config::load_config()?;
-    let expanded = shellexpand::tilde(&config.general.socket_path);
-    let socket_path = Path::new(expanded.as_ref());
+    let socket_path_str = configured_socket_path()?;
+    let socket_path = Path::new(&socket_path_str);
     if !socket_path.exists() {
         return Err(DaemonError::SocketNotFound {
             socket_path: socket_path.display().to_string(),
@@ -677,14 +731,40 @@ async fn send_daemon_command_to_socket(socket_path: &Path, command: &str) -> Res
 
     let mut reader = BufReader::new(reader);
     let mut response = String::new();
-    tokio::time::timeout(
-        DAEMON_COMMAND_IO_TIMEOUT,
-        reader.read_to_string(&mut response),
-    )
-    .await
-    .context("Timed out waiting for daemon response")??;
+    let response_timeout = daemon_command_response_timeout(command);
+    tokio::time::timeout(response_timeout, reader.read_to_string(&mut response))
+        .await
+        .context("Timed out waiting for daemon response")??;
 
     Ok(response)
+}
+
+#[cfg(unix)]
+fn daemon_command_response_timeout(command: &str) -> Duration {
+    if daemon_command_is_capabilities_refresh(command) {
+        DAEMON_CAPABILITIES_REFRESH_RESPONSE_TIMEOUT
+    } else {
+        DAEMON_COMMAND_IO_TIMEOUT
+    }
+}
+
+#[cfg(unix)]
+fn daemon_command_is_capabilities_refresh(command: &str) -> bool {
+    let request_target = command
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .unwrap_or("");
+    let Some(query) = request_target.strip_prefix("/workers/capabilities?") else {
+        return false;
+    };
+
+    query.split('&').any(|param| {
+        let mut kv = param.splitn(2, '=');
+        let key = kv.next().unwrap_or("");
+        let value = kv.next().unwrap_or("");
+        key == "refresh" && (value == "1" || value.eq_ignore_ascii_case("true"))
+    })
 }
 
 #[cfg(all(test, unix))]
@@ -731,5 +811,33 @@ mod daemon_command_tests {
         assert!(response.contains("\"ok\":true"));
         server.await.context("server task")??;
         Ok(())
+    }
+
+    #[test]
+    fn capabilities_refresh_command_gets_extended_response_timeout() {
+        assert_eq!(
+            daemon_command_response_timeout("GET /workers/capabilities?refresh=true\n"),
+            DAEMON_CAPABILITIES_REFRESH_RESPONSE_TIMEOUT
+        );
+        assert_eq!(
+            daemon_command_response_timeout("GET /workers/capabilities?worker=all&refresh=1\n"),
+            DAEMON_CAPABILITIES_REFRESH_RESPONSE_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn ordinary_daemon_commands_keep_default_response_timeout() {
+        assert_eq!(
+            daemon_command_response_timeout("GET /workers/capabilities\n"),
+            DAEMON_COMMAND_IO_TIMEOUT
+        );
+        assert_eq!(
+            daemon_command_response_timeout("GET /workers/capabilities?refresh=false\n"),
+            DAEMON_COMMAND_IO_TIMEOUT
+        );
+        assert_eq!(
+            daemon_command_response_timeout("GET /status\n"),
+            DAEMON_COMMAND_IO_TIMEOUT
+        );
     }
 }

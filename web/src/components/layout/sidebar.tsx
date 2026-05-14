@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
+import { useEffect, useState, useRef, useSyncExternalStore } from 'react';
 import { Server, History, Settings, Activity, Home, Menu, X, Sun, Moon } from 'lucide-react';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
@@ -18,9 +18,17 @@ const navItems = [
 ];
 
 const STORAGE_KEY = 'rch.sidebar.open';
-const subscribeMounted = () => () => {};
-const getClientSnapshot = () => true;
-const getServerSnapshot = () => false;
+function subscribeToMount(): () => void {
+  return () => {};
+}
+
+function getMountedSnapshot(): boolean {
+  return true;
+}
+
+function getServerMountedSnapshot(): boolean {
+  return false;
+}
 
 interface SidebarContentProps {
   pathname: string;
@@ -87,9 +95,9 @@ function SidebarContent({ pathname, onNavigate, variant }: SidebarContentProps) 
 function ThemeToggle() {
   const { resolvedTheme, setTheme } = useTheme();
   const mounted = useSyncExternalStore(
-    subscribeMounted,
-    getClientSnapshot,
-    getServerSnapshot
+    subscribeToMount,
+    getMountedSnapshot,
+    getServerMountedSnapshot
   );
 
   const isDark = resolvedTheme === 'dark';

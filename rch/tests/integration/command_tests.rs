@@ -177,18 +177,35 @@ fn test_doctor_reliability_json_outputs_real_binary_response() {
         .output()
         .expect("Failed to run rch doctor --reliability --check-schemas --json");
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success(),
-        "rch doctor --reliability should exit successfully; status={:?}\nstdout:\n{}\nstderr:\n{}",
-        output.status.code(),
-        stdout,
-        stderr
-    );
-
     let parsed: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("reliability doctor should output JSON");
+    assert_eq!(
+        parsed.pointer("/success").and_then(|value| value.as_bool()),
+        Some(true)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let overall = parsed
+        .pointer("/data/summary/overall")
+        .and_then(|value| value.as_str())
+        .expect("reliability doctor should report an overall verdict");
+    let expected_exit = match overall {
+        "healthy" => Some(0),
+        "degraded" => Some(1),
+        "failing" => Some(2),
+        _ => None,
+    };
+    assert!(
+        expected_exit.is_some(),
+        "unexpected reliability verdict: {overall}"
+    );
+    assert_eq!(
+        output.status.code(),
+        expected_exit,
+        "rch doctor --reliability should use the documented exit code for verdict {overall}; stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
     assert_eq!(
         parsed
             .pointer("/data/schema_version")
@@ -628,6 +645,59 @@ fn test_config_validate_help() {
 
     assert!(output.status.success(), "rch config validate --help failed");
     crate::test_log!("TEST PASS: test_config_validate_help");
+}
+
+// =============================================================================
+// Error Catalog Command Tests
+// =============================================================================
+
+#[test]
+fn test_error_list_unknown_category_fails() {
+    init_test_logging();
+    crate::test_log!("TEST START: test_error_list_unknown_category_fails");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_rch"))
+        .args(["error", "list", "--category", "nonexistent_category"])
+        .output()
+        .expect("Failed to run rch error list");
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "unknown category should be a usage error"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_contains(&stderr, "Unknown error category");
+    assert_contains(&stderr, "disk_pressure");
+    crate::test_log!("TEST PASS: test_error_list_unknown_category_fails");
+}
+
+#[test]
+fn test_error_list_unknown_category_json_fails_with_remediation() {
+    init_test_logging();
+    crate::test_log!("TEST START: test_error_list_unknown_category_json_fails_with_remediation");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_rch"))
+        .args([
+            "error",
+            "list",
+            "--category",
+            "nonexistent_category",
+            "--json",
+        ])
+        .output()
+        .expect("Failed to run rch error list --json");
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "unknown category should be a usage error"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_contains(&stdout, "\"success\": false");
+    assert_contains(&stdout, "\"known_categories\"");
+    assert_contains(&stdout, "nonexistent_category");
+    crate::test_log!("TEST PASS: test_error_list_unknown_category_json_fails_with_remediation");
 }
 
 // =============================================================================

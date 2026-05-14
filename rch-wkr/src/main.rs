@@ -18,7 +18,11 @@ use tracing::info;
 
 #[derive(Parser)]
 #[command(name = "rch-wkr")]
-#[command(author, version, about = "RCH worker agent - remote execution")]
+#[command(
+    author,
+    version = rch_common::build_version_value_static(),
+    about = "RCH worker agent - remote execution"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -1010,11 +1014,4 @@ mod tests {
 
         std::fs::remove_dir_all(&base).expect("cleanup temp topology");
     }
-}
-
-// Global test logging initialization - enables JSONL output for all unit tests
-#[cfg(test)]
-#[ctor::ctor]
-fn init_test_logging() {
-    rch_common::testing::init_global_test_logging();
 }

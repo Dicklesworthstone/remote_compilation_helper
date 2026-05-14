@@ -14,7 +14,7 @@ use rch_common::{
 };
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, Notify, RwLock};
 use tokio::time::interval;
 use tracing::{debug, info, warn};
 
@@ -271,6 +271,8 @@ pub struct HealthMonitor {
     health_states: Arc<RwLock<std::collections::HashMap<String, WorkerHealth>>>,
     /// Whether monitor is running.
     running: Arc<RwLock<bool>>,
+    /// Wake signal for prompt shutdown while the monitor is sleeping between checks.
+    shutdown: Arc<Notify>,
     /// Optional worker status panel for log output.
     status_panel: Option<Arc<Mutex<WorkerStatusPanel>>>,
     /// Optional alert manager for worker health alerting.
@@ -285,6 +287,7 @@ impl HealthMonitor {
             config,
             health_states: Arc::new(RwLock::new(std::collections::HashMap::new())),
             running: Arc::new(RwLock::new(false)),
+            shutdown: Arc::new(Notify::new()),
             status_panel: None,
             alert_manager: None,
         }
@@ -310,6 +313,7 @@ impl HealthMonitor {
         let config = self.config.clone();
         let health_states = self.health_states.clone();
         let running = self.running.clone();
+        let shutdown = self.shutdown.clone();
         let status_panel = self.status_panel.clone();
         let alert_manager = self.alert_manager.clone();
 
@@ -323,7 +327,13 @@ impl HealthMonitor {
             );
 
             loop {
-                ticker.tick().await;
+                tokio::select! {
+                    _ = ticker.tick() => {}
+                    () = shutdown.notified() => {
+                        info!("Health monitor stopping");
+                        break;
+                    }
+                }
 
                 if !*running.read().await {
                     info!("Health monitor stopping");
@@ -479,6 +489,7 @@ impl HealthMonitor {
     #[allow(dead_code)] // Will be used for graceful shutdown
     pub async fn stop(&self) {
         *self.running.write().await = false;
+        self.shutdown.notify_waiters();
     }
 
     /// Get health state for a worker.
@@ -1635,6 +1646,7 @@ mod tests {
         .await;
 
         let worker = pool.get(&worker_id).await.unwrap();
+        assert!(worker.reserve_slots(1).await);
         worker.drain().await;
 
         let monitor = HealthMonitor::new(

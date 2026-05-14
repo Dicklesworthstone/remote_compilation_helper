@@ -62,6 +62,9 @@ rand = "0.10.1"
 
 # Compression
 zstd = "0.13.3"
+flate2 = "1.1.9"
+tar = { version = "0.4.45", default-features = false }
+zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2"] }
 
 # Time formatting for mock transport logging
 chrono = { version = "0.4.43", features = ["serde"] }
@@ -127,9 +130,6 @@ ftui-backend = { path = "/dp/frankentui/crates/ftui-backend", version = "0.4.0" 
 
 # Rich terminal output (optional, for enhanced UI)
 rich_rust = { path = "/dp/rich_rust", version = "0.2.1" }
-
-# Test utilities
-ctor = "0.2.9"
 
 # Internal crates
 # Use default-features = false for cross-platform compatibility (rich-ui uses Unix-only rich_rust)

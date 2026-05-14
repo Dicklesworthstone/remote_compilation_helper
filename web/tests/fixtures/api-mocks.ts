@@ -111,8 +111,8 @@ export const mockStats: BuildStats = {
   total_builds: 128,
   success_count: 120,
   failure_count: 8,
-  remote_count: 126,
-  local_count: 2,
+  remote_count: 96,
+  local_count: 32,
   avg_duration_ms: 3922,
 };
 

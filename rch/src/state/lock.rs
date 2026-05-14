@@ -7,7 +7,10 @@ use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+static LOCK_OWNER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Lock file contents for debugging stale locks.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -20,6 +23,9 @@ pub struct LockInfo {
     pub created_at: String,
     /// Description of the operation being performed.
     pub operation: String,
+    /// Acquisition-unique owner id used to avoid removing another process's lock.
+    #[serde(default)]
+    pub owner_id: String,
 }
 
 /// A file-based configuration lock.
@@ -54,6 +60,7 @@ pub struct ConfigLock {
     #[allow(dead_code)]
     file: File,
     path: PathBuf,
+    body: String,
 }
 
 impl ConfigLock {
@@ -104,35 +111,15 @@ impl ConfigLock {
             // Try to create lock file exclusively
             match OpenOptions::new().write(true).create_new(true).open(&path) {
                 Ok(mut file) => {
-                    // Write lock info for debugging
-                    let info = LockInfo {
-                        pid: std::process::id(),
-                        hostname: hostname(),
-                        created_at: chrono::Utc::now().to_rfc3339(),
-                        operation: operation.to_string(),
-                    };
-
-                    if let Err(e) = serde_json::to_writer(&mut file, &info) {
-                        // Clean up lock file if we can't write info
-                        let _ = fs::remove_file(&path);
-                        return Err(anyhow!("Failed to write lock info: {}", e));
-                    }
-
-                    if let Err(e) = file.sync_all() {
-                        let _ = fs::remove_file(&path);
-                        return Err(anyhow!("Failed to sync lock file: {}", e));
-                    }
-
+                    let body = new_lock_body(operation)?;
+                    write_lock_body(&mut file, &path, &body)?;
                     tracing::debug!("Acquired lock: {:?}", path);
-                    return Ok(ConfigLock { file, path });
+                    return Ok(ConfigLock { file, path, body });
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     // Lock exists, check if stale
-                    if Self::is_stale_lock(&path)? {
+                    if Self::try_remove_stale_lock(&path)? {
                         tracing::warn!("Removing stale lock: {:?}", path);
-                        if let Err(e) = fs::remove_file(&path) {
-                            tracing::warn!("Failed to remove stale lock: {}", e);
-                        }
                         continue;
                     }
 
@@ -171,25 +158,17 @@ impl ConfigLock {
         let path = lock_dir.join(format!("{}.lock", lock_name));
 
         // Check for stale lock first
-        if path.exists() && Self::is_stale_lock(&path)? {
+        if path.exists() && Self::try_remove_stale_lock(&path)? {
             tracing::warn!("Removing stale lock: {:?}", path);
-            let _ = fs::remove_file(&path);
         }
 
         match OpenOptions::new().write(true).create_new(true).open(&path) {
             Ok(mut file) => {
-                let info = LockInfo {
-                    pid: std::process::id(),
-                    hostname: hostname(),
-                    created_at: chrono::Utc::now().to_rfc3339(),
-                    operation: operation.to_string(),
-                };
-
-                serde_json::to_writer(&mut file, &info)?;
-                file.sync_all()?;
+                let body = new_lock_body(operation)?;
+                write_lock_body(&mut file, &path, &body)?;
 
                 tracing::debug!("Acquired lock: {:?}", path);
-                Ok(Some(ConfigLock { file, path }))
+                Ok(Some(ConfigLock { file, path, body }))
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
             Err(e) => Err(anyhow!("Failed to create lock file: {}", e)),
@@ -207,47 +186,35 @@ impl ConfigLock {
     }
 
     /// Check if a lock is stale (holder process dead or lock too old).
+    #[cfg(test)]
     fn is_stale_lock(path: &Path) -> Result<bool> {
-        let info = Self::read_lock_info(path).ok();
+        Ok(Self::stale_lock_body(path)?.is_some())
+    }
 
-        let Some(info) = info else {
-            if let Ok(metadata) = fs::metadata(path)
-                && let Ok(modified) = metadata.modified()
-                && let Ok(age) = modified.elapsed()
-                && age > Duration::from_secs(60 * 60)
-            {
-                return Ok(true);
-            }
+    /// Remove a stale lock only if the file still contains the stale body read
+    /// by this process.
+    fn try_remove_stale_lock(path: &Path) -> Result<bool> {
+        let Some(body) = Self::stale_lock_body(path)? else {
             return Ok(false);
         };
 
-        // Check if process is still alive (Linux only - uses /proc)
-        #[cfg(target_os = "linux")]
-        {
-            let proc_path = format!("/proc/{}", info.pid);
-            if !std::path::Path::new(&proc_path).exists() {
-                // Process doesn't exist
-                return Ok(true);
-            }
-        }
+        remove_lock_if_unchanged(path, &body)
+            .with_context(|| format!("Failed to remove stale lock: {:?}", path))
+    }
 
-        // On non-Linux Unix systems, we rely solely on lock age
-        #[cfg(all(unix, not(target_os = "linux")))]
-        {
-            // Can't safely check process existence without unsafe code
-            // Fall through to age-based staleness check
-            let _ = &info; // suppress unused warning
-        }
+    fn stale_lock_body(path: &Path) -> Result<Option<String>> {
+        let body = match fs::read_to_string(path) {
+            Ok(body) => body,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e).with_context(|| format!("Failed to read lock file: {path:?}")),
+        };
 
-        // Check if lock is too old (> 1 hour)
-        if let Ok(created) = chrono::DateTime::parse_from_rfc3339(&info.created_at) {
-            let age = chrono::Utc::now().signed_duration_since(created);
-            if age > chrono::Duration::hours(1) {
-                return Ok(true);
-            }
-        }
+        let stale = match serde_json::from_str::<LockInfo>(&body) {
+            Ok(info) => lock_info_is_stale(&info),
+            Err(_) => lock_file_is_too_old(path),
+        };
 
-        Ok(false)
+        if stale { Ok(Some(body)) } else { Ok(None) }
     }
 
     /// Read lock info from a lock file.
@@ -279,16 +246,9 @@ impl ConfigLock {
 
         match OpenOptions::new().write(true).create_new(true).open(&path) {
             Ok(mut file) => {
-                let info = LockInfo {
-                    pid: std::process::id(),
-                    hostname: hostname(),
-                    created_at: chrono::Utc::now().to_rfc3339(),
-                    operation: operation.to_string(),
-                };
-
-                serde_json::to_writer(&mut file, &info)?;
-                file.sync_all()?;
-                Ok(ConfigLock { file, path })
+                let body = new_lock_body(operation)?;
+                write_lock_body(&mut file, &path, &body)?;
+                Ok(ConfigLock { file, path, body })
             }
             Err(e) => Err(anyhow!("Failed to create lock file: {}", e)),
         }
@@ -306,22 +266,15 @@ impl ConfigLock {
 
         let path = lock_dir.join(format!("{}.lock", lock_name));
 
-        if path.exists() && Self::is_stale_lock(&path)? {
-            let _ = fs::remove_file(&path);
+        if path.exists() {
+            let _ = Self::try_remove_stale_lock(&path)?;
         }
 
         match OpenOptions::new().write(true).create_new(true).open(&path) {
             Ok(mut file) => {
-                let info = LockInfo {
-                    pid: std::process::id(),
-                    hostname: hostname(),
-                    created_at: chrono::Utc::now().to_rfc3339(),
-                    operation: operation.to_string(),
-                };
-
-                serde_json::to_writer(&mut file, &info)?;
-                file.sync_all()?;
-                Ok(Some(ConfigLock { file, path }))
+                let body = new_lock_body(operation)?;
+                write_lock_body(&mut file, &path, &body)?;
+                Ok(Some(ConfigLock { file, path, body }))
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
             Err(e) => Err(anyhow!("Failed to create lock file: {}", e)),
@@ -356,22 +309,15 @@ impl ConfigLock {
         let poll_interval = Duration::from_millis(10); // Faster polling for tests
 
         loop {
-            if path.exists() && Self::is_stale_lock(&path)? {
-                let _ = fs::remove_file(&path);
+            if path.exists() {
+                let _ = Self::try_remove_stale_lock(&path)?;
             }
 
             match OpenOptions::new().write(true).create_new(true).open(&path) {
                 Ok(mut file) => {
-                    let info = LockInfo {
-                        pid: std::process::id(),
-                        hostname: hostname(),
-                        created_at: chrono::Utc::now().to_rfc3339(),
-                        operation: operation.to_string(),
-                    };
-
-                    serde_json::to_writer(&mut file, &info)?;
-                    file.sync_all()?;
-                    return Ok(ConfigLock { file, path });
+                    let body = new_lock_body(operation)?;
+                    write_lock_body(&mut file, &path, &body)?;
+                    return Ok(ConfigLock { file, path, body });
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     if start.elapsed() >= timeout {
@@ -392,13 +338,125 @@ impl ConfigLock {
     }
 }
 
+fn new_lock_body(operation: &str) -> Result<String> {
+    let info = LockInfo {
+        pid: std::process::id(),
+        hostname: hostname(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        operation: operation.to_string(),
+        owner_id: new_lock_owner_id(),
+    };
+    serde_json::to_string(&info).context("Failed to serialize lock info")
+}
+
+fn new_lock_owner_id() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO);
+    let sequence = LOCK_OWNER_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    format!("{:x}-{:x}", now.as_nanos(), sequence)
+}
+
+fn write_lock_body(file: &mut File, path: &Path, body: &str) -> Result<()> {
+    if let Err(e) = std::io::Write::write_all(file, body.as_bytes()) {
+        let _ = remove_lock_file_if_same_handle(file, path);
+        return Err(anyhow!("Failed to write lock info: {}", e));
+    }
+
+    if let Err(e) = file.sync_all() {
+        let _ = remove_lock_if_unchanged(path, body);
+        return Err(anyhow!("Failed to sync lock file: {}", e));
+    }
+
+    Ok(())
+}
+
+fn remove_lock_file_if_same_handle(file: &File, path: &Path) -> std::io::Result<bool> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let file_metadata = file.metadata()?;
+        let path_metadata = match fs::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e),
+        };
+
+        if file_metadata.dev() == path_metadata.dev() && file_metadata.ino() == path_metadata.ino()
+        {
+            fs::remove_file(path)?;
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = file;
+        let _ = path;
+        Ok(false)
+    }
+}
+
+fn remove_lock_if_unchanged(path: &Path, expected_body: &str) -> std::io::Result<bool> {
+    match fs::read_to_string(path) {
+        Ok(current) if current == expected_body => {
+            fs::remove_file(path)?;
+            Ok(true)
+        }
+        Ok(_) => Ok(false),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+fn lock_info_is_stale(info: &LockInfo) -> bool {
+    // Check if process is still alive (Linux only - uses /proc)
+    #[cfg(target_os = "linux")]
+    {
+        let proc_path = format!("/proc/{}", info.pid);
+        if !std::path::Path::new(&proc_path).exists() {
+            // Process doesn't exist
+            return true;
+        }
+    }
+
+    // On non-Linux Unix systems, we rely solely on lock age
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        // Can't safely check process existence without unsafe code.
+        let _ = &info;
+    }
+
+    lock_timestamp_is_too_old(&info.created_at)
+}
+
+fn lock_timestamp_is_too_old(created_at: &str) -> bool {
+    if let Ok(created) = chrono::DateTime::parse_from_rfc3339(created_at) {
+        let age = chrono::Utc::now().signed_duration_since(created);
+        return age > chrono::Duration::hours(1);
+    }
+    false
+}
+
+fn lock_file_is_too_old(path: &Path) -> bool {
+    if let Ok(metadata) = fs::metadata(path)
+        && let Ok(modified) = metadata.modified()
+        && let Ok(age) = modified.elapsed()
+    {
+        return age > Duration::from_secs(60 * 60);
+    }
+    false
+}
+
 impl Drop for ConfigLock {
     fn drop(&mut self) {
-        // Remove lock file
-        if let Err(e) = fs::remove_file(&self.path) {
-            tracing::warn!("Failed to remove lock file {:?}: {}", self.path, e);
-        } else {
-            tracing::debug!("Released lock: {:?}", self.path);
+        match remove_lock_if_unchanged(&self.path, &self.body) {
+            Ok(true) => tracing::debug!("Released lock: {:?}", self.path),
+            Ok(false) => {}
+            Err(e) => tracing::warn!("Failed to remove lock file {:?}: {}", self.path, e),
         }
     }
 }
@@ -484,7 +542,85 @@ mod tests {
         let info = holder.unwrap();
         assert_eq!(info.pid, std::process::id());
         assert_eq!(info.operation, "test operation");
+        assert!(!info.owner_id.is_empty());
         log_test_pass("test_lock_holder");
+    }
+
+    #[test]
+    fn test_lock_drop_preserves_replaced_lock_body() -> Result<()> {
+        log_test_start("test_lock_drop_preserves_replaced_lock_body");
+        let tmp = TempDir::new()?;
+        let lock_dir = tmp.path().join("locks");
+        let lock = ConfigLock::acquire_in_dir(&lock_dir, "replace_test", "holder")?;
+        let path = lock.path.clone();
+        let replacement = new_lock_body("replacement")?;
+        fs::write(&path, &replacement)?;
+
+        drop(lock);
+
+        assert_eq!(fs::read_to_string(&path)?, replacement);
+        log_test_pass("test_lock_drop_preserves_replaced_lock_body");
+        Ok(())
+    }
+
+    #[test]
+    fn test_stale_cleanup_preserves_replaced_lock_body() -> Result<()> {
+        log_test_start("test_stale_cleanup_preserves_replaced_lock_body");
+        let tmp = TempDir::new()?;
+        let lock_dir = tmp.path().join("locks");
+        fs::create_dir_all(&lock_dir)?;
+        let path = lock_dir.join("stale_replace.lock");
+
+        let stale_info = LockInfo {
+            pid: 9_999_999,
+            hostname: "testhost".to_string(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            operation: "stale".to_string(),
+            owner_id: "stale-owner".to_string(),
+        };
+        fs::write(&path, serde_json::to_string(&stale_info)?)?;
+        let stale_body =
+            ConfigLock::stale_lock_body(&path)?.ok_or_else(|| anyhow!("expected stale body"))?;
+        let replacement = new_lock_body("replacement")?;
+        fs::write(&path, &replacement)?;
+
+        let removed = remove_lock_if_unchanged(&path, &stale_body)?;
+
+        assert!(!removed);
+        assert_eq!(fs::read_to_string(&path)?, replacement);
+        log_test_pass("test_stale_cleanup_preserves_replaced_lock_body");
+        Ok(())
+    }
+
+    #[test]
+    fn test_write_failure_cleanup_preserves_replaced_path() -> Result<()> {
+        log_test_start("test_write_failure_cleanup_preserves_replaced_path");
+        let tmp = TempDir::new()?;
+        let path = tmp.path().join("write-cleanup.lock");
+        let replacement_path = tmp.path().join("replacement.lock");
+
+        let file = File::create(&path)?;
+        fs::write(&replacement_path, "replacement")?;
+        fs::rename(&replacement_path, &path)?;
+
+        let removed = remove_lock_file_if_same_handle(&file, &path)?;
+
+        assert!(!removed);
+        assert_eq!(fs::read_to_string(&path)?, "replacement");
+        log_test_pass("test_write_failure_cleanup_preserves_replaced_path");
+        Ok(())
+    }
+
+    #[test]
+    fn test_new_lock_body_uses_unique_owner_ids() -> Result<()> {
+        let body1 = new_lock_body("same-operation")?;
+        let body2 = new_lock_body("same-operation")?;
+        let info1: LockInfo = serde_json::from_str(&body1)?;
+        let info2: LockInfo = serde_json::from_str(&body2)?;
+
+        assert_ne!(body1, body2);
+        assert_ne!(info1.owner_id, info2.owner_id);
+        Ok(())
     }
 
     #[test]
@@ -507,6 +643,7 @@ mod tests {
             hostname: "testhost".to_string(),
             created_at: "2025-01-01T00:00:00Z".to_string(),
             operation: "test".to_string(),
+            owner_id: "owner".to_string(),
         };
 
         let json = serde_json::to_string(&info).unwrap();
@@ -515,7 +652,19 @@ mod tests {
         assert_eq!(parsed.pid, 12345);
         assert_eq!(parsed.hostname, "testhost");
         assert_eq!(parsed.operation, "test");
+        assert_eq!(parsed.owner_id, "owner");
         log_test_pass("test_lock_info_serialization");
+    }
+
+    #[test]
+    fn test_lock_info_deserializes_legacy_without_owner_id() -> Result<()> {
+        let parsed: LockInfo = serde_json::from_str(
+            r#"{"pid":12345,"hostname":"testhost","created_at":"2025-01-01T00:00:00Z","operation":"test"}"#,
+        )?;
+
+        assert_eq!(parsed.pid, 12345);
+        assert_eq!(parsed.owner_id, "");
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]
@@ -534,6 +683,7 @@ mod tests {
             hostname: "testhost".to_string(),
             created_at: chrono::Utc::now().to_rfc3339(),
             operation: "stale-proc".to_string(),
+            owner_id: "stale-proc".to_string(),
         };
 
         let mut file = File::create(&path).unwrap();
@@ -561,6 +711,7 @@ mod tests {
             hostname: "testhost".to_string(),
             created_at: old_time.to_rfc3339(),
             operation: "stale-age".to_string(),
+            owner_id: "stale-age".to_string(),
         };
 
         let mut file = File::create(&path).unwrap();
@@ -584,15 +735,9 @@ mod tests {
         // Pure atomic create without stale lock check
         match OpenOptions::new().write(true).create_new(true).open(&path) {
             Ok(mut file) => {
-                let info = LockInfo {
-                    pid: std::process::id(),
-                    hostname: hostname(),
-                    created_at: chrono::Utc::now().to_rfc3339(),
-                    operation: operation.to_string(),
-                };
-                serde_json::to_writer(&mut file, &info)?;
-                file.sync_all()?;
-                Ok(Some(ConfigLock { file, path }))
+                let body = new_lock_body(operation)?;
+                write_lock_body(&mut file, &path, &body)?;
+                Ok(Some(ConfigLock { file, path, body }))
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
             Err(e) => Err(anyhow!("Failed to create lock file: {}", e)),

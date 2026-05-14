@@ -179,7 +179,7 @@ pub async fn deploy(
 
     // Per-fleet cooperative lock — prevents two concurrent deploys from
     // racing on worker state (bd-5z2wa). Held for the rest of this function
-    // via RAII; drop removes the file.
+    // via RAII; drop removes only the lock body this process wrote.
     let _fleet_lock = match lock::acquire("fleet-deploy") {
         Ok(guard) => guard,
         Err(err) => {

@@ -280,12 +280,13 @@ run_tests() {
     log "INFO" "Test 8: Config error location"
     TESTS_RUN=$((TESTS_RUN + 1))
 
-    local invalid_config
-    invalid_config=$(mktemp --suffix=.toml)
+    local invalid_config_dir invalid_config
+    invalid_config_dir=$(mktemp -d)
+    invalid_config="$invalid_config_dir/config.toml"
     echo 'invalid toml [' > "$invalid_config"
 
     stderr_file=$(mktemp)
-    RCH_CONFIG="$invalid_config" "$rch" status 2>"$stderr_file" || true
+    RCH_CONFIG_DIR="$invalid_config_dir" "$rch" status 2>"$stderr_file" || true
 
     [[ "$VERBOSE" == "1" ]] && log "DEBUG" "Config error: $(cat "$stderr_file")"
 
@@ -298,6 +299,7 @@ run_tests() {
     fi
 
     rm -f "$invalid_config" "$stderr_file"
+    rmdir "$invalid_config_dir"
 
     # =========================================================================
     # Test 9: Error categories are present

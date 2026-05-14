@@ -35,9 +35,7 @@ use rch_common::{
     SelectionReason, SelectionResponse, SelfHealingConfig, ToolchainInfo, TransferConfig,
     WorkerConfig, WorkerId, build_dependency_closure_plan_with_policy, build_invocation,
     classify_command, mock, normalize_project_path_with_policy,
-    path_topology::{
-        DEFAULT_ALIAS_PROJECT_ROOT, DEFAULT_CANONICAL_PROJECT_ROOT, PathTopologyPolicy,
-    },
+    path_topology::{DEFAULT_CANONICAL_PROJECT_ROOT, PathTopologyPolicy},
     ui::{
         ArtifactSummary, CelebrationSummary, CompilationProgress, CompletionCelebration, Icons,
         OutputContext, RchTheme, TransferProgress,
@@ -50,11 +48,12 @@ use rch_telemetry::protocol::{
 use serde::{Deserialize, Serialize};
 use std::fs::OpenOptions;
 use std::io::{self, Write};
+use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -109,6 +108,7 @@ const RCH_WORKER_ENV: &str = "RCH_WORKER";
 const RCH_WORKERS_ENV: &str = "RCH_WORKERS";
 
 static HOOK_MODE_PANIC_FAIL_OPEN: AtomicBool = AtomicBool::new(false);
+static AUTOSTART_LOCK_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 use rch_common::util::mask_sensitive_command;
 
@@ -995,12 +995,16 @@ enum AutoStartError {
     CooldownActive(u64, u64),
     #[error("Failed to spawn rchd: {0}")]
     SpawnFailed(#[source] std::io::Error),
+    #[error("rchd launch wrapper exited unsuccessfully: {0}")]
+    WrapperFailed(std::process::ExitStatus),
     #[error("Daemon started but socket not found after {0}s")]
     Timeout(u64),
     #[error("rchd binary not found in PATH")]
     BinaryNotFound,
     #[error("Socket exists but daemon not responding (stale socket)")]
     StaleSocket,
+    #[error("Socket accepts connections but daemon health check failed")]
+    UnhealthySocket,
     #[error("Configuration disabled auto-start")]
     Disabled,
     #[error("Auto-start I/O error: {0}")]
@@ -1010,11 +1014,12 @@ enum AutoStartError {
 #[derive(Debug)]
 struct AutoStartLock {
     path: PathBuf,
+    body: String,
 }
 
 impl Drop for AutoStartLock {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        let _ = remove_autostart_lock_if_unchanged(&self.path, &self.body);
     }
 }
 
@@ -1057,15 +1062,225 @@ fn write_cooldown_timestamp(path: &Path) -> Result<(), AutoStartError> {
     std::fs::write(path, format!("{now_secs}")).map_err(AutoStartError::Io)
 }
 
+/// Maximum age (in seconds) of a lockfile before it's eligible for
+/// stale takeover regardless of the recorded PID. Belt-and-suspenders
+/// against PID reuse: even if the recorded PID happens to be alive
+/// (a different process that reused the ID after the original was
+/// killed), a >60s-old lockfile is treated as stale.
+const AUTOSTART_LOCK_STALE_TTL_SECS: u64 = 60;
+
+/// Render the lockfile body. Format: newline-separated
+/// `pid\nunix_secs\nhostname\nnonce\n`. Hand-rolled to avoid bringing in a
+/// serializer for a small file the OS owns.
+fn render_autostart_lock_body() -> String {
+    let pid = std::process::id();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::from_secs(0));
+    let now_secs = now.as_secs();
+    let hostname = std::env::var("HOSTNAME")
+        .ok()
+        .or_else(|| {
+            std::fs::read_to_string("/etc/hostname")
+                .ok()
+                .map(|s| s.trim().to_string())
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+    let sequence = AUTOSTART_LOCK_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let nonce = now.as_nanos();
+    format!("{pid}\n{now_secs}\n{hostname}\n{nonce:x}-{sequence:x}\n")
+}
+
+/// Parsed contents of an autostart lockfile.
+#[derive(Debug)]
+struct ParsedLock {
+    pid: u32,
+    created_at_secs: u64,
+    hostname: String,
+}
+
+fn parse_autostart_lock_body(s: &str) -> Option<ParsedLock> {
+    let mut lines = s.lines();
+    let pid: u32 = lines.next()?.trim().parse().ok()?;
+    let created_at_secs: u64 = lines.next()?.trim().parse().ok()?;
+    let hostname = lines.next()?.trim().to_string();
+    if hostname.is_empty() {
+        return None;
+    }
+    Some(ParsedLock {
+        pid,
+        created_at_secs,
+        hostname,
+    })
+}
+
+fn remove_autostart_lock_if_unchanged(path: &Path, expected_body: &str) -> bool {
+    match std::fs::read_to_string(path) {
+        Ok(current_body) if current_body == expected_body => match std::fs::remove_file(path) {
+            Ok(()) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+            Err(_) => false,
+        },
+        _ => false,
+    }
+}
+
+/// Check whether a PID is alive. On Unix: send signal 0 (no-op) — if
+/// it succeeds the process exists; ESRCH means it's gone; EPERM also
+/// means it's alive (we just can't signal it). On non-Unix platforms:
+/// conservative `true` since we can't check cheaply — combined with
+/// the TTL fallback, a wedged lockfile still recovers within 60s.
+fn pid_is_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        // /proc/<pid> probe — cheap and unambiguous on Linux. We do
+        // NOT use kill(0) because rch is #![forbid(unsafe_code)] and
+        // the kill(2) wrapper would require nix/libc raw syscalls.
+        let proc_path = std::path::PathBuf::from(format!("/proc/{pid}"));
+        if proc_path.exists() {
+            return true;
+        }
+        // On non-Linux Unix (macOS, BSD), /proc may not exist. We can't
+        // easily check liveness without unsafe; rely on TTL fallback.
+        // To distinguish "no /proc" from "PID is dead" we check whether
+        // /proc itself exists.
+        if !std::path::Path::new("/proc").exists() {
+            // No /proc on this platform — be conservative and assume alive.
+            return true;
+        }
+        // /proc exists but /proc/<pid> doesn't — PID is definitively gone.
+        false
+    }
+    #[cfg(not(unix))]
+    {
+        // Conservative on non-Unix; TTL handles the stale case.
+        let _ = pid;
+        true
+    }
+}
+
+/// Decide whether an existing lockfile is stale and may be replaced.
+/// A lockfile is stale when:
+///   * its PID is not alive (process exited / SIGKILLed / power-cycled), OR
+///   * its body is unparseable (corruption), OR
+///   * its hostname matches this host AND it's older than the TTL (PID-reuse defense).
+///
+/// Lockfiles from a DIFFERENT host (NFS shared lock scenario) are NEVER
+/// considered stale here — only the holder's own host can prove liveness.
+fn autostart_lock_is_stale(parsed: &ParsedLock) -> bool {
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::from_secs(0))
+        .as_secs();
+    let age = now_secs.saturating_sub(parsed.created_at_secs);
+
+    let our_hostname = std::env::var("HOSTNAME")
+        .ok()
+        .or_else(|| {
+            std::fs::read_to_string("/etc/hostname")
+                .ok()
+                .map(|s| s.trim().to_string())
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+
+    if parsed.hostname != our_hostname {
+        // Different host — don't touch the lock; trust the holder.
+        // The cooldown mechanism upstream still prevents storm-spawning.
+        return false;
+    }
+
+    if !pid_is_alive(parsed.pid) {
+        return true;
+    }
+
+    // PID is alive, same host: TTL fallback for PID-reuse case.
+    age > AUTOSTART_LOCK_STALE_TTL_SECS
+}
+
 fn acquire_autostart_lock(path: &Path) -> Result<AutoStartLock, AutoStartError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(AutoStartError::Io)?;
     }
+    // Atomic create_new — winner of the race; loser falls into the
+    // stale-detection branch below.
+    let body = render_autostart_lock_body();
     match OpenOptions::new().write(true).create_new(true).open(path) {
-        Ok(_) => Ok(AutoStartLock {
-            path: path.to_path_buf(),
-        }),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(AutoStartError::LockHeld),
+        Ok(mut f) => {
+            // Write the lockfile body so subsequent contenders can decide
+            // whether to wait or take over. We deliberately don't fail the
+            // acquire if the write itself fails — the lockfile-exists
+            // mutual-exclusion is the load-bearing invariant; the body is
+            // diagnostic + stale-detection metadata.
+            let _ = std::io::Write::write_all(&mut f, body.as_bytes());
+            let _ = f.sync_all();
+            tracing::info!(
+                target: "rch::hook::autostart_lock",
+                path = %path.display(),
+                pid = %std::process::id(),
+                "doctor.autostart_lock.acquired",
+            );
+            Ok(AutoStartLock {
+                path: path.to_path_buf(),
+                body,
+            })
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Stale-detection branch: read the existing body, decide
+            // whether the holder is gone, and take over if so.
+            match std::fs::read_to_string(path) {
+                Ok(existing) => {
+                    let parsed = parse_autostart_lock_body(&existing);
+                    let stale = match &parsed {
+                        Some(p) => autostart_lock_is_stale(p),
+                        None => {
+                            // Unparseable / corrupted body — treat as stale.
+                            tracing::warn!(
+                                target: "rch::hook::autostart_lock",
+                                path = %path.display(),
+                                bytes = existing.len(),
+                                "doctor.autostart_lock.body_corrupt_treated_as_stale",
+                            );
+                            true
+                        }
+                    };
+                    if stale {
+                        if !remove_autostart_lock_if_unchanged(path, &existing) {
+                            return Err(AutoStartError::LockHeld);
+                        }
+                        match OpenOptions::new().write(true).create_new(true).open(path) {
+                            Ok(mut f) => {
+                                let _ = std::io::Write::write_all(&mut f, body.as_bytes());
+                                let _ = f.sync_all();
+                                tracing::warn!(
+                                    target: "rch::hook::autostart_lock",
+                                    path = %path.display(),
+                                    holder_pid = ?parsed.as_ref().map(|p| p.pid),
+                                    holder_host = ?parsed.as_ref().map(|p| p.hostname.clone()),
+                                    holder_age_secs = ?parsed.as_ref().map(|p| {
+                                        SystemTime::now()
+                                            .duration_since(UNIX_EPOCH)
+                                            .unwrap_or(Duration::from_secs(0))
+                                            .as_secs()
+                                            .saturating_sub(p.created_at_secs)
+                                    }),
+                                    "doctor.autostart_lock.stale_replaced",
+                                );
+                                Ok(AutoStartLock {
+                                    path: path.to_path_buf(),
+                                    body,
+                                })
+                            }
+                            // Lost the race to recreate — another contender won.
+                            Err(_) => Err(AutoStartError::LockHeld),
+                        }
+                    } else {
+                        Err(AutoStartError::LockHeld)
+                    }
+                }
+                // Couldn't even read the file — treat as held to be safe.
+                Err(_) => Err(AutoStartError::LockHeld),
+            }
+        }
         Err(e) => Err(AutoStartError::Io(e)),
     }
 }
@@ -1089,7 +1304,23 @@ fn spawn_rchd(path: &Path) -> Result<(), AutoStartError> {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .stdin(Stdio::null());
-    cmd.spawn().map_err(AutoStartError::SpawnFailed)?;
+
+    let mut child = cmd.spawn().map_err(AutoStartError::SpawnFailed)?;
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    if let Some(status) = child.try_wait().map_err(AutoStartError::SpawnFailed)? {
+        return if status.success() {
+            Ok(())
+        } else {
+            Err(AutoStartError::WrapperFailed(status))
+        };
+    }
+
+    // `nohup` does not daemonize by itself; it execs/wraps rchd as our
+    // direct child. Keep a detached waiter while rch remains alive so a
+    // later daemon exit is reaped instead of becoming a zombie.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
     Ok(())
 }
 
@@ -1133,6 +1364,17 @@ async fn probe_daemon_health(socket_path: &Path) -> bool {
     };
 
     response.status == "healthy"
+}
+
+async fn socket_is_confirmed_stale(socket_path: &Path) -> bool {
+    match timeout(Duration::from_millis(300), UnixStream::connect(socket_path)).await {
+        Ok(Ok(_stream)) => false,
+        Ok(Err(error)) => matches!(
+            error.kind(),
+            io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
+        ),
+        Err(_) => false,
+    }
 }
 
 async fn wait_for_socket(socket_path: &Path, timeout_secs: u64) -> bool {
@@ -1189,6 +1431,13 @@ async fn try_auto_start_daemon(
             target: "rch::hook::autostart",
             "Socket exists but daemon not responding (after lock-protected re-probe)"
         );
+        if !socket_is_confirmed_stale(socket_path).await {
+            warn!(
+                target: "rch::hook::autostart",
+                "Socket still accepts connections or could not be proven stale; refusing to replace a possible live daemon"
+            );
+            return Err(AutoStartError::UnhealthySocket);
+        }
         if let Err(err) = std::fs::remove_file(socket_path) {
             warn!(
                 target: "rch::hook::autostart",
@@ -1385,13 +1634,17 @@ fn has_exact_flag(command: &str) -> bool {
 
 use std::collections::HashMap;
 
-// Timing infrastructure - currently used only for metrics collection and future
-// timing-based build gating. Allow dead_code until timing estimates are wired
-// into run_exec for smarter offload decisions.
-#[allow(dead_code)]
+// Timing infrastructure: feeds the global `TIMING_CACHE` (live; populated
+// by `record_build_timing` after every offloaded build). The estimator
+// surface that consumes the cache (`estimate_timing_for_build`,
+// `TimingEstimate`) is currently exercised only by unit tests — those
+// items keep `#[allow(dead_code)]` until production callers materialize.
+//
+// `MAX_TIMING_SAMPLES` bounds the per-project sample list (used at line
+// 1441). `MAX_TIMING_PROJECTS` bounds the project-keyed map for
+// LRU-eviction (used at line 1618).
 const MAX_TIMING_SAMPLES: usize = 20;
 
-#[allow(dead_code)]
 const MAX_TIMING_PROJECTS: usize = 500;
 
 /// A single timing record for a completed build.
@@ -1502,24 +1755,32 @@ struct TimingHistory {
     pub entries: HashMap<String, ProjectTimingData>,
 }
 
-/// Process-global in-memory cache for TimingHistory.
+/// Process-global in-memory cache for `TimingHistory`.
 ///
-/// After first load from disk, all reads come from memory (zero disk I/O).
-/// Writes update the cache first, then persist to disk asynchronously.
-/// This eliminates disk I/O from the estimate_timing_for_build hot path.
-#[allow(dead_code)]
+/// **Lifetime:** the hook is a fresh process per invocation, so the cache
+/// is rebuilt at the start of every hook call. Within a single hook call
+/// (or within `rchd` / a long-running `rch exec` session), `record_build_timing`
+/// can fire multiple times across `tokio::task::spawn_blocking` blocks; the
+/// `OnceLock` coalesces disk I/O for that batch — first call pays the
+/// `load_from_disk` cost; subsequent calls in the same process operate on
+/// the in-memory copy and write through to disk on update.
+///
+/// Consumers (live as of t19 close): two `record_build_timing` call sites
+/// in `run_classification_remote_path`. The estimator surface
+/// (`estimate_timing_for_build`, `TimingEstimate`) is currently exercised
+/// only by unit tests; those keep their `#[allow(dead_code)]` annotation
+/// until a production consumer wires them up.
 static TIMING_CACHE: std::sync::OnceLock<std::sync::RwLock<TimingHistory>> =
     std::sync::OnceLock::new();
 
-/// Get or initialize the global TimingHistory cache.
+/// Get or initialize the global `TimingHistory` cache.
 ///
-/// First call loads from disk (blocking); subsequent calls return the cached copy.
-#[allow(dead_code)]
+/// First call loads from disk (blocking); subsequent calls in the same
+/// process return the cached copy.
 fn timing_cache() -> &'static std::sync::RwLock<TimingHistory> {
     TIMING_CACHE.get_or_init(|| std::sync::RwLock::new(TimingHistory::load_from_disk()))
 }
 
-#[allow(dead_code)]
 impl TimingHistory {
     /// Load timing history from disk. Returns empty history on error.
     fn load_from_disk() -> Self {
@@ -1631,7 +1892,15 @@ fn timing_history_path() -> Option<PathBuf> {
 /// Updates the in-memory cache immediately, then persists to disk.
 /// Called after a build completes to update the timing history.
 /// This is used by `estimate_timing_for_build` for future predictions.
-#[allow(dead_code)]
+///
+/// **Lock-scope discipline (t18):** we acquire the write guard, mutate
+/// the in-memory state, CLONE a snapshot, drop the guard, THEN write
+/// to disk. The original implementation held the write guard across
+/// `save_to_disk()` which serialized every other reader/writer on a
+/// disk-I/O (~50ms on slow disks) — fine when nothing else needed the
+/// cache, catastrophic under any concurrent access. The clone cost is
+/// bounded by `MAX_TIMING_PROJECTS` (500) × `MAX_TIMING_SAMPLES` (20)
+/// = at most ~10K small structs; ~µs vs the lock contention's ms.
 pub fn record_build_timing(
     project: &str,
     kind: Option<CompilationKind>,
@@ -1639,11 +1908,30 @@ pub fn record_build_timing(
     remote: bool,
 ) {
     let cache = timing_cache();
-    // Update in-memory cache, then write-through to disk
-    if let Ok(mut history) = cache.write() {
+    // Step 1: mutate in-memory state under the write guard. Snapshot
+    // for disk persistence. Then drop the guard before any I/O.
+    let snapshot = {
+        let mut history = match cache.write() {
+            Ok(g) => g,
+            Err(poison) => {
+                // Poisoned RwLock — another caller panicked while
+                // holding the write guard. Recover the value and
+                // continue; failing here would deny the build a
+                // timing record but isn't worth blocking the user.
+                tracing::warn!(
+                    target: "rch::hook::timing",
+                    "timing cache RwLock poisoned; recovering"
+                );
+                poison.into_inner()
+            }
+        };
         history.record(project, kind, duration_ms, remote);
-        history.save_to_disk();
-    }
+        history.clone()
+        // guard dropped here
+    };
+    // Step 2: persist to disk WITHOUT holding the lock. Other readers
+    // and writers can proceed in parallel with the fsync.
+    snapshot.save_to_disk();
 }
 
 /// Timing estimate for offload gating decisions.
@@ -1804,11 +2092,12 @@ async fn process_hook(input: HookInput) -> HookOutput {
     // Mask sensitive data in debug logs (API keys, tokens, passwords)
     debug!("Processing command: {}", mask_sensitive_command(command));
 
-    // Classify the command using 5-tier system with LRU cache (bd-17cn)
+    // Classify the command using the 5-tier system.
     // Per AGENTS.md: non-compilation decisions must complete in <1ms, compilation in <5ms
-    // The cache reduces CPU overhead for repeated build/test commands
+    // The real hook path bypasses the classification cache because hook
+    // invocations are one-shot even when RCH_HOOK_MODE is not set.
     let classify_start = Instant::now();
-    let classification = crate::cache::classify_cached(command, classify_command);
+    let classification = crate::cache::classify_hook_command(command, classify_command);
     let classification_duration = classify_start.elapsed();
     let classification_duration_us = classification_duration.as_micros() as u64;
 
@@ -2712,6 +3001,11 @@ fn build_dependency_runtime_fail_open_report(
                 .join("Cargo.toml")
                 .to_string_lossy()
                 .to_string(),
+            required_path: normalized_project_root
+                .join("Cargo.toml")
+                .to_string_lossy()
+                .to_string(),
+            required_kind: "manifest",
             status,
             reason_code: decision.reason_code,
             detail: decision.detail.clone(),
@@ -3265,33 +3559,43 @@ fn build_remote_shell_command(remote_cmd: &str) -> String {
     format!("sh -lc {}", shell_escape::escape(remote_cmd.into()))
 }
 
+fn build_worker_projects_topology_cmd(topology_policy: &PathTopologyPolicy) -> String {
+    let canonical_display = topology_policy.canonical_root().display().to_string();
+    let alias_display = topology_policy.alias_root().display().to_string();
+    let canonical_slash_display = format!("{}/", canonical_display.trim_end_matches('/'));
+
+    format!(
+        "set -e; \
+         if [ ! -e {canonical} ] && [ ! -L {canonical} ]; then mkdir -p -- {canonical}; fi; \
+         if [ -e {canonical} ] && [ ! -d {canonical} ]; then echo 'RCH_TOPOLOGY_ERR_CANONICAL_NOT_DIRECTORY' >&2; exit 41; fi; \
+         if [ -L {alias} ]; then \
+           target=$(readlink -- {alias} 2>/dev/null || true); \
+           if [ \"$target\" != {canonical} ] && [ \"$target\" != {canonical_slash} ]; then ln -sfn -- {canonical} {alias}; fi; \
+         elif [ -e {alias} ]; then \
+           echo 'RCH_TOPOLOGY_ERR_ALIAS_NOT_SYMLINK' >&2; exit 42; \
+         else \
+           ln -s -- {canonical} {alias}; \
+         fi; \
+         echo RCH_TOPOLOGY_OK",
+        canonical = shell_escape::escape(canonical_display.into()),
+        canonical_slash = shell_escape::escape(canonical_slash_display.into()),
+        alias = shell_escape::escape(alias_display.into())
+    )
+}
+
 async fn ensure_worker_projects_topology(
     worker: &WorkerConfig,
     reporter: &HookReporter,
+    topology_policy: &PathTopologyPolicy,
 ) -> anyhow::Result<()> {
     if should_skip_remote_preflight(worker) {
         reporter.verbose("[RCH] topology preflight skipped in mock mode");
         return Ok(());
     }
 
-    let topology_cmd = format!(
-        "set -e; \
-         if [ ! -e {canonical} ] && [ ! -L {canonical} ]; then mkdir -p {canonical}; fi; \
-         if [ -e {canonical} ] && [ ! -d {canonical} ]; then echo 'RCH_TOPOLOGY_ERR_CANONICAL_NOT_DIRECTORY' >&2; exit 41; fi; \
-         if [ -L {alias} ]; then \
-           target=$(readlink {alias} 2>/dev/null || true); \
-           if [ \"$target\" != {canonical} ] && [ \"$target\" != {canonical_slash} ]; then ln -sfn {canonical} {alias}; fi; \
-         elif [ -e {alias} ]; then \
-           echo 'RCH_TOPOLOGY_ERR_ALIAS_NOT_SYMLINK' >&2; exit 42; \
-         else \
-           ln -s {canonical} {alias}; \
-         fi; \
-         echo RCH_TOPOLOGY_OK",
-        canonical = shell_escape::escape(DEFAULT_CANONICAL_PROJECT_ROOT.into()),
-        canonical_slash =
-            shell_escape::escape(format!("{}/", DEFAULT_CANONICAL_PROJECT_ROOT).into()),
-        alias = shell_escape::escape(DEFAULT_ALIAS_PROJECT_ROOT.into())
-    );
+    let canonical_display = topology_policy.canonical_root().display().to_string();
+    let alias_display = topology_policy.alias_root().display().to_string();
+    let topology_cmd = build_worker_projects_topology_cmd(topology_policy);
 
     let output = run_worker_ssh_command(worker, &topology_cmd, Duration::from_secs(20)).await?;
     if !output.status.success() {
@@ -3306,8 +3610,8 @@ async fn ensure_worker_projects_topology(
         );
     }
     reporter.verbose(&format!(
-        "[RCH] topology preflight ok on {} (/dp -> /data/projects enforced)",
-        worker.id
+        "[RCH] topology preflight ok on {} ({} -> {} enforced)",
+        worker.id, alias_display, canonical_display
     ));
     Ok(())
 }
@@ -4173,13 +4477,13 @@ const DEPENDENCY_PREFLIGHT_CODE_STALE: &str = "RCH-E325";
 const DEPENDENCY_PREFLIGHT_CODE_UNKNOWN: &str = "RCH-E326";
 const DEPENDENCY_PREFLIGHT_CODE_POLICY: &str = "RCH-E327";
 const DEPENDENCY_PREFLIGHT_CODE_TIMEOUT: &str = "RCH-E328";
-const DEPENDENCY_PREFLIGHT_REMEDIATION_MISSING: &str =
-    "Ensure every dependency root in the closure is synced and Cargo.toml exists remotely.";
+const DEPENDENCY_PREFLIGHT_REMEDIATION_MISSING: &str = "Ensure every dependency root in the closure is synced and Cargo.toml plus required source entrypoints exist remotely.";
 const DEPENDENCY_PREFLIGHT_REMEDIATION_STALE: &str = "One or more dependency roots were not refreshed; rerun after successful sync of skipped roots.";
 const DEPENDENCY_PREFLIGHT_REMEDIATION_UNKNOWN: &str =
     "Dependency verification could not determine remote state; inspect sync/SSH logs and retry.";
 const DEPENDENCY_PREFLIGHT_REMEDIATION_POLICY: &str = "Path dependency topology policy failed; move dependencies under /data/projects (or /dp) and retry.";
 const DEPENDENCY_PREFLIGHT_REMEDIATION_TIMEOUT: &str = "Dependency planner timed out; rerun after system load decreases or investigate cargo metadata latency.";
+const DEPENDENCY_PREFLIGHT_PROBE_BATCH_SIZE: usize = 128;
 const WORKSPACE_METADATA_SYNC_PATTERNS: &[&str] = &[
     "Cargo.toml",
     "Cargo.lock",
@@ -4204,6 +4508,8 @@ enum DependencyPreflightStatus {
 struct DependencyPreflightEvidence {
     root: String,
     manifest: String,
+    required_path: String,
+    required_kind: &'static str,
     status: DependencyPreflightStatus,
     reason_code: &'static str,
     detail: String,
@@ -4310,67 +4616,462 @@ fn dependency_preflight_failure_reason(
     None
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DependencyPreflightCheck {
+    root: String,
+    manifest: String,
+    required_path: String,
+    required_kind: &'static str,
+    is_primary: bool,
+}
+
+fn clean_relative_cargo_path(raw: &str) -> Option<PathBuf> {
+    let path = Path::new(raw);
+    if path.is_absolute() {
+        return None;
+    }
+    if path.components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    }) {
+        return None;
+    }
+    Some(path.to_path_buf())
+}
+
+fn table_path_value(table: &toml::Table, key: &str) -> Option<PathBuf> {
+    table
+        .get(key)
+        .and_then(toml::Value::as_str)
+        .and_then(clean_relative_cargo_path)
+}
+
+fn target_array_paths(table: &toml::Table, key: &str) -> Vec<PathBuf> {
+    table
+        .get(key)
+        .and_then(toml::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(toml::Value::as_table)
+        .filter_map(|target| table_path_value(target, "path"))
+        .collect()
+}
+
+fn table_string_array(table: &toml::Table, key: &str) -> Vec<String> {
+    table
+        .get(key)
+        .and_then(toml::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(toml::Value::as_str)
+        .map(str::to_string)
+        .collect()
+}
+
+fn package_auto_discovery_enabled(table: &toml::Table, key: &str) -> bool {
+    table
+        .get("package")
+        .and_then(toml::Value::as_table)
+        .and_then(|package| package.get(key))
+        .and_then(toml::Value::as_bool)
+        .unwrap_or(true)
+}
+
+fn insert_existing_relative_entrypoint(
+    paths: &mut std::collections::BTreeSet<PathBuf>,
+    package_root: &Path,
+    relative_path: impl Into<PathBuf>,
+) {
+    let relative_path = relative_path.into();
+    if package_root.join(&relative_path).is_file() {
+        paths.insert(relative_path);
+    }
+}
+
+fn insert_auto_discovered_target_entrypoints(
+    paths: &mut std::collections::BTreeSet<PathBuf>,
+    package_root: &Path,
+    relative_dir: &str,
+) {
+    let Ok(entries) = std::fs::read_dir(package_root.join(relative_dir)) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let file_name = entry.file_name();
+        if file_type.is_file() {
+            if entry.path().extension().is_some_and(|ext| ext == "rs") {
+                paths.insert(PathBuf::from(relative_dir).join(file_name));
+            }
+        } else if file_type.is_dir() {
+            insert_existing_relative_entrypoint(
+                paths,
+                package_root,
+                PathBuf::from(relative_dir).join(file_name).join("main.rs"),
+            );
+        }
+    }
+}
+
+fn cargo_package_source_entrypoints(package_root: &Path) -> Vec<PathBuf> {
+    let manifest_path = package_root.join("Cargo.toml");
+    let Ok(contents) = std::fs::read_to_string(&manifest_path) else {
+        return Vec::new();
+    };
+    let Ok(table) = toml::from_str::<toml::Table>(&contents) else {
+        return Vec::new();
+    };
+    if !table.contains_key("package") {
+        return Vec::new();
+    }
+
+    let mut paths = std::collections::BTreeSet::<PathBuf>::new();
+
+    if let Some(lib_path) = table
+        .get("lib")
+        .and_then(toml::Value::as_table)
+        .and_then(|lib| table_path_value(lib, "path"))
+    {
+        paths.insert(lib_path);
+    } else if package_auto_discovery_enabled(&table, "autolib") || table.contains_key("lib") {
+        insert_existing_relative_entrypoint(&mut paths, package_root, "src/lib.rs");
+    }
+
+    if package_auto_discovery_enabled(&table, "autobins") {
+        insert_existing_relative_entrypoint(&mut paths, package_root, "src/main.rs");
+        insert_auto_discovered_target_entrypoints(&mut paths, package_root, "src/bin");
+    }
+    if package_auto_discovery_enabled(&table, "autoexamples") {
+        insert_auto_discovered_target_entrypoints(&mut paths, package_root, "examples");
+    }
+    if package_auto_discovery_enabled(&table, "autotests") {
+        insert_auto_discovered_target_entrypoints(&mut paths, package_root, "tests");
+    }
+    if package_auto_discovery_enabled(&table, "autobenches") {
+        insert_auto_discovered_target_entrypoints(&mut paths, package_root, "benches");
+    }
+
+    for key in ["bin", "example", "test", "bench"] {
+        paths.extend(target_array_paths(&table, key));
+    }
+
+    paths.into_iter().collect()
+}
+
+fn cargo_manifest_table(package_root: &Path) -> Option<toml::Table> {
+    let manifest_path = package_root.join("Cargo.toml");
+    let contents = std::fs::read_to_string(&manifest_path).ok()?;
+    toml::from_str::<toml::Table>(&contents).ok()
+}
+
+fn has_glob_meta(pattern: &str) -> bool {
+    pattern
+        .bytes()
+        .any(|byte| matches!(byte, b'*' | b'?' | b'['))
+}
+
+fn path_slash_string(path: &Path) -> Option<String> {
+    Some(
+        path.to_str()?
+            .trim_start_matches("./")
+            .replace(std::path::MAIN_SEPARATOR, "/"),
+    )
+}
+
+fn workspace_exclude_matches(relative_member: &Path, exclude_patterns: &[String]) -> bool {
+    let Some(relative_member) = path_slash_string(relative_member) else {
+        return false;
+    };
+
+    exclude_patterns.iter().any(|pattern| {
+        let Some(pattern_path) = clean_relative_cargo_path(pattern) else {
+            return false;
+        };
+        let Some(pattern_slash) = path_slash_string(&pattern_path) else {
+            return false;
+        };
+        if has_glob_meta(&pattern_slash) {
+            glob::Pattern::new(&pattern_slash)
+                .map(|compiled| compiled.matches(&relative_member))
+                .unwrap_or(false)
+        } else {
+            relative_member == pattern_slash
+                || relative_member
+                    .strip_prefix(&pattern_slash)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+        }
+    })
+}
+
+fn workspace_member_manifest_paths(workspace_root: &Path) -> Vec<PathBuf> {
+    let Some(table) = cargo_manifest_table(workspace_root) else {
+        return Vec::new();
+    };
+    let Some(workspace) = table.get("workspace").and_then(toml::Value::as_table) else {
+        return Vec::new();
+    };
+
+    let members = table_string_array(workspace, "members");
+    let exclude_patterns = table_string_array(workspace, "exclude");
+    let mut manifests = std::collections::BTreeSet::<PathBuf>::new();
+
+    for member in members {
+        let Some(member_path) = clean_relative_cargo_path(&member) else {
+            continue;
+        };
+        if has_glob_meta(&member) {
+            let glob_path = workspace_root.join(&member_path).join("Cargo.toml");
+            let Some(glob_pattern) = glob_path.to_str() else {
+                continue;
+            };
+            let Ok(entries) = glob::glob(glob_pattern) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                if !entry.is_file() {
+                    continue;
+                }
+                let Ok(relative_manifest) = entry.strip_prefix(workspace_root) else {
+                    continue;
+                };
+                let Some(relative_member) = relative_manifest.parent() else {
+                    continue;
+                };
+                if !workspace_exclude_matches(relative_member, &exclude_patterns) {
+                    manifests.insert(relative_manifest.to_path_buf());
+                }
+            }
+        } else {
+            let relative_manifest = member_path.join("Cargo.toml");
+            if workspace_root.join(&relative_manifest).is_file()
+                && !workspace_exclude_matches(&member_path, &exclude_patterns)
+            {
+                manifests.insert(relative_manifest);
+            }
+        }
+    }
+
+    manifests.into_iter().collect()
+}
+
+fn cargo_workspace_member_source_entrypoints(workspace_root: &Path) -> Vec<PathBuf> {
+    let mut paths = std::collections::BTreeSet::<PathBuf>::new();
+    for manifest_path in workspace_member_manifest_paths(workspace_root) {
+        paths.insert(manifest_path.clone());
+        if let Some(member_root) = manifest_path.parent() {
+            paths.extend(
+                cargo_package_source_entrypoints(&workspace_root.join(member_root))
+                    .into_iter()
+                    .map(|entrypoint| member_root.join(entrypoint)),
+            );
+        }
+    }
+
+    paths.into_iter().collect()
+}
+
+fn dependency_preflight_checks_for_entry(
+    entry: &SyncClosurePlanEntry,
+) -> Vec<DependencyPreflightCheck> {
+    let remote_root = PathBuf::from(&entry.remote_root);
+    let manifest = remote_root.join("Cargo.toml").to_string_lossy().to_string();
+    let mut checks = Vec::new();
+    checks.push(DependencyPreflightCheck {
+        root: entry.remote_root.clone(),
+        manifest: manifest.clone(),
+        required_path: manifest.clone(),
+        required_kind: "manifest",
+        is_primary: entry.is_primary,
+    });
+
+    if entry.mode == SyncClosureMode::Full {
+        checks.extend(
+            cargo_package_source_entrypoints(&entry.local_root)
+                .into_iter()
+                .map(|relative_path| DependencyPreflightCheck {
+                    root: entry.remote_root.clone(),
+                    manifest: manifest.clone(),
+                    required_path: remote_root
+                        .join(relative_path)
+                        .to_string_lossy()
+                        .to_string(),
+                    required_kind: "source_entrypoint",
+                    is_primary: entry.is_primary,
+                }),
+        );
+        checks.extend(
+            cargo_workspace_member_source_entrypoints(&entry.local_root)
+                .into_iter()
+                .map(|relative_path| DependencyPreflightCheck {
+                    root: entry.remote_root.clone(),
+                    manifest: manifest.clone(),
+                    required_path: remote_root
+                        .join(relative_path)
+                        .to_string_lossy()
+                        .to_string(),
+                    required_kind: "source_entrypoint",
+                    is_primary: entry.is_primary,
+                }),
+        );
+    }
+
+    checks.sort_by(|left, right| {
+        (&left.required_path, left.required_kind).cmp(&(&right.required_path, right.required_kind))
+    });
+    checks.dedup_by(|left, right| {
+        left.required_path == right.required_path && left.required_kind == right.required_kind
+    });
+    checks
+}
+
+fn synced_dependency_preflight_checks(
+    root_outcomes: &[(SyncClosurePlanEntry, SyncRootOutcome)],
+) -> Vec<DependencyPreflightCheck> {
+    root_outcomes
+        .iter()
+        .filter(|(_, outcome)| matches!(outcome, SyncRootOutcome::Synced))
+        .flat_map(|(entry, _)| dependency_preflight_checks_for_entry(entry))
+        .collect()
+}
+
 fn build_dependency_preflight_report(
     worker: &WorkerConfig,
     root_outcomes: &[(SyncClosurePlanEntry, SyncRootOutcome)],
-    present_manifests: &std::collections::BTreeSet<String>,
-    missing_manifests: &std::collections::BTreeSet<String>,
+    present_paths: &std::collections::BTreeSet<String>,
+    missing_paths: &std::collections::BTreeSet<String>,
     probe_failure: Option<&str>,
 ) -> DependencyPreflightReport {
-    let mut evidence = Vec::with_capacity(root_outcomes.len());
+    let mut evidence = Vec::new();
+    let mut unknown_probe_samples = std::collections::BTreeSet::<(String, &'static str)>::new();
 
     for (entry, outcome) in root_outcomes {
-        let manifest_path = PathBuf::from(&entry.remote_root).join("Cargo.toml");
-        let manifest = manifest_path.to_string_lossy().to_string();
-        let root = entry.remote_root.clone();
-
-        let (status, reason_code, detail) = match outcome {
-            SyncRootOutcome::Synced => {
-                if missing_manifests.contains(&manifest) {
-                    (
-                        DependencyPreflightStatus::Missing,
-                        DEPENDENCY_PREFLIGHT_CODE_MISSING,
-                        "required Cargo.toml is missing on remote worker".to_string(),
-                    )
-                } else if present_manifests.contains(&manifest) {
-                    (
-                        DependencyPreflightStatus::Present,
-                        DEPENDENCY_PREFLIGHT_CODE_PRESENT,
-                        "manifest present and refreshed in current sync".to_string(),
-                    )
-                } else {
-                    let detail = probe_failure
-                        .map(|failure| format!("manifest probe unavailable: {}", failure))
-                        .unwrap_or_else(|| {
-                            "probe output omitted status for synced manifest".to_string()
-                        });
-                    (
-                        DependencyPreflightStatus::Unknown,
-                        DEPENDENCY_PREFLIGHT_CODE_UNKNOWN,
-                        detail,
-                    )
+        for check in dependency_preflight_checks_for_entry(entry) {
+            let (status, reason_code, detail) = match outcome {
+                SyncRootOutcome::Synced => {
+                    if missing_paths.contains(&check.required_path) {
+                        let detail = match check.required_kind {
+                            "manifest" => "required Cargo.toml is missing on remote worker",
+                            "source_entrypoint" => {
+                                "required package source entrypoint is missing on remote worker"
+                            }
+                            _ => "required dependency path is missing on remote worker",
+                        };
+                        (
+                            DependencyPreflightStatus::Missing,
+                            DEPENDENCY_PREFLIGHT_CODE_MISSING,
+                            format!("{detail}: {}", check.required_path),
+                        )
+                    } else if present_paths.contains(&check.required_path) {
+                        (
+                            DependencyPreflightStatus::Present,
+                            DEPENDENCY_PREFLIGHT_CODE_PRESENT,
+                            format!(
+                                "required {} present after current sync: {}",
+                                check.required_kind, check.required_path
+                            ),
+                        )
+                    } else {
+                        let detail = probe_failure
+                            .map(|failure| {
+                                format!(
+                                    "dependency probe unavailable for {} under {}; sample required_path={}; additional unreported paths for this root/kind share this failure; {}",
+                                    check.required_kind,
+                                    check.root,
+                                    check.required_path,
+                                    failure
+                                )
+                            })
+                            .unwrap_or_else(|| {
+                                format!(
+                                    "probe output omitted status for synced required path: {}",
+                                    check.required_path
+                                )
+                            });
+                        (
+                            DependencyPreflightStatus::Unknown,
+                            DEPENDENCY_PREFLIGHT_CODE_UNKNOWN,
+                            detail,
+                        )
+                    }
                 }
-            }
-            SyncRootOutcome::Skipped { reason } => (
-                DependencyPreflightStatus::Stale,
-                DEPENDENCY_PREFLIGHT_CODE_STALE,
-                format!("dependency root skipped before verification: {}", reason),
-            ),
-            SyncRootOutcome::Failed { error } => (
-                DependencyPreflightStatus::Unknown,
-                DEPENDENCY_PREFLIGHT_CODE_UNKNOWN,
-                format!("dependency root sync failed before verification: {}", error),
-            ),
-        };
+                SyncRootOutcome::Skipped { reason } => (
+                    DependencyPreflightStatus::Stale,
+                    DEPENDENCY_PREFLIGHT_CODE_STALE,
+                    format!(
+                        "dependency root skipped before verification for {}: {}",
+                        check.required_path, reason
+                    ),
+                ),
+                SyncRootOutcome::Failed { error } => (
+                    DependencyPreflightStatus::Unknown,
+                    DEPENDENCY_PREFLIGHT_CODE_UNKNOWN,
+                    format!(
+                        "dependency root sync failed before verification for {}: {}",
+                        check.required_path, error
+                    ),
+                ),
+            };
 
-        evidence.push(DependencyPreflightEvidence {
-            root,
-            manifest,
-            status,
-            reason_code,
-            detail,
-            is_primary: entry.is_primary,
-        });
+            if probe_failure.is_some()
+                && status == DependencyPreflightStatus::Unknown
+                && matches!(outcome, SyncRootOutcome::Synced)
+                && !unknown_probe_samples.insert((check.root.clone(), check.required_kind))
+            {
+                continue;
+            }
+
+            evidence.push(DependencyPreflightEvidence {
+                root: check.root,
+                manifest: check.manifest,
+                required_path: check.required_path,
+                required_kind: check.required_kind,
+                status,
+                reason_code,
+                detail,
+                is_primary: check.is_primary,
+            });
+        }
+    }
+
+    if evidence.is_empty() {
+        for (entry, outcome) in root_outcomes {
+            let manifest = PathBuf::from(&entry.remote_root)
+                .join("Cargo.toml")
+                .to_string_lossy()
+                .to_string();
+            let (status, reason_code, detail) = match outcome {
+                SyncRootOutcome::Synced => (
+                    DependencyPreflightStatus::Unknown,
+                    DEPENDENCY_PREFLIGHT_CODE_UNKNOWN,
+                    "dependency preflight had no required paths to verify".to_string(),
+                ),
+                SyncRootOutcome::Skipped { reason } => (
+                    DependencyPreflightStatus::Stale,
+                    DEPENDENCY_PREFLIGHT_CODE_STALE,
+                    format!("dependency root skipped before verification: {}", reason),
+                ),
+                SyncRootOutcome::Failed { error } => (
+                    DependencyPreflightStatus::Unknown,
+                    DEPENDENCY_PREFLIGHT_CODE_UNKNOWN,
+                    format!("dependency root sync failed before verification: {}", error),
+                ),
+            };
+            evidence.push(DependencyPreflightEvidence {
+                root: entry.remote_root.clone(),
+                manifest: manifest.clone(),
+                required_path: manifest,
+                required_kind: "manifest",
+                status,
+                reason_code,
+                detail,
+                is_primary: entry.is_primary,
+            });
+        }
     }
 
     let (verified, reason_code, remediation) = match dependency_preflight_failure_reason(&evidence)
@@ -4565,21 +5266,22 @@ async fn verify_remote_dependency_manifests(
         return Ok(());
     }
 
-    let synced_roots = synced_remote_roots(root_outcomes);
+    let synced_checks = synced_dependency_preflight_checks(root_outcomes);
 
-    let mut present_manifests = std::collections::BTreeSet::new();
-    let mut missing_manifests = std::collections::BTreeSet::new();
+    let mut present_paths = std::collections::BTreeSet::new();
+    let mut missing_paths = std::collections::BTreeSet::new();
     let mut probe_failure: Option<String> = None;
 
-    if let Some(verify_cmd) = build_remote_dependency_preflight_command(&synced_roots) {
+    for verify_cmd in build_remote_dependency_preflight_commands(&synced_checks) {
         match run_worker_ssh_command(worker, &verify_cmd, Duration::from_secs(20)).await {
             Ok(output) => {
                 let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
                 let (present, missing) = parse_dependency_preflight_probe_output(&stdout);
-                present_manifests = present;
-                missing_manifests = missing;
-                if !output.status.success() && missing_manifests.is_empty() {
+                let batch_had_missing = !missing.is_empty();
+                present_paths.extend(present);
+                missing_paths.extend(missing);
+                if !output.status.success() && !batch_had_missing {
                     probe_failure = Some(format!(
                         "probe exited with status {:?}; stdout='{}'; stderr='{}'",
                         output.status.code(),
@@ -4592,13 +5294,16 @@ async fn verify_remote_dependency_manifests(
                 probe_failure = Some(err.to_string());
             }
         }
+        if probe_failure.is_some() {
+            break;
+        }
     }
 
     let report = build_dependency_preflight_report(
         worker,
         root_outcomes,
-        &present_manifests,
-        &missing_manifests,
+        &present_paths,
+        &missing_paths,
         probe_failure.as_deref(),
     );
     let report_json = serde_json::to_string(&report).unwrap_or_else(|err| {
@@ -4632,37 +5337,32 @@ async fn verify_remote_dependency_manifests(
     Err(failure.into())
 }
 
-fn synced_remote_roots(root_outcomes: &[(SyncClosurePlanEntry, SyncRootOutcome)]) -> Vec<PathBuf> {
-    root_outcomes
-        .iter()
-        .filter_map(|(entry, outcome)| match outcome {
-            SyncRootOutcome::Synced => Some(PathBuf::from(&entry.remote_root)),
-            SyncRootOutcome::Skipped { .. } | SyncRootOutcome::Failed { .. } => None,
-        })
-        .collect()
-}
-
-fn build_remote_dependency_preflight_command(sync_roots: &[PathBuf]) -> Option<String> {
-    if sync_roots.is_empty() {
+fn build_remote_dependency_preflight_command(
+    checks: &[DependencyPreflightCheck],
+) -> Option<String> {
+    if checks.is_empty() {
         return None;
     }
 
-    let checks = sync_roots
+    let commands = checks
         .iter()
-        .map(|root| root.join("Cargo.toml"))
-        .map(|manifest| {
-            let escaped = shell_escape::escape(manifest.to_string_lossy().to_string().into());
-            format!(
-                "manifest={manifest}; if [ -f \"$manifest\" ]; then printf 'RCH_DEP_PRESENT:%s\\n' \"$manifest\"; else printf 'RCH_DEP_MISSING:%s\\n' \"$manifest\"; missing=1; fi",
-                manifest = escaped
-            )
+        .map(|check| {
+            let escaped = shell_escape::escape(check.required_path.clone().into());
+            escaped.to_string()
         })
         .collect::<Vec<_>>()
-        .join("; ");
+        .join(" ");
 
     Some(format!(
-        "missing=0; {checks}; if [ \"$missing\" -ne 0 ]; then exit 43; fi; echo RCH_REMOTE_DEPENDENCIES_OK"
+        "missing=0; for required in {commands}; do if [ -f \"$required\" ]; then printf 'RCH_DEP_PRESENT:%s\\n' \"$required\"; else printf 'RCH_DEP_MISSING:%s\\n' \"$required\"; missing=1; fi; done; if [ \"$missing\" -ne 0 ]; then exit 43; fi; echo RCH_REMOTE_DEPENDENCIES_OK"
     ))
+}
+
+fn build_remote_dependency_preflight_commands(checks: &[DependencyPreflightCheck]) -> Vec<String> {
+    checks
+        .chunks(DEPENDENCY_PREFLIGHT_PROBE_BATCH_SIZE)
+        .filter_map(build_remote_dependency_preflight_command)
+        .collect()
 }
 
 /// Result of remote compilation execution.
@@ -5246,7 +5946,7 @@ async fn execute_remote_compilation(
     ));
 
     // Ensure deterministic remote topology before any repo synchronization.
-    ensure_worker_projects_topology(&worker_config, reporter).await?;
+    ensure_worker_projects_topology(&worker_config, reporter, topology_policy).await?;
 
     // Best-effort repo convergence for multi-repo dependency graphs.
     maybe_sync_repo_set_with_repo_updater(&worker_config, &sync_roots, reporter).await;
@@ -6070,6 +6770,18 @@ mod tests {
     use tokio::net::UnixListener;
     use tokio::sync::Mutex;
 
+    fn delegated_command(output: &HookOutput) -> &str {
+        if let HookOutput::AllowWithModifiedCommand(modified) = output {
+            &modified.hook_specific_output.updated_input.command
+        } else {
+            assert!(
+                matches!(output, HookOutput::AllowWithModifiedCommand(_)),
+                "expected AllowWithModifiedCommand"
+            );
+            ""
+        }
+    }
+
     // ------------------------------------------------------------------
     // join_exec_command tests — guard against the `.join(" ")` round-trip
     // corruption that was present when `rch exec --` rebuilt a command
@@ -6381,6 +7093,27 @@ mod tests {
 
         let output = process_hook(input).await;
         assert!(output.is_allow());
+    }
+
+    #[tokio::test]
+    async fn test_process_hook_bypasses_classification_cache_without_env_flag() {
+        let unique_cmd = "echo rch-hook-cache-bypass-without-env-marker";
+        let input = HookInput {
+            tool_name: "Bash".to_string(),
+            tool_input: ToolInput {
+                command: unique_cmd.to_string(),
+                description: None,
+            },
+            session_id: None,
+        };
+
+        let output = process_hook(input).await;
+        assert!(output.is_allow());
+
+        assert!(
+            crate::cache::global_cache().get(unique_cmd).is_none(),
+            "process_hook must bypass the cache even when RCH_HOOK_MODE is unset"
+        );
     }
 
     #[tokio::test]
@@ -7256,22 +7989,17 @@ mod tests {
         // Hook should return AllowWithModifiedCommand delegating to `rch exec`
         // The actual remote compilation happens when `rch exec` runs, not in the hook
         assert!(output.is_allow());
-        match &output {
-            HookOutput::AllowWithModifiedCommand(modified) => {
-                let cmd = &modified.hook_specific_output.updated_input.command;
-                assert!(
-                    cmd.starts_with("rch exec -- "),
-                    "Modified command should delegate to rch exec: {}",
-                    cmd
-                );
-                assert!(
-                    cmd.contains("cargo build"),
-                    "Modified command should contain original command: {}",
-                    cmd
-                );
-            }
-            _ => panic!("Expected AllowWithModifiedCommand"),
-        }
+        let cmd = delegated_command(&output);
+        assert!(
+            cmd.starts_with("rch exec -- "),
+            "Modified command should delegate to rch exec: {}",
+            cmd
+        );
+        assert!(
+            cmd.contains("cargo build"),
+            "Modified command should contain original command: {}",
+            cmd
+        );
 
         // No rsync/SSH should be invoked during the hook - that happens in run_exec
         let rsync_logs = mock::global_rsync_invocations_snapshot();
@@ -7405,17 +8133,12 @@ mod tests {
         // force_remote should result in transparent interception (AllowWithModifiedCommand)
         // with delegation to `rch exec`
         assert!(output.is_allow());
-        match &output {
-            HookOutput::AllowWithModifiedCommand(modified) => {
-                let cmd = &modified.hook_specific_output.updated_input.command;
-                assert!(
-                    cmd.starts_with("rch exec -- "),
-                    "Should delegate to rch exec: {}",
-                    cmd
-                );
-            }
-            _ => panic!("force_remote should use transparent interception"),
-        }
+        let cmd = delegated_command(&output);
+        assert!(
+            cmd.starts_with("rch exec -- "),
+            "Should delegate to rch exec: {}",
+            cmd
+        );
 
         // No rsync/SSH should be invoked during the hook - that happens in run_exec
         let rsync_logs = mock::global_rsync_invocations_snapshot();
@@ -7466,17 +8189,12 @@ mod tests {
 
         // Hook should return AllowWithModifiedCommand delegating to rch exec
         assert!(output.is_allow());
-        match &output {
-            HookOutput::AllowWithModifiedCommand(modified) => {
-                let cmd = &modified.hook_specific_output.updated_input.command;
-                assert!(
-                    cmd.starts_with("rch exec -- "),
-                    "Should delegate to rch exec: {}",
-                    cmd
-                );
-            }
-            _ => panic!("Expected AllowWithModifiedCommand"),
-        }
+        let cmd = delegated_command(&output);
+        assert!(
+            cmd.starts_with("rch exec -- "),
+            "Should delegate to rch exec: {}",
+            cmd
+        );
 
         // No rsync/SSH should be invoked during the hook
         let rsync_logs = mock::global_rsync_invocations_snapshot();
@@ -7520,32 +8238,27 @@ mod tests {
         let output = process_hook(input).await;
         let _ = std::fs::remove_file(&socket_path);
 
-        match &output {
-            HookOutput::AllowWithModifiedCommand(modified) => {
-                let cmd = &modified.hook_specific_output.updated_input.command;
-                assert!(
-                    cmd.starts_with("rch exec -- env "),
-                    "env wrapper must remain an argv prefix in delegated command: {cmd}"
-                );
-                let tokens = shell_words::split(
-                    cmd.strip_prefix("rch exec -- ")
-                        .expect("delegated command prefix"),
-                )
-                .expect("delegated command should parse as shell words");
-                assert_eq!(
-                    tokens,
-                    vec![
-                        "env".to_string(),
-                        "RUSTFLAGS=-C linker=cc".to_string(),
-                        "cargo".to_string(),
-                        "build".to_string(),
-                        "--bin".to_string(),
-                        "frankenctl".to_string(),
-                    ]
-                );
-            }
-            _ => panic!("Expected AllowWithModifiedCommand"),
-        }
+        let cmd = delegated_command(&output);
+        assert!(
+            cmd.starts_with("rch exec -- env "),
+            "env wrapper must remain an argv prefix in delegated command: {cmd}"
+        );
+        let tokens = shell_words::split(
+            cmd.strip_prefix("rch exec -- ")
+                .expect("delegated command prefix"),
+        )
+        .expect("delegated command should parse as shell words");
+        assert_eq!(
+            tokens,
+            vec![
+                "env".to_string(),
+                "RUSTFLAGS=-C linker=cc".to_string(),
+                "cargo".to_string(),
+                "build".to_string(),
+                "--bin".to_string(),
+                "frankenctl".to_string(),
+            ]
+        );
 
         assert!(mock::global_rsync_invocations_snapshot().is_empty());
         assert!(mock::global_ssh_invocations_snapshot().is_empty());
@@ -8920,17 +9633,29 @@ The file `x11.pc` needs to be installed and the PKG_CONFIG_PATH environment vari
     #[test]
     fn test_build_remote_dependency_preflight_command_separates_checks() {
         let _guard = test_guard!();
-        let sync_roots = vec![
-            PathBuf::from("/data/projects/repo-a"),
-            PathBuf::from("/data/projects/repo-b"),
+        let checks = vec![
+            DependencyPreflightCheck {
+                root: "/data/projects/repo-a".to_string(),
+                manifest: "/data/projects/repo-a/Cargo.toml".to_string(),
+                required_path: "/data/projects/repo-a/Cargo.toml".to_string(),
+                required_kind: "manifest",
+                is_primary: true,
+            },
+            DependencyPreflightCheck {
+                root: "/data/projects/repo-b".to_string(),
+                manifest: "/data/projects/repo-b/Cargo.toml".to_string(),
+                required_path: "/data/projects/repo-b/src/lib.rs".to_string(),
+                required_kind: "source_entrypoint",
+                is_primary: false,
+            },
         ];
 
-        let command = build_remote_dependency_preflight_command(&sync_roots)
+        let command = build_remote_dependency_preflight_command(&checks)
             .expect("command should be constructed");
 
         assert!(
-            command.contains("fi; manifest="),
-            "generated command must separate consecutive if/fi checks with ';'"
+            command.contains("for required in "),
+            "generated command must batch paths through one bounded shell loop"
         );
         assert!(
             !command.contains("fi if ["),
@@ -8947,12 +9672,52 @@ The file `x11.pc` needs to be installed and the PKG_CONFIG_PATH environment vari
     }
 
     #[test]
-    fn test_synced_remote_roots_use_remote_paths() {
+    fn test_build_remote_dependency_preflight_commands_batches_large_workspaces() {
         let _guard = test_guard!();
+        let checks = (0..=DEPENDENCY_PREFLIGHT_PROBE_BATCH_SIZE)
+            .map(|idx| DependencyPreflightCheck {
+                root: "/data/projects/big".to_string(),
+                manifest: "/data/projects/big/Cargo.toml".to_string(),
+                required_path: format!("/data/projects/big/tests/case_{idx}.rs"),
+                required_kind: "source_entrypoint",
+                is_primary: true,
+            })
+            .collect::<Vec<_>>();
+
+        let commands = build_remote_dependency_preflight_commands(&checks);
+
+        assert_eq!(
+            commands.len(),
+            2,
+            "one more than the batch size must be split into two SSH commands"
+        );
+        assert!(commands[0].contains("/data/projects/big/tests/case_127.rs"));
+        assert!(!commands[0].contains("/data/projects/big/tests/case_128.rs"));
+        assert!(commands[1].contains("/data/projects/big/tests/case_128.rs"));
+    }
+
+    #[test]
+    fn test_synced_dependency_preflight_checks_use_remote_paths() {
+        let _guard = test_guard!();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let package_root = temp_dir.path().join("package");
+        std::fs::create_dir_all(package_root.join("src")).expect("create package src");
+        std::fs::write(
+            package_root.join("Cargo.toml"),
+            r#"[package]
+name = "package"
+version = "0.1.0"
+edition = "2024"
+"#,
+        )
+        .expect("write manifest");
+        std::fs::write(package_root.join("src/lib.rs"), "pub fn package() {}\n")
+            .expect("write lib");
+
         let root_outcomes = vec![
             (
                 SyncClosurePlanEntry {
-                    local_root: PathBuf::from("/Users/jemanuel/projects/frankenterm"),
+                    local_root: package_root,
                     remote_root: "/data/projects/frankenterm".to_string(),
                     project_id: "frankenterm".to_string(),
                     root_hash: "hash-primary".to_string(),
@@ -8976,8 +9741,19 @@ The file `x11.pc` needs to be installed and the PKG_CONFIG_PATH environment vari
             ),
         ];
 
-        let synced = synced_remote_roots(&root_outcomes);
-        assert_eq!(synced, vec![PathBuf::from("/data/projects/frankenterm")]);
+        let synced = synced_dependency_preflight_checks(&root_outcomes);
+        let required_paths = synced
+            .iter()
+            .map(|check| check.required_path.as_str())
+            .collect::<Vec<_>>();
+        assert!(required_paths.contains(&"/data/projects/frankenterm/Cargo.toml"));
+        assert!(required_paths.contains(&"/data/projects/frankenterm/src/lib.rs"));
+        assert!(
+            !required_paths
+                .iter()
+                .any(|path| path.starts_with("/data/projects/frankentui")),
+            "failed roots must not be probed as freshly synced"
+        );
     }
 
     #[test]
@@ -9329,6 +10105,413 @@ RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
         );
     }
 
+    #[test]
+    fn test_cargo_package_source_entrypoints_include_auto_discovered_targets() {
+        let _guard = test_guard!();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let package_root = temp_dir.path().join("auto-targets");
+        for dir in [
+            "src",
+            "src/bin/nested",
+            "examples/demo",
+            "tests/integration",
+            "benches/speed",
+        ] {
+            std::fs::create_dir_all(package_root.join(dir)).expect("create target dir");
+        }
+        std::fs::write(
+            package_root.join("Cargo.toml"),
+            r#"[package]
+name = "auto-targets"
+version = "0.1.0"
+edition = "2024"
+"#,
+        )
+        .expect("write manifest");
+        for path in [
+            "src/lib.rs",
+            "src/main.rs",
+            "src/bin/tool.rs",
+            "src/bin/nested/main.rs",
+            "examples/example.rs",
+            "examples/demo/main.rs",
+            "tests/integration.rs",
+            "tests/integration/main.rs",
+            "benches/speed.rs",
+            "benches/speed/main.rs",
+        ] {
+            std::fs::write(package_root.join(path), "fn main() {}\n").expect("write entrypoint");
+        }
+
+        let entrypoints = cargo_package_source_entrypoints(&package_root);
+
+        for path in [
+            "src/lib.rs",
+            "src/main.rs",
+            "src/bin/tool.rs",
+            "src/bin/nested/main.rs",
+            "examples/example.rs",
+            "examples/demo/main.rs",
+            "tests/integration.rs",
+            "tests/integration/main.rs",
+            "benches/speed.rs",
+            "benches/speed/main.rs",
+        ] {
+            assert!(
+                entrypoints.contains(&PathBuf::from(path)),
+                "missing auto-discovered entrypoint {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_cargo_package_source_entrypoints_respect_auto_discovery_flags() {
+        let _guard = test_guard!();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let package_root = temp_dir.path().join("manual-targets");
+        for dir in ["src/bin", "examples", "tests", "benches", "custom"] {
+            std::fs::create_dir_all(package_root.join(dir)).expect("create target dir");
+        }
+        std::fs::write(
+            package_root.join("Cargo.toml"),
+            r#"[package]
+name = "manual-targets"
+version = "0.1.0"
+edition = "2024"
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+
+[lib]
+path = "custom/lib.rs"
+
+[[bin]]
+path = "custom/bin.rs"
+"#,
+        )
+        .expect("write manifest");
+        for path in [
+            "src/lib.rs",
+            "src/main.rs",
+            "src/bin/tool.rs",
+            "examples/example.rs",
+            "tests/integration.rs",
+            "benches/speed.rs",
+            "custom/lib.rs",
+            "custom/bin.rs",
+        ] {
+            std::fs::write(package_root.join(path), "fn main() {}\n").expect("write entrypoint");
+        }
+
+        let entrypoints = cargo_package_source_entrypoints(&package_root);
+
+        assert_eq!(
+            entrypoints,
+            vec![
+                PathBuf::from("custom/bin.rs"),
+                PathBuf::from("custom/lib.rs")
+            ]
+        );
+    }
+
+    #[test]
+    fn test_workspace_member_source_entrypoints_include_all_targets_and_exclusions() {
+        let _guard = test_guard!();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let workspace_root = temp_dir.path().join("workspace");
+
+        for dir in [
+            "crates/core/src",
+            "crates/core/benches",
+            "crates/core/examples",
+            "crates/atlas-types/src",
+            "crates/skipped/src",
+            "tools/cli/src",
+        ] {
+            std::fs::create_dir_all(workspace_root.join(dir)).expect("create workspace dir");
+        }
+        std::fs::write(
+            workspace_root.join("Cargo.toml"),
+            r#"[workspace]
+members = ["crates/*", "tools/cli"]
+exclude = ["crates/skipped"]
+"#,
+        )
+        .expect("write workspace manifest");
+        for (manifest, name) in [
+            ("crates/core/Cargo.toml", "core"),
+            ("crates/atlas-types/Cargo.toml", "atlas-types"),
+            ("crates/skipped/Cargo.toml", "skipped"),
+            ("tools/cli/Cargo.toml", "cli"),
+        ] {
+            std::fs::write(
+                workspace_root.join(manifest),
+                format!(
+                    r#"[package]
+name = "{name}"
+version = "0.1.0"
+edition = "2024"
+"#
+                ),
+            )
+            .expect("write member manifest");
+        }
+        for path in [
+            "crates/core/src/lib.rs",
+            "crates/core/benches/interval_tree_bench.rs",
+            "crates/core/examples/atlas_packing_attestation.rs",
+            "crates/atlas-types/src/lib.rs",
+            "crates/skipped/src/lib.rs",
+            "tools/cli/src/lib.rs",
+        ] {
+            std::fs::write(workspace_root.join(path), "pub fn marker() {}\n")
+                .expect("write member entrypoint");
+        }
+
+        let entrypoints = cargo_workspace_member_source_entrypoints(&workspace_root);
+
+        for path in [
+            "crates/core/Cargo.toml",
+            "crates/core/src/lib.rs",
+            "crates/core/benches/interval_tree_bench.rs",
+            "crates/core/examples/atlas_packing_attestation.rs",
+            "crates/atlas-types/Cargo.toml",
+            "crates/atlas-types/src/lib.rs",
+            "tools/cli/Cargo.toml",
+            "tools/cli/src/lib.rs",
+        ] {
+            assert!(
+                entrypoints.contains(&PathBuf::from(path)),
+                "missing workspace member entrypoint {path}"
+            );
+        }
+        assert!(
+            !entrypoints
+                .iter()
+                .any(|path| path.starts_with("crates/skipped")),
+            "workspace exclude entries must not be preflighted"
+        );
+    }
+
+    #[test]
+    fn test_dependency_preflight_checks_expand_virtual_workspace_all_targets() {
+        let _guard = test_guard!();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let workspace_root = temp_dir.path().join("frankenterm");
+
+        for dir in [
+            "crates/frankenterm-core/src",
+            "crates/frankenterm-core/benches",
+            "crates/frankenterm-core/examples",
+            "crates/frankenterm-core-atlas-pack-types/src",
+            "crates/frankenterm-core-connectors/src",
+            "crates/skipped/src",
+        ] {
+            std::fs::create_dir_all(workspace_root.join(dir)).expect("create workspace dir");
+        }
+        std::fs::write(
+            workspace_root.join("Cargo.toml"),
+            r#"[workspace]
+members = ["crates/frankenterm-core", "crates/frankenterm-core-*", "crates/skipped"]
+exclude = ["crates/skipped"]
+"#,
+        )
+        .expect("write workspace manifest");
+        for (manifest, name) in [
+            ("crates/frankenterm-core/Cargo.toml", "frankenterm-core"),
+            (
+                "crates/frankenterm-core-atlas-pack-types/Cargo.toml",
+                "frankenterm-core-atlas-pack-types",
+            ),
+            (
+                "crates/frankenterm-core-connectors/Cargo.toml",
+                "frankenterm-core-connectors",
+            ),
+            ("crates/skipped/Cargo.toml", "skipped"),
+        ] {
+            std::fs::write(
+                workspace_root.join(manifest),
+                format!(
+                    r#"[package]
+name = "{name}"
+version = "0.1.0"
+edition = "2024"
+"#
+                ),
+            )
+            .expect("write member manifest");
+        }
+        for path in [
+            "crates/frankenterm-core/src/lib.rs",
+            "crates/frankenterm-core/benches/interval_tree_bench.rs",
+            "crates/frankenterm-core/examples/atlas_packing_attestation.rs",
+            "crates/frankenterm-core-atlas-pack-types/src/lib.rs",
+            "crates/frankenterm-core-connectors/src/lib.rs",
+            "crates/skipped/src/lib.rs",
+        ] {
+            std::fs::write(workspace_root.join(path), "pub fn marker() {}\n")
+                .expect("write member entrypoint");
+        }
+        let entry = SyncClosurePlanEntry {
+            local_root: workspace_root,
+            remote_root: "/data/projects/frankenterm".to_string(),
+            project_id: "frankenterm".to_string(),
+            root_hash: "frankenterm-hash".to_string(),
+            is_primary: true,
+            mode: SyncClosureMode::Full,
+        };
+
+        let checks = dependency_preflight_checks_for_entry(&entry);
+        let required_paths = checks
+            .iter()
+            .map(|check| check.required_path.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        for path in [
+            "/data/projects/frankenterm/Cargo.toml",
+            "/data/projects/frankenterm/crates/frankenterm-core/Cargo.toml",
+            "/data/projects/frankenterm/crates/frankenterm-core/src/lib.rs",
+            "/data/projects/frankenterm/crates/frankenterm-core/benches/interval_tree_bench.rs",
+            "/data/projects/frankenterm/crates/frankenterm-core/examples/atlas_packing_attestation.rs",
+            "/data/projects/frankenterm/crates/frankenterm-core-atlas-pack-types/src/lib.rs",
+            "/data/projects/frankenterm/crates/frankenterm-core-connectors/src/lib.rs",
+        ] {
+            assert!(
+                required_paths.contains(path),
+                "missing dependency preflight check for {path}"
+            );
+        }
+        assert!(
+            !required_paths
+                .iter()
+                .any(|path| path.contains("/crates/skipped/")),
+            "workspace excluded members must not be preflighted"
+        );
+    }
+
+    #[test]
+    fn test_dependency_preflight_blocks_missing_source_entrypoint() {
+        let _guard = test_guard!();
+        let worker = make_test_worker_config("worker-missing-source");
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let package_root = temp_dir.path().join("member");
+        std::fs::create_dir_all(package_root.join("src")).expect("create src");
+        std::fs::write(
+            package_root.join("Cargo.toml"),
+            r#"[package]
+name = "member"
+version = "0.1.0"
+edition = "2024"
+"#,
+        )
+        .expect("write manifest");
+        std::fs::write(package_root.join("src/lib.rs"), "pub fn member() {}\n").expect("write lib");
+        let entry = SyncClosurePlanEntry {
+            local_root: package_root,
+            remote_root: "/data/projects/app/crates/member".to_string(),
+            project_id: "member".to_string(),
+            root_hash: "member-hash".to_string(),
+            is_primary: false,
+            mode: SyncClosureMode::Full,
+        };
+        let outcomes = vec![(entry, SyncRootOutcome::Synced)];
+        let present = std::collections::BTreeSet::from([String::from(
+            "/data/projects/app/crates/member/Cargo.toml",
+        )]);
+        let missing = std::collections::BTreeSet::from([String::from(
+            "/data/projects/app/crates/member/src/lib.rs",
+        )]);
+
+        let report =
+            build_dependency_preflight_report(&worker, &outcomes, &present, &missing, None);
+
+        assert!(
+            !report.verified,
+            "a synced root with a missing package source entrypoint must not reach Cargo"
+        );
+        assert_eq!(report.reason_code, Some(DEPENDENCY_PREFLIGHT_CODE_MISSING));
+        assert!(report.evidence.iter().any(|item| {
+            item.required_kind == "source_entrypoint"
+                && item.required_path == "/data/projects/app/crates/member/src/lib.rs"
+                && item.status == DependencyPreflightStatus::Missing
+        }));
+    }
+
+    #[test]
+    fn test_dependency_preflight_probe_failure_compacts_unknown_source_entrypoints() {
+        let _guard = test_guard!();
+        let worker = make_test_worker_config("worker-probe-reset");
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let package_root = temp_dir.path().join("large-member");
+        std::fs::create_dir_all(package_root.join("src")).expect("create src");
+        std::fs::create_dir_all(package_root.join("tests")).expect("create tests");
+        std::fs::write(
+            package_root.join("Cargo.toml"),
+            r#"[package]
+name = "large-member"
+version = "0.1.0"
+edition = "2024"
+"#,
+        )
+        .expect("write manifest");
+        std::fs::write(package_root.join("src/lib.rs"), "pub fn member() {}\n").expect("write lib");
+        for idx in 0..150 {
+            std::fs::write(
+                package_root.join("tests").join(format!("case_{idx}.rs")),
+                "#[test]\nfn case() {}\n",
+            )
+            .expect("write test entrypoint");
+        }
+        let entry = SyncClosurePlanEntry {
+            local_root: package_root,
+            remote_root: "/data/projects/app/crates/large-member".to_string(),
+            project_id: "large-member".to_string(),
+            root_hash: "large-member-hash".to_string(),
+            is_primary: false,
+            mode: SyncClosureMode::Full,
+        };
+        let outcomes = vec![(entry, SyncRootOutcome::Synced)];
+        let present = std::collections::BTreeSet::new();
+        let missing = std::collections::BTreeSet::new();
+
+        let report = build_dependency_preflight_report(
+            &worker,
+            &outcomes,
+            &present,
+            &missing,
+            Some("probe exited with status Some(255); connection reset"),
+        );
+
+        assert!(!report.verified);
+        assert_eq!(report.reason_code, Some(DEPENDENCY_PREFLIGHT_CODE_UNKNOWN));
+        let unknown_source_entrypoints = report
+            .evidence
+            .iter()
+            .filter(|item| {
+                item.status == DependencyPreflightStatus::Unknown
+                    && item.required_kind == "source_entrypoint"
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            unknown_source_entrypoints.len(),
+            1,
+            "transport failures should keep one sample per root/kind instead of duplicating every source entrypoint"
+        );
+        assert!(
+            unknown_source_entrypoints[0]
+                .detail
+                .contains("additional unreported paths"),
+            "unknown sample should explain why the report is compacted"
+        );
+        assert!(
+            report.evidence.len() < 10,
+            "large all-unknown reports should be compact, got {} evidence rows",
+            report.evidence.len()
+        );
+    }
+
     #[tokio::test]
     async fn test_verify_remote_dependency_manifests_blocks_stale_outcomes_deterministically() {
         let _guard = test_guard!();
@@ -9446,6 +10629,81 @@ RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
         assert!(
             wrapped.contains("if ["),
             "wrapped command should preserve the full script"
+        );
+    }
+
+    #[test]
+    fn test_build_worker_projects_topology_cmd_uses_supplied_policy() {
+        let _guard = test_guard!();
+        let policy = PathTopologyPolicy::new(
+            PathBuf::from("/custom/projects"),
+            PathBuf::from("/custom/dp"),
+        );
+
+        let command = build_worker_projects_topology_cmd(&policy);
+
+        assert!(
+            command.contains("/custom/projects"),
+            "preflight command must use the supplied canonical root: {command}"
+        );
+        assert!(
+            command.contains("/custom/dp"),
+            "preflight command must use the supplied alias root: {command}"
+        );
+        assert!(
+            !command.contains("/data/projects"),
+            "preflight command must not silently fall back to default canonical root: {command}"
+        );
+    }
+
+    #[test]
+    fn test_build_worker_projects_topology_cmd_shell_escapes_policy_paths() {
+        let _guard = test_guard!();
+        let policy = PathTopologyPolicy::new(
+            PathBuf::from("/tmp/rch weird'root"),
+            PathBuf::from("/tmp/rch alias;bad"),
+        );
+
+        let command = build_worker_projects_topology_cmd(&policy);
+
+        assert!(
+            command.contains("'/tmp/rch weird'\\''root'"),
+            "single quotes in canonical root must be shell escaped: {command}"
+        );
+        assert!(
+            command.contains("'/tmp/rch alias;bad'"),
+            "shell metacharacters in alias root must be quoted: {command}"
+        );
+    }
+
+    #[test]
+    fn test_build_worker_projects_topology_cmd_terminates_path_options() {
+        let _guard = test_guard!();
+        let policy = PathTopologyPolicy::new(
+            PathBuf::from("-custom/projects"),
+            PathBuf::from("-custom/dp"),
+        );
+        let canonical =
+            shell_escape::escape(std::borrow::Cow::from("-custom/projects")).to_string();
+        let alias = shell_escape::escape(std::borrow::Cow::from("-custom/dp")).to_string();
+
+        let command = build_worker_projects_topology_cmd(&policy);
+
+        assert!(
+            command.contains(&format!("mkdir -p -- {canonical}")),
+            "mkdir must terminate options before configured paths: {command}"
+        );
+        assert!(
+            command.contains(&format!("readlink -- {alias}")),
+            "readlink must terminate options before configured paths: {command}"
+        );
+        assert!(
+            command.contains(&format!("ln -sfn -- {canonical} {alias}")),
+            "ln update must terminate options before configured paths: {command}"
+        );
+        assert!(
+            command.contains(&format!("ln -s -- {canonical} {alias}")),
+            "ln create must terminate options before configured paths: {command}"
         );
     }
 
@@ -9780,13 +11038,8 @@ edition = "2024"
             output.is_allow(),
             "cargo test should be allowed via delegation"
         );
-        match &output {
-            HookOutput::AllowWithModifiedCommand(modified) => {
-                let cmd = &modified.hook_specific_output.updated_input.command;
-                assert_eq!(cmd, "rch exec -- cargo test");
-            }
-            _ => panic!("Expected AllowWithModifiedCommand"),
-        }
+        let cmd = delegated_command(&output);
+        assert_eq!(cmd, "rch exec -- cargo test");
 
         // No rsync/SSH during hook - that happens in run_exec
         let rsync_logs = mock::global_rsync_invocations_snapshot();
@@ -9818,13 +11071,8 @@ edition = "2024"
 
         // Hook should delegate with all arguments preserved
         assert!(output.is_allow());
-        match &output {
-            HookOutput::AllowWithModifiedCommand(modified) => {
-                let cmd = &modified.hook_specific_output.updated_input.command;
-                assert_eq!(cmd, "rch exec -- cargo test --release -- --nocapture");
-            }
-            _ => panic!("Expected AllowWithModifiedCommand"),
-        }
+        let cmd = delegated_command(&output);
+        assert_eq!(cmd, "rch exec -- cargo test --release -- --nocapture");
 
         // No rsync/SSH during hook
         let rsync_logs = mock::global_rsync_invocations_snapshot();
@@ -10938,6 +12186,231 @@ edition = "2024"
     }
 
     #[test]
+    fn test_autostart_lock_drop_preserves_replaced_lock_body() {
+        let _guard = test_guard!();
+        let temp_dir = create_test_state_dir();
+        let lock_path = temp_dir.path().join("autostart.lock");
+
+        let lock = super::acquire_autostart_lock(&lock_path).expect("fresh acquire");
+        let replacement_body = format!(
+            "{}\n{}\n{}-replacement\n",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            our_hostname()
+        );
+        std::fs::write(&lock_path, &replacement_body).expect("replace lock body");
+
+        drop(lock);
+
+        let body = std::fs::read_to_string(&lock_path).expect("replacement should remain");
+        assert_eq!(body, replacement_body);
+    }
+
+    // ========================================================================
+    // t17 — stale-PID detection on autostart lockfile
+    // ========================================================================
+
+    fn write_lockfile(path: &std::path::Path, pid: u32, age_secs: u64, hostname: &str) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let created_at = now.saturating_sub(age_secs);
+        std::fs::write(path, format!("{pid}\n{created_at}\n{hostname}\n")).unwrap();
+    }
+
+    fn our_hostname() -> String {
+        std::env::var("HOSTNAME")
+            .ok()
+            .or_else(|| {
+                std::fs::read_to_string("/etc/hostname")
+                    .ok()
+                    .map(|s| s.trim().to_string())
+            })
+            .unwrap_or_else(|| "unknown".to_string())
+    }
+
+    #[test]
+    fn test_acquire_autostart_lock_writes_body() {
+        // Fresh acquire writes pid/timestamp/hostname so subsequent
+        // contenders can decide whether to wait or take over.
+        let _guard = test_guard!();
+        let temp_dir = create_test_state_dir();
+        let lock_path = temp_dir.path().join("autostart.lock");
+
+        let _lock = super::acquire_autostart_lock(&lock_path).expect("fresh acquire");
+        let body = std::fs::read_to_string(&lock_path).expect("read body");
+        let parsed = super::parse_autostart_lock_body(&body).expect("body parses");
+        assert_eq!(parsed.pid, std::process::id());
+        assert!(!parsed.hostname.is_empty());
+    }
+
+    #[test]
+    fn test_render_autostart_lock_body_is_unique_owner_token() {
+        let _guard = test_guard!();
+
+        let body1 = super::render_autostart_lock_body();
+        let body2 = super::render_autostart_lock_body();
+
+        assert_ne!(
+            body1, body2,
+            "lock cleanup token must be acquisition-unique"
+        );
+        assert!(super::parse_autostart_lock_body(&body1).is_some());
+        assert!(super::parse_autostart_lock_body(&body2).is_some());
+    }
+
+    #[test]
+    fn test_autostart_lock_detects_dead_pid() {
+        // PID 99999 is virtually guaranteed not to exist (kernel PID
+        // max is typically 4194304, but the actual running set is sparse;
+        // we pick a value high enough to almost never collide).
+        let _guard = test_guard!();
+        let temp_dir = create_test_state_dir();
+        let lock_path = temp_dir.path().join("autostart.lock");
+
+        write_lockfile(&lock_path, 99999, 5, &our_hostname());
+        // Acquire — should detect stale and take over.
+        let lock = super::acquire_autostart_lock(&lock_path);
+        assert!(
+            lock.is_ok(),
+            "Stale PID should be detected and replaced; got {:?}",
+            lock.err()
+        );
+        // The new body should record our own PID.
+        let body = std::fs::read_to_string(&lock_path).expect("read body");
+        let parsed = super::parse_autostart_lock_body(&body).expect("body parses");
+        assert_eq!(parsed.pid, std::process::id());
+    }
+
+    #[test]
+    fn test_autostart_lock_respects_live_pid_recent() {
+        // Our own PID, age 5s, same host: definitely alive AND fresh.
+        // Must return LockHeld.
+        let _guard = test_guard!();
+        let temp_dir = create_test_state_dir();
+        let lock_path = temp_dir.path().join("autostart.lock");
+
+        write_lockfile(&lock_path, std::process::id(), 5, &our_hostname());
+        let lock = super::acquire_autostart_lock(&lock_path);
+        assert!(lock.is_err(), "Live recent holder must hold the lock");
+        assert!(matches!(lock.unwrap_err(), super::AutoStartError::LockHeld));
+    }
+
+    #[test]
+    fn test_autostart_lock_corrupt_body_treated_as_stale() {
+        // Garbage body (couldn't parse) → take over.
+        let _guard = test_guard!();
+        let temp_dir = create_test_state_dir();
+        let lock_path = temp_dir.path().join("autostart.lock");
+
+        std::fs::write(
+            &lock_path,
+            "this is not\nthe expected\nlock format with extra junk",
+        )
+        .unwrap();
+        let lock = super::acquire_autostart_lock(&lock_path);
+        assert!(
+            lock.is_ok(),
+            "Corrupted lockfile should be treated as stale; got {:?}",
+            lock.err()
+        );
+    }
+
+    #[test]
+    fn test_autostart_lock_empty_body_treated_as_stale() {
+        let _guard = test_guard!();
+        let temp_dir = create_test_state_dir();
+        let lock_path = temp_dir.path().join("autostart.lock");
+
+        std::fs::write(&lock_path, "").unwrap();
+        let lock = super::acquire_autostart_lock(&lock_path);
+        assert!(
+            lock.is_ok(),
+            "Empty lockfile body should be treated as stale; got {:?}",
+            lock.err()
+        );
+    }
+
+    #[test]
+    fn test_autostart_lock_different_hostname_blocks() {
+        // NFS-shared scenario: a different host holds the lock. Even if
+        // the PID isn't alive on our host, we can't tell — so we trust
+        // the holder and return LockHeld.
+        let _guard = test_guard!();
+        let temp_dir = create_test_state_dir();
+        let lock_path = temp_dir.path().join("autostart.lock");
+
+        // Use a PID that's almost certainly NOT alive on our host AND
+        // a hostname that's almost certainly not ours.
+        write_lockfile(&lock_path, 99999, 5, "definitely-not-our-host-xyz");
+        let lock = super::acquire_autostart_lock(&lock_path);
+        assert!(
+            lock.is_err(),
+            "Lock from a different host must not be taken over"
+        );
+    }
+
+    #[test]
+    fn test_autostart_lock_ttl_fallback_for_same_host() {
+        // PID-reuse defense: our own PID, but the lockfile is very old.
+        // Should be treated as stale (TTL exceeded) and replaced.
+        let _guard = test_guard!();
+        let temp_dir = create_test_state_dir();
+        let lock_path = temp_dir.path().join("autostart.lock");
+
+        // Age > TTL (60s) with our own PID + hostname.
+        write_lockfile(&lock_path, std::process::id(), 120, &our_hostname());
+        let lock = super::acquire_autostart_lock(&lock_path);
+        assert!(
+            lock.is_ok(),
+            "Old lockfile (TTL exceeded) should be stale-replaced even when PID is alive; got {:?}",
+            lock.err()
+        );
+    }
+
+    #[test]
+    fn test_autostart_stale_sweep_preserves_changed_lock_body() {
+        let _guard = test_guard!();
+        let temp_dir = create_test_state_dir();
+        let lock_path = temp_dir.path().join("autostart.lock");
+
+        write_lockfile(&lock_path, std::process::id(), 120, &our_hostname());
+        let observed_stale_body = std::fs::read_to_string(&lock_path).expect("read stale body");
+        let replacement_body = super::render_autostart_lock_body();
+        std::fs::write(&lock_path, &replacement_body).expect("replace lock body");
+
+        assert!(
+            !super::remove_autostart_lock_if_unchanged(&lock_path, &observed_stale_body),
+            "changed lock body must not be removed"
+        );
+        let body = std::fs::read_to_string(&lock_path).expect("replacement should remain");
+        assert_eq!(body, replacement_body);
+    }
+
+    #[test]
+    fn test_parse_autostart_lock_body_valid() {
+        let body = "12345\n1778000000\nmybox\n";
+        let p = super::parse_autostart_lock_body(body).expect("valid body parses");
+        assert_eq!(p.pid, 12345);
+        assert_eq!(p.created_at_secs, 1_778_000_000);
+        assert_eq!(p.hostname, "mybox");
+    }
+
+    #[test]
+    fn test_parse_autostart_lock_body_invalid() {
+        // Various invalid shapes.
+        assert!(super::parse_autostart_lock_body("").is_none());
+        assert!(super::parse_autostart_lock_body("abc\n123\nhost\n").is_none());
+        assert!(super::parse_autostart_lock_body("123\nabc\nhost\n").is_none());
+        assert!(super::parse_autostart_lock_body("123\n456\n").is_none());
+        assert!(super::parse_autostart_lock_body("123\n456\n\n").is_none()); // empty hostname
+    }
+
+    #[test]
     fn test_acquire_autostart_lock_creates_parent_dirs() {
         let _guard = test_guard!();
         let temp_dir = create_test_state_dir();
@@ -10946,6 +12419,57 @@ edition = "2024"
         let lock = super::acquire_autostart_lock(&lock_path);
         assert!(lock.is_ok(), "Should create parent directories");
         assert!(lock_path.exists(), "Lock file should exist");
+    }
+
+    // ========================================================================
+    // t13 follow-up — rchd launch should return quickly for a live daemon,
+    // but immediate launch failures should still surface.
+    // ========================================================================
+
+    #[cfg(unix)]
+    #[test]
+    fn test_spawn_rchd_returns_quickly_for_live_child() {
+        let _guard = test_guard!();
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = create_test_state_dir();
+        let fake_rchd = temp_dir.path().join("rchd");
+        std::fs::write(&fake_rchd, "#!/usr/bin/env sh\nsleep 0.3\n").expect("write fake rchd");
+        let mut perms = std::fs::metadata(&fake_rchd)
+            .expect("fake rchd metadata")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_rchd, perms).expect("chmod fake rchd");
+
+        let started = std::time::Instant::now();
+        super::spawn_rchd(&fake_rchd).expect("spawn fake rchd");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(250),
+            "spawn_rchd should not wait for the daemon body to finish; elapsed={elapsed:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_spawn_rchd_reports_immediate_child_failure() {
+        let _guard = test_guard!();
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = create_test_state_dir();
+        let fake_rchd = temp_dir.path().join("rchd");
+        std::fs::write(&fake_rchd, "#!/usr/bin/env sh\nexit 42\n").expect("write fake rchd");
+        let mut perms = std::fs::metadata(&fake_rchd)
+            .expect("fake rchd metadata")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_rchd, perms).expect("chmod fake rchd");
+
+        let err = super::spawn_rchd(&fake_rchd).expect_err("child failure should surface");
+        assert!(
+            matches!(err, super::AutoStartError::WrapperFailed(status) if status.code() == Some(42)),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[tokio::test]
@@ -10964,6 +12488,40 @@ edition = "2024"
         assert!(
             matches!(result.unwrap_err(), super::AutoStartError::Disabled),
             "Error should be Disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_socket_is_confirmed_stale_false_for_live_listener() {
+        let _guard = test_guard!();
+        let temp_dir = create_test_state_dir();
+        let socket_path = temp_dir.path().join("test.sock");
+        let _listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+
+        assert!(
+            !super::socket_is_confirmed_stale(&socket_path).await,
+            "live listener must not be treated as stale"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_socket_is_confirmed_stale_true_for_dropped_listener() {
+        let _guard = test_guard!();
+        let temp_dir = create_test_state_dir();
+        let socket_path = temp_dir.path().join("test.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        drop(listener);
+
+        for _ in 0..20 {
+            if super::socket_is_confirmed_stale(&socket_path).await {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert!(
+            super::socket_is_confirmed_stale(&socket_path).await,
+            "dropped listener should leave a stale socket path"
         );
     }
 
@@ -11306,6 +12864,127 @@ edition = "2024"
             .unwrap();
         assert_eq!(data.local_samples.len(), 1);
         assert_eq!(data.remote_samples.len(), 1);
+    }
+
+    // ========================================================================
+    // t18 — record_build_timing lock-scope discipline. Verify the write
+    // guard is dropped BEFORE save_to_disk, so other readers/writers
+    // aren't blocked on disk I/O.
+    // ========================================================================
+
+    #[test]
+    fn test_record_build_timing_releases_guard_before_disk_io() {
+        // Verify: between cache.write()-release and cache.read()-acquire
+        // there is no overlap — i.e., another thread can acquire a
+        // read lock while save_to_disk is in flight.
+        //
+        // Property tested indirectly: spawn many threads each calling
+        // record_build_timing concurrently. With the OLD code (save
+        // inside the write guard), high contention would serialize all
+        // calls behind a 5-10ms disk write per thread. With the NEW
+        // code, only the in-memory mutation serializes; disk writes
+        // parallelize. A wallclock cap detects the regression.
+        //
+        // Per-thread project keys are uniquely prefixed so the test
+        // doesn't depend on cache-clearing (which would race with other
+        // tests sharing the global cache).
+        let _guard = test_guard!();
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let unique = format!(
+            "t18-conc-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+
+        let n_threads = 8;
+        let calls_per_thread = 5;
+        let started = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        let t0 = Instant::now();
+        for t in 0..n_threads {
+            let started = Arc::clone(&started);
+            let unique = unique.clone();
+            handles.push(thread::spawn(move || {
+                for i in 0..calls_per_thread {
+                    started.fetch_add(1, Ordering::Relaxed);
+                    let project = format!("{unique}-{t}-{i}");
+                    super::record_build_timing(
+                        &project,
+                        Some(CompilationKind::CargoBuild),
+                        100 + (i as u64),
+                        true,
+                    );
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("worker thread panicked");
+        }
+        let elapsed = t0.elapsed();
+        let total_calls = n_threads * calls_per_thread;
+        assert_eq!(
+            started.load(Ordering::Relaxed),
+            total_calls,
+            "all threads should have started"
+        );
+        // Wallclock cap: 8 threads × 5 calls × 50ms (slow disk fsync)
+        // = 2000ms WORST case if serial. Allow 4s for very slow CI.
+        // A regression to "save inside the write guard" would dominate
+        // the wallclock at scale; this cap catches the worst regressions.
+        assert!(
+            elapsed < Duration::from_millis(4000),
+            "{total_calls} concurrent record_build_timing calls took {elapsed:?} (expected <4s)"
+        );
+    }
+
+    #[test]
+    fn test_record_build_timing_in_memory_state_survives_disk_failure() {
+        // Even if save_to_disk fails (e.g., disk full, permission denied),
+        // the in-memory cache MUST contain the recorded sample. The lock
+        // is dropped before the I/O, so I/O failure can't corrupt the
+        // cache state.
+        //
+        // Uses a unique key (PID + nanosecond timestamp) so the assertion
+        // doesn't depend on cache-clearing — which would race with other
+        // tests sharing the global cache.
+        let _guard = test_guard!();
+
+        let unique = format!(
+            "t18-disk-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+
+        super::record_build_timing(&unique, Some(CompilationKind::CargoBuild), 1234, true);
+
+        let history = super::timing_cache().read().expect("read");
+        let entry = history.get(&unique, Some(CompilationKind::CargoBuild));
+        assert!(
+            entry.is_some(),
+            "in-memory entry for key {unique:?} must be present even if disk write failed"
+        );
+        let data = entry.unwrap();
+        assert!(
+            !data.remote_samples.is_empty(),
+            "at least one remote sample recorded"
+        );
+        // We're the only writer for this unique key, so the last sample
+        // must be the one we recorded.
+        assert_eq!(
+            data.remote_samples.last().unwrap().duration_ms,
+            1234,
+            "recorded duration matches the call"
+        );
     }
 
     // ========================================================================

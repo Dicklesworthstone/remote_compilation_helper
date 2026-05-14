@@ -1354,6 +1354,49 @@ impl TestHarness {
         }
     }
 
+    /// Wait for a managed process to exit without killing it.
+    pub fn wait_for_process_exit(
+        &self,
+        name: &str,
+        timeout: Duration,
+    ) -> HarnessResult<ExitStatus> {
+        self.logger
+            .debug(format!("Waiting for process to exit: {name} ({timeout:?})"));
+
+        let start = Instant::now();
+        while start.elapsed() < timeout {
+            let exit_status = {
+                let mut processes = self.managed_processes.lock().unwrap();
+                let Some(info) = processes.get_mut(name) else {
+                    return Err(HarnessError::ProcessNotFound(name.to_string()));
+                };
+
+                match info.try_exit_status() {
+                    Some(status) => {
+                        self.logger.debug(format!(
+                            "Process {name} exited after {:?} with status: {:?}",
+                            start.elapsed(),
+                            status
+                        ));
+                        Some(status)
+                    }
+                    None => None,
+                }
+            };
+
+            if let Some(status) = exit_status {
+                self.managed_processes.lock().unwrap().remove(name);
+                return Ok(status);
+            }
+
+            thread::sleep(Duration::from_millis(50));
+        }
+
+        self.logger
+            .error(format!("Timeout waiting for process to exit: {name}"));
+        Err(HarnessError::Timeout(timeout))
+    }
+
     /// Stop all managed processes
     pub fn stop_all_processes(&self) {
         let mut processes = self.managed_processes.lock().unwrap();

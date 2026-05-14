@@ -39,6 +39,9 @@ glob = "0.3"
 indicatif = { version = "0.18.4", features = ["tokio"] }
 chrono = { workspace = true, features = ["serde"] }
 uuid = { workspace = true }
+flate2 = { workspace = true }
+tar = { workspace = true }
+zip = { workspace = true }
 
 # Update system dependencies
 reqwest = { version = "0.13.3", features = ["json"] }
@@ -86,7 +89,6 @@ tempfile = "3.25.0"
 proptest = "1.11.0"
 insta = "1.47.2"
 serial_test = "3.2"
-ctor = { workspace = true }
 
 [[test]]
 name = "true_e2e"

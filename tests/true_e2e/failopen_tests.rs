@@ -1030,12 +1030,19 @@ total_slots = 4
         ],
     );
 
-    // Wait for daemon to fully stop
+    // Wait for the managed daemon process to exit. A failed health probe only
+    // proves the server stopped accepting requests; it does not prove the old
+    // process has completed graceful shutdown and removed its socket.
+    let daemon_exit = harness.wait_for_process_exit("daemon", Duration::from_secs(15))?;
+    harness.assert(
+        daemon_exit.success(),
+        "Daemon should exit successfully after shutdown request",
+    )?;
     harness.wait_for(
-        "daemon to stop",
+        "daemon socket cleanup",
         Duration::from_secs(5),
-        Duration::from_millis(200),
-        || send_request(&socket_path, "GET /health").is_err(),
+        Duration::from_millis(100),
+        || !socket_path.exists(),
     )?;
 
     // Phase 3: Verify socket is unavailable

@@ -89,8 +89,8 @@ test('worker slot usage and errors render correctly', async ({ page }) => {
       `[e2e:workers] VERIFY: Worker ${worker.id} slots ${worker.used_slots}/${worker.total_slots}`
     );
 
-    const slotsBar = card.locator('[data-testid="worker-slots-bar"]');
-    await expect(slotsBar).toBeVisible();
+    await expect(card.getByRole('progressbar', { name: 'Slots used' })).toBeVisible();
+    await expect(card.locator('[data-testid="worker-slots-bar"]')).toBeAttached();
 
     if (worker.last_error) {
       const error = card.locator('[data-testid="worker-error"]');

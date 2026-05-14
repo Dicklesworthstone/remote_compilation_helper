@@ -52,7 +52,10 @@ impl BenchmarkQueue {
         // written its timestamp, or both requests would pass through and
         // the per-worker interval would be violated.
         {
-            let mut last = self.last_triggered.lock().expect("benchmark rate lock");
+            let mut last = self
+                .last_triggered
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             if let Some(last_at) = last.get(&worker_id) {
                 let since = now - *last_at;
                 if since < self.min_interval {
@@ -71,14 +74,14 @@ impl BenchmarkQueue {
             requested_at: now,
         };
 
-        let mut queue = self.queue.lock().expect("benchmark queue lock");
+        let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
         queue.push_back(request.clone());
         Ok(request)
     }
 
     /// Current queued depth.
     pub fn len(&self) -> usize {
-        let queue = self.queue.lock().expect("benchmark queue lock");
+        let queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
         queue.len()
     }
 
@@ -89,13 +92,13 @@ impl BenchmarkQueue {
 
     /// Pop the next benchmark request from the queue.
     pub fn pop(&self) -> Option<BenchmarkRequest> {
-        let mut queue = self.queue.lock().expect("benchmark queue lock");
+        let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
         queue.pop_front()
     }
 
     /// Clear all pending requests from the queue.
     pub fn clear(&self) {
-        let mut queue = self.queue.lock().expect("benchmark queue lock");
+        let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
         queue.clear();
     }
 

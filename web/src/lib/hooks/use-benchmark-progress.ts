@@ -60,8 +60,24 @@ export function useBenchmarkProgress({
   const eventSourceRef = useRef<EventSource | null>(null);
   const isActiveRef = useRef(false);
   const statusRef = useRef(state.status);
-  const reconnectRef = useRef<() => void>(() => {});
+  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const connectRef = useRef<(() => void) | null>(null);
   statusRef.current = state.status;
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      isActiveRef.current = false;
+      if (reconnectTimerRef.current) {
+        clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = null;
+      }
+      if (eventSourceRef.current) {
+        eventSourceRef.current.close();
+        eventSourceRef.current = null;
+      }
+    };
+  }, []);
 
   const handleBenchmarkQueued = useCallback((data: BenchmarkQueuedEvent['data']) => {
     if (data.worker_id !== workerId) return;
@@ -151,15 +167,19 @@ export function useBenchmarkProgress({
         break;
     }
   }, [
-    handleBenchmarkCompleted,
-    handleBenchmarkFailed,
-    handleBenchmarkProgress,
     handleBenchmarkQueued,
     handleBenchmarkStarted,
+    handleBenchmarkProgress,
+    handleBenchmarkCompleted,
+    handleBenchmarkFailed,
   ]);
 
   // Connect to SSE for the worker
   const connect = useCallback(() => {
+    if (reconnectTimerRef.current) {
+      clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
+    }
     if (eventSourceRef.current) {
       eventSourceRef.current.close();
     }
@@ -194,26 +214,17 @@ export function useBenchmarkProgress({
     eventSource.onerror = () => {
       // Reconnect after a delay if still active
       if (isActiveRef.current && statusRef.current === 'running') {
-        setTimeout(() => {
-          if (isActiveRef.current) {
-            reconnectRef.current();
-          }
+        reconnectTimerRef.current = setTimeout(() => {
+          reconnectTimerRef.current = null;
+          if (isActiveRef.current) connectRef.current?.();
         }, 3000);
       }
     };
-  }, [handleBenchmarkQueued, handleEvent, workerId]);
-  reconnectRef.current = connect;
+  }, [workerId, handleEvent, handleBenchmarkQueued]);
 
-  // Cleanup on unmount
   useEffect(() => {
-    return () => {
-      isActiveRef.current = false;
-      if (eventSourceRef.current) {
-        eventSourceRef.current.close();
-        eventSourceRef.current = null;
-      }
-    };
-  }, []);
+    connectRef.current = connect;
+  }, [connect]);
 
   /**
    * Trigger a benchmark for the worker.
@@ -272,6 +283,10 @@ export function useBenchmarkProgress({
    */
   const reset = useCallback(() => {
     isActiveRef.current = false;
+    if (reconnectTimerRef.current) {
+      clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
+    }
     if (eventSourceRef.current) {
       eventSourceRef.current.close();
       eventSourceRef.current = null;

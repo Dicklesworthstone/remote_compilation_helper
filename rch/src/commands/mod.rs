@@ -145,8 +145,8 @@ async fn query_daemon_health(socket_path: &str) -> Result<DaemonHealthResponse> 
 
 // NOTE: build_dry_run_summary and diagnose moved to status.rs
 
-// Re-export send_daemon_command from helpers (single source of truth)
-pub(crate) use helpers::send_daemon_command;
+// Re-export daemon IPC helpers from helpers (single source of truth)
+pub(crate) use helpers::{configured_socket_path, send_daemon_command};
 
 // =============================================================================
 // Unit Tests
@@ -161,10 +161,13 @@ mod tests {
     };
     use super::status::{build_diagnose_decision, build_dry_run_summary};
     use super::workers::{
-        collect_local_capability_warnings, has_any_capabilities, summarize_capabilities,
+        collect_local_capability_warnings, collect_refresh_warnings, has_any_capabilities,
+        summarize_capabilities,
     };
     use super::*;
-    use crate::status_types::{WorkerCapabilitiesFromApi, format_bytes};
+    use crate::status_types::{
+        WorkerCapabilitiesFromApi, WorkerCapabilitiesRefreshFromApi, format_bytes,
+    };
     use crate::ui::context::{OutputConfig, OutputContext, OutputMode};
     use crate::ui::writer::SharedOutputBuffer;
     use rch_common::test_guard;
@@ -826,6 +829,7 @@ mod tests {
                 host: "host".to_string(),
                 user: "user".to_string(),
                 capabilities: WorkerCapabilities::new(),
+                refresh: None,
             },
             WorkerCapabilitiesFromApi {
                 id: "w-old".to_string(),
@@ -838,11 +842,34 @@ mod tests {
                     npm_version: None,
                     ..Default::default()
                 },
+                refresh: None,
             },
         ];
         let warnings = collect_local_capability_warnings(&workers, &local);
         assert!(warnings.iter().any(|w| w.contains("missing Rust runtime")));
         assert!(warnings.iter().any(|w| w.contains("Rust version mismatch")));
+    }
+
+    #[test]
+    fn refresh_warnings_include_cached_capability_snapshots() {
+        let _guard = test_guard!();
+        let workers = vec![WorkerCapabilitiesFromApi {
+            id: "slow-worker".to_string(),
+            host: "host".to_string(),
+            user: "user".to_string(),
+            capabilities: WorkerCapabilities::new(),
+            refresh: Some(WorkerCapabilitiesRefreshFromApi {
+                attempted: true,
+                live: false,
+                source: "cached_after_probe_failure".to_string(),
+                message: Some("probe timed out".to_string()),
+            }),
+        }];
+
+        let warnings = collect_refresh_warnings(&workers);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("slow-worker"));
+        assert!(warnings[0].contains("probe timed out"));
     }
 
     #[test]

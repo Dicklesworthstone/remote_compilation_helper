@@ -814,14 +814,14 @@ fn build_remote_kill_script(remote_pgid_file: Option<&str>, build_id: u64) -> St
     if let Some(remote_pgid_file) = remote_pgid_file {
         let escaped_file = shell_escape::escape(std::borrow::Cow::from(remote_pgid_file));
         return format!(
-            "sh -lc 'pgid_file={file}; \
+            "sh -lc 'pgid_file=$1; \
 if [ ! -r \"$pgid_file\" ]; then exit 1; fi; \
 pgid=$(cat \"$pgid_file\" 2>/dev/null); \
 if [ -z \"$pgid\" ]; then exit 1; fi; \
 kill -TERM -- -\"$pgid\" 2>/dev/null || kill -TERM \"$pgid\" 2>/dev/null || exit 1; \
 sleep 1; \
 kill -KILL -- -\"$pgid\" 2>/dev/null || kill -KILL \"$pgid\" 2>/dev/null || true; \
-exit 0'",
+exit 0' sh {file}",
             file = escaped_file,
         );
     }
@@ -992,6 +992,26 @@ mod tests {
         assert!(script.contains("kill -TERM -- -\"$pgid\""));
         assert!(script.contains("/tmp/rch/project/.rch-run/42.pgid"));
         assert!(!script.contains("RCH_BUILD_ID=42;"));
+    }
+
+    #[test]
+    fn test_build_remote_kill_script_handles_shell_special_pgid_file_path() {
+        let script =
+            build_remote_kill_script(Some("/tmp/rch/project dir/agent's/.rch-run/42.pgid"), 42);
+        assert!(script.contains("pgid_file=$1"));
+        assert!(script.contains("/tmp/rch/project"));
+        assert!(!script.contains("pgid_file='/tmp"));
+
+        let status = std::process::Command::new("sh")
+            .arg("-n")
+            .arg("-c")
+            .arg(&script)
+            .status()
+            .expect("shell syntax check should run");
+        assert!(
+            status.success(),
+            "remote kill script must be shell-parseable: {script}"
+        );
     }
 
     // 1. Cancel of non-existent build → error response

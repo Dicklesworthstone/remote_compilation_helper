@@ -24,6 +24,7 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 toml = { workspace = true }
 directories = { workspace = true }
+shellexpand = "3.1.1"
 notify = { workspace = true }
 chrono = { workspace = true }
 shell-escape = "0.1.5"
@@ -54,8 +55,8 @@ hyper = { workspace = true }
 ureq = { workspace = true }
 
 # HMAC signing for webhooks
-hmac = "0.13"
-sha2 = "0.11"
+hmac = "0.13.0"
+sha2 = "0.11.0"
 
 # Rich terminal output (optional)
 rich_rust = { workspace = true, optional = true }
@@ -70,7 +71,6 @@ tempfile = "3.25.0"
 whoami = "2.1.2"
 rch-common = { workspace = true, features = ["rich-ui"] }
 proptest = "1.11.0"
-ctor = { workspace = true }
 serial_test = "3.2"
 
 [lints.rust]

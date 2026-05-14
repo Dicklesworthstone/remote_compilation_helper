@@ -21,7 +21,7 @@ tokio = { workspace = true }
 fastrand = "2.4.1"
 shellexpand = "3.1.1"
 rch-common = { workspace = true }
-rusqlite = { version = "0.39", features = ["bundled"], optional = true }
+rusqlite = { version = "0.39.0", features = ["bundled"], optional = true }
 
 [features]
 default = ["storage"]

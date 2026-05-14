@@ -619,7 +619,6 @@ impl OutputContext {
             }
             OutputFormat::Toon => {
                 let json_value = serde_json::to_value(value)?;
-                // toon_rust::encode works with serde_json::Value directly.
                 Ok(toon_rust::encode(json_value, None))
             }
         }

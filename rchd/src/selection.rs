@@ -2551,7 +2551,10 @@ fn toolchain_capability_mismatch(
     capabilities: &WorkerCapabilities,
 ) -> Option<String> {
     let toolchain = toolchain?;
-    if toolchain.date.is_some() || toolchain.full_version.trim().is_empty() {
+    if toolchain.date.is_some()
+        || toolchain.full_version.trim().is_empty()
+        || toolchain.full_version.trim() == toolchain.channel
+    {
         return None;
     }
 
@@ -3622,6 +3625,21 @@ mod tests {
             ..local
         };
         assert!(toolchain_capability_mismatch(Some(&dated), &caps).is_none());
+    }
+
+    #[test]
+    fn test_toolchain_capability_mismatch_skips_channel_only_toolchain_file() {
+        let local = ToolchainInfo {
+            channel: "nightly".to_string(),
+            date: None,
+            full_version: "nightly".to_string(),
+        };
+        let caps = WorkerCapabilities {
+            rustc_version: Some("rustc 1.95.0-nightly (abcdef 2026-03-01)".to_string()),
+            ..Default::default()
+        };
+
+        assert!(toolchain_capability_mismatch(Some(&local), &caps).is_none());
     }
 
     #[tokio::test]

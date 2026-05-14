@@ -30,6 +30,9 @@ type ApiMockOverrides = {
   speedscoreHistoryForWorker?: (workerId: string, days?: number, limit?: number) => SpeedScoreHistoryResponse;
 };
 
+const daemonMetricsUrl = (url: URL) =>
+  url.origin === 'http://localhost:9100' && url.pathname === '/metrics';
+
 export async function mockApiResponses(
   page: Page,
   overrides: ApiMockOverrides = {}
@@ -60,11 +63,7 @@ export async function mockApiResponses(
     await route.fulfill({ json: budget });
   });
 
-  await page.route('**/metrics', async (route) => {
-    if (route.request().resourceType() === 'document') {
-      await route.fallback();
-      return;
-    }
+  await page.route(daemonMetricsUrl, async (route) => {
     console.log('[mock] Intercepting /metrics');
     await route.fulfill({ body: metrics, contentType: 'text/plain' });
   });

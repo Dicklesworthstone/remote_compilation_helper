@@ -54,9 +54,15 @@ export default function WorkersPage() {
   );
   const workers = useMemo(() => data?.workers ?? [], [data?.workers]);
   const [selectedWorkerId, setSelectedWorkerId] = useState<string | null>(null);
+  const effectiveSelectedWorkerId = useMemo(() => {
+    if (selectedWorkerId && workers.some((worker) => worker.id === selectedWorkerId)) {
+      return selectedWorkerId;
+    }
+    return workers[0]?.id ?? null;
+  }, [workers, selectedWorkerId]);
   const selectedWorker = useMemo(
-    () => workers.find((worker) => worker.id === selectedWorkerId) ?? null,
-    [workers, selectedWorkerId]
+    () => workers.find((worker) => worker.id === effectiveSelectedWorkerId) ?? null,
+    [workers, effectiveSelectedWorkerId]
   );
   const speedScoresMap = useMemo(() => {
     if (!speedScores?.workers) {
@@ -68,9 +74,9 @@ export default function WorkersPage() {
         .map((entry) => [entry.worker_id, entry.speedscore!])
     );
   }, [speedScores]);
-  const historyQuery = useSpeedScoreHistoryPage(selectedWorkerId, {
+  const historyQuery = useSpeedScoreHistoryPage(effectiveSelectedWorkerId, {
     limit: 200,
-    enabled: Boolean(selectedWorkerId),
+    enabled: Boolean(effectiveSelectedWorkerId),
     refetchInterval: 15000,
   });
 
@@ -80,18 +86,6 @@ export default function WorkersPage() {
     }
     hadErrorRef.current = Boolean(error);
   }, [error]);
-
-  useEffect(() => {
-    if (workers.length === 0) {
-      if (selectedWorkerId !== null) {
-        setSelectedWorkerId(null);
-      }
-      return;
-    }
-    if (!selectedWorkerId || !workers.some((worker) => worker.id === selectedWorkerId)) {
-      setSelectedWorkerId(workers[0].id);
-    }
-  }, [workers, selectedWorkerId]);
 
   const handleRetry = async () => {
     setIsRetrying(true);
@@ -150,7 +144,7 @@ export default function WorkersPage() {
   const healthyCount = workers.filter(w => w.status === 'healthy').length;
   const totalSlots = workers.reduce((sum, w) => sum + w.total_slots, 0);
   const usedSlots = workers.reduce((sum, w) => sum + w.used_slots, 0);
-  const selectedSpeedScore = selectedWorkerId ? speedScoresMap.get(selectedWorkerId) ?? null : null;
+  const selectedSpeedScore = effectiveSelectedWorkerId ? speedScoresMap.get(effectiveSelectedWorkerId) ?? null : null;
   const canBenchmark = selectedWorker?.status === 'healthy' || selectedWorker?.status === 'degraded';
 
   return (
@@ -210,11 +204,11 @@ export default function WorkersPage() {
                 </label>
                 <select
                   id="speedscore-worker-select"
-                  value={selectedWorkerId ?? ''}
+                  value={effectiveSelectedWorkerId ?? ''}
                   onChange={(event) => setSelectedWorkerId(event.target.value)}
                   className="h-8 rounded-md border border-border bg-background px-2 text-xs text-foreground shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
                 >
-                  {selectedWorkerId === null && (
+                  {effectiveSelectedWorkerId === null && (
                     <option value="" disabled>
                       Select worker
                     </option>
@@ -237,7 +231,7 @@ export default function WorkersPage() {
 
             <div className="grid gap-6 lg:grid-cols-2">
               <SpeedScoreDetailPanel
-                workerId={selectedWorkerId ?? 'unknown'}
+                workerId={effectiveSelectedWorkerId ?? 'unknown'}
                 speedscore={selectedSpeedScore}
                 isLoading={speedScoresLoading}
                 error={speedScoresError instanceof Error ? speedScoresError : null}
@@ -256,7 +250,7 @@ export default function WorkersPage() {
                 </div>
               ) : (
                 <BenchmarkHistoryChart
-                  workerId={selectedWorkerId ?? 'unknown'}
+                  workerId={effectiveSelectedWorkerId ?? 'unknown'}
                   history={historyQuery.data?.history ?? []}
                   isLoading={historyQuery.isLoading}
                 />

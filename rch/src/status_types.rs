@@ -105,6 +105,21 @@ pub struct WorkerCapabilitiesFromApi {
     pub host: String,
     pub user: String,
     pub capabilities: WorkerCapabilities,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh: Option<WorkerCapabilitiesRefreshFromApi>,
+}
+
+/// Freshness metadata for worker capabilities returned by the daemon.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerCapabilitiesRefreshFromApi {
+    #[serde(default)]
+    pub attempted: bool,
+    #[serde(default)]
+    pub live: bool,
+    #[serde(default)]
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 /// Worker capabilities response from API.
@@ -299,7 +314,11 @@ pub struct RepoConvergenceStatusFromApi {
 // ============================================================================
 
 /// Schema version for the CLI status JSON envelope.
-pub const STATUS_SCHEMA_VERSION: &str = "1.0.0";
+///
+/// Sourced from the central [`rch_common::schema_versions`] registry so
+/// cross-component drift is caught by the registry's pinned-snapshot test.
+pub const STATUS_SCHEMA_VERSION: &str =
+    rch_common::schema_version(rch_common::SchemaComponent::Status);
 
 /// System-level posture summarizing whether builds go remote or fall back local.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

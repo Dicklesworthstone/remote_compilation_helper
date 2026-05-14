@@ -13,15 +13,6 @@ use crate::status_types::{DaemonFullStatusResponse, extract_json_body, format_du
 use crate::ui::theme::Theme;
 use anyhow::{Context, Result};
 use std::io::Write;
-use std::path::PathBuf;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-#[cfg(unix)]
-use tokio::net::UnixStream;
-
-/// Default daemon socket path.
-fn default_socket_path() -> PathBuf {
-    PathBuf::from(rch_common::default_socket_path())
-}
 
 /// Format milliseconds as human-readable duration.
 fn format_duration_ms(ms: u64) -> String {
@@ -72,55 +63,14 @@ async fn send_status_command() -> Result<String> {
 
 #[cfg(unix)]
 async fn send_status_command() -> Result<String> {
-    let stream = UnixStream::connect(default_socket_path())
-        .await
-        .context("Failed to connect to daemon socket")?;
-
-    let (reader, mut writer) = stream.into_split();
-
-    writer.write_all(b"GET /status\n").await?;
-    writer.flush().await?;
-    writer.shutdown().await?;
-
-    let mut buf_reader = BufReader::new(reader);
-    let mut response = String::new();
-
-    loop {
-        let mut line = String::new();
-        match buf_reader.read_line(&mut line).await {
-            Ok(0) => break,
-            Ok(_) => response.push_str(&line),
-            Err(e) => return Err(e.into()),
-        }
-    }
-
-    Ok(response)
+    crate::commands::send_daemon_command("GET /status\n").await
 }
 
 /// Send a worker drain command to the daemon.
 #[cfg(unix)]
 pub async fn drain_worker(worker_id: &str) -> Result<()> {
-    let stream = UnixStream::connect(default_socket_path())
-        .await
-        .context("Failed to connect to daemon socket")?;
-
-    let (reader, mut writer) = stream.into_split();
-    let command = format!("POST /workers/{}/drain\n", worker_id);
-    writer.write_all(command.as_bytes()).await?;
-    writer.flush().await?;
-    writer.shutdown().await?;
-
-    let mut buf_reader = BufReader::new(reader);
-    let mut response = String::new();
-
-    loop {
-        let mut line = String::new();
-        match buf_reader.read_line(&mut line).await {
-            Ok(0) => break,
-            Ok(_) => response.push_str(&line),
-            Err(e) => return Err(e.into()),
-        }
-    }
+    let command = format!("POST /workers/{}/drain\n", urlencoding::encode(worker_id));
+    let response = crate::commands::send_daemon_command(&command).await?;
 
     // Check if response indicates success
     if response.contains("\"status\":\"ok\"") {
@@ -144,27 +94,8 @@ pub async fn drain_worker(_worker_id: &str) -> Result<()> {
 /// Send a worker enable command to the daemon.
 #[cfg(unix)]
 pub async fn enable_worker(worker_id: &str) -> Result<()> {
-    let stream = UnixStream::connect(default_socket_path())
-        .await
-        .context("Failed to connect to daemon socket")?;
-
-    let (reader, mut writer) = stream.into_split();
-    let command = format!("POST /workers/{}/enable\n", worker_id);
-    writer.write_all(command.as_bytes()).await?;
-    writer.flush().await?;
-    writer.shutdown().await?;
-
-    let mut buf_reader = BufReader::new(reader);
-    let mut response = String::new();
-
-    loop {
-        let mut line = String::new();
-        match buf_reader.read_line(&mut line).await {
-            Ok(0) => break,
-            Ok(_) => response.push_str(&line),
-            Err(e) => return Err(e.into()),
-        }
-    }
+    let command = format!("POST /workers/{}/enable\n", urlencoding::encode(worker_id));
+    let response = crate::commands::send_daemon_command(&command).await?;
 
     // Check if response indicates success
     if response.contains("\"status\":\"ok\"") {
@@ -188,27 +119,8 @@ pub async fn enable_worker(_worker_id: &str) -> Result<()> {
 /// Cancel a build via the daemon (SIGTERM).
 #[cfg(unix)]
 pub async fn cancel_build(build_id: &str) -> Result<()> {
-    let stream = UnixStream::connect(default_socket_path())
-        .await
-        .context("Failed to connect to daemon socket")?;
-
-    let (reader, mut writer) = stream.into_split();
     let command = format!("POST /builds/{}/cancel\n", build_id);
-    writer.write_all(command.as_bytes()).await?;
-    writer.flush().await?;
-    writer.shutdown().await?;
-
-    let mut buf_reader = BufReader::new(reader);
-    let mut response = String::new();
-
-    loop {
-        let mut line = String::new();
-        match buf_reader.read_line(&mut line).await {
-            Ok(0) => break,
-            Ok(_) => response.push_str(&line),
-            Err(e) => return Err(e.into()),
-        }
-    }
+    let response = crate::commands::send_daemon_command(&command).await?;
 
     if response.contains("\"status\":\"ok\"") {
         Ok(())
@@ -231,27 +143,8 @@ pub async fn cancel_build(_build_id: &str) -> Result<()> {
 /// Force kill a build via the daemon (SIGKILL).
 #[cfg(unix)]
 pub async fn force_kill_build(build_id: &str) -> Result<()> {
-    let stream = UnixStream::connect(default_socket_path())
-        .await
-        .context("Failed to connect to daemon socket")?;
-
-    let (reader, mut writer) = stream.into_split();
     let command = format!("POST /builds/{}/cancel?force=true\n", build_id);
-    writer.write_all(command.as_bytes()).await?;
-    writer.flush().await?;
-    writer.shutdown().await?;
-
-    let mut buf_reader = BufReader::new(reader);
-    let mut response = String::new();
-
-    loop {
-        let mut line = String::new();
-        match buf_reader.read_line(&mut line).await {
-            Ok(0) => break,
-            Ok(_) => response.push_str(&line),
-            Err(e) => return Err(e.into()),
-        }
-    }
+    let response = crate::commands::send_daemon_command(&command).await?;
 
     if response.contains("\"status\":\"ok\"") {
         Ok(())
@@ -1202,6 +1095,14 @@ mod tests {
     use rch_common::test_guard;
     use tracing::info;
 
+    struct ConfigOverrideReset;
+
+    impl Drop for ConfigOverrideReset {
+        fn drop(&mut self) {
+            crate::config::set_test_config_override(None);
+        }
+    }
+
     fn sample_status() -> DaemonFullStatusResponse {
         DaemonFullStatusResponse {
             daemon: DaemonInfoFromApi {
@@ -1345,6 +1246,52 @@ mod tests {
             }),
             saved_time: None,
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn query_daemon_full_status_uses_configured_socket_path() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::UnixListener;
+
+        let _guard = test_guard!();
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = temp_dir.path().join("custom-rch.sock");
+        let listener = UnixListener::bind(&socket_path).expect("bind custom socket");
+
+        let mut config = rch_common::RchConfig::default();
+        config.general.socket_path = socket_path.display().to_string();
+        crate::config::set_test_config_override(Some(config));
+        let _reset = ConfigOverrideReset;
+
+        let mut expected = sample_status();
+        expected.daemon.version = "configured-socket-test".to_string();
+        let response_body = serde_json::to_string(&expected).expect("serialize status");
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept client");
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(reader);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.expect("read request");
+            assert_eq!(line, "GET /status\n");
+
+            let response = format!(
+                "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n{}\n",
+                response_body
+            );
+            writer
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response");
+        });
+
+        let status = query_daemon_full_status()
+            .await
+            .expect("query configured daemon status");
+
+        server.await.expect("server task");
+        assert_eq!(status.daemon.version, "configured-socket-test");
     }
 
     #[test]

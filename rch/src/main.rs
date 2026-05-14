@@ -30,9 +30,10 @@ mod update;
 use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::CompleteEnv;
-use rch_common::{ApiResponse, LogConfig, init_logging};
+use rch_common::{ApiError, ApiResponse, ErrorCode, LogConfig, init_logging};
 use schemars::schema_for;
 use std::env;
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::Arc;
 use ui::{ColorChoice, OutputConfig, OutputContext, OutputFormat};
@@ -41,7 +42,7 @@ use ui::{ColorChoice, OutputConfig, OutputContext, OutputFormat};
 #[command(name = "rch")]
 #[command(
     author,
-    version,
+    version = rch_common::build_version_value_static(),
     about = "Remote Compilation Helper - transparent compilation offloading",
     long_about = "Remote Compilation Helper (RCH) transparently offloads compilation commands \
                   to remote workers. When invoked without a subcommand, RCH runs as a Claude Code \
@@ -295,9 +296,9 @@ Use 'disable' to mark a worker as unavailable (optionally with --reason)."#)]
     rch check --json        # Machine-readable output
 
 EXIT CODES:
-    0   Ready - daemon running, all workers healthy
+    0   Ready - daemon running, hook installed, all workers healthy
     1   Degraded - daemon running, some workers unreachable
-    2   Not ready - daemon not running or fatal issues
+    2   Not ready - daemon/hook missing or fatal issues
 
 USAGE:
     # CI/CD health gate
@@ -371,6 +372,22 @@ to clean up. Use --force to immediately terminate with SIGKILL."#)]
     Config {
         #[command(subcommand)]
         action: ConfigAction,
+    },
+
+    /// Manage project caches on remote workers (br-4zm6u)
+    ///
+    /// Cache management without running a build. Useful for pre-warming
+    /// workers ahead of an interactive session so the first compilation
+    /// in that session uses an already-synced remote tree.
+    #[command(after_help = r#"EXAMPLES:
+    rch cache warm                                # Warm cache on all healthy workers
+    rch cache warm --workers css                  # Warm cache on specific worker
+    rch cache warm --workers css --workers vmi1   # Warm cache on multiple workers
+    rch cache warm --project /path/to/project     # Warm cache for a non-cwd project
+    rch cache warm --json                         # Emit per-worker results as JSON"#)]
+    Cache {
+        #[command(subcommand)]
+        action: CacheAction,
     },
 
     /// Explain why a command would or wouldn't be offloaded
@@ -484,6 +501,12 @@ CHECKS PERFORMED:
     Hooks           - Claude Code hook installed
     Workers         - Connectivity (with --verbose)
     Reliability     - topology, repo convergence, disk pressure, process debt"#)]
+    /// Look up RCH-Ennn / RCH-Rnnn error and reason codes (operator ergonomics)
+    Error {
+        #[command(subcommand)]
+        sub: ErrorSubcommand,
+    },
+
     Doctor {
         /// Attempt to fix safe issues (e.g., key permissions)
         #[arg(long)]
@@ -504,6 +527,53 @@ CHECKS PERFORMED:
         /// Include schema compatibility checks in reliability mode
         #[arg(long, requires = "reliability")]
         check_schemas: bool,
+
+        /// Strict mode: promote `Degraded` verdict to exit code 2 (warnings
+        /// treated as failures). For tight CI gates. Mutually exclusive with
+        /// `--lenient`. Only meaningful with `--reliability`.
+        #[arg(long, requires = "reliability", conflicts_with = "lenient")]
+        strict: bool,
+
+        /// Lenient mode: demote `Failing` verdict to exit code 1 (logs only,
+        /// never blocks). For non-blocking tripwires. Mutually exclusive with
+        /// `--strict`. Only meaningful with `--reliability`.
+        #[arg(long, requires = "reliability", conflicts_with = "strict")]
+        lenient: bool,
+
+        /// Subset of probes to run, comma-separated. Default = `all`.
+        /// Valid values: `all`, `topology`, `convergence`, `pressure`,
+        /// `triage`, `helpers`, `rollout`, `schema`. Multi-scope:
+        /// `--scope topology,pressure`. Only meaningful with `--reliability`.
+        #[arg(
+            long,
+            requires = "reliability",
+            default_value = "all",
+            value_name = "SCOPES"
+        )]
+        scope: String,
+
+        /// Continuous monitoring mode: re-runs the reliability doctor every
+        /// `--watch-interval` seconds and emits diff-aware output until SIGINT.
+        /// Only meaningful with `--reliability`. Mutually exclusive with `--fix`.
+        #[arg(long, requires = "reliability", conflicts_with = "fix")]
+        watch: bool,
+
+        /// Seconds between sweeps in `--watch` mode. Clamped by the CLI
+        /// handler to 1..=3600. Default: 5.
+        #[arg(long, requires = "watch", default_value = "5", value_name = "SECONDS")]
+        watch_interval: u64,
+
+        /// In `--watch` mode, emit output only when the verdict OR the
+        /// diagnostic set changes versus the prior sweep (suppresses
+        /// unchanged iterations).
+        #[arg(long, requires = "watch")]
+        transitions_only: bool,
+
+        /// On `--watch` exit, write a final summary JSON to PATH (sweep
+        /// count, transition count, final verdict). Useful for tmux/split-
+        /// window setups and CI tripwires.
+        #[arg(long, requires = "watch", value_name = "PATH")]
+        watch_snapshot: Option<PathBuf>,
     },
 
     /// Verify remote compilation by running a self-test
@@ -798,6 +868,30 @@ enum SchemaAction {
 }
 
 #[derive(Subcommand)]
+enum ErrorSubcommand {
+    /// Print details for a specific code (e.g. RCH-R104, RCH-E001).
+    /// Operators paste a code from a log line and get description + remediation.
+    Explain {
+        /// The code to look up (whitespace and case tolerated; one of:
+        /// RCH-Rnnn for reliability codes, RCH-Ennn for error codes).
+        code: String,
+        /// Emit JSON envelope instead of the human-readable form.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List every known code in both namespaces (RCH-Ennn + RCH-Rnnn).
+    List {
+        /// Filter to a single category (snake_case; e.g. `disk_pressure`,
+        /// `worker`, `topology`). Empty = all categories.
+        #[arg(long)]
+        category: Option<String>,
+        /// Emit JSON envelope instead of the human-readable form.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum RobotDocsAction {
     /// Print the agent-oriented operating guide
     Guide,
@@ -1044,6 +1138,30 @@ impl WorkersAction {
             WorkersAction::Init { .. } => "init",
         }
     }
+}
+
+#[derive(Subcommand)]
+enum CacheAction {
+    /// Pre-sync project sources to one or more workers without running a build.
+    ///
+    /// Useful to warm caches ahead of an interactive session so the first
+    /// compilation in the session uses an already-uploaded remote tree.
+    /// Reuses the standard `TransferPipeline::sync_to_remote` path so the
+    /// upload semantics match a real build (incremental rsync + .rchignore
+    /// honored + zstd compression).
+    Warm {
+        /// Worker IDs to warm (repeatable). Default: every configured worker.
+        ///
+        /// Currently the warm path issues one `sync_to_remote` per worker
+        /// sequentially; if a worker is unreachable, the remaining workers
+        /// still warm successfully (per-worker results reported separately).
+        #[arg(long, value_name = "WORKER_ID")]
+        workers: Vec<String>,
+
+        /// Project root to warm. Default: current working directory.
+        #[arg(long, value_name = "PATH")]
+        project: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1436,13 +1554,38 @@ fn base_log_level_for_cli(cli: &Cli) -> String {
 /// Multi-threaded runtime spawns one thread per CPU core (64 cores = 128MB stack allocations).
 /// Current-thread runtime uses a single thread, drastically reducing startup time.
 #[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<()> {
+async fn main() {
+    let args: Vec<OsString> = env::args_os().collect();
+    let wants_machine_output = top_level_machine_output_requested(&args);
+
+    if let Err(error) = run(args).await {
+        if wants_machine_output {
+            let response: ApiResponse<()> =
+                ApiResponse::err(top_level_command_label(), top_level_api_error(&error));
+            match serde_json::to_string_pretty(&response) {
+                Ok(json) => println!("{json}"),
+                Err(serialize_error) => {
+                    eprintln!("Error: {error:#}");
+                    eprintln!("Failed to serialize JSON error response: {serialize_error}");
+                }
+            }
+        } else {
+            eprintln!("Error: {error:#}");
+        }
+        std::process::exit(1);
+    }
+}
+
+async fn run(args: Vec<OsString>) -> Result<()> {
     // Handle dynamic shell completions (exits if handling a completion request)
     CompleteEnv::with_factory(Cli::command).complete();
 
     // Early check for --help-json to handle it before full clap parsing
     // (which would fail on subcommands that require further arguments)
-    let args: Vec<String> = env::args().collect();
+    let args: Vec<String> = args
+        .iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
     if args.iter().any(|a| a == "--help-json") {
         let subcommand_path: Vec<String> = args
             .iter()
@@ -1577,6 +1720,7 @@ async fn main() -> Result<()> {
                 dry_run,
             } => commands::cancel_build(build_id, all, force, yes, dry_run, &ctx).await,
             Commands::Config { action } => handle_config(action, &ctx).await,
+            Commands::Cache { action } => handle_cache(action, &ctx).await,
             Commands::Diagnose { command, dry_run } => {
                 handle_diagnose(command, dry_run, &ctx).await
             }
@@ -1590,7 +1734,31 @@ async fn main() -> Result<()> {
                 install_deps,
                 reliability,
                 check_schemas,
-            } => handle_doctor(fix, dry_run, install_deps, reliability, check_schemas, &ctx).await,
+                strict,
+                lenient,
+                scope,
+                watch,
+                watch_interval,
+                transitions_only,
+                watch_snapshot,
+            } => {
+                handle_doctor(
+                    fix,
+                    dry_run,
+                    install_deps,
+                    reliability,
+                    check_schemas,
+                    strict,
+                    lenient,
+                    scope,
+                    watch,
+                    watch_interval,
+                    transitions_only,
+                    watch_snapshot,
+                    &ctx,
+                )
+                .await
+            }
             Commands::SelfTest {
                 action,
                 worker,
@@ -1671,9 +1839,58 @@ async fn main() -> Result<()> {
             } => handle_web(port, no_open, prod, &ctx).await,
             Commands::Capabilities => handle_capabilities_command(&ctx),
             Commands::RobotDocs { action } => handle_robot_docs(action, &ctx),
+            Commands::Error { sub } => handle_error_explain(sub, &ctx),
             Commands::Schema { action } => handle_schema_command(action, &ctx),
         },
     }
+}
+
+fn top_level_machine_output_requested(args: &[OsString]) -> bool {
+    if env::var_os("RCH_JSON").is_some_and(|value| value != "0" && !value.is_empty())
+        || env::var_os("RCH_OUTPUT_FORMAT").is_some_and(|value| !value.is_empty())
+        || env::var_os("TOON_DEFAULT_FORMAT").is_some_and(|value| !value.is_empty())
+    {
+        return true;
+    }
+
+    for arg in args.iter().skip(1) {
+        let Some(arg) = arg.to_str() else {
+            continue;
+        };
+
+        match arg {
+            "--json" | "-j" | "--help-json" | "--capabilities" | "--schema" | "--robot-triage" => {
+                return true;
+            }
+            "--format" | "-F" => {
+                return true;
+            }
+            _ if arg.starts_with("--format=") => return true,
+            _ => {}
+        }
+    }
+
+    false
+}
+
+fn top_level_api_error(error: &anyhow::Error) -> ApiError {
+    let details = format!("{error:#}");
+    let code = if details.contains("TOML parse error")
+        || details.contains("Failed to parse")
+        || details.contains("Failed to decode")
+    {
+        ErrorCode::ConfigParseError
+    } else if details.contains("Failed to read") {
+        ErrorCode::ConfigReadError
+    } else {
+        ErrorCode::InternalStateError
+    };
+
+    ApiError::from_code(code).with_details(details)
+}
+
+fn top_level_command_label() -> &'static str {
+    "rch"
 }
 
 /// Handle 'rch schema' subcommands.
@@ -2545,7 +2762,7 @@ async fn handle_daemon(action: DaemonAction, ctx: &OutputContext) -> Result<()> 
             commands::daemon_restart(yes, ctx).await?;
         }
         DaemonAction::Status => {
-            commands::daemon_status(ctx)?;
+            commands::daemon_status(ctx).await?;
         }
         DaemonAction::Logs { lines } => {
             commands::daemon_logs(lines, ctx)?;
@@ -2678,6 +2895,318 @@ async fn handle_diagnose(command: Vec<String>, dry_run: bool, ctx: &OutputContex
     Ok(())
 }
 
+/// `rch cache warm` per-worker result (br-4zm6u). Emitted in the JSON
+/// envelope under `data.workers[]` so consumers can summarize per-worker
+/// success/failure programmatically without parsing the human output.
+#[derive(Debug, serde::Serialize)]
+struct CacheWarmWorkerResult {
+    worker_id: String,
+    success: bool,
+    bytes_transferred: u64,
+    files_transferred: u64,
+    duration_ms: u64,
+    /// Only populated on failure. Operators read this to triage.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+/// `rch cache warm` aggregate response. Carries every per-worker entry
+/// plus a top-level summary so consumers can grep for "all-ok" without
+/// iterating the array.
+#[derive(Debug, serde::Serialize)]
+struct CacheWarmResponse {
+    project_root: String,
+    project_id: String,
+    project_hash: String,
+    workers_total: usize,
+    workers_succeeded: usize,
+    workers_failed: usize,
+    bytes_transferred: u64,
+    files_transferred: u64,
+    duration_ms: u64,
+    workers: Vec<CacheWarmWorkerResult>,
+}
+
+async fn handle_cache(action: CacheAction, ctx: &OutputContext) -> Result<()> {
+    match action {
+        CacheAction::Warm { workers, project } => handle_cache_warm(workers, project, ctx).await,
+    }
+}
+
+fn resolve_cache_warm_project_root(
+    project_root: PathBuf,
+    policy: &rch_common::path_topology::PathTopologyPolicy,
+) -> Result<PathBuf> {
+    let project_root = if project_root.is_absolute() {
+        project_root
+    } else {
+        std::env::current_dir()
+            .map_err(|e| anyhow::anyhow!("cannot determine cwd for project path: {e}"))?
+            .join(project_root)
+    };
+
+    if !project_root.exists() {
+        anyhow::bail!("project root does not exist: {}", project_root.display());
+    }
+    if !project_root.is_dir() {
+        anyhow::bail!(
+            "project root is not a directory: {}",
+            project_root.display()
+        );
+    }
+
+    let normalized =
+        rch_common::path_topology::normalize_project_path_with_policy(&project_root, policy)
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "project path normalization failed for {}: {e}",
+                    project_root.display()
+                )
+            })?;
+
+    Ok(normalized.canonical_path().to_path_buf())
+}
+
+/// `rch cache warm` implementation (br-4zm6u): pre-syncs project sources
+/// to one or more workers via `TransferPipeline::sync_to_remote` WITHOUT
+/// running a compilation step. Surfaces per-worker outcomes so an
+/// operator triaging a worker outage can see exactly which workers
+/// failed to warm and why.
+///
+/// Failure policy: a single worker failure does NOT abort the warm
+/// across remaining workers — the loop continues and the final summary
+/// reports `workers_succeeded` / `workers_failed`. The process exits 0
+/// if at least one worker warmed; non-zero (exit 1) if all workers
+/// failed. This mirrors the fail-open philosophy from AGENTS.md (other
+/// workers should still be usable even if one is down).
+async fn handle_cache_warm(
+    worker_filter: Vec<String>,
+    project: Option<PathBuf>,
+    ctx: &OutputContext,
+) -> Result<()> {
+    let style = ctx.theme();
+    let rch_config = config::load_config().map_err(|e| anyhow::anyhow!("load config: {e}"))?;
+    let topology_policy = rch_config.path_topology.to_policy();
+    let project_root = match project {
+        Some(p) => p,
+        None => std::env::current_dir()
+            .map_err(|e| anyhow::anyhow!("cannot determine project root from cwd: {e}"))?,
+    };
+    let project_root = resolve_cache_warm_project_root(project_root, &topology_policy)?;
+    let project_id = transfer::project_id_from_path(&project_root);
+    // Use the production hash entry point (`_with_dependency_roots_and_policy`)
+    // — the other two variants are #[cfg(test)]-gated convenience wrappers.
+    // Empty deps matches the cache-warm contract: warm only the named
+    // project, no path-dep closure crawling. The configured topology
+    // policy must still match the hook path or the warmed hash/path is
+    // different from the first real build.
+    let project_hash = transfer::compute_project_hash_with_dependency_roots_and_policy(
+        &project_root,
+        &[],
+        &topology_policy,
+    );
+
+    let all_workers = commands::load_workers_from_config()
+        .map_err(|e| anyhow::anyhow!("load workers config: {e}"))?;
+    if all_workers.is_empty() {
+        anyhow::bail!("no workers configured; run `rch workers add <host>` first");
+    }
+    // Filter by --workers flag if supplied. A filter that names no
+    // existing worker is a configuration error — fail fast so the
+    // operator notices the typo instead of getting a silent no-op.
+    let selected: Vec<_> = if worker_filter.is_empty() {
+        all_workers
+    } else {
+        let filter_set: std::collections::BTreeSet<&str> =
+            worker_filter.iter().map(String::as_str).collect();
+        let known_ids: std::collections::BTreeSet<String> =
+            all_workers.iter().map(|w| w.id.to_string()).collect();
+        let missing: Vec<&str> = filter_set
+            .iter()
+            .copied()
+            .filter(|id| !known_ids.contains(*id))
+            .collect();
+        if !missing.is_empty() {
+            // Show the actual configured worker list (not the post-filter
+            // empty set) so the operator can spot a typo or stale id.
+            anyhow::bail!(
+                "unknown worker id(s) in --workers filter: {}; configured workers: {}",
+                missing.join(", "),
+                ctx_worker_ids(&all_workers)
+            );
+        }
+        all_workers
+            .into_iter()
+            .filter(|w| filter_set.contains(w.id.as_str()))
+            .collect()
+    };
+
+    tracing::info!(
+        target: "rch::cache::warm",
+        project_root = %project_root.display(),
+        project_id = %project_id,
+        project_hash = %project_hash,
+        worker_count = selected.len(),
+        "cache.warm.start",
+    );
+
+    if !ctx.is_json() {
+        eprintln!(
+            "{} {}",
+            style.format_header("Cache warm"),
+            style.muted(&format!(
+                "project={} ({}/{}) workers={}",
+                project_root.display(),
+                project_id,
+                &project_hash[..project_hash.len().min(12)],
+                selected.len(),
+            )),
+        );
+    }
+
+    let session_start = std::time::Instant::now();
+    let transfer_config = rch_config.transfer;
+    let mut results: Vec<CacheWarmWorkerResult> = Vec::with_capacity(selected.len());
+    let mut total_bytes: u64 = 0;
+    let mut total_files: u64 = 0;
+    let mut succeeded: usize = 0;
+    let mut failed: usize = 0;
+
+    for worker in &selected {
+        // Each worker gets its own TransferPipeline so state (env
+        // overrides, color mode, estimated bytes) cannot leak across
+        // warm targets.
+        let pipeline = transfer::TransferPipeline::new(
+            project_root.clone(),
+            project_id.clone(),
+            project_hash.clone(),
+            transfer_config.clone(),
+        );
+        let started = std::time::Instant::now();
+        match pipeline.sync_to_remote(worker).await {
+            Ok(sync_result) => {
+                succeeded += 1;
+                total_bytes += sync_result.bytes_transferred;
+                total_files += u64::from(sync_result.files_transferred);
+                tracing::info!(
+                    target: "rch::cache::warm",
+                    worker = %worker.id,
+                    bytes = sync_result.bytes_transferred,
+                    files = sync_result.files_transferred,
+                    duration_ms = sync_result.duration_ms,
+                    "cache.warm.worker.ok",
+                );
+                if !ctx.is_json() {
+                    eprintln!(
+                        "  {} {}: {} bytes, {} files, {}ms",
+                        style.format_success("✓"),
+                        style.highlight(worker.id.as_str()),
+                        sync_result.bytes_transferred,
+                        sync_result.files_transferred,
+                        sync_result.duration_ms,
+                    );
+                }
+                results.push(CacheWarmWorkerResult {
+                    worker_id: worker.id.to_string(),
+                    success: true,
+                    bytes_transferred: sync_result.bytes_transferred,
+                    files_transferred: u64::from(sync_result.files_transferred),
+                    duration_ms: sync_result.duration_ms,
+                    error: None,
+                });
+            }
+            Err(err) => {
+                failed += 1;
+                let duration_ms = started.elapsed().as_millis() as u64;
+                let error_msg = err.to_string();
+                tracing::warn!(
+                    target: "rch::cache::warm",
+                    worker = %worker.id,
+                    error = %error_msg,
+                    duration_ms,
+                    "cache.warm.worker.failed",
+                );
+                if !ctx.is_json() {
+                    eprintln!(
+                        "  {} {}: {}",
+                        style.format_error("✗"),
+                        style.highlight(worker.id.as_str()),
+                        style.error(&error_msg),
+                    );
+                }
+                results.push(CacheWarmWorkerResult {
+                    worker_id: worker.id.to_string(),
+                    success: false,
+                    bytes_transferred: 0,
+                    files_transferred: 0,
+                    duration_ms,
+                    error: Some(error_msg),
+                });
+            }
+        }
+    }
+
+    let total_duration_ms = session_start.elapsed().as_millis() as u64;
+    let response = CacheWarmResponse {
+        project_root: project_root.display().to_string(),
+        project_id: project_id.clone(),
+        project_hash: project_hash.clone(),
+        workers_total: selected.len(),
+        workers_succeeded: succeeded,
+        workers_failed: failed,
+        bytes_transferred: total_bytes,
+        files_transferred: total_files,
+        duration_ms: total_duration_ms,
+        workers: results,
+    };
+
+    if ctx.is_json() {
+        let _ = ctx.json(&ApiResponse::ok("cache.warm", &response));
+    } else {
+        eprintln!();
+        eprintln!(
+            "{} {}/{} workers warmed, {} bytes, {} files, {}ms total",
+            style.format_header("Summary"),
+            style.highlight(&succeeded.to_string()),
+            style.highlight(&selected.len().to_string()),
+            style.highlight(&total_bytes.to_string()),
+            style.highlight(&total_files.to_string()),
+            style.highlight(&total_duration_ms.to_string()),
+        );
+    }
+
+    tracing::info!(
+        target: "rch::cache::warm",
+        workers_succeeded = succeeded,
+        workers_failed = failed,
+        bytes = total_bytes,
+        files = total_files,
+        duration_ms = total_duration_ms,
+        "cache.warm.complete",
+    );
+
+    // Exit policy: at least one worker warmed → 0; all failed → 1.
+    // This is friendlier than "any failure = non-zero" because in a
+    // multi-worker fleet, a single offline worker shouldn't break a
+    // pre-session warm step.
+    if succeeded == 0 && failed > 0 {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// Format a `WorkerConfig` slice's IDs for error messages.
+fn ctx_worker_ids(workers: &[rch_common::WorkerConfig]) -> String {
+    if workers.is_empty() {
+        return "(none)".to_string();
+    }
+    workers
+        .iter()
+        .map(|w| w.id.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 async fn handle_hook(action: HookAction, ctx: &OutputContext) -> Result<()> {
     match action {
         HookAction::Install => {
@@ -2714,15 +3243,57 @@ async fn handle_agents(action: AgentsAction, ctx: &OutputContext) -> Result<()> 
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_doctor(
     fix: bool,
     dry_run: bool,
     install_deps: bool,
     reliability: bool,
     check_schemas: bool,
+    strict: bool,
+    lenient: bool,
+    scope: String,
+    watch: bool,
+    watch_interval: u64,
+    transitions_only: bool,
+    watch_snapshot: Option<PathBuf>,
     ctx: &OutputContext,
 ) -> Result<()> {
-    use crate::doctor::DoctorOptions;
+    use crate::doctor::{DoctorOptions, ReliabilityScopeSet};
+    // Parse the scope arg (clap default = "all"). Invalid values produce
+    // a clear error via FromStr that's surfaced to the user.
+    let scope: ReliabilityScopeSet = scope
+        .parse()
+        .map_err(|e: String| anyhow::anyhow!("invalid --scope value: {e}"))?;
+    // Clamp watch interval at the CLI boundary. clap can't express an
+    // inclusive range constraint cleanly for u64, so we do it here so a
+    // pathological `--watch-interval=0` (busy loop) or `--watch-interval=
+    // 86400` (essentially-disabled) is gently corrected with a warning
+    // instead of failing or hanging.
+    let watch_interval_secs = if watch {
+        if watch_interval == 0 {
+            tracing::warn!(
+                target: "rch::doctor::watch",
+                requested = watch_interval,
+                clamped_to = 1u64,
+                "watch interval 0 would busy-loop; clamping to 1 second"
+            );
+            1
+        } else if watch_interval > 3600 {
+            tracing::warn!(
+                target: "rch::doctor::watch",
+                requested = watch_interval,
+                clamped_to = 3600u64,
+                "watch interval > 3600 is pathological; clamping to 1 hour"
+            );
+            3600
+        } else {
+            watch_interval
+        }
+    } else {
+        // Not in watch mode: the field is ignored at runtime.
+        watch_interval
+    };
     let options = DoctorOptions {
         fix,
         dry_run,
@@ -2730,6 +3301,13 @@ async fn handle_doctor(
         reliability,
         check_schemas,
         verbose: ctx.is_verbose(),
+        strict,
+        lenient,
+        scope,
+        watch,
+        watch_interval_secs,
+        transitions_only,
+        watch_snapshot,
     };
     crate::doctor::run_doctor(ctx, options).await
 }
@@ -2771,6 +3349,119 @@ async fn handle_update(
     )
     .await
     .map_err(|e| anyhow::anyhow!("{}", e))
+}
+
+/// Handle `rch error <sub>` subcommands. Operator-facing code lookup
+/// surface — pastes a code from a log line, get description +
+/// remediation. Bridges the two namespaces (RCH-Ennn errors,
+/// RCH-Rnnn reliability) into one uniform interface.
+fn handle_error_explain(sub: ErrorSubcommand, ctx: &OutputContext) -> Result<()> {
+    use rch_common::api::ApiError;
+    use rch_common::errors::{
+        is_known_category, known_categories, list_all, list_by_category, lookup, render_human,
+    };
+    use rch_common::{ApiResponse, ErrorCode};
+
+    match sub {
+        ErrorSubcommand::Explain { code, json } => {
+            let trimmed = code.trim();
+            match lookup(trimmed) {
+                Some(explanation) => {
+                    if json || ctx.is_json() {
+                        let response = ApiResponse::ok("error.explain", &explanation);
+                        if json {
+                            ctx.json_force(&response)?;
+                        } else {
+                            ctx.json(&response)?;
+                        }
+                    } else {
+                        print!("{}", render_human(&explanation));
+                    }
+                    Ok(())
+                }
+                None => {
+                    if json || ctx.is_json() {
+                        let response: ApiResponse<()> = ApiResponse::err(
+                            "error.explain",
+                            ApiError::new(
+                                ErrorCode::ConfigValidationError,
+                                format!("Unknown code {trimmed:?}"),
+                            )
+                            .with_remediation(["Run `rch error list` to see all known codes."]),
+                        );
+                        if json {
+                            ctx.json_force(&response)?;
+                        } else {
+                            ctx.json(&response)?;
+                        }
+                    }
+                    eprintln!(
+                        "Unknown code {trimmed:?}. Try `rch error list` to see all known codes."
+                    );
+                    std::process::exit(2);
+                }
+            }
+        }
+        ErrorSubcommand::List { category, json } => {
+            let requested_category = category.as_deref().map(str::trim).filter(|c| !c.is_empty());
+            let entries = match requested_category {
+                Some(c) => {
+                    let entries = list_by_category(c);
+                    if entries.is_empty() && !is_known_category(c) {
+                        let known = known_categories();
+                        let known_display = known.join(", ");
+                        if json || ctx.is_json() {
+                            let response: ApiResponse<()> = ApiResponse::err(
+                                "error.list",
+                                ApiError::new(
+                                    ErrorCode::ConfigValidationError,
+                                    format!("Unknown error category {c:?}"),
+                                )
+                                .with_context("category", c)
+                                .with_context("known_categories", known_display.as_str())
+                                .with_remediation([format!("Use one of: {known_display}")]),
+                            );
+                            if json {
+                                ctx.json_force(&response)?;
+                            } else {
+                                ctx.json(&response)?;
+                            }
+                        }
+                        eprintln!("Unknown error category {c:?}. Use one of: {known_display}.");
+                        std::process::exit(2);
+                    }
+                    entries
+                }
+                _ => list_all(),
+            };
+            if json || ctx.is_json() {
+                #[derive(serde::Serialize)]
+                struct ListPayload {
+                    count: usize,
+                    codes: Vec<rch_common::CodeExplanation>,
+                }
+                let payload = ListPayload {
+                    count: entries.len(),
+                    codes: entries,
+                };
+                let response = ApiResponse::ok("error.list", &payload);
+                if json {
+                    ctx.json_force(&response)?;
+                } else {
+                    ctx.json(&response)?;
+                }
+            } else {
+                println!("{} known code(s):", entries.len());
+                for e in &entries {
+                    println!(
+                        "  {} [{}] {} — {}",
+                        e.code, e.category, e.name, e.description
+                    );
+                }
+            }
+            Ok(())
+        }
+    }
 }
 
 /// Handle completions subcommands
@@ -3011,13 +3702,6 @@ fn open_browser(url: &str) -> Result<()> {
 // =============================================================================
 // Unit Tests
 // =============================================================================
-
-// Global test logging initialization - enables JSONL output for all unit tests
-#[cfg(test)]
-#[ctor::ctor]
-fn init_test_logging() {
-    rch_common::testing::init_global_test_logging();
-}
 
 #[cfg(test)]
 mod tests {
@@ -3770,6 +4454,132 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
+    // Cache Subcommand Tests (br-4zm6u)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn cli_parses_cache_warm_default() {
+        let _guard = test_guard!();
+        let cli = Cli::try_parse_from(["rch", "cache", "warm"]).unwrap();
+        match cli.command {
+            Some(Commands::Cache {
+                action: CacheAction::Warm { workers, project },
+            }) => {
+                assert!(workers.is_empty(), "default --workers must be empty");
+                assert!(project.is_none(), "default --project must be None");
+            }
+            _ => panic!("Expected cache warm command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_cache_warm_single_worker() {
+        let _guard = test_guard!();
+        let cli = Cli::try_parse_from(["rch", "cache", "warm", "--workers", "css"]).unwrap();
+        match cli.command {
+            Some(Commands::Cache {
+                action:
+                    CacheAction::Warm {
+                        workers,
+                        project: _,
+                    },
+            }) => assert_eq!(workers, vec!["css".to_string()]),
+            _ => panic!("Expected cache warm command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_cache_warm_multiple_workers() {
+        let _guard = test_guard!();
+        let cli = Cli::try_parse_from([
+            "rch",
+            "cache",
+            "warm",
+            "--workers",
+            "css",
+            "--workers",
+            "vmi1",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Cache {
+                action:
+                    CacheAction::Warm {
+                        workers,
+                        project: _,
+                    },
+            }) => assert_eq!(workers, vec!["css".to_string(), "vmi1".to_string()]),
+            _ => panic!("Expected cache warm command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_cache_warm_with_project_path() {
+        let _guard = test_guard!();
+        let cli = Cli::try_parse_from(["rch", "cache", "warm", "--project", "/tmp/some/project"])
+            .unwrap();
+        match cli.command {
+            Some(Commands::Cache {
+                action:
+                    CacheAction::Warm {
+                        workers: _,
+                        project,
+                    },
+            }) => assert_eq!(project, Some(PathBuf::from("/tmp/some/project"))),
+            _ => panic!("Expected cache warm command"),
+        }
+    }
+
+    #[test]
+    fn cli_rejects_cache_warm_unknown_flag() {
+        let _guard = test_guard!();
+        let result = Cli::try_parse_from(["rch", "cache", "warm", "--bogus"]);
+        assert!(result.is_err(), "unknown flag must error");
+    }
+
+    #[test]
+    fn cache_warm_project_root_uses_configured_topology() {
+        let _guard = test_guard!();
+        let temp = tempfile::TempDir::new().unwrap();
+        let canonical_root = temp.path().join("projects");
+        let alias_root = temp.path().join("alias");
+        let project = canonical_root.join("demo");
+        std::fs::create_dir_all(&project).unwrap();
+        let policy = rch_common::path_topology::PathTopologyPolicy::new(canonical_root, alias_root);
+
+        let resolved = resolve_cache_warm_project_root(project.clone(), &policy).unwrap();
+
+        assert_eq!(resolved, std::fs::canonicalize(&project).unwrap());
+        assert!(
+            resolve_cache_warm_project_root(
+                project,
+                &rch_common::path_topology::PathTopologyPolicy::default(),
+            )
+            .is_err(),
+            "cache warm must honor configured topology instead of the compiled-in default"
+        );
+    }
+
+    #[test]
+    fn cache_warm_project_root_rejects_file_path() {
+        let _guard = test_guard!();
+        let temp = tempfile::TempDir::new().unwrap();
+        let project_file = temp.path().join("Cargo.toml");
+        std::fs::write(&project_file, "[package]\n").unwrap();
+        let policy = rch_common::path_topology::PathTopologyPolicy::new(
+            temp.path().to_path_buf(),
+            temp.path().join("alias"),
+        );
+
+        let err = resolve_cache_warm_project_root(project_file, &policy).unwrap_err();
+
+        assert!(
+            err.to_string().contains("project root is not a directory"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
     // Doctor Subcommand Tests
     // -------------------------------------------------------------------------
 
@@ -3784,12 +4594,21 @@ mod tests {
                 install_deps,
                 reliability,
                 check_schemas,
+                strict,
+                lenient,
+                scope: _,
+                watch: _,
+                watch_interval: _,
+                transitions_only: _,
+                watch_snapshot: _,
             }) => {
                 assert!(!fix);
                 assert!(!dry_run);
                 assert!(!install_deps);
                 assert!(!reliability);
                 assert!(!check_schemas);
+                assert!(!strict);
+                assert!(!lenient);
             }
             _ => panic!("Expected doctor command"),
         }
@@ -3806,12 +4625,21 @@ mod tests {
                 install_deps,
                 reliability,
                 check_schemas,
+                strict,
+                lenient,
+                scope: _,
+                watch: _,
+                watch_interval: _,
+                transitions_only: _,
+                watch_snapshot: _,
             }) => {
                 assert!(fix);
                 assert!(!dry_run);
                 assert!(!install_deps);
                 assert!(!reliability);
                 assert!(!check_schemas);
+                assert!(!strict);
+                assert!(!lenient);
             }
             _ => panic!("Expected doctor command"),
         }
@@ -3828,12 +4656,21 @@ mod tests {
                 install_deps,
                 reliability,
                 check_schemas,
+                strict,
+                lenient,
+                scope: _,
+                watch: _,
+                watch_interval: _,
+                transitions_only: _,
+                watch_snapshot: _,
             }) => {
                 assert!(!fix);
                 assert!(dry_run);
                 assert!(!install_deps);
                 assert!(!reliability);
                 assert!(!check_schemas);
+                assert!(!strict);
+                assert!(!lenient);
             }
             _ => panic!("Expected doctor command"),
         }
@@ -3850,12 +4687,21 @@ mod tests {
                 install_deps,
                 reliability,
                 check_schemas,
+                strict,
+                lenient,
+                scope: _,
+                watch: _,
+                watch_interval: _,
+                transitions_only: _,
+                watch_snapshot: _,
             }) => {
                 assert!(!fix);
                 assert!(!dry_run);
                 assert!(install_deps);
                 assert!(!reliability);
                 assert!(!check_schemas);
+                assert!(!strict);
+                assert!(!lenient);
             }
             _ => panic!("Expected doctor command"),
         }
@@ -3872,12 +4718,21 @@ mod tests {
                 install_deps,
                 reliability,
                 check_schemas,
+                strict,
+                lenient,
+                scope: _,
+                watch: _,
+                watch_interval: _,
+                transitions_only: _,
+                watch_snapshot: _,
             }) => {
                 assert!(!fix);
                 assert!(!dry_run);
                 assert!(!install_deps);
                 assert!(reliability);
                 assert!(!check_schemas);
+                assert!(!strict);
+                assert!(!lenient);
             }
             _ => panic!("Expected doctor command"),
         }
@@ -3895,15 +4750,70 @@ mod tests {
                 install_deps,
                 reliability,
                 check_schemas,
+                strict,
+                lenient,
+                scope: _,
+                watch: _,
+                watch_interval: _,
+                transitions_only: _,
+                watch_snapshot: _,
             }) => {
                 assert!(!fix);
                 assert!(!dry_run);
                 assert!(!install_deps);
                 assert!(reliability);
                 assert!(check_schemas);
+                assert!(!strict);
+                assert!(!lenient);
             }
             _ => panic!("Expected doctor command"),
         }
+    }
+
+    #[test]
+    fn cli_parses_doctor_reliability_strict_and_lenient_modes() {
+        let _guard = test_guard!();
+        let strict_cli = Cli::try_parse_from(["rch", "doctor", "--reliability", "--strict"])
+            .expect("strict mode should parse with reliability mode");
+        assert!(
+            matches!(
+                strict_cli.command,
+                Some(Commands::Doctor {
+                    reliability: true,
+                    strict: true,
+                    lenient: false,
+                    ..
+                })
+            ),
+            "Expected doctor command with reliability strict mode"
+        );
+
+        let lenient_cli = Cli::try_parse_from(["rch", "doctor", "--reliability", "--lenient"])
+            .expect("lenient mode should parse with reliability mode");
+        assert!(
+            matches!(
+                lenient_cli.command,
+                Some(Commands::Doctor {
+                    reliability: true,
+                    strict: false,
+                    lenient: true,
+                    ..
+                })
+            ),
+            "Expected doctor command with reliability lenient mode"
+        );
+    }
+
+    #[test]
+    fn cli_rejects_doctor_reliability_strict_and_lenient_together() {
+        let _guard = test_guard!();
+        let result =
+            Cli::try_parse_from(["rch", "doctor", "--reliability", "--strict", "--lenient"]);
+
+        assert!(
+            result.is_err(),
+            "--strict and --lenient are mutually exclusive"
+        );
     }
 
     #[test]
@@ -3917,6 +4827,85 @@ mod tests {
         );
         if let Err(err) = result {
             assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+        }
+    }
+
+    #[test]
+    fn cli_parses_doctor_reliability_watch_flags() {
+        let _guard = test_guard!();
+        let cli = Cli::try_parse_from([
+            "rch",
+            "doctor",
+            "--reliability",
+            "--watch",
+            "--watch-interval",
+            "30",
+            "--transitions-only",
+            "--watch-snapshot",
+            "/tmp/rch-watch.json",
+        ])
+        .expect("watch mode flags should parse with reliability mode");
+
+        match cli.command {
+            Some(Commands::Doctor {
+                reliability,
+                watch,
+                watch_interval,
+                transitions_only,
+                watch_snapshot,
+                ..
+            }) => {
+                assert!(reliability);
+                assert!(watch);
+                assert_eq!(watch_interval, 30);
+                assert!(transitions_only);
+                assert_eq!(watch_snapshot, Some(PathBuf::from("/tmp/rch-watch.json")));
+            }
+            _ => panic!("Expected doctor command with reliability watch mode"),
+        }
+    }
+
+    #[test]
+    fn cli_rejects_doctor_watch_without_reliability() {
+        let _guard = test_guard!();
+        let result = Cli::try_parse_from(["rch", "doctor", "--watch"]);
+        assert!(
+            result.is_err(),
+            "--watch is only valid with reliability mode"
+        );
+        if let Err(err) = result {
+            assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+        }
+    }
+
+    #[test]
+    fn cli_rejects_doctor_watch_with_fix() {
+        let _guard = test_guard!();
+        let result = Cli::try_parse_from(["rch", "doctor", "--reliability", "--fix", "--watch"]);
+        assert!(result.is_err(), "--watch and --fix are mutually exclusive");
+        if let Err(err) = result {
+            assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+        }
+    }
+
+    #[test]
+    fn cli_rejects_doctor_watch_dependents_without_watch() {
+        let _guard = test_guard!();
+        for args in [
+            vec!["rch", "doctor", "--reliability", "--transitions-only"],
+            vec![
+                "rch",
+                "doctor",
+                "--reliability",
+                "--watch-snapshot",
+                "/tmp/rch-watch.json",
+            ],
+        ] {
+            let result = Cli::try_parse_from(args);
+            assert!(result.is_err(), "watch-only flags should require --watch");
+            if let Err(err) = result {
+                assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+            }
         }
     }
 
@@ -4261,6 +5250,37 @@ mod tests {
                 assert_eq!(port, 3001);
             }
             _ => panic!("Expected web command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_error_explain_json() {
+        let _guard = test_guard!();
+        let cli = Cli::try_parse_from(["rch", "error", "explain", "RCH-R104", "--json"]).unwrap();
+        match cli.command {
+            Some(Commands::Error {
+                sub: ErrorSubcommand::Explain { code, json },
+            }) => {
+                assert_eq!(code, "RCH-R104");
+                assert!(json);
+            }
+            _ => panic!("Expected error explain command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_error_list_category() {
+        let _guard = test_guard!();
+        let cli =
+            Cli::try_parse_from(["rch", "error", "list", "--category", "disk_pressure"]).unwrap();
+        match cli.command {
+            Some(Commands::Error {
+                sub: ErrorSubcommand::List { category, json },
+            }) => {
+                assert_eq!(category.as_deref(), Some("disk_pressure"));
+                assert!(!json);
+            }
+            _ => panic!("Expected error list command"),
         }
     }
 

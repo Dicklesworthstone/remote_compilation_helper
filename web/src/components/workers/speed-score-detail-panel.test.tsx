@@ -431,6 +431,7 @@ describe('SpeedScoreDetailPanel', () => {
       );
 
       const panel = screen.getByRole('region');
+      expect(panel).toHaveAttribute('data-expanded', 'true');
       expect(panel).toHaveAttribute('aria-labelledby', 'panel-title-css');
       expect(screen.getByRole('button', { name: /toggle speedscore details/i }))
         .toHaveAttribute('aria-expanded', 'true');

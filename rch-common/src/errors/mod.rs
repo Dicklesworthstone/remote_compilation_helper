@@ -18,7 +18,17 @@
 //! | E310-E319  |   Triage    |   Process triage integration errors  |
 //! | E400-E499  | Transfer    | File transfer and sync errors        |
 //! | E500-E599  | Internal    | Internal/unexpected errors           |
+//!
+//! Reliability-doctor reason codes use a separate `RCH-Rnnn` namespace; see
+//! [`reliability`] for the full table.
 
 pub mod catalog;
+pub mod explain;
+pub mod reliability;
 
 pub use catalog::{ErrorCategory, ErrorCode, ErrorEntry};
+pub use explain::{
+    CodeExplanation, CodeNamespace, is_known, is_known_category, known_categories, list_all,
+    list_by_category, lookup, render_human,
+};
+pub use reliability::{ReliabilityCategoryKind, ReliabilityReasonCode};

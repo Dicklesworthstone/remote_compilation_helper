@@ -1,46 +1,54 @@
 # Dependency Upgrade Log
 
-**Date:** 2026-05-14  |  **Project:** remote_compilation_helper  |  **Language:** Rust + Node
+**Date:** 2026-05-14  |  **Project:** remote_compilation_helper  |  **Language:** Rust + TypeScript
 
 ## Summary
-- **Updated:** Rust direct dependencies, Rust lockfile transitive dependencies, `/dp` local-owner dependencies, release workflow dependency bootstrapping, and web dashboard dependencies
-- **Skipped:** `ctor` 1.0.5, ESLint 10.3.0, TypeScript 6.0.3
+- **Updated:** Rust workspace dependencies, local authored `/dp` crates, and web dashboard dependencies
+- **Skipped latest:** 2 web majors due current peer constraints
 - **Failed:** 0
-- **Needs attention:** 0
+- **Release target:** 1.0.25
 
-## Updates
+## Rust Updates
 
-### Local-owner libraries from `/dp`
-- **FrankenTUI:** GitHub dependency at `0.2.x` → `/dp/frankentui` crates at `0.4.0`
-- **TOON:** `toon-rust` 0.1.3 → `/dp/toon_rust` package `tru` 0.2.3
-- **rich_rust:** crates.io 0.2.0 with `full` feature → `/dp/rich_rust` 0.2.1 without `full`
-- **Reason:** User requested latest local versions for libraries developed in `/dp`; removing `rich_rust/full` also drops unused `syntect`, `bincode`, and `yaml-rust` audit warnings.
-- **Release workflow:** GitHub release, Windows, and crates.io publish jobs now clone `/dp/rich_rust`, `/dp/toon_rust`, and `/dp/frankentui` so fresh runners reproduce the local path dependency layout.
-- **Tests:** `cargo fmt --check`, `cargo check --workspace --all-targets`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, and `actionlint - < .github/workflows/release.yml` passed after migration fixes.
+### Local authored libraries
+- `toon-rust` now resolves to local `/dp/toon_rust` (`package = "tru"`, version `0.2.3`).
+- FrankenTUI crates now resolve to local `/dp/frankentui/crates/*` paths at version `0.4.0`.
+- `rich_rust` now resolves to local `/dp/rich_rust` at version `0.2.1`.
+- GitHub release and crates.io publish jobs recreate `/dp/rich_rust`, `/dp/toon_rust`, and `/dp/frankentui` on fresh runners before building.
 
-### Rust dependency refresh
-- **Updated:** `rand` 0.10.0 → 0.10.1, `reqwest` 0.13.2 → 0.13.3, `sha2` 0.10.9 → 0.11.0, `hmac` 0.12 → 0.13, `terminal_size` 0.4.3 → 0.4.4, `lru` 0.16 → 0.18, `proptest` 1.10.0 → 1.11.0, `insta` 1.46 → 1.47.2, `whoami` 2.1 → 2.1.2, `fastrand` 2.3 → 2.4.1, and `rusqlite` 0.38 → 0.39.
-- **Security:** `cargo update` also moved `rustls-webpki` to 0.103.13 and removed the vulnerable/unused rich rendering transitive stack.
-- **Migrations:** Adapted `sha2` 0.11 hex conversion, imported `hmac::KeyInit`, and adjusted TOON encode/decode call sites for the newer local API.
+### Registry dependencies
+- Updated direct Rust dependencies reported by `cargo outdated`, including `hmac`, `sha2`, `lru`, `reqwest`, `terminal_size`, `rusqlite`, `fastrand`, `whoami`, `proptest`, `insta`, and `rand`.
+- Removed the `ctor` test initializer dependency instead of upgrading it. The 1.x macro API requires unsafe attributes that conflict with this workspace's `#![forbid(unsafe_code)]` policy.
+- Narrowed `rich_rust` features to the UI primitives RCH actually uses, removing unused syntax/markdown/backtrace dependencies and their transitive audit warnings.
+- Updated transitive `rustls-webpki` and `rand` lockfile entries to fixed patch releases after `cargo audit` reported advisories.
 
-### Web dashboard dependency refresh
-- **Updated:** Next 16.1.3 → 16.2.6, React/React DOM 19.2.3 → 19.2.6, Playwright 1.43 → 1.60.0, Vitest 4.0.17 → 4.1.6, Vite React plugin 5.1.2 → 6.0.1 with direct Vite 8.0.12, jsdom 27.4.0 → 29.1.1, and other dashboard/runtime packages to current compatible releases.
-- **Security:** Added a `postcss` override at 8.5.10+ because the latest Next release still carries a vulnerable nested range; `npm audit --json` reports 0 vulnerabilities after the override.
-- **Tests:** `npm run lint`, `npm test` (133 tests), `npm run build`, and full Playwright `npm run test:e2e -- --workers=1` (316 passed, 44 skipped) passed after updating responsive navigation assertions for the current mobile sidebar behavior.
+### Code migrations
+- Adapted `toon_rust::encode` / `decode` call sites to the local `/dp/toon_rust` API.
+- Updated SHA-256 formatting for `sha2` 0.11 by converting finalized digest bytes to lowercase hex explicitly.
+- Imported `hmac::KeyInit` where required by `hmac` 0.13.
 
-## Skipped
+## Web Updates
 
-### ctor: 0.2.9 → 1.0.5
-- **Reason:** ctor 1.x requires `#[ctor(unsafe)]` annotations, conflicting with the repo's unsafe-code policy.
-- **Action:** Kept `ctor` at 0.2.9.
+### Updated dependencies
+- Updated the dashboard stack across Next.js, React, TanStack Query, Motion, Recharts, SWR, Tailwind packages, Playwright, Vitest, Vite, jsdom, and related type packages.
+- Added a direct Vite 8 dev dependency to satisfy `@vitejs/plugin-react` 6.x.
+- Added a package override for `postcss` 8.5.14 to keep `npm audit` clean through the Next.js dependency tree.
 
-### ESLint: 9.39.4 → 10.3.0
-- **Reason:** Next's current lint dependency stack still includes plugins that peer-declare support through ESLint 9 only.
-- **Action:** Kept ESLint at the newest peer-compatible 9.x release to avoid install/lint warnings.
+### Intentionally held
+- Held `eslint` at 9.39.4 because the current Next/TypeScript ESLint stack rejects ESLint 10.
+- Held `typescript` at 5.9.3 because the current TypeScript ESLint peer range rejects TypeScript 6.
 
-### TypeScript: 5.9.3 → 6.0.3
-- **Reason:** `typescript-eslint` in the current Next lint stack peer-declares `typescript <6.0.0`.
-- **Action:** Kept TypeScript at the newest peer-compatible 5.9.x release to avoid install/lint warnings.
+### Code migrations
+- Fixed new React hook dependency and purity lints after the web dependency refresh.
+- Updated dashboard test fixtures for the current API shapes used by the build and E2E suites.
+- Replaced an invalid `aria-expanded` attribute on a `role="region"` element with a testable data attribute.
+
+## Verification
+- `cargo outdated --workspace --depth 1`: all Rust dependencies up to date; local `toon-rust` has no registry update to compare.
+- `cargo audit`: no vulnerabilities or warnings after lockfile and feature cleanup.
+- `npm outdated`: only the intentional `eslint` 10 and TypeScript 6 peer-incompatible majors remain.
+- `npm audit`: 0 vulnerabilities.
+- Full release-gate commands are run separately before publishing 1.0.25.
 
 ---
 

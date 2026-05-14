@@ -6,7 +6,7 @@ use crate::DaemonContext;
 use crate::disk_pressure::{
     DiskPressurePolicyConfig, PressureAssessment, evaluate_pressure_policy,
 };
-use crate::health::{HealthConfig, probe_worker_capabilities};
+use crate::health::probe_worker_capabilities;
 use rch_common::{
     CircuitBreakerConfig, CircuitState, CircuitStats, WorkerCapabilities, WorkerConfig, WorkerId,
     WorkerStatus,
@@ -18,6 +18,19 @@ use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::debug;
+
+const CAPABILITIES_REFRESH_PROBE_TIMEOUT: Duration = Duration::from_secs(4);
+const CAPABILITIES_REFRESH_WORKER_BUDGET: Duration = Duration::from_secs(8);
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+enum DrainCompletionAction {
+    #[default]
+    StayDrained,
+    RemoveFromPool,
+    Disable {
+        reason: Option<String>,
+    },
+}
 
 /// State of a single worker.
 #[derive(Debug)]
@@ -67,6 +80,8 @@ pub struct WorkerState {
     pressure_assessment: RwLock<PressureAssessment>,
     /// Reason for disabling this worker (if disabled).
     disabled_reason: RwLock<Option<String>>,
+    /// Administrative intent to apply when a draining worker reaches zero slots.
+    drain_completion: RwLock<DrainCompletionAction>,
     /// Unix timestamp (seconds since epoch) when worker was disabled.
     ///
     /// **Why atomic:** Queried during worker selection to skip disabled workers.
@@ -97,14 +112,33 @@ impl WorkerState {
             toolchain_preflight: RwLock::new(HashMap::new()),
             pressure_assessment: RwLock::new(PressureAssessment::default()),
             disabled_reason: RwLock::new(None),
+            drain_completion: RwLock::new(DrainCompletionAction::default()),
             disabled_at: AtomicI64::new(0),
         }
     }
 
     /// Update worker configuration.
     pub async fn update_config(&self, new_config: WorkerConfig) {
-        let mut config = self.config.write().await;
-        *config = new_config;
+        {
+            let mut config = self.config.write().await;
+            *config = new_config;
+        }
+
+        let cancelled_pending_removal = {
+            let mut completion = self.drain_completion.write().await;
+            let should_cancel = *completion == DrainCompletionAction::RemoveFromPool;
+            if should_cancel {
+                *completion = DrainCompletionAction::StayDrained;
+            }
+            should_cancel
+        };
+
+        if cancelled_pending_removal {
+            let mut status = self.status.write().await;
+            if matches!(*status, WorkerStatus::Draining | WorkerStatus::Drained) {
+                *status = WorkerStatus::Healthy;
+            }
+        }
     }
 
     /// Get current worker status.
@@ -174,7 +208,21 @@ impl WorkerState {
                 Ordering::SeqCst,
                 Ordering::Relaxed,
             ) {
-                Ok(_) => return true,
+                Ok(_) => {
+                    // TOCTOU defense: re-check status after successful slot reservation.
+                    // If a concurrent drain() occurred between our initial read and the CAS,
+                    // we must rollback the reservation.
+                    let status_after_reservation = *self.status.read().await;
+                    match status_after_reservation {
+                        WorkerStatus::Draining | WorkerStatus::Drained | WorkerStatus::Disabled => {
+                            // Roll back the reservation; release_slots also handles transitioning
+                            // Draining -> Drained if this was the last slot.
+                            self.release_slots(count).await;
+                            return false;
+                        }
+                        _ => return true,
+                    }
+                }
                 Err(actual) => current = actual,
             }
         }
@@ -405,25 +453,38 @@ impl WorkerState {
     /// Disable the worker with an optional reason.
     /// Sets status to Disabled and records the timestamp and reason.
     pub async fn disable(&self, reason: Option<String>) {
+        *self.drain_completion.write().await = DrainCompletionAction::StayDrained;
         *self.status.write().await = WorkerStatus::Disabled;
         *self.disabled_reason.write().await = reason;
-        self.disabled_at.store(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(1), // Use 1 instead of 0 to avoid None sentinel
-            Ordering::Relaxed,
-        );
+        self.disabled_at
+            .store(current_unix_secs_for_disabled_at(), Ordering::Relaxed);
     }
 
     /// Start draining the worker (no new jobs, but finish existing).
     pub async fn drain(&self) {
+        *self.drain_completion.write().await = DrainCompletionAction::StayDrained;
         *self.status.write().await = WorkerStatus::Draining;
+        self.check_drain_complete().await;
+    }
+
+    /// Start draining a worker that should be removed once active jobs finish.
+    pub async fn drain_for_removal(&self) {
+        *self.drain_completion.write().await = DrainCompletionAction::RemoveFromPool;
+        *self.status.write().await = WorkerStatus::Draining;
+        self.check_drain_complete().await;
+    }
+
+    /// Start draining a worker that should become disabled once active jobs finish.
+    pub async fn drain_then_disable(&self, reason: Option<String>) {
+        *self.drain_completion.write().await = DrainCompletionAction::Disable { reason };
+        *self.status.write().await = WorkerStatus::Draining;
+        self.check_drain_complete().await;
     }
 
     /// Enable a previously disabled/draining worker.
     /// Clears disabled reason and timestamp, sets status to Healthy.
     pub async fn enable(&self) {
+        *self.drain_completion.write().await = DrainCompletionAction::StayDrained;
         *self.status.write().await = WorkerStatus::Healthy;
         *self.disabled_reason.write().await = None;
         self.disabled_at.store(0, Ordering::Relaxed);
@@ -444,20 +505,44 @@ impl WorkerState {
         *self.status.read().await == WorkerStatus::Drained
     }
 
-    /// Check if draining worker has completed all jobs and should transition to Drained.
-    /// Called when a job completes; auto-transitions Draining → Drained when no jobs remain.
-    /// Uses a single write lock to avoid TOCTOU race between read and write.
+    /// Check if draining worker has completed all jobs and apply the recorded completion action.
+    ///
+    /// Plain drains transition to `Drained`, config-removal drains become pruneable, and
+    /// drain-before-disable transitions to `Disabled` while preserving the disable reason.
     pub async fn check_drain_complete(&self) {
-        let mut status = self.status.write().await;
-        if *status == WorkerStatus::Draining {
-            // Use Acquire ordering to ensure we see any concurrent reserve_slots writes.
-            // This prevents a race where we transition to Drained while another thread
-            // has just reserved slots (their SeqCst write must happen-before our read).
-            let used = self.used_slots.load(Ordering::Acquire);
-            if used == 0 {
-                *status = WorkerStatus::Drained;
-            }
+        let used = self.used_slots.load(Ordering::Acquire);
+        if used != 0 || *self.status.read().await != WorkerStatus::Draining {
+            return;
         }
+
+        let completion = self.drain_completion.read().await.clone();
+        let mut status = self.status.write().await;
+        if *status != WorkerStatus::Draining || self.used_slots.load(Ordering::Acquire) != 0 {
+            return;
+        }
+
+        let disable_reason = match completion {
+            DrainCompletionAction::StayDrained | DrainCompletionAction::RemoveFromPool => {
+                *status = WorkerStatus::Drained;
+                None
+            }
+            DrainCompletionAction::Disable { reason } => {
+                *status = WorkerStatus::Disabled;
+                Some(reason)
+            }
+        };
+        drop(status);
+
+        if let Some(reason) = disable_reason {
+            *self.disabled_reason.write().await = reason;
+            self.disabled_at
+                .store(current_unix_secs_for_disabled_at(), Ordering::Relaxed);
+            *self.drain_completion.write().await = DrainCompletionAction::StayDrained;
+        }
+    }
+
+    async fn remove_after_drain_pending(&self) -> bool {
+        *self.drain_completion.read().await == DrainCompletionAction::RemoveFromPool
     }
 
     /// Get the reason this worker was disabled (if any).
@@ -564,27 +649,49 @@ impl WorkerPool {
         }
     }
 
-    /// Prune workers that are in Draining or Drained state and have no active slots.
+    /// Prune workers that were removed from config and have finished draining.
     ///
     /// Returns the number of workers removed.
     pub async fn prune_drained(&self) -> usize {
-        let mut workers = self.workers.write().await;
+        let snapshot: Vec<(WorkerId, Arc<WorkerState>)> = {
+            let workers = self.workers.read().await;
+            workers
+                .iter()
+                .map(|(id, worker)| (id.clone(), Arc::clone(worker)))
+                .collect()
+        };
+
         let mut to_remove = Vec::new();
-
-        for (id, worker) in workers.iter() {
+        for (id, worker) in snapshot {
+            worker.check_drain_complete().await;
             let status = worker.status().await;
-            let is_draining_or_drained =
-                status == WorkerStatus::Draining || status == WorkerStatus::Drained;
 
-            if is_draining_or_drained && worker.used_slots() == 0 {
-                to_remove.push(id.clone());
+            if status == WorkerStatus::Drained
+                && worker.used_slots() == 0
+                && worker.remove_after_drain_pending().await
+            {
+                to_remove.push((id, worker));
             }
         }
 
-        let count = to_remove.len();
-        for id in to_remove {
-            workers.remove(&id);
-            debug!("Pruned drained worker: {}", id);
+        let mut count = 0;
+        let mut workers = self.workers.write().await;
+        for (id, worker) in to_remove {
+            let still_same_worker = workers
+                .get(&id)
+                .is_some_and(|current| Arc::ptr_eq(current, &worker));
+            if !still_same_worker {
+                continue;
+            }
+
+            worker.check_drain_complete().await;
+            let should_remove = worker.status().await == WorkerStatus::Drained
+                && worker.used_slots() == 0
+                && worker.remove_after_drain_pending().await;
+            if should_remove && workers.remove(&id).is_some() {
+                count += 1;
+                debug!("Pruned drained worker: {}", id);
+            }
         }
 
         if count > 0 {
@@ -652,6 +759,14 @@ impl WorkerPool {
     }
 }
 
+fn current_unix_secs_for_disabled_at() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(1)
+        .max(1)
+}
+
 impl Default for WorkerPool {
     fn default() -> Self {
         Self::new()
@@ -677,6 +792,38 @@ pub struct WorkerCapabilitiesInfo {
     pub user: String,
     pub capabilities: WorkerCapabilities,
     pub pressure_assessment: PressureAssessment,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refresh: Option<WorkerCapabilitiesRefreshInfo>,
+}
+
+/// Freshness information for a capabilities refresh request.
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkerCapabilitiesRefreshInfo {
+    pub attempted: bool,
+    pub live: bool,
+    pub source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+impl WorkerCapabilitiesRefreshInfo {
+    fn live_probe() -> Self {
+        Self {
+            attempted: true,
+            live: true,
+            source: "live_probe".to_string(),
+            message: None,
+        }
+    }
+
+    fn cached_after_probe_failure(message: impl Into<String>) -> Self {
+        Self {
+            attempted: true,
+            live: false,
+            source: "cached_after_probe_failure".to_string(),
+            message: Some(message.into()),
+        }
+    }
 }
 
 /// Worker capabilities response.
@@ -712,13 +859,13 @@ pub async fn get_workers_capabilities(
 ) -> WorkerCapabilitiesResponse {
     let workers = ctx.pool.all_workers().await;
     let mut entries = Vec::with_capacity(workers.len());
-    let timeout = HealthConfig::default().check_timeout;
+    let mut refresh_results = if refresh {
+        refresh_worker_capabilities_concurrently(&workers).await
+    } else {
+        HashMap::new()
+    };
 
     for worker in workers {
-        if refresh && let Some(capabilities) = probe_worker_capabilities(&worker, timeout).await {
-            worker.set_capabilities(capabilities).await;
-        }
-
         let (id, host, user) = {
             let config = worker.config.read().await;
             (
@@ -729,6 +876,7 @@ pub async fn get_workers_capabilities(
         };
         let capabilities = worker.capabilities().await;
         let pressure_assessment = worker.pressure_assessment().await;
+        let refresh = refresh_results.remove(&id);
 
         entries.push(WorkerCapabilitiesInfo {
             id,
@@ -736,10 +884,66 @@ pub async fn get_workers_capabilities(
             user,
             capabilities,
             pressure_assessment,
+            refresh,
         });
     }
 
     WorkerCapabilitiesResponse { workers: entries }
+}
+
+async fn refresh_worker_capabilities_concurrently(
+    workers: &[Arc<WorkerState>],
+) -> HashMap<String, WorkerCapabilitiesRefreshInfo> {
+    let mut handles = Vec::with_capacity(workers.len());
+
+    for worker in workers {
+        let id = {
+            let config = worker.config.read().await;
+            config.id.to_string()
+        };
+        let worker = Arc::clone(worker);
+        handles.push((
+            id,
+            tokio::spawn(async move { refresh_worker_capabilities_for_worker(worker).await }),
+        ));
+    }
+
+    let mut results = HashMap::with_capacity(handles.len());
+    for (id, handle) in handles {
+        let refresh = match handle.await {
+            Ok(refresh) => refresh,
+            Err(err) => WorkerCapabilitiesRefreshInfo::cached_after_probe_failure(format!(
+                "capabilities refresh task failed: {err}; returning cached capability snapshot"
+            )),
+        };
+        results.insert(id, refresh);
+    }
+
+    results
+}
+
+async fn refresh_worker_capabilities_for_worker(
+    worker: Arc<WorkerState>,
+) -> WorkerCapabilitiesRefreshInfo {
+    let probe = tokio::time::timeout(
+        CAPABILITIES_REFRESH_WORKER_BUDGET,
+        probe_worker_capabilities(&worker, CAPABILITIES_REFRESH_PROBE_TIMEOUT),
+    )
+    .await;
+
+    match probe {
+        Ok(Some(capabilities)) => {
+            worker.set_capabilities(capabilities).await;
+            WorkerCapabilitiesRefreshInfo::live_probe()
+        }
+        Ok(None) => WorkerCapabilitiesRefreshInfo::cached_after_probe_failure(
+            "capabilities probe failed; returning cached capability snapshot",
+        ),
+        Err(_) => WorkerCapabilitiesRefreshInfo::cached_after_probe_failure(format!(
+            "capabilities probe exceeded {}s response budget; returning cached capability snapshot",
+            CAPABILITIES_REFRESH_WORKER_BUDGET.as_secs()
+        )),
+    }
 }
 
 /// Handle a worker drain request.
@@ -748,15 +952,17 @@ pub async fn handle_worker_drain(ctx: &DaemonContext, worker_id: &WorkerId) -> W
         Some(worker) => {
             let active_slots = worker.used_slots();
             worker.drain().await;
+            let new_status = worker.status().await;
             WorkerStateResponse {
                 status: "ok".to_string(),
                 worker_id: worker_id.to_string(),
                 action: "drain".to_string(),
-                new_status: Some("draining".to_string()),
+                new_status: Some(worker_status_label(new_status).to_string()),
                 reason: None,
                 message: Some(format!(
-                    "Worker is draining. {} slot(s) currently in use.",
-                    active_slots
+                    "Worker is {}. {} slot(s) currently in use.",
+                    worker_status_label(new_status),
+                    active_slots,
                 )),
                 active_slots: Some(active_slots),
             }
@@ -816,16 +1022,17 @@ pub async fn handle_worker_disable(
             let active_slots = worker.used_slots();
 
             if drain_first && active_slots > 0 {
-                // Start draining - will be fully disabled when slots reach 0
-                worker.drain().await;
+                worker.drain_then_disable(reason.clone()).await;
+                let new_status = worker.status().await;
                 WorkerStateResponse {
                     status: "ok".to_string(),
                     worker_id: worker_id.to_string(),
                     action: "disable".to_string(),
-                    new_status: Some("draining".to_string()),
+                    new_status: Some(worker_status_label(new_status).to_string()),
                     reason: reason.clone(),
                     message: Some(format!(
-                        "Worker is draining before disable. {} slot(s) in use. Reason: {}",
+                        "Worker is {} before disable. {} slot(s) in use. Reason: {}",
+                        worker_status_label(new_status),
                         active_slots,
                         reason.as_deref().unwrap_or("none provided")
                     )),
@@ -860,6 +1067,17 @@ pub async fn handle_worker_disable(
     }
 }
 
+fn worker_status_label(status: WorkerStatus) -> &'static str {
+    match status {
+        WorkerStatus::Healthy => "healthy",
+        WorkerStatus::Degraded => "degraded",
+        WorkerStatus::Unreachable => "unreachable",
+        WorkerStatus::Draining => "draining",
+        WorkerStatus::Drained => "drained",
+        WorkerStatus::Disabled => "disabled",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -875,6 +1093,29 @@ mod tests {
             priority: 100,
             tags: vec![],
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_refresh_worker_capabilities_marks_live_probe() {
+        let _guard = rch_common::test_guard!();
+        struct MockOverrideGuard;
+        impl Drop for MockOverrideGuard {
+            fn drop(&mut self) {
+                rch_common::mock::clear_mock_overrides();
+            }
+        }
+
+        rch_common::mock::set_mock_enabled_override(Some(true));
+        let _mock_guard = MockOverrideGuard;
+        let state = std::sync::Arc::new(WorkerState::new(test_config("test-worker")));
+
+        let refresh = refresh_worker_capabilities_for_worker(std::sync::Arc::clone(&state)).await;
+
+        assert!(refresh.attempted);
+        assert!(refresh.live);
+        assert_eq!(refresh.source, "live_probe");
+        assert!(state.has_rust().await);
     }
 
     // ============== WorkerState Tests ==============
@@ -1294,6 +1535,7 @@ mod tests {
     async fn test_apply_health_status_preserves_administrative_states() {
         let state = WorkerState::new(test_config("test"));
 
+        assert!(state.reserve_slots(1).await);
         state.drain().await;
         assert_eq!(
             state.apply_health_status(WorkerStatus::Healthy).await,
@@ -1301,7 +1543,7 @@ mod tests {
         );
         assert_eq!(state.status().await, WorkerStatus::Draining);
 
-        state.check_drain_complete().await;
+        state.release_slots(1).await;
         assert_eq!(state.status().await, WorkerStatus::Drained);
         assert_eq!(
             state.apply_health_status(WorkerStatus::Healthy).await,
@@ -1353,6 +1595,7 @@ mod tests {
     async fn test_drain_state() {
         let state = WorkerState::new(test_config("test"));
 
+        assert!(state.reserve_slots(1).await);
         state.drain().await;
         assert!(state.is_draining().await);
         assert_eq!(state.status().await, WorkerStatus::Draining);
@@ -1368,13 +1611,8 @@ mod tests {
     async fn test_drained_state() {
         let state = WorkerState::new(test_config("test"));
 
-        // Drained is set automatically via check_drain_complete()
+        // No slots are in use, so drain completes immediately.
         state.drain().await;
-        assert!(state.is_draining().await);
-        assert!(!state.is_drained().await);
-
-        // When no slots are used, draining should auto-transition to drained
-        state.check_drain_complete().await;
         assert!(!state.is_draining().await);
         assert!(state.is_drained().await);
         assert_eq!(state.status().await, WorkerStatus::Drained);
@@ -1410,6 +1648,29 @@ mod tests {
         assert!(!state.is_draining().await);
         assert!(state.is_drained().await);
         assert_eq!(state.status().await, WorkerStatus::Drained);
+    }
+
+    #[tokio::test]
+    async fn test_drain_then_disable_disables_after_active_jobs_finish() {
+        let state = WorkerState::new(test_config("test"));
+
+        assert!(state.reserve_slots(1).await);
+        state
+            .drain_then_disable(Some("maintenance".to_string()))
+            .await;
+        assert_eq!(state.status().await, WorkerStatus::Draining);
+        assert!(state.disabled_reason().await.is_none());
+        assert!(state.disabled_at().is_none());
+
+        state.release_slots(1).await;
+
+        assert_eq!(state.status().await, WorkerStatus::Disabled);
+        assert_eq!(
+            state.disabled_reason().await,
+            Some("maintenance".to_string())
+        );
+        assert!(state.disabled_at().is_some());
+        assert!(!state.remove_after_drain_pending().await);
     }
 
     #[tokio::test]
@@ -1606,6 +1867,25 @@ mod tests {
         assert_eq!(config.priority, 200);
     }
 
+    #[tokio::test]
+    async fn test_update_config_cancels_pending_removal_drain() {
+        let state = WorkerState::new(test_config("test"));
+
+        assert!(state.reserve_slots(1).await);
+        state.drain_for_removal().await;
+        assert_eq!(state.status().await, WorkerStatus::Draining);
+        assert!(state.remove_after_drain_pending().await);
+
+        let mut new_config = test_config("test");
+        new_config.priority = 250;
+        state.update_config(new_config).await;
+
+        assert_eq!(state.status().await, WorkerStatus::Healthy);
+        assert!(!state.remove_after_drain_pending().await);
+        state.release_slots(1).await;
+        assert_eq!(state.status().await, WorkerStatus::Healthy);
+    }
+
     // ============== WorkerPool Tests ==============
 
     #[tokio::test]
@@ -1782,9 +2062,10 @@ mod tests {
         });
         pool.add_worker_state(active).await;
 
-        // Drained worker with 0 slots used
-        let drained_empty = WorkerState::new(WorkerConfig {
-            id: WorkerId::new("drained_empty"),
+        // User-drained worker with 0 slots used. This must remain in the pool
+        // so `rch workers enable <id>` can bring it back.
+        let user_drained_empty = WorkerState::new(WorkerConfig {
+            id: WorkerId::new("user_drained_empty"),
             host: "localhost".to_string(),
             user: "u".to_string(),
             identity_file: "i".to_string(),
@@ -1792,18 +2073,32 @@ mod tests {
             priority: 100,
             tags: vec![],
         });
-        drained_empty.drain().await;
-        pool.add_worker_state(drained_empty).await;
+        user_drained_empty.drain().await;
+        pool.add_worker_state(user_drained_empty).await;
 
-        // Drained worker with slots in use (should NOT be pruned).
+        // Config-removal drain with 0 slots used. This is the only kind of
+        // drained worker the background cleanup should prune.
+        let removed_empty = WorkerState::new(WorkerConfig {
+            id: WorkerId::new("removed_empty"),
+            host: "localhost".to_string(),
+            user: "u".to_string(),
+            identity_file: "i".to_string(),
+            total_slots: 8,
+            priority: 100,
+            tags: vec![],
+        });
+        removed_empty.drain_for_removal().await;
+        pool.add_worker_state(removed_empty).await;
+
+        // Config-removal drain with slots in use (should NOT be pruned yet).
         //
         // In production, slot reservation happens while the worker is
-        // still healthy (selection path) and a subsequent drain() just
+        // still healthy (selection path) and a subsequent removal drain just
         // stops new reservations without releasing the in-flight ones.
         // `reserve_slots` (correctly) refuses after drain, so the test
         // must mirror that ordering.
-        let drained_busy = WorkerState::new(WorkerConfig {
-            id: WorkerId::new("drained_busy"),
+        let removed_busy = WorkerState::new(WorkerConfig {
+            id: WorkerId::new("removed_busy"),
             host: "localhost".to_string(),
             user: "u".to_string(),
             identity_file: "i".to_string(),
@@ -1811,19 +2106,29 @@ mod tests {
             priority: 100,
             tags: vec![],
         });
-        assert!(drained_busy.reserve_slots(1).await);
-        drained_busy.drain().await;
-        pool.add_worker_state(drained_busy).await;
+        assert!(removed_busy.reserve_slots(1).await);
+        removed_busy.drain_for_removal().await;
+        pool.add_worker_state(removed_busy).await;
 
-        assert_eq!(pool.len(), 3);
+        assert_eq!(pool.len(), 4);
 
         let pruned = pool.prune_drained().await;
         assert_eq!(pruned, 1);
-        assert_eq!(pool.len(), 2);
+        assert_eq!(pool.len(), 3);
 
         assert!(pool.get(&WorkerId::new("active")).await.is_some());
-        assert!(pool.get(&WorkerId::new("drained_busy")).await.is_some());
-        assert!(pool.get(&WorkerId::new("drained_empty")).await.is_none());
+        assert!(
+            pool.get(&WorkerId::new("user_drained_empty"))
+                .await
+                .is_some()
+        );
+        assert!(pool.get(&WorkerId::new("removed_busy")).await.is_some());
+        assert!(pool.get(&WorkerId::new("removed_empty")).await.is_none());
+
+        let removed_busy = pool.get(&WorkerId::new("removed_busy")).await.unwrap();
+        removed_busy.release_slots(1).await;
+        assert_eq!(pool.prune_drained().await, 1);
+        assert!(pool.get(&WorkerId::new("removed_busy")).await.is_none());
     }
 
     #[tokio::test]

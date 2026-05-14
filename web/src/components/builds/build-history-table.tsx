@@ -220,6 +220,8 @@ export function BuildHistoryTable({ activeBuilds, recentBuilds }: BuildHistoryTa
     setSortDirection(defaultSortDirection[key]);
   };
 
+  const resetPage = () => setPage(1);
+
   const rangeLabel = showPagination
     ? `${(currentPage - 1) * PAGE_SIZE + 1}-${Math.min(currentPage * PAGE_SIZE, sortedRows.length)} of ${sortedRows.length}`
     : `${sortedRows.length} build${sortedRows.length === 1 ? '' : 's'}`;
@@ -235,7 +237,7 @@ export function BuildHistoryTable({ activeBuilds, recentBuilds }: BuildHistoryTa
               value={statusFilter}
               onChange={(event) => {
                 setStatusFilter(event.target.value as BuildStatusFilter);
-                setPage(1);
+                resetPage();
               }}
               className="h-9 rounded-md border border-border bg-background px-3 text-sm text-foreground shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
             >
@@ -253,7 +255,7 @@ export function BuildHistoryTable({ activeBuilds, recentBuilds }: BuildHistoryTa
               value={workerFilter}
               onChange={(event) => {
                 setWorkerFilter(event.target.value);
-                setPage(1);
+                resetPage();
               }}
               className="h-9 rounded-md border border-border bg-background px-3 text-sm text-foreground shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
             >
@@ -274,7 +276,7 @@ export function BuildHistoryTable({ activeBuilds, recentBuilds }: BuildHistoryTa
                 value={startDate}
                 onChange={(event) => {
                   setStartDate(event.target.value);
-                  setPage(1);
+                  resetPage();
                 }}
                 className="h-9 rounded-md border border-border bg-background px-2 text-xs text-foreground shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
                 aria-label="Start date"
@@ -285,7 +287,7 @@ export function BuildHistoryTable({ activeBuilds, recentBuilds }: BuildHistoryTa
                 value={endDate}
                 onChange={(event) => {
                   setEndDate(event.target.value);
-                  setPage(1);
+                  resetPage();
                 }}
                 className="h-9 rounded-md border border-border bg-background px-2 text-xs text-foreground shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
                 aria-label="End date"
@@ -302,7 +304,7 @@ export function BuildHistoryTable({ activeBuilds, recentBuilds }: BuildHistoryTa
               value={searchQuery}
               onChange={(event) => {
                 setSearchQuery(event.target.value);
-                setPage(1);
+                resetPage();
               }}
               placeholder="Filter commands..."
               className="h-9 w-full rounded-md border border-border bg-background pl-9 pr-3 text-sm text-foreground shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"

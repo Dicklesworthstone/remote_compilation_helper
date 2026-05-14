@@ -27,7 +27,7 @@ This document provides a comprehensive reference for all error codes used in the
 **Remediation:**
 1. Run `rch init` to create a default configuration
 2. Check if `~/.config/rch/config.toml` exists
-3. Set `RCH_CONFIG` environment variable to specify custom path
+3. Set `RCH_CONFIG_DIR` environment variable to specify custom config directory
 
 ### RCH-E002: ConfigReadError
 **Message:** Failed to read configuration file

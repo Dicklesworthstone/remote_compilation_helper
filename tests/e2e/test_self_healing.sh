@@ -72,17 +72,18 @@ setup_test_env() {
 
     # Create minimal config pointing to test socket
     cat > "${TEST_CONFIG_DIR}/config.toml" <<EOF
+[general]
 socket_path = "${TEST_SOCKET}"
 
 [self_healing]
 hook_starts_daemon = true
 daemon_installs_hooks = true
-daemon_start_timeout = 5
-auto_start_cooldown = 5
+auto_start_timeout_secs = 5
+auto_start_cooldown_secs = 5
 EOF
 
     export HOME="$TEST_HOME"
-    export RCH_CONFIG="${TEST_CONFIG_DIR}/config.toml"
+    export RCH_CONFIG_DIR="$TEST_CONFIG_DIR"
     export RCH_SOCKET_PATH="$TEST_SOCKET"
 
     log_info "Test environment ready"

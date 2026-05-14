@@ -270,17 +270,26 @@ async fn fetch_release_from_url(url: &str) -> Result<ReleaseInfo, UpdateError> {
 
 /// Filter releases by channel.
 fn filter_by_channel(releases: &[ReleaseInfo], channel: Channel) -> Option<&ReleaseInfo> {
-    releases.iter().find(|r| {
-        if r.draft {
-            return false;
-        }
+    releases
+        .iter()
+        .filter_map(|release| {
+            if release.draft {
+                return None;
+            }
 
-        match channel {
-            Channel::Stable => !r.prerelease,
-            Channel::Beta => r.prerelease,
-            Channel::Nightly => true, // Accept any, prefer latest
-        }
-    })
+            let version = Version::parse(&release.tag_name).ok()?;
+            let is_prerelease = release.prerelease || version.is_prerelease();
+
+            let matches_channel = match channel {
+                Channel::Stable => !is_prerelease,
+                Channel::Beta => is_prerelease,
+                Channel::Nightly => true,
+            };
+
+            matches_channel.then_some((version, release))
+        })
+        .max_by(|(left_version, _), (right_version, _)| left_version.cmp(right_version))
+        .map(|(_, release)| release)
 }
 
 /// Compute changelog diff by collecting release notes from versions between current and target.
@@ -309,16 +318,21 @@ fn compute_changelog_diff(
             && let Some(ref body) = release.body
             && !body.trim().is_empty()
         {
-            notes.push(format!("## {}\n{}", release.tag_name, body));
+            notes.push((version, format!("## {}\n{}", release.tag_name, body)));
         }
     }
 
     if notes.is_empty() {
         None
     } else {
-        // Reverse to show oldest first (chronological order)
-        notes.reverse();
-        Some(notes.join("\n\n---\n\n"))
+        notes.sort_by(|(left_version, _), (right_version, _)| left_version.cmp(right_version));
+        Some(
+            notes
+                .into_iter()
+                .map(|(_, note)| note)
+                .collect::<Vec<_>>()
+                .join("\n\n---\n\n"),
+        )
     }
 }
 
@@ -375,6 +389,135 @@ mod tests {
     }
 
     #[test]
+    fn test_filter_by_channel_selects_highest_semver_not_first_release() {
+        let releases = vec![
+            ReleaseInfo {
+                tag_name: "v1.0.1".to_string(),
+                name: "Backfilled patch".to_string(),
+                prerelease: false,
+                draft: false,
+                html_url: "".to_string(),
+                body: None,
+                assets: vec![],
+                published_at: None,
+            },
+            ReleaseInfo {
+                tag_name: "v1.2.0".to_string(),
+                name: "Actual latest".to_string(),
+                prerelease: false,
+                draft: false,
+                html_url: "".to_string(),
+                body: None,
+                assets: vec![],
+                published_at: None,
+            },
+            ReleaseInfo {
+                tag_name: "v1.1.0".to_string(),
+                name: "Intermediate".to_string(),
+                prerelease: false,
+                draft: false,
+                html_url: "".to_string(),
+                body: None,
+                assets: vec![],
+                published_at: None,
+            },
+        ];
+
+        let stable = filter_by_channel(&releases, Channel::Stable).unwrap();
+        assert_eq!(stable.tag_name, "v1.2.0");
+    }
+
+    #[test]
+    fn test_filter_by_channel_selects_highest_prerelease_semver() {
+        let releases = vec![
+            ReleaseInfo {
+                tag_name: "v1.0.0-beta.2".to_string(),
+                name: "Older beta".to_string(),
+                prerelease: true,
+                draft: false,
+                html_url: "".to_string(),
+                body: None,
+                assets: vec![],
+                published_at: None,
+            },
+            ReleaseInfo {
+                tag_name: "v1.0.0-beta.10".to_string(),
+                name: "Newer beta".to_string(),
+                prerelease: true,
+                draft: false,
+                html_url: "".to_string(),
+                body: None,
+                assets: vec![],
+                published_at: None,
+            },
+        ];
+
+        let beta = filter_by_channel(&releases, Channel::Beta).unwrap();
+        assert_eq!(beta.tag_name, "v1.0.0-beta.10");
+    }
+
+    #[test]
+    fn test_filter_by_channel_skips_unparseable_release_tags() {
+        let releases = vec![
+            ReleaseInfo {
+                tag_name: "nightly-build".to_string(),
+                name: "Invalid tag".to_string(),
+                prerelease: false,
+                draft: false,
+                html_url: "".to_string(),
+                body: None,
+                assets: vec![],
+                published_at: None,
+            },
+            ReleaseInfo {
+                tag_name: "v1.2.0".to_string(),
+                name: "Valid tag".to_string(),
+                prerelease: false,
+                draft: false,
+                html_url: "".to_string(),
+                body: None,
+                assets: vec![],
+                published_at: None,
+            },
+        ];
+
+        let stable = filter_by_channel(&releases, Channel::Stable).unwrap();
+        assert_eq!(stable.tag_name, "v1.2.0");
+    }
+
+    #[test]
+    fn test_filter_by_channel_stable_rejects_prerelease_tag_even_without_github_flag() {
+        let releases = vec![
+            ReleaseInfo {
+                tag_name: "v2.0.0-beta.1".to_string(),
+                name: "Misflagged prerelease".to_string(),
+                prerelease: false,
+                draft: false,
+                html_url: "".to_string(),
+                body: None,
+                assets: vec![],
+                published_at: None,
+            },
+            ReleaseInfo {
+                tag_name: "v1.2.0".to_string(),
+                name: "Stable".to_string(),
+                prerelease: false,
+                draft: false,
+                html_url: "".to_string(),
+                body: None,
+                assets: vec![],
+                published_at: None,
+            },
+        ];
+
+        let stable = filter_by_channel(&releases, Channel::Stable).unwrap();
+        assert_eq!(stable.tag_name, "v1.2.0");
+
+        let beta = filter_by_channel(&releases, Channel::Beta).unwrap();
+        assert_eq!(beta.tag_name, "v2.0.0-beta.1");
+    }
+
+    #[test]
     fn test_filter_by_channel_skips_drafts() {
         let releases = vec![ReleaseInfo {
             tag_name: "v0.1.0".to_string(),
@@ -415,7 +558,7 @@ mod tests {
             },
         ];
 
-        // Nightly should accept any release, preferring first (latest)
+        // Nightly accepts any release and chooses the highest semantic version.
         let nightly = filter_by_channel(&releases, Channel::Nightly).unwrap();
         assert_eq!(nightly.tag_name, "v0.3.0-alpha.1");
     }
@@ -442,7 +585,7 @@ mod tests {
             published_at: None,
         }];
 
-        // Beta channel requires prerelease flag
+        // Beta channel requires prerelease semantics.
         assert!(filter_by_channel(&releases, Channel::Beta).is_none());
     }
 
@@ -630,6 +773,54 @@ mod tests {
         let diff = compute_changelog_diff(&releases, &current, &target).unwrap();
 
         // Should be in chronological order (oldest first)
+        let first_pos = diff.find("v1.1.0").unwrap();
+        let second_pos = diff.find("v1.2.0").unwrap();
+        let third_pos = diff.find("v1.3.0").unwrap();
+
+        assert!(first_pos < second_pos);
+        assert!(second_pos < third_pos);
+    }
+
+    #[test]
+    fn test_compute_changelog_diff_sorts_unsorted_release_input() {
+        let releases = vec![
+            ReleaseInfo {
+                tag_name: "v1.1.0".to_string(),
+                name: "First".to_string(),
+                prerelease: false,
+                draft: false,
+                html_url: "".to_string(),
+                body: Some("First".to_string()),
+                assets: vec![],
+                published_at: None,
+            },
+            ReleaseInfo {
+                tag_name: "v1.3.0".to_string(),
+                name: "Third".to_string(),
+                prerelease: false,
+                draft: false,
+                html_url: "".to_string(),
+                body: Some("Third".to_string()),
+                assets: vec![],
+                published_at: None,
+            },
+            ReleaseInfo {
+                tag_name: "v1.2.0".to_string(),
+                name: "Second".to_string(),
+                prerelease: false,
+                draft: false,
+                html_url: "".to_string(),
+                body: Some("Second".to_string()),
+                assets: vec![],
+                published_at: None,
+            },
+        ];
+
+        let current = Version::parse("v1.0.0").unwrap();
+        let target = Version::parse("v1.3.0").unwrap();
+
+        let diff = compute_changelog_diff(&releases, &current, &target).unwrap();
+
         let first_pos = diff.find("v1.1.0").unwrap();
         let second_pos = diff.find("v1.2.0").unwrap();
         let third_pos = diff.find("v1.3.0").unwrap();
