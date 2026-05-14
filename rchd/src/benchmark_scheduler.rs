@@ -161,6 +161,80 @@ impl Default for SchedulerConfig {
     }
 }
 
+fn normalized_event_score(score: f64) -> f64 {
+    if score.is_finite() {
+        score.clamp(0.0, 100.0)
+    } else {
+        0.0
+    }
+}
+
+fn benchmark_score_view(score: f64, measured_at: DateTime<Utc>) -> serde_json::Value {
+    let score = normalized_event_score(score);
+    serde_json::json!({
+        "total": score,
+        "cpu_score": 0.0,
+        "memory_score": 0.0,
+        "disk_score": 0.0,
+        "network_score": 0.0,
+        "compilation_score": score,
+        "measured_at": measured_at.to_rfc3339(),
+        "version": rch_telemetry::speedscore::SPEEDSCORE_VERSION,
+    })
+}
+
+fn benchmark_queued_event_data(request: &ScheduledBenchmarkRequest) -> serde_json::Value {
+    serde_json::json!({
+        "request_id": request.request_id.as_str(),
+        "worker_id": request.worker_id.as_str(),
+        "queued_at": request.requested_at.to_rfc3339(),
+        "priority": format!("{:?}", request.priority),
+        "reason": request.reason.to_string(),
+    })
+}
+
+fn benchmark_started_event_data(request: &ScheduledBenchmarkRequest) -> serde_json::Value {
+    serde_json::json!({
+        "request_id": request.request_id.as_str(),
+        "job_id": request.request_id.as_str(),
+        "worker_id": request.worker_id.as_str(),
+        "reason": request.reason.to_string(),
+    })
+}
+
+fn benchmark_completed_event_data(
+    request_id: &str,
+    worker_id: &WorkerId,
+    score: f64,
+    duration: Duration,
+) -> serde_json::Value {
+    serde_json::json!({
+        "request_id": request_id,
+        "job_id": request_id,
+        "worker_id": worker_id.as_str(),
+        "speedscore": benchmark_score_view(score, Utc::now()),
+        "duration_secs": duration.as_secs_f64(),
+        "success": true,
+    })
+}
+
+fn benchmark_failed_event_data(
+    request_id: &str,
+    worker_id: &WorkerId,
+    error: &str,
+    retryable: bool,
+    consecutive_failures: u32,
+) -> serde_json::Value {
+    serde_json::json!({
+        "request_id": request_id,
+        "job_id": request_id,
+        "worker_id": worker_id.as_str(),
+        "error": error,
+        "retryable": retryable,
+        "consecutive_failures": consecutive_failures,
+    })
+}
+
 /// Benchmark scheduler that orchestrates when and how benchmarks run.
 pub struct BenchmarkScheduler {
     /// Scheduler configuration.
@@ -302,15 +376,8 @@ impl BenchmarkScheduler {
         queue.insert(insert_pos, request.clone());
 
         // Emit event
-        self.events.emit(
-            "benchmark:queued",
-            &serde_json::json!({
-                "request_id": request.request_id,
-                "worker_id": request.worker_id.as_str(),
-                "priority": format!("{:?}", request.priority),
-                "reason": request.reason.to_string(),
-            }),
-        );
+        self.events
+            .emit("benchmark_queued", &benchmark_queued_event_data(&request));
     }
 
     /// Check workers and schedule benchmarks as needed.
@@ -629,14 +696,8 @@ impl BenchmarkScheduler {
             .insert(worker_id.clone(), running);
 
         // Emit started event
-        self.events.emit(
-            "benchmark:started",
-            &serde_json::json!({
-                "request_id": request_id,
-                "worker_id": worker_id.as_str(),
-                "reason": request.reason.to_string(),
-            }),
-        );
+        self.events
+            .emit("benchmark_started", &benchmark_started_event_data(&request));
 
         // Spawn benchmark execution task
         let pool = self.pool.clone();
@@ -673,13 +734,8 @@ impl BenchmarkScheduler {
 
                     // Emit completed event
                     events.emit(
-                        "benchmark:completed",
-                        &serde_json::json!({
-                            "request_id": request_id,
-                            "worker_id": worker_id.as_str(),
-                            "score": score,
-                            "duration_ms": duration.as_millis(),
-                        }),
+                        "benchmark_completed",
+                        &benchmark_completed_event_data(&request_id, &worker_id, score, duration),
                     );
                 }
                 Err(e) => {
@@ -710,14 +766,14 @@ impl BenchmarkScheduler {
 
                     // Emit failed event
                     events.emit(
-                        "benchmark:failed",
-                        &serde_json::json!({
-                            "request_id": request_id,
-                            "worker_id": worker_id.as_str(),
-                            "error": error_msg,
-                            "retryable": retryable,
-                            "consecutive_failures": consecutive_count,
-                        }),
+                        "benchmark_failed",
+                        &benchmark_failed_event_data(
+                            &request_id,
+                            &worker_id,
+                            &error_msg,
+                            retryable,
+                            consecutive_count,
+                        ),
                     );
 
                     // Emit alert if threshold exceeded
@@ -729,7 +785,7 @@ impl BenchmarkScheduler {
                             "Worker benchmark repeatedly failing - alerting"
                         );
                         events.emit(
-                            "benchmark:alert:repeated_failures",
+                            "benchmark_alert_repeated_failures",
                             &serde_json::json!({
                                 "worker_id": worker_id.as_str(),
                                 "consecutive_failures": consecutive_count,
@@ -774,13 +830,13 @@ impl BenchmarkScheduler {
 
             // Emit completed event
             self.events.emit(
-                "benchmark:completed",
-                &serde_json::json!({
-                    "request_id": running.request.request_id,
-                    "worker_id": worker_id.as_str(),
-                    "score": score,
-                    "duration_ms": duration.as_millis(),
-                }),
+                "benchmark_completed",
+                &benchmark_completed_event_data(
+                    &running.request.request_id,
+                    worker_id,
+                    score,
+                    duration,
+                ),
             );
         }
     }
@@ -811,14 +867,14 @@ impl BenchmarkScheduler {
 
             // Emit failed event
             self.events.emit(
-                "benchmark:failed",
-                &serde_json::json!({
-                    "request_id": running.request.request_id,
-                    "worker_id": worker_id.as_str(),
-                    "error": error,
-                    "retryable": retryable,
-                    "consecutive_failures": consecutive_count,
-                }),
+                "benchmark_failed",
+                &benchmark_failed_event_data(
+                    &running.request.request_id,
+                    worker_id,
+                    error,
+                    retryable,
+                    consecutive_count,
+                ),
             );
 
             // Emit alert if consecutive failure threshold exceeded
@@ -830,7 +886,7 @@ impl BenchmarkScheduler {
                     "Worker benchmark repeatedly failing - alerting"
                 );
                 self.events.emit(
-                    "benchmark:alert:repeated_failures",
+                    "benchmark_alert_repeated_failures",
                     &serde_json::json!({
                         "worker_id": worker_id.as_str(),
                         "consecutive_failures": consecutive_count,
@@ -1107,6 +1163,107 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_benchmark_completed_event_matches_web_contract() {
+        let worker_id = WorkerId::new("worker-1");
+        let event =
+            benchmark_completed_event_data("req-1", &worker_id, 87.5, Duration::from_millis(1500));
+        let event = event.as_object().expect("event data should be an object");
+        let speedscore = event
+            .get("speedscore")
+            .and_then(serde_json::Value::as_object)
+            .expect("speedscore should be an object");
+
+        assert_eq!(
+            event.get("request_id").and_then(serde_json::Value::as_str),
+            Some("req-1")
+        );
+        assert_eq!(
+            event.get("job_id").and_then(serde_json::Value::as_str),
+            Some("req-1")
+        );
+        assert_eq!(
+            event.get("worker_id").and_then(serde_json::Value::as_str),
+            Some("worker-1")
+        );
+        assert_eq!(
+            event
+                .get("duration_secs")
+                .and_then(serde_json::Value::as_f64),
+            Some(1.5)
+        );
+        assert_eq!(
+            event.get("success").and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            speedscore.get("total").and_then(serde_json::Value::as_f64),
+            Some(87.5)
+        );
+        assert_eq!(
+            speedscore
+                .get("compilation_score")
+                .and_then(serde_json::Value::as_f64),
+            Some(87.5)
+        );
+        assert_eq!(
+            speedscore
+                .get("cpu_score")
+                .and_then(serde_json::Value::as_f64),
+            Some(0.0)
+        );
+        chrono::DateTime::parse_from_rfc3339(
+            speedscore
+                .get("measured_at")
+                .and_then(serde_json::Value::as_str)
+                .expect("measured_at should be string"),
+        )
+        .expect("measured_at should be RFC3339");
+    }
+
+    #[test]
+    fn test_benchmark_failed_event_matches_web_contract() {
+        let worker_id = WorkerId::new("worker-1");
+        let event = benchmark_failed_event_data("req-1", &worker_id, "ssh timeout", true, 2);
+        let event = event.as_object().expect("event data should be an object");
+
+        assert_eq!(
+            event.get("request_id").and_then(serde_json::Value::as_str),
+            Some("req-1")
+        );
+        assert_eq!(
+            event.get("job_id").and_then(serde_json::Value::as_str),
+            Some("req-1")
+        );
+        assert_eq!(
+            event.get("worker_id").and_then(serde_json::Value::as_str),
+            Some("worker-1")
+        );
+        assert_eq!(
+            event.get("error").and_then(serde_json::Value::as_str),
+            Some("ssh timeout")
+        );
+        assert_eq!(
+            event.get("retryable").and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            event
+                .get("consecutive_failures")
+                .and_then(serde_json::Value::as_u64),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn test_benchmark_event_score_is_finite_and_clamped() {
+        assert_eq!(normalized_event_score(f64::NAN), 0.0);
+        assert_eq!(normalized_event_score(f64::INFINITY), 0.0);
+        assert_eq!(normalized_event_score(-12.0), 0.0);
+        assert_eq!(normalized_event_score(125.0), 100.0);
+        assert_eq!(normalized_event_score(42.5), 42.5);
+    }
+
     #[tokio::test]
     async fn test_enqueue_priority_ordering() {
         let pool = WorkerPool::new();
@@ -1306,6 +1463,7 @@ mod tests {
 
         let telemetry = Arc::new(TelemetryStore::new(Duration::from_secs(300), None));
         let events = EventBus::new(16);
+        let mut rx = events.subscribe();
 
         let (scheduler, _handle) =
             BenchmarkScheduler::new(make_test_config(), pool.clone(), telemetry, events);
@@ -1346,6 +1504,15 @@ mod tests {
         if let Some(worker) = pool.get(&worker_id).await {
             assert_eq!(worker.available_slots().await, 4);
         }
+
+        let msg = tokio::time::timeout(Duration::from_millis(50), rx.recv())
+            .await
+            .expect("timed out waiting for completed event")
+            .expect("event bus should receive completed event");
+        let event: serde_json::Value = serde_json::from_str(&msg).expect("event should be JSON");
+        assert_eq!(event["event"], "benchmark_completed");
+        assert_eq!(event["data"]["job_id"], event["data"]["request_id"]);
+        assert_eq!(event["data"]["speedscore"]["total"], 75.0);
     }
 
     #[tokio::test]
@@ -1355,6 +1522,7 @@ mod tests {
 
         let telemetry = Arc::new(TelemetryStore::new(Duration::from_secs(300), None));
         let events = EventBus::new(16);
+        let mut rx = events.subscribe();
 
         let (scheduler, _handle) =
             BenchmarkScheduler::new(make_test_config(), pool.clone(), telemetry, events);
@@ -1391,6 +1559,15 @@ mod tests {
         let queue = scheduler.pending_queue.lock().await;
         assert_eq!(queue.len(), 1);
         assert_eq!(queue[0].priority, BenchmarkPriority::Low); // Downgraded
+
+        let msg = tokio::time::timeout(Duration::from_millis(50), rx.recv())
+            .await
+            .expect("timed out waiting for failed event")
+            .expect("event bus should receive failed event");
+        let event: serde_json::Value = serde_json::from_str(&msg).expect("event should be JSON");
+        assert_eq!(event["event"], "benchmark_failed");
+        assert_eq!(event["data"]["job_id"], event["data"]["request_id"]);
+        assert_eq!(event["data"]["error"], "SSH connection failed");
     }
 
     #[tokio::test]
