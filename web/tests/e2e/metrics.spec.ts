@@ -2,6 +2,9 @@ import { test, expect } from '@playwright/test';
 import { mockApiResponses } from '../fixtures/test-utils';
 import { mockBudgetResponse, mockMetricsText } from '../fixtures/api-mocks';
 
+const daemonMetricsUrl = (url: URL) =>
+  url.origin === 'http://localhost:9100' && url.pathname === '/metrics';
+
 test.describe('Metrics Page', () => {
   test('metrics page loads and displays metric cards', async ({ page }) => {
     console.log('[e2e:metrics] TEST START: metrics page loads and displays metric cards');
@@ -18,12 +21,12 @@ test.describe('Metrics Page', () => {
     await expect(page.getByText('System Snapshot')).toBeVisible();
 
     console.log('[e2e:metrics] VERIFY: Metric card labels present');
-    await expect(page.getByText('Total Builds')).toBeVisible();
-    await expect(page.getByText('Success Rate')).toBeVisible();
-    await expect(page.getByText('Average Build Time')).toBeVisible();
-    await expect(page.getByText('Active Builds')).toBeVisible();
-    await expect(page.getByText('Workers Online')).toBeVisible();
-    await expect(page.getByText('Data Moved')).toBeVisible();
+    await expect(metricCards.filter({ hasText: 'Total Builds' })).toBeVisible();
+    await expect(metricCards.filter({ hasText: 'Success Rate' })).toBeVisible();
+    await expect(metricCards.filter({ hasText: 'Average Build Time' })).toBeVisible();
+    await expect(metricCards.filter({ hasText: 'Active Builds' })).toBeVisible();
+    await expect(metricCards.filter({ hasText: 'Workers Online' })).toBeVisible();
+    await expect(metricCards.filter({ hasText: 'Data Moved' })).toBeVisible();
 
     console.log('[e2e:metrics] TEST PASS: metrics page loads and displays metric cards');
   });
@@ -48,10 +51,10 @@ test.describe('Metrics Page', () => {
     }
 
     console.log('[e2e:metrics] VERIFY: Budget metrics visible');
-    await expect(page.getByText('Budget')).toBeVisible();
-    await expect(page.getByText('Typical (p50)')).toBeVisible();
-    await expect(page.getByText('Slow (p95)')).toBeVisible();
-    await expect(page.getByText('Worst (p99)')).toBeVisible();
+    await expect(page.getByText('Budget', { exact: true }).first()).toBeVisible();
+    await expect(page.getByText('Typical (p50)').first()).toBeVisible();
+    await expect(page.getByText('Slow (p95)').first()).toBeVisible();
+    await expect(page.getByText('Worst (p99)').first()).toBeVisible();
 
     console.log('[e2e:metrics] TEST PASS: performance budgets section displays correctly');
   });
@@ -113,7 +116,7 @@ test.describe('Metrics Page', () => {
       await route.fulfill({ json: mockBudgetResponse });
     });
 
-    await page.route('**/metrics', async (route) => {
+    await page.route(daemonMetricsUrl, async (route) => {
       await route.fulfill({ body: mockMetricsText, contentType: 'text/plain' });
     });
 
@@ -142,7 +145,7 @@ test.describe('Metrics Page', () => {
       await route.fulfill({ json: mockBudgetResponse });
     });
 
-    await page.route('**/metrics', async (route) => {
+    await page.route(daemonMetricsUrl, async (route) => {
       console.log('[e2e:metrics] MOCK: delaying /metrics response');
       await new Promise((resolve) => setTimeout(resolve, 1200));
       await route.fulfill({ body: mockMetricsText, contentType: 'text/plain' });
@@ -189,14 +192,14 @@ test.describe('Metrics Page', () => {
     await page.goto('/metrics');
 
     console.log('[e2e:metrics] VERIFY: Initial status badge');
-    await expect(page.getByText('passing')).toBeVisible();
+    await expect(page.getByText('passing', { exact: true }).first()).toBeVisible();
 
     console.log('[e2e:metrics] ACTION: Click refresh button');
     const refreshButton = page.getByRole('button', { name: 'Refresh metrics' });
     await refreshButton.click();
 
     console.log('[e2e:metrics] VERIFY: Updated status badge');
-    await expect(page.getByText('warning')).toBeVisible({ timeout: 5000 });
+    await expect(page.getByText('warning', { exact: true }).first()).toBeVisible({ timeout: 5000 });
 
     console.log('[e2e:metrics] TEST PASS: metrics refresh button triggers data reload');
   });
@@ -210,7 +213,7 @@ test.describe('Metrics Page', () => {
 
     console.log('[e2e:metrics] VERIFY: Status badge visible');
     const statusBadge = page.locator('.capitalize').filter({ hasText: /passing|warning|failing/ });
-    await expect(statusBadge).toBeVisible();
+    await expect(statusBadge.first()).toBeVisible();
 
     console.log('[e2e:metrics] VERIFY: Auto-refresh indicator visible');
     await expect(page.getByText('Auto-refreshing every 5s')).toBeVisible();
