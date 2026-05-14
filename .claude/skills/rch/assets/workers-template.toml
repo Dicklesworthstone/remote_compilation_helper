@@ -42,7 +42,5 @@ tags = ["rust", "bun", "fast"]           # Optional capability tags
 # - identity_file: Use ssh-agent for passphrase-protected keys
 #
 # Test your configuration:
-#   rch config validate
-#   rch config doctor
+#   rch config check
 #   rch workers probe --all
-#   rch workers setup --all
