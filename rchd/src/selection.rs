@@ -1960,11 +1960,14 @@ impl WorkerSelector {
         };
 
         // Apply unified reliability penalty (bd-vvmd.5.5).
-        // Aggregates circuit, convergence, pressure, and process-triage
-        // signals into a single penalty (0.0-1.0).  When the aggregator is
-        // not wired, no penalty is applied (fail-open).
+        // Reliability evaluation advances quarantine/recovery hysteresis, so
+        // scoring must reuse the assessment cached during preflight instead of
+        // evaluating a second time and consuming another recovery tick.
         let reliability_penalty = if let Some(ref agg) = self.reliability {
-            let assessment = agg.evaluate(worker, config.id.as_str()).await;
+            let assessment = match agg.get_assessment(config.id.as_str()).await {
+                Some(assessment) => assessment,
+                None => agg.evaluate(worker, config.id.as_str()).await,
+            };
             let p = assessment.penalty;
             if p > 0.0 {
                 final_score *= 1.0 - p;
@@ -5731,6 +5734,98 @@ mod tests {
             assert_eq!(assessment.health_state, WorkerHealthState::Quarantined);
             assert!(assessment.hard_exclude);
             assert_eq!(assessment.penalty, 1.0);
+        }
+
+        #[tokio::test]
+        async fn test_reliability_scoring_does_not_advance_recovery_hysteresis() {
+            let _guard = test_guard!();
+            let pool = WorkerPool::new();
+            let worker = make_worker("recovering", 8, 90.0);
+
+            for _ in 0..10 {
+                worker
+                    .record_failure(Some("build failed".to_string()))
+                    .await;
+            }
+
+            let reliability_cfg = ReliabilityConfig {
+                weights: SignalWeights {
+                    circuit: 1.0,
+                    convergence: 0.0,
+                    pressure: 0.0,
+                    process: 0.0,
+                    cancellation: 0.0,
+                },
+                quarantine_threshold: 0.9,
+                recovery_threshold: 0.1,
+                recovery_ticks: 2,
+                min_quarantine_duration: Duration::ZERO,
+                probing_penalty: 0.5,
+                ..ReliabilityConfig::default()
+            };
+            let reliability = Arc::new(ReliabilityAggregator::new(reliability_cfg));
+
+            let quarantined = reliability.evaluate(&worker, "recovering").await;
+            assert_eq!(quarantined.health_state, WorkerHealthState::Quarantined);
+
+            for _ in 0..500 {
+                worker.record_success().await;
+            }
+
+            pool.add_worker_state(worker).await;
+
+            let mut selector = WorkerSelector::with_config(
+                SelectionConfig {
+                    strategy: SelectionStrategy::Balanced,
+                    weights: SelectionWeightConfig {
+                        speedscore: 1.0,
+                        slots: 0.0,
+                        health: 0.0,
+                        cache: 0.0,
+                        network: 0.0,
+                        priority: 0.0,
+                        ..SelectionWeightConfig::default()
+                    },
+                    ..SelectionConfig::default()
+                },
+                CircuitBreakerConfig::default(),
+            );
+            selector.set_reliability(reliability.clone());
+
+            let request = SelectionRequest {
+                project: "reliability-recovery".to_string(),
+                command: Some("cargo test".to_string()),
+                command_priority: CommandPriority::Normal,
+                estimated_cores: 1,
+                preferred_workers: vec![],
+                toolchain: None,
+                required_runtime: RequiredRuntime::default(),
+                classification_duration_us: None,
+                hook_pid: None,
+            };
+
+            let first = selector.select(&pool, &request).await;
+            assert!(first.worker.is_none());
+            assert_eq!(first.reason, SelectionReason::AllWorkersFailedPreflight);
+            let after_first = reliability
+                .get_assessment("recovering")
+                .await
+                .expect("expected reliability assessment after first selection");
+            assert_eq!(after_first.health_state, WorkerHealthState::Quarantined);
+
+            let second = selector.select(&pool, &request).await;
+            assert_eq!(second.reason, SelectionReason::Success);
+            assert!(second.worker.is_some());
+
+            let after_second = reliability
+                .get_assessment("recovering")
+                .await
+                .expect("expected reliability assessment after second selection");
+            assert_eq!(
+                after_second.health_state,
+                WorkerHealthState::ProbingRecovery
+            );
+            assert_eq!(after_second.penalty, 0.5);
         }
 
         // ====================================================================
