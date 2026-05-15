@@ -97,14 +97,9 @@ impl UpdateLock {
     pub fn is_locked() -> bool {
         if let Ok(path) = get_lock_path()
             && path.exists()
-            && let Ok(mut file) = File::open(&path)
+            && let Some(pid) = read_pid(&path)
         {
-            let mut contents = String::new();
-            if file.read_to_string(&mut contents).is_ok()
-                && let Ok(pid) = contents.trim().parse::<u32>()
-            {
-                return is_process_running(pid);
-            }
+            return is_process_running(pid);
         }
         false
     }
@@ -275,11 +270,9 @@ mod tests {
         let path = get_lock_path().unwrap();
 
         // Read the lock file and verify it contains our PID
-        let contents = std::fs::read_to_string(&path).unwrap();
-        let file_pid: u32 = contents.split_whitespace().next().unwrap().parse().unwrap();
         let our_pid = std::process::id();
 
-        assert_eq!(file_pid, our_pid);
+        assert_eq!(read_pid(&path), Some(our_pid));
 
         drop(lock);
     }
