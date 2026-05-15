@@ -376,6 +376,17 @@ fn classify_with_fresh_telemetry(
             "disk_io>=critical && disk_free_gb<=warning_free_gb".to_string(),
         );
     }
+    if memory_pressure
+        .map(|pressure| pressure >= config.critical_memory_pressure)
+        .unwrap_or(false)
+    {
+        return (
+            PressureState::Critical,
+            PressureConfidence::High,
+            "memory_pressure_critical".to_string(),
+            "memory_pressure>=critical_memory_pressure".to_string(),
+        );
+    }
 
     if disk_free_gb <= config.warning_free_gb {
         return (
@@ -402,17 +413,6 @@ fn classify_with_fresh_telemetry(
             PressureConfidence::High,
             "disk_io_high".to_string(),
             "disk_io>=warning_disk_io_util_pct".to_string(),
-        );
-    }
-    if memory_pressure
-        .map(|pressure| pressure >= config.critical_memory_pressure)
-        .unwrap_or(false)
-    {
-        return (
-            PressureState::Warning,
-            PressureConfidence::High,
-            "memory_pressure_critical".to_string(),
-            "memory_pressure>=critical_memory_pressure".to_string(),
         );
     }
     if memory_pressure
@@ -594,6 +594,40 @@ mod tests {
         assert_eq!(result.state, PressureState::Critical);
         assert_eq!(result.confidence, PressureConfidence::Medium);
         assert_eq!(result.reason_code, "disk_critical_without_fresh_telemetry");
+    }
+
+    #[test]
+    fn pressure_policy_marks_critical_with_fresh_critical_memory_pressure() {
+        let caps = test_capabilities(80.0, 200.0);
+        let telemetry = test_received_telemetry(20.0, 95.0, 5);
+        let cfg = DiskPressurePolicyConfig::default();
+
+        let result = evaluate_pressure_policy(&caps, Some(&telemetry), &cfg);
+        assert_eq!(result.state, PressureState::Critical);
+        assert_eq!(result.confidence, PressureConfidence::High);
+        assert_eq!(result.reason_code, "memory_pressure_critical");
+    }
+
+    #[test]
+    fn pressure_policy_does_not_mask_critical_memory_with_warning_disk_headroom() {
+        let caps = test_capabilities(18.0, 200.0);
+        let telemetry = test_received_telemetry(90.0, 95.0, 5);
+        let cfg = DiskPressurePolicyConfig::default();
+
+        let result = evaluate_pressure_policy(&caps, Some(&telemetry), &cfg);
+        assert_eq!(result.state, PressureState::Critical);
+        assert_eq!(result.reason_code, "memory_pressure_critical");
+    }
+
+    #[test]
+    fn pressure_policy_marks_warning_with_fresh_warning_memory_pressure() {
+        let caps = test_capabilities(80.0, 200.0);
+        let telemetry = test_received_telemetry(20.0, 85.0, 5);
+        let cfg = DiskPressurePolicyConfig::default();
+
+        let result = evaluate_pressure_policy(&caps, Some(&telemetry), &cfg);
+        assert_eq!(result.state, PressureState::Warning);
+        assert_eq!(result.reason_code, "memory_pressure_warning");
     }
 
     #[test]
