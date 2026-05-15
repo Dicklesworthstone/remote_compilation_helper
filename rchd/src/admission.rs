@@ -260,6 +260,13 @@ impl AdmissionGate {
             .unwrap_or(0.0)
     }
 
+    /// Get the cached admission verdict for a worker in the current round.
+    ///
+    /// Returns `None` if the worker was not evaluated in this round.
+    pub async fn cached_verdict(&self, worker_id: &str) -> Option<AdmissionVerdict> {
+        self.latest_verdicts.read().await.get(worker_id).cloned()
+    }
+
     /// Get the current hysteresis state for a worker (for diagnostics).
     ///
     /// Returns `(last_admitted, consecutive_healthy)`.
@@ -435,11 +442,10 @@ mod tests {
         let verdict = gate.evaluate(&worker, "w1", "proj-a").await;
 
         assert!(!verdict.is_admitted());
-        if let AdmissionVerdict::Reject { reason_code, .. } = &verdict {
-            assert_eq!(reason_code, "admission_critical_pressure");
-        } else {
-            panic!("Expected Reject verdict");
-        }
+        let AdmissionVerdict::Reject { reason_code, .. } = &verdict else {
+            unreachable!("critical pressure must reject admission");
+        };
+        assert_eq!(reason_code, "admission_critical_pressure");
     }
 
     #[tokio::test]
@@ -451,9 +457,9 @@ mod tests {
         let worker = make_worker("w1", make_assessment(PressureState::Critical, Some(5.0))).await;
         gate.evaluate(&worker, "w1", "proj-a").await;
 
-        let state = gate.worker_hysteresis_state("w1").await;
-        assert!(state.is_some());
-        let (admitted, healthy) = state.unwrap();
+        let Some((admitted, healthy)) = gate.worker_hysteresis_state("w1").await else {
+            unreachable!("critical pressure rejection must record hysteresis");
+        };
         assert!(!admitted);
         assert_eq!(healthy, 0);
     }
@@ -474,11 +480,10 @@ mod tests {
         let verdict = gate.evaluate(&worker, "w1", "proj-a").await;
 
         assert!(!verdict.is_admitted());
-        if let AdmissionVerdict::Reject { reason_code, .. } = &verdict {
-            assert_eq!(reason_code, "admission_insufficient_headroom");
-        } else {
-            panic!("Expected Reject verdict");
-        }
+        let AdmissionVerdict::Reject { reason_code, .. } = &verdict else {
+            unreachable!("insufficient headroom must reject admission");
+        };
+        assert_eq!(reason_code, "admission_insufficient_headroom");
     }
 
     #[tokio::test]

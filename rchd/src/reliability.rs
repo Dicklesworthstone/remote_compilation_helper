@@ -24,7 +24,7 @@
 
 #![allow(dead_code)] // Integration wiring lands in follow-on beads.
 
-use crate::admission::AdmissionGate;
+use crate::admission::{AdmissionGate, AdmissionVerdict};
 use crate::cancellation::CancellationOrchestrator;
 use crate::disk_pressure::PressureState;
 use crate::metrics;
@@ -313,7 +313,7 @@ impl ReliabilityAggregator {
         let convergence_debt = self.compute_convergence_debt(worker_id).await;
 
         // 3. Pressure debt from admission gate.
-        let pressure_debt = self.compute_pressure_debt(worker).await;
+        let pressure_debt = self.compute_pressure_debt(worker, worker_id).await;
 
         // 4. Process-triage remediation debt.
         let process_debt = self.compute_process_debt(worker_id).await;
@@ -450,8 +450,35 @@ impl ReliabilityAggregator {
         debt
     }
 
-    async fn compute_pressure_debt(&self, worker: &WorkerState) -> f64 {
+    async fn compute_pressure_debt(&self, worker: &WorkerState, worker_id: &str) -> f64 {
         let start = Instant::now();
+        if let Some(ref admission) = self.admission
+            && let Some(verdict) = admission.cached_verdict(worker_id).await
+        {
+            let (debt, outcome, error_kind) = match &verdict {
+                AdmissionVerdict::Admit {
+                    pressure_penalty, ..
+                } if *pressure_penalty <= f64::EPSILON => (0.0, "healthy", None),
+                AdmissionVerdict::Admit {
+                    pressure_penalty, ..
+                } => (pressure_penalty.clamp(0.0, 1.0), "warning", None),
+                AdmissionVerdict::Reject { reason_code, .. }
+                    if reason_code == "admission_critical_pressure" =>
+                {
+                    (1.0, "critical", Some("critical_pressure"))
+                }
+                AdmissionVerdict::Reject { .. } => {
+                    (1.0, "rejected_by_policy", Some("preflight_blocked"))
+                }
+            };
+
+            metrics::observe_reliability_decision("pressure_signal", outcome, start.elapsed());
+            if let Some(error_kind) = error_kind {
+                metrics::inc_reliability_error("pressure_signal", error_kind);
+            }
+            return debt;
+        }
+
         let pressure = worker.pressure_assessment().await;
         let (debt, outcome) = match pressure.state {
             PressureState::Healthy => (0.0, "healthy"),
@@ -560,7 +587,7 @@ impl ReliabilityAggregator {
         let now = Instant::now();
 
         // Determine the new state based on debt and previous state.
-        let new_state = match prev_state {
+        let next_health = match prev_state {
             WorkerHealthState::Healthy => {
                 if debt >= self.config.quarantine_threshold {
                     WorkerHealthState::Quarantined
@@ -618,29 +645,41 @@ impl ReliabilityAggregator {
         };
 
         // Bookkeeping for transitions.
-        if new_state != prev_state {
+        if !matches!(
+            (&prev_state, &next_health),
+            (WorkerHealthState::Healthy, WorkerHealthState::Healthy)
+                | (WorkerHealthState::Degraded, WorkerHealthState::Degraded)
+                | (
+                    WorkerHealthState::Quarantined,
+                    WorkerHealthState::Quarantined
+                )
+                | (
+                    WorkerHealthState::ProbingRecovery,
+                    WorkerHealthState::ProbingRecovery
+                )
+        ) {
             debug!(
                 "Worker {} reliability transition: {} → {}",
-                worker_id, prev_state, new_state
+                worker_id, prev_state, next_health
             );
 
-            if new_state == WorkerHealthState::Quarantined {
+            if matches!(next_health, WorkerHealthState::Quarantined) {
                 tracker.quarantined_at = Some(now);
                 tracker.recovery_tick_count = 0;
             }
-            if new_state == WorkerHealthState::Healthy {
+            if matches!(next_health, WorkerHealthState::Healthy) {
                 tracker.quarantined_at = None;
                 tracker.recovery_tick_count = 0;
             }
         }
 
-        tracker.state = new_state;
+        tracker.state = next_health;
         tracker.last_debt = debt;
         tracker.last_signals = signals.clone();
         tracker.last_evaluated_at = Some(now);
 
-        let (penalty, hard_exclude) = self.penalty_for_state(new_state, debt);
-        (new_state, penalty, hard_exclude)
+        let (penalty, hard_exclude) = self.penalty_for_state(next_health, debt);
+        (next_health, penalty, hard_exclude)
     }
 }
 
@@ -706,7 +745,9 @@ mod tests {
             ..WorkerConfig::default()
         };
         pool.add_worker(config).await;
-        let worker = pool.get(&WorkerId::new(id)).await.unwrap();
+        let Some(worker) = pool.get(&WorkerId::new(id)).await else {
+            unreachable!("pool must return worker immediately after add_worker");
+        };
         (pool, worker)
     }
 
@@ -1302,8 +1343,49 @@ mod tests {
         let agg = ReliabilityAggregator::new(test_config());
         let worker = make_worker("w1");
         // Default pressure is Healthy.
-        let debt = agg.compute_pressure_debt(&worker).await;
+        let debt = agg.compute_pressure_debt(&worker, "w1").await;
         assert!(debt < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn test_pressure_debt_uses_cached_admission_reject() {
+        use crate::disk_pressure::{PressureAssessment, PressureConfidence};
+        use crate::headroom::{HeadroomConfig, HeadroomEstimator};
+        use crate::history::BuildHistory;
+
+        let history = Arc::new(BuildHistory::new(10));
+        let headroom = Arc::new(HeadroomEstimator::new(history, HeadroomConfig::default()));
+        let gate = Arc::new(AdmissionGate::new(
+            crate::admission::AdmissionConfig::default(),
+            headroom,
+        ));
+
+        let mut agg = ReliabilityAggregator::new(test_config());
+        agg.set_admission(gate.clone());
+
+        let worker = make_worker("w1");
+        worker
+            .set_pressure_assessment(PressureAssessment {
+                state: PressureState::Healthy,
+                confidence: PressureConfidence::High,
+                reason_code: "test_healthy_but_low_headroom".to_string(),
+                policy_rule: "test_policy".to_string(),
+                disk_free_gb: Some(1.0),
+                disk_total_gb: Some(500.0),
+                disk_free_ratio: Some(0.002),
+                disk_io_util_pct: None,
+                memory_pressure: None,
+                telemetry_age_secs: Some(5),
+                telemetry_fresh: true,
+                evaluated_at_unix_ms: 1000,
+            })
+            .await;
+
+        let verdict = gate.evaluate(&worker, "w1", "proj-a").await;
+        assert!(!verdict.is_admitted());
+
+        let debt = agg.compute_pressure_debt(&worker, "w1").await;
+        assert!((debt - 1.0).abs() < f64::EPSILON);
     }
 
     // ── Cancellation signal tests ────────────────────────────────────
