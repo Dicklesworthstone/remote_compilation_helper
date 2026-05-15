@@ -6,10 +6,15 @@ use super::types::UpdateError;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+static LOCK_TOKEN_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Lock to prevent concurrent updates.
 pub struct UpdateLock {
     path: PathBuf,
+    body: String,
 }
 
 impl UpdateLock {
@@ -40,7 +45,8 @@ impl UpdateLock {
         loop {
             match exclusive_create(&path) {
                 Ok(mut file) => {
-                    write!(file, "{}", std::process::id()).map_err(|e| {
+                    let body = new_lock_body();
+                    file.write_all(body.as_bytes()).map_err(|e| {
                         // Clean up our half-written file so a later sweep
                         // doesn't see a malformed PID and choke.
                         let _ = fs::remove_file(&path);
@@ -50,7 +56,7 @@ impl UpdateLock {
                         let _ = fs::remove_file(&path);
                         UpdateError::InstallFailed(format!("Failed to sync lock file: {}", e))
                     })?;
-                    return Ok(Self { path });
+                    return Ok(Self { path, body });
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
                     let Some(existing_pid) = read_pid(&path) else {
@@ -106,8 +112,12 @@ impl UpdateLock {
 
 impl Drop for UpdateLock {
     fn drop(&mut self) {
-        // Remove the lock file
-        let _ = fs::remove_file(&self.path);
+        // Only remove the exact lock file this guard created. A newer
+        // process may have reacquired the lock after the file was manually
+        // removed or swept; unconditional removal would clear that fresh lock.
+        if read_lock_body(&self.path).as_deref() == Some(self.body.as_str()) {
+            let _ = fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -127,12 +137,29 @@ fn exclusive_create(path: &Path) -> std::io::Result<File> {
     OpenOptions::new().write(true).create_new(true).open(path)
 }
 
-/// Read the PID recorded in the lock file, if any.
-fn read_pid(path: &Path) -> Option<u32> {
+/// Produce a lock-file body that remains backward-compatible with old
+/// PID-only files by keeping the PID as the first whitespace-delimited token.
+fn new_lock_body() -> String {
+    let timestamp_ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let counter = LOCK_TOKEN_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{} {timestamp_ns:x} {counter:x}", std::process::id())
+}
+
+/// Read the complete lock body.
+fn read_lock_body(path: &Path) -> Option<String> {
     let mut file = File::open(path).ok()?;
     let mut contents = String::new();
     file.read_to_string(&mut contents).ok()?;
-    contents.trim().parse().ok()
+    Some(contents)
+}
+
+/// Read the PID recorded in the lock file, if any.
+fn read_pid(path: &Path) -> Option<u32> {
+    let contents = read_lock_body(path)?;
+    contents.split_whitespace().next()?.parse().ok()
 }
 
 /// Remove the lock file ONLY if the dead PID it contains still matches what we
@@ -249,7 +276,7 @@ mod tests {
 
         // Read the lock file and verify it contains our PID
         let contents = std::fs::read_to_string(&path).unwrap();
-        let file_pid: u32 = contents.trim().parse().unwrap();
+        let file_pid: u32 = contents.split_whitespace().next().unwrap().parse().unwrap();
         let our_pid = std::process::id();
 
         assert_eq!(file_pid, our_pid);
@@ -336,6 +363,47 @@ mod tests {
 
         // Now should report as locked
         assert!(UpdateLock::is_locked());
+    }
+
+    #[test]
+    fn test_drop_preserves_replaced_lock_body() {
+        let _guard = test_lock().lock().unwrap();
+        let path = get_lock_path().unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        let old_lock = UpdateLock::acquire().expect("old lock acquire");
+        let replacement_body = new_lock_body();
+        std::fs::write(&path, &replacement_body).expect("replace lock body");
+
+        drop(old_lock);
+
+        let body_after_old_drop =
+            std::fs::read_to_string(&path).expect("replacement lock should remain");
+        assert_eq!(body_after_old_drop, replacement_body);
+
+        let replacement_lock = UpdateLock {
+            path: path.clone(),
+            body: replacement_body,
+        };
+        drop(replacement_lock);
+        assert!(!path.exists(), "replacement owner should remove its lock");
+    }
+
+    #[test]
+    fn test_read_pid_accepts_tokenized_lock_body() {
+        let _guard = test_lock().lock().unwrap();
+        let path = get_lock_path().unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+
+        std::fs::write(&path, "12345 abc def").unwrap();
+
+        assert_eq!(read_pid(&path), Some(12345));
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
