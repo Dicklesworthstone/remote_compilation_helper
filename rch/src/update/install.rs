@@ -206,9 +206,14 @@ fn get_backup_dir(version: &str) -> Result<PathBuf, UpdateError> {
     std::fs::create_dir_all(&backup_base)
         .map_err(|e| UpdateError::InstallFailed(format!("Failed to create backup dir: {}", e)))?;
 
-    // Use timestamp to allow multiple backups of same version
-    let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
-    Ok(backup_base.join(format!("v{}-{}", version, timestamp)))
+    // Include a nonce so rapid same-version backups cannot alias each other.
+    let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S_%f");
+    Ok(backup_base.join(format!(
+        "v{}-{}-{}",
+        version,
+        timestamp,
+        uuid::Uuid::new_v4()
+    )))
 }
 
 /// Find the latest backup.
@@ -239,11 +244,9 @@ fn backup_current_installation(
 
     for binary in UPDATE_BINARIES {
         let src = install_dir.join(binary);
-        if src.exists() {
+        if binary_path_exists(&src, binary, "installed binary")? {
             let dst = backup_dir.join(binary);
-            std::fs::copy(&src, &dst).map_err(|e| {
-                UpdateError::InstallFailed(format!("Failed to backup {}: {}", binary, e))
-            })?;
+            copy_regular_binary_payload(&src, &dst, binary, "backup")?;
         }
     }
 
@@ -344,8 +347,15 @@ pub fn list_backups() -> Result<Vec<BackupEntry>, UpdateError> {
         }
     }
 
-    // Sort by creation time, newest first
-    backups.sort_by_key(|b| std::cmp::Reverse(b.created_at));
+    // Sort by creation time, newest first. Use the path as a deterministic
+    // tie-breaker because metadata stores seconds, while backup names carry
+    // subsecond time and a nonce.
+    backups.sort_by(|left, right| {
+        right
+            .created_at
+            .cmp(&left.created_at)
+            .then_with(|| right.backup_path.cmp(&left.backup_path))
+    });
 
     Ok(backups)
 }
@@ -645,9 +655,10 @@ fn replace_binaries(
 fn install_binary_from_payload(src: &Path, dst: &Path, binary: &str) -> Result<(), UpdateError> {
     let staged = dst.with_file_name(format!(".{binary}.rch-update-{}", uuid::Uuid::new_v4()));
 
-    std::fs::copy(src, &staged).map_err(|e| {
-        UpdateError::InstallFailed(format!("Failed to stage {} for install: {}", binary, e))
-    })?;
+    if let Err(error) = copy_regular_binary_payload(src, &staged, binary, "stage") {
+        let _ = std::fs::remove_file(&staged);
+        return Err(error);
+    }
 
     if let Err(error) = set_update_binary_permissions(&staged) {
         let _ = std::fs::remove_file(&staged);
@@ -720,11 +731,57 @@ fn restore_from_backup(
 ) -> Result<(), UpdateError> {
     for binary in UPDATE_BINARIES {
         let src = backup_dir.join(binary);
-        if src.exists() {
+        if binary_path_exists(&src, binary, "backup payload")? {
             let dst = install_dir.join(binary);
             install_binary_from_payload(&src, &dst, binary)?;
         }
     }
+
+    Ok(())
+}
+
+fn binary_path_exists(path: &Path, binary: &str, source_name: &str) -> Result<bool, UpdateError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(UpdateError::InstallFailed(format!(
+            "Failed to inspect {} {} at {}: {}",
+            source_name,
+            binary,
+            path.display(),
+            e
+        ))),
+    }
+}
+
+fn copy_regular_binary_payload(
+    src: &Path,
+    dst: &Path,
+    binary: &str,
+    action: &str,
+) -> Result<(), UpdateError> {
+    let metadata = std::fs::symlink_metadata(src).map_err(|e| {
+        UpdateError::InstallFailed(format!(
+            "Failed to inspect {} at {} before {}: {}",
+            binary,
+            src.display(),
+            action,
+            e
+        ))
+    })?;
+
+    if !metadata.file_type().is_file() {
+        return Err(UpdateError::InstallFailed(format!(
+            "Refusing to {} {} from non-regular file {}",
+            action,
+            binary,
+            src.display()
+        )));
+    }
+
+    std::fs::copy(src, dst).map_err(|e| {
+        UpdateError::InstallFailed(format!("Failed to {} {}: {}", action, binary, e))
+    })?;
 
     Ok(())
 }
@@ -925,6 +982,17 @@ mod tests {
     }
 
     #[test]
+    fn test_backup_dir_is_unique_for_same_version() {
+        let first = get_backup_dir("0.1.0").unwrap();
+        let second = get_backup_dir("0.1.0").unwrap();
+
+        assert_ne!(
+            first, second,
+            "same-version backups created in rapid succession must not share a directory"
+        );
+    }
+
+    #[test]
     fn test_backup_and_restore() {
         let temp = TempDir::new().unwrap();
         let install_dir = temp.path().join("install");
@@ -986,6 +1054,29 @@ mod tests {
         {
             assert!(!backup_dir.join(binary).exists());
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_backup_rejects_symlinked_installed_binary() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let install_dir = temp.path().join("install");
+        let backup_dir = temp.path().join("backup");
+        let external_binary = temp.path().join("external-rch");
+
+        std::fs::create_dir_all(&install_dir).unwrap();
+        std::fs::write(&external_binary, "external binary").unwrap();
+        symlink(&external_binary, install_dir.join(REQUIRED_UPDATE_BINARY)).unwrap();
+
+        let result = backup_current_installation(&install_dir, &backup_dir);
+
+        assert!(matches!(result, Err(UpdateError::InstallFailed(_))));
+        assert!(
+            !backup_dir.join(REQUIRED_UPDATE_BINARY).exists(),
+            "backup must not follow installed binary symlinks"
+        );
     }
 
     #[test]
@@ -1297,6 +1388,32 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(install_dir.join(optional_binary)).unwrap(),
             "backup optional"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_restore_rejects_symlink_backup_payload() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let backup_dir = temp.path().join("backup");
+        let install_dir = temp.path().join("install");
+        let external_binary = temp.path().join("external-rch");
+
+        std::fs::create_dir_all(&backup_dir).unwrap();
+        std::fs::create_dir_all(&install_dir).unwrap();
+        std::fs::write(&external_binary, "external backup binary").unwrap();
+        symlink(&external_binary, backup_dir.join(REQUIRED_UPDATE_BINARY)).unwrap();
+        std::fs::write(install_dir.join(REQUIRED_UPDATE_BINARY), "current binary").unwrap();
+
+        let result = restore_from_backup(&backup_dir, &install_dir);
+
+        assert!(matches!(result, Err(UpdateError::InstallFailed(_))));
+        assert_eq!(
+            std::fs::read_to_string(install_dir.join(REQUIRED_UPDATE_BINARY)).unwrap(),
+            "current binary",
+            "rollback must not follow symlinked backup payloads"
         );
     }
 
