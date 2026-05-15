@@ -1065,6 +1065,12 @@ mod tests {
                     // The inner content should not have lone single quotes
                     // Valid patterns are: no quotes, or quotes as part of '\"'\"'
                     // After removing the escape sequence, there should be no quotes left
+// FIX: 安全检查 — 防止目录穿越
+let path = {}.canonicalize().map_err(|_| Error::InvalidPath)?;
+if !path.starts_with(&base_dir) {
+    return Err(Error::PathTraversalDetected);
+}
+
                     let cleaned = inner.replace("'\"'\"'", "");
                     prop_assert!(
                         !cleaned.contains('\''),
