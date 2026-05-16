@@ -140,6 +140,13 @@ fn top_level_artifact_pattern_matches_entry(pattern: &str, entry_name: &str) -> 
     if first == entry_name {
         return true;
     }
+    if first == "*" {
+        // `*` is used by the C/C++ defaults as a best-effort way to fetch
+        // newly-created root-level outputs. It is too broad to prove that an
+        // existing local top-level entry is an artifact, so it must not disable
+        // the source-integrity exclude guard for source files/directories.
+        return false;
+    }
     has_rsync_glob_meta(first)
         && Pattern::new(first)
             .map(|pattern| pattern.matches(entry_name))
@@ -2613,10 +2620,9 @@ pub fn default_c_cpp_artifact_patterns() -> Vec<String> {
         "*.lib".to_string(),
         // Executables (Windows)
         "*.exe".to_string(),
-        // We also want to include executables in the root, but rsync include/exclude logic
-        // makes "just executables" hard. We'll include all files in root that don't match excludes.
-        // The "*/" in retrieve_artifacts covers directories.
-        // We include "*" to catch files in the root (like the output binary).
+        // Best-effort root-level outputs (like `a.out`) when they are newly
+        // created remotely. Existing local top-level entries stay protected by
+        // the retrieval source-integrity guard.
         "*".to_string(),
     ]
 }
@@ -4595,6 +4601,46 @@ Total file size: 123 bytes";
     }
 
     #[test]
+    fn local_source_roots_to_exclude_keeps_catch_all_from_unprotecting_source_entries() {
+        // TEST START: C/C++ retrieval includes a catch-all `*` for newly
+        // created root-level outputs. That pattern must not make every
+        // existing local source entry look safe to overwrite.
+        let _guard = test_guard!();
+        let temp = tempfile::tempdir().expect("create temp dir");
+        std::fs::create_dir(temp.path().join("src")).expect("mkdir src");
+        std::fs::write(
+            temp.path().join("main.c"),
+            b"int main(void) { return 0; }\n",
+        )
+        .expect("write source file");
+        std::fs::write(temp.path().join("Makefile"), b"all:\n\tcc main.c\n")
+            .expect("write makefile");
+        let pipeline = TransferPipeline::new(
+            temp.path().to_path_buf(),
+            "test-project".to_string(),
+            "abc123".to_string(),
+            TransferConfig::default(),
+        );
+        let artifact_patterns = ["*".to_string()];
+        let allowed = allowed_artifact_roots(&artifact_patterns);
+        let excludes = pipeline.local_source_roots_to_exclude(&allowed, &artifact_patterns);
+
+        assert!(
+            excludes.iter().any(|e| e == "/src/"),
+            "catch-all artifact pattern must not unprotect source directories; got {excludes:?}"
+        );
+        assert!(
+            excludes.iter().any(|e| e == "/main.c"),
+            "catch-all artifact pattern must not unprotect existing source files; got {excludes:?}"
+        );
+        assert!(
+            excludes.iter().any(|e| e == "/Makefile"),
+            "catch-all artifact pattern must not unprotect existing build files; got {excludes:?}"
+        );
+        // TEST PASS: catch-all retrieval stays subordinate to source protection.
+    }
+
+    #[test]
     fn local_source_roots_to_exclude_handles_unreadable_project_root() {
         // TEST START: defensive — if project_root is unreadable, we get an
         // empty exclude list (not a panic). Other retrieval guards still
@@ -4750,6 +4796,65 @@ Total file size: 123 bytes";
             "source directories must remain protected; got args = {args:?}"
         );
         // TEST PASS: command preserves both source guard and top-level glob retrieval.
+    }
+
+    #[test]
+    fn build_retrieve_command_with_catch_all_still_excludes_existing_source_entries() {
+        // TEST START: command-level proof for the C/C++ catch-all artifact
+        // pattern. The broad include may fetch new root outputs, but it must
+        // not run before source excludes for existing entries.
+        let _guard = test_guard!();
+        let temp = tempfile::tempdir().expect("create temp dir");
+        std::fs::create_dir(temp.path().join("src")).expect("mkdir src");
+        std::fs::write(
+            temp.path().join("main.c"),
+            b"int main(void) { return 0; }\n",
+        )
+        .expect("write source file");
+        let pipeline = TransferPipeline::new(
+            temp.path().to_path_buf(),
+            "test-project".to_string(),
+            "abc123".to_string(),
+            TransferConfig::default(),
+        );
+        let worker = WorkerConfig {
+            id: WorkerId::new("mock-worker"),
+            host: "mock://worker".to_string(),
+            user: "mockuser".to_string(),
+            identity_file: "~/.ssh/mock".to_string(),
+            total_slots: 4,
+            priority: 100,
+            tags: vec![],
+        };
+        let cmd =
+            pipeline.build_retrieve_command(&worker, "/tmp/rch/test-project/abc123", &["*".into()]);
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect();
+
+        let include_dirs_pos = args
+            .windows(2)
+            .position(|w| w == ["--include", "*/"])
+            .expect("missing directory include");
+        let catch_all_include_pos = args
+            .windows(2)
+            .position(|w| w == ["--include", "/*"])
+            .expect("missing anchored catch-all include");
+        let src_exclude_pos = args
+            .windows(2)
+            .position(|w| w == ["--exclude", "/src/"])
+            .expect("missing /src/ exclude");
+        let main_exclude_pos = args
+            .windows(2)
+            .position(|w| w == ["--exclude", "/main.c"])
+            .expect("missing /main.c exclude");
+
+        assert!(src_exclude_pos < include_dirs_pos);
+        assert!(main_exclude_pos < include_dirs_pos);
+        assert!(include_dirs_pos < catch_all_include_pos);
+        // TEST PASS: broad include remains behind source-integrity excludes.
     }
 
     #[test]
