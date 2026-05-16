@@ -137,9 +137,6 @@ fn top_level_artifact_pattern_matches_entry(pattern: &str, entry_name: &str) -> 
     if first.is_empty() {
         return false;
     }
-    if first == entry_name {
-        return true;
-    }
     if first == "*" {
         // `*` is used by the C/C++ defaults as a best-effort way to fetch
         // newly-created root-level outputs. It is too broad to prove that an
@@ -147,10 +144,32 @@ fn top_level_artifact_pattern_matches_entry(pattern: &str, entry_name: &str) -> 
         // the source-integrity exclude guard for source files/directories.
         return false;
     }
+    if first == entry_name {
+        return true;
+    }
     has_rsync_glob_meta(first)
         && Pattern::new(first)
             .map(|pattern| pattern.matches(entry_name))
             .unwrap_or(false)
+}
+
+fn escape_rsync_filter_literal_component(name: &str) -> Cow<'_, str> {
+    if !has_rsync_glob_meta(name) {
+        return Cow::Borrowed(name);
+    }
+
+    let mut escaped = String::with_capacity(name.len());
+    for ch in name.chars() {
+        match ch {
+            '\\' => escaped.push_str(r"\\"),
+            '*' | '?' | '[' => {
+                escaped.push('\\');
+                escaped.push(ch);
+            }
+            _ => escaped.push(ch),
+        }
+    }
+    Cow::Owned(escaped)
 }
 
 fn artifact_patterns_allow_top_level_entry(artifact_patterns: &[String], entry_name: &str) -> bool {
@@ -829,6 +848,7 @@ impl TransferPipeline {
             // Anchor with leading `/` so the exclude matches ONLY at the
             // rsync transfer root, not at any nested depth.
             let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            let name = escape_rsync_filter_literal_component(name);
             let exclude = if is_dir {
                 format!("/{name}/")
             } else {
@@ -4613,6 +4633,12 @@ Total file size: 123 bytes";
             b"int main(void) { return 0; }\n",
         )
         .expect("write source file");
+        std::fs::write(temp.path().join("*"), b"literal star source\n")
+            .expect("write literal star source file");
+        std::fs::write(temp.path().join("question?mark.c"), b"int q(void);\n")
+            .expect("write literal question source file");
+        std::fs::write(temp.path().join("array[0].c"), b"int a(void);\n")
+            .expect("write literal bracket source file");
         std::fs::write(temp.path().join("Makefile"), b"all:\n\tcc main.c\n")
             .expect("write makefile");
         let pipeline = TransferPipeline::new(
@@ -4636,6 +4662,18 @@ Total file size: 123 bytes";
         assert!(
             excludes.iter().any(|e| e == "/Makefile"),
             "catch-all artifact pattern must not unprotect existing build files; got {excludes:?}"
+        );
+        assert!(
+            excludes.iter().any(|e| e == r"/\*"),
+            "literal local filenames with rsync glob syntax must be excluded literally; got {excludes:?}"
+        );
+        assert!(
+            excludes.iter().any(|e| e == r"/question\?mark.c"),
+            "literal question-mark filenames must not become rsync wildcards; got {excludes:?}"
+        );
+        assert!(
+            excludes.iter().any(|e| e == r"/array\[0].c"),
+            "literal bracket filenames must not become rsync character classes; got {excludes:?}"
         );
         // TEST PASS: catch-all retrieval stays subordinate to source protection.
     }
@@ -4811,6 +4849,8 @@ Total file size: 123 bytes";
             b"int main(void) { return 0; }\n",
         )
         .expect("write source file");
+        std::fs::write(temp.path().join("*"), b"literal star source\n")
+            .expect("write literal star source file");
         let pipeline = TransferPipeline::new(
             temp.path().to_path_buf(),
             "test-project".to_string(),
@@ -4850,10 +4890,19 @@ Total file size: 123 bytes";
             .windows(2)
             .position(|w| w == ["--exclude", "/main.c"])
             .expect("missing /main.c exclude");
+        let literal_star_exclude_pos = args
+            .windows(2)
+            .position(|w| w == ["--exclude", r"/\*"])
+            .expect("missing escaped literal star exclude");
 
         assert!(src_exclude_pos < include_dirs_pos);
         assert!(main_exclude_pos < include_dirs_pos);
+        assert!(literal_star_exclude_pos < include_dirs_pos);
         assert!(include_dirs_pos < catch_all_include_pos);
+        assert!(
+            !args.windows(2).any(|w| w == ["--exclude", "/*"]),
+            "literal local star source must not become a broad /* exclude; got args = {args:?}"
+        );
         // TEST PASS: broad include remains behind source-integrity excludes.
     }
 
