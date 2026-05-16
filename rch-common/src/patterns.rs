@@ -635,6 +635,50 @@ pub fn classify_command_detailed(cmd: &str) -> ClassificationDetails {
         reason: Cow::Borrowed("command present"),
     });
 
+    // Tier 0.5: Compound command handling, mirroring classify_command_inner().
+    // Without this branch, diagnostics could reject a command such as
+    // `cd /repo && cargo build` while the hook classifier accepts it.
+    if cmd.len() < MAX_SPLIT_INPUT_LEN
+        && let Some(classification) = try_classify_compound_command(cmd)
+    {
+        let normalized = classification
+            .extracted_command
+            .clone()
+            .unwrap_or_else(|| cmd.to_string());
+
+        tiers.push(ClassificationTier {
+            tier: 1,
+            name: Cow::Borrowed(TIER_STRUCTURE_ANALYSIS),
+            decision: TierDecision::Pass,
+            reason: Cow::Borrowed("safe compound command with compilation suffix"),
+        });
+        tiers.push(ClassificationTier {
+            tier: 2,
+            name: Cow::Borrowed(TIER_KEYWORD_FILTER),
+            decision: TierDecision::Pass,
+            reason: Cow::Borrowed("keyword present in extracted command"),
+        });
+        tiers.push(ClassificationTier {
+            tier: 3,
+            name: Cow::Borrowed(TIER_NEVER_INTERCEPT),
+            decision: TierDecision::Pass,
+            reason: Cow::Borrowed("extracted command passed never-intercept checks"),
+        });
+        tiers.push(ClassificationTier {
+            tier: 4,
+            name: Cow::Borrowed(TIER_FULL_CLASSIFICATION),
+            decision: TierDecision::Pass,
+            reason: classification.reason.clone(),
+        });
+
+        return ClassificationDetails {
+            original,
+            normalized,
+            tiers,
+            classification,
+        };
+    }
+
     // Tier 1: Structure analysis
     if let Some(reason) = check_structure(cmd) {
         let classification = Classification::not_compilation(reason);
@@ -847,7 +891,7 @@ pub fn normalize_command(cmd: &str) -> Cow<'_, str> {
         }
     }
 
-    if result == cmd {
+    if result.eq(cmd) {
         Cow::Borrowed(cmd)
     } else {
         Cow::Owned(result.to_string())
@@ -1122,12 +1166,12 @@ fn contains_compilation_keyword(cmd: &str) -> bool {
 /// Full classification of a command (Tier 4).
 fn classify_full(cmd: &str) -> Classification {
     // Cargo commands
-    if cmd.starts_with("cargo ") || cmd == "cargo" {
+    if cmd.starts_with("cargo ") || cmd.eq("cargo") {
         return classify_cargo(cmd);
     }
 
     // rustc
-    if cmd.starts_with("rustc ") || cmd == "rustc" {
+    if cmd.starts_with("rustc ") || cmd.eq("rustc") {
         return Classification::compilation(CompilationKind::Rustc, 0.95, "rustc invocation");
     }
 
@@ -1184,7 +1228,7 @@ fn classify_full(cmd: &str) -> Classification {
     }
 
     // Make
-    if cmd.starts_with("make") && (cmd == "make" || cmd.starts_with("make ")) {
+    if cmd.starts_with("make") && (cmd.eq("make") || cmd.starts_with("make ")) {
         // Don't intercept "make clean", "make install", etc.
         if cmd.contains("clean") || cmd.contains("install") || cmd.contains("distclean") {
             return Classification::not_compilation("make maintenance command");
@@ -1193,16 +1237,16 @@ fn classify_full(cmd: &str) -> Classification {
     }
 
     // CMake build (only when cmake is the invoked command)
-    if cmd.starts_with("cmake ") || cmd == "cmake" {
+    if cmd.starts_with("cmake ") || cmd.eq("cmake") {
         let mut tokens = cmd.split_whitespace();
         let _ = tokens.next(); // "cmake"
-        if tokens.any(|token| token == "--build" || token.starts_with("--build=")) {
+        if tokens.any(|token| token.eq("--build") || token.starts_with("--build=")) {
             return Classification::compilation(CompilationKind::CmakeBuild, 0.90, "cmake --build");
         }
     }
 
     // Ninja
-    if cmd.starts_with("ninja") && (cmd == "ninja" || cmd.starts_with("ninja ")) {
+    if cmd.starts_with("ninja") && (cmd.eq("ninja") || cmd.starts_with("ninja ")) {
         if cmd.contains("-t clean") || cmd.contains("clean") {
             return Classification::not_compilation("ninja clean");
         }
@@ -1210,7 +1254,7 @@ fn classify_full(cmd: &str) -> Classification {
     }
 
     // Meson (only when meson is the invoked command)
-    if cmd.starts_with("meson ") || cmd == "meson" {
+    if cmd.starts_with("meson ") || cmd.eq("meson") {
         let mut tokens = cmd.split_whitespace();
         let _ = tokens.next(); // "meson"
         let mut subcommand = None;
@@ -1228,12 +1272,12 @@ fn classify_full(cmd: &str) -> Classification {
 
     // Bun commands
     let mut tokens = cmd.split_whitespace();
-    if tokens.next() == Some("bun") {
+    if tokens.next().is_some_and(|token| token.eq("bun")) {
         match tokens.next() {
             Some("test") => {
                 // Check for --watch flag - don't intercept interactive mode
                 // Clone the iterator to check remaining args
-                if tokens.any(|a| a == "-w" || a == "--watch") {
+                if tokens.any(|a| a.eq("-w") || a.eq("--watch")) {
                     return Classification::not_compilation(
                         "bun test --watch is interactive (not intercepted)",
                     );
@@ -1246,7 +1290,7 @@ fn classify_full(cmd: &str) -> Classification {
             }
             Some("typecheck") => {
                 // Check for --watch flag - don't intercept interactive mode
-                if tokens.any(|a| a == "-w" || a == "--watch") {
+                if tokens.any(|a| a.eq("-w") || a.eq("--watch")) {
                     return Classification::not_compilation(
                         "bun typecheck --watch is interactive (not intercepted)",
                     );
@@ -2086,6 +2130,7 @@ mod tests {
             "cargo test --release",
             "bun typecheck",
             "gcc -c main.c -o main.o",
+            "cd /tmp && cargo build --release",
             "ls -la",
         ];
 
@@ -2101,7 +2146,7 @@ mod tests {
         let _guard = test_guard!();
         let detailed = classify_command_detailed("cargo build | tee log.txt");
         assert!(!detailed.classification.is_compilation);
-        let tier1 = detailed.tiers.iter().find(|t| t.tier == 1).unwrap();
+        let tier1 = detailed.tiers.iter().find(|t| t.tier.eq(&1)).unwrap();
         assert_eq!(tier1.decision, TierDecision::Reject);
         assert!(tier1.reason.contains("piped"));
     }
@@ -2112,6 +2157,34 @@ mod tests {
         let detailed = classify_command_detailed("sudo cargo check");
         assert_eq!(detailed.normalized, "cargo check");
         assert!(detailed.classification.is_compilation);
+    }
+
+    #[test]
+    fn test_classify_command_detailed_matches_compound_command() {
+        let _guard = test_guard!();
+        let detailed = classify_command_detailed("cd /tmp && cargo build --release");
+
+        assert!(detailed.classification.is_compilation);
+        assert_eq!(
+            detailed.classification.kind,
+            Some(CompilationKind::CargoBuild)
+        );
+        assert_eq!(
+            detailed.classification.command_prefix.as_deref(),
+            Some("cd /tmp && ")
+        );
+        assert_eq!(
+            detailed.classification.extracted_command.as_deref(),
+            Some("cargo build --release")
+        );
+        assert_eq!(detailed.normalized, "cargo build --release");
+        assert_eq!(detailed.tiers.len(), 5);
+        assert!(
+            detailed
+                .tiers
+                .iter()
+                .all(|tier| tier.decision == TierDecision::Pass)
+        );
     }
 
     // =========================================================================
@@ -2870,7 +2943,7 @@ mod tests {
                 // Ensure valid result structure
                 prop_assert!(result.confidence >= 0.0 && result.confidence <= 1.0);
                 // fmt and clean should NEVER be classified as compilation
-                if subcommand == "fmt" || subcommand == "clean" {
+                if subcommand.eq("fmt") || subcommand.eq("clean") {
                     prop_assert!(!result.is_compilation,
                         "cargo {} should not be compilation: {}", subcommand, cmd);
                 }
