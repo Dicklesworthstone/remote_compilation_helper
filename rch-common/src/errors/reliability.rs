@@ -52,6 +52,25 @@ pub enum ReliabilityCategoryKind {
     SchemaCompatibility,
 }
 
+impl ReliabilityCategoryKind {
+    /// Stable snake_case identifier — same as the serde tag, exposed
+    /// directly so callers don't need `serde_json::to_value` to render
+    /// the label. Used by `rch doctor --runbook-list` (br-62u24.20)
+    /// to print a per-code category column.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Topology => "topology",
+            Self::DiskPressure => "disk_pressure",
+            Self::ProcessTriage => "process_triage",
+            Self::RepoConvergence => "repo_convergence",
+            Self::HelperCompatibility => "helper_compatibility",
+            Self::RolloutPosture => "rollout_posture",
+            Self::SchemaCompatibility => "schema_compatibility",
+        }
+    }
+}
+
 /// One reason code per emitted reliability diagnostic. Serializes to its
 /// canonical `RCH-Rnnn` string form via [`Serialize`]; deserializes the same
 /// form via [`Deserialize`].
@@ -571,6 +590,343 @@ impl ReliabilityReasonCode {
     }
 }
 
+// =============================================================================
+// Operator Runbook Authoring (br-62u24.20)
+// =============================================================================
+
+/// Per-code operator runbook — symptoms, diagnosis, remediation, escalation.
+/// Consumed by `rch doctor --runbook <code>` to render paste-ready Markdown
+/// (or JSON) that an SRE can drop into a PagerDuty / Slack / wiki page when
+/// the corresponding diagnostic fires. Generated from code so it can't go
+/// stale relative to the registry that produces the codes themselves.
+#[derive(Debug, Clone, Copy)]
+pub struct RunbookEntry {
+    /// Bulletized operator-visible signs: log lines, dashboard panels, the
+    /// `rch doctor` output the operator likely just saw before reaching for
+    /// the runbook. Used to confirm "this is the right runbook" before
+    /// running diagnosis.
+    pub symptoms: &'static [&'static str],
+    /// Numbered procedure with exact commands. Each step is a single
+    /// paste-ready command — no embedded prose. Diagnosis steps are
+    /// READ-ONLY: they should never mutate state.
+    pub diagnosis_steps: &'static [&'static str],
+    /// Numbered remediation procedure. Each step is paste-ready. Steps
+    /// MAY mutate state (restart daemon, reset circuit, evict cache, etc.).
+    pub remediation_steps: &'static [&'static str],
+    /// Final command to confirm the issue resolved. Typically
+    /// `rch doctor --reliability --scope=<applicable>` so the operator
+    /// can re-check the exact diagnostic without re-running the full
+    /// doctor suite.
+    pub verification_command: &'static str,
+    /// Optional escalation guidance. `None` = use the generic default
+    /// ("open a GitHub issue with diagnostic output"). Set this for
+    /// codes that have a specific subject-matter-expert routing.
+    pub escalation: Option<&'static str>,
+    /// External references: AGENTS.md sections, related git commits, RFC
+    /// links. Rendered as a Markdown link list.
+    pub references: &'static [&'static str],
+    /// ISO 8601 date the runbook entry was authored. Used by
+    /// `--runbook --since=<ts>` (deferred) to surface newly-authored
+    /// runbooks. Hand-maintained on entry edits.
+    pub authored_at: &'static str,
+}
+
+impl ReliabilityReasonCode {
+    /// Operator runbook for this reason code. Returns `Some(entry)` when
+    /// an authored runbook exists; `None` for Pass/Info-state codes that
+    /// don't need a runbook (they're not the kind of thing an operator
+    /// gets paged on). Per br-62u24.20 MVP scope, the highest-leverage
+    /// operational codes are authored first; remaining codes return
+    /// `None` and will be filled in as follow-up work.
+    #[must_use]
+    pub fn runbook(self) -> Option<RunbookEntry> {
+        use ReliabilityReasonCode::*;
+        // Ordered to mirror the variant enumeration for grep-ability.
+        // Each authored entry is the operator-facing source of truth
+        // for incident response on that code.
+        match self {
+            // ---------------- Topology ----------------
+            NoWorkersConfigured => Some(RunbookEntry {
+                symptoms: &[
+                    "`rch doctor --reliability` reports `RCH-R002` (Critical)",
+                    "All builds run locally regardless of project size",
+                    "`rch workers list` returns an empty list",
+                ],
+                diagnosis_steps: &[
+                    "rch workers list --json | jq '.data | length'",
+                    "cat ~/.config/rch/workers.toml",
+                ],
+                remediation_steps: &[
+                    "rch workers add <hostname>     # interactive prompt for SSH key + slots",
+                    "rch workers probe --all        # confirm SSH + tools reachable",
+                ],
+                verification_command: "rch doctor --reliability --scope=topology --json",
+                escalation: Some(
+                    "If no remote worker is available, the project may need a local-only \
+                     config: `rch config set general.enabled=false` to skip the hook entirely.",
+                ),
+                references: &[
+                    "AGENTS.md > Architecture > Worker Fleet Management",
+                    "rch workers add --help",
+                ],
+                authored_at: "2026-05-16",
+            }),
+            AllWorkersUnhealthy => Some(RunbookEntry {
+                symptoms: &[
+                    "`rch doctor --reliability` reports `RCH-R006` (Critical)",
+                    "0/N workers healthy in the topology summary",
+                    "Every build falls back to local execution",
+                    "Hook latency spikes (no fast remote target)",
+                ],
+                diagnosis_steps: &[
+                    "rch status --workers --json | jq '.data.workers[] | {id, status, last_error}'",
+                    "rch workers probe --all --verbose",
+                    "for w in $(rch workers list --json | jq -r '.data[].id'); do echo \"--- $w ---\"; rch workers probe --worker=$w --verbose; done",
+                ],
+                remediation_steps: &[
+                    "# 1. Check network from this host:",
+                    "rch workers probe --all  # if it hangs, network is the issue",
+                    "# 2. Restart the daemon to clear stale circuit breakers:",
+                    "rch daemon restart",
+                    "# 3. If specific workers are down, evict them temporarily:",
+                    "rch workers disable <id>",
+                ],
+                verification_command: "rch doctor --reliability --scope=topology",
+                escalation: Some(
+                    "If all workers are reachable via raw SSH but RCH still reports \
+                     unhealthy, capture daemon logs with `rch daemon logs --tail=200 --json` \
+                     and file an issue. This is likely a daemon-side regression.",
+                ),
+                references: &[
+                    "AGENTS.md > Performance > Worker Selection Algorithm",
+                    "RCH-R007 (PartialWorkerCapacity) — same diagnosis path, partial scope",
+                ],
+                authored_at: "2026-05-16",
+            }),
+            PartialWorkerCapacity => Some(RunbookEntry {
+                symptoms: &[
+                    "`rch doctor --reliability` reports `RCH-R007` (Warning)",
+                    "M/N workers healthy where M < N",
+                    "Builds still succeed but on a shrunk fleet",
+                ],
+                diagnosis_steps: &[
+                    "rch status --workers --json | jq '.data.workers[] | select(.status != \"ready\") | {id, status, last_error}'",
+                    "rch workers probe --all --verbose 2>&1 | grep -E 'FAIL|ERROR'",
+                ],
+                remediation_steps: &[
+                    "# Identify the unhealthy worker(s):",
+                    "UNHEALTHY=$(rch status --workers --json | jq -r '.data.workers[] | select(.status != \"ready\") | .id')",
+                    "# Probe each in turn for forensics:",
+                    "for w in $UNHEALTHY; do rch workers probe --worker=$w --verbose; done",
+                    "# If the cause is a transient network blip, the daemon may auto-recover.",
+                    "# Force-clear the circuit breaker if needed:",
+                    "rch workers reset-circuit --worker=<id>",
+                ],
+                verification_command: "rch doctor --reliability --scope=topology",
+                escalation: None,
+                references: &["RCH-R006 (AllWorkersUnhealthy) — same playbook, full-outage scope"],
+                authored_at: "2026-05-16",
+            }),
+            WorkerUnreachable => Some(RunbookEntry {
+                symptoms: &[
+                    "Single worker reports `RCH-R010` (Critical) in topology",
+                    "`rch workers probe --worker=<id>` fails with SSH error",
+                    "Builds skip this worker via selection but fleet still works",
+                ],
+                diagnosis_steps: &[
+                    "rch workers probe --worker=<id> --verbose",
+                    "ssh -i <identity> <user>@<host> 'echo ok'  # raw SSH test",
+                    "rch workers list --json | jq '.data[] | select(.id==\"<id>\")'",
+                ],
+                remediation_steps: &[
+                    "# If raw SSH works but rch probe fails, the daemon's SSH cache may be stale:",
+                    "rch daemon restart",
+                    "# If raw SSH also fails, check the host/network/firewall:",
+                    "ping <host>",
+                    "ssh -vvv -i <identity> <user>@<host>",
+                ],
+                verification_command: "rch workers probe --worker=<id>",
+                escalation: None,
+                references: &["AGENTS.md > Worker Fleet Management"],
+                authored_at: "2026-05-16",
+            }),
+            WorkerCircuitOpen => Some(RunbookEntry {
+                symptoms: &[
+                    "Worker reports `RCH-R009` (Warning)",
+                    "Selection algorithm refuses to route builds to this worker",
+                    "Build failures from this worker recently exceeded the threshold",
+                ],
+                diagnosis_steps: &[
+                    "rch status --workers --json | jq '.data.workers[] | select(.id==\"<id>\") | {circuit_state, consecutive_failures, last_error}'",
+                    "rch daemon logs --tail=200 | grep <worker-id>",
+                ],
+                remediation_steps: &[
+                    "# Manual reset (use after confirming the underlying cause is resolved):",
+                    "rch workers reset-circuit --worker=<id>",
+                    "# Or wait for auto-recovery (typically 5 minutes after the last failure)",
+                ],
+                verification_command: "rch doctor --reliability --scope=topology",
+                escalation: None,
+                references: &["rchd/src/selection.rs > circuit-breaker policy"],
+                authored_at: "2026-05-16",
+            }),
+
+            // ---------------- Daemon ----------------
+            DaemonStatusUnavailable => Some(RunbookEntry {
+                symptoms: &[
+                    "`rch doctor --reliability` reports `RCH-R004` (Warning)",
+                    "Daemon socket not responding to `/status`",
+                    "`rch status` hangs or errors",
+                ],
+                diagnosis_steps: &[
+                    "ls -la /tmp/rch.sock        # socket exists?",
+                    "pgrep -af rchd              # process running?",
+                    "rch daemon logs --tail=50",
+                ],
+                remediation_steps: &[
+                    "rch daemon start            # cold-start if not running",
+                    "rch daemon restart          # restart if process is wedged",
+                    "# If autostart is disabled in config, enable it:",
+                    "rch config set self_healing.hook_starts_daemon true",
+                ],
+                verification_command: "rch status --json",
+                escalation: Some(
+                    "If the daemon repeatedly fails to start, capture full diagnostics: \
+                     `rch doctor --reliability --json > /tmp/diag.json` and inspect with \
+                     `jq '.data.diagnostics[] | select(.severity != \"pass\")'`.",
+                ),
+                references: &["AGENTS.md > Architecture > Daemon Communication"],
+                authored_at: "2026-05-16",
+            }),
+
+            // ---------------- Disk pressure ----------------
+            WorkerDiskPressureCritical => Some(RunbookEntry {
+                symptoms: &[
+                    "Worker reports `RCH-R101` (Critical)",
+                    "Free space on the worker's build volume is below the critical threshold",
+                    "Subsequent rsync upload may fail with ENOSPC",
+                ],
+                diagnosis_steps: &[
+                    "rch status --workers --json | jq '.data.workers[] | select(.id==\"<id>\") | {pressure_disk_free_gb, pressure_confidence, pressure_state}'",
+                    "ssh -i <identity> <user>@<host> 'df -h /tmp /var'",
+                ],
+                remediation_steps: &[
+                    "# Stop new jobs from landing on the saturated worker:",
+                    "rch workers disable <id>",
+                    "# Confirm the remaining fleet can absorb builds while the worker is remediated:",
+                    "rch doctor --reliability --scope=topology",
+                ],
+                verification_command: "rch doctor --reliability --scope=pressure",
+                escalation: Some(
+                    "If disk pressure persists after the worker is disabled, perform \
+                     out-of-band worker cache cleanup only after confirming no jobs are \
+                     active and obtaining explicit approval for the cleanup command. If \
+                     disk fills again within hours, grow the volume or reduce \
+                     CARGO_TARGET_DIR retention.",
+                ),
+                references: &[
+                    "RCH-R102 (WorkerDiskPressureWarning) — same playbook, less urgent",
+                    "rchd/src/workers.rs > disk_pressure tracking",
+                ],
+                authored_at: "2026-05-16",
+            }),
+
+            // ---------------- Repo convergence ----------------
+            RepoConvergenceFailed => Some(RunbookEntry {
+                symptoms: &[
+                    "`rch doctor --reliability` reports `RCH-R301` (Critical)",
+                    "One or more workers have stale repo state vs the local checkout",
+                    "Builds may compile against the wrong revision",
+                ],
+                diagnosis_steps: &[
+                    "rch status --json | jq '.data.repo_convergence'",
+                    "rch workers probe --all --verbose | grep -E 'commit|revision'",
+                ],
+                remediation_steps: &[
+                    "# Force a fresh sync to all workers:",
+                    "rch cache warm",
+                    "# If a specific worker is the outlier, target it:",
+                    "rch cache warm --workers <id>",
+                ],
+                verification_command: "rch doctor --reliability --scope=convergence",
+                escalation: None,
+                references: &["br-4zm6u (rch cache warm subcommand)"],
+                authored_at: "2026-05-16",
+            }),
+
+            // ---------------- Rollout posture ----------------
+            ConfigLoadFailed => Some(RunbookEntry {
+                symptoms: &[
+                    "`rch doctor --reliability` reports `RCH-R504` (Critical)",
+                    "rch commands fail to start with a config-parse error",
+                    "Hook may be falling open (allowing local execution)",
+                ],
+                diagnosis_steps: &[
+                    "rch config doctor --json",
+                    "rch config show --sources",
+                    "cat ~/.config/rch/config.toml | head -40",
+                ],
+                remediation_steps: &[
+                    "# Validate the TOML structure first:",
+                    "rch config lint",
+                    "# If a key has the wrong type, the error message names the line.",
+                    "# To start from a known-good template:",
+                    "rch config init --force",
+                ],
+                verification_command: "rch doctor --reliability --scope=rollout",
+                escalation: None,
+                references: &["rch config doctor --help"],
+                authored_at: "2026-05-16",
+            }),
+
+            // ---------------- Helper compatibility ----------------
+            HelperMissing => Some(RunbookEntry {
+                symptoms: &[
+                    "`rch doctor --reliability` reports `RCH-R401` (Critical/Warning)",
+                    "rsync / ssh / zstd / cargo missing from PATH",
+                    "Builds fail with `command not found`",
+                ],
+                diagnosis_steps: &[
+                    "which rsync ssh zstd cargo",
+                    "rch doctor --reliability --scope=helpers --json | jq '.data.diagnostics[] | select(.code==\"RCH-R401\")'",
+                ],
+                remediation_steps: &[
+                    "# Install missing helpers via the system package manager:",
+                    "# Ubuntu / Debian:",
+                    "sudo apt-get install rsync zstd openssh-client",
+                    "# macOS:",
+                    "brew install rsync zstd",
+                    "# Cargo: install via rustup (https://rustup.rs)",
+                ],
+                verification_command: "rch doctor --reliability --scope=helpers",
+                escalation: None,
+                references: &["AGENTS.md > Toolchain: Rust & Cargo"],
+                authored_at: "2026-05-16",
+            }),
+
+            // ---------------- All other variants return None ----------------
+            //
+            // Pass / Info codes describe healthy states and don't merit
+            // a runbook (an operator wouldn't be paged on them).
+            // Warning/Critical codes not yet authored fall through here
+            // and are filed as follow-up MVP scope.
+            _ => None,
+        }
+    }
+
+    /// Convenience: list every variant that has an authored runbook.
+    /// Used by `rch doctor --runbook-list` to enumerate the codes
+    /// an operator can request a runbook for.
+    #[must_use]
+    pub fn authored_runbook_codes() -> Vec<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .filter(|c| c.runbook().is_some())
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -644,6 +1000,50 @@ mod tests {
         for &c in ReliabilityReasonCode::ALL {
             let hint = c.remediation_hint();
             assert!(!hint.is_empty(), "empty remediation hint for {c:?}");
+        }
+    }
+
+    #[test]
+    fn test_authored_runbook_primary_symptom_names_own_code() {
+        for code in ReliabilityReasonCode::authored_runbook_codes() {
+            let entry = code.runbook().expect("authored code has runbook");
+            let primary = entry
+                .symptoms
+                .first()
+                .expect("authored runbook should have at least one symptom");
+            assert!(
+                primary.contains(code.code()),
+                "primary symptom for {:?} should mention its own code {}; got {primary:?}",
+                code,
+                code.code()
+            );
+        }
+    }
+
+    #[test]
+    fn test_authored_runbooks_do_not_suggest_destructive_cleanup_commands() {
+        const FORBIDDEN_COMMANDS: &[&str] = &["rm -rf", "git reset --hard", "git clean -fd"];
+
+        for code in ReliabilityReasonCode::authored_runbook_codes() {
+            let entry = code.runbook().expect("authored code has runbook");
+            let lines = entry
+                .symptoms
+                .iter()
+                .chain(entry.diagnosis_steps)
+                .chain(entry.remediation_steps)
+                .chain(std::iter::once(&entry.verification_command))
+                .chain(entry.escalation.iter())
+                .chain(entry.references);
+
+            for line in lines {
+                for forbidden in FORBIDDEN_COMMANDS {
+                    assert!(
+                        !line.contains(forbidden),
+                        "runbook {} must not suggest forbidden command {forbidden:?}: {line}",
+                        code.code()
+                    );
+                }
+            }
         }
     }
 

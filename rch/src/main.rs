@@ -574,6 +574,22 @@ CHECKS PERFORMED:
         /// window setups and CI tripwires.
         #[arg(long, requires = "watch", value_name = "PATH")]
         watch_snapshot: Option<PathBuf>,
+
+        /// Render the operator runbook for a specific RCH-Rnnn code as
+        /// Markdown on stdout (br-62u24.20). Pastes cleanly into PagerDuty
+        /// / Slack / wiki pages. Mutually exclusive with the regular
+        /// reliability sweep — when this flag is set, no probes run.
+        #[arg(long, value_name = "CODE", conflicts_with_all = ["fix", "watch"])]
+        runbook: Option<String>,
+
+        /// List every reason code that has an authored runbook
+        /// (br-62u24.20). Mutually exclusive with `--runbook <code>`
+        /// (which renders one) and with the regular sweep.
+        #[arg(
+            long = "runbook-list",
+            conflicts_with_all = ["fix", "watch", "runbook"]
+        )]
+        runbook_list: bool,
     },
 
     /// Verify remote compilation by running a self-test
@@ -1745,6 +1761,8 @@ async fn run(args: Vec<OsString>) -> Result<()> {
                 watch_interval,
                 transitions_only,
                 watch_snapshot,
+                runbook,
+                runbook_list,
             } => {
                 handle_doctor(
                     fix,
@@ -1759,6 +1777,8 @@ async fn run(args: Vec<OsString>) -> Result<()> {
                     watch_interval,
                     transitions_only,
                     watch_snapshot,
+                    runbook,
+                    runbook_list,
                     &ctx,
                 )
                 .await
@@ -3261,9 +3281,22 @@ async fn handle_doctor(
     watch_interval: u64,
     transitions_only: bool,
     watch_snapshot: Option<PathBuf>,
+    runbook: Option<String>,
+    runbook_list: bool,
     ctx: &OutputContext,
 ) -> Result<()> {
     use crate::doctor::{DoctorOptions, ReliabilityScopeSet};
+    // Runbook flags short-circuit before any probe gating — they're
+    // pure renderers over the static runbook registry (br-62u24.20).
+    // The clap conflicts_with_all already rejects --runbook + --fix/
+    // --watch combinations; this branch only fires when the operator
+    // asked for documentation, not diagnostics.
+    if runbook_list {
+        return handle_runbook_list(ctx);
+    }
+    if let Some(code) = runbook {
+        return handle_runbook_render(&code, ctx);
+    }
     // Parse the scope arg (clap default = "all"). Invalid values produce
     // a clear error via FromStr that's surfaced to the user.
     let scope: ReliabilityScopeSet = scope
@@ -3314,6 +3347,188 @@ async fn handle_doctor(
         watch_snapshot,
     };
     crate::doctor::run_doctor(ctx, options).await
+}
+
+/// `rch doctor --runbook <code>` — render the authored runbook for the
+/// given RCH-Rnnn code as Markdown on stdout. Pastes cleanly into
+/// PagerDuty / Slack / wiki pages. br-62u24.20.
+fn handle_runbook_render(code_str: &str, ctx: &OutputContext) -> Result<()> {
+    let code = rch_common::ReliabilityReasonCode::from_code_str(code_str).ok_or_else(|| {
+        anyhow::anyhow!(
+            "unknown reliability reason code: {code_str:?} \
+             (try `rch doctor --runbook-list` for the list of authored codes)"
+        )
+    })?;
+    let entry = code.runbook().ok_or_else(|| {
+        anyhow::anyhow!(
+            "no authored runbook for {code_str} ({}); this is typically a \
+             Pass/Info state code that doesn't need an incident runbook. \
+             Try `rch doctor --runbook-list` for the authored set.",
+            code.name()
+        )
+    })?;
+    let markdown = render_runbook_markdown(code, &entry);
+    // Runbook is data, not diagnostics — emit to stdout so operators can
+    // pipe to `pbcopy` / `xclip` / a file.
+    println!("{markdown}");
+    tracing::info!(
+        target: "rch::doctor::runbook",
+        code = code.code(),
+        name = code.name(),
+        "doctor.runbook.rendered",
+    );
+    let _ = ctx; // ctx unused for Markdown output; reserved for --json variant
+    Ok(())
+}
+
+/// `rch doctor --runbook-list` — enumerate every code that has an
+/// authored runbook entry. One line per code on stdout (machine-friendly).
+/// br-62u24.20.
+fn handle_runbook_list(ctx: &OutputContext) -> Result<()> {
+    let codes = rch_common::ReliabilityReasonCode::authored_runbook_codes();
+    if ctx.is_json() {
+        let entries: Vec<_> = codes
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "code": c.code(),
+                    "name": c.name(),
+                    "category": c.category().as_str(),
+                })
+            })
+            .collect();
+        ctx.json(&rch_common::ApiResponse::ok(
+            "doctor.runbook.list",
+            serde_json::json!({
+                "codes": entries,
+                "count": entries.len(),
+            }),
+        ))?;
+    } else {
+        for c in &codes {
+            // Compact two-column layout. Stable enough to grep.
+            println!("{}  {}  ({})", c.code(), c.name(), c.category().as_str());
+        }
+        eprintln!();
+        eprintln!("{} authored runbook(s)", codes.len());
+    }
+    tracing::info!(
+        target: "rch::doctor::runbook",
+        count = codes.len(),
+        "doctor.runbook.listed",
+    );
+    Ok(())
+}
+
+/// Render a `RunbookEntry` as the Markdown form documented in
+/// br-62u24.20: title, at-a-glance, symptoms, diagnosis, remediation,
+/// verification, escalation, references, auto-footer. Pure function —
+/// trivially unit-testable without spinning up the doctor or daemon.
+fn render_runbook_markdown(
+    code: rch_common::ReliabilityReasonCode,
+    entry: &rch_common::RunbookEntry,
+) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(2048);
+    // Title
+    let _ = writeln!(s, "# {} — {}", code.code(), code.name());
+    // At-a-glance — three short lines so an on-call SRE can decide
+    // urgency in 5 seconds.
+    let _ = writeln!(s);
+    let _ = writeln!(s, "**Category:** `{}`  ", code.category().as_str());
+    let _ = writeln!(
+        s,
+        "**Requires restart:** `{}`  ",
+        if code.requires_restart() { "yes" } else { "no" }
+    );
+    let hint = code.remediation_hint();
+    if !hint.is_empty() {
+        let _ = writeln!(s, "**Quick hint:** {hint}");
+    }
+    let _ = writeln!(s);
+
+    // Symptoms
+    let _ = writeln!(s, "## Symptoms");
+    let _ = writeln!(s);
+    for sym in entry.symptoms {
+        let _ = writeln!(s, "- {sym}");
+    }
+    let _ = writeln!(s);
+
+    // Diagnosis
+    let _ = writeln!(s, "## Diagnosis");
+    let _ = writeln!(s);
+    let _ = writeln!(s, "Run these read-only commands to confirm the cause:");
+    let _ = writeln!(s);
+    let _ = writeln!(s, "```bash");
+    for step in entry.diagnosis_steps {
+        let _ = writeln!(s, "{step}");
+    }
+    let _ = writeln!(s, "```");
+    let _ = writeln!(s);
+
+    // Remediation
+    let _ = writeln!(s, "## Remediation");
+    let _ = writeln!(s);
+    let _ = writeln!(s, "```bash");
+    for step in entry.remediation_steps {
+        let _ = writeln!(s, "{step}");
+    }
+    let _ = writeln!(s, "```");
+    let _ = writeln!(s);
+
+    // Verification
+    let _ = writeln!(s, "## Verification");
+    let _ = writeln!(s);
+    let _ = writeln!(s, "After remediation, confirm the issue resolved with:");
+    let _ = writeln!(s);
+    let _ = writeln!(s, "```bash");
+    let _ = writeln!(s, "{}", entry.verification_command);
+    let _ = writeln!(s, "```");
+    let _ = writeln!(s);
+
+    // Escalation
+    let _ = writeln!(s, "## Escalation");
+    let _ = writeln!(s);
+    if let Some(esc) = entry.escalation {
+        let _ = writeln!(s, "{esc}");
+    } else {
+        let _ = writeln!(
+            s,
+            "If the steps above don't resolve the issue, capture full diagnostic output:"
+        );
+        let _ = writeln!(s);
+        let _ = writeln!(s, "```bash");
+        let _ = writeln!(s, "rch doctor --reliability --json > /tmp/rch-diag.json");
+        let _ = writeln!(s, "```");
+        let _ = writeln!(s);
+        let _ = writeln!(
+            s,
+            "Then open an issue at https://github.com/Dicklesworthstone/remote_compilation_helper/issues \
+             with the JSON attached."
+        );
+    }
+    let _ = writeln!(s);
+
+    // References
+    if !entry.references.is_empty() {
+        let _ = writeln!(s, "## References");
+        let _ = writeln!(s);
+        for r in entry.references {
+            let _ = writeln!(s, "- {r}");
+        }
+        let _ = writeln!(s);
+    }
+
+    // Auto-footer
+    let _ = writeln!(
+        s,
+        "---\n*Authored {} · Generated by `rch doctor --runbook {}` · {}*",
+        entry.authored_at,
+        code.code(),
+        concat!("rch ", env!("CARGO_PKG_VERSION")),
+    );
+    s
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4463,6 +4678,158 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
+    // Doctor Runbook Tests (br-62u24.20)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn runbook_renders_for_every_authored_code() {
+        // TEST START: every code that authored_runbook_codes() returns
+        // MUST also produce non-empty Markdown via render_runbook_markdown.
+        // Catches a future regression where a runbook entry is added to
+        // the registry but has missing required fields.
+        let _guard = test_guard!();
+        let codes = rch_common::ReliabilityReasonCode::authored_runbook_codes();
+        assert!(
+            codes.len() >= 10,
+            "MVP scope authored at least 10 high-leverage codes; got {}",
+            codes.len()
+        );
+        for code in codes {
+            let entry = code
+                .runbook()
+                .expect("authored_runbook_codes only yields Some(...)");
+            // Required-field invariants: every field must have content
+            // (no empty arrays, no empty strings on required scalars).
+            assert!(
+                !entry.symptoms.is_empty(),
+                "{} runbook has empty symptoms",
+                code.code()
+            );
+            assert!(
+                !entry.diagnosis_steps.is_empty(),
+                "{} runbook has empty diagnosis_steps",
+                code.code()
+            );
+            assert!(
+                !entry.remediation_steps.is_empty(),
+                "{} runbook has empty remediation_steps",
+                code.code()
+            );
+            assert!(
+                !entry.verification_command.is_empty(),
+                "{} runbook has empty verification_command",
+                code.code()
+            );
+            assert!(
+                !entry.authored_at.is_empty(),
+                "{} runbook has empty authored_at",
+                code.code()
+            );
+            // Markdown rendering must be non-empty and contain the code
+            // itself plus all the section headers we promise.
+            let md = render_runbook_markdown(code, &entry);
+            assert!(
+                md.contains(code.code()),
+                "rendered markdown for {} missing the code itself",
+                code.code()
+            );
+            for heading in &[
+                "## Symptoms",
+                "## Diagnosis",
+                "## Remediation",
+                "## Verification",
+            ] {
+                assert!(
+                    md.contains(heading),
+                    "rendered markdown for {} missing heading {heading:?}",
+                    code.code()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn runbook_pass_state_codes_return_none() {
+        // TEST START: Pass/Info state codes don't need runbooks (operators
+        // aren't paged on them). Spot-check known Pass codes.
+        let _guard = test_guard!();
+        assert!(
+            rch_common::ReliabilityReasonCode::WorkersConfigured
+                .runbook()
+                .is_none(),
+            "Pass-state code WorkersConfigured must not have a runbook"
+        );
+        assert!(
+            rch_common::ReliabilityReasonCode::SchemaCompatible
+                .runbook()
+                .is_none(),
+            "Pass-state code SchemaCompatible must not have a runbook"
+        );
+    }
+
+    #[test]
+    fn cli_parses_doctor_runbook_with_code() {
+        let _guard = test_guard!();
+        let cli = Cli::try_parse_from(["rch", "doctor", "--runbook", "RCH-R002"]).unwrap();
+        match cli.command {
+            Some(Commands::Doctor {
+                runbook,
+                runbook_list,
+                ..
+            }) => {
+                assert_eq!(runbook, Some("RCH-R002".to_string()));
+                assert!(!runbook_list);
+            }
+            _ => panic!("Expected doctor command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_doctor_runbook_list_flag() {
+        let _guard = test_guard!();
+        let cli = Cli::try_parse_from(["rch", "doctor", "--runbook-list"]).unwrap();
+        match cli.command {
+            Some(Commands::Doctor {
+                runbook,
+                runbook_list,
+                ..
+            }) => {
+                assert!(runbook.is_none());
+                assert!(runbook_list);
+            }
+            _ => panic!("Expected doctor command"),
+        }
+    }
+
+    #[test]
+    fn cli_rejects_doctor_runbook_with_fix() {
+        let _guard = test_guard!();
+        let result = Cli::try_parse_from([
+            "rch",
+            "doctor",
+            "--reliability",
+            "--runbook",
+            "RCH-R002",
+            "--fix",
+        ]);
+        assert!(
+            result.is_err(),
+            "--runbook and --fix must be mutually exclusive"
+        );
+    }
+
+    #[test]
+    fn cli_rejects_doctor_runbook_with_runbook_list() {
+        let _guard = test_guard!();
+        let result =
+            Cli::try_parse_from(["rch", "doctor", "--runbook", "RCH-R002", "--runbook-list"]);
+        assert!(
+            result.is_err(),
+            "--runbook and --runbook-list must be mutually exclusive (render vs enumerate)"
+        );
+    }
+
+    // -------------------------------------------------------------------------
     // Cache Subcommand Tests (br-4zm6u)
     // -------------------------------------------------------------------------
 
@@ -4605,11 +4972,7 @@ mod tests {
                 check_schemas,
                 strict,
                 lenient,
-                scope: _,
-                watch: _,
-                watch_interval: _,
-                transitions_only: _,
-                watch_snapshot: _,
+                ..
             }) => {
                 assert!(!fix);
                 assert!(!dry_run);
@@ -4636,11 +4999,7 @@ mod tests {
                 check_schemas,
                 strict,
                 lenient,
-                scope: _,
-                watch: _,
-                watch_interval: _,
-                transitions_only: _,
-                watch_snapshot: _,
+                ..
             }) => {
                 assert!(fix);
                 assert!(!dry_run);
@@ -4667,11 +5026,7 @@ mod tests {
                 check_schemas,
                 strict,
                 lenient,
-                scope: _,
-                watch: _,
-                watch_interval: _,
-                transitions_only: _,
-                watch_snapshot: _,
+                ..
             }) => {
                 assert!(!fix);
                 assert!(dry_run);
@@ -4698,11 +5053,7 @@ mod tests {
                 check_schemas,
                 strict,
                 lenient,
-                scope: _,
-                watch: _,
-                watch_interval: _,
-                transitions_only: _,
-                watch_snapshot: _,
+                ..
             }) => {
                 assert!(!fix);
                 assert!(!dry_run);
@@ -4729,11 +5080,7 @@ mod tests {
                 check_schemas,
                 strict,
                 lenient,
-                scope: _,
-                watch: _,
-                watch_interval: _,
-                transitions_only: _,
-                watch_snapshot: _,
+                ..
             }) => {
                 assert!(!fix);
                 assert!(!dry_run);
@@ -4761,11 +5108,7 @@ mod tests {
                 check_schemas,
                 strict,
                 lenient,
-                scope: _,
-                watch: _,
-                watch_interval: _,
-                transitions_only: _,
-                watch_snapshot: _,
+                ..
             }) => {
                 assert!(!fix);
                 assert!(!dry_run);

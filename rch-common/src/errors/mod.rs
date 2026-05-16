@@ -31,4 +31,4 @@ pub use explain::{
     CodeExplanation, CodeNamespace, is_known, is_known_category, known_categories, list_all,
     list_by_category, lookup, render_human,
 };
-pub use reliability::{ReliabilityCategoryKind, ReliabilityReasonCode};
+pub use reliability::{ReliabilityCategoryKind, ReliabilityReasonCode, RunbookEntry};

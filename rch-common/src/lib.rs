@@ -186,7 +186,7 @@ pub use ui::{
 // Errors module re-exports
 pub use errors::{
     CodeExplanation, CodeNamespace, ErrorCategory, ErrorCode, ErrorEntry, ReliabilityCategoryKind,
-    ReliabilityReasonCode,
+    ReliabilityReasonCode, RunbookEntry,
 };
 
 // Schema-version registry re-exports
