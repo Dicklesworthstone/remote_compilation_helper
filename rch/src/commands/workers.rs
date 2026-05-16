@@ -845,7 +845,8 @@ pub async fn workers_probe(
                 let start = std::time::Instant::now();
                 match client.health_check().await {
                     Ok(true) => {
-                        let latency = start.elapsed().as_millis() as u64;
+                        let latency =
+                            u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
                         results.push(WorkerProbeResult {
                             id: worker.id.as_str().to_string(),
                             host: worker.host.clone(),
@@ -1134,7 +1135,7 @@ pub async fn workers_benchmark_filtered(
 
                 match result {
                     Ok(r) if r.success() => {
-                        let duration_ms = duration.as_millis() as u64;
+                        let duration_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
                         results.push(WorkerBenchmarkResult {
                             id: worker.id.as_str().to_string(),
                             host: worker.host.clone(),

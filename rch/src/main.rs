@@ -3193,7 +3193,7 @@ async fn handle_cache_warm(
             }
             Err(err) => {
                 failed += 1;
-                let duration_ms = started.elapsed().as_millis() as u64;
+                let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
                 let error_msg = err.to_string();
                 tracing::warn!(
                     target: "rch::cache::warm",
@@ -3222,7 +3222,8 @@ async fn handle_cache_warm(
         }
     }
 
-    let total_duration_ms = cache_warm_started_at.elapsed().as_millis() as u64;
+    let total_duration_ms =
+        u64::try_from(cache_warm_started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
     let response = CacheWarmResponse {
         project_root: project_root.display().to_string(),
         project_id: project_id.clone(),
