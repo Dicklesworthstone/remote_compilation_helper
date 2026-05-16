@@ -797,6 +797,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_concurrent_state_access_with_lock() {
         log_test_start("test_concurrent_state_access_with_lock");
         let tmp = TempDir::new().unwrap();
@@ -816,7 +817,7 @@ mod tests {
                 start.wait();
                 let _lock = ConfigLock::acquire_with_timeout(
                     &lock_name,
-                    Duration::from_secs(10),
+                    Duration::from_secs(30),
                     &format!("thread-{i}"),
                 )
                 .expect("lock acquisition failed");

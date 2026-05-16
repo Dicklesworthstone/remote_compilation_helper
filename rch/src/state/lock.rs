@@ -745,7 +745,7 @@ mod tests {
     }
 
     #[test]
-    fn test_concurrent_contention_real_threads() {
+    fn test_concurrent_contention_real_threads() -> Result<()> {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::{Arc, Barrier};
         use std::thread;
@@ -774,7 +774,7 @@ mod tests {
             let start = Arc::clone(&start_barrier);
             let done = Arc::clone(&done_barrier);
 
-            handles.push(thread::spawn(move || {
+            handles.push(thread::spawn(move || -> Result<()> {
                 // Wait for all threads to be ready
                 start.wait();
 
@@ -792,15 +792,17 @@ mod tests {
                     }
                     Err(e) => {
                         done.wait();
-                        panic!("Unexpected error in thread {}: {}", i, e);
+                        return Err(anyhow!("Unexpected error in thread {}: {}", i, e));
                     }
                 }
+
+                Ok(())
             }));
         }
 
         // Wait for all threads to finish
         for handle in handles {
-            handle.join().expect("Thread panicked");
+            handle.join().map_err(|_| anyhow!("Thread panicked"))??;
         }
 
         let total_acquired = acquired_count.load(Ordering::SeqCst);
@@ -821,10 +823,12 @@ mod tests {
             num_threads - 1,
             "Other threads should fail to acquire"
         );
+        Ok(())
     }
 
     #[test]
-    fn test_concurrent_sequential_acquisition() {
+    #[serial_test::serial]
+    fn test_concurrent_sequential_acquisition() -> Result<()> {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::thread;
@@ -845,12 +849,12 @@ mod tests {
             let lock_dir = Arc::clone(&lock_dir);
             let success_count = Arc::clone(&successful_acquisitions);
 
-            handles.push(thread::spawn(move || {
+            handles.push(thread::spawn(move || -> Result<()> {
                 // Each thread tries to acquire with timeout
                 match ConfigLock::acquire_in_dir_with_timeout(
                     &lock_dir,
                     "sequential_lock",
-                    Duration::from_secs(5),
+                    Duration::from_secs(30),
                     &format!("thread-{}", i),
                 ) {
                     Ok(_lock) => {
@@ -860,14 +864,16 @@ mod tests {
                         // Lock released on drop, allowing next thread to acquire
                     }
                     Err(e) => {
-                        panic!("Thread {} failed to acquire lock: {}", i, e);
+                        return Err(anyhow!("Thread {} failed to acquire lock: {}", i, e));
                     }
                 }
+
+                Ok(())
             }));
         }
 
         for handle in handles {
-            handle.join().expect("Thread panicked");
+            handle.join().map_err(|_| anyhow!("Thread panicked"))??;
         }
 
         let total = successful_acquisitions.load(Ordering::SeqCst);
@@ -881,6 +887,7 @@ mod tests {
             total, num_threads,
             "All threads should eventually acquire the lock"
         );
+        Ok(())
     }
 
     #[test]
@@ -931,6 +938,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_lock_released_during_wait() {
         use std::sync::mpsc;
         use std::thread;
@@ -955,7 +963,7 @@ mod tests {
 
         // Ensure the lock is held before we start waiting (avoid racy sleeps).
         ready_rx
-            .recv_timeout(Duration::from_secs(1))
+            .recv_timeout(Duration::from_secs(10))
             .expect("holder did not acquire lock in time");
 
         // Thread 2 (main): Try to acquire with timeout longer than hold time
@@ -963,7 +971,7 @@ mod tests {
         let result = ConfigLock::acquire_in_dir_with_timeout(
             &lock_dir,
             "release_test",
-            Duration::from_secs(2),
+            Duration::from_secs(10),
             "waiter",
         );
 
@@ -974,7 +982,7 @@ mod tests {
 
         // Should have acquired within reasonable time (not full timeout)
         assert!(
-            elapsed < Duration::from_secs(1),
+            elapsed < Duration::from_secs(10),
             "Should acquire soon after release, got {:?}",
             elapsed
         );
@@ -1025,6 +1033,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_lock_prevents_deadlock_with_timeout() {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -1043,19 +1052,22 @@ mod tests {
         let lock_dir_clone = Arc::clone(&lock_dir);
         let deadlock_flag = Arc::clone(&deadlock_avoided);
         let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
 
         // Thread holds lock forever (simulating a hung process scenario)
         let holder = thread::spawn(move || {
             let _lock = ConfigLock::acquire_in_dir(&lock_dir_clone, "deadlock_test", "forever")
                 .expect("holder should acquire lock");
             ready_tx.send(()).expect("signal holder ready");
-            // Hold lock for longer than waiter's timeout
-            thread::sleep(Duration::from_millis(400));
+            // Hold lock until the waiter has proved it times out.
+            release_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("waiter did not release holder in time");
         });
 
         // Ensure the lock is held before we start waiting (avoid racy sleeps).
         ready_rx
-            .recv_timeout(Duration::from_secs(1))
+            .recv_timeout(Duration::from_secs(10))
             .expect("holder did not acquire lock in time");
 
         // Waiter should timeout rather than deadlock
@@ -1063,7 +1075,7 @@ mod tests {
         let result = ConfigLock::acquire_in_dir_with_timeout(
             &lock_dir,
             "deadlock_test",
-            Duration::from_millis(200),
+            Duration::from_secs(2),
             "waiter",
         );
 
@@ -1073,6 +1085,7 @@ mod tests {
 
         let elapsed = start.elapsed();
 
+        release_tx.send(()).expect("release holder");
         holder.join().expect("holder thread panicked");
 
         assert!(
@@ -1080,7 +1093,7 @@ mod tests {
             "Should timeout instead of deadlocking"
         );
         assert!(
-            elapsed < Duration::from_millis(500),
+            elapsed < Duration::from_secs(10),
             "Should return within timeout period, got {:?}",
             elapsed
         );

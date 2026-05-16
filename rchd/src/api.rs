@@ -1140,7 +1140,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
         }
     }
 
-    if path.starts_with("/benchmark/trigger") {
+    if route_matches_exact_or_child(path, "/benchmark/trigger") {
         if method != "POST" {
             return Err(anyhow!("Only POST method supported for benchmark trigger"));
         }
@@ -1248,9 +1248,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
         return Ok(ApiRequest::SelfTestStatus);
     }
 
-    if path.starts_with("/self-test/history") {
-        let query = path.strip_prefix("/self-test/history").unwrap_or("");
-        let query = query.strip_prefix('?').unwrap_or("");
+    if let Some(query) = query_for_exact_route(path, "/self-test/history") {
         let mut limit = 10usize;
         for param in query.split('&') {
             if param.is_empty() {
@@ -1266,12 +1264,10 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
         return Ok(ApiRequest::SelfTestHistory { limit });
     }
 
-    if path.starts_with("/self-test/run") {
+    if let Some(query) = query_for_exact_route(path, "/self-test/run") {
         if method != "POST" {
             return Err(anyhow!("Only POST method supported for self-test run"));
         }
-        let query = path.strip_prefix("/self-test/run").unwrap_or("");
-        let query = query.strip_prefix('?').unwrap_or("");
 
         let mut worker_ids = Vec::new();
         let mut project = None;
@@ -1312,13 +1308,10 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
         }));
     }
 
-    if path.starts_with("/release-worker") {
+    if let Some(query) = query_for_exact_route(path, "/release-worker") {
         if method != "POST" {
             return Err(anyhow!("Only POST method supported for release"));
         }
-
-        let query = path.strip_prefix("/release-worker").unwrap_or("");
-        let query = query.strip_prefix('?').unwrap_or("");
 
         let mut worker_id = None;
         let mut slots = None;
@@ -1360,13 +1353,10 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
         }));
     }
 
-    if path.starts_with("/record-build") {
+    if let Some(query) = query_for_exact_route(path, "/record-build") {
         if method != "POST" {
             return Err(anyhow!("Only POST method supported for record-build"));
         }
-
-        let query = path.strip_prefix("/record-build").unwrap_or("");
-        let query = query.strip_prefix('?').unwrap_or("");
 
         let mut worker_id = None;
         let mut project = None;
@@ -1401,14 +1391,14 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
         });
     }
 
-    if path.starts_with("/build-heartbeat") {
+    if query_for_exact_route(path, "/build-heartbeat").is_some() {
         if method != "POST" {
             return Err(anyhow!("Only POST method supported for build heartbeat"));
         }
         return Ok(ApiRequest::BuildHeartbeat);
     }
 
-    if path.starts_with("/test-run") {
+    if query_for_exact_route(path, "/test-run").is_some() {
         if method != "POST" {
             return Err(anyhow!("Only POST method supported for test run"));
         }
@@ -1586,13 +1576,9 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
         }
     }
 
-    if !path.starts_with("/select-worker") {
+    let Some(query) = query_for_exact_route(path, "/select-worker") else {
         return Err(anyhow!("Unknown endpoint: {}", path));
-    }
-
-    // Parse query parameters for select-worker
-    let query = path.strip_prefix("/select-worker").unwrap_or("");
-    let query = query.strip_prefix('?').unwrap_or("");
+    };
 
     let mut project = None;
     let mut command = None;
@@ -1685,6 +1671,19 @@ fn parse_worker_id_list(encoded_value: &str) -> Vec<WorkerId> {
         .filter(|id| !id.is_empty())
         .map(WorkerId::new)
         .collect()
+}
+
+fn query_for_exact_route<'a>(path: &'a str, expected_path: &str) -> Option<&'a str> {
+    let (path_only, query) = split_path_query(path);
+    (path_only == expected_path).then_some(query)
+}
+
+fn route_matches_exact_or_child(path: &str, expected_path: &str) -> bool {
+    let (path_only, _) = split_path_query(path);
+    path_only == expected_path
+        || path_only
+            .strip_prefix(expected_path)
+            .is_some_and(|rest| rest.starts_with('/'))
 }
 
 fn parse_telemetry_source(value: &str) -> Option<TelemetrySource> {
@@ -3448,6 +3447,14 @@ mod tests {
             }
             _ => assert!(false, "expected benchmark trigger request"),
         }
+
+        let req = parse_request("POST /benchmark/trigger?worker=css").unwrap();
+        match req {
+            ApiRequest::BenchmarkTrigger { worker_id } => {
+                assert_eq!(worker_id.as_str(), "css");
+            }
+            _ => assert!(false, "expected benchmark trigger query request"),
+        }
     }
 
     #[test]
@@ -3594,6 +3601,28 @@ mod tests {
         let _guard = test_guard!();
         let result = parse_request("GET /unknown?project=test");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_request_rejects_route_prefix_typos() {
+        let _guard = test_guard!();
+        let cases = [
+            "POST /benchmark/trigger-extra?worker=css",
+            "GET /self-test/history-extra?limit=5",
+            "POST /self-test/run-extra?worker=css",
+            "POST /release-worker-extra?worker=css&slots=4",
+            "POST /record-build-extra?worker=css&project=myproject",
+            "POST /build-heartbeat-extra",
+            "POST /test-run-extra",
+            "GET /select-worker-extra?project=test",
+        ];
+
+        for request in cases {
+            assert!(
+                parse_request(request).is_err(),
+                "route typo should be rejected: {request}"
+            );
+        }
     }
 
     #[test]
