@@ -361,7 +361,7 @@ pub async fn diagnose(command: &str, dry_run: bool, ctx: &OutputContext) -> Resu
                 });
                 if let Some(worker) = response.worker.as_ref() {
                     debug!(
-                        "Worker selected id='{}' slots_available={} speed_score={:.2} reason={:?}",
+                        "Worker selected id='{}' slots_remaining_after_reservation={} speed_score={:.2} reason={:?}",
                         worker.id, worker.slots_available, worker.speed_score, response.reason
                     );
                 } else {
@@ -719,7 +719,7 @@ pub async fn diagnose(command: &str, dry_run: bool, ctx: &OutputContext) -> Resu
                 );
                 println!(
                     "  {} {}",
-                    style.key("Slots available:"),
+                    style.key("Slots remaining after reservation:"),
                     style.value(&worker.slots_available.to_string())
                 );
                 println!("  {} {:.1}", style.key("Speed score:"), worker.speed_score);
