@@ -15,8 +15,9 @@ use rch_common::{SshClient, SshOptions};
 use std::path::{Path, PathBuf};
 
 use crate::status_types::{
-    DaemonFullStatusResponse, SpeedScoreListResponseFromApi, WorkerCapabilitiesFromApi,
-    WorkerCapabilitiesResponseFromApi, extract_json_body,
+    DaemonFullStatusResponse, SpeedScoreListResponseFromApi, SpeedScoreResponseFromApi,
+    SpeedScoreViewFromApi, WorkerCapabilitiesFromApi, WorkerCapabilitiesResponseFromApi,
+    extract_json_body,
 };
 use crate::ui::context::OutputContext;
 use crate::ui::progress::MultiProgressManager;
@@ -990,26 +991,92 @@ fn format_probe_summary_line(
     )
 }
 
-/// Run worker benchmarks (not available on non-Unix platforms).
+/// Filtered worker benchmark (br-ifq7s): runs benchmarks against a
+/// single worker if `worker_id` is `Some`, otherwise against every
+/// configured worker. `force` is plumbed through for a future
+/// recency-check; today the underlying SSH-driven benchmark always
+/// runs regardless and `force` is informational (logged via
+/// `tracing::debug!`).
+///
+/// Non-Unix platform: unsupported (the SSH benchmark path is Unix-only).
 #[cfg(not(unix))]
-pub async fn workers_benchmark(_ctx: &OutputContext) -> Result<()> {
+pub async fn workers_benchmark_filtered(
+    _worker_id: Option<&str>,
+    _force: bool,
+    _ctx: &OutputContext,
+) -> Result<()> {
     Err(PlatformError::UnixOnly {
         feature: "worker benchmark".to_string(),
     })?
 }
 
-/// Run worker benchmarks.
+/// Filtered worker benchmark (br-ifq7s).
+///
+/// If `worker_id` is `Some`, only that worker is benchmarked; otherwise
+/// every configured worker is benchmarked sequentially. `force` is
+/// plumbed through for a future "skip if recently measured" gate; the
+/// underlying SSH benchmark always runs today regardless of the flag.
+///
+/// Errors: unknown `worker_id` returns a clear error listing every
+/// configured worker so an operator can spot a typo before any SSH
+/// round-trip.
 #[cfg(unix)]
-pub async fn workers_benchmark(ctx: &OutputContext) -> Result<()> {
-    let workers = load_workers_from_config()?;
+pub async fn workers_benchmark_filtered(
+    worker_id: Option<&str>,
+    force: bool,
+    ctx: &OutputContext,
+) -> Result<()> {
+    let all_workers = load_workers_from_config()?;
     let style = ctx.theme();
+
+    // Filter by worker_id when specified. The filter rejects unknown IDs
+    // up-front (before any SSH connect) so the operator sees a typo
+    // error in milliseconds instead of an inscrutable "0 results".
+    let workers: Vec<_> = if let Some(target) = worker_id {
+        let found: Vec<_> = all_workers
+            .iter()
+            .filter(|w| w.id.as_str() == target)
+            .cloned()
+            .collect();
+        if found.is_empty() {
+            let configured: Vec<String> = all_workers.iter().map(|w| w.id.to_string()).collect();
+            anyhow::bail!(
+                "unknown worker id: {target:?}; configured workers: {}",
+                if configured.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    configured.join(", ")
+                }
+            );
+        }
+        found
+    } else {
+        all_workers
+    };
+
+    tracing::info!(
+        target: "rch::workers::benchmark",
+        worker_filter = ?worker_id,
+        worker_count = workers.len(),
+        force,
+        "workers.benchmark.start",
+    );
+    if force {
+        // Reserved for a future recency-check; today the benchmark
+        // always runs, so --force is a no-op. We log so operators can
+        // see the flag was received.
+        tracing::debug!(
+            target: "rch::workers::benchmark",
+            "workers.benchmark.force=true (no-op today; reserved for future recency gate)",
+        );
+    }
 
     if workers.is_empty() {
         if ctx.is_json() {
-            let _ = ctx.json(&ApiResponse::<Vec<WorkerBenchmarkResult>>::ok(
+            ctx.json(&ApiResponse::<Vec<WorkerBenchmarkResult>>::ok(
                 "workers benchmark",
                 vec![],
-            ));
+            ))?;
         }
         return Ok(());
     }
@@ -1132,13 +1199,225 @@ pub async fn workers_benchmark(ctx: &OutputContext) -> Result<()> {
     }
 
     if ctx.is_json() {
-        let _ = ctx.json(&ApiResponse::ok("workers benchmark", results));
+        ctx.json(&ApiResponse::ok("workers benchmark", results))?;
     } else {
         println!(
             "\n{} For accurate speed scores, use longer benchmark runs.",
             StatusIndicator::Info.display(style)
         );
     }
+    Ok(())
+}
+
+/// `rch workers compare <id1> <id2> [id3..]` (br-ifq7s).
+///
+/// Fetches each named worker's latest SpeedScore from the daemon and
+/// renders a side-by-side comparison table. The leader in each metric
+/// row (SpeedScore, CPU, Memory, Disk, Network, Compile) is marked
+/// with `*` for ASCII-friendly highlighting. A one-line recommendation
+/// at the end names the worker with the highest overall SpeedScore.
+///
+/// Unknown worker IDs fail fast with a clear error. Workers without a
+/// recorded SpeedScore (never benchmarked, or expired) render dash
+/// cells but don't error, so the operator can see which of the named
+/// workers needs a benchmark run.
+pub async fn workers_compare(worker_ids: &[String], ctx: &OutputContext) -> Result<()> {
+    if worker_ids.len() < 2 {
+        anyhow::bail!(
+            "workers compare requires at least 2 worker IDs; got {}",
+            worker_ids.len()
+        );
+    }
+
+    // Validate every named worker exists in the local config BEFORE
+    // any daemon round-trip. Catches typos in the millisecond it takes
+    // to read workers.toml, not the seconds an SSH/daemon RPC would.
+    let all_workers = load_workers_from_config()?;
+    let known: std::collections::BTreeSet<&str> =
+        all_workers.iter().map(|w| w.id.as_str()).collect();
+    let unknown: Vec<&str> = worker_ids
+        .iter()
+        .map(String::as_str)
+        .filter(|id| !known.contains(id))
+        .collect();
+    if !unknown.is_empty() {
+        let configured: Vec<String> = all_workers.iter().map(|w| w.id.to_string()).collect();
+        anyhow::bail!(
+            "unknown worker id(s): {}; configured workers: {}",
+            unknown.join(", "),
+            if configured.is_empty() {
+                "(none)".to_string()
+            } else {
+                configured.join(", ")
+            }
+        );
+    }
+
+    // Fetch each worker's latest SpeedScore. Order in the response
+    // mirrors the operator's argument order so column 1 is the first
+    // ID they passed.
+    let mut entries: Vec<(String, Option<SpeedScoreViewFromApi>)> =
+        Vec::with_capacity(worker_ids.len());
+    for id in worker_ids {
+        let payload = format!("GET /speedscore/{}\n", id);
+        let response = send_daemon_command(&payload).await?;
+        let json = extract_json_body(&response).ok_or_else(|| {
+            anyhow::anyhow!("invalid response format from daemon for /speedscore/{id}")
+        })?;
+        let parsed: SpeedScoreResponseFromApi = serde_json::from_str(json)
+            .with_context(|| format!("failed to parse /speedscore/{id} response from daemon"))?;
+        entries.push((id.clone(), parsed.speedscore));
+    }
+
+    tracing::info!(
+        target: "rch::workers::compare",
+        worker_count = entries.len(),
+        recorded_count = entries.iter().filter(|(_, s)| s.is_some()).count(),
+        "workers.compare.fetched",
+    );
+
+    // Compute the leader for each metric row. Returns the index into
+    // `entries` of the highest score, or None if no worker has a
+    // recorded SpeedScore. Used by the renderer to mark leader cells.
+    fn finite_metric(
+        score: &SpeedScoreViewFromApi,
+        pick: fn(&SpeedScoreViewFromApi) -> f64,
+    ) -> Option<f64> {
+        let value = pick(score);
+        value.is_finite().then_some(value)
+    }
+
+    fn leader_for<F>(entries: &[(String, Option<SpeedScoreViewFromApi>)], pick: F) -> Option<usize>
+    where
+        F: Fn(&SpeedScoreViewFromApi) -> f64,
+    {
+        let mut best: Option<(usize, f64)> = None;
+        for (i, (_, sc)) in entries.iter().enumerate() {
+            if let Some(s) = sc {
+                let v = pick(s);
+                if !v.is_finite() {
+                    continue;
+                }
+                match best {
+                    None => best = Some((i, v)),
+                    Some((_, bv)) if v > bv => best = Some((i, v)),
+                    _ => {}
+                }
+            }
+        }
+        best.map(|(i, _)| i)
+    }
+
+    if ctx.is_json() {
+        let row = |label: &'static str, pick: fn(&SpeedScoreViewFromApi) -> f64| {
+            serde_json::json!({
+                "metric": label,
+                "leader_index": leader_for(&entries, pick),
+                "values": entries
+                    .iter()
+                    .map(|(_, s)| s.as_ref().and_then(|score| finite_metric(score, pick)))
+                    .collect::<Vec<_>>(),
+            })
+        };
+        ctx.json(&ApiResponse::ok(
+            "workers compare",
+            serde_json::json!({
+                "workers": entries.iter().map(|(id, _)| id).collect::<Vec<_>>(),
+                "rows": [
+                    row("speedscore", |s| s.total),
+                    row("cpu",         |s| s.cpu_score),
+                    row("memory",      |s| s.memory_score),
+                    row("disk",        |s| s.disk_score),
+                    row("network",     |s| s.network_score),
+                    row("compile",     |s| s.compilation_score),
+                ],
+                "recommendation_leader_index": leader_for(&entries, |s| s.total),
+            }),
+        ))?;
+        return Ok(());
+    }
+
+    // Human-readable side-by-side table. Plain text (no fancy box
+    // drawing) so it pastes cleanly into Slack / wiki / pager view.
+    let style = ctx.theme();
+    let col_width = entries
+        .iter()
+        .map(|(id, _)| id.len())
+        .max()
+        .unwrap_or(8)
+        .max(8);
+
+    print!("  {:<12}", "Metric");
+    for (id, _) in &entries {
+        print!("  {:>width$}", id, width = col_width);
+    }
+    println!();
+    print!("  {:-<12}", "");
+    for _ in &entries {
+        print!("  {:->width$}", "", width = col_width);
+    }
+    println!();
+
+    let row = |label: &str, pick: fn(&SpeedScoreViewFromApi) -> f64| {
+        let leader = leader_for(&entries, pick);
+        print!("  {:<12}", label);
+        for (i, (_, sc)) in entries.iter().enumerate() {
+            let cell = match sc {
+                Some(s) => match finite_metric(s, pick) {
+                    Some(val) => {
+                        if Some(i) == leader {
+                            format!("*{val:>w$.1}", w = col_width - 1)
+                        } else {
+                            format!("{val:>w$.1}", w = col_width)
+                        }
+                    }
+                    None => format!("{:>w$}", "-", w = col_width),
+                },
+                None => format!("{:>w$}", "-", w = col_width),
+            };
+            print!("  {cell}");
+        }
+        println!();
+    };
+
+    row("SpeedScore", |s| s.total);
+    row("CPU", |s| s.cpu_score);
+    row("Memory", |s| s.memory_score);
+    row("Disk", |s| s.disk_score);
+    row("Network", |s| s.network_score);
+    row("Compile", |s| s.compilation_score);
+
+    println!();
+    match leader_for(&entries, |s| s.total) {
+        Some(idx) => {
+            if let Some((id, Some(score))) = entries.get(idx) {
+                println!(
+                    "{} {} leads with SpeedScore {:.1}",
+                    style.format_success("Recommendation:"),
+                    style.highlight(id),
+                    score.total
+                );
+            } else {
+                println!(
+                    "{}",
+                    style.format_warning(
+                        "No recorded SpeedScore for any named worker; \
+                         run `rch workers benchmark` first."
+                    )
+                );
+            }
+        }
+        None => {
+            println!(
+                "{}",
+                style.format_warning(
+                    "No recorded SpeedScore for any named worker; \
+                     run `rch workers benchmark` first."
+                )
+            );
+        }
+    }
+
     Ok(())
 }
 

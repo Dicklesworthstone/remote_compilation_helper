@@ -996,8 +996,47 @@ enum WorkersAction {
         #[arg(short = 'a', long)]
         all: bool,
     },
-    /// Run speed benchmarks
-    Benchmark,
+    /// Run speed benchmarks against one or more workers (br-ifq7s)
+    #[command(after_help = r#"EXAMPLES:
+    rch workers benchmark             # Benchmark every configured worker
+    rch workers benchmark css         # Benchmark one specific worker
+    rch workers benchmark --all       # Equivalent to no worker id (explicit form)
+    rch workers benchmark css --force # Re-run even if recently benchmarked"#)]
+    Benchmark {
+        /// Worker ID to benchmark. Omit (or use --all) to benchmark every
+        /// configured worker.
+        #[arg(value_name = "WORKER_ID", conflicts_with = "all")]
+        worker_id: Option<String>,
+
+        /// Benchmark every configured worker. Equivalent to omitting the
+        /// worker-id positional, but explicit for scripted invocations.
+        #[arg(long, conflicts_with = "worker_id")]
+        all: bool,
+
+        /// Re-run the benchmark even if the worker was benchmarked
+        /// recently (the recency check is informational today; the
+        /// flag is plumbed through so a future bead can wire it to a
+        /// "skip if measured within N minutes" gate without a CLI break).
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Side-by-side comparison of SpeedScore data across workers (br-ifq7s)
+    ///
+    /// Fetches the latest stored SpeedScore for each named worker from the
+    /// daemon and renders a leader-highlighted table. Workers without a
+    /// recorded SpeedScore are shown with dash cells. A one-line
+    /// recommendation names the best overall worker.
+    #[command(after_help = r#"EXAMPLES:
+    rch workers compare css dlx          # Compare two workers
+    rch workers compare css dlx vmi1     # Compare three+
+    rch workers compare css dlx --json   # Machine-readable response"#)]
+    Compare {
+        /// Worker IDs to compare. Order is preserved in the rendered
+        /// columns. At least 2 IDs required; clap enforces via num_args.
+        #[arg(value_name = "WORKER_ID", num_args = 2..)]
+        worker_ids: Vec<String>,
+    },
 
     /// Drain a worker (stop accepting new jobs, finish current ones)
     ///
@@ -1147,7 +1186,8 @@ impl WorkersAction {
             WorkersAction::List { .. } => "list",
             WorkersAction::Capabilities { .. } => "capabilities",
             WorkersAction::Probe { .. } => "probe",
-            WorkersAction::Benchmark => "benchmark",
+            WorkersAction::Benchmark { .. } => "benchmark",
+            WorkersAction::Compare { .. } => "compare",
             WorkersAction::Drain { .. } => "drain",
             WorkersAction::Enable { .. } => "enable",
             WorkersAction::Disable { .. } => "disable",
@@ -2809,8 +2849,20 @@ async fn handle_workers(action: WorkersAction, ctx: &OutputContext) -> Result<()
         WorkersAction::Probe { worker, all } => {
             commands::workers_probe(worker, all, ctx).await?;
         }
-        WorkersAction::Benchmark => {
-            commands::workers_benchmark(ctx).await?;
+        WorkersAction::Benchmark {
+            worker_id,
+            all: _,
+            force,
+        } => {
+            // `--all` is the explicit form of "no worker_id"; both
+            // resolve to None here and the command runs against every
+            // configured worker. `--force` is plumbed through for a
+            // future recency-check; the underlying benchmark function
+            // always runs today regardless.
+            commands::workers_benchmark_filtered(worker_id.as_deref(), force, ctx).await?;
+        }
+        WorkersAction::Compare { worker_ids } => {
+            commands::workers_compare(&worker_ids, ctx).await?;
         }
         WorkersAction::Drain { worker, yes } => {
             commands::workers_drain(&worker, yes, ctx).await?;
@@ -4258,10 +4310,123 @@ mod tests {
         let cli = Cli::try_parse_from(["rch", "workers", "benchmark"]).unwrap();
         match cli.command {
             Some(Commands::Workers {
-                action: WorkersAction::Benchmark,
-            }) => {}
+                action:
+                    WorkersAction::Benchmark {
+                        worker_id,
+                        all,
+                        force,
+                    },
+            }) => {
+                assert!(worker_id.is_none(), "default has no worker_id");
+                assert!(!all, "default has no --all");
+                assert!(!force, "default has no --force");
+            }
             _ => fail_expected("Expected workers benchmark command"),
         }
+    }
+
+    #[test]
+    fn cli_parses_workers_benchmark_with_worker_id() {
+        let _guard = test_guard!();
+        let cli = Cli::try_parse_from(["rch", "workers", "benchmark", "css"]).unwrap();
+        match cli.command {
+            Some(Commands::Workers {
+                action:
+                    WorkersAction::Benchmark {
+                        worker_id,
+                        all: _,
+                        force: _,
+                    },
+            }) => assert_eq!(worker_id, Some("css".to_string())),
+            _ => fail_expected("Expected workers benchmark with worker id"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_workers_benchmark_force() {
+        let _guard = test_guard!();
+        let cli = Cli::try_parse_from(["rch", "workers", "benchmark", "css", "--force"]).unwrap();
+        match cli.command {
+            Some(Commands::Workers {
+                action:
+                    WorkersAction::Benchmark {
+                        worker_id,
+                        all: _,
+                        force,
+                    },
+            }) => {
+                assert_eq!(worker_id, Some("css".to_string()));
+                assert!(force);
+            }
+            _ => fail_expected("Expected workers benchmark --force"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_workers_benchmark_all_flag() {
+        let _guard = test_guard!();
+        let cli = Cli::try_parse_from(["rch", "workers", "benchmark", "--all"]).unwrap();
+        match cli.command {
+            Some(Commands::Workers {
+                action:
+                    WorkersAction::Benchmark {
+                        worker_id,
+                        all,
+                        force: _,
+                    },
+            }) => {
+                assert!(worker_id.is_none());
+                assert!(all);
+            }
+            _ => fail_expected("Expected workers benchmark --all"),
+        }
+    }
+
+    #[test]
+    fn cli_rejects_workers_benchmark_worker_id_and_all() {
+        let _guard = test_guard!();
+        let result = Cli::try_parse_from(["rch", "workers", "benchmark", "css", "--all"]);
+        assert!(
+            result.is_err(),
+            "worker_id and --all are mutually exclusive"
+        );
+    }
+
+    #[test]
+    fn cli_parses_workers_compare() {
+        let _guard = test_guard!();
+        let cli = Cli::try_parse_from(["rch", "workers", "compare", "css", "dlx"]).unwrap();
+        match cli.command {
+            Some(Commands::Workers {
+                action: WorkersAction::Compare { worker_ids },
+            }) => assert_eq!(worker_ids, vec!["css".to_string(), "dlx".to_string()]),
+            _ => fail_expected("Expected workers compare command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_workers_compare_three_workers() {
+        let _guard = test_guard!();
+        let cli = Cli::try_parse_from(["rch", "workers", "compare", "css", "dlx", "vmi1"]).unwrap();
+        match cli.command {
+            Some(Commands::Workers {
+                action: WorkersAction::Compare { worker_ids },
+            }) => assert_eq!(
+                worker_ids,
+                vec!["css".to_string(), "dlx".to_string(), "vmi1".to_string()]
+            ),
+            _ => fail_expected("Expected workers compare with 3 workers"),
+        }
+    }
+
+    #[test]
+    fn cli_rejects_workers_compare_with_one_worker() {
+        let _guard = test_guard!();
+        let result = Cli::try_parse_from(["rch", "workers", "compare", "css"]);
+        assert!(
+            result.is_err(),
+            "compare requires at least 2 worker ids (num_args = 2..)"
+        );
     }
 
     #[test]

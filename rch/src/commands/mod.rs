@@ -41,8 +41,8 @@ pub use queue::{cancel_build, queue_status};
 
 // Re-export workers commands for backward compatibility
 pub use workers::{
-    workers_benchmark, workers_capabilities, workers_disable, workers_drain, workers_enable,
-    workers_list, workers_probe,
+    workers_benchmark_filtered, workers_capabilities, workers_compare, workers_disable,
+    workers_drain, workers_enable, workers_list, workers_probe,
 };
 
 // Re-export agents commands for backward compatibility
