@@ -592,6 +592,7 @@ struct PartialGeneralConfig {
 struct PartialCompilationConfig {
     confidence_threshold: Option<f64>,
     min_local_time_ms: Option<u64>,
+    remote_speedup_threshold: Option<f64>,
     build_slots: Option<u32>,
     test_slots: Option<u32>,
     check_slots: Option<u32>,
@@ -832,6 +833,13 @@ pub fn validate_rch_config_file(path: &Path) -> FileValidation {
         || config.compilation.confidence_threshold > 1.0
     {
         validation.error("compilation.confidence_threshold must be within [0.0, 1.0]".to_string());
+    }
+    if !config.compilation.remote_speedup_threshold.is_finite()
+        || config.compilation.remote_speedup_threshold <= 0.0
+    {
+        validation.error(
+            "compilation.remote_speedup_threshold must be a positive finite number".to_string(),
+        );
     }
     if config.compilation.build_slots == 0 {
         validation.error("compilation.build_slots must be greater than 0".to_string());
@@ -1166,6 +1174,7 @@ fn default_sources_map() -> ConfigSourceMap {
         "general.socket_path",
         "compilation.confidence_threshold",
         "compilation.min_local_time_ms",
+        "compilation.remote_speedup_threshold",
         "compilation.build_slots",
         "compilation.test_slots",
         "compilation.check_slots",
@@ -1237,6 +1246,14 @@ fn apply_layer(
     if let Some(min_local) = layer.compilation.min_local_time_ms {
         config.compilation.min_local_time_ms = min_local;
         set_source(sources, "compilation.min_local_time_ms", source.clone());
+    }
+    if let Some(speedup_threshold) = layer.compilation.remote_speedup_threshold {
+        config.compilation.remote_speedup_threshold = speedup_threshold;
+        set_source(
+            sources,
+            "compilation.remote_speedup_threshold",
+            source.clone(),
+        );
     }
     if let Some(build_slots) = layer.compilation.build_slots {
         config.compilation.build_slots = build_slots;
@@ -1588,6 +1605,9 @@ fn merge_compilation(
     if overlay.min_local_time_ms != default.min_local_time_ms {
         base.min_local_time_ms = overlay.min_local_time_ms;
     }
+    if (overlay.remote_speedup_threshold - default.remote_speedup_threshold).abs() > EPSILON {
+        base.remote_speedup_threshold = overlay.remote_speedup_threshold;
+    }
     if overlay.build_slots != default.build_slots {
         base.build_slots = overlay.build_slots;
     }
@@ -1875,7 +1895,8 @@ fn apply_env_overrides_inner(
     }
 
     if let Some(val) = get_env("RCH_CONFIDENCE_THRESHOLD")
-        && let Ok(threshold) = val.parse()
+        && let Ok(threshold) = val.parse::<f64>()
+        && (0.0..=1.0).contains(&threshold)
     {
         config.compilation.confidence_threshold = threshold;
         if let Some(ref mut sources) = sources {
@@ -1883,6 +1904,32 @@ fn apply_env_overrides_inner(
                 sources,
                 "compilation.confidence_threshold",
                 ConfigValueSource::EnvVar("RCH_CONFIDENCE_THRESHOLD".to_string()),
+            );
+        }
+    }
+    if let Some(val) = get_env("RCH_MIN_LOCAL_TIME_MS")
+        && let Ok(min_local_time_ms) = val.parse()
+    {
+        config.compilation.min_local_time_ms = min_local_time_ms;
+        if let Some(ref mut sources) = sources {
+            set_source(
+                sources,
+                "compilation.min_local_time_ms",
+                ConfigValueSource::EnvVar("RCH_MIN_LOCAL_TIME_MS".to_string()),
+            );
+        }
+    }
+    if let Some(val) = get_env("RCH_REMOTE_SPEEDUP_THRESHOLD")
+        && let Ok(threshold) = val.parse::<f64>()
+        && threshold.is_finite()
+        && threshold > 0.0
+    {
+        config.compilation.remote_speedup_threshold = threshold;
+        if let Some(ref mut sources) = sources {
+            set_source(
+                sources,
+                "compilation.remote_speedup_threshold",
+                ConfigValueSource::EnvVar("RCH_REMOTE_SPEEDUP_THRESHOLD".to_string()),
             );
         }
     }
@@ -3483,6 +3530,38 @@ canonical_root = "/from/toml"
     }
 
     #[test]
+    fn test_remote_speedup_threshold_loaded_from_toml_with_source() {
+        let _guard = test_guard!();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let user_path = dir.path().join("user.toml");
+        std::fs::write(
+            &user_path,
+            r#"
+[compilation]
+remote_speedup_threshold = 1.75
+"#,
+        )
+        .expect("write user config");
+
+        let loaded = load_config_with_sources_from_paths(Some(&user_path), None, None)
+            .expect("load_config_with_sources_from_paths");
+
+        assert!(
+            (loaded.config.compilation.remote_speedup_threshold - 1.75).abs() < 0.0001,
+            "TOML remote_speedup_threshold should land in effective config"
+        );
+        let source = loaded
+            .sources
+            .get("compilation.remote_speedup_threshold")
+            .expect("source tracked");
+        assert!(
+            matches!(source, ConfigValueSource::UserConfig(_)),
+            "expected UserConfig, got {:?}",
+            source
+        );
+    }
+
+    #[test]
     fn test_apply_env_overrides_enabled_false() {
         let _guard = test_guard!();
         info!("TEST: test_apply_env_overrides_enabled_false");
@@ -3994,6 +4073,65 @@ extra_field = 123
             &ConfigValueSource::EnvVar("RCH_COMPRESSION_LEVEL".to_string())
         );
         info!("PASS: RCH_COMPRESSION_LEVEL override applied");
+    }
+
+    #[test]
+    fn test_apply_env_overrides_min_local_and_remote_speedup() {
+        let _guard = test_guard!();
+        let mut config = RchConfig::default();
+        let mut sources = default_sources_map();
+        let mut env_overrides: HashMap<String, String> = HashMap::new();
+        env_overrides.insert("RCH_MIN_LOCAL_TIME_MS".to_string(), "9000".to_string());
+        env_overrides.insert(
+            "RCH_REMOTE_SPEEDUP_THRESHOLD".to_string(),
+            "1.8".to_string(),
+        );
+
+        apply_env_overrides_inner(&mut config, Some(&mut sources), Some(&env_overrides));
+
+        assert_eq!(config.compilation.min_local_time_ms, 9000);
+        assert!((config.compilation.remote_speedup_threshold - 1.8).abs() < 0.0001);
+        assert_eq!(
+            sources
+                .get("compilation.min_local_time_ms")
+                .expect("min local source present"),
+            &ConfigValueSource::EnvVar("RCH_MIN_LOCAL_TIME_MS".to_string())
+        );
+        assert_eq!(
+            sources
+                .get("compilation.remote_speedup_threshold")
+                .expect("remote speedup source present"),
+            &ConfigValueSource::EnvVar("RCH_REMOTE_SPEEDUP_THRESHOLD".to_string())
+        );
+    }
+
+    #[test]
+    fn test_apply_env_overrides_rejects_invalid_float_thresholds() {
+        let _guard = test_guard!();
+        let mut config = RchConfig::default();
+        let default_confidence = config.compilation.confidence_threshold;
+        let default_speedup = config.compilation.remote_speedup_threshold;
+        let mut sources = default_sources_map();
+        let mut env_overrides: HashMap<String, String> = HashMap::new();
+        env_overrides.insert("RCH_CONFIDENCE_THRESHOLD".to_string(), "NaN".to_string());
+        env_overrides.insert("RCH_REMOTE_SPEEDUP_THRESHOLD".to_string(), "0".to_string());
+
+        apply_env_overrides_inner(&mut config, Some(&mut sources), Some(&env_overrides));
+
+        assert_eq!(config.compilation.confidence_threshold, default_confidence);
+        assert_eq!(config.compilation.remote_speedup_threshold, default_speedup);
+        assert_eq!(
+            sources
+                .get("compilation.confidence_threshold")
+                .expect("confidence source present"),
+            &ConfigValueSource::Default
+        );
+        assert_eq!(
+            sources
+                .get("compilation.remote_speedup_threshold")
+                .expect("remote speedup source present"),
+            &ConfigValueSource::Default
+        );
     }
 
     #[test]

@@ -18,7 +18,7 @@ use super::types::{
     ConfigValueSourceInfo, LintIssue, LintSeverity,
 };
 
-const SUPPORTED_CONFIG_KEYS: &str = "general.enabled, general.force_local, general.force_remote, general.log_level, general.socket_path, compilation.confidence_threshold, compilation.min_local_time_ms, compilation.build_slots, compilation.test_slots, compilation.check_slots, compilation.build_timeout_sec, compilation.test_timeout_sec, compilation.bun_timeout_sec, compilation.external_timeout_enabled, transfer.compression_level, transfer.exclude_patterns, environment.allowlist, output.visibility, output.first_run_complete";
+const SUPPORTED_CONFIG_KEYS: &str = "general.enabled, general.force_local, general.force_remote, general.log_level, general.socket_path, compilation.confidence_threshold, compilation.min_local_time_ms, compilation.remote_speedup_threshold, compilation.build_slots, compilation.test_slots, compilation.check_slots, compilation.build_timeout_sec, compilation.test_timeout_sec, compilation.bun_timeout_sec, compilation.external_timeout_enabled, transfer.compression_level, transfer.exclude_patterns, environment.allowlist, output.visibility, output.first_run_complete";
 
 fn print_file_validation(
     label: &str,
@@ -122,6 +122,7 @@ pub fn config_show(show_sources: bool, ctx: &OutputContext) -> Result<()> {
             compilation: ConfigCompilationSection {
                 confidence_threshold: config.compilation.confidence_threshold,
                 min_local_time_ms: config.compilation.min_local_time_ms,
+                remote_speedup_threshold: config.compilation.remote_speedup_threshold,
                 build_slots: config.compilation.build_slots,
                 test_slots: config.compilation.test_slots,
                 check_slots: config.compilation.check_slots,
@@ -252,6 +253,15 @@ pub fn config_show(show_sources: bool, ctx: &OutputContext) -> Result<()> {
         format_with_source(
             "compilation.min_local_time_ms",
             &style.value(&config.compilation.min_local_time_ms.to_string()),
+            &value_sources
+        )
+    );
+    println!(
+        "  {} = {}",
+        style.key("remote_speedup_threshold"),
+        format_with_source(
+            "compilation.remote_speedup_threshold",
+            &style.value(&config.compilation.remote_speedup_threshold.to_string()),
             &value_sources
         )
     );
@@ -647,6 +657,12 @@ pub(super) fn collect_value_sources(
     );
     push_value_source(
         &mut values,
+        "compilation.remote_speedup_threshold",
+        config.compilation.remote_speedup_threshold.to_string(),
+        sources,
+    );
+    push_value_source(
+        &mut values,
         "compilation.build_slots",
         config.compilation.build_slots.to_string(),
         sources,
@@ -1020,6 +1036,18 @@ fn config_set_at(config_path: &Path, key: &str, value: &str, ctx: &OutputContext
         "compilation.min_local_time_ms" => {
             config.compilation.min_local_time_ms = parse_u64(value, key)?;
         }
+        "compilation.remote_speedup_threshold" => {
+            let threshold = parse_f64(value, key)?;
+            if !threshold.is_finite() || threshold <= 0.0 {
+                return Err(ConfigError::InvalidValue {
+                    field: "compilation.remote_speedup_threshold".to_string(),
+                    reason: format!("value {} is not a positive finite number", threshold),
+                    suggestion: "Use a positive speedup ratio such as 1.0 or 1.2".to_string(),
+                }
+                .into());
+            }
+            config.compilation.remote_speedup_threshold = threshold;
+        }
         "compilation.build_slots" => {
             config.compilation.build_slots = parse_u32(value, key)?;
         }
@@ -1158,6 +1186,11 @@ fn config_reset_at(config_path: &Path, key: &str, ctx: &OutputContext) -> Result
             config.compilation.min_local_time_ms = defaults.compilation.min_local_time_ms;
             config.compilation.min_local_time_ms.to_string()
         }
+        "compilation.remote_speedup_threshold" => {
+            config.compilation.remote_speedup_threshold =
+                defaults.compilation.remote_speedup_threshold;
+            config.compilation.remote_speedup_threshold.to_string()
+        }
         "compilation.build_slots" => {
             config.compilation.build_slots = defaults.compilation.build_slots;
             config.compilation.build_slots.to_string()
@@ -1259,10 +1292,7 @@ pub fn config_export(format: &str, ctx: &OutputContext) -> Result<()> {
             println!("export RCH_ENABLED={}", config.general.enabled);
             println!("export RCH_LOG_LEVEL=\"{}\"", config.general.log_level);
             println!("export RCH_VISIBILITY=\"{}\"", config.output.visibility);
-            println!(
-                "export RCH_DAEMON_SOCKET=\"{}\"",
-                config.general.socket_path
-            );
+            println!("export RCH_SOCKET_PATH=\"{}\"", config.general.socket_path);
             println!(
                 "export RCH_CONFIDENCE_THRESHOLD={}",
                 config.compilation.confidence_threshold
@@ -1270,6 +1300,10 @@ pub fn config_export(format: &str, ctx: &OutputContext) -> Result<()> {
             println!(
                 "export RCH_MIN_LOCAL_TIME_MS={}",
                 config.compilation.min_local_time_ms
+            );
+            println!(
+                "export RCH_REMOTE_SPEEDUP_THRESHOLD={}",
+                config.compilation.remote_speedup_threshold
             );
             println!(
                 "export RCH_BUILD_TIMEOUT_SEC={}",
@@ -1288,7 +1322,7 @@ pub fn config_export(format: &str, ctx: &OutputContext) -> Result<()> {
                 config.compilation.external_timeout_enabled
             );
             println!(
-                "export RCH_TRANSFER_ZSTD_LEVEL={}",
+                "export RCH_COMPRESSION_LEVEL={}",
                 config.transfer.compression_level
             );
             println!(
@@ -1304,7 +1338,7 @@ pub fn config_export(format: &str, ctx: &OutputContext) -> Result<()> {
             println!("RCH_ENABLED={}", config.general.enabled);
             println!("RCH_LOG_LEVEL={}", config.general.log_level);
             println!("RCH_VISIBILITY={}", config.output.visibility);
-            println!("RCH_DAEMON_SOCKET={}", config.general.socket_path);
+            println!("RCH_SOCKET_PATH={}", config.general.socket_path);
             println!(
                 "RCH_CONFIDENCE_THRESHOLD={}",
                 config.compilation.confidence_threshold
@@ -1312,6 +1346,10 @@ pub fn config_export(format: &str, ctx: &OutputContext) -> Result<()> {
             println!(
                 "RCH_MIN_LOCAL_TIME_MS={}",
                 config.compilation.min_local_time_ms
+            );
+            println!(
+                "RCH_REMOTE_SPEEDUP_THRESHOLD={}",
+                config.compilation.remote_speedup_threshold
             );
             println!(
                 "RCH_BUILD_TIMEOUT_SEC={}",
@@ -1327,7 +1365,7 @@ pub fn config_export(format: &str, ctx: &OutputContext) -> Result<()> {
                 config.compilation.external_timeout_enabled
             );
             println!(
-                "RCH_TRANSFER_ZSTD_LEVEL={}",
+                "RCH_COMPRESSION_LEVEL={}",
                 config.transfer.compression_level
             );
             println!(
@@ -1351,6 +1389,7 @@ pub fn config_export(format: &str, ctx: &OutputContext) -> Result<()> {
                     "compilation": {
                         "confidence_threshold": config.compilation.confidence_threshold,
                         "min_local_time_ms": config.compilation.min_local_time_ms,
+                        "remote_speedup_threshold": config.compilation.remote_speedup_threshold,
                         "build_slots": config.compilation.build_slots,
                         "test_slots": config.compilation.test_slots,
                         "check_slots": config.compilation.check_slots,
@@ -1779,6 +1818,12 @@ pub fn config_diff(ctx: &OutputContext) -> Result<()> {
         "compilation.min_local_time_ms"
     );
     diff_field!(
+        "compilation.remote_speedup_threshold",
+        config.compilation.remote_speedup_threshold,
+        defaults.compilation.remote_speedup_threshold,
+        "compilation.remote_speedup_threshold"
+    );
+    diff_field!(
         "compilation.build_slots",
         config.compilation.build_slots,
         defaults.compilation.build_slots,
@@ -2099,6 +2144,13 @@ mod tests {
     use super::*;
     use rch_common::test_guard;
 
+    fn plain_context() -> OutputContext {
+        OutputContext::new(crate::ui::context::OutputConfig {
+            force_mode: Some(crate::ui::context::OutputMode::Plain),
+            ..Default::default()
+        })
+    }
+
     // -------------------------------------------------------------------------
     // parse_bool Tests
     // -------------------------------------------------------------------------
@@ -2283,5 +2335,73 @@ mod tests {
         let _guard = test_guard!();
         let result = parse_string_list("  a  ,  b  ", "test_key").unwrap();
         assert_eq!(result, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn collect_value_sources_includes_remote_speedup_threshold() {
+        let _guard = test_guard!();
+        let mut config = RchConfig::default();
+        config.compilation.remote_speedup_threshold = 1.75;
+        let mut sources = config::ConfigSourceMap::new();
+        sources.insert(
+            "compilation.remote_speedup_threshold".to_string(),
+            ConfigValueSource::EnvVar("RCH_REMOTE_SPEEDUP_THRESHOLD".to_string()),
+        );
+
+        let values = collect_value_sources(&config, &sources);
+        let entry = values
+            .iter()
+            .find(|value| value.key == "compilation.remote_speedup_threshold")
+            .expect("remote speedup threshold is exposed");
+
+        assert_eq!(entry.value, "1.75");
+        assert_eq!(entry.source, "env:RCH_REMOTE_SPEEDUP_THRESHOLD");
+    }
+
+    #[test]
+    fn config_set_and_reset_remote_speedup_threshold() {
+        let _guard = test_guard!();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        let ctx = plain_context();
+
+        config_set_at(
+            &config_path,
+            "compilation.remote_speedup_threshold",
+            "2.25",
+            &ctx,
+        )
+        .expect("set remote speedup threshold");
+        let contents = std::fs::read_to_string(&config_path).expect("read config");
+        let config: RchConfig = toml::from_str(&contents).expect("parse config");
+        assert!((config.compilation.remote_speedup_threshold - 2.25).abs() < 0.0001);
+
+        config_reset_at(&config_path, "compilation.remote_speedup_threshold", &ctx)
+            .expect("reset remote speedup threshold");
+        let contents = std::fs::read_to_string(&config_path).expect("read config");
+        let config: RchConfig = toml::from_str(&contents).expect("parse config");
+        assert!(
+            (config.compilation.remote_speedup_threshold
+                - RchConfig::default().compilation.remote_speedup_threshold)
+                .abs()
+                < 0.0001
+        );
+    }
+
+    #[test]
+    fn config_set_rejects_invalid_remote_speedup_threshold() {
+        let _guard = test_guard!();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        let ctx = plain_context();
+
+        let result = config_set_at(
+            &config_path,
+            "compilation.remote_speedup_threshold",
+            "NaN",
+            &ctx,
+        );
+
+        assert!(result.is_err());
     }
 }

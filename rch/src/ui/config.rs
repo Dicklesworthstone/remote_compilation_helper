@@ -105,6 +105,13 @@ impl<'a> ConfigDisplay<'a> {
             &self.config.compilation.min_local_time_ms.to_string(),
             "compilation.min_local_time_ms",
         );
+        self.push_config_line(
+            &mut lines,
+            "  ",
+            "remote_speedup_threshold",
+            &self.config.compilation.remote_speedup_threshold.to_string(),
+            "compilation.remote_speedup_threshold",
+        );
 
         // Transfer section
         lines.push(format!("{} [transfer]", Icons::tree_branch(self.context)));
@@ -307,6 +314,12 @@ impl<'a> ConfigDisplay<'a> {
             &self.config.compilation.min_local_time_ms.to_string(),
             "compilation.min_local_time_ms",
         );
+        self.print_plain_value(
+            console,
+            "remote_speedup_threshold",
+            &self.config.compilation.remote_speedup_threshold.to_string(),
+            "compilation.remote_speedup_threshold",
+        );
 
         // Transfer section
         console.print_plain("");
@@ -435,6 +448,7 @@ mod tests {
             compilation: ConfigCompilationSection {
                 confidence_threshold: 0.8,
                 min_local_time_ms: 1000,
+                remote_speedup_threshold: 1.2,
                 build_slots: 4,
                 test_slots: 8,
                 check_slots: 2,

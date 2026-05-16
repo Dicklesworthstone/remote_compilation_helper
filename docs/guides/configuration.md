@@ -174,25 +174,27 @@ These are read by the hook configuration loader:
 - `RCH_LOG_LEVEL`
 - `RCH_SOCKET_PATH`
 - `RCH_CONFIDENCE_THRESHOLD`
-- `RCH_COMPRESSION`
+- `RCH_MIN_LOCAL_TIME_MS`
+- `RCH_REMOTE_SPEEDUP_THRESHOLD`
+- `RCH_COMPRESSION_LEVEL`
+- `RCH_COMPRESSION` (legacy alias for `RCH_COMPRESSION_LEVEL`)
 - `RCH_CANONICAL_PROJECT_ROOT`
 - `RCH_ALIAS_PROJECT_ROOT`
 
-Note: `rch config export` currently outputs `RCH_DAEMON_SOCKET` and
-`RCH_TRANSFER_ZSTD_LEVEL`; the hook loader reads `RCH_SOCKET_PATH` and
-`RCH_COMPRESSION`. When in doubt, use `rch config show --sources`.
+`rch config export` emits the loader-consumed names above so exported shell or
+`.env` output can be sourced directly. Use `rch config show --sources` to verify
+which layer supplied each value.
 
 ### CLI/daemon options (documented in `rch --help` / validators)
 
 - `RCH_PROFILE`
 - `RCH_LOG_FORMAT`
-- `RCH_DAEMON_SOCKET`
+- `RCH_DAEMON_SOCKET` (daemon-specific aliases and older wrappers)
 - `RCH_DAEMON_TIMEOUT_MS`
 - `RCH_SSH_KEY`
-- `RCH_TRANSFER_ZSTD_LEVEL`
+- `RCH_TRANSFER_ZSTD_LEVEL` (older wrapper name; prefer `RCH_COMPRESSION_LEVEL`)
 - `RCH_ENABLE_METRICS`
 - `RCH_TEST_MODE`
-- `RCH_MIN_LOCAL_TIME_MS`
 - `RCH_WORKER` (preferred worker override)
 - `RCH_WORKERS` (comma-separated preferred worker override list)
 

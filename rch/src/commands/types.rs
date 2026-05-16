@@ -243,6 +243,7 @@ pub struct ConfigGeneralSection {
 pub struct ConfigCompilationSection {
     pub confidence_threshold: f64,
     pub min_local_time_ms: u64,
+    pub remote_speedup_threshold: f64,
     pub build_slots: u32,
     pub test_slots: u32,
     pub check_slots: u32,

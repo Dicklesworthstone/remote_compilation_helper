@@ -75,13 +75,15 @@ ENVIRONMENT VARIABLES:
     RCH_PROFILE           Profile to use: dev, prod, test (sets defaults below)
     RCH_LOG_LEVEL         Logging level: trace, debug, info, warn, error, off
     RCH_LOG_FORMAT        Log format: pretty, json, compact
-    RCH_DAEMON_SOCKET     Path to daemon Unix socket
+    RCH_SOCKET_PATH       Path to daemon Unix socket
     RCH_DAEMON_TIMEOUT_MS Timeout for daemon communication (default: 5000)
     RCH_SSH_KEY           Path to SSH private key for worker connections
     RCH_SSH_SERVER_ALIVE_INTERVAL_SECS  SSH keepalive interval (ServerAliveInterval)
     RCH_SSH_CONTROL_PERSIST_SECS        SSH ControlPersist idle seconds (0 disables persistence)
-    RCH_TRANSFER_ZSTD_LEVEL  Compression level 1-22 (default: 3)
+    RCH_COMPRESSION_LEVEL Compression level 1-22 (default: 3)
     RCH_ENV_ALLOWLIST     Comma-separated env vars to forward (e.g., RUSTFLAGS,CARGO_TARGET_DIR)
+    RCH_MIN_LOCAL_TIME_MS Minimum local runtime estimate required before offload
+    RCH_REMOTE_SPEEDUP_THRESHOLD Minimum predicted remote speedup ratio before offload
     RCH_VISIBILITY        Hook output visibility: none, summary, verbose
     RCH_VERBOSE           Convenience: sets visibility=verbose when true
     RCH_QUIET             Force visibility=none when true
@@ -2608,7 +2610,7 @@ fn env_var_capabilities() -> Vec<EnvVarCapability> {
             effect: "Disable ANSI color output.".to_string(),
         },
         EnvVarCapability {
-            name: "RCH_DAEMON_SOCKET".to_string(),
+            name: "RCH_SOCKET_PATH".to_string(),
             effect: "Override daemon Unix socket path.".to_string(),
         },
         EnvVarCapability {
@@ -2618,6 +2620,19 @@ fn env_var_capabilities() -> Vec<EnvVarCapability> {
         EnvVarCapability {
             name: "RCH_MOCK_SSH".to_string(),
             effect: "Enable mock SSH for tests and offline verification.".to_string(),
+        },
+        EnvVarCapability {
+            name: "RCH_COMPRESSION_LEVEL".to_string(),
+            effect: "Override transfer compression level.".to_string(),
+        },
+        EnvVarCapability {
+            name: "RCH_MIN_LOCAL_TIME_MS".to_string(),
+            effect: "Override the local-runtime threshold used before offload.".to_string(),
+        },
+        EnvVarCapability {
+            name: "RCH_REMOTE_SPEEDUP_THRESHOLD".to_string(),
+            effect: "Override the predicted remote speedup ratio required before offload."
+                .to_string(),
         },
         EnvVarCapability {
             name: "RCH_VISIBILITY".to_string(),

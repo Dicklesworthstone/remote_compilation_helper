@@ -593,6 +593,7 @@ mod tests {
             compilation: ConfigCompilationSection {
                 confidence_threshold: 0.85,
                 min_local_time_ms: 2000,
+                remote_speedup_threshold: 1.2,
                 build_slots: 4,
                 test_slots: 8,
                 check_slots: 2,
