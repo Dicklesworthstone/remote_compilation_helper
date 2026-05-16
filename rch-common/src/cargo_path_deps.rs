@@ -697,6 +697,10 @@ fn validate_absolute_dependency_scope(
     if !dependency_candidate.is_absolute() {
         return Ok(());
     }
+    if normalize_project_path_with_policy(dependency_candidate, policy).is_ok() {
+        return Ok(());
+    }
+
     let allowed_roots = allowed_dependency_roots(policy);
     if allowed_roots
         .iter()
@@ -3030,6 +3034,81 @@ patched_dep = { path = "../patched/patched_dep" }
                 dependency_name: "patched_dep".to_string(),
             }]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manifest_fallback_accepts_absolute_deps_that_normalize_under_policy() {
+        let id = FIXTURE_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let root = std::env::temp_dir().join(format!(
+            "rch-cargo-path-deps-mixed-roots-{}-{}",
+            std::process::id(),
+            id
+        ));
+        let user_root = root.join("users/jemanuel");
+        let user_projects = user_root.join("projects");
+        let user_dp = user_root.join("dp");
+        let dp_alias = root.join("dp");
+        let data_projects = root.join("data/projects");
+        let app_root = user_projects.join("app");
+        let data_dep_link = data_projects.join("asupersync");
+        let projects_dep_link = user_projects.join("asupersync");
+        let asupersync_root = user_dp.join("asupersync");
+        let frankentui_root = user_dp.join("frankentui");
+
+        fs::create_dir_all(&app_root).expect("create app root");
+        fs::create_dir_all(&data_projects).expect("create data projects root");
+        write_lib_crate(&asupersync_root, "asupersync", &[]);
+        write_lib_crate(&frankentui_root, "frankentui", &[]);
+        symlink(&user_dp, &dp_alias).expect("create /dp-style alias");
+        symlink(&asupersync_root, &projects_dep_link).expect("create canonical project symlink");
+        symlink(&projects_dep_link, &data_dep_link).expect("create /data/projects symlink entry");
+
+        let manifest = format!(
+            "[package]\nname = \"mixed_roots_app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nasupersync = {{ path = \"{}\" }}\nfrankentui = {{ path = \"{}\" }}\n",
+            data_dep_link.display(),
+            dp_alias.join("frankentui").display(),
+        );
+        fs::create_dir_all(app_root.join("src")).expect("create app src");
+        fs::write(app_root.join("Cargo.toml"), manifest).expect("write app manifest");
+        fs::write(app_root.join("src/lib.rs"), "pub fn app() {}\n").expect("write app lib");
+
+        let policy = PathTopologyPolicy::new(user_root.clone(), dp_alias);
+        let graph = resolve_cargo_path_dependency_graph_with_policy_and_provider(
+            &app_root,
+            &policy,
+            |_| {
+                Err(CargoPathDependencyError::new(
+                    CargoPathDependencyErrorKind::MetadataInvocationFailure,
+                    "force manifest fallback",
+                ))
+            },
+        )
+        .expect("mixed absolute dependency roots should normalize under policy");
+
+        let dependency_roots = graph
+            .edges
+            .iter()
+            .map(|edge| (edge.dependency_name.as_str(), edge.to.clone()))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            dependency_roots.get("asupersync"),
+            Some(
+                &asupersync_root
+                    .canonicalize()
+                    .expect("canonical asupersync")
+            )
+        );
+        assert_eq!(
+            dependency_roots.get("frankentui"),
+            Some(
+                &frankentui_root
+                    .canonicalize()
+                    .expect("canonical frankentui")
+            )
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[cfg(unix)]

@@ -396,11 +396,12 @@ pub async fn run_exec(command_parts: Vec<String>) -> anyhow::Result<()> {
     // Classify the command
     let classification = classify_command(&command);
     if !classification.is_compilation {
-        // Not a compilation command - just run locally
-        // This shouldn't normally happen since the hook only rewrites compilations
+        // This should not normally happen because the hook only rewrites
+        // compilations. Preserve the ordinary local behavior, but honor
+        // RCH_REQUIRE_REMOTE for explicit `rch exec` invocations.
         warn!("exec called with non-compilation command: {}", command);
-        let status = local_fallback_command(&command).status()?;
-        std::process::exit(status.code().unwrap_or(1));
+        let reporter = HookReporter::new(OutputVisibility::Summary);
+        exit_with_local_fallback(&command, &reporter, "non-compilation command");
     }
 
     let config = match load_config() {
@@ -2571,6 +2572,17 @@ pub(crate) async fn query_daemon(
 
     for worker in preferred_workers {
         query.push_str(&format!("&worker={}", urlencoding_encode(worker.as_str())));
+    }
+    if !preferred_workers.is_empty() {
+        let legacy_preferred_workers = preferred_workers
+            .iter()
+            .map(|worker| worker.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        query.push_str(&format!(
+            "&preferred_workers={}",
+            urlencoding_encode(&legacy_preferred_workers)
+        ));
     }
 
     // When all workers are at capacity, queue the build on the daemon instead of
@@ -7683,6 +7695,7 @@ mod tests {
 
             assert!(request_line.contains("worker=ts2"));
             assert!(request_line.contains("worker=vmi1264463"));
+            assert!(request_line.contains("preferred_workers=ts2%2Cvmi1264463"));
 
             let response = SelectionResponse {
                 worker: Some(SelectedWorker {

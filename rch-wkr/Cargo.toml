@@ -23,10 +23,8 @@ blake3 = { workspace = true }
 chrono = { workspace = true }
 dirs = { workspace = true }
 schemars = { workspace = true }
-rch-telemetry = { path = "../rch-telemetry", default-features = false }
-
-[dev-dependencies]
 tempfile = "3.25.0"
+rch-telemetry = { path = "../rch-telemetry", default-features = false }
 
 [lints.rust]
 unsafe_code = "forbid"

@@ -60,6 +60,11 @@ pub enum NormalizationDecision {
         alias_root: PathBuf,
         alias_target: PathBuf,
     },
+    AliasSubtreeSymlinkVerified {
+        alias_root: PathBuf,
+        alias_target: PathBuf,
+        canonical_root: PathBuf,
+    },
     AliasDirectoryEntryVerified {
         alias_root: PathBuf,
         canonical_input: PathBuf,
@@ -90,6 +95,17 @@ impl fmt::Display for NormalizationDecision {
                 "alias_symlink_verified={} -> {}",
                 alias_root.display(),
                 alias_target.display()
+            ),
+            Self::AliasSubtreeSymlinkVerified {
+                alias_root,
+                alias_target,
+                canonical_root,
+            } => write!(
+                f,
+                "alias_subtree_symlink_verified={} -> {} root={}",
+                alias_root.display(),
+                alias_target.display(),
+                canonical_root.display()
             ),
             Self::AliasDirectoryEntryVerified {
                 alias_root,
@@ -385,20 +401,9 @@ fn verify_alias(
     })?;
 
     if !metadata.file_type().is_symlink() {
-        let relative_input = input_path.strip_prefix(alias_root).map_err(|e| {
-            PathNormalizationError::new(
-                PathNormalizationErrorKind::AliasNotSymlink,
-                input_path,
-                e.to_string(),
-                decisions,
-            )
-        })?;
-        let canonical_input = canonical_root.join(relative_input);
-        if canonical_input.exists() {
-            decisions.push(NormalizationDecision::AliasDirectoryEntryVerified {
-                alias_root: alias_root.to_path_buf(),
-                canonical_input: canonical_input.clone(),
-            });
+        if let Some(canonical_input) =
+            try_map_alias_directory_entry(input_path, alias_root, canonical_root, decisions)?
+        {
             return Ok(Some(canonical_input));
         }
 
@@ -436,6 +441,21 @@ fn verify_alias(
     })?;
 
     if resolved_target != canonical_root {
+        if resolved_target.starts_with(canonical_root) {
+            decisions.push(NormalizationDecision::AliasSubtreeSymlinkVerified {
+                alias_root: alias_root.to_path_buf(),
+                alias_target: resolved_target,
+                canonical_root: canonical_root.to_path_buf(),
+            });
+            return Ok(None);
+        }
+
+        if let Some(canonical_input) =
+            try_map_alias_directory_entry(input_path, alias_root, canonical_root, decisions)?
+        {
+            return Ok(Some(canonical_input));
+        }
+
         return Err(PathNormalizationError::new(
             PathNormalizationErrorKind::AliasWrongTarget,
             input_path,
@@ -453,6 +473,32 @@ fn verify_alias(
         alias_target: resolved_target,
     });
     Ok(None)
+}
+
+fn try_map_alias_directory_entry(
+    input_path: &Path,
+    alias_root: &Path,
+    canonical_root: &Path,
+    decisions: &mut Vec<NormalizationDecision>,
+) -> Result<Option<PathBuf>, PathNormalizationError> {
+    let relative_input = input_path.strip_prefix(alias_root).map_err(|e| {
+        PathNormalizationError::new(
+            PathNormalizationErrorKind::AliasNotSymlink,
+            input_path,
+            e.to_string(),
+            decisions,
+        )
+    })?;
+    let canonical_input = canonical_root.join(relative_input);
+    if !canonical_input.exists() {
+        return Ok(None);
+    }
+
+    decisions.push(NormalizationDecision::AliasDirectoryEntryVerified {
+        alias_root: alias_root.to_path_buf(),
+        canonical_input: canonical_input.clone(),
+    });
+    Ok(Some(canonical_input))
 }
 
 #[cfg(test)]
@@ -704,6 +750,76 @@ mod tests {
             matches!(
                 decision,
                 NormalizationDecision::AliasDirectoryEntryVerified { .. }
+            )
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn normalize_symlink_alias_entry_to_canonical_subtree() {
+        let fixture = TestFixture::new("alias-symlink-entry-canonical-subtree", false, None);
+        let user_root = fixture.root.join("users/jemanuel");
+        let canonical_root = user_root.clone();
+        let canonical_project = canonical_root.join("projects/repo");
+        let alias_target = fixture.root.join("volumes/data");
+        let alias_root = fixture.root.join("alias-data");
+        let alias_input = alias_root.join("projects/repo");
+
+        fs::create_dir_all(&canonical_project).expect("create canonical project");
+        fs::create_dir_all(&alias_target).expect("create alias target directory");
+        symlink(&alias_target, &alias_root).expect("create /data-style alias symlink");
+
+        let policy = PathTopologyPolicy::new(canonical_root, alias_root);
+        let normalized = normalize_project_path_with_policy(&alias_input, &policy)
+            .expect("normalize /data/projects entry into canonical user subtree");
+
+        assert!(normalized.used_alias_prefix());
+        assert_eq!(
+            normalized.canonical_path(),
+            canonical_project
+                .canonicalize()
+                .expect("canonicalize canonical project")
+        );
+        assert!(normalized.decision_trace().iter().any(|decision| {
+            matches!(
+                decision,
+                NormalizationDecision::AliasDirectoryEntryVerified { .. }
+            )
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn normalize_alias_symlink_target_inside_canonical_root() {
+        let fixture = TestFixture::new("alias-subtree-target", false, None);
+        let user_root = fixture.root.join("users/jemanuel");
+        let alias_target = user_root.join("dp");
+        let alias_root = fixture.root.join("dp");
+        let alias_project = alias_root.join("frankentui");
+        let canonical_project = alias_target.join("frankentui");
+
+        fs::create_dir_all(&canonical_project).expect("create canonical subtree project");
+        symlink(&alias_target, &alias_root).expect("create /dp-style subtree alias");
+
+        let policy = PathTopologyPolicy::new(user_root.clone(), alias_root);
+        let normalized = normalize_project_path_with_policy(&alias_project, &policy)
+            .expect("normalize alias rooted at canonical subtree");
+
+        assert!(normalized.used_alias_prefix());
+        assert_eq!(
+            normalized.canonical_path(),
+            canonical_project
+                .canonicalize()
+                .expect("canonicalize subtree project")
+        );
+        assert_eq!(
+            normalized.canonical_root(),
+            user_root.canonicalize().expect("canonicalize user root")
+        );
+        assert!(normalized.decision_trace().iter().any(|decision| {
+            matches!(
+                decision,
+                NormalizationDecision::AliasSubtreeSymlinkVerified { .. }
             )
         }));
     }
