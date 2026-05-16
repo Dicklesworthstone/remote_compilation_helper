@@ -538,7 +538,7 @@ async fn check_worker_health(
                 Ok(result) => {
                     let duration = start.elapsed();
                     let _ = client.disconnect().await;
-                    if result.success() && result.stdout.trim() == "health_check" {
+                    if result.success() && result.stdout.trim().eq("health_check") {
                         return HealthCheckResult::success(duration_millis_u64(duration));
                     }
                     return HealthCheckResult::failure(format!(
@@ -575,7 +575,7 @@ async fn check_worker_health(
                     let duration = start.elapsed();
                     let _ = client.disconnect().await;
 
-                    if result.success() && result.stdout.trim() == "health_check" {
+                    if result.success() && result.stdout.trim().eq("health_check") {
                         HealthCheckResult::success(duration_millis_u64(duration))
                     } else {
                         HealthCheckResult::failure(format!(
