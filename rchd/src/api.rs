@@ -5291,7 +5291,9 @@ mod tests {
         assert_eq!(stats.error_rate(), 0.0);
         assert_eq!(stats.recent_results(), &[true]);
         assert_eq!(
-            ctx.worker_selector.get_fallback_worker("test-project").await,
+            ctx.worker_selector
+                .get_fallback_worker("test-project")
+                .await,
             Some("worker1".to_string())
         );
     }
