@@ -16,6 +16,10 @@ use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
+fn duration_millis_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
 // ── Cancel Reason ────────────────────────────────────────────────────────
 
 /// Why a build cancellation was initiated.
@@ -722,7 +726,7 @@ impl CancellationOrchestrator {
                 "escalation_count": record.escalation_count,
                 "remote_kill_attempted": record.remote_kill_attempted,
                 "slots_released": record.slots_released,
-                "elapsed_ms": elapsed.as_millis() as u64,
+                "elapsed_ms": duration_millis_u64(elapsed),
                 "cleanup_ok": record.cleanup_ok,
                 "history_cancelled": history_ok,
                 "worker_health": worker_health,
@@ -886,6 +890,11 @@ mod tests {
     use rch_common::SelfTestConfig;
     use std::sync::Arc;
     use std::time::Instant;
+
+    #[test]
+    fn test_duration_millis_u64_saturates() {
+        assert_eq!(duration_millis_u64(Duration::from_secs(u64::MAX)), u64::MAX);
+    }
 
     fn test_events() -> EventBus {
         EventBus::new(64)

@@ -34,6 +34,10 @@ const DEFAULT_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 /// Threshold for degraded status (slow response).
 const DEGRADED_THRESHOLD_MS: u64 = 5000;
 
+fn duration_millis_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
 /// Health monitor configuration.
 #[derive(Debug, Clone)]
 pub struct HealthConfig {
@@ -535,7 +539,7 @@ async fn check_worker_health(
                     let duration = start.elapsed();
                     let _ = client.disconnect().await;
                     if result.success() && result.stdout.trim() == "health_check" {
-                        return HealthCheckResult::success(duration.as_millis() as u64);
+                        return HealthCheckResult::success(duration_millis_u64(duration));
                     }
                     return HealthCheckResult::failure(format!(
                         "Unexpected response: exit={}, stdout={}",
@@ -572,7 +576,7 @@ async fn check_worker_health(
                     let _ = client.disconnect().await;
 
                     if result.success() && result.stdout.trim() == "health_check" {
-                        HealthCheckResult::success(duration.as_millis() as u64)
+                        HealthCheckResult::success(duration_millis_u64(duration))
                     } else {
                         HealthCheckResult::failure(format!(
                             "Unexpected response: exit={}, stdout={}",
@@ -701,6 +705,12 @@ mod tests {
     use rch_common::test_guard;
     use rch_common::{WorkerConfig, WorkerId};
     use std::sync::OnceLock;
+
+    #[test]
+    fn test_duration_millis_u64_saturates() {
+        let _guard = test_guard!();
+        assert_eq!(duration_millis_u64(Duration::from_secs(u64::MAX)), u64::MAX);
+    }
 
     fn test_lock() -> &'static Mutex<()> {
         static ENV_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();

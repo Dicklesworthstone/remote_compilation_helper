@@ -22,6 +22,14 @@ use tracing::debug;
 const CAPABILITIES_REFRESH_PROBE_TIMEOUT: Duration = Duration::from_secs(4);
 const CAPABILITIES_REFRESH_WORKER_BUDGET: Duration = Duration::from_secs(8);
 
+fn duration_millis_i64(duration: Duration) -> i64 {
+    i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
+}
+
+fn duration_secs_i64(duration: Duration) -> i64 {
+    i64::try_from(duration.as_secs()).unwrap_or(i64::MAX)
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 enum DrainCompletionAction {
     #[default]
@@ -581,7 +589,7 @@ impl ToolchainPreflightStatus {
     /// Whether this verdict is fresh enough to reuse for dispatch decisions.
     pub fn is_fresh(&self, ttl: Duration) -> bool {
         let age_ms = current_unix_ms().saturating_sub(self.checked_at_unix_ms);
-        age_ms <= ttl.as_millis() as i64
+        age_ms <= duration_millis_i64(ttl)
     }
 }
 
@@ -766,7 +774,7 @@ impl WorkerPool {
 fn current_unix_secs_for_disabled_at() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
+        .map(duration_secs_i64)
         .unwrap_or(1)
         .max(1)
 }
@@ -780,7 +788,7 @@ impl Default for WorkerPool {
 fn current_unix_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as i64)
+        .map(duration_millis_i64)
         .unwrap_or_default()
 }
 
@@ -1085,6 +1093,25 @@ fn worker_status_label(status: WorkerStatus) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_duration_millis_i64_saturates() {
+        assert_eq!(
+            duration_millis_i64(Duration::from_millis(u64::MAX)),
+            i64::MAX
+        );
+    }
+
+    #[test]
+    fn test_toolchain_preflight_freshness_saturates_extreme_ttl() {
+        let status = ToolchainPreflightStatus {
+            usable: true,
+            reason: None,
+            checked_at_unix_ms: 0,
+        };
+
+        assert!(status.is_fresh(Duration::from_millis(u64::MAX)));
+    }
 
     /// Helper to create a test worker config with given id.
     fn test_config(id: &str) -> WorkerConfig {
