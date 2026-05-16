@@ -389,7 +389,6 @@ fn print_system_info() {
 /// This function detects installed runtimes (Rust, Bun, Node.js, npm)
 /// and returns a WorkerCapabilities struct suitable for JSON serialization.
 fn probe_capabilities() -> WorkerCapabilities {
-    use std::path::Path;
     use std::process::Command;
 
     let mut capabilities = WorkerCapabilities::new();
@@ -458,15 +457,41 @@ fn probe_capabilities() -> WorkerCapabilities {
         capabilities.disk_total_gb = Some(total_gb);
     }
 
-    let (topology_ok, topology_issue) = probe_projects_topology(
-        Path::new(DEFAULT_CANONICAL_PROJECT_ROOT),
-        Path::new(DEFAULT_ALIAS_PROJECT_ROOT),
-    );
+    let (canonical_root, alias_root) = resolved_topology_roots();
+    let (topology_ok, topology_issue) = probe_projects_topology(&canonical_root, &alias_root);
     capabilities.projects_root_ok = Some(topology_ok);
     capabilities.projects_root_issue = topology_issue;
     capabilities.projects_root_checked_at_unix_ms = Some(current_unix_ms());
 
     capabilities
+}
+
+/// Resolve the worker's topology roots, honoring `RCH_WKR_CANONICAL_ROOT` /
+/// `RCH_WKR_ALIAS_ROOT` (set in the worker's systemd unit or shell profile)
+/// and falling back to the compile-time defaults. Hosts that don't ship
+/// `/data/projects` + `/dp` need this so capability probes don't always
+/// report `projects_root_ok = false` and get excluded by daemon preflight.
+/// See rch#15.
+fn resolved_topology_roots() -> (std::path::PathBuf, std::path::PathBuf) {
+    resolve_topology_roots_from_env(
+        std::env::var_os("RCH_WKR_CANONICAL_ROOT"),
+        std::env::var_os("RCH_WKR_ALIAS_ROOT"),
+    )
+}
+
+fn resolve_topology_roots_from_env(
+    canonical_env: Option<std::ffi::OsString>,
+    alias_env: Option<std::ffi::OsString>,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let canonical = canonical_env
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(DEFAULT_CANONICAL_PROJECT_ROOT));
+    let alias = alias_env
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(DEFAULT_ALIAS_PROJECT_ROOT));
+    (canonical, alias)
 }
 
 fn current_unix_ms() -> i64 {
@@ -581,16 +606,14 @@ fn probe_load_average() -> Option<(f64, f64, f64)> {
 /// Probe disk space for project workspace filesystem (free and total in GB).
 ///
 /// We intentionally prefer the project roots because /tmp may be a small tmpfs
-/// on some workers and can produce false pressure signals.
+/// on some workers and can produce false pressure signals. Roots honor
+/// `RCH_WKR_CANONICAL_ROOT` / `RCH_WKR_ALIAS_ROOT` (see rch#15).
 fn probe_disk_space() -> Option<(f64, f64)> {
     use std::path::Path;
-    [
-        Path::new(DEFAULT_CANONICAL_PROJECT_ROOT),
-        Path::new(DEFAULT_ALIAS_PROJECT_ROOT),
-        Path::new("/tmp"),
-    ]
-    .iter()
-    .find_map(|path| probe_disk_space_for(path))
+    let (canonical, alias) = resolved_topology_roots();
+    [canonical.as_path(), alias.as_path(), Path::new("/tmp")]
+        .iter()
+        .find_map(|path| probe_disk_space_for(path))
 }
 
 fn probe_disk_space_for(path: &std::path::Path) -> Option<(f64, f64)> {
@@ -963,6 +986,34 @@ mod tests {
         assert_eq!(issue.as_deref(), Some("canonical_missing"));
 
         std::fs::remove_dir_all(&base).expect("cleanup temp topology");
+    }
+
+    #[test]
+    fn test_resolve_topology_roots_from_env_uses_overrides() {
+        let _guard = test_guard!();
+        let canonical_override = std::ffi::OsString::from("/worker/projects");
+        let alias_override = std::ffi::OsString::from("/worker/dp");
+
+        let (canonical, alias) = resolve_topology_roots_from_env(
+            Some(canonical_override.clone()),
+            Some(alias_override.clone()),
+        );
+
+        assert_eq!(canonical, std::path::PathBuf::from(canonical_override));
+        assert_eq!(alias, std::path::PathBuf::from(alias_override));
+    }
+
+    #[test]
+    fn test_resolve_topology_roots_from_env_falls_back_for_empty_values() {
+        let _guard = test_guard!();
+        let (canonical, alias) =
+            resolve_topology_roots_from_env(None, Some(std::ffi::OsString::new()));
+
+        assert_eq!(
+            canonical,
+            std::path::PathBuf::from(DEFAULT_CANONICAL_PROJECT_ROOT)
+        );
+        assert_eq!(alias, std::path::PathBuf::from(DEFAULT_ALIAS_PROJECT_ROOT));
     }
 
     #[cfg(unix)]

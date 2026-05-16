@@ -35,7 +35,7 @@ use rch_common::{
     SelectionReason, SelectionResponse, SelfHealingConfig, ToolchainInfo, TransferConfig,
     WorkerConfig, WorkerId, build_dependency_closure_plan_with_policy, build_invocation,
     classify_command, mock, normalize_project_path_with_policy,
-    path_topology::{DEFAULT_CANONICAL_PROJECT_ROOT, PathTopologyPolicy},
+    path_topology::PathTopologyPolicy,
     ui::{
         ArtifactSummary, CelebrationSummary, CompilationProgress, CompletionCelebration, Icons,
         OutputContext, RchTheme, TransferProgress,
@@ -511,7 +511,7 @@ pub async fn run_exec(command_parts: Vec<String>) -> anyhow::Result<()> {
     };
 
     info!(
-        "Selected worker: {} at {}@{} ({} slots, speed {:.1})",
+        "Selected worker: {} at {}@{} ({} slots remaining after reservation, speed {:.1})",
         worker.id, worker.user, worker.host, worker.slots_available, worker.speed_score
     );
 
@@ -769,7 +769,7 @@ fn emit_job_banner(
         .map(|id| format!("j-{}", id))
         .unwrap_or_else(|| "job".to_string());
     let message = format!(
-        "{} Job {} submitted to {} (slots {}, speed {:.1})",
+        "{} Job {} submitted to {} ({} slots remaining, speed {:.1})",
         Icons::status_healthy(ctx),
         job,
         worker.id,
@@ -780,7 +780,7 @@ fn emit_job_banner(
     #[cfg(all(feature = "rich-ui", unix))]
     if console.is_rich() {
         let rich = format!(
-            "[bold {}]{}[/] Job {} submitted to {} (slots {}, speed {:.1})",
+            "[bold {}]{}[/] Job {} submitted to {} ({} slots remaining, speed {:.1})",
             RchTheme::INFO,
             Icons::status_healthy(ctx),
             job,
@@ -2260,11 +2260,11 @@ async fn handle_selection_response(
     };
 
     info!(
-        "Selected worker: {} at {}@{} ({} slots, speed {:.1})",
+        "Selected worker: {} at {}@{} ({} slots remaining after reservation, speed {:.1})",
         worker.id, worker.user, worker.host, worker.slots_available, worker.speed_score
     );
     reporter.verbose(&format!(
-        "[RCH] selected {}@{} (slots {}, speed {:.1})",
+        "[RCH] selected {}@{} ({} slots remaining after reservation, speed {:.1})",
         worker.user, worker.host, worker.slots_available, worker.speed_score
     ));
     let invocation_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -5154,7 +5154,13 @@ fn is_within_sync_topology(path: &Path, policy: &PathTopologyPolicy) -> bool {
 }
 
 fn map_sync_root_to_remote_root(path: &Path, policy: &PathTopologyPolicy) -> String {
-    let remote_root = Path::new(DEFAULT_CANONICAL_PROJECT_ROOT);
+    // The remote canonical root comes from the same policy the rest of the
+    // hook uses, never the compile-time `DEFAULT_CANONICAL_PROJECT_ROOT`,
+    // because hosts that don't ship `/data/projects` (which is most of them)
+    // configure their own canonical via `~/.config/rch/config.toml` and
+    // would otherwise see their `[path_topology]` setting silently ignored
+    // for the sync-target translation step. See rch#15.
+    let remote_root = policy.canonical_root();
 
     for root in effective_sync_topology_roots(policy) {
         if let Ok(relative) = path.strip_prefix(&root) {
