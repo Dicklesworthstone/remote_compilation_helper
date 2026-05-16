@@ -4780,7 +4780,7 @@ mod tests {
                 assert_eq!(runbook, Some("RCH-R002".to_string()));
                 assert!(!runbook_list);
             }
-            _ => panic!("Expected doctor command"),
+            _ => fail_expected("Expected doctor command"),
         }
     }
 
@@ -4797,7 +4797,7 @@ mod tests {
                 assert!(runbook.is_none());
                 assert!(runbook_list);
             }
-            _ => panic!("Expected doctor command"),
+            _ => fail_expected("Expected doctor command"),
         }
     }
 

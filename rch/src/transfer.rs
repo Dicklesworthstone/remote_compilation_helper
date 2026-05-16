@@ -4621,6 +4621,25 @@ Total file size: 123 bytes";
     }
 
     #[test]
+    fn catch_all_pattern_does_not_prove_literal_star_entry_is_artifact() {
+        // TEST START: a catch-all retrieval pattern may fetch newly-created
+        // root outputs, but it must not prove that a local source entry named
+        // `*` is safe to overwrite.
+        assert!(!top_level_artifact_pattern_matches_entry("*", "*"));
+        assert_eq!(escape_rsync_filter_literal_component("*").as_ref(), r"\*");
+        assert_eq!(
+            escape_rsync_filter_literal_component("question?mark.c").as_ref(),
+            r"question\?mark.c"
+        );
+        assert_eq!(
+            escape_rsync_filter_literal_component("array[0].c").as_ref(),
+            r"array\[0].c"
+        );
+        // TEST PASS: wildcard-looking local names stay literal in filter rules.
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn local_source_roots_to_exclude_keeps_catch_all_from_unprotecting_source_entries() {
         // TEST START: C/C++ retrieval includes a catch-all `*` for newly
         // created root-level outputs. That pattern must not make every
@@ -4836,6 +4855,7 @@ Total file size: 123 bytes";
         // TEST PASS: command preserves both source guard and top-level glob retrieval.
     }
 
+    #[cfg(unix)]
     #[test]
     fn build_retrieve_command_with_catch_all_still_excludes_existing_source_entries() {
         // TEST START: command-level proof for the C/C++ catch-all artifact
