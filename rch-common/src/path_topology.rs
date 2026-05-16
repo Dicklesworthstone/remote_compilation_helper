@@ -489,6 +489,22 @@ fn try_map_alias_directory_entry(
             decisions,
         )
     })?;
+    if relative_input.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        )
+    }) {
+        return Err(PathNormalizationError::new(
+            PathNormalizationErrorKind::OutsideCanonicalRoot,
+            input_path,
+            "alias-relative path must stay within the alias root",
+            decisions,
+        ));
+    }
+
     let canonical_input = canonical_root.join(relative_input);
     if !canonical_input.exists() {
         return Ok(None);
@@ -752,6 +768,25 @@ mod tests {
                 NormalizationDecision::AliasDirectoryEntryVerified { .. }
             )
         }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reject_alias_directory_entry_parent_component_escape() {
+        let fixture = TestFixture::new("alias-dir-entry-parent", false, None);
+        let project = fixture.canonical_root.join("repo");
+        let alias_input = fixture.alias_root.join("../projects/repo");
+
+        fs::create_dir_all(&project).expect("create canonical project");
+        fs::create_dir_all(&fixture.alias_root).expect("create alias directory");
+
+        let err = normalize_project_path_with_policy(&alias_input, &fixture.policy())
+            .expect_err("parent components must not map through alias directory fallback");
+        log_normalization_error("reject_alias_directory_entry_parent_component_escape", &err);
+        assert_eq!(
+            err.kind(),
+            &PathNormalizationErrorKind::OutsideCanonicalRoot
+        );
     }
 
     #[cfg(unix)]

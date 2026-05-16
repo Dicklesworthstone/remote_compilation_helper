@@ -510,10 +510,7 @@ fn path_with_home_bun_bin(
 fn current_unix_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| match i64::try_from(duration.as_millis()) {
-            Ok(ms) => ms,
-            Err(_) => i64::MAX,
-        })
+        .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
         .unwrap_or_default()
 }
 
