@@ -2113,12 +2113,13 @@ async fn handle_select_worker(
                 .worker_selector
                 .select_with_exclusions(&ctx.pool, request, &excluded_worker_ids)
                 .await;
+            let selection_reason = result.reason;
 
             let Some(worker) = result.worker else {
-                debug!("No worker selected: {}", result.reason);
+                debug!("No worker selected: {}", selection_reason);
                 return Ok(SelectionResponse {
                     worker: None,
-                    reason: result.reason,
+                    reason: selection_reason,
                     build_id: None,
                 });
             };
@@ -2203,7 +2204,7 @@ async fn handle_select_worker(
                         slots_available,
                         speed_score,
                     }),
-                    reason: SelectionReason::Success,
+                    reason: selection_reason,
                     build_id,
                 });
             }
@@ -3789,6 +3790,38 @@ mod tests {
         let worker = response.worker.unwrap();
         assert_eq!(worker.id.as_str(), "worker1");
         // Should have reserved 2 slots
+        assert_eq!(worker.slots_available, 6);
+    }
+
+    #[tokio::test]
+    async fn test_handle_select_worker_preserves_affinity_pin_reason() {
+        let pool = WorkerPool::new();
+        pool.add_worker(make_test_worker("worker1", 8)).await;
+        pool.add_worker(make_test_worker("worker2", 8)).await;
+
+        let ctx = make_test_context(pool);
+        ctx.worker_selector
+            .record_success("worker2", "test-project")
+            .await;
+        let request = SelectionRequest {
+            project: "test-project".to_string(),
+            command: None,
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 2,
+            preferred_workers: vec![],
+            toolchain: None,
+            required_runtime: RequiredRuntime::default(),
+            classification_duration_us: None,
+            hook_pid: None,
+        };
+
+        let response = handle_select_worker(&ctx, request, false, None)
+            .await
+            .unwrap();
+
+        assert_eq!(response.reason, SelectionReason::AffinityPinned);
+        let worker = response.worker.expect("affinity-pinned worker");
+        assert_eq!(worker.id.as_str(), "worker2");
         assert_eq!(worker.slots_available, 6);
     }
 
