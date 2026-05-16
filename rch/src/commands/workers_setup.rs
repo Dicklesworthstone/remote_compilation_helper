@@ -678,20 +678,21 @@ else printf 'NOT_DIRECTORY'; fi"
 fn alias_topology_check_cmd(alias: &Path, canonical: &Path) -> String {
     let a = shell_escape(alias);
     let c = shell_escape(canonical);
-    // Use POSIX `readlink` semantics: target may be `<canonical>` or
-    // `<canonical>/`. The pre-fix command hardcoded both forms; the
-    // runtime form preserves the same dual-comparison. Build the
-    // trailing-slash variant from the rendered display string
-    // directly; `Path::join("")` returns a `PathBuf` whose
-    // serialization differs across platforms (Linux drops the
-    // empty component, Windows preserves it), so an explicit
-    // `format!("{}/", display)` is the only reliable form.
+    // Accept both the raw symlink target and the canonicalized real path.
+    // Some workers expose the configured canonical root as a symlink
+    // (`/Users/.../projects -> /data/projects`) while `/dp` points to
+    // the resolved target. Raw text differs, but the topology is correct.
+    // Build the trailing-slash variant from the rendered display string
+    // directly; `Path::join("")` returns a `PathBuf` whose serialization
+    // differs across platforms.
     let canonical_display = canonical.display().to_string();
     let c_slash = shell_escape_str(&path_display_with_trailing_slash(&canonical_display));
     format!(
         "if [ ! -e {a} ] && [ ! -L {a} ]; then printf 'MISSING'; \
 elif [ -L {a} ]; then target=$(readlink -- {a} 2>/dev/null || true); \
-if [ \"$target\" = {c} ] || [ \"$target\" = {c_slash} ]; then printf 'CORRECT'; \
+canonical_real=$(readlink -f -- {c} 2>/dev/null || printf '%s' {c}); \
+target_real=$(readlink -f -- {a} 2>/dev/null || true); \
+if [ \"$target\" = {c} ] || [ \"$target\" = {c_slash} ] || [ \"$target_real\" = \"$canonical_real\" ]; then printf 'CORRECT'; \
 else printf 'WRONG_TARGET:%s' \"$target\"; fi; \
 else printf 'NOT_SYMLINK'; fi"
     )
@@ -702,10 +703,27 @@ fn create_canonical_root_cmd(canonical: &Path) -> String {
 }
 
 fn create_alias_symlink_cmd(alias: &Path, canonical: &Path) -> String {
+    let a = shell_escape(alias);
+    let c = shell_escape(canonical);
+    let canonical_display = canonical.display().to_string();
+    let c_slash = shell_escape_str(&path_display_with_trailing_slash(&canonical_display));
     format!(
-        "ln -s -- {} {}",
-        shell_escape(canonical),
-        shell_escape(alias)
+        "canonical_real=$(readlink -f -- {c} 2>/dev/null || printf '%s' {c}); \
+ensure_alias_symlink() {{ \
+if [ -L {a} ]; then \
+target=$(readlink -- {a} 2>/dev/null || true); \
+target_real=$(readlink -f -- {a} 2>/dev/null || true); \
+if [ \"$target\" = {c} ] || [ \"$target\" = {c_slash} ] || [ \"$target_real\" = \"$canonical_real\" ]; then return 0; fi; \
+update_stderr=$(ln -sfn -- {c} {a} 2>&1) || {{ echo \"RCH_TOPOLOGY_ERR_ALIAS_UPDATE_FAILED:$update_stderr\" >&2; return 43; }}; \
+elif [ -e {a} ]; then \
+echo 'RCH_TOPOLOGY_ERR_ALIAS_NOT_SYMLINK' >&2; return 42; \
+else \
+create_stderr=$(ln -s -- {c} {a} 2>&1) && return 0; \
+if [ -L {a} ]; then ensure_alias_symlink; return $?; fi; \
+if [ -e {a} ]; then echo 'RCH_TOPOLOGY_ERR_ALIAS_NOT_SYMLINK' >&2; return 42; fi; \
+echo \"RCH_TOPOLOGY_ERR_ALIAS_CREATE_FAILED:$create_stderr\" >&2; return 44; \
+fi; \
+}}; ensure_alias_symlink"
     )
 }
 
@@ -1993,12 +2011,33 @@ mod tests {
             "mkdir -p -- '-canonical-root'"
         );
         assert_eq!(
-            create_alias_symlink_cmd(alias, canonical),
-            "ln -s -- '-canonical-root' '-alias-root'"
-        );
-        assert_eq!(
             update_alias_symlink_cmd(alias, canonical),
             "ln -sfn -- '-canonical-root' '-alias-root'"
+        );
+
+        let create_alias = create_alias_symlink_cmd(alias, canonical);
+        assert!(
+            create_alias.contains("ln -s -- '-canonical-root' '-alias-root'"),
+            "alias create must terminate path options before configured paths: {create_alias}"
+        );
+        assert_eq!(
+            create_alias
+                .matches("ln -s -- '-canonical-root' '-alias-root'")
+                .count(),
+            1,
+            "alias create command should keep a single create operation: {create_alias}"
+        );
+        assert!(
+            create_alias.contains("readlink -- '-alias-root'"),
+            "alias create recovery must re-check symlink targets safely: {create_alias}"
+        );
+        assert!(
+            create_alias.contains("RCH_TOPOLOGY_ERR_ALIAS_NOT_SYMLINK"),
+            "regular-file alias conflicts must keep a structured reason: {create_alias}"
+        );
+        assert!(
+            create_alias.contains("RCH_TOPOLOGY_ERR_ALIAS_CREATE_FAILED"),
+            "missing-alias create failures must keep a structured reason: {create_alias}"
         );
 
         let check_cmd = alias_topology_check_cmd(alias, canonical);

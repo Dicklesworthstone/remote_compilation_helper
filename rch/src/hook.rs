@@ -3580,14 +3580,24 @@ fn build_worker_projects_topology_cmd(topology_policy: &PathTopologyPolicy) -> S
         "set -e; \
          if [ ! -e {canonical} ] && [ ! -L {canonical} ]; then mkdir -p -- {canonical}; fi; \
          if [ -e {canonical} ] && [ ! -d {canonical} ]; then echo 'RCH_TOPOLOGY_ERR_CANONICAL_NOT_DIRECTORY' >&2; exit 41; fi; \
+         canonical_real=$(readlink -f -- {canonical} 2>/dev/null || printf '%s' {canonical}); \
+         ensure_alias_symlink() {{ \
          if [ -L {alias} ]; then \
            target=$(readlink -- {alias} 2>/dev/null || true); \
-           if [ \"$target\" != {canonical} ] && [ \"$target\" != {canonical_slash} ]; then ln -sfn -- {canonical} {alias}; fi; \
+           target_real=$(readlink -f -- {alias} 2>/dev/null || true); \
+           if [ \"$target\" != {canonical} ] && [ \"$target\" != {canonical_slash} ] && [ \"$target_real\" != \"$canonical_real\" ]; then \
+             update_stderr=$(ln -sfn -- {canonical} {alias} 2>&1) || {{ echo \"RCH_TOPOLOGY_ERR_ALIAS_UPDATE_FAILED:$update_stderr\" >&2; return 43; }}; \
+           fi; \
          elif [ -e {alias} ]; then \
-           echo 'RCH_TOPOLOGY_ERR_ALIAS_NOT_SYMLINK' >&2; exit 42; \
+           echo 'RCH_TOPOLOGY_ERR_ALIAS_NOT_SYMLINK' >&2; return 42; \
          else \
-           ln -s -- {canonical} {alias}; \
+           create_stderr=$(ln -s -- {canonical} {alias} 2>&1) && return 0; \
+           if [ -L {alias} ]; then ensure_alias_symlink; return $?; fi; \
+           if [ -e {alias} ]; then echo 'RCH_TOPOLOGY_ERR_ALIAS_NOT_SYMLINK' >&2; return 42; fi; \
+           echo \"RCH_TOPOLOGY_ERR_ALIAS_CREATE_FAILED:$create_stderr\" >&2; return 44; \
          fi; \
+         }}; \
+         ensure_alias_symlink; \
          echo RCH_TOPOLOGY_OK",
         canonical = shell_escape::escape(canonical_display.into()),
         canonical_slash = shell_escape::escape(canonical_slash_display.into()),
@@ -10723,6 +10733,139 @@ edition = "2024"
         assert!(
             command.contains(&format!("ln -s -- {canonical} {alias}")),
             "ln create must terminate options before configured paths: {command}"
+        );
+    }
+
+    #[test]
+    fn test_build_worker_projects_topology_cmd_rechecks_alias_after_create_race() {
+        let _guard = test_guard!();
+        let policy = PathTopologyPolicy::new(
+            PathBuf::from("/custom/projects"),
+            PathBuf::from("/custom/dp"),
+        );
+        let canonical =
+            shell_escape::escape(std::borrow::Cow::from("/custom/projects")).to_string();
+        let alias = shell_escape::escape(std::borrow::Cow::from("/custom/dp")).to_string();
+
+        let command = build_worker_projects_topology_cmd(&policy);
+
+        assert!(
+            command.contains(&format!(
+                "create_stderr=$(ln -s -- {canonical} {alias} 2>&1) && return 0"
+            )),
+            "create path must handle normal symlink creation inside the alias helper: {command}"
+        );
+        assert!(
+            command.contains(&format!(
+                "if [ -L {alias} ]; then ensure_alias_symlink; return $?; fi"
+            )),
+            "failed create must re-check alias state so a concurrent correct symlink is harmless: {command}"
+        );
+        assert!(
+            command.contains("RCH_TOPOLOGY_ERR_ALIAS_NOT_SYMLINK"),
+            "regular-file alias conflicts must still fail with a structured reason: {command}"
+        );
+        assert!(
+            command.contains("RCH_TOPOLOGY_ERR_ALIAS_CREATE_FAILED"),
+            "missing-alias create failures must report a structured reason: {command}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_build_worker_projects_topology_cmd_treats_file_exists_race_as_success() {
+        let _guard = test_guard!();
+        use std::os::unix::fs::PermissionsExt;
+
+        let (temp_dir, policy) = topology_tempdir();
+        let fake_bin = temp_dir.path().join("fake-bin");
+        std::fs::create_dir_all(&fake_bin).expect("create fake bin dir");
+        let fake_ln = fake_bin.join("ln");
+        std::fs::write(
+            &fake_ln,
+            "#!/bin/sh\n\
+if [ \"$1\" = \"-s\" ] && [ \"$2\" = \"--\" ]; then\n\
+  /bin/ln -s \"$3\" \"$4\" 2>/dev/null || true\n\
+  echo \"ln: failed to create symbolic link '$4': File exists\" >&2\n\
+  exit 1\n\
+fi\n\
+exec /bin/ln \"$@\"\n",
+        )
+        .expect("write fake ln");
+        let mut perms = std::fs::metadata(&fake_ln)
+            .expect("fake ln metadata")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_ln, perms).expect("chmod fake ln");
+
+        let command = build_worker_projects_topology_cmd(&policy);
+        let path = format!(
+            "{}:{}",
+            fake_bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let output = std::process::Command::new("sh")
+            .arg("-lc")
+            .arg(command)
+            .env("PATH", path)
+            .output()
+            .expect("run topology command");
+
+        assert!(
+            output.status.success(),
+            "file-exists create race should be harmless; status={:?} stdout={} stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("RCH_TOPOLOGY_OK"),
+            "successful preflight should emit OK"
+        );
+        assert_eq!(
+            std::fs::read_link(policy.alias_root()).expect("alias symlink target"),
+            policy.canonical_root().to_path_buf()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_build_worker_projects_topology_cmd_accepts_resolved_alias_target() {
+        let _guard = test_guard!();
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let real_root = temp_dir.path().join("data/projects");
+        let configured_root = temp_dir.path().join("Users/jemanuel/projects");
+        let alias_root = temp_dir.path().join("dp");
+        std::fs::create_dir_all(&real_root).expect("create real root");
+        std::fs::create_dir_all(configured_root.parent().expect("configured parent"))
+            .expect("create configured parent");
+        symlink(&real_root, &configured_root).expect("create configured canonical symlink");
+        symlink(&real_root, &alias_root).expect("create alias symlink");
+
+        let policy = PathTopologyPolicy::new(configured_root.clone(), alias_root.clone());
+        let output = std::process::Command::new("sh")
+            .arg("-lc")
+            .arg(build_worker_projects_topology_cmd(&policy))
+            .output()
+            .expect("run topology command");
+
+        assert!(
+            output.status.success(),
+            "resolved alias target should be accepted; status={:?} stdout={} stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("RCH_TOPOLOGY_OK"),
+            "successful preflight should emit OK"
+        );
+        assert_eq!(
+            std::fs::read_link(&alias_root).expect("alias symlink target"),
+            real_root,
+            "alias should not be rewritten when it resolves to the configured canonical root"
         );
     }
 
