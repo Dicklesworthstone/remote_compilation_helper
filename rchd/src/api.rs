@@ -2402,15 +2402,13 @@ async fn handle_release_worker(ctx: &DaemonContext, request: ReleaseRequest) -> 
                 }),
             );
 
-            // Record successful builds for affinity pinning
+            // Only successful command completions are positive worker-health
+            // signals. A nonzero command exit is a build/test result, not an
+            // infrastructure failure for the worker circuit.
             if let Some(ref worker_id) = rec.worker_id {
                 if let Some(worker) = ctx.pool.get(&rch_common::WorkerId::new(worker_id)).await {
                     if exit_code == 0 {
                         worker.record_success().await;
-                    } else {
-                        worker
-                            .record_failure(Some(format!("build exited with {exit_code}")))
-                            .await;
                     }
                 }
 
@@ -5288,6 +5286,14 @@ mod tests {
         let completed = recent.iter().find(|b| b.id == build_id);
         assert!(completed.is_some());
         assert_eq!(completed.unwrap().exit_code, 0);
+
+        let stats = worker.circuit_stats().await;
+        assert_eq!(stats.error_rate(), 0.0);
+        assert_eq!(stats.recent_results(), &[true]);
+        assert_eq!(
+            ctx.worker_selector.get_fallback_worker("test-project").await,
+            Some("worker1".to_string())
+        );
     }
 
     #[tokio::test]
@@ -5327,7 +5333,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_handle_release_worker_records_nonzero_exit_as_worker_failure() {
+    async fn test_handle_release_worker_nonzero_exit_preserves_worker_health() {
         let _guard = test_guard!();
         let pool = WorkerPool::new();
         pool.add_worker(make_test_worker("worker1", 8)).await;
@@ -5359,8 +5365,22 @@ mod tests {
         let result = handle_release_worker(&ctx, request).await;
         assert!(result.is_ok());
 
+        let recent = ctx.history.recent(10);
+        let completed = recent
+            .iter()
+            .find(|b| b.id == build_id)
+            .expect("build should be completed");
+        assert_eq!(completed.exit_code, 101);
+
         let stats = worker.circuit_stats().await;
-        assert!(stats.error_rate() > 0.0);
+        assert_eq!(stats.error_rate(), 0.0);
+        assert!(stats.recent_results().is_empty());
+        assert_eq!(
+            ctx.worker_selector
+                .get_fallback_worker("test-project")
+                .await,
+            None
+        );
     }
 
     #[tokio::test]
