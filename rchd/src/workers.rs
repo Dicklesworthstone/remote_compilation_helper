@@ -185,6 +185,10 @@ impl WorkerState {
     /// otherwise let a new build land on a worker that was just asked to
     /// stop accepting work — defeating the entire drain contract.
     pub async fn reserve_slots(&self, count: u32) -> bool {
+        if count == 0 {
+            return false;
+        }
+
         let mut current = self.used_slots.load(Ordering::Relaxed);
         loop {
             // Re-read status on each iteration so a concurrent `drain()` /
@@ -1426,6 +1430,15 @@ mod tests {
 
         state.release_slots(4).await;
         assert_eq!(state.available_slots().await, 4);
+    }
+
+    #[tokio::test]
+    async fn test_zero_slot_reservation_is_rejected() {
+        let state = WorkerState::new(test_config("test"));
+
+        assert!(!state.reserve_slots(0).await);
+        assert_eq!(state.used_slots(), 0);
+        assert_eq!(state.available_slots().await, 8);
     }
 
     #[tokio::test]

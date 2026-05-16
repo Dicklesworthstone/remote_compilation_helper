@@ -1617,7 +1617,7 @@ fn parse_request(line: &str) -> Result<ApiRequest> {
         match key {
             "project" => project = Some(percent_unescape_query_value(value)),
             "command" => command = Some(percent_unescape_query_value(value)),
-            "cores" => cores = value.parse().ok(),
+            "cores" => cores = value.parse::<u32>().ok().filter(|cores| *cores > 0),
             "wait" | "queue" => {
                 wait_for_worker = value == "1" || value.eq_ignore_ascii_case("true");
             }
@@ -2360,12 +2360,19 @@ async fn handle_select_worker(
 
 /// Handle a release-worker request.
 async fn handle_release_worker(ctx: &DaemonContext, request: ReleaseRequest) -> Result<()> {
+    let canonical_release = request
+        .build_id
+        .and_then(|build_id| ctx.history.active_build(build_id))
+        .map(|state| (WorkerId::new(state.worker_id), state.slots));
+    let (release_worker_id, release_slots) =
+        canonical_release.unwrap_or_else(|| (request.worker_id.clone(), request.slots));
+
     debug!(
         "Releasing {} slots on worker {}",
-        request.slots, request.worker_id
+        release_slots, release_worker_id
     );
     ctx.pool
-        .release_slots(&request.worker_id, request.slots)
+        .release_slots(&release_worker_id, release_slots)
         .await;
 
     if let Some(build_id) = request.build_id {
@@ -3276,6 +3283,17 @@ mod tests {
         };
         assert_eq!(req.project, "test");
         assert_eq!(req.estimated_cores, 1); // Default
+    }
+
+    #[test]
+    fn test_parse_request_zero_cores_defaults_to_one() {
+        let _guard = test_guard!();
+        let req = parse_request("GET /select-worker?project=test&cores=0").unwrap();
+        let ApiRequest::SelectWorker { request: req, .. } = req else {
+            assert!(false, "expected select-worker request");
+            return;
+        };
+        assert_eq!(req.estimated_cores, 1);
     }
 
     #[test]
@@ -5241,6 +5259,42 @@ mod tests {
         let completed = recent.iter().find(|b| b.id == build_id);
         assert!(completed.is_some());
         assert_eq!(completed.unwrap().exit_code, 0);
+    }
+
+    #[tokio::test]
+    async fn test_handle_release_worker_uses_active_build_slots() {
+        let _guard = test_guard!();
+        let pool = WorkerPool::new();
+        pool.add_worker(make_test_worker("worker1", 8)).await;
+
+        let ctx = make_test_context(pool.clone());
+        let build = ctx.history.start_active_build(
+            "test-project".to_string(),
+            "worker1".to_string(),
+            "cargo build".to_string(),
+            12345,
+            4,
+            rch_common::BuildLocation::Remote,
+        );
+        let build_id = build.id;
+
+        let worker = pool.get(&WorkerId::new("worker1")).await.unwrap();
+        assert!(worker.reserve_slots(4).await);
+
+        let request = ReleaseRequest {
+            worker_id: WorkerId::new("worker1"),
+            slots: 0,
+            build_id: Some(build_id),
+            exit_code: Some(0),
+            duration_ms: Some(5000),
+            bytes_transferred: Some(1024 * 1024),
+            timing: None,
+        };
+
+        handle_release_worker(&ctx, request).await.unwrap();
+
+        assert_eq!(worker.available_slots().await, 8);
+        assert!(ctx.history.active_build(build_id).is_none());
     }
 
     #[tokio::test]
