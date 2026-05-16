@@ -2406,10 +2406,10 @@ async fn handle_release_worker(ctx: &DaemonContext, request: ReleaseRequest) -> 
             // signals. A nonzero command exit is a build/test result, not an
             // infrastructure failure for the worker circuit.
             if let Some(ref worker_id) = rec.worker_id {
-                if let Some(worker) = ctx.pool.get(&rch_common::WorkerId::new(worker_id)).await {
-                    if exit_code == 0 {
-                        worker.record_success().await;
-                    }
+                if let Some(worker) = ctx.pool.get(&rch_common::WorkerId::new(worker_id)).await
+                    && exit_code == 0
+                {
+                    worker.record_success().await;
                 }
 
                 if exit_code == 0 {
