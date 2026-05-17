@@ -6,6 +6,7 @@
 use crate::ui::context::OutputContext;
 use crate::ui::theme::StatusIndicator;
 use anyhow::{Context, Result};
+use rch_common::ssh_utils::shell_escape_path_with_home;
 use rch_common::{ApiError, ApiResponse, ErrorCode, WorkerConfig};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -288,7 +289,7 @@ async fn deploy_binary_to_worker(
                 println!(
                     "{} (deployed to {})",
                     style.success("OK"),
-                    style.muted(&remote_path)
+                    style.muted(remote_path)
                 );
             }
             DeployResult {
@@ -359,28 +360,33 @@ pub(super) async fn get_remote_version(worker: &WorkerConfig) -> Result<String> 
 }
 
 /// Deploy binary via SCP to remote worker.
-pub(super) async fn deploy_via_scp(worker: &WorkerConfig, local_binary: &Path) -> Result<String> {
+pub(super) async fn deploy_via_scp(
+    worker: &WorkerConfig,
+    local_binary: &Path,
+) -> Result<&'static str> {
     // Try /usr/local/bin first, then fall back to ~/.local/bin
-    let remote_paths = ["/usr/local/bin/rch-wkr", "~/.local/bin/rch-wkr"];
+    let remote_paths = [
+        ("/usr/local/bin/rch-wkr", "/usr/local/bin"),
+        ("~/.local/bin/rch-wkr", "~/.local/bin"),
+    ];
+    let mut failures = Vec::new();
+    let target = format!("{}@{}", worker.user, worker.host);
 
-    for remote_path in remote_paths {
+    for (remote_path, dir) in remote_paths {
         // Ensure target directory exists
-        let dir = if remote_path.starts_with('~') {
-            ".local/bin"
-        } else {
-            "/usr/local/bin"
-        };
-
         let mut mkdir_cmd = Command::new("ssh");
         mkdir_cmd.arg("-o").arg("BatchMode=yes");
         mkdir_cmd.arg("-o").arg("ConnectTimeout=10");
         mkdir_cmd.arg("-i").arg(&worker.identity_file);
 
-        let target = format!("{}@{}", worker.user, worker.host);
         mkdir_cmd.arg(&target);
-        mkdir_cmd.arg(format!("mkdir -p {}", dir));
+        mkdir_cmd.arg(remote_mkdir_command(dir)?);
 
-        let _ = mkdir_cmd.output().await;
+        let mkdir_output = mkdir_cmd.output().await?;
+        if !mkdir_output.status.success() {
+            failures.push(deploy_failure(remote_path, "mkdir", &mkdir_output));
+            continue;
+        }
 
         // SCP the binary
         let mut scp_cmd = Command::new("scp");
@@ -389,7 +395,7 @@ pub(super) async fn deploy_via_scp(worker: &WorkerConfig, local_binary: &Path) -
         scp_cmd.arg("-i").arg(&worker.identity_file);
         scp_cmd.arg(local_binary);
 
-        let remote_target = format!("{}@{}:{}", worker.user, worker.host, remote_path);
+        let remote_target = scp_remote_target(worker, remote_path);
         scp_cmd.arg(&remote_target);
 
         let output = scp_cmd.output().await?;
@@ -398,20 +404,79 @@ pub(super) async fn deploy_via_scp(worker: &WorkerConfig, local_binary: &Path) -
             // Make executable
             let mut chmod_cmd = Command::new("ssh");
             chmod_cmd.arg("-o").arg("BatchMode=yes");
+            chmod_cmd.arg("-o").arg("ConnectTimeout=10");
             chmod_cmd.arg("-i").arg(&worker.identity_file);
             chmod_cmd.arg(&target);
-            chmod_cmd.arg(format!("chmod +x {}", remote_path));
+            chmod_cmd.arg(remote_chmod_command(remote_path)?);
 
-            let _ = chmod_cmd.output().await;
+            let chmod_output = chmod_cmd.output().await?;
+            if !chmod_output.status.success() {
+                failures.push(deploy_failure(remote_path, "chmod", &chmod_output));
+                continue;
+            }
 
-            return Ok(remote_path.to_string());
+            return Ok(remote_path);
+        } else {
+            failures.push(deploy_failure(remote_path, "scp", &output));
         }
     }
 
-    Err(anyhow::anyhow!(
-        "Failed to deploy to any location on {}",
-        worker.host
-    ))
+    if failures.is_empty() {
+        Err(anyhow::anyhow!(
+            "Failed to deploy to any location on {}",
+            worker.host
+        ))
+    } else {
+        Err(anyhow::anyhow!(
+            "Failed to deploy to any location on {} ({})",
+            worker.host,
+            failures.join("; ")
+        ))
+    }
+}
+
+fn remote_mkdir_command(dir: &str) -> Result<String> {
+    let escaped_dir = remote_shell_path(dir)?;
+    Ok(format!("mkdir -p -- {escaped_dir}"))
+}
+
+fn remote_chmod_command(remote_path: &str) -> Result<String> {
+    let escaped_path = remote_shell_path(remote_path)?;
+    Ok(format!("chmod +x -- {escaped_path}"))
+}
+
+fn scp_remote_target(worker: &WorkerConfig, remote_path: &str) -> String {
+    format!("{}@{}:{remote_path}", worker.user, worker.host)
+}
+
+fn remote_shell_path(path: &str) -> Result<String> {
+    shell_escape_path_with_home(path)
+        .ok_or_else(|| anyhow::anyhow!("Remote path contains unsupported control characters"))
+}
+
+fn deploy_failure(remote_path: &str, stage: &str, output: &std::process::Output) -> String {
+    format!(
+        "{remote_path}: {stage} failed: {}",
+        command_failure_summary(output)
+    )
+}
+
+fn command_failure_summary(output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let detail = stderr.trim();
+    let detail = if detail.is_empty() {
+        stdout.trim()
+    } else {
+        detail
+    };
+
+    match output.status.code() {
+        Some(code) if detail.is_empty() => format!("exit {code}"),
+        Some(code) => format!("exit {code}: {detail}"),
+        None if detail.is_empty() => "terminated by signal".to_string(),
+        None => format!("terminated by signal: {detail}"),
+    }
 }
 
 // =============================================================================
@@ -428,4 +493,37 @@ struct DeployResult {
     remote_version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remote_deploy_shell_commands_quote_paths() {
+        assert_eq!(
+            remote_mkdir_command("/usr/local/bin").expect("mkdir command"),
+            "mkdir -p -- '/usr/local/bin'"
+        );
+        assert_eq!(
+            remote_mkdir_command("~/.local/bin").expect("mkdir command"),
+            "mkdir -p -- \"$HOME/.local/bin\""
+        );
+        assert_eq!(
+            remote_chmod_command("~/.local/bin/rch-wkr").expect("chmod command"),
+            "chmod +x -- \"$HOME/.local/bin/rch-wkr\""
+        );
+        assert_eq!(
+            remote_chmod_command("dir with spaces/rch-wkr").expect("chmod command"),
+            "chmod +x -- 'dir with spaces/rch-wkr'"
+        );
+    }
+
+    #[test]
+    fn remote_deploy_shell_commands_reject_control_characters() {
+        let err = remote_chmod_command("bad\npath")
+            .expect_err("control characters should be rejected")
+            .to_string();
+        assert!(err.contains("control characters"));
+    }
 }
