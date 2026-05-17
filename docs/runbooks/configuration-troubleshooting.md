@@ -183,7 +183,7 @@ min_local_time_ms = 2000     # Skip if local < 2s
 compression_level = 3        # zstd level 1-19
 exclude_patterns = [
     "target/",
-    ".git/objects/",
+    ".git/",
     "node_modules/",
 ]
 

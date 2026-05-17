@@ -52,14 +52,24 @@ const REMOTE_RUNTIME_EXCLUDE_PATTERNS: &[&str] = &[
     ".franken_whisper/tools/ffmpeg/",
 ];
 const DEFAULT_REMOTE_CARGO_TARGET_DIR_NAME: &str = ".rch-target";
-const LEGACY_CORE_DUMP_EXCLUDE_REWRITES: &[(&str, &str)] =
-    &[("core.*", "core.[0-9]*"), (".core.*", ".core.[0-9]*")];
+const CONFIG_EXCLUDE_REWRITES: &[(&str, &str)] = &[
+    ("core.*", "core.[0-9]*"),
+    (".core.*", ".core.[0-9]*"),
+    (".git/objects/", ".git/"),
+];
 
 fn normalize_config_exclude_pattern(pattern: &str) -> &str {
-    LEGACY_CORE_DUMP_EXCLUDE_REWRITES
+    CONFIG_EXCLUDE_REWRITES
         .iter()
         .find_map(|(legacy, replacement)| (*legacy == pattern).then_some(*replacement))
         .unwrap_or(pattern)
+}
+
+fn add_portable_rsync_archive_args(cmd: &mut Command) {
+    // `-a` includes owner/group preservation. Across independently provisioned
+    // workers those metadata IDs are not portable and can turn an otherwise
+    // writable sync into a fail-open chgrp failure.
+    cmd.arg("--no-owner").arg("--no-group");
 }
 
 /// Anchor an artifact retrieval pattern so rsync only matches it at the
@@ -1107,14 +1117,12 @@ fi",
         let identity_file = shellexpand::tilde(&worker.identity_file);
         let escaped_identity = escape(Cow::from(identity_file.as_ref()));
 
-        cmd.arg("-az")
-            .arg("--dry-run")
-            .arg("--stats")
-            .arg("-e")
-            .arg(format!(
-                "ssh -i {} -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=5",
-                escaped_identity
-            ));
+        cmd.arg("-az");
+        add_portable_rsync_archive_args(&mut cmd);
+        cmd.arg("--dry-run").arg("--stats").arg("-e").arg(format!(
+            "ssh -i {} -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=5",
+            escaped_identity
+        ));
 
         for pattern in &effective_excludes {
             cmd.arg("--exclude").arg(pattern);
@@ -1241,8 +1249,9 @@ fi",
         let escaped_identity = escape(Cow::from(identity_file.as_ref()));
         let ssh_command = self.build_rsync_ssh_command(escaped_identity.as_ref());
 
-        cmd.arg("-az") // Archive mode + compression
-            .arg("--stats") // Structured output for parse_rsync_bytes/files
+        cmd.arg("-az"); // Archive mode + compression
+        add_portable_rsync_archive_args(&mut cmd);
+        cmd.arg("--stats") // Structured output for parse_rsync_bytes/files
             .arg("-e")
             .arg(ssh_command);
 
@@ -1306,8 +1315,9 @@ fi",
         let escaped_identity = escape(Cow::from(identity_file.as_ref()));
         let ssh_command = self.build_rsync_ssh_command(escaped_identity.as_ref());
 
-        cmd.arg("-az") // Archive mode + compression
-            .arg("--info=progress2")
+        cmd.arg("-az"); // Archive mode + compression
+        add_portable_rsync_archive_args(&mut cmd);
+        cmd.arg("--info=progress2")
             .arg("--info=stats2")
             .arg("-e")
             .arg(ssh_command);
@@ -1817,8 +1827,9 @@ fi",
         // --stats is required so parse_rsync_bytes/parse_rsync_files can read transfer
         // counts from stdout; without it rsync produces no output and the parsers
         // return 0, causing a false "No artifacts retrieved" warning.
-        cmd.arg("-az")
-            .arg("--stats")
+        cmd.arg("-az");
+        add_portable_rsync_archive_args(&mut cmd);
+        cmd.arg("--stats")
             .arg("--safe-links")
             .arg("-e")
             .arg(ssh_command);
@@ -1897,8 +1908,9 @@ fi",
 
         let ssh_command = self.build_rsync_ssh_command(escaped_identity.as_ref());
 
-        cmd.arg("-az")
-            .arg("--info=progress2")
+        cmd.arg("-az");
+        add_portable_rsync_archive_args(&mut cmd);
+        cmd.arg("--info=progress2")
             .arg("--info=stats2")
             .arg("--safe-links")
             .arg("-e")
@@ -2662,6 +2674,24 @@ mod tests {
         })
     }
 
+    fn command_args(cmd: &Command) -> Vec<String> {
+        cmd.as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect()
+    }
+
+    fn assert_portable_rsync_archive_args(args: &[String]) {
+        assert!(
+            args.iter().any(|arg| arg == "--no-owner"),
+            "rsync archive mode must not preserve owner metadata across workers"
+        );
+        assert!(
+            args.iter().any(|arg| arg == "--no-group"),
+            "rsync archive mode must not preserve group metadata across workers"
+        );
+    }
+
     #[test]
     fn test_remote_path() {
         let _guard = test_guard!();
@@ -3371,6 +3401,51 @@ mod tests {
     }
 
     #[test]
+    fn test_rsync_commands_disable_owner_and_group_preservation() {
+        let _guard = test_guard!();
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let pipeline = TransferPipeline::new(
+            temp_dir.path().to_path_buf(),
+            "test-project".to_string(),
+            "abc123".to_string(),
+            TransferConfig::default(),
+        );
+        let worker = WorkerConfig {
+            id: WorkerId::new("mock-worker"),
+            host: "mock://worker".to_string(),
+            user: "mockuser".to_string(),
+            identity_file: "~/.ssh/mock".to_string(),
+            total_slots: 4,
+            priority: 100,
+            tags: vec![],
+        };
+
+        let sync = pipeline.build_sync_command(
+            &worker,
+            "mockuser@mock://worker:/tmp/rch/test-project/abc123",
+            "/tmp/rch/test-project/abc123",
+            &[],
+        );
+        assert_portable_rsync_archive_args(&command_args(&sync));
+
+        let sync_streaming = pipeline.build_sync_streaming_command(
+            &worker,
+            "mockuser@mock://worker:/tmp/rch/test-project/abc123",
+            "/tmp/rch/test-project/abc123",
+            &[],
+        );
+        assert_portable_rsync_archive_args(&command_args(&sync_streaming));
+
+        let retrieve =
+            pipeline.build_retrieve_command(&worker, "/tmp/rch/test-project/abc123", &[]);
+        assert_portable_rsync_archive_args(&command_args(&retrieve));
+
+        let retrieve_streaming =
+            pipeline.build_retrieve_streaming_command(&worker, "/tmp/rch/test-project/abc123", &[]);
+        assert_portable_rsync_archive_args(&command_args(&retrieve_streaming));
+    }
+
+    #[test]
     fn test_build_retrieve_command_applies_rchignore_excludes_before_directory_include() {
         let _guard = test_guard!();
         let temp_dir = tempfile::tempdir().expect("create temp dir");
@@ -3848,9 +3923,9 @@ mod tests {
     #[test]
     fn test_parse_rchignore_content_basic() {
         let _guard = test_guard!();
-        let content = "target/\n.git/objects/\nnode_modules/";
+        let content = "target/\n.git/\nnode_modules/";
         let patterns = parse_rchignore_content(content);
-        assert_eq!(patterns, vec!["target/", ".git/objects/", "node_modules/"]);
+        assert_eq!(patterns, vec!["target/", ".git/", "node_modules/"]);
     }
 
     #[test]
@@ -3858,12 +3933,12 @@ mod tests {
         let _guard = test_guard!();
         let content = r#"# Build artifacts
 target/
-# Git internals
-.git/objects/
+# Git metadata
+.git/
 # Node stuff
 node_modules/"#;
         let patterns = parse_rchignore_content(content);
-        assert_eq!(patterns, vec!["target/", ".git/objects/", "node_modules/"]);
+        assert_eq!(patterns, vec!["target/", ".git/", "node_modules/"]);
     }
 
     #[test]
@@ -3872,21 +3947,21 @@ node_modules/"#;
         let content = r#"
 target/
 
-.git/objects/
+.git/
 
 
 node_modules/
 "#;
         let patterns = parse_rchignore_content(content);
-        assert_eq!(patterns, vec!["target/", ".git/objects/", "node_modules/"]);
+        assert_eq!(patterns, vec!["target/", ".git/", "node_modules/"]);
     }
 
     #[test]
     fn test_parse_rchignore_content_trims_whitespace() {
         let _guard = test_guard!();
-        let content = "  target/  \n\t.git/objects/\t\n   node_modules/   ";
+        let content = "  target/  \n\t.git/\t\n   node_modules/   ";
         let patterns = parse_rchignore_content(content);
-        assert_eq!(patterns, vec!["target/", ".git/objects/", "node_modules/"]);
+        assert_eq!(patterns, vec!["target/", ".git/", "node_modules/"]);
     }
 
     #[test]
@@ -3939,6 +4014,11 @@ node_modules/
         for pattern in &default_excludes {
             assert!(effective.contains(pattern));
         }
+        assert!(effective.contains(&".git/".to_string()));
+        assert!(
+            !effective.contains(&".git/objects/".to_string()),
+            "default upload excludes must avoid syncing a partial .git tree"
+        );
         assert!(effective.contains(&".rch-target/".to_string()));
         assert!(effective.contains(&".rch-tmp/".to_string()));
         assert!(effective.contains(&".franken_whisper/tools/ffmpeg/".to_string()));
@@ -4042,6 +4122,32 @@ node_modules/
         assert!(effective.contains(&"core.[0-9]*".to_string()));
         assert!(effective.contains(&".core.[0-9]*".to_string()));
         assert_eq!(effective.iter().filter(|p| *p == "core.[0-9]*").count(), 1);
+    }
+
+    #[test]
+    fn test_get_effective_excludes_rewrites_legacy_git_objects_exclude() {
+        let _guard = test_guard!();
+        let config = TransferConfig {
+            exclude_patterns: vec![
+                "target/".to_string(),
+                ".git/objects/".to_string(),
+                "node_modules/".to_string(),
+            ],
+            ..TransferConfig::default()
+        };
+
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/nonexistent/project"),
+            "project".to_string(),
+            "hash".to_string(),
+            config,
+        );
+
+        let effective = pipeline.get_effective_excludes();
+
+        assert!(effective.contains(&".git/".to_string()));
+        assert!(!effective.contains(&".git/objects/".to_string()));
+        assert_eq!(effective.iter().filter(|p| *p == ".git/").count(), 1);
     }
 
     // ==========================================================================

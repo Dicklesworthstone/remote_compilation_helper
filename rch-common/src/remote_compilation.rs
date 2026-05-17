@@ -327,9 +327,10 @@ impl RemoteCompilationTest {
     }
 
     /// Build the isolated remote CARGO_HOME path for a single build attempt.
-    fn remote_cargo_home_path(&self, session_id: u32, timestamp: u128) -> String {
+    fn remote_cargo_home_path(&self, session_id: &str) -> String {
         let worker_id = sanitize_remote_path_component(self.worker.id.as_str(), "worker");
-        format!("/tmp/rch-cargo-home-{worker_id}-{session_id}-{timestamp}")
+        let session_id = sanitize_remote_path_component(session_id, "session");
+        format!("/tmp/rch-cargo-home-{worker_id}-{session_id}")
     }
 
     /// Build the project locally.
@@ -412,6 +413,8 @@ impl RemoteCompilationTest {
 
         let mut cmd = Command::new("rsync");
         cmd.arg("-az")
+            .arg("--no-owner")
+            .arg("--no-group")
             .arg("--delete")
             .arg("--exclude")
             .arg("target/")
@@ -447,13 +450,9 @@ impl RemoteCompilationTest {
         let remote_path = self.remote_project_path();
         let escaped_remote_path = escape(Cow::from(&remote_path));
 
-        // Generate unique cargo home and target dir per worker session to prevent cache lock contention
-        let session_id = std::process::id();
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let cargo_home = self.remote_cargo_home_path(session_id, timestamp);
+        // Generate a unique cargo home per build attempt to prevent cache lock contention.
+        let session_id = Uuid::new_v4().simple().to_string();
+        let cargo_home = self.remote_cargo_home_path(&session_id);
         let cargo_target_dir = format!("{}/target", remote_path);
         let escaped_cargo_home = escape(Cow::from(&cargo_home));
         let escaped_cargo_target_dir = escape(Cow::from(&cargo_target_dir));
@@ -545,6 +544,8 @@ impl RemoteCompilationTest {
 
         let mut cmd = Command::new("rsync");
         cmd.arg("-az")
+            .arg("--no-owner")
+            .arg("--no-group")
             .arg("-e")
             .arg(format!(
                 "ssh -i {} -o StrictHostKeyChecking=accept-new -o BatchMode=yes",
@@ -1193,7 +1194,7 @@ mod tests {
         };
 
         let test = RemoteCompilationTest::new(worker, PathBuf::from("/home/user/project"));
-        let cargo_home = test.remote_cargo_home_path(7, 42);
+        let cargo_home = test.remote_cargo_home_path("run/7 with spaces");
         logger.log_with_data(
             TestPhase::Verify,
             "Computed sanitized cargo home",
@@ -1202,7 +1203,7 @@ mod tests {
 
         assert_eq!(
             cargo_home,
-            "/tmp/rch-cargo-home-worker-one-with-spaces-7-42"
+            "/tmp/rch-cargo-home-worker-one-with-spaces-run-7-with-spaces"
         );
 
         logger.pass();

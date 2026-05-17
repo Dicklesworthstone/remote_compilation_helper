@@ -343,6 +343,8 @@ impl RemoteCompilationTest {
         let mut cmd = Command::new("rsync");
         cmd.args([
             "-az",
+            "--no-owner",
+            "--no-group",
             "--delete",
             "--exclude",
             "target/",
@@ -413,7 +415,7 @@ impl RemoteCompilationTest {
             .context("Failed to create local target directory")?;
 
         let mut cmd = Command::new("rsync");
-        cmd.args(["-az"]);
+        cmd.args(["-az", "--no-owner", "--no-group"]);
 
         if let Some(ssh_option) = self.rsync_ssh_option() {
             cmd.args(["-e", &ssh_option]);

@@ -270,7 +270,7 @@ Tips to minimize initial sync:
 [transfer]
 exclude_patterns = [
     "target/",
-    ".git/objects/",
+    ".git/",
     "node_modules/",
     "benches/data/",
     "test_fixtures/large/",

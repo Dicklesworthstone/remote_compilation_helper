@@ -58,7 +58,7 @@ Sections and fields:
 ### `[transfer]`
 - `compression_level` (u32, default `3`) — zstd compression level.
 - `exclude_patterns` (list) — Patterns excluded from transfer. Defaults include:
-  `target/`, `.git/objects/`, `node_modules/`, common build caches, and
+  `target/`, `.git/`, `node_modules/`, common build caches, and
   coverage output. Use `rch config show` to see the full effective list.
 - `ssh_server_alive_interval_secs` (u64, optional) — Sets `ssh -o ServerAliveInterval`
   for remote execution and rsync transfers to reduce dropped connections on flaky networks.

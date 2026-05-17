@@ -2334,8 +2334,9 @@ fn default_excludes() -> Vec<String> {
         "target/".to_string(),
         "*.rlib".to_string(),
         "*.rmeta".to_string(),
-        // Git objects (large, regenerated on clone)
-        ".git/objects/".to_string(),
+        // Git metadata is large, often permission-sensitive on workers, and
+        // a partial `.git/` tree is not reliable for build scripts anyway.
+        ".git/".to_string(),
         // Node.js / Bun dependencies (massive, reinstalled on worker)
         "node_modules/".to_string(),
         // Bun cache and runtime files
@@ -2928,7 +2929,9 @@ mod tests {
 
         let actual_json = serde_json::to_string_pretty(&actual).expect("actual JSON renders");
         let expected_json = serde_json::to_string_pretty(expected).expect("expected JSON renders");
-        panic!(
+        assert_eq!(
+            &actual,
+            expected,
             "golden mismatch in {fixture_path}\n\
              expected_blake3={}\n\
              actual_blake3={}\n\

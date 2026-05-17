@@ -54,7 +54,7 @@ min_local_time_ms = 2000
 compression_level = 3
 exclude_patterns = [
     "target/",
-    ".git/objects/",
+    ".git/",
     "node_modules/",
 ]
 

@@ -126,7 +126,7 @@ min_local_time_ms = {}
 
 [transfer]
 compression_level = 3
-exclude_patterns = ["target/", ".git/objects/", "node_modules/"]
+exclude_patterns = ["target/", ".git/", "node_modules/"]
 "#,
             self.log_level,
             self.socket_path.display(),

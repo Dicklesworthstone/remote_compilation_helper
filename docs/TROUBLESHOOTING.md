@@ -120,7 +120,7 @@ ssh -v -i ~/.ssh/your_key user@worker-host "echo OK"
 - High bandwidth usage
 
 **Understanding:**
-- First sync transfers entire project (excluding `target/`, `.git/objects/`)
+- First sync transfers entire project (excluding `target/`, `.git/`)
 - Subsequent syncs are incremental (only changed files)
 - Large projects with many files take longer
 
@@ -145,7 +145,7 @@ cat ~/.config/rch/config.toml | grep exclude
 [transfer]
 exclude_patterns = [
     "target/",
-    ".git/objects/",
+    ".git/",
     "node_modules/",
     "*.rlib",
     "*.rmeta",

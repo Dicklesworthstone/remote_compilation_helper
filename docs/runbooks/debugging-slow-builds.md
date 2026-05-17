@@ -174,7 +174,7 @@ compression_level = 3  # Default: 3 (1-19, lower = faster)
 [transfer]
 exclude_patterns = [
     "target/",
-    ".git/objects/",
+    ".git/",
     "node_modules/",
     "*.rlib",
     "*.rmeta",

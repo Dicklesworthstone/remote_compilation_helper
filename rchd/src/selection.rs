@@ -811,7 +811,7 @@ impl WorkerSelector {
                 self.select_by_priority(&eligible, request, cache_use).await
             }
             SelectionStrategy::Fastest => {
-                if request.command_priority == CommandPriority::Low {
+                if matches!(request.command_priority, CommandPriority::Low) {
                     self.select_fair_fastest(&eligible).await
                 } else {
                     self.select_by_fastest(&eligible).await
@@ -828,7 +828,7 @@ impl WorkerSelector {
                 }
             },
             SelectionStrategy::FairFastest => {
-                if request.command_priority == CommandPriority::High {
+                if matches!(request.command_priority, CommandPriority::High) {
                     self.select_by_fastest(&eligible).await
                 } else {
                     self.select_fair_fastest(&eligible).await
@@ -1081,7 +1081,7 @@ impl WorkerSelector {
                 None
             };
 
-            let selected = selected_id == Some(worker_id.as_str());
+            let selected = selected_id.is_some_and(|id| id.eq(worker_id.as_str()));
 
             // Query convergence state for audit trail (bd-vvmd.3.3)
             let convergence_state = if let Some(ref convergence_svc) = self.repo_convergence {
@@ -1397,7 +1397,12 @@ impl WorkerSelector {
                             format!("critical pressure: {}", pressure.reason_code),
                         )
                     } else if let Some(ref agg) = self.reliability {
-                        let assessment = agg.evaluate(worker.as_ref(), worker_id.as_str()).await;
+                        // Diagnostics run after preflight in failed-selection paths. Reusing the
+                        // cached assessment keeps the report from consuming a recovery tick.
+                        let assessment = match agg.get_assessment(worker_id.as_str()).await {
+                            Some(assessment) => assessment,
+                            None => agg.evaluate(worker.as_ref(), worker_id.as_str()).await,
+                        };
                         if assessment.hard_exclude {
                             push_reason_code(&mut reason_codes, "reliability.quarantined");
                             (
@@ -1784,7 +1789,7 @@ impl WorkerSelector {
                             "reject",
                             admission_start.elapsed(),
                         );
-                        if reason_code == "admission_critical_pressure" {
+                        if reason_code.eq("admission_critical_pressure") {
                             // Critical pressure: hard exclusion (not even in fallback)
                             metrics::inc_reliability_error(
                                 "preflight_pressure",
@@ -1931,7 +1936,7 @@ impl WorkerSelector {
             eligible.push((worker, circuit_state));
         }
 
-        if !any_has_runtime && request.required_runtime != RequiredRuntime::None {
+        if !any_has_runtime && !matches!(request.required_runtime, RequiredRuntime::None) {
             return Err(SelectionReason::NoWorkersWithRuntime(format!(
                 "{:?}",
                 request.required_runtime
@@ -2620,7 +2625,7 @@ pub async fn select_worker_with_config(
 
     if candidates.is_empty() {
         // Check if no workers have required runtime (before other checks)
-        if !any_has_runtime && request.required_runtime != RequiredRuntime::None {
+        if !any_has_runtime && !matches!(request.required_runtime, RequiredRuntime::None) {
             return SelectionResult {
                 worker: None,
                 reason: SelectionReason::NoWorkersWithRuntime(format!(
@@ -2819,7 +2824,7 @@ fn circuit_state_label(state: CircuitState) -> &'static str {
 }
 
 fn push_reason_code(reason_codes: &mut Vec<String>, reason_code: &'static str) {
-    if !reason_codes.iter().any(|existing| existing == reason_code) {
+    if !reason_codes.iter().any(|existing| existing.eq(reason_code)) {
         reason_codes.push(reason_code.to_string());
     }
 }
@@ -2902,7 +2907,7 @@ fn toolchain_capability_mismatch(
     let toolchain = toolchain?;
     if toolchain.date.is_some()
         || toolchain.full_version.trim().is_empty()
-        || toolchain.full_version.trim() == toolchain.channel
+        || toolchain.full_version.trim().eq(toolchain.channel.as_str())
     {
         return None;
     }
@@ -2918,7 +2923,7 @@ fn toolchain_capability_mismatch(
 fn rustc_version_key(value: &str) -> Option<String> {
     let mut parts = value.split_whitespace();
     let first = parts.next()?;
-    let version = if first == "rustc" {
+    let version = if first.eq("rustc") {
         parts.next()?
     } else {
         first
@@ -3010,7 +3015,8 @@ mod tests {
         let expected_json = serde_json::to_string_pretty(expected).expect("expected JSON renders");
         let expected_hash = sha256_hex(&expected_json);
         let actual_hash = sha256_hex(&actual_json);
-        panic!(
+        assert_eq!(
+            &actual, expected,
             "golden mismatch in {fixture_path}\n\
              expected_sha256={expected_hash}\n\
              actual_sha256={actual_hash}\n\
