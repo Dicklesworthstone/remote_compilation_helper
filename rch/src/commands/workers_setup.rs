@@ -699,7 +699,10 @@ else printf 'NOT_SYMLINK'; fi"
 }
 
 fn create_canonical_root_cmd(canonical: &Path) -> String {
-    format!("mkdir -p -- {}", shell_escape(canonical))
+    let c = shell_escape(canonical);
+    format!(
+        "mkdir_stderr=$(mkdir -p -- {c} 2>&1) || {{ echo \"RCH_TOPOLOGY_ERR_CANONICAL_CREATE_FAILED:path={c}:$mkdir_stderr\" >&2; exit 45; }}"
+    )
 }
 
 fn create_alias_symlink_cmd(alias: &Path, canonical: &Path) -> String {
@@ -714,14 +717,14 @@ if [ -L {a} ]; then \
 target=$(readlink -- {a} 2>/dev/null || true); \
 target_real=$(readlink -f -- {a} 2>/dev/null || true); \
 if [ \"$target\" = {c} ] || [ \"$target\" = {c_slash} ] || [ \"$target_real\" = \"$canonical_real\" ]; then return 0; fi; \
-update_stderr=$(ln -sfn -- {c} {a} 2>&1) || {{ echo \"RCH_TOPOLOGY_ERR_ALIAS_UPDATE_FAILED:$update_stderr\" >&2; return 43; }}; \
+update_stderr=$(ln -sfn -- {c} {a} 2>&1) || {{ echo \"RCH_TOPOLOGY_ERR_ALIAS_UPDATE_FAILED:path={a}:target={c}:$update_stderr\" >&2; return 43; }}; \
 elif [ -e {a} ]; then \
-echo 'RCH_TOPOLOGY_ERR_ALIAS_NOT_SYMLINK' >&2; return 42; \
+echo 'RCH_TOPOLOGY_ERR_ALIAS_NOT_SYMLINK:path={a}' >&2; return 42; \
 else \
 create_stderr=$(ln -s -- {c} {a} 2>&1) && return 0; \
 if [ -L {a} ]; then ensure_alias_symlink; return $?; fi; \
-if [ -e {a} ]; then echo 'RCH_TOPOLOGY_ERR_ALIAS_NOT_SYMLINK' >&2; return 42; fi; \
-echo \"RCH_TOPOLOGY_ERR_ALIAS_CREATE_FAILED:$create_stderr\" >&2; return 44; \
+if [ -e {a} ]; then echo 'RCH_TOPOLOGY_ERR_ALIAS_NOT_SYMLINK:path={a}' >&2; return 42; fi; \
+echo \"RCH_TOPOLOGY_ERR_ALIAS_CREATE_FAILED:path={a}:target={c}:$create_stderr\" >&2; return 44; \
 fi; \
 }}; ensure_alias_symlink"
     )
@@ -2006,9 +2009,16 @@ mod tests {
         let canonical = Path::new("-canonical-root");
         let alias = Path::new("-alias-root");
 
-        assert_eq!(
-            create_canonical_root_cmd(canonical),
-            "mkdir -p -- '-canonical-root'"
+        let create_canonical = create_canonical_root_cmd(canonical);
+        assert!(
+            create_canonical.contains("mkdir -p -- '-canonical-root'"),
+            "canonical create command must still terminate path options: {create_canonical}"
+        );
+        assert!(
+            create_canonical.contains(
+                "RCH_TOPOLOGY_ERR_CANONICAL_CREATE_FAILED:path='-canonical-root':$mkdir_stderr"
+            ),
+            "canonical create failures must report the exact path: {create_canonical}"
         );
         assert_eq!(
             update_alias_symlink_cmd(alias, canonical),
@@ -2038,6 +2048,18 @@ mod tests {
         assert!(
             create_alias.contains("RCH_TOPOLOGY_ERR_ALIAS_CREATE_FAILED"),
             "missing-alias create failures must keep a structured reason: {create_alias}"
+        );
+        assert!(
+            create_alias.contains(
+                "RCH_TOPOLOGY_ERR_ALIAS_CREATE_FAILED:path='-alias-root':target='-canonical-root':$create_stderr"
+            ),
+            "alias create failures must report the exact path and target: {create_alias}"
+        );
+        assert!(
+            create_alias.contains(
+                "RCH_TOPOLOGY_ERR_ALIAS_UPDATE_FAILED:path='-alias-root':target='-canonical-root':$update_stderr"
+            ),
+            "alias update failures must report the exact path and target: {create_alias}"
         );
 
         let check_cmd = alias_topology_check_cmd(alias, canonical);
