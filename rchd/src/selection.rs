@@ -1022,7 +1022,11 @@ impl WorkerSelector {
         let worker_id = WorkerId::new(&fallback_id);
         let worker = pool.get(&worker_id).await?;
         let available = worker.available_slots().await;
-        if available == 0 {
+        if available < request.estimated_cores {
+            debug!(
+                "Affinity fallback worker {} skipped: available slots {} < requested {}",
+                fallback_id, available, request.estimated_cores
+            );
             return None;
         }
 
@@ -5658,6 +5662,47 @@ mod tests {
         let result = selector.select(&pool, &request).await;
         assert!(result.worker.is_none());
         assert_eq!(result.reason, SelectionReason::NoWorkersPassedHealth);
+    }
+
+    #[tokio::test]
+    async fn test_selector_skips_last_success_fallback_without_enough_slots() {
+        let pool = WorkerPool::new();
+        let worker = make_worker("worker1", 4, 50.0);
+        assert!(worker.reserve_slots(3).await);
+        assert_eq!(worker.available_slots().await, 1);
+        pool.add_worker_state(worker).await;
+
+        let selector = WorkerSelector::new();
+        selector.record_success("worker1", "project-a").await;
+
+        let request = SelectionRequest {
+            project: "project-a".to_string(),
+            command: None,
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 2,
+            preferred_workers: vec![],
+            toolchain: None,
+            required_runtime: RequiredRuntime::default(),
+            classification_duration_us: None,
+            hook_pid: None,
+        };
+
+        let result = selector.select(&pool, &request).await;
+        assert!(
+            result.worker.is_none(),
+            "last-success fallback must not return a worker that cannot reserve the requested slots"
+        );
+        assert_eq!(result.reason, SelectionReason::AllWorkersBusy);
+        let diagnostics = result
+            .diagnostics
+            .expect("slot rejection should include diagnostics");
+        assert!(
+            diagnostics.workers.iter().any(|worker| worker
+                .reason_codes
+                .iter()
+                .any(|code| code == "slots.insufficient")),
+            "diagnostics should preserve the slot-capacity root cause: {diagnostics:?}"
+        );
     }
 
     // ========================================================================
