@@ -283,8 +283,10 @@ impl CompilationKind {
 /// Implements the 5-tier classification system for maximum precision with
 /// minimal latency on non-compilation commands.
 ///
-/// Multi-command strings (joined by `&&`, `||`, or `;`) are rejected by
-/// Tier 1 structure analysis to prevent partial interception issues.
+/// Pure `&&` chains with a compilation command as the final segment are
+/// accepted and rewritten to wrap only that final command. Other multi-command
+/// strings are rejected by Tier 1 structure analysis to prevent unsafe partial
+/// interception.
 pub fn classify_command(cmd: &str) -> Classification {
     classify_command_inner(cmd, 0)
 }
@@ -810,10 +812,19 @@ pub fn normalize_command(cmd: &str) -> Cow<'_, str> {
                     // We heuristically strip any token starting with '-' until we find a non-flag.
                     while result.starts_with('-') {
                         // Find the end of this token
-                        let end_idx = result.find(char::is_whitespace).unwrap_or(result.len());
+                        let (flag, rest_after_flag) = result
+                            .split_once(char::is_whitespace)
+                            .unwrap_or((result, ""));
 
                         // Safety: we checked starts_with('-'), so token is not empty
-                        result = result[end_idx..].trim_start();
+                        result = rest_after_flag.trim_start();
+
+                        if wrapper == "env" && matches!(flag, "-u" | "--unset") {
+                            let (_env_name, rest_after_env_name) = result
+                                .split_once(char::is_whitespace)
+                                .unwrap_or((result, ""));
+                            result = rest_after_env_name.trim_start();
+                        }
                     }
                 }
             }
@@ -2166,9 +2177,20 @@ mod tests {
     #[test]
     fn test_classify_command_detailed_normalizes_wrappers() {
         let _guard = test_guard!();
-        let detailed = classify_command_detailed("sudo cargo check");
-        assert_eq!(detailed.normalized, "cargo check");
-        assert!(detailed.classification.is_compilation);
+        for (cmd, normalized) in [
+            ("sudo cargo check", "cargo check"),
+            ("env -u RUST_LOG cargo test", "cargo test"),
+        ] {
+            let detailed = classify_command_detailed(cmd);
+            assert_eq!(
+                (
+                    detailed.normalized.as_str(),
+                    detailed.classification.is_compilation
+                ),
+                (normalized, true),
+                "{cmd}"
+            );
+        }
     }
 
     #[test]
@@ -3869,11 +3891,17 @@ mod tests_normalize_whitespace {
     fn test_env_var_whitespace() {
         let _guard = test_guard!();
 
-        // env with multiple spaces before VAR
-        assert_eq!(normalize_command("env  RUST_BACKTRACE=1 cargo"), "cargo");
-
-        // env with tabs
-        assert_eq!(normalize_command("env\tRUST_BACKTRACE=1\tcargo"), "cargo");
+        for (cmd, normalized) in [
+            // env with multiple spaces before VAR
+            ("env  RUST_BACKTRACE=1 cargo", "cargo"),
+            // env with tabs
+            ("env\tRUST_BACKTRACE=1\tcargo", "cargo"),
+            ("env -u RUST_LOG cargo test", "cargo test"),
+            ("env --unset RUST_LOG cargo test", "cargo test"),
+            ("env --unset=RUST_LOG cargo test", "cargo test"),
+        ] {
+            assert_eq!(normalize_command(cmd), normalized, "{cmd}");
+        }
     }
 }
 
@@ -5168,6 +5196,13 @@ mod regression_classification {
             },
             Case {
                 cmd: "env RUST_BACKTRACE=1 cargo test",
+                expect_compilation: true,
+                expected_kind: Some(CompilationKind::CargoTest),
+                reason_contains: "cargo test",
+                min_confidence: 0.90,
+            },
+            Case {
+                cmd: "env -u RUST_LOG cargo test",
                 expect_compilation: true,
                 expected_kind: Some(CompilationKind::CargoTest),
                 reason_contains: "cargo test",
