@@ -1,0 +1,38 @@
+{
+  "schema_version": "rch.golden.speedscore_list_status_shapes.v1",
+  "stability": {
+    "deterministic": true,
+    "platform_dependent": false,
+    "volatility": 1,
+    "strategy": "exact"
+  },
+  "raw_response": {
+    "workers": [
+      {
+        "worker_id": "vmi-fixture-string",
+        "speedscore": null,
+        "status": "healthy"
+      },
+      {
+        "worker_id": "vmi-fixture-object",
+        "speedscore": null,
+        "status": {
+          "status": "degraded",
+          "circuit_state": "half_open"
+        }
+      }
+    ]
+  },
+  "expected_statuses": [
+    {
+      "worker_id": "vmi-fixture-string",
+      "status": "healthy",
+      "circuit_state": "unknown"
+    },
+    {
+      "worker_id": "vmi-fixture-object",
+      "status": "degraded",
+      "circuit_state": "half_open"
+    }
+  ]
+}

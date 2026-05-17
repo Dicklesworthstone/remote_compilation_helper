@@ -173,9 +173,36 @@ mod tests {
     use rch_common::test_guard;
     use rch_common::{ApiError, ApiResponse, ErrorCode, WorkerCapabilities, WorkerConfig};
     use rch_common::{Classification, CompilationKind, RequiredRuntime, WorkerId};
-    use rch_common::{SelectedWorker, SelectionReason};
+    use rch_common::{
+        SelectedWorker, SelectionDiagnostics, SelectionReason, WorkerSelectionDiagnostic,
+        WorkerSelectionDiagnosticDecision,
+    };
     use serde::Serialize;
     use std::path::PathBuf;
+
+    fn assert_golden_json(
+        actual: serde_json::Value,
+        expected: &serde_json::Value,
+        fixture_path: &str,
+    ) {
+        if &actual == expected {
+            return;
+        }
+
+        let actual_json = serde_json::to_string_pretty(&actual).expect("actual JSON renders");
+        let expected_json = serde_json::to_string_pretty(expected).expect("expected JSON renders");
+        panic!(
+            "golden mismatch in {fixture_path}\n\
+             expected_blake3={}\n\
+             actual_blake3={}\n\
+             bless path: review the semantic diff, update the fixture expected_* field, \
+             and record both hashes in the Beads closeout.\n\
+             expected:\n{expected_json}\n\
+             actual:\n{actual_json}",
+            blake3::hash(expected_json.as_bytes()),
+            blake3::hash(actual_json.as_bytes())
+        );
+    }
 
     struct TestConfigDirGuard;
 
@@ -1033,10 +1060,8 @@ mod tests {
             &None,
             false, // daemon not reachable
         );
-        // With no worker selection and daemon not reachable, would_offload is still true
-        // because the function returns optimistic summary
-        assert!(summary.would_offload);
-        assert!(summary.reason.contains("worker available"));
+        assert!(!summary.would_offload);
+        assert!(summary.reason.contains("daemon is not reachable"));
         // Intercepted commands have 6 pipeline steps
         assert_eq!(summary.pipeline_steps.len(), 6);
         // Classification step should run
@@ -1045,6 +1070,18 @@ mod tests {
         // Daemon query should be skipped (daemon not reachable)
         assert!(summary.pipeline_steps[1].skipped);
         assert_eq!(summary.pipeline_steps[1].name, "Daemon query");
+        assert!(summary.pipeline_steps[2].skipped);
+        assert!(summary.pipeline_steps[3].skipped);
+        assert!(summary.pipeline_steps[4].skipped);
+        assert!(summary.pipeline_steps[5].skipped);
+        for step in &summary.pipeline_steps[2..] {
+            assert_eq!(
+                step.skip_reason.as_deref(),
+                Some("Daemon not reachable"),
+                "skipped step {} should explain the daemon gate",
+                step.name
+            );
+        }
     }
 
     #[test]
@@ -1062,6 +1099,7 @@ mod tests {
             estimated_cores: 4,
             worker: Some(worker),
             reason: SelectionReason::Success,
+            diagnostics: None,
         };
         let summary = build_dry_run_summary(
             true,
@@ -1077,6 +1115,156 @@ mod tests {
         for step in &summary.pipeline_steps {
             assert!(!step.skipped, "Step {} should not be skipped", step.name);
         }
+    }
+
+    #[test]
+    fn dry_run_summary_intercepted_without_worker_reports_no_offload() {
+        let _guard = test_guard!();
+        let worker_selection = DiagnoseWorkerSelection {
+            estimated_cores: 4,
+            worker: None,
+            reason: SelectionReason::NoAdmissibleWorkers("critical_pressure=1".to_string()),
+            diagnostics: None,
+        };
+        let summary = build_dry_run_summary(
+            true,
+            "meets confidence threshold",
+            &Some(worker_selection),
+            true,
+        );
+
+        assert!(!summary.would_offload);
+        assert!(
+            summary
+                .reason
+                .contains("no admissible workers: critical_pressure=1")
+        );
+        assert_eq!(summary.pipeline_steps.len(), 6);
+        assert!(!summary.pipeline_steps[0].skipped);
+        assert!(!summary.pipeline_steps[1].skipped);
+        assert!(summary.pipeline_steps[2].skipped);
+        assert_eq!(
+            summary.pipeline_steps[2].skip_reason.as_deref(),
+            Some("no admissible workers: critical_pressure=1")
+        );
+        assert!(summary.pipeline_steps[3].skipped);
+        assert_eq!(
+            summary.pipeline_steps[3].skip_reason.as_deref(),
+            Some("no admissible workers: critical_pressure=1")
+        );
+        assert!(summary.pipeline_steps[4].skipped);
+        assert_eq!(
+            summary.pipeline_steps[4].skip_reason.as_deref(),
+            Some("no admissible workers: critical_pressure=1")
+        );
+        assert!(summary.pipeline_steps[5].skipped);
+        assert_eq!(
+            summary.pipeline_steps[5].skip_reason.as_deref(),
+            Some("no admissible workers: critical_pressure=1")
+        );
+
+        let fixture_path = "../../../tests/goldens/ft_4tp7g/dry_run_summary_no_worker.json";
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/goldens/ft_4tp7g/dry_run_summary_no_worker.json"
+        ))
+        .expect("dry-run summary no-worker golden fixture parses");
+        assert_eq!(fixture["schema_version"], "rch.golden.dry_run_summary.v1");
+        assert_golden_json(
+            serde_json::to_value(&summary).expect("dry-run summary serializes"),
+            fixture
+                .get("expected_summary")
+                .expect("golden fixture has expected_summary"),
+            fixture_path,
+        );
+    }
+
+    #[test]
+    fn diagnose_dry_run_response_golden_no_worker() {
+        let _guard = test_guard!();
+        let worker_selection = DiagnoseWorkerSelection {
+            estimated_cores: 4,
+            worker: None,
+            reason: SelectionReason::NoAdmissibleWorkers("critical_pressure=1".to_string()),
+            diagnostics: Some(SelectionDiagnostics {
+                required_runtime: RequiredRuntime::Rust,
+                estimated_cores: 4,
+                min_success_rate: 0.8,
+                fallback_min_success_rate: 0.5,
+                active_project_exclusion_count: 0,
+                workers: vec![WorkerSelectionDiagnostic {
+                    worker_id: WorkerId::new("fixture-worker"),
+                    status: "healthy".to_string(),
+                    circuit_state: "closed".to_string(),
+                    pressure_state: "critical".to_string(),
+                    pressure_reason_code: "disk_ratio_below_critical".to_string(),
+                    success_rate: Some(0.95),
+                    min_success_rate: 0.8,
+                    fallback_min_success_rate: 0.5,
+                    required_runtime: RequiredRuntime::Rust,
+                    runtime_available: true,
+                    available_slots: 8,
+                    total_slots: 8,
+                    estimated_cores: 4,
+                    active_project_excluded: false,
+                    final_decision: WorkerSelectionDiagnosticDecision::Deny,
+                    final_reason: "critical pressure: disk_ratio_below_critical".to_string(),
+                    reason_codes: vec!["pressure.critical".to_string()],
+                }],
+            }),
+        };
+        let dry_run = build_dry_run_summary(
+            true,
+            "Compilation command with confidence 0.95 >= threshold 0.85",
+            &Some(worker_selection.clone()),
+            true,
+        );
+        let response = DiagnoseResponse {
+            classification: Classification::compilation(
+                CompilationKind::CargoTest,
+                0.95,
+                "cargo test",
+            ),
+            tiers: Vec::new(),
+            command: "cargo test -p frankenterm-core --lib agent_mail -- --nocapture".to_string(),
+            normalized_command: "cargo test -p frankenterm-core --lib agent_mail -- --nocapture"
+                .to_string(),
+            decision: DiagnoseDecision {
+                would_intercept: true,
+                reason: "Compilation command with confidence 0.95 >= threshold 0.85".to_string(),
+            },
+            threshold: DiagnoseThreshold {
+                value: 0.85,
+                source: "fixture".to_string(),
+            },
+            daemon: DiagnoseDaemonStatus {
+                socket_path: "/tmp/rch.sock".to_string(),
+                socket_exists: true,
+                reachable: true,
+                status: Some("healthy".to_string()),
+                version: Some("1.0.26".to_string()),
+                uptime_seconds: Some(123),
+                error: None,
+            },
+            required_runtime: RequiredRuntime::Rust,
+            local_capabilities: None,
+            capabilities_warnings: Vec::new(),
+            worker_selection: Some(worker_selection),
+            dry_run: Some(dry_run),
+        };
+
+        let fixture_path = "../../../tests/goldens/ft_4tp7g/diagnose_dry_run_no_worker.json";
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/goldens/ft_4tp7g/diagnose_dry_run_no_worker.json"
+        ))
+        .expect("diagnose dry-run no-worker golden fixture parses");
+        assert_eq!(fixture["schema_version"], "rch.golden.diagnose_dry_run.v1");
+        assert_golden_json(
+            serde_json::to_value(&response).expect("diagnose response serializes"),
+            fixture
+                .get("expected_response")
+                .expect("golden fixture has expected_response"),
+            fixture_path,
+        );
     }
 
     #[test]

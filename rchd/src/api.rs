@@ -2094,6 +2094,7 @@ async fn handle_select_worker(
             worker: None,
             reason: SelectionReason::AllCircuitsOpen,
             build_id: None,
+            diagnostics: None,
         });
     }
 
@@ -2113,6 +2114,7 @@ async fn handle_select_worker(
                 .select_with_exclusions(&ctx.pool, request, &excluded_worker_ids)
                 .await;
             let selection_reason = result.reason;
+            let selection_diagnostics = result.diagnostics;
 
             let Some(worker) = result.worker else {
                 debug!("No worker selected: {}", selection_reason);
@@ -2120,6 +2122,7 @@ async fn handle_select_worker(
                     worker: None,
                     reason: selection_reason,
                     build_id: None,
+                    diagnostics: selection_diagnostics,
                 });
             };
 
@@ -2205,6 +2208,7 @@ async fn handle_select_worker(
                     }),
                     reason: selection_reason,
                     build_id,
+                    diagnostics: selection_diagnostics,
                 });
             }
 
@@ -2219,6 +2223,7 @@ async fn handle_select_worker(
                     worker: None,
                     reason: SelectionReason::AllWorkersBusy,
                     build_id: None,
+                    diagnostics: None,
                 });
             }
             // Loop again - next selection will see reduced slot count.
@@ -2300,6 +2305,7 @@ async fn handle_select_worker(
                 worker: None,
                 reason: SelectionReason::SelectionError("queue_timeout".to_string()),
                 build_id: None,
+                diagnostics: None,
             });
         }
 
@@ -2322,6 +2328,7 @@ async fn handle_select_worker(
                 worker: None,
                 reason: SelectionReason::SelectionError("hook_exited".to_string()),
                 build_id: None,
+                diagnostics: None,
             });
         }
 
@@ -3973,6 +3980,17 @@ mod tests {
         assert_eq!(
             second_response.reason,
             SelectionReason::NoAdmissibleWorkers("active_project_exclusion=1".to_string())
+        );
+        let diagnostics = second_response
+            .diagnostics
+            .expect("daemon response should surface selector diagnostics");
+        assert_eq!(diagnostics.active_project_exclusion_count, 1);
+        assert_eq!(diagnostics.workers.len(), 1);
+        assert!(
+            diagnostics.workers[0]
+                .reason_codes
+                .iter()
+                .any(|code| code == "active_project_exclusion")
         );
     }
 

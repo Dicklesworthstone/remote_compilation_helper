@@ -5,8 +5,8 @@
 //! and enable easier testing.
 
 use rch_common::{
-    Classification, ClassificationTier, RequiredRuntime, SelectedWorker, SelectionReason,
-    WorkerCapabilities, WorkerConfig,
+    Classification, ClassificationTier, RequiredRuntime, SelectedWorker, SelectionDiagnostics,
+    SelectionReason, WorkerCapabilities, WorkerConfig,
 };
 use schemars::JsonSchema;
 use serde::Serialize;
@@ -455,6 +455,8 @@ pub struct DiagnoseWorkerSelection {
     pub estimated_cores: u32,
     pub worker: Option<SelectedWorker>,
     pub reason: SelectionReason,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<SelectionDiagnostics>,
 }
 
 /// Pipeline step for dry-run output.

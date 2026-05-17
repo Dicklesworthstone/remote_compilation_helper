@@ -2519,6 +2519,7 @@ pub(crate) async fn query_daemon(
             worker: None,
             reason: SelectionReason::AllCircuitsOpen,
             build_id: None,
+            diagnostics: None,
         });
     }
 
@@ -7124,6 +7125,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_process_hook_allows_beads_comment_with_embedded_build_text() {
+        let input = HookInput {
+            tool_name: "Bash".to_string(),
+            tool_input: ToolInput {
+                command:
+                    r#"br comments add ft-4tp7g.1 "remote proof blocked: cargo test -p rchd --lib""#
+                        .to_string(),
+                description: None,
+            },
+            session_id: None,
+        };
+
+        let output = process_hook(input).await;
+        assert!(
+            matches!(output, HookOutput::Allow(_)),
+            "embedded build text in a Beads comment must not delegate to rch exec: {output:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_process_hook_allows_env_prefixed_beads_comment_with_embedded_build_text() {
+        let input = HookInput {
+            tool_name: "Bash".to_string(),
+            tool_input: ToolInput {
+                command: r#"AGENT_NAME=Codex br comments add ft-4tp7g.4 "proof lane: cargo clippy --workspace""#
+                    .to_string(),
+                description: None,
+            },
+            session_id: None,
+        };
+
+        let output = process_hook(input).await;
+        assert!(
+            matches!(output, HookOutput::Allow(_)),
+            "env-prefixed Beads comments with build text must not delegate to rch exec: {output:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_process_hook_bypasses_classification_cache_without_env_flag() {
         let unique_cmd = "echo rch-hook-cache-bypass-without-env-marker";
         let input = HookInput {
@@ -7636,6 +7676,7 @@ mod tests {
                 }),
                 reason: SelectionReason::Success,
                 build_id: None,
+                diagnostics: None,
             };
             let body = serde_json::to_string(&response).unwrap();
             let http_response = format!(
@@ -7718,6 +7759,7 @@ mod tests {
                 }),
                 reason: SelectionReason::Success,
                 build_id: None,
+                diagnostics: None,
             };
             let body = serde_json::to_string(&response).unwrap();
             let http_response = format!(
@@ -7804,6 +7846,7 @@ mod tests {
                 }),
                 reason: SelectionReason::Success,
                 build_id: None,
+                diagnostics: None,
             };
             let body = serde_json::to_string(&response).unwrap();
             let http_response = format!(
@@ -7879,6 +7922,7 @@ mod tests {
                 }),
                 reason: SelectionReason::Success,
                 build_id: None,
+                diagnostics: None,
             };
             let body = serde_json::to_string(&response).unwrap();
             let http = format!("HTTP/1.1 200 OK\r\n\r\n{}", body);
@@ -7998,6 +8042,7 @@ mod tests {
             }),
             reason: SelectionReason::Success,
             build_id: None,
+            diagnostics: None,
         };
         spawn_mock_daemon(&socket_path, response).await;
 
@@ -8076,6 +8121,7 @@ mod tests {
             }),
             reason: SelectionReason::Success,
             build_id: None,
+            diagnostics: None,
         };
         spawn_mock_daemon(&socket_path, response).await;
 
@@ -8142,6 +8188,7 @@ mod tests {
             }),
             reason: SelectionReason::Success,
             build_id: None,
+            diagnostics: None,
         };
         spawn_mock_daemon(&socket_path, response).await;
 
@@ -8327,6 +8374,7 @@ mod tests {
             }),
             reason: SelectionReason::Success,
             build_id: None,
+            diagnostics: None,
         };
         spawn_mock_daemon(&socket_path, response).await;
 
@@ -8413,6 +8461,7 @@ mod tests {
             worker: None,
             reason: SelectionReason::NoWorkersConfigured,
             build_id: None,
+            diagnostics: None,
         };
         spawn_mock_daemon(&socket_path, response).await;
         tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
@@ -8456,6 +8505,7 @@ mod tests {
             worker: None,
             reason: SelectionReason::AllWorkersUnreachable,
             build_id: None,
+            diagnostics: None,
         };
         spawn_mock_daemon(&socket_path, response).await;
         tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
@@ -8499,6 +8549,7 @@ mod tests {
             worker: None,
             reason: SelectionReason::AllWorkersBusy,
             build_id: None,
+            diagnostics: None,
         };
         spawn_mock_daemon(&socket_path, response).await;
         tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
@@ -8542,6 +8593,7 @@ mod tests {
             worker: None,
             reason: SelectionReason::AllCircuitsOpen,
             build_id: None,
+            diagnostics: None,
         };
         spawn_mock_daemon(&socket_path, response).await;
         tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
@@ -8585,6 +8637,7 @@ mod tests {
             worker: None,
             reason: SelectionReason::SelectionError("Internal error".to_string()),
             build_id: None,
+            diagnostics: None,
         };
         spawn_mock_daemon(&socket_path, response).await;
         tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
@@ -11279,6 +11332,7 @@ edition = "2024"
             }),
             reason: SelectionReason::Success,
             build_id: None,
+            diagnostics: None,
         };
         spawn_mock_daemon(&socket_path, response).await;
 
@@ -11339,6 +11393,7 @@ edition = "2024"
             }),
             reason: SelectionReason::Success,
             build_id: None,
+            diagnostics: None,
         };
         spawn_mock_daemon(&socket_path, response).await;
 
@@ -11399,6 +11454,7 @@ edition = "2024"
             }),
             reason: SelectionReason::Success,
             build_id: None,
+            diagnostics: None,
         };
         spawn_mock_daemon(&socket_path, response).await;
 
@@ -11464,6 +11520,7 @@ edition = "2024"
             }),
             reason: SelectionReason::Success,
             build_id: None,
+            diagnostics: None,
         };
         spawn_mock_daemon(&socket_path, response).await;
 
@@ -11529,6 +11586,7 @@ edition = "2024"
             }),
             reason: SelectionReason::Success,
             build_id: None,
+            diagnostics: None,
         };
         spawn_mock_daemon(&socket_path, response).await;
 
@@ -11589,6 +11647,7 @@ edition = "2024"
             }),
             reason: SelectionReason::Success,
             build_id: None,
+            diagnostics: None,
         };
         spawn_mock_daemon(&socket_path, response).await;
 

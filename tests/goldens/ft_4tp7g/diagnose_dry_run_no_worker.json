@@ -1,0 +1,141 @@
+{
+  "schema_version": "rch.golden.diagnose_dry_run.v1",
+  "volatility": {
+    "platform_dependent": false,
+    "dynamic_fields_scrubbed": [
+      "socket_paths",
+      "timestamps",
+      "pids",
+      "build_ids",
+      "host_temp_dirs",
+      "real_worker_ids",
+      "real_hostnames"
+    ]
+  },
+  "raw_input": {
+    "command": "cargo test -p frankenterm-core --lib agent_mail -- --nocapture",
+    "daemon_reachable": true,
+    "worker_selection": {
+      "estimated_cores": 4,
+      "worker": null,
+      "reason": "no admissible workers: critical_pressure=1",
+      "diagnostics": "one fixture worker denied by critical pressure"
+    }
+  },
+  "expected_response": {
+    "classification": {
+      "is_compilation": true,
+      "confidence": 0.95,
+      "kind": "cargo_test",
+      "reason": "cargo test",
+      "command_prefix": null,
+      "extracted_command": null
+    },
+    "tiers": [],
+    "command": "cargo test -p frankenterm-core --lib agent_mail -- --nocapture",
+    "normalized_command": "cargo test -p frankenterm-core --lib agent_mail -- --nocapture",
+    "decision": {
+      "would_intercept": true,
+      "reason": "Compilation command with confidence 0.95 >= threshold 0.85"
+    },
+    "threshold": {
+      "value": 0.85,
+      "source": "fixture"
+    },
+    "daemon": {
+      "socket_path": "/tmp/rch.sock",
+      "socket_exists": true,
+      "reachable": true,
+      "status": "healthy",
+      "version": "1.0.26",
+      "uptime_seconds": 123
+    },
+    "required_runtime": "rust",
+    "worker_selection": {
+      "estimated_cores": 4,
+      "worker": null,
+      "reason": {
+        "no_admissible_workers": "critical_pressure=1"
+      },
+      "diagnostics": {
+        "required_runtime": "rust",
+        "estimated_cores": 4,
+        "min_success_rate": 0.8,
+        "fallback_min_success_rate": 0.5,
+        "active_project_exclusion_count": 0,
+        "workers": [
+          {
+            "worker_id": "fixture-worker",
+            "status": "healthy",
+            "circuit_state": "closed",
+            "pressure_state": "critical",
+            "pressure_reason_code": "disk_ratio_below_critical",
+            "success_rate": 0.95,
+            "min_success_rate": 0.8,
+            "fallback_min_success_rate": 0.5,
+            "required_runtime": "rust",
+            "runtime_available": true,
+            "available_slots": 8,
+            "total_slots": 8,
+            "estimated_cores": 4,
+            "active_project_excluded": false,
+            "final_decision": "deny",
+            "final_reason": "critical pressure: disk_ratio_below_critical",
+            "reason_codes": [
+              "pressure.critical"
+            ]
+          }
+        ]
+      }
+    },
+    "dry_run": {
+      "would_offload": false,
+      "reason": "compilation command meets threshold, but no worker selected: no admissible workers: critical_pressure=1",
+      "pipeline_steps": [
+        {
+          "step": 1,
+          "name": "Classification",
+          "description": "Command classified as compilation",
+          "skipped": false,
+          "estimated_duration_ms": 1
+        },
+        {
+          "step": 2,
+          "name": "Daemon query",
+          "description": "Request worker selection from daemon",
+          "skipped": false,
+          "estimated_duration_ms": 5
+        },
+        {
+          "step": 3,
+          "name": "Worker selection",
+          "description": "Select best available worker",
+          "skipped": true,
+          "skip_reason": "no admissible workers: critical_pressure=1",
+          "estimated_duration_ms": 2
+        },
+        {
+          "step": 4,
+          "name": "Transfer",
+          "description": "Sync project files to worker via rsync+zstd",
+          "skipped": true,
+          "skip_reason": "no admissible workers: critical_pressure=1"
+        },
+        {
+          "step": 5,
+          "name": "Remote execution",
+          "description": "Execute compilation command on worker",
+          "skipped": true,
+          "skip_reason": "no admissible workers: critical_pressure=1"
+        },
+        {
+          "step": 6,
+          "name": "Artifact retrieval",
+          "description": "Retrieve build artifacts from remote worker",
+          "skipped": true,
+          "skip_reason": "no admissible workers: critical_pressure=1"
+        }
+      ]
+    }
+  }
+}

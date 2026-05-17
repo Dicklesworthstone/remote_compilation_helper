@@ -1,0 +1,44 @@
+{
+  "schema_version": "rch.golden.selection_diagnostics.v1",
+  "stability": {
+    "deterministic": true,
+    "platform_dependent": false,
+    "volatility": 2,
+    "strategy": "exact"
+  },
+  "expected_response": {
+    "worker": null,
+    "reason": "no_workers_passed_health",
+    "diagnostics": {
+      "required_runtime": "rust",
+      "estimated_cores": 2,
+      "min_success_rate": 0.8,
+      "fallback_min_success_rate": 0.5,
+      "active_project_exclusion_count": 0,
+      "workers": [
+        {
+          "worker_id": "fixture-worker",
+          "status": "healthy",
+          "circuit_state": "closed",
+          "pressure_state": "healthy",
+          "pressure_reason_code": "pressure.ok",
+          "success_rate": 0.2,
+          "min_success_rate": 0.8,
+          "fallback_min_success_rate": 0.5,
+          "required_runtime": "rust",
+          "runtime_available": true,
+          "available_slots": 8,
+          "total_slots": 8,
+          "estimated_cores": 2,
+          "active_project_excluded": false,
+          "final_decision": "deny",
+          "final_reason": "success_rate 0.20 < fallback 0.50",
+          "reason_codes": [
+            "health.below_min_success_rate",
+            "health.below_fallback_min_success_rate"
+          ]
+        }
+      ]
+    }
+  }
+}

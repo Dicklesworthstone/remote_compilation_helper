@@ -1,0 +1,73 @@
+{
+  "schema_version": "rch.golden.dry_run_summary.v1",
+  "volatility": {
+    "platform_dependent": false,
+    "dynamic_fields_scrubbed": [
+      "worker_hostnames",
+      "socket_paths",
+      "timestamps",
+      "pids",
+      "build_ids",
+      "host_temp_dirs"
+    ]
+  },
+  "raw_input": {
+    "would_intercept": true,
+    "daemon_reachable": true,
+    "classification_reason": "meets confidence threshold",
+    "worker_selection": {
+      "estimated_cores": 4,
+      "worker": null,
+      "reason": "no admissible workers: critical_pressure=1"
+    }
+  },
+  "expected_summary": {
+    "would_offload": false,
+    "reason": "compilation command meets threshold, but no worker selected: no admissible workers: critical_pressure=1",
+    "pipeline_steps": [
+      {
+        "step": 1,
+        "name": "Classification",
+        "description": "Command classified as compilation",
+        "skipped": false,
+        "estimated_duration_ms": 1
+      },
+      {
+        "step": 2,
+        "name": "Daemon query",
+        "description": "Request worker selection from daemon",
+        "skipped": false,
+        "estimated_duration_ms": 5
+      },
+      {
+        "step": 3,
+        "name": "Worker selection",
+        "description": "Select best available worker",
+        "skipped": true,
+        "skip_reason": "no admissible workers: critical_pressure=1",
+        "estimated_duration_ms": 2
+      },
+      {
+        "step": 4,
+        "name": "Transfer",
+        "description": "Sync project files to worker via rsync+zstd",
+        "skipped": true,
+        "skip_reason": "no admissible workers: critical_pressure=1"
+      },
+      {
+        "step": 5,
+        "name": "Remote execution",
+        "description": "Execute compilation command on worker",
+        "skipped": true,
+        "skip_reason": "no admissible workers: critical_pressure=1"
+      },
+      {
+        "step": 6,
+        "name": "Artifact retrieval",
+        "description": "Retrieve build artifacts from remote worker",
+        "skipped": true,
+        "skip_reason": "no admissible workers: critical_pressure=1"
+      }
+    ]
+  }
+}

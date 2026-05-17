@@ -1,0 +1,59 @@
+{
+  "schema_version": "rch.golden.speedscore_list_status_shapes.v1",
+  "volatility": {
+    "platform_dependent": false,
+    "dynamic_fields_scrubbed": [
+      "measured_at"
+    ]
+  },
+  "raw_response": {
+    "workers": [
+      {
+        "worker_id": "vmi1227854",
+        "speedscore": null,
+        "status": "healthy"
+      },
+      {
+        "worker_id": "linux-builder-2",
+        "speedscore": {
+          "total": 91.0,
+          "cpu_score": 92.0,
+          "memory_score": 90.0,
+          "disk_score": 89.0,
+          "network_score": 93.0,
+          "compilation_score": 91.0,
+          "measured_at": "SCRUBBED_TIMESTAMP",
+          "version": 1
+        },
+        "status": {
+          "status": "degraded",
+          "circuit_state": "half_open"
+        }
+      }
+    ]
+  },
+  "expected_statuses": [
+    {
+      "worker_id": "vmi1227854",
+      "status": "healthy",
+      "circuit_state": "unknown"
+    },
+    {
+      "worker_id": "linux-builder-2",
+      "status": "degraded",
+      "circuit_state": "half_open"
+    }
+  ],
+  "unsupported_raw_response": {
+    "workers": [
+      {
+        "worker_id": "bad-shape",
+        "speedscore": null,
+        "status": {
+          "state": "healthy"
+        }
+      }
+    ]
+  },
+  "expected_unsupported_error_contains": "data did not match any variant"
+}

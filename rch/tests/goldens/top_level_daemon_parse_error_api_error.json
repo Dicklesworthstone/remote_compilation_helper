@@ -1,0 +1,16 @@
+{
+  "schema_version": "rch.golden.top_level_api_error.v1",
+  "stability": {
+    "deterministic": true,
+    "platform_dependent": false,
+    "volatility": 1,
+    "strategy": "exact"
+  },
+  "input_error": "Failed to parse SpeedScore list response: invalid type: string \"healthy\", expected struct WorkerStatusFromSpeedScoreApi at line 1 column 74",
+  "expected": {
+    "code": "RCH-E505",
+    "category": "internal",
+    "message": "Serialization/deserialization error",
+    "details": "Failed to parse SpeedScore list response: invalid type: string \"healthy\", expected struct WorkerStatusFromSpeedScoreApi at line 1 column 74"
+  }
+}

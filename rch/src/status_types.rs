@@ -687,10 +687,46 @@ pub struct SpeedScoreHistoryResponseFromApi {
 }
 
 /// Worker status for SpeedScore list.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct WorkerStatusFromSpeedScoreApi {
     pub status: String,
     pub circuit_state: String,
+}
+
+fn default_speedscore_circuit_state() -> String {
+    "unknown".to_string()
+}
+
+impl<'de> Deserialize<'de> for WorkerStatusFromSpeedScoreApi {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum WireStatus {
+            Text(String),
+            Object {
+                status: String,
+                #[serde(default = "default_speedscore_circuit_state")]
+                circuit_state: String,
+            },
+        }
+
+        match WireStatus::deserialize(deserializer)? {
+            WireStatus::Text(status) => Ok(Self {
+                status,
+                circuit_state: default_speedscore_circuit_state(),
+            }),
+            WireStatus::Object {
+                status,
+                circuit_state,
+            } => Ok(Self {
+                status,
+                circuit_state,
+            }),
+        }
+    }
 }
 
 /// SpeedScore list entry.
@@ -756,6 +792,30 @@ mod tests {
     use super::*;
     use rch_common::test_guard;
 
+    fn assert_golden_json(
+        actual: serde_json::Value,
+        expected: &serde_json::Value,
+        fixture_path: &str,
+    ) {
+        if &actual == expected {
+            return;
+        }
+
+        let actual_json = serde_json::to_string_pretty(&actual).expect("actual JSON renders");
+        let expected_json = serde_json::to_string_pretty(expected).expect("expected JSON renders");
+        panic!(
+            "golden mismatch in {fixture_path}\n\
+             expected_blake3={}\n\
+             actual_blake3={}\n\
+             bless path: review the semantic diff, update the fixture expected_* field, \
+             and record both hashes in the Beads closeout.\n\
+             expected:\n{expected_json}\n\
+             actual:\n{actual_json}",
+            blake3::hash(expected_json.as_bytes()),
+            blake3::hash(actual_json.as_bytes())
+        );
+    }
+
     #[test]
     fn test_format_duration() {
         let _guard = test_guard!();
@@ -778,6 +838,97 @@ mod tests {
         let _guard = test_guard!();
         let response = "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n{\"test\": 1}";
         assert_eq!(extract_json_body(response), Some("{\"test\": 1}"));
+    }
+
+    #[test]
+    fn test_speedscore_list_accepts_string_worker_status() {
+        let _guard = test_guard!();
+        let json = serde_json::json!({
+            "workers": [
+                {
+                    "worker_id": "vmi1227854",
+                    "speedscore": null,
+                    "status": "healthy"
+                }
+            ]
+        });
+
+        let response: SpeedScoreListResponseFromApi = serde_json::from_value(json).unwrap();
+        assert_eq!(response.workers.len(), 1);
+        assert_eq!(response.workers[0].status.status, "healthy");
+        assert_eq!(response.workers[0].status.circuit_state, "unknown");
+    }
+
+    #[test]
+    fn test_speedscore_list_still_accepts_object_worker_status() {
+        let _guard = test_guard!();
+        let json = serde_json::json!({
+            "workers": [
+                {
+                    "worker_id": "vmi1227854",
+                    "speedscore": null,
+                    "status": {
+                        "status": "degraded",
+                        "circuit_state": "half_open"
+                    }
+                }
+            ]
+        });
+
+        let response: SpeedScoreListResponseFromApi = serde_json::from_value(json).unwrap();
+        assert_eq!(response.workers.len(), 1);
+        assert_eq!(response.workers[0].status.status, "degraded");
+        assert_eq!(response.workers[0].status.circuit_state, "half_open");
+    }
+
+    #[test]
+    fn golden_speedscore_list_accepts_current_and_legacy_status_shapes() {
+        let _guard = test_guard!();
+        const FIXTURE_PATH: &str =
+            "../../tests/goldens/ft_4tp7g/speedscore_list_status_shapes.json";
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/goldens/ft_4tp7g/speedscore_list_status_shapes.json"
+        ))
+        .expect("speedscore status-shape golden parses");
+        assert_eq!(
+            fixture["schema_version"],
+            "rch.golden.speedscore_list_status_shapes.v1"
+        );
+
+        let response: SpeedScoreListResponseFromApi =
+            serde_json::from_value(fixture["raw_response"].clone())
+                .expect("speedscore list parses from golden raw response");
+        let actual_statuses = response
+            .workers
+            .iter()
+            .map(|worker| {
+                serde_json::json!({
+                    "worker_id": worker.worker_id.as_str(),
+                    "status": worker.status.status.as_str(),
+                    "circuit_state": worker.status.circuit_state.as_str(),
+                })
+            })
+            .collect::<Vec<_>>();
+
+        assert_golden_json(
+            serde_json::Value::Array(actual_statuses),
+            &fixture["expected_statuses"],
+            FIXTURE_PATH,
+        );
+
+        let unsupported = serde_json::from_value::<SpeedScoreListResponseFromApi>(
+            fixture["unsupported_raw_response"].clone(),
+        )
+        .expect_err("unsupported worker status shape should fail to deserialize");
+        let unsupported_error = unsupported.to_string();
+        assert!(
+            unsupported_error.contains(
+                fixture["expected_unsupported_error_contains"]
+                    .as_str()
+                    .expect("expected unsupported error substring")
+            ),
+            "unsupported status error changed: {unsupported_error}"
+        );
     }
 
     #[test]

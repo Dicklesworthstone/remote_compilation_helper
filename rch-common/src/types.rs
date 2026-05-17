@@ -496,6 +496,78 @@ pub struct SelectionResponse {
     /// Optional build ID assigned by the daemon (for active build tracking).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_id: Option<u64>,
+    /// Optional per-worker selector diagnostics for machine-readable triage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<SelectionDiagnostics>,
+}
+
+/// Final selector decision for a worker considered during routing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerSelectionDiagnosticDecision {
+    /// Worker passed hard gates and normal health threshold.
+    Allow,
+    /// Worker failed normal health threshold but passed fallback threshold.
+    FallbackCandidate,
+    /// Worker was denied by a hard gate or both health thresholds.
+    Deny,
+}
+
+/// Per-worker selector facts captured at worker-selection time.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct WorkerSelectionDiagnostic {
+    /// Worker ID.
+    pub worker_id: WorkerId,
+    /// Worker lifecycle/status label.
+    pub status: String,
+    /// Circuit breaker state label.
+    pub circuit_state: String,
+    /// Current normalized pressure state.
+    pub pressure_state: String,
+    /// Stable pressure reason code.
+    pub pressure_reason_code: String,
+    /// Rolling selector success rate, where available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub success_rate: Option<f64>,
+    /// Normal selection success-rate threshold.
+    pub min_success_rate: f64,
+    /// Last-success fallback success-rate threshold.
+    pub fallback_min_success_rate: f64,
+    /// Required runtime for this command.
+    pub required_runtime: RequiredRuntime,
+    /// Whether this worker has the required runtime.
+    pub runtime_available: bool,
+    /// Available slots at selection time.
+    pub available_slots: u32,
+    /// Total configured slots.
+    pub total_slots: u32,
+    /// Estimated slots requested by this command.
+    pub estimated_cores: u32,
+    /// Whether this worker was excluded because it already runs this project.
+    pub active_project_excluded: bool,
+    /// Final per-worker selector decision.
+    pub final_decision: WorkerSelectionDiagnosticDecision,
+    /// Human-readable final reason.
+    pub final_reason: String,
+    /// Stable machine-readable reasons collected for this worker.
+    pub reason_codes: Vec<String>,
+}
+
+/// Machine-readable worker selector diagnostics for a selection request.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct SelectionDiagnostics {
+    /// Required runtime for this command.
+    pub required_runtime: RequiredRuntime,
+    /// Estimated slots requested by this command.
+    pub estimated_cores: u32,
+    /// Normal success-rate threshold.
+    pub min_success_rate: f64,
+    /// Last-success fallback success-rate threshold.
+    pub fallback_min_success_rate: f64,
+    /// Count of workers excluded because they already run this project.
+    pub active_project_exclusion_count: usize,
+    /// One diagnostic entry per configured worker.
+    pub workers: Vec<WorkerSelectionDiagnostic>,
 }
 
 /// Request to release reserved worker slots.
@@ -2845,6 +2917,30 @@ mod tests {
     use super::*;
     use crate::test_guard;
 
+    fn assert_golden_json(
+        actual: serde_json::Value,
+        expected: &serde_json::Value,
+        fixture_path: &str,
+    ) {
+        if &actual == expected {
+            return;
+        }
+
+        let actual_json = serde_json::to_string_pretty(&actual).expect("actual JSON renders");
+        let expected_json = serde_json::to_string_pretty(expected).expect("expected JSON renders");
+        panic!(
+            "golden mismatch in {fixture_path}\n\
+             expected_blake3={}\n\
+             actual_blake3={}\n\
+             bless path: review the semantic diff, update the fixture expected_* field, \
+             and record both hashes in the Beads closeout.\n\
+             expected:\n{expected_json}\n\
+             actual:\n{actual_json}",
+            blake3::hash(expected_json.as_bytes()),
+            blake3::hash(actual_json.as_bytes())
+        );
+    }
+
     #[test]
     fn test_circuit_state_default() {
         let _guard = test_guard!();
@@ -3207,6 +3303,7 @@ mod tests {
             }),
             reason: SelectionReason::Success,
             build_id: None,
+            diagnostics: None,
         };
 
         let json = serde_json::to_string(&response).unwrap();
@@ -3221,11 +3318,68 @@ mod tests {
             worker: None,
             reason: SelectionReason::AllWorkersBusy,
             build_id: None,
+            diagnostics: None,
         };
 
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("\"worker\":null"));
         assert!(json.contains("\"reason\":\"all_workers_busy\""));
+    }
+
+    #[test]
+    fn golden_selection_response_with_no_workers_passed_health_diagnostics() {
+        let _guard = test_guard!();
+        const FIXTURE_PATH: &str =
+            "../../tests/goldens/ft_4tp7g/selection_diagnostics_no_workers_passed_health.json";
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/goldens/ft_4tp7g/selection_diagnostics_no_workers_passed_health.json"
+        ))
+        .expect("selection diagnostics golden fixture parses");
+        assert_eq!(
+            fixture["schema_version"],
+            "rch.golden.selection_diagnostics.v1"
+        );
+
+        let response = SelectionResponse {
+            worker: None,
+            reason: SelectionReason::NoWorkersPassedHealth,
+            build_id: None,
+            diagnostics: Some(SelectionDiagnostics {
+                required_runtime: RequiredRuntime::Rust,
+                estimated_cores: 2,
+                min_success_rate: 0.8,
+                fallback_min_success_rate: 0.5,
+                active_project_exclusion_count: 0,
+                workers: vec![WorkerSelectionDiagnostic {
+                    worker_id: WorkerId::new("fixture-worker"),
+                    status: "healthy".to_string(),
+                    circuit_state: "closed".to_string(),
+                    pressure_state: "healthy".to_string(),
+                    pressure_reason_code: "pressure.ok".to_string(),
+                    success_rate: Some(0.2),
+                    min_success_rate: 0.8,
+                    fallback_min_success_rate: 0.5,
+                    required_runtime: RequiredRuntime::Rust,
+                    runtime_available: true,
+                    available_slots: 8,
+                    total_slots: 8,
+                    estimated_cores: 2,
+                    active_project_excluded: false,
+                    final_decision: WorkerSelectionDiagnosticDecision::Deny,
+                    final_reason: "success_rate 0.20 < fallback 0.50".to_string(),
+                    reason_codes: vec![
+                        "health.below_min_success_rate".to_string(),
+                        "health.below_fallback_min_success_rate".to_string(),
+                    ],
+                }],
+            }),
+        };
+
+        assert_golden_json(
+            serde_json::to_value(&response).expect("response serializes"),
+            &fixture["expected_response"],
+            FIXTURE_PATH,
+        );
     }
 
     #[test]
@@ -3242,6 +3396,7 @@ mod tests {
             }),
             reason: SelectionReason::Success,
             build_id: None,
+            diagnostics: None,
         };
 
         let json = serde_json::to_string(&original).unwrap();

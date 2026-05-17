@@ -1,0 +1,23 @@
+{
+  "schema_version": "rch.golden.top_level_api_error.v1",
+  "volatility": {
+    "platform_dependent": false,
+    "dynamic_fields_scrubbed": []
+  },
+  "input_error": "Failed to parse SpeedScore list response: invalid type: string \"healthy\"",
+  "raw_input": {
+    "daemon_response_context": "SpeedScore list response parse failure",
+    "unsupported_worker_status_shape": "string status rejected by older clients"
+  },
+  "expected": {
+    "code": "RCH-E505",
+    "category": "internal",
+    "message": "Serialization/deserialization error",
+    "details": "Failed to parse SpeedScore list response: invalid type: string \"healthy\"",
+    "remediation": [
+      "Check for corrupted state files",
+      "Clear cache and restart",
+      "Report bug with reproduction steps"
+    ]
+  }
+}

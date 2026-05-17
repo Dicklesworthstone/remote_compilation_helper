@@ -1,0 +1,172 @@
+{
+  "schema_version": "rch.golden.selector_diagnostics.v1",
+  "volatility": {
+    "platform_dependent": false,
+    "dynamic_fields_scrubbed": [
+      "worker_hostnames",
+      "socket_paths",
+      "timestamps",
+      "pids",
+      "build_ids"
+    ]
+  },
+  "raw_input": {
+    "request": {
+      "project": "frankenterm",
+      "command": "cargo test -p rchd --lib",
+      "required_runtime": "rust",
+      "estimated_cores": 2,
+      "toolchain": {
+        "channel": "nightly",
+        "date": null,
+        "full_version": "rustc 1.97.0-nightly (fixture 2026-05-16)"
+      }
+    },
+    "excluded_worker_ids": [
+      "active-rust"
+    ],
+    "workers": [
+      "active-rust",
+      "busy-rust",
+      "circuit-open",
+      "no-rust",
+      "pressure-critical",
+      "toolchain-mismatch"
+    ]
+  },
+  "expected_diagnostics": {
+    "required_runtime": "rust",
+    "estimated_cores": 2,
+    "min_success_rate": 0.8,
+    "fallback_min_success_rate": 0.5,
+    "active_project_exclusion_count": 1,
+    "workers": [
+      {
+        "worker_id": "active-rust",
+        "status": "healthy",
+        "circuit_state": "closed",
+        "pressure_state": "healthy",
+        "pressure_reason_code": "pressure.ok",
+        "success_rate": 1.0,
+        "min_success_rate": 0.8,
+        "fallback_min_success_rate": 0.5,
+        "required_runtime": "rust",
+        "runtime_available": true,
+        "available_slots": 4,
+        "total_slots": 4,
+        "estimated_cores": 2,
+        "active_project_excluded": true,
+        "final_decision": "deny",
+        "final_reason": "worker already has an active build for this project",
+        "reason_codes": [
+          "active_project_exclusion"
+        ]
+      },
+      {
+        "worker_id": "busy-rust",
+        "status": "healthy",
+        "circuit_state": "closed",
+        "pressure_state": "healthy",
+        "pressure_reason_code": "pressure.ok",
+        "success_rate": 1.0,
+        "min_success_rate": 0.8,
+        "fallback_min_success_rate": 0.5,
+        "required_runtime": "rust",
+        "runtime_available": true,
+        "available_slots": 1,
+        "total_slots": 1,
+        "estimated_cores": 2,
+        "active_project_excluded": false,
+        "final_decision": "deny",
+        "final_reason": "available slots 1 < 2",
+        "reason_codes": [
+          "slots.insufficient"
+        ]
+      },
+      {
+        "worker_id": "circuit-open",
+        "status": "healthy",
+        "circuit_state": "open",
+        "pressure_state": "healthy",
+        "pressure_reason_code": "pressure.ok",
+        "success_rate": 1.0,
+        "min_success_rate": 0.8,
+        "fallback_min_success_rate": 0.5,
+        "required_runtime": "rust",
+        "runtime_available": true,
+        "available_slots": 4,
+        "total_slots": 4,
+        "estimated_cores": 2,
+        "active_project_excluded": false,
+        "final_decision": "deny",
+        "final_reason": "circuit is open",
+        "reason_codes": [
+          "worker.circuit_open"
+        ]
+      },
+      {
+        "worker_id": "no-rust",
+        "status": "healthy",
+        "circuit_state": "closed",
+        "pressure_state": "healthy",
+        "pressure_reason_code": "pressure.ok",
+        "success_rate": 1.0,
+        "min_success_rate": 0.8,
+        "fallback_min_success_rate": 0.5,
+        "required_runtime": "rust",
+        "runtime_available": false,
+        "available_slots": 4,
+        "total_slots": 4,
+        "estimated_cores": 2,
+        "active_project_excluded": false,
+        "final_decision": "deny",
+        "final_reason": "required runtime Rust is unavailable",
+        "reason_codes": [
+          "runtime.unavailable"
+        ]
+      },
+      {
+        "worker_id": "pressure-critical",
+        "status": "healthy",
+        "circuit_state": "closed",
+        "pressure_state": "critical",
+        "pressure_reason_code": "pressure.disk_critical",
+        "success_rate": 1.0,
+        "min_success_rate": 0.8,
+        "fallback_min_success_rate": 0.5,
+        "required_runtime": "rust",
+        "runtime_available": true,
+        "available_slots": 4,
+        "total_slots": 4,
+        "estimated_cores": 2,
+        "active_project_excluded": false,
+        "final_decision": "deny",
+        "final_reason": "critical pressure: pressure.disk_critical",
+        "reason_codes": [
+          "pressure.critical"
+        ]
+      },
+      {
+        "worker_id": "toolchain-mismatch",
+        "status": "healthy",
+        "circuit_state": "closed",
+        "pressure_state": "healthy",
+        "pressure_reason_code": "pressure.ok",
+        "success_rate": 1.0,
+        "min_success_rate": 0.8,
+        "fallback_min_success_rate": 0.5,
+        "required_runtime": "rust",
+        "runtime_available": true,
+        "available_slots": 4,
+        "total_slots": 4,
+        "estimated_cores": 2,
+        "active_project_excluded": false,
+        "final_decision": "deny",
+        "final_reason": "rustc_version_mismatch:local=1.97.0-nightly:worker=1.95.0-nightly",
+        "reason_codes": [
+          "toolchain.version_mismatch"
+        ]
+      }
+    ]
+  }
+}

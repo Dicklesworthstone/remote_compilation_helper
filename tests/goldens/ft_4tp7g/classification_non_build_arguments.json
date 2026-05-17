@@ -1,0 +1,61 @@
+{
+  "schema_version": "rch.golden.classification_non_build_arguments.v1",
+  "volatility": {
+    "platform_dependent": false,
+    "dynamic_fields_scrubbed": []
+  },
+  "cases": [
+    {
+      "name": "beads_comment_mentions_cargo_test",
+      "command": "br comments add ft-4tp7g.1 \"remote proof blocked: cargo test -p rchd --lib\""
+    },
+    {
+      "name": "agent_env_beads_comment_mentions_cargo_clippy",
+      "command": "AGENT_NAME=Codex br comments add ft-4tp7g.1 \"proof lane: cargo clippy --workspace\""
+    },
+    {
+      "name": "printf_mentions_cargo_build",
+      "command": "printf \"cargo build --release\""
+    },
+    {
+      "name": "echo_mentions_cargo_test",
+      "command": "echo 'cargo test -p rchd -- --nocapture'"
+    },
+    {
+      "name": "grep_mentions_cmake_build",
+      "command": "grep \"cmake --build\" docs/proof-notes.md"
+    }
+  ],
+  "expected_results": [
+    {
+      "name": "beads_comment_mentions_cargo_test",
+      "is_compilation": false,
+      "kind": null,
+      "reason": "no compilation keyword"
+    },
+    {
+      "name": "agent_env_beads_comment_mentions_cargo_clippy",
+      "is_compilation": false,
+      "kind": null,
+      "reason": "no compilation keyword"
+    },
+    {
+      "name": "printf_mentions_cargo_build",
+      "is_compilation": false,
+      "kind": null,
+      "reason": "no compilation keyword"
+    },
+    {
+      "name": "echo_mentions_cargo_test",
+      "is_compilation": false,
+      "kind": null,
+      "reason": "no compilation keyword"
+    },
+    {
+      "name": "grep_mentions_cmake_build",
+      "is_compilation": false,
+      "kind": null,
+      "reason": "no compilation keyword"
+    }
+  ]
+}

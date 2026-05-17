@@ -118,6 +118,14 @@ pub(super) fn build_dry_run_summary(
     let worker_selected = worker_selection
         .as_ref()
         .is_some_and(|s| s.worker.is_some());
+    let no_worker_reason = if daemon_reachable {
+        worker_selection
+            .as_ref()
+            .map(|s| s.reason.to_string())
+            .unwrap_or_else(|| "No worker available".to_string())
+    } else {
+        "Daemon not reachable".to_string()
+    };
     steps.push(DryRunPipelineStep {
         step: 3,
         name: "Worker selection".to_string(),
@@ -135,12 +143,7 @@ pub(super) fn build_dry_run_summary(
         },
         skipped: !worker_selected,
         skip_reason: if !worker_selected {
-            Some(
-                worker_selection
-                    .as_ref()
-                    .map(|s| s.reason.to_string())
-                    .unwrap_or_else(|| "No worker available".to_string()),
-            )
+            Some(no_worker_reason.clone())
         } else {
             None
         },
@@ -153,7 +156,11 @@ pub(super) fn build_dry_run_summary(
         name: "Transfer".to_string(),
         description: "Sync project files to worker via rsync+zstd".to_string(),
         skipped: !worker_selected,
-        skip_reason: None,
+        skip_reason: if !worker_selected {
+            Some(no_worker_reason.clone())
+        } else {
+            None
+        },
         estimated_duration_ms: None, // Depends on project size
     });
 
@@ -163,7 +170,11 @@ pub(super) fn build_dry_run_summary(
         name: "Remote execution".to_string(),
         description: "Execute compilation command on worker".to_string(),
         skipped: !worker_selected,
-        skip_reason: None,
+        skip_reason: if !worker_selected {
+            Some(no_worker_reason.clone())
+        } else {
+            None
+        },
         estimated_duration_ms: None, // Depends on build
     });
 
@@ -172,14 +183,26 @@ pub(super) fn build_dry_run_summary(
         step: 6,
         name: "Artifact retrieval".to_string(),
         description: "Retrieve build artifacts from remote worker".to_string(),
-        skipped: false,
-        skip_reason: None,
+        skipped: !worker_selected,
+        skip_reason: if !worker_selected {
+            Some(no_worker_reason.clone())
+        } else {
+            None
+        },
         estimated_duration_ms: None, // Would need rsync dry-run
     });
 
+    let reason = if worker_selected {
+        "compilation command meets threshold, worker available".to_string()
+    } else if !daemon_reachable {
+        "compilation command meets threshold, but daemon is not reachable".to_string()
+    } else {
+        format!("compilation command meets threshold, but no worker selected: {no_worker_reason}")
+    };
+
     DryRunSummary {
-        would_offload: true,
-        reason: "compilation command meets threshold, worker available".to_string(),
+        would_offload: worker_selected,
+        reason,
         pipeline_steps: steps,
         transfer_estimate: None,  // Would need actual rsync dry-run
         total_estimated_ms: None, // Total unknown without transfer estimates
@@ -358,6 +381,7 @@ pub async fn diagnose(command: &str, dry_run: bool, ctx: &OutputContext) -> Resu
                     estimated_cores,
                     worker: response.worker.clone(),
                     reason: response.reason.clone(),
+                    diagnostics: response.diagnostics.clone(),
                 });
                 if let Some(worker) = response.worker.as_ref() {
                     debug!(

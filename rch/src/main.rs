@@ -1942,10 +1942,12 @@ fn top_level_machine_output_requested(args: &[OsString]) -> bool {
 fn top_level_api_error(error: &anyhow::Error) -> ApiError {
     let details = format!("{error:#}");
     let code = if details.contains("TOML parse error")
-        || details.contains("Failed to parse")
-        || details.contains("Failed to decode")
+        || details.contains("Invalid TOML syntax")
+        || details.contains("Failed to parse workers config")
     {
         ErrorCode::ConfigParseError
+    } else if details.contains("Failed to parse") || details.contains("Failed to decode") {
+        ErrorCode::InternalSerdeError
     } else if details.contains("Failed to read") {
         ErrorCode::ConfigReadError
     } else {
@@ -3998,6 +4000,30 @@ mod tests {
     #[track_caller]
     fn fail_expected(message: &str) {
         assert!(std::hint::black_box(false), "{message}");
+    }
+
+    fn assert_golden_json(
+        actual: serde_json::Value,
+        expected: &serde_json::Value,
+        fixture_path: &str,
+    ) {
+        if &actual == expected {
+            return;
+        }
+
+        let actual_json = serde_json::to_string_pretty(&actual).expect("actual JSON renders");
+        let expected_json = serde_json::to_string_pretty(expected).expect("expected JSON renders");
+        panic!(
+            "golden mismatch in {fixture_path}\n\
+             expected_blake3={}\n\
+             actual_blake3={}\n\
+             bless path: review the semantic diff, update the fixture expected_* field, \
+             and record both hashes in the Beads closeout.\n\
+             expected:\n{expected_json}\n\
+             actual:\n{actual_json}",
+            blake3::hash(expected_json.as_bytes()),
+            blake3::hash(actual_json.as_bytes())
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -6723,6 +6749,55 @@ mod tests {
     fn machine_output_requested_neither_set() {
         let _guard = test_guard!();
         assert!(!machine_output_requested(None, false));
+    }
+
+    #[test]
+    fn top_level_api_error_classifies_daemon_response_parse_as_serde() {
+        let _guard = test_guard!();
+        let error = anyhow::anyhow!(
+            "Failed to parse SpeedScore list response: invalid type: string \"healthy\""
+        );
+        let api_error = top_level_api_error(&error);
+
+        assert_eq!(api_error.code, ErrorCode::InternalSerdeError.code_string());
+        assert_eq!(
+            api_error.details.as_deref(),
+            Some("Failed to parse SpeedScore list response: invalid type: string \"healthy\"")
+        );
+    }
+
+    #[test]
+    fn golden_top_level_api_error_for_daemon_response_parse_failure() {
+        let _guard = test_guard!();
+        const FIXTURE_PATH: &str =
+            "../../tests/goldens/ft_4tp7g/top_level_daemon_parse_error_api_error.json";
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/goldens/ft_4tp7g/top_level_daemon_parse_error_api_error.json"
+        ))
+        .expect("top-level api error golden fixture parses");
+        assert_eq!(
+            fixture["schema_version"],
+            "rch.golden.top_level_api_error.v1"
+        );
+
+        let input_error = fixture["input_error"]
+            .as_str()
+            .expect("input_error is a string");
+        let api_error = top_level_api_error(&anyhow::anyhow!(input_error.to_string()));
+        assert_golden_json(
+            serde_json::to_value(&api_error).expect("api error serializes"),
+            &fixture["expected"],
+            FIXTURE_PATH,
+        );
+    }
+
+    #[test]
+    fn top_level_api_error_keeps_toml_parse_as_config() {
+        let _guard = test_guard!();
+        let error = anyhow::anyhow!("TOML parse error at line 1, column 1");
+        let api_error = top_level_api_error(&error);
+
+        assert_eq!(api_error.code, ErrorCode::ConfigParseError.code_string());
     }
 
     #[test]

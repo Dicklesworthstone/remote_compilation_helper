@@ -20,8 +20,9 @@ use crate::workers::{WorkerPool, WorkerState};
 use rand::RngExt;
 use rch_common::{
     CircuitBreakerConfig, CircuitState, CommandPriority, RequiredRuntime, SelectionConfig,
-    SelectionReason, SelectionRequest, SelectionStrategy, SelectionWeightConfig, SshClient,
-    SshOptions, ToolchainInfo, WorkerCapabilities, WorkerId, classify_command,
+    SelectionDiagnostics, SelectionReason, SelectionRequest, SelectionStrategy,
+    SelectionWeightConfig, SshClient, SshOptions, ToolchainInfo, WorkerCapabilities, WorkerId,
+    WorkerSelectionDiagnostic, WorkerSelectionDiagnosticDecision, WorkerStatus, classify_command,
 };
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -578,6 +579,8 @@ pub struct SelectionResult {
     pub worker: Option<Arc<WorkerState>>,
     /// Reason for the selection result.
     pub reason: SelectionReason,
+    /// Optional per-worker selector diagnostics for failed selections.
+    pub diagnostics: Option<SelectionDiagnostics>,
 }
 
 fn cache_use_for_request(request: &SelectionRequest) -> CacheUse {
@@ -694,6 +697,9 @@ impl WorkerSelector {
         {
             Ok(workers) => workers,
             Err(reason) => {
+                let diagnostics = self
+                    .build_selection_diagnostics(pool, request, excluded_worker_ids)
+                    .await;
                 // Record failed selection in audit log
                 self.record_audit_entry(request, Vec::new(), None, &reason, select_start.elapsed())
                     .await;
@@ -701,6 +707,7 @@ impl WorkerSelector {
                 return SelectionResult {
                     worker: None,
                     reason,
+                    diagnostics: Some(diagnostics),
                 };
             }
         };
@@ -732,10 +739,14 @@ impl WorkerSelector {
                     return SelectionResult {
                         worker: Some(worker),
                         reason: SelectionReason::AffinityFallback,
+                        diagnostics: None,
                     };
                 }
             }
 
+            let diagnostics = self
+                .build_selection_diagnostics(pool, request, excluded_worker_ids)
+                .await;
             // Record empty selection in audit log
             self.record_audit_entry(
                 request,
@@ -749,6 +760,7 @@ impl WorkerSelector {
             return SelectionResult {
                 worker: None,
                 reason: SelectionReason::AllWorkersBusy,
+                diagnostics: Some(diagnostics),
             };
         }
 
@@ -789,6 +801,7 @@ impl WorkerSelector {
             return SelectionResult {
                 worker: Some(worker),
                 reason: SelectionReason::AffinityPinned,
+                diagnostics: None,
             };
         }
 
@@ -873,8 +886,12 @@ impl WorkerSelector {
             SelectionResult {
                 worker: Some(worker),
                 reason: SelectionReason::Success,
+                diagnostics: None,
             }
         } else {
+            let diagnostics = self
+                .build_selection_diagnostics(pool, request, excluded_worker_ids)
+                .await;
             // Record failed selection in audit log (bd-37hc)
             let breakdowns = self
                 .build_score_breakdowns(&eligible, request, cache_use, None)
@@ -892,6 +909,7 @@ impl WorkerSelector {
             SelectionResult {
                 worker: None,
                 reason: SelectionReason::AllWorkersBusy,
+                diagnostics: Some(diagnostics),
             }
         }
     }
@@ -1202,6 +1220,288 @@ impl WorkerSelector {
         }
 
         scores
+    }
+
+    async fn build_selection_diagnostics(
+        &self,
+        pool: &WorkerPool,
+        request: &SelectionRequest,
+        excluded_worker_ids: &HashSet<String>,
+    ) -> SelectionDiagnostics {
+        let all_workers = pool.all_workers().await;
+        let mut diagnostics = Vec::with_capacity(all_workers.len());
+        let mut active_project_exclusion_count = 0usize;
+
+        for worker in all_workers {
+            let config = worker.config.read().await;
+            let worker_id = config.id.clone();
+            let total_slots = config.total_slots;
+            drop(config);
+
+            let status = worker.status().await;
+            let circuit_state = worker.circuit_state().await.unwrap_or(CircuitState::Closed);
+            let available_slots = worker.available_slots().await;
+            let capabilities = worker.capabilities().await;
+            let pressure = worker.pressure_assessment().await;
+            let success_rate = self.health_score(&worker).await;
+            let active_project_excluded = excluded_worker_ids.contains(worker_id.as_str());
+            if active_project_excluded {
+                active_project_exclusion_count += 1;
+            }
+
+            let runtime_available = match request.required_runtime {
+                RequiredRuntime::None => true,
+                RequiredRuntime::Rust => capabilities.has_rust(),
+                RequiredRuntime::Bun => capabilities.has_bun(),
+                RequiredRuntime::Node => capabilities.has_node(),
+            };
+
+            let toolchain_mismatch =
+                toolchain_capability_mismatch(request.toolchain.as_ref(), &capabilities);
+            let cached_toolchain_failure = if let Some(toolchain) = request.toolchain.as_ref() {
+                let toolchain_name = toolchain.rustup_toolchain();
+                worker
+                    .toolchain_preflight_status(&toolchain_name)
+                    .await
+                    .filter(|status| status.is_fresh(TOOLCHAIN_PREFLIGHT_TTL))
+                    .and_then(|status| {
+                        (!status.usable).then(|| {
+                            status
+                                .reason
+                                .unwrap_or_else(|| "cached_toolchain_unusable".to_string())
+                        })
+                    })
+            } else {
+                None
+            };
+
+            let mut reason_codes = Vec::new();
+            let mut soft_reason: Option<String> = None;
+
+            let (final_decision, final_reason) =
+                if !matches!(status, WorkerStatus::Healthy | WorkerStatus::Degraded) {
+                    push_reason_code(&mut reason_codes, "worker.status_not_assignable");
+                    (
+                        WorkerSelectionDiagnosticDecision::Deny,
+                        format!("worker status is {status:?}"),
+                    )
+                } else if circuit_state == CircuitState::Open {
+                    push_reason_code(&mut reason_codes, "worker.circuit_open");
+                    (
+                        WorkerSelectionDiagnosticDecision::Deny,
+                        "circuit is open".to_string(),
+                    )
+                } else if circuit_state == CircuitState::HalfOpen
+                    && !worker.can_probe(&self.circuit_config).await
+                {
+                    push_reason_code(&mut reason_codes, "worker.half_open_no_probe_budget");
+                    (
+                        WorkerSelectionDiagnosticDecision::Deny,
+                        "half-open circuit has no probe budget".to_string(),
+                    )
+                } else if active_project_excluded {
+                    push_reason_code(&mut reason_codes, "active_project_exclusion");
+                    (
+                        WorkerSelectionDiagnosticDecision::Deny,
+                        "worker already has an active build for this project".to_string(),
+                    )
+                } else if !runtime_available {
+                    push_reason_code(&mut reason_codes, "runtime.unavailable");
+                    (
+                        WorkerSelectionDiagnosticDecision::Deny,
+                        format!(
+                            "required runtime {:?} is unavailable",
+                            request.required_runtime
+                        ),
+                    )
+                } else if let Some(reason) = toolchain_mismatch {
+                    push_reason_code(&mut reason_codes, "toolchain.version_mismatch");
+                    (WorkerSelectionDiagnosticDecision::Deny, reason)
+                } else if let Some(reason) = cached_toolchain_failure {
+                    push_reason_code(&mut reason_codes, "toolchain.preflight_failed");
+                    (WorkerSelectionDiagnosticDecision::Deny, reason)
+                } else if available_slots < request.estimated_cores {
+                    push_reason_code(&mut reason_codes, "slots.insufficient");
+                    (
+                        WorkerSelectionDiagnosticDecision::Deny,
+                        format!(
+                            "available slots {available_slots} < {}",
+                            request.estimated_cores
+                        ),
+                    )
+                } else if let Some(false) = capabilities.is_topology_healthy() {
+                    push_reason_code(&mut reason_codes, "topology.preflight_failed");
+                    (
+                        WorkerSelectionDiagnosticDecision::Deny,
+                        capabilities
+                            .projects_root_issue
+                            .clone()
+                            .unwrap_or_else(|| "topology preflight failed".to_string()),
+                    )
+                } else {
+                    let mut hard_decision = None;
+                    if let Some(ref convergence_svc) = self.repo_convergence {
+                        let drift_state = convergence_svc.get_drift_state(&worker_id).await;
+                        match drift_state {
+                            crate::repo_convergence::ConvergenceDriftState::Ready => {}
+                            crate::repo_convergence::ConvergenceDriftState::Drifting => {
+                                push_reason_code(&mut reason_codes, "convergence.drifting");
+                            }
+                            crate::repo_convergence::ConvergenceDriftState::Stale => {
+                                push_reason_code(&mut reason_codes, "convergence.stale");
+                            }
+                            crate::repo_convergence::ConvergenceDriftState::Converging => {
+                                push_reason_code(&mut reason_codes, "convergence.in_progress");
+                                hard_decision = Some((
+                                    WorkerSelectionDiagnosticDecision::Deny,
+                                    "repo convergence is in progress".to_string(),
+                                ));
+                            }
+                            crate::repo_convergence::ConvergenceDriftState::Failed => {
+                                push_reason_code(&mut reason_codes, "convergence.failed");
+                                hard_decision = Some((
+                                    WorkerSelectionDiagnosticDecision::Deny,
+                                    "repo convergence failed".to_string(),
+                                ));
+                            }
+                        }
+                    }
+
+                    if hard_decision.is_none()
+                        && let Some(max_load) = self.config.max_load_per_core
+                        && let Some(true) = capabilities.is_high_load(max_load)
+                    {
+                        let load_per_core = capabilities.load_per_core().unwrap_or(0.0);
+                        push_reason_code(&mut reason_codes, "preflight.high_load");
+                        soft_reason = Some(format!(
+                            "high load {:.2} > {:.2} per core",
+                            load_per_core, max_load
+                        ));
+                    }
+
+                    if let Some(min_disk) = self.config.min_free_gb
+                        && let Some(true) = capabilities.is_low_disk(min_disk)
+                    {
+                        let free_gb = capabilities.disk_free_gb.unwrap_or(0.0);
+                        push_reason_code(&mut reason_codes, "preflight.low_disk");
+                        soft_reason =
+                            Some(format!("low disk {:.1} GB < {:.1} GB", free_gb, min_disk));
+                    }
+
+                    if let Some(decision) = hard_decision {
+                        decision
+                    } else if pressure.state == PressureState::Critical {
+                        push_reason_code(&mut reason_codes, "pressure.critical");
+                        (
+                            WorkerSelectionDiagnosticDecision::Deny,
+                            format!("critical pressure: {}", pressure.reason_code),
+                        )
+                    } else if let Some(ref agg) = self.reliability {
+                        let assessment = agg.evaluate(worker.as_ref(), worker_id.as_str()).await;
+                        if assessment.hard_exclude {
+                            push_reason_code(&mut reason_codes, "reliability.quarantined");
+                            (
+                                WorkerSelectionDiagnosticDecision::Deny,
+                                format!("reliability quarantined: {}", assessment.health_state),
+                            )
+                        } else if success_rate < self.config.min_success_rate {
+                            push_reason_code(&mut reason_codes, "health.below_min_success_rate");
+                            if success_rate >= self.config.affinity.fallback_min_success_rate {
+                                (
+                                    WorkerSelectionDiagnosticDecision::FallbackCandidate,
+                                    format!(
+                                        "success_rate {:.2} < min {:.2} but >= fallback {:.2}",
+                                        success_rate,
+                                        self.config.min_success_rate,
+                                        self.config.affinity.fallback_min_success_rate
+                                    ),
+                                )
+                            } else {
+                                push_reason_code(
+                                    &mut reason_codes,
+                                    "health.below_fallback_min_success_rate",
+                                );
+                                (
+                                    WorkerSelectionDiagnosticDecision::Deny,
+                                    format!(
+                                        "success_rate {:.2} < fallback {:.2}",
+                                        success_rate,
+                                        self.config.affinity.fallback_min_success_rate
+                                    ),
+                                )
+                            }
+                        } else if let Some(reason) = soft_reason {
+                            (WorkerSelectionDiagnosticDecision::FallbackCandidate, reason)
+                        } else {
+                            (
+                                WorkerSelectionDiagnosticDecision::Allow,
+                                "eligible".to_string(),
+                            )
+                        }
+                    } else if success_rate < self.config.min_success_rate {
+                        push_reason_code(&mut reason_codes, "health.below_min_success_rate");
+                        if success_rate >= self.config.affinity.fallback_min_success_rate {
+                            (
+                                WorkerSelectionDiagnosticDecision::FallbackCandidate,
+                                format!(
+                                    "success_rate {:.2} < min {:.2} but >= fallback {:.2}",
+                                    success_rate,
+                                    self.config.min_success_rate,
+                                    self.config.affinity.fallback_min_success_rate
+                                ),
+                            )
+                        } else {
+                            push_reason_code(
+                                &mut reason_codes,
+                                "health.below_fallback_min_success_rate",
+                            );
+                            (
+                                WorkerSelectionDiagnosticDecision::Deny,
+                                format!(
+                                    "success_rate {:.2} < fallback {:.2}",
+                                    success_rate, self.config.affinity.fallback_min_success_rate
+                                ),
+                            )
+                        }
+                    } else if let Some(reason) = soft_reason {
+                        (WorkerSelectionDiagnosticDecision::FallbackCandidate, reason)
+                    } else {
+                        (
+                            WorkerSelectionDiagnosticDecision::Allow,
+                            "eligible".to_string(),
+                        )
+                    }
+                };
+
+            diagnostics.push(WorkerSelectionDiagnostic {
+                worker_id,
+                status: worker_status_label(status).to_string(),
+                circuit_state: circuit_state_label(circuit_state).to_string(),
+                pressure_state: pressure.state.to_string(),
+                pressure_reason_code: pressure.reason_code,
+                success_rate: Some(success_rate),
+                min_success_rate: self.config.min_success_rate,
+                fallback_min_success_rate: self.config.affinity.fallback_min_success_rate,
+                required_runtime: request.required_runtime,
+                runtime_available,
+                available_slots,
+                total_slots,
+                estimated_cores: request.estimated_cores,
+                active_project_excluded,
+                final_decision,
+                final_reason,
+                reason_codes,
+            });
+        }
+
+        SelectionDiagnostics {
+            required_runtime: request.required_runtime,
+            estimated_cores: request.estimated_cores,
+            min_success_rate: self.config.min_success_rate,
+            fallback_min_success_rate: self.config.affinity.fallback_min_success_rate,
+            active_project_exclusion_count,
+            workers: diagnostics,
+        }
     }
 
     /// Get eligible workers filtered by health, circuits, slots, and runtime.
@@ -1658,6 +1958,7 @@ impl WorkerSelector {
                     filtered_by_pressure,
                     filtered_by_slots,
                     filtered_by_hard_preflight,
+                    filtered_by_health,
                     filtered_by_active_project,
                 ),
             ));
@@ -1674,12 +1975,13 @@ impl WorkerSelector {
                 "All candidate workers failed hard preflight checks (count={})",
                 filtered_by_hard_preflight
             );
-            if filtered_by_pressure > 0 || filtered_by_slots > 0 {
+            if filtered_by_pressure > 0 || filtered_by_slots > 0 || filtered_by_health > 0 {
                 return Err(SelectionReason::NoAdmissibleWorkers(
                     no_admissible_workers_summary(
                         filtered_by_pressure,
                         filtered_by_slots,
                         filtered_by_hard_preflight,
+                        filtered_by_health,
                     ),
                 ));
             }
@@ -2184,6 +2486,7 @@ pub async fn select_worker_with_config(
             return SelectionResult {
                 worker: None,
                 reason: SelectionReason::NoWorkersConfigured,
+                diagnostics: None,
             };
         }
 
@@ -2212,6 +2515,7 @@ pub async fn select_worker_with_config(
             return SelectionResult {
                 worker: None,
                 reason: SelectionReason::AllCircuitsOpen,
+                diagnostics: None,
             };
         }
 
@@ -2219,12 +2523,14 @@ pub async fn select_worker_with_config(
             return SelectionResult {
                 worker: None,
                 reason: SelectionReason::AllWorkersUnreachable,
+                diagnostics: None,
             };
         }
 
         return SelectionResult {
             worker: None,
             reason: SelectionReason::AllWorkersUnreachable,
+            diagnostics: None,
         };
     }
 
@@ -2321,6 +2627,7 @@ pub async fn select_worker_with_config(
                     "{:?}",
                     request.required_runtime
                 )),
+                diagnostics: None,
             };
         }
 
@@ -2328,6 +2635,7 @@ pub async fn select_worker_with_config(
             return SelectionResult {
                 worker: None,
                 reason: SelectionReason::AllCircuitsOpen,
+                diagnostics: None,
             };
         }
 
@@ -2335,12 +2643,14 @@ pub async fn select_worker_with_config(
             return SelectionResult {
                 worker: None,
                 reason: SelectionReason::AllWorkersBusy,
+                diagnostics: None,
             };
         }
 
         return SelectionResult {
             worker: None,
             reason: SelectionReason::AllWorkersBusy,
+            diagnostics: None,
         };
     }
 
@@ -2379,6 +2689,7 @@ pub async fn select_worker_with_config(
         return SelectionResult {
             worker: None,
             reason: SelectionReason::AllWorkersBusy,
+            diagnostics: None,
         };
     };
 
@@ -2401,6 +2712,7 @@ pub async fn select_worker_with_config(
     SelectionResult {
         worker: Some(selected_worker),
         reason: SelectionReason::Success,
+        diagnostics: None,
     }
 }
 
@@ -2487,10 +2799,36 @@ fn selection_reason_label(reason: &SelectionReason) -> &'static str {
     }
 }
 
+fn worker_status_label(status: WorkerStatus) -> &'static str {
+    match status {
+        WorkerStatus::Healthy => "healthy",
+        WorkerStatus::Degraded => "degraded",
+        WorkerStatus::Unreachable => "unreachable",
+        WorkerStatus::Draining => "draining",
+        WorkerStatus::Drained => "drained",
+        WorkerStatus::Disabled => "disabled",
+    }
+}
+
+fn circuit_state_label(state: CircuitState) -> &'static str {
+    match state {
+        CircuitState::Closed => "closed",
+        CircuitState::Open => "open",
+        CircuitState::HalfOpen => "half_open",
+    }
+}
+
+fn push_reason_code(reason_codes: &mut Vec<String>, reason_code: &'static str) {
+    if !reason_codes.iter().any(|existing| existing == reason_code) {
+        reason_codes.push(reason_code.to_string());
+    }
+}
+
 fn no_admissible_workers_summary(
     critical_pressure: usize,
     insufficient_slots: usize,
     hard_preflight: usize,
+    health_below_fallback: usize,
 ) -> String {
     let mut parts = Vec::new();
     if critical_pressure > 0 {
@@ -2498,6 +2836,9 @@ fn no_admissible_workers_summary(
     }
     if insufficient_slots > 0 {
         parts.push(format!("insufficient_slots={insufficient_slots}"));
+    }
+    if health_below_fallback > 0 {
+        parts.push(format!("health_below_fallback={health_below_fallback}"));
     }
     let generic_hard_preflight = hard_preflight.saturating_sub(critical_pressure);
     if generic_hard_preflight > 0 {
@@ -2510,10 +2851,15 @@ fn no_admissible_workers_summary_with_active_project(
     critical_pressure: usize,
     insufficient_slots: usize,
     hard_preflight: usize,
+    health_below_fallback: usize,
     active_project_exclusion: usize,
 ) -> String {
-    let mut summary =
-        no_admissible_workers_summary(critical_pressure, insufficient_slots, hard_preflight);
+    let mut summary = no_admissible_workers_summary(
+        critical_pressure,
+        insufficient_slots,
+        hard_preflight,
+        health_below_fallback,
+    );
     if active_project_exclusion == 0 {
         return summary;
     }
@@ -2648,7 +2994,42 @@ mod tests {
         CommandPriority, RequiredRuntime, SelectionWeightConfig, ToolchainInfo, WorkerCapabilities,
         WorkerConfig, WorkerId,
     };
+    use sha2::{Digest, Sha256};
     use std::sync::Arc;
+
+    fn assert_golden_json(
+        actual: serde_json::Value,
+        expected: &serde_json::Value,
+        fixture_path: &str,
+    ) {
+        if &actual == expected {
+            return;
+        }
+
+        let actual_json = serde_json::to_string_pretty(&actual).expect("actual JSON renders");
+        let expected_json = serde_json::to_string_pretty(expected).expect("expected JSON renders");
+        let expected_hash = sha256_hex(&expected_json);
+        let actual_hash = sha256_hex(&actual_json);
+        panic!(
+            "golden mismatch in {fixture_path}\n\
+             expected_sha256={expected_hash}\n\
+             actual_sha256={actual_hash}\n\
+             bless path: review the semantic diff, update the fixture expected_* field, \
+             and record both hashes in the Beads closeout.\n\
+             expected:\n{expected_json}\n\
+             actual:\n{actual_json}",
+        );
+    }
+
+    fn sha256_hex(input: &str) -> String {
+        let digest = Sha256::digest(input.as_bytes());
+        let mut output = String::with_capacity(digest.len() * 2);
+        for byte in digest {
+            use std::fmt::Write as _;
+            write!(&mut output, "{byte:02x}").expect("write to string");
+        }
+        output
+    }
 
     fn make_worker(id: &str, total_slots: u32, speed: f64) -> WorkerState {
         let config = WorkerConfig {
@@ -2663,6 +3044,40 @@ mod tests {
         let state = WorkerState::new(config);
         state.set_speed_score(speed);
         state
+    }
+
+    async fn prepare_fixture_worker(
+        worker: &WorkerState,
+        rustc_version: Option<&str>,
+        pressure_state: PressureState,
+        pressure_reason_code: &str,
+    ) {
+        worker
+            .set_capabilities(WorkerCapabilities {
+                rustc_version: rustc_version.map(str::to_string),
+                num_cpus: Some(8),
+                disk_free_gb: Some(100.0),
+                disk_total_gb: Some(200.0),
+                projects_root_ok: Some(true),
+                ..Default::default()
+            })
+            .await;
+        worker
+            .set_pressure_assessment(crate::disk_pressure::PressureAssessment {
+                state: pressure_state,
+                confidence: crate::disk_pressure::PressureConfidence::High,
+                reason_code: pressure_reason_code.to_string(),
+                policy_rule: "ft_4tp7g_golden_fixture".to_string(),
+                disk_free_gb: Some(100.0),
+                disk_total_gb: Some(200.0),
+                disk_free_ratio: Some(0.5),
+                disk_io_util_pct: None,
+                memory_pressure: None,
+                telemetry_age_secs: Some(0),
+                telemetry_fresh: true,
+                evaluated_at_unix_ms: 0,
+            })
+            .await;
     }
 
     fn process_only_weights() -> SignalWeights {
@@ -3570,6 +3985,31 @@ mod tests {
         let result = selector.select(&pool, &request).await;
         assert!(result.worker.is_none());
         assert_eq!(result.reason, SelectionReason::NoWorkersPassedHealth);
+        let diagnostics = result
+            .diagnostics
+            .expect("failed selection should include per-worker diagnostics");
+        assert_eq!(diagnostics.required_runtime, RequiredRuntime::None);
+        assert_eq!(diagnostics.estimated_cores, 2);
+        assert_eq!(diagnostics.min_success_rate, 0.8);
+        assert_eq!(diagnostics.workers.len(), 1);
+        let worker = &diagnostics.workers[0];
+        assert_eq!(worker.worker_id.as_str(), "unhealthy");
+        assert_eq!(
+            worker.final_decision,
+            WorkerSelectionDiagnosticDecision::Deny
+        );
+        assert!(
+            worker
+                .reason_codes
+                .iter()
+                .any(|code| code == "health.below_min_success_rate")
+        );
+        assert!(
+            worker
+                .reason_codes
+                .iter()
+                .any(|code| code == "health.below_fallback_min_success_rate")
+        );
     }
 
     #[tokio::test]
@@ -3850,6 +4290,147 @@ mod tests {
         assert_eq!(
             result.reason,
             SelectionReason::NoAdmissibleWorkers("active_project_exclusion=1".to_string())
+        );
+        let diagnostics = result
+            .diagnostics
+            .expect("active-project rejection should include per-worker diagnostics");
+        assert_eq!(diagnostics.required_runtime, RequiredRuntime::Rust);
+        assert_eq!(diagnostics.active_project_exclusion_count, 1);
+        assert_eq!(diagnostics.workers.len(), 2);
+
+        let active = diagnostics
+            .workers
+            .iter()
+            .find(|worker| worker.worker_id.as_str() == "active-rust")
+            .expect("active worker diagnostic");
+        assert!(active.runtime_available);
+        assert!(active.active_project_excluded);
+        assert_eq!(
+            active.final_decision,
+            WorkerSelectionDiagnosticDecision::Deny
+        );
+        assert!(
+            active
+                .reason_codes
+                .iter()
+                .any(|code| code == "active_project_exclusion")
+        );
+
+        let non_rust = diagnostics
+            .workers
+            .iter()
+            .find(|worker| worker.worker_id.as_str() == "non-rust")
+            .expect("non-rust worker diagnostic");
+        assert!(!non_rust.runtime_available);
+        assert!(
+            non_rust
+                .reason_codes
+                .iter()
+                .any(|code| code == "runtime.unavailable")
+        );
+    }
+
+    #[tokio::test]
+    async fn golden_selector_diagnostics_for_rejected_worker_mix() {
+        let _guard = test_guard!();
+        const FIXTURE_PATH: &str =
+            "../../tests/goldens/ft_4tp7g/selector_diagnostics_rejected_worker_mix.json";
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/goldens/ft_4tp7g/selector_diagnostics_rejected_worker_mix.json"
+        ))
+        .expect("selector diagnostics golden fixture parses");
+        assert_eq!(
+            fixture["schema_version"],
+            "rch.golden.selector_diagnostics.v1"
+        );
+
+        let pool = WorkerPool::new();
+
+        let active = make_worker("active-rust", 4, 80.0);
+        prepare_fixture_worker(
+            &active,
+            Some("rustc 1.97.0-nightly (fixture 2026-05-16)"),
+            PressureState::Healthy,
+            "pressure.ok",
+        )
+        .await;
+        pool.add_worker_state(active).await;
+
+        let busy = make_worker("busy-rust", 1, 75.0);
+        prepare_fixture_worker(
+            &busy,
+            Some("rustc 1.97.0-nightly (fixture 2026-05-16)"),
+            PressureState::Healthy,
+            "pressure.ok",
+        )
+        .await;
+        pool.add_worker_state(busy).await;
+
+        let circuit_open = make_worker("circuit-open", 4, 70.0);
+        prepare_fixture_worker(
+            &circuit_open,
+            Some("rustc 1.97.0-nightly (fixture 2026-05-16)"),
+            PressureState::Healthy,
+            "pressure.ok",
+        )
+        .await;
+        circuit_open.open_circuit().await;
+        pool.add_worker_state(circuit_open).await;
+
+        let no_rust = make_worker("no-rust", 4, 65.0);
+        prepare_fixture_worker(&no_rust, None, PressureState::Healthy, "pressure.ok").await;
+        pool.add_worker_state(no_rust).await;
+
+        let pressure_critical = make_worker("pressure-critical", 4, 60.0);
+        prepare_fixture_worker(
+            &pressure_critical,
+            Some("rustc 1.97.0-nightly (fixture 2026-05-16)"),
+            PressureState::Critical,
+            "pressure.disk_critical",
+        )
+        .await;
+        pool.add_worker_state(pressure_critical).await;
+
+        let toolchain_mismatch = make_worker("toolchain-mismatch", 4, 55.0);
+        prepare_fixture_worker(
+            &toolchain_mismatch,
+            Some("rustc 1.95.0-nightly (fixture 2026-03-01)"),
+            PressureState::Healthy,
+            "pressure.ok",
+        )
+        .await;
+        pool.add_worker_state(toolchain_mismatch).await;
+
+        let selector = WorkerSelector::default();
+        let request = SelectionRequest {
+            project: "frankenterm".to_string(),
+            command: Some("cargo test -p rchd --lib".to_string()),
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 2,
+            preferred_workers: vec![],
+            toolchain: Some(ToolchainInfo {
+                channel: "nightly".to_string(),
+                date: None,
+                full_version: "rustc 1.97.0-nightly (fixture 2026-05-16)".to_string(),
+            }),
+            required_runtime: RequiredRuntime::Rust,
+            classification_duration_us: Some(42),
+            hook_pid: Some(4242),
+        };
+        let mut excluded_worker_ids = std::collections::HashSet::new();
+        excluded_worker_ids.insert("active-rust".to_string());
+
+        let mut diagnostics = selector
+            .build_selection_diagnostics(&pool, &request, &excluded_worker_ids)
+            .await;
+        diagnostics
+            .workers
+            .sort_by(|left, right| left.worker_id.as_str().cmp(right.worker_id.as_str()));
+
+        assert_golden_json(
+            serde_json::to_value(&diagnostics).expect("diagnostics serialize"),
+            &fixture["expected_diagnostics"],
+            FIXTURE_PATH,
         );
     }
 
@@ -4207,6 +4788,102 @@ mod tests {
             result.reason,
             SelectionReason::NoAdmissibleWorkers("critical_pressure=1".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn test_no_admissible_summary_reports_pressure_and_health_filters() {
+        let pool = WorkerPool::new();
+
+        let critical = make_worker("critical-pressure", 8, 95.0);
+        prepare_fixture_worker(
+            &critical,
+            Some("1.87.0"),
+            PressureState::Critical,
+            "disk_ratio_below_critical",
+        )
+        .await;
+        pool.add_worker_state(critical).await;
+
+        let unhealthy = make_worker("unhealthy-rust", 8, 70.0);
+        prepare_fixture_worker(
+            &unhealthy,
+            Some("1.87.0"),
+            PressureState::Healthy,
+            "pressure.ok",
+        )
+        .await;
+        unhealthy.record_failure(None).await;
+        pool.add_worker_state(unhealthy).await;
+
+        let selector = WorkerSelector::default();
+        let request = SelectionRequest {
+            project: "pressure-and-health".to_string(),
+            command: Some("cargo test".to_string()),
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 4,
+            preferred_workers: vec![],
+            toolchain: None,
+            required_runtime: RequiredRuntime::Rust,
+            classification_duration_us: None,
+            hook_pid: None,
+        };
+
+        let result = selector.select(&pool, &request).await;
+        assert!(result.worker.is_none());
+        assert_eq!(
+            result.reason,
+            SelectionReason::NoAdmissibleWorkers(
+                "critical_pressure=1,health_below_fallback=1".to_string()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pressure_preflight_does_not_globalize_single_critical_worker() {
+        let pool = WorkerPool::new();
+
+        let critical = make_worker("critical-pressure", 8, 95.0);
+        prepare_fixture_worker(
+            &critical,
+            Some("1.87.0"),
+            PressureState::Critical,
+            "disk_ratio_below_critical",
+        )
+        .await;
+        pool.add_worker_state(critical).await;
+
+        let telemetry_gap = make_worker("telemetry-gap-rust", 8, 70.0);
+        prepare_fixture_worker(
+            &telemetry_gap,
+            Some("1.87.0"),
+            PressureState::TelemetryGap,
+            "telemetry_unavailable",
+        )
+        .await;
+        pool.add_worker_state(telemetry_gap).await;
+
+        let selector = WorkerSelector::default();
+        let request = SelectionRequest {
+            project: "pressure-mixed".to_string(),
+            command: Some("cargo test".to_string()),
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 4,
+            preferred_workers: vec![],
+            toolchain: None,
+            required_runtime: RequiredRuntime::Rust,
+            classification_duration_us: None,
+            hook_pid: None,
+        };
+
+        let result = selector.select(&pool, &request).await;
+        let selected = result
+            .worker
+            .expect("critical pressure on one worker must not block another admissible worker");
+        assert_eq!(
+            selected.config.read().await.id.as_str(),
+            "telemetry-gap-rust"
+        );
+        assert_eq!(result.reason, SelectionReason::Success);
     }
 
     #[tokio::test]

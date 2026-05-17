@@ -7,7 +7,6 @@
 //! - Tier 3: Negative pattern check
 //! - Tier 4: Full classification with confidence
 
-use memchr::memmem;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -323,14 +322,18 @@ fn classify_command_inner(cmd: &str, depth: u8) -> Classification {
         return Classification::not_compilation(reason);
     }
 
-    // Tier 2: SIMD keyword filter - quick check for compilation keywords
-    if !contains_compilation_keyword(cmd) {
-        return Classification::not_compilation("no compilation keyword");
-    }
-
     // Normalize command for Tier 3 and 4
     let normalized_cow = normalize_command(cmd);
     let normalized = normalized_cow.as_ref();
+
+    // Tier 2: quick check for compilation commands.
+    //
+    // This intentionally checks the normalized command word, not arbitrary
+    // arguments. A Beads comment like `br comments add ... "cargo test ..."`
+    // mentions compilation text, but it is not invoking a compiler.
+    if !starts_with_compilation_command(normalized) {
+        return Classification::not_compilation("no compilation keyword");
+    }
 
     // Tier 3: Negative pattern check - never intercept these
     // Performance: use static string to avoid format! allocation on hot rejection path
@@ -703,8 +706,12 @@ pub fn classify_command_detailed(cmd: &str) -> ClassificationDetails {
         reason: Cow::Borrowed("no pipes/redirects/backgrounding"),
     });
 
-    // Tier 2: SIMD keyword filter
-    if !contains_compilation_keyword(cmd) {
+    // Normalize command for Tier 2, 3, and 4.
+    let normalized_cow = normalize_command(cmd);
+    let normalized = normalized_cow.as_ref();
+
+    // Tier 2: command-word compilation filter.
+    if !starts_with_compilation_command(normalized) {
         let classification = Classification::not_compilation("no compilation keyword");
         tiers.push(ClassificationTier {
             tier: 2,
@@ -714,7 +721,7 @@ pub fn classify_command_detailed(cmd: &str) -> ClassificationDetails {
         });
         return ClassificationDetails {
             original,
-            normalized: cmd.to_string(),
+            normalized: normalized.to_string(),
             tiers,
             classification,
         };
@@ -726,10 +733,6 @@ pub fn classify_command_detailed(cmd: &str) -> ClassificationDetails {
         decision: TierDecision::Pass,
         reason: Cow::Borrowed("keyword present"),
     });
-
-    // Normalize command for Tier 3 and 4
-    let normalized_cow = normalize_command(cmd);
-    let normalized = normalized_cow.as_ref();
 
     // Tier 3: Negative pattern check - never intercept these
     for pattern in NEVER_INTERCEPT {
@@ -1152,15 +1155,23 @@ fn check_structure(cmd: &str) -> Option<&'static str> {
     None
 }
 
-/// Check if command contains any compilation keyword (SIMD-accelerated).
-fn contains_compilation_keyword(cmd: &str) -> bool {
-    let cmd_bytes = cmd.as_bytes();
-    for keyword in COMPILATION_KEYWORDS {
-        if memmem::find(cmd_bytes, keyword.as_bytes()).is_some() {
-            return true;
-        }
-    }
-    false
+/// Check whether the invoked command word is one of the compilation tools.
+///
+/// The keyword filter runs before full classification, so it must be cheap but
+/// cannot treat arbitrary arguments as commands. `normalize_command` strips
+/// wrappers and environment assignments before this helper is called.
+fn starts_with_compilation_command(cmd: &str) -> bool {
+    let cmd = cmd.trim_start();
+    COMPILATION_KEYWORDS
+        .iter()
+        .any(|keyword| command_word_matches(cmd, keyword))
+}
+
+fn command_word_matches(cmd: &str, keyword: &str) -> bool {
+    let Some(rest) = cmd.strip_prefix(keyword) else {
+        return false;
+    };
+    rest.is_empty() || rest.starts_with(char::is_whitespace)
 }
 
 /// Full classification of a command (Tier 4).
@@ -1682,10 +1693,11 @@ mod tests {
     #[test]
     fn test_bun_keyword_detected() {
         let _guard = test_guard!();
-        // Verify "bun" triggers keyword detection (Tier 2 passes)
-        assert!(contains_compilation_keyword("bun test"));
-        assert!(contains_compilation_keyword("bun typecheck"));
-        assert!(contains_compilation_keyword("bun install")); // keyword present, but will be blocked in Tier 3
+        // Verify "bun" command words trigger Tier 2 before Tier 3 decides
+        // whether the subcommand is safe to intercept.
+        assert!(starts_with_compilation_command("bun test"));
+        assert!(starts_with_compilation_command("bun typecheck"));
+        assert!(starts_with_compilation_command("bun install"));
     }
 
     #[test]
@@ -2381,9 +2393,9 @@ mod tests {
     #[test]
     fn test_nextest_keyword_detected() {
         let _guard = test_guard!();
-        // Verify "nextest" triggers keyword detection (Tier 2 passes)
-        assert!(contains_compilation_keyword("cargo nextest run"));
-        assert!(contains_compilation_keyword("cargo nextest list"));
+        // Verify nextest command words trigger Tier 2 before subcommand checks.
+        assert!(starts_with_compilation_command("cargo nextest run"));
+        assert!(starts_with_compilation_command("cargo nextest list"));
     }
 
     #[test]
@@ -3877,6 +3889,30 @@ mod tests_normalize_whitespace {
 mod regression_classification {
     use super::*;
     use crate::test_guard;
+
+    fn assert_golden_json(
+        actual: serde_json::Value,
+        expected: &serde_json::Value,
+        fixture_path: &str,
+    ) {
+        if &actual == expected {
+            return;
+        }
+
+        let actual_json = serde_json::to_string_pretty(&actual).expect("actual JSON renders");
+        let expected_json = serde_json::to_string_pretty(expected).expect("expected JSON renders");
+        panic!(
+            "golden mismatch in {fixture_path}\n\
+             expected_blake3={}\n\
+             actual_blake3={}\n\
+             bless path: review the semantic diff, update the fixture expected_* field, \
+             and record both hashes in the Beads closeout.\n\
+             expected:\n{expected_json}\n\
+             actual:\n{actual_json}",
+            blake3::hash(expected_json.as_bytes()),
+            blake3::hash(actual_json.as_bytes())
+        );
+    }
 
     /// A single regression test case.
     struct Case {
@@ -5563,6 +5599,97 @@ mod regression_classification {
             "cat gcc_output should not compile, got: {:?}",
             result.reason
         );
+    }
+
+    #[test]
+    fn regression_build_words_in_non_build_arguments_are_not_compilation() {
+        let _guard = test_guard!();
+        let cases = [
+            r#"br comments add ft-4tp7g.1 "remote proof blocked: cargo test -p rchd --lib""#,
+            r#"AGENT_NAME=Codex br comments add ft-4tp7g.1 "proof lane: cargo clippy --workspace""#,
+            r#"printf "cargo build --release""#,
+            r#"echo 'cargo test -p rchd -- --nocapture'"#,
+            r#"grep "cmake --build" docs/proof-notes.md"#,
+        ];
+
+        for cmd in cases {
+            let result = classify_command(cmd);
+            assert!(
+                !result.is_compilation,
+                "embedded build text should not compile for {cmd:?}: {:?}",
+                result
+            );
+            assert_eq!(result.reason.as_ref(), "no compilation keyword");
+        }
+    }
+
+    #[test]
+    fn golden_non_build_arguments_with_build_words_stay_non_compilation() {
+        let _guard = test_guard!();
+        const FIXTURE_PATH: &str =
+            "../../tests/goldens/ft_4tp7g/classification_non_build_arguments.json";
+
+        #[derive(serde::Deserialize)]
+        struct Golden {
+            schema_version: String,
+            cases: Vec<Case>,
+            expected_results: serde_json::Value,
+        }
+
+        #[derive(serde::Deserialize)]
+        struct Case {
+            name: String,
+            command: String,
+        }
+
+        let golden: Golden = serde_json::from_str(include_str!(
+            "../../tests/goldens/ft_4tp7g/classification_non_build_arguments.json"
+        ))
+        .expect("classification golden fixture parses");
+        assert_eq!(
+            golden.schema_version,
+            "rch.golden.classification_non_build_arguments.v1"
+        );
+
+        let mut actual_results = Vec::with_capacity(golden.cases.len());
+        for case in golden.cases {
+            let result = classify_command(&case.command);
+            actual_results.push(serde_json::json!({
+                "name": case.name,
+                "is_compilation": result.is_compilation,
+                "kind": result.kind,
+                "reason": result.reason.as_ref(),
+            }));
+        }
+        assert_golden_json(
+            serde_json::Value::Array(actual_results),
+            &golden.expected_results,
+            FIXTURE_PATH,
+        );
+    }
+
+    #[test]
+    fn regression_keyword_filter_still_accepts_normalized_build_invocations() {
+        let _guard = test_guard!();
+        let cases = [
+            ("RUST_BACKTRACE=1 cargo test", CompilationKind::CargoTest),
+            (
+                "env 'CARGO_TARGET_DIR=/data/tmp/rch-target' cargo build",
+                CompilationKind::CargoBuild,
+            ),
+            ("sudo -E cargo check", CompilationKind::CargoCheck),
+            ("/usr/bin/time cargo build", CompilationKind::CargoBuild),
+        ];
+
+        for (cmd, expected_kind) in cases {
+            let result = classify_command(cmd);
+            assert!(
+                result.is_compilation,
+                "normalized build invocation should compile for {cmd:?}: {:?}",
+                result
+            );
+            assert_eq!(result.kind, Some(expected_kind));
+        }
     }
 
     // ------------------------------------------------------------------
