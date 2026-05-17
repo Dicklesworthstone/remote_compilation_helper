@@ -3830,6 +3830,28 @@ mod tests {
     }
 
     #[test]
+    fn test_build_remote_command_preserves_inline_env_before_toolchain_runner() {
+        let _guard = test_guard!();
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/tmp/project"),
+            "project".to_string(),
+            "hash".to_string(),
+            TransferConfig::default(),
+        )
+        .with_compilation_kind(Some(CompilationKind::CargoBuild));
+
+        let command = pipeline.build_remote_command(
+            "RUSTFLAGS='-C target-cpu=native' cargo build",
+            Some(&ToolchainInfo::new("nightly", None, "")),
+        );
+
+        assert!(
+            command.contains("RUSTFLAGS='-C target-cpu=native' rustup run nightly cargo build")
+        );
+        assert!(!command.contains("rustup run nightly RUSTFLAGS="));
+    }
+
+    #[test]
     fn test_build_remote_command_records_remote_pgid_for_cancellation() {
         let _guard = test_guard!();
         let pipeline = TransferPipeline::new(

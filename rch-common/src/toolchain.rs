@@ -4,6 +4,10 @@
 //! for toolchain synchronization between local and remote workers.
 
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
+
+use crate::ssh_utils::is_valid_env_key;
+use crate::types::ColorMode;
 
 /// Detected Rust toolchain information.
 ///
@@ -71,12 +75,193 @@ impl std::fmt::Display for ToolchainInfo {
 /// Otherwise returns the original command unchanged.
 pub fn wrap_command_with_toolchain(command: &str, toolchain: Option<&ToolchainInfo>) -> String {
     match toolchain {
-        Some(tc) => format!("rustup run {} {}", tc.rustup_toolchain(), command),
+        Some(tc) => insert_toolchain_runner(
+            command,
+            &format!(
+                "rustup run {}",
+                shell_escape::escape(Cow::Owned(tc.rustup_toolchain()))
+            ),
+        ),
         None => command.to_string(),
     }
 }
 
-use crate::types::ColorMode;
+fn insert_toolchain_runner(command: &str, runner: &str) -> String {
+    if command.is_empty() {
+        return format!("{runner} ");
+    }
+
+    let insert_at = toolchain_runner_insert_index(command);
+    if insert_at == 0 {
+        format!("{runner} {command}")
+    } else if insert_at >= command.len() {
+        format!("{command} {runner} ")
+    } else {
+        let Some(prefix) = command.get(..insert_at) else {
+            return format!("{runner} {command}");
+        };
+        let Some(suffix) = command.get(insert_at..) else {
+            return format!("{command} {runner} ");
+        };
+        format!("{prefix}{runner} {suffix}")
+    }
+}
+
+fn toolchain_runner_insert_index(command: &str) -> usize {
+    let Some((start, end)) = next_shell_token_span(command, 0) else {
+        return command.len();
+    };
+
+    let Some(first) = command.get(start..end) else {
+        return start;
+    };
+    if matches!(first, "env") {
+        return env_command_insert_index(command, skip_shell_whitespace(command, end));
+    }
+
+    let mut index = start;
+    let mut cursor = start;
+    while let Some((token_start, token_end)) = next_shell_token_span(command, cursor) {
+        let Some(token) = command.get(token_start..token_end) else {
+            return token_start;
+        };
+        if !is_env_assignment_token(token) {
+            return token_start;
+        }
+        index = skip_shell_whitespace(command, token_end);
+        cursor = index;
+    }
+
+    index
+}
+
+fn env_command_insert_index(command: &str, mut cursor: usize) -> usize {
+    while let Some((token_start, token_end)) = next_shell_token_span(command, cursor) {
+        let Some(token) = command.get(token_start..token_end) else {
+            return token_start;
+        };
+        if matches!(token, "--") {
+            return skip_shell_whitespace(command, token_end);
+        }
+        if env_option_takes_next_token(token) {
+            cursor = skip_shell_whitespace(command, token_end);
+            if let Some((_, value_end)) = next_shell_token_span(command, cursor) {
+                cursor = skip_shell_whitespace(command, value_end);
+            }
+            continue;
+        }
+        match token {
+            "-u" | "--unset" => {
+                cursor = skip_shell_whitespace(command, token_end);
+                if let Some((_, unset_end)) = next_shell_token_span(command, cursor) {
+                    cursor = skip_shell_whitespace(command, unset_end);
+                }
+            }
+            _ if token.starts_with("--unset=") => {
+                cursor = skip_shell_whitespace(command, token_end);
+            }
+            _ if env_option_has_inline_value(token) => {
+                cursor = skip_shell_whitespace(command, token_end);
+            }
+            _ if token.starts_with('-') && !token.contains('=') => {
+                cursor = skip_shell_whitespace(command, token_end);
+            }
+            _ if is_env_assignment_token(token) => {
+                cursor = skip_shell_whitespace(command, token_end);
+            }
+            _ => return token_start,
+        }
+    }
+
+    command.len()
+}
+
+fn env_option_takes_next_token(token: &str) -> bool {
+    matches!(
+        token,
+        "-C" | "--chdir"
+            | "-f"
+            | "--file"
+            | "-S"
+            | "--split-string"
+            | "-a"
+            | "--argv0"
+            | "--ignore-signal"
+    )
+}
+
+fn env_option_has_inline_value(token: &str) -> bool {
+    token.starts_with("--chdir=")
+        || token.starts_with("--file=")
+        || token.starts_with("--split-string=")
+        || token.starts_with("--argv0=")
+        || token.starts_with("--ignore-signal=")
+        || token.starts_with("-C")
+        || token.starts_with("-f")
+        || token.starts_with("-S")
+        || token.starts_with("-a")
+        || token.starts_with("-u")
+}
+
+fn is_env_assignment_token(token: &str) -> bool {
+    token
+        .split_once('=')
+        .is_some_and(|(key, _)| is_valid_env_key(key))
+}
+
+fn next_shell_token_span(command: &str, offset: usize) -> Option<(usize, usize)> {
+    let start = skip_shell_whitespace(command, offset);
+    if start >= command.len() {
+        return None;
+    }
+
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+
+    let rest = command.get(start..)?;
+    for (relative_index, ch) in rest.char_indices() {
+        let index = start + relative_index;
+
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && !in_single {
+            escaped = true;
+            continue;
+        }
+        if ch == '\'' && !in_double {
+            in_single = !in_single;
+            continue;
+        }
+        if ch == '"' && !in_single {
+            in_double = !in_double;
+            continue;
+        }
+        if ch.is_whitespace() && !in_single && !in_double {
+            return Some((start, index));
+        }
+    }
+
+    Some((start, command.len()))
+}
+
+fn skip_shell_whitespace(command: &str, mut offset: usize) -> usize {
+    while offset < command.len() {
+        let Some(rest) = command.get(offset..) else {
+            break;
+        };
+        let Some(ch) = rest.chars().next() else {
+            break;
+        };
+        if !ch.is_whitespace() {
+            break;
+        }
+        offset += ch.len_utf8();
+    }
+    offset
+}
 
 /// Wrap a command with environment variables to force color output.
 ///
@@ -204,6 +389,65 @@ mod tests {
         let tc = ToolchainInfo::new("nightly", Some("2024-01-15".to_string()), "");
         let wrapped = wrap_command_with_toolchain("cargo build", Some(&tc));
         assert_eq!(wrapped, "rustup run nightly-2024-01-15 cargo build");
+    }
+
+    #[test]
+    fn test_wrap_command_with_toolchain_preserves_inline_env_assignment() {
+        let tc = ToolchainInfo::new("nightly", None, "");
+        let wrapped = wrap_command_with_toolchain(
+            "RUSTFLAGS=\"-C target-cpu=native\" cargo build",
+            Some(&tc),
+        );
+        assert_eq!(
+            wrapped,
+            "RUSTFLAGS=\"-C target-cpu=native\" rustup run nightly cargo build"
+        );
+    }
+
+    #[test]
+    fn test_wrap_command_with_toolchain_preserves_env_wrapper() {
+        let tc = ToolchainInfo::new("stable", None, "");
+        let wrapped = wrap_command_with_toolchain(
+            "env -u RUST_LOG RUSTFLAGS=\"-C target-cpu=native\" cargo test",
+            Some(&tc),
+        );
+        assert_eq!(
+            wrapped,
+            "env -u RUST_LOG RUSTFLAGS=\"-C target-cpu=native\" rustup run stable cargo test"
+        );
+    }
+
+    #[test]
+    fn test_wrap_command_with_toolchain_preserves_env_options_with_operands() {
+        let tc = ToolchainInfo::new("stable", None, "");
+        let wrapped = wrap_command_with_toolchain(
+            "env -C \"/tmp/project dir\" -f .env RUSTFLAGS=-Awarnings cargo test",
+            Some(&tc),
+        );
+        assert_eq!(
+            wrapped,
+            "env -C \"/tmp/project dir\" -f .env RUSTFLAGS=-Awarnings rustup run stable cargo test"
+        );
+    }
+
+    #[test]
+    fn test_wrap_command_with_toolchain_preserves_env_options_with_inline_operands() {
+        let tc = ToolchainInfo::new("stable", None, "");
+        let wrapped = wrap_command_with_toolchain(
+            "env --chdir=\"/tmp/project dir\" --file=.env RUSTFLAGS=-Awarnings cargo test",
+            Some(&tc),
+        );
+        assert_eq!(
+            wrapped,
+            "env --chdir=\"/tmp/project dir\" --file=.env RUSTFLAGS=-Awarnings rustup run stable cargo test"
+        );
+    }
+
+    #[test]
+    fn test_wrap_command_with_toolchain_quotes_toolchain_name() {
+        let tc = ToolchainInfo::new("nightly;echo injected", None, "");
+        let wrapped = wrap_command_with_toolchain("cargo build", Some(&tc));
+        assert_eq!(wrapped, "rustup run 'nightly;echo injected' cargo build");
     }
 
     #[test]
