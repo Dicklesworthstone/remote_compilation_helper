@@ -701,7 +701,7 @@ else printf 'NOT_SYMLINK'; fi"
 fn create_canonical_root_cmd(canonical: &Path) -> String {
     let c = shell_escape(canonical);
     format!(
-        "mkdir_stderr=$(mkdir -p -- {c} 2>&1) || {{ echo \"RCH_TOPOLOGY_ERR_CANONICAL_CREATE_FAILED:path={c}:$mkdir_stderr\" >&2; exit 45; }}"
+        "mkdir_stderr=$(mkdir -p -- {c} 2>&1) || {{ printf 'RCH_TOPOLOGY_ERR_CANONICAL_CREATE_FAILED:path=%s:%s\\n' {c} \"$mkdir_stderr\" >&2; exit 45; }}"
     )
 }
 
@@ -717,14 +717,14 @@ if [ -L {a} ]; then \
 target=$(readlink -- {a} 2>/dev/null || true); \
 target_real=$(readlink -f -- {a} 2>/dev/null || true); \
 if [ \"$target\" = {c} ] || [ \"$target\" = {c_slash} ] || [ \"$target_real\" = \"$canonical_real\" ]; then return 0; fi; \
-update_stderr=$(ln -sfn -- {c} {a} 2>&1) || {{ echo \"RCH_TOPOLOGY_ERR_ALIAS_UPDATE_FAILED:path={a}:target={c}:$update_stderr\" >&2; return 43; }}; \
+update_stderr=$(ln -sfn -- {c} {a} 2>&1) || {{ printf 'RCH_TOPOLOGY_ERR_ALIAS_UPDATE_FAILED:path=%s:target=%s:%s\\n' {a} {c} \"$update_stderr\" >&2; return 43; }}; \
 elif [ -e {a} ]; then \
-echo 'RCH_TOPOLOGY_ERR_ALIAS_NOT_SYMLINK:path={a}' >&2; return 42; \
+printf 'RCH_TOPOLOGY_ERR_ALIAS_NOT_SYMLINK:path=%s\\n' {a} >&2; return 42; \
 else \
 create_stderr=$(ln -s -- {c} {a} 2>&1) && return 0; \
 if [ -L {a} ]; then ensure_alias_symlink; return $?; fi; \
-if [ -e {a} ]; then echo 'RCH_TOPOLOGY_ERR_ALIAS_NOT_SYMLINK:path={a}' >&2; return 42; fi; \
-echo \"RCH_TOPOLOGY_ERR_ALIAS_CREATE_FAILED:path={a}:target={c}:$create_stderr\" >&2; return 44; \
+if [ -e {a} ]; then printf 'RCH_TOPOLOGY_ERR_ALIAS_NOT_SYMLINK:path=%s\\n' {a} >&2; return 42; fi; \
+printf 'RCH_TOPOLOGY_ERR_ALIAS_CREATE_FAILED:path=%s:target=%s:%s\\n' {a} {c} \"$create_stderr\" >&2; return 44; \
 fi; \
 }}; ensure_alias_symlink"
     )
@@ -2016,7 +2016,7 @@ mod tests {
         );
         assert!(
             create_canonical.contains(
-                "RCH_TOPOLOGY_ERR_CANONICAL_CREATE_FAILED:path='-canonical-root':$mkdir_stderr"
+                "printf 'RCH_TOPOLOGY_ERR_CANONICAL_CREATE_FAILED:path=%s:%s\\n' '-canonical-root' \"$mkdir_stderr\""
             ),
             "canonical create failures must report the exact path: {create_canonical}"
         );
@@ -2051,13 +2051,13 @@ mod tests {
         );
         assert!(
             create_alias.contains(
-                "RCH_TOPOLOGY_ERR_ALIAS_CREATE_FAILED:path='-alias-root':target='-canonical-root':$create_stderr"
+                "printf 'RCH_TOPOLOGY_ERR_ALIAS_CREATE_FAILED:path=%s:target=%s:%s\\n' '-alias-root' '-canonical-root' \"$create_stderr\""
             ),
             "alias create failures must report the exact path and target: {create_alias}"
         );
         assert!(
             create_alias.contains(
-                "RCH_TOPOLOGY_ERR_ALIAS_UPDATE_FAILED:path='-alias-root':target='-canonical-root':$update_stderr"
+                "printf 'RCH_TOPOLOGY_ERR_ALIAS_UPDATE_FAILED:path=%s:target=%s:%s\\n' '-alias-root' '-canonical-root' \"$update_stderr\""
             ),
             "alias update failures must report the exact path and target: {create_alias}"
         );
@@ -2066,6 +2066,36 @@ mod tests {
         assert!(
             check_cmd.contains("readlink -- '-alias-root'"),
             "alias probe must terminate readlink options before the path: {check_cmd}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn topology_bootstrap_diagnostics_do_not_reexpand_escaped_paths() {
+        let canonical = Path::new("/tmp/rch canonical");
+        let alias = Path::new("/tmp/rch alias/alias_$(touch /tmp/rch-owned)");
+
+        let create_canonical = create_canonical_root_cmd(canonical);
+        assert!(
+            create_canonical
+                .contains("printf 'RCH_TOPOLOGY_ERR_CANONICAL_CREATE_FAILED:path=%s:%s\\n'"),
+            "canonical diagnostics must use a static printf format: {create_canonical}"
+        );
+
+        let create_alias = create_alias_symlink_cmd(alias, canonical);
+        assert!(
+            create_alias
+                .contains("printf 'RCH_TOPOLOGY_ERR_ALIAS_CREATE_FAILED:path=%s:target=%s:%s\\n'"),
+            "alias create diagnostics must use a static printf format: {create_alias}"
+        );
+        assert!(
+            create_alias
+                .contains("printf 'RCH_TOPOLOGY_ERR_ALIAS_UPDATE_FAILED:path=%s:target=%s:%s\\n'"),
+            "alias update diagnostics must use a static printf format: {create_alias}"
+        );
+        assert!(
+            !create_alias.contains("echo \"RCH_TOPOLOGY_ERR_ALIAS_CREATE_FAILED:path="),
+            "diagnostics must not splice escaped paths into double-quoted shell text: {create_alias}"
         );
     }
 

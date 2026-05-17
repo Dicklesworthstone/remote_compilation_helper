@@ -3579,23 +3579,23 @@ fn build_worker_projects_topology_cmd(topology_policy: &PathTopologyPolicy) -> S
 
     format!(
         "set -e; \
-         if [ ! -e {canonical} ] && [ ! -L {canonical} ]; then mkdir_stderr=$(mkdir -p -- {canonical} 2>&1) || {{ echo \"RCH_TOPOLOGY_ERR_CANONICAL_CREATE_FAILED:path={canonical}:$mkdir_stderr\" >&2; exit 45; }}; fi; \
-         if [ -e {canonical} ] && [ ! -d {canonical} ]; then echo 'RCH_TOPOLOGY_ERR_CANONICAL_NOT_DIRECTORY:path={canonical}' >&2; exit 41; fi; \
+         if [ ! -e {canonical} ] && [ ! -L {canonical} ]; then mkdir_stderr=$(mkdir -p -- {canonical} 2>&1) || {{ printf 'RCH_TOPOLOGY_ERR_CANONICAL_CREATE_FAILED:path=%s:%s\\n' {canonical} \"$mkdir_stderr\" >&2; exit 45; }}; fi; \
+         if [ -e {canonical} ] && [ ! -d {canonical} ]; then printf 'RCH_TOPOLOGY_ERR_CANONICAL_NOT_DIRECTORY:path=%s\\n' {canonical} >&2; exit 41; fi; \
          canonical_real=$(readlink -f -- {canonical} 2>/dev/null || printf '%s' {canonical}); \
          ensure_alias_symlink() {{ \
          if [ -L {alias} ]; then \
            target=$(readlink -- {alias} 2>/dev/null || true); \
            target_real=$(readlink -f -- {alias} 2>/dev/null || true); \
            if [ \"$target\" != {canonical} ] && [ \"$target\" != {canonical_slash} ] && [ \"$target_real\" != \"$canonical_real\" ]; then \
-             update_stderr=$(ln -sfn -- {canonical} {alias} 2>&1) || {{ echo \"RCH_TOPOLOGY_ERR_ALIAS_UPDATE_FAILED:path={alias}:target={canonical}:$update_stderr\" >&2; return 43; }}; \
+             update_stderr=$(ln -sfn -- {canonical} {alias} 2>&1) || {{ printf 'RCH_TOPOLOGY_ERR_ALIAS_UPDATE_FAILED:path=%s:target=%s:%s\\n' {alias} {canonical} \"$update_stderr\" >&2; return 43; }}; \
            fi; \
          elif [ -e {alias} ]; then \
-           echo 'RCH_TOPOLOGY_ERR_ALIAS_NOT_SYMLINK:path={alias}' >&2; return 42; \
+           printf 'RCH_TOPOLOGY_ERR_ALIAS_NOT_SYMLINK:path=%s\\n' {alias} >&2; return 42; \
          else \
            create_stderr=$(ln -s -- {canonical} {alias} 2>&1) && return 0; \
            if [ -L {alias} ]; then ensure_alias_symlink; return $?; fi; \
-           if [ -e {alias} ]; then echo 'RCH_TOPOLOGY_ERR_ALIAS_NOT_SYMLINK:path={alias}' >&2; return 42; fi; \
-           echo \"RCH_TOPOLOGY_ERR_ALIAS_CREATE_FAILED:path={alias}:target={canonical}:$create_stderr\" >&2; return 44; \
+           if [ -e {alias} ]; then printf 'RCH_TOPOLOGY_ERR_ALIAS_NOT_SYMLINK:path=%s\\n' {alias} >&2; return 42; fi; \
+           printf 'RCH_TOPOLOGY_ERR_ALIAS_CREATE_FAILED:path=%s:target=%s:%s\\n' {alias} {canonical} \"$create_stderr\" >&2; return 44; \
          fi; \
          }}; \
          ensure_alias_symlink; \
@@ -10824,19 +10824,19 @@ edition = "2024"
         );
         assert!(
             command.contains(&format!(
-                "RCH_TOPOLOGY_ERR_ALIAS_CREATE_FAILED:path={alias}:target={canonical}:$create_stderr"
+                "printf 'RCH_TOPOLOGY_ERR_ALIAS_CREATE_FAILED:path=%s:target=%s:%s\\n' {alias} {canonical} \"$create_stderr\""
             )),
             "missing-alias create failures must report the exact alias and canonical paths: {command}"
         );
         assert!(
             command.contains(&format!(
-                "RCH_TOPOLOGY_ERR_ALIAS_UPDATE_FAILED:path={alias}:target={canonical}:$update_stderr"
+                "printf 'RCH_TOPOLOGY_ERR_ALIAS_UPDATE_FAILED:path=%s:target=%s:%s\\n' {alias} {canonical} \"$update_stderr\""
             )),
             "alias update failures must report the exact alias and canonical paths: {command}"
         );
         assert!(
             command.contains(&format!(
-                "RCH_TOPOLOGY_ERR_CANONICAL_CREATE_FAILED:path={canonical}:$mkdir_stderr"
+                "printf 'RCH_TOPOLOGY_ERR_CANONICAL_CREATE_FAILED:path=%s:%s\\n' {canonical} \"$mkdir_stderr\""
             )),
             "canonical mkdir failures must report the exact canonical path: {command}"
         );
@@ -10905,7 +10905,14 @@ exec /bin/ln \"$@\"\n",
         let _guard = test_guard!();
         use std::os::unix::fs::PermissionsExt;
 
-        let (temp_dir, policy) = topology_tempdir();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let sentinel = temp_dir.path().join("diagnostic-substitution-ran");
+        let policy = PathTopologyPolicy::new(
+            temp_dir.path().join("projects"),
+            temp_dir
+                .path()
+                .join(format!("dp_$(touch {})", sentinel.display())),
+        );
         let fake_bin = temp_dir.path().join("fake-bin");
         std::fs::create_dir_all(&fake_bin).expect("create fake bin dir");
         let fake_ln = fake_bin.join("ln");
@@ -10952,12 +10959,20 @@ exec /bin/ln \"$@\"\n",
             "stderr should include the exact colliding alias path: {stderr}"
         );
         assert!(
+            stderr.contains("$(touch "),
+            "stderr should include the literal configured path: {stderr}"
+        );
+        assert!(
             stderr.contains(&format!("target={}", policy.canonical_root().display())),
             "stderr should include the intended canonical target: {stderr}"
         );
         assert!(
             stderr.contains("ln: Already exists"),
             "stderr should preserve the underlying ln diagnostic: {stderr}"
+        );
+        assert!(
+            !sentinel.exists(),
+            "diagnostic formatting must not re-expand command substitutions from configured paths"
         );
     }
 
