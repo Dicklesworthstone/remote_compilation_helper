@@ -3579,23 +3579,23 @@ fn build_worker_projects_topology_cmd(topology_policy: &PathTopologyPolicy) -> S
 
     format!(
         "set -e; \
-         if [ ! -e {canonical} ] && [ ! -L {canonical} ]; then mkdir -p -- {canonical}; fi; \
-         if [ -e {canonical} ] && [ ! -d {canonical} ]; then echo 'RCH_TOPOLOGY_ERR_CANONICAL_NOT_DIRECTORY' >&2; exit 41; fi; \
+         if [ ! -e {canonical} ] && [ ! -L {canonical} ]; then mkdir_stderr=$(mkdir -p -- {canonical} 2>&1) || {{ echo \"RCH_TOPOLOGY_ERR_CANONICAL_CREATE_FAILED:path={canonical}:$mkdir_stderr\" >&2; exit 45; }}; fi; \
+         if [ -e {canonical} ] && [ ! -d {canonical} ]; then echo 'RCH_TOPOLOGY_ERR_CANONICAL_NOT_DIRECTORY:path={canonical}' >&2; exit 41; fi; \
          canonical_real=$(readlink -f -- {canonical} 2>/dev/null || printf '%s' {canonical}); \
          ensure_alias_symlink() {{ \
          if [ -L {alias} ]; then \
            target=$(readlink -- {alias} 2>/dev/null || true); \
            target_real=$(readlink -f -- {alias} 2>/dev/null || true); \
            if [ \"$target\" != {canonical} ] && [ \"$target\" != {canonical_slash} ] && [ \"$target_real\" != \"$canonical_real\" ]; then \
-             update_stderr=$(ln -sfn -- {canonical} {alias} 2>&1) || {{ echo \"RCH_TOPOLOGY_ERR_ALIAS_UPDATE_FAILED:$update_stderr\" >&2; return 43; }}; \
+             update_stderr=$(ln -sfn -- {canonical} {alias} 2>&1) || {{ echo \"RCH_TOPOLOGY_ERR_ALIAS_UPDATE_FAILED:path={alias}:target={canonical}:$update_stderr\" >&2; return 43; }}; \
            fi; \
          elif [ -e {alias} ]; then \
-           echo 'RCH_TOPOLOGY_ERR_ALIAS_NOT_SYMLINK' >&2; return 42; \
+           echo 'RCH_TOPOLOGY_ERR_ALIAS_NOT_SYMLINK:path={alias}' >&2; return 42; \
          else \
            create_stderr=$(ln -s -- {canonical} {alias} 2>&1) && return 0; \
            if [ -L {alias} ]; then ensure_alias_symlink; return $?; fi; \
-           if [ -e {alias} ]; then echo 'RCH_TOPOLOGY_ERR_ALIAS_NOT_SYMLINK' >&2; return 42; fi; \
-           echo \"RCH_TOPOLOGY_ERR_ALIAS_CREATE_FAILED:$create_stderr\" >&2; return 44; \
+           if [ -e {alias} ]; then echo 'RCH_TOPOLOGY_ERR_ALIAS_NOT_SYMLINK:path={alias}' >&2; return 42; fi; \
+           echo \"RCH_TOPOLOGY_ERR_ALIAS_CREATE_FAILED:path={alias}:target={canonical}:$create_stderr\" >&2; return 44; \
          fi; \
          }}; \
          ensure_alias_symlink; \
@@ -10822,6 +10822,24 @@ edition = "2024"
             command.contains("RCH_TOPOLOGY_ERR_ALIAS_CREATE_FAILED"),
             "missing-alias create failures must report a structured reason: {command}"
         );
+        assert!(
+            command.contains(&format!(
+                "RCH_TOPOLOGY_ERR_ALIAS_CREATE_FAILED:path={alias}:target={canonical}:$create_stderr"
+            )),
+            "missing-alias create failures must report the exact alias and canonical paths: {command}"
+        );
+        assert!(
+            command.contains(&format!(
+                "RCH_TOPOLOGY_ERR_ALIAS_UPDATE_FAILED:path={alias}:target={canonical}:$update_stderr"
+            )),
+            "alias update failures must report the exact alias and canonical paths: {command}"
+        );
+        assert!(
+            command.contains(&format!(
+                "RCH_TOPOLOGY_ERR_CANONICAL_CREATE_FAILED:path={canonical}:$mkdir_stderr"
+            )),
+            "canonical mkdir failures must report the exact canonical path: {command}"
+        );
     }
 
     #[cfg(unix)]
@@ -10858,7 +10876,7 @@ exec /bin/ln \"$@\"\n",
             std::env::var("PATH").unwrap_or_default()
         );
         let output = std::process::Command::new("sh")
-            .arg("-lc")
+            .arg("-c")
             .arg(command)
             .env("PATH", path)
             .output()
@@ -10878,6 +10896,68 @@ exec /bin/ln \"$@\"\n",
         assert_eq!(
             std::fs::read_link(policy.alias_root()).expect("alias symlink target"),
             policy.canonical_root().to_path_buf()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_build_worker_projects_topology_cmd_reports_alias_create_collision_path() {
+        let _guard = test_guard!();
+        use std::os::unix::fs::PermissionsExt;
+
+        let (temp_dir, policy) = topology_tempdir();
+        let fake_bin = temp_dir.path().join("fake-bin");
+        std::fs::create_dir_all(&fake_bin).expect("create fake bin dir");
+        let fake_ln = fake_bin.join("ln");
+        std::fs::write(
+            &fake_ln,
+            "#!/bin/sh\n\
+if [ \"$1\" = \"-s\" ] && [ \"$2\" = \"--\" ]; then\n\
+  echo \"ln: Already exists\" >&2\n\
+  exit 1\n\
+fi\n\
+exec /bin/ln \"$@\"\n",
+        )
+        .expect("write fake ln");
+        let mut perms = std::fs::metadata(&fake_ln)
+            .expect("fake ln metadata")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_ln, perms).expect("chmod fake ln");
+
+        let command = build_worker_projects_topology_cmd(&policy);
+        let path = format!(
+            "{}:{}",
+            fake_bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .env("PATH", path)
+            .output()
+            .expect("run topology command");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert!(
+            !output.status.success(),
+            "unresolved alias create collision should fail"
+        );
+        assert!(
+            stderr.contains("RCH_TOPOLOGY_ERR_ALIAS_CREATE_FAILED"),
+            "stderr should keep a structured failure code: {stderr}"
+        );
+        assert!(
+            stderr.contains(&format!("path={}", policy.alias_root().display())),
+            "stderr should include the exact colliding alias path: {stderr}"
+        );
+        assert!(
+            stderr.contains(&format!("target={}", policy.canonical_root().display())),
+            "stderr should include the intended canonical target: {stderr}"
+        );
+        assert!(
+            stderr.contains("ln: Already exists"),
+            "stderr should preserve the underlying ln diagnostic: {stderr}"
         );
     }
 
