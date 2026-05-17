@@ -4,8 +4,8 @@
 //! and checking overall system status.
 
 use crate::hook::{
-    extract_project_name_with_policy, preferred_workers_from_env, query_daemon, release_worker,
-    required_runtime_for_kind,
+    cargo_job_count_for_command, estimate_cores_for_command, extract_project_name_with_policy,
+    preferred_workers_from_env, query_daemon, release_worker, required_runtime_for_kind,
 };
 use crate::status_types::{
     DaemonFullStatusResponse, IssueFromApi, SelfTestHistoryResponseFromApi,
@@ -62,6 +62,17 @@ pub(super) fn build_diagnose_decision(
         would_intercept,
         reason,
     }
+}
+
+pub(super) fn build_diagnose_slot_estimate(
+    kind: Option<rch_common::CompilationKind>,
+    command: &str,
+    config: &rch_common::CompilationConfig,
+) -> (u32, Option<u32>) {
+    (
+        estimate_cores_for_command(kind, command, config),
+        cargo_job_count_for_command(command),
+    )
 }
 
 /// Build dry-run summary showing what would happen.
@@ -332,7 +343,8 @@ pub async fn diagnose(command: &str, dry_run: bool, ctx: &OutputContext) -> Resu
 
     let mut worker_selection = None;
     if would_intercept && daemon_status.reachable {
-        let estimated_cores = 4;
+        let (estimated_cores, cargo_jobs) =
+            build_diagnose_slot_estimate(details.classification.kind, command, &config.compilation);
         let project_root = std::env::current_dir().ok();
         let normalized_project_root = project_root.as_ref().and_then(|path| {
             normalize_project_path_with_policy(path, &topology_policy)
@@ -379,6 +391,7 @@ pub async fn diagnose(command: &str, dry_run: bool, ctx: &OutputContext) -> Resu
                 }
                 worker_selection = Some(DiagnoseWorkerSelection {
                     estimated_cores,
+                    cargo_jobs,
                     worker: response.worker.clone(),
                     reason: response.reason.clone(),
                     diagnostics: response.diagnostics.clone(),

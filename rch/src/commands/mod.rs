@@ -159,7 +159,9 @@ mod tests {
         major_version, major_version_mismatch, runtime_label, rust_version_mismatch,
         urlencoding_encode,
     };
-    use super::status::{build_diagnose_decision, build_dry_run_summary};
+    use super::status::{
+        build_diagnose_decision, build_diagnose_slot_estimate, build_dry_run_summary,
+    };
     use super::workers::{
         collect_local_capability_warnings, collect_refresh_warnings, has_any_capabilities,
         summarize_capabilities,
@@ -821,6 +823,42 @@ mod tests {
     }
 
     #[test]
+    fn diagnose_slot_estimate_honors_cargo_test_jobs() {
+        let _guard = test_guard!();
+        let config = rch_common::CompilationConfig {
+            build_slots: 6,
+            test_slots: 10,
+            check_slots: 3,
+            ..Default::default()
+        };
+
+        let (estimated_cores, cargo_jobs) = build_diagnose_slot_estimate(
+            Some(CompilationKind::CargoTest),
+            "cargo test -j 1 -p frankenterm-core-replay-types -- --nocapture",
+            &config,
+        );
+
+        assert_eq!(estimated_cores, 1);
+        assert_eq!(cargo_jobs, Some(1));
+    }
+
+    #[test]
+    fn diagnose_worker_selection_serializes_cargo_jobs() {
+        let _guard = test_guard!();
+        let worker_selection = DiagnoseWorkerSelection {
+            estimated_cores: 1,
+            cargo_jobs: Some(1),
+            worker: None,
+            reason: SelectionReason::NoAdmissibleWorkers("insufficient_slots=1".to_string()),
+            diagnostics: None,
+        };
+
+        let json = serde_json::to_value(&worker_selection).unwrap();
+        assert_eq!(json["estimated_cores"], 1);
+        assert_eq!(json["cargo_jobs"], 1);
+    }
+
+    #[test]
     fn workers_capabilities_report_serializes_with_local() {
         let _guard = test_guard!();
         let report = WorkersCapabilitiesReport {
@@ -1097,6 +1135,7 @@ mod tests {
         };
         let worker_selection = DiagnoseWorkerSelection {
             estimated_cores: 4,
+            cargo_jobs: None,
             worker: Some(worker),
             reason: SelectionReason::Success,
             diagnostics: None,
@@ -1122,6 +1161,7 @@ mod tests {
         let _guard = test_guard!();
         let worker_selection = DiagnoseWorkerSelection {
             estimated_cores: 4,
+            cargo_jobs: None,
             worker: None,
             reason: SelectionReason::NoAdmissibleWorkers("critical_pressure=1".to_string()),
             diagnostics: None,
@@ -1183,6 +1223,7 @@ mod tests {
         let _guard = test_guard!();
         let worker_selection = DiagnoseWorkerSelection {
             estimated_cores: 4,
+            cargo_jobs: None,
             worker: None,
             reason: SelectionReason::NoAdmissibleWorkers("critical_pressure=1".to_string()),
             diagnostics: Some(SelectionDiagnostics {

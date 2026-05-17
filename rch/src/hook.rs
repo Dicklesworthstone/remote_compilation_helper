@@ -968,6 +968,12 @@ fn parse_jobs_flag(command: &str) -> Option<u32> {
     None
 }
 
+pub(crate) fn cargo_job_count_for_command(command: &str) -> Option<u32> {
+    parse_jobs_flag(command)
+        .or_else(|| parse_env_u32(command, "CARGO_BUILD_JOBS"))
+        .or_else(|| read_env_u32("CARGO_BUILD_JOBS"))
+}
+
 fn parse_test_threads(command: &str) -> Option<u32> {
     let tokens: Vec<&str> = command.split_whitespace().collect();
     for (idx, token) in tokens.iter().enumerate() {
@@ -1985,7 +1991,7 @@ fn estimate_timing_for_build(
     })
 }
 
-fn estimate_cores_for_command(
+pub(crate) fn estimate_cores_for_command(
     kind: Option<CompilationKind>,
     command: &str,
     config: &rch_common::CompilationConfig,
@@ -1998,14 +2004,16 @@ fn estimate_cores_for_command(
     let filtered_test_slots = (test_default / 2).max(2).min(test_default);
 
     match kind {
-        Some(
-            CompilationKind::CargoTest | CompilationKind::CargoNextest | CompilationKind::BunTest,
-        ) => {
+        Some(CompilationKind::CargoTest | CompilationKind::CargoNextest) => {
             // Priority order for test slot estimation:
-            // 1. Explicit --test-threads flag
-            // 2. RUST_TEST_THREADS environment variable (inline or ambient)
-            // 3. Inferred from test filtering (reduced slots)
-            // 4. Default test_slots from config
+            // 1. Explicit cargo -j/--jobs or CARGO_BUILD_JOBS
+            // 2. Explicit --test-threads flag
+            // 3. RUST_TEST_THREADS environment variable (inline or ambient)
+            // 4. Inferred from test filtering (reduced slots)
+            // 5. Default test_slots from config
+            if let Some(jobs) = cargo_job_count_for_command(command) {
+                return jobs.max(1);
+            }
             if let Some(threads) = parse_test_threads(command) {
                 return threads.max(1);
             }
@@ -2028,18 +2036,33 @@ fn estimate_cores_for_command(
 
             test_default.max(1)
         }
+        Some(CompilationKind::BunTest) => {
+            if let Some(threads) = parse_test_threads(command) {
+                return threads.max(1);
+            }
+            if let Some(threads) = parse_env_u32(command, "RUST_TEST_THREADS")
+                .or_else(|| read_env_u32("RUST_TEST_THREADS"))
+            {
+                return threads.max(1);
+            }
+
+            if is_filtered_test_command(command) || has_exact_flag(command) {
+                return filtered_test_slots;
+            }
+            if has_ignored_only_flag(command) {
+                return filtered_test_slots;
+            }
+
+            test_default.max(1)
+        }
         Some(
             CompilationKind::CargoCheck
             | CompilationKind::CargoClippy
             | CompilationKind::BunTypecheck,
-        ) => parse_jobs_flag(command)
-            .or_else(|| parse_env_u32(command, "CARGO_BUILD_JOBS"))
-            .or_else(|| read_env_u32("CARGO_BUILD_JOBS"))
+        ) => cargo_job_count_for_command(command)
             .unwrap_or(check_default)
             .max(1),
-        Some(_) => parse_jobs_flag(command)
-            .or_else(|| parse_env_u32(command, "CARGO_BUILD_JOBS"))
-            .or_else(|| read_env_u32("CARGO_BUILD_JOBS"))
+        Some(_) => cargo_job_count_for_command(command)
             .unwrap_or(build_default)
             .max(1),
         None => build_default,
@@ -7355,6 +7378,34 @@ mod tests {
             &config,
         );
         assert_eq!(test_threads, 4);
+
+        let test_jobs = estimate_cores_for_command(
+            Some(CompilationKind::CargoTest),
+            "cargo test -j 1 -p rchd --lib",
+            &config,
+        );
+        assert_eq!(test_jobs, 1);
+
+        let test_long_jobs = estimate_cores_for_command(
+            Some(CompilationKind::CargoTest),
+            "cargo test --jobs=3 -p rchd --lib",
+            &config,
+        );
+        assert_eq!(test_long_jobs, 3);
+
+        let test_jobs_override_threads = estimate_cores_for_command(
+            Some(CompilationKind::CargoTest),
+            "cargo test -j 1 -- --test-threads=8",
+            &config,
+        );
+        assert_eq!(test_jobs_override_threads, 1);
+
+        let test_build_jobs_env = estimate_cores_for_command(
+            Some(CompilationKind::CargoTest),
+            "CARGO_BUILD_JOBS=2 cargo test -p rchd --lib",
+            &config,
+        );
+        assert_eq!(test_build_jobs_env, 2);
 
         let test_env = estimate_cores_for_command(
             Some(CompilationKind::CargoTest),

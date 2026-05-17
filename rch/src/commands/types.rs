@@ -453,6 +453,8 @@ pub struct DiagnoseDaemonStatus {
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct DiagnoseWorkerSelection {
     pub estimated_cores: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cargo_jobs: Option<u32>,
     pub worker: Option<SelectedWorker>,
     pub reason: SelectionReason,
     #[serde(skip_serializing_if = "Option::is_none")]
