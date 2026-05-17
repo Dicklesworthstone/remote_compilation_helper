@@ -3340,18 +3340,7 @@ fn strip_cargo_target_dir_assignments_from_command_tokens(
                 }
             }
             "env" => {
-                index += 1;
-                while let Some(flag) = stripped.get(index) {
-                    if flag == "--" {
-                        index += 1;
-                        break;
-                    }
-                    if flag.starts_with('-') && !flag.contains('=') {
-                        index += 1;
-                    } else {
-                        break;
-                    }
-                }
+                index = skip_env_option_prefix(&stripped, index + 1);
                 return strip_assignment_prefix(&mut stripped, index).then_some(stripped);
             }
             _ => {
@@ -3361,6 +3350,32 @@ fn strip_cargo_target_dir_assignments_from_command_tokens(
     }
 
     None
+}
+
+fn skip_env_option_prefix(tokens: &[String], mut index: usize) -> usize {
+    while let Some(flag) = tokens.get(index).map(String::as_str) {
+        if flag == "--" {
+            return index + 1;
+        }
+
+        match flag {
+            "-u" | "--unset" => {
+                index += 1;
+                if tokens.get(index).is_some() {
+                    index += 1;
+                }
+            }
+            _ if flag.starts_with("--unset=") => {
+                index += 1;
+            }
+            _ if flag.starts_with('-') && !flag.contains('=') => {
+                index += 1;
+            }
+            _ => break,
+        }
+    }
+
+    index
 }
 
 fn strip_cargo_target_dir_flags_from_command_tokens(tokens: &[String]) -> Option<Vec<String>> {
@@ -3447,18 +3462,7 @@ fn extract_cargo_target_dir_from_command_tokens(tokens: &[String]) -> Option<Str
                 }
             }
             "env" => {
-                index += 1;
-                while let Some(flag) = tokens.get(index) {
-                    if flag == "--" {
-                        index += 1;
-                        break;
-                    }
-                    if flag.starts_with('-') && !flag.contains('=') {
-                        index += 1;
-                    } else {
-                        break;
-                    }
-                }
+                index = skip_env_option_prefix(tokens, index + 1);
                 if let Some(value) = scan_assignment_prefix(tokens, index) {
                     return Some(value);
                 }
@@ -9188,6 +9192,8 @@ The file `x11.pc` needs to be installed and the PKG_CONFIG_PATH environment vari
         let reporter = HookReporter::new(OutputVisibility::Verbose);
         let command_tokens = vec![
             "env".to_string(),
+            "-u".to_string(),
+            "RUST_LOG".to_string(),
             "RUST_BACKTRACE=1".to_string(),
             "CARGO_TARGET_DIR=/data/projects/custom-target".to_string(),
             "cargo".to_string(),
@@ -9280,6 +9286,8 @@ The file `x11.pc` needs to be installed and the PKG_CONFIG_PATH environment vari
         let reporter = HookReporter::new(OutputVisibility::Verbose);
         let command_tokens = vec![
             "env".to_string(),
+            "-u".to_string(),
+            "RUST_LOG".to_string(),
             "RUST_BACKTRACE=1".to_string(),
             "CARGO_TARGET_DIR=/data/projects/custom-target".to_string(),
             "cargo".to_string(),
@@ -9288,13 +9296,16 @@ The file `x11.pc` needs to be installed and the PKG_CONFIG_PATH environment vari
         ];
 
         let rewritten = rewrite_cargo_target_dir_command_for_remote(
-            "env RUST_BACKTRACE=1 CARGO_TARGET_DIR=/data/projects/custom-target cargo build --release",
+            "env -u RUST_LOG RUST_BACKTRACE=1 CARGO_TARGET_DIR=/data/projects/custom-target cargo build --release",
             Some(&command_tokens),
             Some(&PathBuf::from("/data/projects/custom-target")),
             &reporter,
         );
 
-        assert_eq!(rewritten, "env 'RUST_BACKTRACE=1' cargo build --release");
+        assert_eq!(
+            rewritten,
+            "env -u RUST_LOG 'RUST_BACKTRACE=1' cargo build --release"
+        );
         assert!(!rewritten.contains("CARGO_TARGET_DIR=/data/projects/custom-target"));
     }
 
