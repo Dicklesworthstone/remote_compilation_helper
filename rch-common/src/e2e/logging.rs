@@ -3,7 +3,8 @@
 //! Provides comprehensive logging infrastructure for end-to-end tests.
 //!
 //! - Real-time console output (human-readable)
-//! - Per-test JSONL log files under `target/test-logs/` (machine-readable)
+//! - Per-test JSONL log files under the active Cargo target directory
+//!   (`$CARGO_TARGET_DIR/test-logs/` when set, otherwise `target/test-logs/`)
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -846,9 +847,10 @@ pub struct TestLoggerBuilder {
 impl TestLoggerBuilder {
     /// Create a new builder for the given test name.
     ///
-    /// By default, logs are written to `target/test-logs/` relative to the
-    /// workspace root (auto-detected via CARGO_MANIFEST_DIR) as JSONL (one
-    /// JSON object per line).
+    /// By default, logs are written under the active Cargo target directory as
+    /// JSONL (one JSON object per line). This honors `CARGO_TARGET_DIR` first
+    /// so tests do not silently write artifacts to a different filesystem than
+    /// the current build.
     pub fn new(test_name: &str) -> Self {
         // Auto-set log directory for standardized JSONL output
         let config = LoggerConfig {
@@ -861,28 +863,50 @@ impl TestLoggerBuilder {
         }
     }
 
-    /// Auto-detect the log directory based on cargo workspace.
-    /// Returns `target/test-logs/` relative to workspace root.
+    /// Auto-detect the log directory based on Cargo's active target directory.
     fn auto_detect_log_dir() -> Option<PathBuf> {
+        if let Some(log_dir) = std::env::var_os("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .and_then(Self::log_dir_from_cargo_target_dir)
+        {
+            return Some(log_dir);
+        }
+
         // Try CARGO_MANIFEST_DIR first (set during cargo test)
         if let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") {
             let manifest_path = PathBuf::from(&manifest_dir);
             // Walk up to find workspace root (has target/ directory)
             let workspace_root = find_workspace_root(&manifest_path)?;
             let log_dir = workspace_root.join("target").join("test-logs");
-            // Create directory if it doesn't exist
-            let _ = fs::create_dir_all(&log_dir);
-            return Some(log_dir);
+            if fs::create_dir_all(&log_dir).is_ok() {
+                return Some(log_dir);
+            }
         }
         // Fallback: try current directory
         if let Ok(cwd) = std::env::current_dir() {
             let log_dir = cwd.join("target").join("test-logs");
-            if log_dir.parent().map(|p| p.exists()).unwrap_or(false) {
-                let _ = fs::create_dir_all(&log_dir);
+            if log_dir.parent().map(|p| p.exists()).unwrap_or(false)
+                && fs::create_dir_all(&log_dir).is_ok()
+            {
                 return Some(log_dir);
             }
         }
         None
+    }
+
+    fn log_dir_from_cargo_target_dir(target_dir: PathBuf) -> Option<PathBuf> {
+        if target_dir.as_os_str().is_empty() {
+            return None;
+        }
+
+        let target_dir = if target_dir.is_absolute() {
+            target_dir
+        } else {
+            std::env::current_dir().ok()?.join(target_dir)
+        };
+        let log_dir = target_dir.join("test-logs");
+        fs::create_dir_all(&log_dir).ok()?;
+        Some(log_dir)
     }
 
     /// Set the minimum log level
@@ -1074,6 +1098,16 @@ mod tests {
             eprintln!("Log directory: {}", dir.display());
             assert!(dir.ends_with("test-logs"), "Should end with test-logs");
         }
+    }
+
+    #[test]
+    fn test_cargo_target_dir_log_dir_detection() {
+        let temp_dir = tempfile::tempdir().expect("temp dir should be creatable");
+        let log_dir = TestLoggerBuilder::log_dir_from_cargo_target_dir(temp_dir.path().into())
+            .expect("target dir should produce log dir");
+
+        assert_eq!(log_dir, temp_dir.path().join("test-logs"));
+        assert!(log_dir.exists());
     }
 
     #[test]
