@@ -2530,13 +2530,25 @@ fn handle_health(ctx: &DaemonContext) -> HealthResponse {
     }
 }
 
+fn worker_accepts_new_builds(status: WorkerStatus, circuit_state: CircuitState) -> bool {
+    matches!(status, WorkerStatus::Healthy | WorkerStatus::Degraded)
+        && circuit_state != CircuitState::Open
+}
+
 /// Handle a readiness check request.
 async fn handle_ready(ctx: &DaemonContext) -> ReadyResponse {
     let workers = ctx.pool.all_workers().await;
 
-    // Check if any workers are available
+    // Check if any assignable workers are available. Raw free slots on drained,
+    // disabled, unreachable, or open-circuit workers cannot accept new builds.
     let mut workers_available = false;
     for w in workers {
+        let Some(circuit_state) = w.circuit_state().await else {
+            continue;
+        };
+        if !worker_accepts_new_builds(w.status().await, circuit_state) {
+            continue;
+        }
         if w.available_slots().await > 0 {
             workers_available = true;
             break;
@@ -2751,6 +2763,13 @@ async fn handle_status(ctx: &DaemonContext) -> Result<DaemonFullStatus> {
         };
         let available_slots = worker.available_slots().await;
         let used_slots = total_slots - available_slots;
+        let circuit_stats = worker.circuit_stats().await;
+        let circuit_state = circuit_stats.state();
+        let assignable_slots = if worker_accepts_new_builds(status, circuit_state) {
+            available_slots
+        } else {
+            0
+        };
 
         // Count healthy workers
         if status == WorkerStatus::Healthy {
@@ -2758,7 +2777,7 @@ async fn handle_status(ctx: &DaemonContext) -> Result<DaemonFullStatus> {
         }
 
         slots_total = slots_total.saturating_add(total_slots);
-        slots_available = slots_available.saturating_add(available_slots);
+        slots_available = slots_available.saturating_add(assignable_slots);
 
         // Build worker status info
         let status_str = match status {
@@ -2770,9 +2789,6 @@ async fn handle_status(ctx: &DaemonContext) -> Result<DaemonFullStatus> {
             WorkerStatus::Disabled => "disabled",
         };
 
-        // Get circuit state and stats from worker
-        let circuit_stats = worker.circuit_stats().await;
-        let circuit_state = circuit_stats.state();
         let circuit_str = match circuit_state {
             CircuitState::Closed => "closed",
             CircuitState::Open => "open",
@@ -4741,6 +4757,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_handle_ready_ignores_non_assignable_workers_with_free_slots() {
+        let pool = WorkerPool::new();
+        pool.add_worker(make_test_worker("drained", 4)).await;
+        pool.add_worker(make_test_worker("disabled", 4)).await;
+        pool.add_worker(make_test_worker("unreachable", 4)).await;
+        pool.set_status(&WorkerId::new("drained"), WorkerStatus::Drained)
+            .await;
+        pool.set_status(&WorkerId::new("disabled"), WorkerStatus::Disabled)
+            .await;
+        pool.set_status(&WorkerId::new("unreachable"), WorkerStatus::Unreachable)
+            .await;
+        let ctx = make_test_context(pool);
+
+        let response = handle_ready(&ctx).await;
+        assert_eq!(response.status, "not_ready");
+        assert!(!response.workers_available);
+        assert_eq!(response.reason.as_deref(), Some("no_workers_available"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_ready_ignores_open_circuit_workers_with_free_slots() {
+        let pool = WorkerPool::new();
+        pool.add_worker(make_test_worker("worker1", 4)).await;
+        let worker = pool
+            .get(&WorkerId::new("worker1"))
+            .await
+            .expect("worker should exist");
+        worker.open_circuit().await;
+        let ctx = make_test_context(pool);
+
+        let response = handle_ready(&ctx).await;
+        assert_eq!(response.status, "not_ready");
+        assert!(!response.workers_available);
+        assert_eq!(response.reason.as_deref(), Some("no_workers_available"));
+    }
+
+    #[tokio::test]
     async fn test_handle_cancel_build_not_found() {
         let pool = WorkerPool::new();
         let ctx = make_test_context(pool);
@@ -5548,6 +5601,50 @@ mod tests {
         assert_eq!(status.daemon.slots_total, 12); // 8 + 4
         assert_eq!(status.daemon.version, "0.1.0");
         assert_eq!(status.daemon.pid, 1234);
+    }
+
+    #[tokio::test]
+    async fn test_handle_status_slots_available_counts_only_assignable_capacity() {
+        let _guard = test_guard!();
+        let pool = WorkerPool::new();
+        pool.add_worker(make_test_worker("healthy", 8)).await;
+        pool.add_worker(make_test_worker("degraded", 4)).await;
+        pool.add_worker(make_test_worker("drained", 6)).await;
+        pool.add_worker(make_test_worker("disabled", 10)).await;
+        pool.add_worker(make_test_worker("open-circuit", 5)).await;
+
+        let healthy = pool
+            .get(&WorkerId::new("healthy"))
+            .await
+            .expect("healthy worker should exist");
+        assert!(healthy.reserve_slots(2).await);
+
+        let degraded = pool
+            .get(&WorkerId::new("degraded"))
+            .await
+            .expect("degraded worker should exist");
+        degraded.set_status(WorkerStatus::Degraded).await;
+        assert!(degraded.reserve_slots(1).await);
+
+        pool.set_status(&WorkerId::new("drained"), WorkerStatus::Drained)
+            .await;
+        pool.set_status(&WorkerId::new("disabled"), WorkerStatus::Disabled)
+            .await;
+
+        let open_circuit = pool
+            .get(&WorkerId::new("open-circuit"))
+            .await
+            .expect("open-circuit worker should exist");
+        open_circuit.open_circuit().await;
+
+        let ctx = make_test_context(pool);
+        let status = handle_status(&ctx).await.expect("status should succeed");
+
+        assert_eq!(status.daemon.slots_total, 33);
+        assert_eq!(
+            status.daemon.slots_available, 9,
+            "only healthy/degraded, non-open-circuit capacity should be assignable"
+        );
     }
 
     #[tokio::test]
