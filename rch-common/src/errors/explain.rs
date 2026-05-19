@@ -26,7 +26,7 @@
 //!   "name": "WorkerDiskPressureTelemetryGap",
 //!   "category": "disk_pressure",
 //!   "description": "Worker is missing fresh disk telemetry.",
-//!   "remediation": ["Run `rch workers probe <worker>` to refresh telemetry."],
+//!   "remediation": ["Telemetry refresh is automatic; wait for the next poll, or run `rch daemon restart` to force a fresh poll cycle."],
 //!   "requires_restart": false
 //! }
 //! ```

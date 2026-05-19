@@ -2852,8 +2852,15 @@ async fn handle_status(ctx: &DaemonContext) -> Result<DaemonFullStatus> {
                     "Worker '{}' has stale/missing pressure telemetry ({})",
                     worker_id, pressure.reason_code
                 ),
+                // Telemetry ingest is daemon-driven: only the periodic
+                // TelemetryPoller (or worker piggyback) calls
+                // TelemetryStore::ingest(). No client-side `rch workers ...`
+                // subcommand can move a worker out of TelemetryGap; emitting
+                // one as a Fix would train agents to run confident-wrong
+                // commands (issue #16).
                 remediation: Some(
-                    "rch workers capabilities --refresh (re-probe worker metrics)".to_string(),
+                    "telemetry ingest is daemon-driven; wait for next poll (~poll-interval) or run `rch daemon restart` to force a fresh poll cycle"
+                        .to_string(),
                 ),
             });
         } else if status == WorkerStatus::Unreachable {

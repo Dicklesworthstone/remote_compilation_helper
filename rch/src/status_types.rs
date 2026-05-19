@@ -457,7 +457,14 @@ pub fn generate_worker_remediations(workers: &[WorkerStatusFromApi]) -> Vec<Reme
                         reason_code: "pressure_telemetry_gap".into(),
                         severity: "warning".into(),
                         message: format!("Worker {} storage telemetry stale or missing", w.id),
-                        suggested_action: format!("rch workers probe {}", w.id),
+                        // Telemetry ingest is daemon-driven (TelemetryPoller /
+                        // piggyback POST /telemetry/ingest). `rch workers probe`
+                        // is an SSH connectivity check and does not call
+                        // TelemetryStore::ingest(). Pointing agents at it
+                        // produced confident-wrong runs (issue #16).
+                        suggested_action:
+                            "wait for next telemetry poll, or run `rch daemon restart` to force a fresh poll cycle"
+                                .to_string(),
                         worker_id: Some(w.id.clone()),
                     });
                 }

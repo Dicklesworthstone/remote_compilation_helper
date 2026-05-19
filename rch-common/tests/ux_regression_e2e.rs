@@ -371,7 +371,11 @@ fn generate_worker_hints(workers: &[SimWorker]) -> Vec<UxRemediationHint> {
                         reason_code: "pressure_telemetry_gap".into(),
                         severity: HintSeverity::Warning,
                         message: format!("Worker {} storage telemetry stale or missing", w.id),
-                        suggested_action: format!("rch workers probe {}", w.id),
+                        // Mirrors the production hint in rch/src/status_types.rs:
+                        // telemetry refresh is daemon-driven, not client-driven.
+                        suggested_action:
+                            "wait for next telemetry poll, or run `rch daemon restart` to force a fresh poll cycle"
+                                .to_string(),
                         worker_id: Some(w.id.clone()),
                         involves_destructive_action: false,
                         risk_note: None,

@@ -468,7 +468,10 @@ impl ReliabilityReasonCode {
             }
             Self::WorkerDiskPressureHealthy => "No action needed.",
             Self::WorkerDiskPressureTelemetryGap => {
-                "Run `rch workers probe <worker>` to refresh telemetry."
+                // Telemetry ingest is daemon-driven; no `rch workers ...`
+                // subcommand calls TelemetryStore::ingest(). Pointing agents
+                // at `workers probe` was confident-wrong (issue #16).
+                "Telemetry refresh is automatic; wait for the next poll, or run `rch daemon restart` to force a fresh poll cycle."
             }
             Self::DiskPressureNoWorkers => "No action needed.",
             Self::ProcessDebtUnavailable => "Start the daemon with `rch daemon start` and retry.",
