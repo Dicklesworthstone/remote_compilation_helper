@@ -117,6 +117,18 @@ pub(super) fn build_dry_run_summary(
     let worker_selected = worker_selection
         .as_ref()
         .is_some_and(|s| s.worker.is_some());
+    let worker_selection_skip_reason = if worker_selected {
+        None
+    } else if !daemon_reachable {
+        Some("Daemon not reachable".to_string())
+    } else {
+        Some(
+            worker_selection
+                .as_ref()
+                .map(|s| s.reason.to_string())
+                .unwrap_or_else(|| "No worker selection response available".to_string()),
+        )
+    };
     steps.push(DryRunPipelineStep {
         step: 3,
         name: "Worker selection".to_string(),
@@ -133,18 +145,15 @@ pub(super) fn build_dry_run_summary(
             "Select best available worker".to_string()
         },
         skipped: !worker_selected,
-        skip_reason: if !worker_selected {
-            Some(
-                worker_selection
-                    .as_ref()
-                    .map(|s| s.reason.to_string())
-                    .unwrap_or_else(|| "No worker available".to_string()),
-            )
-        } else {
-            None
-        },
+        skip_reason: worker_selection_skip_reason.clone(),
         estimated_duration_ms: Some(2),
     });
+
+    let blocked_by_worker_selection = || {
+        worker_selection_skip_reason
+            .clone()
+            .unwrap_or_else(|| "worker selection did not choose a worker".to_string())
+    };
 
     // Step 4: Transfer
     steps.push(DryRunPipelineStep {
@@ -152,7 +161,11 @@ pub(super) fn build_dry_run_summary(
         name: "Transfer".to_string(),
         description: "Sync project files to worker via rsync+zstd".to_string(),
         skipped: !worker_selected,
-        skip_reason: None,
+        skip_reason: if !worker_selected {
+            Some(blocked_by_worker_selection())
+        } else {
+            None
+        },
         estimated_duration_ms: None, // Depends on project size
     });
 
@@ -162,7 +175,11 @@ pub(super) fn build_dry_run_summary(
         name: "Remote execution".to_string(),
         description: "Execute compilation command on worker".to_string(),
         skipped: !worker_selected,
-        skip_reason: None,
+        skip_reason: if !worker_selected {
+            Some(blocked_by_worker_selection())
+        } else {
+            None
+        },
         estimated_duration_ms: None, // Depends on build
     });
 
@@ -171,14 +188,36 @@ pub(super) fn build_dry_run_summary(
         step: 6,
         name: "Artifact retrieval".to_string(),
         description: "Retrieve build artifacts from remote worker".to_string(),
-        skipped: false,
-        skip_reason: None,
+        skipped: !worker_selected,
+        skip_reason: if !worker_selected {
+            Some(blocked_by_worker_selection())
+        } else {
+            None
+        },
         estimated_duration_ms: None, // Would need rsync dry-run
     });
 
+    let summary_reason = if worker_selected {
+        let worker_id = worker_selection
+            .as_ref()
+            .and_then(|s| s.worker.as_ref())
+            .map(|w| w.id.as_str())
+            .unwrap_or("unknown");
+        format!("compilation command meets threshold, worker {worker_id} available")
+    } else if !daemon_reachable {
+        "compilation command meets threshold, but daemon is not reachable".to_string()
+    } else {
+        format!(
+            "compilation command meets threshold, but worker selection is blocked: {}",
+            worker_selection_skip_reason
+                .as_deref()
+                .unwrap_or("no worker selected")
+        )
+    };
+
     DryRunSummary {
-        would_offload: true,
-        reason: "compilation command meets threshold, worker available".to_string(),
+        would_offload: worker_selected,
+        reason: summary_reason,
         pipeline_steps: steps,
         transfer_estimate: None,  // Would need actual rsync dry-run
         total_estimated_ms: None, // Total unknown without transfer estimates
@@ -1145,7 +1184,8 @@ fn render_self_test_result_verbose_lines(
 pub async fn status_overview(workers: bool, jobs: bool, ctx: &OutputContext) -> Result<()> {
     use crate::status_types::{
         CliStatusResponse, RemediationHint, RepoConvergenceStatusFromApi, STATUS_SCHEMA_VERSION,
-        SystemPosture, generate_convergence_remediations, generate_worker_remediations,
+        SystemPosture, critical_pressure_worker_count, generate_convergence_remediations,
+        generate_worker_remediations, remote_admissible_worker_count,
     };
 
     // Query daemon for full status.
@@ -1183,6 +1223,21 @@ pub async fn status_overview(workers: bool, jobs: bool, ctx: &OutputContext) -> 
                         .into(),
                     worker_id: None,
                 });
+            } else if critical_pressure_worker_count(&status.workers) > 0
+                && remote_admissible_worker_count(&status.workers) == 0
+            {
+                remediation_hints.push(RemediationHint {
+                    reason_code: "all_workers_pressure_critical".into(),
+                    severity: "critical".into(),
+                    message: format!(
+                        "No admissible remote workers; {} worker(s) are blocked by critical storage pressure",
+                        critical_pressure_worker_count(&status.workers)
+                    ),
+                    suggested_action:
+                        "Use the pressure_critical worker hints for read-only df/du attribution; free space only with explicit operator approval, then run rch workers capabilities --refresh"
+                            .into(),
+                    worker_id: None,
+                });
             } else {
                 remediation_hints.push(RemediationHint {
                     reason_code: "all_workers_down".into(),
@@ -1194,14 +1249,29 @@ pub async fn status_overview(workers: bool, jobs: bool, ctx: &OutputContext) -> 
             }
         }
         SystemPosture::Degraded => {
+            let pressure_blocked = critical_pressure_worker_count(&status.workers);
             remediation_hints.push(RemediationHint {
                 reason_code: "partial_capacity".into(),
                 severity: "warning".into(),
-                message: format!(
-                    "Operating at reduced capacity: {}/{} workers healthy",
-                    status.daemon.workers_healthy, status.daemon.workers_total
-                ),
-                suggested_action: "rch workers probe --all".into(),
+                message: if pressure_blocked > 0 {
+                    format!(
+                        "Operating at reduced capacity: {}/{} workers healthy, {} pressure-blocked",
+                        status.daemon.workers_healthy,
+                        status.daemon.workers_total,
+                        pressure_blocked
+                    )
+                } else {
+                    format!(
+                        "Operating at reduced capacity: {}/{} workers healthy",
+                        status.daemon.workers_healthy, status.daemon.workers_total
+                    )
+                },
+                suggested_action: if pressure_blocked > 0 {
+                    "Use rch status --workers --json pressure hints before retrying heavy builds"
+                        .into()
+                } else {
+                    "rch workers probe --all".into()
+                },
                 worker_id: None,
             });
         }
@@ -1377,10 +1447,25 @@ pub async fn check(ctx: &OutputContext) -> Result<()> {
                                 unhealthy: unhealthy.clone(),
                             };
 
+                            let pressure_blocked =
+                                crate::status_types::critical_pressure_worker_count(
+                                    &status.workers,
+                                );
+                            let admissible_workers =
+                                crate::status_types::remote_admissible_worker_count(
+                                    &status.workers,
+                                );
                             let mut issues_list: Vec<String> = unhealthy
                                 .iter()
                                 .map(|w| format!("Worker {} is unreachable", w))
                                 .collect();
+
+                            if pressure_blocked > 0 {
+                                issues_list.push(format!(
+                                    "{} worker(s) blocked by critical storage pressure",
+                                    pressure_blocked
+                                ));
+                            }
 
                             // Add daemon-reported issues
                             for issue in &status.issues {
@@ -1395,14 +1480,40 @@ pub async fn check(ctx: &OutputContext) -> Result<()> {
                                     workers_info,
                                     vec!["No workers configured".to_string()],
                                 )
-                            } else if healthy_count == total_count {
-                                (
-                                    "ready".to_string(),
+                            } else if !status.workers.is_empty()
+                                && pressure_blocked > 0
+                                && admissible_workers == 0
+                            {
+                                issues_list.insert(
                                     0,
+                                    "All workers are blocked by critical storage pressure"
+                                        .to_string(),
+                                );
+                                (
+                                    "not_ready".to_string(),
+                                    2,
                                     daemon_info,
                                     workers_info,
                                     issues_list,
                                 )
+                            } else if healthy_count == total_count {
+                                if pressure_blocked > 0 {
+                                    (
+                                        "degraded".to_string(),
+                                        1,
+                                        daemon_info,
+                                        workers_info,
+                                        issues_list,
+                                    )
+                                } else {
+                                    (
+                                        "ready".to_string(),
+                                        0,
+                                        daemon_info,
+                                        workers_info,
+                                        issues_list,
+                                    )
+                                }
                             } else if healthy_count > 0 {
                                 (
                                     "degraded".to_string(),
@@ -1647,6 +1758,7 @@ mod tests {
     use super::*;
     use crate::ui::context::OutputConfig;
     use crate::ui::writer::SharedOutputBuffer;
+    use rch_common::{SelectedWorker, SelectionReason, WorkerId};
 
     fn make_context(config: OutputConfig) -> OutputContext {
         let stdout = SharedOutputBuffer::new().as_writer(true);
@@ -1693,6 +1805,92 @@ mod tests {
             }
         }))
         .unwrap()
+    }
+
+    fn make_worker_selection(
+        worker: Option<SelectedWorker>,
+        reason: SelectionReason,
+    ) -> Option<DiagnoseWorkerSelection> {
+        Some(DiagnoseWorkerSelection {
+            estimated_cores: 4,
+            worker,
+            reason,
+        })
+    }
+
+    #[test]
+    fn test_dry_run_summary_blocks_offload_when_selection_has_no_worker() {
+        let selection = make_worker_selection(
+            None,
+            SelectionReason::NoAdmissibleWorkers("critical_pressure=5".to_string()),
+        );
+
+        let summary = build_dry_run_summary(true, "compilation command", &selection, true);
+
+        assert!(!summary.would_offload);
+        assert!(summary.reason.contains("worker selection is blocked"));
+        assert!(summary.reason.contains("critical_pressure=5"));
+        assert!(
+            summary
+                .pipeline_steps
+                .iter()
+                .filter(|step| step.step >= 3)
+                .all(|step| step.skipped)
+        );
+        assert!(
+            summary
+                .pipeline_steps
+                .iter()
+                .find(|step| step.step == 6)
+                .unwrap()
+                .skip_reason
+                .as_deref()
+                .unwrap_or("")
+                .contains("critical_pressure=5")
+        );
+    }
+
+    #[test]
+    fn test_dry_run_summary_reports_selected_worker_as_offloadable() {
+        let worker = SelectedWorker {
+            id: WorkerId::new("builder-1"),
+            host: "builder.local".to_string(),
+            user: "ubuntu".to_string(),
+            identity_file: "~/.ssh/id_ed25519".to_string(),
+            slots_available: 8,
+            speed_score: 80.0,
+        };
+        let selection = make_worker_selection(Some(worker), SelectionReason::Success);
+
+        let summary = build_dry_run_summary(true, "compilation command", &selection, true);
+
+        assert!(summary.would_offload);
+        assert!(summary.reason.contains("builder-1"));
+        assert!(
+            summary
+                .pipeline_steps
+                .iter()
+                .filter(|step| step.step >= 3)
+                .all(|step| !step.skipped)
+        );
+    }
+
+    #[test]
+    fn test_dry_run_summary_blocks_offload_when_daemon_unreachable() {
+        let summary = build_dry_run_summary(true, "compilation command", &None, false);
+
+        assert!(!summary.would_offload);
+        assert!(summary.reason.contains("daemon is not reachable"));
+        assert_eq!(
+            summary
+                .pipeline_steps
+                .iter()
+                .find(|step| step.step == 3)
+                .unwrap()
+                .skip_reason
+                .as_deref(),
+            Some("Daemon not reachable")
+        );
     }
 
     #[test]
