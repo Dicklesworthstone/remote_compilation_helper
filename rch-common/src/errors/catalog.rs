@@ -193,6 +193,8 @@ pub enum ErrorCode {
     BuildIncrementalError,
     /// Build artifact not found
     BuildArtifactMissing,
+    /// Cargo workspace inheritance failed under remote topology
+    BuildCargoWorkspaceInheritance,
 
     // -- Process Triage (E310-E319) --
     /// Process triage adapter binary unavailable or not installed
@@ -353,6 +355,7 @@ impl ErrorCode {
             Self::BuildEnvError => 307,
             Self::BuildIncrementalError => 308,
             Self::BuildArtifactMissing => 309,
+            Self::BuildCargoWorkspaceInheritance => 329,
 
             // Process Triage (310-319)
             Self::ProcessTriageAdapterUnavailable => 310,
@@ -519,6 +522,9 @@ impl ErrorCode {
             Self::BuildEnvError => "Build environment setup failed",
             Self::BuildIncrementalError => "Incremental build state is corrupted",
             Self::BuildArtifactMissing => "Build artifact not found",
+            Self::BuildCargoWorkspaceInheritance => {
+                "Cargo workspace inheritance failed under remote topology"
+            }
 
             // Process Triage
             Self::ProcessTriageAdapterUnavailable => {
@@ -895,6 +901,11 @@ impl ErrorCode {
                 "Check artifact path configuration",
                 "Review build output for artifact location",
             ],
+            Self::BuildCargoWorkspaceInheritance => &[
+                "Verify dependency workspace metadata roots are synced",
+                "Isolate remote sync roots from unrelated outer Cargo workspaces",
+                "Check path dependency manifests for workspace-inherited fields",
+            ],
 
             // Process Triage
             Self::ProcessTriageAdapterUnavailable => &[
@@ -1202,6 +1213,7 @@ impl ErrorCode {
             Self::BuildEnvError,
             Self::BuildIncrementalError,
             Self::BuildArtifactMissing,
+            Self::BuildCargoWorkspaceInheritance,
             // Process Triage
             Self::ProcessTriageAdapterUnavailable,
             Self::ProcessTriageDetectorUncertain,
@@ -1583,6 +1595,12 @@ mod tests {
         assert_eq!(ErrorCode::CancelTimeoutExceeded.code_number(), 325);
     }
 
+    /// Contract test: topology-sensitive build error codes are stable.
+    #[test]
+    fn test_build_topology_error_codes_stable() {
+        assert_eq!(ErrorCode::BuildCargoWorkspaceInheritance.code_number(), 329);
+    }
+
     /// Contract test: new error codes belong to correct categories.
     #[test]
     fn test_new_error_codes_correct_categories() {
@@ -1622,6 +1640,10 @@ mod tests {
             ErrorCode::CancelTimeoutExceeded.category(),
             ErrorCategory::Build
         );
+        assert_eq!(
+            ErrorCode::BuildCargoWorkspaceInheritance.category(),
+            ErrorCategory::Build
+        );
     }
 
     /// Contract test: all new error codes have doc URLs pointing to correct sections.
@@ -1657,6 +1679,7 @@ mod tests {
             ErrorCode::ClosurePlanFailed,
             ErrorCode::WorkerDiskPressureCritical,
             ErrorCode::ProcessTriageAdapterUnavailable,
+            ErrorCode::BuildCargoWorkspaceInheritance,
         ];
 
         for code in new_codes {
@@ -1678,10 +1701,10 @@ mod tests {
     fn test_total_error_code_count() {
         let total = ErrorCode::all().len();
         // 10 config + 12 path-dep/closure + 10 network + 10 worker + 8 storage
-        // + 10 build + 8 process-triage + 6 cancellation + 10 transfer + 10 internal = 94
+        // + 11 build + 8 process-triage + 6 cancellation + 10 transfer + 10 internal = 95
         assert!(
-            total >= 94,
-            "Expected at least 94 error codes (was {}); did a code get accidentally removed?",
+            total >= 95,
+            "Expected at least 95 error codes (was {}); did a code get accidentally removed?",
             total,
         );
     }

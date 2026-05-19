@@ -20,7 +20,8 @@ use rch_common::{
 };
 use std::fs;
 use std::os::unix::fs::symlink;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 // ---------------------------------------------------------------------------
@@ -564,6 +565,149 @@ fn e2e_failure_plans_have_elevated_risk_issues() {
             max_risk
         );
     }
+}
+
+#[test]
+fn e2e_workspace_inheritance_leak_fixture_matches_frankensearch_failure() {
+    let fixture = TopologyFixture::new("workspace_inheritance_leak");
+    let outer_workspace = &fixture.canonical_root;
+    let app_root = outer_workspace.join("eidetic_engine_cli");
+    let dep_workspace = outer_workspace.join("frankensearch");
+    let dep_member = dep_workspace.join("frankensearch");
+
+    fs::create_dir_all(app_root.join("src")).expect("create app src");
+    fs::create_dir_all(dep_member.join("src")).expect("create dep member src");
+    fs::write(app_root.join("src/lib.rs"), "pub fn app() {}\n").expect("write app lib");
+    fs::write(dep_member.join("src/lib.rs"), "pub fn search() {}\n").expect("write dep lib");
+    fs::write(
+        app_root.join("Cargo.toml"),
+        r#"[package]
+name = "eidetic_fixture"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+frankensearch = { path = "../frankensearch/frankensearch" }
+"#,
+    )
+    .expect("write app manifest");
+    fs::write(
+        dep_member.join("Cargo.toml"),
+        r#"[package]
+name = "frankensearch"
+version = "0.1.0"
+edition.workspace = true
+repository.workspace = true
+license-file.workspace = true
+"#,
+    )
+    .expect("write dep member manifest");
+
+    fs::write(
+        outer_workspace.join("Cargo.toml"),
+        r#"[workspace]
+members = ["eidetic_engine_cli", "frankensearch/frankensearch"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+repository = "https://example.invalid/outer-workspace"
+"#,
+    )
+    .expect("write leaking outer workspace manifest");
+
+    let leaking = cargo_metadata_probe(&fixture, &app_root);
+    assert!(
+        !leaking.status.success(),
+        "leaking outer workspace layout should fail cargo metadata"
+    );
+    let leaking_stderr = String::from_utf8_lossy(&leaking.stderr);
+    assert!(
+        leaking_stderr.contains("workspace.package.license-file")
+            && leaking_stderr.contains("was not defined"),
+        "failure should capture workspace.package.license-file inheritance leak, stderr={leaking_stderr}"
+    );
+
+    let isolated_parent = fixture.root.join("isolated-remote-projects");
+    let isolated_app_root = isolated_parent.join("eidetic_engine_cli");
+    let isolated_dep_workspace = isolated_parent.join("frankensearch");
+    let isolated_dep_member = isolated_dep_workspace.join("frankensearch");
+    fs::create_dir_all(isolated_app_root.join("src")).expect("create isolated app src");
+    fs::create_dir_all(isolated_dep_member.join("src")).expect("create isolated dep src");
+    fs::write(isolated_app_root.join("src/lib.rs"), "pub fn app() {}\n")
+        .expect("write isolated app lib");
+    fs::write(
+        isolated_dep_member.join("src/lib.rs"),
+        "pub fn search() {}\n",
+    )
+    .expect("write isolated dep lib");
+    fs::write(
+        isolated_app_root.join("Cargo.toml"),
+        r#"[package]
+name = "eidetic_fixture"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+frankensearch = { path = "../frankensearch/frankensearch" }
+"#,
+    )
+    .expect("write isolated app manifest");
+    fs::write(
+        isolated_dep_workspace.join("Cargo.toml"),
+        r#"[workspace]
+members = ["frankensearch"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+repository = "https://example.invalid/frankensearch"
+license-file = "LICENSE"
+"#,
+    )
+    .expect("write isolated dep workspace manifest");
+    fs::write(
+        isolated_dep_member.join("Cargo.toml"),
+        r#"[package]
+name = "frankensearch"
+version = "0.1.0"
+edition.workspace = true
+repository.workspace = true
+license-file.workspace = true
+"#,
+    )
+    .expect("write isolated dep member manifest");
+    fs::write(
+        isolated_dep_workspace.join("LICENSE"),
+        "synthetic test license\n",
+    )
+    .expect("write isolated license");
+
+    let isolated = cargo_metadata_probe(&fixture, &isolated_app_root);
+    assert!(
+        isolated.status.success(),
+        "isolating synced roots away from the outer workspace should satisfy license-file.workspace inheritance, stderr={}",
+        String::from_utf8_lossy(&isolated.stderr)
+    );
+}
+
+fn cargo_metadata_probe(fixture: &TopologyFixture, manifest_root: &Path) -> std::process::Output {
+    let cargo_tmp = fixture.root.join("cargo-metadata-tmp");
+    let cargo_target = fixture.root.join("cargo-metadata-target");
+    fs::create_dir_all(&cargo_tmp).expect("create cargo metadata tmp");
+    fs::create_dir_all(&cargo_target).expect("create cargo metadata target");
+
+    Command::new("cargo")
+        .arg("metadata")
+        .arg("--format-version")
+        .arg("1")
+        .arg("--no-deps")
+        .arg("--manifest-path")
+        .arg(manifest_root.join("Cargo.toml"))
+        .env("TMPDIR", &cargo_tmp)
+        .env("CARGO_TARGET_DIR", &cargo_target)
+        .output()
+        .expect("run cargo metadata probe")
 }
 
 // ===========================================================================

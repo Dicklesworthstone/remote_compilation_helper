@@ -396,11 +396,12 @@ pub async fn run_exec(command_parts: Vec<String>) -> anyhow::Result<()> {
     // Classify the command
     let classification = classify_command(&command);
     if !classification.is_compilation {
-        // Not a compilation command - just run locally
-        // This shouldn't normally happen since the hook only rewrites compilations
+        // This should not normally happen because the hook only rewrites
+        // compilations. Preserve the ordinary local behavior, but honor
+        // RCH_REQUIRE_REMOTE for explicit `rch exec` invocations.
         warn!("exec called with non-compilation command: {}", command);
-        let status = local_fallback_command(&command).status()?;
-        std::process::exit(status.code().unwrap_or(1));
+        let reporter = HookReporter::new(OutputVisibility::Summary);
+        exit_with_local_fallback(&command, &reporter, "non-compilation command");
     }
 
     let config = match load_config() {
@@ -586,6 +587,28 @@ pub async fn run_exec(command_parts: Vec<String>) -> anyhow::Result<()> {
                 warn!("Remote toolchain failure, falling back to local");
                 reporter.summary(&format!("[RCH] local (toolchain missing on {})", worker.id));
                 exit_with_local_fallback(&command, &reporter, "remote toolchain missing");
+            } else if let Some(workspace_failure) =
+                detect_cargo_workspace_inheritance_failure(&result.stderr, result.exit_code)
+            {
+                let error = ErrorCode::BuildCargoWorkspaceInheritance;
+                warn!(
+                    "Remote Cargo workspace-inheritance failure on {} [{}]: {}",
+                    worker.id,
+                    error.code_string(),
+                    workspace_failure.log_detail()
+                );
+                reporter.summary(&format!(
+                    "[RCH] remote {} failed [{}] {}",
+                    worker.id,
+                    error.code_string(),
+                    workspace_failure.summary()
+                ));
+                reporter.verbose(&format!(
+                    "[RCH] remediation [{}]: {}",
+                    error.code_string(),
+                    workspace_failure.remediation()
+                ));
+                std::process::exit(result.exit_code);
             } else if let Some(env_failure) =
                 detect_worker_system_dependency_failure(&result.stderr, result.exit_code)
             {
@@ -2099,8 +2122,30 @@ async fn handle_selection_response(
                 // - 128+N: Process killed by signal N
                 let exit_code = result.exit_code;
 
-                // Check for signal-killed processes (OOM, etc.)
-                if let Some(signal) = is_signal_killed(exit_code) {
+                // Check for topology-specific Cargo workspace inheritance before
+                // falling back to generic build/test failure text.
+                if let Some(workspace_failure) =
+                    detect_cargo_workspace_inheritance_failure(&result.stderr, exit_code)
+                {
+                    let error = ErrorCode::BuildCargoWorkspaceInheritance;
+                    warn!(
+                        "Remote Cargo workspace-inheritance failure on {} [{}]: {}",
+                        worker.id,
+                        error.code_string(),
+                        workspace_failure.log_detail()
+                    );
+                    reporter.summary(&format!(
+                        "[RCH] remote {} failed [{}] {}",
+                        worker.id,
+                        error.code_string(),
+                        workspace_failure.summary()
+                    ));
+                    reporter.verbose(&format!(
+                        "[RCH] remediation [{}]: {}",
+                        error.code_string(),
+                        workspace_failure.remediation()
+                    ));
+                } else if let Some(signal) = is_signal_killed(exit_code) {
                     warn!(
                         "Remote command killed by signal {} ({}) on {}, replacing with exit code for transparency",
                         signal,
@@ -2282,6 +2327,17 @@ pub(crate) async fn query_daemon(
 
     for worker in preferred_workers {
         query.push_str(&format!("&worker={}", urlencoding_encode(worker.as_str())));
+    }
+    if !preferred_workers.is_empty() {
+        let legacy_preferred_workers = preferred_workers
+            .iter()
+            .map(|worker| worker.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        query.push_str(&format!(
+            "&preferred_workers={}",
+            urlencoding_encode(&legacy_preferred_workers)
+        ));
     }
 
     // When all workers are at capacity, queue the build on the daemon instead of
@@ -4133,6 +4189,57 @@ enum SyncClosureMode {
     WorkspaceMetadata,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RemoteWorkspaceIsolation {
+    WorkerCanonical,
+    OuterWorkspaceSafe,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RemoteSyncLayout {
+    workspace_isolation: RemoteWorkspaceIsolation,
+    canonical_remote_root: String,
+}
+
+impl RemoteSyncLayout {
+    fn worker_canonical() -> Self {
+        Self {
+            workspace_isolation: RemoteWorkspaceIsolation::WorkerCanonical,
+            canonical_remote_root: DEFAULT_CANONICAL_PROJECT_ROOT.to_string(),
+        }
+    }
+
+    fn outer_workspace_safe(project_hash: &str) -> Self {
+        let layout_id = safe_remote_layout_id(project_hash);
+        Self {
+            workspace_isolation: RemoteWorkspaceIsolation::OuterWorkspaceSafe,
+            canonical_remote_root: format!("/tmp/rch-sync/{layout_id}/projects"),
+        }
+    }
+
+    fn should_rewrite_topology_paths(&self) -> bool {
+        self.workspace_isolation == RemoteWorkspaceIsolation::OuterWorkspaceSafe
+    }
+
+    fn canonical_remote_root(&self) -> &str {
+        &self.canonical_remote_root
+    }
+}
+
+fn safe_remote_layout_id(project_hash: &str) -> String {
+    let id = project_hash
+        .chars()
+        .filter(|ch| ch.is_ascii_hexdigit())
+        .take(16)
+        .collect::<String>();
+    if id.is_empty() {
+        "unknown".to_string()
+    } else {
+        id
+    }
+}
+
 /// Outcome of syncing a single closure root during multi-root transfer.
 ///
 /// Used to collect per-root results and enable partial failure diagnostics
@@ -4152,6 +4259,8 @@ struct SyncClosureManifest {
     schema_version: &'static str,
     generated_at_unix_ms: i64,
     project_root: String,
+    workspace_isolation: RemoteWorkspaceIsolation,
+    canonical_remote_root: String,
     entries: Vec<SyncClosureManifestEntry>,
 }
 
@@ -4452,8 +4561,12 @@ fn is_within_sync_topology(path: &Path, policy: &PathTopologyPolicy) -> bool {
         .any(|root| path.starts_with(&root))
 }
 
-fn map_sync_root_to_remote_root(path: &Path, policy: &PathTopologyPolicy) -> String {
-    let remote_root = Path::new(DEFAULT_CANONICAL_PROJECT_ROOT);
+fn map_sync_root_to_remote_root_with_layout(
+    path: &Path,
+    policy: &PathTopologyPolicy,
+    remote_layout: &RemoteSyncLayout,
+) -> String {
+    let remote_root = Path::new(remote_layout.canonical_remote_root());
 
     for root in effective_sync_topology_roots(policy) {
         if let Ok(relative) = path.strip_prefix(&root) {
@@ -4464,11 +4577,28 @@ fn map_sync_root_to_remote_root(path: &Path, policy: &PathTopologyPolicy) -> Str
     path.to_string_lossy().to_string()
 }
 
+#[cfg(test)]
 fn build_sync_closure_plan(
     sync_roots: &[PathBuf],
     normalized_project_root: &Path,
     project_hash: &str,
     topology_policy: &PathTopologyPolicy,
+) -> Vec<SyncClosurePlanEntry> {
+    build_sync_closure_plan_with_layout(
+        sync_roots,
+        normalized_project_root,
+        project_hash,
+        topology_policy,
+        &RemoteSyncLayout::worker_canonical(),
+    )
+}
+
+fn build_sync_closure_plan_with_layout(
+    sync_roots: &[PathBuf],
+    normalized_project_root: &Path,
+    project_hash: &str,
+    topology_policy: &PathTopologyPolicy,
+    remote_layout: &RemoteSyncLayout,
 ) -> Vec<SyncClosurePlanEntry> {
     let mut ordered_entries = std::collections::BTreeSet::<(PathBuf, SyncClosureMode)>::new();
     for root in sync_roots {
@@ -4512,7 +4642,11 @@ fn build_sync_closure_plan(
                 compute_project_hash_with_dependency_roots_and_policy(&root, &[], topology_policy)
             };
             SyncClosurePlanEntry {
-                remote_root: map_sync_root_to_remote_root(&root, topology_policy),
+                remote_root: map_sync_root_to_remote_root_with_layout(
+                    &root,
+                    topology_policy,
+                    remote_layout,
+                ),
                 project_id: project_id_from_path(&root),
                 root_hash,
                 is_primary,
@@ -4523,9 +4657,22 @@ fn build_sync_closure_plan(
         .collect()
 }
 
+#[cfg(test)]
 fn build_sync_closure_manifest(
     plan: &[SyncClosurePlanEntry],
     normalized_project_root: &Path,
+) -> SyncClosureManifest {
+    build_sync_closure_manifest_with_layout(
+        plan,
+        normalized_project_root,
+        &RemoteSyncLayout::worker_canonical(),
+    )
+}
+
+fn build_sync_closure_manifest_with_layout(
+    plan: &[SyncClosurePlanEntry],
+    normalized_project_root: &Path,
+    remote_layout: &RemoteSyncLayout,
 ) -> SyncClosureManifest {
     let generated_at_unix_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -4548,6 +4695,8 @@ fn build_sync_closure_manifest(
         schema_version: "rch.sync_closure_manifest.v2",
         generated_at_unix_ms,
         project_root: normalized_project_root.to_string_lossy().to_string(),
+        workspace_isolation: remote_layout.workspace_isolation,
+        canonical_remote_root: remote_layout.canonical_remote_root().to_string(),
         entries,
     }
 }
@@ -4665,6 +4814,184 @@ fn build_remote_dependency_preflight_command(sync_roots: &[PathBuf]) -> Option<S
     ))
 }
 
+fn rewrite_remote_command_for_sync_layout(
+    command: &str,
+    topology_policy: &PathTopologyPolicy,
+    remote_layout: &RemoteSyncLayout,
+    reporter: &HookReporter,
+) -> String {
+    if !remote_layout.should_rewrite_topology_paths() {
+        return command.to_string();
+    }
+
+    match shell_words::split(command) {
+        Ok(tokens) => shell_words::join(tokens.into_iter().map(|token| {
+            rewrite_topology_prefixes_for_remote_layout(&token, topology_policy, remote_layout)
+        })),
+        Err(error) => {
+            reporter.verbose(&format!(
+                "[RCH] failed to parse delegated command for topology path rewrite: {}",
+                error
+            ));
+            rewrite_topology_prefixes_for_remote_layout(command, topology_policy, remote_layout)
+        }
+    }
+}
+
+fn rewrite_topology_prefixes_for_remote_layout(
+    value: &str,
+    topology_policy: &PathTopologyPolicy,
+    remote_layout: &RemoteSyncLayout,
+) -> String {
+    if !remote_layout.should_rewrite_topology_paths() {
+        return value.to_string();
+    }
+
+    let mut rewritten = value.to_string();
+    let remote_root = remote_layout.canonical_remote_root();
+    for source_root in [
+        DEFAULT_CANONICAL_PROJECT_ROOT,
+        DEFAULT_ALIAS_PROJECT_ROOT,
+        topology_policy
+            .canonical_root()
+            .to_str()
+            .unwrap_or(DEFAULT_CANONICAL_PROJECT_ROOT),
+        topology_policy
+            .alias_root()
+            .to_str()
+            .unwrap_or(DEFAULT_ALIAS_PROJECT_ROOT),
+    ] {
+        if source_root != remote_root {
+            rewritten = rewritten.replace(source_root, remote_root);
+        }
+    }
+    rewritten
+}
+
+async fn apply_remote_manifest_path_rewrites(
+    worker: &WorkerConfig,
+    root_outcomes: &[(SyncClosurePlanEntry, SyncRootOutcome)],
+    topology_policy: &PathTopologyPolicy,
+    remote_layout: &RemoteSyncLayout,
+    reporter: &HookReporter,
+) -> anyhow::Result<()> {
+    if should_skip_remote_preflight(worker) {
+        reporter.verbose("[RCH] remote manifest path rewrite skipped in mock mode");
+        return Ok(());
+    }
+
+    let Some(rewrite_cmd) =
+        build_remote_manifest_path_rewrite_command(root_outcomes, topology_policy, remote_layout)
+    else {
+        return Ok(());
+    };
+
+    match run_worker_ssh_command(worker, &rewrite_cmd, Duration::from_secs(30)).await {
+        Ok(output) if output.status.success() => {
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            if !stdout.is_empty() {
+                reporter.verbose(&format!("[RCH] remote manifest path rewrite: {}", stdout));
+            }
+            if !stderr.is_empty() {
+                reporter.verbose(&format!(
+                    "[RCH] remote manifest path rewrite stderr: {}",
+                    stderr
+                ));
+            }
+            Ok(())
+        }
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            anyhow::bail!(
+                "remote manifest path rewrite failed with status {:?}; stdout='{}'; stderr='{}'",
+                output.status.code(),
+                stdout,
+                stderr
+            );
+        }
+        Err(error) => Err(error.context("remote manifest path rewrite failed")),
+    }
+}
+
+fn build_remote_manifest_path_rewrite_command(
+    root_outcomes: &[(SyncClosurePlanEntry, SyncRootOutcome)],
+    topology_policy: &PathTopologyPolicy,
+    remote_layout: &RemoteSyncLayout,
+) -> Option<String> {
+    if !remote_layout.should_rewrite_topology_paths() {
+        return None;
+    }
+
+    let mut remote_roots = std::collections::BTreeSet::<String>::new();
+    for (entry, outcome) in root_outcomes {
+        if matches!(outcome, SyncRootOutcome::Synced) {
+            remote_roots.insert(entry.remote_root.clone());
+        }
+    }
+    if remote_roots.is_empty() {
+        return None;
+    }
+
+    let args = std::iter::once(remote_layout.canonical_remote_root().to_string())
+        .chain([
+            DEFAULT_CANONICAL_PROJECT_ROOT.to_string(),
+            DEFAULT_ALIAS_PROJECT_ROOT.to_string(),
+            topology_policy
+                .canonical_root()
+                .to_string_lossy()
+                .to_string(),
+            topology_policy.alias_root().to_string_lossy().to_string(),
+        ])
+        .chain(remote_roots)
+        .map(|arg| shell_escape::escape(arg.as_str().into()).to_string())
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let script = r#"import os
+import sys
+
+destination = sys.argv[1].rstrip("/")
+sources = []
+for raw in sys.argv[2:6]:
+    source = raw.rstrip("/")
+    if source and source != destination and source not in sources:
+        sources.append(source)
+roots = sys.argv[6:]
+changed = 0
+seen = set()
+pruned = {".git", "target", ".rch-target"}
+
+for root in roots:
+    if not os.path.isdir(root):
+        continue
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [name for name in dirnames if name not in pruned]
+        if "Cargo.toml" not in filenames:
+            continue
+        manifest = os.path.join(dirpath, "Cargo.toml")
+        if manifest in seen:
+            continue
+        seen.add(manifest)
+        with open(manifest, "r", encoding="utf-8") as handle:
+            original = handle.read()
+        rewritten = original
+        for source in sources:
+            rewritten = rewritten.replace(source, destination)
+        if rewritten != original:
+            with open(manifest, "w", encoding="utf-8") as handle:
+                handle.write(rewritten)
+            changed += 1
+
+print(f"RCH_MANIFEST_REWRITE_CHANGED:{changed}")
+"#;
+
+    Some(format!(
+        "set -e; if ! command -v python3 >/dev/null 2>&1; then echo RCH_MANIFEST_REWRITE_ERR_PYTHON3_MISSING >&2; exit 44; fi; python3 - {args} <<'PY'\n{script}PY"
+    ))
+}
+
 /// Result of remote compilation execution.
 #[derive(Debug)]
 struct RemoteExecutionResult {
@@ -4758,6 +5085,64 @@ impl WorkerSystemDependencyFailure {
             parts.join(" ")
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CargoWorkspaceInheritanceFailure {
+    inherited_field: Option<String>,
+}
+
+impl CargoWorkspaceInheritanceFailure {
+    fn summary(&self) -> String {
+        match &self.inherited_field {
+            Some(field) => format!("cargo workspace inheritance blocked for {field}"),
+            None => "cargo workspace inheritance blocked by remote topology".to_string(),
+        }
+    }
+
+    fn remediation(&self) -> &'static str {
+        "Sync dependency workspace metadata roots or isolate remote sync roots from unrelated outer Cargo workspaces before retrying."
+    }
+
+    fn log_detail(&self) -> String {
+        match &self.inherited_field {
+            Some(field) => format!("workspace_package_field={field}"),
+            None => "workspace package inheritance failure matched".to_string(),
+        }
+    }
+}
+
+fn detect_cargo_workspace_inheritance_failure(
+    stderr: &str,
+    exit_code: i32,
+) -> Option<CargoWorkspaceInheritanceFailure> {
+    if exit_code == 0 {
+        return None;
+    }
+
+    let lower = stderr.to_ascii_lowercase();
+    let inherits_from_workspace =
+        lower.contains("error inheriting") && lower.contains("from workspace root manifest");
+    let missing_workspace_package =
+        lower.contains("workspace.package.") && lower.contains("was not defined");
+    if !inherits_from_workspace || !missing_workspace_package {
+        return None;
+    }
+
+    let inherited_field = stderr.lines().find_map(extract_workspace_package_field);
+    Some(CargoWorkspaceInheritanceFailure { inherited_field })
+}
+
+fn extract_workspace_package_field(line: &str) -> Option<String> {
+    let lower = line.to_ascii_lowercase();
+    let prefix = "workspace.package.";
+    let start = lower.find(prefix)? + prefix.len();
+    let original_tail = line.get(start..)?.trim_start();
+    let field = original_tail
+        .split_whitespace()
+        .next()?
+        .trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-' && ch != '_');
+    (!field.is_empty()).then(|| field.to_string())
 }
 
 fn detect_worker_system_dependency_failure(
@@ -5176,17 +5561,27 @@ async fn execute_remote_compilation(
         &raw_sync_roots,
         topology_policy,
     );
-    let sync_plan = build_sync_closure_plan(
+    let remote_layout = if exact_dependency_closure_sync {
+        RemoteSyncLayout::outer_workspace_safe(&project_hash)
+    } else {
+        RemoteSyncLayout::worker_canonical()
+    };
+    let sync_plan = build_sync_closure_plan_with_layout(
         &raw_sync_roots,
         &normalized_project_root,
         &project_hash,
         topology_policy,
+        &remote_layout,
     );
     let sync_roots = sync_plan
         .iter()
         .map(|entry| entry.local_root.clone())
         .collect::<Vec<_>>();
-    let sync_manifest = build_sync_closure_manifest(&sync_plan, &normalized_project_root);
+    let sync_manifest = build_sync_closure_manifest_with_layout(
+        &sync_plan,
+        &normalized_project_root,
+        &remote_layout,
+    );
 
     let output_ctx = OutputContext::detect();
     let console = RchConsole::with_context(output_ctx);
@@ -5218,6 +5613,11 @@ async fn execute_remote_compilation(
     reporter.verbose(&format!(
         "[RCH] dependency sync roots planned: {}",
         sync_plan.len()
+    ));
+    reporter.verbose(&format!(
+        "[RCH] workspace isolation: {:?} ({})",
+        remote_layout.workspace_isolation,
+        remote_layout.canonical_remote_root()
     ));
     for (idx, entry) in sync_plan.iter().enumerate() {
         reporter.verbose(&format!(
@@ -5438,6 +5838,16 @@ async fn execute_remote_compilation(
         progress.apply_summary(sync_result.bytes_transferred, sync_result.files_transferred);
         progress.finish();
     }
+    if exact_dependency_closure_sync && remote_layout.should_rewrite_topology_paths() {
+        apply_remote_manifest_path_rewrites(
+            &worker_config,
+            &root_outcomes,
+            topology_policy,
+            &remote_layout,
+            reporter,
+        )
+        .await?;
+    }
     if let Some(loop_ref) = heartbeat_loop.as_ref() {
         loop_ref.update_phase(
             BuildHeartbeatPhase::Execute,
@@ -5452,7 +5862,12 @@ async fn execute_remote_compilation(
 
     // Step 2: Execute command remotely with streaming output
     // Mask sensitive data (API keys, tokens, passwords) before logging
-    let masked_command = mask_sensitive_command(command);
+    let remote_execution_command =
+        rewrite_remote_command_for_sync_layout(command, topology_policy, &remote_layout, reporter);
+    if remote_execution_command != command {
+        reporter.verbose("[RCH] remote command topology paths rewritten for isolated sync layout");
+    }
+    let masked_command = mask_sensitive_command(&remote_execution_command);
     info!("Executing command remotely: {}", masked_command);
     reporter.verbose(&format!("[RCH] exec start: {}", masked_command));
 
@@ -5501,7 +5916,7 @@ async fn execute_remote_compilation(
     }));
 
     // Add per-worker CARGO_HOME isolation to prevent cache lock contention
-    let isolated_command = add_cargo_isolation(command, &worker_config.id);
+    let isolated_command = add_cargo_isolation(&remote_execution_command, &worker_config.id);
 
     // Stream stdout/stderr to our stderr so the agent sees the output
     let command_with_telemetry = wrap_command_with_telemetry(&isolated_command, &worker_config.id);
@@ -5843,7 +6258,7 @@ async fn execute_remote_compilation(
         let record = TestRunRecord::new(
             project_id.clone(),
             worker_config.id.as_str().to_string(),
-            command.to_string(),
+            remote_execution_command.clone(),
             kind,
             result.exit_code,
             result.duration_ms,
@@ -5878,7 +6293,7 @@ async fn execute_remote_compilation(
             files: u64::from(artifact.files_transferred),
             bytes: artifact.bytes_transferred,
         });
-        let target_label = detect_target_label(command, &output_snapshot);
+        let target_label = detect_target_label(&remote_execution_command, &output_snapshot);
 
         let summary = CelebrationSummary::new(project_id.clone(), result.duration_ms)
             .worker(worker_config.id.as_str())
@@ -6944,6 +7359,7 @@ mod tests {
 
             assert!(request_line.contains("worker=ts2"));
             assert!(request_line.contains("worker=vmi1264463"));
+            assert!(request_line.contains("preferred_workers=ts2%2Cvmi1264463"));
 
             let response = SelectionResponse {
                 worker: Some(SelectedWorker {
@@ -8166,6 +8582,61 @@ The file `x11.pc` needs to be installed and the PKG_CONFIG_PATH environment vari
         assert_eq!(failure.pkg_config_file.as_deref(), Some("x11.pc"));
         assert_eq!(failure.summary(), "missing worker system package x11.pc");
         assert!(failure.remediation().contains("x11.pc"));
+    }
+
+    #[test]
+    fn test_detect_cargo_workspace_inheritance_failure_from_frankensearch_stderr() {
+        let _guard = test_guard!();
+        let stderr = r#"error: failed to load manifest for dependency `frankensearch`
+
+Caused by:
+  failed to parse manifest at `/data/projects/frankensearch/frankensearch/Cargo.toml`
+
+Caused by:
+  error inheriting `license-file` from workspace root manifest's `workspace.package.license-file`
+
+Caused by:
+  `workspace.package.license-file` was not defined
+"#;
+
+        let failure = detect_cargo_workspace_inheritance_failure(stderr, EXIT_BUILD_ERROR)
+            .expect("Cargo workspace inheritance failure should be detected");
+
+        assert_eq!(failure.inherited_field.as_deref(), Some("license-file"));
+        assert!(
+            failure
+                .summary()
+                .contains("cargo workspace inheritance blocked")
+        );
+        assert!(
+            failure
+                .remediation()
+                .contains("Sync dependency workspace metadata roots")
+        );
+    }
+
+    #[test]
+    fn test_detect_cargo_workspace_inheritance_failure_ignores_normal_compile_errors() {
+        let _guard = test_guard!();
+        let stderr = r#"error[E0425]: cannot find value `oops` in this scope
+ --> src/main.rs:4:5
+  |
+4 |     oops();
+  |     ^^^^ not found in this scope
+"#;
+
+        assert!(
+            detect_cargo_workspace_inheritance_failure(stderr, EXIT_BUILD_ERROR).is_none(),
+            "ordinary compile errors must not be classified as topology failures"
+        );
+        assert!(
+            detect_cargo_workspace_inheritance_failure(
+                "workspace.package.license-file was not defined",
+                EXIT_SUCCESS
+            )
+            .is_none(),
+            "successful commands must not be classified as topology failures"
+        );
     }
 
     #[test]
@@ -12237,6 +12708,127 @@ edition = "2024"
                 "dependency root should map back to worker canonical topology"
             );
         }
+    }
+
+    #[test]
+    fn test_build_sync_closure_plan_outer_workspace_safe_layout_uses_isolated_parent() {
+        let _guard = test_guard!();
+        let (temp_dir, policy) = topology_tempdir();
+        let project_root = temp_dir.path().join("eidetic_engine_cli");
+        let dep_root = temp_dir.path().join("frankensearch/frankensearch");
+        std::fs::create_dir_all(&project_root).expect("create project");
+        std::fs::create_dir_all(&dep_root).expect("create dep");
+
+        let layout = RemoteSyncLayout::outer_workspace_safe("abcdef0123456789deadbeef");
+        let plan = build_sync_closure_plan_with_layout(
+            &[project_root.clone(), dep_root.clone()],
+            &project_root,
+            "isolated_hash",
+            &policy,
+            &layout,
+        );
+
+        let primary = plan
+            .iter()
+            .find(|entry| entry.is_primary)
+            .expect("primary entry");
+        assert_eq!(
+            primary.remote_root,
+            "/tmp/rch-sync/abcdef0123456789/projects/eidetic_engine_cli"
+        );
+        assert!(
+            plan.iter().any(|entry| entry.remote_root
+                == "/tmp/rch-sync/abcdef0123456789/projects/frankensearch/frankensearch"),
+            "dependency root should be remapped under the isolated remote parent"
+        );
+    }
+
+    #[test]
+    fn test_outer_workspace_safe_manifest_records_layout_evidence() {
+        let _guard = test_guard!();
+        let (temp_dir, policy) = topology_tempdir();
+        let project_root = temp_dir.path().join("project");
+        std::fs::create_dir_all(&project_root).expect("create project");
+
+        let layout = RemoteSyncLayout::outer_workspace_safe("feedfacecafebeef00112233");
+        let plan = build_sync_closure_plan_with_layout(
+            std::slice::from_ref(&project_root),
+            &project_root,
+            "manifest_hash",
+            &policy,
+            &layout,
+        );
+        let manifest = build_sync_closure_manifest_with_layout(&plan, &project_root, &layout);
+
+        assert_eq!(
+            manifest.workspace_isolation,
+            RemoteWorkspaceIsolation::OuterWorkspaceSafe
+        );
+        assert_eq!(
+            manifest.canonical_remote_root,
+            "/tmp/rch-sync/feedfacecafebeef/projects"
+        );
+    }
+
+    #[test]
+    fn test_outer_workspace_safe_remote_command_topology_rewrite_handles_manifest_and_alias_paths()
+    {
+        let _guard = test_guard!();
+        let policy = PathTopologyPolicy::default();
+        let layout = RemoteSyncLayout::outer_workspace_safe("abcabcabcabcabcabcabcabc");
+        let reporter = HookReporter::new(OutputVisibility::None);
+
+        let rewritten = rewrite_remote_command_for_sync_layout(
+            "env TMPDIR=/tmp cargo test --manifest-path=/data/projects/eidetic_engine_cli/Cargo.toml -- /dp/frankensearch",
+            &policy,
+            &layout,
+            &reporter,
+        );
+
+        assert!(
+            rewritten
+                .contains("--manifest-path=/tmp/rch-sync/abcabcabcabcabca/projects/eidetic_engine_cli/Cargo.toml"),
+            "manifest path should be rewritten into the isolated layout: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("/tmp/rch-sync/abcabcabcabcabca/projects/frankensearch"),
+            "alias path should be rewritten into the isolated layout: {rewritten}"
+        );
+        assert!(
+            !rewritten.contains("/data/projects/eidetic_engine_cli")
+                && !rewritten.contains("/dp/frankensearch"),
+            "original topology paths should not remain in rewritten command: {rewritten}"
+        );
+    }
+
+    #[test]
+    fn test_outer_workspace_safe_manifest_rewrite_command_targets_synced_roots_only() {
+        let _guard = test_guard!();
+        let (temp_dir, policy) = topology_tempdir();
+        let project_root = temp_dir.path().join("project");
+        let dep_root = temp_dir.path().join("dep");
+        std::fs::create_dir_all(&project_root).expect("create project");
+        std::fs::create_dir_all(&dep_root).expect("create dep");
+
+        let layout = RemoteSyncLayout::outer_workspace_safe("1234567890abcdef");
+        let plan = build_sync_closure_plan_with_layout(
+            &[project_root.clone(), dep_root],
+            &project_root,
+            "rewrite_hash",
+            &policy,
+            &layout,
+        );
+        let outcomes = plan
+            .into_iter()
+            .map(|entry| (entry, SyncRootOutcome::Synced))
+            .collect::<Vec<_>>();
+
+        let command = build_remote_manifest_path_rewrite_command(&outcomes, &policy, &layout)
+            .expect("rewrite command");
+
+        assert!(command.contains("python3 -"));
+        assert!(command.contains("RCH_MANIFEST_REWRITE_CHANGED"));
+        assert!(command.contains("/tmp/rch-sync/1234567890abcdef/projects"));
     }
 
     #[test]

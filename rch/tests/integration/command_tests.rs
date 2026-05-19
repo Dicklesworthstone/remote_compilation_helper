@@ -42,6 +42,39 @@ fn test_rch_version_output() {
     crate::test_log!("TEST PASS: test_rch_version_output");
 }
 
+#[test]
+fn test_exec_refuses_non_compilation_local_fallback_when_remote_required() {
+    init_test_logging();
+    crate::test_log!(
+        "TEST START: test_exec_refuses_non_compilation_local_fallback_when_remote_required"
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_rch"))
+        .env("RCH_REQUIRE_REMOTE", "1")
+        .args(["exec", "--", "echo", "should_not_run_locally"])
+        .output()
+        .expect("Failed to run rch exec non-compilation command");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "RCH_REQUIRE_REMOTE=1 must fail closed for non-compilation exec commands"
+    );
+    assert!(
+        stdout.trim().is_empty(),
+        "non-compilation command must not execute locally; stdout={stdout:?}"
+    );
+    assert_contains(
+        &stderr,
+        "remote required; refusing local fallback (non-compilation command)",
+    );
+
+    crate::test_log!(
+        "TEST PASS: test_exec_refuses_non_compilation_local_fallback_when_remote_required"
+    );
+}
+
 // =============================================================================
 // Subcommand Help Tests
 // =============================================================================
