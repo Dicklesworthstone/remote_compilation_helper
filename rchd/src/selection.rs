@@ -1638,12 +1638,17 @@ impl WorkerSelector {
             )));
         }
 
-        // Return preferred workers if available, otherwise all eligible
+        // A non-empty preferred list is a caller pin, not a soft hint. If none
+        // of the requested workers survive filtering, fail closed instead of
+        // silently selecting a different worker.
         if has_preferred && !preferred.is_empty() {
             return Ok(preferred);
         }
         if has_preferred && !preferred_without_health.is_empty() {
             return Ok(preferred_without_health);
+        }
+        if has_preferred {
+            return Err(SelectionReason::NoMatchingWorkers);
         }
         if !eligible.is_empty() {
             return Ok(eligible);
@@ -2300,12 +2305,15 @@ pub async fn select_worker_with_config(
         eligible.push((worker, circuit_state));
     }
 
-    let mut candidates = if has_preferred && !preferred.is_empty() {
+    let mut candidates = if has_preferred {
+        if preferred.is_empty() {
+            return SelectionResult {
+                worker: None,
+                reason: SelectionReason::NoMatchingWorkers,
+            };
+        }
         preferred
     } else {
-        if has_preferred {
-            debug!("Preferred workers not eligible; falling back to all eligible workers");
-        }
         eligible
     };
 
@@ -3125,7 +3133,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_select_worker_falls_back_when_preferred_unavailable() {
+    async fn test_select_worker_refuses_when_preferred_unavailable() {
         let pool = WorkerPool::new();
         pool.add_worker(
             make_worker("available", 8, 50.0)
@@ -3151,8 +3159,8 @@ mod tests {
         let config = CircuitBreakerConfig::default();
 
         let result = select_worker_with_config(&pool, &request, &weights, &config).await;
-        let selected = result.worker.expect("Expected fallback to eligible worker");
-        assert_eq!(selected.config.read().await.id.as_str(), "available");
+        assert!(result.worker.is_none());
+        assert_eq!(result.reason, SelectionReason::NoMatchingWorkers);
     }
 
     #[tokio::test]
@@ -4544,6 +4552,43 @@ mod tests {
         let selected = result.worker.expect("Expected a worker");
         // Preferred workers take precedence even with Fastest strategy
         assert_eq!(selected.config.read().await.id.as_str(), "preferred");
+    }
+
+    #[tokio::test]
+    async fn test_worker_selector_does_not_fallback_outside_preferred_workers() {
+        let pool = WorkerPool::new();
+        pool.add_worker(
+            make_worker("available", 8, 90.0)
+                .config
+                .read()
+                .await
+                .clone(),
+        )
+        .await;
+
+        let selector = WorkerSelector::with_config(
+            SelectionConfig {
+                strategy: SelectionStrategy::Fastest,
+                ..Default::default()
+            },
+            CircuitBreakerConfig::default(),
+        );
+
+        let request = SelectionRequest {
+            project: "test-project".to_string(),
+            command: None,
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 2,
+            preferred_workers: vec![WorkerId::new("missing")],
+            toolchain: None,
+            required_runtime: RequiredRuntime::default(),
+            classification_duration_us: None,
+            hook_pid: None,
+        };
+
+        let result = selector.select(&pool, &request).await;
+        assert!(result.worker.is_none());
+        assert_eq!(result.reason, SelectionReason::NoMatchingWorkers);
     }
 
     // =========================================================================
