@@ -1773,7 +1773,9 @@ async fn handle_telemetry_poll(ctx: &DaemonContext, worker_id: &WorkerId) -> Tel
         };
     }
 
-    match collect_telemetry_from_worker(&worker, Duration::from_secs(5)).await {
+    // 20s (matching TelemetryPollerConfig): a fresh SSH connect+auth+exec to a
+    // trans-continental worker can approach/exceed 5s under load.
+    match collect_telemetry_from_worker(&worker, Duration::from_secs(20)).await {
         Ok(telemetry) => {
             ctx.telemetry
                 .ingest(telemetry.clone(), TelemetrySource::OnDemand);

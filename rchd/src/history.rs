@@ -21,6 +21,32 @@ use tracing::{debug, warn};
 /// Default maximum number of builds to retain.
 const DEFAULT_CAPACITY: usize = 100;
 
+/// Cargo's reserved exit code for its own errors, including compilation failures.
+/// A test command that exits with this code failed to *build*; any other non-zero
+/// exit from a test command means it compiled but had failing assertions.
+const CARGO_INTERNAL_ERROR_EXIT: i32 = 101;
+
+/// Whether a build record represents a successful *build* (as opposed to a
+/// successful test run).
+///
+/// A zero exit code is always a build success. For test/bench commands
+/// (`cargo test`, `cargo nextest`, `cargo bench`, `bun test`), a non-zero exit
+/// usually means the command *compiled* fine but had failing assertions — that
+/// outcome belongs in the test pass-rate (`TestStats`), not in the build
+/// success-rate. Cargo reserves exit code 101 for its own errors (including
+/// compilation failures), so a test command exiting 101 is still a genuine build
+/// failure. This prevents failing tests from dragging the reported build success
+/// rate to 0% (see rchd build-history stats).
+fn build_record_succeeded(record: &BuildRecord) -> bool {
+    if record.exit_code == 0 {
+        return true;
+    }
+    let is_test_command = rch_common::patterns::classify_command(&record.command)
+        .kind
+        .is_some_and(|kind| kind.is_test_command());
+    is_test_command && record.exit_code != CARGO_INTERNAL_ERROR_EXIT
+}
+
 /// In-flight build state tracked for active build visibility.
 #[derive(Debug, Clone)]
 pub struct ActiveBuildState {
@@ -713,7 +739,7 @@ impl BuildHistory {
             return BuildStats::default();
         }
 
-        let successes = records.iter().filter(|r| r.exit_code == 0).count();
+        let successes = records.iter().filter(|r| build_record_succeeded(r)).count();
         let remote = records
             .iter()
             .filter(|r| r.location == BuildLocation::Remote)
@@ -1089,6 +1115,44 @@ mod tests {
         assert_eq!(stats.remote_count, 2);
         assert_eq!(stats.local_count, 1);
         assert_eq!(stats.avg_duration_ms, 1166); // (1000+2000+500)/3
+    }
+
+    #[test]
+    fn test_failing_tests_do_not_count_as_build_failures() {
+        let _guard = test_guard!();
+        let history = BuildHistory::new(10);
+
+        // A `cargo test` that exits non-zero because assertions failed — it still
+        // BUILT successfully, so it must NOT count against the build success rate.
+        let mut failing_test = make_build_record(1);
+        failing_test.command = "env cargo test -p frankenterm-core some_test -- --nocapture".to_string();
+        failing_test.exit_code = 1;
+        history.record(failing_test);
+
+        // A real build command that failed to compile — genuine build failure.
+        let mut failing_build = make_build_record(2);
+        failing_build.command = "cargo build --release".to_string();
+        failing_build.exit_code = 1;
+        history.record(failing_build);
+
+        // A `cargo test` that failed to COMPILE (cargo's exit 101) — still a build failure.
+        let mut test_compile_error = make_build_record(3);
+        test_compile_error.command = "cargo test --workspace".to_string();
+        test_compile_error.exit_code = 101;
+        history.record(test_compile_error);
+
+        // A passing test command.
+        let mut passing_test = make_build_record(4);
+        passing_test.command = "cargo nextest run".to_string();
+        passing_test.exit_code = 0;
+        history.record(passing_test);
+
+        let stats = history.stats();
+        assert_eq!(stats.total_builds, 4);
+        // Successes: the failing-but-compiled test + the passing test = 2.
+        // Failures: the failed `cargo build` + the test that failed to compile = 2.
+        assert_eq!(stats.success_count, 2, "failing test assertions must not count as build failures");
+        assert_eq!(stats.failure_count, 2);
     }
 
     #[test]

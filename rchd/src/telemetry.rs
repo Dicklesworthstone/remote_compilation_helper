@@ -245,7 +245,14 @@ impl Default for TelemetryPollerConfig {
     fn default() -> Self {
         Self {
             poll_interval: Duration::from_secs(30),
-            ssh_timeout: Duration::from_secs(5),
+            // Telemetry is collected via a fresh SSH connect+auth+exec each cycle.
+            // 5s was too tight for trans-continental workers (e.g. Contabo EU VPS
+            // from a US controller): connect+auth alone can approach/exceed 5s under
+            // load, causing intermittent "Command timed out after 5s" failures that
+            // flap worker freshness → flap health → spurious "no workers passed
+            // health thresholds" and offload falling back to local. 20s leaves
+            // comfortable margin while staying under the 30s poll interval.
+            ssh_timeout: Duration::from_secs(20),
             skip_after: Duration::from_secs(60),
         }
     }
@@ -564,7 +571,7 @@ mod tests {
         let _guard = test_guard!();
         let config = TelemetryPollerConfig::default();
         assert_eq!(config.poll_interval, Duration::from_secs(30));
-        assert_eq!(config.ssh_timeout, Duration::from_secs(5));
+        assert_eq!(config.ssh_timeout, Duration::from_secs(20));
         assert_eq!(config.skip_after, Duration::from_secs(60));
     }
 
