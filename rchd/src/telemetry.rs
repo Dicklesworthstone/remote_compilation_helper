@@ -259,10 +259,19 @@ impl Default for TelemetryPollerConfig {
 }
 
 /// Periodic SSH poller for worker telemetry.
+/// Maximum number of worker telemetry SSH polls allowed to run concurrently.
+/// Each poll may block for up to `ssh_timeout`; without a cap, a single tick
+/// fans out one fire-and-forget task per worker, so a burst of slow/hung
+/// workers can pile up across ticks and pressure the runtime. Bounding
+/// concurrency keeps the poller's footprint predictable regardless of fleet
+/// size or worker latency.
+const MAX_CONCURRENT_TELEMETRY_POLLS: usize = 4;
+
 pub struct TelemetryPoller {
     pool: WorkerPool,
     store: Arc<TelemetryStore>,
     config: TelemetryPollerConfig,
+    poll_limit: Arc<tokio::sync::Semaphore>,
 }
 
 impl TelemetryPoller {
@@ -276,6 +285,7 @@ impl TelemetryPoller {
             pool,
             store,
             config,
+            poll_limit: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TELEMETRY_POLLS)),
         }
     }
 
@@ -302,7 +312,13 @@ impl TelemetryPoller {
 
             let store = self.store.clone();
             let config = self.config.clone();
+            let poll_limit = self.poll_limit.clone();
             tokio::spawn(async move {
+                // Bound concurrent SSH polls (see MAX_CONCURRENT_TELEMETRY_POLLS):
+                // a permit is held for the duration of the poll so slow/hung
+                // workers throttle the fan-out instead of flooding the runtime.
+                // The semaphore is never closed, so acquire_owned cannot fail.
+                let _permit = poll_limit.acquire_owned().await;
                 if let Err(e) = poll_worker(worker, store, config).await {
                     warn!("Telemetry poll failed: {}", e);
                 }
@@ -340,14 +356,24 @@ pub async fn collect_telemetry_from_worker(
     worker: &WorkerState,
     ssh_timeout: Duration,
 ) -> anyhow::Result<WorkerTelemetry> {
-    let config = worker.config.read().await;
-    let worker_id = config.id.as_str();
+    // Snapshot the worker config and RELEASE the lock before any SSH work.
+    // Holding `worker.config` across the (up to `ssh_timeout`) SSH round-trip
+    // blocks writers — and any reader queued behind a pending writer, including
+    // the in-memory worker-selection path — for the full SSH duration. Under a
+    // poll burst that surfaced as multi-second "worker_selection latency
+    // exceeded panic threshold" stalls. Cloning + dropping the guard here keeps
+    // selection lock-free while telemetry SSH is in flight.
+    let worker_config = {
+        let config = worker.config.read().await;
+        config.clone()
+    };
+    let worker_id = worker_config.id.clone();
     // Worker IDs come from operator-supplied config (workers.toml), not from
     // a trusted source — a stray quote, semicolon, or `$()` would otherwise
     // be evaluated by the remote shell. Always shell-escape before splicing
     // into the remote command. The companion path in rch/src/hook.rs already
     // uses `shell_escape::escape` for exactly this reason.
-    let escaped_worker = shell_escape::escape(worker_id.into());
+    let escaped_worker = shell_escape::escape(worker_config.id.as_str().into());
     // Use rch-wkr from PATH if available, otherwise fallback to ~/.local/bin/rch-wkr
     // This handles non-interactive SSH sessions where ~/.local/bin might not be in PATH
     let command = format!(
@@ -361,7 +387,7 @@ pub async fn collect_telemetry_from_worker(
         ..Default::default()
     };
 
-    let mut client = SshClient::new(config.clone(), options);
+    let mut client = SshClient::new(worker_config, options);
     client.connect().await?;
     let result = client.execute(&command).await;
     client.disconnect().await?;
@@ -385,7 +411,7 @@ pub async fn collect_telemetry_from_worker(
         WorkerTelemetry::from_json(payload).context("Failed to parse telemetry JSON")?;
 
     if !telemetry.is_compatible() {
-        warn!(worker = worker_id, "Telemetry protocol version mismatch");
+        warn!(worker = worker_id.as_str(), "Telemetry protocol version mismatch");
     }
 
     Ok(telemetry)
