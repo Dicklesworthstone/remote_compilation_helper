@@ -17,7 +17,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::task;
 use tokio::time::interval;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// In-memory telemetry store with time-based eviction.
 pub struct TelemetryStore {
@@ -303,6 +303,10 @@ impl TelemetryPoller {
     pub fn start(self) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let mut ticker = interval(self.config.poll_interval);
+            // A cycle can occasionally run long (a worker failing both attempts
+            // back-to-back). Skip missed ticks rather than firing a burst of
+            // back-to-back cycles, which would only add SSH contention.
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 ticker.tick().await;
                 if let Err(e) = self.poll_once().await {
@@ -314,7 +318,13 @@ impl TelemetryPoller {
 
     async fn poll_once(&self) -> anyhow::Result<()> {
         let workers = self.pool.all_workers().await;
+        let total = workers.len();
 
+        // Spawn one bounded poll task per eligible worker and collect handles so
+        // we can report a per-cycle outcome summary at INFO. The summary is the
+        // single source of truth for "is telemetry actually refreshing?" in
+        // production (the daemon log is INFO-level), and avoids needing debug logs.
+        let mut handles = Vec::new();
         for worker in workers {
             if !self.should_poll_worker(&worker).await {
                 continue;
@@ -323,20 +333,26 @@ impl TelemetryPoller {
             let store = self.store.clone();
             let config = self.config.clone();
             let poll_limit = self.poll_limit.clone();
-            let hard_timeout = poll_hard_timeout(self.config.ssh_timeout);
-            tokio::spawn(async move {
+            handles.push(tokio::spawn(async move {
                 // Bound concurrent SSH polls (see MAX_CONCURRENT_TELEMETRY_POLLS).
                 // The semaphore is never closed, so acquire_owned cannot fail.
                 let _permit = poll_limit.acquire_owned().await;
-                // Hard outer timeout so a poll that hangs past the SSH layer's
-                // own timeout cannot leak the task or its permit — leaked permits
-                // starve future polls and collapse telemetry freshness.
-                match tokio::time::timeout(hard_timeout, poll_worker(worker, store, config)).await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => warn!("Telemetry poll failed: {}", e),
-                    Err(_) => warn!("Telemetry poll exceeded hard timeout {:?}", hard_timeout),
-                }
-            });
+                poll_worker(worker, store, config).await
+            }));
+        }
+
+        let attempted = handles.len();
+        let mut refreshed = 0usize;
+        for handle in handles {
+            if matches!(handle.await, Ok(true)) {
+                refreshed += 1;
+            }
+        }
+        if attempted > 0 {
+            info!(
+                "telemetry poll cycle: refreshed {}/{} polled workers ({} configured)",
+                refreshed, attempted, total
+            );
         }
 
         Ok(())
@@ -431,29 +447,62 @@ pub async fn collect_telemetry_from_worker(
     Ok(telemetry)
 }
 
+/// Total attempts (1 initial + retries) for a single worker poll per cycle.
+const TELEMETRY_POLL_ATTEMPTS: u32 = 2;
+/// Backoff between poll attempts. Short, so a transient SSH connect failure
+/// under contention is retried after the burst clears, without dropping the
+/// worker past the stale threshold until the next cycle.
+const TELEMETRY_RETRY_BACKOFF: Duration = Duration::from_millis(1500);
+
+/// Poll one worker and ingest its telemetry. Returns `true` iff telemetry was
+/// collected and ingested this call.
+///
+/// Each attempt is bounded by a hard timeout (the SSH layer's own timeout is not
+/// always honored); a single transient failure is retried once. Without the
+/// retry, one failed re-poll under concurrent SSH load drops the worker past the
+/// stale threshold — the root cause of fluctuating fleet telemetry freshness.
 async fn poll_worker(
     worker: Arc<WorkerState>,
     store: Arc<TelemetryStore>,
     config: TelemetryPollerConfig,
-) -> anyhow::Result<()> {
+) -> bool {
     let worker_id = worker.config.read().await.id.clone();
+    let per_attempt = poll_hard_timeout(config.ssh_timeout);
+    let mut last_err: Option<String> = None;
 
-    match collect_telemetry_from_worker(&worker, config.ssh_timeout).await {
-        Ok(telemetry) => {
-            debug!(
-                worker = worker_id.as_str(),
-                cpu = %telemetry.cpu.overall_percent,
-                memory = %telemetry.memory.used_percent,
-                "Telemetry collected via SSH"
-            );
-            store.ingest(telemetry, TelemetrySource::SshPoll);
+    for attempt in 1..=TELEMETRY_POLL_ATTEMPTS {
+        match tokio::time::timeout(
+            per_attempt,
+            collect_telemetry_from_worker(&worker, config.ssh_timeout),
+        )
+        .await
+        {
+            Ok(Ok(telemetry)) => {
+                debug!(
+                    worker = worker_id.as_str(),
+                    attempt,
+                    cpu = %telemetry.cpu.overall_percent,
+                    memory = %telemetry.memory.used_percent,
+                    "Telemetry collected via SSH"
+                );
+                store.ingest(telemetry, TelemetrySource::SshPoll);
+                return true;
+            }
+            Ok(Err(e)) => last_err = Some(e.to_string()),
+            Err(_) => last_err = Some(format!("hard timeout after {per_attempt:?}")),
         }
-        Err(e) => {
-            warn!(worker = worker_id.as_str(), "Telemetry poll failed: {}", e);
+        if attempt < TELEMETRY_POLL_ATTEMPTS {
+            tokio::time::sleep(TELEMETRY_RETRY_BACKOFF).await;
         }
     }
 
-    Ok(())
+    warn!(
+        worker = worker_id.as_str(),
+        attempts = TELEMETRY_POLL_ATTEMPTS,
+        "Telemetry poll failed: {}",
+        last_err.unwrap_or_else(|| "unknown error".to_string())
+    );
+    false
 }
 
 #[cfg(test)]
