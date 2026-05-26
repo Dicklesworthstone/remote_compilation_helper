@@ -260,12 +260,22 @@ impl Default for TelemetryPollerConfig {
 
 /// Periodic SSH poller for worker telemetry.
 /// Maximum number of worker telemetry SSH polls allowed to run concurrently.
-/// Each poll may block for up to `ssh_timeout`; without a cap, a single tick
-/// fans out one fire-and-forget task per worker, so a burst of slow/hung
-/// workers can pile up across ticks and pressure the runtime. Bounding
-/// concurrency keeps the poller's footprint predictable regardless of fleet
-/// size or worker latency.
-const MAX_CONCURRENT_TELEMETRY_POLLS: usize = 4;
+/// This bounds the poller's footprint on pathologically large fleets, but MUST
+/// stay comfortably above a normal fleet's worker count: a hung poll holds its
+/// permit until the hard timeout (see `poll_worker` wrapping) fires, so a cap
+/// at/below the worker count would let a few stuck workers starve the rest of
+/// the fleet of poll permits — observed as telemetry freshness collapsing to a
+/// handful of workers. 16 keeps every realistic fleet fully concurrent.
+const MAX_CONCURRENT_TELEMETRY_POLLS: usize = 16;
+
+/// Hard wall-clock bound for a single worker poll. The SSH layer is *supposed*
+/// to honor `ssh_timeout` for connect/command, but in practice a stuck
+/// connection can hang past it; without an outer timeout the spawned task (and
+/// its concurrency permit) leaks indefinitely, silently starving future polls.
+/// Sized just above `ssh_timeout` so a healthy-but-slow worker still completes.
+fn poll_hard_timeout(ssh_timeout: Duration) -> Duration {
+    ssh_timeout + Duration::from_secs(5)
+}
 
 pub struct TelemetryPoller {
     pool: WorkerPool,
@@ -313,14 +323,18 @@ impl TelemetryPoller {
             let store = self.store.clone();
             let config = self.config.clone();
             let poll_limit = self.poll_limit.clone();
+            let hard_timeout = poll_hard_timeout(self.config.ssh_timeout);
             tokio::spawn(async move {
-                // Bound concurrent SSH polls (see MAX_CONCURRENT_TELEMETRY_POLLS):
-                // a permit is held for the duration of the poll so slow/hung
-                // workers throttle the fan-out instead of flooding the runtime.
+                // Bound concurrent SSH polls (see MAX_CONCURRENT_TELEMETRY_POLLS).
                 // The semaphore is never closed, so acquire_owned cannot fail.
                 let _permit = poll_limit.acquire_owned().await;
-                if let Err(e) = poll_worker(worker, store, config).await {
-                    warn!("Telemetry poll failed: {}", e);
+                // Hard outer timeout so a poll that hangs past the SSH layer's
+                // own timeout cannot leak the task or its permit — leaked permits
+                // starve future polls and collapse telemetry freshness.
+                match tokio::time::timeout(hard_timeout, poll_worker(worker, store, config)).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => warn!("Telemetry poll failed: {}", e),
+                    Err(_) => warn!("Telemetry poll exceeded hard timeout {:?}", hard_timeout),
                 }
             });
         }
