@@ -253,7 +253,15 @@ impl Default for TelemetryPollerConfig {
             // health thresholds" and offload falling back to local. 20s leaves
             // comfortable margin while staying under the 30s poll interval.
             ssh_timeout: Duration::from_secs(20),
-            skip_after: Duration::from_secs(60),
+            // Re-poll cadence must stay under the pressure layer's
+            // telemetry-stale threshold (90s). With a 30s tick, a 60s skip
+            // pushed the effective re-poll to ~90s (the tick after the skip
+            // window expires) — equal to the stale threshold, so workers raced
+            // in and out of "fresh". 30s makes a worker eligible again at the
+            // *second* tick, i.e. ~60s effective re-poll: max worker age ~60s,
+            // comfortably inside the 90s window, without tripling SSH load the
+            // way a sub-tick skip (→30s re-poll) would.
+            skip_after: Duration::from_secs(30),
         }
     }
 }
@@ -661,7 +669,7 @@ mod tests {
         let config = TelemetryPollerConfig::default();
         assert_eq!(config.poll_interval, Duration::from_secs(30));
         assert_eq!(config.ssh_timeout, Duration::from_secs(20));
-        assert_eq!(config.skip_after, Duration::from_secs(60));
+        assert_eq!(config.skip_after, Duration::from_secs(30));
     }
 
     #[test]
