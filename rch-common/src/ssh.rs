@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::sync::{RwLock, mpsc};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, warn};
 
 // Re-export platform-independent utilities for backwards compatibility
 pub use crate::ssh_utils::{
@@ -203,7 +203,9 @@ impl SshClient {
             }
         };
 
-        info!("Connected to {} ({})", self.config.id, self.config.host);
+        // debug, not info: the telemetry pool connects to every worker each poll
+        // cycle, so at info this floods the daemon log (8M+ lines / multi-GB).
+        debug!("Connected to {} ({})", self.config.id, self.config.host);
         self.session = Some(session);
         Ok(())
     }
@@ -325,7 +327,8 @@ impl SshClient {
         if let Some(session) = self.session.take() {
             debug!("Disconnecting from {}", self.config.id);
             session.close().await?;
-            info!("Disconnected from {}", self.config.id);
+            // debug, not info: paired with the connect log above; floods at info.
+            debug!("Disconnected from {}", self.config.id);
         }
         Ok(())
     }

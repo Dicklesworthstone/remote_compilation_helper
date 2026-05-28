@@ -3741,7 +3741,53 @@ fn which_rchd_path() -> PathBuf {
     which("rchd").unwrap_or_else(|_| PathBuf::from("rchd"))
 }
 
+/// Ask systemd's user-scope manager to start `rchd.service` (idempotent if
+/// already active). Returns Ok only if a `rchd.service` user unit exists,
+/// the start command succeeds, AND the socket appears within the timeout.
+/// Any failure returns Err so the caller falls back to direct spawn.
+fn start_rchd_via_systemd_user(socket_path: &Path) -> Result<(), String> {
+    // Cheap probe: does the unit exist for this user? (`is-enabled` returns
+    // non-zero for missing units.) `--quiet` suppresses output.
+    let probe = Command::new("systemctl")
+        .args(["--user", "--quiet", "is-enabled", "rchd.service"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|e| format!("systemctl probe failed: {e}"))?;
+    if !probe.success() {
+        return Err("no systemd --user rchd.service unit".into());
+    }
+
+    // `systemctl start` is a no-op if the unit is already active.
+    let start = Command::new("systemctl")
+        .args(["--user", "start", "rchd.service"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|e| format!("systemctl start failed to invoke: {e}"))?;
+    if !start.success() {
+        return Err(format!("systemctl start exited {start}"));
+    }
+
+    if wait_for_socket(socket_path, Duration::from_secs(5)) {
+        Ok(())
+    } else {
+        Err("systemd started rchd but socket did not appear within 5s".into())
+    }
+}
+
 fn spawn_rchd(rchd_path: &Path, socket_path: &Path) -> Result<(), String> {
+    // Prefer the systemd-managed daemon when one exists. Spawning a detached
+    // competing rchd via nohup (below) is what historically caused the
+    // restart-storm: an agent's `rch exec` would auto-spawn an rchd that
+    // grabbed the socket and permanently blocked the systemd unit. Asking
+    // systemd to start its own unit is idempotent and keeps a single owner.
+    if cfg!(target_os = "linux")
+        && start_rchd_via_systemd_user(socket_path).is_ok()
+    {
+        return Ok(());
+    }
+
     let mut cmd = Command::new("nohup");
     cmd.arg(rchd_path)
         .arg("-s")

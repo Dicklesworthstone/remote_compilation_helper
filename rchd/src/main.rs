@@ -147,36 +147,61 @@ pub struct DaemonContext {
 }
 
 async fn bind_daemon_socket(socket: &Path) -> Result<UnixListener> {
-    if socket.exists() {
-        if socket_has_live_listener(socket).await? {
-            bail!(
-                "daemon socket already accepts connections at {}; refusing to start a second rchd",
-                socket.display()
-            );
+    // When systemd is managing us as a unit it sets INVOCATION_ID. If the
+    // socket is currently held by another rchd (e.g. an agent's `rch exec`
+    // auto-spawned a detached one during a momentary daemon outage), exiting
+    // with FAILURE here causes systemd to restart-storm — which is what
+    // happened on css/ts2 (NRestarts in the tens of thousands). Wait
+    // patiently for the other process to free the socket instead; this
+    // keeps the systemd unit Active and avoids the storm entirely.
+    let managed_by_systemd = std::env::var_os("INVOCATION_ID").is_some();
+    let wait_backoff = Duration::from_secs(5);
+    let mut waited_logged = false;
+
+    loop {
+        if socket.exists() {
+            if socket_has_live_listener(socket).await? {
+                if managed_by_systemd {
+                    if !waited_logged {
+                        warn!(
+                            "daemon socket {} already serving; waiting for it to free \
+                             (systemd-managed, will take over when the current owner exits)",
+                            socket.display()
+                        );
+                        waited_logged = true;
+                    }
+                    tokio::time::sleep(wait_backoff).await;
+                    continue;
+                }
+                bail!(
+                    "daemon socket already accepts connections at {}; refusing to start a second rchd",
+                    socket.display()
+                );
+            }
+
+            std::fs::remove_file(socket).with_context(|| {
+                format!("failed to remove stale daemon socket {}", socket.display())
+            })?;
         }
 
-        std::fs::remove_file(socket).with_context(|| {
-            format!("failed to remove stale daemon socket {}", socket.display())
-        })?;
+        let listener = UnixListener::bind(socket)
+            .with_context(|| format!("failed to bind daemon socket {}", socket.display()))?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600)).with_context(
+                || {
+                    format!(
+                        "failed to set daemon socket permissions {}",
+                        socket.display()
+                    )
+                },
+            )?;
+        }
+
+        return Ok(listener);
     }
-
-    let listener = UnixListener::bind(socket)
-        .with_context(|| format!("failed to bind daemon socket {}", socket.display()))?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600)).with_context(
-            || {
-                format!(
-                    "failed to set daemon socket permissions {}",
-                    socket.display()
-                )
-            },
-        )?;
-    }
-
-    Ok(listener)
 }
 
 async fn socket_has_live_listener(socket: &Path) -> Result<bool> {
