@@ -45,8 +45,6 @@ pub struct LogConfig {
     pub format: LogFormat,
     /// Optional file path for rotating logs.
     pub file_path: Option<PathBuf>,
-    /// Maximum number of rotated log files to retain (older ones are pruned).
-    pub max_files: usize,
     /// Per-target log level overrides.
     pub targets: BTreeMap<String, String>,
     /// Include target in log output.
@@ -65,7 +63,6 @@ impl Default for LogConfig {
             level: "info".to_string(),
             format: LogFormat::Pretty,
             file_path: None,
-            max_files: 7,
             targets: BTreeMap::new(),
             with_target: true,
             with_thread_ids: true,
@@ -99,13 +96,6 @@ impl LogConfig {
             && !path.trim().is_empty()
         {
             config.file_path = Some(PathBuf::from(path));
-        }
-
-        if let Ok(max) = std::env::var("RCH_LOG_MAX_FILES")
-            && let Ok(parsed) = max.trim().parse::<usize>()
-            && parsed > 0
-        {
-            config.max_files = parsed;
         }
 
         if let Ok(targets) = std::env::var("RCH_LOG_TARGETS") {
@@ -178,12 +168,21 @@ fn build_writer(
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
         let file_name = path.file_name().unwrap_or_else(|| OsStr::new("rch.log"));
-        // Daily rotation with a retention cap so logs can't grow unbounded
-        // (the bare `rolling::daily` helper keeps every file forever).
+        // Retention cap for daily-rotated logs. The bare `rolling::daily`
+        // helper keeps every file forever, which is how a file-logging
+        // setup would silently fill the disk. Default to a week; allow
+        // operators to override via env without touching the public
+        // LogConfig struct (which would be a SemVer break since it has
+        // no #[non_exhaustive] attribute).
+        let max_files = std::env::var("RCH_LOG_MAX_FILES")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(7);
         let appender = tracing_appender::rolling::Builder::new()
             .rotation(tracing_appender::rolling::Rotation::DAILY)
             .filename_prefix(file_name.to_string_lossy().into_owned())
-            .max_log_files(config.max_files)
+            .max_log_files(max_files)
             .build(dir)
             .map_err(|e| anyhow::anyhow!("failed to build rolling log appender: {e}"))?;
         let (non_blocking, guard) = tracing_appender::non_blocking(appender);
