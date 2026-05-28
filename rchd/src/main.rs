@@ -1004,7 +1004,18 @@ mod tests {
         let socket_path = temp_dir.path().join("rch.sock");
         let _existing = UnixListener::bind(&socket_path).unwrap();
 
-        let error = bind_daemon_socket(&socket_path).await.unwrap_err();
+        // Use the explicit-flag inner function (managed_by_systemd = false)
+        // so this test is deterministic regardless of whether the test
+        // runner itself happens to be inside a systemd unit (which would
+        // set INVOCATION_ID and make the public bind_daemon_socket wait
+        // forever instead of bailing — i.e. the test would hang).
+        let error = bind_daemon_socket_with_mode(
+            &socket_path,
+            false,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             error
