@@ -146,21 +146,45 @@ pub struct DaemonContext {
     pub queue_timeout_secs: u64,
 }
 
+/// Result of one bind attempt — distinguishes "socket is held by another
+/// daemon" (a normal state we wait out under systemd) from real errors.
+enum BindAttempt {
+    Bound(UnixListener),
+    SocketHeld,
+}
+
 async fn bind_daemon_socket(socket: &Path) -> Result<UnixListener> {
-    // When systemd is managing us as a unit it sets INVOCATION_ID. If the
-    // socket is currently held by another rchd (e.g. an agent's `rch exec`
-    // auto-spawned a detached one during a momentary daemon outage), exiting
-    // with FAILURE here causes systemd to restart-storm — which is what
-    // happened on css/ts2 (NRestarts in the tens of thousands). Wait
-    // patiently for the other process to free the socket instead; this
-    // keeps the systemd unit Active and avoids the storm entirely.
+    // When systemd is managing us as a unit it sets INVOCATION_ID.
     let managed_by_systemd = std::env::var_os("INVOCATION_ID").is_some();
-    let wait_backoff = Duration::from_secs(5);
+    bind_daemon_socket_with_mode(socket, managed_by_systemd, Duration::from_secs(5)).await
+}
+
+/// Inner bind routine taking an explicit `managed_by_systemd` flag and
+/// `wait_backoff` (parameterized for tests).
+///
+/// If the socket is currently held by another rchd (e.g. an agent's `rch
+/// exec` auto-spawned a detached one during a momentary daemon outage),
+/// exiting with FAILURE causes systemd to restart-storm — which is what
+/// happened on css/ts2 (NRestarts in the tens of thousands). When
+/// systemd-managed, wait patiently for the other process to free the
+/// socket instead; this keeps the systemd unit Active and avoids the
+/// storm entirely.
+///
+/// We also retry on *any* error from the inner attempt when systemd-managed
+/// (probe timeouts, races on remove/bind, permission glitches): a one-shot
+/// failure must never crash-loop the unit. Standalone invocations preserve
+/// the original fail-fast behavior.
+async fn bind_daemon_socket_with_mode(
+    socket: &Path,
+    managed_by_systemd: bool,
+    wait_backoff: Duration,
+) -> Result<UnixListener> {
     let mut waited_logged = false;
 
     loop {
-        if socket.exists() {
-            if socket_has_live_listener(socket).await? {
+        match try_bind_daemon_socket(socket).await {
+            Ok(BindAttempt::Bound(listener)) => return Ok(listener),
+            Ok(BindAttempt::SocketHeld) => {
                 if managed_by_systemd {
                     if !waited_logged {
                         warn!(
@@ -178,30 +202,49 @@ async fn bind_daemon_socket(socket: &Path) -> Result<UnixListener> {
                     socket.display()
                 );
             }
-
-            std::fs::remove_file(socket).with_context(|| {
-                format!("failed to remove stale daemon socket {}", socket.display())
-            })?;
+            Err(e) if managed_by_systemd => {
+                // Don't restart-storm on transient errors. The most realistic
+                // one is the 300ms connect-probe timeout in
+                // socket_has_live_listener firing under load on the box that
+                // currently holds the socket.
+                warn!(
+                    "daemon socket bind attempt failed (systemd-managed, retrying in {}s): {e:#}",
+                    wait_backoff.as_secs()
+                );
+                tokio::time::sleep(wait_backoff).await;
+            }
+            Err(e) => return Err(e),
         }
-
-        let listener = UnixListener::bind(socket)
-            .with_context(|| format!("failed to bind daemon socket {}", socket.display()))?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600)).with_context(
-                || {
-                    format!(
-                        "failed to set daemon socket permissions {}",
-                        socket.display()
-                    )
-                },
-            )?;
-        }
-
-        return Ok(listener);
     }
+}
+
+async fn try_bind_daemon_socket(socket: &Path) -> Result<BindAttempt> {
+    if socket.exists() {
+        if socket_has_live_listener(socket).await? {
+            return Ok(BindAttempt::SocketHeld);
+        }
+        std::fs::remove_file(socket).with_context(|| {
+            format!("failed to remove stale daemon socket {}", socket.display())
+        })?;
+    }
+
+    let listener = UnixListener::bind(socket)
+        .with_context(|| format!("failed to bind daemon socket {}", socket.display()))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600)).with_context(
+            || {
+                format!(
+                    "failed to set daemon socket permissions {}",
+                    socket.display()
+                )
+            },
+        )?;
+    }
+
+    Ok(BindAttempt::Bound(listener))
 }
 
 async fn socket_has_live_listener(socket: &Path) -> Result<bool> {
@@ -982,6 +1025,66 @@ mod tests {
         let listener = bind_daemon_socket(&socket_path).await.unwrap();
 
         assert!(socket_path.exists());
+        drop(listener);
+    }
+
+    /// When systemd-managed and the socket is held by another process,
+    /// bind_daemon_socket must WAIT (never returning, never erroring), not
+    /// bail. This is the regression test for the css/ts2 restart-storm
+    /// (NRestarts → tens of thousands). We use the explicit-flag inner
+    /// function to avoid the test having to mutate process-global env vars.
+    #[tokio::test]
+    async fn test_bind_daemon_socket_waits_when_systemd_managed() {
+        let _guard = test_guard!();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let socket_path = temp_dir.path().join("rch.sock");
+        let _holder = UnixListener::bind(&socket_path).unwrap();
+
+        // 50 ms backoff (vs the 5 s production value) so the test is quick.
+        // We use timeout to assert the function is still waiting after the
+        // bail path would have returned. If the function ever returned (Ok
+        // or Err) within the timeout, the wait-loop is broken.
+        let result = tokio::time::timeout(
+            Duration::from_millis(400),
+            bind_daemon_socket_with_mode(&socket_path, true, Duration::from_millis(50)),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "bind_daemon_socket_with_mode returned within the timeout instead \
+             of waiting; that means systemd-managed mode would crash-loop. \
+             Got: {result:?}"
+        );
+    }
+
+    /// And once the holder releases the socket, the waiting bind should take
+    /// over cleanly — proving the "current owner exits → systemd rchd binds"
+    /// transition we depend on in production.
+    #[tokio::test]
+    async fn test_bind_daemon_socket_takes_over_after_holder_exits() {
+        let _guard = test_guard!();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let socket_path = temp_dir.path().join("rch.sock");
+        let holder = UnixListener::bind(&socket_path).unwrap();
+
+        let bind_path = socket_path.clone();
+        let bind_task = tokio::spawn(async move {
+            bind_daemon_socket_with_mode(&bind_path, true, Duration::from_millis(50)).await
+        });
+
+        // Give the waiter a couple of iterations on the held socket, then
+        // release it. The waiter should bind on its next loop iteration.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        drop(holder);
+        // The stale-socket file may still be present — that's fine, the
+        // waiter's try_bind_daemon_socket will probe (stale) → remove → bind.
+
+        let listener = tokio::time::timeout(Duration::from_secs(2), bind_task)
+            .await
+            .expect("timed out waiting for bind takeover")
+            .expect("bind_task panicked")
+            .expect("bind_daemon_socket_with_mode returned Err");
         drop(listener);
     }
 

@@ -3742,23 +3742,18 @@ fn which_rchd_path() -> PathBuf {
 }
 
 /// Ask systemd's user-scope manager to start `rchd.service` (idempotent if
-/// already active). Returns Ok only if a `rchd.service` user unit exists,
-/// the start command succeeds, AND the socket appears within the timeout.
+/// already active). Returns Ok only if `systemctl start` succeeds AND a
+/// daemon actually accepts a connection on `socket_path` within the timeout.
 /// Any failure returns Err so the caller falls back to direct spawn.
+///
+/// Note: this assumes the unit's configured socket path matches the one the
+/// caller wants. On hosts where they differ, `wait_for_live_socket` will
+/// time out and the caller falls back to nohup — same net effect as before.
 fn start_rchd_via_systemd_user(socket_path: &Path) -> Result<(), String> {
-    // Cheap probe: does the unit exist for this user? (`is-enabled` returns
-    // non-zero for missing units.) `--quiet` suppresses output.
-    let probe = Command::new("systemctl")
-        .args(["--user", "--quiet", "is-enabled", "rchd.service"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|e| format!("systemctl probe failed: {e}"))?;
-    if !probe.success() {
-        return Err("no systemd --user rchd.service unit".into());
-    }
-
-    // `systemctl start` is a no-op if the unit is already active.
+    // Skip the redundant `is-enabled` probe: `systemctl start` already
+    // fails cleanly for missing units (and also handles disabled-but-defined
+    // ones, which `is-enabled` would have wrongly excluded). It's idempotent
+    // when the unit is already active, so calling it on every miss is cheap.
     let start = Command::new("systemctl")
         .args(["--user", "start", "rchd.service"])
         .stdout(Stdio::null())
@@ -3766,14 +3761,35 @@ fn start_rchd_via_systemd_user(socket_path: &Path) -> Result<(), String> {
         .status()
         .map_err(|e| format!("systemctl start failed to invoke: {e}"))?;
     if !start.success() {
-        return Err(format!("systemctl start exited {start}"));
+        return Err(format!(
+            "systemctl --user start rchd.service exited {start}"
+        ));
     }
 
-    if wait_for_socket(socket_path, Duration::from_secs(5)) {
+    // Probe for a real live listener, not just a socket file. The file may
+    // exist as a leftover from a previous crash; `connect()` is the only
+    // reliable proof that *some* rchd is currently serving on the path.
+    if wait_for_live_socket(socket_path, Duration::from_secs(5)) {
         Ok(())
     } else {
-        Err("systemd started rchd but socket did not appear within 5s".into())
+        Err("systemd started rchd but no listener appeared on the socket within 5s".into())
     }
+}
+
+/// Like `wait_for_socket`, but actually opens a connection rather than just
+/// stat'ing the path. Avoids the stale-file false positive that would let
+/// the caller return Ok before the daemon is actually accepting clients.
+/// Cross-platform via the existing `daemon_socket_accepts_connections`
+/// helper (which is cfg-gated for unix vs not).
+fn wait_for_live_socket(socket_path: &Path, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if daemon_socket_accepts_connections(socket_path) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    daemon_socket_accepts_connections(socket_path)
 }
 
 fn spawn_rchd(rchd_path: &Path, socket_path: &Path) -> Result<(), String> {
@@ -3782,10 +3798,18 @@ fn spawn_rchd(rchd_path: &Path, socket_path: &Path) -> Result<(), String> {
     // restart-storm: an agent's `rch exec` would auto-spawn an rchd that
     // grabbed the socket and permanently blocked the systemd unit. Asking
     // systemd to start its own unit is idempotent and keeps a single owner.
-    if cfg!(target_os = "linux")
-        && start_rchd_via_systemd_user(socket_path).is_ok()
-    {
-        return Ok(());
+    if cfg!(target_os = "linux") {
+        match start_rchd_via_systemd_user(socket_path) {
+            Ok(()) => return Ok(()),
+            Err(reason) => {
+                // Log to stderr so deploy issues (missing unit, wrong socket
+                // path) are diagnosable rather than silently degrading.
+                eprintln!(
+                    "rch: not using systemd --user rchd.service ({reason}); \
+                     falling back to direct spawn"
+                );
+            }
+        }
     }
 
     let mut cmd = Command::new("nohup");
