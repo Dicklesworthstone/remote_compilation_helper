@@ -3769,27 +3769,11 @@ fn start_rchd_via_systemd_user(socket_path: &Path) -> Result<(), String> {
     // Probe for a real live listener, not just a socket file. The file may
     // exist as a leftover from a previous crash; `connect()` is the only
     // reliable proof that *some* rchd is currently serving on the path.
-    if wait_for_live_socket(socket_path, Duration::from_secs(5)) {
+    if wait_for_socket(socket_path, Duration::from_secs(5)) {
         Ok(())
     } else {
         Err("systemd started rchd but no listener appeared on the socket within 5s".into())
     }
-}
-
-/// Like `wait_for_socket`, but actually opens a connection rather than just
-/// stat'ing the path. Avoids the stale-file false positive that would let
-/// the caller return Ok before the daemon is actually accepting clients.
-/// Cross-platform via the existing `daemon_socket_accepts_connections`
-/// helper (which is cfg-gated for unix vs not).
-fn wait_for_live_socket(socket_path: &Path, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if daemon_socket_accepts_connections(socket_path) {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    daemon_socket_accepts_connections(socket_path)
 }
 
 fn spawn_rchd(rchd_path: &Path, socket_path: &Path) -> Result<(), String> {
@@ -3845,15 +3829,21 @@ fn spawn_rchd(rchd_path: &Path, socket_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Wait up to `timeout` for a daemon to actually accept a connection on
+/// `socket_path`. Previously this checked only file existence, which would
+/// falsely return Ok when a stale socket file lingered from a prior crash —
+/// the caller then hit "connection refused" on first use. Using the live
+/// probe is strictly more correct and benefits every call site
+/// (start_daemon_with_binary, start_rchd_via_systemd_user, etc.).
 fn wait_for_socket(socket_path: &Path, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        if socket_path.exists() {
+        if daemon_socket_accepts_connections(socket_path) {
             return true;
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    socket_path.exists()
+    daemon_socket_accepts_connections(socket_path)
 }
 
 fn start_daemon_with_binary(

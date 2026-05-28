@@ -153,6 +153,44 @@ enum BindAttempt {
     SocketHeld,
 }
 
+/// Send a sd_notify(3) message to systemd if NOTIFY_SOCKET is set. Silently
+/// no-op on macOS, on hosts without systemd, and for Type=simple units
+/// (which don't set NOTIFY_SOCKET — the current rchd.service config).
+///
+/// Adding this means the daemon also works under Type=notify without
+/// TimeoutStartSec killing it: we send READY=1 once the socket is bound,
+/// and STATUS=... updates while we're in the wait-for-socket loop.
+///
+/// Path-form sockets (the default on Debian/Ubuntu/etc.) are supported.
+/// Abstract sockets (env var starts with '@') need a libc::sendto with a
+/// sockaddr_un to encode the leading NUL byte — to avoid the new dep we
+/// skip them and let the operator know via debug! log. They're rare in
+/// practice; the unit can use Type=simple as a workaround.
+fn sd_notify(message: &str) {
+    #[cfg(target_os = "linux")]
+    {
+        let Some(raw) = std::env::var("NOTIFY_SOCKET").ok() else {
+            return;
+        };
+        if raw.is_empty() {
+            return;
+        }
+        if raw.starts_with('@') {
+            tracing::debug!(
+                "sd_notify: abstract NOTIFY_SOCKET not supported (would send {message:?})"
+            );
+            return;
+        }
+        if let Ok(sock) = std::os::unix::net::UnixDatagram::unbound() {
+            let _ = sock.send_to(message.as_bytes(), raw);
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = message;
+    }
+}
+
 async fn bind_daemon_socket(socket: &Path) -> Result<UnixListener> {
     // When systemd is managing us as a unit it sets INVOCATION_ID.
     let managed_by_systemd = std::env::var_os("INVOCATION_ID").is_some();
@@ -192,6 +230,9 @@ async fn bind_daemon_socket_with_mode(
                              (systemd-managed, will take over when the current owner exits)",
                             socket.display()
                         );
+                        // Visible via `systemctl --user status rchd` so
+                        // operators can tell *why* the unit looks idle.
+                        sd_notify("STATUS=waiting for another rchd to release the socket");
                         waited_logged = true;
                     }
                     tokio::time::sleep(wait_backoff).await;
@@ -292,6 +333,9 @@ async fn main() -> Result<()> {
 
     let listener = bind_daemon_socket(&cli.socket).await?;
     info!("Listening on {:?}", cli.socket);
+    // Inform systemd we're ready. No-op for Type=simple (the current unit)
+    // and on macOS; essential if anyone ever switches to Type=notify.
+    sd_notify("READY=1");
 
     // Register Prometheus metrics
     if let Err(e) = metrics::register_metrics() {
