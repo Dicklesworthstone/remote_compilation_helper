@@ -313,13 +313,17 @@ jobs:
       - build-linux-x86_64
       - build-linux-x86_64-musl
       - build-linux-aarch64
-      - build-macos-x86_64
       - build-macos-aarch64
-      # build-windows-x86_64 is intentionally NOT a publish dep: the windows
-      # build currently fails with pre-existing compile errors (E0282/E0425
-      # /E0432/E0433/E0599 in rch — unrelated to the rest of the workspace),
-      # and the fleet doesn't ship to Windows. If/when those errors get
-      # fixed, re-add it here so publish blocks until windows is good too.
+      # Intentionally NOT in publish.needs:
+      # - build-windows-x86_64: pre-existing compile errors in rch
+      #   (E0282/E0425/E0432/E0433/E0599), unrelated to the rest of the
+      #   workspace; fleet doesn't target Windows.
+      # - build-macos-x86_64: GitHub-hosted macos-13 (Intel) runner pool
+      #   has been queuing 20+ minutes per attempt, blocking the release
+      #   indefinitely. The fleet's only Mac is Apple Silicon (aarch64),
+      #   covered by build-macos-aarch64 above. The job still runs and its
+      #   artifact will upload if it eventually gets a runner.
+      # Re-add either when the corresponding build is reliable again.
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
