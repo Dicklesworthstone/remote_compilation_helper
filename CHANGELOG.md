@@ -14,6 +14,22 @@ No unreleased changes yet.
 
 ---
 
+## [v1.0.35] -- 2026-05-30 (release)
+
+### Fixes
+
+- **Stale-target reaper: don't reap a just-created sibling.** The reaper's
+  recency check used `find -type f`, which finds nothing in a per-job dir that
+  a *concurrent* build has just `mkdir`'d but not yet written a file into — so it
+  could delete an active build's target dir (the build then fails and must
+  retry). The check now considers the directory itself and any descendant
+  (`find <dir> -mmin -N`), so a freshly-created dir is kept by its own recent
+  mtime while genuinely-abandoned dirs are still reaped. Also corrected the
+  reaper's doc comments (it does not assert per-job dirs are "reused", and the
+  call awaits a quick SSH dispatch rather than adding zero latency).
+
+---
+
 ## [v1.0.34] -- 2026-05-30 (release)
 
 ### Worker disk hygiene
