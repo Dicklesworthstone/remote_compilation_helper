@@ -34,6 +34,14 @@ env:
   CARGO_TERM_COLOR: always
   # Reduce network retries for faster failure
   CARGO_NET_RETRY: 2
+  # Pin the toolchain at the env level so that *every* `cargo` invocation in
+  # this workflow uses nightly-2025-11-01 — the version dtolnay/rust-toolchain
+  # installs (with the per-job `targets:`) below. Without this, the in-repo
+  # rust-toolchain.toml (channel = "nightly") would redirect cargo to the
+  # *latest* nightly, which doesn't have the per-target stdlib installed → all
+  # release jobs fail with `can't find crate for \`core\``. RUSTUP_TOOLCHAIN
+  # takes precedence over both rust-toolchain.toml and `rustup override`.
+  RUSTUP_TOOLCHAIN: nightly-2025-11-01
 
 jobs:
   # Validate tag and plan the release
