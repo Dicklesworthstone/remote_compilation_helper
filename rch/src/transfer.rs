@@ -2219,6 +2219,132 @@ fi",
             Ok(())
         }
     }
+
+    /// Best-effort reaping of *stale* sibling per-job target dirs for this
+    /// project on the worker.
+    ///
+    /// rch gives every forwarded-`CARGO_TARGET_DIR` build a per-job target dir
+    /// (`.rch-target-<worker>-job-<id>-<ts>-<seq>`) and **reuses** that dir across
+    /// an agent's edit-compile-fix loop — in practice one dir was observed holding
+    /// 11.5h of incremental builds. So a per-job dir must *never* be removed merely
+    /// because a build finished; doing so would force a cold rebuild on the next
+    /// quick tweak. Instead we remove only siblings that have seen **no file
+    /// activity for `idle_hours`** — i.e. finished/abandoned sessions. A dir idle
+    /// that long cannot be a live job (active builds touch their dir continuously),
+    /// so this never races a concurrent build on the same project, even when
+    /// multiple agents build it on the same worker at once.
+    ///
+    /// The staleness check uses the newest *file* mtime, not the directory mtime:
+    /// the top-level dir mtime can go stale while deep incremental artifacts keep
+    /// changing, so a dir-mtime check could clip a live cache. The removal is
+    /// detached on the worker so it runs concurrently with the build instead of
+    /// adding latency. Failures are swallowed — reaping is opportunistic, never
+    /// load-bearing.
+    pub async fn reap_stale_sibling_per_job_target_dirs(
+        &self,
+        worker: &WorkerConfig,
+        idle_hours: u32,
+    ) {
+        let project_dir = self.remote_path();
+        let current = self.remote_cargo_target_dir_name.clone();
+
+        // Hard safety guards. Both values are rch-generated and should be simple
+        // path tokens; refuse anything that could escape the intended
+        // `<project_dir>/.rch-target-*` scope or inject shell syntax. The reap
+        // script embeds these unescaped (inside double quotes), so this guard is
+        // the security boundary.
+        if !is_safe_reap_path(&project_dir) || !is_safe_reap_token(&current) {
+            warn!(
+                "stale-target reap: refusing unsafe inputs (project_dir={:?}, current={:?})",
+                project_dir, current
+            );
+            return;
+        }
+        // Never below a 1h floor, no matter how the threshold was configured.
+        let idle_minutes = u64::from(idle_hours.max(1)) * 60;
+
+        if use_mock_transport(worker) {
+            debug!(
+                "Mock stale-target reap in {} on {} (idle>{}h)",
+                project_dir, worker.id, idle_hours
+            );
+            return;
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = (worker, idle_minutes);
+        }
+
+        #[cfg(unix)]
+        {
+            // For each per-job sibling dir: keep it if ANY file was modified within
+            // the idle window (live incremental cache); otherwise remove it.
+            // `-mmin -N -print -quit` stops at the first recent file, so active dirs
+            // are detected cheaply. This job's own dir is always excluded.
+            let script = format!(
+                "cd \"{project_dir}\" 2>/dev/null || exit 0; \
+                 for d in .rch-target-*-job-* .rch-target-*-pid-*; do \
+                 [ -d \"$d\" ] || continue; \
+                 [ \"$d\" = \"{current}\" ] && continue; \
+                 if find \"$d\" -type f -mmin -{idle_minutes} -print -quit 2>/dev/null | grep -q .; then continue; fi; \
+                 rm -rf -- \"$d\"; \
+                 done"
+            );
+            // Detach on the worker so a large reclaim runs concurrently with the
+            // build rather than blocking it. The script contains no single quotes
+            // (inputs are charset-restricted above), so single-quoting is safe.
+            let remote_command = format!("nohup sh -c '{script}' >/dev/null 2>&1 &");
+
+            let mut client = SshClient::new(worker.clone(), self.ssh_options.clone());
+            if let Err(e) = client.connect().await {
+                debug!(
+                    "stale-target reap skipped (ssh connect failed on {}): {}",
+                    worker.id, e
+                );
+                return;
+            }
+            if let Err(e) = client.execute(&remote_command).await {
+                debug!("stale-target reap dispatch failed on {}: {}", worker.id, e);
+            }
+            if let Err(e) = client.disconnect().await {
+                debug!(
+                    "stale-target reap: ssh disconnect warning on {}: {}",
+                    worker.id, e
+                );
+            }
+        }
+    }
+}
+
+/// Whether `s` is safe to use as the `cd` target of the stale-target reap
+/// script: absolute, at least two path segments deep (never `/` or a bare
+/// top-level dir), no `..`, and composed only of unambiguous path characters
+/// (no shell metacharacters, quotes, spaces, or globs).
+fn is_safe_reap_path(s: &str) -> bool {
+    s.starts_with('/')
+        && s.matches('/').count() >= 2
+        && !s.contains("..")
+        && s.len() <= 4096
+        && s.chars().all(is_safe_reap_char)
+}
+
+/// Whether `s` is safe to embed as a directory basename token in the reap
+/// script (the current job's dir name, used to exclude it from reaping).
+fn is_safe_reap_token(s: &str) -> bool {
+    !s.is_empty()
+        && s != "."
+        && s != ".."
+        && !s.contains('/')
+        && s.len() <= 255
+        && s.chars().all(is_safe_reap_char)
+}
+
+/// The only characters permitted in reap-script path inputs. Excludes every
+/// shell metacharacter (quotes, `$`, backtick, `*`, spaces, `;`, `|`, `&`, …)
+/// so the inputs cannot break out of their double-quoted context.
+fn is_safe_reap_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '_' | '.')
 }
 
 /// Result of a file synchronization operation.
@@ -2703,6 +2829,56 @@ mod tests {
         );
 
         assert_eq!(pipeline.remote_path(), "/tmp/rch/myproject/abc123");
+    }
+
+    #[test]
+    fn test_is_safe_reap_path_accepts_real_project_dirs() {
+        // The two shapes remote_path() actually produces.
+        assert!(is_safe_reap_path("/tmp/rch/myproject/abc123"));
+        assert!(is_safe_reap_path(
+            "/data/projects/coding_agent_session_search/9f8e7d6c"
+        ));
+    }
+
+    #[test]
+    fn test_is_safe_reap_path_rejects_dangerous_inputs() {
+        assert!(!is_safe_reap_path(""));
+        assert!(!is_safe_reap_path("/"));
+        assert!(!is_safe_reap_path("relative/path")); // not absolute
+        assert!(!is_safe_reap_path("/toplevel")); // < 2 segments
+        assert!(!is_safe_reap_path("/data/../etc")); // parent traversal
+        // Shell metacharacters / quotes / globs / spaces must all be rejected so
+        // the unescaped embedding in the reap script cannot be subverted.
+        for bad in [
+            "/data/projects/a b",
+            "/data/projects/a'b",
+            "/data/projects/a\"b",
+            "/data/projects/a$b",
+            "/data/projects/a`b",
+            "/data/projects/a;b",
+            "/data/projects/a|b",
+            "/data/projects/a*b",
+            "/data/projects/a&b",
+        ] {
+            assert!(!is_safe_reap_path(bad), "must reject {bad:?}");
+        }
+    }
+
+    #[test]
+    fn test_is_safe_reap_token_guards_basenames() {
+        // A real per-job dir basename is accepted.
+        assert!(is_safe_reap_token(
+            ".rch-target-ts2-job-29863360510034113-1780109474952075077-0"
+        ));
+        // Path separators, traversal, and shell metacharacters are rejected.
+        assert!(!is_safe_reap_token(""));
+        assert!(!is_safe_reap_token("."));
+        assert!(!is_safe_reap_token(".."));
+        assert!(!is_safe_reap_token("a/b"));
+        assert!(!is_safe_reap_token("a b"));
+        assert!(!is_safe_reap_token("a'b"));
+        assert!(!is_safe_reap_token("a$b"));
+        assert!(!is_safe_reap_token("a*b"));
     }
 
     #[test]

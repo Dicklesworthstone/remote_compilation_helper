@@ -3286,6 +3286,23 @@ fn remote_cargo_target_dir_name(build_id: Option<u64>, worker_id: &WorkerId) -> 
     format!(".rch-target-{safe_worker_id}-{job_id}-{timestamp}-{sequence}")
 }
 
+/// Idle threshold (hours) after which an abandoned per-job remote target dir is
+/// eligible for reaping. Defaults to 12h: empirically (ts2 disk-fill incident,
+/// 2026-05) active per-job dirs are touched within ~2h while abandoned ones sit
+/// idle 18h+, so 12h cleanly separates the two with margin. Overridable via
+/// `RCH_STALE_TARGET_REAP_HOURS`; floored at 1h so a misconfiguration can never
+/// reap a live incremental cache.
+fn stale_target_reap_idle_hours() -> u32 {
+    parse_stale_target_reap_idle_hours(std::env::var("RCH_STALE_TARGET_REAP_HOURS").ok())
+}
+
+fn parse_stale_target_reap_idle_hours(raw: Option<String>) -> u32 {
+    const DEFAULT_IDLE_HOURS: u32 = 12;
+    raw.and_then(|v| v.trim().parse::<u32>().ok())
+        .map(|hours| hours.max(1))
+        .unwrap_or(DEFAULT_IDLE_HOURS)
+}
+
 fn rewrite_cargo_target_dir_command_for_remote(
     command: &str,
     command_tokens: Option<&[String]>,
@@ -6186,6 +6203,17 @@ async fn execute_remote_compilation(
         "Sync complete: {} files, {} bytes in {}ms",
         sync_result.files_transferred, sync_result.bytes_transferred, sync_result.duration_ms
     );
+    // Opportunistically reclaim *abandoned* per-job target dirs for this project
+    // on the chosen worker. Only siblings idle past the threshold are removed —
+    // live incremental caches (reused across an agent's edit-compile-fix loop) are
+    // preserved, and the removal is detached on the worker, so this neither races
+    // a concurrent build on the same project nor adds latency. Best-effort; gated
+    // to the forwarded-CARGO_TARGET_DIR mode that creates per-job dirs.
+    if forwarded_cargo_target_dir.is_some() {
+        pipeline
+            .reap_stale_sibling_per_job_target_dirs(&worker_config, stale_target_reap_idle_hours())
+            .await;
+    }
     reporter.verbose(&format!(
         "[RCH] sync done: {} files, {} bytes in {}ms",
         sync_result.files_transferred, sync_result.bytes_transferred, sync_result.duration_ms
@@ -9162,6 +9190,22 @@ The file `x11.pc` needs to be installed and the PKG_CONFIG_PATH environment vari
         assert!(!first.contains('/'));
         assert!(!first.contains(' '));
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn test_parse_stale_target_reap_idle_hours() {
+        // Default when unset or unparseable.
+        assert_eq!(parse_stale_target_reap_idle_hours(None), 12);
+        assert_eq!(
+            parse_stale_target_reap_idle_hours(Some("not-a-number".into())),
+            12
+        );
+        assert_eq!(parse_stale_target_reap_idle_hours(Some(String::new())), 12);
+        // Honors a valid override (with surrounding whitespace).
+        assert_eq!(parse_stale_target_reap_idle_hours(Some("24".into())), 24);
+        assert_eq!(parse_stale_target_reap_idle_hours(Some("  6 ".into())), 6);
+        // Floors at 1h so a misconfiguration can never reap a live cache.
+        assert_eq!(parse_stale_target_reap_idle_hours(Some("0".into())), 1);
     }
 
     #[test]
