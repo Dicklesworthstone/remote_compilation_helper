@@ -2224,21 +2224,22 @@ fi",
     /// project on the worker.
     ///
     /// rch gives every forwarded-`CARGO_TARGET_DIR` build a per-job target dir
-    /// (`.rch-target-<worker>-job-<id>-<ts>-<seq>`) and **reuses** that dir across
-    /// an agent's edit-compile-fix loop — in practice one dir was observed holding
-    /// 11.5h of incremental builds. So a per-job dir must *never* be removed merely
-    /// because a build finished; doing so would force a cold rebuild on the next
-    /// quick tweak. Instead we remove only siblings that have seen **no file
-    /// activity for `idle_hours`** — i.e. finished/abandoned sessions. A dir idle
-    /// that long cannot be a live job (active builds touch their dir continuously),
-    /// so this never races a concurrent build on the same project, even when
-    /// multiple agents build it on the same worker at once.
+    /// (`.rch-target-<worker>-job-<id>-<ts>-<seq>`). Such a dir can stay in active
+    /// use far beyond a single command — a long-running build keeps writing into
+    /// it, and one was observed accumulating ~11.5h of build artifacts. So a
+    /// per-job dir must *never* be removed merely because some build finished; that
+    /// could clip a build still in flight. Instead we remove only siblings that
+    /// have seen **no file activity for `idle_hours`** — i.e. finished/abandoned
+    /// ones. A dir idle that long cannot be a live job (an active build touches its
+    /// dir continuously), so this never races a concurrent build on the same
+    /// project, even when multiple agents build it on the same worker at once.
     ///
     /// The staleness check uses the newest *file* mtime, not the directory mtime:
     /// the top-level dir mtime can go stale while deep incremental artifacts keep
-    /// changing, so a dir-mtime check could clip a live cache. The removal is
-    /// detached on the worker so it runs concurrently with the build instead of
-    /// adding latency. Failures are swallowed — reaping is opportunistic, never
+    /// changing, so a dir-mtime check could clip a live cache. The removal *itself*
+    /// is detached on the worker (a backgrounded `rm`), so the potentially-large
+    /// reclaim runs concurrently with the build — only a quick SSH dispatch is
+    /// awaited here. Failures are swallowed — reaping is opportunistic, never
     /// load-bearing.
     pub async fn reap_stale_sibling_per_job_target_dirs(
         &self,

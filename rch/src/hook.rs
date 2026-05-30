@@ -6204,11 +6204,11 @@ async fn execute_remote_compilation(
         sync_result.files_transferred, sync_result.bytes_transferred, sync_result.duration_ms
     );
     // Opportunistically reclaim *abandoned* per-job target dirs for this project
-    // on the chosen worker. Only siblings idle past the threshold are removed —
-    // live incremental caches (reused across an agent's edit-compile-fix loop) are
-    // preserved, and the removal is detached on the worker, so this neither races
-    // a concurrent build on the same project nor adds latency. Best-effort; gated
-    // to the forwarded-CARGO_TARGET_DIR mode that creates per-job dirs.
+    // on the chosen worker. Only siblings with no file activity past the threshold
+    // are removed, so any dir still in active use is preserved and this never races
+    // a concurrent build on the same project. The heavy removal is detached on the
+    // worker (a backgrounded rm); only a quick SSH dispatch is awaited here.
+    // Best-effort; gated to the forwarded-CARGO_TARGET_DIR mode that makes per-job dirs.
     if forwarded_cargo_target_dir.is_some() {
         pipeline
             .reap_stale_sibling_per_job_target_dirs(&worker_config, stale_target_reap_idle_hours())
