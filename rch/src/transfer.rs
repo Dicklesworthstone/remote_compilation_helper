@@ -2234,13 +2234,16 @@ fi",
     /// dir continuously), so this never races a concurrent build on the same
     /// project, even when multiple agents build it on the same worker at once.
     ///
-    /// The staleness check uses the newest *file* mtime, not the directory mtime:
-    /// the top-level dir mtime can go stale while deep incremental artifacts keep
-    /// changing, so a dir-mtime check could clip a live cache. The removal *itself*
-    /// is detached on the worker (a backgrounded `rm`), so the potentially-large
-    /// reclaim runs concurrently with the build — only a quick SSH dispatch is
-    /// awaited here. Failures are swallowed — reaping is opportunistic, never
-    /// load-bearing.
+    /// The staleness check looks at the dir itself *and* any descendant (file or
+    /// subdir): a recent deep file means an active build (a top-dir-mtime-only
+    /// check would miss it, because the top dir mtime can go stale while deep
+    /// incremental artifacts keep changing), while a recent *dir* mtime means a
+    /// freshly-created target — e.g. a concurrent build that has `mkdir`'d its dir
+    /// but not yet written a file (a files-only check would wrongly reap it). The
+    /// removal *itself* is detached on the worker (a backgrounded `rm`), so the
+    /// potentially-large reclaim runs concurrently with the build — only a quick
+    /// SSH dispatch is awaited here. Failures are swallowed — reaping is
+    /// opportunistic, never load-bearing.
     pub async fn reap_stale_sibling_per_job_target_dirs(
         &self,
         worker: &WorkerConfig,
@@ -2279,16 +2282,19 @@ fi",
 
         #[cfg(unix)]
         {
-            // For each per-job sibling dir: keep it if ANY file was modified within
-            // the idle window (live incremental cache); otherwise remove it.
-            // `-mmin -N -print -quit` stops at the first recent file, so active dirs
-            // are detected cheaply. This job's own dir is always excluded.
+            // For each per-job sibling dir: keep it if the dir OR any descendant
+            // was modified within the idle window (an active or just-created
+            // build); otherwise remove it. `-mmin -N -print -quit` stops at the
+            // first recent entry, so live dirs are detected cheaply. Deliberately
+            // NO `-type f`: an empty, just-`mkdir`'d dir (a concurrent build's
+            // target before its first write) has zero files but a recent dir
+            // mtime, and must be kept. This job's own dir is always excluded.
             let script = format!(
                 "cd \"{project_dir}\" 2>/dev/null || exit 0; \
                  for d in .rch-target-*-job-* .rch-target-*-pid-*; do \
                  [ -d \"$d\" ] || continue; \
                  [ \"$d\" = \"{current}\" ] && continue; \
-                 if find \"$d\" -type f -mmin -{idle_minutes} -print -quit 2>/dev/null | grep -q .; then continue; fi; \
+                 if find \"$d\" -mmin -{idle_minutes} -print -quit 2>/dev/null | grep -q .; then continue; fi; \
                  rm -rf -- \"$d\"; \
                  done"
             );
