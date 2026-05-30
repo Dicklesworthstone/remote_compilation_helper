@@ -198,7 +198,10 @@ jobs:
           git clone --depth 1 https://github.com/Dicklesworthstone/rich_rust.git /tmp/dp/rich_rust
           git clone --depth 1 https://github.com/Dicklesworthstone/toon_rust.git /tmp/dp/toon_rust
           git clone --depth 1 https://github.com/Dicklesworthstone/frankentui.git /tmp/dp/frankentui
-          sudo ln -sf /tmp/dp /dp 2>/dev/null || true
+          # macOS '/' is read-only under SIP on hosted runners — see the
+          # matching note in build-macos-aarch64. Patch the workspace's
+          # absolute /dp/ path deps instead of trying to symlink at /.
+          sed -i '' 's|/dp/|/tmp/dp/|g' Cargo.toml
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly-2025-11-01
@@ -234,7 +237,12 @@ jobs:
           git clone --depth 1 https://github.com/Dicklesworthstone/rich_rust.git /tmp/dp/rich_rust
           git clone --depth 1 https://github.com/Dicklesworthstone/toon_rust.git /tmp/dp/toon_rust
           git clone --depth 1 https://github.com/Dicklesworthstone/frankentui.git /tmp/dp/frankentui
-          sudo ln -sf /tmp/dp /dp 2>/dev/null || true
+          # macOS '/' is read-only under SIP on hosted runners, so the old
+          # `sudo ln -sf /tmp/dp /dp 2>/dev/null || true` silently failed and
+          # the build then couldn't find /dp/frankentui/... Patch the
+          # workspace's absolute /dp/ path deps to point at the writable
+          # clone dir instead. (BSD sed needs the empty backup arg.)
+          sed -i '' 's|/dp/|/tmp/dp/|g' Cargo.toml
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly-2025-11-01
