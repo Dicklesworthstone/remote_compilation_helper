@@ -14,6 +14,27 @@ No unreleased changes yet.
 
 ---
 
+## [v1.0.34] -- 2026-05-30 (release)
+
+### Worker disk hygiene
+
+- **Reap abandoned per-job remote target directories.** Forwarded-`CARGO_TARGET_DIR`
+  builds get a per-job target dir on the worker
+  (`.rch-target-<worker>-job-<id>-<ts>-<seq>`) that rch previously never cleaned
+  up, so they accumulated until worker disks filled (observed on a worker whose
+  single btrfs root hit 100% from ~600G of stale per-job dirs). After each sync,
+  rch now opportunistically removes sibling per-job dirs on the chosen worker
+  whose **newest file is older than an idle threshold** (default **12h**,
+  overridable via `RCH_STALE_TARGET_REAP_HOURS`, floored at 1h). Because per-job
+  dirs are *reused* across an agent's edit-compile-fix loop, the reaper keys on
+  recent file activity so an in-progress incremental cache is always preserved —
+  it never clips a live build or races a concurrent build on the same project,
+  even with multiple agents building it on the same worker. The removal is
+  detached on the worker and best-effort, so it adds no latency to the build.
+  Inputs are charset-guarded before being embedded in the remote reap script.
+
+---
+
 ## [v1.0.25] -- 2026-05-14
 
 ### Dependency and release maintenance
