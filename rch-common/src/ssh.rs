@@ -250,30 +250,28 @@ impl SshClient {
             builder.keyfile(identity_path.as_ref());
         }
 
-        // Enable control master for connection reuse
-        if control_master {
-            if let Some(idle) = self.options.control_persist_idle {
-                if idle.is_zero() {
-                    builder.control_persist(ControlPersist::ClosedAfterInitialConnection);
-                } else {
-                    match usize::try_from(idle.as_secs()) {
-                        Ok(secs) => {
-                            if let Some(nonzero) = NonZeroUsize::new(secs) {
-                                builder.control_persist(ControlPersist::IdleFor(nonzero));
-                            } else {
-                                builder
-                                    .control_persist(ControlPersist::ClosedAfterInitialConnection);
-                            }
-                        }
-                        Err(_) => {
-                            warn!(
-                                "control_persist_idle too large ({}s); ignoring override",
-                                idle.as_secs()
-                            );
-                        }
-                    }
-                }
+        // Always pin ControlPersist explicitly. The openssh crate ALWAYS
+        // spawns a control-master; leaving it unset defaults to
+        // `ControlPersist=yes` (Forever), which leaks a master process for
+        // every short-lived per-call SSH (telemetry/health/capabilities run
+        // with control_master=false). ClosedAfterInitialConnection lets
+        // non-mux masters self-terminate; only the explicit mux-reuse path
+        // with a configured idle keeps a warm master.
+        match control_persist_mode(control_master, self.options.control_persist_idle) {
+            ControlPersistMode::IdleFor(nonzero) => {
+                builder.control_persist(ControlPersist::IdleFor(nonzero));
             }
+            ControlPersistMode::TooLarge(secs) => {
+                warn!("control_persist_idle too large ({secs}s); closing after initial connection");
+                builder.control_persist(ControlPersist::ClosedAfterInitialConnection);
+            }
+            ControlPersistMode::Closed => {
+                builder.control_persist(ControlPersist::ClosedAfterInitialConnection);
+            }
+        }
+
+        // Control-master socket directory only matters when reusing connections.
+        if control_master {
 
             // Use a short control directory path to stay within the Unix domain
             // socket path limit (104 bytes on macOS, 108 on Linux).  The openssh
@@ -1240,5 +1238,67 @@ mod tests {
                 assert!(escaped.is_some(), "Should escape: {:?}", value);
             }
         }
+    }
+}
+
+
+/// How an SSH session's `ControlPersist` should be configured.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ControlPersistMode {
+    /// Close the control-master once the initial connection ends (ControlPersist=no).
+    Closed,
+    /// Keep a warm control-master for the given idle seconds (ControlPersist=Ns).
+    IdleFor(NonZeroUsize),
+    /// Requested idle exceeded usize; caller falls back to Closed.
+    TooLarge(u64),
+}
+
+/// Decide `ControlPersist` for an SSH session. A warm master is kept ONLY for the
+/// explicit connection-reuse path (`control_master` + a configured non-zero idle);
+/// every other case closes after the initial connection so per-call SSH sessions
+/// (telemetry/health/capabilities) cannot leak `ControlPersist=yes` masters.
+fn control_persist_mode(control_master: bool, idle: Option<Duration>) -> ControlPersistMode {
+    match idle {
+        Some(idle) if control_master && !idle.is_zero() => match usize::try_from(idle.as_secs()) {
+            Ok(secs) => match NonZeroUsize::new(secs) {
+                Some(nonzero) => ControlPersistMode::IdleFor(nonzero),
+                None => ControlPersistMode::Closed,
+            },
+            Err(_) => ControlPersistMode::TooLarge(idle.as_secs()),
+        },
+        _ => ControlPersistMode::Closed,
+    }
+}
+
+#[cfg(test)]
+mod control_persist_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn non_mux_sessions_never_persist_forever() {
+        // The per-call paths (control_master=false) must close after use.
+        assert_eq!(control_persist_mode(false, None), ControlPersistMode::Closed);
+        assert_eq!(
+            control_persist_mode(false, Some(Duration::from_secs(60))),
+            ControlPersistMode::Closed
+        );
+    }
+
+    #[test]
+    fn mux_without_idle_closes() {
+        assert_eq!(control_persist_mode(true, None), ControlPersistMode::Closed);
+        assert_eq!(
+            control_persist_mode(true, Some(Duration::from_secs(0))),
+            ControlPersistMode::Closed
+        );
+    }
+
+    #[test]
+    fn mux_with_idle_keeps_warm() {
+        assert_eq!(
+            control_persist_mode(true, Some(Duration::from_secs(60))),
+            ControlPersistMode::IdleFor(NonZeroUsize::new(60).unwrap())
+        );
     }
 }
