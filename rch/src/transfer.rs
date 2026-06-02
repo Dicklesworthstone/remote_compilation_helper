@@ -265,7 +265,24 @@ where
             sleep(delay).await;
         }
 
-        match operation().await {
+        let elapsed_ms = start.elapsed().as_millis();
+        let remaining_ms = if elapsed_ms >= config.total_timeout_ms as u128 {
+            0
+        } else {
+            config.total_timeout_ms - elapsed_ms as u64
+        };
+        let attempt_timeout = std::time::Duration::from_millis(remaining_ms.max(1));
+
+        let operation_result = match tokio::time::timeout(attempt_timeout, operation()).await {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::anyhow!(
+                "{}: timed out after {}ms",
+                operation_name,
+                config.total_timeout_ms
+            )),
+        };
+
+        match operation_result {
             Ok(result) => {
                 if attempt > 0 {
                     info!(
@@ -308,7 +325,9 @@ where
 /// Execute a tokio Command with retry logic.
 ///
 /// Wraps the command execution in retry_with_backoff, retrying on transient
-/// rsync/SSH errors.
+/// rsync/SSH errors. The retry timeout bounds each attempt; timed-out child
+/// processes are killed on drop so rsync/SSH cannot keep running in the
+/// background.
 async fn execute_rsync_with_retry(
     config: &RetryConfig,
     operation_name: &str,
@@ -316,7 +335,12 @@ async fn execute_rsync_with_retry(
 ) -> Result<std::process::Output> {
     retry_with_backoff(config, operation_name, || async {
         let mut cmd = build_command();
-        cmd.output()
+        cmd.kill_on_drop(true);
+        let child = cmd
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("rsync I/O error: {}", e))?;
+        child
+            .wait_with_output()
             .await
             .map_err(|e| anyhow::anyhow!("rsync I/O error: {}", e))
     })
@@ -575,6 +599,16 @@ impl TransferPipeline {
     pub fn with_estimated_transfer_bytes(mut self, bytes: Option<u64>) -> Self {
         self.estimated_transfer_bytes = bytes;
         self
+    }
+
+    fn effective_rsync_retry_config(&self) -> RetryConfig {
+        let mut retry = self.transfer_config.retry.clone();
+        if let Some(max_transfer_time_ms) = self.transfer_config.max_transfer_time_ms
+            && max_transfer_time_ms > 0
+        {
+            retry.total_timeout_ms = max_transfer_time_ms;
+        }
+        retry
     }
 
     /// Override the remote project path used for sync and command execution.
@@ -1409,16 +1443,16 @@ fi",
         let start = std::time::Instant::now();
 
         // Execute rsync with retry logic for transient errors
-        let output =
-            execute_rsync_with_retry(&self.transfer_config.retry, "sync_to_remote", || {
-                self.build_sync_command(
-                    worker,
-                    &destination,
-                    &escaped_remote_path,
-                    &effective_excludes,
-                )
-            })
-            .await?;
+        let retry_config = self.effective_rsync_retry_config();
+        let output = execute_rsync_with_retry(&retry_config, "sync_to_remote", || {
+            self.build_sync_command(
+                worker,
+                &destination,
+                &escaped_remote_path,
+                &effective_excludes,
+            )
+        })
+        .await?;
 
         let duration = start.elapsed();
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -1530,10 +1564,14 @@ fi",
             cmd.as_std().get_args().collect::<Vec<_>>()
         );
 
-        let (output, duration_ms) = run_command_streaming(cmd, |line| {
-            on_line(line);
-        })
-        .await?;
+        let retry_config = self.effective_rsync_retry_config();
+        let transfer_timeout =
+            std::time::Duration::from_millis(retry_config.total_timeout_ms.max(1));
+        let (output, duration_ms) =
+            run_command_streaming(cmd, "sync_to_remote_streaming", transfer_timeout, |line| {
+                on_line(line);
+            })
+            .await?;
 
         Ok(SyncResult {
             bytes_transferred: parse_rsync_bytes(&output),
@@ -2074,11 +2112,11 @@ fi",
         let start = std::time::Instant::now();
 
         // Execute rsync with retry logic for transient errors
-        let output =
-            execute_rsync_with_retry(&self.transfer_config.retry, "retrieve_artifacts", || {
-                self.build_retrieve_command(worker, &escaped_remote_path, artifact_patterns)
-            })
-            .await?;
+        let retry_config = self.effective_rsync_retry_config();
+        let output = execute_rsync_with_retry(&retry_config, "retrieve_artifacts", || {
+            self.build_retrieve_command(worker, &escaped_remote_path, artifact_patterns)
+        })
+        .await?;
 
         let duration = start.elapsed();
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -2164,9 +2202,17 @@ fi",
             cmd.as_std().get_args().collect::<Vec<_>>()
         );
 
-        let (output, duration_ms) = run_command_streaming(cmd, |line| {
-            on_line(line);
-        })
+        let retry_config = self.effective_rsync_retry_config();
+        let transfer_timeout =
+            std::time::Duration::from_millis(retry_config.total_timeout_ms.max(1));
+        let (output, duration_ms) = run_command_streaming(
+            cmd,
+            "retrieve_artifacts_streaming",
+            transfer_timeout,
+            |line| {
+                on_line(line);
+            },
+        )
         .await?;
 
         Ok(SyncResult {
@@ -2478,11 +2524,17 @@ fn parse_rsync_total_files(output: &str) -> Option<u32> {
     None
 }
 
-async fn run_command_streaming<F>(mut cmd: Command, mut on_line: F) -> Result<(String, u64)>
+async fn run_command_streaming<F>(
+    mut cmd: Command,
+    operation_name: &str,
+    operation_timeout: std::time::Duration,
+    mut on_line: F,
+) -> Result<(String, u64)>
 where
     F: FnMut(&str),
 {
     let start = TokioInstant::now();
+    cmd.kill_on_drop(true);
     let mut child = cmd.spawn().context("Failed to execute rsync")?;
 
     let stdout = child.stdout.take().context("Failed to capture stdout")?;
@@ -2521,18 +2573,32 @@ where
 
     let mut combined = String::new();
     const MAX_RSYNC_OUTPUT: usize = 10 * 1024 * 1024;
-    while let Some(text) = rx.recv().await {
-        on_line(&text);
-        if combined.len() < MAX_RSYNC_OUTPUT {
-            combined.push_str(&text);
-            combined.push('\n');
-            if combined.len() >= MAX_RSYNC_OUTPUT {
-                combined.push_str("...[output truncated]...\n");
+    let status = match tokio::time::timeout(operation_timeout, async {
+        while let Some(text) = rx.recv().await {
+            on_line(&text);
+            if combined.len() < MAX_RSYNC_OUTPUT {
+                combined.push_str(&text);
+                combined.push('\n');
+                if combined.len() >= MAX_RSYNC_OUTPUT {
+                    combined.push_str("...[output truncated]...\n");
+                }
             }
         }
-    }
 
-    let status = child.wait().await.context("Failed to wait on rsync")?;
+        child.wait().await.context("Failed to wait on rsync")
+    })
+    .await
+    {
+        Ok(status) => status?,
+        Err(_) => {
+            let _ = child.kill().await;
+            anyhow::bail!(
+                "{}: timed out after {}ms",
+                operation_name,
+                operation_timeout.as_millis()
+            );
+        }
+    };
     if !status.success() {
         return Err(TransferError::SyncFailed {
             reason: "rsync failed".to_string(),
@@ -4443,6 +4509,91 @@ Total file size: 123 bytes";
         assert_eq!(config.max_transfer_time_ms, Some(5000));
         assert_eq!(config.bwlimit_kbps, Some(10000));
         assert_eq!(config.estimated_bandwidth_bps, Some(10 * 1024 * 1024));
+    }
+
+    #[test]
+    fn test_effective_rsync_retry_config_uses_transfer_time_override() {
+        let _guard = test_guard!();
+        let transfer_config = TransferConfig {
+            max_transfer_time_ms: Some(5000),
+            retry: RetryConfig {
+                total_timeout_ms: 30000,
+                ..RetryConfig::default()
+            },
+            ..TransferConfig::default()
+        };
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/tmp/test"),
+            "test-project".to_string(),
+            "abc123".to_string(),
+            transfer_config,
+        );
+
+        assert_eq!(
+            pipeline.effective_rsync_retry_config().total_timeout_ms,
+            5000
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_execute_rsync_with_retry_times_out_hanging_child() {
+        let _guard = test_guard!();
+        let retry_config = RetryConfig {
+            max_attempts: 1,
+            total_timeout_ms: 25,
+            jitter_factor: 0.0,
+            ..RetryConfig::default()
+        };
+        let start = std::time::Instant::now();
+
+        let err = execute_rsync_with_retry(&retry_config, "test_hanging_rsync", || {
+            let mut cmd = Command::new("sleep");
+            cmd.arg("5");
+            cmd.stdout(std::process::Stdio::piped());
+            cmd.stderr(std::process::Stdio::piped());
+            cmd
+        })
+        .await
+        .expect_err("hanging child should time out");
+
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "timeout should stop the child promptly"
+        );
+        assert!(
+            err.to_string()
+                .contains("test_hanging_rsync: timed out after 25ms")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_run_command_streaming_times_out_hanging_child() {
+        let _guard = test_guard!();
+        let mut cmd = Command::new("sleep");
+        cmd.arg("5");
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+        let start = std::time::Instant::now();
+
+        let err = run_command_streaming(
+            cmd,
+            "test_streaming_rsync",
+            std::time::Duration::from_millis(25),
+            |_| {},
+        )
+        .await
+        .expect_err("streaming child should time out");
+
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "timeout should stop the streaming child promptly"
+        );
+        assert!(
+            err.to_string()
+                .contains("test_streaming_rsync: timed out after 25ms")
+        );
     }
 
     #[test]
