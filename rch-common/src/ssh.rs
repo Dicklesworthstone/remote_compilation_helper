@@ -59,8 +59,12 @@ pub struct SshOptions {
     pub server_alive_interval: Option<Duration>,
     /// How long the SSH ControlMaster should remain alive while idle.
     ///
-    /// `None` preserves the OpenSSH crate default (`ControlPersist=yes`).
-    /// `Some(0s)` sets `ControlPersist=no` (close after initial connection).
+    /// Only applies when `control_master` is true (connection reuse). `Some(n)`
+    /// with n > 0 keeps the master warm for n idle seconds (`ControlPersist=Ns`).
+    /// `Some(0s)`/`None`, or ANY non-mux per-call session, closes the master
+    /// after the initial connection (`ControlPersist=no`). The OpenSSH crate
+    /// `ControlPersist=yes` (forever) default is never used — it leaked a
+    /// master process per per-call SSH. See `control_persist_mode`.
     pub control_persist_idle: Option<Duration>,
     /// SSH control master mode for connection reuse.
     pub control_master: bool,
