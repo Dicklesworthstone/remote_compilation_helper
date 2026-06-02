@@ -67,7 +67,7 @@ fn test_exec_refuses_non_compilation_local_fallback_when_remote_required() {
     );
     assert_contains(
         &stderr,
-        "remote required; refusing local fallback (non-compilation command)",
+        "remote required; refusing local fallback [RCH-E301] (non-compilation command)",
     );
 
     crate::test_log!(

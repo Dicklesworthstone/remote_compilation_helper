@@ -370,15 +370,43 @@ fn local_fallback_command(command: &str) -> std::process::Command {
     child
 }
 
-fn exit_with_local_fallback(command: &str, reporter: &HookReporter, reason: &str) -> ! {
-    if exec_requires_remote() {
-        reporter.summary(&format!(
-            "[RCH] remote required; refusing local fallback ({reason})"
-        ));
-        std::process::exit(EXIT_BUILD_ERROR);
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalFallbackRefusal {
+    RemoteRequired,
+}
 
-    match local_fallback_command(command).status() {
+fn local_fallback_command_for_policy(
+    command: &str,
+    require_remote: bool,
+) -> Result<std::process::Command, LocalFallbackRefusal> {
+    if require_remote {
+        Err(LocalFallbackRefusal::RemoteRequired)
+    } else {
+        Ok(local_fallback_command(command))
+    }
+}
+
+fn remote_required_refusal_summary(reason: &str) -> String {
+    if reason == "non-compilation command" {
+        format!(
+            "[RCH] remote required; refusing local fallback [{}] ({reason})",
+            ErrorCode::BuildUnknownCommand.code_string()
+        )
+    } else {
+        format!("[RCH] remote required; refusing local fallback ({reason})")
+    }
+}
+
+fn exit_with_local_fallback(command: &str, reporter: &HookReporter, reason: &str) -> ! {
+    let mut child = match local_fallback_command_for_policy(command, exec_requires_remote()) {
+        Ok(child) => child,
+        Err(LocalFallbackRefusal::RemoteRequired) => {
+            reporter.summary(&remote_required_refusal_summary(reason));
+            std::process::exit(EXIT_BUILD_ERROR);
+        }
+    };
+
+    match child.status() {
         Ok(status) => std::process::exit(status.code().unwrap_or(1)),
         Err(error) => {
             reporter.summary(&format!("[RCH] local fallback failed: {error}"));
@@ -6610,6 +6638,53 @@ mod tests {
                 std::ffi::OsStr::new("-c"),
                 std::ffi::OsStr::new("cargo test -p rch")
             ]
+        );
+    }
+
+    #[test]
+    fn remote_required_fallback_refuses_before_building_local_shell_command() {
+        let _guard = test_guard!();
+        let command = "bash -lc 'cargo test --lib focused_case -- --nocapture'";
+
+        assert!(
+            matches!(
+                local_fallback_command_for_policy(command, true),
+                Err(LocalFallbackRefusal::RemoteRequired)
+            ),
+            "remote-required policy must refuse before constructing a local shell fallback"
+        );
+        assert!(
+            local_fallback_command_for_policy(command, false).is_ok(),
+            "ordinary local fallback behavior remains available when remote is not required"
+        );
+    }
+
+    #[test]
+    fn remote_required_non_compilation_shell_wrapped_cargo_has_stable_refusal_code() {
+        let _guard = test_guard!();
+        let parts = vec![
+            "bash".to_string(),
+            "-lc".to_string(),
+            "cargo test --lib focused_case -- --nocapture".to_string(),
+        ];
+        let command = join_exec_command(&parts);
+        let classification = classify_command(&command);
+
+        assert!(
+            !classification.is_compilation,
+            "global classification should keep arbitrary shell wrappers out of hook-mode offload"
+        );
+        assert!(
+            matches!(
+                local_fallback_command_for_policy(&command, true),
+                Err(LocalFallbackRefusal::RemoteRequired)
+            ),
+            "RCH_REQUIRE_REMOTE must prevent the shell from running locally even when classification rejects it"
+        );
+        assert!(remote_required_refusal_summary("non-compilation command").contains("RCH-E301"));
+        assert!(
+            !remote_required_refusal_summary("dependency preflight failed").contains("RCH-E301"),
+            "dependency-topology refusals should remain distinguishable from command-classification refusals"
         );
     }
 
