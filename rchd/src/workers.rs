@@ -397,10 +397,23 @@ impl WorkerState {
 
     /// Update worker capabilities.
     pub async fn set_capabilities(&self, capabilities: WorkerCapabilities) {
-        let pressure =
-            evaluate_pressure_policy(&capabilities, None, &DiskPressurePolicyConfig::default());
+        let pressure_config = DiskPressurePolicyConfig::default();
+        let pressure = evaluate_pressure_policy(&capabilities, None, &pressure_config);
         *self.capabilities.write().await = capabilities;
-        *self.pressure_assessment.write().await = pressure;
+
+        let now_ms = current_unix_ms();
+        let mut current = self.pressure_assessment.write().await;
+        if pressure.state != crate::disk_pressure::PressureState::Critical
+            && refresh_preserved_pressure_age(&mut current, &pressure_config, now_ms)
+        {
+            current.disk_free_gb = pressure.disk_free_gb;
+            current.disk_total_gb = pressure.disk_total_gb;
+            current.disk_free_ratio = pressure.disk_free_ratio;
+            current.evaluated_at_unix_ms = now_ms;
+            return;
+        }
+
+        *current = pressure;
     }
 
     /// Get worker capabilities.
@@ -790,6 +803,29 @@ fn current_unix_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(duration_millis_i64)
         .unwrap_or_default()
+}
+
+fn refresh_preserved_pressure_age(
+    assessment: &mut PressureAssessment,
+    config: &DiskPressurePolicyConfig,
+    now_ms: i64,
+) -> bool {
+    if !assessment.telemetry_fresh {
+        return false;
+    }
+
+    let Some(previous_age_secs) = assessment.telemetry_age_secs else {
+        return false;
+    };
+
+    let elapsed_secs = now_ms
+        .saturating_sub(assessment.evaluated_at_unix_ms)
+        .max(0) as u64
+        / 1_000;
+    let age_secs = previous_age_secs.saturating_add(elapsed_secs);
+    assessment.telemetry_age_secs = Some(age_secs);
+    assessment.telemetry_fresh = age_secs <= config.telemetry_stale_after.as_secs();
+    assessment.telemetry_fresh
 }
 
 // ============================================================================
@@ -1859,6 +1895,83 @@ mod tests {
         let retrieved = state.capabilities().await;
         assert_eq!(retrieved.rustc_version, Some("1.87.0".to_string()));
         assert_eq!(retrieved.bun_version, Some("1.2.0".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_capability_refresh_preserves_fresh_pressure_telemetry() {
+        let state = WorkerState::new(test_config("test"));
+        state
+            .set_pressure_assessment(crate::disk_pressure::PressureAssessment {
+                state: crate::disk_pressure::PressureState::Healthy,
+                confidence: crate::disk_pressure::PressureConfidence::High,
+                reason_code: "all_pressure_rules_within_threshold".to_string(),
+                policy_rule: "fresh_telemetry".to_string(),
+                disk_free_gb: Some(50.0),
+                disk_total_gb: Some(100.0),
+                disk_free_ratio: Some(0.5),
+                disk_io_util_pct: Some(0.0),
+                memory_pressure: Some(10.0),
+                telemetry_age_secs: Some(10),
+                telemetry_fresh: true,
+                evaluated_at_unix_ms: current_unix_ms(),
+            })
+            .await;
+
+        let mut caps = WorkerCapabilities::new();
+        caps.rustc_version = Some("1.87.0-nightly".to_string());
+        caps.disk_free_gb = Some(90.0);
+        caps.disk_total_gb = Some(120.0);
+        state.set_capabilities(caps).await;
+
+        let pressure = state.pressure_assessment().await;
+        assert_eq!(pressure.state, crate::disk_pressure::PressureState::Healthy);
+        assert_eq!(pressure.reason_code, "all_pressure_rules_within_threshold");
+        assert_eq!(pressure.disk_free_gb, Some(90.0));
+        assert_eq!(pressure.disk_total_gb, Some(120.0));
+        assert_eq!(pressure.disk_free_ratio, Some(0.75));
+        assert_eq!(pressure.disk_io_util_pct, Some(0.0));
+        assert_eq!(pressure.memory_pressure, Some(10.0));
+        assert!(pressure.telemetry_fresh);
+        assert!(pressure.telemetry_age_secs.unwrap_or(u64::MAX) <= 11);
+    }
+
+    #[tokio::test]
+    async fn test_capability_refresh_critical_disk_overrides_fresh_pressure() {
+        let state = WorkerState::new(test_config("test"));
+        state
+            .set_pressure_assessment(crate::disk_pressure::PressureAssessment {
+                state: crate::disk_pressure::PressureState::Healthy,
+                confidence: crate::disk_pressure::PressureConfidence::High,
+                reason_code: "all_pressure_rules_within_threshold".to_string(),
+                policy_rule: "fresh_telemetry".to_string(),
+                disk_free_gb: Some(50.0),
+                disk_total_gb: Some(100.0),
+                disk_free_ratio: Some(0.5),
+                disk_io_util_pct: Some(0.0),
+                memory_pressure: Some(10.0),
+                telemetry_age_secs: Some(10),
+                telemetry_fresh: true,
+                evaluated_at_unix_ms: current_unix_ms(),
+            })
+            .await;
+
+        let mut caps = WorkerCapabilities::new();
+        caps.rustc_version = Some("1.87.0-nightly".to_string());
+        caps.disk_free_gb = Some(2.0);
+        caps.disk_total_gb = Some(120.0);
+        state.set_capabilities(caps).await;
+
+        let pressure = state.pressure_assessment().await;
+        assert_eq!(
+            pressure.state,
+            crate::disk_pressure::PressureState::Critical
+        );
+        assert_eq!(
+            pressure.reason_code,
+            "disk_critical_without_fresh_telemetry"
+        );
+        assert_eq!(pressure.disk_free_gb, Some(2.0));
+        assert!(!pressure.telemetry_fresh);
     }
 
     #[tokio::test]
