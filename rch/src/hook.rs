@@ -5262,22 +5262,23 @@ pub(crate) fn required_runtime_for_kind(kind: Option<CompilationKind>) -> Requir
 
 /// Get artifact patterns based on compilation kind.
 ///
-/// Test commands use minimal patterns since test output is streamed and the full
-/// target/ directory is not needed. This significantly reduces artifact transfer
-/// time for test-only commands.
+/// Test and diagnostic commands use minimal patterns since their output is
+/// streamed and the full target/ directory is not needed. This significantly
+/// reduces artifact transfer time for commands that do not produce runnable
+/// build artifacts.
 fn get_artifact_patterns(kind: Option<CompilationKind>) -> Vec<String> {
     match kind {
         Some(CompilationKind::BunTest) | Some(CompilationKind::BunTypecheck) => {
             default_bun_artifact_patterns()
         }
-        // Test and bench commands only need coverage/results artifacts, not full target/
+        // Test, bench, and diagnostic commands do not need full target/.
         Some(CompilationKind::CargoTest)
         | Some(CompilationKind::CargoNextest)
-        | Some(CompilationKind::CargoBench) => default_rust_test_artifact_patterns(),
+        | Some(CompilationKind::CargoBench)
+        | Some(CompilationKind::CargoCheck)
+        | Some(CompilationKind::CargoClippy) => default_rust_test_artifact_patterns(),
         Some(CompilationKind::Rustc)
         | Some(CompilationKind::CargoBuild)
-        | Some(CompilationKind::CargoCheck)
-        | Some(CompilationKind::CargoClippy)
         | Some(CompilationKind::CargoDoc) => default_rust_artifact_patterns(),
         Some(CompilationKind::Gcc)
         | Some(CompilationKind::Gpp)
@@ -5293,7 +5294,9 @@ fn get_artifact_patterns(kind: Option<CompilationKind>) -> Vec<String> {
 
 fn get_custom_target_artifact_patterns(kind: Option<CompilationKind>) -> Vec<String> {
     match kind {
-        Some(CompilationKind::CargoTest) => Vec::new(),
+        Some(CompilationKind::CargoTest)
+        | Some(CompilationKind::CargoCheck)
+        | Some(CompilationKind::CargoClippy) => Vec::new(),
         Some(CompilationKind::CargoNextest) | Some(CompilationKind::CargoBench) => {
             get_artifact_patterns(kind)
                 .into_iter()
@@ -6148,7 +6151,7 @@ async fn execute_remote_compilation(
             let custom_patterns = get_custom_target_artifact_patterns(kind);
             if custom_patterns.is_empty() {
                 reporter.verbose(&format!(
-                    "[RCH] custom target dir sync skipped for {} after test command",
+                    "[RCH] custom target dir sync skipped for {} after command with no target artifacts",
                     local_target_dir.display()
                 ));
             } else {
@@ -10726,6 +10729,8 @@ edition = "2024"
         let _guard = test_guard!();
         // Verify test commands use minimal artifact patterns
         let test_patterns = get_artifact_patterns(Some(CompilationKind::CargoTest));
+        let check_patterns = get_artifact_patterns(Some(CompilationKind::CargoCheck));
+        let clippy_patterns = get_artifact_patterns(Some(CompilationKind::CargoClippy));
         let build_patterns = get_artifact_patterns(Some(CompilationKind::CargoBuild));
 
         // Test patterns should be smaller (more targeted)
@@ -10752,6 +10757,14 @@ edition = "2024"
             !test_patterns.iter().any(|p| p == "target/release/**"),
             "Test artifacts should not include target/release/**"
         );
+        assert!(
+            !check_patterns.iter().any(|p| p == "target/debug/**"),
+            "Cargo check artifacts should not include target/debug/**"
+        );
+        assert!(
+            !clippy_patterns.iter().any(|p| p == "target/debug/**"),
+            "Cargo clippy artifacts should not include target/debug/**"
+        );
     }
 
     #[test]
@@ -10762,6 +10775,20 @@ edition = "2024"
         assert!(
             patterns.is_empty(),
             "cargo test output is streamed; do not sync a custom target dir after tests"
+        );
+    }
+
+    #[test]
+    fn test_custom_target_artifact_patterns_for_diagnostic_commands_are_skipped() {
+        let _guard = test_guard!();
+
+        assert!(
+            get_custom_target_artifact_patterns(Some(CompilationKind::CargoCheck)).is_empty(),
+            "cargo check output is streamed; do not sync a custom target dir"
+        );
+        assert!(
+            get_custom_target_artifact_patterns(Some(CompilationKind::CargoClippy)).is_empty(),
+            "cargo clippy output is streamed; do not sync a custom target dir"
         );
     }
 

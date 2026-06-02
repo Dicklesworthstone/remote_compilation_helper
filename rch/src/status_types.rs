@@ -316,9 +316,9 @@ pub enum SystemPosture {
 impl SystemPosture {
     /// Compute posture from daemon status response.
     pub fn from_status(status: &DaemonFullStatusResponse) -> Self {
-        if status.daemon.workers_total == 0 || status.daemon.workers_healthy == 0 {
-            Self::LocalOnly
-        } else if !status.workers.is_empty() && remote_admissible_worker_count(&status.workers) == 0
+        if status.daemon.workers_total == 0
+            || status.daemon.workers_healthy == 0
+            || (!status.workers.is_empty() && remote_admissible_worker_count(&status.workers) == 0)
         {
             Self::LocalOnly
         } else if status.daemon.workers_healthy < status.daemon.workers_total
