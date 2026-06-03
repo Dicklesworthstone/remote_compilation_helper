@@ -370,15 +370,43 @@ fn local_fallback_command(command: &str) -> std::process::Command {
     child
 }
 
-fn exit_with_local_fallback(command: &str, reporter: &HookReporter, reason: &str) -> ! {
-    if exec_requires_remote() {
-        reporter.summary(&format!(
-            "[RCH] remote required; refusing local fallback ({reason})"
-        ));
-        std::process::exit(EXIT_BUILD_ERROR);
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalFallbackRefusal {
+    RemoteRequired,
+}
 
-    match local_fallback_command(command).status() {
+fn local_fallback_command_for_policy(
+    command: &str,
+    require_remote: bool,
+) -> Result<std::process::Command, LocalFallbackRefusal> {
+    if require_remote {
+        Err(LocalFallbackRefusal::RemoteRequired)
+    } else {
+        Ok(local_fallback_command(command))
+    }
+}
+
+fn remote_required_refusal_summary(reason: &str) -> String {
+    if reason == "non-compilation command" {
+        format!(
+            "[RCH] remote required; refusing local fallback [{}] ({reason})",
+            ErrorCode::BuildUnknownCommand.code_string()
+        )
+    } else {
+        format!("[RCH] remote required; refusing local fallback ({reason})")
+    }
+}
+
+fn exit_with_local_fallback(command: &str, reporter: &HookReporter, reason: &str) -> ! {
+    let mut child = match local_fallback_command_for_policy(command, exec_requires_remote()) {
+        Ok(child) => child,
+        Err(LocalFallbackRefusal::RemoteRequired) => {
+            reporter.summary(&remote_required_refusal_summary(reason));
+            std::process::exit(EXIT_BUILD_ERROR);
+        }
+    };
+
+    match child.status() {
         Ok(status) => std::process::exit(status.code().unwrap_or(1)),
         Err(error) => {
             reporter.summary(&format!("[RCH] local fallback failed: {error}"));
@@ -5650,22 +5678,23 @@ pub(crate) fn required_runtime_for_kind(kind: Option<CompilationKind>) -> Requir
 
 /// Get artifact patterns based on compilation kind.
 ///
-/// Test commands use minimal patterns since test output is streamed and the full
-/// target/ directory is not needed. This significantly reduces artifact transfer
-/// time for test-only commands.
+/// Test and diagnostic commands use minimal patterns since their output is
+/// streamed and the full target/ directory is not needed. This significantly
+/// reduces artifact transfer time for commands that do not produce runnable
+/// build artifacts.
 fn get_artifact_patterns(kind: Option<CompilationKind>) -> Vec<String> {
     match kind {
         Some(CompilationKind::BunTest) | Some(CompilationKind::BunTypecheck) => {
             default_bun_artifact_patterns()
         }
-        // Test and bench commands only need coverage/results artifacts, not full target/
+        // Test, bench, and diagnostic commands do not need full target/.
         Some(CompilationKind::CargoTest)
         | Some(CompilationKind::CargoNextest)
-        | Some(CompilationKind::CargoBench) => default_rust_test_artifact_patterns(),
+        | Some(CompilationKind::CargoBench)
+        | Some(CompilationKind::CargoCheck)
+        | Some(CompilationKind::CargoClippy) => default_rust_test_artifact_patterns(),
         Some(CompilationKind::Rustc)
         | Some(CompilationKind::CargoBuild)
-        | Some(CompilationKind::CargoCheck)
-        | Some(CompilationKind::CargoClippy)
         | Some(CompilationKind::CargoDoc) => default_rust_artifact_patterns(),
         Some(CompilationKind::Gcc)
         | Some(CompilationKind::Gpp)
@@ -5681,7 +5710,9 @@ fn get_artifact_patterns(kind: Option<CompilationKind>) -> Vec<String> {
 
 fn get_custom_target_artifact_patterns(kind: Option<CompilationKind>) -> Vec<String> {
     match kind {
-        Some(CompilationKind::CargoTest) => Vec::new(),
+        Some(CompilationKind::CargoTest)
+        | Some(CompilationKind::CargoCheck)
+        | Some(CompilationKind::CargoClippy) => Vec::new(),
         Some(CompilationKind::CargoNextest) | Some(CompilationKind::CargoBench) => {
             get_artifact_patterns(kind)
                 .into_iter()
@@ -6517,7 +6548,7 @@ async fn execute_remote_compilation(
             let custom_patterns = get_custom_target_artifact_patterns(kind);
             if custom_patterns.is_empty() {
                 reporter.verbose(&format!(
-                    "[RCH] custom target dir sync skipped for {} after test command",
+                    "[RCH] custom target dir sync skipped for {} after command with no target artifacts",
                     local_target_dir.display()
                 ));
             } else {
@@ -6988,6 +7019,53 @@ mod tests {
                 std::ffi::OsStr::new("-c"),
                 std::ffi::OsStr::new("cargo test -p rch")
             ]
+        );
+    }
+
+    #[test]
+    fn remote_required_fallback_refuses_before_building_local_shell_command() {
+        let _guard = test_guard!();
+        let command = "bash -lc 'cargo test --lib focused_case -- --nocapture'";
+
+        assert!(
+            matches!(
+                local_fallback_command_for_policy(command, true),
+                Err(LocalFallbackRefusal::RemoteRequired)
+            ),
+            "remote-required policy must refuse before constructing a local shell fallback"
+        );
+        assert!(
+            local_fallback_command_for_policy(command, false).is_ok(),
+            "ordinary local fallback behavior remains available when remote is not required"
+        );
+    }
+
+    #[test]
+    fn remote_required_non_compilation_shell_wrapped_cargo_has_stable_refusal_code() {
+        let _guard = test_guard!();
+        let parts = vec![
+            "bash".to_string(),
+            "-lc".to_string(),
+            "cargo test --lib focused_case -- --nocapture".to_string(),
+        ];
+        let command = join_exec_command(&parts);
+        let classification = classify_command(&command);
+
+        assert!(
+            !classification.is_compilation,
+            "global classification should keep arbitrary shell wrappers out of hook-mode offload"
+        );
+        assert!(
+            matches!(
+                local_fallback_command_for_policy(&command, true),
+                Err(LocalFallbackRefusal::RemoteRequired)
+            ),
+            "RCH_REQUIRE_REMOTE must prevent the shell from running locally even when classification rejects it"
+        );
+        assert!(remote_required_refusal_summary("non-compilation command").contains("RCH-E301"));
+        assert!(
+            !remote_required_refusal_summary("dependency preflight failed").contains("RCH-E301"),
+            "dependency-topology refusals should remain distinguishable from command-classification refusals"
         );
     }
 
@@ -11925,6 +12003,8 @@ edition = "2024"
         let _guard = test_guard!();
         // Verify test commands use minimal artifact patterns
         let test_patterns = get_artifact_patterns(Some(CompilationKind::CargoTest));
+        let check_patterns = get_artifact_patterns(Some(CompilationKind::CargoCheck));
+        let clippy_patterns = get_artifact_patterns(Some(CompilationKind::CargoClippy));
         let build_patterns = get_artifact_patterns(Some(CompilationKind::CargoBuild));
 
         // Test patterns should be smaller (more targeted)
@@ -11951,6 +12031,14 @@ edition = "2024"
             !test_patterns.iter().any(|p| p == "target/release/**"),
             "Test artifacts should not include target/release/**"
         );
+        assert!(
+            !check_patterns.iter().any(|p| p == "target/debug/**"),
+            "Cargo check artifacts should not include target/debug/**"
+        );
+        assert!(
+            !clippy_patterns.iter().any(|p| p == "target/debug/**"),
+            "Cargo clippy artifacts should not include target/debug/**"
+        );
     }
 
     #[test]
@@ -11961,6 +12049,20 @@ edition = "2024"
         assert!(
             patterns.is_empty(),
             "cargo test output is streamed; do not sync a custom target dir after tests"
+        );
+    }
+
+    #[test]
+    fn test_custom_target_artifact_patterns_for_diagnostic_commands_are_skipped() {
+        let _guard = test_guard!();
+
+        assert!(
+            get_custom_target_artifact_patterns(Some(CompilationKind::CargoCheck)).is_empty(),
+            "cargo check output is streamed; do not sync a custom target dir"
+        );
+        assert!(
+            get_custom_target_artifact_patterns(Some(CompilationKind::CargoClippy)).is_empty(),
+            "cargo clippy output is streamed; do not sync a custom target dir"
         );
     }
 

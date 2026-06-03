@@ -413,6 +413,22 @@ rch exec -- cargo test --workspace
 rch exec -- cargo clippy --workspace --all-targets -- -D warnings
 ```
 
+When local fallback is not acceptable, set `RCH_REQUIRE_REMOTE=1` on the
+`rch exec` process and keep the build command as direct argv:
+
+```bash
+RCH_REQUIRE_REMOTE=1 rch exec -- cargo test --workspace
+RCH_REQUIRE_REMOTE=1 rch exec -- cargo clippy --workspace --all-targets -- -D warnings
+```
+
+Do not batch several Cargo commands behind a shell wrapper such as
+`rch exec -- bash -lc "cargo test ... && cargo test ..."`. Shell-wrapped
+commands are classified as non-compilation for hook safety. Under
+`RCH_REQUIRE_REMOTE=1`, RCH refuses that local fallback before executing the
+shell and reports `RCH-E301`; without the env var, ordinary non-compilation
+commands may still run locally. For several focused checks, run separate direct
+`RCH_REQUIRE_REMOTE=1 rch exec -- cargo ...` invocations.
+
 ---
 
 ## Security Model
