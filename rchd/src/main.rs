@@ -191,9 +191,72 @@ fn sd_notify(message: &str) {
     }
 }
 
+/// True iff `/proc/self/cgroup` content indicates we are the rchd.service unit.
+#[allow(dead_code)] // used under cfg(linux) and in tests
+fn cgroup_contains_rchd_unit(cgroup: &str) -> bool {
+    cgroup.contains("rchd.service")
+}
+
+/// `Some(true)`/`Some(false)` once we can read our cgroup and decide whether we
+/// are the rchd.service unit's own process; `None` if the cgroup is unreadable
+/// (callers treat `None` conservatively to avoid any restart storm).
+fn cgroup_says_rchd_unit() -> Option<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string("/proc/self/cgroup")
+            .ok()
+            .map(|c| cgroup_contains_rchd_unit(&c))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Some(false)
+    }
+}
+
+/// Is a systemd --user `rchd.service` unit configured (enabled/static) here?
+#[cfg(target_os = "linux")]
+fn rchd_systemd_unit_present() -> bool {
+    std::process::Command::new("systemctl")
+        .args(["--user", "is-enabled", "rchd"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// On systemd hosts, enforce exactly one rchd. If `rchd.service` manages the
+/// daemon here and we are NOT that unit's process (a duplicate spawned by hook
+/// auto-start, `rch daemon start/restart`, or `rch update`), make sure the unit
+/// is running and exit. systemd (Restart=always) is then the single source of
+/// truth, eliminating duplicate/orphan rchd regardless of how it was launched.
+/// No-op on macOS and on Linux hosts with no rchd.service (manual management).
+fn defer_to_systemd_if_managed() {
+    #[cfg(target_os = "linux")]
+    {
+        // Only defer when we can CONFIRM we are not the unit's own process.
+        // `Some(true)` (we ARE the unit) or `None` (cgroup unreadable) -> proceed,
+        // so we never make the real unit exit-loop under systemd Restart=always.
+        if cgroup_says_rchd_unit() != Some(false) {
+            return;
+        }
+        if !rchd_systemd_unit_present() {
+            return;
+        }
+        info!("rchd is managed by the systemd --user rchd.service unit here; starting it and exiting to avoid a duplicate daemon");
+        let _ = std::process::Command::new("systemctl")
+            .args(["--user", "start", "rchd"])
+            .status();
+        std::process::exit(0);
+    }
+}
+
 async fn bind_daemon_socket(socket: &Path) -> Result<UnixListener> {
-    // When systemd is managing us as a unit it sets INVOCATION_ID.
-    let managed_by_systemd = std::env::var_os("INVOCATION_ID").is_some();
+    // "Managed by systemd" only if THIS process is the rchd.service unit's own
+    // main process (our cgroup is rchd.service) -- NOT merely because
+    // INVOCATION_ID was inherited from a parent scope (e.g. an agent's `rch`
+    // auto-spawned us). The genuine unit waits out a transiently-held socket
+    // (avoids a restart storm); any other rchd bails. A non-unit rchd on a
+    // systemd host has already exited via defer_to_systemd_if_managed().
+    let managed_by_systemd = cgroup_says_rchd_unit() == Some(true);
     bind_daemon_socket_with_mode(socket, managed_by_systemd, Duration::from_secs(5)).await
 }
 
@@ -331,6 +394,8 @@ async fn main() -> Result<()> {
 
     info!("Starting RCH daemon...");
 
+    // Enforce single-instance on systemd hosts before we touch the socket.
+    defer_to_systemd_if_managed();
     let listener = bind_daemon_socket(&cli.socket).await?;
     info!("Listening on {:?}", cli.socket);
     // Inform systemd we're ready. No-op for Type=simple (the current unit)
@@ -1500,5 +1565,27 @@ mod tests {
         assert_eq!(stats.remote_count, 2);
         assert_eq!(stats.local_count, 2);
         assert_eq!(stats.avg_duration_ms, 1250); // (1000+2000+500+1500)/4
+    }
+}
+
+#[cfg(test)]
+mod systemd_singleton_tests {
+    use super::*;
+
+    #[test]
+    fn cgroup_detects_rchd_service_unit() {
+        assert!(cgroup_contains_rchd_unit(
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/rchd.service"
+        ));
+    }
+
+    #[test]
+    fn cgroup_rejects_session_and_agent_scopes() {
+        assert!(!cgroup_contains_rchd_unit(
+            "0::/user.slice/user-1000.slice/session-18017.scope"
+        ));
+        assert!(!cgroup_contains_rchd_unit(
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/some-agent.scope"
+        ));
     }
 }
