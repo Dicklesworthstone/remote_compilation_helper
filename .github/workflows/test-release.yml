@@ -15,6 +15,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   CARGO_NET_RETRY: 2
+  RUSTUP_TOOLCHAIN: nightly-2025-11-01
 
 jobs:
   build:
@@ -49,9 +50,38 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Clone local path dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo mkdir -p /dp
+          sudo chown "$(id -un)" /dp
+          git clone --depth 1 https://github.com/Dicklesworthstone/rich_rust.git /dp/rich_rust
+          git clone --depth 1 https://github.com/Dicklesworthstone/toon_rust.git /dp/toon_rust
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankentui.git /dp/frankentui
+
+      - name: Clone local path dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p /tmp/dp
+          git clone --depth 1 https://github.com/Dicklesworthstone/rich_rust.git /tmp/dp/rich_rust
+          git clone --depth 1 https://github.com/Dicklesworthstone/toon_rust.git /tmp/dp/toon_rust
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankentui.git /tmp/dp/frankentui
+          sed -i '' 's|/dp/|/tmp/dp/|g' Cargo.toml
+
+      - name: Clone local path dependencies (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $driveRoot = [System.IO.Path]::GetPathRoot((Get-Location).Path)
+          $dp = Join-Path $driveRoot "dp"
+          New-Item -ItemType Directory -Force -Path $dp | Out-Null
+          git clone --depth 1 https://github.com/Dicklesworthstone/rich_rust.git (Join-Path $dp "rich_rust")
+          git clone --depth 1 https://github.com/Dicklesworthstone/toon_rust.git (Join-Path $dp "toon_rust")
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankentui.git (Join-Path $dp "frankentui")
+
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2025-01-01
+          toolchain: nightly-2025-11-01
           targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
@@ -59,8 +89,13 @@ jobs:
           shared-key: test-release-${{ matrix.target }}
           cache-on-failure: true
 
-      - name: Build (release)
+      - name: Build (release) (unix)
+        if: runner.os != 'Windows'
         run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Build (release) (windows)
+        if: runner.os == 'Windows'
+        run: cargo build --release --locked --no-default-features --target ${{ matrix.target }}
 
       - name: Verify binaries exist (unix)
         if: runner.os != 'Windows'
@@ -74,7 +109,6 @@ jobs:
         shell: pwsh
         run: |
           if (!(Test-Path "target/${{ matrix.target }}/release/rch.exe")) { throw "missing rch.exe" }
-          if (!(Test-Path "target/${{ matrix.target }}/release/rchd.exe")) { throw "missing rchd.exe" }
           if (!(Test-Path "target/${{ matrix.target }}/release/rch-wkr.exe")) { throw "missing rch-wkr.exe" }
 
       - name: Smoke test (version) (unix)
@@ -89,7 +123,6 @@ jobs:
         shell: pwsh
         run: |
           & "target/${{ matrix.target }}/release/rch.exe" --version
-          & "target/${{ matrix.target }}/release/rchd.exe" --version
           & "target/${{ matrix.target }}/release/rch-wkr.exe" --version
 
       - name: Package (unix)
@@ -109,7 +142,7 @@ jobs:
           $Tag = "pr-${{ github.event.pull_request.number || github.run_id }}-$($env:GITHUB_SHA.Substring(0,7))"
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           $Archive = "dist/rch-$Tag-${{ matrix.target }}.zip"
-          Compress-Archive -Path target/${{ matrix.target }}/release/rch.exe,target/${{ matrix.target }}/release/rchd.exe,target/${{ matrix.target }}/release/rch-wkr.exe -DestinationPath $Archive
+          Compress-Archive -Path target/${{ matrix.target }}/release/rch.exe,target/${{ matrix.target }}/release/rch-wkr.exe -DestinationPath $Archive
           $Hash = (Get-FileHash $Archive -Algorithm SHA256).Hash.ToLower()
           "$Hash  rch-$Tag-${{ matrix.target }}.zip" | Out-File -FilePath "$Archive.sha256" -Encoding ascii -NoNewline
 
