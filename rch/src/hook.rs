@@ -4303,6 +4303,13 @@ struct SyncClosureManifestEntry {
     mode: SyncClosureMode,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct RemoteManifestPathRewriteRule {
+    manifest: String,
+    raw_path: String,
+    remote_path: String,
+}
+
 const DEPENDENCY_PREFLIGHT_SCHEMA_VERSION: &str = "rch.dependency_preflight.v1";
 const DEPENDENCY_PREFLIGHT_CODE_PRESENT: &str = "RCH-I324";
 const DEPENDENCY_PREFLIGHT_CODE_MISSING: &str = "RCH-E324";
@@ -4642,8 +4649,12 @@ fn build_sync_closure_plan_with_layout(
     remote_layout: &RemoteSyncLayout,
 ) -> Vec<SyncClosurePlanEntry> {
     let mut ordered_entries = std::collections::BTreeSet::<(PathBuf, SyncClosureMode)>::new();
-    for root in sync_roots {
-        let canonicalized = canonicalize_sync_root_for_plan(root, topology_policy);
+    let mut pending_roots = sync_roots.to_vec();
+    pending_roots.push(normalized_project_root.to_path_buf());
+    let mut seen_full_roots = std::collections::BTreeSet::<PathBuf>::new();
+
+    while let Some(root) = pending_roots.pop() {
+        let canonicalized = canonicalize_sync_root_for_plan(&root, topology_policy);
         if !is_within_sync_topology(&canonicalized, topology_policy) {
             warn!(
                 "Dependency root {} (canonicalized: {}) is outside allowed topology ({} / {}); skipping from sync closure",
@@ -4653,6 +4664,16 @@ fn build_sync_closure_plan_with_layout(
                 topology_policy.alias_root().display(),
             );
             continue;
+        }
+        if !seen_full_roots.insert(canonicalized.clone()) {
+            continue;
+        }
+        for declared_root in
+            manifest_declared_path_dependency_roots(&canonicalized, topology_policy)
+        {
+            if !seen_full_roots.contains(&declared_root) {
+                pending_roots.push(declared_root);
+            }
         }
         ordered_entries.insert((canonicalized.clone(), SyncClosureMode::Full));
         if let Some(workspace_root) =
@@ -4696,6 +4717,31 @@ fn build_sync_closure_plan_with_layout(
             }
         })
         .collect()
+}
+
+fn manifest_declared_path_dependency_roots(
+    root: &Path,
+    topology_policy: &PathTopologyPolicy,
+) -> Vec<PathBuf> {
+    let local_manifest = root.join("Cargo.toml");
+    let Ok(contents) = std::fs::read_to_string(&local_manifest) else {
+        return Vec::new();
+    };
+    let Ok(manifest) = toml::from_str::<toml::Value>(&contents) else {
+        return Vec::new();
+    };
+
+    let mut raw_paths = Vec::new();
+    collect_manifest_path_values(&manifest, &mut raw_paths);
+    let mut roots = raw_paths
+        .into_iter()
+        .map(|raw_path| manifest_path_value_to_local_root(root, &raw_path))
+        .map(|path| canonicalize_sync_root_for_plan(&path, topology_policy))
+        .filter(|path| is_within_sync_topology(path, topology_policy))
+        .collect::<Vec<_>>();
+    roots.sort();
+    roots.dedup();
+    roots
 }
 
 #[cfg(test)]
@@ -4987,34 +5033,72 @@ fn build_remote_manifest_path_rewrite_command(
         return None;
     }
 
-    let args = std::iter::once(remote_layout.canonical_remote_root().to_string())
-        .chain([
-            DEFAULT_CANONICAL_PROJECT_ROOT.to_string(),
-            DEFAULT_ALIAS_PROJECT_ROOT.to_string(),
-            topology_policy
-                .canonical_root()
-                .to_string_lossy()
-                .to_string(),
-            topology_policy.alias_root().to_string_lossy().to_string(),
-        ])
-        .chain(remote_roots)
-        .map(|arg| shell_escape::escape(arg.as_str().into()).to_string())
-        .collect::<Vec<_>>()
-        .join(" ");
+    let sources = [
+        DEFAULT_CANONICAL_PROJECT_ROOT.to_string(),
+        DEFAULT_ALIAS_PROJECT_ROOT.to_string(),
+        topology_policy
+            .canonical_root()
+            .to_string_lossy()
+            .to_string(),
+        topology_policy.alias_root().to_string_lossy().to_string(),
+    ];
+    let rules = build_remote_manifest_path_rewrite_rules(root_outcomes, topology_policy);
+    let rewrite_plan = serde_json::json!({
+        "destination": remote_layout.canonical_remote_root(),
+        "sources": sources,
+        "roots": remote_roots,
+        "rules": rules,
+    });
+    let args = shell_escape::escape(rewrite_plan.to_string().into()).to_string();
 
     let script = r#"import os
+import json
+import re
 import sys
 
-destination = sys.argv[1].rstrip("/")
+plan = json.loads(sys.argv[1])
+destination = plan["destination"].rstrip("/")
 sources = []
-for raw in sys.argv[2:6]:
+for raw in plan.get("sources", []):
     source = raw.rstrip("/")
     if source and source != destination and source not in sources:
         sources.append(source)
-roots = sys.argv[6:]
+sources.sort(key=len, reverse=True)
+roots = plan.get("roots", [])
+rules_by_manifest = {}
+def replace_sources(text):
+    rewritten = text
+    for source in sources:
+        rewritten = rewritten.replace(source, destination)
+    return rewritten
+
+for rule in plan.get("rules", []):
+    manifest = rule.get("manifest")
+    raw_path = rule.get("raw_path")
+    remote_path = rule.get("remote_path")
+    if not manifest or not raw_path or not remote_path:
+        continue
+    manifest_rules = rules_by_manifest.setdefault(manifest, {})
+    manifest_rules[raw_path] = remote_path
+    manifest_rules[replace_sources(raw_path)] = remote_path
 changed = 0
 seen = set()
 pruned = {".git", "target", ".rch-target"}
+path_attr = re.compile(r'(?P<prefix>\bpath\s*=\s*)(?P<quote>["\'])(?P<value>.*?)(?P=quote)')
+
+def rewrite_manifest_path_attrs(text, manifest):
+    rules = rules_by_manifest.get(manifest)
+    if not rules:
+        return text
+
+    def replace(match):
+        value = match.group("value")
+        replacement = rules.get(value)
+        if not replacement:
+            return match.group(0)
+        return f'{match.group("prefix")}{match.group("quote")}{replacement}{match.group("quote")}'
+
+    return path_attr.sub(replace, text)
 
 for root in roots:
     if not os.path.isdir(root):
@@ -5029,9 +5113,8 @@ for root in roots:
         seen.add(manifest)
         with open(manifest, "r", encoding="utf-8") as handle:
             original = handle.read()
-        rewritten = original
-        for source in sources:
-            rewritten = rewritten.replace(source, destination)
+        rewritten = replace_sources(original)
+        rewritten = rewrite_manifest_path_attrs(rewritten, manifest)
         if rewritten != original:
             with open(manifest, "w", encoding="utf-8") as handle:
                 handle.write(rewritten)
@@ -5043,6 +5126,143 @@ print(f"RCH_MANIFEST_REWRITE_CHANGED:{changed}")
     Some(format!(
         "set -e; if ! command -v python3 >/dev/null 2>&1; then echo RCH_MANIFEST_REWRITE_ERR_PYTHON3_MISSING >&2; exit 44; fi; python3 - {args} <<'PY'\n{script}PY"
     ))
+}
+
+fn build_remote_manifest_path_rewrite_rules(
+    root_outcomes: &[(SyncClosurePlanEntry, SyncRootOutcome)],
+    topology_policy: &PathTopologyPolicy,
+) -> Vec<RemoteManifestPathRewriteRule> {
+    let synced_entries = root_outcomes
+        .iter()
+        .filter_map(|(entry, outcome)| matches!(outcome, SyncRootOutcome::Synced).then_some(entry))
+        .collect::<Vec<_>>();
+    if synced_entries.len() < 2 {
+        return Vec::new();
+    }
+
+    let mut rules = Vec::new();
+    for entry in &synced_entries {
+        let local_manifest = entry.local_root.join("Cargo.toml");
+        let Ok(contents) = std::fs::read_to_string(&local_manifest) else {
+            continue;
+        };
+        let Ok(manifest) = toml::from_str::<toml::Value>(&contents) else {
+            continue;
+        };
+
+        let mut raw_paths = Vec::new();
+        collect_manifest_path_values(&manifest, &mut raw_paths);
+        raw_paths.sort();
+        raw_paths.dedup();
+
+        for raw_path in raw_paths {
+            let local_candidate = manifest_path_value_to_local_root(&entry.local_root, &raw_path);
+            let normalized_candidate =
+                canonicalize_sync_root_for_plan(&local_candidate, topology_policy);
+            let Some(target_entry) = synced_entries.iter().find(|candidate| {
+                paths_refer_to_same_sync_root(&candidate.local_root, &normalized_candidate)
+            }) else {
+                continue;
+            };
+            if target_entry.remote_root == entry.remote_root {
+                continue;
+            }
+
+            rules.push(RemoteManifestPathRewriteRule {
+                manifest: PathBuf::from(&entry.remote_root)
+                    .join("Cargo.toml")
+                    .to_string_lossy()
+                    .to_string(),
+                raw_path,
+                remote_path: target_entry.remote_root.clone(),
+            });
+        }
+    }
+
+    rules.sort_by(|a, b| {
+        a.manifest
+            .cmp(&b.manifest)
+            .then_with(|| a.raw_path.cmp(&b.raw_path))
+            .then_with(|| a.remote_path.cmp(&b.remote_path))
+    });
+    rules.dedup();
+    rules
+}
+
+fn paths_refer_to_same_sync_root(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+
+    match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn collect_manifest_path_values(value: &toml::Value, output: &mut Vec<String>) {
+    let Some(table) = value.as_table() else {
+        return;
+    };
+
+    collect_dependency_table_path_values(table.get("dependencies"), output);
+    collect_dependency_table_path_values(table.get("dev-dependencies"), output);
+    collect_dependency_table_path_values(table.get("build-dependencies"), output);
+
+    if let Some(workspace) = table.get("workspace").and_then(toml::Value::as_table) {
+        collect_dependency_table_path_values(workspace.get("dependencies"), output);
+    }
+
+    if let Some(targets) = table.get("target").and_then(toml::Value::as_table) {
+        for target in targets.values().filter_map(toml::Value::as_table) {
+            collect_dependency_table_path_values(target.get("dependencies"), output);
+            collect_dependency_table_path_values(target.get("dev-dependencies"), output);
+            collect_dependency_table_path_values(target.get("build-dependencies"), output);
+        }
+    }
+
+    if let Some(patches) = table.get("patch").and_then(toml::Value::as_table) {
+        for patch_table in patches.values() {
+            collect_dependency_table_path_values(Some(patch_table), output);
+        }
+    }
+}
+
+fn collect_dependency_table_path_values(value: Option<&toml::Value>, output: &mut Vec<String>) {
+    let Some(table) = value.and_then(toml::Value::as_table) else {
+        return;
+    };
+
+    for dependency in table.values() {
+        if let Some(path) = dependency
+            .as_table()
+            .and_then(|dependency| dependency.get("path"))
+            .and_then(toml::Value::as_str)
+        {
+            output.push(path.to_string());
+        }
+    }
+}
+
+fn manifest_path_value_to_local_root(manifest_root: &Path, raw_path: &str) -> PathBuf {
+    let path = Path::new(raw_path);
+    let candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        manifest_root.join(path)
+    };
+    let candidate = if candidate
+        .file_name()
+        .is_some_and(|file_name| file_name == "Cargo.toml")
+    {
+        candidate
+            .parent()
+            .unwrap_or_else(|| Path::new("/"))
+            .to_path_buf()
+    } else {
+        candidate
+    };
+    candidate
 }
 
 /// Result of remote compilation execution.
@@ -12966,6 +13186,115 @@ edition = "2024"
                 && entry.remote_root
                     == "/tmp/rch-sync/abcdeffedcba1234/projects/projects/eidetic_engine_cli"),
             "ordinary projects under the broad user root keep their relative projects/ prefix: {plan:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_outer_workspace_safe_manifest_rewrite_rules_cover_relative_symlink_sibling_dependency()
+    {
+        let _guard = test_guard!();
+        let temp_dir = tempfile::tempdir().expect("create tempdir");
+        let user_root = temp_dir.path().join("Users/example");
+        let projects_root = user_root.join("projects");
+        let dp_root = user_root.join("dp");
+        let data_alias_root = temp_dir.path().join("data");
+        std::fs::create_dir_all(&projects_root).expect("create projects root");
+        std::fs::create_dir_all(&dp_root).expect("create dp root");
+        std::os::unix::fs::symlink(&user_root, &data_alias_root).expect("create data alias");
+
+        let project_root = projects_root.join("eidetic_engine_cli");
+        let dep_root = dp_root.join("frankensearch/frankensearch");
+        let absolute_alias_dep_root = dp_root.join("asupersync");
+        let dep_project_link = projects_root.join("frankensearch");
+        let absolute_alias_project_link = projects_root.join("asupersync");
+        std::fs::create_dir_all(&project_root).expect("create project");
+        std::fs::create_dir_all(&dep_root).expect("create dep");
+        std::fs::create_dir_all(&absolute_alias_dep_root).expect("create absolute alias dep");
+        std::os::unix::fs::symlink(dp_root.join("frankensearch"), &dep_project_link)
+            .expect("create project sibling symlink");
+        std::os::unix::fs::symlink(&absolute_alias_dep_root, &absolute_alias_project_link)
+            .expect("create absolute alias project symlink");
+        let absolute_alias_manifest_path =
+            format!("{}/projects/asupersync", data_alias_root.display());
+        std::fs::write(
+            project_root.join("Cargo.toml"),
+            format!(
+                r#"[package]
+name = "eidetic_engine_cli"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+frankensearch = {{ path = "../frankensearch/frankensearch" }}
+asupersync = {{ path = "{absolute_alias_manifest_path}" }}
+
+[[bench]]
+name = "decision"
+path = "benches/atp/autotune/decision.rs"
+"#,
+            ),
+        )
+        .expect("write project manifest");
+        std::fs::write(
+            dep_root.join("Cargo.toml"),
+            r#"[package]
+name = "frankensearch"
+version = "0.1.0"
+edition = "2024"
+"#,
+        )
+        .expect("write dep manifest");
+        std::fs::write(
+            absolute_alias_dep_root.join("Cargo.toml"),
+            r#"[package]
+name = "asupersync"
+version = "0.1.0"
+edition = "2024"
+"#,
+        )
+        .expect("write absolute alias dep manifest");
+
+        let policy = PathTopologyPolicy::new(user_root.clone(), data_alias_root);
+        let layout = RemoteSyncLayout::outer_workspace_safe("d55ecb92811107ae");
+        let plan = build_sync_closure_plan_with_layout(
+            std::slice::from_ref(&project_root),
+            &project_root,
+            "relative_symlink_hash",
+            &policy,
+            &layout,
+        );
+        let outcomes = plan
+            .into_iter()
+            .map(|entry| (entry, SyncRootOutcome::Synced))
+            .collect::<Vec<_>>();
+
+        let rules = build_remote_manifest_path_rewrite_rules(&outcomes, &policy);
+
+        assert!(
+            rules.iter().any(|rule| {
+                rule.manifest
+                    == "/tmp/rch-sync/d55ecb92811107ae/projects/projects/eidetic_engine_cli/Cargo.toml"
+                    && rule.raw_path == "../frankensearch/frankensearch"
+                    && rule.remote_path
+                        == "/tmp/rch-sync/d55ecb92811107ae/projects/dp/frankensearch/frankensearch"
+            }),
+            "relative symlink dependency should be rewritten to the actual synced root: {rules:?}"
+        );
+        assert!(
+            rules.iter().any(|rule| {
+                rule.manifest
+                    == "/tmp/rch-sync/d55ecb92811107ae/projects/projects/eidetic_engine_cli/Cargo.toml"
+                    && rule.raw_path == absolute_alias_manifest_path
+                    && rule.remote_path == "/tmp/rch-sync/d55ecb92811107ae/projects/dp/asupersync"
+            }),
+            "absolute alias dependency should be rewritten to the actual synced root before broad source-prefix replacement: {rules:?}"
+        );
+        assert!(
+            !rules
+                .iter()
+                .any(|rule| rule.raw_path == "benches/atp/autotune/decision.rs"),
+            "non-dependency target paths must not be treated as dependency roots: {rules:?}"
         );
     }
 
