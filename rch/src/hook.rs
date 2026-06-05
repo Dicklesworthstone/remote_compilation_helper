@@ -4571,14 +4571,27 @@ fn effective_sync_topology_roots(policy: &PathTopologyPolicy) -> Vec<PathBuf> {
     roots.push(policy.canonical_root().to_path_buf());
     roots.push(policy.alias_root().to_path_buf());
 
-    if !policy.canonical_root().exists()
-        && let Ok(alias_target) = std::fs::canonicalize(policy.alias_root())
-    {
+    if let Ok(alias_target) = std::fs::canonicalize(policy.alias_root()) {
         roots.push(alias_target);
+    }
+    if let Ok(canonical_root) = std::fs::canonicalize(policy.canonical_root()) {
+        roots.push(canonical_root);
     }
 
     roots.sort();
     roots.dedup();
+    roots
+}
+
+fn topology_roots_by_specificity(policy: &PathTopologyPolicy) -> Vec<PathBuf> {
+    let mut roots = effective_sync_topology_roots(policy);
+    roots.sort_by(|a, b| {
+        b.components()
+            .count()
+            .cmp(&a.components().count())
+            .then_with(|| b.as_os_str().len().cmp(&a.as_os_str().len()))
+            .then_with(|| a.cmp(b))
+    });
     roots
 }
 
@@ -4596,7 +4609,7 @@ fn map_sync_root_to_remote_root_with_layout(
 ) -> String {
     let remote_root = Path::new(remote_layout.canonical_remote_root());
 
-    for root in effective_sync_topology_roots(policy) {
+    for root in topology_roots_by_specificity(policy) {
         if let Ok(relative) = path.strip_prefix(&root) {
             return remote_root.join(relative).to_string_lossy().to_string();
         }
@@ -4875,9 +4888,8 @@ fn rewrite_topology_prefixes_for_remote_layout(
         return value.to_string();
     }
 
-    let mut rewritten = value.to_string();
     let remote_root = remote_layout.canonical_remote_root();
-    for source_root in [
+    let mut source_roots = [
         DEFAULT_CANONICAL_PROJECT_ROOT,
         DEFAULT_ALIAS_PROJECT_ROOT,
         topology_policy
@@ -4888,9 +4900,22 @@ fn rewrite_topology_prefixes_for_remote_layout(
             .alias_root()
             .to_str()
             .unwrap_or(DEFAULT_ALIAS_PROJECT_ROOT),
-    ] {
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect::<Vec<_>>();
+    source_roots.extend(
+        topology_roots_by_specificity(topology_policy)
+            .into_iter()
+            .filter_map(|root| root.to_str().map(ToOwned::to_owned)),
+    );
+    source_roots.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    source_roots.dedup();
+
+    let mut rewritten = value.to_string();
+    for source_root in source_roots {
         if source_root != remote_root {
-            rewritten = rewritten.replace(source_root, remote_root);
+            rewritten = rewritten.replace(source_root.as_str(), remote_root);
         }
     }
     rewritten
@@ -12900,6 +12925,77 @@ edition = "2024"
             !rewritten.contains("/data/projects/eidetic_engine_cli")
                 && !rewritten.contains("/dp/frankensearch"),
             "original topology paths should not remain in rewritten command: {rewritten}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_outer_workspace_safe_prefers_canonicalized_alias_target_over_broad_user_root() {
+        let _guard = test_guard!();
+        let temp_dir = tempfile::tempdir().expect("create tempdir");
+        let user_root = temp_dir.path().join("Users/example");
+        let projects_root = user_root.join("projects");
+        let alias_target = user_root.join("dp");
+        let alias_root = temp_dir.path().join("dp");
+        std::fs::create_dir_all(&projects_root).expect("create projects root");
+        std::fs::create_dir_all(&alias_target).expect("create alias target");
+        std::os::unix::fs::symlink(&alias_target, &alias_root).expect("create alias symlink");
+
+        let project_root = projects_root.join("eidetic_engine_cli");
+        let dep_root = alias_target.join("asupersync");
+        std::fs::create_dir_all(&project_root).expect("create project");
+        std::fs::create_dir_all(&dep_root).expect("create dep");
+
+        let policy = PathTopologyPolicy::new(user_root.clone(), alias_root);
+        let layout = RemoteSyncLayout::outer_workspace_safe("abcdeffedcba1234");
+        let plan = build_sync_closure_plan_with_layout(
+            std::slice::from_ref(&dep_root),
+            &project_root,
+            "alias_target_hash",
+            &policy,
+            &layout,
+        );
+
+        assert!(
+            plan.iter().any(|entry| entry.local_root == dep_root
+                && entry.remote_root == "/tmp/rch-sync/abcdeffedcba1234/projects/asupersync"),
+            "canonicalized alias target must map as the alias root, not under a dp/ prefix: {plan:?}"
+        );
+        assert!(
+            plan.iter().any(|entry| entry.local_root == project_root
+                && entry.remote_root
+                    == "/tmp/rch-sync/abcdeffedcba1234/projects/projects/eidetic_engine_cli"),
+            "ordinary projects under the broad user root keep their relative projects/ prefix: {plan:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_outer_workspace_safe_rewrite_prefers_canonicalized_alias_target_prefix() {
+        let _guard = test_guard!();
+        let temp_dir = tempfile::tempdir().expect("create tempdir");
+        let user_root = temp_dir.path().join("Users/example");
+        let alias_target = user_root.join("dp");
+        let alias_root = temp_dir.path().join("dp");
+        std::fs::create_dir_all(&alias_target).expect("create alias target");
+        std::os::unix::fs::symlink(&alias_target, &alias_root).expect("create alias symlink");
+
+        let policy = PathTopologyPolicy::new(user_root.clone(), alias_root);
+        let layout = RemoteSyncLayout::outer_workspace_safe("1234abcd5678ef90");
+        let input = format!(
+            "cargo test --manifest-path={}/asupersync/Cargo.toml",
+            alias_target.display()
+        );
+
+        let rewritten = rewrite_topology_prefixes_for_remote_layout(&input, &policy, &layout);
+
+        assert!(
+            rewritten.contains("/tmp/rch-sync/1234abcd5678ef90/projects/asupersync/Cargo.toml"),
+            "canonicalized alias target should rewrite without a dp/ segment: {rewritten}"
+        );
+        assert!(
+            !rewritten.contains("/projects/dp/asupersync"),
+            "broad user root must not rewrite before the alias target: {rewritten}"
         );
     }
 
