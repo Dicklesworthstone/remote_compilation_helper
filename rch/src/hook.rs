@@ -4733,6 +4733,11 @@ fn manifest_declared_path_dependency_roots(
 
     let mut raw_paths = Vec::new();
     collect_manifest_path_values(&manifest, &mut raw_paths);
+    raw_paths.extend(collect_workspace_inherited_path_values(
+        root,
+        &manifest,
+        topology_policy,
+    ));
     let mut roots = raw_paths
         .into_iter()
         .map(|raw_path| manifest_path_value_to_local_root(root, &raw_path))
@@ -5224,6 +5229,97 @@ fn collect_manifest_path_values(value: &toml::Value, output: &mut Vec<String>) {
     if let Some(patches) = table.get("patch").and_then(toml::Value::as_table) {
         for patch_table in patches.values() {
             collect_dependency_table_path_values(Some(patch_table), output);
+        }
+    }
+}
+
+fn collect_workspace_inherited_path_values(
+    manifest_root: &Path,
+    manifest: &toml::Value,
+    topology_policy: &PathTopologyPolicy,
+) -> Vec<String> {
+    let mut names = Vec::new();
+    collect_workspace_inherited_dependency_names(manifest, &mut names);
+    names.sort();
+    names.dedup();
+    if names.is_empty() {
+        return Vec::new();
+    }
+
+    let Some(workspace_root) =
+        enclosing_workspace_root_for_sync_root(manifest_root, topology_policy)
+    else {
+        return Vec::new();
+    };
+    let workspace_manifest = workspace_root.join("Cargo.toml");
+    let Ok(contents) = std::fs::read_to_string(&workspace_manifest) else {
+        return Vec::new();
+    };
+    let Ok(workspace_manifest) = toml::from_str::<toml::Value>(&contents) else {
+        return Vec::new();
+    };
+    let Some(workspace_dependencies) = workspace_manifest
+        .get("workspace")
+        .and_then(toml::Value::as_table)
+        .and_then(|workspace| workspace.get("dependencies"))
+        .and_then(toml::Value::as_table)
+    else {
+        return Vec::new();
+    };
+
+    names
+        .into_iter()
+        .filter_map(|name| {
+            workspace_dependencies
+                .get(&name)
+                .and_then(toml::Value::as_table)
+                .and_then(|dependency| dependency.get("path"))
+                .and_then(toml::Value::as_str)
+                .map(|path| workspace_root.join(path).to_string_lossy().to_string())
+        })
+        .collect()
+}
+
+fn collect_workspace_inherited_dependency_names(value: &toml::Value, output: &mut Vec<String>) {
+    let Some(table) = value.as_table() else {
+        return;
+    };
+
+    collect_dependency_table_workspace_inherited_names(table.get("dependencies"), output);
+    collect_dependency_table_workspace_inherited_names(table.get("dev-dependencies"), output);
+    collect_dependency_table_workspace_inherited_names(table.get("build-dependencies"), output);
+
+    if let Some(targets) = table.get("target").and_then(toml::Value::as_table) {
+        for target in targets.values().filter_map(toml::Value::as_table) {
+            collect_dependency_table_workspace_inherited_names(target.get("dependencies"), output);
+            collect_dependency_table_workspace_inherited_names(
+                target.get("dev-dependencies"),
+                output,
+            );
+            collect_dependency_table_workspace_inherited_names(
+                target.get("build-dependencies"),
+                output,
+            );
+        }
+    }
+}
+
+fn collect_dependency_table_workspace_inherited_names(
+    value: Option<&toml::Value>,
+    output: &mut Vec<String>,
+) {
+    let Some(table) = value.and_then(toml::Value::as_table) else {
+        return;
+    };
+
+    for (dependency_name, dependency) in table {
+        if dependency
+            .as_table()
+            .and_then(|dependency| dependency.get("workspace"))
+            .and_then(toml::Value::as_bool)
+            .unwrap_or(false)
+        {
+            output.push(dependency_name.clone());
         }
     }
 }
