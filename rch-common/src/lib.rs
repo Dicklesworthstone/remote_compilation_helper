@@ -125,6 +125,10 @@ pub use patterns::{
     classify_command, classify_command_detailed, split_shell_commands,
 };
 pub use protocol::{HookInput, HookOutput, ToolInput};
+pub use remote_compilation::{
+    RCH_CARGO_HOME_BASE_VAR, RCH_CARGO_HOME_PREFIX, remote_cargo_home_base_prelude,
+    remote_cargo_home_expr,
+};
 pub use repo_updater_contract::{
     MockRepoUpdaterAdapter, REPO_UPDATER_ALIAS_PROJECTS_ROOT, REPO_UPDATER_CANONICAL_PROJECTS_ROOT,
     REPO_UPDATER_CONTRACT_SCHEMA_VERSION, REPO_UPDATER_DEFAULT_BINARY,

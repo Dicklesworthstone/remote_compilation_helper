@@ -14,6 +14,57 @@ No unreleased changes yet.
 
 ---
 
+## [v1.0.38] -- 2026-06-08 (release)
+
+### Fixes
+
+- **Stale-target reaper now sweeps every project under the canonical root.**
+  The reaper (added in v1.0.34) only ever swept the *current* build's project
+  directory, so once a project stopped dispatching builds its abandoned per-job
+  `.rch-target-<host>-job-*` dirs were never revisited and accumulated forever
+  (observed: 72 dirs / 332G on a single worker). It now roots its sweep at the
+  same `canonical_root` (`/data/projects`) where per-job dirs are actually
+  created, using a depth-robust `find -maxdepth 8 -type d -name
+  '.rch-target-*-job-*' -o -name '.rch-target-*-pid-*' -prune` that matches
+  top-level repos, canonical `<id>/<hash>` layouts, and nested workspace members
+  alike (the old fixed-depth `*/*/` glob silently missed both 1-level and
+  3+-level dirs). The `is_safe_reap_path` guard, the >12h newest-descendant idle
+  check (no `-type f`, so a freshly `mkdir`'d concurrent build survives — the
+  v1.0.35 race fix), and full-path exclusion of the live job dir are all
+  preserved; the live dir is excluded by exact path and a fresh project's dirs
+  are protected by the idle check.
+
+- **Isolated CARGO_HOME staging honors `TMPDIR`.** Per-job cargo-home dirs were
+  hardcoded under `/tmp` (`/tmp/rch-cargo-home-*`), which eats RAM on workers
+  with a tmpfs `/tmp`. The base is now resolved on the worker at execution time
+  to `$TMPDIR` (if a real directory) → `/data/tmp` (if present) → `/tmp`. The
+  `rch-cargo-home-` basename prefix is unchanged so external cleanup (sbh) still
+  matches, and the resolution is done in shell with all values double-quoted, so
+  a hostile `$TMPDIR` cannot inject. (rchd under systemd does not inherit PAM's
+  `/etc/environment`, so the resolution is explicit rather than relying on the
+  daemon's inherited env.)
+
+---
+
+## [v1.0.37] -- 2026-06-02 (release)
+
+### Fixes
+
+- **rchd: enforce a single instance via systemd cgroup detection** to stop
+  orphan/duplicate daemons (no-op on macOS / non-unit hosts).
+
+---
+
+## [v1.0.36] -- 2026-06-02 (release)
+
+### Fixes
+
+- **rch-common: pin a finite ControlPersist** to stop the SSH control-master
+  leak (leaked masters + telemetry gap). Corrects the `control_persist_idle`
+  documentation accordingly.
+
+---
+
 ## [v1.0.35] -- 2026-05-30 (release)
 
 ### Fixes

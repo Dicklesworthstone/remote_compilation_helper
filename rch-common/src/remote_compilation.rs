@@ -107,6 +107,55 @@ fn join_remote_path(base: &str, child: &str) -> String {
     }
 }
 
+/// Shell-snippet name of the variable that [`remote_cargo_home_base_prelude`]
+/// assigns the isolated-CARGO_HOME staging base into.
+pub const RCH_CARGO_HOME_BASE_VAR: &str = "RCH_CH_BASE";
+
+/// Basename prefix of every isolated CARGO_HOME staging dir. Cleanup/reaper
+/// passes (in-tree and external, e.g. sbh) match on this exact prefix, so it
+/// must never change.
+pub const RCH_CARGO_HOME_PREFIX: &str = "rch-cargo-home-";
+
+/// A POSIX-`sh` statement that resolves the temp base for isolated CARGO_HOME
+/// staging dirs **on the worker, at job-execution time**, into the shell
+/// variable [`RCH_CARGO_HOME_BASE_VAR`].
+///
+/// Why resolve remotely rather than bake a path in from the client: these dirs
+/// are created and used on the *worker*, and the worker's correct temp location
+/// (`$TMPDIR`, fleet-wide `/data/tmp`) is what matters, not the orchestrating
+/// client's. Critically, rchd runs under systemd and so does **not** inherit
+/// PAM's `/etc/environment` (where `TMPDIR=/data/tmp` lives) — but a build
+/// dispatched over SSH may, and either way the explicit `/data/tmp` fallback
+/// keeps these (potentially large, long-lived) caches off a tmpfs `/tmp` that
+/// would otherwise eat RAM.
+///
+/// Resolution order: `$TMPDIR` (if set and a real directory) → `/data/tmp`
+/// (if it exists) → `/tmp`.
+pub fn remote_cargo_home_base_prelude() -> String {
+    format!(
+        "{var}=\"${{TMPDIR:-}}\"; \
+         [ -n \"${var}\" ] && [ -d \"${var}\" ] || {var}=/data/tmp; \
+         [ -d \"${var}\" ] || {var}=/tmp",
+        var = RCH_CARGO_HOME_BASE_VAR
+    )
+}
+
+/// The shell expression (referencing the variable set by
+/// [`remote_cargo_home_base_prelude`]) for an isolated CARGO_HOME staging dir
+/// whose unique `suffix` is already path-safe. Keeps the
+/// [`RCH_CARGO_HOME_PREFIX`] basename so cleanup matching still works.
+///
+/// Returns an unquoted expression that must be embedded in a context where the
+/// shell expands `$VAR` (i.e. inside double quotes or bare); both call sites
+/// double-quote it.
+pub fn remote_cargo_home_expr(suffix: &str) -> String {
+    format!(
+        "${{{var}}}/{prefix}{suffix}",
+        var = RCH_CARGO_HOME_BASE_VAR,
+        prefix = RCH_CARGO_HOME_PREFIX
+    )
+}
+
 impl Default for RemoteCompilationTest {
     fn default() -> Self {
         Self {
@@ -326,11 +375,16 @@ impl RemoteCompilationTest {
         )
     }
 
-    /// Build the isolated remote CARGO_HOME path for a single build attempt.
+    /// Build the isolated remote CARGO_HOME shell *expression* for a single
+    /// build attempt. The temp base is resolved on the worker at execution time
+    /// (see [`remote_cargo_home_base_prelude`]), honoring `$TMPDIR` / `/data/tmp`
+    /// rather than hardcoding `/tmp`, so large caches stay off a tmpfs `/tmp`.
+    /// The returned string references the prelude's shell variable and must be
+    /// used in a `$VAR`-expanding (double-quoted) context.
     fn remote_cargo_home_path(&self, session_id: &str) -> String {
         let worker_id = sanitize_remote_path_component(self.worker.id.as_str(), "worker");
         let session_id = sanitize_remote_path_component(session_id, "session");
-        format!("/tmp/rch-cargo-home-{worker_id}-{session_id}")
+        remote_cargo_home_expr(&format!("{worker_id}-{session_id}"))
     }
 
     /// Build the project locally.
@@ -452,10 +506,14 @@ impl RemoteCompilationTest {
 
         // Generate a unique cargo home per build attempt to prevent cache lock contention.
         let session_id = Uuid::new_v4().simple().to_string();
+        // `cargo_home` is a shell *expression* (`${RCH_CH_BASE}/rch-cargo-home-…`)
+        // resolved on the worker by the prelude below — double-quote it (not
+        // shell-escape) so `$RCH_CH_BASE` expands; its suffix is charset-safe.
         let cargo_home = self.remote_cargo_home_path(&session_id);
+        let quoted_cargo_home = format!("\"{cargo_home}\"");
         let cargo_target_dir = format!("{}/target", remote_path);
-        let escaped_cargo_home = escape(Cow::from(&cargo_home));
         let escaped_cargo_target_dir = escape(Cow::from(&cargo_target_dir));
+        let cargo_home_base_prelude = remote_cargo_home_base_prelude();
 
         let cargo_args = if self.release_mode {
             "cargo build --release"
@@ -464,14 +522,14 @@ impl RemoteCompilationTest {
         };
         // Preserve the cargo status after removing the isolated cache.
         let build_cmd = format!(
-            "mkdir -p -- {} {} && cd {} && CARGO_HOME={} CARGO_TARGET_DIR={} CARGO_INCREMENTAL=0 {}; status=$?; rm -rf -- {}; exit $status",
-            escaped_cargo_home,
+            "{cargo_home_base_prelude}; mkdir -p -- {} {} && cd {} && CARGO_HOME={} CARGO_TARGET_DIR={} CARGO_INCREMENTAL=0 {}; status=$?; rm -rf -- {}; exit $status",
+            quoted_cargo_home,
             escaped_cargo_target_dir,
             escaped_remote_path,
-            escaped_cargo_home,
+            quoted_cargo_home,
             escaped_cargo_target_dir,
             cargo_args,
-            escaped_cargo_home
+            quoted_cargo_home
         );
 
         debug!(
@@ -1201,12 +1259,80 @@ mod tests {
             serde_json::json!({ "cargo_home": &cargo_home }),
         );
 
+        // The worker_id/session_id are still sanitized into the basename, but the
+        // base is now a worker-resolved shell variable (honoring $TMPDIR /
+        // /data/tmp) instead of a hardcoded /tmp.
         assert_eq!(
             cargo_home,
-            "/tmp/rch-cargo-home-worker-one-with-spaces-run-7-with-spaces"
+            "${RCH_CH_BASE}/rch-cargo-home-worker-one-with-spaces-run-7-with-spaces"
         );
 
         logger.pass();
+    }
+
+    /// The prelude must never bake in `/tmp`: it resolves the staging base on the
+    /// worker from `$TMPDIR` → `/data/tmp` → `/tmp` at execution time. rchd runs
+    /// under systemd without PAM's `/etc/environment`, so this explicit resolution
+    /// (not a client-baked path) is what keeps caches off a tmpfs `/tmp`.
+    #[test]
+    fn cargo_home_base_prelude_does_not_hardcode_tmp() {
+        let prelude = remote_cargo_home_base_prelude();
+        // Sets the documented variable, references $TMPDIR and /data/tmp.
+        assert!(prelude.contains(RCH_CARGO_HOME_BASE_VAR), "{prelude}");
+        assert!(
+            prelude.contains("$TMPDIR") || prelude.contains("${TMPDIR"),
+            "{prelude}"
+        );
+        assert!(prelude.contains("/data/tmp"), "{prelude}");
+        // /tmp only as the last-resort fallback, never as the leading base.
+        assert!(
+            !prelude.contains("/tmp/rch"),
+            "must not bake a /tmp path: {prelude}"
+        );
+    }
+
+    /// End-to-end behavioral check of the prelude's resolution order, executed
+    /// under POSIX `sh` so a regression in the snippet is actually caught.
+    #[cfg(unix)]
+    #[test]
+    fn cargo_home_base_prelude_resolves_tmpdir_first_then_data_tmp() {
+        use std::process::Command;
+        use tempfile::tempdir;
+
+        let prelude = remote_cargo_home_base_prelude();
+        let var = RCH_CARGO_HOME_BASE_VAR;
+        // Run the prelude then echo the resolved base, under controlled $TMPDIR.
+        let run = |tmpdir_env: Option<&str>| -> String {
+            let mut cmd = Command::new("sh");
+            cmd.arg("-c").arg(format!("{prelude}; printf '%s' \"${var}\""));
+            cmd.env_remove("TMPDIR");
+            if let Some(v) = tmpdir_env {
+                cmd.env("TMPDIR", v);
+            }
+            let out = cmd.output().expect("run prelude under sh");
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+
+        // $TMPDIR set to a real dir wins.
+        let dir = tempdir().expect("tempdir");
+        let real = dir.path().to_str().unwrap();
+        assert_eq!(run(Some(real)), real, "a real $TMPDIR must be honored");
+
+        // $TMPDIR unset → /data/tmp if it exists, else /tmp. Either is acceptable
+        // and proves we never depend on $TMPDIR being present (the systemd case).
+        let resolved = run(None);
+        assert!(
+            resolved == "/data/tmp" || resolved == "/tmp",
+            "unset $TMPDIR must fall back to /data/tmp or /tmp, got {resolved:?}"
+        );
+
+        // A bogus $TMPDIR (not a directory) must be rejected in favor of the
+        // existing fallback, never used blindly.
+        let bogus = run(Some("/nonexistent-rch-tmpdir-xyz"));
+        assert!(
+            bogus == "/data/tmp" || bogus == "/tmp",
+            "a non-directory $TMPDIR must be rejected, got {bogus:?}"
+        );
     }
 
     #[test]

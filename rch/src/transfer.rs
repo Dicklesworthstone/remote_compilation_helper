@@ -2220,19 +2220,28 @@ fi",
         }
     }
 
-    /// Best-effort reaping of *stale* sibling per-job target dirs for this
-    /// project on the worker.
+    /// Best-effort reaping of *stale* per-job target dirs across **every**
+    /// project under `canonical_root` on the worker.
     ///
     /// rch gives every forwarded-`CARGO_TARGET_DIR` build a per-job target dir
     /// (`.rch-target-<worker>-job-<id>-<ts>-<seq>`). Such a dir can stay in active
     /// use far beyond a single command — a long-running build keeps writing into
     /// it, and one was observed accumulating ~11.5h of build artifacts. So a
     /// per-job dir must *never* be removed merely because some build finished; that
-    /// could clip a build still in flight. Instead we remove only siblings that
+    /// could clip a build still in flight. Instead we remove only dirs that
     /// have seen **no file activity for `idle_hours`** — i.e. finished/abandoned
     /// ones. A dir idle that long cannot be a live job (an active build touches its
     /// dir continuously), so this never races a concurrent build on the same
     /// project, even when multiple agents build it on the same worker at once.
+    ///
+    /// Crucially the sweep is rooted at `canonical_root`, the common ancestor of
+    /// all projects on the worker — not at one project — because the reaper is
+    /// only driven by the current build: if it touched a single project's dir it
+    /// would never revisit an *abandoned* project (whose builds, by definition,
+    /// have stopped), so that project's idle per-job dirs would accumulate
+    /// forever on a worker that is busy building other projects. Sweeping the
+    /// whole canonical root means any dispatched build reclaims stale dirs across
+    /// every project on the worker.
     ///
     /// The staleness check looks at the dir itself *and* any descendant (file or
     /// subdir): a recent deep file means an active build (a top-dir-mtime-only
@@ -2248,19 +2257,36 @@ fi",
         &self,
         worker: &WorkerConfig,
         idle_hours: u32,
+        canonical_root: &str,
     ) {
-        let project_dir = self.remote_path();
-        let current = self.remote_cargo_target_dir_name.clone();
+        // The sweep must be rooted at the *canonical project root* (e.g.
+        // `/data/projects`), the common ancestor of every project on the worker
+        // — NOT `transfer_config.remote_base` (`/tmp/rch`). Per-job target dirs
+        // are created at `<remote_path()>/<remote_cargo_target_dir_name>`, where
+        // `remote_path()` is the `with_remote_path_override(entry.remote_root)`
+        // value the hook supplies. `entry.remote_root` is
+        // `map_sync_root_to_remote_root(...)` = `<canonical_root>/<relative>`,
+        // so the live dir — and every sibling/other-project per-job dir — lives
+        // under `canonical_root`, never under `remote_base`. The caller passes
+        // the same `topology_policy.canonical_root()` used to build those paths.
+        let canonical_root = canonical_root.trim_end_matches('/');
+
+        // The live dir for *this* job — excluded from reaping by full path.
+        let live_target_dir = format!(
+            "{}/{}",
+            self.remote_path().trim_end_matches('/'),
+            self.remote_cargo_target_dir_name
+        );
 
         // Hard safety guards. Both values are rch-generated and should be simple
         // path tokens; refuse anything that could escape the intended
-        // `<project_dir>/.rch-target-*` scope or inject shell syntax. The reap
-        // script embeds these unescaped (inside double quotes), so this guard is
-        // the security boundary.
-        if !is_safe_reap_path(&project_dir) || !is_safe_reap_token(&current) {
+        // `<canonical_root>/**/.rch-target-*` scope or inject shell syntax. The
+        // reap script embeds these unescaped (inside double quotes), so this
+        // guard is the security boundary.
+        if !is_safe_reap_path(canonical_root) || !is_safe_reap_path(&live_target_dir) {
             warn!(
-                "stale-target reap: refusing unsafe inputs (project_dir={:?}, current={:?})",
-                project_dir, current
+                "stale-target reap: refusing unsafe inputs (canonical_root={:?}, live_target_dir={:?})",
+                canonical_root, live_target_dir
             );
             return;
         }
@@ -2269,8 +2295,8 @@ fi",
 
         if use_mock_transport(worker) {
             debug!(
-                "Mock stale-target reap in {} on {} (idle>{}h)",
-                project_dir, worker.id, idle_hours
+                "Mock stale-target reap under {} on {} (idle>{}h, keep {})",
+                canonical_root, worker.id, idle_hours, live_target_dir
             );
             return;
         }
@@ -2282,22 +2308,8 @@ fi",
 
         #[cfg(unix)]
         {
-            // For each per-job sibling dir: keep it if the dir OR any descendant
-            // was modified within the idle window (an active or just-created
-            // build); otherwise remove it. `-mmin -N -print -quit` stops at the
-            // first recent entry, so live dirs are detected cheaply. Deliberately
-            // NO `-type f`: an empty, just-`mkdir`'d dir (a concurrent build's
-            // target before its first write) has zero files but a recent dir
-            // mtime, and must be kept. This job's own dir is always excluded.
-            let script = format!(
-                "cd \"{project_dir}\" 2>/dev/null || exit 0; \
-                 for d in .rch-target-*-job-* .rch-target-*-pid-*; do \
-                 [ -d \"$d\" ] || continue; \
-                 [ \"$d\" = \"{current}\" ] && continue; \
-                 if find \"$d\" -mmin -{idle_minutes} -print -quit 2>/dev/null | grep -q .; then continue; fi; \
-                 rm -rf -- \"$d\"; \
-                 done"
-            );
+            let script =
+                build_stale_target_reap_script(canonical_root, &live_target_dir, idle_minutes);
             // Detach on the worker so a large reclaim runs concurrently with the
             // build rather than blocking it. The script contains no single quotes
             // (inputs are charset-restricted above), so single-quoting is safe.
@@ -2324,6 +2336,62 @@ fi",
     }
 }
 
+/// Build the POSIX-`sh` reap script that sweeps abandoned per-job target dirs
+/// across **every** project under `canonical_root` (e.g. `/data/projects`).
+///
+/// Why a depth-robust `find` rather than a fixed-depth glob: a top-level project
+/// lives one level under `canonical_root` (`<root>/<repo>/.rch-target-*`), a
+/// canonical multi-repo layout two levels (`<root>/<id>/<hash>/.rch-target-*`),
+/// and a workspace member three or more — so no single `*/*/…` glob can find
+/// them all. `find -maxdepth 8 -name ".rch-target-*-job-*" -o -name
+/// ".rch-target-*-pid-*" -prune` matches the per-job dir at *any* of those
+/// depths and `-prune`s so it never descends into the (large) artifact tree.
+/// The bound is 8 (not the per-job dir's typical depth of 2-4) to give deep
+/// nested layouts — e.g. `<root>/org/team/repo/crate/.rch-target-*` — ample
+/// headroom while still bounding the source-tree walk; `-prune` already keeps
+/// the giant artifact trees out of the traversal cost.
+///
+/// For each candidate dir it keeps the dir if the dir OR any descendant was
+/// modified within the idle window (an active or just-`mkdir`'d build);
+/// otherwise it removes it. The inner `find "$d" -mmin -N -print -quit` stops at
+/// the first recent entry, so live dirs are detected cheaply. Deliberately NO
+/// `-type f`: an empty, just-created dir (a concurrent build's target before its
+/// first write) has zero files but a recent dir mtime and must be kept (the
+/// v1.0.35 race fix). `live_target_dir` (this job's own dir, an absolute path)
+/// is always excluded by full path.
+///
+/// The `-name` glob patterns are wrapped in **double** quotes, not single: the
+/// whole script is later embedded in a single-quoted `sh -c '…'` at the dispatch
+/// site, so it must contain no single quote of its own. Double quotes keep the
+/// `*` literal (the shell does not glob inside `"…"`, and `find` does its own
+/// glob matching), so this is equivalent without introducing a single quote.
+///
+/// Inputs are charset-restricted by [`is_safe_reap_path`] before this is called,
+/// so they embed safely inside the double-quoted context and the whole script
+/// embeds safely inside single quotes.
+#[cfg(unix)]
+fn build_stale_target_reap_script(
+    canonical_root: &str,
+    live_target_dir: &str,
+    idle_minutes: u64,
+) -> String {
+    // `find … -prune` emits (via the implicit `-print`) one absolute candidate
+    // dir per line. We iterate it with a `while read` over a process
+    // substitution-free pipe so it stays POSIX `sh`-portable. Each candidate is
+    // the per-job dir itself (pruned), so the per-dir idle check runs against
+    // `$d` directly.
+    format!(
+        "[ -d \"{canonical_root}\" ] || exit 0; \
+         find \"{canonical_root}\" -maxdepth 8 -type d \\( -name \".rch-target-*-job-*\" -o -name \".rch-target-*-pid-*\" \\) -prune 2>/dev/null | \
+         while IFS= read -r d; do \
+         [ -d \"$d\" ] || continue; \
+         [ \"$d\" = \"{live_target_dir}\" ] && continue; \
+         if find \"$d\" -mmin -{idle_minutes} -print -quit 2>/dev/null | grep -q .; then continue; fi; \
+         rm -rf -- \"$d\"; \
+         done"
+    )
+}
+
 /// Whether `s` is safe to use as the `cd` target of the stale-target reap
 /// script: absolute, at least two path segments deep (never `/` or a bare
 /// top-level dir), no `..`, and composed only of unambiguous path characters
@@ -2337,7 +2405,9 @@ fn is_safe_reap_path(s: &str) -> bool {
 }
 
 /// Whether `s` is safe to embed as a directory basename token in the reap
-/// script (the current job's dir name, used to exclude it from reaping).
+/// script. Retained as a reusable charset validator (and exercised by tests);
+/// the reaper now excludes the live dir by full path via [`is_safe_reap_path`].
+#[cfg(test)]
 fn is_safe_reap_token(s: &str) -> bool {
     !s.is_empty()
         && s != "."
@@ -2886,6 +2956,142 @@ mod tests {
         assert!(!is_safe_reap_token("a'b"));
         assert!(!is_safe_reap_token("a$b"));
         assert!(!is_safe_reap_token("a*b"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_build_stale_target_reap_script_roots_at_canonical_root() {
+        // The script must be rooted at the canonical root (the common ancestor
+        // of all projects), use a depth-robust `find` (not a fixed-depth glob),
+        // prune at the per-job dir, and exclude the live dir by full path.
+        let script = build_stale_target_reap_script(
+            "/data/projects",
+            "/data/projects/projA/hash1/.rch-target-host-job-2-222-1",
+            720,
+        );
+        assert!(
+            script.contains("[ -d \"/data/projects\" ]"),
+            "must guard on the canonical root: {script}"
+        );
+        assert!(
+            script.contains("find \"/data/projects\" -maxdepth 8 -type d"),
+            "must sweep the whole canonical root depth-robustly: {script}"
+        );
+        assert!(
+            script.contains("-name \".rch-target-*-job-*\"")
+                && script.contains("-name \".rch-target-*-pid-*\""),
+            "must match both per-job dir name shapes: {script}"
+        );
+        // The script must contain no single quote of its own, because the
+        // dispatch site wraps it in a single-quoted `sh -c '…'`.
+        assert!(
+            !script.contains('\''),
+            "script must not contain single quotes (single-quote-wrapped at dispatch): {script}"
+        );
+        assert!(
+            script.contains("-prune"),
+            "must prune so it never descends into the artifact tree: {script}"
+        );
+        assert!(
+            script.contains(
+                "[ \"$d\" = \"/data/projects/projA/hash1/.rch-target-host-job-2-222-1\" ]"
+            ),
+            "must exclude the live dir by full path: {script}"
+        );
+        assert!(
+            script.contains("-mmin -720"),
+            "must use the idle window: {script}"
+        );
+        // No `-type f` in the inner idle check, so a freshly-`mkdir`'d empty dir
+        // (recent dir mtime) is kept.
+        assert!(
+            !script.contains("-mmin -720 -type f"),
+            "inner idle check must not require files: {script}"
+        );
+        // Must NOT be rooted at the /tmp/rch transfer base (the prior C1 defect).
+        assert!(
+            !script.contains("/tmp/rch"),
+            "must not root the sweep at remote_base: {script}"
+        );
+    }
+
+    /// End-to-end behavioral test: actually run the reap script (under POSIX
+    /// `sh`) against a fake multi-project canonical-root tree and assert which
+    /// dirs survive. This is the regression guard for the two reaper defects:
+    ///   * C1 — the reaper used to `cd` into `remote_base` (`/tmp/rch`), the
+    ///     wrong tree, so it was a silent no-op. Here the sweep base is the
+    ///     canonical root, *distinct* from any `remote_base`.
+    ///   * C2 — the reaper used a fixed two-level glob, missing top-level and
+    ///     workspace-member projects. Here projects live at DEPTH 1, 2, and 3.
+    #[cfg(unix)]
+    #[test]
+    fn test_reap_script_collects_idle_dirs_across_depths_and_projects() {
+        use std::fs;
+        use std::process::Command;
+        use tempfile::tempdir;
+
+        let canonical = tempdir().expect("create canonical root");
+        let root = canonical.path();
+
+        // Helper: make a per-job target dir (at an arbitrary relative project
+        // path) containing one artifact, optionally aging the whole subtree to a
+        // long-past timestamp (well beyond the 12h idle window).
+        let make_dir = |rel_project: &str, name: &str, aged: bool| -> std::path::PathBuf {
+            let job_dir = root.join(rel_project).join(name);
+            let deps = job_dir.join("deps");
+            fs::create_dir_all(&deps).expect("mkdir per-job dir");
+            fs::write(deps.join("artifact.rlib"), b"x").expect("write artifact");
+            if aged {
+                let ok = Command::new("find")
+                    .arg(&job_dir)
+                    .args(["-exec", "touch", "-t", "202601010000", "{}", ";"])
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+                assert!(ok, "aging {name} should succeed");
+            }
+            job_dir
+        };
+
+        // DEPTH 1: a top-level project directly under the canonical root.
+        let depth1_idle = make_dir("projTop", ".rch-target-host-job-1-111-0", true);
+        // DEPTH 2: canonical `<id>/<hash>` layout — one idle dir + the live dir.
+        let depth2_idle = make_dir("projA/hash1", ".rch-target-host-job-2-222-0", true);
+        let live = make_dir("projA/hash1", ".rch-target-host-job-3-333-1", false);
+        // DEPTH 3: a workspace member, in an entirely separate abandoned project
+        // — the case the old per-project, fixed-depth reaper could never reach.
+        let depth3_idle = make_dir("projB/hash9/member", ".rch-target-host-job-9-999-0", true);
+        // A freshly-created EMPTY dir must be kept (v1.0.35 race fix).
+        let empty = root.join("projA/hash1/.rch-target-host-job-4-444-0");
+        fs::create_dir_all(&empty).expect("mkdir empty fresh dir");
+        // A recently-touched (not idle) abandoned-looking dir must be kept.
+        let recent = make_dir("projC/hash3", ".rch-target-host-job-5-555-0", false);
+
+        let script =
+            build_stale_target_reap_script(root.to_str().unwrap(), live.to_str().unwrap(), 720);
+        // Run the script through the SAME single-quote wrapping the dispatch site
+        // uses (`sh -c '<script>'`, minus the nohup/backgrounding so the test can
+        // wait). This guards against the script containing a single quote that
+        // would prematurely terminate the wrapper.
+        let wrapped = format!("sh -c '{script}'");
+        let status = Command::new("sh")
+            .arg("-c")
+            .arg(&wrapped)
+            .status()
+            .expect("run reap script");
+        assert!(status.success(), "reap script should exit 0");
+
+        // Idle dirs at depths 1, 2 and 3 (across separate projects) are reaped.
+        assert!(!depth1_idle.exists(), "idle DEPTH-1 dir must be reaped");
+        assert!(!depth2_idle.exists(), "idle DEPTH-2 dir must be reaped");
+        assert!(
+            !depth3_idle.exists(),
+            "idle DEPTH-3 dir in OTHER project must be reaped (the bug)"
+        );
+        // Live, freshly-empty, and recently-touched dirs survive.
+        assert!(live.exists(), "live dir must be preserved");
+        assert!(empty.exists(), "freshly-created empty dir must be preserved");
+        assert!(recent.exists(), "recently-touched dir must be preserved");
     }
 
     #[test]

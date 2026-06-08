@@ -3252,12 +3252,12 @@ fn cargo_target_env_overrides(local_target_dir: Option<&Path>) -> Option<HashMap
     Some(overrides)
 }
 
-fn remote_cargo_target_dir_name(build_id: Option<u64>, worker_id: &WorkerId) -> String {
-    static REMOTE_CARGO_TARGET_DIR_SEQUENCE: std::sync::atomic::AtomicU64 =
-        std::sync::atomic::AtomicU64::new(0);
-
-    let safe_worker_id = worker_id
-        .as_str()
+/// Reduce an arbitrary token to a path-safe basename component: ASCII
+/// alphanumerics, `-` and `_` are kept; everything else collapses to `-`,
+/// leading/trailing `-` are trimmed, and an empty result falls back to
+/// `"worker"`. Shared by the per-job target dir and isolated CARGO_HOME naming.
+fn sanitize_cargo_home_token(token: &str) -> String {
+    let safe = token
         .chars()
         .map(|ch| {
             if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
@@ -3267,12 +3267,19 @@ fn remote_cargo_target_dir_name(build_id: Option<u64>, worker_id: &WorkerId) -> 
             }
         })
         .collect::<String>();
-    let safe_worker_id = safe_worker_id.trim_matches('-');
-    let safe_worker_id = if safe_worker_id.is_empty() {
-        "worker"
+    let safe = safe.trim_matches('-');
+    if safe.is_empty() {
+        "worker".to_string()
     } else {
-        safe_worker_id
-    };
+        safe.to_string()
+    }
+}
+
+fn remote_cargo_target_dir_name(build_id: Option<u64>, worker_id: &WorkerId) -> String {
+    static REMOTE_CARGO_TARGET_DIR_SEQUENCE: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+
+    let safe_worker_id = sanitize_cargo_home_token(worker_id.as_str());
     let job_id = build_id
         .map(|id| format!("job-{id}"))
         .unwrap_or_else(|| format!("pid-{}", std::process::id()));
@@ -6210,8 +6217,18 @@ async fn execute_remote_compilation(
     // worker (a backgrounded rm); only a quick SSH dispatch is awaited here.
     // Best-effort; gated to the forwarded-CARGO_TARGET_DIR mode that makes per-job dirs.
     if forwarded_cargo_target_dir.is_some() {
+        // Sweep across the canonical project root (the common ancestor of every
+        // project on the worker) so abandoned per-job dirs in *other* projects
+        // are reclaimed too — not just the one currently building. This is the
+        // same root the per-job target dirs are created under (see
+        // `map_sync_root_to_remote_root`).
+        let canonical_root = topology_policy.canonical_root().to_string_lossy().to_string();
         pipeline
-            .reap_stale_sibling_per_job_target_dirs(&worker_config, stale_target_reap_idle_hours())
+            .reap_stale_sibling_per_job_target_dirs(
+                &worker_config,
+                stale_target_reap_idle_hours(),
+                &canonical_root,
+            )
             .await;
     }
     reporter.verbose(&format!(
@@ -6715,16 +6732,23 @@ fn add_cargo_isolation(command: &str, worker_id: &WorkerId) -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let cargo_home = format!(
-        "/tmp/rch-cargo-home-{}-{}-{}",
-        worker_id, session_id, timestamp
-    );
+    // The staging base is resolved on the worker at execution time (honoring
+    // $TMPDIR / /data/tmp / /tmp) rather than hardcoding /tmp, so these caches
+    // don't eat RAM on tmpfs-/tmp hosts. `cargo_home` is therefore a shell
+    // expression (`${RCH_CH_BASE}/rch-cargo-home-…`) and must be double-quoted,
+    // not shell-escaped, so `$RCH_CH_BASE` expands; the worker_id is sanitized
+    // and the rest is numeric, so the basename needs no further escaping.
+    let safe_worker_id = sanitize_cargo_home_token(worker_id.as_str());
+    let cargo_home =
+        rch_common::remote_cargo_home_expr(&format!("{safe_worker_id}-{session_id}-{timestamp}"));
+    let quoted_cargo_home = format!("\"{cargo_home}\"");
+    let base_prelude = rch_common::remote_cargo_home_base_prelude();
 
-    let escaped_cargo_home = shell_escape::escape(cargo_home.as_str().into());
     let escaped_command = shell_escape::escape(command.into());
     let script = format!(
-        "mkdir -p {cargo_home} || exit $?; export CARGO_HOME={cargo_home}; sh -c {command}; status=$?; rm -rf {cargo_home}; exit $status",
-        cargo_home = escaped_cargo_home,
+        "{base_prelude}; mkdir -p {cargo_home} || exit $?; export CARGO_HOME={cargo_home}; sh -c {command}; status=$?; rm -rf {cargo_home}; exit $status",
+        base_prelude = base_prelude,
+        cargo_home = quoted_cargo_home,
         command = escaped_command
     );
 
@@ -9119,12 +9143,33 @@ The file `x11.pc` needs to be installed and the PKG_CONFIG_PATH environment vari
 
         assert!(isolated.starts_with("sh -c "));
         assert!(!isolated.starts_with("CARGO_HOME="));
-        assert!(isolated.contains("mkdir -p /tmp/rch-cargo-home-test-worker-"));
-        assert!(isolated.contains("CARGO_HOME=/tmp/rch-cargo-home-test-worker-"));
+        // The staging base is resolved on the worker (no hardcoded /tmp) and the
+        // basename keeps the rch-cargo-home- prefix that cleanup matches.
+        assert!(
+            !isolated.contains("/tmp/rch-cargo-home-"),
+            "must not hardcode /tmp: {isolated}"
+        );
+        assert!(isolated.contains("RCH_CH_BASE="));
+        assert!(isolated.contains("/data/tmp"));
+        assert!(isolated.contains("mkdir -p \"${RCH_CH_BASE}/rch-cargo-home-test-worker-"));
+        assert!(isolated.contains("CARGO_HOME=\"${RCH_CH_BASE}/rch-cargo-home-test-worker-"));
         assert!(isolated.contains("cargo build --release"));
         assert!(isolated.contains("status=$?"));
         assert!(isolated.contains("exit $status"));
-        assert!(isolated.contains("rm -rf /tmp/rch-cargo-home-test-worker-"));
+        assert!(isolated.contains("rm -rf \"${RCH_CH_BASE}/rch-cargo-home-test-worker-"));
+    }
+
+    #[test]
+    fn test_sanitize_cargo_home_token_collapses_unsafe_chars() {
+        // Path-safe tokens pass through unchanged.
+        assert_eq!(sanitize_cargo_home_token("worker-1_2"), "worker-1_2");
+        // Spaces, slashes and other shell-meaningful chars collapse to '-'.
+        assert_eq!(sanitize_cargo_home_token("a b/c"), "a-b-c");
+        // Leading/trailing unsafe chars are trimmed, not left as dangling '-'.
+        assert_eq!(sanitize_cargo_home_token("  weird!! "), "weird");
+        // An entirely-unsafe (or empty) token falls back to a stable default.
+        assert_eq!(sanitize_cargo_home_token("***"), "worker");
+        assert_eq!(sanitize_cargo_home_token(""), "worker");
     }
 
     #[test]
@@ -9150,12 +9195,16 @@ The file `x11.pc` needs to be installed and the PKG_CONFIG_PATH environment vari
         let isolated = add_cargo_isolation(complex_command, &worker_id);
 
         assert!(isolated.starts_with("sh -c "));
-        assert!(isolated.contains("mkdir -p /tmp/rch-cargo-home-worker-123-"));
-        assert!(isolated.contains("CARGO_HOME=/tmp/rch-cargo-home-worker-123-"));
+        assert!(
+            !isolated.contains("/tmp/rch-cargo-home-"),
+            "must not hardcode /tmp: {isolated}"
+        );
+        assert!(isolated.contains("mkdir -p \"${RCH_CH_BASE}/rch-cargo-home-worker-123-"));
+        assert!(isolated.contains("CARGO_HOME=\"${RCH_CH_BASE}/rch-cargo-home-worker-123-"));
         assert!(isolated.contains("cd /some/path && RUSTFLAGS=\"-C target-cpu=native\" cargo test --release --features=foo"));
         assert!(isolated.contains("status=$?"));
         assert!(isolated.contains("exit $status"));
-        assert!(isolated.contains("rm -rf /tmp/rch-cargo-home-worker-123-"));
+        assert!(isolated.contains("rm -rf \"${RCH_CH_BASE}/rch-cargo-home-worker-123-"));
     }
 
     #[test]
