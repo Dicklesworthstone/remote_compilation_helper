@@ -14,6 +14,134 @@ No unreleased changes yet.
 
 ---
 
+## [v1.0.41] -- 2026-06-08 (release)
+
+### Added
+
+- **Autonomous worker-side stale-target reaper (default-OFF).** `rchd` gains an
+  optional periodic background sweep that SSHes each healthy worker every
+  `interval_mins` (default 120) and reaps abandoned per-job `.rch-target-*-job-*`
+  / `.rch-target-*-pid-*` dirs idle >`idle_hours` (default 12h) across **all**
+  repos under the worker's canonical project root — closing the gap where the
+  orchestrator hook only ever reaps the single repo currently being built (the
+  ~1.6 TB-across-the-fleet accumulation). Shares one predicate with the hook
+  reaper (`rch_common::stale_target_reap`) so the two cannot drift. Depth-robust
+  (`find -maxdepth 8 -prune`, catches nested workspace members), canonicalizes a
+  symlinked base, and re-asserts a ≥2-path-segment guard on the resolved root.
+  **Ships default-OFF** (this is an autonomous periodic deleter targeting
+  `/data/projects`); enable per-host with `RCH_WORKER_REAP_ENABLE=1` or
+  `[stale_target_reap] enabled = true`, disable with `RCH_WORKER_REAP_DISABLE=1`.
+
+### Changed
+
+- **Orchestrator hook reaper reverted to cheap current-project-only.** With the
+  daemon now handling cross-repo GC, the hook reaper no longer does a full
+  `find` over the canonical root on every build dispatch (the v1.0.38/39
+  behavior) — it again sweeps only the just-built repo's sibling per-job dirs via
+  a `cd`-based glob (which also follows a symlinked project dir natively). This
+  removes the per-dispatch full-tree walk.
+
+### Fixes
+
+- **`rch daemon restart` now cycles a systemd-managed rchd.** On hosts where
+  rchd runs as a systemd `--user` (or system) unit, the old socket-shutdown +
+  spawn path could not restart the unit (systemd respawned the old on-disk
+  image; the manual spawn deferred to systemd and exited), leaving a stale
+  binary running. `rch daemon restart` now detects a systemd-managed rchd and
+  restarts via `systemctl [--user] restart rchd`, falling back to the manual
+  path for user-launched daemons and macOS launchd.
+- **`rch update` retries transient download/checksum failures.** GitHub
+  `502/503/504`/`429` and request timeouts on the release asset or its `.sha256`
+  sidecar are now retried with bounded backoff (4 attempts, 2s/5s/15s) instead
+  of aborting (the "Checksum not found" symptom was a 504 on the sidecar). A
+  genuine checksum **mismatch** (corruption) and a `404` (asset absent) remain
+  hard failures.
+
+---
+
+## [v1.0.40] -- 2026-06-08 (release)
+
+### Fixes
+
+- **`rch exec` reaps the whole test process group at the runtime cap.** Killing
+  only the direct child left grandchildren (test servers, fixtures) orphaned —
+  observed as 20-45h orphan trees pinning worker resources. The cap now reaps the
+  entire process group. (Also tightens `rchd` cache-cleanup and cancellation
+  handling.)
+
+---
+
+## [v1.0.39] -- 2026-06-08 (release)
+
+### Fixes
+
+- **Stale-target reaper now works when the canonical root is a symlink on the
+  worker.** v1.0.38 rooted the sweep at the orchestrator's `canonical_root`, but
+  on a real worker that path is frequently a symlink (the macOS orchestrator
+  passes `/Users/<u>/projects`, which is a symlink to `/data/projects` on the
+  worker) and `find <symlink>` does not descend the target without `-L`. The
+  reaper was therefore a silent no-op for builds dispatched from such an
+  orchestrator (found by live canary testing). The generated reap script now
+  canonicalizes the root and the live-dir path at runtime (`cd … && pwd -P`)
+  before walking, so `find` traverses the real tree and the live-dir exclusion
+  still matches the physical paths `find` emits. `-L` is deliberately *not* used
+  (following arbitrary in-tree symlinks during a root-owned delete sweep is
+  unsafe). A defense-in-depth check re-asserts the ≥2-path-segment invariant on
+  the *resolved* root before any `find`/`rm`.
+
+---
+
+## [v1.0.38] -- 2026-06-08 (release)
+
+### Fixes
+
+- **Stale-target reaper now sweeps every project under the canonical root.**
+  The reaper (added in v1.0.34) only ever swept the *current* build's project
+  directory, so once a project stopped dispatching builds its abandoned per-job
+  `.rch-target-<host>-job-*` dirs were never revisited and accumulated forever
+  (observed: 72 dirs / 332G on a single worker). It now roots its sweep at the
+  same `canonical_root` (`/data/projects`) where per-job dirs are actually
+  created, using a depth-robust `find -maxdepth 8 -type d -name
+  '.rch-target-*-job-*' -o -name '.rch-target-*-pid-*' -prune` that matches
+  top-level repos, canonical `<id>/<hash>` layouts, and nested workspace members
+  alike (the old fixed-depth `*/*/` glob silently missed both 1-level and
+  3+-level dirs). The `is_safe_reap_path` guard, the >12h newest-descendant idle
+  check (no `-type f`, so a freshly `mkdir`'d concurrent build survives — the
+  v1.0.35 race fix), and full-path exclusion of the live job dir are all
+  preserved; the live dir is excluded by exact path and a fresh project's dirs
+  are protected by the idle check.
+
+- **Isolated CARGO_HOME staging honors `TMPDIR`.** Per-job cargo-home dirs were
+  hardcoded under `/tmp` (`/tmp/rch-cargo-home-*`), which eats RAM on workers
+  with a tmpfs `/tmp`. The base is now resolved on the worker at execution time
+  to `$TMPDIR` (if a real directory) → `/data/tmp` (if present) → `/tmp`. The
+  `rch-cargo-home-` basename prefix is unchanged so external cleanup (sbh) still
+  matches, and the resolution is done in shell with all values double-quoted, so
+  a hostile `$TMPDIR` cannot inject. (rchd under systemd does not inherit PAM's
+  `/etc/environment`, so the resolution is explicit rather than relying on the
+  daemon's inherited env.)
+
+---
+
+## [v1.0.37] -- 2026-06-02 (release)
+
+### Fixes
+
+- **rchd: enforce a single instance via systemd cgroup detection** to stop
+  orphan/duplicate daemons (no-op on macOS / non-unit hosts).
+
+---
+
+## [v1.0.36] -- 2026-06-02 (release)
+
+### Fixes
+
+- **rch-common: pin a finite ControlPersist** to stop the SSH control-master
+  leak (leaked masters + telemetry gap). Corrects the `control_persist_idle`
+  documentation accordingly.
+
+---
+
 ## [v1.0.35] -- 2026-05-30 (release)
 
 ### Fixes

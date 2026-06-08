@@ -67,17 +67,41 @@ fn build_cleanup_command(escaped_base: &str, max_cache_age_hours: u64, min_free_
     let max_age_minutes = max_cache_age_hours.saturating_mul(60);
     let threshold_kb = cleanup_threshold_kb(min_free_gb);
     let active_grace_minutes = 5_u64;
+    // Worker-side orphan watchdog: a pgid-tracked job whose `.pgid` file is older
+    // than this AND whose process group still contains a member running this long
+    // is a stuck/orphaned build (escaped the in-session watchdog via ssh-drop or a
+    // daemon restart). 240 min is far above any legitimate test cap (default 30
+    // min), and the dual age check (file mtime + member elapsed time) prevents a
+    // reused pgid from ever matching. See transfer.rs build_id watchdog.
+    let orphan_after_minutes = 240_u64;
     format!(
         "set -u; \
          base={base}; \
          max_age_minutes={max_age_minutes}; \
          threshold_kb={threshold_kb}; \
          active_grace_minutes={active_grace_minutes}; \
+         orphan_after_minutes={orphan_after_minutes}; \
          if [ ! -d \"$base\" ]; then mkdir -p \"$base\"; fi; \
          before_kb=$(df -Pk \"$base\" 2>/dev/null | awk 'NR==2 {{print $4}}'); \
          if [ -z \"$before_kb\" ]; then before_kb=0; fi; \
-         removed=0; freed_kb=0; low_disk=0; remove_errors=0; \
+         removed=0; freed_kb=0; low_disk=0; remove_errors=0; orphans_killed=0; \
          if [ \"$before_kb\" -lt \"$threshold_kb\" ]; then low_disk=1; fi; \
+         if [ -d /tmp/rch-run ]; then \
+           for pgf in /tmp/rch-run/*/*.pgid; do \
+             [ -f \"$pgf\" ] || continue; \
+             pg=$(cat \"$pgf\" 2>/dev/null); \
+             case \"$pg\" in ''|*[!0-9]*) continue ;; esac; \
+             [ \"$pg\" -gt 1 ] || continue; \
+             [ -n \"$(find \"$pgf\" -mmin +\"$orphan_after_minutes\" -print 2>/dev/null)\" ] || continue; \
+             if ! kill -0 -\"$pg\" 2>/dev/null; then rm -f \"$pgf\" 2>/dev/null; continue; fi; \
+             oldest=$(pgrep -g \"$pg\" 2>/dev/null | while IFS= read -r p; do ps -o etimes= -p \"$p\" 2>/dev/null; done | tr -d ' ' | sort -n | tail -1); \
+             case \"$oldest\" in ''|*[!0-9]*) continue ;; esac; \
+             if [ \"$oldest\" -ge $((orphan_after_minutes * 60)) ]; then \
+               if kill -KILL -\"$pg\" 2>/dev/null; then orphans_killed=$((orphans_killed + 1)); fi; \
+               rm -f \"$pgf\" 2>/dev/null; \
+             fi; \
+           done; \
+         fi; \
          candidates=$(mktemp /tmp/rch-cleanup.XXXXXX); \
          if [ \"$low_disk\" -eq 1 ]; then \
            find \"$base\" -mindepth 2 -maxdepth 2 -type d -printf '%T@ %p\\n' 2>/dev/null \
@@ -107,12 +131,13 @@ fn build_cleanup_command(escaped_base: &str, max_cache_age_hours: u64, min_free_
          rm -f \"$candidates\"; \
          after_kb=$(df -Pk \"$base\" 2>/dev/null | awk 'NR==2 {{print $4}}'); \
          if [ -z \"$after_kb\" ]; then after_kb=0; fi; \
-         printf 'RCH_CLEANUP_METRICS removed=%s freed_kb=%s before_kb=%s after_kb=%s low_disk=%s remove_errors=%s\\n' \"$removed\" \"$freed_kb\" \"$before_kb\" \"$after_kb\" \"$low_disk\" \"$remove_errors\"; \
+         printf 'RCH_CLEANUP_METRICS removed=%s freed_kb=%s before_kb=%s after_kb=%s low_disk=%s remove_errors=%s orphans_killed=%s\\n' \"$removed\" \"$freed_kb\" \"$before_kb\" \"$after_kb\" \"$low_disk\" \"$remove_errors\" \"$orphans_killed\"; \
          if [ \"$remove_errors\" -gt 0 ]; then exit 1; fi",
         base = escaped_base,
         max_age_minutes = max_age_minutes,
         threshold_kb = threshold_kb,
         active_grace_minutes = active_grace_minutes,
+        orphan_after_minutes = orphan_after_minutes,
     )
 }
 
@@ -1036,5 +1061,33 @@ mod tests {
         assert!(command.contains("RCH_CLEANUP_METRICS"));
         assert!(command.contains("low_disk"));
         assert!(command.contains("remove_errors"));
+    }
+
+    #[test]
+    fn test_build_cleanup_command_orphan_sweeper_guards() {
+        // The worker-side orphan sweeper must reap stuck pgid groups but be
+        // hardened against pgid reuse and against ever touching pid 0/1.
+        let _guard = test_guard!();
+        let command = build_cleanup_command("'/tmp/rch'", 72, 10);
+        // Threshold wired (240 min).
+        assert!(command.contains("orphan_after_minutes=240"));
+        // Scans only the fixed run-dir.
+        assert!(command.contains("for pgf in /tmp/rch-run/*/*.pgid"));
+        // pgid must be all-digits and > 1 (never signal pid 0/1 / "kill -- -1").
+        assert!(command.contains("case \"$pg\" in ''|*[!0-9]*) continue ;; esac"));
+        assert!(command.contains("[ \"$pg\" -gt 1 ] || continue"));
+        // Only sweep files older than the threshold.
+        assert!(command.contains("-mmin +\"$orphan_after_minutes\""));
+        // Liveness check before kill; clean up dead-group files (no `--`: dash).
+        assert!(command.contains("kill -0 -\"$pg\""));
+        // Reuse guard: a group member must actually have been running that long.
+        assert!(command.contains("pgrep -g \"$pg\""));
+        assert!(command.contains("ps -o etimes= -p \"$p\""));
+        assert!(command.contains("[ \"$oldest\" -ge $((orphan_after_minutes * 60)) ]"));
+        // The actual group kill + accounting (no `--`: broken in dash).
+        assert!(command.contains("kill -KILL -\"$pg\""));
+        assert!(!command.contains("kill -KILL -- -"));
+        assert!(command.contains("orphans_killed=$((orphans_killed + 1))"));
+        assert!(command.contains("orphans_killed=%s"));
     }
 }

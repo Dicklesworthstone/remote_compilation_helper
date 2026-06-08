@@ -30,6 +30,7 @@ mod reload;
 mod repo_convergence;
 mod selection;
 mod self_test;
+mod stale_target_reap;
 mod telemetry;
 mod ui;
 mod workers;
@@ -570,6 +571,17 @@ async fn main() -> Result<()> {
         daemon_config.cache_cleanup,
     ));
     let _cache_cleanup_handle = cache_cleanup_scheduler.start();
+
+    // Start the worker-side stale per-job target dir reaper. The orchestrator hook
+    // only reaps the single repo being built; this periodic daemon sweep reclaims
+    // abandoned `.rch-target-*-job-*` dirs across ALL repos on each worker using
+    // the same idle predicate (shared via rch_common::stale_target_reap).
+    // Default-on with conservative thresholds; env-overridable / disablable.
+    let stale_target_reaper = Arc::new(stale_target_reap::StaleTargetReaper::new(
+        worker_pool.clone(),
+        daemon_config.stale_target_reap.with_env_overrides(),
+    ));
+    let _stale_target_reaper_handle = stale_target_reaper.start();
 
     // Create daemon context
     let telemetry_storage = match telemetry::default_telemetry_db_path() {

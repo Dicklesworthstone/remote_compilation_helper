@@ -1017,6 +1017,16 @@ impl TransferPipeline {
         // - https://github.com/oven-sh/bun/issues/6751 (multiple test files cause hangs)
         // The `timeout` command provides a hard kill that works even for CPU-bound loops.
         let timeout_wrapped_command = self.wrap_with_external_timeout(&colored_command);
+        // Wall-clock cap in seconds for the pgid-tracked path's watchdog (0 = disabled).
+        // Same source of truth as `wrap_with_external_timeout`, applied via an
+        // in-session group-kill watchdog instead of `timeout(1)` (see build_id branch).
+        let external_timeout_secs = if self.compilation_config.external_timeout_enabled() {
+            self.compilation_config
+                .timeout_for_kind(self.compilation_kind)
+                .as_secs()
+        } else {
+            0
+        };
 
         // Ensure remote-scoped env directories exist before build execution.
         let ensure_dirs_command = if env_plan.ensure_dirs.is_empty() {
@@ -1040,20 +1050,44 @@ impl TransferPipeline {
             let remote_run_dir = Self::remote_run_dir_for_root(&remote_path);
             let escaped_pgid_file = escape(Cow::from(remote_pgid_file));
             let escaped_run_dir = escape(Cow::from(remote_run_dir));
-            let escaped_command = escape(Cow::from(timeout_wrapped_command.as_str()));
+            // For the pgid-tracked path we do NOT use the `timeout(1)` wrapper:
+            // `timeout --foreground` only signals its direct child, so a livelocked
+            // test binary (and its fixtures) that the test harness spawned survive
+            // the cap and reparent to init as 20-45h PPID-1 orphans. Instead we run
+            // the raw command and arm an in-session watchdog that, at the wall-clock
+            // cap, SIGKILLs the whole process group (`-$pgid`) — the SAME group the
+            // daemon's stuck-detector kills (`cancellation.rs`). One group, both
+            // reapers, entire tree. Killing the group includes the leader `sh -c`,
+            // but that is a child of the ssh `sh -s`, so the outer shell still
+            // reports 137 (128+SIGKILL) for clean timeout exit semantics.
+            let escaped_command = escape(Cow::from(colored_command.as_str()));
+            // The watchdog program (single-quoted, no inner single quotes):
+            //   $1 = pgid file, $2 = timeout secs (0 disables), $3.. = command.
+            // Record $$ (session-leader pgid) so the daemon kill path keeps working.
+            // NOTE: group kill is `kill -KILL -PGID` with NO `--`. dash's (/bin/sh)
+            // kill builtin mishandles `kill -KILL -- -PGID` (the `--` makes it a
+            // no-op), so `--` would silently fail to reap on the Ubuntu fleet. The
+            // `-PGID` form works in both dash and bash.
+            let watchdog = "echo $$ > \"$1\"; __p=$$; __t=\"$2\"; shift 2; \"$@\" & __c=$!; \
+if [ \"$__t\" -gt 0 ] 2>/dev/null; then ( sleep \"$__t\"; kill -KILL -\"$__p\" 2>/dev/null ) & __w=$!; fi; \
+wait \"$__c\"; __s=$?; if [ -n \"$__w\" ]; then kill \"$__w\" 2>/dev/null; fi; exit \"$__s\"";
 
             format!(
                 "mkdir -p {} && rm -f {} && \
 if command -v setsid >/dev/null 2>&1; then \
-setsid sh -c 'echo $$ > \"$1\"; shift; exec \"$@\"' rch-build {} sh -lc {}; \
+setsid sh -c '{}' rch-build {} {} sh -lc {}; \
 else \
-sh -c 'echo $$ > \"$1\"; shift; exec \"$@\"' rch-build {} sh -lc {}; \
+sh -c '{}' rch-build {} {} sh -lc {}; \
 fi",
                 escaped_run_dir,
                 escaped_pgid_file,
+                watchdog,
                 escaped_pgid_file,
+                external_timeout_secs,
                 escaped_command,
+                watchdog,
                 escaped_pgid_file,
+                external_timeout_secs,
                 escaped_command,
             )
         } else {
@@ -2274,11 +2308,19 @@ fi",
     /// use far beyond a single command — a long-running build keeps writing into
     /// it, and one was observed accumulating ~11.5h of build artifacts. So a
     /// per-job dir must *never* be removed merely because some build finished; that
-    /// could clip a build still in flight. Instead we remove only siblings that
+    /// could clip a build still in flight. Instead we remove only dirs that
     /// have seen **no file activity for `idle_hours`** — i.e. finished/abandoned
     /// ones. A dir idle that long cannot be a live job (an active build touches its
     /// dir continuously), so this never races a concurrent build on the same
     /// project, even when multiple agents build it on the same worker at once.
+    ///
+    /// The sweep is confined to the *single current project dir* (`remote_path()`),
+    /// reaping only its abandoned sibling per-job dirs. The expensive cross-project
+    /// full-tree scan has moved OFF this per-dispatch path into the durable
+    /// daemon-side worker sweep (`rchd::stale_target_reap`), which scans every
+    /// project under the worker's `remote_base` on a background interval. Both
+    /// share the idle predicate via `rch_common::stale_target_reap` so they cannot
+    /// drift; this orchestrator side stays cheap (one `cd` + a two-glob loop).
     ///
     /// The staleness check looks at the dir itself *and* any descendant (file or
     /// subdir): a recent deep file means an active build (a top-dir-mtime-only
@@ -2302,8 +2344,12 @@ fi",
         // path tokens; refuse anything that could escape the intended
         // `<project_dir>/.rch-target-*` scope or inject shell syntax. The reap
         // script embeds these unescaped (inside double quotes), so this guard is
-        // the security boundary.
-        if !is_safe_reap_path(&project_dir) || !is_safe_reap_token(&current) {
+        // the security boundary. The predicate + safety checks are shared with the
+        // daemon-side worker sweep (`rchd::stale_target_reap`) via
+        // `rch_common::stale_target_reap` so the two can't drift.
+        if !rch_common::stale_target_reap::is_safe_reap_path(&project_dir)
+            || !rch_common::stale_target_reap::is_safe_reap_token(&current)
+        {
             warn!(
                 "stale-target reap: refusing unsafe inputs (project_dir={:?}, current={:?})",
                 project_dir, current
@@ -2311,7 +2357,7 @@ fi",
             return;
         }
         // Never below a 1h floor, no matter how the threshold was configured.
-        let idle_minutes = u64::from(idle_hours.max(1)) * 60;
+        let idle_minutes = rch_common::stale_target_reap::idle_minutes_from_hours(idle_hours);
 
         if use_mock_transport(worker) {
             debug!(
@@ -2328,21 +2374,17 @@ fi",
 
         #[cfg(unix)]
         {
-            // For each per-job sibling dir: keep it if the dir OR any descendant
-            // was modified within the idle window (an active or just-created
-            // build); otherwise remove it. `-mmin -N -print -quit` stops at the
-            // first recent entry, so live dirs are detected cheaply. Deliberately
-            // NO `-type f`: an empty, just-`mkdir`'d dir (a concurrent build's
-            // target before its first write) has zero files but a recent dir
-            // mtime, and must be kept. This job's own dir is always excluded.
+            // For each per-job sibling dir apply the SHARED reap predicate
+            // (`rch_common::stale_target_reap::reap_loop_body`): keep it if the dir
+            // OR any descendant was modified within the idle window (an active or
+            // just-created build); otherwise remove it. This job's own dir is
+            // always excluded. The glob list is the shared `REAP_GLOBS`.
+            let globs = rch_common::stale_target_reap::REAP_GLOBS.join(" ");
+            let loop_body =
+                rch_common::stale_target_reap::reap_loop_body(idle_minutes, Some(&current), "", "");
             let script = format!(
                 "cd \"{project_dir}\" 2>/dev/null || exit 0; \
-                 for d in .rch-target-*-job-* .rch-target-*-pid-*; do \
-                 [ -d \"$d\" ] || continue; \
-                 [ \"$d\" = \"{current}\" ] && continue; \
-                 if find \"$d\" -mmin -{idle_minutes} -print -quit 2>/dev/null | grep -q .; then continue; fi; \
-                 rm -rf -- \"$d\"; \
-                 done"
+                 for d in {globs}; do {loop_body} done"
             );
             // Detach on the worker so a large reclaim runs concurrently with the
             // build rather than blocking it. The script contains no single quotes
@@ -2370,34 +2412,21 @@ fi",
     }
 }
 
-/// Whether `s` is safe to use as the `cd` target of the stale-target reap
-/// script: absolute, at least two path segments deep (never `/` or a bare
-/// top-level dir), no `..`, and composed only of unambiguous path characters
-/// (no shell metacharacters, quotes, spaces, or globs).
+// The stale-target reap safety predicates now live in
+// `rch_common::stale_target_reap` so the orchestrator reaper (here) and the
+// daemon-side worker sweep (`rchd::stale_target_reap`) share a single source of
+// truth and cannot drift. These thin wrappers preserve the local test surface.
+
+/// See [`rch_common::stale_target_reap::is_safe_reap_path`].
+#[cfg(test)]
 fn is_safe_reap_path(s: &str) -> bool {
-    s.starts_with('/')
-        && s.matches('/').count() >= 2
-        && !s.contains("..")
-        && s.len() <= 4096
-        && s.chars().all(is_safe_reap_char)
+    rch_common::stale_target_reap::is_safe_reap_path(s)
 }
 
-/// Whether `s` is safe to embed as a directory basename token in the reap
-/// script (the current job's dir name, used to exclude it from reaping).
+/// See [`rch_common::stale_target_reap::is_safe_reap_token`].
+#[cfg(test)]
 fn is_safe_reap_token(s: &str) -> bool {
-    !s.is_empty()
-        && s != "."
-        && s != ".."
-        && !s.contains('/')
-        && s.len() <= 255
-        && s.chars().all(is_safe_reap_char)
-}
-
-/// The only characters permitted in reap-script path inputs. Excludes every
-/// shell metacharacter (quotes, `$`, backtick, `*`, spaces, `;`, `|`, `&`, …)
-/// so the inputs cannot break out of their double-quoted context.
-fn is_safe_reap_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '_' | '.')
+    rch_common::stale_target_reap::is_safe_reap_token(s)
 }
 
 /// Result of a file synchronization operation.
@@ -2952,6 +2981,151 @@ mod tests {
         assert!(!is_safe_reap_token("a'b"));
         assert!(!is_safe_reap_token("a$b"));
         assert!(!is_safe_reap_token("a*b"));
+    }
+
+    /// End-to-end behavioral test for the cheap CURRENT-PROJECT-ONLY orchestrator
+    /// reaper: actually run the generated script (under POSIX `sh`, single-quote
+    /// wrapped exactly like the dispatch site) against a fake repo dir holding
+    /// idle, live, current-job, and empty sibling per-job dirs and assert which
+    /// survive. The expensive cross-project full-tree sweep moved to the daemon;
+    /// the orchestrator now only `cd`s into the one repo dir and globs its
+    /// siblings, always excluding the current job's own dir.
+    #[cfg(unix)]
+    #[test]
+    fn test_current_project_reap_script_reaps_idle_keeps_live_current_and_empty() {
+        use std::fs;
+        use std::process::Command;
+        use tempfile::tempdir;
+
+        let tmp = tempdir().expect("create repo root");
+        // The single repo dir the orchestrator `cd`s into (>=2 segments deep so it
+        // passes is_safe_reap_path; the script itself just `cd`s into it verbatim).
+        let project_dir = tmp.path().join("repo");
+        fs::create_dir_all(&project_dir).expect("mkdir repo dir");
+
+        // Helper: a per-job sibling dir with one artifact, optionally aged past the
+        // idle window via `touch -t` (portable GNU/BSD).
+        let make = |name: &str, aged: bool| -> std::path::PathBuf {
+            let d = project_dir.join(name);
+            fs::create_dir_all(d.join("deps")).expect("mkdir per-job dir");
+            fs::write(d.join("deps/a.rlib"), b"x").expect("write artifact");
+            if aged {
+                let ok = Command::new("find")
+                    .arg(&d)
+                    .args(["-exec", "touch", "-t", "202601010000", "{}", ";"])
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+                assert!(ok, "aging {name} should succeed");
+            }
+            d
+        };
+
+        let current = ".rch-target-host-job-9-999-1";
+        let idle = make(".rch-target-host-job-1-111-0", true);
+        let idle_pid = make(".rch-target-host-pid-2-222-0", true);
+        let live = make(".rch-target-host-job-3-333-0", false);
+        let current_dir = make(current, true); // aged but must be EXCLUDED by name
+        // Empty just-created dir (mkdir, no first write) must be kept.
+        let empty = project_dir.join(".rch-target-host-job-4-444-0");
+        fs::create_dir_all(&empty).expect("mkdir empty dir");
+        // A non-rch sibling must never match the glob.
+        let bystander = project_dir.join("target");
+        fs::create_dir_all(&bystander).expect("mkdir bystander");
+
+        // Build the script EXACTLY as the reaper does (shared globs + loop body,
+        // excluding the current job dir), then run it single-quote wrapped.
+        let globs = rch_common::stale_target_reap::REAP_GLOBS.join(" ");
+        let loop_body = rch_common::stale_target_reap::reap_loop_body(720, Some(current), "", "");
+        let project_dir_str = project_dir.to_str().unwrap();
+        let script = format!(
+            "cd \"{project_dir_str}\" 2>/dev/null || exit 0; \
+             for d in {globs}; do {loop_body} done"
+        );
+        // Guard: no single quote of its own (it is single-quote wrapped at dispatch
+        // — `reap_loop_body`'s `awk '{{print $1}}'` is only emitted in the METRICS
+        // variant; the orchestrator passes empty counters so no awk/quotes appear).
+        assert!(
+            !script.contains('\''),
+            "orchestrator script must contain no single quotes: {script}"
+        );
+        let status = Command::new("sh")
+            .arg("-c")
+            .arg(format!("sh -c '{script}'"))
+            .status()
+            .expect("run reap script");
+        assert!(status.success(), "reap script should exit 0");
+
+        assert!(!idle.exists(), "idle -job- sibling must be reaped");
+        assert!(!idle_pid.exists(), "idle -pid- sibling must be reaped");
+        assert!(live.exists(), "freshly-touched sibling must be kept");
+        assert!(
+            current_dir.exists(),
+            "the current job's own dir must NEVER be reaped (excluded by name)"
+        );
+        assert!(empty.exists(), "empty just-created dir must be kept");
+        assert!(bystander.exists(), "non-rch `target` must never be touched");
+    }
+
+    /// The orchestrator `cd`s into the repo dir verbatim, so a SYMLINKED project
+    /// dir is followed transparently by `cd` (no `pwd -P` needed) and its idle
+    /// siblings are still reaped while the live one survives.
+    #[cfg(unix)]
+    #[test]
+    fn test_current_project_reap_script_follows_symlinked_project_dir() {
+        use std::fs;
+        use std::os::unix::fs::symlink;
+        use std::process::Command;
+        use tempfile::tempdir;
+
+        let base = tempdir().expect("create base");
+        let physical = base.path().join("data_repo");
+        fs::create_dir_all(&physical).expect("mkdir physical repo dir");
+        let link = base.path().join("home_repo");
+        symlink(&physical, &link).expect("create symlink to physical repo dir");
+
+        let make = |name: &str, aged: bool| -> std::path::PathBuf {
+            let d = physical.join(name);
+            fs::create_dir_all(d.join("deps")).expect("mkdir per-job dir");
+            fs::write(d.join("deps/a.rlib"), b"x").expect("write artifact");
+            if aged {
+                let ok = Command::new("find")
+                    .arg(&d)
+                    .args(["-exec", "touch", "-t", "202601010000", "{}", ";"])
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+                assert!(ok, "aging {name} should succeed");
+            }
+            d
+        };
+
+        let idle = make(".rch-target-host-job-1-111-0", true);
+        let live = make(".rch-target-host-job-2-222-1", false);
+
+        // Pass the SYMLINK path as the project dir — `cd <symlink>` follows it.
+        let link_str = link.to_str().unwrap();
+        let globs = rch_common::stale_target_reap::REAP_GLOBS.join(" ");
+        let loop_body = rch_common::stale_target_reap::reap_loop_body(720, None, "", "");
+        let script = format!(
+            "cd \"{link_str}\" 2>/dev/null || exit 0; \
+             for d in {globs}; do {loop_body} done"
+        );
+        let status = Command::new("sh")
+            .arg("-c")
+            .arg(format!("sh -c '{script}'"))
+            .status()
+            .expect("run reap script");
+        assert!(status.success(), "reap script should exit 0");
+
+        assert!(
+            !idle.exists(),
+            "idle sibling behind a SYMLINKED project dir must be reaped"
+        );
+        assert!(
+            live.exists(),
+            "live sibling must be preserved via the symlinked project dir"
+        );
     }
 
     #[test]
@@ -4121,6 +4295,146 @@ mod tests {
         assert!(command.contains("echo $$ > \"$1\""));
         assert!(command.contains("setsid sh -c"));
         assert!(command.contains(&remote_pgid_file));
+    }
+
+    #[test]
+    fn test_build_id_path_uses_group_kill_watchdog_not_foreground_timeout() {
+        // The pgid-tracked path must group-kill the whole session at the wall-clock
+        // cap (so a livelocked test binary + fixtures are reaped together), NOT use
+        // `timeout --foreground` (which only kills its direct child -> 20-45h orphans).
+        let _guard = test_guard!();
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/tmp/project"),
+            "project".to_string(),
+            "hash".to_string(),
+            TransferConfig::default(),
+        )
+        .with_build_id(Some(7))
+        .with_compilation_kind(Some(CompilationKind::CargoTest));
+
+        let command = pipeline.build_remote_command("cargo test", None);
+
+        // Watchdog group-kill of the recorded pgid (no `--`: dash mishandles it).
+        assert!(
+            command.contains("kill -KILL -\"$__p\""),
+            "build_id path must SIGKILL the whole process group: {command}"
+        );
+        assert!(
+            !command.contains("kill -KILL -- -"),
+            "must not use the `--` form (broken in dash): {command}"
+        );
+        // The default cargo-test cap (1800s) is passed to the watchdog as an arg.
+        assert!(
+            command.contains("1800 sh -lc"),
+            "watchdog must receive the test timeout (1800s): {command}"
+        );
+        assert!(command.contains("wait \"$__c\""), "watchdog must wait on the job");
+        // The build_id path must NOT shell out to `timeout --foreground` (the bug).
+        assert!(
+            !command.contains("--foreground"),
+            "build_id path must not use timeout --foreground: {command}"
+        );
+    }
+
+    /// Functional proof: a SIGTERM-ignoring grandchild that the test harness forked
+    /// is fully reaped by the watchdog at the cap. Under the old `timeout
+    /// --foreground` behavior the grandchild would orphan and survive. Linux-only
+    /// (needs setsid + process-group signaling); the build/CI workers are Linux.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_watchdog_reaps_forking_orphan_at_cap() {
+        use std::process::Command;
+        use std::time::{Duration, Instant};
+
+        if !Command::new("sh")
+            .arg("-c")
+            .arg("command -v setsid")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        {
+            eprintln!("setsid unavailable; skipping functional watchdog test");
+            return;
+        }
+
+        let dir = std::env::temp_dir().join(format!("rch-wd-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pgf = dir.join("job.pgid");
+        let marker = dir.join("grandchild-alive");
+        let _ = std::fs::remove_file(&pgf);
+        let _ = std::fs::remove_file(&marker);
+
+        // Exactly the production watchdog program (build_id branch).
+        let watchdog = "echo $$ > \"$1\"; __p=$$; __t=\"$2\"; shift 2; \"$@\" & __c=$!; \
+if [ \"$__t\" -gt 0 ] 2>/dev/null; then ( sleep \"$__t\"; kill -KILL -\"$__p\" 2>/dev/null ) & __w=$!; fi; \
+wait \"$__c\"; __s=$?; if [ -n \"$__w\" ]; then kill \"$__w\" 2>/dev/null; fi; exit \"$__s\"";
+
+        // Job forks a grandchild that IGNORES SIGTERM and loops forever (a livelock
+        // that only a group SIGKILL can stop), then waits on it.
+        let inner = format!(
+            "( trap '' TERM; touch '{}'; while true; do sleep 1; done ) & gc=$!; trap '' TERM; wait $gc",
+            marker.display()
+        );
+
+        let mut child = Command::new("setsid")
+            .arg("sh")
+            .arg("-c")
+            .arg(watchdog)
+            .arg("rch-build")
+            .arg(pgf.to_str().unwrap())
+            .arg("2") // 2-second cap
+            .arg("sh")
+            .arg("-lc")
+            .arg(&inner)
+            // Detach all stdio: otherwise the forked grandchild inherits libtest's
+            // captured stdout pipe and the harness blocks waiting for EOF.
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+
+        // Grandchild must come up.
+        let start = Instant::now();
+        while !marker.exists() && start.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(marker.exists(), "grandchild should have started");
+        let pgid = std::fs::read_to_string(&pgf).unwrap().trim().to_string();
+        assert!(pgid.parse::<i64>().unwrap() > 1, "recorded a real pgid");
+
+        // The session leader must die from the cap within a few seconds.
+        let mut exited = false;
+        let wstart = Instant::now();
+        while wstart.elapsed() < Duration::from_secs(8) {
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                exited = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        // Safety net: ensure nothing leaks regardless of assertions.
+        let _ = Command::new("sh")
+            .arg("-c")
+            .arg(format!("kill -KILL -- -{pgid} 2>/dev/null"))
+            .status();
+        let _ = child.wait();
+
+        assert!(exited, "watchdog should have killed the session at the ~2s cap");
+
+        // The whole process group (incl. the TERM-ignoring grandchild) must be gone.
+        std::thread::sleep(Duration::from_millis(300));
+        let group_alive = Command::new("sh")
+            .arg("-c")
+            .arg(format!("kill -0 -- -{pgid} 2>/dev/null"))
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            !group_alive,
+            "process group {pgid} (with the SIGTERM-ignoring grandchild) must be fully reaped"
+        );
     }
 
     #[test]

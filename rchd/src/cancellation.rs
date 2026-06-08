@@ -822,9 +822,9 @@ fn build_remote_kill_script(remote_pgid_file: Option<&str>, build_id: u64) -> St
 if [ ! -r \"$pgid_file\" ]; then exit 1; fi; \
 pgid=$(cat \"$pgid_file\" 2>/dev/null); \
 if [ -z \"$pgid\" ]; then exit 1; fi; \
-kill -TERM -- -\"$pgid\" 2>/dev/null || kill -TERM \"$pgid\" 2>/dev/null || exit 1; \
+kill -TERM -\"$pgid\" 2>/dev/null || kill -TERM \"$pgid\" 2>/dev/null || exit 1; \
 sleep 1; \
-kill -KILL -- -\"$pgid\" 2>/dev/null || kill -KILL \"$pgid\" 2>/dev/null || true; \
+kill -KILL -\"$pgid\" 2>/dev/null || kill -KILL \"$pgid\" 2>/dev/null || true; \
 exit 0' sh {file}",
             file = escaped_file,
         );
@@ -998,7 +998,10 @@ mod tests {
     fn test_build_remote_kill_script_prefers_recorded_pgid_file() {
         let script = build_remote_kill_script(Some("/tmp/rch/project/.rch-run/42.pgid"), 42);
         assert!(script.contains("pgid_file="));
-        assert!(script.contains("kill -TERM -- -\"$pgid\""));
+        // Group-kill must use `-PGID` (no `--`): dash's kill builtin mishandles
+        // `kill -TERM -- -PGID`, silently failing to signal the group.
+        assert!(script.contains("kill -TERM -\"$pgid\""));
+        assert!(!script.contains("kill -TERM -- -"));
         assert!(script.contains("/tmp/rch/project/.rch-run/42.pgid"));
         assert!(!script.contains("RCH_BUILD_ID=42;"));
     }

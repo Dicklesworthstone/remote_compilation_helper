@@ -63,6 +63,100 @@ fn daemon_start_args(socket_path: &Path) -> [&std::ffi::OsStr; 2] {
     [std::ffi::OsStr::new("--socket"), socket_path.as_os_str()]
 }
 
+/// Which systemd scope, if any, manages `rchd.service` on this host.
+///
+/// Mirrors the daemon-side detection (`rchd::rchd_systemd_unit_present`,
+/// which probes `systemctl --user is-enabled rchd`) so that `rch daemon
+/// restart` cycles the unit the same way `rch update`'s restart step does
+/// instead of fighting it with a manual shutdown + `nohup rchd` spawn.
+///
+/// On systemd hosts the manual spawn path is doomed: any rchd launched
+/// outside the unit calls `defer_to_systemd_if_managed()` and exits, while
+/// systemd's `Restart=always` respawns the unit's *own* process — leaving the
+/// old (possibly deleted-on-disk) binary running. `systemctl restart` is the
+/// only thing that re-execs the unit from the freshly installed binary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// On non-Linux hosts `detect_rchd_systemd_scope` always returns `None`, so the
+// variants are never constructed there; they are live on Linux.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+enum SystemdUnitScope {
+    /// `systemctl --user is-enabled rchd` succeeds.
+    User,
+    /// `systemctl is-enabled rchd` (system scope) succeeds.
+    System,
+}
+
+impl SystemdUnitScope {
+    /// The scope-selecting flag to pass to `systemctl` (empty for system scope).
+    fn systemctl_scope_args(self) -> &'static [&'static str] {
+        match self {
+            SystemdUnitScope::User => &["--user"],
+            SystemdUnitScope::System => &[],
+        }
+    }
+}
+
+/// Detect whether an `rchd.service` systemd unit manages the daemon here, and
+/// in which scope. Returns `None` on non-Linux hosts (e.g. macOS launchd) and
+/// on Linux hosts with no such unit (manual / nohup management) — both of which
+/// keep the legacy shutdown+spawn restart path.
+#[cfg(target_os = "linux")]
+fn detect_rchd_systemd_scope() -> Option<SystemdUnitScope> {
+    // Prefer the user scope: that is what `rch daemon start`/the hook/`rch
+    // update` interact with on dev hosts (trj/css/csd/ts1). System-scope units
+    // (vmi root daemons) are checked second.
+    let probe = |scope_args: &[&str]| -> bool {
+        std::process::Command::new("systemctl")
+            .args(scope_args)
+            .args(["is-enabled", "rchd"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    };
+
+    if probe(&["--user"]) {
+        Some(SystemdUnitScope::User)
+    } else if probe(&[]) {
+        Some(SystemdUnitScope::System)
+    } else {
+        None
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn detect_rchd_systemd_scope() -> Option<SystemdUnitScope> {
+    None
+}
+
+/// Restart the daemon via its systemd unit and wait for the socket to come
+/// back live. Returns `Err` (with a human message) on any failure so the
+/// caller can fall back to the manual shutdown+spawn path.
+async fn restart_via_systemd(scope: SystemdUnitScope) -> std::result::Result<(), String> {
+    let status = Command::new("systemctl")
+        .args(scope.systemctl_scope_args())
+        .args(["restart", "rchd"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .map_err(|e| format!("failed to invoke systemctl: {e}"))?;
+
+    if !status.success() {
+        return Err(format!("systemctl restart rchd exited {status}"));
+    }
+
+    // Confirm a live listener actually came back, not just that systemctl
+    // returned 0 (the unit could fail its own start). wait_for_daemon_ready
+    // polls the configured socket for up to ~2s.
+    if wait_for_daemon_ready().await {
+        Ok(())
+    } else {
+        Err("systemd restarted rchd but no daemon responded on the socket".to_string())
+    }
+}
+
 fn ensure_socket_parent(socket_path: &Path) -> Result<()> {
     if let Some(parent) = socket_path
         .parent()
@@ -529,7 +623,67 @@ pub async fn daemon_restart(skip_confirm: bool, ctx: &OutputContext) -> Result<(
             StatusIndicator::Info.display(style)
         );
     }
-    // Pass true for skip_confirm since we already prompted above
+
+    // When rchd is managed by a systemd unit, the manual shutdown+spawn path
+    // does NOT reliably cycle it: a `nohup rchd` spawned outside the unit
+    // defers to systemd and exits, while systemd's `Restart=always` respawns
+    // the unit's own process — keeping the OLD (possibly already-deleted)
+    // binary running. Only `systemctl restart` re-execs the unit from the
+    // freshly installed binary. Route through it (reusing the same detection
+    // `rch update`'s restart step relies on) and only fall back to the legacy
+    // path if the unit restart fails.
+    if let Some(scope) = detect_rchd_systemd_scope() {
+        match restart_via_systemd(scope).await {
+            Ok(()) => {
+                let socket_path_str = configured_socket_path()?;
+                if ctx.is_json() {
+                    let _ = ctx.json(&ApiResponse::ok(
+                        "daemon restart",
+                        DaemonActionResponse {
+                            action: "restart".to_string(),
+                            success: true,
+                            socket_path: socket_path_str,
+                            message: Some(format!(
+                                "Daemon restarted via systemctl{} restart rchd",
+                                match scope {
+                                    SystemdUnitScope::User => " --user",
+                                    SystemdUnitScope::System => "",
+                                }
+                            )),
+                        },
+                    ));
+                } else {
+                    println!(
+                        "{}",
+                        StatusIndicator::Success
+                            .with_label(style, "Daemon restarted via its systemd unit.")
+                    );
+                    println!(
+                        "  {} {} {}",
+                        style.key("Unit"),
+                        style.muted(":"),
+                        style.value(match scope {
+                            SystemdUnitScope::User => "systemctl --user rchd.service",
+                            SystemdUnitScope::System => "systemctl rchd.service",
+                        })
+                    );
+                }
+                return Ok(());
+            }
+            Err(reason) => {
+                // Log to stderr so deploy issues are diagnosable, then fall
+                // through to the manual path (e.g. for a defined-but-broken
+                // unit on a host that can still run a bare daemon).
+                eprintln!(
+                    "rch: systemd unit restart did not complete ({reason}); \
+                     falling back to manual stop+start"
+                );
+            }
+        }
+    }
+
+    // Manual path: user-launched daemon (no unit) and macOS launchd hosts.
+    // Pass true for skip_confirm since we already prompted above.
     daemon_stop(true, ctx).await?;
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     daemon_start(ctx).await?;
@@ -850,5 +1004,33 @@ mod tests {
         let parsed: ReloadApiResponse = serde_json::from_str(json).unwrap();
         assert!(!parsed.success);
         assert_eq!(parsed.error.as_deref(), Some("bad config"));
+    }
+
+    #[test]
+    fn systemd_user_scope_passes_user_flag() {
+        let _guard = test_guard!();
+        assert_eq!(
+            SystemdUnitScope::User.systemctl_scope_args(),
+            &["--user"],
+            "user-scope restart must target the per-user systemd manager"
+        );
+    }
+
+    #[test]
+    fn systemd_system_scope_passes_no_scope_flag() {
+        let _guard = test_guard!();
+        assert!(
+            SystemdUnitScope::System.systemctl_scope_args().is_empty(),
+            "system-scope restart must use the default (system) systemd manager"
+        );
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn non_linux_hosts_have_no_systemd_unit() {
+        let _guard = test_guard!();
+        // macOS (launchd) and other non-Linux hosts must never route restart
+        // through systemctl, preserving the manual stop+start path.
+        assert_eq!(detect_rchd_systemd_scope(), None);
     }
 }
