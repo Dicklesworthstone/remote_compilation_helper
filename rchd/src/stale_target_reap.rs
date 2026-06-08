@@ -38,7 +38,7 @@
 use crate::config::StaleTargetReapConfig;
 use crate::workers::{WorkerPool, WorkerState};
 use rch_common::stale_target_reap;
-use rch_common::{SshClient, SshOptions, WorkerId, WorkerStatus};
+use rch_common::{CommandResult, SshClient, SshOptions, WorkerId, WorkerStatus};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::interval;
@@ -119,7 +119,10 @@ fn build_sweep_command(escaped_base: &str, idle_minutes: u64) -> String {
          __rt=$(cd \"$base\" 2>/dev/null && pwd -P) || {{ printf 'RCH_WORKER_REAP_METRICS removed=0 freed_kb=0\\n'; exit 0; }}; \
          [ -n \"$__rt\" ] || {{ printf 'RCH_WORKER_REAP_METRICS removed=0 freed_kb=0\\n'; exit 0; }}; \
          case \"$__rt\" in */*/*) ;; *) printf 'RCH_WORKER_REAP_METRICS removed=0 freed_kb=0\\n'; exit 0;; esac; \
-         __tmpf=$(mktemp 2>/dev/null || mktemp -p \"${{TMPDIR:-/data/tmp}}\" 2>/dev/null) || {{ printf 'RCH_WORKER_REAP_METRICS removed=0 freed_kb=0\\n'; exit 0; }}; \
+         __tmpbase=\"${{TMPDIR:-}}\"; \
+         [ -n \"$__tmpbase\" ] && [ -d \"$__tmpbase\" ] || __tmpbase=/data/tmp; \
+         [ -d \"$__tmpbase\" ] || __tmpbase=/tmp; \
+         __tmpf=$(mktemp 2>/dev/null || mktemp -p \"$__tmpbase\" 2>/dev/null) || {{ printf 'RCH_WORKER_REAP_METRICS removed=0 freed_kb=0\\n'; exit 0; }}; \
          find \"$__rt\" -maxdepth 8 -type d \\( -name \".rch-target-*-job-*\" -o -name \".rch-target-*-pid-*\" \\) -prune 2>/dev/null > \"$__tmpf\"; \
          while IFS= read -r d; do {loop_body} done < \"$__tmpf\"; \
          rm -f \"$__tmpf\"; \
@@ -147,6 +150,23 @@ fn parse_reap_metrics(stdout: &str) -> Option<ReapMetrics> {
         removed: removed.unwrap_or(0),
         freed_bytes: freed_kb.unwrap_or(0).saturating_mul(1024),
     })
+}
+
+fn ensure_sweep_command_success(result: &CommandResult) -> anyhow::Result<()> {
+    if result.success() {
+        return Ok(());
+    }
+
+    let stderr = result.stderr.trim();
+    if stderr.is_empty() {
+        anyhow::bail!("sweep command exited with code {}", result.exit_code);
+    }
+
+    anyhow::bail!(
+        "sweep command exited with code {}: {}",
+        result.exit_code,
+        stderr
+    )
 }
 
 /// Periodic worker-side stale-target reaper.
@@ -296,6 +316,7 @@ impl StaleTargetReaper {
         let result = ssh.execute(&cmd).await;
         let _ = ssh.disconnect().await;
         let result = result?;
+        ensure_sweep_command_success(&result)?;
 
         let metrics = parse_reap_metrics(&result.stdout).unwrap_or_default();
         debug!(
@@ -342,6 +363,13 @@ mod tests {
         assert!(!cmd.contains("/target "));
         // Metrics counters survive the loop: the `while read` is fed from a temp
         // file (redirect-from-file, NOT the right side of a pipe → no subshell).
+        assert!(cmd.contains("__tmpbase=\"${TMPDIR:-}\""));
+        assert!(
+            cmd.contains("[ -n \"$__tmpbase\" ] && [ -d \"$__tmpbase\" ] || __tmpbase=/data/tmp")
+        );
+        assert!(cmd.contains("[ -d \"$__tmpbase\" ] || __tmpbase=/tmp"));
+        assert!(cmd.contains("mktemp -p \"$__tmpbase\""));
+        assert!(!cmd.contains("mktemp -p \"${TMPDIR:-/data/tmp}\""));
         assert!(cmd.contains("done < \"$__tmpf\""));
         assert!(!cmd.contains("-prune 2>/dev/null | \\\n"));
         assert!(!cmd.contains("-prune 2>/dev/null | while"));
@@ -449,6 +477,21 @@ mod tests {
     #[test]
     fn parse_metrics_missing_line() {
         assert!(parse_reap_metrics("no metrics\n").is_none());
+    }
+
+    #[test]
+    fn nonzero_sweep_command_result_is_error() {
+        let result = CommandResult {
+            exit_code: 2,
+            stdout: "RCH_WORKER_REAP_METRICS removed=0 freed_kb=0\n".to_string(),
+            stderr: "find failed".to_string(),
+            duration_ms: 10,
+        };
+
+        let error = ensure_sweep_command_success(&result).expect_err("nonzero exit is an error");
+
+        assert!(error.to_string().contains("exited with code 2"));
+        assert!(error.to_string().contains("find failed"));
     }
 
     #[test]

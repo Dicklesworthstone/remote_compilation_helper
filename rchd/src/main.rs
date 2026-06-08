@@ -576,7 +576,7 @@ async fn main() -> Result<()> {
     // only reaps the single repo being built; this periodic daemon sweep reclaims
     // abandoned `.rch-target-*-job-*` dirs across ALL repos on each worker using
     // the same idle predicate (shared via rch_common::stale_target_reap).
-    // Default-on with conservative thresholds; env-overridable / disablable.
+    // Default-off for canary safety; env-overridable / opt-in via config.
     let stale_target_reaper = Arc::new(stale_target_reap::StaleTargetReaper::new(
         worker_pool.clone(),
         daemon_config.stale_target_reap.with_env_overrides(),

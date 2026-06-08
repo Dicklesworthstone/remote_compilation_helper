@@ -134,8 +134,8 @@ pub const RCH_CARGO_HOME_PREFIX: &str = "rch-cargo-home-";
 pub fn remote_cargo_home_base_prelude() -> String {
     format!(
         "{var}=\"${{TMPDIR:-}}\"; \
-         [ -n \"${var}\" ] && [ -d \"${var}\" ] || {var}=/data/tmp; \
-         [ -d \"${var}\" ] || {var}=/tmp",
+         [ -n \"${{{var}}}\" ] && [ -d \"${{{var}}}\" ] || {var}=/data/tmp; \
+         [ -d \"${{{var}}}\" ] || {var}=/tmp",
         var = RCH_CARGO_HOME_BASE_VAR
     )
 }
@@ -1284,6 +1284,12 @@ mod tests {
             "{prelude}"
         );
         assert!(prelude.contains("/data/tmp"), "{prelude}");
+        // The guards must inspect the shell variable's value, not the literal
+        // string "RCH_CH_BASE"; otherwise the prelude falls through to /tmp.
+        assert!(prelude.contains("[ -n \"${RCH_CH_BASE}\" ]"), "{prelude}");
+        assert!(prelude.contains("[ -d \"${RCH_CH_BASE}\" ]"), "{prelude}");
+        assert!(!prelude.contains("[ -n \"RCH_CH_BASE\" ]"), "{prelude}");
+        assert!(!prelude.contains("[ -d \"RCH_CH_BASE\" ]"), "{prelude}");
         // /tmp only as the last-resort fallback, never as the leading base.
         assert!(
             !prelude.contains("/tmp/rch"),
