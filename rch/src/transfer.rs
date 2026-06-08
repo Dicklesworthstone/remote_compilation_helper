@@ -2380,12 +2380,27 @@ fn build_stale_target_reap_script(
     // substitution-free pipe so it stays POSIX `sh`-portable. Each candidate is
     // the per-job dir itself (pruned), so the per-dir idle check runs against
     // `$d` directly.
+    // Resolve `canonical_root` to its PHYSICAL path at runtime before walking it:
+    // on a real worker the orchestrator's canonical root is frequently a symlink
+    // (e.g. the macOS orchestrator passes `/Users/<u>/projects`, which is a
+    // symlink to `/data/projects` on the worker). `find <symlink>` does NOT
+    // descend the link's target without `-L`, and we deliberately avoid `-L`
+    // (following arbitrary in-tree symlinks during a root-owned delete sweep is
+    // unsafe). Instead `cd … && pwd -P` canonicalizes the start point once, so
+    // `find` walks the real tree and emits physical paths. `live_target_dir` is
+    // resolved the same way so the exclusion compares like-for-like against the
+    // physical paths `find` prints (otherwise a symlinked live path would never
+    // match and the live dir would be spared only by the idle check).
     format!(
-        "[ -d \"{canonical_root}\" ] || exit 0; \
-         find \"{canonical_root}\" -maxdepth 8 -type d \\( -name \".rch-target-*-job-*\" -o -name \".rch-target-*-pid-*\" \\) -prune 2>/dev/null | \
+        "__rt=$(cd \"{canonical_root}\" 2>/dev/null && pwd -P) || exit 0; \
+         [ -n \"$__rt\" ] || exit 0; \
+         case \"$__rt\" in */*/*) ;; *) exit 0;; esac; \
+         __lp=$(cd \"$(dirname \"{live_target_dir}\")\" 2>/dev/null && pwd -P); \
+         __live=\"$__lp/$(basename \"{live_target_dir}\")\"; \
+         find \"$__rt\" -maxdepth 8 -type d \\( -name \".rch-target-*-job-*\" -o -name \".rch-target-*-pid-*\" \\) -prune 2>/dev/null | \
          while IFS= read -r d; do \
          [ -d \"$d\" ] || continue; \
-         [ \"$d\" = \"{live_target_dir}\" ] && continue; \
+         [ \"$d\" = \"$__live\" ] && continue; \
          if find \"$d\" -mmin -{idle_minutes} -print -quit 2>/dev/null | grep -q .; then continue; fi; \
          rm -rf -- \"$d\"; \
          done"
@@ -2970,12 +2985,16 @@ mod tests {
             720,
         );
         assert!(
-            script.contains("[ -d \"/data/projects\" ]"),
-            "must guard on the canonical root: {script}"
+            script.contains("cd \"/data/projects\" 2>/dev/null && pwd -P"),
+            "must canonicalize the canonical root (handles a symlinked root): {script}"
         );
         assert!(
-            script.contains("find \"/data/projects\" -maxdepth 8 -type d"),
-            "must sweep the whole canonical root depth-robustly: {script}"
+            script.contains("find \"$__rt\" -maxdepth 8 -type d"),
+            "must sweep the resolved physical root depth-robustly: {script}"
+        );
+        assert!(
+            script.contains("case \"$__rt\" in */*/*) ;; *) exit 0;; esac"),
+            "must re-assert the >=2-segment invariant on the RESOLVED root (guards a symlink-to-/): {script}"
         );
         assert!(
             script.contains("-name \".rch-target-*-job-*\"")
@@ -2993,10 +3012,14 @@ mod tests {
             "must prune so it never descends into the artifact tree: {script}"
         );
         assert!(
+            script.contains("[ \"$d\" = \"$__live\" ]"),
+            "must exclude the live dir by its resolved physical path: {script}"
+        );
+        assert!(
             script.contains(
-                "[ \"$d\" = \"/data/projects/projA/hash1/.rch-target-host-job-2-222-1\" ]"
+                "dirname \"/data/projects/projA/hash1/.rch-target-host-job-2-222-1\""
             ),
-            "must exclude the live dir by full path: {script}"
+            "must canonicalize the live dir so the exclusion matches find's physical output: {script}"
         );
         assert!(
             script.contains("-mmin -720"),
@@ -3092,6 +3115,71 @@ mod tests {
         assert!(live.exists(), "live dir must be preserved");
         assert!(empty.exists(), "freshly-created empty dir must be preserved");
         assert!(recent.exists(), "recently-touched dir must be preserved");
+    }
+
+    /// Regression guard for the deployment bug found by live canary testing:
+    /// when the canonical root passed to the reaper is a SYMLINK (as on a real
+    /// worker — the macOS orchestrator passes `/Users/<u>/projects`, a symlink to
+    /// `/data/projects`), the old `find "$canonical_root"` descended nothing
+    /// (find won't traverse a symlinked start point without `-L`), so the reaper
+    /// was a silent no-op. The fix canonicalizes the root (and the live dir) with
+    /// `cd … && pwd -P` before walking. Here the reaper is invoked with the
+    /// SYMLINK path and must still reap the idle dir behind it while sparing the
+    /// live one.
+    #[cfg(unix)]
+    #[test]
+    fn test_reap_script_handles_symlinked_canonical_root() {
+        use std::fs;
+        use std::os::unix::fs::symlink;
+        use std::process::Command;
+        use tempfile::tempdir;
+
+        let base = tempdir().expect("create base");
+        // Physical canonical root and a symlink that points at it.
+        let physical = base.path().join("data_projects");
+        fs::create_dir_all(&physical).expect("mkdir physical root");
+        let link = base.path().join("home_projects");
+        symlink(&physical, &link).expect("create symlink to physical root");
+
+        let make_dir = |name: &str, aged: bool| -> std::path::PathBuf {
+            let job_dir = physical.join("proj/hash").join(name);
+            fs::create_dir_all(job_dir.join("deps")).expect("mkdir per-job dir");
+            fs::write(job_dir.join("deps/a.rlib"), b"x").expect("write artifact");
+            if aged {
+                let ok = Command::new("find")
+                    .arg(&job_dir)
+                    .args(["-exec", "touch", "-t", "202601010000", "{}", ";"])
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+                assert!(ok, "aging {name} should succeed");
+            }
+            job_dir
+        };
+
+        let idle = make_dir(".rch-target-host-job-1-111-0", true);
+        let live = make_dir(".rch-target-host-job-2-222-1", false);
+
+        // Invoke the reaper with the SYMLINK path as canonical root and a
+        // symlinked live-dir path — exactly what a worker receives.
+        let link_root = link.to_str().unwrap();
+        let live_via_link = format!("{link_root}/proj/hash/.rch-target-host-job-2-222-1");
+        let script = build_stale_target_reap_script(link_root, &live_via_link, 720);
+        let status = Command::new("sh")
+            .arg("-c")
+            .arg(format!("sh -c '{script}'"))
+            .status()
+            .expect("run reap script");
+        assert!(status.success(), "reap script should exit 0");
+
+        assert!(
+            !idle.exists(),
+            "idle dir behind a SYMLINKED canonical root must be reaped"
+        );
+        assert!(
+            live.exists(),
+            "live dir must be preserved even when reached via a symlinked root"
+        );
     }
 
     #[test]

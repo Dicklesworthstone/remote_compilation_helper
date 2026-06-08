@@ -14,6 +14,26 @@ No unreleased changes yet.
 
 ---
 
+## [v1.0.39] -- 2026-06-08 (release)
+
+### Fixes
+
+- **Stale-target reaper now works when the canonical root is a symlink on the
+  worker.** v1.0.38 rooted the sweep at the orchestrator's `canonical_root`, but
+  on a real worker that path is frequently a symlink (the macOS orchestrator
+  passes `/Users/<u>/projects`, which is a symlink to `/data/projects` on the
+  worker) and `find <symlink>` does not descend the target without `-L`. The
+  reaper was therefore a silent no-op for builds dispatched from such an
+  orchestrator (found by live canary testing). The generated reap script now
+  canonicalizes the root and the live-dir path at runtime (`cd … && pwd -P`)
+  before walking, so `find` traverses the real tree and the live-dir exclusion
+  still matches the physical paths `find` emits. `-L` is deliberately *not* used
+  (following arbitrary in-tree symlinks during a root-owned delete sweep is
+  unsafe). A defense-in-depth check re-asserts the ≥2-path-segment invariant on
+  the *resolved* root before any `find`/`rm`.
+
+---
+
 ## [v1.0.38] -- 2026-06-08 (release)
 
 ### Fixes
