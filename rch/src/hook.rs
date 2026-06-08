@@ -163,14 +163,62 @@ impl From<SelectionResponseWire> for SelectionResponse {
     }
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
+#[derive(Debug)]
 enum SelectionReasonWire {
     NoAdmissibleWorkers { no_admissible_workers: String },
     NoWorkersWithRuntime { no_workers_with_runtime: String },
     SelectionError { selection_error: String },
     Unit(UnitSelectionReasonWire),
     Unknown(serde_json::Value),
+}
+
+impl<'de> Deserialize<'de> for SelectionReasonWire {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+
+        match &value {
+            serde_json::Value::Object(object) if object.len() == 1 => {
+                if let Some(reason) = object
+                    .get("no_admissible_workers")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    return Ok(Self::NoAdmissibleWorkers {
+                        no_admissible_workers: reason.to_string(),
+                    });
+                }
+                if let Some(runtime) = object
+                    .get("no_workers_with_runtime")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    return Ok(Self::NoWorkersWithRuntime {
+                        no_workers_with_runtime: runtime.to_string(),
+                    });
+                }
+                if let Some(error) = object
+                    .get("selection_error")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    return Ok(Self::SelectionError {
+                        selection_error: error.to_string(),
+                    });
+                }
+            }
+            serde_json::Value::String(_) => {
+                let unit = serde_json::from_value::<UnitSelectionReasonWire>(value.clone())
+                    .map_err(serde::de::Error::custom)?;
+                return Ok(match unit {
+                    UnitSelectionReasonWire::Unknown => Self::Unknown(value),
+                    unit => Self::Unit(unit),
+                });
+            }
+            _ => {}
+        }
+
+        Ok(Self::Unknown(value))
+    }
 }
 
 impl From<SelectionReasonWire> for SelectionReason {
@@ -12601,6 +12649,11 @@ edition = "2024"
                 .reason
                 .to_string()
                 .contains("unknown daemon selection reason")
+        );
+        assert!(
+            response.reason.to_string().contains("future_selector_gate"),
+            "unknown unit reason should preserve daemon detail: {}",
+            response.reason
         );
     }
 
