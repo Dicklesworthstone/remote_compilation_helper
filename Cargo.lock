@@ -3781,7 +3781,7 @@ dependencies = [
 
 [[package]]
 name = "rch"
-version = "1.0.39"
+version = "1.0.40"
 dependencies = [
  "anyhow",
  "blake3",
@@ -3919,7 +3919,7 @@ dependencies = [
 
 [[package]]
 name = "rchd"
-version = "1.0.39"
+version = "1.0.40"
 dependencies = [
  "anyhow",
  "axum",

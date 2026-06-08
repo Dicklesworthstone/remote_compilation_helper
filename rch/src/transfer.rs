@@ -983,6 +983,16 @@ impl TransferPipeline {
         // - https://github.com/oven-sh/bun/issues/6751 (multiple test files cause hangs)
         // The `timeout` command provides a hard kill that works even for CPU-bound loops.
         let timeout_wrapped_command = self.wrap_with_external_timeout(&colored_command);
+        // Wall-clock cap in seconds for the pgid-tracked path's watchdog (0 = disabled).
+        // Same source of truth as `wrap_with_external_timeout`, applied via an
+        // in-session group-kill watchdog instead of `timeout(1)` (see build_id branch).
+        let external_timeout_secs = if self.compilation_config.external_timeout_enabled() {
+            self.compilation_config
+                .timeout_for_kind(self.compilation_kind)
+                .as_secs()
+        } else {
+            0
+        };
 
         // Ensure remote-scoped env directories exist before build execution.
         let ensure_dirs_command = if env_plan.ensure_dirs.is_empty() {
@@ -1006,20 +1016,44 @@ impl TransferPipeline {
             let remote_run_dir = Self::remote_run_dir_for_root(&remote_path);
             let escaped_pgid_file = escape(Cow::from(remote_pgid_file));
             let escaped_run_dir = escape(Cow::from(remote_run_dir));
-            let escaped_command = escape(Cow::from(timeout_wrapped_command.as_str()));
+            // For the pgid-tracked path we do NOT use the `timeout(1)` wrapper:
+            // `timeout --foreground` only signals its direct child, so a livelocked
+            // test binary (and its fixtures) that the test harness spawned survive
+            // the cap and reparent to init as 20-45h PPID-1 orphans. Instead we run
+            // the raw command and arm an in-session watchdog that, at the wall-clock
+            // cap, SIGKILLs the whole process group (`-$pgid`) — the SAME group the
+            // daemon's stuck-detector kills (`cancellation.rs`). One group, both
+            // reapers, entire tree. Killing the group includes the leader `sh -c`,
+            // but that is a child of the ssh `sh -s`, so the outer shell still
+            // reports 137 (128+SIGKILL) for clean timeout exit semantics.
+            let escaped_command = escape(Cow::from(colored_command.as_str()));
+            // The watchdog program (single-quoted, no inner single quotes):
+            //   $1 = pgid file, $2 = timeout secs (0 disables), $3.. = command.
+            // Record $$ (session-leader pgid) so the daemon kill path keeps working.
+            // NOTE: group kill is `kill -KILL -PGID` with NO `--`. dash's (/bin/sh)
+            // kill builtin mishandles `kill -KILL -- -PGID` (the `--` makes it a
+            // no-op), so `--` would silently fail to reap on the Ubuntu fleet. The
+            // `-PGID` form works in both dash and bash.
+            let watchdog = "echo $$ > \"$1\"; __p=$$; __t=\"$2\"; shift 2; \"$@\" & __c=$!; \
+if [ \"$__t\" -gt 0 ] 2>/dev/null; then ( sleep \"$__t\"; kill -KILL -\"$__p\" 2>/dev/null ) & __w=$!; fi; \
+wait \"$__c\"; __s=$?; if [ -n \"$__w\" ]; then kill \"$__w\" 2>/dev/null; fi; exit \"$__s\"";
 
             format!(
                 "mkdir -p {} && rm -f {} && \
 if command -v setsid >/dev/null 2>&1; then \
-setsid sh -c 'echo $$ > \"$1\"; shift; exec \"$@\"' rch-build {} sh -lc {}; \
+setsid sh -c '{}' rch-build {} {} sh -lc {}; \
 else \
-sh -c 'echo $$ > \"$1\"; shift; exec \"$@\"' rch-build {} sh -lc {}; \
+sh -c '{}' rch-build {} {} sh -lc {}; \
 fi",
                 escaped_run_dir,
                 escaped_pgid_file,
+                watchdog,
                 escaped_pgid_file,
+                external_timeout_secs,
                 escaped_command,
+                watchdog,
                 escaped_pgid_file,
+                external_timeout_secs,
                 escaped_command,
             )
         } else {
@@ -4349,6 +4383,146 @@ mod tests {
         assert!(command.contains("echo $$ > \"$1\""));
         assert!(command.contains("setsid sh -c"));
         assert!(command.contains(&remote_pgid_file));
+    }
+
+    #[test]
+    fn test_build_id_path_uses_group_kill_watchdog_not_foreground_timeout() {
+        // The pgid-tracked path must group-kill the whole session at the wall-clock
+        // cap (so a livelocked test binary + fixtures are reaped together), NOT use
+        // `timeout --foreground` (which only kills its direct child -> 20-45h orphans).
+        let _guard = test_guard!();
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/tmp/project"),
+            "project".to_string(),
+            "hash".to_string(),
+            TransferConfig::default(),
+        )
+        .with_build_id(Some(7))
+        .with_compilation_kind(Some(CompilationKind::CargoTest));
+
+        let command = pipeline.build_remote_command("cargo test", None);
+
+        // Watchdog group-kill of the recorded pgid (no `--`: dash mishandles it).
+        assert!(
+            command.contains("kill -KILL -\"$__p\""),
+            "build_id path must SIGKILL the whole process group: {command}"
+        );
+        assert!(
+            !command.contains("kill -KILL -- -"),
+            "must not use the `--` form (broken in dash): {command}"
+        );
+        // The default cargo-test cap (1800s) is passed to the watchdog as an arg.
+        assert!(
+            command.contains("1800 sh -lc"),
+            "watchdog must receive the test timeout (1800s): {command}"
+        );
+        assert!(command.contains("wait \"$__c\""), "watchdog must wait on the job");
+        // The build_id path must NOT shell out to `timeout --foreground` (the bug).
+        assert!(
+            !command.contains("--foreground"),
+            "build_id path must not use timeout --foreground: {command}"
+        );
+    }
+
+    /// Functional proof: a SIGTERM-ignoring grandchild that the test harness forked
+    /// is fully reaped by the watchdog at the cap. Under the old `timeout
+    /// --foreground` behavior the grandchild would orphan and survive. Linux-only
+    /// (needs setsid + process-group signaling); the build/CI workers are Linux.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_watchdog_reaps_forking_orphan_at_cap() {
+        use std::process::Command;
+        use std::time::{Duration, Instant};
+
+        if !Command::new("sh")
+            .arg("-c")
+            .arg("command -v setsid")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        {
+            eprintln!("setsid unavailable; skipping functional watchdog test");
+            return;
+        }
+
+        let dir = std::env::temp_dir().join(format!("rch-wd-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pgf = dir.join("job.pgid");
+        let marker = dir.join("grandchild-alive");
+        let _ = std::fs::remove_file(&pgf);
+        let _ = std::fs::remove_file(&marker);
+
+        // Exactly the production watchdog program (build_id branch).
+        let watchdog = "echo $$ > \"$1\"; __p=$$; __t=\"$2\"; shift 2; \"$@\" & __c=$!; \
+if [ \"$__t\" -gt 0 ] 2>/dev/null; then ( sleep \"$__t\"; kill -KILL -\"$__p\" 2>/dev/null ) & __w=$!; fi; \
+wait \"$__c\"; __s=$?; if [ -n \"$__w\" ]; then kill \"$__w\" 2>/dev/null; fi; exit \"$__s\"";
+
+        // Job forks a grandchild that IGNORES SIGTERM and loops forever (a livelock
+        // that only a group SIGKILL can stop), then waits on it.
+        let inner = format!(
+            "( trap '' TERM; touch '{}'; while true; do sleep 1; done ) & gc=$!; trap '' TERM; wait $gc",
+            marker.display()
+        );
+
+        let mut child = Command::new("setsid")
+            .arg("sh")
+            .arg("-c")
+            .arg(watchdog)
+            .arg("rch-build")
+            .arg(pgf.to_str().unwrap())
+            .arg("2") // 2-second cap
+            .arg("sh")
+            .arg("-lc")
+            .arg(&inner)
+            // Detach all stdio: otherwise the forked grandchild inherits libtest's
+            // captured stdout pipe and the harness blocks waiting for EOF.
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+
+        // Grandchild must come up.
+        let start = Instant::now();
+        while !marker.exists() && start.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(marker.exists(), "grandchild should have started");
+        let pgid = std::fs::read_to_string(&pgf).unwrap().trim().to_string();
+        assert!(pgid.parse::<i64>().unwrap() > 1, "recorded a real pgid");
+
+        // The session leader must die from the cap within a few seconds.
+        let mut exited = false;
+        let wstart = Instant::now();
+        while wstart.elapsed() < Duration::from_secs(8) {
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                exited = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        // Safety net: ensure nothing leaks regardless of assertions.
+        let _ = Command::new("sh")
+            .arg("-c")
+            .arg(format!("kill -KILL -- -{pgid} 2>/dev/null"))
+            .status();
+        let _ = child.wait();
+
+        assert!(exited, "watchdog should have killed the session at the ~2s cap");
+
+        // The whole process group (incl. the TERM-ignoring grandchild) must be gone.
+        std::thread::sleep(Duration::from_millis(300));
+        let group_alive = Command::new("sh")
+            .arg("-c")
+            .arg(format!("kill -0 -- -{pgid} 2>/dev/null"))
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            !group_alive,
+            "process group {pgid} (with the SIGTERM-ignoring grandchild) must be fully reaped"
+        );
     }
 
     #[test]
