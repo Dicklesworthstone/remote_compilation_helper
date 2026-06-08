@@ -449,7 +449,10 @@ pub async fn collect_telemetry_from_worker(
         WorkerTelemetry::from_json(payload).context("Failed to parse telemetry JSON")?;
 
     if !telemetry.is_compatible() {
-        warn!(worker = worker_id.as_str(), "Telemetry protocol version mismatch");
+        warn!(
+            worker = worker_id.as_str(),
+            "Telemetry protocol version mismatch"
+        );
     }
 
     Ok(telemetry)

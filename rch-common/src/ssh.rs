@@ -276,7 +276,6 @@ impl SshClient {
 
         // Control-master socket directory only matters when reusing connections.
         if control_master {
-
             // Use a short control directory path to stay within the Unix domain
             // socket path limit (104 bytes on macOS, 108 on Linux).  The openssh
             // crate appends a `%C` hash (~32 chars) to form the socket filename,
@@ -1245,7 +1244,6 @@ mod tests {
     }
 }
 
-
 /// How an SSH session's `ControlPersist` should be configured.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ControlPersistMode {
@@ -1282,7 +1280,10 @@ mod control_persist_tests {
     #[test]
     fn non_mux_sessions_never_persist_forever() {
         // The per-call paths (control_master=false) must close after use.
-        assert_eq!(control_persist_mode(false, None), ControlPersistMode::Closed);
+        assert_eq!(
+            control_persist_mode(false, None),
+            ControlPersistMode::Closed
+        );
         assert_eq!(
             control_persist_mode(false, Some(Duration::from_secs(60))),
             ControlPersistMode::Closed

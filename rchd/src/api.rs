@@ -19,8 +19,9 @@ use anyhow::{Result, anyhow};
 use chrono::{Duration as ChronoDuration, Utc};
 use rch_common::{
     ApiError, BuildHeartbeatRequest, BuildRecord, BuildStats, CircuitBreakerConfig, CircuitState,
-    CommandPriority, ErrorCode, ReleaseRequest, RequiredRuntime, SavedTimeStats, SelectedWorker,
-    SelectionReason, SelectionRequest, SelectionResponse, WorkerId, WorkerStatus,
+    CommandPriority, ErrorCode, ReleaseRequest, RequiredRuntime,
+    SELECTION_RESPONSE_PROTOCOL_VERSION, SavedTimeStats, SelectedWorker, SelectionReason,
+    SelectionRequest, SelectionResponse, WorkerId, WorkerStatus,
 };
 use rch_telemetry::protocol::{TelemetrySource, TestRunRecord, TestRunStats, WorkerTelemetry};
 use rch_telemetry::speedscore::SpeedScore;
@@ -621,6 +622,18 @@ enum ApiResponse<T: Serialize> {
     Error(ApiError),
 }
 
+fn selection_response_json(response: &SelectionResponse) -> Result<String> {
+    let mut value = serde_json::to_value(response)?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("selection response did not serialize as an object"))?;
+    object.insert(
+        "selection_protocol_version".to_string(),
+        serde_json::json!(SELECTION_RESPONSE_PROTOCOL_VERSION),
+    );
+    Ok(serde_json::to_string(&value)?)
+}
+
 /// Handle an incoming connection on the Unix socket.
 pub async fn handle_connection(
     stream: UnixStream,
@@ -650,7 +663,7 @@ pub async fn handle_connection(
             metrics::inc_requests("select-worker");
             let response =
                 handle_select_worker(&ctx, request, wait_for_worker, wait_timeout_secs).await?;
-            (serde_json::to_string(&response)?, "application/json")
+            (selection_response_json(&response)?, "application/json")
         }
         Ok(ApiRequest::ReleaseWorker(mut request)) => {
             metrics::inc_requests("release-worker");
@@ -5001,6 +5014,26 @@ mod tests {
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("\"worker_id\":\"worker1\""));
         assert!(json.contains("\"has_more\":false"));
+    }
+
+    #[test]
+    fn test_selection_response_json_includes_protocol_version() {
+        let _guard = test_guard!();
+        let response = SelectionResponse {
+            worker: None,
+            reason: SelectionReason::AllWorkersBusy,
+            build_id: None,
+            diagnostics: None,
+        };
+
+        let json = selection_response_json(&response).expect("selection response serializes");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+
+        assert_eq!(
+            value["selection_protocol_version"],
+            rch_common::SELECTION_RESPONSE_PROTOCOL_VERSION
+        );
+        assert_eq!(value["reason"], "all_workers_busy");
     }
 
     // =========================================================================

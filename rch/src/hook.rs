@@ -142,6 +142,152 @@ fn remote_pipeline_failure_summary(worker_id: &WorkerId) -> String {
     )
 }
 
+#[derive(Debug, Deserialize)]
+struct SelectionResponseWire {
+    worker: Option<SelectedWorker>,
+    reason: SelectionReasonWire,
+    #[serde(default)]
+    build_id: Option<u64>,
+    #[serde(default)]
+    diagnostics: Option<rch_common::SelectionDiagnostics>,
+}
+
+impl From<SelectionResponseWire> for SelectionResponse {
+    fn from(value: SelectionResponseWire) -> Self {
+        Self {
+            worker: value.worker,
+            reason: value.reason.into(),
+            build_id: value.build_id,
+            diagnostics: value.diagnostics,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum SelectionReasonWire {
+    NoAdmissibleWorkers { no_admissible_workers: String },
+    NoWorkersWithRuntime { no_workers_with_runtime: String },
+    SelectionError { selection_error: String },
+    Unit(UnitSelectionReasonWire),
+    Unknown(serde_json::Value),
+}
+
+impl From<SelectionReasonWire> for SelectionReason {
+    fn from(value: SelectionReasonWire) -> Self {
+        match value {
+            SelectionReasonWire::NoAdmissibleWorkers {
+                no_admissible_workers,
+            } => Self::NoAdmissibleWorkers(no_admissible_workers),
+            SelectionReasonWire::NoWorkersWithRuntime {
+                no_workers_with_runtime,
+            } => Self::NoWorkersWithRuntime(no_workers_with_runtime),
+            SelectionReasonWire::SelectionError { selection_error } => {
+                Self::SelectionError(selection_error)
+            }
+            SelectionReasonWire::Unit(unit) => unit.into(),
+            SelectionReasonWire::Unknown(value) => Self::SelectionError(format!(
+                "unknown daemon selection reason: {}",
+                selection_reason_wire_detail(&value)
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum UnitSelectionReasonWire {
+    Success,
+    NoWorkersConfigured,
+    AllWorkersUnreachable,
+    AllCircuitsOpen,
+    AllWorkersBusy,
+    NoWorkersPassedHealth,
+    AllWorkersFailedPreflight,
+    AllWorkersFailedConvergence,
+    NoMatchingWorkers,
+    AffinityPinned,
+    AffinityFallback,
+    #[serde(other)]
+    Unknown,
+}
+
+impl From<UnitSelectionReasonWire> for SelectionReason {
+    fn from(value: UnitSelectionReasonWire) -> Self {
+        match value {
+            UnitSelectionReasonWire::Success => Self::Success,
+            UnitSelectionReasonWire::NoWorkersConfigured => Self::NoWorkersConfigured,
+            UnitSelectionReasonWire::AllWorkersUnreachable => Self::AllWorkersUnreachable,
+            UnitSelectionReasonWire::AllCircuitsOpen => Self::AllCircuitsOpen,
+            UnitSelectionReasonWire::AllWorkersBusy => Self::AllWorkersBusy,
+            UnitSelectionReasonWire::NoWorkersPassedHealth => Self::NoWorkersPassedHealth,
+            UnitSelectionReasonWire::AllWorkersFailedPreflight => Self::AllWorkersFailedPreflight,
+            UnitSelectionReasonWire::AllWorkersFailedConvergence => {
+                Self::AllWorkersFailedConvergence
+            }
+            UnitSelectionReasonWire::NoMatchingWorkers => Self::NoMatchingWorkers,
+            UnitSelectionReasonWire::AffinityPinned => Self::AffinityPinned,
+            UnitSelectionReasonWire::AffinityFallback => Self::AffinityFallback,
+            UnitSelectionReasonWire::Unknown => {
+                Self::SelectionError("unknown daemon selection reason".to_string())
+            }
+        }
+    }
+}
+
+fn parse_selection_response(body: &str) -> anyhow::Result<SelectionResponse> {
+    let value: serde_json::Value = serde_json::from_str(body)
+        .map_err(|e| anyhow::anyhow!("Failed to parse daemon response JSON: {}", e))?;
+    validate_selection_response_protocol(&value)?;
+    let wire: SelectionResponseWire = serde_json::from_value(value)
+        .map_err(|e| anyhow::anyhow!("Failed to parse daemon selection response: {}", e))?;
+    Ok(wire.into())
+}
+
+fn validate_selection_response_protocol(value: &serde_json::Value) -> anyhow::Result<()> {
+    let Some(version_value) = value
+        .get("selection_protocol_version")
+        .or_else(|| value.get("protocol_version"))
+    else {
+        return Ok(());
+    };
+
+    let version = selection_protocol_version_value(version_value).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Daemon selection protocol version must be an integer or integer string, got {}",
+            version_value
+        )
+    })?;
+    let supported = rch_common::SELECTION_RESPONSE_PROTOCOL_VERSION;
+    if version > supported {
+        return Err(anyhow::anyhow!(
+            "Daemon selection protocol version {} exceeds client support {}; reinstall matching rch/rchd binaries",
+            version,
+            supported
+        ));
+    }
+
+    Ok(())
+}
+
+fn selection_protocol_version_value(value: &serde_json::Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+}
+
+fn selection_reason_wire_detail(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(reason) => reason.clone(),
+        serde_json::Value::Object(object) if object.len() == 1 => object
+            .keys()
+            .next()
+            .cloned()
+            .unwrap_or_else(|| value.to_string()),
+        _ => value.to_string(),
+    }
+}
+
 /// Run the hook, reading from stdin and writing to stdout.
 ///
 /// **Fail-open contract**: this function MUST return `Ok(())` for every
@@ -2686,7 +2832,7 @@ pub(crate) async fn query_daemon(
             }
         }
 
-        serde_json::from_str::<SelectionResponse>(body.trim())
+        parse_selection_response(body.trim())
             .map_err(|e| anyhow::anyhow!("Failed to parse daemon response: {}", e))
     };
 
@@ -12367,6 +12513,71 @@ edition = "2024"
             &config,
         );
         assert_eq!(with_skip, 10, "--skip uses full slots");
+    }
+
+    #[test]
+    fn test_parse_selection_response_accepts_known_newer_health_reason() {
+        let _guard = test_guard!();
+        let json = serde_json::json!({
+            "selection_protocol_version": rch_common::SELECTION_RESPONSE_PROTOCOL_VERSION,
+            "worker": null,
+            "reason": "no_workers_passed_health",
+            "build_id": null,
+            "diagnostics": null
+        })
+        .to_string();
+
+        let response = parse_selection_response(&json).expect("selection response parses");
+
+        assert_eq!(response.reason, SelectionReason::NoWorkersPassedHealth);
+        assert!(response.worker.is_none());
+    }
+
+    #[test]
+    fn test_parse_selection_response_tolerates_unknown_unit_reason() {
+        let _guard = test_guard!();
+        let json = serde_json::json!({
+            "selection_protocol_version": rch_common::SELECTION_RESPONSE_PROTOCOL_VERSION,
+            "worker": null,
+            "reason": "future_selector_gate",
+            "build_id": null,
+            "diagnostics": null
+        })
+        .to_string();
+
+        let response = parse_selection_response(&json).expect("unknown reason should not fail");
+
+        assert!(response.worker.is_none());
+        assert!(matches!(
+            response.reason,
+            SelectionReason::SelectionError(_)
+        ));
+        assert!(
+            response
+                .reason
+                .to_string()
+                .contains("unknown daemon selection reason")
+        );
+    }
+
+    #[test]
+    fn test_parse_selection_response_rejects_unsupported_protocol_version() {
+        let _guard = test_guard!();
+        let json = serde_json::json!({
+            "selection_protocol_version": rch_common::SELECTION_RESPONSE_PROTOCOL_VERSION + 1,
+            "worker": null,
+            "reason": "all_workers_busy",
+            "build_id": null,
+            "diagnostics": null
+        })
+        .to_string();
+
+        let error = parse_selection_response(&json).expect_err("future protocol should fail");
+
+        assert!(
+            error.to_string().contains("exceeds client support"),
+            "unexpected error: {error}"
+        );
     }
 
     // =========================================================================

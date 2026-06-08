@@ -154,12 +154,12 @@ pub use types::{
     CompilationConfig, CompilationMetrics, CompilationTimer, CompilationTimingBreakdown,
     EnvironmentConfig, ExecutionConfig, FairnessConfig, FleetConfig, GeneralConfig,
     MetricsAggregator, OutputConfig, OutputVisibility, PathTopologyConfig, RchConfig,
-    ReleaseRequest, RequiredRuntime, RetryConfig, SavedTimeStats, SelectedWorker, SelectionConfig,
-    SelectionDiagnostics, SelectionReason, SelectionRequest, SelectionResponse, SelectionStrategy,
-    SelectionWeightConfig, SelfHealingConfig, SelfHealingLogLevel, SelfTestConfig,
-    SelfTestFailureAction, SelfTestWorkers, TransferConfig, WorkerCapabilities, WorkerConfig,
-    WorkerId, WorkerSelectionDiagnostic, WorkerSelectionDiagnosticDecision, WorkerStatus,
-    default_socket_path, validate_remote_base,
+    ReleaseRequest, RequiredRuntime, RetryConfig, SELECTION_RESPONSE_PROTOCOL_VERSION,
+    SavedTimeStats, SelectedWorker, SelectionConfig, SelectionDiagnostics, SelectionReason,
+    SelectionRequest, SelectionResponse, SelectionStrategy, SelectionWeightConfig,
+    SelfHealingConfig, SelfHealingLogLevel, SelfTestConfig, SelfTestFailureAction, SelfTestWorkers,
+    TransferConfig, WorkerCapabilities, WorkerConfig, WorkerId, WorkerSelectionDiagnostic,
+    WorkerSelectionDiagnosticDecision, WorkerStatus, default_socket_path, validate_remote_base,
 };
 
 // Testing module re-exports

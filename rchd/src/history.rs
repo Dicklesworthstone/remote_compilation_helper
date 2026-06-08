@@ -1125,7 +1125,8 @@ mod tests {
         // A `cargo test` that exits non-zero because assertions failed — it still
         // BUILT successfully, so it must NOT count against the build success rate.
         let mut failing_test = make_build_record(1);
-        failing_test.command = "env cargo test -p frankenterm-core some_test -- --nocapture".to_string();
+        failing_test.command =
+            "env cargo test -p frankenterm-core some_test -- --nocapture".to_string();
         failing_test.exit_code = 1;
         history.record(failing_test);
 
@@ -1151,7 +1152,10 @@ mod tests {
         assert_eq!(stats.total_builds, 4);
         // Successes: the failing-but-compiled test + the passing test = 2.
         // Failures: the failed `cargo build` + the test that failed to compile = 2.
-        assert_eq!(stats.success_count, 2, "failing test assertions must not count as build failures");
+        assert_eq!(
+            stats.success_count, 2,
+            "failing test assertions must not count as build failures"
+        );
         assert_eq!(stats.failure_count, 2);
     }
 

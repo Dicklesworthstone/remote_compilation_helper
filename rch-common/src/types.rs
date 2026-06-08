@@ -193,6 +193,13 @@ pub enum SelectionReason {
     AffinityFallback,
 }
 
+/// Wire protocol version for daemon `/select-worker` responses.
+///
+/// This is intentionally separate from the broader CLI API envelope version:
+/// selection responses are emitted as a raw [`SelectionResponse`] on the hook
+/// hot path, so the client needs a small explicit compatibility marker.
+pub const SELECTION_RESPONSE_PROTOCOL_VERSION: u64 = 1;
+
 impl std::fmt::Display for SelectionReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

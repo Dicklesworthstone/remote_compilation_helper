@@ -241,7 +241,9 @@ fn defer_to_systemd_if_managed() {
         if !rchd_systemd_unit_present() {
             return;
         }
-        info!("rchd is managed by the systemd --user rchd.service unit here; starting it and exiting to avoid a duplicate daemon");
+        info!(
+            "rchd is managed by the systemd --user rchd.service unit here; starting it and exiting to avoid a duplicate daemon"
+        );
         let _ = std::process::Command::new("systemctl")
             .args(["--user", "start", "rchd"])
             .status();
@@ -1118,13 +1120,9 @@ mod tests {
         // runner itself happens to be inside a systemd unit (which would
         // set INVOCATION_ID and make the public bind_daemon_socket wait
         // forever instead of bailing — i.e. the test would hang).
-        let error = bind_daemon_socket_with_mode(
-            &socket_path,
-            false,
-            Duration::from_secs(5),
-        )
-        .await
-        .unwrap_err();
+        let error = bind_daemon_socket_with_mode(&socket_path, false, Duration::from_secs(5))
+            .await
+            .unwrap_err();
 
         assert!(
             error
