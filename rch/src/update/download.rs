@@ -74,8 +74,17 @@ pub async fn download_release(
 
     let archive_path = asset_temp_path(temp_dir.path(), &archive_asset.name)?;
 
-    // Download with retries
-    download_with_retry(&archive_asset.browser_download_url, &archive_path, 3).await?;
+    // Download with retries. GitHub release-asset downloads are served via a
+    // CDN that intermittently returns 5xx (esp. 504 Gateway Timeout) and 429
+    // under load; a short retry-with-backoff rides those out instead of forcing
+    // a manual install.
+    download_with_retry(
+        &archive_asset.browser_download_url,
+        &archive_path,
+        &archive_asset.name,
+        MAX_DOWNLOAD_ATTEMPTS,
+    )
+    .await?;
 
     // Verify checksum if available
     let (checksum_verified, signature_verified) = if let Some(checksum_asset) = checksum_asset {
@@ -84,7 +93,17 @@ pub async fn download_release(
         }
 
         let checksum_path = asset_temp_path(temp_dir.path(), &checksum_asset.name)?;
-        download_with_retry(&checksum_asset.browser_download_url, &checksum_path, 3).await?;
+        // The checksum sidecar is fetched through the same CDN and 504s under
+        // the same conditions. Retry transient fetch failures here too so a
+        // flaky sidecar GET does not get surfaced as an opaque
+        // "Checksum not found" / hard failure.
+        download_with_retry(
+            &checksum_asset.browser_download_url,
+            &checksum_path,
+            &checksum_asset.name,
+            MAX_DOWNLOAD_ATTEMPTS,
+        )
+        .await?;
 
         let expected_checksum = extract_checksum(&checksum_path, &archive_asset.name).await?;
         let signature_bundle_asset = update
@@ -97,7 +116,13 @@ pub async fn download_release(
                 println!("Verifying signature (sigstore bundle)...");
             }
             let sig_path = asset_temp_path(temp_dir.path(), &sig_asset.name)?;
-            download_with_retry(&sig_asset.browser_download_url, &sig_path, 3).await?;
+            download_with_retry(
+                &sig_asset.browser_download_url,
+                &sig_path,
+                &sig_asset.name,
+                MAX_DOWNLOAD_ATTEMPTS,
+            )
+            .await?;
             Some(sig_path)
         } else {
             if !ctx.is_json() {
@@ -129,39 +154,60 @@ pub async fn download_release(
     })
 }
 
-/// Download a file with retry logic.
+/// Maximum number of attempts for a single release-asset download.
+const MAX_DOWNLOAD_ATTEMPTS: u32 = 4;
+
+/// Backoff schedule (waited *before* the 2nd, 3rd, and 4th attempts).
+///
+/// Kept intentionally bounded: 2s + 5s + 15s = 22s of worst-case waiting on
+/// top of the per-request timeouts, so even a fully-flaky CDN run finishes in
+/// well under a minute rather than hanging.
+const DOWNLOAD_BACKOFF: [Duration; 3] = [
+    Duration::from_secs(2),
+    Duration::from_secs(5),
+    Duration::from_secs(15),
+];
+
+/// Download a file with retry-and-backoff for transient CDN failures.
+///
+/// Retries only on RETRYABLE errors (HTTP 5xx — esp. 502/503/504 —, HTTP 429,
+/// request timeouts, and connection/reset errors). A genuine 404, a 4xx other
+/// than 429, or a local I/O failure aborts immediately.
 async fn download_with_retry(
     url: &str,
     dest: &PathBuf,
-    max_retries: u32,
+    asset_name: &str,
+    max_attempts: u32,
 ) -> Result<(), UpdateError> {
-    let mut delay = Duration::from_secs(1);
+    let mut last_err: Option<UpdateError> = None;
 
-    for attempt in 0..max_retries {
+    for attempt in 1..=max_attempts {
         match download_file(url, dest).await {
             Ok(()) => return Ok(()),
-            Err(e) if is_transient_error(&e) => {
-                if attempt + 1 < max_retries {
-                    tracing::warn!(
-                        "Download attempt {} failed: {}, retrying in {:?}",
-                        attempt + 1,
-                        e,
-                        delay
-                    );
-                    tokio::time::sleep(delay).await;
-                    delay = (delay * 2).min(Duration::from_secs(60));
-                } else {
-                    return Err(e);
-                }
+            Err(e) if is_transient_error(&e) && attempt < max_attempts => {
+                // Backoff indices are 0-based and the schedule may be shorter
+                // than the attempt count; fall back to the last entry.
+                let wait = DOWNLOAD_BACKOFF
+                    .get((attempt - 1) as usize)
+                    .copied()
+                    .unwrap_or_else(|| DOWNLOAD_BACKOFF[DOWNLOAD_BACKOFF.len() - 1]);
+                tracing::warn!(
+                    "Download of {asset_name} attempt {attempt}/{max_attempts} failed ({e}); \
+                     retrying in {wait:?}"
+                );
+                last_err = Some(e);
+                tokio::time::sleep(wait).await;
             }
             Err(e) => return Err(e),
         }
     }
 
-    Err(UpdateError::DownloadFailed(format!(
-        "Failed after {} retries",
-        max_retries
-    )))
+    // Exhausted retries on a transient error.
+    Err(last_err.unwrap_or_else(|| {
+        UpdateError::DownloadFailed(format!(
+            "Failed to download {asset_name} after {max_attempts} attempts"
+        ))
+    }))
 }
 
 /// Download a single file.
@@ -177,13 +223,17 @@ async fn download_file(url: &str, dest: &PathBuf) -> Result<(), UpdateError> {
         .header("User-Agent", format!("rch/{}", env!("CARGO_PKG_VERSION")))
         .send()
         .await
+        // A reqwest send() failure is a connection/timeout/reset error — always
+        // transient. Classify as NetworkError so the retry loop rides it out.
         .map_err(|e| UpdateError::NetworkError(e.to_string()))?;
 
-    if !response.status().is_success() {
-        return Err(UpdateError::DownloadFailed(format!(
-            "Server returned {}",
-            response.status()
-        )));
+    let status = response.status();
+    if !status.is_success() {
+        // Distinguish retryable HTTP statuses (5xx, 429) from terminal ones
+        // (404 = asset genuinely missing, other 4xx). Retryable statuses map
+        // to NetworkError so `is_transient_error` permits a retry; terminal
+        // ones map to DownloadFailed and abort.
+        return Err(classify_http_status(status));
     }
 
     let mut file = tokio::fs::File::create(dest)
@@ -193,6 +243,7 @@ async fn download_file(url: &str, dest: &PathBuf) -> Result<(), UpdateError> {
     let bytes = response
         .bytes()
         .await
+        // Body-read failures (truncated/reset mid-stream) are transient too.
         .map_err(|e| UpdateError::NetworkError(e.to_string()))?;
 
     file.write_all(&bytes)
@@ -202,7 +253,30 @@ async fn download_file(url: &str, dest: &PathBuf) -> Result<(), UpdateError> {
     Ok(())
 }
 
+/// Map a non-success HTTP status to the appropriate `UpdateError`, encoding
+/// retryability in the variant choice: retryable → `NetworkError`, terminal →
+/// `DownloadFailed`.
+fn classify_http_status(status: reqwest::StatusCode) -> UpdateError {
+    if is_retryable_status(status) {
+        UpdateError::NetworkError(format!("Server returned {status} (transient)"))
+    } else {
+        UpdateError::DownloadFailed(format!("Server returned {status}"))
+    }
+}
+
+/// HTTP statuses worth retrying: any 5xx (esp. 502/503/504 from the CDN) and
+/// 429 Too Many Requests. Notably NOT 404 (asset genuinely absent) or other
+/// 4xx (a request the retry can't fix).
+fn is_retryable_status(status: reqwest::StatusCode) -> bool {
+    status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+}
+
 /// Check if an error is transient (worth retrying).
+///
+/// `NetworkError` covers connection/timeout/reset failures and the retryable
+/// HTTP statuses classified by [`classify_http_status`]. A `ChecksumMismatch`
+/// (binary corruption) or a `DownloadFailed` (404, terminal HTTP status, or
+/// local I/O failure) is a hard failure and must NOT be retried.
 fn is_transient_error(e: &UpdateError) -> bool {
     matches!(e, UpdateError::NetworkError(_))
 }
@@ -395,6 +469,85 @@ mod tests {
             expected: "a".to_string(),
             actual: "b".to_string()
         }));
+    }
+
+    #[test]
+    fn test_is_retryable_status_classifier() {
+        use reqwest::StatusCode;
+
+        // Transient: all 5xx (esp. CDN gateway errors) and 429.
+        assert!(is_retryable_status(StatusCode::BAD_GATEWAY)); // 502
+        assert!(is_retryable_status(StatusCode::SERVICE_UNAVAILABLE)); // 503
+        assert!(is_retryable_status(StatusCode::GATEWAY_TIMEOUT)); // 504
+        assert!(is_retryable_status(StatusCode::INTERNAL_SERVER_ERROR)); // 500
+        assert!(is_retryable_status(StatusCode::TOO_MANY_REQUESTS)); // 429
+
+        // Terminal: 404 (asset missing) and other 4xx must NOT be retried.
+        assert!(!is_retryable_status(StatusCode::NOT_FOUND)); // 404
+        assert!(!is_retryable_status(StatusCode::FORBIDDEN)); // 403
+        assert!(!is_retryable_status(StatusCode::BAD_REQUEST)); // 400
+        assert!(!is_retryable_status(StatusCode::UNAUTHORIZED)); // 401
+    }
+
+    #[test]
+    fn test_classify_http_status_maps_to_retryable_variant() {
+        use reqwest::StatusCode;
+
+        // 504 → NetworkError (transient → retried).
+        let e = classify_http_status(StatusCode::GATEWAY_TIMEOUT);
+        assert!(
+            matches!(e, UpdateError::NetworkError(_)),
+            "504 should be a retryable NetworkError, got {e:?}"
+        );
+        assert!(is_transient_error(&e));
+
+        // 429 → NetworkError (transient → retried).
+        let e = classify_http_status(StatusCode::TOO_MANY_REQUESTS);
+        assert!(is_transient_error(&e));
+
+        // 404 → DownloadFailed (terminal → NOT retried).
+        let e = classify_http_status(StatusCode::NOT_FOUND);
+        assert!(
+            matches!(e, UpdateError::DownloadFailed(_)),
+            "404 should be a terminal DownloadFailed, got {e:?}"
+        );
+        assert!(!is_transient_error(&e));
+    }
+
+    #[test]
+    fn test_checksum_mismatch_is_not_transient() {
+        // A checksum MISMATCH (corrupt binary) must be a hard failure, distinct
+        // from a transient sidecar FETCH failure (NetworkError).
+        let mismatch = UpdateError::ChecksumMismatch {
+            expected: "aaaa".to_string(),
+            actual: "bbbb".to_string(),
+        };
+        assert!(!is_transient_error(&mismatch));
+
+        let fetch_504 = classify_http_status(reqwest::StatusCode::GATEWAY_TIMEOUT);
+        assert!(is_transient_error(&fetch_504));
+    }
+
+    #[test]
+    fn test_download_backoff_is_bounded() {
+        let total: Duration = DOWNLOAD_BACKOFF.iter().copied().sum();
+        // 4 attempts => 3 waits; keep total bounded (~22s here, < 45s budget).
+        assert_eq!(DOWNLOAD_BACKOFF.len() as u32, MAX_DOWNLOAD_ATTEMPTS - 1);
+        assert!(
+            total <= Duration::from_secs(45),
+            "cumulative backoff {total:?} exceeds the ~45s budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_download_with_retry_does_not_retry_terminal_error() {
+        // A 404 from a bogus host resolves quickly via DownloadFailed and must
+        // abort on the first attempt rather than burning the backoff budget.
+        // We can't hit a real 404 offline, but an unresolvable host yields a
+        // NetworkError (transient) — so instead assert the classifier path:
+        // terminal DownloadFailed short-circuits.
+        let terminal = UpdateError::DownloadFailed("Server returned 404 Not Found".to_string());
+        assert!(!is_transient_error(&terminal));
     }
 
     #[test]

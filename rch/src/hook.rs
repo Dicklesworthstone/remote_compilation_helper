@@ -6217,18 +6217,13 @@ async fn execute_remote_compilation(
     // worker (a backgrounded rm); only a quick SSH dispatch is awaited here.
     // Best-effort; gated to the forwarded-CARGO_TARGET_DIR mode that makes per-job dirs.
     if forwarded_cargo_target_dir.is_some() {
-        // Sweep across the canonical project root (the common ancestor of every
-        // project on the worker) so abandoned per-job dirs in *other* projects
-        // are reclaimed too — not just the one currently building. This is the
-        // same root the per-job target dirs are created under (see
-        // `map_sync_root_to_remote_root`).
-        let canonical_root = topology_policy.canonical_root().to_string_lossy().to_string();
+        // Cheap, current-project-only reap: only this build's own repo dir is
+        // swept for abandoned sibling per-job dirs. The durable cross-project
+        // GC (every repo under the worker's sync-root) now runs OFF this
+        // per-dispatch path in the background daemon sweep
+        // (`rchd::stale_target_reap`), so this stays a single `cd` + glob loop.
         pipeline
-            .reap_stale_sibling_per_job_target_dirs(
-                &worker_config,
-                stale_target_reap_idle_hours(),
-                &canonical_root,
-            )
+            .reap_stale_sibling_per_job_target_dirs(&worker_config, stale_target_reap_idle_hours())
             .await;
     }
     reporter.verbose(&format!(

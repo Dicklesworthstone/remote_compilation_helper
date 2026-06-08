@@ -39,6 +39,7 @@ pub mod ssh;
 #[cfg(all(test, unix))]
 mod ssh_timeout_test;
 pub mod ssh_utils;
+pub mod stale_target_reap;
 pub mod test_change;
 pub mod testing;
 pub mod toolchain;

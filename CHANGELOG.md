@@ -14,6 +14,63 @@ No unreleased changes yet.
 
 ---
 
+## [v1.0.41] -- 2026-06-08 (release)
+
+### Added
+
+- **Autonomous worker-side stale-target reaper (default-OFF).** `rchd` gains an
+  optional periodic background sweep that SSHes each healthy worker every
+  `interval_mins` (default 120) and reaps abandoned per-job `.rch-target-*-job-*`
+  / `.rch-target-*-pid-*` dirs idle >`idle_hours` (default 12h) across **all**
+  repos under the worker's canonical project root — closing the gap where the
+  orchestrator hook only ever reaps the single repo currently being built (the
+  ~1.6 TB-across-the-fleet accumulation). Shares one predicate with the hook
+  reaper (`rch_common::stale_target_reap`) so the two cannot drift. Depth-robust
+  (`find -maxdepth 8 -prune`, catches nested workspace members), canonicalizes a
+  symlinked base, and re-asserts a ≥2-path-segment guard on the resolved root.
+  **Ships default-OFF** (this is an autonomous periodic deleter targeting
+  `/data/projects`); enable per-host with `RCH_WORKER_REAP_ENABLE=1` or
+  `[stale_target_reap] enabled = true`, disable with `RCH_WORKER_REAP_DISABLE=1`.
+
+### Changed
+
+- **Orchestrator hook reaper reverted to cheap current-project-only.** With the
+  daemon now handling cross-repo GC, the hook reaper no longer does a full
+  `find` over the canonical root on every build dispatch (the v1.0.38/39
+  behavior) — it again sweeps only the just-built repo's sibling per-job dirs via
+  a `cd`-based glob (which also follows a symlinked project dir natively). This
+  removes the per-dispatch full-tree walk.
+
+### Fixes
+
+- **`rch daemon restart` now cycles a systemd-managed rchd.** On hosts where
+  rchd runs as a systemd `--user` (or system) unit, the old socket-shutdown +
+  spawn path could not restart the unit (systemd respawned the old on-disk
+  image; the manual spawn deferred to systemd and exited), leaving a stale
+  binary running. `rch daemon restart` now detects a systemd-managed rchd and
+  restarts via `systemctl [--user] restart rchd`, falling back to the manual
+  path for user-launched daemons and macOS launchd.
+- **`rch update` retries transient download/checksum failures.** GitHub
+  `502/503/504`/`429` and request timeouts on the release asset or its `.sha256`
+  sidecar are now retried with bounded backoff (4 attempts, 2s/5s/15s) instead
+  of aborting (the "Checksum not found" symptom was a 504 on the sidecar). A
+  genuine checksum **mismatch** (corruption) and a `404` (asset absent) remain
+  hard failures.
+
+---
+
+## [v1.0.40] -- 2026-06-08 (release)
+
+### Fixes
+
+- **`rch exec` reaps the whole test process group at the runtime cap.** Killing
+  only the direct child left grandchildren (test servers, fixtures) orphaned —
+  observed as 20-45h orphan trees pinning worker resources. The cap now reaps the
+  entire process group. (Also tightens `rchd` cache-cleanup and cancellation
+  handling.)
+
+---
+
 ## [v1.0.39] -- 2026-06-08 (release)
 
 ### Fixes

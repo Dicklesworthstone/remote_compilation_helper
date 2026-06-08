@@ -207,6 +207,78 @@ async fn fetch_specific_version(
     })
 }
 
+/// Maximum attempts for a GitHub API metadata fetch.
+const MAX_API_ATTEMPTS: u32 = 4;
+
+/// Backoff schedule waited before the 2nd/3rd/4th API attempts (~22s total).
+const API_BACKOFF: [Duration; 3] = [
+    Duration::from_secs(2),
+    Duration::from_secs(5),
+    Duration::from_secs(15),
+];
+
+/// GitHub API responses (rate limiting, abuse detection, upstream 5xx) are
+/// retryable on 5xx and 429; everything else is terminal.
+fn is_retryable_api_status(status: reqwest::StatusCode) -> bool {
+    status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+}
+
+/// Run a single-shot GitHub API GET with retry-and-backoff for transient
+/// failures (connection/timeout errors and retryable HTTP statuses). `op`
+/// returns `Ok(Some(_))` on success, `Ok(None)` to signal a transient HTTP
+/// status worth retrying, and `Err(_)` for a terminal failure.
+async fn api_get_with_retry<T, F, Fut>(label: &str, op: F) -> Result<T, UpdateError>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<Option<T>, UpdateError>>,
+{
+    let mut last_err: Option<UpdateError> = None;
+
+    for attempt in 1..=MAX_API_ATTEMPTS {
+        match op().await {
+            Ok(Some(value)) => return Ok(value),
+            // Transient HTTP status flagged by the caller.
+            Ok(None) if attempt < MAX_API_ATTEMPTS => {
+                let wait = backoff_for(attempt);
+                tracing::warn!(
+                    "{label} attempt {attempt}/{MAX_API_ATTEMPTS} hit a transient status; \
+                     retrying in {wait:?}"
+                );
+                tokio::time::sleep(wait).await;
+            }
+            Ok(None) => {
+                return Err(last_err.unwrap_or_else(|| {
+                    UpdateError::CheckFailed(format!(
+                        "{label} failed after {MAX_API_ATTEMPTS} attempts (transient status)"
+                    ))
+                }));
+            }
+            // Connection/timeout errors are transient; retry them too.
+            Err(e) if matches!(e, UpdateError::NetworkError(_)) && attempt < MAX_API_ATTEMPTS => {
+                let wait = backoff_for(attempt);
+                tracing::warn!(
+                    "{label} attempt {attempt}/{MAX_API_ATTEMPTS} failed ({e}); \
+                     retrying in {wait:?}"
+                );
+                last_err = Some(e);
+                tokio::time::sleep(wait).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| {
+        UpdateError::CheckFailed(format!("{label} failed after {MAX_API_ATTEMPTS} attempts"))
+    }))
+}
+
+fn backoff_for(attempt: u32) -> Duration {
+    API_BACKOFF
+        .get((attempt - 1) as usize)
+        .copied()
+        .unwrap_or_else(|| API_BACKOFF[API_BACKOFF.len() - 1])
+}
+
 /// Fetch all releases from GitHub.
 async fn fetch_releases() -> Result<Vec<ReleaseInfo>, UpdateError> {
     let url = format!(
@@ -214,58 +286,70 @@ async fn fetch_releases() -> Result<Vec<ReleaseInfo>, UpdateError> {
         GITHUB_API_BASE, REPO_OWNER, REPO_NAME
     );
 
-    let client = build_http_client()?;
-    let response = client
-        .get(&url)
-        .header("Accept", "application/vnd.github+json")
-        .header("User-Agent", format!("rch/{}", env!("CARGO_PKG_VERSION")))
-        .send()
-        .await
-        .map_err(|e| UpdateError::NetworkError(e.to_string()))?;
+    api_get_with_retry("Fetching releases", || async {
+        let client = build_http_client()?;
+        let response = client
+            .get(&url)
+            .header("Accept", "application/vnd.github+json")
+            .header("User-Agent", format!("rch/{}", env!("CARGO_PKG_VERSION")))
+            .send()
+            .await
+            .map_err(|e| UpdateError::NetworkError(e.to_string()))?;
 
-    if !response.status().is_success() {
-        return Err(UpdateError::CheckFailed(format!(
-            "GitHub API returned {}",
-            response.status()
-        )));
-    }
+        let status = response.status();
+        if !status.is_success() {
+            if is_retryable_api_status(status) {
+                // Signal transient → retry.
+                return Ok(None);
+            }
+            return Err(UpdateError::CheckFailed(format!(
+                "GitHub API returned {status}"
+            )));
+        }
 
-    let releases: Vec<ReleaseInfo> = response
-        .json()
-        .await
-        .map_err(|e| UpdateError::CheckFailed(format!("Failed to parse releases: {}", e)))?;
-
-    Ok(releases)
+        let releases: Vec<ReleaseInfo> = response
+            .json()
+            .await
+            .map_err(|e| UpdateError::CheckFailed(format!("Failed to parse releases: {}", e)))?;
+        Ok(Some(releases))
+    })
+    .await
 }
 
 /// Fetch a single release from a URL.
 async fn fetch_release_from_url(url: &str) -> Result<ReleaseInfo, UpdateError> {
-    let client = build_http_client()?;
-    let response = client
-        .get(url)
-        .header("Accept", "application/vnd.github+json")
-        .header("User-Agent", format!("rch/{}", env!("CARGO_PKG_VERSION")))
-        .send()
-        .await
-        .map_err(|e| UpdateError::NetworkError(e.to_string()))?;
+    api_get_with_retry("Fetching release", || async {
+        let client = build_http_client()?;
+        let response = client
+            .get(url)
+            .header("Accept", "application/vnd.github+json")
+            .header("User-Agent", format!("rch/{}", env!("CARGO_PKG_VERSION")))
+            .send()
+            .await
+            .map_err(|e| UpdateError::NetworkError(e.to_string()))?;
 
-    if response.status() == reqwest::StatusCode::NOT_FOUND {
-        return Err(UpdateError::CheckFailed("Release not found".to_string()));
-    }
+        let status = response.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            // 404 is terminal — the requested release genuinely does not exist.
+            return Err(UpdateError::CheckFailed("Release not found".to_string()));
+        }
 
-    if !response.status().is_success() {
-        return Err(UpdateError::CheckFailed(format!(
-            "GitHub API returned {}",
-            response.status()
-        )));
-    }
+        if !status.is_success() {
+            if is_retryable_api_status(status) {
+                return Ok(None);
+            }
+            return Err(UpdateError::CheckFailed(format!(
+                "GitHub API returned {status}"
+            )));
+        }
 
-    let release: ReleaseInfo = response
-        .json()
-        .await
-        .map_err(|e| UpdateError::CheckFailed(format!("Failed to parse release: {}", e)))?;
-
-    Ok(release)
+        let release: ReleaseInfo = response
+            .json()
+            .await
+            .map_err(|e| UpdateError::CheckFailed(format!("Failed to parse release: {}", e)))?;
+        Ok(Some(release))
+    })
+    .await
 }
 
 /// Filter releases by channel.
@@ -354,6 +438,27 @@ mod tests {
         let version = get_current_version().unwrap();
         // Should parse successfully - checking the struct is valid
         assert!(!version.to_string().is_empty());
+    }
+
+    #[test]
+    fn test_is_retryable_api_status() {
+        use reqwest::StatusCode;
+
+        assert!(is_retryable_api_status(StatusCode::GATEWAY_TIMEOUT)); // 504
+        assert!(is_retryable_api_status(StatusCode::BAD_GATEWAY)); // 502
+        assert!(is_retryable_api_status(StatusCode::SERVICE_UNAVAILABLE)); // 503
+        assert!(is_retryable_api_status(StatusCode::TOO_MANY_REQUESTS)); // 429
+
+        assert!(!is_retryable_api_status(StatusCode::NOT_FOUND)); // 404
+        assert!(!is_retryable_api_status(StatusCode::UNAUTHORIZED)); // 401
+        assert!(!is_retryable_api_status(StatusCode::FORBIDDEN)); // 403
+    }
+
+    #[test]
+    fn test_api_backoff_is_bounded() {
+        let total: Duration = API_BACKOFF.iter().copied().sum();
+        assert_eq!(API_BACKOFF.len() as u32, MAX_API_ATTEMPTS - 1);
+        assert!(total <= Duration::from_secs(45));
     }
 
     #[test]
