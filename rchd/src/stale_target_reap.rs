@@ -185,11 +185,13 @@ impl StaleTargetReaper {
             info!(
                 "Worker stale-target reaper started (interval={}min, idle>{}h, base={})",
                 reaper.config.interval_mins,
-                reaper.config.idle_hours.max(stale_target_reap::MIN_IDLE_HOURS),
+                reaper
+                    .config
+                    .idle_hours
+                    .max(stale_target_reap::MIN_IDLE_HOURS),
                 reaper.config.remote_base
             );
-            let mut ticker =
-                interval(Duration::from_secs(reaper.config.interval_mins.max(1) * 60));
+            let mut ticker = interval(Duration::from_secs(reaper.config.interval_mins.max(1) * 60));
             loop {
                 ticker.tick().await;
                 let stats = reaper.run_cycle().await;
@@ -426,7 +428,10 @@ mod tests {
 
         // Metrics survive the loop: exactly 3 removals are reported.
         let m = parse_reap_metrics(&stdout).expect("metrics line present");
-        assert_eq!(m.removed, 3, "metrics must count all 3 reaped dirs: {stdout}");
+        assert_eq!(
+            m.removed, 3,
+            "metrics must count all 3 reaped dirs: {stdout}"
+        );
         assert!(
             m.freed_bytes > 0,
             "freed bytes must be > 0 when dirs were removed: {stdout}"

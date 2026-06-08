@@ -4328,7 +4328,10 @@ mod tests {
             command.contains("1800 sh -lc"),
             "watchdog must receive the test timeout (1800s): {command}"
         );
-        assert!(command.contains("wait \"$__c\""), "watchdog must wait on the job");
+        assert!(
+            command.contains("wait \"$__c\""),
+            "watchdog must wait on the job"
+        );
         // The build_id path must NOT shell out to `timeout --foreground` (the bug).
         assert!(
             !command.contains("--foreground"),
@@ -4420,7 +4423,10 @@ wait \"$__c\"; __s=$?; if [ -n \"$__w\" ]; then kill \"$__w\" 2>/dev/null; fi; e
             .status();
         let _ = child.wait();
 
-        assert!(exited, "watchdog should have killed the session at the ~2s cap");
+        assert!(
+            exited,
+            "watchdog should have killed the session at the ~2s cap"
+        );
 
         // The whole process group (incl. the TERM-ignoring grandchild) must be gone.
         std::thread::sleep(Duration::from_millis(300));

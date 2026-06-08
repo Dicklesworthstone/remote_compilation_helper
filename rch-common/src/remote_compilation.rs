@@ -1304,7 +1304,8 @@ mod tests {
         // Run the prelude then echo the resolved base, under controlled $TMPDIR.
         let run = |tmpdir_env: Option<&str>| -> String {
             let mut cmd = Command::new("sh");
-            cmd.arg("-c").arg(format!("{prelude}; printf '%s' \"${var}\""));
+            cmd.arg("-c")
+                .arg(format!("{prelude}; printf '%s' \"${var}\""));
             cmd.env_remove("TMPDIR");
             if let Some(v) = tmpdir_env {
                 cmd.env("TMPDIR", v);

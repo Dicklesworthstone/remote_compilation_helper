@@ -119,13 +119,11 @@ pub fn reap_loop_body(
     };
     // Account for size only when both counter var names are provided.
     let (size_capture, removal) = if removed_counter.is_empty() || freed_kb.is_empty() {
-        (
-            String::new(),
-            "rm -rf -- \"$d\" 2>/dev/null;".to_string(),
-        )
+        (String::new(), "rm -rf -- \"$d\" 2>/dev/null;".to_string())
     } else {
         (
-            "sz=$(du -sk \"$d\" 2>/dev/null | awk '{print $1}'); [ -z \"$sz\" ] && sz=0; ".to_string(),
+            "sz=$(du -sk \"$d\" 2>/dev/null | awk '{print $1}'); [ -z \"$sz\" ] && sz=0; "
+                .to_string(),
             format!(
                 "if rm -rf -- \"$d\" 2>/dev/null; then {removed_counter}=$(({removed_counter} + 1)); {freed_kb}=$(({freed_kb} + sz)); fi;"
             ),
