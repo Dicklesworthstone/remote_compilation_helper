@@ -1345,19 +1345,29 @@ fn classify_cargo(cmd: &str) -> Classification {
     // Token 0: "cargo" (already validated by caller)
     let _cargo = tokens.next();
 
-    // Token 1: subcommand or +toolchain
-    let Some(token1) = tokens.next() else {
-        return Classification::not_compilation("bare cargo command");
-    };
-
-    // Handle toolchain overrides (e.g., cargo +nightly build)
-    let subcommand = if token1.starts_with('+') {
-        let Some(sub) = tokens.next() else {
-            return Classification::not_compilation("cargo +toolchain without subcommand");
+    // Skip an optional +toolchain override AND any leading global flags that can
+    // precede the subcommand (e.g. `cargo --offline build`, `cargo -q test`,
+    // `cargo --locked check`, `cargo --color never build`). Without this, a
+    // global flag was read AS the subcommand, so a real build was misclassified
+    // non-compilation and silently run locally. Value-taking global flags
+    // written without `=` consume their following value token.
+    const CARGO_VALUE_FLAGS: &[&str] = &["--color", "-Z", "-C", "--config"];
+    let subcommand = loop {
+        let Some(tok) = tokens.next() else {
+            return Classification::not_compilation("bare cargo command");
         };
-        sub
-    } else {
-        token1
+        if tok.starts_with('+') {
+            // +toolchain override — skip.
+            continue;
+        }
+        if tok.starts_with('-') {
+            if !tok.contains('=') && CARGO_VALUE_FLAGS.contains(&tok) {
+                // Consume the separate value token (e.g. `--color never`).
+                let _ = tokens.next();
+            }
+            continue;
+        }
+        break tok;
     };
 
     match subcommand {
@@ -4232,6 +4242,43 @@ mod regression_classification {
                 expect_compilation: true,
                 expected_kind: Some(CompilationKind::CargoNextest),
                 reason_contains: "cargo nextest run",
+                min_confidence: 0.90,
+            },
+            // Leading global flags before the subcommand must NOT hide the build
+            // (regression for the flag-read-as-subcommand misclassification).
+            Case {
+                cmd: "cargo --offline build",
+                expect_compilation: true,
+                expected_kind: Some(CompilationKind::CargoBuild),
+                reason_contains: "cargo build",
+                min_confidence: 0.90,
+            },
+            Case {
+                cmd: "cargo -q test",
+                expect_compilation: true,
+                expected_kind: Some(CompilationKind::CargoTest),
+                reason_contains: "cargo test",
+                min_confidence: 0.90,
+            },
+            Case {
+                cmd: "cargo --locked --frozen check",
+                expect_compilation: true,
+                expected_kind: Some(CompilationKind::CargoCheck),
+                reason_contains: "cargo check",
+                min_confidence: 0.85,
+            },
+            Case {
+                cmd: "cargo --color never build",
+                expect_compilation: true,
+                expected_kind: Some(CompilationKind::CargoBuild),
+                reason_contains: "cargo build",
+                min_confidence: 0.90,
+            },
+            Case {
+                cmd: "cargo +nightly --offline -Z unstable-options build",
+                expect_compilation: true,
+                expected_kind: Some(CompilationKind::CargoBuild),
+                reason_contains: "cargo build",
                 min_confidence: 0.90,
             },
         ];
