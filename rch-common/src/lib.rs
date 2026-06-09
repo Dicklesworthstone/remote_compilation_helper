@@ -19,6 +19,7 @@ pub mod e2e;
 pub mod errors;
 pub mod hooks;
 pub mod incident;
+pub mod incident_ledger;
 pub mod logging;
 pub mod mock;
 pub mod mock_worker;
@@ -195,6 +196,9 @@ pub use ui::{
 pub use incident::{
     ControlState, IncidentEvent, IncidentEventType, IncidentReasonCode, IncidentSource,
     SelectedMode, incident_schema_version,
+};
+pub use incident_ledger::{
+    IncidentFilter, IncidentLedger, IncidentLedgerConfig, LedgerReadStats, default_ledger_path,
 };
 
 // Errors module re-exports
