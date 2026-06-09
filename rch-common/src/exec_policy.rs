@@ -115,21 +115,28 @@ pub fn mutates_local_state(command: &str) -> bool {
     // Skip a leading `env` and its `VAR=value` assignments.
     if tokens.peek() == Some(&"env") {
         tokens.next();
-        while tokens.peek().is_some_and(|t| t.contains('=') && !t.starts_with('-')) {
+        while tokens
+            .peek()
+            .is_some_and(|t| t.contains('=') && !t.starts_with('-'))
+        {
             tokens.next();
         }
     }
     // Skip any remaining leading `VAR=value` assignments (env-style without `env`).
-    while tokens.peek().is_some_and(|t| {
-        t.contains('=') && !t.starts_with('-') && !t.contains('/')
-    }) {
+    while tokens
+        .peek()
+        .is_some_and(|t| t.contains('=') && !t.starts_with('-') && !t.contains('/'))
+    {
         tokens.next();
     }
     let Some(tool) = tokens.next() else {
         return false;
     };
-    // First non-flag token after the tool is the subcommand.
-    let subcommand = tokens.find(|t| !t.starts_with('-'));
+    // First token after the tool that is neither a flag nor a `+toolchain`
+    // override is the subcommand — without skipping `+toolchain`, `cargo
+    // +nightly fmt` would be read with subcommand `+nightly` and the mutating
+    // `fmt` would go undetected (and could be shipped remote under force-remote).
+    let subcommand = tokens.find(|t| !t.starts_with('-') && !t.starts_with('+'));
     let Some(subcommand) = subcommand else {
         return false;
     };
