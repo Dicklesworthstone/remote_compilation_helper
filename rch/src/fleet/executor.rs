@@ -718,6 +718,187 @@ async fn detect_worker_platform(worker: &WorkerConfig) -> Option<BinaryPlatform>
     parse_worker_platform(uname_s, uname_m)
 }
 
+// =============================================================================
+// Per-worker target-triple discovery and artifact resolution
+// (bd-session-history-remediation-ocv9i.7.1, elaborating P0 6h54q)
+// =============================================================================
+//
+// `rch update --fleet` must select the rch-wkr artifact matching each WORKER's
+// target triple, never assume the controller's own OS/arch. The 6h54q guard
+// refuses a proven mismatch *at deploy time*; this adds the upstream half:
+// discover each worker's triple and resolve the compatible artifact ahead of
+// time, failing closed when none exists.
+
+/// C runtime flavor for linux targets. RCH ships linux binaries as static
+/// `musl` builds, so `musl` is the default expectation; `gnu` is recorded when
+/// a worker clearly lacks musl, and `unknown` when undetermined.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // wired into the deploy flow by bead 7.2
+enum LinuxLibc {
+    Musl,
+    Gnu,
+    Unknown,
+}
+
+/// Facts discovered about a worker needed to pick its fleet-update artifact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // fields consumed by the deploy-flow integration (bead 7.2)
+struct WorkerTargetFacts {
+    /// OS + CPU arch (from `uname`).
+    platform: BinaryPlatform,
+    /// libc flavor (linux only; ignored for macOS).
+    libc: LinuxLibc,
+    /// The SSH user the controller connects as.
+    remote_user: String,
+    /// The currently-installed `rch-wkr` path on the worker, if found.
+    rch_wkr_path: Option<String>,
+}
+
+/// Map a worker's discovered facts to its Rust target triple. Returns `None`
+/// when the OS/arch could not be classified (caller must fail closed).
+///
+/// Linux defaults to `musl` (RCH's static release flavor) unless a worker was
+/// positively detected as `gnu`-only. Mirrors the os/arch→triple mapping used
+/// by the self-update path so fleet and self artifacts name workers
+/// identically.
+#[allow(dead_code)] // consumed by the deploy-flow integration (bead 7.2)
+fn worker_target_triple(facts: &WorkerTargetFacts) -> Option<String> {
+    let arch = facts.platform.arch?;
+    let arch_str = match arch {
+        BinaryArch::X86_64 => "x86_64",
+        BinaryArch::Aarch64 => "aarch64",
+        // 32-bit targets are not part of the fleet release matrix.
+        BinaryArch::X86 | BinaryArch::Arm => return None,
+    };
+    match facts.platform.os {
+        BinaryOs::Linux => {
+            let libc = match facts.libc {
+                LinuxLibc::Gnu => "gnu",
+                // musl is the default static release flavor.
+                LinuxLibc::Musl | LinuxLibc::Unknown => "musl",
+            };
+            Some(format!("{arch_str}-unknown-linux-{libc}"))
+        }
+        BinaryOs::MacOs => Some(format!("{arch_str}-apple-darwin")),
+        // Windows workers are not part of the fleet.
+        BinaryOs::Windows => None,
+    }
+}
+
+/// A fleet-update artifact available to deploy, identified by the target triple
+/// it was built for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // consumed by the deploy-flow integration (bead 7.2)
+struct FleetArtifact {
+    /// Artifact file name (e.g. `rch-wkr-v1.0.27-x86_64-unknown-linux-musl`).
+    name: String,
+    /// The Rust target triple this artifact targets.
+    target_triple: String,
+}
+
+/// Failure to resolve a compatible artifact for a worker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // consumed by the deploy-flow integration (bead 7.2)
+enum ArtifactResolveError {
+    /// The worker's target triple could not be determined.
+    UnknownTriple { worker_id: String },
+    /// No available artifact matches the worker's triple.
+    NoCompatibleArtifact {
+        worker_id: String,
+        triple: String,
+        available: Vec<String>,
+    },
+}
+
+impl std::fmt::Display for ArtifactResolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ArtifactResolveError::UnknownTriple { worker_id } => write!(
+                f,
+                "cannot resolve fleet artifact for {worker_id}: worker target triple is unknown"
+            ),
+            ArtifactResolveError::NoCompatibleArtifact {
+                worker_id,
+                triple,
+                available,
+            } => write!(
+                f,
+                "no fleet artifact for {worker_id} (target {triple}); available: [{}]",
+                available.join(", ")
+            ),
+        }
+    }
+}
+
+/// Resolve the artifact matching a worker's target triple, failing **closed**
+/// when none is compatible. An artifact matches when its `target_triple` equals
+/// the worker triple or its `name` contains the triple as a substring (release
+/// asset names embed the triple).
+#[allow(dead_code)] // consumed by the deploy-flow integration (bead 7.2)
+fn resolve_worker_artifact<'a>(
+    worker_id: &str,
+    triple: &str,
+    artifacts: &'a [FleetArtifact],
+) -> Result<&'a FleetArtifact, ArtifactResolveError> {
+    artifacts
+        .iter()
+        .find(|a| a.target_triple == triple || a.name.contains(triple))
+        .ok_or_else(|| ArtifactResolveError::NoCompatibleArtifact {
+            worker_id: worker_id.to_string(),
+            triple: triple.to_string(),
+            available: artifacts.iter().map(|a| a.target_triple.clone()).collect(),
+        })
+}
+
+/// Discover a worker's target facts over SSH: `uname`, libc flavor, the SSH
+/// user, and the current `rch-wkr` path. Returns `None` when the platform
+/// cannot be classified (caller fails closed).
+#[allow(dead_code)] // invoked by the deploy-flow integration (bead 7.2)
+async fn discover_worker_target_facts(worker: &WorkerConfig) -> Option<WorkerTargetFacts> {
+    let platform = detect_worker_platform(worker).await?;
+    let ssh = SshExecutor::new(worker);
+
+    // libc detection (linux only): a musl loader under /lib indicates musl;
+    // `ldd --version` mentioning GNU indicates gnu. Best-effort.
+    let libc = if platform.os == BinaryOs::Linux {
+        match ssh
+            .run_command(
+                "ls /lib/ld-musl-* >/dev/null 2>&1 && echo musl || (ldd --version 2>&1 | head -1)",
+            )
+            .await
+        {
+            Ok(out) if out.success() => {
+                let lower = out.stdout.to_ascii_lowercase();
+                if lower.contains("musl") {
+                    LinuxLibc::Musl
+                } else if lower.contains("gnu") || lower.contains("glibc") {
+                    LinuxLibc::Gnu
+                } else {
+                    LinuxLibc::Unknown
+                }
+            }
+            _ => LinuxLibc::Unknown,
+        }
+    } else {
+        LinuxLibc::Unknown
+    };
+
+    let rch_wkr_path = match ssh
+        .run_command("command -v rch-wkr 2>/dev/null || echo ~/.local/bin/rch-wkr")
+        .await
+    {
+        Ok(out) if out.success() => out.stdout.lines().next().map(str::to_string),
+        _ => None,
+    };
+
+    Some(WorkerTargetFacts {
+        platform,
+        libc,
+        remote_user: worker.user.clone(),
+        rch_wkr_path,
+    })
+}
+
 /// Refuse to deploy a binary whose OS/arch is incompatible with the worker.
 ///
 /// Fails open (returns `Ok`) when either side cannot be classified — the
@@ -1475,6 +1656,153 @@ mod tests {
     fn detect_binary_platform_returns_none_for_garbage() {
         assert!(detect_binary_platform(&[0x00, 0x01, 0x02, 0x03]).is_none());
         assert!(detect_binary_platform(&[]).is_none());
+    }
+
+    // ========================
+    // Target-triple discovery + artifact resolution (bd-...-7.1)
+    // ========================
+
+    fn facts(os: BinaryOs, arch: Option<BinaryArch>, libc: LinuxLibc) -> WorkerTargetFacts {
+        WorkerTargetFacts {
+            platform: BinaryPlatform { os, arch },
+            libc,
+            remote_user: "ubuntu".to_string(),
+            rch_wkr_path: Some("~/.local/bin/rch-wkr".to_string()),
+        }
+    }
+
+    #[test]
+    fn worker_target_triple_linux_defaults_to_musl() {
+        // Linux x86_64 with unknown libc => musl (RCH's static release flavor).
+        assert_eq!(
+            worker_target_triple(&facts(
+                BinaryOs::Linux,
+                Some(BinaryArch::X86_64),
+                LinuxLibc::Unknown
+            ))
+            .as_deref(),
+            Some("x86_64-unknown-linux-musl")
+        );
+        // Explicit musl.
+        assert_eq!(
+            worker_target_triple(&facts(
+                BinaryOs::Linux,
+                Some(BinaryArch::X86_64),
+                LinuxLibc::Musl
+            ))
+            .as_deref(),
+            Some("x86_64-unknown-linux-musl")
+        );
+        // gnu detected.
+        assert_eq!(
+            worker_target_triple(&facts(
+                BinaryOs::Linux,
+                Some(BinaryArch::X86_64),
+                LinuxLibc::Gnu
+            ))
+            .as_deref(),
+            Some("x86_64-unknown-linux-gnu")
+        );
+        // aarch64 linux.
+        assert_eq!(
+            worker_target_triple(&facts(
+                BinaryOs::Linux,
+                Some(BinaryArch::Aarch64),
+                LinuxLibc::Musl
+            ))
+            .as_deref(),
+            Some("aarch64-unknown-linux-musl")
+        );
+    }
+
+    #[test]
+    fn worker_target_triple_macos_and_unsupported() {
+        assert_eq!(
+            worker_target_triple(&facts(
+                BinaryOs::MacOs,
+                Some(BinaryArch::Aarch64),
+                LinuxLibc::Unknown
+            ))
+            .as_deref(),
+            Some("aarch64-apple-darwin")
+        );
+        assert_eq!(
+            worker_target_triple(&facts(
+                BinaryOs::MacOs,
+                Some(BinaryArch::X86_64),
+                LinuxLibc::Unknown
+            ))
+            .as_deref(),
+            Some("x86_64-apple-darwin")
+        );
+        // Unknown arch, 32-bit, and Windows are not in the fleet matrix.
+        assert!(worker_target_triple(&facts(BinaryOs::Linux, None, LinuxLibc::Musl)).is_none());
+        assert!(
+            worker_target_triple(&facts(
+                BinaryOs::Linux,
+                Some(BinaryArch::X86),
+                LinuxLibc::Musl
+            ))
+            .is_none()
+        );
+        assert!(
+            worker_target_triple(&facts(
+                BinaryOs::Windows,
+                Some(BinaryArch::X86_64),
+                LinuxLibc::Unknown
+            ))
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn resolve_worker_artifact_matches_by_triple_and_name() {
+        let artifacts = vec![
+            FleetArtifact {
+                name: "rch-wkr-v1-x86_64-unknown-linux-musl".to_string(),
+                target_triple: "x86_64-unknown-linux-musl".to_string(),
+            },
+            FleetArtifact {
+                name: "rch-wkr-v1-aarch64-apple-darwin".to_string(),
+                target_triple: "aarch64-apple-darwin".to_string(),
+            },
+        ];
+        // Exact triple match.
+        let got = resolve_worker_artifact("w1", "x86_64-unknown-linux-musl", &artifacts).unwrap();
+        assert_eq!(got.target_triple, "x86_64-unknown-linux-musl");
+        // Match by name substring when target_triple field differs.
+        let by_name = vec![FleetArtifact {
+            name: "rch-wkr-aarch64-apple-darwin.tar.gz".to_string(),
+            target_triple: "darwin-aarch64".to_string(),
+        }];
+        assert!(resolve_worker_artifact("w2", "aarch64-apple-darwin", &by_name).is_ok());
+    }
+
+    #[test]
+    fn resolve_worker_artifact_fails_closed_with_no_match() {
+        // The exact 6h54q failure mode: a darwin controller's artifacts only,
+        // resolving for a linux worker => fail closed, never reuse a darwin one.
+        let darwin_only = vec![FleetArtifact {
+            name: "rch-wkr-aarch64-apple-darwin".to_string(),
+            target_triple: "aarch64-apple-darwin".to_string(),
+        }];
+        let err =
+            resolve_worker_artifact("linux-worker", "x86_64-unknown-linux-musl", &darwin_only)
+                .unwrap_err();
+        match err {
+            ArtifactResolveError::NoCompatibleArtifact {
+                worker_id,
+                triple,
+                available,
+            } => {
+                assert_eq!(worker_id, "linux-worker");
+                assert_eq!(triple, "x86_64-unknown-linux-musl");
+                assert_eq!(available, vec!["aarch64-apple-darwin".to_string()]);
+            }
+            other => panic!("expected NoCompatibleArtifact, got {other:?}"),
+        }
+        // Empty artifact set also fails closed.
+        assert!(resolve_worker_artifact("w", "x86_64-unknown-linux-musl", &[]).is_err());
     }
 
     #[test]
