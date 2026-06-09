@@ -8,6 +8,7 @@
 
 pub mod agent;
 mod cache;
+mod cache_gc;
 mod commands;
 mod completions;
 mod config;
@@ -1224,6 +1225,27 @@ enum CacheAction {
         /// Project root to warm. Default: current working directory.
         #[arg(long, value_name = "PATH")]
         project: Option<PathBuf>,
+    },
+
+    /// Prune stale local staging trees under the configured remote_base to
+    /// bound disk usage (bd-s3433).
+    ///
+    /// Safe by default: a bare `rch cache clean` is a DRY RUN that only reports
+    /// what would be removed. Pass `--execute` to actually delete. Trees
+    /// modified within `--older` are kept (an in-flight build keeps its tree
+    /// fresh), and every path is validated as a safe reap path before removal.
+    Clean {
+        /// Only prune trees idle at least this long (e.g. `30m`, `24h`, `7d`).
+        #[arg(long, value_name = "DURATION", default_value = "24h")]
+        older: String,
+
+        /// Restrict to a single project's staging trees (the project id dir).
+        #[arg(long, value_name = "NAME")]
+        project: Option<String>,
+
+        /// Actually delete (default is a dry-run report only).
+        #[arg(long)]
+        execute: bool,
     },
 }
 
@@ -3055,7 +3077,75 @@ struct CacheWarmResponse {
 async fn handle_cache(action: CacheAction, ctx: &OutputContext) -> Result<()> {
     match action {
         CacheAction::Warm { workers, project } => handle_cache_warm(workers, project, ctx).await,
+        CacheAction::Clean {
+            older,
+            project,
+            execute,
+        } => handle_cache_clean(older, project, execute, ctx).await,
     }
+}
+
+/// `rch cache clean`: prune stale local staging trees under the configured
+/// `transfer.remote_base`. Dry-run unless `execute`. (bd-s3433)
+async fn handle_cache_clean(
+    older: String,
+    project: Option<String>,
+    execute: bool,
+    ctx: &OutputContext,
+) -> Result<()> {
+    let min_age = cache_gc::parse_human_duration(&older)
+        .map_err(|e| anyhow::anyhow!("invalid --older value: {e}"))?;
+
+    let config = crate::config::load_config().unwrap_or_default();
+    let remote_base = PathBuf::from(&config.transfer.remote_base);
+
+    let now = std::time::SystemTime::now();
+    let trees =
+        cache_gc::enumerate_staging_trees(&remote_base, project.as_deref(), now).map_err(|e| {
+            anyhow::anyhow!("failed to enumerate staging trees under {remote_base:?}: {e}")
+        })?;
+    let plan =
+        cache_gc::plan_staging_gc(&trees, cache_gc::StagingGcPolicy { min_age }, &remote_base);
+
+    let style = ctx.theme();
+    if execute {
+        let outcome = cache_gc::execute_staging_gc(&plan, &remote_base);
+        if ctx.is_json() {
+            let _ = ctx.json(&ApiResponse::ok("cache clean", &outcome));
+        } else {
+            println!(
+                "Pruned {} tree(s), reclaimed {} ({} failed)",
+                outcome.removed_count,
+                cache_gc::human_bytes(outcome.removed_bytes),
+                outcome.failed.len()
+            );
+        }
+    } else if ctx.is_json() {
+        let _ = ctx.json(&ApiResponse::ok("cache clean", &plan));
+    } else {
+        println!(
+            "Dry run over {} ({} tree(s), {} total). Would prune {} tree(s), reclaim {}.",
+            remote_base.display(),
+            plan.entries.len(),
+            cache_gc::human_bytes(plan.total_bytes),
+            plan.prunable_count,
+            cache_gc::human_bytes(plan.prunable_bytes)
+        );
+        for e in plan
+            .entries
+            .iter()
+            .filter(|e| matches!(e.action, cache_gc::GcAction::Prune))
+        {
+            println!(
+                "  prune {} ({}, idle {}s)",
+                e.path,
+                cache_gc::human_bytes(e.size_bytes),
+                e.age_secs
+            );
+        }
+        println!("  {} pass --execute to actually delete", style.muted("→"));
+    }
+    Ok(())
 }
 
 fn resolve_cache_warm_project_root(
