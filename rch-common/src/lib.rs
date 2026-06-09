@@ -18,6 +18,7 @@ pub mod discovery;
 pub mod e2e;
 pub mod errors;
 pub mod hooks;
+pub mod incident;
 pub mod logging;
 pub mod mock;
 pub mod mock_worker;
@@ -188,6 +189,12 @@ pub use ui::{
     ErrorPanel, ErrorSeverity, Icons, IntoErrorPanel, OutputContext, RchTheme, ResultExt,
     anyhow_to_json, anyhow_to_panel, display_anyhow_error, display_error, display_error_with_code,
     error_to_json, error_to_panel,
+};
+
+// Incident schema re-exports
+pub use incident::{
+    ControlState, IncidentEvent, IncidentEventType, IncidentReasonCode, IncidentSource,
+    SelectedMode, incident_schema_version,
 };
 
 // Errors module re-exports

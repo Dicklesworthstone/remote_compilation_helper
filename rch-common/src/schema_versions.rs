@@ -46,6 +46,8 @@ pub enum SchemaComponent {
     RepoUpdaterContract,
     /// Process-triage wire contract.
     ProcessTriageContract,
+    /// Incident event schema (shared remediation reason-code ledger).
+    IncidentLedger,
 }
 
 /// The canonical version string for a given component.
@@ -60,6 +62,7 @@ pub const fn current_version(component: SchemaComponent) -> &'static str {
         SchemaComponent::Status => "1.0.0",
         SchemaComponent::RepoUpdaterContract => "1.0.0",
         SchemaComponent::ProcessTriageContract => "1.0.0",
+        SchemaComponent::IncidentLedger => "1.0.0",
     }
 }
 
@@ -82,6 +85,10 @@ pub const ALL_COMPONENTS: &[(SchemaComponent, &str)] = &[
         SchemaComponent::ProcessTriageContract,
         current_version(SchemaComponent::ProcessTriageContract),
     ),
+    (
+        SchemaComponent::IncidentLedger,
+        current_version(SchemaComponent::IncidentLedger),
+    ),
 ];
 
 #[cfg(test)]
@@ -100,6 +107,7 @@ mod tests {
         (SchemaComponent::Status, "1.0.0"),
         (SchemaComponent::RepoUpdaterContract, "1.0.0"),
         (SchemaComponent::ProcessTriageContract, "1.0.0"),
+        (SchemaComponent::IncidentLedger, "1.0.0"),
     ];
 
     #[test]
