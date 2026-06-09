@@ -85,3 +85,7 @@ rch-install/
 
 # Beads compliance audit dir (managed by /beads-compliance-and-completion-verification skill)
 /beads_compliance_audit/
+
+# Python bytecode (e.g. from scripts/lib/*.py tooling)
+__pycache__/
+*.pyc
