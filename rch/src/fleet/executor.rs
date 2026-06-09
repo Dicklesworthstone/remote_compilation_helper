@@ -398,6 +398,15 @@ impl FleetExecutor {
                 // Upload phase - create remote directory and copy binary
                 progress.set_phase(&worker_id, DeployPhase::Uploading).await;
 
+                // Guard against clobbering a worker's good binary with one built
+                // for the wrong OS/arch (e.g. pushing a macOS binary onto a
+                // linux/amd64 worker => `Exec format error`). Runs before SCP so
+                // a mismatch never overwrites the existing binary.
+                if let Err(e) = ensure_binary_matches_worker(&worker_config, &local_binary).await {
+                    progress.worker_failed(&worker_id, &format!("{}", e)).await;
+                    return (idx, worker_id, false, DeploymentStatus::Failed);
+                }
+
                 if let Err(e) = create_remote_directory(&worker_config).await {
                     progress
                         .worker_failed(&worker_id, &format!("mkdir failed: {}", e))
@@ -493,6 +502,283 @@ async fn create_remote_directory(worker: &WorkerConfig) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("mkdir failed: {}", e))
 }
 
+// =============================================================================
+// Binary / worker platform compatibility guard
+// =============================================================================
+//
+// A controller must never overwrite a worker's good binary with one built for
+// the wrong OS/arch. Pushing a macOS Mach-O onto a linux/amd64 worker leaves
+// every invocation failing with `Exec format error` (exit 126). We detect the
+// local binary's executable format from its magic bytes and the worker's
+// platform from `uname`, and refuse the deploy on mismatch *before* the
+// existing binary is replaced.
+
+/// Operating-system family of an executable or a remote worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BinaryOs {
+    Linux,
+    MacOs,
+    Windows,
+}
+
+impl BinaryOs {
+    fn as_str(self) -> &'static str {
+        match self {
+            BinaryOs::Linux => "linux",
+            BinaryOs::MacOs => "macos",
+            BinaryOs::Windows => "windows",
+        }
+    }
+}
+
+/// CPU architecture of an executable or a remote worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BinaryArch {
+    X86_64,
+    Aarch64,
+    X86,
+    Arm,
+}
+
+impl BinaryArch {
+    fn as_str(self) -> &'static str {
+        match self {
+            BinaryArch::X86_64 => "x86_64",
+            BinaryArch::Aarch64 => "aarch64",
+            BinaryArch::X86 => "x86",
+            BinaryArch::Arm => "arm",
+        }
+    }
+}
+
+/// OS + arch of an executable or worker. `arch == None` means the arch could
+/// not be determined (e.g. a universal/fat Mach-O, or an unrecognised
+/// `uname -m`); in that case we only enforce the OS match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BinaryPlatform {
+    os: BinaryOs,
+    arch: Option<BinaryArch>,
+}
+
+impl std::fmt::Display for BinaryPlatform {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.arch {
+            Some(arch) => write!(f, "{}/{}", self.os.as_str(), arch.as_str()),
+            None => write!(f, "{}/unknown", self.os.as_str()),
+        }
+    }
+}
+
+/// Number of header bytes that are sufficient to classify ELF, Mach-O and PE
+/// executables (magic + machine/cputype fields all live in the first 20 bytes).
+const BINARY_MAGIC_PROBE_LEN: usize = 20;
+
+/// Classify a local executable from its leading magic bytes.
+///
+/// Returns `None` when the format is unrecognised, in which case the guard
+/// fails open (the post-deploy health check remains the backstop).
+fn detect_binary_platform(header: &[u8]) -> Option<BinaryPlatform> {
+    // PE / Windows ("MZ").
+    if header.len() >= 2 && &header[0..2] == b"MZ" {
+        return Some(BinaryPlatform {
+            os: BinaryOs::Windows,
+            arch: None,
+        });
+    }
+
+    // ELF: 0x7F 'E' 'L' 'F'.
+    if header.len() >= 20 && header[0..4] == [0x7F, b'E', b'L', b'F'] {
+        // EI_DATA at offset 5: 1 = little-endian, 2 = big-endian.
+        let little_endian = header[5] != 2;
+        // e_machine: 2-byte field at offset 18.
+        let machine = if little_endian {
+            u16::from_le_bytes([header[18], header[19]])
+        } else {
+            u16::from_be_bytes([header[18], header[19]])
+        };
+        let arch = match machine {
+            0x3E => Some(BinaryArch::X86_64),  // EM_X86_64
+            0xB7 => Some(BinaryArch::Aarch64), // EM_AARCH64
+            0x03 => Some(BinaryArch::X86),     // EM_386
+            0x28 => Some(BinaryArch::Arm),     // EM_ARM
+            _ => None,
+        };
+        return Some(BinaryPlatform {
+            os: BinaryOs::Linux,
+            arch,
+        });
+    }
+
+    // Mach-O (single-arch). Magic stored in native endianness:
+    //   little-endian on disk: CF FA ED FE (64-bit) / CE FA ED FE (32-bit)
+    //   cross-endian:          FE ED FA CF / FE ED FA CE
+    if header.len() >= 8 {
+        let magic = &header[0..4];
+        let is_macho_le = magic == [0xCF, 0xFA, 0xED, 0xFE] || magic == [0xCE, 0xFA, 0xED, 0xFE];
+        let is_macho_be = magic == [0xFE, 0xED, 0xFA, 0xCF] || magic == [0xFE, 0xED, 0xFA, 0xCE];
+        if is_macho_le || is_macho_be {
+            // cputype: 4-byte field at offset 4, in the same endianness as magic.
+            let cputype = if is_macho_le {
+                u32::from_le_bytes([header[4], header[5], header[6], header[7]])
+            } else {
+                u32::from_be_bytes([header[4], header[5], header[6], header[7]])
+            };
+            let arch = match cputype {
+                0x0100_0007 => Some(BinaryArch::X86_64),  // CPU_TYPE_X86_64
+                0x0100_000C => Some(BinaryArch::Aarch64), // CPU_TYPE_ARM64
+                0x0000_0007 => Some(BinaryArch::X86),     // CPU_TYPE_X86
+                0x0000_000C => Some(BinaryArch::Arm),     // CPU_TYPE_ARM
+                _ => None,
+            };
+            return Some(BinaryPlatform {
+                os: BinaryOs::MacOs,
+                arch,
+            });
+        }
+
+        // Universal / fat Mach-O: FAT_MAGIC 0xCAFEBABE (and byte-swapped). Such
+        // a binary contains multiple slices, so we only assert the macOS OS.
+        if magic == [0xCA, 0xFE, 0xBA, 0xBE] || magic == [0xBE, 0xBA, 0xFE, 0xCA] {
+            return Some(BinaryPlatform {
+                os: BinaryOs::MacOs,
+                arch: None,
+            });
+        }
+    }
+
+    None
+}
+
+/// Parse `uname -s` / `uname -m` output into a worker platform.
+///
+/// `uname_s` is the kernel name (`Linux`, `Darwin`, ...) and `uname_m` is the
+/// machine hardware name (`x86_64`, `aarch64`, `arm64`, ...). Returns `None`
+/// when the OS is unrecognised so the guard fails open.
+fn parse_worker_platform(uname_s: &str, uname_m: &str) -> Option<BinaryPlatform> {
+    let os = match uname_s.trim().to_ascii_lowercase().as_str() {
+        "linux" => BinaryOs::Linux,
+        "darwin" => BinaryOs::MacOs,
+        s if s.contains("mingw") || s.contains("msys") || s.contains("cygwin") => BinaryOs::Windows,
+        _ => return None,
+    };
+
+    let arch = match uname_m.trim().to_ascii_lowercase().as_str() {
+        "x86_64" | "amd64" => Some(BinaryArch::X86_64),
+        "aarch64" | "arm64" => Some(BinaryArch::Aarch64),
+        "i386" | "i486" | "i586" | "i686" | "x86" => Some(BinaryArch::X86),
+        m if m.starts_with("armv") || m == "arm" => Some(BinaryArch::Arm),
+        _ => None,
+    };
+
+    Some(BinaryPlatform { os, arch })
+}
+
+/// Whether a binary built for `local` can execute on a `worker` platform.
+///
+/// The OS must match exactly. The arch must match when both are known; an
+/// unknown arch on either side (universal binary, unrecognised `uname -m`)
+/// degrades to an OS-only check rather than a false rejection.
+fn platforms_compatible(local: BinaryPlatform, worker: BinaryPlatform) -> bool {
+    if local.os != worker.os {
+        return false;
+    }
+    match (local.arch, worker.arch) {
+        (Some(a), Some(b)) => a == b,
+        _ => true,
+    }
+}
+
+/// Read the leading magic bytes of a local binary.
+fn read_binary_header(path: &Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut buf = vec![0u8; BINARY_MAGIC_PROBE_LEN];
+    let mut read = 0;
+    while read < buf.len() {
+        match file.read(&mut buf[read..])? {
+            0 => break,
+            n => read += n,
+        }
+    }
+    buf.truncate(read);
+    Ok(buf)
+}
+
+/// Detect a worker's platform via `uname`.
+async fn detect_worker_platform(worker: &WorkerConfig) -> Option<BinaryPlatform> {
+    let ssh = SshExecutor::new(worker);
+    let output = ssh
+        .run_command("uname -s; uname -m")
+        .await
+        .ok()
+        .filter(CommandOutput::success)?;
+    let mut lines = output.stdout.lines();
+    let uname_s = lines.next()?;
+    let uname_m = lines.next().unwrap_or("");
+    parse_worker_platform(uname_s, uname_m)
+}
+
+/// Refuse to deploy a binary whose OS/arch is incompatible with the worker.
+///
+/// Fails open (returns `Ok`) when either side cannot be classified — the
+/// post-deploy health check stays as the final backstop — but fails loudly on a
+/// *proven* mismatch so a controller never clobbers a worker's good binary with
+/// an `Exec format error` time bomb.
+async fn ensure_binary_matches_worker(worker: &WorkerConfig, local_binary: &Path) -> Result<()> {
+    let header = match read_binary_header(local_binary) {
+        Ok(header) => header,
+        Err(e) => {
+            warn!(
+                worker = %worker.id,
+                path = %local_binary.display(),
+                error = %e,
+                "Could not read local binary header for platform check; proceeding"
+            );
+            return Ok(());
+        }
+    };
+
+    let local_platform = match detect_binary_platform(&header) {
+        Some(platform) => platform,
+        None => {
+            warn!(
+                worker = %worker.id,
+                path = %local_binary.display(),
+                "Unrecognised local binary format; skipping platform pre-check"
+            );
+            return Ok(());
+        }
+    };
+
+    let worker_platform = match detect_worker_platform(worker).await {
+        Some(platform) => platform,
+        None => {
+            warn!(
+                worker = %worker.id,
+                "Could not determine worker platform via uname; skipping platform pre-check"
+            );
+            return Ok(());
+        }
+    };
+
+    if platforms_compatible(local_platform, worker_platform) {
+        debug!(
+            worker = %worker.id,
+            local = %local_platform,
+            remote = %worker_platform,
+            "Binary platform matches worker"
+        );
+        return Ok(());
+    }
+
+    Err(FleetError::BinaryPlatformMismatch {
+        worker_id: worker.id.0.clone(),
+        local: local_platform.to_string(),
+        worker: worker_platform.to_string(),
+    }
+    .into())
+}
+
 /// Copy the binary to the worker via SCP.
 ///
 /// Uploads to a temporary file in the target directory, then atomically renames
@@ -558,8 +844,23 @@ async fn verify_installation(worker: &WorkerConfig) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("health check failed: {}", e))?;
 
     if !output.success() {
+        // Exit 126 / "Exec format error" means the deployed binary does not
+        // match the worker's architecture. Surface that explicitly so an
+        // operator immediately understands the failure mode (and to backstop
+        // the pre-deploy platform guard for unclassifiable binaries).
+        let stderr = output.stderr.trim();
+        if output.exit_code == 126 || stderr.contains("Exec format error") {
+            return Err(FleetError::HealthCheckFailed {
+                reason: format!(
+                    "deployed rch-wkr is not executable on this worker (exit {}: {}); \
+                    the binary architecture does not match the worker",
+                    output.exit_code, stderr
+                ),
+            }
+            .into());
+        }
         return Err(FleetError::HealthCheckFailed {
-            reason: output.stderr.trim().to_string(),
+            reason: stderr.to_string(),
         }
         .into());
     }
@@ -1104,6 +1405,166 @@ mod tests {
 
         assert!(staging_path.starts_with("~/.local/bin/.rch-wkr.tmp."));
         assert_ne!(staging_path, REMOTE_WORKER_BINARY);
+    }
+
+    // ========================
+    // Binary / worker platform guard tests
+    // ========================
+
+    fn elf_header(machine: u16, little_endian: bool) -> Vec<u8> {
+        let mut h = vec![0u8; BINARY_MAGIC_PROBE_LEN];
+        h[0..4].copy_from_slice(&[0x7F, b'E', b'L', b'F']);
+        h[4] = 2; // EI_CLASS = 64-bit
+        h[5] = if little_endian { 1 } else { 2 };
+        let bytes = if little_endian {
+            machine.to_le_bytes()
+        } else {
+            machine.to_be_bytes()
+        };
+        h[18] = bytes[0];
+        h[19] = bytes[1];
+        h
+    }
+
+    fn macho_header(magic: [u8; 4], cputype: u32, little_endian: bool) -> Vec<u8> {
+        let mut h = vec![0u8; BINARY_MAGIC_PROBE_LEN];
+        h[0..4].copy_from_slice(&magic);
+        let bytes = if little_endian {
+            cputype.to_le_bytes()
+        } else {
+            cputype.to_be_bytes()
+        };
+        h[4..8].copy_from_slice(&bytes);
+        h
+    }
+
+    #[test]
+    fn detect_binary_platform_recognises_linux_elf() {
+        let platform = detect_binary_platform(&elf_header(0x3E, true)).unwrap();
+        assert_eq!(platform.os, BinaryOs::Linux);
+        assert_eq!(platform.arch, Some(BinaryArch::X86_64));
+
+        let aarch = detect_binary_platform(&elf_header(0xB7, true)).unwrap();
+        assert_eq!(aarch.arch, Some(BinaryArch::Aarch64));
+    }
+
+    #[test]
+    fn detect_binary_platform_recognises_macho() {
+        // 64-bit little-endian arm64 Mach-O (CF FA ED FE).
+        let arm =
+            detect_binary_platform(&macho_header([0xCF, 0xFA, 0xED, 0xFE], 0x0100_000C, true))
+                .unwrap();
+        assert_eq!(arm.os, BinaryOs::MacOs);
+        assert_eq!(arm.arch, Some(BinaryArch::Aarch64));
+
+        // 64-bit little-endian x86_64 Mach-O.
+        let x86 =
+            detect_binary_platform(&macho_header([0xCF, 0xFA, 0xED, 0xFE], 0x0100_0007, true))
+                .unwrap();
+        assert_eq!(x86.arch, Some(BinaryArch::X86_64));
+    }
+
+    #[test]
+    fn detect_binary_platform_recognises_fat_macho_as_unknown_arch() {
+        let fat = detect_binary_platform(&[0xCA, 0xFE, 0xBA, 0xBE, 0, 0, 0, 2]).unwrap();
+        assert_eq!(fat.os, BinaryOs::MacOs);
+        assert_eq!(fat.arch, None);
+    }
+
+    #[test]
+    fn detect_binary_platform_returns_none_for_garbage() {
+        assert!(detect_binary_platform(&[0x00, 0x01, 0x02, 0x03]).is_none());
+        assert!(detect_binary_platform(&[]).is_none());
+    }
+
+    #[test]
+    fn parse_worker_platform_normalises_uname() {
+        let linux = parse_worker_platform("Linux", "x86_64").unwrap();
+        assert_eq!(linux.os, BinaryOs::Linux);
+        assert_eq!(linux.arch, Some(BinaryArch::X86_64));
+
+        let mac = parse_worker_platform("Darwin", "arm64").unwrap();
+        assert_eq!(mac.os, BinaryOs::MacOs);
+        assert_eq!(mac.arch, Some(BinaryArch::Aarch64));
+
+        // amd64 alias and unknown arch degrade gracefully.
+        assert_eq!(
+            parse_worker_platform("Linux", "amd64").unwrap().arch,
+            Some(BinaryArch::X86_64)
+        );
+        assert_eq!(
+            parse_worker_platform("Linux", "riscv64").unwrap().arch,
+            None
+        );
+        assert!(parse_worker_platform("Plan9", "x86_64").is_none());
+    }
+
+    #[test]
+    fn platforms_compatible_rejects_the_p0_failure_mode() {
+        // The exact bug: a macOS/arm64 controller binary pushed onto a
+        // linux/amd64 worker.
+        let mac_binary = BinaryPlatform {
+            os: BinaryOs::MacOs,
+            arch: Some(BinaryArch::Aarch64),
+        };
+        let linux_worker = BinaryPlatform {
+            os: BinaryOs::Linux,
+            arch: Some(BinaryArch::X86_64),
+        };
+        assert!(!platforms_compatible(mac_binary, linux_worker));
+    }
+
+    #[test]
+    fn platforms_compatible_rejects_arch_mismatch_same_os() {
+        let arm_linux = BinaryPlatform {
+            os: BinaryOs::Linux,
+            arch: Some(BinaryArch::Aarch64),
+        };
+        let x86_linux = BinaryPlatform {
+            os: BinaryOs::Linux,
+            arch: Some(BinaryArch::X86_64),
+        };
+        assert!(!platforms_compatible(arm_linux, x86_linux));
+    }
+
+    #[test]
+    fn platforms_compatible_accepts_exact_match_and_unknown_arch() {
+        let x86_linux = BinaryPlatform {
+            os: BinaryOs::Linux,
+            arch: Some(BinaryArch::X86_64),
+        };
+        assert!(platforms_compatible(x86_linux, x86_linux));
+
+        // Unknown arch on either side degrades to an OS-only match.
+        let unknown_linux = BinaryPlatform {
+            os: BinaryOs::Linux,
+            arch: None,
+        };
+        assert!(platforms_compatible(unknown_linux, x86_linux));
+        assert!(platforms_compatible(x86_linux, unknown_linux));
+    }
+
+    #[test]
+    fn read_binary_header_reads_leading_magic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fake-elf");
+        std::fs::write(&path, elf_header(0x3E, true)).unwrap();
+        let header = read_binary_header(&path).unwrap();
+        let platform = detect_binary_platform(&header).unwrap();
+        assert_eq!(platform.os, BinaryOs::Linux);
+        assert_eq!(platform.arch, Some(BinaryArch::X86_64));
+    }
+
+    #[tokio::test]
+    async fn ensure_binary_matches_worker_fails_open_on_unreadable_binary() {
+        let worker = test_worker_config();
+        let missing = PathBuf::from("/nonexistent/path/rch-wkr");
+        // Unreadable local binary => fail open (Ok), backstopped by health check.
+        assert!(
+            ensure_binary_matches_worker(&worker, &missing)
+                .await
+                .is_ok()
+        );
     }
 
     // ========================
