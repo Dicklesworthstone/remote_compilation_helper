@@ -37,6 +37,7 @@ pub mod proof_intent;
 #[cfg(test)]
 mod proptest_tests;
 pub mod protocol;
+pub mod queue_contract;
 #[cfg(unix)]
 pub mod remote_compilation;
 #[cfg(unix)]
@@ -156,6 +157,10 @@ pub use patterns::{
     classify_command, classify_command_detailed, split_shell_commands,
 };
 pub use protocol::{HookInput, HookOutput, ToolInput};
+pub use queue_contract::{
+    AdmissionState, QueueContractOutcome, QueueContractResponse, QueueOptions, StartState,
+    WaitResult, resolve_queue_contract,
+};
 pub use remote_compilation::{
     RCH_CARGO_HOME_BASE_VAR, RCH_CARGO_HOME_PREFIX, remote_cargo_home_base_prelude,
     remote_cargo_home_expr,
