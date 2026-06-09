@@ -586,6 +586,31 @@ fn auto_config_flip(code: ReliabilityReasonCode) -> Option<AutoConfigFlip> {
     }
 }
 
+/// Pre-write plan for an auto-fixable step (pure; no I/O). Encodes the
+/// (intent × execute) matrix for the auto case before any disk write is
+/// attempted — the actual write only happens for [`AutoFlipPlan::Apply`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutoFlipPlan {
+    /// Config already at the desired value — idempotent no-op.
+    AlreadySatisfied,
+    /// `--fix --dry-run`: report the intent without mutating anything.
+    WouldApply,
+    /// `--fix`: perform the write (result becomes `Applied` or `Failed`).
+    Apply,
+}
+
+/// Classify an auto-fixable step before touching disk. `already` is whether the
+/// flip is already satisfied; `preview` is true under `--fix --dry-run`.
+fn plan_auto_flip(already: bool, preview: bool) -> AutoFlipPlan {
+    if already {
+        AutoFlipPlan::AlreadySatisfied
+    } else if preview {
+        AutoFlipPlan::WouldApply
+    } else {
+        AutoFlipPlan::Apply
+    }
+}
+
 /// Is `flip` already satisfied by the loaded config? Used to recognise
 /// idempotent no-ops so a `--fix` re-run reports `AlreadySatisfied` instead of
 /// rewriting the file.
@@ -2882,22 +2907,24 @@ fn apply_reliability_remediations(response: &mut ReliabilityDoctorResponse) {
                     .as_ref()
                     .is_some_and(|cfg| config_flip_satisfied(cfg, flip));
                 let command = format!("rch config set {} {}", flip.key, flip.value);
-                let (status, detail) = if already {
-                    (RemediationOutcomeStatus::AlreadySatisfied, None)
-                } else if preview {
-                    (
+                let (status, detail) = match plan_auto_flip(already, preview) {
+                    AutoFlipPlan::AlreadySatisfied => {
+                        (RemediationOutcomeStatus::AlreadySatisfied, None)
+                    }
+                    AutoFlipPlan::WouldApply => (
                         RemediationOutcomeStatus::WouldApply,
                         Some(format!("would set {} = {}", flip.key, flip.value)),
-                    )
-                } else {
-                    match crate::commands::config::default_config_path().and_then(|path| {
-                        crate::commands::config::apply_config_set(&path, flip.key, flip.value)
-                    }) {
-                        Ok(()) => (
-                            RemediationOutcomeStatus::Applied,
-                            Some(format!("set {} = {}", flip.key, flip.value)),
-                        ),
-                        Err(e) => (RemediationOutcomeStatus::Failed, Some(e.to_string())),
+                    ),
+                    AutoFlipPlan::Apply => {
+                        match crate::commands::default_config_path().and_then(|path| {
+                            crate::commands::apply_config_set(&path, flip.key, flip.value)
+                        }) {
+                            Ok(()) => (
+                                RemediationOutcomeStatus::Applied,
+                                Some(format!("set {} = {}", flip.key, flip.value)),
+                            ),
+                            Err(e) => (RemediationOutcomeStatus::Failed, Some(e.to_string())),
+                        }
                     }
                 };
                 ReliabilityRemediationOutcome {
@@ -4949,6 +4976,150 @@ mod tests {
             "last_error": null
         }))
         .expect("worker status fixture should parse")
+    }
+
+    // ========================
+    // --fix remediation executor tests (bead 2s99h.12)
+    // ========================
+
+    #[test]
+    fn auto_config_flip_maps_self_healing_codes_only() {
+        let hook = auto_config_flip(ReliabilityReasonCode::HookAutoStartDisabled)
+            .expect("hook auto-start disabled is auto-fixable");
+        assert_eq!(hook.key, "self_healing.hook_starts_daemon");
+        assert_eq!(hook.value, "true");
+
+        let repair = auto_config_flip(ReliabilityReasonCode::DaemonHookRepairDisabled)
+            .expect("daemon hook repair disabled is auto-fixable");
+        assert_eq!(repair.key, "self_healing.daemon_installs_hooks");
+        assert_eq!(repair.value, "true");
+
+        // A code with no safe idempotent flip stays manual.
+        assert!(auto_config_flip(ReliabilityReasonCode::NoWorkersConfigured).is_none());
+    }
+
+    #[test]
+    fn config_flip_satisfied_reads_the_target_key() {
+        let mut config = rch_common::RchConfig::default();
+        config.self_healing.hook_starts_daemon = false;
+        let flip = auto_config_flip(ReliabilityReasonCode::HookAutoStartDisabled).unwrap();
+        assert!(!config_flip_satisfied(&config, flip));
+        config.self_healing.hook_starts_daemon = true;
+        assert!(config_flip_satisfied(&config, flip));
+    }
+
+    #[test]
+    fn plan_auto_flip_covers_the_intent_execute_matrix() {
+        // already-satisfied dominates regardless of preview.
+        assert_eq!(plan_auto_flip(true, false), AutoFlipPlan::AlreadySatisfied);
+        assert_eq!(plan_auto_flip(true, true), AutoFlipPlan::AlreadySatisfied);
+        // not satisfied + preview => would-apply (no write).
+        assert_eq!(plan_auto_flip(false, true), AutoFlipPlan::WouldApply);
+        // not satisfied + execute => apply (write).
+        assert_eq!(plan_auto_flip(false, false), AutoFlipPlan::Apply);
+    }
+
+    fn remediation_step(
+        order: u32,
+        code: ReliabilityReasonCode,
+        command: &str,
+    ) -> ReliabilityRemediationStep {
+        ReliabilityRemediationStep {
+            order,
+            category: ReliabilityCategory::RolloutPosture,
+            code,
+            description: format!("step {order}"),
+            command: command.to_string(),
+            validation: "rch doctor --reliability --json".to_string(),
+            requires_restart: false,
+            dry_run_safe: true,
+            auto_fixable: auto_config_flip(code).is_some(),
+        }
+    }
+
+    fn response_with_plan(
+        mode: ReliabilityDoctorMode,
+        fix_requested: bool,
+        plan: Vec<ReliabilityRemediationStep>,
+    ) -> ReliabilityDoctorResponse {
+        let scope = ReliabilityScopeSet::default();
+        let mut response = build_reliability_doctor_response(mode, &scope, Vec::new());
+        response.remediation_plan = plan;
+        response.fix_requested = fix_requested;
+        response
+    }
+
+    #[test]
+    fn executor_is_noop_without_fix_requested() {
+        // Plain --dry-run / --check: fix not requested => no outcomes, ever.
+        let plan = vec![remediation_step(
+            1,
+            ReliabilityReasonCode::HookAutoStartDisabled,
+            "rch config set self_healing.hook_starts_daemon true",
+        )];
+        let mut response = response_with_plan(ReliabilityDoctorMode::DryRun, false, plan);
+        apply_reliability_remediations(&mut response);
+        assert!(
+            response.remediation_outcomes.is_empty(),
+            "no fix requested must yield no outcomes"
+        );
+    }
+
+    #[test]
+    fn executor_preview_never_applies_and_classifies_manual_steps() {
+        // --fix --dry-run (mode downgraded to DryRun, fix_requested=true).
+        let plan = vec![
+            remediation_step(
+                1,
+                ReliabilityReasonCode::HookAutoStartDisabled,
+                "rch config set self_healing.hook_starts_daemon true",
+            ),
+            // A non-auto-fixable code -> Manual.
+            remediation_step(
+                2,
+                ReliabilityReasonCode::NoWorkersConfigured,
+                "rch workers add <host>",
+            ),
+        ];
+        let mut response = response_with_plan(ReliabilityDoctorMode::DryRun, true, plan);
+        apply_reliability_remediations(&mut response);
+
+        assert_eq!(response.remediation_outcomes.len(), 2);
+        // The auto step is previewed, never applied (no disk write in DryRun).
+        // Ambient config decides would-apply vs already-satisfied; both are
+        // valid "no mutation occurred" outcomes — never Applied/Failed.
+        let auto = &response.remediation_outcomes[0];
+        assert!(
+            matches!(
+                auto.status,
+                RemediationOutcomeStatus::WouldApply | RemediationOutcomeStatus::AlreadySatisfied
+            ),
+            "preview auto step must not mutate: {:?}",
+            auto.status
+        );
+        // The manual step is always Manual and carries the operator command.
+        let manual = &response.remediation_outcomes[1];
+        assert_eq!(manual.status, RemediationOutcomeStatus::Manual);
+        assert_eq!(manual.command, "rch workers add <host>");
+    }
+
+    #[test]
+    fn remediation_plan_marks_auto_fixable_steps() {
+        let diag = ReliabilityDiagnostic::new(
+            ReliabilityCategory::RolloutPosture,
+            "hook_starts_daemon",
+            ReliabilitySeverity::Warning,
+            "Hook auto-start is disabled",
+            ReliabilityReasonCode::HookAutoStartDisabled,
+        )
+        .with_remediation(
+            "rch config set self_healing.hook_starts_daemon true",
+            "rch config get self_healing.hook_starts_daemon --json",
+        );
+        let plan = build_reliability_remediation_plan(&[diag]);
+        assert_eq!(plan.len(), 1);
+        assert!(plan[0].auto_fixable);
+        assert_eq!(plan[0].code, ReliabilityReasonCode::HookAutoStartDisabled);
     }
 
     #[test]

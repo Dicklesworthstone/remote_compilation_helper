@@ -18,7 +18,7 @@ use super::types::{
     ConfigValueSourceInfo, LintIssue, LintSeverity,
 };
 
-const SUPPORTED_CONFIG_KEYS: &str = "general.enabled, general.force_local, general.force_remote, general.log_level, general.socket_path, compilation.confidence_threshold, compilation.min_local_time_ms, compilation.remote_speedup_threshold, compilation.build_slots, compilation.test_slots, compilation.check_slots, compilation.build_timeout_sec, compilation.test_timeout_sec, compilation.bun_timeout_sec, compilation.external_timeout_enabled, transfer.compression_level, transfer.exclude_patterns, environment.allowlist, output.visibility, output.first_run_complete";
+const SUPPORTED_CONFIG_KEYS: &str = "general.enabled, general.force_local, general.force_remote, general.log_level, general.socket_path, compilation.confidence_threshold, compilation.min_local_time_ms, compilation.remote_speedup_threshold, compilation.build_slots, compilation.test_slots, compilation.check_slots, compilation.build_timeout_sec, compilation.test_timeout_sec, compilation.bun_timeout_sec, compilation.external_timeout_enabled, transfer.compression_level, transfer.exclude_patterns, environment.allowlist, output.visibility, output.first_run_complete, self_healing.hook_starts_daemon, self_healing.daemon_installs_hooks, self_healing.auto_start_cooldown_secs, self_healing.auto_start_timeout_secs";
 
 fn print_file_validation(
     label: &str,
@@ -988,14 +988,47 @@ pub fn config_validate(ctx: &OutputContext) -> Result<()> {
 
 /// Set a configuration value.
 pub fn config_set(key: &str, value: &str, ctx: &OutputContext) -> Result<()> {
+    config_set_at(&default_config_path()?, key, value, ctx)
+}
+
+/// Resolve the default on-disk config path (`<config_dir>/config.toml`),
+/// creating the config directory if needed.
+///
+/// Exposed so the reliability doctor's `--fix` executor writes to the same file
+/// the CLI's `config get/set` use.
+pub(crate) fn default_config_path() -> Result<PathBuf> {
     let config_dir = config_dir().context("Could not determine config directory")?;
     std::fs::create_dir_all(&config_dir)
         .with_context(|| format!("Failed to create config directory: {:?}", config_dir))?;
-    let config_path = config_dir.join("config.toml");
-    config_set_at(&config_path, key, value, ctx)
+    Ok(config_dir.join("config.toml"))
 }
 
 fn config_set_at(config_path: &Path, key: &str, value: &str, ctx: &OutputContext) -> Result<()> {
+    apply_config_set(config_path, key, value)?;
+
+    if ctx.is_json() {
+        let _ = ctx.json(&ApiResponse::ok(
+            "config set",
+            ConfigSetResponse {
+                key: key.to_string(),
+                value: value.to_string(),
+                config_path: config_path.display().to_string(),
+            },
+        ));
+    } else {
+        println!("Updated {:?}: {} = {}", config_path, key, value);
+    }
+    Ok(())
+}
+
+/// Apply a single `key=value` mutation to the on-disk config, with no stdout or
+/// JSON output.
+///
+/// Shared by the `config set` command (which adds its own success output) and
+/// the reliability doctor's `--fix` executor, which must not emit its own
+/// `ApiResponse` envelope into the doctor's single JSON document. Performs the
+/// same parse → mutate → validate → atomic-rewrite as `config set`.
+pub(crate) fn apply_config_set(config_path: &Path, key: &str, value: &str) -> Result<()> {
     let mut config = if config_path.exists() {
         let contents = std::fs::read_to_string(config_path)
             .with_context(|| format!("Failed to read {:?}", config_path))?;
@@ -1099,6 +1132,18 @@ fn config_set_at(config_path: &Path, key: &str, value: &str, ctx: &OutputContext
         "output.first_run_complete" | "first_run_complete" => {
             config.output.first_run_complete = parse_bool(value, key)?;
         }
+        "self_healing.hook_starts_daemon" => {
+            config.self_healing.hook_starts_daemon = parse_bool(value, key)?;
+        }
+        "self_healing.daemon_installs_hooks" => {
+            config.self_healing.daemon_installs_hooks = parse_bool(value, key)?;
+        }
+        "self_healing.auto_start_cooldown_secs" => {
+            config.self_healing.auto_start_cooldown_secs = parse_u64(value, key)?;
+        }
+        "self_healing.auto_start_timeout_secs" => {
+            config.self_healing.auto_start_timeout_secs = parse_u64(value, key)?;
+        }
         _ => {
             return Err(ConfigError::InvalidValue {
                 field: key.to_string(),
@@ -1122,18 +1167,6 @@ fn config_set_at(config_path: &Path, key: &str, value: &str, ctx: &OutputContext
     std::fs::write(config_path, format!("{}\n", contents))
         .with_context(|| format!("Failed to write {:?}", config_path))?;
 
-    if ctx.is_json() {
-        let _ = ctx.json(&ApiResponse::ok(
-            "config set",
-            ConfigSetResponse {
-                key: key.to_string(),
-                value: value.to_string(),
-                config_path: config_path.display().to_string(),
-            },
-        ));
-    } else {
-        println!("Updated {:?}: {} = {}", config_path, key, value);
-    }
     Ok(())
 }
 
@@ -2356,6 +2389,35 @@ mod tests {
 
         assert_eq!(entry.value, "1.75");
         assert_eq!(entry.source, "env:RCH_REMOTE_SPEEDUP_THRESHOLD");
+    }
+
+    #[test]
+    fn apply_config_set_persists_self_healing_hook_starts_daemon() {
+        // The reliability doctor's --fix path and the documented remediation
+        // `rch config set self_healing.hook_starts_daemon true` both flow
+        // through apply_config_set; before this key was wired it hit the
+        // unknown-key arm and the remediation was silently broken.
+        let _guard = test_guard!();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+
+        apply_config_set(&config_path, "self_healing.hook_starts_daemon", "true")
+            .expect("set self_healing.hook_starts_daemon");
+        let contents = std::fs::read_to_string(&config_path).expect("read config");
+        let config: RchConfig = toml::from_str(&contents).expect("parse config");
+        assert!(config.self_healing.hook_starts_daemon);
+
+        apply_config_set(&config_path, "self_healing.daemon_installs_hooks", "true")
+            .expect("set self_healing.daemon_installs_hooks");
+        let contents = std::fs::read_to_string(&config_path).expect("read config");
+        let config: RchConfig = toml::from_str(&contents).expect("parse config");
+        assert!(config.self_healing.daemon_installs_hooks);
+        // Idempotent: re-applying the same value succeeds and stays true.
+        apply_config_set(&config_path, "self_healing.hook_starts_daemon", "true")
+            .expect("re-apply is idempotent");
+        let contents = std::fs::read_to_string(&config_path).expect("read config");
+        let config: RchConfig = toml::from_str(&contents).expect("parse config");
+        assert!(config.self_healing.hook_starts_daemon);
     }
 
     #[test]

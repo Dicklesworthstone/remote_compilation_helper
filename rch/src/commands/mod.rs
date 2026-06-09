@@ -49,6 +49,7 @@ pub use workers::{
 pub use agents::{agents_install_hook, agents_list, agents_status, agents_uninstall_hook};
 
 // Re-export config commands for backward compatibility
+pub(crate) use config::{apply_config_set, default_config_path};
 pub use config::{
     config_diff, config_edit, config_export, config_get, config_lint, config_reset, config_set,
     config_show, config_validate,
