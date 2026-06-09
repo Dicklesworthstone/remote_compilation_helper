@@ -76,7 +76,7 @@ fn config_dir_from_env_value(value: Option<&OsStr>) -> Option<PathBuf> {
 /// Bumping invalidates every operator's cache on next run — they pay one
 /// TOML parse, then the cache repopulates. Cheap insurance against silent
 /// deserialization drift.
-const CACHE_SCHEMA_VERSION: u32 = 2;
+const CACHE_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct SourceFingerprint {

@@ -12,6 +12,7 @@ mod commands;
 mod completions;
 mod config;
 mod doctor;
+mod doctor_webhooks;
 pub mod error;
 pub mod fleet;
 #[cfg_attr(not(unix), path = "hook_windows.rs")]

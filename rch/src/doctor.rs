@@ -201,6 +201,17 @@ enum ReliabilitySeverity {
     Critical,
 }
 
+/// Stable lowercase token for a severity (matches the `snake_case` serde
+/// spelling). Used to attribute diagnostics in webhook payloads.
+fn reliability_severity_token(severity: ReliabilitySeverity) -> &'static str {
+    match severity {
+        ReliabilitySeverity::Pass => "pass",
+        ReliabilitySeverity::Info => "info",
+        ReliabilitySeverity::Warning => "warning",
+        ReliabilitySeverity::Critical => "critical",
+    }
+}
+
 /// Tri-state aggregate verdict for the reliability doctor.
 ///
 /// - `Healthy`  — every diagnostic passed (or only Info diagnostics).
@@ -534,11 +545,103 @@ struct ReliabilityDoctorSummary {
 struct ReliabilityRemediationStep {
     order: u32,
     category: ReliabilityCategory,
+    /// Canonical reason code of the diagnostic that produced this step. Lets
+    /// the `--fix` executor decide whether an idempotent auto-flip applies.
+    code: ReliabilityReasonCode,
     description: String,
     command: String,
     validation: String,
     requires_restart: bool,
     dry_run_safe: bool,
+    /// True when an idempotent auto-remediation (config flip) exists for this
+    /// step, i.e. `--fix` can resolve it without operator intervention.
+    auto_fixable: bool,
+}
+
+/// A structured, idempotent config flip that `--fix` can apply automatically.
+///
+/// Limited to self-healing posture toggles: these are the only remediations
+/// safe to apply unattended (they enable resilience features, are trivially
+/// reversible with `rch config set <key> false`, and never touch fleet/worker
+/// state). Everything else stays a manual operator command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AutoConfigFlip {
+    key: &'static str,
+    value: &'static str,
+}
+
+/// Map a diagnostic reason code to the idempotent config flip that resolves it,
+/// or `None` when remediation requires a manual operator command.
+fn auto_config_flip(code: ReliabilityReasonCode) -> Option<AutoConfigFlip> {
+    match code {
+        ReliabilityReasonCode::HookAutoStartDisabled => Some(AutoConfigFlip {
+            key: "self_healing.hook_starts_daemon",
+            value: "true",
+        }),
+        ReliabilityReasonCode::DaemonHookRepairDisabled => Some(AutoConfigFlip {
+            key: "self_healing.daemon_installs_hooks",
+            value: "true",
+        }),
+        _ => None,
+    }
+}
+
+/// Is `flip` already satisfied by the loaded config? Used to recognise
+/// idempotent no-ops so a `--fix` re-run reports `AlreadySatisfied` instead of
+/// rewriting the file.
+fn config_flip_satisfied(config: &rch_common::RchConfig, flip: AutoConfigFlip) -> bool {
+    match flip.key {
+        "self_healing.hook_starts_daemon" => {
+            config.self_healing.hook_starts_daemon.to_string() == flip.value
+        }
+        "self_healing.daemon_installs_hooks" => {
+            config.self_healing.daemon_installs_hooks.to_string() == flip.value
+        }
+        _ => false,
+    }
+}
+
+/// Outcome of one remediation step under `--fix` / `--fix --dry-run`.
+///
+/// The (intent × execute) matrix:
+/// - `--check` / plain `--dry-run`: executor is a no-op (no outcomes emitted).
+/// - `--fix`: each auto step is `Applied` / `AlreadySatisfied` / `Failed`.
+/// - `--fix --dry-run`: each auto step is `WouldApply` (nothing mutated).
+/// - Manual steps (no safe auto-flip) are always reported `Manual` so the
+///   operator learns exactly what `--fix` could not do.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum RemediationOutcomeStatus {
+    Applied,
+    AlreadySatisfied,
+    WouldApply,
+    Failed,
+    Manual,
+}
+
+impl RemediationOutcomeStatus {
+    fn label(self) -> &'static str {
+        match self {
+            RemediationOutcomeStatus::Applied => "applied",
+            RemediationOutcomeStatus::AlreadySatisfied => "already-satisfied",
+            RemediationOutcomeStatus::WouldApply => "would-apply",
+            RemediationOutcomeStatus::Failed => "failed",
+            RemediationOutcomeStatus::Manual => "manual",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ReliabilityRemediationOutcome {
+    order: u32,
+    code: ReliabilityReasonCode,
+    description: String,
+    /// The command that was applied (auto steps) or that the operator must run
+    /// (manual steps).
+    command: String,
+    status: RemediationOutcomeStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -561,6 +664,14 @@ struct ReliabilityDoctorResponse {
     diagnostics: Vec<ReliabilityDiagnostic>,
     summary: ReliabilityDoctorSummary,
     remediation_plan: Vec<ReliabilityRemediationStep>,
+    /// True when the operator passed `--fix`, even if `--dry-run` downgraded
+    /// `mode` to `DryRun`. Distinguishes a "preview of fix" (`--fix --dry-run`)
+    /// from a plain read-only dry run (`--dry-run`). (bead 2s99h.12, issue #2)
+    fix_requested: bool,
+    /// Per-step results of the `--fix` executor. Empty unless `--fix` was
+    /// requested; populated by `apply_reliability_remediations`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    remediation_outcomes: Vec<ReliabilityRemediationOutcome>,
 }
 
 impl ReliabilityDiagnostic {
@@ -768,7 +879,10 @@ async fn run_reliability_doctor(ctx: &OutputContext, options: &DoctorOptions) ->
     if options.watch {
         return run_reliability_watch_loop(ctx, options).await;
     }
-    let response = collect_reliability_response_once(options).await;
+    let mut response = collect_reliability_response_once(options).await;
+
+    // `--fix` (and `--fix --dry-run`) execution. No-op for Check / plain DryRun.
+    apply_reliability_remediations(&mut response);
 
     if ctx.is_json() {
         // t05: command tag is a single dotted token ("doctor.reliability")
@@ -975,7 +1089,12 @@ async fn collect_reliability_response_once(options: &DoctorOptions) -> Reliabili
     } else {
         ReliabilityDoctorMode::Check
     };
-    build_reliability_doctor_response(mode, scope, diagnostics)
+    let mut response = build_reliability_doctor_response(mode, scope, diagnostics);
+    // `--fix --dry-run` downgrades `mode` to DryRun; `fix_requested` preserves
+    // the operator's intent so the executor previews instead of staying inert,
+    // and JSON consumers can tell a fix-preview from a plain dry run.
+    response.fix_requested = options.fix;
+    response
 }
 
 // =============================================================================
@@ -1408,6 +1527,22 @@ async fn run_reliability_watch_loop(ctx: &OutputContext, options: &DoctorOptions
         eprintln!();
     }
 
+    // Build the verdict-transition webhook dispatcher from config. `None`
+    // (the common case: no endpoints configured) costs nothing per sweep.
+    // Config-load failure is non-fatal — webhooks are an add-on, never
+    // load-bearing for the watch verdict.
+    let webhook_dispatcher = match crate::config::load_config() {
+        Ok(cfg) => crate::doctor_webhooks::WebhookDispatcher::from_config(&cfg.doctor.webhooks),
+        Err(e) => {
+            tracing::warn!(
+                target: "rch::doctor::webhook",
+                error = %e,
+                "doctor.webhook.config_load_failed",
+            );
+            None
+        }
+    };
+
     let mut state = WatchState::new();
     // `tokio::time::interval` ticks immediately on the first call to
     // `tick()`. That's exactly what we want — sweep at t=0, then every
@@ -1451,6 +1586,43 @@ async fn run_reliability_watch_loop(ctx: &OutputContext, options: &DoctorOptions
                     state.transitions_count += 1;
                 }
                 state.observe_verdict(verdict);
+
+                // Fire verdict-transition webhooks. The implicit baseline for
+                // the very first sweep is `Healthy`, so a watch session that
+                // starts in a bad state still pages (`any_to_failing` etc.).
+                if verdict_changed
+                    && let Some(dispatcher) = &webhook_dispatcher
+                {
+                    let from = state.last_verdict.unwrap_or(ReliabilityVerdict::Healthy);
+                    let transition = crate::doctor_webhooks::WebhookTransition {
+                        from,
+                        to: verdict,
+                        host: crate::doctor_webhooks::hostname(),
+                        ts: chrono::Utc::now().to_rfc3339(),
+                        scope: response.scope.clone(),
+                        diagnostics: response
+                            .diagnostics
+                            .iter()
+                            .map(|d| crate::doctor_webhooks::WebhookDiagnostic {
+                                code: d.code.to_string(),
+                                severity: reliability_severity_token(d.severity).to_string(),
+                                category: d.category.as_str().to_string(),
+                                message: d.message.clone(),
+                            })
+                            .collect(),
+                    };
+                    let fired = dispatcher.on_transition(&transition);
+                    if fired > 0 {
+                        tracing::info!(
+                            target: "rch::doctor::webhook",
+                            from = from.label(),
+                            to = verdict.label(),
+                            endpoints = fired,
+                            "doctor.webhook.transition_dispatched",
+                        );
+                    }
+                }
+
                 let sweep_elapsed_ms = sweep_started.elapsed().as_millis();
 
                 let should_emit = !options.transitions_only || any_change || state.sweep_count == 1;
@@ -2631,6 +2803,10 @@ fn build_reliability_doctor_response(
         diagnostics,
         summary,
         remediation_plan,
+        // `fix_requested` is set by the caller (`collect_reliability_response_once`)
+        // from the CLI flags; outcomes are filled by the `--fix` executor.
+        fix_requested: false,
+        remediation_outcomes: Vec::new(),
     }
 }
 
@@ -2660,6 +2836,7 @@ fn build_reliability_remediation_plan(
         .map(|(index, diagnostic)| ReliabilityRemediationStep {
             order: u32::try_from(index + 1).unwrap_or(u32::MAX),
             category: diagnostic.category,
+            code: diagnostic.code,
             description: format!("{}: {}", diagnostic.check_name, diagnostic.message),
             command: diagnostic.remediation_command.clone().unwrap_or_default(),
             validation: diagnostic
@@ -2668,8 +2845,94 @@ fn build_reliability_remediation_plan(
                 .unwrap_or_else(|| "rch doctor --reliability --json".to_string()),
             requires_restart: diagnostic.code.requires_restart(),
             dry_run_safe: diagnostic.dry_run_safe,
+            auto_fixable: auto_config_flip(diagnostic.code).is_some(),
         })
         .collect()
+}
+
+/// Execute the `--fix` remediation pass over a collected response, populating
+/// `response.remediation_outcomes`.
+///
+/// Behaviour by (intent × execute) — see [`RemediationOutcomeStatus`]:
+/// - `fix_requested == false`: no-op (Check / plain DryRun stay read-only).
+/// - `mode == DryRun` (i.e. `--fix --dry-run`): preview only — every auto step
+///   is `WouldApply`, nothing is written to disk.
+/// - `mode == Fix`: apply each idempotent config flip (`Applied` /
+///   `AlreadySatisfied` / `Failed`); manual steps are reported `Manual`.
+///
+/// Config is loaded once up front to recognise already-satisfied flips so a
+/// re-run is a clean idempotent no-op. Every step is emitted as a structured
+/// `rch::doctor::remediation` tracing event for post-incident forensics.
+fn apply_reliability_remediations(response: &mut ReliabilityDoctorResponse) {
+    if !response.fix_requested {
+        return;
+    }
+    let preview = matches!(response.mode, ReliabilityDoctorMode::DryRun);
+
+    // Snapshot current config to short-circuit already-satisfied flips. A load
+    // failure doesn't abort the pass — we just can't detect no-ops, so an
+    // otherwise-satisfied flip is re-applied (still idempotent on disk).
+    let current = crate::config::load_config().ok();
+
+    let mut outcomes = Vec::with_capacity(response.remediation_plan.len());
+    for step in &response.remediation_plan {
+        let outcome = match auto_config_flip(step.code) {
+            Some(flip) => {
+                let already = current
+                    .as_ref()
+                    .is_some_and(|cfg| config_flip_satisfied(cfg, flip));
+                let command = format!("rch config set {} {}", flip.key, flip.value);
+                let (status, detail) = if already {
+                    (RemediationOutcomeStatus::AlreadySatisfied, None)
+                } else if preview {
+                    (
+                        RemediationOutcomeStatus::WouldApply,
+                        Some(format!("would set {} = {}", flip.key, flip.value)),
+                    )
+                } else {
+                    match crate::commands::config::default_config_path().and_then(|path| {
+                        crate::commands::config::apply_config_set(&path, flip.key, flip.value)
+                    }) {
+                        Ok(()) => (
+                            RemediationOutcomeStatus::Applied,
+                            Some(format!("set {} = {}", flip.key, flip.value)),
+                        ),
+                        Err(e) => (RemediationOutcomeStatus::Failed, Some(e.to_string())),
+                    }
+                };
+                ReliabilityRemediationOutcome {
+                    order: step.order,
+                    code: step.code,
+                    description: step.description.clone(),
+                    command,
+                    status,
+                    detail,
+                }
+            }
+            None => ReliabilityRemediationOutcome {
+                order: step.order,
+                code: step.code,
+                description: step.description.clone(),
+                command: step.command.clone(),
+                status: RemediationOutcomeStatus::Manual,
+                detail: None,
+            },
+        };
+
+        tracing::info!(
+            target: "rch::doctor::remediation",
+            order = outcome.order,
+            code = outcome.code.code(),
+            status = outcome.status.label(),
+            preview,
+            command = %outcome.command,
+            detail = outcome.detail.as_deref().unwrap_or(""),
+            "doctor.remediation.step",
+        );
+        outcomes.push(outcome);
+    }
+
+    response.remediation_outcomes = outcomes;
 }
 
 fn print_reliability_doctor_response(ctx: &OutputContext, response: &ReliabilityDoctorResponse) {
@@ -2739,14 +3002,49 @@ fn print_reliability_doctor_response(ctx: &OutputContext, response: &Reliability
         println!();
         println!("{}", style.format_header("Remediation Plan"));
         for step in &response.remediation_plan {
+            let auto = if step.auto_fixable {
+                style.success(" [auto-fixable]")
+            } else {
+                style.muted(" [manual]")
+            };
             println!(
-                "  {}. [{}] {}",
+                "  {}. [{}] {}{}",
                 step.order,
                 step.category.as_str(),
-                step.description
+                step.description,
+                auto
             );
             println!("     {}", style.value(&step.command));
             println!("     validate: {}", style.value(&step.validation));
+        }
+    }
+
+    if !response.remediation_outcomes.is_empty() {
+        println!();
+        let header = match response.mode {
+            ReliabilityDoctorMode::DryRun => "Fix Preview (--fix --dry-run, no changes applied)",
+            _ => "Fix Results",
+        };
+        println!("{}", style.format_header(header));
+        for outcome in &response.remediation_outcomes {
+            let indicator = match outcome.status {
+                RemediationOutcomeStatus::Applied | RemediationOutcomeStatus::AlreadySatisfied => {
+                    StatusIndicator::Success
+                }
+                RemediationOutcomeStatus::WouldApply => StatusIndicator::Info,
+                RemediationOutcomeStatus::Manual => StatusIndicator::Warning,
+                RemediationOutcomeStatus::Failed => StatusIndicator::Error,
+            };
+            println!(
+                "  {} {}. {} — {}",
+                indicator.display(style),
+                outcome.order,
+                style.highlight(outcome.status.label()),
+                outcome.description
+            );
+            if let Some(detail) = &outcome.detail {
+                println!("     {}", style.muted(detail));
+            }
         }
     }
 

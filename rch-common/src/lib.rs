@@ -157,6 +157,7 @@ pub use types::{
     BuildHeartbeatRequest, BuildLocation, BuildRecord, BuildStats, CircuitBreakerConfig,
     CircuitState, CircuitStats, ColorMode, CommandPriority, CommandTimingBreakdown,
     CompilationConfig, CompilationMetrics, CompilationTimer, CompilationTimingBreakdown,
+    DoctorConfig, DoctorWebhookEndpoint, DoctorWebhookFormat, DoctorWebhooksConfig,
     EnvironmentConfig, ExecutionConfig, FairnessConfig, FleetConfig, GeneralConfig,
     MetricsAggregator, OutputConfig, OutputVisibility, PathTopologyConfig, RchConfig,
     ReleaseRequest, RequiredRuntime, RetryConfig, SELECTION_RESPONSE_PROTOCOL_VERSION,

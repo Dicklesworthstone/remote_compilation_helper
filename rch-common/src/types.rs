@@ -884,6 +884,129 @@ pub struct RchConfig {
     /// Path topology overrides for project root directories.
     #[serde(default)]
     pub path_topology: PathTopologyConfig,
+    /// Doctor / reliability subsystem configuration (verdict webhooks).
+    #[serde(default)]
+    pub doctor: DoctorConfig,
+}
+
+/// Doctor reliability subsystem configuration.
+///
+/// Currently carries the verdict-transition webhook surface. Kept as its own
+/// section (`[doctor]`) so future doctor knobs land here rather than bloating
+/// the top-level config.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DoctorConfig {
+    /// Verdict-transition webhook destinations.
+    #[serde(default)]
+    pub webhooks: DoctorWebhooksConfig,
+}
+
+/// Webhook notification surface for reliability verdict transitions.
+///
+/// Fires when `rch doctor --reliability --watch` observes a verdict change
+/// (`Healthy → Degraded`, `Degraded → Failing`, etc.). Each endpoint selects
+/// which transitions it cares about and how the payload is formatted.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DoctorWebhooksConfig {
+    /// Named webhook destinations. Empty = no webhook dispatch.
+    #[serde(default)]
+    pub endpoints: Vec<DoctorWebhookEndpoint>,
+    /// Maximum number of in-flight webhook deliveries. Bounds memory and
+    /// outbound connection pressure: when the queue is full, a transition's
+    /// delivery is dropped (and journaled) rather than growing unboundedly.
+    /// Per-process, shared across all endpoints.
+    #[serde(default = "default_webhook_max_inflight")]
+    pub max_inflight: usize,
+}
+
+// Manual `Default` so the in-code default matches the serde default
+// (`#[derive(Default)]` would give `max_inflight = 0`, diverging from a
+// from-TOML load that fills in 16).
+impl Default for DoctorWebhooksConfig {
+    fn default() -> Self {
+        Self {
+            endpoints: Vec::new(),
+            max_inflight: default_webhook_max_inflight(),
+        }
+    }
+}
+
+/// A single webhook destination for verdict transitions.
+///
+/// SECRETS ARE NEVER STORED HERE. Routing keys, bearer tokens, and signing
+/// secrets are referenced by the *name* of an environment variable
+/// (`*_env` fields) read at dispatch time. There is deliberately no
+/// `secret` / `routing_key` / `bearer_token` / `password` field on this
+/// struct (enforced by `test_no_inline_secret_fields`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DoctorWebhookEndpoint {
+    /// Operator-facing name (appears in logs and the audit trail).
+    pub name: String,
+    /// Destination URL.
+    pub url: String,
+    /// Payload format.
+    #[serde(default)]
+    pub format: DoctorWebhookFormat,
+    /// Transition predicates that arm this endpoint. Empty = never fire.
+    /// Supported: `healthy_to_degraded`, `degraded_to_failing`,
+    /// `any_to_failing`, `any_to_degraded`, `failing_to_healthy`,
+    /// `degraded_to_healthy`, `any_to_healthy`, `any_to_any`.
+    #[serde(default)]
+    pub on_transitions: Vec<String>,
+    /// Maximum retry attempts after the first try fails.
+    #[serde(default = "default_webhook_retry_max")]
+    pub retry_max: u32,
+    /// Base backoff between retries (milliseconds); doubles each attempt.
+    #[serde(default = "default_webhook_retry_backoff_ms")]
+    pub retry_backoff_ms: u64,
+    /// Per-attempt request timeout (milliseconds).
+    #[serde(default = "default_webhook_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Per-endpoint kill switch.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Name of the env var holding the PagerDuty Events API routing key.
+    /// Required for `format = "pagerduty"`. Read at runtime, never stored.
+    #[serde(default)]
+    pub routing_key_env: Option<String>,
+    /// Name of the env var holding a bearer token sent as
+    /// `Authorization: Bearer <token>`. Read at runtime, never stored.
+    #[serde(default)]
+    pub bearer_token_env: Option<String>,
+    /// Name of the env var holding an HMAC-SHA256 signing secret. When set,
+    /// the body is signed and the signature sent as `X-RCH-Signature:
+    /// sha256=<hex>`. Read at runtime, never stored.
+    #[serde(default)]
+    pub signing_secret_env: Option<String>,
+}
+
+/// Built-in webhook payload formats.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DoctorWebhookFormat {
+    /// Opinionated RCH JSON schema (default).
+    #[default]
+    GenericJson,
+    /// Slack Block Kit payload.
+    Slack,
+    /// PagerDuty Events API v2 payload.
+    Pagerduty,
+}
+
+fn default_webhook_max_inflight() -> usize {
+    16
+}
+
+fn default_webhook_retry_max() -> u32 {
+    3
+}
+
+fn default_webhook_retry_backoff_ms() -> u64 {
+    200
+}
+
+fn default_webhook_timeout_ms() -> u64 {
+    5000
 }
 
 /// Worker health alerting configuration.
@@ -2924,6 +3047,93 @@ impl Default for MetricsAggregator {
 mod tests {
     use super::*;
     use crate::test_guard;
+
+    /// Verdict-webhook config must NEVER carry an inline secret. Operators
+    /// reference secrets by env-var name (`*_env`); the resolved value is
+    /// read at dispatch time and never persisted to the cache or config TOML.
+    /// This guards against a future careless `pub secret: String` addition.
+    #[test]
+    fn test_no_inline_secret_fields() {
+        let endpoint = DoctorWebhookEndpoint {
+            name: "ops".to_string(),
+            url: "https://example.com/hook".to_string(),
+            format: DoctorWebhookFormat::Pagerduty,
+            on_transitions: vec!["any_to_failing".to_string()],
+            retry_max: 3,
+            retry_backoff_ms: 200,
+            timeout_ms: 5000,
+            enabled: true,
+            routing_key_env: Some("RCH_PAGERDUTY_ROUTING_KEY".to_string()),
+            bearer_token_env: Some("RCH_WEBHOOK_BEARER".to_string()),
+            signing_secret_env: Some("RCH_WEBHOOK_HMAC".to_string()),
+        };
+        // Serialize to a JSON object and inspect the *keys*. The forbidden
+        // field names must be entirely absent; only `*_env` references survive.
+        let value = serde_json::to_value(&endpoint).unwrap();
+        let obj = value.as_object().expect("endpoint serializes to an object");
+        for forbidden in ["secret", "routing_key", "bearer_token", "password", "token"] {
+            assert!(
+                !obj.contains_key(forbidden),
+                "endpoint config must not expose an inline `{forbidden}` field"
+            );
+        }
+        assert!(obj.contains_key("routing_key_env"));
+        assert!(obj.contains_key("bearer_token_env"));
+        assert!(obj.contains_key("signing_secret_env"));
+    }
+
+    #[test]
+    fn test_webhook_format_toml_spelling() {
+        // The config TOML uses snake_case spellings.
+        assert_eq!(
+            toml::to_string(&DoctorWebhookFormat::GenericJson)
+                .unwrap()
+                .trim(),
+            "\"generic_json\""
+        );
+        let slack: DoctorWebhookFormat = toml::from_str("\"slack\"").unwrap();
+        assert_eq!(slack, DoctorWebhookFormat::Slack);
+        let pd: DoctorWebhookFormat = toml::from_str("\"pagerduty\"").unwrap();
+        assert_eq!(pd, DoctorWebhookFormat::Pagerduty);
+    }
+
+    #[test]
+    fn test_doctor_webhooks_defaults() {
+        let cfg = DoctorWebhooksConfig::default();
+        assert!(cfg.endpoints.is_empty());
+        assert_eq!(cfg.max_inflight, 16);
+        // RchConfig wires the section in with serde(default), so an empty
+        // config still yields an empty (never-firing) webhook surface.
+        let rch: RchConfig = toml::from_str("").unwrap();
+        assert!(rch.doctor.webhooks.endpoints.is_empty());
+    }
+
+    #[test]
+    fn test_doctor_webhook_endpoint_parses_from_toml() {
+        let toml_src = r#"
+[doctor.webhooks]
+max_inflight = 8
+
+[[doctor.webhooks.endpoints]]
+name = "ops-slack"
+url = "https://hooks.slack.com/services/T0/B0/x"
+format = "slack"
+on_transitions = ["healthy_to_degraded", "any_to_failing"]
+retry_max = 2
+"#;
+        let cfg: RchConfig = toml::from_str(toml_src).unwrap();
+        assert_eq!(cfg.doctor.webhooks.max_inflight, 8);
+        assert_eq!(cfg.doctor.webhooks.endpoints.len(), 1);
+        let ep = &cfg.doctor.webhooks.endpoints[0];
+        assert_eq!(ep.name, "ops-slack");
+        assert_eq!(ep.format, DoctorWebhookFormat::Slack);
+        assert_eq!(ep.on_transitions.len(), 2);
+        assert_eq!(ep.retry_max, 2);
+        // Defaults filled in for omitted fields.
+        assert_eq!(ep.retry_backoff_ms, 200);
+        assert_eq!(ep.timeout_ms, 5000);
+        assert!(ep.enabled);
+    }
 
     fn assert_golden_json(
         actual: serde_json::Value,

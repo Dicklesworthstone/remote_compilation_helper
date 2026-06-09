@@ -174,6 +174,58 @@ webhook_url = "https://hooks.slack.com/services/..."
 alert_on = ["daemon_down", "circuit_open", "all_workers_down"]
 ```
 
+### Reliability Verdict Webhooks
+
+`rch doctor --reliability --watch` continuously re-runs the reliability
+probe suite and computes a tri-state verdict (`Healthy` / `Degraded` /
+`Failing`). Configure first-class webhooks to fire the moment the verdict
+*transitions*, so an on-call engineer is paged within ~50ms instead of
+waiting on a log-shipper pipeline.
+
+```toml
+# ~/.config/rch/config.toml
+[doctor.webhooks]
+# Bound on concurrent in-flight deliveries (shared across endpoints).
+# When exhausted, a delivery is dropped and journaled rather than queued
+# unboundedly.
+max_inflight = 16
+
+[[doctor.webhooks.endpoints]]
+name = "ops-slack"
+url = "https://hooks.slack.com/services/T0/B0/..."
+format = "slack"                 # slack | pagerduty | generic_json
+on_transitions = ["healthy_to_degraded", "any_to_failing", "failing_to_healthy"]
+retry_max = 3
+retry_backoff_ms = 200           # doubles each retry (200, 400, 800, …)
+timeout_ms = 5000
+enabled = true
+# Optional HMAC-SHA256 signing. The named env var holds the secret; the
+# signature is sent as `X-RCH-Signature: sha256=<hex>`.
+signing_secret_env = "RCH_WEBHOOK_HMAC"
+
+[[doctor.webhooks.endpoints]]
+name = "pagerduty-critical"
+url = "https://events.pagerduty.com/v2/enqueue"
+format = "pagerduty"
+on_transitions = ["any_to_failing"]   # `resolve` auto-fires on any_to_healthy
+# Secrets are NEVER stored in config — only the NAME of the env var that
+# holds them is. The runtime reads it at dispatch time.
+routing_key_env = "RCH_PAGERDUTY_ROUTING_KEY"
+enabled = true
+```
+
+**Transition predicates** (`on_transitions`): `healthy_to_degraded`,
+`degraded_to_failing`, `any_to_failing`, `any_to_degraded`,
+`failing_to_healthy`, `degraded_to_healthy`, `any_to_healthy`,
+`any_to_any`. An empty list never fires; `enabled = false` is a
+per-endpoint kill switch. The implicit baseline for the first sweep is
+`Healthy`, so a watch session that starts in a bad state still pages.
+
+Every delivery attempt (and its outcome) is journaled to the
+`rch::doctor::webhook` tracing target for post-mortem audit. Webhook
+dispatch is fail-open: a misconfigured or unreachable endpoint never
+affects the watch loop's verdict or exit code.
+
 ### Email Alerts
 
 ```bash
