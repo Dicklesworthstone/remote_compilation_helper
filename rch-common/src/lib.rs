@@ -9,6 +9,7 @@
 use std::sync::OnceLock;
 
 pub mod api;
+pub mod artifact_cost;
 pub mod artifact_pattern;
 pub mod artifact_verify;
 pub mod binary_hash;
@@ -106,6 +107,10 @@ fn short_commit(commit: &str) -> &str {
         .map_or(commit, |(index, _)| &commit[..index])
 }
 
+pub use artifact_cost::{
+    ArtifactCostReport, ArtifactPhaseTimings, GlobAdvice, RetrievalMode, assess_glob_expansion,
+    compute_artifact_cost, is_broad_recursive_glob,
+};
 pub use artifact_pattern::{
     ArtifactPatternRewrite, ArtifactRetrievalDiagnostics, rewrite_artifact_pattern,
 };
