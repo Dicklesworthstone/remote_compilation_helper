@@ -12,7 +12,7 @@
 //!    proof handoff totality; incident reason-code stability).
 
 use proptest::prelude::*;
-use rch_common::admission_recommendation::{NextAction, recommend, recommend_for_summary};
+use rch_common::admission_recommendation::{recommend, recommend_for_summary};
 use rch_common::admission_rejection::{
     AdmissionRejectionCategory, CandidateRejection, RejectionClass, aggregate_rejections,
 };
