@@ -40,8 +40,7 @@ impl ClassificationTransition {
     /// Whether the refresh changed the placement picture at all.
     #[must_use]
     pub fn changed(&self) -> bool {
-        self.compilation_before != self.compilation_after
-            || self.worker_before != self.worker_after
+        self.compilation_before != self.compilation_after || self.worker_before != self.worker_after
     }
 
     /// Whether remote placement is possible after the refresh.

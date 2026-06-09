@@ -44,9 +44,8 @@ pub struct ExecMisuseReport {
 /// `--`-separated command, or multiple argv tokens are all legitimate.
 #[must_use]
 pub fn detect_exec_misuse(argv: &[String], had_separator: bool) -> ExecMisuseReport {
-    let is_single_quoted = !had_separator
-        && argv.len() == 1
-        && argv[0].split_whitespace().count() > 1;
+    let is_single_quoted =
+        !had_separator && argv.len() == 1 && argv[0].split_whitespace().count() > 1;
 
     if is_single_quoted {
         let raw = argv[0].trim();
@@ -86,7 +85,10 @@ mod tests {
             report.suggestion.as_deref(),
             Some("rch exec -- cargo check --all-targets")
         );
-        assert_eq!(report.parsed_command, argv(&["cargo", "check", "--all-targets"]));
+        assert_eq!(
+            report.parsed_command,
+            argv(&["cargo", "check", "--all-targets"])
+        );
     }
 
     #[test]
@@ -113,11 +115,13 @@ mod tests {
     fn shell_quoted_command_is_misuse() {
         let report = detect_exec_misuse(&argv(&["bash -lc 'cargo build'"]), false);
         assert!(report.misuse);
-        assert!(report
-            .suggestion
-            .as_deref()
-            .unwrap()
-            .contains("bash -lc 'cargo build'"));
+        assert!(
+            report
+                .suggestion
+                .as_deref()
+                .unwrap()
+                .contains("bash -lc 'cargo build'")
+        );
     }
 
     #[test]

@@ -81,7 +81,9 @@ impl NextAction {
             NextAction::WaitForBypassRecovery => "wait for the bypassed worker to recover",
             NextAction::RefreshCapabilities => "refresh capabilities/classifier, then retry",
             NextAction::ForceResync => "force a source/path-dependency resync, then retry",
-            NextAction::FixWorkerCapability => "install the missing runtime/toolchain/target on a worker",
+            NextAction::FixWorkerCapability => {
+                "install the missing runtime/toolchain/target on a worker"
+            }
             NextAction::ContactOperator => "contact an operator (structural/config issue)",
         }
     }
@@ -305,7 +307,10 @@ mod tests {
         assert_eq!(recs.len(), 2, "deduped to distinct categories");
         assert_eq!(recs[0].category, AdmissionRejectionCategory::CircuitOpen);
         assert_eq!(recs[0].action, NextAction::WaitForBypassRecovery);
-        assert_eq!(recs[1].category, AdmissionRejectionCategory::MissingRustTarget);
+        assert_eq!(
+            recs[1].category,
+            AdmissionRejectionCategory::MissingRustTarget
+        );
         assert_eq!(recs[1].action, NextAction::FixWorkerCapability);
     }
 

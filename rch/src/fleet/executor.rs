@@ -1084,26 +1084,101 @@ async fn set_executable_permissions(worker: &WorkerConfig) -> Result<()> {
 /// Verify the installation by running health check.
 ///
 /// Uses `SshExecutor::run_command()` for consistent behavior and logging.
+// =============================================================================
+// Post-deploy exact user/path validation
+// (bd-session-history-remediation-ocv9i.7.3)
+// =============================================================================
+
+/// Eligibility verdict from validating the deployed binary at the EXACT path
+/// (and as the user) RCH will actually invoke it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PostDeployEligibility {
+    Eligible,
+    /// The deployed binary cannot run on this worker (most commonly an
+    /// `Exec format error` from an OS/arch mismatch). The worker must be marked
+    /// not eligible; `reason_code` is a stable token for incident/proof/
+    /// admission surfaces.
+    NotEligible {
+        reason_code: &'static str,
+        detail: String,
+    },
+}
+
+/// Build the post-deploy validation command. Runs against the EXACT remote
+/// path RCH invokes (shell-escaped, never the bare PATH-resolved `rch-wkr`
+/// which could be a different binary), as the connecting worker user (the SSH
+/// session is already that user — NOT root, NOT a login-default path). Probes
+/// `uname`, `file`, and `<path> --version` so a wrong-OS/arch binary surfaces
+/// as a non-zero exit / `Exec format error`.
+fn post_deploy_validation_command(remote_path: &str) -> Result<String> {
+    let p = remote_shell_path(remote_path)?;
+    Ok(format!(
+        "uname -s -m; file {p} 2>/dev/null || true; {p} --version"
+    ))
+}
+
+/// Classify the exact-path validation result. `Exec format error` (exit 126 or
+/// the kernel message) means the binary is built for the wrong OS/arch and the
+/// worker is not eligible; any other non-zero exit is a generic validation
+/// failure.
+fn classify_post_deploy(exit_code: i32, stderr: &str) -> PostDeployEligibility {
+    let trimmed = stderr.trim();
+    if exit_code == 126 || trimmed.contains("Exec format error") {
+        return PostDeployEligibility::NotEligible {
+            reason_code: "os_arch_mismatch",
+            detail: format!(
+                "deployed rch-wkr is not executable on this worker (exit {exit_code}: {trimmed}); \
+                the binary architecture does not match the worker"
+            ),
+        };
+    }
+    if exit_code != 0 {
+        return PostDeployEligibility::NotEligible {
+            reason_code: "post_deploy_validation_failed",
+            detail: format!("post-deploy validation failed (exit {exit_code}: {trimmed})"),
+        };
+    }
+    PostDeployEligibility::Eligible
+}
+
 async fn verify_installation(worker: &WorkerConfig) -> Result<()> {
     let ssh = SshExecutor::new(worker);
+
+    // 1. Exact user/path validation (bd-...-7.3): run `<exact path> --version`
+    //    (+ uname/file) as the worker user. An Exec format error here marks the
+    //    worker not eligible with a stable reason code — the post-deploy
+    //    backstop for the pre-deploy/staged arch guards.
+    let validation_cmd = post_deploy_validation_command(REMOTE_WORKER_BINARY)?;
+    let validation = ssh
+        .run_command(&validation_cmd)
+        .await
+        .map_err(|e| anyhow::anyhow!("post-deploy validation failed: {}", e))?;
+    if let PostDeployEligibility::NotEligible {
+        reason_code,
+        detail,
+    } = classify_post_deploy(validation.exit_code, &validation.stderr)
+    {
+        return Err(FleetError::HealthCheckFailed {
+            reason: format!("[{reason_code}] {detail}"),
+        }
+        .into());
+    }
+
+    // 2. Protocol handshake via the same exact path.
     let output = ssh
         .run_command("~/.local/bin/rch-wkr health")
         .await
         .map_err(|e| anyhow::anyhow!("health check failed: {}", e))?;
 
     if !output.success() {
-        // Exit 126 / "Exec format error" means the deployed binary does not
-        // match the worker's architecture. Surface that explicitly so an
-        // operator immediately understands the failure mode (and to backstop
-        // the pre-deploy platform guard for unclassifiable binaries).
         let stderr = output.stderr.trim();
-        if output.exit_code == 126 || stderr.contains("Exec format error") {
+        if let PostDeployEligibility::NotEligible {
+            reason_code,
+            detail,
+        } = classify_post_deploy(output.exit_code, stderr)
+        {
             return Err(FleetError::HealthCheckFailed {
-                reason: format!(
-                    "deployed rch-wkr is not executable on this worker (exit {}: {}); \
-                    the binary architecture does not match the worker",
-                    output.exit_code, stderr
-                ),
+                reason: format!("[{reason_code}] {detail}"),
             }
             .into());
         }
@@ -1771,6 +1846,51 @@ mod tests {
             local_file_sha256_hex(&abc).unwrap(),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    #[test]
+    fn post_deploy_validation_runs_the_exact_quoted_path() -> Result<()> {
+        // Must invoke the EXACT path (shell-escaped to $HOME), never the bare
+        // PATH-resolved `rch-wkr`.
+        let cmd = post_deploy_validation_command(REMOTE_WORKER_BINARY)?;
+        assert!(cmd.contains("\"$HOME/.local/bin/rch-wkr\" --version"));
+        assert!(cmd.contains("uname -s -m"));
+        // Never a bare `rch-wkr --version` (would PATH-resolve to a different
+        // binary than the one RCH invokes).
+        assert!(!cmd.contains(" rch-wkr --version"));
+        Ok(())
+    }
+
+    #[test]
+    fn classify_post_deploy_marks_exec_format_ineligible() {
+        // The exact 6h54q Darwin-controller -> Linux-worker regression: the
+        // pushed binary triggers `Exec format error` (exit 126).
+        match classify_post_deploy(126, "sh: 1: rch-wkr: Exec format error") {
+            PostDeployEligibility::NotEligible { reason_code, .. } => {
+                assert_eq!(reason_code, "os_arch_mismatch");
+            }
+            other => panic!("expected NotEligible(os_arch_mismatch), got {other:?}"),
+        }
+        // Message without the 126 exit code is still caught.
+        assert!(matches!(
+            classify_post_deploy(1, "Exec format error"),
+            PostDeployEligibility::NotEligible {
+                reason_code: "os_arch_mismatch",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn classify_post_deploy_generic_failure_and_success() {
+        assert!(matches!(
+            classify_post_deploy(2, "some other error"),
+            PostDeployEligibility::NotEligible {
+                reason_code: "post_deploy_validation_failed",
+                ..
+            }
+        ));
+        assert_eq!(classify_post_deploy(0, ""), PostDeployEligibility::Eligible);
     }
 
     #[test]

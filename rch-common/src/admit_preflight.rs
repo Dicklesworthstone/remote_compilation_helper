@@ -18,7 +18,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::admission_rejection::{AdmissionRejectionSummary, RejectionClass};
 use crate::capability_probe::CapabilityRequirement;
-use crate::patterns::{CompilationKind, classify_command, classify_command_detailed, split_shell_commands};
+use crate::patterns::{
+    CompilationKind, classify_command, classify_command_detailed, split_shell_commands,
+};
 
 /// The decisive recommendation `rch admit` returns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -288,7 +290,9 @@ pub fn is_offloadable(command: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::admission_rejection::{AdmissionRejectionCategory, CandidateRejection, aggregate_rejections};
+    use crate::admission_rejection::{
+        AdmissionRejectionCategory, CandidateRejection, aggregate_rejections,
+    };
 
     #[test]
     fn common_cargo_build_offloads_needing_cargo() {
@@ -353,7 +357,11 @@ mod tests {
     #[test]
     fn compound_shell_form_is_split_and_unioned() {
         let p = preflight("cargo build && bun test", false);
-        assert!(p.compound.len() >= 2, "compound must be split: {:?}", p.compound);
+        assert!(
+            p.compound.len() >= 2,
+            "compound must be split: {:?}",
+            p.compound
+        );
         // It is compilation if either part is, and capabilities union.
         if p.is_compilation {
             assert!(p.required.needs_cargo || p.required.needs_bun);
@@ -436,7 +444,10 @@ mod tests {
         let req = p.required.to_requirement(3);
         assert!(req.needs_cargo);
         assert_eq!(req.min_protocol, 3);
-        assert_eq!(req.needs_targets, vec!["wasm32-unknown-unknown".to_string()]);
+        assert_eq!(
+            req.needs_targets,
+            vec!["wasm32-unknown-unknown".to_string()]
+        );
     }
 
     #[test]

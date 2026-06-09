@@ -4931,8 +4931,9 @@ Total file size: 123 bytes";
         let err = execute_rsync_with_retry(&retry_config, "transient_rsync", move || {
             calls_in.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let mut cmd = Command::new("sh");
-            cmd.arg("-c")
-                .arg("echo 'rsync: connection unexpectedly closed (0 bytes received)' >&2; exit 12");
+            cmd.arg("-c").arg(
+                "echo 'rsync: connection unexpectedly closed (0 bytes received)' >&2; exit 12",
+            );
             cmd.stdout(std::process::Stdio::piped());
             cmd.stderr(std::process::Stdio::piped());
             cmd
@@ -4966,7 +4967,8 @@ Total file size: 123 bytes";
         let output = execute_rsync_with_retry(&retry_config, "fatal_rsync", move || {
             calls_in.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let mut cmd = Command::new("sh");
-            cmd.arg("-c").arg("echo 'rsync: mkstemp failed: Permission denied' >&2; exit 23");
+            cmd.arg("-c")
+                .arg("echo 'rsync: mkstemp failed: Permission denied' >&2; exit 23");
             cmd.stdout(std::process::Stdio::piped());
             cmd.stderr(std::process::Stdio::piped());
             cmd

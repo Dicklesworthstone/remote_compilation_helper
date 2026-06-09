@@ -924,8 +924,10 @@ mod tests {
         assert_eq!(r.method, "POST");
         assert_eq!(r.header("content-type"), Some("application/json"));
         // The signature header carries a real HMAC over the exact wire body.
-        let expected =
-            format!("sha256={}", hmac_sha256_hex(secret.as_bytes(), rendered.body.as_bytes()));
+        let expected = format!(
+            "sha256={}",
+            hmac_sha256_hex(secret.as_bytes(), rendered.body.as_bytes())
+        );
         assert_eq!(r.header("x-rch-signature"), Some(expected.as_str()));
         assert_eq!(r.body, rendered.body, "wire body matches rendered body");
         // The body is the well-formed generic JSON envelope.

@@ -295,8 +295,10 @@ mod tests {
     #[test]
     fn the_twelve_categories_are_distinct_and_classified() {
         assert_eq!(AdmissionRejectionCategory::ALL.len(), 12);
-        let mut tokens: Vec<&str> =
-            AdmissionRejectionCategory::ALL.iter().map(|c| c.as_str()).collect();
+        let mut tokens: Vec<&str> = AdmissionRejectionCategory::ALL
+            .iter()
+            .map(|c| c.as_str())
+            .collect();
         tokens.sort_unstable();
         let before = tokens.len();
         tokens.dedup();

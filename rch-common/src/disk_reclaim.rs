@@ -252,7 +252,11 @@ impl ReclaimReceipt {
     /// salient accounting in `details` (no raw paths in the wire schema's
     /// fingerprint field — the command fingerprint identifies the pass).
     #[must_use]
-    pub fn to_incident_event(&self, project_id: impl Into<String>, occurred_at_unix_ms: u64) -> IncidentEvent {
+    pub fn to_incident_event(
+        &self,
+        project_id: impl Into<String>,
+        occurred_at_unix_ms: u64,
+    ) -> IncidentEvent {
         let reclaimable = self.reclaimable_paths().len();
         let protected = self.protected_active().len();
         let unmanaged = self.skipped_for(ReclaimSkipReason::UnmanagedRoot).len();
@@ -362,10 +366,16 @@ mod tests {
             managed_roots: vec!["/tmp/rch".to_string()],
             min_idle_minutes: 0,
         };
-        let mut c = candidate("/tmp/rch/proj/.rch-target-w-job-1-2-0", ReclaimCategory::StaleTargetDir);
+        let mut c = candidate(
+            "/tmp/rch/proj/.rch-target-w-job-1-2-0",
+            ReclaimCategory::StaleTargetDir,
+        );
         c.active_build = true;
         let receipt = plan_reclaim(&[c], &aggressive);
-        assert!(receipt.reclaimable_paths().is_empty(), "active build must not be reclaimed");
+        assert!(
+            receipt.reclaimable_paths().is_empty(),
+            "active build must not be reclaimed"
+        );
         assert_eq!(receipt.protected_active().len(), 1);
         assert_eq!(receipt.planned_bytes, 0);
     }
@@ -376,7 +386,10 @@ mod tests {
         let c = candidate("/home/user/project/target", ReclaimCategory::StaleTargetDir);
         let receipt = plan_reclaim(&[c], &policy());
         assert!(receipt.reclaimable_paths().is_empty());
-        assert_eq!(receipt.skipped_for(ReclaimSkipReason::UnmanagedRoot).len(), 1);
+        assert_eq!(
+            receipt.skipped_for(ReclaimSkipReason::UnmanagedRoot).len(),
+            1
+        );
     }
 
     #[test]
@@ -406,15 +419,26 @@ mod tests {
     #[test]
     fn distinguishes_reclaimable_categories_from_operator_required() {
         let candidates = vec![
-            candidate("/tmp/rch/p/.rch-target-w-job-1-2-0", ReclaimCategory::StaleTargetDir),
+            candidate(
+                "/tmp/rch/p/.rch-target-w-job-1-2-0",
+                ReclaimCategory::StaleTargetDir,
+            ),
             candidate("/tmp/rch/cargo-home-stale", ReclaimCategory::StaleCargoHome),
             candidate("/tmp/rch/logs/old", ReclaimCategory::LogRotation),
-            candidate("/tmp/rch/mystery-bigdir", ReclaimCategory::OperatorRequiredManual),
+            candidate(
+                "/tmp/rch/mystery-bigdir",
+                ReclaimCategory::OperatorRequiredManual,
+            ),
         ];
         let receipt = plan_reclaim(&candidates, &policy());
         // Three auto-reclaimable categories are planned; operator-required is not.
         assert_eq!(receipt.reclaimable_paths().len(), 3);
-        assert_eq!(receipt.skipped_for(ReclaimSkipReason::OperatorRequired).len(), 1);
+        assert_eq!(
+            receipt
+                .skipped_for(ReclaimSkipReason::OperatorRequired)
+                .len(),
+            1
+        );
         assert_eq!(receipt.planned_bytes, 3_000);
         assert_eq!(receipt.planned_inodes, 30);
     }
@@ -422,7 +446,10 @@ mod tests {
     #[test]
     fn conservative_staleness_preserves_warm_caches() {
         // Within the idle window (managed, not active) => preserved as NotStale.
-        let mut c = candidate("/tmp/rch/p/.rch-target-w-job-1-2-0", ReclaimCategory::StaleTargetDir);
+        let mut c = candidate(
+            "/tmp/rch/p/.rch-target-w-job-1-2-0",
+            ReclaimCategory::StaleTargetDir,
+        );
         c.idle_minutes = 5; // far below 12h floor
         let receipt = plan_reclaim(&[c], &policy());
         assert!(receipt.reclaimable_paths().is_empty());
@@ -435,7 +462,10 @@ mod tests {
         // still preserves a 30-min-idle cache.
         let p = ReclaimPolicy::new(vec!["/tmp/rch".to_string()], 0);
         assert_eq!(p.min_idle_minutes, 60);
-        let mut c = candidate("/tmp/rch/p/.rch-target-w-job-1-2-0", ReclaimCategory::StaleTargetDir);
+        let mut c = candidate(
+            "/tmp/rch/p/.rch-target-w-job-1-2-0",
+            ReclaimCategory::StaleTargetDir,
+        );
         c.idle_minutes = 30;
         let receipt = plan_reclaim(&[c], &p);
         assert!(receipt.reclaimable_paths().is_empty());
@@ -446,9 +476,15 @@ mod tests {
     #[test]
     fn planned_totals_count_only_reclaimable() {
         let candidates = vec![
-            candidate("/tmp/rch/p/.rch-target-w-job-1-2-0", ReclaimCategory::StaleTargetDir), // reclaim
+            candidate(
+                "/tmp/rch/p/.rch-target-w-job-1-2-0",
+                ReclaimCategory::StaleTargetDir,
+            ), // reclaim
             {
-                let mut a = candidate("/tmp/rch/active/.rch-target-w-job-9-9-0", ReclaimCategory::StaleTargetDir);
+                let mut a = candidate(
+                    "/tmp/rch/active/.rch-target-w-job-9-9-0",
+                    ReclaimCategory::StaleTargetDir,
+                );
                 a.active_build = true; // skipped
                 a.bytes = 9_999;
                 a
@@ -456,12 +492,18 @@ mod tests {
             candidate("/elsewhere/junk", ReclaimCategory::StaleTargetDir), // unmanaged
         ];
         let receipt = plan_reclaim(&candidates, &policy());
-        assert_eq!(receipt.planned_bytes, 1_000, "only the one reclaimable path counts");
+        assert_eq!(
+            receipt.planned_bytes, 1_000,
+            "only the one reclaimable path counts"
+        );
     }
 
     #[test]
     fn finalize_records_actual_freed() {
-        let c = candidate("/tmp/rch/p/.rch-target-w-job-1-2-0", ReclaimCategory::StaleTargetDir);
+        let c = candidate(
+            "/tmp/rch/p/.rch-target-w-job-1-2-0",
+            ReclaimCategory::StaleTargetDir,
+        );
         let mut receipt = plan_reclaim(&[c], &policy());
         assert_eq!(receipt.actual_bytes, None);
         receipt.finalize(950, 9);
@@ -472,9 +514,15 @@ mod tests {
     #[test]
     fn journal_event_is_diskfull_with_accounting() {
         let candidates = vec![
-            candidate("/tmp/rch/p/.rch-target-w-job-1-2-0", ReclaimCategory::StaleTargetDir),
+            candidate(
+                "/tmp/rch/p/.rch-target-w-job-1-2-0",
+                ReclaimCategory::StaleTargetDir,
+            ),
             {
-                let mut a = candidate("/tmp/rch/active/.rch-target-w-job-9-9-0", ReclaimCategory::StaleTargetDir);
+                let mut a = candidate(
+                    "/tmp/rch/active/.rch-target-w-job-9-9-0",
+                    ReclaimCategory::StaleTargetDir,
+                );
                 a.active_build = true;
                 a
             },
@@ -484,9 +532,18 @@ mod tests {
         let event = receipt.to_incident_event("proj-1", 1_700_000_000_000);
         assert_eq!(event.reason_code, IncidentReasonCode::DiskFull);
         assert_eq!(event.event_type, IncidentEventType::WorkerLifecycle);
-        assert_eq!(event.details.get("planned_bytes").map(String::as_str), Some("1000"));
-        assert_eq!(event.details.get("protected_active").map(String::as_str), Some("1"));
-        assert_eq!(event.details.get("actual_bytes").map(String::as_str), Some("1000"));
+        assert_eq!(
+            event.details.get("planned_bytes").map(String::as_str),
+            Some("1000")
+        );
+        assert_eq!(
+            event.details.get("protected_active").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            event.details.get("actual_bytes").map(String::as_str),
+            Some("1000")
+        );
     }
 
     // --- Serde / contract ---------------------------------------------------
@@ -494,7 +551,10 @@ mod tests {
     #[test]
     fn receipt_serializes_with_stable_decision_tokens() {
         let candidates = vec![
-            candidate("/tmp/rch/p/.rch-target-w-job-1-2-0", ReclaimCategory::StaleTargetDir),
+            candidate(
+                "/tmp/rch/p/.rch-target-w-job-1-2-0",
+                ReclaimCategory::StaleTargetDir,
+            ),
             candidate("/elsewhere/x", ReclaimCategory::LogRotation),
         ];
         let receipt = plan_reclaim(&candidates, &policy());

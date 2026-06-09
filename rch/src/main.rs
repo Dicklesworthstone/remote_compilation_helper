@@ -1758,9 +1758,7 @@ async fn run(args: Vec<OsString>) -> Result<()> {
     let _logging_guards = match init_logging(&log_config) {
         Ok(guards) => Some(guards),
         Err(error) => {
-            eprintln!(
-                "rch: logging initialization failed ({error:#}); continuing without logging"
-            );
+            eprintln!("rch: logging initialization failed ({error:#}); continuing without logging");
             None
         }
     };

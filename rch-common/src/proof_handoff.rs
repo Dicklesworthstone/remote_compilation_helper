@@ -128,7 +128,11 @@ pub struct ProofHandoff {
 impl ProofHandoff {
     /// Build a handoff for a proof refusal.
     #[must_use]
-    pub fn for_refusal(intent_id: impl Into<String>, command: &str, refusal: &ProofRefusal) -> Self {
+    pub fn for_refusal(
+        intent_id: impl Into<String>,
+        command: &str,
+        refusal: &ProofRefusal,
+    ) -> Self {
         let next_action = next_action_for_refusal(refusal.reason);
         Self {
             proof_intent_id: intent_id.into(),
@@ -194,7 +198,10 @@ mod tests {
     fn classifier_chose_local_is_local_fallback_refused() {
         let refusal = ProofRefusal::new(ProofRefusalReason::ClassifierChoseLocal);
         let handoff = ProofHandoff::for_refusal("i2", "cargo fmt", &refusal);
-        assert_eq!(handoff.failure_class, ProofFailureClass::LocalFallbackRefused);
+        assert_eq!(
+            handoff.failure_class,
+            ProofFailureClass::LocalFallbackRefused
+        );
         assert_eq!(handoff.next_action, NextAction::RefreshCapabilities);
     }
 

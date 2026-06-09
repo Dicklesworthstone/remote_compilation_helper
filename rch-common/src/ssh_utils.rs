@@ -25,11 +25,14 @@ pub fn is_retryable_transport_error(err: &anyhow::Error) -> bool {
 pub fn is_retryable_transport_error_text(message: &str) -> bool {
     let message = message.to_lowercase();
 
-    // Fail-fast: non-retryable authentication / host trust issues.
+    // Fail-fast: non-retryable authentication / host trust issues. NOTE: a bare
+    // "no such file or directory" is deliberately NOT here — openssh emits it for
+    // a transient stale ControlMaster socket (retryable), and the genuinely-fatal
+    // missing-key case is already covered by "identity file"/"keyfile". Keeping
+    // it as an unconditional fatal mis-classified a recoverable mux-socket drop.
     if message.contains("permission denied")
         || message.contains("host key verification failed")
         || message.contains("could not resolve hostname")
-        || message.contains("no such file or directory")
         || message.contains("identity file")
         || message.contains("keyfile")
         || message.contains("invalid format")
@@ -56,6 +59,12 @@ pub fn is_retryable_transport_error_text(message: &str) -> bool {
         || message.contains("ssh_exchange_identification")
         || message.contains("kex_exchange_identification")
         || message.contains("temporary failure in name resolution")
+        // Stale ControlMaster / multiplexing socket — a reconnect re-establishes
+        // the master, so these are transient, not fatal.
+        || message.contains("control socket")
+        || message.contains("controlsocket")
+        || message.contains("mux_client")
+        || message.contains("multiplexing")
 }
 
 /// Result of a remote command execution.
@@ -265,6 +274,25 @@ mod tests {
         ));
         assert!(!is_retryable_transport_error_text(
             "Identity file /nope/id_rsa not accessible: No such file or directory"
+        ));
+    }
+
+    #[test]
+    fn test_stale_control_socket_is_retryable_not_fatal() {
+        let _guard = test_guard!();
+        // A stale/missing ControlMaster socket is transient — a reconnect fixes
+        // it — even though the message contains "No such file or directory",
+        // which used to force it non-retryable.
+        assert!(is_retryable_transport_error_text(
+            "Control socket connect(/tmp/rch/cm-worker): No such file or directory"
+        ));
+        assert!(is_retryable_transport_error_text(
+            "mux_client_request_session: read from master failed: Broken pipe"
+        ));
+        // But a genuine missing identity file stays fatal (covered by the
+        // "identity file" marker, not the bare path error).
+        assert!(!is_retryable_transport_error_text(
+            "Warning: Identity file ~/.ssh/id_ed25519 not accessible: No such file or directory"
         ));
     }
 

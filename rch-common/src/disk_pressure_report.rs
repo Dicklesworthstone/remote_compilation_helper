@@ -69,7 +69,11 @@ impl PressureLevel {
     /// The worse (higher-rank) of two levels.
     #[must_use]
     pub fn worse(self, other: PressureLevel) -> PressureLevel {
-        if other.rank() > self.rank() { other } else { self }
+        if other.rank() > self.rank() {
+            other
+        } else {
+            self
+        }
     }
 }
 
@@ -387,7 +391,11 @@ mod tests {
         assert_eq!(r.inodes, PressureLevel::Unknown);
         assert!(r.available_bytes.is_none());
         // A zero-total df line is equally unassessable.
-        let z = assess_root(DiskRootKind::TargetRoot, Some(&facts("/x/y", 0, 0, 0)), &th());
+        let z = assess_root(
+            DiskRootKind::TargetRoot,
+            Some(&facts("/x/y", 0, 0, 0)),
+            &th(),
+        );
         assert_eq!(z.bytes, PressureLevel::Unknown);
     }
 
@@ -469,7 +477,8 @@ mod tests {
     #[test]
     fn enospc_with_real_compiler_diagnostics_is_product_compile() {
         // Real rustc coded diagnostic proves the code genuinely failed to compile.
-        let stderr = "error[E0308]: mismatched types\n  --> src/lib.rs:1:1\nNo space left on device";
+        let stderr =
+            "error[E0308]: mismatched types\n  --> src/lib.rs:1:1\nNo space left on device";
         assert_eq!(
             classify_exec_failure(stderr),
             ExecFailureClass::ProductCompile

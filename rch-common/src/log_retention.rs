@@ -292,7 +292,9 @@ pub fn log_remediation_guidance(level: PressureLevel) -> &'static str {
         PressureLevel::Critical => {
             "daemon logs are large; rotation will reclaim space on the next cycle. Do NOT delete log files by hand — RCH rotates only its own daemon.log/daemon.err generations"
         }
-        PressureLevel::Unknown => "log sizes could not be determined; check the daemon log directory path",
+        PressureLevel::Unknown => {
+            "log sizes could not be determined; check the daemon log directory path"
+        }
     }
 }
 
@@ -315,8 +317,14 @@ mod tests {
     #[test]
     fn rotate_by_size_only_when_over_limit() {
         let files = vec![
-            LogFile { name: "daemon.log".into(), bytes: 150 }, // over 100 -> rotate
-            LogFile { name: "daemon.err".into(), bytes: 50 },  // under -> keep
+            LogFile {
+                name: "daemon.log".into(),
+                bytes: 150,
+            }, // over 100 -> rotate
+            LogFile {
+                name: "daemon.err".into(),
+                bytes: 50,
+            }, // under -> keep
         ];
         let plan = plan_log_rotation(&files, &small_policy());
         assert_eq!(plan.names_for(LogAction::Rotate), vec!["daemon.log"]);
@@ -326,21 +334,42 @@ mod tests {
     #[test]
     fn preserve_recent_generations_prune_old() {
         let files = vec![
-            LogFile { name: "daemon.log.1".into(), bytes: 10 }, // keep (<= keep_rotated=2)
-            LogFile { name: "daemon.log.2".into(), bytes: 10 }, // keep
-            LogFile { name: "daemon.log.3".into(), bytes: 10 }, // prune (>2)
+            LogFile {
+                name: "daemon.log.1".into(),
+                bytes: 10,
+            }, // keep (<= keep_rotated=2)
+            LogFile {
+                name: "daemon.log.2".into(),
+                bytes: 10,
+            }, // keep
+            LogFile {
+                name: "daemon.log.3".into(),
+                bytes: 10,
+            }, // prune (>2)
         ];
         let plan = plan_log_rotation(&files, &small_policy());
-        assert_eq!(plan.names_for(LogAction::Keep), vec!["daemon.log.1", "daemon.log.2"]);
+        assert_eq!(
+            plan.names_for(LogAction::Keep),
+            vec!["daemon.log.1", "daemon.log.2"]
+        );
         assert_eq!(plan.names_for(LogAction::Prune), vec!["daemon.log.3"]);
     }
 
     #[test]
     fn unmanaged_files_are_reported_never_actioned() {
         let files = vec![
-            LogFile { name: "daemon.log".into(), bytes: 999 }, // managed, rotate
-            LogFile { name: "someone_elses.log".into(), bytes: 999 },
-            LogFile { name: "notes.txt".into(), bytes: 10 },
+            LogFile {
+                name: "daemon.log".into(),
+                bytes: 999,
+            }, // managed, rotate
+            LogFile {
+                name: "someone_elses.log".into(),
+                bytes: 999,
+            },
+            LogFile {
+                name: "notes.txt".into(),
+                bytes: 10,
+            },
         ];
         let plan = plan_log_rotation(&files, &small_policy());
         let unmanaged = plan.names_for(LogAction::SkipUnmanaged);
@@ -349,7 +378,11 @@ mod tests {
         assert_eq!(plan.unmanaged_total_bytes, 1_009);
         // Unmanaged never appears in rotate/prune.
         assert!(!plan.names_for(LogAction::Rotate).contains(&"notes.txt"));
-        assert!(!plan.names_for(LogAction::Prune).contains(&"someone_elses.log"));
+        assert!(
+            !plan
+                .names_for(LogAction::Prune)
+                .contains(&"someone_elses.log")
+        );
     }
 
     #[test]
@@ -357,8 +390,14 @@ mod tests {
         assert!(is_managed_active_log("daemon.log"));
         assert!(is_managed_active_log("daemon.err"));
         assert!(!is_managed_active_log("daemon.log.1"));
-        assert_eq!(managed_rotated_generation("daemon.err.2"), Some(("daemon.err", 2)));
-        assert_eq!(managed_rotated_generation("daemon.log.1"), Some(("daemon.log", 1)));
+        assert_eq!(
+            managed_rotated_generation("daemon.err.2"),
+            Some(("daemon.err", 2))
+        );
+        assert_eq!(
+            managed_rotated_generation("daemon.log.1"),
+            Some(("daemon.log", 1))
+        );
         // Not a bare integer generation => unmanaged.
         assert_eq!(managed_rotated_generation("daemon.log.1.gz"), None);
         assert_eq!(managed_rotated_generation("daemon.log.old"), None);
@@ -405,9 +444,22 @@ mod tests {
 
         let receipt = rotate_logs(p, &small_policy()).unwrap();
         // Unmanaged files reported and still present, unchanged.
-        assert!(receipt.skipped_unmanaged.contains(&"important_unmanaged.db".to_string()));
-        assert!(receipt.skipped_unmanaged.contains(&"user_notes.txt".to_string()));
-        assert_eq!(fs::metadata(p.join("important_unmanaged.db")).unwrap().len(), 999);
+        assert!(
+            receipt
+                .skipped_unmanaged
+                .contains(&"important_unmanaged.db".to_string())
+        );
+        assert!(
+            receipt
+                .skipped_unmanaged
+                .contains(&"user_notes.txt".to_string())
+        );
+        assert_eq!(
+            fs::metadata(p.join("important_unmanaged.db"))
+                .unwrap()
+                .len(),
+            999
+        );
         assert_eq!(fs::metadata(p.join("user_notes.txt")).unwrap().len(), 5);
     }
 
@@ -448,7 +500,10 @@ mod tests {
 
     #[test]
     fn plan_serializes_with_stable_tokens() {
-        let files = vec![LogFile { name: "daemon.log".into(), bytes: 200 }];
+        let files = vec![LogFile {
+            name: "daemon.log".into(),
+            bytes: 200,
+        }];
         let plan = plan_log_rotation(&files, &small_policy());
         let value = serde_json::to_value(&plan).unwrap();
         assert_eq!(value["decisions"][0]["action"], "rotate");

@@ -165,7 +165,10 @@ pub fn assess_readiness(inputs: &ReadinessInputs) -> ReadinessReport {
         DecisiveBlocker::ProofRefused => "proof mode refused before execution".to_string(),
         DecisiveBlocker::NoDesiredFleet => "no workers configured in the fleet".to_string(),
         DecisiveBlocker::NoHealthyWorkers => {
-            format!("{} desired worker(s) but none live/healthy", s.desired_fleet_workers)
+            format!(
+                "{} desired worker(s) but none live/healthy",
+                s.desired_fleet_workers
+            )
         }
         DecisiveBlocker::NoCommandCapability => format!(
             "{} healthy worker(s) but none admissible for this command",
@@ -298,7 +301,10 @@ mod tests {
         // The incident chain is replayed, oldest-first.
         assert_eq!(v["incident_chain"][0]["reason_code"], "RCH-I011");
         assert_eq!(v["incident_chain"][1]["reason_code"], "RCH-I014");
-        assert_eq!(v["incident_chain"][1]["occurred_at_unix_ms"], 1_700_000_001_000u64);
+        assert_eq!(
+            v["incident_chain"][1]["occurred_at_unix_ms"],
+            1_700_000_001_000u64
+        );
     }
 
     // --- Precedence + structure --------------------------------------------

@@ -729,7 +729,10 @@ mod tests {
                    RCH_FACT worker_version=1.0.41\nRCH_FACT worker_protocol=3\n";
         let f = parse_capability_probe(out);
         let v = assess_worker_eligibility(&f, &req_wasm(), &WorkerLiveness::ready());
-        assert_eq!(v.reason(), Some(IncidentReasonCode::MissingRuntimeToolchainTarget));
+        assert_eq!(
+            v.reason(),
+            Some(IncidentReasonCode::MissingRuntimeToolchainTarget)
+        );
         assert!(matches!(v, EligibilityVerdict::MissingCapability { .. }));
     }
 
@@ -788,7 +791,10 @@ mod tests {
              RCH_FACT cargo_version=cargo 1.98\nRCH_FACT target=x86_64-unknown-linux-gnu\n",
         );
         let v_before = assess_worker_eligibility(&before, &req_wasm(), &WorkerLiveness::ready());
-        assert!(matches!(v_before, EligibilityVerdict::MissingCapability { .. }));
+        assert!(matches!(
+            v_before,
+            EligibilityVerdict::MissingCapability { .. }
+        ));
 
         // After refresh: the wasm target was installed => now eligible.
         let after = parse_capability_probe(good_output());

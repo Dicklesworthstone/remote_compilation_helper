@@ -813,14 +813,16 @@ pub async fn admit(command: &str, ctx: &OutputContext) -> Result<()> {
 
     // Proof/strict-remote policy mirrors the ControlState surface
     // (RCH_REQUIRE_REMOTE / RCH_FORCE_REMOTE).
-    let proof_policy = ["RCH_REQUIRE_REMOTE", "RCH_FORCE_REMOTE"].iter().any(|key| {
-        std::env::var(key).is_ok_and(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-    });
+    let proof_policy = ["RCH_REQUIRE_REMOTE", "RCH_FORCE_REMOTE"]
+        .iter()
+        .any(|key| {
+            std::env::var(key).is_ok_and(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+        });
 
     let pf = preflight(command, proof_policy);
 

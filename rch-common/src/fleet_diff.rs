@@ -274,11 +274,17 @@ mod tests {
     fn temporary_bypass_and_unreachable_and_unconfigured() {
         let mut bypass = WorkerObservation::ready("a");
         bypass.temporarily_bypassed = true;
-        assert_eq!(derive_worker_diff(&bypass), WorkerDiffState::TemporarilyBypassed);
+        assert_eq!(
+            derive_worker_diff(&bypass),
+            WorkerDiffState::TemporarilyBypassed
+        );
 
         let mut unreachable = WorkerObservation::ready("b");
         unreachable.reachable = false; // still in pool
-        assert_eq!(derive_worker_diff(&unreachable), WorkerDiffState::Unreachable);
+        assert_eq!(
+            derive_worker_diff(&unreachable),
+            WorkerDiffState::Unreachable
+        );
 
         let mut orphan = WorkerObservation::ready("c");
         orphan.configured = false; // in pool but not configured
@@ -319,14 +325,11 @@ mod tests {
 
     #[test]
     fn fleet_diff_reports_ready_count() {
-        let diff = build_fleet_diff(&[
-            WorkerObservation::ready("a"),
-            {
-                let mut b = WorkerObservation::ready("b");
-                b.command_admissible = false;
-                b
-            },
-        ]);
+        let diff = build_fleet_diff(&[WorkerObservation::ready("a"), {
+            let mut b = WorkerObservation::ready("b");
+            b.command_admissible = false;
+            b
+        }]);
         assert_eq!(diff.ready_workers, 1);
         assert!(!diff.capacity_collapsed());
         assert!(diff.explanation.contains("1/2 worker(s) ready"));

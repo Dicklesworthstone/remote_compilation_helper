@@ -127,7 +127,11 @@ impl PooledTargetKey {
         absorb(&mut hasher, "toolchain", &dims.toolchain);
         absorb(&mut hasher, "triple", &dims.target_triple);
         absorb(&mut hasher, "profile", &dims.profile);
-        absorb(&mut hasher, "runtime", dims.runtime.as_deref().unwrap_or(""));
+        absorb(
+            &mut hasher,
+            "runtime",
+            dims.runtime.as_deref().unwrap_or(""),
+        );
         // Canonicalized features, count-prefixed then each length-framed, so the
         // feature *set* (not its order or multiplicity) determines the key.
         let features = dims.canonical_features();
@@ -268,7 +272,8 @@ mod tests {
         let s = key.as_str();
         assert_eq!(s.len(), 32, "128-bit truncated hex");
         assert!(
-            s.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            s.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
             "lowercase hex only: {s}"
         );
         assert_eq!(key.pooled_dir_name(), format!(".rch-pool/{s}"));

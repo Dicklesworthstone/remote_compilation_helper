@@ -182,10 +182,15 @@ impl ExecResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::admission_rejection::{AdmissionRejectionCategory, CandidateRejection, aggregate_rejections};
+    use crate::admission_rejection::{
+        AdmissionRejectionCategory, CandidateRejection, aggregate_rejections,
+    };
 
     fn assert_invariant(r: &ExecResponse) {
-        assert!(r.invariant_holds(), "location/worker invariant violated: {r:?}");
+        assert!(
+            r.invariant_holds(),
+            "location/worker invariant violated: {r:?}"
+        );
     }
 
     // --- The five required golden scenarios ---------------------------------
@@ -304,7 +309,13 @@ mod tests {
             ExecResponse::daemon_unavailable(),
         ] {
             let v = serde_json::to_value(&r).unwrap();
-            for key in ["local_or_remote", "is_compilation", "disposition", "proof_mode", "detail"] {
+            for key in [
+                "local_or_remote",
+                "is_compilation",
+                "disposition",
+                "proof_mode",
+                "detail",
+            ] {
                 assert!(v.get(key).is_some(), "missing required field {key}");
             }
         }

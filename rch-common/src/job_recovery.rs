@@ -399,7 +399,10 @@ mod tests {
         assert_eq!(warning.class, StuckClass::DaemonForgotJob);
         assert_eq!(warning.recommended_action, RecoveryAction::Recover);
         assert!(warning.stuck);
-        assert_eq!(warning.reason_code, Some(IncidentReasonCode::QueueAmbiguity));
+        assert_eq!(
+            warning.reason_code,
+            Some(IncidentReasonCode::QueueAmbiguity)
+        );
         assert!(warning.offered.recover.is_some());
         assert!(warning.offered.cancel.is_some());
     }
@@ -447,10 +450,7 @@ mod tests {
         // reattach cleanly."
         let state = WrapperState::waiting(JobLifecycleState::Queued).reservation_failed();
         let warning = diagnose_stuck_wrapper(&admitted_job(), &state);
-        assert_eq!(
-            warning.class,
-            StuckClass::ReservationFailedAfterAdmission
-        );
+        assert_eq!(warning.class, StuckClass::ReservationFailedAfterAdmission);
         assert_eq!(warning.recommended_action, RecoveryAction::Cancel);
         assert!(warning.offered.cancel.is_some());
     }
