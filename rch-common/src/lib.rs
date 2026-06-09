@@ -114,7 +114,8 @@ pub use artifact_cost::{
     compute_artifact_cost, is_broad_recursive_glob,
 };
 pub use artifact_pattern::{
-    ArtifactPatternRewrite, ArtifactRetrievalDiagnostics, rewrite_artifact_pattern,
+    ARTIFACT_OUTPUT_ROOTS, ArtifactPatternRewrite, ArtifactRetrievalDiagnostics,
+    artifact_dest_is_safe, rewrite_artifact_pattern,
 };
 pub use artifact_verify::{
     ArtifactManifest, FileHash, VerificationFailure, VerificationResult, compute_file_hash,

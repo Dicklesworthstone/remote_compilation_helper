@@ -72,6 +72,33 @@ pub fn rewrite_artifact_pattern(
     unchanged(false, pattern.to_string())
 }
 
+/// Recognized artifact output roots (relative to the project). A retrieved
+/// artifact must land under one of these — never over tracked source.
+pub const ARTIFACT_OUTPUT_ROOTS: &[&str] = &["target", ".rch-target"];
+
+/// Whether a retrieved artifact's RELATIVE destination is safe to write into the
+/// local project. Protects against a malicious or stale remote layout
+/// overwriting local source: the destination must not escape the project root
+/// (no absolute path, no `..` traversal — the top-level root protection) and
+/// must land under a recognized artifact output root (`target` or a
+/// `.rch-target*` worker-scoped dir), never under `src/` or the project root
+/// itself.
+#[must_use]
+pub fn artifact_dest_is_safe(rel_dest: &str) -> bool {
+    if rel_dest.is_empty() || rel_dest.starts_with('/') {
+        return false;
+    }
+    if std::path::Path::new(rel_dest)
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return false;
+    }
+    let first = rel_dest.split('/').next().unwrap_or("");
+    // `.rch-target`, `.rch-target-worker-css`, … all start with ".rch-target".
+    first == "target" || first.starts_with(".rch-target")
+}
+
 /// Auditable record of an artifact-retrieval attempt under a (possibly
 /// rewritten) target dir. Printed by retrieval diagnostics and surfaced in the
 /// JSON envelope.
