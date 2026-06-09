@@ -1750,7 +1750,20 @@ async fn run(args: Vec<OsString>) -> Result<()> {
     } else if cli.quiet {
         log_config = log_config.with_level("error");
     }
-    let _logging_guards = init_logging(&log_config)?;
+    // Logging is best-effort diagnostics and must NEVER hard-fail a command.
+    // Most critically: a non-zero exit from the PreToolUse hook (the no-subcommand
+    // path below) is interpreted by Claude Code as "deny" and BLOCKS the user's
+    // command — so an init failure (e.g. an unwritable RCH_LOG_FILE directory)
+    // must degrade to no-logging and continue, not propagate and exit non-zero.
+    let _logging_guards = match init_logging(&log_config) {
+        Ok(guards) => Some(guards),
+        Err(error) => {
+            eprintln!(
+                "rch: logging initialization failed ({error:#}); continuing without logging"
+            );
+            None
+        }
+    };
 
     // br-4zf3p: emit one INFO event so agents (and `rch ... --verbose`)
     // can verify the CLI override actually took effect. Silent flags are
