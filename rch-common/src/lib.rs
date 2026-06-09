@@ -14,6 +14,7 @@ pub mod artifact_verify;
 pub mod binary_hash;
 pub mod capability_probe;
 pub mod cargo_path_deps;
+pub mod closure_explain;
 pub mod config;
 pub mod dependency_closure_planner;
 pub mod discovery;
@@ -119,6 +120,10 @@ pub use cargo_path_deps::{
     CargoPathDependencyEdge, CargoPathDependencyError, CargoPathDependencyErrorKind,
     CargoPathDependencyGraph, CargoPathDependencyPackage, resolve_cargo_path_dependency_graph,
     resolve_cargo_path_dependency_graph_with_policy,
+};
+pub use closure_explain::{
+    ClosureExplainEntry, ClosureExplainReport, RootConvergence, RootSyncOutcome, derive_outcome,
+    explain_closure,
 };
 pub use dependency_closure_planner::{
     DependencyClosurePlan, DependencyClosurePlanState, DependencyPlanIssue, DependencyRiskClass,
