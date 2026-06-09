@@ -18,7 +18,7 @@ This pass used:
 - The `$cass`, `$sc`, and `$operationalizing-expertise` skills, mainly for the broad-query, evidence-bank, and operationalization workflow.
 - Open Beads in this repo.
 
-Important caveat: every machine had some indexing, access, or corpus-shape complication. I did not treat that as a reason to skip the machine. I recorded it as an operational finding, because a stale, absent, or misleading session index is itself relevant to debugging and fleet recovery work. The first pass over-relied on capped `cass` searches. The second pass went directly to the raw `.jsonl` stores with bounded `rg` scans and targeted JSONL snippet extraction.
+Important caveat: every machine had some indexing, access, or corpus-shape complication. I did not treat that as a reason to skip the machine. I recorded it as an operational finding, because a stale, absent, or misleading session index is itself relevant to debugging and fleet recovery work. The first pass over-relied on capped `cass` searches. The second pass went directly to the raw `.jsonl` stores with bounded `rg` scans. The third pass checked CASS source configuration, counted RCH-explicit candidate files, and sampled direct raw session/tool-output evidence from the live and backup stores.
 
 ## Directly Inspected Evidence Trail
 
@@ -33,9 +33,11 @@ This report is based on broad `cass` query matrices, direct raw-session scans, a
 - RCH docs: `docs/design/pooled-target-dirs.md`, `docs/runbooks/worker-recovery.md`, `docs/runbooks/debugging-slow-builds.md`.
 - Canonical skill package: `/dp/je_private_skills_repo/.claude/skills/rch/SKILL.md` and its referenced worker, disk pressure, contention, self-healing, fail-open, and operations references.
 - Open Beads in this repo, especially the P0 Darwin-controller/Linux-worker deploy issue and P1 doctor/hook reliability issues.
+- Local RCH project stores `/home/ubuntu/.claude/projects/-data-projects-remote-compilation-helper`, `/home/ubuntu/.claude/projects/-data-projects-remote_compilation_helper`, and `/data/agent_config_folder_backups/.claude/projects/-data-projects-remote-compilation-helper`, including `doctor.reliability.watch` output and product-history beads around multi-repo sync, disk pressure, worker self-healing, and hook/UX gaps.
 - `ts1` raw sessions including `/home/ubuntu/.codex/sessions/2026/05/10/rollout-2026-05-10T01-09-44-019e104a-9799-7ca3-a309-b02f0f8f2eab.jsonl`, which showed local fallback after failed preflight, local cargo lock contention, later successful SSH probes to VMI workers, daemon connection refusal, and daemon logs reconnecting workers.
 - `css` raw sessions including `/home/ubuntu/.codex/sessions/2026/04/25/rollout-2026-04-25T11-23-30-019dc53d-2000-7f10-909f-0eedc03c0437.jsonl` and `/home/ubuntu/.codex/sessions/2026/05/08/rollout-2026-05-08T01-18-38-019e0606-04ca-72c1-adb3-3721583f55a0.jsonl`, which showed non-compilation `rch exec` confusion, missing `wasm32-unknown-unknown`, `rsync failed` on vanished `.git/index.lock`, and multi-agent proof lanes routing through RCH.
 - `mac-mini-max` raw session `/Users/jemanuel/.claude/projects/-Users-jemanuel/6808415d-2854-4409-914c-7ed9c1513bcb.jsonl`, which confirmed a Darwin controller pushing a Darwin `rch-wkr` binary to Linux workers, causing `Exec format error` and breaking telemetry/offload.
+- mac-mini-max raw sessions under `/Users/jemanuel/.claude/projects/-Users-jemanuel-projects/6991adb6-d686-4d70-8bed-bcc569877b63/`, which include VMI build-worker sweeps, active `rsync`/`.rch-target-vmi...` paths, `/tmp/rch-cargo-home-vmi...` cargo homes, and safe-cleanup pressure during active builds.
 
 The broad query matrices were run locally and on every requested reachable machine. `mac-mini-old` could not be mined because SSH to the Tailscale address timed out. `ts2` was slow but reachable during the second pass and was raw-mined directly.
 
@@ -95,6 +97,50 @@ Immediate conclusions from the raw matrix:
 5. Cloud/fleet disruptions are central, not peripheral. `Contabo` and `vmi` dominate mac, ts1, css, and local histories.
 6. Wrong-architecture deployment is not hypothetical. `Exec format error` and `rch update --fleet` co-occur across the local, mac, ts1, ts2, css, and csd corpora, with mac-mini-max providing the clearest direct narrative.
 7. WebAssembly target friction and `rsync` failure are recurring capability/convergence classes. They need first-class capability inventory and sync diagnostics, not one-off agent workarounds.
+
+## Third-Pass Expanded Raw-Session Evidence
+
+A deeper pass corrected the earlier undercount. The first indexed `cass` pass and even the second raw-count pass did not adequately show how much session history exists outside the indexed happy path. The third pass therefore widened the method in three ways:
+
+1. It checked the CASS source configuration and CASS health on every reachable host.
+2. It counted RCH-explicit candidate files before sampling category evidence.
+3. It prioritized direct raw session files and tool-output sidecars over `cass search` output.
+
+Important CASS-source findings:
+
+| Machine | CASS source state observed in this pass | Implication |
+| --- | --- | --- |
+| Local VPS `/data/projects` | `cass 0.6.13`; `sources.toml` contains only local backup stores under `/data/agent_config_folder_backups`; `cass health` was unhealthy/stale with 133 quarantined conversations | Local indexed search is not a complete view of live history; raw live stores and backup stores both matter |
+| `ts1` | `cass 0.6.13`; `cass sources list` returned zero configured sources | Use raw `~/.claude`, `~/.codex`, and `~/.gemini` stores directly |
+| `ts2` | `cass 0.6.10`; `cass sources list` returned zero configured sources | Same; indexed evidence undercounts by construction |
+| `css` | `cass 0.6.13`; `cass sources list` returned zero configured sources | Same |
+| `csd` | `cass 0.4.1`; `cass sources list` returned zero configured sources | Same, and older CASS makes the index less trustworthy |
+| `mac-mini-max` | `cass 0.4.1`; configured SSH sources for `css`, `csd`, `trj`, `yto`, and `fmd`; index stale | Mac has the broadest configured cross-machine CASS map, but it is stale and older |
+| `mac-mini-old` | SSH timed out at `100.101.242.107:22` | Not mined |
+
+RCH-explicit candidate-file counts from the third-pass prefilter:
+
+| Machine/root group | RCH-relevant candidate files |
+| --- | ---: |
+| Local live stores (`~/.claude`, `~/.codex`, `~/.gemini`, rollout summaries) | 14,475 |
+| Local backup Claude store | 21,294 |
+| Local backup Codex store | 626 |
+| Local backup Gemini store | 523 |
+| `ts1` live stores | 3,836 |
+| `ts2` live stores | 3,277 |
+| `css` live stores | 884 |
+| `csd` live stores | 1,105 |
+| `mac-mini-max` live stores | 5,619 |
+
+These are file counts after filtering for explicit RCH markers such as `rch`, `remote compilation`, `remote_compilation_helper`, `target_rch`, `workers.toml`, `/tmp/rch`, `rchd`, `NoWorkers`, `telemetry_gap`, and `RCH_`. They are not line counts or incident counts. The important point is scale: the complete history surface is tens of thousands of files even before interpreting individual incidents.
+
+Third-pass evidence sharpened the diagnosis in these specific ways:
+
+1. CASS is useful but insufficient for RCH postmortems. Stale indexes, absent sources, and quarantined sessions are normal enough that the `$rch` skill should include a raw-history fallback query pack.
+2. RCH has no durable incident ledger that agents can query directly. Agents are reconstructing fleet state from session logs, `rch status`, `rch doctor`, `journalctl`, and ad hoc grep. RCH should write its own compact, append-only incident log with reason codes, worker eligibility transitions, selection refusals, fallback decisions, and recovery events.
+3. The "remote_ready but no admissible workers" state appears repeatedly. The product should not advertise readiness at one layer while selection refuses every worker at another layer without a single decisive explanation.
+4. `RCH_REQUIRE_REMOTE=1` and `RCH_FORCE_REMOTE=1` have become folk remedies. They help distinguish proof runs from convenience runs, but they do not solve the underlying need for reliable admission, queueing, and self-healing.
+5. The session history distinguishes host problems from RCH problems. Disk pressure, swap saturation, stuck `rustc`, and paused/unreachable VMIs are host/fleet issues; silent fallback, sticky pool shrinkage, poor eligibility explanation, target-dir sprawl, and missing auto-rejoin are RCH issues.
 
 ## Executive Summary
 
@@ -485,6 +531,16 @@ Second-pass local raw-session additions:
 
 12. Local memory and raw sessions independently show that agents have learned to use `RCH_REQUIRE_REMOTE=1` for proof runs, but the system still frequently falls back or blocks. That means "teach agents to require remote" is necessary but not sufficient; RCH itself must make remote unavailability explainable and recoverable.
 
+Third-pass local raw-session additions:
+
+13. The dedicated local RCH Claude stores (`-data-projects-remote-compilation-helper` and `-data-projects-remote_compilation_helper`) contain direct product-history evidence, not just downstream-user complaints. A `doctor.reliability.watch` tool output from session `77ba25db-...` reported 9 configured workers, 8 healthy workers, and 52/70 available slots while the overall verdict remained `Degraded`. That shows RCH can have many healthy-looking workers and still be in a degraded operational state that agents need to understand.
+
+14. The same RCH project history contains the already-closed epic "Deterministic Multi-Repo Remote Builds + Worker Self-Healing". Its description names the recurring field problems directly: local path dependencies fail on workers, workers accumulate disk pressure, and remote stuck processes degrade capacity. This is independent confirmation that the issues in this report are not isolated to one recent incident.
+
+15. Local RCH code-reading sessions repeatedly surfaced fail-open behavior in the hook: parse errors and other hook failures allow local execution. Fail-open is appropriate as a safety default, but session history shows it becomes harmful when agents treat local success as remote proof. RCH needs a separate "proof mode" where local fallback is impossible or at least unmistakably non-compliant.
+
+16. Local RCH documentation/bead history explicitly calls out user confusion around "why isn't this working?", hook silence, circuit breaker behavior, and understanding when commands are not offloaded. That UX problem is a product defect because the main consumers are agents that will otherwise keep working under a false assumption.
+
 ## ts1: `thinkstation1`
 
 Status:
@@ -536,6 +592,16 @@ Second-pass ts1 raw-session additions:
 
 9. `ts1` raw output also showed remote artifact retrieval of 55,823 files and only 914,945 bytes taking about 109.5 seconds. RCH's artifact cost model must account for file count and metadata overhead, not just byte volume.
 
+Third-pass ts1 raw-session additions:
+
+10. `ts1` rollout summaries include a stale `rch check` warning about `ts1` disk pressure while `rch status --workers --jobs` still reported remote-ready. This is another form of split-brain readiness: one surface says ready, another surface says pressured.
+
+11. `ts1` histories include a benchmark that silently fell back locally because RCH reported `no admissible workers`; a retry with `RCH_FORCE_REMOTE=1` produced the actual remote profile artifact. This shows why perf and proof workflows cannot trust default fail-open behavior.
+
+12. `ts1` histories also mention `no admissible workers: insufficient_slots=3,hard_preflight=4` and concurrent Cargo build-lock waits. That connects RCH admission failure directly to local lock contention.
+
+13. Several `ts1` proof lanes use `RCH_WORKER=ts1`, `RCH_VISIBILITY=summary`, and worker-scoped `CARGO_TARGET_DIR` values. That indicates users are compensating for selection uncertainty manually; RCH should expose the same intent as first-class CLI options and diagnostics.
+
 ## ts2: `thinkstation2`
 
 Status:
@@ -572,6 +638,16 @@ Findings from ts2 history and access behavior:
    - `rch-wkr` unreachable.
    - Worker busy but healthy.
    - Worker reachable but missing the requested crate path, toolchain, target, or runtime.
+
+Third-pass ts2 raw-session additions:
+
+7. `ts2` session summaries contain repeated strict remote-only attempts that failed before test output because both workers were reachable but rejected by critical disk pressure. The exact recurring shape is `no admissible workers: critical_pressure=2`.
+
+8. A `ts2` audit session states that capability refresh changed the pressure reason text but did not restore admissible workers. This means "refresh capabilities" is not enough; RCH needs an explicit repair or bypass path for admission pressure.
+
+9. Another `ts2` session reports `remote_ready` while both workers still had critical disk pressure or stale telemetry. This should be impossible as an unqualified status. RCH status should separate "daemon reachable" from "at least one worker admissible for this command".
+
+10. `ts2` histories show the correct agent behavior under strict proof requirements: record the refusal and avoid local fallback. RCH should make that the easy path by returning structured proof-failure output with the exact reason, not by depending on agent discipline.
 
 ## css: `superserver`
 
@@ -628,6 +704,16 @@ Second-pass css raw-session additions:
 
 10. css sessions also showed a degraded fleet status with 5/9 workers healthy, 86/102 slots available, low success rate, a degraded `ts2`, VMI telemetry unavailable, and advice to refresh capabilities. That is exactly the kind of state that needs a unified fleet-incident diagnosis.
 
+Third-pass css raw-session additions:
+
+11. css histories include strict remote proof commands using `RCH_REQUIRE_REMOTE=1`, `RCH_QUEUE_WHEN_BUSY=1`, and extended daemon wait timeouts. Agents are explicitly trying to use queue semantics, but the report surface still often collapses to "no admissible workers" or local fallback.
+
+12. css histories show `active_project_exclusion=2` as a selection blocker. RCH should distinguish "all workers globally bad" from "this project is excluded or saturated on otherwise healthy workers".
+
+13. css histories include fail-opened local lanes on registry/target-availability problems. That shows another class of non-worker host issue that RCH should preserve as a structured local-fallback reason instead of burying in cargo output.
+
+14. css histories use dedicated `CARGO_TARGET_DIR` paths under `/tmp/rch_target_*`, which validates the current best practice but also reinforces the need for RCH-managed target-dir lifecycle and cleanup.
+
 ## csd: `sensedemobox`
 
 Status:
@@ -656,6 +742,16 @@ Findings from csd history:
 4. RCH diagnostics should make it easy to compare a failing worker against a known-good worker such as csd: toolchain, paths, disk, version, user, SSH latency, telemetry freshness, preflight result, and canary result.
 
 5. csd's combination of raw local fallback, preflight failures, disk errors, VMI references, and manual disable/enable commands reinforces the same fleet-lifecycle issue seen everywhere else.
+
+Third-pass csd raw-session additions:
+
+6. csd histories include a `franken_node` one-bead workflow where the source work was complete but "remote proof is still the blocker." That is exactly the operational failure mode RCH should make actionable: the code may be ready, but proof cannot land until RCH explains and resolves admission.
+
+7. csd histories show agents reading the `$rch` skill specifically because commands were running locally, workers were unhealthy, hooks were silent, sync failed, disk was pressured, or SSH/daemon/telemetry recovery was needed. That means the operational skill is already the de facto front door for RCH failures.
+
+8. csd histories include panes blocked on `rch exec -- env RUSTUP_TOOLCHAIN=nightly cargo check ...`; the visible user-facing state was "blocked", not "RCH is repairing or queueing this". RCH should offer durable job IDs and reattachable status so panes do not become opaque blocked terminals.
+
+9. csd histories also show quoted explicit-exec misuse, such as `rch exec "cargo test --test ..."` inside spawned shells. The CLI should detect single-string command invocations and print the corrected `rch exec -- cargo test --test ...` form.
 
 ## mac-mini-max
 
@@ -728,6 +824,20 @@ Second-pass mac-mini-max raw-session additions:
 10. mac raw sessions show `rch exec "cargo check --all-targets"` being interpreted as a single binary name, followed by a correction to `rch exec -- cargo check --all-targets`. That is a CLI ergonomics problem; RCH should detect and explain quoted single-command misuse.
 
 11. mac raw sessions also show long multi-root syncs, worker-scoped `.rch-target-*` paths, and successful remote proof lanes. That matters because some RCH paths work; the design goal is not to abandon RCH, but to make the failing paths recover the same way the healthy remote paths do.
+
+Third-pass mac-mini-max raw-session additions:
+
+12. mac-mini-max has direct fleet-sweep sessions for the VMI build workers. One session tasked agents to inspect `vmi1149989`, `vmi1152480`, `vmi1153651`, and `vmi1156319`; another targeted `vmi1167313`, `vmi1227854`, `vmi1264463`, and `vmi1293453`. The sweep instructions explicitly called these "RCH build workers", collected disk/swap/PSI/version/service data, and warned that `rustc`/`cargo` on those hosts is normal. This confirms the VMI fleet is the real production worker layer, not background noise in the logs.
+
+13. mac-mini-max system-performance sessions show the host side of the same issue: local mac health reports included 95.3% swap usage, 98% root filesystem usage, and critical `/tmp`/cargo target cleanup pressure. When RCH fails open to a local machine in that condition, it can turn a remote-worker issue into local machine overload.
+
+14. mac-mini-max sessions show `ts2` described as wedged rather than merely busy: LAN ping worked, Tailscale ping had multi-second latency, and SSH banner exchange timed out because the userspace host could not fork a session handler. This is exactly the kind of state that should become temporary bypass plus periodic recovery probe, not sticky removal.
+
+15. mac-mini-max sessions show active remote build processes and `rsync` transfers against VMI workers, including `.rch-target-vmi...` paths and `/tmp/rch-cargo-home-vmi...` cargo homes. That supports both sides of the target-dir conclusion: per-job isolation is real and useful, but it must be managed because it creates cleanup and artifact-retrieval pressure.
+
+16. mac-mini-max sessions show cleanup of `rch-cargo-home` and build artifacts freeing space while active builds simultaneously consume more. RCH should account for active jobs before cleanup, reserve cleanup budgets, and expose "safe to reap" state rather than leaving agents to infer it from `lsof`, `ps`, and path names.
+
+17. mac-mini-max histories contain a wrong-architecture packaging example (`Mach-O 64-bit executable arm64`) alongside the earlier RCH worker `Exec format error` story. Fleet update tooling must verify the binary format on the remote host and for the exact remote user before switching worker binaries.
 
 ## mac-mini-old
 
@@ -834,6 +944,18 @@ Acceptance criteria:
 - Doctor detects and fixes stale hook, missing hook, wrong socket path, and daemon not running.
 - `doctor --fix` performs concrete remediations.
 
+### P0. Incident Ledger and Readiness Split
+
+RCH should record its own compact incident evidence instead of forcing agents to reconstruct incidents from stale CASS indexes and raw session logs.
+
+Acceptance criteria:
+
+- Append an incident event whenever a worker changes live eligibility, a selection run rejects all workers, a command falls back locally, a daemon/socket check fails, telemetry goes stale, a capability refresh changes a worker, or artifact retrieval misses expected outputs.
+- Every event includes a stable reason code, command fingerprint, worker id if applicable, project id, selected mode, and whether local fallback was allowed.
+- `rch status` separates daemon reachability, configured desired workers, live healthy workers, and command-admissible workers.
+- `remote_ready` is never shown without also stating whether at least one worker is admissible for the requested command shape.
+- `rch diagnose --json -- <command>` can replay the last relevant incident chain for that command and explain the decisive blocker.
+
 ### P0. OS/Arch-Aware Fleet Update
 
 Fix the Darwin-controller to Linux-worker deploy bug.
@@ -934,6 +1056,7 @@ Acceptance criteria:
 - Skills include a standard remote CASS query pack.
 - Skills teach `RCH_REQUIRE_REMOTE=1` for proof runs.
 - Skills teach raw-session fallback when `cass` is stale, absent, or misses tool output.
+- Skills teach the CASS source-state check: `cass sources list --json`, `cass health --json`, then raw `rg` over `~/.claude/projects`, `~/.codex/sessions`, `~/.gemini/tmp`, and backup stores when indexes are absent or stale.
 - Skills document wrong-architecture fleet update risk, wasm target checks, and volatile sync-file handling.
 
 ## Standard Query Pack Used
