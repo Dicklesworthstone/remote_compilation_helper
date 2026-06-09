@@ -396,3 +396,197 @@ fn e2e_docs_logging_integration() {
     assert_eq!(entries.len(), 1);
     assert!(entries[0].message.contains("requirements"));
 }
+
+// ===========================================================================
+// Tests: session-history remediation validation contract
+// ===========================================================================
+
+const SESSION_HISTORY_CONTRACT_PATH: &str = "docs/guides/session-history-remediation-validation.md";
+
+const REQUIRED_SESSION_HISTORY_REMEDIATION_BEADS: &[&str] = &[
+    "bd-session-history-remediation-ocv9i",
+    "bd-session-history-remediation-ocv9i.1",
+    "bd-session-history-remediation-ocv9i.1.1",
+    "bd-session-history-remediation-ocv9i.1.2",
+    "bd-session-history-remediation-ocv9i.1.3",
+    "bd-session-history-remediation-ocv9i.2",
+    "bd-session-history-remediation-ocv9i.2.1",
+    "bd-session-history-remediation-ocv9i.2.2",
+    "bd-session-history-remediation-ocv9i.3",
+    "bd-session-history-remediation-ocv9i.3.1",
+    "bd-session-history-remediation-ocv9i.3.2",
+    "bd-session-history-remediation-ocv9i.3.3",
+    "bd-session-history-remediation-ocv9i.4",
+    "bd-session-history-remediation-ocv9i.4.1",
+    "bd-session-history-remediation-ocv9i.4.2",
+    "bd-session-history-remediation-ocv9i.4.3",
+    "bd-session-history-remediation-ocv9i.5",
+    "bd-session-history-remediation-ocv9i.5.1",
+    "bd-session-history-remediation-ocv9i.5.2",
+    "bd-session-history-remediation-ocv9i.5.3",
+    "bd-session-history-remediation-ocv9i.5.4",
+    "bd-session-history-remediation-ocv9i.6",
+    "bd-session-history-remediation-ocv9i.6.1",
+    "bd-session-history-remediation-ocv9i.6.2",
+    "bd-session-history-remediation-ocv9i.6.3",
+    "bd-session-history-remediation-ocv9i.6.4",
+    "bd-session-history-remediation-ocv9i.7",
+    "bd-session-history-remediation-ocv9i.7.1",
+    "bd-session-history-remediation-ocv9i.7.2",
+    "bd-session-history-remediation-ocv9i.7.3",
+    "bd-session-history-remediation-ocv9i.7.4",
+    "bd-session-history-remediation-ocv9i.8",
+    "bd-session-history-remediation-ocv9i.8.1",
+    "bd-session-history-remediation-ocv9i.8.2",
+    "bd-session-history-remediation-ocv9i.8.3",
+    "bd-session-history-remediation-ocv9i.9",
+    "bd-session-history-remediation-ocv9i.9.1",
+    "bd-session-history-remediation-ocv9i.9.2",
+    "bd-session-history-remediation-ocv9i.9.3",
+    "bd-session-history-remediation-ocv9i.10",
+    "bd-session-history-remediation-ocv9i.10.1",
+    "bd-session-history-remediation-ocv9i.10.2",
+    "bd-session-history-remediation-ocv9i.10.3",
+    "bd-session-history-remediation-ocv9i.10.4",
+    "bd-session-history-remediation-ocv9i.11",
+    "bd-session-history-remediation-ocv9i.11.1",
+    "bd-session-history-remediation-ocv9i.11.2",
+    "bd-session-history-remediation-ocv9i.11.3",
+    "bd-session-history-remediation-ocv9i.11.4",
+    "bd-session-history-remediation-ocv9i.12",
+    "bd-session-history-remediation-ocv9i.12.1",
+    "bd-session-history-remediation-ocv9i.12.2",
+    "bd-session-history-remediation-ocv9i.12.3",
+    "bd-session-history-remediation-ocv9i.12.4",
+    "bd-session-history-remediation-ocv9i.13",
+    "bd-session-history-remediation-ocv9i.13.1",
+    "bd-session-history-remediation-ocv9i.13.2",
+    "bd-session-history-remediation-ocv9i.13.3",
+    "bd-session-history-remediation-ocv9i.13.4",
+    "bd-session-history-remediation-ocv9i.13.5",
+    "bd-session-history-remediation-ocv9i.14",
+    "bd-session-history-remediation-ocv9i.14.1",
+    "bd-session-history-remediation-ocv9i.14.2",
+    "bd-session-history-remediation-ocv9i.14.3",
+    "bd-session-history-remediation-ocv9i.14.4",
+    "bd-session-history-remediation-ocv9i.14.5",
+    "bd-session-history-remediation-ocv9i.15",
+    "bd-session-history-remediation-ocv9i.16",
+    "bd-session-history-remediation-ocv9i.16.1",
+    "bd-session-history-remediation-ocv9i.16.2",
+    "bd-session-history-remediation-ocv9i.16.3",
+    "bd-session-history-remediation-ocv9i.16.4",
+    "bd-session-history-remediation-ocv9i.16.5",
+    "bd-session-history-remediation-ocv9i.16.6",
+    "bd-session-history-remediation-ocv9i.16.7",
+    "bd-session-history-remediation-ocv9i.16.8",
+    "bd-session-history-remediation-ocv9i.17",
+    "bd-session-history-remediation-ocv9i.17.1",
+    "bd-session-history-remediation-ocv9i.17.2",
+    "bd-session-history-remediation-ocv9i.17.3",
+];
+
+fn repo_root() -> std::path::PathBuf {
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    manifest_dir.parent().unwrap_or(manifest_dir).to_path_buf()
+}
+
+fn read_session_history_contract() -> std::io::Result<String> {
+    let path = repo_root().join(SESSION_HISTORY_CONTRACT_PATH);
+    std::fs::read_to_string(path)
+}
+
+#[test]
+fn e2e_docs_session_history_contract_exists() {
+    let path = repo_root().join(SESSION_HISTORY_CONTRACT_PATH);
+    assert!(
+        path.exists(),
+        "session-history validation contract must exist at {}",
+        path.display()
+    );
+}
+
+#[test]
+fn e2e_docs_session_history_contract_covers_open_remediation_beads() -> std::io::Result<()> {
+    let contract = read_session_history_contract()?;
+    let missing: Vec<_> = REQUIRED_SESSION_HISTORY_REMEDIATION_BEADS
+        .iter()
+        .filter(|bead_id| !contract.contains(&format!("`{bead_id}`")))
+        .copied()
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "session-history validation contract is missing P0/P1/P2 bead mappings:\n{}",
+        missing.join("\n")
+    );
+    Ok(())
+}
+
+#[test]
+fn e2e_docs_session_history_contract_names_failure_classes_and_proof_fields() -> std::io::Result<()>
+{
+    let contract = read_session_history_contract()?;
+    let required_snippets = [
+        "no admissible workers",
+        "critical pressure",
+        "insufficient slots",
+        "hard preflight",
+        "active project exclusion",
+        "missing runtime/toolchain/Rust target",
+        "OS/arch mismatch",
+        "telemetry stale/age unknown",
+        "circuit open",
+        "daemon socket refused",
+        "local fallback",
+        "proof refusal",
+        "rsync vanished file",
+        "artifact miss",
+        "queue ambiguity",
+        "disk full",
+        "wrong user/path worker binary",
+        "unit tests",
+        "integration tests",
+        "E2E script scenario",
+        "fault injection",
+        "golden JSON/schema checks",
+        "performance budget checks",
+        "close-reason evidence",
+        "`run_id`",
+        "`bead_id`",
+        "`scenario`",
+        "`event`",
+        "`status`",
+        "`reason_code`",
+        "`worker_id`",
+        "`command_fingerprint`",
+        "`duration_ms`",
+        "`detail`",
+        "`RCH_WORKER`",
+        "`RCH_VISIBILITY`",
+        "`RCH_QUEUE_WHEN_BUSY`",
+        "`RCH_FORCE_REMOTE`",
+        "`RCH_REQUIRE_REMOTE`",
+        "`RCH_NO_SELF_HEALING`",
+        "wait timeout controls",
+        "`--worker`",
+        "`--all`",
+        "`--timeout`",
+        "worker-scoped target-dir diagnostics",
+        "registry/package-cache availability",
+        "target availability reason codes",
+    ];
+
+    let missing: Vec<_> = required_snippets
+        .iter()
+        .filter(|snippet| !contract.contains(**snippet))
+        .copied()
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "session-history validation contract is missing required snippets:\n{}",
+        missing.join("\n")
+    );
+    Ok(())
+}
