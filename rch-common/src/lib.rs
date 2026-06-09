@@ -9,6 +9,7 @@
 use std::sync::OnceLock;
 
 pub mod api;
+pub mod artifact_pattern;
 pub mod artifact_verify;
 pub mod binary_hash;
 pub mod capability_probe;
@@ -104,6 +105,9 @@ fn short_commit(commit: &str) -> &str {
         .map_or(commit, |(index, _)| &commit[..index])
 }
 
+pub use artifact_pattern::{
+    ArtifactPatternRewrite, ArtifactRetrievalDiagnostics, rewrite_artifact_pattern,
+};
 pub use artifact_verify::{
     ArtifactManifest, FileHash, VerificationFailure, VerificationResult, compute_file_hash,
     create_manifest, verify_artifacts,
