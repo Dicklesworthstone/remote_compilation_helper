@@ -29,6 +29,7 @@ pub mod path_topology;
 pub mod patterns;
 #[cfg(test)]
 mod patterns_security_test;
+pub mod proof_intent;
 #[cfg(test)]
 mod proptest_tests;
 pub mod protocol;
@@ -208,6 +209,11 @@ pub use incident::{
 };
 pub use incident_ledger::{
     IncidentFilter, IncidentLedger, IncidentLedgerConfig, LedgerReadStats, default_ledger_path,
+};
+pub use proof_intent::{
+    ProofIntent, ProofIntentStore, ReplayConstraints, ReplayContext, ReplayDecision,
+    SourceFingerprint, StaleSourcePolicy, derive_intent_id, proof_intent_schema,
+    proof_intent_schema_version, validate_replay,
 };
 pub use telemetry_explain::{
     ProbeOutcome, TelemetrySignals, TelemetryUnavailabilityReason, WhyUnhealthy,
