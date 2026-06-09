@@ -210,6 +210,67 @@ pub struct CapabilityRequirement {
     pub min_protocol: u32,
     /// Whether a working cargo is required.
     pub needs_cargo: bool,
+    /// Required host OS for the produced artifact (e.g. `linux`, `darwin`).
+    /// Matched case-insensitively against the worker's probed `os`.
+    pub needs_os: Option<String>,
+    /// Required host arch (e.g. `x86_64`, `aarch64`), matched case-insensitively.
+    pub needs_arch: Option<String>,
+    /// Whether a working `bun` runtime is required.
+    pub needs_bun: bool,
+    /// Whether a working `node` runtime is required.
+    pub needs_node: bool,
+    /// Specific rustup toolchains the build needs (prefix-matched against the
+    /// worker's installed toolchains, e.g. `nightly-2025-11-01` matches
+    /// `nightly-2025-11-01-x86_64-unknown-linux-gnu`).
+    pub needs_toolchains: Vec<String>,
+}
+
+impl CapabilityRequirement {
+    /// A bare Rust build requirement (cargo, given wire protocol).
+    #[must_use]
+    pub fn rust(min_protocol: u32) -> Self {
+        Self {
+            min_protocol,
+            needs_cargo: true,
+            ..Self::default()
+        }
+    }
+
+    /// Require these rustup targets (builder style).
+    #[must_use]
+    pub fn with_targets<I, S>(mut self, targets: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.needs_targets = targets.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Require a host OS (e.g. `linux` / `darwin`).
+    #[must_use]
+    pub fn with_os(mut self, os: impl Into<String>) -> Self {
+        self.needs_os = Some(os.into());
+        self
+    }
+
+    /// Require a host arch (e.g. `x86_64` / `aarch64`).
+    #[must_use]
+    pub fn with_arch(mut self, arch: impl Into<String>) -> Self {
+        self.needs_arch = Some(arch.into());
+        self
+    }
+
+    /// Require specific rustup toolchains (builder style).
+    #[must_use]
+    pub fn with_toolchains<I, S>(mut self, toolchains: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.needs_toolchains = toolchains.into_iter().map(Into::into).collect();
+        self
+    }
 }
 
 /// Outcome of an admissibility assessment. Reachability is the caller's concern
@@ -250,11 +311,55 @@ pub fn assess_admissibility(facts: &ProbedFacts, req: &CapabilityRequirement) ->
             ),
         };
     }
+    // Host OS/arch must match the required output triple — a worker that ran the
+    // probe fine can still produce the wrong-platform artifact.
+    if let Some(needed_os) = &req.needs_os {
+        let matches = facts
+            .os
+            .as_deref()
+            .is_some_and(|os| os.eq_ignore_ascii_case(needed_os));
+        if !matches {
+            return CapabilityVerdict::Rejected {
+                reason: IncidentReasonCode::OsArchMismatch,
+                detail: format!(
+                    "worker OS {} does not satisfy required {}",
+                    facts.os.as_deref().unwrap_or("<unknown>"),
+                    needed_os
+                ),
+            };
+        }
+    }
+    if let Some(needed_arch) = &req.needs_arch {
+        let matches = facts
+            .arch
+            .as_deref()
+            .is_some_and(|arch| arch.eq_ignore_ascii_case(needed_arch));
+        if !matches {
+            return CapabilityVerdict::Rejected {
+                reason: IncidentReasonCode::OsArchMismatch,
+                detail: format!(
+                    "worker arch {} does not satisfy required {}",
+                    facts.arch.as_deref().unwrap_or("<unknown>"),
+                    needed_arch
+                ),
+            };
+        }
+    }
     if req.needs_cargo && facts.rust.rustc_version.is_none() {
         return CapabilityVerdict::Rejected {
             reason: IncidentReasonCode::MissingRuntimeToolchainTarget,
             detail: "cargo/rust toolchain not found at the configured user/path".to_string(),
         };
+    }
+    for needed in &req.needs_toolchains {
+        // Prefix match: `nightly-2025-11-01` satisfies
+        // `nightly-2025-11-01-x86_64-unknown-linux-gnu`.
+        if !facts.rust.toolchains.iter().any(|t| t.starts_with(needed)) {
+            return CapabilityVerdict::Rejected {
+                reason: IncidentReasonCode::MissingRuntimeToolchainTarget,
+                detail: format!("missing rustup toolchain {needed}"),
+            };
+        }
     }
     for needed in &req.needs_targets {
         if !facts.rust.targets.iter().any(|t| t == needed) {
@@ -264,7 +369,115 @@ pub fn assess_admissibility(facts: &ProbedFacts, req: &CapabilityRequirement) ->
             };
         }
     }
+    if req.needs_bun && facts.runtimes.bun_version.is_none() {
+        return CapabilityVerdict::Rejected {
+            reason: IncidentReasonCode::MissingRuntimeToolchainTarget,
+            detail: "bun runtime not found at the configured user/path".to_string(),
+        };
+    }
+    if req.needs_node && facts.runtimes.node_version.is_none() {
+        return CapabilityVerdict::Rejected {
+            reason: IncidentReasonCode::MissingRuntimeToolchainTarget,
+            detail: "node runtime not found at the configured user/path".to_string(),
+        };
+    }
     CapabilityVerdict::Admissible
+}
+
+/// A worker's live admission state, separate from its (structural) capability.
+/// Capability says *can this worker ever run the command*; liveness says *is it
+/// usable right now*. Keeping them distinct is what lets selection report a
+/// missing-capability reason instead of conflating it with an unhealthy or busy
+/// worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkerLiveness {
+    /// The worker's capability facts are too stale to trust.
+    pub telemetry_stale: bool,
+    /// The worker is healthy (circuit closed, reachable).
+    pub healthy: bool,
+    /// The worker has at least one free build slot.
+    pub has_free_slot: bool,
+}
+
+impl WorkerLiveness {
+    /// A fresh, healthy, idle worker.
+    #[must_use]
+    pub fn ready() -> Self {
+        Self {
+            telemetry_stale: false,
+            healthy: true,
+            has_free_slot: true,
+        }
+    }
+}
+
+/// The distinct eligibility outcomes selection must tell apart, each with its
+/// own incident reason — so an agent learns *why* a worker was not chosen
+/// (missing capability vs unhealthy vs busy vs stale facts) rather than a single
+/// opaque "no admissible workers".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EligibilityVerdict {
+    /// Capable, fresh, healthy, and has a free slot.
+    Eligible,
+    /// The worker structurally cannot run this command.
+    MissingCapability {
+        reason: IncidentReasonCode,
+        detail: String,
+    },
+    /// Capability is unknowable because the facts are stale.
+    StaleTelemetry,
+    /// Capable but unhealthy (circuit open / unreachable).
+    Unhealthy,
+    /// Capable and healthy but at capacity right now.
+    Busy,
+}
+
+impl EligibilityVerdict {
+    /// The incident reason for this verdict (`None` when eligible).
+    #[must_use]
+    pub fn reason(&self) -> Option<IncidentReasonCode> {
+        match self {
+            EligibilityVerdict::Eligible => None,
+            EligibilityVerdict::MissingCapability { reason, .. } => Some(*reason),
+            EligibilityVerdict::StaleTelemetry => Some(IncidentReasonCode::TelemetryStale),
+            EligibilityVerdict::Unhealthy => Some(IncidentReasonCode::CircuitOpen),
+            EligibilityVerdict::Busy => Some(IncidentReasonCode::InsufficientSlots),
+        }
+    }
+
+    /// Whether the worker is eligible to run the command.
+    #[must_use]
+    pub fn is_eligible(&self) -> bool {
+        matches!(self, EligibilityVerdict::Eligible)
+    }
+}
+
+/// Assess a worker's full eligibility for a command, distinguishing missing
+/// capability from an unhealthy or busy worker. Pure and total.
+///
+/// Precedence: stale facts (can't trust capability) first; then a structural
+/// capability rejection (no point waiting for a slot it can never use); then
+/// health; then capacity. Capacity/health are transient, so they only matter
+/// once the worker is known capable on fresh facts.
+#[must_use]
+pub fn assess_worker_eligibility(
+    facts: &ProbedFacts,
+    req: &CapabilityRequirement,
+    liveness: &WorkerLiveness,
+) -> EligibilityVerdict {
+    if liveness.telemetry_stale {
+        return EligibilityVerdict::StaleTelemetry;
+    }
+    if let CapabilityVerdict::Rejected { reason, detail } = assess_admissibility(facts, req) {
+        return EligibilityVerdict::MissingCapability { reason, detail };
+    }
+    if !liveness.healthy {
+        return EligibilityVerdict::Unhealthy;
+    }
+    if !liveness.has_free_slot {
+        return EligibilityVerdict::Busy;
+    }
+    EligibilityVerdict::Eligible
 }
 
 #[cfg(test)]
@@ -341,6 +554,7 @@ mod tests {
             needs_targets: vec!["wasm32-unknown-unknown".to_string()],
             min_protocol: 3,
             needs_cargo: true,
+            ..CapabilityRequirement::default()
         }
     }
 
@@ -421,5 +635,164 @@ mod tests {
         assert_eq!(f, ProbedFacts::default());
         assert!(f.worker.is_none());
         assert!(f.os.is_none());
+    }
+
+    // --- 12.3: OS/arch, runtime, toolchain capability dimensions -----------
+
+    #[test]
+    fn os_mismatch_rejected_with_osarch_reason() {
+        // A linux worker cannot produce a darwin artifact.
+        let f = parse_capability_probe(good_output());
+        let req = CapabilityRequirement::rust(3).with_os("darwin");
+        match assess_admissibility(&f, &req) {
+            CapabilityVerdict::Rejected { reason, detail } => {
+                assert_eq!(reason, IncidentReasonCode::OsArchMismatch);
+                assert!(detail.contains("darwin"));
+            }
+            other => panic!("expected OS-mismatch rejection, got {other:?}"),
+        }
+        // The matching OS is admissible.
+        assert_eq!(
+            assess_admissibility(&f, &CapabilityRequirement::rust(3).with_os("linux")),
+            CapabilityVerdict::Admissible
+        );
+    }
+
+    #[test]
+    fn arch_mismatch_rejected_with_osarch_reason() {
+        let f = parse_capability_probe(good_output());
+        let req = CapabilityRequirement::rust(3).with_arch("aarch64");
+        match assess_admissibility(&f, &req) {
+            CapabilityVerdict::Rejected { reason, .. } => {
+                assert_eq!(reason, IncidentReasonCode::OsArchMismatch);
+            }
+            other => panic!("expected arch-mismatch rejection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_node_runtime_rejected() {
+        // good_output has bun but no node.
+        let f = parse_capability_probe(good_output());
+        let mut req = CapabilityRequirement::rust(3);
+        req.needs_node = true;
+        match assess_admissibility(&f, &req) {
+            CapabilityVerdict::Rejected { reason, detail } => {
+                assert_eq!(reason, IncidentReasonCode::MissingRuntimeToolchainTarget);
+                assert!(detail.contains("node"));
+            }
+            other => panic!("expected node rejection, got {other:?}"),
+        }
+        // bun IS present, so a bun requirement is admissible.
+        let mut bun_req = CapabilityRequirement::rust(3);
+        bun_req.needs_bun = true;
+        assert_eq!(
+            assess_admissibility(&f, &bun_req),
+            CapabilityVerdict::Admissible
+        );
+    }
+
+    #[test]
+    fn specific_toolchain_prefix_matched() {
+        let f = parse_capability_probe(good_output());
+        // Installed nightly-2026-05-22 satisfies the bare prefix.
+        let ok = CapabilityRequirement::rust(3).with_toolchains(["nightly-2026-05-22"]);
+        assert_eq!(assess_admissibility(&f, &ok), CapabilityVerdict::Admissible);
+        // A different pinned nightly is missing.
+        let missing = CapabilityRequirement::rust(3).with_toolchains(["nightly-2025-01-01"]);
+        match assess_admissibility(&f, &missing) {
+            CapabilityVerdict::Rejected { reason, detail } => {
+                assert_eq!(reason, IncidentReasonCode::MissingRuntimeToolchainTarget);
+                assert!(detail.contains("nightly-2025-01-01"));
+            }
+            other => panic!("expected toolchain rejection, got {other:?}"),
+        }
+    }
+
+    // --- 12.3: eligibility distinguishes missing-capability / unhealthy /
+    //           busy / stale ------------------------------------------------
+
+    #[test]
+    fn eligible_when_capable_fresh_healthy_idle() {
+        let f = parse_capability_probe(good_output());
+        let v = assess_worker_eligibility(&f, &req_wasm(), &WorkerLiveness::ready());
+        assert_eq!(v, EligibilityVerdict::Eligible);
+        assert!(v.is_eligible());
+        assert_eq!(v.reason(), None);
+    }
+
+    #[test]
+    fn no_worker_with_runtime_is_missing_capability_not_busy() {
+        // A worker without cargo, even if idle+healthy, is missing-capability —
+        // distinct from a busy or unhealthy worker.
+        let out = "RCH_FACT os=linux\nRCH_FACT arch=x86_64\n\
+                   RCH_FACT worker_version=1.0.41\nRCH_FACT worker_protocol=3\n";
+        let f = parse_capability_probe(out);
+        let v = assess_worker_eligibility(&f, &req_wasm(), &WorkerLiveness::ready());
+        assert_eq!(v.reason(), Some(IncidentReasonCode::MissingRuntimeToolchainTarget));
+        assert!(matches!(v, EligibilityVerdict::MissingCapability { .. }));
+    }
+
+    #[test]
+    fn os_arch_mismatch_surfaces_as_missing_capability() {
+        let f = parse_capability_probe(good_output());
+        let req = CapabilityRequirement::rust(3).with_os("darwin");
+        let v = assess_worker_eligibility(&f, &req, &WorkerLiveness::ready());
+        assert_eq!(v.reason(), Some(IncidentReasonCode::OsArchMismatch));
+    }
+
+    #[test]
+    fn unhealthy_and_busy_are_distinct_from_missing_capability() {
+        let f = parse_capability_probe(good_output());
+        // Capable but circuit-open => Unhealthy.
+        let unhealthy = WorkerLiveness {
+            telemetry_stale: false,
+            healthy: false,
+            has_free_slot: true,
+        };
+        assert_eq!(
+            assess_worker_eligibility(&f, &req_wasm(), &unhealthy).reason(),
+            Some(IncidentReasonCode::CircuitOpen)
+        );
+        // Capable + healthy but no slot => Busy.
+        let busy = WorkerLiveness {
+            telemetry_stale: false,
+            healthy: true,
+            has_free_slot: false,
+        };
+        assert_eq!(
+            assess_worker_eligibility(&f, &req_wasm(), &busy).reason(),
+            Some(IncidentReasonCode::InsufficientSlots)
+        );
+    }
+
+    #[test]
+    fn stale_capability_cache_is_distinct_reason() {
+        let f = parse_capability_probe(good_output());
+        let stale = WorkerLiveness {
+            telemetry_stale: true,
+            healthy: true,
+            has_free_slot: true,
+        };
+        let v = assess_worker_eligibility(&f, &req_wasm(), &stale);
+        assert_eq!(v, EligibilityVerdict::StaleTelemetry);
+        assert_eq!(v.reason(), Some(IncidentReasonCode::TelemetryStale));
+    }
+
+    #[test]
+    fn capability_refresh_changes_eligibility() {
+        // Before refresh: worker lacks the wasm target => missing capability.
+        let before = parse_capability_probe(
+            "RCH_FACT os=linux\nRCH_FACT arch=x86_64\n\
+             RCH_FACT worker_version=1.0.41\nRCH_FACT worker_protocol=3\n\
+             RCH_FACT cargo_version=cargo 1.98\nRCH_FACT target=x86_64-unknown-linux-gnu\n",
+        );
+        let v_before = assess_worker_eligibility(&before, &req_wasm(), &WorkerLiveness::ready());
+        assert!(matches!(v_before, EligibilityVerdict::MissingCapability { .. }));
+
+        // After refresh: the wasm target was installed => now eligible.
+        let after = parse_capability_probe(good_output());
+        let v_after = assess_worker_eligibility(&after, &req_wasm(), &WorkerLiveness::ready());
+        assert_eq!(v_after, EligibilityVerdict::Eligible);
     }
 }

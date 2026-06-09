@@ -235,8 +235,9 @@ pub use ui::{
 
 // Incident schema re-exports
 pub use capability_probe::{
-    CapabilityRequirement, CapabilityVerdict, ProbeSpec, ProbedFacts, assess_admissibility,
-    build_capability_probe_script, parse_capability_probe,
+    CapabilityRequirement, CapabilityVerdict, EligibilityVerdict, ProbeSpec, ProbedFacts,
+    WorkerLiveness, assess_admissibility, assess_worker_eligibility, build_capability_probe_script,
+    parse_capability_probe,
 };
 pub use incident::{
     ControlState, IncidentEvent, IncidentEventType, IncidentReasonCode, IncidentSource,
