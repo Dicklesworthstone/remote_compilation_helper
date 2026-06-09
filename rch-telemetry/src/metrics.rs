@@ -14,8 +14,10 @@ use tracing::{Event, Subscriber};
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::Context;
 
-const DEFAULT_HISTOGRAM_BUCKETS: &[f64] = &[0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0];
-const HOOK_HISTOGRAM_BUCKETS: &[f64] = &[0.0001, 0.0005, 0.001, 0.002, 0.005, 0.01, 0.025, 0.05];
+pub(crate) const DEFAULT_HISTOGRAM_BUCKETS: &[f64] =
+    &[0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0];
+pub(crate) const HOOK_HISTOGRAM_BUCKETS: &[f64] =
+    &[0.0001, 0.0005, 0.001, 0.002, 0.005, 0.01, 0.025, 0.05];
 const MAX_TRACKED_REQUESTS: usize = 1024;
 
 const VERDICT_LABELS: &[&str] = &["healthy", "degraded", "failing", "unknown"];
@@ -237,6 +239,11 @@ pub struct Metrics {
     pub hook_autostart_lock_total: CounterVec,
     /// Entrypoint request durations in seconds.
     pub request_duration_seconds: HistogramVec,
+    /// Optional OTLP mirror. When present, every record/observe call is also
+    /// forwarded to OpenTelemetry instruments carrying the same (already
+    /// normalized) labels, so a configured OTLP collector receives identical
+    /// signals to the Prometheus exposition. `None` = Prometheus-only.
+    otel: Option<crate::otlp::OtelMetrics>,
 }
 
 impl Metrics {
@@ -312,7 +319,23 @@ impl Metrics {
                 DEFAULT_HISTOGRAM_BUCKETS,
                 &["entrypoint"],
             )?,
+            otel: None,
         })
+    }
+
+    /// Attach an OTLP mirror so subsequent record/observe calls also export via
+    /// OpenTelemetry. Replaces any previously attached mirror; pass the value
+    /// returned by [`crate::otlp::OtelMetrics::from_env`].
+    #[must_use]
+    pub fn with_otel(mut self, otel: Option<crate::otlp::OtelMetrics>) -> Self {
+        self.otel = otel;
+        self
+    }
+
+    /// Whether an OTLP mirror is currently attached.
+    #[must_use]
+    pub fn otel_enabled(&self) -> bool {
+        self.otel.is_some()
     }
 
     /// Create and register metrics in the global Prometheus default registry.
@@ -359,94 +382,148 @@ impl Metrics {
 
     /// Increment `rch_doctor_verdict_total`.
     pub fn record_doctor_verdict(&self, verdict: &str, scope: &str) {
+        let (verdict, scope) = (normalize_verdict(verdict), normalize_scope(scope));
         self.doctor_verdict_total
-            .with_label_values(&[normalize_verdict(verdict), normalize_scope(scope)])
+            .with_label_values(&[verdict, scope])
             .inc();
+        if let Some(otel) = &self.otel {
+            otel.record_doctor_verdict(verdict, scope);
+        }
     }
 
     /// Observe `rch_doctor_probe_duration_seconds`.
     pub fn observe_doctor_probe_duration(&self, probe: &str, result: &str, seconds: f64) {
+        let (probe, result) = (normalize_probe(probe), normalize_probe_result(result));
+        let seconds = sanitize_duration(seconds);
         self.doctor_probe_duration_seconds
-            .with_label_values(&[normalize_probe(probe), normalize_probe_result(result)])
-            .observe(sanitize_duration(seconds));
+            .with_label_values(&[probe, result])
+            .observe(seconds);
+        if let Some(otel) = &self.otel {
+            otel.observe_doctor_probe_duration(probe, result, seconds);
+        }
     }
 
     /// Increment `rch_doctor_diagnostic_total`.
     pub fn record_doctor_diagnostic(&self, code: &str, severity: &str) {
+        let (code, severity) = (normalize_code(code), normalize_severity(severity));
         self.doctor_diagnostic_total
-            .with_label_values(&[normalize_code(code), normalize_severity(severity)])
+            .with_label_values(&[code, severity])
             .inc();
+        if let Some(otel) = &self.otel {
+            otel.record_doctor_diagnostic(code, severity);
+        }
     }
 
     /// Increment `rch_doctor_fix_steps_total`.
     pub fn record_doctor_fix_step(&self, outcome: &str) {
+        let outcome = normalize_fix_outcome(outcome);
         self.doctor_fix_steps_total
-            .with_label_values(&[normalize_fix_outcome(outcome)])
+            .with_label_values(&[outcome])
             .inc();
+        if let Some(otel) = &self.otel {
+            otel.record_doctor_fix_step(outcome);
+        }
     }
 
     /// Observe `rch_doctor_fix_duration_seconds`.
     pub fn observe_doctor_fix_duration(&self, outcome: &str, seconds: f64) {
+        let outcome = normalize_fix_outcome(outcome);
+        let seconds = sanitize_duration(seconds);
         self.doctor_fix_duration_seconds
-            .with_label_values(&[normalize_fix_outcome(outcome)])
-            .observe(sanitize_duration(seconds));
+            .with_label_values(&[outcome])
+            .observe(seconds);
+        if let Some(otel) = &self.otel {
+            otel.observe_doctor_fix_duration(outcome, seconds);
+        }
     }
 
     /// Increment `rch_doctor_daemon_unreachable_total`.
     pub fn record_doctor_daemon_unreachable(&self) {
         self.doctor_daemon_unreachable_total.inc();
+        if let Some(otel) = &self.otel {
+            otel.record_doctor_daemon_unreachable();
+        }
     }
 
     /// Increment `rch_hook_invocations_total`.
     pub fn record_hook_invocation(&self, outcome: &str) {
+        let outcome = normalize_hook_outcome(outcome);
         self.hook_invocations_total
-            .with_label_values(&[normalize_hook_outcome(outcome)])
+            .with_label_values(&[outcome])
             .inc();
+        if let Some(otel) = &self.otel {
+            otel.record_hook_invocation(outcome);
+        }
     }
 
     /// Observe `rch_hook_duration_seconds`.
     pub fn observe_hook_duration(&self, outcome: &str, seconds: f64) {
+        let outcome = normalize_hook_outcome(outcome);
+        let seconds = sanitize_duration(seconds);
         self.hook_duration_seconds
-            .with_label_values(&[normalize_hook_outcome(outcome)])
-            .observe(sanitize_duration(seconds));
+            .with_label_values(&[outcome])
+            .observe(seconds);
+        if let Some(otel) = &self.otel {
+            otel.observe_hook_duration(outcome, seconds);
+        }
     }
 
     /// Observe `rch_hook_classify_duration_seconds`.
     pub fn observe_hook_classify_duration(&self, kind: &str, seconds: f64) {
+        let kind = normalize_classify_kind(kind);
+        let seconds = sanitize_duration(seconds);
         self.hook_classify_duration_seconds
-            .with_label_values(&[normalize_classify_kind(kind)])
-            .observe(sanitize_duration(seconds));
+            .with_label_values(&[kind])
+            .observe(seconds);
+        if let Some(otel) = &self.otel {
+            otel.observe_hook_classify_duration(kind, seconds);
+        }
     }
 
     /// Increment `rch_hook_config_cache_total`.
     pub fn record_hook_config_cache(&self, result: &str, reason: &str) {
+        let (result, reason) = (
+            normalize_config_cache_result(result),
+            normalize_config_cache_reason(reason),
+        );
         self.hook_config_cache_total
-            .with_label_values(&[
-                normalize_config_cache_result(result),
-                normalize_config_cache_reason(reason),
-            ])
+            .with_label_values(&[result, reason])
             .inc();
+        if let Some(otel) = &self.otel {
+            otel.record_hook_config_cache(result, reason);
+        }
     }
 
     /// Increment `rch_hook_fail_open_total`.
     pub fn record_hook_fail_open(&self, reason: &str) {
-        self.hook_fail_open_total
-            .with_label_values(&[normalize_fail_open_reason(reason)])
-            .inc();
+        let reason = normalize_fail_open_reason(reason);
+        self.hook_fail_open_total.with_label_values(&[reason]).inc();
+        if let Some(otel) = &self.otel {
+            otel.record_hook_fail_open(reason);
+        }
     }
 
     /// Increment `rch_hook_autostart_lock_total`.
     pub fn record_hook_autostart_lock(&self, outcome: &str) {
+        let outcome = normalize_autostart_lock_outcome(outcome);
         self.hook_autostart_lock_total
-            .with_label_values(&[normalize_autostart_lock_outcome(outcome)])
+            .with_label_values(&[outcome])
             .inc();
+        if let Some(otel) = &self.otel {
+            otel.record_hook_autostart_lock(outcome);
+        }
     }
 
     /// Observe `rch_request_duration_seconds`.
     pub fn observe_request_duration(&self, entrypoint: &str, seconds: f64) {
+        let entrypoint = normalize_entrypoint(entrypoint);
+        let seconds = sanitize_duration(seconds);
         self.request_duration_seconds
-            .with_label_values(&[normalize_entrypoint(entrypoint)])
-            .observe(sanitize_duration(seconds));
+            .with_label_values(&[entrypoint])
+            .observe(seconds);
+        if let Some(otel) = &self.otel {
+            otel.observe_request_duration(entrypoint, seconds);
+        }
     }
 }
 

@@ -119,6 +119,33 @@ Available metrics:
 - `rch_transfer_bytes_total{direction}` - Bytes transferred
 - `rch_circuit_state{worker, state}` - Circuit breaker states
 
+### OpenTelemetry (OTLP) Export
+
+The doctor/hook event metrics (`rch_doctor_*`, `rch_hook_*`,
+`rch_request_duration_seconds`) are mirrored to an OpenTelemetry collector
+over OTLP/gRPC when enabled. The Prometheus inventory remains the single
+source of truth — OTLP carries the *same* metric names and labels, so both
+exposition surfaces can run simultaneously.
+
+Enable it with environment variables (no config-file change needed):
+
+```bash
+export RCH_OTEL_ENABLED=1
+# Preferred RCH-specific endpoint var; falls back to the OTel standard
+# OTEL_EXPORTER_OTLP_ENDPOINT if unset.
+export RCH_OTEL_EXPORTER_OTLP_ENDPOINT="http://localhost:4317"
+export OTEL_SERVICE_NAME="rch"               # resource service.name (default: rch)
+export RCH_OTEL_EXPORT_INTERVAL_SECS=30      # periodic push cadence (default: 30)
+```
+
+Behavior:
+- Export activates only when **both** `RCH_OTEL_ENABLED` is truthy **and** an
+  endpoint is set. Otherwise the pipeline stays off (Prometheus-only).
+- Fail-open: if the exporter cannot be built (bad endpoint, missing runtime),
+  RCH logs `otlp.exporter.build_failed` and continues with Prometheus only.
+- Histogram bucket boundaries match the Prometheus definitions
+  (hook hot-path buckets stay sub-millisecond).
+
 ### StatsD/DataDog
 
 ```toml

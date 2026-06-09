@@ -23,6 +23,11 @@ fastrand = "2.4.1"
 shellexpand = "3.1.1"
 rch-common = { workspace = true }
 prometheus = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+# `grpc-tonic` enables the OTLP/gRPC transport (`with_tonic`); the bead targets
+# OTLP gRPC export. Member-level features are additive to the workspace set.
+opentelemetry-otlp = { workspace = true, features = ["grpc-tonic"] }
 rusqlite = { version = "0.39.0", features = ["bundled"], optional = true }
 
 [features]
@@ -31,6 +36,8 @@ storage = ["dep:rusqlite"]
 
 [dev-dependencies]
 proptest = "1.11.0"
+# In-memory metric exporter for deterministic OTLP-instrument tests (no network).
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
 
 [lints.rust]
 unsafe_code = "deny"

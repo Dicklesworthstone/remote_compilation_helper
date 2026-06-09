@@ -14,6 +14,7 @@
 pub mod benchmarks;
 pub mod collect;
 pub mod metrics;
+pub mod otlp;
 pub mod protocol;
 pub mod speedscore;
 #[cfg(feature = "storage")]
