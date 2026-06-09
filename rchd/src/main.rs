@@ -31,6 +31,7 @@ mod repo_convergence;
 mod selection;
 mod self_test;
 mod stale_target_reap;
+mod startup_consistency;
 mod telemetry;
 mod ui;
 mod workers;
@@ -451,6 +452,18 @@ async fn main() -> Result<()> {
             cfg
         }
     };
+
+    // Startup self-consistency check (bd-...-3.2): verify the daemon's bound
+    // socket, the hook/CLI's configured socket, and the installed Claude Code
+    // hook agree, reporting any drift as structured events. Read-only — it
+    // never rewrites operator-owned config.
+    {
+        let hook_config_socket = {
+            let configured = rch_config.general.socket_path.trim();
+            (!configured.is_empty()).then(|| PathBuf::from(configured))
+        };
+        let _ = startup_consistency::gather_and_log(cli.socket.clone(), hook_config_socket);
+    }
 
     // Initialize worker selector
     let worker_selector = Arc::new(WorkerSelector::with_config(
