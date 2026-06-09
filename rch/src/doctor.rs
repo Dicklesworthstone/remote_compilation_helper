@@ -1102,6 +1102,18 @@ async fn collect_reliability_response_once(options: &DoctorOptions) -> Reliabili
         diagnostics.extend(reliability_rollout_posture_diagnostics(
             config_load.as_ref().map(|c| *c).map_err(|e| e.as_str()),
         ));
+        // Hook/socket drift diagnostics (bd-...-3.3): does the rch PreToolUse
+        // hook exist, and does the configured socket match the canonical
+        // daemon socket? Read-only probe of the real settings file.
+        let config_socket = config_load
+            .as_ref()
+            .ok()
+            .map(|cfg| cfg.general.socket_path.as_str());
+        diagnostics.extend(reliability_hook_consistency_diagnostics(
+            rch_common::hooks::installed_rch_hook_command().as_deref(),
+            config_socket,
+            &rch_common::default_socket_path(),
+        ));
     }
     if scope.runs_schema_probe(options.check_schemas) {
         diagnostics.extend(reliability_schema_compatibility_diagnostics());
@@ -2692,6 +2704,90 @@ fn reliability_rollout_posture_diagnostics(
         "Disk-pressure fields are wired into worker status",
         ReliabilityReasonCode::DiskPressureSurfaceAvailable,
     ));
+
+    diagnostics
+}
+
+/// Hook/socket drift diagnostics (bd-session-history-remediation-ocv9i.3.3).
+///
+/// Detects the two silent-fallback drift modes from session history and emits
+/// remediation steps the `--fix` executor surfaces with machine-readable
+/// outcomes:
+/// - the Claude Code PreToolUse `rch` hook is missing (builds never offload);
+/// - the configured `general.socket_path` diverges from the canonical daemon
+///   socket (the hook cannot reach the daemon).
+///
+/// Pure over its inputs so it can be exercised against fixtures rather than the
+/// real `~/.claude/settings.json`. Both remediations are operator actions
+/// (hook install, socket realignment) — they are deliberately NOT auto-applied
+/// by `--fix`, which only flips idempotent self-healing config; they surface as
+/// `Manual` outcomes with the exact command.
+fn reliability_hook_consistency_diagnostics(
+    installed_hook_command: Option<&str>,
+    config_socket: Option<&str>,
+    canonical_socket: &str,
+) -> Vec<ReliabilityDiagnostic> {
+    let mut diagnostics = Vec::new();
+
+    match installed_hook_command {
+        Some(cmd) => diagnostics.push(
+            ReliabilityDiagnostic::new(
+                ReliabilityCategory::RolloutPosture,
+                "hook_installed",
+                ReliabilitySeverity::Pass,
+                "Claude Code PreToolUse rch hook is installed",
+                ReliabilityReasonCode::HookInstalled,
+            )
+            .with_details(format!("hook command: {cmd}")),
+        ),
+        None => diagnostics.push(
+            ReliabilityDiagnostic::new(
+                ReliabilityCategory::RolloutPosture,
+                "hook_installed",
+                ReliabilitySeverity::Warning,
+                "Claude Code PreToolUse rch hook is missing; builds will not offload",
+                ReliabilityReasonCode::HookNotInstalled,
+            )
+            .with_remediation("rch hook install", "rch hook status --json"),
+        ),
+    }
+
+    // Socket consistency: the hook/CLI reaches the daemon at the configured
+    // socket; if that diverges from the canonical socket the daemon binds by
+    // default, the hook silently misses the daemon. An explicitly-matching or
+    // absent (=> canonical) config is consistent.
+    let socket_consistent = match config_socket {
+        None => true,
+        Some(configured) => configured.trim() == canonical_socket,
+    };
+    if socket_consistent {
+        diagnostics.push(ReliabilityDiagnostic::new(
+            ReliabilityCategory::RolloutPosture,
+            "socket_path",
+            ReliabilitySeverity::Pass,
+            "Configured socket path matches the canonical daemon socket",
+            ReliabilityReasonCode::SocketPathConsistent,
+        ));
+    } else {
+        let configured = config_socket.unwrap_or("").trim();
+        diagnostics.push(
+            ReliabilityDiagnostic::new(
+                ReliabilityCategory::RolloutPosture,
+                "socket_path",
+                ReliabilitySeverity::Warning,
+                "Configured socket path diverges from the canonical daemon socket; \
+                the hook may not reach the daemon",
+                ReliabilityReasonCode::SocketPathMismatch,
+            )
+            .with_details(format!(
+                "configured={configured}, canonical={canonical_socket}"
+            ))
+            .with_remediation(
+                format!("rch config set general.socket_path {canonical_socket}"),
+                "rch doctor --reliability --json",
+            ),
+        );
+    }
 
     diagnostics
 }
@@ -5101,6 +5197,82 @@ mod tests {
             reliability_severity_token(ReliabilitySeverity::Critical),
             "critical"
         );
+    }
+
+    #[test]
+    fn hook_consistency_pass_when_hook_present_and_socket_matches() {
+        let diags = reliability_hook_consistency_diagnostics(
+            Some("/usr/local/bin/rch"),
+            Some("/home/u/.cache/rch/rch.sock"),
+            "/home/u/.cache/rch/rch.sock",
+        );
+        let hook = diags
+            .iter()
+            .find(|d| d.check_name == "hook_installed")
+            .unwrap();
+        assert_eq!(hook.severity, ReliabilitySeverity::Pass);
+        assert_eq!(hook.code, ReliabilityReasonCode::HookInstalled);
+        let socket = diags
+            .iter()
+            .find(|d| d.check_name == "socket_path")
+            .unwrap();
+        assert_eq!(socket.severity, ReliabilitySeverity::Pass);
+        assert_eq!(socket.code, ReliabilityReasonCode::SocketPathConsistent);
+    }
+
+    #[test]
+    fn hook_consistency_warns_with_remediation_when_hook_missing() {
+        let diags = reliability_hook_consistency_diagnostics(None, None, "/c/rch.sock");
+        let hook = diags
+            .iter()
+            .find(|d| d.check_name == "hook_installed")
+            .unwrap();
+        assert_eq!(hook.severity, ReliabilitySeverity::Warning);
+        assert_eq!(hook.code, ReliabilityReasonCode::HookNotInstalled);
+        assert_eq!(
+            hook.remediation_command.as_deref(),
+            Some("rch hook install")
+        );
+        // Absent config socket defaults to canonical => consistent.
+        let socket = diags
+            .iter()
+            .find(|d| d.check_name == "socket_path")
+            .unwrap();
+        assert_eq!(socket.code, ReliabilityReasonCode::SocketPathConsistent);
+    }
+
+    #[test]
+    fn hook_consistency_warns_on_socket_mismatch_with_realign_remediation() {
+        let diags = reliability_hook_consistency_diagnostics(
+            Some("rch"),
+            Some("/tmp/custom.sock"),
+            "/home/u/.cache/rch/rch.sock",
+        );
+        let socket = diags
+            .iter()
+            .find(|d| d.check_name == "socket_path")
+            .unwrap();
+        assert_eq!(socket.severity, ReliabilitySeverity::Warning);
+        assert_eq!(socket.code, ReliabilityReasonCode::SocketPathMismatch);
+        assert_eq!(
+            socket.remediation_command.as_deref(),
+            Some("rch config set general.socket_path /home/u/.cache/rch/rch.sock")
+        );
+    }
+
+    #[test]
+    fn hook_consistency_steps_are_manual_not_auto_fixable() {
+        // Hook-install and socket-realign are operator actions: they must NOT
+        // be auto-applied by --fix (which only flips idempotent self-healing
+        // config); they surface as remediation-plan steps that are not
+        // auto-fixable.
+        assert!(auto_config_flip(ReliabilityReasonCode::HookNotInstalled).is_none());
+        assert!(auto_config_flip(ReliabilityReasonCode::SocketPathMismatch).is_none());
+        let diags =
+            reliability_hook_consistency_diagnostics(None, Some("/tmp/x.sock"), "/c/rch.sock");
+        let plan = build_reliability_remediation_plan(&diags);
+        assert_eq!(plan.len(), 2, "both warnings become remediation steps");
+        assert!(plan.iter().all(|s| !s.auto_fixable));
     }
 
     #[test]

@@ -171,6 +171,15 @@ pub enum ReliabilityReasonCode {
     RepoConvergenceSurfaceAvailable,
     /// Disk-pressure fields are wired into worker status (Pass).
     DiskPressureSurfaceAvailable,
+    /// The Claude Code PreToolUse `rch` hook is installed (Pass).
+    HookInstalled,
+    /// The Claude Code PreToolUse `rch` hook is missing; builds will not offload.
+    HookNotInstalled,
+    /// The hook/CLI socket path matches the canonical daemon socket (Pass).
+    SocketPathConsistent,
+    /// The configured socket path diverges from the canonical daemon socket;
+    /// the hook may not reach the daemon.
+    SocketPathMismatch,
 
     // ---- SchemaCompatibility (R600-R699) ----
     /// Schema versions are compatible (Pass).
@@ -228,6 +237,10 @@ impl ReliabilityReasonCode {
             Self::StatusSurfaceAvailable => "StatusSurfaceAvailable",
             Self::RepoConvergenceSurfaceAvailable => "RepoConvergenceSurfaceAvailable",
             Self::DiskPressureSurfaceAvailable => "DiskPressureSurfaceAvailable",
+            Self::HookInstalled => "HookInstalled",
+            Self::HookNotInstalled => "HookNotInstalled",
+            Self::SocketPathConsistent => "SocketPathConsistent",
+            Self::SocketPathMismatch => "SocketPathMismatch",
             Self::SchemaCompatible => "SchemaCompatible",
             Self::SchemaIncompatible => "SchemaIncompatible",
         }
@@ -290,6 +303,10 @@ impl ReliabilityReasonCode {
             Self::StatusSurfaceAvailable => "RCH-R505",
             Self::RepoConvergenceSurfaceAvailable => "RCH-R506",
             Self::DiskPressureSurfaceAvailable => "RCH-R507",
+            Self::HookInstalled => "RCH-R508",
+            Self::HookNotInstalled => "RCH-R509",
+            Self::SocketPathConsistent => "RCH-R510",
+            Self::SocketPathMismatch => "RCH-R511",
 
             // R600-R699 — SchemaCompatibility
             Self::SchemaCompatible => "RCH-R600",
@@ -348,7 +365,11 @@ impl ReliabilityReasonCode {
             | Self::ConfigLoadFailed
             | Self::StatusSurfaceAvailable
             | Self::RepoConvergenceSurfaceAvailable
-            | Self::DiskPressureSurfaceAvailable => C::RolloutPosture,
+            | Self::DiskPressureSurfaceAvailable
+            | Self::HookInstalled
+            | Self::HookNotInstalled
+            | Self::SocketPathConsistent
+            | Self::SocketPathMismatch => C::RolloutPosture,
 
             Self::SchemaCompatible | Self::SchemaIncompatible => C::SchemaCompatibility,
         }
@@ -418,6 +439,10 @@ impl ReliabilityReasonCode {
             Self::StatusSurfaceAvailable
             | Self::RepoConvergenceSurfaceAvailable
             | Self::DiskPressureSurfaceAvailable => false,
+            // Installing the hook / fixing the socket path takes effect on the
+            // next hook invocation; no daemon restart needed.
+            Self::HookInstalled | Self::SocketPathConsistent => false,
+            Self::HookNotInstalled | Self::SocketPathMismatch => false,
 
             // Schema versions are pinned at compile/bind time; mismatch
             // requires a fresh process.
@@ -471,7 +496,7 @@ impl ReliabilityReasonCode {
                 // Telemetry ingest is daemon-driven; no `rch workers ...`
                 // subcommand calls TelemetryStore::ingest(). Pointing agents
                 // at `workers probe` was confident-wrong (issue #16).
-                "Telemetry refresh is automatic; wait for the next poll, or run `rch daemon restart` to force a fresh poll cycle."
+                "Telemetry refresh is automatic; wait for the next daemon poll cycle (telemetry ingest is daemon-driven, not an `rch workers` action)."
             }
             Self::DiskPressureNoWorkers => "No action needed.",
             Self::ProcessDebtUnavailable => "Start the daemon with `rch daemon start` and retry.",
@@ -508,6 +533,13 @@ impl ReliabilityReasonCode {
             Self::StatusSurfaceAvailable
             | Self::RepoConvergenceSurfaceAvailable
             | Self::DiskPressureSurfaceAvailable => "No action needed.",
+            Self::HookInstalled | Self::SocketPathConsistent => "No action needed.",
+            Self::HookNotInstalled => "Install the hook with `rch hook install`.",
+            Self::SocketPathMismatch => {
+                "Align the socket: set `general.socket_path` to the daemon's socket \
+                (`rch config set general.socket_path <path>`) or relaunch the daemon on the \
+                configured socket."
+            }
             Self::SchemaCompatible => "No action needed.",
             Self::SchemaIncompatible => {
                 "Upgrade rch / rchd / rch-wkr binaries to the same release."
@@ -559,6 +591,10 @@ impl ReliabilityReasonCode {
         Self::StatusSurfaceAvailable,
         Self::RepoConvergenceSurfaceAvailable,
         Self::DiskPressureSurfaceAvailable,
+        Self::HookInstalled,
+        Self::HookNotInstalled,
+        Self::SocketPathConsistent,
+        Self::SocketPathMismatch,
         Self::SchemaCompatible,
         Self::SchemaIncompatible,
     ];
@@ -1140,6 +1176,10 @@ mod tests {
             false,
         ),
         (ReliabilityReasonCode::DiskPressureSurfaceAvailable, false),
+        (ReliabilityReasonCode::HookInstalled, false),
+        (ReliabilityReasonCode::HookNotInstalled, false),
+        (ReliabilityReasonCode::SocketPathConsistent, false),
+        (ReliabilityReasonCode::SocketPathMismatch, false),
         // SchemaCompatibility
         (ReliabilityReasonCode::SchemaCompatible, false),
         (ReliabilityReasonCode::SchemaIncompatible, true),
