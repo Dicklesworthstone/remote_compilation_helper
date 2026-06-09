@@ -27,6 +27,7 @@ pub mod disk_pressure_report;
 pub mod disk_reclaim;
 pub mod e2e;
 pub mod errors;
+pub mod exec_policy;
 pub mod force_resync;
 pub mod hooks;
 pub mod incident;
