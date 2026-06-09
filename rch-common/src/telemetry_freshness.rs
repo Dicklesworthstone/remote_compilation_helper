@@ -145,11 +145,17 @@ pub fn assess(inputs: &FreshnessInputs) -> FreshnessAssessment {
     let base_tolerated = inputs.poll_interval.saturating_add(inputs.ssh_timeout);
     // Adaptive tolerance widens with observer slowness, latency, and timeouts,
     // then scales up under poller saturation (a saturated poller defers polls).
-    let tolerated = base_tolerated
+    let tolerated_base = base_tolerated
         .saturating_add(observer_extra)
         .saturating_add(rtt_extra)
-        .saturating_add(timeout_extra)
-        .mul_f64(1.0 + pressure);
+        .saturating_add(timeout_extra);
+    // Scale by (1 + pressure) without `Duration::mul_f64`, which PANICS when the
+    // product overflows `Duration` — and `tolerated_base` can saturate toward
+    // `Duration::MAX` via the chain above (e.g. a pathological `ssh_timeout` or
+    // `host_rtt`). Do the scale on the saturating millisecond count and clamp,
+    // so this never-failing classifier never panics on extreme input.
+    let scaled_ms = (ms(tolerated_base) as f64 * (1.0 + pressure)).min(u64::MAX as f64);
+    let tolerated = Duration::from_millis(scaled_ms as u64);
     // Tolerance must never sit below the expected next sample.
     let tolerated = tolerated.max(expected_next);
 
@@ -237,6 +243,32 @@ mod tests {
 
     const POLL: Duration = Duration::from_secs(30);
     const TIMEOUT: Duration = Duration::from_secs(20);
+
+    #[test]
+    fn extreme_inputs_do_not_panic_in_tolerance_scaling() {
+        // Regression: the tolerance scale must never `Duration::mul_f64`-panic
+        // on a saturated chain. A pathological ssh_timeout/host_rtt that pushes
+        // the saturating chain toward Duration::MAX, under full pressure, must
+        // still yield a definite verdict rather than panicking.
+        let inputs = FreshnessInputs {
+            poll_interval: Duration::from_secs(u64::MAX),
+            ssh_timeout: Duration::from_secs(u64::MAX),
+            last_poll_duration: Duration::from_secs(u64::MAX),
+            recent_timeout_count: u32::MAX,
+            host_rtt: Some(Duration::from_secs(u64::MAX)),
+            concurrency_pressure: 1.0,
+            age: Some(Duration::from_secs(1)),
+        };
+        let a = assess(&inputs); // must not panic
+        // A tiny age against an enormous tolerance is fresh.
+        assert_eq!(a.verdict, FreshnessVerdict::Fresh);
+        // And the unknown-age path is equally panic-free.
+        let unknown = FreshnessInputs {
+            age: None,
+            ..inputs
+        };
+        assert_eq!(assess(&unknown).verdict, FreshnessVerdict::Unknown);
+    }
 
     #[test]
     fn fresh_within_expected_window() {
