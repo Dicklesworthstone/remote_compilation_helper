@@ -58,6 +58,7 @@ pub mod transfer_hardening;
 pub mod types;
 pub mod ui;
 pub mod util;
+pub mod worker_config_validation;
 pub mod worker_facts;
 
 pub const BUILD_COMMIT_ENV_VARS: &[&str] = &[
@@ -245,6 +246,9 @@ pub use telemetry_explain::{
 };
 pub use telemetry_freshness::{
     FreshnessAssessment, FreshnessInputs, FreshnessVerdict, assess as assess_telemetry_freshness,
+};
+pub use worker_config_validation::{
+    ConfigDriftFinding, ConfigDriftKind, LiveHostObservation, validate_worker_config,
 };
 pub use worker_facts::{
     DiskFacts, DiskRootFacts, HostFacts, RuntimeFacts, RustFacts, UserFacts, WorkerBinaryFacts,
