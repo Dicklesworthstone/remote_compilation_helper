@@ -249,6 +249,11 @@ struct RenderedRequest {
     body: String,
     /// Optional bearer token (already resolved from env).
     bearer: Option<String>,
+    /// Optional HMAC signing secret (already resolved from env). `Some` iff the
+    /// endpoint configured `signing_secret_env` and it resolved successfully; a
+    /// configured-but-unset secret is a `RenderError::MissingEnv` rather than a
+    /// silent downgrade to unsigned delivery.
+    signing_secret: Option<String>,
 }
 
 /// An error that aborts rendering before any network call (e.g. a required
@@ -297,10 +302,21 @@ fn render_request(
         })?),
         None => None,
     };
+    // A configured signing secret that is unset/empty must abort delivery
+    // (skip + journal), never silently downgrade to an unsigned payload — a
+    // strict receiver would 4xx-reject (non-retryable) and drop the alert.
+    let signing_secret = match endpoint.signing_secret_env.as_deref() {
+        Some(var) => Some(read_env(var).ok_or_else(|| RenderError::MissingEnv {
+            field: "signing_secret_env",
+            var: var.to_string(),
+        })?),
+        None => None,
+    };
     Ok(RenderedRequest {
         // `to_string` on a serde_json::Value never fails.
         body: body_value.to_string(),
         bearer,
+        signing_secret,
     })
 }
 
@@ -499,7 +515,6 @@ impl WebhookDispatcher {
                     continue;
                 }
             };
-            let signing_secret = endpoint.signing_secret_env.as_deref().and_then(read_env);
 
             // Queue-bound: acquire a permit without waiting. If the budget is
             // exhausted, drop this delivery (journaled) instead of growing an
@@ -520,6 +535,7 @@ impl WebhookDispatcher {
             let endpoint = endpoint.clone();
             tokio::spawn(async move {
                 let _permit = permit; // released on task completion
+                let signing_secret = rendered.signing_secret.clone();
                 deliver(&client, &endpoint, &rendered, signing_secret.as_deref()).await;
             });
             dispatched += 1;
@@ -684,6 +700,28 @@ mod tests {
         match err {
             RenderError::MissingEnv { field, .. } => assert_eq!(field, "routing_key_env"),
         }
+    }
+
+    #[test]
+    fn render_refuses_configured_but_unset_signing_secret() {
+        // Regression (bd-review-webhook-unsigned-silent): a configured signing
+        // secret whose env var is unset must abort with MissingEnv (skip +
+        // journal), NOT silently dispatch an unsigned payload.
+        let mut ep = endpoint(DoctorWebhookFormat::GenericJson, &["any_to_failing"]);
+        ep.signing_secret_env = Some("RCH_TEST_SIGNING_SECRET_DEFINITELY_UNSET".to_string());
+        let err = render_request(&ep, &transition(Healthy, Failing)).unwrap_err();
+        match err {
+            RenderError::MissingEnv { field, .. } => assert_eq!(field, "signing_secret_env"),
+        }
+    }
+
+    #[test]
+    fn render_omits_signature_when_signing_unconfigured() {
+        // No signing_secret_env => unsigned delivery is intentional, not a
+        // downgrade; render succeeds with signing_secret = None.
+        let ep = endpoint(DoctorWebhookFormat::GenericJson, &["any_to_failing"]);
+        let rendered = render_request(&ep, &transition(Healthy, Failing)).expect("renders");
+        assert!(rendered.signing_secret.is_none());
     }
 
     #[test]
