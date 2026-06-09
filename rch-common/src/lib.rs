@@ -21,6 +21,7 @@ pub mod dependency_closure_planner;
 pub mod discovery;
 pub mod e2e;
 pub mod errors;
+pub mod force_resync;
 pub mod hooks;
 pub mod incident;
 pub mod incident_ledger;
@@ -136,6 +137,10 @@ pub use dependency_closure_planner::{
     DependencySyncAction, DependencySyncMetadata, DependencySyncReason,
     build_dependency_closure_plan, build_dependency_closure_plan_with_policy,
     plan_dependency_closure_from_graph,
+};
+pub use force_resync::{
+    ForceResyncPlan, ForceResyncReport, InvalidationAction, RefusedInvalidation, ResyncOutcome,
+    StaleRoot, apply_force_resync, is_safe_invalidation_target, plan_force_resync,
 };
 pub use logging::{LogConfig, LogFormat, LoggingGuards, init_logging};
 pub use mock_worker::MockWorkerServer;
