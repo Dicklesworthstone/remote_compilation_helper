@@ -37,6 +37,9 @@ dirs = { workspace = true }
 toml = { workspace = true }
 uuid = { workspace = true }
 unicode-width = { workspace = true }
+# Used by the always-compiled `e2e` test-support module (fault-injection
+# fixtures, harness temp roots), so it must be a regular (not dev) dependency.
+tempfile = "3.25.0"
 
 [target.'cfg(unix)'.dependencies]
 openssh = { workspace = true }
@@ -50,7 +53,6 @@ default = ["rich-ui"]
 rich-ui = ["rich_rust"]
 
 [dev-dependencies]
-tempfile = "3.25.0"
 criterion = { version = "0.8.2", features = ["html_reports"] }
 tracing-subscriber = { workspace = true }
 proptest = "1.11.0"
