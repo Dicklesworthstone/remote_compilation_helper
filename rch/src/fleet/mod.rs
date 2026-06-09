@@ -266,6 +266,32 @@ pub async fn deploy(
                     }
                 );
             }
+            FleetResult::CanaryPending {
+                promoted,
+                remaining,
+                skipped,
+                failed,
+            } => {
+                println!();
+                println!(
+                    "  {} Canary deployed to {} worker(s); {} still on the previous version \
+                    (auto_promote off — fleet NOT fully rolled out). Skipped: {}, Failed: {}",
+                    StatusIndicator::Warning.display(style),
+                    style.success(&promoted.to_string()),
+                    style.highlight(&remaining.to_string()),
+                    style.muted(&skipped.to_string()),
+                    if failed > 0 {
+                        style.error(&failed.to_string())
+                    } else {
+                        style.muted("0")
+                    }
+                );
+                println!(
+                    "  {} Promote the rest with a full `rch fleet deploy` (or re-run with \
+                    auto-promote).",
+                    style.muted("→")
+                );
+            }
             FleetResult::CanaryFailed { reason } => {
                 println!();
                 println!(

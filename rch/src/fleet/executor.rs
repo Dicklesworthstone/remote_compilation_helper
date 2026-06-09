@@ -48,6 +48,17 @@ pub enum FleetResult {
     },
     /// Canary deployment failed validation.
     CanaryFailed { reason: String },
+    /// Canary succeeded but `auto_promote` is off, so the rest of the fleet is
+    /// intentionally NOT yet deployed. Distinct from `Success` so operators and
+    /// JSON consumers never read a partial canary rollout as a finished one.
+    CanaryPending {
+        /// Workers deployed in the canary batch.
+        promoted: usize,
+        /// Workers still running the previous version, awaiting promotion.
+        remaining: usize,
+        skipped: usize,
+        failed: usize,
+    },
     /// Deployment was aborted.
     Aborted { reason: String },
 }
@@ -120,6 +131,9 @@ impl FleetExecutor {
         let mut deployed = 0;
         let mut skipped = 0;
         let mut failed = 0;
+        // Set when a canary succeeds but auto_promote is off: the count of
+        // workers intentionally left on the previous version.
+        let mut canary_pending_remaining: Option<usize> = None;
 
         // Clone strategy to avoid borrow issues
         let strategy = plan.strategy.clone();
@@ -215,31 +229,37 @@ impl FleetExecutor {
                     }
                 }
 
-                // Deploy to remaining workers if auto_promote is enabled
-                if auto_promote && canary_count < worker_count {
-                    if !ctx.is_json() {
-                        println!("  {} Deploying to remaining workers...", style.muted("→"));
-                    }
-                    let remaining_results = self
-                        .deploy_batch(
-                            &mut plan,
-                            canary_count..worker_count,
-                            self.parallelism,
-                            ctx,
-                            progress.clone(),
-                        )
-                        .await?;
-
-                    for (idx, success) in remaining_results {
-                        if success {
-                            if plan.workers[idx].status == DeploymentStatus::Skipped {
-                                skipped += 1;
-                            } else {
-                                deployed += 1;
-                            }
-                        } else {
-                            failed += 1;
+                // Deploy to remaining workers if auto_promote is enabled;
+                // otherwise leave them on the previous version and record the
+                // pending count so the caller doesn't report a finished rollout.
+                if canary_count < worker_count {
+                    if auto_promote {
+                        if !ctx.is_json() {
+                            println!("  {} Deploying to remaining workers...", style.muted("→"));
                         }
+                        let remaining_results = self
+                            .deploy_batch(
+                                &mut plan,
+                                canary_count..worker_count,
+                                self.parallelism,
+                                ctx,
+                                progress.clone(),
+                            )
+                            .await?;
+
+                        for (idx, success) in remaining_results {
+                            if success {
+                                if plan.workers[idx].status == DeploymentStatus::Skipped {
+                                    skipped += 1;
+                                } else {
+                                    deployed += 1;
+                                }
+                            } else {
+                                failed += 1;
+                            }
+                        }
+                    } else {
+                        canary_pending_remaining = Some(worker_count - canary_count);
                     }
                 }
             }
@@ -306,11 +326,20 @@ impl FleetExecutor {
         // Finish progress display
         progress.finish();
 
-        Ok(FleetResult::Success {
-            deployed,
-            skipped,
-            failed,
-        })
+        if let Some(remaining) = canary_pending_remaining {
+            Ok(FleetResult::CanaryPending {
+                promoted: deployed,
+                remaining,
+                skipped,
+                failed,
+            })
+        } else {
+            Ok(FleetResult::Success {
+                deployed,
+                skipped,
+                failed,
+            })
+        }
     }
 
     /// Deploy a batch of workers in parallel.
@@ -1311,6 +1340,55 @@ mod tests {
         let json = serde_json::to_string(&result).unwrap();
         assert!(json.contains("\"status\":\"CanaryFailed\""));
         assert!(json.contains("Health check failed"));
+    }
+
+    #[test]
+    fn fleet_result_canary_pending_serializes_distinctly_from_success() {
+        // Regression (bd-review-canary-success-misreport): a canary with
+        // auto_promote off must NOT serialize as Success — a JSON consumer
+        // would otherwise read a partial rollout as finished.
+        let pending = FleetResult::CanaryPending {
+            promoted: 5,
+            remaining: 95,
+            skipped: 0,
+            failed: 0,
+        };
+        let json = serde_json::to_string(&pending).unwrap();
+        assert!(json.contains("\"status\":\"CanaryPending\""));
+        assert!(json.contains("\"promoted\":5"));
+        assert!(json.contains("\"remaining\":95"));
+        // Must be distinguishable from Success with the same deployed count.
+        let success = serde_json::to_string(&FleetResult::Success {
+            deployed: 5,
+            skipped: 0,
+            failed: 0,
+        })
+        .unwrap();
+        assert_ne!(json, success);
+        assert!(!json.contains("\"status\":\"Success\""));
+    }
+
+    #[test]
+    fn fleet_result_canary_pending_round_trips() {
+        let pending = FleetResult::CanaryPending {
+            promoted: 2,
+            remaining: 6,
+            skipped: 1,
+            failed: 0,
+        };
+        let json = serde_json::to_string(&pending).unwrap();
+        let back: FleetResult = serde_json::from_str(&json).unwrap();
+        match back {
+            FleetResult::CanaryPending {
+                promoted,
+                remaining,
+                skipped,
+                failed,
+            } => {
+                assert_eq!((promoted, remaining, skipped, failed), (2, 6, 1, 0));
+            }
+            other => panic!("expected CanaryPending, got {other:?}"),
+        }
     }
 
     #[test]
