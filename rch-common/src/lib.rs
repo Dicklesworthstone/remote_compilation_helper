@@ -17,6 +17,7 @@ pub mod artifact_verify;
 pub mod binary_hash;
 pub mod capability_probe;
 pub mod cargo_path_deps;
+pub mod classifier_drift;
 pub mod closure_explain;
 pub mod config;
 pub mod dependency_closure_planner;
