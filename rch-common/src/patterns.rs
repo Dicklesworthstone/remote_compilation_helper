@@ -788,6 +788,32 @@ pub fn classify_command_detailed(cmd: &str) -> ClassificationDetails {
     }
 }
 
+/// Whether a `-flag VALUE` form for `wrapper` consumes the following token as
+/// its value (so the value isn't mistaken for the wrapped command word).
+/// Only the space-separated forms are listed; `=`-joined and space-attached
+/// forms (`--adjustment=10`, `-n10`) carry their value in the same token.
+fn wrapper_flag_takes_value(wrapper: &str, flag: &str) -> bool {
+    match wrapper {
+        "env" => matches!(flag, "-u" | "--unset"),
+        "nice" => matches!(flag, "-n" | "--adjustment"),
+        "ionice" => matches!(
+            flag,
+            "-c" | "--class" | "-n" | "--classdata" | "-p" | "--pid"
+        ),
+        "taskset" => matches!(flag, "-c" | "--cpu-list" | "-p" | "--pid"),
+        "chrt" => matches!(flag, "-p" | "--pid"),
+        "timeout" => matches!(flag, "-s" | "--signal" | "-k" | "--kill-after"),
+        _ => false,
+    }
+}
+
+/// Heuristic: does `token` look like a `timeout` duration (`60`, `1.5h`, `30s`)
+/// or a `chrt` priority (`10`)? Used to decide whether to skip a positional
+/// value token without ever eating a real command word.
+fn looks_like_duration_or_priority(token: &str) -> bool {
+    token.chars().next().is_some_and(|c| c.is_ascii_digit())
+}
+
 /// Normalize a command by stripping common wrappers (sudo, time, env, etc.)
 pub fn normalize_command(cmd: &str) -> Cow<'_, str> {
     let mut result = cmd.trim();
@@ -795,7 +821,8 @@ pub fn normalize_command(cmd: &str) -> Cow<'_, str> {
     // Strip common command prefixes/wrappers
     // Note: We match the command name, then ensure it's followed by whitespace
     let wrappers = [
-        "sudo", "env", "time", "nice", "ionice", "strace", "ltrace", "perf", "taskset", "numactl",
+        "sudo", "env", "time", "timeout", "nice", "ionice", "chrt", "strace", "ltrace", "perf",
+        "taskset", "numactl",
     ];
 
     loop {
@@ -803,13 +830,19 @@ pub fn normalize_command(cmd: &str) -> Cow<'_, str> {
         for wrapper in wrappers {
             if let Some(rest) = result.strip_prefix(wrapper) {
                 // Must be followed by whitespace or end of string
-                // (e.g., "sudo" matches "sudo ls", but not "sudoku")
+                // (e.g., "sudo" matches "sudo ls", but not "sudoku"; "time"
+                // must not swallow "timeout" — guarded by this whitespace check)
                 if rest.is_empty() || rest.starts_with(char::is_whitespace) {
                     result = rest.trim_start();
                     changed = true;
 
-                    // Strip flags that might follow the wrapper (e.g., "time -v", "sudo -E")
+                    // Strip flags that might follow the wrapper (e.g., "time -v", "sudo -E").
                     // We heuristically strip any token starting with '-' until we find a non-flag.
+                    // For value-taking flags (e.g. `nice -n 10`, `taskset -c 0-3`, `env -u VAR`)
+                    // we must ALSO consume the following value token, or it is left as the
+                    // command word and a real `cargo build` is misclassified as non-compilation
+                    // (silent local fallback). Space-attached forms (`-n10`, `--adjustment=10`)
+                    // carry their value in the same token and need no extra consume.
                     while result.starts_with('-') {
                         // Find the end of this token
                         let (flag, rest_after_flag) = result
@@ -819,12 +852,25 @@ pub fn normalize_command(cmd: &str) -> Cow<'_, str> {
                         // Safety: we checked starts_with('-'), so token is not empty
                         result = rest_after_flag.trim_start();
 
-                        if wrapper == "env" && matches!(flag, "-u" | "--unset") {
-                            let (_env_name, rest_after_env_name) = result
+                        if wrapper_flag_takes_value(wrapper, flag) {
+                            let (_value, rest_after_value) = result
                                 .split_once(char::is_whitespace)
                                 .unwrap_or((result, ""));
-                            result = rest_after_env_name.trim_start();
+                            result = rest_after_value.trim_start();
                         }
+                    }
+
+                    // Positional value wrappers: `timeout <duration> cmd` and
+                    // `chrt <prio> cmd` carry a bare (non-flag) value token before
+                    // the command. Skip exactly one such token when it looks like a
+                    // duration/priority (leading digit), so we never eat the real
+                    // command word (e.g. `timeout cargo build` keeps `cargo build`).
+                    if matches!(wrapper, "timeout" | "chrt")
+                        && let Some((first, after_first)) = result.split_once(char::is_whitespace)
+                        && !first.starts_with('-')
+                        && looks_like_duration_or_priority(first)
+                    {
+                        result = after_first.trim_start();
                     }
                 }
             }
@@ -3895,6 +3941,71 @@ mod tests_normalize_whitespace {
 
         // Bare wrapper (should become empty)
         assert_eq!(normalize_command("sudo"), "");
+    }
+
+    #[test]
+    fn wrapper_value_flags_consume_their_value_token() {
+        // Regression (bd-review-wrapper-flag-eater): value-taking wrapper flags
+        // must consume the VALUE token too, or it is left as the command word
+        // and a real build silently runs local.
+        let _guard = test_guard!();
+        assert_eq!(normalize_command("nice -n 10 cargo build"), "cargo build");
+        assert_eq!(
+            normalize_command("taskset -c 0-3 cargo build"),
+            "cargo build"
+        );
+        assert_eq!(normalize_command("ionice -c 2 cargo test"), "cargo test");
+        assert_eq!(
+            normalize_command("ionice -c 2 -n 4 cargo build"),
+            "cargo build"
+        );
+        assert_eq!(normalize_command("chrt -r 10 cargo build"), "cargo build");
+        assert_eq!(normalize_command("timeout 60 cargo build"), "cargo build");
+        assert_eq!(
+            normalize_command("timeout -s KILL 90 cargo build"),
+            "cargo build"
+        );
+        assert_eq!(
+            normalize_command("sudo nice -n 5 cargo build"),
+            "cargo build"
+        );
+        // Attached / `=`-joined values carry their own value (no extra consume).
+        assert_eq!(normalize_command("nice -n10 cargo build"), "cargo build");
+        assert_eq!(normalize_command("ionice -c2 cargo build"), "cargo build");
+        // Existing env -u behavior preserved.
+        assert_eq!(
+            normalize_command("env -u RUSTFLAGS cargo build"),
+            "cargo build"
+        );
+    }
+
+    #[test]
+    fn positional_wrapper_does_not_eat_a_non_numeric_command() {
+        // Malformed `timeout cargo build` (no duration): the leading non-digit
+        // token is the command and must NOT be skipped.
+        let _guard = test_guard!();
+        assert_eq!(normalize_command("timeout cargo build"), "cargo build");
+    }
+
+    #[test]
+    fn wrapped_cargo_build_is_still_classified_as_compilation() {
+        let _guard = test_guard!();
+        for cmd in [
+            "nice -n 10 cargo build",
+            "taskset -c 0-3 cargo build",
+            "ionice -c 2 cargo build",
+            "chrt -r 10 cargo build",
+            "timeout 60 cargo build",
+            "timeout -s KILL 90 cargo test",
+        ] {
+            assert!(
+                classify_command(cmd).is_compilation,
+                "wrapper must not defeat offload: {cmd}"
+            );
+        }
+        // A wrapper around a non-build must still pass through (not offloaded).
+        assert!(!classify_command("nice -n 10 ls -la").is_compilation);
+        assert!(!classify_command("timeout 60 echo hi").is_compilation);
     }
 
     #[test]
