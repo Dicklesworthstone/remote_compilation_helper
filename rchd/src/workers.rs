@@ -59,7 +59,8 @@ fn duration_secs_i64(duration: Duration) -> i64 {
 // daemon/status JSON boundary. They are *additive*: the legacy single-axis
 // [`WorkerStatus`] enum is untouched, and [`WorkerLifecycle::legacy_status`]
 // collapses the two axes back to a `WorkerStatus` for older status consumers
-// (`TemporaryBypass` → `Unreachable`, `RecoveredPendingCanary` → `Degraded`).
+// (both quarantine states — `TemporaryBypass` and `RecoveredPendingCanary` —
+// collapse to `Unreachable` so they stay out of legacy scheduling).
 // New variants must be appended, never reordered or renamed, so historical
 // JSONL replays continue to deserialize.
 
@@ -232,9 +233,15 @@ impl WorkerLifecycle {
     }
 
     /// Collapse the two axes back to a legacy [`WorkerStatus`] for older
-    /// status/JSON consumers. Admin intent takes precedence; the new transient
-    /// states map to their closest legacy equivalent (`TemporaryBypass` →
-    /// `Unreachable`, `RecoveredPendingCanary` → `Degraded`).
+    /// status/JSON consumers. Admin intent takes precedence.
+    ///
+    /// Both transient quarantine states collapse to `Unreachable` so they stay
+    /// EXCLUDED from the legacy scheduler (which treats `Degraded` as
+    /// schedulable). In particular `RecoveredPendingCanary` must NOT become
+    /// `Degraded`: the legacy scheduler would then route a normal build to a
+    /// worker that is only cleared for a single canary build, violating the
+    /// one-canary-first invariant that [`Self::is_schedulable`] enforces
+    /// (bd-review-canary-legacy-status).
     pub fn legacy_status(&self) -> WorkerStatus {
         match self.admin {
             AdminIntent::Disabled => WorkerStatus::Disabled,
@@ -242,12 +249,12 @@ impl WorkerLifecycle {
             AdminIntent::Drained => WorkerStatus::Drained,
             AdminIntent::Active => match self.eligibility {
                 EligibilityState::Healthy => WorkerStatus::Healthy,
-                EligibilityState::Degraded | EligibilityState::RecoveredPendingCanary => {
-                    WorkerStatus::Degraded
-                }
-                EligibilityState::Unreachable | EligibilityState::TemporaryBypass => {
-                    WorkerStatus::Unreachable
-                }
+                EligibilityState::Degraded => WorkerStatus::Degraded,
+                // Unreachable, failure-class bypass, and canary-pending all stay
+                // out of normal scheduling.
+                EligibilityState::Unreachable
+                | EligibilityState::TemporaryBypass
+                | EligibilityState::RecoveredPendingCanary => WorkerStatus::Unreachable,
             },
         }
     }
@@ -1544,7 +1551,9 @@ mod tests {
             eligibility: EligibilityState::RecoveredPendingCanary,
             bypass_cause: None,
         };
-        assert_eq!(canary.legacy_status(), WorkerStatus::Degraded);
+        // Canary-pending must collapse to Unreachable (NOT Degraded), so the
+        // legacy scheduler keeps it out of normal builds (one-canary-first).
+        assert_eq!(canary.legacy_status(), WorkerStatus::Unreachable);
         // Round-trip the unambiguous health states.
         for status in [
             WorkerStatus::Healthy,
