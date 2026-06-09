@@ -8,6 +8,7 @@
 
 use std::sync::OnceLock;
 
+pub mod admission_rejection;
 pub mod api;
 pub mod artifact_cost;
 pub mod artifact_pattern;
