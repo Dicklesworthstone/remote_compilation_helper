@@ -20,6 +20,7 @@ pub mod errors;
 pub mod hooks;
 pub mod incident;
 pub mod incident_ledger;
+pub mod job_identity;
 pub mod logging;
 pub mod mock;
 pub mod mock_worker;
