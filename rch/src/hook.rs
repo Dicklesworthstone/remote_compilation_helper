@@ -3842,7 +3842,9 @@ async fn run_worker_ssh_command(
 }
 
 fn build_remote_shell_command(remote_cmd: &str) -> String {
-    format!("sh -lc {}", shell_escape::escape(remote_cmd.into()))
+    // These snippets are non-interactive probes; using a login shell makes dash
+    // source worker profile files and can break on bash/zsh-only profile syntax.
+    format!("sh -c {}", shell_escape::escape(remote_cmd.into()))
 }
 
 fn build_worker_projects_topology_cmd(topology_policy: &PathTopologyPolicy) -> String {
@@ -11121,13 +11123,13 @@ edition = "2024"
 
         let wrapped = build_remote_shell_command(command);
 
-        assert!(wrapped.starts_with("sh -lc "));
+        assert!(wrapped.starts_with("sh -c "));
         assert!(
-            wrapped.starts_with("sh -lc '"),
+            wrapped.starts_with("sh -c '"),
             "shell wrapper must quote the script as a single argument"
         );
         assert!(
-            !wrapped.starts_with("sh -lc missing=0"),
+            !wrapped.starts_with("sh -c missing=0"),
             "script must not be passed unquoted"
         );
         assert!(
