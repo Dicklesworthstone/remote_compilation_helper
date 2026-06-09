@@ -1,0 +1,119 @@
+name: e2e
+
+# Runs every scripts/e2e_*.sh as its own matrix job after building the
+# workspace, uploads each run's JSONL + build log, and aggregates a PASS/FAIL
+# summary posted as a PR comment (remote_compilation_helper-62u24.15).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Auto-discover the e2e scripts so adding scripts/e2e_*.sh needs no workflow edit.
+  discover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      scripts: ${{ steps.list.outputs.scripts }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: list
+        run: |
+          echo "scripts=$(find scripts -maxdepth 1 -name 'e2e_*.sh' -printf '%f\n' \
+            | sort | jq -R . | jq -sc .)" >> "$GITHUB_OUTPUT"
+
+  run:
+    needs: discover
+    strategy:
+      fail-fast: false
+      matrix:
+        script: ${{ fromJson(needs.discover.outputs.scripts) }}
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      # The workspace depends on these path deps under /dp (see ci.yml).
+      - name: Clone local path dependencies
+        run: |
+          sudo mkdir -p /dp
+          sudo chown "$USER" /dp
+          git clone --depth 1 https://github.com/Dicklesworthstone/rich_rust.git /dp/rich_rust
+          git clone --depth 1 https://github.com/Dicklesworthstone/toon_rust.git /dp/toon_rust
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankentui.git /dp/frankentui
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2025-11-01
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          shared-key: e2e-${{ matrix.os }}
+      - name: Build workspace
+        run: cargo build --release --workspace
+      # Run the single matrix script through the SAME runner CI and operators use,
+      # so a local `run_all_e2e.sh --filter=<script>` reproduces this job exactly.
+      # The script's exit code (0 pass / 4 skip / else fail) gates this job.
+      - name: Run e2e
+        run: scripts/run_all_e2e.sh --filter='${{ matrix.script }}' --out=target/e2e-artifacts
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e2e-${{ matrix.script }}-${{ matrix.os }}
+          path: target/e2e-artifacts/
+          if-no-files-found: warn
+
+  aggregate:
+    needs: run
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: e2e-artifacts
+      - name: Aggregate
+        run: |
+          python3 scripts/lib/aggregate_e2e.py \
+            --artifacts-dir e2e-artifacts \
+            --output e2e_summary.md
+          cat e2e_summary.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: e2e-summary
+          path: e2e_summary.md
+      - name: Post summary as PR comment
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync('e2e_summary.md', 'utf8');
+            const marker = '<!-- e2e-summary -->';
+            const tagged = `${marker}\n${body}`;
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const { data: comments } = await github.rest.issues.listComments({
+              owner, repo, issue_number,
+            });
+            const existing = comments.find(
+              (c) => c.user.type === 'Bot' && c.body && c.body.includes(marker),
+            );
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner, repo, comment_id: existing.id, body: tagged,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number, body: tagged,
+              });
+            }
