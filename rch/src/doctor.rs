@@ -4979,6 +4979,409 @@ mod tests {
     }
 
     // ========================
+    // Reliability diagnostic coverage (bead 2s99h.16)
+    // ========================
+
+    fn diag(severity: ReliabilitySeverity, code: ReliabilityReasonCode) -> ReliabilityDiagnostic {
+        ReliabilityDiagnostic::new(
+            ReliabilityCategory::Topology,
+            "fixture",
+            severity,
+            "fixture diagnostic",
+            code,
+        )
+    }
+
+    /// Build a `DaemonFullStatusResponse` with the given worker rows and
+    /// daemon health counts; all build/queue lists empty.
+    fn daemon_status(
+        workers_total: usize,
+        workers_healthy: usize,
+        workers: serde_json::Value,
+    ) -> crate::status_types::DaemonFullStatusResponse {
+        serde_json::from_value(json!({
+            "daemon": {
+                "pid": 1,
+                "uptime_secs": 10,
+                "version": "0.1.0",
+                "socket_path": "/tmp/rch.sock",
+                "started_at": "2026-01-01T00:00:00Z",
+                "workers_total": workers_total,
+                "workers_healthy": workers_healthy,
+                "slots_total": 8,
+                "slots_available": 4
+            },
+            "workers": workers,
+            "active_builds": [],
+            "queued_builds": [],
+            "recent_builds": [],
+            "issues": [],
+            "alerts": [],
+            "stats": {
+                "total_builds": 0,
+                "success_count": 0,
+                "failure_count": 0,
+                "remote_count": 0,
+                "local_count": 0,
+                "avg_duration_ms": 0
+            },
+            "test_stats": null,
+            "saved_time": null
+        }))
+        .expect("daemon status fixture should parse")
+    }
+
+    #[test]
+    fn aggregate_verdict_is_healthy_for_empty_and_pass_info() {
+        assert_eq!(aggregate_verdict(&[]), ReliabilityVerdict::Healthy);
+        let diags = vec![
+            diag(
+                ReliabilitySeverity::Pass,
+                ReliabilityReasonCode::StatusSurfaceAvailable,
+            ),
+            diag(
+                ReliabilitySeverity::Info,
+                ReliabilityReasonCode::DiskPressureNoWorkers,
+            ),
+        ];
+        assert_eq!(aggregate_verdict(&diags), ReliabilityVerdict::Healthy);
+    }
+
+    #[test]
+    fn aggregate_verdict_warning_is_degraded() {
+        let diags = vec![
+            diag(
+                ReliabilitySeverity::Pass,
+                ReliabilityReasonCode::StatusSurfaceAvailable,
+            ),
+            diag(
+                ReliabilitySeverity::Warning,
+                ReliabilityReasonCode::HookAutoStartDisabled,
+            ),
+        ];
+        assert_eq!(aggregate_verdict(&diags), ReliabilityVerdict::Degraded);
+    }
+
+    #[test]
+    fn aggregate_verdict_critical_dominates_warning_regardless_of_order() {
+        let warn = diag(
+            ReliabilitySeverity::Warning,
+            ReliabilityReasonCode::HookAutoStartDisabled,
+        );
+        let crit = diag(
+            ReliabilitySeverity::Critical,
+            ReliabilityReasonCode::NoWorkersConfigured,
+        );
+        assert_eq!(
+            aggregate_verdict(&[warn.clone(), crit.clone()]),
+            ReliabilityVerdict::Failing
+        );
+        // Order independence: critical still wins when it comes first.
+        assert_eq!(
+            aggregate_verdict(&[crit, warn]),
+            ReliabilityVerdict::Failing
+        );
+    }
+
+    #[test]
+    fn reliability_severity_token_maps_all_severities() {
+        assert_eq!(
+            reliability_severity_token(ReliabilitySeverity::Pass),
+            "pass"
+        );
+        assert_eq!(
+            reliability_severity_token(ReliabilitySeverity::Info),
+            "info"
+        );
+        assert_eq!(
+            reliability_severity_token(ReliabilitySeverity::Warning),
+            "warning"
+        );
+        assert_eq!(
+            reliability_severity_token(ReliabilitySeverity::Critical),
+            "critical"
+        );
+    }
+
+    #[test]
+    fn schema_compatibility_diagnostics_are_deterministic_and_categorised() {
+        let a = reliability_schema_compatibility_diagnostics();
+        let b = reliability_schema_compatibility_diagnostics();
+        assert!(!a.is_empty(), "schema probe must emit diagnostics");
+        assert_eq!(a.len(), b.len(), "schema probe must be deterministic");
+        assert!(
+            a.iter()
+                .all(|d| d.category == ReliabilityCategory::SchemaCompatibility)
+        );
+    }
+
+    #[test]
+    fn rollout_posture_passes_when_self_healing_enabled() {
+        let mut config = rch_common::RchConfig::default();
+        config.self_healing.hook_starts_daemon = true;
+        config.self_healing.daemon_installs_hooks = true;
+        let diags = reliability_rollout_posture_diagnostics(Ok(&config));
+        // The two self-healing toggles must be Pass; no auto-fix remediation.
+        let hook = diags
+            .iter()
+            .find(|d| d.check_name == "hook_starts_daemon")
+            .expect("hook diagnostic present");
+        assert_eq!(hook.severity, ReliabilitySeverity::Pass);
+        assert!(hook.remediation_command.is_none());
+    }
+
+    #[test]
+    fn rollout_posture_warns_with_remediation_when_disabled() {
+        let mut config = rch_common::RchConfig::default();
+        config.self_healing.hook_starts_daemon = false;
+        config.self_healing.daemon_installs_hooks = false;
+        let diags = reliability_rollout_posture_diagnostics(Ok(&config));
+        let hook = diags
+            .iter()
+            .find(|d| d.check_name == "hook_starts_daemon")
+            .expect("hook diagnostic present");
+        assert_eq!(hook.severity, ReliabilitySeverity::Warning);
+        assert_eq!(
+            hook.remediation_command.as_deref(),
+            Some("rch config set self_healing.hook_starts_daemon true")
+        );
+        assert_eq!(hook.code, ReliabilityReasonCode::HookAutoStartDisabled);
+    }
+
+    #[test]
+    fn rollout_posture_warns_on_config_load_failure() {
+        let diags = reliability_rollout_posture_diagnostics(Err("boom"));
+        let load = diags
+            .iter()
+            .find(|d| d.check_name == "config_load")
+            .expect("config_load diagnostic present");
+        assert_eq!(load.severity, ReliabilitySeverity::Warning);
+        assert_eq!(load.code, ReliabilityReasonCode::ConfigLoadFailed);
+    }
+
+    #[test]
+    fn build_response_counts_severities_and_defaults_fix_fields() {
+        let scope = ReliabilityScopeSet::default();
+        let diags = vec![
+            diag(
+                ReliabilitySeverity::Pass,
+                ReliabilityReasonCode::StatusSurfaceAvailable,
+            ),
+            diag(
+                ReliabilitySeverity::Warning,
+                ReliabilityReasonCode::HookAutoStartDisabled,
+            ),
+            diag(
+                ReliabilitySeverity::Critical,
+                ReliabilityReasonCode::NoWorkersConfigured,
+            ),
+        ];
+        let response =
+            build_reliability_doctor_response(ReliabilityDoctorMode::Check, &scope, diags);
+        assert_eq!(response.summary.total_checks, 3);
+        assert_eq!(response.summary.pass, 1);
+        assert_eq!(response.summary.warning, 1);
+        assert_eq!(response.summary.critical, 1);
+        assert_eq!(response.summary.overall, ReliabilityVerdict::Failing);
+        // No daemon-unavailable codes => not flagged unreachable.
+        assert!(!response.daemon_unreachable);
+        // Fix scaffolding defaults until the executor / caller set them.
+        assert!(!response.fix_requested);
+        assert!(response.remediation_outcomes.is_empty());
+    }
+
+    #[test]
+    fn build_response_flags_daemon_unreachable_from_reason_codes() {
+        let scope = ReliabilityScopeSet::default();
+        let diags = vec![diag(
+            ReliabilitySeverity::Warning,
+            ReliabilityReasonCode::DaemonStatusUnavailable,
+        )];
+        let response =
+            build_reliability_doctor_response(ReliabilityDoctorMode::Check, &scope, diags);
+        assert!(response.daemon_unreachable);
+        assert_eq!(response.daemon_unreachable_reasons.len(), 1);
+    }
+
+    #[test]
+    fn remediation_plan_orders_critical_before_warning_and_skips_unactionable() {
+        // Warning WITH remediation, Critical WITH remediation, Pass (ignored),
+        // Warning WITHOUT remediation (ignored).
+        let warn = ReliabilityDiagnostic::new(
+            ReliabilityCategory::RolloutPosture,
+            "warn_fix",
+            ReliabilitySeverity::Warning,
+            "warn",
+            ReliabilityReasonCode::HookAutoStartDisabled,
+        )
+        .with_remediation("rch config set self_healing.hook_starts_daemon true", "v");
+        let crit = ReliabilityDiagnostic::new(
+            ReliabilityCategory::Topology,
+            "crit_fix",
+            ReliabilitySeverity::Critical,
+            "crit",
+            ReliabilityReasonCode::NoWorkersConfigured,
+        )
+        .with_remediation("rch workers add <host>", "v");
+        let pass = diag(
+            ReliabilitySeverity::Pass,
+            ReliabilityReasonCode::StatusSurfaceAvailable,
+        );
+        let warn_no_cmd = diag(
+            ReliabilitySeverity::Warning,
+            ReliabilityReasonCode::DaemonHookRepairDisabled,
+        );
+
+        let plan = build_reliability_remediation_plan(&[warn, crit, pass, warn_no_cmd]);
+        assert_eq!(plan.len(), 2, "only actionable diagnostics become steps");
+        // Critical sorts ahead of Warning and gets order 1.
+        assert_eq!(plan[0].order, 1);
+        assert_eq!(plan[0].code, ReliabilityReasonCode::NoWorkersConfigured);
+        assert_eq!(plan[1].order, 2);
+        assert_eq!(plan[1].code, ReliabilityReasonCode::HookAutoStartDisabled);
+        // The hook flip is auto-fixable; the workers-add step is manual.
+        assert!(!plan[0].auto_fixable);
+        assert!(plan[1].auto_fixable);
+    }
+
+    #[test]
+    fn topology_critical_when_worker_config_unreadable() {
+        let diags =
+            reliability_topology_diagnostics(None, None, Some("permission denied".to_string()));
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.severity == ReliabilitySeverity::Critical
+                    && d.code == ReliabilityReasonCode::WorkersConfigUnreadable)
+        );
+    }
+
+    #[test]
+    fn topology_critical_when_no_workers_configured() {
+        let workers: Vec<rch_common::WorkerConfig> = Vec::new();
+        let diags = reliability_topology_diagnostics(Some(&workers), None, None);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.severity == ReliabilitySeverity::Critical
+                    && d.code == ReliabilityReasonCode::NoWorkersConfigured)
+        );
+    }
+
+    #[test]
+    fn topology_passes_worker_config_and_warns_on_missing_daemon() {
+        let worker = rch_common::WorkerConfig {
+            id: rch_common::WorkerId("worker-a".to_string()),
+            ..Default::default()
+        };
+        let workers = vec![worker];
+        let diags = reliability_topology_diagnostics(Some(&workers), None, None);
+        assert!(
+            diags.iter().any(
+                |d| d.check_name == "workers_config" && d.severity == ReliabilitySeverity::Pass
+            )
+        );
+        // Daemon status absent => a daemon_status warning is emitted.
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.severity == ReliabilitySeverity::Warning
+                    && d.code == ReliabilityReasonCode::DaemonStatusUnavailable)
+        );
+    }
+
+    #[test]
+    fn repo_diagnostics_unavailable_when_convergence_missing() {
+        let diags = reliability_repo_diagnostics(None);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.code == ReliabilityReasonCode::RepoConvergenceUnavailable)
+        );
+    }
+
+    #[test]
+    fn disk_pressure_unavailable_when_status_missing() {
+        let diags = reliability_disk_pressure_diagnostics(None);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].severity, ReliabilitySeverity::Warning);
+        assert_eq!(
+            diags[0].code,
+            ReliabilityReasonCode::DiskPressureUnavailable
+        );
+    }
+
+    #[test]
+    fn disk_pressure_info_when_no_workers_report() {
+        let status = daemon_status(0, 0, json!([]));
+        let diags = reliability_disk_pressure_diagnostics(Some(&status));
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].severity, ReliabilitySeverity::Info);
+        assert_eq!(diags[0].code, ReliabilityReasonCode::DiskPressureNoWorkers);
+    }
+
+    #[test]
+    fn disk_pressure_critical_for_worker_under_critical_pressure() {
+        let status = daemon_status(
+            1,
+            1,
+            json!([{
+                "id": "worker-a",
+                "host": "worker.example",
+                "user": "ubuntu",
+                "status": "ready",
+                "circuit_state": "closed",
+                "used_slots": 0,
+                "total_slots": 8,
+                "speed_score": 99.0,
+                "last_error": null,
+                "pressure_state": "critical",
+                "pressure_reason_code": "disk_free_below_critical_gb"
+            }]),
+        );
+        let diags = reliability_disk_pressure_diagnostics(Some(&status));
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.severity == ReliabilitySeverity::Critical
+                    && d.code == ReliabilityReasonCode::WorkerDiskPressureCritical)
+        );
+    }
+
+    #[test]
+    fn process_debt_unavailable_when_status_missing() {
+        let diags = reliability_process_debt_diagnostics(None);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.code == ReliabilityReasonCode::ProcessDebtUnavailable)
+        );
+    }
+
+    #[test]
+    fn process_debt_emits_diagnostics_for_present_status() {
+        let status = daemon_status(1, 1, json!([]));
+        let diags = reliability_process_debt_diagnostics(Some(&status));
+        assert!(!diags.is_empty());
+        assert!(
+            diags
+                .iter()
+                .all(|d| d.category == ReliabilityCategory::ProcessDebt)
+        );
+    }
+
+    #[test]
+    fn helper_compatibility_diagnostics_cover_helper_category() {
+        let diags = reliability_helper_compatibility_diagnostics();
+        assert!(!diags.is_empty());
+        assert!(
+            diags
+                .iter()
+                .all(|d| d.category == ReliabilityCategory::HelperCompatibility)
+        );
+    }
+
+    // ========================
     // --fix remediation executor tests (bead 2s99h.12)
     // ========================
 
