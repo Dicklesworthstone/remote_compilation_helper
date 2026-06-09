@@ -118,7 +118,15 @@ fn ms(d: Duration) -> u64 {
 #[allow(clippy::cast_precision_loss)]
 #[must_use]
 pub fn assess(inputs: &FreshnessInputs) -> FreshnessAssessment {
-    let pressure = inputs.concurrency_pressure.clamp(0.0, 1.0);
+    // `f64::clamp` does NOT sanitize NaN (`NaN.clamp(0.0, 1.0) == NaN`), and a
+    // non-finite pressure flows into `Duration::from_secs_f64` in
+    // `dominant_reason`, which PANICS on NaN/inf — in a classifier documented
+    // as never-failing. Coerce any non-finite pressure to 0.0 first.
+    let pressure = if inputs.concurrency_pressure.is_finite() {
+        inputs.concurrency_pressure.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
 
     // How far behind the loop is relative to its nominal cadence.
     let observer_extra = inputs
@@ -414,5 +422,121 @@ mod tests {
             assert!(v.get(key).is_some(), "missing field {key}");
         }
         assert_eq!(v["verdict"], "fresh");
+    }
+
+    /// Property/fuzz + metamorphic coverage for `assess`
+    /// (bd-review-test-freshness-fuzz). Mock-free, pure-function fuzzing.
+    mod fuzz {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Durations spanning the full u64 millisecond range — including the
+        /// extremes that exercise the saturating/overflow tolerance paths.
+        fn any_duration() -> impl Strategy<Value = Duration> {
+            any::<u64>().prop_map(Duration::from_millis)
+        }
+
+        /// Pressure including out-of-range and non-finite values, so the clamp
+        /// and scale paths are stressed (must never panic or produce NaN
+        /// confidence).
+        fn any_pressure() -> impl Strategy<Value = f64> {
+            prop_oneof![
+                Just(f64::NAN),
+                Just(f64::INFINITY),
+                Just(f64::NEG_INFINITY),
+                -5.0_f64..5.0_f64,
+                any::<f64>(),
+            ]
+        }
+
+        fn any_inputs() -> impl Strategy<Value = FreshnessInputs> {
+            (
+                any_duration(),
+                any_duration(),
+                any_duration(),
+                any::<u32>(),
+                proptest::option::of(any_duration()),
+                any_pressure(),
+                proptest::option::of(any_duration()),
+            )
+                .prop_map(
+                    |(poll, timeout, last, timeouts, rtt, pressure, age)| FreshnessInputs {
+                        poll_interval: poll,
+                        ssh_timeout: timeout,
+                        last_poll_duration: last,
+                        recent_timeout_count: timeouts,
+                        host_rtt: rtt,
+                        concurrency_pressure: pressure,
+                        age,
+                    },
+                )
+        }
+
+        /// Severity rank for the metamorphic monotonicity check (Unknown only
+        /// arises when there is no sample, so it never participates here).
+        fn verdict_rank(v: FreshnessVerdict) -> u8 {
+            match v {
+                FreshnessVerdict::Fresh => 0,
+                FreshnessVerdict::SlowObserver => 1,
+                FreshnessVerdict::Stale => 2,
+                FreshnessVerdict::Unknown => 3,
+            }
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(2048))]
+
+            /// Never panics; confidence is always finite and in [0,1]; `usable`
+            /// mirrors the verdict; `Unknown` iff there is no sample.
+            #[test]
+            fn assess_never_panics_and_holds_invariants(inputs in any_inputs()) {
+                let a = assess(&inputs);
+                prop_assert!(a.confidence.is_finite(), "confidence not finite: {}", a.confidence);
+                prop_assert!(
+                    (0.0..=1.0).contains(&a.confidence),
+                    "confidence out of range: {}",
+                    a.confidence
+                );
+                prop_assert_eq!(
+                    a.usable,
+                    matches!(a.verdict, FreshnessVerdict::Fresh | FreshnessVerdict::SlowObserver)
+                );
+                prop_assert_eq!(
+                    matches!(a.verdict, FreshnessVerdict::Unknown),
+                    inputs.age.is_none()
+                );
+                // tolerance is always at least the expected-next window.
+                prop_assert!(a.tolerated_age_ms >= a.expected_next_sample_ms);
+            }
+
+            /// Metamorphic: with a sample present, a larger age never produces a
+            /// FRESHER verdict (rank is monotonic non-decreasing in age).
+            #[test]
+            fn larger_age_is_never_fresher(base in any_inputs(), a in any_duration(), b in any_duration()) {
+                let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+                let mut inputs = base;
+                inputs.age = Some(lo);
+                let v_lo = assess(&inputs).verdict;
+                inputs.age = Some(hi);
+                let v_hi = assess(&inputs).verdict;
+                prop_assert!(
+                    verdict_rank(v_hi) >= verdict_rank(v_lo),
+                    "monotonicity violated: {lo:?}->{v_lo:?} then {hi:?}->{v_hi:?}"
+                );
+            }
+
+            /// Metamorphic: higher concurrency pressure never SHRINKS the
+            /// tolerated age (a saturated poller defers polls → wider tolerance).
+            #[test]
+            fn higher_pressure_never_shrinks_tolerance(base in any_inputs(), age in any_duration()) {
+                let mut inputs = base;
+                inputs.age = Some(age);
+                inputs.concurrency_pressure = 0.0;
+                let tol_lo = assess(&inputs).tolerated_age_ms;
+                inputs.concurrency_pressure = 1.0;
+                let tol_hi = assess(&inputs).tolerated_age_ms;
+                prop_assert!(tol_hi >= tol_lo, "pressure shrank tolerance: {tol_lo} -> {tol_hi}");
+            }
+        }
     }
 }
