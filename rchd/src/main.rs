@@ -10,6 +10,7 @@ mod alerts;
 mod api;
 mod benchmark_queue;
 mod benchmark_scheduler;
+mod build_root_policy;
 mod cache_cleanup;
 mod cancellation;
 mod cleanup;
