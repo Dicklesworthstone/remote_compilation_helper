@@ -48,6 +48,7 @@ pub mod proof_policy;
 mod proptest_tests;
 pub mod protocol;
 pub mod queue_contract;
+pub mod readiness;
 #[cfg(unix)]
 pub mod remote_compilation;
 #[cfg(unix)]
