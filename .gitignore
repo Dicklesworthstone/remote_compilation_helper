@@ -39,6 +39,8 @@ target_dusty/
 target_dusty_eagle/
 target-upgrade/
 target-local/
+/target_codex_rch*/
+/target_v*/
 logs/
 
 # Ephemeral files (agent-generated, build artifacts, test detritus)
