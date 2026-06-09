@@ -42,6 +42,7 @@ pub mod ssh;
 mod ssh_timeout_test;
 pub mod ssh_utils;
 pub mod stale_target_reap;
+pub mod telemetry_freshness;
 pub mod test_change;
 pub mod testing;
 pub mod toolchain;
@@ -199,6 +200,9 @@ pub use incident::{
 };
 pub use incident_ledger::{
     IncidentFilter, IncidentLedger, IncidentLedgerConfig, LedgerReadStats, default_ledger_path,
+};
+pub use telemetry_freshness::{
+    FreshnessAssessment, FreshnessInputs, FreshnessVerdict, assess as assess_telemetry_freshness,
 };
 
 // Errors module re-exports
