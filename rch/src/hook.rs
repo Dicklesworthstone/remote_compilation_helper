@@ -327,11 +327,6 @@ fn selection_protocol_version_value(value: &serde_json::Value) -> Option<u64> {
 fn selection_reason_wire_detail(value: &serde_json::Value) -> String {
     match value {
         serde_json::Value::String(reason) => reason.clone(),
-        serde_json::Value::Object(object) if object.len() == 1 => object
-            .keys()
-            .next()
-            .cloned()
-            .unwrap_or_else(|| value.to_string()),
         _ => value.to_string(),
     }
 }
@@ -12656,6 +12651,35 @@ edition = "2024"
             response.reason.to_string().contains("future_selector_gate"),
             "unknown unit reason should preserve daemon detail: {}",
             response.reason
+        );
+    }
+
+    #[test]
+    fn test_parse_selection_response_preserves_unknown_structured_reason_detail() {
+        let _guard = test_guard!();
+        let json = serde_json::json!({
+            "selection_protocol_version": rch_common::SELECTION_RESPONSE_PROTOCOL_VERSION,
+            "worker": null,
+            "reason": { "future_selector_gate": "runtime_probe_missing" },
+            "build_id": null,
+            "diagnostics": null
+        })
+        .to_string();
+
+        let response = parse_selection_response(&json).expect("unknown reason should not fail");
+        let detail = response.reason.to_string();
+
+        assert!(matches!(
+            response.reason,
+            SelectionReason::SelectionError(_)
+        ));
+        assert!(
+            detail.contains("future_selector_gate"),
+            "unknown structured reason should preserve variant name: {detail}"
+        );
+        assert!(
+            detail.contains("runtime_probe_missing"),
+            "unknown structured reason should preserve daemon payload: {detail}"
         );
     }
 
