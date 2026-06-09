@@ -47,6 +47,11 @@ pub fn is_retryable_transport_error_text(message: &str) -> bool {
         || message.contains("network is unreachable")
         || message.contains("no route to host")
         || message.contains("connection closed")
+        // rsync's canonical transient-drop message ("rsync: connection
+        // unexpectedly closed") does NOT contain the substring "connection
+        // closed" (the word "unexpectedly" sits between), so it must be matched
+        // explicitly or the most common rsync transport drop is treated fatal.
+        || message.contains("connection unexpectedly closed")
         || message.contains("connection lost")
         || message.contains("ssh_exchange_identification")
         || message.contains("kex_exchange_identification")
@@ -238,6 +243,12 @@ mod tests {
         ));
         assert!(is_retryable_transport_error_text("Broken pipe"));
         assert!(is_retryable_transport_error_text("Network is unreachable"));
+        // rsync's canonical transient drop — must be retryable (it does not
+        // contain the substring "connection closed").
+        assert!(is_retryable_transport_error_text(
+            "rsync: connection unexpectedly closed (0 bytes received so far) [sender]"
+        ));
+        assert!(!"rsync: connection unexpectedly closed".contains("connection closed"));
     }
 
     #[test]

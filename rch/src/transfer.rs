@@ -8,7 +8,8 @@ use anyhow::{Context, Result};
 use glob::Pattern;
 use rch_common::mock::{self, MockConfig, MockRsync, MockRsyncConfig, MockSshClient};
 use rch_common::ssh_utils::{
-    EnvPrefix, is_retryable_transport_error, is_valid_env_key, shell_escape_value,
+    EnvPrefix, is_retryable_transport_error, is_retryable_transport_error_text, is_valid_env_key,
+    shell_escape_value,
 };
 use rch_common::{
     ColorMode, CommandResult, CompilationKind, PathTopologyPolicy, RetryConfig, ToolchainInfo,
@@ -339,10 +340,33 @@ async fn execute_rsync_with_retry(
         let child = cmd
             .spawn()
             .map_err(|e| anyhow::anyhow!("rsync I/O error: {}", e))?;
-        child
+        let output = child
             .wait_with_output()
             .await
-            .map_err(|e| anyhow::anyhow!("rsync I/O error: {}", e))
+            .map_err(|e| anyhow::anyhow!("rsync I/O error: {}", e))?;
+        // A process that RAN but exited non-zero on a *transient transport*
+        // error must surface as Err so retry_with_backoff classifies and
+        // retries it. `wait_with_output` returns Ok for any exit status, so
+        // without this the retry subsystem was inert for the exact failure
+        // (flaky SSH → rsync exit 12/30/10, "connection unexpectedly closed")
+        // it exists to handle. The full stderr is embedded so the retry layer's
+        // re-classification agrees. Non-retryable non-zero exits return
+        // Ok(output) unchanged, so the caller's existing failure handling
+        // (exit-code/stderr reporting, partial-transfer checks) is preserved.
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if is_retryable_transport_error_text(&stderr) {
+                return Err(anyhow::anyhow!(
+                    "rsync transport error (exit {}): {}",
+                    output
+                        .status
+                        .code()
+                        .map_or_else(|| "signal".to_string(), |c| c.to_string()),
+                    stderr
+                ));
+            }
+        }
+        Ok(output)
     })
     .await
 }
@@ -4884,6 +4908,76 @@ Total file size: 123 bytes";
         assert!(
             err.to_string()
                 .contains("test_hanging_rsync: timed out after 25ms")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_execute_rsync_with_retry_retries_transient_transport_failure() {
+        // Regression: a process that RAN but exited non-zero on a transient
+        // transport error (rsync exit 12 / "connection unexpectedly closed")
+        // must be RETRIED. Previously wait_with_output()'s Ok-on-any-exit made
+        // retry_with_backoff return on attempt 0 — the retry subsystem was inert.
+        let _guard = test_guard!();
+        let retry_config = RetryConfig {
+            max_attempts: 3,
+            base_delay_ms: 1,
+            max_delay_ms: 2,
+            jitter_factor: 0.0,
+            total_timeout_ms: 5_000,
+        };
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_in = std::sync::Arc::clone(&calls);
+        let err = execute_rsync_with_retry(&retry_config, "transient_rsync", move || {
+            calls_in.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut cmd = Command::new("sh");
+            cmd.arg("-c")
+                .arg("echo 'rsync: connection unexpectedly closed (0 bytes received)' >&2; exit 12");
+            cmd.stdout(std::process::Stdio::piped());
+            cmd.stderr(std::process::Stdio::piped());
+            cmd
+        })
+        .await
+        .expect_err("transient transport failure should exhaust retries as Err");
+        assert!(err.to_string().contains("transport error"));
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "must retry up to max_attempts on a retryable transport failure"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_execute_rsync_with_retry_does_not_retry_non_transport_failure() {
+        // A non-zero exit that is NOT a transport error returns Ok(output) with
+        // a non-success status (so the caller's existing failure handling runs)
+        // and is NOT retried.
+        let _guard = test_guard!();
+        let retry_config = RetryConfig {
+            max_attempts: 3,
+            base_delay_ms: 1,
+            max_delay_ms: 2,
+            jitter_factor: 0.0,
+            total_timeout_ms: 5_000,
+        };
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_in = std::sync::Arc::clone(&calls);
+        let output = execute_rsync_with_retry(&retry_config, "fatal_rsync", move || {
+            calls_in.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut cmd = Command::new("sh");
+            cmd.arg("-c").arg("echo 'rsync: mkstemp failed: Permission denied' >&2; exit 23");
+            cmd.stdout(std::process::Stdio::piped());
+            cmd.stderr(std::process::Stdio::piped());
+            cmd
+        })
+        .await
+        .expect("non-transport failure returns Ok(output) for caller handling");
+        assert!(!output.status.success());
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "must NOT retry a non-transport failure"
         );
     }
 
