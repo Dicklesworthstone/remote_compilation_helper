@@ -3084,17 +3084,26 @@ mod tests {
 
     #[test]
     fn test_webhook_format_toml_spelling() {
-        // The config TOML uses snake_case spellings.
-        assert_eq!(
-            toml::to_string(&DoctorWebhookFormat::GenericJson)
-                .unwrap()
-                .trim(),
-            "\"generic_json\""
+        // The config TOML uses snake_case spellings. TOML documents are tables
+        // at the root, so a bare enum cannot be (de)serialized standalone —
+        // verify the wire spelling through a `format = "..."` table field, the
+        // shape it actually appears in within the config.
+        #[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug)]
+        struct FormatWrap {
+            format: DoctorWebhookFormat,
+        }
+        let rendered = toml::to_string(&FormatWrap {
+            format: DoctorWebhookFormat::GenericJson,
+        })
+        .unwrap();
+        assert!(
+            rendered.contains("format = \"generic_json\""),
+            "unexpected TOML: {rendered}"
         );
-        let slack: DoctorWebhookFormat = toml::from_str("\"slack\"").unwrap();
-        assert_eq!(slack, DoctorWebhookFormat::Slack);
-        let pd: DoctorWebhookFormat = toml::from_str("\"pagerduty\"").unwrap();
-        assert_eq!(pd, DoctorWebhookFormat::Pagerduty);
+        let slack: FormatWrap = toml::from_str("format = \"slack\"").unwrap();
+        assert_eq!(slack.format, DoctorWebhookFormat::Slack);
+        let pd: FormatWrap = toml::from_str("format = \"pagerduty\"").unwrap();
+        assert_eq!(pd.format, DoctorWebhookFormat::Pagerduty);
     }
 
     #[test]
