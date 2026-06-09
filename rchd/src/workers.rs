@@ -11,7 +11,7 @@ use rch_common::{
     CircuitBreakerConfig, CircuitState, CircuitStats, WorkerCapabilities, WorkerConfig, WorkerId,
     WorkerStatus,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -28,6 +28,326 @@ fn duration_millis_i64(duration: Duration) -> i64 {
 
 fn duration_secs_i64(duration: Duration) -> i64 {
     i64::try_from(duration.as_secs()).unwrap_or(i64::MAX)
+}
+
+// =============================================================================
+// Worker lifecycle type model (bd-session-history-remediation-ocv9i.1.1)
+// =============================================================================
+//
+// A worker's lifecycle is modelled as **two independent axes** so that
+// permanent operator intent can never be confused with transient scheduler
+// eligibility:
+//
+//   1. [`AdminIntent`]  — the *desired inventory* axis. Changes ONLY through
+//      explicit operator actions (`rch workers disable/enable/drain`). This is
+//      what `workers.toml` encodes; it is the source of truth for what the
+//      operator wants in the fleet.
+//   2. [`EligibilityState`] — the *live scheduler eligibility* axis. Advances
+//      automatically from health probes and concrete failure classes. It NEVER
+//      writes back to `AdminIntent` / `workers.toml`.
+//
+// The cardinal safety invariant (session-history remediation): a transient
+// failure quarantines a worker on the eligibility axis (`TemporaryBypass`) but
+// must never mutate desired inventory, and a recovering worker must never
+// auto-rejoin if the operator has disabled it. Keeping the two axes as distinct
+// types makes "auto-rejoin an operator-disabled worker" unrepresentable rather
+// than merely discouraged.
+//
+// ## Serialization compatibility policy
+//
+// These types derive `serde` with `snake_case` so they are stable across the
+// daemon/status JSON boundary. They are *additive*: the legacy single-axis
+// [`WorkerStatus`] enum is untouched, and [`WorkerLifecycle::legacy_status`]
+// collapses the two axes back to a `WorkerStatus` for older status consumers
+// (`TemporaryBypass` → `Unreachable`, `RecoveredPendingCanary` → `Degraded`).
+// New variants must be appended, never reordered or renamed, so historical
+// JSONL replays continue to deserialize.
+
+/// Operator-controlled *desired* lifecycle intent for a worker.
+///
+/// This is the desired-inventory axis. It changes only through explicit
+/// operator actions and is never advanced by health probes or transient
+/// failures. A worker is only ever schedulable when its intent is
+/// [`AdminIntent::Active`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdminIntent {
+    /// Operator wants this worker in service (default).
+    #[default]
+    Active,
+    /// Operator asked the worker to stop taking *new* jobs but finish current
+    /// ones (`rch workers drain`).
+    Draining,
+    /// Drain has completed (no active jobs); the operator's intent is still
+    /// "out of service" until they re-enable.
+    Drained,
+    /// Operator explicitly disabled the worker. Never eligible — and never
+    /// auto-rejoined by the recovery path — until re-enabled.
+    Disabled,
+}
+
+/// Transient *scheduler eligibility* derived from health probes and failure
+/// classes.
+///
+/// This is the live axis. It advances automatically and never writes back to
+/// [`AdminIntent`]. The quarantine lifecycle is:
+///
+/// ```text
+/// Healthy/Degraded/Unreachable --enter_bypass(class)--> TemporaryBypass
+/// TemporaryBypass              --recover_to_canary----> RecoveredPendingCanary
+/// RecoveredPendingCanary       --promote_from_canary--> Healthy
+/// RecoveredPendingCanary       --enter_bypass(class)--> TemporaryBypass   (relapse)
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EligibilityState {
+    /// Healthy and accepting work.
+    #[default]
+    Healthy,
+    /// Responding but slow/partially degraded — still eligible for work.
+    Degraded,
+    /// Failed to respond to heartbeat — temporarily ineligible, but not yet
+    /// quarantined into a failure-class bypass.
+    Unreachable,
+    /// Quarantined out of scheduling because a probe hit a concrete failure
+    /// class. Distinct from [`AdminIntent::Disabled`]: this is transient and
+    /// recovers automatically via probe + canary.
+    TemporaryBypass,
+    /// A previously bypassed worker passed its recovery probe and is awaiting a
+    /// single canary build before full rejoin.
+    RecoveredPendingCanary,
+}
+
+/// Concrete failure class that quarantined a worker into
+/// [`EligibilityState::TemporaryBypass`].
+///
+/// Mirrors the raw session-history failure classes enumerated in the program
+/// validation contract (`docs/guides/session-history-remediation-validation.md`)
+/// so incident/status output can attribute a bypass to a specific root cause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BypassFailureClass {
+    /// SSH connection/auth failure to the worker.
+    Ssh,
+    /// `rch-wkr` missing, wrong path, or wrong user on the worker.
+    WorkerBinary,
+    /// Required runtime/toolchain/Rust target absent on the worker.
+    RuntimeToolchain,
+    /// Disk or inode pressure on the worker.
+    DiskInodePressure,
+    /// Worker telemetry is stale or its age is unknown.
+    StaleTelemetry,
+    /// Path/source sync (rsync) failure to the worker.
+    PathSync,
+    /// Artifact retrieval from the worker failed.
+    ArtifactRetrieval,
+    /// Worker's circuit breaker is open.
+    CircuitBreaker,
+    /// Worker OS/architecture does not match the build target.
+    OsArchMismatch,
+}
+
+/// An attempted lifecycle transition that the state machine rejects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IllegalLifecycleTransition {
+    /// Eligibility state the worker was in.
+    pub from: EligibilityState,
+    /// Eligibility state that was requested.
+    pub to: EligibilityState,
+    /// Why the transition is not permitted.
+    pub reason: &'static str,
+}
+
+impl std::fmt::Display for IllegalLifecycleTransition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "illegal worker lifecycle transition {:?} -> {:?}: {}",
+            self.from, self.to, self.reason
+        )
+    }
+}
+
+impl std::error::Error for IllegalLifecycleTransition {}
+
+/// The full lifecycle state of a worker: the two independent axes plus the
+/// failure class that explains a current bypass (if any).
+///
+/// Scheduling decisions combine both axes via [`WorkerLifecycle::is_schedulable`]
+/// — admin intent dominates, but neither axis ever overwrites the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct WorkerLifecycle {
+    /// Operator-controlled desired intent.
+    pub admin: AdminIntent,
+    /// Health-/probe-driven live eligibility.
+    pub eligibility: EligibilityState,
+    /// Set iff `eligibility == TemporaryBypass`; explains the quarantine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bypass_cause: Option<BypassFailureClass>,
+}
+
+impl WorkerLifecycle {
+    /// A fresh, fully in-service worker: `Active` + `Healthy`.
+    pub fn new() -> Self {
+        Self {
+            admin: AdminIntent::Active,
+            eligibility: EligibilityState::Healthy,
+            bypass_cause: None,
+        }
+    }
+
+    /// Bridge from the legacy single-axis [`WorkerStatus`] so existing call
+    /// sites can be migrated incrementally. Admin-intent statuses populate the
+    /// admin axis with a `Healthy` eligibility; health statuses populate the
+    /// eligibility axis with an `Active` intent.
+    pub fn from_worker_status(status: WorkerStatus) -> Self {
+        match status {
+            WorkerStatus::Healthy => Self::new(),
+            WorkerStatus::Degraded => Self {
+                admin: AdminIntent::Active,
+                eligibility: EligibilityState::Degraded,
+                bypass_cause: None,
+            },
+            WorkerStatus::Unreachable => Self {
+                admin: AdminIntent::Active,
+                eligibility: EligibilityState::Unreachable,
+                bypass_cause: None,
+            },
+            WorkerStatus::Draining => Self {
+                admin: AdminIntent::Draining,
+                eligibility: EligibilityState::Healthy,
+                bypass_cause: None,
+            },
+            WorkerStatus::Drained => Self {
+                admin: AdminIntent::Drained,
+                eligibility: EligibilityState::Healthy,
+                bypass_cause: None,
+            },
+            WorkerStatus::Disabled => Self {
+                admin: AdminIntent::Disabled,
+                eligibility: EligibilityState::Healthy,
+                bypass_cause: None,
+            },
+        }
+    }
+
+    /// Collapse the two axes back to a legacy [`WorkerStatus`] for older
+    /// status/JSON consumers. Admin intent takes precedence; the new transient
+    /// states map to their closest legacy equivalent (`TemporaryBypass` →
+    /// `Unreachable`, `RecoveredPendingCanary` → `Degraded`).
+    pub fn legacy_status(&self) -> WorkerStatus {
+        match self.admin {
+            AdminIntent::Disabled => WorkerStatus::Disabled,
+            AdminIntent::Draining => WorkerStatus::Draining,
+            AdminIntent::Drained => WorkerStatus::Drained,
+            AdminIntent::Active => match self.eligibility {
+                EligibilityState::Healthy => WorkerStatus::Healthy,
+                EligibilityState::Degraded | EligibilityState::RecoveredPendingCanary => {
+                    WorkerStatus::Degraded
+                }
+                EligibilityState::Unreachable | EligibilityState::TemporaryBypass => {
+                    WorkerStatus::Unreachable
+                }
+            },
+        }
+    }
+
+    /// Whether the scheduler may route a *normal* build to this worker.
+    ///
+    /// True only when the operator intends it to be in service (`Active`) and
+    /// its live eligibility is `Healthy` or `Degraded`. Unreachable, bypassed,
+    /// and canary-pending workers are excluded from normal scheduling.
+    pub fn is_schedulable(&self) -> bool {
+        self.admin == AdminIntent::Active
+            && matches!(
+                self.eligibility,
+                EligibilityState::Healthy | EligibilityState::Degraded
+            )
+    }
+
+    /// Whether this worker may receive exactly one canary build (it recovered
+    /// from a bypass and the operator still wants it in service). The canary
+    /// build itself is driven by a later bead; this predicate gates it.
+    pub fn is_canary_pending(&self) -> bool {
+        self.admin == AdminIntent::Active
+            && self.eligibility == EligibilityState::RecoveredPendingCanary
+    }
+
+    /// Apply an operator intent change. This is the *only* way the desired
+    /// inventory axis moves; it never touches the eligibility axis.
+    pub fn set_admin(&mut self, intent: AdminIntent) {
+        self.admin = intent;
+    }
+
+    /// Record a plain health observation (`Healthy`/`Degraded`/`Unreachable`).
+    ///
+    /// Health observations move freely among the three plain health states but
+    /// must NOT silently clear a quarantine: if the worker is currently
+    /// `TemporaryBypass` or `RecoveredPendingCanary`, the observation is
+    /// ignored and `false` is returned. Recovery happens only through the
+    /// explicit probe/canary transitions.
+    ///
+    /// Returns `true` when the observation was applied. Passing a non-health
+    /// state (`TemporaryBypass` / `RecoveredPendingCanary`) returns `false`
+    /// without mutating; use [`Self::enter_bypass`] / [`Self::recover_to_canary`]
+    /// for those.
+    pub fn observe_health(&mut self, health: EligibilityState) -> bool {
+        let is_plain_health = matches!(
+            health,
+            EligibilityState::Healthy | EligibilityState::Degraded | EligibilityState::Unreachable
+        );
+        let currently_quarantined = matches!(
+            self.eligibility,
+            EligibilityState::TemporaryBypass | EligibilityState::RecoveredPendingCanary
+        );
+        if !is_plain_health || currently_quarantined {
+            return false;
+        }
+        self.eligibility = health;
+        true
+    }
+
+    /// Quarantine the worker on the eligibility axis because a probe hit a
+    /// concrete failure class. Legal from *any* eligibility state — a failure
+    /// is a fact, including a failed canary (`RecoveredPendingCanary` relapses
+    /// here) or an already-bypassed worker whose cause is being updated. Never
+    /// mutates the admin axis — this is the core "transient failure ≠ desired
+    /// inventory" invariant.
+    pub fn enter_bypass(&mut self, cause: BypassFailureClass) {
+        self.eligibility = EligibilityState::TemporaryBypass;
+        self.bypass_cause = Some(cause);
+    }
+
+    /// Advance a bypassed worker to `RecoveredPendingCanary` after a successful
+    /// recovery probe. Legal only from `TemporaryBypass`.
+    pub fn recover_to_canary(&mut self) -> Result<(), IllegalLifecycleTransition> {
+        if self.eligibility != EligibilityState::TemporaryBypass {
+            return Err(IllegalLifecycleTransition {
+                from: self.eligibility,
+                to: EligibilityState::RecoveredPendingCanary,
+                reason: "recovery to canary is only legal from temporary_bypass",
+            });
+        }
+        self.eligibility = EligibilityState::RecoveredPendingCanary;
+        self.bypass_cause = None;
+        Ok(())
+    }
+
+    /// Fully rejoin a worker after a successful canary build. Legal only from
+    /// `RecoveredPendingCanary`. Does not, and must not, change admin intent —
+    /// an operator-disabled worker stays disabled even after a clean canary.
+    pub fn promote_from_canary(&mut self) -> Result<(), IllegalLifecycleTransition> {
+        if self.eligibility != EligibilityState::RecoveredPendingCanary {
+            return Err(IllegalLifecycleTransition {
+                from: self.eligibility,
+                to: EligibilityState::Healthy,
+                reason: "promotion is only legal from recovered_pending_canary",
+            });
+        }
+        self.eligibility = EligibilityState::Healthy;
+        self.bypass_cause = None;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1129,6 +1449,339 @@ fn worker_status_label(status: WorkerStatus) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // =========================================================================
+    // Worker lifecycle type model (bd-session-history-remediation-ocv9i.1.1)
+    // =========================================================================
+
+    /// Every concrete failure class, for exhaustive bypass-attribution tests.
+    const ALL_FAILURE_CLASSES: &[BypassFailureClass] = &[
+        BypassFailureClass::Ssh,
+        BypassFailureClass::WorkerBinary,
+        BypassFailureClass::RuntimeToolchain,
+        BypassFailureClass::DiskInodePressure,
+        BypassFailureClass::StaleTelemetry,
+        BypassFailureClass::PathSync,
+        BypassFailureClass::ArtifactRetrieval,
+        BypassFailureClass::CircuitBreaker,
+        BypassFailureClass::OsArchMismatch,
+    ];
+
+    #[test]
+    fn lifecycle_new_is_active_healthy_and_schedulable() {
+        let lc = WorkerLifecycle::new();
+        assert_eq!(lc.admin, AdminIntent::Active);
+        assert_eq!(lc.eligibility, EligibilityState::Healthy);
+        assert_eq!(lc.bypass_cause, None);
+        assert!(lc.is_schedulable());
+        assert!(!lc.is_canary_pending());
+        // Default must match new().
+        assert_eq!(WorkerLifecycle::default(), lc);
+    }
+
+    #[test]
+    fn lifecycle_from_worker_status_maps_both_axes() {
+        let cases = [
+            (
+                WorkerStatus::Healthy,
+                AdminIntent::Active,
+                EligibilityState::Healthy,
+            ),
+            (
+                WorkerStatus::Degraded,
+                AdminIntent::Active,
+                EligibilityState::Degraded,
+            ),
+            (
+                WorkerStatus::Unreachable,
+                AdminIntent::Active,
+                EligibilityState::Unreachable,
+            ),
+            (
+                WorkerStatus::Draining,
+                AdminIntent::Draining,
+                EligibilityState::Healthy,
+            ),
+            (
+                WorkerStatus::Drained,
+                AdminIntent::Drained,
+                EligibilityState::Healthy,
+            ),
+            (
+                WorkerStatus::Disabled,
+                AdminIntent::Disabled,
+                EligibilityState::Healthy,
+            ),
+        ];
+        for (status, admin, eligibility) in cases {
+            let lc = WorkerLifecycle::from_worker_status(status);
+            assert_eq!(lc.admin, admin, "admin axis for {status:?}");
+            assert_eq!(
+                lc.eligibility, eligibility,
+                "eligibility axis for {status:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn lifecycle_legacy_status_collapses_two_axes() {
+        // Admin intent dominates.
+        let disabled = WorkerLifecycle {
+            admin: AdminIntent::Disabled,
+            eligibility: EligibilityState::Healthy,
+            bypass_cause: None,
+        };
+        assert_eq!(disabled.legacy_status(), WorkerStatus::Disabled);
+        // New transient states map to their closest legacy equivalent.
+        let bypassed = WorkerLifecycle {
+            admin: AdminIntent::Active,
+            eligibility: EligibilityState::TemporaryBypass,
+            bypass_cause: Some(BypassFailureClass::Ssh),
+        };
+        assert_eq!(bypassed.legacy_status(), WorkerStatus::Unreachable);
+        let canary = WorkerLifecycle {
+            admin: AdminIntent::Active,
+            eligibility: EligibilityState::RecoveredPendingCanary,
+            bypass_cause: None,
+        };
+        assert_eq!(canary.legacy_status(), WorkerStatus::Degraded);
+        // Round-trip the unambiguous health states.
+        for status in [
+            WorkerStatus::Healthy,
+            WorkerStatus::Degraded,
+            WorkerStatus::Disabled,
+        ] {
+            assert_eq!(
+                WorkerLifecycle::from_worker_status(status).legacy_status(),
+                status
+            );
+        }
+    }
+
+    #[test]
+    fn lifecycle_is_schedulable_matrix() {
+        // Active + Healthy/Degraded => schedulable.
+        for elig in [EligibilityState::Healthy, EligibilityState::Degraded] {
+            let lc = WorkerLifecycle {
+                admin: AdminIntent::Active,
+                eligibility: elig,
+                bypass_cause: None,
+            };
+            assert!(lc.is_schedulable(), "Active+{elig:?} must schedule");
+        }
+        // Active + non-eligible => not schedulable.
+        for elig in [
+            EligibilityState::Unreachable,
+            EligibilityState::TemporaryBypass,
+            EligibilityState::RecoveredPendingCanary,
+        ] {
+            let lc = WorkerLifecycle {
+                admin: AdminIntent::Active,
+                eligibility: elig,
+                bypass_cause: None,
+            };
+            assert!(!lc.is_schedulable(), "Active+{elig:?} must NOT schedule");
+        }
+        // Any non-Active admin intent => never schedulable, even when Healthy.
+        for admin in [
+            AdminIntent::Draining,
+            AdminIntent::Drained,
+            AdminIntent::Disabled,
+        ] {
+            let lc = WorkerLifecycle {
+                admin,
+                eligibility: EligibilityState::Healthy,
+                bypass_cause: None,
+            };
+            assert!(!lc.is_schedulable(), "{admin:?}+Healthy must NOT schedule");
+        }
+    }
+
+    #[test]
+    fn lifecycle_enter_bypass_quarantines_for_every_failure_class_without_touching_admin() {
+        for &cause in ALL_FAILURE_CLASSES {
+            let mut lc = WorkerLifecycle::new();
+            let admin_before = lc.admin;
+            lc.enter_bypass(cause);
+            assert_eq!(lc.eligibility, EligibilityState::TemporaryBypass);
+            assert_eq!(lc.bypass_cause, Some(cause), "cause recorded for {cause:?}");
+            // The cardinal invariant: transient failure never mutates desired
+            // inventory.
+            assert_eq!(lc.admin, admin_before, "admin axis must be untouched");
+            assert!(!lc.is_schedulable());
+        }
+    }
+
+    #[test]
+    fn lifecycle_legal_recovery_path_healthy_again() {
+        let mut lc = WorkerLifecycle::new();
+        lc.enter_bypass(BypassFailureClass::DiskInodePressure);
+        lc.recover_to_canary().expect("probe success -> canary");
+        assert_eq!(lc.eligibility, EligibilityState::RecoveredPendingCanary);
+        assert_eq!(lc.bypass_cause, None, "cause cleared on recovery");
+        assert!(lc.is_canary_pending());
+        assert!(
+            !lc.is_schedulable(),
+            "canary-pending is not normal scheduling"
+        );
+        lc.promote_from_canary().expect("canary success -> healthy");
+        assert_eq!(lc.eligibility, EligibilityState::Healthy);
+        assert!(lc.is_schedulable());
+    }
+
+    #[test]
+    fn lifecycle_canary_relapse_via_enter_bypass_is_legal() {
+        let mut lc = WorkerLifecycle::new();
+        lc.enter_bypass(BypassFailureClass::Ssh);
+        lc.recover_to_canary().unwrap();
+        // Canary build fails -> relapse back to bypass with the new cause.
+        lc.enter_bypass(BypassFailureClass::PathSync);
+        assert_eq!(lc.eligibility, EligibilityState::TemporaryBypass);
+        assert_eq!(lc.bypass_cause, Some(BypassFailureClass::PathSync));
+    }
+
+    #[test]
+    fn lifecycle_illegal_recover_to_canary_from_non_bypass() {
+        for elig in [
+            EligibilityState::Healthy,
+            EligibilityState::Degraded,
+            EligibilityState::Unreachable,
+            EligibilityState::RecoveredPendingCanary,
+        ] {
+            let mut lc = WorkerLifecycle {
+                admin: AdminIntent::Active,
+                eligibility: elig,
+                bypass_cause: None,
+            };
+            let err = lc
+                .recover_to_canary()
+                .expect_err("recover_to_canary must be illegal from non-bypass");
+            assert_eq!(err.from, elig);
+            assert_eq!(err.to, EligibilityState::RecoveredPendingCanary);
+            // State unchanged on illegal transition.
+            assert_eq!(lc.eligibility, elig);
+        }
+    }
+
+    #[test]
+    fn lifecycle_illegal_promote_from_non_canary() {
+        for elig in [
+            EligibilityState::Healthy,
+            EligibilityState::Degraded,
+            EligibilityState::Unreachable,
+            EligibilityState::TemporaryBypass,
+        ] {
+            let mut lc = WorkerLifecycle {
+                admin: AdminIntent::Active,
+                eligibility: elig,
+                bypass_cause: None,
+            };
+            let err = lc
+                .promote_from_canary()
+                .expect_err("promote must be illegal from non-canary");
+            assert_eq!(err.from, elig);
+            assert_eq!(lc.eligibility, elig, "state unchanged on illegal promote");
+        }
+    }
+
+    #[test]
+    fn lifecycle_observe_health_never_clears_quarantine() {
+        let mut lc = WorkerLifecycle::new();
+        lc.enter_bypass(BypassFailureClass::StaleTelemetry);
+        // A "healthy" heartbeat must NOT auto-clear a failure-class bypass.
+        assert!(!lc.observe_health(EligibilityState::Healthy));
+        assert_eq!(lc.eligibility, EligibilityState::TemporaryBypass);
+        assert_eq!(lc.bypass_cause, Some(BypassFailureClass::StaleTelemetry));
+        // Same protection while awaiting canary.
+        lc.recover_to_canary().unwrap();
+        assert!(!lc.observe_health(EligibilityState::Healthy));
+        assert_eq!(lc.eligibility, EligibilityState::RecoveredPendingCanary);
+    }
+
+    #[test]
+    fn lifecycle_observe_health_moves_among_plain_states() {
+        let mut lc = WorkerLifecycle::new();
+        assert!(lc.observe_health(EligibilityState::Degraded));
+        assert_eq!(lc.eligibility, EligibilityState::Degraded);
+        assert!(lc.observe_health(EligibilityState::Unreachable));
+        assert_eq!(lc.eligibility, EligibilityState::Unreachable);
+        assert!(lc.observe_health(EligibilityState::Healthy));
+        assert_eq!(lc.eligibility, EligibilityState::Healthy);
+        // Passing a non-health state is rejected without mutation.
+        assert!(!lc.observe_health(EligibilityState::TemporaryBypass));
+        assert_eq!(lc.eligibility, EligibilityState::Healthy);
+    }
+
+    #[test]
+    fn lifecycle_operator_disabled_worker_never_auto_rejoins() {
+        // A worker the operator disabled must stay out of service even if it
+        // walks the full recovery path on the eligibility axis.
+        let mut lc = WorkerLifecycle::new();
+        lc.set_admin(AdminIntent::Disabled);
+        lc.enter_bypass(BypassFailureClass::CircuitBreaker);
+        lc.recover_to_canary().unwrap();
+        lc.promote_from_canary().unwrap();
+        assert_eq!(lc.eligibility, EligibilityState::Healthy);
+        // Admin intent is the gate: still disabled => never schedulable.
+        assert_eq!(lc.admin, AdminIntent::Disabled);
+        assert!(!lc.is_schedulable());
+        assert!(!lc.is_canary_pending());
+    }
+
+    #[test]
+    fn lifecycle_admin_axis_is_invariant_across_eligibility_transitions() {
+        for admin in [
+            AdminIntent::Active,
+            AdminIntent::Draining,
+            AdminIntent::Drained,
+            AdminIntent::Disabled,
+        ] {
+            let mut lc = WorkerLifecycle {
+                admin,
+                eligibility: EligibilityState::Healthy,
+                bypass_cause: None,
+            };
+            lc.enter_bypass(BypassFailureClass::OsArchMismatch);
+            lc.recover_to_canary().unwrap();
+            lc.promote_from_canary().unwrap();
+            lc.observe_health(EligibilityState::Degraded);
+            assert_eq!(
+                lc.admin, admin,
+                "eligibility transitions must not move admin"
+            );
+        }
+    }
+
+    #[test]
+    fn lifecycle_serde_round_trips_full_state() {
+        let lc = WorkerLifecycle {
+            admin: AdminIntent::Draining,
+            eligibility: EligibilityState::TemporaryBypass,
+            bypass_cause: Some(BypassFailureClass::ArtifactRetrieval),
+        };
+        let json = serde_json::to_string(&lc).expect("serialize");
+        assert!(json.contains("temporary_bypass"));
+        assert!(json.contains("artifact_retrieval"));
+        let back: WorkerLifecycle = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, lc);
+        // bypass_cause omitted when None.
+        let healthy = WorkerLifecycle::new();
+        let json = serde_json::to_string(&healthy).expect("serialize");
+        assert!(!json.contains("bypass_cause"), "None cause must be omitted");
+    }
+
+    #[test]
+    fn lifecycle_every_failure_class_serializes_to_distinct_snake_case_token() {
+        let mut seen = std::collections::BTreeSet::new();
+        for &cause in ALL_FAILURE_CLASSES {
+            let token = serde_json::to_string(&cause).expect("serialize cause");
+            assert!(seen.insert(token.clone()), "duplicate token {token}");
+            // Round-trips.
+            let back: BypassFailureClass = serde_json::from_str(&token).expect("deserialize cause");
+            assert_eq!(back, cause);
+        }
+        assert_eq!(seen.len(), ALL_FAILURE_CLASSES.len());
+    }
 
     #[test]
     fn test_duration_millis_i64_saturates() {
