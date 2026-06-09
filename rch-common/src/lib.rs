@@ -50,6 +50,7 @@ pub mod toolchain;
 pub mod types;
 pub mod ui;
 pub mod util;
+pub mod worker_facts;
 
 pub const BUILD_COMMIT_ENV_VARS: &[&str] = &[
     "RCH_GIT_COMMIT",
@@ -208,6 +209,10 @@ pub use telemetry_explain::{
 };
 pub use telemetry_freshness::{
     FreshnessAssessment, FreshnessInputs, FreshnessVerdict, assess as assess_telemetry_freshness,
+};
+pub use worker_facts::{
+    DiskFacts, DiskRootFacts, HostFacts, RuntimeFacts, RustFacts, UserFacts, WorkerBinaryFacts,
+    WorkerFacts, derive_target_triple, worker_facts_schema, worker_facts_schema_version,
 };
 
 // Errors module re-exports
