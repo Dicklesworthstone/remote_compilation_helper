@@ -8,6 +8,7 @@
 
 use std::sync::OnceLock;
 
+pub mod admission_recommendation;
 pub mod admission_rejection;
 pub mod admit_preflight;
 pub mod api;
