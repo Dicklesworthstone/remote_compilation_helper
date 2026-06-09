@@ -1011,26 +1011,64 @@ async fn copy_binary_via_scp(worker: &WorkerConfig, local_binary: &Path) -> Resu
         .await
         .map_err(|e| anyhow::anyhow!("scp failed: {}", e))?;
 
-    let finalize_cmd = finalize_staged_binary_command(&staging_path, remote_path)?;
+    // Atomic, rollback-safe switch (bd-...-7.2): chmod + checksum-verify +
+    // startup-validate the staged temp binary, and only `mv` it into place if
+    // all of that succeeds. `set -e` aborts BEFORE the rename on any failure
+    // (truncated/corrupt transfer => checksum mismatch; wrong arch/bad binary
+    // => `--version` exec error), so the previously working binary stays live.
+    let expected_sha256 = local_file_sha256_hex(local_binary)
+        .map_err(|e| anyhow::anyhow!("hash local binary {}: {}", local_binary.display(), e))?;
+    let finalize_cmd = staged_install_command(&staging_path, remote_path, &expected_sha256)?;
     let output = ssh
         .run_command(&finalize_cmd)
         .await
-        .map_err(|e| anyhow::anyhow!("finalize staged binary failed: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("staged install failed: {}", e))?;
 
     if output.success() {
         return Ok(());
     }
 
+    // Validation/checksum failed (or an interrupted transfer): the rename never
+    // ran, so the old binary is intact. Best-effort remove the staged temp.
     if let Ok(staging_path) = remote_shell_path(&staging_path) {
         let cleanup_cmd = format!("rm -f {staging_path}");
         let _ = ssh.run_command(&cleanup_cmd).await;
     }
 
     Err(anyhow::anyhow!(
-        "finalize staged binary failed with exit {}: {}",
+        "staged install rejected before switch (exit {}: {}); previous binary left active",
         output.exit_code,
         output.stderr.trim()
     ))
+}
+
+/// Streaming SHA-256 of a local file as a lowercase hex string. Matches the
+/// worker's `sha256sum` so a corrupt/truncated transfer is caught before the
+/// atomic switch.
+fn local_file_sha256_hex(path: &Path) -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hex_lower(&hasher.finalize()))
+}
+
+/// Lowercase hex encoding of a byte slice.
+fn hex_lower(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
 }
 
 /// Set executable permissions on the remote binary.
@@ -1097,11 +1135,34 @@ fn remote_shell_path(remote_path: &str) -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("invalid remote path contains control characters"))
 }
 
-fn finalize_staged_binary_command(staging_path: &str, final_path: &str) -> Result<String> {
+/// Build the atomic, rollback-safe install script for a staged worker binary
+/// (bd-...-7.2).
+///
+/// Under `set -e`, in order: make the staged temp executable, verify its
+/// SHA-256 against `expected_sha256` (catches a truncated/corrupt transfer),
+/// run `--version` FROM THE TEMP PATH (catches a wrong-arch/broken binary via
+/// an `Exec format error`), and only then `mv -f` it over the live binary. Any
+/// earlier failure exits non-zero before the rename, so the previously working
+/// binary is never replaced by a bad one.
+fn staged_install_command(
+    staging_path: &str,
+    final_path: &str,
+    expected_sha256: &str,
+) -> Result<String> {
+    let staged = remote_shell_path(staging_path)?;
+    let final_path = remote_shell_path(final_path)?;
+    // expected_sha256 is our own lowercase hex (64 chars, [0-9a-f]); guard
+    // anyway so a non-hex value can never inject shell.
+    if expected_sha256.len() != 64 || !expected_sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(anyhow::anyhow!("invalid expected sha256 digest"));
+    }
     Ok(format!(
-        "set -e; chmod +x {staged}; mv -f {staged} {final_path}",
-        staged = remote_shell_path(staging_path)?,
-        final_path = remote_shell_path(final_path)?
+        "set -e; \
+         chmod +x {staged}; \
+         actual=$(sha256sum {staged} | cut -d' ' -f1); \
+         [ \"$actual\" = \"{expected_sha256}\" ] || {{ echo \"checksum mismatch: $actual != {expected_sha256}\" >&2; exit 1; }}; \
+         {staged} --version >/dev/null 2>&1 || {{ echo \"staged binary failed --version (wrong arch or corrupt)\" >&2; exit 1; }}; \
+         mv -f {staged} {final_path}"
     ))
 }
 
@@ -1645,17 +1706,71 @@ mod tests {
     }
 
     #[test]
-    fn finalize_staged_binary_command_renames_temp_binary_into_place() -> Result<()> {
-        let command = finalize_staged_binary_command(
+    fn staged_install_command_validates_then_renames_in_order() -> Result<()> {
+        let sha = "a".repeat(64);
+        let command = staged_install_command(
             "~/.local/bin/.rch-wkr.tmp.123.456",
             REMOTE_WORKER_BINARY,
+            &sha,
         )?;
 
+        // chmod, checksum, --version, then mv — with mv strictly last.
+        assert!(command.contains("set -e"));
         assert!(command.contains("chmod +x \"$HOME/.local/bin/.rch-wkr.tmp.123.456\""));
+        assert!(command.contains("sha256sum \"$HOME/.local/bin/.rch-wkr.tmp.123.456\""));
+        assert!(
+            command.contains(&sha),
+            "expected digest embedded for comparison"
+        );
+        assert!(command.contains("\"$HOME/.local/bin/.rch-wkr.tmp.123.456\" --version"));
         assert!(command.contains(
             "mv -f \"$HOME/.local/bin/.rch-wkr.tmp.123.456\" \"$HOME/.local/bin/rch-wkr\""
         ));
+        // Rollback-safety: the rename must be the LAST step (after both guards),
+        // so a failed checksum/version (set -e) never reaches it.
+        let mv_pos = command.find("mv -f").expect("mv present");
+        let sha_pos = command.find("sha256sum").expect("checksum present");
+        let ver_pos = command.find("--version").expect("version present");
+        assert!(
+            mv_pos > sha_pos && mv_pos > ver_pos,
+            "mv must come after both guards"
+        );
         Ok(())
+    }
+
+    #[test]
+    fn staged_install_command_rejects_non_hex_digest() {
+        // A non-hex/short digest must never be embedded into the shell script.
+        assert!(
+            staged_install_command("~/.local/bin/.rch-wkr.tmp.1", REMOTE_WORKER_BINARY, "nope")
+                .is_err()
+        );
+        assert!(
+            staged_install_command(
+                "~/.local/bin/.rch-wkr.tmp.1",
+                REMOTE_WORKER_BINARY,
+                "abc; rm -rf /"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn local_file_sha256_matches_known_vector() {
+        // SHA-256("") = e3b0c442...; SHA-256("abc") = ba7816bf...
+        let dir = tempfile::tempdir().unwrap();
+        let empty = dir.path().join("empty");
+        std::fs::write(&empty, b"").unwrap();
+        assert_eq!(
+            local_file_sha256_hex(&empty).unwrap(),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        let abc = dir.path().join("abc");
+        std::fs::write(&abc, b"abc").unwrap();
+        assert_eq!(
+            local_file_sha256_hex(&abc).unwrap(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
     }
 
     #[test]
