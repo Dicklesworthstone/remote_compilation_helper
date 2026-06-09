@@ -43,6 +43,7 @@ pub mod patterns;
 pub mod pooled_target_key;
 #[cfg(test)]
 mod patterns_security_test;
+pub mod proof_handoff;
 pub mod proof_intent;
 pub mod proof_policy;
 #[cfg(test)]
