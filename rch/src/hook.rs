@@ -27,6 +27,7 @@ use rch_common::repo_updater_contract::{
     RepoUpdaterAuthContext, RepoUpdaterAuthMode, RepoUpdaterCredentialSource,
     RepoUpdaterOperatorOverride, RepoUpdaterTrustedHostIdentity, RepoUpdaterVerifiedHostIdentity,
 };
+use rch_common::ssh_utils::shell_escape_value;
 use rch_common::{
     BuildHeartbeatPhase, BuildHeartbeatRequest, ColorMode, CommandPriority, CommandTimingBreakdown,
     CompilationKind, DependencyClosurePlan, HookInput, HookOutput, OutputVisibility,
@@ -40,12 +41,14 @@ use rch_common::{
         ArtifactSummary, CelebrationSummary, CompilationProgress, CompletionCelebration, Icons,
         OutputContext, RchTheme, TransferProgress,
     },
+    wrap_command_with_toolchain,
 };
 use rch_telemetry::protocol::{
     PIGGYBACK_MARKER, TelemetrySource, TestRunRecord, WorkerTelemetry,
     extract_piggybacked_telemetry,
 };
 use serde::{Deserialize, Serialize};
+use std::fmt::Write as _;
 use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::path::Component;
@@ -3857,23 +3860,29 @@ fn build_worker_projects_topology_cmd(topology_policy: &PathTopologyPolicy) -> S
          if [ ! -e {canonical} ] && [ ! -L {canonical} ]; then mkdir_stderr=$(mkdir -p -- {canonical} 2>&1) || {{ printf 'RCH_TOPOLOGY_ERR_CANONICAL_CREATE_FAILED:path=%s:%s\\n' {canonical} \"$mkdir_stderr\" >&2; exit 45; }}; fi; \
          if [ -e {canonical} ] && [ ! -d {canonical} ]; then printf 'RCH_TOPOLOGY_ERR_CANONICAL_NOT_DIRECTORY:path=%s\\n' {canonical} >&2; exit 41; fi; \
          canonical_real=$(readlink -f -- {canonical} 2>/dev/null || printf '%s' {canonical}); \
-         ensure_alias_symlink() {{ \
          if [ -L {alias} ]; then \
            target=$(readlink -- {alias} 2>/dev/null || true); \
            target_real=$(readlink -f -- {alias} 2>/dev/null || true); \
            if [ \"$target\" != {canonical} ] && [ \"$target\" != {canonical_slash} ] && [ \"$target_real\" != \"$canonical_real\" ]; then \
-             update_stderr=$(ln -sfn -- {canonical} {alias} 2>&1) || {{ printf 'RCH_TOPOLOGY_ERR_ALIAS_UPDATE_FAILED:path=%s:target=%s:%s\\n' {alias} {canonical} \"$update_stderr\" >&2; return 43; }}; \
+             update_stderr=$(ln -sfn -- {canonical} {alias} 2>&1) || {{ printf 'RCH_TOPOLOGY_ERR_ALIAS_UPDATE_FAILED:path=%s:target=%s:%s\\n' {alias} {canonical} \"$update_stderr\" >&2; exit 43; }}; \
            fi; \
          elif [ -e {alias} ]; then \
-           printf 'RCH_TOPOLOGY_ERR_ALIAS_NOT_SYMLINK:path=%s\\n' {alias} >&2; return 42; \
+           printf 'RCH_TOPOLOGY_ERR_ALIAS_NOT_SYMLINK:path=%s\\n' {alias} >&2; exit 42; \
          else \
-           create_stderr=$(ln -s -- {canonical} {alias} 2>&1) && return 0; \
-           if [ -L {alias} ]; then ensure_alias_symlink; return $?; fi; \
-           if [ -e {alias} ]; then printf 'RCH_TOPOLOGY_ERR_ALIAS_NOT_SYMLINK:path=%s\\n' {alias} >&2; return 42; fi; \
-           printf 'RCH_TOPOLOGY_ERR_ALIAS_CREATE_FAILED:path=%s:target=%s:%s\\n' {alias} {canonical} \"$create_stderr\" >&2; return 44; \
+           create_stderr=$(ln -s -- {canonical} {alias} 2>&1) || {{ \
+             if [ -L {alias} ]; then \
+               target=$(readlink -- {alias} 2>/dev/null || true); \
+               target_real=$(readlink -f -- {alias} 2>/dev/null || true); \
+               if [ \"$target\" != {canonical} ] && [ \"$target\" != {canonical_slash} ] && [ \"$target_real\" != \"$canonical_real\" ]; then \
+                 update_stderr=$(ln -sfn -- {canonical} {alias} 2>&1) || {{ printf 'RCH_TOPOLOGY_ERR_ALIAS_UPDATE_FAILED:path=%s:target=%s:%s\\n' {alias} {canonical} \"$update_stderr\" >&2; exit 43; }}; \
+               fi; \
+             elif [ -e {alias} ]; then \
+               printf 'RCH_TOPOLOGY_ERR_ALIAS_NOT_SYMLINK:path=%s\\n' {alias} >&2; exit 42; \
+             else \
+               printf 'RCH_TOPOLOGY_ERR_ALIAS_CREATE_FAILED:path=%s:target=%s:%s\\n' {alias} {canonical} \"$create_stderr\" >&2; exit 44; \
+             fi; \
+           }}; \
          fi; \
-         }}; \
-         ensure_alias_symlink; \
          echo RCH_TOPOLOGY_OK",
         canonical = shell_escape::escape(canonical_display.into()),
         canonical_slash = shell_escape::escape(canonical_slash_display.into()),
@@ -6523,11 +6532,12 @@ async fn execute_remote_compilation(
         warnings: None,
     }));
 
-    // Add per-worker CARGO_HOME isolation to prevent cache lock contention
-    let isolated_command = add_cargo_isolation(command, &worker_config.id);
-
-    // Stream stdout/stderr to our stderr so the agent sees the output
-    let command_with_telemetry = wrap_command_with_telemetry(&isolated_command, &worker_config.id);
+    // Prepare command before the transfer layer adds its process-group wrapper.
+    // Toolchain selection must happen before shell wrappers such as `sh -c`;
+    // otherwise `rustup run ... sh -c <multiline script>` creates fragile nested
+    // quoting and can override explicit `cargo +toolchain` commands.
+    let command_with_telemetry =
+        prepare_remote_execution_command(command, &worker_config.id, toolchain);
     let ui_state_stdout = Rc::clone(&ui_state);
     let ui_state_stderr = Rc::clone(&ui_state);
     let stderr_capture_stderr = Rc::clone(&stderr_capture_cell);
@@ -6543,7 +6553,7 @@ async fn execute_remote_compilation(
         .execute_remote_streaming(
             &worker_config,
             &command_with_telemetry,
-            toolchain,
+            None,
             move |line| {
                 if suppress_telemetry {
                     return;
@@ -6942,6 +6952,78 @@ async fn execute_remote_compilation(
 }
 
 /// Add per-worker CARGO_HOME isolation to prevent cache lock contention.
+fn prepare_remote_execution_command(
+    command: &str,
+    worker_id: &WorkerId,
+    toolchain: Option<&ToolchainInfo>,
+) -> String {
+    let command = if command_has_explicit_cargo_toolchain(command) {
+        command.to_string()
+    } else {
+        wrap_command_with_toolchain(command, toolchain)
+    };
+    wrap_command_with_remote_context(&command, worker_id)
+}
+
+fn command_has_explicit_cargo_toolchain(command: &str) -> bool {
+    let Ok(tokens) = shell_words::split(command) else {
+        return false;
+    };
+    tokens
+        .windows(2)
+        .any(|pair| pair[0] == "cargo" && pair[1].starts_with('+') && pair[1].len() > 1)
+}
+
+fn wrap_command_with_remote_context(command: &str, worker_id: &WorkerId) -> String {
+    let encoded_command = shell_octal_printf_arg(command);
+    let escaped_worker = shell_escape_value(worker_id.as_str())
+        .expect("worker id should not contain shell control characters");
+
+    let cargo_context = if command.contains("cargo") {
+        let session_id = std::process::id();
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let safe_worker_id = sanitize_cargo_home_token(worker_id.as_str());
+        let cargo_home = rch_common::remote_cargo_home_expr(&format!(
+            "{safe_worker_id}-{session_id}-{timestamp}"
+        ));
+        let quoted_cargo_home = format!("\"{cargo_home}\"");
+        let base_prelude = rch_common::remote_cargo_home_base_prelude();
+        format!(
+            "{base_prelude}; mkdir -p {cargo_home} || exit $?; export CARGO_HOME={cargo_home}; __rch_cleanup_cargo_home={cargo_home}; ",
+            base_prelude = base_prelude,
+            cargo_home = quoted_cargo_home,
+        )
+    } else {
+        String::new()
+    };
+
+    let cleanup = if command.contains("cargo") {
+        "rm -rf \"$__rch_cleanup_cargo_home\"; "
+    } else {
+        ""
+    };
+    let script = format!(
+        "{cargo_context}__cmd=$(printf '%b' \"$1\"); sh -c \"$__cmd\"; status=$?; {cleanup}if command -v rch-telemetry >/dev/null 2>&1; then \
+         telemetry=$(rch-telemetry collect --format json --worker-id {worker} 2>/dev/null || true); \
+         if [ -n \"$telemetry\" ]; then echo '{marker}'; echo \"$telemetry\"; fi; \
+         fi; exit $status",
+        worker = escaped_worker,
+        marker = PIGGYBACK_MARKER,
+    );
+
+    format!(
+        "sh -c {} rch-remote-command {}",
+        shell_escape_value(&script)
+            .expect("remote context script must not contain control characters"),
+        encoded_command
+    )
+}
+
+/// Add per-worker CARGO_HOME isolation to prevent cache lock contention.
+#[cfg(test)]
 fn add_cargo_isolation(command: &str, worker_id: &WorkerId) -> String {
     // Check if this is a cargo command that could benefit from isolation
     if !command.contains("cargo") {
@@ -6966,34 +7048,50 @@ fn add_cargo_isolation(command: &str, worker_id: &WorkerId) -> String {
     let quoted_cargo_home = format!("\"{cargo_home}\"");
     let base_prelude = rch_common::remote_cargo_home_base_prelude();
 
-    let escaped_command = shell_escape::escape(command.into());
+    let encoded_command = shell_octal_printf_arg(command);
     let script = format!(
-        "{base_prelude}; mkdir -p {cargo_home} || exit $?; export CARGO_HOME={cargo_home}; sh -c {command}; status=$?; rm -rf {cargo_home}; exit $status",
+        "{base_prelude}; mkdir -p {cargo_home} || exit $?; export CARGO_HOME={cargo_home}; __cmd=$(printf '%b' \"$1\"); sh -c \"$__cmd\"; status=$?; rm -rf {cargo_home}; exit $status",
         base_prelude = base_prelude,
         cargo_home = quoted_cargo_home,
-        command = escaped_command
     );
 
     // The transfer layer may prepend `timeout ...` directly before this string.
     // Running the env assignment inside an explicit shell prevents `timeout`
     // from trying to exec `CARGO_HOME=...` as argv[0], while preserving the
     // original cargo exit status after cleanup.
-    format!("sh -c {}", shell_escape::escape(script.into()))
+    format!(
+        "sh -c {} rch-cargo {}",
+        shell_escape_value(&script)
+            .expect("cargo isolation script must not contain control characters"),
+        encoded_command
+    )
 }
 
+#[cfg(test)]
 fn wrap_command_with_telemetry(command: &str, worker_id: &WorkerId) -> String {
     let escaped_worker = shell_escape::escape(worker_id.as_str().into());
-    // Use newline instead of semicolon to ensure trailing comments in command
-    // don't comment out the status capture logic.
-    format!(
-        "{cmd}\nstatus=$?; if command -v rch-telemetry >/dev/null 2>&1; then \
+    let encoded_command = shell_octal_printf_arg(command);
+    let script = format!(
+        "__cmd=$(printf '%b' \"$1\"); sh -c \"$__cmd\"; status=$?; if command -v rch-telemetry >/dev/null 2>&1; then \
          telemetry=$(rch-telemetry collect --format json --worker-id {worker} 2>/dev/null || true); \
          if [ -n \"$telemetry\" ]; then echo '{marker}'; echo \"$telemetry\"; fi; \
          fi; exit $status",
-        cmd = command,
         worker = escaped_worker,
         marker = PIGGYBACK_MARKER
+    );
+    format!(
+        "sh -c {} rch-telemetry-command {}",
+        shell_escape_value(&script).expect("telemetry script must not contain control characters"),
+        encoded_command
     )
+}
+
+fn shell_octal_printf_arg(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len() * 4);
+    for byte in value.as_bytes() {
+        write!(&mut encoded, "\\{byte:03o}").expect("write to String should not fail");
+    }
+    format!("'{encoded}'")
 }
 
 async fn send_telemetry(
@@ -9389,16 +9487,96 @@ The file `x11.pc` needs to be installed and the PKG_CONFIG_PATH environment vari
         let command = "echo hello # my comment";
         let wrapped = wrap_command_with_telemetry(command, &worker_id);
 
-        // Ensure newline separation exists
-        assert!(wrapped.contains(&format!("{}\nstatus=$?", command)));
-
-        // Ensure status capture isn't commented out (it should be on a new line)
-        let lines: Vec<&str> = wrapped.lines().collect();
-        assert!(lines.iter().any(|l| l.starts_with("status=$?")));
-
-        // Basic sanity check on structure
+        assert!(wrapped.starts_with("sh -c "));
+        assert!(
+            !wrapped.contains(command),
+            "child command should be encoded as data, not nested shell syntax: {wrapped}"
+        );
         assert!(wrapped.contains("rch-telemetry collect"));
         assert!(wrapped.contains("exit $status"));
+
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&wrapped)
+            .output()
+            .expect("telemetry wrapper should execute");
+        assert!(
+            output.status.success(),
+            "telemetry wrapper should preserve command status; wrapped={wrapped} stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("hello"),
+            "wrapped command should run before telemetry"
+        );
+    }
+
+    #[test]
+    fn test_prepare_remote_execution_command_skips_detected_toolchain_for_explicit_cargo_toolchain()
+    {
+        let _guard = test_guard!();
+        let worker_id = rch_common::WorkerId::new("worker1");
+        let toolchain = ToolchainInfo::new("stable", None, "");
+        let wrapped =
+            prepare_remote_execution_command("cargo +nightly check", &worker_id, Some(&toolchain));
+
+        assert!(!wrapped.contains('\n'));
+        assert!(
+            !wrapped.contains("rustup run stable cargo +nightly"),
+            "detected stable toolchain must not override explicit cargo +nightly: {wrapped}"
+        );
+        assert!(
+            !wrapped.contains("rustup run stable sh -c"),
+            "toolchain wrapper must not wrap the shell isolation layer: {wrapped}"
+        );
+    }
+
+    #[test]
+    fn test_prepare_remote_execution_command_applies_detected_toolchain_before_shell_wrappers() {
+        let _guard = test_guard!();
+        let worker_id = rch_common::WorkerId::new("worker1");
+        let toolchain = ToolchainInfo::new("stable", None, "");
+        let wrapped = prepare_remote_execution_command("cargo check", &worker_id, Some(&toolchain));
+
+        assert!(
+            !wrapped.contains("rustup run stable sh -c"),
+            "toolchain wrapper must be inside, not around, the shell isolation layer: {wrapped}"
+        );
+        assert!(!wrapped.contains('\n'));
+    }
+
+    #[test]
+    fn test_command_has_explicit_cargo_toolchain_detects_plus_toolchains() {
+        assert!(command_has_explicit_cargo_toolchain("cargo +nightly check"));
+        assert!(command_has_explicit_cargo_toolchain(
+            "env FOO=bar cargo +beta test"
+        ));
+        assert!(!command_has_explicit_cargo_toolchain("cargo check"));
+        assert!(!command_has_explicit_cargo_toolchain("cargo + check"));
+    }
+
+    #[test]
+    fn test_prepare_remote_execution_command_executes_encoded_cargo_wrapper() {
+        let _guard = test_guard!();
+        let worker_id = rch_common::WorkerId::new("worker1");
+        let wrapped = prepare_remote_execution_command("cargo --version", &worker_id, None);
+
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&wrapped)
+            .output()
+            .expect("prepared encoded cargo wrapper should execute");
+        assert!(
+            output.status.success(),
+            "encoded cargo wrapper should preserve command success; wrapped={wrapped} stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("cargo "),
+            "wrapped cargo command should run"
+        );
     }
 
     #[test]
@@ -9422,7 +9600,10 @@ The file `x11.pc` needs to be installed and the PKG_CONFIG_PATH environment vari
         assert!(isolated.contains("/data/tmp"));
         assert!(isolated.contains("mkdir -p \"${RCH_CH_BASE}/rch-cargo-home-test-worker-"));
         assert!(isolated.contains("CARGO_HOME=\"${RCH_CH_BASE}/rch-cargo-home-test-worker-"));
-        assert!(isolated.contains("cargo build --release"));
+        assert!(
+            isolated.contains(&shell_octal_printf_arg(cargo_command)),
+            "cargo command should be encoded as a printf payload: {isolated}"
+        );
         assert!(isolated.contains("status=$?"));
         assert!(isolated.contains("exit $status"));
         assert!(isolated.contains("rm -rf \"${RCH_CH_BASE}/rch-cargo-home-test-worker-"));
@@ -9470,7 +9651,10 @@ The file `x11.pc` needs to be installed and the PKG_CONFIG_PATH environment vari
         );
         assert!(isolated.contains("mkdir -p \"${RCH_CH_BASE}/rch-cargo-home-worker-123-"));
         assert!(isolated.contains("CARGO_HOME=\"${RCH_CH_BASE}/rch-cargo-home-worker-123-"));
-        assert!(isolated.contains("cd /some/path && RUSTFLAGS=\"-C target-cpu=native\" cargo test --release --features=foo"));
+        assert!(
+            isolated.contains(&shell_octal_printf_arg(complex_command)),
+            "complex cargo command should be encoded as a printf payload: {isolated}"
+        );
         assert!(isolated.contains("status=$?"));
         assert!(isolated.contains("exit $status"));
         assert!(isolated.contains("rm -rf \"${RCH_CH_BASE}/rch-cargo-home-worker-123-"));
@@ -11228,15 +11412,17 @@ edition = "2024"
 
         assert!(
             command.contains(&format!(
-                "create_stderr=$(ln -s -- {canonical} {alias} 2>&1) && return 0"
+                "create_stderr=$(ln -s -- {canonical} {alias} 2>&1) || {{"
             )),
-            "create path must handle normal symlink creation inside the alias helper: {command}"
+            "create path must handle symlink creation failure inside the alias branch: {command}"
         );
         assert!(
-            command.contains(&format!(
-                "if [ -L {alias} ]; then ensure_alias_symlink; return $?; fi"
-            )),
+            command.contains(&format!("if [ -L {alias} ]; then")),
             "failed create must re-check alias state so a concurrent correct symlink is harmless: {command}"
+        );
+        assert!(
+            !command.contains("ensure_alias_symlink()"),
+            "topology preflight should avoid shell functions in the SSH-wrapped remote script: {command}"
         );
         assert!(
             command.contains("RCH_TOPOLOGY_ERR_ALIAS_NOT_SYMLINK"),
@@ -11418,7 +11604,7 @@ exec /bin/ln \"$@\"\n",
 
         let policy = PathTopologyPolicy::new(configured_root.clone(), alias_root.clone());
         let output = std::process::Command::new("sh")
-            .arg("-lc")
+            .arg("-c")
             .arg(build_worker_projects_topology_cmd(&policy))
             .output()
             .expect("run topology command");
@@ -11438,6 +11624,34 @@ exec /bin/ln \"$@\"\n",
             std::fs::read_link(&alias_root).expect("alias symlink target"),
             real_root,
             "alias should not be rewritten when it resolves to the configured canonical root"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_build_worker_projects_topology_cmd_survives_remote_shell_wrapper() {
+        let _guard = test_guard!();
+
+        let (_temp_dir, policy) = topology_tempdir();
+        let command = build_worker_projects_topology_cmd(&policy);
+        let wrapped = build_remote_shell_command(&command);
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&wrapped)
+            .output()
+            .expect("run wrapped topology command");
+
+        assert!(
+            output.status.success(),
+            "SSH-style wrapper should parse and execute topology command; status={:?} wrapped={} stdout={} stderr={}",
+            output.status.code(),
+            wrapped,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("RCH_TOPOLOGY_OK"),
+            "successful wrapped preflight should emit OK"
         );
     }
 

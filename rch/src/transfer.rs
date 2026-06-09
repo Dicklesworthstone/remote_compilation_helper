@@ -20,6 +20,7 @@ use rch_common::{SshClient, SshOptions};
 use shell_escape::escape;
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap};
+use std::fmt::Write as _;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -1060,35 +1061,37 @@ impl TransferPipeline {
             // reapers, entire tree. Killing the group includes the leader `sh -c`,
             // but that is a child of the ssh `sh -s`, so the outer shell still
             // reports 137 (128+SIGKILL) for clean timeout exit semantics.
-            let escaped_command = escape(Cow::from(colored_command.as_str()));
-            // The watchdog program (single-quoted, no inner single quotes):
-            //   $1 = pgid file, $2 = timeout secs (0 disables), $3.. = command.
+            let encoded_command = shell_octal_printf_arg(&colored_command);
+            // The watchdog program:
+            //   $1 = pgid file, $2 = timeout secs (0 disables), $3 = octal command payload.
             // Record $$ (session-leader pgid) so the daemon kill path keeps working.
             // NOTE: group kill is `kill -KILL -PGID` with NO `--`. dash's (/bin/sh)
             // kill builtin mishandles `kill -KILL -- -PGID` (the `--` makes it a
             // no-op), so `--` would silently fail to reap on the Ubuntu fleet. The
             // `-PGID` form works in both dash and bash.
-            let watchdog = "echo $$ > \"$1\"; __p=$$; __t=\"$2\"; shift 2; \"$@\" & __c=$!; \
-if [ \"$__t\" -gt 0 ] 2>/dev/null; then ( sleep \"$__t\"; kill -KILL -\"$__p\" 2>/dev/null ) & __w=$!; fi; \
+            let watchdog = "__cmd=$(printf '%b' \"$3\"); echo $$ > \"$1\"; __p=$$; __t=\"$2\"; shift 3; sh -c \"$__cmd\" & __c=$!; \
+if [ \"$__t\" -gt 0 ] 2>/dev/null; then ( sleep \"$__t\"; kill -KILL -\"$__p\" 2>/dev/null ) >/dev/null 2>&1 < /dev/null & __w=$!; fi; \
 wait \"$__c\"; __s=$?; if [ -n \"$__w\" ]; then kill \"$__w\" 2>/dev/null; fi; exit \"$__s\"";
+            let escaped_watchdog = shell_escape_value(watchdog)
+                .expect("watchdog script must not contain control characters");
 
             format!(
                 "mkdir -p {} && rm -f {} && \
 if command -v setsid >/dev/null 2>&1; then \
-setsid sh -c '{}' rch-build {} {} sh -lc {}; \
+setsid sh -c {} rch-build {} {} {}; \
 else \
-sh -c '{}' rch-build {} {} sh -lc {}; \
+sh -c {} rch-build {} {} {}; \
 fi",
                 escaped_run_dir,
                 escaped_pgid_file,
-                watchdog,
+                escaped_watchdog,
                 escaped_pgid_file,
                 external_timeout_secs,
-                escaped_command,
-                watchdog,
+                encoded_command,
+                escaped_watchdog,
                 escaped_pgid_file,
                 external_timeout_secs,
-                escaped_command,
+                encoded_command,
             )
         } else {
             timeout_wrapped_command
@@ -2410,6 +2413,14 @@ fi",
             }
         }
     }
+}
+
+fn shell_octal_printf_arg(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len() * 4);
+    for byte in value.as_bytes() {
+        write!(&mut encoded, "\\{byte:03o}").expect("write to String should not fail");
+    }
+    shell_escape_value(&encoded).expect("octal command payload must be shell-safe")
 }
 
 // The stale-target reap safety predicates now live in
@@ -4294,6 +4305,16 @@ mod tests {
         assert!(!command.contains("/.rch-run/"));
         assert!(command.contains("echo $$ > \"$1\""));
         assert!(command.contains("setsid sh -c"));
+        assert!(command.contains("__cmd=$(printf"));
+        assert!(command.contains("\"$3\""));
+        assert!(
+            !command.contains("$'\\!'"),
+            "watchdog must be quoted for POSIX sh, not Bash ANSI-C quoting: {command}"
+        );
+        assert!(
+            !command.contains("cargo test --no-run"),
+            "the cargo command should be an octal payload, not outer shell syntax: {command}"
+        );
         assert!(command.contains(&remote_pgid_file));
     }
 
@@ -4325,7 +4346,7 @@ mod tests {
         );
         // The default cargo-test cap (1800s) is passed to the watchdog as an arg.
         assert!(
-            command.contains("1800 sh -lc"),
+            command.contains(" 1800 "),
             "watchdog must receive the test timeout (1800s): {command}"
         );
         assert!(
@@ -4336,6 +4357,105 @@ mod tests {
         assert!(
             !command.contains("--foreground"),
             "build_id path must not use timeout --foreground: {command}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_build_remote_command_with_build_id_executes_under_shell() {
+        let _guard = test_guard!();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let remote_base = dir.path().join("remote");
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/tmp/project"),
+            "project".to_string(),
+            "hash".to_string(),
+            TransferConfig {
+                remote_base: remote_base.display().to_string(),
+                ..TransferConfig::default()
+            },
+        )
+        .with_build_id(Some(99))
+        .with_compilation_kind(Some(CompilationKind::CargoCheck));
+        std::fs::create_dir_all(pipeline.remote_path()).expect("create remote root");
+
+        let command = pipeline.build_remote_command("printf RCH_EXEC_OK", None);
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&command)
+            .output()
+            .expect("run build_id remote command wrapper");
+
+        assert!(
+            output.status.success(),
+            "build_id remote command wrapper should parse and execute; status={:?} command={} stdout={} stderr={}",
+            output.status.code(),
+            command,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("RCH_EXEC_OK"),
+            "wrapped command should run"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_build_remote_command_with_multiline_shell_arg_executes_under_shell() {
+        let _guard = test_guard!();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let remote_base = dir.path().join("remote");
+        let mut overrides = HashMap::new();
+        overrides.insert(
+            "CARGO_TARGET_DIR".to_string(),
+            "/data/tmp/cargo-target-rch-test".to_string(),
+        );
+        let pipeline = TransferPipeline::new(
+            PathBuf::from("/tmp/project"),
+            "project".to_string(),
+            "hash".to_string(),
+            TransferConfig {
+                remote_base: remote_base.display().to_string(),
+                ..TransferConfig::default()
+            },
+        )
+        .with_env_allowlist(vec!["CARGO_TARGET_DIR".to_string()])
+        .with_env_overrides(overrides)
+        .with_build_id(Some(100))
+        .with_compilation_kind(Some(CompilationKind::CargoCheck));
+        std::fs::create_dir_all(pipeline.remote_path()).expect("create remote root");
+
+        let cargo_home = "\"${RCH_CH_BASE}/rch-cargo-home-vmi-test-123\"";
+        let isolated_script = format!(
+            "{}; mkdir -p {cargo_home} || exit $?; export CARGO_HOME={cargo_home}; sh -c {}; status=$?; rm -rf {cargo_home}; exit $status",
+            rch_common::remote_cargo_home_base_prelude(),
+            shell_escape::escape("printf RCH_EXEC_OK".into()),
+        );
+        let isolated_command = format!("sh -c {}", shell_escape::escape(isolated_script.into()));
+        let telemetry_command = format!(
+            "{isolated_command}\nstatus=$?; if command -v rch-telemetry >/dev/null 2>&1; then telemetry=$(rch-telemetry collect --format json --worker-id vmi-test 2>/dev/null || true); if [ -n \"$telemetry\" ]; then echo '__RCH_TELEMETRY__'; echo \"$telemetry\"; fi; fi; exit $status"
+        );
+
+        let toolchain = ToolchainInfo::new("stable", None, "");
+        let command = pipeline.build_remote_command(&telemetry_command, Some(&toolchain));
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&command)
+            .output()
+            .expect("run multiline build_id command wrapper");
+
+        assert!(
+            output.status.success(),
+            "multiline build_id command wrapper should parse and execute; status={:?} command={} stdout={} stderr={}",
+            output.status.code(),
+            command,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("RCH_EXEC_OK"),
+            "wrapped multiline command should run"
         );
     }
 
@@ -4368,8 +4488,8 @@ mod tests {
         let _ = std::fs::remove_file(&marker);
 
         // Exactly the production watchdog program (build_id branch).
-        let watchdog = "echo $$ > \"$1\"; __p=$$; __t=\"$2\"; shift 2; \"$@\" & __c=$!; \
-if [ \"$__t\" -gt 0 ] 2>/dev/null; then ( sleep \"$__t\"; kill -KILL -\"$__p\" 2>/dev/null ) & __w=$!; fi; \
+        let watchdog = "__cmd=$(printf '%b' \"$3\"); echo $$ > \"$1\"; __p=$$; __t=\"$2\"; shift 3; sh -c \"$__cmd\" & __c=$!; \
+if [ \"$__t\" -gt 0 ] 2>/dev/null; then ( sleep \"$__t\"; kill -KILL -\"$__p\" 2>/dev/null ) >/dev/null 2>&1 < /dev/null & __w=$!; fi; \
 wait \"$__c\"; __s=$?; if [ -n \"$__w\" ]; then kill \"$__w\" 2>/dev/null; fi; exit \"$__s\"";
 
         // Job forks a grandchild that IGNORES SIGTERM and loops forever (a livelock
@@ -4378,6 +4498,11 @@ wait \"$__c\"; __s=$?; if [ -n \"$__w\" ]; then kill \"$__w\" 2>/dev/null; fi; e
             "( trap '' TERM; touch '{}'; while true; do sleep 1; done ) & gc=$!; trap '' TERM; wait $gc",
             marker.display()
         );
+        let encoded_inner = inner
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("\\{byte:03o}"))
+            .collect::<String>();
 
         let mut child = Command::new("setsid")
             .arg("sh")
@@ -4386,9 +4511,7 @@ wait \"$__c\"; __s=$?; if [ -n \"$__w\" ]; then kill \"$__w\" 2>/dev/null; fi; e
             .arg("rch-build")
             .arg(pgf.to_str().unwrap())
             .arg("2") // 2-second cap
-            .arg("sh")
-            .arg("-lc")
-            .arg(&inner)
+            .arg(&encoded_inner)
             // Detach all stdio: otherwise the forked grandchild inherits libtest's
             // captured stdout pipe and the harness blocks waiting for EOF.
             .stdin(std::process::Stdio::null())
