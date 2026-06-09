@@ -11,6 +11,7 @@ use std::sync::OnceLock;
 pub mod api;
 pub mod artifact_verify;
 pub mod binary_hash;
+pub mod capability_probe;
 pub mod cargo_path_deps;
 pub mod config;
 pub mod dependency_closure_planner;
@@ -197,6 +198,10 @@ pub use ui::{
 };
 
 // Incident schema re-exports
+pub use capability_probe::{
+    CapabilityRequirement, CapabilityVerdict, ProbeSpec, ProbedFacts, assess_admissibility,
+    build_capability_probe_script, parse_capability_probe,
+};
 pub use incident::{
     ControlState, IncidentEvent, IncidentEventType, IncidentReasonCode, IncidentSource,
     SelectedMode, incident_schema_version,
