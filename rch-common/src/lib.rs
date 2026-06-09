@@ -19,6 +19,7 @@ pub mod closure_explain;
 pub mod config;
 pub mod dependency_closure_planner;
 pub mod discovery;
+pub mod disk_pressure_report;
 pub mod disk_reclaim;
 pub mod e2e;
 pub mod errors;
