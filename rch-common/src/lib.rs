@@ -53,6 +53,7 @@ pub mod telemetry_freshness;
 pub mod test_change;
 pub mod testing;
 pub mod toolchain;
+pub mod transfer_hardening;
 pub mod types;
 pub mod ui;
 pub mod util;
@@ -174,6 +175,9 @@ pub use ssh_utils::{
 pub use ssh::{KnownHostsPolicy, SshClient, SshOptions, SshPool};
 pub use test_change::{TestChangeGuard, TestCodeChange};
 pub use toolchain::{ToolchainInfo, wrap_command_with_color, wrap_command_with_toolchain};
+pub use transfer_hardening::{
+    FirstFailure, RetryDecision, RsyncFailureClass, classify_rsync_outcome, is_ephemeral_path,
+};
 pub use types::{
     AffinityConfig, BuildCancellationMetadata, BuildCancellationWorkerHealth, BuildHeartbeatPhase,
     BuildHeartbeatRequest, BuildLocation, BuildRecord, BuildStats, CircuitBreakerConfig,
