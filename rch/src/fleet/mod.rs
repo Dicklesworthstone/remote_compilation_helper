@@ -4,6 +4,7 @@
 //! capabilities for the rch-wkr worker agent across all configured remote workers.
 
 mod audit;
+pub mod doctor;
 mod dry_run;
 mod executor;
 mod history;

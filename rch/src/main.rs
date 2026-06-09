@@ -1577,6 +1577,37 @@ enum FleetAction {
         #[arg(long)]
         worker: Option<String>,
     },
+
+    /// Run reliability diagnostics across the whole fleet
+    #[command(after_help = r#"EXAMPLES:
+    rch fleet doctor --reliability                     # Fleet-wide health (worst verdict wins)
+    rch fleet doctor --reliability --json              # Machine-readable envelope
+    rch fleet doctor --reliability --scope pressure    # Narrow check across all workers
+    rch fleet doctor --reliability --workers css,bil   # Only these workers
+    rch fleet doctor --reliability --fix --fleet-confirm  # Apply fixes fleet-wide"#)]
+    Doctor {
+        /// Run the reliability probe suite (required; reserved for future modes)
+        #[arg(long)]
+        reliability: bool,
+        /// Probe scope(s), comma-separated (default: all)
+        #[arg(long, value_delimiter = ',')]
+        scope: Vec<String>,
+        /// Apply remediations on each worker (requires --fleet-confirm)
+        #[arg(long)]
+        fix: bool,
+        /// Safety gate required to actually apply --fix fleet-wide
+        #[arg(long)]
+        fleet_confirm: bool,
+        /// Keep going after a worker's fix fails (default: halt)
+        #[arg(long)]
+        continue_on_failure: bool,
+        /// Restrict to specific worker(s), comma-separated
+        #[arg(long)]
+        workers: Option<String>,
+        /// Per-worker probe timeout in seconds (default: 10)
+        #[arg(long, default_value = "10")]
+        worker_timeout: u64,
+    },
 }
 
 fn machine_output_requested(format: Option<&str>, json_flag: bool) -> bool {
@@ -3841,6 +3872,39 @@ async fn handle_fleet(action: FleetAction, ctx: &OutputContext) -> Result<()> {
             yes,
         } => fleet::drain(ctx, worker, all, timeout, yes).await,
         FleetAction::History { limit, worker } => fleet::history(ctx, limit, worker).await,
+        FleetAction::Doctor {
+            reliability,
+            scope,
+            fix,
+            fleet_confirm,
+            continue_on_failure,
+            workers,
+            worker_timeout,
+        } => {
+            // `--reliability` is the only mode today; require it explicitly so
+            // the flag space stays open for future fleet doctor modes.
+            if !reliability {
+                ctx.error("`rch fleet doctor` currently requires --reliability");
+                anyhow::bail!("fleet doctor requires --reliability");
+            }
+            let scope = if scope.is_empty() {
+                vec!["all".to_string()]
+            } else {
+                scope
+            };
+            fleet::doctor::run(
+                ctx,
+                fleet::doctor::FleetDoctorOptions {
+                    scope,
+                    fix,
+                    fleet_confirm,
+                    continue_on_failure,
+                    workers,
+                    worker_timeout_secs: worker_timeout,
+                },
+            )
+            .await
+        }
     }
 }
 

@@ -23,6 +23,38 @@ rch status --stats
 rch status --circuits
 ```
 
+### Fleet-wide Reliability
+
+`rch doctor --reliability` checks the **local** machine. To assess the whole
+fleet in one command, `rch fleet doctor --reliability` fans out over SSH to
+every worker, runs the per-worker reliability doctor in parallel, and
+aggregates the results. The fleet verdict is the **worst** per-worker verdict;
+an unreachable worker counts as `failing` (you cannot prove a worker you could
+not reach is healthy).
+
+```bash
+# Fleet-wide health (worst verdict wins)
+rch fleet doctor --reliability
+
+# Machine-readable envelope (per-worker drill-down under data.per_worker)
+rch fleet doctor --reliability --json
+
+# Narrow check across all workers
+rch fleet doctor --reliability --scope pressure,topology
+
+# Only specific workers
+rch fleet doctor --reliability --workers css,bil
+
+# Apply remediations fleet-wide (requires the confirmation gate)
+rch fleet doctor --reliability --fix --fleet-confirm
+```
+
+Probes run with bounded concurrency (≤16 simultaneous SSH sessions) and a
+per-worker timeout (`--worker-timeout`, default 10s); a stalled worker is
+reported as `unreachable` rather than hanging the command. `--fix` is a
+fleet-wide mutation and requires `--fleet-confirm`; without it the command
+runs check-only.
+
 ### JSON Output
 
 For programmatic monitoring:
