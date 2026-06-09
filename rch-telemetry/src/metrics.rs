@@ -675,11 +675,29 @@ impl MetricsLayer {
     }
 
     fn record_request_start(&self, fields: &EventFields) {
-        let request_id = fields.string("request_id").unwrap_or("default");
+        // A request with no id cannot be correlated to its later `request.end`.
+        // Tracking it under a shared "default" key would conflate concurrent
+        // unidentified requests (they'd overwrite each other), so skip tracking
+        // — such a request only contributes a duration if its end carries an
+        // inline `duration_seconds`.
+        let Some(request_id) = fields.string("request_id") else {
+            return;
+        };
         let entrypoint = fields.string("entrypoint").unwrap_or("other").to_string();
         if let Ok(mut starts) = self.request_starts.lock() {
-            if starts.len() >= MAX_TRACKED_REQUESTS {
-                starts.clear();
+            // Bound the map by evicting the OLDEST in-flight entry rather than
+            // clearing the whole map — clearing dropped every pending request's
+            // duration (its later `request.end` would find no start). Only
+            // evict when actually growing (a re-start of a known id replaces in
+            // place).
+            if starts.len() >= MAX_TRACKED_REQUESTS
+                && !starts.contains_key(request_id)
+                && let Some(oldest_key) = starts
+                    .iter()
+                    .min_by_key(|(_, started)| started.start)
+                    .map(|(key, _)| key.clone())
+            {
+                starts.remove(&oldest_key);
             }
             starts.insert(
                 request_id.to_string(),
@@ -697,7 +715,12 @@ impl MetricsLayer {
             self.metrics.observe_request_duration(entrypoint, seconds);
             return;
         }
-        let request_id = fields.string("request_id").unwrap_or("default");
+        // No inline duration: correlate to the tracked start by request_id.
+        // Without an id there is nothing to correlate (the start was not
+        // tracked), so there is no duration to record.
+        let Some(request_id) = fields.string("request_id") else {
+            return;
+        };
         if let Ok(mut starts) = self.request_starts.lock()
             && let Some(started) = starts.remove(request_id)
         {
@@ -1225,6 +1248,85 @@ mod tests {
                 .get_sample_count(),
             1
         );
+    }
+
+    fn request_fields(pairs: &[(&str, &str)]) -> EventFields {
+        let mut values = std::collections::BTreeMap::new();
+        for (k, v) in pairs {
+            values.insert((*k).to_string(), FieldValue::String((*v).to_string()));
+        }
+        EventFields { values }
+    }
+
+    #[test]
+    fn request_start_then_end_records_duration_by_correlation() {
+        let layer = MetricsLayer::new(Metrics::new().expect("metrics"));
+        let label = normalize_entrypoint("hook");
+        let before = layer
+            .metrics
+            .request_duration_seconds
+            .with_label_values(&[label])
+            .get_sample_count();
+        layer.record_request_start(&request_fields(&[
+            ("request_id", "r1"),
+            ("entrypoint", "hook"),
+        ]));
+        // request.end without an inline duration must correlate to the start.
+        layer.record_request_end(&request_fields(&[
+            ("request_id", "r1"),
+            ("entrypoint", "hook"),
+        ]));
+        let after = layer
+            .metrics
+            .request_duration_seconds
+            .with_label_values(&[label])
+            .get_sample_count();
+        assert_eq!(after, before + 1, "correlated duration must be recorded");
+    }
+
+    #[test]
+    fn full_map_evicts_one_not_clears_all() {
+        // Regression (bd-review-metrics-request-starts-clear): filling the map
+        // then adding one more must evict a single oldest entry, NOT wipe every
+        // in-flight start (which dropped all their pending durations).
+        let layer = MetricsLayer::new(Metrics::new().expect("metrics"));
+        for i in 0..MAX_TRACKED_REQUESTS {
+            layer.record_request_start(&request_fields(&[
+                ("request_id", &format!("r{i}")),
+                ("entrypoint", "hook"),
+            ]));
+        }
+        assert_eq!(
+            layer.request_starts.lock().unwrap().len(),
+            MAX_TRACKED_REQUESTS
+        );
+        layer.record_request_start(&request_fields(&[
+            ("request_id", "r_new"),
+            ("entrypoint", "hook"),
+        ]));
+        let starts = layer.request_starts.lock().unwrap();
+        // clear() would have collapsed the map to 1; evict-oldest keeps it full.
+        assert_eq!(
+            starts.len(),
+            MAX_TRACKED_REQUESTS,
+            "evict-one keeps the map bounded but full, not cleared"
+        );
+        assert!(starts.contains_key("r_new"), "newest start retained");
+    }
+
+    #[test]
+    fn missing_request_id_is_not_tracked_under_default() {
+        // A start with no request_id must not be inserted under a shared
+        // "default" key (which would conflate concurrent unidentified requests).
+        let layer = MetricsLayer::new(Metrics::new().expect("metrics"));
+        layer.record_request_start(&request_fields(&[("entrypoint", "hook")]));
+        assert!(
+            layer.request_starts.lock().unwrap().is_empty(),
+            "untracked start must not create a 'default' entry"
+        );
+        // And an end with no id + no inline duration is a no-op (nothing to
+        // correlate), not a panic.
+        layer.record_request_end(&request_fields(&[("entrypoint", "hook")]));
     }
 
     #[test]
