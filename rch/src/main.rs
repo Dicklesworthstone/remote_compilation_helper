@@ -410,6 +410,18 @@ to clean up. Use --force to immediately terminate with SIGKILL."#)]
         dry_run: bool,
     },
 
+    /// Preflight a command's admission before expensive work
+    ///
+    /// Read-only and side-effect free: classifies the command, derives the
+    /// capabilities a worker must have to run it, and returns a decisive
+    /// offload/local/queue/defer recommendation. Use `--json` for the
+    /// machine-readable envelope.
+    Admit {
+        /// Command to preflight (quote or pass as multiple args)
+        #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
+        command: Vec<String>,
+    },
+
     /// Execute a compilation command on a remote worker
     ///
     /// This command is typically invoked by the PreToolUse hook to perform
@@ -1840,6 +1852,7 @@ async fn run(args: Vec<OsString>) -> Result<()> {
             Commands::Diagnose { command, dry_run } => {
                 handle_diagnose(command, dry_run, &ctx).await
             }
+            Commands::Admit { command } => handle_admit(command, &ctx).await,
             Commands::Exec { command } => hook::run_exec(command).await,
             Commands::Hook { action } => handle_hook(action, &ctx).await,
             Commands::Agents { action } => handle_agents(action, &ctx).await,
@@ -3040,6 +3053,11 @@ async fn handle_diagnose(command: Vec<String>, dry_run: bool, ctx: &OutputContex
     let joined = command.join(" ");
     commands::diagnose(&joined, dry_run, ctx).await?;
     Ok(())
+}
+
+async fn handle_admit(command: Vec<String>, ctx: &OutputContext) -> Result<()> {
+    let joined = command.join(" ");
+    commands::admit(&joined, ctx).await
 }
 
 /// `rch cache warm` per-worker result (br-4zm6u). Emitted in the JSON

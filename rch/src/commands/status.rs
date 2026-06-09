@@ -802,6 +802,86 @@ pub async fn diagnose(command: &str, dry_run: bool, ctx: &OutputContext) -> Resu
     Ok(())
 }
 
+/// `rch admit -- <command>`: a fast, read-only admission preflight. Classifies
+/// the command, derives the capabilities a worker must have, and returns a
+/// decisive Offload / Local / Queue / Defer recommendation before any expensive
+/// work starts. Pure classification — no network side effects; the daemon
+/// candidate/rejection query that further refines the recommendation lands with
+/// the selection-RPC work (bd-...12.3).
+pub async fn admit(command: &str, ctx: &OutputContext) -> Result<()> {
+    use rch_common::admit_preflight::preflight;
+
+    // Proof/strict-remote policy mirrors the ControlState surface
+    // (RCH_REQUIRE_REMOTE / RCH_FORCE_REMOTE).
+    let proof_policy = ["RCH_REQUIRE_REMOTE", "RCH_FORCE_REMOTE"].iter().any(|key| {
+        std::env::var(key).is_ok_and(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+    });
+
+    let pf = preflight(command, proof_policy);
+
+    if ctx.is_json() {
+        let _ = ctx.json(&ApiResponse::ok("admit", &pf));
+        return Ok(());
+    }
+
+    let style = ctx.theme();
+    println!("{}", style.format_header("RCH Admit"));
+    println!();
+    println!("{} {}", style.key("Recommendation:"), {
+        let r = pf.base_recommendation.as_str();
+        match pf.base_recommendation {
+            rch_common::admit_preflight::AdmitRecommendation::Offload => style.format_success(r),
+            rch_common::admit_preflight::AdmitRecommendation::Local => style.format_warning(r),
+            _ => style.value(r).to_string(),
+        }
+    });
+    println!("{} {}", style.key("Compilation:"), pf.is_compilation);
+    if let Some(family) = &pf.family {
+        println!("{} {}", style.key("Family:"), style.value(family));
+    }
+    if pf.compound.len() > 1 {
+        println!(
+            "{} {} parts",
+            style.key("Compound:"),
+            style.value(&pf.compound.len().to_string())
+        );
+    }
+    let req = &pf.required;
+    let mut needs: Vec<String> = Vec::new();
+    if req.needs_cargo {
+        needs.push("cargo".to_string());
+    }
+    if req.needs_bun {
+        needs.push("bun".to_string());
+    }
+    for t in &req.needs_targets {
+        needs.push(format!("target:{t}"));
+    }
+    for tc in &req.needs_toolchains {
+        needs.push(format!("toolchain:{tc}"));
+    }
+    println!(
+        "{} {}",
+        style.key("Required capabilities:"),
+        if needs.is_empty() {
+            style.muted("none").to_string()
+        } else {
+            style.value(&needs.join(", ")).to_string()
+        }
+    );
+    if pf.proof_policy {
+        println!("{} {}", style.key("Proof policy:"), style.value("strict"));
+    }
+    println!();
+    println!("{}", style.muted(&pf.detail));
+    Ok(())
+}
+
 // =============================================================================
 // Self-Test Command
 // =============================================================================

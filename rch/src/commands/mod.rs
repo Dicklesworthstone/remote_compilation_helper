@@ -34,7 +34,7 @@ pub use daemon::{
 pub use hook::{hook_install, hook_status, hook_test, hook_uninstall};
 
 // Re-export status/diagnostics commands for backward compatibility
-pub use status::{check, diagnose, self_test, status_overview};
+pub use status::{admit, check, diagnose, self_test, status_overview};
 
 // Re-export queue/cancel commands for backward compatibility
 pub use queue::{cancel_build, queue_status};
