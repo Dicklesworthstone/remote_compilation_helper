@@ -102,8 +102,9 @@ pub struct FreshnessAssessment {
     pub age_ms: Option<u64>,
     /// Whether the worker should remain eligible (mirror of `verdict.is_usable`).
     pub usable: bool,
-    /// Short, stable human explanation (operator-facing).
-    pub reason: &'static str,
+    /// Short, stable human explanation (operator-facing). Owned so the struct
+    /// remains `Deserialize` for any lifetime (it nests inside other records).
+    pub reason: String,
 }
 
 /// Saturating conversion of a `Duration` to whole milliseconds.
@@ -162,7 +163,7 @@ pub fn assess(inputs: &FreshnessInputs) -> FreshnessAssessment {
             confidence: 0.0,
             age_ms: None,
             usable: false,
-            reason: "no telemetry sample yet",
+            reason: "no telemetry sample yet".to_string(),
         };
     };
 
@@ -199,7 +200,7 @@ pub fn assess(inputs: &FreshnessInputs) -> FreshnessAssessment {
         confidence,
         age_ms: Some(ms(age)),
         usable: verdict.is_usable(),
-        reason,
+        reason: reason.to_string(),
     }
 }
 
