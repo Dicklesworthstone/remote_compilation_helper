@@ -89,3 +89,9 @@ rch-install/
 # Python bytecode (e.g. from scripts/lib/*.py tooling)
 __pycache__/
 *.pyc
+
+# NTM agent runtime logs/PIDs (ephemeral). NOTE: existing tracked files under
+# these dirs must be removed from the index (`git rm --cached`) for the ignore
+# to take effect on them; this only stops NEW files from being tracked.
+.ntm/logs/
+.ntm/pids/
