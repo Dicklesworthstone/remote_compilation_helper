@@ -1541,28 +1541,23 @@ fi",
             .into());
         }
 
-        // Verify transfer completed successfully by checking for partial transfer indicators.
-        // rsync can exit with code 0 even if interrupted mid-file in some edge cases.
-        // Look for warning signs in stderr that indicate incomplete transfer.
-        if !stderr.is_empty() {
-            let stderr_lower = stderr.to_lowercase();
-            let partial_indicators = [
-                "partial transfer",
-                "connection unexpectedly closed",
-                "write error",
-                "read error",
-                "truncated file",
-            ];
-            if let Some(indicator) = partial_indicators
-                .iter()
-                .find(|ind| stderr_lower.contains(*ind))
-            {
-                warn!(
-                    "rsync reported potential partial transfer (matched '{}'): {}",
-                    indicator,
-                    stderr.lines().next().unwrap_or(&stderr)
-                );
+        // rsync can exit 0 even when interrupted mid-file in edge cases. Treat a
+        // partial-transfer indicator on a "successful" sync as a failure rather
+        // than warning and returning Ok: otherwise the hook reports success, the
+        // remote source tree is incomplete, and the remote build compiles
+        // stale/partial sources, returning a trusted-but-wrong result.
+        if let Some(indicator) = detect_partial_transfer(&stderr) {
+            warn!(
+                "rsync exited 0 but reported a partial transfer (matched '{}'): {}",
+                indicator,
+                stderr.lines().next().unwrap_or(&stderr)
+            );
+            return Err(TransferError::SyncFailed {
+                reason: format!("partial transfer despite exit 0 ({indicator})"),
+                exit_code: output.status.code(),
+                stderr: stderr.to_string(),
             }
+            .into());
         }
 
         info!("Sync completed in {}ms", duration.as_millis());
@@ -1644,6 +1639,23 @@ fi",
             },
         )
         .await?;
+
+        // Same exit-0-but-incomplete guard as the non-streaming sync_to_remote:
+        // run_command_streaming returns the combined stdout+stderr, so scan it for
+        // partial-transfer indicators and fail rather than report a success that
+        // would feed the remote build stale/partial sources.
+        if let Some(indicator) = detect_partial_transfer(&output) {
+            warn!(
+                "streaming rsync exited 0 but reported a partial transfer (matched '{}')",
+                indicator
+            );
+            return Err(TransferError::SyncFailed {
+                reason: format!("partial transfer despite exit 0 ({indicator})"),
+                exit_code: None,
+                stderr: output,
+            }
+            .into());
+        }
 
         Ok(SyncResult {
             bytes_transferred: parse_rsync_bytes(&output),
@@ -2204,6 +2216,22 @@ fi",
             .into());
         }
 
+        // An exit-0 partial download leaves the local artifact tree incomplete;
+        // fail rather than report success (see sync_to_remote).
+        if let Some(indicator) = detect_partial_transfer(&stderr) {
+            warn!(
+                "rsync exited 0 but reported a partial artifact retrieval (matched '{}'): {}",
+                indicator,
+                stderr.lines().next().unwrap_or(&stderr)
+            );
+            return Err(TransferError::SyncFailed {
+                reason: format!("partial artifact retrieval despite exit 0 ({indicator})"),
+                exit_code: output.status.code(),
+                stderr: stderr.clone(),
+            }
+            .into());
+        }
+
         let bytes_transferred = parse_rsync_bytes(&stdout);
         let files_transferred = parse_rsync_files(&stdout);
 
@@ -2288,6 +2316,21 @@ fi",
             },
         )
         .await?;
+
+        // An exit-0 partial download leaves the local artifact tree incomplete;
+        // fail rather than report success (see retrieve_artifacts).
+        if let Some(indicator) = detect_partial_transfer(&output) {
+            warn!(
+                "streaming rsync exited 0 but reported a partial artifact retrieval (matched '{}')",
+                indicator
+            );
+            return Err(TransferError::SyncFailed {
+                reason: format!("partial artifact retrieval despite exit 0 ({indicator})"),
+                exit_code: None,
+                stderr: output,
+            }
+            .into());
+        }
 
         Ok(SyncResult {
             bytes_transferred: parse_rsync_bytes(&output),
@@ -2678,6 +2721,36 @@ where
     }
 
     Ok((combined, start.elapsed().as_millis() as u64))
+}
+
+/// Scan rsync output for indicators that a transfer was incomplete despite a
+/// zero exit code.
+///
+/// rsync usually exits non-zero on a partial transfer, but it can exit 0 while
+/// interrupted mid-file in edge cases. Trusting that success is dangerous: for
+/// an upload the remote build then compiles stale/partial sources and returns a
+/// trusted-but-wrong result; for a download the local artifact tree is silently
+/// incomplete. Returns the first matched indicator, if any, so the caller can
+/// fail the transfer instead of reporting success.
+///
+/// Note: callers on the streaming path pass the combined stdout+stderr (rsync
+/// runs without `-v`, so it emits progress/stats — not a per-file listing — and
+/// these phrases do not appear benignly).
+fn detect_partial_transfer(output: &str) -> Option<&'static str> {
+    if output.is_empty() {
+        return None;
+    }
+    const PARTIAL_INDICATORS: [&str; 5] = [
+        "partial transfer",
+        "connection unexpectedly closed",
+        "write error",
+        "read error",
+        "truncated file",
+    ];
+    let lower = output.to_lowercase();
+    PARTIAL_INDICATORS
+        .into_iter()
+        .find(|ind| lower.contains(ind))
 }
 
 /// Decide whether a [`run_command_streaming`] failure is a transient transport
@@ -5378,6 +5451,39 @@ Total file size: 123 bytes";
             calls.load(std::sync::atomic::Ordering::SeqCst),
             2,
             "should succeed on the second attempt"
+        );
+    }
+
+    #[test]
+    fn test_detect_partial_transfer_matches_indicators() {
+        // Regression (bd-review-transfer-partial-warn-only): exit-0 rsync output
+        // carrying a partial-transfer indicator must be detectable so the
+        // upload/download paths fail instead of reporting trusted-but-wrong
+        // success.
+        let _guard = test_guard!();
+        assert_eq!(detect_partial_transfer(""), None);
+        assert_eq!(
+            detect_partial_transfer("sent 100 bytes  received 50 bytes  total size 4096"),
+            None
+        );
+        assert_eq!(
+            detect_partial_transfer("rsync: connection unexpectedly closed (0 bytes received)"),
+            Some("connection unexpectedly closed")
+        );
+        assert_eq!(
+            detect_partial_transfer(
+                "rsync warning: some files vanished\npartial transfer (code 23)"
+            ),
+            Some("partial transfer")
+        );
+        assert_eq!(
+            detect_partial_transfer("rsync: read error: Connection reset by peer"),
+            Some("read error")
+        );
+        // Case-insensitive.
+        assert_eq!(
+            detect_partial_transfer("WRITE ERROR: broken pipe (32)"),
+            Some("write error")
         );
     }
 
