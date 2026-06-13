@@ -334,6 +334,24 @@ impl SshClient {
         Ok(())
     }
 
+    /// Force a fresh connection, dropping any existing (possibly dead) session.
+    ///
+    /// [`connect`](Self::connect) is a no-op when a `Session` object already
+    /// exists, so a pooled client whose underlying SSH ControlMaster has died
+    /// cannot recover through it. `reconnect` tears the stale session down first
+    /// (closing it best-effort — a dead master may itself error on close, but
+    /// [`disconnect`](Self::disconnect) `take()`s the session before closing so
+    /// it is gone regardless) and then establishes a new one.
+    pub async fn reconnect(&mut self) -> Result<()> {
+        if let Err(e) = self.disconnect().await {
+            debug!(
+                "Ignoring error closing stale session to {} before reconnect: {}",
+                self.config.id, e
+            );
+        }
+        self.connect().await
+    }
+
     /// Execute a command on the remote worker.
     pub async fn execute(&self, command: &str) -> Result<CommandResult> {
         let session = self.session.as_ref().context("Not connected to worker")?;
@@ -627,23 +645,44 @@ impl SshPool {
     }
 
     /// Get or create a connection to a worker.
+    ///
+    /// Validates liveness on borrow: a pooled `SshClient` reports
+    /// [`is_connected`](SshClient::is_connected) purely from the presence of a
+    /// `Session` object, which cannot detect that the underlying SSH
+    /// ControlMaster has died (idle `ControlPersist` expiry, a network blip, or
+    /// the remote `sshd` being restarted). Returning such a client hands the
+    /// caller a dead master, and its next `execute()` fails with
+    /// broken-pipe/connection-closed and no chance to recover. So before reusing
+    /// a connected client this probes it with a lightweight health check, and on
+    /// failure reconnects once under the per-worker write lock.
     pub async fn get_or_connect(&self, config: &WorkerConfig) -> Result<Arc<RwLock<SshClient>>> {
         let shared_client = self.get_or_create_client_entry(config).await;
 
-        let is_connected = {
+        // Fast path: reuse only a session that is both present AND verified live.
+        // The probe needs `&self` only (health_check → execute), so it runs under
+        // a shared read lock and never blocks other borrowers of this worker.
+        let reusable = {
             let guard = shared_client.read().await;
-            guard.is_connected()
+            guard.is_connected() && guard.health_check().await.unwrap_or(false)
         };
-        if is_connected {
-            debug!("Reusing existing connection to {}", config.id);
+        if reusable {
+            debug!("Reusing live connection to {}", config.id);
             return Ok(shared_client);
         }
 
-        // Perform the slow connection process while holding only the lock for this specific worker
+        // Slow path: (re)connect under the per-worker write lock. Re-evaluate the
+        // state here because another task may have connected/reconnected while we
+        // waited for the lock, and to distinguish "never connected" (connect)
+        // from "session exists but the master is dead" (reconnect).
         let mut client_guard = shared_client.write().await;
-        // Double check it wasn't connected by another task that won the race
         if !client_guard.is_connected() {
             client_guard.connect().await?;
+        } else if !client_guard.health_check().await.unwrap_or(false) {
+            warn!(
+                "Pooled SSH connection to {} failed liveness probe; reconnecting",
+                config.id
+            );
+            client_guard.reconnect().await?;
         }
         // Drop write lock before returning
         drop(client_guard);
@@ -906,6 +945,24 @@ mod tests {
 
         let replacement_guard = replacement.read().await;
         assert!(replacement_guard.is_configured_for(&new_config));
+    }
+
+    #[tokio::test]
+    async fn test_health_check_reports_not_alive_without_session() {
+        // get_or_connect's liveness probe relies on health_check() returning a
+        // non-true value (without erroring) for a client that has no live
+        // session, so a dead/empty pooled entry is reconnected rather than
+        // falsely handed back as "reused". execute() errors "Not connected",
+        // which health_check() maps to Ok(false).
+        let _guard = test_guard!();
+        let config = worker_config("worker-a", "192.168.1.100", "ubuntu", "~/.ssh/id_rsa");
+        let client = SshClient::new(config, SshOptions::default());
+        assert!(!client.is_connected());
+        let alive = client
+            .health_check()
+            .await
+            .expect("health_check maps execution errors to Ok(false), never Err");
+        assert!(!alive, "a client with no session must not report as alive");
     }
 
     #[test]
