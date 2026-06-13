@@ -907,9 +907,54 @@ mod tests {
         ep
     }
 
+    /// Hard per-test watchdog backstop (bd-review-test-webhook-e2e-followup).
+    ///
+    /// The webhook E2E tests are already bounded on every blocking call (8s
+    /// `deliver` timeout, 6s sink accept deadline, 3s collect `recv_timeout`), so
+    /// they cannot hang indefinitely. This is a final safety net for pathological
+    /// build-lock/runtime contention: a detached thread aborts the process if the
+    /// test body has not finished within `secs`, so a stuck test can never stall
+    /// the whole suite. The deadline is far above the inner timeouts, and the
+    /// guard cancels the watchdog the instant the test returns (normally or by an
+    /// unwinding panic), so it never fires on a test that completed.
+    struct Watchdog(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Watchdog {
+        fn arm(name: &'static str, secs: u64) -> Self {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            let done = Arc::new(AtomicBool::new(false));
+            let flag = Arc::clone(&done);
+            std::thread::spawn(move || {
+                let deadline = Instant::now() + StdDuration::from_secs(secs);
+                while Instant::now() < deadline {
+                    if flag.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    std::thread::sleep(StdDuration::from_millis(50));
+                }
+                if !flag.load(Ordering::SeqCst) {
+                    eprintln!(
+                        "test watchdog: '{name}' exceeded {secs}s without completing — aborting to avoid a hung suite"
+                    );
+                    std::process::abort();
+                }
+            });
+            Self(done)
+        }
+    }
+
+    impl Drop for Watchdog {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
     #[tokio::test]
-    #[ignore = "flaky real-service E2E: local HTTP sink can hang under build-lock/runtime contention; needs deterministic 127.0.0.1:0 + bounded recv + watchdog — see bd-review-test-webhook-e2e-followup"]
     async fn webhook_e2e_signed_delivery_reaches_sink_with_valid_hmac() {
+        let _wd = Watchdog::arm(
+            "webhook_e2e_signed_delivery_reaches_sink_with_valid_hmac",
+            30,
+        );
         let sink = TestSink::start(1, 200);
         let mut ep = sink_endpoint(sink.addr);
         ep.retry_max = 0;
@@ -943,8 +988,8 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "flaky real-service E2E: see bd-review-test-webhook-e2e-followup"]
     async fn webhook_e2e_unsigned_delivery_omits_signature_header() {
+        let _wd = Watchdog::arm("webhook_e2e_unsigned_delivery_omits_signature_header", 30);
         let sink = TestSink::start(1, 200);
         let mut ep = sink_endpoint(sink.addr);
         ep.retry_max = 0;
@@ -969,10 +1014,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "flaky real-service E2E: see bd-review-test-webhook-e2e-followup"]
     async fn webhook_e2e_bounded_retries_on_5xx() {
         // retry_max=2 ⇒ up to 3 attempts; a persistently-500 sink must receive
         // exactly 3 connections, then deliver gives up (bounded retry).
+        let _wd = Watchdog::arm("webhook_e2e_bounded_retries_on_5xx", 30);
         let sink = TestSink::start(3, 500);
         let mut ep = sink_endpoint(sink.addr);
         ep.retry_max = 2;
