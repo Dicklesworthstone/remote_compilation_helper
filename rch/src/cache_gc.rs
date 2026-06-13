@@ -162,7 +162,15 @@ pub fn enumerate_staging_trees(
             Ok(e) => e,
             Err(_) => continue,
         };
-        if !project_entry.path().is_dir() {
+        // Use the directory entry's own type, which does NOT follow symlinks.
+        // Path::is_dir() follows symlinks (fs::metadata), so a symlinked
+        // project/hash entry pointing at an external directory would be treated
+        // as a real staging tree and could be remove_dir_all'd.
+        if !project_entry
+            .file_type()
+            .map(|ft| ft.is_dir())
+            .unwrap_or(false)
+        {
             continue;
         }
         if let Some(filter) = project
@@ -178,7 +186,12 @@ pub fn enumerate_staging_trees(
         for hash_entry in hash_dirs {
             let Ok(hash_entry) = hash_entry else { continue };
             let tree_path = hash_entry.path();
-            if !tree_path.is_dir() {
+            // Same as above: skip symlinked hash entries (do not follow).
+            if !hash_entry
+                .file_type()
+                .map(|ft| ft.is_dir())
+                .unwrap_or(false)
+            {
                 continue;
             }
             let (size_bytes, newest) = tree_size_and_newest_mtime(&tree_path);
@@ -280,6 +293,15 @@ fn tree_size_and_newest_mtime(root: &Path) -> (u64, Option<std::time::SystemTime
             continue;
         };
         for entry in rd.flatten() {
+            // file_type() and DirEntry::metadata() both report the entry itself
+            // and do NOT follow symlinks. This matters for the idle-detection
+            // contract: a symlink inside the tree must contribute only its own
+            // (lstat) mtime, never its target's — otherwise a link to an
+            // unrelated quiescent directory could mask live build activity and
+            // get the active tree pruned.
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
             let Ok(meta) = entry.metadata() else { continue };
             if let Ok(mtime) = meta.modified() {
                 newest = Some(match newest {
@@ -287,7 +309,8 @@ fn tree_size_and_newest_mtime(root: &Path) -> (u64, Option<std::time::SystemTime
                     _ => mtime,
                 });
             }
-            if meta.is_dir() {
+            // Recurse only into real directories; never descend a symlinked dir.
+            if file_type.is_dir() {
                 stack.push(entry.path());
             } else {
                 total = total.saturating_add(meta.len());
@@ -406,6 +429,46 @@ mod tests {
             enumerate_staging_trees(&base.path().join("does-not-exist"), None, SystemTime::now())
                 .unwrap();
         assert!(missing.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn enumerate_and_sizing_do_not_follow_symlinks() {
+        // Regression (bd-review-cachegc-symlink-walk): the walk must never follow
+        // symlinks. A symlinked project/hash entry must not be enumerated as a
+        // prunable tree, and a symlink INSIDE a tree must not drag the tree's
+        // size/mtime to reflect its (possibly old, quiescent) target — which
+        // could get an active build tree judged idle and pruned.
+        use std::os::unix::fs::symlink;
+
+        let base = tempfile::tempdir().expect("tempdir");
+        // A large file in a directory OUTSIDE any staging tree.
+        let external = tempfile::tempdir().expect("external tempdir");
+        std::fs::write(external.path().join("big.bin"), vec![b'x'; 10_000]).unwrap();
+
+        // A real staging tree with a small file plus a symlink to the external dir.
+        let tree = base.path().join("proj-a/hash1");
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::write(tree.join("src.rs"), vec![b'x'; 100]).unwrap();
+        symlink(external.path(), tree.join("ext")).unwrap();
+
+        // Symlinked hash and project entries must be skipped during enumeration.
+        symlink(external.path(), base.path().join("proj-a/hashsym")).unwrap();
+        symlink(external.path(), base.path().join("projsym")).unwrap();
+
+        let trees =
+            enumerate_staging_trees(base.path(), None, SystemTime::now()).expect("enumerate");
+        assert_eq!(
+            trees.len(),
+            1,
+            "symlinked project/hash entries must not be enumerated"
+        );
+        assert!(trees[0].path.ends_with("proj-a/hash1"));
+        assert!(
+            trees[0].size_bytes < 10_000,
+            "symlink target bytes ({}) must not be counted via descent",
+            trees[0].size_bytes
+        );
     }
 
     #[test]
