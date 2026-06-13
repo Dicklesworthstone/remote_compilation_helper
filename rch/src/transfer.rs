@@ -1092,8 +1092,15 @@ impl TransferPipeline {
             // kill builtin mishandles `kill -KILL -- -PGID` (the `--` makes it a
             // no-op), so `--` would silently fail to reap on the Ubuntu fleet. The
             // `-PGID` form works in both dash and bash.
+            // The timer subshell MUST run with stdio detached from the SSH
+            // channel: `kill "$__w"` reaps only the subshell, and its `sleep`
+            // child reparents to init still holding any inherited pipe FDs.
+            // Without the redirects, sshd cannot see EOF on the channel until
+            // the orphaned sleep expires, so every successful build held the
+            // session for the full timeout and the client misreported it as
+            // "SSH command timed out" (#20).
             let watchdog = "echo $$ > \"$1\"; __p=$$; __t=\"$2\"; shift 2; \"$@\" & __c=$!; \
-if [ \"$__t\" -gt 0 ] 2>/dev/null; then ( sleep \"$__t\"; kill -KILL -\"$__p\" 2>/dev/null ) & __w=$!; fi; \
+if [ \"$__t\" -gt 0 ] 2>/dev/null; then ( sleep \"$__t\"; kill -KILL -\"$__p\" 2>/dev/null ) >/dev/null 2>&1 </dev/null & __w=$!; fi; \
 wait \"$__c\"; __s=$?; if [ -n \"$__w\" ]; then kill \"$__w\" 2>/dev/null; fi; exit \"$__s\"";
 
             format!(
@@ -4361,6 +4368,13 @@ mod tests {
             !command.contains("--foreground"),
             "build_id path must not use timeout --foreground: {command}"
         );
+        // The timer subshell must detach stdio: its orphaned `sleep` otherwise
+        // holds the SSH channel's pipe FDs open after a successful build, so
+        // the session lasts the full cap and the client misreports a timeout (#20).
+        assert!(
+            command.contains(") >/dev/null 2>&1 </dev/null &"),
+            "watchdog timer subshell must redirect stdio away from the channel: {command}"
+        );
     }
 
     /// Functional proof: a SIGTERM-ignoring grandchild that the test harness forked
@@ -4393,7 +4407,7 @@ mod tests {
 
         // Exactly the production watchdog program (build_id branch).
         let watchdog = "echo $$ > \"$1\"; __p=$$; __t=\"$2\"; shift 2; \"$@\" & __c=$!; \
-if [ \"$__t\" -gt 0 ] 2>/dev/null; then ( sleep \"$__t\"; kill -KILL -\"$__p\" 2>/dev/null ) & __w=$!; fi; \
+if [ \"$__t\" -gt 0 ] 2>/dev/null; then ( sleep \"$__t\"; kill -KILL -\"$__p\" 2>/dev/null ) >/dev/null 2>&1 </dev/null & __w=$!; fi; \
 wait \"$__c\"; __s=$?; if [ -n \"$__w\" ]; then kill \"$__w\" 2>/dev/null; fi; exit \"$__s\"";
 
         // Job forks a grandchild that IGNORES SIGTERM and loops forever (a livelock
@@ -4464,6 +4478,66 @@ wait \"$__c\"; __s=$?; if [ -n \"$__w\" ]; then kill \"$__w\" 2>/dev/null; fi; e
         assert!(
             !group_alive,
             "process group {pgid} (with the SIGTERM-ignoring grandchild) must be fully reaped"
+        );
+    }
+
+    /// Functional proof of the #20 fix: after a SUCCESSFUL fast job, the
+    /// watchdog session must release its stdout pipe (EOF) immediately — long
+    /// before the timeout cap. Before the fix, the timer subshell's orphaned
+    /// `sleep` inherited the pipe write-end, so EOF only arrived when the full
+    /// cap expired and every remote build appeared to hang for build_timeout_sec.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_watchdog_releases_output_pipe_immediately_on_success() {
+        use std::io::Read;
+        use std::process::Command;
+        use std::time::{Duration, Instant};
+
+        let dir = std::env::temp_dir().join(format!("rch-wd-eof-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pgf = dir.join("job.pgid");
+        let _ = std::fs::remove_file(&pgf);
+
+        // Exactly the production watchdog program (build_id branch).
+        let watchdog = "echo $$ > \"$1\"; __p=$$; __t=\"$2\"; shift 2; \"$@\" & __c=$!; \
+if [ \"$__t\" -gt 0 ] 2>/dev/null; then ( sleep \"$__t\"; kill -KILL -\"$__p\" 2>/dev/null ) >/dev/null 2>&1 </dev/null & __w=$!; fi; \
+wait \"$__c\"; __s=$?; if [ -n \"$__w\" ]; then kill \"$__w\" 2>/dev/null; fi; exit \"$__s\"";
+
+        // Generous 20s cap; the job itself completes instantly. EOF must NOT
+        // wait for the cap.
+        let start = Instant::now();
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(watchdog)
+            .arg("rch-build")
+            .arg(pgf.to_str().unwrap())
+            .arg("20")
+            .arg("sh")
+            .arg("-c")
+            .arg("echo job-done")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+
+        let mut out = String::new();
+        child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut out)
+            .unwrap();
+        let eof_after = start.elapsed();
+        let status = child.wait().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(status.success(), "fast job must exit 0: {status:?}");
+        assert!(out.contains("job-done"), "job output must arrive: {out:?}");
+        assert!(
+            eof_after < Duration::from_secs(5),
+            "stdout EOF must arrive promptly after job success, not at the \
+             timeout cap (took {eof_after:?})"
         );
     }
 

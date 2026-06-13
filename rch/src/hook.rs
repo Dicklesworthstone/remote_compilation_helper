@@ -6252,7 +6252,16 @@ async fn execute_remote_compilation(
     maybe_sync_repo_set_with_repo_updater(&worker_config, &sync_roots, reporter).await;
 
     // Build transfer pipelines with color mode, command timeout, and compilation kind.
-    let command_timeout = compilation_config.timeout_for_kind(kind);
+    // When the in-session watchdog is active it enforces the real build cap
+    // remotely (same timeout_for_kind value). Give the local SSH stream a grace
+    // margin over that cap so a genuine remote group-kill propagates as exit
+    // 137 instead of losing the race to a local "SSH command timed out" (#20).
+    let remote_cap = compilation_config.timeout_for_kind(kind);
+    let command_timeout = if compilation_config.external_timeout_enabled() {
+        remote_cap + std::time::Duration::from_secs(30)
+    } else {
+        remote_cap
+    };
     let effective_env_allowlist =
         cargo_target_env_allowlist(&env_allowlist, forwarded_cargo_target_dir.is_some());
     let cargo_env_overrides = cargo_target_env_overrides(forwarded_cargo_target_dir.as_deref());
