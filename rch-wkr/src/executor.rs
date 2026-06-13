@@ -16,6 +16,20 @@ pub struct CommandFailed {
     pub exit_code: i32,
 }
 
+/// Sentinel exit code returned when worker-side dependency prepare
+/// (`bun install` / `npm install`) fails or times out *before* the user command
+/// runs. Distinct from a real build/test exit 1 so the client can report
+/// "remote dependency install failed" instead of a misleading user-command
+/// failure (bd-review-wkr-prepare-exit-collision). Chosen below 124 to avoid the
+/// shell-reserved range (124 timeout, 125-127 shell, 128+ signals).
+pub const EXIT_PREPARE_FAILED: i32 = 121;
+
+/// Sentinel exit code returned when the command exited 0 but its output stream
+/// to the client was truncated by a relay write/read error. The (success) exit
+/// status and the (incomplete) output are then inconsistent, so report a failure
+/// rather than a trusted-but-partial result (bd-review-wkr-output-truncation).
+pub const EXIT_OUTPUT_TRUNCATED: i32 = 122;
+
 /// Strip leading `VAR=value` shell env assignments from a command.
 /// Returns the remainder. Tokens that look like flags (`-foo`) or that
 /// contain no `=` are not stripped. Path-valued env vars are handled
@@ -384,6 +398,11 @@ pub async fn execute(workdir: &str, command: &str) -> Result<()> {
                     report.action,
                     crate::prepare::PrepareAction::Failed | crate::prepare::PrepareAction::Timeout
                 ) {
+                    let log_hint = report
+                        .install_log_path
+                        .as_ref()
+                        .map(|p| format!(" (install log: {})", p.display()))
+                        .unwrap_or_default();
                     if let Some(p) = &report.install_log_path {
                         error!(
                             target: "rch::wkr::executor",
@@ -392,7 +411,18 @@ pub async fn execute(workdir: &str, command: &str) -> Result<()> {
                             p.display()
                         );
                     }
-                    return Err(CommandFailed { exit_code: 1 }.into());
+                    // Write to the worker's real stderr (relayed over SSH to the
+                    // client) with a distinct exit code, so the client reports a
+                    // dependency-install failure rather than a misleading
+                    // user-command exit 1 — the user command never ran.
+                    eprintln!(
+                        "rch-wkr: remote dependency install ({runtime:?}) did not finish cleanly ({:?}); the command was not run{log_hint}",
+                        report.action
+                    );
+                    return Err(CommandFailed {
+                        exit_code: EXIT_PREPARE_FAILED,
+                    }
+                    .into());
                 }
             }
             Err(e) => {
@@ -423,6 +453,11 @@ pub async fn execute(workdir: &str, command: &str) -> Result<()> {
     let mut stdout = child.stdout.take().expect("Failed to capture stdout");
     let mut stderr = child.stderr.take().expect("Failed to capture stderr");
 
+    // Each relay task returns `true` only if it drained the child pipe to EOF and
+    // relayed every byte to the client. A read error (child output incomplete) or
+    // a write/flush error (the SSH channel back to the client closed/back-pressured
+    // then failed) returns `false` so the caller knows the client saw a truncated
+    // stream and must not trust a "success" exit status.
     let stdout_task = tokio::spawn(async move {
         let mut buffer = [0u8; 4096];
         let mut out = tokio::io::stdout();
@@ -432,19 +467,20 @@ pub async fn execute(workdir: &str, command: &str) -> Result<()> {
                 Ok(n) => {
                     if let Err(e) = out.write_all(&buffer[..n]).await {
                         error!("Failed to write to stdout: {}", e);
-                        break;
+                        return false;
                     }
                     if let Err(e) = out.flush().await {
                         error!("Failed to flush stdout: {}", e);
-                        break;
+                        return false;
                     }
                 }
                 Err(e) => {
                     error!("Failed to read from command stdout: {}", e);
-                    break;
+                    return false;
                 }
             }
         }
+        true
     });
 
     let stderr_task = tokio::spawn(async move {
@@ -456,29 +492,48 @@ pub async fn execute(workdir: &str, command: &str) -> Result<()> {
                 Ok(n) => {
                     if let Err(e) = err.write_all(&buffer[..n]).await {
                         error!("Failed to write to stderr: {}", e);
-                        break;
+                        return false;
                     }
                     if let Err(e) = err.flush().await {
                         error!("Failed to flush stderr: {}", e);
-                        break;
+                        return false;
                     }
                 }
                 Err(e) => {
                     error!("Failed to read from command stderr: {}", e);
-                    break;
+                    return false;
                 }
             }
         }
+        true
     });
 
     // Wait for process to complete
     let status = child.wait().await?;
 
-    // Wait for output tasks
-    let _ = stdout_task.await;
-    let _ = stderr_task.await;
+    // Wait for output tasks; a panicked relay task (JoinError) is treated as a
+    // non-clean relay.
+    let stdout_relayed = stdout_task.await.unwrap_or(false);
+    let stderr_relayed = stderr_task.await.unwrap_or(false);
 
     if status.success() {
+        if !stdout_relayed || !stderr_relayed {
+            // Exit status says success, but the client only received a truncated
+            // output stream. Reporting success would make the result and the
+            // (incomplete) output inconsistent — the client would trust a build
+            // whose output it never fully saw. Surface a distinct failure so the
+            // client fails open / retries instead.
+            error!(
+                "Command exited 0 but output relay was truncated (stdout_ok={stdout_relayed}, stderr_ok={stderr_relayed})"
+            );
+            eprintln!(
+                "rch-wkr: command exited 0 but its output stream to the client was truncated; reporting failure to avoid a trusted-but-incomplete result"
+            );
+            return Err(CommandFailed {
+                exit_code: EXIT_OUTPUT_TRUNCATED,
+            }
+            .into());
+        }
         debug!("Command completed successfully");
         Ok(())
     } else {
@@ -608,6 +663,27 @@ mod tests {
     }
 
     // === Exit Code Capture Tests ===
+
+    #[test]
+    fn test_worker_sentinel_exit_codes_are_distinct() {
+        // Regression: a prepare failure (bd-review-wkr-prepare-exit-collision) and
+        // a truncated-output success (bd-review-wkr-output-truncation) must each
+        // have a sentinel exit code that the client can distinguish from a real
+        // build/test exit 1, from success, and from each other — and must stay
+        // out of the shell-reserved range (124 timeout, 125-127 shell, 128+
+        // signals).
+        assert_ne!(EXIT_PREPARE_FAILED, 0);
+        assert_ne!(EXIT_PREPARE_FAILED, 1);
+        assert_ne!(EXIT_OUTPUT_TRUNCATED, 0);
+        assert_ne!(EXIT_OUTPUT_TRUNCATED, 1);
+        assert_ne!(EXIT_PREPARE_FAILED, EXIT_OUTPUT_TRUNCATED);
+        for code in [EXIT_PREPARE_FAILED, EXIT_OUTPUT_TRUNCATED] {
+            assert!(
+                (2..124).contains(&code),
+                "sentinel {code} should be a plain, non-reserved exit code"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn test_execute_exit_code_zero() {
