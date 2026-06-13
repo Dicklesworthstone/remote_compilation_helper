@@ -1021,6 +1021,24 @@ impl WorkerSelector {
         // Check if the fallback worker is viable
         let worker_id = WorkerId::new(&fallback_id);
         let worker = pool.get(&worker_id).await?;
+
+        // Mirror the main selection path / healthy_workers(): never fall back onto
+        // a worker that is not assignable (operator-Drained/Disabled, Unreachable,
+        // …). Without this, an admin-Drained worker is returned as the affinity
+        // fallback and audited as AffinityFallback; reserve_slots then refuses it,
+        // and because the select->reserve retry loop does not exclude it on a
+        // reservation failure, try_fallback returns the SAME disabled worker every
+        // round, so the request ends AllWorkersBusy instead of failing open to
+        // local execution.
+        let status = worker.status().await;
+        if !matches!(status, WorkerStatus::Healthy | WorkerStatus::Degraded) {
+            debug!(
+                "Affinity fallback worker {} skipped: status is {:?}",
+                fallback_id, status
+            );
+            return None;
+        }
+
         let available = worker.available_slots().await;
         if available < request.estimated_cores {
             debug!(
@@ -5662,6 +5680,53 @@ mod tests {
         let result = selector.select(&pool, &request).await;
         assert!(result.worker.is_none());
         assert_eq!(result.reason, SelectionReason::NoWorkersPassedHealth);
+    }
+
+    #[tokio::test]
+    async fn test_try_fallback_rejects_non_assignable_worker() {
+        // Regression (bd-review-selection-fallback-drain): try_fallback must not
+        // return an operator-Drained/Disabled worker as the affinity fallback.
+        // Otherwise it is audited as AffinityFallback, reserve_slots refuses it,
+        // and the select->reserve retry loop returns the SAME disabled worker
+        // every round, ending the request AllWorkersBusy instead of failing open.
+        let pool = WorkerPool::new();
+        pool.add_worker_state(make_worker("worker1", 8, 90.0)).await;
+
+        let selector = WorkerSelector::new();
+        selector.record_success("worker1", "project-a").await;
+
+        let request = SelectionRequest {
+            project: "project-a".to_string(),
+            command: None,
+            command_priority: CommandPriority::Normal,
+            estimated_cores: 2,
+            preferred_workers: vec![],
+            toolchain: None,
+            required_runtime: RequiredRuntime::default(),
+            classification_duration_us: None,
+            hook_pid: None,
+        };
+        let empty = std::collections::HashSet::new();
+
+        // Control: a Healthy last-success worker IS returned as the fallback.
+        assert_eq!(
+            selector
+                .try_fallback(&pool, &request, &empty)
+                .await
+                .as_deref(),
+            Some("worker1"),
+            "healthy last-success worker should be a valid fallback"
+        );
+
+        // Drained / Disabled workers must be rejected by the fallback.
+        for status in [WorkerStatus::Drained, WorkerStatus::Disabled] {
+            pool.set_status(&WorkerId::new("worker1"), status).await;
+            assert_eq!(
+                selector.try_fallback(&pool, &request, &empty).await,
+                None,
+                "non-assignable worker ({status:?}) must not be an affinity fallback"
+            );
+        }
     }
 
     #[tokio::test]
