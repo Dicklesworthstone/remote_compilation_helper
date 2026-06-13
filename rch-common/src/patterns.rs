@@ -1231,6 +1231,34 @@ fn command_word_matches(cmd: &str, keyword: &str) -> bool {
     rest.is_empty() || rest.starts_with(char::is_whitespace)
 }
 
+/// Bare positional target tokens of a `make`/`ninja` command.
+///
+/// Skips the program name, option flags (`-x`, `--long`, combined `-j8`), the
+/// value token consumed by any flag in `value_flags`, and `VAR=value`
+/// assignments. This lets the maintenance-target check match WHOLE tokens
+/// (`clean`, `install`, …) instead of a substring anywhere in the command, so
+/// real builds like `make CFLAGS=-Iinstall/include`, `make TARGET=cleanup`,
+/// `ninja build/clean_obj.o`, and `make -C install` / `ninja -C clean` (a
+/// directory argument, not the target) are no longer misclassified as
+/// maintenance.
+fn positional_build_targets<'a>(cmd: &'a str, value_flags: &[&str]) -> Vec<&'a str> {
+    let mut targets = Vec::new();
+    let toks: Vec<&str> = cmd.split_whitespace().skip(1).collect();
+    let mut i = 0;
+    while i < toks.len() {
+        let tok = toks[i];
+        if value_flags.contains(&tok) {
+            i += 2; // flag consumes the following token as its value
+        } else if tok.starts_with('-') || tok.contains('=') {
+            i += 1; // other flag (incl. combined `-j8`) or VAR=value assignment
+        } else {
+            targets.push(tok);
+            i += 1;
+        }
+    }
+    targets
+}
+
 /// Full classification of a command (Tier 4).
 fn classify_full(cmd: &str) -> Classification {
     // Cargo commands
@@ -1297,8 +1325,25 @@ fn classify_full(cmd: &str) -> Classification {
 
     // Make
     if cmd.starts_with("make") && (cmd.eq("make") || cmd.starts_with("make ")) {
-        // Don't intercept "make clean", "make install", etc.
-        if cmd.contains("clean") || cmd.contains("install") || cmd.contains("distclean") {
+        // Don't intercept "make clean", "make install", etc. — but match them as
+        // whole TARGET tokens, not as a substring anywhere. A `contains` check
+        // rejected real builds like "make CFLAGS=-Iinstall/include" and
+        // "make TARGET=cleanup" as maintenance.
+        const MAKE_VALUE_FLAGS: [&str; 8] = [
+            "-f",
+            "-C",
+            "-I",
+            "-o",
+            "-W",
+            "--file",
+            "--directory",
+            "--include-dir",
+        ];
+        const MAKE_MAINTENANCE_TARGETS: [&str; 4] = ["clean", "install", "distclean", "uninstall"];
+        let is_maintenance = positional_build_targets(cmd, &MAKE_VALUE_FLAGS)
+            .iter()
+            .any(|target| MAKE_MAINTENANCE_TARGETS.contains(target));
+        if is_maintenance {
             return Classification::not_compilation("make maintenance command");
         }
         return Classification::compilation(CompilationKind::Make, 0.85, "make build");
@@ -1315,7 +1360,14 @@ fn classify_full(cmd: &str) -> Classification {
 
     // Ninja
     if cmd.starts_with("ninja") && (cmd.eq("ninja") || cmd.starts_with("ninja ")) {
-        if cmd.contains("-t clean") || cmd.contains("clean") {
+        // Match the `-t clean` tool form and a whole-token `clean` target — not
+        // the substring "clean" anywhere ("ninja build/clean_obj.o" is a real
+        // build, and "ninja -C clean" cleans a directory argument).
+        const NINJA_VALUE_FLAGS: [&str; 8] = ["-C", "-f", "-j", "-k", "-l", "-d", "-t", "-w"];
+        let raw: Vec<&str> = cmd.split_whitespace().collect();
+        let is_clean_tool = raw.windows(2).any(|w| w[0] == "-t" && w[1] == "clean");
+        let is_clean_target = positional_build_targets(cmd, &NINJA_VALUE_FLAGS).contains(&"clean");
+        if is_clean_tool || is_clean_target {
             return Classification::not_compilation("ninja clean");
         }
         return Classification::compilation(CompilationKind::Ninja, 0.90, "ninja build");
@@ -1691,6 +1743,64 @@ mod tests {
         let result = classify_command("(cargo build)");
         assert!(!result.is_compilation);
         assert!(result.reason.contains("subshell execution"));
+    }
+
+    #[test]
+    fn test_make_maintenance_matches_whole_target_tokens() {
+        // Regression (bd-review-make-ninja-substring): maintenance targets must
+        // match as whole TARGET tokens, not as a substring anywhere.
+        let _guard = test_guard!();
+
+        // Real maintenance targets are still rejected.
+        for cmd in [
+            "make clean",
+            "make install",
+            "make distclean",
+            "make uninstall",
+        ] {
+            let r = classify_command(cmd);
+            assert!(!r.is_compilation, "{cmd} should not be intercepted");
+            assert!(r.reason.contains("make maintenance command"), "{cmd}");
+        }
+        // With parallelism flags too.
+        let r = classify_command("make -j8 clean");
+        assert!(!r.is_compilation);
+
+        // Real builds whose tokens merely CONTAIN a maintenance word are builds.
+        for cmd in [
+            "make CFLAGS=-Iinstall/include",
+            "make build INSTALL_DIR=/x",
+            "make TARGET=cleanup",
+            "make clean-all",  // distinct target, not "clean"
+            "make -C install", // build in a directory named "install"
+        ] {
+            let r = classify_command(cmd);
+            assert!(r.is_compilation, "{cmd} should be intercepted as a build");
+            assert_eq!(r.kind, Some(CompilationKind::Make), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn test_ninja_clean_matches_tool_and_whole_target() {
+        // Regression (bd-review-make-ninja-substring): only `-t clean` and a
+        // whole-token `clean` target are maintenance.
+        let _guard = test_guard!();
+
+        for cmd in ["ninja clean", "ninja -t clean", "ninja -j8 clean"] {
+            let r = classify_command(cmd);
+            assert!(!r.is_compilation, "{cmd} should not be intercepted");
+            assert!(r.reason.contains("ninja clean"), "{cmd}");
+        }
+
+        for cmd in [
+            "ninja build/clean_obj.o", // path containing "clean"
+            "ninja -C clean",          // build in a directory named "clean"
+            "ninja -j4",
+        ] {
+            let r = classify_command(cmd);
+            assert!(r.is_compilation, "{cmd} should be intercepted as a build");
+            assert_eq!(r.kind, Some(CompilationKind::Ninja), "{cmd}");
+        }
     }
 
     #[test]
