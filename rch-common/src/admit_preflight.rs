@@ -339,7 +339,7 @@ mod tests {
         let p = preflight("ls -la", false);
         assert!(!p.is_compilation);
         assert_eq!(p.base_recommendation, AdmitRecommendation::Local);
-        assert!(p.required.needs_cargo == false && p.required.needs_bun == false);
+        assert!(!p.required.needs_cargo && !p.required.needs_bun);
         assert!(p.detail.contains("locally"));
     }
 

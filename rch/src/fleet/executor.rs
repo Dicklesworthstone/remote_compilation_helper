@@ -1081,9 +1081,6 @@ async fn set_executable_permissions(worker: &WorkerConfig) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("chmod failed: {}", e))
 }
 
-/// Verify the installation by running health check.
-///
-/// Uses `SshExecutor::run_command()` for consistent behavior and logging.
 // =============================================================================
 // Post-deploy exact user/path validation
 // (bd-session-history-remediation-ocv9i.7.3)
