@@ -352,9 +352,16 @@ pub fn assess_admissibility(facts: &ProbedFacts, req: &CapabilityRequirement) ->
         };
     }
     for needed in &req.needs_toolchains {
-        // Prefix match: `nightly-2025-11-01` satisfies
-        // `nightly-2025-11-01-x86_64-unknown-linux-gnu`.
-        if !facts.rust.toolchains.iter().any(|t| t.starts_with(needed)) {
+        // Match the exact name OR a `-`-suffixed host-triple form, so
+        // `nightly-2025-11-01` satisfies
+        // `nightly-2025-11-01-x86_64-unknown-linux-gnu` but NOT
+        // `nightly-2025-11-010` (bd-review-toolchain-prefix).
+        if !facts
+            .rust
+            .toolchains
+            .iter()
+            .any(|t| t == needed || t.starts_with(&format!("{needed}-")))
+        {
             return CapabilityVerdict::Rejected {
                 reason: IncidentReasonCode::MissingRuntimeToolchainTarget,
                 detail: format!("missing rustup toolchain {needed}"),

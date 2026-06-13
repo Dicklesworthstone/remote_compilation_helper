@@ -163,14 +163,19 @@ impl WorkerFacts {
             || self.host.artifact_platforms.iter().any(|p| p == triple)
     }
 
-    /// Whether a named rustup toolchain is installed (prefix match, so
-    /// `nightly` matches `nightly-2026-05-22`).
+    /// Whether a named rustup toolchain is installed.
+    ///
+    /// Matches the exact channel/pinned name OR a `-`-suffixed host-triple form
+    /// (so `nightly` matches `nightly-2026-05-22` and `nightly-x86_64-...`). The
+    /// `-` boundary is required so `nightly` does NOT match a hypothetical
+    /// `nightlyfoo`, and `nightly-2025-11` does not match `nightly-2025-110`
+    /// (bd-review-toolchain-prefix).
     #[must_use]
     pub fn has_toolchain(&self, name: &str) -> bool {
         self.rust
             .toolchains
             .iter()
-            .any(|t| t == name || t.starts_with(name))
+            .any(|t| t == name || t.starts_with(&format!("{name}-")))
     }
 
     /// Whether a rustup target is installed (e.g. `wasm32-unknown-unknown`).
