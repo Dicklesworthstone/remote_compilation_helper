@@ -450,8 +450,17 @@ impl RemoteCompilationTest {
         let mut client = SshClient::new(self.worker.clone(), self.ssh_options.clone());
         client.connect().await?;
         let mkdir_cmd = format!("mkdir -p -- {}", escaped_remote_path);
-        let mkdir_result = client.execute(&mkdir_cmd).await?;
-        client.disconnect().await?;
+        // Always disconnect, even on error/timeout — see the build path below: a
+        // dropped RemoteChild is not reaped while the ControlMaster is alive, so
+        // `?` before disconnect() would leak the remote process.
+        let mkdir_result = client.execute(&mkdir_cmd).await;
+        if let Err(e) = client.disconnect().await {
+            warn!(
+                "Failed to disconnect from {} after remote mkdir: {}",
+                self.worker.id, e
+            );
+        }
+        let mkdir_result = mkdir_result?;
 
         if !mkdir_result.success() {
             bail!("Failed to create remote directory: {}", mkdir_result.stderr);
@@ -556,8 +565,22 @@ impl RemoteCompilationTest {
 
         let mut client = SshClient::new(self.worker.clone(), self.ssh_options.clone());
         client.connect().await?;
-        let result = client.execute(&build_cmd).await?;
-        client.disconnect().await?;
+        // Capture the result and ALWAYS disconnect, even on error/timeout. On an
+        // execute() timeout the inner RemoteChild is dropped, but dropping it does
+        // NOT kill the remote process while the SSH ControlMaster is alive — only
+        // closing the session (disconnect) reaps it. Propagating `?` straight from
+        // execute() would skip disconnect() and leak a timed-out `cargo build`
+        // that keeps burning worker CPU and holding cache/target locks until sshd
+        // reaps it. The disconnect error is best-effort and must not mask the
+        // primary build error.
+        let result = client.execute(&build_cmd).await;
+        if let Err(e) = client.disconnect().await {
+            warn!(
+                "Failed to disconnect from {} after remote build: {}",
+                self.worker.id, e
+            );
+        }
+        let result = result?;
 
         if !result.success() {
             bail!(
