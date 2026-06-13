@@ -1617,26 +1617,33 @@ fi",
 
         debug!("Effective exclude patterns: {:?}", effective_excludes);
 
-        let cmd = self.build_sync_streaming_command(
-            worker,
-            &destination,
-            &escaped_remote_path,
-            &effective_excludes,
-        );
+        // Rebuilt per retry attempt: rsync consumes its `Command`, and a
+        // transient SSH/rsync drop on this streaming path must reconnect from a
+        // fresh command rather than fail the whole transfer with zero retries.
+        let build_cmd = || {
+            self.build_sync_streaming_command(
+                worker,
+                &destination,
+                &escaped_remote_path,
+                &effective_excludes,
+            )
+        };
 
         debug!(
             "Running (streaming): rsync {:?}",
-            cmd.as_std().get_args().collect::<Vec<_>>()
+            build_cmd().as_std().get_args().collect::<Vec<_>>()
         );
 
         let retry_config = self.effective_rsync_retry_config();
-        let transfer_timeout =
-            std::time::Duration::from_millis(retry_config.total_timeout_ms.max(1));
-        let (output, duration_ms) =
-            run_command_streaming(cmd, "sync_to_remote_streaming", transfer_timeout, |line| {
+        let (output, duration_ms) = run_command_streaming_with_retry(
+            &retry_config,
+            "sync_to_remote_streaming",
+            build_cmd,
+            |line| {
                 on_line(line);
-            })
-            .await?;
+            },
+        )
+        .await?;
 
         Ok(SyncResult {
             bytes_transferred: parse_rsync_bytes(&output),
@@ -2259,21 +2266,23 @@ fi",
             remote_path, worker.id
         );
 
-        let cmd =
-            self.build_retrieve_streaming_command(worker, &escaped_remote_path, artifact_patterns);
+        // Rebuilt per retry attempt (see `sync_to_remote_streaming`): a transient
+        // transport drop while pulling artifacts must reconnect and retry instead
+        // of failing the build's artifact return outright.
+        let build_cmd = || {
+            self.build_retrieve_streaming_command(worker, &escaped_remote_path, artifact_patterns)
+        };
 
         debug!(
             "Running artifact retrieval (streaming): rsync {:?}",
-            cmd.as_std().get_args().collect::<Vec<_>>()
+            build_cmd().as_std().get_args().collect::<Vec<_>>()
         );
 
         let retry_config = self.effective_rsync_retry_config();
-        let transfer_timeout =
-            std::time::Duration::from_millis(retry_config.total_timeout_ms.max(1));
-        let (output, duration_ms) = run_command_streaming(
-            cmd,
+        let (output, duration_ms) = run_command_streaming_with_retry(
+            &retry_config,
             "retrieve_artifacts_streaming",
-            transfer_timeout,
+            build_cmd,
             |line| {
                 on_line(line);
             },
@@ -2669,6 +2678,122 @@ where
     }
 
     Ok((combined, start.elapsed().as_millis() as u64))
+}
+
+/// Decide whether a [`run_command_streaming`] failure is a transient transport
+/// error worth retrying.
+///
+/// `run_command_streaming` reports a non-zero rsync exit as
+/// `TransferError::SyncFailed { stderr, .. }`, whose `Display` is only
+/// `"Project sync failed: rsync failed"` — the transport signature lives in the
+/// captured `stderr`, NOT in the error chain. So the generic
+/// `is_retryable_transport_error` (which walks `err.chain()` strings) would
+/// classify every streaming rsync drop as fatal. We therefore inspect the
+/// captured `stderr` directly for `SyncFailed`, and fall back to the error-chain
+/// classifier for everything else (spawn I/O errors, the streaming-timeout
+/// `bail!`, etc.).
+fn streaming_error_is_retryable(err: &anyhow::Error) -> bool {
+    if let Some(TransferError::SyncFailed { stderr, .. }) = err.downcast_ref::<TransferError>() {
+        return is_retryable_transport_error_text(stderr);
+    }
+    is_retryable_transport_error(err)
+}
+
+/// Streaming counterpart of [`execute_rsync_with_retry`].
+///
+/// `run_command_streaming` consumes its `Command` (so it cannot be retried in
+/// place) and surfaces transport failures inside a `TransferError::SyncFailed`
+/// whose `Display` omits the stderr — which is why this loop is hand-rolled
+/// rather than delegating to `retry_with_backoff`. Each attempt rebuilds the
+/// command via `build_command`, runs it under the *remaining* total budget
+/// (mirroring `retry_with_backoff`'s per-attempt timeout accounting), and on a
+/// transient transport failure backs off and retries up to `max_attempts`.
+///
+/// `on_line` is re-invoked from scratch on every attempt (rsync restarts from
+/// the beginning). All call sites use it purely for progress/heartbeat display,
+/// which tolerates repetition; do not route side-effecting work through it.
+async fn run_command_streaming_with_retry<F>(
+    config: &RetryConfig,
+    operation_name: &str,
+    build_command: impl Fn() -> Command,
+    mut on_line: F,
+) -> Result<(String, u64)>
+where
+    F: FnMut(&str),
+{
+    let start = std::time::Instant::now();
+    let mut last_error: Option<anyhow::Error> = None;
+
+    for attempt in 0..config.max_attempts {
+        // Stop before a retry once the total budget is spent.
+        if attempt > 0 && !config.should_retry(attempt, start.elapsed()) {
+            debug!(
+                "{}: total timeout exceeded after {} attempts",
+                operation_name, attempt
+            );
+            break;
+        }
+
+        // Exponential backoff with jitter for retries only.
+        if attempt > 0 {
+            let delay = config.delay_for_attempt(attempt);
+            debug!(
+                "{}: attempt {}/{} after {}ms delay",
+                operation_name,
+                attempt + 1,
+                config.max_attempts,
+                delay.as_millis()
+            );
+            sleep(delay).await;
+        }
+
+        // The per-attempt timeout is the remaining total budget, so the sum of
+        // all attempts stays bounded by `total_timeout_ms` exactly as the
+        // non-streaming retry path does.
+        let elapsed_ms = start.elapsed().as_millis();
+        let remaining_ms = if elapsed_ms >= config.total_timeout_ms as u128 {
+            1
+        } else {
+            (config.total_timeout_ms - elapsed_ms as u64).max(1)
+        };
+        let attempt_timeout = std::time::Duration::from_millis(remaining_ms);
+
+        let cmd = build_command();
+        match run_command_streaming(cmd, operation_name, attempt_timeout, &mut on_line).await {
+            Ok(result) => {
+                if attempt > 0 {
+                    info!(
+                        "{}: succeeded on attempt {}/{}",
+                        operation_name,
+                        attempt + 1,
+                        config.max_attempts
+                    );
+                }
+                return Ok(result);
+            }
+            Err(err) => {
+                if !streaming_error_is_retryable(&err) {
+                    debug!(
+                        "{}: non-retryable error on attempt {}: {}",
+                        operation_name,
+                        attempt + 1,
+                        err
+                    );
+                    return Err(err);
+                }
+                warn!(
+                    "{}: retryable error on attempt {}/{}: {}",
+                    operation_name,
+                    attempt + 1,
+                    config.max_attempts,
+                    err
+                );
+                last_error = Some(err);
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("{}: all retries exhausted", operation_name)))
 }
 
 fn normalize_hash_root(path: &Path, policy: &PathTopologyPolicy) -> PathBuf {
@@ -5083,6 +5208,176 @@ Total file size: 123 bytes";
         assert!(
             err.to_string()
                 .contains("test_streaming_rsync: timed out after 25ms")
+        );
+    }
+
+    #[test]
+    fn test_streaming_error_is_retryable_reads_syncfailed_stderr() {
+        // The whole point of the streaming classifier: TransferError::SyncFailed's
+        // Display is only "Project sync failed: rsync failed", so the transport
+        // signature must be read from the captured `stderr`, not the error chain.
+        let _guard = test_guard!();
+        let transient: anyhow::Error = TransferError::SyncFailed {
+            reason: "rsync failed".to_string(),
+            exit_code: Some(12),
+            stderr: "rsync: connection unexpectedly closed (0 bytes received)".to_string(),
+        }
+        .into();
+        assert!(
+            streaming_error_is_retryable(&transient),
+            "transport stderr inside SyncFailed must classify as retryable"
+        );
+
+        let fatal: anyhow::Error = TransferError::SyncFailed {
+            reason: "rsync failed".to_string(),
+            exit_code: Some(23),
+            stderr: "rsync: mkstemp failed: Permission denied".to_string(),
+        }
+        .into();
+        assert!(
+            !streaming_error_is_retryable(&fatal),
+            "permission-denied stderr inside SyncFailed must NOT be retryable"
+        );
+
+        // Non-SyncFailed errors fall back to the error-chain classifier.
+        assert!(streaming_error_is_retryable(&anyhow::anyhow!(
+            "op: timed out after 25ms"
+        )));
+        assert!(!streaming_error_is_retryable(&anyhow::anyhow!(
+            "Failed to execute rsync"
+        )));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_run_command_streaming_with_retry_retries_transient_transport_failure() {
+        // Regression (bd-review-transfer-streaming-noretry): streaming
+        // upload/retrieve called run_command_streaming directly, so a transient
+        // rsync transport drop failed the whole transfer with zero retries. The
+        // wrapper must classify the SyncFailed stderr and retry to max_attempts.
+        let _guard = test_guard!();
+        let retry_config = RetryConfig {
+            max_attempts: 3,
+            base_delay_ms: 1,
+            max_delay_ms: 2,
+            jitter_factor: 0.0,
+            total_timeout_ms: 5_000,
+        };
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_in = std::sync::Arc::clone(&calls);
+        let lines = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let lines_in = std::sync::Arc::clone(&lines);
+        let err = run_command_streaming_with_retry(
+            &retry_config,
+            "transient_streaming_rsync",
+            move || {
+                calls_in.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut cmd = Command::new("sh");
+                cmd.arg("-c").arg(
+                    "echo 'rsync: connection unexpectedly closed (0 bytes received)' >&2; exit 12",
+                );
+                cmd.stdout(std::process::Stdio::piped());
+                cmd.stderr(std::process::Stdio::piped());
+                cmd
+            },
+            |_line| {
+                lines_in.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            },
+        )
+        .await
+        .expect_err("transient transport failure should exhaust retries as Err");
+        assert!(
+            err.to_string().contains("Project sync failed"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "must retry up to max_attempts on a retryable transport failure"
+        );
+        assert!(
+            lines.load(std::sync::atomic::Ordering::SeqCst) >= 3,
+            "on_line must be re-invoked on every attempt"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_run_command_streaming_with_retry_does_not_retry_non_transport_failure() {
+        let _guard = test_guard!();
+        let retry_config = RetryConfig {
+            max_attempts: 3,
+            base_delay_ms: 1,
+            max_delay_ms: 2,
+            jitter_factor: 0.0,
+            total_timeout_ms: 5_000,
+        };
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_in = std::sync::Arc::clone(&calls);
+        run_command_streaming_with_retry(
+            &retry_config,
+            "fatal_streaming_rsync",
+            move || {
+                calls_in.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut cmd = Command::new("sh");
+                cmd.arg("-c")
+                    .arg("echo 'rsync: mkstemp failed: Permission denied' >&2; exit 23");
+                cmd.stdout(std::process::Stdio::piped());
+                cmd.stderr(std::process::Stdio::piped());
+                cmd
+            },
+            |_| {},
+        )
+        .await
+        .expect_err("non-transport streaming failure should fail fast as Err");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "must NOT retry a non-transport failure"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_run_command_streaming_with_retry_recovers_after_transient() {
+        // A transient drop on the first attempt followed by success proves the
+        // streaming path now reconnects instead of failing the whole transfer.
+        let _guard = test_guard!();
+        let retry_config = RetryConfig {
+            max_attempts: 3,
+            base_delay_ms: 1,
+            max_delay_ms: 2,
+            jitter_factor: 0.0,
+            total_timeout_ms: 5_000,
+        };
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_in = std::sync::Arc::clone(&calls);
+        let (out, _ms) = run_command_streaming_with_retry(
+            &retry_config,
+            "recovering_streaming_rsync",
+            move || {
+                let n = calls_in.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut cmd = Command::new("sh");
+                if n == 0 {
+                    cmd.arg("-c")
+                        .arg("echo 'rsync: connection unexpectedly closed' >&2; exit 12");
+                } else {
+                    cmd.arg("-c")
+                        .arg("echo 'sent 100 bytes  received 50 bytes'; exit 0");
+                }
+                cmd.stdout(std::process::Stdio::piped());
+                cmd.stderr(std::process::Stdio::piped());
+                cmd
+            },
+            |_| {},
+        )
+        .await
+        .expect("should recover on the second attempt");
+        assert!(out.contains("received"), "stdout should be captured: {out}");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "should succeed on the second attempt"
         );
     }
 
