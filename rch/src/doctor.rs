@@ -1619,7 +1619,13 @@ async fn run_reliability_watch_loop(ctx: &OutputContext, options: &DoctorOptions
                 let verdict = response.summary.overall;
                 let verdict_changed = state.last_verdict != Some(verdict);
                 let any_change = diff.has_changes() || verdict_changed;
-                if any_change {
+                // transitions_count must count VERDICT transitions only — that is
+                // what the "transitions"/"transitions_total" summary fields report
+                // and what the webhooks fire on. A diagnostic-text-only diff (the
+                // verdict unchanged) must not inflate it, or it misleads CI gates
+                // keying on transitions_total (bd-review-doctor-transitions-count).
+                // `any_change` still drives --transitions-only output below.
+                if verdict_changed {
                     state.transitions_count += 1;
                 }
                 state.observe_verdict(verdict);
