@@ -1249,6 +1249,20 @@ fn staged_install_command(
 /// - Returns `Ok(None)` on any error (logged at WARN level)
 /// - Returns `Ok(Some(backup))` on success
 ///
+/// True if a worker-reported version string is safe to interpolate into the
+/// shell commands (cp/sha256sum/rm) that manage its backup file, and into the
+/// backup path stored for rollback. The version is parsed from an untrusted
+/// `<binary> --version`, so a corrupt or hostile binary could report a token
+/// carrying shell metacharacters, command substitution, or globs. Restrict to
+/// the conventional version charset; anything else is rejected rather than
+/// risking word-splitting/injection.
+fn is_safe_version_token(version: &str) -> bool {
+    !version.is_empty()
+        && version
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | '-'))
+}
+
 /// The backup is registered in the local rollback registry for later rollback.
 /// Old backups exceeding MAX_BACKUPS_PER_WORKER are automatically pruned.
 pub async fn backup_before_deploy(
@@ -1309,6 +1323,21 @@ async fn backup_before_deploy_with_runner<R: CommandRunner>(
             return Ok(None);
         }
     };
+
+    // `version` is interpolated UNQUOTED into the backup path used by cp /
+    // sha256sum / rm here AND (via WorkerBackup.remote_path) by the rollback
+    // path. Reject any version with characters outside the conventional set so a
+    // corrupt or hostile worker binary cannot inject shell into those commands.
+    // Validating once at the source keeps every downstream command safe without
+    // escaping each call site; the rollback path reuses the same stored path.
+    if !is_safe_version_token(&version) {
+        warn!(
+            worker = %worker.id,
+            version = %version,
+            "Skipping backup: worker-reported version contains unsafe characters"
+        );
+        return Ok(None);
+    }
 
     info!(worker = %worker.id, version = %version, "Creating backup before deploy");
 
@@ -2249,6 +2278,55 @@ mod tests {
             .unwrap();
 
         assert!(result.is_none());
+        assert!(manager.get_latest_backup(&worker.id.0).is_none());
+    }
+
+    #[test]
+    fn is_safe_version_token_accepts_conventional_and_rejects_metachars() {
+        for ok in ["1.0.0", "0.2.2", "1.2.3-rc.1+build.5", "rch_wkr-2024"] {
+            assert!(is_safe_version_token(ok), "{ok} should be accepted");
+        }
+        assert!(!is_safe_version_token(""), "empty must be rejected");
+        for bad in [
+            "1.0.0;rm",
+            "$(touch x)",
+            "1.0 0",
+            "1.0`id`",
+            "v*",
+            "a|b",
+            "a&b",
+            "a>b",
+            "a/b",
+            "a\nb",
+        ] {
+            assert!(!is_safe_version_token(bad), "{bad} should be rejected");
+        }
+    }
+
+    #[tokio::test]
+    async fn backup_before_deploy_rejects_unsafe_version_token() {
+        use crate::fleet::ssh::{MockCommandResult, MockSshExecutor};
+
+        let worker = test_worker_config();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut manager = RollbackManager::with_path(temp_dir.path()).unwrap();
+
+        // A corrupt/hostile binary reports a version with a shell metacharacter:
+        // split_whitespace().nth(1) => "1.0.0;rm", which must be rejected before
+        // it reaches cp/sha256sum/rm. The cp mock returns success so that if the
+        // validation regressed, a backup WOULD be created and the assertions
+        // below would fail.
+        let mock = MockSshExecutor::new()
+            .with_command("--version", MockCommandResult::ok("rch-wkr 1.0.0;rm"))
+            .with_command("mkdir -p", MockCommandResult::ok(""))
+            .with_command("df -Pm", MockCommandResult::ok("500"))
+            .with_command("cp ", MockCommandResult::ok(""));
+
+        let result = backup_before_deploy_with_runner(&worker, &mut manager, &mock)
+            .await
+            .unwrap();
+
+        assert!(result.is_none(), "unsafe version must skip the backup");
         assert!(manager.get_latest_backup(&worker.id.0).is_none());
     }
 }
