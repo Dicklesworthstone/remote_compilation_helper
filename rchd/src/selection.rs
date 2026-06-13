@@ -1410,14 +1410,63 @@ impl WorkerSelector {
                             Some(format!("low disk {:.1} GB < {:.1} GB", free_gb, min_disk));
                     }
 
-                    if let Some(decision) = hard_decision {
-                        decision
+                    // Mirror get_eligible_workers: when an admission gate is wired
+                    // it REPLACES the raw pressure-state check, so the diagnostic
+                    // decision must come from the gate verdict too. Otherwise a
+                    // gate-REJECTED worker is reported here as Allow — misleading
+                    // exactly the "why was nothing selected" output operators rely
+                    // on (bd-review-selection-diag-gate). `None` means admitted (or
+                    // no critical pressure), letting the chain fall through to the
+                    // reliability/health checks just like the real selection path.
+                    let admission_decision: Option<(
+                        WorkerSelectionDiagnosticDecision,
+                        String,
+                        &'static str,
+                    )> = if let Some(ref gate) = self.admission_gate {
+                        use crate::admission::AdmissionVerdict;
+                        match gate
+                            .evaluate(worker.as_ref(), worker_id.as_str(), &request.project)
+                            .await
+                        {
+                            AdmissionVerdict::Reject {
+                                reason_code,
+                                reason,
+                            } => {
+                                if reason_code == "admission_critical_pressure" {
+                                    // Hard exclusion (not even fail-open fallback).
+                                    Some((
+                                        WorkerSelectionDiagnosticDecision::Deny,
+                                        format!("critical pressure: {reason}"),
+                                        "pressure.critical",
+                                    ))
+                                } else {
+                                    // Non-critical reject: excluded from primary
+                                    // selection but kept for fail-open fallback,
+                                    // exactly as get_eligible_workers does.
+                                    Some((
+                                        WorkerSelectionDiagnosticDecision::FallbackCandidate,
+                                        format!("admission rejected: {reason}"),
+                                        "admission.rejected",
+                                    ))
+                                }
+                            }
+                            AdmissionVerdict::Admit { .. } => None,
+                        }
                     } else if pressure.state == PressureState::Critical {
-                        push_reason_code(&mut reason_codes, "pressure.critical");
-                        (
+                        Some((
                             WorkerSelectionDiagnosticDecision::Deny,
                             format!("critical pressure: {}", pressure.reason_code),
-                        )
+                            "pressure.critical",
+                        ))
+                    } else {
+                        None
+                    };
+
+                    if let Some(decision) = hard_decision {
+                        decision
+                    } else if let Some((decision, reason, code)) = admission_decision {
+                        push_reason_code(&mut reason_codes, code);
+                        (decision, reason)
                     } else if let Some(ref agg) = self.reliability {
                         // Diagnostics run after preflight in failed-selection paths. Reusing the
                         // cached assessment keeps the report from consuming a recovery tick.
