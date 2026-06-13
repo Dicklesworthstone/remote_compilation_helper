@@ -482,6 +482,13 @@ impl WebhookDispatcher {
         }
         let client = reqwest::Client::builder()
             .user_agent(concat!("rch/", env!("CARGO_PKG_VERSION")))
+            // A webhook must POST to the EXACT configured URL. reqwest follows up
+            // to 10 redirects by default and, while it strips Authorization on a
+            // cross-origin redirect, it does NOT strip our custom X-RCH-Signature
+            // header — so a 30x-redirecting receiver would receive a replayable
+            // signed payload on another host within one attempt. Never follow
+            // redirects (bd-review-webhook-redirect-leak).
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .ok()?;
         Some(Self {
