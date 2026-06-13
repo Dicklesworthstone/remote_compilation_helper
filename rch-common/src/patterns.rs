@@ -450,7 +450,11 @@ fn split_and_chain(cmd: &str) -> Option<Vec<&str>> {
             continue;
         }
 
-        if b == b'\\' {
+        // POSIX: backslash is LITERAL inside single quotes; only honor it as an
+        // escape when not in a single-quoted span, or the next `'` is wrongly
+        // swallowed and the quote stays "open", hiding an exposed operator
+        // (bd-review-singlequote-escape).
+        if b == b'\\' && !in_single {
             escaped = true;
             i += 1;
             continue;
@@ -520,7 +524,9 @@ fn split_multi_command(cmd: &str) -> Option<Vec<&str>> {
             continue;
         }
 
-        if c == '\\' {
+        // POSIX: backslash is LITERAL inside single quotes (see
+        // bd-review-singlequote-escape); only treat it as an escape elsewhere.
+        if c == '\\' && !in_single {
             escaped = true;
             i += 1;
             continue;
@@ -982,7 +988,11 @@ fn has_file_redirect(cmd: &str) -> bool {
             i += 1;
             continue;
         }
-        if b == b'\\' {
+        // POSIX: backslash is LITERAL inside single quotes; only honor it as an
+        // escape when not in a single-quoted span, or the next `'` is wrongly
+        // swallowed and the quote stays "open", hiding an exposed operator
+        // (bd-review-singlequote-escape).
+        if b == b'\\' && !in_single {
             escaped = true;
             i += 1;
             continue;
@@ -1074,7 +1084,11 @@ fn check_structure(cmd: &str) -> Option<&'static str> {
             i += 1;
             continue;
         }
-        if b == b'\\' {
+        // POSIX: backslash is LITERAL inside single quotes; only honor it as an
+        // escape when not in a single-quoted span, or the next `'` is wrongly
+        // swallowed and the quote stays "open", hiding an exposed operator
+        // (bd-review-singlequote-escape).
+        if b == b'\\' && !in_single {
             escaped = true;
             i += 1;
             continue;
@@ -1540,7 +1554,11 @@ pub fn split_shell_commands(cmd: &str) -> Vec<&str> {
             continue;
         }
 
-        if b == b'\\' {
+        // POSIX: backslash is LITERAL inside single quotes; only honor it as an
+        // escape when not in a single-quoted span, or the next `'` is wrongly
+        // swallowed and the quote stays "open", hiding an exposed operator
+        // (bd-review-singlequote-escape).
+        if b == b'\\' && !in_single {
             escaped = true;
             i += 1;
             continue;
@@ -3347,6 +3365,19 @@ mod tests {
             assert_eq!(
                 split_shell_commands(r"echo it\'s && cargo build"),
                 vec![r"echo it\'s", "cargo build"]
+            );
+        }
+
+        #[test]
+        fn test_split_backslash_literal_in_single_quotes() {
+            let _guard = test_guard!();
+            // POSIX: backslash is LITERAL inside single quotes, so 'a\' is the
+            // string a\ and the closing quote ENDS the span — exposing the
+            // following operator. Previously the \ swallowed the closing ',
+            // kept the quote "open", and hid the && (bd-review-singlequote-escape).
+            assert_eq!(
+                split_shell_commands(r"cargo build 'a\' && rm -rf x"),
+                vec![r"cargo build 'a\'", "rm -rf x"]
             );
         }
 
