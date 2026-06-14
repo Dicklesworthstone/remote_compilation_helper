@@ -3,7 +3,8 @@
 //! These types mirror the response structures from rchd's /status API endpoint.
 
 use rch_common::{
-    BuildCancellationMetadata, CommandTimingBreakdown, SavedTimeStats, WorkerCapabilities,
+    BuildCancellationMetadata, BypassRecord, CommandTimingBreakdown, SavedTimeStats,
+    WorkerCapabilities,
 };
 use serde::{Deserialize, Serialize};
 
@@ -96,6 +97,10 @@ pub struct WorkerStatusFromApi {
     /// Whether the latest telemetry sample is fresh enough for high-confidence decisions.
     #[serde(default)]
     pub pressure_telemetry_fresh: Option<bool>,
+    /// Active temporary-bypass record, if this worker is currently quarantined
+    /// on the transient-eligibility axis (bd-session-history-remediation-ocv9i.1.2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bypass: Option<BypassRecord>,
 }
 
 /// Worker capabilities information from API.
@@ -1550,6 +1555,7 @@ mod tests {
             pressure_memory_pressure: None,
             pressure_telemetry_age_secs: None,
             pressure_telemetry_fresh: None,
+            bypass: None,
         }
     }
 

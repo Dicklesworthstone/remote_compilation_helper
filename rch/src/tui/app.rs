@@ -808,6 +808,7 @@ mod tests {
             pressure_memory_pressure: None,
             pressure_telemetry_age_secs: None,
             pressure_telemetry_fresh: None,
+            bypass: None,
         }
     }
 

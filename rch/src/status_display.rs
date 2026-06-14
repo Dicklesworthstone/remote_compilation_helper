@@ -505,8 +505,36 @@ fn render_workers_table_to<W: Write>(
         {
             render_pressure_details_to(out, worker, style)?;
         }
+
+        // Show temporary-bypass info for transiently-quarantined workers.
+        if let Some(ref bypass) = worker.bypass {
+            render_bypass_details_to(out, bypass, style)?;
+        }
     }
 
+    Ok(())
+}
+
+/// Render temporary-bypass details for a worker quarantined on the transient
+/// eligibility axis (bd-session-history-remediation-ocv9i.1.2).
+fn render_bypass_details_to<W: Write>(
+    out: &mut W,
+    bypass: &rch_common::BypassRecord,
+    style: &Theme,
+) -> std::io::Result<()> {
+    let state = style.warning(bypass.state.label());
+    writeln!(
+        out,
+        "    {} {} — {} ({}); consec fail {}",
+        style.muted("Bypass:"),
+        state,
+        bypass.failure_class.label(),
+        bypass.reason_code.code(),
+        bypass.consecutive_failures,
+    )?;
+    if !bypass.last_diagnostic.is_empty() {
+        writeln!(out, "      {} {}", style.muted("↳"), bypass.last_diagnostic)?;
+    }
     Ok(())
 }
 
@@ -1141,6 +1169,7 @@ mod tests {
                     pressure_memory_pressure: None,
                     pressure_telemetry_age_secs: None,
                     pressure_telemetry_fresh: None,
+                    bypass: None,
                 },
                 WorkerStatusFromApi {
                     id: "worker-b".to_string(),
@@ -1166,6 +1195,7 @@ mod tests {
                     pressure_memory_pressure: None,
                     pressure_telemetry_age_secs: None,
                     pressure_telemetry_fresh: None,
+                    bypass: None,
                 },
             ],
             active_builds: vec![ActiveBuildFromApi {

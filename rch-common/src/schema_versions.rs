@@ -52,6 +52,8 @@ pub enum SchemaComponent {
     WorkerFacts,
     /// Durable proof-intent record schema (deferred proof queue).
     ProofIntent,
+    /// Worker temporary-bypass record schema (transient-quarantine lifecycle).
+    WorkerBypassRecord,
 }
 
 /// The canonical version string for a given component.
@@ -69,6 +71,7 @@ pub const fn current_version(component: SchemaComponent) -> &'static str {
         SchemaComponent::IncidentLedger => "1.0.0",
         SchemaComponent::WorkerFacts => "1.0.0",
         SchemaComponent::ProofIntent => "1.0.0",
+        SchemaComponent::WorkerBypassRecord => "1.0.0",
     }
 }
 
@@ -103,6 +106,10 @@ pub const ALL_COMPONENTS: &[(SchemaComponent, &str)] = &[
         SchemaComponent::ProofIntent,
         current_version(SchemaComponent::ProofIntent),
     ),
+    (
+        SchemaComponent::WorkerBypassRecord,
+        current_version(SchemaComponent::WorkerBypassRecord),
+    ),
 ];
 
 #[cfg(test)]
@@ -124,6 +131,7 @@ mod tests {
         (SchemaComponent::IncidentLedger, "1.0.0"),
         (SchemaComponent::WorkerFacts, "1.0.0"),
         (SchemaComponent::ProofIntent, "1.0.0"),
+        (SchemaComponent::WorkerBypassRecord, "1.0.0"),
     ];
 
     #[test]

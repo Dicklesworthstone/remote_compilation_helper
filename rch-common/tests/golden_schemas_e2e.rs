@@ -15,6 +15,7 @@
 //! constructors they pin. To update a golden after a reviewed, intentional
 //! change, edit the corresponding `json!` block and bump the schema version.
 
+use rch_common::bypass_record::{AutoRejoinCriteria, BypassFailureClass, BypassRecord};
 use rch_common::incident::{
     ControlState, IncidentEvent, IncidentEventType, IncidentReasonCode, IncidentSource,
     SelectedMode,
@@ -136,6 +137,149 @@ fn golden_incident_no_admissible_workers_failure() {
             "control": { "requested_worker": "css", "strict_remote_policy": true },
             "details": { "candidates": "3" },
         }),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Worker temporary-bypass record (success / degraded / failure)
+// ---------------------------------------------------------------------------
+
+/// A freshly-bypassed worker (transient SSH failure). The "success" case: the
+/// recovery path quarantined it cleanly with a stable reason code and a probe
+/// already scheduled.
+#[test]
+fn golden_bypass_fresh_ssh() {
+    let record = BypassRecord::new(
+        "css",
+        "203.0.113.20",
+        "ubuntu",
+        BypassFailureClass::Ssh,
+        FIXED_TS,
+    )
+    .with_diagnostic("ssh: connection timed out");
+    assert_golden(
+        "bypass_fresh_ssh",
+        &record,
+        json!({
+            "schema_version": "1.0.0",
+            "worker_id": "css",
+            "host": "203.0.113.20",
+            "user": "ubuntu",
+            "failure_class": "ssh",
+            "reason_code": "RCH-I004",
+            "state": "temporary_bypass",
+            "first_failure_unix_ms": 1_700_000_000_000_u64,
+            "last_failure_unix_ms": 1_700_000_000_000_u64,
+            "next_probe_unix_ms": 1_700_000_030_000_u64,
+            "backoff": { "current_ms": 30_000, "attempts": 0, "max_ms": 900_000 },
+            "consecutive_failures": 1,
+            "consecutive_passes": 0,
+            "last_diagnostic": "ssh: connection timed out",
+            "auto_rejoin": { "required_consecutive_passes": 2, "canary_required": true },
+            "local_fallback_allowed": true,
+        }),
+    );
+}
+
+/// A worker that passed recovery and is awaiting its canary build. The
+/// "degraded" middle state: out of normal scheduling but on its way back.
+#[test]
+fn golden_bypass_recovered_pending_canary() {
+    let mut record = BypassRecord::new(
+        "bil",
+        "203.0.113.21",
+        "ubuntu",
+        BypassFailureClass::CircuitBreaker,
+        FIXED_TS,
+    );
+    // Two passing probes meet the default criteria → pending canary.
+    assert!(!record.record_probe_pass(FIXED_TS + 30_000));
+    assert!(record.record_probe_pass(FIXED_TS + 60_000));
+    assert_golden(
+        "bypass_recovered_pending_canary",
+        &record,
+        json!({
+            "schema_version": "1.0.0",
+            "worker_id": "bil",
+            "host": "203.0.113.21",
+            "user": "ubuntu",
+            "failure_class": "circuit_breaker",
+            "reason_code": "RCH-I009",
+            "state": "recovered_pending_canary",
+            "first_failure_unix_ms": 1_700_000_000_000_u64,
+            "last_failure_unix_ms": 1_700_000_000_000_u64,
+            "next_probe_unix_ms": 1_700_000_090_000_u64,
+            "backoff": { "current_ms": 30_000, "attempts": 0, "max_ms": 900_000 },
+            "consecutive_failures": 0,
+            "consecutive_passes": 2,
+            "last_diagnostic": "",
+            "auto_rejoin": { "required_consecutive_passes": 2, "canary_required": true },
+            "local_fallback_allowed": true,
+        }),
+    );
+}
+
+/// A worker repeatedly failing on disk pressure with local fallback denied
+/// (strict-remote). The "failure" case: backoff has grown, details are carried,
+/// and the record reflects a worker that keeps failing its probes.
+#[test]
+fn golden_bypass_disk_pressure_repeated_failure() {
+    let mut record = BypassRecord::new(
+        "vmi",
+        "203.0.113.22",
+        "ubuntu",
+        BypassFailureClass::DiskInodePressure,
+        FIXED_TS,
+    )
+    .with_local_fallback_allowed(false)
+    .with_detail("free_gb", "0.4");
+    // One additional failed probe doubles the backoff (30s → 60s).
+    record.record_failure(FIXED_TS + 30_000, "no space left on device");
+    assert_golden(
+        "bypass_disk_pressure_repeated_failure",
+        &record,
+        json!({
+            "schema_version": "1.0.0",
+            "worker_id": "vmi",
+            "host": "203.0.113.22",
+            "user": "ubuntu",
+            "failure_class": "disk_inode_pressure",
+            "reason_code": "RCH-I016",
+            "state": "temporary_bypass",
+            "first_failure_unix_ms": 1_700_000_000_000_u64,
+            "last_failure_unix_ms": 1_700_000_030_000_u64,
+            "next_probe_unix_ms": 1_700_000_090_000_u64,
+            "backoff": { "current_ms": 60_000, "attempts": 1, "max_ms": 900_000 },
+            "consecutive_failures": 2,
+            "consecutive_passes": 0,
+            "last_diagnostic": "no space left on device",
+            "auto_rejoin": { "required_consecutive_passes": 2, "canary_required": true },
+            "local_fallback_allowed": false,
+            "details": { "free_gb": "0.4" },
+        }),
+    );
+}
+
+/// The auto-rejoin criteria default is part of the contract dashboards key off.
+#[test]
+fn golden_bypass_custom_auto_rejoin() {
+    let record = BypassRecord::new(
+        "css",
+        "h",
+        "u",
+        BypassFailureClass::StaleTelemetry,
+        FIXED_TS,
+    )
+    .with_auto_rejoin(AutoRejoinCriteria {
+        required_consecutive_passes: 3,
+        canary_required: false,
+    });
+    let value = serde_json::to_value(&record).unwrap();
+    assert_eq!(value["state"], "temporary_bypass");
+    assert_eq!(value["reason_code"], "RCH-I008");
+    assert_eq!(
+        value["auto_rejoin"],
+        json!({ "required_consecutive_passes": 3, "canary_required": false })
     );
 }
 

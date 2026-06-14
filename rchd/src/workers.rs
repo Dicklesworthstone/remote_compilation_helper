@@ -120,33 +120,10 @@ pub enum EligibilityState {
 }
 
 /// Concrete failure class that quarantined a worker into
-/// [`EligibilityState::TemporaryBypass`].
-///
-/// Mirrors the raw session-history failure classes enumerated in the program
-/// validation contract (`docs/guides/session-history-remediation-validation.md`)
-/// so incident/status output can attribute a bypass to a specific root cause.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BypassFailureClass {
-    /// SSH connection/auth failure to the worker.
-    Ssh,
-    /// `rch-wkr` missing, wrong path, or wrong user on the worker.
-    WorkerBinary,
-    /// Required runtime/toolchain/Rust target absent on the worker.
-    RuntimeToolchain,
-    /// Disk or inode pressure on the worker.
-    DiskInodePressure,
-    /// Worker telemetry is stale or its age is unknown.
-    StaleTelemetry,
-    /// Path/source sync (rsync) failure to the worker.
-    PathSync,
-    /// Artifact retrieval from the worker failed.
-    ArtifactRetrieval,
-    /// Worker's circuit breaker is open.
-    CircuitBreaker,
-    /// Worker OS/architecture does not match the build target.
-    OsArchMismatch,
-}
+/// [`EligibilityState::TemporaryBypass`]. Defined in `rch_common` so the shared
+/// bypass-record schema, incident ledger, and status surfaces speak one
+/// vocabulary; re-exported here as it is part of the worker lifecycle model.
+pub use rch_common::BypassFailureClass;
 
 /// An attempted lifecycle transition that the state machine rejects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

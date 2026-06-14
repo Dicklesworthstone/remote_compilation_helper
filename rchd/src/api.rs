@@ -18,10 +18,11 @@ use crate::workers::{
 use anyhow::{Result, anyhow};
 use chrono::{Duration as ChronoDuration, Utc};
 use rch_common::{
-    ApiError, BuildHeartbeatRequest, BuildRecord, BuildStats, CircuitBreakerConfig, CircuitState,
-    CommandPriority, ErrorCode, ReleaseRequest, RequiredRuntime,
-    SELECTION_RESPONSE_PROTOCOL_VERSION, SavedTimeStats, SelectedWorker, SelectionReason,
-    SelectionRequest, SelectionResponse, WorkerId, WorkerStatus,
+    ApiError, BuildHeartbeatRequest, BuildRecord, BuildStats, BypassRecord, BypassRecordStore,
+    CircuitBreakerConfig, CircuitState, CommandPriority, ErrorCode, ReleaseRequest,
+    RequiredRuntime, SELECTION_RESPONSE_PROTOCOL_VERSION, SavedTimeStats, SelectedWorker,
+    SelectionReason, SelectionRequest, SelectionResponse, WorkerId, WorkerStatus,
+    default_bypass_record_path,
 };
 use rch_telemetry::protocol::{TelemetrySource, TestRunRecord, TestRunStats, WorkerTelemetry};
 use rch_telemetry::speedscore::SpeedScore;
@@ -288,6 +289,12 @@ pub struct WorkerStatusInfo {
     pub pressure_telemetry_age_secs: Option<u64>,
     /// Whether the latest telemetry sample is fresh enough for high-confidence policy decisions.
     pub pressure_telemetry_fresh: bool,
+    /// Active temporary-bypass record for this worker, if it is currently
+    /// quarantined on the transient-eligibility axis. `None` for healthy or
+    /// admin-disabled workers. Surfaces the bypass reason, next probe, backoff,
+    /// and auto-rejoin criteria (bd-session-history-remediation-ocv9i.1.2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bypass: Option<BypassRecord>,
 }
 
 /// Active build information (placeholder).
@@ -2758,6 +2765,12 @@ fn active_build_issues_from_active_builds(
 async fn handle_status(ctx: &DaemonContext) -> Result<DaemonFullStatus> {
     let workers = ctx.pool.all_workers().await;
 
+    // Current temporary-bypass records, persisted across daemon restarts. The
+    // store file is the single source of truth; a missing/corrupt file yields an
+    // empty store, so status never fails because of bypass state
+    // (bd-session-history-remediation-ocv9i.1.2).
+    let bypass_store = BypassRecordStore::load(default_bypass_record_path());
+
     let mut workers_healthy = 0;
     let mut slots_total = 0u32;
     let mut slots_available = 0u32;
@@ -2839,6 +2852,7 @@ async fn handle_status(ctx: &DaemonContext) -> Result<DaemonFullStatus> {
             pressure_memory_pressure: pressure.memory_pressure,
             pressure_telemetry_age_secs: pressure.telemetry_age_secs,
             pressure_telemetry_fresh: pressure.telemetry_fresh,
+            bypass: bypass_store.get(&worker_id).cloned(),
         });
 
         // Generate issues based on worker state
@@ -4257,6 +4271,7 @@ mod tests {
             pressure_memory_pressure: Some(44.0),
             pressure_telemetry_age_secs: Some(7),
             pressure_telemetry_fresh: true,
+            bypass: None,
         };
         let json = serde_json::to_string(&info).unwrap();
         assert!(json.contains("\"id\":\"worker1\""));
