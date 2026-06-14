@@ -538,6 +538,90 @@ fn render_bypass_details_to<W: Write>(
     Ok(())
 }
 
+/// Render the fleet-wide status report: ready count, dominant problem class,
+/// per-state worker grouping, and absence alerts
+/// (bd-session-history-remediation-ocv9i.2.2).
+pub fn render_fleet_status(report: &rch_common::fleet_status::FleetStatusReport, style: &Theme) {
+    let mut out = Vec::new();
+    // Writing to a Vec<u8> is infallible; fall back to nothing on the impossible
+    // error so a render never panics.
+    if render_fleet_status_to(&mut out, report, style).is_ok() {
+        print!("{}", String::from_utf8_lossy(&out));
+    }
+}
+
+fn render_fleet_status_to<W: Write>(
+    out: &mut W,
+    report: &rch_common::fleet_status::FleetStatusReport,
+    style: &Theme,
+) -> std::io::Result<()> {
+    use std::collections::BTreeMap;
+
+    writeln!(out, "{}", style.format_header("Fleet Status"))?;
+    writeln!(out)?;
+
+    let total = report.diff.workers.len();
+    writeln!(
+        out,
+        "  {} {}/{}",
+        style.muted("Ready:"),
+        report.diff.ready_workers,
+        total
+    )?;
+    let problem = if report.problem_class.as_str() == "healthy" {
+        style.success(report.problem_class.label())
+    } else {
+        style.warning(report.problem_class.label())
+    };
+    writeln!(out, "  {} {}", style.muted("Problem:"), problem)?;
+    writeln!(
+        out,
+        "  {} {}",
+        style.muted("Summary:"),
+        report.problem_summary
+    )?;
+
+    if !report.diff.workers.is_empty() {
+        writeln!(out)?;
+        writeln!(out, "{}", style.format_header("Workers by state"))?;
+        // Group worker ids by diff state (BTreeMap keeps output deterministic).
+        let mut groups: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        for row in &report.diff.workers {
+            groups
+                .entry(row.state.as_str())
+                .or_default()
+                .push(row.worker_id.as_str());
+        }
+        for (state, ids) in &groups {
+            writeln!(
+                out,
+                "  {} ({}): {}",
+                style.highlight(state),
+                ids.len(),
+                style.muted(&ids.join(", "))
+            )?;
+        }
+    }
+
+    if report.has_absence_warnings() {
+        writeln!(out)?;
+        writeln!(out, "{}", style.format_header("Absence alerts"))?;
+        for alert in &report.absence_alerts {
+            writeln!(
+                out,
+                "  {} {} absent {}s as {} (> {}s window)",
+                style.warning("⚠"),
+                style.highlight(&alert.worker_id),
+                alert.absent_secs,
+                alert.state.as_str(),
+                alert.threshold_secs,
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
 /// Render pressure details for a worker under storage pressure.
 fn render_pressure_details_to<W: Write>(
     out: &mut W,

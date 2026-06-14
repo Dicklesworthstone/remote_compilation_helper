@@ -288,6 +288,11 @@ Use 'disable' to mark a worker as unavailable (optionally with --reason)."#)]
         /// Show active jobs
         #[arg(short = 'J', long)]
         jobs: bool,
+
+        /// Show the fleet-wide desired/live worker grouping, dominant problem
+        /// class, and absence alerts (workers absent from eligibility too long)
+        #[arg(long)]
+        fleet: bool,
     },
 
     /// Quick health check - is RCH working?
@@ -1848,7 +1853,11 @@ async fn run(args: Vec<OsString>) -> Result<()> {
             Commands::Init { yes, skip_test } => commands::init_wizard(yes, skip_test, &ctx).await,
             Commands::Daemon { action } => handle_daemon(action, &ctx).await,
             Commands::Workers { action } => handle_workers(action, &ctx).await,
-            Commands::Status { workers, jobs } => handle_status(workers, jobs, &ctx).await,
+            Commands::Status {
+                workers,
+                jobs,
+                fleet,
+            } => handle_status(workers, jobs, fleet, &ctx).await,
             Commands::Check => commands::check(&ctx).await,
             Commands::Queue { watch, follow } => commands::queue_status(watch, follow, &ctx).await,
             Commands::Cancel {
@@ -3007,8 +3016,8 @@ async fn handle_workers(action: WorkersAction, ctx: &OutputContext) -> Result<()
     Ok(())
 }
 
-async fn handle_status(workers: bool, jobs: bool, ctx: &OutputContext) -> Result<()> {
-    commands::status_overview(workers, jobs, ctx).await?;
+async fn handle_status(workers: bool, jobs: bool, fleet: bool, ctx: &OutputContext) -> Result<()> {
+    commands::status_overview(workers, jobs, fleet, ctx).await?;
     Ok(())
 }
 
@@ -4750,7 +4759,7 @@ mod tests {
         let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "status"]).unwrap();
         match cli.command {
-            Some(Commands::Status { workers, jobs }) => {
+            Some(Commands::Status { workers, jobs, .. }) => {
                 assert!(!workers);
                 assert!(!jobs);
             }
@@ -4763,7 +4772,7 @@ mod tests {
         let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "status", "--workers"]).unwrap();
         match cli.command {
-            Some(Commands::Status { workers, jobs }) => {
+            Some(Commands::Status { workers, jobs, .. }) => {
                 assert!(workers);
                 assert!(!jobs);
             }
@@ -4776,7 +4785,7 @@ mod tests {
         let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "status", "--jobs"]).unwrap();
         match cli.command {
-            Some(Commands::Status { workers, jobs }) => {
+            Some(Commands::Status { workers, jobs, .. }) => {
                 assert!(!workers);
                 assert!(jobs);
             }
@@ -4789,9 +4798,27 @@ mod tests {
         let _guard = test_guard!();
         let cli = Cli::try_parse_from(["rch", "status", "--workers", "--jobs"]).unwrap();
         match cli.command {
-            Some(Commands::Status { workers, jobs }) => {
+            Some(Commands::Status { workers, jobs, .. }) => {
                 assert!(workers);
                 assert!(jobs);
+            }
+            _ => fail_expected("Expected status command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_status_with_fleet() {
+        let _guard = test_guard!();
+        let cli = Cli::try_parse_from(["rch", "status", "--fleet"]).unwrap();
+        match cli.command {
+            Some(Commands::Status {
+                workers,
+                jobs,
+                fleet,
+            }) => {
+                assert!(!workers);
+                assert!(!jobs);
+                assert!(fleet);
             }
             _ => fail_expected("Expected status command"),
         }

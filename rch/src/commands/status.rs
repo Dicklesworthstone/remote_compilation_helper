@@ -1262,7 +1262,12 @@ fn render_self_test_result_verbose_lines(
 // Status Overview Command
 // =============================================================================
 
-pub async fn status_overview(workers: bool, jobs: bool, ctx: &OutputContext) -> Result<()> {
+pub async fn status_overview(
+    workers: bool,
+    jobs: bool,
+    fleet: bool,
+    ctx: &OutputContext,
+) -> Result<()> {
     use crate::status_types::{
         CliStatusResponse, RemediationHint, RepoConvergenceStatusFromApi, STATUS_SCHEMA_VERSION,
         SystemPosture, generate_convergence_remediations, generate_worker_remediations,
@@ -1274,6 +1279,19 @@ pub async fn status_overview(workers: bool, jobs: bool, ctx: &OutputContext) -> 
         .ok_or_else(|| anyhow::anyhow!("Invalid response format from daemon"))?;
     let status: DaemonFullStatusResponse =
         serde_json::from_str(json).context("Failed to parse daemon status response")?;
+
+    // `--fleet`: a focused desired/live grouping + dominant-problem summary +
+    // absence alerts (bd-session-history-remediation-ocv9i.2.2). Short-circuits
+    // the normal status render with its own JSON/human output.
+    if fleet {
+        let report = build_fleet_status_report(&status);
+        if ctx.is_json() {
+            let _ = ctx.json(&ApiResponse::ok("status-fleet", &report));
+        } else {
+            crate::status_display::render_fleet_status(&report, ctx.style());
+        }
+        return Ok(());
+    }
 
     // Query convergence status (best-effort; don't fail if endpoint unreachable).
     let convergence = match send_daemon_command("GET /repo-convergence/status\n").await {
@@ -1361,6 +1379,97 @@ pub async fn status_overview(workers: bool, jobs: bool, ctx: &OutputContext) -> 
     }
 
     Ok(())
+}
+
+/// Map daemon status + desired config + the bypass store into the fleet-wide
+/// status report (bd-session-history-remediation-ocv9i.2.2). Each worker becomes
+/// a [`rch_common::fleet_status::FleetWorkerSignal`]; absence durations come from
+/// the age of a worker's active offline alert.
+fn build_fleet_status_report(
+    status: &DaemonFullStatusResponse,
+) -> rch_common::fleet_status::FleetStatusReport {
+    use chrono::{DateTime, Utc};
+    use rch_common::fleet_diff::WorkerObservation;
+    use rch_common::fleet_status::{
+        DEFAULT_ABSENCE_THRESHOLD_SECS, FleetWorkerSignal, compute_fleet_status,
+    };
+    use std::collections::BTreeSet;
+
+    let desired = super::helpers::load_workers_from_config().unwrap_or_default();
+    let desired_ids: BTreeSet<String> = desired.iter().map(|w| w.id.to_string()).collect();
+    let live_ids: BTreeSet<String> = status.workers.iter().map(|w| w.id.clone()).collect();
+    let now = Utc::now();
+
+    // A worker's absence duration is the age of its longest-standing active
+    // offline alert, if any.
+    let absent_secs_for = |id: &str| -> Option<u64> {
+        status
+            .alerts
+            .iter()
+            .filter(|a| a.worker_id.as_deref() == Some(id) && a.kind.contains("offline"))
+            .filter_map(|a| DateTime::parse_from_rfc3339(&a.first_seen).ok())
+            .map(|fs| {
+                u64::try_from((now - fs.with_timezone(&Utc)).num_seconds().max(0)).unwrap_or(0)
+            })
+            .max()
+    };
+
+    let mut signals: Vec<FleetWorkerSignal> =
+        Vec::with_capacity(desired.len() + status.workers.len());
+
+    for w in &status.workers {
+        let reachable = w.status != "unreachable";
+        let admin_disabled = w.status == "disabled";
+        let temporarily_bypassed = w.bypass.is_some();
+        let observation = WorkerObservation {
+            worker_id: w.id.clone(),
+            configured: desired_ids.contains(&w.id),
+            in_daemon_pool: true,
+            reachable,
+            admin_disabled,
+            temporarily_bypassed,
+            facts_known: w.pressure_state.as_deref() != Some("telemetry_gap"),
+            // The bare fleet view is not tied to a specific command.
+            command_admissible: true,
+        };
+        let disk_pressure = matches!(
+            w.pressure_state.as_deref(),
+            Some("critical") | Some("warning")
+        );
+        let slots_saturated = w.total_slots > 0 && w.used_slots >= w.total_slots;
+        signals.push(FleetWorkerSignal {
+            observation,
+            disk_pressure,
+            slots_saturated,
+            absent_secs: absent_secs_for(&w.id),
+        });
+    }
+
+    // Desired workers entirely missing from the live pool.
+    for cfg in &desired {
+        let id = cfg.id.to_string();
+        if live_ids.contains(&id) {
+            continue;
+        }
+        let observation = WorkerObservation {
+            worker_id: id.clone(),
+            configured: true,
+            in_daemon_pool: false,
+            reachable: false,
+            admin_disabled: false,
+            temporarily_bypassed: false,
+            facts_known: true,
+            command_admissible: true,
+        };
+        signals.push(FleetWorkerSignal {
+            observation,
+            disk_pressure: false,
+            slots_saturated: false,
+            absent_secs: absent_secs_for(&id),
+        });
+    }
+
+    compute_fleet_status(&signals, DEFAULT_ABSENCE_THRESHOLD_SECS)
 }
 
 fn status_overview_section_flags(workers: bool, jobs: bool, ctx: &OutputContext) -> (bool, bool) {
