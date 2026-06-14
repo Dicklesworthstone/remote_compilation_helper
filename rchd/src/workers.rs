@@ -334,6 +334,37 @@ impl WorkerLifecycle {
     }
 }
 
+/// Map a legacy health [`WorkerStatus`] to the eligibility axis for
+/// [`WorkerLifecycle::observe_health`]. Administrative statuses
+/// (`Draining`/`Drained`/`Disabled`) are not health observations and return
+/// `None`, so the caller leaves the lifecycle untouched.
+fn health_status_to_eligibility(status: WorkerStatus) -> Option<EligibilityState> {
+    match status {
+        WorkerStatus::Healthy => Some(EligibilityState::Healthy),
+        WorkerStatus::Degraded => Some(EligibilityState::Degraded),
+        WorkerStatus::Unreachable => Some(EligibilityState::Unreachable),
+        WorkerStatus::Draining | WorkerStatus::Drained | WorkerStatus::Disabled => None,
+    }
+}
+
+/// Whether a worker may accept a *new* slot reservation given its lifecycle.
+///
+/// Mirrors the pre-lifecycle `reserve_slots` admin guard (refuse
+/// `Draining`/`Drained`/`Disabled`) and additionally refuses the transient
+/// quarantine states so a bypassed or canary-pending worker can never have a
+/// normal build land on it between selection and reservation. An `Unreachable`
+/// but `Active` worker is intentionally still allowed here (unchanged from the
+/// legacy guard); the selector already filters it out up front.
+fn lifecycle_accepts_new_builds(lifecycle: WorkerLifecycle) -> bool {
+    !matches!(
+        lifecycle.admin,
+        AdminIntent::Draining | AdminIntent::Drained | AdminIntent::Disabled
+    ) && !matches!(
+        lifecycle.eligibility,
+        EligibilityState::TemporaryBypass | EligibilityState::RecoveredPendingCanary
+    )
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 enum DrainCompletionAction {
     #[default]
@@ -349,8 +380,17 @@ enum DrainCompletionAction {
 pub struct WorkerState {
     /// Worker configuration.
     pub config: RwLock<WorkerConfig>,
-    /// Current status (uses RwLock for interior mutability).
-    status: RwLock<WorkerStatus>,
+    /// Authoritative worker lifecycle — the two-axis (admin intent + live
+    /// eligibility) model from [`WorkerLifecycle`].
+    ///
+    /// **Single source of truth.** The legacy single-axis [`WorkerStatus`] is
+    /// *derived* from this via [`WorkerLifecycle::legacy_status`] (see
+    /// [`Self::status`]); there is no separate status field that could disagree.
+    /// Both transient quarantine states (`TemporaryBypass` /
+    /// `RecoveredPendingCanary`) collapse to `Unreachable` for every legacy
+    /// consumer, so a bypassed or canary-pending worker stays out of the
+    /// scheduler automatically with no extra bookkeeping.
+    lifecycle: RwLock<WorkerLifecycle>,
     /// Number of slots currently in use.
     used_slots: Arc<AtomicU32>,
     /// Speed score from benchmarking (0-100).
@@ -413,7 +453,7 @@ impl WorkerState {
     pub fn new(config: WorkerConfig) -> Self {
         Self {
             config: RwLock::new(config),
-            status: RwLock::new(WorkerStatus::Healthy),
+            lifecycle: RwLock::new(WorkerLifecycle::new()),
             used_slots: Arc::new(AtomicU32::new(0)),
             speed_score: AtomicU64::new(50.0_f64.to_bits()), // Default mid-range score
             last_latency_ms: AtomicU64::new(0),
@@ -446,36 +486,92 @@ impl WorkerState {
         };
 
         if cancelled_pending_removal {
-            let mut status = self.status.write().await;
-            if matches!(*status, WorkerStatus::Draining | WorkerStatus::Drained) {
-                *status = WorkerStatus::Healthy;
+            let mut lifecycle = self.lifecycle.write().await;
+            if matches!(
+                lifecycle.admin,
+                AdminIntent::Draining | AdminIntent::Drained
+            ) {
+                lifecycle.set_admin(AdminIntent::Active);
             }
         }
     }
 
-    /// Get current worker status.
-    pub async fn status(&self) -> WorkerStatus {
-        *self.status.read().await
-    }
-
-    /// Set worker status.
-    pub async fn set_status(&self, status: WorkerStatus) {
-        *self.status.write().await = status;
-    }
-
-    /// Apply a health-derived status without overriding administrative lifecycle states.
+    /// Get the current worker status as the legacy single-axis [`WorkerStatus`].
     ///
-    /// Health probes may mark a worker healthy/unreachable, but they must not revive
-    /// workers that are intentionally `Draining`, `Drained`, or `Disabled`.
+    /// This is a *derived* view of the authoritative [`WorkerLifecycle`]: both
+    /// quarantine states (`TemporaryBypass` / `RecoveredPendingCanary`) collapse
+    /// to [`WorkerStatus::Unreachable`], so a bypassed worker is excluded from
+    /// the legacy scheduler with no separate bookkeeping.
+    pub async fn status(&self) -> WorkerStatus {
+        self.lifecycle.read().await.legacy_status()
+    }
+
+    /// Get a copy of the authoritative two-axis [`WorkerLifecycle`].
+    pub async fn lifecycle(&self) -> WorkerLifecycle {
+        *self.lifecycle.read().await
+    }
+
+    /// Get the live scheduler-eligibility axis.
+    pub async fn eligibility(&self) -> EligibilityState {
+        self.lifecycle.read().await.eligibility
+    }
+
+    /// Set worker status from the legacy single-axis [`WorkerStatus`].
+    ///
+    /// Bridges through [`WorkerLifecycle::from_worker_status`]. This is a legacy
+    /// setter for status-API and test call sites; the lifecycle-aware paths
+    /// ([`Self::enter_bypass`], [`Self::recover_to_canary`],
+    /// [`Self::promote_from_canary`], [`Self::apply_health_status`]) move the
+    /// two axes independently and must be used for quarantine/recovery.
+    pub async fn set_status(&self, status: WorkerStatus) {
+        *self.lifecycle.write().await = WorkerLifecycle::from_worker_status(status);
+    }
+
+    /// Apply a health-derived status without overriding administrative lifecycle
+    /// states *or* an active quarantine.
+    ///
+    /// Health probes may mark a worker healthy/degraded/unreachable, but they
+    /// must not revive workers that are intentionally `Draining`, `Drained`, or
+    /// `Disabled` (admin axis), and — critically for auto-rejoin safety — they
+    /// must NOT clear a `TemporaryBypass` / `RecoveredPendingCanary` quarantine.
+    /// Only the recovery probe/canary loop may do that. The observation routes
+    /// through [`WorkerLifecycle::observe_health`], which refuses to overwrite a
+    /// quarantine, so a single lucky health check can never auto-rejoin a
+    /// bypassed worker. Returns the resulting legacy [`WorkerStatus`].
     pub async fn apply_health_status(&self, health_status: WorkerStatus) -> WorkerStatus {
-        let mut status = self.status.write().await;
-        match *status {
-            WorkerStatus::Draining | WorkerStatus::Drained | WorkerStatus::Disabled => *status,
-            _ => {
-                *status = health_status;
-                health_status
-            }
+        let mut lifecycle = self.lifecycle.write().await;
+        if let Some(eligibility) = health_status_to_eligibility(health_status) {
+            lifecycle.observe_health(eligibility);
         }
+        lifecycle.legacy_status()
+    }
+
+    /// Quarantine this worker into [`EligibilityState::TemporaryBypass`] because
+    /// a probe hit a concrete failure `class`. Never touches the admin axis
+    /// (transient failure ≠ desired inventory). The worker immediately drops out
+    /// of scheduling — its [`Self::status`] reads `Unreachable` — and stays out
+    /// until the recovery probe/canary loop clears it.
+    pub async fn enter_bypass(&self, class: BypassFailureClass) {
+        self.lifecycle.write().await.enter_bypass(class);
+    }
+
+    /// Advance a bypassed worker to [`EligibilityState::RecoveredPendingCanary`]
+    /// after a fully-healthy recovery-probe streak. Legal only from
+    /// `TemporaryBypass`.
+    pub async fn recover_to_canary(&self) -> Result<(), IllegalLifecycleTransition> {
+        self.lifecycle.write().await.recover_to_canary()
+    }
+
+    /// Fully rejoin a worker after a passing canary build. Legal only from
+    /// `RecoveredPendingCanary`; never changes admin intent (an
+    /// operator-disabled worker stays disabled even after a clean canary).
+    pub async fn promote_from_canary(&self) -> Result<(), IllegalLifecycleTransition> {
+        self.lifecycle.write().await.promote_from_canary()
+    }
+
+    /// Whether this worker is cleared for exactly one canary build.
+    pub async fn is_canary_pending(&self) -> bool {
+        self.lifecycle.read().await.is_canary_pending()
     }
 
     /// Get the number of available slots.
@@ -503,14 +599,13 @@ impl WorkerState {
 
         let mut current = self.used_slots.load(Ordering::Relaxed);
         loop {
-            // Re-read status on each iteration so a concurrent `drain()` /
-            // `disable()` becomes authoritative as soon as it's written,
-            // not only on the next selection round.
-            match *self.status.read().await {
-                WorkerStatus::Draining | WorkerStatus::Drained | WorkerStatus::Disabled => {
-                    return false;
-                }
-                _ => {}
+            // Re-read the lifecycle on each iteration so a concurrent `drain()`
+            // / `disable()` (admin axis) or a freshly-entered `TemporaryBypass`
+            // / `RecoveredPendingCanary` quarantine (eligibility axis) becomes
+            // authoritative as soon as it's written, not only on the next
+            // selection round.
+            if !lifecycle_accepts_new_builds(*self.lifecycle.read().await) {
+                return false;
             }
             // Re-read total_slots on each iteration to handle concurrent config changes.
             // This is safe because CAS loops typically succeed in 1-2 iterations.
@@ -525,19 +620,17 @@ impl WorkerState {
                 Ordering::Relaxed,
             ) {
                 Ok(_) => {
-                    // TOCTOU defense: re-check status after successful slot reservation.
-                    // If a concurrent drain() occurred between our initial read and the CAS,
-                    // we must rollback the reservation.
-                    let status_after_reservation = *self.status.read().await;
-                    match status_after_reservation {
-                        WorkerStatus::Draining | WorkerStatus::Drained | WorkerStatus::Disabled => {
-                            // Roll back the reservation; release_slots also handles transitioning
-                            // Draining -> Drained if this was the last slot.
-                            self.release_slots(count).await;
-                            return false;
-                        }
-                        _ => return true,
+                    // TOCTOU defense: re-check the lifecycle after a successful
+                    // slot reservation. If a concurrent drain()/disable() or a
+                    // bypass quarantine landed between our initial read and the
+                    // CAS, roll the reservation back.
+                    if lifecycle_accepts_new_builds(*self.lifecycle.read().await) {
+                        return true;
                     }
+                    // Roll back the reservation; release_slots also handles
+                    // transitioning Draining -> Drained if this was the last slot.
+                    self.release_slots(count).await;
+                    return false;
                 }
                 Err(actual) => current = actual,
             }
@@ -783,7 +876,10 @@ impl WorkerState {
     /// Sets status to Disabled and records the timestamp and reason.
     pub async fn disable(&self, reason: Option<String>) {
         *self.drain_completion.write().await = DrainCompletionAction::StayDrained;
-        *self.status.write().await = WorkerStatus::Disabled;
+        self.lifecycle
+            .write()
+            .await
+            .set_admin(AdminIntent::Disabled);
         *self.disabled_reason.write().await = reason;
         self.disabled_at
             .store(current_unix_secs_for_disabled_at(), Ordering::Relaxed);
@@ -792,21 +888,30 @@ impl WorkerState {
     /// Start draining the worker (no new jobs, but finish existing).
     pub async fn drain(&self) {
         *self.drain_completion.write().await = DrainCompletionAction::StayDrained;
-        *self.status.write().await = WorkerStatus::Draining;
+        self.lifecycle
+            .write()
+            .await
+            .set_admin(AdminIntent::Draining);
         self.check_drain_complete().await;
     }
 
     /// Start draining a worker that should be removed once active jobs finish.
     pub async fn drain_for_removal(&self) {
         *self.drain_completion.write().await = DrainCompletionAction::RemoveFromPool;
-        *self.status.write().await = WorkerStatus::Draining;
+        self.lifecycle
+            .write()
+            .await
+            .set_admin(AdminIntent::Draining);
         self.check_drain_complete().await;
     }
 
     /// Start draining a worker that should become disabled once active jobs finish.
     pub async fn drain_then_disable(&self, reason: Option<String>) {
         *self.drain_completion.write().await = DrainCompletionAction::Disable { reason };
-        *self.status.write().await = WorkerStatus::Draining;
+        self.lifecycle
+            .write()
+            .await
+            .set_admin(AdminIntent::Draining);
         self.check_drain_complete().await;
     }
 
@@ -814,24 +919,26 @@ impl WorkerState {
     /// Clears disabled reason and timestamp, sets status to Healthy.
     pub async fn enable(&self) {
         *self.drain_completion.write().await = DrainCompletionAction::StayDrained;
-        *self.status.write().await = WorkerStatus::Healthy;
+        // Operator re-enable is an authoritative override: restore both axes to
+        // fully in-service (Active + Healthy) and clear any bypass cause.
+        *self.lifecycle.write().await = WorkerLifecycle::new();
         *self.disabled_reason.write().await = None;
         self.disabled_at.store(0, Ordering::Relaxed);
     }
 
-    /// Check if worker is disabled.
+    /// Check if worker is disabled (operator admin intent).
     pub async fn is_disabled(&self) -> bool {
-        *self.status.read().await == WorkerStatus::Disabled
+        self.lifecycle.read().await.admin == AdminIntent::Disabled
     }
 
-    /// Check if worker is draining.
+    /// Check if worker is draining (operator admin intent).
     pub async fn is_draining(&self) -> bool {
-        *self.status.read().await == WorkerStatus::Draining
+        self.lifecycle.read().await.admin == AdminIntent::Draining
     }
 
     /// Check if worker is drained (drain complete, no active jobs).
     pub async fn is_drained(&self) -> bool {
-        *self.status.read().await == WorkerStatus::Drained
+        self.lifecycle.read().await.admin == AdminIntent::Drained
     }
 
     /// Check if draining worker has completed all jobs and apply the recorded completion action.
@@ -840,27 +947,28 @@ impl WorkerState {
     /// drain-before-disable transitions to `Disabled` while preserving the disable reason.
     pub async fn check_drain_complete(&self) {
         let used = self.used_slots.load(Ordering::Acquire);
-        if used != 0 || *self.status.read().await != WorkerStatus::Draining {
+        if used != 0 || self.lifecycle.read().await.admin != AdminIntent::Draining {
             return;
         }
 
         let completion = self.drain_completion.read().await.clone();
-        let mut status = self.status.write().await;
-        if *status != WorkerStatus::Draining || self.used_slots.load(Ordering::Acquire) != 0 {
+        let mut lifecycle = self.lifecycle.write().await;
+        if lifecycle.admin != AdminIntent::Draining || self.used_slots.load(Ordering::Acquire) != 0
+        {
             return;
         }
 
         let disable_reason = match completion {
             DrainCompletionAction::StayDrained | DrainCompletionAction::RemoveFromPool => {
-                *status = WorkerStatus::Drained;
+                lifecycle.set_admin(AdminIntent::Drained);
                 None
             }
             DrainCompletionAction::Disable { reason } => {
-                *status = WorkerStatus::Disabled;
+                lifecycle.set_admin(AdminIntent::Disabled);
                 Some(reason)
             }
         };
-        drop(status);
+        drop(lifecycle);
 
         if let Some(reason) = disable_reason {
             *self.disabled_reason.write().await = reason;
@@ -2272,6 +2380,131 @@ mod tests {
             WorkerStatus::Disabled
         );
         assert_eq!(state.status().await, WorkerStatus::Disabled);
+    }
+
+    #[tokio::test]
+    async fn test_enter_bypass_excludes_from_scheduling() {
+        // A worker quarantined into TemporaryBypass must look `Unreachable` to
+        // every legacy consumer, report not-schedulable, and refuse new slot
+        // reservations — all derived from the single lifecycle source of truth.
+        let state = WorkerState::new(test_config("bypassed"));
+        assert!(state.reserve_slots(1).await);
+        state.release_slots(1).await;
+
+        state.enter_bypass(BypassFailureClass::Ssh).await;
+
+        assert_eq!(state.eligibility().await, EligibilityState::TemporaryBypass);
+        assert_eq!(state.status().await, WorkerStatus::Unreachable);
+        assert!(!state.lifecycle().await.is_schedulable());
+        assert_eq!(
+            state.lifecycle().await.bypass_cause,
+            Some(BypassFailureClass::Ssh)
+        );
+        assert!(
+            !state.reserve_slots(1).await,
+            "a bypassed worker must refuse new reservations"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_health_probe_never_clears_bypass() {
+        // The cardinal safety invariant: lucky health observations routed
+        // through the health monitor must NOT auto-rejoin a bypassed worker.
+        // Only the recovery probe/canary loop may clear a quarantine.
+        let state = WorkerState::new(test_config("flapper"));
+        state
+            .enter_bypass(BypassFailureClass::DiskInodePressure)
+            .await;
+
+        for _ in 0..5 {
+            let effective = state.apply_health_status(WorkerStatus::Healthy).await;
+            assert_eq!(effective, WorkerStatus::Unreachable);
+            assert_eq!(state.eligibility().await, EligibilityState::TemporaryBypass);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_recover_to_canary_then_promote() {
+        // The full recovery path: bypass -> canary-pending -> healthy. The
+        // canary-pending worker is still excluded from *normal* scheduling
+        // (status reads Unreachable, reservations refused) while
+        // is_canary_pending gates the single allowed canary build.
+        let state = WorkerState::new(test_config("recoverer"));
+        state.enter_bypass(BypassFailureClass::CircuitBreaker).await;
+
+        state
+            .recover_to_canary()
+            .await
+            .expect("bypass -> canary is legal");
+        assert!(state.is_canary_pending().await);
+        assert_eq!(
+            state.eligibility().await,
+            EligibilityState::RecoveredPendingCanary
+        );
+        assert_eq!(state.status().await, WorkerStatus::Unreachable);
+        assert!(
+            !state.reserve_slots(1).await,
+            "canary-pending worker must not take normal builds"
+        );
+
+        state
+            .promote_from_canary()
+            .await
+            .expect("canary-pending -> healthy is legal");
+        assert_eq!(state.status().await, WorkerStatus::Healthy);
+        assert!(state.lifecycle().await.is_schedulable());
+        assert!(!state.is_canary_pending().await);
+        assert!(state.reserve_slots(1).await, "rejoined worker accepts work");
+    }
+
+    #[tokio::test]
+    async fn test_recover_to_canary_illegal_from_healthy() {
+        // recover_to_canary is only legal from TemporaryBypass; a healthy worker
+        // can never shortcut into the canary gate.
+        let state = WorkerState::new(test_config("healthy"));
+        let err = state.recover_to_canary().await.unwrap_err();
+        assert_eq!(err.from, EligibilityState::Healthy);
+        assert_eq!(err.to, EligibilityState::RecoveredPendingCanary);
+    }
+
+    #[tokio::test]
+    async fn test_enable_clears_bypass() {
+        // Operator re-enable is an authoritative override that clears a
+        // quarantine (both axes back to Active + Healthy).
+        let state = WorkerState::new(test_config("reenabled"));
+        state
+            .enter_bypass(BypassFailureClass::RuntimeToolchain)
+            .await;
+        assert_eq!(state.status().await, WorkerStatus::Unreachable);
+
+        state.enable().await;
+        assert_eq!(state.status().await, WorkerStatus::Healthy);
+        assert!(state.lifecycle().await.is_schedulable());
+        assert_eq!(state.lifecycle().await.bypass_cause, None);
+    }
+
+    #[tokio::test]
+    async fn test_pool_healthy_workers_excludes_bypassed() {
+        // The pool's healthy_workers() filter (the selector's candidate source)
+        // must drop TemporaryBypass and RecoveredPendingCanary workers just like
+        // an Unreachable one.
+        let pool = WorkerPool::new();
+        pool.add_worker(test_config("healthy")).await;
+        pool.add_worker(test_config("bypassed")).await;
+        pool.add_worker(test_config("canary")).await;
+
+        pool.get(&WorkerId::new("bypassed"))
+            .await
+            .unwrap()
+            .enter_bypass(BypassFailureClass::Ssh)
+            .await;
+        let canary = pool.get(&WorkerId::new("canary")).await.unwrap();
+        canary.enter_bypass(BypassFailureClass::Ssh).await;
+        canary.recover_to_canary().await.unwrap();
+
+        let healthy = pool.healthy_workers().await;
+        assert_eq!(healthy.len(), 1);
+        assert_eq!(healthy[0].config.read().await.id, WorkerId::new("healthy"));
     }
 
     #[tokio::test]
