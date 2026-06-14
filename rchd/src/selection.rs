@@ -1415,23 +1415,27 @@ impl WorkerSelector {
                     // decision must come from the gate verdict too. Otherwise a
                     // gate-REJECTED worker is reported here as Allow — misleading
                     // exactly the "why was nothing selected" output operators rely
-                    // on (bd-review-selection-diag-gate). `None` means admitted (or
-                    // no critical pressure), letting the chain fall through to the
-                    // reliability/health checks just like the real selection path.
+                    // on (bd-review-selection-diag-gate). `None` means admitted, not
+                    // evaluated this round, or no critical pressure — letting the
+                    // chain fall through to the reliability/health checks.
+                    //
+                    // Use the CACHED verdict (recorded by get_eligible_workers
+                    // during this selection round), never `evaluate()`: evaluate()
+                    // mutates gate state (record_rejection/cache_verdict, hysteresis
+                    // recovery), and diagnostics must be read-only — exactly the
+                    // reason the reliability check above reuses `get_assessment`
+                    // rather than re-evaluating.
                     let admission_decision: Option<(
                         WorkerSelectionDiagnosticDecision,
                         String,
                         &'static str,
                     )> = if let Some(ref gate) = self.admission_gate {
                         use crate::admission::AdmissionVerdict;
-                        match gate
-                            .evaluate(worker.as_ref(), worker_id.as_str(), &request.project)
-                            .await
-                        {
-                            AdmissionVerdict::Reject {
+                        match gate.cached_verdict(worker_id.as_str()).await {
+                            Some(AdmissionVerdict::Reject {
                                 reason_code,
                                 reason,
-                            } => {
+                            }) => {
                                 if reason_code == "admission_critical_pressure" {
                                     // Hard exclusion (not even fail-open fallback).
                                     Some((
@@ -1450,7 +1454,9 @@ impl WorkerSelector {
                                     ))
                                 }
                             }
-                            AdmissionVerdict::Admit { .. } => None,
+                            // Admitted, or not evaluated this round (e.g. excluded
+                            // by an earlier hard gate): no admission-based denial.
+                            Some(AdmissionVerdict::Admit { .. }) | None => None,
                         }
                     } else if pressure.state == PressureState::Critical {
                         Some((
