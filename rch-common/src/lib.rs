@@ -17,6 +17,7 @@ pub mod artifact_pattern;
 pub mod artifact_verify;
 pub mod binary_hash;
 pub mod bypass_record;
+pub mod bypass_recovery;
 pub mod capability_probe;
 pub mod cargo_path_deps;
 pub mod classifier_drift;
@@ -149,6 +150,9 @@ pub use bypass_record::{
     BypassState, DisabledMigration, DisabledWorkerSnapshot, MAX_DIAGNOSTIC_CHARS,
     bypass_record_schema, bypass_record_schema_version, classify_disable_reason,
     default_bypass_record_path, migrate_disabled_worker, truncate_diagnostic,
+};
+pub use bypass_recovery::{
+    CanaryDecision, CanaryOutcome, ProbeDecision, RecoveryProbe, decide_canary, decide_probe,
 };
 pub use cargo_path_deps::{
     CargoPathDependencyEdge, CargoPathDependencyError, CargoPathDependencyErrorKind,
