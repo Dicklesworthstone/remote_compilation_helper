@@ -2,12 +2,22 @@
 
 use anyhow::Result;
 use rch_common::types::RequiredRuntime;
+use std::io::Write as _;
 use std::path::Path;
 use std::process::Stdio;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tracing::{debug, error, info};
+
+/// Best-effort write of a worker-side message to the real stderr (the SSH
+/// channel relayed to the client). Unlike `eprintln!`, this never panics if the
+/// channel is broken — important on the output-truncation path, which is reached
+/// precisely when the client's stream has already failed (and release builds use
+/// `panic = "abort"`, so a panic here would abort the process).
+fn eprintln_best_effort(msg: &str) {
+    let _ = writeln!(std::io::stderr(), "{msg}");
+}
 
 /// Error returned when a command exits with a non-zero status.
 #[derive(Debug, Error)]
@@ -415,10 +425,10 @@ pub async fn execute(workdir: &str, command: &str) -> Result<()> {
                     // client) with a distinct exit code, so the client reports a
                     // dependency-install failure rather than a misleading
                     // user-command exit 1 — the user command never ran.
-                    eprintln!(
+                    eprintln_best_effort(&format!(
                         "rch-wkr: remote dependency install ({runtime:?}) did not finish cleanly ({:?}); the command was not run{log_hint}",
                         report.action
-                    );
+                    ));
                     return Err(CommandFailed {
                         exit_code: EXIT_PREPARE_FAILED,
                     }
@@ -526,8 +536,8 @@ pub async fn execute(workdir: &str, command: &str) -> Result<()> {
             error!(
                 "Command exited 0 but output relay was truncated (stdout_ok={stdout_relayed}, stderr_ok={stderr_relayed})"
             );
-            eprintln!(
-                "rch-wkr: command exited 0 but its output stream to the client was truncated; reporting failure to avoid a trusted-but-incomplete result"
+            eprintln_best_effort(
+                "rch-wkr: command exited 0 but its output stream to the client was truncated; reporting failure to avoid a trusted-but-incomplete result",
             );
             return Err(CommandFailed {
                 exit_code: EXIT_OUTPUT_TRUNCATED,
