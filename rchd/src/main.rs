@@ -11,6 +11,7 @@ mod api;
 mod benchmark_queue;
 mod benchmark_scheduler;
 mod build_root_policy;
+mod bypass_recovery_service;
 mod cache_cleanup;
 mod cancellation;
 mod cleanup;
@@ -54,9 +55,11 @@ use tokio::signal::unix::{SignalKind, signal};
 
 use benchmark_queue::BenchmarkQueue;
 use benchmark_scheduler::{BenchmarkScheduler, BenchmarkTriggerHandle, SchedulerConfig};
+use bypass_recovery_service::{BypassRecoveryConfig, BypassRecoveryService, SshRecoveryProber};
 use disk_pressure::{DiskPressureMonitor, DiskPressurePolicyConfig};
 use events::EventBus;
 use history::BuildHistory;
+use rch_common::bypass_record::{BypassRecordStore, default_bypass_record_path};
 use rch_telemetry::storage::TelemetryStorage;
 use selection::WorkerSelector;
 use self_test::{DEFAULT_RESULT_CAPACITY, DEFAULT_RUN_CAPACITY, SelfTestHistory, SelfTestService};
@@ -744,6 +747,24 @@ async fn main() -> Result<()> {
     );
     let _convergence_loop_handle = convergence_loop.start();
     info!("Convergence loop started");
+
+    // Start the bypass recovery service (bd-session-history-remediation-ocv9i.1.3):
+    // quarantines plainly-unreachable workers into temporary bypass, then probes
+    // them (capabilities/disk/load/telemetry) and runs a canary before any
+    // auto-rejoin. The durable bypass records persist alongside incidents and are
+    // reconciled into live worker lifecycle on startup.
+    let bypass_config = BypassRecoveryConfig::default();
+    let bypass_prober = SshRecoveryProber::new(telemetry_store.clone(), bypass_config.clone());
+    let bypass_recovery = BypassRecoveryService::new(
+        worker_pool.clone(),
+        Arc::new(Mutex::new(BypassRecordStore::load(
+            default_bypass_record_path(),
+        ))),
+        bypass_prober,
+        bypass_config,
+    );
+    let _bypass_recovery_handle = bypass_recovery.start();
+    info!("Bypass recovery service started");
 
     let metrics_pool = worker_pool.clone();
     let metrics_history = context.history.clone();
