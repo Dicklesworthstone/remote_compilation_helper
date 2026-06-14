@@ -42,17 +42,21 @@ use super::repo_updater::maybe_sync_repo_set_with_repo_updater;
 use super::ssh::ensure_worker_projects_topology;
 use super::*;
 
+const PIGGYBACK_TELEMETRY_TIMEOUT_SECS: u64 = 5;
+
 pub(super) fn wrap_command_with_telemetry(command: &str, worker_id: &WorkerId) -> String {
     let escaped_worker = shell_escape::escape(worker_id.as_str().into());
     // Use newline instead of semicolon to ensure trailing comments in command
-    // don't comment out the status capture logic.
+    // don't comment out the status capture logic. Telemetry is optional and
+    // must never keep a completed build active after the real command exits.
     format!(
-        "{cmd}\nstatus=$?; if command -v rch-telemetry >/dev/null 2>&1; then \
-         telemetry=$(rch-telemetry collect --format json --worker-id {worker} 2>/dev/null || true); \
+        "{cmd}\nstatus=$?; if command -v rch-telemetry >/dev/null 2>&1 && command -v timeout >/dev/null 2>&1; then \
+         telemetry=$(timeout --signal=KILL {timeout_secs} rch-telemetry collect --format json --worker-id {worker} 2>/dev/null || true); \
          if [ -n \"$telemetry\" ]; then echo '{marker}'; echo \"$telemetry\"; fi; \
          fi; exit $status",
         cmd = command,
         worker = escaped_worker,
+        timeout_secs = PIGGYBACK_TELEMETRY_TIMEOUT_SECS,
         marker = PIGGYBACK_MARKER
     )
 }
@@ -603,7 +607,7 @@ pub(super) async fn execute_remote_compilation(
                     return;
                 }
                 if let Some(state) = heartbeat_state_stdout.as_ref() {
-                    mark_heartbeat_progress(state);
+                    mark_heartbeat_progress(state, line);
                 }
 
                 let mut state = ui_state_stdout.borrow_mut();
@@ -624,7 +628,7 @@ pub(super) async fn execute_remote_compilation(
             },
             move |line| {
                 if let Some(state) = heartbeat_state_stderr.as_ref() {
-                    mark_heartbeat_progress(state);
+                    mark_heartbeat_progress(state, line);
                 }
                 // Write stderr lines to stderr and capture for analysis
                 let mut state = ui_state_stderr.borrow_mut();
@@ -720,7 +724,7 @@ pub(super) async fn execute_remote_compilation(
                 .retrieve_artifacts_streaming(&worker_config, &artifact_patterns, |line| {
                     progress.update_from_line(line);
                     if let Some(state) = heartbeat_state_download.as_ref() {
-                        mark_heartbeat_progress(state);
+                        mark_heartbeat_progress(state, line);
                     }
                 })
                 .await
@@ -844,7 +848,7 @@ pub(super) async fn execute_remote_compilation(
                         .retrieve_artifacts_streaming(&worker_config, &custom_patterns, |line| {
                             progress.update_from_line(line);
                             if let Some(state) = heartbeat_state_target.as_ref() {
-                                mark_heartbeat_progress(state);
+                                mark_heartbeat_progress(state, line);
                             }
                         })
                         .await

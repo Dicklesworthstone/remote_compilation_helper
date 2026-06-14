@@ -1431,6 +1431,7 @@ mod tests {
                 },
             ],
             issues: vec![IssueFromApi {
+                reason_code: Some("worker_unreachable".to_string()),
                 severity: "warning".to_string(),
                 summary: "worker-b unreachable".to_string(),
                 remediation: Some("Check SSH connectivity".to_string()),

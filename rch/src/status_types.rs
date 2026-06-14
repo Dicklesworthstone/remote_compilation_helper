@@ -216,6 +216,8 @@ pub struct BuildRecordFromApi {
 /// Issue from API.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IssueFromApi {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<String>,
     pub severity: String,
     pub summary: String,
     pub remediation: Option<String>,
@@ -1325,12 +1327,14 @@ mod tests {
     fn test_deserialize_issue() {
         let _guard = test_guard!();
         let json = serde_json::json!({
+            "reason_code": "worker_latency",
             "severity": "warning",
             "summary": "Worker worker-1 has high latency",
             "remediation": "Check network connection"
         });
 
         let issue: IssueFromApi = serde_json::from_value(json).unwrap();
+        assert_eq!(issue.reason_code, Some("worker_latency".to_string()));
         assert_eq!(issue.severity, "warning");
         assert_eq!(
             issue.remediation,

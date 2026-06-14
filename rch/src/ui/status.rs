@@ -535,6 +535,7 @@ mod tests {
             queued_builds: vec![],
             recent_builds: vec![],
             issues: vec![IssueFromApi {
+                reason_code: Some("worker_latency".to_string()),
                 severity: "warning".to_string(),
                 summary: "Worker-2 has high latency".to_string(),
                 remediation: Some("Check network connection".to_string()),

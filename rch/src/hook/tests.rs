@@ -2399,6 +2399,38 @@ fn test_wrap_command_with_telemetry_handles_comments() {
 }
 
 #[test]
+fn telemetry_wrapper_bounds_optional_collection_after_command_exit() {
+    let _guard = test_guard!();
+    let wrapped = wrap_command_with_telemetry(
+        "cargo test -p rch focused_filter",
+        &rch_common::WorkerId::new("w1"),
+    );
+
+    assert!(
+        wrapped.contains("status=$?;"),
+        "must capture the real command status before optional telemetry: {wrapped}"
+    );
+    assert!(
+        wrapped.contains(
+            "command -v rch-telemetry >/dev/null 2>&1 && command -v timeout >/dev/null 2>&1"
+        ),
+        "telemetry collection must be gated by timeout availability: {wrapped}"
+    );
+    assert!(
+        wrapped.contains("timeout --signal=KILL 5 rch-telemetry collect"),
+        "optional telemetry must have a hard cap: {wrapped}"
+    );
+    assert!(
+        !wrapped.contains("telemetry=$(rch-telemetry collect"),
+        "unbounded telemetry collection can keep completed builds active: {wrapped}"
+    );
+    assert!(
+        wrapped.trim_end().ends_with("exit $status"),
+        "wrapper must preserve the real command status: {wrapped}"
+    );
+}
+
+#[test]
 fn test_add_cargo_isolation_adds_unique_cargo_home() {
     let _guard = test_guard!();
     let worker_id = rch_common::WorkerId::new("test-worker");

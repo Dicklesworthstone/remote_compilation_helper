@@ -834,6 +834,7 @@ mod tests {
             queued_builds: vec![],
             recent_builds,
             issues: vec![IssueFromApi {
+                reason_code: Some("test_info".to_string()),
                 severity: "info".to_string(),
                 summary: "all good".to_string(),
                 remediation: None,

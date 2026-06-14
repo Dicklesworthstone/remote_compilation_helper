@@ -376,6 +376,9 @@ pub struct QueuedBuild {
 /// Issue or warning.
 #[derive(Debug, Serialize)]
 pub struct Issue {
+    /// Stable reason code for machine consumers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<String>,
     /// Severity: info, warning, error.
     pub severity: String,
     /// Short summary.
@@ -2678,6 +2681,7 @@ fn cancellation_issues_from_recent_builds(recent_builds: &[BuildRecord]) -> Vec<
             .map(|op| format!(" Last operation: {op}."))
             .unwrap_or_default();
         issues.push(Issue {
+            reason_code: Some("cancellation_cleanup_failed".to_string()),
             severity: "error".to_string(),
             summary: format!(
                 "{} recent cancellation(s) finished with cleanup failures.{operation_hint}",
@@ -2691,6 +2695,7 @@ fn cancellation_issues_from_recent_builds(recent_builds: &[BuildRecord]) -> Vec<
 
     if sigkill_escalations > 0 {
         issues.push(Issue {
+            reason_code: Some("cancellation_sigkill_escalated".to_string()),
             severity: "warning".to_string(),
             summary: format!(
                 "{} recent cancellation(s) escalated to SIGKILL (stuck or unresponsive process trees).",
@@ -2704,6 +2709,7 @@ fn cancellation_issues_from_recent_builds(recent_builds: &[BuildRecord]) -> Vec<
 
     if unreachable_workers > 0 {
         issues.push(Issue {
+            reason_code: Some("cancellation_worker_unreachable".to_string()),
             severity: "warning".to_string(),
             summary: format!(
                 "{} cancellation(s) ended while worker health reported unreachable.",
@@ -2717,6 +2723,7 @@ fn cancellation_issues_from_recent_builds(recent_builds: &[BuildRecord]) -> Vec<
 
     if cancelled > 0 && issues.is_empty() {
         issues.push(Issue {
+            reason_code: Some("cancellation_completed".to_string()),
             severity: "info".to_string(),
             summary: format!(
                 "{} recent cancellation(s) completed cleanly with deterministic cleanup.",
@@ -2734,6 +2741,8 @@ fn cancellation_issues_from_recent_builds(recent_builds: &[BuildRecord]) -> Vec<
 fn active_build_issues_from_active_builds(
     active_builds: &[crate::history::ActiveBuildState],
 ) -> Vec<Issue> {
+    const DEPENDENCY_FETCH_DETAIL: &str = "cargo_git_fetch";
+
     let stalled_live_hook_builds: Vec<_> = active_builds
         .iter()
         .filter(|build| {
@@ -2747,12 +2756,40 @@ fn active_build_issues_from_active_builds(
         return Vec::new();
     }
 
+    let dependency_fetch_stalls: Vec<_> = stalled_live_hook_builds
+        .iter()
+        .copied()
+        .filter(|build| build.heartbeat_detail.as_deref() == Some(DEPENDENCY_FETCH_DETAIL))
+        .collect();
+    if !dependency_fetch_stalls.is_empty() {
+        let representative = dependency_fetch_stalls
+            .iter()
+            .max_by_key(|build| build.detector_build_age_secs)
+            .expect("non-empty dependency-fetch stall list");
+
+        return vec![Issue {
+            reason_code: Some("dependency_fetch_stalled".to_string()),
+            severity: "warning".to_string(),
+            summary: format!(
+                "{} active build(s) are stalled while Cargo fetches git dependencies; hook heartbeats remain fresh for build {} on worker {}.",
+                dependency_fetch_stalls.len(),
+                representative.id,
+                representative.worker_id
+            ),
+            remediation: Some(format!(
+                "Fail closed for proof lanes. Inspect with `rch queue --json`; if progress remains stale, run `rch cancel {}`. Before retrying on {}, verify Cargo git fetch/reuse works for that worker or drain it with `rch workers drain {}`.",
+                representative.id, representative.worker_id, representative.worker_id
+            )),
+        }];
+    }
+
     let representative = stalled_live_hook_builds
         .iter()
         .max_by_key(|build| build.detector_build_age_secs)
         .expect("non-empty stalled live-hook build list");
 
     vec![Issue {
+        reason_code: Some("live_hook_progress_stalled".to_string()),
         severity: "warning".to_string(),
         summary: format!(
             "{} active build(s) have stale progress while hook heartbeats remain fresh; queued validations may stall behind build {} on worker {}.",
@@ -2970,12 +3007,14 @@ async fn handle_status(ctx: &DaemonContext) -> Result<DaemonFullStatus> {
         // Generate issues based on worker state
         if circuit_state == CircuitState::Open {
             issues.push(Issue {
+                reason_code: Some("worker_circuit_open".to_string()),
                 severity: "error".to_string(),
                 summary: format!("Circuit open for worker '{}'", worker_id),
                 remediation: Some(format!("rch workers probe {} --force", worker_id)),
             });
         } else if pressure.state == crate::disk_pressure::PressureState::Critical {
             issues.push(Issue {
+                reason_code: Some("worker_pressure_critical".to_string()),
                 severity: "error".to_string(),
                 summary: format!(
                     "Worker '{}' in critical pressure state ({})",
@@ -2988,6 +3027,7 @@ async fn handle_status(ctx: &DaemonContext) -> Result<DaemonFullStatus> {
             });
         } else if pressure.state == crate::disk_pressure::PressureState::TelemetryGap {
             issues.push(Issue {
+                reason_code: Some("worker_pressure_telemetry_gap".to_string()),
                 severity: "warning".to_string(),
                 summary: format!(
                     "Worker '{}' has stale/missing pressure telemetry ({})",
@@ -3006,12 +3046,14 @@ async fn handle_status(ctx: &DaemonContext) -> Result<DaemonFullStatus> {
             });
         } else if status == WorkerStatus::Unreachable {
             issues.push(Issue {
+                reason_code: Some("worker_unreachable".to_string()),
                 severity: "error".to_string(),
                 summary: format!("Worker '{}' is unreachable", worker_id),
                 remediation: Some(format!("rch workers probe {}", worker_id)),
             });
         } else if status == WorkerStatus::Degraded {
             issues.push(Issue {
+                reason_code: Some("worker_degraded".to_string()),
                 severity: "warning".to_string(),
                 summary: format!("Worker '{}' is degraded (slow response)", worker_id),
                 remediation: None,
@@ -4501,11 +4543,13 @@ mod tests {
     fn test_issue_serialization() {
         let _guard = test_guard!();
         let issue = Issue {
+            reason_code: Some("worker_unreachable".to_string()),
             severity: "warning".to_string(),
             summary: "Worker w1 is unreachable".to_string(),
             remediation: Some("rch doctor".to_string()),
         };
         let json = serde_json::to_string(&issue).unwrap();
+        assert!(json.contains("\"reason_code\":\"worker_unreachable\""));
         assert!(json.contains("\"severity\":\"warning\""));
         assert!(json.contains("\"remediation\":\"rch doctor\""));
     }
@@ -6017,6 +6061,64 @@ mod tests {
             .remediation
             .as_ref()
             .expect("stall issue should include remediation");
+        assert!(remediation.contains(&format!("rch cancel {}", active.id)));
+        assert!(remediation.contains("rch workers drain worker1"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_status_emits_dependency_fetch_stall_issue() {
+        let _guard = test_guard!();
+        let pool = WorkerPool::new();
+        pool.add_worker(make_test_worker("worker1", 8)).await;
+        let ctx = make_test_context(pool);
+
+        let active = ctx.history.start_active_build(
+            "test-project".to_string(),
+            "worker1".to_string(),
+            "cargo test".to_string(),
+            0,
+            4,
+            rch_common::BuildLocation::Remote,
+        );
+        let _ = ctx.history.record_build_heartbeat(BuildHeartbeatRequest {
+            build_id: active.id,
+            worker_id: WorkerId::new("worker1"),
+            hook_pid: Some(1234),
+            remote_pgid_file: None,
+            phase: rch_common::BuildHeartbeatPhase::Execute,
+            detail: Some("cargo_git_fetch".to_string()),
+            progress_counter: Some(2),
+            progress_percent: None,
+        });
+        let updated = ctx.history.record_stuck_detector_snapshot(
+            active.id,
+            crate::history::StuckDetectorSnapshot {
+                hook_alive: true,
+                heartbeat_stale: false,
+                progress_stale: true,
+                confidence: 0.25,
+                build_age_secs: 240,
+                slots_owned: 4,
+            },
+        );
+        assert!(updated.is_some());
+
+        let status = handle_status(&ctx).await.expect("status should succeed");
+        let issue = status
+            .issues
+            .iter()
+            .find(|issue| issue.reason_code.as_deref() == Some("dependency_fetch_stalled"))
+            .expect("status issues should include dependency-fetch stall");
+
+        assert_eq!(issue.severity, "warning");
+        assert!(issue.summary.contains("Cargo fetches git dependencies"));
+        assert!(issue.summary.contains(&active.id.to_string()));
+        assert!(issue.summary.contains("worker1"));
+        let remediation = issue
+            .remediation
+            .as_ref()
+            .expect("dependency-fetch issue should include remediation");
+        assert!(remediation.contains("Fail closed for proof lanes"));
         assert!(remediation.contains(&format!("rch cancel {}", active.id)));
         assert!(remediation.contains("rch workers drain worker1"));
     }

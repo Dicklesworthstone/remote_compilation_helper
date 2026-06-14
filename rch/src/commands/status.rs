@@ -2251,6 +2251,7 @@ mod tests {
 
     fn check_issue(severity: &str, summary: &str) -> IssueFromApi {
         IssueFromApi {
+            reason_code: None,
             severity: severity.to_string(),
             summary: summary.to_string(),
             remediation: None,
