@@ -1454,9 +1454,23 @@ impl WorkerSelector {
                                     ))
                                 }
                             }
-                            // Admitted, or not evaluated this round (e.g. excluded
-                            // by an earlier hard gate): no admission-based denial.
-                            Some(AdmissionVerdict::Admit { .. }) | None => None,
+                            // Gate admitted this worker → authoritative (it already
+                            // weighed pressure/headroom/hysteresis); no denial.
+                            Some(AdmissionVerdict::Admit { .. }) => None,
+                            // Not evaluated by the gate this round (excluded by an
+                            // earlier check): fall back to the raw critical-pressure
+                            // check so a pressured worker isn't reported as Allow.
+                            None => {
+                                if pressure.state == PressureState::Critical {
+                                    Some((
+                                        WorkerSelectionDiagnosticDecision::Deny,
+                                        format!("critical pressure: {}", pressure.reason_code),
+                                        "pressure.critical",
+                                    ))
+                                } else {
+                                    None
+                                }
+                            }
                         }
                     } else if pressure.state == PressureState::Critical {
                         Some((
