@@ -1,8 +1,10 @@
 //! Shared predicate + shell-snippet builder for reaping *stale* per-job remote
 //! `CARGO_TARGET_DIR` directories.
 //!
-//! rch gives every forwarded-`CARGO_TARGET_DIR` build a per-job target dir named
-//! `.rch-target-<worker>-job-<id>-<ts>-<seq>` (or `…-pid-<pid>-…`). Such a dir can
+//! rch gives every forwarded-`CARGO_TARGET_DIR` build a target dir named either
+//! `.rch-target-<worker>-job-<id>-<ts>-<seq>` (per-job, the legacy/opt-out name;
+//! also `…-pid-<pid>-…`) or `.rch-target-<worker>-pool-<key>` (the default
+//! REUSED-across-jobs pooled dir keyed by build dimensions). Such a dir can
 //! stay in active use far beyond a single command — a long-running build keeps
 //! writing into it (one was observed accumulating ~11.5h of artifacts). So a
 //! per-job dir must **never** be removed merely because some build finished; that
@@ -26,12 +28,22 @@
 //! Both share [`is_safe_reap_path`] / [`is_safe_reap_token`] (the security
 //! boundary — inputs are embedded into the generated shell) and
 //! [`reap_loop_body`] (the per-dir staleness test + removal). The matched glob is
-//! always exactly `.rch-target-*-job-*` / `.rch-target-*-pid-*` — never a bare
-//! `target`, never a source dir, never `.git`/`.beads`.
+//! always exactly `.rch-target-*-job-*` / `.rch-target-*-pid-*` / `.rch-target-*-pool-*`
+//! — never a bare `target`, never a source dir, never `.git`/`.beads`.
+//!
+//! Pooled dirs (`-pool-`) are SHARED by concurrent jobs with identical build
+//! dimensions, but the idle-based predicate still reaps them safely: an actively
+//! building pool dir has a fresh mtime (cargo writes into it continuously), so it
+//! is never evicted while in use, and once every job sharing it has finished it
+//! goes idle like any per-job dir and is reclaimed after `idle_hours`.
 
-/// The glob patterns matched for reaping. Restricted to per-job/per-pid dirs so a
-/// bare `target` (or any non-rch dir) is never touched.
-pub const REAP_GLOBS: &[&str] = &[".rch-target-*-job-*", ".rch-target-*-pid-*"];
+/// The glob patterns matched for reaping. Restricted to per-job / per-pid /
+/// pooled dirs so a bare `target` (or any non-rch dir) is never touched.
+pub const REAP_GLOBS: &[&str] = &[
+    ".rch-target-*-job-*",
+    ".rch-target-*-pid-*",
+    ".rch-target-*-pool-*",
+];
 
 /// Whether `s` is safe to use as a `cd` target / `find` root of a reap script:
 /// absolute, at least two path segments deep (never `/` or a bare top-level dir),
@@ -200,5 +212,63 @@ mod tests {
         assert!(body.contains("du -sk \"$d\""));
         assert!(body.contains("removed=$((removed + 1))"));
         assert!(body.contains("freed_kb=$((freed_kb + sz))"));
+    }
+
+    /// Minimal shell-style glob match (`*` = any run of chars) for asserting a
+    /// dir name is covered by one of the `REAP_GLOBS`.
+    fn glob_matches(glob: &str, name: &str) -> bool {
+        // Split on `*` and require each literal segment to appear in order, with
+        // the first/last anchored when the glob has no leading/trailing `*`.
+        let parts: Vec<&str> = glob.split('*').collect();
+        let mut pos = 0usize;
+        for (i, part) in parts.iter().enumerate() {
+            if part.is_empty() {
+                continue;
+            }
+            match name[pos..].find(part) {
+                Some(idx) => {
+                    if i == 0 && !glob.starts_with('*') && idx != 0 {
+                        return false;
+                    }
+                    pos += idx + part.len();
+                }
+                None => return false,
+            }
+        }
+        // Trailing literal must end the name when glob doesn't end in `*`.
+        if !glob.ends_with('*') {
+            return name.ends_with(parts.last().copied().unwrap_or(""));
+        }
+        true
+    }
+
+    #[test]
+    fn pooled_target_dir_name_is_reapable() {
+        // The pooled remote target dir (`.rch-target-<worker>-pool-<key>`) minted
+        // by the hook for target-dir REUSE must still be matched by a reap glob so
+        // the existing idle-based reaper reclaims abandoned pools.
+        let name = ".rch-target-ts2-pool-deadbeefcafef00ddeadbeefcafef00d";
+        assert!(
+            REAP_GLOBS.iter().any(|g| glob_matches(g, name)),
+            "pooled target dir {name} must match a reap glob: {REAP_GLOBS:?}"
+        );
+        assert!(
+            is_safe_reap_token(name),
+            "pooled name must be reap-token-safe"
+        );
+        // The legacy per-job/per-pid names stay reapable too.
+        assert!(
+            REAP_GLOBS
+                .iter()
+                .any(|g| glob_matches(g, ".rch-target-ts2-job-7-123-0"))
+        );
+        assert!(
+            REAP_GLOBS
+                .iter()
+                .any(|g| glob_matches(g, ".rch-target-ts2-pid-99-123-0"))
+        );
+        // A bare `target` (or non-rch dir) is NEVER matched.
+        assert!(!REAP_GLOBS.iter().any(|g| glob_matches(g, "target")));
+        assert!(!REAP_GLOBS.iter().any(|g| glob_matches(g, ".rch-target")));
     }
 }

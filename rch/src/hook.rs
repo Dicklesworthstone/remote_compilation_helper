@@ -102,10 +102,25 @@ const EXIT_TEST_FAILURES: i32 = 101;
 #[allow(dead_code)] // Used in run_exec
 const EXIT_SIGNAL_BASE: i32 = 128;
 
+/// Process exit code returned when the remote compile SUCCEEDED but the build
+/// artifacts could NOT be transferred back, leaving the local build incomplete
+/// (no binary/lib where the agent expects one). From the caller's perspective the
+/// build did not actually complete, so this must be a NON-zero, build-failure-class
+/// code rather than the remote command's exit 0 — re-running locally is the right
+/// recovery, exactly like the AGENTS.md "Build failed (remote compilation)" case.
+/// Pairs with the `RCH-E309 BuildArtifactMissing` diagnostic on stderr.
+const EXIT_ARTIFACT_TRANSFER_FAILED: i32 = 102;
+
 const RCH_CARGO_WRAPPER_BYPASS_ENV: &str = "RCH_CARGO_WRAPPER_BYPASS";
 const RCH_REQUIRE_REMOTE_ENV: &str = "RCH_REQUIRE_REMOTE";
 const RCH_WORKER_ENV: &str = "RCH_WORKER";
 const RCH_WORKERS_ENV: &str = "RCH_WORKERS";
+
+/// Opt-out knob for remote target-dir REUSE. When set to a truthy value the hook
+/// falls back to the legacy unique-per-job remote target dir name
+/// (`remote_cargo_target_dir_name`) instead of the stable pooled name, for users
+/// who hit problems with the shared pool.
+const RCH_DISABLE_TARGET_REUSE_ENV: &str = "RCH_DISABLE_TARGET_REUSE";
 
 static HOOK_MODE_PANIC_FAIL_OPEN: AtomicBool = AtomicBool::new(false);
 static AUTOSTART_LOCK_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -3510,6 +3525,148 @@ fn remote_cargo_target_dir_name(build_id: Option<u64>, worker_id: &WorkerId) -> 
     format!(".rch-target-{safe_worker_id}-{job_id}-{timestamp}-{sequence}")
 }
 
+/// Whether remote target-dir REUSE is disabled via [`RCH_DISABLE_TARGET_REUSE_ENV`].
+/// Any non-empty value other than `0`/`false`/`no`/`off` (case-insensitive) opts out.
+fn target_reuse_disabled() -> bool {
+    target_reuse_disabled_from_value(std::env::var(RCH_DISABLE_TARGET_REUSE_ENV).ok())
+}
+
+/// Pure predicate behind [`target_reuse_disabled`] (env value injected so it is
+/// unit-testable under `#![forbid(unsafe_code)]`, where `set_var` is unusable).
+fn target_reuse_disabled_from_value(value: Option<String>) -> bool {
+    value
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            !v.is_empty() && v != "0" && v != "false" && v != "no" && v != "off"
+        })
+        .unwrap_or(false)
+}
+
+/// The Rust target triple this build will compile for: an explicit `--target
+/// <triple>` / `--target=<triple>` from the command wins, otherwise the host
+/// default the binary was built for (`std::env::consts`-derived). This is a
+/// pooled-dir cache DIMENSION — a cross-compile must not share a host build's
+/// pool — so a stable, host-correct fallback matters.
+fn target_triple_for_command(command: &str) -> String {
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    let mut iter = tokens.iter();
+    while let Some(token) = iter.next() {
+        if let Some(value) = token.strip_prefix("--target=") {
+            if !value.is_empty() {
+                return value.to_string();
+            }
+        } else if *token == "--target"
+            && let Some(value) = iter.next()
+            && !value.is_empty()
+        {
+            return (*value).to_string();
+        }
+    }
+    default_host_target_triple()
+}
+
+/// Best-effort host target triple, assembled from compile-time `std::env::consts`.
+/// Cargo's own triples are `<arch>-<vendor>-<os>[-<env>]`; we reconstruct the
+/// common Linux/macOS/Windows shapes. Only used as a *cache-key dimension* (and to
+/// disambiguate pools), so an approximate-but-stable value is acceptable — it just
+/// needs to be the SAME across invocations on the same host and DIFFERENT across
+/// architectures/OSes.
+fn default_host_target_triple() -> String {
+    let arch = std::env::consts::ARCH; // e.g. "x86_64", "aarch64"
+    match std::env::consts::OS {
+        "linux" => format!("{arch}-unknown-linux-gnu"),
+        "macos" => format!("{arch}-apple-darwin"),
+        "windows" => format!("{arch}-pc-windows-msvc"),
+        other => format!("{arch}-unknown-{other}"),
+    }
+}
+
+/// Parse the cargo feature set that affects compiled artifacts from `command`.
+/// Captures `--features <list>` / `--features=<list>` (space- or comma-separated),
+/// `-F <list>`, `--all-features`, and `--no-default-features`. The result feeds
+/// `PooledTargetDimensions` whose key derivation is order- and duplicate-insensitive,
+/// so two commands that enable the same feature SET share a pool regardless of
+/// flag order. `--all-features`/`--no-default-features` are recorded as sentinel
+/// pseudo-features so they partition pools (they change the compiled output).
+fn feature_set_for_command(command: &str) -> Vec<String> {
+    let mut features: Vec<String> = Vec::new();
+    let push_list = |list: &str, features: &mut Vec<String>| {
+        for f in list
+            .split([',', ' '])
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            features.push(f.to_string());
+        }
+    };
+
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    let mut iter = tokens.iter().peekable();
+    while let Some(token) = iter.next() {
+        if let Some(value) = token.strip_prefix("--features=") {
+            push_list(value, &mut features);
+        } else if let Some(value) = token.strip_prefix("-F=") {
+            push_list(value, &mut features);
+        } else if *token == "--features" || *token == "-F" {
+            if let Some(value) = iter.next() {
+                push_list(value, &mut features);
+            }
+        } else if *token == "--all-features" {
+            features.push("__rch_all_features".to_string());
+        } else if *token == "--no-default-features" {
+            features.push("__rch_no_default_features".to_string());
+        }
+    }
+    features
+}
+
+/// Derive the STABLE pooled remote target-dir name for a build's cache dimensions,
+/// so independent jobs sharing (project, toolchain, triple, profile, feature-set)
+/// REUSE the same warm remote incremental cache instead of cold-recompiling into a
+/// unique-per-job dir.
+///
+/// The key (`rch_common::PooledTargetKey`) is a domain-separated 32-char hex over
+/// those dimensions; its native layout is `.rch-pool/<key>` but that contains a
+/// `/` which `TransferPipeline::with_remote_cargo_target_dir_name` rejects (the
+/// name must be a single path segment). So we flatten to one segment that keeps
+/// the `.rch-target-` prefix the stale-dir reaper recognizes and adds a `-pool-`
+/// marker the reaper's `REAP_GLOBS` matches: `.rch-target-<worker>-pool-<key>`.
+///
+/// CONCURRENCY: two concurrent jobs with identical dimensions now share one remote
+/// target dir. cargo's own `target/.cargo-lock` (an flock) serializes them
+/// correctly — this is expected/fine. The 12h-idle reaper won't evict an
+/// actively-building dir (fresh mtime), so the immediate eviction race is
+/// low-risk. (Fuller active-build pinning — marking a pool dir in-use for the
+/// duration of a job — is a follow-up; the idle-based reaper + cargo flock are the
+/// safety mechanism today.)
+fn remote_cargo_pooled_target_dir_name(
+    worker_id: &WorkerId,
+    normalized_project_root: &Path,
+    toolchain: Option<&ToolchainInfo>,
+    command: &str,
+) -> String {
+    let toolchain_id = toolchain
+        .map(ToolchainInfo::rustup_toolchain)
+        .unwrap_or_else(|| "unknown".to_string());
+    let profile = detect_target_label(command, "").unwrap_or_else(|| "dev".to_string());
+    let triple = target_triple_for_command(command);
+
+    let dims = rch_common::pooled_target_key::PooledTargetDimensions::new(
+        normalized_project_root.to_string_lossy().to_string(),
+        toolchain_id,
+        triple,
+        profile,
+    )
+    .with_features(feature_set_for_command(command));
+
+    let key = rch_common::pooled_target_key::PooledTargetKey::derive(&dims);
+    let safe_worker_id = sanitize_cargo_home_token(worker_id.as_str());
+    // Flatten `.rch-pool/<key>` to a single, slash-free segment while keeping the
+    // reaper-recognized `.rch-target-…-pool-…` shape. The key is lowercase hex and
+    // the worker id is sanitized, so the result is filesystem- and reaper-safe.
+    format!(".rch-target-{safe_worker_id}-pool-{}", key.as_str())
+}
+
 /// Idle threshold (hours) after which an abandoned per-job remote target dir is
 /// eligible for reaping. Defaults to 12h: empirically (ts2 disk-fill incident,
 /// 2026-05) active per-job dirs are touched within ~2h while abandoned ones sit
@@ -5904,12 +6061,36 @@ fn get_artifact_patterns(kind: Option<CompilationKind>) -> Vec<String> {
     }
 }
 
+/// Rsync filter entries that, prefixed onto an artifact pattern list, are emitted
+/// as `--exclude` rules BEFORE the `--include` rules (rsync first-match-wins). They
+/// strip cargo's per-job *cache* state out of a custom-`CARGO_TARGET_DIR` sync-back
+/// so only build OUTPUTS travel — the multi-hundred-MB-to-GB `incremental/`,
+/// `.fingerprint/`, `build/`, and `*.d` trees stay on the worker (they are
+/// regenerated locally on demand and are useless without the matching remote
+/// fingerprints anyway). The profile dirs are enumerated explicitly rather than
+/// globbed so a source-tree `build/` (legitimate C/C++ artifact root) is never
+/// caught — these only ever match the cargo `target/<profile>/` layout.
+const CARGO_TARGET_CACHE_EXCLUDES: &[&str] = &[
+    "- debug/incremental/",
+    "- debug/.fingerprint/",
+    "- debug/build/",
+    "- release/incremental/",
+    "- release/.fingerprint/",
+    "- release/build/",
+    "- */incremental/",
+    "- */.fingerprint/",
+    "- */build/",
+    "- *.d",
+];
+
 fn get_custom_target_artifact_patterns(kind: Option<CompilationKind>) -> Vec<String> {
     match kind {
         Some(CompilationKind::CargoTest)
         | Some(CompilationKind::CargoCheck)
         | Some(CompilationKind::CargoClippy) => Vec::new(),
         Some(CompilationKind::CargoNextest) | Some(CompilationKind::CargoBench) => {
+            // Test/bench artifacts are already a narrow allowlist; just rebase them
+            // onto the target-dir root (the sync root IS the remote target dir).
             get_artifact_patterns(kind)
                 .into_iter()
                 .map(|pattern| {
@@ -5920,7 +6101,28 @@ fn get_custom_target_artifact_patterns(kind: Option<CompilationKind>) -> Vec<Str
                 })
                 .collect()
         }
-        _ => vec!["**".to_string()],
+        // CargoBuild / CargoDoc / Rustc (the `_` arm) previously synced the WHOLE
+        // per-job remote target dir via `**`, dragging deps/, incremental/,
+        // .fingerprint/, and build/ back on every build. Capture only the build
+        // OUTPUTS — final binaries/libs under `<profile>/` and the crate's own
+        // compiled artifacts in `<profile>/deps` (rlibs, the linked binary, etc.) —
+        // plus doc output, while excluding the cache trees. Reuses the same
+        // well-tested output globs as `get_artifact_patterns` (with the `target/`
+        // prefix stripped because the sync root is already the target dir). The
+        // exclude rules are emitted first so rsync never pulls cache bytes.
+        _ => {
+            let mut patterns: Vec<String> = CARGO_TARGET_CACHE_EXCLUDES
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect();
+            patterns.extend(get_artifact_patterns(kind).into_iter().map(|pattern| {
+                pattern
+                    .strip_prefix("target/")
+                    .unwrap_or(pattern.as_str())
+                    .to_string()
+            }));
+            patterns
+        }
     }
 }
 
@@ -6265,9 +6467,30 @@ async fn execute_remote_compilation(
     let effective_env_allowlist =
         cargo_target_env_allowlist(&env_allowlist, forwarded_cargo_target_dir.is_some());
     let cargo_env_overrides = cargo_target_env_overrides(forwarded_cargo_target_dir.as_deref());
-    let remote_cargo_target_dir_name_override = forwarded_cargo_target_dir
-        .as_ref()
-        .map(|_| remote_cargo_target_dir_name(build_id, &worker_config.id));
+    // Remote target-dir name for the forwarded-CARGO_TARGET_DIR sync. By default
+    // this is a STABLE pooled name keyed on (project, toolchain, triple, profile,
+    // features) so independent jobs with identical dimensions REUSE the same warm
+    // remote incremental cache instead of cold-recompiling into a unique-per-job
+    // dir. `RCH_DISABLE_TARGET_REUSE=1` restores the legacy unique-per-job name.
+    let remote_cargo_target_dir_name_override = forwarded_cargo_target_dir.as_ref().map(|_| {
+        if target_reuse_disabled() {
+            reporter.verbose(
+                "[RCH] remote target-dir reuse disabled (RCH_DISABLE_TARGET_REUSE); using unique-per-job dir",
+            );
+            remote_cargo_target_dir_name(build_id, &worker_config.id)
+        } else {
+            let name = remote_cargo_pooled_target_dir_name(
+                &worker_config.id,
+                &normalized_project_root,
+                toolchain,
+                command,
+            );
+            reporter.verbose(&format!(
+                "[RCH] remote target-dir reuse active; pooled dir {name}"
+            ));
+            name
+        }
+    });
     let mut primary_pipeline: Option<TransferPipeline> = None;
     let mut aggregate_sync_result: Option<SyncResult> = None;
 
@@ -6935,12 +7158,84 @@ async fn execute_remote_compilation(
         loop_ref.finish(BuildHeartbeatPhase::Finalize, detail).await;
     }
 
+    // Loud, fatal sync-back failure (issue #19 Fix 1). A remote compile that
+    // SUCCEEDED but whose artifacts never came back leaves the local build
+    // incomplete — no binary/lib where the agent expects one. Reporting exit 0
+    // here is a silent footgun: the agent believes the build succeeded and the
+    // missing artifact only surfaces much later. So when the compile succeeded,
+    // artifact retrieval failed, AND this kind actually produces transferable
+    // artifacts, surface a PROMINENT stderr error and return a non-zero,
+    // build-failure-class exit code. The retrieval layer already turns exit-0
+    // partial transfers into `TransferError::SyncFailed` (transfer.rs); this
+    // propagates that as a non-zero hook exit instead of swallowing it.
+    let exit_code =
+        if result.success() && artifacts_failed && kind_produces_transferable_artifacts(kind) {
+            let code = ErrorCode::BuildArtifactMissing;
+            // stderr, not just `warn!`: this MUST reach the operator/agent even when
+            // tracing is silenced. stderr is the diagnostics stream (AGENTS.md).
+            eprintln!(
+                "[RCH] {} remote compile on {} SUCCEEDED but build artifacts could not be \
+             retrieved — the local build is INCOMPLETE (expected binaries/libraries are \
+             missing). Treating as a build failure (exit {EXIT_ARTIFACT_TRANSFER_FAILED}); \
+             re-run to rebuild, or check connectivity to the worker.",
+                code.code_string(),
+                worker_config.id,
+            );
+            warn!(
+                "Artifact transfer failed after a successful remote compile on {} [{}]; \
+             returning exit {} so the caller knows the local build is incomplete",
+                worker_config.id,
+                code.code_string(),
+                EXIT_ARTIFACT_TRANSFER_FAILED
+            );
+            EXIT_ARTIFACT_TRANSFER_FAILED
+        } else {
+            result.exit_code
+        };
+
     Ok(RemoteExecutionResult {
-        exit_code: result.exit_code,
+        exit_code,
         stderr: stderr_capture,
         duration_ms: result.duration_ms,
         timing,
     })
+}
+
+/// Whether a compilation kind produces build artifacts that must be transferred
+/// back for the local build to be complete (binaries, libraries, docs, object
+/// files). For these kinds, a failed artifact sync-back is a build failure
+/// (issue #19 Fix 1), not a benign warning. Test/diagnostic kinds
+/// (`cargo test`/`check`/`clippy`) stream their results over stdout/stderr and
+/// produce no required local artifact, so a sync-back miss for them is tolerable.
+///
+/// Mirrors the artifact-producing set used by `get_custom_target_artifact_patterns`
+/// / `get_artifact_patterns`: build/doc/rustc and the C/C++/build-system kinds.
+fn kind_produces_transferable_artifacts(kind: Option<CompilationKind>) -> bool {
+    match kind {
+        Some(CompilationKind::CargoBuild)
+        | Some(CompilationKind::CargoDoc)
+        | Some(CompilationKind::Rustc)
+        | Some(CompilationKind::Gcc)
+        | Some(CompilationKind::Gpp)
+        | Some(CompilationKind::Clang)
+        | Some(CompilationKind::Clangpp)
+        | Some(CompilationKind::Make)
+        | Some(CompilationKind::CmakeBuild)
+        | Some(CompilationKind::Ninja)
+        | Some(CompilationKind::Meson) => true,
+        // Test/diagnostic kinds stream results; no required local artifact.
+        Some(CompilationKind::CargoTest)
+        | Some(CompilationKind::CargoNextest)
+        | Some(CompilationKind::CargoBench)
+        | Some(CompilationKind::CargoCheck)
+        | Some(CompilationKind::CargoClippy)
+        | Some(CompilationKind::BunTest)
+        | Some(CompilationKind::BunTypecheck) => false,
+        // Unclassified command: be conservative and treat a sync-back failure as
+        // benign (we cannot prove a required artifact exists), matching the legacy
+        // continue-on-warning behavior.
+        None => false,
+    }
 }
 
 /// Add per-worker CARGO_HOME isolation to prevent cache lock contention.
@@ -9443,6 +9738,245 @@ The file `x11.pc` needs to be installed and the PKG_CONFIG_PATH environment vari
         assert_eq!(sanitize_cargo_home_token(""), "worker");
     }
 
+    // =========================================================================
+    // Issue #19 Fix 3: pooled remote target-dir REUSE
+    // =========================================================================
+
+    #[test]
+    fn test_pooled_target_dir_same_dimensions_reuse_same_name() {
+        // (a) The whole point: identical (project, toolchain, triple, profile,
+        // features) yields the SAME remote dir name across calls, so the warm
+        // remote incremental cache is reused instead of cold-recompiling.
+        let _guard = test_guard!();
+        let worker = rch_common::WorkerId::new("ts2");
+        let root = Path::new("/data/projects/acme");
+        let tc = ToolchainInfo::new("nightly", Some("2025-11-01".to_string()), "x");
+
+        let a = remote_cargo_pooled_target_dir_name(&worker, root, Some(&tc), "cargo build");
+        let b = remote_cargo_pooled_target_dir_name(&worker, root, Some(&tc), "cargo build");
+        assert_eq!(a, b, "same dimensions must reuse the same pooled dir");
+
+        // Feature SET (not order/dups) determines the key.
+        let f1 = remote_cargo_pooled_target_dir_name(
+            &worker,
+            root,
+            Some(&tc),
+            "cargo build --features serde,tokio",
+        );
+        let f2 = remote_cargo_pooled_target_dir_name(
+            &worker,
+            root,
+            Some(&tc),
+            "cargo build --features tokio --features serde",
+        );
+        assert_eq!(f1, f2, "feature set is order/dup-insensitive");
+    }
+
+    #[test]
+    fn test_pooled_target_dir_each_dimension_change_invalidates() {
+        // (b) Changing ANY cache dimension yields a DIFFERENT name, so an
+        // incompatible build never reuses a contaminated pool.
+        let _guard = test_guard!();
+        let worker = rch_common::WorkerId::new("ts2");
+        let root = Path::new("/data/projects/acme");
+        let tc = ToolchainInfo::new("nightly", Some("2025-11-01".to_string()), "x");
+        let base = remote_cargo_pooled_target_dir_name(&worker, root, Some(&tc), "cargo build");
+
+        // Profile (--release).
+        assert_ne!(
+            base,
+            remote_cargo_pooled_target_dir_name(&worker, root, Some(&tc), "cargo build --release"),
+            "profile change must invalidate"
+        );
+        // Target triple.
+        assert_ne!(
+            base,
+            remote_cargo_pooled_target_dir_name(
+                &worker,
+                root,
+                Some(&tc),
+                "cargo build --target wasm32-unknown-unknown"
+            ),
+            "triple change must invalidate"
+        );
+        // Toolchain.
+        let tc2 = ToolchainInfo::new("nightly", Some("2026-01-01".to_string()), "x");
+        assert_ne!(
+            base,
+            remote_cargo_pooled_target_dir_name(&worker, root, Some(&tc2), "cargo build"),
+            "toolchain change must invalidate"
+        );
+        // Features.
+        assert_ne!(
+            base,
+            remote_cargo_pooled_target_dir_name(
+                &worker,
+                root,
+                Some(&tc),
+                "cargo build --features serde"
+            ),
+            "feature change must invalidate"
+        );
+        assert_ne!(
+            base,
+            remote_cargo_pooled_target_dir_name(
+                &worker,
+                root,
+                Some(&tc),
+                "cargo build --all-features"
+            ),
+            "--all-features must invalidate"
+        );
+        // Project root.
+        assert_ne!(
+            base,
+            remote_cargo_pooled_target_dir_name(
+                &worker,
+                Path::new("/data/projects/other"),
+                Some(&tc),
+                "cargo build"
+            ),
+            "project change must invalidate (no cross-project contamination)"
+        );
+    }
+
+    #[test]
+    fn test_pooled_target_dir_name_shape_is_single_segment_and_reapable() {
+        // (d) The name has no `/` (so `with_remote_cargo_target_dir_name` accepts
+        // it) and keeps the `.rch-target-…-pool-…` shape the reaper recognizes.
+        let _guard = test_guard!();
+        let worker = rch_common::WorkerId::new("ts2");
+        let root = Path::new("/data/projects/acme");
+        let tc = ToolchainInfo::new("nightly", Some("2025-11-01".to_string()), "x");
+        let name = remote_cargo_pooled_target_dir_name(&worker, root, Some(&tc), "cargo build");
+
+        assert!(
+            !name.contains('/'),
+            "pooled name must be a single segment: {name}"
+        );
+        assert!(
+            name.starts_with(".rch-target-"),
+            "must keep the reaper-recognized prefix: {name}"
+        );
+        assert!(
+            name.contains("-pool-"),
+            "must carry the -pool- marker the reaper globs match: {name}"
+        );
+        assert!(
+            rch_common::stale_target_reap::is_safe_reap_token(&name),
+            "pooled name must be reap-token-safe: {name}"
+        );
+    }
+
+    #[test]
+    fn test_target_reuse_opt_out_restores_unique_per_job_name() {
+        // (c) The opt-out predicate is honored; under opt-out the legacy
+        // unique-per-job name is used (distinct per call, distinct from pooled).
+        let _guard = test_guard!();
+        // Predicate: truthy values disable reuse; falsy/unset keep it on.
+        assert!(target_reuse_disabled_from_value(Some("1".to_string())));
+        assert!(target_reuse_disabled_from_value(Some("true".to_string())));
+        assert!(target_reuse_disabled_from_value(Some("YES".to_string())));
+        assert!(!target_reuse_disabled_from_value(None));
+        assert!(!target_reuse_disabled_from_value(Some("0".to_string())));
+        assert!(!target_reuse_disabled_from_value(Some("false".to_string())));
+        assert!(!target_reuse_disabled_from_value(Some(String::new())));
+
+        // The fallback path (unique-per-job) is non-pooled and unique per call.
+        let worker = rch_common::WorkerId::new("ts2");
+        let root = Path::new("/data/projects/acme");
+        let tc = ToolchainInfo::new("nightly", Some("2025-11-01".to_string()), "x");
+        let pooled = remote_cargo_pooled_target_dir_name(&worker, root, Some(&tc), "cargo build");
+        let unique_a = remote_cargo_target_dir_name(Some(7), &worker);
+        let unique_b = remote_cargo_target_dir_name(Some(7), &worker);
+        assert_ne!(unique_a, unique_b, "opt-out name is unique per invocation");
+        assert_ne!(
+            pooled, unique_a,
+            "opt-out name differs from the pooled name"
+        );
+        assert!(
+            !unique_a.contains("-pool-"),
+            "opt-out name is not a pool dir"
+        );
+    }
+
+    #[test]
+    fn test_feature_and_triple_parsing_from_command() {
+        let _guard = test_guard!();
+        // --features list (comma-separated), the `=` form, and `-F`. The command
+        // is a whitespace-tokenized string, so a single `--features` value is a
+        // comma list (`a,b`); a space-separated `--features a b` lists `a` and
+        // takes `b` as the next positional only if it follows the flag directly,
+        // so we use the comma form (cargo's own canonical multi-feature syntax).
+        assert_eq!(
+            feature_set_for_command("cargo build --features a,b --features=c,d -F e"),
+            vec!["a", "b", "c", "d", "e"]
+        );
+        assert!(
+            feature_set_for_command("cargo build --all-features")
+                .iter()
+                .any(|f| f == "__rch_all_features")
+        );
+        assert!(
+            feature_set_for_command("cargo build --no-default-features")
+                .iter()
+                .any(|f| f == "__rch_no_default_features")
+        );
+
+        // Triple: explicit wins, else host default (stable, non-empty).
+        assert_eq!(
+            target_triple_for_command("cargo build --target wasm32-unknown-unknown"),
+            "wasm32-unknown-unknown"
+        );
+        assert_eq!(
+            target_triple_for_command("cargo build --target=aarch64-apple-darwin"),
+            "aarch64-apple-darwin"
+        );
+        let host = target_triple_for_command("cargo build");
+        assert!(!host.is_empty(), "host triple fallback must be non-empty");
+        assert_eq!(
+            host,
+            target_triple_for_command("cargo build"),
+            "host triple fallback must be stable"
+        );
+    }
+
+    #[test]
+    fn test_kind_produces_transferable_artifacts() {
+        let _guard = test_guard!();
+        // Build/doc/rustc + C/C++/build-system kinds produce required artifacts.
+        for kind in [
+            CompilationKind::CargoBuild,
+            CompilationKind::CargoDoc,
+            CompilationKind::Rustc,
+            CompilationKind::Gcc,
+            CompilationKind::Make,
+            CompilationKind::CmakeBuild,
+            CompilationKind::Ninja,
+        ] {
+            assert!(
+                kind_produces_transferable_artifacts(Some(kind)),
+                "{kind:?} must be artifact-producing"
+            );
+        }
+        // Test/diagnostic kinds stream their results; no required artifact.
+        for kind in [
+            CompilationKind::CargoTest,
+            CompilationKind::CargoNextest,
+            CompilationKind::CargoBench,
+            CompilationKind::CargoCheck,
+            CompilationKind::CargoClippy,
+            CompilationKind::BunTest,
+            CompilationKind::BunTypecheck,
+        ] {
+            assert!(
+                !kind_produces_transferable_artifacts(Some(kind)),
+                "{kind:?} must NOT be treated as artifact-producing"
+            );
+        }
+        assert!(!kind_produces_transferable_artifacts(None));
+    }
+
     #[test]
     fn test_add_cargo_isolation_skips_non_cargo_commands() {
         let _guard = test_guard!();
@@ -11748,6 +12282,111 @@ edition = "2024"
         );
     }
 
+    /// Issue #19 Fix 1: a SUCCESSFUL remote compile whose artifacts fail to sync
+    /// back must NOT report exit 0 for an artifact-producing kind — the local
+    /// build is incomplete, so the hook returns a non-zero, build-failure-class
+    /// code. (A test/diagnostic kind, which streams its output and needs no local
+    /// artifact, still returns the remote exit code on the same failure.)
+    #[tokio::test]
+    #[serial(mock_global)]
+    async fn test_artifact_sync_failure_fails_an_artifact_producing_build() {
+        let _lock = test_lock().lock().await;
+        let _guard = test_guard!();
+
+        let socket_path = format!(
+            "/tmp/rch_test_artifact_fail_{}_{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be after epoch")
+                .as_nanos()
+        );
+
+        // Mock SSH succeeds (remote compile exit 0) but rsync artifact retrieval
+        // ALWAYS fails — exactly the silent-footgun scenario.
+        let _overrides = TestOverridesGuard::set(
+            &socket_path,
+            MockConfig::default(),
+            MockRsyncConfig::artifact_failure(),
+        );
+        mock::clear_global_invocations();
+
+        let (temp_dir, policy) = topology_tempdir();
+        let project_dir = temp_dir.path().join("remote_compilation_helper");
+        std::fs::create_dir_all(&project_dir).expect("create project dir");
+
+        let prev_cwd = std::env::current_dir().ok();
+        std::env::set_current_dir(&project_dir).expect("cd into project dir");
+
+        let worker = SelectedWorker {
+            id: rch_common::WorkerId::new("mock-worker"),
+            host: "mock.host.local".to_string(),
+            user: "mockuser".to_string(),
+            identity_file: "~/.ssh/mock_key".to_string(),
+            slots_available: 8,
+            speed_score: 90.0,
+        };
+        let reporter = HookReporter::new(OutputVisibility::None);
+
+        // Artifact-producing kind (cargo build): a failed sync-back is FATAL.
+        let build = execute_remote_compilation(
+            &worker,
+            "cargo build",
+            TransferConfig::default(),
+            Vec::new(),
+            None,
+            &rch_common::CompilationConfig::default(),
+            None,
+            Some(CompilationKind::CargoBuild),
+            &reporter,
+            &socket_path,
+            ColorMode::Auto,
+            None,
+            &policy,
+        )
+        .await;
+
+        // Test kind (cargo test): output streamed, no required artifact — the
+        // remote exit code (0) is preserved despite the same artifact failure.
+        mock::clear_global_invocations();
+        let test_run = execute_remote_compilation(
+            &worker,
+            "cargo test",
+            TransferConfig::default(),
+            Vec::new(),
+            None,
+            &rch_common::CompilationConfig::default(),
+            None,
+            Some(CompilationKind::CargoTest),
+            &reporter,
+            &socket_path,
+            ColorMode::Auto,
+            None,
+            &policy,
+        )
+        .await;
+
+        if let Some(prev) = prev_cwd {
+            let _ = std::env::set_current_dir(prev);
+        }
+
+        let build = build.expect("remote execution should return Ok in mock mode");
+        assert_ne!(
+            build.exit_code, 0,
+            "a successful compile with a failed artifact sync-back must NOT exit 0"
+        );
+        assert_eq!(
+            build.exit_code, EXIT_ARTIFACT_TRANSFER_FAILED,
+            "artifact-transfer failure must surface the build-failure-class exit code"
+        );
+
+        let test_run = test_run.expect("remote execution should return Ok in mock mode");
+        assert_eq!(
+            test_run.exit_code, 0,
+            "cargo test streams its output; a missing artifact must not fail it"
+        );
+    }
+
     #[tokio::test]
     #[serial(mock_global)]
     async fn test_cargo_test_delegates_to_rch_exec() {
@@ -12328,11 +12967,129 @@ edition = "2024"
     }
 
     #[test]
-    fn test_custom_target_artifact_patterns_for_build_commands_keep_full_target() {
+    fn test_custom_target_artifact_patterns_for_build_commands_capture_outputs_only() {
+        let _guard = test_guard!();
+        for kind in [
+            CompilationKind::CargoBuild,
+            CompilationKind::CargoDoc,
+            CompilationKind::Rustc,
+        ] {
+            let patterns = get_custom_target_artifact_patterns(Some(kind));
+
+            // No longer the firehose: must NOT sync the entire per-job target dir.
+            assert!(
+                !patterns.iter().any(|p| p == "**"),
+                "{kind:?}: build sync-back must not pull the whole target dir"
+            );
+            // The sync root IS the remote target dir, so patterns are already
+            // rooted there — never re-prefixed with `target/`.
+            assert!(
+                !patterns.iter().any(|p| p.starts_with("target/")),
+                "{kind:?}: custom-target patterns must be target-dir-relative: {patterns:?}"
+            );
+
+            // Build OUTPUTS are retained: final binaries/libs under `<profile>/`
+            // (and the crate's own artifacts under `<profile>/deps`, which
+            // `debug/**`/`release/**` cover). The final binary lives directly
+            // under `<profile>/`, so the profile globs MUST be present.
+            assert!(
+                patterns.iter().any(|p| p == "debug/**"),
+                "{kind:?}: must retain debug profile outputs (incl. the binary): {patterns:?}"
+            );
+            assert!(
+                patterns.iter().any(|p| p == "release/**"),
+                "{kind:?}: must retain release profile outputs (incl. the binary): {patterns:?}"
+            );
+
+            // Cache trees are EXCLUDED via `- <pat>` rules (emitted as rsync
+            // `--exclude` before the includes).
+            for needle in ["incremental/", ".fingerprint/", "build/", "*.d"] {
+                assert!(
+                    patterns
+                        .iter()
+                        .any(|p| p.starts_with("- ") && p.contains(needle)),
+                    "{kind:?}: must exclude cargo cache tree {needle:?}: {patterns:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_custom_target_patterns_match_a_binary_but_not_cache() {
+        // Verify against a realistic remote target layout that the output globs
+        // match the final binary under `<profile>/` while the exclude rules drop
+        // the cache trees. Mirrors how the rsync filter chain evaluates them:
+        // an explicit `- <pat>` exclude wins over a later `debug/**` include.
         let _guard = test_guard!();
         let patterns = get_custom_target_artifact_patterns(Some(CompilationKind::CargoBuild));
 
-        assert_eq!(patterns, vec!["**".to_string()]);
+        let (excludes, includes): (Vec<&String>, Vec<&String>) =
+            patterns.iter().partition(|p| p.starts_with("- "));
+        let exclude_payloads: Vec<&str> = excludes
+            .iter()
+            .map(|p| p.trim_start_matches("- "))
+            .collect();
+
+        // Helper mirroring rsync first-match-wins: an exclude rule that matches
+        // the path wins (the excludes are emitted before the includes); otherwise
+        // an include glob decides. Directory excludes (`<dir>/`, `*/<dir>/`) match
+        // any path containing that segment; `*.d` matches by suffix.
+        let excluded = |path: &str| -> bool {
+            exclude_payloads.iter().any(|ex| {
+                if let Some(dir) = ex.strip_suffix('/') {
+                    let segment = dir.trim_start_matches("*/");
+                    path.split('/').any(|comp| comp == segment)
+                } else if let Some(suffix) = ex.strip_prefix('*') {
+                    path.ends_with(suffix)
+                } else {
+                    path == *ex
+                }
+            })
+        };
+        let included = |path: &str| -> bool {
+            if excluded(path) {
+                return false;
+            }
+            includes.iter().any(|inc| {
+                if let Some(prefix) = inc.strip_suffix("/**") {
+                    path.starts_with(&format!("{prefix}/"))
+                } else {
+                    path == inc.as_str()
+                }
+            })
+        };
+
+        // The final binary (directly under the profile dir) IS retrieved.
+        assert!(
+            included("debug/my_app"),
+            "the final debug binary must be synced back: {patterns:?}"
+        );
+        assert!(
+            included("release/my_app"),
+            "the final release binary must be synced back: {patterns:?}"
+        );
+        // The crate's compiled deps artifacts ARE retrieved.
+        assert!(
+            included("debug/deps/libmy_app.rlib"),
+            "crate deps artifacts must be synced back: {patterns:?}"
+        );
+        // Cache trees are NOT retrieved.
+        assert!(
+            !included("debug/incremental/foo/bar.bin"),
+            "incremental cache must not be synced back: {patterns:?}"
+        );
+        assert!(
+            !included("debug/.fingerprint/my_app/lib.json"),
+            ".fingerprint cache must not be synced back: {patterns:?}"
+        );
+        assert!(
+            !included("debug/build/somecrate/out/generated.rs"),
+            "build-script cache must not be synced back: {patterns:?}"
+        );
+        assert!(
+            !included("debug/deps/my_app.d"),
+            "dep (*.d) files must not be synced back: {patterns:?}"
+        );
     }
 
     // =========================================================================

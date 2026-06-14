@@ -100,6 +100,35 @@ fn anchor_retrieval_pattern(pattern: &str) -> String {
     format!("/{}", pattern)
 }
 
+/// An artifact-pattern entry that begins with the rsync-style `- ` marker is an
+/// EXCLUDE rule, not an include. Returns the exclude payload (the text after the
+/// marker) so the retrieve builders can emit it as `--exclude` BEFORE the include
+/// rules — rsync evaluates filter rules in order with first-match-wins, so an
+/// up-front exclude (e.g. cargo's `incremental/`/`.fingerprint/`/`build/` cache
+/// trees, `*.d` dep files) keeps those bytes from ever transferring even though a
+/// broad include like `debug/**` would otherwise match them. See
+/// `hook::CARGO_TARGET_CACHE_EXCLUDES`.
+fn artifact_pattern_exclude(pattern: &str) -> Option<&str> {
+    pattern.strip_prefix("- ")
+}
+
+/// Partition an artifact-pattern list into `(excludes, includes)`. Exclude
+/// entries (`- <pat>`) yield their bare payload (the `- ` marker stripped);
+/// everything else is an include pattern, preserved verbatim and in order. The
+/// include list is what the existing root/source-integrity helpers consume, so
+/// they never mistake an exclude marker for an artifact root.
+fn partition_artifact_filters(artifact_patterns: &[String]) -> (Vec<String>, Vec<String>) {
+    let mut excludes = Vec::new();
+    let mut includes = Vec::new();
+    for pattern in artifact_patterns {
+        match artifact_pattern_exclude(pattern) {
+            Some(payload) => excludes.push(payload.to_string()),
+            None => includes.push(pattern.clone()),
+        }
+    }
+    (excludes, includes)
+}
+
 /// Compute the set of "allowed top-level roots" implied by anchored
 /// artifact patterns. Used to build the `--exclude` belt-and-suspenders
 /// for retrieval: anything at the rsync transfer root that ISN'T in this
@@ -1974,10 +2003,23 @@ fi",
         // empty parents of excluded files (side effect of --include="*/")
         cmd.arg("--prune-empty-dirs");
 
+        // Split caller-supplied EXCLUDE rules (`- <pat>`) from INCLUDE patterns.
+        // Excludes (e.g. cargo cache trees in a custom-target sync) must be emitted
+        // first so rsync's first-match-wins ordering keeps them from transferring;
+        // only the include patterns feed the root/source-integrity helpers below.
+        let (caller_excludes, include_patterns) = partition_artifact_filters(artifact_patterns);
+
         // Apply retrieval-safe excludes before the directory include so rsync
         // never descends into known junk trees like `.beads/recovery_*` on the
         // worker, while still allowing traversal into declared artifact roots.
-        for pattern in self.get_retrieval_excludes(artifact_patterns) {
+        for pattern in self.get_retrieval_excludes(&include_patterns) {
+            cmd.arg("--exclude").arg(pattern);
+        }
+
+        // Caller-supplied excludes (cargo `incremental/`, `.fingerprint/`,
+        // `build/`, `*.d`, …) — emitted before the includes so a broad output
+        // include like `debug/**` cannot drag the cache trees back.
+        for pattern in &caller_excludes {
             cmd.arg("--exclude").arg(pattern);
         }
 
@@ -1987,8 +2029,8 @@ fi",
         // includes, or a stale remote tree pulling source files into the local
         // checkout. The excludes are emitted BEFORE the directory include so
         // rsync evaluates them first and refuses to descend into source dirs.
-        let allowed_roots = allowed_artifact_roots(artifact_patterns);
-        for exclude in self.local_source_roots_to_exclude(&allowed_roots, artifact_patterns) {
+        let allowed_roots = allowed_artifact_roots(&include_patterns);
+        for exclude in self.local_source_roots_to_exclude(&allowed_roots, &include_patterns) {
             cmd.arg("--exclude").arg(exclude);
         }
 
@@ -2001,7 +2043,7 @@ fi",
         // transfer root via `anchor_retrieval_pattern` (RCH bug d7xc3) so
         // a pattern like `target/debug/**` cannot match `<root>/anything/
         // target/debug/...` at arbitrary depth.
-        for pattern in artifact_patterns {
+        for pattern in &include_patterns {
             cmd.arg("--include").arg(anchor_retrieval_pattern(pattern));
         }
         cmd.arg("--exclude").arg("*"); // Exclude everything else
@@ -2055,16 +2097,26 @@ fi",
         // Prune empty directories to prevent cluttering local project
         cmd.arg("--prune-empty-dirs");
 
+        // Split caller-supplied EXCLUDE rules (`- <pat>`) from INCLUDE patterns;
+        // see build_retrieve_command for the rationale (first-match-wins ordering).
+        let (caller_excludes, include_patterns) = partition_artifact_filters(artifact_patterns);
+
         // Reuse the retrieval-safe excludes so streaming downloads skip stale
         // worker-local junk trees without excluding legitimate artifact roots.
-        for pattern in self.get_retrieval_excludes(artifact_patterns) {
+        for pattern in self.get_retrieval_excludes(&include_patterns) {
+            cmd.arg("--exclude").arg(pattern);
+        }
+
+        // Caller-supplied excludes (cargo cache trees, `*.d`, …) emitted before
+        // the includes so a broad output include cannot drag them back.
+        for pattern in &caller_excludes {
             cmd.arg("--exclude").arg(pattern);
         }
 
         // Source-integrity guard (RCH bug d7xc3): see build_retrieve_command.
         // Same belt-and-suspenders defense applied to the streaming variant.
-        let allowed_roots = allowed_artifact_roots(artifact_patterns);
-        for exclude in self.local_source_roots_to_exclude(&allowed_roots, artifact_patterns) {
+        let allowed_roots = allowed_artifact_roots(&include_patterns);
+        for exclude in self.local_source_roots_to_exclude(&allowed_roots, &include_patterns) {
             cmd.arg("--exclude").arg(exclude);
         }
 
@@ -2073,7 +2125,7 @@ fi",
 
         // Artifact include patterns are anchored (RCH bug d7xc3) so they can
         // only match at the rsync transfer root.
-        for pattern in artifact_patterns {
+        for pattern in &include_patterns {
             cmd.arg("--include").arg(anchor_retrieval_pattern(pattern));
         }
         cmd.arg("--exclude").arg("*");
