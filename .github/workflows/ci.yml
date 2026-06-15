@@ -306,7 +306,9 @@ jobs:
         with:
           python-version: '3.11'
       - name: Run benchmarks
-        run: cargo bench -p rch-common --bench classifier -- --save-baseline ci
+        run: |
+          cargo bench -p rch-common --bench classifier -- --save-baseline ci
+          cargo bench -p rch-common --bench remediation_hotpath -- --save-baseline ci
       - name: Verify performance budgets
         run: python3 scripts/check_benchmark_budgets.py
       - name: Upload benchmark results

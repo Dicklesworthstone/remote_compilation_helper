@@ -385,6 +385,44 @@ fn build_coverage_matrix() -> CoverageMatrix {
             has_log_assertion: true,
             gap: None,
         },
+        RequirementRow {
+            id: "REQ-PERF-002".into(),
+            description:
+                "Remediation hot-path performance budgets + regression suite (admit preflight, \
+                 incident append/read, output-mode detection, config load, rejection aggregation)"
+                    .into(),
+            domain: "performance_budget".into(),
+            bead_id: "bd-session-history-remediation-ocv9i.16.7".into(),
+            test_refs: vec![
+                TestRef {
+                    file: "remediation_hotpath_budget_e2e.rs".into(),
+                    name_prefix: "budget_".into(),
+                    tier: "smoke".into(),
+                },
+                TestRef {
+                    file: "remediation_hotpath_budget_e2e.rs".into(),
+                    name_prefix: "remediation_hotpath_budgets_emit_jsonl".into(),
+                    tier: "smoke".into(),
+                },
+                TestRef {
+                    file: "../../scripts/e2e_perf_budgets.sh".into(),
+                    name_prefix: "e2e_perf_budgets".into(),
+                    tier: "smoke".into(),
+                },
+            ],
+            artifact_assertions: vec![
+                "Admit preflight under compilation budget; non-compilation reject under 1ms".into(),
+                "Incident append/read measured with record counts and cold/warm cache cases".into(),
+                "Output-mode detection on the non-compilation budget".into(),
+                "JSONL timing records carry run_id/bead_id/scenario/event/status/\
+                 command_fingerprint/duration_ms/budget_ms/p95_ms/p99_ms/detail"
+                    .into(),
+                "CI cargo-bench gate + waiver mechanism (perf_budget_waivers.json)".into(),
+            ],
+            has_executable_test: true,
+            has_log_assertion: true,
+            gap: None,
+        },
         // ---------------------------------------------------------------
         // Domain: Redaction & Retention
         // ---------------------------------------------------------------
@@ -639,6 +677,7 @@ const KNOWN_TEST_FILES: &[&str] = &[
     "local_remote_parity_e2e.rs",
     "deterministic_replay_e2e.rs",
     "performance_budget_e2e.rs",
+    "remediation_hotpath_budget_e2e.rs",
     "redaction_retention_e2e.rs",
     "contract_drift_e2e.rs",
     "feature_flags_rollout_e2e.rs",

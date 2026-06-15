@@ -1,0 +1,11 @@
+{
+  "schema_version": "1.0.0",
+  "_comment": "Explicit, auditable waivers for performance-budget regressions (bd-session-history-remediation-ocv9i.16.7). The CI/release benchmark gate (scripts/check_benchmark_budgets.py) fails on any budget regression UNLESS a matching active waiver is recorded here with a rationale and owning bead. A waiver demotes a failing benchmark from FAIL to WAIVED (a warning), it never silences a passing one. Keep this list empty in steady state; every entry is a tracked debt.",
+  "_schema": {
+    "benchmark": "budget key or prefix it applies to, e.g. 'remediation/incident_append' or 'remediation/'",
+    "rationale": "why the regression is temporarily acceptable (required, non-empty)",
+    "bead_id": "owning bead that will remove the waiver (required, 'bd-' prefixed)",
+    "expires": "YYYY-MM-DD after which the waiver is inactive and the budget re-gates (required)"
+  },
+  "waivers": []
+}
