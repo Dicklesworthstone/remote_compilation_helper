@@ -1897,6 +1897,43 @@ fn apply_env_overrides_inner(
         }
     }
 
+    // Strict-remote placement controls (bd-...remediation-ocv9i.13.5).
+    //
+    // `RCH_FORCE_REMOTE` was previously read only by `rch admit` and had no
+    // effect on the actual offload decision — a silently-ignored knob. Wire it
+    // to `general.force_remote` (always attempt offload, bypassing the
+    // local-time/speedup heuristics, but still fail open to local).
+    //
+    // `RCH_REQUIRE_REMOTE` keeps its fail-closed meaning (enforced in the hook
+    // via `exec_requires_remote`); it additionally *implies* the force-remote
+    // intent so a required build is never gated away from offload. The two are
+    // distinct and the canonical resolution lives in
+    // `rch_common::placement::resolve_placement`.
+    if let Some(val) = get_env("RCH_FORCE_REMOTE")
+        && let Some(force_remote) = parse_bool(&val)
+    {
+        config.general.force_remote = force_remote;
+        if let Some(ref mut sources) = sources {
+            set_source(
+                sources,
+                "general.force_remote",
+                ConfigValueSource::EnvVar("RCH_FORCE_REMOTE".to_string()),
+            );
+        }
+    }
+    if let Some(val) = get_env("RCH_REQUIRE_REMOTE")
+        && parse_bool(&val) == Some(true)
+    {
+        config.general.force_remote = true;
+        if let Some(ref mut sources) = sources {
+            set_source(
+                sources,
+                "general.force_remote",
+                ConfigValueSource::EnvVar("RCH_REQUIRE_REMOTE".to_string()),
+            );
+        }
+    }
+
     if let Some(val) = get_env("RCH_SOCKET_PATH") {
         config.general.socket_path = val;
         if let Some(ref mut sources) = sources {
@@ -3662,6 +3699,53 @@ remote_speedup_threshold = 1.75
             &ConfigValueSource::EnvVar("RCH_ENABLED".to_string())
         );
         info!("PASS: RCH_ENABLED override applied with source tracking");
+    }
+
+    #[test]
+    fn test_apply_env_overrides_force_remote_no_longer_silently_ignored() {
+        // bd-...remediation-ocv9i.13.5: RCH_FORCE_REMOTE used to be read only by
+        // `rch admit` and had no effect on the offload decision. It now maps to
+        // general.force_remote with source tracking.
+        let _guard = test_guard!();
+        let mut config = RchConfig::default();
+        assert!(!config.general.force_remote, "precondition: default is false");
+        let mut sources = default_sources_map();
+        let mut env_overrides: HashMap<String, String> = HashMap::new();
+        env_overrides.insert("RCH_FORCE_REMOTE".to_string(), "1".to_string());
+
+        apply_env_overrides_inner(&mut config, Some(&mut sources), Some(&env_overrides));
+
+        assert!(
+            config.general.force_remote,
+            "RCH_FORCE_REMOTE=1 must set general.force_remote"
+        );
+        assert_eq!(
+            sources.get("general.force_remote"),
+            Some(&ConfigValueSource::EnvVar("RCH_FORCE_REMOTE".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_apply_env_overrides_require_remote_implies_force_remote() {
+        // RCH_REQUIRE_REMOTE keeps its fail-closed meaning in the hook and also
+        // implies the force-remote intent so a required build is never gated
+        // away from offload.
+        let _guard = test_guard!();
+        let mut config = RchConfig::default();
+        let mut sources = default_sources_map();
+        let mut env_overrides: HashMap<String, String> = HashMap::new();
+        env_overrides.insert("RCH_REQUIRE_REMOTE".to_string(), "true".to_string());
+
+        apply_env_overrides_inner(&mut config, Some(&mut sources), Some(&env_overrides));
+
+        assert!(
+            config.general.force_remote,
+            "RCH_REQUIRE_REMOTE=true must imply general.force_remote"
+        );
+        assert_eq!(
+            sources.get("general.force_remote"),
+            Some(&ConfigValueSource::EnvVar("RCH_REQUIRE_REMOTE".to_string()))
+        );
     }
 
     #[test]

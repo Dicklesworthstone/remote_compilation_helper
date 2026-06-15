@@ -88,6 +88,16 @@
         ]
       }
     },
+    "placement": {
+      "schema_version": "1.0.0",
+      "strict_remote_policy": "off",
+      "queue_policy": "queue_when_busy",
+      "visibility_mode": "default",
+      "target_dir_policy": "pooled",
+      "requested_worker_outcome": {
+        "status": "not_requested"
+      }
+    },
     "dry_run": {
       "would_offload": false,
       "reason": "compilation command meets threshold, but no worker selected: no admissible workers: critical_pressure=1",

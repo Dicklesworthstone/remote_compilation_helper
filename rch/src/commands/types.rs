@@ -5,8 +5,8 @@
 //! and enable easier testing.
 
 use rch_common::{
-    Classification, ClassificationTier, RequiredRuntime, SelectedWorker, SelectionDiagnostics,
-    SelectionReason, WorkerCapabilities, WorkerConfig,
+    Classification, ClassificationTier, PlacementPlan, RequiredRuntime, SelectedWorker,
+    SelectionDiagnostics, SelectionReason, WorkerCapabilities, WorkerConfig,
 };
 use schemars::JsonSchema;
 use serde::Serialize;
@@ -418,6 +418,12 @@ pub struct DiagnoseResponse {
     pub capabilities_warnings: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worker_selection: Option<DiagnoseWorkerSelection>,
+    /// Canonical placement control plan resolved from the environment: the
+    /// requested/effective worker, strict-remote/queue/visibility/wait-timeout
+    /// /target-dir policies, the requested-worker admissibility outcome, and any
+    /// control diagnostics. This is the surface agents should read before
+    /// forcing local/remote behavior (bd-...remediation-ocv9i.13.5).
+    pub placement: PlacementPlan,
     /// Dry-run summary showing the full pipeline (only present when --dry-run is used).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dry_run: Option<DryRunSummary>,

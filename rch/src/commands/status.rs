@@ -18,7 +18,9 @@ use crate::ui::progress::Spinner;
 use crate::ui::theme::{StatusIndicator, Theme};
 use anyhow::{Context, Result};
 use rch_common::{
-    ApiResponse, CommandPriority, RequiredRuntime, normalize_project_path_with_policy,
+    ApiResponse, CommandPriority, PlacementPlan, RequestedWorkerFacts, RequestedWorkerOutcome,
+    RequiredRuntime, evaluate_requested_worker, normalize_project_path_with_policy,
+    resolve_placement,
 };
 use std::path::Path;
 use tracing::debug;
@@ -249,6 +251,83 @@ fn summarize_capabilities(caps: &rch_common::WorkerCapabilities) -> String {
 }
 
 /// Diagnose command classification and selection decisions.
+/// Resolve the canonical placement plan from the environment and refine it with
+/// the simulated worker-selection result. When a worker was explicitly
+/// requested, the requested-worker outcome is evaluated against the daemon's
+/// per-worker selection diagnostics so an inadmissible requested worker yields a
+/// structured refusal instead of a silent swap
+/// (bd-...remediation-ocv9i.13.5).
+fn build_diagnose_placement(worker_selection: &Option<DiagnoseWorkerSelection>) -> PlacementPlan {
+    let mut plan = resolve_placement(|key| std::env::var(key).ok());
+
+    let effective_worker = worker_selection
+        .as_ref()
+        .and_then(|s| s.worker.as_ref())
+        .map(|w| w.id.to_string());
+    plan = plan.with_effective_worker(effective_worker.clone());
+
+    // Refine the requested-worker outcome from the live selection diagnostics.
+    if let Some(requested) = plan.requested_worker.clone() {
+        // A comma list requests several; evaluate the primary (first) entry.
+        let primary = requested
+            .split(',')
+            .map(str::trim)
+            .find(|s| !s.is_empty())
+            .unwrap_or("");
+        let outcome = match worker_selection
+            .as_ref()
+            .and_then(|s| s.diagnostics.as_ref())
+        {
+            Some(diag) => {
+                match diag
+                    .workers
+                    .iter()
+                    .find(|w| w.worker_id.as_str() == primary)
+                {
+                    Some(wd) => {
+                        let facts = RequestedWorkerFacts {
+                            requested: Some(primary.to_string()),
+                            exists: true,
+                            admin_disabled: wd.status.eq_ignore_ascii_case("disabled"),
+                            draining_or_drained: wd.status.to_ascii_lowercase().contains("drain"),
+                            reachable: !wd.status.eq_ignore_ascii_case("unreachable"),
+                            temporarily_bypassed: wd.circuit_state.eq_ignore_ascii_case("open")
+                                || wd.status.to_ascii_lowercase().contains("bypass"),
+                            platform_matches: !wd
+                                .reason_codes
+                                .iter()
+                                .any(|c| c.contains("os_arch") || c.contains("platform")),
+                            has_required_runtime: wd.runtime_available,
+                            project_excluded: wd.active_project_excluded,
+                            has_free_slots: wd.available_slots >= wd.estimated_cores,
+                        };
+                        evaluate_requested_worker(&facts)
+                    }
+                    // Requested worker is not among the configured workers.
+                    None => evaluate_requested_worker(&RequestedWorkerFacts {
+                        requested: Some(primary.to_string()),
+                        exists: false,
+                        ..RequestedWorkerFacts::none()
+                    }),
+                }
+            }
+            // No diagnostics (daemon unreachable / not intercepted): leave the
+            // outcome as "requested, pending fleet evaluation" but record honor
+            // when the effective worker matches the request.
+            None => {
+                if effective_worker.as_deref() == Some(primary) {
+                    evaluate_requested_worker(&RequestedWorkerFacts::admissible(primary))
+                } else {
+                    RequestedWorkerOutcome::requested()
+                }
+            }
+        };
+        plan = plan.with_requested_worker_outcome(outcome);
+    }
+
+    plan
+}
+
 pub async fn diagnose(command: &str, dry_run: bool, ctx: &OutputContext) -> Result<()> {
     use rch_common::classify_command_detailed;
 
@@ -458,6 +537,10 @@ pub async fn diagnose(command: &str, dry_run: bool, ctx: &OutputContext) -> Resu
         }
     }
 
+    // Resolve the canonical placement plan (env controls + requested-worker
+    // admissibility against the simulated selection).
+    let placement = build_diagnose_placement(&worker_selection);
+
     // Build dry-run summary if requested
     let dry_run_summary = if dry_run {
         Some(build_dry_run_summary(
@@ -489,6 +572,7 @@ pub async fn diagnose(command: &str, dry_run: bool, ctx: &OutputContext) -> Resu
             local_capabilities: local_has_any.then(|| local_capabilities.clone()),
             capabilities_warnings: capabilities_warnings.clone(),
             worker_selection,
+            placement: placement.clone(),
             dry_run: dry_run_summary.clone(),
         };
         let _ = ctx.json(&ApiResponse::ok("diagnose", response));
@@ -796,6 +880,87 @@ pub async fn diagnose(command: &str, dry_run: bool, ctx: &OutputContext) -> Resu
             "  {} {}",
             style.key("Skipped:"),
             style.value("Selection unavailable")
+        );
+    }
+    println!();
+
+    println!("{}", style.highlight("Placement Controls"));
+    println!(
+        "  {} {}",
+        style.key("Requested worker:"),
+        style.value(placement.requested_worker.as_deref().unwrap_or("(none)"))
+    );
+    println!(
+        "  {} {}",
+        style.key("Effective worker:"),
+        style.value(placement.effective_worker.as_deref().unwrap_or("(none)"))
+    );
+    if let Some(profile) = placement.requested_profile.as_deref() {
+        println!(
+            "  {} {}",
+            style.key("Requested profile:"),
+            style.value(profile)
+        );
+    }
+    println!(
+        "  {} {}",
+        style.key("Strict remote:"),
+        style.value(placement.strict_remote_policy.as_str())
+    );
+    println!(
+        "  {} {}",
+        style.key("Queue policy:"),
+        style.value(placement.queue_policy.as_str())
+    );
+    println!(
+        "  {} {}",
+        style.key("Visibility:"),
+        style.value(placement.visibility_mode.as_str())
+    );
+    if let Some(ms) = placement.wait_timeout_ms {
+        println!(
+            "  {} {}ms",
+            style.key("Wait timeout:"),
+            style.value(&ms.to_string())
+        );
+    }
+    println!(
+        "  {} {}",
+        style.key("Target dir:"),
+        style.value(placement.target_dir_policy.as_str())
+    );
+    // Requested-worker outcome: honored, refused (with reason + next action),
+    // or not-requested.
+    let outcome = &placement.requested_worker_outcome;
+    if outcome.status.is_refusal() {
+        println!(
+            "  {} {} {}",
+            style.key("Requested worker:"),
+            style.format_warning(&format!("REFUSED ({})", outcome.status.as_str())),
+            style.muted(
+                &outcome
+                    .reason_code
+                    .as_deref()
+                    .map(|c| format!("[{c}]"))
+                    .unwrap_or_default()
+            )
+        );
+        if let Some(action) = outcome.next_action.as_deref() {
+            println!("    {} {}", style.muted("next:"), style.value(action));
+        }
+    } else {
+        println!(
+            "  {} {}",
+            style.key("Requested-worker outcome:"),
+            style.value(outcome.status.as_str())
+        );
+    }
+    for diag in &placement.diagnostics {
+        println!(
+            "  {} {} {}",
+            StatusIndicator::Warning.display(style),
+            style.muted(&format!("[{}]", diag.control)),
+            style.warning(&diag.message)
         );
     }
 

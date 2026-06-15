@@ -814,6 +814,7 @@ mod tests {
             local_capabilities: None,
             capabilities_warnings: Vec::new(),
             worker_selection: None,
+            placement: rch_common::resolve_placement(|_| None),
             dry_run: None,
         };
 
@@ -1291,6 +1292,7 @@ mod tests {
             local_capabilities: None,
             capabilities_warnings: Vec::new(),
             worker_selection: Some(worker_selection),
+            placement: rch_common::resolve_placement(|_| None),
             dry_run: Some(dry_run),
         };
 

@@ -48,6 +48,7 @@ pub mod path_topology;
 pub mod patterns;
 #[cfg(test)]
 mod patterns_security_test;
+pub mod placement;
 pub mod pooled_target_key;
 pub mod proof_handoff;
 pub mod proof_intent;
@@ -272,6 +273,12 @@ pub use incident::{
 };
 pub use incident_ledger::{
     IncidentFilter, IncidentLedger, IncidentLedgerConfig, LedgerReadStats, default_ledger_path,
+};
+pub use placement::{
+    ControlDiagnostic, ControlDiagnosticLevel, ControlKind, PlacementControl, PlacementPlan,
+    QueuePolicy, RequestedWorkerFacts, RequestedWorkerOutcome, RequestedWorkerStatus,
+    StrictRemotePolicy, TargetDirPolicy, VisibilityMode, evaluate_requested_worker,
+    placement_controls, resolve_placement,
 };
 pub use proof_intent::{
     ProofIntent, ProofIntentStore, ReplayConstraints, ReplayContext, ReplayDecision,

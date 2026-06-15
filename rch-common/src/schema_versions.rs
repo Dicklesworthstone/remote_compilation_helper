@@ -60,6 +60,9 @@ pub enum SchemaComponent {
     RedactionPolicy,
     /// Operator-facing remediation view rendered by the TUI/web dashboards.
     RemediationView,
+    /// Canonical placement / visibility / strict-remote control plan
+    /// (`rch diagnose` placement surface + `rch exec` control state).
+    PlacementPlan,
 }
 
 /// The canonical version string for a given component.
@@ -81,6 +84,7 @@ pub const fn current_version(component: SchemaComponent) -> &'static str {
         SchemaComponent::WorkerBypassRecord => "1.0.0",
         SchemaComponent::RedactionPolicy => "1.0.0",
         SchemaComponent::RemediationView => "1.0.0",
+        SchemaComponent::PlacementPlan => "1.0.0",
     }
 }
 
@@ -131,6 +135,10 @@ pub const ALL_COMPONENTS: &[(SchemaComponent, &str)] = &[
         SchemaComponent::RemediationView,
         current_version(SchemaComponent::RemediationView),
     ),
+    (
+        SchemaComponent::PlacementPlan,
+        current_version(SchemaComponent::PlacementPlan),
+    ),
 ];
 
 #[cfg(test)]
@@ -156,6 +164,7 @@ mod tests {
         (SchemaComponent::WorkerBypassRecord, "1.0.0"),
         (SchemaComponent::RedactionPolicy, "1.0.0"),
         (SchemaComponent::RemediationView, "1.0.0"),
+        (SchemaComponent::PlacementPlan, "1.0.0"),
     ];
 
     #[test]

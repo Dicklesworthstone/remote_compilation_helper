@@ -2684,7 +2684,7 @@ fn exit_code_capabilities() -> Vec<ExitCodeCapability> {
 }
 
 fn env_var_capabilities() -> Vec<EnvVarCapability> {
-    vec![
+    let mut caps = vec![
         EnvVarCapability {
             name: "RCH_OUTPUT_FORMAT".to_string(),
             effect: "Set machine output format: json or toon; implies machine output.".to_string(),
@@ -2735,7 +2735,26 @@ fn env_var_capabilities() -> Vec<EnvVarCapability> {
             name: "RCH_VISIBILITY".to_string(),
             effect: "Control hook output visibility: none, summary, or verbose.".to_string(),
         },
-    ]
+    ];
+
+    // Append the canonical placement/visibility/strict/queue/wait controls from
+    // the single-source registry so agents discover them instead of relying on
+    // folklore (bd-...remediation-ocv9i.13.5). De-dup against names already
+    // listed above (e.g. RCH_VISIBILITY).
+    for control in rch_common::placement_controls() {
+        if caps.iter().any(|c| c.name == control.canonical_env) {
+            continue;
+        }
+        let mut effect = format!("{} [{}]", control.description, control.value_form);
+        if !control.aliases.is_empty() {
+            effect.push_str(&format!(" (aliases: {})", control.aliases.join(", ")));
+        }
+        caps.push(EnvVarCapability {
+            name: control.canonical_env.to_string(),
+            effect,
+        });
+    }
+    caps
 }
 
 fn recommended_commands() -> Vec<RecommendedCommand> {

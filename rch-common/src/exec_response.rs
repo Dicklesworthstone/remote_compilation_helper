@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use crate::admission_recommendation::{Recommendation, recommend_for_summary};
 use crate::admission_rejection::AdmissionRejectionSummary;
 use crate::exec_policy::ExecDisposition;
-use crate::incident::IncidentReasonCode;
+use crate::incident::{ControlState, IncidentReasonCode};
 
 /// Where a command definitively executed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -71,6 +71,15 @@ pub struct ExecResponse {
     /// Next-action remediation (may be empty on success).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub remediation: Vec<Recommendation>,
+    /// Canonical placement control snapshot (`requested_worker`,
+    /// `strict_remote_policy`, `queue_policy`, `visibility_mode`,
+    /// `wait_timeout_ms`, `target_dir_policy`). Omitted from the wire form when
+    /// no control was explicitly set, so the simple-success contract is
+    /// unchanged. `selected_worker` above is the *effective* worker — the
+    /// pairing of requested-vs-effective is what makes a steered build visible
+    /// rather than a silent swap (bd-...remediation-ocv9i.13.5).
+    #[serde(default, skip_serializing_if = "ControlState::is_empty")]
+    pub control: ControlState,
     /// Concise human/agent-facing detail.
     pub detail: String,
 }
@@ -100,6 +109,7 @@ impl ExecResponse {
             disposition: ExecDisposition::RunRemote,
             proof_mode: false,
             remediation: Vec::new(),
+            control: ControlState::default(),
             detail: "ran on remote worker".to_string(),
         }
     }
@@ -121,6 +131,7 @@ impl ExecResponse {
             disposition: ExecDisposition::RunLocalFallback,
             proof_mode: false,
             remediation: Vec::new(),
+            control: ControlState::default(),
             detail: detail.into(),
         }
     }
@@ -140,6 +151,7 @@ impl ExecResponse {
             disposition: ExecDisposition::Reject,
             proof_mode: true,
             remediation,
+            control: ControlState::default(),
             detail: "proof mode refused before execution".to_string(),
         }
     }
@@ -157,6 +169,7 @@ impl ExecResponse {
             disposition: ExecDisposition::Reject,
             proof_mode: true,
             remediation: Vec::new(),
+            control: ControlState::default(),
             detail: "non-compilation command rejected under proof mode".to_string(),
         }
     }
@@ -174,8 +187,23 @@ impl ExecResponse {
             disposition: ExecDisposition::RunLocalFallback,
             proof_mode: false,
             remediation: Vec::new(),
+            control: ControlState::default(),
             detail: "daemon unreachable; ran locally (fail-open)".to_string(),
         }
+    }
+
+    /// Attach the canonical placement control snapshot.
+    #[must_use]
+    pub fn with_control(mut self, control: ControlState) -> Self {
+        self.control = control;
+        self
+    }
+
+    /// The *effective* worker the command ran on (an alias for
+    /// `selected_worker`, named to pair with the control's `requested_worker`).
+    #[must_use]
+    pub fn effective_worker(&self) -> Option<&str> {
+        self.selected_worker.as_deref()
     }
 }
 
@@ -295,6 +323,37 @@ mod tests {
     fn response_round_trips() {
         let r = ExecResponse::daemon_unavailable();
         let v = serde_json::to_value(&r).unwrap();
+        let back: ExecResponse = serde_json::from_value(v).unwrap();
+        assert_eq!(back, r);
+    }
+
+    #[test]
+    fn empty_control_is_omitted_from_wire() {
+        // The simple-success contract is unchanged: with no explicit controls,
+        // the `control` block does not appear in the JSON.
+        let r = ExecResponse::remote_success("css", "cargo_build");
+        let v = serde_json::to_value(&r).unwrap();
+        assert!(v.get("control").is_none(), "empty control must be omitted");
+    }
+
+    #[test]
+    fn control_snapshot_round_trips_and_pairs_requested_with_effective() {
+        use crate::incident::ControlState;
+        let r = ExecResponse::remote_success("ovh-a", "cargo_test").with_control(ControlState {
+            requested_worker: Some("css".to_string()),
+            strict_remote_policy: true,
+            queue_policy: Some("no_queue".to_string()),
+            ..ControlState::default()
+        });
+        assert_invariant(&r);
+        // selected_worker is the effective worker; the control carries what was
+        // requested — a steered build is therefore visible, not silent.
+        assert_eq!(r.effective_worker(), Some("ovh-a"));
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["selected_worker"], "ovh-a");
+        assert_eq!(v["control"]["requested_worker"], "css");
+        assert_eq!(v["control"]["strict_remote_policy"], true);
+        assert_eq!(v["control"]["queue_policy"], "no_queue");
         let back: ExecResponse = serde_json::from_value(v).unwrap();
         assert_eq!(back, r);
     }

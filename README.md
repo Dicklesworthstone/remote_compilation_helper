@@ -368,6 +368,34 @@ JSON responses use a stable envelope (`api_version`, `timestamp`, `success`, `da
 
 ---
 
+## Placement Controls
+
+Worker placement, strict-remote, queue, wait-timeout, visibility, and target-dir
+behavior are first-class, canonical controls — not folklore. The authoritative
+list is discoverable at runtime (`rch capabilities --json`), and the resolved
+plan for any command is shown by `rch diagnose <command> --json` under
+`data.placement` (and in the human `Placement Controls` section):
+
+| Control | Env (aliases) | Effect |
+|---|---|---|
+| Requested worker | `RCH_WORKER` (`RCH_WORKERS`) | Request specific worker(s) by id. Still passes capability/admission checks; an inadmissible requested worker is **refused** with a stable `RCH-Innn` reason code and a next action — never silently swapped. |
+| Requested profile | `RCH_PRESET` | Named execution profile (recorded as `requested_profile`). |
+| Strict remote (fail-closed) | `RCH_REQUIRE_REMOTE` | Refuse local fallback (proof mode). Takes precedence over `RCH_FORCE_REMOTE`. |
+| Force remote (fail-open) | `RCH_FORCE_REMOTE` | Always attempt offload (bypass local-time/speedup gating) but still fail open to local. Distinct from `RCH_REQUIRE_REMOTE`. |
+| Queue when busy | `RCH_QUEUE_WHEN_BUSY` (default `1`) | Wait for a busy worker instead of falling back to local. Set `0` to disable. |
+| Wait timeout | `RCH_DAEMON_WAIT_RESPONSE_TIMEOUT_SECS` (`RCH_DAEMON_RESPONSE_TIMEOUT_SECS`) | Max seconds to wait for a queued worker. |
+| Visibility | `RCH_VISIBILITY=none\|summary\|verbose` (`RCH_QUIET`, `RCH_VERBOSE`) | Hook output verbosity. |
+| Target dir | `RCH_DISABLE_TARGET_REUSE` | Legacy unique-per-job remote target dir instead of the pooled, reuse-friendly dir. |
+
+The resolved plan reports `requested_worker`, `requested_profile`,
+`effective_worker`, `strict_remote_policy`, `queue_policy`, `visibility_mode`,
+`wait_timeout_ms`, `target_dir_policy`, the requested-worker admissibility
+outcome, and a `diagnostics` list. Any control value that cannot be applied as
+written (an unrecognized value or a superseded alias) surfaces a diagnostic
+rather than being silently ignored.
+
+---
+
 ## Monitoring and Observability
 
 RCH exposes observability through daemon APIs and metrics:

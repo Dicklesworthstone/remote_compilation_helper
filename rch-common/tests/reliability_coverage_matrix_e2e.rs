@@ -789,6 +789,59 @@ fn build_coverage_matrix() -> CoverageMatrix {
             has_log_assertion: true,
             gap: None,
         },
+        RequirementRow {
+            id: "REQ-PLACEMENT-001".into(),
+            description: "First-class placement / visibility / strict-remote controls: a canonical \
+                          control registry + pure env->PlacementPlan resolver that never silently \
+                          drops a knob (RCH_FORCE_REMOTE vs RCH_REQUIRE_REMOTE force-vs-require, \
+                          queue-when-busy, wait timeout, visibility, target-dir), and a \
+                          requested-worker admissibility evaluator that yields a structured refusal \
+                          (reason code + next action) instead of a silent worker swap. Surfaced via \
+                          `rch diagnose` (JSON + human) and `rch capabilities`"
+                .into(),
+            domain: "ux_quality".into(),
+            bead_id: "bd-session-history-remediation-ocv9i.13.5".into(),
+            test_refs: vec![
+                TestRef {
+                    // Golden wire-form + schema pin for PlacementPlan and the
+                    // requested-worker refusal vocabulary.
+                    file: "placement_golden_e2e.rs".into(),
+                    name_prefix: "golden_".into(),
+                    tier: "smoke".into(),
+                },
+                TestRef {
+                    // Pure resolver + admissibility evaluator unit tests.
+                    file: "../src/placement.rs".into(),
+                    name_prefix: "evaluate_".into(),
+                    tier: "smoke".into(),
+                },
+                TestRef {
+                    // E2E runner: env-control scenarios over `rch diagnose --json`.
+                    file: "../../scripts/e2e_placement_controls.sh".into(),
+                    name_prefix: "e2e_placement_controls".into(),
+                    tier: "smoke".into(),
+                },
+            ],
+            artifact_assertions: vec![
+                "RCH_FORCE_REMOTE resolves to force_remote (fail-open) and RCH_REQUIRE_REMOTE to \
+                 require_remote (fail-closed); both-set yields a precedence diagnostic"
+                    .into(),
+                "Each requested-worker refusal class (unavailable, admin_disabled, \
+                 temporarily_bypassed, wrong_platform, missing_runtime, project_excluded, \
+                 no_free_slots) maps to a stable RCH-Innn reason code and a next action"
+                    .into(),
+                "Unrecognized / superseded control values surface a diagnostic rather than being \
+                 silently ignored"
+                    .into(),
+                "E2E JSONL emitted with run_id, bead_id, command, requested_worker, \
+                 effective_worker, strict_remote_policy, queue_policy, visibility_mode, status, \
+                 reason_code, duration_ms, and detail"
+                    .into(),
+            ],
+            has_executable_test: true,
+            has_log_assertion: true,
+            gap: None,
+        },
     ];
 
     let total = requirements.len();
