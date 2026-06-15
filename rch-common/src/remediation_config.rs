@@ -35,6 +35,8 @@ use schemars::{JsonSchema, schema_for};
 
 use crate::incident_ledger::{IncidentLedgerConfig, default_ledger_path};
 use crate::proof_intent::{ReplayConstraints, StaleSourcePolicy};
+// Single source of truth for path masking lives in the shared redaction policy.
+use crate::redaction::redact_path;
 
 // ── Canonical default constants ──────────────────────────────────────────────
 //
@@ -904,27 +906,6 @@ fn check_managed_path(field: &str, path: &str, issues: &mut Vec<RemediationIssue
             ),
         ));
     }
-}
-
-/// Mask the home/user segment of a path so it is safe to print.
-///
-/// Pure and env-independent for stable golden output: `/home/<user>/x` →
-/// `/home/<redacted>/x`, `/Users/<user>/x` → `/Users/<redacted>/x`, and a
-/// leading `~` is preserved.
-#[must_use]
-fn redact_path(path: &str) -> String {
-    for marker in ["/home/", "/Users/"] {
-        if let Some(rest_start) = path.find(marker) {
-            let (head, tail) = path.split_at(rest_start + marker.len());
-            // `tail` begins with the username segment; mask up to the next `/`.
-            let masked_tail = match tail.find('/') {
-                Some(slash) => format!("<redacted>{}", &tail[slash..]),
-                None => "<redacted>".to_string(),
-            };
-            return format!("{head}{masked_tail}");
-        }
-    }
-    path.to_string()
 }
 
 // ── Conversions into rch-common runtime structs ──────────────────────────────
