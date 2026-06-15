@@ -1266,6 +1266,7 @@ pub async fn status_overview(
     workers: bool,
     jobs: bool,
     fleet: bool,
+    remediation: bool,
     ctx: &OutputContext,
 ) -> Result<()> {
     use crate::status_types::{
@@ -1289,6 +1290,23 @@ pub async fn status_overview(
             let _ = ctx.json(&ApiResponse::ok("status-fleet", &report));
         } else {
             crate::status_display::render_fleet_status(&report, ctx.style());
+        }
+        return Ok(());
+    }
+
+    // `--remediation`: the operator-facing remediation view assembled by the
+    // daemon (single source of truth). Falls back to a CLI-side assembly only
+    // when talking to a daemon that predates the field
+    // (bd-session-history-remediation-ocv9i.14.4).
+    if remediation {
+        let view = status
+            .remediation
+            .clone()
+            .unwrap_or_else(|| build_remediation_view_from_status(&status));
+        if ctx.is_json() {
+            let _ = ctx.json(&ApiResponse::ok("status-remediation", &view));
+        } else {
+            crate::status_display::render_remediation_view(&view, ctx.style());
         }
         return Ok(());
     }
@@ -1470,6 +1488,89 @@ fn build_fleet_status_report(
     }
 
     compute_fleet_status(&signals, DEFAULT_ABSENCE_THRESHOLD_SECS)
+}
+
+/// Assemble the operator-facing remediation view (bd-..14.4) from the daemon
+/// status response. This is only the CLI-side fallback for a daemon that
+/// predates the `remediation` status field — the daemon is the authoritative
+/// source; both call the same pure `rch_common` assembler so the result is
+/// identical regardless of where the inputs are gathered.
+fn build_remediation_view_from_status(
+    status: &DaemonFullStatusResponse,
+) -> rch_common::remediation_view::RemediationView {
+    use rch_common::bypass_record::BypassState;
+    use rch_common::fleet_diff::WorkerObservation;
+    use rch_common::fleet_status::DEFAULT_ABSENCE_THRESHOLD_SECS;
+    use rch_common::remediation_view::{
+        DiskLevel, JobsInput, MAX_VIEW_INCIDENTS, ProofQueueInput, RemediationIncidentLine,
+        RemediationWorkerRow, assemble, build_inputs,
+    };
+
+    let rows: Vec<RemediationWorkerRow> = status
+        .workers
+        .iter()
+        .map(|w| {
+            let facts_known = w.pressure_state.as_deref() != Some("telemetry_gap");
+            RemediationWorkerRow {
+                observation: WorkerObservation {
+                    worker_id: w.id.clone(),
+                    configured: true,
+                    in_daemon_pool: true,
+                    reachable: w.status != "unreachable",
+                    admin_disabled: w.status == "disabled",
+                    temporarily_bypassed: w.bypass.is_some(),
+                    facts_known,
+                    command_admissible: true,
+                },
+                disk_level: DiskLevel::from_pressure_state(
+                    w.pressure_state.as_deref().unwrap_or(""),
+                ),
+                reclaiming: false,
+                free_ratio: w.pressure_disk_free_ratio,
+                slots_used: w.used_slots,
+                slots_total: w.total_slots,
+                telemetry_known: facts_known,
+                telemetry_fresh: w.pressure_telemetry_fresh.unwrap_or(false),
+                telemetry_age_secs: w.pressure_telemetry_age_secs,
+                recovered_pending_canary: w
+                    .bypass
+                    .as_ref()
+                    .is_some_and(|b| b.state == BypassState::RecoveredPendingCanary),
+                absent_secs: None,
+            }
+        })
+        .collect();
+
+    let jobs = JobsInput {
+        active: status.active_builds.len(),
+        queued: status.queued_builds.len(),
+        stuck: 0,
+    };
+
+    let incidents: Vec<RemediationIncidentLine> = status
+        .alerts
+        .iter()
+        .filter(|a| a.state == "active")
+        .take(MAX_VIEW_INCIDENTS)
+        .map(|a| {
+            RemediationIncidentLine::new(
+                a.kind.clone(),
+                "alert",
+                a.worker_id.clone(),
+                0,
+                &a.message,
+            )
+        })
+        .collect();
+
+    let inputs = build_inputs(
+        &rows,
+        jobs,
+        ProofQueueInput::default(),
+        incidents,
+        DEFAULT_ABSENCE_THRESHOLD_SECS,
+    );
+    assemble(&inputs, 0)
 }
 
 fn status_overview_section_flags(workers: bool, jobs: bool, ctx: &OutputContext) -> (bool, bool) {

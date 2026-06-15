@@ -737,6 +737,58 @@ fn build_coverage_matrix() -> CoverageMatrix {
             has_log_assertion: true,
             gap: None,
         },
+        RequirementRow {
+            id: "REQ-UX-002".into(),
+            description: "Human dashboard TUI + web remediation views: compact status bands \
+                          (desired/live fleet, admissibility, proof queue, jobs, disk pressure, \
+                          telemetry freshness, recent incidents) each tagged operator-action / \
+                          self-healing / normal-fail-open, assembled once by the daemon and \
+                          rendered identically by TUI, CLI, and web with no secret leakage"
+                .into(),
+            domain: "ux_quality".into(),
+            bead_id: "bd-session-history-remediation-ocv9i.14.4".into(),
+            test_refs: vec![
+                TestRef {
+                    // Golden + dashboard-data-adapter + no-leak checks for the
+                    // pure assembler (rch_common::remediation_view).
+                    file: "remediation_view_golden_e2e.rs".into(),
+                    name_prefix: "dashboard_states_have_expected_posture".into(),
+                    tier: "smoke".into(),
+                },
+                TestRef {
+                    file: "remediation_view_golden_e2e.rs".into(),
+                    name_prefix: "no_secret_leaks_across_render_modes".into(),
+                    tier: "smoke".into(),
+                },
+                TestRef {
+                    // TUI overlay snapshot tests for the seven mandated states.
+                    file: "../../rch/src/tui/widgets.rs".into(),
+                    name_prefix: "test_remediation_overlay_".into(),
+                    tier: "smoke".into(),
+                },
+                TestRef {
+                    // E2E runner: dump-state view, redaction, CLI envelope, web surface.
+                    file: "../../scripts/e2e_remediation_views.sh".into(),
+                    name_prefix: "e2e_remediation_views".into(),
+                    tier: "smoke".into(),
+                },
+            ],
+            artifact_assertions: vec![
+                "All eight remediation bands render in canonical order on TUI, CLI, and web".into(),
+                "Each band and the overall posture is classified operator-action / self-healing / \
+                 normal-fail-open and the seven dashboard states map to the expected class"
+                    .into(),
+                "No hostnames, SSH users, filesystem paths, or secret-shaped values appear in the \
+                 serialized view across JSON (pretty/compact) and Debug renderings"
+                    .into(),
+                "E2E JSONL emitted with run_id, bead_id, scenario, event, status, route_or_view, \
+                 reason_code, duration_ms, and detail"
+                    .into(),
+            ],
+            has_executable_test: true,
+            has_log_assertion: true,
+            gap: None,
+        },
     ];
 
     let total = requirements.len();

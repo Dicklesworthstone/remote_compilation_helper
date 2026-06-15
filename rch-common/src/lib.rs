@@ -60,6 +60,7 @@ pub mod queue_contract;
 pub mod readiness;
 pub mod redaction;
 pub mod remediation_config;
+pub mod remediation_view;
 #[cfg(unix)]
 pub mod remote_compilation;
 #[cfg(unix)]

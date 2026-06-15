@@ -226,6 +226,10 @@ fn state_to_json(state: &TuiState) -> serde_json::Value {
         "high_contrast": state.high_contrast,
         "color_blind": state.color_blind,
         "error": &state.error,
+        // Operator-facing remediation snapshot (bd-..14.4): present in the
+        // dump-state automation surface so dashboards/scripts can read the same
+        // redacted view the interactive overlay renders.
+        "remediation": &state.remediation,
     })
 }
 
@@ -305,10 +309,67 @@ fn apply_mock_data(state: &mut TuiState) {
             exit_code: Some(0),
         });
     }
+
+    // Mock remediation snapshot mirroring the two mock workers above
+    // (one healthy, one degraded/bypassed) so `--mock-data` can demo the
+    // remediation overlay without a daemon.
+    state.remediation = Some(build_mock_remediation_view());
+}
+
+/// Build a deterministic remediation view for the `--mock-data` path, assembled
+/// through the real `rch_common` classifier so the demo matches live behavior.
+fn build_mock_remediation_view() -> rch_common::remediation_view::RemediationView {
+    use rch_common::fleet_diff::WorkerObservation;
+    use rch_common::remediation_view::{
+        DiskLevel, JobsInput, ProofQueueInput, RemediationWorkerRow, assemble, build_inputs,
+    };
+
+    let healthy = |id: &str| RemediationWorkerRow {
+        observation: WorkerObservation {
+            worker_id: id.to_string(),
+            configured: true,
+            in_daemon_pool: true,
+            reachable: true,
+            admin_disabled: false,
+            temporarily_bypassed: false,
+            facts_known: true,
+            command_admissible: true,
+        },
+        disk_level: DiskLevel::Ok,
+        reclaiming: false,
+        free_ratio: Some(0.6),
+        slots_used: 4,
+        slots_total: 16,
+        telemetry_known: true,
+        telemetry_fresh: true,
+        telemetry_age_secs: Some(8),
+        recovered_pending_canary: false,
+        absent_secs: None,
+    };
+    let mut degraded = healthy("worker-2");
+    degraded.observation.temporarily_bypassed = true;
+
+    let rows = vec![healthy("worker-1"), degraded];
+    let inputs = build_inputs(
+        &rows,
+        JobsInput {
+            active: 2,
+            queued: 1,
+            stuck: 0,
+        },
+        ProofQueueInput::default(),
+        Vec::new(),
+        300,
+    );
+    assemble(&inputs, 1_700_000_000_000)
 }
 
 /// Convert daemon API response to TUI state types.
 fn update_state_from_daemon(state: &mut TuiState, response: DaemonFullStatusResponse) {
+    // Operator-facing remediation snapshot (assembled by the daemon). Extract
+    // before the rest of `response` is consumed field-by-field below.
+    state.remediation = response.remediation;
+
     // Update daemon state
     state.daemon = DaemonState {
         status: Status::Running,
@@ -428,8 +489,10 @@ async fn run_app(backend: &mut TtyBackend, state: &mut TuiState, config: &TuiCon
         {
             match action {
                 Action::Quit => {
-                    // If help overlay is open, close it; otherwise quit
-                    if state.show_help {
+                    // If an overlay is open, close it; otherwise quit
+                    if state.show_remediation {
+                        state.show_remediation = false;
+                    } else if state.show_help {
                         state.show_help = false;
                     } else if state.filter_mode {
                         state.filter_mode = false;
@@ -516,7 +579,9 @@ async fn run_app(backend: &mut TtyBackend, state: &mut TuiState, config: &TuiCon
                 }
                 Action::Back => {
                     // Handle back action - close overlays or go back
-                    if state.show_help {
+                    if state.show_remediation {
+                        state.show_remediation = false;
+                    } else if state.show_help {
                         state.show_help = false;
                     } else if state.filter_mode {
                         state.filter_mode = false;
@@ -529,6 +594,10 @@ async fn run_app(backend: &mut TtyBackend, state: &mut TuiState, config: &TuiCon
                 Action::Help => {
                     // Toggle help overlay
                     state.show_help = !state.show_help;
+                }
+                Action::ToggleRemediation => {
+                    // Toggle the operator-facing remediation overlay.
+                    state.show_remediation = !state.show_remediation;
                 }
                 Action::Filter => {
                     // Toggle filter mode
@@ -780,6 +849,7 @@ mod tests {
             },
             test_stats: None,
             saved_time: None,
+            remediation: None,
         }
     }
 
@@ -891,6 +961,11 @@ mod tests {
         assert!(json["workers"].is_array());
         assert!(json["active_builds"].is_array());
         assert!(json["build_history"].is_array());
+        // The operator-facing remediation view (bd-..14.4) is exposed in the
+        // dump-state automation surface: 8 bands + an overall posture.
+        assert!(json["remediation"]["bands"].is_array());
+        assert_eq!(json["remediation"]["bands"].as_array().unwrap().len(), 8);
+        assert!(json["remediation"]["overall"].is_string());
         info!("TEST PASS: test_dump_state_json_mock_data_has_expected_shape");
     }
 

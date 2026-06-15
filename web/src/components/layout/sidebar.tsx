@@ -1,7 +1,18 @@
 'use client';
 
 import { useEffect, useState, useRef, useSyncExternalStore } from 'react';
-import { Server, History, Settings, Activity, Home, Menu, X, Sun, Moon } from 'lucide-react';
+import {
+  Server,
+  History,
+  Settings,
+  Activity,
+  Home,
+  Menu,
+  X,
+  Sun,
+  Moon,
+  ShieldCheck,
+} from 'lucide-react';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import { AnimatePresence, motion } from 'motion/react';
@@ -12,6 +23,7 @@ import { Button } from '@/components/ui/button';
 const navItems = [
   { href: '/', icon: Home, label: 'Overview' },
   { href: '/workers', icon: Server, label: 'Workers' },
+  { href: '/remediation', icon: ShieldCheck, label: 'Remediation' },
   { href: '/builds', icon: History, label: 'Build History' },
   { href: '/metrics', icon: Activity, label: 'Metrics' },
   { href: '/settings', icon: Settings, label: 'Settings' },

@@ -160,6 +160,10 @@ pub fn render(frame: &mut Frame, state: &TuiState) {
     }
 
     // Render overlays on top
+    if state.show_remediation {
+        render_remediation_overlay(frame, state, &colors);
+    }
+
     if state.show_help {
         render_help_overlay(frame, &colors);
     }
@@ -670,6 +674,7 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &TuiState, colors: &Color
             ("↑/↓", "Navigate"),
             ("Tab", "Panel"),
             ("r", "Refresh"),
+            ("R", "Remediation"),
             ("?", "Help"),
             ("/", "Filter"),
         ]
@@ -734,7 +739,7 @@ fn render_help_overlay(frame: &mut Frame, colors: &ColorScheme) {
         Line::from("  G           Jump to bottom (resume auto-scroll)"),
         Line::from(""),
         Line::from_spans(vec![Span::styled("Actions", Style::new().bold())]),
-        Line::from("  r           Refresh data from daemon"),
+        Line::from("  r / R       Refresh data / toggle remediation overlay"),
         Line::from("  y           Copy selected item"),
         Line::from(""),
         Line::from_spans(vec![Span::styled(
@@ -787,6 +792,144 @@ fn render_help_overlay(frame: &mut Frame, colors: &ColorScheme) {
         .wrap(WrapMode::Word);
 
     help.render(help_area, frame);
+}
+
+/// Render the operator-facing remediation overlay: compact status bands for
+/// desired/live fleet, admissibility, proof queue, jobs, disk pressure,
+/// telemetry freshness, and recent incidents, each tagged with whether it needs
+/// operator action, is self-healing, or is normal fail-open
+/// (bd-session-history-remediation-ocv9i.14.4).
+fn render_remediation_overlay(frame: &mut Frame, state: &TuiState, colors: &ColorScheme) {
+    use rch_common::remediation_view::{BandSeverity, RemediationActionClass};
+
+    let area = frame.bounds();
+    let width = 76.min(area.width.saturating_sub(4));
+    let height = 44.min(area.height.saturating_sub(4));
+    let x = (area.width.saturating_sub(width)) / 2;
+    let y = (area.height.saturating_sub(height)) / 2;
+    let overlay_area = Rect::new(x, y, width, height);
+
+    frame
+        .buffer
+        .fill(overlay_area, ftui_render::cell::Cell::default());
+
+    let sev_color = |sev: BandSeverity| match sev {
+        BandSeverity::Ok => colors.success,
+        BandSeverity::Info => colors.info,
+        BandSeverity::Warn => colors.warning,
+        BandSeverity::Critical => colors.error,
+    };
+    let class_tag = |class: RemediationActionClass| match class {
+        RemediationActionClass::Healthy => ("OK", colors.success),
+        RemediationActionClass::NormalFailOpen => ("FAIL-OPEN", colors.muted),
+        RemediationActionClass::SelfHealingInProgress => ("HEALING", colors.info),
+        RemediationActionClass::OperatorActionRequired => ("ACTION", colors.error),
+    };
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    match &state.remediation {
+        None => {
+            lines.push(Line::from(Span::styled(
+                "Remediation view unavailable",
+                Style::new().fg(colors.warning).bold(),
+            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "The daemon did not report a remediation snapshot. It may be",
+                Style::new().fg(colors.muted),
+            )));
+            lines.push(Line::from(Span::styled(
+                "starting up, or predates this feature. Press 'r' to refresh.",
+                Style::new().fg(colors.muted),
+            )));
+        }
+        Some(view) => {
+            let (tag, tag_color) = class_tag(view.overall);
+            lines.push(Line::from_spans(vec![
+                Span::styled("Overall posture: ", Style::new().bold()),
+                Span::styled(
+                    view.overall.label().to_string(),
+                    Style::new().fg(tag_color).bold(),
+                ),
+                Span::styled(format!("  [{tag}]"), Style::new().fg(tag_color)),
+            ]));
+            lines.push(Line::from(Span::styled(
+                "operator-action  vs  self-healing  vs  normal fail-open",
+                Style::new().fg(colors.muted),
+            )));
+            lines.push(Line::from(""));
+
+            for band in &view.bands {
+                let (btag, btag_color) = class_tag(band.action_class);
+                lines.push(Line::from_spans(vec![
+                    Span::styled("● ", Style::new().fg(sev_color(band.severity))),
+                    Span::styled(format!("{:<20}", band.title), Style::new().bold()),
+                    Span::styled(format!(" {}", band.headline), Style::new().fg(colors.fg)),
+                ]));
+                lines.push(Line::from_spans(vec![
+                    Span::styled("    ", Style::new()),
+                    Span::styled(format!("[{btag}]"), Style::new().fg(btag_color)),
+                    Span::styled(
+                        band.reason_code
+                            .as_ref()
+                            .map_or(String::new(), |r| format!("  reason: {r}")),
+                        Style::new().fg(colors.muted),
+                    ),
+                ]));
+                for detail in &band.detail_lines {
+                    lines.push(Line::from(Span::styled(
+                        format!("      {detail}"),
+                        Style::new().fg(colors.muted),
+                    )));
+                }
+            }
+
+            lines.push(Line::from(""));
+            if view.incidents.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "Recent incidents: none",
+                    Style::new().fg(colors.success),
+                )));
+            } else {
+                lines.push(Line::from_spans(vec![Span::styled(
+                    "Recent incidents",
+                    Style::new().bold(),
+                )]));
+                for inc in view.incidents.iter().take(5) {
+                    let who = inc
+                        .worker_id
+                        .as_deref()
+                        .map_or(String::new(), |w| format!(" [{w}]"));
+                    lines.push(Line::from(Span::styled(
+                        format!(
+                            "  {} {}{} — {} ({}s ago)",
+                            inc.reason_code, inc.event_type, who, inc.summary, inc.age_secs
+                        ),
+                        Style::new().fg(colors.muted),
+                    )));
+                }
+            }
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Press 'R' or any key to close",
+        Style::new().fg(colors.muted),
+    )));
+
+    let overlay = Paragraph::new(ftui_text::Text::from_lines(lines))
+        .block(
+            Block::new()
+                .borders(Borders::ALL)
+                .title("Remediation")
+                .border_style(Style::new().fg(colors.highlight)),
+        )
+        .alignment(Alignment::Left)
+        .wrap(WrapMode::Word);
+
+    overlay.render(overlay_area, frame);
 }
 
 /// Render error bar at bottom of screen.
@@ -2517,6 +2660,159 @@ mod tests {
         assert!(
             content.contains("Force kill"),
             "Force kill shortcut must be documented"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Remediation overlay snapshot tests
+    // (bd-session-history-remediation-ocv9i.14.4)
+    //
+    // Cover the seven mandated dashboard render states: healthy, degraded,
+    // no admissible workers, proof queued, disk pressure, stale telemetry, and
+    // auto-rejoin pending — plus the data-unavailable case.
+    // -----------------------------------------------------------------------
+
+    use crate::tui::test_data;
+
+    fn remediation_state(view: rch_common::remediation_view::RemediationView) -> TuiState {
+        let mut state = TuiState::new();
+        state.show_remediation = true;
+        state.remediation = Some(view);
+        state
+    }
+
+    fn render_remediation(state: &TuiState) -> String {
+        render_to_string(90, 60, |f| render(f, state))
+    }
+
+    #[test]
+    fn test_remediation_overlay_healthy() {
+        init_test_logging();
+        let state = remediation_state(test_data::mock_remediation_view_healthy());
+        let content = render_remediation(&state);
+        assert!(content.contains("Remediation"), "overlay title present");
+        assert!(content.contains("Overall posture"), "posture line present");
+        assert!(
+            content.contains("Desired Fleet"),
+            "desired fleet band present"
+        );
+        assert!(
+            content.contains("Live Eligibility"),
+            "eligibility band present"
+        );
+        assert!(
+            content.contains("Admissible Workers"),
+            "admissible band present"
+        );
+        assert!(content.contains("Proof Queue"), "proof band present");
+        assert!(
+            content.contains("Telemetry Freshness"),
+            "telemetry band present"
+        );
+        assert!(
+            !content.contains("[ACTION]"),
+            "a healthy fleet needs no operator action"
+        );
+    }
+
+    #[test]
+    fn test_remediation_overlay_degraded() {
+        init_test_logging();
+        let state = remediation_state(test_data::mock_remediation_view_degraded());
+        let content = render_remediation(&state);
+        assert!(
+            content.contains("[HEALING]"),
+            "degraded fleet is self-healing"
+        );
+        assert!(
+            content.contains("bypassed"),
+            "bypass is surfaced in the eligibility band"
+        );
+    }
+
+    #[test]
+    fn test_remediation_overlay_no_admissible_workers() {
+        init_test_logging();
+        let state = remediation_state(test_data::mock_remediation_view_no_admissible());
+        let content = render_remediation(&state);
+        assert!(
+            content.contains("[ACTION]"),
+            "no admissible workers requires operator action"
+        );
+        assert!(content.contains("Admissible Workers"));
+    }
+
+    #[test]
+    fn test_remediation_overlay_proof_queued() {
+        init_test_logging();
+        let state = remediation_state(test_data::mock_remediation_view_proof_queued());
+        let content = render_remediation(&state);
+        assert!(content.contains("Proof Queue"));
+        assert!(
+            content.contains("[HEALING]"),
+            "an active proof queue is self-healing"
+        );
+    }
+
+    #[test]
+    fn test_remediation_overlay_disk_pressure() {
+        init_test_logging();
+        let state = remediation_state(test_data::mock_remediation_view_disk_pressure());
+        let content = render_remediation(&state);
+        assert!(content.contains("Disk Pressure"));
+        assert!(
+            content.contains("[ACTION]"),
+            "critical disk pressure without reclaim requires operator action"
+        );
+    }
+
+    #[test]
+    fn test_remediation_overlay_stale_telemetry() {
+        init_test_logging();
+        let state = remediation_state(test_data::mock_remediation_view_stale_telemetry());
+        let content = render_remediation(&state);
+        assert!(content.contains("Telemetry Freshness"));
+        assert!(
+            content.contains("[HEALING]"),
+            "stale telemetry self-corrects"
+        );
+    }
+
+    #[test]
+    fn test_remediation_overlay_auto_rejoin_pending() {
+        init_test_logging();
+        let state = remediation_state(test_data::mock_remediation_view_auto_rejoin_pending());
+        let content = render_remediation(&state);
+        assert!(content.contains("[HEALING]"), "auto-rejoin is self-healing");
+        assert!(
+            content.contains("canary") || content.contains("bypassed"),
+            "auto-rejoin state is surfaced"
+        );
+    }
+
+    #[test]
+    fn test_remediation_overlay_unavailable_when_none() {
+        init_test_logging();
+        let mut state = TuiState::new();
+        state.show_remediation = true;
+        state.remediation = None;
+        let content = render_remediation(&state);
+        assert!(
+            content.contains("Remediation view unavailable"),
+            "absent snapshot renders an explicit unavailable message"
+        );
+    }
+
+    #[test]
+    fn test_remediation_overlay_hidden_when_toggled_off() {
+        init_test_logging();
+        let mut state = TuiState::new();
+        state.show_remediation = false;
+        state.remediation = Some(test_data::mock_remediation_view_healthy());
+        let content = render_remediation(&state);
+        assert!(
+            !content.contains("Overall posture"),
+            "overlay must not render when toggled off"
         );
     }
 }

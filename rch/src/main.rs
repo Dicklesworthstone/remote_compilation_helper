@@ -293,6 +293,13 @@ Use 'disable' to mark a worker as unavailable (optionally with --reason)."#)]
         /// class, and absence alerts (workers absent from eligibility too long)
         #[arg(long)]
         fleet: bool,
+
+        /// Show the operator-facing remediation view: compact status bands
+        /// (desired/live fleet, admissibility, proof queue, jobs, disk pressure,
+        /// telemetry freshness, recent incidents) tagged operator-action /
+        /// self-healing / normal fail-open.
+        #[arg(long)]
+        remediation: bool,
     },
 
     /// Quick health check - is RCH working?
@@ -1857,7 +1864,8 @@ async fn run(args: Vec<OsString>) -> Result<()> {
                 workers,
                 jobs,
                 fleet,
-            } => handle_status(workers, jobs, fleet, &ctx).await,
+                remediation,
+            } => handle_status(workers, jobs, fleet, remediation, &ctx).await,
             Commands::Check => commands::check(&ctx).await,
             Commands::Queue { watch, follow } => commands::queue_status(watch, follow, &ctx).await,
             Commands::Cancel {
@@ -3016,8 +3024,14 @@ async fn handle_workers(action: WorkersAction, ctx: &OutputContext) -> Result<()
     Ok(())
 }
 
-async fn handle_status(workers: bool, jobs: bool, fleet: bool, ctx: &OutputContext) -> Result<()> {
-    commands::status_overview(workers, jobs, fleet, ctx).await?;
+async fn handle_status(
+    workers: bool,
+    jobs: bool,
+    fleet: bool,
+    remediation: bool,
+    ctx: &OutputContext,
+) -> Result<()> {
+    commands::status_overview(workers, jobs, fleet, remediation, ctx).await?;
     Ok(())
 }
 
@@ -4815,10 +4829,12 @@ mod tests {
                 workers,
                 jobs,
                 fleet,
+                remediation,
             }) => {
                 assert!(!workers);
                 assert!(!jobs);
                 assert!(fleet);
+                assert!(!remediation);
             }
             _ => fail_expected("Expected status command"),
         }

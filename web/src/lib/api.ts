@@ -5,6 +5,7 @@ import type {
   BudgetStatusResponse,
   SpeedScoreHistoryResponse,
   SpeedScoreListResponse,
+  RemediationView,
 } from './types';
 
 // Default to local daemon socket proxy
@@ -63,6 +64,14 @@ export const api = {
     // Use Next.js node runtime proxy so the browser doesn't need direct access
     // to the daemon's HTTP endpoints (status lives on the Unix socket).
     return fetchJson<StatusResponse>('/api/status');
+  },
+
+  /**
+   * Get the operator-facing remediation view (stable, redacted JSON)
+   * (bd-session-history-remediation-ocv9i.14.4).
+   */
+  async getRemediation(): Promise<RemediationView> {
+    return fetchJson<RemediationView>('/api/remediation');
   },
 
   /**

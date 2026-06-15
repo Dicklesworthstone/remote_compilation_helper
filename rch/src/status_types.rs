@@ -2,6 +2,7 @@
 //!
 //! These types mirror the response structures from rchd's /status API endpoint.
 
+use rch_common::remediation_view::RemediationView;
 use rch_common::{
     BuildCancellationMetadata, BypassRecord, CommandTimingBreakdown, SavedTimeStats,
     WorkerCapabilities,
@@ -27,6 +28,11 @@ pub struct DaemonFullStatusResponse {
     /// Saved time statistics from remote builds.
     #[serde(default)]
     pub saved_time: Option<SavedTimeStats>,
+    /// Operator-facing remediation view assembled by the daemon
+    /// (bd-session-history-remediation-ocv9i.14.4). `None` when talking to a
+    /// daemon that predates the field; otherwise always present.
+    #[serde(default)]
+    pub remediation: Option<RemediationView>,
 }
 
 /// Daemon metadata from API.
@@ -1462,6 +1468,7 @@ mod tests {
             },
             test_stats: None,
             saved_time: None,
+            remediation: None,
         }
     }
 

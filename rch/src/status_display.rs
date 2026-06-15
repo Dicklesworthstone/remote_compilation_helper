@@ -622,6 +622,100 @@ fn render_fleet_status_to<W: Write>(
     Ok(())
 }
 
+/// Render the operator-facing remediation view: compact status bands tagged
+/// operator-action / self-healing / normal fail-open
+/// (bd-session-history-remediation-ocv9i.14.4).
+pub fn render_remediation_view(
+    view: &rch_common::remediation_view::RemediationView,
+    style: &Theme,
+) {
+    let mut out = Vec::new();
+    if render_remediation_view_to(&mut out, view, style).is_ok() {
+        print!("{}", String::from_utf8_lossy(&out));
+    }
+}
+
+fn render_remediation_view_to<W: Write>(
+    out: &mut W,
+    view: &rch_common::remediation_view::RemediationView,
+    style: &Theme,
+) -> std::io::Result<()> {
+    use rch_common::remediation_view::{BandSeverity, RemediationActionClass};
+
+    // Colorize an action-class label by severity.
+    let class_str = |class: RemediationActionClass, text: &str| match class {
+        RemediationActionClass::Healthy => style.success(text),
+        RemediationActionClass::NormalFailOpen => style.muted(text),
+        RemediationActionClass::SelfHealingInProgress => style.info(text),
+        RemediationActionClass::OperatorActionRequired => style.error(text),
+    };
+    let sev_bullet = |sev: BandSeverity| match sev {
+        BandSeverity::Ok => style.success("●"),
+        BandSeverity::Info => style.info("●"),
+        BandSeverity::Warn => style.warning("●"),
+        BandSeverity::Critical => style.error("●"),
+    };
+
+    writeln!(out, "{}", style.format_header("Remediation"))?;
+    writeln!(out)?;
+    writeln!(
+        out,
+        "  {} {}",
+        style.muted("Overall:"),
+        class_str(view.overall, view.overall.label())
+    )?;
+    writeln!(
+        out,
+        "  {}",
+        style.muted("operator-action  vs  self-healing  vs  normal fail-open")
+    )?;
+    writeln!(out)?;
+
+    for band in &view.bands {
+        let tag = match band.action_class {
+            RemediationActionClass::Healthy => "OK",
+            RemediationActionClass::NormalFailOpen => "FAIL-OPEN",
+            RemediationActionClass::SelfHealingInProgress => "HEALING",
+            RemediationActionClass::OperatorActionRequired => "ACTION",
+        };
+        writeln!(
+            out,
+            "  {} {:<20} {}  {}",
+            sev_bullet(band.severity),
+            style.value(&band.title),
+            band.headline,
+            class_str(band.action_class, &format!("[{tag}]")),
+        )?;
+        for detail in &band.detail_lines {
+            writeln!(out, "      {}", style.muted(detail))?;
+        }
+    }
+
+    writeln!(out)?;
+    if view.incidents.is_empty() {
+        writeln!(out, "  {}", style.success("Recent incidents: none"))?;
+    } else {
+        writeln!(out, "{}", style.format_header("Recent incidents"))?;
+        for inc in view.incidents.iter().take(5) {
+            let who = inc
+                .worker_id
+                .as_deref()
+                .map_or(String::new(), |w| format!(" [{w}]"));
+            writeln!(
+                out,
+                "  {} {}{} — {} ({}s ago)",
+                style.key(&inc.reason_code),
+                inc.event_type,
+                who,
+                inc.summary,
+                inc.age_secs
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
 /// Render pressure details for a worker under storage pressure.
 fn render_pressure_details_to<W: Write>(
     out: &mut W,
@@ -1359,6 +1453,7 @@ mod tests {
                 runs_by_kind: std::collections::HashMap::from([("cargo_test".to_string(), 3)]),
             }),
             saved_time: None,
+            remediation: None,
         }
     }
 

@@ -214,6 +214,12 @@ pub struct DaemonFullStatus {
     pub test_stats: TestRunStats,
     /// Saved time statistics from remote builds.
     pub saved_time: SavedTimeStats,
+    /// Operator-facing remediation view: a compact, redacted snapshot of the
+    /// remediation posture (desired/live fleet, admissibility, proof queue,
+    /// jobs, disk pressure, telemetry freshness, recent incidents) rendered by
+    /// the TUI/web dashboards (bd-session-history-remediation-ocv9i.14.4).
+    /// Assembled once here so the three surfaces cannot disagree.
+    pub remediation: rch_common::remediation_view::RemediationView,
 }
 
 /// Daemon metadata.
@@ -2762,6 +2768,112 @@ fn active_build_issues_from_active_builds(
 }
 
 /// Handle a status request.
+/// Assemble the operator-facing remediation view (bd-..14.4) from the live
+/// daemon state already gathered for `/status`. Single source of truth: the
+/// TUI, CLI, and web all render this struct, so the three surfaces cannot
+/// disagree on counts or posture.
+///
+/// Zero extra I/O on the (TUI-polled) status path: worker rows come from the
+/// already-built `worker_infos`, jobs from the already-fetched build history,
+/// and recent incidents from the in-memory active alerts. The deferred-proof
+/// conveyor is not daemon-resident yet (bd-..5.3 is foundation-only), so the
+/// proof-queue census is empty here; the assembler supports a populated census
+/// once the conveyor is wired.
+fn build_remediation_view(
+    worker_infos: &[WorkerStatusInfo],
+    active_builds: &[crate::history::ActiveBuildState],
+    queued_count: usize,
+    alerts: &[AlertInfo],
+    now: chrono::DateTime<Utc>,
+) -> rch_common::remediation_view::RemediationView {
+    use rch_common::bypass_record::BypassState;
+    use rch_common::fleet_diff::WorkerObservation;
+    use rch_common::fleet_status::DEFAULT_ABSENCE_THRESHOLD_SECS;
+    use rch_common::remediation_view::{
+        DiskLevel, JobsInput, MAX_VIEW_INCIDENTS, ProofQueueInput, RemediationIncidentLine,
+        RemediationWorkerRow, assemble, build_inputs,
+    };
+
+    let rows: Vec<RemediationWorkerRow> = worker_infos
+        .iter()
+        .map(|w| {
+            let facts_known = w.pressure_state != "telemetry_gap";
+            RemediationWorkerRow {
+                observation: WorkerObservation {
+                    worker_id: w.id.clone(),
+                    configured: true,
+                    in_daemon_pool: true,
+                    reachable: w.status != "unreachable",
+                    admin_disabled: w.status == "disabled",
+                    temporarily_bypassed: w.bypass.is_some(),
+                    facts_known,
+                    // The bare dashboard view is not tied to a specific command.
+                    command_admissible: true,
+                },
+                disk_level: DiskLevel::from_pressure_state(&w.pressure_state),
+                // Per-worker reclaim progress is not surfaced in the status row;
+                // critical pressure without a reclaim signal reads as operator
+                // action, which is the safe default.
+                reclaiming: false,
+                free_ratio: w.pressure_disk_free_ratio,
+                slots_used: w.used_slots,
+                slots_total: w.total_slots,
+                telemetry_known: facts_known,
+                telemetry_fresh: w.pressure_telemetry_fresh,
+                telemetry_age_secs: w.pressure_telemetry_age_secs,
+                recovered_pending_canary: w
+                    .bypass
+                    .as_ref()
+                    .is_some_and(|b| b.state == BypassState::RecoveredPendingCanary),
+                absent_secs: None,
+            }
+        })
+        .collect();
+
+    let stuck = active_builds
+        .iter()
+        .filter(|b| {
+            !b.detector_hook_alive || (b.detector_heartbeat_stale && b.detector_progress_stale)
+        })
+        .count();
+    let jobs = JobsInput {
+        active: active_builds.len(),
+        queued: queued_count,
+        stuck,
+    };
+
+    let incidents: Vec<RemediationIncidentLine> = alerts
+        .iter()
+        .filter(|a| a.state == "active")
+        .take(MAX_VIEW_INCIDENTS)
+        .map(|a| {
+            let age = chrono::DateTime::parse_from_rfc3339(&a.last_seen)
+                .ok()
+                .map(|t| {
+                    u64::try_from((now - t.with_timezone(&Utc)).num_seconds().max(0)).unwrap_or(0)
+                })
+                .unwrap_or(0);
+            RemediationIncidentLine::new(
+                a.kind.clone(),
+                "alert",
+                a.worker_id.clone(),
+                age,
+                a.message.clone(),
+            )
+        })
+        .collect();
+
+    let inputs = build_inputs(
+        &rows,
+        jobs,
+        ProofQueueInput::default(),
+        incidents,
+        DEFAULT_ABSENCE_THRESHOLD_SECS,
+    );
+    let now_ms = u64::try_from(now.timestamp_millis()).unwrap_or(0);
+    assemble(&inputs, now_ms)
+}
+
 async fn handle_status(ctx: &DaemonContext) -> Result<DaemonFullStatus> {
     let workers = ctx.pool.all_workers().await;
 
@@ -2945,6 +3057,16 @@ async fn handle_status(ctx: &DaemonContext) -> Result<DaemonFullStatus> {
         metrics::set_build_queue_depth(queue_depth);
     }
 
+    // Assemble the operator-facing remediation view from the live state above,
+    // before `active_builds`/`worker_infos` are moved into the response.
+    let remediation = build_remediation_view(
+        &worker_infos,
+        &active_builds,
+        queue_depth,
+        &alerts,
+        Utc::now(),
+    );
+
     Ok(DaemonFullStatus {
         daemon: DaemonStatusInfo {
             pid: ctx.pid,
@@ -3009,6 +3131,7 @@ async fn handle_status(ctx: &DaemonContext) -> Result<DaemonFullStatus> {
         stats,
         test_stats,
         saved_time: ctx.history.saved_time_stats(),
+        remediation,
     })
 }
 

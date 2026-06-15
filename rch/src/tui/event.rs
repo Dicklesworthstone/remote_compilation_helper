@@ -28,6 +28,8 @@ pub enum Action {
     Refresh,
     /// Toggle help overlay.
     Help,
+    /// Toggle the operator-facing remediation overlay.
+    ToggleRemediation,
     /// Filter input mode.
     Filter,
     /// Copy to clipboard.
@@ -87,6 +89,7 @@ fn handle_key(key: KeyEvent) -> Action {
         KeyCode::Backspace => Action::Back,
         KeyCode::Char('r') => Action::Refresh,
         KeyCode::Char('?') | KeyCode::F(1) => Action::Help,
+        KeyCode::Char('R') => Action::ToggleRemediation,
         KeyCode::Char('/') => Action::Filter,
         KeyCode::Char('y') => Action::Copy,
         KeyCode::Char('d') => Action::DrainWorker,

@@ -141,6 +141,11 @@ pub struct TuiState {
     pub build_history_sort: BuildHistorySort,
     /// Show detail bar for selected item (full untruncated content).
     pub show_detail: bool,
+    /// Show the remediation overlay (operator-facing status bands;
+    /// bd-session-history-remediation-ocv9i.14.4).
+    pub show_remediation: bool,
+    /// Latest operator-facing remediation view from the daemon, if available.
+    pub remediation: Option<rch_common::remediation_view::RemediationView>,
 }
 
 impl Default for TuiState {
@@ -165,6 +170,8 @@ impl Default for TuiState {
             last_copied: None,
             confirm_dialog: None,
             show_detail: true,
+            show_remediation: false,
+            remediation: None,
         }
     }
 }

@@ -58,6 +58,8 @@ pub enum SchemaComponent {
     WorkerBypassRecord,
     /// Shared secret-redaction / privacy policy for all remediation data.
     RedactionPolicy,
+    /// Operator-facing remediation view rendered by the TUI/web dashboards.
+    RemediationView,
 }
 
 /// The canonical version string for a given component.
@@ -78,6 +80,7 @@ pub const fn current_version(component: SchemaComponent) -> &'static str {
         SchemaComponent::ProofReplayState => "1.0.0",
         SchemaComponent::WorkerBypassRecord => "1.0.0",
         SchemaComponent::RedactionPolicy => "1.0.0",
+        SchemaComponent::RemediationView => "1.0.0",
     }
 }
 
@@ -124,6 +127,10 @@ pub const ALL_COMPONENTS: &[(SchemaComponent, &str)] = &[
         SchemaComponent::RedactionPolicy,
         current_version(SchemaComponent::RedactionPolicy),
     ),
+    (
+        SchemaComponent::RemediationView,
+        current_version(SchemaComponent::RemediationView),
+    ),
 ];
 
 #[cfg(test)]
@@ -148,6 +155,7 @@ mod tests {
         (SchemaComponent::ProofReplayState, "1.0.0"),
         (SchemaComponent::WorkerBypassRecord, "1.0.0"),
         (SchemaComponent::RedactionPolicy, "1.0.0"),
+        (SchemaComponent::RemediationView, "1.0.0"),
     ];
 
     #[test]
