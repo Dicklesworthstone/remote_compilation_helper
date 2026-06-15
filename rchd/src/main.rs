@@ -416,6 +416,20 @@ async fn main() -> Result<()> {
     }
     metrics::set_daemon_info(env!("CARGO_PKG_VERSION"));
 
+    // Register remediation-state observability (bead 14.5) into the same served
+    // registry and install the process-global handle so daemon decision points
+    // can record via `rch_telemetry::remediation::record_*`. Best-effort: a
+    // construction/registration failure must never block the daemon.
+    match rch_telemetry::remediation::RemediationMetrics::new() {
+        Ok(remediation) => {
+            if let Err(e) = remediation.register(&metrics::REGISTRY) {
+                warn!("Failed to register remediation metrics: {}", e);
+            }
+            rch_telemetry::remediation::init_global(remediation);
+        }
+        Err(e) => warn!("Failed to construct remediation metrics: {}", e),
+    }
+
     // Initialize OpenTelemetry tracing (optional, configured via env vars)
     let _otel_guard = match metrics::tracing::init_otel() {
         Ok(guard) => guard,

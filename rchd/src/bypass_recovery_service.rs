@@ -50,6 +50,7 @@ use rch_common::capability_probe::{
 };
 use rch_common::ssh::{SshClient, SshOptions};
 use rch_common::{BypassFailureClass, WorkerConfig, WorkerId};
+use rch_telemetry::remediation::{self, BypassTransition, SelfHealingAction, SelfHealingOutcome};
 
 use crate::telemetry::TelemetryStore;
 use crate::workers::{AdminIntent, EligibilityState, WorkerPool, WorkerState};
@@ -355,6 +356,10 @@ pub async fn record_worker_bypass(
         return;
     }
     worker.enter_bypass(class).await;
+    // Remediation observability (bead 14.5): a worker just entered temporary
+    // bypass — record the lifecycle transition and the ineligibility reason.
+    remediation::record_bypass_transition(BypassTransition::Bypassed);
+    remediation::record_worker_ineligible(class);
 
     let (id, host, user) = {
         let c = worker.config.read().await;
@@ -517,6 +522,7 @@ impl<P: RecoveryProber + 'static> BypassRecoveryService<P> {
                 record,
             } => {
                 debug!(worker = %worker_id, dimension = %failed_dimension, "recovery probe failed; staying bypassed");
+                remediation::record_bypass_transition(BypassTransition::StayBypassed);
                 worker.enter_bypass(record.failure_class).await;
                 self.persist(*record).await;
             }
@@ -526,10 +532,12 @@ impl<P: RecoveryProber + 'static> BypassRecoveryService<P> {
                 record,
             } => {
                 debug!(worker = %worker_id, consecutive_passes, required, "recovery probe passed; keep probing");
+                remediation::record_bypass_transition(BypassTransition::KeepProbing);
                 self.persist(*record).await;
             }
             ProbeDecision::ReadyForCanary { record } => {
                 info!(worker = %worker_id, "recovery probes passed; running canary");
+                remediation::record_bypass_transition(BypassTransition::ReadyForCanary);
                 if worker.recover_to_canary().await.is_err() {
                     // Lifecycle wasn't TemporaryBypass (e.g. it was reconciled or
                     // raced); re-quarantine then advance so record and lifecycle
@@ -539,13 +547,21 @@ impl<P: RecoveryProber + 'static> BypassRecoveryService<P> {
                 }
                 self.persist((*record).clone()).await;
                 let outcome = self.prober.canary(worker.clone()).await;
+                // Remediation observability (bead 14.5): record the canary result.
+                remediation::record_canary(outcome);
                 match decide_canary(*record, outcome, now_ms) {
                     CanaryDecision::Rejoin => {
                         info!(worker = %worker_id, "canary passed; rejoining worker");
+                        remediation::record_bypass_transition(BypassTransition::Rejoin);
+                        remediation::record_self_healing(
+                            SelfHealingAction::WorkerRejoin,
+                            SelfHealingOutcome::Success,
+                        );
                         self.rejoin(&worker, &worker_id).await;
                     }
                     CanaryDecision::Relapse { record } => {
                         warn!(worker = %worker_id, "canary failed; relapsing into bypass");
+                        remediation::record_bypass_transition(BypassTransition::Relapse);
                         worker.enter_bypass(record.failure_class).await;
                         self.persist(*record).await;
                     }
@@ -553,6 +569,11 @@ impl<P: RecoveryProber + 'static> BypassRecoveryService<P> {
             }
             ProbeDecision::Rejoin => {
                 info!(worker = %worker_id, "recovery criteria met (no canary required); rejoining worker");
+                remediation::record_bypass_transition(BypassTransition::Rejoin);
+                remediation::record_self_healing(
+                    SelfHealingAction::WorkerRejoin,
+                    SelfHealingOutcome::Success,
+                );
                 self.rejoin(&worker, &worker_id).await;
             }
         }

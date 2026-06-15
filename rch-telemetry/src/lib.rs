@@ -16,6 +16,7 @@ pub mod collect;
 pub mod metrics;
 pub mod otlp;
 pub mod protocol;
+pub mod remediation;
 pub mod speedscore;
 #[cfg(feature = "storage")]
 pub mod storage;
@@ -40,6 +41,10 @@ pub use collect::network::{
     NetDevStats, NetworkCollector, NetworkError, NetworkMetrics, NetworkTelemetry,
 };
 pub use protocol::{TestRunRecord, TestRunStats};
+pub use remediation::{
+    AdmissionDecision, BypassTransition, RemediationAttributes, RemediationMetrics,
+    SelfHealingAction, SelfHealingOutcome,
+};
 pub use speedscore::{
     BenchmarkConditions, BenchmarkResults, SPEEDSCORE_VERSION, SpeedScore, SpeedScoreWeights,
     calculate_speedscore,

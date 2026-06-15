@@ -2985,6 +2985,13 @@ fn record_selection_metrics(reason: &SelectionReason, duration: Duration) {
             | SelectionReason::AffinityFallback
     ) {
         metrics::inc_local_fallback_reason(selection_reason_label(reason));
+        // Remediation observability (bead 14.5): a non-success selection means
+        // the command falls back to local — record the admission decision by
+        // its normalized reason so dashboards can track fallback pressure.
+        rch_telemetry::remediation::record_admission(
+            rch_telemetry::remediation::AdmissionDecision::Local,
+            selection_reason_label(reason),
+        );
         if matches!(reason, SelectionReason::SelectionError(_)) {
             metrics::inc_reliability_error("selection", "selection_error");
         }

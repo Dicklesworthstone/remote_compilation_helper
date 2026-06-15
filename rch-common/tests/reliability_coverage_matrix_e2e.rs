@@ -696,6 +696,47 @@ fn build_coverage_matrix() -> CoverageMatrix {
             has_log_assertion: true,
             gap: None,
         },
+        RequirementRow {
+            id: "REQ-OBS-001".into(),
+            description: "Prometheus + OpenTelemetry instrumentation for remediation states \
+                          (incident, admission/fallback, proof, queue, worker eligibility, \
+                          temporary bypass, canary, disk pressure, telemetry freshness, artifact \
+                          retrieval, self-healing) with bounded-cardinality labels and redacted, \
+                          OTel-compatible span attributes"
+                .into(),
+            domain: "observability".into(),
+            bead_id: "bd-session-history-remediation-ocv9i.14.5".into(),
+            test_refs: vec![
+                TestRef {
+                    // Lives in rch-telemetry/tests/ (the metrics depend on
+                    // prometheus/opentelemetry, which rch-common does not pull in).
+                    file: "../../rch-telemetry/tests/remediation_metrics_e2e.rs".into(),
+                    name_prefix: "remediation_metrics_scrape_traces_and_evidence".into(),
+                    tier: "smoke".into(),
+                },
+                TestRef {
+                    file: "../../rch-telemetry/src/remediation.rs".into(),
+                    name_prefix: "register_is_idempotent_and_exposes_all_specs".into(),
+                    tier: "smoke".into(),
+                },
+            ],
+            artifact_assertions: vec![
+                "Every remediation metric family appears in a Prometheus scrape with bounded labels"
+                    .into(),
+                "Incident spans carry stable attributes (event_type, reason_code, source, \
+                 selected_mode, command_fingerprint, project_id) plus worker/queue/job ids"
+                    .into(),
+                "No raw command text, home/absolute paths, or secret-shaped values appear in \
+                 metric labels or span attributes (path hashed to blake3:, token masked)"
+                    .into(),
+                "JSONL evidence emitted with run_id, bead_id, scenario, metric_name, labels, \
+                 value, status, and detail"
+                    .into(),
+            ],
+            has_executable_test: true,
+            has_log_assertion: true,
+            gap: None,
+        },
     ];
 
     let total = requirements.len();

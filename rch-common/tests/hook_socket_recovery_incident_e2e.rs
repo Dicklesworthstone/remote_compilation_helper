@@ -113,7 +113,7 @@ fn e2e_hook_socket_refused_records_daemon_socket_refused() {
         Some("refused")
     );
     // No mismatch was supplied, so the mismatch details are absent.
-    assert!(ev.details.get("socket_path_mismatch").is_none());
+    assert!(!ev.details.contains_key("socket_path_mismatch"));
 }
 
 #[test]
