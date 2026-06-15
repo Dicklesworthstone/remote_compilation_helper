@@ -887,6 +887,12 @@ pub struct RchConfig {
     /// Doctor / reliability subsystem configuration (verdict webhooks).
     #[serde(default)]
     pub doctor: DoctorConfig,
+    /// Session-history remediation knobs: the central schema and default policy
+    /// for temporary bypass, auto-rejoin, reconciliation, proof, incident
+    /// ledger, build-root, pooled targets, telemetry freshness, log retention,
+    /// disk pressure, and smoke defaults (bd-...remediation-ocv9i.17.1).
+    #[serde(default)]
+    pub remediation: crate::remediation_config::RemediationConfig,
 }
 
 /// Doctor reliability subsystem configuration.

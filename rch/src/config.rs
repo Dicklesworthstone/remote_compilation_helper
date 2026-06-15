@@ -945,6 +945,20 @@ pub fn validate_rch_config_file(path: &Path) -> FileValidation {
         validation.validate_rsync_pattern(&format!("transfer.exclude_patterns[{}]", idx), pattern);
     }
 
+    // Validate remediation knobs (bd-...remediation-ocv9i.17.1). Errors are
+    // genuine misconfigurations; warnings flag operator paths outside the
+    // RCH-managed roots.
+    for issue in config.remediation.validate() {
+        match issue.severity {
+            rch_common::remediation_config::IssueSeverity::Error => {
+                validation.error(format!("{}: {}", issue.field, issue.message));
+            }
+            rch_common::remediation_config::IssueSeverity::Warning => {
+                validation.warn(format!("{}: {}", issue.field, issue.message));
+            }
+        }
+    }
+
     validation
 }
 
@@ -2208,6 +2222,72 @@ fn apply_env_overrides_inner(
                 sources,
                 "path_topology.alias_root",
                 ConfigValueSource::EnvVar("RCH_ALIAS_PROJECT_ROOT".to_string()),
+            );
+        }
+    }
+
+    // Remediation knob overrides (bd-...remediation-ocv9i.17.1). A focused set of
+    // the highest-signal knobs; the full surface is driven by TOML layering.
+    if let Some(val) = get_env("RCH_REMEDIATION_HOOK_EXEC_FAIL_OPEN")
+        && let Some(b) = parse_bool(&val)
+    {
+        config.remediation.policy.hook_exec_fail_open = b;
+        if let Some(ref mut sources) = sources {
+            set_source(
+                sources,
+                "remediation.policy.hook_exec_fail_open",
+                ConfigValueSource::EnvVar("RCH_REMEDIATION_HOOK_EXEC_FAIL_OPEN".to_string()),
+            );
+        }
+    }
+    if let Some(val) = get_env("RCH_REMEDIATION_PROOF_FAIL_CLOSED")
+        && let Some(b) = parse_bool(&val)
+    {
+        config.remediation.policy.proof_mode_fail_closed = b;
+        if let Some(ref mut sources) = sources {
+            set_source(
+                sources,
+                "remediation.policy.proof_mode_fail_closed",
+                ConfigValueSource::EnvVar("RCH_REMEDIATION_PROOF_FAIL_CLOSED".to_string()),
+            );
+        }
+    }
+    if let Some(val) = get_env("RCH_REMEDIATION_INCIDENT_MAX_ENTRIES")
+        && let Ok(n) = val.parse::<usize>()
+        && n > 0
+    {
+        config.remediation.incident_ledger.max_entries = n;
+        if let Some(ref mut sources) = sources {
+            set_source(
+                sources,
+                "remediation.incident_ledger.max_entries",
+                ConfigValueSource::EnvVar("RCH_REMEDIATION_INCIDENT_MAX_ENTRIES".to_string()),
+            );
+        }
+    }
+    if let Some(val) = get_env("RCH_REMEDIATION_BYPASS_CHECK_INTERVAL_SECS")
+        && let Ok(n) = val.parse::<u64>()
+        && n > 0
+    {
+        config.remediation.auto_rejoin.check_interval_secs = n;
+        if let Some(ref mut sources) = sources {
+            set_source(
+                sources,
+                "remediation.auto_rejoin.check_interval_secs",
+                ConfigValueSource::EnvVar("RCH_REMEDIATION_BYPASS_CHECK_INTERVAL_SECS".to_string()),
+            );
+        }
+    }
+    if let Some(val) = get_env("RCH_REMEDIATION_TELEMETRY_MAX_AGE_SECS")
+        && let Ok(n) = val.parse::<u64>()
+        && n > 0
+    {
+        config.remediation.telemetry_freshness.max_age_secs = n;
+        if let Some(ref mut sources) = sources {
+            set_source(
+                sources,
+                "remediation.telemetry_freshness.max_age_secs",
+                ConfigValueSource::EnvVar("RCH_REMEDIATION_TELEMETRY_MAX_AGE_SECS".to_string()),
             );
         }
     }
@@ -3582,6 +3662,103 @@ remote_speedup_threshold = 1.75
             &ConfigValueSource::EnvVar("RCH_ENABLED".to_string())
         );
         info!("PASS: RCH_ENABLED override applied with source tracking");
+    }
+
+    #[test]
+    fn test_remediation_config_layer_precedence() {
+        use std::io::Write;
+        let _guard = test_guard!();
+        info!("TEST: test_remediation_config_layer_precedence");
+
+        // User layer: overrides several built-in defaults.
+        let mut user_file = NamedTempFile::new().expect("user temp file");
+        write!(
+            user_file,
+            r#"
+[remediation.policy]
+hook_exec_fail_open = false
+
+[remediation.auto_rejoin]
+check_interval_secs = 50
+required_consecutive_passes = 5
+
+[remediation.incident_ledger]
+max_entries = 1000
+"#
+        )
+        .expect("write user config");
+        user_file.flush().expect("flush user config");
+
+        // Project layer: overrides one knob the user also set.
+        let mut project_file = NamedTempFile::new().expect("project temp file");
+        write!(
+            project_file,
+            r#"
+[remediation.auto_rejoin]
+check_interval_secs = 70
+"#
+        )
+        .expect("write project config");
+        project_file.flush().expect("flush project config");
+
+        let mut config =
+            load_config_uncached_from_paths(Some(user_file.path()), Some(project_file.path()))
+                .expect("load layered config");
+
+        // Built-in default preserved where nobody set it.
+        assert!(config.remediation.policy.proof_mode_fail_closed);
+        // User layer applied over built-in.
+        assert!(!config.remediation.policy.hook_exec_fail_open);
+        assert_eq!(
+            config.remediation.auto_rejoin.required_consecutive_passes,
+            5
+        );
+        assert_eq!(config.remediation.incident_ledger.max_entries, 1000);
+        // Project layer overrides user.
+        assert_eq!(config.remediation.auto_rejoin.check_interval_secs, 70);
+
+        // Env layer overrides project.
+        let mut env: HashMap<String, String> = HashMap::new();
+        env.insert(
+            "RCH_REMEDIATION_BYPASS_CHECK_INTERVAL_SECS".to_string(),
+            "90".to_string(),
+        );
+        apply_env_overrides_inner(&mut config, None, Some(&env));
+        assert_eq!(config.remediation.auto_rejoin.check_interval_secs, 90);
+        // Env did not touch the user-set value it does not control.
+        assert_eq!(config.remediation.incident_ledger.max_entries, 1000);
+
+        info!("PASS: remediation built-in < user < project < env precedence");
+    }
+
+    #[test]
+    fn test_remediation_env_policy_overrides_and_source_tracking() {
+        let _guard = test_guard!();
+        info!("TEST: test_remediation_env_policy_overrides_and_source_tracking");
+        let mut config = RchConfig::default();
+        let mut sources = default_sources_map();
+        let mut env: HashMap<String, String> = HashMap::new();
+        env.insert(
+            "RCH_REMEDIATION_HOOK_EXEC_FAIL_OPEN".to_string(),
+            "false".to_string(),
+        );
+        env.insert(
+            "RCH_REMEDIATION_TELEMETRY_MAX_AGE_SECS".to_string(),
+            "300".to_string(),
+        );
+
+        apply_env_overrides_inner(&mut config, Some(&mut sources), Some(&env));
+
+        assert!(!config.remediation.policy.hook_exec_fail_open);
+        assert_eq!(config.remediation.telemetry_freshness.max_age_secs, 300);
+        let src = sources
+            .get("remediation.policy.hook_exec_fail_open")
+            .expect("source recorded");
+        assert_eq!(
+            src,
+            &ConfigValueSource::EnvVar("RCH_REMEDIATION_HOOK_EXEC_FAIL_OPEN".to_string())
+        );
+        info!("PASS: remediation env overrides applied with source tracking");
     }
 
     #[test]

@@ -57,6 +57,7 @@ mod proptest_tests;
 pub mod protocol;
 pub mod queue_contract;
 pub mod readiness;
+pub mod remediation_config;
 #[cfg(unix)]
 pub mod remote_compilation;
 #[cfg(unix)]
