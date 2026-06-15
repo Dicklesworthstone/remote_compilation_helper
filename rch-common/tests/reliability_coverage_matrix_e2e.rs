@@ -628,6 +628,37 @@ fn build_coverage_matrix() -> CoverageMatrix {
             has_log_assertion: true,
             gap: None,
         },
+        // ---------------------------------------------------------------
+        // Domain: Deferred Proof Replay
+        // ---------------------------------------------------------------
+        RequirementRow {
+            id: "REQ-PROOF-001".into(),
+            description: "Deferred proof replay conveyor + state machine: revalidate source \
+                          before replay, honor every safety block, never starve interactive \
+                          work, and publish queued/blocked/replaying/passed/failed/stale"
+                .into(),
+            domain: "proof_replay".into(),
+            bead_id: "bd-session-history-remediation-ocv9i.5.3".into(),
+            test_refs: vec![TestRef {
+                file: "proof_replay_conveyor_e2e.rs".into(),
+                name_prefix: "e2e_proof_replay_".into(),
+                tier: "smoke".into(),
+            }],
+            artifact_assertions: vec![
+                "Recovery after disk pressure: queued under pressure, replays once it clears"
+                    .into(),
+                "Source changed while queued transitions to stale and is never replayed".into(),
+                "Capability still missing stays blocked with reason RCH-I006".into(),
+                "Worker eligible after canary rejoin transitions queued -> replaying".into(),
+                "Replay never bypasses a safety block; concurrency cap + FIFO fairness \
+                 prevent interactive starvation"
+                    .into(),
+                "Published record carries state token + stable RCH-Innn reason code".into(),
+            ],
+            has_executable_test: true,
+            has_log_assertion: true,
+            gap: None,
+        },
     ];
 
     let total = requirements.len();
@@ -678,6 +709,7 @@ const KNOWN_TEST_FILES: &[&str] = &[
     "deterministic_replay_e2e.rs",
     "performance_budget_e2e.rs",
     "remediation_hotpath_budget_e2e.rs",
+    "proof_replay_conveyor_e2e.rs",
     "redaction_retention_e2e.rs",
     "contract_drift_e2e.rs",
     "feature_flags_rollout_e2e.rs",

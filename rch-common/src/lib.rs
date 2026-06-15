@@ -52,6 +52,7 @@ pub mod pooled_target_key;
 pub mod proof_handoff;
 pub mod proof_intent;
 pub mod proof_policy;
+pub mod proof_replay;
 #[cfg(test)]
 mod proptest_tests;
 pub mod protocol;

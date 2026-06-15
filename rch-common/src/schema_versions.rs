@@ -52,6 +52,8 @@ pub enum SchemaComponent {
     WorkerFacts,
     /// Durable proof-intent record schema (deferred proof queue).
     ProofIntent,
+    /// Durable proof-replay state record schema (deferred proof conveyor).
+    ProofReplayState,
     /// Worker temporary-bypass record schema (transient-quarantine lifecycle).
     WorkerBypassRecord,
     /// Shared secret-redaction / privacy policy for all remediation data.
@@ -73,6 +75,7 @@ pub const fn current_version(component: SchemaComponent) -> &'static str {
         SchemaComponent::IncidentLedger => "1.0.0",
         SchemaComponent::WorkerFacts => "1.0.0",
         SchemaComponent::ProofIntent => "1.0.0",
+        SchemaComponent::ProofReplayState => "1.0.0",
         SchemaComponent::WorkerBypassRecord => "1.0.0",
         SchemaComponent::RedactionPolicy => "1.0.0",
     }
@@ -110,6 +113,10 @@ pub const ALL_COMPONENTS: &[(SchemaComponent, &str)] = &[
         current_version(SchemaComponent::ProofIntent),
     ),
     (
+        SchemaComponent::ProofReplayState,
+        current_version(SchemaComponent::ProofReplayState),
+    ),
+    (
         SchemaComponent::WorkerBypassRecord,
         current_version(SchemaComponent::WorkerBypassRecord),
     ),
@@ -138,6 +145,7 @@ mod tests {
         (SchemaComponent::IncidentLedger, "1.0.0"),
         (SchemaComponent::WorkerFacts, "1.0.0"),
         (SchemaComponent::ProofIntent, "1.0.0"),
+        (SchemaComponent::ProofReplayState, "1.0.0"),
         (SchemaComponent::WorkerBypassRecord, "1.0.0"),
         (SchemaComponent::RedactionPolicy, "1.0.0"),
     ];
