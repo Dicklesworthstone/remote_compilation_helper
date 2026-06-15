@@ -7,7 +7,9 @@
 use proptest::prelude::*;
 use rch_common::admit_preflight::{AdmitRecommendation, preflight};
 use rch_common::exec_misuse::detect_exec_misuse;
-use rch_common::exec_policy::{ExecContext, ExecDisposition, decide_exec_policy, mutates_local_state};
+use rch_common::exec_policy::{
+    ExecContext, ExecDisposition, decide_exec_policy, mutates_local_state,
+};
 
 /// Command-like strings built from realistic tokens (cargo/bun/wrappers/env/
 /// operators/quotes) plus a free-form token, joined with spaces.

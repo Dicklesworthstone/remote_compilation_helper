@@ -459,8 +459,8 @@ mod tests {
                 any_pressure(),
                 proptest::option::of(any_duration()),
             )
-                .prop_map(
-                    |(poll, timeout, last, timeouts, rtt, pressure, age)| FreshnessInputs {
+                .prop_map(|(poll, timeout, last, timeouts, rtt, pressure, age)| {
+                    FreshnessInputs {
                         poll_interval: poll,
                         ssh_timeout: timeout,
                         last_poll_duration: last,
@@ -468,8 +468,8 @@ mod tests {
                         host_rtt: rtt,
                         concurrency_pressure: pressure,
                         age,
-                    },
-                )
+                    }
+                })
         }
 
         /// Severity rank for the metamorphic monotonicity check (Unknown only

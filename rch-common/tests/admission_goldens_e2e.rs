@@ -181,7 +181,11 @@ fn every_rejection_category_maps_to_exactly_one_action_class_reason() {
         let _reason: IncidentReasonCode = c.incident_reason();
         let _a0 = recommend(c, false);
         let _a1 = recommend(c, true);
-        assert!(tokens.insert(c.as_str()), "duplicate category token {}", c.as_str());
+        assert!(
+            tokens.insert(c.as_str()),
+            "duplicate category token {}",
+            c.as_str()
+        );
     }
 }
 
@@ -193,7 +197,12 @@ fn unambiguous_incident_reasons_round_trip_to_categories() {
             Some(back) => {
                 // 1:1 codes must round-trip to a category that maps back to the
                 // same code.
-                assert_eq!(back.incident_reason(), code, "{} reason mismatch", c.as_str());
+                assert_eq!(
+                    back.incident_reason(),
+                    code,
+                    "{} reason mismatch",
+                    c.as_str()
+                );
             }
             None => {
                 // Non-invertible codes are the coarse runtime code (shared by
@@ -274,7 +283,12 @@ fn proof_handoff_is_total_over_all_refusal_reasons() {
         let v = serde_json::to_value(&handoff).unwrap();
         assert!(v["failure_class"].is_string());
         assert!(v["next_action"].is_string());
-        assert!(v["replay_command"].as_str().unwrap().contains("cargo build"));
+        assert!(
+            v["replay_command"]
+                .as_str()
+                .unwrap()
+                .contains("cargo build")
+        );
     }
 }
 
@@ -283,7 +297,11 @@ fn incident_reason_codes_are_stable_and_sequential() {
     // Guards against an RCH-Innn renumber/removal that would silently break
     // every persisted ledger entry and the goldens above.
     let all = IncidentReasonCode::ALL;
-    assert!(all.len() >= 17, "reason code registry shrank: {}", all.len());
+    assert!(
+        all.len() >= 17,
+        "reason code registry shrank: {}",
+        all.len()
+    );
     let mut seen = std::collections::BTreeSet::new();
     for (i, r) in all.iter().enumerate() {
         let expected = format!("RCH-I{:03}", i + 1);
