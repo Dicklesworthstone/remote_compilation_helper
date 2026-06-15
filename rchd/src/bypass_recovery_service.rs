@@ -45,10 +45,12 @@ use rch_common::bypass_record::{
 use rch_common::bypass_recovery::{
     CanaryDecision, CanaryOutcome, ProbeDecision, RecoveryProbe, decide_canary, decide_probe,
 };
+use rch_common::capability_probe::{
+    FACT_PREFIX, ProbeSpec, build_capability_probe_script, parse_capability_probe,
+};
 use rch_common::ssh::{SshClient, SshOptions};
-use rch_common::{BypassFailureClass, WorkerId};
+use rch_common::{BypassFailureClass, WorkerConfig, WorkerId};
 
-use crate::health::probe_worker_capabilities;
 use crate::telemetry::TelemetryStore;
 use crate::workers::{AdminIntent, EligibilityState, WorkerPool, WorkerState};
 
@@ -60,6 +62,9 @@ fn now_unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Bytes per gigabyte, for the disk-free-GB → bytes threshold.
+const BYTES_PER_GB: f64 = 1024.0 * 1024.0 * 1024.0;
+
 /// Tunable knobs for the recovery loop and the real SSH prober.
 #[derive(Debug, Clone)]
 pub struct BypassRecoveryConfig {
@@ -67,10 +72,26 @@ pub struct BypassRecoveryConfig {
     pub check_interval: Duration,
     /// SSH/probe timeout for a single capability probe or canary command.
     pub probe_timeout: Duration,
-    /// Minimum free disk (GB) a worker must report to pass the disk dimension.
+    /// Minimum free disk (GB) a worker must report on every probed root to pass
+    /// the disk dimension.
     pub min_disk_free_gb: f64,
+    /// Minimum free inodes a worker must report on every probed root.
+    pub min_disk_inodes: u64,
+    /// Disk roots whose capacity/inodes the probe reports (the roots real builds
+    /// use). 11.1's mount-aware policy can supply precise roots; the default
+    /// covers the standard transfer base.
+    pub disk_roots: Vec<String>,
     /// Maximum load-per-core a worker may report to pass the load dimension.
     pub max_load_per_core: f64,
+    /// Minimum worker wire protocol required. Held at 0 because the current
+    /// `rch-wkr` exposes no `--protocol-version`; raise once it does so a stale
+    /// binary's missing handshake fails the protocol dimension distinctly.
+    pub min_protocol: u32,
+    /// rustup targets a recovered worker must have installed (e.g.
+    /// `wasm32-unknown-unknown`). Empty = only a working cargo/rustc is required.
+    pub required_targets: Vec<String>,
+    /// rustup toolchains a recovered worker must have (prefix-matched).
+    pub required_toolchains: Vec<String>,
     /// Maximum telemetry age that still counts as "fresh".
     pub telemetry_max_age: Duration,
     /// The canary command run over the SSH path before full rejoin.
@@ -83,7 +104,12 @@ impl Default for BypassRecoveryConfig {
             check_interval: Duration::from_secs(30),
             probe_timeout: Duration::from_secs(10),
             min_disk_free_gb: 5.0,
+            min_disk_inodes: 10_000,
+            disk_roots: vec!["/tmp".to_string(), "/tmp/rch".to_string()],
             max_load_per_core: 4.0,
+            min_protocol: 0,
+            required_targets: Vec::new(),
+            required_toolchains: Vec::new(),
             telemetry_max_age: Duration::from_secs(120),
             // A lightweight toolchain exercise through the same SSH transport
             // real builds use. Configurable for heavier canaries.
@@ -125,12 +151,49 @@ impl SshRecoveryProber {
         Self { telemetry, config }
     }
 
+    /// The exact absolute path to `rch-wkr` for the worker's SSH user. The
+    /// capability probe shell-quotes this path (no `~`/`$HOME` expansion), so it
+    /// must be absolute; a wrong path simply omits the worker-binary fact, which
+    /// keeps the worker bypassed (the safe failure mode — never a false rejoin).
+    fn rch_wkr_path(user: &str) -> String {
+        let home = if user == "root" {
+            "/root".to_string()
+        } else {
+            format!("/home/{user}")
+        };
+        format!("{home}/.local/bin/rch-wkr")
+    }
+
+    /// Build the exact-path capability [`ProbeSpec`] for a worker.
+    fn probe_spec(&self, config: &WorkerConfig) -> ProbeSpec {
+        let mut spec = ProbeSpec::new(config.user.clone(), Self::rch_wkr_path(&config.user));
+        spec.disk_roots.clone_from(&self.config.disk_roots);
+        spec
+    }
+
+    fn ssh_options(&self) -> SshOptions {
+        SshOptions {
+            command_timeout: self.config.probe_timeout,
+            connect_timeout: self.config.probe_timeout,
+            ..Default::default()
+        }
+    }
+
+    /// Run a command on the worker over SSH, returning its stdout, or `None` if
+    /// the worker is unreachable (connect/exec failed).
+    async fn ssh_run(&self, config: &WorkerConfig, command: &str) -> Option<String> {
+        let mut client = SshClient::new(config.clone(), self.ssh_options());
+        if client.connect().await.is_err() {
+            return None;
+        }
+        client.execute(command).await.ok().map(|r| r.stdout)
+    }
+
     /// Whether the worker's most recent telemetry sample is within tolerance.
     /// No sample at all is treated as stale — a worker with no fresh telemetry
     /// must not rejoin (the bead's "stale telemetry must not rejoin" property).
-    async fn telemetry_fresh(&self, worker: &Arc<WorkerState>) -> bool {
-        let id = worker.config.read().await.id.to_string();
-        match self.telemetry.latest(&id) {
+    async fn telemetry_fresh(&self, worker_id: &str) -> bool {
+        match self.telemetry.latest(worker_id) {
             Some(sample) => Utc::now()
                 .signed_duration_since(sample.received_at)
                 .to_std()
@@ -138,55 +201,132 @@ impl SshRecoveryProber {
             None => false,
         }
     }
+
+    /// Derive load-per-core from the appended `loadavg1`/`nproc` probe facts.
+    fn parse_load_per_core(stdout: &str) -> Option<f64> {
+        let (mut load1, mut nproc): (Option<f64>, Option<f64>) = (None, None);
+        for line in stdout.lines() {
+            let Some(kv) = line.trim().strip_prefix(FACT_PREFIX) else {
+                continue;
+            };
+            if let Some(v) = kv.strip_prefix("loadavg1=") {
+                load1 = v.trim().parse().ok();
+            } else if let Some(v) = kv.strip_prefix("nproc=") {
+                nproc = v.trim().parse().ok();
+            }
+        }
+        match (load1, nproc) {
+            (Some(l), Some(n)) if n > 0.0 => Some(l / n),
+            _ => None,
+        }
+    }
+}
+
+/// Map exact-path capability [`ProbedFacts`] (+ fresh load + telemetry verdict)
+/// onto the 7-dimension [`RecoveryProbe`]. Pure, so the dimension fidelity is
+/// unit-tested without real SSH.
+///
+/// `worker_binary_ok` requires the exact-path `rch-wkr` to have reported a
+/// version; `toolchain_ok` requires cargo plus every configured target/toolchain;
+/// `disk_ok` requires every probed root to clear both the byte and inode floor.
+/// A reachable worker with a dimension we could not measure (no probed disk
+/// roots, no load fact) is not trapped on that dimension. A fully empty parse is
+/// unreachable — every dimension fails.
+fn assess_probe_facts(
+    facts: &rch_common::capability_probe::ProbedFacts,
+    load_per_core: Option<f64>,
+    telemetry_ok: bool,
+    config: &BypassRecoveryConfig,
+) -> RecoveryProbe {
+    // The script always emits os/arch/user (uname/id); their total absence means
+    // the shell never ran -> unreachable.
+    let reachable = facts.os.is_some() || facts.arch.is_some() || facts.probed_user.is_some();
+    if !reachable {
+        return RecoveryProbe {
+            ssh_ok: false,
+            worker_binary_ok: false,
+            protocol_ok: false,
+            toolchain_ok: false,
+            disk_ok: false,
+            load_ok: false,
+            telemetry_ok: false,
+        };
+    }
+
+    let worker_binary_ok = facts.worker.is_some();
+    let protocol_ok = facts
+        .worker
+        .as_ref()
+        .is_some_and(|w| w.protocol_version >= config.min_protocol);
+    let toolchain_ok = facts.rust.rustc_version.is_some()
+        && config
+            .required_targets
+            .iter()
+            .all(|t| facts.rust.targets.iter().any(|have| have == t))
+        && config.required_toolchains.iter().all(|t| {
+            facts
+                .rust
+                .toolchains
+                .iter()
+                .any(|have| have.starts_with(t.as_str()))
+        });
+    let min_bytes = (config.min_disk_free_gb * BYTES_PER_GB) as u64;
+    let disk_ok = if facts.disk_roots.is_empty() {
+        true
+    } else {
+        facts
+            .disk_roots
+            .iter()
+            .all(|r| r.available_bytes >= min_bytes && r.available_inodes >= config.min_disk_inodes)
+    };
+    let load_ok = load_per_core.is_none_or(|lpc| lpc <= config.max_load_per_core);
+
+    RecoveryProbe {
+        ssh_ok: true,
+        worker_binary_ok,
+        protocol_ok,
+        toolchain_ok,
+        disk_ok,
+        load_ok,
+        telemetry_ok,
+    }
 }
 
 impl RecoveryProber for SshRecoveryProber {
     async fn probe(&self, worker: Arc<WorkerState>) -> RecoveryProbe {
-        // A successful capability probe means SSH connected, the rch-wkr binary
-        // at the configured path ran, and emitted a parseable protocol response.
-        let caps = probe_worker_capabilities(&worker, self.config.probe_timeout).await;
-        let reachable = caps.is_some();
-        let toolchain_ok = caps
-            .as_ref()
-            .is_some_and(rch_common::WorkerCapabilities::has_rust);
-        // For disk/load: a reported breach fails the dimension; a missing metric
-        // on an otherwise-reachable worker is not held against it (those are
-        // separately gated at admission/selection), but an unreachable worker
-        // fails everything.
-        let disk_ok = match caps
-            .as_ref()
-            .and_then(|c| c.is_low_disk(self.config.min_disk_free_gb))
-        {
-            Some(low) => !low,
-            None => reachable,
+        let config = worker.config.read().await.clone();
+        let spec = self.probe_spec(&config);
+        // The 12.2 exact-path capability script (rch-wkr --version at the exact
+        // path, rustup toolchains/targets, df -Pk/-Pi disk+inode roots), plus a
+        // fresh load probe the capability script doesn't cover.
+        let mut script = build_capability_probe_script(&spec);
+        script.push_str(
+            " la=$(awk 'NR==1{print $1}' /proc/loadavg 2>/dev/null) && printf '%sloadavg1=%s\\n' \"$P\" \"$la\"; \
+             nc=$(nproc 2>/dev/null) && printf '%snproc=%s\\n' \"$P\" \"$nc\"; ",
+        );
+
+        let Some(stdout) = self.ssh_run(&config, &script).await else {
+            // SSH/shell never ran -> unreachable; every dimension fails.
+            return RecoveryProbe {
+                ssh_ok: false,
+                worker_binary_ok: false,
+                protocol_ok: false,
+                toolchain_ok: false,
+                disk_ok: false,
+                load_ok: false,
+                telemetry_ok: false,
+            };
         };
-        let load_ok = match caps
-            .as_ref()
-            .and_then(|c| c.is_high_load(self.config.max_load_per_core))
-        {
-            Some(high) => !high,
-            None => reachable,
-        };
-        let telemetry_ok = self.telemetry_fresh(&worker).await;
-        RecoveryProbe {
-            ssh_ok: reachable,
-            worker_binary_ok: reachable,
-            protocol_ok: reachable,
-            toolchain_ok,
-            disk_ok,
-            load_ok,
-            telemetry_ok,
-        }
+
+        let facts = parse_capability_probe(&stdout);
+        let load_per_core = Self::parse_load_per_core(&stdout);
+        let telemetry_ok = self.telemetry_fresh(config.id.as_str()).await;
+        assess_probe_facts(&facts, load_per_core, telemetry_ok, &self.config)
     }
 
     async fn canary(&self, worker: Arc<WorkerState>) -> CanaryOutcome {
         let config = worker.config.read().await.clone();
-        let options = SshOptions {
-            command_timeout: self.config.probe_timeout,
-            connect_timeout: self.config.probe_timeout,
-            ..Default::default()
-        };
-        let mut client = SshClient::new(config, options);
+        let mut client = SshClient::new(config, self.ssh_options());
         if client.connect().await.is_err() {
             return CanaryOutcome::Failed;
         }
@@ -445,9 +585,34 @@ impl<P: RecoveryProber + 'static> BypassRecoveryService<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rch_common::WorkerConfig;
     use rch_common::bypass_record::AutoRejoinCriteria;
+    use rch_common::capability_probe::ProbedFacts;
     use std::collections::VecDeque;
+
+    const GB: u64 = 1024 * 1024 * 1024;
+
+    /// A fully-healthy fact set, built through the real `parse_capability_probe`
+    /// so the test also pins the probe-output contract. Disk is reported in KiB
+    /// (`df -Pk`): 50 GiB free, 1M inodes on `/tmp`.
+    fn facts_all_good() -> ProbedFacts {
+        let out = [
+            "RCH_FACT os=linux",
+            "RCH_FACT arch=x86_64",
+            "RCH_FACT user=ubuntu",
+            "RCH_FACT rch_wkr_path=/home/ubuntu/.local/bin/rch-wkr",
+            "RCH_FACT worker_version=rch-wkr 1.0.41",
+            "RCH_FACT worker_protocol=1",
+            "RCH_FACT cargo_version=cargo 1.90",
+            "RCH_FACT toolchain=nightly-2026-05-22-x86_64-unknown-linux-gnu",
+            "RCH_FACT target=x86_64-unknown-linux-gnu",
+            "RCH_FACT target=wasm32-unknown-unknown",
+            "RCH_FACT disk=/tmp;104857600;52428800;1000000",
+        ]
+        .join("\n");
+        let facts = parse_capability_probe(&out);
+        assert_eq!(facts.disk_roots[0].available_bytes, 50 * GB);
+        facts
+    }
 
     /// A scripted prober: returns queued probe outcomes (falling back to a
     /// default) and a fixed canary outcome.
@@ -883,6 +1048,155 @@ mod tests {
         assert_eq!(
             before, after,
             "re-detecting an already-recorded worker is a no-op"
+        );
+    }
+
+    #[test]
+    fn assess_facts_all_good_is_fully_healthy() {
+        let probe = assess_probe_facts(
+            &facts_all_good(),
+            Some(0.5),
+            true,
+            &BypassRecoveryConfig::default(),
+        );
+        assert!(probe.fully_healthy(), "{:?}", probe.first_failure());
+    }
+
+    #[test]
+    fn assess_facts_empty_parse_is_unreachable() {
+        let probe = assess_probe_facts(
+            &ProbedFacts::default(),
+            None,
+            true,
+            &BypassRecoveryConfig::default(),
+        );
+        assert!(!probe.ssh_ok);
+        assert_eq!(probe.first_failure(), Some("ssh"));
+    }
+
+    #[test]
+    fn assess_facts_missing_exact_path_binary_fails_binary_and_protocol() {
+        let mut f = facts_all_good();
+        f.worker = None; // exact-path rch-wkr never reported a version
+        let probe = assess_probe_facts(&f, Some(0.1), true, &BypassRecoveryConfig::default());
+        assert!(probe.ssh_ok);
+        assert!(!probe.worker_binary_ok);
+        assert!(!probe.protocol_ok);
+        assert!(!probe.fully_healthy());
+    }
+
+    #[test]
+    fn assess_facts_missing_cargo_or_required_target_fails_toolchain() {
+        let mut no_cargo = facts_all_good();
+        no_cargo.rust.rustc_version = None;
+        assert!(
+            !assess_probe_facts(&no_cargo, Some(0.1), true, &BypassRecoveryConfig::default())
+                .toolchain_ok
+        );
+
+        let mut no_wasm = facts_all_good();
+        no_wasm.rust.targets = vec!["x86_64-unknown-linux-gnu".to_string()];
+        let needs_wasm = BypassRecoveryConfig {
+            required_targets: vec!["wasm32-unknown-unknown".to_string()],
+            ..BypassRecoveryConfig::default()
+        };
+        assert!(!assess_probe_facts(&no_wasm, Some(0.1), true, &needs_wasm).toolchain_ok);
+        // ...but the all-good facts DO have the wasm target.
+        assert!(assess_probe_facts(&facts_all_good(), Some(0.1), true, &needs_wasm).toolchain_ok);
+    }
+
+    #[test]
+    fn assess_facts_low_disk_or_inodes_fails_disk() {
+        let mut low_bytes = facts_all_good();
+        low_bytes.disk_roots[0].available_bytes = GB; // 1 GiB < 5 GiB floor
+        assert!(
+            !assess_probe_facts(
+                &low_bytes,
+                Some(0.1),
+                true,
+                &BypassRecoveryConfig::default()
+            )
+            .disk_ok
+        );
+
+        let mut low_inodes = facts_all_good();
+        low_inodes.disk_roots[0].available_inodes = 5; // < 10_000 floor
+        assert!(
+            !assess_probe_facts(
+                &low_inodes,
+                Some(0.1),
+                true,
+                &BypassRecoveryConfig::default()
+            )
+            .disk_ok
+        );
+    }
+
+    #[test]
+    fn assess_facts_no_probed_roots_does_not_trap_disk() {
+        let mut f = facts_all_good();
+        f.disk_roots.clear();
+        assert!(
+            assess_probe_facts(&f, Some(0.1), true, &BypassRecoveryConfig::default()).disk_ok,
+            "an unmeasurable disk dimension must not trap a reachable worker"
+        );
+    }
+
+    #[test]
+    fn assess_facts_high_load_fails_but_unknown_load_is_lenient() {
+        assert!(
+            !assess_probe_facts(
+                &facts_all_good(),
+                Some(99.0),
+                true,
+                &BypassRecoveryConfig::default()
+            )
+            .load_ok
+        );
+        assert!(
+            assess_probe_facts(
+                &facts_all_good(),
+                None,
+                true,
+                &BypassRecoveryConfig::default()
+            )
+            .load_ok
+        );
+    }
+
+    #[test]
+    fn assess_facts_stale_telemetry_fails_telemetry() {
+        let probe = assess_probe_facts(
+            &facts_all_good(),
+            Some(0.1),
+            false,
+            &BypassRecoveryConfig::default(),
+        );
+        assert!(!probe.telemetry_ok);
+        assert!(!probe.fully_healthy());
+    }
+
+    #[test]
+    fn parse_load_per_core_divides_loadavg_by_cores() {
+        let out = "incidental noise\nRCH_FACT loadavg1=2.0\nRCH_FACT nproc=4\nRCH_FACT os=linux\n";
+        assert_eq!(SshRecoveryProber::parse_load_per_core(out), Some(0.5));
+        // Missing nproc or empty -> unmeasurable.
+        assert_eq!(
+            SshRecoveryProber::parse_load_per_core("RCH_FACT loadavg1=2.0\n"),
+            None
+        );
+        assert_eq!(SshRecoveryProber::parse_load_per_core(""), None);
+    }
+
+    #[test]
+    fn rch_wkr_path_is_absolute_per_user() {
+        assert_eq!(
+            SshRecoveryProber::rch_wkr_path("ubuntu"),
+            "/home/ubuntu/.local/bin/rch-wkr"
+        );
+        assert_eq!(
+            SshRecoveryProber::rch_wkr_path("root"),
+            "/root/.local/bin/rch-wkr"
         );
     }
 }
