@@ -29,13 +29,16 @@ use rch_common::repo_updater_contract::{
 };
 use rch_common::{
     BuildHeartbeatPhase, BuildHeartbeatRequest, ColorMode, CommandPriority, CommandTimingBreakdown,
-    CompilationKind, DependencyClosurePlan, HookInput, HookOutput, OutputVisibility,
-    REPO_UPDATER_CANONICAL_PROJECTS_ROOT, RepoUpdaterAdapterCommand, RepoUpdaterAdapterContract,
-    RepoUpdaterAdapterRequest, RepoUpdaterOutputFormat, RequiredRuntime, SelectedWorker,
-    SelectionReason, SelectionResponse, SelfHealingConfig, ToolchainInfo, TransferConfig,
-    WorkerConfig, WorkerId, build_dependency_closure_plan_with_policy, build_invocation,
-    classify_command, mock, normalize_project_path_with_policy,
+    CompilationKind, ControlState, DependencyClosurePlan, HookInput, HookOutput, IncidentEvent,
+    IncidentEventType, IncidentLedger, IncidentLedgerConfig, IncidentReasonCode, IncidentSource,
+    OutputVisibility, REPO_UPDATER_CANONICAL_PROJECTS_ROOT, RepoUpdaterAdapterCommand,
+    RepoUpdaterAdapterContract, RepoUpdaterAdapterRequest, RepoUpdaterOutputFormat,
+    RequiredRuntime, SelectedMode, SelectedWorker, SelectionReason, SelectionResponse,
+    SelfHealingConfig, ToolchainInfo, TransferConfig, WorkerConfig, WorkerId,
+    build_dependency_closure_plan_with_policy, build_invocation, classify_command,
+    default_socket_path, mock, normalize_project_path_with_policy,
     path_topology::PathTopologyPolicy,
+    redaction::{redact_path, redact_secrets},
     ui::{
         ArtifactSummary, CelebrationSummary, CompilationProgress, CompletionCelebration, Icons,
         OutputContext, RchTheme, TransferProgress,
@@ -619,6 +622,260 @@ fn exit_with_local_fallback(command: &str, reporter: &HookReporter, reason: &str
     }
 }
 
+// ---------------------------------------------------------------------------
+// Hook daemon-recovery: socket-failure classification, configured-vs-canonical
+// socket mismatch detection, and durable structured-incident emission
+// (bd-session-history-remediation-ocv9i.3.1).
+//
+// When the hook cannot reach the daemon it must record *why* — a missing,
+// refused, or stale socket, or a configured-vs-canonical socket-path mismatch —
+// as a durable structured incident, attempt a bounded daemon autostart and one
+// selection retry, then either proceed remotely or fall back / refuse (proof
+// mode) loudly. All of this lives on the slow recovery path; the fast
+// non-compilation classification budget is never touched.
+//
+// The decision cores are pure so the six bead scenarios (refused / stale /
+// wrong-configured socket, daemon start success / failure, proof-mode refusal)
+// are unit-testable without spawning a daemon; the side effects (autostart,
+// ledger append) are thin wrappers around them.
+// ---------------------------------------------------------------------------
+
+/// Why the hook could not reach the daemon over its Unix socket. Reported in
+/// the `socket_failure` incident detail so postmortems can tell a never-started
+/// daemon (`missing`) from a crashed one (`refused`/`stale`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SocketFailureKind {
+    /// The socket file does not exist (daemon never created it, or wrong path).
+    Missing,
+    /// The socket exists but refused the connection (no live listener).
+    Refused,
+    /// The socket exists and connected but the daemon did not respond in time.
+    Stale,
+    /// Any other daemon-query failure (protocol/read error, malformed response).
+    Other,
+}
+
+impl SocketFailureKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            SocketFailureKind::Missing => "missing",
+            SocketFailureKind::Refused => "refused",
+            SocketFailureKind::Stale => "stale",
+            SocketFailureKind::Other => "other",
+        }
+    }
+}
+
+/// Classify a [`query_daemon`] failure for incident reporting. Pure: inspects
+/// the error chain plus whether the socket file is present on disk.
+fn classify_socket_failure(err: &anyhow::Error, socket_exists: bool) -> SocketFailureKind {
+    // Explicit daemon-side signals from query_daemon.
+    if let Some(daemon_err) = err.downcast_ref::<DaemonError>() {
+        match daemon_err {
+            DaemonError::SocketNotFound { .. } | DaemonError::NotRunning => {
+                return SocketFailureKind::Missing;
+            }
+            DaemonError::ConnectionFailed { .. } | DaemonError::SocketPermissionDenied { .. } => {
+                return SocketFailureKind::Refused;
+            }
+            _ => {}
+        }
+    }
+    // Raw std::io errors surfaced from UnixStream::connect (wrapped by `?`).
+    for cause in err.chain() {
+        if let Some(io_err) = cause.downcast_ref::<std::io::Error>() {
+            return match io_err.kind() {
+                std::io::ErrorKind::NotFound => SocketFailureKind::Missing,
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::PermissionDenied => {
+                    SocketFailureKind::Refused
+                }
+                std::io::ErrorKind::TimedOut => SocketFailureKind::Stale,
+                _ if socket_exists => SocketFailureKind::Stale,
+                _ => SocketFailureKind::Other,
+            };
+        }
+    }
+    // The 5s connect timeout is an anyhow string error with no io::Error source.
+    if err.to_string().contains("timed out") {
+        return SocketFailureKind::Stale;
+    }
+    if socket_exists {
+        SocketFailureKind::Stale
+    } else {
+        SocketFailureKind::Missing
+    }
+}
+
+/// A configured-vs-canonical socket-path disagreement. Like the daemon's
+/// startup-consistency probe, the hook reports this drift but **never** rewrites
+/// operator-owned config — detection and loud reporting only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SocketPathMismatch {
+    configured: String,
+    canonical: String,
+    /// Whether the canonical default socket exists (a live daemon there is the
+    /// likely reason the hook missed it on the configured path).
+    canonical_exists: bool,
+}
+
+/// Lexical socket-path equivalence (trims surrounding whitespace; exact match
+/// otherwise — mirrors the daemon startup-consistency `PathBuf` comparison).
+fn socket_paths_equivalent(a: &str, b: &str) -> bool {
+    a.trim() == b.trim()
+}
+
+/// Detect a "wrong configured socket" condition: the configured socket path
+/// differs from the canonical default. Returns `None` when they agree. Pure —
+/// the caller supplies `canonical` and `canonical_exists` so this is testable
+/// without filesystem or environment access.
+fn detect_socket_path_mismatch(
+    configured: &str,
+    canonical: &str,
+    canonical_exists: bool,
+) -> Option<SocketPathMismatch> {
+    if socket_paths_equivalent(configured, canonical) {
+        return None;
+    }
+    Some(SocketPathMismatch {
+        configured: configured.to_string(),
+        canonical: canonical.to_string(),
+        canonical_exists,
+    })
+}
+
+/// Terminal action after a daemon-socket failure plus a bounded autostart and
+/// one selection retry. Pure so the bead's daemon-start-success / failure /
+/// proof-mode-refusal scenarios are unit-testable without spawning a daemon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DaemonRecoveryAction {
+    /// The daemon answered after autostart + retry — proceed remotely.
+    ProceedRemote,
+    /// Fail-open: run the command locally (records `LocalFallback`, RCH-I011).
+    LocalFallback,
+    /// Proof mode: refuse local fallback (records `ProofRefusal`, RCH-I012) and
+    /// exit fail-closed.
+    Refuse,
+}
+
+/// Decide the terminal action. `retry_succeeded` is whether the post-autostart
+/// selection retry produced a usable daemon response. A successful retry always
+/// wins; otherwise proof mode refuses and convenience mode falls back.
+fn decide_recovery_action(retry_succeeded: bool, strict_remote: bool) -> DaemonRecoveryAction {
+    if retry_succeeded {
+        DaemonRecoveryAction::ProceedRemote
+    } else if strict_remote {
+        DaemonRecoveryAction::Refuse
+    } else {
+        DaemonRecoveryAction::LocalFallback
+    }
+}
+
+/// Current wall-clock time as Unix epoch milliseconds. The hook is a real
+/// process, so wall-clock is appropriate here (unlike the clock-free pure
+/// rch-common modules); a pre-epoch clock — impossible in practice — yields 0.
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+/// Build the structured incident for a daemon-socket failure (RCH-I010). The
+/// `selected_mode` is recorded as `Local` because at detection time the build
+/// has not yet been steered; the terminal local-fallback / proof-refusal
+/// incident records the final disposition.
+fn build_socket_failure_incident(
+    kind: SocketFailureKind,
+    mismatch: Option<&SocketPathMismatch>,
+    project: &str,
+    command_fingerprint: &str,
+    strict_remote: bool,
+    now_ms: u64,
+) -> IncidentEvent {
+    let mut event = IncidentEvent::new(
+        IncidentEventType::Selection,
+        IncidentReasonCode::DaemonSocketRefused,
+        IncidentSource::Hook,
+        project,
+        command_fingerprint,
+        SelectedMode::Local,
+        !strict_remote,
+        now_ms,
+    )
+    .with_detail("socket_failure", kind.as_str())
+    .with_control(ControlState {
+        strict_remote_policy: strict_remote,
+        ..ControlState::default()
+    });
+    if let Some(m) = mismatch {
+        event = event
+            .with_detail("socket_path_mismatch", "true")
+            .with_detail("configured_socket", redact_path(&m.configured))
+            .with_detail("canonical_socket", redact_path(&m.canonical))
+            .with_detail("canonical_socket_exists", m.canonical_exists.to_string());
+    }
+    event
+}
+
+/// Build the terminal incident after autostart + retry could not restore the
+/// daemon: `ProofRefusal` (RCH-I012) when proof mode forbids local fallback,
+/// else `LocalFallback` (RCH-I011).
+fn build_recovery_terminal_incident(
+    strict_remote: bool,
+    project: &str,
+    command_fingerprint: &str,
+    detail_reason: &str,
+    now_ms: u64,
+) -> IncidentEvent {
+    let (reason_code, event_type) = if strict_remote {
+        (IncidentReasonCode::ProofRefusal, IncidentEventType::Proof)
+    } else {
+        (
+            IncidentReasonCode::LocalFallback,
+            IncidentEventType::Fallback,
+        )
+    };
+    IncidentEvent::new(
+        event_type,
+        reason_code,
+        IncidentSource::Hook,
+        project,
+        command_fingerprint,
+        SelectedMode::Local,
+        !strict_remote,
+        now_ms,
+    )
+    .with_detail("reason", detail_reason.to_string())
+    .with_control(ControlState {
+        strict_remote_policy: strict_remote,
+        ..ControlState::default()
+    })
+}
+
+/// Append `event` to the durable incident ledger, best-effort. Incident logging
+/// must never break a build, so a write failure is logged and swallowed. A
+/// tracing breadcrumb is always emitted so the incident is visible even when the
+/// ledger write fails. The ledger lives off the hot path, so the append cost
+/// (one buffered line) does not affect the classification budgets.
+fn record_hook_incident(event: &IncidentEvent) {
+    warn!(
+        target: "rch::hook::incident",
+        reason_code = %event.reason_code,
+        failure_class = event.reason_code.failure_class(),
+        selected_mode = ?event.selected_mode,
+        local_fallback_allowed = event.local_fallback_allowed,
+        "hook incident recorded",
+    );
+    let ledger = IncidentLedger::new(IncidentLedgerConfig::default());
+    if let Err(e) = ledger.append(event) {
+        warn!(
+            target: "rch::hook::incident",
+            error = %e,
+            "failed to append incident to ledger (continuing)",
+        );
+    }
+}
+
 pub async fn run_exec(command_parts: Vec<String>) -> anyhow::Result<()> {
     let command = join_exec_command(&command_parts);
     if command.is_empty() {
@@ -702,15 +959,38 @@ pub async fn run_exec(command_parts: Vec<String>) -> anyhow::Result<()> {
     {
         Ok(resp) => resp,
         Err(e) => {
-            warn!("Failed to query daemon: {}, running locally", e);
-            // Try auto-start daemon
-            if let Ok(()) =
-                try_auto_start_daemon(&config.self_healing, Path::new(&config.general.socket_path))
-                    .await
+            warn!("Failed to query daemon: {}, attempting recovery", e);
+
+            // Classify the failure and detect a configured-vs-canonical socket
+            // mismatch, then record a durable structured incident (RCH-I010)
+            // so postmortems can see *why* the hook could not reach the daemon.
+            let socket_path = config.general.socket_path.clone();
+            let socket_exists = Path::new(&socket_path).exists();
+            let failure_kind = classify_socket_failure(&e, socket_exists);
+            let strict_remote = exec_requires_remote();
+            let canonical_socket = default_socket_path();
+            let canonical_exists = Path::new(&canonical_socket).exists();
+            let mismatch =
+                detect_socket_path_mismatch(&socket_path, &canonical_socket, canonical_exists);
+            // Privacy-safe fingerprint (secrets and home paths masked).
+            let command_fingerprint = redact_secrets(&command);
+
+            record_hook_incident(&build_socket_failure_incident(
+                failure_kind,
+                mismatch.as_ref(),
+                &project,
+                &command_fingerprint,
+                strict_remote,
+                now_unix_ms(),
+            ));
+
+            // Attempt a bounded daemon autostart, then retry selection ONCE.
+            let retry = if try_auto_start_daemon(&config.self_healing, Path::new(&socket_path))
+                .await
+                .is_ok()
             {
-                // Retry query
-                match query_daemon(
-                    &config.general.socket_path,
+                query_daemon(
+                    &socket_path,
                     &project,
                     estimated_cores,
                     &remote_command,
@@ -723,16 +1003,44 @@ pub async fn run_exec(command_parts: Vec<String>) -> anyhow::Result<()> {
                     &preferred_workers,
                 )
                 .await
-                {
-                    Ok(resp) => resp,
-                    Err(_) => {
-                        reporter.summary("[RCH] local (daemon unavailable)");
-                        exit_with_local_fallback(&command, &reporter, "daemon unavailable");
-                    }
-                }
+                .ok()
             } else {
-                reporter.summary("[RCH] local (daemon unavailable)");
-                exit_with_local_fallback(&command, &reporter, "daemon unavailable");
+                None
+            };
+
+            match decide_recovery_action(retry.is_some(), strict_remote) {
+                // Daemon came back after autostart + retry — proceed remotely.
+                // ProceedRemote implies `retry` is Some; fail open defensively
+                // rather than panicking if that invariant is ever violated.
+                DaemonRecoveryAction::ProceedRemote => retry.unwrap_or_else(|| {
+                    reporter.summary("[RCH] local (daemon unavailable)");
+                    exit_with_local_fallback(&command, &reporter, "daemon unavailable");
+                }),
+                // Fail-open convenience lane: record the fallback and run local.
+                DaemonRecoveryAction::LocalFallback => {
+                    record_hook_incident(&build_recovery_terminal_incident(
+                        false,
+                        &project,
+                        &command_fingerprint,
+                        "daemon unavailable",
+                        now_unix_ms(),
+                    ));
+                    reporter.summary("[RCH] local (daemon unavailable)");
+                    exit_with_local_fallback(&command, &reporter, "daemon unavailable");
+                }
+                // Proof lane: record the refusal and fail closed.
+                // exit_with_local_fallback also refuses under proof mode and
+                // prints the explicit "remote required" refusal summary.
+                DaemonRecoveryAction::Refuse => {
+                    record_hook_incident(&build_recovery_terminal_incident(
+                        true,
+                        &project,
+                        &command_fingerprint,
+                        "daemon unavailable",
+                        now_unix_ms(),
+                    ));
+                    exit_with_local_fallback(&command, &reporter, "daemon unavailable");
+                }
             }
         }
     };
@@ -14110,6 +14418,231 @@ edition = "2024"
         assert!(
             matches!(result.unwrap_err(), super::AutoStartError::Disabled),
             "Error should be Disabled"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // bd-session-history-remediation-ocv9i.3.1: hook socket-failure recovery.
+    // The six bead scenarios exercised against the pure decision cores and the
+    // structured incidents they emit — no daemon spawn required.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_classify_socket_failure_missing_when_socket_not_found() {
+        let err: anyhow::Error = super::DaemonError::SocketNotFound {
+            socket_path: "/run/rch/rch.sock".to_string(),
+        }
+        .into();
+        // The socket file is genuinely absent.
+        assert_eq!(
+            super::classify_socket_failure(&err, false),
+            super::SocketFailureKind::Missing
+        );
+    }
+
+    #[test]
+    fn test_classify_socket_failure_refused_socket() {
+        // Scenario: refused socket (no live listener on an existing socket).
+        let err = anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::ConnectionRefused));
+        assert_eq!(
+            super::classify_socket_failure(&err, true),
+            super::SocketFailureKind::Refused
+        );
+    }
+
+    #[test]
+    fn test_classify_socket_failure_stale_socket_on_timeout() {
+        // Scenario: stale socket. The 5s connect timeout is a plain anyhow
+        // string error (no io::Error source).
+        let err = anyhow::anyhow!("Daemon connect timed out after 5s");
+        assert_eq!(
+            super::classify_socket_failure(&err, true),
+            super::SocketFailureKind::Stale
+        );
+        // A TimedOut io error classifies the same way.
+        let io_timeout = anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::TimedOut));
+        assert_eq!(
+            super::classify_socket_failure(&io_timeout, true),
+            super::SocketFailureKind::Stale
+        );
+    }
+
+    #[test]
+    fn test_detect_socket_path_mismatch_wrong_configured_socket() {
+        // Scenario: wrong configured socket. Configured path differs from the
+        // canonical default => reported mismatch (detection only).
+        let mismatch = super::detect_socket_path_mismatch(
+            "/tmp/custom-rch.sock",
+            "/home/dev/.cache/rch/rch.sock",
+            true,
+        )
+        .expect("differing paths must be reported as a mismatch");
+        assert_eq!(mismatch.configured, "/tmp/custom-rch.sock");
+        assert_eq!(mismatch.canonical, "/home/dev/.cache/rch/rch.sock");
+        assert!(mismatch.canonical_exists);
+        // Equivalent paths (ignoring surrounding whitespace) => no mismatch.
+        assert!(
+            super::detect_socket_path_mismatch(
+                " /home/dev/.cache/rch/rch.sock ",
+                "/home/dev/.cache/rch/rch.sock",
+                true,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn test_decide_recovery_action_daemon_start_success_proceeds_remote() {
+        // Scenario: daemon start success. A successful retry proceeds remotely
+        // regardless of proof mode.
+        assert_eq!(
+            super::decide_recovery_action(true, false),
+            super::DaemonRecoveryAction::ProceedRemote
+        );
+        assert_eq!(
+            super::decide_recovery_action(true, true),
+            super::DaemonRecoveryAction::ProceedRemote
+        );
+    }
+
+    #[test]
+    fn test_decide_recovery_action_daemon_start_failure_falls_back_open() {
+        // Scenario: daemon start failure, convenience lane => fail open local.
+        assert_eq!(
+            super::decide_recovery_action(false, false),
+            super::DaemonRecoveryAction::LocalFallback
+        );
+    }
+
+    #[test]
+    fn test_decide_recovery_action_proof_mode_refuses() {
+        // Scenario: proof-mode refusal. Retry failed under proof mode => fail
+        // closed (refuse local fallback).
+        assert_eq!(
+            super::decide_recovery_action(false, true),
+            super::DaemonRecoveryAction::Refuse
+        );
+    }
+
+    #[test]
+    fn test_build_socket_failure_incident_records_reason_and_mismatch() {
+        let mismatch = super::SocketPathMismatch {
+            configured: "/home/alice/.cache/rch/rch.sock".to_string(),
+            canonical: "/home/alice/.config/rch/rch.sock".to_string(),
+            canonical_exists: true,
+        };
+        let event = super::build_socket_failure_incident(
+            super::SocketFailureKind::Refused,
+            Some(&mismatch),
+            "demo-project",
+            "cargo build --release",
+            false,
+            1_700_000_000_000,
+        );
+        assert_eq!(
+            event.reason_code,
+            rch_common::IncidentReasonCode::DaemonSocketRefused
+        );
+        assert_eq!(event.reason_code.code(), "RCH-I010");
+        assert_eq!(event.source, rch_common::IncidentSource::Hook);
+        assert_eq!(event.selected_mode, rch_common::SelectedMode::Local);
+        assert!(
+            event.local_fallback_allowed,
+            "convenience lane permits fallback"
+        );
+        assert_eq!(
+            event.details.get("socket_failure").map(String::as_str),
+            Some("refused")
+        );
+        assert_eq!(
+            event
+                .details
+                .get("socket_path_mismatch")
+                .map(String::as_str),
+            Some("true")
+        );
+        // Home segment must be masked in the recorded path detail.
+        let configured = event.details.get("configured_socket").unwrap();
+        assert!(
+            configured.contains("<redacted>"),
+            "home user must be masked: {configured}"
+        );
+        assert!(
+            !configured.contains("alice"),
+            "raw username must not leak: {configured}"
+        );
+        assert_eq!(
+            event
+                .details
+                .get("canonical_socket_exists")
+                .map(String::as_str),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn test_build_recovery_terminal_incident_proof_vs_fallback() {
+        // Proof mode => ProofRefusal (RCH-I012), no local fallback allowed.
+        let refusal = super::build_recovery_terminal_incident(
+            true,
+            "demo",
+            "cargo test",
+            "daemon unavailable",
+            1_700_000_000_001,
+        );
+        assert_eq!(
+            refusal.reason_code,
+            rch_common::IncidentReasonCode::ProofRefusal
+        );
+        assert_eq!(refusal.reason_code.code(), "RCH-I012");
+        assert!(!refusal.local_fallback_allowed);
+        assert!(refusal.control.strict_remote_policy);
+        // Convenience mode => LocalFallback (RCH-I011), fallback allowed.
+        let fallback = super::build_recovery_terminal_incident(
+            false,
+            "demo",
+            "cargo test",
+            "daemon unavailable",
+            1_700_000_000_002,
+        );
+        assert_eq!(
+            fallback.reason_code,
+            rch_common::IncidentReasonCode::LocalFallback
+        );
+        assert_eq!(fallback.reason_code.code(), "RCH-I011");
+        assert!(fallback.local_fallback_allowed);
+        assert!(!fallback.control.strict_remote_policy);
+    }
+
+    #[test]
+    fn test_socket_failure_incident_durably_appends_to_ledger() {
+        // End-to-end durable record: build the incident the hook emits, append
+        // it to a temp ledger, and read it back — proving the structured
+        // incident survives a process restart (no env mutation needed).
+        let dir = create_test_state_dir();
+        let ledger = rch_common::IncidentLedger::with_path(dir.path().join("incidents.jsonl"));
+        let event = super::build_socket_failure_incident(
+            super::SocketFailureKind::Stale,
+            None,
+            "demo",
+            "cargo check",
+            true,
+            1_700_000_000_003,
+        );
+        ledger.append(&event).expect("append must succeed");
+        let read = rch_common::IncidentLedger::with_path(ledger.path()).read_all();
+        assert_eq!(read.len(), 1);
+        assert_eq!(
+            read[0].reason_code,
+            rch_common::IncidentReasonCode::DaemonSocketRefused
+        );
+        assert_eq!(
+            read[0].details.get("socket_failure").map(String::as_str),
+            Some("stale")
+        );
+        assert!(
+            !read[0].local_fallback_allowed,
+            "proof mode records no fallback"
         );
     }
 

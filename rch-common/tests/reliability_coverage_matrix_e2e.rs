@@ -659,6 +659,43 @@ fn build_coverage_matrix() -> CoverageMatrix {
             has_log_assertion: true,
             gap: None,
         },
+        // ---------------------------------------------------------------
+        // Domain: Hook Daemon-Recovery
+        // ---------------------------------------------------------------
+        RequirementRow {
+            id: "REQ-HOOK-001".into(),
+            description: "Hook socket-failure recovery: classify missing/refused/stale socket and \
+                          configured-vs-canonical socket-path mismatch, record a durable \
+                          structured incident, autostart + retry once, then proceed remotely or \
+                          fall back (fail-open) / refuse (proof mode) loudly"
+                .into(),
+            domain: "hook_recovery".into(),
+            bead_id: "bd-session-history-remediation-ocv9i.3.1".into(),
+            test_refs: vec![TestRef {
+                file: "hook_socket_recovery_incident_e2e.rs".into(),
+                name_prefix: "e2e_hook_socket_".into(),
+                tier: "smoke".into(),
+            }],
+            artifact_assertions: vec![
+                "Refused/stale/missing socket records DaemonSocketRefused (RCH-I010) with the \
+                 socket_failure failure class"
+                    .into(),
+                "Wrong configured socket records the configured/canonical mismatch with home \
+                 paths redacted"
+                    .into(),
+                "Daemon start success records only the detection incident (no terminal fallback)"
+                    .into(),
+                "Daemon start failure records LocalFallback (RCH-I011) with fallback allowed"
+                    .into(),
+                "Proof-mode refusal records ProofRefusal (RCH-I012) fail-closed (no fallback)"
+                    .into(),
+                "Incidents survive a process restart and carry a stable RCH-Innn reason token"
+                    .into(),
+            ],
+            has_executable_test: true,
+            has_log_assertion: true,
+            gap: None,
+        },
     ];
 
     let total = requirements.len();
@@ -710,6 +747,7 @@ const KNOWN_TEST_FILES: &[&str] = &[
     "performance_budget_e2e.rs",
     "remediation_hotpath_budget_e2e.rs",
     "proof_replay_conveyor_e2e.rs",
+    "hook_socket_recovery_incident_e2e.rs",
     "redaction_retention_e2e.rs",
     "contract_drift_e2e.rs",
     "feature_flags_rollout_e2e.rs",
