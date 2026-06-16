@@ -26,6 +26,11 @@ fn run_rch(args: &[&str]) -> (bool, String, String) {
         .env("NO_COLOR", "1")
         .env_remove("RCH_HOOK_MODE")
         .env_remove("RCH_JSON")
+        // Pin the output format to what each test's flags request, so an ambient
+        // RCH_OUTPUT_FORMAT/TOON_DEFAULT_FORMAT cannot turn a --json assertion's
+        // stdout into TOON and break JSON parsing.
+        .env_remove("RCH_OUTPUT_FORMAT")
+        .env_remove("TOON_DEFAULT_FORMAT")
         .output()
         .expect("failed to spawn the rch binary");
     (
@@ -49,6 +54,30 @@ fn envelope_data(stdout: &str) -> serde_json::Value {
         .get("data")
         .cloned()
         .expect("envelope should carry a data payload")
+}
+
+/// Collect every example command string a discovery payload emits
+/// (`recommended_commands`, `canonical_commands`, and each remediation
+/// workflow's `commands`).
+fn collect_command_strings(data: &serde_json::Value, out: &mut Vec<String>) {
+    for key in ["recommended_commands", "canonical_commands"] {
+        if let Some(arr) = data.get(key).and_then(|v| v.as_array()) {
+            for c in arr {
+                if let Some(s) = c.get("command").and_then(|v| v.as_str()) {
+                    out.push(s.to_string());
+                }
+            }
+        }
+    }
+    if let Some(arr) = data.get("remediation_workflows").and_then(|v| v.as_array()) {
+        for w in arr {
+            if let Some(cmds) = w.get("commands").and_then(|v| v.as_array()) {
+                for c in cmds.iter().filter_map(|c| c.as_str()) {
+                    out.push(c.to_string());
+                }
+            }
+        }
+    }
 }
 
 #[test]
@@ -400,4 +429,43 @@ fn test_completions_include_remediation_commands() {
     }
 
     crate::test_log!("TEST PASS: test_completions_include_remediation_commands");
+}
+
+#[test]
+fn test_discovery_examples_put_json_flag_before_trailing_command() {
+    init_test_logging();
+    crate::test_log!("TEST START: test_discovery_examples_put_json_flag_before_trailing_command");
+
+    // `admit`/`diagnose` use clap `trailing_var_arg`: any `--json` placed AFTER
+    // the command positional is swallowed into the command and never enables JSON
+    // output. Every example these surfaces emit must therefore put the flag
+    // before the (quoted) command. This guards against silently broken examples.
+    let mut commands = Vec::new();
+    let (_, cap, _) = run_rch(&["capabilities", "--json"]);
+    collect_command_strings(&envelope_data(&cap), &mut commands);
+    let (_, rd, _) = run_rch(&["robot-docs", "guide", "--json"]);
+    collect_command_strings(&envelope_data(&rd), &mut commands);
+    assert!(
+        !commands.is_empty(),
+        "expected some example commands to check"
+    );
+
+    for cmd in &commands {
+        let trailing_subcmd = cmd.contains("rch admit") || cmd.contains("rch diagnose");
+        let has_json_flag = cmd.contains("--json") || cmd.contains(" -j ");
+        if trailing_subcmd && has_json_flag {
+            let flag = cmd
+                .find("--json")
+                .or_else(|| cmd.find(" -j "))
+                .expect("flag present per the guard above");
+            if let Some(quote) = cmd.find('"') {
+                assert!(
+                    flag < quote,
+                    "`--json` is swallowed by trailing_var_arg; place it before the command: {cmd}"
+                );
+            }
+        }
+    }
+
+    crate::test_log!("TEST PASS: test_discovery_examples_put_json_flag_before_trailing_command");
 }

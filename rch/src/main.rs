@@ -2851,7 +2851,7 @@ fn recommended_commands() -> Vec<RecommendedCommand> {
             purpose: "Fast readiness probe with stable exit codes.".to_string(),
         },
         RecommendedCommand {
-            command: "rch diagnose \"cargo test\" --json".to_string(),
+            command: "rch diagnose --json \"cargo test\"".to_string(),
             purpose: "Explain whether a command will be offloaded.".to_string(),
         },
         RecommendedCommand {
@@ -2908,7 +2908,7 @@ fn reason_code_families() -> Vec<ReasonCodeFamily> {
                 },
                 ReasonCodeExample {
                     code: "RCH-E300".to_string(),
-                    meaning: "remote build failed".to_string(),
+                    meaning: "build compilation failed".to_string(),
                 },
             ],
         },
@@ -2968,7 +2968,7 @@ fn policies() -> Vec<PolicyCapability> {
                     .to_string(),
             reason_code: Some("RCH-I011".to_string()),
             next_action: "If you expected offload, inspect `rch status --remediation --json` and \
-                 `rch diagnose \"<cmd>\" --json`."
+                 `rch diagnose --json \"<cmd>\"`."
                 .to_string(),
         },
         PolicyCapability {
@@ -2980,7 +2980,7 @@ fn policies() -> Vec<PolicyCapability> {
                     .to_string(),
             reason_code: Some("RCH-I011".to_string()),
             next_action:
-                "Force an offload attempt; confirm routing with `rch diagnose \"<cmd>\" --json`."
+                "Force an offload attempt; confirm routing with `rch diagnose --json \"<cmd>\"`."
                     .to_string(),
         },
         PolicyCapability {
@@ -3083,7 +3083,7 @@ First commands to try:
   rch capabilities --json         Machine-readable command/env/exit-code map
   rch check --json                Fast readiness status
   rch status --workers --jobs --json
-  rch diagnose "cargo test" --json
+  rch diagnose --json "cargo test"
   rch doctor --dry-run --json
 
 Output rules:
@@ -3103,8 +3103,8 @@ Common workflows:
     rch check --json
 
   Explain routing:
-    rch diagnose "cargo build --release" --json
-    rch diagnose "bun test" --json
+    rch diagnose --json "cargo build --release"
+    rch diagnose --json "bun test"
 
   Inspect fleet health:
     rch workers list --json
@@ -3117,7 +3117,7 @@ Common workflows:
 
 Remediation workflows (machine-readable list under `remediation_workflows`):
   Admit before proof:
-    rch admit "cargo test" --json        # offload/local/queue/defer + required caps
+    rch admit --json "cargo test"        # offload/local/queue/defer + required caps
     RCH_REQUIRE_REMOTE=1 rch exec -- cargo test
 
   Proof mode (queued / refused / replayed):
@@ -3154,7 +3154,7 @@ Remediation workflows (machine-readable list under `remediation_workflows`):
 Dashboards and metrics:
   rch dashboard                          # interactive TUI (press 'R' for remediation)
   rch web                                # web dashboard incl. /remediation route
-  Daemon exposes Prometheus metrics for remediation state (see `rch doctor`).
+  rchd serves Prometheus metrics (rch_remediation_* families) at its /metrics endpoint.
 "#
 }
 
@@ -3169,7 +3169,7 @@ fn remediation_workflows() -> Vec<RemediationWorkflow> {
             id: "admit_before_proof".to_string(),
             summary: "Preflight admissibility, then run the build in proof mode.".to_string(),
             commands: vec![
-                "rch admit \"cargo test\" --json".to_string(),
+                "rch admit --json \"cargo test\"".to_string(),
                 "RCH_REQUIRE_REMOTE=1 rch exec -- cargo test".to_string(),
             ],
             observe: Some(
@@ -3300,7 +3300,7 @@ fn handle_robot_triage(ctx: &OutputContext) -> Result<()> {
         ],
         safety_notes: vec![
             "Run mutating commands with --dry-run first when the flag exists.".to_string(),
-            "Use `rch diagnose <command> --json` before forcing local/remote behavior.".to_string(),
+            "Use `rch diagnose --json <command>` before forcing local/remote behavior.".to_string(),
             "If RCH cannot safely offload, it fails open instead of blocking builds.".to_string(),
         ],
     };

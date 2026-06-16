@@ -102,7 +102,7 @@ echo "Discovery surfaces E2E (run_id=$RUN_ID)" >&2
 
 # --- capabilities: reason-code families + policies -------------------------
 t0=$(now_ms)
-json="$(env NO_COLOR=1 "$RCH_BIN" capabilities --json 2>/dev/null || true)"
+json="$(env -u RCH_OUTPUT_FORMAT -u TOON_DEFAULT_FORMAT NO_COLOR=1 "$RCH_BIN" capabilities --json 2>/dev/null || true)"
 dur=$(($(now_ms) - t0))
 if [[ -n "$json" ]]; then
     verdict="$(printf '%s' "$json" | python3 -c 'import json,sys
@@ -124,7 +124,7 @@ fi
 
 # --- robot-docs guide: remediation workflows -------------------------------
 t0=$(now_ms)
-json="$(env NO_COLOR=1 "$RCH_BIN" robot-docs guide --json 2>/dev/null || true)"
+json="$(env -u RCH_OUTPUT_FORMAT -u TOON_DEFAULT_FORMAT NO_COLOR=1 "$RCH_BIN" robot-docs guide --json 2>/dev/null || true)"
 dur=$(($(now_ms) - t0))
 if [[ -n "$json" ]]; then
     verdict="$(printf '%s' "$json" | python3 -c 'import json,sys
@@ -151,7 +151,7 @@ check_help_json() {
     local path_label="${*}"
     local t0 dur json got
     t0=$(now_ms)
-    json="$(env NO_COLOR=1 "$RCH_BIN" --help-json "$@" 2>/dev/null || true)"
+    json="$(env -u RCH_OUTPUT_FORMAT -u TOON_DEFAULT_FORMAT NO_COLOR=1 "$RCH_BIN" --help-json "$@" 2>/dev/null || true)"
     dur=$(($(now_ms) - t0))
     if [[ -z "$json" ]]; then
         emit "$path_label" "help-json" "skip" "no_output" "$dur" "no help-json output"
@@ -178,7 +178,7 @@ check_help_json "self-test" "self-test"
 
 # --- check: parseable readiness envelope -----------------------------------
 t0=$(now_ms)
-json="$(env NO_COLOR=1 "$RCH_BIN" check --json 2>/dev/null || true)"
+json="$(env -u RCH_OUTPUT_FORMAT -u TOON_DEFAULT_FORMAT NO_COLOR=1 "$RCH_BIN" check --json 2>/dev/null || true)"
 dur=$(($(now_ms) - t0))
 if [[ -n "$json" ]] && printf '%s' "$json" | python3 -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null; then
     emit "check" "check" "pass" "" "$dur" "check --json is a parseable envelope"
