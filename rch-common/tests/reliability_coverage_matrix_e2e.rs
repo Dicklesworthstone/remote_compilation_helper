@@ -948,6 +948,64 @@ fn build_coverage_matrix() -> CoverageMatrix {
             has_log_assertion: true,
             gap: None,
         },
+        RequirementRow {
+            id: "REQ-CONFIG-ROLLOUT-002".into(),
+            description: "Config rollout E2E logs and golden tests: integration scenarios over temp \
+                          config homes AND project configs (default install writes/loads the \
+                          [remediation] block; a project .rch/config.toml override is attributed to \
+                          the project file via `config show --sources`; invalid config; \
+                          upgrade-from-old); golden output proves config-command JSON envelope \
+                          stability, TOON parity, and useful remediation text; E2E script emits \
+                          self-validated JSONL with run_id, bead_id, scenario, event, status, \
+                          reason_code, config_source, path, detail. Unit coverage of the schema/\
+                          default helpers and redaction utilities is provided by 17.1 \
+                          (remediation_config_golden_e2e.rs / redaction_policy_golden_e2e.rs)"
+                .into(),
+            domain: "e2e_scripts".into(),
+            bead_id: "bd-session-history-remediation-ocv9i.17.3".into(),
+            test_refs: vec![
+                TestRef {
+                    // Adds default-install, project-override, golden-envelope and
+                    // TOON-parity tests to the rollout suite.
+                    file: "../../rch/tests/integration/config_remediation_rollout.rs".into(),
+                    name_prefix: "config_lint_golden".into(),
+                    tier: "smoke".into(),
+                },
+                TestRef {
+                    // E2E runner emitting the bead's required JSONL field set, with
+                    // an in-script schema self-validator.
+                    file: "../../scripts/e2e_config_rollout_logs.sh".into(),
+                    name_prefix: "e2e_config_rollout_logs".into(),
+                    tier: "smoke".into(),
+                },
+                TestRef {
+                    // Schema/default + redaction unit/golden coverage (17.1).
+                    file: "remediation_config_golden_e2e.rs".into(),
+                    name_prefix: "golden_".into(),
+                    tier: "smoke".into(),
+                },
+            ],
+            artifact_assertions: vec![
+                "Integration scenarios cover default install (init writes [remediation], loads \
+                 clean), project override (attributed to project: source via config show \
+                 --sources), invalid config, and upgrade-from-old"
+                    .into(),
+                "Golden config-command output proves envelope stability (success/command/\
+                 api_version), lowercase LintSeverity, the LINT-W101 code, and actionable \
+                 remediation text; config lint --format toon carries the same code and field"
+                    .into(),
+                "E2E script emits one JSONL record per scenario/event with run_id, bead_id, \
+                 scenario, event, status, reason_code, config_source, path, detail and \
+                 self-validates the field set"
+                    .into(),
+                "Schema/default helpers and redaction utilities have unit + golden coverage in \
+                 17.1's remediation_config_golden_e2e.rs and redaction_policy_golden_e2e.rs"
+                    .into(),
+            ],
+            has_executable_test: true,
+            has_log_assertion: true,
+            gap: None,
+        },
     ];
 
     let total = requirements.len();

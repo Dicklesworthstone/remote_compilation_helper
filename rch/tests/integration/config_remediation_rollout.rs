@@ -45,6 +45,42 @@ fn run_config(config_dir: &Path, args: &[&str]) -> (bool, String) {
     )
 }
 
+/// Run `rch <args>` with a user config dir AND a project CWD (so a CWD-relative
+/// `.rch/config.toml` is honored), returning (success, stdout).
+fn run_config_in(config_dir: &Path, cwd: &Path, args: &[&str]) -> (bool, String) {
+    let output = Command::new(env!("CARGO_BIN_EXE_rch"))
+        .args(args)
+        .current_dir(cwd)
+        .env("NO_COLOR", "1")
+        .env("RCH_CONFIG_DIR", config_dir)
+        .env_remove("RCH_JSON")
+        .env_remove("RCH_OUTPUT_FORMAT")
+        .env_remove("TOON_DEFAULT_FORMAT")
+        .output()
+        .expect("failed to run rch");
+    (
+        output.status.success(),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+    )
+}
+
+/// Create a unique temp project dir containing `.rch/config.toml` with `body`.
+fn temp_project_dir(body: &str) -> PathBuf {
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("rch-172-proj-{}-{n}", std::process::id()));
+    std::fs::create_dir_all(dir.join(".rch")).expect("create project .rch dir");
+    std::fs::write(dir.join(".rch/config.toml"), body).expect("write project config");
+    dir
+}
+
+/// Create an empty (config-free) temp user dir.
+fn empty_config_dir() -> PathBuf {
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("rch-172-user-{}-{n}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create empty user dir");
+    dir
+}
+
 fn data(stdout: &str) -> serde_json::Value {
     let parsed: serde_json::Value =
         serde_json::from_str(stdout.trim()).expect("stdout is one JSON document");
@@ -275,5 +311,168 @@ fn config_export_redacts_operator_paths() {
     assert!(
         path.contains("/home/<redacted>/") && !path.contains("/home/alice/"),
         "operator home path must be redacted in export; got {path:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Layer 3: default-install + project-override scenarios (17.3 AC2)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn default_install_writes_and_loads_remediation_section() {
+    init_test_logging();
+    // Fresh install: `rch config init --non-interactive` writes a config.toml that
+    // carries the documented [remediation] block and then validates cleanly.
+    let dir = empty_config_dir();
+    let (ok, _out) = run_config(&dir, &["config", "init", "--non-interactive"]);
+    assert!(ok, "config init --non-interactive should succeed");
+    let written = std::fs::read_to_string(dir.join("config.toml")).expect("config.toml written");
+    assert!(
+        written.contains("[remediation]"),
+        "fresh config must document the [remediation] section; got:\n{written}"
+    );
+    // The freshly-written config validates without remediation errors.
+    let (validate_ok, vstdout) = run_config(&dir, &["config", "validate", "--json"]);
+    let vd = data(&vstdout);
+    let blob = serde_json::to_string(&vd).unwrap();
+    assert!(
+        !blob.contains("remediation."),
+        "fresh-install config must not raise remediation validation errors; got {blob}"
+    );
+    let _ = validate_ok; // workers.toml-missing may still flag; remediation is what we assert
+}
+
+#[test]
+fn project_override_is_attributed_to_project_source() {
+    init_test_logging();
+    // A project `.rch/config.toml` override must win over the (empty) user config
+    // and `config show --sources` must attribute it to the project file.
+    let user = empty_config_dir();
+    let proj = temp_project_dir("[general]\nforce_remote = true\n");
+    let (ok, stdout) = run_config_in(&user, &proj, &["config", "show", "--sources", "--json"]);
+    assert!(ok, "config show --sources should succeed");
+    let d = data(&stdout);
+    let entry = d
+        .get("value_sources")
+        .and_then(|v| v.as_array())
+        .expect("value_sources present with --sources")
+        .iter()
+        .find(|e| e.get("key").and_then(|k| k.as_str()) == Some("general.force_remote"))
+        .expect("general.force_remote attributed");
+    assert_eq!(entry.get("value").and_then(|v| v.as_str()), Some("true"));
+    assert!(
+        entry
+            .get("source")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| s.starts_with("project:")),
+        "project override must be attributed to the project file; got {entry:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Layer 4: golden envelope stability + TOON parity + remediation text (17.3 AC4)
+// ---------------------------------------------------------------------------
+
+/// A config dir whose only lint finding is the remediation warning: a minimal
+/// valid workers.toml suppresses the workers-missing lint so the output is a
+/// single, stable issue suitable for golden assertions.
+fn lint_golden_config_dir() -> PathBuf {
+    let dir = temp_config_dir(
+        "[remediation.incident_ledger]\npath = \"/var/tmp/operator/ledger.jsonl\"\n",
+    );
+    let workers = "[[workers]]\nid = \"golden\"\nhost = \"192.0.2.10\"\nuser = \"ubuntu\"\n\
+         identity_file = \"~/.ssh/id_rsa\"\ntotal_slots = 4\n";
+    std::fs::write(dir.join("workers.toml"), workers).expect("write workers.toml");
+    dir
+}
+
+#[test]
+fn config_lint_golden_envelope_and_remediation_text() {
+    init_test_logging();
+    let dir = lint_golden_config_dir();
+    let (_ok, stdout) = run_config(&dir, &["config", "lint", "--json"]);
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("config lint emits one JSON document");
+
+    // Envelope stability: the standard ApiResponse keys are present and stable.
+    assert_eq!(
+        parsed.get("success").and_then(|v| v.as_bool()),
+        Some(true),
+        "envelope success flag stable"
+    );
+    assert_eq!(
+        parsed.get("command").and_then(|v| v.as_str()),
+        Some("config lint"),
+        "envelope command field stable"
+    );
+    assert!(
+        parsed.get("api_version").is_some(),
+        "envelope carries api_version"
+    );
+
+    // Exactly one issue (the remediation warning) — workers.toml suppresses the
+    // workers-missing finding, so this is a stable golden.
+    let issues = parsed
+        .pointer("/data/issues")
+        .and_then(|v| v.as_array())
+        .expect("issues array present");
+    let rem: Vec<&serde_json::Value> = issues
+        .iter()
+        .filter(|i| {
+            i.get("message")
+                .and_then(|m| m.as_str())
+                .is_some_and(|m| m.contains("remediation."))
+        })
+        .collect();
+    assert_eq!(
+        rem.len(),
+        1,
+        "exactly one remediation lint issue; got {issues:?}"
+    );
+    let issue = rem[0];
+    // LintSeverity serializes lowercase (rename_all = "lowercase") — a stable
+    // envelope detail.
+    assert_eq!(
+        issue.get("severity").and_then(|v| v.as_str()),
+        Some("warning")
+    );
+    assert_eq!(
+        issue.get("code").and_then(|v| v.as_str()),
+        Some("LINT-W101")
+    );
+    assert!(
+        issue
+            .get("message")
+            .and_then(|v| v.as_str())
+            .is_some_and(|m| m.starts_with("remediation.incident_ledger.path:")),
+        "message names the offending field; got {issue:?}"
+    );
+    // Useful remediation text: points at the field + how to re-check.
+    let remediation = issue
+        .get("remediation")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    assert!(
+        remediation.contains("remediation.incident_ledger.path")
+            && remediation.contains("rch config doctor"),
+        "remediation text must be actionable; got {remediation:?}"
+    );
+}
+
+#[test]
+fn config_lint_toon_parity() {
+    init_test_logging();
+    let dir = lint_golden_config_dir();
+    // The same lint payload renders as TOON and still carries the stable code and
+    // the offending field (TOON parity where supported).
+    let (json_ok, json_out) = run_config(&dir, &["config", "lint", "--json"]);
+    assert!(json_ok, "config lint --json should succeed");
+    assert!(json_out.contains("LINT-W101"));
+
+    let (toon_ok, toon_out) = run_config(&dir, &["config", "lint", "--format", "toon"]);
+    assert!(toon_ok, "config lint --format toon should succeed");
+    assert!(
+        toon_out.contains("LINT-W101") && toon_out.contains("incident_ledger"),
+        "TOON output must carry the stable code and field; got {toon_out}"
     );
 }
