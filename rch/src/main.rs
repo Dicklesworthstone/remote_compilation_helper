@@ -2417,6 +2417,10 @@ struct CapabilitiesOutput {
     env_vars: Vec<EnvVarCapability>,
     /// Copy-paste-ready commands agents should try first.
     recommended_commands: Vec<RecommendedCommand>,
+    /// Stable reason/error code families agents can discover and look up.
+    reason_code_families: Vec<ReasonCodeFamily>,
+    /// Placement / fallback policies (fail-open, force-remote, proof, queue).
+    policies: Vec<PolicyCapability>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
@@ -2466,10 +2470,61 @@ struct RecommendedCommand {
     purpose: String,
 }
 
+/// A family of stable reason/error codes agents can discover and look up.
+///
+/// The large catalogs (`RCH-E`, `RCH-R`) are enumerable at runtime via
+/// `rch error list --json`; the small incident registry (`RCH-I`) is enumerated
+/// in full here because it is not (yet) resolvable through `rch error explain`.
+#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
+struct ReasonCodeFamily {
+    /// Stable code prefix, e.g. "RCH-E", "RCH-R", "RCH-I".
+    family: String,
+    /// Human-readable family name.
+    name: String,
+    /// What this family covers.
+    description: String,
+    /// Inclusive code range, e.g. "RCH-E001..RCH-E599".
+    code_range: String,
+    /// Command (or surface) that explains a single code from this family.
+    lookup: String,
+    /// Command (or surface) that enumerates this family.
+    enumerate: String,
+    /// Representative or (for small families) exhaustive code list.
+    examples: Vec<ReasonCodeExample>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
+struct ReasonCodeExample {
+    code: String,
+    meaning: String,
+}
+
+/// A placement / fallback policy an agent can rely on.
+///
+/// Proof-mode (`require_remote`, fail-closed) and force-mode (`force_remote`,
+/// fail-open) are the two most-conflated controls; making them first-class here
+/// keeps the fail-open vs fail-closed distinction discoverable instead of
+/// folklore.
+#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
+struct PolicyCapability {
+    /// Stable policy id, e.g. "fail_open", "force_remote", "require_remote".
+    id: String,
+    /// Governing environment variable, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    env_var: Option<String>,
+    /// What the policy does.
+    behavior: String,
+    /// Reason code emitted when the policy refuses or falls back, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason_code: Option<String>,
+    /// What an agent should do to observe or act on this policy.
+    next_action: String,
+}
+
 fn build_capabilities_output() -> CapabilitiesOutput {
     CapabilitiesOutput {
         contract_version: "rch.capabilities.v1".to_string(),
-        schema_version: "1.0".to_string(),
+        schema_version: "1.1".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         build_timestamp: option_env!("RCH_BUILD_TIMESTAMP").map(|s| s.to_string()),
         runtimes: vec![
@@ -2579,6 +2634,8 @@ fn build_capabilities_output() -> CapabilitiesOutput {
         exit_codes: exit_code_capabilities(),
         env_vars: env_var_capabilities(),
         recommended_commands: recommended_commands(),
+        reason_code_families: reason_code_families(),
+        policies: policies(),
     }
 }
 
@@ -2601,6 +2658,24 @@ fn handle_capabilities_command(ctx: &OutputContext) -> Result<()> {
         ctx.key_value("Version", &output.version);
         ctx.key_value("Commands", &output.commands.len().to_string());
         ctx.key_value("Output formats", &output.output_formats.join(", "));
+        ctx.key_value(
+            "Reason-code families",
+            &output
+                .reason_code_families
+                .iter()
+                .map(|f| f.family.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        ctx.key_value(
+            "Policies",
+            &output
+                .policies
+                .iter()
+                .map(|p| p.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
         ctx.print("");
         ctx.print("Recommended agent entry points:");
         for command in &output.recommended_commands {
@@ -2786,11 +2861,179 @@ fn recommended_commands() -> Vec<RecommendedCommand> {
     ]
 }
 
+/// Stable reason/error code families for agent discovery.
+///
+/// `RCH-E` and `RCH-R` are large and enumerable via `rch error list --json`, so
+/// only representative examples are inlined. `RCH-I` is small and is NOT yet
+/// resolvable through `rch error explain`, so it is enumerated in full straight
+/// from the [`IncidentReasonCode`](rch_common::incident::IncidentReasonCode)
+/// registry (no drift).
+fn reason_code_families() -> Vec<ReasonCodeFamily> {
+    use rch_common::incident::IncidentReasonCode;
+
+    let incident_examples: Vec<ReasonCodeExample> = IncidentReasonCode::ALL
+        .iter()
+        .map(|reason| ReasonCodeExample {
+            code: reason.code().to_string(),
+            meaning: reason.failure_class().to_string(),
+        })
+        .collect();
+    let incident_range = match (
+        IncidentReasonCode::ALL.first(),
+        IncidentReasonCode::ALL.last(),
+    ) {
+        (Some(first), Some(last)) => format!("{}..{}", first.code(), last.code()),
+        _ => "RCH-I001..".to_string(),
+    };
+
+    vec![
+        ReasonCodeFamily {
+            family: "RCH-E".to_string(),
+            name: "Operational error catalog".to_string(),
+            description:
+                "Configuration, network/SSH, worker, build, transfer, and internal errors carried \
+                 in the JSON error envelope's `error.code`."
+                    .to_string(),
+            code_range: "RCH-E001..RCH-E599".to_string(),
+            lookup: "rch error explain RCH-E100".to_string(),
+            enumerate: "rch error list --json".to_string(),
+            examples: vec![
+                ReasonCodeExample {
+                    code: "RCH-E001".to_string(),
+                    meaning: "configuration not found".to_string(),
+                },
+                ReasonCodeExample {
+                    code: "RCH-E100".to_string(),
+                    meaning: "SSH connection failed".to_string(),
+                },
+                ReasonCodeExample {
+                    code: "RCH-E300".to_string(),
+                    meaning: "remote build failed".to_string(),
+                },
+            ],
+        },
+        ReasonCodeFamily {
+            family: "RCH-R".to_string(),
+            name: "Reliability reason codes".to_string(),
+            description:
+                "Topology/fleet, disk-pressure, process-debt/cancellation, and repo-convergence \
+                 reliability states surfaced by `rch status` and `rch doctor --reliability`."
+                    .to_string(),
+            code_range: "RCH-R001..RCH-R3xx".to_string(),
+            lookup: "rch error explain RCH-R101".to_string(),
+            enumerate: "rch error list --json".to_string(),
+            examples: vec![
+                ReasonCodeExample {
+                    code: "RCH-R006".to_string(),
+                    meaning: "all workers unhealthy".to_string(),
+                },
+                ReasonCodeExample {
+                    code: "RCH-R101".to_string(),
+                    meaning: "worker disk pressure critical".to_string(),
+                },
+                ReasonCodeExample {
+                    code: "RCH-R302".to_string(),
+                    meaning: "repo convergence drift".to_string(),
+                },
+            ],
+        },
+        ReasonCodeFamily {
+            family: "RCH-I".to_string(),
+            name: "Incident / refusal reason codes".to_string(),
+            description:
+                "Stable failure classes emitted when a build is steered, refused, deferred, or \
+                 falls back (selection, admission, proof, fallback, artifact, worker lifecycle). \
+                 Enumerated in full here because they are not resolvable through `rch error \
+                 explain`; live occurrences surface in incident events and \
+                 `rch status --remediation`."
+                    .to_string(),
+            code_range: incident_range,
+            lookup: "rch status --remediation --json".to_string(),
+            enumerate: "rch status --remediation --json".to_string(),
+            examples: incident_examples,
+        },
+    ]
+}
+
+/// Placement / fallback policies an agent can rely on. Keeps the fail-open vs
+/// fail-closed distinction (the most-conflated control pair) first-class.
+fn policies() -> Vec<PolicyCapability> {
+    vec![
+        PolicyCapability {
+            id: "fail_open".to_string(),
+            env_var: None,
+            behavior:
+                "Default. If remote execution is unavailable or unsafe, the command runs locally \
+                 instead of blocking."
+                    .to_string(),
+            reason_code: Some("RCH-I011".to_string()),
+            next_action: "If you expected offload, inspect `rch status --remediation --json` and \
+                 `rch diagnose \"<cmd>\" --json`."
+                .to_string(),
+        },
+        PolicyCapability {
+            id: "force_remote".to_string(),
+            env_var: Some("RCH_FORCE_REMOTE".to_string()),
+            behavior:
+                "Always attempt offload, bypassing the local-time and predicted-speedup gating, \
+                 but still fail open to local execution if offload cannot proceed."
+                    .to_string(),
+            reason_code: Some("RCH-I011".to_string()),
+            next_action:
+                "Force an offload attempt; confirm routing with `rch diagnose \"<cmd>\" --json`."
+                    .to_string(),
+        },
+        PolicyCapability {
+            id: "require_remote".to_string(),
+            env_var: Some("RCH_REQUIRE_REMOTE".to_string()),
+            behavior:
+                "Proof mode: fail closed. Refuse local fallback entirely. Takes precedence over \
+                 RCH_FORCE_REMOTE."
+                    .to_string(),
+            reason_code: Some("RCH-I012".to_string()),
+            next_action:
+                "Run proofs as `RCH_REQUIRE_REMOTE=1 rch exec -- <build cmd>`; a refusal surfaces \
+                 RCH-I012 instead of silently running locally."
+                    .to_string(),
+        },
+        PolicyCapability {
+            id: "queue_when_busy".to_string(),
+            env_var: Some("RCH_QUEUE_WHEN_BUSY".to_string()),
+            behavior:
+                "Default on. Wait for a busy-but-eligible worker instead of falling back to local. \
+                 Set to 0 to disable queueing."
+                    .to_string(),
+            reason_code: None,
+            next_action: "Tune the wait with RCH_DAEMON_WAIT_RESPONSE_TIMEOUT_SECS; watch with \
+                 `rch queue --follow`."
+                .to_string(),
+        },
+    ]
+}
+
+/// A concise, machine-readable remediation workflow for agents. Each entry maps
+/// an operator workflow to the *real* commands that deliver it today, plus how
+/// to observe its state — never an aspirational command that does not exist.
+#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
+struct RemediationWorkflow {
+    /// Stable workflow id, e.g. "admit_before_proof", "proof_mode".
+    id: String,
+    /// One-line summary of the workflow.
+    summary: String,
+    /// Commands an agent runs, in order.
+    commands: Vec<String>,
+    /// How to observe the resulting state (status surface, reason code), if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    observe: Option<String>,
+}
+
 #[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
 struct RobotDocsGuideOutput {
     contract_version: String,
     guide: String,
     canonical_commands: Vec<RecommendedCommand>,
+    /// Concise remediation workflows keyed to real commands.
+    remediation_workflows: Vec<RemediationWorkflow>,
     output_contracts: Vec<String>,
     safety_notes: Vec<String>,
 }
@@ -2802,6 +3045,7 @@ fn handle_robot_docs(action: RobotDocsAction, ctx: &OutputContext) -> Result<()>
                 contract_version: "rch.robot_docs.v1".to_string(),
                 guide: robot_docs_guide_text().to_string(),
                 canonical_commands: recommended_commands(),
+                remediation_workflows: remediation_workflows(),
                 output_contracts: vec![
                     "Use --json or --format toon for parseable stdout.".to_string(),
                     "Diagnostics, progress, and remediation text belong on stderr.".to_string(),
@@ -2870,7 +3114,143 @@ Common workflows:
   Repair safely:
     rch doctor --dry-run --json
     rch config validate --json
+
+Remediation workflows (machine-readable list under `remediation_workflows`):
+  Admit before proof:
+    rch admit "cargo test" --json        # offload/local/queue/defer + required caps
+    RCH_REQUIRE_REMOTE=1 rch exec -- cargo test
+
+  Proof mode (queued / refused / replayed):
+    RCH_REQUIRE_REMOTE=1 rch exec -- cargo test --workspace
+    # fail-closed: a refusal is RCH-I012 (never a silent local run).
+    # queue/replay is daemon-driven; observe the proof_queue band in
+    rch status --remediation --json
+
+  Worker temporary bypass and auto-rejoin:
+    rch workers drain <id>               # manual: stop sending new jobs
+    rch workers enable <id>              # manual: bring it back
+    # transient bypass + auto-rejoin are automatic; observe per-worker state in
+    rch status --workers --json
+
+  Fleet status:
+    rch status --fleet --json
+    rch fleet status --json
+
+  Force resync (stale path-dependency roots):
+    # convergence/resync is daemon-driven today; observe drift with
+    rch doctor --reliability --scope convergence --json
+    rch status --remediation --json
+
+  Queue attach / cancel:
+    rch queue --json
+    rch queue --follow
+    rch cancel <id>   |   rch cancel --all --yes
+
+  Real-fleet smoke validation:
+    rch self-test --all --json
+    rch self-test status --json
+    rch self-test history --limit 10 --json
+
+Dashboards and metrics:
+  rch dashboard                          # interactive TUI (press 'R' for remediation)
+  rch web                                # web dashboard incl. /remediation route
+  Daemon exposes Prometheus metrics for remediation state (see `rch doctor`).
 "#
+}
+
+/// Concise remediation workflows for agents, keyed to the commands that deliver
+/// them today. Surfaces under `remediation_workflows` in `rch robot-docs guide
+/// --json`. Every command listed here resolves against the real CLI surface —
+/// where a workflow has no dedicated command yet (e.g. one-shot force-resync),
+/// the observation surface is documented honestly instead.
+fn remediation_workflows() -> Vec<RemediationWorkflow> {
+    vec![
+        RemediationWorkflow {
+            id: "admit_before_proof".to_string(),
+            summary: "Preflight admissibility, then run the build in proof mode.".to_string(),
+            commands: vec![
+                "rch admit \"cargo test\" --json".to_string(),
+                "RCH_REQUIRE_REMOTE=1 rch exec -- cargo test".to_string(),
+            ],
+            observe: Some(
+                "admit returns an offload/local/queue/defer recommendation plus the capabilities a \
+                 worker must have."
+                    .to_string(),
+            ),
+        },
+        RemediationWorkflow {
+            id: "proof_mode".to_string(),
+            summary: "Fail-closed remote proof; refusal is RCH-I012, queue/replay is daemon-driven."
+                .to_string(),
+            commands: vec![
+                "RCH_REQUIRE_REMOTE=1 rch exec -- cargo test --workspace".to_string(),
+            ],
+            observe: Some(
+                "rch status --remediation --json shows the proof_queue band (queued/blocked/\
+                 replaying/failed); a refusal surfaces RCH-I012 rather than a silent local run."
+                    .to_string(),
+            ),
+        },
+        RemediationWorkflow {
+            id: "worker_bypass_rejoin".to_string(),
+            summary: "Drain/enable a worker; transient bypass and auto-rejoin are automatic."
+                .to_string(),
+            commands: vec![
+                "rch workers drain <id>".to_string(),
+                "rch workers enable <id>".to_string(),
+            ],
+            observe: Some(
+                "rch status --workers --json (or rch workers list --json) reports the per-worker \
+                 bypass record: reason, next probe, and auto-rejoin posture."
+                    .to_string(),
+            ),
+        },
+        RemediationWorkflow {
+            id: "fleet_status".to_string(),
+            summary: "Fleet-wide desired/live grouping, dominant problem class, and absence alerts."
+                .to_string(),
+            commands: vec![
+                "rch status --fleet --json".to_string(),
+                "rch fleet status --json".to_string(),
+            ],
+            observe: None,
+        },
+        RemediationWorkflow {
+            id: "force_resync".to_string(),
+            summary: "Stale path-dependency roots: convergence/resync is daemon-driven today."
+                .to_string(),
+            commands: vec![
+                "rch doctor --reliability --scope convergence --json".to_string(),
+                "rch status --remediation --json".to_string(),
+            ],
+            observe: Some(
+                "The repo_convergence band reports drift (RCH-R3xx); a one-shot force-resync CLI \
+                 is tracked separately."
+                    .to_string(),
+            ),
+        },
+        RemediationWorkflow {
+            id: "queue_attach_cancel".to_string(),
+            summary: "Inspect the build queue and cancel active or queued builds.".to_string(),
+            commands: vec![
+                "rch queue --json".to_string(),
+                "rch queue --follow".to_string(),
+                "rch cancel <id>".to_string(),
+                "rch cancel --all --yes".to_string(),
+            ],
+            observe: None,
+        },
+        RemediationWorkflow {
+            id: "real_fleet_smoke".to_string(),
+            summary: "Run a real-fleet smoke/self-test and read its history.".to_string(),
+            commands: vec![
+                "rch self-test --all --json".to_string(),
+                "rch self-test status --json".to_string(),
+                "rch self-test history --limit 10 --json".to_string(),
+            ],
+            observe: None,
+        },
+    ]
 }
 
 #[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]

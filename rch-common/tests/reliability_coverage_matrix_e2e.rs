@@ -842,6 +842,60 @@ fn build_coverage_matrix() -> CoverageMatrix {
             has_log_assertion: true,
             gap: None,
         },
+        RequirementRow {
+            id: "REQ-DISCOVERY-001".into(),
+            description: "Agent discovery surfaces for remediation workflows: `rch capabilities \
+                          --json` lists reason-code families (RCH-E/R/I, with the small incident \
+                          registry enumerated in full) and placement/fallback policies (fail-open, \
+                          force-remote, require-remote/proof, queue); `rch robot-docs guide` carries \
+                          machine-readable remediation_workflows (admit-before-proof, proof mode, \
+                          worker bypass/auto-rejoin, fleet status, force resync, queue \
+                          attach/cancel, real-fleet smoke) keyed to real commands; `--help-json` \
+                          resolves and is structurally valid for every real nested path; shell \
+                          completions include the new remediation commands/flags"
+                .into(),
+            domain: "ux_quality".into(),
+            bead_id: "bd-session-history-remediation-ocv9i.13.4".into(),
+            test_refs: vec![
+                TestRef {
+                    // Contract tests over the built binary: capabilities families/
+                    // policies, robot-docs workflows, --help-json schema-check,
+                    // stream separation, TOON parity, completions coverage.
+                    file: "../../rch/tests/integration/discovery_surfaces.rs".into(),
+                    name_prefix: "test_".into(),
+                    tier: "smoke".into(),
+                },
+                TestRef {
+                    // E2E runner: drives the discovery commands and emits JSONL
+                    // evidence keyed by bead id and command path.
+                    file: "../../scripts/e2e_discovery_surfaces.sh".into(),
+                    name_prefix: "e2e_discovery_surfaces".into(),
+                    tier: "smoke".into(),
+                },
+            ],
+            artifact_assertions: vec![
+                "capabilities.reason_code_families includes RCH-E, RCH-R, and RCH-I; the RCH-I \
+                 family enumerates the incident registry including RCH-I011 (local fallback) and \
+                 RCH-I012 (proof refusal)"
+                    .into(),
+                "capabilities.policies includes require_remote (fail-closed, reason_code RCH-I012), \
+                 force_remote (fail-open), fail_open, and queue_when_busy, each with next-action \
+                 text"
+                    .into(),
+                "robot-docs guide remediation_workflows covers the seven named workflows with \
+                 runnable commands and next-action/observe text; proof_mode references \
+                 RCH_REQUIRE_REMOTE and RCH-I012"
+                    .into(),
+                "--help-json resolves to the correct leaf for every real nested path and rejects \
+                 unknown paths; stdout stays pure JSON while diagnostics stay on stderr"
+                    .into(),
+                "E2E JSONL emitted with run_id, bead_id, command_path, surface, status, and detail"
+                    .into(),
+            ],
+            has_executable_test: true,
+            has_log_assertion: true,
+            gap: None,
+        },
     ];
 
     let total = requirements.len();
