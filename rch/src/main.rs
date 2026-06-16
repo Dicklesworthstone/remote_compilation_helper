@@ -2864,10 +2864,11 @@ fn recommended_commands() -> Vec<RecommendedCommand> {
 /// Stable reason/error code families for agent discovery.
 ///
 /// `RCH-E` and `RCH-R` are large and enumerable via `rch error list --json`, so
-/// only representative examples are inlined. `RCH-I` is small and is NOT yet
-/// resolvable through `rch error explain`, so it is enumerated in full straight
-/// from the [`IncidentReasonCode`](rch_common::incident::IncidentReasonCode)
-/// registry (no drift).
+/// only representative examples are inlined. `RCH-I` is small and is now also
+/// resolvable through `rch error explain` / `rch error list`; it is still
+/// enumerated in full here straight from the
+/// [`IncidentReasonCode`](rch_common::incident::IncidentReasonCode) registry
+/// (no drift).
 fn reason_code_families() -> Vec<ReasonCodeFamily> {
     use rch_common::incident::IncidentReasonCode;
 
@@ -2943,13 +2944,12 @@ fn reason_code_families() -> Vec<ReasonCodeFamily> {
             description:
                 "Stable failure classes emitted when a build is steered, refused, deferred, or \
                  falls back (selection, admission, proof, fallback, artifact, worker lifecycle). \
-                 Enumerated in full here because they are not resolvable through `rch error \
-                 explain`; live occurrences surface in incident events and \
-                 `rch status --remediation`."
+                 Resolvable via `rch error explain RCH-Innn` and `rch error list --json`; live \
+                 occurrences surface in incident events and `rch status --remediation`."
                     .to_string(),
             code_range: incident_range,
-            lookup: "rch status --remediation --json".to_string(),
-            enumerate: "rch status --remediation --json".to_string(),
+            lookup: "rch error explain RCH-I012".to_string(),
+            enumerate: "rch error list --json".to_string(),
             examples: incident_examples,
         },
     ]
