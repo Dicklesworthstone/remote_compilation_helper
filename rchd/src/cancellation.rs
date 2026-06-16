@@ -471,6 +471,9 @@ impl CancellationOrchestrator {
         let grace_end = Instant::now() + self.config.grace_period;
         while Instant::now() < grace_end && Instant::now() < deadline {
             if record.hook_pid == 0 || !is_process_alive(record.hook_pid) {
+                if record.remote_pgid_file.is_some() {
+                    self.attempt_remote_kill_stage(ctx, record).await;
+                }
                 record.state = CancellationState::Completed;
                 return;
             }
@@ -485,19 +488,7 @@ impl CancellationOrchestrator {
         }
 
         // Step 2: Process still alive — attempt remote kill.
-        record.escalation_count += 1;
-        self.events.emit(
-            "cancellation_escalated",
-            &serde_json::json!({
-                "build_id": record.build_id,
-                "worker_id": record.worker_id,
-                "stage": "remote_kill",
-                "escalation_count": record.escalation_count,
-            }),
-        );
-
-        record.state = CancellationState::RemoteKillSent;
-        let remote_killed = self.try_remote_kill(ctx, record).await;
+        let remote_killed = self.attempt_remote_kill_stage(ctx, record).await;
 
         if remote_killed {
             // Give a moment for the local process to die too.
@@ -539,6 +530,26 @@ impl CancellationOrchestrator {
         tokio::time::sleep(self.config.kill_timeout.min(Duration::from_secs(2))).await;
 
         record.state = CancellationState::Completed;
+    }
+
+    async fn attempt_remote_kill_stage(
+        &self,
+        ctx: &DaemonContext,
+        record: &mut CancellationRecord,
+    ) -> bool {
+        record.escalation_count += 1;
+        self.events.emit(
+            "cancellation_escalated",
+            &serde_json::json!({
+                "build_id": record.build_id,
+                "worker_id": record.worker_id,
+                "stage": "remote_kill",
+                "escalation_count": record.escalation_count,
+            }),
+        );
+
+        record.state = CancellationState::RemoteKillSent;
+        self.try_remote_kill(ctx, record).await
     }
 
     /// Attempt to kill the remote process on the worker via SSH.
@@ -1344,6 +1355,74 @@ mod tests {
             vec!["requested", "escalated", "remote_kill_sent", "completed"]
         );
         assert_eq!(cancellation_escalation_stage(&record), "remote_kill");
+    }
+
+    #[tokio::test]
+    async fn test_cancellation_attempts_remote_kill_when_local_hook_exits_with_pgid_file() {
+        let pool = WorkerPool::new();
+        let history = Arc::new(BuildHistory::new(100));
+        let ctx = make_test_context(pool, history);
+        let orch = CancellationOrchestrator::new(test_config(), test_events());
+        let mut record = CancellationRecord {
+            build_id: 42,
+            worker_id: "missing-worker".to_string(),
+            state: CancellationState::Requested,
+            reason: CancelReason::User,
+            requested_at: Instant::now(),
+            completed_at: None,
+            escalation_count: 0,
+            remote_kill_attempted: false,
+            cleanup_ok: true,
+            slots: 1,
+            slots_released: 0,
+            hook_pid: 0,
+            remote_pgid_file: Some("/tmp/rch/project/.rch-run/42.pgid".to_string()),
+        };
+
+        orch.execute_cancellation(&ctx, &mut record, false).await;
+
+        assert_eq!(record.state, CancellationState::Completed);
+        assert!(record.remote_kill_attempted);
+        assert_eq!(record.escalation_count, 1);
+        assert_eq!(
+            cancellation_decision_path(&record),
+            vec!["requested", "term_sent", "remote_kill_sent", "completed"]
+        );
+        assert_eq!(cancellation_escalation_stage(&record), "remote_kill");
+    }
+
+    #[tokio::test]
+    async fn test_cancellation_without_pgid_file_preserves_term_only_fast_path() {
+        let pool = WorkerPool::new();
+        let history = Arc::new(BuildHistory::new(100));
+        let ctx = make_test_context(pool, history);
+        let orch = CancellationOrchestrator::new(test_config(), test_events());
+        let mut record = CancellationRecord {
+            build_id: 43,
+            worker_id: "missing-worker".to_string(),
+            state: CancellationState::Requested,
+            reason: CancelReason::User,
+            requested_at: Instant::now(),
+            completed_at: None,
+            escalation_count: 0,
+            remote_kill_attempted: false,
+            cleanup_ok: true,
+            slots: 1,
+            slots_released: 0,
+            hook_pid: 0,
+            remote_pgid_file: None,
+        };
+
+        orch.execute_cancellation(&ctx, &mut record, false).await;
+
+        assert_eq!(record.state, CancellationState::Completed);
+        assert!(!record.remote_kill_attempted);
+        assert_eq!(record.escalation_count, 0);
+        assert_eq!(
+            cancellation_decision_path(&record),
+            vec!["requested", "term_sent", "completed"]
+        );
+        assert_eq!(cancellation_escalation_stage(&record), "term");
     }
 
     #[test]
