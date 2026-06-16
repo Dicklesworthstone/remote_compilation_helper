@@ -81,6 +81,11 @@ rch status --fleet                        # confirm it returned to the live pool
 ```
 Do **not** `rch workers disable` for a transient outage — that blocks auto-rejoin.
 
+**Risk:** `rch workers disable` is a permanent decommission, not a transient
+pause: it suppresses auto-rejoin until you explicitly `rch workers enable`, so a
+worker disabled for a momentary blip stays out of the pool. Prefer observing the
+self-healing breaker (open → half-open → closed) over any manual intervention.
+
 ### Disk Pressure Critical
 
 **Symptoms:** Worker pressure state "critical", builds deferred
@@ -130,6 +135,10 @@ rch fleet doctor --reliability --scope convergence                              
 rch fleet doctor --reliability --scope convergence --fix --fleet-confirm --workers <id>   # apply on one worker
 ```
 
+The `--fix` path triggers the daemon's `repo-convergence repair` for the targeted
+worker (the same operation as the `POST /repo-convergence/repair` admin endpoint):
+it resets the convergence budget so the next cycle re-syncs the missing repos.
+
 **Risk:** Convergence repair may re-sync/re-clone repositories, discarding any
 worker-side local changes. `--fleet-confirm` is the required safety gate before
 `--fix` touches workers; scope to specific `--workers` rather than the whole fleet
@@ -170,6 +179,11 @@ atomic, verified deploy (do not hand-patch a worker binary):
 rch fleet deploy --worker <id> --force --verify
 rch status --json | jq '.schema_version'
 ```
+
+If the mismatch is a genuine schema-version bump rather than a stale binary,
+follow the schema migration steps for the affected component before redeploying:
+a migration may be required when the persisted on-disk format changed, and a blind
+redeploy would not reconcile already-written records.
 
 ## Cloud / VMI Fleet Incidents
 
@@ -271,7 +285,7 @@ rch status --json | jq '.feature_flags'
 
 ## Safe vs Destructive Operations
 
-All diagnostics are read-only and safe in production:
+All diagnostics are read-only and **safe to run** in production:
 
 ```bash
 rch check                                 # read-only
