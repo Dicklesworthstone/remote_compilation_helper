@@ -27,6 +27,7 @@
 //! | E210-E219  | Worker/Storage     | Disk pressure and storage errors      |
 //! | E310-E319  | Build/Triage       | Process triage integration errors     |
 //! | E320-E325  | Build/Cancellation | Build cancellation lifecycle errors   |
+//! | E410-E414  | Transfer/Preflight | Remote dependency preflight errors    |
 //!
 //! # Example
 //!
@@ -249,6 +250,16 @@ pub enum ErrorCode {
     TransferIncomplete,
     /// Transfer protocol error
     TransferProtocolError,
+    /// Required dependency path missing on remote worker after sync
+    DependencyPreflightMissing,
+    /// Dependency root was not refreshed before preflight
+    DependencyPreflightStale,
+    /// Dependency preflight could not determine remote state
+    DependencyPreflightUnknown,
+    /// Dependency topology policy blocked remote execution
+    DependencyPreflightPolicyViolation,
+    /// Dependency preflight planning timed out
+    DependencyPreflightTimeout,
 
     // =========================================================================
     // Internal Errors (E500-E599)
@@ -383,6 +394,11 @@ impl ErrorCode {
             Self::TransferBinaryFailed => 407,
             Self::TransferIncomplete => 408,
             Self::TransferProtocolError => 409,
+            Self::DependencyPreflightMissing => 410,
+            Self::DependencyPreflightStale => 411,
+            Self::DependencyPreflightUnknown => 412,
+            Self::DependencyPreflightPolicyViolation => 413,
+            Self::DependencyPreflightTimeout => 414,
 
             // Internal (500-599)
             Self::InternalDaemonSocket => 500,
@@ -561,6 +577,19 @@ impl ErrorCode {
             Self::TransferBinaryFailed => "Binary download failed",
             Self::TransferIncomplete => "Transfer completed partially",
             Self::TransferProtocolError => "Transfer protocol error",
+            Self::DependencyPreflightMissing => {
+                "Remote dependency preflight found a missing required path"
+            }
+            Self::DependencyPreflightStale => {
+                "Remote dependency preflight found a stale dependency root"
+            }
+            Self::DependencyPreflightUnknown => {
+                "Remote dependency preflight could not verify dependency state"
+            }
+            Self::DependencyPreflightPolicyViolation => {
+                "Remote dependency preflight blocked a topology policy violation"
+            }
+            Self::DependencyPreflightTimeout => "Remote dependency preflight planning timed out",
 
             // Internal
             Self::InternalDaemonSocket => "Failed to connect to daemon socket",
@@ -1021,6 +1050,31 @@ impl ErrorCode {
                 "Check SSH protocol settings",
                 "Review transfer configuration",
             ],
+            Self::DependencyPreflightMissing => &[
+                "Inspect the dependency preflight evidence for the missing remote path",
+                "Ensure every dependency root in the closure is synced to the worker",
+                "Verify Cargo.toml and required source entrypoints exist on the worker",
+            ],
+            Self::DependencyPreflightStale => &[
+                "Rerun after a successful sync of all dependency roots",
+                "Check whether transfer estimation skipped a dependency root",
+                "Inspect dependency preflight evidence for the stale root",
+            ],
+            Self::DependencyPreflightUnknown => &[
+                "Inspect sync and SSH logs for the dependency preflight probe",
+                "Retry after worker connectivity and shell probes are healthy",
+                "Use verbose output to view the full dependency preflight report",
+            ],
+            Self::DependencyPreflightPolicyViolation => &[
+                "Move path dependencies under the configured canonical project root",
+                "Use /data/projects or /dp topology aliases consistently",
+                "Inspect the dependency closure policy diagnostics before retrying",
+            ],
+            Self::DependencyPreflightTimeout => &[
+                "Retry after system load decreases",
+                "Inspect cargo metadata latency for the workspace",
+                "Increase planner timeout only after ruling out dependency graph issues",
+            ],
 
             // Internal
             Self::InternalDaemonSocket => &[
@@ -1119,6 +1173,12 @@ impl ErrorCode {
             | Self::CancelCleanupFailed
             | Self::CancelSlotLeak
             | Self::CancelTimeoutExceeded => Some("https://rch.dev/docs/cancellation"),
+
+            Self::DependencyPreflightMissing
+            | Self::DependencyPreflightStale
+            | Self::DependencyPreflightUnknown
+            | Self::DependencyPreflightPolicyViolation
+            | Self::DependencyPreflightTimeout => Some("https://rch.dev/docs/sync"),
 
             _ => match self.category() {
                 ErrorCategory::Config => Some("https://rch.dev/docs/config"),
@@ -1229,6 +1289,11 @@ impl ErrorCode {
             Self::TransferBinaryFailed,
             Self::TransferIncomplete,
             Self::TransferProtocolError,
+            Self::DependencyPreflightMissing,
+            Self::DependencyPreflightStale,
+            Self::DependencyPreflightUnknown,
+            Self::DependencyPreflightPolicyViolation,
+            Self::DependencyPreflightTimeout,
             // Internal
             Self::InternalDaemonSocket,
             Self::InternalDaemonProtocol,
@@ -1390,6 +1455,10 @@ mod tests {
         assert_eq!(
             ErrorCode::ProcessTriageAdapterUnavailable.code_string(),
             "RCH-E310"
+        );
+        assert_eq!(
+            ErrorCode::DependencyPreflightMissing.code_string(),
+            "RCH-E410"
         );
     }
 
@@ -1583,6 +1652,19 @@ mod tests {
         assert_eq!(ErrorCode::CancelTimeoutExceeded.code_number(), 325);
     }
 
+    /// Contract test: dependency preflight error codes are stable.
+    #[test]
+    fn test_dependency_preflight_error_codes_stable() {
+        assert_eq!(ErrorCode::DependencyPreflightMissing.code_number(), 410);
+        assert_eq!(ErrorCode::DependencyPreflightStale.code_number(), 411);
+        assert_eq!(ErrorCode::DependencyPreflightUnknown.code_number(), 412);
+        assert_eq!(
+            ErrorCode::DependencyPreflightPolicyViolation.code_number(),
+            413
+        );
+        assert_eq!(ErrorCode::DependencyPreflightTimeout.code_number(), 414);
+    }
+
     /// Contract test: new error codes belong to correct categories.
     #[test]
     fn test_new_error_codes_correct_categories() {
@@ -1622,6 +1704,16 @@ mod tests {
             ErrorCode::CancelTimeoutExceeded.category(),
             ErrorCategory::Build
         );
+
+        // Dependency preflight failures happen after sync and belong to Transfer.
+        assert_eq!(
+            ErrorCode::DependencyPreflightMissing.category(),
+            ErrorCategory::Transfer
+        );
+        assert_eq!(
+            ErrorCode::DependencyPreflightTimeout.category(),
+            ErrorCategory::Transfer
+        );
     }
 
     /// Contract test: all new error codes have doc URLs pointing to correct sections.
@@ -1647,6 +1739,10 @@ mod tests {
             ErrorCode::CancelGracefulSent.doc_url(),
             Some("https://rch.dev/docs/cancellation")
         );
+        assert_eq!(
+            ErrorCode::DependencyPreflightMissing.doc_url(),
+            Some("https://rch.dev/docs/sync")
+        );
     }
 
     /// Contract test: new error codes roundtrip through JSON serialization.
@@ -1657,6 +1753,7 @@ mod tests {
             ErrorCode::ClosurePlanFailed,
             ErrorCode::WorkerDiskPressureCritical,
             ErrorCode::ProcessTriageAdapterUnavailable,
+            ErrorCode::DependencyPreflightMissing,
         ];
 
         for code in new_codes {
@@ -1678,10 +1775,10 @@ mod tests {
     fn test_total_error_code_count() {
         let total = ErrorCode::all().len();
         // 10 config + 12 path-dep/closure + 10 network + 10 worker + 8 storage
-        // + 10 build + 8 process-triage + 6 cancellation + 10 transfer + 10 internal = 94
+        // + 10 build + 8 process-triage + 6 cancellation + 15 transfer + 10 internal = 99
         assert!(
-            total >= 94,
-            "Expected at least 94 error codes (was {}); did a code get accidentally removed?",
+            total >= 99,
+            "Expected at least 99 error codes (was {}); did a code get accidentally removed?",
             total,
         );
     }

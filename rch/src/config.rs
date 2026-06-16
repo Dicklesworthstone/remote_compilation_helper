@@ -3708,7 +3708,10 @@ remote_speedup_threshold = 1.75
         // general.force_remote with source tracking.
         let _guard = test_guard!();
         let mut config = RchConfig::default();
-        assert!(!config.general.force_remote, "precondition: default is false");
+        assert!(
+            !config.general.force_remote,
+            "precondition: default is false"
+        );
         let mut sources = default_sources_map();
         let mut env_overrides: HashMap<String, String> = HashMap::new();
         env_overrides.insert("RCH_FORCE_REMOTE".to_string(), "1".to_string());
