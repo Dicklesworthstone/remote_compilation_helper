@@ -985,15 +985,37 @@ impl WorkerSelector {
             return None;
         }
 
-        // Find the pinned worker in the eligible list
+        // Find the pinned worker in the eligible list.
+        let mut pinned: Option<(Arc<WorkerState>, CircuitState, u32)> = None;
         for (worker, circuit_state) in eligible {
             let config = worker.config.read().await;
             if config.id.as_str() == pinned_worker_id {
-                return Some((worker.clone(), *circuit_state));
+                pinned = Some((worker.clone(), *circuit_state, config.priority));
+                break;
+            }
+        }
+        let (worker, circuit_state, pinned_priority) = pinned?;
+
+        // Priority-aware pin skip: if a strictly higher-priority worker is
+        // eligible and has capacity for this job, skip the cache pin so the
+        // higher-priority worker can win normal scoring. This keeps deliberately
+        // preferred (high-priority) workers from being starved by affinity, while
+        // still preserving cache affinity once those workers are saturated (the
+        // skip condition no longer holds, so the pin is honored).
+        for (candidate, _) in eligible {
+            let config = candidate.config.read().await;
+            if config.priority > pinned_priority
+                && candidate.available_slots().await >= request.estimated_cores
+            {
+                debug!(
+                    "Skipping affinity pin {} for project {}: higher-priority worker {} (priority {}) has capacity",
+                    pinned_worker_id, request.project, config.id, config.priority
+                );
+                return None;
             }
         }
 
-        None
+        Some((worker, circuit_state))
     }
 
     /// Try to find a fallback worker when no eligible workers exist.
