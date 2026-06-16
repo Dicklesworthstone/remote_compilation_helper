@@ -362,6 +362,25 @@ impl IncidentEvent {
         self.details.insert(key.into(), value.into());
         self
     }
+
+    /// Return a copy with the free-form `details` *values* routed through the
+    /// shared secret redactor (bd-53ga7).
+    ///
+    /// The structured fields (ids, hashes, fingerprints, enums, timestamps) are
+    /// non-sensitive by construction; only the free-form `details` map can carry
+    /// an injected secret. The ledger redacts it at write time as defense in
+    /// depth even though callers are asked not to put secrets here. Detail
+    /// *keys* are stable field names and are left intact.
+    #[must_use]
+    pub fn redacted(&self) -> Self {
+        let mut out = self.clone();
+        out.details = self
+            .details
+            .iter()
+            .map(|(k, v)| (k.clone(), crate::redaction::redact_secrets(v)))
+            .collect();
+        out
+    }
 }
 
 /// The current incident-schema version string.

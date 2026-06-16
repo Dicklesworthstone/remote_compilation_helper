@@ -195,8 +195,10 @@ impl IncidentLedger {
             fs::create_dir_all(parent)?;
         }
         // One JSON object per line. serde_json::to_string never embeds a raw
-        // newline, so line framing stays intact.
-        let mut line = serde_json::to_string(event)
+        // newline, so line framing stays intact. Free-form `details` values are
+        // routed through the shared secret redactor at write time (bd-53ga7) so
+        // an injected secret never reaches the persisted ledger.
+        let mut line = serde_json::to_string(&event.redacted())
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         line.push('\n');
 

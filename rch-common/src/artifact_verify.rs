@@ -84,7 +84,12 @@ impl VerificationResult {
         msg.push_str("Artifact integrity verification failed:\n\n");
 
         for failure in &self.failed {
-            msg.push_str(&format!("  {} - HASH MISMATCH\n", failure.path));
+            // Mask any home/user segment in the artifact path before it reaches
+            // a diagnostic surface (bd-53ga7); relative paths pass through.
+            msg.push_str(&format!(
+                "  {} - HASH MISMATCH\n",
+                crate::redaction::redact_path(&failure.path)
+            ));
             msg.push_str(&format!(
                 "    Expected: {} ({} bytes)\n",
                 short_hash(&failure.expected_hash),

@@ -1050,7 +1050,13 @@ impl TestHarness {
             stage: stage.to_string(),
             command_name: command.name.clone(),
             invoked_program: invoked_program.clone(),
-            invoked_args: invoked_args.clone(),
+            // Route invoked args through the shared secret redactor before they
+            // land in the JSONL artifact (bd-53ga7): a `--token <secret>` or
+            // `KEY=secret` arg must not survive into the recorded transcript.
+            invoked_args: invoked_args
+                .iter()
+                .map(|a| crate::redaction::redact_secrets(a))
+                .collect(),
             exit_code: result.exit_code,
             duration_ms: result.duration.as_millis() as u64,
             required_success: command.required_success,
