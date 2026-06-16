@@ -12,7 +12,8 @@
 | `rch exec -- <cmd>` | Explicitly offload one build command | (env: `RCH_REQUIRE_REMOTE`, `RCH_FORCE_REMOTE`) |
 | `rch self-test` | Full end-to-end verification | `--worker <id>`, `--all` |
 | `rch workers probe` | Test workers | `--all`, `-v`, `worker_id` |
-| `rch workers list` | List workers | `--capabilities`, `--json` |
+| `rch workers list` | List workers | `--speedscore`, `--json` |
+| `rch workers capabilities` | Detected toolchains/targets | `--refresh`, `--command` |
 | `rch workers discover` | Auto-find workers | `--from-ssh-config`, `--dry-run` |
 | `rch workers drain` / `enable` / `disable` | Worker lifecycle (drain reversible; disable permanent) | `-y`, `--reason`, `--drain` |
 | `rch hook install` | Setup Claude hook | `--force` |

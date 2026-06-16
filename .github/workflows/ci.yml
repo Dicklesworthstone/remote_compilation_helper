@@ -63,6 +63,10 @@ jobs:
         run: |
           chmod +x scripts/check_rch_skill.sh
           ./scripts/check_rch_skill.sh
+      - name: Guard operational runbooks against stale/destructive guidance
+        run: |
+          chmod +x scripts/check_runbooks_safe.sh
+          ./scripts/check_runbooks_safe.sh
 
   # Validate GitHub Actions workflow syntax
   workflow_lint:

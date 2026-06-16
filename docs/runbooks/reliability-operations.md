@@ -10,9 +10,13 @@ RCH's reliability architecture is built around five pillars:
 4. **Circuit Breakers** — Isolates failing workers to prevent cascade failures
 5. **Fail-Open Semantics** — Falls back to local builds when remote is unavailable
 
-### System Posture
+All five are **self-healing**: workers are temporarily bypassed and auto-rejoined,
+breakers open and re-close on their own, stale remote dirs are reaped with
+active-build protection, and stuck processes are escalated TERM → KILL with an
+audit trail. Operator action is for genuine, lasting problems — and should use
+the reversible, audited primitives below, never blind `pkill`/`rm -rf`.
 
-The system reports one of three postures:
+### System Posture
 
 | Posture | Meaning |
 |---------|---------|
@@ -23,27 +27,24 @@ The system reports one of three postures:
 Check current posture:
 ```bash
 rch status --json | jq '.posture'
+rch status --remediation            # human bands: fleet, admissibility, proof queue, pressure, telemetry, incidents
 ```
 
 ## Quick Diagnosis
 
 ```bash
-# Full status overview with remediation hints
-rch status
-
-# JSON output for scripting
-rch status --json
-
-# Doctor diagnostics with remediation plan
-rch doctor
-
-# System self-test
-rch self-test --quick
+rch check                           # quick yes/no health (exit 0=ready, 1=degraded, 2=not ready)
+rch status --fleet                  # desired vs live, dominant problem class, absence alerts
+rch status --json                   # machine-readable for scripting
+rch doctor                          # diagnostics + remediation plan (read-only)
+rch doctor --reliability            # reliability-focused probes (topology/convergence/pressure/triage/…)
 ```
 
 ## Error Taxonomy
 
-Error codes follow the pattern `RCH-Exxx`:
+Error codes follow `RCH-Exxx`; admission/incident reason codes use `RCH-Innn`;
+operator runbooks for remediation codes use `RCH-Rnnn` (see
+`rch doctor --runbook-list`).
 
 | Range | Category | Examples |
 |-------|----------|---------|
@@ -58,103 +59,99 @@ Error codes follow the pattern `RCH-Exxx`:
 
 ### Worker Unreachable
 
-**Symptoms:** Status shows worker as "unreachable", circuit breaker "open"
+**Symptoms:** Status shows worker "unreachable"/"bypassed", circuit breaker "open"
 
 **Reason codes:** `circuit_open`, `worker_unreachable`
 
 **Diagnosis:**
 ```bash
-rch status --workers
+rch status --fleet
 rch workers probe <worker-id> --verbose
 ssh <user>@<host> 'echo ok'
 ```
 
-**Remediation:**
+**Remediation:** fix the underlying SSH/network/agent issue (see the
+[worker-recovery runbook](worker-recovery.md)), then let the breaker self-heal.
+There is no manual circuit reset and no `--force` probe; a successful scheduled
+probe moves the breaker open → half-open → closed and a canary build auto-rejoins
+the worker.
 ```bash
-# Force-probe to reset circuit breaker
-rch workers probe <worker-id> --force
-
-# Verify recovery
-rch status --workers
+rch workers probe <worker-id> --verbose   # observe; daemon clears the breaker after a good probe
+rch status --fleet                        # confirm it returned to the live pool
 ```
-
-**Risk:** Force-probing resets the circuit breaker cooldown timer. If the worker is genuinely down, the circuit will re-open after the next failure.
+Do **not** `rch workers disable` for a transient outage — that blocks auto-rejoin.
 
 ### Disk Pressure Critical
 
-**Symptoms:** Worker shows pressure state "critical", builds deferred
+**Symptoms:** Worker pressure state "critical", builds deferred
 
 **Reason code:** `pressure_critical`
 
 **Diagnosis:**
 ```bash
+rch doctor --reliability --scope pressure
 rch status --json | jq '.daemon.workers[] | select(.pressure_state == "critical")'
 ssh <user>@<host> 'df -h / /tmp'
 ```
 
-**Remediation:**
+**Remediation:** reclaim safely. The daemon's stale-target reaper removes only
+idle remote dirs (active builds are always kept); local staging trees are reaped
+via `rch cache clean`, which is **dry-run by default**:
 ```bash
-# Check temp and target churn separately
-ssh <user>@<host> 'du -sh /tmp/rch-* /tmp/rch_target_* 2>/dev/null'
-ssh <user>@<host> 'find /data/projects -maxdepth 2 -type d \( -name "target_rch_*" -o -name "target_*" -o -name "target-*" -o -name target \) -exec du -sh {} + 2>/dev/null | sort -h | tail -n 20'
-
-# Reclaim incremental build state before deleting whole target trees
+rch cache clean --older 1h                 # preview reclaimable local staging trees
+rch cache clean --older 1h --execute       # reclaim idle trees
+# Reclaim incremental build state without nuking a whole target tree:
 ssh <user>@<host> 'cargo clean --manifest-path /tmp/rch/<project>/Cargo.toml'
-
-# Verify candidate is inactive before cleanup
-ssh <user>@<host> 'sudo lsof +D /tmp/rch_target_<name>'
-
-# Clean only inactive build artifacts (destructive)
-ssh <user>@<host> 'rm -rf /tmp/rch_target_<name>'
-
-# Verify recovery
-rch workers probe <worker-id>
+# Manual removal is a last resort — verify the candidate is inactive FIRST:
+ssh <user>@<host> 'sudo lsof +D /tmp/rch_target_<name>'   # empty ⇒ inactive
+ssh <user>@<host> 'rm -rf /tmp/rch_target_<name>'         # only if lsof was empty
 ```
 
-**Risk:** Disk cleanup removes cached build artifacts. Subsequent builds will be slower until caches are rebuilt.
+**Risk:** Reclaim removes cached build artifacts; subsequent builds are slower
+until caches rebuild. Blind `rm -rf` of an active dir can corrupt a live build —
+hence the lsof guard and active-build-protected reaper.
 
 ### Repo Convergence Failed
 
-**Symptoms:** Worker convergence state "failed" or "drifting", missing repos
+**Symptoms:** Worker convergence state "failed"/"drifting", missing repos
 
-**Reason codes:** `convergence_failed`, `convergence_drifting`
+**Reason codes:** `convergence_failed`, `convergence_drifting` (RCH-R3xx)
 
 **Diagnosis:**
 ```bash
+rch doctor --reliability --scope convergence
 rch status --json | jq '.convergence.workers[] | select(.drift_state != "ready")'
 ```
 
-**Remediation:**
+**Remediation:** the daemon converges drift automatically; to force a repair,
+use the operator-confirmed fleet doctor fix (preview first):
 ```bash
-# Soft repair (non-destructive)
-rch repo-convergence repair --worker <worker-id>
-
-# Force repair (may re-clone repos, destructive)
-rch repo-convergence repair --worker <worker-id> --force
-
-# Dry-run check
-rch repo-convergence dry-run --worker <worker-id>
+rch fleet doctor --reliability --scope convergence                                   # diagnose
+rch fleet doctor --reliability --scope convergence --fix --fleet-confirm --workers <id>   # apply on one worker
 ```
 
-**Risk:** Force repair may re-clone repositories, discarding any local worker-side changes.
+**Risk:** Convergence repair may re-sync/re-clone repositories, discarding any
+worker-side local changes. `--fleet-confirm` is the required safety gate before
+`--fix` touches workers; scope to specific `--workers` rather than the whole fleet
+when in doubt.
 
 ### All Workers Down (Fail-Open)
 
-**Symptoms:** Posture is "local-only", all builds running locally
+**Symptoms:** Posture `local-only`, all builds running locally
 
-**Reason:** No healthy workers available
+**Reason:** No healthy workers available — often a cloud/VMI fleet incident or a
+self-induced swarm-load collapse (see the dedicated sections below)
 
 **Diagnosis:**
 ```bash
-rch status
+rch status --fleet
 rch doctor
 ```
 
-**Remediation:**
-1. Check network connectivity to all workers
-2. Verify worker daemon processes are running
-3. Force-probe each worker: `rch workers probe <id> --force`
-4. Check for systemic issues (DNS, firewall, SSH keys)
+**Remediation:** fail-open is working as designed — builds are not blocked. Fix
+the systemic cause (network, DNS, SSH keys, cloud outage), then workers
+auto-rejoin. Do **not** `rch workers disable` or delete absent workers to "clean
+up"; they are part of desired state and rejoin on recovery.
 
 ### Schema/Contract Mismatch
 
@@ -167,15 +164,77 @@ rch doctor
 rch doctor --reliability --check-schemas
 ```
 
-**Remediation:**
-1. Update the affected adapter binary on workers
-2. Verify schema version match: `rch status --json | jq '.schema_version'`
+**Remediation:** redeploy the affected adapter binary to workers with an
+atomic, verified deploy (do not hand-patch a worker binary):
+```bash
+rch fleet deploy --worker <id> --force --verify
+rch status --json | jq '.schema_version'
+```
 
-**Risk:** Major version mismatches may require migration steps. Check release notes before updating.
+## Cloud / VMI Fleet Incidents
+
+When the whole fleet (or a region) disappears at once — provider outage, VMI
+image roll, network partition — RCH treats it as a desired-vs-live gap, not a
+config problem:
+
+```bash
+rch status --fleet            # dominant problem class = absent/unreachable across many workers
+rch status --remediation      # posture local-only/degraded, fallback flagged intentional
+```
+
+- **Fail-open carries you:** builds run locally; nothing is blocked.
+- **Do not mutate desired state to react.** Editing `workers.toml` or
+  `rch workers disable`-ing the absent nodes forces a manual re-add and defeats
+  auto-rejoin when the cloud recovers.
+- **When the fleet returns,** workers are re-probed and auto-rejoined (canary
+  before full traffic). Confirm with `rch status --fleet`.
+- **Genuinely dead node?** Decommission explicitly:
+  `rch workers disable <id> --reason "decommissioned" --drain -y`.
+
+## Local Fallback Hazards Under Swarm Load
+
+Many agents building at once can starve the worker pool. The danger is a
+feedback loop: builds fall back to local, local CPU saturates, everything slows,
+and operators "fix" it with destructive manual cleanup that removes capacity.
+
+Safer handling:
+
+```bash
+rch status --fleet            # is it real shortage, overload, or pressure?
+rch queue                     # depth + which builds are running/waiting
+rch admit "cargo build"       # RCH-I003 insufficient slots? RCH-I011 local fallback?
+```
+
+- **Prefer queueing over fallback** under contention — `RCH_QUEUE_WHEN_BUSY=1`
+  (default) waits for a busy worker instead of piling onto local CPU.
+- **Shed load by cancelling, not killing:** `rch cancel <id>` / `rch cancel --all -y`
+  reclaims slots with tracked cleanup.
+- **Do not add/remove workers reflexively** or `pkill` local cargo — that masks
+  the signal and can worsen the loop. Watch the fallback rate against the SLO.
+
+## Proof-Mode Handoff
+
+When a result must be *proven* to have run remotely (no silent local fallback),
+hand off through proof mode rather than trusting logs:
+
+```bash
+# Interim proof lane — fail-closed, self-healing disabled so nothing auto-starts underneath:
+RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- cargo test --workspace
+```
+
+- `RCH_REQUIRE_REMOTE=1` refuses local fallback (`RCH-I012` / `RCH-E301`) instead
+  of running locally. Keep the build command as **direct argv** after `--`;
+  shell-wrapped (`bash -lc "..."`) commands classify as non-compilation and are
+  refused under strict mode.
+- A refusal records a durable **proof intent** in the proof store
+  (`<state>/proofs.jsonl`), which the daemon replays when capacity returns; the
+  matching incident lands in `<state>/incidents.jsonl`
+  (`<state>` = `RCH_STATE_HOME`, else `XDG_STATE_HOME/rch`, else
+  `~/.local/state/rch`, else `/tmp/rch`).
+- Inspect the handoff with `rch status --remediation --json` (proof-queue band)
+  and `rch admit "<cmd>" --json` rather than scraping output.
 
 ## Feature Flags and Rollout
-
-Reliability features use staged rollout:
 
 | State | Meaning |
 |-------|---------|
@@ -184,14 +243,11 @@ Reliability features use staged rollout:
 | `canary` | Feature active on subset of workers |
 | `enabled` | Feature fully active |
 
-**Check rollout status:**
 ```bash
 rch status --json | jq '.feature_flags'
 ```
 
 ## SLO Guardrails
-
-Key performance budgets:
 
 | Metric | P50 Budget | P99 Budget | Release Blocking |
 |--------|-----------|-----------|-----------------|
@@ -203,25 +259,60 @@ Key performance budgets:
 
 ## Incident Triage Flowchart
 
-1. **Check posture:** `rch status --json | jq '.posture'`
-2. **If `local-only`:** Check all workers → network → SSH → daemon
-3. **If `degraded`:** Check specific failing workers → `rch doctor`
-4. **If `remote-ready` but slow:** Check pressure states → convergence → build stats
-5. **Escalation:** If unable to resolve, collect `rch status --json` and `rch doctor` output for incident report
+1. **Check posture:** `rch status --fleet` / `rch status --json | jq '.posture'`
+2. **If `local-only`:** all workers → network → SSH → daemon; suspect a cloud/VMI
+   incident or swarm-load collapse (sections above). Fail-open is correct; fix the
+   cause, don't disable desired state.
+3. **If `degraded`:** inspect failing workers → `rch doctor --reliability`
+4. **If `remote-ready` but slow:** pressure → convergence → build/queue stats
+5. **Escalation:** collect `rch status --remediation --json` and
+   `rch doctor --reliability --json`; the incident ledger already has the
+   reason-coded chain.
 
-## Dry-Run Operations
+## Safe vs Destructive Operations
 
-All diagnostic commands are safe to run in production:
-
-```bash
-rch status          # read-only
-rch doctor          # read-only diagnostics
-rch self-test       # creates temp files, cleans up
-```
-
-Repair commands with `--force` are destructive and should be confirmed:
+All diagnostics are read-only and safe in production:
 
 ```bash
-rch workers probe <id> --force           # resets circuit breaker
-rch repo-convergence repair <id> --force # may re-clone repos
+rch check                                 # read-only
+rch status / rch status --fleet           # read-only
+rch doctor / rch doctor --reliability     # read-only diagnostics
+rch self-test                             # creates temp files, cleans up
+rch cache clean --older <dur>             # DRY-RUN unless --execute is added
 ```
+
+Operations that change state require operator intent — preview, then confirm:
+
+```bash
+rch cache clean --older <dur> --execute                                   # reclaims idle staging trees
+rch fleet doctor --reliability --scope convergence --fix --fleet-confirm  # may re-sync repos
+rch fleet deploy --worker <id> --force --verify                           # atomic, rollback-safe
+rch workers disable <id> --reason "..." --drain -y                        # PERMANENT decommission only
+```
+
+Never: `pkill -9` a build/agent, `rm -rf` a worker's RCH tree, or `rm` the daemon
+socket. Use `rch cancel`, the audited triage fix, the active-build-protected
+reaper, and `rch daemon restart` instead.
+
+## Validation
+
+The behaviors in this runbook are backed by tests; the runbook itself is guarded
+against stale guidance returning:
+
+```bash
+# Runbook regression guard (forbidden/stale guidance cannot return; wired into CI):
+./scripts/check_runbooks_safe.sh
+# Reliability traceability matrix + convergence + pressure/triage behaviors:
+cargo test -p rch-common --test reliability_coverage_matrix_e2e
+cargo test -p rch-common --test repo_convergence_e2e
+# Admission reason-code vocabulary + proof-mode + incident ledger:
+cargo test -p rch-common --test admission_goldens_e2e
+cargo test -p rch-common --lib proof incident telemetry_explain
+```
+
+Structured records live under `<state>` (`RCH_STATE_HOME`, else
+`XDG_STATE_HOME/rch`, else `~/.local/state/rch`, else `/tmp/rch`):
+`incidents.jsonl` (reason-coded incidents) and `proofs.jsonl` (proof intents +
+replay state). E2E scenario logs are written as JSONL under `target/test-logs/`.
+Read live state via `rch status --remediation --json`, `rch diagnose "<cmd>"
+--json`, and `rch admit "<cmd>" --json`.

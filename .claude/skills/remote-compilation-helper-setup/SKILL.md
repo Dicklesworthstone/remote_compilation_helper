@@ -52,7 +52,7 @@ rch workers discover --from-ssh-config            # Add to config
 ```bash
 rch workers probe worker1 --verbose  # Test single
 rch workers probe --all              # Test all
-rch workers list --capabilities      # Show detected toolchains
+rch workers capabilities             # Show detected toolchains/targets
 ```
 
 ## Quick Fixes

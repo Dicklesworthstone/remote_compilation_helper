@@ -43,8 +43,8 @@ Configuration is loaded in this order (later overrides earlier):
 # Verify hook is installed
 rch hook status
 
-# Test classification manually
-rch classify "cargo build --release"
+# Test classification / offload decision manually
+rch diagnose "cargo build --release"
 ```
 
 **If hook not installed:**

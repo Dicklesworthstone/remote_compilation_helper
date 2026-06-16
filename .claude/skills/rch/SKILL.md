@@ -162,8 +162,8 @@ rch workers discover --from-ssh-config            # Add to config
 ```bash
 rch workers probe --all              # Test all workers
 rch workers probe worker1 -v         # Test single, verbose
-rch workers list --capabilities      # Show status + detected toolchains/targets
-rch workers capabilities --refresh   # Re-probe exact user/path facts
+rch workers list                     # Show configured workers + status
+rch workers capabilities --refresh   # Re-probe toolchains/targets (exact user/path facts)
 ```
 
 ---

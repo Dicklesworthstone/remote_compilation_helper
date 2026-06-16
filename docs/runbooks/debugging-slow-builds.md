@@ -49,23 +49,26 @@ Worker 'fra' (16 slots):
 ### 2. Check Circuit Breaker States
 
 ```bash
-rch status --circuits
+rch workers list --verbose     # per-worker circuit + health state
+rch queue                      # circuit states alongside running/queued builds
+rch status --remediation       # operator bands incl. circuit/telemetry
 ```
 
 **If circuits are open:**
 - Worker is experiencing repeated failures
-- RCH stopped routing to protect system
-- Wait for half-open state (30s default) or investigate worker
+- RCH stopped routing to protect the system
+- The breaker recovers itself: open → half-open (probe window) → closed after a
+  successful canary. There is no manual reset (and no `--circuits` flag).
 
 **Resolution options:**
 ```bash
-# Manual reset (if you know worker is fixed)
-rch worker reset <worker-id>
-
-# Or wait for automatic recovery
-# Check logs for failure reason
-rch daemon logs | grep <worker-id>
+# Fix the underlying worker issue, then observe the breaker self-heal:
+rch workers probe <worker-id> -v
+rch daemon logs -n 200 | grep <worker-id>
+rch status --fleet             # confirm it returned to the live pool
 ```
+Do not `rch workers disable` a worker whose breaker is open for a transient
+failure — it auto-rejoins once probes succeed.
 
 ### 3. Check Transfer Performance
 
@@ -86,8 +89,8 @@ RCH_LOG_LEVEL=debug cargo build 2>&1 | grep -i transfer
 # Test raw network speed
 ssh worker "dd if=/dev/zero bs=1M count=100" | dd of=/dev/null
 
-# Check what's being transferred
-rch sync --dry-run
+# Inspect the resolved transfer/offload plan (no side effects)
+rch diagnose "cargo build --release" --dry-run --json
 
 # Verify excludes are working
 cat .rch/config.toml  # Check exclude patterns
@@ -98,7 +101,8 @@ cat .rch/config.toml  # Check exclude patterns
 Verify the command is being classified correctly:
 
 ```bash
-rch classify "your command here"
+rch diagnose "your command here"
+rch admit "your command here"        # offload recommendation + RCH-Innn reason code
 ```
 
 **Expected output:**
@@ -110,8 +114,9 @@ Decision: INTERCEPT (threshold: 0.85)
 ```
 
 **If classification is wrong:**
-- Report as bug if legitimate compilation command not intercepted
-- Use `--local` flag for specific commands that shouldn't be remoted
+- Report as a bug if a legitimate compilation command is not intercepted
+- Force a command to stay local via config: `general.force_local = true` in a
+  project `.rch/config.toml` (or `RCH_FORCE_REMOTE=1` to force the opposite)
 
 ### 5. Check Worker Resources
 
@@ -137,8 +142,10 @@ ssh worker "ps aux | grep -E 'cargo|rustc' | head -20"
 # View cache usage on worker
 ssh worker "du -sh /tmp/rch/*"
 
-# Clean old caches
-rch worker clean <worker-id> --max-age-hours=24
+# Reclaim idle local staging trees (dry-run first, then --execute).
+# Remote worker dirs are reaped automatically with active-build protection.
+rch cache clean --older 24h
+rch cache clean --older 24h --execute
 ```
 
 ## Common Solutions
@@ -149,8 +156,8 @@ rch worker clean <worker-id> --max-age-hours=24
 | High transfer time | Check network, adjust compression level |
 | Worker degraded | Investigate worker load, add more workers |
 | Slots exhausted | Reduce parallel agents or add workers |
-| Wrong classification | Report bug, use `--local` flag |
-| Cache too large | Clean worker caches |
+| Wrong classification | Report bug; pin with `general.force_local` in `.rch/config.toml` |
+| Cache too large | `rch cache clean --older <dur> --execute` (reaper handles remote) |
 | First build slow | Normal - initial sync is full transfer |
 
 ## Performance Tuning
@@ -184,9 +191,18 @@ exclude_patterns = [
 
 ### Increase Parallelism
 
+Slot counts are config-driven; edit them and reload (no restart needed):
+
+```toml
+# ~/.config/rch/config.toml
+[compilation]
+build_slots = 4
+test_slots = 8
+check_slots = 2
+```
+
 ```bash
-# If workers have capacity
-rch daemon restart --max-parallel=8
+rch daemon reload
 ```
 
 ## Escalation
@@ -195,7 +211,8 @@ If the issue persists after following this runbook:
 
 1. Collect diagnostic information:
    ```bash
-   rch debug-bundle > rch-debug-$(date +%Y%m%d).txt
+   rch doctor --json > rch-doctor.json
+   rch status --remediation --json > rch-remediation.json
    ```
 
 2. Check recent changes:
@@ -205,7 +222,7 @@ If the issue persists after following this runbook:
 
 3. Review daemon logs:
    ```bash
-   rch daemon logs --tail 100
+   rch daemon logs -n 100
    ```
 
 4. File an issue with the debug bundle attached.
