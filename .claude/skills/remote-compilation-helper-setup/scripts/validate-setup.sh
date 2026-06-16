@@ -81,18 +81,33 @@ echo
 # 3. Check daemon
 echo "Daemon:"
 
-SOCKET_PATH="/tmp/rch.sock"
+# The socket path is not fixed: it resolves to $XDG_RUNTIME_DIR/rch.sock, then
+# ~/.cache/rch/rch.sock, then /tmp/rch.sock. Check each candidate (and let
+# config override RCH_SOCKET_PATH/RCH_DAEMON_SOCKET win) rather than hardcoding.
+SOCKET_FOUND=""
+for candidate in \
+    "${RCH_SOCKET_PATH:-}" \
+    "${RCH_DAEMON_SOCKET:-}" \
+    "${XDG_RUNTIME_DIR:-}/rch.sock" \
+    "$HOME/.cache/rch/rch.sock" \
+    "/tmp/rch.sock"; do
+    [ -n "$candidate" ] || continue
+    if [ -S "$candidate" ]; then
+        SOCKET_FOUND="$candidate"
+        break
+    fi
+done
 
-if [ -S "$SOCKET_PATH" ]; then
-    pass "Daemon socket exists: $SOCKET_PATH"
+if [ -n "$SOCKET_FOUND" ]; then
+    pass "Daemon socket exists: $SOCKET_FOUND"
 else
-    warn "Daemon socket not found (rchd may not be running)"
+    warn "Daemon socket not found (run: rch daemon status)"
 fi
 
 if pgrep -x rchd &>/dev/null; then
     pass "rchd process running"
 else
-    warn "rchd not running (start with: rchd &)"
+    warn "rchd not running (start with: rch daemon start)"
 fi
 
 echo

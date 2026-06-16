@@ -38,9 +38,9 @@ tags = ["rust", "bun", "fast"]           # Optional capability tags
 # Tips:
 # - total_slots: Match to CPU cores. Leave 1-2 for system overhead.
 # - priority: Range 1-100. Equal slots? Higher priority wins.
-# - tags: Projects can require specific tags in .rch.toml
+# - tags: Projects can require specific tags in .rch/config.toml
 # - identity_file: Use ssh-agent for passphrase-protected keys
 #
 # Test your configuration:
-#   rch config check
+#   rch config validate
 #   rch workers probe --all

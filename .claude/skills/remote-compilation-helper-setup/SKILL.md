@@ -25,8 +25,8 @@ If `--fix` can't solve it, continue below.
 - [ ] **Install**: `cargo install --path rch` (or `--path .` from repo root)
 - [ ] **Configure**: Create `~/.config/rch/workers.toml` (see below)
 - [ ] **Hook**: `rch hook install`
-- [ ] **Daemon**: `rchd &` or `systemctl --user start rchd`
-- [ ] **Validate**: `rch doctor` → all checks pass
+- [ ] **Daemon**: `rch daemon start` (or `systemctl --user start rchd`)
+- [ ] **Validate**: `rch doctor` → all checks pass, then `rch self-test`
 
 ## Worker Config
 
@@ -60,14 +60,13 @@ rch workers list --capabilities      # Show detected toolchains
 | Symptom | Fix |
 |---------|-----|
 | SSH fails | `eval $(ssh-agent) && ssh-add ~/.ssh/your_key` |
-| Daemon down | `rm -f /tmp/rch.sock && rchd &` |
-| Hook missing | `rch hook install --force` |
-| No workers | Check config path, SSH connectivity |
+| Daemon down / stale socket | `rch daemon restart` — never `rm` the socket by hand |
+| Hook missing | `rch hook install` (`--force` only after `rch hook status`) |
+| No workers | `rch status --fleet` + `rch admit "cargo build"` — find the real cause; **do not** edit `workers.toml` for transient illness |
 
-**Test hook directly**:
+**Test the hook**:
 ```bash
-echo '{"tool":"Bash","input":{"command":"cargo check"}}' | rch hook
-# Expect: {"allow":true,"output":"..."}
+rch hook test
 ```
 
 ## Validation
@@ -75,7 +74,7 @@ echo '{"tool":"Bash","input":{"command":"cargo check"}}' | rch hook
 ```bash
 rch doctor --verbose   # Full diagnostics
 rch doctor --json      # Machine-readable
-RCH_DRY_RUN=1 cargo check  # Test without remote execution
+rch diagnose "cargo check" --dry-run  # Show the decision without remote execution
 ```
 
 ⚠️ **All `rch doctor` checks must pass before use.**

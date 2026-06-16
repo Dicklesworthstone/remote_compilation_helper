@@ -74,25 +74,25 @@ cargo build &              # Background
 ## Testing
 
 ```bash
-# Test classification
-echo '{"tool":"Bash","input":{"command":"cargo build"}}' | rch hook
-# → {"allow":true,"output":"..."}
+# Built-in hook self-test (preferred)
+rch hook test
 
-echo '{"tool":"Bash","input":{"command":"ls -la"}}' | rch hook
-# → {"allow":true}
+# Raw protocol: the hook is the bare `rch` binary reading JSON on stdin in
+# hook mode (RCH_HOOK_MODE=1 forces it; Claude Code invokes the binary directly).
+echo '{"tool":"Bash","input":{"command":"cargo build"}}' | RCH_HOOK_MODE=1 rch
+# → strict JSON decision on stdout
 
-# Dry run with file input
-RCH_DRY_RUN=1 rch hook < test-input.json
+echo '{"tool":"Bash","input":{"command":"ls -la"}}' | RCH_HOOK_MODE=1 rch
 
-# Dry run (logs but no remote execution)
-RCH_DRY_RUN=1 cargo check
+# Show the decision without remote execution
+rch diagnose "cargo check" --dry-run
 
 # Debug logging
-RCH_LOG=debug cargo build
-RCH_LOG=trace cargo build  # Maximum detail
+RCH_LOG_LEVEL=debug rch diagnose "cargo build"
+RCH_LOG_LEVEL=trace rch diagnose "cargo build"  # Maximum detail
 
-# Verify hook is running
-ps aux | grep rch
+# Verify hook registration
+rch hook status
 ```
 
 ## Configuration
