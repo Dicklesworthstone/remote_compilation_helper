@@ -896,6 +896,58 @@ fn build_coverage_matrix() -> CoverageMatrix {
             has_log_assertion: true,
             gap: None,
         },
+        RequirementRow {
+            id: "REQ-CONFIG-ROLLOUT-001".into(),
+            description: "Remediation config rollout across install/init/upgrade/doctor surfaces: \
+                          old configs without [remediation] deserialize to safe defaults (no \
+                          migration step) and partial sections merge per-field; `rch config \
+                          validate/lint/doctor` and the top-level `rch doctor` (run by the \
+                          installer/easy-mode) report unsafe/out-of-range/contradictory remediation \
+                          settings with concrete remediation; `rch config diff` shows changed \
+                          remediation knobs and `rch config export --format json` includes the \
+                          remediation section with operator paths redacted; `rch init` writes a \
+                          documented [remediation] block without overwriting operator choices"
+                .into(),
+            domain: "ux_quality".into(),
+            bead_id: "bd-session-history-remediation-ocv9i.17.2".into(),
+            test_refs: vec![
+                TestRef {
+                    // Merge/upgrade behavior + surface wiring driven against the
+                    // built binary via RCH_CONFIG_DIR.
+                    file: "../../rch/tests/integration/config_remediation_rollout.rs".into(),
+                    name_prefix: "config_".into(),
+                    tier: "smoke".into(),
+                },
+                TestRef {
+                    // E2E runner: drives the config surfaces over a crafted config
+                    // and emits JSONL evidence keyed by bead id and surface.
+                    file: "../../scripts/e2e_config_rollout.sh".into(),
+                    name_prefix: "e2e_config_rollout".into(),
+                    tier: "smoke".into(),
+                },
+            ],
+            artifact_assertions: vec![
+                "An old config without a [remediation] section deserializes with the whole \
+                 section defaulted (RemediationConfig::default()); partial sections merge per-field"
+                    .into(),
+                "config validate/lint/doctor and the top-level doctor surface \
+                 RemediationConfig::validate() findings (LINT-E101/W101, DOC-E100/W100, the \
+                 doctor remediation_config check) each with a concrete next step"
+                    .into(),
+                "config diff shows changed remediation knobs (e.g. \
+                 remediation.policy.hook_exec_fail_open) and config export --format json includes \
+                 the remediation section with operator home paths redacted to /home/<redacted>/"
+                    .into(),
+                "Disabling fail-open / proof-fail-closed is accepted without error; an \
+                 out-of-range knob (auto_rejoin.check_interval_secs=0) is reported as an error"
+                    .into(),
+                "E2E JSONL emitted with run_id, bead_id, surface, command, status, and detail"
+                    .into(),
+            ],
+            has_executable_test: true,
+            has_log_assertion: true,
+            gap: None,
+        },
     ];
 
     let total = requirements.len();

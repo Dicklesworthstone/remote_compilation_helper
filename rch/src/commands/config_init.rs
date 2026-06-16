@@ -588,6 +588,17 @@ min_local_time_ms = {}
 compression_level = {}
 exclude_patterns = [
 {exclude_lines}]
+
+# [remediation]
+# Session-history remediation knobs: temporary bypass, auto-rejoin, proof mode,
+# reconciliation, incident ledger, build-root safety, pooled targets, telemetry
+# freshness, log retention, disk pressure, and smoke defaults. Every section is
+# OPTIONAL and falls back to safe defaults; uncomment only what you override.
+# Validate with `rch config doctor`; see effective overrides with `rch config diff`.
+#
+# [remediation.policy]
+# hook_exec_fail_open = true      # hook/exec errors fall back to local builds
+# proof_mode_fail_closed = true   # RCH_REQUIRE_REMOTE refuses local fallback
 "###,
         log_level,
         socket_path,

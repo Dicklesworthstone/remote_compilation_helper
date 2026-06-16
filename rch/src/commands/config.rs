@@ -1437,7 +1437,12 @@ pub fn config_export(format: &str, ctx: &OutputContext) -> Result<()> {
                     },
                     "environment": {
                         "allowlist": config.environment.allowlist,
-                    }
+                    },
+                    // Redacted so any operator paths (proof store, incident
+                    // ledger, disk roots, remote base) never leak into an export
+                    // (bd-...remediation-ocv9i.17.2).
+                    "remediation": serde_json::to_value(config.remediation.redacted())
+                        .unwrap_or(serde_json::Value::Null),
                 }),
             ));
         }
@@ -1577,6 +1582,31 @@ pub fn config_lint(ctx: &OutputContext) -> Result<()> {
             remediation:
                 "Short timeouts may cause builds to fail prematurely. Consider at least 300s"
                     .to_string(),
+        });
+    }
+
+    // Check 7: Remediation knobs (bd-...remediation-ocv9i.17.2). Surface the
+    // central RemediationConfig validation findings so operators learn about
+    // unsafe, contradictory, or out-of-range remediation settings here rather
+    // than discovering drift at runtime.
+    for issue in config.remediation.validate() {
+        let (severity, code) = match issue.severity {
+            rch_common::remediation_config::IssueSeverity::Error => {
+                (LintSeverity::Error, "LINT-E101")
+            }
+            rch_common::remediation_config::IssueSeverity::Warning => {
+                (LintSeverity::Warning, "LINT-W101")
+            }
+        };
+        issues.push(LintIssue {
+            severity,
+            code: code.to_string(),
+            message: format!("{}: {}", issue.field, issue.message),
+            remediation: format!(
+                "Adjust `{}` under [remediation] (or the matching RCH_REMEDIATION_* env var); \
+                 re-check with `rch config doctor`.",
+                issue.field
+            ),
         });
     }
 
@@ -1786,6 +1816,31 @@ pub fn config_edit(project: bool, user: bool, workers: bool, ctx: &OutputContext
 }
 
 /// Show configuration values that differ from defaults.
+/// Flatten a JSON object into `dotted.key -> rendered-scalar` entries
+/// (e.g. `remediation.policy.hook_exec_fail_open -> true`). Nested objects
+/// recurse; strings render without surrounding quotes, all other leaves use
+/// their compact JSON form. Used by `config diff` to compare the remediation
+/// section field-by-field without hand-listing every knob.
+fn flatten_json_scalars(
+    prefix: &str,
+    value: &serde_json::Value,
+    out: &mut std::collections::BTreeMap<String, String>,
+) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (k, v) in map {
+                flatten_json_scalars(&format!("{prefix}.{k}"), v, out);
+            }
+        }
+        serde_json::Value::String(s) => {
+            out.insert(prefix.to_string(), s.clone());
+        }
+        other => {
+            out.insert(prefix.to_string(), other.to_string());
+        }
+    }
+}
+
 pub fn config_diff(ctx: &OutputContext) -> Result<()> {
     use rch_common::RchConfig;
 
@@ -2015,6 +2070,35 @@ pub fn config_diff(ctx: &OutputContext) -> Result<()> {
             default: format!("[{}]", defaults.environment.allowlist.join(", ")),
             source,
         });
+    }
+
+    // Remediation section (bd-...remediation-ocv9i.17.2): a generic redacted
+    // diff so every changed knob is visible — with operator paths redacted —
+    // without hand-listing ~40 fields. The effective value is redacted before
+    // comparison so a changed proof-store/ledger/disk-root/remote-base path is
+    // never exported in the clear.
+    {
+        let current = serde_json::to_value(config.remediation.redacted()).unwrap_or_default();
+        let default = serde_json::to_value(&defaults.remediation).unwrap_or_default();
+        let mut cur_flat = std::collections::BTreeMap::new();
+        let mut def_flat = std::collections::BTreeMap::new();
+        flatten_json_scalars("remediation", &current, &mut cur_flat);
+        flatten_json_scalars("remediation", &default, &mut def_flat);
+        for (key, cur_val) in &cur_flat {
+            let def_val = def_flat.get(key).cloned().unwrap_or_default();
+            if *cur_val != def_val {
+                let source = sources
+                    .get(key.as_str())
+                    .map(|s| format!("{:?}", s))
+                    .unwrap_or_else(|| "config".to_string());
+                entries.push(ConfigDiffEntry {
+                    key: key.clone(),
+                    current: cur_val.clone(),
+                    default: def_val,
+                    source,
+                });
+            }
+        }
     }
 
     let total_changes = entries.len();

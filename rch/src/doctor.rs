@@ -3614,9 +3614,68 @@ fn check_configuration(
     print_check_result(&workers_result, ctx);
     checks.push(workers_result);
 
+    // Check remediation knobs (bd-...remediation-ocv9i.17.2) so `rch doctor`
+    // — including the installer/easy-mode post-install run — surfaces unsafe or
+    // contradictory [remediation] settings rather than letting them drift.
+    for result in check_remediation_results() {
+        print_check_result(&result, ctx);
+        checks.push(result);
+    }
+
     if !ctx.is_json() {
         println!();
     }
+}
+
+/// Validate the central remediation knobs (bd-...remediation-ocv9i.17.2).
+///
+/// Returns one `Pass` when the `[remediation]` section is valid (defaults apply
+/// where unset), or one check per `RemediationConfig::validate()` finding with a
+/// concrete suggestion. Config-load failures are reported by the config checks,
+/// so this stays silent in that case.
+fn check_remediation_results() -> Vec<CheckResult> {
+    let Ok(config) = crate::config::load_config() else {
+        return Vec::new();
+    };
+    let issues = config.remediation.validate();
+    if issues.is_empty() {
+        return vec![CheckResult {
+            category: "configuration".to_string(),
+            name: "remediation_config".to_string(),
+            status: CheckStatus::Pass,
+            message: "Remediation settings valid".to_string(),
+            details: Some(
+                "[remediation] knobs within safe ranges (defaults apply where unset)".to_string(),
+            ),
+            suggestion: None,
+            fixable: false,
+            fix_applied: false,
+            fix_message: None,
+        }];
+    }
+    issues
+        .into_iter()
+        .map(|issue| {
+            let status = match issue.severity {
+                rch_common::remediation_config::IssueSeverity::Error => CheckStatus::Fail,
+                rch_common::remediation_config::IssueSeverity::Warning => CheckStatus::Warning,
+            };
+            CheckResult {
+                category: "configuration".to_string(),
+                name: "remediation_config".to_string(),
+                status,
+                message: format!("{}: {}", issue.field, issue.message),
+                details: None,
+                suggestion: Some(format!(
+                    "Adjust `{}` under [remediation] (or the matching RCH_REMEDIATION_* env var)",
+                    issue.field
+                )),
+                fixable: false,
+                fix_applied: false,
+                fix_message: None,
+            }
+        })
+        .collect()
 }
 
 fn check_config_directory() -> CheckResult {
