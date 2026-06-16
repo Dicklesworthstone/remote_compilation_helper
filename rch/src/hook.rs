@@ -1160,19 +1160,21 @@ pub async fn run_exec(command_parts: Vec<String>) -> anyhow::Result<()> {
         }
         Err(e) => {
             if let Some(preflight_err) = e.downcast_ref::<DependencyPreflightFailure>() {
+                let evidence_summary = preflight_err.evidence_summary();
                 warn!(
-                    "Dependency preflight blocked remote execution [{}]: {}",
-                    preflight_err.reason_code, preflight_err.remediation
+                    "Dependency preflight blocked remote execution [{}]: {}; evidence='{}'",
+                    preflight_err.reason_code, preflight_err.remediation, evidence_summary
                 );
                 reporter.summary(&format!(
-                    "[RCH] local (dependency preflight {}: {})",
-                    preflight_err.reason_code, preflight_err.remediation
+                    "[RCH] local (dependency preflight {}: {}; evidence: {})",
+                    preflight_err.reason_code, preflight_err.remediation, evidence_summary
                 ));
                 reporter.verbose(&format!(
                     "[RCH] dependency preflight report: {}",
                     preflight_err.report_json()
                 ));
-                exit_with_local_fallback(&command, &reporter, "dependency preflight failed");
+                let fallback_reason = format!("dependency preflight failed: {evidence_summary}");
+                exit_with_local_fallback(&command, &reporter, &fallback_reason);
             }
 
             // Check for transfer skip (not a failure)
@@ -3006,13 +3008,14 @@ async fn handle_selection_response(
         }
         Err(e) => {
             if let Some(preflight_err) = e.downcast_ref::<DependencyPreflightFailure>() {
+                let evidence_summary = preflight_err.evidence_summary();
                 info!(
-                    "Dependency preflight blocked remote execution [{}], falling back to local",
-                    preflight_err.reason_code
+                    "Dependency preflight blocked remote execution [{}], falling back to local; evidence='{}'",
+                    preflight_err.reason_code, evidence_summary
                 );
                 reporter.summary(&format!(
-                    "[RCH] local (dependency preflight {}: {})",
-                    preflight_err.reason_code, preflight_err.remediation
+                    "[RCH] local (dependency preflight {}: {}; evidence: {})",
+                    preflight_err.reason_code, preflight_err.remediation, evidence_summary
                 ));
                 reporter.verbose(&format!(
                     "[RCH] dependency preflight report: {}",
@@ -5227,12 +5230,12 @@ struct SyncClosureManifestEntry {
 }
 
 const DEPENDENCY_PREFLIGHT_SCHEMA_VERSION: &str = "rch.dependency_preflight.v1";
-const DEPENDENCY_PREFLIGHT_CODE_PRESENT: &str = "RCH-I324";
-const DEPENDENCY_PREFLIGHT_CODE_MISSING: &str = "RCH-E324";
-const DEPENDENCY_PREFLIGHT_CODE_STALE: &str = "RCH-E325";
-const DEPENDENCY_PREFLIGHT_CODE_UNKNOWN: &str = "RCH-E326";
-const DEPENDENCY_PREFLIGHT_CODE_POLICY: &str = "RCH-E327";
-const DEPENDENCY_PREFLIGHT_CODE_TIMEOUT: &str = "RCH-E328";
+const DEPENDENCY_PREFLIGHT_CODE_PRESENT: &str = "RCH-I410";
+const DEPENDENCY_PREFLIGHT_CODE_MISSING: &str = "RCH-E410";
+const DEPENDENCY_PREFLIGHT_CODE_STALE: &str = "RCH-E411";
+const DEPENDENCY_PREFLIGHT_CODE_UNKNOWN: &str = "RCH-E412";
+const DEPENDENCY_PREFLIGHT_CODE_POLICY: &str = "RCH-E413";
+const DEPENDENCY_PREFLIGHT_CODE_TIMEOUT: &str = "RCH-E414";
 const DEPENDENCY_PREFLIGHT_REMEDIATION_MISSING: &str = "Ensure every dependency root in the closure is synced and Cargo.toml plus required source entrypoints exist remotely.";
 const DEPENDENCY_PREFLIGHT_REMEDIATION_STALE: &str = "One or more dependency roots were not refreshed; rerun after successful sync of skipped roots.";
 const DEPENDENCY_PREFLIGHT_REMEDIATION_UNKNOWN: &str =
@@ -5312,6 +5315,39 @@ impl DependencyPreflightFailure {
                 DEPENDENCY_PREFLIGHT_SCHEMA_VERSION, self.reason_code, err
             )
         })
+    }
+
+    fn evidence_summary(&self) -> String {
+        dependency_preflight_evidence_summary(&self.report.evidence)
+    }
+}
+
+fn dependency_preflight_status_label(status: DependencyPreflightStatus) -> &'static str {
+    match status {
+        DependencyPreflightStatus::Present => "present",
+        DependencyPreflightStatus::Missing => "missing",
+        DependencyPreflightStatus::Stale => "stale",
+        DependencyPreflightStatus::PolicyViolation => "policy_violation",
+        DependencyPreflightStatus::Timeout => "timeout",
+        DependencyPreflightStatus::Unknown => "unknown",
+    }
+}
+
+fn dependency_preflight_evidence_summary(evidence: &[DependencyPreflightEvidence]) -> String {
+    let selected = evidence
+        .iter()
+        .find(|item| item.status != DependencyPreflightStatus::Present)
+        .or_else(|| evidence.first());
+
+    match selected {
+        Some(item) => format!(
+            "{} {} {}: {}",
+            dependency_preflight_status_label(item.status),
+            item.required_kind,
+            item.required_path,
+            item.detail
+        ),
+        None => "no dependency preflight evidence rows".to_string(),
     }
 }
 
@@ -6088,9 +6124,10 @@ async fn verify_remote_dependency_manifests(
     }
 
     let failure = DependencyPreflightFailure::from_report(report);
+    let evidence_summary = failure.evidence_summary();
     warn!(
-        "Remote dependency preflight blocked remote execution on {} [{}] remediation='{}'",
-        worker.id, failure.reason_code, failure.remediation
+        "Remote dependency preflight blocked remote execution on {} [{}] remediation='{}' evidence='{}'",
+        worker.id, failure.reason_code, failure.remediation, evidence_summary
     );
     reporter.verbose(&format!(
         "[RCH] dependency preflight remediation [{}]: {}",
@@ -11125,6 +11162,38 @@ RCH_DEP_PRESENT:/data/projects/c/Cargo.toml
         assert!(missing.contains("/data/projects/b/Cargo.toml"));
     }
 
+    #[test]
+    fn test_dependency_preflight_error_codes_match_public_catalog() {
+        let _guard = test_guard!();
+        assert_eq!(
+            DEPENDENCY_PREFLIGHT_CODE_MISSING,
+            ErrorCode::DependencyPreflightMissing.code_string().as_str()
+        );
+        assert_eq!(
+            DEPENDENCY_PREFLIGHT_CODE_STALE,
+            ErrorCode::DependencyPreflightStale.code_string().as_str()
+        );
+        assert_eq!(
+            DEPENDENCY_PREFLIGHT_CODE_UNKNOWN,
+            ErrorCode::DependencyPreflightUnknown.code_string().as_str()
+        );
+        assert_eq!(
+            DEPENDENCY_PREFLIGHT_CODE_POLICY,
+            ErrorCode::DependencyPreflightPolicyViolation
+                .code_string()
+                .as_str()
+        );
+        assert_eq!(
+            DEPENDENCY_PREFLIGHT_CODE_TIMEOUT,
+            ErrorCode::DependencyPreflightTimeout.code_string().as_str()
+        );
+        assert_ne!(
+            DEPENDENCY_PREFLIGHT_CODE_MISSING,
+            ErrorCode::CancelSlotLeak.code_string().as_str(),
+            "dependency preflight must not reuse the cancellation slot-leak code"
+        );
+    }
+
     fn make_sync_entry(root: &str, is_primary: bool) -> SyncClosurePlanEntry {
         SyncClosurePlanEntry {
             local_root: PathBuf::from(root),
@@ -11787,6 +11856,16 @@ edition = "2024"
                 && item.required_path == "/data/projects/app/crates/member/src/lib.rs"
                 && item.status == DependencyPreflightStatus::Missing
         }));
+        let failure = DependencyPreflightFailure::from_report(report);
+        let summary = failure.evidence_summary();
+        assert!(
+            summary.contains("/data/projects/app/crates/member/src/lib.rs"),
+            "summary should expose the missing path, got {summary}"
+        );
+        assert!(
+            summary.contains("missing source_entrypoint"),
+            "summary should expose the failure class and path kind, got {summary}"
+        );
     }
 
     #[test]

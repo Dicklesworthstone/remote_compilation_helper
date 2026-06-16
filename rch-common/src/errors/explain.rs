@@ -190,119 +190,9 @@ pub fn is_known_category(category: &str) -> bool {
     !cat.is_empty() && known_categories().iter().any(|known| known == &cat)
 }
 
-/// All known [`ErrorCode`] variants. Hand-maintained because `ErrorCode`
-/// doesn't expose an iteration API; this list is the authoritative
-/// snapshot. A unit test asserts every variant has a unique `RCH-Ennn`
-/// `code_string()`, which catches drift if the enum gains/renames variants.
+/// All known [`ErrorCode`] variants from the authoritative catalog.
 fn error_code_all() -> &'static [ErrorCode] {
-    use ErrorCode::*;
-    &[
-        // Config (E001-E099)
-        ConfigNotFound,
-        ConfigReadError,
-        ConfigParseError,
-        ConfigValidationError,
-        ConfigEnvError,
-        ConfigProfileNotFound,
-        ConfigNoWorkers,
-        ConfigInvalidWorker,
-        ConfigSshKeyError,
-        ConfigSocketPathError,
-        // Path-Dependency (within Config E013-E018)
-        PathDepManifestParseFailed,
-        PathDepMissing,
-        PathDepCyclic,
-        PathDepPolicyViolation,
-        PathDepMetadataFailed,
-        PathDepMetadataParseFailed,
-        // Closure planner (within Config E019-E024)
-        ClosureFailOpen,
-        ClosureFingerprintMismatch,
-        ClosureHighRisk,
-        ClosureMissingData,
-        ClosureNonDeterministic,
-        ClosurePlanFailed,
-        // Network (E100-E199)
-        SshConnectionFailed,
-        SshAuthFailed,
-        SshHostKeyError,
-        SshKeyError,
-        SshTimeout,
-        NetworkTimeout,
-        NetworkConnectionRefused,
-        NetworkDnsError,
-        NetworkUnreachable,
-        SshSessionDropped,
-        // Worker (E200-E299)
-        WorkerAllUnhealthy,
-        WorkerAtCapacity,
-        WorkerCircuitOpen,
-        WorkerHealthCheckFailed,
-        WorkerLoadQueryFailed,
-        WorkerMissingToolchain,
-        WorkerNoneAvailable,
-        WorkerSelectionFailed,
-        WorkerSelfTestFailed,
-        WorkerStateError,
-        // Worker/Storage (E210-E219)
-        WorkerDiskPressureWarning,
-        WorkerDiskPressureCritical,
-        WorkerDiskHeadroomInsufficient,
-        WorkerDiskIoHigh,
-        WorkerMemoryPressureHigh,
-        WorkerTelemetryGap,
-        WorkerReclaimFailed,
-        WorkerReclaimProtected,
-        // Build (E300-E399)
-        BuildCompilationFailed,
-        BuildTimeout,
-        BuildArtifactMissing,
-        BuildOutputError,
-        BuildKilledBySignal,
-        BuildToolchainError,
-        BuildIncrementalError,
-        BuildEnvError,
-        BuildWorkdirError,
-        BuildUnknownCommand,
-        // Build/Triage (E310-E319)
-        ProcessTriageAdapterUnavailable,
-        ProcessTriageDetectorUncertain,
-        ProcessTriageExecutorError,
-        ProcessTriageInvalidRequest,
-        ProcessTriagePartialResult,
-        ProcessTriagePolicyViolation,
-        ProcessTriageTimeout,
-        ProcessTriageTransportError,
-        // Build/Cancellation (E320-E325)
-        CancelGracefulSent,
-        CancelTimeoutExceeded,
-        CancelEscalatedKill,
-        CancelRemoteKillFailed,
-        CancelCleanupFailed,
-        CancelSlotLeak,
-        // Transfer (E400-E499)
-        TransferRsyncFailed,
-        TransferTimeout,
-        TransferSourceMissing,
-        TransferDestError,
-        TransferDiskFull,
-        TransferPermissionDenied,
-        TransferChecksumError,
-        TransferBinaryFailed,
-        TransferIncomplete,
-        TransferProtocolError,
-        // Internal (E500-E599)
-        InternalDaemonSocket,
-        InternalDaemonProtocol,
-        InternalDaemonNotRunning,
-        InternalIpcError,
-        InternalStateError,
-        InternalSerdeError,
-        InternalHookError,
-        InternalMetricsError,
-        InternalLoggingError,
-        InternalUpdateError,
-    ]
+    ErrorCode::all()
 }
 
 /// Render a [`CodeExplanation`] in a paste-ready human form. Used by
@@ -359,6 +249,21 @@ mod tests {
         assert_eq!(e.category, "config");
         assert!(!e.description.is_empty());
         assert!(e.requires_restart.is_none());
+    }
+
+    #[test]
+    fn test_lookup_dependency_preflight_error_code() {
+        let e = lookup("RCH-E410").expect("dependency preflight missing known");
+        assert_eq!(e.code, "RCH-E410");
+        assert_eq!(e.namespace, CodeNamespace::Error);
+        assert_eq!(e.name, "DependencyPreflightMissing");
+        assert_eq!(e.category, "transfer");
+        assert!(e.description.contains("missing required path"));
+        assert!(
+            e.remediation
+                .iter()
+                .any(|step| step.contains("missing remote path"))
+        );
     }
 
     #[test]
