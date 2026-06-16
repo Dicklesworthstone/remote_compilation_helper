@@ -610,7 +610,11 @@ async fn main() -> Result<()> {
     // Default-off for canary safety; env-overridable / opt-in via config.
     let stale_target_reaper = Arc::new(stale_target_reap::StaleTargetReaper::new(
         worker_pool.clone(),
-        daemon_config.stale_target_reap.with_env_overrides(),
+        // bd-28xs5: source the reaper config from the central remediation config
+        // (remediation.pooled_target) rather than rchd-local defaults; env knobs
+        // still override on top.
+        config::StaleTargetReapConfig::from_remediation(&rch_config.remediation)
+            .with_env_overrides(),
     ));
     let _stale_target_reaper_handle = stale_target_reaper.start();
 
@@ -686,9 +690,14 @@ async fn main() -> Result<()> {
     };
     let alert_manager = Arc::new(alerts::AlertManager::new(alert_config));
 
-    let repo_convergence = Arc::new(repo_convergence::RepoConvergenceService::new(
-        event_bus.clone(),
-    ));
+    // bd-28xs5: source reconciliation windows/bounds from the central remediation
+    // config (remediation.reconciliation) rather than rchd module constants.
+    let repo_convergence = Arc::new(
+        repo_convergence::RepoConvergenceService::with_reconciliation(
+            event_bus.clone(),
+            rch_config.remediation.reconciliation,
+        ),
+    );
 
     let cancellation_orchestrator = Arc::new(cancellation::CancellationOrchestrator::new(
         cancellation::CancellationConfig::default(),
@@ -767,7 +776,10 @@ async fn main() -> Result<()> {
     // them (capabilities/disk/load/telemetry) and runs a canary before any
     // auto-rejoin. The durable bypass records persist alongside incidents and are
     // reconciled into live worker lifecycle on startup.
-    let bypass_config = BypassRecoveryConfig::default();
+    // bd-28xs5: source recovery knobs from the central remediation config
+    // (remediation.auto_rejoin + remediation.telemetry_freshness) rather than
+    // rchd-local defaults.
+    let bypass_config = BypassRecoveryConfig::from_remediation(&rch_config.remediation);
     let bypass_prober = SshRecoveryProber::new(telemetry_store.clone(), bypass_config.clone());
     let bypass_recovery = BypassRecoveryService::new(
         worker_pool.clone(),

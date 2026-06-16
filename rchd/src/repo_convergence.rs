@@ -5,6 +5,7 @@
 //! convergence through the repo_updater adapter contract.
 
 use rch_common::WorkerId;
+use rch_common::remediation_config::ReconciliationConfig;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -15,23 +16,35 @@ use tracing::{info, warn};
 use crate::events::EventBus;
 
 // ── Constants ──────────────────────────────────────────────────────────────
+//
+// bd-28xs5: the reconciliation knobs below are now sourced at runtime from the
+// central `RemediationConfig` (`remediation.reconciliation`) and threaded into
+// the service via [`RepoConvergenceService::with_reconciliation`]. These
+// module consts remain only as the documented default values the tests pin;
+// `drift_guard_reconciliation` asserts they still match the central defaults.
 
 /// Maximum convergence attempts per worker before entering Failed state.
+#[cfg(test)]
 const MAX_CONVERGENCE_ATTEMPTS: u32 = 3;
 
 /// Maximum wall-clock time budget per convergence cycle (seconds).
+#[cfg(test)]
 const CONVERGENCE_TIME_BUDGET_SECS: u64 = 120;
 
 /// Minimum dwell time in a state before allowing transition (hysteresis, ms).
+#[cfg(test)]
 const STATE_HYSTERESIS_MS: u64 = 5_000;
 
 /// Maximum retained transition history entries per worker.
+#[cfg(test)]
 const MAX_TRANSITION_HISTORY: usize = 64;
 
 /// Maximum retained convergence outcomes globally.
+#[cfg(test)]
 const MAX_OUTCOME_HISTORY: usize = 256;
 
 /// Staleness threshold: if last status check is older than this, mark Stale.
+#[cfg(test)]
 const STALENESS_THRESHOLD_SECS: u64 = 300;
 
 // ── Drift State ────────────────────────────────────────────────────────────
@@ -97,7 +110,9 @@ pub struct WorkerConvergenceState {
 }
 
 impl WorkerConvergenceState {
-    fn new(worker_id: &str) -> Self {
+    /// Create initial per-worker state with budgets seeded from the central
+    /// reconciliation config (bd-28xs5) rather than module constants.
+    fn new(worker_id: &str, reconciliation: &ReconciliationConfig) -> Self {
         Self {
             worker_id: worker_id.to_string(),
             current_state: ConvergenceDriftState::Stale,
@@ -107,17 +122,18 @@ impl WorkerConvergenceState {
             last_status_check_unix_ms: 0,
             last_convergence_attempt_unix_ms: 0,
             convergence_attempts: 0,
-            time_budget_remaining_ms: CONVERGENCE_TIME_BUDGET_SECS * 1000,
-            attempt_budget_remaining: MAX_CONVERGENCE_ATTEMPTS,
+            time_budget_remaining_ms: reconciliation.time_budget_secs.saturating_mul(1000),
+            attempt_budget_remaining: reconciliation.max_attempts,
             last_transition_at: None,
         }
     }
 
     /// Returns `true` if the hysteresis interval has elapsed since the last
-    /// state transition, allowing a new transition.
-    fn can_transition(&self) -> bool {
+    /// state transition, allowing a new transition. `hysteresis_ms` is the
+    /// configured minimum dwell time (`remediation.reconciliation`).
+    fn can_transition(&self, hysteresis_ms: u64) -> bool {
         match self.last_transition_at {
-            Some(last) => last.elapsed() >= Duration::from_millis(STATE_HYSTERESIS_MS),
+            Some(last) => last.elapsed() >= Duration::from_millis(hysteresis_ms),
             None => true,
         }
     }
@@ -132,11 +148,12 @@ impl WorkerConvergenceState {
         (missing / total).clamp(0.0, 1.0)
     }
 
-    /// Reset budgets for a new convergence cycle.
-    fn reset_budgets(&mut self) {
+    /// Reset budgets for a new convergence cycle from the central reconciliation
+    /// config (bd-28xs5).
+    fn reset_budgets(&mut self, reconciliation: &ReconciliationConfig) {
         self.convergence_attempts = 0;
-        self.time_budget_remaining_ms = CONVERGENCE_TIME_BUDGET_SECS * 1000;
-        self.attempt_budget_remaining = MAX_CONVERGENCE_ATTEMPTS;
+        self.time_budget_remaining_ms = reconciliation.time_budget_secs.saturating_mul(1000);
+        self.attempt_budget_remaining = reconciliation.max_attempts;
     }
 }
 
@@ -211,6 +228,9 @@ impl std::fmt::Display for ConvergenceError {
 /// events for observability.
 pub struct RepoConvergenceService {
     events: EventBus,
+    /// Reconciliation windows/bounds sourced from the central remediation config
+    /// (`remediation.reconciliation`, bd-28xs5). `Copy`, so methods snapshot it.
+    reconciliation: ReconciliationConfig,
     /// Per-worker convergence tracking.
     state: RwLock<HashMap<String, WorkerConvergenceState>>,
     /// Global convergence outcome log (bounded).
@@ -220,10 +240,18 @@ pub struct RepoConvergenceService {
 }
 
 impl RepoConvergenceService {
-    /// Create a new service wired to the daemon event bus.
+    /// Create a new service wired to the daemon event bus, using the default
+    /// reconciliation windows/bounds.
     pub fn new(events: EventBus) -> Self {
+        Self::with_reconciliation(events, ReconciliationConfig::default())
+    }
+
+    /// Create a service whose reconciliation windows/bounds come from the central
+    /// remediation config (`remediation.reconciliation`, bd-28xs5).
+    pub fn with_reconciliation(events: EventBus, reconciliation: ReconciliationConfig) -> Self {
         Self {
             events,
+            reconciliation,
             state: RwLock::new(HashMap::new()),
             outcomes: RwLock::new(VecDeque::new()),
             transitions: RwLock::new(HashMap::new()),
@@ -305,10 +333,11 @@ impl RepoConvergenceService {
         required_repos: Vec<String>,
         synced_repos: Vec<String>,
     ) {
+        let reconciliation = self.reconciliation;
         let mut state = self.state.write().await;
         let entry = state
             .entry(worker_id.as_str().to_string())
-            .or_insert_with(|| WorkerConvergenceState::new(worker_id.as_str()));
+            .or_insert_with(|| WorkerConvergenceState::new(worker_id.as_str(), &reconciliation));
 
         entry.required_repos = required_repos;
         entry.synced_repos = synced_repos.clone();
@@ -337,7 +366,9 @@ impl RepoConvergenceService {
         };
 
         // Apply state transition with hysteresis.
-        if new_state != entry.current_state && entry.can_transition() {
+        if new_state != entry.current_state
+            && entry.can_transition(reconciliation.state_hysteresis_ms)
+        {
             let old_state = entry.current_state;
             let reason = if new_state == ConvergenceDriftState::Ready {
                 "all_repos_present".to_string()
@@ -359,7 +390,7 @@ impl RepoConvergenceService {
             entry.last_transition_at = Some(Instant::now());
 
             if new_state == ConvergenceDriftState::Ready {
-                entry.reset_budgets();
+                entry.reset_budgets(&reconciliation);
             }
         }
     }
@@ -377,10 +408,11 @@ impl RepoConvergenceService {
         duration_ms: u64,
         failure: Option<String>,
     ) -> Result<ConvergenceOutcome, ConvergenceError> {
+        let reconciliation = self.reconciliation;
         let mut state = self.state.write().await;
         let entry = state
             .entry(worker_id.as_str().to_string())
-            .or_insert_with(|| WorkerConvergenceState::new(worker_id.as_str()));
+            .or_insert_with(|| WorkerConvergenceState::new(worker_id.as_str(), &reconciliation));
 
         let drift_state_before = entry.current_state;
 
@@ -441,7 +473,7 @@ impl RepoConvergenceService {
             entry.last_transition_at = Some(Instant::now());
 
             if new_state == ConvergenceDriftState::Ready {
-                entry.reset_budgets();
+                entry.reset_budgets(&reconciliation);
             }
         }
 
@@ -463,7 +495,7 @@ impl RepoConvergenceService {
 
         // Store outcome.
         let mut outcomes = self.outcomes.write().await;
-        if outcomes.len() >= MAX_OUTCOME_HISTORY {
+        if outcomes.len() >= reconciliation.max_outcome_history {
             outcomes.pop_front();
         }
         outcomes.push_back(outcome.clone());
@@ -473,10 +505,11 @@ impl RepoConvergenceService {
 
     /// Mark a worker as entering the Converging state (sync starting).
     pub async fn mark_converging(&self, worker_id: &WorkerId) {
+        let reconciliation = self.reconciliation;
         let mut state = self.state.write().await;
         let entry = state
             .entry(worker_id.as_str().to_string())
-            .or_insert_with(|| WorkerConvergenceState::new(worker_id.as_str()));
+            .or_insert_with(|| WorkerConvergenceState::new(worker_id.as_str(), &reconciliation));
 
         // No hysteresis — mark_converging is a deliberate action.
         if entry.current_state != ConvergenceDriftState::Converging {
@@ -502,11 +535,12 @@ impl RepoConvergenceService {
 
     /// Check and mark workers as Stale if their last status check is too old.
     pub async fn check_staleness(&self) {
+        let reconciliation = self.reconciliation;
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or_default();
-        let threshold_ms = (STALENESS_THRESHOLD_SECS * 1000) as i64;
+        let threshold_ms = reconciliation.staleness_threshold_secs.saturating_mul(1000) as i64;
 
         let mut state = self.state.write().await;
         let mut transitions = self.transitions.write().await;
@@ -515,7 +549,7 @@ impl RepoConvergenceService {
             if entry.current_state != ConvergenceDriftState::Stale
                 && entry.last_status_check_unix_ms > 0
                 && (now_ms - entry.last_status_check_unix_ms) > threshold_ms
-                && entry.can_transition()
+                && entry.can_transition(reconciliation.state_hysteresis_ms)
             {
                 let old_state = entry.current_state;
                 self.record_transition_locked(
@@ -542,6 +576,7 @@ impl RepoConvergenceService {
     ///
     /// Returns the previous drift state, or `None` if the worker is not tracked.
     pub async fn repair_worker(&self, worker_id: &WorkerId) -> Option<ConvergenceDriftState> {
+        let reconciliation = self.reconciliation;
         let mut state = self.state.write().await;
         let entry = state.get_mut(worker_id.as_str())?;
 
@@ -550,7 +585,7 @@ impl RepoConvergenceService {
         // Reset synced repos to force Drifting, reset budgets.
         entry.synced_repos.clear();
         entry.missing_repos = entry.required_repos.clone();
-        entry.reset_budgets();
+        entry.reset_budgets(&reconciliation);
 
         let new_state = if entry.required_repos.is_empty() {
             ConvergenceDriftState::Ready
@@ -636,7 +671,7 @@ impl RepoConvergenceService {
             .emit("repo_convergence.state_changed", &transition);
 
         let worker_transitions = transitions.entry(worker_id.to_string()).or_default();
-        if worker_transitions.len() >= MAX_TRANSITION_HISTORY {
+        if worker_transitions.len() >= self.reconciliation.max_transition_history {
             worker_transitions.pop_front();
         }
         worker_transitions.push_back(transition);
@@ -976,6 +1011,23 @@ mod tests {
         WorkerId::new(name)
     }
 
+    /// Drift guard (bd-28xs5): the reconciliation windows/bounds the daemon now
+    /// reads from the central `RemediationConfig` (`remediation.reconciliation`)
+    /// must match the documented values this module's tests pin (and that the
+    /// runtime previously hardcoded as module constants). Fails if either side
+    /// drifts.
+    #[test]
+    fn drift_guard_reconciliation() {
+        let _guard = test_guard!();
+        let rec = ReconciliationConfig::default();
+        assert_eq!(rec.max_attempts, MAX_CONVERGENCE_ATTEMPTS);
+        assert_eq!(rec.time_budget_secs, CONVERGENCE_TIME_BUDGET_SECS);
+        assert_eq!(rec.state_hysteresis_ms, STATE_HYSTERESIS_MS);
+        assert_eq!(rec.max_transition_history, MAX_TRANSITION_HISTORY);
+        assert_eq!(rec.max_outcome_history, MAX_OUTCOME_HISTORY);
+        assert_eq!(rec.staleness_threshold_secs, STALENESS_THRESHOLD_SECS);
+    }
+
     #[test]
     fn test_convergence_drift_state_display() {
         let _guard = test_guard!();
@@ -1015,7 +1067,7 @@ mod tests {
     #[test]
     fn test_worker_convergence_state_drift_confidence() {
         let _guard = test_guard!();
-        let mut ws = WorkerConvergenceState::new("w1");
+        let mut ws = WorkerConvergenceState::new("w1", &ReconciliationConfig::default());
         assert_eq!(ws.drift_confidence(), 0.0); // no required repos
 
         ws.required_repos = vec!["a".into(), "b".into(), "c".into(), "d".into()];
@@ -1563,7 +1615,7 @@ mod tests {
     #[test]
     fn test_drift_confidence_all_missing() {
         let _guard = test_guard!();
-        let mut ws = WorkerConvergenceState::new("dc1");
+        let mut ws = WorkerConvergenceState::new("dc1", &ReconciliationConfig::default());
         ws.required_repos = vec!["a".into(), "b".into(), "c".into()];
         ws.missing_repos = vec!["a".into(), "b".into(), "c".into()];
         assert!((ws.drift_confidence() - 1.0).abs() < f64::EPSILON);
@@ -1572,7 +1624,7 @@ mod tests {
     #[test]
     fn test_drift_confidence_none_missing() {
         let _guard = test_guard!();
-        let mut ws = WorkerConvergenceState::new("dc2");
+        let mut ws = WorkerConvergenceState::new("dc2", &ReconciliationConfig::default());
         ws.required_repos = vec!["a".into(), "b".into()];
         ws.missing_repos = vec![];
         assert_eq!(ws.drift_confidence(), 0.0);
@@ -1581,7 +1633,7 @@ mod tests {
     #[test]
     fn test_drift_confidence_empty_required() {
         let _guard = test_guard!();
-        let ws = WorkerConvergenceState::new("dc3");
+        let ws = WorkerConvergenceState::new("dc3", &ReconciliationConfig::default());
         // empty required → 0.0, not NaN from division by zero.
         assert_eq!(ws.drift_confidence(), 0.0);
     }

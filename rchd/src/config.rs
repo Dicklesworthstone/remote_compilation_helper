@@ -233,6 +233,21 @@ impl StaleTargetReapConfig {
         }
         self
     }
+
+    /// Build the reaper config from the central remediation config
+    /// (`remediation.pooled_target`) instead of this module's hardcoded defaults
+    /// (bd-28xs5). Env overrides ([`Self::with_env_overrides`]) still apply on
+    /// top of the result. The [`Default`] impl mirrors the central defaults; the
+    /// `drift_guard_stale_target_reap` test fails if the two ever diverge.
+    #[must_use]
+    pub fn from_remediation(rem: &rch_common::remediation_config::RemediationConfig) -> Self {
+        Self {
+            enabled: rem.pooled_target.reaper_enabled,
+            interval_mins: rem.pooled_target.reaper_interval_mins,
+            idle_hours: rem.pooled_target.reaper_idle_hours,
+            remote_base: rem.pooled_target.remote_base.clone(),
+        }
+    }
 }
 
 /// Configuration for automatic cache cleanup on workers.
@@ -608,6 +623,23 @@ mod tests {
         assert_eq!(config.socket_path, expected_socket);
         assert_eq!(config.health_check_interval_secs, 30);
         assert!(config.connection_pooling);
+    }
+
+    /// Drift guard (bd-28xs5): the reaper config built from the central
+    /// `RemediationConfig` defaults must reproduce this module's own
+    /// `StaleTargetReapConfig::default()`. Fails if the central `pooled_target`
+    /// defaults diverge from the rchd reaper defaults.
+    #[test]
+    fn drift_guard_stale_target_reap() {
+        let _guard = test_guard!();
+        let from_cfg = StaleTargetReapConfig::from_remediation(
+            &rch_common::remediation_config::RemediationConfig::default(),
+        );
+        let runtime = StaleTargetReapConfig::default();
+        assert_eq!(from_cfg.enabled, runtime.enabled);
+        assert_eq!(from_cfg.interval_mins, runtime.interval_mins);
+        assert_eq!(from_cfg.idle_hours, runtime.idle_hours);
+        assert_eq!(from_cfg.remote_base, runtime.remote_base);
     }
 
     #[test]

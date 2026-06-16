@@ -102,7 +102,7 @@ impl RootCandidate {
 }
 
 /// Thresholds below which a root is unsafe.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RootSafetyThresholds {
     pub min_free_bytes: u64,
     pub min_free_inodes: u64,
@@ -113,6 +113,20 @@ impl Default for RootSafetyThresholds {
         Self {
             min_free_bytes: DEFAULT_MIN_FREE_BYTES,
             min_free_inodes: DEFAULT_MIN_FREE_INODES,
+        }
+    }
+}
+
+impl RootSafetyThresholds {
+    /// Build the runtime thresholds from the central remediation config
+    /// (`remediation.build_root`) instead of this module's hardcoded defaults
+    /// (bd-28xs5). The [`Default`] impl above mirrors the central defaults; the
+    /// `drift_guard_build_root` test fails if the two ever diverge.
+    #[must_use]
+    pub fn from_remediation(rem: &rch_common::remediation_config::RemediationConfig) -> Self {
+        Self {
+            min_free_bytes: rem.build_root.min_free_bytes,
+            min_free_inodes: rem.build_root.min_free_inodes,
         }
     }
 }
@@ -328,6 +342,18 @@ mod tests {
 
     fn cand(role: RootRole, stats: MountStats) -> RootCandidate {
         RootCandidate::new(role, stats, false)
+    }
+
+    /// Drift guard (bd-28xs5): the runtime thresholds built from the central
+    /// `RemediationConfig` defaults must reproduce this module's own
+    /// `RootSafetyThresholds::default()`. If the central `build_root` defaults
+    /// ever diverge from the rchd defaults, this fails.
+    #[test]
+    fn drift_guard_build_root() {
+        let from_cfg = RootSafetyThresholds::from_remediation(
+            &rch_common::remediation_config::RemediationConfig::default(),
+        );
+        assert_eq!(from_cfg, RootSafetyThresholds::default());
     }
 
     #[test]

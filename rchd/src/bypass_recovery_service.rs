@@ -67,7 +67,7 @@ fn now_unix_ms() -> u64 {
 const BYTES_PER_GB: f64 = 1024.0 * 1024.0 * 1024.0;
 
 /// Tunable knobs for the recovery loop and the real SSH prober.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BypassRecoveryConfig {
     /// How often the service scans for due recovery probes.
     pub check_interval: Duration,
@@ -115,6 +115,35 @@ impl Default for BypassRecoveryConfig {
             // A lightweight toolchain exercise through the same SSH transport
             // real builds use. Configurable for heavier canaries.
             canary_command: "rustc --version".to_string(),
+        }
+    }
+}
+
+impl BypassRecoveryConfig {
+    /// Build the recovery config from the central remediation config (bd-28xs5).
+    ///
+    /// The probe-dimension knobs come from `remediation.auto_rejoin` and the
+    /// freshness tolerance from `remediation.telemetry_freshness`; the
+    /// consecutive-pass / canary-required thresholds live in
+    /// [`rch_common::bypass_record::AutoRejoinCriteria`] (also derived from
+    /// `auto_rejoin`) and are applied by the recovery state machine, so they are
+    /// intentionally absent here. The [`Default`] impl mirrors the central
+    /// defaults; the `drift_guard_bypass_recovery_config` test fails on divergence.
+    #[must_use]
+    pub fn from_remediation(rem: &rch_common::remediation_config::RemediationConfig) -> Self {
+        let ar = &rem.auto_rejoin;
+        Self {
+            check_interval: Duration::from_secs(ar.check_interval_secs),
+            probe_timeout: Duration::from_secs(ar.probe_timeout_secs),
+            min_disk_free_gb: ar.min_disk_free_gb,
+            min_disk_inodes: ar.min_disk_inodes,
+            disk_roots: ar.disk_roots.clone(),
+            max_load_per_core: ar.max_load_per_core,
+            min_protocol: ar.min_protocol,
+            required_targets: ar.required_targets.clone(),
+            required_toolchains: ar.required_toolchains.clone(),
+            telemetry_max_age: Duration::from_secs(rem.telemetry_freshness.max_age_secs),
+            canary_command: ar.canary_command.clone(),
         }
     }
 }
@@ -611,6 +640,18 @@ mod tests {
     use std::collections::VecDeque;
 
     const GB: u64 = 1024 * 1024 * 1024;
+
+    /// Drift guard (bd-28xs5): the recovery config built from the central
+    /// `RemediationConfig` defaults (auto_rejoin + telemetry_freshness) must
+    /// reproduce this module's own `BypassRecoveryConfig::default()`. Fails if
+    /// the central defaults ever diverge from the rchd recovery defaults.
+    #[test]
+    fn drift_guard_bypass_recovery_config() {
+        let from_cfg = BypassRecoveryConfig::from_remediation(
+            &rch_common::remediation_config::RemediationConfig::default(),
+        );
+        assert_eq!(from_cfg, BypassRecoveryConfig::default());
+    }
 
     /// A fully-healthy fact set, built through the real `parse_capability_probe`
     /// so the test also pins the probe-output contract. Disk is reported in KiB
