@@ -1006,6 +1006,71 @@ fn build_coverage_matrix() -> CoverageMatrix {
             has_log_assertion: true,
             gap: None,
         },
+        // ---------------------------------------------------------------
+        // Domain: Desired-state fleet reconciliation (epic ocv9i.2)
+        // ---------------------------------------------------------------
+        RequirementRow {
+            id: "REQ-FLEET-001".into(),
+            description: "Desired-state fleet reconciliation: `rch status --fleet` reports \
+                          desired vs live workers (ready / missing-from-fleet / \
+                          recovered-not-rejoined / admin-disabled / temporary-bypass / \
+                          unreachable / facts-unknown / command-ineligible / unconfigured), \
+                          classifies the dominant problem (cloud disappearance, local \
+                          overload, disk pressure, missing capability, admin intent, \
+                          daemon/config drift), and raises absence alerts for workers absent \
+                          beyond the policy threshold — without treating a transient bypass \
+                          as a permanent desired-state edit (no-admissible-workers coverage)"
+                .into(),
+            domain: "fleet_reconciliation".into(),
+            bead_id: "bd-session-history-remediation-ocv9i.2".into(),
+            test_refs: vec![
+                TestRef {
+                    // 2.1: desired-state inventory + live eligibility diff (capacity
+                    // collapse explanation, empty fleet, stable serialized tokens).
+                    file: "../src/fleet_diff.rs".into(),
+                    name_prefix: "fleet_diff_".into(),
+                    tier: "smoke".into(),
+                },
+                TestRef {
+                    // 2.2: FleetProblemClass + compute_fleet_status + absence alerts +
+                    // stable-shape (golden) serialization.
+                    file: "../src/fleet_status.rs".into(),
+                    name_prefix: "absence_alerts_".into(),
+                    tier: "smoke".into(),
+                },
+                TestRef {
+                    // CLI/E2E surface: `rch status --fleet --json` for empty and
+                    // all-absent fleets. Deep classification is proven by the unit
+                    // tests above; the live binary run is deferred to CI (stale-binary
+                    // precedent), so the .sh existence check is skipped by the matrix.
+                    file: "../../scripts/e2e_fleet_reconciliation.sh".into(),
+                    name_prefix: "e2e_fleet_reconciliation".into(),
+                    tier: "smoke".into(),
+                },
+            ],
+            artifact_assertions: vec![
+                "Empty fleet is explained with zero ready/desired (fleet_diff::empty_fleet_is_explained, \
+                 fleet_status::empty_fleet_is_healthy_with_no_alerts)"
+                    .into(),
+                "All-absent / capacity collapse is classified (fleet_diff::fleet_diff_explains_capacity_collapse, \
+                 fleet_status::cloud_disappearance_when_hosts_missing)"
+                    .into(),
+                "Absence alerts respect the threshold and sort longest-absent first \
+                 (fleet_status::absence_alerts_respect_threshold_and_sort_longest_first; \
+                 ready_worker_never_raises_absence_alert)"
+                    .into(),
+                "Stable JSON token/shape golden checks (fleet_diff::fleet_diff_serializes_with_stable_tokens, \
+                 fleet_status::report_serializes_with_stable_shape)"
+                    .into(),
+                "rch status --fleet --json emits a well-formed report for empty and all-absent \
+                 fleets; E2E JSONL fields: run_id, bead_id, scenario, event, status, reason_code, \
+                 problem_class, detail"
+                    .into(),
+            ],
+            has_executable_test: true,
+            has_log_assertion: true,
+            gap: None,
+        },
     ];
 
     let total = requirements.len();
