@@ -15,7 +15,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   CARGO_NET_RETRY: 2
-  RUSTUP_TOOLCHAIN: nightly-2025-11-01
+  RUSTUP_TOOLCHAIN: nightly-2026-06-06
 
 jobs:
   build:
@@ -81,7 +81,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2025-11-01
+          toolchain: nightly-2026-06-06
           targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2

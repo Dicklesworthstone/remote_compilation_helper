@@ -52,7 +52,7 @@ jobs:
           git clone --depth 1 https://github.com/Dicklesworthstone/frankentui.git /dp/frankentui
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2025-11-01
+          toolchain: nightly-2026-06-06
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
