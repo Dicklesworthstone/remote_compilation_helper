@@ -39,7 +39,7 @@ use crate::ui::context::OutputContext;
 
 use super::load_workers_from_config;
 use super::send_daemon_command;
-use super::workers_setup::run_worker_ssh_command;
+use super::workers_setup::run_setup_ssh_command;
 
 /// A refused invalidation surfaced to the agent (cache path escaped the base).
 #[derive(Debug, Clone, Serialize)]
@@ -234,7 +234,7 @@ async fn apply_on_worker(
     is_apply: bool,
 ) -> SyncForceWorkerResult {
     // Reachability probe (also gates apply_force_resync's deferral decision).
-    let reachable = match run_worker_ssh_command(worker, "true").await {
+    let reachable = match run_setup_ssh_command(worker, "true").await {
         Ok(out) => out.status.success(),
         Err(_) => false,
     };
@@ -259,7 +259,7 @@ async fn apply_on_worker(
                 continue;
             }
             let cmd = remote_rm_command(path);
-            match run_worker_ssh_command(worker, &cmd).await {
+            match run_setup_ssh_command(worker, &cmd).await {
                 Ok(out) if out.status.success() => removed_ok += 1,
                 Ok(out) => {
                     let stderr = String::from_utf8_lossy(&out.stderr);

@@ -898,7 +898,14 @@ fn push_topology_audit(
     audit.push(entry);
 }
 
-pub(crate) async fn run_worker_ssh_command(
+/// Run a one-shot SSH command on a worker for **setup / probing** flows
+/// (reachability checks, canonical/alias topology probes and fixes). Uses a
+/// fixed 10s connect timeout and a plain `cmd.output()`.
+///
+/// Distinct from the offload hot-path executor `run_offload_ssh_command` in
+/// `hook::ssh`, which takes a caller-supplied timeout and is hardened with
+/// `kill_on_drop` + concurrent stdout/stderr draining for the build pipeline.
+pub(crate) async fn run_setup_ssh_command(
     worker: &WorkerConfig,
     remote_cmd: &str,
 ) -> Result<std::process::Output> {
@@ -923,7 +930,7 @@ async fn query_canonical_topology_state(
     policy: &rch_common::path_topology::PathTopologyPolicy,
 ) -> Result<CanonicalTopologyState> {
     let cmd = canonical_topology_check_cmd(policy.canonical_root());
-    let output = run_worker_ssh_command(worker, &cmd).await?;
+    let output = run_setup_ssh_command(worker, &cmd).await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!(
@@ -943,7 +950,7 @@ async fn query_alias_topology_state(
     policy: &rch_common::path_topology::PathTopologyPolicy,
 ) -> Result<AliasTopologyState> {
     let cmd = alias_topology_check_cmd(policy.alias_root(), policy.canonical_root());
-    let output = run_worker_ssh_command(worker, &cmd).await?;
+    let output = run_setup_ssh_command(worker, &cmd).await?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!(
@@ -966,7 +973,7 @@ async fn execute_topology_fix(
     action_message: &str,
     ctx: &mut TopologyFixContext<'_>,
 ) -> bool {
-    match run_worker_ssh_command(worker, command).await {
+    match run_setup_ssh_command(worker, command).await {
         Ok(output) if output.status.success() => {
             ctx.outcome.changed = true;
             push_topology_audit(
