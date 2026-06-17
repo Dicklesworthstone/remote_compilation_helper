@@ -3905,106 +3905,6 @@ async fn ensure_worker_projects_topology(
     Ok(())
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
-struct RepoUpdaterSyncRoots {
-    roots: Vec<PathBuf>,
-    specs: Vec<String>,
-}
-
-async fn collect_repo_updater_roots_and_specs(sync_roots: &[PathBuf]) -> RepoUpdaterSyncRoots {
-    let mut specs = std::collections::BTreeSet::new();
-    let mut roots = Vec::new();
-
-    for root in sync_roots {
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(root)
-            .arg("remote")
-            .arg("get-url")
-            .arg("origin")
-            .output()
-            .await;
-
-        let Ok(output) = output else {
-            continue;
-        };
-        if !output.status.success() {
-            continue;
-        }
-        let remote = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if !remote.is_empty() {
-            roots.push(root.clone());
-            specs.insert(remote);
-        }
-    }
-
-    RepoUpdaterSyncRoots {
-        roots,
-        specs: specs.into_iter().collect(),
-    }
-}
-
-async fn detect_dirty_sync_roots(sync_roots: &[PathBuf]) -> Vec<PathBuf> {
-    let mut dirty = Vec::new();
-
-    for root in sync_roots {
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(root)
-            .arg("status")
-            .arg("--porcelain")
-            .output()
-            .await;
-
-        let Ok(output) = output else {
-            continue;
-        };
-        if !output.status.success() {
-            continue;
-        }
-
-        let status = String::from_utf8_lossy(&output.stdout);
-        if !status.trim().is_empty() {
-            dirty.push(root.clone());
-        }
-    }
-
-    dirty
-}
-
-async fn detect_remote_unsuitable_sync_roots(
-    worker: &WorkerConfig,
-    sync_roots: &[PathBuf],
-) -> Vec<(PathBuf, String)> {
-    let mut unsuitable = Vec::new();
-
-    for root in sync_roots {
-        let escaped_root = shell_escape::escape(root.to_string_lossy()).to_string();
-        let command = format!("git -C {escaped_root} status --porcelain");
-
-        match run_worker_ssh_command(worker, &command, Duration::from_secs(10)).await {
-            Ok(output) if output.status.success() => {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                if !stdout.trim().is_empty() {
-                    unsuitable.push((root.clone(), "dirty".to_string()));
-                }
-            }
-            Ok(output) => {
-                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                let reason = if stderr.is_empty() {
-                    format!("git status failed with exit {:?}", output.status.code())
-                } else {
-                    format!("git status failed: {stderr}")
-                };
-                unsuitable.push((root.clone(), reason));
-            }
-            Err(err) => unsuitable.push((root.clone(), format!("status probe error: {err}"))),
-        }
-    }
-
-    unsuitable
-}
-
 fn merge_sync_result(base: &SyncResult, extra: &SyncResult) -> SyncResult {
     SyncResult {
         bytes_transferred: base
@@ -6303,7 +6203,7 @@ mod tests {
     // here rather than re-exported into the non-test hook namespace).
     use super::repo_updater::{
         auto_tune_repo_updater_contract, build_repo_sync_idempotency_key_for_command,
-        hydrate_repo_updater_auth_context_defaults,
+        collect_repo_updater_roots_and_specs, hydrate_repo_updater_auth_context_defaults,
         infer_repo_updater_auth_context_with_env_lookup, repo_updater_command_name,
     };
     use proptest::prelude::*;
