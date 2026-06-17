@@ -898,7 +898,7 @@ fn push_topology_audit(
     audit.push(entry);
 }
 
-async fn run_worker_ssh_command(
+pub(crate) async fn run_worker_ssh_command(
     worker: &WorkerConfig,
     remote_cmd: &str,
 ) -> Result<std::process::Output> {

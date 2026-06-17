@@ -377,6 +377,41 @@ to clean up. Use --force to immediately terminate with SIGKILL."#)]
         dry_run: bool,
     },
 
+    /// Force-resync stale worker caches for a project's path-dependency closure
+    #[command(after_help = r#"EXAMPLES:
+    rch sync --project .                 # Preview: what force-resync would invalidate
+    rch sync --force --worker css        # Invalidate css's RCH cache + trigger resync
+    rch sync --force --all               # Force-resync every configured worker
+    rch sync --force --all --dry-run     # Preview the apply plan, take no action
+    rch sync --force --worker css --json # Machine-readable report
+
+Force-resync invalidates the RCH-managed worker cache (under transfer.remote_base)
+for the target project and its path-dependency closure, then triggers a daemon
+convergence repair so the closure re-syncs on the next build. It NEVER deletes
+anything outside the RCH-managed base: canonical source mirrors are refused, not
+wiped. Without --force (or with --dry-run) it only previews the plan."#)]
+    Sync {
+        /// Apply the destructive cache invalidation (without this, preview only)
+        #[arg(long)]
+        force: bool,
+
+        /// Target a specific worker by id
+        #[arg(long, short = 'w')]
+        worker: Option<String>,
+
+        /// Apply to all configured workers
+        #[arg(long, short = 'a')]
+        all: bool,
+
+        /// Project whose closure to force-resync (defaults to current directory)
+        #[arg(long, short = 'p')]
+        project: Option<PathBuf>,
+
+        /// Preview the plan without taking any destructive action
+        #[arg(long, short = 'n')]
+        dry_run: bool,
+    },
+
     /// View and manage RCH configuration
     #[command(after_help = r#"EXAMPLES:
     rch config show           # Display effective config
@@ -1875,6 +1910,13 @@ async fn run(args: Vec<OsString>) -> Result<()> {
                 yes,
                 dry_run,
             } => commands::cancel_build(build_id, all, force, yes, dry_run, &ctx).await,
+            Commands::Sync {
+                force,
+                worker,
+                all,
+                project,
+                dry_run,
+            } => commands::sync_force(force, worker, all, project, dry_run, &ctx).await,
             Commands::Config { action } => handle_config(action, &ctx).await,
             Commands::Cache { action } => handle_cache(action, &ctx).await,
             Commands::Diagnose { command, dry_run } => {
@@ -2708,7 +2750,7 @@ fn command_category(name: &str) -> &'static str {
     match name {
         "init" | "hook" | "agents" | "completions" => "setup",
         "status" | "check" | "queue" | "speedscore" | "dashboard" | "web" => "monitoring",
-        "daemon" | "workers" | "cancel" | "exec" | "update" | "fleet" => "management",
+        "daemon" | "workers" | "cancel" | "sync" | "exec" | "update" | "fleet" => "management",
         "config" => "configuration",
         "diagnose" | "doctor" | "self-test" | "schema" => "debugging",
         "capabilities" | "robot-docs" => "agent-docs",
@@ -3217,15 +3259,20 @@ fn remediation_workflows() -> Vec<RemediationWorkflow> {
         },
         RemediationWorkflow {
             id: "force_resync".to_string(),
-            summary: "Stale path-dependency roots: convergence/resync is daemon-driven today."
+            summary: "Force-resync stale path-dependency roots: invalidate the RCH-managed worker \
+                      cache and trigger closure re-sync."
                 .to_string(),
             commands: vec![
-                "rch doctor --reliability --scope convergence --json".to_string(),
-                "rch status --remediation --json".to_string(),
+                "rch sync --project . --json".to_string(),
+                "rch sync --force --worker <id> --json".to_string(),
+                "rch sync --force --all --json".to_string(),
             ],
             observe: Some(
-                "The repo_convergence band reports drift (RCH-R3xx); a one-shot force-resync CLI \
-                 is tracked separately."
+                "Preview (no --force) lists the planned cache invalidations and any refusals; \
+                 --force invalidates only paths strictly under transfer.remote_base (canonical \
+                 source mirrors are refused, never wiped) and triggers a daemon convergence \
+                 repair. rch status --remediation --json shows the repo_convergence band \
+                 (RCH-R3xx) clearing afterward."
                     .to_string(),
             ),
         },

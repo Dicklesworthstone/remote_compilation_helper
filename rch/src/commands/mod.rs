@@ -19,6 +19,7 @@ mod init;
 mod queue;
 mod speedscore;
 mod status;
+mod sync;
 pub mod types;
 mod workers;
 mod workers_deploy;
@@ -59,6 +60,9 @@ pub use config_init::config_init;
 
 // Re-export speedscore command for backward compatibility
 pub use speedscore::speedscore;
+
+// Re-export force-resync sync command (bd-apg5l)
+pub use sync::sync_force;
 
 // Re-export workers init/discover commands for backward compatibility
 pub use workers_init::{workers_discover, workers_init};

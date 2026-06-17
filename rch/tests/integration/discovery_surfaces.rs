@@ -263,6 +263,18 @@ fn test_robot_docs_guide_covers_remediation_workflows() {
         "proof_mode must reference the RCH-I012 refusal code"
     );
 
+    // force_resync now points at the real `rch sync` command (bd-apg5l), not the
+    // prior "tracked separately" placeholder.
+    let force_resync = workflows
+        .iter()
+        .find(|w| w.get("id").and_then(|v| v.as_str()) == Some("force_resync"))
+        .expect("force_resync present");
+    let force_resync_blob = serde_json::to_string(force_resync).unwrap();
+    assert!(
+        force_resync_blob.contains("rch sync"),
+        "force_resync workflow must point at the real `rch sync` command; got {force_resync_blob}"
+    );
+
     // The human guide text mentions the real entry points too.
     let guide = data
         .get("guide")
@@ -290,13 +302,15 @@ fn test_help_json_schema_checks_all_remediation_paths() {
 
     // (path-as-args, expected leaf command name). Every entry is a REAL command
     // path on the current CLI surface — aspirational names from the bead that do
-    // not exist as commands (proof, jobs, sync) are intentionally excluded.
+    // not exist as commands (proof, jobs) are intentionally excluded. `sync` is
+    // now real (bd-apg5l: the force-resync command) and is exercised here.
     let cases: &[(&[&str], &str)] = &[
         (&["admit"], "admit"),
         (&["exec"], "exec"),
         (&["status"], "status"),
         (&["queue"], "queue"),
         (&["cancel"], "cancel"),
+        (&["sync"], "sync"),
         (&["self-test"], "self-test"),
         (&["capabilities"], "capabilities"),
         (&["workers", "capabilities"], "capabilities"),
