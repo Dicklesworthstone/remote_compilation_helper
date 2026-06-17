@@ -394,7 +394,13 @@ fn default_weight_network() -> f64 {
     0.1
 }
 fn default_weight_priority() -> f64 {
-    0.1
+    // Worker priority is a first-class selection factor: operators set high
+    // priority on preferred boxes (e.g. fast dedicated workers) and expect them
+    // to actually receive work. At the old 0.1 a top-priority worker gained at
+    // most +0.1 to its balanced score — too weak to overcome a warm-cache or
+    // lower-latency competitor, so the highest-priority workers could sit idle
+    // indefinitely. Load/slots still throttle a high-priority worker as it fills.
+    0.5
 }
 fn default_half_open_penalty() -> f64 {
     0.5
@@ -1654,12 +1660,20 @@ impl CircuitStats {
     }
 
     /// Get the error rate in the current window (0.0-1.0).
+    ///
+    /// Computed over the bounded recent-results window (the last
+    /// `CIRCUIT_HISTORY_SIZE` health checks) rather than the unbounded lifetime
+    /// `window_successes`/`window_failures` counters. A long-lived daemon polling
+    /// distant workers accumulates occasional transient failures over days; with a
+    /// lifetime ratio a currently-healthy worker could stay gated (circuit kept
+    /// open, depressed health score) until the daemon was restarted. A recency
+    /// window lets the rate self-heal as fresh successes age out old failures.
     pub fn error_rate(&self) -> f64 {
-        let total = self.window_successes + self.window_failures;
-        if total == 0 {
+        if self.recent_results.is_empty() {
             return 0.0;
         }
-        self.window_failures as f64 / total as f64
+        let failures = self.recent_results.iter().filter(|&&ok| !ok).count();
+        failures as f64 / self.recent_results.len() as f64
     }
 
     /// Record a successful operation.
@@ -1711,9 +1725,10 @@ impl CircuitStats {
             return true;
         }
 
-        // Open if error rate exceeds threshold (with minimum 5 samples)
-        let total = self.window_successes + self.window_failures;
-        if total >= 5 && self.error_rate() >= config.error_rate_threshold {
+        // Open if error rate exceeds threshold (with a minimum sample size).
+        // Counts samples in the bounded recent-results window so the gate
+        // reflects recent behavior, matching error_rate() above.
+        if self.recent_results.len() >= 5 && self.error_rate() >= config.error_rate_threshold {
             return true;
         }
 
@@ -1802,18 +1817,26 @@ impl CircuitStats {
             self.consecutive_failures = 0;
             self.consecutive_successes = 0;
             self.active_probes = 0;
-            // Reset the window on close
+            // Reset the window on close, INCLUDING the recent-results history
+            // that error_rate() now reads. Otherwise a freshly-recovered circuit
+            // would still compute a high error rate from the pre-failure samples
+            // and immediately re-open (flapping). Matches the original intent of
+            // resetting the error-rate inputs when the circuit recovers.
             self.window_successes = 0;
             self.window_failures = 0;
+            self.recent_results.clear();
         }
     }
 
     /// Reset the rolling window counters.
     ///
     /// Called periodically to ensure the window reflects recent activity.
+    /// Also clears the recent-results history that `error_rate()` is computed
+    /// from, so a reset truly zeroes the observed error rate.
     pub fn reset_window(&mut self) {
         self.window_successes = 0;
         self.window_failures = 0;
+        self.recent_results.clear();
     }
 
     /// Get recent health check results for history visualization.
@@ -3758,6 +3781,32 @@ retry_max = 2
 
         stats.record_failure(); // 5 samples: 2 success, 3 failures = 60% error rate
         assert!(stats.should_open(&config));
+    }
+
+    #[test]
+    fn test_circuit_close_clears_recent_results_no_flap() {
+        let _guard = test_guard!();
+        // Regression: error_rate() is computed over recent_results, so close()
+        // must clear that history or a recovered circuit immediately re-opens
+        // on stale pre-failure samples (flapping).
+        let mut stats = CircuitStats::new();
+        let config = CircuitBreakerConfig {
+            error_rate_threshold: 0.5,
+            ..Default::default()
+        };
+        for _ in 0..6 {
+            stats.record_failure();
+        }
+        assert!(stats.should_open(&config));
+        stats.open();
+        // Recover via half-open probes, then close.
+        stats.half_open();
+        stats.record_success();
+        stats.record_success();
+        stats.close();
+        // Error rate must be reset and the circuit must NOT immediately re-open.
+        assert_eq!(stats.error_rate(), 0.0);
+        assert!(!stats.should_open(&config));
     }
 
     #[test]
