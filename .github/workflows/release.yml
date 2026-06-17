@@ -35,13 +35,13 @@ env:
   # Reduce network retries for faster failure
   CARGO_NET_RETRY: 2
   # Pin the toolchain at the env level so that *every* `cargo` invocation in
-  # this workflow uses nightly-2025-11-01 — the version dtolnay/rust-toolchain
+  # this workflow uses nightly-2026-06-06 — the version dtolnay/rust-toolchain
   # installs (with the per-job `targets:`) below. Without this, the in-repo
   # rust-toolchain.toml (channel = "nightly") would redirect cargo to the
   # *latest* nightly, which doesn't have the per-target stdlib installed → all
   # release jobs fail with `can't find crate for \`core\``. RUSTUP_TOOLCHAIN
   # takes precedence over both rust-toolchain.toml and `rustup override`.
-  RUSTUP_TOOLCHAIN: nightly-2025-11-01
+  RUSTUP_TOOLCHAIN: nightly-2026-06-06
 
 jobs:
   # Validate tag and plan the release
@@ -89,7 +89,7 @@ jobs:
           git clone --depth 1 https://github.com/Dicklesworthstone/frankentui.git /dp/frankentui
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2025-11-01
+          toolchain: nightly-2026-06-06
           targets: x86_64-unknown-linux-gnu
       - uses: Swatinem/rust-cache@v2
         with:
@@ -126,7 +126,7 @@ jobs:
           git clone --depth 1 https://github.com/Dicklesworthstone/frankentui.git /dp/frankentui
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2025-11-01
+          toolchain: nightly-2026-06-06
           targets: x86_64-unknown-linux-musl
       - name: Install musl-tools
         run: sudo apt-get update && sudo apt-get install -y musl-tools
@@ -165,7 +165,7 @@ jobs:
           git clone --depth 1 https://github.com/Dicklesworthstone/frankentui.git /dp/frankentui
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2025-11-01
+          toolchain: nightly-2026-06-06
           targets: aarch64-unknown-linux-gnu
       - uses: Swatinem/rust-cache@v2
         with:
@@ -204,7 +204,7 @@ jobs:
           sed -i '' 's|/dp/|/tmp/dp/|g' Cargo.toml
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2025-11-01
+          toolchain: nightly-2026-06-06
           targets: x86_64-apple-darwin
       - uses: Swatinem/rust-cache@v2
         with:
@@ -245,7 +245,7 @@ jobs:
           sed -i '' 's|/dp/|/tmp/dp/|g' Cargo.toml
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2025-11-01
+          toolchain: nightly-2026-06-06
           targets: aarch64-apple-darwin
       - uses: Swatinem/rust-cache@v2
         with:
@@ -283,7 +283,7 @@ jobs:
           git clone --depth 1 https://github.com/Dicklesworthstone/frankentui.git (Join-Path $dp "frankentui")
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2025-11-01
+          toolchain: nightly-2026-06-06
           targets: x86_64-pc-windows-msvc
       - uses: Swatinem/rust-cache@v2
         with:
@@ -609,7 +609,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2025-11-01
+          toolchain: nightly-2026-06-06
 
       - name: Verify version matches tag
         run: |
