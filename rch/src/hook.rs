@@ -1550,6 +1550,13 @@ mod auto_start;
 mod progress_reporting;
 use progress_reporting::{BuildHeartbeatLoop, mark_heartbeat_progress};
 
+// The transfer / remote-execution orchestration cluster lives in the
+// `transfer_orchestration` submodule (grown incrementally per zcecy.14). The
+// leaf telemetry-forwarding helpers are imported so `execute_remote_compilation`
+// and the hook tests call them unqualified.
+mod transfer_orchestration;
+use transfer_orchestration::{send_telemetry, send_test_run, wrap_command_with_telemetry};
+
 fn tokenize_command(command: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
@@ -6970,81 +6977,6 @@ fn add_cargo_isolation(command: &str, worker_id: &WorkerId) -> String {
     // from trying to exec `CARGO_HOME=...` as argv[0], while preserving the
     // original cargo exit status after cleanup.
     format!("sh -c {}", shell_escape::escape(script.into()))
-}
-
-fn wrap_command_with_telemetry(command: &str, worker_id: &WorkerId) -> String {
-    let escaped_worker = shell_escape::escape(worker_id.as_str().into());
-    // Use newline instead of semicolon to ensure trailing comments in command
-    // don't comment out the status capture logic.
-    format!(
-        "{cmd}\nstatus=$?; if command -v rch-telemetry >/dev/null 2>&1; then \
-         telemetry=$(rch-telemetry collect --format json --worker-id {worker} 2>/dev/null || true); \
-         if [ -n \"$telemetry\" ]; then echo '{marker}'; echo \"$telemetry\"; fi; \
-         fi; exit $status",
-        cmd = command,
-        worker = escaped_worker,
-        marker = PIGGYBACK_MARKER
-    )
-}
-
-async fn send_telemetry(
-    socket_path: &str,
-    source: TelemetrySource,
-    telemetry: &WorkerTelemetry,
-) -> anyhow::Result<()> {
-    if !Path::new(socket_path).exists() {
-        return Ok(());
-    }
-
-    let stream = match timeout(Duration::from_secs(2), UnixStream::connect(socket_path)).await {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => return Err(e.into()),
-        Err(_) => return Ok(()), // Timeout connecting — don't block hook
-    };
-    let (reader, mut writer) = stream.into_split();
-
-    let body = telemetry.to_json()?;
-    let request = format!(
-        "POST /telemetry/ingest?source={}\n{}\n",
-        urlencoding_encode(&source.to_string()),
-        body
-    );
-
-    writer.write_all(request.as_bytes()).await?;
-    writer.flush().await?;
-    writer.shutdown().await?;
-
-    let mut reader = BufReader::new(reader);
-    let mut line = String::new();
-    let _ = timeout(Duration::from_secs(5), reader.read_line(&mut line)).await;
-
-    Ok(())
-}
-
-async fn send_test_run(socket_path: &str, record: &TestRunRecord) -> anyhow::Result<()> {
-    if !Path::new(socket_path).exists() {
-        return Ok(());
-    }
-
-    let stream = match timeout(Duration::from_secs(2), UnixStream::connect(socket_path)).await {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => return Err(e.into()),
-        Err(_) => return Ok(()), // Timeout connecting — don't block hook
-    };
-    let (reader, mut writer) = stream.into_split();
-
-    let body = record.to_json()?;
-    let request = format!("POST /test-run\n{}\n", body);
-
-    writer.write_all(request.as_bytes()).await?;
-    writer.flush().await?;
-    writer.shutdown().await?;
-
-    let mut reader = BufReader::new(reader);
-    let mut line = String::new();
-    let _ = timeout(Duration::from_secs(5), reader.read_line(&mut line)).await;
-
-    Ok(())
 }
 
 #[cfg(test)]
