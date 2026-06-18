@@ -26,8 +26,6 @@ use serde::{Deserialize, Serialize};
 pub mod reason_code {
     /// No real workers are configured, so a real-fleet scenario is skipped.
     pub const NO_REAL_WORKERS: &str = "smoke_no_real_workers";
-    /// `--dry-run`: the scenario is planned but not executed.
-    pub const DRY_RUN: &str = "smoke_dry_run";
     /// The proof-mode refusal scenario cannot be exercised because remote
     /// execution IS available (nothing to refuse).
     pub const REMOTE_AVAILABLE: &str = "smoke_remote_available";
