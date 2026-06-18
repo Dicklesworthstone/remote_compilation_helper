@@ -21,6 +21,10 @@
 //! stays `pub(super)` for the hook test suite; the two daemon-IPC POST helpers
 //! are private to this module.
 
+use super::artifact_patterns::{
+    get_artifact_patterns, get_custom_target_artifact_patterns,
+    kind_produces_transferable_artifacts,
+};
 use super::cargo_target_dir::{
     cargo_target_env_allowlist, cargo_target_env_overrides, remote_cargo_pooled_target_dir_name,
     remote_cargo_target_dir_name, stale_target_reap_idle_hours, target_reuse_disabled,

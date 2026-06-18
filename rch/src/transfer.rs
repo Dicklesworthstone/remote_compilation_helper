@@ -107,7 +107,7 @@ fn anchor_retrieval_pattern(pattern: &str) -> String {
 /// up-front exclude (e.g. cargo's `incremental/`/`.fingerprint/`/`build/` cache
 /// trees, `*.d` dep files) keeps those bytes from ever transferring even though a
 /// broad include like `debug/**` would otherwise match them. See
-/// `hook::CARGO_TARGET_CACHE_EXCLUDES`.
+/// `hook::artifact_patterns::CARGO_TARGET_CACHE_EXCLUDES`.
 fn artifact_pattern_exclude(pattern: &str) -> Option<&str> {
     pattern.strip_prefix("- ")
 }
