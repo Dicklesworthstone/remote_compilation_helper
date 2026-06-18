@@ -29,6 +29,7 @@ use super::cargo_target_dir::{
     cargo_target_env_allowlist, cargo_target_env_overrides, remote_cargo_pooled_target_dir_name,
     remote_cargo_target_dir_name, stale_target_reap_idle_hours, target_reuse_disabled,
 };
+use super::daemon_ipc::urlencoding_encode;
 use super::dependency_closure::{
     SyncClosureMode, SyncClosurePlanEntry, SyncRootOutcome, build_sync_closure_manifest,
     build_sync_closure_plan, merge_sync_result, verify_remote_dependency_manifests,
