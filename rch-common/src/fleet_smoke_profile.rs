@@ -595,4 +595,43 @@ mod tests {
         }
         assert_eq!(SmokeScenario::DaemonReachable.as_str(), "daemon_reachable");
     }
+
+    #[test]
+    fn scenario_action_variants_round_trip() {
+        // The internally-tagged `ScenarioAction` must round-trip every variant,
+        // including the UNIT variants (Run/DryRun) — a classic serde footgun for
+        // `#[serde(tag = ...)]` enums.
+        let variants = [
+            ScenarioAction::Run,
+            ScenarioAction::DryRun,
+            ScenarioAction::Skip {
+                reason_code: reason_code::NO_REAL_WORKERS.to_string(),
+                detail: "d".to_string(),
+            },
+            ScenarioAction::ExpectRefusal {
+                reason_code: reason_code::PROOF_REFUSAL_EXPECTED.to_string(),
+                detail: "d".to_string(),
+            },
+        ];
+        for action in variants {
+            let json = serde_json::to_string(&action).unwrap();
+            let back: ScenarioAction = serde_json::from_str(&json).unwrap();
+            assert_eq!(action, back, "round-trip failed for {json}");
+        }
+        // The unit variant carries the snake_case action tag and nothing else.
+        assert_eq!(
+            serde_json::to_string(&ScenarioAction::Run).unwrap(),
+            "{\"action\":\"run\"}"
+        );
+    }
+
+    #[test]
+    fn full_plan_round_trips() {
+        // A whole plan (with mixed action variants across the 8 scenarios) must
+        // survive a serde round-trip for `rch self-test --json`.
+        let plan = plan_smoke_profile(&SmokeProfileInputs::no_workers());
+        let json = serde_json::to_string(&plan).unwrap();
+        let back: SmokeProfilePlan = serde_json::from_str(&json).unwrap();
+        assert_eq!(plan, back);
+    }
 }

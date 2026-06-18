@@ -706,6 +706,14 @@ mod tests {
         let json = serde_json::to_string(&rejected).unwrap();
         assert!(json.contains("\"status\":\"rejected\""));
         assert!(json.contains("provenance_checksum_mismatch"));
+
+        // The internally-tagged UNIT variant must round-trip too (a classic
+        // serde footgun for `#[serde(tag = ...)]` enums with unit variants).
+        let verified = ProvenanceVerdict::Verified;
+        let vjson = serde_json::to_string(&verified).unwrap();
+        assert_eq!(vjson, "{\"status\":\"verified\"}");
+        let back: ProvenanceVerdict = serde_json::from_str(&vjson).unwrap();
+        assert_eq!(back, ProvenanceVerdict::Verified);
     }
 
     #[test]
