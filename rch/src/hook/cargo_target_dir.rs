@@ -40,6 +40,7 @@
 //! `default_host_target_triple`, `skip_env_option_prefix`) stay private.
 
 use super::*;
+use std::collections::HashMap;
 
 fn env_allowlist_contains(env_allowlist: &[String], key: &str) -> bool {
     env_allowlist

@@ -31,6 +31,10 @@ use super::repo_updater::{
     collect_repo_updater_roots_and_specs, hydrate_repo_updater_auth_context_defaults,
     infer_repo_updater_auth_context_with_env_lookup, repo_updater_command_name,
 };
+use super::timing_history::{
+    MAX_TIMING_SAMPLES, ProjectTimingData, TimingEstimate, TimingHistory, TimingRecord,
+    estimate_timing_for_build, record_build_timing, timing_cache,
+};
 use super::transfer_orchestration::wrap_command_with_telemetry;
 use proptest::prelude::*;
 use rch_common::mock::{
@@ -6278,7 +6282,7 @@ fn test_timing_record_creation() {
         .unwrap()
         .as_secs();
 
-    let record = super::TimingRecord {
+    let record = TimingRecord {
         timestamp: now_secs,
         duration_ms: 5000,
         remote: true,
@@ -6292,7 +6296,7 @@ fn test_timing_record_creation() {
 #[test]
 fn test_project_timing_data_add_sample() {
     let _guard = test_guard!();
-    let mut data = super::ProjectTimingData::default();
+    let mut data = ProjectTimingData::default();
 
     // Add local sample
     data.add_sample(1000, false);
@@ -6310,7 +6314,7 @@ fn test_project_timing_data_add_sample() {
 #[test]
 fn test_project_timing_data_median_odd_count() {
     let _guard = test_guard!();
-    let mut data = super::ProjectTimingData::default();
+    let mut data = ProjectTimingData::default();
     data.add_sample(100, false);
     data.add_sample(300, false);
     data.add_sample(200, false);
@@ -6322,7 +6326,7 @@ fn test_project_timing_data_median_odd_count() {
 #[test]
 fn test_project_timing_data_median_even_count() {
     let _guard = test_guard!();
-    let mut data = super::ProjectTimingData::default();
+    let mut data = ProjectTimingData::default();
     data.add_sample(100, true);
     data.add_sample(300, true);
     data.add_sample(200, true);
@@ -6335,7 +6339,7 @@ fn test_project_timing_data_median_even_count() {
 #[test]
 fn test_project_timing_data_median_empty() {
     let _guard = test_guard!();
-    let data = super::ProjectTimingData::default();
+    let data = ProjectTimingData::default();
     assert_eq!(data.median_duration(false), None);
     assert_eq!(data.median_duration(true), None);
 }
@@ -6343,7 +6347,7 @@ fn test_project_timing_data_median_empty() {
 #[test]
 fn test_project_timing_data_speedup_ratio() {
     let _guard = test_guard!();
-    let mut data = super::ProjectTimingData::default();
+    let mut data = ProjectTimingData::default();
     // Local takes 1000ms
     data.add_sample(1000, false);
     // Remote takes 500ms
@@ -6356,7 +6360,7 @@ fn test_project_timing_data_speedup_ratio() {
 #[test]
 fn test_project_timing_data_speedup_no_data() {
     let _guard = test_guard!();
-    let mut data = super::ProjectTimingData::default();
+    let mut data = ProjectTimingData::default();
     data.add_sample(1000, false);
 
     // No remote data, can't compute speedup
@@ -6366,7 +6370,7 @@ fn test_project_timing_data_speedup_no_data() {
 #[test]
 fn test_project_timing_data_sample_truncation() {
     let _guard = test_guard!();
-    let mut data = super::ProjectTimingData::default();
+    let mut data = ProjectTimingData::default();
 
     // Add more than MAX_TIMING_SAMPLES
     for i in 0..25 {
@@ -6374,7 +6378,7 @@ fn test_project_timing_data_sample_truncation() {
     }
 
     // Should be capped at MAX_TIMING_SAMPLES (20)
-    assert_eq!(data.local_samples.len(), super::MAX_TIMING_SAMPLES);
+    assert_eq!(data.local_samples.len(), MAX_TIMING_SAMPLES);
     // First sample should be removed (FIFO)
     assert_eq!(data.local_samples[0].duration_ms, 500); // Started at 0, removed 0-4
 }
@@ -6382,11 +6386,11 @@ fn test_project_timing_data_sample_truncation() {
 #[test]
 fn test_timing_history_key() {
     let _guard = test_guard!();
-    let key = super::TimingHistory::key("my_project", Some(CompilationKind::CargoTest));
+    let key = TimingHistory::key("my_project", Some(CompilationKind::CargoTest));
     assert!(key.contains("my_project"));
     assert!(key.contains("CargoTest"));
 
-    let key_unknown = super::TimingHistory::key("project2", None);
+    let key_unknown = TimingHistory::key("project2", None);
     assert!(key_unknown.contains("project2"));
     assert!(key_unknown.contains("Unknown"));
 }
@@ -6394,7 +6398,7 @@ fn test_timing_history_key() {
 #[test]
 fn test_timing_history_record_and_get() {
     let _guard = test_guard!();
-    let mut history = super::TimingHistory::default();
+    let mut history = TimingHistory::default();
 
     history.record("proj1", Some(CompilationKind::CargoBuild), 1000, true);
     history.record("proj1", Some(CompilationKind::CargoBuild), 800, true);
@@ -6413,12 +6417,12 @@ fn test_timing_history_record_and_get() {
 #[test]
 fn test_timing_history_serialization() {
     let _guard = test_guard!();
-    let mut history = super::TimingHistory::default();
+    let mut history = TimingHistory::default();
     history.record("proj", Some(CompilationKind::CargoCheck), 500, false);
     history.record("proj", Some(CompilationKind::CargoCheck), 250, true);
 
     let json = serde_json::to_string(&history).unwrap();
-    let loaded: super::TimingHistory = serde_json::from_str(&json).unwrap();
+    let loaded: TimingHistory = serde_json::from_str(&json).unwrap();
 
     let data = loaded
         .get("proj", Some(CompilationKind::CargoCheck))
@@ -6476,7 +6480,7 @@ fn test_record_build_timing_releases_guard_before_disk_io() {
             for i in 0..calls_per_thread {
                 started.fetch_add(1, Ordering::Relaxed);
                 let project = format!("{unique}-{t}-{i}");
-                super::record_build_timing(
+                record_build_timing(
                     &project,
                     Some(CompilationKind::CargoBuild),
                     100 + (i as u64),
@@ -6526,9 +6530,9 @@ fn test_record_build_timing_in_memory_state_survives_disk_failure() {
             .unwrap_or(0)
     );
 
-    super::record_build_timing(&unique, Some(CompilationKind::CargoBuild), 1234, true);
+    record_build_timing(&unique, Some(CompilationKind::CargoBuild), 1234, true);
 
-    let history = super::timing_cache().read().expect("read");
+    let history = timing_cache().read().expect("read");
     let entry = history.get(&unique, Some(CompilationKind::CargoBuild));
     assert!(
         entry.is_some(),
@@ -6560,7 +6564,7 @@ async fn test_spawn_blocking_load_with_valid_file() {
     let history_path = temp_dir.path().join("timing_history.json");
 
     // Create valid timing data
-    let mut history = super::TimingHistory::default();
+    let mut history = TimingHistory::default();
     history.record(
         "test-project",
         Some(CompilationKind::CargoBuild),
@@ -6576,7 +6580,7 @@ async fn test_spawn_blocking_load_with_valid_file() {
         // In production we use timing_history_path(), here we test the pattern
         std::fs::read_to_string(&path)
             .ok()
-            .and_then(|content| serde_json::from_str::<super::TimingHistory>(&content).ok())
+            .and_then(|content| serde_json::from_str::<TimingHistory>(&content).ok())
             .unwrap_or_default()
     })
     .await
@@ -6597,7 +6601,7 @@ async fn test_spawn_blocking_load_missing_file() {
     let loaded = tokio::task::spawn_blocking(move || {
         std::fs::read_to_string(&missing_path)
             .ok()
-            .and_then(|content| serde_json::from_str::<super::TimingHistory>(&content).ok())
+            .and_then(|content| serde_json::from_str::<TimingHistory>(&content).ok())
             .unwrap_or_default()
     })
     .await
@@ -6617,7 +6621,7 @@ async fn test_spawn_blocking_load_corrupt_json() {
     let loaded = tokio::task::spawn_blocking(move || {
         std::fs::read_to_string(&corrupt_path)
             .ok()
-            .and_then(|content| serde_json::from_str::<super::TimingHistory>(&content).ok())
+            .and_then(|content| serde_json::from_str::<TimingHistory>(&content).ok())
             .unwrap_or_default()
     })
     .await
@@ -6633,7 +6637,7 @@ async fn test_spawn_blocking_save_creates_file() {
     let temp_dir = tempfile::tempdir().unwrap();
     let save_path = temp_dir.path().join("saved_history.json");
 
-    let mut history = super::TimingHistory::default();
+    let mut history = TimingHistory::default();
     history.record(
         "saved-project",
         Some(CompilationKind::CargoTest),
@@ -6652,7 +6656,7 @@ async fn test_spawn_blocking_save_creates_file() {
     // Verify file was created and has correct content
     assert!(save_path.exists());
     let content = std::fs::read_to_string(&save_path).unwrap();
-    let loaded: super::TimingHistory = serde_json::from_str(&content).unwrap();
+    let loaded: TimingHistory = serde_json::from_str(&content).unwrap();
     let data = loaded.get("saved-project", Some(CompilationKind::CargoTest));
     assert!(data.is_some());
     assert_eq!(data.unwrap().remote_samples.len(), 1);
@@ -6665,7 +6669,7 @@ async fn test_spawn_blocking_timeout_protection() {
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(5),
         tokio::task::spawn_blocking(|| {
-            let history = super::TimingHistory::default();
+            let history = TimingHistory::default();
             // Simulate some work
             std::thread::sleep(std::time::Duration::from_millis(10));
             history
@@ -6686,7 +6690,7 @@ async fn test_spawn_blocking_concurrent_loads() {
     let history_path = temp_dir.path().join("concurrent.json");
 
     // Create test file
-    let mut history = super::TimingHistory::default();
+    let mut history = TimingHistory::default();
     history.record("concurrent", Some(CompilationKind::CargoBuild), 500, false);
     std::fs::write(&history_path, serde_json::to_string(&history).unwrap()).unwrap();
 
@@ -6697,7 +6701,7 @@ async fn test_spawn_blocking_concurrent_loads() {
         handles.push(tokio::task::spawn_blocking(move || {
             std::fs::read_to_string(&path)
                 .ok()
-                .and_then(|c| serde_json::from_str::<super::TimingHistory>(&c).ok())
+                .and_then(|c| serde_json::from_str::<TimingHistory>(&c).ok())
                 .unwrap_or_default()
         }));
     }
@@ -6722,7 +6726,7 @@ async fn test_spawn_blocking_concurrent_saves() {
     let mut handles = Vec::new();
     for i in 0..5 {
         let path = temp_dir.path().join(format!("save_{}.json", i));
-        let mut history = super::TimingHistory::default();
+        let mut history = TimingHistory::default();
         history.record(
             &format!("project-{}", i),
             Some(CompilationKind::CargoBuild),
@@ -6751,7 +6755,7 @@ async fn test_spawn_blocking_performance_budget() {
     let history_path = temp_dir.path().join("perf_test.json");
 
     // Create a reasonably sized history file
-    let mut history = super::TimingHistory::default();
+    let mut history = TimingHistory::default();
     for i in 0..10 {
         history.record(
             &format!("project-{}", i),
@@ -6778,7 +6782,7 @@ async fn test_spawn_blocking_performance_budget() {
     let _loaded = tokio::task::spawn_blocking(move || {
         std::fs::read_to_string(&load_path)
             .ok()
-            .and_then(|c| serde_json::from_str::<super::TimingHistory>(&c).ok())
+            .and_then(|c| serde_json::from_str::<TimingHistory>(&c).ok())
             .unwrap_or_default()
     })
     .await
