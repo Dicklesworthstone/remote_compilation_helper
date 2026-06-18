@@ -1222,6 +1222,71 @@ fn build_coverage_matrix() -> CoverageMatrix {
             has_log_assertion: true,
             gap: None,
         },
+        // ---------------------------------------------------------------
+        // Domain: Real-fleet smoke/soak validation profile (bead .16.6)
+        // ---------------------------------------------------------------
+        RequirementRow {
+            id: "REQ-SMOKE-001".into(),
+            description: "Real-fleet smoke/soak validation profile planning + skip/refusal logic: a \
+                          bounded profile (daemon reachability, desired-vs-live fleet, exact \
+                          user/path capabilities, disk/inode admission, cargo canary, artifact \
+                          retrieval, queue attach/cancel, proof-mode refusal) plans WHICH scenarios \
+                          run, which SKIP with a stable reason (no real workers, dry-run, \
+                          single-worker selection), and which are EXPECTED to fail closed \
+                          (proof-mode refusal when remote execution is unavailable). Emits a \
+                          structured SmokeProfileEvent JSONL record."
+                .into(),
+            domain: "smoke_validation".into(),
+            bead_id: "bd-session-history-remediation-ocv9i.16.6".into(),
+            test_refs: vec![
+                TestRef {
+                    file: "../src/fleet_smoke_profile.rs".into(),
+                    name_prefix: "no_workers".into(),
+                    tier: "smoke".into(),
+                },
+                TestRef {
+                    file: "../src/fleet_smoke_profile.rs".into(),
+                    name_prefix: "proof_refusal".into(),
+                    tier: "smoke".into(),
+                },
+                TestRef {
+                    file: "../src/fleet_smoke_profile.rs".into(),
+                    name_prefix: "single_worker".into(),
+                    tier: "smoke".into(),
+                },
+                TestRef {
+                    file: "../src/fleet_smoke_profile.rs".into(),
+                    name_prefix: "event_serde".into(),
+                    tier: "smoke".into(),
+                },
+            ],
+            artifact_assertions: vec![
+                "No real workers configured -> every real-fleet scenario Skip{smoke_no_real_workers}; \
+                 daemon reachability still runs (fleet_smoke_profile::no_workers_skips_all_real_scenarios_and_marks_overall_skipped)"
+                    .into(),
+                "Proof-mode refusal is EXPECTED (fail-closed) when remote execution is unavailable, \
+                 and Skip{smoke_remote_available} when it is available — asserted even under --dry-run \
+                 (fleet_smoke_profile::proof_refusal_skipped_when_remote_available, \
+                 dry_run_marks_buildy_scenarios_dry_but_still_asserts_proof_refusal)"
+                    .into(),
+                "A single --worker selection skips the fleet-wide desired-vs-live scenario \
+                 with reason smoke_not_selected while per-worker scenarios still run \
+                 (fleet_smoke_profile::single_worker_selection_skips_fleet_wide_scenario)"
+                    .into(),
+                "Plan covers every scenario once in run order; full fleet executes 7 scenarios; soak \
+                 mode is carried into the plan (fleet_smoke_profile::plan_covers_every_scenario_once_in_order, \
+                 full_fleet_runs_all_per_worker_scenarios, soak_mode_is_carried_into_the_plan)"
+                    .into(),
+                "SmokeProfileEvent JSONL carries run_id/bead_id/worker_id/scenario/event/status/reason_code/\
+                 command_fingerprint/duration_ms/remote_target_dir/artifact_summary and survives a serde \
+                 roundtrip; daemon-only scenarios drop worker_id \
+                 (fleet_smoke_profile::event_serde_roundtrip_is_stable, planned_event_carries_fields_and_omits_worker_for_daemon_scenario)"
+                    .into(),
+            ],
+            has_executable_test: true,
+            has_log_assertion: true,
+            gap: None,
+        },
     ];
 
     let total = requirements.len();
