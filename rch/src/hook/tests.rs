@@ -14,6 +14,10 @@ use super::cargo_target_dir::{
     strip_cargo_target_dir_flags_from_command_tokens, target_reuse_disabled_from_value,
     target_triple_for_command,
 };
+use super::command_parsing::{
+    has_exact_flag, has_ignored_only_flag, is_filtered_test_command, parse_jobs_flag,
+    parse_test_threads,
+};
 use super::daemon_ipc::{
     DEFAULT_DAEMON_RESPONSE_TIMEOUT_SECS, DEFAULT_DAEMON_WAIT_RESPONSE_TIMEOUT_SECS,
     daemon_response_timeout_for, queue_when_busy_enabled_from, urlencoding_encode,
