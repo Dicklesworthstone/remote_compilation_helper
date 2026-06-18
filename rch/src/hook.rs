@@ -1587,6 +1587,16 @@ use dependency_closure::{
     DependencyPreflightReport, DependencyPreflightStatus,
 };
 
+// The remote-execution result type (`RemoteExecutionResult`) and the outcome
+// classifiers that interpret it live in the `remote_result` submodule. The four
+// classifier fns below are consumed by `run_hook` / `run_exec`; the sibling
+// `transfer_orchestration` constructs and returns `RemoteExecutionResult`
+// directly from `super::remote_result`.
+mod remote_result;
+use remote_result::{
+    detect_worker_system_dependency_failure, is_signal_killed, is_toolchain_failure, signal_name,
+};
+
 fn tokenize_command(command: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
@@ -3774,195 +3784,6 @@ fn parse_command_tokens(command: &str, reporter: &HookReporter) -> Option<Vec<St
             ));
             None
         }
-    }
-}
-
-/// Result of remote compilation execution.
-#[derive(Debug)]
-struct RemoteExecutionResult {
-    /// Exit code of the remote command.
-    exit_code: i32,
-    /// Standard error output (used for toolchain detection).
-    stderr: String,
-    /// Remote command duration in milliseconds.
-    duration_ms: u64,
-    /// Per-phase timing breakdown.
-    timing: CommandTimingBreakdown,
-}
-
-/// Check if the failure is a toolchain-related infrastructure failure.
-///
-/// Returns true if the error indicates a toolchain issue that should
-/// trigger a local fallback rather than denying execution.
-fn is_toolchain_failure(stderr: &str, exit_code: i32) -> bool {
-    if exit_code == 0 || exit_code == EXIT_TEST_FAILURES || is_signal_killed(exit_code).is_some() {
-        return false;
-    }
-
-    stderr
-        .lines()
-        .map(str::trim)
-        .map(str::to_ascii_lowercase)
-        .any(|line| {
-            line.starts_with("rustup: command not found")
-                || line.starts_with("rustup: not found")
-                || line.contains("error: no default toolchain configured")
-                || line.contains("error: no active toolchain")
-                || (line.contains("error: toolchain ")
-                    && (line.contains(" is not installed")
-                        || line.contains(" is unavailable")
-                        || line.contains(" does not have the binary ")))
-                || (line.contains("error: override toolchain ")
-                    && line.contains(" is not installed"))
-        })
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct WorkerSystemDependencyFailure {
-    system_library: Option<String>,
-    crate_name: Option<String>,
-    pkg_config_file: Option<String>,
-}
-
-impl WorkerSystemDependencyFailure {
-    fn summary(&self) -> String {
-        if let Some(pkg_config_file) = &self.pkg_config_file {
-            return format!("missing worker system package {}", pkg_config_file);
-        }
-        if let Some(system_library) = &self.system_library {
-            return format!("missing worker system library {}", system_library);
-        }
-        "worker build environment is missing a required system package".to_string()
-    }
-
-    fn remediation(&self) -> String {
-        match (&self.pkg_config_file, &self.system_library) {
-            (Some(pkg_config_file), Some(system_library)) => format!(
-                "Install the worker-side development package that provides {} (system library {}) and ensure pkg-config can resolve it on the worker.",
-                pkg_config_file, system_library
-            ),
-            (Some(pkg_config_file), None) => format!(
-                "Install the worker-side development package that provides {} and ensure PKG_CONFIG_PATH includes its parent directory on the worker.",
-                pkg_config_file
-            ),
-            (None, Some(system_library)) => format!(
-                "Install the worker-side development package for system library {} and ensure pkg-config is configured on the worker.",
-                system_library
-            ),
-            (None, None) => "Install the missing worker-side development package and ensure pkg-config can find it on the worker.".to_string(),
-        }
-    }
-
-    fn log_detail(&self) -> String {
-        let mut parts = Vec::new();
-        if let Some(crate_name) = &self.crate_name {
-            parts.push(format!("crate={}", crate_name));
-        }
-        if let Some(system_library) = &self.system_library {
-            parts.push(format!("system_library={}", system_library));
-        }
-        if let Some(pkg_config_file) = &self.pkg_config_file {
-            parts.push(format!("pkg_config_file={}", pkg_config_file));
-        }
-        if parts.is_empty() {
-            "pkg-config/system dependency detection matched".to_string()
-        } else {
-            parts.join(" ")
-        }
-    }
-}
-
-fn detect_worker_system_dependency_failure(
-    stderr: &str,
-    exit_code: i32,
-) -> Option<WorkerSystemDependencyFailure> {
-    if exit_code == 0 {
-        return None;
-    }
-
-    let mut system_library = None;
-    let mut crate_name = None;
-    let mut pkg_config_file = None;
-    let mut pkg_config_signal = false;
-
-    for raw_line in stderr.lines() {
-        let line = raw_line.trim();
-        let lower = line.to_ascii_lowercase();
-
-        if lower.contains("pkg-config exited with status code")
-            || lower.contains("pkg_config_path")
-            || lower.contains("the system library `")
-            || lower.contains(".pc` needs to be installed")
-        {
-            pkg_config_signal = true;
-        }
-
-        if let Some(value) = extract_tick_quoted_value(line, "The system library `") {
-            system_library = Some(value);
-        }
-        if let Some(value) = extract_tick_quoted_value(line, "required by crate `") {
-            crate_name = Some(value);
-        }
-        if let Some(value) = extract_tick_quoted_value(line, "The file `")
-            && value.ends_with(".pc")
-        {
-            pkg_config_file = Some(value);
-        }
-    }
-
-    if !pkg_config_signal || (system_library.is_none() && pkg_config_file.is_none()) {
-        return None;
-    }
-
-    Some(WorkerSystemDependencyFailure {
-        system_library,
-        crate_name,
-        pkg_config_file,
-    })
-}
-
-fn extract_tick_quoted_value(line: &str, prefix: &str) -> Option<String> {
-    let remainder = line.split_once(prefix)?.1;
-    let value = remainder.split('`').next()?.trim();
-    if value.is_empty() {
-        None
-    } else {
-        Some(value.to_string())
-    }
-}
-
-/// Check if the process was killed by a signal.
-///
-/// Exit codes > 128 indicate the process was terminated by a signal.
-/// The signal number is exit_code - 128.
-///
-/// Common signals:
-/// - 137 (SIGKILL = 9): Typically OOM killer
-/// - 143 (SIGTERM = 15): Graceful termination request
-/// - 139 (SIGSEGV = 11): Segmentation fault
-#[allow(dead_code)]
-fn is_signal_killed(exit_code: i32) -> Option<i32> {
-    if exit_code > EXIT_SIGNAL_BASE {
-        Some(exit_code - EXIT_SIGNAL_BASE)
-    } else {
-        None
-    }
-}
-
-/// Format a signal number as a human-readable name.
-#[allow(dead_code)]
-fn signal_name(signal: i32) -> &'static str {
-    match signal {
-        1 => "SIGHUP",
-        2 => "SIGINT",
-        3 => "SIGQUIT",
-        6 => "SIGABRT",
-        9 => "SIGKILL",
-        11 => "SIGSEGV",
-        13 => "SIGPIPE",
-        14 => "SIGALRM",
-        15 => "SIGTERM",
-        _ => "UNKNOWN",
     }
 }
 

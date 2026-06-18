@@ -27,6 +27,7 @@ use super::dependency_closure::{
     workspace_metadata_sync_patterns,
 };
 use super::progress_reporting::{BuildHeartbeatLoop, mark_heartbeat_progress};
+use super::remote_result::RemoteExecutionResult;
 use super::repo_updater::maybe_sync_repo_set_with_repo_updater;
 use super::ssh::ensure_worker_projects_topology;
 use super::*;
