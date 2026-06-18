@@ -35,6 +35,7 @@ use super::dependency_closure::{
     build_sync_closure_plan, merge_sync_result, verify_remote_dependency_manifests,
     workspace_metadata_sync_patterns,
 };
+use super::formatting::{cache_hit, detect_target_label, emit_job_banner, render_compile_summary};
 use super::progress_reporting::{BuildHeartbeatLoop, mark_heartbeat_progress};
 use super::remote_result::RemoteExecutionResult;
 use super::repo_updater::maybe_sync_repo_set_with_repo_updater;

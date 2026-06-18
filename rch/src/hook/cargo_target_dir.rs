@@ -39,6 +39,7 @@
 //! (`env_allowlist_contains`, `cargo_kind_uses_target_dir`,
 //! `default_host_target_triple`, `skip_env_option_prefix`) stay private.
 
+use super::formatting::detect_target_label;
 use super::*;
 use std::collections::HashMap;
 
