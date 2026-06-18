@@ -149,7 +149,7 @@ const RCH_RELEASE_IDENTITY_PATTERN: &str = r"^https://github\.com/Dicklesworthst
 ///
 /// Wildcard patterns (`.*`) are intentionally NOT used as they would accept
 /// any sigstore signature, defeating supply chain security.
-async fn verify_signature(
+pub(crate) async fn verify_signature(
     file_path: &std::path::Path,
     bundle_path: &std::path::Path,
 ) -> Result<bool, UpdateError> {

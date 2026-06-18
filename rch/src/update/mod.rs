@@ -12,7 +12,7 @@ mod download;
 mod install;
 mod lock;
 mod types;
-mod verify;
+pub(crate) mod verify;
 
 pub use check::{check_for_updates, spawn_update_check_if_needed};
 pub use download::download_release;

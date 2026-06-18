@@ -156,6 +156,20 @@ impl ProvenancePolicy {
             allow_dev_artifacts: true,
         }
     }
+
+    /// Resolve a policy from an environment-variable value (the contents of
+    /// `RCH_FLEET_PROVENANCE`). A case-insensitive, trimmed `strict` selects
+    /// [`Self::STRICT`]; an unset or any other value falls back to the
+    /// dev-friendly default, so a fleet of locally-built binaries keeps
+    /// deploying (fail-open) while still recording an explicit dev-artifact
+    /// reason rather than refusing.
+    #[must_use]
+    pub fn from_env_value(value: Option<&str>) -> Self {
+        match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+            Some("strict") => Self::STRICT,
+            _ => Self::dev_friendly(),
+        }
+    }
 }
 
 impl Default for ProvenancePolicy {
@@ -441,6 +455,24 @@ impl FleetDeployAuditRecord {
             detail: detail.into(),
         }
     }
+
+    /// Mark a failed deploy as successfully rolled back to the previous
+    /// artifact. Used by the deploy/canary path after a reverting rollback.
+    pub fn mark_rolled_back(&mut self) {
+        self.rollback_status = rollback_status::ROLLED_BACK.to_string();
+    }
+
+    /// Mark that a rollback was attempted but did not complete — the worker may
+    /// be in a degraded state and needs operator attention.
+    pub fn mark_rollback_failed(&mut self) {
+        self.rollback_status = rollback_status::ROLLBACK_FAILED.to_string();
+    }
+
+    /// Record how long the deploy attempt took once it completes. The verdict is
+    /// computed before transfer, so the duration is not known at construction.
+    pub fn set_duration_ms(&mut self, duration_ms: u64) {
+        self.duration_ms = duration_ms;
+    }
 }
 
 #[cfg(test)]
@@ -719,5 +751,88 @@ mod tests {
     #[test]
     fn schema_version_is_pinned() {
         assert_eq!(FLEET_DEPLOY_AUDIT_SCHEMA_VERSION, "1.0.0");
+    }
+
+    #[test]
+    fn policy_from_env_value_selects_strict_only_for_strict() {
+        assert_eq!(
+            ProvenancePolicy::from_env_value(Some("strict")),
+            ProvenancePolicy::STRICT
+        );
+        // Case-insensitive + whitespace tolerant.
+        assert_eq!(
+            ProvenancePolicy::from_env_value(Some("  STRICT \n")),
+            ProvenancePolicy::STRICT
+        );
+        // Anything else (including unset) is the dev-friendly fail-open default.
+        for v in [
+            None,
+            Some(""),
+            Some("dev"),
+            Some("1"),
+            Some("relaxed"),
+            Some("strictish"),
+        ] {
+            assert_eq!(
+                ProvenancePolicy::from_env_value(v),
+                ProvenancePolicy::dev_friendly(),
+                "value {v:?} should resolve to dev_friendly"
+            );
+        }
+    }
+
+    // Scenario: rollback after a failed canary deploy — the audit record is
+    // updated from `none` to `rolled_back` and carries the elapsed duration.
+    #[test]
+    fn rollback_after_canary_marks_record_rolled_back() {
+        let p = ArtifactProvenance::dev_artifact("rch-wkr", LINUX);
+        let verdict = ProvenanceVerdict::DevArtifactAllowed {
+            reason: "dev".to_string(),
+        };
+        let mut rec = FleetDeployAuditRecord::from_verdict(
+            "run-canary",
+            "bd-x",
+            "css",
+            "ubuntu",
+            "/home/ubuntu/.local/bin/rch-wkr",
+            &p,
+            Some("rch-wkr-prev".to_string()),
+            1,
+            &verdict,
+            "canary_failure",
+            "canary failed, reverting",
+        );
+        assert_eq!(rec.rollback_status, rollback_status::NONE);
+        rec.set_duration_ms(4_200);
+        rec.mark_rolled_back();
+        assert_eq!(rec.rollback_status, rollback_status::ROLLED_BACK);
+        assert_eq!(rec.duration_ms, 4_200);
+        // Round-trips with the mutated status.
+        let json = serde_json::to_string(&rec).unwrap();
+        let back: FleetDeployAuditRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, rec);
+    }
+
+    // Scenario: an interrupted deploy whose rollback also fails is flagged
+    // `rollback_failed` so operators see the worker needs attention.
+    #[test]
+    fn interrupted_deploy_with_failed_rollback_is_flagged() {
+        let p = ArtifactProvenance::dev_artifact("rch-wkr", LINUX);
+        let verdict = ProvenanceVerdict::Verified;
+        let mut rec = FleetDeployAuditRecord::from_verdict(
+            "run-interrupt",
+            "bd-x",
+            "hz1",
+            "ubuntu",
+            "/home/ubuntu/.local/bin/rch-wkr",
+            &p,
+            None,
+            1,
+            &verdict,
+            "operator",
+            "transfer interrupted mid-deploy",
+        );
+        rec.mark_rollback_failed();
+        assert_eq!(rec.rollback_status, rollback_status::ROLLBACK_FAILED);
     }
 }

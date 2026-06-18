@@ -3,6 +3,7 @@
 //! Tracks past deployments for auditing and rollback purposes.
 
 use anyhow::Result;
+use rch_common::fleet_provenance::FleetDeployAuditRecord;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
@@ -100,6 +101,63 @@ impl HistoryManager {
         file.write_all(&line)?;
 
         Ok(())
+    }
+
+    /// Append a fleet-deploy provenance audit record to the audit trail
+    /// (bd-session-history-remediation-ocv9i.7.4).
+    ///
+    /// Stored in `provenance_audit.jsonl`, separate from `deployments.jsonl`,
+    /// so the verification/rollback audit trail keeps its own stable schema and
+    /// does not perturb the existing deployment-history reader. Uses the same
+    /// single-`write_all` atomicity as [`Self::record_deployment`] because fleet
+    /// deploys write from parallel `tokio::spawn` tasks.
+    pub fn record_provenance_audit(&self, record: &FleetDeployAuditRecord) -> Result<()> {
+        let audit_file = self.history_dir.join("provenance_audit.jsonl");
+
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&audit_file)?;
+
+        use std::io::Write;
+        let mut line = serde_json::to_vec(record)?;
+        line.push(b'\n');
+        file.write_all(&line)?;
+
+        Ok(())
+    }
+
+    /// Read fleet-deploy provenance audit records, newest first, optionally
+    /// filtered by worker and capped at `limit`. The audit reader for the fleet
+    /// history surface; consumed by tests and (follow-up) a `rch fleet history`
+    /// provenance view.
+    #[allow(dead_code)]
+    pub fn get_provenance_audit(
+        &self,
+        limit: usize,
+        worker: Option<&str>,
+    ) -> Result<Vec<FleetDeployAuditRecord>> {
+        let audit_file = self.history_dir.join("provenance_audit.jsonl");
+
+        if !audit_file.exists() {
+            return Ok(Vec::new());
+        }
+
+        let content = fs::read_to_string(&audit_file)?;
+        let mut entries: Vec<FleetDeployAuditRecord> = content
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+
+        if let Some(worker_id) = worker {
+            entries.retain(|e| e.worker_id == worker_id);
+        }
+
+        // Newest first by deploy timestamp.
+        entries.sort_by_key(|e| std::cmp::Reverse(e.deployed_at_unix_ms));
+        entries.truncate(limit);
+
+        Ok(entries)
     }
 
     /// Get the last successful deployment for a worker.
@@ -442,6 +500,145 @@ mod tests {
 
         let prev = manager.get_previous_version("worker-1").unwrap();
         assert!(prev.is_none());
+    }
+
+    // ========================
+    // Provenance audit trail tests (bd-...-ocv9i.7.4)
+    // ========================
+
+    use rch_common::fleet_provenance::{
+        ArtifactProvenance, FleetDeployAuditRecord, ProvenancePolicy, ProvenanceVerdict,
+        SignatureCheck, rollback_status, verify_artifact_provenance,
+    };
+
+    fn audit_record(worker: &str, deployed_at: u64) -> FleetDeployAuditRecord {
+        let triple = "x86_64-unknown-linux-musl";
+        let p = ArtifactProvenance::dev_artifact("rch-wkr", triple);
+        let verdict = verify_artifact_provenance(
+            &p,
+            triple,
+            None,
+            SignatureCheck::Absent,
+            &ProvenancePolicy::dev_friendly(),
+        );
+        FleetDeployAuditRecord::from_verdict(
+            "run-1",
+            "bd-session-history-remediation-ocv9i.7.4",
+            worker,
+            "ubuntu",
+            "/home/ubuntu/.local/bin/rch-wkr",
+            &p,
+            None,
+            deployed_at,
+            &verdict,
+            "operator",
+            "deploy",
+        )
+    }
+
+    #[test]
+    fn provenance_audit_empty_when_no_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager = HistoryManager::with_dir(temp_dir.path().join("history")).unwrap();
+        let entries = manager.get_provenance_audit(10, None).unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn provenance_audit_record_and_read_back() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager = HistoryManager::with_dir(temp_dir.path().join("history")).unwrap();
+
+        let mut rec = audit_record("css", 1_700_000_000_000);
+        rec.set_duration_ms(1234);
+        manager.record_provenance_audit(&rec).unwrap();
+
+        let entries = manager.get_provenance_audit(10, None).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].worker_id, "css");
+        assert_eq!(entries[0].verification_status, "dev_allowed");
+        assert_eq!(entries[0].rollback_status, rollback_status::NONE);
+        assert_eq!(entries[0].duration_ms, 1234);
+    }
+
+    #[test]
+    fn provenance_audit_filters_by_worker_and_orders_newest_first() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager = HistoryManager::with_dir(temp_dir.path().join("history")).unwrap();
+
+        manager
+            .record_provenance_audit(&audit_record("css", 100))
+            .unwrap();
+        manager
+            .record_provenance_audit(&audit_record("hz1", 200))
+            .unwrap();
+        manager
+            .record_provenance_audit(&audit_record("css", 300))
+            .unwrap();
+
+        let css = manager.get_provenance_audit(10, Some("css")).unwrap();
+        assert_eq!(css.len(), 2);
+        // Newest first.
+        assert_eq!(css[0].deployed_at_unix_ms, 300);
+        assert_eq!(css[1].deployed_at_unix_ms, 100);
+
+        let all = manager.get_provenance_audit(10, None).unwrap();
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].deployed_at_unix_ms, 300);
+    }
+
+    #[test]
+    fn provenance_audit_does_not_pollute_deployment_history() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager = HistoryManager::with_dir(temp_dir.path().join("history")).unwrap();
+
+        // A provenance audit write must not appear in the deployment-history
+        // reader (separate JSONL files, separate schemas).
+        manager
+            .record_provenance_audit(&audit_record("css", 1))
+            .unwrap();
+        let deployments = manager.get_history(10, None).unwrap();
+        assert!(deployments.is_empty());
+    }
+
+    // A rejected verdict is recorded for audit even though the deploy is refused.
+    #[test]
+    fn provenance_audit_records_rejected_verdict() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager = HistoryManager::with_dir(temp_dir.path().join("history")).unwrap();
+
+        let triple = "x86_64-unknown-linux-musl";
+        let mut p = ArtifactProvenance::dev_artifact("rch-wkr", triple);
+        p.target_triple = "aarch64-apple-darwin".to_string();
+        let verdict = verify_artifact_provenance(
+            &p,
+            triple,
+            None,
+            SignatureCheck::Absent,
+            &ProvenancePolicy::dev_friendly(),
+        );
+        assert!(matches!(verdict, ProvenanceVerdict::Rejected { .. }));
+        let rec = FleetDeployAuditRecord::from_verdict(
+            "run-x",
+            "bd-x",
+            "css",
+            "ubuntu",
+            "/home/ubuntu/.local/bin/rch-wkr",
+            &p,
+            None,
+            7,
+            &verdict,
+            "operator",
+            "refused: wrong triple",
+        );
+        manager.record_provenance_audit(&rec).unwrap();
+        let entries = manager.get_provenance_audit(10, None).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].verification_status, "rejected");
+        assert_eq!(
+            entries[0].reason_code.as_deref(),
+            Some("provenance_wrong_target_triple")
+        );
     }
 
     #[test]

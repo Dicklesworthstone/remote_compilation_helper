@@ -10,6 +10,7 @@
 //! Backup failures are non-fatal and never block deployment.
 
 use crate::fleet::audit::AuditLogger;
+use crate::fleet::history::HistoryManager;
 use crate::fleet::plan::{DeploymentPlan, DeploymentStatus, DeploymentStrategy};
 use crate::fleet::progress::{DeployPhase, FleetProgress};
 use crate::fleet::rollback::{
@@ -22,6 +23,10 @@ use anyhow::Result;
 
 use crate::error::{FleetError, SshError};
 use futures::future::BoxFuture;
+use rch_common::fleet_provenance::{
+    ArtifactProvenance, FleetDeployAuditRecord, ProvenancePolicy, ProvenanceVerdict,
+    SignatureCheck, verify_artifact_provenance,
+};
 use rch_common::ssh_utils::shell_escape_path_with_home;
 use rch_common::{WorkerCapabilities, WorkerConfig, WorkerId};
 use serde::{Deserialize, Serialize};
@@ -29,7 +34,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
@@ -360,6 +365,11 @@ impl FleetExecutor {
         let style = ctx.theme();
         let is_json = ctx.is_json();
 
+        // Active release-provenance policy for this deploy run (bd-...-7.4).
+        // Resolved once; `ProvenancePolicy` is `Copy` so each spawned task gets
+        // its own copy.
+        let policy = resolve_provenance_policy();
+
         for idx in range.clone() {
             let permit = semaphore.clone().acquire_owned().await?;
             let worker_id = plan.workers[idx].worker_id.clone();
@@ -369,6 +379,9 @@ impl FleetExecutor {
             let progress = progress.clone();
             let worker_configs = self.worker_configs.clone();
             let local_binary = self.local_binary.clone();
+            // Correlation id for the provenance audit trail: the deployment plan
+            // id, shared across every worker in this run.
+            let run_id = plan.id.to_string();
 
             let handle = tokio::spawn(async move {
                 let _permit = permit;
@@ -406,9 +419,13 @@ impl FleetExecutor {
 
                 // Backup phase - create backup of current binary (best-effort, non-fatal)
                 // This runs before upload to capture the existing version
+                let mut previous_artifact_id: Option<String> = None;
                 if let Ok(mut rollback_manager) = RollbackManager::new() {
                     match backup_before_deploy(&worker_config, &mut rollback_manager).await {
                         Ok(Some(backup)) => {
+                            // Records the previously-installed artifact for the
+                            // provenance audit/rollback trail (bd-...-7.4).
+                            previous_artifact_id = Some(backup.version.clone());
                             debug!(
                                 worker = %worker_id,
                                 version = %backup.version,
@@ -433,6 +450,44 @@ impl FleetExecutor {
                 // a mismatch never overwrites the existing binary.
                 if let Err(e) = ensure_binary_matches_worker(&worker_config, &local_binary).await {
                     progress.worker_failed(&worker_id, &format!("{}", e)).await;
+                    return (idx, worker_id, false, DeploymentStatus::Failed);
+                }
+
+                // Release-provenance gate (bd-...-7.4): prove this is the
+                // intended artifact for this worker before transfer, and record
+                // the verdict to the append-only audit trail. Fails closed on a
+                // `Rejected` verdict (wrong triple / checksum mismatch / invalid
+                // or — under strict policy — missing signature), leaving the
+                // worker's existing binary untouched.
+                let gate_start = Instant::now();
+                let worker_triple = discover_worker_target_facts(&worker_config)
+                    .await
+                    .and_then(|facts| worker_target_triple(&facts));
+                let (verdict, provenance) =
+                    run_provenance_gate(&local_binary, worker_triple.as_deref(), &policy).await;
+                let mut audit = FleetDeployAuditRecord::from_verdict(
+                    run_id.clone(),
+                    PROVENANCE_BEAD_ID,
+                    worker_id.as_str(),
+                    worker_config.user.as_str(),
+                    REMOTE_WORKER_BINARY,
+                    &provenance,
+                    previous_artifact_id.clone(),
+                    now_unix_ms(),
+                    &verdict,
+                    "operator",
+                    provenance_detail(&verdict),
+                );
+                audit.set_duration_ms(
+                    u64::try_from(gate_start.elapsed().as_millis()).unwrap_or(u64::MAX),
+                );
+                persist_provenance_audit(&audit);
+
+                if !verdict.may_transfer() {
+                    let reason = verdict.reason_code().unwrap_or("provenance_rejected");
+                    progress
+                        .worker_failed(&worker_id, &format!("provenance gate rejected: {reason}"))
+                        .await;
                     return (idx, worker_id, false, DeploymentStatus::Failed);
                 }
 
@@ -926,6 +981,161 @@ async fn discover_worker_target_facts(worker: &WorkerConfig) -> Option<WorkerTar
         remote_user: worker.user.clone(),
         rch_wkr_path,
     })
+}
+
+// =============================================================================
+// Release-provenance verification gate
+// (bd-session-history-remediation-ocv9i.7.4)
+// =============================================================================
+//
+// Before a fleet `rch-wkr` binary is pushed to a worker, prove it is the
+// intended release artifact for that worker (target-triple match + expected
+// checksum + signature/provenance) under the active policy, and record the
+// verdict to an append-only audit trail. The pure decision logic lives in
+// `rch_common::fleet_provenance`; this module supplies the I/O: computing the
+// local checksum, running cosign verification, and reading a sidecar manifest.
+
+/// Owning bead for the provenance audit-trail records.
+const PROVENANCE_BEAD_ID: &str = "bd-session-history-remediation-ocv9i.7.4";
+
+/// Env var selecting the fleet provenance policy. `strict` => fail closed on a
+/// missing/invalid signature or an uncheckable checksum; unset/other =>
+/// dev-friendly (verify whatever material exists; allow an explicitly-noted dev
+/// artifact). Defaulting to dev-friendly keeps a fleet of locally-built binaries
+/// deploying (fail-open) while still auditing the dev-artifact reason.
+const FLEET_PROVENANCE_ENV: &str = "RCH_FLEET_PROVENANCE";
+
+/// Resolve the active provenance policy from the environment.
+fn resolve_provenance_policy() -> ProvenancePolicy {
+    ProvenancePolicy::from_env_value(std::env::var(FLEET_PROVENANCE_ENV).ok().as_deref())
+}
+
+/// Sidecar provenance manifest path for a local artifact:
+/// `<binary>.provenance.json`.
+fn provenance_manifest_path(local_binary: &Path) -> PathBuf {
+    let mut name = local_binary.as_os_str().to_os_string();
+    name.push(".provenance.json");
+    PathBuf::from(name)
+}
+
+/// Load the artifact provenance for `local_binary`. Prefers a sidecar
+/// `<binary>.provenance.json` manifest (release deploy); falls back to a
+/// dev-artifact record targeting `fallback_triple` (a locally-built fleet
+/// binary with no release manifest).
+fn load_artifact_provenance(local_binary: &Path, fallback_triple: &str) -> ArtifactProvenance {
+    let manifest = provenance_manifest_path(local_binary);
+    match std::fs::read(&manifest) {
+        Ok(bytes) => match serde_json::from_slice::<ArtifactProvenance>(&bytes) {
+            Ok(provenance) => return provenance,
+            Err(e) => warn!(
+                path = %manifest.display(),
+                error = %e,
+                "provenance manifest present but unparseable; treating as dev artifact"
+            ),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => warn!(
+            path = %manifest.display(),
+            error = %e,
+            "could not read provenance manifest; treating as dev artifact"
+        ),
+    }
+    let name = local_binary
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("rch-wkr")
+        .to_string();
+    ArtifactProvenance::dev_artifact(name, fallback_triple)
+}
+
+/// Evaluate the artifact's signature material against the local binary. No
+/// material => `Absent`; a declared bundle that verifies => `Valid`; a declared
+/// bundle that fails to verify (including cosign unavailable) => `Invalid`, so a
+/// signed-but-unverifiable artifact fails closed.
+async fn evaluate_signature_check(
+    provenance: &ArtifactProvenance,
+    local_binary: &Path,
+) -> SignatureCheck {
+    let Some(sig) = provenance.signature.as_ref() else {
+        return SignatureCheck::Absent;
+    };
+    let bundle = PathBuf::from(&sig.bundle_ref);
+    match crate::update::verify::verify_signature(local_binary, &bundle).await {
+        Ok(true) => SignatureCheck::Valid,
+        Ok(false) => SignatureCheck::Invalid,
+        Err(e) => {
+            warn!(
+                bundle = %sig.bundle_ref,
+                error = %e,
+                "signature verification failed; treating as invalid (fail closed)"
+            );
+            SignatureCheck::Invalid
+        }
+    }
+}
+
+/// Run the full provenance gate for `local_binary` against `worker_triple` under
+/// `policy`, returning the verdict and the resolved provenance. Computes the
+/// local checksum and evaluates the signature as side effects; the decision
+/// itself is the pure [`verify_artifact_provenance`].
+///
+/// When `worker_triple` is `None` (the platform could not be discovered), the
+/// artifact is judged against its own declared triple so an undiscoverable
+/// platform cannot cause a false `WRONG_TARGET_TRIPLE` rejection — the checksum
+/// and signature gates still apply.
+async fn run_provenance_gate(
+    local_binary: &Path,
+    worker_triple: Option<&str>,
+    policy: &ProvenancePolicy,
+) -> (ProvenanceVerdict, ArtifactProvenance) {
+    let fallback = worker_triple.unwrap_or("unknown");
+    let provenance = load_artifact_provenance(local_binary, fallback);
+    let actual_sha = local_file_sha256_hex(local_binary).ok();
+    let signature_check = evaluate_signature_check(&provenance, local_binary).await;
+    let effective_triple =
+        worker_triple.map_or_else(|| provenance.target_triple.clone(), str::to_string);
+    let verdict = verify_artifact_provenance(
+        &provenance,
+        &effective_triple,
+        actual_sha.as_deref(),
+        signature_check,
+        policy,
+    );
+    (verdict, provenance)
+}
+
+/// Human-readable audit detail for a provenance verdict.
+fn provenance_detail(verdict: &ProvenanceVerdict) -> String {
+    match verdict {
+        ProvenanceVerdict::Verified => "artifact provenance verified".to_string(),
+        ProvenanceVerdict::DevArtifactAllowed { reason } => reason.clone(),
+        ProvenanceVerdict::Rejected { detail, .. } => detail.clone(),
+    }
+}
+
+/// Best-effort persistence of a provenance audit record. A failure to write the
+/// audit trail must never fail a deploy, so errors are logged and swallowed.
+fn persist_provenance_audit(record: &FleetDeployAuditRecord) {
+    match HistoryManager::new() {
+        Ok(history) => {
+            if let Err(e) = history.record_provenance_audit(record) {
+                warn!(
+                    worker = %record.worker_id,
+                    error = %e,
+                    "failed to persist provenance audit record"
+                );
+            }
+        }
+        Err(e) => warn!(error = %e, "failed to open history manager for provenance audit"),
+    }
+}
+
+/// Current wall-clock time as Unix epoch milliseconds (saturating to 0 before
+/// the epoch, which cannot happen in practice).
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 /// Refuse to deploy a binary whose OS/arch is incompatible with the worker.
@@ -2495,5 +2705,231 @@ mod tests {
 
         assert!(result.is_none(), "unsafe version must skip the backup");
         assert!(manager.get_latest_backup(&worker.id.0).is_none());
+    }
+
+    // ========================
+    // Release-provenance gate tests (bd-...-ocv9i.7.4)
+    // ========================
+
+    use rch_common::fleet_provenance::{SignatureMaterial, reason_code};
+
+    const TEST_TRIPLE: &str = "x86_64-unknown-linux-musl";
+
+    /// Write a fake binary into a temp dir and return (dir, path).
+    fn fake_binary(content: &[u8]) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rch-wkr");
+        std::fs::write(&path, content).unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn provenance_manifest_path_appends_suffix() {
+        let p = provenance_manifest_path(Path::new("/tmp/rch-wkr"));
+        assert_eq!(p, PathBuf::from("/tmp/rch-wkr.provenance.json"));
+    }
+
+    #[test]
+    fn provenance_detail_renders_each_verdict() {
+        assert_eq!(
+            provenance_detail(&ProvenanceVerdict::Verified),
+            "artifact provenance verified"
+        );
+        assert_eq!(
+            provenance_detail(&ProvenanceVerdict::DevArtifactAllowed {
+                reason: "because dev".to_string()
+            }),
+            "because dev"
+        );
+        assert_eq!(
+            provenance_detail(&ProvenanceVerdict::Rejected {
+                reason_code: reason_code::CHECKSUM_MISMATCH.to_string(),
+                detail: "bad hash".to_string()
+            }),
+            "bad hash"
+        );
+    }
+
+    #[test]
+    fn load_artifact_provenance_falls_back_to_dev_artifact() {
+        let (_dir, bin) = fake_binary(b"hello");
+        let prov = load_artifact_provenance(&bin, TEST_TRIPLE);
+        assert_eq!(prov.target_triple, TEST_TRIPLE);
+        assert_eq!(prov.artifact_id, "rch-wkr");
+        assert!(prov.expected_sha256.is_none());
+        assert!(prov.signature.is_none());
+        assert!(prov.release_id.is_none());
+    }
+
+    #[test]
+    fn load_artifact_provenance_reads_sidecar_manifest() {
+        let (_dir, bin) = fake_binary(b"hello");
+        let manifest = ArtifactProvenance {
+            artifact_id: "rch-wkr-v1.0.42".to_string(),
+            release_id: Some("v1.0.42".to_string()),
+            target_triple: "aarch64-apple-darwin".to_string(),
+            expected_sha256: Some("deadbeef".to_string()),
+            signature: Some(SignatureMaterial {
+                bundle_ref: "/nonexistent/bundle.json".to_string(),
+                identity_pattern: "^https://example$".to_string(),
+            }),
+            builder_identity: Some("ci".to_string()),
+            expected_protocol_version: Some(2),
+        };
+        std::fs::write(
+            provenance_manifest_path(&bin),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        // The fallback triple is ignored when a manifest is present.
+        let loaded = load_artifact_provenance(&bin, TEST_TRIPLE);
+        assert_eq!(loaded, manifest);
+    }
+
+    #[test]
+    fn load_artifact_provenance_unparseable_manifest_falls_back() {
+        let (_dir, bin) = fake_binary(b"hello");
+        std::fs::write(provenance_manifest_path(&bin), b"{ not json").unwrap();
+        let prov = load_artifact_provenance(&bin, TEST_TRIPLE);
+        assert_eq!(prov.target_triple, TEST_TRIPLE);
+        assert!(prov.expected_sha256.is_none());
+    }
+
+    // Scenario: local development artifact policy — a locally-built binary with
+    // no manifest is allowed under the dev-friendly default, with an explicit
+    // recorded reason.
+    #[tokio::test]
+    async fn gate_dev_artifact_under_dev_friendly_is_allowed() {
+        let (_dir, bin) = fake_binary(b"a local dev binary");
+        let (verdict, prov) =
+            run_provenance_gate(&bin, Some(TEST_TRIPLE), &ProvenancePolicy::dev_friendly()).await;
+        assert!(verdict.may_transfer());
+        assert_eq!(verdict.verification_status(), "dev_allowed");
+        assert_eq!(prov.target_triple, TEST_TRIPLE);
+    }
+
+    // Scenario: missing material under STRICT policy fails closed (the deploy
+    // path would refuse the transfer).
+    #[tokio::test]
+    async fn gate_dev_artifact_under_strict_is_rejected() {
+        let (_dir, bin) = fake_binary(b"a local dev binary");
+        let (verdict, _prov) =
+            run_provenance_gate(&bin, Some(TEST_TRIPLE), &ProvenancePolicy::STRICT).await;
+        assert!(!verdict.may_transfer());
+        // STRICT requires a checksum first; a dev artifact has none.
+        assert_eq!(verdict.reason_code(), Some(reason_code::CHECKSUM_MISSING));
+    }
+
+    // Scenario: a manifest whose expected checksum matches the artifact verifies
+    // even without a signature under dev-friendly policy.
+    #[tokio::test]
+    async fn gate_manifest_matching_checksum_is_verified() {
+        let (_dir, bin) = fake_binary(b"release artifact bytes");
+        let sha = local_file_sha256_hex(&bin).unwrap();
+        let manifest = ArtifactProvenance {
+            artifact_id: "rch-wkr-v1.0.42".to_string(),
+            release_id: Some("v1.0.42".to_string()),
+            target_triple: TEST_TRIPLE.to_string(),
+            expected_sha256: Some(sha),
+            signature: None,
+            builder_identity: Some("github-actions".to_string()),
+            expected_protocol_version: Some(1),
+        };
+        std::fs::write(
+            provenance_manifest_path(&bin),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let (verdict, _prov) =
+            run_provenance_gate(&bin, Some(TEST_TRIPLE), &ProvenancePolicy::dev_friendly()).await;
+        assert_eq!(verdict, ProvenanceVerdict::Verified);
+    }
+
+    // Scenario: a manifest declaring a checksum that does NOT match the artifact
+    // fails closed (truncated/tampered transfer).
+    #[tokio::test]
+    async fn gate_manifest_checksum_mismatch_is_rejected() {
+        let (_dir, bin) = fake_binary(b"release artifact bytes");
+        let manifest = ArtifactProvenance {
+            artifact_id: "rch-wkr-v1.0.42".to_string(),
+            release_id: Some("v1.0.42".to_string()),
+            target_triple: TEST_TRIPLE.to_string(),
+            expected_sha256: Some(
+                "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+            ),
+            signature: None,
+            builder_identity: None,
+            expected_protocol_version: None,
+        };
+        std::fs::write(
+            provenance_manifest_path(&bin),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let (verdict, _prov) =
+            run_provenance_gate(&bin, Some(TEST_TRIPLE), &ProvenancePolicy::dev_friendly()).await;
+        assert_eq!(verdict.reason_code(), Some(reason_code::CHECKSUM_MISMATCH));
+        assert!(!verdict.may_transfer());
+    }
+
+    // Scenario: wrong target triple — a manifest built for a different platform
+    // than the worker is refused regardless of checksum.
+    #[tokio::test]
+    async fn gate_wrong_target_triple_is_rejected() {
+        let (_dir, bin) = fake_binary(b"release artifact bytes");
+        let sha = local_file_sha256_hex(&bin).unwrap();
+        let manifest = ArtifactProvenance {
+            artifact_id: "rch-wkr".to_string(),
+            release_id: None,
+            target_triple: "aarch64-apple-darwin".to_string(),
+            expected_sha256: Some(sha),
+            signature: None,
+            builder_identity: None,
+            expected_protocol_version: None,
+        };
+        std::fs::write(
+            provenance_manifest_path(&bin),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        // Worker is linux/musl, artifact targets macOS => rejected.
+        let (verdict, _prov) =
+            run_provenance_gate(&bin, Some(TEST_TRIPLE), &ProvenancePolicy::dev_friendly()).await;
+        assert_eq!(
+            verdict.reason_code(),
+            Some(reason_code::WRONG_TARGET_TRIPLE)
+        );
+        assert!(!verdict.may_transfer());
+    }
+
+    // When the worker triple is undiscoverable, a manifest artifact is judged
+    // against its own declared triple (no false WRONG_TARGET_TRIPLE), with the
+    // checksum still gating.
+    #[tokio::test]
+    async fn gate_unknown_worker_triple_judges_on_checksum() {
+        let (_dir, bin) = fake_binary(b"release artifact bytes");
+        let sha = local_file_sha256_hex(&bin).unwrap();
+        let manifest = ArtifactProvenance {
+            artifact_id: "rch-wkr".to_string(),
+            release_id: None,
+            target_triple: "aarch64-apple-darwin".to_string(),
+            expected_sha256: Some(sha),
+            signature: None,
+            builder_identity: None,
+            expected_protocol_version: None,
+        };
+        std::fs::write(
+            provenance_manifest_path(&bin),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let (verdict, _prov) =
+            run_provenance_gate(&bin, None, &ProvenancePolicy::dev_friendly()).await;
+        assert_eq!(verdict, ProvenanceVerdict::Verified);
     }
 }
