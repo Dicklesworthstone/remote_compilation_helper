@@ -24,9 +24,9 @@ use std::collections::HashMap;
 // `TimingEstimate`) is currently exercised only by unit tests — those
 // items keep `#[allow(dead_code)]` until production callers materialize.
 //
-// `MAX_TIMING_SAMPLES` bounds the per-project sample list (used at line
-// 1441). `MAX_TIMING_PROJECTS` bounds the project-keyed map for
-// LRU-eviction (used at line 1618).
+// `MAX_TIMING_SAMPLES` bounds the per-project sample ring buffer (enforced in
+// `ProjectTimingData::add_sample`). `MAX_TIMING_PROJECTS` bounds the
+// project-keyed map for LRU-eviction (enforced in `TimingHistory::record`).
 pub(super) const MAX_TIMING_SAMPLES: usize = 20;
 
 const MAX_TIMING_PROJECTS: usize = 500;
@@ -150,7 +150,7 @@ pub(super) struct TimingHistory {
 /// the in-memory copy and write through to disk on update.
 ///
 /// Consumers (live as of t19 close): two `record_build_timing` call sites
-/// in `run_classification_remote_path`. The estimator surface
+/// in `hook::handle_selection_response`. The estimator surface
 /// (`estimate_timing_for_build`, `TimingEstimate`) is currently exercised
 /// only by unit tests; those keep their `#[allow(dead_code)]` annotation
 /// until a production consumer wires them up.

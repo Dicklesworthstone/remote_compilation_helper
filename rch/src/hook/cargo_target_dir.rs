@@ -27,7 +27,8 @@
 //! It reaches its support layer from the parent via `use super::*`: `HookReporter`,
 //! the `rch_common` types (`CompilationKind`, `WorkerId`, `ToolchainInfo`,
 //! `pooled_target_key::*`), the `RCH_DISABLE_TARGET_REUSE_ENV` const, and the
-//! parent helpers `parse_command_tokens` / `join_exec_command` / `detect_target_label`.
+//! parent helpers `parse_command_tokens` / `join_exec_command`. `detect_target_label`
+//! is imported directly from the sibling `super::formatting` module.
 //!
 //! Items consumed by the parent (`run_hook` / `run_exec` call
 //! `resolve_forwarded_cargo_target_dir` + `rewrite_cargo_target_dir_command_for_remote`,
