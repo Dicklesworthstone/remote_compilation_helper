@@ -21,6 +21,11 @@
 //! stays `pub(super)` for the hook test suite; the two daemon-IPC POST helpers
 //! are private to this module.
 
+use super::dependency_closure::{
+    SyncClosureMode, SyncClosurePlanEntry, SyncRootOutcome, build_sync_closure_manifest,
+    build_sync_closure_plan, merge_sync_result, verify_remote_dependency_manifests,
+    workspace_metadata_sync_patterns,
+};
 use super::progress_reporting::{BuildHeartbeatLoop, mark_heartbeat_progress};
 use super::repo_updater::maybe_sync_repo_set_with_repo_updater;
 use super::ssh::ensure_worker_projects_topology;
