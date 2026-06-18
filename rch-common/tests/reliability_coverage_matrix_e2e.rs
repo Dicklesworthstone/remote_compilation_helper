@@ -1143,6 +1143,85 @@ fn build_coverage_matrix() -> CoverageMatrix {
             has_log_assertion: true,
             gap: None,
         },
+        // ---------------------------------------------------------------
+        // Domain: Release provenance + signature/checksum + deploy audit
+        // (epic ocv9i.7, bead .7.4)
+        // ---------------------------------------------------------------
+        RequirementRow {
+            id: "REQ-FLEET-003".into(),
+            description: "Release provenance and signature/checksum verification gate fleet binary \
+                          deploys BEFORE transfer: target-triple match, expected-checksum match, \
+                          and signature validity are checked under a policy. A wrong-triple, \
+                          checksum-mismatch, invalid-signature, or (under strict policy) \
+                          missing-signature/checksum artifact is REJECTED fail-closed with a stable \
+                          provenance_* reason_code; an artifact with no material is allowed only \
+                          when policy permits a dev artifact, recording an explicit reason. A \
+                          FleetDeployAuditRecord captures run_id, bead_id, worker_id, remote \
+                          user/path, artifact/release id, target_triple, previous artifact, \
+                          verification_status, rollback_status, reason_code, trigger, and detail."
+                .into(),
+            domain: "fleet_update".into(),
+            bead_id: "bd-session-history-remediation-ocv9i.7.4".into(),
+            test_refs: vec![
+                TestRef {
+                    // Pure verification verdicts: verified / dev-allowed / rejected.
+                    file: "../src/fleet_provenance.rs".into(),
+                    name_prefix: "good_signature".into(),
+                    tier: "smoke".into(),
+                },
+                TestRef {
+                    file: "../src/fleet_provenance.rs".into(),
+                    name_prefix: "checksum_mismatch".into(),
+                    tier: "smoke".into(),
+                },
+                TestRef {
+                    file: "../src/fleet_provenance.rs".into(),
+                    name_prefix: "wrong_target_triple".into(),
+                    tier: "smoke".into(),
+                },
+                TestRef {
+                    file: "../src/fleet_provenance.rs".into(),
+                    name_prefix: "dev_artifact".into(),
+                    tier: "smoke".into(),
+                },
+                TestRef {
+                    // Deploy audit record shape + serde stability.
+                    file: "../src/fleet_provenance.rs".into(),
+                    name_prefix: "audit_record".into(),
+                    tier: "smoke".into(),
+                },
+            ],
+            artifact_assertions: vec![
+                "Target triple is the highest-priority gate: a wrong-triple artifact is rejected \
+                 even with a valid signature (fleet_provenance::wrong_target_triple_is_rejected_even_with_valid_signature)"
+                    .into(),
+                "Checksum mismatch -> Rejected{provenance_checksum_mismatch}; case-insensitive match \
+                 -> Verified (fleet_provenance::checksum_mismatch_is_rejected, \
+                 checksum_comparison_is_case_insensitive, checksum_only_match_is_verified)"
+                    .into(),
+                "Signature: invalid -> Rejected{provenance_signature_invalid} under any policy; \
+                 missing under STRICT -> Rejected{provenance_signature_missing}; good signature -> \
+                 Verified (fleet_provenance::invalid_signature_is_rejected_under_any_policy, \
+                 missing_signature_under_strict_policy_is_rejected, good_signature_and_checksum_is_verified)"
+                    .into(),
+                "Dev artifact with no material -> DevArtifactAllowed{explicit reason} under \
+                 dev-friendly policy, but Rejected{provenance_unverifiable} when dev artifacts are \
+                 forbidden; require_checksum with nothing to compare -> Rejected{provenance_checksum_missing} \
+                 (fleet_provenance::dev_artifact_is_allowed_with_explicit_reason, \
+                 dev_artifact_without_allowance_is_unverifiable, require_checksum_without_value_is_rejected)"
+                    .into(),
+                "FleetDeployAuditRecord carries verification_status/rollback_status/reason_code + \
+                 previous_artifact_id and survives a serde roundtrip; verdict serializes with a stable \
+                 snake_case status tag; schema component FleetDeployAudit is version-pinned 1.0.0 \
+                 (fleet_provenance::audit_record_from_verdict_carries_status_and_reason, \
+                 audit_record_serde_roundtrip_is_stable, verdict_is_tagged_with_snake_case_status, \
+                 schema_version_is_pinned)"
+                    .into(),
+            ],
+            has_executable_test: true,
+            has_log_assertion: true,
+            gap: None,
+        },
     ];
 
     let total = requirements.len();

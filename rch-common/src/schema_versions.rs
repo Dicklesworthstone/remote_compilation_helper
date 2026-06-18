@@ -63,6 +63,9 @@ pub enum SchemaComponent {
     /// Canonical placement / visibility / strict-remote control plan
     /// (`rch diagnose` placement surface + `rch exec` control state).
     PlacementPlan,
+    /// Fleet binary deploy audit record: release provenance, verification
+    /// status, and rollback trail (`rch fleet deploy` audit log).
+    FleetDeployAudit,
 }
 
 /// The canonical version string for a given component.
@@ -85,6 +88,7 @@ pub const fn current_version(component: SchemaComponent) -> &'static str {
         SchemaComponent::RedactionPolicy => "1.0.0",
         SchemaComponent::RemediationView => "1.0.0",
         SchemaComponent::PlacementPlan => "1.0.0",
+        SchemaComponent::FleetDeployAudit => "1.0.0",
     }
 }
 
@@ -139,6 +143,10 @@ pub const ALL_COMPONENTS: &[(SchemaComponent, &str)] = &[
         SchemaComponent::PlacementPlan,
         current_version(SchemaComponent::PlacementPlan),
     ),
+    (
+        SchemaComponent::FleetDeployAudit,
+        current_version(SchemaComponent::FleetDeployAudit),
+    ),
 ];
 
 #[cfg(test)]
@@ -165,6 +173,7 @@ mod tests {
         (SchemaComponent::RedactionPolicy, "1.0.0"),
         (SchemaComponent::RemediationView, "1.0.0"),
         (SchemaComponent::PlacementPlan, "1.0.0"),
+        (SchemaComponent::FleetDeployAudit, "1.0.0"),
     ];
 
     #[test]

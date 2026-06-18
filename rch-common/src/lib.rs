@@ -33,6 +33,7 @@ pub mod exec_misuse;
 pub mod exec_policy;
 pub mod exec_response;
 pub mod fleet_diff;
+pub mod fleet_provenance;
 pub mod fleet_status;
 pub mod force_resync;
 pub mod hooks;
