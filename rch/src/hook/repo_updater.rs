@@ -18,14 +18,16 @@
 //!
 //! It reaches everything it needs from the parent via `use super::*`: the
 //! `RepoUpdater*` contract types and `REPO_UPDATER_*` consts (re-exported from
-//! `rch_common` in `hook.rs`), the shared SSH helper `run_worker_ssh_command`,
-//! the sync-root detection helpers (`collect_repo_updater_roots_and_specs`,
-//! `detect_dirty_sync_roots`, `detect_remote_unsuitable_sync_roots`,
-//! `should_skip_remote_preflight`) and their `RepoUpdaterSyncRoots` carrier,
-//! and `HookReporter`. Only the six symbols consumed from outside the moved set
-//! (`execute_remote_compilation` and the hook test suite) are `pub(super)`;
-//! everything else stays private to this module.
+//! `rch_common` in `hook.rs`) and `HookReporter`. The shared SSH primitives it
+//! drives (`run_offload_ssh_command`, `should_skip_remote_preflight`) live in
+//! the sibling `ssh` submodule and are imported explicitly below. The sync-root
+//! detection helpers (`collect_repo_updater_roots_and_specs`,
+//! `detect_dirty_sync_roots`, `detect_remote_unsuitable_sync_roots`) and their
+//! `RepoUpdaterSyncRoots` carrier are local to this module. Only the symbols
+//! consumed from outside the moved set (`execute_remote_compilation` and the
+//! hook test suite) are `pub(super)`; everything else stays private.
 
+use super::ssh::{run_offload_ssh_command, should_skip_remote_preflight};
 use super::*;
 
 fn repo_updater_timeout_for(
@@ -158,7 +160,8 @@ async fn execute_repo_updater_command(
                 .min(retry_policy.max_backoff_ms);
         }
 
-        match run_worker_ssh_command(worker, &remote_cmd, Duration::from_secs(timeout_secs)).await {
+        match run_offload_ssh_command(worker, &remote_cmd, Duration::from_secs(timeout_secs)).await
+        {
             Ok(output) if output.status.success() => {
                 if attempt > 0 {
                     reporter.verbose(&format!(
@@ -799,7 +802,7 @@ async fn detect_remote_unsuitable_sync_roots(
         let escaped_root = shell_escape::escape(root.to_string_lossy()).to_string();
         let command = format!("git -C {escaped_root} status --porcelain");
 
-        match run_worker_ssh_command(worker, &command, Duration::from_secs(10)).await {
+        match run_offload_ssh_command(worker, &command, Duration::from_secs(10)).await {
             Ok(output) if output.status.success() => {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 if !stdout.trim().is_empty() {

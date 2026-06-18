@@ -8,12 +8,13 @@
 //! that forward the collected `WorkerTelemetry` / `TestRunRecord` back to the
 //! local daemon).
 //!
-//! It reaches its support layer from the parent via `use super::*`: the shared
-//! SSH primitives (`run_worker_ssh_command`, `ensure_worker_projects_topology`,
-//! `should_skip_remote_preflight`), the sync-topology / dependency-manifest
-//! helpers, `HookReporter`, and the `rch_common` types/consts. The build
+//! It reaches its support layer from the parent via `use super::*`: the
+//! sync-topology / dependency-manifest helpers, `HookReporter`, and the
+//! `rch_common` types/consts. The offload SSH primitives now live in the sibling
+//! `ssh` submodule — this module drives the remote topology preflight via
+//! `ensure_worker_projects_topology`, imported explicitly below. The build
 //! heartbeat (`progress_reporting`) and the repo_updater pre-sync entry point
-//! (`repo_updater`) live in sibling submodules and are imported explicitly below.
+//! (`repo_updater`) likewise live in sibling submodules and are imported below.
 //!
 //! `execute_remote_compilation` is `pub(super)` (its only non-test callers,
 //! `run_hook`/`run_exec`, are re-exported into `hook`); `wrap_command_with_telemetry`
@@ -22,6 +23,7 @@
 
 use super::progress_reporting::{BuildHeartbeatLoop, mark_heartbeat_progress};
 use super::repo_updater::maybe_sync_repo_set_with_repo_updater;
+use super::ssh::ensure_worker_projects_topology;
 use super::*;
 
 pub(super) fn wrap_command_with_telemetry(command: &str, worker_id: &WorkerId) -> String {
