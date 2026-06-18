@@ -1071,6 +1071,78 @@ fn build_coverage_matrix() -> CoverageMatrix {
             has_log_assertion: true,
             gap: None,
         },
+        // ---------------------------------------------------------------
+        // Domain: OS/arch-aware fleet update + post-deploy validation
+        // (epic ocv9i.7)
+        // ---------------------------------------------------------------
+        RequirementRow {
+            id: "REQ-FLEET-002".into(),
+            description: "OS/arch-aware post-deploy validation runs against the EXACT remote \
+                          user/path RCH invokes (never root / login-default / bare PATH-resolved \
+                          rch-wkr): probes `uname`/`file`/`--version`, a liveness handshake, and a \
+                          capabilities/protocol-JSON handshake. A wrong-OS/arch binary \
+                          (`Exec format error`) is marked not eligible with reason_code \
+                          `os_arch_mismatch`; a version-skewed/corrupt binary that runs but cannot \
+                          emit parseable WorkerCapabilities JSON is marked not eligible with \
+                          `capabilities_handshake_failed`; any other non-zero exit is \
+                          `post_deploy_validation_failed`. Covers the Darwin-controller -> \
+                          Linux-worker regression."
+                .into(),
+            domain: "fleet_update".into(),
+            bead_id: "bd-session-history-remediation-ocv9i.7.3".into(),
+            test_refs: vec![
+                TestRef {
+                    // Exact-path command builders (uname/file/--version, health,
+                    // capabilities) — all shell-escaped to $HOME.
+                    file: "../../rch/src/fleet/executor.rs".into(),
+                    name_prefix: "post_deploy_".into(),
+                    tier: "smoke".into(),
+                },
+                TestRef {
+                    // Exact-path / liveness classifier: Exec format error ->
+                    // os_arch_mismatch; generic non-zero -> validation failure.
+                    file: "../../rch/src/fleet/executor.rs".into(),
+                    name_prefix: "classify_post_deploy".into(),
+                    tier: "smoke".into(),
+                },
+                TestRef {
+                    // Capabilities/protocol handshake classifier: unparseable JSON
+                    // -> capabilities_handshake_failed; Exec format error ->
+                    // os_arch_mismatch; valid JSON (incl. {}) -> eligible.
+                    file: "../../rch/src/fleet/executor.rs".into(),
+                    name_prefix: "capabilities_handshake_".into(),
+                    tier: "smoke".into(),
+                },
+            ],
+            artifact_assertions: vec![
+                "Exact-path probes are shell-escaped to $HOME, never a bare PATH-resolved rch-wkr \
+                 (executor::post_deploy_validation_runs_the_exact_quoted_path, \
+                 post_deploy_capabilities_command_runs_the_exact_quoted_path, \
+                 post_deploy_health_command_runs_the_exact_quoted_path)"
+                    .into(),
+                "Exec format error (exit 126 or kernel message) -> NotEligible{os_arch_mismatch} on \
+                 both the --version and capabilities probes — the Darwin->Linux regression \
+                 (executor::classify_post_deploy_marks_exec_format_ineligible, \
+                 capabilities_handshake_exec_format_is_os_arch_mismatch)"
+                    .into(),
+                "Binary that runs but emits unparseable WorkerCapabilities JSON -> \
+                 NotEligible{capabilities_handshake_failed}; valid JSON incl. all-defaults {} -> \
+                 Eligible (executor::capabilities_handshake_unparseable_json_is_ineligible, \
+                 capabilities_handshake_valid_json_is_eligible)"
+                    .into(),
+                "Generic non-zero exit -> NotEligible{post_deploy_validation_failed} \
+                 (executor::classify_post_deploy_generic_failure_and_success, \
+                 capabilities_handshake_nonzero_exit_is_generic_failure)"
+                    .into(),
+                "Structured ineligibility log fields worker/step/reason_code/detail where step is \
+                 exact_path_version|health|capabilities_handshake \
+                 (executor::verify_installation warn!/info! tracing)"
+                    .into(),
+            ],
+            has_executable_test: true,
+            has_log_assertion: true,
+            gap: None,
+        },
     ];
 
     let total = requirements.len();

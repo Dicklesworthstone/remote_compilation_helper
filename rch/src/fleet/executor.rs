@@ -23,7 +23,7 @@ use anyhow::Result;
 use crate::error::{FleetError, SshError};
 use futures::future::BoxFuture;
 use rch_common::ssh_utils::shell_escape_path_with_home;
-use rch_common::{WorkerConfig, WorkerId};
+use rch_common::{WorkerCapabilities, WorkerConfig, WorkerId};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -1138,8 +1138,74 @@ fn classify_post_deploy(exit_code: i32, stderr: &str) -> PostDeployEligibility {
     PostDeployEligibility::Eligible
 }
 
+/// Build the post-deploy liveness command. Runs the EXACT remote path's
+/// `health` subcommand (shell-escaped to `$HOME`, never the bare PATH-resolved
+/// `rch-wkr`) so the binary RCH actually invokes is the one probed.
+fn post_deploy_health_command(remote_path: &str) -> Result<String> {
+    let p = remote_shell_path(remote_path)?;
+    Ok(format!("{p} health"))
+}
+
+/// Build the post-deploy capabilities / protocol-handshake command. Runs the
+/// EXACT remote path's `capabilities` subcommand (shell-escaped to `$HOME`) so a
+/// wrong-OS/arch binary surfaces as an `Exec format error` and a
+/// protocol-incompatible (version-skewed / corrupt) binary surfaces as
+/// non-parseable JSON on stdout.
+fn post_deploy_capabilities_command(remote_path: &str) -> Result<String> {
+    let p = remote_shell_path(remote_path)?;
+    Ok(format!("{p} capabilities"))
+}
+
+/// Classify the result of the capabilities / protocol handshake. The deployed
+/// binary must both (a) run cleanly (no `Exec format error`, zero exit) and
+/// (b) emit a parseable `WorkerCapabilities` JSON document on stdout. A binary
+/// that runs but cannot produce valid protocol JSON is marked not eligible with
+/// a stable `capabilities_handshake_failed` reason code — this catches a
+/// version-skewed or corrupt binary that survives `--version` but cannot speak
+/// the daemon protocol. The exact-path classifier remains the single source of
+/// truth for the `Exec format error` / non-zero-exit cases.
+fn classify_capabilities_handshake(
+    exit_code: i32,
+    stdout: &str,
+    stderr: &str,
+) -> PostDeployEligibility {
+    match classify_post_deploy(exit_code, stderr) {
+        PostDeployEligibility::Eligible => {}
+        not_eligible => return not_eligible,
+    }
+    match serde_json::from_str::<WorkerCapabilities>(stdout.trim()) {
+        Ok(_) => PostDeployEligibility::Eligible,
+        Err(e) => PostDeployEligibility::NotEligible {
+            reason_code: "capabilities_handshake_failed",
+            detail: format!(
+                "deployed rch-wkr ran but did not emit parseable WorkerCapabilities JSON \
+                 (protocol handshake failed: {e})"
+            ),
+        },
+    }
+}
+
 async fn verify_installation(worker: &WorkerConfig) -> Result<()> {
     let ssh = SshExecutor::new(worker);
+    let worker_id = worker.id.as_str();
+
+    // Log the ineligible outcome with structured fields (worker, step, stable
+    // reason code, detail) and build the deploy-failing error carrying the
+    // reason code for incident/proof/admission surfaces.
+    let ineligible =
+        |step: &'static str, reason_code: &'static str, detail: String| -> anyhow::Error {
+            warn!(
+                worker = worker_id,
+                step,
+                reason_code,
+                detail = %detail,
+                "post-deploy validation marked worker ineligible"
+            );
+            FleetError::HealthCheckFailed {
+                reason: format!("[{reason_code}] {detail}"),
+            }
+            .into()
+        };
 
     // 1. Exact user/path validation (bd-...-7.3): run `<exact path> --version`
     //    (+ uname/file) as the worker user. An Exec format error here marks the
@@ -1155,15 +1221,13 @@ async fn verify_installation(worker: &WorkerConfig) -> Result<()> {
         detail,
     } = classify_post_deploy(validation.exit_code, &validation.stderr)
     {
-        return Err(FleetError::HealthCheckFailed {
-            reason: format!("[{reason_code}] {detail}"),
-        }
-        .into());
+        return Err(ineligible("exact_path_version", reason_code, detail));
     }
 
-    // 2. Protocol handshake via the same exact path.
+    // 2. Liveness handshake via the same EXACT path.
+    let health_cmd = post_deploy_health_command(REMOTE_WORKER_BINARY)?;
     let output = ssh
-        .run_command("~/.local/bin/rch-wkr health")
+        .run_command(&health_cmd)
         .await
         .map_err(|e| anyhow::anyhow!("health check failed: {}", e))?;
 
@@ -1174,10 +1238,7 @@ async fn verify_installation(worker: &WorkerConfig) -> Result<()> {
             detail,
         } = classify_post_deploy(output.exit_code, stderr)
         {
-            return Err(FleetError::HealthCheckFailed {
-                reason: format!("[{reason_code}] {detail}"),
-            }
-            .into());
+            return Err(ineligible("health", reason_code, detail));
         }
         return Err(FleetError::HealthCheckFailed {
             reason: stderr.to_string(),
@@ -1185,6 +1246,28 @@ async fn verify_installation(worker: &WorkerConfig) -> Result<()> {
         .into());
     }
 
+    // 3. Capabilities / protocol handshake via the same EXACT path (bd-...-7.3):
+    //    the binary must emit parseable WorkerCapabilities JSON, proving it both
+    //    runs and speaks the daemon protocol. A version-skewed/corrupt binary
+    //    that passes `--version` but cannot produce protocol JSON is marked not
+    //    eligible with a stable reason code for incident/proof/admission.
+    let capabilities_cmd = post_deploy_capabilities_command(REMOTE_WORKER_BINARY)?;
+    let caps = ssh
+        .run_command(&capabilities_cmd)
+        .await
+        .map_err(|e| anyhow::anyhow!("capabilities handshake failed: {}", e))?;
+    if let PostDeployEligibility::NotEligible {
+        reason_code,
+        detail,
+    } = classify_capabilities_handshake(caps.exit_code, &caps.stdout, &caps.stderr)
+    {
+        return Err(ineligible("capabilities_handshake", reason_code, detail));
+    }
+
+    info!(
+        worker = worker_id,
+        "post-deploy validation passed (exact-path version, health, capabilities handshake)"
+    );
     Ok(())
 }
 
@@ -1917,6 +2000,90 @@ mod tests {
             }
         ));
         assert_eq!(classify_post_deploy(0, ""), PostDeployEligibility::Eligible);
+    }
+
+    #[test]
+    fn post_deploy_capabilities_command_runs_the_exact_quoted_path() -> Result<()> {
+        // Must invoke the EXACT shell-escaped path's `capabilities` subcommand,
+        // never the bare PATH-resolved `rch-wkr`.
+        let cmd = post_deploy_capabilities_command(REMOTE_WORKER_BINARY)?;
+        assert!(cmd.contains("\"$HOME/.local/bin/rch-wkr\" capabilities"));
+        assert!(!cmd.contains(" rch-wkr capabilities"));
+        Ok(())
+    }
+
+    #[test]
+    fn post_deploy_health_command_runs_the_exact_quoted_path() -> Result<()> {
+        let cmd = post_deploy_health_command(REMOTE_WORKER_BINARY)?;
+        assert!(cmd.contains("\"$HOME/.local/bin/rch-wkr\" health"));
+        assert!(!cmd.contains(" rch-wkr health"));
+        Ok(())
+    }
+
+    #[test]
+    fn capabilities_handshake_valid_json_is_eligible() {
+        // A binary that runs cleanly and emits parseable WorkerCapabilities JSON
+        // (even the all-defaults `{}`) passes the protocol handshake.
+        assert_eq!(
+            classify_capabilities_handshake(0, "{}", ""),
+            PostDeployEligibility::Eligible
+        );
+        let full = r#"{"rustc_version":"rustc 1.80.0","num_cpus":32,"disk_free_gb":120.5}"#;
+        assert_eq!(
+            classify_capabilities_handshake(0, full, ""),
+            PostDeployEligibility::Eligible
+        );
+        // Surrounding whitespace/newlines from the SSH transport are tolerated.
+        assert_eq!(
+            classify_capabilities_handshake(0, "  {}\n", ""),
+            PostDeployEligibility::Eligible
+        );
+    }
+
+    #[test]
+    fn capabilities_handshake_unparseable_json_is_ineligible() {
+        // The binary ran (exit 0) but did not emit protocol JSON — e.g. a
+        // version-skewed/corrupt binary that printed a banner instead. This must
+        // be caught by the handshake, not silently accepted.
+        match classify_capabilities_handshake(0, "not json at all", "") {
+            PostDeployEligibility::NotEligible { reason_code, .. } => {
+                assert_eq!(reason_code, "capabilities_handshake_failed");
+            }
+            other => panic!("expected NotEligible(capabilities_handshake_failed), got {other:?}"),
+        }
+        // Empty stdout is likewise not valid protocol JSON.
+        assert!(matches!(
+            classify_capabilities_handshake(0, "", ""),
+            PostDeployEligibility::NotEligible {
+                reason_code: "capabilities_handshake_failed",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn capabilities_handshake_exec_format_is_os_arch_mismatch() {
+        // The Darwin-controller -> Linux-worker regression must also be caught on
+        // the capabilities probe: an Exec format error here is an os/arch
+        // mismatch, never a protocol-handshake failure.
+        match classify_capabilities_handshake(126, "", "sh: 1: rch-wkr: Exec format error") {
+            PostDeployEligibility::NotEligible { reason_code, .. } => {
+                assert_eq!(reason_code, "os_arch_mismatch");
+            }
+            other => panic!("expected NotEligible(os_arch_mismatch), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn capabilities_handshake_nonzero_exit_is_generic_failure() {
+        // A non-zero exit that is not an Exec format error is a generic
+        // post-deploy validation failure, and stdout is not even parsed.
+        match classify_capabilities_handshake(1, "{}", "some transient error") {
+            PostDeployEligibility::NotEligible { reason_code, .. } => {
+                assert_eq!(reason_code, "post_deploy_validation_failed");
+            }
+            other => panic!("expected NotEligible(post_deploy_validation_failed), got {other:?}"),
+        }
     }
 
     #[test]
