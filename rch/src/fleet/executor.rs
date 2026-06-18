@@ -459,10 +459,22 @@ impl FleetExecutor {
                 // `Rejected` verdict (wrong triple / checksum mismatch / invalid
                 // or — under strict policy — missing signature), leaving the
                 // worker's existing binary untouched.
+                //
+                // The worker's target triple is only needed to check it against a
+                // release manifest's declared triple, so the (3-round-trip) SSH
+                // discovery runs ONLY when a sidecar manifest is present. The
+                // common path — a locally-built binary with no manifest — adds no
+                // SSH and reuses the checksum `copy_binary_via_scp` computes
+                // anyway; `ensure_binary_matches_worker` above remains the
+                // OS/arch backstop.
                 let gate_start = Instant::now();
-                let worker_triple = discover_worker_target_facts(&worker_config)
-                    .await
-                    .and_then(|facts| worker_target_triple(&facts));
+                let worker_triple = if provenance_manifest_path(&local_binary).exists() {
+                    discover_worker_target_facts(&worker_config)
+                        .await
+                        .and_then(|facts| worker_target_triple(&facts))
+                } else {
+                    None
+                };
                 let (verdict, provenance) =
                     run_provenance_gate(&local_binary, worker_triple.as_deref(), &policy).await;
                 let mut audit = FleetDeployAuditRecord::from_verdict(
