@@ -1158,7 +1158,8 @@ fn build_coverage_matrix() -> CoverageMatrix {
                           when policy permits a dev artifact, recording an explicit reason. A \
                           FleetDeployAuditRecord captures run_id, bead_id, worker_id, remote \
                           user/path, artifact/release id, target_triple, previous artifact, \
-                          verification_status, rollback_status, reason_code, trigger, and detail."
+                          deployed_at/duration_ms, verification_status, rollback_status, \
+                          reason_code, trigger, and detail."
                 .into(),
             domain: "fleet_update".into(),
             bead_id: "bd-session-history-remediation-ocv9i.7.4".into(),

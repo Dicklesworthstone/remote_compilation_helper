@@ -341,6 +341,8 @@ pub fn verify_artifact_provenance(
 /// ..." acceptance criteria.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FleetDeployAuditRecord {
+    /// Schema version of this record (for migration of persisted history).
+    pub schema_version: String,
     /// Correlates every event of one deploy run.
     pub run_id: String,
     /// Owning bead id (provenance for the audit row itself).
@@ -369,6 +371,11 @@ pub struct FleetDeployAuditRecord {
     pub expected_protocol_version: Option<u32>,
     /// When the deploy attempt occurred (Unix epoch millis).
     pub deployed_at_unix_ms: u64,
+    /// How long the deploy attempt took, in milliseconds. Defaults to 0 and is
+    /// set by the deploy path once the attempt completes (the verdict is
+    /// recorded before transfer, so the duration is not yet known then).
+    #[serde(default)]
+    pub duration_ms: u64,
     /// `verified` | `dev_allowed` | `rejected` (from [`ProvenanceVerdict`]).
     pub verification_status: String,
     /// `none` | `rolled_back` | `rollback_failed`.
@@ -395,7 +402,8 @@ pub mod rollback_status {
 
 impl FleetDeployAuditRecord {
     /// Build an audit record from a verdict and deploy facts. `rollback_status`
-    /// defaults to `none`; the deploy path overwrites it if a rollback runs.
+    /// defaults to `none` and `duration_ms` to 0; the deploy path overwrites
+    /// them once a rollback runs / the attempt completes.
     #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub fn from_verdict(
@@ -412,6 +420,7 @@ impl FleetDeployAuditRecord {
         detail: impl Into<String>,
     ) -> Self {
         Self {
+            schema_version: FLEET_DEPLOY_AUDIT_SCHEMA_VERSION.to_string(),
             run_id: run_id.into(),
             bead_id: bead_id.into(),
             worker_id: worker_id.into(),
@@ -424,6 +433,7 @@ impl FleetDeployAuditRecord {
             builder_identity: provenance.builder_identity.clone(),
             expected_protocol_version: provenance.expected_protocol_version,
             deployed_at_unix_ms,
+            duration_ms: 0,
             verification_status: verdict.verification_status().to_string(),
             rollback_status: rollback_status::NONE.to_string(),
             reason_code: verdict.reason_code().map(ToString::to_string),
@@ -646,10 +656,14 @@ mod tests {
             "operator",
             "deploy verified",
         );
+        assert_eq!(rec.schema_version, FLEET_DEPLOY_AUDIT_SCHEMA_VERSION);
         assert_eq!(rec.verification_status, "verified");
         assert_eq!(rec.rollback_status, rollback_status::NONE);
         assert_eq!(rec.reason_code, None);
         assert_eq!(rec.target_triple, LINUX);
+        // duration_ms defaults to 0 until the deploy path sets it.
+        assert_eq!(rec.duration_ms, 0);
+        assert_eq!(rec.deployed_at_unix_ms, 1_700_000_000_000);
         assert_eq!(
             rec.previous_artifact_id.as_deref(),
             Some("rch-wkr-v1.0.41-x86_64-unknown-linux-musl")

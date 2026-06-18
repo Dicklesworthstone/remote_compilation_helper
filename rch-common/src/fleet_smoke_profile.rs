@@ -221,15 +221,17 @@ impl SmokeProfilePlan {
 
 /// Plan a smoke/soak run from observed inputs. Pure and total.
 ///
-/// Per-scenario decision (first match wins):
-/// 1. A real-worker scenario with no workers configured -> `Skip(no_real_workers)`.
-/// 2. The proof-mode refusal scenario: when remote execution is available ->
+/// Per-scenario decision, in the order the implementation checks them (first
+/// match wins; the guards are mutually exclusive, so the order only documents
+/// intent):
+/// 1. The proof-mode refusal scenario: when remote execution is available ->
 ///    `Skip(remote_available)` (cannot exercise); otherwise ->
 ///    `ExpectRefusal(proof_refusal_expected)` (even under dry-run, since asserting
 ///    the refusal does not run a remote build).
-/// 3. `--dry-run` -> `DryRun`.
-/// 4. A `--worker`-scoped run drops the fleet-wide `DesiredVsLiveFleet` scenario
+/// 2. A real-worker scenario with no workers configured -> `Skip(no_real_workers)`.
+/// 3. A `--worker`-scoped run drops the fleet-wide `DesiredVsLiveFleet` scenario
 ///    -> `Skip(not_selected)`.
+/// 4. `--dry-run` -> `DryRun`.
 /// 5. Otherwise -> `Run`.
 #[must_use]
 pub fn plan_smoke_profile(inputs: &SmokeProfileInputs) -> SmokeProfilePlan {
