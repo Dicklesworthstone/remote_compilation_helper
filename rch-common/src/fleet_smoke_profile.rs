@@ -89,12 +89,14 @@ impl SmokeScenario {
         }
     }
 
-    /// Whether the scenario needs a live worker to execute. The daemon-only
-    /// reachability check does not; everything that probes/builds on a worker
-    /// does. `DaemonReachable` is the only non-worker scenario.
+    /// Whether the scenario needs a live worker to execute. `DaemonReachable`
+    /// (a local daemon check) and `ProofModeRefusal` (which asserts a fail-closed
+    /// refusal — it needs the ABSENCE of an available remote, not a live worker)
+    /// do not; every scenario that probes or builds on a worker does. This is
+    /// what makes the real-fleet validation "skipped" when no workers exist.
     #[must_use]
     pub const fn requires_real_worker(self) -> bool {
-        !matches!(self, Self::DaemonReachable)
+        !matches!(self, Self::DaemonReachable | Self::ProofModeRefusal)
     }
 }
 
@@ -129,7 +131,8 @@ pub struct SmokeProfileInputs {
 
 impl SmokeProfileInputs {
     /// The common "no workers configured" case (e.g. a fresh dev box): every
-    /// real-fleet scenario is skipped, the profile is overall-skipped.
+    /// real-worker scenario is skipped (so `overall_skipped` is true), though the
+    /// local daemon check and the proof-mode refusal still run.
     #[must_use]
     pub fn no_workers() -> Self {
         Self {
@@ -199,8 +202,11 @@ pub struct SmokeProfilePlan {
     pub mode: ProfileMode,
     pub selected_worker: Option<String>,
     pub scenarios: Vec<PlannedScenario>,
-    /// True when no real scenario will execute (e.g. no workers configured):
-    /// the consumer should report a clean SKIP, not a failure.
+    /// True when no real-WORKER scenario executed — i.e. the real-fleet
+    /// validation was skipped (e.g. no workers configured, or a full
+    /// `--dry-run`). The local daemon-reachability and proof-mode-refusal checks
+    /// may still have run; this flags specifically that the fleet was not
+    /// exercised, so the consumer reports a clean SKIP rather than a pass/fail.
     pub overall_skipped: bool,
 }
 
@@ -237,7 +243,13 @@ pub fn plan_smoke_profile(inputs: &SmokeProfileInputs) -> SmokeProfilePlan {
         })
         .collect::<Vec<_>>();
 
-    let overall_skipped = !scenarios.iter().any(|p| p.action.is_executed());
+    // The real-fleet validation is "skipped" when no scenario that genuinely
+    // needs a live worker executed — even if the local daemon check and the
+    // proof-mode refusal still ran. The consumer reports a clean SKIP (not a
+    // pass/fail) for fleet validation in that case.
+    let overall_skipped = !scenarios
+        .iter()
+        .any(|p| p.scenario.requires_real_worker() && p.action.is_executed());
 
     SmokeProfilePlan {
         mode: inputs.mode,
@@ -384,8 +396,8 @@ mod tests {
     #[test]
     fn no_workers_skips_all_real_scenarios_and_marks_overall_skipped() {
         let plan = plan_smoke_profile(&SmokeProfileInputs::no_workers());
-        // Daemon reachability is the only non-worker scenario; with remote
-        // unavailable, proof refusal is EXPECTED (executed). Everything else
+        // Daemon reachability still runs (it needs no worker); with remote
+        // unavailable, proof refusal is EXPECTED. Every real-worker scenario
         // skips for lack of workers.
         assert_eq!(
             action_for(&plan, SmokeScenario::DaemonReachable),
@@ -397,21 +409,21 @@ mod tests {
             }
             other => panic!("expected Skip(no_real_workers), got {other:?}"),
         }
-        // Proof refusal is exercised (remote unavailable) -> a real check runs,
-        // so the profile is NOT overall-skipped.
         assert!(matches!(
             action_for(&plan, SmokeScenario::ProofModeRefusal),
             ScenarioAction::ExpectRefusal { .. }
         ));
-        assert!(!plan.overall_skipped);
+        // No real-worker scenario executed -> the real-fleet validation is
+        // skipped, even though the daemon and proof-refusal checks ran.
+        assert!(plan.overall_skipped);
     }
 
     #[test]
     fn daemon_reachability_runs_even_with_no_workers_and_remote_available() {
         // No workers, but remote somehow available: daemon reachability still
         // runs, proof refusal is skipped (nothing to refuse), every per-worker
-        // scenario skips. So exactly one scenario executes and the profile is
-        // not fully skipped.
+        // scenario skips. Exactly one scenario executes (the daemon check), but
+        // since it needs no worker the real-fleet validation is still skipped.
         let inputs = SmokeProfileInputs {
             workers_configured: false,
             remote_execution_available: true,
@@ -428,8 +440,9 @@ mod tests {
             action_for(&plan, SmokeScenario::ProofModeRefusal),
             ScenarioAction::Skip { .. }
         ));
-        assert!(!plan.overall_skipped);
         assert_eq!(plan.executed_count(), 1);
+        // Only the (worker-less) daemon check ran -> real-fleet validation skipped.
+        assert!(plan.overall_skipped);
     }
 
     #[test]
