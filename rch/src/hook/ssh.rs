@@ -3,9 +3,11 @@
 //! This submodule owns the offload pipeline's SSH primitives, extracted from
 //! `hook.rs` per bead `remote_compilation_helper-zcecy.14`:
 //!
-//! - `run_offload_ssh_command` — the hardened remote-command executor used
-//!   throughout the offload flow (topology preflight, repo sync,
-//!   dependency-manifest verification, and the build itself). It takes a
+//! - `run_offload_ssh_command` — the hardened executor for the offload flow's
+//!   one-shot *control-plane* SSH commands (topology preflight, repo_updater
+//!   closure convergence, and dependency-manifest verification). The build
+//!   command itself does not go through here — it streams over a separate path
+//!   (`transfer_orchestration`'s `execute_remote_streaming`). It takes a
 //!   caller-supplied timeout and is hardened with `kill_on_drop` + concurrent
 //!   stdout/stderr draining so a slow or hung worker can never leak a local
 //!   `ssh` process or deadlock the child on a full pipe buffer.
@@ -195,17 +197,24 @@ mod tests {
     /// private copy here lets the SSH tests stay self-contained without
     /// exposing the helper across module boundaries — the same pattern used
     /// for `create_test_state_dir` in the `auto_start` submodule.
+    ///
+    /// Gated `#[cfg(unix)]` because its only consumer here is the unix-only
+    /// `..._treats_file_exists_race_as_success` test; without the gate it would
+    /// be unused (dead_code → clippy `-D warnings`) on non-unix targets.
+    #[cfg(unix)]
     struct CanonicalTempDir {
         _dir: tempfile::TempDir,
         path: PathBuf,
     }
 
+    #[cfg(unix)]
     impl CanonicalTempDir {
         fn path(&self) -> &Path {
             &self.path
         }
     }
 
+    #[cfg(unix)]
     fn topology_tempdir() -> (CanonicalTempDir, PathTopologyPolicy) {
         let raw = tempfile::tempdir().expect("create tempdir");
         let canonical = std::fs::canonicalize(raw.path()).expect("canonicalize tempdir");

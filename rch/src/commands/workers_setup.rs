@@ -902,9 +902,10 @@ fn push_topology_audit(
 /// (reachability checks, canonical/alias topology probes and fixes). Uses a
 /// fixed 10s connect timeout and a plain `cmd.output()`.
 ///
-/// Distinct from the offload hot-path executor `run_offload_ssh_command` in
-/// `hook::ssh`, which takes a caller-supplied timeout and is hardened with
-/// `kill_on_drop` + concurrent stdout/stderr draining for the build pipeline.
+/// Distinct from the offload-pipeline control-plane executor
+/// `run_offload_ssh_command` in `hook::ssh`, which takes a caller-supplied
+/// timeout and is hardened with `kill_on_drop` + concurrent stdout/stderr
+/// draining.
 pub(crate) async fn run_setup_ssh_command(
     worker: &WorkerConfig,
     remote_cmd: &str,
