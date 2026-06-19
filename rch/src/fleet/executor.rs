@@ -27,6 +27,9 @@ use rch_common::capability_probe::{
     CapabilityRequirement, CapabilityVerdict, ProbeSpec, assess_admissibility,
     build_capability_probe_script, parse_capability_probe,
 };
+use rch_common::disk_pressure_report::{
+    DiskRootKind, PressureLevel, PressureThresholds, assess_root,
+};
 use rch_common::fleet_provenance::{
     ArtifactProvenance, FleetDeployAuditRecord, ProvenancePolicy, ProvenanceVerdict,
     SignatureCheck, verify_artifact_provenance,
@@ -1213,6 +1216,46 @@ async fn run_smoke_capabilities(
 ) -> Result<CapabilityVerdict, FleetSshError> {
     let ssh = SshExecutor::new(worker);
     run_smoke_capabilities_with_runner(worker, req, &ssh).await
+}
+
+/// Execute the DiskInodeAdmission smoke scenario against a worker: probe the
+/// configured build `roots`' disk + inode headroom (`df -Pk`/`df -Pi` at the
+/// exact paths) and return the WORST [`PressureLevel`] across them. `Critical`
+/// means an offloaded build would risk `No space left on device`; no probed
+/// roots (none configured, or df gave nothing) is `Unknown`. The caller treats
+/// both `Critical` and `Unknown` as a failed admission — never a silent pass.
+/// Generic over the runner for mock-SSH integration testing.
+#[allow(dead_code)] // consumed by the smoke live runner (bd-...-16.6 Part 2)
+async fn run_smoke_disk_inode_with_runner<R: CommandRunner>(
+    worker: &WorkerConfig,
+    roots: &[String],
+    thresholds: &PressureThresholds,
+    runner: &R,
+) -> Result<PressureLevel, FleetSshError> {
+    let mut spec = smoke_capability_probe_spec(worker);
+    spec.disk_roots = roots.to_vec();
+    let script = build_capability_probe_script(&spec);
+    let output = runner.run_command(&script).await?;
+    let facts = parse_capability_probe(&output.stdout);
+    if facts.disk_roots.is_empty() {
+        return Ok(PressureLevel::Unknown);
+    }
+    Ok(facts
+        .disk_roots
+        .iter()
+        .map(|root| assess_root(DiskRootKind::TempRoot, Some(root), thresholds).worst())
+        .fold(PressureLevel::Ok, PressureLevel::worse))
+}
+
+/// Production wrapper: run the disk/inode admission smoke scenario over real SSH.
+#[allow(dead_code)] // consumed by the smoke live runner (bd-...-16.6 Part 2)
+async fn run_smoke_disk_inode(
+    worker: &WorkerConfig,
+    roots: &[String],
+    thresholds: &PressureThresholds,
+) -> Result<PressureLevel, FleetSshError> {
+    let ssh = SshExecutor::new(worker);
+    run_smoke_disk_inode_with_runner(worker, roots, thresholds, &ssh).await
 }
 
 /// Refuse to deploy a binary whose OS/arch is incompatible with the worker.
@@ -3102,5 +3145,100 @@ RCH_FACT target=x86_64-unknown-linux-gnu\n";
         .await
         .unwrap();
         assert!(matches!(verdict, CapabilityVerdict::Rejected { .. }));
+    }
+
+    // ========================
+    // Smoke disk/inode admission executor — mock-SSH integration (bd-...-16.6 Part 2)
+    // ========================
+
+    // Comfortable disk + inode headroom => Ok (admissible).
+    #[tokio::test]
+    async fn smoke_disk_inode_ok_with_headroom() {
+        use crate::fleet::ssh::{MockCommandResult, MockSshExecutor};
+        // total=1048576KB, avail=524288KB (50%), inodes=900000.
+        let probe_out = "RCH_FACT disk=/data/tmp;1048576;524288;900000\n";
+        let mock = MockSshExecutor::new().with_command("df -Pk", MockCommandResult::ok(probe_out));
+        let level = run_smoke_disk_inode_with_runner(
+            &smoke_worker(),
+            &["/data/tmp".to_string()],
+            &PressureThresholds::default(),
+            &mock,
+        )
+        .await
+        .unwrap();
+        assert_eq!(level, PressureLevel::Ok);
+    }
+
+    // Byte exhaustion (avail <= critical pct) => Critical (failed admission).
+    #[tokio::test]
+    async fn smoke_disk_inode_critical_on_low_bytes() {
+        use crate::fleet::ssh::{MockCommandResult, MockSshExecutor};
+        // avail=10240/1048576 ~= 1% <= 5% critical.
+        let probe_out = "RCH_FACT disk=/data/tmp;1048576;10240;900000\n";
+        let mock = MockSshExecutor::new().with_command("df -Pk", MockCommandResult::ok(probe_out));
+        let level = run_smoke_disk_inode_with_runner(
+            &smoke_worker(),
+            &["/data/tmp".to_string()],
+            &PressureThresholds::default(),
+            &mock,
+        )
+        .await
+        .unwrap();
+        assert_eq!(level, PressureLevel::Critical);
+    }
+
+    // Inode exhaustion is critical even with plenty of bytes free.
+    #[tokio::test]
+    async fn smoke_disk_inode_critical_on_low_inodes() {
+        use crate::fleet::ssh::{MockCommandResult, MockSshExecutor};
+        // bytes 50% (Ok) but inodes=5000 < 10000 critical.
+        let probe_out = "RCH_FACT disk=/data/tmp;1048576;524288;5000\n";
+        let mock = MockSshExecutor::new().with_command("df -Pk", MockCommandResult::ok(probe_out));
+        let level = run_smoke_disk_inode_with_runner(
+            &smoke_worker(),
+            &["/data/tmp".to_string()],
+            &PressureThresholds::default(),
+            &mock,
+        )
+        .await
+        .unwrap();
+        assert_eq!(level, PressureLevel::Critical);
+    }
+
+    // No probed roots (df returned nothing) => Unknown, never a silent pass.
+    #[tokio::test]
+    async fn smoke_disk_inode_unknown_when_no_roots() {
+        use crate::fleet::ssh::{MockCommandResult, MockSshExecutor};
+        let mock = MockSshExecutor::new().with_command(
+            "--protocol-version",
+            MockCommandResult::ok("RCH_FACT os=linux\n"),
+        );
+        let level = run_smoke_disk_inode_with_runner(
+            &smoke_worker(),
+            &[],
+            &PressureThresholds::default(),
+            &mock,
+        )
+        .await
+        .unwrap();
+        assert_eq!(level, PressureLevel::Unknown);
+    }
+
+    // The worst level across multiple roots wins (one critical root fails the run).
+    #[tokio::test]
+    async fn smoke_disk_inode_worst_root_wins() {
+        use crate::fleet::ssh::{MockCommandResult, MockSshExecutor};
+        let probe_out = "RCH_FACT disk=/data/tmp;1048576;524288;900000\n\
+RCH_FACT disk=/var/cache;1048576;10240;900000\n";
+        let mock = MockSshExecutor::new().with_command("df -Pk", MockCommandResult::ok(probe_out));
+        let level = run_smoke_disk_inode_with_runner(
+            &smoke_worker(),
+            &["/data/tmp".to_string(), "/var/cache".to_string()],
+            &PressureThresholds::default(),
+            &mock,
+        )
+        .await
+        .unwrap();
+        assert_eq!(level, PressureLevel::Critical);
     }
 }

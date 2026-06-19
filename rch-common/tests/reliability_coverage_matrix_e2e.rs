@@ -1287,6 +1287,11 @@ fn build_coverage_matrix() -> CoverageMatrix {
                     name_prefix: "smoke_capabilities".into(),
                     tier: "smoke".into(),
                 },
+                TestRef {
+                    file: "../../rch/src/fleet/executor.rs".into(),
+                    name_prefix: "smoke_disk_inode".into(),
+                    tier: "smoke".into(),
+                },
             ],
             artifact_assertions: vec![
                 "No real workers configured -> every real-fleet scenario Skip{smoke_no_real_workers}; \
