@@ -361,6 +361,53 @@ fn dedupe_worker_ids(workers: Vec<WorkerId>) -> Vec<WorkerId> {
     deduped
 }
 
+/// Read `[routing] preferred_workers` from the project-local `.rch/config.toml`
+/// (relative to the current dir, matching `config::resolved_source_paths`). This
+/// lets a repo durably pin its builds to specific workers — e.g. routing a
+/// project whose target dir is huge to big-disk boxes — without a per-invocation
+/// `RCH_WORKER` env. The result is merged with the env-based preference list by
+/// the caller, then deduped. Best-effort: any missing file / parse error / wrong
+/// shape yields an empty list (no pinning), never an error, so a malformed
+/// project config can never break the build path.
+fn preferred_workers_from_project_config() -> Vec<WorkerId> {
+    let path = std::env::current_dir()
+        .map(|dir| dir.join(".rch/config.toml"))
+        .unwrap_or_else(|_| PathBuf::from(".rch/config.toml"));
+    preferred_workers_from_config_path(&path)
+}
+
+fn preferred_workers_from_config_path(path: &Path) -> Vec<WorkerId> {
+    match std::fs::read_to_string(path) {
+        Ok(contents) => parse_preferred_workers_from_toml(&contents),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Extract `[routing] preferred_workers = ["id", ...]` from project-config TOML.
+/// Unknown sections (e.g. `[compilation]`) are ignored; a wrong-typed or
+/// malformed value yields an empty list rather than an error.
+fn parse_preferred_workers_from_toml(contents: &str) -> Vec<WorkerId> {
+    #[derive(serde::Deserialize)]
+    struct Doc {
+        routing: Option<RoutingSection>,
+    }
+    #[derive(serde::Deserialize)]
+    struct RoutingSection {
+        preferred_workers: Option<Vec<String>>,
+    }
+    let Ok(doc) = toml::from_str::<Doc>(contents) else {
+        return Vec::new();
+    };
+    doc.routing
+        .and_then(|routing| routing.preferred_workers)
+        .unwrap_or_default()
+        .iter()
+        .map(|id| id.trim())
+        .filter(|id| !id.is_empty())
+        .map(WorkerId::new)
+        .collect()
+}
+
 fn local_fallback_command(command: &str) -> std::process::Command {
     let mut child = std::process::Command::new("sh");
     child
@@ -450,7 +497,15 @@ pub async fn run_exec(command_parts: Vec<String>) -> anyhow::Result<()> {
     let required_runtime = required_runtime_for_kind(classification.kind);
     let command_priority = command_priority_from_env(&reporter);
     let wait_for_worker = queue_when_busy_enabled();
-    let preferred_workers = preferred_workers_from_env();
+    // Preferred workers: env (`RCH_WORKER`/`RCH_WORKERS`) merged with the
+    // project-local `.rch/config.toml` `[routing] preferred_workers`. The
+    // daemon treats a non-empty list as a hard preference (selects only those
+    // workers when any is eligible, else falls back to all eligible).
+    let preferred_workers = {
+        let mut combined = preferred_workers_from_env();
+        combined.extend(preferred_workers_from_project_config());
+        dedupe_worker_ids(combined)
+    };
 
     // Query daemon for worker selection
     let response = match query_daemon(
@@ -7704,6 +7759,48 @@ mod tests {
         let workers = dedupe_worker_ids(parse_preferred_workers(" ts2, vmi1,,ts2 , vmi2 "));
         let ids: Vec<&str> = workers.iter().map(|worker| worker.as_str()).collect();
         assert_eq!(ids, vec!["ts2", "vmi1", "vmi2"]);
+    }
+
+    #[test]
+    fn test_parse_preferred_workers_from_toml_routing_section() {
+        let _guard = test_guard!();
+        let toml = r#"
+[general]
+enabled = true
+
+[routing]
+preferred_workers = ["hz2", " vmi1264463 ", ""]
+"#;
+        let ids: Vec<String> = parse_preferred_workers_from_toml(toml)
+            .iter()
+            .map(|w| w.as_str().to_string())
+            .collect();
+        // Trims whitespace and drops empty entries.
+        assert_eq!(ids, vec!["hz2".to_string(), "vmi1264463".to_string()]);
+    }
+
+    #[test]
+    fn test_parse_preferred_workers_from_toml_absent_or_malformed_is_empty() {
+        let _guard = test_guard!();
+        // No [routing] section.
+        assert!(parse_preferred_workers_from_toml("[general]\nenabled = true\n").is_empty());
+        // [routing] present but no preferred_workers key.
+        assert!(parse_preferred_workers_from_toml("[routing]\nother = 1\n").is_empty());
+        // Wrong type (not an array).
+        assert!(
+            parse_preferred_workers_from_toml("[routing]\npreferred_workers = \"hz2\"\n").is_empty()
+        );
+        // Malformed TOML never errors — yields empty (no pinning).
+        assert!(parse_preferred_workers_from_toml("this is not toml {{{").is_empty());
+        // Empty input.
+        assert!(parse_preferred_workers_from_toml("").is_empty());
+    }
+
+    #[test]
+    fn test_preferred_workers_from_config_path_missing_file_is_empty() {
+        let _guard = test_guard!();
+        let missing = std::path::Path::new("/tmp/definitely-not-a-real-rch-config-xyz.toml");
+        assert!(preferred_workers_from_config_path(missing).is_empty());
     }
 
     // =========================================================================
