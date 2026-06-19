@@ -1280,6 +1280,13 @@ fn build_coverage_matrix() -> CoverageMatrix {
                     name_prefix: "e2e".into(),
                     tier: "smoke".into(),
                 },
+                // Mock-SSH integration for the capabilities scenario executor
+                // (composes the 12.2 capability-probe + admissibility foundation).
+                TestRef {
+                    file: "../../rch/src/fleet/executor.rs".into(),
+                    name_prefix: "smoke_capabilities".into(),
+                    tier: "smoke".into(),
+                },
             ],
             artifact_assertions: vec![
                 "No real workers configured -> every real-fleet scenario Skip{smoke_no_real_workers}; \

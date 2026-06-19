@@ -23,12 +23,16 @@ use anyhow::Result;
 
 use crate::error::{FleetError, SshError};
 use futures::future::BoxFuture;
+use rch_common::capability_probe::{
+    CapabilityRequirement, CapabilityVerdict, ProbeSpec, assess_admissibility,
+    build_capability_probe_script, parse_capability_probe,
+};
 use rch_common::fleet_provenance::{
     ArtifactProvenance, FleetDeployAuditRecord, ProvenancePolicy, ProvenanceVerdict,
     SignatureCheck, verify_artifact_provenance,
 };
 use rch_common::ssh_utils::shell_escape_path_with_home;
-use rch_common::{WorkerCapabilities, WorkerConfig, WorkerId};
+use rch_common::{IncidentReasonCode, WorkerCapabilities, WorkerConfig, WorkerId};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -1148,6 +1152,67 @@ fn now_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+// =============================================================================
+// Real-fleet smoke scenario executors
+// (bd-session-history-remediation-ocv9i.16.6, Part 2)
+// =============================================================================
+//
+// SSH-coupled execution of the per-worker smoke scenarios, composing the pure
+// 12.2 capability-probe + admissibility foundation. Each executor is generic
+// over `CommandRunner` so it is mock-SSH integration-testable WITHOUT a live
+// worker (the bead's "integration tests use mock SSH/mock workers" target). The
+// smoke command's live runner (commands/status.rs `self_test_smoke`) is wired to
+// these in the Part 2 continuation; until then they are exercised by the
+// mock-SSH integration tests below.
+
+/// Exact-user/path capability probe spec for a worker's installed `rch-wkr`. The
+/// path is the exact configured binary location (no PATH resolution), matching
+/// the .7.3 exact-user/path validation discipline.
+#[allow(dead_code)] // consumed by the smoke live runner (bd-...-16.6 Part 2)
+fn smoke_capability_probe_spec(worker: &WorkerConfig) -> ProbeSpec {
+    ProbeSpec::new(worker.user.clone(), REMOTE_WORKER_BINARY)
+}
+
+/// Execute the WorkerCapabilitiesExactUserPath smoke scenario against a worker:
+/// run the exact-user/path capability probe, parse it, and assess it against
+/// `req`. A probe that yields no parseable facts (the binary is missing or
+/// unusable as the configured user) is a rejection, never a silent pass. Generic
+/// over the runner so it is mock-SSH integration-testable.
+#[allow(dead_code)] // consumed by the smoke live runner (bd-...-16.6 Part 2)
+async fn run_smoke_capabilities_with_runner<R: CommandRunner>(
+    worker: &WorkerConfig,
+    req: &CapabilityRequirement,
+    runner: &R,
+) -> Result<CapabilityVerdict, FleetSshError> {
+    let spec = smoke_capability_probe_spec(worker);
+    let script = build_capability_probe_script(&spec);
+    let output = runner.run_command(&script).await?;
+    let facts = parse_capability_probe(&output.stdout);
+    // An empty parse (no worker version AND no os) means the probe produced no
+    // usable facts: treat as a rejection rather than handing empty facts to
+    // assess_admissibility (which assumes a reachable probe).
+    if facts.worker.is_none() && facts.os.is_none() {
+        return Ok(CapabilityVerdict::Rejected {
+            reason: IncidentReasonCode::WrongUserPathWorkerBinary,
+            detail: format!(
+                "capability probe at {REMOTE_WORKER_BINARY} produced no parseable facts as user {} (binary missing or unreachable)",
+                worker.user
+            ),
+        });
+    }
+    Ok(assess_admissibility(&facts, req))
+}
+
+/// Production wrapper: run the capabilities smoke scenario over real SSH.
+#[allow(dead_code)] // consumed by the smoke live runner (bd-...-16.6 Part 2)
+async fn run_smoke_capabilities(
+    worker: &WorkerConfig,
+    req: &CapabilityRequirement,
+) -> Result<CapabilityVerdict, FleetSshError> {
+    let ssh = SshExecutor::new(worker);
+    run_smoke_capabilities_with_runner(worker, req, &ssh).await
 }
 
 /// Refuse to deploy a binary whose OS/arch is incompatible with the worker.
@@ -2943,5 +3008,99 @@ mod tests {
         let (verdict, _prov) =
             run_provenance_gate(&bin, None, &ProvenancePolicy::dev_friendly()).await;
         assert_eq!(verdict, ProvenanceVerdict::Verified);
+    }
+
+    // ========================
+    // Smoke capabilities scenario executor — mock-SSH integration (bd-...-16.6 Part 2)
+    // ========================
+
+    fn smoke_worker() -> WorkerConfig {
+        WorkerConfig {
+            user: "rch".to_string(),
+            ..Default::default()
+        }
+    }
+
+    // A healthy worker that reports a usable exact-path rch-wkr + cargo +
+    // protocol >= required is Admissible.
+    #[tokio::test]
+    async fn smoke_capabilities_admits_healthy_worker() {
+        use crate::fleet::ssh::{MockCommandResult, MockSshExecutor};
+        let probe_out = "RCH_FACT os=linux\nRCH_FACT arch=x86_64\nRCH_FACT user=rch\n\
+RCH_FACT rch_wkr_path=/home/rch/.local/bin/rch-wkr\nRCH_FACT worker_version=1.0.41\n\
+RCH_FACT worker_protocol=3\nRCH_FACT cargo_version=cargo 1.98.0-nightly\n\
+RCH_FACT toolchain=nightly\nRCH_FACT target=x86_64-unknown-linux-gnu\n\
+RCH_FACT disk=/data/tmp;1048576;524288;900000\n";
+        // The probe runs as one multi-line script; match a substring it embeds.
+        let mock = MockSshExecutor::new()
+            .with_command("--protocol-version", MockCommandResult::ok(probe_out));
+        let verdict = run_smoke_capabilities_with_runner(
+            &smoke_worker(),
+            &CapabilityRequirement::rust(1),
+            &mock,
+        )
+        .await
+        .unwrap();
+        assert_eq!(verdict, CapabilityVerdict::Admissible);
+    }
+
+    // The probe ran (os present) but the exact-path binary produced no version
+    // as the configured user => Rejected (root-good / user-broken).
+    #[tokio::test]
+    async fn smoke_capabilities_rejects_binary_unusable_as_user() {
+        use crate::fleet::ssh::{MockCommandResult, MockSshExecutor};
+        let probe_out = "RCH_FACT os=linux\nRCH_FACT arch=x86_64\nRCH_FACT user=rch\n";
+        let mock = MockSshExecutor::new()
+            .with_command("--protocol-version", MockCommandResult::ok(probe_out));
+        let verdict = run_smoke_capabilities_with_runner(
+            &smoke_worker(),
+            &CapabilityRequirement::rust(1),
+            &mock,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(verdict, CapabilityVerdict::Rejected { .. }));
+    }
+
+    // An empty probe (worker unreachable / no facts) is a rejection, never a
+    // silent pass — the cardinal safety invariant.
+    #[tokio::test]
+    async fn smoke_capabilities_unreachable_probe_is_rejected_not_passed() {
+        use crate::fleet::ssh::{MockCommandResult, MockSshExecutor};
+        let mock =
+            MockSshExecutor::new().with_command("--protocol-version", MockCommandResult::ok(""));
+        let verdict = run_smoke_capabilities_with_runner(
+            &smoke_worker(),
+            &CapabilityRequirement::rust(1),
+            &mock,
+        )
+        .await
+        .unwrap();
+        match verdict {
+            CapabilityVerdict::Rejected { reason, .. } => {
+                assert_eq!(reason, IncidentReasonCode::WrongUserPathWorkerBinary);
+            }
+            other => panic!("expected Rejected for an unreachable probe, got {other:?}"),
+        }
+    }
+
+    // A protocol below the requirement is rejected even though the binary runs.
+    #[tokio::test]
+    async fn smoke_capabilities_rejects_protocol_below_requirement() {
+        use crate::fleet::ssh::{MockCommandResult, MockSshExecutor};
+        let probe_out = "RCH_FACT os=linux\nRCH_FACT arch=x86_64\nRCH_FACT user=rch\n\
+RCH_FACT rch_wkr_path=/home/rch/.local/bin/rch-wkr\nRCH_FACT worker_version=1.0.41\n\
+RCH_FACT worker_protocol=1\nRCH_FACT cargo_version=cargo 1.98.0-nightly\n\
+RCH_FACT target=x86_64-unknown-linux-gnu\n";
+        let mock = MockSshExecutor::new()
+            .with_command("--protocol-version", MockCommandResult::ok(probe_out));
+        let verdict = run_smoke_capabilities_with_runner(
+            &smoke_worker(),
+            &CapabilityRequirement::rust(3),
+            &mock,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(verdict, CapabilityVerdict::Rejected { .. }));
     }
 }
