@@ -1260,6 +1260,26 @@ fn build_coverage_matrix() -> CoverageMatrix {
                     name_prefix: "event_serde".into(),
                     tier: "smoke".into(),
                 },
+                // Consumer: `rch self-test --smoke` builds inputs from config +
+                // daemon reachability, runs the foundation planner, and emits the
+                // SmokeProfileEvent JSONL trace (single source of truth = the
+                // foundation; live per-worker SSH execution is the operator
+                // procedure, paired with .7.4's deploy E2E).
+                TestRef {
+                    file: "../../rch/src/commands/status.rs".into(),
+                    name_prefix: "smoke_planned_events".into(),
+                    tier: "smoke".into(),
+                },
+                TestRef {
+                    file: "../../rch/src/commands/status.rs".into(),
+                    name_prefix: "build_smoke_inputs".into(),
+                    tier: "smoke".into(),
+                },
+                TestRef {
+                    file: "../../scripts/e2e_real_fleet_smoke.sh".into(),
+                    name_prefix: "e2e".into(),
+                    tier: "smoke".into(),
+                },
             ],
             artifact_assertions: vec![
                 "No real workers configured -> every real-fleet scenario Skip{smoke_no_real_workers}; \
@@ -1282,6 +1302,13 @@ fn build_coverage_matrix() -> CoverageMatrix {
                  command_fingerprint/duration_ms/remote_target_dir/artifact_summary and survives a serde \
                  roundtrip; daemon-only scenarios drop worker_id \
                  (fleet_smoke_profile::event_serde_roundtrip_is_stable, planned_event_carries_fields_and_omits_worker_for_daemon_scenario)"
+                    .into(),
+                "Consumer `rch self-test --smoke [--dry-run] [--soak]` derives inputs from config + a \
+                 daemon /health probe (remote_execution_available = daemon up AND workers configured), \
+                 runs plan_smoke_profile, and emits the planned JSONL trace; scripts/e2e_real_fleet_smoke.sh \
+                 drives the safe --dry-run --json surface for empty_fleet/all_absent and self-validates \
+                 the plan (8 scenarios) + SmokeProfileEvent fields \
+                 (status::tests::{build_smoke_inputs_maps_environment_and_flags, smoke_planned_events_cover_every_scenario_with_reasons})"
                     .into(),
             ],
             has_executable_test: true,

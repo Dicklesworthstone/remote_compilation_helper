@@ -17,6 +17,10 @@ use crate::ui::context::OutputContext;
 use crate::ui::progress::Spinner;
 use crate::ui::theme::{StatusIndicator, Theme};
 use anyhow::{Context, Result};
+use rch_common::fleet_smoke_profile::{
+    ProfileMode, ScenarioAction, SmokeProfileEvent, SmokeProfileInputs, SmokeProfilePlan,
+    SmokeScenario, plan_smoke_profile,
+};
 use rch_common::{
     ApiResponse, CommandPriority, PlacementPlan, RequestedWorkerFacts, RequestedWorkerOutcome,
     RequiredRuntime, evaluate_requested_worker, normalize_project_path_with_policy,
@@ -1062,8 +1066,16 @@ pub async fn self_test(
     timeout: u64,
     debug: bool,
     scheduled: bool,
+    smoke: bool,
+    soak: bool,
+    dry_run: bool,
     ctx: &OutputContext,
 ) -> Result<()> {
+    // The real-fleet smoke/soak profile is a distinct mode from the per-worker
+    // canary self-test (bd-session-history-remediation-ocv9i.16.6).
+    if smoke {
+        return self_test_smoke(worker, all, dry_run, soak, ctx).await;
+    }
     match action {
         Some(crate::SelfTestAction::Status) => self_test_status(ctx).await,
         Some(crate::SelfTestAction::History { limit }) => self_test_history(limit, ctx).await,
@@ -1379,6 +1391,233 @@ async fn self_test_run(
     );
 
     Ok(())
+}
+
+// =============================================================================
+// Real-fleet smoke/soak validation profile
+// (bd-session-history-remediation-ocv9i.16.6)
+// =============================================================================
+//
+// `rch self-test --smoke` plans the bounded real-fleet validation profile from
+// observed environment (config + daemon reachability) and emits the structured
+// `SmokeProfileEvent` JSONL trace operators attach to Beads close reasons. The
+// scenario set, skip/refusal logic, and JSONL schema are owned by the pure
+// `rch_common::fleet_smoke_profile` foundation (single source of truth) — this
+// consumer only gathers inputs, runs the planner, performs the one fully
+// client-side scenario (daemon reachability) for real, and renders/persists the
+// trace. Live per-worker SSH execution is the operator real-fleet procedure
+// (documented), paired with the .7.4 deploy E2E since both need the real fleet.
+
+/// Owning bead id for the smoke-profile JSONL trace.
+const SMOKE_BEAD_ID: &str = "bd-session-history-remediation-ocv9i.16.6";
+
+/// Build the smoke-profile inputs from observed environment + flags. Pure so the
+/// input-derivation is unit-testable without a daemon or workers.
+fn build_smoke_inputs(
+    workers_configured: bool,
+    daemon_reachable: bool,
+    dry_run: bool,
+    soak: bool,
+    selected_worker: Option<String>,
+) -> SmokeProfileInputs {
+    SmokeProfileInputs {
+        workers_configured,
+        // Remote execution can proceed only if the daemon is up AND at least one
+        // worker is configured — a bounded, honest proxy for full admission that
+        // drives the proof-mode-refusal scenario decision.
+        remote_execution_available: daemon_reachable && workers_configured,
+        dry_run,
+        mode: if soak {
+            ProfileMode::Soak
+        } else {
+            ProfileMode::Smoke
+        },
+        selected_worker,
+    }
+}
+
+/// Generate one `planned` JSONL event per scenario, in run order. Pure so the
+/// trace shape is unit-testable. A complete planned trace is emitted even for a
+/// dry-run (the foundation's design), so the JSONL is always auditable.
+fn smoke_planned_events(
+    plan: &SmokeProfilePlan,
+    run_id: &str,
+    representative_worker: Option<&str>,
+) -> Vec<SmokeProfileEvent> {
+    plan.scenarios
+        .iter()
+        .map(|planned| {
+            SmokeProfileEvent::planned(
+                run_id,
+                SMOKE_BEAD_ID,
+                representative_worker.map(str::to_string),
+                planned,
+            )
+        })
+        .collect()
+}
+
+/// Persist the JSONL trace under the cache dir (best-effort). Returns the path so
+/// operators can attach it to a Beads close reason and CI can self-validate it.
+fn write_smoke_jsonl(run_id: &str, events: &[SmokeProfileEvent]) -> Option<String> {
+    let dir = dirs::cache_dir()?.join("rch").join("smoke");
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join(format!("{run_id}.jsonl"));
+    let mut buf = String::new();
+    for event in events {
+        let line = serde_json::to_string(event).ok()?;
+        buf.push_str(&line);
+        buf.push('\n');
+    }
+    std::fs::write(&path, buf).ok()?;
+    Some(path.display().to_string())
+}
+
+async fn self_test_smoke(
+    worker: Option<String>,
+    all: bool,
+    dry_run: bool,
+    soak: bool,
+    ctx: &OutputContext,
+) -> Result<()> {
+    let workers = load_workers_from_config().unwrap_or_default();
+    let workers_configured = !workers.is_empty();
+
+    // Probe daemon reachability — this both feeds the plan and IS the real result
+    // of the daemon-reachability scenario.
+    let probe_start = std::time::Instant::now();
+    let daemon_reachable = send_daemon_command("GET /health\n").await.is_ok();
+    let probe_ms = u64::try_from(probe_start.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+    // A single --worker selects that worker; --all (or neither) is fleet-wide.
+    let selected_worker = if all { None } else { worker };
+    let inputs = build_smoke_inputs(
+        workers_configured,
+        daemon_reachable,
+        dry_run,
+        soak,
+        selected_worker.clone(),
+    );
+    let plan = plan_smoke_profile(&inputs);
+
+    let run_id = uuid::Uuid::new_v4().to_string();
+    let representative_worker = selected_worker
+        .clone()
+        .or_else(|| workers.first().map(|w| w.id.to_string()));
+
+    let mut events = smoke_planned_events(&plan, &run_id, representative_worker.as_deref());
+
+    // Execute the one fully client-side scenario for real: daemon reachability.
+    // The per-worker SSH scenarios are planned here; their live execution is the
+    // operator real-fleet procedure. Skipped under --dry-run (which executes
+    // nothing by definition).
+    if !dry_run
+        && let Some(planned) = plan
+            .scenarios
+            .iter()
+            .find(|p| p.scenario == SmokeScenario::DaemonReachable)
+        && planned.action.is_executed()
+    {
+        events.push(SmokeProfileEvent {
+            run_id: run_id.clone(),
+            bead_id: SMOKE_BEAD_ID.to_string(),
+            worker_id: None,
+            scenario: SmokeScenario::DaemonReachable.as_str().to_string(),
+            event: if daemon_reachable { "passed" } else { "failed" }.to_string(),
+            status: if daemon_reachable { "ok" } else { "fail" }.to_string(),
+            reason_code: None,
+            command_fingerprint: Some("GET /health".to_string()),
+            duration_ms: probe_ms,
+            remote_target_dir: None,
+            artifact_summary: None,
+        });
+    }
+
+    let log_path = write_smoke_jsonl(&run_id, &events);
+
+    let payload = serde_json::json!({
+        "run_id": run_id,
+        "bead_id": SMOKE_BEAD_ID,
+        "mode": plan.mode,
+        "dry_run": dry_run,
+        "workers_configured": workers_configured,
+        "remote_execution_available": inputs.remote_execution_available,
+        "daemon_reachable": daemon_reachable,
+        "overall_skipped": plan.overall_skipped,
+        "plan": plan,
+        "events": events,
+        "log_path": log_path,
+    });
+    let _ = ctx.json(&payload);
+    if ctx.is_json() {
+        return Ok(());
+    }
+
+    render_smoke_plan(&plan, daemon_reachable, log_path.as_deref(), ctx);
+    Ok(())
+}
+
+fn render_smoke_plan(
+    plan: &SmokeProfilePlan,
+    daemon_reachable: bool,
+    log_path: Option<&str>,
+    ctx: &OutputContext,
+) {
+    let style = ctx.style();
+    println!("{}", style.format_header("Real-Fleet Smoke Profile (plan)"));
+
+    let rows: Vec<Vec<String>> = plan
+        .scenarios
+        .iter()
+        .map(|p| {
+            vec![
+                p.scenario.as_str().to_string(),
+                p.action.status_token().to_string(),
+                p.action.reason_code().unwrap_or("").to_string(),
+            ]
+        })
+        .collect();
+    ctx.table(&["Scenario", "Action", "Reason"], &rows);
+
+    let count = |pred: fn(&ScenarioAction) -> bool| -> usize {
+        plan.scenarios.iter().filter(|p| pred(&p.action)).count()
+    };
+    let run = count(|a| matches!(a, ScenarioAction::Run));
+    let dry = count(|a| matches!(a, ScenarioAction::DryRun));
+    let skip = count(|a| matches!(a, ScenarioAction::Skip { .. }));
+    let refuse = count(|a| matches!(a, ScenarioAction::ExpectRefusal { .. }));
+
+    println!(
+        "\n{} {} run, {} dry-run, {} skip, {} expect-refusal{}.",
+        style.muted("Summary:"),
+        style.success(&run.to_string()),
+        dry,
+        skip,
+        refuse,
+        if plan.overall_skipped {
+            format!(" ({})", style.warning("real-fleet validation skipped"))
+        } else {
+            String::new()
+        }
+    );
+    println!(
+        "  {} {}",
+        style.key("Daemon reachable"),
+        if daemon_reachable {
+            style.success("yes")
+        } else {
+            style.warning("no")
+        }
+    );
+    if let Some(path) = log_path {
+        println!("  {} {}", style.key("JSONL trace"), style.info(path));
+    }
+    println!(
+        "  {}",
+        style.muted(
+            "Per-worker scenario execution is the operator real-fleet procedure; see docs/runbooks."
+        )
+    );
 }
 
 fn render_self_test_result_verbose_lines(
@@ -2427,5 +2666,90 @@ mod tests {
         let failed_output = render_self_test_result_verbose_lines(&failed, &style).join("\n");
         assert!(failed_output.contains("error:"));
         assert!(failed_output.contains("deliberately long"));
+    }
+
+    // ========================
+    // Smoke-profile consumer tests (bd-...-ocv9i.16.6)
+    // ========================
+
+    #[test]
+    fn build_smoke_inputs_maps_environment_and_flags() {
+        // Workers + daemon up => remote execution available.
+        let i = build_smoke_inputs(true, true, false, false, None);
+        assert!(i.workers_configured);
+        assert!(i.remote_execution_available);
+        assert_eq!(i.mode, ProfileMode::Smoke);
+        assert!(!i.dry_run);
+
+        // No workers => remote unavailable even if the daemon is up.
+        assert!(!build_smoke_inputs(false, true, false, false, None).remote_execution_available);
+        // Daemon down => remote unavailable even with workers.
+        assert!(!build_smoke_inputs(true, false, false, false, None).remote_execution_available);
+
+        // soak + dry_run + a selected worker are carried through.
+        let i = build_smoke_inputs(true, true, true, true, Some("css".to_string()));
+        assert_eq!(i.mode, ProfileMode::Soak);
+        assert!(i.dry_run);
+        assert_eq!(i.selected_worker.as_deref(), Some("css"));
+    }
+
+    #[test]
+    fn smoke_planned_events_cover_every_scenario_with_reasons() {
+        // No-workers plan: real-worker scenarios skip with a reason, the daemon
+        // scenario runs, and proof-mode refusal is expected.
+        let inputs = build_smoke_inputs(false, false, false, false, None);
+        let plan = plan_smoke_profile(&inputs);
+        let events = smoke_planned_events(&plan, "run-1", Some("css"));
+
+        assert_eq!(events.len(), SmokeScenario::ALL.len());
+        assert!(
+            events
+                .iter()
+                .all(|e| e.run_id == "run-1" && e.event == "planned" && e.bead_id == SMOKE_BEAD_ID)
+        );
+
+        // The daemon scenario is not worker-scoped, so its worker id is dropped.
+        let daemon = events
+            .iter()
+            .find(|e| e.scenario == "daemon_reachable")
+            .unwrap();
+        assert_eq!(daemon.worker_id, None);
+        assert_eq!(daemon.status, "run");
+
+        // A real-worker scenario keeps the worker and carries the skip reason.
+        let canary = events
+            .iter()
+            .find(|e| e.scenario == "cargo_canary")
+            .unwrap();
+        assert_eq!(canary.worker_id.as_deref(), Some("css"));
+        assert_eq!(canary.status, "skip");
+        assert_eq!(canary.reason_code.as_deref(), Some("smoke_no_real_workers"));
+
+        // Remote unavailable => proof-mode refusal is expected.
+        let proof = events
+            .iter()
+            .find(|e| e.scenario == "proof_mode_refusal")
+            .unwrap();
+        assert_eq!(proof.status, "expect_refusal");
+    }
+
+    #[test]
+    fn smoke_planned_events_full_fleet_runs_per_worker_scenarios() {
+        let inputs = build_smoke_inputs(true, true, false, false, None);
+        let plan = plan_smoke_profile(&inputs);
+        let events = smoke_planned_events(&plan, "run-2", Some("hz1"));
+        let canary = events
+            .iter()
+            .find(|e| e.scenario == "cargo_canary")
+            .unwrap();
+        assert_eq!(canary.status, "run");
+        assert_eq!(canary.reason_code, None);
+        // Remote available => proof-mode refusal cannot be exercised (skipped).
+        let proof = events
+            .iter()
+            .find(|e| e.scenario == "proof_mode_refusal")
+            .unwrap();
+        assert_eq!(proof.status, "skip");
+        assert_eq!(proof.reason_code.as_deref(), Some("smoke_remote_available"));
     }
 }

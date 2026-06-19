@@ -687,6 +687,15 @@ CHECKS PERFORMED:
         /// Run using scheduled settings (ignores worker selection flags)
         #[arg(long)]
         scheduled: bool,
+        /// Run the real-fleet smoke/soak validation profile (planner + JSONL trace)
+        #[arg(long)]
+        smoke: bool,
+        /// Soak mode: bounded repeated passes (use with --smoke)
+        #[arg(long)]
+        soak: bool,
+        /// Plan only; do not execute scenarios (use with --smoke)
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Update RCH binaries on local machine and/or workers
@@ -1970,9 +1979,13 @@ async fn run(args: Vec<OsString>) -> Result<()> {
                 timeout,
                 debug,
                 scheduled,
+                smoke,
+                soak,
+                dry_run,
             } => {
                 commands::self_test(
-                    action, worker, all, project, timeout, debug, scheduled, &ctx,
+                    action, worker, all, project, timeout, debug, scheduled, smoke, soak, dry_run,
+                    &ctx,
                 )
                 .await
             }
@@ -7265,6 +7278,9 @@ mod tests {
                 timeout,
                 debug,
                 scheduled,
+                smoke,
+                soak,
+                dry_run,
             }) => {
                 assert!(action.is_none());
                 assert!(worker.is_none());
@@ -7273,6 +7289,9 @@ mod tests {
                 assert_eq!(timeout, 300);
                 assert!(!debug);
                 assert!(!scheduled);
+                assert!(!smoke);
+                assert!(!soak);
+                assert!(!dry_run);
             }
             _ => fail_expected("Expected self-test command"),
         }
@@ -7288,6 +7307,26 @@ mod tests {
                 assert!(!all);
             }
             _ => fail_expected("Expected self-test --worker command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_self_test_smoke_dry_run() {
+        let _guard = test_guard!();
+        let cli =
+            Cli::try_parse_from(["rch", "self-test", "--smoke", "--dry-run", "--soak"]).unwrap();
+        match cli.command {
+            Some(Commands::SelfTest {
+                smoke,
+                soak,
+                dry_run,
+                ..
+            }) => {
+                assert!(smoke);
+                assert!(soak);
+                assert!(dry_run);
+            }
+            _ => fail_expected("Expected self-test --smoke command"),
         }
     }
 
