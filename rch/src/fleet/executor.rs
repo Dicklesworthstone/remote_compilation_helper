@@ -1109,7 +1109,15 @@ async fn run_provenance_gate(
 ) -> (ProvenanceVerdict, ArtifactProvenance) {
     let fallback = worker_triple.unwrap_or("unknown");
     let provenance = load_artifact_provenance(local_binary, fallback);
-    let actual_sha = local_file_sha256_hex(local_binary).ok();
+    // Only hash the (potentially large) binary when there is an expected checksum
+    // to compare against; with none, `verify_artifact_provenance` ignores the
+    // actual checksum, so hashing every worker in the common no-manifest dev path
+    // would be wasted work on top of the hash `copy_binary_via_scp` already does.
+    let actual_sha = if provenance.expected_sha256.is_some() {
+        local_file_sha256_hex(local_binary).ok()
+    } else {
+        None
+    };
     let signature_check = evaluate_signature_check(&provenance, local_binary).await;
     let effective_triple =
         worker_triple.map_or_else(|| provenance.target_triple.clone(), str::to_string);
@@ -1208,14 +1216,26 @@ async fn run_smoke_capabilities_with_runner<R: CommandRunner>(
     Ok(assess_admissibility(&facts, req))
 }
 
-/// Production wrapper: run the capabilities smoke scenario over real SSH.
+/// The capability requirement the smoke capabilities scenario asserts: a usable
+/// Rust build worker (cargo present) speaking at least the minimum wire protocol.
+///
+/// `min_protocol` is intentionally **0**. The shipping `rch-wkr` has no
+/// `--protocol-version` subcommand, so the probe reports protocol 0; any
+/// positive floor would reject EVERY real worker — the de04443 / bd-woidb
+/// gotcha, where a positive floor "traps the whole fleet" (the bypass-recovery
+/// `SshRecoveryProber` keeps it at 0 for the same reason). Raise this only in
+/// lockstep with adding that subcommand to `rch-wkr`.
 #[allow(dead_code)] // consumed by the smoke live runner (bd-...-16.6 Part 2)
-async fn run_smoke_capabilities(
-    worker: &WorkerConfig,
-    req: &CapabilityRequirement,
-) -> Result<CapabilityVerdict, FleetSshError> {
+fn smoke_capability_requirement() -> CapabilityRequirement {
+    CapabilityRequirement::rust(0)
+}
+
+/// Production wrapper: run the capabilities smoke scenario over real SSH, using
+/// the smoke default requirement ([`smoke_capability_requirement`]).
+#[allow(dead_code)] // consumed by the smoke live runner (bd-...-16.6 Part 2)
+async fn run_smoke_capabilities(worker: &WorkerConfig) -> Result<CapabilityVerdict, FleetSshError> {
     let ssh = SshExecutor::new(worker);
-    run_smoke_capabilities_with_runner(worker, req, &ssh).await
+    run_smoke_capabilities_with_runner(worker, &smoke_capability_requirement(), &ssh).await
 }
 
 /// Execute the DiskInodeAdmission smoke scenario against a worker: probe the
@@ -3145,6 +3165,33 @@ RCH_FACT target=x86_64-unknown-linux-gnu\n";
         .await
         .unwrap();
         assert!(matches!(verdict, CapabilityVerdict::Rejected { .. }));
+    }
+
+    // The smoke default requirement uses min_protocol=0 because the shipping
+    // rch-wkr has NO --protocol-version subcommand. A worker that runs --version
+    // but reports no protocol (=> 0) must STILL be admitted, or the scenario
+    // would reject the entire real fleet (the de04443 / bd-woidb gotcha).
+    #[tokio::test]
+    async fn smoke_capabilities_default_admits_worker_without_protocol_version() {
+        use crate::fleet::ssh::{MockCommandResult, MockSshExecutor};
+        // Real-fleet shape: version present, NO worker_protocol line, cargo present.
+        let probe_out = "RCH_FACT os=linux\nRCH_FACT arch=x86_64\nRCH_FACT user=rch\n\
+RCH_FACT rch_wkr_path=/home/rch/.local/bin/rch-wkr\nRCH_FACT worker_version=1.0.41\n\
+RCH_FACT cargo_version=cargo 1.98.0-nightly\n";
+        let mock = MockSshExecutor::new()
+            .with_command("--protocol-version", MockCommandResult::ok(probe_out));
+        let verdict = run_smoke_capabilities_with_runner(
+            &smoke_worker(),
+            &smoke_capability_requirement(),
+            &mock,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            verdict,
+            CapabilityVerdict::Admissible,
+            "min_protocol=0 must admit a real worker lacking --protocol-version"
+        );
     }
 
     // ========================
