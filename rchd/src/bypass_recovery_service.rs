@@ -47,6 +47,7 @@ use rch_common::bypass_recovery::{
 };
 use rch_common::capability_probe::{
     FACT_PREFIX, ProbeSpec, build_capability_probe_script, parse_capability_probe,
+    remote_worker_binary_path,
 };
 use rch_common::ssh::{SshClient, SshOptions};
 use rch_common::{BypassFailureClass, WorkerConfig, WorkerId};
@@ -181,22 +182,14 @@ impl SshRecoveryProber {
         Self { telemetry, config }
     }
 
-    /// The exact absolute path to `rch-wkr` for the worker's SSH user. The
-    /// capability probe shell-quotes this path (no `~`/`$HOME` expansion), so it
-    /// must be absolute; a wrong path simply omits the worker-binary fact, which
-    /// keeps the worker bypassed (the safe failure mode — never a false rejoin).
-    fn rch_wkr_path(user: &str) -> String {
-        let home = if user == "root" {
-            "/root".to_string()
-        } else {
-            format!("/home/{user}")
-        };
-        format!("{home}/.local/bin/rch-wkr")
-    }
-
-    /// Build the exact-path capability [`ProbeSpec`] for a worker.
+    /// Build the exact-path capability [`ProbeSpec`] for a worker. The absolute
+    /// `rch-wkr` path comes from the shared [`remote_worker_binary_path`] (the
+    /// probe script shell-quotes it, so a literal `~` would never expand — the
+    /// single source of truth shared with `rch self-test --smoke`). A wrong path
+    /// simply omits the worker-binary fact, keeping the worker bypassed (the safe
+    /// failure mode — never a false rejoin).
     fn probe_spec(&self, config: &WorkerConfig) -> ProbeSpec {
-        let mut spec = ProbeSpec::new(config.user.clone(), Self::rch_wkr_path(&config.user));
+        let mut spec = ProbeSpec::new(config.user.clone(), remote_worker_binary_path(&config.user));
         spec.disk_roots.clone_from(&self.config.disk_roots);
         spec
     }
@@ -1253,11 +1246,11 @@ mod tests {
     #[test]
     fn rch_wkr_path_is_absolute_per_user() {
         assert_eq!(
-            SshRecoveryProber::rch_wkr_path("ubuntu"),
+            remote_worker_binary_path("ubuntu"),
             "/home/ubuntu/.local/bin/rch-wkr"
         );
         assert_eq!(
-            SshRecoveryProber::rch_wkr_path("root"),
+            remote_worker_binary_path("root"),
             "/root/.local/bin/rch-wkr"
         );
     }

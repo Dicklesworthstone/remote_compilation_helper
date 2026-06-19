@@ -56,6 +56,23 @@ fn shq(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// The canonical ABSOLUTE path to the deployed `rch-wkr` binary for a remote
+/// user (`root` -> `/root`, otherwise `/home/<user>`). The probe script
+/// shell-quotes this path, so it MUST be absolute: a literal `~/.local/bin/...`
+/// would be single-quoted and never expand, making `[ -x ... ]` fail and every
+/// worker look like it has a missing binary. Single source of truth for both the
+/// daemon bypass-recovery prober and the `rch self-test --smoke` capability
+/// scenario.
+#[must_use]
+pub fn remote_worker_binary_path(user: &str) -> String {
+    let home = if user == "root" {
+        "/root".to_string()
+    } else {
+        format!("/home/{user}")
+    };
+    format!("{home}/.local/bin/rch-wkr")
+}
+
 /// Build the capability-probe shell script. It is intentionally fail-soft:
 /// every probe that errors simply omits its fact line, so a missing rustup or a
 /// broken binary shows up as *absent facts* (capability), never as a script
@@ -807,5 +824,30 @@ mod tests {
         let after = parse_capability_probe(good_output());
         let v_after = assess_worker_eligibility(&after, &req_wasm(), &WorkerLiveness::ready());
         assert_eq!(v_after, EligibilityVerdict::Eligible);
+    }
+
+    #[test]
+    fn remote_worker_binary_path_is_absolute_per_user() {
+        assert_eq!(
+            remote_worker_binary_path("root"),
+            "/root/.local/bin/rch-wkr"
+        );
+        assert_eq!(
+            remote_worker_binary_path("ubuntu"),
+            "/home/ubuntu/.local/bin/rch-wkr"
+        );
+        // The path must be absolute: the probe script single-quotes it, so a
+        // literal `~` would never expand and `[ -x ... ]` would always fail.
+        for user in ["root", "rch", "ubuntu"] {
+            let path = remote_worker_binary_path(user);
+            assert!(!path.contains('~'), "{path} must not contain a tilde");
+            assert!(path.starts_with('/'), "{path} must be absolute");
+            let spec = ProbeSpec::new(user, path);
+            let script = build_capability_probe_script(&spec);
+            // The shell-quoted binary path embedded in the script is absolute,
+            // so `[ -x ... ]` resolves on the real worker.
+            assert!(script.contains("/.local/bin/rch-wkr'"));
+            assert!(!script.contains("'~/.local/bin/rch-wkr'"));
+        }
     }
 }

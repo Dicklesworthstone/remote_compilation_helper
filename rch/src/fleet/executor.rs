@@ -25,7 +25,7 @@ use crate::error::{FleetError, SshError};
 use futures::future::BoxFuture;
 use rch_common::capability_probe::{
     CapabilityRequirement, CapabilityVerdict, ProbeSpec, assess_admissibility,
-    build_capability_probe_script, parse_capability_probe,
+    build_capability_probe_script, parse_capability_probe, remote_worker_binary_path,
 };
 use rch_common::disk_pressure_report::{
     DiskRootKind, PressureLevel, PressureThresholds, assess_root,
@@ -1183,7 +1183,11 @@ fn now_unix_ms() -> u64 {
 /// path is the exact configured binary location (no PATH resolution), matching
 /// the .7.3 exact-user/path validation discipline.
 fn smoke_capability_probe_spec(worker: &WorkerConfig) -> ProbeSpec {
-    ProbeSpec::new(worker.user.clone(), REMOTE_WORKER_BINARY)
+    // Use the ABSOLUTE binary path: the probe script shell-quotes it, so a
+    // literal `~` would never expand and every worker would look like it has a
+    // missing binary (the live-fleet bug the mock tests masked by injecting an
+    // already-expanded path). Mirrors the daemon bypass-recovery prober.
+    ProbeSpec::new(worker.user.clone(), remote_worker_binary_path(&worker.user))
 }
 
 /// Execute the WorkerCapabilitiesExactUserPath smoke scenario against a worker:
@@ -3437,6 +3441,25 @@ RCH_FACT disk=/var/cache;1048576;10240;900000\n";
             user: "rch".to_string(),
             ..Default::default()
         }
+    }
+
+    // The smoke capability probe must target an ABSOLUTE binary path. The probe
+    // script single-quotes it, so a literal `~/.local/bin/rch-wkr` would never
+    // expand and EVERY real worker would be rejected as binary-missing (the
+    // live-fleet bug the mock tests masked by injecting an expanded path).
+    #[test]
+    fn smoke_capability_probe_spec_uses_absolute_path() {
+        let spec = smoke_capability_probe_spec(&smoke_worker()); // user "rch"
+        assert_eq!(spec.rch_wkr_path, "/home/rch/.local/bin/rch-wkr");
+        assert!(!spec.rch_wkr_path.contains('~'));
+        let root = WorkerConfig {
+            user: "root".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            smoke_capability_probe_spec(&root).rch_wkr_path,
+            "/root/.local/bin/rch-wkr"
+        );
     }
 
     // A healthy worker (good caps + comfortable disk) yields started+passed for

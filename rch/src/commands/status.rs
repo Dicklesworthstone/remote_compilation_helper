@@ -1423,12 +1423,29 @@ const SOAK_PASSES: usize = 3;
 /// The build-root path(s) the disk/inode admission scenario probes for headroom.
 /// Derived from the effective `transfer.remote_base` (where offloaded builds
 /// land), falling back to the documented default when config is unavailable.
+///
+/// The build root itself may not exist yet on a freshly-provisioned worker (it
+/// is created on the first offloaded build), so we ALSO probe its parent mount,
+/// which always exists and shares the relevant filesystem. The disk executor
+/// skips non-existent roots and reports the worst pressure across those present,
+/// so a fresh worker still yields a real reading instead of `Unknown`. Mirrors
+/// the daemon recovery prober, which probes both the base and its parent.
 fn smoke_disk_roots() -> Vec<String> {
     let base = crate::config::load_config_with_sources()
         .ok()
         .map(|loaded| loaded.config.transfer.remote_base)
         .unwrap_or_else(rch_common::types::default_remote_base);
-    vec![base]
+    let mut roots = vec![base.clone()];
+    if let Some(parent) = std::path::Path::new(&base)
+        .parent()
+        .and_then(std::path::Path::to_str)
+        && !parent.is_empty()
+        && parent != "/"
+        && parent != base
+    {
+        roots.push(parent.to_string());
+    }
+    roots
 }
 
 /// Build the smoke-profile inputs from observed environment + flags. Pure so the
