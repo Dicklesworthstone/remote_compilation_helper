@@ -141,7 +141,11 @@ PY
 run_smoke_scenario() {
     local scenario="$1" cfg_dir="$2" expect_scenario="$3" expect_status="$4"
     local out verdict
+    # Isolate the smoke JSONL trace (written via dirs::cache_dir()) into the
+    # per-scenario temp dir so the e2e stays hermetic and does not pollute (or
+    # accumulate in) the runner's real ~/.cache/rch.
     out="$(env -u RCH_OUTPUT_FORMAT NO_COLOR=1 RCH_CONFIG_DIR="$cfg_dir" \
+        XDG_CACHE_HOME="$cfg_dir/cache" \
         "$RCH_BIN" self-test --smoke --dry-run --json 2>/dev/null || true)"
     if [[ -z "$out" ]]; then
         emit "$scenario" "smoke_plan" "skip" "no_output" \
