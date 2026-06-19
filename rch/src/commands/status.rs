@@ -1589,6 +1589,34 @@ async fn self_test_smoke(
         }
     }
 
+    // Proof-mode refusal (client-side, no SSH): when the plan expects a refusal
+    // (remote execution unavailable), confirm the proof-mode control actually
+    // resolves to a fail-closed policy — `RCH_REQUIRE_REMOTE` must refuse local
+    // fallback rather than silently building locally. Exercising the real 13.5
+    // `resolve_placement` path catches a fail-open regression in that mapping.
+    if !dry_run
+        && let Some(planned) = plan
+            .scenarios
+            .iter()
+            .find(|p| p.scenario == SmokeScenario::ProofModeRefusal)
+        && matches!(planned.action, ScenarioAction::ExpectRefusal { .. })
+    {
+        let policy = resolve_placement(|k| (k == "RCH_REQUIRE_REMOTE").then(|| "1".to_string()))
+            .strict_remote_policy;
+        let held = policy.fail_closed();
+        events.push(SmokeProfileEvent::refused(
+            run_id.clone(),
+            SMOKE_BEAD_ID,
+            held,
+            Some(
+                rch_common::IncidentReasonCode::ProofRefusal
+                    .code()
+                    .to_string(),
+            ),
+            0,
+        ));
+    }
+
     let log_path = write_smoke_jsonl(&run_id, &events);
 
     let payload = serde_json::json!({

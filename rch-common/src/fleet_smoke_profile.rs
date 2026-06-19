@@ -418,6 +418,36 @@ impl SmokeProfileEvent {
             artifact_summary: None,
         }
     }
+
+    /// A terminal event for the proof-mode-refusal scenario. `held` = the
+    /// fail-closed invariant held (the system correctly refused local fallback
+    /// when no remote was available) -> `refused`/`ok`; when false the scenario
+    /// `failed`/`fail` — a fail-OPEN safety regression where proof-mode would
+    /// have silently built locally. This scenario is never worker-scoped, so
+    /// `worker_id` is always omitted. `reason_code` carries the proof-refusal
+    /// incident code that should have fired.
+    #[must_use]
+    pub fn refused(
+        run_id: impl Into<String>,
+        bead_id: impl Into<String>,
+        held: bool,
+        reason_code: Option<String>,
+        duration_ms: u64,
+    ) -> Self {
+        Self {
+            run_id: run_id.into(),
+            bead_id: bead_id.into(),
+            worker_id: None,
+            scenario: SmokeScenario::ProofModeRefusal.as_str().to_string(),
+            event: if held { "refused" } else { "failed" }.to_string(),
+            status: if held { "ok" } else { "fail" }.to_string(),
+            reason_code,
+            command_fingerprint: None,
+            duration_ms,
+            remote_target_dir: None,
+            artifact_summary: None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -746,6 +776,24 @@ mod tests {
             Some("wrong_user_path_worker_binary")
         );
         assert_eq!(ev.duration_ms, 7);
+    }
+
+    #[test]
+    fn refused_event_holds_vs_regression() {
+        // The fail-closed invariant held -> a `refused`/`ok` event, never
+        // worker-scoped, carrying the proof-refusal reason code.
+        let ok =
+            SmokeProfileEvent::refused("run-6", "bd-...-16.6", true, Some("RCH-I012".into()), 3);
+        assert_eq!(ok.event, "refused");
+        assert_eq!(ok.status, "ok");
+        assert_eq!(ok.scenario, "proof_mode_refusal");
+        assert_eq!(ok.worker_id, None);
+        assert_eq!(ok.reason_code.as_deref(), Some("RCH-I012"));
+
+        // A fail-OPEN regression (the invariant did not hold) is a hard failure.
+        let bad = SmokeProfileEvent::refused("run-6", "bd-...-16.6", false, None, 3);
+        assert_eq!(bad.event, "failed");
+        assert_eq!(bad.status, "fail");
     }
 
     #[test]
