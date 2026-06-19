@@ -131,7 +131,6 @@ impl HistoryManager {
     /// filtered by worker and capped at `limit`. The audit reader for the fleet
     /// history surface; consumed by tests and (follow-up) a `rch fleet history`
     /// provenance view.
-    #[allow(dead_code)]
     pub fn get_provenance_audit(
         &self,
         limit: usize,
