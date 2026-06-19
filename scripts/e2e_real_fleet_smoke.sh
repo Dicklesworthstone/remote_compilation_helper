@@ -8,10 +8,16 @@
 # structured SmokeProfileEvent trace:
 #
 #   empty_fleet  — no workers configured: every real-worker scenario is SKIPPED
-#                  with reason smoke_no_real_workers; the plan is overall-skipped.
-#   all_absent   — workers configured but no daemon/remote in this hermetic env:
-#                  proof-mode refusal is EXPECTED (fail-closed when remote is
-#                  unavailable); buildy scenarios are planned (dry-run).
+#                  with reason smoke_no_real_workers (asserted on cargo_canary);
+#                  the plan is overall-skipped.
+#   all_absent   — workers configured but unreachable: real-worker scenarios are
+#                  PLANNED (dry-run, not skipped — asserted on cargo_canary),
+#                  which distinguishes it from empty_fleet. (Proof-mode refusal
+#                  depends on live daemon reachability, so it is NOT asserted.)
+#
+# Both per-scenario assertions are invariant of daemon state, so the script
+# distinguishes the two fleet shapes without being flaky on whether an rchd
+# happens to be reachable in the run environment.
 #
 # --dry-run executes nothing live (no SSH, no source mutation) — the deep
 # scenario/skip/refusal logic is proven deterministically by the rch-common unit
@@ -91,13 +97,15 @@ BASE="$LOG_DIR/smoke-$$"
 mkdir -p "$BASE"
 
 # Validate `rch self-test --smoke --dry-run --json` output: a well-formed plan
-# (run_id/bead_id present, exactly the 8 scenarios, a non-empty events array, and
-# every SmokeProfileEvent carrying the required fields + the right bead). Echo
-# "ok" or a stable error token.
+# (run_id/bead_id present, exactly the 8 scenarios, a non-empty events array,
+# every SmokeProfileEvent carrying the required fields + the right bead) AND that
+# the named scenario's planned status matches the fleet shape's expectation (an
+# invariant of daemon reachability, so it actually distinguishes the two shapes).
+# Echoes "ok" or a stable error token. Args: <expect_scenario> <expect_status>.
 validate_smoke_json() {
-    python3 - "$BEAD_ID" <<'PY'
+    python3 - "$BEAD_ID" "$1" "$2" <<'PY'
 import json, sys
-bead = sys.argv[1]
+bead, want_scenario, want_status = sys.argv[1], sys.argv[2], sys.argv[3]
 try:
     d = json.load(sys.stdin)
 except Exception:
@@ -118,12 +126,20 @@ for ev in events:
         print("event_missing:" + ",".join(miss)); sys.exit(0)
     if ev["bead_id"] != bead:
         print("event_wrong_bead"); sys.exit(0)
+# Per-scenario invariant: the named scenario's planned status must match the
+# fleet shape's expectation, regardless of whether a daemon is reachable.
+match = [e for e in events if e.get("scenario") == want_scenario]
+if not match:
+    print("missing_scenario:" + want_scenario); sys.exit(0)
+got = match[0].get("status")
+if got != want_status:
+    print("status_mismatch:%s=%s!=%s" % (want_scenario, got, want_status)); sys.exit(0)
 print("ok")
 PY
 }
 
 run_smoke_scenario() {
-    local scenario="$1" cfg_dir="$2"
+    local scenario="$1" cfg_dir="$2" expect_scenario="$3" expect_status="$4"
     local out verdict
     out="$(env -u RCH_OUTPUT_FORMAT NO_COLOR=1 RCH_CONFIG_DIR="$cfg_dir" \
         "$RCH_BIN" self-test --smoke --dry-run --json 2>/dev/null || true)"
@@ -132,11 +148,11 @@ run_smoke_scenario() {
             "no output in hermetic env (fail-open); logic covered by unit tests"
         return 0
     fi
-    verdict="$(printf '%s' "$out" | validate_smoke_json)"
+    verdict="$(printf '%s' "$out" | validate_smoke_json "$expect_scenario" "$expect_status")"
     case "$verdict" in
         ok)
             emit "$scenario" "smoke_plan" "pass" "" \
-                "self-test --smoke emitted a well-formed plan + SmokeProfileEvent trace" ;;
+                "well-formed plan + SmokeProfileEvent trace; $expect_scenario=$expect_status" ;;
         *)
             emit "$scenario" "smoke_plan" "fail" "$verdict" \
                 "self-test --smoke output failed validation: $verdict" ;;
@@ -144,9 +160,10 @@ run_smoke_scenario() {
 }
 
 # --- empty_fleet: no workers configured ------------------------------------
+# Invariant: a real-worker scenario (cargo_canary) is SKIPPED for lack of workers.
 EF="$BASE/empty_fleet"; mkdir -p "$EF"
 : >"$EF/workers.toml"
-run_smoke_scenario "empty_fleet" "$EF"
+run_smoke_scenario "empty_fleet" "$EF" "cargo_canary" "skip"
 
 # --- all_absent: workers configured but unreachable ------------------------
 AA="$BASE/all_absent"; mkdir -p "$AA"
@@ -167,7 +184,9 @@ identity_file = "~/.ssh/id_ed25519"
 total_slots = 8
 priority = 90
 TOML
-run_smoke_scenario "all_absent" "$AA"
+# Invariant: with workers configured + --dry-run, a real-worker scenario
+# (cargo_canary) is PLANNED as dry_run (not skipped) — distinguishes from empty.
+run_smoke_scenario "all_absent" "$AA" "cargo_canary" "dry_run"
 
 # --- self-validate the emitted harness JSONL schema ------------------------
 schema_ok="$(python3 - "$SUITE_LOG" "$BEAD_ID" <<'PY'

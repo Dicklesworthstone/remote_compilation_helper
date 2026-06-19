@@ -456,14 +456,19 @@ impl FleetDeployAuditRecord {
         }
     }
 
-    /// Mark a failed deploy as successfully rolled back to the previous
-    /// artifact. Used by the deploy/canary path after a reverting rollback.
+    /// Record that a failed deploy was reverted to the previous artifact. This
+    /// is the mutator the rollback path applies to a deploy's audit record
+    /// before re-persisting it; the live deploy/rollback wiring is part of the
+    /// `.7.4` continuation, so today only the rollback-after-canary unit tests
+    /// exercise it.
     pub fn mark_rolled_back(&mut self) {
         self.rollback_status = rollback_status::ROLLED_BACK.to_string();
     }
 
-    /// Mark that a rollback was attempted but did not complete — the worker may
-    /// be in a degraded state and needs operator attention.
+    /// Record that a rollback was attempted but did not complete — the worker
+    /// may be in a degraded state and needs operator attention. Like
+    /// [`Self::mark_rolled_back`], this is applied by the (still-pending)
+    /// deploy/rollback wiring; today only unit tests exercise it.
     pub fn mark_rollback_failed(&mut self) {
         self.rollback_status = rollback_status::ROLLBACK_FAILED.to_string();
     }

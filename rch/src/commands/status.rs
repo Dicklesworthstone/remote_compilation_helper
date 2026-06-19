@@ -1501,11 +1501,13 @@ async fn self_test_smoke(
     let plan = plan_smoke_profile(&inputs);
 
     let run_id = uuid::Uuid::new_v4().to_string();
-    let representative_worker = selected_worker
-        .clone()
-        .or_else(|| workers.first().map(|w| w.id.to_string()));
 
-    let mut events = smoke_planned_events(&plan, &run_id, representative_worker.as_deref());
+    // For a single `--worker` the planned per-worker events are scoped to that
+    // worker; a fleet-wide run (`--all` or the default) leaves worker_id unset,
+    // because the plan is not tied to one worker — per-worker execution is the
+    // live runner's job and would emit one event per worker. Attributing a
+    // fleet-wide plan to an arbitrary `workers.first()` would mislead.
+    let mut events = smoke_planned_events(&plan, &run_id, selected_worker.as_deref());
 
     // Execute the one fully client-side scenario for real: daemon reachability.
     // The per-worker SSH scenarios are planned here; their live execution is the

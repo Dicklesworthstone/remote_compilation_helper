@@ -690,7 +690,8 @@ CHECKS PERFORMED:
         /// Run the real-fleet smoke/soak validation profile (planner + JSONL trace)
         #[arg(long)]
         smoke: bool,
-        /// Soak mode: bounded repeated passes (use with --smoke)
+        /// Soak mode: record repeated-pass intent in the plan (use with --smoke;
+        /// the live repeated passes are run by the operator real-fleet procedure)
         #[arg(long)]
         soak: bool,
         /// Plan only; do not execute scenarios (use with --smoke)
