@@ -23,7 +23,7 @@ use rch_common::fleet_smoke_profile::{
 };
 use rch_common::{
     ApiResponse, CommandPriority, PlacementPlan, RequestedWorkerFacts, RequestedWorkerOutcome,
-    RequiredRuntime, evaluate_requested_worker, normalize_project_path_with_policy,
+    RequiredRuntime, WorkerConfig, evaluate_requested_worker, normalize_project_path_with_policy,
     resolve_placement,
 };
 use std::path::Path;
@@ -1403,13 +1403,33 @@ async fn self_test_run(
 // `SmokeProfileEvent` JSONL trace operators attach to Beads close reasons. The
 // scenario set, skip/refusal logic, and JSONL schema are owned by the pure
 // `rch_common::fleet_smoke_profile` foundation (single source of truth) — this
-// consumer only gathers inputs, runs the planner, performs the one fully
-// client-side scenario (daemon reachability) for real, and renders/persists the
-// trace. Live per-worker SSH execution is the operator real-fleet procedure
-// (documented), paired with the .7.4 deploy E2E since both need the real fleet.
+// consumer gathers inputs, runs the planner, performs the client-side daemon
+// reachability scenario for real, drives the live per-worker SSH probe scenarios
+// (capabilities + disk/inode admission, via the mock-SSH-tested executor
+// orchestrator), and renders/persists the trace. The remaining daemon/pipeline
+// scenarios (cargo canary, artifact retrieval, queue attach/cancel, desired-vs-
+// live fleet) and the client-side proof-mode refusal stay `planned` for now.
 
 /// Owning bead id for the smoke-profile JSONL trace.
 const SMOKE_BEAD_ID: &str = "bd-session-history-remediation-ocv9i.16.6";
+
+/// Number of repeated per-worker probe passes a `--soak` run performs. Soak is a
+/// bounded endurance check that the cheap, idempotent per-worker probes (exact
+/// user/path capabilities + disk/inode headroom) stay green across repeated
+/// passes; a single smoke run does exactly one pass. Full load/endurance soak
+/// (repeated cargo canaries over time) belongs to the daemon-pipeline scenarios.
+const SOAK_PASSES: usize = 3;
+
+/// The build-root path(s) the disk/inode admission scenario probes for headroom.
+/// Derived from the effective `transfer.remote_base` (where offloaded builds
+/// land), falling back to the documented default when config is unavailable.
+fn smoke_disk_roots() -> Vec<String> {
+    let base = crate::config::load_config_with_sources()
+        .ok()
+        .map(|loaded| loaded.config.transfer.remote_base)
+        .unwrap_or_else(rch_common::types::default_remote_base);
+    vec![base]
+}
 
 /// Build the smoke-profile inputs from observed environment + flags. Pure so the
 /// input-derivation is unit-testable without a daemon or workers.
@@ -1510,9 +1530,9 @@ async fn self_test_smoke(
     let mut events = smoke_planned_events(&plan, &run_id, selected_worker.as_deref());
 
     // Execute the one fully client-side scenario for real: daemon reachability.
-    // The per-worker SSH scenarios are planned here; their live execution is the
-    // operator real-fleet procedure. Skipped under --dry-run (which executes
-    // nothing by definition).
+    // The per-worker SSH scenarios then execute live (below); proof-mode refusal
+    // and the daemon/pipeline scenarios remain `planned`. Skipped under --dry-run
+    // (which executes nothing by definition).
     if !dry_run
         && let Some(planned) = plan
             .scenarios
@@ -1520,19 +1540,53 @@ async fn self_test_smoke(
             .find(|p| p.scenario == SmokeScenario::DaemonReachable)
         && planned.action.is_executed()
     {
-        events.push(SmokeProfileEvent {
-            run_id: run_id.clone(),
-            bead_id: SMOKE_BEAD_ID.to_string(),
-            worker_id: None,
-            scenario: SmokeScenario::DaemonReachable.as_str().to_string(),
-            event: if daemon_reachable { "passed" } else { "failed" }.to_string(),
-            status: if daemon_reachable { "ok" } else { "fail" }.to_string(),
-            reason_code: None,
-            command_fingerprint: Some("GET /health".to_string()),
-            duration_ms: probe_ms,
-            remote_target_dir: None,
-            artifact_summary: None,
-        });
+        events.push(SmokeProfileEvent::outcome(
+            run_id.clone(),
+            SMOKE_BEAD_ID,
+            None,
+            SmokeScenario::DaemonReachable,
+            daemon_reachable,
+            Some(
+                rch_common::IncidentReasonCode::DaemonSocketRefused
+                    .code()
+                    .to_string(),
+            ),
+            Some("GET /health".to_string()),
+            probe_ms,
+        ));
+    }
+
+    // Live per-worker SSH scenarios: when not a dry-run and the capabilities
+    // scenario is planned to execute, probe each target worker for real. The
+    // executor orchestrator (mock-SSH tested) runs the WorkerCapabilitiesExactUserPath
+    // and DiskInodeAdmission scenarios and returns started/passed/failed events.
+    // The other five scenarios are daemon/pipeline-level (composed elsewhere) or
+    // client-side (proof-mode refusal); they remain `planned` here.
+    if !dry_run
+        && plan.scenarios.iter().any(|p| {
+            p.scenario == SmokeScenario::WorkerCapabilitiesExactUserPath && p.action.is_executed()
+        })
+    {
+        let disk_roots = smoke_disk_roots();
+        // A single `--worker` scopes to that worker; otherwise every configured
+        // worker is exercised. Soak repeats each pass `soak_passes()` times.
+        let targets: Vec<&WorkerConfig> = match selected_worker.as_deref() {
+            Some(id) => workers.iter().filter(|w| w.id.0 == id).collect(),
+            None => workers.iter().collect(),
+        };
+        let passes = if soak { SOAK_PASSES } else { 1 };
+        for _ in 0..passes {
+            for worker in &targets {
+                let worker_events = crate::fleet::run_smoke_worker_scenarios(
+                    &run_id,
+                    SMOKE_BEAD_ID,
+                    worker,
+                    &disk_roots,
+                )
+                .await;
+                events.extend(worker_events);
+            }
+        }
     }
 
     let log_path = write_smoke_jsonl(&run_id, &events);

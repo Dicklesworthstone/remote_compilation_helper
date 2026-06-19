@@ -34,6 +34,7 @@ use rch_common::fleet_provenance::{
     ArtifactProvenance, FleetDeployAuditRecord, ProvenancePolicy, ProvenanceVerdict,
     SignatureCheck, verify_artifact_provenance,
 };
+use rch_common::fleet_smoke_profile::{SmokeProfileEvent, SmokeScenario};
 use rch_common::ssh_utils::shell_escape_path_with_home;
 use rch_common::{IncidentReasonCode, WorkerCapabilities, WorkerConfig, WorkerId};
 use serde::{Deserialize, Serialize};
@@ -1181,7 +1182,6 @@ fn now_unix_ms() -> u64 {
 /// Exact-user/path capability probe spec for a worker's installed `rch-wkr`. The
 /// path is the exact configured binary location (no PATH resolution), matching
 /// the .7.3 exact-user/path validation discipline.
-#[allow(dead_code)] // consumed by the smoke live runner (bd-...-16.6 Part 2)
 fn smoke_capability_probe_spec(worker: &WorkerConfig) -> ProbeSpec {
     ProbeSpec::new(worker.user.clone(), REMOTE_WORKER_BINARY)
 }
@@ -1191,7 +1191,6 @@ fn smoke_capability_probe_spec(worker: &WorkerConfig) -> ProbeSpec {
 /// `req`. A probe that yields no parseable facts (the binary is missing or
 /// unusable as the configured user) is a rejection, never a silent pass. Generic
 /// over the runner so it is mock-SSH integration-testable.
-#[allow(dead_code)] // consumed by the smoke live runner (bd-...-16.6 Part 2)
 async fn run_smoke_capabilities_with_runner<R: CommandRunner>(
     worker: &WorkerConfig,
     req: &CapabilityRequirement,
@@ -1225,17 +1224,8 @@ async fn run_smoke_capabilities_with_runner<R: CommandRunner>(
 /// gotcha, where a positive floor "traps the whole fleet" (the bypass-recovery
 /// `SshRecoveryProber` keeps it at 0 for the same reason). Raise this only in
 /// lockstep with adding that subcommand to `rch-wkr`.
-#[allow(dead_code)] // consumed by the smoke live runner (bd-...-16.6 Part 2)
 fn smoke_capability_requirement() -> CapabilityRequirement {
     CapabilityRequirement::rust(0)
-}
-
-/// Production wrapper: run the capabilities smoke scenario over real SSH, using
-/// the smoke default requirement ([`smoke_capability_requirement`]).
-#[allow(dead_code)] // consumed by the smoke live runner (bd-...-16.6 Part 2)
-async fn run_smoke_capabilities(worker: &WorkerConfig) -> Result<CapabilityVerdict, FleetSshError> {
-    let ssh = SshExecutor::new(worker);
-    run_smoke_capabilities_with_runner(worker, &smoke_capability_requirement(), &ssh).await
 }
 
 /// Execute the DiskInodeAdmission smoke scenario against a worker: probe the
@@ -1245,7 +1235,6 @@ async fn run_smoke_capabilities(worker: &WorkerConfig) -> Result<CapabilityVerdi
 /// roots (none configured, or df gave nothing) is `Unknown`. The caller treats
 /// both `Critical` and `Unknown` as a failed admission — never a silent pass.
 /// Generic over the runner for mock-SSH integration testing.
-#[allow(dead_code)] // consumed by the smoke live runner (bd-...-16.6 Part 2)
 async fn run_smoke_disk_inode_with_runner<R: CommandRunner>(
     worker: &WorkerConfig,
     roots: &[String],
@@ -1267,15 +1256,164 @@ async fn run_smoke_disk_inode_with_runner<R: CommandRunner>(
         .fold(PressureLevel::Ok, PressureLevel::worse))
 }
 
-/// Production wrapper: run the disk/inode admission smoke scenario over real SSH.
-#[allow(dead_code)] // consumed by the smoke live runner (bd-...-16.6 Part 2)
-async fn run_smoke_disk_inode(
+/// Execute the per-worker SSH-probe smoke scenarios that have clean executors —
+/// `WorkerCapabilitiesExactUserPath` and `DiskInodeAdmission` — against one
+/// worker and return the lifecycle JSONL events (`started` then `passed`/`failed`
+/// per scenario). The other five scenarios are daemon/pipeline-level and are
+/// composed by the live runner from existing daemon calls, not as standalone SSH
+/// probes. Generic over the runner so the live wiring is mock-SSH
+/// integration-testable WITHOUT a real fleet.
+///
+/// A scenario "passes" only on an affirmatively-good verdict: capabilities must
+/// be [`CapabilityVerdict::Admissible`]; disk/inode must be strictly better than
+/// `Critical`/`Unknown` (both of which mean an offloaded build could hit
+/// `No space left on device` — never a silent pass). An SSH error is a `failed`
+/// outcome carrying the worker-unreachable reason, never a swallowed pass.
+async fn run_smoke_worker_scenarios_with_runner<R: CommandRunner>(
+    run_id: &str,
+    bead_id: &str,
     worker: &WorkerConfig,
-    roots: &[String],
+    disk_roots: &[String],
     thresholds: &PressureThresholds,
-) -> Result<PressureLevel, FleetSshError> {
+    runner: &R,
+) -> Vec<SmokeProfileEvent> {
+    let mut events = Vec::with_capacity(4);
+    let worker_id = worker.id.to_string();
+
+    // --- WorkerCapabilitiesExactUserPath ---
+    let scenario = SmokeScenario::WorkerCapabilitiesExactUserPath;
+    events.push(SmokeProfileEvent::started(
+        run_id,
+        bead_id,
+        Some(worker_id.clone()),
+        scenario,
+    ));
+    let started = std::time::Instant::now();
+    let cap_result =
+        run_smoke_capabilities_with_runner(worker, &smoke_capability_requirement(), runner).await;
+    let cap_ms = smoke_elapsed_ms(started);
+    let cap_fingerprint = Some("rch-wkr capability probe (exact user/path)".to_string());
+    events.push(match cap_result {
+        Ok(CapabilityVerdict::Admissible) => SmokeProfileEvent::outcome(
+            run_id,
+            bead_id,
+            Some(worker_id.clone()),
+            scenario,
+            true,
+            None,
+            cap_fingerprint,
+            cap_ms,
+        ),
+        Ok(CapabilityVerdict::Rejected { reason, .. }) => SmokeProfileEvent::outcome(
+            run_id,
+            bead_id,
+            Some(worker_id.clone()),
+            scenario,
+            false,
+            Some(reason.code().to_string()),
+            cap_fingerprint,
+            cap_ms,
+        ),
+        Err(_) => SmokeProfileEvent::outcome(
+            run_id,
+            bead_id,
+            Some(worker_id.clone()),
+            scenario,
+            false,
+            Some(SMOKE_WORKER_UNREACHABLE.to_string()),
+            cap_fingerprint,
+            cap_ms,
+        ),
+    });
+
+    // --- DiskInodeAdmission ---
+    let scenario = SmokeScenario::DiskInodeAdmission;
+    events.push(SmokeProfileEvent::started(
+        run_id,
+        bead_id,
+        Some(worker_id.clone()),
+        scenario,
+    ));
+    let started = std::time::Instant::now();
+    let disk_result =
+        run_smoke_disk_inode_with_runner(worker, disk_roots, thresholds, runner).await;
+    let disk_ms = smoke_elapsed_ms(started);
+    let disk_fingerprint = Some("df -Pk / df -Pi (build root headroom)".to_string());
+    events.push(match disk_result {
+        Ok(level) if !matches!(level, PressureLevel::Critical | PressureLevel::Unknown) => {
+            SmokeProfileEvent::outcome(
+                run_id,
+                bead_id,
+                Some(worker_id.clone()),
+                scenario,
+                true,
+                None,
+                disk_fingerprint,
+                disk_ms,
+            )
+        }
+        Ok(level) => SmokeProfileEvent::outcome(
+            run_id,
+            bead_id,
+            Some(worker_id.clone()),
+            scenario,
+            false,
+            // `Critical` maps to the operator-resolvable incident code
+            // (`rch error explain RCH-Innn`); `Unknown` (cannot assess) has no
+            // incident code, so it gets a descriptive token.
+            Some(match level {
+                PressureLevel::Critical => IncidentReasonCode::CriticalPressure.code().to_string(),
+                _ => "disk_pressure_unknown".to_string(),
+            }),
+            disk_fingerprint,
+            disk_ms,
+        ),
+        Err(_) => SmokeProfileEvent::outcome(
+            run_id,
+            bead_id,
+            Some(worker_id),
+            scenario,
+            false,
+            Some(SMOKE_WORKER_UNREACHABLE.to_string()),
+            disk_fingerprint,
+            disk_ms,
+        ),
+    });
+
+    events
+}
+
+/// Reason-code token for an SSH transport failure during a smoke probe. There is
+/// no `IncidentReasonCode` for raw worker unreachability (the capability/disk
+/// codes describe *binary*/*headroom* problems, not transport), so the smoke
+/// trace uses a descriptive snake_case token — the same convention the .7.3 fleet
+/// validation uses for reasons without an incident code.
+const SMOKE_WORKER_UNREACHABLE: &str = "worker_unreachable";
+
+/// Milliseconds elapsed since `started`, saturating into `u64`.
+fn smoke_elapsed_ms(started: std::time::Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Production wrapper: run the per-worker smoke SSH scenarios over real SSH and
+/// return the lifecycle JSONL events. Called by the `rch self-test --smoke` live
+/// runner (commands/status.rs) for each target worker on a non-dry-run pass.
+pub(crate) async fn run_smoke_worker_scenarios(
+    run_id: &str,
+    bead_id: &str,
+    worker: &WorkerConfig,
+    disk_roots: &[String],
+) -> Vec<SmokeProfileEvent> {
     let ssh = SshExecutor::new(worker);
-    run_smoke_disk_inode_with_runner(worker, roots, thresholds, &ssh).await
+    run_smoke_worker_scenarios_with_runner(
+        run_id,
+        bead_id,
+        worker,
+        disk_roots,
+        &PressureThresholds::default(),
+        &ssh,
+    )
+    .await
 }
 
 /// Refuse to deploy a binary whose OS/arch is incompatible with the worker.
@@ -3287,5 +3425,166 @@ RCH_FACT disk=/var/cache;1048576;10240;900000\n";
         .await
         .unwrap();
         assert_eq!(level, PressureLevel::Critical);
+    }
+
+    // ========================
+    // Per-worker live runner orchestrator — mock-SSH integration (bd-...-16.6 Part 3)
+    // ========================
+
+    fn smoke_worker_named(id: &str) -> WorkerConfig {
+        WorkerConfig {
+            id: WorkerId(id.to_string()),
+            user: "rch".to_string(),
+            ..Default::default()
+        }
+    }
+
+    // A healthy worker (good caps + comfortable disk) yields started+passed for
+    // BOTH per-worker scenarios, scoped to the worker, in stable order.
+    #[tokio::test]
+    async fn smoke_worker_scenarios_all_pass_on_healthy_worker() {
+        use crate::fleet::ssh::{MockCommandResult, MockSshExecutor};
+        let probe_out = "RCH_FACT os=linux\nRCH_FACT arch=x86_64\nRCH_FACT user=rch\n\
+RCH_FACT rch_wkr_path=/home/rch/.local/bin/rch-wkr\nRCH_FACT worker_version=1.0.41\n\
+RCH_FACT cargo_version=cargo 1.98.0-nightly\n\
+RCH_FACT disk=/tmp/rch;1048576;524288;900000\n";
+        // The full multi-line probe script embeds both `--protocol-version` and
+        // `df -Pk`; one mock entry keyed on a shared substring serves both calls.
+        let mock = MockSshExecutor::new()
+            .with_command("RCH_FACT", MockCommandResult::ok(probe_out))
+            .with_command("--protocol-version", MockCommandResult::ok(probe_out));
+        let events = run_smoke_worker_scenarios_with_runner(
+            "run-x",
+            "bd-...-16.6",
+            &smoke_worker_named("css"),
+            &["/tmp/rch".to_string()],
+            &PressureThresholds::default(),
+            &mock,
+        )
+        .await;
+        // started, passed (capabilities); started, passed (disk).
+        assert_eq!(events.len(), 4);
+        let tokens: Vec<(&str, &str)> = events
+            .iter()
+            .map(|e| (e.scenario.as_str(), e.event.as_str()))
+            .collect();
+        assert_eq!(
+            tokens,
+            vec![
+                ("worker_capabilities_exact_user_path", "started"),
+                ("worker_capabilities_exact_user_path", "passed"),
+                ("disk_inode_admission", "started"),
+                ("disk_inode_admission", "passed"),
+            ]
+        );
+        for e in &events {
+            assert_eq!(e.worker_id.as_deref(), Some("css"));
+            assert_eq!(e.run_id, "run-x");
+        }
+        // Passing outcomes carry no reason code.
+        for e in events.iter().filter(|e| e.event == "passed") {
+            assert!(e.reason_code.is_none());
+        }
+    }
+
+    // A missing/broken binary fails capabilities (with the incident code) but the
+    // disk probe still runs and passes — scenarios are independent.
+    #[tokio::test]
+    async fn smoke_worker_scenarios_capabilities_fail_disk_pass() {
+        use crate::fleet::ssh::{MockCommandResult, MockSshExecutor};
+        // os present but NO worker version => Rejected(WrongUserPathWorkerBinary);
+        // disk facts still present and comfortable.
+        let probe_out = "RCH_FACT os=linux\nRCH_FACT arch=x86_64\nRCH_FACT user=rch\n\
+RCH_FACT disk=/tmp/rch;1048576;524288;900000\n";
+        let mock = MockSshExecutor::new()
+            .with_command("RCH_FACT", MockCommandResult::ok(probe_out))
+            .with_command("--protocol-version", MockCommandResult::ok(probe_out));
+        let events = run_smoke_worker_scenarios_with_runner(
+            "run-y",
+            "bd-...-16.6",
+            &smoke_worker_named("hz1"),
+            &["/tmp/rch".to_string()],
+            &PressureThresholds::default(),
+            &mock,
+        )
+        .await;
+        let cap = events
+            .iter()
+            .find(|e| e.scenario == "worker_capabilities_exact_user_path" && e.event == "failed")
+            .expect("capabilities failed event");
+        assert_eq!(cap.status, "fail");
+        assert_eq!(
+            cap.reason_code.as_deref(),
+            Some(IncidentReasonCode::WrongUserPathWorkerBinary.code())
+        );
+        // Disk still ran and passed.
+        assert!(
+            events
+                .iter()
+                .any(|e| e.scenario == "disk_inode_admission" && e.event == "passed")
+        );
+    }
+
+    // Critical disk pressure is a failed admission carrying the incident code,
+    // never a silent pass.
+    #[tokio::test]
+    async fn smoke_worker_scenarios_disk_critical_fails() {
+        use crate::fleet::ssh::{MockCommandResult, MockSshExecutor};
+        let probe_out = "RCH_FACT os=linux\nRCH_FACT user=rch\n\
+RCH_FACT rch_wkr_path=/home/rch/.local/bin/rch-wkr\nRCH_FACT worker_version=1.0.41\n\
+RCH_FACT cargo_version=cargo 1.98.0-nightly\n\
+RCH_FACT disk=/tmp/rch;1048576;10240;900000\n";
+        let mock = MockSshExecutor::new()
+            .with_command("RCH_FACT", MockCommandResult::ok(probe_out))
+            .with_command("--protocol-version", MockCommandResult::ok(probe_out));
+        let events = run_smoke_worker_scenarios_with_runner(
+            "run-z",
+            "bd-...-16.6",
+            &smoke_worker_named("hz1"),
+            &["/tmp/rch".to_string()],
+            &PressureThresholds::default(),
+            &mock,
+        )
+        .await;
+        let disk = events
+            .iter()
+            .find(|e| e.scenario == "disk_inode_admission" && e.event == "failed")
+            .expect("disk failed event");
+        assert_eq!(
+            disk.reason_code.as_deref(),
+            Some(IncidentReasonCode::CriticalPressure.code())
+        );
+    }
+
+    // An unreachable worker fails BOTH scenarios with the worker_unreachable
+    // token — an SSH transport error is never swallowed into a pass.
+    #[tokio::test]
+    async fn smoke_worker_scenarios_unreachable_fails_both() {
+        use crate::fleet::ssh::MockSshExecutor;
+        let mock = MockSshExecutor::unreachable();
+        let events = run_smoke_worker_scenarios_with_runner(
+            "run-w",
+            "bd-...-16.6",
+            &smoke_worker_named("dead"),
+            &["/tmp/rch".to_string()],
+            &PressureThresholds::default(),
+            &mock,
+        )
+        .await;
+        let failed: Vec<&str> = events
+            .iter()
+            .filter(|e| e.event == "failed")
+            .map(|e| e.scenario.as_str())
+            .collect();
+        assert_eq!(
+            failed,
+            vec![
+                "worker_capabilities_exact_user_path",
+                "disk_inode_admission"
+            ]
+        );
+        for e in events.iter().filter(|e| e.event == "failed") {
+            assert_eq!(e.reason_code.as_deref(), Some("worker_unreachable"));
+        }
     }
 }

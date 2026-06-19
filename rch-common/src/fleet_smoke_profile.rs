@@ -361,6 +361,63 @@ impl SmokeProfileEvent {
             artifact_summary: None,
         }
     }
+
+    /// A `started` event emitted immediately before the consumer executes a
+    /// scenario against a worker (live runner only — a dry-run never starts).
+    /// `worker_id` is preserved only for scenarios that pertain to a worker.
+    #[must_use]
+    pub fn started(
+        run_id: impl Into<String>,
+        bead_id: impl Into<String>,
+        worker_id: Option<String>,
+        scenario: SmokeScenario,
+    ) -> Self {
+        Self {
+            run_id: run_id.into(),
+            bead_id: bead_id.into(),
+            worker_id: worker_id.filter(|_| scenario.requires_real_worker()),
+            scenario: scenario.as_str().to_string(),
+            event: "started".to_string(),
+            status: "run".to_string(),
+            reason_code: None,
+            command_fingerprint: None,
+            duration_ms: 0,
+            remote_target_dir: None,
+            artifact_summary: None,
+        }
+    }
+
+    /// A terminal `passed`/`failed` outcome event after the consumer executed a
+    /// scenario. `passed` selects the `passed`/`ok` vs `failed`/`fail`
+    /// event/status tokens; `reason_code` carries the failure reason (`None` on
+    /// success); `command_fingerprint` is the redacted command that ran, if any.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)] // one param per JSONL field the outcome carries
+    pub fn outcome(
+        run_id: impl Into<String>,
+        bead_id: impl Into<String>,
+        worker_id: Option<String>,
+        scenario: SmokeScenario,
+        passed: bool,
+        reason_code: Option<String>,
+        command_fingerprint: Option<String>,
+        duration_ms: u64,
+    ) -> Self {
+        Self {
+            run_id: run_id.into(),
+            bead_id: bead_id.into(),
+            worker_id: worker_id.filter(|_| scenario.requires_real_worker()),
+            scenario: scenario.as_str().to_string(),
+            event: if passed { "passed" } else { "failed" }.to_string(),
+            status: if passed { "ok" } else { "fail" }.to_string(),
+            // A passing scenario never carries a failure reason.
+            reason_code: reason_code.filter(|_| !passed),
+            command_fingerprint,
+            duration_ms,
+            remote_target_dir: None,
+            artifact_summary: None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -623,6 +680,72 @@ mod tests {
             serde_json::to_string(&ScenarioAction::Run).unwrap(),
             "{\"action\":\"run\"}"
         );
+    }
+
+    #[test]
+    fn started_event_marks_run_and_scopes_worker() {
+        let ev = SmokeProfileEvent::started(
+            "run-3",
+            "bd-...-16.6",
+            Some("css".into()),
+            SmokeScenario::WorkerCapabilitiesExactUserPath,
+        );
+        assert_eq!(ev.event, "started");
+        assert_eq!(ev.status, "run");
+        assert_eq!(ev.scenario, "worker_capabilities_exact_user_path");
+        assert_eq!(ev.worker_id.as_deref(), Some("css"));
+        assert_eq!(ev.duration_ms, 0);
+        assert!(ev.reason_code.is_none());
+        // A worker-id passed for a daemon-only scenario is dropped.
+        let daemon = SmokeProfileEvent::started(
+            "run-3",
+            "bd-...-16.6",
+            Some("css".into()),
+            SmokeScenario::DaemonReachable,
+        );
+        assert_eq!(daemon.worker_id, None);
+    }
+
+    #[test]
+    fn outcome_passed_drops_reason_and_sets_ok_tokens() {
+        let ev = SmokeProfileEvent::outcome(
+            "run-4",
+            "bd-...-16.6",
+            Some("hz1".into()),
+            SmokeScenario::DiskInodeAdmission,
+            true,
+            // A stray reason code on a pass must be dropped.
+            Some("disk_pressure_critical".into()),
+            Some("df -Pk".into()),
+            42,
+        );
+        assert_eq!(ev.event, "passed");
+        assert_eq!(ev.status, "ok");
+        assert_eq!(ev.reason_code, None);
+        assert_eq!(ev.command_fingerprint.as_deref(), Some("df -Pk"));
+        assert_eq!(ev.duration_ms, 42);
+        assert_eq!(ev.worker_id.as_deref(), Some("hz1"));
+    }
+
+    #[test]
+    fn outcome_failed_keeps_reason_and_sets_fail_tokens() {
+        let ev = SmokeProfileEvent::outcome(
+            "run-5",
+            "bd-...-16.6",
+            Some("hz1".into()),
+            SmokeScenario::WorkerCapabilitiesExactUserPath,
+            false,
+            Some("wrong_user_path_worker_binary".into()),
+            None,
+            7,
+        );
+        assert_eq!(ev.event, "failed");
+        assert_eq!(ev.status, "fail");
+        assert_eq!(
+            ev.reason_code.as_deref(),
+            Some("wrong_user_path_worker_binary")
+        );
+        assert_eq!(ev.duration_ms, 7);
     }
 
     #[test]
