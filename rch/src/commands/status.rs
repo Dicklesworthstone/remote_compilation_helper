@@ -1448,6 +1448,38 @@ fn smoke_disk_roots() -> Vec<String> {
     roots
 }
 
+/// Decide the DesiredVsLiveFleet smoke outcome from the fleet status report.
+///
+/// The inventory is "consistent" when no desired worker is sustained-absent from
+/// live eligibility (no [`absence_alerts`](rch_common::fleet_status::FleetStatusReport::absence_alerts))
+/// and the fleet has not collapsed to zero usable workers. Present-but-degraded
+/// workers (busy, disk pressure, stale telemetry) are NOT inventory drift — they
+/// are in the pool, just not ready — so this deliberately does not key off the
+/// general `problem_class`. Pure so it is unit-testable without a daemon.
+fn smoke_fleet_consistency(
+    report: &rch_common::fleet_status::FleetStatusReport,
+) -> (bool, Option<String>) {
+    if report.capacity_collapsed() {
+        return (false, Some("fleet_capacity_collapsed".to_string()));
+    }
+    if !report.absence_alerts.is_empty() {
+        return (false, Some("fleet_workers_absent".to_string()));
+    }
+    (true, None)
+}
+
+/// Fetch the daemon full status and fold it into a fleet status report (reuses
+/// the same `GET /status` + [`build_fleet_status_report`] path as `rch status
+/// --fleet`). Used by the DesiredVsLiveFleet smoke scenario.
+async fn fetch_fleet_status_report() -> Result<rch_common::fleet_status::FleetStatusReport> {
+    let response = send_daemon_command("GET /status\n").await?;
+    let json = extract_json_body(&response)
+        .ok_or_else(|| anyhow::anyhow!("Invalid response format from daemon"))?;
+    let status: DaemonFullStatusResponse =
+        serde_json::from_str(json).context("Failed to parse daemon status response")?;
+    Ok(build_fleet_status_report(&status))
+}
+
 /// Build the smoke-profile inputs from observed environment + flags. Pure so the
 /// input-derivation is unit-testable without a daemon or workers.
 fn build_smoke_inputs(
@@ -1570,6 +1602,35 @@ async fn self_test_smoke(
             ),
             Some("GET /health".to_string()),
             probe_ms,
+        ));
+    }
+
+    // DesiredVsLiveFleet (daemon-view, no SSH): when planned to run, query the
+    // daemon's full status, build the fleet report, and assert inventory
+    // consistency — no desired worker sustained-absent and the fleet not
+    // collapsed. A failed daemon fetch is a failed outcome (cannot verify).
+    if !dry_run
+        && let Some(planned) = plan
+            .scenarios
+            .iter()
+            .find(|p| p.scenario == SmokeScenario::DesiredVsLiveFleet)
+        && planned.action.is_executed()
+    {
+        let started = std::time::Instant::now();
+        let (passed, reason) = match fetch_fleet_status_report().await {
+            Ok(report) => smoke_fleet_consistency(&report),
+            Err(_) => (false, Some("fleet_status_unavailable".to_string())),
+        };
+        let ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        events.push(SmokeProfileEvent::outcome(
+            run_id.clone(),
+            SMOKE_BEAD_ID,
+            None,
+            SmokeScenario::DesiredVsLiveFleet,
+            passed,
+            reason,
+            Some("GET /status".to_string()),
+            ms,
         ));
     }
 
@@ -2852,5 +2913,53 @@ mod tests {
             .unwrap();
         assert_eq!(proof.status, "skip");
         assert_eq!(proof.reason_code.as_deref(), Some("smoke_remote_available"));
+    }
+
+    #[test]
+    fn smoke_fleet_consistency_pass_and_fail_paths() {
+        use rch_common::fleet_diff::WorkerObservation;
+        use rch_common::fleet_status::{
+            DEFAULT_ABSENCE_THRESHOLD_SECS, FleetWorkerSignal, compute_fleet_status,
+        };
+        let ready = |id: &str| FleetWorkerSignal {
+            observation: WorkerObservation {
+                worker_id: id.to_string(),
+                configured: true,
+                in_daemon_pool: true,
+                reachable: true,
+                admin_disabled: false,
+                temporarily_bypassed: false,
+                facts_known: true,
+                command_admissible: true,
+            },
+            disk_pressure: false,
+            slots_saturated: false,
+            absent_secs: None,
+        };
+
+        // Ready workers, no absences -> inventory consistent.
+        let healthy =
+            compute_fleet_status(&[ready("a"), ready("b")], DEFAULT_ABSENCE_THRESHOLD_SECS);
+        assert_eq!(smoke_fleet_consistency(&healthy), (true, None));
+
+        // Workers present but none ready -> capacity collapsed -> inconsistent.
+        let mut down1 = ready("a");
+        down1.observation.reachable = false;
+        let mut down2 = ready("b");
+        down2.observation.reachable = false;
+        let collapsed = compute_fleet_status(&[down1, down2], DEFAULT_ABSENCE_THRESHOLD_SECS);
+        let (ok, reason) = smoke_fleet_consistency(&collapsed);
+        assert!(!ok);
+        assert_eq!(reason.as_deref(), Some("fleet_capacity_collapsed"));
+
+        // A configured worker sustained-absent from live -> inventory drift.
+        let mut absent = ready("c");
+        absent.observation.reachable = false;
+        absent.observation.in_daemon_pool = false;
+        absent.absent_secs = Some(DEFAULT_ABSENCE_THRESHOLD_SECS + 10);
+        let drifted = compute_fleet_status(&[ready("a"), absent], DEFAULT_ABSENCE_THRESHOLD_SECS);
+        let (ok2, reason2) = smoke_fleet_consistency(&drifted);
+        assert!(!ok2);
+        assert_eq!(reason2.as_deref(), Some("fleet_workers_absent"));
     }
 }
