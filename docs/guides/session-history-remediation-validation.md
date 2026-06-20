@@ -193,6 +193,50 @@ name the review evidence.
 | `bd-session-history-remediation-ocv9i.15.2` | close-reason evidence for rewritten safe automated recovery runbooks |
 | `bd-session-history-remediation-ocv9i.15.3` | close-reason evidence for CASS query pack and raw-session fallback |
 
+## Real-Fleet Smoke and Soak Profile (16.6)
+
+Mock-worker E2E proves logic in CI; the real-fleet smoke profile lets an operator
+verify an ACTUAL worker fleet. Run it **after a fleet deploy or `rch update
+--fleet`, after recovery from disk pressure, after a daemon restart, and before
+trusting proof results**.
+
+```bash
+rch self-test --smoke --dry-run --json     # plan only — safe anywhere, no SSH
+rch self-test --smoke --worker hz1 --json  # one healthy worker (bounded canary)
+rch self-test --smoke --json               # whole fleet (canary on the first worker)
+rch self-test --smoke --soak --worker hz1  # repeat the cheap probes N passes
+rch self-test --smoke --timeout 240 --json # raise the per-worker canary budget
+```
+
+It runs eight scenarios (`daemon_reachable`, `desired_vs_live_fleet`,
+`worker_capabilities_exact_user_path`, `disk_inode_admission`, `cargo_canary`,
+`artifact_retrieval`, `queue_attach_cancel`, `proof_mode_refusal`) and emits a
+structured `SmokeProfileEvent` JSONL trace to `~/.cache/rch/smoke/<run_id>.jsonl`
+(also under `.log_path` / `.events` in `--json`). It is **non-destructive**:
+per-worker checks are read-only SSH probes plus a tiny throwaway cargo canary;
+`queue_attach_cancel` only cancels a synthetic build id and never touches a real
+in-flight build.
+
+Reading the trace:
+
+- `cargo_canary` passes when the remote build COMPLETED; `artifact_retrieval`
+  passes when the artifact RETURNED. Bit-for-bit identity to the local build is
+  reported in `artifact_summary` as informational, **not** a pass requirement —
+  workers whose rustc differs from the orchestrator legitimately differ (see
+  `bd-784xt`).
+- A `--worker` run skips `desired_vs_live_fleet` (`smoke_not_selected`);
+  `proof_mode_refusal` runs only when remote execution is unavailable.
+- A failed `disk_inode_admission` (e.g. `RCH-I002`) or a per-worker canary
+  failure reflects that worker's real health — it is a finding, not a tool bug.
+
+Attach the trace to a Beads close reason:
+
+```bash
+rch self-test --smoke --worker hz1 --json > /tmp/smoke.json
+cp "$(jq -r .log_path /tmp/smoke.json)" docs/evidence/smoke_<bead>_<date>.jsonl
+# cite docs/evidence/smoke_*.jsonl in `br close --reason`
+```
+
 ## Release Gate
 
 Before closing any non-doc remediation child bead:
