@@ -2498,6 +2498,13 @@ allowlist = ["RUSTFLAGS", "CARGO_TARGET_DIR"]
 [output]
 # Hook output visibility: none, summary, verbose
 visibility = "none"
+
+[routing]
+# Pin this project's remote builds to specific worker IDs (from workers.toml).
+# When set, the daemon selects ONLY these workers if any is eligible, and falls
+# back to all eligible workers only if none are. Use to keep a project with a
+# huge target dir on big-disk workers. Merged with the RCH_WORKER env var.
+# preferred_workers = ["hz2", "vmi1264463"]
 "#
     )
 }

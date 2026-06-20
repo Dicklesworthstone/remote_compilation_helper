@@ -379,6 +379,53 @@ fn dedupe_worker_ids(workers: Vec<WorkerId>) -> Vec<WorkerId> {
     deduped
 }
 
+/// Read `[routing] preferred_workers` from the project-local `.rch/config.toml`
+/// (relative to the current dir, matching `config::resolved_source_paths`). This
+/// lets a repo durably pin its remote builds to specific workers — e.g. routing a
+/// project whose target dir is huge to big-disk boxes — without a per-invocation
+/// `RCH_WORKER` env. Merged with the env-based preference list by the caller, then
+/// deduped. Best-effort: a missing file / parse error / wrong shape yields an empty
+/// list (no pinning), never an error, so a malformed project config can never break
+/// the build path.
+fn preferred_workers_from_project_config() -> Vec<WorkerId> {
+    let path = std::env::current_dir()
+        .map(|dir| dir.join(".rch/config.toml"))
+        .unwrap_or_else(|_| PathBuf::from(".rch/config.toml"));
+    preferred_workers_from_config_path(&path)
+}
+
+fn preferred_workers_from_config_path(path: &Path) -> Vec<WorkerId> {
+    match std::fs::read_to_string(path) {
+        Ok(contents) => parse_preferred_workers_from_toml(&contents),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Extract `[routing] preferred_workers = ["id", ...]` from project-config TOML.
+/// Unknown sections (e.g. `[compilation]`) are ignored; a wrong-typed or malformed
+/// value yields an empty list rather than an error.
+fn parse_preferred_workers_from_toml(contents: &str) -> Vec<WorkerId> {
+    #[derive(serde::Deserialize)]
+    struct Doc {
+        routing: Option<RoutingSection>,
+    }
+    #[derive(serde::Deserialize)]
+    struct RoutingSection {
+        preferred_workers: Option<Vec<String>>,
+    }
+    let Ok(doc) = toml::from_str::<Doc>(contents) else {
+        return Vec::new();
+    };
+    doc.routing
+        .and_then(|routing| routing.preferred_workers)
+        .unwrap_or_default()
+        .iter()
+        .map(|id| id.trim())
+        .filter(|id| !id.is_empty())
+        .map(WorkerId::new)
+        .collect()
+}
+
 fn local_fallback_command(command: &str) -> std::process::Command {
     let mut child = std::process::Command::new("sh");
     child
@@ -750,7 +797,15 @@ pub async fn run_exec(command_parts: Vec<String>) -> anyhow::Result<()> {
     let required_runtime = required_runtime_for_kind(classification.kind);
     let command_priority = command_priority_from_env(&reporter);
     let wait_for_worker = queue_when_busy_enabled();
-    let preferred_workers = preferred_workers_from_env();
+    // Preferred workers: env (`RCH_WORKER`/`RCH_WORKERS`) merged with the
+    // project-local `.rch/config.toml` `[routing] preferred_workers`. The daemon
+    // treats a non-empty list as a hard preference (selects only those workers
+    // when any is eligible, else falls back to all eligible).
+    let preferred_workers = {
+        let mut combined = preferred_workers_from_env();
+        combined.extend(preferred_workers_from_project_config());
+        dedupe_worker_ids(combined)
+    };
 
     // Query daemon for worker selection
     let response = match query_daemon(

@@ -14,6 +14,23 @@ No unreleased changes yet.
 
 ---
 
+## [v1.0.43] -- 2026-06-19 (release)
+
+Built on **v1.0.42** (the deployed fleet baseline).
+
+### Added
+- **Per-project worker routing via `[routing] preferred_workers` in `.rch/config.toml`.**
+  The daemon's selector already honors `SelectionRequest.preferred_workers` as a hard
+  preference (selects only listed workers when any is eligible; falls back to all eligible
+  only if none are), but the hook only populated it from the `RCH_WORKER`/`RCH_WORKERS` env.
+  The hook now *also* reads a `[routing] preferred_workers` list from the project-local
+  `.rch/config.toml` (relative to the build cwd) and merges it with the env list. This lets
+  a repo durably pin its remote builds to specific workers — e.g. routing a project whose
+  target dir is huge to big-disk workers so it never wedges a small-disk one. Best-effort:
+  a missing/malformed project config yields no pinning, never an error.
+
+---
+
 ## [v1.0.41] -- 2026-06-08 (release)
 
 ### Added
